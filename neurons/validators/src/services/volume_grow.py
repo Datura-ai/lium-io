@@ -8,10 +8,12 @@ create; each cleanup pass grows a live pod's volume towards it as far as free di
 import asyncio
 import logging
 import shlex
+from dataclasses import dataclass, field
 
 import asyncssh
 
 from core.utils import _m
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 
 logger = logging.getLogger(__name__)
 
@@ -23,13 +25,14 @@ GROW_PASS_MAX_SECONDS = (
 )
 SSH_CALL_TIMEOUT_SECONDS = 30  # each docker read
 RESIZE_TIMEOUT_SECONDS = (
-    120  # the host script, killed on the host past this (a stalled fallocate or xfs_growfs)
+    120  # the host script, killed past this on the host (a stalled fallocate or xfs_growfs)
 )
 
 # Runs in the host's mount namespace: the volume's mount (under the plugin's propagated-mount) and backing file are
-# host paths. Grows only, by whole
-# 4 KiB sectors (the v3 plugin's loop sector size), never past the order or into the headroom. Prints the outcome and,
-# when it read one, the volume's filesystem size in bytes after it (what the renter can use, not the file's size).
+# host paths. Grows only, by whole 4 KiB sectors (the v3 plugin's loop sector size), never past the order or into the
+# headroom. Prints the outcome and, when it read one, the volume's filesystem size in bytes after it (what the renter
+# can use, not the file's size); an unreadable filesystem size prints no size. Disk a preallocated grow took is printed
+# first on its own line (`allocated <bytes>`), so a grow whose xfs_growfs then fails still reports what it used.
 GROW_SCRIPT = r"""
 set -eu
 mp=$1 order=$2 headroom=$3 sparse=$4
@@ -46,15 +49,20 @@ if command -v flock >/dev/null 2>&1; then
   flock -w "${VOLUME_GROW_LOCK_WAIT:-30}" 9 || { echo locked; exit 0; }
 fi
 cur=$(stat -c %s "$file")
-# the filesystem's size (xfs data section), or the file's when it cannot be read
+# the filesystem's size (xfs data section); empty when it cannot be read
 fs_size() { s=$(xfs_info "$mp" 2>/dev/null | awk '/^data/ {for (i = 1; i <= NF; i++) {
   if ($i ~ /^bsize=/) b = substr($i, 7); if ($i ~ /^blocks=/) n = substr($i, 8) + 0 }; printf "%.0f", n * b; exit}') || s=
-  [ -n "$s" ] && [ "$s" -gt 0 ] && echo "$s" || echo "$1"; }
+  [ -n "$s" ] && [ "$s" -gt 0 ] && echo "$s" || true; }
 fs=$cur
 if command -v xfs_growfs >/dev/null 2>&1; then
-  fs=$(fs_size "$cur")
+  # never the file's size in its place: it would hide a filesystem an earlier pass failed to grow
+  fs=$(fs_size)
+  [ -n "$fs" ] || { echo fs-size-unread; exit 0; }
   # an earlier pass extended the file but its xfs_growfs failed: finish that grow before anything else
-  if [ "$fs" -lt "$cur" ]; then losetup -c "$dev"; xfs_growfs "$mp" >/dev/null; fs=$(fs_size "$cur"); fi
+  if [ "$fs" -lt "$cur" ]; then
+    losetup -c "$dev"; xfs_growfs "$mp" >/dev/null; fs=$(fs_size)
+    [ -n "$fs" ] || { echo fs-size-unread; exit 0; }
+  fi
 fi
 if [ "$cur" -ge "$order" ]; then echo full "$fs"; exit 0; fi
 command -v xfs_growfs >/dev/null 2>&1 || { echo no-xfs-growfs "$cur"; exit 0; }
@@ -71,10 +79,15 @@ target=$((alloc + avail - headroom))
 if [ "$target" -gt "$order" ]; then target=$order; fi
 target=$((target / 4096 * 4096))
 if [ "$target" -le "$cur" ]; then echo no-room "$fs"; exit 0; fi
-if [ "$sparse" = true ]; then truncate -s ">$target" "$file"; else fallocate -o "$cur" -l $((target - cur)) "$file"; fi
+if [ "$sparse" = true ]; then
+  truncate -s ">$target" "$file"
+else
+  fallocate -o "$cur" -l $((target - cur)) "$file"
+  echo allocated $((target - cur))
+fi
 losetup -c "$dev"
 xfs_growfs "$mp" >/dev/null
-echo grown "$(fs_size "$target")"
+echo grown "$(fs_size)"
 """
 
 
@@ -85,30 +98,53 @@ def order_labels(ordered_gb: int | None, granted_gb: int | None) -> dict[str, st
     return {ORDER_LABEL: str(ordered_gb)}
 
 
+@dataclass
+class GrowPass:
+    # pod id -> its volume's filesystem size in GB after the pass, which the backend records
+    sizes_gb: dict[str, int] = field(default_factory=dict)
+    # host disk the pass's preallocated grows took, failed xfs_growfs included: the cycle's free disk is less by this
+    allocated_bytes: int = 0
+
+
+def pod_ids_at_endpoint(
+    rented_data: RentedExecutorsResponse | None, address: str, port: int | str
+) -> set[str]:
+    """The pods the snapshot lists at this node's endpoint, under any executor id there: the only volumes a pass
+    here may grow. A pod listed on another node is a retained copy on this one and never grows."""
+    if not rented_data:
+        return set()
+    return {
+        pod.pod_id
+        for executor in rented_data.executors.values()
+        if (executor.executor_ip_address, str(executor.executor_ip_port)) == (address, str(port))
+        for pod in executor.pods
+    }
+
+
 async def grow_short_volumes(
     ssh_client: asyncssh.SSHClientConnection,
     live_pod_ids: set[str],
     budget_seconds: float = GROW_PASS_MAX_SECONDS,
-) -> dict[str, int]:
-    """Grow each live pod's short volume as far as free disk allows; pod id -> its volume's size in GB after the pass,
-    which the backend records. Never raises and never runs past `budget_seconds`: out of time, it returns the sizes
-    it has, and a volume not grown this pass is tried again on the next."""
-    sizes_gb: dict[str, int] = {}
+) -> GrowPass:
+    """Grow each live pod's short volume as far as free disk allows. Never raises and never runs past
+    `budget_seconds`: out of time, it returns what it has, and a volume not grown this pass is tried again on the
+    next."""
+    grow = GrowPass()
     try:
         async with asyncio.timeout(budget_seconds):
-            await _grow_short_volumes(ssh_client, live_pod_ids, sizes_gb)
+            await _grow_short_volumes(ssh_client, live_pod_ids, grow)
     except TimeoutError:
         logger.warning(
             _m(
                 "volume_grow_out_of_time",
-                extra={"budget_seconds": budget_seconds, "sized": len(sizes_gb)},
+                extra={"budget_seconds": budget_seconds, "sized": len(grow.sizes_gb)},
             )
         )
-    return sizes_gb
+    return grow
 
 
 async def _grow_short_volumes(
-    ssh_client: asyncssh.SSHClientConnection, live_pod_ids: set[str], sizes_gb: dict[str, int]
+    ssh_client: asyncssh.SSHClientConnection, live_pod_ids: set[str], grow: GrowPass
 ) -> None:
     try:
         listing = await ssh_client.run(
@@ -177,15 +213,19 @@ async def _grow_short_volumes(
         except Exception as exc:  # noqa: BLE001
             logger.warning(_m("volume_grow_failed", extra={"volume_name": name, "error": str(exc)}))
             continue
-        outcome = (
-            result.stdout or ""
-        ).strip() or f"exit {result.exit_status}: {(result.stderr or '').strip()[-300:]}"
+        lines = (result.stdout or "").strip().splitlines()
+        allocated = [line.split()[-1] for line in lines if line.startswith("allocated ")]
+        grow.allocated_bytes += sum(int(n) for n in allocated if n.isdigit())
+        outcome = " ".join(line for line in lines if not line.startswith("allocated ")).strip()
+        if result.exit_status != 0 or not outcome:
+            # a failed script prints no size: never read one from what it printed before failing
+            outcome = f"exit {result.exit_status}: {(result.stderr or '').strip()[-300:]}"
         logger.info(
             _m(
                 "volume_grow",
                 extra={"volume_name": name, "order_gb": int(order_gb), "outcome": outcome},
             )
         )
-        size_bytes = outcome.split()[-1]
+        size_bytes = outcome.split()[-1] if result.exit_status == 0 else ""
         if size_bytes.isdigit():
-            sizes_gb[name.removeprefix("volume_")] = int(size_bytes) // _GB
+            grow.sizes_gb[name.removeprefix("volume_")] = int(size_bytes) // _GB

@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 from services.volume_grow import (
+    GrowPass,
+    pod_ids_at_endpoint,
     GROW_HEADROOM_BYTES,
     GROW_SCRIPT,
     ORDER_LABEL,
@@ -51,7 +53,7 @@ async def test_only_a_live_pods_short_volume_is_grown_to_its_order():
     grown = await grow_short_volumes(ssh, {"live"})
 
     inspect, grow = ssh.run.await_args_list[1].args[0], ssh.run.await_args_list[4].args[0]
-    assert (grown, "volume_retained" in inspect) == ({"live": 466}, False)
+    assert (grown.sizes_gb, "volume_retained" in inspect) == ({"live": 466}, False)
     assert grow.startswith("timeout -k 5 120 nsenter -t 1 -m -- sh -c ")
     # the host path of the mount, not the plugin-internal /mnt/<volume> docker reports
     assert grow.endswith(
@@ -63,7 +65,7 @@ async def test_only_a_live_pods_short_volume_is_grown_to_its_order():
 async def test_a_failed_listing_grows_nothing_and_does_not_raise():
     ssh = SimpleNamespace(run=AsyncMock(side_effect=OSError("channel closed")))
 
-    assert await grow_short_volumes(ssh, {"live"}) == {}
+    assert await grow_short_volumes(ssh, {"live"}) == GrowPass()
 
 
 def _stub(bin_dir, name, body):
@@ -154,7 +156,16 @@ def test_the_host_script_grows_up_to_the_order_and_never_into_the_headroom(
     expected = (
         [grow_call, "losetup -c /dev/loop7", "xfs_growfs /mnt/volume_live"] if grow_call else []
     )
-    assert (result.stdout.strip(), calls) == (outcome, expected)
+    # a preallocated grow first prints the disk it took
+    took = (
+        f"allocated {(int(outcome.split()[-1]) - cur_gb * GB)}"
+        if grow_call and sparse == "false"
+        else None
+    )
+    assert (result.stdout.strip().splitlines(), calls) == (
+        [took, outcome] if took else [outcome],
+        expected,
+    )
 
 
 def test_a_pods_volume_size_from_the_cleanup_pass_rides_on_its_pod_state():
@@ -317,7 +328,7 @@ def test_the_reported_size_is_the_filesystems_not_the_files(tmp_path):
         env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
     )
 
-    assert result.stdout.strip() == f"grown {110 * GB}"
+    assert result.stdout.strip().splitlines()[-1] == f"grown {110 * GB}"
 
 
 def test_a_pass_waits_for_another_on_the_same_host_and_never_shrinks_a_file(tmp_path):
@@ -368,5 +379,107 @@ async def test_a_stalled_resize_ends_the_pass_at_its_budget_with_the_sizes_it_ha
         grow_short_volumes(ssh, {"done", "stuck"}, budget_seconds=0.2), 5
     )
 
-    assert grown == {"done": 466}
+    assert grown.sizes_gb == {"done": 466}
     assert all("timeout" in call.kwargs for call in ssh.run.await_args_list)
+
+
+def test_an_unreadable_filesystem_size_reports_no_size_and_grows_nothing(tmp_path):
+    # the file reached 466 GB, its xfs_growfs failed, and now xfs_info fails too: never "full 466"
+    log = tmp_path / "calls"
+    _stub(tmp_path, "findmnt", "echo /dev/loop7")
+    _stub(
+        tmp_path,
+        "losetup",
+        f'[ "$1" = -c ] && echo "losetup $*" >> {log} || echo /data/volume_live',
+    )
+    _stub(tmp_path, "stat", f"echo {466 * GB}")
+    _stub(tmp_path, "xfs_info", "exit 1")
+    _stub(tmp_path, "xfs_growfs", f'echo "xfs_growfs $*" >> {log}; exit 1')
+
+    result = subprocess.run(
+        ["sh", "-c", GROW_SCRIPT, "grow", "/mnt/volume_live", str(466 * GB), str(10 * GB), "false"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+    )
+
+    assert (result.stdout.strip(), log.exists()) == ("fs-size-unread", False)
+
+
+@pytest.mark.asyncio
+async def test_a_grow_whose_xfs_growfs_failed_reports_the_disk_it_took_and_no_size():
+    ssh = SimpleNamespace(
+        run=AsyncMock(
+            side_effect=[
+                _ran("volume_live\n"),
+                _ran("volume_live|466|vloopback:v3|\n"),
+                _ran("/var/lib/docker\n"),
+                _ran("abc\n"),
+                _ran(f"allocated {60 * GB}\n", exit_status=1),
+            ]
+        )
+    )
+
+    assert await grow_short_volumes(ssh, {"live"}) == GrowPass(sizes_gb={}, allocated_bytes=60 * GB)
+
+
+def test_only_pods_listed_at_this_nodes_endpoint_may_grow():
+    from protocol.vc_protocol.compute_requests import (
+        RentedExecutor,
+        RentedExecutorsResponse,
+        RentedPod,
+    )
+
+    def at(address, port, *pod_ids):
+        return RentedExecutor(
+            miner_hotkey="h",
+            executor_ip_address=address,
+            executor_ip_port=port,
+            pods=[RentedPod(pod_id=p, container_name=p, rented_ports=[]) for p in pod_ids],
+        )
+
+    rented = RentedExecutorsResponse(
+        executors={
+            "this": at("192.0.2.1", "8080", "here"),
+            # the same endpoint under a second executor id
+            "alias": at("192.0.2.1", "8080", "alias-pod"),
+            # the renter moved on: its pod is listed on another node, the copy here is retained
+            "other": at("192.0.2.2", "8080", "moved"),
+            "other-port": at("192.0.2.1", "9090", "next-door"),
+        }
+    )
+
+    assert pod_ids_at_endpoint(rented, "192.0.2.1", 8080) == {"here", "alias-pod"}
+    assert pod_ids_at_endpoint(None, "192.0.2.1", 8080) == set()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "taken_gb", "free_after_gb", "listable_gpus"),
+    [
+        ("no-room", 0, None, None),
+        ("partial", 15, 55, 1),
+        ("full", 60, 10, 0),
+        # the file was extended, xfs_growfs failed: the disk is taken all the same
+        ("failed-growfs", 60, 10, 0),
+    ],
+)
+def test_the_disk_a_grow_took_is_what_the_listing_and_paid_count_judge(
+    context_factory, outcome, taken_gb, free_after_gb, listable_gpus
+):
+    from services.task.checks.disk_space import KB_PER_GB, specs_after_disk_taken
+
+    from tests.test_disk_space_check import _split_state
+
+    # 2 GPUs split 1 each, 1 rented, 70 GB free against the 50 GB floor
+    state = _split_state(70, gpu_count=2, gpu_splitting_min_count=1, pods=(1,))
+    state.specs["hard_disk"]["used"] = 30 * KB_PER_GB
+    ctx = context_factory(state=state, rented=True)
+
+    specs = specs_after_disk_taken(ctx, taken_gb * GB)
+
+    if free_after_gb is None:
+        assert specs is None
+        return
+    assert specs["hard_disk"]["free"] == free_after_gb * KB_PER_GB
+    assert specs["hard_disk"]["utilization"] == pytest.approx((30 + taken_gb) / 100 * 100)
+    assert specs["split_disk"]["listable_gpu_count"] == listable_gpus

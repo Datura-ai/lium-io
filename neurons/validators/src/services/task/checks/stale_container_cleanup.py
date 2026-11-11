@@ -15,9 +15,9 @@ from protocol.vc_protocol.compute_requests import (
     PodRentalActiveResponse,
 )
 from protocol.vc_protocol.validator_requests import POD_STATES_MAX_ITEMS, ContainerState, PodContainerState
-from services.container_cleanup import live_pod_ids, rented_list_unknown_reason
+from services.container_cleanup import rented_list_unknown_reason
 from services.redis_service import CLEANUP_SEEN_EXECUTORS_SET
-from services.volume_grow import GROW_PASS_MAX_SECONDS, grow_short_volumes
+from services.volume_grow import GROW_PASS_MAX_SECONDS, GrowPass, grow_short_volumes, pod_ids_at_endpoint
 
 from ...const import (
     unparked_name,
@@ -29,6 +29,7 @@ from ...const import (
 from ..messages import StaleContainerCleanupMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .disk_space import specs_after_disk_taken
 from .task_time import task_seconds_left
 
 logger = logging.getLogger(__name__)
@@ -190,11 +191,20 @@ class StaleContainerCleanupCheck:
         # the rest once the disk is free; only on a known rented list, so a retained or orphan volume is never grown
         # bounded, and to half the task's time left at most, so the rental checks and state publication after it run
         grow_budget = min(GROW_PASS_MAX_SECONDS, task_seconds_left(ctx) / 2)
-        volume_sizes_gb = (
-            await grow_short_volumes(ctx.ssh, live_pod_ids(ctx.state.rented_data), grow_budget)
+        # only pods listed at this node's endpoint: live_pod_ids is fleet-wide, so a pod rented on another node would
+        # grow its retained copy here (deletion protection keeps the fleet-wide set)
+        grown = (
+            await grow_short_volumes(
+                ctx.ssh,
+                pod_ids_at_endpoint(ctx.state.rented_data, ctx.executor.address, ctx.executor.port),
+                grow_budget,
+            )
             if rented_list_unknown is None and grow_budget > 0
-            else {}
+            else GrowPass()
         )
+        volume_sizes_gb = grown.sizes_gb
+        # the grow took disk the scrape counted free: the listing and the paid GPU count must judge what is left
+        specs_after_grow = specs_after_disk_taken(ctx, grown.allocated_bytes)
 
         # DAH-2475: give the DPHN filler cache back when the node can no longer afford it. This is
         # the ONLY caller — the create-time sweep deliberately never reclaims (it would raise free
@@ -259,7 +269,7 @@ class StaleContainerCleanupCheck:
             # queued before the attempt (the hook runs first), still on the host: not reaped
             await queue.drop(name)
         reaped = await queue.states(limit=self._reaped_slots_in_spec(ctx))
-        if not unremovable_names and not reaped and not removed_names and not volume_sizes_gb:
+        if not unremovable_names and not reaped and not removed_names and not volume_sizes_gb and not specs_after_grow:
             return CheckResult(passed=True, event=event)
         # confirmed AND gone: a confirmed container that survived docker rm still runs its processes
         removed = await queue.claim_gpu_exemptions(confirmed.intersection(removed_names))
@@ -273,6 +283,7 @@ class StaleContainerCleanupCheck:
             ],
             pod_states=[*ctx.state.pod_states, *reaped],
             volume_sizes_gb={**ctx.state.volume_sizes_gb, **volume_sizes_gb},
+            specs=specs_after_grow if specs_after_grow is not None else ctx.state.specs,
         )
         return CheckResult(passed=True, event=event, updates={"state": state})
 
