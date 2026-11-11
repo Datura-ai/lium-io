@@ -138,6 +138,7 @@ STUBS = {
     ),
     # records "<seconds> <command>" in .stub-docker/timeouts, then runs the command
     "timeout": '#!/bin/bash\necho "$*" >> "$SYSBOX_SETUP_HOST_ROOT/.stub-docker/timeouts"\nshift\nexec "$@"\n',
+    "systemctl": '#!/bin/bash\necho "$*" >> "$SYSBOX_SETUP_HOST_ROOT/.stub-docker/systemctl"\n',
     "apparmor_parser": '#!/bin/bash\necho "$*" >> "$SYSBOX_SETUP_HOST_ROOT/.stub-docker/apparmor"\n',
     "nvidia-container-cli": '#!/bin/bash\nprintf "cli-version: 1.17.8\\nlib-version: 1.17.8\\n"\n',
     # the real `sysbox-runc --version`: the name alone on line 1, the version on line 2
@@ -447,6 +448,16 @@ def test_install_reloads_the_profile_even_when_an_earlier_run_already_wrote_the_
     assert rc == 0
     assert (tmp_path / "root/.stub-docker/apparmor").read_text() == "-r /etc/apparmor.d/fusermount3\n"
     assert (tmp_path / "root/etc/apparmor.d/local/fusermount3").read_text().count(APPARMOR_RULE) == 1
+
+
+def test_install_gives_sysbox_services_time_to_start_and_a_restart(tmp_path):
+    # sysbox-ce 0.7.1: 10 s start timeout and no Restart=, so a slow boot left sysbox down until a manual restart
+    rc, _, _ = run_check(tmp_path, "install_sysbox_restart_dropins")
+    assert rc == 0
+    for svc in ("sysbox-fs", "sysbox-mgr"):
+        dropin = tmp_path / f"root/etc/systemd/system/{svc}.service.d/lium-restart.conf"
+        assert dropin.read_text() == "[Service]\nTimeoutStartSec=90\nRestart=on-failure\nRestartSec=5\n"
+    assert (tmp_path / "root/.stub-docker/systemctl").read_text() == "daemon-reload\n"
 
 
 def test_install_with_apparmor_off_skips_the_reload(tmp_path):
