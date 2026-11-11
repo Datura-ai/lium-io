@@ -86,7 +86,9 @@ def _fault_kind(fault: str) -> str:
     return "pcie" if ": PCIe link " in fault else "xid"
 
 
-def _healed(fault: str, gpus: dict[str, dict[str, Any]], every_card_named: bool, rebooted: bool) -> bool:
+def _held_fault_proven_healed(
+    fault: str, gpus: dict[str, dict[str, Any]], every_card_named: bool, rebooted: bool
+) -> bool:
     """Proof that a held card fault is over: the card is gone from a read naming every card (the
     missing-card rule reports that), a PCIe downgrade reads its full link at full performance, an Xid a
     new host boot. A read that merely shows nothing new, or lacks the values, proves nothing."""
@@ -105,9 +107,9 @@ def _healed(fault: str, gpus: dict[str, dict[str, Any]], every_card_named: bool,
 
 async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardHealthState) -> None:
     """Put this cycle's per-card hardware faults into `report["card_faults"]`: the probe's new Xids, a PCIe
-    downgrade also read on the previous cycle, and every earlier fault not yet proven healed (`_healed`);
-    then keep the state for the next read. A dry run shares Redis with the live validator, so it writes
-    nothing."""
+    downgrade also read on the previous cycle, and every earlier fault not yet proven healed
+    (`_held_fault_proven_healed`); then keep the state for the next read. A dry run shares Redis with
+    the live validator, so it writes nothing."""
     if report.get("status") not in ("ok", "flagged"):
         # no NVML reading: the state stays as it was, and must not expire while NVML stays unreadable
         if not settings.DRY_RUN:
@@ -128,7 +130,7 @@ async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardH
     every_card_named = bool(listed) and len(gpus) == len(listed)
     downgraded_before = {_card_uuid(s) for s in before.pcie_downgrades} - {None}
     new = xid_faults + [s for s in downgrades if _card_uuid(s) in downgraded_before]
-    held = [f for f in before.held if not _healed(f, gpus, every_card_named, rebooted)]
+    held = [f for f in before.held if not _held_fault_proven_healed(f, gpus, every_card_named, rebooted)]
     # one fault per card and kind, this read's first: a card repeating an Xid must not grow the stored state,
     # and a link fault healing must not close the same card's Xid, which needs its own proof
     by_card: dict[tuple[str, str], str] = {}
