@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable
 from dataclasses import replace
 
 from core.config import settings
+from core.utils import _m, get_extra_info
 from services.default_docker_image_digest_service import executor_build_published
 from services.executor_image_policy import (
     ImageVerdict,
@@ -16,6 +18,8 @@ from ..messages import ExecutorImageMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .rental_owner import rental_of_this_node
+
+logger = logging.getLogger(__name__)
 
 _EXECUTOR_NAME = re.compile(r"(?:^|-)executor-\d+$")
 
@@ -78,8 +82,24 @@ class ExecutorImageCheck:
             return CheckResult(passed=True, event=event)
 
         report = snapshot.report(observed_executor_digest(ctx.state.specs))
-        if report.status is ImageVerdict.OUTDATED and await executor_build_published(report.observed_digest) is False:
-            report = replace(report, status=ImageVerdict.UNOFFICIAL)
+        if report.status is ImageVerdict.OUTDATED:
+            published = await executor_build_published(report.observed_digest)
+            # a plain line, outside the event sink's repeat demotion, so a Loki count per cycle is exact
+            logger.info(
+                _m(
+                    "EXECUTOR_BUILD",
+                    extra=get_extra_info(
+                        {
+                            **ctx.default_extra,
+                            "executor_build": {True: "official", False: "unofficial"}.get(published, "unknown"),
+                            "observed_digest": report.observed_digest,
+                            "executor_image_unofficial_enforced": settings.EXECUTOR_IMAGE_UNOFFICIAL_ENFORCE,
+                        }
+                    ),
+                )
+            )
+            if published is False and settings.EXECUTOR_IMAGE_UNOFFICIAL_ENFORCE:
+                report = replace(report, status=ImageVerdict.UNOFFICIAL)
         updated_state = replace(ctx.state, executor_image_report=report)
         what = report.as_dict()
 

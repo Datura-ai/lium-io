@@ -33,6 +33,11 @@ def warn_only(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", False)
 
 
+@pytest.fixture
+def unofficial_enforced(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_UNOFFICIAL_ENFORCE", True)
+
+
 def policy() -> ExpectedImageSnapshot:
     return ExpectedImageSnapshot(
         executor=ExpectedImage("executor:latest", EXECUTOR_DIGEST),
@@ -89,7 +94,9 @@ async def test_unrented_outdated_executor_fails_validation(enforce):
 
 
 @pytest.mark.asyncio
-async def test_unobservable_executor_digest_is_unofficial(enforce, no_registry_lookup_for_executor_build):
+async def test_unobservable_executor_digest_is_unofficial(
+    enforce, unofficial_enforced, no_registry_lookup_for_executor_build
+):
     no_registry_lookup_for_executor_build.side_effect = real_executor_build_published
     context = make_context(
         config=build_context_config(executor_image_snapshot=policy()),
@@ -149,7 +156,7 @@ async def test_outdated_executor_under_another_miners_rental_on_a_different_endp
 
 @pytest.mark.asyncio
 async def test_unrented_executor_on_a_build_we_never_published_fails_even_warn_only(
-    warn_only, no_registry_lookup_for_executor_build
+    warn_only, unofficial_enforced, no_registry_lookup_for_executor_build
 ):
     no_registry_lookup_for_executor_build.return_value = False
     context = make_context(
@@ -163,6 +170,27 @@ async def test_unrented_executor_on_a_build_we_never_published_fails_even_warn_o
     assert result.updates["state"].executor_image_report.status is ImageVerdict.UNOFFICIAL
     assert result.event.reason_code == "EXECUTOR_IMAGE_UNOFFICIAL"
     no_registry_lookup_for_executor_build.assert_awaited_once_with(STALE_DIGEST)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("published", "build"), [(False, "unofficial"), (True, "official"), (None, "unknown")])
+async def test_with_unofficial_enforcement_off_a_build_is_only_logged(
+    warn_only, no_registry_lookup_for_executor_build, caplog, published, build
+):
+    no_registry_lookup_for_executor_build.return_value = published
+    context = make_context(
+        config=build_context_config(executor_image_snapshot=policy()),
+        state=build_state(specs=specs(executor_digest=STALE_DIGEST), rented_data=SimpleNamespace(executors={})),
+    )
+
+    with caplog.at_level("INFO"):
+        result = await ExecutorImageCheck().run(context)
+
+    assert result.passed is True
+    assert result.updates["state"].executor_image_report.status is ImageVerdict.OUTDATED
+    logged = [r for r in caplog.records if "EXECUTOR_BUILD" in r.getMessage()]
+    assert len(logged) == 1 and logged[0].levelname == "INFO"
+    assert logged[0].msg.extra["executor_build"] == build
 
 
 @pytest.mark.asyncio
