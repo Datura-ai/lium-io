@@ -155,36 +155,44 @@ async def settle_excused_storage_helper_keys(
     Unreadable states keep every record and
     excuse nothing this cycle, and so does Redis not answering.
     """
-    keys: set[str] = set()
+    raws: list[str] = []
 
-    async def settle() -> None:
-        now = int(time.time())
-        records = {
-            raw: StorageHelperRecord.parse(raw) for raw in await _raw_records(redis, executor_id)
-        }
-        live = {
-            raw: record
-            for raw, record in records.items()
-            if record and 0 <= now - record.started <= STARTED_STORAGE_HELPERS_TTL_SECONDS
-        }
-        for raw in records.keys() - live.keys():
-            await redis.srem(_key(executor_id), raw)
-        if not live:
-            return
-        states = await read_states(sorted({r.operation_id for r in live.values()}))
-        if states is None:
-            return
-        for raw, record in live.items():
+    async def read() -> None:
+        raws.extend(await _raw_records(redis, executor_id))
+
+    if not await _redis_call(f"read helpers of {executor_id}", read):
+        return set()
+    now = int(time.time())
+    records = {raw: StorageHelperRecord.parse(raw) for raw in raws}
+    unexpired_records = {
+        raw: record
+        for raw, record in records.items()
+        if record and 0 <= now - record.started <= STARTED_STORAGE_HELPERS_TTL_SECONDS
+    }
+    ended = list(records.keys() - unexpired_records.keys())
+    keys: set[str] = set()
+    # outside the Redis timeout: the node read has its own, longer one
+    states = (
+        await read_states(sorted({r.operation_id for r in unexpired_records.values()}))
+        if unexpired_records
+        else None
+    )
+    if states is not None:
+        for raw, record in unexpired_records.items():
             state = states.get(record.operation_id, "")
             in_grace = now - record.started <= STORAGE_OPERATION_START_GRACE_SECONDS
             if state == "RUNNING" or (state == "STARTING" and in_grace):
                 keys.add(storage_helper_key(record.operation_id))
             elif not (state == "GONE" and in_grace):
                 # GONE in the grace may still be about to launch: kept, but excuses nothing
-                await redis.srem(_key(executor_id), raw)
+                ended.append(raw)
 
-    if not await _redis_call(f"read helpers of {executor_id}", settle):
-        return set()
+    async def drop() -> None:
+        for raw in ended:
+            await redis.srem(_key(executor_id), raw)
+
+    if ended:
+        await _redis_call(f"drop ended helpers of {executor_id}", drop)
     return keys
 
 

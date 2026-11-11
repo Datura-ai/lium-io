@@ -291,11 +291,15 @@ async def storage_operation_states(ctx: Context, operation_ids: list[str]) -> di
     """The runner state of each operation on the node; None when it cannot be read."""
     if ctx.runner is None:
         return None
-    result = await ctx.runner.run(
-        operation_states_command(operation_ids),
-        timeout=STORAGE_OPERATION_STATES_TIMEOUT_SECONDS,
-        retryable=False,
-    )
+    try:
+        result = await ctx.runner.run(
+            operation_states_command(operation_ids),
+            timeout=STORAGE_OPERATION_STATES_TIMEOUT_SECONDS,
+            retryable=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Storage operation states unreadable: %s", exc)
+        return None
     return parse_operation_states(result.stdout) if result.success else None
 
 

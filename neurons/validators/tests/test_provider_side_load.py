@@ -1,4 +1,5 @@
 """DAH-2734: provider-side CPU/disk gate — the twin of the DAH-2735 foreign-GPU gate."""
+import asyncio
 import os
 import time
 from contextlib import contextmanager
@@ -1027,6 +1028,23 @@ def test_the_node_command_reads_each_operation_state(tmp_path, files, expected):
     stdout = subprocess.run(["sh", "-c", command], capture_output=True, text=True).stdout
 
     assert parse_operation_states(stdout) == {str(OPERATION): expected}
+
+
+@pytest.mark.asyncio
+async def test_a_node_read_slower_than_the_redis_timeout_still_excuses(monkeypatch):
+    # only the Redis calls are cut at their short timeout; the node read has its own
+    from neurons.validators.src.services import storage_operations
+
+    monkeypatch.setattr(storage_operations, "_STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC", 0.05)
+    store = {f"{OPERATION}|{int(time.time())}"}
+
+    async def slow_running(ops):
+        await asyncio.sleep(0.2)
+        return {op: "RUNNING" for op in ops}
+
+    keys = await settle_excused_storage_helper_keys(_set_redis(store), "executor-1", slow_running)
+
+    assert keys == {storage_helper_key(OPERATION)}
 
 
 def test_operation_states_round_trip_through_the_node_command():
