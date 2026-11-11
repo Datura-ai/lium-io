@@ -30,10 +30,13 @@ RESET_REQUIRED_STREAK_LIMIT = 3
 _reset_required_streak: dict[tuple[str, str], int] = {}
 
 # DAH-5869: per executor, the kernel-log Xid lines already judged, the host's boot id, the last read's PCIe
-# downgrades (one needs two reads in a row) and one held fault per card: it closes only on proof the card healed
+# downgrades (one needs two reads in a row) and one held fault per card and kind: it closes only on proof it healed
 CARD_HEALTH_KEY_PREFIX = "gpu_card_health"
 CARD_HEALTH_TTL_SECONDS = 86400
 _REDIS_ERRORS: tuple[type[BaseException], ...] = (redis.exceptions.RedisError, OSError)
+# a state Redis failed to store: the next read judges against it, so a confirmed fault is not lost
+# shortcut: kept in this process only, so a validator restart during a Redis outage drops it; persist if it bites
+_unsaved_card_health: dict[str, "CardHealthState"] = {}
 
 
 @dataclass
@@ -51,6 +54,8 @@ def _card_health_key(ctx: Context) -> str:
 async def _load_card_health(ctx: Context) -> CardHealthState | None:
     """The stored state, or None when Redis could not be read: then nothing is judged or written, so a held
     fault is neither closed nor overwritten."""
+    if (unsaved := _unsaved_card_health.get(_card_health_key(ctx))) is not None:
+        return unsaved
     try:
         stored = json.loads(await ctx.services.redis.get(_card_health_key(ctx)) or "{}")
     except (*_REDIS_ERRORS, TypeError, ValueError):
@@ -77,6 +82,10 @@ def _card_uuid(fault: str) -> str | None:
     return match.group(1) if match and match.group(1) != "None" else None
 
 
+def _fault_kind(fault: str) -> str:
+    return "pcie" if ": PCIe link " in fault else "xid"
+
+
 def _healed(fault: str, gpus: dict[str, dict[str, Any]], every_card_named: bool, rebooted: bool) -> bool:
     """Proof that a held card fault is over: the card is gone from a read naming every card (the
     missing-card rule reports that), a PCIe downgrade reads its full link at full performance, an Xid a
@@ -100,7 +109,13 @@ async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardH
     then keep the state for the next read. A dry run shares Redis with the live validator, so it writes
     nothing."""
     if report.get("status") not in ("ok", "flagged"):
-        return  # no NVML reading: the state stays as it was
+        # no NVML reading: the state stays as it was, and must not expire while NVML stays unreadable
+        if not settings.DRY_RUN:
+            try:
+                await ctx.services.redis.expire(_card_health_key(ctx), CARD_HEALTH_TTL_SECONDS)
+            except _REDIS_ERRORS:
+                pass
+        return
     downgrades = [s for s in report.get("card_suspects") or [] if isinstance(s, str)]
     xid_faults = [s for s in report.get("xid_faults") or [] if isinstance(s, str)]
     xid = report.get("xid") if isinstance(report.get("xid"), dict) else {}
@@ -114,32 +129,26 @@ async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardH
     downgraded_before = {_card_uuid(s) for s in before.pcie_downgrades} - {None}
     new = xid_faults + [s for s in downgrades if _card_uuid(s) in downgraded_before]
     held = [f for f in before.held if not _healed(f, gpus, every_card_named, rebooted)]
-    # one fault per card, this read's first: a card repeating an Xid must not grow the stored state
-    by_card: dict[str, str] = {}
+    # one fault per card and kind, this read's first: a card repeating an Xid must not grow the stored state,
+    # and a link fault healing must not close the same card's Xid, which needs its own proof
+    by_card: dict[tuple[str, str], str] = {}
     for fault in new + held:
         uuid = _card_uuid(fault)
         if uuid is not None:
-            by_card.setdefault(uuid, fault)
+            by_card.setdefault((uuid, _fault_kind(fault)), fault)
     report["card_faults"] = list(by_card.values())
     if settings.DRY_RUN:
         return
+    key = _card_health_key(ctx)
+    state = CardHealthState(
+        xid_seen=seen, boot_id=boot_id or before.boot_id, pcie_downgrades=downgrades, held=report["card_faults"]
+    )
     try:
-        await ctx.services.redis.set(
-            _card_health_key(ctx),
-            json.dumps(
-                asdict(
-                    CardHealthState(
-                        xid_seen=seen,
-                        boot_id=boot_id or before.boot_id,
-                        pcie_downgrades=downgrades,
-                        held=report["card_faults"],
-                    )
-                )
-            ),
-            ex=CARD_HEALTH_TTL_SECONDS,
-        )
+        await ctx.services.redis.set(key, json.dumps(asdict(state)), ex=CARD_HEALTH_TTL_SECONDS)
     except _REDIS_ERRORS:
-        pass  # the next read judges against the older state: a suspect waits a cycle longer
+        _unsaved_card_health[key] = state
+    else:
+        _unsaved_card_health.pop(key, None)
 
 
 async def read_memory_health(ctx: Context) -> MemoryHealthRead:

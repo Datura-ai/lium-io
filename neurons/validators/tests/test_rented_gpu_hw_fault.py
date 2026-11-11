@@ -234,6 +234,54 @@ async def test_repeated_xids_on_one_card_keep_one_held_fault(context_factory):
 
 
 @pytest.mark.asyncio
+async def test_a_held_xid_survives_a_later_downgrade_on_the_same_card_healing(context_factory):
+    services = _services()
+    boot = {"boot_id": "boot-a"}
+    xid_fault = f"gpu 3 ({UUIDS[3]}): new NVRM Xid on a probed GPU: {HW}"
+    await _read(context_factory, services, _ok(xid={"available": True, "count": 4}, **boot))
+    await _read(context_factory, services, _ok(xid={"available": True, "count": 5}, xid_faults=[xid_fault], **boot))
+    narrow = _ok(xid={"available": True, "count": 5}, card_suspects=[NARROW_LINK], **boot)
+    await _read(context_factory, services, narrow)
+    both, _ = await _read(context_factory, services, narrow)
+    link_healed, _ = await _read(
+        context_factory, services, _ok(gpu=FULL_LINK_AT_P0, xid={"available": True, "count": 5}, **boot)
+    )
+
+    assert sorted(both.report["card_faults"]) == sorted([NARROW_LINK, xid_fault])
+    assert link_healed.report["card_faults"] == [xid_fault]
+
+
+@pytest.mark.asyncio
+async def test_a_confirmed_downgrade_redis_could_not_store_is_not_closed_by_an_idle_read(context_factory, monkeypatch):
+    services = _services()
+    await _read(context_factory, services, _ok(card_suspects=[NARROW_LINK]))
+    real_set = services.redis.set
+
+    async def failing_set(*args, **kwargs):
+        raise ConnectionError("redis down")
+
+    monkeypatch.setattr(services.redis, "set", failing_set)
+    confirmed, _ = await _read(context_factory, services, _ok(card_suspects=[NARROW_LINK]))
+    monkeypatch.setattr(services.redis, "set", real_set)
+    idle, _ = await _read(context_factory, services, _ok(gpu={"pstate": 8}, card_suspects=[]))
+
+    assert confirmed.report["card_faults"] == [NARROW_LINK]
+    assert idle.report["card_faults"] == [NARROW_LINK]
+
+
+@pytest.mark.asyncio
+async def test_an_unread_cycle_keeps_a_held_fault_from_expiring(context_factory):
+    services = _services()
+    await _read(context_factory, services, _ok(card_suspects=[NARROW_LINK]))
+    await _read(context_factory, services, _ok(card_suspects=[NARROW_LINK]))
+    [key] = [k for k in services.redis.store if k.startswith("gpu_card_health:")]
+    services.redis.ttl[key] = 5
+    await _read(context_factory, services, _report("error", error="NVML unavailable"))
+
+    assert services.redis.ttl[key] == gpu_memory_health.CARD_HEALTH_TTL_SECONDS
+
+
+@pytest.mark.asyncio
 async def test_a_dry_run_writes_no_card_state(context_factory, monkeypatch):
     monkeypatch.setattr(settings, "DRY_RUN", True)
     services = _services()
