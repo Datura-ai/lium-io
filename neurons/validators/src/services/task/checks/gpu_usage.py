@@ -676,7 +676,8 @@ def _describe_process(process: dict) -> str:
     return f"{owner} (pid {process.get('pid')})"
 
 
-_DOCKER_SCOPE = re.compile(r"docker-([0-9a-f]{64})\.scope")
+# systemd driver: .../docker-<id>.scope; cgroupfs driver (neurons/executor/daemon.json): .../<id>/...
+_DOCKER_SCOPE = re.compile(r"(?:docker-([0-9a-f]{64})\.scope|/([0-9a-f]{64})(?=/|$))")
 
 
 def _removed_container_owner(process: dict) -> str:
@@ -685,7 +686,7 @@ def _removed_container_owner(process: dict) -> str:
     # and a reboot beside a live rental would stop the renter's pod
     if match := _DOCKER_SCOPE.search(process.get("info") or ""):
         return (
-            f"a leftover process of container {match[1][:12]}, which is no longer running "
+            f"a leftover process of container {(match[1] or match[2])[:12]}, which is no longer running "
             "(once no rental is running, reboot the node to clear it)"
         )
     return "a host process"

@@ -1853,20 +1853,24 @@ async def test_a_busy_gpu_names_its_measured_load_the_limit_and_the_processes(co
     )
 
 
+_LEFTOVER_ID = "ee61df8264ce3006fff5b96ac6005f46067c6fedb3cb053ac67b7f91030dc9a7"
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "info",
+    [
+        f"0::/../docker-{_LEFTOVER_ID}.scope/init.scope",  # systemd cgroup driver
+        f"0::/../{_LEFTOVER_ID}/init.scope",  # cgroupfs driver
+        f"0::/docker/{_LEFTOVER_ID}",  # cgroupfs driver, host cgroup namespace
+    ],
+)
 async def test_a_busy_gpu_held_by_a_container_no_longer_running_says_a_reboot_clears_it(
-    context_factory,
+    context_factory, info
 ):
-    container_id = "ee61df8264ce3006fff5b96ac6005f46067c6fedb3cb053ac67b7f91030dc9a7"
     state = build_state(
         gpu_details=[{"gpu_utilization": 100, "memory_utilization": 0}],
-        gpu_processes=[
-            {
-                "pid": 644002,
-                "info": f"0::/../docker-{container_id}.scope/init.scope",
-                "container_name": None,
-            }
-        ],
+        gpu_processes=[{"pid": 644002, "info": info, "container_name": None}],
     )
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
 
@@ -1876,6 +1880,23 @@ async def test_a_busy_gpu_held_by_a_container_no_longer_running_says_a_reboot_cl
         "GPU processes on the node: a leftover process of container ee61df8264ce, which is no "
         "longer running (once no rental is running, reboot the node to clear it) (pid 644002)." in result.event.remediation
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "info", [f"0::/../docker-{_LEFTOVER_ID}.scope/init.scope", f"0::/../{_LEFTOVER_ID}/init.scope"]
+)
+async def test_a_running_named_container_is_named_not_called_a_leftover(context_factory, info):
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 100, "memory_utilization": 0}],
+        gpu_processes=[{"pid": 4242, "info": info, "container_name": "someones-trainer"}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert "someones-trainer (pid 4242)" in result.event.remediation
+    assert "leftover process of container" not in result.event.remediation
 
 
 @pytest.mark.asyncio
