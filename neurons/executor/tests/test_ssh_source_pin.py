@@ -176,13 +176,36 @@ def test_the_signed_message_carries_the_ssh_sources_prefix(monkeypatch, clock):
     assert messages == ["ssh-sources:198.51.100.7:1000"]
 
 
-@pytest.mark.parametrize("sources,pin_on", [("", True), ("198.51.100.7", False)])
-def test_no_refresh_where_the_pin_never_applies(monkeypatch, sources, pin_on):
+@pytest.mark.parametrize(
+    "sources,pin_on,cvm",
+    [("", True, False), ("198.51.100.7", False, False), ("198.51.100.7", True, True)],
+    ids=["no_source_list", "switch_off", "cvm"],
+)
+def test_no_refresh_where_the_pin_never_applies(monkeypatch, sources, pin_on, cvm):
     monkeypatch.setattr(ssh_service, "VALIDATOR_SSH_SOURCES", sources)
     monkeypatch.setattr(ssh_service.settings, "EXECUTOR_SSH_SOURCE_PIN", pin_on)
+    monkeypatch.setattr(ssh_service, "_in_cvm", lambda: cvm)
     get = MagicMock()
     monkeypatch.setattr(ssh_service.requests, "get", get)
 
     asyncio.run(asyncio.wait_for(ssh_service.run_ssh_sources_refresh(), timeout=1))  # returns, never loops
 
     get.assert_not_called()
+
+
+class _StopLoop(Exception):
+    pass
+
+
+def test_where_the_pin_applies_the_refresh_runs(monkeypatch):
+    # the other side of the skip: an unconditional return would pass the test above but fail this one
+    monkeypatch.setattr(ssh_service, "VALIDATOR_SSH_SOURCES", "198.51.100.7")
+    monkeypatch.setattr(ssh_service.settings, "EXECUTOR_SSH_SOURCE_PIN", True)
+    monkeypatch.setattr(ssh_service, "_in_cvm", lambda: False)
+    refresh = MagicMock(side_effect=_StopLoop)
+    monkeypatch.setattr(ssh_service._signed_ssh_sources, "refresh", refresh)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(asyncio.wait_for(ssh_service.run_ssh_sources_refresh(), timeout=1))
+
+    refresh.assert_called_once()
