@@ -685,7 +685,6 @@ async def test_the_reclaim_never_removes_the_image_the_rental_is_about_to_run(do
     assert _removed_volumes(ssh_client) == [_KIMI]
 
 
-
 @pytest.mark.parametrize("keep_image", ["daturaai/dolphin:1", "docker.io/daturaai/dolphin:1", "index.docker.io/daturaai/dolphin:1"])
 def test_the_idle_filler_removal_keeps_the_rented_image_under_any_docker_hub_prefix(keep_image):
     command = idle_filler_images_removal_command(keep_image)
