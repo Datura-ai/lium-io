@@ -41,9 +41,10 @@ CLAIMED_EXCUSE_CORES = PROVIDER_SIDE_CPU_CORES_LIMIT
 
 # DAH-6148: a Lium backup runs restic in a `lium-storage-<operation>` helper container (executor
 # storage/restic.py). It is on no rental list and usually starts between the scrape and the second
-# look, so its cores landed on the provider. Only the exact names of helpers this validator started
-# on the node are excused (storage_operations.note_started_storage_helper), and only up to restic's
-# GOMAXPROCS: a container that merely wears the prefix stays the provider's.
+# look, so its cores landed on the provider. Only the helpers this validator started on the node
+# are excused (storage_operations.started_storage_helpers: by name until first seen, then by that
+# container's id), and only up to restic's GOMAXPROCS: a container that merely wears the prefix,
+# or takes a helper's name after it ended, stays the provider's.
 STORAGE_HELPER_EXCUSE_CORES = 8.0
 
 # A second look before any money is withheld, the same rule the foreign-GPU twin follows with
@@ -125,7 +126,9 @@ def provider_cores_outside_lium(
     lium_short_ids: set[str] = {key[:12] for key in lium_container_keys}
     lium_percent = helper_percent = 0.0
     for row in rows:
-        if row.name.startswith(STORAGE_HELPER_PREFIX) and row.name in lium_container_keys:
+        if row.name.startswith(STORAGE_HELPER_PREFIX) and (
+            row.name in lium_container_keys or row.container_id[:12] in lium_short_ids
+        ):
             # a helper this validator started: excused up to the cap below
             helper_percent += row.measured_cpu_percent
         elif row.name in lium_container_keys or row.container_id[:12] in lium_short_ids:
@@ -263,7 +266,15 @@ async def lium_containers(ctx: Context) -> set[str] | None:
         containers.update(f"{BUILD_DIND_PREFIX}{pod.pod_id}" for pod in rented_executor.pods)
     specs = ctx.state.specs or {}
     containers.update(await late_started_containers_the_backend_owns(ctx, containers))
-    containers.update(await started_storage_helpers(ctx.services.redis, ctx.executor.uuid))
+    rows = docker_containers(specs)
+    running_helpers = {
+        row.name: row.container_id for row in rows if row.name.startswith(STORAGE_HELPER_PREFIX)
+    }
+    containers.update(
+        await started_storage_helpers(
+            ctx.services.redis, ctx.executor.uuid, running_helpers if rows else None
+        )
+    )
     stack_ids: set[str] = executor_stack_container_ids(specs)
     if settings.PROVIDER_SIDE_LOAD_STACK_EXCUSE_CAP_ENABLED and stack_excuse_is_over_its_cap(specs):
         # like the name tier: over the cap the whole tier excuses nothing

@@ -1,4 +1,5 @@
 """DAH-2734: provider-side CPU/disk gate — the twin of the DAH-2735 foreign-GPU gate."""
+import time
 from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
@@ -20,6 +21,7 @@ from neurons.validators.src.services.task.pipeline import ContextState
 from neurons.validators.src.services.task.messages import ProviderSideLoadMessages as Msg
 
 from neurons.validators.src.services.storage_operations import (
+    forget_storage_helper,
     note_started_storage_helper,
     started_storage_helpers,
 )
@@ -757,9 +759,16 @@ def _helper_runner(name: str, helper_percent: float = 700.0, host_cores: float =
     )
 
 
-def _with_recorded_helpers(ctx, *names: str):
-    """The helpers this validator recorded when it started storage operations here (DAH-6148)."""
-    ctx.services.redis.smembers = AsyncMock(return_value={name.encode() for name in names})
+def _with_recorded_helpers(ctx, *names: str, records: set[str] | None = None):
+    """The helpers this validator recorded when it started storage operations here (DAH-6148).
+
+    `records` shares one store across cycles; it is returned so a test can read it back."""
+    store = records if records is not None else set()
+    store.update(f"{name}|{int(time.time())}|" for name in names)
+    redis = ctx.services.redis
+    redis.smembers = AsyncMock(side_effect=lambda key: {record.encode() for record in store})
+    redis.srem = AsyncMock(side_effect=lambda key, record: store.discard(record))
+    redis.sadd = AsyncMock(side_effect=lambda key, record: store.add(record))
     return ctx
 
 
@@ -796,6 +805,65 @@ async def test_a_lium_storage_name_the_validator_did_not_start_is_the_providers(
     assert result.event.what_we_saw["provider_cpu_cores"] == 8.9
 
 
+async def _cycle(context_factory, store: set[str], rows) -> float:
+    """One validation cycle whose scrape and second look both list `rows` (id, name, percent)."""
+    containers = [
+        {"container_id": cid, "name": name, "cpu_percent": pct} for cid, name, pct in rows
+    ]
+    specs = {**SN13_SPECS, "docker": {**SN13_SPECS["docker"], "containers": containers}}
+    ctx = _with_recorded_helpers(
+        context_factory(state=_rented_state(specs), runner=confirming_runner(10.56, 32, rows)),
+        records=store,
+    )
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+    return result.event.what_we_saw["provider_cpu_cores"]
+
+
+@pytest.mark.parametrize("gap_cycle", [True, False], ids=["after_it_ended", "swapped_in_place"])
+@pytest.mark.asyncio
+async def test_a_helper_name_reused_after_the_backup_ended_is_the_providers(
+    context_factory, gap_cycle
+):
+    # the excuse follows the container first seen under the recorded name, not the name
+    store = {f"{BACKUP_HELPER}|{int(time.time())}|"}
+    pod = ("c1", "pod_renter", 158.0)
+
+    assert await _cycle(context_factory, store, [pod, ("c2", BACKUP_HELPER, 700.0)]) == 1.9
+    if gap_cycle:  # the helper is gone: its operation ended and the record with it
+        await _cycle(context_factory, store, [pod])
+        assert store == set()
+    reused = await _cycle(context_factory, store, [pod, ("c3", BACKUP_HELPER, 700.0)])
+
+    assert reused == 8.9
+    assert store == set()
+
+
+@pytest.mark.asyncio
+async def test_a_record_older_than_any_backup_is_dropped(context_factory):
+    # the backend fails a backup still open after 4 h, so no helper outlives that
+    store = {f"{BACKUP_HELPER}|{int(time.time()) - 5 * 3600}|"}
+
+    cores = await _cycle(
+        context_factory, store, [("c1", "pod_renter", 158.0), ("c2", BACKUP_HELPER, 700.0)]
+    )
+
+    assert cores == 8.9
+    assert store == set()
+
+
+@pytest.mark.asyncio
+async def test_a_scrape_without_containers_changes_no_record():
+    # an unreadable container list is not "the helper is gone"
+    record = f"{BACKUP_HELPER}|{int(time.time())}|c2"
+    store = {record}
+
+    keys = await started_storage_helpers(_set_redis(store), "executor-1", None)
+
+    assert keys == {"c2"}
+    assert store == {record}
+
+
 @pytest.mark.asyncio
 async def test_with_redis_unreadable_no_helper_is_excused(context_factory):
     ctx = context_factory(state=_rented_state(SN13_SPECS), runner=_helper_runner(BACKUP_HELPER))
@@ -823,18 +891,24 @@ async def test_backup_helpers_excuse_no_more_than_restics_own_cores(context_fact
     assert result.event.what_we_saw["provider_cpu_cores"] == 4.4
 
 
-@pytest.mark.asyncio
-async def test_a_started_operation_records_exactly_its_helper_name():
-    sets: dict[str, set[str]] = {}
-    redis = MagicMock(
-        sadd=AsyncMock(side_effect=lambda key, elem: sets.setdefault(key, set()).add(elem)),
+def _set_redis(store: set[str]) -> MagicMock:
+    return MagicMock(
+        sadd=AsyncMock(side_effect=lambda key, record: store.add(record)),
+        srem=AsyncMock(side_effect=lambda key, record: store.discard(record)),
         expire=AsyncMock(),
-        smembers=AsyncMock(side_effect=lambda key: sets.get(key, set())),
+        smembers=AsyncMock(side_effect=lambda key: set(store)),
     )
 
+
+@pytest.mark.asyncio
+async def test_a_started_operation_records_its_helper_until_it_is_forgotten():
+    store: set[str] = set()
+    redis = _set_redis(store)
     operation_id = UUID("01234567-89ab-4def-8123-456789abcdef")
+
     await note_started_storage_helper(redis, "executor-1", operation_id)
 
-    assert await started_storage_helpers(redis, "executor-1") == {BACKUP_HELPER}
-    assert await started_storage_helpers(redis, "executor-2") == set()
+    assert await started_storage_helpers(redis, "executor-1", None) == {BACKUP_HELPER}
     redis.expire.assert_awaited_once()
+    await forget_storage_helper(redis, "executor-1", operation_id)
+    assert await started_storage_helpers(redis, "executor-1", None) == set()

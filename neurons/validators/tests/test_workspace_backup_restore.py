@@ -295,11 +295,15 @@ async def test_cancel_storage_operation_pins_the_host_key(monkeypatch):
         operation_id="11111111-1111-4111-8111-111111111111",
     )
 
-    await MinerService.__new__(MinerService).handle_cancel_storage_operation_req(
+    miner = MinerService.__new__(MinerService)
+    miner.redis_service = AsyncMock(smembers=AsyncMock(return_value=set()))
+    await miner.handle_cancel_storage_operation_req(
         _executor_info(), payload, Mock(), _docker_service_with_pinned_hosts()
     )
 
     assert connect.call_args.kwargs["known_hosts"] is KNOWN_HOSTS
+    # DAH-6148: the cancelled operation's helper is forgotten
+    miner.redis_service.smembers.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -471,9 +475,9 @@ async def _run_encrypted_restic_backup(monkeypatch, mountinfo: str):
     miner.redis_service = AsyncMock()  # DAH-6148: records the helper it starts
     await miner.handle_backup_container_req(_executor_info(), payload, Mock(), docker_service)
     start.assert_awaited_once()
-    miner.redis_service.sadd.assert_awaited_once_with(
-        "started_storage_helpers:" + _executor_info().uuid, "lium-storage-11111111-111"
-    )
+    key, record = miner.redis_service.sadd.await_args.args
+    assert key == "started_storage_helpers:" + _executor_info().uuid
+    assert record.startswith("lium-storage-11111111-111|")
     return docker_service.setup_encrypted_local_volume
 
 

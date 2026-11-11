@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import shlex
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -19,11 +20,16 @@ REMOTE_RUNNER_PATH = "/root/app/src/storage_runner.py"
 REMOTE_SECRETS_DIRECTORY = PurePosixPath("/root/app/storage-secrets")
 
 # DAH-6148: an operation runs restic in a `lium-storage-<operation id[:12]>` helper container on
-# the node. The names of the helpers this validator started are kept per executor, so the
-# provider-side load check excuses exactly those, never a container that only wears the prefix.
+# the node. The helpers this validator started are kept per executor, so the provider-side load
+# check excuses exactly those, never a container that only wears the prefix. A record is
+# "name|started|container id": the id is the container first seen running under that name, and
+# from then on only that container is excused, so a same-name container started after the
+# helper ends is the provider's.
 STORAGE_HELPER_PREFIX = "lium-storage-"
 STARTED_STORAGE_HELPERS_PREFIX = "started_storage_helpers:"
-STARTED_STORAGE_HELPERS_TTL_SECONDS = 24 * 3600
+# the backend fails a backup still open after 4 h (BACKUP_AUTH_TOKEN_EXPIRY_HOURS): no helper
+# legitimately outlives that, so no record does either
+STARTED_STORAGE_HELPERS_TTL_SECONDS = 4 * 3600
 _STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC = 2
 
 
@@ -31,35 +37,86 @@ def storage_helper_name(operation_id: UUID | str) -> str:
     return f"{STORAGE_HELPER_PREFIX}{str(operation_id)[:12]}"
 
 
+def _key(executor_id: str) -> str:
+    return f"{STARTED_STORAGE_HELPERS_PREFIX}{executor_id}"
+
+
+async def _redis_call(what: str, call) -> bool:
+    """Best effort: Redis down or slow leaves the records as they are (an unrecorded helper's
+    cores stay on the provider, as before DAH-6148)."""
+    try:
+        await asyncio.wait_for(call(), timeout=_STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Storage helper records: %s failed: %s", what, exc)
+        return False
+
+
+async def _records(redis, executor_id: str) -> list[str]:
+    members = await redis.smembers(_key(executor_id))
+    return [m.decode() if isinstance(m, bytes) else str(m) for m in members or ()]
+
+
 async def note_started_storage_helper(redis, executor_id: str, operation_id: UUID | str) -> None:
-    """Records the helper an operation started on this executor. Best effort: unrecorded, its
-    cores stay on the provider, as before DAH-6148."""
-    key = f"{STARTED_STORAGE_HELPERS_PREFIX}{executor_id}"
+    """Records the helper an operation is starting on this executor."""
 
     async def note() -> None:
-        await redis.sadd(key, storage_helper_name(operation_id))
-        await redis.expire(key, STARTED_STORAGE_HELPERS_TTL_SECONDS)
+        record = f"{storage_helper_name(operation_id)}|{int(time.time())}|"
+        await redis.sadd(_key(executor_id), record)
+        await redis.expire(_key(executor_id), STARTED_STORAGE_HELPERS_TTL_SECONDS)
 
-    try:
-        await asyncio.wait_for(note(), timeout=_STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "Storage helper of %s not recorded for %s: %s", operation_id, executor_id, exc
-        )
+    await _redis_call(f"record {operation_id} on {executor_id}", note)
 
 
-async def started_storage_helpers(redis, executor_id: str) -> set[str]:
-    """The helpers this validator started on the executor in the last day; empty when Redis does
-    not answer."""
-    try:
-        members = await asyncio.wait_for(
-            redis.smembers(f"{STARTED_STORAGE_HELPERS_PREFIX}{executor_id}"),
-            timeout=_STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Started storage helpers unreadable for %s: %s", executor_id, exc)
+async def forget_storage_helper(redis, executor_id: str, operation_id: UUID | str) -> None:
+    """The operation ended where the validator saw it end (launch failure, cancel, a bootstrap
+    restore it waited for): its helper is no longer Lium's."""
+    name = storage_helper_name(operation_id)
+
+    async def forget() -> None:
+        for record in await _records(redis, executor_id):
+            if record.split("|", 1)[0] == name:
+                await redis.srem(_key(executor_id), record)
+
+    await _redis_call(f"forget {operation_id} on {executor_id}", forget)
+
+
+async def started_storage_helpers(
+    redis, executor_id: str, running: dict[str, str] | None
+) -> set[str]:
+    """The keys to excuse for this validator's helpers on the executor: a helper not yet seen
+    running by its name, a seen one by its container id only.
+
+    `running` maps this cycle's helper-named containers to their ids; None when the scrape
+    listed no containers, which then changes no record. A record past the TTL is dropped, and so
+    is a seen helper whose container is gone or replaced: its operation ended. Empty when Redis
+    does not answer.
+    """
+    keys: set[str] = set()
+
+    async def settle() -> None:
+        now = int(time.time())
+        for record in await _records(redis, executor_id):
+            name, _, rest = record.partition("|")
+            started, _, seen_id = rest.partition("|")
+            current_id = (running or {}).get(name)
+            age = now - int(started) if started.isdigit() else None
+            expired = age is None or age > STARTED_STORAGE_HELPERS_TTL_SECONDS
+            ended = running is not None and seen_id and current_id != seen_id
+            if expired or ended:
+                await redis.srem(_key(executor_id), record)
+            elif seen_id:
+                keys.add(seen_id)
+            elif current_id:
+                await redis.srem(_key(executor_id), record)
+                await redis.sadd(_key(executor_id), f"{name}|{started}|{current_id}")
+                keys.add(current_id)
+            else:
+                keys.add(name)  # starting: its container is not up yet
+
+    if not await _redis_call(f"read helpers of {executor_id}", settle):
         return set()
-    return {m.decode() if isinstance(m, bytes) else str(m) for m in members or ()}
+    return keys
 
 
 class StorageOperationLaunchError(RuntimeError):
