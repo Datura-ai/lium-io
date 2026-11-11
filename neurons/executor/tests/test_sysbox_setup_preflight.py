@@ -476,7 +476,7 @@ def test_fusermount3_without_a_profile_or_with_the_rule_passes(tmp_path, files):
 
 
 def test_install_mode_stops_on_a_stopped_rental(tmp_path):
-    # a renter's stopped pod is still a rental; the upgrade path removes every stopped container
+    # a renter's stopped pod is still a rental
     proc = run_script(tmp_path, env={"STUB_SYSBOX_VERSION": "0.6.6", "STUB_STOPPED_POD": "pod_abc123"})
     assert proc.returncode == 1
     assert "Rentals found (pod_* containers, running or stopped). Cannot proceed." in proc.stdout
@@ -496,8 +496,7 @@ def test_install_mode_keeps_the_default_job(tmp_path):
     assert "Unknown containers found" not in proc.stdout
     calls = (tmp_path / "root/.stub-docker/calls").read_text().splitlines()
     assert "stop filler_abc" in calls
-    assert "rm -f bbb" in calls
-    assert not [c for c in calls if c.startswith("rm -f") and "aaa" in c]
+    assert not [c for c in calls if c.startswith("rm")]  # the provider's stopped containers are kept
 
 
 def test_install_mode_keeps_a_default_job_that_was_already_stopped(tmp_path):
@@ -506,7 +505,7 @@ def test_install_mode_keeps_a_default_job_that_was_already_stopped(tmp_path):
     assert "Docker is clear for sysbox installation." in proc.stdout, proc.stdout + proc.stderr
     calls = (tmp_path / "root/.stub-docker/calls").read_text().splitlines()
     assert "stop filler_abc" in calls
-    assert "rm -f bbb" in calls
+    assert not [c for c in calls if c.startswith("rm")]
 
 
 def test_install_mode_loads_the_iptables_modules_itself(tmp_path):
