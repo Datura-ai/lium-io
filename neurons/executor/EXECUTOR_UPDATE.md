@@ -49,20 +49,18 @@ The answer is `{"miner_hotkey": "<ss58>", "nonce": "<the nonce sent>"}`, plus `"
 If the node is behind, run this on the host. A `lium mine` installation puts the checkout at `compute-subnet` under the directory where `lium mine` was run, usually the home directory. For a manual installation, replace the first path with the directory that holds `neurons/executor/docker-compose.yml`:
 
 ```bash
-cd ~/compute-subnet/neurons/executor && git pull && docker compose pull watchtower && docker compose up -d watchtower
+cd ~/compute-subnet/neurons/executor && git pull && docker compose pull watchtower && docker compose up -d
 ```
 
 What the command does:
 
 1. `git pull` brings the current compose file with the digest-based updater. The checkout must be on the `main` branch: `git branch --show-current` prints `main`. If it prints another name, run `git checkout main` first.
 2. `docker compose pull watchtower` fetches the updater image and nothing else. A pull of the runner tag would return the mirror's old copy again, so the command does not ask for it.
-3. `docker compose up -d watchtower` replaces `nickfedor/watchtower` with the updater and does not touch the runner. The updater checks at start, pulls the current runner by digest and recreates the runner. The new runner then pulls the current executor image and recreates `executor-executor-1`.
+3. `docker compose up -d` replaces `nickfedor/watchtower` with the updater and recreates the runner from the compose file, or creates it on a host that has none (the updater cannot create a missing runner on this stack: it does not know where `.env` is). That runner can come from the mirror's old copy of the tag; the updater checks at start, pulls the current runner by digest and recreates the runner. The new runner then pulls the current executor image and recreates `executor-executor-1`.
 
-Pod containers are not part of the compose project, so the command does not touch them. The executor container restarts once, the pods keep running.
+Pod containers are not part of the compose project, so the command does not touch them. The executor container restarts once or twice, the pods keep running.
 
-A later `docker compose up -d` without a service name recreates the runner from the compose file too, because the runner's service definition changed. That is harmless: the updater brings the runner back to the signed digest at its next check.
-
-If `git pull` stops because of local changes to tracked files, run `git stash && git pull && git stash pop`. Then run `docker compose pull watchtower && docker compose up -d watchtower`. If `git stash pop` reports a conflict, send the output to Lium support.
+If `git pull` stops because of local changes to tracked files, run `git stash && git pull && git stash pop`. Then run `docker compose pull watchtower && docker compose up -d`. If `git stash pop` reports a conflict, send the output to Lium support.
 
 After about two minutes, make sure that both containers are up:
 

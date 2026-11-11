@@ -984,7 +984,7 @@ class PidHostRequiredMessages:
             "The executor must run with pid: host (see docker-compose.app.yml); encrypted pod backups and "
             "restores cannot run. Standard stack (one-time updater move, then wait 5 minutes): cd "
             "~/compute-subnet/neurons/executor && git pull && docker compose pull watchtower && docker compose "
-            "up -d watchtower. Custom stack: docker compose -f docker-compose.app.yml up -d --force-recreate."
+            "up -d. Custom stack: docker compose -f docker-compose.app.yml up -d --force-recreate."
         ),
     )
     RENTED_WARNING = MessageTemplate(
@@ -997,7 +997,7 @@ class PidHostRequiredMessages:
             "The executor must run with pid: host (see docker-compose.app.yml); encrypted pod backups and "
             "restores cannot run. Standard stack (one-time updater move, then wait 5 minutes): cd "
             "~/compute-subnet/neurons/executor && git pull && docker compose pull watchtower && docker compose "
-            "up -d watchtower. Custom stack: docker compose -f docker-compose.app.yml up -d --force-recreate."
+            "up -d. Custom stack: docker compose -f docker-compose.app.yml up -d --force-recreate."
         ),
     )
     OK = MessageTemplate(
