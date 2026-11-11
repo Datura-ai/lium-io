@@ -38,6 +38,10 @@ def _other_key() -> str:
         ("executor.example", "matching", True),
         ("executor.example", "mismatching", False),
         ("executor.example", "multiline", True),
+        # a registered key followed by an unregistered one would put both into known_hosts
+        ("executor.example", "appended", False),
+        # the validation cycle leaves this to NodeAccountCheck, which reports NODE_ACCOUNT_MISMATCH
+        ("executor.example", "mismatching-cycle", True),
         # an IP cannot be repointed by DNS; NodeAccountCheck skips it the same way
         ("192.0.2.10", "mismatching", True),
     ],
@@ -85,7 +89,10 @@ async def test_attestation_service_accepts_fixture_quote(monkeypatch, address, e
         executor_info.expected_ssh_host_key = fixture["host_key"]
     elif expected == "multiline":
         executor_info.expected_ssh_host_key = f"{_other_key()}\n{fixture['host_key']} recorded-comment\n"
-    elif expected == "mismatching":
+    elif expected == "appended":
+        executor_info.expected_ssh_host_key = fixture["host_key"]
+        executor_info.ssh_host_key = f"{fixture['host_key']}\n{_other_key()}"
+    elif expected.startswith("mismatching"):
         executor_info.expected_ssh_host_key = (
             asyncssh.generate_private_key("ssh-ed25519")
             .export_public_key("openssh").decode().strip()
@@ -95,7 +102,9 @@ async def test_attestation_service_accepts_fixture_quote(monkeypatch, address, e
             await service.prepare_host_policy(executor_info)
         return
 
-    host_policy = await service.prepare_host_policy(executor_info)
+    host_policy = await service.prepare_host_policy(
+        executor_info, check_registered_key=expected != "mismatching-cycle"
+    )
     assert host_policy.known_hosts is not None
     assert host_policy.attestation_digest is not None
     assert host_policy.tee_type == "dstack/tdx"

@@ -51,9 +51,11 @@ def registered_host_keys(executor) -> set[str]:
 
 
 def reports_registered_host_key(executor) -> bool:
-    """A hostname can be repointed at another machine: its reported key must be one the portal recorded."""
+    """A hostname can be repointed at another machine: every key it reports must be one the portal recorded
+    (known_hosts is built from all reported lines, so one unregistered line is enough to trust another machine)."""
     registered = registered_host_keys(executor)
-    return not registered or host_key_body(executor.ssh_host_key) in registered
+    reported = {host_key_body(line) for line in (executor.ssh_host_key or "").splitlines()} - {""}
+    return not registered or (bool(reported) and reported <= registered)
 
 
 class _CheckedAddresses(list):

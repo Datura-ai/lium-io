@@ -692,6 +692,8 @@ class AttestationService:
         self,
         executor: ExecutorSSHInfo,
         nonce: AttestationNonce | None = None,
+        *,
+        check_registered_key: bool = True,
     ) -> HostPolicyResult:
         """Verify TDX (and, when supplied, NVIDIA GPU) attestation and build the
         SSH known_hosts policy for the executor.
@@ -711,7 +713,7 @@ class AttestationService:
         should_verify = self._should_verify(executor)
 
         # before any policy is built: a rental pinned to an unregistered key would trust whatever machine the name points at
-        if not reports_registered_host_key(executor):
+        if check_registered_key and not reports_registered_host_key(executor):
             raise AttestationError(
                 f"Executor {executor.address}:{executor.port} reported an SSH host key that is not registered for its hostname"
             )
