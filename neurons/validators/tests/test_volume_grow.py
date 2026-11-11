@@ -668,3 +668,32 @@ async def test_host_free_bytes_reads_the_hosts_docker_root_through_pid_1():
     assert await host_free_bytes(ssh) == 123
     command = ssh.run.await_args.args[0]
     assert "h=/proc/1/root$r" in command and 'df -P -B1 "$h"' in command
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("removed_orphans", "free_published_gb"), [(1, 10), (0, 150)])
+async def test_a_pass_that_removed_volumes_caps_on_the_raw_read_without_the_scrapes_credit(
+    monkeypatch, removed_orphans, free_published_gb
+):
+    # scrape: 100 GB raw + a 200 GB orphan filler volume = 300 free; renters wrote 140, the sweep removed the orphan
+    # (free_before 160), the grow took 150 (free_after 10). The removed volume's credit is already in the raw read.
+    from dataclasses import replace
+
+    from services.task.checks import stale_container_cleanup as module
+    from services.task.checks.disk_space import KB_PER_GB
+
+    from tests.test_container_cleanup import _cleanup_check_ctx
+
+    monkeypatch.setattr(module, "pod_ids_at_endpoint", lambda *_: {"live"})
+    monkeypatch.setattr(module, "host_free_bytes", AsyncMock(side_effect=[160 * GB, 10 * GB]))
+    monkeypatch.setattr(
+        module, "grow_short_volumes", AsyncMock(return_value=GrowPass(allocated_bytes=150 * GB, attempted=True))
+    )
+    ctx = _cleanup_check_ctx([], [])
+    ctx.services.container_cleanup.remove_orphan_rental_volumes.return_value = removed_orphans
+    disk = {"hard_disk": {"free": 300 * KB_PER_GB, "used": 0, "utilization": 0, "filler_released": 200 * KB_PER_GB}}
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, specs=disk)})
+
+    result = await module.StaleContainerCleanupCheck().run(ctx)
+
+    assert result.updates["state"].specs["hard_disk"]["free"] == free_published_gb * KB_PER_GB

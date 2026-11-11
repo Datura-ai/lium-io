@@ -247,7 +247,11 @@ class StaleContainerCleanupCheck:
         # No read after a grow: the scrape can't bound what was written since, so publish no free disk this cycle
         # (the next scrape restores it) rather than a figure that may sit above the floor when the disk does not
         specs_after_grow = (
-            specs_after_disk_taken(ctx, taken, free_after if free_after is not None else 0) if grown.attempted else None
+            specs_after_disk_taken(
+                ctx, taken, free_after if free_after is not None else 0, scrape_credit_held=not removed_orphan_volumes
+            )
+            if grown.attempted
+            else None
         )
 
         event = render_message(
