@@ -131,12 +131,12 @@ async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardH
     every_card_tied = every_card_named and all(isinstance(gpu.get("pci_bus_id"), str) for gpu in listed)
     seen = xid.get("count") if xid.get("available") and every_card_tied else before.xid_seen
     downgraded_before = {_card_uuid(s) for s in before.pcie_downgrades} - {None}
-    new = xid_faults + [s for s in downgrades if _card_uuid(s) in downgraded_before]
+    confirmed_this_read = xid_faults + [s for s in downgrades if _card_uuid(s) in downgraded_before]
     held = [f for f in before.held if not _held_fault_proven_healed(f, gpus, every_card_named, rebooted)]
     # one fault per card and kind, this read's first: a card repeating an Xid must not grow the stored state,
     # and a link fault healing must not close the same card's Xid, which needs its own proof
     by_card: dict[tuple[str, str], str] = {}
-    for fault in new + held:
+    for fault in confirmed_this_read + held:
         uuid = _card_uuid(fault)
         if uuid is not None:
             by_card.setdefault((uuid, _fault_kind(fault)), fault)

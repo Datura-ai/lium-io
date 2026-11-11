@@ -435,8 +435,8 @@ class RentedGpuDropCheck:
             broken_uuids, hw_uuids, updates = None, None, {}
             drop: GpuDrop | None = _scrape_timeout_drop(rented_total, anchor_uuids)
         else:
-            memory = await _read_broken_uuids(ctx)
-            broken_uuids, hw_uuids, updates = memory.uuids, memory.hw_uuids, memory.updates
+            broken_cards = await _read_broken_uuids(ctx)
+            broken_uuids, hw_uuids, updates = broken_cards.uuids, broken_cards.hw_uuids, broken_cards.updates
             drop = judge_rented_gpus(
                 rented_gpu_count=rented_total,
                 anchor_uuids=anchor_uuids,
