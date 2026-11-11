@@ -1,6 +1,7 @@
 """DAH-2734: provider-side CPU/disk gate — the twin of the DAH-2735 foreign-GPU gate."""
 import asyncio
 import os
+import subprocess
 import time
 from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,6 +25,7 @@ from neurons.validators.src.services.task.checks.provider_side_load import (
 from neurons.validators.src.services.task.pipeline import ContextState
 from neurons.validators.src.services.task.messages import ProviderSideLoadMessages as Msg
 
+from neurons.validators.src.services import storage_operations
 from neurons.validators.src.services.storage_operations import (
     StorageHelperRecord,
     forget_storage_helper,
@@ -1017,8 +1019,6 @@ async def test_a_started_operation_records_its_helper_until_it_is_forgotten():
     ids=["no_files", "spec_only", "live_pid", "dead_pid", "ended_with_status"],
 )
 def test_the_node_command_reads_each_operation_state(tmp_path, files, expected):
-    import subprocess
-
     for suffix, content in files.items():
         (tmp_path / f"{OPERATION}.{suffix}").write_text(content)
     command = operation_states_command([str(OPERATION)]).replace(
@@ -1033,8 +1033,6 @@ def test_the_node_command_reads_each_operation_state(tmp_path, files, expected):
 @pytest.mark.asyncio
 async def test_a_node_read_slower_than_the_redis_timeout_still_excuses(monkeypatch):
     # only the Redis calls are cut at their short timeout; the node read has its own
-    from neurons.validators.src.services import storage_operations
-
     monkeypatch.setattr(storage_operations, "_STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC", 0.05)
     store = {f"{OPERATION}|{int(time.time())}"}
 

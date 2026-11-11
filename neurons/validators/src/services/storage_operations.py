@@ -120,7 +120,7 @@ def operation_states_command(operation_ids: list[str]) -> str:
     """One `<operation id> <state>` line per operation, the state as `_operation_state` reads it,
     except that STARTING with no spec file reads GONE: the operation either has not been written
     yet or has ended (an online one removes its status, pid and spec when it ends)."""
-    lines = []
+    lines: list[str] = []
     for op in operation_ids:
         files = StorageOperationFiles.for_operation(UUID(op))
         lines.append(
@@ -155,15 +155,15 @@ async def settle_excused_storage_helper_keys(
     Unreadable states keep every record and
     excuse nothing this cycle, and so does Redis not answering.
     """
-    raws: list[str] = []
+    raw_records: list[str] = []
 
-    async def read() -> None:
-        raws.extend(await _raw_records(redis, executor_id))
+    async def read_raw_records() -> None:
+        raw_records.extend(await _raw_records(redis, executor_id))
 
-    if not await _redis_call(f"read helpers of {executor_id}", read):
+    if not await _redis_call(f"read helpers of {executor_id}", read_raw_records):
         return set()
     now = int(time.time())
-    records = {raw: StorageHelperRecord.parse(raw) for raw in raws}
+    records = {raw: StorageHelperRecord.parse(raw) for raw in raw_records}
     unexpired_records = {
         raw: record
         for raw, record in records.items()
@@ -187,12 +187,12 @@ async def settle_excused_storage_helper_keys(
                 # GONE in the grace may still be about to launch: kept, but excuses nothing
                 ended.append(raw)
 
-    async def drop() -> None:
+    async def drop_ended_records() -> None:
         for raw in ended:
             await redis.srem(_key(executor_id), raw)
 
     if ended:
-        await _redis_call(f"drop ended helpers of {executor_id}", drop)
+        await _redis_call(f"drop ended helpers of {executor_id}", drop_ended_records)
     return keys
 
 
