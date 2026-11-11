@@ -64,6 +64,18 @@ def _stub(bin_dir, name, body):
     path.chmod(0o755)
 
 
+def _xfs(bin_dir, log, before, after):
+    """xfs_info answers `before` until xfs_growfs ran, then `after`."""
+    grew = bin_dir / "grew"
+    _stub(bin_dir, "xfs_growfs", f'echo "xfs_growfs $*" >> {log}; touch {grew}')
+    _stub(
+        bin_dir,
+        "xfs_info",
+        f"b={before // 4096}; [ -e {grew} ] && b={after // 4096}; "
+        'echo "meta-data=/dev/loop7 isize=512 agcount=4"; echo "data     =   bsize=4096   blocks=$b, imaxpct=25"',
+    )
+
+
 @pytest.mark.parametrize(
     ("cur_gb", "alloc_gb", "avail_gb", "sparse", "outcome", "grow_call"),
     [
@@ -119,8 +131,9 @@ def test_the_host_script_grows_up_to_the_order_and_never_into_the_headroom(
         "df",
         f'echo "Filesystem 1-blocks Used Available Use% Mounted"; echo "/dev/x 0 0 {avail_gb * GB} 0% /"',
     )
-    for tool in ("fallocate", "truncate", "xfs_growfs"):
+    for tool in ("fallocate", "truncate"):
         _stub(tmp_path, tool, f'echo "{tool} $*" >> {log}')
+    _xfs(tmp_path, log, before=cur_gb * GB, after=int(outcome.split()[-1]))
 
     result = subprocess.run(
         ["sh", "-c", GROW_SCRIPT, "grow", "/mnt/volume_live", str(466 * GB), str(10 * GB), sparse],
@@ -221,3 +234,64 @@ def test_the_host_script_reads_the_allocated_size_before_free_disk(tmp_path):
     )
 
     assert log.read_text().split("\n").index("df") > log.read_text().split("\n").index("stat %B")
+
+
+@pytest.mark.parametrize(("cur_gb", "outcome"), [(466, "full"), (300, "no-room")])
+def test_a_file_extended_by_a_pass_whose_xfs_growfs_failed_is_grown_on_the_next(
+    tmp_path, cur_gb, outcome
+):
+    # the file is already at its size, so the size check alone would stop before the filesystem ever caught up
+    log = tmp_path / "calls"
+    _stub(tmp_path, "findmnt", "echo /dev/loop7")
+    _stub(
+        tmp_path,
+        "losetup",
+        f'[ "$1" = -c ] && echo "losetup $*" >> {log} || echo /data/volume_live',
+    )
+    _stub(
+        tmp_path,
+        "stat",
+        f'case "$2" in %s) echo {cur_gb * GB};; %b) echo {cur_gb * GB // 512};; %B) echo 512;; esac',
+    )
+    _stub(tmp_path, "df", 'echo h; echo "/dev/x 0 0 0 0% /"')
+    _xfs(tmp_path, log, before=110 * GB, after=cur_gb * GB)
+
+    result = subprocess.run(
+        ["sh", "-c", GROW_SCRIPT, "grow", "/mnt/volume_live", str(466 * GB), str(10 * GB), "false"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+    )
+
+    assert (result.stdout.strip(), log.read_text().splitlines()) == (
+        f"{outcome} {cur_gb * GB}",
+        ["losetup -c /dev/loop7", "xfs_growfs /mnt/volume_live"],
+    )
+
+
+def test_the_reported_size_is_the_filesystems_not_the_files(tmp_path):
+    log = tmp_path / "calls"
+    _stub(tmp_path, "findmnt", "echo /dev/loop7")
+    _stub(
+        tmp_path,
+        "losetup",
+        f'[ "$1" = -c ] && echo "losetup $*" >> {log} || echo /data/volume_live',
+    )
+    _stub(
+        tmp_path,
+        "stat",
+        f'case "$2" in %s) echo {110 * GB};; %b) echo {110 * GB // 512};; %B) echo 512;; esac',
+    )
+    _stub(tmp_path, "df", f'echo h; echo "/dev/x 0 0 {500 * GB} 0% /"')
+    _stub(tmp_path, "fallocate", "true")
+    # the grow of the file worked, xfs_growfs ran but the filesystem stayed at 110 GB
+    _xfs(tmp_path, log, before=110 * GB, after=110 * GB)
+
+    result = subprocess.run(
+        ["sh", "-c", GROW_SCRIPT, "grow", "/mnt/volume_live", str(466 * GB), str(10 * GB), "false"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+    )
+
+    assert result.stdout.strip() == f"grown {110 * GB}"

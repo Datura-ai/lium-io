@@ -21,7 +21,7 @@ _GB = 1024**3
 # Runs in the host's mount namespace: the volume's mount (under the plugin's propagated-mount) and backing file are
 # host paths. Grows only, by whole
 # 4 KiB sectors (the v3 plugin's loop sector size), never past the order or into the headroom. Prints the outcome and,
-# when it read one, the volume's size in bytes after it.
+# when it read one, the volume's filesystem size in bytes after it (what the renter can use, not the file's size).
 GROW_SCRIPT = r"""
 set -eu
 mp=$1 order=$2 headroom=$3 sparse=$4
@@ -31,7 +31,17 @@ file=$(losetup -n -O BACK-FILE "$dev")
 # the plugin opens it from its own rootfs, where the host's / is /srv
 [ -e "$file" ] || file=${file#/srv}
 cur=$(stat -c %s "$file")
-if [ "$cur" -ge "$order" ]; then echo full "$cur"; exit 0; fi
+# the filesystem's size (xfs data section), or the file's when it cannot be read
+fs_size() { s=$(xfs_info "$mp" 2>/dev/null | awk '/^data/ {for (i = 1; i <= NF; i++) {
+  if ($i ~ /^bsize=/) b = substr($i, 7); if ($i ~ /^blocks=/) n = substr($i, 8) + 0 }; printf "%.0f", n * b; exit}') || s=
+  [ -n "$s" ] && [ "$s" -gt 0 ] && echo "$s" || echo "$1"; }
+fs=$cur
+if command -v xfs_growfs >/dev/null 2>&1; then
+  fs=$(fs_size "$cur")
+  # an earlier pass extended the file but its xfs_growfs failed: finish that grow before anything else
+  if [ "$fs" -lt "$cur" ]; then losetup -c "$dev"; xfs_growfs "$mp" >/dev/null; fs=$(fs_size "$cur"); fi
+fi
+if [ "$cur" -ge "$order" ]; then echo full "$fs"; exit 0; fi
 command -v xfs_growfs >/dev/null 2>&1 || { echo no-xfs-growfs "$cur"; exit 0; }
 # allocated, not apparent, size: a sparse file's unwritten space is already in avail (counting it twice grows the
 # volume every pass); for a preallocated file the two are the same. Read before avail: a renter write in between
@@ -41,11 +51,11 @@ avail=$(df -P -B1 "$(dirname "$file")" | awk 'NR==2 {print $4}')
 target=$((alloc + avail - headroom))
 if [ "$target" -gt "$order" ]; then target=$order; fi
 target=$((target / 4096 * 4096))
-if [ "$target" -le "$cur" ]; then echo no-room "$cur"; exit 0; fi
+if [ "$target" -le "$cur" ]; then echo no-room "$fs"; exit 0; fi
 if [ "$sparse" = true ]; then truncate -s "$target" "$file"; else fallocate -o "$cur" -l $((target - cur)) "$file"; fi
 losetup -c "$dev"
 xfs_growfs "$mp" >/dev/null
-echo grown "$target"
+echo grown "$(fs_size "$target")"
 """
 
 
