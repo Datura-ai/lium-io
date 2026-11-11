@@ -19,6 +19,7 @@ from services.container_cleanup import rented_list_unknown_reason
 from services.redis_service import CLEANUP_SEEN_EXECUTORS_SET
 from services.volume_grow import (
     GROW_PASS_MAX_SECONDS,
+    SSH_CALL_TIMEOUT_SECONDS,
     GrowPass,
     grow_short_volumes,
     host_free_bytes,
@@ -129,8 +130,15 @@ class StaleContainerCleanupCheck:
             if rented_list_unknown is None
             else set()
         )
+        # the grow and both disk reads share one budget, half the task's time left at most, so the rental checks and
+        # state publication after this check always keep the other half
+        grow_deadline = time.monotonic() + min(GROW_PASS_MAX_SECONDS, task_seconds_left(ctx) / 2)
         # read before any removal: a pass that grows judges the disk by what it measures, releases included
-        free_before = await host_free_bytes(ctx.ssh) if grow_pod_ids else None
+        free_before = (
+            await host_free_bytes(ctx.ssh, min(SSH_CALL_TIMEOUT_SECONDS, grow_deadline - time.monotonic()))
+            if grow_pod_ids
+            else None
+        )
         confirmed: set[str] = set()  # names the backend's record shows were this node's ended Lium workload
         lookups = {"made": 0, "skipped": 0}
         # labelled removals holding a GPU process: each has a lookup slot kept for its exemption
@@ -204,8 +212,8 @@ class StaleContainerCleanupCheck:
 
         # DAH-6073: a live pod granted less disk than it ordered (another renter's kept volume held the space) gets
         # the rest once the disk is free; only on a known rented list, so a retained or orphan volume is never grown
-        # bounded, and to half the task's time left at most, so the rental checks and state publication after it run
-        grow_budget = min(GROW_PASS_MAX_SECONDS, task_seconds_left(ctx) / 2)
+        # bounded by the shared budget above, keeping a disk read's worth for the measurement after it
+        grow_budget = grow_deadline - time.monotonic() - SSH_CALL_TIMEOUT_SECONDS
         grown = (
             await grow_short_volumes(ctx.ssh, grow_pod_ids, grow_budget)
             if grow_pod_ids and grow_budget > 0
@@ -225,8 +233,14 @@ class StaleContainerCleanupCheck:
 
         # the grow took disk the scrape counted free: the listing and the paid GPU count must judge what is left.
         # Measured after the whole pass, so the removals' releases and a grow whose report was lost (a timeout) count
-        free_after = await host_free_bytes(ctx.ssh) if grown.attempted and free_before is not None else None
-        taken = free_before - free_after if free_after is not None else grown.allocated_bytes
+        # A grow whose report never came back may still take up to its order after the read, so its order counts too
+        free_after = (
+            await host_free_bytes(ctx.ssh, min(SSH_CALL_TIMEOUT_SECONDS, grow_deadline - time.monotonic()))
+            if grown.attempted and free_before is not None
+            else None
+        )
+        measured = free_before - free_after if free_after is not None else grown.allocated_bytes
+        taken = measured + grown.unreported_bytes
         specs_after_grow = specs_after_disk_taken(ctx, taken) if grown.attempted else None
 
         event = render_message(

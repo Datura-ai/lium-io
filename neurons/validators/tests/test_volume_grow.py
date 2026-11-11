@@ -13,6 +13,7 @@ from services.volume_grow import (
     GROW_SCRIPT,
     ORDER_LABEL,
     grow_short_volumes,
+    host_free_bytes,
     order_labels,
 )
 
@@ -380,6 +381,8 @@ async def test_a_stalled_resize_ends_the_pass_at_its_budget_with_the_sizes_it_ha
     )
 
     assert grown.sizes_gb == {"done": 466}
+    # the stalled grow may still allocate on the host: its order stays counted as taken
+    assert grown.unreported_bytes == 466 * GB
     assert all("timeout" in call.kwargs for call in ssh.run.await_args_list)
 
 
@@ -504,18 +507,22 @@ def test_a_pass_that_released_more_than_it_took_lists_on_the_disk_now_free(conte
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("free_reads_gb", "reported_gb", "free_after_gb"),
+    ("free_reads_gb", "reported_gb", "unreported_gb", "free_after_gb"),
     [
         # the grow took 60 GB, the removals before it gave 30 GB back: the measured net is what is gone
-        ((70, 40), 60, 40),
-        # the grow's report was lost to a timeout after it allocated: the measurement still sees it
-        ((70, 10), 0, 10),
+        ((70, 40), 60, 0, 40),
+        # the grow's report was lost after it allocated, the read after it saw the disk go
+        ((70, 10), 0, 0, 10),
         # no measurement: what the grows reported
-        ((None, None), 60, 10),
+        ((None, None), 60, 0, 10),
+        # no measurement and the report lost: its order counts as taken, never the pre-grow capacity
+        ((None, None), 0, 60, 10),
+        # measured, but a grow with no report may still be allocating after the read: its order counts too
+        ((70, 50), 0, 40, 10),
     ],
 )
 async def test_the_cleanup_pass_judges_the_disk_it_measured_around_the_whole_pass(
-    monkeypatch, free_reads_gb, reported_gb, free_after_gb
+    monkeypatch, free_reads_gb, reported_gb, unreported_gb, free_after_gb
 ):
     from dataclasses import replace
 
@@ -530,7 +537,11 @@ async def test_the_cleanup_pass_judges_the_disk_it_measured_around_the_whole_pas
     monkeypatch.setattr(
         module,
         "grow_short_volumes",
-        AsyncMock(return_value=GrowPass(allocated_bytes=reported_gb * GB, attempted=True)),
+        AsyncMock(
+            return_value=GrowPass(
+                allocated_bytes=reported_gb * GB, attempted=True, unreported_bytes=unreported_gb * GB
+            )
+        ),
     )
     ctx = _cleanup_check_ctx([], [])
     disk = {"hard_disk": {"free": 70 * KB_PER_GB, "used": 30 * KB_PER_GB, "utilization": 30}}
@@ -539,3 +550,22 @@ async def test_the_cleanup_pass_judges_the_disk_it_measured_around_the_whole_pas
     result = await module.StaleContainerCleanupCheck().run(ctx)
 
     assert result.updates["state"].specs["hard_disk"]["free"] == free_after_gb * KB_PER_GB
+
+
+@pytest.mark.asyncio
+async def test_with_no_task_time_left_the_pass_neither_measures_nor_grows(monkeypatch):
+    from services.task.checks import stale_container_cleanup as module
+
+    from tests.test_container_cleanup import _cleanup_check_ctx
+
+    ssh = SimpleNamespace(run=AsyncMock())
+    grow = AsyncMock(return_value=GrowPass())
+    monkeypatch.setattr(module, "pod_ids_at_endpoint", lambda *_: {"live"})
+    monkeypatch.setattr(module, "task_seconds_left", lambda _ctx: 0)
+    monkeypatch.setattr(module, "grow_short_volumes", grow)
+
+    await module.StaleContainerCleanupCheck().run(_cleanup_check_ctx([], []))
+
+    grow.assert_not_called()
+    assert await host_free_bytes(ssh, 0) is None
+    ssh.run.assert_not_called()

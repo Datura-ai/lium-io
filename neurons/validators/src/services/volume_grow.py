@@ -106,6 +106,9 @@ class GrowPass:
     allocated_bytes: int = 0
     # a grow script was started: it may have taken disk even when its report was lost (a timeout)
     attempted: bool = False
+    # the orders of grows whose report never came back (cancelled, timed out or the call failed): each may still
+    # take up to its order on the host after the pass, so the cycle counts it as taken
+    unreported_bytes: int = 0
 
 
 def pod_ids_at_endpoint(
@@ -123,13 +126,19 @@ def pod_ids_at_endpoint(
     }
 
 
-async def host_free_bytes(ssh_client: asyncssh.SSHClientConnection) -> int | None:
-    """Free bytes on the filesystem under docker's root, where the volumes' backing files live; None when unread."""
+async def host_free_bytes(
+    ssh_client: asyncssh.SSHClientConnection, timeout_seconds: float = SSH_CALL_TIMEOUT_SECONDS
+) -> int | None:
+    """Free bytes on the filesystem under docker's root, where the volumes' backing files live; None when unread
+    or out of time."""
+    if timeout_seconds <= 0:
+        return None
     try:
-        result = await ssh_client.run(
-            "df -P -B1 \"$(/usr/bin/docker info -f '{{.DockerRootDir}}')\" | awk 'NR==2 {print $4}'",
-            timeout=SSH_CALL_TIMEOUT_SECONDS,
-        )
+        async with asyncio.timeout(timeout_seconds):
+            result = await ssh_client.run(
+                "df -P -B1 \"$(/usr/bin/docker info -f '{{.DockerRootDir}}')\" | awk 'NR==2 {print $4}'",
+                timeout=timeout_seconds,
+            )
     except Exception:  # noqa: BLE001 - unread: the caller falls back to what the grows reported
         return None
     free = (result.stdout or "").strip()
@@ -224,11 +233,13 @@ async def _grow_short_volumes(
             + " ".join(map(shlex.quote, args))
         )
         grow.attempted = True
+        grow.unreported_bytes += int(order_gb) * _GB  # until its report comes back (a cancel leaves it counted)
         try:
             result = await ssh_client.run(command, timeout=RESIZE_TIMEOUT_SECONDS + 15)
         except Exception as exc:  # noqa: BLE001
             logger.warning(_m("volume_grow_failed", extra={"volume_name": name, "error": str(exc)}))
             continue
+        grow.unreported_bytes -= int(order_gb) * _GB
         lines = (result.stdout or "").strip().splitlines()
         allocated = [line.split()[-1] for line in lines if line.startswith("allocated ")]
         grow.allocated_bytes += sum(int(n) for n in allocated if n.isdigit())
