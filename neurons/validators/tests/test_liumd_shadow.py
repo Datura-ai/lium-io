@@ -332,6 +332,57 @@ async def test_facts_are_compared_when_both_sides_have_them(keypair, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_containers_churned_since_the_scrape_are_not_drift(
+    keypair, monkeypatch, verifyx_service
+):
+    # Prod 11 Nov: the check's own pod_<uuid> and a rotating monitor read as drift.
+    specs = {
+        **SPECS,
+        "docker": {
+            "containers": [
+                {"name": "executor-1", "container_id": "c1"},
+                {"name": "monitor-old", "container_id": "c2"},
+            ]
+        },
+    }
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=build_state(specs=specs))
+    later = datetime.now(UTC).isoformat().replace("+00:00", "123Z")
+    fake = FakeLiumd(
+        facts={
+            "docker": {
+                "data": {
+                    "containers": [
+                        {"name": "executor-1", "status": "running", "created": "2026-01-01T00:00:00Z"},
+                        {"name": "pod_x", "status": "running", "created": later},
+                        {"name": "monitor-new", "status": "running", "created": later},
+                    ]
+                },
+            }
+        }
+    )
+
+    record = await _shadow(ctx, fake)
+
+    entry = {c["field"]: c for c in record["facts"]}["docker.container_names"]
+    assert entry["agree"] is True and entry["liumd"] == ["executor-1"]
+    assert entry["created_since_start"] == ["monitor-new", "pod_x"]
+    assert entry["removed_since_scrape"] == ["monitor-old"]
+
+
+@pytest.mark.asyncio
+async def test_a_running_container_liumd_misses_is_still_drift(keypair, monkeypatch, verifyx_service):
+    specs = {**SPECS, "docker": {"containers": [{"name": "executor-1", "container_id": "c1"}]}}
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=build_state(specs=specs))
+    fake = FakeLiumd(
+        facts={"docker": {"data": {"containers": [{"name": "executor-1", "status": "exited"}]}}}
+    )
+
+    record = await _shadow(ctx, fake)
+
+    assert record["facts_agree"] is False
+
+
+@pytest.mark.asyncio
 async def test_fact_values_are_capped_in_the_log(keypair, monkeypatch, verifyx_service):
     long_name = "n" * (DETAIL_MAX_CHARS * 2)
     specs = {**SPECS, "docker": {"containers": [{"name": long_name, "container_id": "c1"}]}}

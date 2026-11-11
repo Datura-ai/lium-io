@@ -33,6 +33,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable
 
 from datura.requests.validator_requests import MatmulStep, VerifyXStep
@@ -444,18 +445,29 @@ def _logged_fact(value: Any) -> Any:
     return value if len(text) <= DETAIL_MAX_CHARS else text[:DETAIL_MAX_CHARS]
 
 
+def _created_after(created: Any, since: float) -> bool:
+    """Whether docker's RFC 3339 `Created` is after `since` (epoch seconds); unparsable is not."""
+    if not isinstance(created, str):
+        return False
+    try:
+        return datetime.fromisoformat(created).timestamp() > since
+    except ValueError:
+        return False
+
+
 def _facts(ctx: Context, answer: LocalVerifyAnswer) -> dict[str, Any]:
     """Compare the facts both paths collect. Missing or skipped data is not a mismatch."""
     specs = ctx.state.specs or {}
     checks: list[dict[str, Any]] = []
 
-    def check(field: str, liumd: Any, python: Any) -> None:
+    def check(field: str, liumd: Any, python: Any, **notes: Any) -> None:
         checks.append(
             {
                 "field": field,
                 "liumd": _logged_fact(liumd),
                 "python": _logged_fact(python),
                 "agree": liumd == python,
+                **{k: _logged_fact(v) for k, v in notes.items() if v},
             }
         )
 
@@ -468,13 +480,26 @@ def _facts(ctx: Context, answer: LocalVerifyAnswer) -> dict[str, Any]:
     ):
         # liumd lists every container; today's scrape lists the running ones, and `specs` is the
         # miner's raw machine JSON, so read it through the check that owns that shape.
+        # liumd runs minutes after the scrape, so containers started or removed in between
+        # (the check's own pod_<uuid>, a provider's rotating monitor) are churn, not drift.
+        containers = [c for c in data["containers"] if isinstance(c, dict) and c.get("name")]
+        started = time.time() - (time.monotonic() - ctx.started_at_monotonic)
+        created_since = {c["name"] for c in containers if _created_after(c.get("created"), started)}
+        python_all = {row.name for row in docker_containers(specs) if row.name}
+        removed_since = python_all - {c["name"] for c in containers}
         liumd_names = sorted(
             c["name"]
-            for c in data["containers"]
-            if isinstance(c, dict) and c.get("name") and c.get("status") == "running"
+            for c in containers
+            if c.get("status") == "running" and c["name"] not in created_since
         )
-        python_names = sorted(row.name for row in docker_containers(specs) if row.name)
-        check("docker.container_names", liumd_names, python_names)
+        python_names = sorted(python_all - created_since - removed_since)
+        check(
+            "docker.container_names",
+            liumd_names,
+            python_names,
+            created_since_start=sorted(created_since),
+            removed_since_scrape=sorted(removed_since),
+        )
 
     ports = answer.step("ports")
     data = ports.data if ports.status == "ok" and isinstance(ports.data, dict) else None
