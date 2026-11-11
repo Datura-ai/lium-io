@@ -6326,7 +6326,7 @@ class DockerService:
         # fstrim in the host mount namespace: through /proc/1/root it cannot resolve the vloopback mount
         command = f'( {_wipe_volume_cmd(run_volume, *killed)} && {HOST_NSENTER}fstrim "$p" && echo trimmed ) 2>&1'
         try:
-            free_before = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
+            free_bytes_before = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
             trim_result = await asyncio.wait_for(ssh_client.run(command), CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS)
             output = trim_result.stdout or ""
         except asyncio.CancelledError:
@@ -6342,7 +6342,7 @@ class DockerService:
             )
             return 0
         # an exiting filler can still hold files open, so fstrim may free less than the declared size
-        freed_gb = (await self._get_fs_available_bytes(ssh_client, docker_root_dir) - free_before) / (1024**3)
+        freed_gb = (await self._get_fs_available_bytes(ssh_client, docker_root_dir) - free_bytes_before) / (1024**3)
         return min(max(freed_gb, 0), declared_gb)
 
     async def _rental_disk_fit(
