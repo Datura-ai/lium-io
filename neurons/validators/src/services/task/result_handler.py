@@ -19,7 +19,7 @@ from services.gpu_spec_table import (
 )
 from services.redis_service import (
     GPU_ANCHOR_KEY,
-    IDLE_MEM_AVAILABLE_MARGIN_KIB,
+    IDLE_MEM_AVAILABLE_MARGIN_PERCENT,
     IDLE_MEM_AVAILABLE_PREFIX,
     INSPECTOR_EVENT_CHANNEL,
     RedisService,
@@ -251,7 +251,7 @@ class ResultHandler:
         # the backend lists the RAM a pod will actually get without computing the margin itself
         idle_available_kib = await self._idle_mem_available_kib(executor_info.uuid)
         if idle_available_kib and isinstance(specs.get("ram"), dict):
-            specs["ram"] = {**specs["ram"], "tenant_ceiling": idle_available_kib - IDLE_MEM_AVAILABLE_MARGIN_KIB}
+            specs["ram"] = {**specs["ram"], "tenant_ceiling": idle_available_kib * (100 - IDLE_MEM_AVAILABLE_MARGIN_PERCENT) // 100}
 
         executor_image_report = (
             context.state.executor_image_report.as_dict()
