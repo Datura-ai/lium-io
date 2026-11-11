@@ -87,6 +87,7 @@ from services.task_service import TaskService, JobResult
 from services.storage_operations import (
     cancel_storage_operation,
     report_launch_failure,
+    note_started_storage_helper,
     start_storage_operation,
     supports_workspace_field,
 )
@@ -1637,6 +1638,9 @@ class MinerService:
                     raise error
                 if payload.volume_encrypted and payload.container_name:
                     await _remount_dropped_gocryptfs(ssh_client, payload, docker_service)
+                await note_started_storage_helper(
+                    self.redis_service, executor_info.uuid, operation_id
+                )
                 await start_storage_operation(
                     ssh_client,
                     executor_info.python_path,
@@ -1693,6 +1697,9 @@ class MinerService:
 
             if payload.backup_engine == "restic":
                 operation_id = UUID(payload.restore_log_id)
+                await note_started_storage_helper(
+                    self.redis_service, executor_info.uuid, operation_id
+                )
                 await start_storage_operation(
                     ssh_client,
                     executor_info.python_path,

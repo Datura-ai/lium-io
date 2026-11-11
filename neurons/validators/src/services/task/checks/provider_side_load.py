@@ -10,6 +10,7 @@ from typing import Any
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.const import LIUM_INFRA_CONTAINER_PREFIXES
+from services.storage_operations import STORAGE_HELPER_PREFIX, started_storage_helpers
 
 from .cpu_truth import advertised_cpu_count
 from .custom_build_orphan_sweep import BUILD_DIND_PREFIX
@@ -40,9 +41,9 @@ CLAIMED_EXCUSE_CORES = PROVIDER_SIDE_CPU_CORES_LIMIT
 
 # DAH-6148: a Lium backup runs restic in a `lium-storage-<operation>` helper container (executor
 # storage/restic.py). It is on no rental list and usually starts between the scrape and the second
-# look, so its cores landed on the provider. A name is forgeable, so it is excused only beside a
-# pod the backend reports here (a backup is of a pod), and only up to restic's GOMAXPROCS there.
-STORAGE_HELPER_PREFIX = "lium-storage-"
+# look, so its cores landed on the provider. Only the exact names of helpers this validator started
+# on the node are excused (storage_operations.note_started_storage_helper), and only up to restic's
+# GOMAXPROCS: a container that merely wears the prefix stays the provider's.
 STORAGE_HELPER_EXCUSE_CORES = 8.0
 
 # A second look before any money is withheld, the same rule the foreign-GPU twin follows with
@@ -122,13 +123,13 @@ def provider_cores_outside_lium(
     reports the first 12 characters.
     """
     lium_short_ids: set[str] = {key[:12] for key in lium_container_keys}
-    helpers_are_lium = STORAGE_HELPER_PREFIX in lium_container_keys
     lium_percent = helper_percent = 0.0
     for row in rows:
-        if row.name in lium_container_keys or row.container_id[:12] in lium_short_ids:
-            lium_percent += row.measured_cpu_percent
-        elif helpers_are_lium and row.name.startswith(STORAGE_HELPER_PREFIX):
+        if row.name.startswith(STORAGE_HELPER_PREFIX) and row.name in lium_container_keys:
+            # a helper this validator started: excused up to the cap below
             helper_percent += row.measured_cpu_percent
+        elif row.name in lium_container_keys or row.container_id[:12] in lium_short_ids:
+            lium_percent += row.measured_cpu_percent
     lium_percent += min(helper_percent, STORAGE_HELPER_EXCUSE_CORES * 100)
     # Floor, not round: 1.96 cores must not become 2.0 and cross the limit on its own. The
     # inner round absorbs float noise first, so an exact 1.6 does not floor to 1.5.
@@ -260,10 +261,9 @@ async def lium_containers(ctx: Context) -> set[str] | None:
     rented_executor = rental_of_this_node(ctx)
     if rented_executor:
         containers.update(f"{BUILD_DIND_PREFIX}{pod.pod_id}" for pod in rented_executor.pods)
-        if rented_executor.pods:
-            containers.add(STORAGE_HELPER_PREFIX)  # a prefix, matched in provider_cores_outside_lium
     specs = ctx.state.specs or {}
     containers.update(await late_started_containers_the_backend_owns(ctx, containers))
+    containers.update(await started_storage_helpers(ctx.services.redis, ctx.executor.uuid))
     stack_ids: set[str] = executor_stack_container_ids(specs)
     if settings.PROVIDER_SIDE_LOAD_STACK_EXCUSE_CAP_ENABLED and stack_excuse_is_over_its_cap(specs):
         # like the name tier: over the cap the whole tier excuses nothing

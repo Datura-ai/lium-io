@@ -406,6 +406,7 @@ async def test_encrypted_bootstrap_restore_spec_never_carries_the_passphrase(mon
     monkeypatch.setattr(docker_service_module, "start_storage_operation", start)
     monkeypatch.setattr(docker_service_module, "wait_for_storage_operation", AsyncMock())
     service = DockerService.__new__(DockerService)
+    service.redis_service = AsyncMock()  # DAH-6148: records the helper it starts
     restore = SimpleNamespace(
         backup_engine="restic",
         restore_log_id="33333333-3333-4333-8333-333333333333",
@@ -466,8 +467,13 @@ async def _run_encrypted_restic_backup(monkeypatch, mountinfo: str):
     payload.backup_log_id = "11111111-1111-4111-8111-111111111111"
     payload.volume_encrypted = True
     payload.container_name = "container_pod"
-    await MinerService.__new__(MinerService).handle_backup_container_req(_executor_info(), payload, Mock(), docker_service)
+    miner = MinerService.__new__(MinerService)
+    miner.redis_service = AsyncMock()  # DAH-6148: records the helper it starts
+    await miner.handle_backup_container_req(_executor_info(), payload, Mock(), docker_service)
     start.assert_awaited_once()
+    miner.redis_service.sadd.assert_awaited_once_with(
+        "started_storage_helpers:" + _executor_info().uuid, "lium-storage-11111111-111"
+    )
     return docker_service.setup_encrypted_local_volume
 
 

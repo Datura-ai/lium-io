@@ -219,6 +219,7 @@ from services.rental_docker_sdk import (
 )
 from services.ssh_connect_timing import connect_with_phase_timing
 from services.storage_operations import (
+    note_started_storage_helper,
     start_storage_operation,
     supports_bootstrap_restore,
     supports_storage_operation,
@@ -11932,6 +11933,7 @@ class DockerService:
                 "failure_timeout_seconds": restore.failure_timeout_seconds,
             },
         }
+        await note_started_storage_helper(self.redis_service, executor_info.uuid, operation_id)
         files = await start_storage_operation(
             ssh_client,
             executor_info.python_path,

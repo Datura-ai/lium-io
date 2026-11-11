@@ -1,6 +1,7 @@
 """DAH-2734: provider-side CPU/disk gate — the twin of the DAH-2735 foreign-GPU gate."""
 from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
 
 import pytest
 
@@ -18,6 +19,10 @@ from neurons.validators.src.services.task.checks.provider_side_load import (
 from neurons.validators.src.services.task.pipeline import ContextState
 from neurons.validators.src.services.task.messages import ProviderSideLoadMessages as Msg
 
+from neurons.validators.src.services.storage_operations import (
+    note_started_storage_helper,
+    started_storage_helpers,
+)
 from tests.helpers import build_state
 
 GB_KB = 1024 * 1024
@@ -743,15 +748,27 @@ async def test_under_the_cap_the_honest_stack_is_still_excused(context_factory):
     assert result.event.what_we_saw["executor_stack_cores"] == 1.5
 
 
-BACKUP_HELPER = "lium-storage-0123456789ab"
+BACKUP_HELPER = "lium-storage-01234567-89a"  # storage_helper_name(UUID("01234567-89ab-..."))
+
+
+def _helper_runner(name: str, helper_percent: float = 700.0, host_cores: float = 10.56):
+    return confirming_runner(
+        host_cores, 32, [("c1", "pod_renter", 158.0), ("c2", name, helper_percent)]
+    )
+
+
+def _with_recorded_helpers(ctx, *names: str):
+    """The helpers this validator recorded when it started storage operations here (DAH-6148)."""
+    ctx.services.redis.smembers = AsyncMock(return_value={name.encode() for name in names})
+    return ctx
 
 
 @pytest.mark.asyncio
-async def test_a_lium_backup_helper_beside_a_pod_is_lium_load(context_factory):
+async def test_a_backup_helper_this_validator_started_is_lium_load(context_factory):
     # DAH-6148: the hourly backup's restic helper starts after the scrape; its cores are Lium's
-    ctx = context_factory(
-        state=_rented_state(SN13_SPECS),
-        runner=confirming_runner(10.56, 32, [("c1", "pod_renter", 158.0), ("c2", BACKUP_HELPER, 700.0)]),
+    ctx = _with_recorded_helpers(
+        context_factory(state=_rented_state(SN13_SPECS), runner=_helper_runner(BACKUP_HELPER)),
+        BACKUP_HELPER,
     )
 
     with provider_load_gate(enforce=True):
@@ -760,27 +777,64 @@ async def test_a_lium_backup_helper_beside_a_pod_is_lium_load(context_factory):
     assert result.event.what_we_saw["provider_cpu_cores"] == 1.9  # below the floor; was 8.9
 
 
+@pytest.mark.parametrize(
+    "name", ["lium-storage-ffffffff-fff", "lium-storage-"], ids=["foreign_helper", "bare_prefix"]
+)
 @pytest.mark.asyncio
-async def test_a_backup_helper_name_on_a_node_with_no_pod_stays_on_the_provider(context_factory):
-    ctx = context_factory(
-        state=build_state(specs=SN13_SPECS, rented_data=_no_rentals()),
-        runner=confirming_runner(10.56, 32, [("c2", BACKUP_HELPER, 700.0)]),
+async def test_a_lium_storage_name_the_validator_did_not_start_is_the_providers(
+    context_factory, name
+):
+    # a name is forgeable: only the exact helpers this validator recorded are excused
+    ctx = _with_recorded_helpers(
+        context_factory(state=_rented_state(SN13_SPECS), runner=_helper_runner(name)),
+        BACKUP_HELPER,
     )
 
     with provider_load_gate(enforce=True):
         result = await ProviderSideLoadCheck().run(ctx)
 
-    assert result.event.what_we_saw["provider_cpu_cores"] == 10.5
+    assert result.event.what_we_saw["provider_cpu_cores"] == 8.9
+
+
+@pytest.mark.asyncio
+async def test_with_redis_unreadable_no_helper_is_excused(context_factory):
+    ctx = context_factory(state=_rented_state(SN13_SPECS), runner=_helper_runner(BACKUP_HELPER))
+    ctx.services.redis.smembers = AsyncMock(side_effect=ConnectionError("Redis down"))
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.event.what_we_saw["provider_cpu_cores"] == 8.9
 
 
 @pytest.mark.asyncio
 async def test_backup_helpers_excuse_no_more_than_restics_own_cores(context_factory):
-    ctx = context_factory(
-        state=_rented_state(SN13_SPECS),
-        runner=confirming_runner(14.0, 32, [("c1", "pod_renter", 158.0), ("c2", BACKUP_HELPER, 1000.0)]),
+    ctx = _with_recorded_helpers(
+        context_factory(
+            state=_rented_state(SN13_SPECS),
+            runner=_helper_runner(BACKUP_HELPER, helper_percent=1000.0, host_cores=14.0),
+        ),
+        BACKUP_HELPER,
     )
 
     with provider_load_gate(enforce=True):
         result = await ProviderSideLoadCheck().run(ctx)
 
     assert result.event.what_we_saw["provider_cpu_cores"] == 4.4
+
+
+@pytest.mark.asyncio
+async def test_a_started_operation_records_exactly_its_helper_name():
+    sets: dict[str, set[str]] = {}
+    redis = MagicMock(
+        sadd=AsyncMock(side_effect=lambda key, elem: sets.setdefault(key, set()).add(elem)),
+        expire=AsyncMock(),
+        smembers=AsyncMock(side_effect=lambda key: sets.get(key, set())),
+    )
+
+    operation_id = UUID("01234567-89ab-4def-8123-456789abcdef")
+    await note_started_storage_helper(redis, "executor-1", operation_id)
+
+    assert await started_storage_helpers(redis, "executor-1") == {BACKUP_HELPER}
+    assert await started_storage_helpers(redis, "executor-2") == set()
+    redis.expire.assert_awaited_once()

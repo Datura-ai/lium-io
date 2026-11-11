@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -11,9 +12,54 @@ from uuid import UUID, uuid4
 import aiohttp
 import asyncssh
 
+logger = logging.getLogger(__name__)
+
 REMOTE_OPERATION_DIRECTORY = PurePosixPath("/root/app/storage-operations")
 REMOTE_RUNNER_PATH = "/root/app/src/storage_runner.py"
 REMOTE_SECRETS_DIRECTORY = PurePosixPath("/root/app/storage-secrets")
+
+# DAH-6148: an operation runs restic in a `lium-storage-<operation id[:12]>` helper container on
+# the node. The names of the helpers this validator started are kept per executor, so the
+# provider-side load check excuses exactly those, never a container that only wears the prefix.
+STORAGE_HELPER_PREFIX = "lium-storage-"
+STARTED_STORAGE_HELPERS_PREFIX = "started_storage_helpers:"
+STARTED_STORAGE_HELPERS_TTL_SECONDS = 24 * 3600
+_STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC = 2
+
+
+def storage_helper_name(operation_id: UUID | str) -> str:
+    return f"{STORAGE_HELPER_PREFIX}{str(operation_id)[:12]}"
+
+
+async def note_started_storage_helper(redis, executor_id: str, operation_id: UUID | str) -> None:
+    """Records the helper an operation started on this executor. Best effort: unrecorded, its
+    cores stay on the provider, as before DAH-6148."""
+    key = f"{STARTED_STORAGE_HELPERS_PREFIX}{executor_id}"
+
+    async def note() -> None:
+        await redis.sadd(key, storage_helper_name(operation_id))
+        await redis.expire(key, STARTED_STORAGE_HELPERS_TTL_SECONDS)
+
+    try:
+        await asyncio.wait_for(note(), timeout=_STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Storage helper of %s not recorded for %s: %s", operation_id, executor_id, exc
+        )
+
+
+async def started_storage_helpers(redis, executor_id: str) -> set[str]:
+    """The helpers this validator started on the executor in the last day; empty when Redis does
+    not answer."""
+    try:
+        members = await asyncio.wait_for(
+            redis.smembers(f"{STARTED_STORAGE_HELPERS_PREFIX}{executor_id}"),
+            timeout=_STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Started storage helpers unreadable for %s: %s", executor_id, exc)
+        return set()
+    return {m.decode() if isinstance(m, bytes) else str(m) for m in members or ()}
 
 
 class StorageOperationLaunchError(RuntimeError):
@@ -264,7 +310,7 @@ async def cancel_storage_operation(
 ) -> None:
     files = StorageOperationFiles.for_operation(operation_id)
     spec = await _read_operation_spec(ssh_client, files.spec)
-    helper_name = f"lium-storage-{str(operation_id)[:12]}"
+    helper_name = storage_helper_name(operation_id)
     cancel_path = shlex.quote(str(files.cancel))
     pid_path = shlex.quote(str(files.pid))
     # Let the runner terminate its Restic process and helper first. Direct
@@ -331,7 +377,7 @@ async def _helper_owned_by_live_runner(
     operation_id: UUID,
     files: StorageOperationFiles,
 ) -> bool:
-    helper_name = f"lium-storage-{str(operation_id)[:12]}"
+    helper_name = storage_helper_name(operation_id)
     # "[-]-spec" keeps pgrep from matching this command's own shell
     runner_pattern = f"[-]-spec {files.spec}"
     result = await ssh_client.run(
@@ -346,7 +392,7 @@ async def _remove_stale_helper_container(
     ssh_client: asyncssh.SSHClientConnection,
     operation_id: UUID,
 ) -> None:
-    helper_name = f"lium-storage-{str(operation_id)[:12]}"
+    helper_name = storage_helper_name(operation_id)
     await ssh_client.run(
         f"/usr/bin/docker rm -f -- {shlex.quote(helper_name)} >/dev/null 2>&1 || true",
         check=False,
