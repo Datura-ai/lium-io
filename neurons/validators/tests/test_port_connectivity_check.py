@@ -1868,6 +1868,19 @@ class CountingBackendService(DummyBackendService):
 
 
 @pytest.mark.asyncio
+async def test_a_failed_port_check_on_a_live_session_stays_a_ports_verdict(context_factory):
+    ctx = _port_ctx(
+        context_factory, DummyRedis(), success=False, connectivity=DummyConnectivityService(success=False, status="error")
+    )
+    ctx = ctx.model_copy(update={"ssh": _Session(closed=False)})
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.VERIFY_FAILED.reason
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "declared,expected_pass,expected_reason",
     [(2, True, Msg.SKIPPED_ALL_PORTS_RENTED.reason), (3, False, Msg.VERIFY_FAILED.reason)],
