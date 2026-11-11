@@ -177,6 +177,8 @@ EXPRESS_LANE_VALIDATED_SET = "express_lane_validated_executors"
 EXPRESS_LANE_RECHECK_REQUESTS_SET = "express_lane:recheck_requests"
 # shortcut: one TTL for the whole set, refreshed per request; per-id expiry if requests pile up.
 EXPRESS_LANE_RECHECK_REQUESTS_TTL_SECONDS = 30 * 60
+# DAH-6137: a node a check asked to recheck itself, so it asks once per window.
+EXPRESS_LANE_RECHECK_ONCE_PREFIX = "express_lane:recheck_once"
 # executor id -> how many times it was requested; a run ends only the request it started from (review 4510532999)
 EXPRESS_LANE_RECHECK_GENERATIONS_HASH = "express_lane:recheck_generations"
 RECHECK_POP_ATTEMPTS = 5
@@ -590,6 +592,15 @@ class RedisService:
             await self.redis.sadd(EXPRESS_LANE_RECHECK_REQUESTS_SET, executor_id)
             for key in (EXPRESS_LANE_RECHECK_REQUESTS_SET, EXPRESS_LANE_RECHECK_GENERATIONS_HASH):
                 await self.redis.expire(key, EXPRESS_LANE_RECHECK_REQUESTS_TTL_SECONDS)
+
+    async def request_executor_recheck_once(self, executor_id: str, ttl_seconds: int) -> bool:
+        """Queue a recheck unless this one already queued one in the last ttl_seconds; True when queued."""
+        async with self.lock:
+            key = f"{EXPRESS_LANE_RECHECK_ONCE_PREFIX}:{executor_id}"
+            fresh = await self.redis.set(key, "1", ex=ttl_seconds, nx=True)
+        if fresh:
+            await self.request_executor_recheck(executor_id)
+        return bool(fresh)
 
     async def get_executor_recheck_requests(self) -> set[str]:
         members = await self.smembers(EXPRESS_LANE_RECHECK_REQUESTS_SET)
