@@ -104,6 +104,8 @@ class GrowPass:
     sizes_gb: dict[str, int] = field(default_factory=dict)
     # host disk the pass's preallocated grows took, failed xfs_growfs included: the cycle's free disk is less by this
     allocated_bytes: int = 0
+    # a grow script was started: it may have taken disk even when its report was lost (a timeout)
+    attempted: bool = False
 
 
 def pod_ids_at_endpoint(
@@ -119,6 +121,19 @@ def pod_ids_at_endpoint(
         if (executor.executor_ip_address, str(executor.executor_ip_port)) == (address, str(port))
         for pod in executor.pods
     }
+
+
+async def host_free_bytes(ssh_client: asyncssh.SSHClientConnection) -> int | None:
+    """Free bytes on the filesystem under docker's root, where the volumes' backing files live; None when unread."""
+    try:
+        result = await ssh_client.run(
+            "df -P -B1 \"$(/usr/bin/docker info -f '{{.DockerRootDir}}')\" | awk 'NR==2 {print $4}'",
+            timeout=SSH_CALL_TIMEOUT_SECONDS,
+        )
+    except Exception:  # noqa: BLE001 - unread: the caller falls back to what the grows reported
+        return None
+    free = (result.stdout or "").strip()
+    return int(free) if result.exit_status == 0 and free.isdigit() else None
 
 
 async def grow_short_volumes(
@@ -208,6 +223,7 @@ async def _grow_short_volumes(
             + " grow "
             + " ".join(map(shlex.quote, args))
         )
+        grow.attempted = True
         try:
             result = await ssh_client.run(command, timeout=RESIZE_TIMEOUT_SECONDS + 15)
         except Exception as exc:  # noqa: BLE001

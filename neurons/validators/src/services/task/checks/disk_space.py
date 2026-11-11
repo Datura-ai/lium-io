@@ -70,20 +70,23 @@ def split_disk(ctx: Context, pods: list, free_kb: float) -> dict[str, Any] | Non
 
 
 def specs_after_disk_taken(ctx: Context, taken_bytes: int) -> dict[str, Any] | None:
-    """The cycle's specs with `taken_bytes` more of the host disk used since the scrape (DAH-6073: a volume grown
-    in the cleanup pass), and the split sizing redone on that figure, so the listing, the paid GPU count and the disk
-    floor all judge the disk as it is after the grow. None when nothing was taken or there is no disk reading."""
+    """The cycle's specs with `taken_bytes` more of the host disk used since the scrape (DAH-6073: the cleanup pass's
+    net change, a grow taking and a removal releasing; negative when more was released), and the split sizing redone
+    on that figure, so the listing, the paid GPU count and the disk floor all judge the disk as it is after the pass.
+    None when nothing changed or there is no disk reading."""
     specs = ctx.state.specs or {}
     hard_disk = specs.get("hard_disk")
     free_kb = _as_float(hard_disk.get("free")) if isinstance(hard_disk, dict) else math.nan
-    if taken_bytes <= 0 or not math.isfinite(free_kb):
+    if taken_bytes == 0 or not math.isfinite(free_kb):
         return None
     taken_kb = taken_bytes / 1024
     used_kb = _as_float(hard_disk.get("used"))
     updated = {**hard_disk, "free": max(free_kb - taken_kb, 0)}
     if math.isfinite(used_kb) and used_kb + free_kb > 0:
-        updated["used"] = used_kb + taken_kb
-        updated["utilization"] = min((used_kb + taken_kb) / (used_kb + free_kb) * 100, 100)
+        used_after = min(max(used_kb + taken_kb, 0), used_kb + free_kb)
+        updated["free"] = used_kb + free_kb - used_after
+        updated["used"] = used_after
+        updated["utilization"] = used_after / (used_kb + free_kb) * 100
     rental = rental_of_this_node(ctx)
     per_split = split_disk(ctx, rental.pods, updated["free"]) if rental and rental.pods else None
     return {**specs, "hard_disk": updated, **({"split_disk": per_split} if per_split is not None else {})}

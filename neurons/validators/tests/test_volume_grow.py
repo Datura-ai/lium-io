@@ -420,7 +420,7 @@ async def test_a_grow_whose_xfs_growfs_failed_reports_the_disk_it_took_and_no_si
         )
     )
 
-    assert await grow_short_volumes(ssh, {"live"}) == GrowPass(sizes_gb={}, allocated_bytes=60 * GB)
+    assert await grow_short_volumes(ssh, {"live"}) == GrowPass(sizes_gb={}, allocated_bytes=60 * GB, attempted=True)
 
 
 def test_only_pods_listed_at_this_nodes_endpoint_may_grow():
@@ -483,3 +483,59 @@ def test_the_disk_a_grow_took_is_what_the_listing_and_paid_count_judge(
     assert specs["hard_disk"]["free"] == free_after_gb * KB_PER_GB
     assert specs["hard_disk"]["utilization"] == pytest.approx((30 + taken_gb) / 100 * 100)
     assert specs["split_disk"]["listable_gpu_count"] == listable_gpus
+
+
+def test_a_pass_that_released_more_than_it_took_lists_on_the_disk_now_free(context_factory):
+    from services.task.checks.disk_space import KB_PER_GB, specs_after_disk_taken
+
+    from tests.test_disk_space_check import _split_state
+
+    # 40 GB free is under the 50 GB floor; the pass's removals freed 30 GB more than its grow took
+    state = _split_state(40, gpu_count=2, gpu_splitting_min_count=1, pods=(1,))
+    state.specs["hard_disk"]["used"] = 60 * KB_PER_GB
+    ctx = context_factory(state=state, rented=True)
+
+    specs = specs_after_disk_taken(ctx, -30 * GB)
+
+    assert specs["hard_disk"]["free"] == 70 * KB_PER_GB
+    assert specs["hard_disk"]["utilization"] == pytest.approx(30)
+    assert specs["split_disk"]["listable_gpu_count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("free_reads_gb", "reported_gb", "free_after_gb"),
+    [
+        # the grow took 60 GB, the removals before it gave 30 GB back: the measured net is what is gone
+        ((70, 40), 60, 40),
+        # the grow's report was lost to a timeout after it allocated: the measurement still sees it
+        ((70, 10), 0, 10),
+        # no measurement: what the grows reported
+        ((None, None), 60, 10),
+    ],
+)
+async def test_the_cleanup_pass_judges_the_disk_it_measured_around_the_whole_pass(
+    monkeypatch, free_reads_gb, reported_gb, free_after_gb
+):
+    from dataclasses import replace
+
+    from services.task.checks import stale_container_cleanup as module
+    from services.task.checks.disk_space import KB_PER_GB
+
+    from tests.test_container_cleanup import _cleanup_check_ctx
+
+    reads = [None if gb is None else gb * GB for gb in free_reads_gb]
+    monkeypatch.setattr(module, "pod_ids_at_endpoint", lambda *_: {"live"})
+    monkeypatch.setattr(module, "host_free_bytes", AsyncMock(side_effect=reads))
+    monkeypatch.setattr(
+        module,
+        "grow_short_volumes",
+        AsyncMock(return_value=GrowPass(allocated_bytes=reported_gb * GB, attempted=True)),
+    )
+    ctx = _cleanup_check_ctx([], [])
+    disk = {"hard_disk": {"free": 70 * KB_PER_GB, "used": 30 * KB_PER_GB, "utilization": 30}}
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, specs=disk)})
+
+    result = await module.StaleContainerCleanupCheck().run(ctx)
+
+    assert result.updates["state"].specs["hard_disk"]["free"] == free_after_gb * KB_PER_GB

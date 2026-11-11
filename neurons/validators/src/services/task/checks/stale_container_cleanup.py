@@ -17,7 +17,13 @@ from protocol.vc_protocol.compute_requests import (
 from protocol.vc_protocol.validator_requests import POD_STATES_MAX_ITEMS, ContainerState, PodContainerState
 from services.container_cleanup import rented_list_unknown_reason
 from services.redis_service import CLEANUP_SEEN_EXECUTORS_SET
-from services.volume_grow import GROW_PASS_MAX_SECONDS, GrowPass, grow_short_volumes, pod_ids_at_endpoint
+from services.volume_grow import (
+    GROW_PASS_MAX_SECONDS,
+    GrowPass,
+    grow_short_volumes,
+    host_free_bytes,
+    pod_ids_at_endpoint,
+)
 
 from ...const import (
     unparked_name,
@@ -116,6 +122,15 @@ class StaleContainerCleanupCheck:
         queue = _ReapedPodStateQueue(ctx)
         first_sight = await self._first_sight(ctx)
         rented_list_unknown = rented_list_unknown_reason(ctx.state.rented_data)
+        # DAH-6073: pods at this node's endpoint may grow; live_pod_ids is fleet-wide, so a pod rented on another
+        # node would grow its retained copy here (deletion protection keeps the fleet-wide set)
+        grow_pod_ids = (
+            pod_ids_at_endpoint(ctx.state.rented_data, ctx.executor.address, ctx.executor.port)
+            if rented_list_unknown is None
+            else set()
+        )
+        # read before any removal: a pass that grows judges the disk by what it measures, releases included
+        free_before = await host_free_bytes(ctx.ssh) if grow_pod_ids else None
         confirmed: set[str] = set()  # names the backend's record shows were this node's ended Lium workload
         lookups = {"made": 0, "skipped": 0}
         # labelled removals holding a GPU process: each has a lookup slot kept for its exemption
@@ -191,20 +206,12 @@ class StaleContainerCleanupCheck:
         # the rest once the disk is free; only on a known rented list, so a retained or orphan volume is never grown
         # bounded, and to half the task's time left at most, so the rental checks and state publication after it run
         grow_budget = min(GROW_PASS_MAX_SECONDS, task_seconds_left(ctx) / 2)
-        # only pods listed at this node's endpoint: live_pod_ids is fleet-wide, so a pod rented on another node would
-        # grow its retained copy here (deletion protection keeps the fleet-wide set)
         grown = (
-            await grow_short_volumes(
-                ctx.ssh,
-                pod_ids_at_endpoint(ctx.state.rented_data, ctx.executor.address, ctx.executor.port),
-                grow_budget,
-            )
-            if rented_list_unknown is None and grow_budget > 0
+            await grow_short_volumes(ctx.ssh, grow_pod_ids, grow_budget)
+            if grow_pod_ids and grow_budget > 0
             else GrowPass()
         )
         volume_sizes_gb = grown.sizes_gb
-        # the grow took disk the scrape counted free: the listing and the paid GPU count must judge what is left
-        specs_after_grow = specs_after_disk_taken(ctx, grown.allocated_bytes)
 
         # DAH-2475: give the DPHN filler cache back when the node can no longer afford it. This is
         # the ONLY caller — the create-time sweep deliberately never reclaims (it would raise free
@@ -215,6 +222,12 @@ class StaleContainerCleanupCheck:
             ssh_client=ctx.ssh,
             executor_uuid=ctx.executor.uuid,
         )
+
+        # the grow took disk the scrape counted free: the listing and the paid GPU count must judge what is left.
+        # Measured after the whole pass, so the removals' releases and a grow whose report was lost (a timeout) count
+        free_after = await host_free_bytes(ctx.ssh) if grown.attempted and free_before is not None else None
+        taken = free_before - free_after if free_after is not None else grown.allocated_bytes
+        specs_after_grow = specs_after_disk_taken(ctx, taken) if grown.attempted else None
 
         event = render_message(
             Msg.CLEANED if rented_list_unknown is None else Msg.RENTED_LIST_UNKNOWN,
