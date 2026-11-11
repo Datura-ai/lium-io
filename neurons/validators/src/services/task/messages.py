@@ -633,7 +633,7 @@ class PostRentalGpuRecheckMessages:
         remediation=(
             "A GPU showed a fault (during a rental, or it dropped out), and after it at least one card failed the "
             "all-cards matmul or the kernel-fault probe. Check `nvidia-smi -q` and the host `dmesg` for NVRM "
-            "Xid lines; reset the card (`nvidia-smi -r`) or reboot the host, replace a card that still fails, "
+            "Xid lines; reset the card once its processes stop (`nvidia-smi -r -i <index>`) or reboot the host, replace a card that still fails, "
             "and wait one cycle."
         ),
     )
@@ -2055,8 +2055,8 @@ class GpuMemoryHealthMessages:
         remediation="NVML reports uncorrected ECC errors, a pending or failed row remap, or a "
         "required recovery action on the card(s) in flags; a rented card in this state faults the "
         "renter's jobs. Check `nvidia-smi -q -d ECC,ROW_REMAPPER`: a pending remap or a "
-        "DRAIN_AND_RESET / GPU_RESET action needs the card drained and reset (`nvidia-smi -r` with "
-        "no process on it, or a host reboot); a failed remap, or uncorrected errors that return "
+        "DRAIN_AND_RESET / GPU_RESET action needs the card drained and reset (`nvidia-smi -r -i <index>` "
+        "with no process on it, or a host reboot); a failed remap, or uncorrected errors that return "
         "after a reset, mean the card must be replaced. The node passes again on the first "
         "validation after NVML reads the card clean.",
     )
@@ -2069,7 +2069,7 @@ class GpuMemoryHealthMessages:
         remediation="NVML reports uncorrected ECC errors, a pending or failed row remap, or a "
         "required recovery action on the card(s) in flags. Check `nvidia-smi -q -d "
         "ECC,ROW_REMAPPER`: a pending remap or a DRAIN_AND_RESET / GPU_RESET action needs the card "
-        "drained and reset (`nvidia-smi -r` with no process on it, or a host reboot); a failed "
+        "drained and reset (`nvidia-smi -r -i <index>` with no process on it, or a host reboot); a failed "
         "remap, or uncorrected errors that return after a reset, mean the card should be replaced.",
     )
     UNKNOWN = MessageTemplate(
@@ -2087,8 +2087,8 @@ class GpuMemoryHealthMessages:
         impact="Proceed; score not changed",
         remediation="NVML reports a pending row remap or a recovery action from correctable errors "
         "on the card(s) in warnings. The card still works, but the remap takes effect only after "
-        "a reset: drain the card and reset it (`nvidia-smi -r` with no process on it, or a host "
-        "reboot) when it is free.",
+        "a reset: drain the card and reset it (`nvidia-smi -r -i <index>` with no process on it, "
+        "or a host reboot) when it is free.",
     )
     OK = MessageTemplate(
         event="GPU memory health ok",
@@ -2126,7 +2126,7 @@ class GpuFaultProbeMessages:
         remediation=(
             "A GPU returned a CUDA error, wrong data or hung under indexed memory access, or NVML reported "
             "new uncorrected ECC errors / remapped rows. Check `nvidia-smi -q -d ECC,ROW_REMAPPER` and the host "
-            "`dmesg` for NVRM Xid lines; reseat or replace the card, or reset it (`nvidia-smi -r`) and wait one cycle."
+            "`dmesg` for NVRM Xid lines; reseat or replace the card, or stop its processes, reset only it (`nvidia-smi -r -i <index>`) and wait one cycle."
         ),
     )
     UNKNOWN = MessageTemplate(
