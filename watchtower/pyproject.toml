@@ -1,6 +1,6 @@
 [project]
 name = "watchtower"
-version = "1.2.1"
+version = "1.2.2"
 description = "Automated Docker image update service with cryptographic verification"
 authors = [
     {name = "Lium Team"},

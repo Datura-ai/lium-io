@@ -455,8 +455,7 @@ class RentalPriceIncentive(DefaultIncentive):
         # unreachable by construction; a verified TDX quote is that machine's capability path.
         # The quote alone, not JobResult.tdx_attestation_passed: that flag also drops on a failed
         # GPU-CC verdict, which is observe-only today, so a CVM submitting failing GPU evidence
-        # would earn less than one submitting none. Bad GPU evidence is the GPU-attestation
-        # enforcement flag's job; once it is on, evidence is mandatory and no digest reaches here.
+        # would earn less than one submitting none. GPU attestation is observe-only (DAH-4904).
         attested_cvm: bool = result.attestation_digest is not None
         if (
             ncu_profiling_access == NCU_PROFILING_UNRESTRICTED

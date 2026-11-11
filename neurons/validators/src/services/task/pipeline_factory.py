@@ -86,6 +86,7 @@ from .checks import (
     StaleContainerCleanupCheck,
     StartGPUMonitorCheck,
     SshdBootstrapCheck,
+    DockerCpuCheck,
     PidHostRequiredCheck,
     SysboxRequiredCheck,
     TdxHostCheck,
@@ -410,6 +411,7 @@ class PipelineFactory:
                 # the authoritative probe result used for scoring (not the earlier scrape hint).
                 SysboxRequiredCheck(),
                 PidHostRequiredCheck(),
+                DockerCpuCheck(),
                 ExecutorImageCheck(),
                 InspectorRentedCheck(),
                 RentedPodResourcesCheck(),
@@ -568,6 +570,7 @@ class PipelineFactory:
                             ContainerDownloadSpeedCheck(),
                             SysboxRequiredCheck(),
                             PidHostRequiredCheck(),
+                            DockerCpuCheck(),
                             RentalVerificationCheck(),
                         ],
                         [
@@ -664,6 +667,7 @@ class PipelineFactory:
                 # the authoritative probe result used for scoring (not the earlier scrape hint).
                 SysboxRequiredCheck(),
                 PidHostRequiredCheck(),
+                DockerCpuCheck(),
                 ExecutorImageCheck(),
                 # recover_stale_pods=False: dry run still reports a pod as down, but must not rmdir
                 # a stale mountpoint on the host or start a customer's container (DAH-2306).

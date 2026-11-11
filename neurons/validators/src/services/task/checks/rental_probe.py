@@ -1203,6 +1203,7 @@ async def _step_teardown(
 
 # Passed probes' teardowns still running: the loop keeps only a weak reference to a task.
 _TEARDOWNS_AFTER_VERDICT: set[asyncio.Task] = set()
+_TEARDOWN_TASK_PREFIX = "rental-probe-teardown:"
 
 
 def _teardown_after_verdict(ctx: Context, outcome: _ProbeOutcome) -> None:
@@ -1212,9 +1213,21 @@ def _teardown_after_verdict(ctx: Context, outcome: _ProbeOutcome) -> None:
     A teardown that does not finish clears the pass stamp, so the next cycle probes the node again, as
     an inconclusive run would; the leftover goes to the by-name removal and the stale-container sweep.
     """
-    task = asyncio.ensure_future(_teardown_passed_probe(ctx, outcome))
+    task = asyncio.create_task(_teardown_passed_probe(ctx, outcome), name=f"{_TEARDOWN_TASK_PREFIX}{ctx.miner_hotkey}")
     _TEARDOWNS_AFTER_VERDICT.add(task)
     task.add_done_callback(_TEARDOWNS_AFTER_VERDICT.discard)
+
+
+async def wait_for_teardowns_after_verdict(miner_hotkey: str, max_seconds: float) -> None:
+    """Wait for the miner's background teardowns, so they end before the cycle removes the validator's SSH key.
+
+    A teardown still running when the key goes fails with Permission denied and leaves its container to the
+    stale-container sweep. The wait is capped at the teardown's deadline and at max_seconds, the time the miner's job
+    has left; a teardown past either is left running.
+    """
+    pending = [t for t in _TEARDOWNS_AFTER_VERDICT if t.get_name() == f"{_TEARDOWN_TASK_PREFIX}{miner_hotkey}"]
+    if pending and max_seconds > 0:
+        await asyncio.wait(pending, timeout=min(_teardown_deadline_seconds(), max_seconds))
 
 
 async def _teardown_passed_probe(ctx: Context, outcome: _ProbeOutcome) -> None:

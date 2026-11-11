@@ -5,6 +5,7 @@ The probe's pod hit one filler port, moved, then hit the second one and failed a
 host's listening sockets never showed them as taken.
 """
 
+import time
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -51,6 +52,22 @@ def test_container_published_host_ports_count_as_taken():
 def test_listening_ports_read_a_published_range():
     block = "0.0.0.0:20040-20049->20040-20049/tcp, :::20040-20049->20040-20049/tcp\n"
     assert _parse_listening_ports(block) == set(range(20040, 20050))
+
+
+def test_many_wide_published_ranges_are_merged_not_expanded_each_time():
+    wide = "0.0.0.0:1-65535->1-65535/tcp, :::1-65535->1-65535/tcp\n" * 2000
+    started = time.monotonic()
+    assert _parse_listening_ports(wide) == set(range(1, 65536))
+    assert time.monotonic() - started < 2
+    overlapping = "0.0.0.0:100-200->1/tcp\n0.0.0.0:150-300->1/tcp\n0.0.0.0:0-0->1/tcp\n0.0.0.0:400->1/tcp\n"
+    assert _parse_listening_ports(overlapping) == set(range(100, 301)) | {400}
+    # many distinct reversed (ignored) and overlapping ranges, the shape a hostile executor can send
+    reversed_ranges = "".join(f"0.0.0.0:{65535 - i}-{i + 1}->1/tcp\n" for i in range(20000))
+    overlapping_ranges = "".join(f"0.0.0.0:{i + 1}-{i + 100}->1/tcp\n" for i in range(20000))
+    started = time.monotonic()
+    assert _parse_listening_ports(reversed_ranges) == set()
+    assert _parse_listening_ports(overlapping_ranges) == set(range(1, 20100))
+    assert time.monotonic() - started < 2
 
 
 @pytest.mark.asyncio

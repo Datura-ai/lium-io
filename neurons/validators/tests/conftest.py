@@ -109,6 +109,15 @@ def no_docker_hub_digest_on_rent_path():
 
 
 @pytest.fixture(autouse=True)
+def no_registry_lookup_for_executor_build():
+    """The image check asks the registry whether an outdated digest is ours; no answer keeps tests offline."""
+    with patch(
+        "services.task.checks.executor_image.executor_build_published", AsyncMock(return_value=None)
+    ) as lookup:
+        yield lookup
+
+
+@pytest.fixture(autouse=True)
 def no_rental_start_record_on_fake_hosts():
     """A customer create records each GPU's power at rental start and fails when the host cannot report
     it; the create tests' fake hosts answer no nvidia-smi. test_gpu_power_limit.py tests the record
