@@ -132,6 +132,7 @@ STUBS = {
             --query-gpu=driver_version) echo "${STUB_NV_DRIVER:-580.65.06}" ;;
             --query-gpu=name) for _ in $(seq "${STUB_NV_GPUS:-8}"); do echo "${STUB_NV_NAME:-NVIDIA H100 80GB HBM3}"; done ;;
             --query-gpu=memory.total) for _ in $(seq "${STUB_NV_GPUS:-8}"); do echo "${STUB_NV_MEM_MIB:-81559}"; done ;;
+            --query-gpu=name,memory.total) for _ in $(seq "${STUB_NV_GPUS:-8}"); do echo "${STUB_NV_NAME:-NVIDIA H100 80GB HBM3}, ${STUB_NV_MEM_MIB:-81559}"; done ;;
             --list-gpus) for i in $(seq "${STUB_NV_GPUS:-8}"); do echo "GPU $((i - 1)): NVIDIA H100 80GB HBM3"; done ;;
         esac
         """
@@ -330,6 +331,29 @@ def test_blackwell_without_a_driver_gets_the_open_module_from_pci(tmp_path):
 
 
 # ── disk >= 1.5x VRAM (validators' MIN_DISK_TO_VRAM_RATE) ────────────────────
+
+
+def test_disk_rule_uses_nvidia_smi_memory(tmp_path):
+    # 8 x 81559 MiB = 637.2 GB VRAM needs 955.8 GB; the stub disk is 1000.0 GB
+    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram")
+    assert rc == 0, out
+    assert "(1.5x of 637.2 GB VRAM)" in out
+
+
+def test_gb10_unified_memory_counts_host_ram_like_the_validator(tmp_path):
+    # DGX Spark: nvidia-smi prints [N/A] for memory.total; the validator's scrape takes the host RAM
+    env = {"STUB_NV_GPUS": "1", "STUB_NV_NAME": "NVIDIA GB10", "STUB_NV_MEM_MIB": "[N/A]", "STUB_DF_TOTAL_KB": str(100 * 1024 * 1024)}
+    files = {"proc/meminfo": "MemTotal:       127535272 kB\nMemFree:        1000 kB\n"}
+    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=env, files=files)
+    assert rc == 1, out
+    assert "(1.5x of 121.6 GB VRAM)" in out and "SKIP Disk" not in out
+
+
+def test_unknown_card_without_memory_is_still_skipped(tmp_path):
+    env = {"STUB_NV_GPUS": "1", "STUB_NV_NAME": "NVIDIA Other", "STUB_NV_MEM_MIB": "[N/A]"}
+    rc, out, _ = run_check(tmp_path, "check_total_disk_for_vram", env=env, files={"proc/meminfo": "MemTotal: 1000 kB\n"})
+    assert rc == 0
+    assert "nvidia-smi reports no GPU memory" in out
 
 
 # ── free disk for the node's images and VerifyX's storage test ───────────────

@@ -469,7 +469,10 @@ check_total_disk_for_vram() {
     # rootfs lives under Docker's data-root) with total GPU VRAM; free space is not the rule.
     local vram_mib vram_gb data_root total_kb total_gb needed_gb
     command -v nvidia-smi &>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — no NVIDIA driver, VRAM unknown."; return 0; }
-    vram_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | awk '{s += $1} END {print s + 0}')
+    # a unified-memory card (DGX Spark GB10) prints [N/A]; the validator's scrape counts the host RAM for it
+    vram_mib=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits 2>/dev/null \
+        | awk -F', *' -v host_mib="$(awk '/^MemTotal:/ {print int($2 / 1024)}' "$(host_path /proc/meminfo)" 2>/dev/null)" \
+            '$1 == "NVIDIA GB10" && $2 !~ /^[0-9]/ {s += host_mib; next} {s += $2} END {print s + 0}')
     [ "${vram_mib:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — nvidia-smi reports no GPU memory."; return 0; }
     data_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
     if [ -z "$data_root" ] || [ ! -d "$data_root" ]; then data_root=/var/lib/docker; fi
