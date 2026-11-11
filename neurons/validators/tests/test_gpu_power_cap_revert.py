@@ -398,7 +398,7 @@ async def test_a_failed_clear_is_retried_once_the_filler_is_gone(
 
 @pytest.mark.asyncio
 async def test_a_claim_left_by_a_teardown_with_redis_down_is_not_a_revert(context_factory, monkeypatch) -> None:
-    # lio-dep#140 review: Redis was down through the whole delete, so the claim was never cleared and the
+    # Redis was down through the whole delete, so the claim was never cleared and the
     # backend still reports owner "lium" while the run is STOPPING. The job's container is gone: no revert.
     stale_claim = BrokenRedis({_restore_key("GPU-a"): _stored_restore_record(executor_id=CHECK_EXECUTOR_UUID)})
     assert await clear_filler_pod_applied_caps(stale_claim, POD_ID) == {}
@@ -412,11 +412,21 @@ async def test_a_claim_left_by_a_teardown_with_redis_down_is_not_a_revert(contex
 
 
 @pytest.mark.asyncio
-async def test_a_revert_needs_an_answer_from_the_host(context_factory, monkeypatch) -> None:
-    # our SSH failing is no proof the job runs: the money gate fails open
+async def test_a_revert_is_dropped_only_on_a_clear_answer_from_the_host(context_factory, monkeypatch) -> None:
     redis = FakeRedis()
     ssh = AsyncMock()
     ssh.run.side_effect = OSError("ssh dropped")
+
+    await _run_check_while_filler_runs(context_factory, monkeypatch, redis, [_record()], [("GPU-a", 400.0)], ssh=ssh)
+
+    assert _revert_key(CHECK_EXECUTOR_UUID) in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_claim_whose_container_no_longer_exists_is_not_a_revert(context_factory, monkeypatch) -> None:
+    redis = FakeRedis()
+    ssh = AsyncMock()
+    ssh.run.return_value = FakeRun(stderr=f"Error: No such object: filler_{POD_ID}\n", exit_status=1)
 
     await _run_check_while_filler_runs(context_factory, monkeypatch, redis, [_record()], [("GPU-a", 400.0)], ssh=ssh)
 
