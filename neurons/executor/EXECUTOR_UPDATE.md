@@ -70,7 +70,7 @@ If the host has no runner at all (`docker compose ps -a executor-runner` lists n
 docker compose create --no-recreate executor-runner
 ```
 
-At its next check (within 5 minutes) the updater finds that container, verifies the signed digest, pulls the current runner by it and starts that in its place; the created container never runs. If the runner then still shows `Created` and `docker logs executor-watchtower-1 --tail 5` says `Image is up to date`, the image on the host already is the signed one: `docker compose start executor-runner`.
+At its next check (within 5 minutes) the updater finds that container, verifies the signed digest, pulls the current runner by it and starts that in its place. Only if that start fails does the updater roll back and start the created container, as it does for any runner; its log then says `Switch to the new container failed`, and the updater tries again at its next check. If the runner then still shows `Created` and `docker logs executor-watchtower-1 --tail 5` says `Image is up to date`, the image on the host already is the signed one: `docker compose start executor-runner`.
 
 After about two minutes (five after the `create` step), make sure that both containers are up:
 
