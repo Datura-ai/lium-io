@@ -62,11 +62,11 @@ def calculate_scores(
         )
 
     # Minimal-G5 CVM attestation gate: a CVM-flagged executor (it presented a TDX
-    # quote) whose attestation did not pass earns nothing. Non-CVM executors (no quote)
+    # quote) whose TDX attestation did not pass earns nothing. Non-CVM executors (no quote)
     # are untouched — omitted-quote bypass by a known CVM is rejected upstream by the
     # attestation ratchet. Only with the TDX verifier configured (otherwise nothing is
-    # attested), and not for a failed GPU-CC verdict alone: that stays observe-only until
-    # ENABLE_GPU_ATTESTATION_ENFORCEMENT, like the CVM capability path in rental_price.py.
+    # attested). GPU attestation is observe-only: tdx_attestation_passed also drops on a
+    # verified-bad GPU verdict, and that alone must not zero the score.
     if (
         settings.TDX_VERIFIER_URL
         and ctx.executor.tdx_quote
@@ -75,7 +75,7 @@ def calculate_scores(
     ):
         actual_score = 0.0
         job_score = 0.0
-        warning_messages.append("CVM attestation not passed (TDX/GPU attestation required)")
+        warning_messages.append("CVM attestation not passed (TDX attestation required)")
 
     # CPU-truth gate: the advertised CPU(s) count is contradicted by the kernel-present
     # population. CpuTruthCheck is non-fatal and runs before this, so passed=False alone would
@@ -115,7 +115,9 @@ def calculate_scores(
         warning_messages.append(
             "Rented throughput reading could not run in several cycles in a row"
             if ctx.rented_throughput_not_run
+            # the portal matches the prefix; the detail after it names the side and its values
             else "A rented pod gets far too little network or disk throughput"
+            + (f" ({ctx.rented_throughput_slow_detail})" if ctx.rented_throughput_slow_detail else "")
         )
 
     # GPU identity gate (DAH-4551): non-fatal on a live rental, so only this line zeroes the

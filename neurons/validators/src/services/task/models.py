@@ -47,6 +47,9 @@ class JobResult(BaseModel):
     # One timestamp shared by every executor finalized in this validator cycle.
     # It is assigned after final weights are calculated and is the accounting/day key.
     scored_at: datetime | None = None
+    # Set by the express lane: when its run outside the cycle started (the backend reads it, not job_batch_id,
+    # against a maintenance window's end).
+    check_started_at: datetime | None = None
     gpu_model: str | None = None
     gpu_count: int = 0
     sysbox_runtime: bool = False
@@ -126,6 +129,9 @@ class JobResult(BaseModel):
     # DAH-4658: the node's last scored result, standing in for a scrape the renter's GPU reset hid the cards
     # from; scored like the cycle it came from, never published
     carried_for_renter_gpu_reset: bool = Field(default=False, exclude=True)
+    # DAH-5718: the validator's own SSH session died in the port check; no verdict this cycle (withheld at cycle end),
+    # only the findings of the checks that finished are published
+    session_lost_in_port_check: bool = Field(default=False, exclude=True)
 
     # Incentive relevant fields
     mining_score: float | None = None                   # Score for mining pool for scoring logic
@@ -156,6 +162,11 @@ class JobResult(BaseModel):
     # the share of its own spot rate a spot node is paid: below 1 when its GPU model's spot nodes would
     # together be paid more than the model's fillers earn per hour (filler_revenue_usd_per_hour)
     spot_pool_multiplier: float | None = None
+    # DAH-5944: idle spot GPUs have their own cap per (GPU model, bucket) at the secure numbers. Kept apart
+    # from max_cap / total_unrented_by_gpu_type / unrented_cap_multiplier, which mean a secure tier.
+    spot_cap: int | None = None
+    spot_gpus_in_bucket: int | None = None
+    spot_cap_multiplier: float | None = None
     # Spot pay and secure-floor top-ups are paid on top of the burn-capped rental share:
     # unbucketed_share is the emission share that pays them, unbucketed_rental_cost their USD/hour,
     # floor_top_up_rate the per-GPU USD/hour the floor added to this node (after its multipliers),
