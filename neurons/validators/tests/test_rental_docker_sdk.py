@@ -781,6 +781,113 @@ async def test_run_container_creates_the_container_with_the_spec_labels_and_the_
     }
 
 
+class CpuRefusingApiClient(FakeApiClient):
+    """dockerd on a host with `daemon_cpus` CPUs: refuses any --cpus above that at create."""
+
+    def __init__(self, daemon_cpus):
+        super().__init__()
+        self.daemon_cpus = daemon_cpus
+        self.create_nano_cpus = []
+
+    def create_container(self, **kwargs):
+        nano = self.host_config_kwargs.get("nano_cpus")
+        self.create_nano_cpus.append(nano)
+        if nano and nano > self.daemon_cpus * 1_000_000_000:
+            self.events.append("create_container")
+            raise APIError(
+                "400 Client Error: Bad Request",
+                explanation=(
+                    f"range of CPUs is from 0.01 to {self.daemon_cpus}.00, as there are only "
+                    f"{self.daemon_cpus} CPUs available"
+                ),
+            )
+        return super().create_container(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_run_container_retries_a_cpu_refusal_within_the_bound_with_the_daemon_count():
+    api_client = CpuRefusingApiClient(daemon_cpus=10)
+    granted = []
+
+    container_id = await RentalDockerSdkClient(api_client).run_container(
+        ContainerRunSpec(
+            image="img",
+            name="pod_t",
+            cpu_count=12,
+            min_cpu_count=10,
+            pids_limit=12_000,
+            pids_limit_for=lambda cpus: cpus * 1000,
+            on_cpus_granted=granted.append,
+        )
+    )
+
+    assert container_id == "container-id"
+    assert api_client.create_nano_cpus == [12_000_000_000, 10_000_000_000]
+    assert api_client.created_container["labels"]["io.lium.cpu_count"] == "10"
+    assert api_client.host_config_kwargs["pids_limit"] == 10_000
+    assert granted == [10]
+
+
+@pytest.mark.asyncio
+async def test_run_container_does_not_retry_a_cpu_refusal_below_the_renters_minimum():
+    api_client = CpuRefusingApiClient(daemon_cpus=10)
+
+    with pytest.raises(RentalDockerOperationError, match="only 10 CPUs available"):
+        await RentalDockerSdkClient(api_client).run_container(
+            ContainerRunSpec(image="img", name="pod_t", cpu_count=12, min_cpu_count=12)
+        )
+
+    assert api_client.create_nano_cpus == [12_000_000_000]
+
+
+class ShrinkingCpuApiClient(CpuRefusingApiClient):
+    """dockerd whose CPU count drops between the create and its retry."""
+
+    def __init__(self, daemon_cpus_per_create):
+        super().__init__(daemon_cpus_per_create[0])
+        self.daemon_cpus_per_create = list(daemon_cpus_per_create)
+
+    def create_container(self, **kwargs):
+        self.daemon_cpus = self.daemon_cpus_per_create.pop(0)
+        return super().create_container(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_run_container_retries_a_cpu_refusal_only_once():
+    api_client = ShrinkingCpuApiClient([10, 6])
+
+    with pytest.raises(RentalDockerOperationError, match="only 6 CPUs available"):
+        await RentalDockerSdkClient(api_client).run_container(
+            ContainerRunSpec(image="img", name="pod_t", cpu_count=12)
+        )
+
+    assert api_client.create_nano_cpus == [12_000_000_000, 10_000_000_000]
+
+
+@pytest.mark.asyncio
+async def test_run_container_does_not_retry_a_cpu_refusal_past_the_bound():
+    api_client = CpuRefusingApiClient(daemon_cpus=10)
+
+    with pytest.raises(RentalDockerOperationError, match="only 10 CPUs available"):
+        await RentalDockerSdkClient(api_client).run_container(
+            ContainerRunSpec(image="img", name="pod_t", cpu_count=64)
+        )
+
+    assert api_client.create_nano_cpus == [64_000_000_000]
+
+
+@pytest.mark.asyncio
+async def test_run_container_does_not_retry_a_cpu_refusal_more_than_two_cpus_short():
+    api_client = CpuRefusingApiClient(daemon_cpus=4)
+
+    with pytest.raises(RentalDockerOperationError, match="only 4 CPUs available"):
+        await RentalDockerSdkClient(api_client).run_container(
+            ContainerRunSpec(image="img", name="pod_t", cpu_count=11)
+        )
+
+    assert api_client.create_nano_cpus == [11_000_000_000]
+
+
 @pytest.mark.asyncio
 async def test_run_container_without_a_network_stays_on_the_default_bridge():
     api_client = FakeApiClient()
