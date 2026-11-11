@@ -377,7 +377,7 @@ async def _read_broken_uuids(ctx: Context) -> BrokenCardsRead:
     return BrokenCardsRead(uuids, updates, hw_uuids)
 
 
-def _unverified_drop(rented_total: int, anchor_uuids: list[str]) -> GpuDrop:
+def _scrape_timeout_drop(rented_total: int, anchor_uuids: list[str]) -> GpuDrop:
     """No reading at all: nothing is read from the node, and no card is named."""
     return GpuDrop(
         expected=max(rented_total or 1, len(anchor_uuids)),
@@ -433,7 +433,7 @@ class RentedGpuDropCheck:
         anchor_uuids = split_uuids((ctx.verified or {}).get(GPU_ANCHOR_KEY) or "")
         if self.scrape_timed_out_repeatedly:
             broken_uuids, hw_uuids, updates = None, None, {}
-            drop: GpuDrop | None = _unverified_drop(rented_total, anchor_uuids)
+            drop: GpuDrop | None = _scrape_timeout_drop(rented_total, anchor_uuids)
         else:
             memory = await _read_broken_uuids(ctx)
             broken_uuids, hw_uuids, updates = memory.uuids, memory.hw_uuids, memory.updates

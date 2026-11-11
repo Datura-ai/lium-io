@@ -1121,6 +1121,15 @@ def card_xid_faults(snapshot: dict, xid: dict, xid_seen: int | None) -> list[str
     return faults
 
 
+def boot_id() -> str | None:
+    """The host's boot id (the same inside a container): a new one proves the host rebooted."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
 def print_nvml_health_report(mp, xid_seen: int | None = None) -> None:
     """The `--nvml-only` verdict: one NVML snapshot and its standing memory faults, plus the cards'
     new hardware Xids and this read's PCIe downgrades."""
@@ -1137,6 +1146,7 @@ def print_nvml_health_report(mp, xid_seen: int | None = None) -> None:
         "xid_faults": card_xid_faults(snapshot, xid, xid_seen),
         # the kernel log is often not readable from the container: then no Xid is judged
         "xid": {k: v for k, v in xid.items() if k in ("available", "count", "error")},
+        "boot_id": boot_id(),
     }
     print(JSON_MARKER, json.dumps(report, sort_keys=True))
 

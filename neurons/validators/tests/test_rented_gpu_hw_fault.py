@@ -96,6 +96,7 @@ def test_nvml_only_reports_the_xid_read_and_the_card_lists():
     assert set(report["xid"]) <= {"available", "count", "error"}
     assert "available" in report["xid"]
     assert report["card_suspects"] == [] and report["xid_faults"] == []
+    assert report["boot_id"] is None or isinstance(report["boot_id"], str)
 
 
 # --- the validator's memory read --------------------------------------------------------------------------------
@@ -153,19 +154,83 @@ async def test_a_downgrade_counts_from_its_second_read_and_holds_until_a_full_li
 
 
 @pytest.mark.asyncio
-async def test_an_xid_fault_holds_until_the_kernel_log_restarts(context_factory):
+async def test_an_xid_fault_holds_until_the_host_boots_again(context_factory):
     services = _services()
     xid_fault = f"gpu 3 ({UUIDS[3]}): new NVRM Xid on a probed GPU: {HW}"
-    await _read(context_factory, services, _ok(xid={"available": True, "count": 4}))
-    new, _ = await _read(context_factory, services, _ok(xid={"available": True, "count": 5}, xid_faults=[xid_fault]))
-    quiet, _ = await _read(context_factory, services, _ok(xid={"available": True, "count": 5}))
-    unread, _ = await _read(context_factory, services, _ok(xid={"available": False, "error": "denied"}))
-    rebooted, _ = await _read(context_factory, services, _ok(xid={"available": True, "count": 1}))
+    boot = {"boot_id": "boot-a"}
+    await _read(context_factory, services, _ok(xid={"available": True, "count": 4}, **boot))
+    new, _ = await _read(
+        context_factory, services, _ok(xid={"available": True, "count": 5}, xid_faults=[xid_fault], **boot)
+    )
+    quiet, _ = await _read(context_factory, services, _ok(xid={"available": True, "count": 5}, **boot))
+    unread, _ = await _read(context_factory, services, _ok(xid={"available": False, "error": "denied"}, **boot))
+    # a cleared or wrapped kernel log shrinks the count on the same boot: no proof
+    cleared, _ = await _read(context_factory, services, _ok(xid={"available": True, "count": 1}, **boot))
+    no_boot_id, _ = await _read(context_factory, services, _ok(xid={"available": True, "count": 1}))
+    rebooted, _ = await _read(context_factory, services, _ok(xid={"available": True, "count": 1}, boot_id="boot-b"))
 
     assert new.report["card_faults"] == [xid_fault]
     assert quiet.report["card_faults"] == [xid_fault]
     assert unread.report["card_faults"] == [xid_fault]
+    assert cleared.report["card_faults"] == [xid_fault]
+    assert no_boot_id.report["card_faults"] == [xid_fault]
     assert rebooted.report["card_faults"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_card_state_redis_cannot_read_is_unread_and_not_overwritten(context_factory, monkeypatch):
+    services = _services()
+    await _read(context_factory, services, _ok(card_suspects=[NARROW_LINK]))
+    await _read(context_factory, services, _ok(card_suspects=[NARROW_LINK]))
+    stored = _stored(services.redis)
+
+    async def failing_get(key):
+        raise ConnectionError("redis down")
+
+    monkeypatch.setattr(services.redis, "get", failing_get)
+    read, _ = await _read(context_factory, services, _ok(gpu=FULL_LINK_AT_P0, card_suspects=[]))
+
+    assert gpu_memory_health.card_fault_uuids(read.report) is None
+    assert _stored(services.redis) == stored
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "gpu",
+    [
+        pytest.param({"uuid": None}, id="card-without-uuid-in-the-read"),
+        pytest.param({"pstate": 0, "pcie_width": None, "pcie_width_max": None}, id="pcie-values-unread"),
+    ],
+)
+async def test_a_read_missing_values_does_not_heal_a_held_downgrade(context_factory, gpu):
+    services = _services()
+    await _read(context_factory, services, _ok(card_suspects=[NARROW_LINK]))
+    await _read(context_factory, services, _ok(card_suspects=[NARROW_LINK]))
+    read, _ = await _read(context_factory, services, _ok(gpu=gpu, card_suspects=[]))
+
+    assert read.report["card_faults"] == [NARROW_LINK]
+
+
+@pytest.mark.asyncio
+async def test_a_link_that_changes_width_between_reads_still_confirms(context_factory):
+    services = _services()
+    narrower = f"gpu 3 ({UUIDS[3]}): PCIe link x4 of x16"
+    await _read(context_factory, services, _ok(card_suspects=[NARROW_LINK]))
+    second, _ = await _read(context_factory, services, _ok(card_suspects=[narrower]))
+
+    assert second.report["card_faults"] == [narrower]
+
+
+@pytest.mark.asyncio
+async def test_repeated_xids_on_one_card_keep_one_held_fault(context_factory):
+    services = _services()
+    boot = {"boot_id": "boot-a"}
+    await _read(context_factory, services, _ok(xid={"available": True, "count": 4}, **boot))
+    for count in range(5, 9):
+        faults = [f"gpu 3 ({UUIDS[3]}): new NVRM Xid on a probed GPU: {HW} #{n}" for n in range(2)]
+        await _read(context_factory, services, _ok(xid={"available": True, "count": count}, xid_faults=faults, **boot))
+
+    assert len(_stored(services.redis)["held"]) == 1
 
 
 @pytest.mark.asyncio
