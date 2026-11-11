@@ -24,6 +24,10 @@ EXECUTOR_RUNNER_CONTAINER_NAME = "executor-runner"
 # is `<project>-executor-runner-1` there (`executor-executor-runner-1` under the default project),
 # so the standard stack is found by this label when the CVM name above does not exist.
 EXECUTOR_RUNNER_SERVICE_LABEL = "com.docker.compose.service=executor-runner"
+COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
+# This watchtower's own container ID is in its mount sources (/var/lib/docker/containers/<id>/hostname).
+MOUNTINFO_PATH = "/proc/self/mountinfo"
+_OWN_CONTAINER_ID = re.compile(r"/containers/([0-9a-f]{64})/")
 # Docker Hub's registry host. `registry-mirrors` in the daemon apply to `docker.io` names only,
 # so a reference that names this host goes straight to Docker Hub.
 CANONICAL_REGISTRY_HOST = "registry-1.docker.io"
@@ -114,9 +118,34 @@ def pull_image_by_digest(client: docker.DockerClient, image_name: str, remote_di
     return reference
 
 
+def own_compose_project(client: docker.DockerClient) -> Optional[str]:
+    """
+    The compose project of this watchtower's own container, or None when it runs in no container or
+    its container has no project (the CVM stack, `docker run`). A host can carry a second executor
+    project (an old checkout, a stopped test stack); the runner lookup by label is scoped to this one.
+
+    Raises:
+        RunnerLookupError: its own container is known but could not be inspected. Read as "no
+            project", that would widen the lookup to every stack on the host for this cycle.
+    """
+    try:
+        with open(MOUNTINFO_PATH) as f:
+            match = _OWN_CONTAINER_ID.search(f.read())
+    except OSError:
+        return None
+    if not match:
+        return None
+    try:
+        own = client.containers.get(match.group(1))
+    except Exception as e:
+        raise RunnerLookupError(f"inspecting this watchtower's own container failed: {e}") from e
+    return own.labels.get(COMPOSE_PROJECT_LABEL) or None
+
+
 def find_runner_container(client: docker.DockerClient) -> Optional[Container]:
     """
-    Find the executor-runner container: by the CVM name first, then by the compose service label.
+    Find the executor-runner container. Inside a compose project: by the service label within that
+    project only. Outside one (the CVM stack, `docker run`): by the CVM name first, then by the label.
 
     A container named `<runner>-previous-<id>` is a leftover of an interrupted
     `recreate_container` (the daemon or this process died between the rename and the
@@ -134,13 +163,18 @@ def find_runner_container(client: docker.DockerClient) -> Optional[Container]:
             more than one leftover and no live runner, or the listing failed. The caller
             must not pull or create anything in that state.
     """
-    container = find_container_by_name(client, EXECUTOR_RUNNER_CONTAINER_NAME)
-    if container is not None:
-        return container
+    # Inside a compose project only that project's labelled containers count: a container named
+    # `executor-runner` or `executor-runner-previous-*` on the same host can belong to another stack.
+    project = own_compose_project(client)
+    if not project:
+        container = find_container_by_name(client, EXECUTOR_RUNNER_CONTAINER_NAME)
+        if container is not None:
+            return container
     try:
-        matches = client.containers.list(all=True, filters={"label": EXECUTOR_RUNNER_SERVICE_LABEL})
+        label = [EXECUTOR_RUNNER_SERVICE_LABEL, f"{COMPOSE_PROJECT_LABEL}={project}"] if project else EXECUTOR_RUNNER_SERVICE_LABEL
+        matches = client.containers.list(all=True, filters={"label": label})
         # the CVM runner carries no compose label: its leftover is found by name
-        cvm_leftovers = client.containers.list(
+        cvm_leftovers = [] if project else client.containers.list(
             all=True, filters={"name": f"^/?{EXECUTOR_RUNNER_CONTAINER_NAME}{PREVIOUS_RUNNER_SUFFIX}"}
         )
     except Exception as e:
