@@ -105,8 +105,9 @@ class BatchVerifier:
                     await asyncio.sleep(2)
 
             except asyncio.TimeoutError:
-                if start_watch.verified:
-                    # the deadline fired after ports answered (a loaded host's starts use most of the 60 s)
+                if start_watch.verified and len(start_watch.verified.successful) >= min_ports:
+                    # the deadline fired after enough ports answered (a loaded host's starts use most of the 60 s);
+                    # fewer than min_ports would fail the port check, so attempt 2 and the slower tiers run
                     logger.info(
                         _m(
                             f"complete: {len(start_watch.verified.successful)}/{len(ports)} verified at the deadline",
@@ -177,7 +178,7 @@ class BatchVerifier:
         if not ports_left:
             return BatchResult(sampled_ok, [], external)
 
-        def answered() -> BatchResult:
+        def ports_answered_so_far() -> BatchResult:
             ok = set(sampled_ok + successful)
             return BatchResult([p for p in ports if p in ok], failed, external)
 
@@ -194,7 +195,7 @@ class BatchVerifier:
 
         async with aiohttp.ClientSession(connector=public_host_connector(limit=0)) as session:
             successful, failed = await self.port_tester.test_many(session, host, ports_left, token, log_ctx)
-            start_watch.verified = answered() if successful else None
+            start_watch.verified = ports_answered_so_far() if successful else None
             # a loaded host binds its nc listeners late; a refused port's listener is still waiting, so
             # re-probe the refused ports while the count is below what PortCountCheck needs to list the node;
             # the published sample alone never ends it: with no host-listener answer the attempt fails below
@@ -205,7 +206,7 @@ class BatchVerifier:
                 await asyncio.sleep(self.REPROBE_DELAY_SEC)
                 late, failed = await self.port_tester.test_many(session, host, failed, token, log_ctx)
                 successful = successful + late
-                start_watch.verified = answered() if successful else None
+                start_watch.verified = ports_answered_so_far() if successful else None
                 logger.debug(
                     _m(f"re-probe {round_no}/{rounds}: {len(late)} late", extra=get_extra_info(log_ctx))
                 )
@@ -217,7 +218,7 @@ class BatchVerifier:
             # DAH-5597: only the host listener decides this tier; a host that drops INPUT but forwards published
             # ports answers the published sample, and must still reach the semi-batch tier
             return BatchResult([], ports, external)
-        return answered()
+        return ports_answered_so_far()
 
     async def _start_container(
         self,
