@@ -31,6 +31,7 @@ from services.redis_service import (
     EDIT_PARKED_CONTAINER_PREFIX,
     FILLER_IMAGE_DIGESTS_PREFIX,
     FILLER_IMAGE_DIGESTS_TTL_SECONDS,
+    STOPPED_BY_RECOVERY_PREFIX,
 )
 from services.gpu_wedge import (
     COMPUTE_APPS_QUERY_COMMAND,
@@ -633,8 +634,19 @@ async def the_backend_still_owns(ctx: Context, container_name: str) -> bool:
 async def _parked_by_this_validator(ctx: Context, container_name: str) -> bool | None:
     """None when the record does not answer: unknown, so the backend's verdict on the pod decides, as for any pod name."""
     if container_name.endswith(RECOVERY_STOPPED_SUFFIX):
-        # a recovery parks under this name only when its Redis mark failed: its record is the recovery's own
-        return await _recovery_parked(_pod_name(container_name).removeprefix(POD_CONTAINER_PREFIX))
+        # a recovery parks under this name only when its Redis mark failed: its record is the recovery's own, or the
+        # mark once its background retry lands (the record may be in a restarted process's memory only)
+        pod_id = _pod_name(container_name).removeprefix(POD_CONTAINER_PREFIX)
+        parked = await _recovery_parked(pod_id)
+        if parked:
+            return True
+        try:
+            if await asyncio.wait_for(ctx.services.redis.get(f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}"), timeout=2):
+                return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Recovery-stop mark unreadable for %s: %s", container_name, exc)
+            return None
+        return parked
     try:
         return bool(
             await asyncio.wait_for(

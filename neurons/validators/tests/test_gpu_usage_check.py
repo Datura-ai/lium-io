@@ -22,7 +22,7 @@ from neurons.validators.src.services.task.messages import TenantEnforcementMessa
 from neurons.validators.src.services.task.pipeline import Pipeline
 from neurons.validators.src.services.task.score_calculator import calculate_scores
 
-from neurons.validators.src.services.redis_service import EDIT_PARKED_CONTAINER_PREFIX
+from neurons.validators.src.services.redis_service import EDIT_PARKED_CONTAINER_PREFIX, STOPPED_BY_RECOVERY_PREFIX
 from tests.helpers import build_context_config, build_services, build_state, default_executor
 
 
@@ -2009,3 +2009,28 @@ async def test_only_the_backends_own_filler_is_left_out_of_the_processes_to_stop
     assert filler_container not in stop
     assert keep.strip() == f"{filler_container} (pid 3217038)."
     assert "filler_*" not in remediation
+
+
+@pytest.mark.parametrize("gpu_details", [BUSY_GPU, IDLE_GPU_HOLDING_VRAM], ids=["busy", "idle"])
+@pytest.mark.asyncio
+async def test_a_recovery_parked_name_is_ours_by_its_redis_mark_when_no_record_is_left(
+    context_factory, monkeypatch, gpu_details
+):
+    # the park record was in a restarted process's memory only; the mark's background retry landed since
+    services = build_services(score_calculator=_Scores())
+    monkeypatch.setattr(gpu_usage, "_recovery_parked", AsyncMock(return_value=False))
+    services.redis.store[f"{STOPPED_BY_RECOVERY_PREFIX}{TEARDOWN_POD_ID}"] = "stopped"
+    services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
+        active=True, executor_id=default_executor().uuid
+    )
+    state = build_state(
+        gpu_details=gpu_details,
+        gpu_processes=[_pod_process(f"{TEARDOWN_POD}__stopped")],
+        rented_data=RentedExecutorsResponse(executors={}),
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state, rented=False)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    services.backend.get_pod_rental_active.assert_awaited_once_with(TEARDOWN_POD_ID)

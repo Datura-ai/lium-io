@@ -762,6 +762,25 @@ async def test_the_parked_name_is_recorded_while_parked_and_kept_briefly_after_t
 
 
 @pytest.mark.asyncio
+async def test_a_recovered_kept_container_is_recorded_again_before_its_stop():
+    # its earlier edit's record may have expired: unrecorded, a GPU check during this edit judges it the provider's
+    from services.docker_service import _EditSwap
+    from services.redis_service import EDIT_PARKED_CONTAINER_PREFIX, EDIT_PARKED_CONTAINER_TTL_SECONDS
+
+    redis = AsyncMock()
+    ssh = _ssh_recording(container_present=False)
+    old = "kept_unmounted_abc_1700000000"
+    ssh.kept = [old]
+    swap = _EditSwap(ssh, "pod_abc", {}, redis=redis, executor_id="ex-1")
+
+    parked = await swap.park()
+
+    assert parked == old
+    redis.set.assert_awaited_once_with(f"{EDIT_PARKED_CONTAINER_PREFIX}ex-1:{old}", "1", ex=EDIT_PARKED_CONTAINER_TTL_SECONDS)
+    assert _docker(ssh.commands, "rename") == []
+
+
+@pytest.mark.asyncio
 async def test_an_edit_whose_parked_record_cannot_be_written_leaves_the_pod_as_it_was():
     from services.docker_service import _EditSwap
 

@@ -2065,12 +2065,14 @@ class _EditSwap:
             if self.was_mounted is None and self.plaintext_path:
                 # unknown, an undo could not tell whether to remount the workspace: the running pod stays as it is
                 raise Exception("[park_current_container] the pod's volume mount could not be read; the pod was left as it was")
-            if self.redis is not None and self.executor_id:
-                self.parked_record_key = f"{EDIT_PARKED_CONTAINER_PREFIX}{self.executor_id}:{parked}"
-            await self._record_parked(True)
-            if self.parked_record_key is not None and not self.parked_recorded:
-                # unrecorded, the GPU check would judge the renter's own load as the provider's while it is parked
-                raise Exception("[park_current_container] the parked container could not be recorded; the pod was left as it was")
+        # a recovered kept container is recorded again too: its earlier edit's record may have expired
+        if self.redis is not None and self.executor_id:
+            self.parked_record_key = f"{EDIT_PARKED_CONTAINER_PREFIX}{self.executor_id}:{parked}"
+        await self._record_parked(True)
+        if self.parked_record_key is not None and not self.parked_recorded:
+            # unrecorded, the GPU check would judge the renter's own load as the provider's while it is parked
+            raise Exception("[park_current_container] the parked container could not be recorded; the pod was left as it was")
+        if not recover_kept:
             await self._rename_aside(container_id, parked)
         self.parked_name = parked
         self.parked_id = container_id
