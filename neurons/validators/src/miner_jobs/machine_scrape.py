@@ -632,9 +632,28 @@ def nvmlStructToFriendlyObject(struct):
 
 
 def nvmlDeviceGetComputeRunningProcesses_v2(handle):
+    return _nvmlDeviceGetRunningProcesses_v2(handle, "nvmlDeviceGetComputeRunningProcesses_v2")
+
+
+def nvmlDeviceGetGraphicsRunningProcesses_v2(handle):
+    return _nvmlDeviceGetRunningProcesses_v2(handle, "nvmlDeviceGetGraphicsRunningProcesses_v2")
+
+
+def graphicsOnlyMemoryMb(handle):
+    # VRAM held by graphics-only contexts (a desktop's Xorg / compositor). The driver sets the context
+    # type, so renaming a process cannot move compute work here: a C+G process stays a compute owner.
+    compute_pids = {proc.c_nvmlProcessInfo_v2_t_pid for proc in nvmlDeviceGetComputeRunningProcesses_v2(handle)}
+    return sum(
+        (proc.c_nvmlProcessInfo_v2_t_usedGpuMemory or 0)
+        for proc in nvmlDeviceGetGraphicsRunningProcesses_v2(handle)
+        if proc.c_nvmlProcessInfo_v2_t_pid not in compute_pids
+    ) / (1024 ** 2)
+
+
+def _nvmlDeviceGetRunningProcesses_v2(handle, function_name):
     # first call to get the size
     c_count = c_uint(0)
-    fn = _nvmlGetFunctionPointer("nvmlDeviceGetComputeRunningProcesses_v2")
+    fn = _nvmlGetFunctionPointer(function_name)
     ret = fn(handle, byref(c_count), None)
     if (ret == NVML_SUCCESS):
         # special case, no running processes
@@ -2260,6 +2279,8 @@ def read_gpu_details(device_count, gpu_process_ids):
                         lambda: nvmlDeviceGetMaxClockInfo(handle, NVML_CLOCK_GRAPHICS)
                     ),
                     "gpu.clocks_event_reasons": safeNvmlValue(lambda: nvmlDeviceGetClocksEventReasons(handle)),
+                    # GpuUsageCheck: VRAM a desktop holds is not a hidden workload. None on a driver without the call.
+                    "gpu.graphics_only_memory_mb": safeNvmlValue(lambda: graphicsOnlyMemoryMb(handle)),
                 }
             )
 

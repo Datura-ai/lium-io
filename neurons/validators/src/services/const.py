@@ -135,6 +135,9 @@ GPU_MEMORY_UTILIZATION_LIMIT = 5  # percent
 # 22 GB at idle reads ~0%. Judge held VRAM in absolute MB instead; the floor sits above the
 # driver-reserved block NVML counts (measured up to 728 MB on B200).
 GPU_HELD_VRAM_MB_LIMIT = 2048
+# DAH-4889: VRAM a desktop's graphics-only contexts hold (Xorg, compositor) is not a hidden workload,
+# credited up to this much per card; a graphics context holding more is no desktop and stays judged.
+GPU_DESKTOP_GRAPHICS_VRAM_MB_LIMIT = 1024
 
 # DAH-2427 ghost GPU: an orphaned CUDA kernel left by a hard-killed GPU process pins the
 # card at full utilization with no memory and no process attached (observed for days on

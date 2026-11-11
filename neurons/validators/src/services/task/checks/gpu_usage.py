@@ -6,7 +6,6 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from uuid import UUID
 
-from core.config import settings
 from protocol.vc_protocol.compute_requests import (
     BROKEN_POD_STATUS,
     LIVE_FILLER_RUN_STATUSES,
@@ -17,6 +16,7 @@ from services.const import (
     BROKEN_POD_CONTAINER_GRACE_MINUTES,
     EDIT_PARKED_SUFFIX,
     FILLER_CONTAINER_PREFIX,
+    GPU_DESKTOP_GRAPHICS_VRAM_MB_LIMIT,
     GPU_HELD_VRAM_MB_LIMIT,
     GPU_MEMORY_UTILIZATION_LIMIT,
     GPU_UTILIZATION_LIMIT,
@@ -56,6 +56,7 @@ class ForeignGpuProcess:
 class HeldVram:
     gpu_uuid: str | None
     memory_used_mb: float
+    desktop_graphics_mb: float = 0
 
 
 @dataclass(frozen=True)
@@ -210,7 +211,7 @@ class GpuUsageCheck:
             if not live_memory_mb:
                 return False
             return any(
-                live_memory_mb.get(held.gpu_uuid or "", 0) > GPU_HELD_VRAM_MB_LIMIT
+                live_memory_mb.get(held.gpu_uuid or "", 0) - held.desktop_graphics_mb > GPU_HELD_VRAM_MB_LIMIT
                 for held in held_vram
             )
         except Exception as exc:  # noqa: BLE001
@@ -593,7 +594,11 @@ async def the_backend_still_owns(ctx: Context, container_name: str) -> bool:
         return True
     if not _the_answer_is_about_this_node(ctx, pod_rental.executor_id):
         return False
-    return pod_rental.active or _a_broken_pod_the_reaper_has_not_collected_yet(pod_rental)
+    if _a_broken_pod_the_reaper_has_not_collected_yet(pod_rental):
+        return True
+    # A pod that ended within its teardown grace gets the same verdict at 0% load as above the limit.
+    rental = _pod_container_rental_from(ctx, container_name, backend_issued_id, pod_rental)
+    return rental.state not in _ORPHAN_STATES
 
 
 def _a_broken_pod_the_reaper_has_not_collected_yet(pod_rental: PodRentalActiveResponse) -> bool:
@@ -647,11 +652,18 @@ async def _pod_container_rental(ctx: Context, container_name: str) -> PodContain
             container_name, None, PodRentalState.ORPHAN, "its name carries no pod id Lium issued"
         )
 
+    pod_rental: PodRentalActiveResponse | None = await ctx.services.backend.get_pod_rental_active(pod_id)
+    return _pod_container_rental_from(ctx, container_name, pod_id, pod_rental)
+
+
+def _pod_container_rental_from(
+    ctx: Context, container_name: str, pod_id: str, pod_rental: PodRentalActiveResponse | None
+) -> PodContainerRental:
+    """`_pod_container_rental`'s verdict on a backend answer already in hand."""
     rented_executor = rental_of_this_node(ctx)
     rented_at_run_start: bool = rented_executor is not None and any(
         pod.pod_id == pod_id for pod in rented_executor.pods
     )
-    pod_rental: PodRentalActiveResponse | None = await ctx.services.backend.get_pod_rental_active(pod_id)
 
     if pod_rental is not None and not _the_answer_is_about_this_node(ctx, pod_rental.executor_id):
         if pod_rental.active:
@@ -783,11 +795,16 @@ def _held_vram_without_owner(
     """
     if gpu_processes or workload_containers:
         return []
-    return [
-        HeldVram(gpu_uuid=detail.get("uuid"), memory_used_mb=detail.get("memory_used_mb") or 0)
-        for detail in gpu_details
-        if (detail.get("memory_used_mb") or 0) > GPU_HELD_VRAM_MB_LIMIT
-    ]
+    held_vram: list[HeldVram] = []
+    for detail in gpu_details:
+        memory_used_mb: float = detail.get("memory_used_mb") or 0
+        # The scrape lists compute contexts only, so a desktop's graphics-only VRAM reads as ownerless.
+        desktop_graphics_mb: float = min(
+            detail.get("graphics_only_memory_mb") or 0, GPU_DESKTOP_GRAPHICS_VRAM_MB_LIMIT
+        )
+        if memory_used_mb - desktop_graphics_mb > GPU_HELD_VRAM_MB_LIMIT:
+            held_vram.append(HeldVram(detail.get("uuid"), memory_used_mb, desktop_graphics_mb))
+    return held_vram
 
 
 def _find_violation(gpu_details: list[dict], gpu_processes: list[dict]) -> dict | None:
