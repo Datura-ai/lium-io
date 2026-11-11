@@ -16,6 +16,7 @@ from fastapi import Depends
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.const import TDX_WHITELIST
+from services.node_host import reports_registered_host_key
 from services.redis_service import RedisService
 
 logger = logging.getLogger(__name__)
@@ -708,6 +709,12 @@ class AttestationService:
         await self._reject_omitted_quote_if_ratcheted(executor)
 
         should_verify = self._should_verify(executor)
+
+        # before any policy is built: a rental pinned to an unregistered key would trust whatever machine the name points at
+        if not reports_registered_host_key(executor):
+            raise AttestationError(
+                f"Executor {executor.address}:{executor.port} reported an SSH host key that is not registered for its hostname"
+            )
 
         if not executor.ssh_host_key:
             if should_verify:

@@ -1360,6 +1360,30 @@ def test_require_rental_docker_ssh_host_key_strips_present_key():
     assert require_rental_docker_ssh_host_key(executor_info) == "ssh-ed25519 AAAATESTKEY"
 
 
+@pytest.mark.parametrize(
+    ("registered", "accepted"),
+    [("ssh-ed25519 AAAAOTHERKEY", False), ("ssh-ed25519 AAAAOTHERKEY\nssh-ed25519 AAAATESTKEY node", True)],
+)
+def test_require_rental_docker_ssh_host_key_checks_a_hostnames_registered_key(registered, accepted):
+    executor_info = ExecutorSSHInfo(
+        uuid="executor-id",
+        address="node.example",
+        port=8000,
+        ssh_username="root",
+        ssh_port=2222,
+        python_path="/usr/bin/python",
+        root_dir="/root",
+        ssh_host_key="ssh-ed25519 AAAATESTKEY",
+        expected_ssh_host_key=registered,
+    )
+
+    if accepted:
+        assert require_rental_docker_ssh_host_key(executor_info) == "ssh-ed25519 AAAATESTKEY"
+    else:
+        with pytest.raises(RentalDockerConnectionError, match="not the host key registered"):
+            require_rental_docker_ssh_host_key(executor_info)
+
+
 def test_rental_ssh_adapter_uses_explicit_key_and_known_hosts(monkeypatch, tmp_path):
     import paramiko
 

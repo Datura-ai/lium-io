@@ -38,6 +38,24 @@ def is_ip_literal(host: str) -> bool:
     return True
 
 
+def host_key_body(openssh: str | None) -> str:
+    """`<type> <base64>` of an OpenSSH public key line, without its comment."""
+    return " ".join((openssh or "").split()[:2])
+
+
+def registered_host_keys(executor) -> set[str]:
+    """Host keys the portal recorded for a hostname node (one per line); empty for an IP or an unrecorded name."""
+    if is_ip_literal(executor.address):
+        return set()
+    return {host_key_body(line) for line in (executor.expected_ssh_host_key or "").splitlines()} - {""}
+
+
+def reports_registered_host_key(executor) -> bool:
+    """A hostname can be repointed at another machine: its reported key must be one the portal recorded."""
+    registered = registered_host_keys(executor)
+    return not registered or host_key_body(executor.ssh_host_key) in registered
+
+
 class _CheckedAddresses(list):
     """``resolve_public_host``'s results for a name; keeps the name so the dial can log both."""
 

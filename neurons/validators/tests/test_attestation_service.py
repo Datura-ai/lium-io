@@ -5,7 +5,7 @@ from typing import Any
 import asyncssh  # noqa: E402
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo  # noqa: E402
-from neurons.validators.src.services.attestation_service import AttestationService  # noqa: E402
+from neurons.validators.src.services.attestation_service import AttestationError, AttestationService  # noqa: E402
 from core.config import settings  # noqa: E402
 
 
@@ -25,8 +25,24 @@ def _fixture() -> dict[str, Any]:
     return json.loads(FIXTURE_PATH.read_text())
 
 
+def _other_key() -> str:
+    return asyncssh.generate_private_key("ssh-ed25519").export_public_key("openssh").decode().strip()
+
+
+# expected_ssh_host_key is what the portal recorded for the node; a hostname's reported key must be one of them
 @pytest.mark.asyncio
-async def test_attestation_service_accepts_fixture_quote(monkeypatch):
+@pytest.mark.parametrize(
+    ("address", "expected", "accepted"),
+    [
+        ("executor.example", "missing", True),
+        ("executor.example", "matching", True),
+        ("executor.example", "mismatching", False),
+        ("executor.example", "multiline", True),
+        # an IP cannot be repointed by DNS; NodeAccountCheck skips it the same way
+        ("192.0.2.10", "mismatching", True),
+    ],
+)
+async def test_attestation_service_accepts_fixture_quote(monkeypatch, address, expected, accepted):
     fixture = _fixture()
     quote_json = json.dumps(fixture["quote_response"])
 
@@ -52,7 +68,7 @@ async def test_attestation_service_accepts_fixture_quote(monkeypatch):
 
     executor_info = ExecutorSSHInfo(
         uuid="test-executor",
-        address="executor.example",
+        address=address,
         port=2222,
         ssh_username="exec-user",
         ssh_port=2222,
@@ -64,6 +80,20 @@ async def test_attestation_service_accepts_fixture_quote(monkeypatch):
         ssh_host_key=fixture["host_key"],
         tdx_quote=quote_json,
     )
+
+    if expected == "matching":
+        executor_info.expected_ssh_host_key = fixture["host_key"]
+    elif expected == "multiline":
+        executor_info.expected_ssh_host_key = f"{_other_key()}\n{fixture['host_key']} recorded-comment\n"
+    elif expected == "mismatching":
+        executor_info.expected_ssh_host_key = (
+            asyncssh.generate_private_key("ssh-ed25519")
+            .export_public_key("openssh").decode().strip()
+        )
+    if not accepted:
+        with pytest.raises(AttestationError):
+            await service.prepare_host_policy(executor_info)
+        return
 
     host_policy = await service.prepare_host_policy(executor_info)
     assert host_policy.known_hosts is not None
