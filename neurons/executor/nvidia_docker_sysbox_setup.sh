@@ -372,7 +372,7 @@ check_fusermount3_apparmor() {
         "or by hand: printf '%s\\n' '$FUSERMOUNT3_RULE' 'umount /var/lib/sysboxfs/**,' | sudo tee -a $FUSERMOUNT3_LOCAL && sudo apparmor_parser -r $FUSERMOUNT3_PROFILE"
 }
 
-# sysbox-ce 0.7.1 ships sysbox-fs/sysbox-mgr with a 10 s start timeout and no Restart=: a slow boot leaves
+# sysbox-ce 0.7.1 ships sysbox-fs (10 s) and sysbox-mgr (45 s) start timeouts and no Restart=: a slow boot leaves
 # sysbox down until someone restarts it by hand, and the node fails every check meanwhile
 SYSBOX_DROPIN_NAME="lium-restart.conf"
 install_sysbox_restart_dropins() {
@@ -659,6 +659,14 @@ check_sysbox() {
             "$(self_cmd)   # upgrades Sysbox; it refuses to run while the node has a rental"
         return 1
     fi
+    local svc
+    for svc in sysbox-fs sysbox-mgr; do
+        if [ ! -f "$(host_path "/etc/systemd/system/${svc}.service.d/$SYSBOX_DROPIN_NAME")" ]; then
+            pf_fix "$svc has no restart-on-failure drop-in: after a slow reboot Sysbox can stay down." \
+                "$(self_cmd)   # adds the drop-ins; restarts no service"
+            return 1
+        fi
+    done
     pf_pass "sysbox-runc ${installed:-installed} runs a container."
 }
 
