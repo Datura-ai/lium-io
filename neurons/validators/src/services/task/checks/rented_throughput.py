@@ -56,6 +56,9 @@ LATE_SKIPS_BEFORE_VERDICT = 3
 SAVE_RESERVE_SECONDS = 5
 RETRY_SECONDS = 30 * 60
 READINGS_BEFORE_VERDICT = 2
+# a failed reading older than this (its retry never ran, e.g. the node was unrented in between) does not count
+# "in a row" with the next one: RETRY_SECONDS plus LATE_SKIPS_BEFORE_VERDICT late cycles fit well inside it
+STREAK_GAP_SECONDS = 3 * RETRY_SECONDS
 BUSY_WINDOW_SECONDS = 2
 DISK_MARKER = "lium_disk"
 SNAP_MARKER = "lium_tp"
@@ -362,6 +365,25 @@ def _step(failures: int, side: str) -> int:
     return failures + 1 if side == "fail" else (0 if side == "pass" else failures)
 
 
+def slow_detail(state: _State) -> str:
+    """Which confirmed side failed and the values behind it, e.g. "network: pypi 1.5 Mbps measured, 10 Mbps
+    required". Read by the score warning and the provider portal, so no "|" (the warning separator)."""
+    reading = state.reading
+    parts = []
+    if state.net_failures >= READINGS_BEFORE_VERDICT:
+        need = reading.get("min_mbps")
+        # only what this reading's network verdict confirmed; a later unjudged reading names no endpoint
+        slow = reading.get("net_failed") or []
+        parts.append(f"network: {', '.join(slow)} measured, {need:g} Mbps required" if slow and need else "network")
+    if state.disk_failures >= READINGS_BEFORE_VERDICT:
+        mb, need = (reading.get("disk") or {}).get("mb_per_s"), reading.get("disk_min_mb_per_s")
+        # a standing verdict can carry a later passing, excused or unjudged write; only a write this reading judged
+        # failing is the failure
+        confirmed = reading.get("disk_verdict") == "fail" and mb is not None and need and mb < need
+        parts.append(f"disk: {mb:.1f} MB/s measured, {need:g} MB/s required" if confirmed else "disk")
+    return "; ".join(parts)
+
+
 @dataclass
 class _State:
     at: float
@@ -419,7 +441,8 @@ class RentedThroughputCheck:
     cannot be read makes it inconclusive; an unsure measurement stays inconclusive. Incomplete pod counters (a pod stopped, restarted or unreadable) make a
     failing side inconclusive too. Inconclusive = no strike and no pass however many in a row (owner decision: IO that
     cannot be attributed never fails a node), re-probed after RETRY_SECONDS.
-    READINGS_BEFORE_VERDICT failing readings of one side in a row (RETRY_SECONDS apart) zero the score
+    READINGS_BEFORE_VERDICT failing readings of one side in a row (RETRY_SECONDS apart; a side's lone failure older than
+    STREAK_GAP_SECONDS starts no streak) zero the score
     (RENTED_THROUGHPUT_SLOW) until that side passes a reading; so do LATE_SKIPS_BEFORE_VERDICT due readings in a row
     skipped for too little cycle time (RENTED_THROUGHPUT_NOT_RUN), until a reading completes. Non-fatal: the rental keeps running.
 
@@ -432,6 +455,8 @@ class RentedThroughputCheck:
     """
 
     check_id = "host.validate.rented_throughput"
+    # a replay would advance this cycle's counters a second time
+    replays_after_session_drop = False
     fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:
@@ -479,10 +504,11 @@ class RentedThroughputCheck:
         skip_under_pressure = await self._reserve_probe_skip(ctx, key, state)
         reading, net, disk = await self._measure_and_judge(ctx, skip_under_pressure=skip_under_pressure)
         reading["inconclusive"] = "inconclusive" in (net, disk)
-        net_failures, disk_failures = (
-            _step(state.net_failures, net),
-            _step(state.disk_failures, disk),
-        )
+        net_failures, disk_failures = state.net_failures, state.disk_failures
+        if now - state.at > STREAK_GAP_SECONDS:
+            # per side, only a strike short of a verdict expires: a standing SLOW stays until a reading passes
+            net_failures, disk_failures = (n if n >= READINGS_BEFORE_VERDICT else 0 for n in (net_failures, disk_failures))
+        net_failures, disk_failures = _step(net_failures, net), _step(disk_failures, disk)
         failures = max(net_failures, disk_failures)
         state = _State(
             at=now,
@@ -633,6 +659,12 @@ class RentedThroughputCheck:
             "min_mbps": settings.CONTAINER_DOWNLOAD_SPEED_MIN_MBPS,
             "disk_min_mb_per_s": settings.RENTED_THROUGHPUT_DISK_MIN_MB_PER_S,
         }
+        if net == "fail":
+            # what _judge confirmed, reused: no second control request to any endpoint
+            reading["net_failed"] = [
+                f"{r.endpoint} {r.mbps:.1f} Mbps" if r.mbps is not None else f"{r.endpoint} {r.error}"
+                for r in judged.failed
+            ]
         if pressure is not None:
             # shadow: what the disk side would be with the gate enforced, next to what it is
             reading["disk_pressure"] = pressure.as_spec()
@@ -669,10 +701,17 @@ class RentedThroughputCheck:
         slow = state.failures_in_a_row >= READINGS_BEFORE_VERDICT
         if slow or state.late_skips >= LATE_SKIPS_BEFORE_VERDICT:
             template = Msg.SLOW if slow else Msg.NOT_RUN
-            event = render_message(template, ctx=ctx, check_id=self.check_id, what=what)
+            detail = slow_detail(state) if slow else ""
+            event = render_message(
+                template,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={**what, "failed": detail} if detail else what,
+                remediation=f"failed: {detail}. {template.remediation}" if detail else None,
+            )
             # NOT_RUN measured nothing, so scoring and the portal must not call it slow
             updates = (
-                {"rented_throughput_passed": False}
+                {"rented_throughput_passed": False, "rented_throughput_slow_detail": detail}
                 if slow
                 else {
                     "rented_throughput_passed": False,

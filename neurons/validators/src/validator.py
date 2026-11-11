@@ -25,8 +25,9 @@ async def app_lifespan(app: FastAPI):
     try:
         yield
     finally:
-        await validator.stop()  # Ensure proper cleanup
-        await task  # Wait for the background task to complete
+        # DAH-6011: let the running cycle finish before cleanup, so a rollout does not lose it
+        await validator.finish_running_cycle(task)
+        await validator.stop()
         logging.info("Validator exited successfully.")
 
 

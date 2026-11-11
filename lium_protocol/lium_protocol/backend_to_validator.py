@@ -43,6 +43,8 @@ class BackendMessageType(enum.Enum):
     ResetPodGpuRequest = "ResetPodGpuRequest"
     # 2.4.0: lock or reset a running pod's GPU clocks; the validator answers with PodGpuClocksResult
     LockPodGpuClocksRequest = "LockPodGpuClocksRequest"
+    # 2.6.0: validate one node now (a provider's "Recheck now")
+    RecheckExecutorRequest = "RecheckExecutorRequest"
 
 
 BACKEND_MESSAGES: Registry[BackendMessage] = Registry(BackendMessageType)
@@ -356,6 +358,15 @@ class ForcedValidationCycleRequest(BackendMessage):
     """Staging only: start the validation cycle now. No executor — the cycle validates the whole fleet."""
 
     message_type: BackendMessageType = BackendMessageType.ForcedValidationCycleRequest
+
+
+@BACKEND_MESSAGES.register
+class RecheckExecutorRequest(BackendMessage):
+    """2.6.0: validate one node now, outside the cycle (a provider's "Recheck now" in the portal). A validator that
+    does not list the node ignores it; an older validator ignores the message."""
+
+    message_type: BackendMessageType = BackendMessageType.RecheckExecutorRequest
+    executor_id: str
 
 
 # --- typeless replies on the socket -----------------------------------------------------------------

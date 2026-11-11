@@ -53,7 +53,7 @@ Docs and the Provider Portal call a miner a **provider** and an executor a **nod
 
 Per GPU host (the full list is in the [Node Quickstart](https://docs.lium.io/providers/nodes/quickstart#requirements)):
 
-- **OS:** Ubuntu 24.04, or Ubuntu 22.04 with the HWE kernel. Sysbox needs kernel 5.19 or newer.
+- **OS:** Ubuntu 24.04 or 26.04, or Ubuntu 22.04 with the HWE kernel. Sysbox needs kernel 5.19 or newer. On 26.04 the Sysbox setup script adds an AppArmor rule so Sysbox can mount its file systems.
 - **GPU:** an NVIDIA model on the [supported list](https://docs.lium.io/providers/architecture#supported-gpus) (the validator's source of truth is `GPU_MODEL_RATES` in [`neurons/validators/src/services/const.py`](neurons/validators/src/services/const.py)), with the driver installed (`nvidia-smi` works).
 - **Docker Engine**, installed and running.
 - **Network:** a public IP and at least **100 Mbps download**, as measured by the validator.
@@ -115,7 +115,7 @@ To set every value by hand, use the [manual setup](neurons/executor/README.md#ma
 | What you see | Cause | Fix |
 |---|---|---|
 | Stuck at `VALIDATION PENDING`, then `NOT_DETECTED`, with no errors | The account has no coordinator, so no check ever runs | Select the Central Provider Server in [Profile Settings](https://provider.lium.io/settings), or start your self-hosted miner |
-| `INSUFFICIENT_PORTS` | Fewer than 3 renting ports are reachable from the validator | Open `RENTING_PORT_RANGE` on the firewall or NAT, or widen it, then `docker compose up -d` in `neurons/executor` |
+| `INSUFFICIENT_PORTS` | Fewer than 3 renting ports are reachable from the validator, or a node offered as GPU splits has fewer than 3 per split (an 8-GPU node in 1-GPU splits needs 24, in 2-GPU splits 12) | Open `RENTING_PORT_RANGE` on the firewall or NAT, or widen it, then `docker compose restart executor-runner` in `neurons/executor` (edit `.env` with nano) |
 | `PORT_VERIFY_FAILED` | A port the validator mapped is closed, or NAT forwards a different external port | Behind NAT, list the pairs in `RENTING_PORT_MAPPINGS` (internal, external) and leave `RENTING_PORT_RANGE` unset |
 | SSH errors or `UPLOAD_FAILED` | The node SSH port (`2200`) is not reachable from outside | Open it, or set `SSH_PUBLIC_PORT` to the port your NAT forwards |
 | Job Logs mention `sysbox-runc` | Sysbox is missing or not working | Rerun step 3; see [Sysbox](https://docs.lium.io/providers/nodes/sysbox) |

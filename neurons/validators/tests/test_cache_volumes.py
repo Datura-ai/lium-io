@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from payload_models.payloads import CacheVolume, ContainerCreateRequest, WorkloadKind
+from services.container_cleanup import idle_filler_images_removal_command
 from services.docker_service import DockerService, _filler_run_volume_gb, _wipe_volume_cmd
 
 
@@ -453,6 +454,94 @@ async def test_an_emptied_cache_left_behind_is_swept_and_never_mounted_as_ready(
     assert await docker_service.select_affordable_cache_volumes(ssh_client, _kimi_filler(), {}) == []
 
 
+_DPHN = ["dphn_cache_dp_runtime-1a2b3c4d", "dphn_cache_hf_auto-5e6f7a8b"]
+
+
+class KilledFillerDolphinHost(HostSshClient):
+    """prod 4 Nov, 8x B300: the killed filler is still exiting (rm timed out, D state) and mounts both Dolphin
+    volumes, so `volume rm` fails; each wipe frees `wiped_gb` when every user is in its allowed list."""
+
+    def __init__(self, users: list[str], wiped_gb: float, **kwargs):
+        super().__init__([*_DPHN, "volume_pod"], **kwargs)
+        self.users = users
+        self.wiped_gb = wiped_gb
+
+    async def run(self, command: str, *args, **kwargs):
+        if "volume rm" in command and "/proc/1/root" in command:
+            allowed = command.split("ok=' ", 1)[1].split(" '", 1)[0].split()
+            if all(user in allowed for user in self.users):
+                self._free_bytes += int(self.wiped_gb * 1024**3)
+        return await super().run(command, *args, **kwargs)
+
+
+def _one_eighth_rental(monkeypatch, docker_service, volume_gb: int, storage_gb: int, existing_bytes: int):
+    monkeypatch.setattr(docker_service, "_get_existing_vloopback_bytes", AsyncMock(return_value=existing_bytes))
+    rental = _rental(volume_gb, storage_gb)
+    rental.disk_share = 0.125
+    return rental
+
+
+# the 4 Nov creates: free and needed GiB from the logs; the Dolphin set's on-disk size there was not
+# logged, so each wipe frees half the gap plus a little (illustrative)
+_DOLPHIN_CASES = [
+    pytest.param("filler_killed_a", 271, 135, 587 * 10**9, 2466.1, id="14:51Z"),
+    pytest.param("filler_killed_b", 358, 179, int(1596.3 * 1024**3), 2324.0, id="18:37Z"),
+    # 1/8 slice, 79 + 39 GB ordered beside 540 GB of pod volumes: needs 461.1 GiB free, 412.9 free
+    pytest.param("filler_killed_c", 79, 39, 540 * 10**9, 412.9, id="20:04Z"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("filler", "volume_gb", "storage_gb", "existing_bytes", "free_gb"), _DOLPHIN_CASES)
+async def test_dolphin_caches_the_killed_filler_still_mounts_are_wiped_and_the_order_keeps_its_size(
+    docker_service, monkeypatch, filler, volume_gb, storage_gb, existing_bytes, free_gb
+):
+    rental = _one_eighth_rental(monkeypatch, docker_service, volume_gb, storage_gb, existing_bytes)
+    gap_gb = (await docker_service._rental_disk_fit(None, rental)).needs_free_gb - free_gb
+    ssh_client = KilledFillerDolphinHost([filler], wiped_gb=gap_gb / 2 + 1, free_gb=free_gb)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}, killed_fillers=[filler]) is True
+    assert _removed_volumes(ssh_client) == _DPHN
+    assert any("/proc/1/root" in command and _DPHN[0] in command for command in ssh_client.commands)
+    assert rental.volume_limit_gb == volume_gb
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("filler", "volume_gb", "storage_gb", "existing_bytes", "free_gb"), _DOLPHIN_CASES)
+async def test_dolphin_caches_a_live_filler_mounts_are_not_wiped_and_the_order_clamps(
+    docker_service, monkeypatch, filler, volume_gb, storage_gb, existing_bytes, free_gb
+):
+    rental = _one_eighth_rental(monkeypatch, docker_service, volume_gb, storage_gb, existing_bytes)
+    ssh_client = KilledFillerDolphinHost([filler, "filler_live"], wiped_gb=500, free_gb=free_gb)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}, killed_fillers=[filler]) is True
+    assert rental.volume_limit_gb < volume_gb
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("held_gb", "free_gb", "granted"), [(0, 100, False), (0, 400, True), (12, 100, True)])
+async def test_an_emptied_dolphin_cache_is_charged_its_download_and_a_filled_one_mounts_as_before(
+    docker_service, held_gb, free_gb, granted
+):
+    # the wipe leaves the volume empty: mounting it is a 40 GB download again, refused under the floor + margin
+    payload = _make_payload(workload_kind=WorkloadKind.FILLER, cache_volumes=[CacheVolume(name=_DPHN[1], target="/c")])
+    payload.volume_limit_gb = 40
+    ssh_client = DuHostSshClient([_DPHN[1]], free_gb=free_gb, du_stdout=_kb(held_gb))
+
+    assert bool(await docker_service.select_affordable_cache_volumes(ssh_client, payload, {})) is granted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("free_gb", "granted"), [(100, False), (400, True)])
+async def test_an_unmeasured_dolphin_cache_is_charged_its_download(docker_service, free_gb, granted):
+    # a failed du can hide a wiped volume: charge the download rather than mount it as ready
+    payload = _make_payload(workload_kind=WorkloadKind.FILLER, cache_volumes=[CacheVolume(name=_DPHN[1], target="/c")])
+    payload.volume_limit_gb = 40
+    ssh_client = DuHostSshClient([_DPHN[1]], free_gb=free_gb, du_stdout="")
+
+    assert bool(await docker_service.select_affordable_cache_volumes(ssh_client, payload, {})) is granted
+
+
 @pytest.mark.asyncio
 async def test_a_timed_out_removal_still_clamps_the_rental_to_the_free_disk(docker_service, monkeypatch):
     class HangingRemoval(HostSshClient):
@@ -556,3 +645,49 @@ async def test_a_fresh_sized_rental_fits_only_under_the_df_guard_too(docker_serv
 
     assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is bool(removed)
     assert _removed_volumes(ssh_client) == removed
+
+
+class ImageHostSshClient(HostSshClient):
+    """Also keeps the host's image store: the idle-filler-image removal (image ls | xargs image rm) deletes
+    every listed image whose repository a `--filter reference=` names."""
+
+    def __init__(self, listed_volumes: list[str], free_gb: float, images: list[str]):
+        super().__init__(listed_volumes, free_gb)
+        self.images = set(images)
+
+    async def run(self, command: str, *args, **kwargs):
+        if "image ls" in command and "image rm" in command:
+            self.commands.append(command)
+            repositories = {part.split("=", 1)[1] for part in command.split() if part.startswith("reference=")}
+            self.images = {image for image in self.images if image.rsplit(":", 1)[0] not in repositories}
+            return SimpleNamespace(exit_status=0, stdout="", stderr="")
+        return await super().run(command, *args, **kwargs)
+
+
+_ENGY_IMAGE = "ghcr.io/hanlinai/engy-golden-serve:0.8.9"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("renter_image", [_ENGY_IMAGE, "img:tag"])
+async def test_the_reclaim_never_removes_the_image_the_rental_is_about_to_run(docker_service, renter_image):
+    # prod 4 Nov: a renter rented the Engy image; it was pulled, the reclaim's idle-filler-image removal deleted
+    # it (no container used it yet), and docker run failed "No such image". Order: pull -> reclaim -> run.
+    ssh_client = ImageHostSshClient([_KIMI, "volume_pod"], free_gb=2389, images=[_ENGY_IMAGE, "daturaai/dolphin:1"])
+    rental = _rental(2620, 1310)
+    rental.docker_image = renter_image
+    ssh_client.images.add(renter_image)  # the pull
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is True
+
+    assert renter_image in ssh_client.images  # docker run finds it
+    assert "daturaai/dolphin:1" not in ssh_client.images  # other idle filler images still go
+    assert (_ENGY_IMAGE in ssh_client.images) is (renter_image == _ENGY_IMAGE)
+    assert _removed_volumes(ssh_client) == [_KIMI]
+
+
+@pytest.mark.parametrize("keep_image", ["daturaai/dolphin:1", "docker.io/daturaai/dolphin:1", "index.docker.io/daturaai/dolphin:1"])
+def test_the_idle_filler_removal_keeps_the_rented_image_under_any_docker_hub_prefix(keep_image):
+    command = idle_filler_images_removal_command(keep_image)
+
+    assert "reference=daturaai/dolphin " not in command
+    assert "reference=daturaai/dlph " in command

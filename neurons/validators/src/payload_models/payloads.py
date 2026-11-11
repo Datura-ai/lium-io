@@ -227,6 +227,13 @@ class ForcedValidationCycleRequest(BaseModel):
     message_type: Literal["ForcedValidationCycleRequest"]
 
 
+class RecheckExecutorRequest(BaseModel):
+    """Ask the validator to queue a single-node check of one executor (the provider asked)."""
+
+    message_type: Literal["RecheckExecutorRequest"]
+    executor_id: str
+
+
 class WorkloadKind(enum.Enum):
     CUSTOMER_RENTAL = "CUSTOMER_RENTAL"
     FILLER = "FILLER"
@@ -326,6 +333,8 @@ class ContainerCreateRequest(ContainerBaseRequest):
     user_public_keys: list[str] = []
     gpu_uuids: list[str]
     cpu_count: int | None = None
+    # the renter's own CPU floor (rent by spec); a node that cannot grant it is refused, never shrunk below it
+    min_cpu_count: int | None = None
     memory_gb: int | None = None
     custom_options: CustomOptions | None = None
     debug: bool | None = None
@@ -571,6 +580,14 @@ class BaseValidatorResponse(BaseRequest, DeliveryStamps):
 class ContainerWarningCode(enum.Enum):
     ExternalVolumeFailed = "ExternalVolumeFailed"
     DockerInDockerDisabled = "DockerInDockerDisabled"
+    # DAH-5301: a reboot found a pod GPU hung and reset it before the new container started
+    HungGpuReset = "HungGpuReset"
+    # ...or found one hung and could not reset it: MIG, an NVLink peer outside the pod, a process
+    # outside the pod on it, or the driver refused the reset
+    HungGpuNotResetMig = "HungGpuNotResetMig"
+    HungGpuNotResetNvlinkShared = "HungGpuNotResetNvlinkShared"
+    HungGpuNotResetInUse = "HungGpuNotResetInUse"
+    HungGpuNotResetUnsupported = "HungGpuNotResetUnsupported"
 
 
 class VolumeEncryptionStatus(str, enum.Enum):
@@ -726,6 +743,8 @@ class ContainerCreated(ContainerBaseResponse):
     volume_limit_gb: int | None = None
     local_volume_path: str | None = None
     volume_encryption_status: VolumeEncryptionStatus | None = None
+    # the CPUs the container got; below the ordered count when the daemon has fewer than advertised
+    cpu_count: int | None = None
 
 
 class ContainerStarted(ContainerBaseResponse):
@@ -856,6 +875,7 @@ class GpuResetErrorCode(enum.Enum):
     OperationInProgress = "OperationInProgress"
     ExecutorUnreachable = "ExecutorUnreachable"
     ClockLockNotSupported = "ClockLockNotSupported"
+    GpusLostOnHost = "GpusLostOnHost"
 
 
 class GpuResetOutcome(BaseModel):

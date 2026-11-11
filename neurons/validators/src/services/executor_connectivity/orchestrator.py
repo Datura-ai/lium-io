@@ -2,7 +2,7 @@ import random
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 
-from services.const import BATCH_PORT_VERIFICATION_SIZE
+from services.const import BATCH_PORT_VERIFICATION_SIZE, MIN_PORT_COUNT
 from services.executor_connectivity.dind_probe import DindProbe
 from services.executor_connectivity.models import PortVerificationResult
 from services.executor_connectivity.port_probe import PortProbe
@@ -35,6 +35,7 @@ class ConnectivityOrchestrator:
         unavailable_ports: list[int] | None,
         ssh_client,
         log_ctx: dict | None = None,
+        min_ports: int = MIN_PORT_COUNT,
         dind_deadline_monotonic: float | None = None,
     ) -> PortVerificationResult:
         log_ctx = {
@@ -70,6 +71,7 @@ class ConnectivityOrchestrator:
             ssh_client=ssh_client,
             host=executor_info.address,
             log_ctx=log_ctx,
+            min_ports=min_ports,
         )
 
         successful = list(probe_result.successful)
@@ -109,6 +111,7 @@ class ConnectivityOrchestrator:
             external_probe=probe_result.external,
             declared_port_count=declared_port_count,
             port_ranges=port_ranges,
+            host_runtime_fault=dind_result.sshd_never_answered,
             sysbox_measured=dind_result.sysbox_runtime
             if dind_result.success and sysbox_requested and not dind_result.sysbox_timed_out
             else None,

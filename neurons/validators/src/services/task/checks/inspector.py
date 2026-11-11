@@ -32,6 +32,8 @@ BLIND_STREAK_TTL_SECONDS = 24 * 60 * 60
 
 class InspectorRentedCheck:
     check_id = "executor.validate.inspector_rented"
+    # a replay that is also blind would count this cycle in the blind streak twice
+    replays_after_session_drop = False
     fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:

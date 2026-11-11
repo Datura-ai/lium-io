@@ -2,31 +2,32 @@ import ast
 import json
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 from neurons.validators.src.protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-from neurons.validators.src.services.const import FILLER_CONTAINER_PREFIX
+from neurons.validators.src.services.const import FILLER_CONTAINER_PREFIX, MAX_GPU_COUNT
 from neurons.validators.src.services.task import pipeline_factory
 from neurons.validators.src.services.task.checks import gpu_fault_probe as module
 from neurons.validators.src.services.task.checks.gpu_fault_probe import (
     PROBE_JSON_MARKER,
     PROBE_SECONDS,
-    PROBE_SOURCE,
     PROBE_TIMEOUT_SECONDS,
     GpuFaultProbeCheck,
+    probe_source,
 )
 from neurons.validators.src.services.task.messages import GpuFaultProbeMessages as Msg
 from neurons.validators.src.services.task.runner import SSHCommandResult
 
 from tests.helpers import build_context_config, build_services, build_state, default_executor
 
+PROBE_SOURCE = probe_source()
+
 
 @contextmanager
-def probe_gate(*, enforce: bool = False, enforce_unknown_streak: bool = False):
-    # shadow-first like every score-zeroing gate: the check runs and logs, enforcement fails the node
+def probe_gate(*, enforce_unknown_streak: bool = False):
     with patch("neurons.validators.src.services.task.checks.gpu_fault_probe.settings") as s:
-        s.GPU_FAULT_PROBE_ENFORCEMENT_ENABLED = enforce
         s.GPU_FAULT_PROBE_UNKNOWN_STREAK_ENFORCEMENT_ENABLED = enforce_unknown_streak
         yield s
 
@@ -111,33 +112,18 @@ def make_ctx(context_factory, runner, *, rented_data=None, first_pass=False):
     )
 
 
-def test_shadow_by_default_runs_the_probe_but_never_enforces():
-    # DAH-4257: the probe runs on every idle node and logs its verdict; a fault zeroes nothing until
-    # the owner turns enforcement on
+def test_the_fault_enforcement_flag_is_gone():
     fields = type(module.settings).model_fields
     assert "GPU_FAULT_PROBE_CHECK_ENABLED" not in fields
-    assert fields["GPU_FAULT_PROBE_ENFORCEMENT_ENABLED"].default is False
+    assert "GPU_FAULT_PROBE_ENFORCEMENT_ENABLED" not in fields
 
 
 @pytest.mark.asyncio
-async def test_first_pass_in_shadow_skips_the_probe(context_factory):
+async def test_first_pass_runs_the_probe(context_factory):
     runner = FakeRunner(probe_stdout("ok"))
     ctx = make_ctx(context_factory, runner, first_pass=True)
 
-    with probe_gate(enforce=False):
-        result = await GpuFaultProbeCheck().run(ctx)
-
-    assert result.passed is True
-    assert result.event.reason_code == Msg.FIRST_PASS_SKIPPED.reason
-    assert runner.calls == []
-
-
-@pytest.mark.asyncio
-async def test_first_pass_under_enforcement_runs_the_probe(context_factory):
-    runner = FakeRunner(probe_stdout("ok"))
-    ctx = make_ctx(context_factory, runner, first_pass=True)
-
-    with probe_gate(enforce=True):
+    with probe_gate():
         result = await GpuFaultProbeCheck().run(ctx)
 
     assert result.event.reason_code == Msg.PROBE_OK.reason
@@ -159,6 +145,7 @@ async def test_probe_source_goes_over_stdin_to_the_executor_interpreter(context_
     assert call["stdin_text"] == PROBE_SOURCE
     assert call["timeout"] == PROBE_TIMEOUT_SECONDS
     assert call["retryable"] is False
+    assert "--hang-in-kernels-is-fault" not in call["cmd"]
     probe = result.event.what_we_saw["probe"]
     assert probe["status"] == "ok"
     assert probe["devices"][0]["rounds"] == 7
@@ -166,36 +153,11 @@ async def test_probe_source_goes_over_stdin_to_the_executor_interpreter(context_
 
 
 @pytest.mark.asyncio
-async def test_fault_in_shadow_warns_and_passes(context_factory):
-    stdout = probe_stdout(
-        "fault",
-        faults=["gpu 0: cuStreamSynchronize -> CUDA_ERROR_ILLEGAL_ADDRESS (700)"],
-        devices=[
-            {
-                "index": 0,
-                "status": "fault",
-                "error": "cuStreamSynchronize -> CUDA_ERROR_ILLEGAL_ADDRESS (700)",
-            }
-        ],
-    )
-    ctx = make_ctx(context_factory, FakeRunner(stdout, exit_code=1))
-
-    with probe_gate(enforce=False):
-        result = await GpuFaultProbeCheck().run(ctx)
-
-    assert result.passed is True
-    assert result.event.reason_code == Msg.PROBE_FAILED.reason
-    assert result.event.severity == "warning"
-    assert "NOT changed" in result.event.impact
-    assert "CUDA_ERROR_ILLEGAL_ADDRESS" in result.event.what_we_saw["error"]
-
-
-@pytest.mark.asyncio
-async def test_fault_under_enforcement_fails_the_fatal_check(context_factory):
+async def test_a_fault_fails_the_fatal_check(context_factory):
     stdout = probe_stdout("fault", faults=["gpu 0: gather: 1 of 134217728 elements wrong"])
     ctx = make_ctx(context_factory, FakeRunner(stdout, exit_code=1))
 
-    with probe_gate(enforce=True):
+    with probe_gate():
         result = await GpuFaultProbeCheck().run(ctx)
 
     assert GpuFaultProbeCheck.fatal is True
@@ -210,7 +172,7 @@ async def test_nvml_delta_is_a_fault_even_when_every_kernel_passed(context_facto
     stdout = probe_stdout("fault", faults=["gpu 0: uncorrected ECC errors 0 -> 2"])
     ctx = make_ctx(context_factory, FakeRunner(stdout, exit_code=1))
 
-    with probe_gate(enforce=True):
+    with probe_gate():
         result = await GpuFaultProbeCheck().run(ctx)
 
     assert result.passed is False
@@ -225,7 +187,7 @@ async def test_ssh_timeout_is_unknown_not_a_fault(context_factory):
     # like the sibling no-report path
     ctx = make_ctx(context_factory, FakeRunner("", exit_code=-1, error_type="timeout"))
 
-    with probe_gate(enforce=True):
+    with probe_gate():
         result = await GpuFaultProbeCheck().run(ctx)
 
     assert result.passed is True
@@ -233,8 +195,21 @@ async def test_ssh_timeout_is_unknown_not_a_fault(context_factory):
     assert f"{PROBE_TIMEOUT_SECONDS}s" in result.event.what_we_saw["error"]
 
 
+def test_importing_the_check_does_not_read_the_probe_source():
+    tree = ast.parse(Path(module.__file__).read_text())
+    top_level = [
+        node for node in tree.body if not isinstance(node, (ast.FunctionDef, ast.ClassDef))
+    ]
+    assert not any(
+        isinstance(call, ast.Call) and getattr(call.func, "attr", None) == "read_text"
+        for node in top_level
+        for call in ast.walk(node)
+    )
+    assert probe_source() == module.PROBE_SOURCE_PATH.read_text()
+
+
 def test_the_ssh_cap_sits_above_the_probes_own_largest_deadline():
-    # otherwise the SSH timeout fires first and a hung 8th GPU is never reported as a fault by the probe.
+    # otherwise the SSH timeout fires first and the largest nodes (MAX_GPU_COUNT) never get the probe's verdict.
     # The whole worst path counts, not the drain alone: eight workers hung once their kernels run, killed and
     # still held by the driver, then the reap grace, the NVML snapshot fork hanging on the wedged card (before
     # and after), and two dmesg reads at their timeout.
@@ -248,15 +223,17 @@ def test_the_ssh_cap_sits_above_the_probes_own_largest_deadline():
     drain = (
         PROBE_SECONDS
         + namespace["WORKER_GRACE_SECONDS"]
-        + namespace["WORKER_GRACE_PER_GPU_SECONDS"] * 7
+        + namespace["WORKER_GRACE_PER_GPU_SECONDS"] * (MAX_GPU_COUNT - 1)
     )
+    # the enumeration fork's poll, join(5), then kill + join(5)
+    device_count_wait_seconds = namespace["WORKER_GRACE_SECONDS"] + 5 + 5
     nvml_fork = namespace["NVML_GRACE_SECONDS"] + 1 + 5  # poll, join(1), kill + join(5)
     tail = (
         namespace["WORKER_REAP_AFTER_KILL_SECONDS"]
         + 2 * nvml_fork
         + 2 * namespace["DMESG_TIMEOUT_SECONDS"]
     )
-    assert PROBE_TIMEOUT_SECONDS > drain + tail + 5
+    assert PROBE_TIMEOUT_SECONDS > device_count_wait_seconds + drain + tail + 5
 
 
 @pytest.mark.asyncio
@@ -297,7 +274,7 @@ async def test_executor_controlled_report_fields_are_capped_in_the_event(context
     )
     ctx = make_ctx(context_factory, FakeRunner(stdout, exit_code=1))
 
-    with probe_gate(enforce=True):
+    with probe_gate():
         result = await GpuFaultProbeCheck().run(ctx)
 
     seen = result.event.what_we_saw
@@ -328,7 +305,7 @@ async def test_a_fault_report_with_non_string_faults_still_fails_the_check(conte
     stdout = probe_stdout("fault", faults=["gpu 0: Xid 79", 7, None, {"x": 1}, True])
     ctx = make_ctx(context_factory, FakeRunner(stdout, exit_code=1))
 
-    with probe_gate(enforce=True):
+    with probe_gate():
         result = await GpuFaultProbeCheck().run(ctx)
 
     assert result.passed is False
@@ -342,7 +319,7 @@ async def test_a_hostile_report_on_the_unknown_path_is_capped_too(context_factor
     stdout = probe_stdout("error", error="E" * 5000, devices=[], faults=[7, None, {"x": 1}])
     ctx = make_ctx(context_factory, FakeRunner(stdout, exit_code=2))
 
-    with probe_gate(enforce=True):
+    with probe_gate():
         result = await GpuFaultProbeCheck().run(ctx)
 
     assert result.passed is True
@@ -358,7 +335,7 @@ async def test_probe_that_could_not_start_passes_as_unknown(context_factory):
     )
     ctx = make_ctx(context_factory, FakeRunner(stdout, exit_code=2))
 
-    with probe_gate(enforce=True):
+    with probe_gate():
         result = await GpuFaultProbeCheck().run(ctx)
 
     assert result.passed is True
@@ -373,7 +350,7 @@ async def test_no_report_in_output_passes_as_unknown_with_the_tails(context_fact
         FakeRunner("Traceback ...\n", exit_code=1, stderr="ModuleNotFoundError: ctypes"),
     )
 
-    with probe_gate(enforce=True):
+    with probe_gate():
         result = await GpuFaultProbeCheck().run(ctx)
 
     assert result.passed is True
@@ -385,7 +362,7 @@ async def test_no_report_in_output_passes_as_unknown_with_the_tails(context_fact
 async def test_malformed_marker_line_is_unknown_not_a_crash(context_factory):
     ctx = make_ctx(context_factory, FakeRunner(PROBE_JSON_MARKER + " [1, 2\n"))
 
-    with probe_gate(enforce=True):
+    with probe_gate():
         result = await GpuFaultProbeCheck().run(ctx)
 
     assert result.passed is True
@@ -565,6 +542,64 @@ def test_nvml_snapshots_are_paired_by_uuid_not_by_position():
     ) == ["gpu 0: uncorrected ECC errors 0 -> 1"]
 
 
+def test_an_unavailable_after_snapshot_is_no_nvml_fault():
+    # a hung or dead NVML child after the run must not write every card up as missing
+    nvml_faults = _probe_namespace("nvml_faults")["nvml_faults"]
+    before = {
+        "available": True,
+        "gpus": [{"index": i, "uuid": f"GPU-{i}", "ecc_uncorrected": 0} for i in range(8)],
+    }
+
+    assert nvml_faults(before, {"available": False, "error": "NVML snapshot hung for 10s"}) == []
+    # a card really gone from an available snapshot is still a fault
+    assert nvml_faults(before, {"available": True, "gpus": before["gpus"][1:]}) == [
+        "gpu 0 (GPU-0): missing from the NVML snapshot after the run"
+    ]
+
+
+def test_a_hung_nvml_after_snapshot_makes_the_run_an_error_not_ok(capsys, monkeypatch):
+    # no post-run counters is no verdict (UNKNOWN): an "ok" would clear a pending post-rental recheck
+    import sys
+    import types
+
+    module = types.ModuleType("gpu_fault_probe_main")
+    monkeypatch.setitem(sys.modules, module.__name__, module)  # its dataclasses look the module up
+    exec(compile(PROBE_SOURCE, "probe", "exec"), module.__dict__)
+    ns = module.__dict__
+    snapshots = iter(
+        [
+            {"available": True, "gpus": [{"index": 0, "uuid": "GPU-0", "ecc_uncorrected": 0}]},
+            {"available": False, "error": "NVML snapshot hung for 10s"},
+        ]
+    )
+
+    class FakeProcess:
+        def __init__(self, target, args):
+            pass
+
+        def start(self):
+            pass
+
+    class FakeMp:
+        Pipe = staticmethod(
+            lambda duplex=False: (None, type("C", (), {"close": lambda self: None})())
+        )
+        Process = FakeProcess
+
+    ns["multiprocessing"] = type("M", (), {"get_context": staticmethod(lambda kind: FakeMp)})
+    ns["_device_count"] = lambda mp: 1
+    ns["nvml_snapshot_forked"] = lambda mp: next(snapshots)
+    ns["xid_lines"] = lambda: {"available": False}
+    ns["drain_workers"] = lambda workers, deadline, budget, hang_in_kernels_is_fault: [
+        {"index": 0, "status": "ok", "pci_bus_id": "00000000:01:00.0"}
+    ]
+
+    assert ns["main"]([]) == 2
+    report = json.loads(capsys.readouterr().out.split(ns["JSON_MARKER"], 1)[1])
+    assert report["status"] == "error" and report["faults"] == []
+    assert report["error"] == "NVML after the run: NVML snapshot hung for 10s"
+
+
 def test_a_dead_nvml_child_is_an_unavailable_snapshot_not_a_crash():
     # the child closes its pipe without sending (a driver call aborted the process): recv() raises EOFError
     # and the probe must still print its verdict
@@ -646,7 +681,8 @@ def test_a_hung_worker_does_not_swallow_the_verdicts_of_the_others():
     elapsed = time.perf_counter() - started
 
     assert [r["index"] for r in reports] == [0, 1, 2, 3, 4]
-    assert reports[0]["status"] == "fault" and "hung in kernels" in reports[0]["error"]
+    # out of time in the kernels is no verdict (UNKNOWN), not a fault (taiberium on lium-io-deployment#127)
+    assert reports[0]["status"] == "error" and "hung in kernels" in reports[0]["error"]
     assert reports[1] == {"index": 1, "status": "fault", "error": "Xid 79"}
     assert reports[2]["status"] == "ok"
     assert (
@@ -656,6 +692,42 @@ def test_a_hung_worker_does_not_swallow_the_verdicts_of_the_others():
     assert reports[4]["status"] == "error" and "hung in setup" in reports[4]["error"]
     assert 3.0 <= elapsed < 10.0  # the two hangs cost one budget, not one budget each
     assert not any(process.is_alive() for _, process, _ in workers)
+
+
+def test_on_the_recheck_a_hang_in_the_kernels_is_a_fault():
+    # taiberium on #2085: a card that hangs its kernels every cycle must not list again after a rental
+    import multiprocessing
+    import time
+
+    namespace = _probe_namespace("drain_workers", "_exit_code", "WORKER_REAP_AFTER_KILL_SECONDS")
+    namespace["multiprocessing"] = multiprocessing
+    namespace["time"] = time
+    mp = multiprocessing.get_context("fork")
+    workers = []
+    for index, behaviour in enumerate(["hang-in-kernels", "hang-in-setup"]):
+        parent_conn, child_conn = mp.Pipe(duplex=False)
+        process = mp.Process(target=_fake_worker, args=(index, behaviour, child_conn))
+        process.start()
+        child_conn.close()
+        workers.append((index, process, parent_conn))
+
+    started = time.perf_counter()
+    reports = namespace["drain_workers"](workers, started + 2.0, 2.0, hang_in_kernels_is_fault=True)
+
+    assert reports[0]["status"] == "fault" and "hung in kernels" in reports[0]["error"]
+    assert reports[1]["status"] == "error" and "hung in setup" in reports[1]["error"]
+
+
+@pytest.mark.asyncio
+async def test_the_recheck_asks_the_probe_to_fail_a_hang_in_the_kernels(context_factory):
+    runner = FakeRunner(probe_stdout("ok"))
+    ctx = make_ctx(context_factory, runner)
+
+    with probe_gate():
+        await GpuFaultProbeCheck(is_post_rental_recheck=True).run(ctx)
+
+    (call,) = runner.calls
+    assert call["cmd"].endswith(" --hang-in-kernels-is-fault")
 
 
 def test_setup_calls_in_the_probe_are_errors_not_faults():

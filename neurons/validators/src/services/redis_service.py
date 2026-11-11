@@ -3,7 +3,8 @@ import json
 import logging
 import math
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+from contextvars import ContextVar
 from typing import Literal, NamedTuple
 
 import redis.asyncio as aioredis
@@ -27,7 +28,13 @@ RESET_VERIFIED_JOB_CHANNEL = "RESET_VERIFIED_JOB_CHANNEL"
 # DAH-3338: one message per PodStatesReport chunk, published right after the cycle's spec
 POD_STATES_CHANNEL = "POD_STATES_CHANNEL"
 RENTED_MACHINE_PREFIX = "rented_machines_prefix"
+# set with every rebuild of the hash above: before the first one a missing machine proves nothing
+RENTED_MACHINES_SYNCED_KEY = "rented_machines_synced"
 PENDING_PODS_PREFIX = "pending_pods_prefix"
+# epoch seconds of the node's latest create (add_pending_pod); outlives VERIFYX_COMMAND_TIMEOUT_SECONDS (600) so a
+# VerifyX cold retry sees a create whose pending-pod marker came and went between two of its reads
+CREATE_STARTED_AT_PREFIX = "create_started_at"
+CREATE_STARTED_AT_TTL_SECONDS = 900
 GPU_RESET_PENDING_KIND = "gpu_reset"
 # DAH-4663: a renter's own GPU clock lock in progress (a second lock, reset or create is declined meanwhile)
 GPU_CLOCKS_PENDING_KIND = "gpu_clocks"
@@ -40,6 +47,10 @@ LAST_SCORED_RESULT_TTL_SECONDS = 60 * 60
 # connector starts was cut off by the restart (a redeploy recreates the connector mid-create)
 INFLIGHT_BACKEND_CREATES_KEY = "inflight_backend_creates"
 BACKEND_COMMAND_PREFIX = "backend_command:"
+# DAH-5592: a create's replies that failed it for a host fault (the backend stops billing on these), by command id; sent
+# again on every backend socket for HOST_FAULT_FAILURE_RESEND_SECONDS, since one the backend lost (its database and
+# broker down, then a restart) is not otherwise sent again. The backend ignores a copy of one it already has.
+HOST_FAULT_FAILURES_KEY = "host_fault_create_failures"
 DUPLICATED_MACHINE_SET = "duplicated_machines"
 RENTAL_SUCCEED_MACHINE_SET = "rental_succeed_machines"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
@@ -48,11 +59,38 @@ RENTAL_PROBE_FAILED_PREFIX = "rental_probe_failed"
 # filler container name -> JSON list of the image digests (bare sha256) the validator started it from
 FILLER_IMAGE_DIGESTS_PREFIX = "filler_image_digests:"
 FILLER_IMAGE_DIGESTS_TTL_SECONDS = 30 * 24 * 3600
+# pod id -> set by the rented-pod recovery when it stops a pod or before it renames one back, cleared
+# once the pod is started again (no expiry: it is the only evidence the stop was ours): a stopped
+# pod_<id> it marked is its own to start next cycle, even when the rename's reply and its cleanup
+# were lost with the SSH transport
+STOPPED_BY_RECOVERY_PREFIX = "stopped_by_recovery:"
+# its values: RENAMING only makes the pod restartable (the rename may not have applied, so the pod is
+# still judged down); STOPPED also means the recovery itself stopped the pod
+STOPPED_BY_RECOVERY_RENAMING = "renaming"
+STOPPED_BY_RECOVERY_STOPPED = "stopped"
+# DAH-5904: "<executor uuid>:<filler container name>" while the cycle snapshot lists that filler on that node
+RECENT_FILLER_PREFIX = "recent_filler:"
+# a filler stopped for a customer rent leaves the snapshot at once but stays on the host until its delete lands:
+# one cycle (~17 min) plus RENTAL_TEARDOWN_GRACE_MINUTES, with margin, from its create or the last cycle that listed it
+RECENT_FILLER_TTL_SECONDS = 45 * 60
 # set by a filler create whose sshd never came up in the container, cleared by one where it did
 SSHD_BOOTSTRAP_FAILED_PREFIX = "sshd_bootstrap_failed"
 # prod, 24 h: failed filler creates on a broken node came 5 min to 2.7 h apart, so 6 h outlives the
 # longest gap about twice over; a stale stamp ends by itself
 SSHD_BOOTSTRAP_FAILED_TTL_SECONDS = 6 * 3600
+
+
+def create_started_at_key(miner_hotkey: str, executor_id: str) -> str:
+    return f"{CREATE_STARTED_AT_PREFIX}:{miner_hotkey}:{executor_id}"
+
+
+# VerifyX runs the validator cut off and could not clean up: hash of run_dir -> epoch, reaped before the next run
+VERIFYX_STALE_RUNS_PREFIX = "verifyx_stale_runs"
+VERIFYX_STALE_RUNS_TTL_SECONDS = 7 * 24 * 3600
+
+
+def verifyx_stale_runs_key(miner_hotkey: str, executor_uuid: str) -> str:
+    return f"{VERIFYX_STALE_RUNS_PREFIX}:{miner_hotkey}:{executor_uuid}"
 
 
 def sshd_bootstrap_failed_key(miner_hotkey: str, executor_uuid: str) -> str:
@@ -126,6 +164,15 @@ FORCED_VALIDATION_CYCLE_TTL_SECONDS = 60
 # treats anything in the portal snapshot that is NOT here as never validated. Seeded by every
 # cycle's publish, so one completed cycle after deploy is enough to know the whole fleet.
 EXPRESS_LANE_VALIDATED_SET = "express_lane_validated_executors"
+# DAH-5716: executor ids a provider asked to have checked again; the express lane pops each one
+# it picks. Written by the connector process, read by the validator process.
+EXPRESS_LANE_RECHECK_REQUESTS_SET = "express_lane:recheck_requests"
+# shortcut: one TTL for the whole set, refreshed per request; per-id expiry if requests pile up.
+EXPRESS_LANE_RECHECK_REQUESTS_TTL_SECONDS = 30 * 60
+# When the express lane first saw a never-validated executor (epoch s), kept across validator restarts:
+# an in-memory stamp restarted with every rollout and logged discovery waits of up to 25 min (5 Nov).
+EXPRESS_LANE_FIRST_SEEN_PREFIX = "express_lane:first_seen"
+EXPRESS_LANE_FIRST_SEEN_TTL_SECONDS = 2 * 3600
 
 # Distributed lock settings
 EXECUTOR_LOCK_TIMEOUT = 30  # TTL for lock auto-release (seconds)
@@ -142,6 +189,20 @@ EXECUTOR_LOCK_BLOCKING_TIMEOUT = 10  # Time to wait for lock acquisition (second
 # shared the key.
 EXECUTOR_CREATE_LOCK_TIMEOUT = 360  # TTL (seconds)
 EXECUTOR_CREATE_LOCK_BLOCKING_TIMEOUT = 360  # a renter's create waits at most this long
+
+
+def _executor_create_lock_key(executor_id: str) -> str:
+    return f"lock:executor-create:{executor_id}"
+
+
+# the connector's id of the create execution being run (InflightBackendCreate.create_id), set around the create
+renter_create_id: ContextVar[str] = ContextVar("renter_create_id", default="")
+
+
+def _renter_create_lock_token(pod_id: str, create_id: str = "") -> str:
+    # names the create EXECUTION holding the lock: a late release by an earlier create of the same pod whose lock
+    # lapsed must not free a retry's lock, and a restarted connector releases exactly its cut-off creates' locks
+    return f"create:{pod_id}:{create_id}" if create_id else f"create:{pod_id}"
 
 # DAH-2475: connection-pool resilience. The client used to be built with no options at all, which
 # meant an UNBOUNDED pool and no retries: a wave of concurrent container creates each grabbed a fresh
@@ -161,7 +222,10 @@ REDIS_PUBSUB_MAX_CONNECTIONS = 8
 # BlockingConnectionPool for this: the default pool raises MaxConnectionsError instead of waiting,
 # and it raises from get_connection() BEFORE the retry wrapper is reached, so a bounded default pool
 # would convert an overload burst into exactly the hard failures this hardening exists to remove.
-REDIS_POOL_WAIT_TIMEOUT_SECONDS = 10
+# DAH-5805: since commands no longer queue on the process-wide lock (DAH-5723), a wave's burst queues
+# here instead; 10 s turned that wait into ~500 "No connection available" failures an hour (whole runs
+# among them). The old lock waited without limit; this waits up to a minute, still well inside a task.
+REDIS_POOL_WAIT_TIMEOUT_SECONDS = 60
 REDIS_SOCKET_TIMEOUT_SECONDS = 10
 REDIS_CONNECT_TIMEOUT_SECONDS = 5
 REDIS_RETRY_ATTEMPTS = 3
@@ -170,6 +234,33 @@ REDIS_RETRY_ATTEMPTS = 3
 REDIS_HEALTH_CHECK_INTERVAL_SECONDS = 30
 
 logger = logging.getLogger(__name__)
+
+# Set by the express lane for a new node's first pass (core/express_lane.py). Every RedisService command
+# runs under one process-wide lock; after a wave send hundreds of wave pipelines queue on it, and a new
+# node's few reads waited behind them (69 s before one rental probe's create, 4 Nov). The first pass gets
+# its own slot: its commands queue only behind other first passes.
+EXPRESS_REDIS_SLOT: ContextVar[bool] = ContextVar("express_redis_slot", default=False)
+_HELD_SLOT: ContextVar[asyncio.Lock] = ContextVar("redis_held_slot")
+
+
+class _CommandLock:
+    """The command lock: one slot for the express lane's first passes, one for everything else."""
+
+    def __init__(self):
+        self._default = asyncio.Lock()
+        self._express = asyncio.Lock()
+
+    def _slot(self) -> asyncio.Lock:
+        return self._express if EXPRESS_REDIS_SLOT.get() else self._default
+
+    async def __aenter__(self) -> None:
+        lock = self._slot()
+        await lock.acquire()
+        _HELD_SLOT.set(lock)  # released by the slot it took, even if the flag changed meanwhile
+
+    async def __aexit__(self, *exc) -> None:
+        _HELD_SLOT.get().release()
+
 
 
 class BackendCommand(BaseModel):
@@ -183,9 +274,22 @@ class InflightBackendCreate(BaseModel):
     executor_id: str
     workload_kind: WorkloadKind
     started_at_unix_seconds: int
+    # which execution wrote it; each execution has its own record
+    create_id: str = ""
     # DAH-5437: how many connector restarts this create has already been resumed after. The request itself is never
     # stored (it carries the renter's environment and credentials); the backend re-sends it from its own records.
     resumes: int = 0
+
+
+def _inflight_create_field(pod_id: str, create_id: str) -> str:
+    # one field per execution, so overlapping creates of a pod each keep their own record
+    return f"{pod_id}|{create_id}" if create_id else pod_id
+
+
+def _pod_of_inflight_create_field(field: str | bytes) -> str:
+    if isinstance(field, bytes):
+        field = field.decode()
+    return field.split("|", 1)[0]
 
 
 class RedisWrite(NamedTuple):
@@ -278,7 +382,7 @@ class RedisService:
         # DAH-5723: only for the few methods that send two commands (SET NX then EXPIRE, INCR then EXPIRE, SET NX
         # then GET, SCAN then DEL). A single command is atomic on the server; locking each one queued every Redis
         # call of the process behind one another, 5-12 s per call during a wave.
-        self.lock = asyncio.Lock()
+        self.lock = _CommandLock()
 
     @asynccontextmanager
     async def acquire_executor_lock(
@@ -315,13 +419,13 @@ class RedisService:
         """
         return aioredis.lock.Lock(
             self.redis,
-            f"lock:executor-create:{executor_id}",
+            _executor_create_lock_key(executor_id),
             timeout=EXECUTOR_CREATE_LOCK_TIMEOUT,
             blocking_timeout=EXECUTOR_CREATE_LOCK_BLOCKING_TIMEOUT,
         )
 
     @asynccontextmanager
-    async def executor_create_exclusion(self, executor_id: str):
+    async def executor_create_exclusion(self, executor_id: str, pod_id: str):
         """Hold the per-executor create lock around a renter's create_container (DAH-3436, review).
 
         The lock keeps the rental probe off a node whose rent is being created (the probe's sweep would
@@ -335,7 +439,7 @@ class RedisService:
         lock = self.executor_create_lock(executor_id)
         held = False
         try:
-            held = bool(await lock.acquire())
+            held = bool(await lock.acquire(token=_renter_create_lock_token(pod_id, renter_create_id.get())))
             if not held:
                 logger.warning(
                     _m(f"Create lock for executor {executor_id} still held at the deadline; creating without it")
@@ -360,6 +464,47 @@ class RedisService:
                             extra={"error": str(e)},
                         )
                     )
+
+    @asynccontextmanager
+    async def rented_gpu_drop_lock(self, pod_id: str):
+        # The validator's cycle and the connector's renter reset both write the pod's drop mark: a recovery whose
+        # reply lands after a renewed fault was saved would delete that fault.
+        # yields True (held), False (another holder kept it past the wait) or None (Redis unreachable)
+        lock = aioredis.lock.Lock(self.redis, f"lock:rented_gpu_drop:{pod_id}", timeout=60, blocking_timeout=30)
+        held: bool | None = None
+        try:
+            held = bool(await lock.acquire())
+        except (redis.exceptions.RedisError, OSError) as e:
+            logger.warning(_m(f"Rented GPU drop lock for pod {pod_id} could not be taken", extra={"error": str(e)}))
+        try:
+            yield held
+        finally:
+            if held:
+                with suppress(redis.exceptions.RedisError, OSError):  # past its TTL the lock is no longer ours
+                    await lock.release()
+
+    async def release_cut_off_create_lock(self, executor_id: str, pod_id: str, create_id: str = "") -> None:
+        """The create lock a create cut off by a connector restart still holds, released if it is that create's.
+
+        The connector that held it is gone, so nothing releases it before its TTL: the backend's re-send of the
+        same create would wait out the rest of EXECUTOR_CREATE_LOCK_TIMEOUT (up to 6 min) and renters deleted the
+        pod first. A lock with another token (the rental probe's, another pod's create, or another create of this pod)
+        is left alone.
+        """
+        key = _executor_create_lock_key(executor_id)
+        try:
+            async with self.redis.pipeline(transaction=True) as pipe:
+                await pipe.watch(key)
+                if await pipe.get(key) != _renter_create_lock_token(pod_id, create_id).encode():
+                    return
+                pipe.multi()
+                pipe.delete(key)
+                await pipe.execute()
+        except redis.exceptions.WatchError:
+            pass  # released or taken by someone else meanwhile: no longer the cut-off create's
+        except Exception as e:
+            # the lock lapses at its TTL as before; the re-send only waits longer
+            logger.warning(_m("Could not release a cut-off create's lock", extra={"pod_id": pod_id, "error": str(e)}))
 
     async def publish(self, channel: str, message: dict):
         """Publish a message to a Redis channel."""
@@ -394,6 +539,35 @@ class RedisService:
     async def get_validated_executors(self) -> set[str]:
         members = await self.smembers(EXPRESS_LANE_VALIDATED_SET)
         return {m.decode() if isinstance(m, bytes) else m for m in members}
+
+    async def request_executor_recheck(self, executor_id: str) -> None:
+        async with self.lock:
+            await self.redis.sadd(EXPRESS_LANE_RECHECK_REQUESTS_SET, executor_id)
+            await self.redis.expire(
+                EXPRESS_LANE_RECHECK_REQUESTS_SET, EXPRESS_LANE_RECHECK_REQUESTS_TTL_SECONDS
+            )
+
+    async def get_executor_recheck_requests(self) -> set[str]:
+        members = await self.smembers(EXPRESS_LANE_RECHECK_REQUESTS_SET)
+        return {m.decode() if isinstance(m, bytes) else m for m in members}
+
+    async def express_first_seen(self, executor_ids: list[str], now: float) -> dict[str, float]:
+        """When the express lane first saw each executor (epoch s): SET NX keeps the first sighting,
+        so a restarted validator reads the stamp the previous process wrote. One round trip."""
+        keys = [f"{EXPRESS_LANE_FIRST_SEEN_PREFIX}:{executor_id}" for executor_id in executor_ids]
+        async with self.redis.pipeline(transaction=False) as pipe:
+            for key in keys:
+                pipe.set(key, repr(now), ex=EXPRESS_LANE_FIRST_SEEN_TTL_SECONDS, nx=True)
+            pipe.mget(keys)
+            *_, values = await pipe.execute()
+        return {
+            executor_id: float(value)
+            for executor_id, value in zip(executor_ids, values, strict=True)
+            if value is not None
+        }
+
+    async def pop_executor_recheck_request(self, executor_id: str) -> None:
+        await self.srem(EXPRESS_LANE_RECHECK_REQUESTS_SET, executor_id)
 
     async def is_forced_validation_cycle_requested(self) -> bool:
         return await self.get(FORCED_VALIDATION_CYCLE_KEY) is not None
@@ -632,9 +806,20 @@ class RedisService:
             async for key in self.redis.scan_iter(match=pattern):
                 await self.redis.delete(key.decode())
 
-    async def add_rented_machine(self, machine: RentedMachine):
-        await self.hset(RENTED_MACHINE_PREFIX, f"{machine.executor_ip_address}:{machine.executor_ip_port}", machine.model_dump_json())
-    
+    async def keep_host_fault_failure(self, command_id: str, responses: list[str]) -> None:
+        await self.hset(HOST_FAULT_FAILURES_KEY, command_id, json.dumps({"at": time.time(), "responses": responses}))
+
+    async def recent_host_fault_failures(self, max_age_seconds: float) -> list[str]:
+        """The kept replies younger than `max_age_seconds`, oldest command first; older ones are dropped."""
+        kept, now = [], time.time()
+        for command_id, raw in (await self.hgetall(HOST_FAULT_FAILURES_KEY)).items():
+            entry = json.loads(raw)
+            if now - entry["at"] > max_age_seconds:
+                await self.hdel(HOST_FAULT_FAILURES_KEY, command_id)
+            else:
+                kept.append(entry)
+        return [response for entry in sorted(kept, key=lambda e: e["at"]) for response in entry["responses"]]
+
     async def add_rented_pod(self, executor: ExecutorSSHInfo, pod_id: str, container_name: str):
         rented_machine = await self.get_rented_machine(executor)
         if not rented_machine:
@@ -656,6 +841,18 @@ class RedisService:
                 await self.hdel(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}")
             else:
                 await self.hset(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}", json.dumps(rented_machine))
+
+    async def replace_rented_machines(self, machines: list[RentedMachine]) -> None:
+        """Swap in the backend's whole list at once, so a reader never sees the hash half rebuilt."""
+        writes = RedisWrites().delete(RENTED_MACHINE_PREFIX)
+        for machine in machines:
+            writes.hset(
+                RENTED_MACHINE_PREFIX, f"{machine.executor_ip_address}:{machine.executor_ip_port}", machine.model_dump_json()
+            )
+        await self.write_atomically(writes.set(RENTED_MACHINES_SYNCED_KEY, "1"))
+
+    async def rented_machines_synced(self) -> bool:
+        return bool(await self.get(RENTED_MACHINES_SYNCED_KEY))
 
     async def get_rented_machine(self, executor: ExecutorSSHInfo) -> dict | None:
         data = await self.hget(RENTED_MACHINE_PREFIX, f"{executor.address}:{executor.port}")
@@ -714,6 +911,7 @@ class RedisService:
         pod_id: str,
         kind: str | None = None,
         gpu_uuids: list[str] | None = None,
+        synthetic_probe: bool = False,
     ):
         # every entry: a write must not drop a build past 30 min that the orphan sweep still spares
         pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id, max_age_seconds=None)
@@ -726,11 +924,24 @@ class RedisService:
         if gpu_uuids:
             item["gpu_uuids"] = list(gpu_uuids)
         pending_pods.append(item)
-        await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
+        # one step: a marker written without its stamp would abort the caller before its cleanup and leave the marker behind
+        writes = RedisWrites().hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
+        if kind is None and not synthetic_probe:
+            # only a rental create stamps: the validator's own rental probe and a GPU reset or clock operation
+            # keep their marker but leave no stamp, since neither is a rental being created
+            writes = writes.set(
+                create_started_at_key(miner_hotkey, executor_id), str(time.time()), ex=CREATE_STARTED_AT_TTL_SECONDS
+            )
+        await self.write_atomically(writes)
 
-    async def remove_pending_pod(self, miner_hotkey: str, executor_id: str, pod_id: str):
+    async def remove_pending_pod(self, miner_hotkey: str, executor_id: str, pod_id: str, kind: str | None = None):
+        """Every pending mark of the pod, or only its marks of `kind` when given."""
         pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id, max_age_seconds=None)
-        pending_pods = [item for item in pending_pods if item.get('pod_id', '') != pod_id]
+        pending_pods = [
+            item
+            for item in pending_pods
+            if item.get('pod_id', '') != pod_id or (kind is not None and item.get('kind') != kind)
+        ]
         if pending_pods:
             await self.hset(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}", json.dumps(pending_pods))
         else:
@@ -781,6 +992,7 @@ class RedisService:
         miner_hotkey: str,
         executor_id: str,
         workload_kind: WorkloadKind,
+        create_id: str = "",
         resumes: int = 0,
     ) -> None:
         create = InflightBackendCreate(
@@ -788,30 +1000,38 @@ class RedisService:
             executor_id=executor_id,
             workload_kind=workload_kind,
             started_at_unix_seconds=int(time.time()),
+            create_id=create_id,
             resumes=resumes,
         )
-        await self.hset(INFLIGHT_BACKEND_CREATES_KEY, pod_id, create.model_dump_json())
+        await self.hset(INFLIGHT_BACKEND_CREATES_KEY, _inflight_create_field(pod_id, create_id), create.model_dump_json())
 
-    async def remove_inflight_backend_create(self, pod_id: str) -> None:
-        await self.hdel(INFLIGHT_BACKEND_CREATES_KEY, pod_id)
+    async def remove_inflight_backend_create(self, pod_id: str, create_id: str = "") -> None:
+        """Remove one execution's record; the pod's other executions keep theirs."""
+        await self.hdel(INFLIGHT_BACKEND_CREATES_KEY, _inflight_create_field(pod_id, create_id))
 
-    async def inflight_backend_creates(self) -> dict[str, InflightBackendCreate]:
-        """pod id -> the create the backend sent for it"""
+    async def backend_create_inflight(self, pod_id: str) -> bool:
+        """Whether the connector is running any create, reboot or edit of the pod (another process)."""
+        fields = await self.hgetall(INFLIGHT_BACKEND_CREATES_KEY)
+        return any(_pod_of_inflight_create_field(field) == pod_id for field in fields)
+
+    async def inflight_backend_creates(self) -> dict[str, list[InflightBackendCreate]]:
+        """pod id -> every create the backend sent for it that is still recorded"""
         raw = await self.hgetall(INFLIGHT_BACKEND_CREATES_KEY)
-        creates: dict[str, InflightBackendCreate] = {}
-        for raw_pod_id, entry in raw.items():
-            pod_id = raw_pod_id.decode() if isinstance(raw_pod_id, bytes) else raw_pod_id
+        creates: dict[str, list[InflightBackendCreate]] = {}
+        for raw_field, entry in raw.items():
+            field = raw_field.decode() if isinstance(raw_field, bytes) else raw_field
+            pod_id = _pod_of_inflight_create_field(field)
             try:
-                creates[pod_id] = InflightBackendCreate.model_validate_json(entry)
+                creates.setdefault(pod_id, []).append(InflightBackendCreate.model_validate_json(entry))
             except ValidationError:
                 # one bad entry must not block the sweep of the others on every start
                 logger.error(_m("Dropping an unreadable inflight backend create", extra={"pod_id": pod_id}))
-                await self.hdel(INFLIGHT_BACKEND_CREATES_KEY, pod_id)
+                await self.hdel(INFLIGHT_BACKEND_CREATES_KEY, field)
                 continue
             if set(json.loads(entry)) - set(InflightBackendCreate.model_fields):
                 # an entry an earlier build wrote with the whole create request in it: rewritten without
-                await self.hset(INFLIGHT_BACKEND_CREATES_KEY, pod_id, creates[pod_id].model_dump_json())
-        return creates
+                await self.hset(INFLIGHT_BACKEND_CREATES_KEY, field, creates[pod_id][-1].model_dump_json())
+        return {pod_id: pod_creates for pod_id, pod_creates in creates.items() if pod_creates}
 
     async def get_pending_pods(
         self, miner_hotkey: str, executor_id: str, max_age_seconds: int | None = 30 * 60

@@ -345,6 +345,44 @@ check_fuse3() {
         "or by hand: sudo apt-get install -y fuse3"
 }
 
+# Ubuntu 26.04 confines fusermount3 with an AppArmor profile that allows FUSE mounts only under $HOME,
+# /mnt, /media, /tmp and /run/user: sysbox-fs mounts under /var/lib/sysboxfs and every sysbox container
+# fails with "failed to pre-register with sysbox-fs" (fusermount3: mount failed: Permission denied)
+FUSERMOUNT3_PROFILE=/etc/apparmor.d/fusermount3
+FUSERMOUNT3_LOCAL=/etc/apparmor.d/local/fusermount3
+FUSERMOUNT3_RULE='mount fstype=@{fuse_types} -> /var/lib/sysboxfs/**,'
+
+# the profile only binds when AppArmor is on: with apparmor=0 there is nothing to fix and apparmor_parser fails
+fusermount3_profile_enforced() {
+    [ -f "$(host_path "$FUSERMOUNT3_PROFILE")" ] && grep -q Y "$(host_path /sys/module/apparmor/parameters/enabled)" 2>/dev/null
+}
+
+fusermount3_needs_sysboxfs_rule() {
+    fusermount3_profile_enforced && ! grep -qF "$FUSERMOUNT3_RULE" "$(host_path "$FUSERMOUNT3_LOCAL")" 2>/dev/null
+}
+
+check_fusermount3_apparmor() {
+    if ! fusermount3_needs_sysboxfs_rule; then
+        pf_pass "fusermount3 may mount sysbox-fs under /var/lib/sysboxfs (no enforced AppArmor profile, or the rule is in $FUSERMOUNT3_LOCAL)."
+        return 0
+    fi
+    pf_fix "The AppArmor profile $FUSERMOUNT3_PROFILE (Ubuntu 26.04) stops sysbox-fs mounting under /var/lib/sysboxfs — every sysbox container fails." \
+        "$(self_cmd)   # adds the rule below and reloads the profile" \
+        "or by hand: printf '%s\\n' '$FUSERMOUNT3_RULE' 'umount /var/lib/sysboxfs/**,' | sudo tee -a $FUSERMOUNT3_LOCAL && sudo apparmor_parser -r $FUSERMOUNT3_PROFILE"
+}
+
+allow_sysboxfs_in_fusermount3_apparmor() {
+    fusermount3_profile_enforced || return 0
+    if fusermount3_needs_sysboxfs_rule; then
+        mkdir -p "$(dirname "$(host_path "$FUSERMOUNT3_LOCAL")")"
+        printf '%s\n' "# lium: sysbox-fs mounts its FUSE file systems under /var/lib/sysboxfs" \
+            "$FUSERMOUNT3_RULE" 'umount /var/lib/sysboxfs/**,' >> "$(host_path "$FUSERMOUNT3_LOCAL")"
+    fi
+    # reload even when the rule was already on disk: an earlier run may have written it and then failed to reload
+    apparmor_parser -r "$FUSERMOUNT3_PROFILE" || { fail "Could not reload $FUSERMOUNT3_PROFILE with the sysbox-fs rule."; return 1; }
+    ok "AppArmor: fusermount3 may mount sysbox-fs under /var/lib/sysboxfs."
+}
+
 nvidia_driver_package() {
     # Blackwell (RTX 50xx, RTX PRO 6000 Blackwell, B200, B300) runs only the open kernel module, and a host already on
     # the open module would otherwise be switched to the closed one by the FIX command
@@ -838,6 +876,7 @@ preflight_stack() {
     check_nvidia_toolkit || true
     check_docker_features || true
     check_fuse3 || true
+    check_fusermount3_apparmor || true
     check_sysbox || true
     check_vloopback || true
 }
@@ -954,6 +993,7 @@ unknown_list=""
 for name in $all_containers; do
     case "$name" in
         pod_*)       ;;  # handled by abort_on_active_rentals below
+        filler_*)    ;;  # Lium's Default Job: kept through setup, see filler_list below
         container_*|lium_storage_check_*) has_validator=true ;;  # a validator's scrape or its vloopback test
         executor-*|executor_*)
             has_executor=true
@@ -1016,8 +1056,17 @@ if [ "$has_executor" = true ]; then
     fi
 fi
 
-# Check for stopped containers (sysbox requires zero containers)
-stopped=$(docker ps -a -q 2>/dev/null || true)
+# every Default Job, also one already stopped (by hand or an earlier run): all are kept and started after setup
+filler_list=$(docker ps -a --format '{{.Names}}' 2>/dev/null | awk '/^filler_/ {printf "%s ", $1}' || true)
+if [ -n "$filler_list" ]; then
+    warn "Lium's Default Job will be stopped and started again after setup (do not remove it)."
+    # shellcheck disable=SC2086  # one name per word
+    docker stop $filler_list > /dev/null 2>&1 || true
+fi
+
+# Remove stopped containers so Docker can restart cleanly; keep Lium's Default Job (filler_*), which the
+# validator would otherwise report as missing and stop idle pay for until it starts a new one
+stopped=$(docker ps -a --format '{{.ID}} {{.Names}}' 2>/dev/null | awk '$2 !~ /^filler_/ {print $1}' || true)
 if [ -n "$stopped" ]; then
     warn "Removing stopped containers (sysbox requires none)..."
     # shellcheck disable=SC2086  # one id per word
@@ -1036,6 +1085,7 @@ apt_install update -qq || exit 1
 # fuse3 before the .deb: its postinst starts sysbox-fs, which needs fusermount3 (see check_fuse3)
 apt_install install -y -qq nvidia-container-toolkit jq fuse3 || exit 1
 ok "nvidia-container-toolkit, jq, fuse3"
+allow_sysboxfs_in_fusermount3_apparmor || exit 1
 
 if [ "$SKIP_INSTALL" = false ]; then
     LOCAL_DEB="./${SYSBOX_DEB_NAME}"
@@ -1096,6 +1146,14 @@ systemctl restart docker
 for _ in $(seq 1 30); do docker ps &>/dev/null && break; sleep 1; done
 docker ps &>/dev/null || { fail "Docker failed to restart. Check: journalctl -u docker.service"; exit 1; }
 ok "Docker is running."
+if [ -n "$filler_list" ]; then
+    # shellcheck disable=SC2086  # one name per word
+    if docker start $filler_list > /dev/null 2>&1; then
+        ok "Lium's Default Job started again."
+    else
+        warn "Lium's Default Job did not start again; the validator starts a new one on its next check."
+    fi
+fi
 
 # ── 7. Verify ──────────────────────────────────────────
 
