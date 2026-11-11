@@ -115,3 +115,36 @@ async def test_build_gpu_flags_partial_rental():
 # ---------------------------- build_gpu_flags fallback ----------------------------
 
 
+
+
+def _shared_nodes_on_fake_host(tmp_path, *, nvswitch_devices: list[str]) -> list[str]:
+    # Runs the real shell command against a fake /dev and /proc under tmp_path.
+    import subprocess
+
+    from neurons.validators.src.services.nvidia_devices import shared_device_nodes_command
+
+    for node in ("nvidiactl", "nvidia-uvm", "nvidia-nvswitchctl", "nvidia-nvswitch0"):
+        (tmp_path / "dev").mkdir(exist_ok=True)
+        (tmp_path / "dev" / node).touch()
+    switches = tmp_path / "proc" / "driver" / "nvidia-nvswitch" / "devices"
+    switches.mkdir(parents=True)
+    for pci_address in nvswitch_devices:
+        (switches / pci_address).mkdir()
+    command = shared_device_nodes_command(is_whole_host_rental=False)
+    command = command.replace("/dev/", f"{tmp_path}/dev/").replace("/proc/", f"{tmp_path}/proc/")
+    output = subprocess.run(["sh", "-c", command], capture_output=True, text=True).stdout
+    return [line.removeprefix(str(tmp_path)) for line in output.splitlines()]
+
+
+def test_shared_nodes_skip_nvswitch_nodes_on_a_host_without_nvswitch(tmp_path):
+    # DAH-6184: nvidia-modprobe creates /dev/nvidia-nvswitchctl inside the executor container on
+    # every host; forwarding it where the host has no switch fails the create in dockerd.
+    nodes = _shared_nodes_on_fake_host(tmp_path, nvswitch_devices=[])
+
+    assert nodes == ["/dev/nvidiactl", "/dev/nvidia-uvm"]
+
+
+def test_shared_nodes_keep_nvswitch_nodes_on_a_host_with_nvswitch(tmp_path):
+    nodes = _shared_nodes_on_fake_host(tmp_path, nvswitch_devices=["0000:05:00.0"])
+
+    assert nodes == ["/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-nvswitchctl", "/dev/nvidia-nvswitch0"]
