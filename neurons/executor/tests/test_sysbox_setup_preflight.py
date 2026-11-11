@@ -567,9 +567,10 @@ def test_aarch64_host_passes_the_arch_check(tmp_path):
 
 
 def test_aarch64_install_never_installs_the_x86_only_plugin(tmp_path):
-    # the pinned legacy plugin is an x86 binary (exec format error on GB10); validators set up the arm64 build themselves
+    # the pinned legacy plugin is an x86 binary (exec format error on GB10) and no arm64 build is published yet
     proc = run_script(tmp_path, env={"STUB_ARCH": "aarch64", "STUB_VLOOPBACK": "absent"})
     assert "vloopback: skipped on aarch64" in proc.stdout
+    assert "a rental with a disk limit fails on this host" in proc.stdout
     assert not [call for call in _docker_calls(tmp_path) if call.startswith("plugin install")]
 
 
