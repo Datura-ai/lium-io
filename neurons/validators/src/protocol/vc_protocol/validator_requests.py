@@ -104,7 +104,7 @@ class PodContainerState(pydantic.BaseModel):
     pod_id: str
     container_state: ContainerState
     observed_at: datetime
-    # DAH-6073 (protocol 2.12.0): the size of a /root volume granted short of its order, after this cycle's grow; left
+    # DAH-6073 (protocol 2.14.0): the size of a /root volume granted short of its order, after this cycle's grow; left
     # off the wire when None, so every other pod's state reads as before
     volume_limit_gb: int | None = pydantic.Field(default=None, exclude_if=lambda value: value is None)
 

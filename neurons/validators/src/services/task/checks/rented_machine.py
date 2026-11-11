@@ -57,6 +57,51 @@ from .port_count import (
 
 logger = logging.getLogger(__name__)
 
+# DAH-6141: a rental check the backend leaves unanswered holds the pod's verdict; from the 3rd such cycle in a row
+# (about 30 min of holds at 15-min cycles) the down pod is judged as down until the backend answers or the pod runs,
+# so a backend outage cannot hide one for long
+RENTAL_STATE_UNKNOWN_PREFIX = "rental_state_unknown:"
+RENTAL_STATE_UNKNOWN_MAX_HELD = 2
+RENTAL_STATE_UNKNOWN_TTL_SECONDS = 3600
+RENTAL_STATE_UNKNOWN_REDIS_TIMEOUT_SEC = 2
+
+
+async def _hold_for_unknown_rental_state(ctx: Context, pod_id: str, *, record: bool) -> bool:
+    """True to hold this cycle's verdict, counting the consecutive unanswered cycles.
+
+    The count stays at its limit (TTL refreshed) until an answer or a running pod clears it. Redis down or slow: not
+    held, as before the hold existed. A dry run (record=False) reads the count and never changes it."""
+    redis, key = ctx.services.redis, f"{RENTAL_STATE_UNKNOWN_PREFIX}{pod_id}"
+
+    async def count() -> bool:
+        held = int(await redis.get(key) or 0)
+        if record:
+            await redis.set(
+                key, str(min(held + 1, RENTAL_STATE_UNKNOWN_MAX_HELD)), ex=RENTAL_STATE_UNKNOWN_TTL_SECONDS
+            )
+        return held < RENTAL_STATE_UNKNOWN_MAX_HELD
+
+    try:
+        return await asyncio.wait_for(count(), timeout=RENTAL_STATE_UNKNOWN_REDIS_TIMEOUT_SEC)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Unanswered rental check count unreadable for %s, judged now: %s", pod_id, exc)
+        return False
+
+
+async def _forget_unknown_rental_state(ctx: Context, pod_id: str) -> None:
+    """An answer or a running pod ends the unanswered streak."""
+    redis, key = ctx.services.redis, f"{RENTAL_STATE_UNKNOWN_PREFIX}{pod_id}"
+
+    async def forget() -> None:
+        if await redis.get(key) is not None:  # the usual case writes nothing
+            await redis.delete(key)
+
+    try:
+        await asyncio.wait_for(forget(), timeout=RENTAL_STATE_UNKNOWN_REDIS_TIMEOUT_SEC)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Unanswered rental check count not cleared for %s: %s", pod_id, exc)
+
+
 # cycle time kept after the rented pod reads, to report the result and close the shell
 POD_READ_RESERVE_SECONDS = 30
 
@@ -268,6 +313,8 @@ class TenantEnforcementCheck:
         # DAH-3338: pod_id -> what this cycle saw of its container. A pod the loop never reached
         # (an earlier pod's verdict returned first, or the transport died) is reported unknown.
         state_by_pod_id: dict[str, ContainerState] = {}
+        # DAH-6141: pods whose rental the backend confirmed closed, skipped because a sibling is not closed
+        closed_pod_ids: set[str] = set()
 
         def with_pod_states(result: CheckResult) -> CheckResult:
             return _with_pod_states(result, ctx, rented_pods, state_by_pod_id)
@@ -342,6 +389,7 @@ class TenantEnforcementCheck:
                 state_by_pod_id[pod_id] = ContainerState.RUNNING
                 if self.recover_stale_pods:
                     await _clear_leftover_recovery_mark(ctx, pod_container_name, pod_id, pod.status)
+                    await _forget_unknown_rental_state(ctx, pod_id)
             elif pod.container_name_pending and _within_container_name_grace(pod):
                 # DAH-4315: the backend lists a pod before it records the container's name, so
                 # its container may still be being created. Judged next cycle, not penalised.
@@ -362,7 +410,23 @@ class TenantEnforcementCheck:
                     ssh_pub_keys = []
                     continue
                 rental_active = await ctx.services.backend.get_pod_rental_active(pod_id)
+                if rental_active is None:
+                    if await _hold_for_unknown_rental_state(ctx, pod_id, record=self.recover_stale_pods):
+                        # the backend did not answer, so the renter may have ended the pod since the batch-start
+                        # list. Judged next cycle, not penalised or restarted.
+                        extra.setdefault("pods_rental_state_unknown", []).append(pod_id)
+                        ssh_pub_keys = []
+                        continue
+                elif self.recover_stale_pods:  # a dry run never changes the count
+                    await _forget_unknown_rental_state(ctx, pod_id)
                 if rental_active and not rental_active.active:
+                    if not await _every_listed_pod_stale(ctx, rented_pods, pod_index, closed_pod_ids):
+                        # one rule (DAH-6141): a closed pod never decides the node while a sibling is running, down
+                        # with an open rental or unanswered; the loop judges that sibling, the node stays rented
+                        # (its container stays on the GPU tenant list: the GPU snapshot may predate its end)
+                        closed_pod_ids.add(pod_id)
+                        ssh_pub_keys = []
+                        continue
                     stale_what = {
                         "pod_id": pod_id,
                         "container_name": pod_container_name,
@@ -374,7 +438,7 @@ class TenantEnforcementCheck:
                         ),
                         "diagnostics": diagnostics,
                     }
-                    if ctx.state.port_check_deferred and await _every_listed_pod_stale(ctx, rented_pods, pod_index):
+                    if ctx.state.port_check_deferred:
                         # DAH-5851: idle now, on a deferred port check: withheld, as PortCountCheck withholds an idle node
                         await port_connectivity.spend_disk_pressure_deferrals(ctx)
                         return with_pod_states(
@@ -392,14 +456,13 @@ class TenantEnforcementCheck:
                         )
                     # PortCountCheck exempted this node from the port floor because the batch-start rented
                     # list named a pod; the node goes on as unrented with a count the backend will not list.
-                    # The floor is enforced only when every listed pod is stale: a live rental on the same
-                    # node is a real exemption, and this loop returns before it would reach later pods.
+                    # Every listed pod is stale here (the check above): the floor applies to an idle node.
                     port_count_below_floor = port_count_below_listing_floor(ctx.state)
                     # DAH-3698 (owner rule): only a rented split node is exempt from its per-split ports, so a
                     # node whose every listed pod is stale is idle and needs them, with or without the floor flag
                     split_short = split_port_shortfall(ctx.state)
                     reprobed: dict[str, Any] = {}
-                    if split_short is not None and await _every_listed_pod_stale(ctx, rented_pods, pod_index):
+                    if split_short is not None:
                         # the probe skipped the stale pods' ports: re-probe them all, only answering ports count
                         split_short, reprobed = await _reprobe_split_shortfall(ctx, split_short, rented_pods)
                         if "rented_data" in reprobed:
@@ -434,7 +497,6 @@ class TenantEnforcementCheck:
                     if (
                         port_count_below_floor is not None
                         and settings.ENFORCE_PORT_FLOOR_ON_STALE_POD
-                        and await _every_listed_pod_stale(ctx, rented_pods, pod_index)
                     ):
                         event = render_message(
                             PortCountMessages.INSUFFICIENT_PORTS,
@@ -512,6 +574,11 @@ class TenantEnforcementCheck:
                 )
             )
 
+        if closed_pod_ids:
+            # reported only: the cycle keeps the batch-start rental view the split sizing and pay were built from,
+            # as for any pod that ends between cycles; the next cycle's list no longer names it
+            extra["pods_rental_closed"] = sorted(closed_pod_ids)
+        # a closed pod's container is still the renter's, and the GPU snapshot may predate its end
         container_names = [pod.docker_container_name for pod in rented_pods]
         container_names.extend(filler_containers)
         gpu_processes = list(ctx.state.gpu_processes)
@@ -1303,20 +1370,24 @@ async def _reprobe_split_shortfall(
     return published(fresh.get_filler_ports(ctx.executor.uuid))
 
 
-async def _every_listed_pod_stale(ctx: Context, rented_pods: list[RentedPod], stale_pod_index: int) -> bool:
+async def _every_listed_pod_stale(
+    ctx: Context, rented_pods: list[RentedPod], stale_pod_index: int, closed_pod_ids: set[str]
+) -> bool:
     """True only when every listed pod is not running and its rental is closed.
 
-    `rented_pods[stale_pod_index]` is already known stale. The loop only gets past a pod that is running
-    (or was recovered), so any pod before it is live. Anything unknown (no rental record, a dead SSH
-    transport) counts as live, so the floor is never enforced on a guess.
+    `rented_pods[stale_pod_index]` is already known stale. An earlier pod is stale only if the loop skipped
+    it as closed; any other earlier pod was running, held or judged. Anything unknown (no rental record, a
+    dead or hung SSH transport) counts as live, so the node is never sent on as idle on a guess.
     """
-    if stale_pod_index > 0:
+    if any(pod.pod_id not in closed_pod_ids for pod in rented_pods[:stale_pod_index]):
         return False
-    for other in rented_pods[1:]:
+    for other in rented_pods[stale_pod_index + 1 :]:
         try:
-            other_state = await _check_pod_running_and_read_authorized_keys(
-                ctx.ssh, other.docker_container_name, ctx.default_extra
-            )
+            # the main loop's read budget; a hung read counts as live and the loop's own read then reports it
+            async with asyncio.timeout(max(1.0, task_seconds_left(ctx) - POD_READ_RESERVE_SECONDS)):
+                other_state = await _check_pod_running_and_read_authorized_keys(
+                    ctx.ssh, other.docker_container_name, ctx.default_extra
+                )
         except (asyncssh.Error, OSError):
             return False
         if other_state.running:
