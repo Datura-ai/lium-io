@@ -488,12 +488,20 @@ def _port_collision_candidates(
 def _parse_listening_ports(output: str) -> set[int]:
     """Local ports out of `ss -Hltn` / `netstat -ltn` lines (`0.0.0.0:9101`, `[::]:22`, `*:8888`),
     plus the host ports of `docker ps` Ports lines (`0.0.0.0:10071->9101/tcp, :::10071->9101/tcp`, ranges too)."""
-    ports: set[int] = {
-        port
-        for first, last in _PUBLISHED_HOST_PORT_RE.findall(output)
-        for port in range(int(first), int(last or first) + 1)
-        if 0 < port <= 65535
-    }
+    # A difference array over 1..65535: any number of published ranges costs O(matches + 65535), never a set per range.
+    delta = [0] * 65537
+    for match in _PUBLISHED_HOST_PORT_RE.finditer(output):
+        first, last = int(match[1]), int(match[2] or match[1])
+        first, last = max(first, 1), min(last, 65535)
+        if first <= last:
+            delta[first] += 1
+            delta[last + 1] -= 1
+    ports: set[int] = set()
+    covered = 0
+    for port in range(1, 65536):
+        covered += delta[port]
+        if covered:
+            ports.add(port)
     for line in output.splitlines():
         for column in line.split():
             if column.endswith("*") or ":" not in column:
@@ -4108,6 +4116,7 @@ class DockerService:
         quote_socket: bool = False,
         image_command_fallback: tuple[str, ...] = (),
         docker_data_volume_driver: str | None = None,
+        on_cpus_granted: Callable[[int], None] | None = None,
     ) -> ContainerRunSpec:
         # A sysbox pod's inner dockerd writes /var/lib/docker; without a mount there it lands in an
         # uncapped host volume (the image's VOLUME, or sysbox's own) that can fill the host disk. It
@@ -4210,6 +4219,9 @@ class DockerService:
                 else effective_storage_limit_gb
             ),
             pids_limit=self._rental_pids_limit(cpu_count, host_pid_max),
+            pids_limit_for=partial(self._rental_pids_limit, host_pid_max=host_pid_max),
+            min_cpu_count=payload.min_cpu_count,
+            on_cpus_granted=on_cpus_granted,
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
@@ -6227,6 +6239,7 @@ class DockerService:
                     rental_fits,
                     evict_first_prefix=ENGY_CACHE_VOLUME_PREFIX,
                     volume_remove=volume_remove,
+                    keep_image=payload.docker_image,
                 )
             except asyncio.CancelledError:
                 raise
@@ -11023,6 +11036,7 @@ class DockerService:
                     )
                 # host_pid_max was read and validated fail-closed before any host side-effect above
                 # (review finding on PR #1531); here it only sizes the container's pids.max.
+                granted_cpu_counts: list[int] = []
                 run_spec = self._build_rental_container_run_spec(
                     payload=payload,
                     container_name=container_name,
@@ -11041,6 +11055,7 @@ class DockerService:
                     quote_socket=quote_socket,
                     image_command_fallback=image_command_fallback,
                     docker_data_volume_driver=local_volume_driver,
+                    on_cpus_granted=granted_cpu_counts.append,
                 )
 
                 logger.info(
@@ -11683,6 +11698,7 @@ class DockerService:
                     volume_limit_gb=effective_volume_limit_gb,
                     local_volume_path=local_volume_path,
                     volume_encryption_status=volume_encryption_status,
+                    cpu_count=granted_cpu_counts[-1] if granted_cpu_counts else cpu_count,
                 )
                 # Last, so nothing can fail after it: the pod is usable, the reply goes now, and
                 # the steps after it take over this create's sessions and close them.
