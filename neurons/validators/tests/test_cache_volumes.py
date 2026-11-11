@@ -298,20 +298,22 @@ async def test_a_whole_node_rental_sized_on_the_listed_cache_evicts_it(docker_se
 
 @pytest.mark.asyncio
 async def test_the_container_storage_is_a_quota_and_never_evicts_the_cache(docker_service):
-    # DAH-6187: the 2300 GB volume fits 2389 GB beside the cache; its 1150 GB storage limit is a quota
-    ssh_client = HostSshClient([_KIMI, "volume_pod"], free_gb=2389)
+    # DAH-6187: the 2300 GB volume and the 100 GB listing floor fit 2489 GB beside the cache; its 1150 GB
+    # storage limit is a quota
+    ssh_client = HostSshClient([_KIMI, "volume_pod"], free_gb=2489)
 
     assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, _rental(2300, 1150), {}) is False
     assert _removed_volumes(ssh_client) == []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("free_gb", "removed"), [(2389, []), (2300, [_KIMI])])
+@pytest.mark.parametrize(("free_gb", "removed"), [(2420, []), (2389, [_KIMI])])
 async def test_a_whole_node_rental_keeps_the_engy_cache_when_its_volume_fits_beside_it(
     docker_service, monkeypatch, free_gb, removed
 ):
     # DAH-6187, prod: the backend orders the whole free disk, the Engy cache counted as free (2300 GB volume +
-    # 1150 GB storage). The volume needs 2300 GB + the sizing's 20 GB overhead: 2389 GB keeps the cache, 2300 does not
+    # 1150 GB storage). The volume needs 2300 GB + the sizing's 20 GB overhead, and the pod's writes the 100 GB
+    # listing floor beside it (the reclaim looks only every ~15 min): 2420 GB keeps the cache, 2389 does not
     ssh_client = HostSshClient([_KIMI, "volume_pod"], free_gb=free_gb)
     monkeypatch.setattr(docker_service, "_get_existing_vloopback_bytes", AsyncMock(return_value=0))
     rental = _rental(2300, 1150)
@@ -652,10 +654,10 @@ async def test_a_half_node_rental_evicts_the_cache_its_share_was_sized_on(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("free_gb", "removed"), [(95, [_KIMI]), (110, [])])
+@pytest.mark.parametrize(("free_gb", "removed"), [(195, [_KIMI]), (210, [])])
 async def test_a_fresh_sized_rental_counts_the_sizing_overhead_in_its_fit(docker_service, monkeypatch, free_gb, removed):
     # DAH-5260 live test: resolve_volume_sizing keeps 20 GB back, so an 82 GB volume needs 102 GB free (DAH-6187:
-    # the 41 GB storage is a quota). The fit check leaves out the same 20 GB.
+    # the 41 GB storage is a quota) plus the 100 GB listing floor. The fit check leaves out the same 20 GB.
     ssh_client = HostSshClient([_KIMI, "volume_pod"], free_gb=free_gb)
     monkeypatch.setattr(docker_service, "_get_existing_vloopback_bytes", AsyncMock(return_value=0))
     rental = _rental(82, 41)
@@ -666,10 +668,11 @@ async def test_a_fresh_sized_rental_counts_the_sizing_overhead_in_its_fit(docker
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("free_gb", "removed"), [(105, [_KIMI]), (115, [])])
+@pytest.mark.parametrize(("free_gb", "removed"), [(205, [_KIMI]), (215, [])])
 async def test_a_fresh_sized_rental_fits_only_under_the_df_guard_too(docker_service, monkeypatch, free_gb, removed):
     # DAH-5260 review: 500 GB of pod volumes already on the node make the pool fit, but resolve_volume_sizing's
-    # df_guard caps the volume at df free less 10 GB, so 100 GB needs 110 GB free or the cache goes
+    # df_guard caps the volume at df free less 10 GB, so 100 GB needs 110 GB free, plus the 100 GB listing floor,
+    # or the cache goes
     ssh_client = HostSshClient([_KIMI, "volume_pod"], free_gb=free_gb)
     monkeypatch.setattr(docker_service, "_get_existing_vloopback_bytes", AsyncMock(return_value=500 * 1024**3))
     rental = _rental(100, 50)

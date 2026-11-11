@@ -6167,9 +6167,9 @@ class DockerService:
         rental fits beside them, and go oldest first until it does; the listing can also be stale (~15 min old,
         an Engy download writes ~1 GB/s until the filler is removed). With no requested size (no --storage-opt)
         the renter did not ask for the disk, so every cache stays (Rustam, 2 Nov): evicting up front would
-        re-download up to 1.5 TB after each such rental. Only the volume counts here: the pod's container
-        writes take disk later, and `reclaim_dphn_cache_when_disk_is_tight` evicts the kept cache mid-rental
-        once they push the node under the listing floor (DAH-6187). Every
+        re-download up to 1.5 TB after each such rental. The volume counts here, not the storage quota, plus
+        the listing floor for the pod's container writes; `reclaim_dphn_cache_when_disk_is_tight` evicts a kept
+        cache mid-rental once those writes push the node under the floor (DAH-6187). Every
         removal is awaited before this returns; a sized rental that still does not fit (a removal failed or
         timed out) has its volume clamped to the disk actually free, so the pod volume is never sized on
         disk that was not freed (create_container refuses a clamp far below the order). A
@@ -6307,6 +6307,9 @@ class DockerService:
         if fresh_sizing and not payload.local_volume:
             # resolve_volume_sizing's df_guard caps the volume at df free less its headroom
             needs_free_gb = max(needs_free_gb, payload.volume_limit_gb + _FRESH_SIZING_HEADROOM_GB)
+        # the pod's writes take disk too and the reclaim only looks every ~15 min: a cache stays only
+        # if the listing floor is still free beside the volume
+        needs_free_gb += DPHN_CACHE_LISTING_FLOOR_GB
         return RentalDiskFit(own_gb, existing_gb, disk_share, fresh_sizing, needs_free_gb)
 
     async def _clamp_rental_volume_to_free_disk(
