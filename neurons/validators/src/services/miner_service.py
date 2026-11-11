@@ -137,8 +137,10 @@ def _is_miner_unreachable_error(error: Exception) -> bool:
 def _storage_repository_spec(
     volume_info,
     password: str | None,
+    version: int = 1,
 ) -> dict[str, object]:
     return {
+        "version": version,
         "bucket": volume_info.name,
         "access_key_id": volume_info.iam_user_access_key,
         "secret_access_key": volume_info.iam_user_secret_key,
@@ -1764,6 +1766,7 @@ class MinerService:
             "repository": _storage_repository_spec(
                 payload.backup_volume_info,
                 payload.repository_password,
+                payload.repository_version,
             ),
             "workspace": {
                 "mode": "encrypted_running" if payload.volume_encrypted else "plain_volume",
@@ -1793,6 +1796,7 @@ class MinerService:
             "repository": _storage_repository_spec(
                 payload.backup_volume_info,
                 payload.repository_password,
+                payload.repository_version,
             ),
             "workspace": {
                 "mode": "encrypted_running" if payload.volume_encrypted else "plain_volume",

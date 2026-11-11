@@ -380,6 +380,18 @@ def test_restic_backup_spec_carries_the_exclude_patterns():
     assert spec["workspace"]["exclude_patterns"] == [".cache", ".ssh"]
 
 
+def test_restic_backup_spec_carries_the_repository_version():
+    # DAH-2002: the executor builds restic/v{version}/pods/{pod}; a request without it stays on v1
+    payload = _backup_payload()
+    payload.backup_engine = "restic"
+    payload.repository_password = "repository-password"
+    assert MinerService._restic_backup_operation_spec(payload)["repository"]["version"] == 1
+
+    payload.repository_version = 2
+
+    assert MinerService._restic_backup_operation_spec(payload)["repository"]["version"] == 2
+
+
 def _walk_json(value, path=""):
     if isinstance(value, dict):
         for key, item in value.items():
@@ -417,6 +429,7 @@ async def test_encrypted_bootstrap_restore_spec_never_carries_the_passphrase(mon
             session_token=None,
         ),
         repository_password="repo-password",
+        repository_version=1,
         repository_pod_id="pod-1",
         snapshot_id="a" * 64,
         legacy_object_key=None,

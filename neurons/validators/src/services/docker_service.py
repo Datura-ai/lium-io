@@ -11929,6 +11929,7 @@ class DockerService:
             "secret_access_key": restore.backup_volume_info.iam_user_secret_key,
             "session_token": restore.backup_volume_info.session_token,
             "password": restore.repository_password,
+            "version": restore.repository_version,
         }
         spec: dict[str, object] = {
             "operation_id": restore.restore_log_id,

@@ -266,6 +266,7 @@ class BootstrapRestoreSpec(BaseModel):
     backup_engine: str
     repository_pod_id: str
     repository_password: str | None = Field(default=None, repr=False)
+    repository_version: int = 1
     backup_volume_info: ExternalVolumeInfo
     snapshot_id: str | None = None
     legacy_object_key: str | None = None
@@ -512,6 +513,7 @@ class BackupContainerRequest(ContainerBaseRequest):
     backup_engine: str = "tar_aws_cli"
     repository_pod_id: str | None = None
     repository_password: str | None = Field(default=None, repr=False)
+    repository_version: int = 1
     failure_timeout_seconds: int = Field(default=600, gt=0)
     exclude_patterns: list[str] = []
 
@@ -530,6 +532,7 @@ class RestoreContainerRequest(ContainerBaseRequest):
     backup_engine: str = "tar_aws_cli"
     repository_pod_id: str | None = None
     repository_password: str | None = Field(default=None, repr=False)
+    repository_version: int = 1
     snapshot_id: str | None = None
     legacy_object_size_bytes: int | None = None
     failure_timeout_seconds: int = Field(default=600, gt=0)

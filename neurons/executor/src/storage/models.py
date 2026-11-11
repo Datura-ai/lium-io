@@ -55,9 +55,17 @@ class RepositorySpec:
     session_token: str | None = field(default=None, repr=False)
     region: str = "us-east-1"
     endpoint: str = "s3.amazonaws.com"
+    # the backend starts a fresh repository under the next version when the pod's repository never
+    # completed a backup and will not open (DAH-2002); a validator that predates this sends none
+    version: int = 1
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> RepositorySpec:
+        version = value.get("version", 1)
+        if version is None:
+            version = 1
+        if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+            raise OperationSpecError("repository.version must be a positive integer")
         return cls(
             bucket=_required_string(value, "bucket"),
             access_key_id=_required_string(value, "access_key_id"),
@@ -66,11 +74,12 @@ class RepositorySpec:
             session_token=_optional_nullable_string(value, "session_token"),
             region=_optional_string(value, "region", "us-east-1"),
             endpoint=_optional_string(value, "endpoint", "s3.amazonaws.com"),
+            version=version,
         )
 
     def url_for_pod(self, pod_id: UUID) -> str:
         endpoint = self.endpoint.rstrip("/")
-        prefix = f"restic/v1/pods/{pod_id}"
+        prefix = f"restic/v{self.version}/pods/{pod_id}"
         return f"s3:{endpoint}/{self.bucket}/{prefix}"
 
 

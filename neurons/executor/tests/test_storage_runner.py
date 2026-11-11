@@ -101,6 +101,20 @@ def test_operation_derives_repository_from_pod() -> None:
     )
 
 
+def test_a_repository_version_from_the_backend_selects_a_fresh_prefix() -> None:
+    # DAH-2002: a pod whose repository never completed and will not open gets a new one under v2
+    payload = _operation_payload()
+    payload["repository"]["version"] = 2
+    operation = StorageOperationSpec.from_mapping(payload)
+
+    assert operation.repository.url_for_pod(operation.pod_id) == (
+        f"s3:s3.amazonaws.com/backup-bucket/restic/v2/pods/{POD_ID}"
+    )
+    payload["repository"]["version"] = 0
+    with pytest.raises(OperationSpecError, match="repository.version"):
+        StorageOperationSpec.from_mapping(payload)
+
+
 def test_legacy_s3_connection_override_is_ignored() -> None:
     payload = _operation_payload()
     repository = payload["repository"]
