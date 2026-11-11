@@ -1497,6 +1497,44 @@ async def test_a_removal_before_a_hang_still_drops_the_removed_containers_gpu_pr
 
 
 @pytest.mark.asyncio
+async def test_slow_lookups_after_a_timeout_still_claim_what_is_already_confirmed(monkeypatch):
+    """Review 4534599627: a slow backend lookup used the whole exemption budget before the claim ran, so
+    the confirmed removal's GPU processes counted and GpuUsageCheck failed a healthy node."""
+    from protocol.vc_protocol.compute_requests import PodRentalActiveResponse
+    from services.task.checks import stale_container_cleanup
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+
+    monkeypatch.setattr(stale_container_cleanup, "STALE_CLEANUP_BUDGET_SECONDS", 0.05)
+    monkeypatch.setattr(stale_container_cleanup, "GPU_EXEMPTION_BUDGET_AFTER_TIMEOUT_SECONDS", 0.05)
+    fast = "pod_00000000-0000-4000-8000-0000000000a1"
+    slow = "pod_00000000-0000-4000-8000-0000000000a2"
+    backend = AsyncMock()
+    gone = {"pid": 1, "container_name": fast}
+    other = {"pid": 2, "container_name": slow}
+    ctx = _cleanup_check_ctx([], [gone, other], backend=backend)
+
+    async def lookup(record_id):
+        if record_id == slow.partition("_")[2]:
+            await asyncio.sleep(60)  # a backend that never answers
+        return PodRentalActiveResponse(active=False, rental_closed_at=CLOSED, executor_id=str(ctx.executor.uuid))
+
+    backend.get_pod_rental_active.side_effect = lookup
+
+    async def remove_both_then_hang(**kwargs):
+        for name in (fast, slow):
+            assert kwargs["reserve_removal"](name)
+            kwargs["on_removed"](name)
+        await asyncio.sleep(60)
+
+    ctx.services.container_cleanup.cleanup.side_effect = remove_both_then_hang
+
+    result = await asyncio.wait_for(StaleContainerCleanupCheck().run(ctx), timeout=5)
+
+    assert result.event.reason_code == "STALE_CLEANUP_TIMED_OUT"
+    assert result.updates["state"].gpu_processes == [other]
+
+
+@pytest.mark.asyncio
 async def test_a_cache_sweep_cut_by_the_budget_does_not_run_again_next_cycle(monkeypatch):
     """Review 4491995523: an unstamped sweep repeats on a slow node every cycle and the reclaim after it never runs."""
     from services.task.checks import stale_container_cleanup

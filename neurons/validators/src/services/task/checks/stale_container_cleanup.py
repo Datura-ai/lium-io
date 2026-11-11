@@ -117,11 +117,11 @@ class StaleContainerCleanupCheck:
             pass
         # a container already removed is in the reaped queue and is reported next cycle; its GPU
         # processes must not count, or GpuUsageCheck judges a container that is gone
-        exempt: set[str] = set()
         with contextlib.suppress(TimeoutError):
             async with asyncio.timeout(GPU_EXEMPTION_BUDGET_AFTER_TIMEOUT_SECONDS):
-                await _confirm_reserved_removals(ctx, removed, confirmed, reserved)
-                exempt = await queue.claim_gpu_exemptions(confirmed.intersection(removed))
+                await _confirm_ended_workloads_of_reserved_removals(ctx, removed, confirmed, reserved)
+        # outside the lookup budget: slow lookups must not skip the claim for what is already confirmed
+        exempt = await queue.claim_gpu_exemptions(confirmed.intersection(removed))
         event = render_message(
             Msg.TIMED_OUT, ctx=ctx, check_id=self.check_id, what={"budget_seconds": STALE_CLEANUP_BUDGET_SECONDS}
         )
@@ -250,7 +250,7 @@ class StaleContainerCleanupCheck:
         # neither TenantEnforcementCheck nor GpuUsageCheck may count them against the node. Only when
         # the backend confirms it was Lium's: a label or a health_check_ name is the host's to forge,
         # and a forged container recreated between cycles would otherwise pass the GPU gate each cycle.
-        await _confirm_reserved_removals(ctx, removed_names, confirmed, reserved)
+        await _confirm_ended_workloads_of_reserved_removals(ctx, removed_names, confirmed, reserved)
         if lookups["skipped"]:
             logger.warning(
                 _m(
@@ -275,14 +275,14 @@ class StaleContainerCleanupCheck:
         if not unremovable_names and not reaped and not removed_names:
             return CheckResult(passed=True, event=event)
         # confirmed AND gone: a confirmed container that survived docker rm still runs its processes
-        removed = await queue.claim_gpu_exemptions(confirmed.intersection(removed_names))
+        exempt = await queue.claim_gpu_exemptions(confirmed.intersection(removed_names))
         state = replace(
             ctx.state,
             orphaned_containers=unremovable_names,
             gpu_processes=[
                 process
                 for process in ctx.state.gpu_processes
-                if process.get("container_name") not in removed
+                if process.get("container_name") not in exempt
             ],
             pod_states=[*ctx.state.pod_states, *reaped],
         )
@@ -331,7 +331,9 @@ class StaleContainerCleanupCheck:
             return True
 
 
-async def _confirm_reserved_removals(ctx: Context, removed: list[str], confirmed: set[str], reserved: set[str]) -> None:
+async def _confirm_ended_workloads_of_reserved_removals(
+    ctx: Context, removed: list[str], confirmed: set[str], reserved: set[str]
+) -> None:
     """Adds to ``confirmed`` each removed container whose lookup slot was reserved before removal and
     whose backend record shows it ended here; a failed lookup leaves it unconfirmed (its processes count)."""
     for name in removed:
