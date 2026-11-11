@@ -13,7 +13,7 @@ The stack runs two containers: `executor-executor-runner-1` and `executor-watcht
 
 The updater never pulls by tag. A pull by tag (`runner:latest`) asks the host's Docker daemon, and the daemon asks a registry mirror first when `/etc/docker/daemon.json` has one. A mirror can keep an old copy of the tag, and the pull then "succeeds" with the old image. A pull by digest is content-addressed: the daemon checks the hash of what it receives, so a mirror can answer with the right image or with an error, never with an old one. When the daemon's path fails, the updater pulls the same digest from `registry-1.docker.io` directly, which the daemon's mirror setting does not cover.
 
-Stacks started before this change run `nickfedor/watchtower`, which pulls by tag. Those hosts keep it until the one-time restart below.
+Stacks started before this change run `nickfedor/watchtower` (or the older `containrrr/watchtower`), which pulls by tag. The runner replaces it: every time the runner starts, it checks the stack's updater container and, when it runs another image, starts `daturaai/lium-watchtower` in its place with the same name. When that container does not start, the runner puts the old updater back. The next runner release reaches those hosts through their old updater, so they need no step. The one-time restart below is for a host whose updater no longer runs.
 
 ## Make sure that a node is current
 
@@ -64,13 +64,21 @@ A later `docker compose up -d` without a service name recreates the runner from 
 
 If `git pull` stops because of local changes to tracked files, run `git stash && git pull && git stash pop`. Then run `docker compose pull watchtower && docker compose up -d watchtower`. If `git stash pop` reports a conflict, send the output to Lium support.
 
-After about two minutes, make sure that both containers are up:
+If the host has no runner at all (`docker compose ps -a executor-runner` lists nothing), the updater cannot make one for this stack. Create it without starting it:
 
 ```bash
-docker compose ps executor-runner watchtower
+docker compose create --no-recreate executor-runner
 ```
 
-The output must list `executor-executor-runner-1` and `executor-watchtower-1` with the state `Up`. Then run the `/update-status` command from the section above: `runner.update_pending` must be `false`. The node earns again at the next validation cycle after the executor image matches the current release.
+At its next check (within 5 minutes) the updater finds that container, verifies the signed digest, pulls the current runner by it and starts that in its place. The created container never runs: the updater does not probe with its image, and when the current runner fails to start it leaves the created one stopped (its log says `Switch to the new container failed`) and tries again at its next check. This needs `daturaai/lium-watchtower:1.2.3` or later, which the `git pull` above brings. If the runner then still shows `Created` and `docker logs executor-watchtower-1 --tail 5` says `Image is up to date`, the image on the host already is the signed one: `docker compose start executor-runner`.
+
+After about two minutes (five after the `create` step), make sure that both containers are up:
+
+```bash
+docker compose ps -a executor-runner watchtower
+```
+
+The output must list `executor-executor-runner-1` and `executor-watchtower-1` with the state `Up`. A runner in the state `Created` is waiting for the updater's next check: look again after 5 minutes. Then run the `/update-status` command from the section above: `runner.update_pending` must be `false`. The node earns again at the next validation cycle after the executor image matches the current release.
 
 ## If `update_pending` stays `true` after the restart
 

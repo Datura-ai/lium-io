@@ -73,9 +73,10 @@ from services.docker_service import DockerService, create_steps_after_reply, cus
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.node_host import for_payload_miner, public_host_sock
 from services.redis_service import MACHINE_SPEC_CHANNEL, POD_STATES_CHANNEL, RedisService
-from services.roce_link_probe import measure_and_attach
+from services.roce_link_probe import CYCLE_JOB_WAIT_SECONDS, PROBE_TAIL_MARGIN_SECONDS, measure_and_attach
 from services.ssh_service import SSHService
 from services.task.checks.duplicate_executor import _gpu_uuids
+from services.task.checks.rental_probe import wait_for_teardowns_after_verdict
 from services.task.availability import (
     availability_errors,
     build_executor_unreachable_by_miner_event,
@@ -378,8 +379,9 @@ class MinerService:
         self.published_gpu_uuids: dict[str, set[str]] = {}
         # DAH-5635: the running cycle's outage share for publish_unreachable_early; None = publish nothing early
         self.outage_tally: RunningOutageTally | None = None
-        # DAH-5635: executor uuid -> the availability errors this process's last cycle publish sent for it
-        self.cycle_published_availability: dict[str, list[dict]] = {}
+        # DAH-5635: (miner hotkey, executor uuid) -> the availability errors this process's last cycle publish sent for
+        # it; two miners can report one uuid, and the backend tells their nodes apart by hotkey (review 4491025362)
+        self.cycle_published_availability: dict[tuple[str, str], list[dict]] = {}
 
     def start_awaiting_wave_lists(self, job_batch_id: str, miner_hotkeys: list[str]) -> None:
         """Validator.sync(), in the same step that publishes the cycle's inputs to the lane."""
@@ -1228,7 +1230,7 @@ class MinerService:
             # recorded before the publish: a node hidden by a partial publish must be re-listable too
             tally.published_early.update(str(result.executor_info.uuid) for result in early)
             await self.publish_machine_specs(
-                early, job["miner_hotkey"], job["miner_coldkey"], is_whole_miner_batch=False
+                early, job["miner_hotkey"], job["miner_coldkey"], is_whole_miner_batch=False, published_early=True
             )
             logger.info(
                 _m(
@@ -1255,8 +1257,15 @@ class MinerService:
         miner_coldkey: str,
         *,
         is_whole_miner_batch: bool = True,
+        remember_availability: bool = False,
+        published_early: bool = False,
     ):
         """Publish machine specs to compute app connector process.
+
+        `remember_availability` records a partial publish's full availability list (an express run) for the outage
+        restore, as the whole batch's is. Any other partial publish with a finding forgets the recorded list: the
+        backend merges it, so the copy is stale, and the restore then leaves the stored list alone (review
+        4523252162). `published_early` is the early unreachable publish, the one the restore undoes: it keeps it.
 
         `is_whole_miner_batch` False leaves `batch_total` unset: the backend's delivery metrics
         (DAH-2792) take a miner's expected spec count from the first spec per (validator,
@@ -1285,15 +1294,9 @@ class MinerService:
             ),
         )
         batch_total = len(results) if is_whole_miner_batch else None
-        if is_whole_miner_batch:
-            for result in results:
-                if result.availability_errors is not None:
-                    self.cycle_published_availability[str(result.executor_info.uuid).lower()] = list(
-                        result.availability_errors
-                    )
         for result in results:
             try:
-                await self.redis_service.publish(
+                receivers = await self.redis_service.publish(
                     MACHINE_SPEC_CHANNEL,
                     {
                         "specs": result.spec,
@@ -1363,6 +1366,17 @@ class MinerService:
                     exc_info=True,
                 )
                 continue
+            # review 4510532986: recorded only once published, so a failed publish leaves the backend's list in place
+            published_key = (miner_hotkey, str(result.executor_info.uuid).lower())
+            if (is_whole_miner_batch or remember_availability) and result.availability_errors is not None:
+                if receivers:
+                    self.cycle_published_availability[published_key] = list(result.availability_errors)
+                else:
+                    # review 4523252153: no connector listening, so the backend's list is unknown
+                    # shortcut: a receiver is not a backend ack; restore from backend state if one is ever exposed
+                    self.cycle_published_availability.pop(published_key, None)
+            elif result.availability_errors and not published_early:
+                self.cycle_published_availability.pop(published_key, None)
             # only a passed spec moves the backend to these UUIDs; a failed one must not hide the recovery
             if result.is_successful and (gpu_uuids := _gpu_uuids(result)):
                 self.published_gpu_uuids[str(result.executor_info.uuid).lower()] = set(gpu_uuids)
@@ -2222,6 +2236,12 @@ class MinerService:
 
                 # Remove SSH key only if it was successfully accepted
                 if ssh_key_accepted:
+                    # a passed rental probe tears its container down after the verdict, over this key
+                    await wait_for_teardowns_after_verdict(
+                        payload.miner_hotkey,
+                        settings.JOB_TIME_OUT - CYCLE_JOB_WAIT_SECONDS - PROBE_TAIL_MARGIN_SECONDS
+                        - (time.monotonic() - job_started_at),
+                    )
                     await self._remove_ssh_key_via_rest(
                         base_url=base_url,
                         my_key=my_key,
@@ -2363,8 +2383,9 @@ class MinerService:
                 _m("Sent SSH key to miner via REST API.", extra=get_extra_info(default_extra)),
             )
 
-            # A restarting miner refuses connections for about a minute. A create waits that out instead of
-            # failing the renter's pod; a resubmitted key is harmless, the removal drops every copy.
+            # A restarting miner refuses connections for about a minute. Every request waits that out instead of
+            # failing (a create the renter's pod, a backup its hourly slot); a resubmitted key is harmless, the
+            # removal drops every copy.
             deadline = time.monotonic() + MINER_RESTART_WAIT_S
             while True:
                 # The miner accepts a signed timestamp for 10 s only, so each attempt signs anew.
@@ -2380,15 +2401,17 @@ class MinerService:
                         log_extra=default_extra,
                         operation_name="SSH key submit",
                     )
-                    # A request held up by the restart reaches the new miner after the signature aged out.
+                    # A request held up (a restarting miner, or a busy one at the top of the hour when the hourly
+                    # backups start) reaches it after the signature aged out. The miner refused it before acting,
+                    # so any request, not only a create, is signed anew and resent.
                     stale = status == 401 and "too old" in str(response_data)
-                    if not stale or not isinstance(payload, ContainerCreateRequest) or time.monotonic() >= deadline:
+                    if not stale or time.monotonic() >= deadline:
                         break
                 except (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError):
                     # refused, or a connect nobody answered: it never reached the miner, so its rental hook did not
                     # run and a resubmit must run it. A read timeout may have run it, and the hook is not idempotent:
                     # that create fails.
-                    if not isinstance(payload, ContainerCreateRequest) or time.monotonic() >= deadline:
+                    if time.monotonic() >= deadline:
                         raise
                 await asyncio.sleep(MINER_RESTART_RETRY_S)
 

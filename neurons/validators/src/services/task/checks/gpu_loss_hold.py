@@ -74,6 +74,8 @@ GPU_LOSS_CONFIRM_SECONDS = 45 * 60
 # shortcut: not a hold window, only how long Redis keeps the mark of a node no cycle sees any more (every held cycle
 # renews it, like the load-test marker); the hold itself ends only on a clean read.
 GPU_LOSS_MARK_TTL_SECONDS = MARKER_TTL_SECONDS
+# DAH-6137: at most one early recheck per node in this window while a pod is left on the old cards.
+POD_GPUS_GONE_RECHECK_SECONDS = 30 * 60
 
 
 def _key(ctx: Context) -> str:
@@ -212,6 +214,7 @@ class GpuLossHoldCheck:
             if stranded is not None:
                 if mark is not None and replaced_all:
                     await self._forget(ctx, key)
+                await self._recheck_soon(ctx)
                 stamp = now.isoformat()
                 # fatal: the cycle scores 0 (no passing report for a pod with no GPU) and nothing re-anchors yet
                 return self._lost(
@@ -295,6 +298,18 @@ class GpuLossHoldCheck:
             },
         )
         return CheckResult(passed=False, event=event, fatal=fatal)
+
+    async def _recheck_soon(self, ctx: Context) -> None:
+        """DAH-6137: the backend recreates the pod on the new cards within a minute; the express lane checks the node
+        again then instead of a cycle later. Once per window, so a pod that is never recreated starts no loop."""
+        if settings.DRY_RUN:
+            return
+        try:
+            await ctx.services.redis.request_executor_recheck_once(
+                ctx.executor.uuid, POD_GPUS_GONE_RECHECK_SECONDS
+            )
+        except GPU_DROP_REDIS_ERRORS:
+            self._log_redis_unavailable(ctx, "recheck request")
 
     async def _save(self, ctx: Context, key: str, mark: DropMark, ttl: int) -> None:
         # A dry run shares Redis with the live validator, so it leaves the live hold alone.

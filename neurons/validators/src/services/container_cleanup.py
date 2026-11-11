@@ -15,7 +15,8 @@ from core.utils import _m
 from services.const import (
     DPHN_CACHE_LISTING_FLOOR_GB,
     CACHE_SWEEP_CONTAINER_NAME,
-    EDIT_PARKED_SUFFIX,
+    PARKED_SUFFIXES,
+    unparked_name,
     FILLER_CACHE_VOLUME_PREFIXES,
     FILLER_CONTAINER_GRACE_MINUTES,
     FILLER_CONTAINER_PREFIX,
@@ -76,11 +77,27 @@ REMOVE_CACHE_SWEEP_CONTAINER = f"/usr/bin/docker rm -f {CACHE_SWEEP_CONTAINER_NA
 # The images of the fillers whose caches the reclaims below give back (Engy's alone is ~32 GB). No
 # `-f`: dockerd refuses an image any container still uses, running or stopped, so a live filler keeps it.
 FILLER_IMAGE_REPOSITORIES = ("ghcr.io/hanlinai/engy-golden-serve", "daturaai/dolphin", "daturaai/dlph")
-REMOVE_IDLE_FILLER_IMAGES = (
-    "/usr/bin/docker image ls "
-    + " ".join(f"--filter reference={repository}" for repository in FILLER_IMAGE_REPOSITORIES)
-    + " --format '{{.Repository}}:{{.Tag}}' | xargs -r /usr/bin/docker image rm >/dev/null 2>&1 || true"
-)
+
+
+def _image_repository(image: str) -> str:
+    reference = image.split("@", 1)[0]
+    name, _, tag = reference.rpartition(":")
+    repository = name if name and "/" not in tag else reference
+    return repository.removeprefix("index.docker.io/").removeprefix("docker.io/")
+
+
+def idle_filler_images_removal_command(keep_image: str | None = None) -> str:
+    """The idle filler images' removal; `keep_image` is the image a create is about to run, whose repository
+    is left alone: a renter may rent the Engy image itself, and it has no container until docker run."""
+    keep = _image_repository(keep_image) if keep_image else None
+    repositories = [repository for repository in FILLER_IMAGE_REPOSITORIES if repository != keep]
+    if not repositories:  # `docker image ls` without a filter would list every image
+        return "true"
+    return (
+        "/usr/bin/docker image ls "
+        + " ".join(f"--filter reference={repository}" for repository in repositories)
+        + " --format '{{.Repository}}:{{.Tag}}' | xargs -r /usr/bin/docker image rm >/dev/null 2>&1 || true"
+    )
 
 
 async def evict_cache_volumes_oldest_first(
@@ -90,6 +107,7 @@ async def evict_cache_volumes_oldest_first(
     has_room: Callable[[], Awaitable[bool]],
     evict_first_prefix: str | None = None,
     volume_remove: Callable[[str], str] = DockerCommand.volume_remove,
+    keep_image: str | None = None,
 ) -> None:
     """Remove filler cache volumes oldest first, stopping as soon as `has_room()` says the disk is enough.
 
@@ -111,7 +129,7 @@ async def evict_cache_volumes_oldest_first(
     except Exception:
         pass
     # the image first: a pull brings it back far faster than a checkpoint download
-    await run_removal(REMOVE_IDLE_FILLER_IMAGES)
+    await run_removal(idle_filler_images_removal_command(keep_image))
     if await has_room():
         return
     # DAH-5260: a rental passes the Engy prefix, the cache its listing offered as free disk
@@ -148,7 +166,7 @@ def listed_container_names(rented_data: Optional[RentedExecutorsResponse]) -> se
         names.update(pod.docker_container_name for pod in executor.pods)
         # An edit parks the pod's current container under <name>__prev while the replacement
         # is created; it is the customer's only copy until then, whatever its age
-        names.update(f"{pod.docker_container_name}{EDIT_PARKED_SUFFIX}" for pod in executor.pods)
+        names.update(f"{pod.docker_container_name}{suffix}" for pod in executor.pods for suffix in PARKED_SUFFIXES)
     # Every filler is protected — a GPU-split node runs one per VRAM bundle, and reaping a
     # sibling kills a live worker mid-cycle. The legacy single map covers an older backend.
     for fillers in rented_data.all_filler_containers_by_executor.values():
@@ -200,7 +218,7 @@ def _bound_pod_id_label(container_name: str, label: str) -> str:
     A renter's image can carry an inherited label naming another live pod, so the label counts only
     when it matches the name: the id after pod_/filler_ (ignoring __prev), or a probe's own name.
     """
-    base = container_name.removesuffix(EDIT_PARKED_SUFFIX)
+    base = unparked_name(container_name)
     if base.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX)):
         return label if label == base.partition("_")[2] else ""
     return label if label == container_name else ""
