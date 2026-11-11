@@ -1825,6 +1825,31 @@ async def test_a_busy_gpu_names_its_measured_load_the_limit_and_the_processes(co
 
 
 @pytest.mark.asyncio
+async def test_a_busy_gpu_held_by_a_container_no_longer_running_says_a_reboot_clears_it(
+    context_factory,
+):
+    container_id = "ee61df8264ce3006fff5b96ac6005f46067c6fedb3cb053ac67b7f91030dc9a7"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 100, "memory_utilization": 0}],
+        gpu_processes=[
+            {
+                "pid": 644002,
+                "info": f"0::/../docker-{container_id}.scope/init.scope",
+                "container_name": None,
+            }
+        ],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert (
+        "GPU processes on the node: a leftover process of container ee61df8264ce, which is no "
+        "longer running (reboot the node to clear it) (pid 644002)." in result.event.remediation
+    )
+
+
+@pytest.mark.asyncio
 async def test_a_busy_gpu_beside_the_nodes_filler_never_names_the_filler_to_stop(context_factory):
     filler_container = "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
     state = build_state(
