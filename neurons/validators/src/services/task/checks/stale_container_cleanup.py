@@ -257,7 +257,6 @@ class StaleContainerCleanupCheck:
                 ctx,
                 taken,
                 free_after if free_after is not None else 0,
-                scrape_credit_held=not removed_orphan_volumes,
                 credit_volumes=credit_volumes,
             )
             if grown.attempted

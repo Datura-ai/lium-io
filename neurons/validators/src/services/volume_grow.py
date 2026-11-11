@@ -149,24 +149,37 @@ async def host_free_bytes(
 
 async def credit_volumes_on_host(
     ssh_client: asyncssh.SSHClientConnection, timeout_seconds: float = SSH_CALL_TIMEOUT_SECONDS
-) -> set[str] | None:
-    """The volumes the scrape counts as free disk (release_filler_cache) still on the host: the filler run volumes and
-    the Engy cache. One removed since the scrape (the cleanup's sweep, a customer create's eviction) is free in a raw
-    read already. None when unread or out of time."""
+) -> dict[str, int | None] | None:
+    """The volumes the scrape counts as free disk (release_filler_cache) still on the host, each with the KB it holds
+    now: an Engy cache emptied or removed since the scrape (the cleanup's sweep, a customer create's eviction) is free
+    in a raw read already. A filler run volume maps to None: preallocated, it holds its scraped size while it exists.
+    None when unread, out of time or any line is malformed."""
     if timeout_seconds <= 0:
         return None
     try:
         async with asyncio.timeout(timeout_seconds):
             result = await ssh_client.run(
-                "/usr/bin/docker volume ls -q --filter label=io.lium.workload=filler"
-                " && /usr/bin/docker volume ls -q --filter name=engy_cache_",
+                "d=/usr/bin/docker; f=$($d volume ls -q --filter label=io.lium.workload=filler) || exit 1;"
+                ' e=$($d volume ls -q --filter name=engy_cache_) || exit 1; for v in $f; do echo "F $v"; done;'
+                " for v in $e; do m=$($d volume inspect -f '{{.Mountpoint}}' \"$v\") || exit 1;"
+                ' h=/proc/1/root$m; [ -d "$h" ] || h=$m; s=$(du -sk "$h") || exit 1; set -- $s; echo "E $1 $v"; done',
                 timeout=timeout_seconds,
             )
-    except Exception:  # noqa: BLE001 - unread: the caller falls back to the scrape's credit
+    except Exception:  # noqa: BLE001 - unread: the caller gives no credit
         return None
     if result.exit_status != 0 or not isinstance(result.stdout, str):
         return None
-    return set(result.stdout.split())
+    volumes: dict[str, int | None] = {}
+    for line in result.stdout.splitlines():
+        kind, _, rest = line.partition(" ")
+        size, _, name = rest.partition(" ")
+        if kind == "F" and rest:
+            volumes[rest] = None
+        elif kind == "E" and size.isdigit() and name:
+            volumes[name] = int(size)
+        else:
+            return None
+    return volumes
 
 
 async def grow_short_volumes(

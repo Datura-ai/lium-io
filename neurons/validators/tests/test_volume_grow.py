@@ -547,7 +547,12 @@ def test_the_read_after_the_pass_caps_on_the_scrapes_footing(
     state.specs["hard_disk"]["filler_released"] = credit_gb * KB_PER_GB
     ctx = context_factory(state=state, rented=True)
 
-    specs = specs_after_disk_taken(ctx, taken_gb * GB, free_now_bytes=free_now_gb * GB)
+    specs = specs_after_disk_taken(
+        ctx,
+        taken_gb * GB,
+        free_now_bytes=free_now_gb * GB,
+        credit_volumes={"engy_cache_c": credit_gb * KB_PER_GB},
+    )
 
     if free_published_gb is None:
         assert specs is None
@@ -676,10 +681,19 @@ async def test_host_free_bytes_reads_the_hosts_docker_root_through_pid_1():
     ("credit_volumes", "removed_orphans", "free_published_gb"),
     [
         # a customer create evicted the Engy cache since the scrape: its space is in the raw read already
-        (set(), 0, 10),
-        # the sweep removed an orphan, but the cache the credit stands for is still on the host
-        ({"engy_cache_x"}, 1, 150),
+        ({}, 0, 10),
+        # the sweep removed an orphan, but the cache the credit stands for is still on the host, as large
+        ({"engy_cache_x": 200 * GB // 1024}, 1, 150),
+        # the cache is still there but emptied since the scrape: its space is in the raw read already
+        ({"engy_cache_x": 0}, 0, 10),
+        # half emptied: only what it holds now is credited
+        ({"engy_cache_x": 100 * GB // 1024}, 0, 110),
+        # a preallocated filler run volume keeps its size while it exists: the scrape's figure stands
+        ({"engy_cache_x": None}, 0, 150),
+        # the inventory could not be read: no credit, whatever the pass removed
+        (None, 0, 10),
     ],
+    ids=["evicted", "kept", "emptied", "half-emptied", "preallocated", "unread"],
 )
 async def test_the_cap_credits_only_the_cache_volumes_still_on_the_host(
     monkeypatch, credit_volumes, removed_orphans, free_published_gb
@@ -716,15 +730,29 @@ async def test_the_cap_credits_only_the_cache_volumes_still_on_the_host(
 
 
 @pytest.mark.asyncio
-async def test_credit_volumes_on_host_lists_the_filler_and_engy_cache_volumes():
+async def test_credit_volumes_on_host_sizes_each_engy_cache_now():
+    # filler run volumes are preallocated (their scraped size stands); an Engy cache is sized as it is now
     ssh = MagicMock()
-    ssh.run = AsyncMock(return_value=MagicMock(exit_status=0, stdout="filler_vol\nengy_cache_a\n"))
+    stdout = "F filler_vol\nE 0 engy_cache_a\nE 42 engy_cache_b\n"
+    ssh.run = AsyncMock(return_value=MagicMock(exit_status=0, stdout=stdout))
 
-    assert await credit_volumes_on_host(ssh) == {"filler_vol", "engy_cache_a"}
+    expected = {"filler_vol": None, "engy_cache_a": 0, "engy_cache_b": 42}
+    assert await credit_volumes_on_host(ssh) == expected
+    command = ssh.run.await_args.args[0]
+    assert "du -sk" in command and "/proc/1/root" in command
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("removed_orphans", "free_published_gb"), [(1, 10), (0, 150)])
+@pytest.mark.parametrize("stdout", ["E x engy_cache_a\n", "E 5\n", "? engy_cache_a\n"])
+async def test_credit_volumes_on_host_is_unread_on_a_malformed_line(stdout):
+    ssh = MagicMock()
+    ssh.run = AsyncMock(return_value=MagicMock(exit_status=0, stdout=stdout))
+
+    assert await credit_volumes_on_host(ssh) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("removed_orphans", "free_published_gb"), [(1, 10), (0, 10)])
 async def test_a_pass_that_removed_volumes_caps_on_the_raw_read_without_the_scrapes_credit(
     monkeypatch, removed_orphans, free_published_gb
 ):
@@ -739,6 +767,8 @@ async def test_a_pass_that_removed_volumes_caps_on_the_raw_read_without_the_scra
 
     monkeypatch.setattr(module, "pod_ids_at_endpoint", lambda *_: {"live"})
     monkeypatch.setattr(module, "host_free_bytes", AsyncMock(side_effect=[160 * GB, 10 * GB]))
+    # the inventory of credit volumes is unread: no credit either way
+    monkeypatch.setattr(module, "credit_volumes_on_host", AsyncMock(return_value=None))
     monkeypatch.setattr(
         module, "grow_short_volumes", AsyncMock(return_value=GrowPass(allocated_bytes=150 * GB, attempted=True))
     )
