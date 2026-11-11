@@ -744,6 +744,31 @@ def test_container_create_kwargs_leaves_inherited_cmd_and_entrypoint_to_the_new_
     assert kwargs["command"] == ["--interval", "60"]
 
 
+def test_container_create_kwargs_takes_no_execution_settings_from_an_unverified_image():
+    """DAH-5942 F-4: a runner made by `docker compose create` holds an image nobody verified.
+    Env entries, working directory and user that came from that image are left to the signed
+    image, compose-set values are kept, and an uninspectable image refuses the rebuild instead
+    of copying its entrypoint."""
+    runner = _fake_container(status="created")
+    runner.attrs["Config"]["Env"] = ["PATH=/usr/bin", "LD_PRELOAD=/evil.so", "COMPOSE_SET=1"]
+    runner.attrs["Config"]["WorkingDir"] = "/evil"
+    runner.attrs["Config"]["User"] = "evil"
+    image = _fake_image(OLD_DIGEST)
+    image.attrs["Config"].update({"Env": ["PATH=/usr/bin", "LD_PRELOAD=/evil.so"], "WorkingDir": "/evil", "User": "evil"})
+    client = _client_with(runner, old_image=image)
+
+    kwargs = container_create_kwargs(client, runner, f"{IMAGE}@{NEW_DIGEST}")
+
+    assert kwargs["environment"] == ["COMPOSE_SET=1"]
+    assert kwargs["working_dir"] is None
+    assert kwargs["user"] is None
+    assert kwargs["entrypoint"] is None
+
+    client.images.get.side_effect = docker.errors.ImageNotFound("gone")
+    with pytest.raises(RuntimeError):
+        container_create_kwargs(client, runner, f"{IMAGE}@{NEW_DIGEST}")
+
+
 def test_recreate_container_keeps_a_runner_on_the_host_at_every_step():
     """Regression: stop and remove the old container, then fail to create the new one, and
     the host has no runner until the next cycle creates a CVM-shaped one. The order is:

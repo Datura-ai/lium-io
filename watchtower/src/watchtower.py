@@ -402,8 +402,11 @@ def container_create_kwargs(client: docker.DockerClient, old: Container, image_r
     Name, command, entrypoint, environment, labels, working directory, user, the whole
     HostConfig (binds, restart policy, ports, privileges) and the network endpoints are
     copied from the old container, so a runner created by compose keeps its compose
-    labels, its `.env` bind and its restart policy. A Cmd or Entrypoint that the old
-    container inherited from its image is not copied: the new image decides it.
+    labels, its `.env` bind and its restart policy. A Cmd, Entrypoint, working directory,
+    user or Env entry that the old container inherited from its image is not copied: the
+    new image decides it. A runner that never ran (`docker compose create`) has an image
+    nobody verified; when that image cannot be inspected nothing is copied blindly and
+    the rebuild is refused.
     """
     attrs = old.attrs
     config = attrs.get("Config") or {}
@@ -411,7 +414,10 @@ def container_create_kwargs(client: docker.DockerClient, old: Container, image_r
     try:
         old_image_config = client.images.get(attrs["Image"]).attrs.get("Config") or {}
     except Exception as e:
+        if old.status == "created":
+            raise RuntimeError(f"Image of the never-started runner is not inspectable: {e}") from e
         logger.warning(_m("Old image not inspectable, copying Cmd/Entrypoint as they are", {"error": str(e)}))
+    image_env = set(old_image_config.get("Env") or [])
 
     networks = (attrs.get("NetworkSettings") or {}).get("Networks") or {}
     endpoints = {}
@@ -425,12 +431,11 @@ def container_create_kwargs(client: docker.DockerClient, old: Container, image_r
         "name": attrs.get("Name", "").lstrip("/") or None,
         "command": _inherited_or_none(config.get("Cmd"), old_image_config.get("Cmd")),
         "entrypoint": _inherited_or_none(config.get("Entrypoint"), old_image_config.get("Entrypoint")),
-        # Env is copied whole: compose-set variables must survive, and the image-provided
-        # part (PATH and the like) is the same in every runner build.
-        "environment": config.get("Env"),
+        # Compose-set variables survive; entries the old image set are left to the new image.
+        "environment": [e for e in config.get("Env") or [] if e not in image_env] or None,
         "labels": config.get("Labels"),
-        "working_dir": config.get("WorkingDir") or None,
-        "user": config.get("User") or None,
+        "working_dir": _inherited_or_none(config.get("WorkingDir") or None, old_image_config.get("WorkingDir") or None),
+        "user": _inherited_or_none(config.get("User") or None, old_image_config.get("User") or None),
         "host_config": attrs.get("HostConfig") or {},
         "networking_config": client.api.create_networking_config(endpoints) if endpoints else None,
     }
