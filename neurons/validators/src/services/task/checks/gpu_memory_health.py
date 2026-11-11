@@ -121,13 +121,15 @@ async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardH
     downgrades = [s for s in report.get("card_suspects") or [] if isinstance(s, str)]
     xid_faults = [s for s in report.get("xid_faults") or [] if isinstance(s, str)]
     xid = report.get("xid") if isinstance(report.get("xid"), dict) else {}
-    seen = xid.get("count") if xid.get("available") else before.xid_seen
     boot_id = report.get("boot_id") if isinstance(report.get("boot_id"), str) else None
     # the boot id, not the Xid line count: a cleared or wrapped kernel log shrinks the count on a faulty card
     rebooted = before.boot_id is not None and boot_id is not None and boot_id != before.boot_id
     listed = [gpu for gpu in (report.get("nvml") or {}).get("gpus") or [] if isinstance(gpu, dict)]
     gpus = {gpu["uuid"]: gpu for gpu in listed if isinstance(gpu.get("uuid"), str)}
     every_card_named = bool(listed) and len(gpus) == len(listed)
+    # a card read without its UUID or bus id had its new Xid lines skipped: keep them for the next read
+    every_card_tied = every_card_named and all(isinstance(gpu.get("pci_bus_id"), str) for gpu in listed)
+    seen = xid.get("count") if xid.get("available") and every_card_tied else before.xid_seen
     downgraded_before = {_card_uuid(s) for s in before.pcie_downgrades} - {None}
     new = xid_faults + [s for s in downgrades if _card_uuid(s) in downgraded_before]
     held = [f for f in before.held if not _held_fault_proven_healed(f, gpus, every_card_named, rebooted)]

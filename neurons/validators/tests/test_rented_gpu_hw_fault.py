@@ -108,7 +108,8 @@ FULL_LINK_AT_P0 = {"pstate": 0, "pcie_width": 16, "pcie_width_max": 16, "pcie_ge
 
 
 def _ok(gpu=None, **extra):
-    nvml = {"available": True, "gpus": [{"index": 3, "uuid": UUIDS[3], "ecc_uncorrected": 0, **(gpu or {})}]}
+    card = {"index": 3, "uuid": UUIDS[3], "pci_bus_id": "00000000:03:00.0", "ecc_uncorrected": 0}
+    nvml = {"available": True, "gpus": [{**card, **(gpu or {})}]}
     return _report("ok", flags=[], nvml=nvml, **extra)
 
 
@@ -133,6 +134,16 @@ async def test_the_xid_baseline_is_kept_and_passed_to_the_next_read(context_fact
     _, cmd = await _read(context_factory, services, _ok(xid={"available": False, "error": "denied"}))
     assert cmd.endswith("--nvml-only --xid-seen 4")
     # a log not readable this time keeps the old baseline
+    assert _stored(services.redis)["xid_seen"] == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unread", ["uuid", "pci_bus_id"])
+async def test_a_card_nvml_could_not_name_keeps_the_xid_baseline(context_factory, unread):
+    services = _services()
+    await _read(context_factory, services, _ok(xid={"available": True, "count": 4}))
+    # the probe cannot tie that card's new Xid lines to it this cycle, so they must be judged next time
+    await _read(context_factory, services, _ok(gpu={unread: None}, xid={"available": True, "count": 6}))
     assert _stored(services.redis)["xid_seen"] == 4
 
 
