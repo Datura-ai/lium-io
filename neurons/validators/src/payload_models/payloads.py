@@ -333,6 +333,8 @@ class ContainerCreateRequest(ContainerBaseRequest):
     user_public_keys: list[str] = []
     gpu_uuids: list[str]
     cpu_count: int | None = None
+    # the renter's own CPU floor (rent by spec); a node that cannot grant it is refused, never shrunk below it
+    min_cpu_count: int | None = None
     memory_gb: int | None = None
     custom_options: CustomOptions | None = None
     debug: bool | None = None
@@ -745,6 +747,8 @@ class ContainerCreated(ContainerBaseResponse):
     volume_encryption_status: VolumeEncryptionStatus | None = None
     # protocol 2.13.0: the ContainerCreateRequest's command_id, so the backend can tell which dispatch this completes
     command_id: str = ""
+    # the CPUs the container got; below the ordered count when the daemon has fewer than advertised
+    cpu_count: int | None = None
 
 
 class ContainerStarted(ContainerBaseResponse):
