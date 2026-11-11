@@ -689,9 +689,13 @@ async def test_an_undo_whose_ssh_session_died_keeps_the_creates_own_error(svc, m
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("edit_error", [None, RuntimeError("create failed")], ids=["edit-done", "edit-failed"])
-async def test_the_parked_name_is_recorded_while_parked_and_dropped_when_the_edit_ends(edit_error):
+async def test_the_parked_name_is_recorded_while_parked_and_kept_briefly_after_the_edit_ends(edit_error):
     from services.docker_service import _EditSwap
-    from services.redis_service import EDIT_PARKED_CONTAINER_PREFIX, EDIT_PARKED_CONTAINER_TTL_SECONDS
+    from services.redis_service import (
+        EDIT_PARKED_CONTAINER_AFTER_EDIT_SECONDS,
+        EDIT_PARKED_CONTAINER_PREFIX,
+        EDIT_PARKED_CONTAINER_TTL_SECONDS,
+    )
 
     redis = AsyncMock()
     key = f"{EDIT_PARKED_CONTAINER_PREFIX}ex-1:pod_abc{EDIT_PARKED_SUFFIX}"
@@ -699,11 +703,13 @@ async def test_the_parked_name_is_recorded_while_parked_and_dropped_when_the_edi
 
     await swap.park()
     redis.set.assert_awaited_once_with(key, "1", ex=EDIT_PARKED_CONTAINER_TTL_SECONDS)
-    redis.delete.assert_not_awaited()
+    redis.expire.assert_not_awaited()
 
     await swap.__aexit__(type(edit_error) if edit_error else None, edit_error, None)
-    redis.delete.assert_awaited_once_with(key)
-    assert EDIT_PARKED_CONTAINER_TTL_SECONDS <= 3600  # a backstop for a validator killed mid-edit, not a lease
+    # a GPU check that read the parked container's processes before the end still finds the record
+    redis.delete.assert_not_awaited()
+    redis.expire.assert_awaited_once_with(key, EDIT_PARKED_CONTAINER_AFTER_EDIT_SECONDS)
+    assert EDIT_PARKED_CONTAINER_AFTER_EDIT_SECONDS < EDIT_PARKED_CONTAINER_TTL_SECONDS <= 3600
 
 
 @pytest.mark.asyncio

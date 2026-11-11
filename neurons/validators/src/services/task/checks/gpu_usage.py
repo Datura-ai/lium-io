@@ -579,7 +579,7 @@ async def the_backend_still_owns(ctx: Context, container_name: str) -> bool:
     # an edit parks the pod's old container as pod_<id>__prev before stopping it; only a name this
     # validator parked is ours, anyone can start a container under that name
     if not is_filler and container_name.endswith(EDIT_PARKED_SUFFIX):
-        if not await _parked_by_this_validator(ctx, container_name):
+        if await _parked_by_this_validator(ctx, container_name) is False:
             return False
     backend_issued_id: str | None = _uuid_after_prefix(
         container_name if is_filler else container_name.removesuffix(EDIT_PARKED_SUFFIX), prefix
@@ -614,8 +614,8 @@ async def the_backend_still_owns(ctx: Context, container_name: str) -> bool:
     return rental.state not in _ORPHAN_STATES
 
 
-async def _parked_by_this_validator(ctx: Context, container_name: str) -> bool:
-    """False when Redis does not answer: the name alone proves nothing."""
+async def _parked_by_this_validator(ctx: Context, container_name: str) -> bool | None:
+    """None when Redis does not answer: unknown, so the backend's verdict on the pod decides, as for any pod name."""
     try:
         return bool(
             await asyncio.wait_for(
@@ -625,7 +625,7 @@ async def _parked_by_this_validator(ctx: Context, container_name: str) -> bool:
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Edit-parked container record unreadable for %s: %s", container_name, exc)
-        return False
+        return None
 
 
 def _a_broken_pod_the_reaper_has_not_collected_yet(pod_rental: PodRentalActiveResponse) -> bool:
@@ -678,7 +678,7 @@ async def _pod_container_rental(ctx: Context, container_name: str) -> PodContain
         return PodContainerRental(
             container_name, None, PodRentalState.ORPHAN, "its name carries no pod id Lium issued"
         )
-    if container_name.endswith(EDIT_PARKED_SUFFIX) and not await _parked_by_this_validator(ctx, container_name):
+    if container_name.endswith(EDIT_PARKED_SUFFIX) and await _parked_by_this_validator(ctx, container_name) is False:
         return PodContainerRental(container_name, pod_id, PodRentalState.ORPHAN, "no edit of this pod parked it")
 
     pod_rental: PodRentalActiveResponse | None = await ctx.services.backend.get_pod_rental_active(pod_id)

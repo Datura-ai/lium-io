@@ -594,9 +594,15 @@ async def test_a_pod_container_on_an_unrented_node_is_judged_by_its_pod(
 
 
 @pytest.mark.parametrize("gpu_details", [BUSY_GPU, IDLE_GPU_HOLDING_VRAM], ids=["busy", "idle"])
-@pytest.mark.parametrize("redis_failing", [False, True], ids=["unrecorded", "redis-down"])
+@pytest.mark.parametrize(
+    "redis_failing, passed, backend_asked",
+    [(False, False, False), (True, True, True)],
+    ids=["unrecorded-is-provider-load", "redis-down-backend-decides"],
+)
 @pytest.mark.asyncio
-async def test_a_self_named_edit_parked_container_stays_provider_load(context_factory, gpu_details, redis_failing):
+async def test_an_edit_parked_name_is_ours_only_when_recorded_or_the_record_is_unreadable(
+    context_factory, gpu_details, redis_failing, passed, backend_asked
+):
     services = build_services(score_calculator=_Scores())
     services.redis.failing = redis_failing
     services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
@@ -611,8 +617,8 @@ async def test_a_self_named_edit_parked_container_stays_provider_load(context_fa
 
     result = await GpuUsageCheck().run(ctx)
 
-    assert result.passed is False
-    services.backend.get_pod_rental_active.assert_not_awaited()
+    assert result.passed is passed
+    assert services.backend.get_pod_rental_active.await_count == (1 if backend_asked else 0)
 
 
 @pytest.mark.asyncio

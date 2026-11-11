@@ -159,6 +159,7 @@ from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networkin
 from services.redis_service import (
     GPU_CLOCKS_PENDING_KIND,
     GPU_RESET_PENDING_KIND,
+    EDIT_PARKED_CONTAINER_AFTER_EDIT_SECONDS,
     EDIT_PARKED_CONTAINER_PREFIX,
     EDIT_PARKED_CONTAINER_TTL_SECONDS,
     FILLER_IMAGE_DIGESTS_PREFIX,
@@ -1913,7 +1914,9 @@ class _EditSwap:
                 if parked:
                     await self.redis.set(self.parked_record_key, "1", ex=EDIT_PARKED_CONTAINER_TTL_SECONDS)
                 else:
-                    await self.redis.delete(self.parked_record_key)
+                    # not deleted: a GPU check that read the parked container's processes before the edit ended
+                    # still asks about it afterwards
+                    await self.redis.expire(self.parked_record_key, EDIT_PARKED_CONTAINER_AFTER_EDIT_SECONDS)
             self.parked_recorded = parked
         except Exception as exc:  # noqa: BLE001
             logger.warning(
