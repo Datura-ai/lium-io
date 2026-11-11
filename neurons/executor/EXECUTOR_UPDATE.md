@@ -64,11 +64,13 @@ A later `docker compose up -d` without a service name recreates the runner from 
 
 If `git pull` stops because of local changes to tracked files, run `git stash && git pull && git stash pop`. Then run `docker compose pull watchtower && docker compose up -d watchtower`. If `git stash pop` reports a conflict, send the output to Lium support.
 
-If the host has no runner (`docker compose ps executor-runner` lists nothing), the updater cannot make one for this stack, and `docker compose up -d` would start whatever runner image the host has cached. Create it once from the digest the validator signed:
+If the host has no runner at all (`docker compose ps -a executor-runner` lists nothing), the updater cannot make one for this stack. Create it without starting it:
 
 ```bash
-d=$(curl -s https://lium.io/api/watchtower/digest | python3 -c 'import sys, json; print(json.load(sys.stdin)["digest"])') && docker pull "daturaai/compute-subnet-executor-runner@$d" && docker tag "daturaai/compute-subnet-executor-runner@$d" daturaai/compute-subnet-executor-runner:latest && docker compose up -d --no-recreate executor-runner
+docker compose create --no-recreate executor-runner
 ```
+
+At its next check (within 5 minutes) the updater finds that container, verifies the signed digest, pulls the current runner by it and starts that in its place; the created container never runs. If the runner then still shows `Created` and `docker logs executor-watchtower-1 --tail 5` says `Image is up to date`, the image on the host already is the signed one: `docker compose start executor-runner`.
 
 After about two minutes, make sure that both containers are up:
 
