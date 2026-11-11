@@ -868,7 +868,7 @@ def _docker_rm_command(targets: list[str]) -> str:
 class RentalDiskFit(NamedTuple):
     """What a customer rental needs free beside the filler caches (DAH-5260)."""
 
-    own_gb: float  # its volume (unless already on disk) plus its container storage
+    own_gb: float  # its volume (unless already on disk); the container storage is a quota, not disk
     existing_gb: float  # pod volumes already on disk less the sizing overhead (fresh sizing only)
     disk_share: float
     fresh_sizing: bool
@@ -6287,11 +6287,14 @@ class DockerService:
     async def _rental_disk_fit(
         self, ssh_client: asyncssh.SSHClientConnection, payload: ContainerCreateRequest
     ) -> RentalDiskFit:
-        """The free disk a customer rental needs to be sized as ordered (DAH-5260)."""
+        """The free disk a customer rental needs to be sized as ordered (DAH-5260).
+
+        DAH-6187: only the volume takes disk; the storage limit is a quota, so the order's storage
+        part never forces the Engy cache out (it did at every whole-node rent)."""
         # a re-create's volume is already preallocated, outside df free: counting it again never fits
-        own_gb: float = (0 if payload.local_volume else payload.volume_limit_gb) + (payload.storage_limit_gb or 0)
-        # a fresh-sized (disk_share) rental gets its share of free disk plus the pod volumes already on it,
-        # less the overhead resolve_volume_sizing reserves, so a half-node one needs twice its size there
+        own_gb: float = 0 if payload.local_volume else payload.volume_limit_gb
+        # a fresh-sized (disk_share) rental's volume gets its share of free disk plus the pod volumes already
+        # on it, less the overhead resolve_volume_sizing reserves, so a half-node one needs twice its size there
         fresh_sizing = self.measures_host_for_volume_sizing(payload)
         disk_share: float = payload.disk_share if fresh_sizing and payload.disk_share else 1
         existing_gb: float = (
@@ -6315,15 +6318,7 @@ class DockerService:
         """Clamp a rental's volume to the disk actually free after the cache eviction (DAH-5260)."""
         free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
         rental_gets_gb = (free_now_gb + fit.existing_gb) * fit.disk_share
-        payload.volume_limit_gb = max(
-            int(
-                # fresh sizing splits the slice between volume and storage in the order's proportion
-                rental_gets_gb * payload.volume_limit_gb / fit.own_gb
-                if fit.fresh_sizing
-                else rental_gets_gb - (payload.storage_limit_gb or 0)
-            ),
-            1,
-        )
+        payload.volume_limit_gb = max(int(rental_gets_gb), 1)
 
     async def select_affordable_cache_volumes(
         self,
@@ -8330,7 +8325,9 @@ class DockerService:
             - _FRESH_SIZING_OVERHEAD_GB * _FRESH_SIZING_GB_BYTES,
             0,
         )
-        slice_candidates = [("pool", payload.disk_share * pool_bytes)]
+        # DAH-6187: the pod's share of the pool bounds its volume, the only part that takes disk; the
+        # storage limit is a quota on the shared filesystem
+        slice_candidates = [("pool", payload.disk_share * pool_bytes * 1.5)]
         if payload.volume_limit_gb is not None:
             slice_candidates.append(
                 ("request_cap", payload.volume_limit_gb * _FRESH_SIZING_GB_BYTES * 1.5)
