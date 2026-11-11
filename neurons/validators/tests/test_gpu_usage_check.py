@@ -159,6 +159,7 @@ async def test_a_pod_named_container_lium_never_issued_is_left_to_the_provider(c
 TEARDOWN_POD_ID = "5703f4c9-c2f4-4fae-a652-3dee4753030a"
 TEARDOWN_POD = f"{POD_CONTAINER_PREFIX}{TEARDOWN_POD_ID}"
 BUSY_GPU = [{"gpu_utilization": 100, "memory_utilization": 61}]
+IDLE_GPU_HOLDING_VRAM = [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 9000}]
 
 
 class _Scores:
@@ -548,19 +549,45 @@ async def test_a_foreign_process_beside_a_renters_pod_never_gets_advice_to_stop_
     assert result.event.what_we_saw["process_count"] == 1
 
 
+@pytest.mark.parametrize("container_name", [TEARDOWN_POD, f"{TEARDOWN_POD}__prev"], ids=["pod", "edit-parked"])
+@pytest.mark.parametrize("gpu_details", [BUSY_GPU, IDLE_GPU_HOLDING_VRAM], ids=["busy", "idle"])
+@pytest.mark.parametrize(
+    "pod_rental, owned",
+    [
+        (PodRentalActiveResponse(active=True, executor_id=default_executor().uuid), True),
+        # a renter's delete in flight: DELETING, no close time yet
+        (
+            PodRentalActiveResponse(active=False, status="DELETING", executor_id=default_executor().uuid),
+            True,
+        ),
+        (_closed(minutes_ago=1), True),
+        (_closed(minutes_ago=30), False),  # past the teardown grace
+        (PodRentalActiveResponse(active=False), False),  # an id the backend does not know
+        (PodRentalActiveResponse(active=True, executor_id="another-executor"), False),
+        (
+            PodRentalActiveResponse(active=False, status="DELETING", executor_id="another-executor"),
+            False,
+        ),
+    ],
+    ids=["live", "deleting", "closed-in-grace", "closed-past-grace", "unknown", "another-node", "deleting-elsewhere"],
+)
 @pytest.mark.asyncio
-async def test_an_edit_parked_pod_container_is_judged_by_its_pod(context_factory):
-    ctx = _unrented_ctx(
-        context_factory,
-        pod_rental=_closed(minutes_ago=1),
-        gpu_processes=[_pod_process(f"{TEARDOWN_POD}__prev")],
+async def test_a_pod_container_on_an_unrented_node_is_judged_by_its_pod(
+    context_factory, container_name, gpu_details, pod_rental, owned
+):
+    services = build_services(score_calculator=_Scores())
+    services.backend.get_pod_rental_active.return_value = pod_rental
+    state = build_state(
+        gpu_details=gpu_details,
+        gpu_processes=[_pod_process(container_name)],
+        rented_data=RentedExecutorsResponse(executors={}),
     )
+    ctx = context_factory(services=services, config=build_context_config(), state=state, rented=False)
 
     result = await GpuUsageCheck().run(ctx)
 
-    assert result.passed is True
-    assert result.event.reason_code == Msg.USAGE_OK.reason
-    ctx.services.backend.get_pod_rental_active.assert_awaited_once_with(TEARDOWN_POD_ID)
+    assert result.passed is owned
+    services.backend.get_pod_rental_active.assert_awaited_once_with(TEARDOWN_POD_ID)
 
 
 @pytest.mark.asyncio

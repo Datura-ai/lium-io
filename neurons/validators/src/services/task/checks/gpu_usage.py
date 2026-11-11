@@ -73,6 +73,9 @@ class PodRentalState(str, Enum):
 
 
 _ORPHAN_STATES = frozenset({PodRentalState.ORPHAN, PodRentalState.LIVE_ON_ANOTHER_NODE})
+# The backend marks a pod DELETING before its container is removed and closes the rental after, so in between
+# rental-active answers active=False with no close time.
+DELETING_POD_STATUS = "DELETING"
 
 
 @dataclass(frozen=True)
@@ -543,7 +546,8 @@ async def _drop_containers_the_backend_still_owns(
         {
             process.container_name
             for process in foreign_processes
-            if _carries_a_lium_prefix(process) and process.container_name not in claimed_elsewhere
+            if _carries_a_lium_prefix(process)
+            and process.container_name.removesuffix(EDIT_PARKED_SUFFIX) not in claimed_elsewhere
         }
     )
     if not lium_named_containers:
@@ -568,7 +572,10 @@ async def the_backend_still_owns(ctx: Context, container_name: str) -> bool:
     """
     is_filler: bool = container_name.startswith(FILLER_CONTAINER_PREFIX)
     prefix: str = FILLER_CONTAINER_PREFIX if is_filler else POD_CONTAINER_PREFIX
-    backend_issued_id: str | None = _uuid_after_prefix(container_name, prefix)
+    # an edit parks the pod's old container as pod_<id>__prev before stopping it
+    backend_issued_id: str | None = _uuid_after_prefix(
+        container_name if is_filler else container_name.removesuffix(EDIT_PARKED_SUFFIX), prefix
+    )
     if backend_issued_id is None:
         return False
 
@@ -676,6 +683,8 @@ def _pod_container_rental_from(
         )
     if pod_rental is not None and pod_rental.active:
         return PodContainerRental(container_name, pod_id, PodRentalState.LIVE, "its rental is live")
+    if pod_rental is not None and pod_rental.status == DELETING_POD_STATUS and pod_rental.rental_closed_at is None:
+        return PodContainerRental(container_name, pod_id, PodRentalState.LIVE, "its pod is being deleted")
 
     closed_at: datetime | None = pod_rental.rental_closed_at if pod_rental else None
     if closed_at is not None:
