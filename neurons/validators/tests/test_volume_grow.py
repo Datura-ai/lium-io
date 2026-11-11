@@ -743,6 +743,16 @@ async def test_credit_volumes_on_host_sizes_each_engy_cache_now():
 
 
 @pytest.mark.asyncio
+async def test_credit_volumes_on_host_credits_only_names_the_scrape_counts():
+    # docker's name filter matches anywhere in the name; the scrape credits only names that start with the prefix
+    ssh = MagicMock()
+    stdout = "E 7 engy_cache_a\nE 9 backup_engy_cache_x\n"
+    ssh.run = AsyncMock(return_value=MagicMock(exit_status=0, stdout=stdout))
+
+    assert await credit_volumes_on_host(ssh) == {"engy_cache_a": 7}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stdout", ["E x engy_cache_a\n", "E 5\n", "? engy_cache_a\n"])
 async def test_credit_volumes_on_host_is_unread_on_a_malformed_line(stdout):
     ssh = MagicMock()

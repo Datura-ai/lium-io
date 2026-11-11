@@ -176,7 +176,9 @@ async def credit_volumes_on_host(
         if kind == "F" and rest:
             volumes[rest] = None
         elif kind == "E" and size.isdigit() and name:
-            volumes[name] = int(size)
+            # docker's name filter matches anywhere in the name; credit only what the scrape counts (its prefix)
+            if name.startswith("engy_cache_"):
+                volumes[name] = int(size)
         else:
             return None
     return volumes
