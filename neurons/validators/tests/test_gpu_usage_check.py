@@ -1042,46 +1042,37 @@ async def test_held_vram_with_no_visible_processes_fails(context_factory):
     assert result.event.what_we_saw["held_vram"][0].memory_used_mb == 22400
 
 
-@pytest.mark.parametrize(
-    "graphics_only_mb,expected_pass",
-    [
-        # A desktop's Xorg/compositor holds VRAM in graphics-only contexts the compute list never shows.
-        (600, True),
-        # A graphics context holding more than a desktop does is credited only up to the cap.
-        (20000, False),
-        # An older scrape without the reading judges the card as before.
-        (None, False),
-    ],
-)
 @pytest.mark.asyncio
-async def test_desktop_graphics_vram_is_not_held_vram(context_factory, graphics_only_mb, expected_pass):
+async def test_graphics_only_vram_is_never_credited(context_factory):
+    # A compute shader can run in a graphics context, which NVML lists only as graphics: VRAM held
+    # there has no owner we can verify, so it is judged like any other ownerless VRAM.
     state = _idle_state(
         [
             {
                 "uuid": HELD_UUID,
                 "gpu_utilization": 0,
                 "memory_utilization": 0,
-                "memory_used_mb": 2529 if graphics_only_mb != 20000 else 22400,
-                "graphics_only_memory_mb": graphics_only_mb,
+                "memory_used_mb": 2529,
+                "graphics_only_memory_mb": 600,
             }
         ],
         [],
     )
-    live_mb = 2529 if graphics_only_mb != 20000 else 22400
-    runner = _mock_runner(requery_gpu_csv=f"{HELD_UUID}, 0, {live_mb}\n")
+    runner = _mock_runner(requery_gpu_csv=f"{HELD_UUID}, 0, 2529\n")
     ctx = context_factory(
         services=build_services(), config=build_context_config(), state=state, runner=runner
     )
 
     result = await GpuUsageCheck().run(ctx)
 
-    assert result.passed is expected_pass
+    assert result.passed is False
+    assert result.event.reason_code == Msg.VRAM_HELD.reason
 
 
 @pytest.mark.asyncio
 async def test_a_compute_process_named_like_a_desktop_still_flags(context_factory):
-    # The exclusion follows the context type the driver reports, never a name: a compute process
-    # running as Xorg under the display manager is still listed, and still foreign.
+    # No name buys an exclusion: a compute process running as Xorg under the display manager is
+    # still listed, and still foreign.
     state = _idle_state(
         [
             {
@@ -1089,7 +1080,6 @@ async def test_a_compute_process_named_like_a_desktop_still_flags(context_factor
                 "gpu_utilization": 0,
                 "memory_utilization": 0,
                 "memory_used_mb": 22400,
-                "graphics_only_memory_mb": 600,
             }
         ],
         [{"pid": 1717, "info": "0::/../../system.slice/display-manager.service", "container_name": None, "name": "Xorg"}],

@@ -16,7 +16,6 @@ from services.const import (
     BROKEN_POD_CONTAINER_GRACE_MINUTES,
     EDIT_PARKED_SUFFIX,
     FILLER_CONTAINER_PREFIX,
-    GPU_DESKTOP_GRAPHICS_VRAM_MB_LIMIT,
     GPU_HELD_VRAM_MB_LIMIT,
     GPU_MEMORY_UTILIZATION_LIMIT,
     GPU_UTILIZATION_LIMIT,
@@ -56,7 +55,6 @@ class ForeignGpuProcess:
 class HeldVram:
     gpu_uuid: str | None
     memory_used_mb: float
-    desktop_graphics_mb: float = 0
 
 
 @dataclass(frozen=True)
@@ -211,7 +209,7 @@ class GpuUsageCheck:
             if not live_memory_mb:
                 return False
             return any(
-                live_memory_mb.get(held.gpu_uuid or "", 0) - held.desktop_graphics_mb > GPU_HELD_VRAM_MB_LIMIT
+                live_memory_mb.get(held.gpu_uuid or "", 0) > GPU_HELD_VRAM_MB_LIMIT
                 for held in held_vram
             )
         except Exception as exc:  # noqa: BLE001
@@ -795,16 +793,11 @@ def _held_vram_without_owner(
     """
     if gpu_processes or workload_containers:
         return []
-    held_vram: list[HeldVram] = []
-    for detail in gpu_details:
-        memory_used_mb: float = detail.get("memory_used_mb") or 0
-        # The scrape lists compute contexts only, so a desktop's graphics-only VRAM reads as ownerless.
-        desktop_graphics_mb: float = min(
-            detail.get("graphics_only_memory_mb") or 0, GPU_DESKTOP_GRAPHICS_VRAM_MB_LIMIT
-        )
-        if memory_used_mb - desktop_graphics_mb > GPU_HELD_VRAM_MB_LIMIT:
-            held_vram.append(HeldVram(detail.get("uuid"), memory_used_mb, desktop_graphics_mb))
-    return held_vram
+    return [
+        HeldVram(gpu_uuid=detail.get("uuid"), memory_used_mb=detail.get("memory_used_mb") or 0)
+        for detail in gpu_details
+        if (detail.get("memory_used_mb") or 0) > GPU_HELD_VRAM_MB_LIMIT
+    ]
 
 
 def _find_violation(gpu_details: list[dict], gpu_processes: list[dict]) -> dict | None:

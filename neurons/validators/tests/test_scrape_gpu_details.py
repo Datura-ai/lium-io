@@ -63,15 +63,3 @@ def test_a_hung_card_is_skipped_and_the_rest_are_read():
     assert [row["gpu.uuid"] for row in details] == ["GPU-0", "GPU-2", "GPU-3"]
     assert error == "NVMLError(999)"
     assert pids == {100, 102, 103}
-
-
-def test_graphics_only_memory_leaves_out_a_process_that_also_computes():
-    # 1 is a desktop compositor (graphics only); 2 is C+G and so a compute owner, whatever it is called.
-    proc = lambda pid, mb: SimpleNamespace(c_nvmlProcessInfo_v2_t_pid=pid, c_nvmlProcessInfo_v2_t_usedGpuMemory=mb * 1024**2)  # noqa: E731
-    stubs = {
-        "nvmlDeviceGetComputeRunningProcesses_v2": lambda handle: [proc(2, 9000)],
-        "nvmlDeviceGetGraphicsRunningProcesses_v2": lambda handle: [proc(1, 300), proc(2, 9000)],
-    }
-    scrape = build_scrape_namespace(SCRAPE, {"graphicsOnlyMemoryMb"}, stubs)
-
-    assert scrape["graphicsOnlyMemoryMb"](0) == 300
