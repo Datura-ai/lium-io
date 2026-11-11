@@ -762,6 +762,23 @@ async def test_the_parked_name_is_recorded_while_parked_and_kept_briefly_after_t
 
 
 @pytest.mark.asyncio
+async def test_an_edit_whose_parked_record_cannot_be_written_leaves_the_pod_as_it_was():
+    from services.docker_service import _EditSwap
+
+    redis = AsyncMock()
+    redis.set = AsyncMock(side_effect=ConnectionError("redis down"))
+    ssh = _ssh_recording()
+    swap = _EditSwap(ssh, "pod_abc", {}, redis=redis, executor_id="ex-1")
+
+    with pytest.raises(Exception, match="could not be recorded"):
+        await swap.park()
+
+    assert _docker(ssh.commands, "rename") == []
+    assert _docker(ssh.commands, "stop") == []
+    assert swap.parked_name is None
+
+
+@pytest.mark.asyncio
 async def test_the_undo_removes_the_replacement_by_its_id_so_a_sibling_retry_under_the_pod_name_survives():
     from services.docker_service import _EditSwap
 

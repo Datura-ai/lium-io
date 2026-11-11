@@ -84,6 +84,7 @@ from services.const import (
     PARKED_SUFFIXES,
     RECOVERY_STOPPED_SUFFIX,
     unparked_name,
+    KEPT_UNMOUNTED_PREFIX,
     LIUM_POD_ID_LABEL,
     LEGACY_LOOPBACK_PLUGIN_ALIAS,
     LOOPBACK_PLUGIN_ALIAS,
@@ -1762,10 +1763,6 @@ _PARK_COMMAND_TIMEOUT_SECONDS = 60
 _EDIT_PARKED_RECORD_TIMEOUT_SECONDS = 2
 # the undo's bring-up (start, gocryptfs remount, sshd bootstrap) is several SDK and SSH steps, not one command
 _RESTORE_BRING_UP_TIMEOUT_SECONDS = 300
-# A parked container with renter files in its own layer under the encrypted volume's plaintext path (written
-# while dockerd ran it without the gocryptfs mount; a later remount only hides them) is kept under this prefix
-# after a successful edit, instead of removed: no sweep removes a name outside pod_/filler_.
-KEPT_UNMOUNTED_PREFIX = "kept_unmounted_"
 
 
 class KeptContainersNotRemoved(RuntimeError):
@@ -2071,6 +2068,9 @@ class _EditSwap:
             if self.redis is not None and self.executor_id:
                 self.parked_record_key = f"{EDIT_PARKED_CONTAINER_PREFIX}{self.executor_id}:{parked}"
             await self._record_parked(True)
+            if self.parked_record_key is not None and not self.parked_recorded:
+                # unrecorded, the GPU check would judge the renter's own load as the provider's while it is parked
+                raise Exception("[park_current_container] the parked container could not be recorded; the pod was left as it was")
             await self._rename_aside(container_id, parked)
         self.parked_name = parked
         self.parked_id = container_id
@@ -2959,6 +2959,13 @@ async def _drop_unmarked_recovery_stop(pod_id: str) -> None:
 async def _unmarked_recovery_stop_known(pod_id: str) -> bool:
     await _load_unmarked_recovery_stops()
     return pod_id in _UNMARKED_RECOVERY_STOPS
+
+
+async def recovery_parked(pod_id: str) -> bool | None:
+    """Whether this validator parked the pod as <name>__stopped; None while its record cannot be read."""
+    if await _unmarked_recovery_stop_known(pod_id):
+        return True
+    return False if _UNMARKED_RECOVERY_STOPS_LOADED else None
 
 
 def _retry_recovery_mark_in_background(

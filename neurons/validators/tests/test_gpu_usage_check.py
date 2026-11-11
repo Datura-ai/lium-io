@@ -593,25 +593,38 @@ async def test_a_pod_container_on_an_unrented_node_is_judged_by_its_pod(
     services.backend.get_pod_rental_active.assert_awaited_once_with(TEARDOWN_POD_ID)
 
 
-@pytest.mark.parametrize("suffix", ["__prev", "__stopped"])
+KEPT_POD = f"kept_unmounted_{TEARDOWN_POD_ID}_1731312000"
+
+
+@pytest.mark.parametrize(
+    "container_name",
+    [f"{TEARDOWN_POD}__prev", f"{TEARDOWN_POD}__stopped", KEPT_POD],
+    ids=["edit-parked", "recovery-stopped", "edit-kept"],
+)
 @pytest.mark.parametrize("gpu_details", [BUSY_GPU, IDLE_GPU_HOLDING_VRAM], ids=["busy", "idle"])
 @pytest.mark.parametrize(
-    "redis_failing, passed, backend_asked",
-    [(False, False, False), (True, True, True)],
-    ids=["unrecorded-is-provider-load", "redis-down-backend-decides"],
+    "record, passed, backend_asked",
+    [(False, False, False), (None, True, True), (True, True, True)],
+    ids=["unrecorded-is-provider-load", "record-unreadable-backend-decides", "recorded-backend-decides"],
 )
 @pytest.mark.asyncio
-async def test_an_edit_parked_name_is_ours_only_when_recorded_or_the_record_is_unreadable(
-    context_factory, suffix, gpu_details, redis_failing, passed, backend_asked
+async def test_a_parked_name_is_ours_only_when_this_validator_recorded_parking_it(
+    context_factory, monkeypatch, container_name, gpu_details, record, passed, backend_asked
 ):
     services = build_services(score_calculator=_Scores())
-    services.redis.failing = redis_failing
+    if container_name.endswith("__stopped"):
+        # a recovery's park is recorded by the recovery, not by an edit
+        monkeypatch.setattr(gpu_usage, "_recovery_parked", AsyncMock(return_value=record))
+    elif record is None:
+        services.redis.failing = True
+    elif record:
+        services.redis.store[f"{EDIT_PARKED_CONTAINER_PREFIX}{default_executor().uuid}:{container_name}"] = "1"
     services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
         active=True, executor_id=default_executor().uuid
     )
     state = build_state(
         gpu_details=gpu_details,
-        gpu_processes=[_pod_process(f"{TEARDOWN_POD}{suffix}")],
+        gpu_processes=[_pod_process(container_name)],
         rented_data=RentedExecutorsResponse(executors={}),
     )
     ctx = context_factory(services=services, config=build_context_config(), state=state, rented=False)
@@ -620,6 +633,8 @@ async def test_an_edit_parked_name_is_ours_only_when_recorded_or_the_record_is_u
 
     assert result.passed is passed
     assert services.backend.get_pod_rental_active.await_count == (1 if backend_asked else 0)
+    if backend_asked:
+        services.backend.get_pod_rental_active.assert_awaited_with(TEARDOWN_POD_ID)
 
 
 @pytest.mark.asyncio

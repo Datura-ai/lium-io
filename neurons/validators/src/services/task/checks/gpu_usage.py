@@ -20,7 +20,9 @@ from services.const import (
     GPU_MEMORY_UTILIZATION_LIMIT,
     GPU_UTILIZATION_LIMIT,
     GPU_WEDGE_MEMORY_MAX,
+    KEPT_UNMOUNTED_PREFIX,
     POD_CONTAINER_PREFIX,
+    RECOVERY_STOPPED_SUFFIX,
     RENTAL_CLOSE_CLOCK_SKEW_MINUTES,
     RENTAL_TEARDOWN_GRACE_MINUTES,
 )
@@ -275,7 +277,7 @@ class GpuUsageCheck:
             {
                 name
                 for process in gpu_processes
-                if (name := process.get("container_name")) and name.startswith(POD_CONTAINER_PREFIX)
+                if (name := process.get("container_name")) and _pod_name(name).startswith(POD_CONTAINER_PREFIX)
             }
         )
         if pod_containers and not ctx.rented:
@@ -529,7 +531,14 @@ async def _fillers_off_their_image(ctx: Context, names: set[str]) -> list[str]:
 def carries_a_rental_prefix(container_name: str) -> bool:
     """Named like a rental of ours. Says nothing about who really started it: `docker rename`
     forges the name, which is why every caller confirms it against the backend."""
-    return container_name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX))
+    return container_name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX, KEPT_UNMOUNTED_PREFIX))
+
+
+def _pod_name(container_name: str) -> str:
+    """The pod's own container name behind a parked one (pod_<id>__prev, __stopped, kept_unmounted_<id>_<time>)."""
+    if container_name.startswith(KEPT_UNMOUNTED_PREFIX):
+        return POD_CONTAINER_PREFIX + container_name.removeprefix(KEPT_UNMOUNTED_PREFIX).rpartition("_")[0]
+    return unparked_name(container_name)
 
 
 def _carries_a_lium_prefix(process: ForeignGpuProcess) -> bool:
@@ -558,7 +567,7 @@ async def _drop_containers_the_backend_still_owns(
             process.container_name
             for process in foreign_processes
             if _carries_a_lium_prefix(process)
-            and unparked_name(process.container_name) not in claimed_elsewhere
+            and _pod_name(process.container_name) not in claimed_elsewhere
         }
     )
     if not lium_named_containers:
@@ -585,11 +594,11 @@ async def the_backend_still_owns(ctx: Context, container_name: str) -> bool:
     prefix: str = FILLER_CONTAINER_PREFIX if is_filler else POD_CONTAINER_PREFIX
     # a parked pod container (pod_<id>__prev, __stopped) is ours only under a name this validator
     # recorded parking: anyone can start a container under that name
-    if not is_filler and unparked_name(container_name) != container_name:
+    if not is_filler and _pod_name(container_name) != container_name:
         if await _parked_by_this_validator(ctx, container_name) is False:
             return False
     backend_issued_id: str | None = _uuid_after_prefix(
-        container_name if is_filler else unparked_name(container_name), prefix
+        container_name if is_filler else _pod_name(container_name), prefix
     )
     if backend_issued_id is None:
         return False
@@ -622,7 +631,10 @@ async def the_backend_still_owns(ctx: Context, container_name: str) -> bool:
 
 
 async def _parked_by_this_validator(ctx: Context, container_name: str) -> bool | None:
-    """None when Redis does not answer: unknown, so the backend's verdict on the pod decides, as for any pod name."""
+    """None when the record does not answer: unknown, so the backend's verdict on the pod decides, as for any pod name."""
+    if container_name.endswith(RECOVERY_STOPPED_SUFFIX):
+        # a recovery parks under this name only when its Redis mark failed: its record is the recovery's own
+        return await _recovery_parked(_pod_name(container_name).removeprefix(POD_CONTAINER_PREFIX))
     try:
         return bool(
             await asyncio.wait_for(
@@ -633,6 +645,12 @@ async def _parked_by_this_validator(ctx: Context, container_name: str) -> bool |
     except Exception as exc:  # noqa: BLE001
         logger.warning("Edit-parked container record unreadable for %s: %s", container_name, exc)
         return None
+
+
+async def _recovery_parked(pod_id: str) -> bool | None:
+    from services.docker_service import recovery_parked  # docker_service imports this package
+
+    return await recovery_parked(pod_id)
 
 
 def _a_broken_pod_the_reaper_has_not_collected_yet(pod_rental: PodRentalActiveResponse) -> bool:
@@ -714,13 +732,13 @@ async def _pod_container_rental(ctx: Context, container_name: str) -> PodContain
     container called pod_<any uuid> must not buy a pass.
     """
     pod_id: str | None = _uuid_after_prefix(
-        unparked_name(container_name), POD_CONTAINER_PREFIX
+        _pod_name(container_name), POD_CONTAINER_PREFIX
     )
     if pod_id is None:
         return PodContainerRental(
             container_name, None, PodRentalState.ORPHAN, "its name carries no pod id Lium issued"
         )
-    if unparked_name(container_name) != container_name and await _parked_by_this_validator(ctx, container_name) is False:
+    if _pod_name(container_name) != container_name and await _parked_by_this_validator(ctx, container_name) is False:
         return PodContainerRental(container_name, pod_id, PodRentalState.ORPHAN, "no edit of this pod parked it")
 
     pod_rental: PodRentalActiveResponse | None = await ctx.services.backend.get_pod_rental_active(pod_id)
