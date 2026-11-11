@@ -243,8 +243,12 @@ class StaleContainerCleanupCheck:
         )
         measured = free_before - free_after if free_after is not None else grown.allocated_bytes
         taken = measured + grown.unreported_bytes
-        # free_after also caps it: what the renters wrote since the scrape is in that read, not in the delta
-        specs_after_grow = specs_after_disk_taken(ctx, taken, free_after) if grown.attempted else None
+        # free_after also caps it: what the renters wrote since the scrape is in that read, not in the delta.
+        # No read after a grow: the scrape can't bound what was written since, so publish no free disk this cycle
+        # (the next scrape restores it) rather than a figure that may sit above the floor when the disk does not
+        specs_after_grow = (
+            specs_after_disk_taken(ctx, taken, free_after if free_after is not None else 0) if grown.attempted else None
+        )
 
         event = render_message(
             Msg.CLEANED if rented_list_unknown is None else Msg.RENTED_LIST_UNKNOWN,

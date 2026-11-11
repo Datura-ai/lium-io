@@ -529,10 +529,10 @@ def test_a_read_after_the_pass_caps_what_the_listing_judges(context_factory):
         ((70, 40), 60, 0, 40),
         # the grow's report was lost after it allocated, the read after it saw the disk go
         ((70, 10), 0, 0, 10),
-        # no measurement: what the grows reported
-        ((None, None), 60, 0, 10),
-        # no measurement and the report lost: its order counts as taken, never the pre-grow capacity
-        ((None, None), 0, 60, 10),
+        # no read after the grow: what was written since the scrape is unknown, so no free disk is published
+        ((None, None), 60, 0, 0),
+        ((None, None), 0, 60, 0),
+        ((70, None), 60, 0, 0),
         # measured, but a grow with no report may still be allocating after the read: its order counts too
         ((70, 50), 0, 40, 10),
     ],
