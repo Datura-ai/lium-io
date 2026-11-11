@@ -747,6 +747,7 @@ class _PendingRedis(FakeRedis):
     get_pending_pods = RedisService.get_pending_pods
     add_pending_pod = RedisService.add_pending_pod
     remove_pending_pod = RedisService.remove_pending_pod
+    _remove_unacked_container_created_unless = RedisService._remove_unacked_container_created_unless
     renting_in_progress = RedisService.renting_in_progress
 
 

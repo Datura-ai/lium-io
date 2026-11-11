@@ -83,6 +83,7 @@ def client(monkeypatch):
     client.miner_service = MagicMock(redis_service=service)
     client._write_backend_create_record = AsyncMock(return_value=True)
     client.deleted_pod_ids = set()
+    client.unrecorded_create_acceptances = {}
     client.resume_by_pod_id = {}
     client.get_miner_axon_info = AsyncMock(return_value=MagicMock(ip="127.0.0.1", port=8000))
     client.miner_service.handle_container = AsyncMock(
@@ -160,9 +161,8 @@ async def test_same_pod_with_independent_commands(client, ids):
         await client.miner_driver(request(command_id))
     assert client.miner_service.handle_container.await_count == 2
     if not ids[0]:
-        # no command id, no dedup state; only the renter's create mark (test_rented_mid_cycle_check)
-        dedup = [c for c in client.miner_service.redis_service.mock_calls if "rent_requested" not in c[0]]
-        assert dedup == []
+        # no command id, no dedup claim (the created-report keep is DAH-5380's, not dedup's)
+        assert not [c for c in client.miner_service.redis_service.mock_calls if "backend_command" in c[0]]
 
 
 @pytest.mark.asyncio

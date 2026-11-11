@@ -490,6 +490,8 @@ class Settings(BaseSettings):
     # Ships off. Turned on only by the Lium product owner, once the native verifier accepts a 48 GB 4090, the provider
     # preflight classifies it too, and the all-card probe is sized from the classified model.
     RTX_4090_48GB_MODEL_ENABLED: bool = Field(env="RTX_4090_48GB_MODEL_ENABLED", default=False)
+    # DockerCpuCheck: when disabled, a node whose Docker daemon sees fewer CPUs than the machine is logged only.
+    DOCKER_CPU_MISMATCH_ENFORCEMENT_ENABLED: bool = Field(env="DOCKER_CPU_MISMATCH_ENFORCEMENT_ENABLED", default=False)
     PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED: bool = Field(
         env="PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED", default=False
     )
@@ -648,6 +650,10 @@ class Settings(BaseSettings):
     # validation and every OUTDATED executor earns 0. Off until nodes auto-update again
     # (DAH-3419): with Watchtower stalled, 99 executors earned 0 for it in one hour on 11 Sep.
     EXECUTOR_IMAGE_CHECK_ENFORCE: bool = Field(env="EXECUTOR_IMAGE_CHECK_ENFORCE", default=False)
+    # DAH-5936: an executor digest absent from EXECUTOR_IMAGE_REF's repository is logged as an unofficial build
+    # every cycle (EXECUTOR_BUILD lines). Off (default): no consequence, the node is judged as OUTDATED is.
+    # On: UNOFFICIAL fails an idle node, and a rented one keeps its rental at score 0, out of both incentive pools.
+    EXECUTOR_IMAGE_UNOFFICIAL_ENFORCE: bool = Field(env="EXECUTOR_IMAGE_UNOFFICIAL_ENFORCE", default=False)
     # DAH-3405: for this many validation cycles, counting the one in which the registry digest of
     # EXECUTOR_IMAGE_REF was seen to change, an executor that fails the way a watchtower restart
     # makes it fail (SSH gone, scrape failed, ports missing, image not yet the new one) gets no
@@ -752,13 +758,6 @@ class Settings(BaseSettings):
     # Issued nonce validity window; a quote echoing an older nonce is stale.
     ATTESTATION_NONCE_TTL_SECONDS: int = Field(env="ATTESTATION_NONCE_TTL_SECONDS", default=600)
 
-    # G1 — NVIDIA GPU confidential-compute attestation (validator-side verification).
-    # Off = observe-only: nvidia_payload, when present, is verified and logged but
-    # never affects the outcome. On = a CVM executor (verified TDX quote) must supply
-    # GPU evidence bound to the issued nonce; any failure raises AttestationError.
-    ENABLE_GPU_ATTESTATION_ENFORCEMENT: bool = Field(
-        env="ENABLE_GPU_ATTESTATION_ENFORCEMENT", default=False
-    )
     # DAH-4551 - GpuAttestationIdentityCheck: each Hopper/Blackwell GPU's NVIDIA-signed identity, pinned to its
     # UUID both ways. Shadow by default: a mismatch or forged evidence is logged as a warning event and the node
     # passes. On = it fails the node (not fatal with a live rental). Unavailable evidence alone never fails it.
