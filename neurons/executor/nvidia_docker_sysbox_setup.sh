@@ -575,11 +575,11 @@ ufw_blocks_port() {
 }
 
 check_ports() {
-    local ports p listener container label assumed has_fix=0
+    local ports p listener container label is_default_port has_fix=0
     read -r -a ports <<< "$(resolve_preflight_ports)"
     command -v ss &>/dev/null || { pf_skip "Ports — 'ss' (iproute2) is missing, cannot tell what listens."; return 0; }
     for p in "${ports[0]}:executor:${ports[2]}" "${ports[1]}:SSH:${ports[3]}"; do
-        assumed=${p##*:} p=${p%:*}
+        is_default_port=${p##*:} p=${p%:*}
         label=${p#*:} p=${p%%:*}
         listener=$(port_listener "$p")
         container=""
@@ -587,7 +587,7 @@ check_ports() {
             container=$(port_container "$p")
             case "$container" in
                 executor-*|executor_*) ;;   # the executor itself, from an earlier install
-                *) if [ "$assumed" = 1 ]; then
+                *) if [ "$is_default_port" = 1 ]; then
                        pf_skip "TCP $p (default $label port, assumed: no .env found) is published by container ${container:-unknown}. If your executor uses another port, re-run with EXECUTOR_PORT=<port> SSH_PORT=<port> to check that one instead."
                        continue
                    fi
@@ -596,7 +596,7 @@ check_ports() {
                    has_fix=1
                    continue ;;
             esac
-        elif [ -n "$listener" ] && [ "$assumed" = 1 ]; then
+        elif [ -n "$listener" ] && [ "$is_default_port" = 1 ]; then
             pf_skip "TCP $p (default $label port, assumed: no .env found) is in use by $listener. If your executor uses another port, re-run with EXECUTOR_PORT=<port> SSH_PORT=<port> to check that one instead."
             continue
         elif [ -n "$listener" ]; then
