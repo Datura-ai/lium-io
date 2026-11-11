@@ -298,6 +298,68 @@ async def test_batch_reprobe_gives_up_after_its_budget(mocker):
 
 
 @pytest.mark.asyncio
+async def test_batch_reprobes_late_host_listeners_when_only_the_published_sample_answered(mocker):
+    # DAH-5699: the 3 sampled ports answered on the published container, which met the floor and skipped the
+    # re-probe, then the attempt failed because no host listener had answered yet
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(10)]
+    external = mocker.Mock()
+    external.reached = mocker.AsyncMock(return_value=ports[:3])
+    mocker.patch("services.executor_connectivity.port_verifiers.random.sample", lambda ps, k: ps[:k])
+    calls = []
+
+    def late_listeners(_s, _h, probed, *_a):
+        calls.append(list(probed))
+        return ([], probed) if len(calls) == 1 else (probed, [])
+
+    verifier, _ = _batch_verifier(mocker, late_listeners, external)
+
+    result = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert verifier.runner.run.await_count == 2  # one attempt: its published and host-listener containers
+    assert calls == [ports[3:], ports[3:]]
+    assert sorted(result.successful, key=lambda p: p.internal) == ports
+
+
+@pytest.mark.asyncio
+async def test_batch_caps_the_reprobe_when_only_the_published_sample_answers(mocker):
+    # a host that drops its host ports (ufw default deny) never answers the host listener: it gets a short
+    # re-probe, not the full below-floor budget, before the semi-batch tier
+    from services.executor_connectivity.port_verifiers import BatchVerifier
+
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(10)]
+    external = mocker.Mock()
+    external.reached = mocker.AsyncMock(return_value=ports[:3])
+    mocker.patch("services.executor_connectivity.port_verifiers.random.sample", lambda ps, k: ps[:k])
+    verifier, port_tester = _batch_verifier(mocker, lambda _s, _h, probed, *_a: ([], probed), external)
+
+    result = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert port_tester.test_many.await_count == 2 * (1 + BatchVerifier.SAMPLE_ONLY_REPROBE_ROUNDS)
+    assert result.successful == []
+
+
+@pytest.mark.asyncio
+async def test_batch_runs_attempt_2_when_the_deadline_fires_below_min_ports(mocker):
+    # DAH-5699: ports that answered before the deadline are kept only when they meet min_ports;
+    # one of the 3 needed would fail the port check, so attempt 2 and the slower tiers still run
+    from services.executor_connectivity.port_verifiers import BatchVerifier
+
+    ports = [PortPair(9000 + i, 9000 + i) for i in range(10)]
+
+    async def one_then_past_the_deadline(_s, _h, probed, *_a):
+        if port_tester.test_many.await_count > 1:
+            await asyncio.sleep(5)
+        return probed[:1], probed[1:]
+
+    verifier, port_tester = _batch_verifier(mocker, one_then_past_the_deadline)
+    mocker.patch.object(BatchVerifier, "ATTEMPT_TIMEOUT_SEC", 0.2)
+
+    await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4", min_ports=3)
+
+    assert verifier.runner.run.await_count == 2  # attempt 2 started its own container
+
+
+@pytest.mark.asyncio
 async def test_batch_reprobes_past_the_floor_up_to_the_ports_a_split_node_needs(mocker):
     ports = [PortPair(9000 + i, 9000 + i) for i in range(24)]
     calls = []

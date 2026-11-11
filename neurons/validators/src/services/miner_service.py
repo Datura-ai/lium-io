@@ -73,9 +73,10 @@ from services.docker_service import DockerService, create_steps_after_reply, cus
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.node_host import for_payload_miner, public_host_sock
 from services.redis_service import MACHINE_SPEC_CHANNEL, POD_STATES_CHANNEL, RedisService
-from services.roce_link_probe import measure_and_attach
+from services.roce_link_probe import CYCLE_JOB_WAIT_SECONDS, PROBE_TAIL_MARGIN_SECONDS, measure_and_attach
 from services.ssh_service import SSHService
 from services.task.checks.duplicate_executor import _gpu_uuids
+from services.task.checks.rental_probe import wait_for_teardowns_after_verdict
 from services.task.availability import (
     availability_errors,
     build_executor_unreachable_by_miner_event,
@@ -2222,6 +2223,12 @@ class MinerService:
 
                 # Remove SSH key only if it was successfully accepted
                 if ssh_key_accepted:
+                    # a passed rental probe tears its container down after the verdict, over this key
+                    await wait_for_teardowns_after_verdict(
+                        payload.miner_hotkey,
+                        settings.JOB_TIME_OUT - CYCLE_JOB_WAIT_SECONDS - PROBE_TAIL_MARGIN_SECONDS
+                        - (time.monotonic() - job_started_at),
+                    )
                     await self._remove_ssh_key_via_rest(
                         base_url=base_url,
                         my_key=my_key,
