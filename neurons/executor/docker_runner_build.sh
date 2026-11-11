@@ -168,12 +168,14 @@ if [[ -n "${PLATFORMS:-}" ]]; then
     --provenance=false \
     --file "${SCRIPT_DIR}/Dockerfile.runner" \
     --build-arg "targetFile=$(basename "$TEMP_COMPOSE_FILE")" \
+    --build-arg "updaterStaging=$([[ "$TAG" == dev ]] && echo 1 || true)" \
     --output "type=oci,dest=${RUNNER_OCI_ARCHIVE:-/tmp/executor-runner.oci.tar}" \
     "${SCRIPT_DIR}"
 else
   docker build \
     --file "${SCRIPT_DIR}/Dockerfile.runner" \
     --build-arg "targetFile=$(basename "$TEMP_COMPOSE_FILE")" \
+    --build-arg "updaterStaging=$([[ "$TAG" == dev ]] && echo 1 || true)" \
     --tag "${IMAGE_NAME}" \
     "${SCRIPT_DIR}"
 fi

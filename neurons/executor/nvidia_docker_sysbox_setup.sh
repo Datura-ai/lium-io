@@ -11,7 +11,8 @@ set -e
 # with a doc link when that fails.
 # Env:
 #   SYSBOX_SKIP_KERNEL_CHECK=1  install even when the ID-mapped mounts check rejects the host
-#   EXECUTOR_PORT / SSH_PORT    the ports the preflight checks (else neurons/executor/.env next to this script, else 8080 / 2200)
+#   EXECUTOR_PORT / SSH_PORT    the ports the preflight checks (else neurons/executor/.env next to this script or under
+#                               the current directory, else 8080 / 2200, assumed: a busy assumed port is a note, not a FIX)
 #   SYSBOX_SETUP_HOST_ROOT      test-only: prefix for the host files the preflight reads (/proc/modules, /etc/os-release, ...)
 
 # 0.7.1 (DAH-3833): 0.6.6 cannot start an image with 44+ layers under Docker 29's containerd image store,
@@ -530,16 +531,20 @@ check_free_disk_for_node() {
 }
 
 resolve_preflight_ports() {
-    # EXECUTOR_PORT / SSH_PORT from the environment, else the executor .env next to this script, else the defaults
-    local env_file=""
-    [ -f "$0" ] && env_file="$(dirname "$0")/.env"   # piped from curl there is no file next to the script
-    if [ -z "${EXECUTOR_PORT:-}" ] && [ -n "$env_file" ] && [ -r "$env_file" ]; then
+    # "<executor> <ssh> <executor assumed 0/1> <ssh assumed 0/1>": the environment, else the executor .env next to
+    # this script, else one under the current directory (piped from curl there is no file next to the script),
+    # else the defaults, marked assumed because the provider may run the executor on another port
+    local env_file="" candidate
+    for candidate in "$([ -f "$0" ] && dirname "$0")/.env" "$PWD/neurons/executor/.env" "$PWD/.env"; do
+        [ "$candidate" != "/.env" ] && grep -qs '^EXTERNAL_PORT=' "$candidate" && { env_file=$candidate; break; }
+    done
+    if [ -z "${EXECUTOR_PORT:-}" ] && [ -n "$env_file" ]; then
         EXECUTOR_PORT=$(sed -n 's/^EXTERNAL_PORT=\([0-9]*\).*/\1/p' "$env_file" | head -1)
     fi
-    if [ -z "${SSH_PORT:-}" ] && [ -n "$env_file" ] && [ -r "$env_file" ]; then
+    if [ -z "${SSH_PORT:-}" ] && [ -n "$env_file" ]; then
         SSH_PORT=$(sed -n 's/^SSH_PORT=\([0-9]*\).*/\1/p' "$env_file" | head -1)
     fi
-    echo "${EXECUTOR_PORT:-8080} ${SSH_PORT:-2200}"
+    echo "${EXECUTOR_PORT:-8080} ${SSH_PORT:-2200} $([ -n "${EXECUTOR_PORT:-}" ] && echo 0 || echo 1) $([ -n "${SSH_PORT:-}" ] && echo 0 || echo 1)"
 }
 
 port_listener() {
@@ -570,10 +575,11 @@ ufw_blocks_port() {
 }
 
 check_ports() {
-    local ports p listener container label has_fix=0
+    local ports p listener container label is_default_port has_fix=0
     read -r -a ports <<< "$(resolve_preflight_ports)"
     command -v ss &>/dev/null || { pf_skip "Ports — 'ss' (iproute2) is missing, cannot tell what listens."; return 0; }
-    for p in "${ports[0]}:executor" "${ports[1]}:SSH"; do
+    for p in "${ports[0]}:executor:${ports[2]}" "${ports[1]}:SSH:${ports[3]}"; do
+        is_default_port=${p##*:} p=${p%:*}
         label=${p#*:} p=${p%%:*}
         listener=$(port_listener "$p")
         container=""
@@ -581,11 +587,18 @@ check_ports() {
             container=$(port_container "$p")
             case "$container" in
                 executor-*|executor_*) ;;   # the executor itself, from an earlier install
-                *) pf_fix "TCP $p ($label port) is published by container ${container:-unknown} — the executor cannot bind it." \
+                *) if [ "$is_default_port" = 1 ]; then
+                       pf_skip "TCP $p (default $label port, assumed: no .env found) is published by container ${container:-unknown}. If your executor uses another port, re-run with EXECUTOR_PORT=<port> SSH_PORT=<port> to check that one instead."
+                       continue
+                   fi
+                   pf_fix "TCP $p ($label port) is published by container ${container:-unknown} — the executor cannot bind it." \
                        "docker stop ${container:-<name>}, or choose another port (EXTERNAL_PORT / SSH_PORT in neurons/executor/.env) and open it instead."
                    has_fix=1
                    continue ;;
             esac
+        elif [ -n "$listener" ] && [ "$is_default_port" = 1 ]; then
+            pf_skip "TCP $p (default $label port, assumed: no .env found) is in use by $listener. If your executor uses another port, re-run with EXECUTOR_PORT=<port> SSH_PORT=<port> to check that one instead."
+            continue
         elif [ -n "$listener" ]; then
             pf_fix "TCP $p ($label port) is already in use by $listener — the executor cannot bind it." \
                 "Stop that process, or choose another port (EXTERNAL_PORT / SSH_PORT in neurons/executor/.env) and open it instead."
@@ -993,6 +1006,7 @@ unknown_list=""
 for name in $all_containers; do
     case "$name" in
         pod_*)       ;;  # handled by abort_on_active_rentals below
+        filler_*)    ;;  # Lium's Default Job: kept through setup, see filler_list below
         container_*|lium_storage_check_*) has_validator=true ;;  # a validator's scrape or its vloopback test
         executor-*|executor_*)
             has_executor=true
@@ -1055,8 +1069,17 @@ if [ "$has_executor" = true ]; then
     fi
 fi
 
-# Check for stopped containers (sysbox requires zero containers)
-stopped=$(docker ps -a -q 2>/dev/null || true)
+# every Default Job, also one already stopped (by hand or an earlier run): all are kept and started after setup
+filler_list=$(docker ps -a --format '{{.Names}}' 2>/dev/null | awk '/^filler_/ {printf "%s ", $1}' || true)
+if [ -n "$filler_list" ]; then
+    warn "Lium's Default Job will be stopped and started again after setup (do not remove it)."
+    # shellcheck disable=SC2086  # one name per word
+    docker stop $filler_list > /dev/null 2>&1 || true
+fi
+
+# Remove stopped containers so Docker can restart cleanly; keep Lium's Default Job (filler_*), which the
+# validator would otherwise report as missing and stop idle pay for until it starts a new one
+stopped=$(docker ps -a --format '{{.ID}} {{.Names}}' 2>/dev/null | awk '$2 !~ /^filler_/ {print $1}' || true)
 if [ -n "$stopped" ]; then
     warn "Removing stopped containers (sysbox requires none)..."
     # shellcheck disable=SC2086  # one id per word
@@ -1136,6 +1159,14 @@ systemctl restart docker
 for _ in $(seq 1 30); do docker ps &>/dev/null && break; sleep 1; done
 docker ps &>/dev/null || { fail "Docker failed to restart. Check: journalctl -u docker.service"; exit 1; }
 ok "Docker is running."
+if [ -n "$filler_list" ]; then
+    # shellcheck disable=SC2086  # one name per word
+    if docker start $filler_list > /dev/null 2>&1; then
+        ok "Lium's Default Job started again."
+    else
+        warn "Lium's Default Job did not start again; the validator starts a new one on its next check."
+    fi
+fi
 
 # ── 7. Verify ──────────────────────────────────────────
 

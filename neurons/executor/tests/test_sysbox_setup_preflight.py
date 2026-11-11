@@ -60,6 +60,11 @@ STUBS = {
             "ps --format") [ -z "${STUB_RUNNING:-}" ] || echo "$STUB_RUNNING" ;;   # install mode's running-container sort
             "ps -a")   # every container, stopped ones too
                 [ -z "${STUB_PS_A_HANGS:-}" ] || exit 124
+                if [ "$3" = --format ]; then
+                    [ -z "${STUB_ALL_CONTAINERS:-}" ] && exit 0
+                    case "$4" in *.ID*) echo -e "$STUB_ALL_CONTAINERS" ;; *) echo -e "$STUB_ALL_CONTAINERS" | awk '{print $2}' ;; esac
+                    exit 0
+                fi
                 echo "${STUB_STOPPED_POD:-}"
                 [ "$4" != name=pod_ ] || [ -z "${STUB_PODS:-}" ] || echo "$STUB_PODS" ;;
             "ps --filter")
@@ -480,6 +485,30 @@ def test_install_mode_stops_on_a_stopped_rental(tmp_path):
     assert "Removing stopped containers" not in proc.stdout
 
 
+def test_install_mode_keeps_the_default_job(tmp_path):
+    # the Default Job (filler_*) is not an unknown container; the install stops it, keeps it and starts it again
+    proc = run_script(
+        tmp_path,
+        env={"STUB_SYSBOX_VERSION": "0.6.6", "STUB_RUNNING": "filler_abc", "STUB_ALL_CONTAINERS": "aaa filler_abc\nbbb old_one"},
+    )
+    # the stub host cannot fetch packages, so the run ends at step 3; the clean-up before it is what matters
+    assert "Docker is clear for sysbox installation." in proc.stdout, proc.stdout + proc.stderr
+    assert "Unknown containers found" not in proc.stdout
+    calls = (tmp_path / "root/.stub-docker/calls").read_text().splitlines()
+    assert "stop filler_abc" in calls
+    assert "rm -f bbb" in calls
+    assert not [c for c in calls if c.startswith("rm -f") and "aaa" in c]
+
+
+def test_install_mode_keeps_a_default_job_that_was_already_stopped(tmp_path):
+    # the provider stopped it by hand before running setup: it is still kept, and in the list started after setup
+    proc = run_script(tmp_path, env={"STUB_SYSBOX_VERSION": "0.6.6", "STUB_ALL_CONTAINERS": "aaa filler_abc\nbbb old_one"})
+    assert "Docker is clear for sysbox installation." in proc.stdout, proc.stdout + proc.stderr
+    calls = (tmp_path / "root/.stub-docker/calls").read_text().splitlines()
+    assert "stop filler_abc" in calls
+    assert "rm -f bbb" in calls
+
+
 def test_install_mode_loads_the_iptables_modules_itself(tmp_path):
     proc = run_script(tmp_path, files={"proc/modules": "nf_tables 311296 0\n"})
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -512,3 +541,29 @@ def test_aarch64_host_passes_the_arch_check(tmp_path):
     # GB300 / Grace: nestybox ships an arm64 .deb, so aarch64 is no longer a blocking FIX
     proc = run_script(tmp_path, "--check", env={"STUB_ARCH": "aarch64"})
     assert "PASS Architecture aarch64." in proc.stdout
+
+
+# ── ports ────────────────────────────────────────────────────────────────────
+
+
+def test_piped_without_an_env_a_busy_default_port_is_a_note_not_a_fix(tmp_path):
+    # piped from curl there is no .env, so 8080 is only assumed; the provider may run the executor on another port
+    rc, out, fix_count = run_check(tmp_path, "check_ports", env={"STUB_BUSY_PORT": "8080", "STUB_BUSY_PROC": "python3"})
+    assert fix_count == 0
+    assert "TCP 8080 (default executor port, assumed: no .env found) is in use" in out
+    assert "EXECUTOR_PORT=<port>" in out
+
+
+def test_piped_from_the_executor_directory_checks_the_env_port(tmp_path):
+    (tmp_path / ".env").write_text("EXTERNAL_PORT=9000\nSSH_PORT=2300\n")
+    rc, out, fix_count = run_check(tmp_path, "check_ports", env={"STUB_BUSY_PORT": "9000", "STUB_BUSY_PROC": "python3"})
+    assert fix_count == 1
+    assert "TCP 9000 (executor port) is already in use" in out
+
+
+def test_an_explicit_port_in_use_is_still_a_fix(tmp_path):
+    rc, out, fix_count = run_check(
+        tmp_path, "check_ports", env={"EXECUTOR_PORT": "8080", "STUB_BUSY_PORT": "8080", "STUB_BUSY_PROC": "python3"}
+    )
+    assert fix_count == 1
+    assert "TCP 8080 (executor port) is already in use" in out

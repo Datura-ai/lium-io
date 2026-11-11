@@ -593,6 +593,7 @@ async def test_a_pod_container_on_an_unrented_node_is_judged_by_its_pod(
     services.backend.get_pod_rental_active.assert_awaited_once_with(TEARDOWN_POD_ID)
 
 
+@pytest.mark.parametrize("suffix", ["__prev", "__stopped"])
 @pytest.mark.parametrize("gpu_details", [BUSY_GPU, IDLE_GPU_HOLDING_VRAM], ids=["busy", "idle"])
 @pytest.mark.parametrize(
     "redis_failing, passed, backend_asked",
@@ -601,7 +602,7 @@ async def test_a_pod_container_on_an_unrented_node_is_judged_by_its_pod(
 )
 @pytest.mark.asyncio
 async def test_an_edit_parked_name_is_ours_only_when_recorded_or_the_record_is_unreadable(
-    context_factory, gpu_details, redis_failing, passed, backend_asked
+    context_factory, suffix, gpu_details, redis_failing, passed, backend_asked
 ):
     services = build_services(score_calculator=_Scores())
     services.redis.failing = redis_failing
@@ -610,7 +611,7 @@ async def test_an_edit_parked_name_is_ours_only_when_recorded_or_the_record_is_u
     )
     state = build_state(
         gpu_details=gpu_details,
-        gpu_processes=[_pod_process(f"{TEARDOWN_POD}__prev")],
+        gpu_processes=[_pod_process(f"{TEARDOWN_POD}{suffix}")],
         rented_data=RentedExecutorsResponse(executors={}),
     )
     ctx = context_factory(services=services, config=build_context_config(), state=state, rented=False)
@@ -1875,3 +1876,121 @@ def test_lium_workload_containers_skips_another_miners_rental_on_a_different_end
     ctx.state.rented_data = rented_data
 
     assert gpu_usage.lium_workload_containers(ctx) == set()
+
+
+@pytest.mark.asyncio
+async def test_a_busy_gpu_names_its_measured_load_the_limit_and_the_processes(context_factory):
+    state = build_state(
+        gpu_details=[
+            {"gpu_utilization": 0, "memory_utilization": 0},
+            {"gpu_utilization": 37, "memory_utilization": 12},
+        ],
+        gpu_processes=[{"pid": 4242, "name": "python3"}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.USAGE_HIGH.reason
+    assert result.event.remediation.startswith(
+        "GPU 1: utilization 37% and memory utilization 12%; an idle node must stay below 5% "
+        "utilization and at most 5% memory utilization. GPU processes on the node: python3 "
+        "(pid 4242)."
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_busy_gpu_beside_the_nodes_filler_never_names_the_filler_to_stop(context_factory):
+    filler_container = "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 34, "memory_utilization": 3}],
+        gpu_processes=[
+            {"pid": 3217038, "container_name": filler_container},
+            {"pid": 777, "name": "python3"},
+        ],
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            all_filler_containers_by_executor={"executor-123": [filler_container]},
+        ),
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.USAGE_HIGH.reason
+    stop = result.event.remediation.split("Leave Lium's own filler running:")[0]
+    assert "filler_5703" not in stop
+    assert "must stay below" not in result.event.remediation
+    assert "python3 (pid 777)" in result.event.remediation
+
+
+@pytest.mark.asyncio
+async def test_a_busy_gpu_after_a_reset_of_an_earlier_gpu_keeps_its_node_index(
+    context_factory, monkeypatch
+):
+    async def resets(*_args):
+        return [{"gpu_uuids": ["GPU-0"]}]
+
+    monkeypatch.setattr(gpu_usage, "renter_gpu_resets", resets)
+    state = build_state(
+        gpu_details=[
+            {"uuid": "GPU-0", "gpu_utilization": 0, "memory_utilization": 0},
+            {"uuid": "GPU-1", "gpu_utilization": 37, "memory_utilization": 12},
+        ],
+        gpu_processes=[{"pid": 4242, "name": "python3"}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.USAGE_HIGH.reason
+    assert result.event.remediation.startswith("GPU 1: utilization 37%")
+    assert result.event.what_we_saw["gpu_index"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_busy_gpu_lists_the_processes_of_every_card_as_the_nodes(context_factory):
+    state = build_state(
+        gpu_details=[
+            {"gpu_utilization": 37, "memory_utilization": 12},
+            {"gpu_utilization": 0, "memory_utilization": 0},
+        ],
+        gpu_processes=[{"pid": 4242, "name": "python3"}, {"pid": 5151, "name": "miner"}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert "On the GPU" not in result.event.remediation
+    expected = "GPU processes on the node: python3 (pid 4242), miner (pid 5151)."
+    assert expected in result.event.remediation
+
+
+@pytest.mark.parametrize(
+    "stray",
+    [{"pid": 777, "name": "python3"}, {"pid": 778, "container_name": "filler_my_training"}],
+    ids=["host-process", "unmapped-filler-name"],
+)
+@pytest.mark.asyncio
+async def test_only_the_backends_own_filler_is_left_out_of_the_processes_to_stop(
+    context_factory, stray
+):
+    filler_container = "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 34, "memory_utilization": 3}],
+        gpu_processes=[{"pid": 3217038, "container_name": filler_container}, stray],
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            all_filler_containers_by_executor={"executor-123": [filler_container]},
+        ),
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    remediation = result.event.remediation
+    stop, keep = remediation.split("Leave Lium's own filler running:")
+    assert f"(pid {stray['pid']})" in stop
+    assert filler_container not in stop
+    assert keep.strip() == f"{filler_container} (pid 3217038)."
+    assert "filler_*" not in remediation

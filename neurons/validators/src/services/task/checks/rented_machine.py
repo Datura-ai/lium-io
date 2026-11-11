@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import functools
 import logging
 import re
 import shlex
@@ -10,7 +12,7 @@ from typing import Any, NamedTuple
 import asyncssh
 from pydantic import BaseModel
 
-from core.docker_utils import DockerCommand, collect_container_death_diagnostics
+from core.docker_utils import ContainerDeathDiagnostics, DockerCommand, collect_container_death_diagnostics
 from core.utils import _m, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedPod
 from protocol.vc_protocol.validator_requests import (
@@ -20,17 +22,27 @@ from protocol.vc_protocol.validator_requests import (
 )
 
 from ...const import (
+    FILLER_CONTAINER_PREFIX,
     GPU_MEMORY_UTILIZATION_LIMIT,
     GPU_UTILIZATION_LIMIT,
+    PARKED_SUFFIXES,
     POD_CONTAINER_NAME_GRACE_MINUTES,
 )
 from core.config import settings
 from services.gpu_reset import renter_gpu_reset_in_progress
+from services.redis_service import (
+    EXECUTOR_CREATE_LOCK_TIMEOUT,
+    RECENT_FILLER_PREFIX,
+    RECENT_FILLER_TTL_SECONDS,
+    STOPPED_BY_RECOVERY_PREFIX,
+    STOPPED_BY_RECOVERY_STOPPED,
+)
 
 from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from . import port_connectivity
+from .gpu_usage import _fillers_off_their_image
 from .port_connectivity import PortConnectivityCheck
 from .provider_maintenance import maintenance_failure, maintenance_window_at_cycle_start
 from .rental_owner import rental_of_this_node
@@ -47,6 +59,45 @@ logger = logging.getLogger(__name__)
 
 # cycle time kept after the rented pod reads, to report the result and close the shell
 POD_READ_RESERVE_SECONDS = 30
+
+def _scraped_container_ids(ctx: Context) -> dict[str, str]:
+    return {
+        str(entry.get("name") or ""): str(entry.get("container_id") or "")
+        for entry in ((ctx.state.specs or {}).get("docker") or {}).get("containers") or []
+        if isinstance(entry, dict)
+    }
+
+
+async def _remember_fillers(ctx: Context, names: list[str]) -> None:
+    container_ids = _scraped_container_ids(ctx)
+    try:
+        for name in names:
+            # the record is the container itself: a replacement under the same name is not our load
+            if container_ids.get(name):
+                key = f"{RECENT_FILLER_PREFIX}{ctx.executor.uuid}:{name}"
+                await ctx.services.redis.set(key, container_ids[name], ex=RECENT_FILLER_TTL_SECONDS)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Recent filler record not written for %s: %s", ctx.executor.uuid, exc)
+
+
+async def _recently_listed_fillers(ctx: Context, names: set[str]) -> list[str]:
+    """The filler-named containers the snapshot listed on THIS node within RECENT_FILLER_TTL_SECONDS: our own load."""
+    found = []
+    container_ids = _scraped_container_ids(ctx)
+    try:
+        for name in sorted(names):
+            if not name.startswith(FILLER_CONTAINER_PREFIX) or not container_ids.get(name):
+                continue
+            recorded = await ctx.services.redis.get(f"{RECENT_FILLER_PREFIX}{ctx.executor.uuid}:{name}")
+            if isinstance(recorded, bytes):
+                recorded = recorded.decode()
+            if recorded == container_ids[name]:
+                found.append(name)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Recent filler records unreadable for %s: %s", ctx.executor.uuid, exc)
+    # the remembered name alone is not enough: a container reusing it must also run the image we started
+    off_image = await _fillers_off_their_image(ctx, set(found)) if found else []
+    return [name for name in found if name not in off_image]
 
 
 def _has_gpu_process_outside_container(rented_pods: list[str], processes: Iterable[dict]) -> bool:
@@ -153,6 +204,8 @@ class TenantEnforcementCheck:
     """
 
     check_id = "executor.validate.rented_state"
+    # starts named containers / recovers the pod on the host: never replayed after a dropped session
+    replays_after_session_drop = False
     fatal = True
 
     def __init__(self, recover_stale_pods: bool = True):
@@ -173,6 +226,7 @@ class TenantEnforcementCheck:
         # makes its siblings' GPU processes read as usage outside the tenant.
         filler_containers = rented_data.get_filler_containers(ctx.executor.uuid) if rented_data else []
         filler_container = filler_containers[0] if filler_containers else None
+        await _remember_fillers(ctx, filler_containers)
 
         if not rented_executor or not rented_executor.pods:
             extra = {**ctx.default_extra, "rented": False}
@@ -243,8 +297,51 @@ class TenantEnforcementCheck:
                         extra=extra,
                     )
                 )
+            if pod_running and self.recover_stale_pods:  # a dry run never touches a live pod
+                try:
+                    # False once a pod that could not be remounted was stopped: judged below as down
+                    pod_running = await _restore_missing_volume_mount(ctx, pod_container_name, pod_id, pod.status)
+                except (asyncssh.Error, OSError) as exc:
+                    return with_pod_states(
+                        _executor_transport_unreachable_result(
+                            ctx=ctx,
+                            check_id=self.check_id,
+                            container_name=pod_container_name,
+                            pod_id=pod_id,
+                            transport_error=exc,
+                            extra=extra,
+                        )
+                    )
+                if not pod_running:
+                    stop_outcome = await ctx.services.pod_recovery.unmounted_stop_outcome(pod_id)
+                    if stop_outcome == "failed":
+                        # docker refused the stop: the pod still runs without its mount, taking the renter's writes
+                        # unencrypted onto the host disk, so the host fails the check (lio#1827 review)
+                        extra.setdefault("pods_stop_refused", []).append(pod_id)
+                        # bounded: a stalled read must not let the task deadline cancel this failure unpublished
+                        diagnostics = await _collect_pod_diagnostics(
+                            ctx.ssh,
+                            pod_container_name,
+                            timeout=max(1.0, task_seconds_left(ctx) - POD_READ_RESERVE_SECONDS),
+                        )
+                        state_by_pod_id[pod_id] = _container_state_from_diagnostics(diagnostics)
+                        return with_pod_states(
+                            self._pod_not_running_failure(ctx, pod_container_name, pod_id, diagnostics, extra)
+                        )
+                    # stopped by this cycle's own restore: a second recovery now would eat the result's reserve,
+                    # so the next cycle restarts it (lio#1827 review F-17); a stop it could not confirm is judged
+                    # then as well, not counted as ours
+                    if stop_outcome == "unknown":
+                        state_by_pod_id[pod_id] = ContainerState.UNKNOWN
+                    else:
+                        state_by_pod_id[pod_id] = ContainerState.EXITED
+                        extra.setdefault("pods_stopped_by_validator", []).append(pod_id)
+                    ssh_pub_keys = []
+                    continue
             if pod_running:
                 state_by_pod_id[pod_id] = ContainerState.RUNNING
+                if self.recover_stale_pods:
+                    await _clear_leftover_recovery_mark(ctx, pod_container_name, pod_id, pod.status)
             elif pod.container_name_pending and _within_container_name_grace(pod):
                 # DAH-4315: the backend lists a pod before it records the container's name, so
                 # its container may still be being created. Judged next cycle, not penalised.
@@ -277,6 +374,22 @@ class TenantEnforcementCheck:
                         ),
                         "diagnostics": diagnostics,
                     }
+                    if ctx.state.port_check_deferred and await _every_listed_pod_stale(ctx, rented_pods, pod_index):
+                        # DAH-5851: idle now, on a deferred port check: withheld, as PortCountCheck withholds an idle node
+                        await port_connectivity.spend_disk_pressure_deferrals(ctx)
+                        return with_pod_states(
+                            CheckResult(
+                                passed=False,
+                                event=render_message(
+                                    PortCountMessages.VERDICT_WITHHELD_PORT_CHECK_DEFERRED,
+                                    ctx=ctx,
+                                    check_id=self.check_id,
+                                    what={"stale_pod": stale_what},
+                                    extra=extra,
+                                ),
+                                updates={"default_extra": extra, "rented": False, "ssh_pub_keys": None},
+                            )
+                        )
                     # PortCountCheck exempted this node from the port floor because the batch-start rented
                     # list named a pod; the node goes on as unrented with a count the backend will not list.
                     # The floor is enforced only when every listed pod is stale: a live rental on the same
@@ -305,7 +418,8 @@ class TenantEnforcementCheck:
                         event = split_ports_event(
                             ctx,
                             self.check_id,
-                            reprobed.get("state", ctx.state),
+                            # a completed re-probe is a current reading; the pipeline flag itself stays as it was
+                            replace(reprobed["state"], port_check_deferred=False) if "state" in reprobed else ctx.state,
                             *split_short,
                             what={"stale_pod": stale_what},
                             extra=extra,
@@ -402,6 +516,10 @@ class TenantEnforcementCheck:
         container_names.extend(filler_containers)
         gpu_processes = list(ctx.state.gpu_processes)
         gpu_running_outside = _has_gpu_process_outside_container(container_names, gpu_processes)
+        if gpu_running_outside and not rented_executor.owner_flag:
+            unlisted = {process.get("container_name") or "" for process in gpu_processes} - set(container_names)
+            container_names.extend(await _recently_listed_fillers(ctx, unlisted))
+            gpu_running_outside = _has_gpu_process_outside_container(container_names, gpu_processes)
 
         if not rented_executor.owner_flag and gpu_running_outside:
             gpu_details = ctx.state.gpu_details
@@ -484,7 +602,9 @@ class TenantEnforcementCheck:
         container_state = _container_state_from_diagnostics(diagnostics)
         if self.recover_stale_pods:
             try:
-                if await _recover_pod_after_stale_vloopback_mount(
+                if await _recover_parked_pod_container(
+                    ctx, container_name, pod_id, pod_status, diagnostics, local_volume_path
+                ) or await _recover_pod_after_stale_vloopback_mount(
                     ctx, container_name, pod_id, diagnostics, local_volume_path
                 ):
                     # Re-read the pod, so the recovered container's own SSH keys are what gets
@@ -526,6 +646,40 @@ class TenantEnforcementCheck:
                 container_state=container_state,
             )
 
+        # a pod the validator stopped itself (its mount could not be restored) is down, but not by the
+        # host: reported down through its pod state, yet no failed check or host reset, so a renter
+        # breaking the mount from inside cannot fail the provider's validation or get the node reset
+        # only a stop's mark: a mark written before a rename that then failed stopped nothing
+        stopped_by_validator = False
+        with contextlib.suppress(Exception):
+            mark = await ctx.services.redis.get(f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}")
+            stopped_by_validator = (mark.decode() if isinstance(mark, bytes) else mark) == STOPPED_BY_RECOVERY_STOPPED
+        if not stopped_by_validator and diagnostics.get("container_missing") is True:
+            # a stop whose mark could not be written parked the pod under <name>__stopped; the name alone is
+            # forgeable on the provider's daemon, so only this validator's own record of that park attributes it
+            with contextlib.suppress(Exception):
+                stopped_by_validator = (
+                    await ctx.services.pod_recovery.unmarked_stop_parked(ctx.ssh, container_name, pod_id) is True
+                )
+        if stopped_by_validator and diagnostics.get("container_missing") is True:
+            # the container we stopped is gone (provider rm, reinstall): passing it would keep billing a pod that no
+            # longer exists, since only the POD_NOT_RUNNING reset stops billing. Report it down only once neither
+            # <name> nor its parked <name>__prev exists under the create lock; anything unconfirmed keeps the pass.
+            stopped_by_validator = not await _clear_leftover_recovery_mark(
+                ctx, container_name, pod_id, pod_status, container_gone=True
+            )
+        if stopped_by_validator:
+            extra.setdefault("pods_stopped_by_validator", []).append(pod_id)
+            return _DownedPodOutcome(failure=None, ssh_pub_keys=[], container_state=container_state)
+        return _DownedPodOutcome(
+            failure=self._pod_not_running_failure(ctx, container_name, pod_id, diagnostics, extra),
+            ssh_pub_keys=[],
+            container_state=container_state,
+        )
+
+    def _pod_not_running_failure(
+        self, ctx: Context, container_name: str, pod_id: str, diagnostics: dict[str, object], extra: dict[str, Any]
+    ) -> CheckResult:
         event = render_message(
             Msg.POD_NOT_RUNNING,
             ctx=ctx,
@@ -539,27 +693,23 @@ class TenantEnforcementCheck:
             },
             extra=extra,
         )
-        return _DownedPodOutcome(
-            failure=CheckResult(
-                passed=False,
-                event=event,
-                updates={
-                    "default_extra": extra,
-                    "clear_verified_job_info": True,
-                    "clear_verified_job_reason": ResetVerifiedJobReason.POD_NOT_RUNNING.value,
-                    # DAH-3386: the backend's penalty row shows why the container was not running — a renter's
-                    # entrypoint exiting with its own code and a host that lost the container look different here.
-                    "clear_verified_job_evidence": {
-                        "reason_code": event.reason_code,
-                        "check_id": self.check_id,
-                        "pod_id": pod_id,
-                        "container_name": container_name,
-                        "container": _penalty_evidence_from_diagnostics(diagnostics),
-                    },
+        return CheckResult(
+            passed=False,
+            event=event,
+            updates={
+                "default_extra": extra,
+                "clear_verified_job_info": True,
+                "clear_verified_job_reason": ResetVerifiedJobReason.POD_NOT_RUNNING.value,
+                # DAH-3386: the backend's penalty row shows why the container was not running — a renter's
+                # entrypoint exiting with its own code and a host that lost the container look different here.
+                "clear_verified_job_evidence": {
+                    "reason_code": event.reason_code,
+                    "check_id": self.check_id,
+                    "pod_id": pod_id,
+                    "container_name": container_name,
+                    "container": _penalty_evidence_from_diagnostics(diagnostics),
                 },
-            ),
-            ssh_pub_keys=[],
-            container_state=container_state,
+            },
         )
 
     def _reboot_failed_host_fault_result(
@@ -806,6 +956,275 @@ async def _recover_pod_after_stale_vloopback_mount(
         return False
 
 
+# A recovery runs only for a pod no operation is under: a *_PENDING pod (or a STOPPED one) is the
+# backend's to drive.
+_RECOVERY_POD_STATUSES = (None, "RUNNING", REBOOT_FAILED_POD_STATUS)
+# a recovery under the create lock finishes (cleanup included) well before the lock expires, so a
+# create can never take the lock while a recovery is still mutating the pod's containers
+_RECOVERY_DEADLINE_SEC = EXECUTOR_CREATE_LOCK_TIMEOUT - 120
+_RECOVERY_MARK_CLEAR_TIMEOUT_SEC = 5
+# the running-pod mount probe: the backend's path lookup (10 s) and the docker probe (30 s)
+_MOUNT_PROBE_SECONDS = 40
+# a restore cut by the deadline still marks, records, parks and stops the pod: the 5 s mark, the 5 s DB record, three
+# 30 s commands and the record's 5 s drop after a park or stop that did not take
+_MOUNT_RESTORE_CLEANUP_RESERVE_SEC = 105
+# a parked recovery cut by its deadline still stops the container and parks it back
+_PARKED_RECOVERY_CLEANUP_RESERVE_SEC = 90
+
+
+@contextlib.asynccontextmanager
+async def _no_create_in_flight(ctx: Context, pod_id: str, pod_status: str | None):
+    """Yields True while the executor's create lock is held for a pod no create can be running on.
+
+    A create between its park and `docker run` looks like a lone `<name>__prev`, and one between its
+    `docker run` and the gocryptfs mount looks like a running pod without its volume: a recovery
+    under it would race the create's own steps."""
+    if pod_status not in _RECOVERY_POD_STATUSES:
+        yield False
+        return
+    redis = ctx.services.redis
+    try:
+        # the connector's creates, reboots and edits of the pod, however long they run (the pending
+        # mark expires at 30 min, and a create that waited out the lock goes on without it), and the
+        # create's pending-pod mark
+        if await redis.backend_create_inflight(pod_id) or await redis.renting_in_progress(
+            ctx.miner_hotkey, ctx.executor.uuid, pod_id
+        ):
+            acquired, lock = False, None
+        else:
+            lock = redis.executor_create_lock(ctx.executor.uuid)
+            acquired = await lock.acquire(blocking=False)
+    except Exception:
+        acquired, lock = False, None  # whether a create is in flight is unknown: leave the pod as it is
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            with contextlib.suppress(Exception):  # a release past the TTL: the lock is not held anyway
+                await lock.release()
+
+
+async def _recover_parked_pod_container(
+    ctx: Context,
+    container_name: str,
+    pod_id: str,
+    pod_status: str | None,
+    diagnostics: dict[str, object],
+    local_volume_path: str | None,
+) -> bool:
+    # A reboot or edit whose undo never ran leaves the pod's only container under <name>__prev and
+    # no <name>; nothing but the pod's next create renamed it back (22 Oct, REBOOT_FAILED pod).
+    if not ctx.executor_ssh_private_key:
+        return False
+    stopped_by_recovery = False
+    if diagnostics.get("container_missing") is not True:
+        # a stopped <name> is started only when a recovery of ours stopped it (an unremountable pod)
+        # or renamed it back and lost the answer; a pod stopped by anyone else stays as it is
+        with contextlib.suppress(Exception):
+            stopped_by_recovery = await ctx.services.redis.get(f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}") is not None
+        if not stopped_by_recovery:
+            return False
+    # out of the cycle's time: a recovery outliving the task drops its verdict
+    budget = task_seconds_left(ctx) - POD_READ_RESERVE_SECONDS - _PARKED_RECOVERY_CLEANUP_RESERVE_SEC
+    if budget <= 0:
+        return False  # left parked: the next cycle recovers it
+    async with _no_create_in_flight(ctx, pod_id, pod_status) as clear:
+        if not clear:
+            return False
+        try:
+            async with asyncio.timeout(min(_RECOVERY_DEADLINE_SEC, budget)):
+                return await ctx.services.pod_recovery.recover_parked_pod_container(
+                    ssh_client=ctx.ssh,
+                    executor_info=ctx.executor,
+                    miner_hotkey=ctx.miner_hotkey,
+                    private_key=ctx.executor_ssh_private_key,
+                    container_name=container_name,
+                    pod_id=pod_id,
+                    local_volume_path=local_volume_path,
+                    default_extra=ctx.default_extra,
+                    stopped_by_recovery=stopped_by_recovery,
+                )
+        except TimeoutError as exc:  # before OSError: a missed deadline is not a dead transport
+            _log_recovery_failed("POD_PARKED_CONTAINER_RECOVERY_FAILED", ctx, container_name, pod_id, exc)
+            return False
+        except (asyncssh.Error, OSError):
+            raise
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "POD_PARKED_CONTAINER_RECOVERY_FAILED",
+                    extra=get_extra_info({
+                        **ctx.default_extra,
+                        "container_name": container_name,
+                        "pod_id": pod_id,
+                        "error": str(exc),
+                    }),
+                )
+            )
+            return False
+
+
+async def _clear_leftover_recovery_mark(
+    ctx: Context, container_name: str, pod_id: str, pod_status: str | None, *, container_gone: bool = False
+) -> bool:
+    # the mark means something only while the pod is stopped: one a lost delete left on a running pod would restart a
+    # later provider stop, and one left on a removed container would pass a billed pod forever (container_gone).
+    # Bounded and best-effort; the next cycle retries. Returns True only for container_gone once neither <name> nor
+    # a parked twin of it exists under the create lock, whether or not the mark's delete then lands.
+    key = f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}"
+    absence_confirmed = False  # survives a mark delete that outlives the deadline
+
+    async def inspect(name: str):
+        return await ctx.ssh.run(f"/usr/bin/docker inspect -f '{{{{.State.Running}}}}' {shlex.quote(name)}")
+
+    def absent(result) -> bool:
+        return result.exit_status != 0 and "No such" in str(result.stderr)
+
+    async def clear() -> bool:
+        nonlocal absence_confirmed
+        # a pending retry of a stop mark that never landed, or the park record, counts even with no mark in Redis
+        if (
+            not container_gone
+            and await ctx.services.redis.get(key) is None
+            and not await ctx.services.pod_recovery.recovery_stop_pending(pod_id)
+        ):
+            return False
+        # under the create lock every mark write and its stop run under: never between a recovery's mark and its stop
+        async with _no_create_in_flight(ctx, pod_id, pod_status) as clear_to_delete:
+            if not clear_to_delete:
+                return False
+            # re-read under the lock: a recovery may have marked and stopped the pod since this cycle saw it running
+            inspect_result = await inspect(container_name)
+            if not container_gone:
+                if (inspect_result.stdout or "").strip() == "true":
+                    # running again by this read under the lock, never an earlier one a concurrent recovery's stop
+                    # followed: its stale pending mark write or park record would attribute a later provider stop
+                    # to the recovery (lio#1827 review)
+                    await ctx.services.pod_recovery.forget_recovery_stop(pod_id)
+                    await ctx.services.redis.delete(key)
+                return False
+            # a failed recovery can leave the stopped original parked (<name>__prev, <name>__stopped): still the renter's pod
+            if not absent(inspect_result):
+                return False
+            for suffix in PARKED_SUFFIXES:
+                if not absent(await inspect(f"{container_name}{suffix}")):
+                    return False
+            absence_confirmed = True
+            await ctx.services.pod_recovery.forget_recovery_stop(pod_id)
+            with contextlib.suppress(Exception):
+                await ctx.services.redis.delete(key)
+            return True
+
+    try:
+        return await asyncio.wait_for(clear(), timeout=_RECOVERY_MARK_CLEAR_TIMEOUT_SEC)
+    except Exception:
+        return absence_confirmed
+
+
+def _log_recovery_failed(event: str, ctx: Context, container_name: str, pod_id: str, exc: Exception) -> None:
+    logger.warning(
+        _m(
+            event,
+            extra=get_extra_info({
+                **ctx.default_extra,
+                "container_name": container_name,
+                "pod_id": pod_id,
+                "error": f"{type(exc).__name__}: {exc}",
+            }),
+        )
+    )
+
+
+# DAH-5034 follow-up: the backend sets a pod's plaintext path once, at its create, so it is asked once per pod rather
+# than for every running pod every cycle (that burst at cycle start timed the backend out, 10 Nov). "" = no path.
+PLAINTEXT_VOLUME_PATH_PREFIX = "plaintext_volume_path:"
+PLAINTEXT_VOLUME_PATH_TTL_SECONDS = 24 * 3600
+_PLAINTEXT_VOLUME_PATH_REDIS_TIMEOUT_SEC = 2
+
+
+async def _plaintext_volume_path(ctx: Context, pod_id: str) -> str | None:
+    key = f"{PLAINTEXT_VOLUME_PATH_PREFIX}{pod_id}"
+    try:
+        cached = await asyncio.wait_for(ctx.services.redis.get(key), timeout=_PLAINTEXT_VOLUME_PATH_REDIS_TIMEOUT_SEC)
+    except Exception:  # noqa: BLE001
+        cached = None  # Redis down or slow: ask the backend
+    if cached is not None:
+        cached = cached.decode() if isinstance(cached, bytes) else str(cached)
+        return cached or None
+    try:
+        rental_active = await ctx.services.backend.get_pod_rental_active(pod_id)
+    except Exception:
+        return None  # unknown: the restore stops the pod rather than remount at a guessed path
+    if rental_active is None:
+        return None  # not cached: an unanswered lookup is asked again next cycle
+    path = rental_active.local_volume_path
+    if rental_active.status != "RUNNING":
+        return path  # a create, reboot or edit in flight: the path may not be stored yet, so ask again next cycle
+    try:
+        await asyncio.wait_for(
+            ctx.services.redis.set(key, path or "", ex=PLAINTEXT_VOLUME_PATH_TTL_SECONDS),
+            timeout=_PLAINTEXT_VOLUME_PATH_REDIS_TIMEOUT_SEC,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Plaintext volume path not cached for %s: %s", pod_id, exc)
+    return path
+
+
+async def _restore_missing_volume_mount(
+    ctx: Context, container_name: str, pod_id: str, pod_status: str | None
+) -> bool:
+    """False once the pod was stopped (or may have been); True while it runs.
+
+    ticket-0729: a container started by hand runs with its encrypted volume unmounted, so the
+    renter sees an empty workspace and no cycle noticed (recovery only looked at stopped ones).
+    Once the mount is known missing, a pod that cannot be remounted (no plaintext path, the
+    backend unreachable included) is stopped and marked, and the next cycle's rename-back starts
+    it with its mount; only a create in flight, which mounts it itself, leaves it running."""
+    recovery = ctx.services.pod_recovery
+    restore = functools.partial(
+        recovery.restore_volume_mount_of_running_container,
+        ssh_client=ctx.ssh,
+        executor_info=ctx.executor,
+        private_key=ctx.executor_ssh_private_key,
+        container_name=container_name,
+        pod_id=pod_id,
+        default_extra=ctx.default_extra,
+    )
+    running = True
+    # the whole step comes out of the cycle's time, keeping the result's reserve and a cut restore's stop
+    budget = task_seconds_left(ctx) - POD_READ_RESERVE_SECONDS - _MOUNT_RESTORE_CLEANUP_RESERVE_SEC
+    if budget < _MOUNT_PROBE_SECONDS:
+        return True  # it cannot fit: left as it is, the next cycle probes it
+    try:
+        async with asyncio.timeout(min(_RECOVERY_DEADLINE_SEC, budget)):
+            # the mount must be the rental's own, at its path: another gocryptfs mount in the pod does not count
+            local_volume_path = await _plaintext_volume_path(ctx, pod_id)
+            if not await recovery.encrypted_volume_mount_missing(ctx.ssh, container_name, local_volume_path):
+                return True
+            async with _no_create_in_flight(ctx, pod_id, pod_status) as clear:
+                if not clear:
+                    return True
+                running = False  # from here every failure has stopped the pod
+                running = await restore(local_volume_path=local_volume_path)
+    except TimeoutError as exc:  # before OSError: a missed deadline is not a dead transport
+        _log_recovery_failed("POD_VOLUME_MOUNT_RESTORE_FAILED", ctx, container_name, pod_id, exc)
+    except (asyncssh.Error, OSError):
+        raise
+    except Exception as exc:
+        logger.warning(
+            _m(
+                "POD_VOLUME_MOUNT_RESTORE_FAILED",
+                extra=get_extra_info({
+                    **ctx.default_extra,
+                    "container_name": container_name,
+                    "pod_id": pod_id,
+                    "error": str(exc),
+                }),
+            )
+        )
+    return running
+
+
 async def _reprobe_split_shortfall(
     ctx: Context, split_short: tuple[int, tuple[int, int]], stale_pods: list[RentedPod]
 ) -> tuple[tuple[int, tuple[int, int]] | None, dict[str, Any]]:
@@ -1036,7 +1455,7 @@ def _penalty_evidence_from_diagnostics(diagnostics: dict[str, object]) -> dict[s
 
 
 async def _collect_pod_diagnostics(
-    ssh_client: asyncssh.SSHClientConnection, container_name: str
+    ssh_client: asyncssh.SSHClientConnection, container_name: str, timeout: float | None = None
 ) -> dict[str, object]:
     """Diagnostics for a pod the ps-running check reported as down (run-time death).
 
@@ -1044,5 +1463,12 @@ async def _collect_pod_diagnostics(
     failure path in docker_service (DAH-2395 / DAH-2193), so container deaths at
     create time and run time are queryable together.
     """
-    diagnostics = await collect_container_death_diagnostics(ssh_client, container_name)
+    # a caller that must still publish its result passes a timeout; the fields read before it are kept
+    diagnostics = ContainerDeathDiagnostics()
+    try:
+        await asyncio.wait_for(
+            collect_container_death_diagnostics(ssh_client, container_name, diagnostics), timeout=timeout
+        )
+    except TimeoutError:
+        diagnostics.capture_error = "diagnostics timed out"
     return diagnostics.to_log_fields()
