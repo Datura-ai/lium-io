@@ -200,3 +200,24 @@ def test_the_host_script_finds_the_backing_file_outside_the_plugins_srv_view(tmp
         f"full {466 * GB}",
         [str(host_file)],
     )
+
+
+def test_the_host_script_reads_the_allocated_size_before_free_disk(tmp_path):
+    # a renter write between the reads must lower free disk only, never count the same bytes twice
+    log = tmp_path / "calls"
+    _stub(tmp_path, "findmnt", "echo /dev/loop7")
+    _stub(tmp_path, "losetup", "echo /data/volume_live")
+    _stub(
+        tmp_path, "stat", f'echo "stat $2" >> {log}; case "$2" in %b) echo 1;; *) echo 512;; esac'
+    )
+    _stub(tmp_path, "df", f'echo df >> {log}; echo "h"; echo "/dev/x 0 0 0 0% /"')
+    _stub(tmp_path, "xfs_growfs", "true")
+
+    subprocess.run(
+        ["sh", "-c", GROW_SCRIPT, "grow", "/mnt/x", str(466 * GB), str(10 * GB), "true"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+    )
+
+    assert log.read_text().split("\n").index("df") > log.read_text().split("\n").index("stat %B")

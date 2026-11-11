@@ -33,10 +33,11 @@ file=$(losetup -n -O BACK-FILE "$dev")
 cur=$(stat -c %s "$file")
 if [ "$cur" -ge "$order" ]; then echo full "$cur"; exit 0; fi
 command -v xfs_growfs >/dev/null 2>&1 || { echo no-xfs-growfs "$cur"; exit 0; }
-avail=$(df -P -B1 "$(dirname "$file")" | awk 'NR==2 {print $4}')
 # allocated, not apparent, size: a sparse file's unwritten space is already in avail (counting it twice grows the
-# volume every pass); for a preallocated file the two are the same
+# volume every pass); for a preallocated file the two are the same. Read before avail: a renter write in between
+# then lowers avail only, so the target errs low, never counting the same bytes twice
 alloc=$(( $(stat -c %b "$file") * $(stat -c %B "$file") ))
+avail=$(df -P -B1 "$(dirname "$file")" | awk 'NR==2 {print $4}')
 target=$((alloc + avail - headroom))
 if [ "$target" -gt "$order" ]; then target=$order; fi
 target=$((target / 4096 * 4096))
