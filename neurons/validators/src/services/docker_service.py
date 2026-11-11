@@ -6167,8 +6167,9 @@ class DockerService:
         rental fits beside them, and go oldest first until it does; the listing can also be stale (~15 min old,
         an Engy download writes ~1 GB/s until the filler is removed). With no requested size (no --storage-opt)
         the renter did not ask for the disk, so every cache stays (Rustam, 2 Nov): evicting up front would
-        re-download up to 1.5 TB after each such rental. Nothing reclaims it mid-rental (the idle backstop
-        `reclaim_dphn_cache_when_disk_is_tight` waits for no live pod). Every
+        re-download up to 1.5 TB after each such rental. Only the volume counts here: the pod's container
+        writes take disk later, and `reclaim_dphn_cache_when_disk_is_tight` evicts the kept cache mid-rental
+        once they push the node under the listing floor (DAH-6187). Every
         removal is awaited before this returns; a sized rental that still does not fit (a removal failed or
         timed out) has its volume clamped to the disk actually free, so the pod volume is never sized on
         disk that was not freed (create_container refuses a clamp far below the order). A
