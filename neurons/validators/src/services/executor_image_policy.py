@@ -30,6 +30,9 @@ class ExecutorImageReport:
     observed_digest: str | None
     expected_ref: str
     expected_digest: str
+    # A rented host whose GPU runtime cannot start a new GPU container (NVIDIA driver/library
+    # mismatch): the executor updater holds it on the old image so the running pod keeps serving.
+    update_held: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -37,6 +40,7 @@ class ExecutorImageReport:
             "observed_digest": self.observed_digest,
             "expected_ref": self.expected_ref,
             "expected_digest": self.expected_digest,
+            "update_held": self.update_held,
         }
 
 
@@ -75,18 +79,12 @@ def build_expected_image_snapshot(digest: str | None) -> ExpectedImageSnapshot:
     return ExpectedImageSnapshot(executor=executor, executor_ref=ref)
 
 
-def outdated_image_remediation(expected_ref: str, *, enforced: bool) -> str:
-    consequence = (
-        "The node earns no incentive until the executor image matches the current release."
-        if enforced
-        else "Incentive is unchanged for now: the image check is a warning until "
-        "EXECUTOR_IMAGE_CHECK_ENFORCE is on."
-    )
+def outdated_image_remediation(expected_ref: str) -> str:
     return (
         f"This node is not running the current {expected_ref} image. "
         "On a standard stack, confirm executor-executor-runner-1 and executor-watchtower-1 "
         "are running so Watchtower can pull and redeploy the latest executor automatically. "
         "If auto-update stopped, follow "
         "https://docs.lium.io/providers/nodes/gpu-power-cap#the-standard-stack-which-stopped-updating. "
-        f"{consequence}"
+        "The node earns no incentive until the executor image matches the current release."
     )
