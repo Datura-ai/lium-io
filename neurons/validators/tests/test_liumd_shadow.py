@@ -371,7 +371,7 @@ async def test_facts_come_from_the_read_right_after_the_scrape(
 async def test_no_post_scrape_read_on_a_rented_node(keypair, monkeypatch, verifyx_service, shadow_on):
     node = {
         "miner_hotkey": "5Miner",
-        "executor_ip_address": "10.0.0.5",
+        "executor_ip_address": EXECUTOR_INFO.address,
         "executor_ip_port": "8001",
         "pods": [{"pod_id": "p1", "container_name": "c1"}],
     }
