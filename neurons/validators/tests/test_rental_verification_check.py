@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta
 from unittest.mock import Mock, patch
 
@@ -701,6 +702,23 @@ async def test_rental_verification_filler_killed_enforcement_fails():
     assert result.event.reason_code == Msg.FILLER_KILLED.reason
     assert result.event.what_we_saw["enforced"] is True
     assert backend_client.called_with is None
+
+
+@pytest.mark.asyncio
+async def test_a_filler_the_gpu_recheck_removed_this_cycle_is_not_a_kill():
+    """The post-rental GPU recheck removes the node's fillers to probe the cards; the same cycle must not
+    then fail the node for the missing filler."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(running=False, removed_from_host=True)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+    ctx = ctx.model_copy(
+        update={"state": replace(ctx.state, fillers_removed_this_cycle=["filler_11111111-2222-3333-4444-555555555555"])}
+    )
+
+    result = await _run_filler_check(ctx)
+
+    assert result.event.reason_code != Msg.FILLER_KILLED.reason
+    assert backend_client.filler_run_active_calls == []
 
 
 @pytest.mark.asyncio

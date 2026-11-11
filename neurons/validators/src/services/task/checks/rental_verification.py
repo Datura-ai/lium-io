@@ -134,6 +134,8 @@ class RentalVerificationCheck:
         # VRAM bundle (DAH-2465), and checking only the first left the siblings unverifiable — a
         # removed sibling was never observed, so it was neither punished nor reconciled (DAH-2471).
         filler_containers: list[str] = rented_data.get_filler_containers(ctx.executor.uuid) if rented_data else []
+        # the GPU recheck removed these itself this cycle and told the backend; their absence is not a kill
+        filler_containers = [c for c in filler_containers if c not in ctx.state.fillers_removed_this_cycle]
         # DAH-2703: same offence, earlier kill. A host reaper that removes the filler seconds after
         # `docker run` leaves no RUNNING run and no container, so the liveness probe below never
         # sees it and the node collects unrented incentive while never running a default job. The

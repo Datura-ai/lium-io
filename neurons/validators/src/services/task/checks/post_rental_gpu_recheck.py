@@ -135,6 +135,14 @@ class PostRentalGpuRecheckCheck:
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
+        removed: list[str] = []
+        result = await self._recheck(ctx, removed)
+        if not removed:
+            return result
+        state = replace(ctx.state, fillers_removed_this_cycle=[*ctx.state.fillers_removed_this_cycle, *removed])
+        return result.model_copy(update={"updates": {**result.updates, "state": state}})
+
+    async def _recheck(self, ctx: Context, removed: list[str]) -> CheckResult:
         key = marker_key(ctx.miner_hotkey, ctx.executor.uuid)
         marker = await self._read_marker(ctx, key)
         if marker is None:
@@ -149,6 +157,7 @@ class PostRentalGpuRecheckCheck:
                 await record_marker(ctx, replace(marker, filler_skips=marker.filler_skips + 1))
                 return self._not_run(ctx, marker, Msg.FILLER_SKIPPED, what)
             what["removed_fillers"] = await self._remove_fillers(ctx)
+            removed.extend(what["removed_fillers"])
             if not what["removed_fillers"]:
                 # the filler still holds VRAM: a probe OOM here would fail a healthy card
                 await self._refresh_marker(ctx, key, what)
