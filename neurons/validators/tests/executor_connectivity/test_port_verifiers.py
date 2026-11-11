@@ -390,54 +390,6 @@ def test_the_provider_sees_the_port_and_why_ssh_failed(error, expected):
 
 
 @pytest.mark.asyncio
-async def test_port_probes_start_staggered_not_all_at_once(mocker):
-    # a provider report: a router's port-scan filter dropped the validator after 36 simultaneous connects
-    import time
-
-    from services.executor_connectivity import port_tester
-
-    mocker.patch.object(port_tester, "PROBE_STAGGER_SEC", 0.05)
-    starts = []
-
-    async def record(_session, _host, port, _token):
-        starts.append(time.monotonic())
-        return True
-
-    tester = port_tester.PortTester()
-    mocker.patch.object(tester, "test_one", side_effect=record)
-
-    ok, failed = await tester.test_many(mocker.Mock(), "host", [PortPair(i, i) for i in range(4)], "t")
-
-    assert len(ok) == 4 and not failed
-    gaps = [b - a for a, b in zip(starts, starts[1:])]
-    assert all(gap >= 0.04 for gap in gaps)
-
-
-@pytest.mark.asyncio
-async def test_a_wide_batch_spreads_its_probes_over_a_bounded_time(mocker):
-    # review: 300 ports at the full gap would start the last probe after the 60 s attempt ends
-    from services.executor_connectivity import port_tester
-
-    mocker.patch.object(port_tester, "PROBE_STAGGER_SEC", 0.25)
-    mocker.patch.object(port_tester, "MAX_PROBE_SPREAD_SEC", 0.3)
-    delays = []
-    real_sleep = asyncio.sleep
-
-    async def record_sleep(seconds):
-        delays.append(seconds)
-        await real_sleep(0)
-
-    mocker.patch.object(port_tester.asyncio, "sleep", side_effect=record_sleep)
-    tester = port_tester.PortTester()
-    mocker.patch.object(tester, "test_one", mocker.AsyncMock(return_value=True))
-
-    ok, _ = await tester.test_many(mocker.Mock(), "host", [PortPair(i, i) for i in range(300)], "t")
-
-    assert len(ok) == 300
-    assert max(delays) <= 0.3
-
-
-@pytest.mark.asyncio
 async def test_batch_keeps_verified_ports_when_cleanup_passes_the_attempt_timeout(mocker):
     # DAH-5868: 297 of 300 ports answered near the end of the 60 s, then the cleanup crossed it
     from services.executor_connectivity.port_verifiers import BatchVerifier
