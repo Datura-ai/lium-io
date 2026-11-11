@@ -167,7 +167,7 @@ failure_diagnostics() {
 
 abort_on_active_rentals() {
     # a rental blocks every path below, so check before anything that costs the node time or bandwidth;
-    # -a: a renter's stopped pod is still a rental, and the install removes every stopped container
+    # -a: a renter's stopped pod is still a rental
     docker ps -a --filter "name=pod_" --format '{{.Names}}' 2>/dev/null | grep -q . || return 0
     fail "Rentals found (pod_* containers, running or stopped). Cannot proceed."
     docker ps -a --filter "name=pod_" --format "    - {{.Names}} ({{.Status}})" 2>/dev/null
@@ -1106,6 +1106,11 @@ if [ "$SKIP_INSTALL" = false ]; then
     fi
     apt_install install -y -qq "$SYSBOX_DEB" || exit 1
     ok "Sysbox v${SYSBOX_VERSION} installed."
+    # its postinst writes bip/default-address-pools but skips its own restart when any container exists,
+    # and prints "remove them": the restart in step 5 applies those settings, so nothing is removed
+    if docker ps -aq 2>/dev/null | grep -q .; then
+        warn "Ignore sysbox's note to remove containers: Docker is restarted below and keeps them."
+    fi
 else
     ok "Sysbox already installed, skipping."
 fi
