@@ -94,7 +94,7 @@ fi
 IMAGE_NAME="daturaai/lium-watchtower:$IMAGE_TAG"
 
 # The executor compose files (neurons/executor/docker-compose*.yml) pull the updater by
-# this version tag, never by a moving tag: `1.2.2` for prod, `1.2.2-staging` for the dev stack.
+# this version tag, never by a moving tag: `1.2.3` for prod, `1.2.3-staging` for the dev stack.
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$SCRIPT_DIR/pyproject.toml")"
 if [ -z "$VERSION" ]; then
     log_error "No version in $SCRIPT_DIR/pyproject.toml"
@@ -112,7 +112,9 @@ if [ -n "${PLATFORMS:-}" ]; then
     # image cannot be loaded into the local daemon, so it is written to an OCI archive that the
     # publish workflow copies to Docker Hub after login (skopeo copy --all oci-archive:...).
     OCI_ARCHIVE="${OCI_ARCHIVE:-${TMPDIR:-/tmp}/lium-watchtower-$IMAGE_TAG.oci.tar}"  # outside the build context
-    docker buildx build --platform "$PLATFORMS" -t "$IMAGE_NAME" -t "$VERSION_IMAGE_NAME" \
+    # one untagged image in the archive (as the executor's), so `skopeo copy` needs no ref; the
+    # tag is given at the push. No provenance: it shows as an `unknown` platform on Docker Hub.
+    docker buildx build --platform "$PLATFORMS" --provenance=false \
         --output "type=oci,dest=$OCI_ARCHIVE" "$SCRIPT_DIR"
     log_info "Wrote $PLATFORMS image to $OCI_ARCHIVE"
 else

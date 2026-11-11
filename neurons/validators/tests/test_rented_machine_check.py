@@ -1,3 +1,4 @@
+from dataclasses import replace
 import asyncio
 import json
 import subprocess
@@ -13,6 +14,8 @@ from helpers import FakeRedis, build_context_config, build_services, build_state
 import neurons.validators.src.services.task.checks.rented_machine as rented_machine_module
 from neurons.validators.src.core.docker_utils import DockerCommand, _collect_host_context
 from neurons.validators.src.services.task.checks.rented_machine import (
+    RENTAL_STATE_UNKNOWN_MAX_HELD,
+    RENTAL_STATE_UNKNOWN_PREFIX,
     TenantEnforcementCheck,
     _collect_pod_diagnostics,
 )
@@ -465,7 +468,7 @@ async def test_tenant_enforcement_skips_pod_not_running_when_backend_says_inacti
 
 
 @pytest.mark.asyncio
-async def test_tenant_enforcement_keeps_pod_not_running_when_backend_state_unknown(context_factory):
+async def test_tenant_enforcement_withholds_the_verdict_when_the_backend_state_is_unknown(context_factory):
     executor_uuid = "executor-123"
     rented_data = build_rented_data(
         executor_uuid,
@@ -495,11 +498,107 @@ async def test_tenant_enforcement_keeps_pod_not_running_when_backend_state_unkno
 
     result = await TenantEnforcementCheck().run(ctx)
 
-    assert result.passed is False
-    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+    # a renter who ended the pod since the batch-start list is not the provider's fault
+    assert result.passed is True
     assert backend.called_with == ["pod-1"]
-    assert result.updates["clear_verified_job_info"] is True
-    assert result.updates["clear_verified_job_reason"] == ResetVerifiedJobReason.POD_NOT_RUNNING.value
+    assert result.updates["default_extra"]["pods_rental_state_unknown"] == ["pod-1"]
+    assert "clear_verified_job_info" not in result.updates
+
+
+def _unknown_rental_ctx(context_factory, backend, redis):
+    rented_data = build_rented_data(
+        "executor-123", {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}], "owner_flag": False}
+    )
+    services = build_services(
+        score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
+        container_cleanup=MockContainerCleanup(),
+        backend=backend,
+        redis=redis,
+    )
+    state = build_state(gpu_processes=[], gpu_details=[], gpu_model="NVIDIA RTX 4090", rented_data=rented_data)
+    return context_factory(
+        services=services,
+        config=build_context_config(),
+        state=state,
+        ssh=DummySSHClient(pod_running=False),
+        collateral_deposited=True,
+        is_rental_succeed=True,
+        contract_version="v1.0.0",
+    )
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_judges_a_down_pod_on_the_third_unanswered_rental_check(context_factory):
+    # a long backend outage must not keep a really-down pod unpenalised: two cycles held, the third judged
+    backend, redis = DummyBackendClient(active=None), FakeRedis()
+
+    def cycle():
+        return TenantEnforcementCheck().run(_unknown_rental_ctx(context_factory, backend, redis))
+
+    assert [(await cycle()).passed for _ in range(2)] == [True, True]
+    third = await cycle()
+
+    assert third.event.reason_code == Msg.POD_NOT_RUNNING.reason
+    assert third.updates["clear_verified_job_info"] is True
+    # the same outage goes on: judged every cycle until an answer, never held again
+    assert (await cycle()).event.reason_code == Msg.POD_NOT_RUNNING.reason
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_an_answered_rental_check_resets_the_unanswered_count(context_factory):
+    backend, redis = DummyBackendClient(active=None), FakeRedis()
+
+    def cycle():
+        return TenantEnforcementCheck().run(_unknown_rental_ctx(context_factory, backend, redis))
+
+    await cycle()
+    await cycle()
+    backend.active = False  # the stale-pod answer
+    assert (await cycle()).event.reason_code == Msg.STALE_POD_NOT_RUNNING.reason
+    backend.active = None
+
+    assert (await cycle()).passed is True
+    assert redis.store["rental_state_unknown:pod-1"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_judges_now_when_redis_cannot_count(context_factory):
+    # a backend and Redis outage together must not hide a down pod forever: without a count, the pod is judged
+    result = await TenantEnforcementCheck().run(
+        _unknown_rental_ctx(context_factory, DummyBackendClient(active=None), FakeRedis(failing=True))
+    )
+
+    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_a_running_pod_resets_the_unanswered_count(context_factory):
+    backend, redis = DummyBackendClient(active=None), FakeRedis()
+    ctx = _unknown_rental_ctx(context_factory, backend, redis)
+
+    await TenantEnforcementCheck().run(ctx)
+    await TenantEnforcementCheck().run(ctx)
+    ctx.ssh.pod_running = True
+    assert (await TenantEnforcementCheck().run(ctx)).passed is True
+    ctx.ssh.pod_running = False
+
+    assert (await TenantEnforcementCheck().run(ctx)).passed is True  # a fresh unanswered check is held again
+    assert redis.store["rental_state_unknown:pod-1"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_a_dry_run_never_changes_the_unanswered_count(context_factory):
+    backend, redis = DummyBackendClient(active=None), FakeRedis()
+    ctx = _unknown_rental_ctx(context_factory, backend, redis)
+
+    for _ in range(2):
+        await TenantEnforcementCheck(recover_stale_pods=False).run(ctx)
+    backend.active = True
+    await TenantEnforcementCheck(recover_stale_pods=False).run(ctx)
+
+    assert "rental_state_unknown:pod-1" not in redis.store
+    backend.active = None
+    assert (await TenantEnforcementCheck().run(ctx)).passed is True  # production still has both holds
 
 
 class DiagnosticsSSHClient:
@@ -1417,6 +1516,7 @@ def _recovery_redis(lock, marks: dict[str, str]) -> Mock:
         renting_in_progress=AsyncMock(return_value=False),
         executor_create_lock=Mock(return_value=lock),
         get=AsyncMock(side_effect=lambda key: marks.get(key)),
+        set=AsyncMock(side_effect=lambda key, value, ex=None: marks.__setitem__(key, value)),
         delete=AsyncMock(side_effect=lambda key: marks.pop(key, None)),
     )
 
@@ -1440,12 +1540,12 @@ async def test_tenant_enforcement_clears_a_leftover_recovery_mark_on_a_running_p
 
     redis.delete.side_effect = ConnectionError("Redis down")
     assert (await cycle()).passed  # a failed delete is harmless
-    assert marks
+    assert "stopped_by_recovery:pod-1" in marks
 
     redis.delete.side_effect = lambda key: marks.pop(key, None)
     lock.acquire.return_value = False  # a recovery holds the create lock between its mark and its stop
     assert (await cycle()).passed
-    assert marks
+    assert "stopped_by_recovery:pod-1" in marks
 
     async def acquire(*args, **kwargs):  # a competing recovery marks and stops the pod, then releases the lock
         if stopped_before_lock:
@@ -1456,7 +1556,7 @@ async def test_tenant_enforcement_clears_a_leftover_recovery_mark_on_a_running_p
     lock.acquire.side_effect = acquire
     assert (await cycle()).passed
     # only a pod still running under the lock loses its mark
-    assert bool(marks) is stopped_before_lock
+    assert ("stopped_by_recovery:pod-1" in marks) is stopped_before_lock  # marks also holds the path cache
     lock.release.assert_awaited()
     if stopped_before_lock:
         return
@@ -1516,9 +1616,9 @@ async def test_tenant_enforcement_starts_next_cycle_a_pod_it_stopped_while_the_b
         assert not any(key.startswith("clear_verified_job") for key in first.updates)
         assert first.updates["default_extra"]["pods_stopped_by_validator"] == ["pod-1"]
     else:
-        assert not first.passed
-        assert first.event.reason_code == Msg.POD_NOT_RUNNING.reason
-        assert first.updates["clear_verified_job_reason"] == ResetVerifiedJobReason.POD_NOT_RUNNING.value
+        # the backend did not answer whether the rental is still open, so the verdict waits for the next cycle
+        assert not any(key.startswith("clear_verified_job") for key in first.updates)
+        assert first.updates["default_extra"]["pods_rental_state_unknown"] == ["pod-1"]
 
     backend.active, backend.local_volume_path = True, "/workspace"
     second = await cycle()
@@ -1528,6 +1628,7 @@ async def test_tenant_enforcement_starts_next_cycle_a_pod_it_stopped_while_the_b
         assert _pod_states(second)["pod-1"] == "running"
     else:
         assert not second.passed
+        assert second.event.reason_code == Msg.POD_NOT_RUNNING.reason
         assert not ssh.pod_running
         docker.recover_parked_pod_container.assert_not_awaited()
 
@@ -2327,6 +2428,182 @@ async def test_a_replacement_container_under_a_remembered_filler_name_and_image_
     result = await _rented_cycle_with_filler_process(context_factory, redis, [], filler, specs=specs)
 
     assert result.event.reason_code == Msg.GPU_OUTSIDE_TENANT.reason
+
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_a_pod_recovered_in_the_cycle_keeps_the_unanswered_count(context_factory):
+    # a provider must not reset the limit by letting recovery start the pod and stopping it again
+    ssh = DummySSHClient(pod_running=False, ssh_keys=["ssh-rsa renter"])
+    docker = AsyncMock()
+    docker.recover_pod_after_stale_vloopback_mount.return_value = False
+    docker.recover_parked_pod_container.return_value = False
+    docker.encrypted_volume_mount_missing.return_value = False
+    backend, redis = DummyBackendClient(active=None), FakeRedis()
+
+    def cycle():
+        return TenantEnforcementCheck().run(build_recovery_context(context_factory, ssh, docker, backend=backend, redis=redis))
+
+    assert [(await cycle()).passed for _ in range(2)] == [True, True]
+
+    async def bring_pod_back_up(**kwargs):
+        ssh.pod_running = True
+        return True
+
+    docker.recover_pod_after_stale_vloopback_mount.side_effect = bring_pod_back_up
+    assert (await cycle()).passed is True
+    assert "rental_state_unknown:pod-1" in redis.store
+
+    ssh.pod_running = False
+    docker.recover_pod_after_stale_vloopback_mount.side_effect = None
+    result = await cycle()
+    assert result.passed is False
+    assert result.event.reason_code == "POD_NOT_RUNNING"
+
+
+class _PerPodBackend(DummyBackendClient):
+    def __init__(self, answers: dict[str, bool | None]):
+        super().__init__()
+        self.answers = answers
+
+    async def get_pod_rental_active(self, pod_id: str):
+        self.called_with.append(pod_id)
+        if self.answers[pod_id] is None:
+            return None
+        return Mock(active=self.answers[pod_id], rental_closed_at=None, local_volume_path=None)
+
+
+def _held_and_closed_ctx(context_factory, *, order, ssh=None, gpu_processes=(), gpu_details=()):
+    pods = {
+        "u": RentedPod(pod_id="pod-u", container_name="tenant-u", rented_ports=[], gpu_count=2),
+        "c": RentedPod(pod_id="pod-c", container_name="tenant-c", rented_ports=[], gpu_count=6),
+    }
+    rented_data = RentedExecutorsResponse(
+        executors={
+            "executor-123": RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="22",
+                pods=[pods[key] for key in order],
+                owner_flag=False,
+            )
+        },
+        banned_guids=[],
+    )
+    ctx = _unknown_rental_ctx(context_factory, _PerPodBackend({"pod-u": None, "pod-c": False}), FakeRedis())
+    state = replace(ctx.state, rented_data=rented_data, gpu_processes=list(gpu_processes), gpu_details=list(gpu_details))
+    return ctx.model_copy(update={"state": state, **({"ssh": ssh} if ssh else {})})
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_gpu_work_of_the_closed_sibling_is_not_outside_the_tenant(context_factory):
+    # the GPU snapshot predates the renter ending pod-c, so its processes are still the renter's
+    ctx = _held_and_closed_ctx(
+        context_factory,
+        order="uc",
+        gpu_processes=[{"container_name": "tenant-c", "pid": 1234}],
+        gpu_details=[{"gpu_utilization": 100, "memory_utilization": 90}],
+    )
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.ALREADY_RENTED.reason
+
+
+@pytest.mark.asyncio
+async def test_tenant_enforcement_a_hung_sibling_read_reports_the_node_unreachable(context_factory, monkeypatch):
+    from neurons.validators.src.services.task.checks import rented_machine
+
+    class HangsOnPodU(DummySSHClient):
+        async def run(self, command: str):
+            if "tenant-u" in command:
+                await asyncio.sleep(3600)
+            return await super().run(command)
+
+    monkeypatch.setattr(rented_machine, "task_seconds_left", lambda _ctx: rented_machine.POD_READ_RESERVE_SECONDS)
+    ctx = _held_and_closed_ctx(context_factory, order="cu", ssh=HangsOnPodU(pod_running=False))
+
+    result = await asyncio.wait_for(TenantEnforcementCheck().run(ctx), 5)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.EXECUTOR_TRANSPORT_UNREACHABLE.reason
+
+
+# DAH-6141 exhaustive table, two pods: R running, A down with an active rental, N down with no backend
+# answer, C down with its rental confirmed closed. The rule: a closed pod never decides the node while any
+# sibling is not confirmed closed; N is held while its count is fresh and judged like A once it is spent.
+_SIBLING_STATES = "RANC"
+
+
+def _intended(order: str, spent: bool) -> tuple[str, list[str], list[str]]:
+    """(verdict, held pod ids, closed pod ids dropped from the rental)"""
+    if "A" in order or ("N" in order and spent):
+        return Msg.POD_NOT_RUNNING.reason, [], []
+    if set(order) == {"C"}:
+        return Msg.STALE_POD_NOT_RUNNING.reason, [], []
+    return (
+        Msg.ALREADY_RENTED.reason,
+        [f"pod-{i}" for i, state in enumerate(order) if state == "N"],
+        [f"pod-{i}" for i, state in enumerate(order) if state == "C"],
+    )
+
+
+class _StatesSSH(DummySSHClient):
+    def __init__(self, running: set[str]):
+        super().__init__(pod_running=False)
+        self.running = running
+
+    async def run(self, command: str):
+        result = await super().run(command)
+        if "docker ps" in command:
+            result.stdout = "container_id_123" if any(name in command for name in self.running) else ""
+        elif "{{.State.Running}}" in command:
+            result.stdout = f"{str(any(name in command for name in self.running)).lower()}\n"
+        return result
+
+
+@pytest.mark.parametrize("spent", [False, True])
+@pytest.mark.parametrize("order", [a + b for a in _SIBLING_STATES for b in _SIBLING_STATES])
+@pytest.mark.asyncio
+async def test_tenant_enforcement_every_two_pod_combination(context_factory, order, spent):
+    pods = [
+        RentedPod(pod_id=f"pod-{i}", container_name=f"tenant-{i}", rented_ports=[], gpu_count=i + 1)
+        for i in range(len(order))
+    ]
+    answers = {f"pod-{i}": {"R": True, "A": True, "N": None, "C": False}[state] for i, state in enumerate(order)}
+    redis = FakeRedis()
+    if spent:
+        for pod_id, answer in answers.items():
+            if answer is None:
+                await redis.set(f"{RENTAL_STATE_UNKNOWN_PREFIX}{pod_id}", str(RENTAL_STATE_UNKNOWN_MAX_HELD))
+    ctx = _unknown_rental_ctx(context_factory, _PerPodBackend(answers), redis)
+    rented_data = RentedExecutorsResponse(
+        executors={
+            "executor-123": RentedExecutor(
+                miner_hotkey="miner-hotkey", executor_ip_address="127.0.0.1", executor_ip_port="22",
+                pods=pods, owner_flag=False,
+            )
+        },
+        banned_guids=[],
+    )
+    running = {f"tenant-{i}" for i, state in enumerate(order) if state == "R"}
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, rented_data=rented_data), "ssh": _StatesSSH(running)})
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    verdict, held, closed = _intended(order, spent)
+    assert result.event.reason_code == verdict
+    if verdict == Msg.ALREADY_RENTED.reason:
+        extra = result.updates["default_extra"]
+        assert result.updates["rented"] is True
+        assert extra.get("pods_rental_state_unknown", []) == held
+        assert extra.get("pods_rental_closed", []) == closed
+        # the cycle keeps the batch-start rental view its split sizing and pay were built from
+        assert extra["rented_gpu_count"] == sum(pod.gpu_count for pod in pods)
+        assert "state" not in result.updates or result.updates["state"].rented_data == rented_data
+    if verdict == Msg.STALE_POD_NOT_RUNNING.reason:
+        assert result.updates["rented"] is False
 
 
 @pytest.mark.asyncio

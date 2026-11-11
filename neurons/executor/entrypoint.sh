@@ -6,7 +6,7 @@ set -eu
 # which pull by tag (DAH-3419); the runner is the one container every updater recreates. Only an updater
 # container of the runner's own compose project is replaced, never created: a stack without one (the dstack
 # TEE) is left alone. If the new updater cannot start, the old one is put back.
-UPDATER_IMAGE="daturaai/lium-watchtower:1.2.2"
+UPDATER_IMAGE="daturaai/lium-watchtower:1.2.3"
 ensure_updater() {
     # The runner's own container, by the ID in its mount paths (/var/lib/docker/containers/<id>/hostname), not
     # $HOSTNAME (an updater that recreates the runner copies the old hostname) and not a label lookup (that can
