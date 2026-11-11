@@ -4117,7 +4117,6 @@ class DockerService:
         quote_socket: bool = False,
         image_command_fallback: tuple[str, ...] = (),
         docker_data_volume_driver: str | None = None,
-        on_cpus_granted: Callable[[int], None] | None = None,
     ) -> ContainerRunSpec:
         # A sysbox pod's inner dockerd writes /var/lib/docker; without a mount there it lands in an
         # uncapped host volume (the image's VOLUME, or sysbox's own) that can fill the host disk. It
@@ -4220,9 +4219,6 @@ class DockerService:
                 else effective_storage_limit_gb
             ),
             pids_limit=self._rental_pids_limit(cpu_count, host_pid_max),
-            pids_limit_for=partial(self._rental_pids_limit, host_pid_max=host_pid_max),
-            min_cpu_count=payload.min_cpu_count,
-            on_cpus_granted=on_cpus_granted,
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
@@ -11043,7 +11039,6 @@ class DockerService:
                     )
                 # host_pid_max was read and validated fail-closed before any host side-effect above
                 # (review finding on PR #1531); here it only sizes the container's pids.max.
-                granted_cpu_counts: list[int] = []
                 run_spec = self._build_rental_container_run_spec(
                     payload=payload,
                     container_name=container_name,
@@ -11062,7 +11057,6 @@ class DockerService:
                     quote_socket=quote_socket,
                     image_command_fallback=image_command_fallback,
                     docker_data_volume_driver=local_volume_driver,
-                    on_cpus_granted=granted_cpu_counts.append,
                 )
 
                 logger.info(
@@ -11719,7 +11713,6 @@ class DockerService:
                     volume_encryption_status=volume_encryption_status,
                     volume_grows_to_order=bool(grow_labels),
                     command_id=payload.command_id,
-                    cpu_count=granted_cpu_counts[-1] if granted_cpu_counts else cpu_count,
                 )
                 # Last, so nothing can fail after it: the pod is usable, the reply goes now, and
                 # the steps after it take over this create's sessions and close them.

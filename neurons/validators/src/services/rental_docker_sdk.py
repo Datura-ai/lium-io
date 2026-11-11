@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import http.client
 import logging
-import re
 import socket as socket_module
 import tempfile
 import threading
@@ -11,7 +10,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import TypeVar
@@ -369,11 +368,6 @@ class ContainerRunSpec:
     # runs in the Docker thread between the create and the start call with the names of every container
     # on the host; may raise ContainerCreateRefused, and the created container is then left unstarted
     before_start: Callable[[list[str]], None] | None = field(default=None, repr=False, compare=False)
-    # the CPU-refusal retry: never below min_cpu_count, pids_limit_for re-sizes pids.max for the granted
-    # count, on_cpus_granted is told the count the container got
-    min_cpu_count: int | None = None
-    pids_limit_for: Callable[[int], int | None] | None = field(default=None, repr=False, compare=False)
-    on_cpus_granted: Callable[[int], None] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(slots=True)
@@ -1084,64 +1078,30 @@ class RentalDockerSdkClient:
             self._ensure_rental_network_sync(spec.network)
         created = None
         adopted_id = self._adopt_container_by_name_sync(spec) if adopt_existing else None
-        attempt = spec
-        while adopted_id is None:
+        if adopted_id is None:
             host_config = self._api_client.create_host_config(
-                **_build_host_config_kwargs(attempt)
+                **_build_host_config_kwargs(spec)
             )
-            if attempt.before_create is not None:
-                attempt.before_create()
+            if spec.before_create is not None:
+                spec.before_create()
             try:
                 created = self._api_client.create_container(
-                    image=attempt.image,
-                    command=list(attempt.command) or None,
+                    image=spec.image,
+                    command=list(spec.command) or None,
                     detach=True,
-                    ports=_container_ports(attempt.ports) or None,
-                    environment=attempt.environment or None,
-                    volumes=_container_volumes(attempt.volumes) or None,
-                    name=attempt.name,
-                    entrypoint=attempt.entrypoint or None,
+                    ports=_container_ports(spec.ports) or None,
+                    environment=spec.environment or None,
+                    volumes=_container_volumes(spec.volumes) or None,
+                    name=spec.name,
+                    entrypoint=spec.entrypoint or None,
                     host_config=host_config,
                     labels={
-                        **attempt.labels,
-                        **({RENTAL_CPU_COUNT_LABEL: str(attempt.cpu_count)} if attempt.cpu_count else {}),
+                        **spec.labels,
+                        **({RENTAL_CPU_COUNT_LABEL: str(spec.cpu_count)} if spec.cpu_count else {}),
                     }
                     or None,
                 )
-                if attempt is not spec and spec.on_cpus_granted is not None:
-                    spec.on_cpus_granted(attempt.cpu_count)
-                break
             except Exception as exc:
-                daemon_cpus = _daemon_cpu_count_from_refusal(exc)
-                # The daemon has at most 2 CPUs fewer than advertised (DAH-5991): rent with the daemon's
-                # count, label included. One retry; a larger gap or a second refusal fails like any other.
-                cpus = spec.cpu_count
-                if (
-                    attempt is spec
-                    and cpus
-                    and daemon_cpus
-                    and cpus - 2 <= daemon_cpus < cpus
-                    and daemon_cpus >= (spec.min_cpu_count or 0)
-                ):
-                    logger.warning(
-                        _m(
-                            "Docker refused the requested CPUs; retrying with the daemon's count",
-                            extra=get_extra_info(
-                                {
-                                    "container_name": spec.name,
-                                    "requested_cpus": spec.cpu_count,
-                                    "daemon_cpus": daemon_cpus,
-                                }
-                            ),
-                        )
-                    )
-                    attempt = replace(
-                        spec,
-                        cpu_count=daemon_cpus,
-                        pids_limit=spec.pids_limit_for(daemon_cpus) if spec.pids_limit_for else spec.pids_limit,
-                        before_create=None,
-                    )
-                    continue
                 # The first attempt's create timed out on the client but still runs in dockerd: it holds
                 # the name (409) while inspect answers 404 until it registers the container. Adopt it then.
                 if not adopt_existing or f'"/{spec.name}" is already in use' not in str(exc):
@@ -1191,15 +1151,6 @@ class RentalDockerSdkClient:
         config = info.get("Config") if isinstance(info, dict) else None
         existing_image = config.get("Image") if isinstance(config, dict) else None
         if existing_image == spec.image:
-            # a CPU-refusal retry whose reply was lost: the container's label holds the count it got (DAH-5991)
-            granted = (config.get("Labels") or {}).get(RENTAL_CPU_COUNT_LABEL)
-            if (
-                spec.on_cpus_granted is not None
-                and spec.cpu_count
-                and str(granted).isdigit()
-                and int(granted) != spec.cpu_count
-            ):
-                spec.on_cpus_granted(int(granted))
             existing_id = info.get("Id")
             return existing_id if isinstance(existing_id, str) else ""
         raise ContainerNameTakenOnRetry(
@@ -2110,12 +2061,6 @@ def _raise_pull_event_error(event) -> None:
 
 def _with_default_tag(driver: str) -> str:
     return driver if ":" in driver else f"{driver}:latest"
-
-
-def _daemon_cpu_count_from_refusal(exc: Exception) -> int | None:
-    """N from dockerd's `range of CPUs is from 0.01 to N.00, as there are only N CPUs available`."""
-    match = re.search(r"there are only (\d+) CPUs available", str(exc))
-    return int(match.group(1)) if match else None
 
 
 def _is_docker_not_found_error(exc: Exception) -> bool:
