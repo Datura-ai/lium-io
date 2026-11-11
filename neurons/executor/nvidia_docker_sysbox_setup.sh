@@ -251,25 +251,26 @@ daemon_feature_off() {
 
 # The sysbox .deb's config script exits 1 when dockerd runs, daemon.json lacks bip / default-address-pools
 # (matched line by line, so the file must be indented) and any container exists, before its postinst runs.
-# Write sysbox's own values first, so the provider's containers stay; same subnets and overlap rule as its
-# postinst (Docker is restarted in step 5).
+# Write the .deb's own subnets ($1 bip, $2 pool base) first, so the provider's containers stay; same overlap
+# rule as its postinst (Docker is restarted in step 5).
 seed_sysbox_network_config() {
     local file gw subnet
     file=$(host_path /etc/docker/daemon.json)
     docker ps -a --format '{{.ID}}' 2>/dev/null | grep -q . || return 0
+    [ -n "$1" ] && [ -n "$2" ] || { fail "Could not read sysbox's Docker subnets from its package."; return 1; }
     mkdir -p "$(dirname "$file")"
     [ -s "$file" ] || echo '{}' > "$file"
     if ! jq -e '(.bip // "") != "" and ((."default-address-pools" // []) | length) > 0' "$file" > /dev/null 2>&1; then
         gw=$(ip route | awk '/default/ {print $3; exit}')
-        for subnet in 172.20.0.1 172.25.0.0; do
+        for subnet in "${1%/*}" "${2%/*}"; do
             if ! ip route get "$subnet" | grep -q "via $gw"; then
                 fail "$subnet overlaps a local network: set \"bip\" and \"default-address-pools\" in /etc/docker/daemon.json yourself, then re-run."
                 return 1
             fi
         done
     fi
-    jq --indent 4 'if (.bip // "") == "" then .bip = "172.20.0.1/16" else . end
-        | if ((."default-address-pools" // []) | length) == 0 then ."default-address-pools" = [{"base": "172.25.0.0/16", "size": 24}] else . end' \
+    jq --indent 4 --arg bip "$1" --arg pool "$2" 'if (.bip // "") == "" then .bip = $bip else . end
+        | if ((."default-address-pools" // []) | length) == 0 then ."default-address-pools" = [{"base": $pool, "size": 24}] else . end' \
         "$file" > "$file.tmp" && mv "$file.tmp" "$file" || { fail "Failed to update $file (invalid JSON?)."; return 1; }
     ok "Docker network settings for sysbox are in daemon.json (applied at the Docker restart below)."
 }
@@ -1129,7 +1130,11 @@ if [ "$SKIP_INSTALL" = false ]; then
         actual=$(sha256sum "$SYSBOX_DEB" | cut -d' ' -f1)
         [ "$actual" = "$SYSBOX_SHA" ] || { fail "Checksum mismatch!"; exit 1; }
     fi
-    seed_sysbox_network_config || exit 1
+    SYSBOX_CTL=$(mktemp -d)
+    dpkg-deb -e "$SYSBOX_DEB" "$SYSBOX_CTL"
+    seed_sysbox_network_config "$(sed -n 's/^bip_subnet="\(.*\)"$/\1/p' "$SYSBOX_CTL/postinst")" \
+        "$(sed -n 's/^pool_subnet="\(.*\)"$/\1/p' "$SYSBOX_CTL/postinst")" || { rm -rf "$SYSBOX_CTL"; exit 1; }
+    rm -rf "$SYSBOX_CTL"
     apt_install install -y -qq "$SYSBOX_DEB" || exit 1
     ok "Sysbox v${SYSBOX_VERSION} installed."
 else

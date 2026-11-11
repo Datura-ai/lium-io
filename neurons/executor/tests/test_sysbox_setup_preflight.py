@@ -584,6 +584,10 @@ def test_an_explicit_port_in_use_is_still_a_fix(tmp_path):
 SYSBOX_NET_KEYS = re.compile(r'^ +"bip": "[0-9.]+.*"', re.M), re.compile(r'^ +"default-address-pools"', re.M)
 
 
+# TEST-NET stand-ins for the subnets setup reads from the .deb's postinst
+SEED = "seed_sysbox_network_config 192.0.2.1/24 198.51.100.0/24"
+
+
 def _daemon_json(tmp_path: Path) -> str:
     return (tmp_path / "root/etc/docker/daemon.json").read_text()
 
@@ -591,7 +595,7 @@ def _daemon_json(tmp_path: Path) -> str:
 def test_seed_writes_sysbox_network_settings_when_a_stopped_container_exists(tmp_path):
     # without them the .deb's config script exits 1 on a host with any container, before anything is installed
     result = run_check(
-        tmp_path, "seed_sysbox_network_config", env={"STUB_ALL_CONTAINERS": "aaa old_one"}, with_jq=True
+        tmp_path, SEED, env={"STUB_ALL_CONTAINERS": "aaa old_one"}, with_jq=True
     )
     assert result.rc == 0, result.output
     text = _daemon_json(tmp_path)
@@ -601,20 +605,20 @@ def test_seed_writes_sysbox_network_settings_when_a_stopped_container_exists(tmp
 def test_seed_keeps_the_provider_settings_and_indents_a_one_line_file(tmp_path):
     result = run_check(
         tmp_path,
-        "seed_sysbox_network_config",
+        SEED,
         env={"STUB_ALL_CONTAINERS": "aaa old_one"},
-        files={"etc/docker/daemon.json": '{"data-root":"/data/docker","bip":"192.0.2.1/24"}'},
+        files={"etc/docker/daemon.json": '{"data-root":"/data/docker","bip":"203.0.113.1/24"}'},
         with_jq=True,
     )
     assert result.rc == 0, result.output
     text = _daemon_json(tmp_path)
     assert all(key.search(text) for key in SYSBOX_NET_KEYS), text
-    assert '"bip": "192.0.2.1/24"' in text and '"data-root": "/data/docker"' in text
+    assert '"bip": "203.0.113.1/24"' in text and '"data-root": "/data/docker"' in text
 
 
 def test_seed_leaves_daemon_json_alone_without_containers(tmp_path):
     # sysbox configures and restarts Docker itself when no container exists
-    result = run_check(tmp_path, "seed_sysbox_network_config", with_jq=True)
+    result = run_check(tmp_path, SEED, with_jq=True)
     assert result.rc == 0, result.output
     assert not (tmp_path / "root/etc/docker/daemon.json").exists()
 
@@ -622,8 +626,8 @@ def test_seed_leaves_daemon_json_alone_without_containers(tmp_path):
 def test_seed_stops_when_the_sysbox_subnet_is_a_local_network(tmp_path):
     result = run_check(
         tmp_path,
-        "seed_sysbox_network_config",
-        env={"STUB_ALL_CONTAINERS": "aaa old_one", "STUB_IP_LOCAL": "172.25.0.0"},
+        SEED,
+        env={"STUB_ALL_CONTAINERS": "aaa old_one", "STUB_IP_LOCAL": "198.51.100.0"},
         files={"etc/docker/daemon.json": "{}"},
         with_jq=True,
     )
