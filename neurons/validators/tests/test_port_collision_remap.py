@@ -210,3 +210,56 @@ async def test_ssh_or_jupyter_port_is_never_dropped_when_no_pair_is_left(monkeyp
         )
 
     assert port_maps == [(docker_port, 40400, 40400), (40419, 40419, 40419)]
+
+
+@pytest.mark.asyncio
+async def test_dropping_a_tcp_port_keeps_a_udp_binding_on_the_same_host_port(monkeypatch):
+    monkeypatch.setattr("services.docker_service.asyncio.sleep", AsyncMock())
+    port_maps = [(22, 40400, 40400), (40418, 40418, 40418)]
+    client = _RunRecorder(_bind_refused(40418), None)
+    udp = PortBinding(container_port=40418, host_port=40418, protocol="udp")
+
+    await _whole_range_service()._run_rental_docker_create_with_port_retry(
+        docker_client=client,
+        ssh_client=RecordingSSHClient(stdout="LISTEN 0 128  0.0.0.0:40418     0.0.0.0:*\n"),
+        run_spec=ContainerRunSpec(
+            image="lium/pod:1",
+            name="pod_test",
+            ports=tuple(PortBinding(container_port=d, host_port=h) for d, h, _ in port_maps) + (udp,),
+        ),
+        container_name="pod_test",
+        default_extra={},
+        port_maps=port_maps,
+        spare_port_pairs=[],
+    )
+
+    assert port_maps == [(22, 40400, 40400)]
+    assert udp in client.specs[-1].ports
+
+
+@pytest.mark.asyncio
+async def test_a_port_is_not_dropped_while_free_pairs_remain_past_the_listening_candidates(monkeypatch):
+    monkeypatch.setattr("services.docker_service.asyncio.sleep", AsyncMock())
+    port_maps = [(22, 40400, 40400), (40418, 40418, 40418)]
+    taken = [40418, 40419, 40420, 40421]
+    spare = [PayloadPortMapping(internal_port=p, external_port=p) for p in (40419, 40420, 40421, 40422)]
+    client = _RunRecorder(_bind_refused(40418), None)
+
+    with pytest.raises(RentalPortCollisionError):
+        await _whole_range_service()._run_rental_docker_create_with_port_retry(
+            docker_client=client,
+            ssh_client=RecordingSSHClient(
+                stdout="".join(f"LISTEN 0 128  0.0.0.0:{p}     0.0.0.0:*\n" for p in taken)
+            ),
+            run_spec=ContainerRunSpec(
+                image="lium/pod:1",
+                name="pod_test",
+                ports=tuple(PortBinding(container_port=d, host_port=h) for d, h, _ in port_maps),
+            ),
+            container_name="pod_test",
+            default_extra={},
+            port_maps=port_maps,
+            spare_port_pairs=spare,
+        )
+
+    assert port_maps == [(22, 40400, 40400), (40418, 40418, 40418)]

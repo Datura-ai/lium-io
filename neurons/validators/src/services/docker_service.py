@@ -4040,7 +4040,7 @@ class DockerService:
                 (pair for pair in candidates if listening is None or pair.internal_port not in listening),
                 None,
             )
-            if chosen is None and docker_port not in _PORT_COLLISION_KEPT_DOCKER_PORTS:
+            if not candidates and docker_port not in _PORT_COLLISION_KEPT_DOCKER_PORTS:
                 # DAH-6186: the pod already holds the node's whole range, so nothing is left to move
                 # to; one fewer extra port beats failing the rental
                 dropped.add(old_internal)
@@ -4093,7 +4093,7 @@ class DockerService:
                 if binding.protocol == "tcp" and binding.host_port in moved
                 else binding
                 for binding in run_spec.ports
-                if binding.host_port not in dropped
+                if binding.protocol != "tcp" or binding.host_port not in dropped
             ),
         )
 
