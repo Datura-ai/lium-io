@@ -38,8 +38,8 @@ from services.task.models import JobResult
 logger = logging.getLogger(__name__)
 
 # The reviewed manifest digest of 0.0.2, the first tag that carries libfabric and `lium-efa-probe`; run by digest,
-# never by tag, since the probe gets host networking and the fabric devices. Empty until 0.0.2 is published: no probe.
-EFA_PROBE_IMAGE_DIGEST = ""
+# never by tag, since the probe gets host networking and the fabric devices.
+EFA_PROBE_IMAGE_DIGEST = "sha256:8e6bf7f085c70c2f16c1862fdb0ab67b2c218c09fe4a91b41be79b235f5491e2"
 EFA_PROBE_IMAGE_REPOSITORY = "daturaai/lium-rdma-probe"
 EFA_PROBE_ENTRYPOINT = "/usr/local/bin/lium-efa-probe"
 EFA_DRIVER = "efa"

@@ -221,3 +221,10 @@ async def test_a_cancel_while_the_server_starts_still_stops_it(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await task
     assert stopped == [True]
+
+
+def test_the_probe_runs_the_reviewed_0_0_2_image_by_digest(monkeypatch):
+    monkeypatch.undo()  # drop the autouse placeholder digest
+    assert efa_link_probe._probe_image() == (
+        "daturaai/lium-rdma-probe@sha256:8e6bf7f085c70c2f16c1862fdb0ab67b2c218c09fe4a91b41be79b235f5491e2"
+    )
