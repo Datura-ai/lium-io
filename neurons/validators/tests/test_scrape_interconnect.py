@@ -33,6 +33,8 @@ INTERCONNECT_HELPERS = {
     "GpuInterconnectObservation",
     "summarize_gpu_interconnect",
     "get_gpu_interconnect",
+    "RENTAL_P2P_MARKER",
+    "rental_p2p_output",
 }
 
 
@@ -486,3 +488,25 @@ def test_the_obfuscated_scrape_still_summarizes_the_topology() -> None:
     assert values.count(True) == 2  # nvlink and p2p
     assert 18 in values and 28 in values
     assert not any(key.startswith("ic_") for key in payload)
+
+
+def test_probe_lists_the_p2p_table_read_under_the_rental_runtime(scrape: dict[str, Any]) -> None:
+    # Arrange: the scrape container reads OK on every pair, the sysbox check container reads NS on one
+    in_rental = uniform(8, "OK")
+    in_rental[0][1] = in_rental[1][0] = "NS"
+    check_stdout = "+---- nvidia-smi ----+\nLIUM_RENTAL_P2P\n" + p2p_table(in_rental)
+    scrape["run_cmd"] = _stub_run_cmd(
+        {
+            "nvidia-smi topo -m": topo_table(HGX_H200),
+            "nvidia-smi topo -p2p r": p2p_table(uniform(8, "OK")),
+            "nvidia-smi nvlink -s": nvlink_status([18] * 8),
+        }
+    )
+
+    # Act
+    observation = scrape["get_gpu_interconnect"](scrape["rental_p2p_output"](check_stdout))
+
+    # Assert
+    assert observation.payload["ic_p2p"] is False
+    assert observation.payload["ic_p2p_ok_pairs"] == 27
+    assert scrape["rental_p2p_output"]("+---- nvidia-smi ----+\n") is None
