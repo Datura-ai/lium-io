@@ -639,6 +639,7 @@ def test_the_engy_cache_is_reported_as_free_disk_and_the_dolphin_cache_stays_use
         "hard_disk_used": 100 * 1024**2,
         "hard_disk_free": 3900 * 1024**2,
         "hard_disk_utilization": 2.5,
+        "hard_disk_filler_released": 1500 * 1024**2,
         "hard_disk_images": 0,
         "hard_disk_containers": 0,
         "hard_disk_volumes": 50 * 1024**2,

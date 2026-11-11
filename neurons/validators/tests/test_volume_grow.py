@@ -521,6 +521,40 @@ def test_a_read_after_the_pass_caps_what_the_listing_judges(context_factory):
     assert specs["split_disk"]["listable_gpu_count"] == 0  # under the 50 GB floor
 
 
+@pytest.mark.parametrize(
+    ("taken_gb", "free_now_gb", "credit_gb", "free_published_gb", "listable_gpus"),
+    [
+        # the grow's take was offset by a release, but the read after the pass is under the floor
+        (0, 40, 0, 40, 0),
+        # no read after the pass: nothing is known free beyond the filler credit
+        (0, 0, 0, 0, 0),
+        # the read after is raw; the filler cache the scrape counts free still is
+        (21, 49, 30, 79, 1),
+        # the read after is higher than the scrape's figure: the cap never raises it
+        (0, 120, 30, None, None),
+    ],
+)
+def test_the_read_after_the_pass_caps_on_the_scrapes_footing(
+    context_factory, taken_gb, free_now_gb, credit_gb, free_published_gb, listable_gpus
+):
+    from services.task.checks.disk_space import KB_PER_GB, specs_after_disk_taken
+
+    from tests.test_disk_space_check import _split_state
+
+    state = _split_state(100, gpu_count=2, gpu_splitting_min_count=1, pods=(1,))
+    state.specs["hard_disk"]["used"] = 0
+    state.specs["hard_disk"]["filler_released"] = credit_gb * KB_PER_GB
+    ctx = context_factory(state=state, rented=True)
+
+    specs = specs_after_disk_taken(ctx, taken_gb * GB, free_now_bytes=free_now_gb * GB)
+
+    if free_published_gb is None:
+        assert specs is None
+        return
+    assert specs["hard_disk"]["free"] == free_published_gb * KB_PER_GB
+    assert specs["split_disk"]["listable_gpu_count"] == listable_gpus
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("free_reads_gb", "reported_gb", "unreported_gb", "free_after_gb"),

@@ -78,11 +78,16 @@ def specs_after_disk_taken(ctx: Context, taken_bytes: int, free_now_bytes: int |
     specs = ctx.state.specs or {}
     hard_disk = specs.get("hard_disk")
     free_kb = _as_float(hard_disk.get("free")) if isinstance(hard_disk, dict) else math.nan
-    if taken_bytes == 0 or not math.isfinite(free_kb):
+    if (taken_bytes == 0 and free_now_bytes is None) or not math.isfinite(free_kb):
         return None
     taken_kb = taken_bytes / 1024
     if free_now_bytes is not None:
-        taken_kb = max(taken_kb, free_kb - free_now_bytes / 1024)
+        # the scrape counts the filler run volumes and the Engy cache as free (release_filler_cache); a raw read does not
+        credit_kb = _as_float(hard_disk.get("filler_released"))
+        cap_kb = free_now_bytes / 1024 + (credit_kb if math.isfinite(credit_kb) else 0)
+        taken_kb = max(taken_kb, free_kb - cap_kb)
+    if taken_kb == 0:
+        return None
     used_kb = _as_float(hard_disk.get("used"))
     updated = {**hard_disk, "free": max(free_kb - taken_kb, 0)}
     if math.isfinite(used_kb) and used_kb + free_kb > 0:

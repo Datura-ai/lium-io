@@ -947,9 +947,12 @@ def release_filler_cache(hard_disk):
     if not cache_kb or not hard_disk.get("hard_disk_total"):
         return
     used_kb = max(hard_disk["hard_disk_used"] - cache_kb, 0)
+    free_before = hard_disk["hard_disk_free"]
     hard_disk["hard_disk_free"] += hard_disk["hard_disk_used"] - used_kb
     hard_disk["hard_disk_used"] = used_kb
     hard_disk["hard_disk_utilization"] = used_kb / hard_disk["hard_disk_total"] * 100
+    # DAH-6073: what was moved, so a raw disk read later in the cycle can be put on the same footing
+    hard_disk["hard_disk_filler_released"] = hard_disk["hard_disk_free"] - free_before
 
 
 def get_container_cpu_percents(docker_path: str) -> tuple[float, dict[str, float], dict[str, tuple[int, int]]]:
