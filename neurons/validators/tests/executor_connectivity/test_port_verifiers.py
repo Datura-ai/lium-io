@@ -339,9 +339,9 @@ async def test_batch_caps_the_reprobe_when_only_the_published_sample_answers(moc
 
 
 @pytest.mark.asyncio
-async def test_batch_keeps_the_ports_that_answered_when_the_deadline_fires_after_them(mocker):
-    # DAH-5699: on a loaded host the starts use most of the 60 s; ports that answered were dropped when the
-    # deadline fired before the attempt returned, and the node ran attempt 2 or the slower tiers
+async def test_batch_runs_attempt_2_when_the_deadline_fires_below_min_ports(mocker):
+    # DAH-5699: ports that answered before the deadline are kept only when they meet min_ports;
+    # one of the 3 needed would fail the port check, so attempt 2 and the slower tiers still run
     from services.executor_connectivity.port_verifiers import BatchVerifier
 
     ports = [PortPair(9000 + i, 9000 + i) for i in range(10)]
@@ -354,10 +354,9 @@ async def test_batch_keeps_the_ports_that_answered_when_the_deadline_fires_after
     verifier, port_tester = _batch_verifier(mocker, one_then_past_the_deadline)
     mocker.patch.object(BatchVerifier, "ATTEMPT_TIMEOUT_SEC", 0.2)
 
-    result = await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
+    await verifier.verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4", min_ports=3)
 
-    assert result.successful == ports[:1]
-    assert port_tester.test_many.await_count == 2  # no attempt 2
+    assert verifier.runner.run.await_count == 2  # attempt 2 started its own container
 
 
 @pytest.mark.asyncio
