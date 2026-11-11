@@ -909,14 +909,15 @@ async def _another_listed_pod_running(
     ctx: Context, rented_pods: list[RentedPod], state_by_pod_id: dict[str, ContainerState], stale_pod_index: int
 ) -> bool:
     """True when a listed pod other than the stale one has its container running (a sibling rental closing must
-    not send a node with a live rental on as unrented). A pod that cannot be read in time is not."""
+    not send a node with a live rental on as unrented). A pod that cannot be read counts as running: the loop's
+    own read of it then reports the transport unreachable."""
     if any(state_by_pod_id.get(pod.pod_id) == ContainerState.RUNNING for pod in rented_pods[:stale_pod_index]):
         return True
     for other in rented_pods[stale_pod_index + 1 :]:
         try:
             other_state = await _read_other_pod(ctx, other)
         except (asyncssh.Error, OSError):
-            continue
+            return True
         if other_state.running:
             return True
     return False

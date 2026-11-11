@@ -392,9 +392,10 @@ async def test_a_hung_sibling_read_ends_in_time_instead_of_dropping_the_cycle(co
     _, ctx = await apply(ctx, PortCountCheck())
     tenant_result, _ = await asyncio.wait_for(apply(ctx, TenantEnforcementCheck()), 10)
 
-    # the unread sibling is not counted as live (no enforcement on a guess either): the cycle still ends with a result
-    assert tenant_result.passed is True
-    assert tenant_result.event.reason_code == TenantEnforcementMessages.STALE_POD_NOT_RUNNING.reason
+    # the unread sibling counts as live, so the stale pod is skipped and the sibling's own read reports the shell
+    assert tenant_result.passed is False
+    assert tenant_result.event.reason_code == TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason
+    assert tenant_result.updates.get("rented") is not False
 
 
 @pytest.mark.asyncio
