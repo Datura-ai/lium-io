@@ -26,7 +26,7 @@ from core.express_lane import (
     EXPRESS_PUBLISHED_EVENT,
     CycleInputs,
     ExpressLane,
-    _LeftToLane,
+    _LaneOwnedNodes,
     _Pending,
 )
 from fakeredis.aioredis import FakeRedis
@@ -201,7 +201,7 @@ async def test_the_wave_takes_a_node_whose_failed_first_pass_retry_is_due(rest_m
     cycle. The wave runs it; a retry not due yet, or a node never run, stays the lane's."""
     due, waiting, never_run = str(uuid4()), str(uuid4()), str(uuid4())
     rest_miner_service.miner_returns(due, waiting, never_run)
-    rest_miner_service.express_queued = _LeftToLane(
+    rest_miner_service.express_queued = _LaneOwnedNodes(
         {
             due: _queued(due, failed_runs=1, not_before=time.monotonic() - 1),
             waiting: _queued(waiting, failed_runs=1, not_before=time.monotonic() + 60),
