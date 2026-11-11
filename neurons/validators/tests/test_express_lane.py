@@ -765,6 +765,19 @@ async def test_a_recheck_request_is_queued_and_a_bad_id_is_ignored():
 
 
 @pytest.mark.asyncio
+async def test_a_recheck_asked_once_per_window_is_queued_only_the_first_time():
+    redis_service = _redis_service()
+    node = str(uuid4())
+
+    first = await redis_service.request_executor_recheck_once(node, 1800)
+    await redis_service.srem("express_lane:recheck_requests", node)  # the lane picked it
+    again = await redis_service.request_executor_recheck_once(node, 1800)
+
+    assert (first, again) == (True, False)
+    assert await redis_service.get_executor_recheck_requests() == set()
+
+
+@pytest.mark.asyncio
 async def test_a_recheck_request_landing_while_the_old_one_ends_survives():
     """Review 4512796524: a request made after the finishing run read the generation is not removed by it."""
     redis_service = _redis_service()
