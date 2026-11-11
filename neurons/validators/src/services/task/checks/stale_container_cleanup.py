@@ -114,23 +114,30 @@ class StaleContainerCleanupCheck:
         reserved: set[str] = set()  # labelled removals holding a GPU process: a lookup slot kept for each
         try:
             async with asyncio.timeout(STALE_CLEANUP_BUDGET_SECONDS):
-                return await self._run(ctx, queue, removed, confirmed, reserved)
+                result = await self._run(ctx, queue, removed, confirmed, reserved)
         except TimeoutError:
-            pass
-        # a container already removed is in the reaped queue and is reported next cycle; its GPU
-        # processes must not count, or GpuUsageCheck judges a container that is gone
-        with contextlib.suppress(TimeoutError):
-            async with asyncio.timeout(GPU_EXEMPTION_BUDGET_AFTER_TIMEOUT_SECONDS):
-                await _confirm_ended_workloads_of_reserved_removals(ctx, removed, confirmed, reserved)
-        # outside the lookup budget: slow lookups must not skip the claim for what is already confirmed
+            result = CheckResult(
+                passed=True,
+                event=render_message(
+                    Msg.TIMED_OUT,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={"budget_seconds": STALE_CLEANUP_BUDGET_SECONDS},
+                ),
+            )
+            # a container already removed is in the reaped queue and is reported next cycle; its GPU
+            # processes must not count, or GpuUsageCheck judges a container that is gone
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(GPU_EXEMPTION_BUDGET_AFTER_TIMEOUT_SECONDS):
+                    await _confirm_ended_workloads_of_reserved_removals(ctx, removed, confirmed, reserved)
+        # outside every budget: a claim a timeout cut would be written, then refused as already spent
         exempt = await queue.claim_gpu_exemptions(confirmed.intersection(removed))
-        event = render_message(
-            Msg.TIMED_OUT, ctx=ctx, check_id=self.check_id, what={"budget_seconds": STALE_CLEANUP_BUDGET_SECONDS}
-        )
         if not exempt:
-            return CheckResult(passed=True, event=event)
-        processes = [p for p in ctx.state.gpu_processes if p.get("container_name") not in exempt]
-        return CheckResult(passed=True, event=event, updates={"state": replace(ctx.state, gpu_processes=processes)})
+            return result
+        state = result.updates.get("state", ctx.state)
+        processes = [p for p in state.gpu_processes if p.get("container_name") not in exempt]
+        updates = {**result.updates, "state": replace(state, gpu_processes=processes)}
+        return result.model_copy(update={"updates": updates})
 
     async def _run(
         self,
@@ -196,6 +203,8 @@ class StaleContainerCleanupCheck:
                 reserve_removal=reserve_removal,
                 on_removed=removed.append,
             )
+            # run() claims the GPU exemption from `removed`
+            removed.extend(name for name in removed_names if name not in removed)
 
         # DAH-2805: killed weight downloads leave `*.incomplete` files nothing reads again — 741 GB
         # on one prod node. Swept from here because this check reaches every node, whatever image it
@@ -276,16 +285,10 @@ class StaleContainerCleanupCheck:
         reaped = await queue.states(limit=self._reaped_slots_in_spec(ctx))
         if not unremovable_names and not reaped and not removed_names:
             return CheckResult(passed=True, event=event)
-        # confirmed AND gone: a confirmed container that survived docker rm still runs its processes
-        exempt = await queue.claim_gpu_exemptions(confirmed.intersection(removed_names))
+        # the GPU exemption for confirmed AND gone removals is claimed in run(), outside the budget
         state = replace(
             ctx.state,
             orphaned_containers=unremovable_names,
-            gpu_processes=[
-                process
-                for process in ctx.state.gpu_processes
-                if process.get("container_name") not in exempt
-            ],
             pod_states=[*ctx.state.pod_states, *reaped],
         )
         return CheckResult(passed=True, event=event, updates={"state": state})

@@ -1552,6 +1552,45 @@ async def test_slow_lookups_after_a_timeout_still_claim_what_is_already_confirme
 
 
 @pytest.mark.asyncio
+async def test_a_claim_slower_than_the_budget_still_exempts_the_removed_container(monkeypatch):
+    """Rustam (lio#2075): a timeout during the claim left the exemption written, so the retry after it
+    refused it and GpuUsageCheck failed the node."""
+    from protocol.vc_protocol.compute_requests import PodRentalActiveResponse
+    from services.task.checks import stale_container_cleanup
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck, _ReapedPodStateQueue
+
+    monkeypatch.setattr(stale_container_cleanup, "STALE_CLEANUP_BUDGET_SECONDS", 0.05)
+    name = "pod_00000000-0000-4000-8000-0000000000a1"
+    backend = AsyncMock()
+    gone = {"pid": 1, "container_name": name}
+    foreign = {"pid": 2, "container_name": "my_miner"}
+    ctx = _cleanup_check_ctx([], [gone, foreign], backend=backend)
+    backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
+        active=False, rental_closed_at=CLOSED, executor_id=str(ctx.executor.uuid)
+    )
+    spent: set[str] = set()
+
+    async def claim_written_then_slow(self, names):
+        fresh = names - spent
+        spent.update(names)
+        await asyncio.sleep(0.1)  # the write landed; the answer comes after the budget
+        return fresh
+
+    monkeypatch.setattr(_ReapedPodStateQueue, "claim_gpu_exemptions", claim_written_then_slow)
+
+    async def remove(**kwargs):
+        assert kwargs["reserve_removal"](name)
+        kwargs["on_removed"](name)
+        return 1, [name], []
+
+    ctx.services.container_cleanup.cleanup.side_effect = remove
+
+    result = await asyncio.wait_for(StaleContainerCleanupCheck().run(ctx), timeout=5)
+
+    assert result.updates["state"].gpu_processes == [foreign]
+
+
+@pytest.mark.asyncio
 async def test_a_cache_sweep_cut_by_the_budget_does_not_run_again_next_cycle(monkeypatch):
     """Review 4491995523: an unstamped sweep repeats on a slow node every cycle and the reclaim after it never runs."""
     from services.task.checks import stale_container_cleanup
