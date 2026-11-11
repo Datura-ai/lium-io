@@ -72,13 +72,13 @@ docker compose create --no-recreate executor-runner
 
 At its next check (within 5 minutes) the updater finds that container, verifies the signed digest, pulls the current runner by it and starts that in its place; the created container never runs. If the runner then still shows `Created` and `docker logs executor-watchtower-1 --tail 5` says `Image is up to date`, the image on the host already is the signed one: `docker compose start executor-runner`.
 
-After about two minutes, make sure that both containers are up:
+After about two minutes (five after the `create` step), make sure that both containers are up:
 
 ```bash
-docker compose ps executor-runner watchtower
+docker compose ps -a executor-runner watchtower
 ```
 
-The output must list `executor-executor-runner-1` and `executor-watchtower-1` with the state `Up`. Then run the `/update-status` command from the section above: `runner.update_pending` must be `false`. The node earns again at the next validation cycle after the executor image matches the current release.
+The output must list `executor-executor-runner-1` and `executor-watchtower-1` with the state `Up`. A runner in the state `Created` is waiting for the updater's next check: look again after 5 minutes. Then run the `/update-status` command from the section above: `runner.update_pending` must be `false`. The node earns again at the next validation cycle after the executor image matches the current release.
 
 ## If `update_pending` stays `true` after the restart
 
