@@ -4448,8 +4448,7 @@ async def test_a_template_that_starts_its_own_sshd_is_checked_without_the_bootst
     monkeypatch.setattr(docker_service, "generate_portMappings", AsyncMock(return_value=([(22, 20001, 20001)], None)))
     bootstrap = AsyncMock(return_value=False)
     monkeypatch.setattr(docker_service, "install_open_ssh_server_and_start_ssh_service_with_rental_docker", bootstrap)
-    register_vulkan_icd = AsyncMock()
-    monkeypatch.setattr(docker_service, "register_vulkan_icd_with_rental_docker", register_vulkan_icd)
+    monkeypatch.setattr(docker_service, "register_vulkan_icd_with_rental_docker", AsyncMock())
     payload = _private_registry_create_payload().model_copy(update={"ships_sshd": True})
     executor_info = ExecutorSSHInfo(
         uuid=payload.executor_id,
@@ -4472,13 +4471,49 @@ async def test_a_template_that_starts_its_own_sshd_is_checked_without_the_bootst
     assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
     bootstrap.assert_not_awaited()
     pod_ssh_answers_on_create_path.assert_awaited_once()
-    # the Vulkan ICD registration runs after the reply, on the create's docker client
-    register_vulkan_icd.assert_not_awaited()
-    await _drain_create_steps_after_reply(payload.pod_id)
-    register_vulkan_icd.assert_awaited_once()
-    assert register_vulkan_icd.await_args.kwargs["container_name"] == f"pod_{payload.pod_id}"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ships_sshd", [True, False], ids=["cached_template", "bootstrap"])
+async def test_the_vulkan_icd_is_registered_before_the_create_replies(
+    docker_service, monkeypatch, pod_ssh_answers_on_create_path, ships_sshd
+):
+    """DAH-5847: a slow ICD registration still ends before ContainerCreated, on both create paths."""
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(docker_service, "generate_portMappings", AsyncMock(return_value=([(22, 20001, 20001)], None)))
+    registered = []
+
+    async def slow_registration(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        registered.append(True)
+        return True
+
+    # the cached template registers it on its own; the bootstrap script registers it inside the bootstrap
+    monkeypatch.setattr(docker_service, "register_vulkan_icd_with_rental_docker", slow_registration)
+    monkeypatch.setattr(
+        docker_service, "install_open_ssh_server_and_start_ssh_service_with_rental_docker", slow_registration
+    )
+    payload = _private_registry_create_payload().model_copy(update={"ships_sshd": ships_sshd})
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+    assert registered == [True]
 @pytest.mark.asyncio
 async def test_create_container_reports_set_environment_failure_step(
     docker_service,

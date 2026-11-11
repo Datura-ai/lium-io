@@ -9661,16 +9661,10 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         executor_info: ExecutorSSHInfo,
         log_extra: dict,
-        vulkan_icd_docker_client: RentalDockerSdkClient | None = None,
     ) -> None:
         # the create's steps a renter's first login does not need; closes the create's sessions
         try:
             async with connections:
-                if vulkan_icd_docker_client is not None:
-                    # best effort, logs its own duration and failure
-                    await self.register_vulkan_icd_with_rental_docker(
-                        vulkan_icd_docker_client, container_name=log_extra["container_name"], log_extra=log_extra
-                    )
                 started_ms = now_ms()
                 # logs its own failure as "Inspector collector start failed"
                 await self._run_inspector_collector_lifecycle(
@@ -9717,7 +9711,7 @@ class DockerService:
         # check after it) is gated on this, never on workload_kind alone.
         removes_every_filler = payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL and not beside_fillers
         warnings = []
-        vulkan_icd_after_reply = False
+        vulkan_icd: asyncio.Task | None = None
         local_volume = payload.local_volume
         external_volume_info = payload.external_volume_info
 
@@ -11416,8 +11410,12 @@ class DockerService:
                                 extra=get_extra_info({**default_extra, "container_name": container_name}),
                             )
                         )
-                        # after the reply: the renter's first login does not need it, and it took a median 1.4 s
-                        vulkan_icd_after_reply = True
+                        # runs beside the remaining steps (median 1.4 s); awaited before the reply
+                        vulkan_icd = asyncio.create_task(
+                            self.register_vulkan_icd_with_rental_docker(
+                                docker_client, container_name=container_name, log_extra=default_extra
+                            )
+                        )
                     elif not await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
                         docker_client=docker_client,
                         container_name=container_name,
@@ -11537,6 +11535,10 @@ class DockerService:
                         )
                         current_step = "finalize"
 
+                    if vulkan_icd is not None:
+                        # a Vulkan app started right after readiness must see the GPU
+                        await vulkan_icd
+
                     # DAH-2728: last call before the pod is cached as rented — a delete that landed
                     # during the run or the bootstrap above is holding ports it could not see.
                     await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
@@ -11560,6 +11562,8 @@ class DockerService:
                         )
                     )
                 except Exception as post_run_exc:
+                    if vulkan_icd is not None:
+                        await vulkan_icd  # best effort, never raises: let its exec end before cleanup removes the pod
                     container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
                         default_extra=default_extra,
@@ -11709,7 +11713,6 @@ class DockerService:
                         connections.pop_all(),
                         ssh_client=ssh_client,
                         executor_info=executor_info,
-                        vulkan_icd_docker_client=docker_client if vulkan_icd_after_reply else None,
                         log_extra={**default_extra, "container_name": container_name},
                     ),
                 )
