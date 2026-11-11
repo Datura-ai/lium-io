@@ -14,10 +14,14 @@ from protocol.vc_protocol.compute_requests import (
     FillerRunActiveResponse,
     PodRentalActiveResponse,
 )
-from protocol.vc_protocol.validator_requests import POD_STATES_MAX_ITEMS, ContainerState, PodContainerState
+from protocol.vc_protocol.validator_requests import (
+    POD_STATES_MAX_ITEMS,
+    ContainerState,
+    PodContainerState,
+)
 from services.container_cleanup import live_pod_ids, rented_list_unknown_reason
 from services.redis_service import CLEANUP_SEEN_EXECUTORS_SET
-from services.volume_grow import grow_short_volumes
+from services.volume_grow import GROW_PASS_MAX_SECONDS, grow_short_volumes
 
 from ...const import (
     unparked_name,
@@ -29,6 +33,7 @@ from ...const import (
 from ..messages import StaleContainerCleanupMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .task_time import task_seconds_left
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +119,9 @@ class StaleContainerCleanupCheck:
         queue = _ReapedPodStateQueue(ctx)
         first_sight = await self._first_sight(ctx)
         rented_list_unknown = rented_list_unknown_reason(ctx.state.rented_data)
-        confirmed: set[str] = set()  # names the backend's record shows were this node's ended Lium workload
+        confirmed: set[str] = (
+            set()
+        )  # names the backend's record shows were this node's ended Lium workload
         lookups = {"made": 0, "skipped": 0}
         # labelled removals holding a GPU process: each has a lookup slot kept for its exemption
         reserved: set[str] = set()
@@ -170,25 +177,33 @@ class StaleContainerCleanupCheck:
         now: float = time.monotonic()
         last_sweep_at: float = self._last_sweep_at.get(ctx.executor.uuid, float("-inf"))
         if now - last_sweep_at >= DOWNLOAD_TEMPORARY_SWEEP_INTERVAL_SECONDS:
-            swept_download_temporaries = await ctx.services.container_cleanup.sweep_abandoned_download_temporaries(
-                ssh_client=ctx.ssh,
-                executor_uuid=ctx.executor.uuid,
+            swept_download_temporaries = (
+                await ctx.services.container_cleanup.sweep_abandoned_download_temporaries(
+                    ssh_client=ctx.ssh,
+                    executor_uuid=ctx.executor.uuid,
+                )
             )
             # A volume_<uuid> whose container is gone and whose pod or filler run is over is never read
             # again; same hourly throttle, since each candidate costs backend lookups. Before the
             # reclaim below, which measures free disk itself: the renter's leftovers go first.
-            removed_orphan_volumes = await ctx.services.container_cleanup.remove_orphan_rental_volumes(
-                ssh_client=ctx.ssh,
-                rented_data=ctx.state.rented_data,
-                executor_uuid=ctx.executor.uuid,
-                is_orphan=lambda volume_id, age: _is_orphan_volume(ctx, volume_id, age),
+            removed_orphan_volumes = (
+                await ctx.services.container_cleanup.remove_orphan_rental_volumes(
+                    ssh_client=ctx.ssh,
+                    rented_data=ctx.state.rented_data,
+                    executor_uuid=ctx.executor.uuid,
+                    is_orphan=lambda volume_id, age: _is_orphan_volume(ctx, volume_id, age),
+                )
             )
             self._last_sweep_at[ctx.executor.uuid] = now
 
         # DAH-6073: a live pod granted less disk than it ordered (another renter's kept volume held the space) gets
         # the rest once the disk is free; only on a known rented list, so a retained or orphan volume is never grown
+        # bounded, and to half the task's time left at most, so the rental checks and state publication after it run
+        grow_budget = min(GROW_PASS_MAX_SECONDS, task_seconds_left(ctx) / 2)
         volume_sizes_gb = (
-            await grow_short_volumes(ctx.ssh, live_pod_ids(ctx.state.rented_data)) if rented_list_unknown is None else {}
+            await grow_short_volumes(ctx.ssh, live_pod_ids(ctx.state.rented_data), grow_budget)
+            if rented_list_unknown is None and grow_budget > 0
+            else {}
         )
 
         # DAH-2475: give the DPHN filler cache back when the node can no longer afford it. This is
@@ -196,9 +211,11 @@ class StaleContainerCleanupCheck:
         # disk, the backend would grant the cache again next cycle, and the node would re-download
         # ~37 GB forever), so a node that has fallen under the rental listing floor is rescued from
         # here, where the decision is made on real free space and outside any launch.
-        reclaimed_cache_volumes = await ctx.services.container_cleanup.reclaim_dphn_cache_when_disk_is_tight(
-            ssh_client=ctx.ssh,
-            executor_uuid=ctx.executor.uuid,
+        reclaimed_cache_volumes = (
+            await ctx.services.container_cleanup.reclaim_dphn_cache_when_disk_is_tight(
+                ssh_client=ctx.ssh,
+                executor_uuid=ctx.executor.uuid,
+            )
         )
 
         event = render_message(
@@ -224,7 +241,9 @@ class StaleContainerCleanupCheck:
             if name in confirmed or name not in reserved:
                 continue
             try:
-                if await _lium_workload_ended_here(ctx, name):  # its slot was reserved before removal
+                if await _lium_workload_ended_here(
+                    ctx, name
+                ):  # its slot was reserved before removal
                     confirmed.add(name)
             except Exception as e:  # noqa: BLE001 - unconfirmed: its processes still count
                 logger.warning(
@@ -303,7 +322,9 @@ class StaleContainerCleanupCheck:
         costs one cycle of delayed GC, removing a live tenant's container cannot be undone.
         """
         try:
-            return bool(await ctx.services.redis.sadd(CLEANUP_SEEN_EXECUTORS_SET, ctx.executor.uuid))
+            return bool(
+                await ctx.services.redis.sadd(CLEANUP_SEEN_EXECUTORS_SET, ctx.executor.uuid)
+            )
         except Exception as e:  # noqa: BLE001 - best-effort check, never fatal
             logger.warning(
                 _m(
@@ -455,14 +476,18 @@ class _ReapedPodStateQueue:
                 await self._redis.hset(self._exempt_key, unparked_name(name), now)
         except Exception as e:  # noqa: BLE001 - one-shot unverifiable: the processes still count
             logger.warning(
-                _m("GPU exemption record unavailable; removed containers' processes still count",
-                   extra={**self._extra, "error": str(e)})
+                _m(
+                    "GPU exemption record unavailable; removed containers' processes still count",
+                    extra={**self._extra, "error": str(e)},
+                )
             )
             return set()
         if names - fresh:
             logger.warning(
-                _m("Removed container was exempted before; its GPU processes count",
-                   extra={**self._extra, "container_names": sorted(names - fresh)})
+                _m(
+                    "Removed container was exempted before; its GPU processes count",
+                    extra={**self._extra, "container_names": sorted(names - fresh)},
+                )
             )
         return fresh
 
@@ -479,7 +504,12 @@ class _ReapedPodStateQueue:
             # the hash of a node that leaves the fleet is not read again; the TTL is what removes it
             await self._redis.expire(self._key, REAPED_POD_STATE_RETENTION_SECONDS)
         except Exception as e:
-            logger.warning(_m("reaped pod state not queued", extra={**self._extra, "pod_id": pod_id, "error": str(e)}))
+            logger.warning(
+                _m(
+                    "reaped pod state not queued",
+                    extra={**self._extra, "pod_id": pod_id, "error": str(e)},
+                )
+            )
 
     async def drop(self, container_name: str) -> None:
         pod_id = pod_id_of_container(container_name)
@@ -491,7 +521,12 @@ class _ReapedPodStateQueue:
         try:
             await self._redis.hdel(self._key, pod_id)
         except Exception as e:
-            logger.warning(_m("reaped pod state not dropped", extra={**self._extra, "pod_id": pod_id, "error": str(e)}))
+            logger.warning(
+                _m(
+                    "reaped pod state not dropped",
+                    extra={**self._extra, "pod_id": pod_id, "error": str(e)},
+                )
+            )
 
     async def states(self, limit: int | None) -> list[PodContainerState]:
         """Up to ``limit`` queued reaps for this cycle's message (all of them for None), and record
@@ -506,7 +541,9 @@ class _ReapedPodStateQueue:
             try:
                 stored = await self._redis.hgetall(self._key)
             except Exception as e:
-                logger.warning(_m("reaped pod state queue unreadable", extra={**self._extra, "error": str(e)}))
+                logger.warning(
+                    _m("reaped pod state queue unreadable", extra={**self._extra, "error": str(e)})
+                )
                 stored = {}
             cutoff = datetime.now(UTC).timestamp() - REAPED_POD_STATE_RETENTION_SECONDS
             expired: list[str] = []
@@ -526,7 +563,12 @@ class _ReapedPodStateQueue:
                 try:
                     await self._redis.hdel(self._key, *expired)
                 except Exception as e:
-                    logger.warning(_m("expired reaped pod states not dropped", extra={**self._extra, "error": str(e)}))
+                    logger.warning(
+                        _m(
+                            "expired reaped pod states not dropped",
+                            extra={**self._extra, "error": str(e)},
+                        )
+                    )
 
         in_send_order = sorted(queued.items(), key=lambda item: item[1].send_order())
         sending = in_send_order if limit is None else in_send_order[: max(0, limit)]
@@ -534,7 +576,12 @@ class _ReapedPodStateQueue:
             logger.info(
                 _m(
                     "reaped pod states over this cycle's share of the message; the rest go next cycle",
-                    extra={**self._extra, "queued": len(in_send_order), "sent": len(sending), "share": limit},
+                    extra={
+                        **self._extra,
+                        "queued": len(in_send_order),
+                        "sent": len(sending),
+                        "share": limit,
+                    },
                 )
             )
         sent_at = datetime.now(UTC)
@@ -546,8 +593,12 @@ class _ReapedPodStateQueue:
                     await self._redis.hset(self._key, pod_id, entry.encode())
             except Exception as e:
                 # the ids go out anyway; an unrecorded send only puts them first in line again
-                logger.warning(_m("reaped pod state send not recorded", extra={**self._extra, "error": str(e)}))
+                logger.warning(
+                    _m("reaped pod state send not recorded", extra={**self._extra, "error": str(e)})
+                )
         return [
-            PodContainerState(pod_id=pod_id, container_state=ContainerState.REAPED, observed_at=entry.observed_at)
+            PodContainerState(
+                pod_id=pod_id, container_state=ContainerState.REAPED, observed_at=entry.observed_at
+            )
             for pod_id, entry in sorted(sending, key=lambda item: item[1].observed_at)
         ]

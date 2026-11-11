@@ -5,6 +5,7 @@ disk, e.g. while another renter's stopped pod still keeps its volume. The volume
 create; each cleanup pass grows a live pod's volume towards it as far as free disk allows, online (xfs_growfs).
 """
 
+import asyncio
 import logging
 import shlex
 
@@ -17,6 +18,13 @@ logger = logging.getLogger(__name__)
 ORDER_LABEL = "io.lium.volume-order-gb"
 GROW_HEADROOM_BYTES = 10 * 1024**3  # resolve_volume_sizing's headroom: never fill the host's disk
 _GB = 1024**3
+GROW_PASS_MAX_SECONDS = (
+    180  # the whole pass; the caller also keeps it under the task's own deadline
+)
+SSH_CALL_TIMEOUT_SECONDS = 30  # each docker read
+RESIZE_TIMEOUT_SECONDS = (
+    120  # the host script, killed on the host past this (a stalled fallocate or xfs_growfs)
+)
 
 # Runs in the host's mount namespace: the volume's mount (under the plugin's propagated-mount) and backing file are
 # host paths. Grows only, by whole
@@ -30,6 +38,13 @@ case "$dev" in /dev/loop*) ;; *) echo not-loop; exit 0 ;; esac
 file=$(losetup -n -O BACK-FILE "$dev")
 # the plugin opens it from its own rootfs, where the host's / is /srv
 [ -e "$file" ] || file=${file#/srv}
+# one pass at a time per host (a node can sit in two pipelines at once): another pass's stale target must never
+# truncate this one's grow; bounded, a pass that cannot get it retries on the next
+lock=${VOLUME_GROW_LOCK:-/run/lium-volume-grow.lock}
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$lock"
+  flock -w "${VOLUME_GROW_LOCK_WAIT:-30}" 9 || { echo locked; exit 0; }
+fi
 cur=$(stat -c %s "$file")
 # the filesystem's size (xfs data section), or the file's when it cannot be read
 fs_size() { s=$(xfs_info "$mp" 2>/dev/null | awk '/^data/ {for (i = 1; i <= NF; i++) {
@@ -56,7 +71,7 @@ target=$((alloc + avail - headroom))
 if [ "$target" -gt "$order" ]; then target=$order; fi
 target=$((target / 4096 * 4096))
 if [ "$target" -le "$cur" ]; then echo no-room "$fs"; exit 0; fi
-if [ "$sparse" = true ]; then truncate -s "$target" "$file"; else fallocate -o "$cur" -l $((target - cur)) "$file"; fi
+if [ "$sparse" = true ]; then truncate -s ">$target" "$file"; else fallocate -o "$cur" -l $((target - cur)) "$file"; fi
 losetup -c "$dev"
 xfs_growfs "$mp" >/dev/null
 echo grown "$(fs_size "$target")"
@@ -71,34 +86,59 @@ def order_labels(ordered_gb: int | None, granted_gb: int | None) -> dict[str, st
 
 
 async def grow_short_volumes(
-    ssh_client: asyncssh.SSHClientConnection, live_pod_ids: set[str]
+    ssh_client: asyncssh.SSHClientConnection,
+    live_pod_ids: set[str],
+    budget_seconds: float = GROW_PASS_MAX_SECONDS,
 ) -> dict[str, int]:
     """Grow each live pod's short volume as far as free disk allows; pod id -> its volume's size in GB after the pass,
-    which the backend records. Never raises: a volume not grown this pass is tried again on the next."""
+    which the backend records. Never raises and never runs past `budget_seconds`: out of time, it returns the sizes
+    it has, and a volume not grown this pass is tried again on the next."""
+    sizes_gb: dict[str, int] = {}
     try:
-        listing = await ssh_client.run(f"/usr/bin/docker volume ls -q --filter label={ORDER_LABEL}")
+        async with asyncio.timeout(budget_seconds):
+            await _grow_short_volumes(ssh_client, live_pod_ids, sizes_gb)
+    except TimeoutError:
+        logger.warning(
+            _m(
+                "volume_grow_out_of_time",
+                extra={"budget_seconds": budget_seconds, "sized": len(sizes_gb)},
+            )
+        )
+    return sizes_gb
+
+
+async def _grow_short_volumes(
+    ssh_client: asyncssh.SSHClientConnection, live_pod_ids: set[str], sizes_gb: dict[str, int]
+) -> None:
+    try:
+        listing = await ssh_client.run(
+            f"/usr/bin/docker volume ls -q --filter label={ORDER_LABEL}",
+            timeout=SSH_CALL_TIMEOUT_SECONDS,
+        )
         names = [
             name
             for name in (listing.stdout or "").split()
             if listing.exit_status == 0 and name.removeprefix("volume_") in live_pod_ids
         ]
         if not names:
-            return {}
+            return
         fields = f'{{{{.Name}}}}|{{{{index .Labels "{ORDER_LABEL}"}}}}|{{{{.Driver}}}}|{{{{index .Options "sparse"}}}}'
         inspect = await ssh_client.run(
-            f"/usr/bin/docker volume inspect {' '.join(shlex.quote(n) for n in names)} --format {shlex.quote(fields)}"
+            f"/usr/bin/docker volume inspect {' '.join(shlex.quote(n) for n in names)} --format {shlex.quote(fields)}",
+            timeout=SSH_CALL_TIMEOUT_SECONDS,
         )
         if inspect.exit_status != 0:
             raise RuntimeError(f"docker volume inspect failed: {inspect.stderr}")
-        info = await ssh_client.run("/usr/bin/docker info -f '{{.DockerRootDir}}'")
+        info = await ssh_client.run(
+            "/usr/bin/docker info -f '{{.DockerRootDir}}'", timeout=SSH_CALL_TIMEOUT_SECONDS
+        )
         docker_root = (info.stdout or "").strip()
         if info.exit_status != 0 or not docker_root:
             raise RuntimeError(f"docker info failed: {info.stderr}")
     except Exception as exc:  # noqa: BLE001 - a later pass retries
         logger.warning(_m("volume_grow_list_failed", extra={"error": str(exc)}))
-        return {}
+        return
 
-    sizes_gb: dict[str, int] = {}
     plugin_ids: dict[str, str] = {}
     for line in (inspect.stdout or "").splitlines():
         name, order_gb, driver, sparse = (line.strip().split("|") + ["", "", "", ""])[:4]
@@ -107,7 +147,8 @@ async def grow_short_volumes(
         if driver not in plugin_ids:
             try:
                 plugin = await ssh_client.run(
-                    f"/usr/bin/docker plugin inspect -f '{{{{.Id}}}}' {shlex.quote(driver)}"
+                    f"/usr/bin/docker plugin inspect -f '{{{{.Id}}}}' {shlex.quote(driver)}",
+                    timeout=SSH_CALL_TIMEOUT_SECONDS,
                 )
                 plugin_ids[driver] = (
                     (plugin.stdout or "").strip() if plugin.exit_status == 0 else ""
@@ -126,13 +167,13 @@ async def grow_short_volumes(
         mountpoint = f"{docker_root}/plugins/{plugin_ids[driver]}/propagated-mount/{name}"
         args = [mountpoint, str(int(order_gb) * _GB), str(GROW_HEADROOM_BYTES), sparse or "false"]
         command = (
-            "nsenter -t 1 -m -- sh -c "
+            f"timeout -k 5 {RESIZE_TIMEOUT_SECONDS} nsenter -t 1 -m -- sh -c "
             + shlex.quote(GROW_SCRIPT)
             + " grow "
             + " ".join(map(shlex.quote, args))
         )
         try:
-            result = await ssh_client.run(command)
+            result = await ssh_client.run(command, timeout=RESIZE_TIMEOUT_SECONDS + 15)
         except Exception as exc:  # noqa: BLE001
             logger.warning(_m("volume_grow_failed", extra={"volume_name": name, "error": str(exc)}))
             continue
@@ -148,4 +189,3 @@ async def grow_short_volumes(
         size_bytes = outcome.split()[-1]
         if size_bytes.isdigit():
             sizes_gb[name.removeprefix("volume_")] = int(size_bytes) // _GB
-    return sizes_gb

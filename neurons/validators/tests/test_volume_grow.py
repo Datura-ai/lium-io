@@ -1,3 +1,5 @@
+import asyncio
+import fcntl
 import os
 import subprocess
 from types import SimpleNamespace
@@ -13,6 +15,12 @@ from services.volume_grow import (
 )
 
 GB = 1024**3
+
+
+@pytest.fixture(autouse=True)
+def _host_lock(tmp_path, monkeypatch):
+    # the host script's lock lives in /run on a node; here a writable path
+    monkeypatch.setenv("VOLUME_GROW_LOCK", str(tmp_path / "grow.lock"))
 
 
 def test_only_a_volume_granted_short_of_its_order_is_labelled():
@@ -44,7 +52,7 @@ async def test_only_a_live_pods_short_volume_is_grown_to_its_order():
 
     inspect, grow = ssh.run.await_args_list[1].args[0], ssh.run.await_args_list[4].args[0]
     assert (grown, "volume_retained" in inspect) == ({"live": 466}, False)
-    assert grow.startswith("nsenter -t 1 -m -- sh -c ")
+    assert grow.startswith("timeout -k 5 120 nsenter -t 1 -m -- sh -c ")
     # the host path of the mount, not the plugin-internal /mnt/<volume> docker reports
     assert grow.endswith(
         f" grow /var/lib/docker/plugins/abc/propagated-mount/volume_live {466 * GB} {GROW_HEADROOM_BYTES} false"
@@ -95,7 +103,7 @@ def _xfs(bin_dir, log, before, after):
             f"grown {150 * GB}",
             f"fallocate -o {110 * GB} -l {40 * GB} /data/volume_live",
         ),
-        (110, 5, 500, "true", f"grown {466 * GB}", f"truncate -s {466 * GB} /data/volume_live"),
+        (110, 5, 500, "true", f"grown {466 * GB}", f"truncate -s >{466 * GB} /data/volume_live"),
         # sparse, 5 GB written: its 105 GB unwritten is already in avail, so 115 free is no room, not 215
         (110, 5, 115, "true", f"no-room {110 * GB}", None),
         (110, 110, 5, "false", f"no-room {110 * GB}", None),
@@ -310,3 +318,55 @@ def test_the_reported_size_is_the_filesystems_not_the_files(tmp_path):
     )
 
     assert result.stdout.strip() == f"grown {110 * GB}"
+
+
+def test_a_pass_waits_for_another_on_the_same_host_and_never_shrinks_a_file(tmp_path):
+    # pass A holds the host lock (it targets 200 while pass B already grew to 400): B gives up, A's truncate
+    # can only extend
+    lock = tmp_path / "lock"
+    log = tmp_path / "calls"
+    _stub(tmp_path, "findmnt", "echo /dev/loop7")
+    _stub(tmp_path, "losetup", "echo /data/volume_live")
+    _stub(tmp_path, "stat", f"echo {110 * GB}")
+    _stub(tmp_path, "truncate", f'echo "truncate $*" >> {log}')
+    with open(lock, "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        result = subprocess.run(
+            ["sh", "-c", GROW_SCRIPT, "grow", "/mnt/x", str(466 * GB), str(10 * GB), "true"],
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "PATH": f"{tmp_path}:{os.environ['PATH']}",
+                "VOLUME_GROW_LOCK": str(lock),
+                "VOLUME_GROW_LOCK_WAIT": "0",
+            },
+        )
+
+    assert (result.stdout.strip(), log.exists()) == ("locked", False)
+    assert 'truncate -s ">$target"' in GROW_SCRIPT
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_resize_ends_the_pass_at_its_budget_with_the_sizes_it_has():
+    async def run(command, **kwargs):
+        if command.startswith("timeout "):
+            if "volume_stuck" in command:
+                await asyncio.Event().wait()
+            return _ran(f"grown {466 * GB}\n")
+        if "volume ls" in command:
+            return _ran("volume_done\nvolume_stuck\n")
+        if "volume inspect" in command:
+            return _ran("volume_done|466|vloopback:v3|\nvolume_stuck|466|vloopback:v3|\n")
+        if "docker info" in command:
+            return _ran("/var/lib/docker\n")
+        return _ran("abc\n")
+
+    ssh = SimpleNamespace(run=AsyncMock(side_effect=run))
+
+    grown = await asyncio.wait_for(
+        grow_short_volumes(ssh, {"done", "stuck"}, budget_seconds=0.2), 5
+    )
+
+    assert grown == {"done": 466}
+    assert all("timeout" in call.kwargs for call in ssh.run.await_args_list)
