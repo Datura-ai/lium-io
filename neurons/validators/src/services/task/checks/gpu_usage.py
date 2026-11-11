@@ -32,6 +32,7 @@ from services.redis_service import (
     FILLER_IMAGE_DIGESTS_PREFIX,
     FILLER_IMAGE_DIGESTS_TTL_SECONDS,
     STOPPED_BY_RECOVERY_PREFIX,
+    STOPPED_BY_RECOVERY_STOPPED,
 )
 from services.gpu_wedge import (
     COMPUTE_APPS_QUERY_COMMAND,
@@ -641,7 +642,9 @@ async def _parked_by_this_validator(ctx: Context, container_name: str) -> bool |
         if parked:
             return True
         try:
-            if await asyncio.wait_for(ctx.services.redis.get(f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}"), timeout=2):
+            mark = await asyncio.wait_for(ctx.services.redis.get(f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}"), timeout=2)
+            # only a completed park's mark: "renaming" is written before a rename that may never apply
+            if (mark.decode() if isinstance(mark, bytes) else mark) == STOPPED_BY_RECOVERY_STOPPED:
                 return True
         except Exception as exc:  # noqa: BLE001
             logger.warning("Recovery-stop mark unreadable for %s: %s", container_name, exc)

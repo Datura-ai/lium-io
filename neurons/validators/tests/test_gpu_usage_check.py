@@ -2011,15 +2011,22 @@ async def test_only_the_backends_own_filler_is_left_out_of_the_processes_to_stop
     assert "filler_*" not in remediation
 
 
+@pytest.mark.parametrize(
+    "mark, passed",
+    [("stopped", True), (b"stopped", True), ("renaming", False), (b"renaming", False)],
+    ids=["park-done", "park-done-bytes", "rename-in-progress", "rename-in-progress-bytes"],
+)
 @pytest.mark.parametrize("gpu_details", [BUSY_GPU, IDLE_GPU_HOLDING_VRAM], ids=["busy", "idle"])
 @pytest.mark.asyncio
 async def test_a_recovery_parked_name_is_ours_by_its_redis_mark_when_no_record_is_left(
-    context_factory, monkeypatch, gpu_details
+    context_factory, monkeypatch, gpu_details, mark, passed
 ):
-    # the park record was in a restarted process's memory only; the mark's background retry landed since
+    # the park record was in a restarted process's memory only; the mark's background retry landed since.
+    # Only a completed park's mark counts: "renaming" is written before the rename, which may never apply,
+    # so a <name>__stopped container next to it is not known to be the one this validator parked
     services = build_services(score_calculator=_Scores())
     monkeypatch.setattr(gpu_usage, "_recovery_parked", AsyncMock(return_value=False))
-    services.redis.store[f"{STOPPED_BY_RECOVERY_PREFIX}{TEARDOWN_POD_ID}"] = "stopped"
+    services.redis.store[f"{STOPPED_BY_RECOVERY_PREFIX}{TEARDOWN_POD_ID}"] = mark
     services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
         active=True, executor_id=default_executor().uuid
     )
@@ -2032,5 +2039,5 @@ async def test_a_recovery_parked_name_is_ours_by_its_redis_mark_when_no_record_i
 
     result = await GpuUsageCheck().run(ctx)
 
-    assert result.passed is True
-    services.backend.get_pod_rental_active.assert_awaited_once_with(TEARDOWN_POD_ID)
+    assert result.passed is passed
+    assert services.backend.get_pod_rental_active.await_count == (1 if passed else 0)
