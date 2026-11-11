@@ -488,12 +488,20 @@ def _port_collision_candidates(
 def _parse_listening_ports(output: str) -> set[int]:
     """Local ports out of `ss -Hltn` / `netstat -ltn` lines (`0.0.0.0:9101`, `[::]:22`, `*:8888`),
     plus the host ports of `docker ps` Ports lines (`0.0.0.0:10071->9101/tcp, :::10071->9101/tcp`, ranges too)."""
-    ports: set[int] = {
-        port
-        for first, last in _PUBLISHED_HOST_PORT_RE.findall(output)
-        for port in range(int(first), int(last or first) + 1)
-        if 0 < port <= 65535
-    }
+    # A difference array over 1..65535: any number of published ranges costs O(matches + 65535), never a set per range.
+    delta = [0] * 65537
+    for match in _PUBLISHED_HOST_PORT_RE.finditer(output):
+        first, last = int(match[1]), int(match[2] or match[1])
+        first, last = max(first, 1), min(last, 65535)
+        if first <= last:
+            delta[first] += 1
+            delta[last + 1] -= 1
+    ports: set[int] = set()
+    covered = 0
+    for port in range(1, 65536):
+        covered += delta[port]
+        if covered:
+            ports.add(port)
     for line in output.splitlines():
         for column in line.split():
             if column.endswith("*") or ":" not in column:
