@@ -477,7 +477,7 @@ async def _run_encrypted_restic_backup(monkeypatch, mountinfo: str):
     start.assert_awaited_once()
     key, record = miner.redis_service.sadd.await_args.args
     assert key == "started_storage_helpers:" + _executor_info().uuid
-    assert record.startswith("lium-storage-11111111-111|")
+    assert record.startswith("11111111-1111-4111-8111-111111111111|")
     return docker_service.setup_encrypted_local_volume
 
 

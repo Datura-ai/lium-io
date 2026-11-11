@@ -13,17 +13,24 @@ from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     RentedPod,
 )
 from neurons.validators.src.services.task.checks.provider_side_load import (
+    ContainerRow,
     ProviderSideLoad,
     ProviderSideLoadCheck,
     compute_provider_side_load,
+    provider_cores_outside_lium,
 )
 from neurons.validators.src.services.task.pipeline import ContextState
 from neurons.validators.src.services.task.messages import ProviderSideLoadMessages as Msg
 
 from neurons.validators.src.services.storage_operations import (
+    StorageHelperRecord,
     forget_storage_helper,
     note_started_storage_helper,
-    started_storage_helpers,
+    operation_states_command,
+    parse_operation_states,
+    settle_excused_storage_helper_keys,
+    storage_helper_key,
+    storage_helper_name,
 )
 from tests.helpers import build_state
 
@@ -750,21 +757,39 @@ async def test_under_the_cap_the_honest_stack_is_still_excused(context_factory):
     assert result.event.what_we_saw["executor_stack_cores"] == 1.5
 
 
-BACKUP_HELPER = "lium-storage-01234567-89a"  # storage_helper_name(UUID("01234567-89ab-..."))
+OPERATION = UUID("01234567-89ab-4def-8123-456789abcdef")
+BACKUP_HELPER = storage_helper_name(OPERATION)  # "lium-storage-01234567-89a"
+POD = ("c1", "pod_renter", 158.0)
 
 
-def _helper_runner(name: str, helper_percent: float = 700.0, host_cores: float = 10.56):
-    return confirming_runner(
-        host_cores, 32, [("c1", "pod_renter", 158.0), ("c2", name, helper_percent)]
-    )
+def _on_node(runner, states: dict[UUID, str] | None):
+    """The node also answers the operations' runner states (None: the read fails)."""
+    second_look = runner.run.return_value
+
+    def run(command, **_):
+        if "storage-operations" not in command:
+            return second_look
+        if states is None:
+            return MagicMock(success=False, stdout="")
+        return MagicMock(success=True, stdout="".join(f"{op} {st}\n" for op, st in states.items()))
+
+    runner.run = AsyncMock(side_effect=run)
+    return runner
 
 
-def _with_recorded_helpers(ctx, *names: str, records: set[str] | None = None):
-    """The helpers this validator recorded when it started storage operations here (DAH-6148).
+def _helper_runner(
+    name: str, helper_percent: float = 700.0, host_cores: float = 10.56, state: str = "RUNNING"
+):
+    runner = confirming_runner(host_cores, 32, [POD, ("c2", name, helper_percent)])
+    return _on_node(runner, {OPERATION: state})
+
+
+def _with_recorded_helpers(ctx, *operations: UUID, records: set[str] | None = None, age: int = 0):
+    """The operations this validator recorded when it started them here (DAH-6148).
 
     `records` shares one store across cycles; it is returned so a test can read it back."""
     store = records if records is not None else set()
-    store.update(f"{name}|{int(time.time())}|" for name in names)
+    store.update(f"{op}|{int(time.time()) - age}" for op in operations)
     redis = ctx.services.redis
     redis.smembers = AsyncMock(side_effect=lambda key: {record.encode() for record in store})
     redis.srem = AsyncMock(side_effect=lambda key, record: store.discard(record))
@@ -772,18 +797,21 @@ def _with_recorded_helpers(ctx, *names: str, records: set[str] | None = None):
     return ctx
 
 
+async def _provider_cores(ctx) -> float:
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+    return result.event.what_we_saw["provider_cpu_cores"]
+
+
 @pytest.mark.asyncio
 async def test_a_backup_helper_this_validator_started_is_lium_load(context_factory):
     # DAH-6148: the hourly backup's restic helper starts after the scrape; its cores are Lium's
     ctx = _with_recorded_helpers(
         context_factory(state=_rented_state(SN13_SPECS), runner=_helper_runner(BACKUP_HELPER)),
-        BACKUP_HELPER,
+        OPERATION,
     )
 
-    with provider_load_gate(enforce=True):
-        result = await ProviderSideLoadCheck().run(ctx)
-
-    assert result.event.what_we_saw["provider_cpu_cores"] == 1.9  # below the floor; was 8.9
+    assert await _provider_cores(ctx) == 1.9  # below the floor; was 8.9
 
 
 @pytest.mark.parametrize(
@@ -796,72 +824,110 @@ async def test_a_lium_storage_name_the_validator_did_not_start_is_the_providers(
     # a name is forgeable: only the exact helpers this validator recorded are excused
     ctx = _with_recorded_helpers(
         context_factory(state=_rented_state(SN13_SPECS), runner=_helper_runner(name)),
-        BACKUP_HELPER,
+        OPERATION,
     )
 
-    with provider_load_gate(enforce=True):
-        result = await ProviderSideLoadCheck().run(ctx)
-
-    assert result.event.what_we_saw["provider_cpu_cores"] == 8.9
+    assert await _provider_cores(ctx) == 8.9
 
 
-async def _cycle(context_factory, store: set[str], rows) -> float:
+@pytest.mark.parametrize(
+    "state, age",
+    [("STATUS:0", 60), ("EXITED", 60), ("INVALID", 60), ("STARTING", 600)],
+    ids=["finished", "runner_died", "bad_pid", "never_started"],
+)
+@pytest.mark.asyncio
+async def test_a_helper_name_after_its_operation_ended_is_the_providers(
+    context_factory, state, age
+):
+    # a container started under the recorded name once the operation is over gets no excuse,
+    # and the record goes
+    store: set[str] = set()
+    ctx = _with_recorded_helpers(
+        context_factory(
+            state=_rented_state(SN13_SPECS), runner=_helper_runner(BACKUP_HELPER, state=state)
+        ),
+        OPERATION,
+        records=store,
+        age=age,
+    )
+
+    assert await _provider_cores(ctx) == 8.9
+    assert store == set()
+
+
+@pytest.mark.asyncio
+async def test_a_helper_about_to_start_is_excused(context_factory):
+    # the record is written before the launch: no runner pid yet is not an ended operation
+    ctx = _with_recorded_helpers(
+        context_factory(
+            state=_rented_state(SN13_SPECS), runner=_helper_runner(BACKUP_HELPER, state="STARTING")
+        ),
+        OPERATION,
+    )
+
+    assert await _provider_cores(ctx) == 1.9
+
+
+async def _cycle(context_factory, store: set[str], rows, state="RUNNING") -> float:
     """One validation cycle whose scrape and second look both list `rows` (id, name, percent)."""
     containers = [
         {"container_id": cid, "name": name, "cpu_percent": pct} for cid, name, pct in rows
     ]
     specs = {**SN13_SPECS, "docker": {**SN13_SPECS["docker"], "containers": containers}}
+    runner = _on_node(confirming_runner(10.56, 32, rows), {OPERATION: state})
     ctx = _with_recorded_helpers(
-        context_factory(state=_rented_state(specs), runner=confirming_runner(10.56, 32, rows)),
-        records=store,
+        context_factory(state=_rented_state(specs), runner=runner), records=store
     )
-    with provider_load_gate(enforce=True):
-        result = await ProviderSideLoadCheck().run(ctx)
-    return result.event.what_we_saw["provider_cpu_cores"]
+    return await _provider_cores(ctx)
 
 
-@pytest.mark.parametrize("gap_cycle", [True, False], ids=["after_it_ended", "swapped_in_place"])
 @pytest.mark.asyncio
-async def test_a_helper_name_reused_after_the_backup_ended_is_the_providers(
-    context_factory, gap_cycle
-):
-    # the excuse follows the container first seen under the recorded name, not the name
-    store = {f"{BACKUP_HELPER}|{int(time.time())}|"}
-    pod = ("c1", "pod_renter", 158.0)
+async def test_a_rerun_helper_of_an_open_operation_stays_lium_load(context_factory):
+    # restic renews its credentials or retries an upload in a new container under the same name
+    store = {f"{OPERATION}|{int(time.time()) - 3700}"}
 
-    assert await _cycle(context_factory, store, [pod, ("c2", BACKUP_HELPER, 700.0)]) == 1.9
-    if gap_cycle:  # the helper is gone: its operation ended and the record with it
-        await _cycle(context_factory, store, [pod])
-        assert store == set()
-    reused = await _cycle(context_factory, store, [pod, ("c3", BACKUP_HELPER, 700.0)])
+    first = await _cycle(context_factory, store, [POD, ("c2", BACKUP_HELPER, 700.0)])
+    await _cycle(context_factory, store, [POD])  # between the two helpers
+    rerun = await _cycle(context_factory, store, [POD, ("c3", BACKUP_HELPER, 700.0)])
 
-    assert reused == 8.9
-    assert store == set()
+    assert (first, rerun) == (1.9, 1.9)
+    assert len(store) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_helper_renamed_away_from_its_name_is_the_providers(context_factory):
+    # the excuse is the exact helper name: a rename keeps the id but loses it, uncapped or not
+    store = {f"{OPERATION}|{int(time.time())}"}
+
+    assert await _cycle(context_factory, store, [POD, ("c2", BACKUP_HELPER, 700.0)]) == 1.9
+    assert await _cycle(context_factory, store, [POD, ("c2", "miner", 700.0)]) == 8.9
+
+
+@pytest.mark.asyncio
+async def test_unreadable_operation_states_excuse_nothing_and_keep_the_record(context_factory):
+    store: set[str] = set()
+    runner = _on_node(confirming_runner(10.56, 32, [POD, ("c2", BACKUP_HELPER, 700.0)]), None)
+    ctx = _with_recorded_helpers(
+        context_factory(state=_rented_state(SN13_SPECS), runner=runner), OPERATION, records=store
+    )
+
+    assert await _provider_cores(ctx) == 8.9
+    assert len(store) == 1
 
 
 @pytest.mark.asyncio
 async def test_a_record_older_than_any_backup_is_dropped(context_factory):
     # the backend fails a backup still open after 4 h, so no helper outlives that
-    store = {f"{BACKUP_HELPER}|{int(time.time()) - 5 * 3600}|"}
-
-    cores = await _cycle(
-        context_factory, store, [("c1", "pod_renter", 158.0), ("c2", BACKUP_HELPER, 700.0)]
+    store: set[str] = set()
+    ctx = _with_recorded_helpers(
+        context_factory(state=_rented_state(SN13_SPECS), runner=_helper_runner(BACKUP_HELPER)),
+        OPERATION,
+        records=store,
+        age=5 * 3600,
     )
 
-    assert cores == 8.9
+    assert await _provider_cores(ctx) == 8.9
     assert store == set()
-
-
-@pytest.mark.asyncio
-async def test_a_scrape_without_containers_changes_no_record():
-    # an unreadable container list is not "the helper is gone"
-    record = f"{BACKUP_HELPER}|{int(time.time())}|c2"
-    store = {record}
-
-    keys = await started_storage_helpers(_set_redis(store), "executor-1", None)
-
-    assert keys == {"c2"}
-    assert store == {record}
 
 
 @pytest.mark.asyncio
@@ -869,10 +935,7 @@ async def test_with_redis_unreadable_no_helper_is_excused(context_factory):
     ctx = context_factory(state=_rented_state(SN13_SPECS), runner=_helper_runner(BACKUP_HELPER))
     ctx.services.redis.smembers = AsyncMock(side_effect=ConnectionError("Redis down"))
 
-    with provider_load_gate(enforce=True):
-        result = await ProviderSideLoadCheck().run(ctx)
-
-    assert result.event.what_we_saw["provider_cpu_cores"] == 8.9
+    assert await _provider_cores(ctx) == 8.9
 
 
 @pytest.mark.asyncio
@@ -882,13 +945,17 @@ async def test_backup_helpers_excuse_no_more_than_restics_own_cores(context_fact
             state=_rented_state(SN13_SPECS),
             runner=_helper_runner(BACKUP_HELPER, helper_percent=1000.0, host_cores=14.0),
         ),
-        BACKUP_HELPER,
+        OPERATION,
     )
 
-    with provider_load_gate(enforce=True):
-        result = await ProviderSideLoadCheck().run(ctx)
+    assert await _provider_cores(ctx) == 4.4
 
-    assert result.event.what_we_saw["provider_cpu_cores"] == 4.4
+
+def test_a_helper_key_never_matches_a_container_by_id():
+    # the helper tier is always capped: its key is no container's name or id
+    rows = [ContainerRow(container_id="c2", name="renamed", cpu_percent=700.0)]
+
+    assert provider_cores_outside_lium(10.0, rows, {storage_helper_key(OPERATION)}) == 10.0
 
 
 def _set_redis(store: set[str]) -> MagicMock:
@@ -904,11 +971,28 @@ def _set_redis(store: set[str]) -> MagicMock:
 async def test_a_started_operation_records_its_helper_until_it_is_forgotten():
     store: set[str] = set()
     redis = _set_redis(store)
-    operation_id = UUID("01234567-89ab-4def-8123-456789abcdef")
 
-    await note_started_storage_helper(redis, "executor-1", operation_id)
+    async def running(ops):
+        return {op: "RUNNING" for op in ops}
 
-    assert await started_storage_helpers(redis, "executor-1", None) == {BACKUP_HELPER}
+    await note_started_storage_helper(redis, "executor-1", OPERATION)
+
+    assert await settle_excused_storage_helper_keys(redis, "executor-1", running) == {
+        storage_helper_key(OPERATION)
+    }
     redis.expire.assert_awaited_once()
-    await forget_storage_helper(redis, "executor-1", operation_id)
-    assert await started_storage_helpers(redis, "executor-1", None) == set()
+    await forget_storage_helper(redis, "executor-1", OPERATION)
+    assert await settle_excused_storage_helper_keys(redis, "executor-1", running) == set()
+
+
+def test_operation_states_round_trip_through_the_node_command():
+    command = operation_states_command([str(OPERATION)])
+
+    assert f"/root/app/storage-operations/{OPERATION}.pid" in command
+    assert parse_operation_states(f"{OPERATION} STATUS:0\n\n{OPERATION}x\n") == {
+        str(OPERATION): "STATUS:0"
+    }
+    assert StorageHelperRecord.parse(StorageHelperRecord(str(OPERATION), 5).format()) == (
+        StorageHelperRecord(str(OPERATION), 5)
+    )
+    assert StorageHelperRecord.parse("lium-storage-01234567-89a|5|c2") is None

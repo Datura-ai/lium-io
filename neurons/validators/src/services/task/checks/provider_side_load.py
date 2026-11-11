@@ -10,7 +10,12 @@ from typing import Any
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.const import LIUM_INFRA_CONTAINER_PREFIXES
-from services.storage_operations import STORAGE_HELPER_PREFIX, started_storage_helpers
+from services.storage_operations import (
+    STORAGE_HELPER_KEY_MARK,
+    operation_states_command,
+    parse_operation_states,
+    settle_excused_storage_helper_keys,
+)
 
 from .cpu_truth import advertised_cpu_count
 from .custom_build_orphan_sweep import BUILD_DIND_PREFIX
@@ -42,10 +47,11 @@ CLAIMED_EXCUSE_CORES = PROVIDER_SIDE_CPU_CORES_LIMIT
 # DAH-6148: a Lium backup runs restic in a `lium-storage-<operation>` helper container (executor
 # storage/restic.py). It is on no rental list and usually starts between the scrape and the second
 # look, so its cores landed on the provider. Only the helpers this validator started on the node
-# are excused (storage_operations.started_storage_helpers: by name until first seen, then by that
-# container's id), and only up to restic's GOMAXPROCS: a container that merely wears the prefix,
-# or takes a helper's name after it ended, stays the provider's.
+# are excused (storage_operations.settle_excused_storage_helper_keys: by exact name while the node
+# shows the operation's runner alive), and only up to restic's GOMAXPROCS: a container that merely
+# wears the prefix, or takes a helper's name after its operation ended, stays the provider's.
 STORAGE_HELPER_EXCUSE_CORES = 8.0
+STORAGE_OPERATION_STATES_TIMEOUT_SECONDS = 20
 
 # A second look before any money is withheld, the same rule the foreign-GPU twin follows with
 # the live card. The scrape's window is about two seconds, and Lium's own housekeeping
@@ -123,12 +129,12 @@ def provider_cores_outside_lium(
     Matching by both id and name, because the scrape reports full ids and `docker stats`
     reports the first 12 characters.
     """
-    lium_short_ids: set[str] = {key[:12] for key in lium_container_keys}
+    lium_short_ids: set[str] = {
+        key[:12] for key in lium_container_keys if not key.startswith(STORAGE_HELPER_KEY_MARK)
+    }
     lium_percent = helper_percent = 0.0
     for row in rows:
-        if row.name.startswith(STORAGE_HELPER_PREFIX) and (
-            row.name in lium_container_keys or row.container_id[:12] in lium_short_ids
-        ):
+        if f"{STORAGE_HELPER_KEY_MARK}{row.name}" in lium_container_keys:
             # a helper this validator started: excused up to the cap below
             helper_percent += row.measured_cpu_percent
         elif row.name in lium_container_keys or row.container_id[:12] in lium_short_ids:
@@ -266,13 +272,9 @@ async def lium_containers(ctx: Context) -> set[str] | None:
         containers.update(f"{BUILD_DIND_PREFIX}{pod.pod_id}" for pod in rented_executor.pods)
     specs = ctx.state.specs or {}
     containers.update(await late_started_containers_the_backend_owns(ctx, containers))
-    rows = docker_containers(specs)
-    running_helpers = {
-        row.name: row.container_id for row in rows if row.name.startswith(STORAGE_HELPER_PREFIX)
-    }
     containers.update(
-        await started_storage_helpers(
-            ctx.services.redis, ctx.executor.uuid, running_helpers if rows else None
+        await settle_excused_storage_helper_keys(
+            ctx.services.redis, ctx.executor.uuid, lambda ops: storage_operation_states(ctx, ops)
         )
     )
     stack_ids: set[str] = executor_stack_container_ids(specs)
@@ -283,6 +285,18 @@ async def lium_containers(ctx: Context) -> set[str] | None:
     containers.update(infra_container_names(specs, stack_ids))
     containers.discard("")
     return containers
+
+
+async def storage_operation_states(ctx: Context, operation_ids: list[str]) -> dict[str, str] | None:
+    """The runner state of each operation on the node; None when it cannot be read."""
+    if ctx.runner is None:
+        return None
+    result = await ctx.runner.run(
+        operation_states_command(operation_ids),
+        timeout=STORAGE_OPERATION_STATES_TIMEOUT_SECONDS,
+        retryable=False,
+    )
+    return parse_operation_states(result.stdout) if result.success else None
 
 
 def executor_stack_container_ids(specs: dict[str, Any]) -> set[str]:

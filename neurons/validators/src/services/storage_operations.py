@@ -5,13 +5,17 @@ import json
 import logging
 import shlex
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 import aiohttp
 import asyncssh
+
+if TYPE_CHECKING:
+    from services.redis_service import RedisService
 
 logger = logging.getLogger(__name__)
 
@@ -20,16 +24,20 @@ REMOTE_RUNNER_PATH = "/root/app/src/storage_runner.py"
 REMOTE_SECRETS_DIRECTORY = PurePosixPath("/root/app/storage-secrets")
 
 # DAH-6148: an operation runs restic in a `lium-storage-<operation id[:12]>` helper container on
-# the node. The helpers this validator started are kept per executor, so the provider-side load
-# check excuses exactly those, never a container that only wears the prefix. A record is
-# "name|started|container id": the id is the container first seen running under that name, and
-# from then on only that container is excused, so a same-name container started after the
-# helper ends is the provider's.
+# the node, and reruns it under the same name when it renews credentials or retries an upload.
+# The operations this validator started are recorded per executor, and the provider-side load
+# check excuses a helper only by its exact name, only while the node shows that operation's
+# runner alive, and only up to the helper cap: never a container that only wears the prefix,
+# and never one after its operation ended.
 STORAGE_HELPER_PREFIX = "lium-storage-"
 STARTED_STORAGE_HELPERS_PREFIX = "started_storage_helpers:"
+# a docker container name cannot hold ":", so no container's name or id ever matches this key
+STORAGE_HELPER_KEY_MARK = "helper:"
 # the backend fails a backup still open after 4 h (BACKUP_AUTH_TOKEN_EXPIRY_HOURS): no helper
 # legitimately outlives that, so no record does either
 STARTED_STORAGE_HELPERS_TTL_SECONDS = 4 * 3600
+# the record is written before the launch, so its runner may not have a pid yet
+STORAGE_OPERATION_START_GRACE_SECONDS = 300
 _STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC = 2
 
 
@@ -37,11 +45,34 @@ def storage_helper_name(operation_id: UUID | str) -> str:
     return f"{STORAGE_HELPER_PREFIX}{str(operation_id)[:12]}"
 
 
+def storage_helper_key(operation_id: UUID | str) -> str:
+    return f"{STORAGE_HELPER_KEY_MARK}{storage_helper_name(operation_id)}"
+
+
+@dataclass(frozen=True)
+class StorageHelperRecord:
+    """An operation this validator started on the executor, and when."""
+
+    operation_id: str
+    started: int
+
+    def format(self) -> str:
+        return f"{self.operation_id}|{self.started}"
+
+    @classmethod
+    def parse(cls, raw: str) -> StorageHelperRecord | None:
+        operation_id, _, started = raw.partition("|")
+        try:
+            return cls(str(UUID(operation_id)), int(started))
+        except ValueError:
+            return None
+
+
 def _key(executor_id: str) -> str:
     return f"{STARTED_STORAGE_HELPERS_PREFIX}{executor_id}"
 
 
-async def _redis_call(what: str, call) -> bool:
+async def _redis_call(what: str, call: Callable[[], Awaitable[None]]) -> bool:
     """Best effort: Redis down or slow leaves the records as they are (an unrecorded helper's
     cores stay on the provider, as before DAH-6148)."""
     try:
@@ -52,67 +83,97 @@ async def _redis_call(what: str, call) -> bool:
         return False
 
 
-async def _records(redis, executor_id: str) -> list[str]:
+async def _raw_records(redis: RedisService, executor_id: str) -> list[str]:
     members = await redis.smembers(_key(executor_id))
     return [m.decode() if isinstance(m, bytes) else str(m) for m in members or ()]
 
 
-async def note_started_storage_helper(redis, executor_id: str, operation_id: UUID | str) -> None:
-    """Records the helper an operation is starting on this executor."""
+async def note_started_storage_helper(
+    redis: RedisService, executor_id: str, operation_id: UUID | str
+) -> None:
+    """Records the operation starting its helper on this executor."""
 
     async def note() -> None:
-        record = f"{storage_helper_name(operation_id)}|{int(time.time())}|"
-        await redis.sadd(_key(executor_id), record)
+        record = StorageHelperRecord(str(operation_id), int(time.time()))
+        await redis.sadd(_key(executor_id), record.format())
         await redis.expire(_key(executor_id), STARTED_STORAGE_HELPERS_TTL_SECONDS)
 
     await _redis_call(f"record {operation_id} on {executor_id}", note)
 
 
-async def forget_storage_helper(redis, executor_id: str, operation_id: UUID | str) -> None:
+async def forget_storage_helper(
+    redis: RedisService, executor_id: str, operation_id: UUID | str
+) -> None:
     """The operation ended where the validator saw it end (launch failure, cancel, a bootstrap
     restore it waited for): its helper is no longer Lium's."""
-    name = storage_helper_name(operation_id)
 
     async def forget() -> None:
-        for record in await _records(redis, executor_id):
-            if record.split("|", 1)[0] == name:
-                await redis.srem(_key(executor_id), record)
+        for raw in await _raw_records(redis, executor_id):
+            record = StorageHelperRecord.parse(raw)
+            if record and record.operation_id == str(operation_id):
+                await redis.srem(_key(executor_id), raw)
 
     await _redis_call(f"forget {operation_id} on {executor_id}", forget)
 
 
-async def started_storage_helpers(
-    redis, executor_id: str, running: dict[str, str] | None
-) -> set[str]:
-    """The keys to excuse for this validator's helpers on the executor: a helper not yet seen
-    running by its name, a seen one by its container id only.
+def operation_states_command(operation_ids: list[str]) -> str:
+    """One `<operation id> <state>` line per operation, the state as `_operation_state` reads it."""
+    return " ".join(
+        f"printf '%s ' {shlex.quote(op)}; "
+        f"{_operation_state_command(StorageOperationFiles.for_operation(UUID(op)))}; echo;"
+        for op in operation_ids
+    )
 
-    `running` maps this cycle's helper-named containers to their ids; None when the scrape
-    listed no containers, which then changes no record. A record past the TTL is dropped, and so
-    is a seen helper whose container is gone or replaced: its operation ended. Empty when Redis
-    does not answer.
+
+def parse_operation_states(stdout: str) -> dict[str, str]:
+    states: dict[str, str] = {}
+    for line in stdout.splitlines():
+        operation_id, _, state = line.strip().partition(" ")
+        if operation_id and state:
+            states[operation_id] = state.strip()
+    return states
+
+
+async def settle_excused_storage_helper_keys(
+    redis: RedisService,
+    executor_id: str,
+    read_states: Callable[[list[str]], Awaitable[dict[str, str] | None]],
+) -> set[str]:
+    """Drops the records whose operation ended and returns the helper keys to excuse.
+
+    `read_states` reads the operations' runner states on the node (None when unreadable). An
+    operation is open while its runner is alive, or for a short grace before its runner starts;
+    an ended one, or one past the TTL, loses its record. Unreadable states keep every record and
+    excuse nothing this cycle, and so does Redis not answering.
     """
     keys: set[str] = set()
 
     async def settle() -> None:
         now = int(time.time())
-        for record in await _records(redis, executor_id):
-            name, _, rest = record.partition("|")
-            started, _, seen_id = rest.partition("|")
-            current_id = (running or {}).get(name)
-            age = now - int(started) if started.isdigit() else None
-            expired = age is None or age > STARTED_STORAGE_HELPERS_TTL_SECONDS
-            ended = running is not None and seen_id and current_id != seen_id
-            if expired or ended:
-                await redis.srem(_key(executor_id), record)
-            elif seen_id:
-                keys.add(seen_id)
-            elif current_id:
-                await redis.srem(_key(executor_id), record)
-                await redis.sadd(_key(executor_id), f"{name}|{started}|{current_id}")
-                keys.add(current_id)
+        records = {
+            raw: StorageHelperRecord.parse(raw) for raw in await _raw_records(redis, executor_id)
+        }
+        live = {
+            raw: record
+            for raw, record in records.items()
+            if record and 0 <= now - record.started <= STARTED_STORAGE_HELPERS_TTL_SECONDS
+        }
+        for raw in records.keys() - live.keys():
+            await redis.srem(_key(executor_id), raw)
+        if not live:
+            return
+        states = await read_states(sorted({r.operation_id for r in live.values()}))
+        if states is None:
+            return
+        for raw, record in live.items():
+            state = states.get(record.operation_id, "")
+            starting = state == "STARTING" and (
+                now - record.started <= STORAGE_OPERATION_START_GRACE_SECONDS
+            )
+            if state == "RUNNING" or starting:
+                keys.add(storage_helper_key(record.operation_id))
             else:
-                keys.add(name)  # starting: its container is not up yet
+                await redis.srem(_key(executor_id), raw)
 
     if not await _redis_call(f"read helpers of {executor_id}", settle):
         return set()
@@ -344,20 +405,23 @@ async def wait_for_storage_operation(
         await asyncio.sleep(poll_interval_seconds)
 
 
-async def _operation_state(
-    ssh_client: asyncssh.SSHClientConnection,
-    files: StorageOperationFiles,
-) -> str:
+def _operation_state_command(files: StorageOperationFiles) -> str:
     status_path = shlex.quote(str(files.status))
     pid_path = shlex.quote(str(files.pid))
-    command = (
+    return (
         f"if test -s {status_path}; then printf 'STATUS:'; cat {status_path}; "
         f"elif test -s {pid_path}; then pid=$(cat {pid_path}); "
         "case \"$pid\" in (*[!0-9]*|'') echo INVALID;; "
         '(*) if kill -0 "$pid" 2>/dev/null; then echo RUNNING; else echo EXITED; fi;; esac; '
         "else echo STARTING; fi"
     )
-    result = await ssh_client.run(command, check=False)
+
+
+async def _operation_state(
+    ssh_client: asyncssh.SSHClientConnection,
+    files: StorageOperationFiles,
+) -> str:
+    result = await ssh_client.run(_operation_state_command(files), check=False)
     return (result.stdout or "").strip()
 
 
