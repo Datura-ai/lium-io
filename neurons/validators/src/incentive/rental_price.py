@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from core.config import get_total_burn_emission, settings, shared_client
 from core.utils import _m, get_logger
 from incentive.config import BASE_GPU_MAP
+from incentive.idle_pay_budget import SHADOW_K, idle_pay_scale, load_default_job_revenue
 from incentive.eligibility import earns_spot_rental_incentive, is_missing_discord_after_cutoff
 from incentive.miner_incentive_log import MinerLogLine, ZeroIncentiveReason
 
@@ -285,6 +286,7 @@ class RentalPriceIncentive(DefaultIncentive):
         self.unbucketed_share = 0.0
         self.unbucketed_share_raw = 0.0
         self.unbucketed_paid_fraction = 1.0
+        self.idle_pay_scale = 1.0
         # Idle spot nodes priced this cycle, scaled to their GPU model's filler earnings once all are known.
         self._spot_pay_candidates: list[tuple[str, JobResult]] = []
         # DAH-5944: idle spot GPUs per (base_model, bucket), a pool of their own under the secure caps.
@@ -1029,6 +1031,7 @@ class RentalPriceIncentive(DefaultIncentive):
             )
 
         self._settle_unbucketed_share()
+        await self._apply_idle_pay_budget()
 
         # Calculate emission splits
         self.burn_share = total_burn_emission - self.rental_share - self.unbucketed_share
@@ -1075,6 +1078,42 @@ class RentalPriceIncentive(DefaultIncentive):
                 )
             )
 
+    async def _apply_idle_pay_budget(self) -> None:
+        """DAH-6030: scale every idle payee by s = min(1, k * Default Job revenue / uncapped idle pay). The withheld
+        share stays in burn_share, computed after this. Off (k unset), cold start or no idle pay: s = 1."""
+        k: float | None = settings.IDLE_PAY_BUDGET_K
+        revenue, revenue_age_hours = await load_default_job_revenue(self.redis_service)
+        share_per_usd_hour: float = self._share_for_rental_cost(1.0)
+        # the weights are normalized to sum 1: with no mining score the mining share is not paid, the vector
+        # sums to the burn emission only, and every idle share is worth 1/mass more than its raw value
+        mass: float = self.total_burn_emission + (self.mining_share if self.total_mining_score > 0 else 0.0)
+        uncapped: float = (
+            (self.rental_share + self.unbucketed_share) / share_per_usd_hour / (mass if 0 < mass < 1 else 1.0)
+            if share_per_usd_hour > 0
+            else 0.0
+        )
+        scale: float = idle_pay_scale(k, revenue, uncapped)
+        if scale < 1.0:
+            self.rental_share *= scale
+            self.unbucketed_share *= scale
+            self.unbucketed_paid_fraction = (
+                self.unbucketed_share / self.unbucketed_share_raw if self.unbucketed_share_raw > 0 else 1.0
+            )
+        self.idle_pay_scale = scale
+        extra: dict[str, Any] = {
+            "k": k,
+            "scale": scale,
+            "budget_usd_per_hour": k * revenue if k is not None and revenue is not None else None,
+            "uncapped_idle_usd_per_hour": uncapped,
+            "default_job_revenue_usd_per_hour": revenue,
+            "default_job_revenue_age_hours": revenue_age_hours,
+            "shadow_scale_at_k": idle_pay_scale(SHADOW_K, revenue, uncapped),
+        }
+        if revenue is None and uncapped > 0:
+            logger.warning(_m("Idle-pay budget: no Default Job revenue reading, idle pay not scaled", extra=extra))
+        else:
+            logger.info(_m("Idle-pay budget", extra=extra))
+
     def _share_for_rental_cost(self, rental_cost: float) -> float:
         """The emission share a USD/hour cost is worth this cycle: the rental-share formula."""
         if self.epoch_subnet_emission <= 0:
@@ -1105,7 +1144,9 @@ class RentalPriceIncentive(DefaultIncentive):
         if result.spot_pay_candidate:
             self._set_cycle_formula_context(result)
             result.incentive = self._pay_unbucketed(result, result.effective_rate)
-            if result.effective_rate > 0 and self._unbucketed_clamped_to_zero:
+            if result.effective_rate > 0 and self.idle_pay_scale <= 0:
+                result.record_incentive_log(MinerLogLine.no_payout_because_idle_pay_budget_zero(result))
+            elif result.effective_rate > 0 and self._unbucketed_clamped_to_zero:
                 result.record_incentive_log(
                     MinerLogLine.no_payout_because_spot_no_headroom_at_burn_cap(
                         result, self.unbucketed_paid_fraction
@@ -1179,7 +1220,11 @@ class RentalPriceIncentive(DefaultIncentive):
             elif self._unbucketed_clamped_to_zero:
                 result.record_incentive_log(
                     MinerLogLine.secure_filler_revenue_floor_not_paid(
-                        result, diluted_rate, floored_rate, floor_factor=SECURE_FILLER_REVENUE_FLOOR_FACTOR
+                        result,
+                        diluted_rate,
+                        floored_rate,
+                        floor_factor=SECURE_FILLER_REVENUE_FLOOR_FACTOR,
+                        budget_zero=self.idle_pay_scale <= 0,
                     )
                 )
 

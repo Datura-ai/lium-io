@@ -490,6 +490,11 @@ class Settings(BaseSettings):
     # Ships off. Turned on only by the Lium product owner, once the native verifier accepts a 48 GB 4090, the provider
     # preflight classifies it too, and the all-card probe is sized from the classified model.
     RTX_4090_48GB_MODEL_ENABLED: bool = Field(env="RTX_4090_48GB_MODEL_ENABLED", default=False)
+    # DAH-6030: total idle pay (Secure buckets, Spot, Secure floor) at most k times realized Default Job revenue
+    # (trailing 72 h, from the backend); every idle payee scales by the same factor and the rest is burned. Unset = off:
+    # each cycle only logs what the factor would be at 0.9. Moves provider money, so it is set (to 0.9) only after the
+    # 24 h provider notice.
+    IDLE_PAY_BUDGET_K: float | None = Field(env="IDLE_PAY_BUDGET_K", default=None, ge=0)
     PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED: bool = Field(
         env="PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED", default=False
     )
