@@ -1064,16 +1064,8 @@ if [ -n "$filler_list" ]; then
     docker stop $filler_list > /dev/null 2>&1 || true
 fi
 
-# Remove stopped containers so Docker can restart cleanly; keep Lium's Default Job (filler_*), which the
-# validator would otherwise report as missing and stop idle pay for until it starts a new one
-stopped=$(docker ps -a --format '{{.ID}} {{.Names}}' 2>/dev/null | awk '$2 !~ /^filler_/ {print $1}' || true)
-if [ -n "$stopped" ]; then
-    warn "Removing stopped containers (sysbox requires none)..."
-    # shellcheck disable=SC2086  # one id per word
-    docker rm -f $stopped > /dev/null 2>&1
-    ok "Stopped containers removed."
-fi
-
+# Stopped containers are left alone: they are the provider's own, Docker restarts fine with them (the stopped
+# Default Job above proves it), and removing them deleted unrelated user containers
 ok "Docker is clear for sysbox installation."
 
 # ── 4. Install ──────────────────────────────────────────

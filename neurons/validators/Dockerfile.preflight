@@ -1,4 +1,10 @@
-FROM daturaai/ubuntu:24.04-py3.11
+ARG TARGETARCH
+# daturaai/ubuntu is amd64-only; arm64 (DGX Spark, Grace) builds on python:3.11-slim with the aarch64 libraries
+FROM daturaai/ubuntu:24.04-py3.11 AS base-amd64
+ENV LIB_SUFFIX=
+FROM python:3.11-slim AS base-arm64
+ENV LIB_SUFFIX=-aarch64
+FROM base-${TARGETARCH}
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -14,9 +20,9 @@ COPY src/preflight /app/preflight
 COPY src/services /app/services
 
 # Copy libraries
-COPY libdmcompverify.so /usr/lib/libdmcompverify.so
-COPY libverifyx.so /usr/lib/libverifyx.so
-COPY libinspector.so /usr/lib/libinspector.so
+COPY libdmcompverify${LIB_SUFFIX}.so /usr/lib/libdmcompverify.so
+COPY libverifyx${LIB_SUFFIX}.so /usr/lib/libverifyx.so
+COPY libinspector${LIB_SUFFIX}.so /usr/lib/libinspector.so
 
 # Install Python dependencies
 RUN pip3 install --no-cache-dir \
