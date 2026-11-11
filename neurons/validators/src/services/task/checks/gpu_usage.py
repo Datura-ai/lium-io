@@ -25,7 +25,11 @@ from services.const import (
     RENTAL_TEARDOWN_GRACE_MINUTES,
 )
 from services.gpu_reset import renter_gpu_resets
-from services.redis_service import FILLER_IMAGE_DIGESTS_PREFIX, FILLER_IMAGE_DIGESTS_TTL_SECONDS
+from services.redis_service import (
+    EDIT_PARKED_CONTAINER_PREFIX,
+    FILLER_IMAGE_DIGESTS_PREFIX,
+    FILLER_IMAGE_DIGESTS_TTL_SECONDS,
+)
 from services.gpu_wedge import (
     COMPUTE_APPS_QUERY_COMMAND,
     GPU_QUERY_COMMAND,
@@ -572,7 +576,11 @@ async def the_backend_still_owns(ctx: Context, container_name: str) -> bool:
     """
     is_filler: bool = container_name.startswith(FILLER_CONTAINER_PREFIX)
     prefix: str = FILLER_CONTAINER_PREFIX if is_filler else POD_CONTAINER_PREFIX
-    # an edit parks the pod's old container as pod_<id>__prev before stopping it
+    # an edit parks the pod's old container as pod_<id>__prev before stopping it; only a name this
+    # validator parked is ours, anyone can start a container under that name
+    if not is_filler and container_name.endswith(EDIT_PARKED_SUFFIX):
+        if not await _parked_by_this_validator(ctx, container_name):
+            return False
     backend_issued_id: str | None = _uuid_after_prefix(
         container_name if is_filler else container_name.removesuffix(EDIT_PARKED_SUFFIX), prefix
     )
@@ -604,6 +612,20 @@ async def the_backend_still_owns(ctx: Context, container_name: str) -> bool:
     # A pod that ended within its teardown grace gets the same verdict at 0% load as above the limit.
     rental = _pod_container_rental_from(ctx, container_name, backend_issued_id, pod_rental)
     return rental.state not in _ORPHAN_STATES
+
+
+async def _parked_by_this_validator(ctx: Context, container_name: str) -> bool:
+    """False when Redis does not answer: the name alone proves nothing."""
+    try:
+        return bool(
+            await asyncio.wait_for(
+                ctx.services.redis.get(f"{EDIT_PARKED_CONTAINER_PREFIX}{ctx.executor.uuid}:{container_name}"),
+                timeout=2,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Edit-parked container record unreadable for %s: %s", container_name, exc)
+        return False
 
 
 def _a_broken_pod_the_reaper_has_not_collected_yet(pod_rental: PodRentalActiveResponse) -> bool:
@@ -656,6 +678,8 @@ async def _pod_container_rental(ctx: Context, container_name: str) -> PodContain
         return PodContainerRental(
             container_name, None, PodRentalState.ORPHAN, "its name carries no pod id Lium issued"
         )
+    if container_name.endswith(EDIT_PARKED_SUFFIX) and not await _parked_by_this_validator(ctx, container_name):
+        return PodContainerRental(container_name, pod_id, PodRentalState.ORPHAN, "no edit of this pod parked it")
 
     pod_rental: PodRentalActiveResponse | None = await ctx.services.backend.get_pod_rental_active(pod_id)
     return _pod_container_rental_from(ctx, container_name, pod_id, pod_rental)

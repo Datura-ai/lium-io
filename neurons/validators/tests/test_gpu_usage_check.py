@@ -22,6 +22,7 @@ from neurons.validators.src.services.task.messages import TenantEnforcementMessa
 from neurons.validators.src.services.task.pipeline import Pipeline
 from neurons.validators.src.services.task.score_calculator import calculate_scores
 
+from neurons.validators.src.services.redis_service import EDIT_PARKED_CONTAINER_PREFIX
 from tests.helpers import build_context_config, build_services, build_state, default_executor
 
 
@@ -577,6 +578,8 @@ async def test_a_pod_container_on_an_unrented_node_is_judged_by_its_pod(
 ):
     services = build_services(score_calculator=_Scores())
     services.backend.get_pod_rental_active.return_value = pod_rental
+    # the validator recorded this name when the edit parked it
+    services.redis.store[f"{EDIT_PARKED_CONTAINER_PREFIX}{default_executor().uuid}:{TEARDOWN_POD}__prev"] = "1"
     state = build_state(
         gpu_details=gpu_details,
         gpu_processes=[_pod_process(container_name)],
@@ -588,6 +591,28 @@ async def test_a_pod_container_on_an_unrented_node_is_judged_by_its_pod(
 
     assert result.passed is owned
     services.backend.get_pod_rental_active.assert_awaited_once_with(TEARDOWN_POD_ID)
+
+
+@pytest.mark.parametrize("gpu_details", [BUSY_GPU, IDLE_GPU_HOLDING_VRAM], ids=["busy", "idle"])
+@pytest.mark.parametrize("redis_failing", [False, True], ids=["unrecorded", "redis-down"])
+@pytest.mark.asyncio
+async def test_a_self_named_edit_parked_container_stays_provider_load(context_factory, gpu_details, redis_failing):
+    services = build_services(score_calculator=_Scores())
+    services.redis.failing = redis_failing
+    services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
+        active=True, executor_id=default_executor().uuid
+    )
+    state = build_state(
+        gpu_details=gpu_details,
+        gpu_processes=[_pod_process(f"{TEARDOWN_POD}__prev")],
+        rented_data=RentedExecutorsResponse(executors={}),
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state, rented=False)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    services.backend.get_pod_rental_active.assert_not_awaited()
 
 
 @pytest.mark.asyncio

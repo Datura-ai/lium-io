@@ -688,6 +688,25 @@ async def test_an_undo_whose_ssh_session_died_keeps_the_creates_own_error(svc, m
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("edit_error", [None, RuntimeError("create failed")], ids=["edit-done", "edit-failed"])
+async def test_the_parked_name_is_recorded_while_parked_and_dropped_when_the_edit_ends(edit_error):
+    from services.docker_service import _EditSwap
+    from services.redis_service import EDIT_PARKED_CONTAINER_PREFIX, EDIT_PARKED_CONTAINER_TTL_SECONDS
+
+    redis = AsyncMock()
+    key = f"{EDIT_PARKED_CONTAINER_PREFIX}ex-1:pod_abc{EDIT_PARKED_SUFFIX}"
+    swap = _EditSwap(_ssh_recording(), "pod_abc", {}, redis=redis, executor_id="ex-1")
+
+    await swap.park()
+    redis.set.assert_awaited_once_with(key, "1", ex=EDIT_PARKED_CONTAINER_TTL_SECONDS)
+    redis.delete.assert_not_awaited()
+
+    await swap.__aexit__(type(edit_error) if edit_error else None, edit_error, None)
+    redis.delete.assert_awaited_once_with(key)
+    assert EDIT_PARKED_CONTAINER_TTL_SECONDS <= 3600  # a backstop for a validator killed mid-edit, not a lease
+
+
+@pytest.mark.asyncio
 async def test_the_undo_removes_the_replacement_by_its_id_so_a_sibling_retry_under_the_pod_name_survives():
     from services.docker_service import _EditSwap
 

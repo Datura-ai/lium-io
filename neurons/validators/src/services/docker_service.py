@@ -159,6 +159,8 @@ from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networkin
 from services.redis_service import (
     GPU_CLOCKS_PENDING_KIND,
     GPU_RESET_PENDING_KIND,
+    EDIT_PARKED_CONTAINER_PREFIX,
+    EDIT_PARKED_CONTAINER_TTL_SECONDS,
     FILLER_IMAGE_DIGESTS_PREFIX,
     FILLER_IMAGE_DIGESTS_TTL_SECONDS,
     IN_CONTAINER_SSH_BOOTSTRAP_PATH,
@@ -1715,6 +1717,7 @@ _PARK_KILL_SETTLE_SECONDS = 2
 _PARK_KILL_WAIT_SECONDS = 30
 # each SSH command of the edit swap (stop -t 10 included); exit 124 when the host ends it
 _PARK_COMMAND_TIMEOUT_SECONDS = 60
+_EDIT_PARKED_RECORD_TIMEOUT_SECONDS = 2
 # the undo's bring-up (start, gocryptfs remount, sshd bootstrap) is several SDK and SSH steps, not one command
 _RESTORE_BRING_UP_TIMEOUT_SECONDS = 300
 
@@ -1745,9 +1748,24 @@ class _EditSwap:
     destroyed. Entered together with the SSH connection so the undo still has a live session.
     """
 
-    def __init__(self, ssh_client: asyncssh.SSHClientConnection, container_name: str, default_extra: dict):
+    def __init__(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+        default_extra: dict,
+        redis: RedisService | None = None,
+        executor_id: str | None = None,
+    ):
         self.ssh_client = ssh_client
         self.container_name = container_name
+        self.redis = redis
+        # the key that marks this edit's parked name as ours for the GPU checks; set once recorded
+        self.parked_record_key: str | None = (
+            f"{EDIT_PARKED_CONTAINER_PREFIX}{executor_id}:{container_name}{EDIT_PARKED_SUFFIX}"
+            if redis is not None and executor_id
+            else None
+        )
+        self.parked_recorded = False
         self.parked_name: str | None = None
         # the parked container's own Docker ID: its removal after the reply can land after a later edit
         # of the pod parked another container under the same name, and removing by name would delete that one
@@ -1824,6 +1842,7 @@ class _EditSwap:
             # Both exist: the earlier edit's replacement is the pod now and its cleanup did not run;
             # the leftover parked one is stale and must not block the rename.
             await self._run(f"/usr/bin/docker rm -fv {shlex.quote(parked)} 2>/dev/null || true")
+        await self._record_parked(True)
         renamed = await self._run(
             f"/usr/bin/docker rename {shlex.quote(self.container_name)} {shlex.quote(parked)}"
         )
@@ -1885,7 +1904,30 @@ class _EditSwap:
         )
         return is_stopped
 
+    async def _record_parked(self, parked: bool) -> None:
+        """Best effort: unrecorded, a parked container's GPU load counts as the provider's."""
+        if self.parked_record_key is None or parked == self.parked_recorded:
+            return
+        try:
+            async with asyncio.timeout(_EDIT_PARKED_RECORD_TIMEOUT_SECONDS):
+                if parked:
+                    await self.redis.set(self.parked_record_key, "1", ex=EDIT_PARKED_CONTAINER_TTL_SECONDS)
+                else:
+                    await self.redis.delete(self.parked_record_key)
+            self.parked_recorded = parked
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                _m("Edit-parked container record not updated", extra=get_extra_info({**self.default_extra, "error": repr(exc)}))
+            )
+
     async def __aexit__(self, exc_type, exc, tb) -> bool:
+        try:
+            return await self._finish(exc)
+        finally:
+            # after the parked container is gone or renamed back, never before
+            await self._record_parked(False)
+
+    async def _finish(self, exc) -> bool:
         # Nothing here may change the create's own outcome: the cleanup and the undo are best effort,
         # and an SSH session that died (the very thing that fails an edit) must not turn the create's
         # error into a ChannelOpenError from the undo.
@@ -9485,7 +9527,13 @@ class DockerService:
                 )
                 # DAH-2740: undoes a failed edit while this SSH session is still open
                 edit_swap = await connections.enter_async_context(
-                    _EditSwap(ssh_client, self.get_container_name(payload), default_extra)
+                    _EditSwap(
+                        ssh_client,
+                        self.get_container_name(payload),
+                        default_extra,
+                        redis=self.redis_service,
+                        executor_id=str(executor_info.uuid),
+                    )
                 )
                 # Add profiler for ssh connection
                 profilers.append(ProfilerStep.since(ProfilerStepName.SSH_CONNECTION_ESTABLISHED, prev_timestamp))
