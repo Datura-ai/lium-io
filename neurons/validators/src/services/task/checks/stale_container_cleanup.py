@@ -133,12 +133,6 @@ class StaleContainerCleanupCheck:
         # the grow and both disk reads share one budget, half the task's time left at most, so the rental checks and
         # state publication after this check always keep the other half
         grow_deadline = time.monotonic() + min(GROW_PASS_MAX_SECONDS, task_seconds_left(ctx) / 2)
-        # read before any removal: a pass that grows judges the disk by what it measures, releases included
-        free_before = (
-            await host_free_bytes(ctx.ssh, min(SSH_CALL_TIMEOUT_SECONDS, grow_deadline - time.monotonic()))
-            if grow_pod_ids
-            else None
-        )
         confirmed: set[str] = set()  # names the backend's record shows were this node's ended Lium workload
         lookups = {"made": 0, "skipped": 0}
         # labelled removals holding a GPU process: each has a lookup slot kept for its exemption
@@ -212,6 +206,13 @@ class StaleContainerCleanupCheck:
 
         # DAH-6073: a live pod granted less disk than it ordered (another renter's kept volume held the space) gets
         # the rest once the disk is free; only on a known rented list, so a retained or orphan volume is never grown
+        # read after the removals, right before the grow: a removal may free a filler volume the scrape already counts
+        # as free, so only the grow and the Dolphin reclaim (which the scrape counts as used) fall inside the window
+        free_before = (
+            await host_free_bytes(ctx.ssh, min(SSH_CALL_TIMEOUT_SECONDS, grow_deadline - time.monotonic()))
+            if grow_pod_ids
+            else None
+        )
         # bounded by the shared budget above, keeping a disk read's worth for the measurement after it
         grow_budget = grow_deadline - time.monotonic() - SSH_CALL_TIMEOUT_SECONDS
         grown = (
@@ -232,7 +233,8 @@ class StaleContainerCleanupCheck:
         )
 
         # the grow took disk the scrape counted free: the listing and the paid GPU count must judge what is left.
-        # Measured after the whole pass, so the removals' releases and a grow whose report was lost (a timeout) count
+        # Measured around the grow and the reclaim, so a grow whose report was lost (a timeout) counts; the removals'
+        # releases are left to the next scrape, which can tell a filler volume (already free) from the rest
         # A grow whose report never came back may still take up to its order after the read, so its order counts too
         free_after = (
             await host_free_bytes(ctx.ssh, min(SSH_CALL_TIMEOUT_SECONDS, grow_deadline - time.monotonic()))

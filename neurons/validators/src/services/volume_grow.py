@@ -129,14 +129,16 @@ def pod_ids_at_endpoint(
 async def host_free_bytes(
     ssh_client: asyncssh.SSHClientConnection, timeout_seconds: float = SSH_CALL_TIMEOUT_SECONDS
 ) -> int | None:
-    """Free bytes on the filesystem under docker's root, where the volumes' backing files live; None when unread
+    """Free bytes on the filesystem under docker's root, where the volumes' backing files live, read through PID 1's
+    root like the scrape's hard_disk (this session's own `/` is the executor container's overlay); None when unread
     or out of time."""
     if timeout_seconds <= 0:
         return None
     try:
         async with asyncio.timeout(timeout_seconds):
             result = await ssh_client.run(
-                "df -P -B1 \"$(/usr/bin/docker info -f '{{.DockerRootDir}}')\" | awk 'NR==2 {print $4}'",
+                "r=$(/usr/bin/docker info -f '{{.DockerRootDir}}') && h=/proc/1/root$r && { [ -d \"$h\" ] || h=$r; } "
+                "&& df -P -B1 \"$h\" | awk 'NR==2 {print $4}'",
                 timeout=timeout_seconds,
             )
     except Exception:  # noqa: BLE001 - unread: the caller falls back to what the grows reported

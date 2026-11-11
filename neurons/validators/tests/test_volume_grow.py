@@ -509,7 +509,7 @@ def test_a_pass_that_released_more_than_it_took_lists_on_the_disk_now_free(conte
 @pytest.mark.parametrize(
     ("free_reads_gb", "reported_gb", "unreported_gb", "free_after_gb"),
     [
-        # the grow took 60 GB, the removals before it gave 30 GB back: the measured net is what is gone
+        # the grow reported 60 GB but the disk around it went down 30 (the Dolphin reclaim gave some back): measured
         ((70, 40), 60, 0, 40),
         # the grow's report was lost after it allocated, the read after it saw the disk go
         ((70, 10), 0, 0, 10),
@@ -521,7 +521,7 @@ def test_a_pass_that_released_more_than_it_took_lists_on_the_disk_now_free(conte
         ((70, 50), 0, 40, 10),
     ],
 )
-async def test_the_cleanup_pass_judges_the_disk_it_measured_around_the_whole_pass(
+async def test_the_cleanup_pass_judges_the_disk_it_measured_around_the_grow(
     monkeypatch, free_reads_gb, reported_gb, unreported_gb, free_after_gb
 ):
     from dataclasses import replace
@@ -569,3 +569,52 @@ async def test_with_no_task_time_left_the_pass_neither_measures_nor_grows(monkey
     grow.assert_not_called()
     assert await host_free_bytes(ssh, 0) is None
     ssh.run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_the_disk_is_read_after_the_removals_so_a_freed_filler_volume_is_not_counted_twice(monkeypatch):
+    # a removal can free a filler run volume the scrape already lists as free: it must fall outside the window
+    from services.task.checks import stale_container_cleanup as module
+
+    from tests.test_container_cleanup import _cleanup_check_ctx
+
+    order = []
+    ctx = _cleanup_check_ctx([], [])
+    cleanup = ctx.services.container_cleanup
+    removal = cleanup.cleanup.side_effect
+
+    async def remove(**kwargs):
+        order.append("remove")
+        return await removal(**kwargs)
+
+    async def orphans(**_kwargs):
+        order.append("orphans")
+        return 0
+
+    async def read(*_args):
+        order.append("read")
+        return 70 * GB
+
+    async def grow(*_args):
+        order.append("grow")
+        return GrowPass(attempted=True)
+
+    cleanup.cleanup.side_effect = remove
+    cleanup.remove_orphan_rental_volumes.side_effect = orphans
+    monkeypatch.setattr(module, "pod_ids_at_endpoint", lambda *_: {"live"})
+    monkeypatch.setattr(module, "host_free_bytes", read)
+    monkeypatch.setattr(module, "grow_short_volumes", grow)
+
+    await module.StaleContainerCleanupCheck().run(ctx)
+
+    assert order == ["remove", "orphans", "read", "grow", "read"]
+
+
+@pytest.mark.asyncio
+async def test_host_free_bytes_reads_the_hosts_docker_root_through_pid_1():
+    # the session's own `/` is the executor container's overlay; the scrape reads /proc/1/root<DockerRootDir>
+    ssh = SimpleNamespace(run=AsyncMock(return_value=SimpleNamespace(exit_status=0, stdout="123\n", stderr="")))
+
+    assert await host_free_bytes(ssh) == 123
+    command = ssh.run.await_args.args[0]
+    assert "h=/proc/1/root$r" in command and 'df -P -B1 "$h"' in command
