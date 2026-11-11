@@ -386,23 +386,20 @@ async def wait_for_storage_operation(
         await asyncio.sleep(poll_interval_seconds)
 
 
-def _operation_state_command(files: StorageOperationFiles) -> str:
+async def _operation_state(
+    ssh_client: asyncssh.SSHClientConnection,
+    files: StorageOperationFiles,
+) -> str:
     status_path = shlex.quote(str(files.status))
     pid_path = shlex.quote(str(files.pid))
-    return (
+    command = (
         f"if test -s {status_path}; then printf 'STATUS:'; cat {status_path}; "
         f"elif test -s {pid_path}; then pid=$(cat {pid_path}); "
         "case \"$pid\" in (*[!0-9]*|'') echo INVALID;; "
         '(*) if kill -0 "$pid" 2>/dev/null; then echo RUNNING; else echo EXITED; fi;; esac; '
         "else echo STARTING; fi"
     )
-
-
-async def _operation_state(
-    ssh_client: asyncssh.SSHClientConnection,
-    files: StorageOperationFiles,
-) -> str:
-    result = await ssh_client.run(_operation_state_command(files), check=False)
+    result = await ssh_client.run(command, check=False)
     return (result.stdout or "").strip()
 
 
