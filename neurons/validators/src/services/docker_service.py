@@ -12080,7 +12080,7 @@ class DockerService:
                 )
             # attach to the keeper, not race it: two concurrent pulls of one image on the containerd store
             # fail "failed commit on ref". The SDK pull after it is then a no-op, or the real pull and its error.
-            wait = asyncio.ensure_future(
+            keeper_exit = asyncio.ensure_future(
                 ssh_client.run(
                     pull_keeper_wait_command(payload.pod_id),
                     check=False,
@@ -12089,16 +12089,16 @@ class DockerService:
             )
             try:
                 last_progress = None
-                while not wait.done():
-                    await asyncio.wait({wait}, timeout=_PULL_KEEPER_PROGRESS_INTERVAL_SECONDS)
-                    if not wait.done():
+                while not keeper_exit.done():
+                    await asyncio.wait({keeper_exit}, timeout=_PULL_KEEPER_PROGRESS_INTERVAL_SECONDS)
+                    if not keeper_exit.done():
                         last_progress = await self._report_pull_keeper_progress(
                             ssh_client, payload, log_tag, waited_from, last_progress
                         )
             finally:
-                wait.cancel()
+                keeper_exit.cancel()
             with contextlib.suppress(Exception):
-                wait.result()
+                keeper_exit.result()
             if time.monotonic() - waited_from >= _DOCKER_PULL_TIMEOUT_SECONDS:
                 raise RentalDockerOperationError(
                     f"Docker SDK pull timed out after {int(_DOCKER_PULL_TIMEOUT_SECONDS)} seconds"
@@ -12115,12 +12115,12 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         payload: ContainerCreateRequest,
         log_tag: str,
-        started: float,
-        last: str | None = None,
+        waited_from: float,
+        last_posted_line: str | None = None,
     ) -> str:
         """Post the renter one progress line, unless it is the same as the last one posted; returns it."""
         # the SDK pull only starts once the keeper is done, so the keeper's own output is the renter's progress
-        minutes = int((time.monotonic() - started) // 60)
+        minutes = int((time.monotonic() - waited_from) // 60)
         progress = f"still downloading ({minutes} min)"
         with contextlib.suppress(Exception):
             result = await ssh_client.run(pull_keeper_progress_command(payload.pod_id), check=False, timeout=30)
@@ -12128,7 +12128,7 @@ class DockerService:
             if total:
                 progress = f"{done} of {total} layers done ({minutes} min)"
         line = f"Pulling docker image {payload.docker_image}: {progress}"
-        if line != last:
+        if line != last_posted_line:
             await self.stream_log(line, "success", log_tag)
         return line
 
