@@ -449,6 +449,9 @@ class ContainerCreated(PodContainerResponse):
     volume_limit_gb: int | None = None
     local_volume_path: str | None = None
     volume_encryption_status: VolumeEncryptionStatus | None = None
+    # DAH-6073 (protocol 2.12.0): the volume was granted short of its order and labelled, so a later cleanup pass
+    # grows it online as disk frees; left off the wire when False
+    volume_grows_to_order: bool = pydantic.Field(default=False, exclude_if=lambda value: not value)
 
 
 @VALIDATOR_MESSAGES.register

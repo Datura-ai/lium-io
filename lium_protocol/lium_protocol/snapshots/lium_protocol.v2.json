@@ -1231,6 +1231,11 @@
           ],
           "default": null
         },
+        "volume_grows_to_order": {
+          "default": false,
+          "title": "Volume Grows To Order",
+          "type": "boolean"
+        },
         "volume_limit_gb": {
           "anyOf": [
             {
