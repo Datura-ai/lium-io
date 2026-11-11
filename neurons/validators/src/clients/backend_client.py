@@ -22,6 +22,7 @@ from protocol.vc_protocol.compute_requests import (
     PodRentalActiveResponse,
     PodSshReachabilityResponse,
     RentedExecutor,
+    StorageOperationActiveResponse,
     RentedExecutorsResponse,
     RentedGpuDropResponse,
     RentedPod,
@@ -531,6 +532,16 @@ class BackendClient:
         if container_missing:
             path += "?container_missing=true"
         return await self.get(path, FillerRunActiveResponse, timeout=10)
+
+    async def get_storage_operation_active(
+        self, operation_id: str
+    ) -> StorageOperationActiveResponse | None:
+        """Whether the backend still has this storage operation open; None when it did not say."""
+        return await self.get(
+            f"/internal/storage-operations/{operation_id}/active",
+            StorageOperationActiveResponse,
+            timeout=10,
+        )
 
     async def check_executor_health(
         self,

@@ -12,8 +12,6 @@ from core.utils import _m, get_extra_info
 from services.const import LIUM_INFRA_CONTAINER_PREFIXES
 from services.storage_operations import (
     STORAGE_HELPER_KEY_MARK,
-    operation_states_command,
-    parse_operation_states,
     settle_excused_storage_helper_keys,
 )
 
@@ -47,11 +45,11 @@ CLAIMED_EXCUSE_CORES = PROVIDER_SIDE_CPU_CORES_LIMIT
 # DAH-6148: a Lium backup runs restic in a `lium-storage-<operation>` helper container (executor
 # storage/restic.py). It is on no rental list and usually starts between the scrape and the second
 # look, so its cores landed on the provider. Only the helpers this validator started on the node
-# are excused (storage_operations.settle_excused_storage_helper_keys: by exact name while the node
-# shows the operation's runner alive), and only up to restic's GOMAXPROCS: a container that merely
-# wears the prefix, or takes a helper's name after its operation ended, stays the provider's.
+# are excused (storage_operations.settle_excused_storage_helper_keys: by exact name while the
+# backend has the operation open; files on the node are the provider's to write, so never asked),
+# and only up to restic's GOMAXPROCS: a container that merely wears the prefix, or takes a
+# helper's name after its operation ended, stays the provider's.
 STORAGE_HELPER_EXCUSE_CORES = 8.0
-STORAGE_OPERATION_STATES_TIMEOUT_SECONDS = 20
 
 # A second look before any money is withheld, the same rule the foreign-GPU twin follows with
 # the live card. The scrape's window is about two seconds, and Lium's own housekeeping
@@ -274,7 +272,7 @@ async def lium_containers(ctx: Context) -> set[str] | None:
     containers.update(await late_started_containers_the_backend_owns(ctx, containers))
     containers.update(
         await settle_excused_storage_helper_keys(
-            ctx.services.redis, ctx.executor.uuid, lambda ops: storage_operation_states(ctx, ops)
+            ctx.services.redis, ctx.executor.uuid, lambda op: storage_operation_open(ctx, op)
         )
     )
     stack_ids: set[str] = executor_stack_container_ids(specs)
@@ -287,20 +285,14 @@ async def lium_containers(ctx: Context) -> set[str] | None:
     return containers
 
 
-async def storage_operation_states(ctx: Context, operation_ids: list[str]) -> dict[str, str] | None:
-    """The runner state of each operation on the node; None when it cannot be read."""
-    if ctx.runner is None:
-        return None
+async def storage_operation_open(ctx: Context, operation_id: str) -> bool | None:
+    """Whether the backend still has the operation open; None when it did not answer."""
     try:
-        result = await ctx.runner.run(
-            operation_states_command(operation_ids),
-            timeout=STORAGE_OPERATION_STATES_TIMEOUT_SECONDS,
-            retryable=False,
-        )
+        answer = await ctx.services.backend.get_storage_operation_active(operation_id)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Storage operation states unreadable: %s", exc)
+        logger.warning("Storage operation %s status unreadable: %s", operation_id, exc)
         return None
-    return parse_operation_states(result.stdout) if result.success else None
+    return None if answer is None else answer.active
 
 
 def executor_stack_container_ids(specs: dict[str, Any]) -> set[str]:

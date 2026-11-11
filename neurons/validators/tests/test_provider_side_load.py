@@ -1,7 +1,5 @@
 """DAH-2734: provider-side CPU/disk gate — the twin of the DAH-2735 foreign-GPU gate."""
 import asyncio
-import os
-import subprocess
 import time
 from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,6 +12,7 @@ from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     RentedExecutor,
     RentedExecutorsResponse,
     RentedPod,
+    StorageOperationActiveResponse,
 )
 from neurons.validators.src.services.task.checks.provider_side_load import (
     ContainerRow,
@@ -30,8 +29,6 @@ from neurons.validators.src.services.storage_operations import (
     StorageHelperRecord,
     forget_storage_helper,
     note_started_storage_helper,
-    operation_states_command,
-    parse_operation_states,
     settle_excused_storage_helper_keys,
     storage_helper_key,
     storage_helper_name,
@@ -766,29 +763,47 @@ BACKUP_HELPER = storage_helper_name(OPERATION)  # "lium-storage-01234567-89a"
 POD = ("c1", "pod_renter", 158.0)
 
 
-def _on_node(runner, states: dict[UUID, str] | None):
-    """The node also answers the operations' runner states (None: the read fails)."""
+def _on_node(runner, states: dict[UUID, str]):
+    """The node also serves runner files claiming `states`; the check must never ask them."""
     second_look = runner.run.return_value
 
     def run(command, **_):
         if "storage-operations" not in command:
             return second_look
-        if states is None:
-            return MagicMock(success=False, stdout="")
         return MagicMock(success=True, stdout="".join(f"{op} {st}\n" for op, st in states.items()))
 
     runner.run = AsyncMock(side_effect=run)
     return runner
 
 
-def _helper_runner(
-    name: str, helper_percent: float = 700.0, host_cores: float = 10.56, state: str = "RUNNING"
-):
+def _helper_runner(name: str, helper_percent: float = 700.0, host_cores: float = 10.56):
     runner = confirming_runner(host_cores, 32, [POD, ("c2", name, helper_percent)])
-    return _on_node(runner, {OPERATION: state})
+    return _on_node(runner, {OPERATION: "RUNNING"})
 
 
-def _with_recorded_helpers(ctx, *operations: UUID, records: set[str] | None = None, age: int = 0):
+def _backend_says(ctx, answer):
+    """The backend's answer on the operation: open (True), ended (False), none (None) or raise."""
+    if isinstance(answer, Exception):
+        mock = AsyncMock(side_effect=answer)
+    elif answer is None:
+        mock = AsyncMock(return_value=None)
+    else:
+        mock = AsyncMock(
+            return_value=StorageOperationActiveResponse(
+                active=answer, status="RUNNING" if answer else "COMPLETED"
+            )
+        )
+    ctx.services.backend.get_storage_operation_active = mock
+    return ctx
+
+
+def _with_recorded_helpers(
+    ctx,
+    *operations: UUID,
+    records: set[str] | None = None,
+    age: int = 0,
+    backend: object = True,
+):
     """The operations this validator recorded when it started them here (DAH-6148).
 
     `records` shares one store across cycles; it is returned so a test can read it back."""
@@ -798,7 +813,7 @@ def _with_recorded_helpers(ctx, *operations: UUID, records: set[str] | None = No
     redis.smembers = AsyncMock(side_effect=lambda key: {record.encode() for record in store})
     redis.srem = AsyncMock(side_effect=lambda key, record: store.discard(record))
     redis.sadd = AsyncMock(side_effect=lambda key, record: store.add(record))
-    return ctx
+    return _backend_says(ctx, backend)
 
 
 async def _provider_cores(ctx) -> float:
@@ -834,69 +849,50 @@ async def test_a_lium_storage_name_the_validator_did_not_start_is_the_providers(
     assert await _provider_cores(ctx) == 8.9
 
 
-@pytest.mark.parametrize(
-    "state, age",
-    [("STATUS:0", 60), ("EXITED", 60), ("INVALID", 60), ("STARTING", 600), ("GONE", 600)],
-    ids=["finished", "runner_died", "bad_pid", "never_started", "files_gone"],
-)
 @pytest.mark.asyncio
-async def test_a_helper_name_after_its_operation_ended_is_the_providers(
-    context_factory, state, age
+async def test_node_files_saying_running_do_not_excuse_an_operation_the_backend_ended(
+    context_factory,
 ):
-    # a container started under the recorded name once the operation is over gets no excuse,
-    # and the record goes
+    # the runner files are the provider's to write; only the backend's status counts, and an
+    # ended operation's record goes
     store: set[str] = set()
     ctx = _with_recorded_helpers(
-        context_factory(
-            state=_rented_state(SN13_SPECS), runner=_helper_runner(BACKUP_HELPER, state=state)
-        ),
+        context_factory(state=_rented_state(SN13_SPECS), runner=_helper_runner(BACKUP_HELPER)),
         OPERATION,
         records=store,
-        age=age,
+        backend=False,
     )
 
     assert await _provider_cores(ctx) == 8.9
     assert store == set()
+    ctx.services.backend.get_storage_operation_active.assert_awaited_once_with(str(OPERATION))
+    assert not any("storage-operations" in c.args[0] for c in ctx.runner.run.await_args_list)
 
 
+@pytest.mark.parametrize(
+    "answer", [None, RuntimeError("backend down")], ids=["no_answer", "raised"]
+)
 @pytest.mark.asyncio
-async def test_a_helper_about_to_start_is_excused(context_factory):
-    # the record is written before the launch: no runner pid yet is not an ended operation
-    ctx = _with_recorded_helpers(
-        context_factory(
-            state=_rented_state(SN13_SPECS), runner=_helper_runner(BACKUP_HELPER, state="STARTING")
-        ),
-        OPERATION,
-    )
-
-    assert await _provider_cores(ctx) == 1.9
-
-
-@pytest.mark.asyncio
-async def test_an_operation_that_ended_inside_the_grace_excuses_nothing(context_factory):
-    # an online operation removes its files when it ends, minutes after its record: a container
-    # taking the freed helper name then is the provider's
+async def test_no_backend_answer_excuses_nothing_and_keeps_the_record(context_factory, answer):
     store: set[str] = set()
     ctx = _with_recorded_helpers(
-        context_factory(
-            state=_rented_state(SN13_SPECS), runner=_helper_runner(BACKUP_HELPER, state="GONE")
-        ),
+        context_factory(state=_rented_state(SN13_SPECS), runner=_helper_runner(BACKUP_HELPER)),
         OPERATION,
         records=store,
-        age=60,
+        backend=answer,
     )
 
     assert await _provider_cores(ctx) == 8.9
-    assert len(store) == 1  # it may still be about to launch: kept until the grace ends
+    assert len(store) == 1
 
 
-async def _cycle(context_factory, store: set[str], rows, state="RUNNING") -> float:
+async def _cycle(context_factory, store: set[str], rows) -> float:
     """One validation cycle whose scrape and second look both list `rows` (id, name, percent)."""
     containers = [
         {"container_id": cid, "name": name, "cpu_percent": pct} for cid, name, pct in rows
     ]
     specs = {**SN13_SPECS, "docker": {**SN13_SPECS["docker"], "containers": containers}}
-    runner = _on_node(confirming_runner(10.56, 32, rows), {OPERATION: state})
+    runner = _on_node(confirming_runner(10.56, 32, rows), {OPERATION: "RUNNING"})
     ctx = _with_recorded_helpers(
         context_factory(state=_rented_state(specs), runner=runner), records=store
     )
@@ -923,18 +919,6 @@ async def test_a_helper_renamed_away_from_its_name_is_the_providers(context_fact
 
     assert await _cycle(context_factory, store, [POD, ("c2", BACKUP_HELPER, 700.0)]) == 1.9
     assert await _cycle(context_factory, store, [POD, ("c2", "miner", 700.0)]) == 8.9
-
-
-@pytest.mark.asyncio
-async def test_unreadable_operation_states_excuse_nothing_and_keep_the_record(context_factory):
-    store: set[str] = set()
-    runner = _on_node(confirming_runner(10.56, 32, [POD, ("c2", BACKUP_HELPER, 700.0)]), None)
-    ctx = _with_recorded_helpers(
-        context_factory(state=_rented_state(SN13_SPECS), runner=runner), OPERATION, records=store
-    )
-
-    assert await _provider_cores(ctx) == 8.9
-    assert len(store) == 1
 
 
 @pytest.mark.asyncio
@@ -994,8 +978,8 @@ async def test_a_started_operation_records_its_helper_until_it_is_forgotten():
     store: set[str] = set()
     redis = _set_redis(store)
 
-    async def running(ops):
-        return {op: "RUNNING" for op in ops}
+    async def running(op):
+        return True
 
     await note_started_storage_helper(redis, "executor-1", OPERATION)
 
@@ -1007,51 +991,22 @@ async def test_a_started_operation_records_its_helper_until_it_is_forgotten():
     assert await settle_excused_storage_helper_keys(redis, "executor-1", running) == set()
 
 
-@pytest.mark.parametrize(
-    "files, expected",
-    [
-        ({}, "GONE"),
-        ({"json": "{}"}, "STARTING"),
-        ({"json": "{}", "pid": str(os.getpid())}, "RUNNING"),
-        ({"pid": "999999999"}, "EXITED"),
-        ({"status": "0\n"}, "STATUS:0"),
-    ],
-    ids=["no_files", "spec_only", "live_pid", "dead_pid", "ended_with_status"],
-)
-def test_the_node_command_reads_each_operation_state(tmp_path, files, expected):
-    for suffix, content in files.items():
-        (tmp_path / f"{OPERATION}.{suffix}").write_text(content)
-    command = operation_states_command([str(OPERATION)]).replace(
-        "/root/app/storage-operations", str(tmp_path)
-    )
-
-    stdout = subprocess.run(["sh", "-c", command], capture_output=True, text=True).stdout
-
-    assert parse_operation_states(stdout) == {str(OPERATION): expected}
-
-
 @pytest.mark.asyncio
-async def test_a_node_read_slower_than_the_redis_timeout_still_excuses(monkeypatch):
-    # only the Redis calls are cut at their short timeout; the node read has its own
+async def test_a_backend_answer_slower_than_the_redis_timeout_still_excuses(monkeypatch):
+    # only the Redis calls are cut at their short timeout; the backend call has its own
     monkeypatch.setattr(storage_operations, "_STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC", 0.05)
     store = {f"{OPERATION}|{int(time.time())}"}
 
-    async def slow_running(ops):
+    async def slow_running(op):
         await asyncio.sleep(0.2)
-        return {op: "RUNNING" for op in ops}
+        return True
 
     keys = await settle_excused_storage_helper_keys(_set_redis(store), "executor-1", slow_running)
 
     assert keys == {storage_helper_key(OPERATION)}
 
 
-def test_operation_states_round_trip_through_the_node_command():
-    command = operation_states_command([str(OPERATION)])
-
-    assert f"/root/app/storage-operations/{OPERATION}.pid" in command
-    assert parse_operation_states(f"{OPERATION} STATUS:0\n\n{OPERATION}x\n") == {
-        str(OPERATION): "STATUS:0"
-    }
+def test_a_helper_record_round_trips():
     assert StorageHelperRecord.parse(StorageHelperRecord(str(OPERATION), 5).format()) == (
         StorageHelperRecord(str(OPERATION), 5)
     )

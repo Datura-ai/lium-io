@@ -26,9 +26,9 @@ REMOTE_SECRETS_DIRECTORY = PurePosixPath("/root/app/storage-secrets")
 # DAH-6148: an operation runs restic in a `lium-storage-<operation id[:12]>` helper container on
 # the node, and reruns it under the same name when it renews credentials or retries an upload.
 # The operations this validator started are recorded per executor, and the provider-side load
-# check excuses a helper only by its exact name, only while the node shows that operation's
-# runner alive, and only up to the helper cap: never a container that only wears the prefix,
-# and never one after its operation ended.
+# check excuses a helper only by its exact name, only while the backend has that operation
+# open (never by files on the node, which the provider can write), and only up to the helper
+# cap: never a container that only wears the prefix, and never one after its operation ended.
 STORAGE_HELPER_PREFIX = "lium-storage-"
 STARTED_STORAGE_HELPERS_PREFIX = "started_storage_helpers:"
 # a docker container name cannot hold ":", so no container's name or id ever matches this key
@@ -36,8 +36,6 @@ STORAGE_HELPER_KEY_MARK = "helper:"
 # the backend fails a backup still open after 4 h (BACKUP_AUTH_TOKEN_EXPIRY_HOURS): no helper
 # legitimately outlives that, so no record does either
 STARTED_STORAGE_HELPERS_TTL_SECONDS = 4 * 3600
-# the record is written before the launch, so its runner may not have a pid yet
-STORAGE_OPERATION_START_GRACE_SECONDS = 300
 _STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC = 2
 
 
@@ -116,44 +114,18 @@ async def forget_storage_helper(
     await _redis_call(f"forget {operation_id} on {executor_id}", forget)
 
 
-def operation_states_command(operation_ids: list[str]) -> str:
-    """One `<operation id> <state>` line per operation, the state as `_operation_state` reads it,
-    except that STARTING with no spec file reads GONE: the operation either has not been written
-    yet or has ended (an online one removes its status, pid and spec when it ends)."""
-    lines: list[str] = []
-    for op in operation_ids:
-        files = StorageOperationFiles.for_operation(UUID(op))
-        lines.append(
-            f"state=$({_operation_state_command(files)}); "
-            f'if [ "$state" = STARTING ] && ! test -e {shlex.quote(str(files.spec))}; '
-            "then state=GONE; fi; "
-            f"printf '%s %s\\n' {shlex.quote(op)} \"$state\";"
-        )
-    return " ".join(lines)
-
-
-def parse_operation_states(stdout: str) -> dict[str, str]:
-    states: dict[str, str] = {}
-    for line in stdout.splitlines():
-        operation_id, _, state = line.strip().partition(" ")
-        if operation_id and state:
-            states[operation_id] = state.strip()
-    return states
-
-
 async def settle_excused_storage_helper_keys(
     redis: RedisService,
     executor_id: str,
-    read_states: Callable[[list[str]], Awaitable[dict[str, str] | None]],
+    is_open: Callable[[str], Awaitable[bool | None]],
 ) -> set[str]:
     """Drops the records whose operation ended and returns the helper keys to excuse.
 
-    `read_states` reads the operations' runner states on the node (None when unreadable). An
-    operation is open while its runner is alive, or for a short grace while its spec is written
-    and its runner not yet; an ended one, or one past the TTL, loses its record. No files at all
-    (GONE) excuses nothing: inside the grace the record waits for the launch, after it it goes.
-    Unreadable states keep every record and
-    excuse nothing this cycle, and so does Redis not answering.
+    `is_open` asks the backend whether the operation is still open (None: no answer). The node's
+    own runner files are never read: the provider can write them (DAH-6148). An open operation's
+    helper is excused by its exact name; an ended one, or one past the TTL, loses its record. An
+    operation the backend did not answer for keeps its record and excuses nothing this cycle, and
+    so does Redis not answering.
     """
     raw_records: list[str] = []
 
@@ -171,21 +143,14 @@ async def settle_excused_storage_helper_keys(
     }
     ended = list(records.keys() - unexpired_records.keys())
     keys: set[str] = set()
-    # outside the Redis timeout: the node read has its own, longer one
-    states = (
-        await read_states(sorted({r.operation_id for r in unexpired_records.values()}))
-        if unexpired_records
-        else None
-    )
-    if states is not None:
-        for raw, record in unexpired_records.items():
-            state = states.get(record.operation_id, "")
-            in_grace = now - record.started <= STORAGE_OPERATION_START_GRACE_SECONDS
-            if state == "RUNNING" or (state == "STARTING" and in_grace):
-                keys.add(storage_helper_key(record.operation_id))
-            elif not (state == "GONE" and in_grace):
-                # GONE in the grace may still be about to launch: kept, but excuses nothing
-                ended.append(raw)
+    # outside the Redis timeout: the backend call has its own, longer one
+    operation_ids = sorted({r.operation_id for r in unexpired_records.values()})
+    answers = dict(zip(operation_ids, await asyncio.gather(*map(is_open, operation_ids))))
+    for raw, record in unexpired_records.items():
+        if answers[record.operation_id]:
+            keys.add(storage_helper_key(record.operation_id))
+        elif answers[record.operation_id] is False:
+            ended.append(raw)
 
     async def drop_ended_records() -> None:
         for raw in ended:
