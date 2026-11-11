@@ -160,7 +160,7 @@ def test_fetch_verified_digest_returns_digest_on_success(mock_get, mock_verify):
     # Assert — verified digest is returned and the correct URL was used
     assert digest == "sha256:newdigest"
     mock_get.assert_called_once_with(
-        "http://test-endpoint.com/digest", headers={"User-Agent": "lium-watchtower/1.2.1"}, timeout=30
+        "http://test-endpoint.com/digest", headers={"User-Agent": "lium-watchtower/1.2.2"}, timeout=30
     )
     mock_verify.assert_called_once()
 
@@ -822,6 +822,21 @@ def test_recreate_container_restores_the_old_runner_when_the_new_one_does_not_st
     runner.remove.assert_not_called()
 
 
+def test_recreate_container_never_starts_a_runner_that_was_only_created_when_the_new_one_does_not_start():
+    """A runner made by `docker compose create` holds an unverified image: when the signed
+    one does not start, it gets its name back but stays stopped for the next cycle."""
+    runner = _fake_container(status="created")
+    client = _client_with(runner)
+    client.api.start.side_effect = docker.errors.APIError("cannot start")
+
+    with pytest.raises(docker.errors.APIError):
+        recreate_container(client, runner, f"{IMAGE}@{NEW_DIGEST}")
+
+    client.api.remove_container.assert_called_once_with("newid", force=True)
+    assert runner.rename.call_args_list[-1].args[0] == "executor-executor-runner-1"
+    runner.start.assert_not_called()
+
+
 # ── pull_and_restart_containers ───────────────────────────────────────────────
 
 def test_pull_and_restart_containers_rebuilds_the_compose_runner_from_the_digest():
@@ -1304,6 +1319,28 @@ def test_check_and_update_skips_the_probe_when_there_is_no_runner_yet(
     to break; the create path is unchanged."""
     mock_settings.WATCHTOWER_IMAGE = IMAGE
     client = _client_with(None)
+    mock_docker.return_value = client
+    mock_fetch.return_value = NEW_DIGEST
+    mock_pull.return_value = True
+
+    check_and_update()
+
+    mock_probe.assert_not_called()
+    mock_pull.assert_called_once_with(client, IMAGE, NEW_DIGEST)
+
+
+@patch('watchtower.probe_nvidia_runtime')
+@patch('watchtower.pull_and_restart_containers')
+@patch('watchtower.fetch_verified_digest')
+@patch('watchtower.docker.from_env')
+@patch('watchtower.settings')
+def test_check_and_update_skips_the_probe_for_a_runner_that_was_only_created(
+    mock_settings, mock_docker, mock_fetch, mock_pull, mock_probe
+):
+    """The probe would run the created runner's unverified image; it goes straight to the
+    signed pull instead."""
+    mock_settings.WATCHTOWER_IMAGE = IMAGE
+    client = _client_with(_fake_container(status="created"))
     mock_docker.return_value = client
     mock_fetch.return_value = NEW_DIGEST
     mock_pull.return_value = True

@@ -450,6 +450,8 @@ def recreate_container(client: docker.DockerClient, old: Container, image_refere
     name = kwargs["name"]
     previous_name = previous_runner_name(name, old.short_id)
     logger.info(_m("Renaming existing container aside", {"name": name, "id": old.short_id, "to": previous_name}))
+    # A runner that never ran (`docker compose create`) holds an image nobody verified: never start it.
+    never_started = old.status == "created"
     old.rename(previous_name)
     try:
         logger.info(_m("Creating new container with updated image", {"name": name, "image": image_reference}))
@@ -465,7 +467,8 @@ def recreate_container(client: docker.DockerClient, old: Container, image_refere
         logger.error(_m("Switch to the new container failed, restoring the old one", {"name": name, "image": image_reference}))
         client.api.remove_container(created["Id"], force=True)
         old.rename(name)
-        old.start()
+        if not never_started:
+            old.start()
         raise
     logger.info(_m("Removing old container", {"name": previous_name}))
     old.remove(force=True)
@@ -667,7 +670,9 @@ def check_and_update() -> None:
         # GPU container right now. The check repeats every cycle, so the update resumes on its
         # own once the host is fixed (reboot or driver reload). A first boot (no runner) has
         # nothing to break and skips the probe.
-        if container is not None:
+        # A runner that never ran has an unverified image: running even `true` from it is not safe,
+        # and nothing runs on it that an update could break.
+        if container is not None and container.status != "created":
             image_id = container.attrs.get("Image")
             probe = (
                 probe_nvidia_runtime(client, image_id)
