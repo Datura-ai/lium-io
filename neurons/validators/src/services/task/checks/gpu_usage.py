@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -15,7 +16,7 @@ from protocol.vc_protocol.compute_requests import (
 )
 from services.const import (
     BROKEN_POD_CONTAINER_GRACE_MINUTES,
-    EDIT_PARKED_SUFFIX,
+    unparked_name,
     FILLER_CONTAINER_PREFIX,
     GPU_HELD_VRAM_MB_LIMIT,
     GPU_MEMORY_UTILIZATION_LIMIT,
@@ -669,8 +670,26 @@ def _measured_usage_remediation(violation: dict, filler_containers: set[str]) ->
 
 
 def _describe_process(process: dict) -> str:
-    owner: str = process.get("container_name") or process.get("name") or "a host process"
+    owner: str = (
+        process.get("container_name") or process.get("name") or _removed_container_owner(process)
+    )
     return f"{owner} (pid {process.get('pid')})"
+
+
+# systemd driver: .../docker-<id>.scope; cgroupfs driver (neurons/executor/daemon.json): .../<id>/...
+_DOCKER_SCOPE = re.compile(r"(?:docker-([0-9a-f]{64})\.scope|/([0-9a-f]{64})(?=/|$))")
+
+
+def _removed_container_owner(process: dict) -> str:
+    # the scrape lists running containers only: a docker cgroup it cannot name is a process the
+    # container's removal could not kill (ticket-0996, stuck in the GPU driver); only a reboot ends it,
+    # and a reboot beside a live rental would stop the renter's pod
+    if match := _DOCKER_SCOPE.search(process.get("info") or ""):
+        return (
+            f"a leftover process of container {(match[1] or match[2])[:12]}, which is no longer running "
+            "(once no rental is running, reboot the node to clear it)"
+        )
+    return "a host process"
 
 
 def _in_minutes(elapsed: timedelta) -> str:
@@ -687,7 +706,7 @@ async def _pod_container_rental(ctx: Context, container_name: str) -> PodContain
     container called pod_<any uuid> must not buy a pass.
     """
     pod_id: str | None = _uuid_after_prefix(
-        container_name.removesuffix(EDIT_PARKED_SUFFIX), POD_CONTAINER_PREFIX
+        unparked_name(container_name), POD_CONTAINER_PREFIX
     )
     if pod_id is None:
         return PodContainerRental(

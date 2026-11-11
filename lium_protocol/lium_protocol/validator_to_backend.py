@@ -446,6 +446,8 @@ class ContainerCreated(PodContainerResponse):
     volume_limit_gb: int | None = None
     local_volume_path: str | None = None
     volume_encryption_status: VolumeEncryptionStatus | None = None
+    # the ContainerCreateRequest's command_id, echoed so the backend can tell which dispatch this completes
+    command_id: str = ""
 
 
 @VALIDATOR_MESSAGES.register
@@ -566,7 +568,7 @@ class GpuResetErrorCode(enum.Enum):
     ExecutorUnreachable = "ExecutorUnreachable"
     # 2.4.0: sysbox or TEE pod, no supported clocks, or the driver refused the lock
     ClockLockNotSupported = "ClockLockNotSupported"
-    # 2.12.0: the host GPU listing failed, timed out or came back empty: the GPUs are gone from the host driver
+    # 2.14.0: the host GPU listing failed, timed out or came back empty: the GPUs are gone from the host driver
     GpusLostOnHost = "GpusLostOnHost"
 
 

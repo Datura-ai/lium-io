@@ -229,6 +229,23 @@ class FakeRedis:
         for field in fields:
             self.hashes.get(key, {}).pop(field, None)
 
+    async def _update_pending_pods(self, miner_hotkey: str, executor_id: str, change, also=None):
+        """`RedisService._update_pending_pods`: read, change and write with no await between, so atomic here;
+        `also()` first, so a batch that fails applies none of it"""
+        import json
+
+        from neurons.validators.src.services.redis_service import PENDING_PODS_PREFIX, _parse_pending_pods
+
+        self._touch()
+        field = f"{miner_hotkey}:{executor_id}"
+        pending_pods = change(_parse_pending_pods(self.hashes.get(PENDING_PODS_PREFIX, {}).get(field)))
+        if also:
+            await self.write_atomically(also())
+        if pending_pods:
+            self.hashes.setdefault(PENDING_PODS_PREFIX, {})[field] = json.dumps(pending_pods)
+        else:
+            self.hashes.get(PENDING_PODS_PREFIX, {}).pop(field, None)
+
     async def expire(self, key: str, seconds: int):
         self._touch()
         if key in self.store or key in self.hashes:
@@ -281,6 +298,8 @@ def build_services(**overrides) -> ContextServices:
     pod_recovery = AsyncMock()
     # A bare AsyncMock would report every pod as recovered; opt in per test instead.
     pod_recovery.recover_pod_after_stale_vloopback_mount.return_value = False
+    pod_recovery.recover_parked_pod_container.return_value = False
+    pod_recovery.encrypted_volume_mount_missing.return_value = False
     backend = AsyncMock()
     # A bare AsyncMock would confirm every Lium-named container as ours (DAH-2757); opt in per test.
     backend.get_filler_run_active.return_value = FillerRunActiveResponse(active=False)

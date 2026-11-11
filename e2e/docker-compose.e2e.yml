@@ -52,6 +52,7 @@ services:
       context: ../neurons/executor
       additional_contexts:
         datura: ../datura
+        liumd: ../neurons/executor/liumd
     image: lium-e2e/executor
     network_mode: service:dind
     # Match a provider executor: it can inspect the daemon host's saved plugin manifest
