@@ -56,29 +56,29 @@ APP_UNLISTED = "NVRM: Xid (PCI:0000:81:00): 69, pid=1, Graphics Exception: Class
 OTHER_CARD = "NVRM: Xid (PCI:0000:c1:00): 79, pid=1, GPU has fallen off the bus."
 
 
-def _card_xids(lines, seen, available=True):
+def _card_xids(lines, xid_seen, available=True):
     ns = _probe_namespace("card_xid_faults", "xid_faults", "pci_key", "SOFTWARE_XIDS", "HARDWARE_XIDS")
     ns["re"] = __import__("re")
     xid = {"available": available, "count": len(lines), "lines": lines}
-    return ns["card_xid_faults"]({"available": True, "gpus": [XID_GPU]}, xid, seen)
+    return ns["card_xid_faults"]({"available": True, "gpus": [XID_GPU]}, xid, xid_seen)
 
 
 def test_only_a_new_hardware_xid_on_this_nodes_card_is_a_fault():
-    faults = _card_xids([OLD, HW, APP, APP_UNLISTED, OTHER_CARD], seen=1)
+    faults = _card_xids([OLD, HW, APP, APP_UNLISTED, OTHER_CARD], xid_seen=1)
 
     assert faults == [f"gpu 2 (GPU-2): new NVRM Xid on a probed GPU: {HW}"]
 
 
 @pytest.mark.parametrize(
-    "seen, available",
+    "xid_seen, available",
     [
         pytest.param(None, True, id="no-baseline-yet"),
         pytest.param(9, True, id="log-shorter-than-baseline"),
         pytest.param(0, False, id="kernel-log-not-readable"),
     ],
 )
-def test_no_baseline_a_rotated_log_or_an_unreadable_one_flags_nothing(seen, available):
-    assert _card_xids([OLD, HW], seen=seen, available=available) == []
+def test_no_baseline_a_rotated_log_or_an_unreadable_one_flags_nothing(xid_seen, available):
+    assert _card_xids([OLD, HW], xid_seen=xid_seen, available=available) == []
 
 
 def test_nvml_only_reports_the_xid_read_and_the_card_lists():
@@ -145,6 +145,30 @@ async def test_a_card_nvml_could_not_name_keeps_the_xid_baseline(context_factory
     # the probe cannot tie that card's new Xid lines to it this cycle, so they must be judged next time
     await _read(context_factory, services, _ok(gpu={unread: None}, xid={"available": True, "count": 6}))
     assert _stored(services.redis)["xid_seen"] == 4
+
+
+@pytest.mark.asyncio
+async def test_a_first_read_with_an_untied_card_still_takes_the_xid_baseline(context_factory):
+    services = _services()
+    # no baseline yet: the probe judged no lines, so the count is the baseline even if a card is untied (review)
+    await _read(context_factory, services, _ok(gpu={"pci_bus_id": None}, xid={"available": True, "count": 4}))
+    assert _stored(services.redis)["xid_seen"] == 4
+
+
+@pytest.mark.asyncio
+async def test_a_reboot_heals_a_held_xid_even_when_a_card_is_missing_from_a_partial_read(context_factory):
+    services = _services()
+    xid_fault = f"gpu 3 ({UUIDS[3]}): new NVRM Xid on a probed GPU: {HW}"
+    await _read(context_factory, services, _ok(xid={"available": True, "count": 4}, boot_id="boot-a"))
+    await _read(
+        context_factory, services,
+        _ok(xid={"available": True, "count": 5}, xid_faults=[xid_fault], boot_id="boot-a"),
+    )
+    # the card is not named on this read (no UUID), but the host booted again: the reboot proof must count
+    rebooted, _ = await _read(
+        context_factory, services, _ok(gpu={"uuid": None}, xid={"available": True, "count": 1}, boot_id="boot-b")
+    )
+    assert rebooted.report["card_faults"] == []
 
 
 @pytest.mark.asyncio

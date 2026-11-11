@@ -95,6 +95,8 @@ def _held_fault_proven_healed(
     uuid = _card_uuid(fault)
     if uuid is None:
         return False
+    if _fault_kind(fault) == "xid" and rebooted:
+        return True
     gpu = gpus.get(uuid)
     if gpu is None:
         return every_card_named
@@ -102,7 +104,7 @@ def _held_fault_proven_healed(
         link = [gpu.get(k) for k in ("pcie_width", "pcie_width_max", "pcie_gen", "pcie_gen_max")]
         return gpu.get("pstate") == 0 and None not in link and link[0] == link[1] and link[2] == link[3]
     # shortcut: a card reset without a reboot leaves an Xid fault held; add a reset proof if that bites
-    return rebooted
+    return False
 
 
 async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardHealthState) -> None:
@@ -127,25 +129,27 @@ async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardH
     listed = [gpu for gpu in (report.get("nvml") or {}).get("gpus") or [] if isinstance(gpu, dict)]
     gpus = {gpu["uuid"]: gpu for gpu in listed if isinstance(gpu.get("uuid"), str)}
     every_card_named = bool(listed) and len(gpus) == len(listed)
-    # a card read without its UUID or bus id had its new Xid lines skipped: keep them for the next read
+    # a card read without its UUID or bus id had its new Xid lines skipped: keep them for the next read;
+    # with no baseline yet no line was judged, so the count is the baseline
     every_card_tied = every_card_named and all(isinstance(gpu.get("pci_bus_id"), str) for gpu in listed)
-    seen = xid.get("count") if xid.get("available") and every_card_tied else before.xid_seen
+    takes_count = xid.get("available") and (every_card_tied or before.xid_seen is None)
+    xid_seen = xid.get("count") if takes_count else before.xid_seen
     downgraded_before = {_card_uuid(s) for s in before.pcie_downgrades} - {None}
     confirmed_this_read = xid_faults + [s for s in downgrades if _card_uuid(s) in downgraded_before]
     held = [f for f in before.held if not _held_fault_proven_healed(f, gpus, every_card_named, rebooted)]
     # one fault per card and kind, this read's first: a card repeating an Xid must not grow the stored state,
     # and a link fault healing must not close the same card's Xid, which needs its own proof
-    by_card: dict[tuple[str, str], str] = {}
+    fault_by_card_and_kind: dict[tuple[str, str], str] = {}
     for fault in confirmed_this_read + held:
         uuid = _card_uuid(fault)
         if uuid is not None:
-            by_card.setdefault((uuid, _fault_kind(fault)), fault)
-    report["card_faults"] = list(by_card.values())
+            fault_by_card_and_kind.setdefault((uuid, _fault_kind(fault)), fault)
+    report["card_faults"] = list(fault_by_card_and_kind.values())
     if settings.DRY_RUN:
         return
     key = _card_health_key(ctx)
     state = CardHealthState(
-        xid_seen=seen, boot_id=boot_id or before.boot_id, pcie_downgrades=downgrades, held=report["card_faults"]
+        xid_seen=xid_seen, boot_id=boot_id or before.boot_id, pcie_downgrades=downgrades, held=report["card_faults"]
     )
     try:
         await ctx.services.redis.set(key, json.dumps(asdict(state)), ex=CARD_HEALTH_TTL_SECONDS)
