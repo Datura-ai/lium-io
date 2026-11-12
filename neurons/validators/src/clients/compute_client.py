@@ -3,6 +3,7 @@ import functools
 import json
 import logging
 import os
+import random
 import time
 from contextlib import suppress
 from contextvars import ContextVar
@@ -115,6 +116,17 @@ logger = logging.getLogger(__name__)
 # mirrors ws_ping_* in compute-app apps/server/src/core/uvicorn_worker.py, which holds the burst.
 WS_PING_INTERVAL = 20
 WS_PING_TIMEOUT = 40
+# The backend waits 10 s for a validator connection on a rent, so after the backend restarts the connector must be
+# back within seconds; the websockets default backoff grows to 90 s (55.6 s waits seen on 12 Nov).
+WS_RECONNECT_MAX_DELAY = 8
+
+
+def reconnect_delays():
+    """Waits between failed connects: 1, 2, 4, 8, 8... s with jitter. websockets starts a new one after a connect."""
+    delay = 1.0
+    while True:
+        yield delay * random.uniform(0.5, 1.0)
+        delay = min(delay * 2, WS_RECONNECT_MAX_DELAY)
 # the backend closes the socket with 1009 on a bigger frame (its ws_max_size); resending that frame can never succeed
 MAX_FRAME_BYTES = 4 * 1024 * 1024
 # room left for the delivery stamps send_model adds to an event report
@@ -293,6 +305,7 @@ class ComputeClient:
             self.compute_app_uri,
             ping_interval=WS_PING_INTERVAL,
             ping_timeout=WS_PING_TIMEOUT,
+            reconnect_delays=reconnect_delays,
         )
 
     async def miner_driver_awaiter(self):
