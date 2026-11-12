@@ -3883,7 +3883,11 @@ class DockerService:
         The backend sizes a whole-host rental at every host core, which leaves sshd, dockerd and the
         executor only the scheduler's share under a full load. A host too small for the reserve, an
         unread host count or no per-pod cap (None) keep the value as sent."""
-        if not cpu_count or not host_cpu_count:
+        if cpu_count is None:
+            return None
+        # a 1-GPU slice of a small host rounds down to 0 cores, and 0 means no --cpus (the whole host)
+        cpu_count = max(cpu_count, 1)
+        if not host_cpu_count:
             return cpu_count
         reserve = settings.RENTAL_HOST_CPU_RESERVE
         room = host_cpu_count - reserve

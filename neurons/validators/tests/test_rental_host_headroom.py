@@ -42,6 +42,8 @@ def test_a_rental_container_log_is_capped_so_stdout_cannot_fill_the_host_disk(sv
         (None, 128, None),  # no per-pod cap (CVM) stays uncapped
         (2, 1, 2),  # a host too small for the reserve keeps the backend's value
         (4, 2, 4 - settings.RENTAL_HOST_CPU_RESERVE),  # a low host count never cuts more than the reserve
+        (0, 8, 1),  # a 1-GPU slice of an 8-core 8-GPU host rounds to 0: floored at 1, never unlimited
+        (0, None, 1),  # same with the host count unread
     ],
 )
 def test_rental_cpu_count_leaves_the_host_reserve(cpu_count, host_cpus, expected):
