@@ -86,6 +86,13 @@ SSHD_BOOTSTRAP_FAILED_PREFIX = "sshd_bootstrap_failed"
 # prod, 24 h: failed filler creates on a broken node came 5 min to 2.7 h apart, so 6 h outlives the
 # longest gap about twice over; a stale stamp ends by itself
 SSHD_BOOTSTRAP_FAILED_TTL_SECONDS = 6 * 3600
+# DAH-6066: the host's MemAvailable (KiB) read at a create with no pod or filler on it, per executor; it caps
+# later rentals' memory limits. Refreshed at every idle create; 30 days so a node rented for weeks keeps it.
+IDLE_MEM_AVAILABLE_PREFIX = "idle_mem_available_kib"
+IDLE_MEM_AVAILABLE_TTL_SECONDS = 30 * 24 * 3600
+# DAH-6066: share of the host's free-if-empty MemAvailable kept free: the kernel's free-page floor plus slab and
+# page-table growth while a rental runs, which scale with the host. The reserve clamp still bounds small hosts.
+IDLE_MEM_AVAILABLE_MARGIN_PERCENT = 3
 
 
 def create_started_at_key(miner_hotkey: str, executor_id: str) -> str:
