@@ -9,8 +9,10 @@ from neurons.validators.src.services.task.availability import availability_error
 from neurons.validators.src.services.task.checks import capability
 from neurons.validators.src.services.task.checks.capability import CapabilityCheck
 from neurons.validators.src.services.task.checks.gpu_model_verdict import GpuModelVerdictCheck
+from neurons.validators.src.services.const import GPU_MODEL_RATES
 from neurons.validators.src.services.task.checks.gpu_model_truth import (
     EXPECTED_CC_AND_SM,
+    NOT_JUDGED_YET,
     gpu_model_mismatch,
 )
 from neurons.validators.src.services.task.messages import CapabilityMessages as Msg
@@ -419,3 +421,67 @@ def test_a_gpu_model_mismatch_is_the_nodes_own_fault_never_our_outage():
 
     assert AvailabilityErrorCode(Msg.GPU_MODEL_MISMATCH.reason) in NODE_GPU_FAULT_CODES
     assert _is_the_nodes_own_fault({"reason_code": Msg.GPU_MODEL_MISMATCH.reason}) is True
+
+
+def test_an_nvml_alias_of_a_listed_model_is_judged():
+    assert gpu_model_mismatch(_specs("Tesla H100 80GB HBM3"), {"cc": "8.0", "sm_count": 108}) is not None
+
+
+def test_every_rated_model_is_judged_or_listed_as_not_judged_yet():
+    assert sorted(set(GPU_MODEL_RATES) - set(EXPECTED_CC_AND_SM) - NOT_JUDGED_YET) == []
+    assert sorted(NOT_JUDGED_YET & set(EXPECTED_CC_AND_SM)) == []
+
+
+class _PinnedCardService(DummyValidationService):
+    """The idle matmul runs on card 0 only (all-cards off); a run pinned to a card UUID answers that
+    card's own numbers."""
+
+    def __init__(self, card_0: dict, pinned: dict[str, dict]):
+        super().__init__(success=True, metrics=card_0)
+        self.card_0, self.pinned, self.gpu_uuids = card_0, pinned, []
+
+    async def validate_gpu_model_and_process_job(self, *, gpu_uuid=None, vram_budget_mb=None, probe_all_cards=True, **kwargs):
+        if gpu_uuid:
+            self.gpu_uuids.append(gpu_uuid)
+        self.metrics = self.pinned[gpu_uuid] if gpu_uuid else self.card_0
+        return await super().validate_gpu_model_and_process_job(**kwargs)
+
+
+async def _idle_run(context_factory, redis, service):
+    ctx = context_factory(
+        services=build_services(validation=service, redis=redis),
+        config=build_context_config(),
+        state=build_state(specs=_two_card_specs()),
+    )
+    return await CapabilityCheck().run(ctx)
+
+
+def _store_card_1_mismatch(redis) -> None:
+    mismatch = gpu_model_mismatch(_two_card_specs(), FAKE_H100[1], 1)
+    redis.store[_verdict_key()] = json.dumps({"mismatches": [mismatch.as_dict()]})
+
+
+@pytest.mark.asyncio
+async def test_a_stored_mismatch_on_card_1_is_measured_again_on_that_card_and_clears_when_real(context_factory):
+    redis = FakeRedis()
+    _store_card_1_mismatch(redis)
+    service = _PinnedCardService(REAL_H100[1], {"GPU-1": REAL_H100[1]})
+
+    result = await _idle_run(context_factory, redis, service)
+
+    assert service.gpu_uuids == ["GPU-1"]
+    assert result.passed is True
+    assert json.loads(redis.store[_verdict_key()])["mismatches"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_stored_mismatch_on_card_1_stands_when_that_card_is_still_faked(context_factory):
+    redis = FakeRedis()
+    _store_card_1_mismatch(redis)
+    service = _PinnedCardService(REAL_H100[1], {"GPU-1": FAKE_H100[1]})
+
+    result = await _idle_run(context_factory, redis, service)
+
+    assert service.gpu_uuids == ["GPU-1"]
+    assert result.passed is False
+    assert result.event.what_we_saw["card_index"] == 1

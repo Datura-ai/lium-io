@@ -123,11 +123,11 @@ class CapabilityCheck:
         if result and result.success:
             # DAH-6241: a correct answer from a card that is not the reported model earns nothing
             card_metrics = getattr(result, "card_metrics", None)
+            measured_cards = judged_cards(result.metrics, card_metrics)
             mismatches = await judge_gpu_model(
-                ctx,
-                gpu_model_mismatches(specs, result.metrics, card_metrics),
-                judged_cards(result.metrics, card_metrics),
+                ctx, gpu_model_mismatches(specs, result.metrics, card_metrics), measured_cards
             )
+            mismatches = await _remeasure_carried_mismatch(ctx, specs, mismatches, measured_cards)
             if mismatches:
                 return gpu_model_mismatch_result(
                     ctx, self.check_id, {**mismatches[0].as_dict(), "sealed": result.sealed, "transport": transport}
@@ -370,13 +370,27 @@ async def _filler_matmul_sample(
     within the budget. One card per sample costs what an unpinned sample did; every card in one
     sample could run past the job timeout on a wedged node."""
     sample: dict = {"vram_budget_mb": settings.FILLER_MATMUL_SAMPLE_VRAM_MB}
-    found: list[GpuModelMismatch] | None = None  # None: the sample gave no verdict
     details = (specs.get("gpu") or {}).get("details") or []
-    gpu_uuid = None
     if details:
         every = max(settings.FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES, 1)
         sample_index = (cycle + _filler_sample_offset(ctx)) // every
-        card_index = sample_index % len(details)
+        found = await _card_matmul_sample(ctx, specs, sample_index % len(details), sample)
+    else:
+        found = await _card_matmul_sample(ctx, specs, None, sample)
+    logger.warning(_m("FILLER_MATMUL_SAMPLE", extra=get_extra_info({**ctx.default_extra, **sample})))
+    return sample, found
+
+
+async def _card_matmul_sample(
+    ctx: Context, specs: dict, card_index: int | None, sample: dict
+) -> list[GpuModelMismatch] | None:
+    """The sealed challenge on a small VRAM budget, pinned to the reported card at `card_index`
+    (unpinned when the specs list no card). Records the run in `sample`; answers the card's GPU
+    model mismatches, or None when the run gave no verdict."""
+    found: list[GpuModelMismatch] | None = None
+    gpu_uuid = None
+    details = (specs.get("gpu") or {}).get("details") or []
+    if card_index is not None:
         gpu_uuid = details[card_index].get("uuid") or ""
         sample.update(card_index=card_index, card_count=len(details), gpu_uuid=gpu_uuid)
     try:
@@ -405,8 +419,26 @@ async def _filler_matmul_sample(
             sample["error_kind"] = _sample_error_kind(result)
     except Exception as exc:
         sample.update(passed=False, timed_out=False, error=str(exc), error_kind="validator_error")
-    logger.warning(_m("FILLER_MATMUL_SAMPLE", extra=get_extra_info({**ctx.default_extra, **sample})))
-    return sample, found
+    return found
+
+
+async def _remeasure_carried_mismatch(
+    ctx: Context, specs: dict, mismatches: list[GpuModelMismatch], measured_cards: set[int]
+) -> list[GpuModelMismatch]:
+    """A stored mismatch on a card this run did not measure (all-cards off: the matmul ran on
+    card 0 only) is measured again on that card, pinned, one card per cycle, so a card that was
+    put right clears and a stored mismatch never stands unmeasured. A run with no verdict keeps
+    it."""
+    carried = [m.card_index for m in mismatches if m.card_index not in measured_cards]
+    if not carried:
+        return mismatches
+    sample: dict = {"vram_budget_mb": settings.FILLER_MATMUL_SAMPLE_VRAM_MB, "reason": "carried_gpu_model_mismatch"}
+    found = await _card_matmul_sample(ctx, specs, carried[0], sample)
+    logger.warning(_m("GPU_MODEL_MISMATCH_REMEASURE", extra=get_extra_info({**ctx.default_extra, **sample})))
+    if found is None:
+        return mismatches
+    return await judge_gpu_model(ctx, found, {carried[0]})
+
 
 
 def gpu_model_mismatch_result(ctx: Context, check_id: str, what: dict) -> CheckResult:
