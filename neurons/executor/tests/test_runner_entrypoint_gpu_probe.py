@@ -20,6 +20,7 @@ DOCKER_STUB = textwrap.dedent(
     """\
     #!/bin/sh
     echo "$*" >> "$STUB_CALLS"
+    [ "$1" = exec ] && exit "${STUB_SSH_SESSION_EXIT:-1}"
     case "$1 $2" in
         "compose ps") echo "${STUB_RUNNING_EXECUTOR:-}" ;;
         "compose logs") exit 0 ;;
@@ -59,7 +60,7 @@ def run_entrypoint(tmp_path, **env):
     calls.touch()
     result = subprocess.run(
         ["sh", SCRIPT],
-        env={"PATH": str(bin_dir), "STUB_CALLS": str(calls), **env},
+        env={"PATH": str(bin_dir), "STUB_CALLS": str(calls), "RUNNER_SSH_HOLD_FILE": str(tmp_path / "hold"), **env},
         capture_output=True,
         text=True,
         timeout=30,
@@ -196,3 +197,30 @@ def test_old_images_are_kept_when_the_running_image_cannot_be_tagged(tmp_path):
     assert recreated(calls)
     assert "image prune -f" in calls
     assert any(c.startswith("compose logs") for c in calls)
+
+
+def test_open_validator_ssh_session_holds_the_recreate(tmp_path):
+    result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_SSH_SESSION_EXIT="0")
+
+    assert any(c.startswith("exec abc123 sh -c") for c in calls)
+    assert not recreated(calls)
+    assert "a validator SSH session is open" in result.stdout
+    assert "sleep 30" in calls
+    assert (tmp_path / "hold").read_text().strip() == "1"
+
+
+def test_ssh_hold_gives_up_after_the_max_tries(tmp_path):
+    (tmp_path / "hold").write_text("30\n")
+    result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_SSH_SESSION_EXIT="0")
+
+    assert recreated(calls)
+    assert "a validator SSH session is open" not in result.stdout
+    assert (tmp_path / "hold").read_text() == ""
+
+
+def test_no_ssh_session_recreates_and_resets_the_hold(tmp_path):
+    (tmp_path / "hold").write_text("5\n")
+    result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123")
+
+    assert recreated(calls)
+    assert (tmp_path / "hold").read_text() == ""

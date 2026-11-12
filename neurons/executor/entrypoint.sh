@@ -122,6 +122,21 @@ if [ -n "$running_executor" ]; then
         sleep "${RUNNER_PROBE_RETRY_SECONDS:-300}"
         exit 1
     fi
+    # sshd runs inside the executor, so a recreate cuts every open session. A root session is the validator
+    # creating a pod or checking the node; cutting it fails that create (12 Nov 2026: a pod create lost SSH in
+    # encrypted_volume_setup). Wait for it to close, at most RUNNER_SSH_HOLD_MAX_TRIES retries, so an update
+    # still lands while the validator's rollout grace covers the node.
+    hold_file=${RUNNER_SSH_HOLD_FILE:-/tmp/runner-ssh-hold-tries}
+    tries=$(cat "$hold_file" 2>/dev/null || true)
+    tries=${tries:-0}
+    if [ "$tries" -lt "${RUNNER_SSH_HOLD_MAX_TRIES:-30}" ] \
+        && docker exec "$running_executor" sh -c 'grep -qaE "^sshd[^:]*: root@" /proc/[0-9]*/cmdline' >/dev/null 2>&1; then
+        echo $((tries + 1)) > "$hold_file"
+        echo "Update held, running executor kept: a validator SSH session is open in it. Retrying in ${RUNNER_SSH_HOLD_RETRY_SECONDS:-30}s."
+        sleep "${RUNNER_SSH_HOLD_RETRY_SECONDS:-30}"
+        exit 1
+    fi
+    : > "$hold_file"
 fi
 
 docker compose up --pull always --detach --wait --force-recreate
