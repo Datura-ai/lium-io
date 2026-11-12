@@ -21,7 +21,7 @@ import urllib3
 from core.utils import _m, get_extra_info
 from datura.requests.miner_requests import ExecutorSSHInfo
 from services.const import RENTAL_CPU_COUNT_LABEL
-from services.node_host import NodeHostError, dial_validated, resolve_node_host
+from services.node_host import NodeHostError, dial_validated, reports_registered_host_key, resolve_node_host
 
 
 # 1 h: no rental pull that succeeded in 30 days took more than 44 min (DAH-3720).
@@ -278,6 +278,8 @@ def require_rental_docker_ssh_host_key(executor_info: ExecutorSSHInfo) -> str:
         raise RentalDockerConnectionError(
             "Executor is missing ssh_host_key; rental Docker operations require the executor SSH host public key"
         )
+    if not reports_registered_host_key(executor_info):
+        raise RentalDockerConnectionError("Executor ssh_host_key is not the host key registered for its hostname")
     return host_key
 
 
