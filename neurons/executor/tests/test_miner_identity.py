@@ -156,3 +156,20 @@ def test_no_host_key_proofs_when_no_private_key_can_be_read(monkeypatch, tmp_pat
     _keys_dir(monkeypatch, tmp_path, mounted=True)  # only the .pub
     body = _client().get("/miner-identity", params={"nonce": NONCE}).json()
     assert body["ssh_host_key_port"] and "host_key_proofs" not in body
+
+
+def test_host_keys_are_parsed_once_per_file_version(monkeypatch, tmp_path):
+    import os
+
+    from routes import apis
+
+    publics = _signing_keys_dir(monkeypatch, tmp_path, mounted=True)
+    apis._load_host_key.cache_clear()
+    for _ in range(3):
+        assert set(_client().get("/miner-identity", params={"nonce": NONCE}).json()["host_key_proofs"]) == set(publics)
+    assert apis._load_host_key.cache_info().misses == 3  # one parse per key, not per request
+
+    rsa_key = tmp_path / "ssh_host_rsa_key"
+    os.utime(rsa_key, ns=(rsa_key.stat().st_atime_ns, rsa_key.stat().st_mtime_ns + 1))
+    _client().get("/miner-identity", params={"nonce": NONCE})
+    assert apis._load_host_key.cache_info().misses == 4  # a rewritten key file is read again

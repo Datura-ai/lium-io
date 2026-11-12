@@ -471,7 +471,10 @@ async def get_miner_identity(
         nonce=nonce,
         account_claim=claim,
         ssh_host_key_port=port,
-        host_key_proofs=_host_key_proofs(nonce, settings.MINER_HOTKEY_SS58_ADDRESS, claim) if port else None,
+        # off the event loop: an RSA signature still costs ~ms, and this endpoint is public
+        host_key_proofs=(
+            await asyncio.to_thread(_host_key_proofs, nonce, settings.MINER_HOTKEY_SS58_ADDRESS, claim) if port else None
+        ),
     )
 
 
@@ -494,6 +497,12 @@ def _sign_with_host_key(key, message: bytes) -> bytes | None:
     return None
 
 
+@functools.lru_cache(maxsize=16)
+def _load_host_key(path: str, mtime_ns: int, size: int):
+    """Parsed once per key file version: loading (and checking) an RSA private key costs ~100 ms, signing does not."""
+    return serialization.load_ssh_private_key(Path(path).read_bytes(), password=None)
+
+
 def _host_key_proofs(nonce: str, miner_hotkey: str, account_claim: str | None) -> dict[str, str] | None:
     """A signature by each of sshd's persisted host keys over this answer, keyed by its `<type> <base64>` public line
     (DAH-5729). The portal binds a hostname node only when every key its SSH scan returned signed the check, so an SSH
@@ -502,7 +511,8 @@ def _host_key_proofs(nonce: str, miner_hotkey: str, account_claim: str | None) -
     proofs: dict[str, str] = {}
     for path in sorted(Path(settings.SSH_HOST_KEYS_DIR).glob("ssh_host_*_key")):
         try:
-            key = serialization.load_ssh_private_key(path.read_bytes(), password=None)
+            stat = path.stat()
+            key = _load_host_key(str(path), stat.st_mtime_ns, stat.st_size)
         except (OSError, ValueError, TypeError):
             continue
         signature = _sign_with_host_key(key, message)
