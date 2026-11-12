@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Literal
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.const import SECONDS_PER_BLOCK
+from services.gpu_spec_table import normalize_gpu_model
 from services.matrix_validation_service import UUID_MISMATCH_ERROR_PREFIX
 
 from ..availability import ReachSource, ReachTarget
@@ -491,7 +492,12 @@ async def _read_gpu_model_verdict(ctx: Context) -> tuple[bool, list[GpuModelMism
     except Exception as exc:
         logger.warning(_m("GPU model verdict read failed", extra=get_extra_info({**ctx.default_extra, "error": str(exc)})))
         return True, [], set(), False
-    current = [m for m in mismatches if m.reported_gpu_model == reported_gpu_model(ctx.state.specs, m.card_index)]
+    current = [
+        m
+        for m in mismatches
+        if normalize_gpu_model(m.reported_gpu_model)
+        == normalize_gpu_model(reported_gpu_model(ctx.state.specs, m.card_index))
+    ]
     return len(current) == len(mismatches), current, measured_ok, True
 
 

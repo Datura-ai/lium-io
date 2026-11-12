@@ -631,3 +631,14 @@ async def test_an_all_cards_answer_with_no_numbers_after_card_0_is_logged_and_do
 
     assert result.passed is True
     assert result.event.what_we_saw["no_numbers_cards"] == [1]
+
+
+@pytest.mark.asyncio
+async def test_a_stored_mismatch_stands_when_the_card_is_renamed_to_an_alias_of_its_model(context_factory):
+    redis = FakeRedis()
+    await _run(context_factory, "NVIDIA H100 80GB HBM3", "8.0", 108, redis=redis)
+
+    result = await _verdict_check(context_factory, redis, _rented(_specs("Tesla H100 80GB HBM3"), redis))
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.GPU_MODEL_MISMATCH.reason
