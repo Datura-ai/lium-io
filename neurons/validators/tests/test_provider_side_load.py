@@ -953,6 +953,21 @@ async def test_a_backup_that_starts_before_the_second_look_is_lium_load(context_
 
 
 @pytest.mark.asyncio
+async def test_a_backup_that_ends_before_the_second_look_is_not_excused_on_it(context_factory):
+    # the second look trusts only the fresh read: an operation the backend ended since the first
+    # read leaves no excuse behind for a container under its helper name
+    ctx = _with_recorded_helpers(
+        context_factory(state=_rented_state(SN13_SPECS), runner=_helper_runner(BACKUP_HELPER)),
+        OPERATION,
+    )
+    still_open = ctx.services.backend.get_storage_operation_active.return_value
+    ended = StorageOperationActiveResponse(active=False, status="COMPLETED", last_report_at=None)
+    ctx.services.backend.get_storage_operation_active.side_effect = [still_open, ended]
+
+    assert await _provider_cores(ctx) == 8.9
+
+
+@pytest.mark.asyncio
 async def test_a_rerun_helper_of_an_open_operation_stays_lium_load(context_factory):
     # restic renews its credentials or retries an upload in a new container under the same name
     store = {f"{OPERATION}|{int(time.time()) - 3700}"}

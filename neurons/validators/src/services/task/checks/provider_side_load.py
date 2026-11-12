@@ -562,8 +562,11 @@ class ProviderSideLoadCheck:
         if (measured.cpu_cores or 0.0) < PROVIDER_SIDE_CPU_CORES_LIMIT:
             return measured
         if lium_container_keys is not None:
-            # a backup that started after the first read is excused on the second look too
-            lium_container_keys = lium_container_keys | await excused_storage_helper_keys(ctx)
+            # the second look trusts only a fresh read of the helpers: a backup that started since
+            # the first read is excused, one the backend ended since is not
+            lium_container_keys = {
+                key for key in lium_container_keys if not key.startswith(STORAGE_HELPER_KEY_MARK)
+            } | await excused_storage_helper_keys(ctx)
         return replace(
             measured,
             cpu_cores=await self._resample_cpu_cores(ctx, lium_container_keys),
