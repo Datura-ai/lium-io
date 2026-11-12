@@ -88,6 +88,8 @@ from services.task_service import TaskService, JobResult
 from services.storage_operations import (
     cancel_storage_operation,
     report_launch_failure,
+    forget_storage_helper,
+    note_started_storage_helper,
     start_storage_operation,
     supports_workspace_field,
 )
@@ -1651,13 +1653,22 @@ class MinerService:
                     raise error
                 if payload.volume_encrypted and payload.container_name:
                     await _remount_dropped_gocryptfs(ssh_client, payload, docker_service)
-                await start_storage_operation(
-                    ssh_client,
-                    executor_info.python_path,
-                    operation_id,
-                    self._restic_backup_operation_spec(payload),
-                    retain_terminal_artifacts=False,
+                await note_started_storage_helper(
+                    self.redis_service, executor_info.uuid, operation_id
                 )
+                try:
+                    await start_storage_operation(
+                        ssh_client,
+                        executor_info.python_path,
+                        operation_id,
+                        self._restic_backup_operation_spec(payload),
+                        retain_terminal_artifacts=False,
+                    )
+                except Exception:
+                    await forget_storage_helper(
+                        self.redis_service, executor_info.uuid, operation_id
+                    )
+                    raise
                 return
 
             remote_script_path = "/root/app/backup_storage.py"
@@ -1707,13 +1718,22 @@ class MinerService:
 
             if payload.backup_engine == "restic":
                 operation_id = UUID(payload.restore_log_id)
-                await start_storage_operation(
-                    ssh_client,
-                    executor_info.python_path,
-                    operation_id,
-                    self._restic_restore_operation_spec(payload),
-                    retain_terminal_artifacts=False,
+                await note_started_storage_helper(
+                    self.redis_service, executor_info.uuid, operation_id
                 )
+                try:
+                    await start_storage_operation(
+                        ssh_client,
+                        executor_info.python_path,
+                        operation_id,
+                        self._restic_restore_operation_spec(payload),
+                        retain_terminal_artifacts=False,
+                    )
+                except Exception:
+                    await forget_storage_helper(
+                        self.redis_service, executor_info.uuid, operation_id
+                    )
+                    raise
                 return
 
             remote_script_path = "/root/app/restore_storage.py"
@@ -1766,6 +1786,9 @@ class MinerService:
             known_hosts=await _storage_known_hosts(docker_service, executor_info, payload),
         ) as ssh_client:
             await cancel_storage_operation(ssh_client, UUID(payload.operation_id))
+            await forget_storage_helper(
+                self.redis_service, executor_info.uuid, payload.operation_id
+            )
 
     @staticmethod
     def _restic_backup_operation_spec(payload: BackupContainerRequest) -> dict[str, object]:

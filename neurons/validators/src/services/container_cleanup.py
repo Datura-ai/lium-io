@@ -263,6 +263,7 @@ class ContainerCleanup:
         on_before_remove: Callable[[str], Awaitable[None]] | None = None,
         lium_workload_ended: Callable[[str], Awaitable[bool]] | None = None,
         reserve_removal: Callable[[str], bool] | None = None,
+        on_removed: Callable[[str], None] | None = None,
     ) -> tuple[int, list[str], list[str]]:
         """Remove Lium's containers whose pod is no longer live and that are older than threshold.
 
@@ -277,6 +278,9 @@ class ContainerCleanup:
 
         ``reserve_removal(container_name)`` is asked before removing a labelled pod_/filler_
         container; False defers it to a later cycle (the caller's per-cycle lookup budget is spent).
+
+        ``on_removed(container_name)`` is called right after each successful removal, so a caller that
+        times out mid-sweep still knows what is gone.
 
         Returns:
             Tuple of (number_removed, removed container names, orphaned containers that survived
@@ -352,7 +356,9 @@ class ContainerCleanup:
                     if on_before_remove is not None:
                         await on_before_remove(stripped_name)
                     keep_volume = stripped_name.partition("_")[2] in kept_volumes
-                    if await self._remove_container(ssh_client, stripped_name, keep_volume=keep_volume):
+                    if await self._remove_container(
+                        ssh_client, stripped_name, on_removed, keep_volume=keep_volume
+                    ):
                         removed_names.append(stripped_name)
                         logger.info(
                             _m(
@@ -916,7 +922,13 @@ class ContainerCleanup:
             )
             return None
 
-    async def _remove_container(self, ssh_client, container_name: str, keep_volume: bool = False) -> bool:
+    async def _remove_container(
+        self,
+        ssh_client,
+        container_name: str,
+        on_removed: Callable[[str], None] | None = None,
+        keep_volume: bool = False,
+    ) -> bool:
         """Remove a container and its associated resources.
 
         True once the container itself is gone. The pod volume removal after it is best-effort:
@@ -962,6 +974,9 @@ class ContainerCleanup:
             )
             return False
 
+        # before the volume step: a hang there must not keep the gone container's GPU processes judged
+        if on_removed is not None:
+            on_removed(container_name)
         # A create names both the container and its volume after payload.pod_id (the pod id or the
         # filler run id), so `volume_<id>` is this container's own volume and no one else's.
         for prefix in (POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX):
