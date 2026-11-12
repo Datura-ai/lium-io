@@ -1049,3 +1049,22 @@ async def test_the_ordered_share_is_checked_on_the_final_volume_size_only_after_
         assert result.failure_step == ds_module.RENTAL_DISK_SHORT_STEP
         assert "106 GB sized of 123 GB ordered" in result.detail
         svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+
+
+@pytest.mark.parametrize(("switch_pci_addresses", "expected_nvswitch_nodes"), [([], []), (["0000:05:00.0"], ["/dev/nvidia-nvswitchctl"])])
+def test_probe_shared_section_lists_nvswitch_nodes_only_with_a_switch(tmp_path, switch_pci_addresses, expected_nvswitch_nodes):
+    # DAH-6184: the NVSwitch check must survive the shlex quoting `t SHARED '...'` wraps it in.
+    (tmp_path / "dev").mkdir()
+    for node in ("nvidiactl", "nvidia-nvswitchctl"):
+        (tmp_path / "dev" / node).touch()
+    switches = tmp_path / "proc" / "driver" / "nvidia-nvswitch" / "devices"
+    switches.mkdir(parents=True)
+    for pci_address in switch_pci_addresses:
+        (switches / pci_address).mkdir()
+    command = prerun_host_probe_command(docker_image="img:1", image_label=None, with_power=False, miner_hotkey="hk")
+    command = command.replace("/dev/", f"{tmp_path}/dev/").replace("/proc/driver/", f"{tmp_path}/proc/driver/")
+
+    stdout = subprocess.run(["sh", "-c", command], capture_output=True, text=True).stdout
+
+    shared_nodes = [line.split("\t", 1)[1].removeprefix(str(tmp_path)) for line in stdout.splitlines() if line.startswith("SHARED\t")]
+    assert shared_nodes == ["/dev/nvidiactl", *expected_nvswitch_nodes]

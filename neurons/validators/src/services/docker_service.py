@@ -873,7 +873,7 @@ def _docker_rm_command(targets: list[str]) -> str:
 class RentalDiskFit(NamedTuple):
     """What a customer rental needs free beside the filler caches (DAH-5260)."""
 
-    own_gb: float  # its volume (unless already on disk) plus its container storage
+    own_gb: float  # its volume (unless already on disk); the container storage is a quota, not disk
     existing_gb: float  # pod volumes already on disk less the sizing overhead (fresh sizing only)
     disk_share: float
     fresh_sizing: bool
@@ -881,7 +881,9 @@ class RentalDiskFit(NamedTuple):
 
     @property
     def needs_free_gb(self) -> float:
-        return max(self.own_gb / self.disk_share - self.existing_gb, self.floor_gb)
+        # the pod's writes take disk too and the reclaim only looks every ~15 min: a cache stays only
+        # if the listing floor is still free beside the volume (DAH-6187)
+        return max(self.own_gb / self.disk_share - self.existing_gb, self.floor_gb) + DPHN_CACHE_LISTING_FLOOR_GB
 
 
 class CustomerContainerRemoval(NamedTuple):
@@ -4125,7 +4127,6 @@ class DockerService:
         quote_socket: bool = False,
         image_command_fallback: tuple[str, ...] = (),
         docker_data_volume_driver: str | None = None,
-        on_cpus_granted: Callable[[int], None] | None = None,
     ) -> ContainerRunSpec:
         # A sysbox pod's inner dockerd writes /var/lib/docker; without a mount there it lands in an
         # uncapped host volume (the image's VOLUME, or sysbox's own) that can fill the host disk. It
@@ -4228,9 +4229,6 @@ class DockerService:
                 else effective_storage_limit_gb
             ),
             pids_limit=self._rental_pids_limit(cpu_count, host_pid_max),
-            pids_limit_for=partial(self._rental_pids_limit, host_pid_max=host_pid_max),
-            min_cpu_count=payload.min_cpu_count,
-            on_cpus_granted=on_cpus_granted,
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
@@ -6177,8 +6175,9 @@ class DockerService:
         rental fits beside them, and go oldest first until it does; the listing can also be stale (~15 min old,
         an Engy download writes ~1 GB/s until the filler is removed). With no requested size (no --storage-opt)
         the renter did not ask for the disk, so every cache stays (Rustam, 2 Nov): evicting up front would
-        re-download up to 1.5 TB after each such rental. Nothing reclaims it mid-rental (the idle backstop
-        `reclaim_dphn_cache_when_disk_is_tight` waits for no live pod). Every
+        re-download up to 1.5 TB after each such rental. The volume counts here, not the storage quota, plus
+        the listing floor for the pod's container writes; `reclaim_dphn_cache_when_disk_is_tight` evicts a kept
+        cache mid-rental once those writes push the node under the floor (DAH-6187). Every
         removal is awaited before this returns; a sized rental that still does not fit (a removal failed or
         timed out) has its volume clamped to the disk actually free, so the pod volume is never sized on
         disk that was not freed (create_container refuses a clamp far below the order). A
@@ -6352,11 +6351,14 @@ class DockerService:
     async def _rental_disk_fit(
         self, ssh_client: asyncssh.SSHClientConnection, payload: ContainerCreateRequest
     ) -> RentalDiskFit:
-        """The free disk a customer rental needs to be sized as ordered (DAH-5260)."""
+        """The free disk a customer rental needs to be sized as ordered (DAH-5260).
+
+        DAH-6187: only the volume takes disk; the storage limit is a quota, so the order's storage
+        part never forces the Engy cache out (it did at every whole-node rent)."""
         # a re-create's volume is already preallocated, outside df free: counting it again never fits
-        own_gb: float = (0 if payload.local_volume else payload.volume_limit_gb) + (payload.storage_limit_gb or 0)
-        # a fresh-sized (disk_share) rental gets its share of free disk plus the pod volumes already on it,
-        # less the overhead resolve_volume_sizing reserves, so a half-node one needs twice its size there
+        own_gb: float = 0 if payload.local_volume else payload.volume_limit_gb
+        # a fresh-sized (disk_share) rental's volume gets its share of free disk plus the pod volumes already
+        # on it, less the overhead resolve_volume_sizing reserves, so a half-node one needs twice its size there
         fresh_sizing = self.measures_host_for_volume_sizing(payload)
         disk_share: float = payload.disk_share if fresh_sizing and payload.disk_share else 1
         existing_gb: float = (
@@ -6380,15 +6382,7 @@ class DockerService:
         """Clamp a rental's volume to the disk actually free after the cache eviction (DAH-5260)."""
         free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
         rental_gets_gb = (free_now_gb + fit.existing_gb) * fit.disk_share
-        payload.volume_limit_gb = max(
-            int(
-                # fresh sizing splits the slice between volume and storage in the order's proportion
-                rental_gets_gb * payload.volume_limit_gb / fit.own_gb
-                if fit.fresh_sizing
-                else rental_gets_gb - (payload.storage_limit_gb or 0)
-            ),
-            1,
-        )
+        payload.volume_limit_gb = max(int(rental_gets_gb), 1)
 
     async def select_affordable_cache_volumes(
         self,
@@ -8400,7 +8394,9 @@ class DockerService:
             - _FRESH_SIZING_OVERHEAD_GB * _FRESH_SIZING_GB_BYTES,
             0,
         )
-        slice_candidates = [("pool", payload.disk_share * pool_bytes)]
+        # DAH-6187: the pod's share of the pool bounds its volume, the only part that takes disk; the
+        # storage limit is a quota on the shared filesystem
+        slice_candidates = [("pool", payload.disk_share * pool_bytes * 1.5)]
         if payload.volume_limit_gb is not None:
             slice_candidates.append(
                 ("request_cap", payload.volume_limit_gb * _FRESH_SIZING_GB_BYTES * 1.5)
@@ -9781,6 +9777,7 @@ class DockerService:
         # check after it) is gated on this, never on workload_kind alone.
         removes_every_filler = payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL and not beside_fillers
         warnings = []
+        vulkan_icd: asyncio.Task | None = None
         local_volume = payload.local_volume
         external_volume_info = payload.external_volume_info
 
@@ -9853,7 +9850,7 @@ class DockerService:
             )
             logger.error(log_text)
             await self.redis_service.remove_pending_pod(
-                payload.miner_hotkey, payload.executor_id, payload.pod_id
+                payload.miner_hotkey, payload.executor_id, payload.pod_id, command_id=payload.command_id
             )
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,
@@ -9970,7 +9967,11 @@ class DockerService:
             # add executor in pending status dict
             current_step = "pending_pod"
             await self.redis_service.add_pending_pod(
-                payload.miner_hotkey, payload.executor_id, payload.pod_id, synthetic_probe=synthetic_probe
+                payload.miner_hotkey,
+                payload.executor_id,
+                payload.pod_id,
+                command_id=payload.command_id,
+                synthetic_probe=synthetic_probe,
             )
 
             current_step = "ssh_key_import"
@@ -11105,7 +11106,6 @@ class DockerService:
                     )
                 # host_pid_max was read and validated fail-closed before any host side-effect above
                 # (review finding on PR #1531); here it only sizes the container's pids.max.
-                granted_cpu_counts: list[int] = []
                 run_spec = self._build_rental_container_run_spec(
                     payload=payload,
                     container_name=container_name,
@@ -11124,7 +11124,6 @@ class DockerService:
                     quote_socket=quote_socket,
                     image_command_fallback=image_command_fallback,
                     docker_data_volume_driver=local_volume_driver,
-                    on_cpus_granted=granted_cpu_counts.append,
                 )
 
                 logger.info(
@@ -11485,8 +11484,11 @@ class DockerService:
                                 extra=get_extra_info({**default_extra, "container_name": container_name}),
                             )
                         )
-                        await self.register_vulkan_icd_with_rental_docker(
-                            docker_client, container_name=container_name, log_extra=default_extra
+                        # runs beside the remaining steps (median 1.4 s); awaited before the reply
+                        vulkan_icd = asyncio.create_task(
+                            self.register_vulkan_icd_with_rental_docker(
+                                docker_client, container_name=container_name, log_extra=default_extra
+                            )
                         )
                     elif not await self.install_open_ssh_server_and_start_ssh_service_with_rental_docker(
                         docker_client=docker_client,
@@ -11587,6 +11589,11 @@ class DockerService:
 
                     await self.finish_stream_logs()
 
+                    if vulkan_icd is not None:
+                        # before the running check: a Vulkan app started right after readiness must see the GPU,
+                        # and a container that stopped during the registration must not be reported created
+                        await vulkan_icd
+
                     # A kill after the last bootstrap exec leaves nothing failed: with no Jupyter run by
                     # the validator, no environment and ships_sshd, no exec runs after the key step. Read
                     # after the log drain, which awaits, so a kill while it drains is seen too.
@@ -11630,6 +11637,8 @@ class DockerService:
                         )
                     )
                 except Exception as post_run_exc:
+                    if vulkan_icd is not None:
+                        await vulkan_icd  # best effort, never raises: let its exec end before cleanup removes the pod
                     container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
                         default_extra=default_extra,
@@ -11711,6 +11720,7 @@ class DockerService:
                         payload.miner_hotkey,
                         payload.executor_id,
                         payload.pod_id,
+                        command_id=payload.command_id,
                     )
 
                 # DAH-1524: one structured, Loki-queryable summary of the deploy
@@ -11768,7 +11778,7 @@ class DockerService:
                     volume_limit_gb=effective_volume_limit_gb,
                     local_volume_path=local_volume_path,
                     volume_encryption_status=volume_encryption_status,
-                    cpu_count=granted_cpu_counts[-1] if granted_cpu_counts else cpu_count,
+                    command_id=payload.command_id,
                 )
                 # Last, so nothing can fail after it: the pod is usable, the reply goes now, and
                 # the steps after it take over this create's sessions and close them.
@@ -11864,8 +11874,13 @@ class DockerService:
                 logger.error(log_text, exc_info=True)
 
             await self.finish_stream_logs()
-            await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
-            await self.hold_node_until_probe_passes(payload.executor_id, current_step, default_extra, error=_last_attempt_exception(e))
+            # this dispatch's mark and report only: a newer dispatch of the pod may have saved its success (lium-io#1952)
+            await self.redis_service.remove_pending_pod(
+                payload.miner_hotkey, payload.executor_id, payload.pod_id, command_id=payload.command_id
+            )
+            await self.hold_node_until_probe_passes(
+                payload.executor_id, current_step, default_extra, error=_last_attempt_exception(e)
+            )
 
             # Port release now handled by backend.
             # DAH-2475: msg carries the renter-safe headline; detail carries the FULL text (headline +
@@ -14282,7 +14297,10 @@ class DockerService:
             if after is not None:
                 await after(report, default_extra)
             try:
-                await self.redis_service.remove_pending_pod(payload.miner_hotkey, payload.executor_id, payload.pod_id)
+                # only this operation's mark: the pod's create mark and saved report are not its to clear
+                await self.redis_service.remove_pending_pod(
+                    payload.miner_hotkey, payload.executor_id, payload.pod_id, kind=kind
+                )
             except Exception as exc:
                 logger.warning(
                     _m(f"{label}: pending mark not removed", extra=get_extra_info({**default_extra, "error": str(exc)}))

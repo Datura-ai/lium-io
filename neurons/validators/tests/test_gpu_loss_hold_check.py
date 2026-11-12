@@ -597,6 +597,30 @@ async def test_a_set_change_under_a_rental_posts_the_renters_incident_and_a_pod_
     rented_gpu_drop._LOCAL_MARKS.clear()
 
 
+@pytest.mark.asyncio
+async def test_a_pod_left_on_the_old_cards_asks_for_a_recheck_once_instead_of_waiting_a_cycle(context_factory):
+    """DAH-6137 (d1a7498a, 10 Nov): the backend recreated the pod on the new cards seconds after this cycle failed,
+    and the node waited 15 min for the next one. Ask the express lane to check it again, once per window."""
+    redis = FakeRedis()
+
+    with patch.object(gpu_loss_hold.settings, "DRY_RUN", False):
+        first = await _cycle(context_factory, redis, listed=OTHER_CARDS, pods=(4,), pod_gpus=UUIDS)
+        again = await _cycle(context_factory, redis, listed=OTHER_CARDS, pods=(4,), pod_gpus=UUIDS)
+
+    assert first.event.event == again.event.event == Msg.POD_GPUS_GONE.event
+    assert redis.recheck_requests == [default_executor().uuid]
+
+
+@pytest.mark.asyncio
+async def test_a_dry_run_asks_for_no_recheck(context_factory):
+    redis = FakeRedis()
+
+    with patch.object(gpu_loss_hold.settings, "DRY_RUN", True):
+        await _cycle(context_factory, redis, listed=OTHER_CARDS, pods=(4,), pod_gpus=UUIDS)
+
+    assert redis.recheck_requests == []
+
+
 HELD_BY_A_DROPOUT = {
     "held": True, "since": "2026-10-29T10:28:46+00:00", "last_seen": "2026-10-29T10:28:46+00:00", "replaced": False,
 }

@@ -472,8 +472,9 @@ class ContainerCleanup:
 
         Gated on NO live filler container: a cache a sibling still mounts is in use (docker refuses to
         remove it anyway), and a node still filling bundles is not the node this is meant to rescue.
-        Nor a live customer pod (Fish 26 Oct): the cache is kept across rentals and listed as used, so
-        a renter who took the listed free disk leaves the node under the floor by design.
+        A live customer pod does not hold it back (DAH-6187): the rent keeps the cache when the
+        pod's volume fits beside it, but the pod's container writes take real disk, so once they
+        push the node under the floor the cache gives way to the renter.
         Returns how many volumes were removed.
         """
         extra = {"executor_uuid": executor_uuid}
@@ -489,7 +490,7 @@ class ContainerCleanup:
 
             # RUNNING only: _get_all_rental_containers uses `docker ps -a`, so one long-exited
             # filler_* would make "no live filler" false forever and the reclaim would never fire.
-            if await self._has_running_filler_or_pod(ssh_client):
+            if await self._has_running_filler(ssh_client):
                 return 0
 
             free_gb = await self._get_free_disk_gb(ssh_client)
@@ -648,10 +649,10 @@ class ContainerCleanup:
             return None
         return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
 
-    async def _has_running_filler_or_pod(self, ssh_client: asyncssh.SSHClientConnection) -> bool:
-        # A cache a live filler still mounts is in use; a live rental keeps it (two name filters OR).
+    async def _has_running_filler(self, ssh_client: asyncssh.SSHClientConnection) -> bool:
+        # A cache a live filler still mounts is in use.
         result = await ssh_client.run(
-            f'/usr/bin/docker ps --filter "name={FILLER_CONTAINER_PREFIX}" --filter "name={POD_CONTAINER_PREFIX}" '
+            f'/usr/bin/docker ps --filter "name={FILLER_CONTAINER_PREFIX}" '
             '--format "{{.Names}}"'
         )
         if getattr(result, "exit_status", 0) != 0:

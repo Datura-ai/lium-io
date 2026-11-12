@@ -541,3 +541,29 @@ def test_aarch64_host_passes_the_arch_check(tmp_path):
     # GB300 / Grace: nestybox ships an arm64 .deb, so aarch64 is no longer a blocking FIX
     proc = run_script(tmp_path, "--check", env={"STUB_ARCH": "aarch64"})
     assert "PASS Architecture aarch64." in proc.stdout
+
+
+# ── ports ────────────────────────────────────────────────────────────────────
+
+
+def test_piped_without_an_env_a_busy_default_port_is_a_note_not_a_fix(tmp_path):
+    # piped from curl there is no .env, so 8080 is only assumed; the provider may run the executor on another port
+    rc, out, fix_count = run_check(tmp_path, "check_ports", env={"STUB_BUSY_PORT": "8080", "STUB_BUSY_PROC": "python3"})
+    assert fix_count == 0
+    assert "TCP 8080 (default executor port, assumed: no .env found) is in use" in out
+    assert "EXECUTOR_PORT=<port>" in out
+
+
+def test_piped_from_the_executor_directory_checks_the_env_port(tmp_path):
+    (tmp_path / ".env").write_text("EXTERNAL_PORT=9000\nSSH_PORT=2300\n")
+    rc, out, fix_count = run_check(tmp_path, "check_ports", env={"STUB_BUSY_PORT": "9000", "STUB_BUSY_PROC": "python3"})
+    assert fix_count == 1
+    assert "TCP 9000 (executor port) is already in use" in out
+
+
+def test_an_explicit_port_in_use_is_still_a_fix(tmp_path):
+    rc, out, fix_count = run_check(
+        tmp_path, "check_ports", env={"EXECUTOR_PORT": "8080", "STUB_BUSY_PORT": "8080", "STUB_BUSY_PROC": "python3"}
+    )
+    assert fix_count == 1
+    assert "TCP 8080 (executor port) is already in use" in out

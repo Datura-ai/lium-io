@@ -24,7 +24,7 @@ import logging
 import os
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -66,6 +66,11 @@ MINER_DID_NOT_RETURN_EXECUTOR = "miner did not return the executor"
 FIRST_PASS_FAILED = "first pass failed"
 FIRST_PASS_FAILED_RETRY_SECONDS = 60
 FIRST_PASS_MAX_RUNS = 3
+SESSION_LOST_IN_PORT_CHECK = "the validator's SSH session closed during the port check"
+# A lost session is the validator's, not the node's, so it spends none of MAX_ATTEMPTS (which the
+# miner's snapshot misses may already have used). Its own bound keeps a node whose session always
+# drops from staying queued, and hidden from the wave, for good: ~20 min at RETRY_SECONDS.
+SESSION_LOST_MAX_RUNS = 10
 # Self-hosted miners' executor lists: how often, how many miners at once, and the longest a miner
 # that keeps not answering is skipped (one miss skips one interval, doubling per further miss).
 # Each ask is bounded by REST_EXECUTOR_LIST_TIMEOUT (miner_service).
@@ -133,12 +138,38 @@ class _Pending:
     # First passes that ran to a failed result; counted apart from attempts, which the miner's
     # snapshot misses may already have spent.
     failed_runs: int = 0
+    # Runs whose validator session closed during the port check (no verdict).
+    lost_sessions: int = 0
     # DAH-5716: set for a recheck of an already-validated executor; monotonic end of its run.
     recheck_deadline: float | None = None
     # Taken only because it was requested: never queued in _pending, so the wave never leaves it out.
     recheck_only: bool = False
     # Picked this tick because a recheck was requested; its run spends the request's budget.
     requested: bool = False
+    # The request generation this run started from; ending it leaves a newer request queued (review 4510532999).
+    recheck_generation: int | None = None
+
+
+class _LaneOwnedNodes:
+    """What the wave leaves to the lane (MinerService.express_queued): the lane's queue, minus a
+    node whose failed-first-pass retry is due. The lane launches nothing for a miner the wave has
+    not listed yet, and each cycle start marks every miner so, so a due retry could wait cycle
+    after cycle while the wave kept leaving the node to the lane (DAH-6185); the wave runs it.
+    A live view of the queue, never a copy."""
+
+    def __init__(self, pending: dict[str, _Pending]):
+        self._pending: dict[str, _Pending] = pending
+
+    def _is_lane_owned(self, executor_id: str, now: float) -> bool:
+        pending = self._pending.get(executor_id)
+        return pending is not None and not (pending.failed_runs and pending.not_before <= now)
+
+    def __contains__(self, executor_id: object) -> bool:
+        return isinstance(executor_id, str) and self._is_lane_owned(executor_id, time.monotonic())
+
+    def __iter__(self) -> Iterator[str]:
+        now = time.monotonic()
+        return iter([e for e in self._pending if self._is_lane_owned(e, now)])
 
 
 class ExpressLane:
@@ -162,9 +193,9 @@ class ExpressLane:
         self.cycle_inputs = cycle_inputs
         self.portal_api = portal_api
         self._pending: dict[str, _Pending] = {}
-        # The wave leaves what this lane has queued to it (MinerService._claim_for_cycle). The
-        # same dict, never rebound, so the wave always reads the current queue.
-        self.miner_service.express_queued = self._pending
+        # The wave leaves what this lane has queued to it (MinerService._claim_for_cycle), through
+        # a view of this dict, never rebound, so the wave always reads the current queue.
+        self.miner_service.express_queued = _LaneOwnedNodes(self._pending)
         self._tasks: set[asyncio.Task] = set()
         self._my_hotkey: str | None = None
         # Given up on this process's watch (MAX_ATTEMPTS without the miner returning them); the
@@ -186,6 +217,8 @@ class ExpressLane:
         # DAH-6013: (executor id, window end) already queued for a recheck, so a window is queued once.
         self._maintenance_end_rechecks: set[tuple[str, datetime]] = set()
         self._rechecks_in_flight: dict[str, str] = {}  # executor id -> miner hotkey
+        # Recheck-only runs kept between ticks, so a deferral and the lost-session count outlive one tick.
+        self._recheck_pending: dict[str, _Pending] = {}
 
     def directories_in_use(self) -> set[str]:
         """Job-files directories a running express verification still reads."""
@@ -246,6 +279,10 @@ class ExpressLane:
         await self._restore_first_seen()
         for pending in chosen:
             pending.requested = pending.executor.id in rechecks
+            if pending.requested:
+                pending.recheck_generation = await self.redis_service.get_executor_recheck_generation(
+                    pending.executor.id
+                )
             pending.recheck_deadline = (
                 recheck_deadline if pending.requested and pending.executor.id in validated else None
             )
@@ -391,7 +428,7 @@ class ExpressLane:
                 if not new_to_lane and executor.id not in rechecks:
                     continue
                 present.add(executor.id)
-                pending = self._pending.get(executor.id)
+                pending = self._pending.get(executor.id) or self._recheck_pending.get(executor.id)
                 if pending is None:
                     pending = _Pending(
                         executor=executor,
@@ -401,6 +438,8 @@ class ExpressLane:
                     )
                     if new_to_lane:
                         self._pending[executor.id] = pending
+                    else:
+                        self._recheck_pending[executor.id] = pending
                 if executor.id in in_flight or pending.not_before > now:
                     continue
                 # The wave has not received this miner's list yet (a cycle started seconds ago):
@@ -412,6 +451,8 @@ class ExpressLane:
         # Removed from the portal (or validated by the cycle) before this lane got to it.
         for executor_id in [e for e in self._pending if e not in present and e not in in_flight]:
             del self._pending[executor_id]
+        for executor_id in [e for e in self._recheck_pending if e not in present and e not in in_flight]:
+            del self._recheck_pending[executor_id]
 
         # Oldest registration first; then the two caps that bound a registration flood.
         candidates.sort(key=lambda p: p.executor.created_at or p.first_seen_at)
@@ -477,7 +518,6 @@ class ExpressLane:
             return 0
 
         launched = 0
-        budget_spent: list[str] = []
         for pending in chosen:
             if pending.executor.id in in_flight:
                 # The wave accepted it during the awaits above; it publishes it at the wave's end.
@@ -495,18 +535,11 @@ class ExpressLane:
                 self._rechecks_in_flight[pending.executor.id] = pending.miner_hotkey
             if pending.requested:
                 self._recheck_runs[pending.executor.id] += 1
-                if self._recheck_runs[pending.executor.id] >= RECHECK_MAX_RUNS:
-                    budget_spent.append(pending.executor.id)
             self._directories_in_use[directory] += 1
             task = asyncio.create_task(self._verify(pending, miner, inputs, rented_data))
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
             launched += 1
-        # Last run of the budget started: whatever its outcome, the request ends here. After the
-        # loop, so nothing awaits between reading the inputs and the holds above.
-        for executor_id in budget_spent:
-            with suppress(Exception):
-                await self._end_recheck(executor_id)
         return launched
 
     async def _verify(
@@ -593,6 +626,11 @@ class ExpressLane:
             )
             self._defer(pending, str(exc))
         finally:
+            # The budget's last run ended, whatever its outcome: so does the request. Before the
+            # in-flight entry goes, so no tick starts a further run in between.
+            if pending.requested and self._recheck_runs.get(executor_id, 0) >= RECHECK_MAX_RUNS:
+                with suppress(Exception):
+                    await self._end_recheck(pending)
             if self.miner_service.in_flight.get(executor_id) == EXPRESS_LANE:
                 del self.miner_service.in_flight[executor_id]
             self._rechecks_in_flight.pop(executor_id, None)
@@ -617,24 +655,42 @@ class ExpressLane:
         """
         executor_id = pending.executor.id
         result = results[0]
+        if result.session_lost_in_port_check:
+            # The run has no verdict: its findings still go out, and it is retried without spending one of
+            # MAX_ATTEMPTS (bounded by SESSION_LOST_MAX_RUNS), neither a failed first pass nor validated.
+            if result.availability_errors or result.pod_states:
+                await self.miner_service.publish_machine_specs(
+                    results, miner.hotkey, miner.coldkey, is_whole_miner_batch=False
+                )
+            pending.attempts -= 1  # _verify counted this run
+            pending.lost_sessions += 1
+            if pending.requested:
+                # review 4491025356: a lost session spends none of the recheck's runs; its own bound ends it
+                self._recheck_runs[executor_id] -= 1
+                if pending.lost_sessions >= SESSION_LOST_MAX_RUNS:
+                    with suppress(Exception):
+                        await self._end_recheck(pending)
+            self._defer(pending, SESSION_LOST_IN_PORT_CHECK)
+            return
         passed = result.score > 0 or result.job_score > 0
         should_run_first_pass_again = (
             not passed
             and settings.EXPRESS_LANE_FAILED_FIRST_PASS_RETRY_ENABLED
             and pending.failed_runs + 1 < FIRST_PASS_MAX_RUNS
         )
-        # One node under the cycle's id: never the miner's batch for that id, the wave's is.
+        # One node under the cycle's id: never the miner's batch for that id, the wave's is. Its list is whole, so
+        # the outage restore starts from it (review 4510532986: a recheck that cleared a hold).
         await self.miner_service.publish_machine_specs(
-            results, miner.hotkey, miner.coldkey, is_whole_miner_batch=False
+            results, miner.hotkey, miner.coldkey, is_whole_miner_batch=False, remember_availability=True
         )
         pending.recheck_deadline = None
         if not should_run_first_pass_again:
             # A failed first pass that runs again keeps the request: the next tick selects it.
             with suppress(Exception):
-                await self._end_recheck(executor_id)
+                await self._end_recheck(pending)
         if should_run_first_pass_again:
-            # Not recorded as validated, so the lane runs it again; a wave that starts meanwhile
-            # claims it through in_flight and its publish records it.
+            # Not recorded as validated, so the lane runs it again; a wave that lists its miner
+            # once the retry is due takes it instead (_LaneOwnedNodes) and its publish records it.
             pending.failed_runs += 1
             pending.not_before = time.monotonic() + FIRST_PASS_FAILED_RETRY_SECONDS
             self._log_published(pending, result, passed, extra, started)
@@ -676,9 +732,14 @@ class ExpressLane:
         self._pending.pop(executor_id, None)
         self._log_published(pending, result, passed, extra, started)
 
-    async def _end_recheck(self, executor_id: str) -> None:
+    async def _end_recheck(self, pending: _Pending) -> None:
+        if not pending.requested:
+            return  # review 4523252174: this run selected no request, so one that arrived during it stays
+        executor_id = pending.executor.id
+        # Redis first: local state goes only once the request is gone or a newer one is confirmed (review 4523252183)
+        await self.redis_service.pop_executor_recheck_request(executor_id, pending.recheck_generation)
         self._recheck_runs.pop(executor_id, None)
-        await self.redis_service.pop_executor_recheck_request(executor_id)
+        self._recheck_pending.pop(executor_id, None)
 
     def _log_published(
         self,
@@ -728,7 +789,11 @@ class ExpressLane:
             "attempt": pending.attempts,
             "reason": reason,
         }
-        if pending.attempts >= max_attempts_for(reason):
+        if (
+            pending.lost_sessions >= SESSION_LOST_MAX_RUNS
+            if reason == SESSION_LOST_IN_PORT_CHECK
+            else pending.attempts >= max_attempts_for(reason)
+        ):
             self._left_to_cycle.add(pending.executor.id)
             self._pending.pop(pending.executor.id, None)
             logger.warning(
