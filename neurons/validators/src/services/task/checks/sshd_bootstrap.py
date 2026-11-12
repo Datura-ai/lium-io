@@ -173,7 +173,7 @@ async def remove_lium_fillers(ctx: Context, fillers: list[str]) -> list[str]:
     for name in fillers:
         try:
             # only a filler running right now is ours to mark: a host stop or kill before this cycle
-            # leaves it exited or gone, and `rm -f` still exits 0 (and names an exited one) (review)
+            # leaves it exited or gone, and `rm -f` still exits 0 (and names an exited one)
             was_running = False
             with contextlib.suppress(Exception):
                 ps = await ctx.ssh.run(DockerCommand.ps_running(name), timeout=60)

@@ -231,9 +231,9 @@ async def test_a_filler_cycle_renews_the_marker(context_factory):
     "ps_stdout, rm_stdout, marked",
     [
         pytest.param("abc123\n", "filler_run-1\n", True, id="running-and-docker-removed-it"),
-        # `rm -f` exits 0 for a container already gone: the host removed it, not us (review)
+        # `rm -f` exits 0 for a container already gone: the host removed it, not us
         pytest.param("", "", False, id="already-gone"),
-        # a host-stopped filler is exited: `rm -f` removes and names it, but the stop was not ours (review)
+        # a host-stopped filler is exited: `rm -f` removes and names it, but the stop was not ours
         pytest.param("", "filler_run-1\n", False, id="stopped-before-removal"),
     ],
 )
