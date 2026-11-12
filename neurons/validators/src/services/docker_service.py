@@ -3115,6 +3115,12 @@ async def _run_with_host_timeout(
     )
 
 
+def _listed_freed_bytes(freed_volume_bytes: Mapping[str, int] | None, listed_names: Iterable[str]) -> int:
+    # a volume the filler's delete already removed is not in the listing, so its freed bytes never were in the pool
+    listed = set(listed_names)
+    return sum(freed for name, freed in (freed_volume_bytes or {}).items() if name in listed)
+
+
 def _host_bounded_command(command: str, host_timeout: float) -> str:
     return f"timeout -k 5 {host_timeout} sh -c {shlex.quote(command)}"
 
@@ -6331,7 +6337,7 @@ class DockerService:
         command = f'( {_wipe_volume_cmd(run_volume, *killed)} && {HOST_NSENTER}fstrim "$p" && echo trimmed ) 2>&1'
         try:
             free_bytes_before = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
-            trim_result = await asyncio.wait_for(ssh_client.run(command), CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS)
+            trim_result = await _run_with_host_timeout(ssh_client, command, CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS)
             output = trim_result.stdout or ""
         except asyncio.CancelledError:
             raise
@@ -8180,6 +8186,7 @@ class DockerService:
     async def _get_existing_vloopback_bytes(
         self,
         ssh_client: asyncssh.SSHClientConnection,
+        freed_volume_bytes: Mapping[str, int] | None = None,
     ) -> int:
         list_result = await ssh_client.run(
             '/usr/bin/docker volume ls --format "{{.Name}} {{.Driver}}"'
@@ -8197,7 +8204,8 @@ class DockerService:
             name, driver = parts
             if _is_reserved_vloopback_volume(name, driver):
                 volume_names.append(name)
-        return await self._inspect_vloopback_volumes_bytes(ssh_client, volume_names)
+        listed_bytes = await self._inspect_vloopback_volumes_bytes(ssh_client, volume_names)
+        return max(listed_bytes - _listed_freed_bytes(freed_volume_bytes, volume_names), 0)
 
     async def _inspect_vloopback_volumes_bytes(
         self,
@@ -8365,12 +8373,16 @@ class DockerService:
                 existing_volumes_bytes = await self._inspect_vloopback_volumes_bytes(
                     ssh_client, host_probe.vloopback_volume_names
                 )
+                existing_volumes_bytes = max(
+                    existing_volumes_bytes
+                    - _listed_freed_bytes(freed_volume_bytes, host_probe.vloopback_volume_names),
+                    0,
+                )
             else:
                 docker_root_dir = await self.get_docker_root_dir(ssh_client)
                 if df_avail_bytes is None:
                     df_avail_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
-                existing_volumes_bytes = await self._get_existing_vloopback_bytes(ssh_client)
-            existing_volumes_bytes = max(existing_volumes_bytes - sum((freed_volume_bytes or {}).values()), 0)
+                existing_volumes_bytes = await self._get_existing_vloopback_bytes(ssh_client, freed_volume_bytes)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

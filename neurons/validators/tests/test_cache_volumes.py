@@ -1,4 +1,5 @@
 import asyncio
+import shlex
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -49,6 +50,13 @@ class FakeSshClient:
         self.commands.append(command)
         stdout = self._listing if "volume ls" in command else ""
         return SimpleNamespace(exit_status=0, stdout=stdout, stderr="")
+
+    async def create_process(self, command: str):
+        # a host-bounded command (`timeout -k 5 N sh -c '<cmd>'`) answers as its inner command does
+        if command.startswith("timeout "):
+            command = shlex.split(command)[-1]
+        result = await self.run(command)
+        return SimpleNamespace(wait=AsyncMock(return_value=result), close=Mock())
 
 
 class HostSshClient(FakeSshClient):
