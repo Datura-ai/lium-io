@@ -660,3 +660,29 @@ async def test_the_running_check_leaves_a_killed_exiting_filler_to_dockerd(svc, 
 
     assert isinstance(result, ContainerCreated)
     assert not [cmd for cmd in _commands(ssh_client) if _FILLER_ID in cmd and "docker rm" in cmd]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_rm_logs_dockerds_reason_before_retrying(
+    docker_service, retry_ssh_mock, caplog
+):
+    """9 and 12 Nov: a create cut by a validator rollout left a container whose `docker rm -fv`
+    exited 1 and whose retry ran past the cleanup bound; nothing logged why dockerd refused."""
+    refusal = "Error response from daemon: removal of container pod_target is in progress"
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            _listing("pod_target\n"),
+            _removal("pod_target", rm_exit=1, stderr=refusal),
+            _listing(""),
+        ]
+    )
+
+    with caplog.at_level(logging.INFO):
+        await _clean_for_customer(docker_service, ssh_client)
+
+    assert retry_ssh_mock.await_count >= 1
+    [retrying] = [
+        r for r in caplog.records if "retrying those" in str(getattr(r.msg, "message", r.msg))
+    ]
+    assert retrying.msg.extra["rm_stderr"] == refusal
