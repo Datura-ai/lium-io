@@ -15,6 +15,8 @@
 # file is on main, the loop runs tools/codeql_cutover.sh (disable default setup → dispatch this workflow on main →
 # verify → set the repository variable CODEQL_ADVANCED=true, without which every job skips); by hand: Settings → Advanced Security → CodeQL analysis → ⋯ → "Switch to advanced", then Actions → CodeQL →
 # "Run workflow" on main with force-upload ticked (a plain re-run still sees default setup's last analysis and skips the upload).
+# Then, by hand as well, set the repository variable CODEQL_ADVANCED=true (Settings → Secrets and variables → Actions →
+# Variables): until it is set every job here skips, and no PR gets a CodeQL analysis.
 name: CodeQL
 
 on:
