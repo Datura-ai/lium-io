@@ -20,7 +20,7 @@ DOCKER_STUB = textwrap.dedent(
     """\
     #!/bin/sh
     echo "$*" >> "$STUB_CALLS"
-    [ "$1" = exec ] && exit "${STUB_SSH_SESSION_EXIT:-1}"
+    [ "$1" = top ] && { printf 'PID COMMAND\n%b' "${STUB_TOP:-}"; exit 0; }
     case "$1 $2" in
         "compose ps") echo "${STUB_RUNNING_EXECUTOR:-}" ;;
         "compose logs") exit 0 ;;
@@ -55,7 +55,7 @@ def run_entrypoint(tmp_path, **env):
     # the log-follow loop never ends; a `sleep` that fails ends the script after one round
     (bin_dir / "sleep").write_text('#!/bin/sh\necho "sleep $*" >> "$STUB_CALLS"\nexit 7\n')
     (bin_dir / "sleep").chmod(0o755)
-    for tool in ("sh", "tail", "cat", "timeout"):
+    for tool in ("sh", "tail", "cat", "timeout", "grep"):
         os.symlink(shutil.which(tool), bin_dir / tool)
     calls = tmp_path / "calls"
     calls.touch()
@@ -67,6 +67,9 @@ def run_entrypoint(tmp_path, **env):
         timeout=30,
     )
     return result, calls.read_text().splitlines()
+
+
+ROOT_SESSION = "  42 sshd: root@notty\\n"
 
 
 def recreated(calls):
@@ -201,19 +204,34 @@ def test_old_images_are_kept_when_the_running_image_cannot_be_tagged(tmp_path):
 
 
 def test_open_validator_ssh_session_holds_the_recreate(tmp_path):
-    result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_SSH_SESSION_EXIT="0")
+    result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_TOP=ROOT_SESSION)
 
-    check = next(c for c in calls if c.startswith("exec abc123 sh -c"))
-    assert "^sshd[^:]*: root@" in check and "storage_runner" not in check
+    assert "top abc123 -eo pid,args" in calls
     assert not recreated(calls)
     assert "a validator SSH session is open" in result.stdout
     assert "sleep 30" in calls
     assert (tmp_path / "hold").read_text().strip() == "1"
 
 
+@pytest.mark.parametrize(
+    "top, held",
+    [
+        (ROOT_SESSION, True),  # the validator's root session in the executor
+        ("  42 sshd-session: root@notty\\n", True),  # newer OpenSSH names the session process sshd-session
+        ("  42 sshd: liumuser@pts/0\\n", False),  # a non-root login does not hold
+        ("  42 sshd: root [priv]\\n", False),  # pre-auth: no session yet
+        ("", False),  # host and renter-pod logins are not executor processes, so docker top never lists them
+    ],
+)
+def test_only_an_executor_root_session_holds(tmp_path, top, held):
+    result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_TOP=top)
+
+    assert recreated(calls) is not held
+
+
 def test_ssh_hold_gives_up_after_the_max_tries(tmp_path):
     (tmp_path / "hold").write_text("30\n")
-    result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_SSH_SESSION_EXIT="0")
+    result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_TOP=ROOT_SESSION)
 
     assert recreated(calls)
     assert "a validator SSH session is open" not in result.stdout
@@ -232,7 +250,7 @@ def test_new_images_are_pulled_before_the_ssh_check_and_the_recreate(tmp_path):
     result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123")
 
     pull = calls.index("compose pull --quiet")
-    check = next(i for i, c in enumerate(calls) if c.startswith("exec abc123 sh -c"))
+    check = calls.index("top abc123 -eo pid,args")
     # already pulled: up must not wait on the registry again after the session check
     up = calls.index("compose up --pull missing --detach --wait --force-recreate")
     assert pull < check < up
@@ -242,5 +260,5 @@ def test_a_failed_pull_holds_the_update(tmp_path):
     result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_PULL_EXIT="1")
 
     assert not recreated(calls)
-    assert not any(c.startswith("exec abc123") for c in calls)
+    assert not any(c.startswith("top abc123") for c in calls)
     assert "the new images cannot be pulled" in result.stdout

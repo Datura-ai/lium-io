@@ -136,12 +136,14 @@ if [ -n "$running_executor" ]; then
     # creating a pod or checking the node; cutting it fails that create (12 Nov 2026: a pod create lost SSH in
     # encrypted_volume_setup). Wait for it to close, at most RUNNER_SSH_HOLD_MAX_TRIES retries, so an update
     # still lands while the validator's rollout grace covers the node. A volume backup or restore is not held
-    # (updates are never held for one).
+    # (updates are never held for one). The executor runs with pid: host, so list only its own processes
+    # (docker top): a host or renter-pod root login must not hold the update.
     hold_file=${RUNNER_SSH_HOLD_FILE:-/tmp/runner-ssh-hold-tries}
     tries=$(cat "$hold_file" 2>/dev/null || true)
     tries=${tries:-0}
     if [ "$tries" -lt "${RUNNER_SSH_HOLD_MAX_TRIES:-30}" ] \
-        && docker exec "$running_executor" sh -c 'grep -qaE "^sshd[^:]*: root@" /proc/[0-9]*/cmdline' >/dev/null 2>&1; then
+        && docker top "$running_executor" -eo pid,args 2>/dev/null \
+            | grep -qE '^[[:space:]]*[0-9]+[[:space:]]+sshd[^:]*: root@'; then
         echo $((tries + 1)) > "$hold_file"
         echo "Update held, running executor kept: a validator SSH session is open in it. Retrying in ${RUNNER_SSH_HOLD_RETRY_SECONDS:-30}s."
         sleep "${RUNNER_SSH_HOLD_RETRY_SECONDS:-30}"
