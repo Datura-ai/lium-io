@@ -101,7 +101,7 @@ def test_probe_ok_recreates(tmp_path):
     result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123")
 
     probe = calls.index("run --rm --gpus all --label io.lium.executor-runner.probe=nvidia-runtime --entrypoint true sha256:executorimage")
-    up = calls.index("compose up --pull always --detach --wait --force-recreate")
+    up = calls.index("compose up --pull missing --detach --wait --force-recreate")
     assert probe < up
     assert "Update held" not in result.stdout
 
@@ -120,7 +120,7 @@ def test_previous_executor_image_is_removed_after_the_update(tmp_path):
         tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_EXECUTOR_IMAGES="sha256:previous sha256:executorimage"
     )
 
-    up = calls.index("compose up --pull always --detach --wait --force-recreate")
+    up = calls.index("compose up --pull missing --detach --wait --force-recreate")
     assert calls.index("image rm sha256:previous") > up
     assert "image rm sha256:executorimage" not in calls
     assert "Removed old executor image sha256:previous" in result.stdout
@@ -203,9 +203,10 @@ def test_old_images_are_kept_when_the_running_image_cannot_be_tagged(tmp_path):
 def test_open_validator_ssh_session_holds_the_recreate(tmp_path):
     result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_SSH_SESSION_EXIT="0")
 
-    assert any(c.startswith("exec abc123 sh -c") for c in calls)
+    check = next(c for c in calls if c.startswith("exec abc123 sh -c"))
+    assert "^sshd[^:]*: root@" in check and "storage_runner[.]py" in check
     assert not recreated(calls)
-    assert "a validator SSH session is open" in result.stdout
+    assert "a validator SSH session or a storage backup/restore is running" in result.stdout
     assert "sleep 30" in calls
     assert (tmp_path / "hold").read_text().strip() == "1"
 
@@ -215,7 +216,7 @@ def test_ssh_hold_gives_up_after_the_max_tries(tmp_path):
     result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_SSH_SESSION_EXIT="0")
 
     assert recreated(calls)
-    assert "a validator SSH session is open" not in result.stdout
+    assert "a validator SSH session or a storage backup/restore is running" not in result.stdout
     assert (tmp_path / "hold").read_text() == ""
 
 
@@ -232,7 +233,8 @@ def test_new_images_are_pulled_before_the_ssh_check_and_the_recreate(tmp_path):
 
     pull = calls.index("compose pull --quiet")
     check = next(i for i, c in enumerate(calls) if c.startswith("exec abc123 sh -c"))
-    up = calls.index("compose up --pull always --detach --wait --force-recreate")
+    # already pulled: up must not wait on the registry again after the session check
+    up = calls.index("compose up --pull missing --detach --wait --force-recreate")
     assert pull < check < up
 
 
