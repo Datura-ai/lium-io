@@ -176,13 +176,16 @@ async def remove_lium_fillers(ctx: Context, fillers: list[str]) -> list[str]:
             if result.exit_status != 0:
                 continue
             removed.append(name)
-            # an unmarked removal is judged as before; the missing report below still goes
-            with contextlib.suppress(Exception):
-                await ctx.services.redis.set(
-                    f"{FILLER_REMOVED_BY_VALIDATOR_PREFIX}{name}",
-                    "1",
-                    ex=FILLER_REMOVED_BY_VALIDATOR_TTL_SECONDS,
-                )
+            # `rm -f` exits 0 for a container already gone; only a removal docker names is ours to mark,
+            # else a host kill before this cycle would pass as our removal (review)
+            if name in (result.stdout or "").split():
+                # an unmarked removal is judged as before; the missing report below still goes
+                with contextlib.suppress(Exception):
+                    await ctx.services.redis.set(
+                        f"{FILLER_REMOVED_BY_VALIDATOR_PREFIX}{name}",
+                        "1",
+                        ex=FILLER_REMOVED_BY_VALIDATOR_TTL_SECONDS,
+                    )
             await ctx.services.backend.get_filler_run_active(
                 name.removeprefix(FILLER_CONTAINER_PREFIX), container_missing=True
             )

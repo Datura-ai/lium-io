@@ -227,11 +227,19 @@ async def test_a_filler_cycle_renews_the_marker(context_factory):
 
 
 @pytest.mark.asyncio
-async def test_a_node_that_always_runs_a_filler_is_probed_after_the_skip_limit(context_factory):
+@pytest.mark.parametrize(
+    "rm_stdout, marked",
+    [
+        pytest.param("filler_run-1\n", True, id="docker-removed-it"),
+        # `rm -f` exits 0 for a container already gone: the host removed it, not us (review)
+        pytest.param("", False, id="already-gone"),
+    ],
+)
+async def test_a_node_that_always_runs_a_filler_is_probed_after_the_skip_limit(context_factory, rm_stdout, marked):
     filler = "filler_run-1"
     runner, validation = FakeRunner(probe_stdout("ok")), FakeValidation(_all_cards("", ""))
     ssh = AsyncMock()
-    ssh.run.return_value = SimpleNamespace(exit_status=0, stdout="", stderr="")
+    ssh.run.return_value = SimpleNamespace(exit_status=0, stdout=rm_stdout, stderr="")
     services = build_services(validation=validation)
     services.redis.store[KEY] = json.dumps({**MARKER, "filler_skips": module.FILLER_SKIP_LIMIT})
     uuid = default_executor().uuid
@@ -254,7 +262,7 @@ async def test_a_node_that_always_runs_a_filler_is_probed_after_the_skip_limit(c
 
     assert ctx.ssh.run.await_args.args[0] == f"/usr/bin/docker rm -fv {filler}"
     assert result.event.what_we_saw["removed_fillers"] == [filler]
-    assert ctx.services.redis.store[f"filler_removed_by_validator:{filler}"] == "1"
+    assert (f"filler_removed_by_validator:{filler}" in ctx.services.redis.store) is marked
     assert validation.calls == 1
     assert result.passed and result.event.reason_code == Msg.PASSED.reason
     assert KEY not in ctx.services.redis.store
