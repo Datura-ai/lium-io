@@ -304,9 +304,9 @@ EXPRESS_LANE = "express"
 # seeds that set once, after scoring and publishing — minutes after the miner's wave returned).
 # Kept in in_flight so the express lane does not run the same node a second time meanwhile.
 CYCLE_DONE = "cycle-done"
-# DAH-6137: a rented node whose pod was left on its old GPUs fails the wave's check; the backend
-# moves the pod to the new cards and recreates it within ~30 s, so the wave checks it once more
-# after this wait (12 Nov: the express recheck could not run beside the wave's claim, and the node
+# DAH-6137: a rented node whose pod was left on its old GPUs fails the check; the backend
+# moves the pod to the new cards and recreates it within ~30 s, so the wave (or a provider's
+# express recheck) checks it once more after this wait (12 Nov: the express recheck could not run beside the wave's claim, and the node
 # waited ~19 min for the next wave's publish).
 POD_GPUS_GONE_RERUN_DELAY_SECONDS = 60
 # A rerun starts only with at least this much of the miner's job budget left.
@@ -506,11 +506,13 @@ class MinerService:
         run,
         job_started_at: float,
         default_extra: dict,
+        publish_early: bool = True,
     ) -> None:
         """DAH-6137: check once more, in place in ``raw_results``, each node whose pod was left on
         its old GPUs, once the backend has had time to recreate the pod on the new cards, and
-        publish a pass at once (spec-only, as publish_gpu_set_changes; the cycle's publish carries
-        the same result). Kept to the miner's job budget; a rerun with no result keeps the first."""
+        (a wave only: an express run publishes its own result next) publish a pass at once
+        (spec-only, as publish_gpu_set_changes; the cycle's publish carries the same result).
+        Kept to the miner's job budget; a rerun with no result keeps the first."""
         stranded = [i for i, result in enumerate(raw_results) if _pod_left_on_old_gpus(result)]
         if not stranded:
             return
@@ -540,7 +542,7 @@ class MinerService:
                 extra=get_extra_info({**extra, "passed": [str(r.executor_info.uuid) for r in passed]}),
             )
         )
-        if not passed:
+        if not passed or not publish_early:
             return
         try:
             await self.publish_machine_specs(
@@ -2293,11 +2295,17 @@ class MinerService:
                 try:
                     tasks = [asyncio.create_task(run(executor_info)) for executor_info in executors]
                     raw_results = await asyncio.gather(*tasks, return_exceptions=True)
-                    if executor_id is None:
-                        # under the wave's claim: the express lane cannot run these nodes meanwhile
-                        await self._rerun_pods_left_on_old_gpus(
-                            payload, executors, raw_results, run, job_started_at, default_extra
-                        )
+                    # the wave holds its claim (the express lane cannot run these nodes meanwhile); an express
+                    # run (a provider's recheck) waits in place too, so its one result is the moved pod's
+                    await self._rerun_pods_left_on_old_gpus(
+                        payload,
+                        executors,
+                        raw_results,
+                        run,
+                        job_started_at,
+                        default_extra,
+                        publish_early=executor_id is None,
+                    )
                 finally:
                     self._release_cycle_claims(executors)
                 results = self._filter_task_results(executors, raw_results, default_extra)
