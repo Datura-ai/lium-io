@@ -15,7 +15,12 @@ from services.matrix_validation_service import UUID_MISMATCH_ERROR_PREFIX
 
 from ..messages import CapabilityMessages as Msg, MessageTemplate, render_message
 from ..pipeline import CheckResult, Context
-from .gpu_model_truth import GpuModelMismatch, gpu_model_mismatch
+from .gpu_model_truth import (
+    GpuModelMismatch,
+    first_gpu_model_mismatch,
+    gpu_model_mismatch,
+    reported_gpu_model,
+)
 from .matmul_speed_log import log_matmul_speed
 from .rental_owner import uuid_listed_under_another_miner, rental_of_this_node
 
@@ -57,7 +62,7 @@ class CapabilityCheck:
         if filler_container:
             what_filler: dict = {"filler_container": filler_container}
             cycle = _filler_cycle_index(ctx)
-            seen, mismatch = await _stored_gpu_model_verdict(ctx)
+            seen, mismatch = await stored_gpu_model_verdict(ctx)
             # a node with no verdict yet is sampled now, not at its turn up to a day later
             unjudged = not seen and settings.FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES > 0
             if unjudged or _filler_matmul_sample_due(ctx, cycle):
@@ -118,7 +123,9 @@ class CapabilityCheck:
 
         if result and result.success:
             # DAH-6241: a correct answer from a card that is not the reported model earns nothing
-            mismatch = gpu_model_mismatch(specs, result.metrics)
+            mismatch = first_gpu_model_mismatch(
+                specs, result.metrics, getattr(result, "card_metrics", None)
+            )
             await _store_gpu_model_verdict(ctx, _as_dict(mismatch), GPU_MODEL_VERDICT_TTL_SECONDS)
             if mismatch is not None:
                 event = render_message(
@@ -403,16 +410,23 @@ def _as_dict(mismatch: GpuModelMismatch | None) -> dict | None:
     return None if mismatch is None else mismatch.as_dict()
 
 
-async def _stored_gpu_model_verdict(ctx: Context) -> tuple[bool, dict | None]:
+async def stored_gpu_model_verdict(ctx: Context) -> tuple[bool, dict | None]:
     """(a verdict is stored, the stored mismatch or None). A Redis error reads as a stored pass:
-    the node is neither failed nor sampled out of turn for it."""
+    the node is neither failed nor sampled out of turn for it. A mismatch stored for a model the
+    node no longer reports on that card is no verdict: the node is judged again."""
     key = GPU_MODEL_VERDICT_KEY.format(executor_uuid=ctx.executor.uuid)
     try:
         raw = await ctx.services.redis.get(key)
         if raw is None:
             return False, None
         mismatch = json.loads(raw).get("mismatch")
-        return True, mismatch if isinstance(mismatch, dict) else None
+        if not isinstance(mismatch, dict):
+            return True, None
+        card_index = mismatch.get("card_index", 0)
+        reported_now = reported_gpu_model(ctx.state.specs, card_index if isinstance(card_index, int) else 0)
+        if mismatch.get("reported_gpu_model") != reported_now:
+            return False, None
+        return True, mismatch
     except Exception as exc:
         logger.warning(_m("GPU model verdict read failed", extra=get_extra_info({**ctx.default_extra, "error": str(exc)})))
         return True, None

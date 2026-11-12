@@ -57,6 +57,7 @@ EXPECTED_CC_AND_SM: dict[str, tuple[str, int]] = {
 
 @dataclass(frozen=True)
 class GpuModelMismatch:
+    card_index: int
     reported_gpu_model: str
     expected_compute_capability: str
     expected_sm_count: int
@@ -68,7 +69,7 @@ class GpuModelMismatch:
         return asdict(self)
 
 
-def _reported_model(machine_spec: Any, card_index: int) -> str | None:
+def reported_gpu_model(machine_spec: Any, card_index: int) -> str | None:
     gpu = machine_spec.get("gpu") if isinstance(machine_spec, dict) else None
     details = gpu.get("details") if isinstance(gpu, dict) else None
     card = details[card_index] if isinstance(details, list) and 0 <= card_index < len(details) else None
@@ -91,7 +92,7 @@ def gpu_model_mismatch(machine_spec: Any, metrics: Any, card_index: int = 0) -> 
     """What was reported and measured when the card (the reported card at `card_index`, the one
     the matmul ran on) is below the reported model; None otherwise (the model or a bigger card,
     an unknown name, or a run that did not give both numbers)."""
-    model = _reported_model(machine_spec, card_index)
+    model = reported_gpu_model(machine_spec, card_index)
     expected = EXPECTED_CC_AND_SM.get(model) if model else None
     if expected is None or not isinstance(metrics, dict):
         return None
@@ -103,6 +104,7 @@ def gpu_model_mismatch(machine_spec: Any, metrics: Any, card_index: int = 0) -> 
         return None
     device = metrics.get("device")
     return GpuModelMismatch(
+        card_index=card_index,
         reported_gpu_model=model,
         expected_compute_capability=expected[0],
         expected_sm_count=expected[1],
@@ -110,3 +112,14 @@ def gpu_model_mismatch(machine_spec: Any, metrics: Any, card_index: int = 0) -> 
         measured_sm_count=sm_count,
         measured_device_name=device if isinstance(device, str) else None,
     )
+
+
+def first_gpu_model_mismatch(
+    machine_spec: Any, metrics: Any, card_metrics: dict[int, dict] | None = None
+) -> GpuModelMismatch | None:
+    """The first card below its reported model: device 0 from the capability matmul, then each
+    card the all-cards probe measured under its own seal."""
+    found = gpu_model_mismatch(machine_spec, metrics)
+    for index, measured in sorted((card_metrics or {}).items()):
+        found = found or gpu_model_mismatch(machine_spec, measured, index)
+    return found

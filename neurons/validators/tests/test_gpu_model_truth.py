@@ -1,17 +1,20 @@
 """DAH-6241: a node whose card is not the model it reports earns nothing."""
 
+import json
+
 import pytest
 
 from neurons.validators.src.services.matrix_validation_service import ValidationResult
 from neurons.validators.src.services.task.checks import capability
 from neurons.validators.src.services.task.checks.capability import CapabilityCheck
+from neurons.validators.src.services.task.checks.gpu_model_verdict import GpuModelVerdictCheck
 from neurons.validators.src.services.task.checks.gpu_model_truth import (
     EXPECTED_CC_AND_SM,
     gpu_model_mismatch,
 )
 from neurons.validators.src.services.task.messages import CapabilityMessages as Msg
 
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 from tests.helpers import FakeRedis, build_context_config, build_services, build_state
 from tests.test_capability_check import DummyValidationService
 from tests.test_filler_matmul_sample import SamplingValidationService
@@ -232,3 +235,120 @@ async def test_a_redis_outage_neither_fails_nor_samples_a_filler_node(context_fa
 
 def _verdict_key() -> str:
     return capability.GPU_MODEL_VERDICT_KEY.format(executor_uuid="executor-123")
+
+
+# --- every card, a rented node, and a model the node stops reporting
+
+
+def _two_card_specs(model: str = "NVIDIA H100 80GB HBM3") -> dict:
+    return {"gpu": {"count": 2, "details": [{"name": model, "uuid": "GPU-0"}, {"name": model, "uuid": "GPU-1"}]}}
+
+
+@pytest.mark.asyncio
+async def test_a_faked_card_after_card_0_fails_from_its_own_sealed_metrics(context_factory):
+    redis = FakeRedis()
+    service = DummyValidationService(success=True, metrics={"cc": "9.0", "sm_count": 132})
+    real_validate = service.validate_gpu_model_and_process_job
+
+    async def with_cards(**kwargs):
+        result = await real_validate(**kwargs)
+        result.card_metrics = {0: {"cc": "9.0", "sm_count": 132}, 1: {"cc": "8.0", "sm_count": 108}}
+        return result
+
+    service.validate_gpu_model_and_process_job = with_cards
+    ctx = context_factory(
+        services=build_services(validation=service, redis=redis),
+        config=build_context_config(),
+        state=build_state(specs=_two_card_specs()),
+    )
+
+    result = await CapabilityCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.GPU_MODEL_MISMATCH.reason
+    assert json.loads(redis.store[_verdict_key()])["mismatch"]["card_index"] == 1
+
+
+def _rented(specs: dict, redis) -> object:
+    state = build_state(
+        specs=specs,
+        rented_data=RentedExecutorsResponse(
+            executors={
+                "executor-123": RentedExecutor(
+                    miner_hotkey="miner-hotkey",
+                    executor_ip_address="1.2.3.4",
+                    executor_ip_port="40022",
+                    pods=[RentedPod(pod_id="pod-1", container_name="pod_renter")],
+                )
+            },
+            banned_guids=[],
+        ),
+    )
+    return state
+
+
+async def _verdict_check(context_factory, redis, state, validation=None):
+    ctx = context_factory(services=build_services(validation=validation, redis=redis), state=state)
+    return await GpuModelVerdictCheck().run(ctx)
+
+
+@pytest.mark.asyncio
+async def test_a_rented_node_with_a_stored_mismatch_fails_before_the_rented_halt(context_factory):
+    redis = FakeRedis()
+    await _run(context_factory, "NVIDIA H100 80GB HBM3", "8.0", 108, redis=redis)
+    no_matmul = DummyValidationService(success=True, metrics=REAL_H100[1])
+
+    result = await _verdict_check(
+        context_factory, redis, _rented(_specs("NVIDIA H100 80GB HBM3"), redis), validation=no_matmul
+    )
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.GPU_MODEL_MISMATCH.reason
+    assert no_matmul.called_with is None  # nothing runs beside the renter's pod
+
+
+@pytest.mark.parametrize("stored", ["none", "pass"])
+@pytest.mark.asyncio
+async def test_a_rented_node_with_no_mismatch_stored_is_untouched(context_factory, stored):
+    redis = FakeRedis()
+    if stored == "pass":
+        await _run(context_factory, "NVIDIA H100 80GB HBM3", "9.0", 132, redis=redis)
+
+    result = await _verdict_check(context_factory, redis, _rented(_specs("NVIDIA H100 80GB HBM3"), redis))
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.GPU_MODEL_VERDICT_OK.reason
+
+
+@pytest.mark.asyncio
+async def test_an_idle_node_is_left_to_the_capability_check(context_factory):
+    # the matmul runs later in the same cycle and writes a fresh verdict
+    redis = FakeRedis()
+    await _run(context_factory, "NVIDIA H100 80GB HBM3", "8.0", 108, redis=redis)
+
+    result = await _verdict_check(context_factory, redis, build_state(specs=_specs("NVIDIA H100 80GB HBM3")))
+
+    assert result.passed is True
+
+
+@pytest.mark.asyncio
+async def test_a_stored_mismatch_for_a_model_the_node_no_longer_reports_is_ignored(context_factory):
+    redis = FakeRedis()
+    await _run(context_factory, "NVIDIA H100 80GB HBM3", "8.0", 108, redis=redis)
+
+    result = await _verdict_check(context_factory, redis, _rented(_specs("NVIDIA A100 80GB PCIe"), redis))
+
+    assert result.passed is True
+
+
+@pytest.mark.asyncio
+async def test_a_filler_node_that_now_reports_another_model_is_sampled_again(context_factory, sample_never_due):
+    redis = FakeRedis()
+    await _run(context_factory, "NVIDIA H100 80GB HBM3", "8.0", 108, redis=redis)
+    ctx, service = _filler_ctx(context_factory, redis, {"cc": "8.0", "sm_count": 108})
+    ctx.state.specs["gpu"]["details"][0]["name"] = "NVIDIA A100 80GB PCIe"
+
+    result = await CapabilityCheck().run(ctx)
+
+    assert len(service.budgets) == 1  # no verdict for the new model: judged now
+    assert result.passed is True  # an A100 is not in the table, so it is not judged

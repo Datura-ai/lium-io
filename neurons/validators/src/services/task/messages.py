@@ -2008,6 +2008,14 @@ class CapabilityMessages:
             "it has."
         ),
     )
+    # DAH-6241: a rented node has no stored GPU model mismatch (or is not rented: judged later)
+    GPU_MODEL_VERDICT_OK = MessageTemplate(
+        event="GPU model verdict: no stored mismatch",
+        reason="GPU_MODEL_VERDICT_OK",
+        severity="info",
+        category="gpu",
+        impact="Proceed",
+    )
     # One reason code per CUDA failure the probe can hit (DAH-3362, ticket-0318), as
     # GPU_VERIFY_TIMEOUT and the VERIFYX_FAILED_* family already do; the full steps live in the
     # reason-code table the default help_uri points at. Wording is provider-facing; no backticks,
