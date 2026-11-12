@@ -1131,6 +1131,14 @@ class StaleContainerCleanupMessages:
         category="prep",
         impact="No rental container removed this cycle; live pods and fillers are left alone",
     )
+    TIMED_OUT = MessageTemplate(
+        event="Stale container cleanup timed out",
+        reason="STALE_CLEANUP_TIMED_OUT",
+        severity="warning",
+        category="prep",
+        impact="Cleanup stopped for this cycle; the rest of the validation runs",
+        remediation="Docker on the node answers slowly; check that dockerd is responsive.",
+    )
 
 
 class CustomBuildOrphanSweepMessages:
@@ -2500,6 +2508,32 @@ class CpuTruthMessages:
         severity="info",
         category="env",
         impact="Proceed without penalty",
+    )
+
+
+class DockerCpuMessages:
+    """The Docker daemon sees fewer CPUs than the machine reports. MISMATCH fails the validation."""
+
+    OK = MessageTemplate(
+        event="Docker CPU count check passed",
+        reason="DOCKER_CPU_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    MISMATCH = MessageTemplate(
+        event="Docker sees fewer CPUs than the machine",
+        reason="DOCKER_CPU_MISMATCH",
+        severity="error",
+        category="env",
+        impact="Score set to 0 for this cycle; rentals on this node fail until Docker sees every CPU",
+    )
+    WARNING = MessageTemplate(
+        event="Docker sees fewer CPUs than the machine",
+        reason="DOCKER_CPU_MISMATCH",
+        severity="warning",
+        category="env",
+        impact="Warning only: score unchanged",
     )
 
 

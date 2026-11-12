@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -72,6 +74,12 @@ REAPED_POD_STATES_FLOOR = 32
 # record stays ended, so a provider recreating pod_<old id> each cycle would otherwise be exempt forever.
 # Never expired: see _ReapedPodStateQueue.claim_gpu_exemptions.
 REAPED_GPU_EXEMPT_KEY_PREFIX = "reaped_gpu_exempt:"
+# The cleanup's docker calls carry no timeout of their own, and a slow dockerd held this step for 5-10
+# min on some nodes (prod, 4-5 Nov), so the executor task hit its own timeout and the cycle ended
+# with no result. Healthy runs take under ~140 s; past this budget the step gives up for the cycle.
+STALE_CLEANUP_BUDGET_SECONDS = 180
+# After a timeout: the backend lookups and exemption claim for the containers already removed.
+GPU_EXEMPTION_BUDGET_AFTER_TIMEOUT_SECONDS = 30
 
 
 class StaleContainerCleanupCheck:
@@ -110,6 +118,46 @@ class StaleContainerCleanupCheck:
         self._last_sweep_at: dict[str, float] = {}
 
     async def run(self, ctx: Context) -> CheckResult:
+        # held here, not in _run: a timeout must not lose what was already removed and confirmed
+        queue = _ReapedPodStateQueue(ctx)
+        removed: list[str] = []
+        confirmed: set[str] = set()  # names the backend's record shows were this node's ended Lium workload
+        reserved: set[str] = set()  # labelled removals holding a GPU process: a lookup slot kept for each
+        try:
+            async with asyncio.timeout(STALE_CLEANUP_BUDGET_SECONDS):
+                result = await self._run(ctx, queue, removed, confirmed, reserved)
+        except TimeoutError:
+            result = CheckResult(
+                passed=True,
+                event=render_message(
+                    Msg.TIMED_OUT,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={"budget_seconds": STALE_CLEANUP_BUDGET_SECONDS},
+                ),
+            )
+            # a container already removed is in the reaped queue and is reported next cycle; its GPU
+            # processes must not count, or GpuUsageCheck judges a container that is gone
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(GPU_EXEMPTION_BUDGET_AFTER_TIMEOUT_SECONDS):
+                    await _confirm_ended_workloads_of_reserved_removals(ctx, removed, confirmed, reserved)
+        # outside every budget: a claim a timeout cut would be written, then refused as already spent
+        exempt = await queue.claim_gpu_exemptions(confirmed.intersection(removed))
+        if not exempt:
+            return result
+        state = result.updates.get("state", ctx.state)
+        processes = [p for p in state.gpu_processes if p.get("container_name") not in exempt]
+        updates = {**result.updates, "state": replace(state, gpu_processes=processes)}
+        return result.model_copy(update={"updates": updates})
+
+    async def _run(
+        self,
+        ctx: Context,
+        queue: _ReapedPodStateQueue,
+        removed: list[str],
+        confirmed: set[str],
+        reserved: set[str],
+    ) -> CheckResult:
         # DAH-1932: when a miner re-adds an executor it gets a new subnet UUID for the same
         # IP:port. `rented_data` is keyed by UUID, so the tenant that is still running on the
         # box is listed under the OLD uuid and this executor looks unrented. Removing "orphans"
@@ -121,7 +169,7 @@ class StaleContainerCleanupCheck:
         # backend's zero-score publish) is the open question on the PR.
         # DAH-3338: the reaped-pod queue is built either way, so a grace cycle still re-sends the
         # ids an earlier cycle reaped and queued.
-        queue = _ReapedPodStateQueue(ctx)
+        started = time.monotonic()
         first_sight = await self._first_sight(ctx)
         rented_list_unknown = rented_list_unknown_reason(ctx.state.rented_data)
         # DAH-6073: pods at this node's endpoint may grow; live_pod_ids is fleet-wide, so a pod rented on another
@@ -133,11 +181,11 @@ class StaleContainerCleanupCheck:
         )
         # the grow and both disk reads share one budget, half the task's time left at most, so the rental checks and
         # state publication after this check always keep the other half
-        grow_deadline = time.monotonic() + min(GROW_PASS_MAX_SECONDS, task_seconds_left(ctx) / 2)
-        confirmed: set[str] = set()  # names the backend's record shows were this node's ended Lium workload
+        # and inside run()'s cleanup budget, which this check started just before _run: a cut pass loses its sizes
+        grow_deadline = time.monotonic() + min(
+            GROW_PASS_MAX_SECONDS, task_seconds_left(ctx) / 2, STALE_CLEANUP_BUDGET_SECONDS - (time.monotonic() - started)
+        )
         lookups = {"made": 0, "skipped": 0}
-        # labelled removals holding a GPU process: each has a lookup slot kept for its exemption
-        reserved: set[str] = set()
         gpu_container_names = {process.get("container_name") for process in ctx.state.gpu_processes}
 
         def budget_left() -> bool:
@@ -178,7 +226,10 @@ class StaleContainerCleanupCheck:
                 on_before_remove=queue.add,
                 lium_workload_ended=lium_workload_ended,
                 reserve_removal=reserve_removal,
+                on_removed=removed.append,
             )
+            # run() claims the GPU exemption from `removed`
+            removed.extend(name for name in removed_names if name not in removed)
 
         # DAH-2805: killed weight downloads leave `*.incomplete` files nothing reads again — 741 GB
         # on one prod node. Swept from here because this check reaches every node, whatever image it
@@ -190,6 +241,8 @@ class StaleContainerCleanupCheck:
         now: float = time.monotonic()
         last_sweep_at: float = self._last_sweep_at.get(ctx.executor.uuid, float("-inf"))
         if now - last_sweep_at >= DOWNLOAD_TEMPORARY_SWEEP_INTERVAL_SECONDS:
+            # stamped first: a sweep cut by the step's budget must not run again next cycle ahead of the reclaim
+            self._last_sweep_at[ctx.executor.uuid] = now
             swept_download_temporaries = await ctx.services.container_cleanup.sweep_abandoned_download_temporaries(
                 ssh_client=ctx.ssh,
                 executor_uuid=ctx.executor.uuid,
@@ -203,7 +256,6 @@ class StaleContainerCleanupCheck:
                 executor_uuid=ctx.executor.uuid,
                 is_orphan=lambda volume_id, age: _is_orphan_volume(ctx, volume_id, age),
             )
-            self._last_sweep_at[ctx.executor.uuid] = now
 
         # DAH-6073: a live pod granted less disk than it ordered (another renter's kept volume held the space) gets
         # the rest once the disk is free; only on a known rented list, so a retained or orphan volume is never grown
@@ -282,19 +334,7 @@ class StaleContainerCleanupCheck:
         # neither TenantEnforcementCheck nor GpuUsageCheck may count them against the node. Only when
         # the backend confirms it was Lium's: a label or a health_check_ name is the host's to forge,
         # and a forged container recreated between cycles would otherwise pass the GPU gate each cycle.
-        for name in removed_names:
-            if name in confirmed or name not in reserved:
-                continue
-            try:
-                if await _lium_workload_ended_here(ctx, name):  # its slot was reserved before removal
-                    confirmed.add(name)
-            except Exception as e:  # noqa: BLE001 - unconfirmed: its processes still count
-                logger.warning(
-                    _m(
-                        "Pod record check failed; the removed container's GPU processes still count",
-                        extra={"container_name": name, "error": str(e)},
-                    )
-                )
+        await _confirm_ended_workloads_of_reserved_removals(ctx, removed_names, confirmed, reserved)
         if lookups["skipped"]:
             logger.warning(
                 _m(
@@ -318,16 +358,10 @@ class StaleContainerCleanupCheck:
         reaped = await queue.states(limit=self._reaped_slots_in_spec(ctx))
         if not unremovable_names and not reaped and not removed_names and not volume_sizes_gb and not specs_after_grow:
             return CheckResult(passed=True, event=event)
-        # confirmed AND gone: a confirmed container that survived docker rm still runs its processes
-        removed = await queue.claim_gpu_exemptions(confirmed.intersection(removed_names))
+        # the GPU exemption for confirmed AND gone removals is claimed in run(), outside the budget
         state = replace(
             ctx.state,
             orphaned_containers=unremovable_names,
-            gpu_processes=[
-                process
-                for process in ctx.state.gpu_processes
-                if process.get("container_name") not in removed
-            ],
             pod_states=[*ctx.state.pod_states, *reaped],
             volume_sizes_gb={**ctx.state.volume_sizes_gb, **volume_sizes_gb},
             specs=specs_after_grow if specs_after_grow is not None else ctx.state.specs,
@@ -375,6 +409,26 @@ class StaleContainerCleanupCheck:
                 )
             )
             return True
+
+
+async def _confirm_ended_workloads_of_reserved_removals(
+    ctx: Context, removed: list[str], confirmed: set[str], reserved: set[str]
+) -> None:
+    """Adds to ``confirmed`` each removed container whose lookup slot was reserved before removal and
+    whose backend record shows it ended here; a failed lookup leaves it unconfirmed (its processes count)."""
+    for name in removed:
+        if name in confirmed or name not in reserved:
+            continue
+        try:
+            if await _lium_workload_ended_here(ctx, name):
+                confirmed.add(name)
+        except Exception as e:  # noqa: BLE001 - unconfirmed: its processes still count
+            logger.warning(
+                _m(
+                    "Pod record check failed; the removed container's GPU processes still count",
+                    extra={"container_name": name, "error": str(e)},
+                )
+            )
 
 
 async def _lium_workload_ended_here(ctx: Context, container_name: str) -> bool:
