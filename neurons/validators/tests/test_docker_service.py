@@ -6408,8 +6408,12 @@ async def test_resolve_volume_sizing_takes_the_free_disk_measured_under_the_flat
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("with_probe", [True, False])
-async def test_resolve_volume_sizing_leaves_killed_fillers_run_volumes_out_of_the_pool(docker_service, with_probe):
-    # DAH-5798: a trimmed run volume's disk is already back in df; counting its declared size too oversizes the slice
+@pytest.mark.parametrize("freed_gb", [300, 120])
+async def test_resolve_volume_sizing_leaves_the_trimmed_part_of_run_volumes_out_of_the_pool(
+    docker_service, with_probe, freed_gb
+):
+    # DAH-5798: a trimmed run volume's freed disk is already back in df; counting it too oversizes the slice.
+    # A partial trim (120 of 300) keeps the untrimmed 180 in the pool, or the renter gets less than ordered.
     payload = _make_sizing_payload(disk_share=0.5, storage_limit_gb=1)
     ssh_client = _make_sizing_ssh_client(
         df_avail_bytes=900 * _SIZING_GB,
@@ -6419,11 +6423,11 @@ async def test_resolve_volume_sizing_leaves_killed_fillers_run_volumes_out_of_th
     probe = VolumeHostProbe("/var/lib/docker", 900 * _SIZING_GB, ["volume_killed"], True) if with_probe else None
 
     result = await docker_service.resolve_volume_sizing(
-        ssh_client, payload, "tag", {}, host_probe=probe, excluded_volume_names={"volume_killed"}
+        ssh_client, payload, "tag", {}, host_probe=probe, freed_volume_bytes={"volume_killed": freed_gb * _SIZING_GB}
     )
 
     assert result.path == "fresh"
-    assert result.existing_volumes_bytes == 0
+    assert result.existing_volumes_bytes == (300 - freed_gb) * _SIZING_GB
 
 
 @pytest.mark.asyncio

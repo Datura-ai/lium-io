@@ -16,7 +16,7 @@ import shlex
 import threading
 import time
 from collections import Counter
-from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass, field
 from functools import partial
@@ -6165,7 +6165,7 @@ class DockerService:
         default_extra: dict,
         host_probe: PrerunHostProbe | None = None,
         killed_fillers: Iterable[str] = (),
-        trimmed_run_volumes: set[str] | None = None,
+        trimmed_run_volumes: dict[str, int] | None = None,
     ) -> bool:
         """Free filler cache volumes when a customer rental's volume does not fit beside them; True when
         volumes may have been removed.
@@ -6238,7 +6238,8 @@ class DockerService:
                     ssh_client, filler, killed, docker_root_dir, default_extra
                 )
                 if freed_gb and trimmed_run_volumes is not None:
-                    trimmed_run_volumes.add(_filler_run_volume_name(filler))  # only these leave the sizing pool
+                    # only the freed part leaves the sizing pool: a partly trimmed volume still holds the rest
+                    trimmed_run_volumes[_filler_run_volume_name(filler)] = int(freed_gb * 1024**3)
                 if fit.fresh_sizing:
                     # a trimmed run volume still counts its declared size among the pod volumes (existing_gb) while
                     # its disk is back in df: without this the rental would be counted on that disk twice
@@ -6382,7 +6383,8 @@ class DockerService:
         """Clamp a rental's volume to the disk actually free after the cache eviction (DAH-5260)."""
         free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
         rental_gets_gb = (free_now_gb + fit.existing_gb) * fit.disk_share
-        payload.volume_limit_gb = max(int(rental_gets_gb), 1)
+        # a clamp only shrinks: the listing floor can fail the fit while the order itself still fits
+        payload.volume_limit_gb = max(min(int(rental_gets_gb), payload.volume_limit_gb), 1)
 
     async def select_affordable_cache_volumes(
         self,
@@ -8178,7 +8180,6 @@ class DockerService:
     async def _get_existing_vloopback_bytes(
         self,
         ssh_client: asyncssh.SSHClientConnection,
-        excluded_volume_names: frozenset[str] | set[str] = frozenset(),
     ) -> int:
         list_result = await ssh_client.run(
             '/usr/bin/docker volume ls --format "{{.Name}} {{.Driver}}"'
@@ -8194,7 +8195,7 @@ class DockerService:
             if len(parts) != 2:
                 continue
             name, driver = parts
-            if _is_reserved_vloopback_volume(name, driver) and name not in excluded_volume_names:
+            if _is_reserved_vloopback_volume(name, driver):
                 volume_names.append(name)
         return await self._inspect_vloopback_volumes_bytes(ssh_client, volume_names)
 
@@ -8307,12 +8308,12 @@ class DockerService:
         locked_df_avail_bytes: int | None = None,
         locked_df_error: Exception | None = None,
         flatten_copy_bytes: int | None = None,
-        excluded_volume_names: frozenset[str] | set[str] = frozenset(),
+        freed_volume_bytes: Mapping[str, int] | None = None,
     ) -> VolumeSizingResult:
         """Resolve effective volume/storage limits for a new pod volume (DAH-2183).
 
-        `excluded_volume_names` (killed fillers' run volumes the trim freed, DAH-5798) stay out of the pool: their
-        disk is already back in df, so their declared size would count it twice. An untrimmed one still holds it.
+        `freed_volume_bytes` (killed fillers' run volumes -> the bytes their trim freed, DAH-5798) leave the pool:
+        that disk is already back in df, so their declared size would count it twice. The untrimmed rest still holds it.
 
         `flatten_copy_bytes` (a many-layer image on a Sysbox full node) caps the grant so a one-layer copy
         still fits beside it, never below `payload.min_volume_gb` or the ordered `payload.volume_limit_gb`.
@@ -8362,13 +8363,14 @@ class DockerService:
                 if df_avail_bytes is None:
                     df_avail_bytes = host_probe.df_avail_bytes
                 existing_volumes_bytes = await self._inspect_vloopback_volumes_bytes(
-                    ssh_client, [n for n in host_probe.vloopback_volume_names if n not in excluded_volume_names]
+                    ssh_client, host_probe.vloopback_volume_names
                 )
             else:
                 docker_root_dir = await self.get_docker_root_dir(ssh_client)
                 if df_avail_bytes is None:
                     df_avail_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
-                existing_volumes_bytes = await self._get_existing_vloopback_bytes(ssh_client, excluded_volume_names)
+                existing_volumes_bytes = await self._get_existing_vloopback_bytes(ssh_client)
+            existing_volumes_bytes = max(existing_volumes_bytes - sum((freed_volume_bytes or {}).values()), 0)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -10673,7 +10675,7 @@ class DockerService:
                 killed_fillers = (
                     [] if beside_fillers else [n for n in removed_containers if n.startswith(FILLER_CONTAINER_PREFIX)]
                 )
-                trimmed_run_volumes: set[str] = set()
+                trimmed_run_volumes: dict[str, int] = {}
                 reclaimed_cache_volumes = (
                     False
                     if beside_fillers
@@ -10861,7 +10863,7 @@ class DockerService:
                         locked_df_avail_bytes=locked_df_avail_bytes,
                         locked_df_error=locked_df_error,
                         flatten_copy_bytes=flatten_copy,
-                        excluded_volume_names=trimmed_run_volumes,
+                        freed_volume_bytes=trimmed_run_volumes,
                     )
                     effective_volume_limit_gb = sizing.volume_limit_gb
                     effective_storage_limit_gb = sizing.storage_limit_gb

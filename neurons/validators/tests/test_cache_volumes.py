@@ -722,45 +722,45 @@ def _full_node_rental(monkeypatch, docker_service):
 async def test_the_killed_filler_run_volume_is_trimmed_and_the_order_keeps_its_share(docker_service, monkeypatch):
     rental = _full_node_rental(monkeypatch, docker_service)
     ssh_client = KilledFillerRunVolumeHost(["filler_f9c9d1e7"], free_gb=262.2)
-    trimmed: set[str] = set()
+    trimmed: dict[str, int] = {}
 
     assert await docker_service.reclaim_dphn_cache_for_rental(
         ssh_client, rental, {}, killed_fillers=["filler_f9c9d1e7"], trimmed_run_volumes=trimmed
     ) is True
-    assert trimmed == {_RUN_VOLUME}
+    assert trimmed == {_RUN_VOLUME: 80 * 10**9}
     assert any('nsenter -t 1 -m -- fstrim "$p"' in command and _RUN_VOLUME in command for command in ssh_client.commands)
-    # the trimmed volume is not counted twice: (262.2 + 74.5 + 37.3 free + 54.5 pod volumes - 74.5) x 242/363
-    assert rental.volume_limit_gb == 235  # 95% of 242 is 229.9
+    # the trim and both Dolphin wipes make 373.9 GiB free, over the 362 the order and the listing floor need
+    assert rental.volume_limit_gb == 242
 
 
 @pytest.mark.asyncio
 async def test_a_run_volume_a_live_container_mounts_is_not_trimmed(docker_service, monkeypatch):
     rental = _full_node_rental(monkeypatch, docker_service)
     ssh_client = KilledFillerRunVolumeHost(["filler_f9c9d1e7", "filler_live"], free_gb=262.2)
-    trimmed: set[str] = set()
+    trimmed: dict[str, int] = {}
 
     assert await docker_service.reclaim_dphn_cache_for_rental(
         ssh_client, rental, {}, killed_fillers=["filler_f9c9d1e7"], trimmed_run_volumes=trimmed
     ) is True
-    assert trimmed == set()  # still holds its disk: it stays in the sizing pool
+    assert trimmed == {}  # still holds its disk: it stays in the sizing pool
     assert ssh_client._free_bytes == int(262.2 * 1024**3)
-    assert rental.volume_limit_gb < 242 * 0.95
+    assert rental.volume_limit_gb == 242  # the clamp to 316.7 GiB free never grows the order
 
 
 @pytest.mark.asyncio
 async def test_a_trimmed_run_volume_does_not_raise_the_df_guard_floor(docker_service, monkeypatch):
     """Review 4522060750: the trimmed GiB belong to the share term only. 110 GB ordered beside 400 GB of pod
-    volumes: the df_guard floor (110 GiB) binds, and the trim's 74.5 GiB lifts 50 free to 124.5, which fits,
-    so the Dolphin caches stay. Adding the trim to the floor too (184.5) evicted them for nothing."""
+    volumes: the df_guard floor (110 GiB) plus the 100 GiB listing floor binds, and the trim's 74.5 GiB lifts 150
+    free to 224.5, which fits, so the Dolphin caches stay. Adding the trim to the floor too (284.5) evicted them."""
     monkeypatch.setattr(docker_service, "_get_existing_vloopback_bytes", AsyncMock(return_value=400 * 10**9))
     rental = _rental(100, 10)
     rental.disk_share = 1.0
-    ssh_client = KilledFillerRunVolumeHost(["filler_f9c9d1e7"], free_gb=50)
+    ssh_client = KilledFillerRunVolumeHost(["filler_f9c9d1e7"], free_gb=150)
 
     await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}, killed_fillers=["filler_f9c9d1e7"])
 
     assert _removed_volumes(ssh_client) == []
-    assert ssh_client._free_bytes == int(50 * 1024**3) + 80 * 10**9  # only the trim freed disk
+    assert ssh_client._free_bytes == int(150 * 1024**3) + 80 * 10**9  # only the trim freed disk
     assert rental.volume_limit_gb == 100
 
 
@@ -776,14 +776,14 @@ class FailedTrimHost(KilledFillerRunVolumeHost):
 async def test_a_failed_run_volume_trim_is_logged_with_the_volume_and_its_output(docker_service, monkeypatch, caplog):
     rental = _full_node_rental(monkeypatch, docker_service)
     ssh_client = FailedTrimHost(["filler_f9c9d1e7"], free_gb=262.2)
-    trimmed: set[str] = set()
+    trimmed: dict[str, int] = {}
 
     with caplog.at_level("WARNING"):
         await docker_service.reclaim_dphn_cache_for_rental(
             ssh_client, rental, {}, killed_fillers=["filler_f9c9d1e7"], trimmed_run_volumes=trimmed
         )
 
-    assert trimmed == set()
+    assert trimmed == {}
 
     [record] = [r for r in caplog.records if "run volume" in r.getMessage()]
     assert record.msg.extra["volume"] == _RUN_VOLUME and "cannot get realpath" in record.msg.extra["output"]
@@ -808,6 +808,20 @@ async def test_a_partial_trim_counts_only_the_disk_it_freed(docker_service):
     )
 
     assert freed_gb == pytest.approx(30 * 10**9 / 1024**3)
+
+
+@pytest.mark.asyncio
+async def test_a_partial_trim_hands_sizing_only_the_freed_bytes(docker_service, monkeypatch):
+    # review 4546421865: the untrimmed 50 GB still holds disk, so only the freed 30 GB leave the sizing pool
+    rental = _full_node_rental(monkeypatch, docker_service)
+    ssh_client = PartialTrimHost(["filler_f9c9d1e7"], free_gb=262.2)
+    trimmed: dict[str, int] = {}
+
+    await docker_service.reclaim_dphn_cache_for_rental(
+        ssh_client, rental, {}, killed_fillers=["filler_f9c9d1e7"], trimmed_run_volumes=trimmed
+    )
+
+    assert trimmed[_RUN_VOLUME] == pytest.approx(30 * 10**9, abs=1)
 
 
 class ImageHostSshClient(HostSshClient):
