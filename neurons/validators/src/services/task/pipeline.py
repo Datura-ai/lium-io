@@ -250,6 +250,9 @@ class ContextState:
     # The liumd shadow's docker and ports read, started right after machine_scrape so both see the
     # same containers; awaited by the shadow at the end of the run. None = no shadow for this node.
     liumd_facts_task: Any = None
+    # True once machine_scrape has tried to start that read, so a later shadow never falls back
+    # to a different Docker moment.
+    liumd_facts_attempted: bool = False
     # DAH-5462: VerifyX's cold first sample, re-measured by VerifyXColdRetryCheck just before scoring
     verifyx_cold_retry: Any = None
 

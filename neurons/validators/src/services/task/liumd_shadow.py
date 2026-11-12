@@ -336,11 +336,15 @@ async def _compare(
         )
         intent["steps"]["inspector"] = False
         # The facts come from the read taken right after machine_scrape; liumd is called again
-        # here only for GPU steps.
+        # here only for GPU steps. With GPU steps off there is no late fallback: a missing early
+        # read would compare a different Docker moment.
+        facts_only = matmul_challenge is None and verifyx_challenge is None
         early = ctx.state.liumd_facts_task
+        if facts_only and ctx.state.liumd_facts_attempted and early is None:
+            return _skipped("no_facts_read", steps=steps)
         facts_answer = await early if early is not None else None
         try:
-            if facts_answer is not None and matmul_challenge is None and verifyx_challenge is None:
+            if facts_only and facts_answer is not None:
                 answer = facts_answer
             else:
                 answer = await client_factory(ctx, budget).run(ctx.ssh, intent)

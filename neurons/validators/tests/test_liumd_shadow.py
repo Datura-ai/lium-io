@@ -368,6 +368,20 @@ async def test_facts_come_from_the_read_right_after_the_scrape(
 
 
 @pytest.mark.asyncio
+async def test_no_late_read_when_the_early_facts_task_is_missing(
+    keypair, monkeypatch, verifyx_service, shadow_on
+):
+    ctx = _ctx(keypair, monkeypatch, verifyx_service)
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, liumd_facts_attempted=True)})
+    late = FakeLiumd(facts=_docker("executor-1", "pod_x"))
+
+    record = await _shadow(ctx, late)
+
+    assert (record["outcome"], record["reason"]) == ("skipped", "no_facts_read")
+    assert late.intents == []
+
+
+@pytest.mark.asyncio
 async def test_no_post_scrape_read_on_a_rented_node(keypair, monkeypatch, verifyx_service, shadow_on):
     node = {
         "miner_hotkey": "5Miner",
