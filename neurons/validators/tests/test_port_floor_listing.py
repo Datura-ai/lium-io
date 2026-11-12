@@ -7,6 +7,7 @@ probe cascade and checks to show where the 2 comes from and what each run now re
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -494,6 +495,23 @@ async def test_a_stale_pod_beside_a_down_pod_without_a_rental_record_is_not_enfo
     # DAH-6141: the unanswered sibling holds the verdict, so the node stays rented, not idle
     assert tenant_result.event.reason_code == TenantEnforcementMessages.ALREADY_RENTED.reason
     assert tenant_result.updates["default_extra"]["pods_rental_state_unknown"] == ["pod-unknown"]
+
+
+@pytest.mark.asyncio
+async def test_a_hung_sibling_read_counts_as_live_and_raises_nothing(monkeypatch):
+    import time
+
+    from neurons.validators.src.services.task.checks import rented_machine
+
+    async def hang(*_args, **_kwargs):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(rented_machine, "_check_pod_running_and_read_authorized_keys", hang)
+    pods = rented_with_pods("pod-stale", "pod-hung").executors[EXECUTOR_UUID].pods
+    # no time left, so the read gets the 1 s floor; the asyncio.timeout TimeoutError is an OSError on 3.11+
+    ctx = SimpleNamespace(ssh=None, default_extra={}, started_at_monotonic=time.monotonic() - 10**6)
+
+    assert await rented_machine._every_listed_pod_stale(ctx, pods, 0, set()) is False
 
 
 @pytest.mark.asyncio
