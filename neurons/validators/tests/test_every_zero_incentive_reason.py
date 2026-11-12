@@ -372,6 +372,23 @@ async def test_an_outdated_image_is_one_reason_for_one_cause(monkeypatch, engine
     assert _codes(result) == ["outdated_executor_image"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", [RentalPriceIncentive, DefaultIncentive])
+async def test_an_unofficial_image_is_one_reason_for_one_cause(engine):
+    result = _idle_full_8x(
+        score=0,
+        job_score=0,
+        log_status="error",
+        failure_reason_code=ExecutorImageMessages.UNOFFICIAL.reason,
+        executor_image_report={"status": "UNOFFICIAL", "expected_ref": "daturaai/compute-subnet-executor:latest"},
+    )
+    incentive = engine(IncentiveConfig(), AsyncMock(), {"hk": [result]}, {})
+
+    await incentive._pre_process_job_result("hk", result)
+
+    assert _codes(result) == ["outdated_executor_image"]
+
+
 # ── excluded nodes: scored 0, never an exception ──────────────────────────────
 
 

@@ -39,7 +39,8 @@ fi
 
 if [ "$MODE" = "validator" ]; then
     pdm run alembic upgrade head
-    pdm run src/validator.py
+    # exec: bash as PID 1 would swallow the rollout's SIGTERM; pdm forwards it to the validator (DAH-6011)
+    exec pdm run src/validator.py
 elif [ "$MODE" = "connector" ]; then
     pdm run src/connector.py
 else
