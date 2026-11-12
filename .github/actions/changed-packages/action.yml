@@ -37,6 +37,10 @@ outputs:
     value: ${{ steps.route.outputs.protocol }}
   e2e:
     value: ${{ steps.route.outputs.e2e }}
+  approved:
+    # "true" on a PR with an approving review (each reviewer's latest approve/request-changes counts), and on any
+    # non-PR event; test.yml runs the package jobs and e2e-gate only then (DAH-5832)
+    value: ${{ steps.route.outputs.approved }}
 
 runs:
   using: composite
@@ -57,7 +61,7 @@ runs:
             files.some(f => f.startsWith(prefix)) || files.some(f => SHARED.some(s => f.startsWith(s)))
             || files.some(f => (ALSO[pkg] || []).some(s => f.startsWith(s)));
 
-          let files = null, why = 'no diff for this event';
+          let files = null, why = 'no diff for this event', approved = true;
           const prNumber = context.payload.pull_request?.number;
           if (prNumber) {
             const listed = await github.paginate(github.rest.pulls.listFiles, {
@@ -66,6 +70,14 @@ runs:
             // a rename out of a package is still a change to that package
             files = listed.flatMap(f => [f.filename, f.previous_filename].filter(Boolean)).filter(f => !isDoc(f));
             why = `PR #${prNumber}: ${files.length} files`;
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber, per_page: 100,
+            });
+            const latest = {};
+            // the repo is public: only a member's or collaborator's review counts, not any GitHub user's
+            const TEAM = ['OWNER', 'MEMBER', 'COLLABORATOR'];
+            for (const r of reviews) if (r.user && r.state !== 'COMMENTED' && TEAM.includes(r.author_association)) latest[r.user.login] = r.state;
+            approved = Object.values(latest).includes('APPROVED');
           } else {
             // merge group: base..head; push: before..after (all zeros on a new branch: no diff, every package)
             const mg = context.payload.merge_group;
@@ -97,6 +109,8 @@ runs:
           const e2e = anyPackage || (e2eFiles ? touches(e2eFiles, 'e2e', 'e2e/') : true);
           core.setOutput('e2e', e2e);
           rows.push(['e2e', e2e ? 'changed' : 'unchanged', why]);
+          core.setOutput('approved', approved);
+          rows.push(['approved', String(approved), approved ? 'package jobs and e2e-gate run' : 'lint only until a review approves']);
           core.summary
             .addHeading('Route', 3)
             .addTable([[{data: 'package', header: true}, {data: 'result', header: true}, {data: 'why', header: true}], ...rows])
