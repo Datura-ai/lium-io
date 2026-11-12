@@ -1994,6 +1994,20 @@ class CapabilityMessages:
         impact="Score set to 0",
         remediation="Run Docker GPU diagnostics (nvidia-smi) and ensure containers can access GPUs.",
     )
+    # DAH-6241: the matmul answered, but the card it ran on has another compute capability or SM
+    # count than the reported model has
+    GPU_MODEL_MISMATCH = MessageTemplate(
+        event="GPU model check failed: the card is not the reported model",
+        reason="GPU_MODEL_MISMATCH",
+        severity="error",
+        category="gpu",
+        impact="Score set to 0",
+        remediation=(
+            "The compute capability and SM count measured on the GPU do not match the GPU model "
+            "the node reports. Report the model the card really is; a node is paid for the GPU "
+            "it has."
+        ),
+    )
     # One reason code per CUDA failure the probe can hit (DAH-3362, ticket-0318), as
     # GPU_VERIFY_TIMEOUT and the VERIFYX_FAILED_* family already do; the full steps live in the
     # reason-code table the default help_uri points at. Wording is provider-facing; no backticks,

@@ -14,6 +14,7 @@ from services.matrix_validation_service import UUID_MISMATCH_ERROR_PREFIX
 
 from ..messages import CapabilityMessages as Msg, MessageTemplate, render_message
 from ..pipeline import CheckResult, Context
+from .gpu_model_truth import gpu_model_mismatch
 from .matmul_speed_log import log_matmul_speed
 from .rental_owner import uuid_listed_under_another_miner, rental_of_this_node
 
@@ -92,6 +93,16 @@ class CapabilityCheck:
         log_matmul_speed(specs, result, transport=transport, default_extra=ctx.default_extra)
 
         if result and result.success:
+            # DAH-6241: a correct answer from a card that is not the reported model earns nothing
+            mismatch = gpu_model_mismatch(specs, result.metrics)
+            if mismatch is not None:
+                event = render_message(
+                    Msg.GPU_MODEL_MISMATCH,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={**mismatch, "sealed": result.sealed, "transport": transport},
+                )
+                return CheckResult(passed=False, event=event)
             what: dict = {"metrics": result.metrics, "transport": transport}
             if sizing:
                 what["first_pass_vram_budget_mb"] = sizing["vram_budget_mb"]
