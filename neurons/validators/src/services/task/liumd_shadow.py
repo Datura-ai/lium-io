@@ -153,9 +153,19 @@ def start_facts_after_scrape(
     will compare this node."""
     if not settings.VALIDATOR_LIUMD_SHADOW or settings.DRY_RUN or ctx.config.first_pass:
         return None
-    if ctx.config.validator_keypair is None or not _reserved(ctx) or _workload_on_node(ctx, {}):
+    # called from the fatal scrape check: a shadow error (e.g. a malformed reserved list) must never fail it
+    try:
+        if ctx.config.validator_keypair is None or not _reserved(ctx) or _workload_on_node(ctx, {}):
+            return None
+        return asyncio.create_task(_facts_only(ctx, client_factory or _default_client))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            _m(
+                "liumd shadow early facts read not started",
+                extra=get_extra_info({**ctx.default_extra, "error": f"{type(exc).__name__}: {exc}"[:DETAIL_MAX_CHARS]}),
+            )
+        )
         return None
-    return asyncio.create_task(_facts_only(ctx, client_factory or _default_client))
 
 
 async def _facts_only(ctx: Context, client_factory: Callable[[Context, float], Any]) -> Any:

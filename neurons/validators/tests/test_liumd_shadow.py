@@ -381,6 +381,17 @@ async def test_no_late_read_when_the_early_facts_task_is_missing(
     assert late.intents == []
 
 
+def test_a_malformed_reserved_entry_starts_no_early_read_and_raises_nothing(
+    keypair, monkeypatch, verifyx_service, shadow_on
+):
+    # start_facts_after_scrape runs inside the fatal scrape check: a bad shadow setting must not fail it
+    monkeypatch.setattr(settings, "LIUMD_SHADOW_RESERVED_EXECUTORS", f"{RESERVED},{UUID}")
+    early = FakeLiumd()
+
+    assert start_facts_after_scrape(_ctx(keypair, monkeypatch, verifyx_service), early.factory) is None
+    assert early.intents == []
+
+
 @pytest.mark.asyncio
 async def test_no_post_scrape_read_on_a_rented_node(keypair, monkeypatch, verifyx_service, shadow_on):
     node = {
