@@ -25,7 +25,7 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 SCRIPT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "nvidia_docker_sysbox_setup.sh"))
 
 # the real tools the check functions call, so PATH can be built without the host's jq
-REAL_TOOLS = ["bash", "grep", "sed", "awk", "head", "tail", "cut", "ls", "dirname", "cat", "seq", "rm", "mkdir", "readlink",
+REAL_TOOLS = ["bash", "grep", "sed", "awk", "head", "tail", "cut", "ls", "dirname", "cat", "seq", "rm", "mkdir", "mv", "readlink",
               # the real ones are used only where a test drops the recording stub (an unresponsive ctr)
               "timeout", "sleep"]
 
@@ -63,6 +63,11 @@ STUBS = {
             "ps --format") [ -z "${STUB_RUNNING:-}" ] || echo "$STUB_RUNNING" ;;   # install mode's running-container sort
             "ps -a")   # every container, stopped ones too
                 [ -z "${STUB_PS_A_HANGS:-}" ] || exit 124
+                if [ "$3" = --format ]; then
+                    [ -z "${STUB_ALL_CONTAINERS:-}" ] && exit 0
+                    case "$4" in *.ID*) echo -e "$STUB_ALL_CONTAINERS" ;; *) echo -e "$STUB_ALL_CONTAINERS" | awk '{print $2}' ;; esac
+                    exit 0
+                fi
                 echo "${STUB_STOPPED_POD:-}"
                 [ "$4" != name=pod_ ] || [ -z "${STUB_PODS:-}" ] || echo "$STUB_PODS" ;;
             "ps --filter")
@@ -138,6 +143,16 @@ STUBS = {
     ),
     # records "<seconds> <command>" in .stub-docker/timeouts, then runs the command
     "timeout": '#!/bin/bash\necho "$*" >> "$SYSBOX_SETUP_HOST_ROOT/.stub-docker/timeouts"\nshift\nexec "$@"\n',
+    # `ip route` gives the default route; `ip route get X` routes X via it unless STUB_IP_LOCAL names X (a local subnet)
+    "ip": textwrap.dedent(
+        """\
+        #!/bin/bash
+        case "$1 $2" in
+            "route ") echo "default via 192.0.2.1 dev eth0" ;;
+            "route get") if [ "${STUB_IP_LOCAL:-}" = "$3" ]; then echo "$3 dev br0 src $3"; else echo "$3 via 192.0.2.1 dev eth0"; fi ;;
+        esac
+        """
+    ),
     "apparmor_parser": '#!/bin/bash\necho "$*" >> "$SYSBOX_SETUP_HOST_ROOT/.stub-docker/apparmor"\n',
     "nvidia-container-cli": '#!/bin/bash\nprintf "cli-version: 1.17.8\\nlib-version: 1.17.8\\n"\n',
     # the real `sysbox-runc --version`: the name alone on line 1, the version on line 2
@@ -751,13 +766,36 @@ def test_fusermount3_without_a_profile_or_with_the_rule_passes(tmp_path, files):
 
 
 def test_install_mode_stops_on_a_stopped_rental(tmp_path):
-    # a renter's stopped pod is still a rental; the upgrade path removes every stopped container
+    # a renter's stopped pod is still a rental
     proc = run_script(tmp_path, env={"STUB_SYSBOX_VERSION": "0.6.6", "STUB_STOPPED_POD": "pod_abc123"})
     assert proc.returncode == 1
     assert "Rentals found (pod_* containers, running or stopped). Cannot proceed." in proc.stdout
     assert "docker ps -a --filter name=pod_" in proc.stdout
     assert "pod_abc123" in proc.stdout
     assert "Removing stopped containers" not in proc.stdout
+
+
+def test_install_mode_keeps_the_default_job(tmp_path):
+    # the Default Job (filler_*) is not an unknown container; the install stops it, keeps it and starts it again
+    proc = run_script(
+        tmp_path,
+        env={"STUB_SYSBOX_VERSION": "0.6.6", "STUB_RUNNING": "filler_abc", "STUB_ALL_CONTAINERS": "aaa filler_abc\nbbb old_one"},
+    )
+    # the stub host cannot fetch packages, so the run ends at step 3; the clean-up before it is what matters
+    assert "Docker is clear for sysbox installation." in proc.stdout, proc.stdout + proc.stderr
+    assert "Unknown containers found" not in proc.stdout
+    calls = (tmp_path / "root/.stub-docker/calls").read_text().splitlines()
+    assert "stop filler_abc" in calls
+    assert not [c for c in calls if c.startswith("rm")]  # the provider's stopped containers are kept
+
+
+def test_install_mode_keeps_a_default_job_that_was_already_stopped(tmp_path):
+    # the provider stopped it by hand before running setup: it is still kept, and in the list started after setup
+    proc = run_script(tmp_path, env={"STUB_SYSBOX_VERSION": "0.6.6", "STUB_ALL_CONTAINERS": "aaa filler_abc\nbbb old_one"})
+    assert "Docker is clear for sysbox installation." in proc.stdout, proc.stdout + proc.stderr
+    calls = (tmp_path / "root/.stub-docker/calls").read_text().splitlines()
+    assert "stop filler_abc" in calls
+    assert not [c for c in calls if c.startswith("rm")]
 
 
 def test_install_mode_loads_the_iptables_modules_itself(tmp_path):
@@ -792,3 +830,87 @@ def test_aarch64_host_passes_the_arch_check(tmp_path):
     # GB300 / Grace: nestybox ships an arm64 .deb, so aarch64 is no longer a blocking FIX
     proc = run_script(tmp_path, "--check", env={"STUB_ARCH": "aarch64"})
     assert "PASS Architecture aarch64." in proc.stdout
+
+
+# ── ports ────────────────────────────────────────────────────────────────────
+
+
+def test_piped_without_an_env_a_busy_default_port_is_a_note_not_a_fix(tmp_path):
+    # piped from curl there is no .env, so 8080 is only assumed; the provider may run the executor on another port
+    rc, out, fix_count = run_check(tmp_path, "check_ports", env={"STUB_BUSY_PORT": "8080", "STUB_BUSY_PROC": "python3"})
+    assert fix_count == 0
+    assert "TCP 8080 (default executor port, assumed: no .env found) is in use" in out
+    assert "EXECUTOR_PORT=<port>" in out
+
+
+def test_piped_from_the_executor_directory_checks_the_env_port(tmp_path):
+    (tmp_path / ".env").write_text("EXTERNAL_PORT=9000\nSSH_PORT=2300\n")
+    rc, out, fix_count = run_check(tmp_path, "check_ports", env={"STUB_BUSY_PORT": "9000", "STUB_BUSY_PROC": "python3"})
+    assert fix_count == 1
+    assert "TCP 9000 (executor port) is already in use" in out
+
+
+def test_an_explicit_port_in_use_is_still_a_fix(tmp_path):
+    rc, out, fix_count = run_check(
+        tmp_path, "check_ports", env={"EXECUTOR_PORT": "8080", "STUB_BUSY_PORT": "8080", "STUB_BUSY_PROC": "python3"}
+    )
+    assert fix_count == 1
+    assert "TCP 8080 (executor port) is already in use" in out
+
+
+# ── sysbox network settings before the .deb ─────────────────────────────────
+
+# the .deb's config script greps daemon.json line by line for these two keys
+SYSBOX_NET_KEYS = re.compile(r'^ +"bip": "[0-9.]+.*"', re.M), re.compile(r'^ +"default-address-pools"', re.M)
+
+
+# TEST-NET stand-ins for the subnets setup reads from the .deb's postinst
+SEED = "seed_sysbox_network_config 192.0.2.1/24 198.51.100.0/24"
+
+
+def _daemon_json(tmp_path: Path) -> str:
+    return (tmp_path / "root/etc/docker/daemon.json").read_text()
+
+
+def test_seed_writes_sysbox_network_settings_when_a_stopped_container_exists(tmp_path):
+    # without them the .deb's config script exits 1 on a host with any container, before anything is installed
+    result = run_check(
+        tmp_path, SEED, env={"STUB_ALL_CONTAINERS": "aaa old_one"}, with_jq=True
+    )
+    assert result.rc == 0, result.output
+    text = _daemon_json(tmp_path)
+    assert all(key.search(text) for key in SYSBOX_NET_KEYS), text
+
+
+def test_seed_keeps_the_provider_settings_and_indents_a_one_line_file(tmp_path):
+    result = run_check(
+        tmp_path,
+        SEED,
+        env={"STUB_ALL_CONTAINERS": "aaa old_one"},
+        files={"etc/docker/daemon.json": '{"data-root":"/data/docker","bip":"203.0.113.1/24"}'},
+        with_jq=True,
+    )
+    assert result.rc == 0, result.output
+    text = _daemon_json(tmp_path)
+    assert all(key.search(text) for key in SYSBOX_NET_KEYS), text
+    assert '"bip": "203.0.113.1/24"' in text and '"data-root": "/data/docker"' in text
+
+
+def test_seed_leaves_daemon_json_alone_without_containers(tmp_path):
+    # sysbox configures and restarts Docker itself when no container exists
+    result = run_check(tmp_path, SEED, with_jq=True)
+    assert result.rc == 0, result.output
+    assert not (tmp_path / "root/etc/docker/daemon.json").exists()
+
+
+def test_seed_stops_when_the_sysbox_subnet_is_a_local_network(tmp_path):
+    result = run_check(
+        tmp_path,
+        SEED,
+        env={"STUB_ALL_CONTAINERS": "aaa old_one", "STUB_IP_LOCAL": "198.51.100.0"},
+        files={"etc/docker/daemon.json": "{}"},
+        with_jq=True,
+    )
+    assert result.rc == 1
+    assert "overlaps a local network" in result.output
+    assert _daemon_json(tmp_path) == "{}"

@@ -27,3 +27,5 @@ class MinerIdentityResponse(BaseModel):
     miner_hotkey: str
     nonce: str
     account_claim: str | None = None
+    # the SSH port validators dial, sent only while its host keys survive recreation (portal records them)
+    ssh_host_key_port: int | None = None

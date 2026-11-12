@@ -7,8 +7,10 @@ including context setup and check instantiation.
 import logging
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import cast
 
+import asyncssh
 import bittensor
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
@@ -84,12 +86,14 @@ from .checks import (
     StaleContainerCleanupCheck,
     StartGPUMonitorCheck,
     SshdBootstrapCheck,
+    DockerCpuCheck,
     PidHostRequiredCheck,
     SysboxRequiredCheck,
     TdxHostCheck,
     TenantEnforcementCheck,
     UploadFilesCheck,
     VerifyXCheck,
+    VerifyXColdRetryCheck,
 )
 from .pipeline import (
     Check,
@@ -407,6 +411,7 @@ class PipelineFactory:
                 # the authoritative probe result used for scoring (not the earlier scrape hint).
                 SysboxRequiredCheck(),
                 PidHostRequiredCheck(),
+                DockerCpuCheck(),
                 ExecutorImageCheck(),
                 InspectorRentedCheck(),
                 RentedPodResourcesCheck(),
@@ -451,6 +456,8 @@ class PipelineFactory:
                 RentalProbeCheck(),
                 # DAH-5320: the idle node's disk write with fsync, shadow only; last so it never takes the checks' time.
                 IdleDiskWriteCheck(),
+                # DAH-5462: VerifyX's second sample of a cold never-measured node, in whatever time the checks above left
+                VerifyXColdRetryCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),
             ],
@@ -563,6 +570,7 @@ class PipelineFactory:
                             ContainerDownloadSpeedCheck(),
                             SysboxRequiredCheck(),
                             PidHostRequiredCheck(),
+                            DockerCpuCheck(),
                             RentalVerificationCheck(),
                         ],
                         [
@@ -578,6 +586,8 @@ class PipelineFactory:
                 RentalProbeCheck(),
                 # DAH-5320: the idle node's disk write with fsync, shadow only; last so it never takes the checks' time.
                 IdleDiskWriteCheck(),
+                # DAH-5462: VerifyX's second sample of a cold never-measured node, in whatever time the checks above left
+                VerifyXColdRetryCheck(),
                 ScoreCheck(),
                 FinalizeCheck(),
             ],
@@ -657,6 +667,7 @@ class PipelineFactory:
                 # the authoritative probe result used for scoring (not the earlier scrape hint).
                 SysboxRequiredCheck(),
                 PidHostRequiredCheck(),
+                DockerCpuCheck(),
                 ExecutorImageCheck(),
                 # recover_stale_pods=False: dry run still reports a pod as down, but must not rmdir
                 # a stale mountpoint on the host or start a customer's container (DAH-2306).
@@ -677,13 +688,16 @@ class PipelineFactory:
             ],
         )
 
-    def build_pipeline(self, checks: list[Check]) -> Pipeline:
+    def build_pipeline(
+        self, checks: list[Check], reconnect: Callable[[], Awaitable[asyncssh.SSHClientConnection]] | None = None
+    ) -> Pipeline:
         """Build a pipeline with the given checks.
 
         Args:
             checks: List of validation checks
+            reconnect: opens a fresh session to the node when the open one drops mid-check
 
         Returns:
             Configured Pipeline ready to run
         """
-        return Pipeline(checks, sink=LoggerSink(logger, tracker=self.status_tracker))
+        return Pipeline(checks, sink=LoggerSink(logger, tracker=self.status_tracker), reconnect=reconnect)

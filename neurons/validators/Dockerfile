@@ -8,7 +8,8 @@ RUN apt-get update \
 
 WORKDIR /app
 
-RUN pip install "pdm==2.29.3" "unearth<0.19"
+# pdm[locked]: pdm's own dependency pins; plain pdm took hishel 2.0.0, which crashes `pdm install` (DAH-5825)
+RUN pip install "pdm[locked]==2.29.3" "unearth<0.19"
 ENV PDM_CHECK_UPDATE=false
 
 COPY pyproject.toml pdm.lock README.md ./
@@ -28,5 +29,8 @@ RUN for f in lib*-aarch64.so; do [ ! -e "$f" ] || mv "$f" /usr/lib/; done
 ENV ENV=prod
 ENV USE_TORCH=0
 ENV PYTHONUNBUFFERED=1
+# websockets reconnect backoff (pdm.lock pins 16.1, which reads these at import): after a backend restart the
+# connector must be back within the backend's 10 s rent wait; the default grows to 90 s (55.6 s waits seen 12 Nov)
+ENV WEBSOCKETS_BACKOFF_INITIAL_DELAY=1 WEBSOCKETS_BACKOFF_MIN_DELAY=1 WEBSOCKETS_BACKOFF_MAX_DELAY=8
 
 CMD ["bash", "run.sh"]

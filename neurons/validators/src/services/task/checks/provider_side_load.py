@@ -5,11 +5,16 @@ import logging
 import math
 from dataclasses import dataclass
 from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Any
 
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.const import LIUM_INFRA_CONTAINER_PREFIXES
+from services.storage_operations import (
+    STORAGE_HELPER_KEY_MARK,
+    settle_excused_storage_helper_keys,
+)
 
 from .cpu_truth import advertised_cpu_count
 from .custom_build_orphan_sweep import BUILD_DIND_PREFIX
@@ -37,6 +42,18 @@ PROVIDER_SIDE_DISK_LIMIT_KB = 100 * 1024 * 1024  # 100 GB outside docker
 # own stack is matched by image digest instead and stays uncapped - the scrape itself runs in
 # that container and can hold several cores, and zeroing an honest node is the worse error.
 CLAIMED_EXCUSE_CORES = PROVIDER_SIDE_CPU_CORES_LIMIT
+
+# DAH-6148: a Lium backup runs restic in a `lium-storage-<operation>` helper container (executor
+# storage/restic.py). It is on no rental list and usually starts between the scrape and the second
+# look, so its cores landed on the provider. Only the helpers this validator started on the node
+# are excused (storage_operations.settle_excused_storage_helper_keys: by exact name while the
+# backend has the operation open; files on the node are the provider's to write, so never asked),
+# and only up to restic's GOMAXPROCS: a container that merely wears the prefix, or takes a
+# helper's name after its operation ended, stays the provider's.
+STORAGE_HELPER_EXCUSE_CORES = 8.0
+# ...and only while its runner reported within this (it reports every 30 s; Rustam, DAH-6148)
+STORAGE_REPORT_MAX_AGE_SECONDS = 10 * 60
+STORAGE_REPORT_MAX_FUTURE_SECONDS = 60
 
 # A second look before any money is withheld, the same rule the foreign-GPU twin follows with
 # the live card. The scrape's window is about two seconds, and Lium's own housekeeping
@@ -114,12 +131,17 @@ def provider_cores_outside_lium(
     Matching by both id and name, because the scrape reports full ids and `docker stats`
     reports the first 12 characters.
     """
-    lium_short_ids: set[str] = {key[:12] for key in lium_container_keys}
-    lium_percent: float = sum(
-        row.measured_cpu_percent
-        for row in rows
-        if row.name in lium_container_keys or row.container_id[:12] in lium_short_ids
-    )
+    lium_short_ids: set[str] = {
+        key[:12] for key in lium_container_keys if not key.startswith(STORAGE_HELPER_KEY_MARK)
+    }
+    lium_percent = helper_percent = 0.0
+    for row in rows:
+        if f"{STORAGE_HELPER_KEY_MARK}{row.name}" in lium_container_keys:
+            # a helper this validator started: excused up to the cap below
+            helper_percent += row.measured_cpu_percent
+        elif row.name in lium_container_keys or row.container_id[:12] in lium_short_ids:
+            lium_percent += row.measured_cpu_percent
+    lium_percent += min(helper_percent, STORAGE_HELPER_EXCUSE_CORES * 100)
     # Floor, not round: 1.96 cores must not become 2.0 and cross the limit on its own. The
     # inner round absorbs float noise first, so an exact 1.6 does not floor to 1.5.
     provider_cores = max(0.0, host_cores - lium_percent / 100)
@@ -252,6 +274,7 @@ async def lium_containers(ctx: Context) -> set[str] | None:
         containers.update(f"{BUILD_DIND_PREFIX}{pod.pod_id}" for pod in rented_executor.pods)
     specs = ctx.state.specs or {}
     containers.update(await late_started_containers_the_backend_owns(ctx, containers))
+    containers.update(await excused_storage_helper_keys(ctx))
     stack_ids: set[str] = executor_stack_container_ids(specs)
     if settings.PROVIDER_SIDE_LOAD_STACK_EXCUSE_CAP_ENABLED and stack_excuse_is_over_its_cap(specs):
         # like the name tier: over the cap the whole tier excuses nothing
@@ -260,6 +283,36 @@ async def lium_containers(ctx: Context) -> set[str] | None:
     containers.update(infra_container_names(specs, stack_ids))
     containers.discard("")
     return containers
+
+
+async def excused_storage_helper_keys(ctx: Context) -> set[str]:
+    return await settle_excused_storage_helper_keys(
+        ctx.services.redis, ctx.executor.uuid, lambda op: storage_operation_open(ctx, op)
+    )
+
+
+async def storage_operation_open(ctx: Context, operation_id: str) -> bool | None:
+    """True while the backend has the operation open and its runner reported within
+    STORAGE_REPORT_MAX_AGE_SECONDS; False once the backend ended it; None when it did not answer
+    or the open operation went quiet (the record stays, nothing is excused this cycle)."""
+    try:
+        answer = await ctx.services.backend.get_storage_operation_active(operation_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Storage operation %s status unreadable: %s", operation_id, exc)
+        return None
+    if answer is None or not answer.active:
+        return None if answer is None else False
+    # the progress token lives on the node, so open alone is not proof the helper still works
+    # for Lium: an operation whose runner stopped reporting excuses nothing
+    if answer.last_report_at is None:
+        return None
+    last_report_at = answer.last_report_at
+    if last_report_at.tzinfo is None:
+        last_report_at = last_report_at.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - last_report_at).total_seconds()
+    # a report "from the future" would pass any age check: past a minute of clock skew, no answer
+    fresh = -STORAGE_REPORT_MAX_FUTURE_SECONDS <= age <= STORAGE_REPORT_MAX_AGE_SECONDS
+    return True if fresh else None
 
 
 def executor_stack_container_ids(specs: dict[str, Any]) -> set[str]:
@@ -424,9 +477,9 @@ class ProviderSideLoadCheck:
     because he never touches the card.
 
     The verdict comes from the specs the scrape already collects: host CPU minus every Lium
-    container's CPU, and disk used minus the docker breakdown. Above the floors the node is
-    judged, rented or idle alike — the provider cheats the renter in the first case and the
-    marketplace in the second.
+    container's CPU, and disk used minus the docker breakdown. Above the floors an idle node is
+    judged; beside a Lium pod or filler the reading is logged only, since it carries Lium's own
+    load. A workload the provider runs all day shows on the idle cycles.
 
     Shadow by default like every other money-withholding gate: without
     PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED the verdict is logged, not scored. An inability to
@@ -514,9 +567,32 @@ class ProviderSideLoadCheck:
         )
         if (measured.cpu_cores or 0.0) < PROVIDER_SIDE_CPU_CORES_LIMIT:
             return measured
+        if lium_container_keys is not None:
+            # the second look trusts only a fresh read of the helpers: a backup that started since
+            # the first read is excused, one the backend ended since is not
+            lium_container_keys = {
+                key for key in lium_container_keys if not key.startswith(STORAGE_HELPER_KEY_MARK)
+            } | await excused_storage_helper_keys(ctx)
         return replace(
             measured,
             cpu_cores=await self._resample_cpu_cores(ctx, lium_container_keys),
+        )
+
+    @staticmethod
+    def _is_cpu_verdict_scored(
+        ctx: Context, provider_side_load: ProviderSideLoad, lium_container_keys: set[str] | None
+    ) -> bool:
+        """Only the CPU half withholds money. A high disk figure is reported and never scored:
+        it is read once, with no second look, and every docker category nobody enumerated
+        (loopback volumes, json logs, BuildCache so far) lands in it and would zero an honest
+        node. The shadow week measures the disk numbers before that half is armed.
+        Beside a Lium pod or filler the host reading carries Lium's own load; a rental-named key of
+        `lium_containers` is one the backend reported or confirmed after the cycle's snapshot."""
+        late_workloads: set[str] = {
+            key for key in lium_container_keys or () if carries_a_rental_prefix(key)
+        }
+        return provider_side_load.is_cpu_above_limit and not (
+            lium_workload_containers(ctx) | late_workloads
         )
 
     async def run(self, ctx: Context) -> CheckResult:
@@ -542,18 +618,14 @@ class ProviderSideLoadCheck:
             event = render_message(Msg.LOAD_OK, ctx=ctx, check_id=self.check_id, what=what)
             return CheckResult(passed=True, event=event, updates=updates)
 
-        # Only the CPU half withholds money. A high disk figure is reported and never scored:
-        # it is read once, with no second look, and every docker category nobody enumerated
-        # (loopback volumes, json logs, BuildCache so far) lands in it and would zero an honest
-        # node. The shadow week measures the disk numbers before that half is armed.
-        enforce: bool = (
-            settings.PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED
-            and provider_side_load.is_cpu_above_limit
-        )
+        is_cpu_verdict_scored = self._is_cpu_verdict_scored(ctx, provider_side_load, lium_container_keys)
+        enforce: bool = settings.PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED and is_cpu_verdict_scored
         if enforce:
             impact = None
         elif not provider_side_load.is_cpu_above_limit:
             impact = "Disk is observed only: score was NOT changed"
+        elif not is_cpu_verdict_scored:
+            impact = "Observed only beside a Lium workload: score was NOT changed"
         else:
             impact = "Shadow observation only: score was NOT changed"
         event = render_message(

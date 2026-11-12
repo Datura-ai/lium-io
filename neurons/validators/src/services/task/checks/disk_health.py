@@ -17,6 +17,7 @@ class DiskHealthCheck:
     """
 
     check_id = "executor.validate.disk_health"
+    replays_after_session_drop = True
     fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:

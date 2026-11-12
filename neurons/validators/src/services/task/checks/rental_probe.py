@@ -5,7 +5,9 @@ import logging
 import shlex
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any
 
 import asyncssh
@@ -21,6 +23,7 @@ from payload_models.payloads import (
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from services.container_cleanup import retained_volume_pod_ids
 from services.redis_service import (
     RENTAL_PROBE_FAILED_PREFIX,
     RENTAL_PROBE_OK_PREFIX,
@@ -63,7 +66,6 @@ _CREATE_STEPS_BEFORE_THE_HOST = frozenset(
         "pending_pod",
         "ssh_key_import",
         "attestation",
-        "docker_sdk_ssh_host_key",
         "build_input_empty",
         "cancelled_by_delete",
         # renters got pods on the nodes whose probe create failed here on 21 Oct
@@ -76,7 +78,8 @@ _REMEDIATION_BY_STEP: dict[str, str] = {
     STEP_CONTAINER_START: (
         "The validator could not start a renter container on this node (create step: {create_step}). "
         "Check that Docker and the NVIDIA container runtime start a GPU container by hand, that the "
-        "default renter image is present, and that the executor's port range is free."
+        "default renter image is present, that the executor's port range is free, and that sshd, the "
+        "network and dockerd stay up so the validator's Docker connection over SSH does not drop."
     ),
     STEP_SSHD_LISTEN: (
         "The container started but sshd did not answer on port {port} within {deadline} s. "
@@ -180,6 +183,8 @@ class _ProbeOutcome:
     create_step: str | None = None
     ssh_port: int | None = None
     inconclusive_reason: str | None = None
+    # A passed probe's teardown, left for RentalProbeCheck.run to start once the verdict is recorded
+    teardown: Callable[[], Awaitable[None]] | None = None
 
 
 @dataclass
@@ -193,6 +198,8 @@ class _ProbeGate:
     standing: _Failure | None
     # the fillers the backend listed under the lock, which the probe runs beside and leaves alone
     fillers_beside: frozenset[str] = frozenset()
+    # volume_<pod_id> names the backend keeps without their container; the probe's create must not sweep them
+    kept_volumes: frozenset[str] = frozenset()
 
 
 class RentalProbeCheck:
@@ -243,6 +250,8 @@ class RentalProbeCheck:
     """
 
     check_id = "executor.validate.rental_probe"
+    # starts named containers / recovers the pod on the host: never replayed after a dropped session
+    replays_after_session_drop = False
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
@@ -267,6 +276,7 @@ class RentalProbeCheck:
                 image_ref,
                 gate.create_lock,
                 beside_fillers=bool(gate.fillers_beside),
+                kept_volumes=gate.kept_volumes,
                 create_deadline=create_deadline,
             )
         finally:
@@ -287,8 +297,11 @@ class RentalProbeCheck:
             )
 
         if outcome.failed_step is None:
-            await _stamp_last_ok(ctx)
-            await _clear_failure(ctx)
+            try:
+                await _stamp_last_ok(ctx)
+                await _clear_failure(ctx)
+            finally:
+                _teardown_after_verdict(ctx, outcome)
             return CheckResult(
                 passed=True,
                 event=render_message(Msg.PROBE_OK, ctx=ctx, check_id=self.check_id, what=what),
@@ -392,25 +405,24 @@ class RentalProbeCheck:
             return self._skipped(ctx, _RENT_IN_PROGRESS)
 
         try:
-            stop_result_or_fillers_beside = await self._idle_under_lock(ctx, standing)
+            stop_result_or_idle = await self._idle_under_lock(ctx, standing)
         except BaseException:
             await create_lock.release(ctx)
             raise
-        if isinstance(stop_result_or_fillers_beside, CheckResult):
+        if isinstance(stop_result_or_idle, CheckResult):
             await create_lock.release(ctx)
-            return stop_result_or_fillers_beside
+            return stop_result_or_idle
         return _ProbeGate(
             image_ref=image_ref,
             create_lock=create_lock,
             standing=standing,
-            fillers_beside=stop_result_or_fillers_beside,
+            fillers_beside=stop_result_or_idle.fillers_beside,
+            kept_volumes=stop_result_or_idle.kept_volumes,
         )
 
-    async def _idle_under_lock(
-        self, ctx: Context, standing: _Failure | None
-    ) -> CheckResult | frozenset[str]:
+    async def _idle_under_lock(self, ctx: Context, standing: _Failure | None) -> CheckResult | _BusyNow:
         """Re-read the node's idleness under the create lock; the result that stops the cycle,
-        or the fillers the probe may run beside (empty on a node without a filler).
+        or the idle reading: the fillers the probe may run beside and the volumes it must keep.
 
         ctx.state.rented_data is the snapshot the cycle started from, minutes ago for the last check
         in the pipeline. create_container sweeps every pod_* container it is not told about, so the
@@ -433,7 +445,7 @@ class RentalProbeCheck:
             return self._inconclusive(
                 ctx, "the idleness re-read overran its budget", steps=[], standing=standing
             )
-        return now.fillers_beside
+        return now
 
     def _failed(
         self, ctx: Context, failure: _Failure, *, what: dict[str, Any], ssh_port: int | None
@@ -576,6 +588,8 @@ class _BusyNow:
     busy: str | None
     # the fillers on it the probe runs beside
     fillers_beside: frozenset[str] = frozenset()
+    # retained volume_<pod_id> names, from the cycle's snapshot and this re-read
+    kept_volumes: frozenset[str] = frozenset()
 
 
 async def _busy_now(ctx: Context) -> _BusyNow:
@@ -597,7 +611,8 @@ async def _busy_now(ctx: Context) -> _BusyNow:
     except Exception:
         _read_failed(ctx, "its pending-pod marks in Redis")
         return _BusyNow(None)
-    return _BusyNow("", fillers)
+    kept_ids = retained_volume_pod_ids(ctx.state.rented_data) | retained_volume_pod_ids(rented)
+    return _BusyNow("", fillers, frozenset(f"volume_{pod_id}" for pod_id in kept_ids))
 
 
 def _missing_inputs(ctx: Context) -> str | None:
@@ -856,7 +871,7 @@ def _probe_memory_gb(ctx: Context) -> int | None:
 
 
 def _probe_payload(
-    ctx: Context, *, pod_id: str, image_ref: str, public_key: str
+    ctx: Context, *, pod_id: str, image_ref: str, public_key: str, kept_volumes: frozenset[str] = frozenset()
 ) -> ContainerCreateRequest:
     return ContainerCreateRequest(
         miner_hotkey=ctx.miner_hotkey,
@@ -878,10 +893,10 @@ def _probe_payload(
             for internal, external in ctx.state.verified_port_pairs
         ],
         pod_mapping=[],
-        # nothing to protect: the backend lists no pod here, and create_container's `beside_fillers`
+        # no container to protect: the backend lists no pod here, and create_container's `beside_fillers`
         # keeps every filler_* on the node, not only the ones listed at this moment
         active_container_names=[],
-        active_volume_names=[],
+        active_volume_names=sorted(kept_volumes),
     )
 
 
@@ -891,6 +906,7 @@ async def _probe(
     create_lock: _CreateLock,
     *,
     beside_fillers: bool = False,
+    kept_volumes: frozenset[str] = frozenset(),
     create_deadline: float = _CREATE_DEADLINE_SECONDS,
 ) -> _ProbeOutcome:
     """Run the six steps in order; whatever happens, the node and this validator's Redis are left as found.
@@ -905,7 +921,9 @@ async def _probe(
     6. `_step_teardown`: remove the container and the pending-pod mark, whichever step ended the probe.
 
     A step that ends the probe returns None and says why in `outcome` (a failed step, or an inconclusive
-    reason). The teardown runs in `finally`, so it also runs after a raise or a cancel.
+    reason). The teardown runs in `finally`, so it also runs after a raise or a cancel. A probe that
+    passed hands its teardown to `run` instead (`outcome.teardown`): it runs after the verdict, off the
+    node's first listing (p50 35 s, 5 Nov), see `_teardown_after_verdict`.
     """
     outcome = _ProbeOutcome()
     pod_id = str(uuid.uuid4())
@@ -922,6 +940,7 @@ async def _probe(
             public_key=public_key,
             create_lock=create_lock,
             beside_fillers=beside_fillers,
+            kept_volumes=kept_volumes,
             create_deadline=create_deadline,
         )
         if created is None:
@@ -936,9 +955,14 @@ async def _probe(
         _step_gpu_count(ctx, outcome, login)
         if outcome.failed_step is None:
             _step_egress(ctx, outcome, login)
+        if outcome.failed_step is None and outcome.inconclusive_reason is None:
+            outcome.teardown = partial(
+                _settle, ctx, outcome, created=created, pod_id=pod_id, log_extra=log_extra
+            )
         return outcome
     finally:
-        await _step_teardown(ctx, outcome, created=created, pod_id=pod_id, log_extra=log_extra)
+        if outcome.teardown is None:
+            await _step_teardown(ctx, outcome, created=created, pod_id=pod_id, log_extra=log_extra)
 
 
 async def _step_container_start(
@@ -950,6 +974,7 @@ async def _step_container_start(
     public_key: str,
     create_lock: _CreateLock,
     beside_fillers: bool = False,
+    kept_volumes: frozenset[str] = frozenset(),
     create_deadline: float = _CREATE_DEADLINE_SECONDS,
 ) -> ContainerCreated | None:
     """Step 1: start the container through create_container, the path a renter's pod takes.
@@ -968,11 +993,14 @@ async def _step_container_start(
     try:
         result = await asyncio.wait_for(
             docker.create_container(
-                _probe_payload(ctx, pod_id=pod_id, image_ref=image_ref, public_key=public_key),
+                _probe_payload(
+                    ctx, pod_id=pod_id, image_ref=image_ref, public_key=public_key, kept_volumes=kept_volumes
+                ),
                 ctx.executor,
                 ctx.config.validator_keypair,
                 ctx.executor_ssh_private_key_encrypted,
                 beside_fillers=beside_fillers,
+                synthetic_probe=True,
             ),
             timeout=create_deadline,
         )
@@ -1171,6 +1199,60 @@ async def _step_teardown(
             cancelled = True
     if cancelled:
         raise asyncio.CancelledError()
+
+
+# Passed probes' teardowns still running: the loop keeps only a weak reference to a task.
+_TEARDOWNS_AFTER_VERDICT: set[asyncio.Task] = set()
+_TEARDOWN_TASK_PREFIX = "rental-probe-teardown:"
+
+
+def _teardown_after_verdict(ctx: Context, outcome: _ProbeOutcome) -> None:
+    """Start a passed probe's teardown in the background; the pass is already recorded.
+
+    The pending-pod mark stays until it ends, so the stale-container sweep leaves the container to it.
+    A teardown that does not finish clears the pass stamp, so the next cycle probes the node again, as
+    an inconclusive run would; the leftover goes to the by-name removal and the stale-container sweep.
+    """
+    task = asyncio.create_task(_teardown_passed_probe(ctx, outcome), name=f"{_TEARDOWN_TASK_PREFIX}{ctx.miner_hotkey}")
+    _TEARDOWNS_AFTER_VERDICT.add(task)
+    task.add_done_callback(_TEARDOWNS_AFTER_VERDICT.discard)
+
+
+async def wait_for_teardowns_after_verdict(miner_hotkey: str, max_seconds: float) -> None:
+    """Wait for the miner's background teardowns, so they end before the cycle removes the validator's SSH key.
+
+    A teardown still running when the key goes fails with Permission denied and leaves its container to the
+    stale-container sweep. The wait is capped at the teardown's deadline and at max_seconds, the time the miner's job
+    has left; a teardown past either is left running.
+    """
+    pending = [t for t in _TEARDOWNS_AFTER_VERDICT if t.get_name() == f"{_TEARDOWN_TASK_PREFIX}{miner_hotkey}"]
+    if pending and max_seconds > 0:
+        await asyncio.wait(pending, timeout=min(_teardown_deadline_seconds(), max_seconds))
+
+
+async def _teardown_passed_probe(ctx: Context, outcome: _ProbeOutcome) -> None:
+    try:
+        await outcome.teardown()
+        step = next((s for s in outcome.steps if s.name == STEP_TEARDOWN), None)
+        extra = {**ctx.default_extra, "teardown": step.as_record() if step else None}
+        if step is not None and not step.ok:
+            await _clear_last_ok(ctx)
+            logger.warning(
+                _m(
+                    "Rental probe teardown after a passed verdict did not finish; the node is probed again next cycle",
+                    extra=get_extra_info(extra),
+                )
+            )
+        else:
+            logger.info(_m("Rental probe torn down after its verdict", extra=get_extra_info(extra)))
+    except Exception:
+        logger.error(
+            _m(
+                "Rental probe teardown after the verdict failed",
+                extra=get_extra_info(ctx.default_extra),
+            ),
+            exc_info=True,
+        )
 
 
 async def _settle(
@@ -1510,7 +1592,16 @@ async def _remove_pending_pod(ctx: Context, pod_id: str) -> None:
         )
 
 
+_HOST_KEY_REMEDIATION = (
+    "The validator could not start a renter container on this node because the executor has not "
+    "reported its SSH host key. Check that the executor is running and up to date, then restart it "
+    "(`docker restart executor-executor-1`) so it reports the key again."
+)
+
+
 def _remediation(failure: _Failure, *, ssh_port: int | None, expected_gpus: int) -> str:
+    if failure.create_step == "docker_sdk_ssh_host_key":
+        return _HOST_KEY_REMEDIATION
     template = _REMEDIATION_BY_STEP.get(failure.step, "")
     return template.format(
         create_step=failure.create_step or "unknown",
