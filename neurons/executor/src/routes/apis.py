@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import functools
 import ipaddress
 import json
@@ -13,6 +14,8 @@ from pathlib import Path
 from typing import Annotated, Any, Optional
 
 import docker
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from datura.requests.validator_requests import ssh_pubkey_signing_blob, upload_nonce_issued_at
 from fastapi import APIRouter, Depends, Query, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -461,12 +464,35 @@ async def get_miner_identity(
     `account_claim`: every node of an e-mail or Google portal account reports the same pool hotkey, so
     the claim is what ties the node to the account that installed it. It is not a secret.
     """
+    claim = settings.MINER_ACCOUNT_CLAIM or None
+    port = _ssh_host_key_port()
     return MinerIdentityResponse(
         miner_hotkey=settings.MINER_HOTKEY_SS58_ADDRESS,
         nonce=nonce,
-        account_claim=settings.MINER_ACCOUNT_CLAIM or None,
-        ssh_host_key_port=_ssh_host_key_port(),
+        account_claim=claim,
+        ssh_host_key_port=port,
+        host_key_proof=_host_key_proof(nonce, settings.MINER_HOTKEY_SS58_ADDRESS, claim) if port else None,
     )
+
+
+def identity_proof_message(nonce: str, miner_hotkey: str, account_claim: str | None) -> bytes:
+    """What `host_key_proof` signs; the portal (lium-platform node_control.py) builds the same bytes."""
+    return b"\n".join([b"lium-miner-identity-v1", nonce.encode(), miner_hotkey.encode(), (account_claim or "").encode()])
+
+
+def _host_key_proof(nonce: str, miner_hotkey: str, account_claim: str | None) -> str | None:
+    """An ed25519 signature by sshd's host key over this answer (DAH-5729): the portal binds a hostname node to the key
+    the SSH scan returns only when that key signed the check, so an SSH port forwarded to another machine is refused.
+    None when the key cannot be read."""
+    try:
+        key = serialization.load_ssh_private_key(
+            (Path(settings.SSH_HOST_KEYS_DIR) / "ssh_host_ed25519_key").read_bytes(), password=None
+        )
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(key, Ed25519PrivateKey):
+        return None
+    return base64.b64encode(key.sign(identity_proof_message(nonce, miner_hotkey, account_claim))).decode()
 
 
 def _ssh_host_key_port() -> int | None:
