@@ -167,7 +167,7 @@ failure_diagnostics() {
 
 abort_on_active_rentals() {
     # a rental blocks every path below, so check before anything that costs the node time or bandwidth;
-    # -a: a renter's stopped pod is still a rental, and the install removes every stopped container
+    # -a: a renter's stopped pod is still a rental
     docker ps -a --filter "name=pod_" --format '{{.Names}}' 2>/dev/null | grep -q . || return 0
     fail "Rentals found (pod_* containers, running or stopped). Cannot proceed."
     docker ps -a --filter "name=pod_" --format "    - {{.Names}} ({{.Status}})" 2>/dev/null
@@ -247,6 +247,32 @@ daemon_feature_off() {
     else
         grep -Eq "\"$1\"[[:space:]]*:[[:space:]]*false" "$file"
     fi
+}
+
+# The sysbox .deb's config script exits 1 when dockerd runs, daemon.json lacks bip / default-address-pools
+# (matched line by line, so the file must be indented) and any container exists, before its postinst runs.
+# Write the .deb's own subnets ($1 bip, $2 pool base) first, so the provider's containers stay; same overlap
+# rule as its postinst (Docker is restarted in step 5).
+seed_sysbox_network_config() {
+    local file gw subnet
+    file=$(host_path /etc/docker/daemon.json)
+    docker ps -a --format '{{.ID}}' 2>/dev/null | grep -q . || return 0
+    [ -n "$1" ] && [ -n "$2" ] || { fail "Could not read sysbox's Docker subnets from its package."; return 1; }
+    mkdir -p "$(dirname "$file")"
+    [ -s "$file" ] || echo '{}' > "$file"
+    if ! jq -e '(.bip // "") != "" and ((."default-address-pools" // []) | length) > 0' "$file" > /dev/null 2>&1; then
+        gw=$(ip route | awk '/default/ {print $3; exit}')
+        for subnet in "${1%/*}" "${2%/*}"; do
+            if ! ip route get "$subnet" | grep -q "via $gw"; then
+                fail "$subnet overlaps a local network: set \"bip\" and \"default-address-pools\" in /etc/docker/daemon.json yourself, then re-run."
+                return 1
+            fi
+        done
+    fi
+    jq --indent 4 --arg bip "$1" --arg pool "$2" 'if (.bip // "") == "" then .bip = $bip else . end
+        | if ((."default-address-pools" // []) | length) == 0 then ."default-address-pools" = [{"base": $pool, "size": 24}] else . end' \
+        "$file" > "$file.tmp" && mv "$file.tmp" "$file" || { fail "Failed to update $file (invalid JSON?)."; return 1; }
+    ok "Docker network settings for sysbox are in daemon.json (applied at the Docker restart below)."
 }
 
 check_root() {
@@ -1100,16 +1126,8 @@ if [ -n "$filler_list" ]; then
     docker stop $filler_list > /dev/null 2>&1 || true
 fi
 
-# Remove stopped containers so Docker can restart cleanly; keep Lium's Default Job (filler_*), which the
-# validator would otherwise report as missing and stop idle pay for until it starts a new one
-stopped=$(docker ps -a --format '{{.ID}} {{.Names}}' 2>/dev/null | awk '$2 !~ /^filler_/ {print $1}' || true)
-if [ -n "$stopped" ]; then
-    warn "Removing stopped containers (sysbox requires none)..."
-    # shellcheck disable=SC2086  # one id per word
-    docker rm -f $stopped > /dev/null 2>&1
-    ok "Stopped containers removed."
-fi
-
+# Stopped containers are left alone: they are the provider's own, Docker restarts fine with them (the stopped
+# Default Job above proves it), and removing them deleted unrelated user containers
 ok "Docker is clear for sysbox installation."
 
 # ── 4. Install ──────────────────────────────────────────
@@ -1135,6 +1153,11 @@ if [ "$SKIP_INSTALL" = false ]; then
         actual=$(sha256sum "$SYSBOX_DEB" | cut -d' ' -f1)
         [ "$actual" = "$SYSBOX_SHA" ] || { fail "Checksum mismatch!"; exit 1; }
     fi
+    SYSBOX_CTL=$(mktemp -d)
+    dpkg-deb -e "$SYSBOX_DEB" "$SYSBOX_CTL"
+    seed_sysbox_network_config "$(sed -n 's/^bip_subnet="\(.*\)"$/\1/p' "$SYSBOX_CTL/postinst")" \
+        "$(sed -n 's/^pool_subnet="\(.*\)"$/\1/p' "$SYSBOX_CTL/postinst")" || { rm -rf "$SYSBOX_CTL"; exit 1; }
+    rm -rf "$SYSBOX_CTL"
     apt_install install -y -qq "$SYSBOX_DEB" || exit 1
     ok "Sysbox v${SYSBOX_VERSION} installed."
 else

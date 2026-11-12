@@ -7,7 +7,6 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from uuid import UUID
 
-from core.config import settings
 from protocol.vc_protocol.compute_requests import (
     BROKEN_POD_STATUS,
     LIVE_FILLER_RUN_STATUSES,
@@ -22,12 +21,20 @@ from services.const import (
     GPU_MEMORY_UTILIZATION_LIMIT,
     GPU_UTILIZATION_LIMIT,
     GPU_WEDGE_MEMORY_MAX,
+    KEPT_UNMOUNTED_PREFIX,
     POD_CONTAINER_PREFIX,
+    RECOVERY_STOPPED_SUFFIX,
     RENTAL_CLOSE_CLOCK_SKEW_MINUTES,
     RENTAL_TEARDOWN_GRACE_MINUTES,
 )
 from services.gpu_reset import renter_gpu_resets
-from services.redis_service import FILLER_IMAGE_DIGESTS_PREFIX, FILLER_IMAGE_DIGESTS_TTL_SECONDS
+from services.redis_service import (
+    EDIT_PARKED_CONTAINER_PREFIX,
+    FILLER_IMAGE_DIGESTS_PREFIX,
+    FILLER_IMAGE_DIGESTS_TTL_SECONDS,
+    STOPPED_BY_RECOVERY_PREFIX,
+    STOPPED_BY_RECOVERY_STOPPED,
+)
 from services.gpu_wedge import (
     COMPUTE_APPS_QUERY_COMMAND,
     GPU_QUERY_COMMAND,
@@ -75,6 +82,9 @@ class PodRentalState(str, Enum):
 
 
 _ORPHAN_STATES = frozenset({PodRentalState.ORPHAN, PodRentalState.LIVE_ON_ANOTHER_NODE})
+# The backend marks a pod DELETING before its container is removed and closes the rental after, so in between
+# rental-active answers active=False with no close time.
+DELETING_POD_STATUS = "DELETING"
 
 
 @dataclass(frozen=True)
@@ -131,17 +141,14 @@ class GpuUsageCheck:
         come from the backend (`rented_data`), never from a container-name prefix — the whole
         point of the ticket is a verdict `docker rename` cannot defeat. A container named like
         ours but missing from the snapshot is asked about directly (DAH-2757); the prefix only
-        decides whom to ask, the backend still gives the answer. Shadow by default like
-        every other money-withholding gate: without FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED
-        the verdict is logged, not scored. Returns None when the card is clean, leaving the
-        legacy verdict to the caller.
+        decides whom to ask, the backend still gives the answer. A foreign holder fails the
+        check. Returns None when the card is clean, leaving the legacy verdict to the caller.
         """
         # No backend truth this cycle means no allowlist to judge against — an inability to
         # measure, which never withholds money here.
         if ctx.state.rented_data is None:
             return None
 
-        enforce: bool = settings.FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED
         workload_containers: set[str] = lium_workload_containers(ctx)
         foreign_processes: list[ForeignGpuProcess] = [
             ForeignGpuProcess(
@@ -179,11 +186,9 @@ class GpuUsageCheck:
             template,
             ctx=ctx,
             check_id=self.check_id,
-            severity=None if enforce else "warning",
-            impact=None if enforce else "Shadow observation only: score was NOT changed",
             what=what,
         )
-        return CheckResult(passed=not enforce, event=event)
+        return CheckResult(passed=False, event=event)
 
     async def _card_still_holds_vram_with_no_owner(
         self, ctx: Context, held_vram: list[HeldVram]
@@ -275,7 +280,7 @@ class GpuUsageCheck:
             {
                 name
                 for process in gpu_processes
-                if (name := process.get("container_name")) and name.startswith(POD_CONTAINER_PREFIX)
+                if (name := process.get("container_name")) and _pod_name(name).startswith(POD_CONTAINER_PREFIX)
             }
         )
         if pod_containers and not ctx.rented:
@@ -529,7 +534,14 @@ async def _fillers_off_their_image(ctx: Context, names: set[str]) -> list[str]:
 def carries_a_rental_prefix(container_name: str) -> bool:
     """Named like a rental of ours. Says nothing about who really started it: `docker rename`
     forges the name, which is why every caller confirms it against the backend."""
-    return container_name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX))
+    return container_name.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX, KEPT_UNMOUNTED_PREFIX))
+
+
+def _pod_name(container_name: str) -> str:
+    """The pod's own container name behind a parked one (pod_<id>__prev, __stopped, kept_unmounted_<id>_<time>)."""
+    if container_name.startswith(KEPT_UNMOUNTED_PREFIX):
+        return POD_CONTAINER_PREFIX + container_name.removeprefix(KEPT_UNMOUNTED_PREFIX).rpartition("_")[0]
+    return unparked_name(container_name)
 
 
 def _carries_a_lium_prefix(process: ForeignGpuProcess) -> bool:
@@ -557,7 +569,8 @@ async def _drop_containers_the_backend_still_owns(
         {
             process.container_name
             for process in foreign_processes
-            if _carries_a_lium_prefix(process) and process.container_name not in claimed_elsewhere
+            if _carries_a_lium_prefix(process)
+            and _pod_name(process.container_name) not in claimed_elsewhere
         }
     )
     if not lium_named_containers:
@@ -582,7 +595,14 @@ async def the_backend_still_owns(ctx: Context, container_name: str) -> bool:
     """
     is_filler: bool = container_name.startswith(FILLER_CONTAINER_PREFIX)
     prefix: str = FILLER_CONTAINER_PREFIX if is_filler else POD_CONTAINER_PREFIX
-    backend_issued_id: str | None = _uuid_after_prefix(container_name, prefix)
+    # a parked pod container (pod_<id>__prev, __stopped) is ours only under a name this validator
+    # recorded parking: anyone can start a container under that name
+    if not is_filler and _pod_name(container_name) != container_name:
+        if await _parked_by_this_validator(ctx, container_name) is False:
+            return False
+    backend_issued_id: str | None = _uuid_after_prefix(
+        container_name if is_filler else _pod_name(container_name), prefix
+    )
     if backend_issued_id is None:
         return False
 
@@ -606,7 +626,47 @@ async def the_backend_still_owns(ctx: Context, container_name: str) -> bool:
         return True
     if not _the_answer_is_about_this_node(ctx, pod_rental.executor_id):
         return False
-    return pod_rental.active or _a_broken_pod_the_reaper_has_not_collected_yet(pod_rental)
+    if _a_broken_pod_the_reaper_has_not_collected_yet(pod_rental):
+        return True
+    # A pod that ended within its teardown grace gets the same verdict at 0% load as above the limit.
+    rental = _pod_container_rental_from(ctx, container_name, backend_issued_id, pod_rental)
+    return rental.state not in _ORPHAN_STATES
+
+
+async def _parked_by_this_validator(ctx: Context, container_name: str) -> bool | None:
+    """None when the record does not answer: unknown, so the backend's verdict on the pod decides, as for any pod name."""
+    if container_name.endswith(RECOVERY_STOPPED_SUFFIX):
+        # a recovery parks under this name only when its Redis mark failed: its record is the recovery's own, or the
+        # mark once its background retry lands (the record may be in a restarted process's memory only)
+        pod_id = _pod_name(container_name).removeprefix(POD_CONTAINER_PREFIX)
+        parked = await _recovery_parked(pod_id)
+        if parked:
+            return True
+        try:
+            mark = await asyncio.wait_for(ctx.services.redis.get(f"{STOPPED_BY_RECOVERY_PREFIX}{pod_id}"), timeout=2)
+            # only a completed park's mark: "renaming" is written before a rename that may never apply
+            if (mark.decode() if isinstance(mark, bytes) else mark) == STOPPED_BY_RECOVERY_STOPPED:
+                return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Recovery-stop mark unreadable for %s: %s", container_name, exc)
+            return None
+        return parked
+    try:
+        return bool(
+            await asyncio.wait_for(
+                ctx.services.redis.get(f"{EDIT_PARKED_CONTAINER_PREFIX}{ctx.executor.uuid}:{container_name}"),
+                timeout=2,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Edit-parked container record unreadable for %s: %s", container_name, exc)
+        return None
+
+
+async def _recovery_parked(pod_id: str) -> bool | None:
+    from services.docker_service import recovery_parked  # docker_service imports this package
+
+    return await recovery_parked(pod_id)
 
 
 def _a_broken_pod_the_reaper_has_not_collected_yet(pod_rental: PodRentalActiveResponse) -> bool:
@@ -706,18 +766,27 @@ async def _pod_container_rental(ctx: Context, container_name: str) -> PodContain
     container called pod_<any uuid> must not buy a pass.
     """
     pod_id: str | None = _uuid_after_prefix(
-        unparked_name(container_name), POD_CONTAINER_PREFIX
+        _pod_name(container_name), POD_CONTAINER_PREFIX
     )
     if pod_id is None:
         return PodContainerRental(
             container_name, None, PodRentalState.ORPHAN, "its name carries no pod id Lium issued"
         )
+    if _pod_name(container_name) != container_name and await _parked_by_this_validator(ctx, container_name) is False:
+        return PodContainerRental(container_name, pod_id, PodRentalState.ORPHAN, "no edit of this pod parked it")
 
+    pod_rental: PodRentalActiveResponse | None = await ctx.services.backend.get_pod_rental_active(pod_id)
+    return _pod_container_rental_from(ctx, container_name, pod_id, pod_rental)
+
+
+def _pod_container_rental_from(
+    ctx: Context, container_name: str, pod_id: str, pod_rental: PodRentalActiveResponse | None
+) -> PodContainerRental:
+    """`_pod_container_rental`'s verdict on a backend answer already in hand."""
     rented_executor = rental_of_this_node(ctx)
     rented_at_run_start: bool = rented_executor is not None and any(
         pod.pod_id == pod_id for pod in rented_executor.pods
     )
-    pod_rental: PodRentalActiveResponse | None = await ctx.services.backend.get_pod_rental_active(pod_id)
 
     if pod_rental is not None and not _the_answer_is_about_this_node(ctx, pod_rental.executor_id):
         if pod_rental.active:
@@ -732,6 +801,8 @@ async def _pod_container_rental(ctx: Context, container_name: str) -> PodContain
         )
     if pod_rental is not None and pod_rental.active:
         return PodContainerRental(container_name, pod_id, PodRentalState.LIVE, "its rental is live")
+    if pod_rental is not None and pod_rental.status == DELETING_POD_STATUS and pod_rental.rental_closed_at is None:
+        return PodContainerRental(container_name, pod_id, PodRentalState.LIVE, "its pod is being deleted")
 
     closed_at: datetime | None = pod_rental.rental_closed_at if pod_rental else None
     if closed_at is not None:

@@ -328,6 +328,10 @@ EDIT_PARKED_SUFFIX = "__prev"
 # the name itself says the validator stopped it. Protected and reaped like EDIT_PARKED_SUFFIX.
 RECOVERY_STOPPED_SUFFIX = "__stopped"
 PARKED_SUFFIXES = (EDIT_PARKED_SUFFIX, RECOVERY_STOPPED_SUFFIX)
+# A parked container with renter files in its own layer under the encrypted volume's plaintext path (written
+# while dockerd ran it without the gocryptfs mount; a later remount only hides them) is kept under this prefix
+# after a successful edit, instead of removed: no sweep removes a name outside pod_/filler_.
+KEPT_UNMOUNTED_PREFIX = "kept_unmounted_"
 
 
 def unparked_name(name: str) -> str:
