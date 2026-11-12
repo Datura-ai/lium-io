@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import shlex
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -816,6 +817,30 @@ async def test_a_partial_trim_counts_only_the_disk_it_freed(docker_service):
     )
 
     assert freed_gb == pytest.approx(30 * 10**9 / 1024**3)
+
+
+class UnmountedRunVolumeHost(KilledFillerRunVolumeHost):
+    """The filler stopped cleanly and vloopback unmounted its run volume: the wipe finds no dir (exit 4)."""
+
+    async def run(self, command: str, *args, **kwargs):
+        if "fstrim" in command:
+            return SimpleNamespace(exit_status=4, stdout="no dir /mnt/x\n", stderr="")
+        return await super().run(command, *args, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_an_already_unmounted_run_volume_is_logged_at_info(docker_service, caplog):
+    # live test 6816872742: most whole-node rents hit this; it is not a fault
+    ssh_client = UnmountedRunVolumeHost(["filler_f9c9d1e7"], free_gb=262.2)
+
+    with caplog.at_level(logging.INFO):
+        freed_gb = await docker_service._trim_killed_filler_run_volume(
+            ssh_client, "filler_f9c9d1e7", ("filler_f9c9d1e7",), "/var/lib/docker", {}
+        )
+
+    assert freed_gb == 0
+    [record] = [r for r in caplog.records if "Could not free a killed filler" in r.getMessage()]
+    assert record.levelno == logging.INFO
 
 
 @pytest.mark.asyncio

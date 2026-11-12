@@ -6344,7 +6344,9 @@ class DockerService:
         except Exception as exc:
             output = repr(exc)  # best-effort, as the cache removals
         if "trimmed" not in output:
-            logger.warning(
+            # exit 4: vloopback already unmounted the volume when the filler stopped, the usual whole-node rent
+            log = logger.info if "no dir " in output else logger.warning
+            log(
                 _m(
                     "Could not free a killed filler's run volume",
                     extra=get_extra_info({**default_extra, "volume": run_volume, "output": output[-2000:]}),
