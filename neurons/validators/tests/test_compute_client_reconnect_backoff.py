@@ -1,36 +1,21 @@
 import itertools
-from unittest.mock import MagicMock
+import re
+from pathlib import Path
 
-import clients.compute_client as compute_client
-from clients.compute_client import (
-    WS_RECONNECT_MAX_DELAY,
-    ComputeClient,
-    reconnect_delays,
-)
+from websockets.client import backoff
+
+DOCKERFILE = Path(__file__).resolve().parents[1] / "Dockerfile"
 
 
-def test_reconnect_waits_stay_under_the_backends_rent_wait() -> None:
-    delays = list(itertools.islice(reconnect_delays(), 50))
-    assert all(0 < d <= WS_RECONNECT_MAX_DELAY for d in delays)
-    assert (
-        WS_RECONNECT_MAX_DELAY < 10
-    )  # the backend's rent wait for a validator connection
-    assert max(delays[10:]) >= WS_RECONNECT_MAX_DELAY / 2  # grows to the cap, jittered
+def _image_backoff_env() -> dict[str, float]:
+    found = re.findall(r"WEBSOCKETS_BACKOFF_(\w+)=([\d.]+)", DOCKERFILE.read_text())
+    return {name.lower(): float(value) for name, value in found}
 
 
-def test_a_new_sequence_starts_short_again() -> None:
-    # websockets takes a new sequence after each successful connect, so this is the reset
-    for _ in range(20):
-        seq = reconnect_delays()
-        assert next(seq) <= 1
-        assert next(seq) <= 2
-
-
-def test_connect_uses_the_capped_delays(monkeypatch) -> None:
-    connect = MagicMock()
-    monkeypatch.setattr(compute_client.websockets, "connect", connect)
-    client = ComputeClient.__new__(ComputeClient)
-    client.compute_app_uri = "ws://backend"
-    client.logging_extra = {}
-    client.connect()
-    assert connect.call_args.kwargs["reconnect_delays"] is reconnect_delays
+def test_image_caps_reconnect_waits_under_the_backends_rent_wait() -> None:
+    env = _image_backoff_env()
+    assert env["max_delay"] < 10  # the backend's rent wait for a validator connection
+    delays = list(itertools.islice(backoff(**env), 50))
+    assert all(0 <= d <= env["max_delay"] for d in delays)
+    assert delays[0] <= 1 and delays[1] <= 1  # first retries are quick
+    assert delays[-1] == env["max_delay"]
