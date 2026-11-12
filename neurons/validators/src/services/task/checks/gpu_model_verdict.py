@@ -3,7 +3,7 @@ from __future__ import annotations
 from ..messages import CapabilityMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from .banned_provider import has_live_rental
-from .capability import gpu_model_mismatch_result, stored_gpu_model_verdict
+from .capability import gpu_model_mismatch_result, refresh_gpu_model_verdict, stored_gpu_model_verdict
 
 
 class GpuModelVerdictCheck:
@@ -18,6 +18,7 @@ class GpuModelVerdictCheck:
         rented = has_live_rental(ctx)
         mismatches = (await stored_gpu_model_verdict(ctx))[1] if rented else []
         if mismatches:
+            await refresh_gpu_model_verdict(ctx)  # the rental may outlast the TTL
             # the cycle goes on, so the rental is still verified; score 0 and hidden from new rentals
             return gpu_model_mismatch_result(
                 ctx, self.check_id, {**mismatches[0].as_dict(), "transport": "stored", "rented": True}

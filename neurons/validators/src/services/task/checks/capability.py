@@ -17,11 +17,14 @@ from ..availability import ReachSource, ReachTarget
 from ..messages import CapabilityMessages as Msg, MessageTemplate, render_message
 from ..pipeline import CheckResult, Context
 from .gpu_model_truth import (
+    NOT_MEASURED,
     GpuModelMismatch,
     gpu_model_mismatch,
     gpu_model_mismatches,
     judged_cards,
+    not_measured,
     reported_gpu_model,
+    unmeasured_cards,
 )
 from .matmul_speed_log import log_matmul_speed
 from .rental_owner import uuid_listed_under_another_miner, rental_of_this_node
@@ -74,6 +77,8 @@ class CapabilityCheck:
                 what_filler["matmul_sample"] = sample
                 if found is not None:
                     mismatches = await judge_gpu_model(ctx, found, {sample.get("card_index", 0)})
+                elif sample.get("no_numbers"):
+                    mismatches = await judge_gpu_model(ctx, [], set(), {sample.get("card_index", 0)})
                 elif not seen:
                     await _store_gpu_model_verdict(ctx, [], GPU_MODEL_NO_VERDICT_TTL_SECONDS)
             if mismatches:
@@ -125,7 +130,10 @@ class CapabilityCheck:
             card_metrics = getattr(result, "card_metrics", None)
             measured_cards = judged_cards(result.metrics, card_metrics)
             mismatches = await judge_gpu_model(
-                ctx, gpu_model_mismatches(specs, result.metrics, card_metrics), measured_cards
+                ctx,
+                gpu_model_mismatches(specs, result.metrics, card_metrics),
+                measured_cards,
+                unmeasured_cards(specs, result.metrics, card_metrics),
             )
             mismatches = await _remeasure_carried_mismatch(ctx, specs, mismatches, measured_cards)
             if mismatches:
@@ -415,6 +423,8 @@ async def _card_matmul_sample(
                 mismatch = gpu_model_mismatch(specs, result.metrics, card_index)
                 found = [mismatch] if mismatch else []
                 sample["gpu_model_mismatch"] = mismatch.as_dict() if mismatch else None
+            elif unmeasured_cards(specs, None, {card_index: result.metrics}):
+                sample["no_numbers"] = True
         else:
             sample["error_kind"] = _sample_error_kind(result)
     except Exception as exc:
@@ -435,9 +445,11 @@ async def _remeasure_carried_mismatch(
     sample: dict = {"vram_budget_mb": settings.FILLER_MATMUL_SAMPLE_VRAM_MB, "reason": "carried_gpu_model_mismatch"}
     found = await _card_matmul_sample(ctx, specs, carried[0], sample)
     logger.warning(_m("GPU_MODEL_MISMATCH_REMEASURE", extra=get_extra_info({**ctx.default_extra, **sample})))
-    if found is None:
-        return mismatches
-    return await judge_gpu_model(ctx, found, {carried[0]})
+    if found is not None:
+        return await judge_gpu_model(ctx, found, {carried[0]})
+    if sample.get("no_numbers"):
+        return await judge_gpu_model(ctx, [], set(), {carried[0]})
+    return mismatches
 
 
 
@@ -447,7 +459,7 @@ def gpu_model_mismatch_result(ctx: Context, check_id: str, what: dict) -> CheckR
     pod running it is not fatal: the rental runs on and is still verified."""
     rental = rental_of_this_node(ctx)
     event = render_message(
-        Msg.GPU_MODEL_MISMATCH,
+        Msg.GPU_MODEL_NOT_MEASURED if what.get("kind") == NOT_MEASURED else Msg.GPU_MODEL_MISMATCH,
         ctx=ctx,
         check_id=check_id,
         what={**what, "reach_source": str(ReachSource.VALIDATOR), "reach_target": str(ReachTarget.GPU)},
@@ -464,35 +476,72 @@ def _gpu_model_verdict_key(ctx: Context) -> str:
     return GPU_MODEL_VERDICT_KEY.format(miner_hotkey=ctx.miner_hotkey, executor_uuid=ctx.executor.uuid)
 
 
-async def stored_gpu_model_verdict(ctx: Context) -> tuple[bool, list[GpuModelMismatch]]:
-    """(a verdict is stored, the stored mismatches). A Redis error reads as a stored pass: the
-    node is neither failed nor sampled out of turn for it. A mismatch stored for a model the node
-    no longer reports on that card is no verdict: the node is judged again."""
+async def _read_gpu_model_verdict(ctx: Context) -> tuple[bool, list[GpuModelMismatch], set[int], bool]:
+    """(a verdict is stored, the stored mismatches, the cards with a measured pass since their last
+    miss, the read worked). A mismatch stored for a model the node no longer reports on that card
+    is no verdict: the node is judged again."""
     try:
         raw = await ctx.services.redis.get(_gpu_model_verdict_key(ctx))
         if raw is None:
-            return False, []
-        mismatches = [GpuModelMismatch(**m) for m in json.loads(raw).get("mismatches") or []]
+            return False, [], set(), True
+        stored = json.loads(raw)
+        mismatches = [GpuModelMismatch(**m) for m in stored.get("mismatches") or []]
+        measured_ok = {int(i) for i in stored.get("measured_ok") or []}
     except Exception as exc:
         logger.warning(_m("GPU model verdict read failed", extra=get_extra_info({**ctx.default_extra, "error": str(exc)})))
-        return True, []
+        return True, [], set(), False
     current = [m for m in mismatches if m.reported_gpu_model == reported_gpu_model(ctx.state.specs, m.card_index)]
-    return len(current) == len(mismatches), current
+    return len(current) == len(mismatches), current, measured_ok, True
+
+
+async def stored_gpu_model_verdict(ctx: Context) -> tuple[bool, list[GpuModelMismatch]]:
+    """(a verdict is stored, the stored mismatches). A Redis error reads as a stored pass: the
+    node is neither failed nor sampled out of turn for it."""
+    seen, mismatches, _, _ = await _read_gpu_model_verdict(ctx)
+    return seen, mismatches
 
 
 async def judge_gpu_model(
-    ctx: Context, found: list[GpuModelMismatch], measured_cards: set[int]
+    ctx: Context,
+    found: list[GpuModelMismatch],
+    measured_cards: set[int],
+    unmeasured: set[int] = frozenset(),
 ) -> list[GpuModelMismatch]:
     """Store and return the node's mismatches after a run that judged `measured_cards`. A stored
-    mismatch of a card this run did not judge stands: a pass on one card never clears another."""
-    _, stored = await stored_gpu_model_verdict(ctx)
+    mismatch of a card this run did not judge stands: a pass on one card never clears another.
+    A judged card in `unmeasured` (its run gave no numbers) passes once after a measured pass and
+    is NOT_MEASURED after that. After a failed read nothing is written, so one failed GET never
+    erases a stored mismatch."""
+    _, stored, measured_ok, read_ok = await _read_gpu_model_verdict(ctx)
+    failed = {m.card_index for m in found}
+    measured_ok = (measured_ok - failed) | (measured_cards - failed)
     mismatches = [m for m in stored if m.card_index not in measured_cards] + found
-    await _store_gpu_model_verdict(ctx, mismatches, GPU_MODEL_VERDICT_TTL_SECONDS)
+    for card in sorted(unmeasured - measured_cards):
+        if card in measured_ok:
+            measured_ok.discard(card)  # one miss is tolerated; the next one fails
+        elif all(m.card_index != card for m in mismatches):
+            mismatches.append(not_measured(ctx.state.specs, card))
+    if read_ok:
+        await _store_gpu_model_verdict(ctx, mismatches, GPU_MODEL_VERDICT_TTL_SECONDS, measured_ok)
     return mismatches
 
 
-async def _store_gpu_model_verdict(ctx: Context, mismatches: list[GpuModelMismatch], ttl_seconds: int) -> None:
-    payload = json.dumps({"mismatches": [m.as_dict() for m in mismatches]})
+async def refresh_gpu_model_verdict(ctx: Context) -> None:
+    """Keep a standing mismatch alive while only read (a rented node): it ends with a pass, not the TTL."""
+    if settings.DRY_RUN:
+        return
+    try:
+        await ctx.services.redis.expire(_gpu_model_verdict_key(ctx), GPU_MODEL_VERDICT_TTL_SECONDS)
+    except Exception as exc:
+        logger.warning(_m("GPU model verdict refresh failed", extra=get_extra_info({**ctx.default_extra, "error": str(exc)})))
+
+
+async def _store_gpu_model_verdict(
+    ctx: Context, mismatches: list[GpuModelMismatch], ttl_seconds: int, measured_ok: set[int] = frozenset()
+) -> None:
+    if settings.DRY_RUN:
+        return
+    payload = json.dumps({"mismatches": [m.as_dict() for m in mismatches], "measured_ok": sorted(measured_ok)})
     try:
         await ctx.services.redis.set(_gpu_model_verdict_key(ctx), payload, ex=ttl_seconds)
     except Exception as exc:

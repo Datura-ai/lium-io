@@ -2018,6 +2018,19 @@ class CapabilityMessages:
             "it has."
         ),
     )
+    # DAH-6241: a card of a judged model whose GPU check gave no numbers twice in a row
+    GPU_MODEL_NOT_MEASURED = MessageTemplate(
+        event="GPU model check failed: the card's model could not be measured",
+        reason="GPU_MODEL_NOT_MEASURED",
+        severity="error",
+        category=AVAILABILITY_CATEGORY,
+        impact="Score set to 0; node hidden and not rentable until the card is measured (a running "
+        "rental is kept)",
+        remediation=(
+            "The GPU check finished but returned no compute capability or SM count for the card. Run "
+            "the current executor image with its default environment; the next measured pass clears it."
+        ),
+    )
     # DAH-6241: a rented node has no stored GPU model mismatch (or is not rented: judged later)
     GPU_MODEL_VERDICT_OK = MessageTemplate(
         event="GPU model verdict: no stored mismatch",

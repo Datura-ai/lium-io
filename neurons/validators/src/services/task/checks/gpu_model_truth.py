@@ -7,8 +7,9 @@ reporting itself as an H100 (8.0/108 against 9.0/132), an A6000 as an RTX 6000 A
 against 8.9/142). Only a card below the reported model fails: a lower generation or fewer SMs.
 A bigger card under a smaller name (an SXM H100 listed as an H100 PCIe) is not paid more for it,
 so it passes. A reported name is normalized first (`Tesla H100 80GB HBM3` is the H100 SXM).
-Only names in the table are judged; an unknown name, or a run without both numbers, never
-fails. Every rated model is either in the table or in NOT_JUDGED_YET.
+Every rated model is judged by its compute capability; the SM count only where the fleet has
+measured it. A name that is not rated is never judged. A judged card whose sealed run gives
+neither number is `not_measured`: one miss after a measured pass is tolerated, a second fails.
 """
 
 from __future__ import annotations
@@ -23,10 +24,8 @@ from services.gpu_spec_table import normalize_gpu_model
 # 2026, 12 h of MATMUL_SPEED_SHADOW). Exact names: one name is one SKU, so its SM count is fixed.
 EXPECTED_CC_AND_SM: dict[str, tuple[str, int]] = {
     "NVIDIA A100 80GB PCIe": ("8.0", 108),
-    "NVIDIA A100-PCIE-40GB": ("8.0", 108),
     "NVIDIA A100-SXM4-40GB": ("8.0", 108),
     "NVIDIA A100-SXM4-80GB": ("8.0", 108),
-    "NVIDIA A800 80GB PCIe": ("8.0", 108),
     "NVIDIA B200": ("10.0", 148),
     "NVIDIA B300 SXM6 AC": ("10.3", 148),
     "NVIDIA B300 SXM6 PC": ("10.3", 148),
@@ -47,12 +46,9 @@ EXPECTED_CC_AND_SM: dict[str, tuple[str, int]] = {
     "NVIDIA GeForce RTX 5080": ("12.0", 84),
     "NVIDIA GeForce RTX 5090": ("12.0", 170),
     "NVIDIA H100 80GB HBM3": ("9.0", 132),
-    "NVIDIA H100 NVL": ("9.0", 132),
     "NVIDIA H100 PCIe": ("9.0", 114),
     "NVIDIA H200": ("9.0", 132),
     "NVIDIA H200 NVL": ("9.0", 132),
-    "NVIDIA H800 80GB HBM3": ("9.0", 132),
-    "NVIDIA H800 PCIe": ("9.0", 114),
     "NVIDIA L40": ("8.9", 142),
     "NVIDIA L40S": ("8.9", 142),
     "NVIDIA RTX 6000 Ada Generation": ("8.9", 142),
@@ -67,64 +63,72 @@ EXPECTED_CC_AND_SM: dict[str, tuple[str, int]] = {
     "NVIDIA T4 Tensor Core GPU": ("7.5", 40),
 }
 
-# Rated models not judged yet: no honest node of the name measured on the fleet, and a wrong
-# SM count would fail an honest node, so they are added once the fleet shows their numbers.
-NOT_JUDGED_YET: frozenset[str] = frozenset(
-    {
-        "NVIDIA A10 Tensor Core GPU",
-        "NVIDIA CMP 170HX",
-        "NVIDIA GB200",
-        "NVIDIA GB300",
-        "NVIDIA GeForce GTX 1060",
-        "NVIDIA GeForce GTX 1070",
-        "NVIDIA GeForce GTX 1070 Ti",
-        "NVIDIA GeForce GTX 1080",
-        "NVIDIA GeForce GTX 1080 Ti",
-        "NVIDIA GeForce GTX 1660",
-        "NVIDIA GeForce GTX 1660 SUPER",
-        "NVIDIA GeForce GTX 1660 Ti",
-        "NVIDIA GeForce RTX 2060",
-        "NVIDIA GeForce RTX 2060 SUPER",
-        "NVIDIA GeForce RTX 2070 SUPER",
-        "NVIDIA GeForce RTX 2080 SUPER",
-        "NVIDIA GeForce RTX 2080 Ti",
-        "NVIDIA GeForce RTX 3050",
-        "NVIDIA GeForce RTX 3060",
-        "NVIDIA GeForce RTX 3060 Laptop GPU",
-        "NVIDIA GeForce RTX 3060 Ti",
-        "NVIDIA GeForce RTX 3080",
-        "NVIDIA GeForce RTX 3080 Ti",
-        "NVIDIA GeForce RTX 4060",
-        "NVIDIA GeForce RTX 4070",
-        "NVIDIA GeForce RTX 4090 48GB",
-        "NVIDIA GeForce RTX 4090 D",
-        "NVIDIA GeForce RTX 5060",
-        "NVIDIA GeForce RTX 5090 D",
-        "NVIDIA H800 NVL",
-        "NVIDIA L4",
-        "NVIDIA Quadro P4000",
-        "NVIDIA Quadro RTX 5000",
-        "NVIDIA Quadro RTX 6000",
-        "NVIDIA Quadro RTX 8000",
-        "NVIDIA RTX 4500 Ada Generation",
-        "NVIDIA RTX 5000 Ada Generation",
-        "NVIDIA RTX 5880 Ada Generation",
-        "NVIDIA RTX 6000D",
-        "NVIDIA RTX A2000",
-        "NVIDIA RTX A5000",
-        "NVIDIA RTX PRO 2000 Blackwell",
-        "NVIDIA RTX PRO 4500 Blackwell",
-        "NVIDIA RTX PRO 4500 Blackwell Server Edition",
-        "NVIDIA RTX PRO 6000D Blackwell Workstation Edition",
-        "NVIDIA TITAN RTX",
-        "NVIDIA TITAN V",
-        "NVIDIA TITAN Xp",
-        "NVIDIA Tesla M40",
-        "NVIDIA Tesla P100",
-        "NVIDIA Tesla P40",
-        "NVIDIA Tesla V100 Tensor Core GPU",
-    }
-)
+# Every other rated model, judged by compute capability only: the cc is fixed by the GPU
+# generation (NVIDIA's table), but its SM count is not measured on the fleet yet, and an unmeasured
+# SM count could fail an honest node. A name moves to EXPECTED_CC_AND_SM once the fleet shows it.
+EXPECTED_CC_ONLY: dict[str, str] = {
+    "NVIDIA A10 Tensor Core GPU": "8.6",
+    "NVIDIA A100-PCIE-40GB": "8.0",
+    "NVIDIA A800 80GB PCIe": "8.0",
+    "NVIDIA CMP 170HX": "8.0",
+    "NVIDIA GB200": "10.0",
+    "NVIDIA GB300": "10.3",
+    "NVIDIA GeForce GTX 1060": "6.1",
+    "NVIDIA GeForce GTX 1070": "6.1",
+    "NVIDIA GeForce GTX 1070 Ti": "6.1",
+    "NVIDIA GeForce GTX 1080": "6.1",
+    "NVIDIA GeForce GTX 1080 Ti": "6.1",
+    "NVIDIA GeForce GTX 1660": "7.5",
+    "NVIDIA GeForce GTX 1660 SUPER": "7.5",
+    "NVIDIA GeForce GTX 1660 Ti": "7.5",
+    "NVIDIA GeForce RTX 2060": "7.5",
+    "NVIDIA GeForce RTX 2060 SUPER": "7.5",
+    "NVIDIA GeForce RTX 2070 SUPER": "7.5",
+    "NVIDIA GeForce RTX 2080 SUPER": "7.5",
+    "NVIDIA GeForce RTX 2080 Ti": "7.5",
+    "NVIDIA GeForce RTX 3050": "8.6",
+    "NVIDIA GeForce RTX 3060": "8.6",
+    "NVIDIA GeForce RTX 3060 Laptop GPU": "8.6",
+    "NVIDIA GeForce RTX 3060 Ti": "8.6",
+    "NVIDIA GeForce RTX 3080": "8.6",
+    "NVIDIA GeForce RTX 3080 Ti": "8.6",
+    "NVIDIA GeForce RTX 4060": "8.9",
+    "NVIDIA GeForce RTX 4070": "8.9",
+    "NVIDIA GeForce RTX 4090 48GB": "8.9",
+    "NVIDIA GeForce RTX 4090 D": "8.9",
+    "NVIDIA GeForce RTX 5060": "12.0",
+    "NVIDIA GeForce RTX 5090 D": "12.0",
+    "NVIDIA H100 NVL": "9.0",
+    "NVIDIA H800 80GB HBM3": "9.0",
+    "NVIDIA H800 NVL": "9.0",
+    "NVIDIA H800 PCIe": "9.0",
+    "NVIDIA L4": "8.9",
+    "NVIDIA Quadro P4000": "6.1",
+    "NVIDIA Quadro RTX 5000": "7.5",
+    "NVIDIA Quadro RTX 6000": "7.5",
+    "NVIDIA Quadro RTX 8000": "7.5",
+    "NVIDIA RTX 4500 Ada Generation": "8.9",
+    "NVIDIA RTX 5000 Ada Generation": "8.9",
+    "NVIDIA RTX 5880 Ada Generation": "8.9",
+    "NVIDIA RTX 6000D": "12.0",
+    "NVIDIA RTX A2000": "8.6",
+    "NVIDIA RTX A5000": "8.6",
+    "NVIDIA RTX PRO 2000 Blackwell": "12.0",
+    "NVIDIA RTX PRO 4500 Blackwell": "12.0",
+    "NVIDIA RTX PRO 4500 Blackwell Server Edition": "12.0",
+    "NVIDIA RTX PRO 6000D Blackwell Workstation Edition": "12.0",
+    "NVIDIA TITAN RTX": "7.5",
+    "NVIDIA TITAN V": "7.0",
+    "NVIDIA TITAN Xp": "6.1",
+    "NVIDIA Tesla M40": "5.2",
+    "NVIDIA Tesla P100": "6.0",
+    "NVIDIA Tesla P40": "6.1",
+    "NVIDIA Tesla V100 Tensor Core GPU": "7.0",
+}
+
+
+BELOW_MODEL = "below_model"
+NOT_MEASURED = "not_measured"
 
 
 @dataclass(frozen=True)
@@ -132,10 +136,12 @@ class GpuModelMismatch:
     card_index: int
     reported_gpu_model: str
     expected_compute_capability: str
-    expected_sm_count: int
-    measured_compute_capability: str
-    measured_sm_count: int
+    expected_sm_count: int | None  # None: judged by compute capability only
+    measured_compute_capability: str | None
+    measured_sm_count: int | None
     measured_device_name: str | None
+    # BELOW_MODEL: measured below the reported model; NOT_MEASURED: a judged card gave no numbers
+    kind: str = BELOW_MODEL
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -160,19 +166,27 @@ def _cc_version(value: Any) -> tuple[int, int] | None:
     return (int(major), int(minor)) if dot and major.isdigit() and minor.isdigit() else None
 
 
+def expected_cc_and_sm(model: str | None) -> tuple[str, int | None] | None:
+    """The (compute capability, SM count or None) a reported name is judged by; None if not rated."""
+    name = normalize_gpu_model(model) if model else None
+    if name in EXPECTED_CC_AND_SM:
+        return EXPECTED_CC_AND_SM[name]
+    return (EXPECTED_CC_ONLY[name], None) if name in EXPECTED_CC_ONLY else None
+
+
 def gpu_model_mismatch(machine_spec: Any, metrics: Any, card_index: int = 0) -> GpuModelMismatch | None:
     """What was reported and measured when the card (the reported card at `card_index`, the one
     the matmul ran on) is below the reported model; None otherwise (the model or a bigger card,
-    an unknown name, or a run that did not give both numbers)."""
+    a name that is not rated, or a run that did not give both numbers)."""
     model = reported_gpu_model(machine_spec, card_index)
-    expected = EXPECTED_CC_AND_SM.get(normalize_gpu_model(model)) if model else None
+    expected = expected_cc_and_sm(model)
     if expected is None or not isinstance(metrics, dict):
         return None
     cc, sm_count = metrics.get("cc"), _sm_count(metrics.get("sm_count"))
     measured_cc = _cc_version(cc)
     if measured_cc is None or sm_count is None:
         return None
-    if measured_cc >= _cc_version(expected[0]) and sm_count >= expected[1]:
+    if measured_cc >= _cc_version(expected[0]) and (expected[1] is None or sm_count >= expected[1]):
         return None
     device = metrics.get("device")
     return GpuModelMismatch(
@@ -183,6 +197,22 @@ def gpu_model_mismatch(machine_spec: Any, metrics: Any, card_index: int = 0) -> 
         measured_compute_capability=cc,
         measured_sm_count=sm_count,
         measured_device_name=device if isinstance(device, str) else None,
+    )
+
+
+def not_measured(machine_spec: Any, card_index: int) -> GpuModelMismatch:
+    """A judged card whose successful sealed run gave no compute capability or SM count."""
+    model = reported_gpu_model(machine_spec, card_index) or ""
+    expected = expected_cc_and_sm(model) or ("", None)
+    return GpuModelMismatch(
+        card_index=card_index,
+        reported_gpu_model=model,
+        expected_compute_capability=expected[0],
+        expected_sm_count=expected[1],
+        measured_compute_capability=None,
+        measured_sm_count=None,
+        measured_device_name=None,
+        kind=NOT_MEASURED,
     )
 
 
@@ -203,4 +233,15 @@ def judged_cards(metrics: Any, card_metrics: dict[int, dict] | None = None) -> s
         i
         for i, m in runs.items()
         if isinstance(m, dict) and _cc_version(m.get("cc")) and _sm_count(m.get("sm_count")) is not None
+    }
+
+
+
+def unmeasured_cards(machine_spec: Any, metrics: Any, card_metrics: dict[int, dict] | None = None) -> set[int]:
+    """The cards of a successful run under a judged name that gave no numbers (`metrics` is device
+    0, `card_metrics` each card the all-cards probe measured)."""
+    runs = {0: metrics, **(card_metrics or {})}
+    judged = judged_cards(metrics, card_metrics)
+    return {
+        i for i in runs if i not in judged and expected_cc_and_sm(reported_gpu_model(machine_spec, i)) is not None
     }

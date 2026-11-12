@@ -12,7 +12,7 @@ from neurons.validators.src.services.task.checks.gpu_model_verdict import GpuMod
 from neurons.validators.src.services.const import GPU_MODEL_RATES
 from neurons.validators.src.services.task.checks.gpu_model_truth import (
     EXPECTED_CC_AND_SM,
-    NOT_JUDGED_YET,
+    EXPECTED_CC_ONLY,
     gpu_model_mismatch,
 )
 from neurons.validators.src.services.task.messages import CapabilityMessages as Msg
@@ -427,9 +427,9 @@ def test_an_nvml_alias_of_a_listed_model_is_judged():
     assert gpu_model_mismatch(_specs("Tesla H100 80GB HBM3"), {"cc": "8.0", "sm_count": 108}) is not None
 
 
-def test_every_rated_model_is_judged_or_listed_as_not_judged_yet():
-    assert sorted(set(GPU_MODEL_RATES) - set(EXPECTED_CC_AND_SM) - NOT_JUDGED_YET) == []
-    assert sorted(NOT_JUDGED_YET & set(EXPECTED_CC_AND_SM)) == []
+def test_every_rated_model_is_judged_by_its_compute_capability():
+    assert sorted(set(GPU_MODEL_RATES) - set(EXPECTED_CC_AND_SM) - set(EXPECTED_CC_ONLY)) == []
+    assert sorted(set(EXPECTED_CC_ONLY) & set(EXPECTED_CC_AND_SM)) == []
 
 
 class _PinnedCardService(DummyValidationService):
@@ -485,3 +485,96 @@ async def test_a_stored_mismatch_on_card_1_stands_when_that_card_is_still_faked(
     assert service.gpu_uuids == ["GPU-1"]
     assert result.passed is False
     assert result.event.what_we_saw["card_index"] == 1
+
+
+# --- review at f1c3f85c: a judged card with no numbers, cc-only names, and the verdict store
+
+
+async def _no_numbers(context_factory, redis):
+    return await _run_metrics(context_factory, redis, {})
+
+
+async def _run_metrics(context_factory, redis, metrics, model="NVIDIA H100 80GB HBM3"):
+    service = DummyValidationService(success=True, metrics=metrics)
+    ctx = context_factory(
+        services=build_services(validation=service, redis=redis),
+        config=build_context_config(),
+        state=build_state(specs=_specs(model)),
+    )
+    return await CapabilityCheck().run(ctx)
+
+
+@pytest.mark.asyncio
+async def test_a_judged_card_with_no_numbers_and_no_measured_pass_fails_as_not_measured(context_factory):
+    result = await _no_numbers(context_factory, FakeRedis())
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.GPU_MODEL_NOT_MEASURED.reason
+
+
+@pytest.mark.asyncio
+async def test_one_miss_after_a_measured_pass_is_tolerated_then_fails_until_numbers_return(context_factory):
+    redis = FakeRedis()
+    assert (await _run_metrics(context_factory, redis, REAL_H100[1])).passed is True
+
+    assert (await _no_numbers(context_factory, redis)).passed is True
+    second = await _no_numbers(context_factory, redis)
+    assert second.passed is False
+    assert second.event.reason_code == Msg.GPU_MODEL_NOT_MEASURED.reason
+
+    assert (await _run_metrics(context_factory, redis, REAL_H100[1])).passed is True
+    assert json.loads(redis.store[_verdict_key()]) == {"mismatches": [], "measured_ok": [0]}
+
+
+@pytest.mark.parametrize(
+    "model, cc, sm_count, passed",
+    [
+        ("NVIDIA RTX PRO 2000 Blackwell", "8.6", 48, False),  # prod: an Ampere card under a Blackwell name
+        ("NVIDIA CMP 170HX", "8.0", 70, True),
+        ("NVIDIA H100 NVL", "9.0", 114, True),  # cc-only now: its SM count varies by SKU
+    ],
+)
+def test_a_cc_only_name_is_judged_by_its_compute_capability_alone(model, cc, sm_count, passed):
+    assert (gpu_model_mismatch(_specs(model), {"cc": cc, "sm_count": sm_count}) is None) is passed
+
+
+@pytest.mark.parametrize(
+    "model", ["NVIDIA A100-PCIE-40GB", "NVIDIA A800 80GB PCIe", "NVIDIA H100 NVL", "NVIDIA H800 80GB HBM3", "NVIDIA H800 PCIe"]
+)
+def test_names_with_more_than_one_sm_count_are_cc_only(model):
+    assert model not in EXPECTED_CC_AND_SM and model in EXPECTED_CC_ONLY
+
+
+class _ReadFailsRedis(FakeRedis):
+    async def get(self, key: str):
+        raise ConnectionError("read failed")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_verdict_read_writes_nothing(context_factory):
+    redis = _ReadFailsRedis()
+
+    await _run_metrics(context_factory, redis, FAKE_H100[1])
+
+    assert _verdict_key() not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_rented_read_of_a_standing_mismatch_refreshes_its_ttl(context_factory):
+    redis = FakeRedis()
+    await _run(context_factory, "NVIDIA H100 80GB HBM3", "8.0", 108, redis=redis)
+    redis.ttl[_verdict_key()] = 5
+
+    await _verdict_check(context_factory, redis, _rented(_specs("NVIDIA H100 80GB HBM3"), redis))
+
+    assert redis.ttl[_verdict_key()] == capability.GPU_MODEL_VERDICT_TTL_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_a_dry_run_stores_no_verdict(context_factory, monkeypatch):
+    monkeypatch.setattr(capability.settings, "DRY_RUN", True)
+    redis = FakeRedis()
+
+    await _run(context_factory, "NVIDIA H100 80GB HBM3", "8.0", 108, redis=redis)
+
+    assert _verdict_key() not in redis.store
