@@ -67,6 +67,13 @@ RENTAL_PROBE_FAILED_PREFIX = "rental_probe_failed"
 # filler container name -> JSON list of the image digests (bare sha256) the validator started it from
 FILLER_IMAGE_DIGESTS_PREFIX = "filler_image_digests:"
 FILLER_IMAGE_DIGESTS_TTL_SECONDS = 30 * 24 * 3600
+# A pod edit parks the pod's container under another name; the exact name this validator parked is
+# recorded per executor (key + parked name) so the GPU checks never take a self-named parked
+# container as ours. The edit's end shortens it to one GPU check's span; the TTL only backstops a
+# validator killed mid-edit.
+EDIT_PARKED_CONTAINER_PREFIX = "edit_parked_container:"
+EDIT_PARKED_CONTAINER_TTL_SECONDS = 30 * 60
+EDIT_PARKED_CONTAINER_AFTER_EDIT_SECONDS = 5 * 60
 # pod id -> set by the rented-pod recovery when it stops a pod or before it renames one back, cleared
 # once the pod is started again (no expiry: it is the only evidence the stop was ours): a stopped
 # pod_<id> it marked is its own to start next cycle, even when the rename's reply and its cleanup

@@ -84,6 +84,7 @@ from services.const import (
     PARKED_SUFFIXES,
     RECOVERY_STOPPED_SUFFIX,
     unparked_name,
+    KEPT_UNMOUNTED_PREFIX,
     LIUM_POD_ID_LABEL,
     LEGACY_LOOPBACK_PLUGIN_ALIAS,
     LOOPBACK_PLUGIN_ALIAS,
@@ -164,6 +165,9 @@ from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networkin
 from services.redis_service import (
     GPU_CLOCKS_PENDING_KIND,
     GPU_RESET_PENDING_KIND,
+    EDIT_PARKED_CONTAINER_AFTER_EDIT_SECONDS,
+    EDIT_PARKED_CONTAINER_PREFIX,
+    EDIT_PARKED_CONTAINER_TTL_SECONDS,
     FILLER_IMAGE_DIGESTS_PREFIX,
     FILLER_IMAGE_DIGESTS_TTL_SECONDS,
     IDLE_MEM_AVAILABLE_MARGIN_PERCENT,
@@ -1779,12 +1783,9 @@ _PARK_KILL_SETTLE_SECONDS = 2
 _PARK_KILL_WAIT_SECONDS = 30
 # each SSH command of the edit swap (stop -t 10 included); exit 124 when the host ends it
 _PARK_COMMAND_TIMEOUT_SECONDS = 60
+_EDIT_PARKED_RECORD_TIMEOUT_SECONDS = 2
 # the undo's bring-up (start, gocryptfs remount, sshd bootstrap) is several SDK and SSH steps, not one command
 _RESTORE_BRING_UP_TIMEOUT_SECONDS = 300
-# A parked container with renter files in its own layer under the encrypted volume's plaintext path (written
-# while dockerd ran it without the gocryptfs mount; a later remount only hides them) is kept under this prefix
-# after a successful edit, instead of removed: no sweep removes a name outside pod_/filler_.
-KEPT_UNMOUNTED_PREFIX = "kept_unmounted_"
 
 
 class KeptContainersNotRemoved(RuntimeError):
@@ -1931,11 +1932,24 @@ class _EditSwap:
     destroyed. Entered together with the SSH connection so the undo still has a live session.
     """
 
-    def __init__(self, ssh_client: asyncssh.SSHClientConnection, container_name: str, default_extra: dict, docker_client=None):
+    def __init__(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+        default_extra: dict,
+        docker_client=None,
+        redis: RedisService | None = None,
+        executor_id: str | None = None,
+    ):
         self.ssh_client = ssh_client
         # the create's Docker SDK connection, independent of the SSH session: stops a renamed pod a dead SSH lost track of
         self.docker_client = docker_client
         self.container_name = container_name
+        self.redis = redis
+        self.executor_id = executor_id
+        # the key that marks this edit's parked name as ours for the GPU checks; set when parking
+        self.parked_record_key: str | None = None
+        self.parked_recorded = False
         self.parked_name: str | None = None
         # the parked container's own Docker ID: its removal after the reply can land after a later edit
         # of the pod parked another container under the same name, and removing by name would delete that one
@@ -2074,6 +2088,14 @@ class _EditSwap:
             if self.was_mounted is None and self.plaintext_path:
                 # unknown, an undo could not tell whether to remount the workspace: the running pod stays as it is
                 raise Exception("[park_current_container] the pod's volume mount could not be read; the pod was left as it was")
+        # a recovered kept container is recorded again too: its earlier edit's record may have expired
+        if self.redis is not None and self.executor_id:
+            self.parked_record_key = f"{EDIT_PARKED_CONTAINER_PREFIX}{self.executor_id}:{parked}"
+        await self._record_parked(True)
+        if self.parked_record_key is not None and not self.parked_recorded:
+            # unrecorded, the GPU check would judge the renter's own load as the provider's while it is parked
+            raise Exception("[park_current_container] the parked container could not be recorded; the pod was left as it was")
+        if not recover_kept:
             await self._rename_aside(container_id, parked)
         self.parked_name = parked
         self.parked_id = container_id
@@ -2197,7 +2219,32 @@ class _EditSwap:
         )
         return is_stopped
 
+    async def _record_parked(self, parked: bool) -> None:
+        """Best effort: unrecorded, a parked container's GPU load counts as the provider's."""
+        if self.parked_record_key is None or parked == self.parked_recorded:
+            return
+        try:
+            async with asyncio.timeout(_EDIT_PARKED_RECORD_TIMEOUT_SECONDS):
+                if parked:
+                    await self.redis.set(self.parked_record_key, "1", ex=EDIT_PARKED_CONTAINER_TTL_SECONDS)
+                else:
+                    # not deleted: a GPU check that read the parked container's processes before the edit ended
+                    # still asks about it afterwards
+                    await self.redis.expire(self.parked_record_key, EDIT_PARKED_CONTAINER_AFTER_EDIT_SECONDS)
+            self.parked_recorded = parked
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                _m("Edit-parked container record not updated", extra=get_extra_info({**self.default_extra, "error": repr(exc)}))
+            )
+
     async def __aexit__(self, exc_type, exc, tb) -> bool:
+        try:
+            return await self._finish(exc)
+        finally:
+            # after the parked container is gone or renamed back, never before
+            await self._record_parked(False)
+
+    async def _finish(self, exc) -> bool:
         # Nothing here may change the create's own outcome: the cleanup and the undo are best effort,
         # and an SSH session that died (the very thing that fails an edit) must not turn the create's
         # error into a ChannelOpenError from the undo.
@@ -2937,6 +2984,13 @@ async def _drop_unmarked_recovery_stop(pod_id: str) -> None:
 async def _unmarked_recovery_stop_known(pod_id: str) -> bool:
     await _load_unmarked_recovery_stops()
     return pod_id in _UNMARKED_RECOVERY_STOPS
+
+
+async def recovery_parked(pod_id: str) -> bool | None:
+    """Whether this validator parked the pod as <name>__stopped; None while its record cannot be read."""
+    if await _unmarked_recovery_stop_known(pod_id):
+        return True
+    return False if _UNMARKED_RECOVERY_STOPS_LOADED else None
 
 
 def _retry_recovery_mark_in_background(
@@ -10161,7 +10215,14 @@ class DockerService:
                 )
                 # DAH-2740: undoes a failed edit while this SSH session is still open
                 edit_swap = await connections.enter_async_context(
-                    _EditSwap(ssh_client, self.get_container_name(payload), default_extra, docker_client=docker_client)
+                    _EditSwap(
+                        ssh_client,
+                        self.get_container_name(payload),
+                        default_extra,
+                        docker_client=docker_client,
+                        redis=self.redis_service,
+                        executor_id=str(executor_info.uuid),
+                    )
                 )
                 # Add profiler for ssh connection
                 profilers.append(ProfilerStep.since(ProfilerStepName.SSH_CONNECTION_ESTABLISHED, prev_timestamp))
