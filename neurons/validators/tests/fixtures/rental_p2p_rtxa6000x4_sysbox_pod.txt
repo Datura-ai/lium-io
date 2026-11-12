@@ -1,0 +1,73 @@
+Thu Nov 12 12:10:08 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.178.04             Driver Version: 580.178.04     CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA RTX A6000               On  |   00000000:01:00.0 Off |                  Off |
+|  0%   27C    P8             15W /  300W |       1MiB /  49140MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA RTX A6000               On  |   00000000:2C:00.0 Off |                  Off |
+|  0%   27C    P8             16W /  300W |       1MiB /  49140MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA RTX A6000               On  |   00000000:41:00.0 Off |                  Off |
+|  0%   28C    P8             21W /  300W |       1MiB /  49140MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA RTX A6000               On  |   00000000:61:00.0 Off |                  Off |
+|  0%   28C    P8             20W /  300W |       1MiB /  49140MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+LIUM_RENTAL_P2P
+ 	[4mGPU0	GPU1	GPU2	GPU3	[0m
+ GPU0	X	OK	OK	OK	
+ GPU1	OK	X	OK	OK	
+ GPU2	OK	OK	X	OK	
+ GPU3	OK	OK	OK	X	
+
+Legend:
+
+  X    = Self
+  OK   = Status Ok
+  CNS  = Chipset not supported
+  GNS  = GPU not supported
+  TNS  = Topology not supported
+  NS   = Not supported
+  U    = Unknown
+===TOPO_M
+	[4mGPU0	GPU1	GPU2	GPU3	CPU Affinity	NUMA Affinity	GPU NUMA ID[0m
+GPU0	 X 	NODE	NODE	NODE	0-127	0		N/A
+GPU1	NODE	 X 	NODE	NODE	0-127	0		N/A
+GPU2	NODE	NODE	 X 	NODE	0-127	0		N/A
+GPU3	NODE	NODE	NODE	 X 	0-127	0		N/A
+
+Legend:
+
+  X    = Self
+  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)
+  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node
+  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)
+  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)
+  PIX  = Connection traversing at most a single PCIe bridge
+  NV#  = Connection traversing a bonded set of # NVLinks
+===NVLINK
+GPU 0: NVIDIA RTX A6000 (UUID: GPU-00000000-0000-0000-0000-000000000000)
+NVML: Unable to retrieve NVLink information as all links are inActive
+GPU 1: NVIDIA RTX A6000 (UUID: GPU-00000000-0000-0000-0000-000000000000)
+NVML: Unable to retrieve NVLink information as all links are inActive
+GPU 2: NVIDIA RTX A6000 (UUID: GPU-00000000-0000-0000-0000-000000000000)
+NVML: Unable to retrieve NVLink information as all links are inActive
+GPU 3: NVIDIA RTX A6000 (UUID: GPU-00000000-0000-0000-0000-000000000000)
+NVML: Unable to retrieve NVLink information as all links are inActive

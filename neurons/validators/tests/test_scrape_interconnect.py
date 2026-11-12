@@ -535,3 +535,31 @@ def test_sysbox_probe_returns_the_p2p_table_its_shipped_command_prints(tmp_path)
 
     assert ok is True
     assert rental_table.strip() == table.strip()
+
+
+@pytest.mark.parametrize(
+    ("capture", "devices", "ok_pairs", "p2p", "pcie_class"),
+    [
+        ("rental_p2p_rtx3090x8_sysbox_pod.txt", 8, 0, False, "SYS"),  # every pair GNS
+        ("rental_p2p_rtxa6000x4_sysbox_pod.txt", 4, 6, True, "NODE"),  # every pair OK
+    ],
+)
+def test_real_rental_capture_parses(scrape: dict[str, Any], capture, devices, ok_pairs, p2p, pcie_class) -> None:
+    # review on lio#2205: real nvidia-smi output (driver tables keep ESC[4m/ESC[0m in the header and a trailing tab
+    # per row) captured inside a sysbox rental with the probe's own `sh -c` script, then `topo -m` and `nvlink -s`
+    raw = (SRC.parent / "tests" / "fixtures" / capture).read_text()
+    check_stdout, rest = raw.split("===TOPO_M\n", 1)
+    topo, nvlink = rest.split("===NVLINK\n", 1)
+    rental = scrape["rental_p2p_output"](check_stdout)
+    assert rental is not None
+    scrape["run_cmd"] = _stub_run_cmd(
+        {"nvidia-smi topo -m": topo, "nvidia-smi topo -p2p r": rental, "nvidia-smi nvlink -s": nvlink}
+    )
+
+    for observation in (scrape["get_gpu_interconnect"](rental), scrape["get_gpu_interconnect"]()):
+        payload = observation.payload
+        assert observation.scrape_error == ""
+        assert payload["ic_devices"] == devices
+        assert payload["ic_p2p_pairs"] == devices * (devices - 1) // 2
+        assert (payload["ic_p2p"], payload["ic_p2p_ok_pairs"]) == (p2p, ok_pairs)
+        assert (payload["ic_nvlink"], payload["ic_pcie_class"]) == (False, pcie_class)
