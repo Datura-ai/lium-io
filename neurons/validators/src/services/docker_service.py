@@ -144,6 +144,7 @@ from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, 
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.hung_gpu_reset import HungGpuResult, reset_hung_pod_gpus
 from services.image_flatten import (
+    CACHE_TRASH_DIR,
     FLATTEN_NO_DISK_RENTER_SENTENCE,
     FLATTEN_SIZING_SLACK_BYTES,
     FlattenMeasureFailed,
@@ -3283,7 +3284,7 @@ def _detach_volume_data_cmd(volume_name: str, remove_cmd: str) -> str:
         f"dm=$({docker} volume inspect -f '{{{{.Driver}}}} {{{{.Mountpoint}}}}' $v 2>/dev/null) && "
         '[ "${dm%% *}" = local ] && m=${dm#* } && case "$m" in */volumes/"$v"/_data) true;; *) false;; esac && '
         f"u=$({docker} ps -aq --filter volume=$v) && [ -z \"$u\" ] && "
-        't=${m%/volumes/*}/lium-cache-trash && mkdir -p "/proc/1/root$t" && '
+        f't=${{m%/volumes/*}}/{CACHE_TRASH_DIR} && mkdir -p "/proc/1/root$t" && '
         '[ "$(stat -c %d "/proc/1/root$m")" = "$(stat -c %d "/proc/1/root$t")" ] && '
         'b=$(du -sxB1 "/proc/1/root$m" | cut -f1) && mv "/proc/1/root$m" "/proc/1/root$t/$v.$$" && '
         '{ mkdir "/proc/1/root$m" 2>/dev/null; true; } || t=; '
@@ -8445,7 +8446,8 @@ class DockerService:
         """Resolve effective volume/storage limits for a new pod volume (DAH-2183).
 
         `df_floor_bytes` (DAH-2498) is the free disk once the cache reclaim's detached deletes finish; df is read
-        as at least that, so a delete still running does not shrink the grant. A locked measure ignores it.
+        as at least that, so a delete still running does not shrink the grant. A locked measure ignores it: it adds
+        the bytes that delete is still freeing, read under the lock (`wait_for_node_flatten(with_trash=True)`).
 
         `flatten_copy_bytes` (a many-layer image on a Sysbox full node) caps the grant so a one-layer copy
         still fits beside it, never below `payload.min_volume_gb` or the ordered `payload.volume_limit_gb`.
@@ -10984,7 +10986,7 @@ class DockerService:
                             await early_volume_probe
                         current_step = "flatten_wait"
                         try:
-                            locked_df_avail_bytes = await wait_for_node_flatten(ssh_client)
+                            locked_df_avail_bytes = await wait_for_node_flatten(ssh_client, with_trash=bool(cache_df_floor))
                         except FlattenMeasureFailed as exc:
                             # lock held and mark written: the sizing's measurement-failure fallback;
                             # a lock or mark failure propagates and stops the create

@@ -729,6 +729,17 @@ async def test_a_node_without_flock_runs_no_flatten_and_gives_no_locked_measure(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("trash_line, expected_gib", [("trash 214748364800", 290), ("trash ", 90), (None, 90)])
+async def test_the_locked_measure_adds_the_cache_files_still_being_deleted(trash_line, expected_gib):
+    # review: a detached cache delete still running shrank every fresh-sized volume on flock hosts
+    df = f"Filesystem 1B-blocks Used Available Capacity Mounted\n/dev/x 1 1 {90 * 1024**3} 1% /hostfs\n"
+    ssh = Mock(run=AsyncMock(return_value=Mock(exit_status=0, stdout=df + (trash_line + "\n" if trash_line else ""))))
+
+    assert await image_flatten.wait_for_node_flatten(ssh, with_trash=trash_line is not None) == expected_gib * 1024**3
+    assert ("lium-cache-trash" in ssh.run.await_args.args[0]) == (trash_line is not None)
+
+
+@pytest.mark.asyncio
 async def test_a_failed_wait_for_a_running_flatten_stops_the_create():
     ssh = Mock(run=AsyncMock(return_value=Mock(exit_status=1)))
     with pytest.raises(RuntimeError, match="image copy") as raised:

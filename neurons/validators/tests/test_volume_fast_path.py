@@ -594,6 +594,28 @@ async def test_create_container_sizes_on_the_disk_measured_under_the_flatten_loc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("detached", [True, False])
+async def test_the_locked_measure_counts_the_cache_delete_only_when_the_reclaim_detached_one(svc, monkeypatch, detached):
+    # review: on flock hosts the sizing takes the locked measure, so it must see the delete still freeing disk
+    ssh_client = _deploy_ssh_client()
+    _patch_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(svc, "probe_volume_host", AsyncMock(return_value=None))
+
+    async def reclaim(*, df_floor, **_):
+        if detached:
+            df_floor.append(200 * _SIZING_GB)
+        return False
+
+    monkeypatch.setattr(svc, "reclaim_dphn_cache_for_rental", reclaim)
+    wait = AsyncMock(return_value=90 * _SIZING_GB)
+    monkeypatch.setattr(docker_service_module, "wait_for_node_flatten", wait)
+
+    await _run_create_container(svc, _create_payload())
+
+    assert wait.await_args.kwargs == {"with_trash": detached}
+
+
+@pytest.mark.asyncio
 async def test_a_failed_measure_under_the_flatten_lock_takes_the_sizing_fallback(svc, monkeypatch):
     # review: a transient failure of the locked measure must not abort the create
     ssh_client = _deploy_ssh_client()

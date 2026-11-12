@@ -243,23 +243,31 @@ def _export_count_check(factor: int, fixed_bytes: int) -> str:
     )
 
 
+# under the Docker root dir: where a cache reclaim moves volume files for its detached delete (DAH-2498)
+CACHE_TRASH_DIR = "lium-cache-trash"
+
+
 def flatten_sized_mark_command() -> str:
     """Prints the mtime of FLATTEN_SIZED_PATH (empty when absent); `_flatten_command` refuses once it changed."""
     return f"stat -c %y {FLATTEN_SIZED_PATH} 2>/dev/null; true"
 
 
-def flatten_wait_command() -> str:
+def flatten_wait_command(with_trash: bool = False) -> str:
     root = "\"$(/usr/bin/docker info --format '{{.DockerRootDir}}')\""
     # under the lock a copy holds for its whole run: no copy is half-written while df measures, and a
     # flatten that has not started copying refuses once it sees the mark (nothing to print without flock)
-    return (
+    command = (
         f"command -v flock >/dev/null || exit 0; exec 9>>{FLATTEN_LOCK_PATH}; "
         f"flock -w {FLATTEN_TIMEOUT_SECONDS + 300} 9 || exit 1; touch {FLATTEN_SIZED_PATH} || exit 1; "
         f"{df_command(root)} || exit {FLATTEN_MEASURE_FAILED_EXIT}"
     )
+    if with_trash:
+        # the cache files this create's detached `rm` is still deleting (DAH-2498): free once it ends
+        command += f'; echo "trash $(du -sxB1 "/proc/1/root"{root}/{CACHE_TRASH_DIR} 2>/dev/null | cut -f1)"'
+    return command
 
 
-async def wait_for_node_flatten(ssh_client: asyncssh.SSHClientConnection) -> int | None:
+async def wait_for_node_flatten(ssh_client: asyncssh.SSHClientConnection, with_trash: bool = False) -> int | None:
     """The Docker disk's free bytes, measured under the node flatten lock, for a create's sizing.
 
     A copy holds that lock from its disk check to its tag, so the measure waits for a running copy
@@ -268,17 +276,22 @@ async def wait_for_node_flatten(ssh_client: asyncssh.SSHClientConnection) -> int
     A disk probe taken before this, outside the lock, may predate a copy and must not size the create.
     None on a node without flock, which runs no flatten. Raises FlattenMeasureFailed when only the
     measure failed (lock held, mark written); any other error when the lock or the mark was not taken,
-    which must stop the create: no other sizing is safe then."""
-    result = await ssh_client.run(flatten_wait_command(), check=False, timeout=FLATTEN_TIMEOUT_SECONDS + 420)
+    which must stop the create: no other sizing is safe then. `with_trash` (the create's cache reclaim
+    detached a delete) adds what that delete is still freeing."""
+    result = await ssh_client.run(flatten_wait_command(with_trash), check=False, timeout=FLATTEN_TIMEOUT_SECONDS + 420)
     if result.exit_status == FLATTEN_MEASURE_FAILED_EXIT:
         raise FlattenMeasureFailed("measuring the disk under the node flatten lock failed")
     if result.exit_status != 0:
         raise RuntimeError(f"waiting for any image copy on this node failed (exit {result.exit_status})")
     out = str(result.stdout or "")
+    if not out.strip():
+        return None
     try:
-        return parse_df_available_bytes(out) if out.strip() else None
+        free = parse_df_available_bytes(out)
     except Exception as exc:
         raise FlattenMeasureFailed(str(exc)) from exc
+    trash = next((line.split()[1:] for line in out.splitlines() if line.startswith("trash")), [])
+    return free + (int(trash[0]) if trash and trash[0].isdigit() else 0)
 
 
 # Docker switches to the relative layer paths Sysbox cannot ID-map at ~40 layers on the default data root
