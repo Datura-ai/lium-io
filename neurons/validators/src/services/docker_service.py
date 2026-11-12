@@ -6420,7 +6420,9 @@ class DockerService:
         """Clamp a rental's volume to the disk actually free after the cache eviction (DAH-5260)."""
         free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
         rental_gets_gb = (free_now_gb + fit.existing_gb) * fit.disk_share
-        payload.volume_limit_gb = max(int(rental_gets_gb), 1)
+        # a clamp only lowers: other pods' volumes counted as reclaimable (existing_gb) can put this above the order,
+        # which then reads as clamped and fails the rent at rental_disk_short on disk the cache never held
+        payload.volume_limit_gb = min(payload.volume_limit_gb, max(int(rental_gets_gb), 1))
 
     async def select_affordable_cache_volumes(
         self,

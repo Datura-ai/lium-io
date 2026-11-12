@@ -594,6 +594,21 @@ async def test_a_timed_out_removal_still_clamps_the_rental_to_the_free_disk(dock
 
 
 @pytest.mark.asyncio
+async def test_a_failed_removal_never_clamps_a_whole_node_order_above_what_was_ordered(docker_service, monkeypatch):
+    # prod 12 Nov, 8x 5090: two stopped pods keep 1264 GB of volumes, the cache removal frees nothing. The clamp counted
+    # those volumes as reclaimable and raised the 1250 GB order to 1812, so the fresh sizing's 645 GB read as a clamp
+    # far below the order and the rent failed at rental_disk_short; the order now stays as placed.
+    monkeypatch.setattr(docker_service, "_get_existing_vloopback_bytes", AsyncMock(return_value=1264 * 10**9))
+    rental = _rental(1250, 625)
+    rental.disk_share = 1.0
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(
+        HostSshClient([_KIMI, "volume_pod"], free_gb=655), rental, {}
+    ) is True
+    assert rental.volume_limit_gb == 1250
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("free_gb", "removed"), [(2389, []), (1000, [])])
 async def test_a_recreate_on_its_existing_volume_needs_no_free_disk_and_is_never_clamped(
     docker_service, free_gb, removed
