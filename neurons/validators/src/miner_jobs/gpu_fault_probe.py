@@ -15,8 +15,8 @@ setup) is an error, not a fault: the validator does not penalise what it could n
 
 Prints one line `GPU_FAULT_PROBE_JSON: {...}`. Exit 0 ok, 1 fault, 2 could not run.
 `--nvml-only` (GpuMemoryHealthCheck) reads NVML once and runs no CUDA: status ok, flagged (see
-`flags`) or error, exit 0. It also lists, per card, the new hardware Xids since `--xid-seen` (`xid_faults`)
-and the PCIe link downgrades of this read (`card_suspects`); none of those sets the status.
+`flags`) or error, exit 0. It also lists, per card, the new hardware Xids since `--xid-seen` (`xid_faults`),
+which do not set the status.
 """
 
 from __future__ import annotations
@@ -797,11 +797,6 @@ def nvml_snapshot() -> dict:
                 ),
                 ("remapped_rows", lambda h: list(pynvml.nvmlDeviceGetRemappedRows(h))),
                 ("recovery_action", nvml_recovery_action),
-                ("pcie_gen", lambda h: pynvml.nvmlDeviceGetCurrPcieLinkGeneration(h)),
-                ("pcie_gen_max", lambda h: pynvml.nvmlDeviceGetMaxPcieLinkGeneration(h)),
-                ("pcie_width", lambda h: pynvml.nvmlDeviceGetCurrPcieLinkWidth(h)),
-                ("pcie_width_max", lambda h: pynvml.nvmlDeviceGetMaxPcieLinkWidth(h)),
-                ("pstate", lambda h: pynvml.nvmlDeviceGetPerformanceState(h)),
             ):
                 try:
                     value = read(handle)
@@ -949,26 +944,6 @@ def nvml_health(snapshot: dict) -> tuple[list[str], list[str]]:
             name_of_action = RECOVERY_ACTIONS.get(action, action)
             reset_needed_target.append(f"{name}: NVML recovery action {name_of_action} required")
     return flags, warnings
-
-
-def nvml_card_suspects(snapshot: dict) -> list[str]:
-    """Per card, a PCIe link below what the card and slot can do, in this one read. The validator reports one
-    only once the same reading comes back on the next cycle. Clocks are GpuThermalThrottleCheck's alone: one rule
-    for a slowdown bit, which never holds a rented node."""
-    suspects = []
-    for gpu in snapshot.get("gpus") or []:
-        # a card below full performance may narrow and slow its link by design (power saving): a healthy
-        # rented card between kernels reads that way, so the link is only judged at P0 (review)
-        if gpu.get("pstate") != 0:
-            continue
-        name = f"gpu {gpu.get('index')} ({gpu.get('uuid')})"
-        width, width_max = gpu.get("pcie_width"), gpu.get("pcie_width_max")
-        if isinstance(width, int) and isinstance(width_max, int) and 0 < width < width_max:
-            suspects.append(f"{name}: PCIe link x{width} of x{width_max}")
-        gen, gen_max = gpu.get("pcie_gen"), gpu.get("pcie_gen_max")
-        if isinstance(gen, int) and isinstance(gen_max, int) and 0 < gen < gen_max:
-            suspects.append(f"{name}: PCIe link gen {gen} of gen {gen_max}")
-    return suspects
 
 
 def xid_lines() -> dict:
@@ -1132,7 +1107,7 @@ def boot_id() -> str | None:
 
 def print_nvml_health_report(mp, xid_seen: int | None = None) -> None:
     """The `--nvml-only` verdict: one NVML snapshot and its standing memory faults, plus the cards'
-    new hardware Xids and this read's PCIe downgrades."""
+    new hardware Xids."""
     snapshot = nvml_snapshot_forked(mp)
     flags, warnings = nvml_health(snapshot)
     status = "error" if not snapshot.get("available") else "flagged" if flags else "ok"
@@ -1142,7 +1117,6 @@ def print_nvml_health_report(mp, xid_seen: int | None = None) -> None:
         "flags": flags,
         "warnings": warnings,
         "nvml": snapshot,
-        "card_suspects": nvml_card_suspects(snapshot),
         "xid_faults": card_xid_faults(snapshot, xid, xid_seen),
         # the kernel log is often not readable from the container: then no Xid is judged
         "xid": {k: v for k, v in xid.items() if k in ("available", "count", "error")},
