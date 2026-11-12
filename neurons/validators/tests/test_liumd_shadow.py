@@ -999,3 +999,17 @@ async def test_flag_off_or_dry_run_never_calls_the_shadow(keypair, monkeypatch, 
     [call] = shadow.await_args_list
     assert call.args == (ctx,)
     assert call.kwargs["ok"] is False and call.kwargs["events"] == PASSED[:1]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_post_scrape_read_is_not_overwritten_by_a_later_gpu_answer(
+    keypair, monkeypatch, verifyx_service, shadow_on, gpu_steps
+):
+    ctx = _ctx(keypair, monkeypatch, verifyx_service)
+    _, ctx = _with_facts_task(ctx, FakeLiumd(result=LocalVerifyUnavailable("transport", "closed")))
+    late = FakeLiumd()
+
+    record = await _shadow(ctx, late)
+
+    assert (record["outcome"], record["reason"]) == ("unavailable", "transport")
+    assert late.intents

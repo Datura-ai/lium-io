@@ -379,6 +379,25 @@ async def _compare(
                 "steps": steps,
                 "first_pass": first_pass,
             }
+        if isinstance(facts_answer, LocalVerifyUnavailable):
+            return {
+                "outcome": "unavailable",
+                "reason": facts_answer.reason,
+                "detail": facts_answer.detail[:DETAIL_MAX_CHARS],
+                "steps": steps,
+                "first_pass": first_pass,
+            }
+        if isinstance(facts_answer, LiumdRefusal):
+            return {
+                "outcome": "refused",
+                "reason": facts_answer.error,
+                "detail": facts_answer.detail,
+                "exit_status": facts_answer.exit_status,
+                "echoed": facts_answer.echoed,
+                "round_trip_ms": facts_answer.round_trip_ms,
+                "steps": steps,
+                "first_pass": first_pass,
+            }
         if not isinstance(facts_answer, LocalVerifyAnswer):
             facts_answer = answer
         return _judged(
