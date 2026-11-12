@@ -317,7 +317,8 @@ async def test_a_miner_whose_dns_stalls_cannot_stop_another_miners_rental_connec
 
     def info(address):
         return SimpleNamespace(
-            address=address, ssh_port=2222, ssh_username="root", ssh_host_key="ssh-ed25519 AAAATESTKEY"
+            address=address, ssh_port=2222, ssh_username="root", ssh_host_key="ssh-ed25519 AAAATESTKEY",
+            expected_ssh_host_key=None,
         )
 
     async def connect_as(miner, address):

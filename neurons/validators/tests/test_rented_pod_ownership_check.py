@@ -159,7 +159,7 @@ def test_read_command_reports_a_missing_pid_without_failing(tmp_path):
     out = subprocess.run(
         ["sh", "-c", read_command([999], proc=str(tmp_path))], capture_output=True, text=True
     )
-    assert out.stdout == "999|||\n"
+    assert out.stdout == "999|||||||\n"
 
 
 @pytest.mark.parametrize(
@@ -179,3 +179,30 @@ def test_an_unread_root_home_is_judged_from_slash_and_an_unread_slash_is_unknown
         assert pod is None
     else:
         assert pod["outside_namespace"] == outside
+
+
+def test_a_shifted_sudo_file_warns_although_slash_and_root_home_are_inside():
+    # a power loss left /etc/sudoers.d/README owned by nobody while / and /root were fine: sudo fails
+    pod = judge("4242|0 100000 65536|100000|100000|100000|100000|65534|100000")
+    assert pod["outside_namespace"] == ["/etc/sudoers.d/README"]
+
+
+@pytest.mark.asyncio
+async def test_the_read_includes_sudo_files_and_an_image_without_sudo_is_ok(
+    context_factory, tmp_path
+):
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me}      65536\n")
+    (tmp_path / "4242" / "root" / "etc" / "sudoers.d").mkdir(parents=True)
+    (tmp_path / "4242" / "root" / "etc" / "sudoers.d" / "README").write_text("")
+    _proc(tmp_path, 4343, f"         0     {me}      65536\n")  # no sudo in the image
+    result = await RentedPodOwnershipCheck().run(_ctx(context_factory, _ssh(str(tmp_path))))
+    assert result.event.reason_code == Msg.OK.reason
+    pods = {p["container"]: p for p in result.event.what_we_saw["pods"]}
+    assert pods["pod_1"]["host_owners"] == {
+        "/": me,
+        "/root": me,
+        "/etc/sudoers.d": me,
+        "/etc/sudoers.d/README": me,
+    }
+    assert pods["pod_2"]["host_owners"] == {"/": me, "/root": me}

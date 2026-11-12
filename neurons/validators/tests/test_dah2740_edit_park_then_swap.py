@@ -51,7 +51,7 @@ def svc():
     service = DockerService(ssh_service=Mock(), redis_service=Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True)), attestation_service=Mock())
     # the pre-run kernel.pid_max read is mandatory and the SSH doubles here do not model /proc
     service._read_host_pid_max = AsyncMock(return_value=4_194_304)
-    service._read_host_ram_kib = AsyncMock(return_value=None)
+    service._read_host_meminfo_kib = AsyncMock(return_value=(None, None))
     return service
 
 
@@ -735,6 +735,67 @@ async def test_an_undo_whose_ssh_session_died_keeps_the_creates_own_error(svc, m
     assert isinstance(result, FailedContainerRequest)
     assert result.failure_step == "docker_run" and "gocryptfs: EPERM" in result.detail
     assert "Connection lost" not in result.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("edit_error", [None, RuntimeError("create failed")], ids=["edit-done", "edit-failed"])
+async def test_the_parked_name_is_recorded_while_parked_and_kept_briefly_after_the_edit_ends(edit_error):
+    from services.docker_service import _EditSwap
+    from services.redis_service import (
+        EDIT_PARKED_CONTAINER_AFTER_EDIT_SECONDS,
+        EDIT_PARKED_CONTAINER_PREFIX,
+        EDIT_PARKED_CONTAINER_TTL_SECONDS,
+    )
+
+    redis = AsyncMock()
+    swap = _EditSwap(_ssh_recording(), "pod_abc", {}, redis=redis, executor_id="ex-1")
+
+    parked = await swap.park()
+    key = f"{EDIT_PARKED_CONTAINER_PREFIX}ex-1:{parked}"
+    redis.set.assert_awaited_once_with(key, "1", ex=EDIT_PARKED_CONTAINER_TTL_SECONDS)
+    redis.expire.assert_not_awaited()
+
+    await swap.__aexit__(type(edit_error) if edit_error else None, edit_error, None)
+    # a GPU check that read the parked container's processes before the end still finds the record
+    redis.delete.assert_not_awaited()
+    redis.expire.assert_awaited_once_with(key, EDIT_PARKED_CONTAINER_AFTER_EDIT_SECONDS)
+    assert EDIT_PARKED_CONTAINER_AFTER_EDIT_SECONDS < EDIT_PARKED_CONTAINER_TTL_SECONDS <= 3600
+
+
+@pytest.mark.asyncio
+async def test_a_recovered_kept_container_is_recorded_again_before_its_stop():
+    # its earlier edit's record may have expired: unrecorded, a GPU check during this edit judges it the provider's
+    from services.docker_service import _EditSwap
+    from services.redis_service import EDIT_PARKED_CONTAINER_PREFIX, EDIT_PARKED_CONTAINER_TTL_SECONDS
+
+    redis = AsyncMock()
+    ssh = _ssh_recording(container_present=False)
+    old = "kept_unmounted_abc_1700000000"
+    ssh.kept = [old]
+    swap = _EditSwap(ssh, "pod_abc", {}, redis=redis, executor_id="ex-1")
+
+    parked = await swap.park()
+
+    assert parked == old
+    redis.set.assert_awaited_once_with(f"{EDIT_PARKED_CONTAINER_PREFIX}ex-1:{old}", "1", ex=EDIT_PARKED_CONTAINER_TTL_SECONDS)
+    assert _docker(ssh.commands, "rename") == []
+
+
+@pytest.mark.asyncio
+async def test_an_edit_whose_parked_record_cannot_be_written_leaves_the_pod_as_it_was():
+    from services.docker_service import _EditSwap
+
+    redis = AsyncMock()
+    redis.set = AsyncMock(side_effect=ConnectionError("redis down"))
+    ssh = _ssh_recording()
+    swap = _EditSwap(ssh, "pod_abc", {}, redis=redis, executor_id="ex-1")
+
+    with pytest.raises(Exception, match="could not be recorded"):
+        await swap.park()
+
+    assert _docker(ssh.commands, "rename") == []
+    assert _docker(ssh.commands, "stop") == []
+    assert swap.parked_name is None
 
 
 @pytest.mark.asyncio
