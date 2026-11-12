@@ -452,13 +452,89 @@ async def test_host_view_is_not_read_when_the_container_list_is_long_enough(
 
 
 @pytest.mark.asyncio
-async def test_host_view_is_not_read_when_the_container_list_is_missing(context_factory, check_enabled):
+async def test_container_list_missing_and_host_lists_every_reported_card_matches_on_the_host_view(
+    context_factory, check_enabled
+):
     ctx = _ctx(context_factory, reported=REAL[:4], kernel=None, host=_host_stdout(REAL))
 
     result = await GpuKernelCountCheck().run(ctx)
 
+    assert result.passed is True
+    assert result.event.reason_code == Msg.COUNT_OK.reason
+    what = result.event.what_we_saw
+    assert what["kernel_verdict"] == "match_host_view"
+    assert what["kernel_view_source"] == "host_pid1_root"
+    assert what["host_fallback"] is True
+    assert what["would_fail"] is False
+
+
+@pytest.fixture
+def host_fallback_enforced(monkeypatch):
+    monkeypatch.setattr(settings, "GPU_KERNEL_COUNT_HOST_FALLBACK_ENFORCEMENT_ENABLED", True)
+
+
+def test_the_host_fallback_is_shadow_by_default():
+    assert type(settings).model_fields["GPU_KERNEL_COUNT_HOST_FALLBACK_ENFORCEMENT_ENABLED"].default is False
+
+
+@pytest.mark.asyncio
+async def test_container_list_missing_and_a_short_host_list_is_recorded_and_passes_by_default(
+    context_factory, check_enabled
+):
+    ctx = _ctx(context_factory, reported=REAL[:4], kernel=None, host=_host_stdout(REAL[:1]))
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.updates == {}
+    assert result.event.reason_code == Msg.COUNT_MISMATCH_HOST_SHADOW.reason
+    what = result.event.what_we_saw
+    assert what["kernel_verdict"] == "count_lower_host_view"
+    assert what["kernel_view_source"] == "host_pid1_root"
+    assert what["host_kernel_gpu_count"] == 1
+    assert what["would_fail"] is True
+
+
+@pytest.mark.asyncio
+async def test_container_list_missing_and_a_short_host_list_fails_when_enforced(
+    context_factory, check_enabled, host_fallback_enforced
+):
+    ctx = _ctx(context_factory, reported=REAL[:4], kernel=None, host=_host_stdout(REAL[:1]))
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.fatal is True
+    assert result.updates == {"gpu_kernel_count_passed": False}
+    assert result.event.reason_code == Msg.COUNT_MISMATCH.reason
+
+
+@pytest.mark.asyncio
+async def test_a_short_host_list_on_a_rented_node_fails_but_does_not_stop_the_run_when_enforced(
+    context_factory, check_enabled, host_fallback_enforced
+):
+    ctx = _with_live_rental(
+        _ctx(context_factory, reported=REAL[:4], kernel=None, host=_host_stdout(REAL[:1]))
+    )
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.fatal is False
+    assert result.updates == {"gpu_kernel_count_passed": False}
+
+
+@pytest.mark.asyncio
+async def test_container_and_host_lists_both_missing_stay_not_evaluated_when_enforced(
+    context_factory, check_enabled, host_fallback_enforced
+):
+    ctx = _ctx(context_factory, reported=REAL[:4], kernel=None)
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is True
     assert result.event.reason_code == Msg.NOT_EVALUATED.reason
-    assert ctx.ssh.run.await_count == 0
+    assert result.event.what_we_saw["kernel_verdict"] == "not_evaluated"
 
 
 # ---------------------------- kernel 8 vs reported 8 ----------------------------
@@ -704,3 +780,21 @@ def test_check_is_in_every_pipeline_after_the_kernel_read():
     ):
         assert ids.count(GpuKernelCountCheck.check_id) == 1
         assert ids.index("gpu.validate.banned_provider") < ids.index(GpuKernelCountCheck.check_id)
+
+
+@pytest.mark.asyncio
+async def test_an_unattachable_card_still_fails_when_the_host_list_is_also_short(context_factory, check_enabled):
+    ctx = _behind_a_foreign_mount(
+        _ctx(
+            context_factory,
+            reported=REAL[:4],
+            kernel=None,
+            host=_host_stdout(REAL[:1]),
+            attachable=REAL[:3],
+        )
+    )
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.UNATTACHABLE.reason

@@ -130,7 +130,8 @@ class HostViewResult:
 async def host_view_verdict(
     ctx: Context, *, reported_count: int, reported_uuids: list[str]
 ) -> HostViewResult:
-    """Second reading, taken only when the container's list is shorter than the reported count.
+    """Second reading, taken when the container's list is shorter than the reported count or
+    unavailable (DAH-6273).
 
     A container that was handed a subset of the host's cards has only those under its own /proc,
     while the scrape can still list every card. The host's list, read through PID 1's root, is
@@ -190,8 +191,11 @@ class GpuKernelCountCheck:
     short list is checked once more against the host's own list (host_view_verdict): if that one
     covers the reported cards the verdict is match_host_view and nothing fails.
 
-    A kernel list that is missing (unreadable, empty, read failed, withheld behind a foreign
-    mount) is never a failure: the verdict is GPU_KERNEL_COUNT_NOT_EVALUATED. One exception
+    A container list that is missing (unreadable, empty, read failed, withheld behind a foreign
+    mount) is replaced by the host's list (DAH-6273): one that covers the reported cards is
+    match_host_view; one that is shorter is count_lower_host_view, which fails only with
+    GPU_KERNEL_COUNT_HOST_FALLBACK_ENFORCEMENT_ENABLED. With neither list there is no failure:
+    the verdict is GPU_KERNEL_COUNT_NOT_EVALUATED. One exception
     (DAH-5519): behind a foreign mount, a reported card the create step cannot attach fails like a
     short list (verdict unattachable), since no renter can start a container on it.
     """
@@ -238,6 +242,16 @@ class GpuKernelCountCheck:
             )
             kernel_check_fields.update(host_view.as_fields())
         verdict = kernel_check_fields["kernel_verdict"]
+        host_short = False
+        if verdict == "not_evaluated":
+            # DAH-6273: no container list, so the host's list decides
+            host_view = await host_view_verdict(
+                ctx, reported_count=reported_count, reported_uuids=reported_uuids
+            )
+            kernel_check_fields.update(host_view.as_fields())
+            kernel_check_fields["host_fallback"] = True
+            host_short = host_view.kernel_verdict is None and host_view.host_kernel_gpu_count is not None
+            verdict = kernel_check_fields["kernel_verdict"]
         if verdict == "not_evaluated":
             kernel_check_fields["not_evaluated_reason"] = (
                 "kernel_list_behind_foreign_mount" if foreign_mounts else "kernel_list_unavailable"
@@ -248,7 +262,14 @@ class GpuKernelCountCheck:
             if unattachable:
                 verdict = kernel_check_fields["kernel_verdict"] = "unattachable"
                 kernel_check_fields["unattachable_uuids"] = unattachable
-        would_fail = verdict in ("count_lower", "unattachable")
+            elif host_short:
+                verdict = kernel_check_fields["kernel_verdict"] = "count_lower_host_view"
+                kernel_check_fields["kernel_view_source"] = KERNEL_VIEW_SOURCE_HOST
+        would_fail = verdict in ("count_lower", "unattachable", "count_lower_host_view")
+        enforced = (
+            verdict != "count_lower_host_view"
+            or settings.GPU_KERNEL_COUNT_HOST_FALLBACK_ENFORCEMENT_ENABLED
+        )
         kernel_check_fields.update(
             {
                 "reported_uuids": reported_uuids,
@@ -258,8 +279,8 @@ class GpuKernelCountCheck:
             }
         )
 
-        event = self._render_event(ctx, kernel_check_fields)
-        if would_fail:
+        event = self._render_event(ctx, kernel_check_fields, enforced)
+        if would_fail and enforced:
             # A node with a renter's pod on it keeps being verified, so the failure stops the
             # run only when there is no live rental; the flag zeroes the score in either case.
             return CheckResult(
@@ -270,10 +291,14 @@ class GpuKernelCountCheck:
             )
         return CheckResult(passed=True, event=event)
 
-    def _render_event(self, ctx: Context, kernel_check_fields: dict[str, Any]) -> ValidationEvent:
+    def _render_event(
+        self, ctx: Context, kernel_check_fields: dict[str, Any], enforced: bool = True
+    ) -> ValidationEvent:
         """The event for a finished evaluation."""
         if kernel_check_fields["kernel_verdict"] == "unattachable":
             template = Msg.UNATTACHABLE
+        elif kernel_check_fields["would_fail"] and not enforced:
+            template = Msg.COUNT_MISMATCH_HOST_SHADOW
         elif kernel_check_fields["would_fail"]:
             template = Msg.COUNT_MISMATCH
         else:
