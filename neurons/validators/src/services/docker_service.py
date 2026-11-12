@@ -5880,6 +5880,7 @@ class DockerService:
         rm_deadline = min(cleanup_deadline, asyncio.get_running_loop().time() + rm_timeout)
         started = time.monotonic()
         timeout_error: TimeoutError | None = None
+        rm_stderr = None
         try:
             # asyncssh's timeout= bounds only the command, not its channel open
             async with asyncio.timeout_at(rm_deadline):
@@ -5894,6 +5895,7 @@ class DockerService:
             rm_exit_status, listing_after = None, None
         else:
             rm_exit_status, listing_after = _parse_remove_and_list_containers(result.stdout or "")
+            rm_stderr = (result.stderr or "").strip()[:500]
             rm_error = Exception(
                 f"[clean_existing_containers] command: {command} exit_code {rm_exit_status}, "
                 f"stderr: {(result.stderr or '').strip()}"
@@ -5941,7 +5943,12 @@ class DockerService:
                     logger.info(
                         _m(
                             "docker rm -fv failed with containers still on the host; retrying those",
-                            extra=get_extra_info({**default_extra, "container_names": still_present}),
+                            # why dockerd refused: a retry that then hangs left no cause (9, 12 Nov)
+                            extra=get_extra_info({
+                                **default_extra,
+                                "container_names": still_present,
+                                "rm_stderr": rm_stderr,
+                            }),
                         ),
                     )
                     await self._rm_containers(
