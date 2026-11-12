@@ -32,6 +32,7 @@ async def test_spec_change_check(
 
     if expect_clear:
         assert result.updates.get("clear_verified_job_info") is True
+        assert result.updates.get("gpu_respec") is True
     else:
         assert "clear_verified_job_info" not in result.updates
 
