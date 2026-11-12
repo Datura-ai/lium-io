@@ -316,12 +316,14 @@ async def storage_operation_open(ctx: Context, operation_id: str) -> bool | None
 
 
 def executor_stack_container_ids(specs: dict[str, Any]) -> set[str]:
-    """Ids of the containers running the executor's own image.
+    """Ids of the executor's own stack: `docker.container_id` (the executor, where the scrape
+    runs) and at most ONE other container on its image digest (the monitor).
 
-    `docker.container_id` names one of them, but the stack runs that image TWICE - `executor`
-    and `monitor` - so the id alone leaves the second one looking like a stranger's workload.
-    They are matched by image digest instead. The stack's other containers (postgres, autoheal)
-    run other images and stay on the provider's side, where their idle load belongs.
+    Any container started from the executor image carries its digest, so a match alone proves
+    nothing: every further match is the provider's load (DAH-6251). Of the matches the one
+    holding the fewest cores is excused, so a container started beside the stack is never the
+    one that goes free. The stack's other containers (postgres, autoheal) run other images and
+    stay on the provider's side, where their idle load belongs.
     """
     docker_info = specs.get("docker")
     executor_id = (
@@ -330,20 +332,31 @@ def executor_stack_container_ids(specs: dict[str, Any]) -> set[str]:
     rows = docker_containers(specs)
     executor_digest = next((row.digest for row in rows if row.container_id == executor_id), "")
     ids: set[str] = {executor_id}
-    if executor_digest:
-        ids.update(row.container_id for row in rows if row.digest == executor_digest)
+    others = [
+        row for row in rows if executor_digest and row.digest == executor_digest and row.container_id != executor_id
+    ]
+    if others:
+        ids.add(min(others, key=lambda row: row.cpu_percent or 0.0).container_id)
     # an empty id is "the scrape did not say", never a container to excuse
     ids.discard("")
     return ids
 
 
 def executor_stack_excuse(specs: dict[str, Any]) -> tuple[int, float]:
-    """How many containers the executor's image digest excuses, and the cores they held in the
-    scrape window. Any container started from that image carries the digest, so this tier is as
-    free to claim as a name: the stack is two containers, and what they hold is the scrape."""
+    """How many containers the executor's stack excuses (at most two), and the cores they held in
+    the scrape window."""
     stack_ids = executor_stack_container_ids(specs)
     rows = [row for row in docker_containers(specs) if row.container_id in stack_ids]
     return len(rows), round(sum(row.cpu_percent or 0.0 for row in rows) / 100, 2)
+
+
+def executor_monitor_cores(specs: dict[str, Any]) -> float:
+    """Cores of the stack's second container (the monitor), recorded to size its own cap."""
+    docker_info = specs.get("docker")
+    executor_id = docker_info.get("container_id") if isinstance(docker_info, dict) else None
+    monitor_ids = executor_stack_container_ids(specs) - {executor_id}
+    rows = [row for row in docker_containers(specs) if row.container_id in monitor_ids]
+    return round(sum(row.cpu_percent or 0.0 for row in rows) / 100, 2)
 
 
 def stack_excuse_is_over_its_cap(specs: dict[str, Any]) -> bool:
@@ -536,6 +549,7 @@ class ProviderSideLoadCheck:
         return {
             "executor_stack_containers": stack_containers,
             "executor_stack_cores": stack_cores,
+            "executor_monitor_cores": executor_monitor_cores(ctx.state.specs or {}),
             "executor_uuid": ctx.executor.uuid,
             "provider_cpu_cores": provider_side_load.cpu_cores,
             "provider_disk_gb": (
