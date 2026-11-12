@@ -1362,12 +1362,17 @@ class _FillerRemovalStuck(Exception):
 
 
 class _FillerBesideCustomerContainer(Exception):
-    """Raised by a customer create's running check: a `filler_*` on the host survived its removal, the host
-    could not be listed to confirm there is none, or the removed filler's GPU power restore did not finish."""
+    """Raised by a customer create's running check: a `filler_*` on the host survived its removal, or the host
+    could not be listed to confirm there is none."""
 
 
 class _FillerRestoreStateUnavailable(Exception):
     """A customer final check could not confirm platform GPU power restore state."""
+
+
+class _FillerPowerRestoreFailed(Exception):
+    """A customer final check could not restore or read the removed filler's GPU power on the host (nvidia-smi):
+    the host's failure, reported at `gpu_power_restore` so a known filler run does not excuse it."""
 
 
 class _FillerRefusedBesideUnlistedPod(_FillerRefusedForCustomerCreate):
@@ -5260,7 +5265,7 @@ class DockerService:
                     f"GPU power restore state after removing {name} could not be confirmed"
                 ) from exc
             except RuntimeError as exc:
-                raise _FillerBesideCustomerContainer(
+                raise _FillerPowerRestoreFailed(
                     f"GPU power restoration after removing {name} could not be confirmed"
                 ) from exc
 
@@ -11309,6 +11314,9 @@ class DockerService:
                         )
                     except _FillerRestoreStateUnavailable:
                         current_step = "gpu_power_restore_state"
+                        raise
+                    except _FillerPowerRestoreFailed:
+                        current_step = "gpu_power_restore"  # the host's nvidia-smi, as in the pre-run restore
                         raise
                     except _FillerBesideCustomerContainer:
                         # the sweep's own rm and listing, failed after `docker run`: the backend counts this
