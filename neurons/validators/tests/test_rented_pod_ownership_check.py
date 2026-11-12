@@ -96,6 +96,17 @@ async def test_a_pod_not_read_back_is_unread_not_ok(context_factory, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_an_unread_pod_names_the_reads_that_came_back_empty(context_factory, tmp_path):
+    # the pod's /proc root cannot be stat'ed from the session: the event says so instead of a bare unread
+    _proc(tmp_path, 4242, f"         0     {os.getuid()}      65536\n")
+    (tmp_path / "4343").mkdir()
+    (tmp_path / "4343" / "uid_map").write_text("         0     100000      65536\n")
+    result = await RentedPodOwnershipCheck().run(_ctx(context_factory, _ssh(str(tmp_path))))
+    assert result.event.reason_code == Msg.UNREAD.reason
+    assert result.event.what_we_saw["empty_reads"] == {"pod_2": ["/", "/root"]}
+
+
+@pytest.mark.asyncio
 async def test_malformed_ssh_output_is_unread_and_does_not_raise(context_factory):
     async def run(cmd, check=False):
         if cmd.startswith("/usr/bin/docker inspect"):
@@ -154,15 +165,15 @@ def test_read_command_reports_a_missing_pid_without_failing(tmp_path):
 @pytest.mark.parametrize(
     "line, outside",
     [
-        ("4242|0 100000 65536|100000|", None),  # /root unread, / fine: unknown, not healthy
-        ("4242|0 100000 65536||100000", None),  # / unread, /root fine
-        ("4242|0 100000 65536|7|", ["/"]),  # / shifted proves it even with /root unread
+        ("4242|0 100000 65536|100000|", []),  # /root unread (no /root in the image): / alone decides
+        ("4242|0 100000 65536|7|", ["/"]),  # / shifted with /root unread
+        ("4242|0 100000 65536||100000", None),  # / unread, /root fine: unknown, not healthy
         ("4242|0 100000 65536||7", ["/root"]),  # /root shifted proves it even with / unread
         ("4242|0 100000 65536||", None),
         ("4242|0 100000 65536|100000|100000", []),
     ],
 )
-def test_an_unread_path_is_unknown_unless_the_other_is_shifted(line, outside):
+def test_an_unread_root_home_is_judged_from_slash_and_an_unread_slash_is_unknown(line, outside):
     pod = judge(line)
     if outside is None:
         assert pod is None

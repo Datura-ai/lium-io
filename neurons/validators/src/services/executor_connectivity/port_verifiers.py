@@ -31,6 +31,8 @@ class ContainerStartWatch:
 
     in_progress: bool = False
     started_at: float = 0.0  # loop time the in-progress start began
+    # the ports that answered so far: an attempt whose deadline fires after they answered still returns them
+    verified: BatchResult | None = None
 
 
 class BatchVerifier:
@@ -38,6 +40,9 @@ class BatchVerifier:
 
     REPROBE_DELAY_SEC = 3
     REPROBE_ROUNDS = 5  # ~15s budget: a filler download can hold a loaded host past one 3s window
+    # the published sample already met the floor: a late host listener answers within seconds, while a host that
+    # drops its host ports (ufw default deny) never does and must reach the semi-batch tier without the full budget
+    SAMPLE_ONLY_REPROBE_ROUNDS = 2
     ATTEMPT_TIMEOUT_SEC = 60
     # a start the attempt deadline cut off counts as hung only if it had this long: on a slow host the outside
     # probe's container can use most of the 60 s, leaving the batch start seconds before the deadline
@@ -100,6 +105,17 @@ class BatchVerifier:
                     await asyncio.sleep(2)
 
             except asyncio.TimeoutError:
+                if start_watch.verified and len(start_watch.verified.successful) >= min_ports:
+                    # the deadline fired after enough ports answered (a loaded host's starts use
+                    # most of the 60 s); fewer than min_ports would fail the port check, so
+                    # attempt 2 and the slower tiers run
+                    logger.info(
+                        _m(
+                            f"complete: {len(start_watch.verified.successful)}/{len(ports)} verified at the deadline",
+                            extra=get_extra_info(log_ctx),
+                        )
+                    )
+                    return start_watch.verified
                 start_hung += start_watch.in_progress and (
                     asyncio.get_running_loop().time() - start_watch.started_at >= self.HUNG_START_MIN_SEC
                 )
@@ -110,7 +126,6 @@ class BatchVerifier:
                         extra=get_extra_info(log_ctx),
                     )
                 )
-                await self.runner.cleanup(ssh_client, container_name)
                 if attempt < max_attempts:
                     await asyncio.sleep(2)
 
@@ -119,9 +134,15 @@ class BatchVerifier:
                     _m(f"attempt {attempt} failed: {e}", extra=get_extra_info(log_ctx)),
                     exc_info=True,
                 )
-                await self.runner.cleanup(ssh_client, container_name)
                 if attempt < max_attempts:
                     await asyncio.sleep(2)
+
+            finally:
+                # DAH-5868: outside wait_for, so a slow cleanup cannot time out an attempt whose ports answered
+                try:
+                    await self.runner.cleanup(ssh_client, container_name)
+                except Exception as e:
+                    logger.debug(_m(f"cleanup failed: {str(e)[:50]}", extra=get_extra_info(log_ctx)))
 
         # DAH-3593: the outcome is the PortCountCheck verdict ("Port verification failed"); the
         # attempts and tiers on the way there are DEBUG. An exception inside an attempt keeps
@@ -158,6 +179,10 @@ class BatchVerifier:
         if not ports_left:
             return BatchResult(sampled_ok, [], external)
 
+        def ports_answered_so_far() -> BatchResult:
+            ok = set(sampled_ok + successful)
+            return BatchResult([p for p in ports if p in ok], failed, external)
+
         script = NetcatScript.batch(ports_left, token, 0)
         start_result = await self._start_container(start_watch, ssh_client, name, script, "host", 60)
         if not start_result.ok:
@@ -169,32 +194,32 @@ class BatchVerifier:
             )
             return BatchResult([], ports, external)
 
-        try:
-            async with aiohttp.ClientSession(connector=public_host_connector(limit=0)) as session:
-                successful, failed = await self.port_tester.test_many(session, host, ports_left, token, log_ctx)
-                # a loaded host binds its nc listeners late; a refused port's listener is still waiting, so
-                # re-probe the refused ports while the count is below what PortCountCheck needs to list the node
-                for round_no in range(1, self.REPROBE_ROUNDS + 1):
-                    if not failed or len(sampled_ok) + len(successful) >= min_ports:
-                        break
-                    await asyncio.sleep(self.REPROBE_DELAY_SEC)
-                    late, failed = await self.port_tester.test_many(session, host, failed, token, log_ctx)
-                    successful = successful + late
-                    logger.debug(
-                        _m(f"re-probe {round_no}/{self.REPROBE_ROUNDS}: {len(late)} late", extra=get_extra_info(log_ctx))
-                    )
-                logger.info(
-                    _m(f"progress: {len(successful)}/{len(ports)} verified", extra=get_extra_info(log_ctx))
+        async with aiohttp.ClientSession(connector=public_host_connector(limit=0)) as session:
+            successful, failed = await self.port_tester.test_many(session, host, ports_left, token, log_ctx)
+            start_watch.verified = ports_answered_so_far() if successful else None
+            # a loaded host binds its nc listeners late; a refused port's listener is still waiting, so
+            # re-probe the refused ports while the count is below what PortCountCheck needs to list the node;
+            # the published sample alone never ends it: with no host-listener answer the attempt fails below
+            rounds = self.SAMPLE_ONLY_REPROBE_ROUNDS if len(sampled_ok) >= min_ports else self.REPROBE_ROUNDS
+            for round_no in range(1, rounds + 1):
+                if not failed or (successful and len(sampled_ok) + len(successful) >= min_ports):
+                    break
+                await asyncio.sleep(self.REPROBE_DELAY_SEC)
+                late, failed = await self.port_tester.test_many(session, host, failed, token, log_ctx)
+                successful = successful + late
+                start_watch.verified = ports_answered_so_far() if successful else None
+                logger.debug(
+                    _m(f"re-probe {round_no}/{rounds}: {len(late)} late", extra=get_extra_info(log_ctx))
                 )
-        finally:
-            await self.runner.cleanup(ssh_client, name)
+            logger.info(
+                _m(f"progress: {len(successful)}/{len(ports)} verified", extra=get_extra_info(log_ctx))
+            )
 
         if not successful:
             # DAH-5597: only the host listener decides this tier; a host that drops INPUT but forwards published
             # ports answers the published sample, and must still reach the semi-batch tier
             return BatchResult([], ports, external)
-        answered = set(sampled_ok + successful)
-        return BatchResult([p for p in ports if p in answered], failed, external)
+        return ports_answered_so_far()
 
     async def _start_container(
         self,
