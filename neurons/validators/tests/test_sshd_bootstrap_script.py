@@ -545,22 +545,25 @@ def test_a_non_lock_apt_failure_is_not_retried(harness):
 
 
 @pytest.mark.parametrize(
-    "failed_suites, falls_back",
+    "failed, falls_back",
     [
-        (["noble-backports"], False),
-        (["noble-updates"], False),  # Ubuntu mirror mid-sync: noble + noble-security still carry a patched openssh
-        (["noble-security"], False),
-        (["noble-updates", "noble-security"], True),  # only the release openssh left: take the full path
-        (["noble"], True),
+        ([("E", "noble-backports")], False),
+        ([("E", "noble-updates")], False),  # Ubuntu mirror mid-sync: noble + noble-security still carry openssh's fixes
+        ([("E", "noble-updates"), ("W", "noble-backports")], False),
+        ([("E", "noble-security")], True),  # the security pocket is the one that must arrive
+        ([("E", "noble-updates"), ("W", "noble-security")], True),  # an unreachable security InRelease counts too
+        ([("E", "noble")], True),
     ],
 )
-def test_a_failed_list_fetch_installs_from_the_lists_that_arrived(harness, failed_suites, falls_back):
+def test_a_failed_list_fetch_installs_from_the_lists_that_arrived(harness, failed, falls_back):
     harness.stage_sshd_payload(SSHD_STARTS)
     (harness.apt_etc / "sources.list").write_text("deb http://archive.ubuntu.com/ubuntu noble main\n")
     errs = "".join(
         f"E: Failed to fetch http://archive.ubuntu.com/ubuntu/dists/{s}/main/binary-amd64/Packages.gz"
         "  File has unexpected size (1 != 2). Mirror sync in progress?\n"
-        for s in failed_suites
+        if level == "E"
+        else f"W: Failed to fetch http://archive.ubuntu.com/ubuntu/dists/{s}/InRelease  Temporary failure resolving x\n"
+        for level, s in failed
     )
     fail = f"case \"$*\" in update*SourceList*) printf '%s' '{errs}' >&2; exit 100 ;; esac\ncase"
     harness._write_executable(harness.shims / "apt-get", APT_GET_SHIM.replace("case", fail, 1))

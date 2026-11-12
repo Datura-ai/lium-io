@@ -205,20 +205,18 @@ apt_get() {
 }
 
 # A failed index fetch (Ubuntu's "Mirror sync in progress?", a dead backports mirror) leaves the
-# other lists usable: install from them, unless the base suite failed or neither -updates nor
-# -security arrived (a patched openssh needs one of the two). Reads the last apt_get's stderr.
+# other lists usable: install from them when only -updates or -backports failed. The base suite
+# and -security (the pocket that carries openssh's security fixes) must have arrived. Both E:
+# (bad index) and W: (unreachable InRelease) failures count. Reads the last apt_get's stderr.
 apt_lists_usable() {
-    failed="$(sed -n 's|^E: Failed to fetch .*/dists/\([^/ ]*\)/.*|\1|p' "$RUN_DIR/lium-apt.err" | sort -u)"
+    failed="$(sed -n 's|^[EW]: Failed to fetch .*/dists/\([^/ ]*\)/.*|\1|p' "$RUN_DIR/lium-apt.err" | sort -u)"
     [ -n "$failed" ] || return 1
     for suite in $failed; do
         case "$suite" in
-            *-backports | *-updates | *-security | *-proposed) ;;
+            *-backports | *-updates) ;;
             *) return 1 ;;
         esac
     done
-    case "$failed" in
-        *-updates*-security* | *-security*-updates*) return 1 ;;
-    esac
     log "Some package lists failed to download; installing from the rest"
 }
 
