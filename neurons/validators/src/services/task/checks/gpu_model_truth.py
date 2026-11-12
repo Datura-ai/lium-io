@@ -114,12 +114,21 @@ def gpu_model_mismatch(machine_spec: Any, metrics: Any, card_index: int = 0) -> 
     )
 
 
-def first_gpu_model_mismatch(
+def gpu_model_mismatches(
     machine_spec: Any, metrics: Any, card_metrics: dict[int, dict] | None = None
-) -> GpuModelMismatch | None:
-    """The first card below its reported model: device 0 from the capability matmul, then each
-    card the all-cards probe measured under its own seal."""
-    found = gpu_model_mismatch(machine_spec, metrics)
-    for index, measured in sorted((card_metrics or {}).items()):
-        found = found or gpu_model_mismatch(machine_spec, measured, index)
-    return found
+) -> list[GpuModelMismatch]:
+    """Every card below its reported model: device 0 from the capability matmul, then each card
+    the all-cards probe measured under its own seal."""
+    found = [gpu_model_mismatch(machine_spec, metrics)]
+    found += [gpu_model_mismatch(machine_spec, m, i) for i, m in sorted((card_metrics or {}).items())]
+    return list({m.card_index: m for m in found if m is not None}.values())
+
+
+def judged_cards(metrics: Any, card_metrics: dict[int, dict] | None = None) -> set[int]:
+    """The cards a run gave both numbers for: only these can clear a stored mismatch."""
+    runs = {0: metrics, **(card_metrics or {})}
+    return {
+        i
+        for i, m in runs.items()
+        if isinstance(m, dict) and _cc_version(m.get("cc")) and _sm_count(m.get("sm_count")) is not None
+    }

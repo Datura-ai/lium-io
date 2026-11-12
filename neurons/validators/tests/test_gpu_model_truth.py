@@ -133,12 +133,12 @@ FAKE_H100 = ("NVIDIA H100 80GB HBM3", {"cc": "8.0", "sm_count": 108})
 REAL_H100 = ("NVIDIA H100 80GB HBM3", {"cc": "9.0", "sm_count": 132})
 
 
-def _filler_ctx(context_factory, redis, metrics, *, success=True):
+def _filler_ctx(context_factory, redis, metrics, *, success=True, specs=None):
     service = SamplingValidationService(
         result=ValidationResult(success=success, error_message="" if success else "no memory", metrics=metrics)
     )
     state = build_state(
-        specs=_specs(FAKE_H100[0]),
+        specs=specs or _specs(FAKE_H100[0]),
         rented_data=RentedExecutorsResponse(
             executors={}, banned_guids=[], filler_containers_by_executor={"executor-123": "filler_active"}
         ),
@@ -234,7 +234,7 @@ async def test_a_redis_outage_neither_fails_nor_samples_a_filler_node(context_fa
 
 
 def _verdict_key() -> str:
-    return capability.GPU_MODEL_VERDICT_KEY.format(executor_uuid="executor-123")
+    return capability.GPU_MODEL_VERDICT_KEY.format(miner_hotkey="miner-hotkey", executor_uuid="executor-123")
 
 
 # --- every card, a rented node, and a model the node stops reporting
@@ -266,7 +266,7 @@ async def test_a_faked_card_after_card_0_fails_from_its_own_sealed_metrics(conte
 
     assert result.passed is False
     assert result.event.reason_code == Msg.GPU_MODEL_MISMATCH.reason
-    assert json.loads(redis.store[_verdict_key()])["mismatch"]["card_index"] == 1
+    assert [m["card_index"] for m in json.loads(redis.store[_verdict_key()])["mismatches"]] == [1]
 
 
 def _rented(specs: dict, redis) -> object:
@@ -304,6 +304,7 @@ async def test_a_rented_node_with_a_stored_mismatch_fails_before_the_rented_halt
 
     assert result.passed is False
     assert result.event.reason_code == Msg.GPU_MODEL_MISMATCH.reason
+    assert result.fatal is False  # the rental is still verified and billed
     assert no_matmul.called_with is None  # nothing runs beside the renter's pod
 
 
@@ -352,3 +353,44 @@ async def test_a_filler_node_that_now_reports_another_model_is_sampled_again(con
 
     assert len(service.budgets) == 1  # no verdict for the new model: judged now
     assert result.passed is True  # an A100 is not in the table, so it is not judged
+
+
+@pytest.mark.asyncio
+async def test_a_verdict_stored_under_another_miner_does_not_judge_this_node(context_factory):
+    redis = FakeRedis()
+    other = DummyValidationService(success=True, metrics=FAKE_H100[1])
+    ctx = context_factory(
+        services=build_services(validation=other, redis=redis),
+        state=build_state(specs=_specs(FAKE_H100[0])),
+        miner_hotkey="other-miner",
+    )
+    assert (await CapabilityCheck().run(ctx)).passed is False
+
+    result = await _verdict_check(context_factory, redis, _rented(_specs(FAKE_H100[0]), redis))
+
+    assert result.passed is True
+
+
+@pytest.mark.asyncio
+async def test_a_filler_sample_passing_on_another_card_keeps_a_cards_stored_mismatch(
+    context_factory, monkeypatch
+):
+    redis = FakeRedis()
+    service = DummyValidationService(success=True, metrics=FAKE_H100[1])
+    ctx = context_factory(
+        services=build_services(validation=service, redis=redis),
+        config=build_context_config(),
+        state=build_state(specs=_two_card_specs()),
+    )
+    assert (await CapabilityCheck().run(ctx)).passed is False  # card 0 is the faked one
+    monkeypatch.setattr(capability, "_filler_matmul_sample_due", lambda ctx, cycle: True)
+    monkeypatch.setattr(capability, "_filler_sample_offset", lambda ctx: 0)
+    monkeypatch.setattr(capability, "_filler_cycle_index", lambda ctx: 1)  # card 1's turn
+    monkeypatch.setattr(capability.settings, "FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES", 1)
+
+    ctx, sampler = _filler_ctx(context_factory, redis, REAL_H100[1], specs=_two_card_specs())
+    result = await CapabilityCheck().run(ctx)
+
+    assert sampler.gpu_uuids == ["GPU-1"]
+    assert result.passed is False
+    assert result.event.what_we_saw["card_index"] == 0
