@@ -242,7 +242,7 @@ These are the commands `.github/workflows/test.yml` (**Tests**) runs on every pu
 
 Tests follow Arrange-Act-Assert, one behavior per function; `ruff format` (pre-commit hook in `.pre-commit-config.yaml`, not run in CI) is the formatter.
 
-Other checks: **image-pins** runs only when a compose file, an env template or its script changes, plus daily on `main`. **CodeQL** comes from default setup while it is on; `.github/workflows/codeql.yml` then skips every job, and analyses once default setup is switched off and the repository variable `CODEQL_ADVANCED` is `true`.
+Other checks: **image-pins** runs only when a compose file, an env template or its script changes, plus daily on `main`. **CodeQL** comes from default setup while it is on; `.github/workflows/codeql.yml` then skips every job; once default setup is switched off and the repository variable `CODEQL_ADVANCED` is `true`, it analyses every PR, merge group and push to `main`.
 
 ## Releases
 
