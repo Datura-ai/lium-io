@@ -123,8 +123,14 @@ async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardH
     every_card_tied = every_card_named and all(isinstance(gpu.get("pci_bus_id"), str) for gpu in listed)
     # after a reboot the kernel clock starts over, so the old baseline no longer orders the lines
     last_ts = xid.get("last_ts") if type(xid.get("last_ts")) in (int, float) else None
-    takes_baseline = xid.get("available") and (every_card_tied or before.xid_after is None or rebooted)
-    xid_after = last_ts if takes_baseline else before.xid_after
+    uses_this_read_as_xid_baseline = xid.get("available") and (
+        every_card_tied or before.xid_after is None or rebooted
+    )
+    if uses_this_read_as_xid_baseline:
+        xid_after = last_ts
+    else:
+        # an old boot's time would skip this boot's early lines: start the new boot from its first line
+        xid_after = 0.0 if rebooted else before.xid_after
     scraped_uuids = {str(d["uuid"]) for d in ctx.state.gpu_details or [] if isinstance(d, dict) and d.get("uuid")}
     held = [f for f in before.held if not _held_fault_proven_healed(f, gpus, every_card_named, rebooted, scraped_uuids)]
     # one fault per card, this read's first: a card repeating an Xid must not grow the stored state
@@ -157,6 +163,8 @@ async def read_memory_health(ctx: Context) -> MemoryHealthRead:
     command = f"{shlex.quote(ctx.executor.python_path)} -I - --nvml-only"
     if before is not None and before.xid_after is not None:
         command += f" --xid-after {before.xid_after}"
+        if before.boot_id is not None:
+            command += f" --xid-boot {shlex.quote(before.boot_id)}"
     run = await ctx.runner.run(
         command, timeout=TIMEOUT_SECONDS, retryable=False, stdin_text=probe_source()
     )

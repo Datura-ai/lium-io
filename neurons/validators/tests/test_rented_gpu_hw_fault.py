@@ -64,6 +64,21 @@ def test_no_baseline_no_new_line_or_an_unreadable_log_flags_nothing(lines, xid_a
     assert _card_xids(lines, xid_after=xid_after, available=available) == []
 
 
+@pytest.mark.parametrize(
+    "xid_boot, this_boot, expected",
+    [
+        pytest.param("boot-a", "boot-a", 500.0, id="same-boot-keeps-the-baseline"),
+        pytest.param("boot-a", "boot-b", 0.0, id="new-boot-judges-every-line"),
+        pytest.param(None, "boot-b", 500.0, id="no-stored-boot"),
+        pytest.param("boot-a", None, 500.0, id="boot-not-readable"),
+    ],
+)
+def test_a_baseline_from_another_boot_judges_the_new_boot_from_its_first_line(xid_boot, this_boot, expected):
+    ns = _probe_namespace("xid_after_for_this_boot")
+
+    assert ns["xid_after_for_this_boot"](500.0, xid_boot, this_boot) == expected
+
+
 def test_nvml_only_reports_the_xid_read_and_the_card_lists():
     run = subprocess.run(
         [sys.executable, "-I", "-", "--nvml-only", "--xid-after", "0"],
@@ -118,6 +133,17 @@ async def test_the_xid_baseline_is_kept_and_passed_to_the_next_read(context_fact
 
 
 @pytest.mark.asyncio
+async def test_the_baseline_carries_its_boot_and_a_reboot_without_a_log_read_starts_over(context_factory):
+    services = _services()
+    await _read(context_factory, services, _ok(xid={"available": True, "last_ts": 900}, boot_id="boot-a"))
+    _, cmd = await _read(context_factory, services, _ok(xid={"available": False, "error": "denied"}, boot_id="boot-b"))
+    assert cmd.endswith("--nvml-only --xid-after 900 --xid-boot boot-a")
+    # the old boot's 900 would skip the new boot's first lines on the next read (review)
+    assert _stored(services.redis)["xid_after"] == 0.0
+    assert _stored(services.redis)["boot_id"] == "boot-b"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("unread", ["uuid", "pci_bus_id"])
 async def test_a_card_nvml_could_not_name_keeps_the_xid_baseline(context_factory, unread):
     services = _services()
@@ -130,7 +156,7 @@ async def test_a_card_nvml_could_not_name_keeps_the_xid_baseline(context_factory
 @pytest.mark.asyncio
 async def test_a_first_read_with_an_untied_card_still_takes_the_xid_baseline(context_factory):
     services = _services()
-    # no baseline yet: the probe judged no lines, so the count is the baseline even if a card is untied (review)
+    # no baseline yet: the probe judged no lines, so the last line's time is the baseline even if a card is untied (review)
     await _read(context_factory, services, _ok(gpu={"pci_bus_id": None}, xid={"available": True, "last_ts": 4}))
     assert _stored(services.redis)["xid_after"] == 4
 
@@ -155,7 +181,7 @@ async def test_a_reboot_heals_a_held_xid_even_when_a_card_is_missing_from_a_part
 async def test_a_reboot_takes_the_new_xid_baseline_even_with_an_untied_card(context_factory):
     services = _services()
     await _read(context_factory, services, _ok(xid={"available": True, "last_ts": 9}, boot_id="boot-a"))
-    # the new boot's log is shorter than the old baseline: keeping 9 would hide its next Xids (review)
+    # the new boot's kernel clock starts over below the old baseline: keeping 9 would hide its next Xids (review)
     await _read(
         context_factory, services, _ok(gpu={"pci_bus_id": None}, xid={"available": True, "last_ts": 2}, boot_id="boot-b")
     )
@@ -186,7 +212,7 @@ async def test_an_xid_fault_holds_until_the_host_boots_again(context_factory):
     )
     quiet, _ = await _read(context_factory, services, _ok(xid={"available": True, "last_ts": 5}, **boot))
     unread, _ = await _read(context_factory, services, _ok(xid={"available": False, "error": "denied"}, **boot))
-    # a cleared or wrapped kernel log shrinks the count on the same boot: no proof
+    # a cleared or wrapped kernel log moves the last line's time back on the same boot: no proof
     cleared, _ = await _read(context_factory, services, _ok(xid={"available": True, "last_ts": 1}, **boot))
     no_boot_id, _ = await _read(context_factory, services, _ok(xid={"available": True, "last_ts": 1}))
     rebooted, _ = await _read(context_factory, services, _ok(xid={"available": True, "last_ts": 1}, boot_id="boot-b"))

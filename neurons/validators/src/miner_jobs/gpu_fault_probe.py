@@ -1117,9 +1117,17 @@ def boot_id() -> str | None:
         return None
 
 
-def print_nvml_health_report(mp, xid_after: float | None = None) -> None:
+def xid_after_for_this_boot(xid_after: float | None, xid_boot: str | None, this_boot: str | None) -> float | None:
+    """A baseline from another boot does not order this boot's lines: none of them is judged yet."""
+    if xid_after is not None and xid_boot is not None and this_boot not in (None, xid_boot):
+        return 0.0
+    return xid_after
+
+
+def print_nvml_health_report(mp, xid_after: float | None = None, xid_boot: str | None = None) -> None:
     """The `--nvml-only` verdict: one NVML snapshot and its standing memory faults, plus the cards'
     new hardware Xids."""
+    xid_after = xid_after_for_this_boot(xid_after, xid_boot, boot_id())
     snapshot = nvml_snapshot_forked(mp)
     flags, warnings = nvml_health(snapshot)
     status = "error" if not snapshot.get("available") else "flagged" if flags else "ok"
@@ -1159,6 +1167,10 @@ def main(argv: list[str]) -> int:
         help="with --nvml-only: kernel time of the last Xid line already judged; only later ones are new",
     )
     parser.add_argument(
+        "--xid-boot",
+        help="with --xid-after: the boot id that kernel time belongs to; on another boot every line is new",
+    )
+    parser.add_argument(
         "--hang-in-kernels-is-fault",
         action="store_true",
         help="a worker still in its kernels at the deadline is a fault, not an error (post-rental recheck)",
@@ -1171,7 +1183,7 @@ def main(argv: list[str]) -> int:
     # in the driver takes the worker, not the verdict, and the parent never initialises CUDA itself
     mp = multiprocessing.get_context("fork")
     if args.nvml_only:
-        print_nvml_health_report(mp, args.xid_after)
+        print_nvml_health_report(mp, args.xid_after, args.xid_boot)
         return 0
     try:
         indices = args.device if args.device else list(range(_device_count(mp)))
