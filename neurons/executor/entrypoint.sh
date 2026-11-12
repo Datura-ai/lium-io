@@ -122,6 +122,13 @@ if [ -n "$running_executor" ]; then
         sleep "${RUNNER_PROBE_RETRY_SECONDS:-300}"
         exit 1
     fi
+    # Pull the new images before the session check: a pull can take minutes, and a session the validator opens
+    # during it would be cut by the recreate below, which then only checks the registry.
+    if ! docker compose pull --quiet >/dev/null 2>&1; then
+        echo "Update held, running executor kept: the new images cannot be pulled. Retrying in ${RUNNER_PROBE_RETRY_SECONDS:-300}s."
+        sleep "${RUNNER_PROBE_RETRY_SECONDS:-300}"
+        exit 1
+    fi
     # sshd runs inside the executor, so a recreate cuts every open session. A root session is the validator
     # creating a pod or checking the node; cutting it fails that create (12 Nov 2026: a pod create lost SSH in
     # encrypted_volume_setup). Wait for it to close, at most RUNNER_SSH_HOLD_MAX_TRIES retries, so an update

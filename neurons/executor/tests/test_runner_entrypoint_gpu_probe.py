@@ -25,6 +25,7 @@ DOCKER_STUB = textwrap.dedent(
         "compose ps") echo "${STUB_RUNNING_EXECUTOR:-}" ;;
         "compose logs") exit 0 ;;
         "compose up") exit 0 ;;
+        "compose pull") exit "${STUB_PULL_EXIT:-0}" ;;
         "inspect --format") echo "sha256:executorimage" ;;
         "ps --all") echo "${STUB_PROBE_LEFTOVERS:-}" ;;
         "rm --force") exit "${STUB_RM_EXIT:-0}" ;;
@@ -224,3 +225,20 @@ def test_no_ssh_session_recreates_and_resets_the_hold(tmp_path):
 
     assert recreated(calls)
     assert (tmp_path / "hold").read_text() == ""
+
+
+def test_new_images_are_pulled_before_the_ssh_check_and_the_recreate(tmp_path):
+    result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123")
+
+    pull = calls.index("compose pull --quiet")
+    check = next(i for i, c in enumerate(calls) if c.startswith("exec abc123 sh -c"))
+    up = calls.index("compose up --pull always --detach --wait --force-recreate")
+    assert pull < check < up
+
+
+def test_a_failed_pull_holds_the_update(tmp_path):
+    result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_PULL_EXIT="1")
+
+    assert not recreated(calls)
+    assert not any(c.startswith("exec abc123") for c in calls)
+    assert "the new images cannot be pulled" in result.stdout
