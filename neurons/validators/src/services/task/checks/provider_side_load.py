@@ -5,6 +5,7 @@ import logging
 import math
 from dataclasses import dataclass
 from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Any
 
 from core.config import settings
@@ -50,6 +51,8 @@ CLAIMED_EXCUSE_CORES = PROVIDER_SIDE_CPU_CORES_LIMIT
 # and only up to restic's GOMAXPROCS: a container that merely wears the prefix, or takes a
 # helper's name after its operation ended, stays the provider's.
 STORAGE_HELPER_EXCUSE_CORES = 8.0
+# ...and only while its runner reported within this (it reports every 30 s; Rustam, DAH-6148)
+STORAGE_REPORT_MAX_AGE_SECONDS = 10 * 60
 
 # A second look before any money is withheld, the same rule the foreign-GPU twin follows with
 # the live card. The scrape's window is about two seconds, and Lium's own housekeeping
@@ -270,11 +273,7 @@ async def lium_containers(ctx: Context) -> set[str] | None:
         containers.update(f"{BUILD_DIND_PREFIX}{pod.pod_id}" for pod in rented_executor.pods)
     specs = ctx.state.specs or {}
     containers.update(await late_started_containers_the_backend_owns(ctx, containers))
-    containers.update(
-        await settle_excused_storage_helper_keys(
-            ctx.services.redis, ctx.executor.uuid, lambda op: storage_operation_open(ctx, op)
-        )
-    )
+    containers.update(await excused_storage_helper_keys(ctx))
     stack_ids: set[str] = executor_stack_container_ids(specs)
     if settings.PROVIDER_SIDE_LOAD_STACK_EXCUSE_CAP_ENABLED and stack_excuse_is_over_its_cap(specs):
         # like the name tier: over the cap the whole tier excuses nothing
@@ -285,14 +284,32 @@ async def lium_containers(ctx: Context) -> set[str] | None:
     return containers
 
 
+async def excused_storage_helper_keys(ctx: Context) -> set[str]:
+    return await settle_excused_storage_helper_keys(
+        ctx.services.redis, ctx.executor.uuid, lambda op: storage_operation_open(ctx, op)
+    )
+
+
 async def storage_operation_open(ctx: Context, operation_id: str) -> bool | None:
-    """Whether the backend still has the operation open; None when it did not answer."""
+    """True while the backend has the operation open and its runner reported within
+    STORAGE_REPORT_MAX_AGE_SECONDS; False once the backend ended it; None when it did not answer
+    or the open operation went quiet (the record stays, nothing is excused this cycle)."""
     try:
         answer = await ctx.services.backend.get_storage_operation_active(operation_id)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Storage operation %s status unreadable: %s", operation_id, exc)
         return None
-    return None if answer is None else answer.active
+    if answer is None or not answer.active:
+        return None if answer is None else False
+    # the progress token lives on the node, so open alone is not proof the helper still works
+    # for Lium: an operation whose runner stopped reporting excuses nothing
+    if answer.last_report_at is None:
+        return None
+    last_report_at = answer.last_report_at
+    if last_report_at.tzinfo is None:
+        last_report_at = last_report_at.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - last_report_at).total_seconds()
+    return True if age <= STORAGE_REPORT_MAX_AGE_SECONDS else None
 
 
 def executor_stack_container_ids(specs: dict[str, Any]) -> set[str]:
@@ -541,6 +558,9 @@ class ProviderSideLoadCheck:
         )
         if (measured.cpu_cores or 0.0) < PROVIDER_SIDE_CPU_CORES_LIMIT:
             return measured
+        if lium_container_keys is not None:
+            # a backup that started after the first read is excused on the second look too
+            lium_container_keys = lium_container_keys | await excused_storage_helper_keys(ctx)
         return replace(
             measured,
             cpu_cores=await self._resample_cpu_cores(ctx, lium_container_keys),

@@ -441,10 +441,12 @@ class FillerRunActiveResponse(BaseModel):
 
 
 class StorageOperationActiveResponse(BaseModel):
-    """DAH-6148: whether the backend still has a storage operation open (pending or running)."""
+    """DAH-6148: whether the backend still has a storage operation open (pending or running), and
+    when its runner last reported progress (before the first report: when it was created)."""
 
     active: bool
     status: str | None = None
+    last_report_at: datetime | None = None
 
 # DAH-2757: the states in which the backend still owns the container. `active` is not enough — the
 # backend sets it for RUNNING alone, and a filler the snapshot missed is usually still STARTING.

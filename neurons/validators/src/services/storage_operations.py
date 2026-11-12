@@ -121,7 +121,8 @@ async def settle_excused_storage_helper_keys(
 ) -> set[str]:
     """Drops the records whose operation ended and returns the helper keys to excuse.
 
-    `is_open` asks the backend whether the operation is still open (None: no answer). The node's
+    `is_open` asks the backend whether the operation is still open (None: no answer, or open but
+    its runner went quiet). The node's
     own runner files are never read: the provider can write them (DAH-6148). An open operation's
     helper is excused by its exact name; an ended one, or one past the TTL, loses its record. An
     operation the backend did not answer for keeps its record and excuses nothing this cycle, and

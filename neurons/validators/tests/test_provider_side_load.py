@@ -1,6 +1,7 @@
 """DAH-2734: provider-side CPU/disk gate — the twin of the DAH-2735 foreign-GPU gate."""
 import asyncio
 import time
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
@@ -781,7 +782,7 @@ def _helper_runner(name: str, helper_percent: float = 700.0, host_cores: float =
     return _on_node(runner, {OPERATION: "RUNNING"})
 
 
-def _backend_says(ctx, answer):
+def _backend_says(ctx, answer, report_age: int = 30):
     """The backend's answer on the operation: open (True), ended (False), none (None) or raise."""
     if isinstance(answer, Exception):
         mock = AsyncMock(side_effect=answer)
@@ -790,7 +791,9 @@ def _backend_says(ctx, answer):
     else:
         mock = AsyncMock(
             return_value=StorageOperationActiveResponse(
-                active=answer, status="RUNNING" if answer else "COMPLETED"
+                active=answer,
+                status="RUNNING" if answer else "COMPLETED",
+                last_report_at=datetime.now(timezone.utc) - timedelta(seconds=report_age),
             )
         )
     ctx.services.backend.get_storage_operation_active = mock
@@ -803,6 +806,7 @@ def _with_recorded_helpers(
     records: set[str] | None = None,
     age: int = 0,
     backend: object = True,
+    report_age: int = 30,
 ):
     """The operations this validator recorded when it started them here (DAH-6148).
 
@@ -813,7 +817,7 @@ def _with_recorded_helpers(
     redis.smembers = AsyncMock(side_effect=lambda key: {record.encode() for record in store})
     redis.srem = AsyncMock(side_effect=lambda key, record: store.discard(record))
     redis.sadd = AsyncMock(side_effect=lambda key, record: store.add(record))
-    return _backend_says(ctx, backend)
+    return _backend_says(ctx, backend, report_age)
 
 
 async def _provider_cores(ctx) -> float:
@@ -897,6 +901,43 @@ async def _cycle(context_factory, store: set[str], rows) -> float:
         context_factory(state=_rented_state(specs), runner=runner), records=store
     )
     return await _provider_cores(ctx)
+
+
+@pytest.mark.asyncio
+async def test_an_open_operation_whose_runner_went_quiet_excuses_nothing(context_factory):
+    # Rustam (DAH-6148): the backup's progress token is on the node, so open is not enough; a
+    # last report over 10 min old excuses nothing, and the record stays for when it reports again
+    store: set[str] = set()
+    ctx = _with_recorded_helpers(
+        context_factory(state=_rented_state(SN13_SPECS), runner=_helper_runner(BACKUP_HELPER)),
+        OPERATION,
+        records=store,
+        report_age=11 * 60,
+    )
+
+    assert await _provider_cores(ctx) == 8.9
+    assert len(store) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_backup_that_starts_before_the_second_look_is_lium_load(context_factory):
+    # the records are read again just before the second look, so a helper recorded after the
+    # first read is excused in the same cycle
+    store: set[str] = set()
+    ctx = _with_recorded_helpers(
+        context_factory(state=_rented_state(SN13_SPECS), runner=_helper_runner(BACKUP_HELPER)),
+        records=store,
+    )
+    first_read = ctx.services.redis.smembers.side_effect
+
+    def started_after_the_first_read(key):
+        store.add(f"{OPERATION}|{int(time.time())}")
+        ctx.services.redis.smembers.side_effect = first_read
+        return set()
+
+    ctx.services.redis.smembers.side_effect = started_after_the_first_read
+
+    assert await _provider_cores(ctx) == 1.9
 
 
 @pytest.mark.asyncio
