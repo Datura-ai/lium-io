@@ -123,9 +123,10 @@ class StaleContainerCleanupCheck:
         removed: list[str] = []
         confirmed: set[str] = set()  # names the backend's record shows were this node's ended Lium workload
         reserved: set[str] = set()  # labelled removals holding a GPU process: a lookup slot kept for each
+        grows: list[GrowPass] = []  # a finished grow pass: a later step cut by the budget must not lose its sizes
         try:
             async with asyncio.timeout(STALE_CLEANUP_BUDGET_SECONDS):
-                result = await self._run(ctx, queue, removed, confirmed, reserved)
+                result = await self._run(ctx, queue, removed, confirmed, reserved, grows)
         except TimeoutError:
             result = CheckResult(
                 passed=True,
@@ -141,6 +142,16 @@ class StaleContainerCleanupCheck:
             with contextlib.suppress(TimeoutError):
                 async with asyncio.timeout(GPU_EXEMPTION_BUDGET_AFTER_TIMEOUT_SECONDS):
                     await _confirm_ended_workloads_of_reserved_removals(ctx, removed, confirmed, reserved)
+            if grows and grows[0].attempted:
+                grown = grows[0]
+                # no read after the grow survived the cut: no free disk this cycle, as in _run's own no-read path
+                specs = specs_after_disk_taken(ctx, grown.allocated_bytes + grown.unreported_bytes, 0)
+                state = replace(
+                    ctx.state,
+                    volume_sizes_gb={**ctx.state.volume_sizes_gb, **grown.sizes_gb},
+                    specs=specs if specs is not None else ctx.state.specs,
+                )
+                result = result.model_copy(update={"updates": {"state": state}})
         # outside every budget: a claim a timeout cut would be written, then refused as already spent
         exempt = await queue.claim_gpu_exemptions(confirmed.intersection(removed))
         if not exempt:
@@ -157,6 +168,7 @@ class StaleContainerCleanupCheck:
         removed: list[str],
         confirmed: set[str],
         reserved: set[str],
+        grows: list[GrowPass] | None = None,
     ) -> CheckResult:
         # DAH-1932: when a miner re-adds an executor it gets a new subnet UUID for the same
         # IP:port. `rented_data` is keyed by UUID, so the tenant that is still running on the
@@ -273,6 +285,8 @@ class StaleContainerCleanupCheck:
             if grow_pod_ids and grow_budget > 0
             else GrowPass()
         )
+        if grows is not None:
+            grows.append(grown)
         volume_sizes_gb = grown.sizes_gb
 
         # DAH-2475: give the DPHN filler cache back when the node can no longer afford it. This is

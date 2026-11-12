@@ -611,6 +611,38 @@ async def test_the_cleanup_pass_judges_the_disk_it_measured_around_the_grow(
 
 
 @pytest.mark.asyncio
+async def test_a_grow_that_finished_keeps_its_sizes_when_the_reclaim_after_it_hangs_past_the_budget(monkeypatch):
+    from dataclasses import replace
+
+    from services.task.checks import stale_container_cleanup as module
+    from services.task.checks.disk_space import KB_PER_GB
+
+    from tests.test_container_cleanup import _cleanup_check_ctx
+
+    async def hang(**_kwargs):
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(module, "STALE_CLEANUP_BUDGET_SECONDS", 0.5)
+    monkeypatch.setattr(module, "SSH_CALL_TIMEOUT_SECONDS", 0.01)  # leaves the grow a share of the short budget
+    monkeypatch.setattr(module, "pod_ids_at_endpoint", lambda *_: {"live"})
+    monkeypatch.setattr(module, "host_free_bytes", AsyncMock(return_value=70 * GB))
+    monkeypatch.setattr(
+        module,
+        "grow_short_volumes",
+        AsyncMock(return_value=GrowPass(sizes_gb={"live": 466}, allocated_bytes=60 * GB, attempted=True)),
+    )
+    ctx = _cleanup_check_ctx([], [])
+    ctx.services.container_cleanup.reclaim_dphn_cache_when_disk_is_tight.side_effect = hang
+    disk = {"hard_disk": {"free": 70 * KB_PER_GB, "used": 30 * KB_PER_GB, "utilization": 30}}
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, specs=disk)})
+
+    state = (await asyncio.wait_for(module.StaleContainerCleanupCheck().run(ctx), 5)).updates["state"]
+
+    # the size the backend records survives the cut, and no free disk is published with no read after the grow
+    assert (state.volume_sizes_gb, state.specs["hard_disk"]["free"]) == ({"live": 466}, 0)
+
+
+@pytest.mark.asyncio
 async def test_with_no_task_time_left_the_pass_neither_measures_nor_grows(monkeypatch):
     from services.task.checks import stale_container_cleanup as module
 
