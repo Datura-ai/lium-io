@@ -152,15 +152,21 @@ async def credit_volumes_on_host(
 ) -> dict[str, int | None] | None:
     """The volumes the scrape counts as free disk (release_filler_cache) still on the host, each with the KB it holds
     now: an Engy cache emptied or removed since the scrape (the cleanup's sweep, a customer create's eviction) is free
-    in a raw read already. A filler run volume maps to None: preallocated, it holds its scraped size while it exists.
+    in a raw read already. A filler run volume maps to its backing file's allocated KB, the figure the scrape credits
+    (get_vloopback_volume_bytes), not the filesystem usage it stores in by_volume; 0 when no backing file is found.
     None when unread, out of time or any line is malformed."""
     if timeout_seconds <= 0:
         return None
     try:
         async with asyncio.timeout(timeout_seconds):
             result = await ssh_client.run(
-                "d=/usr/bin/docker; f=$($d volume ls -q --filter label=io.lium.workload=filler) || exit 1;"
-                ' e=$($d volume ls -q --filter name=engy_cache_) || exit 1; for v in $f; do echo "F $v"; done;'
+                "d=/usr/bin/docker; r=$($d info -f '{{.DockerRootDir}}') || exit 1;"
+                " f=$($d volume ls -q --filter label=io.lium.workload=filler) || exit 1;"
+                " e=$($d volume ls -q --filter name=engy_cache_) || exit 1;"
+                # the scrape's data dirs: inside a plugin rootfs, or on the host for the v2 and v3 plugins
+                ' for v in $f; do k=0; for b in /proc/1/root$r/plugins/*/rootfs$r/loopback/$v'
+                ' /proc/1/root$r/vloopback-v2/$v /proc/1/root$r/vloopback-v3/$v; do'
+                ' if [ -f "$b" ]; then s=$(du -sk "$b") || exit 1; set -- $s; k=$1; break; fi; done; echo "F $k $v"; done;'
                 " for v in $e; do m=$($d volume inspect -f '{{.Mountpoint}}' \"$v\") || exit 1;"
                 ' h=/proc/1/root$m; [ -d "$h" ] || h=$m; s=$(du -sk "$h") || exit 1; set -- $s; echo "E $1 $v"; done',
                 timeout=timeout_seconds,
@@ -173,8 +179,8 @@ async def credit_volumes_on_host(
     for line in result.stdout.splitlines():
         kind, _, rest = line.partition(" ")
         size, _, name = rest.partition(" ")
-        if kind == "F" and rest:
-            volumes[rest] = None
+        if kind == "F" and size.isdigit() and name:
+            volumes[name] = int(size)
         elif kind == "E" and size.isdigit() and name:
             # docker's name filter matches anywhere in the name; credit only what the scrape counts (its prefix)
             if name.startswith("engy_cache_"):

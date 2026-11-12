@@ -563,6 +563,37 @@ def test_the_read_after_the_pass_caps_on_the_scrapes_footing(
     assert specs["split_disk"]["listable_gpu_count"] == listable_gpus
 
 
+@pytest.mark.parametrize(
+    ("filler", "free_now_gb"),
+    [
+        # retained, mounted: its filesystem holds 5 GB of the 200 GB its preallocated backing file takes
+        ("mounted", 10),
+        # retained, unmounted: its filesystem holds nothing, the backing file still takes 200 GB
+        ("unmounted", 10),
+        # removed by the pass: the raw read after it has the 200 GB already
+        ("removed", 210),
+    ],
+)
+def test_a_filler_is_credited_its_backing_allocation_not_its_filesystem_usage(context_factory, filler, free_now_gb):
+    from services.task.checks.disk_space import KB_PER_GB, specs_after_disk_taken
+
+    from tests.test_disk_space_check import _split_state
+
+    # r4548229722: 240 GB scraped free, 200 of it the filler's backing file; a 30 GB grow leaves 10 GB raw free
+    state = _split_state(240, gpu_count=2, gpu_splitting_min_count=1, pods=(1,))
+    state.specs["hard_disk"]["used"] = 0
+    state.specs["hard_disk"]["filler_released"] = 200 * KB_PER_GB
+    state.specs["hard_disk"]["by_volume"] = {"filler_vol": (5 if filler == "mounted" else 0) * KB_PER_GB}
+    ctx = context_factory(state=state, rented=True)
+    credit = {} if filler == "removed" else {"filler_vol": 200 * KB_PER_GB}
+
+    specs = specs_after_disk_taken(ctx, 30 * GB, free_now_bytes=free_now_gb * GB, credit_volumes=credit)
+
+    # the listing and the paid GPU count judge the same 210 GB
+    assert specs["hard_disk"]["free"] == 210 * KB_PER_GB
+    assert specs["split_disk"]["listable_gpu_count"] == 1
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("free_reads_gb", "reported_gb", "unreported_gb", "free_after_gb"),
@@ -765,15 +796,16 @@ async def test_the_cap_credits_only_the_cache_volumes_still_on_the_host(
 
 @pytest.mark.asyncio
 async def test_credit_volumes_on_host_sizes_each_engy_cache_now():
-    # filler run volumes are preallocated (their scraped size stands); an Engy cache is sized as it is now
+    # a filler run volume is its backing file's allocated KB, as the scrape credits it; an Engy cache as it is now
     ssh = MagicMock()
-    stdout = "F filler_vol\nE 0 engy_cache_a\nE 42 engy_cache_b\n"
+    stdout = "F 209715200 filler_vol\nF 0 filler_gone\nE 0 engy_cache_a\nE 42 engy_cache_b\n"
     ssh.run = AsyncMock(return_value=MagicMock(exit_status=0, stdout=stdout))
 
-    expected = {"filler_vol": None, "engy_cache_a": 0, "engy_cache_b": 42}
+    expected = {"filler_vol": 209715200, "filler_gone": 0, "engy_cache_a": 0, "engy_cache_b": 42}
     assert await credit_volumes_on_host(ssh) == expected
     command = ssh.run.await_args.args[0]
     assert "du -sk" in command and "/proc/1/root" in command
+    assert "vloopback-v3/$v" in command and "rootfs$r/loopback/$v" in command
 
 
 @pytest.mark.asyncio
@@ -787,7 +819,7 @@ async def test_credit_volumes_on_host_credits_only_names_the_scrape_counts():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stdout", ["E x engy_cache_a\n", "E 5\n", "? engy_cache_a\n"])
+@pytest.mark.parametrize("stdout", ["E x engy_cache_a\n", "E 5\n", "? engy_cache_a\n", "F filler_vol\n"])
 async def test_credit_volumes_on_host_is_unread_on_a_malformed_line(stdout):
     ssh = MagicMock()
     ssh.run = AsyncMock(return_value=MagicMock(exit_status=0, stdout=stdout))
