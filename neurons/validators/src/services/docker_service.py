@@ -219,6 +219,8 @@ from services.rental_docker_sdk import (
 )
 from services.ssh_connect_timing import connect_with_phase_timing
 from services.storage_operations import (
+    forget_storage_helper,
+    note_started_storage_helper,
     start_storage_operation,
     supports_bootstrap_restore,
     supports_storage_operation,
@@ -11964,14 +11966,19 @@ class DockerService:
                 "failure_timeout_seconds": restore.failure_timeout_seconds,
             },
         }
-        files = await start_storage_operation(
-            ssh_client,
-            executor_info.python_path,
-            operation_id,
-            spec,
-            retain_terminal_artifacts=True,
-        )
-        await wait_for_storage_operation(ssh_client, files)
+        await note_started_storage_helper(self.redis_service, executor_info.uuid, operation_id)
+        try:
+            files = await start_storage_operation(
+                ssh_client,
+                executor_info.python_path,
+                operation_id,
+                spec,
+                retain_terminal_artifacts=True,
+            )
+            await wait_for_storage_operation(ssh_client, files)
+        finally:
+            # the restore ended (or never started) here: its helper is no longer Lium's
+            await forget_storage_helper(self.redis_service, executor_info.uuid, operation_id)
 
     async def _run_legacy_bootstrap_restore(
         self,
