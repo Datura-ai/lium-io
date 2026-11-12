@@ -209,10 +209,11 @@ jobs:
   tests-ok:
     # sums up every job; the ruleset requires e2e-gate (see the e2e job).
     # A package whose job was skipped as unchanged passes, and so does a skipped e2e-gate
-    # (a PR that touches no neuron); a failed or cancelled one fails this.
+    # (a PR that touches no neuron); a failed or cancelled one fails this. Before approval it is skipped: route shows
+    # the ruff result itself, and e2e-gate makes the same check once the jobs run.
     name: tests-ok
     needs: [route, validators, executor, miners, protocol, e2e]
-    if: always() && needs.route.result != 'skipped'
+    if: always() && needs.route.result != 'skipped' && needs.route.outputs.approved == 'true'
     runs-on: ubuntu-latest
     steps:
       - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')

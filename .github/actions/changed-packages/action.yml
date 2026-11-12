@@ -74,7 +74,9 @@ runs:
               owner: context.repo.owner, repo: context.repo.repo, pull_number: prNumber, per_page: 100,
             });
             const latest = {};
-            for (const r of reviews) if (r.user && r.state !== 'COMMENTED') latest[r.user.login] = r.state;
+            // the repo is public: only a member's or collaborator's review counts, not any GitHub user's
+            const TEAM = ['OWNER', 'MEMBER', 'COLLABORATOR'];
+            for (const r of reviews) if (r.user && r.state !== 'COMMENTED' && TEAM.includes(r.author_association)) latest[r.user.login] = r.state;
             approved = Object.values(latest).includes('APPROVED');
           } else {
             // merge group: base..head; push: before..after (all zeros on a new branch: no diff, every package)
