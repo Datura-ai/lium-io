@@ -198,6 +198,7 @@ from services.rental_docker_sdk import (
     ContainerGoneBeforeExec,
     ContainerRunSpec,
     ContainerStateSnapshot,
+    docker_size,
     ContainerUlimit,
     DeviceMount,
     DriverVolumeMount,
@@ -4242,7 +4243,7 @@ class DockerService:
                     DriverVolumeMount(
                         target=_DEFAULT_DOCKER_ROOT_DIR,
                         driver=docker_data_volume_driver,
-                        driver_opts={"size": f"{docker_data_volume_gb:.10g}g", "sparse": "true"},
+                        driver_opts={"size": docker_size(docker_data_volume_gb), "sparse": "true"},
                     ),
                 )
                 if docker_data_volume_gb

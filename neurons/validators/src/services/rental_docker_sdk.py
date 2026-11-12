@@ -66,6 +66,11 @@ _TRANSPORT_ERROR_TYPES = (
 # paramiko's EOFError has no text; the SDK client wraps it as "<operation> failed: EOFError".
 _TRANSPORT_EOF_SUFFIX = ": EOFError"
 _T = TypeVar("_T")
+
+
+def docker_size(gb: float) -> str:
+    """A Docker size string with no fraction: Docker refuses one like `36.5g`, so a half GiB goes as whole MiB."""
+    return f"{int(gb)}g" if gb == int(gb) else f"{int(gb * 1024)}m"
 # DAH-2475: the Docker SDK is synchronous, so every call below has to run in a thread. It must not be
 # the event loop's default executor: asyncio resolves DNS there too (loop.getaddrinfo runs in it), and
 # a wave of filler creates fills that pool with minutes-long pulls. Name resolution then queues behind
@@ -1847,7 +1852,7 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
         "oom_score_adj": spec.oom_score_adj,
         "pids_limit": spec.pids_limit if spec.pids_limit else None,
         "storage_opt": (
-            {"size": f"{spec.storage_limit_gb:.10g}g"}
+            {"size": docker_size(spec.storage_limit_gb)}
             if spec.storage_limit_gb
             else None
         ),
