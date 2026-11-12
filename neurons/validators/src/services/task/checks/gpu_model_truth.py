@@ -4,12 +4,15 @@ The model name is the node's own claim; the matmul's sealed metrics carry the co
 and SM count the CUDA runtime read off the card it ran on (device 0, the first reported card). A
 name whose card has another generation (cc) or another SM count is not that model: an A100
 reporting itself as an H100 (8.0/108 against 9.0/132), an A6000 as an RTX 6000 Ada (8.6/84
-against 8.9/142). Only names in the table are judged; an unknown name, or a run without both
+against 8.9/142). Only a card below the reported model fails: a lower generation or fewer SMs.
+A bigger card under a smaller name (an SXM H100 listed as an H100 PCIe) is not paid more for it,
+so it passes. Only names in the table are judged; an unknown name, or a run without both
 numbers, never fails.
 """
 
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass
 from typing import Any
 
 # reported name -> (compute capability, SM count), NVIDIA's values; each matches what the
@@ -52,11 +55,24 @@ EXPECTED_CC_AND_SM: dict[str, tuple[str, int]] = {
 }
 
 
-def _reported_model(machine_spec: Any) -> str | None:
+@dataclass(frozen=True)
+class GpuModelMismatch:
+    reported_gpu_model: str
+    expected_compute_capability: str
+    expected_sm_count: int
+    measured_compute_capability: str
+    measured_sm_count: int
+    measured_device_name: str | None
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+def _reported_model(machine_spec: Any, card_index: int) -> str | None:
     gpu = machine_spec.get("gpu") if isinstance(machine_spec, dict) else None
     details = gpu.get("details") if isinstance(gpu, dict) else None
-    first = details[0] if isinstance(details, list) and details else None
-    name = first.get("name") if isinstance(first, dict) else None
+    card = details[card_index] if isinstance(details, list) and 0 <= card_index < len(details) else None
+    name = card.get("name") if isinstance(card, dict) else None
     return name if isinstance(name, str) else None
 
 
@@ -66,23 +82,31 @@ def _sm_count(value: Any) -> int | None:
     return int(value)
 
 
-def gpu_model_mismatch(machine_spec: Any, metrics: Any) -> dict[str, object] | None:
-    """What was reported and measured when the card is not the reported model; None otherwise
-    (a match, an unknown name, or a run that did not give both numbers)."""
-    model = _reported_model(machine_spec)
+def _cc_version(value: Any) -> tuple[int, int] | None:
+    major, dot, minor = value.partition(".") if isinstance(value, str) else ("", "", "")
+    return (int(major), int(minor)) if dot and major.isdigit() and minor.isdigit() else None
+
+
+def gpu_model_mismatch(machine_spec: Any, metrics: Any, card_index: int = 0) -> GpuModelMismatch | None:
+    """What was reported and measured when the card (the reported card at `card_index`, the one
+    the matmul ran on) is below the reported model; None otherwise (the model or a bigger card,
+    an unknown name, or a run that did not give both numbers)."""
+    model = _reported_model(machine_spec, card_index)
     expected = EXPECTED_CC_AND_SM.get(model) if model else None
     if expected is None or not isinstance(metrics, dict):
         return None
     cc, sm_count = metrics.get("cc"), _sm_count(metrics.get("sm_count"))
-    if not isinstance(cc, str) or not cc or sm_count is None:
+    measured_cc = _cc_version(cc)
+    if measured_cc is None or sm_count is None:
         return None
-    if (cc, sm_count) == expected:
+    if measured_cc >= _cc_version(expected[0]) and sm_count >= expected[1]:
         return None
-    return {
-        "reported_gpu_model": model,
-        "expected_compute_capability": expected[0],
-        "expected_sm_count": expected[1],
-        "measured_compute_capability": cc,
-        "measured_sm_count": sm_count,
-        "measured_device_name": metrics.get("device"),
-    }
+    device = metrics.get("device")
+    return GpuModelMismatch(
+        reported_gpu_model=model,
+        expected_compute_capability=expected[0],
+        expected_sm_count=expected[1],
+        measured_compute_capability=cc,
+        measured_sm_count=sm_count,
+        measured_device_name=device if isinstance(device, str) else None,
+    )
