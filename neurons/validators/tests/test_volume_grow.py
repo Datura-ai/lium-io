@@ -222,6 +222,8 @@ def test_the_host_script_finds_the_backing_file_outside_the_plugins_srv_view(tmp
     _stub(tmp_path, "findmnt", "echo /dev/loop7")
     _stub(tmp_path, "losetup", f'[ "$1" = -c ] || echo /srv{host_file}')
     _stub(tmp_path, "stat", f'echo "$3" >> {log}; echo {466 * GB}')
+    # stubbed so a runner with xfsprogs installed does not read /mnt/x for real
+    _xfs(tmp_path, tmp_path / "xfs_calls", 466 * GB, 466 * GB)
 
     result = subprocess.run(
         ["sh", "-c", GROW_SCRIPT, "grow", "/mnt/x", str(466 * GB), str(10 * GB), "false"],
