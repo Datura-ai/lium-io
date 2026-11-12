@@ -134,16 +134,16 @@ if [ -n "$running_executor" ]; then
     pull=missing
     # sshd runs inside the executor, so a recreate cuts every open session. A root session is the validator
     # creating a pod or checking the node; cutting it fails that create (12 Nov 2026: a pod create lost SSH in
-    # encrypted_volume_setup). A storage runner is a volume backup or restore the validator started; the recreate
-    # kills it. Wait for both to end, at most RUNNER_SSH_HOLD_MAX_TRIES retries, so an update still lands while the
-    # validator's rollout grace covers the node. `[.]` keeps the pattern from matching this grep's own command line.
+    # encrypted_volume_setup). Wait for it to close, at most RUNNER_SSH_HOLD_MAX_TRIES retries, so an update
+    # still lands while the validator's rollout grace covers the node. A volume backup or restore is not held
+    # (updates are never held for one).
     hold_file=${RUNNER_SSH_HOLD_FILE:-/tmp/runner-ssh-hold-tries}
     tries=$(cat "$hold_file" 2>/dev/null || true)
     tries=${tries:-0}
     if [ "$tries" -lt "${RUNNER_SSH_HOLD_MAX_TRIES:-30}" ] \
-        && docker exec "$running_executor" sh -c 'grep -qaE "^sshd[^:]*: root@|storage_runner[.]py" /proc/[0-9]*/cmdline' >/dev/null 2>&1; then
+        && docker exec "$running_executor" sh -c 'grep -qaE "^sshd[^:]*: root@" /proc/[0-9]*/cmdline' >/dev/null 2>&1; then
         echo $((tries + 1)) > "$hold_file"
-        echo "Update held, running executor kept: a validator SSH session or a storage backup/restore is running in it. Retrying in ${RUNNER_SSH_HOLD_RETRY_SECONDS:-30}s."
+        echo "Update held, running executor kept: a validator SSH session is open in it. Retrying in ${RUNNER_SSH_HOLD_RETRY_SECONDS:-30}s."
         sleep "${RUNNER_SSH_HOLD_RETRY_SECONDS:-30}"
         exit 1
     fi

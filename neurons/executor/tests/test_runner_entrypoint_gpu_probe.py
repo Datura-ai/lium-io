@@ -204,9 +204,9 @@ def test_open_validator_ssh_session_holds_the_recreate(tmp_path):
     result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_SSH_SESSION_EXIT="0")
 
     check = next(c for c in calls if c.startswith("exec abc123 sh -c"))
-    assert "^sshd[^:]*: root@" in check and "storage_runner[.]py" in check
+    assert "^sshd[^:]*: root@" in check and "storage_runner" not in check
     assert not recreated(calls)
-    assert "a validator SSH session or a storage backup/restore is running" in result.stdout
+    assert "a validator SSH session is open" in result.stdout
     assert "sleep 30" in calls
     assert (tmp_path / "hold").read_text().strip() == "1"
 
@@ -216,7 +216,7 @@ def test_ssh_hold_gives_up_after_the_max_tries(tmp_path):
     result, calls = run_entrypoint(tmp_path, STUB_RUNNING_EXECUTOR="abc123", STUB_SSH_SESSION_EXIT="0")
 
     assert recreated(calls)
-    assert "a validator SSH session or a storage backup/restore is running" not in result.stdout
+    assert "a validator SSH session is open" not in result.stdout
     assert (tmp_path / "hold").read_text() == ""
 
 
