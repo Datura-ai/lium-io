@@ -75,7 +75,6 @@ from .checks import (
     RentedGpuDropCheck,
     RentedPodNetworkCheck,
     RentedPodOwnershipCheck,
-    RentedPodDiskCheck,
     RentedPodResourcesCheck,
     RentedThroughputCheck,
     ScoreCheck,
@@ -412,8 +411,6 @@ class PipelineFactory:
                 ExecutorImageCheck(),
                 InspectorRentedCheck(),
                 RentedPodResourcesCheck(),
-                # DAH-5951: pauses a pod filling a no-quota host's Docker disk, so never in the dry run.
-                RentedPodDiskCheck(),
                 RentedPodNetworkCheck(),
                 RentedPodOwnershipCheck(),
                 # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
@@ -549,8 +546,6 @@ class PipelineFactory:
                 ExecutorImageCheck(),
                 InspectorRentedCheck(),
                 RentedPodResourcesCheck(),
-                # DAH-5951: pauses a pod filling a no-quota host's Docker disk, so never in the dry run.
-                RentedPodDiskCheck(),
                 RentedPodNetworkCheck(),
                 RentedPodOwnershipCheck(),
                 # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.

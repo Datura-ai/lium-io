@@ -2703,60 +2703,6 @@ class RentedPodResourcesMessages:
     )
 
 
-class RentedPodDiskMessages:
-    """DAH-5951: on a host whose Docker cannot limit a container's disk, a rented pod filling the Docker disk is
-    paused (data and volume kept) and resumed once the disk has room again."""
-
-    PAUSED = MessageTemplate(
-        event="Rented pod paused: the host's Docker disk is almost full",
-        reason="RENTED_POD_DISK_PAUSED",
-        severity="error",
-        category="env",
-        impact="Pod paused, its data kept; resumed on the first validation that finds 10% of the disk free",
-        remediation=(
-            "Docker on this node cannot limit a container's disk, and the paused pod (see paused) holds much of the "
-            "Docker disk, which is almost full. The pod's data and volume are kept. Provider: free space on the "
-            "Docker disk, and set up Docker storage that limits each container "
-            "(https://docs.lium.io/providers/nodes/docker-storage) so this cannot happen again."
-        ),
-    )
-    RESUMED = MessageTemplate(
-        event="Rented pod resumed: the host's Docker disk has room again",
-        reason="RENTED_POD_DISK_RESUMED",
-        severity="info",
-        category="env",
-        impact="Proceed",
-    )
-    OK = MessageTemplate(
-        event="Rented pods leave room on the host's Docker disk",
-        reason="RENTED_POD_DISK_OK",
-        severity="info",
-        category="env",
-        impact="Proceed",
-    )
-    LIMITED = MessageTemplate(
-        event="Rented pod disk check skipped: Docker limits each container's disk",
-        reason="RENTED_POD_DISK_LIMITED",
-        severity="info",
-        category="env",
-        impact="Proceed",
-    )
-    NOT_RENTED = MessageTemplate(
-        event="Rented pod disk check skipped: no running rental",
-        reason="RENTED_POD_DISK_NOT_RENTED",
-        severity="info",
-        category="env",
-        impact="Proceed",
-    )
-    UNKNOWN = MessageTemplate(
-        event="Rented pod disk use could not be read",
-        reason="RENTED_POD_DISK_UNKNOWN",
-        severity="info",
-        category="env",
-        impact="Proceed without penalty",
-    )
-
-
 class RentedPodNetworkMessages:
     SUMMARY = MessageTemplate(
         event="Rented pod network summary",

@@ -377,11 +377,6 @@ class PodHostRebootRecoveredResponse(BaseModel):
     recorded: bool
 
 
-class PodDiskPauseResponse(BaseModel):
-    # DAH-5951: False when the backend already had this state, nothing changed
-    recorded: bool
-
-
 class PodSshUnreachableResponse(BaseModel):
     # DAH-2870: False when the backend already holds an event for this outage of the pod.
     recorded: bool

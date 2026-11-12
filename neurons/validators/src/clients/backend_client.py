@@ -18,7 +18,6 @@ from protocol.vc_protocol.compute_requests import (
     ExecutorHealthCheckResponse,
     FillerRunActiveResponse,
     NvmlReportAckResponse,
-    PodDiskPauseResponse,
     PodHostRebootRecoveredResponse,
     PodRentalActiveResponse,
     RentedExecutorsResponse,
@@ -395,18 +394,6 @@ class BackendClient:
             f"/internal/pods/{pod_id}/host-reboot-recovered",
             PodHostRebootRecoveredResponse,
             json_data={"container_finished_at": container_finished_at},
-            timeout=10,
-        )
-
-    async def report_pod_disk_pause(
-        self, pod_id: str, *, paused: bool, executor_id: str
-    ) -> PodDiskPauseResponse | None:
-        """Tell the backend the validator paused a rented pod filling its host's disk, or resumed it
-        (DAH-5951): the backend bills a paused pod nothing and tells the renter."""
-        return await self.post(
-            f"/internal/pods/{pod_id}/disk-pause",
-            PodDiskPauseResponse,
-            json_data={"paused": paused, "executor_id": executor_id},
             timeout=10,
         )
 
