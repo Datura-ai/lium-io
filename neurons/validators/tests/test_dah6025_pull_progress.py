@@ -30,6 +30,27 @@ def test_downloaded_layer_is_not_done_until_extracted():
     assert pull_progress_text(progress) == "2 of 3 layers done, 1.7 GB downloaded"
 
 
+@pytest.mark.parametrize(
+    "statuses, done",
+    [
+        (["Pulling fs layer", "Downloading", "Download complete", "Extracting"], False),  # fresh, unpacking
+        (["Pulling fs layer", "Downloading", "Download complete", "Extracting", "Pull complete"], True),
+        (["Already exists"], True),  # cached and already extracted
+        (["Already exists", "Extracting"], False),  # cached blob whose snapshot still unpacks (containerd)
+        (["Already exists", "Extracting", "Pull complete"], True),
+    ],
+)
+def test_a_layer_is_done_only_once_registered(statuses, done):
+    progress: dict = {}
+    for status in statuses:
+        event = {"status": status, "id": "l1"}
+        if status == "Downloading":
+            event["progressDetail"] = {"current": 10, "total": 20}
+        _track_pull_progress(progress, event)
+
+    assert progress["l1"][1] is done
+
+
 def test_progress_counts_layers_and_downloaded_bytes():
     progress: dict = {}
     assert pull_progress_text(progress) is None

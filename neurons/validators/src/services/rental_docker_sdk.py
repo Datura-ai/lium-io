@@ -2043,6 +2043,9 @@ def _track_pull_progress(progress: dict[str, list], event) -> None:
         current = (event.get("progressDetail") or {}).get("current")
         if isinstance(current, int):
             progress.setdefault(event["id"], [0, False])[0] = current
+    elif status == "Extracting":
+        # a cached blob can still need unpacking: Already exists -> Extracting -> Pull complete
+        progress.setdefault(event["id"], [0, False])[1] = False
     elif status in _LAYER_DONE_STATUSES:
         progress.setdefault(event["id"], [0, False])[1] = True
 
