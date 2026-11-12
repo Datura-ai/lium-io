@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Literal
 
 from core.config import settings
 from core.utils import _m, get_extra_info
-from services.const import SECONDS_PER_BLOCK
+from services.const import DEFAULT_JOB_OWNER_LIUM, SECONDS_PER_BLOCK
 from services.gpu_spec_table import normalize_gpu_model
 from services.matrix_validation_service import UUID_MISMATCH_ERROR_PREFIX
 
@@ -29,6 +29,7 @@ from .gpu_model_truth import (
 )
 from .matmul_speed_log import log_matmul_speed
 from .rental_owner import uuid_listed_under_another_miner, rental_of_this_node
+from .sshd_bootstrap import remove_lium_fillers
 
 if TYPE_CHECKING:
     from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
@@ -81,6 +82,12 @@ class CapabilityCheck:
                 elif not seen:
                     await _store_gpu_model_verdict(ctx, [], GPU_MODEL_NO_VERDICT_TTL_SECONDS)
             if mismatches:
+                # the node earns nothing, so Lium's filler no longer runs on it (as SshdBootstrapCheck)
+                rented_data = ctx.state.rented_data
+                if not settings.DRY_RUN and rented_data.get_default_job_owner(ctx.executor.uuid) == DEFAULT_JOB_OWNER_LIUM:
+                    what_filler["removed_fillers"] = await remove_lium_fillers(
+                        ctx, rented_data.get_filler_containers(ctx.executor.uuid)
+                    )
                 return gpu_model_mismatch_result(
                     ctx, self.check_id, {**mismatches[0].as_dict(), **what_filler, "transport": "filler"}
                 )

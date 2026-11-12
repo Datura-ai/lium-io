@@ -1,6 +1,8 @@
 """DAH-6241: a node whose card is not the model it reports earns nothing."""
 
 import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -642,3 +644,20 @@ async def test_a_stored_mismatch_stands_when_the_card_is_renamed_to_an_alias_of_
 
     assert result.passed is False
     assert result.event.reason_code == Msg.GPU_MODEL_MISMATCH.reason
+
+
+@pytest.mark.parametrize("owner, removed", [("lium", True), ("miner", False)])
+@pytest.mark.asyncio
+async def test_a_faked_model_on_a_filler_node_removes_lium_filler_only(context_factory, sample_never_due, owner, removed):
+    redis = FakeRedis()
+    ctx, _ = _filler_ctx(context_factory, redis, FAKE_H100[1])
+    ctx.state.rented_data.all_filler_containers_by_executor = {"executor-123": ["filler_active"]}
+    ctx.state.rented_data.default_job_owner_by_executor = {"executor-123": owner}
+    ssh = AsyncMock()
+    ssh.run.return_value = SimpleNamespace(exit_status=0, stdout="", stderr="")
+    ctx = ctx.model_copy(update={"ssh": ssh})
+
+    result = await CapabilityCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.GPU_MODEL_MISMATCH.reason
+    assert result.event.what_we_saw.get("removed_fillers") == (["filler_active"] if removed else None)
