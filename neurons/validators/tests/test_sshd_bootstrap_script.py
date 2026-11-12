@@ -544,6 +544,39 @@ def test_a_non_lock_apt_failure_is_not_retried(harness):
     assert [c for c in harness.apt_calls() if "SourceList" in c] and len(harness.apt_calls()) == 3
 
 
+@pytest.mark.parametrize(
+    "failed_suites, falls_back",
+    [
+        (["noble-backports"], False),
+        (["noble-updates"], False),  # Ubuntu mirror mid-sync: noble + noble-security still carry a patched openssh
+        (["noble-security"], False),
+        (["noble-updates", "noble-security"], True),  # only the release openssh left: take the full path
+        (["noble"], True),
+    ],
+)
+def test_a_failed_list_fetch_installs_from_the_lists_that_arrived(harness, failed_suites, falls_back):
+    harness.stage_sshd_payload(SSHD_STARTS)
+    (harness.apt_etc / "sources.list").write_text("deb http://archive.ubuntu.com/ubuntu noble main\n")
+    errs = "".join(
+        f"E: Failed to fetch http://archive.ubuntu.com/ubuntu/dists/{s}/main/binary-amd64/Packages.gz"
+        "  File has unexpected size (1 != 2). Mirror sync in progress?\n"
+        for s in failed_suites
+    )
+    fail = f"case \"$*\" in update*SourceList*) printf '%s' '{errs}' >&2; exit 100 ;; esac\ncase"
+    harness._write_executable(harness.shims / "apt-get", APT_GET_SHIM.replace("case", fail, 1))
+
+    result = harness.run("--grace", "0")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = harness.apt_calls()
+    if falls_back:
+        assert [c.split()[0] for c in calls] == ["update", "update", "install"] and "SourceList" not in calls[2], calls
+        assert "retrying with all of the image's apt sources" in result.stdout
+    else:
+        assert len(calls) == 2 and "install" in calls[1] and "SourceList" in calls[1], calls
+        assert "retrying with all of the image's apt sources" not in result.stdout
+
+
 # DAH-6029: one fixture across the deb822 / one-line grammar, checked against apt's own parser.
 GRAMMAR_LIST = """# deb http://commented.example/debian stable main
 deb http://http.kali.org/kali kali-rolling main contrib non-free

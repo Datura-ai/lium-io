@@ -204,13 +204,31 @@ apt_get() {
     done
 }
 
+# A failed index fetch (Ubuntu's "Mirror sync in progress?", a dead backports mirror) leaves the
+# other lists usable: install from them, unless the base suite failed or neither -updates nor
+# -security arrived (a patched openssh needs one of the two). Reads the last apt_get's stderr.
+apt_lists_usable() {
+    failed="$(sed -n 's|^E: Failed to fetch .*/dists/\([^/ ]*\)/.*|\1|p' "$RUN_DIR/lium-apt.err" | sort -u)"
+    [ -n "$failed" ] || return 1
+    for suite in $failed; do
+        case "$suite" in
+            *-backports | *-updates | *-security | *-proposed) ;;
+            *) return 1 ;;
+        esac
+    done
+    case "$failed" in
+        *-updates*-security* | *-security*-updates*) return 1 ;;
+    esac
+    log "Some package lists failed to download; installing from the rest"
+}
+
 install_sshd() {
     if command -v apt-get >/dev/null 2>&1; then
         export DEBIAN_FRONTEND=noninteractive
         # shellcheck disable=SC2086 # APT_PACKAGES is a word list
         if main_dir="$(apt_main_only_dir)"; then
             apt_main="-o Dir::Etc::SourceList=$main_dir/sources.list -o Dir::Etc::SourceParts=$main_dir/parts"
-            if apt_get update $apt_main && apt_get install -y --no-install-recommends $APT_PACKAGES $apt_main; then
+            if { apt_get update $apt_main || apt_lists_usable; } && apt_get install -y --no-install-recommends $APT_PACKAGES $apt_main; then
                 rm -rf "$main_dir"
                 return 0
             fi
