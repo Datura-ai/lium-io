@@ -228,9 +228,6 @@ async def test_a_dropout_keeps_the_node_hidden_while_cards_are_missing_with_no_t
 
 def _hold_then_load_test_pipeline(context_factory, redis, *, all_cards, probe):
     ctx = _ctx(context_factory, redis, pods=())
-    for card in all_cards.per_card if all_cards else []:
-        if card["ok"]:
-            card["metrics"] = {"cc": "8.6", "sm_count": 82}  # an honest card's sealed numbers (DAH-6241)
     validation = FakeValidation(all_cards)
     ctx = ctx.model_copy(
         update={"services": build_services(redis=redis, validation=validation), "runner": FakeRunner(probe)}

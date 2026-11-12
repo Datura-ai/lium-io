@@ -110,7 +110,6 @@ EXPECTED_CC_ONLY: dict[str, str] = {
     "NVIDIA RTX 4500 Ada Generation": "8.9",
     "NVIDIA RTX 5000 Ada Generation": "8.9",
     "NVIDIA RTX 5880 Ada Generation": "8.9",
-    "NVIDIA RTX 6000D": "12.0",
     "NVIDIA RTX A2000": "8.6",
     "NVIDIA RTX A5000": "8.6",
     "NVIDIA RTX PRO 2000 Blackwell": "12.0",

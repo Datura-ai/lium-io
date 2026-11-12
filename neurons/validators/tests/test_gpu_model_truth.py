@@ -428,7 +428,8 @@ def test_an_nvml_alias_of_a_listed_model_is_judged():
 
 
 def test_every_rated_model_is_judged_by_its_compute_capability():
-    assert sorted(set(GPU_MODEL_RATES) - set(EXPECTED_CC_AND_SM) - set(EXPECTED_CC_ONLY)) == []
+    # unjudged until a node of the name shows its numbers (no source for its value)
+    assert sorted(set(GPU_MODEL_RATES) - set(EXPECTED_CC_AND_SM) - set(EXPECTED_CC_ONLY)) == ["NVIDIA RTX 6000D"]
     assert sorted(set(EXPECTED_CC_ONLY) & set(EXPECTED_CC_AND_SM)) == []
 
 
@@ -578,3 +579,55 @@ async def test_a_dry_run_stores_no_verdict(context_factory, monkeypatch):
     await _run(context_factory, "NVIDIA H100 80GB HBM3", "8.0", 108, redis=redis)
 
     assert _verdict_key() not in redis.store
+
+
+# --- review at 9ff05368: not measured fails only on card 0 of the idle full matmul; elsewhere it is logged
+
+
+@pytest.mark.asyncio
+async def test_a_filler_sample_with_no_numbers_is_logged_and_does_not_fail(context_factory, sample_never_due):
+    redis = FakeRedis()
+    ctx, _ = _filler_ctx(context_factory, redis, {})
+
+    result = await CapabilityCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["matmul_sample"]["no_numbers"] is True
+    assert json.loads(redis.store[_verdict_key()])["mismatches"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_carried_remeasure_with_no_numbers_keeps_the_stored_mismatch_and_adds_none(context_factory):
+    redis = FakeRedis()
+    _store_card_1_mismatch(redis)
+    service = _PinnedCardService(REAL_H100[1], {"GPU-1": {}})
+
+    result = await _idle_run(context_factory, redis, service)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.GPU_MODEL_MISMATCH.reason
+    assert [m["kind"] for m in json.loads(redis.store[_verdict_key()])["mismatches"]] == ["below_model"]
+
+
+@pytest.mark.asyncio
+async def test_an_all_cards_answer_with_no_numbers_after_card_0_is_logged_and_does_not_fail(context_factory):
+    redis = FakeRedis()
+    service = DummyValidationService(success=True, metrics=REAL_H100[1])
+    real_validate = service.validate_gpu_model_and_process_job
+
+    async def with_cards(**kwargs):
+        result = await real_validate(**kwargs)
+        result.card_metrics = {0: REAL_H100[1], 1: {}}
+        return result
+
+    service.validate_gpu_model_and_process_job = with_cards
+    ctx = context_factory(
+        services=build_services(validation=service, redis=redis),
+        config=build_context_config(),
+        state=build_state(specs=_two_card_specs()),
+    )
+
+    result = await CapabilityCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["no_numbers_cards"] == [1]

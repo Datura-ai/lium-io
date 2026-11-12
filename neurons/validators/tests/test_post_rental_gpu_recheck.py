@@ -379,9 +379,10 @@ async def test_a_card_below_its_reported_model_fails_the_recheck_and_stores_the_
     assert KEY in ctx.services.redis.store
 
 
+
 @pytest.mark.asyncio
-async def test_a_judged_card_with_no_numbers_and_no_measured_pass_fails_the_recheck(context_factory):
-    # DAH-6241: the one probe that reaches every card cannot pass a card that gives no numbers forever
+async def test_a_judged_card_with_no_numbers_is_only_logged_by_the_recheck(context_factory):
+    # DAH-6241: no prod data yet on per-card numbers of the all-cards probe, so no fail on this path
     probe = _all_cards("", "")
     probe.per_card[0]["metrics"] = {"cc": "9.0", "sm_count": 132}
     h100 = {"name": "NVIDIA H100 80GB HBM3"}
@@ -390,23 +391,7 @@ async def test_a_judged_card_with_no_numbers_and_no_measured_pass_fails_the_rech
 
     result = await PostRentalGpuRecheckCheck().run(ctx)
 
-    assert result.passed is False and result.event.reason_code == Msg.FAILED.reason
-    assert result.event.what_we_saw["gpu_model_mismatch"]["card_index"] == 1
-    assert result.event.what_we_saw["gpu_model_mismatch"]["kind"] == "not_measured"
-    assert KEY in ctx.services.redis.store
-
-
-@pytest.mark.asyncio
-async def test_a_card_with_no_numbers_after_a_measured_pass_is_tolerated_once_in_the_recheck(context_factory):
-    probe = _all_cards("", "")
-    probe.per_card[0]["metrics"] = {"cc": "9.0", "sm_count": 132}
-    h100 = {"name": "NVIDIA H100 80GB HBM3"}
-    specs = {"gpu": {"count": 2, "details": [h100, h100]}}
-    ctx = _idle_ctx(context_factory, FakeRunner(probe_stdout("ok")), FakeValidation(probe), specs=specs)
-    ctx.services.redis.store["gpu_model_verdict:miner-hotkey:" + default_executor().uuid] = json.dumps(
-        {"mismatches": [], "measured_ok": [0, 1]}
-    )
-
-    result = await PostRentalGpuRecheckCheck().run(ctx)
-
+    assert result.event.what_we_saw["gpu_model_no_numbers_cards"] == [1]
     assert "gpu_model_mismatch" not in result.event.what_we_saw
+    stored = json.loads(ctx.services.redis.store["gpu_model_verdict:miner-hotkey:" + default_executor().uuid])
+    assert stored["mismatches"] == []

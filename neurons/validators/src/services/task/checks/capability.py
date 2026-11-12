@@ -77,8 +77,6 @@ class CapabilityCheck:
                 what_filler["matmul_sample"] = sample
                 if found is not None:
                     mismatches = await judge_gpu_model(ctx, found, {sample.get("card_index", 0)})
-                elif sample.get("no_numbers"):
-                    mismatches = await judge_gpu_model(ctx, [], set(), {sample.get("card_index", 0)})
                 elif not seen:
                     await _store_gpu_model_verdict(ctx, [], GPU_MODEL_NO_VERDICT_TTL_SECONDS)
             if mismatches:
@@ -129,18 +127,23 @@ class CapabilityCheck:
             # DAH-6241: a correct answer from a card that is not the reported model earns nothing
             card_metrics = getattr(result, "card_metrics", None)
             measured_cards = judged_cards(result.metrics, card_metrics)
+            # not measured fails on card 0 of the full matmul only (prod-measured); other cards are logged
+            no_numbers = sorted(unmeasured_cards(specs, result.metrics, card_metrics) - measured_cards - {0})
             mismatches = await judge_gpu_model(
                 ctx,
                 gpu_model_mismatches(specs, result.metrics, card_metrics),
                 measured_cards,
-                unmeasured_cards(specs, result.metrics, card_metrics),
+                unmeasured_cards(specs, result.metrics),
             )
             mismatches = await _remeasure_carried_mismatch(ctx, specs, mismatches, measured_cards)
+            logged = {"no_numbers_cards": no_numbers} if no_numbers else {}
             if mismatches:
                 return gpu_model_mismatch_result(
-                    ctx, self.check_id, {**mismatches[0].as_dict(), "sealed": result.sealed, "transport": transport}
+                    ctx,
+                    self.check_id,
+                    {**mismatches[0].as_dict(), "sealed": result.sealed, "transport": transport, **logged},
                 )
-            what: dict = {"metrics": result.metrics, "transport": transport}
+            what: dict = {"metrics": result.metrics, "transport": transport, **logged}
             if sizing:
                 what["first_pass_vram_budget_mb"] = sizing["vram_budget_mb"]
             event = render_message(
@@ -447,9 +450,7 @@ async def _remeasure_carried_mismatch(
     logger.warning(_m("GPU_MODEL_MISMATCH_REMEASURE", extra=get_extra_info({**ctx.default_extra, **sample})))
     if found is not None:
         return await judge_gpu_model(ctx, found, {carried[0]})
-    if sample.get("no_numbers"):
-        return await judge_gpu_model(ctx, [], set(), {carried[0]})
-    return mismatches
+    return mismatches  # no_numbers is only logged here: no prod data yet for a pinned sample
 
 
 
