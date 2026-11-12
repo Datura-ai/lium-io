@@ -15,7 +15,7 @@ setup) is an error, not a fault: the validator does not penalise what it could n
 
 Prints one line `GPU_FAULT_PROBE_JSON: {...}`. Exit 0 ok, 1 fault, 2 could not run.
 `--nvml-only` (GpuMemoryHealthCheck) reads NVML once and runs no CUDA: status ok, flagged (see
-`flags`) or error, exit 0. It also lists, per card, the new hardware Xids since `--xid-seen` (`xid_faults`),
+`flags`) or error, exit 0. It also lists, per card, the new hardware Xids since `--xid-after` (`xid_faults`),
 which do not set the status.
 """
 
@@ -957,7 +957,15 @@ def xid_lines() -> dict:
     if out.returncode != 0:
         return {"available": False, "error": (out.stderr or "").strip()[:200]}
     lines = [line.strip() for line in out.stdout.splitlines() if "NVRM: Xid" in line]
-    return {"available": True, "count": len(lines), "last": lines[-5:], "lines": lines}
+    # the next read's baseline: the last line's kernel time, 0 with no Xid yet, None when lines carry no time
+    last_ts = kernel_ts(lines[-1]) if lines else 0.0
+    return {"available": True, "count": len(lines), "last_ts": last_ts, "last": lines[-5:], "lines": lines}
+
+
+def kernel_ts(line: str) -> float | None:
+    """The kernel time of a dmesg line (`[  123.456789] ...`), or None without one."""
+    match = re.match(r"\[\s*(\d+(?:\.\d+)?)\]", line)
+    return float(match.group(1)) if match else None
 
 
 def pci_key(bus_id) -> str | None:
@@ -1080,12 +1088,16 @@ def _exit_code(process):
     return process.exitcode
 
 
-def card_xid_faults(snapshot: dict, xid: dict, xid_seen: int | None) -> list[str]:
-    """The hardware Xids logged on each card since the validator's last read (`xid_seen` lines in). No
-    baseline yet, or a log shorter than it (rotated, or the host rebooted), flags nothing this time."""
-    if not xid.get("available") or xid_seen is None or xid_seen > xid["count"]:
+def card_xid_faults(snapshot: dict, xid: dict, xid_after: float | None) -> list[str]:
+    """The hardware Xids logged on each card since the validator's last read: lines whose kernel time is after
+    `xid_after`, the last judged line's. A wrapped ring buffer drops old lines, so a line count would slice off
+    new ones (review). No baseline yet, or lines without a kernel time, flag nothing."""
+    if not xid.get("available") or xid_after is None:
         return []
-    before = {"available": True, "lines": xid["lines"][:xid_seen]}
+    # shortcut: a host booted with printk.time=0 logs no kernel time, so no Xid is judged there; parse the
+    # line order if such hosts show up
+    new = [line for line in xid["lines"] if (ts := kernel_ts(line)) is not None and ts > xid_after]
+    before, xid = {"available": True, "lines": []}, {"available": True, "lines": new}
     faults = []
     for gpu in snapshot.get("gpus") or []:
         bus = pci_key(gpu.get("pci_bus_id"))
@@ -1105,7 +1117,7 @@ def boot_id() -> str | None:
         return None
 
 
-def print_nvml_health_report(mp, xid_seen: int | None = None) -> None:
+def print_nvml_health_report(mp, xid_after: float | None = None) -> None:
     """The `--nvml-only` verdict: one NVML snapshot and its standing memory faults, plus the cards'
     new hardware Xids."""
     snapshot = nvml_snapshot_forked(mp)
@@ -1117,9 +1129,9 @@ def print_nvml_health_report(mp, xid_seen: int | None = None) -> None:
         "flags": flags,
         "warnings": warnings,
         "nvml": snapshot,
-        "xid_faults": card_xid_faults(snapshot, xid, xid_seen),
+        "xid_faults": card_xid_faults(snapshot, xid, xid_after),
         # the kernel log is often not readable from the container: then no Xid is judged
-        "xid": {k: v for k, v in xid.items() if k in ("available", "count", "error")},
+        "xid": {k: v for k, v in xid.items() if k in ("available", "count", "last_ts", "error")},
         "boot_id": boot_id(),
     }
     print(JSON_MARKER, json.dumps(report, sort_keys=True))
@@ -1142,9 +1154,9 @@ def main(argv: list[str]) -> int:
         help="read the cards' standing memory health from NVML; no CUDA, safe beside a rental",
     )
     parser.add_argument(
-        "--xid-seen",
-        type=int,
-        help="with --nvml-only: kernel-log Xid lines already judged; only later ones are new",
+        "--xid-after",
+        type=float,
+        help="with --nvml-only: kernel time of the last Xid line already judged; only later ones are new",
     )
     parser.add_argument(
         "--hang-in-kernels-is-fault",
@@ -1159,7 +1171,7 @@ def main(argv: list[str]) -> int:
     # in the driver takes the worker, not the verdict, and the parent never initialises CUDA itself
     mp = multiprocessing.get_context("fork")
     if args.nvml_only:
-        print_nvml_health_report(mp, args.xid_seen)
+        print_nvml_health_report(mp, args.xid_after)
         return 0
     try:
         indices = args.device if args.device else list(range(_device_count(mp)))

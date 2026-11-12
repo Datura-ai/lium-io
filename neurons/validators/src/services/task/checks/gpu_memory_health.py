@@ -29,7 +29,7 @@ _FLAG_UUID = re.compile(r"^gpu \S+ \(([^()]+)\): ")
 RESET_REQUIRED_STREAK_LIMIT = 3
 _reset_required_streak: dict[tuple[str, str], int] = {}
 
-# DAH-5869: per executor, the kernel-log Xid lines already judged, the host's boot id and one held Xid fault per
+# DAH-5869: per executor, the kernel time of the last Xid line already judged, the host's boot id and one held Xid fault per
 # card: it closes only on proof it healed
 CARD_HEALTH_KEY_PREFIX = "gpu_card_health"
 CARD_HEALTH_TTL_SECONDS = 86400
@@ -41,7 +41,7 @@ _unsaved_card_health: dict[str, "CardHealthState"] = {}
 
 @dataclass
 class CardHealthState:
-    xid_seen: int | None = None
+    xid_after: float | None = None
     boot_id: str | None = None
     held: list[str] = field(default_factory=list)
 
@@ -61,7 +61,8 @@ async def _load_card_health(ctx: Context) -> CardHealthState | None:
         return None
     if not isinstance(stored, dict):
         return None
-    xid_seen = stored.get("xid_seen")
+    # a baseline stored as a line count (before the kernel-time baseline) is dropped: the next read sets one
+    xid_after = stored.get("xid_after")
     boot_id = stored.get("boot_id")
 
     def strings(key: str) -> list[str]:
@@ -69,7 +70,7 @@ async def _load_card_health(ctx: Context) -> CardHealthState | None:
         return [s for s in value if isinstance(s, str)] if isinstance(value, list) else []
 
     return CardHealthState(
-        xid_seen=xid_seen if type(xid_seen) is int else None,
+        xid_after=xid_after if type(xid_after) in (int, float) else None,
         boot_id=boot_id if isinstance(boot_id, str) else None,
         held=strings("held"),
     )
@@ -81,7 +82,7 @@ def _card_uuid(fault: str) -> str | None:
 
 
 def _held_fault_proven_healed(
-    fault: str, gpus: dict[str, dict[str, Any]], every_card_named: bool, rebooted: bool, scraped: set[str]
+    fault: str, gpus: dict[str, dict[str, Any]], every_card_named: bool, rebooted: bool, scraped_uuids: set[str]
 ) -> bool:
     """Proof that a held card fault is over: the card is gone from a read naming every card and from this
     cycle's scrape (the missing-card rule reports that), or a new host boot. A read that merely shows nothing new
@@ -93,7 +94,7 @@ def _held_fault_proven_healed(
         return True
     # a card that drops out after the scrape is still listed there, so no missing-card fault fires yet
     # shortcut: a card reset without a reboot leaves an Xid fault held; add a reset proof if that bites
-    return uuid not in gpus and every_card_named and uuid not in scraped
+    return uuid not in gpus and every_card_named and uuid not in scraped_uuids
 
 
 async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardHealthState) -> None:
@@ -112,19 +113,20 @@ async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardH
     xid_faults = [s for s in report.get("xid_faults") or [] if isinstance(s, str)]
     xid = report.get("xid") if isinstance(report.get("xid"), dict) else {}
     boot_id = report.get("boot_id") if isinstance(report.get("boot_id"), str) else None
-    # the boot id, not the Xid line count: a cleared or wrapped kernel log shrinks the count on a faulty card
+    # the boot id, not the Xid lines: a cleared or wrapped kernel log drops lines on a faulty card
     rebooted = before.boot_id is not None and boot_id is not None and boot_id != before.boot_id
     listed = [gpu for gpu in (report.get("nvml") or {}).get("gpus") or [] if isinstance(gpu, dict)]
     gpus = {gpu["uuid"]: gpu for gpu in listed if isinstance(gpu.get("uuid"), str)}
     every_card_named = bool(listed) and len(gpus) == len(listed)
     # a card read without its UUID or bus id had its new Xid lines skipped: keep them for the next read;
-    # with no baseline yet no line was judged, so the count is the baseline
+    # with no baseline yet no line was judged, so the last line's time is the baseline
     every_card_tied = every_card_named and all(isinstance(gpu.get("pci_bus_id"), str) for gpu in listed)
-    # after a reboot the new log is shorter than the old baseline, so the probe judged no line either
-    takes_count = xid.get("available") and (every_card_tied or before.xid_seen is None or rebooted)
-    xid_seen = xid.get("count") if takes_count else before.xid_seen
-    scraped = {str(d["uuid"]) for d in ctx.state.gpu_details or [] if isinstance(d, dict) and d.get("uuid")}
-    held = [f for f in before.held if not _held_fault_proven_healed(f, gpus, every_card_named, rebooted, scraped)]
+    # after a reboot the kernel clock starts over, so the old baseline no longer orders the lines
+    last_ts = xid.get("last_ts") if type(xid.get("last_ts")) in (int, float) else None
+    takes_baseline = xid.get("available") and (every_card_tied or before.xid_after is None or rebooted)
+    xid_after = last_ts if takes_baseline else before.xid_after
+    scraped_uuids = {str(d["uuid"]) for d in ctx.state.gpu_details or [] if isinstance(d, dict) and d.get("uuid")}
+    held = [f for f in before.held if not _held_fault_proven_healed(f, gpus, every_card_named, rebooted, scraped_uuids)]
     # one fault per card, this read's first: a card repeating an Xid must not grow the stored state
     fault_by_card: dict[str, str] = {}
     for fault in xid_faults + held:
@@ -136,7 +138,7 @@ async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardH
         return
     key = _card_health_key(ctx)
     state = CardHealthState(
-        xid_seen=xid_seen, boot_id=boot_id or before.boot_id, held=report["card_faults"]
+        xid_after=xid_after, boot_id=boot_id or before.boot_id, held=report["card_faults"]
     )
     try:
         await ctx.services.redis.set(key, json.dumps(asdict(state)), ex=CARD_HEALTH_TTL_SECONDS)
@@ -153,8 +155,8 @@ async def read_memory_health(ctx: Context) -> MemoryHealthRead:
         return ctx.state.memory_health
     before = await _load_card_health(ctx)
     command = f"{shlex.quote(ctx.executor.python_path)} -I - --nvml-only"
-    if before is not None and before.xid_seen is not None:
-        command += f" --xid-seen {before.xid_seen}"
+    if before is not None and before.xid_after is not None:
+        command += f" --xid-after {before.xid_after}"
     run = await ctx.runner.run(
         command, timeout=TIMEOUT_SECONDS, retryable=False, stdin_text=probe_source()
     )
