@@ -408,3 +408,14 @@ async def test_an_idle_faked_model_fails_fatally_and_is_hidden_from_new_rentals(
     assert result.updates == {"gpu_model_passed": False, "clear_verified_job_info": True}
     (entry,) = availability_errors([result.event])
     assert (entry.reach_source, entry.reach_target) == ("validator", "gpu")
+
+
+def test_a_gpu_model_mismatch_is_the_nodes_own_fault_never_our_outage():
+    from neurons.validators.src.services.task.availability import (
+        NODE_GPU_FAULT_CODES,
+        AvailabilityErrorCode,
+        _is_the_nodes_own_fault,
+    )
+
+    assert AvailabilityErrorCode(Msg.GPU_MODEL_MISMATCH.reason) in NODE_GPU_FAULT_CODES
+    assert _is_the_nodes_own_fault({"reason_code": Msg.GPU_MODEL_MISMATCH.reason}) is True
