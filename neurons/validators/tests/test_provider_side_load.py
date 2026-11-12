@@ -782,7 +782,7 @@ def _helper_runner(name: str, helper_percent: float = 700.0, host_cores: float =
     return _on_node(runner, {OPERATION: "RUNNING"})
 
 
-def _backend_says(ctx, answer, report_age: int = 30):
+def _backend_says(ctx, answer, report_age: int | None = 30):
     """The backend's answer on the operation: open (True), ended (False), none (None) or raise."""
     if isinstance(answer, Exception):
         mock = AsyncMock(side_effect=answer)
@@ -793,7 +793,11 @@ def _backend_says(ctx, answer, report_age: int = 30):
             return_value=StorageOperationActiveResponse(
                 active=answer,
                 status="RUNNING" if answer else "COMPLETED",
-                last_report_at=datetime.now(timezone.utc) - timedelta(seconds=report_age),
+                last_report_at=(
+                    None
+                    if report_age is None
+                    else datetime.now(timezone.utc) - timedelta(seconds=report_age)
+                ),
             )
         )
     ctx.services.backend.get_storage_operation_active = mock
@@ -806,7 +810,7 @@ def _with_recorded_helpers(
     records: set[str] | None = None,
     age: int = 0,
     backend: object = True,
-    report_age: int = 30,
+    report_age: int | None = 30,
 ):
     """The operations this validator recorded when it started them here (DAH-6148).
 
@@ -903,16 +907,24 @@ async def _cycle(context_factory, store: set[str], rows) -> float:
     return await _provider_cores(ctx)
 
 
+@pytest.mark.parametrize(
+    "report_age",
+    [11 * 60, -2 * 60, None],
+    ids=["went_quiet", "report_from_the_future", "backend_without_report_time"],
+)
 @pytest.mark.asyncio
-async def test_an_open_operation_whose_runner_went_quiet_excuses_nothing(context_factory):
+async def test_an_open_operation_whose_runner_went_quiet_excuses_nothing(
+    context_factory, report_age
+):
     # Rustam (DAH-6148): the backup's progress token is on the node, so open is not enough; a
-    # last report over 10 min old excuses nothing, and the record stays for when it reports again
+    # last report over 10 min old excuses nothing, and the record stays for when it reports again.
+    # So does a report time past the clock skew, or none (a backend older than the field)
     store: set[str] = set()
     ctx = _with_recorded_helpers(
         context_factory(state=_rented_state(SN13_SPECS), runner=_helper_runner(BACKUP_HELPER)),
         OPERATION,
         records=store,
-        report_age=11 * 60,
+        report_age=report_age,
     )
 
     assert await _provider_cores(ctx) == 8.9

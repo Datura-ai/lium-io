@@ -53,6 +53,7 @@ CLAIMED_EXCUSE_CORES = PROVIDER_SIDE_CPU_CORES_LIMIT
 STORAGE_HELPER_EXCUSE_CORES = 8.0
 # ...and only while its runner reported within this (it reports every 30 s; Rustam, DAH-6148)
 STORAGE_REPORT_MAX_AGE_SECONDS = 10 * 60
+STORAGE_REPORT_MAX_FUTURE_SECONDS = 60
 
 # A second look before any money is withheld, the same rule the foreign-GPU twin follows with
 # the live card. The scrape's window is about two seconds, and Lium's own housekeeping
@@ -309,7 +310,9 @@ async def storage_operation_open(ctx: Context, operation_id: str) -> bool | None
     if last_report_at.tzinfo is None:
         last_report_at = last_report_at.replace(tzinfo=timezone.utc)
     age = (datetime.now(timezone.utc) - last_report_at).total_seconds()
-    return True if age <= STORAGE_REPORT_MAX_AGE_SECONDS else None
+    # a report "from the future" would pass any age check: past a minute of clock skew, no answer
+    fresh = -STORAGE_REPORT_MAX_FUTURE_SECONDS <= age <= STORAGE_REPORT_MAX_AGE_SECONDS
+    return True if fresh else None
 
 
 def executor_stack_container_ids(specs: dict[str, Any]) -> set[str]:
