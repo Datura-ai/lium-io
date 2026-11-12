@@ -553,6 +553,8 @@ def test_a_non_lock_apt_failure_is_not_retried(harness):
         ([("E", "noble-security")], True),  # the security pocket is the one that must arrive
         ([("E", "noble-updates"), ("W", "noble-security")], True),  # an unreachable security InRelease counts too
         ([("E", "noble")], True),
+        # a fatal repository error suppresses the later fetch summaries (the unreachable -security one)
+        ([("E", "trixie-updates"), ("RAW", "E: The repository http://deb.debian.org/debian trixie-updates InRelease is not signed.")], True),
     ],
 )
 def test_a_failed_list_fetch_installs_from_the_lists_that_arrived(harness, failed, falls_back):
@@ -562,6 +564,8 @@ def test_a_failed_list_fetch_installs_from_the_lists_that_arrived(harness, faile
         f"E: Failed to fetch http://archive.ubuntu.com/ubuntu/dists/{s}/main/binary-amd64/Packages.gz"
         "  File has unexpected size (1 != 2). Mirror sync in progress?\n"
         if level == "E"
+        else f"{s}\n"
+        if level == "RAW"
         else f"W: Failed to fetch http://archive.ubuntu.com/ubuntu/dists/{s}/InRelease  Temporary failure resolving x\n"
         for level, s in failed
     )

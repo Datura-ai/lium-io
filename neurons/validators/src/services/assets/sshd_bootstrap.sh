@@ -209,6 +209,10 @@ apt_get() {
 # and -security (the pocket that carries openssh's security fixes) must have arrived. Both E:
 # (bad index) and W: (unreachable InRelease) failures count. Reads the last apt_get's stderr.
 apt_lists_usable() {
+    # any other fatal line (an unsigned or 403'd repository) makes apt stop summarising later fetches
+    if grep '^E: ' "$RUN_DIR/lium-apt.err" | grep -qv -e '^E: Failed to fetch ' -e '^E: Some index files failed to download'; then
+        return 1
+    fi
     failed="$(sed -n 's|^[EW]: Failed to fetch .*/dists/\([^/ ]*\)/.*|\1|p' "$RUN_DIR/lium-apt.err" | sort -u)"
     [ -n "$failed" ] || return 1
     for suite in $failed; do
