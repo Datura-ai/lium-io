@@ -1,4 +1,7 @@
 import asyncio
+import os
+import subprocess
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -6,7 +9,7 @@ import pytest
 
 from payload_models.payloads import CacheVolume, ContainerCreateRequest, WorkloadKind
 from services.container_cleanup import idle_filler_images_removal_command
-from services.docker_service import DockerService, _filler_run_volume_gb, _wipe_volume_cmd
+from services.docker_service import DockerService, _detach_volume_data_cmd, _filler_run_volume_gb, _wipe_volume_cmd
 
 
 @pytest.fixture
@@ -438,7 +441,7 @@ class KilledFillerHostSshClient(HostSshClient):
         self.users = users
 
     async def run(self, command: str, *args, **kwargs):
-        if "volume rm" in command and "/proc/1/root" in command:
+        if "volume rm" in command and "ok=' " in command:
             allowed = command.split("ok=' ", 1)[1].split(" '", 1)[0].split()
             if all(user in allowed for user in self.users):
                 self._free_bytes += 1561 * 1024**3
@@ -500,7 +503,7 @@ class KilledFillerDolphinHost(HostSshClient):
         self.wiped_gb = wiped_gb
 
     async def run(self, command: str, *args, **kwargs):
-        if "volume rm" in command and "/proc/1/root" in command:
+        if "volume rm" in command and "ok=' " in command:
             allowed = command.split("ok=' ", 1)[1].split(" '", 1)[0].split()
             if all(user in allowed for user in self.users):
                 self._free_bytes += int(self.wiped_gb * 1024**3)
@@ -726,3 +729,69 @@ def test_the_idle_filler_removal_keeps_the_rented_image_under_any_docker_hub_pre
 
     assert "reference=daturaai/dolphin " not in command
     assert "reference=daturaai/dlph " in command
+
+
+# ---------------------------------------------------------------- DAH-2498: cache files deleted off the start path
+
+
+def _run_detach(tmp_path, users: str) -> tuple[str, str]:
+    """Runs the real command against a fake docker and a temp dir standing in for the host root."""
+    root = tmp_path / "host"
+    data = root / "var/lib/docker/volumes/engy_cache_hf_x/_data"
+    data.mkdir(parents=True)
+    (data / "model.safetensors").write_bytes(b"x" * 8192)
+    docker = tmp_path / "docker"
+    docker.write_text(
+        "#!/bin/sh\n"
+        'case "$1 $2" in\n'
+        '"volume inspect") echo "local /var/lib/docker/volumes/engy_cache_hf_x/_data";;\n'
+        f'"ps -aq") printf "{users}";;\n'
+        "esac\n"
+    )
+    docker.chmod(0o755)
+    command = (
+        _detach_volume_data_cmd("engy_cache_hf_x", "echo removed")
+        .replace("/usr/bin/docker", str(docker))
+        .replace("/proc/1/root", str(root))
+    )
+    out = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=10).stdout
+    return out, str(data)
+
+
+def test_an_unused_cache_volume_is_emptied_at_once_and_its_files_deleted_in_the_background(tmp_path):
+    out, data = _run_detach(tmp_path, "")
+
+    assert out.splitlines()[0] == "removed"
+    assert out.splitlines()[1].startswith("detached ") and int(out.split()[-1]) >= 8192
+    assert os.listdir(data) == []  # the volume docker removes is empty
+    trash = tmp_path / "host/var/lib/docker/lium-cache-trash"
+    for _ in range(50):
+        if not trash.exists():
+            break
+        time.sleep(0.1)
+    assert not trash.exists()
+
+
+def test_a_cache_volume_a_container_still_uses_is_left_to_the_plain_removal(tmp_path):
+    out, data = _run_detach(tmp_path, "abc123\\n")
+
+    assert out.split() == ["removed"]
+    assert os.listdir(data) == ["model.safetensors"]
+
+
+@pytest.mark.asyncio
+async def test_bytes_still_being_freed_in_the_background_count_toward_the_rental_fit(docker_service):
+    # 2389 GB free cannot hold the 2620 GB volume: the first cache's 1561 GB are detached, so the second stays
+    class DetachingSshClient(HostSshClient):
+        async def run(self, command: str, *args, **kwargs):
+            if "volume rm" in command:
+                self.commands.append(command)
+                return SimpleNamespace(exit_status=0, stdout=f"detached {1561 * 1024**3}\n", stderr="")
+            return await super().run(command, *args, **kwargs)
+
+    ssh_client = DetachingSshClient(["dphn_cache_hf_x", _KIMI, "volume_pod"], free_gb=2389)
+    rental = _rental(2620, 1310)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is True
+    assert len(_removed_volumes(ssh_client)) == 1
+    assert rental.volume_limit_gb == 2620

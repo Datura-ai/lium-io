@@ -3267,6 +3267,32 @@ def _wipe_volume_cmd(local_volume: str, *container_names: str) -> str:
     )
 
 
+def _detach_volume_data_cmd(volume_name: str, remove_cmd: str) -> str:
+    """`remove_cmd` with the volume's files moved out first and deleted in the background (DAH-2498).
+
+    Deleting a cache of hundreds of GB held a customer start for up to ~40 s. A rename within the docker root's
+    filesystem is instant, so `remove_cmd` then removes an empty volume, and a detached `rm` frees the disk while
+    the pod starts. Prints `detached <bytes>` for what is still being freed. Moves nothing (and `remove_cmd` does
+    the whole removal as before) unless the volume is a plain local one, no container uses it, and the trash
+    directory is on the same filesystem. The detached `rm` takes the whole trash directory, so files a lost
+    earlier `rm` left behind go too.
+    """
+    docker = "/usr/bin/docker"
+    return (
+        f"v={shlex.quote(volume_name)}; t=; b=0; "
+        f"dm=$({docker} volume inspect -f '{{{{.Driver}}}} {{{{.Mountpoint}}}}' $v 2>/dev/null) && "
+        '[ "${dm%% *}" = local ] && m=${dm#* } && case "$m" in */volumes/"$v"/_data) true;; *) false;; esac && '
+        f"u=$({docker} ps -aq --filter volume=$v) && [ -z \"$u\" ] && "
+        't=${m%/volumes/*}/lium-cache-trash && mkdir -p "/proc/1/root$t" && '
+        '[ "$(stat -c %d "/proc/1/root$m")" = "$(stat -c %d "/proc/1/root$t")" ] && '
+        'b=$(du -sxB1 "/proc/1/root$m" | cut -f1) && mv "/proc/1/root$m" "/proc/1/root$t/$v.$$" && '
+        '{ mkdir "/proc/1/root$m" 2>/dev/null; true; } || t=; '
+        f"{remove_cmd}; "
+        'if [ -n "$t" ]; then (setsid nohup nice -n 19 rm -rf "/proc/1/root$t" </dev/null >/dev/null 2>&1 &); '
+        'echo "detached $b"; fi'
+    )
+
+
 def _should_repair_stale_mountpoint(
     exc: Exception,
     local_volume: str | None,
@@ -6362,24 +6388,34 @@ class DockerService:
                     }),
                 )
             )
+            # DAH-2498: bytes a detached `rm` is still freeing; they count as free, the files are already unlinked
+            # from every volume
+            detached_gb = 0.0
+
             async def remove(command: str) -> object:
-                return await asyncio.wait_for(
+                nonlocal detached_gb
+                result = await asyncio.wait_for(
                     retry_ssh_command(ssh_client, command, "reclaim_dphn_cache_for_rental"),
                     CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS,
                 )
+                detached = re.search(r"^detached (\d+)$", getattr(result, "stdout", None) or "", re.MULTILINE)
+                if detached:
+                    detached_gb += int(detached.group(1)) / (1024**3)
+                return result
 
             async def rental_fits() -> bool:
                 free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
-                return free_now_gb >= rental_needs_free_gb
+                return free_now_gb + detached_gb >= rental_needs_free_gb
 
             killed: tuple[str, ...] = tuple(killed_fillers)
 
             def volume_remove(name: str) -> str:
                 if not killed:
-                    return DockerCommand.volume_remove(name)
-                return (
+                    return _detach_volume_data_cmd(name, DockerCommand.volume_remove(name))
+                return _detach_volume_data_cmd(
+                    name,
                     f"/usr/bin/docker volume rm {shlex.quote(name)} 2>/dev/null || "
-                    f"( {_wipe_volume_cmd(name, *killed)} ) || true"
+                    f"( {_wipe_volume_cmd(name, *killed)} ) || true",
                 )
 
             # Oldest first, only as much as the rental needs: a kept Engy checkpoint still restarts fast.
