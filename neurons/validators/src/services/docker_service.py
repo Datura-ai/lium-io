@@ -8149,9 +8149,18 @@ class DockerService:
             "--format '{{index .Status \"size-max\"}}|{{index .Options \"size\"}}'"
         )
         if getattr(inspect_result, "exit_status", 0) != 0:
-            raise Exception(
-                f"docker volume inspect failed: {getattr(inspect_result, 'stderr', '')}"
-            )
+            stderr = getattr(inspect_result, "stderr", "") or ""
+            errors = [line for line in stderr.splitlines() if line.strip()]
+            if not errors or not all("no such volume" in line.lower() for line in errors):
+                raise Exception(f"docker volume inspect failed: {stderr}")
+            # A listed volume was removed before this inspect (a renter deleting a pod while creating
+            # the next one): it holds no disk now, so size from the volumes that are still there.
+            if len(volume_names) == 1:
+                return 0
+            total_bytes = 0
+            for volume_name in volume_names:
+                total_bytes += await self._inspect_vloopback_volumes_bytes(ssh_client, [volume_name])
+            return total_bytes
 
         total_bytes = 0
         for volume_name, line in zip(volume_names, (inspect_result.stdout or "").splitlines()):
