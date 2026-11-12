@@ -81,6 +81,10 @@ RECENT_FILLER_PREFIX = "recent_filler:"
 # a filler stopped for a customer rent leaves the snapshot at once but stays on the host until its delete lands:
 # one cycle (~17 min) plus RENTAL_TEARDOWN_GRACE_MINUTES, with margin, from its create or the last cycle that listed it
 RECENT_FILLER_TTL_SECONDS = 45 * 60
+# filler container name -> set when the validator removed that filler itself (GPU recheck, failed sshd). The backend
+# closes the run only after ~30 min of missing reports; until then the container's absence is not a host kill.
+FILLER_REMOVED_BY_VALIDATOR_PREFIX = "filler_removed_by_validator:"
+FILLER_REMOVED_BY_VALIDATOR_TTL_SECONDS = 2 * 3600
 # set by a filler create whose sshd never came up in the container, cleared by one where it did
 SSHD_BOOTSTRAP_FAILED_PREFIX = "sshd_bootstrap_failed"
 # prod, 24 h: failed filler creates on a broken node came 5 min to 2.7 h apart, so 6 h outlives the
