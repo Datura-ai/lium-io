@@ -798,3 +798,24 @@ async def test_an_unattachable_card_still_fails_when_the_host_list_is_also_short
 
     assert result.passed is False
     assert result.event.reason_code == Msg.UNATTACHABLE.reason
+
+
+@pytest.mark.asyncio
+async def test_an_unattachable_card_still_fails_when_the_host_list_covers_every_card(
+    context_factory, check_enabled
+):
+    ctx = _behind_a_foreign_mount(
+        _ctx(
+            context_factory,
+            reported=REAL[:4],
+            kernel=None,
+            host=_host_stdout(REAL[:4]),
+            attachable=REAL[:3],
+        )
+    )
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.UNATTACHABLE.reason
+    assert result.event.what_we_saw["unattachable_uuids"] == [REAL[3]]

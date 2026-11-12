@@ -242,29 +242,31 @@ class GpuKernelCountCheck:
             )
             kernel_check_fields.update(host_view.as_fields())
         verdict = kernel_check_fields["kernel_verdict"]
-        host_short = False
-        if verdict == "not_evaluated":
-            # DAH-6273: no container list, so the host's list decides
-            host_view = await host_view_verdict(
-                ctx, reported_count=reported_count, reported_uuids=reported_uuids
-            )
-            kernel_check_fields.update(host_view.as_fields())
-            kernel_check_fields["host_fallback"] = True
-            host_short = host_view.kernel_verdict is None and host_view.host_kernel_gpu_count is not None
-            verdict = kernel_check_fields["kernel_verdict"]
         if verdict == "not_evaluated":
             kernel_check_fields["not_evaluated_reason"] = (
                 "kernel_list_behind_foreign_mount" if foreign_mounts else "kernel_list_unavailable"
             )
+            # the attach lookup runs before the host read, so a host list that covers the cards
+            # never hides a card the create step cannot attach
             unattachable = (
                 await unattachable_gpu_uuids(ctx, reported_uuids) if foreign_mounts else []
             )
             if unattachable:
                 verdict = kernel_check_fields["kernel_verdict"] = "unattachable"
                 kernel_check_fields["unattachable_uuids"] = unattachable
-            elif host_short:
-                verdict = kernel_check_fields["kernel_verdict"] = "count_lower_host_view"
-                kernel_check_fields["kernel_view_source"] = KERNEL_VIEW_SOURCE_HOST
+            else:
+                # DAH-6273: no container list, so the host's list decides
+                host_view = await host_view_verdict(
+                    ctx, reported_count=reported_count, reported_uuids=reported_uuids
+                )
+                kernel_check_fields.update(host_view.as_fields())
+                kernel_check_fields["host_fallback"] = True
+                if host_view.kernel_verdict is None and host_view.host_kernel_gpu_count is not None:
+                    kernel_check_fields["kernel_verdict"] = "count_lower_host_view"
+                    kernel_check_fields["kernel_view_source"] = KERNEL_VIEW_SOURCE_HOST
+                verdict = kernel_check_fields["kernel_verdict"]
+                if verdict != "not_evaluated":
+                    kernel_check_fields.pop("not_evaluated_reason")
         would_fail = verdict in ("count_lower", "unattachable", "count_lower_host_view")
         enforced = (
             verdict != "count_lower_host_view"
