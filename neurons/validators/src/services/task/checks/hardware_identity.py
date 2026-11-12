@@ -88,7 +88,7 @@ def digest(values: list[str]) -> str:
 def dmi_identity_drifted(previous: dict | None, gpus: list[str], dmi_identity: str, boot_id: str = "") -> bool:
     """DMI identity changed between checks while the GPU set stayed: the board did not change, the overlay did.
 
-    A host restart in between does not count: a hypervisor may give a restarted VM a new product_uuid.
+    The boot id avoids a false positive after a host restart (a hypervisor may assign a new product_uuid).
     """
     restarted = bool(boot_id and previous and previous.get("boot") and previous.get("boot") != boot_id)
     return bool(

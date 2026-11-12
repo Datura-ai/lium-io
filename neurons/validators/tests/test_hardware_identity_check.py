@@ -144,7 +144,7 @@ async def test_dmi_change_under_same_gpus_is_flagged(context_factory):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("boot_before", "boot_after", "flagged"), [("boot-1", "boot-1", True), ("boot-1", "boot-2", False)])
-async def test_dmi_change_counts_only_within_one_boot(context_factory, boot_before, boot_after, flagged):
+async def test_host_restart_false_positive(context_factory, boot_before, boot_after, flagged):
     ctx = _ctx(context_factory, stdout=_stdout(values="uuid-1|serial-1|", boot=boot_before))
     redis = ctx.services.redis
     assert (await _run(ctx)).passed is True
