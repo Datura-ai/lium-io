@@ -228,18 +228,25 @@ async def test_a_filler_cycle_renews_the_marker(context_factory):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "rm_stdout, marked",
+    "ps_stdout, rm_stdout, marked",
     [
-        pytest.param("filler_run-1\n", True, id="docker-removed-it"),
+        pytest.param("abc123\n", "filler_run-1\n", True, id="running-and-docker-removed-it"),
         # `rm -f` exits 0 for a container already gone: the host removed it, not us (review)
-        pytest.param("", False, id="already-gone"),
+        pytest.param("", "", False, id="already-gone"),
+        # a host-stopped filler is exited: `rm -f` removes and names it, but the stop was not ours (review)
+        pytest.param("", "filler_run-1\n", False, id="stopped-before-removal"),
     ],
 )
-async def test_a_node_that_always_runs_a_filler_is_probed_after_the_skip_limit(context_factory, rm_stdout, marked):
+async def test_a_node_that_always_runs_a_filler_is_probed_after_the_skip_limit(
+    context_factory, ps_stdout, rm_stdout, marked
+):
     filler = "filler_run-1"
     runner, validation = FakeRunner(probe_stdout("ok")), FakeValidation(_all_cards("", ""))
     ssh = AsyncMock()
-    ssh.run.return_value = SimpleNamespace(exit_status=0, stdout=rm_stdout, stderr="")
+    ssh.run.side_effect = [
+        SimpleNamespace(exit_status=0, stdout=ps_stdout, stderr=""),
+        SimpleNamespace(exit_status=0, stdout=rm_stdout, stderr=""),
+    ]
     services = build_services(validation=validation)
     services.redis.store[KEY] = json.dumps({**MARKER, "filler_skips": module.FILLER_SKIP_LIMIT})
     uuid = default_executor().uuid

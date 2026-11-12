@@ -172,13 +172,17 @@ async def remove_lium_fillers(ctx: Context, fillers: list[str]) -> list[str]:
     removed: list[str] = []
     for name in fillers:
         try:
+            # only a filler running right now is ours to mark: a host stop or kill before this cycle
+            # leaves it exited or gone, and `rm -f` still exits 0 (and names an exited one) (review)
+            was_running = False
+            with contextlib.suppress(Exception):
+                ps = await ctx.ssh.run(DockerCommand.ps_running(name), timeout=60)
+                was_running = ps.exit_status == 0 and bool((ps.stdout or "").strip())
             result = await ctx.ssh.run(DockerCommand.remove_with_volumes(shlex.quote(name)), timeout=60)
             if result.exit_status != 0:
                 continue
             removed.append(name)
-            # `rm -f` exits 0 for a container already gone; only a removal docker names is ours to mark,
-            # else a host kill before this cycle would pass as our removal (review)
-            if name in (result.stdout or "").split():
+            if was_running and name in (result.stdout or "").split():
                 # an unmarked removal is judged as before; the missing report below still goes
                 with contextlib.suppress(Exception):
                     await ctx.services.redis.set(
