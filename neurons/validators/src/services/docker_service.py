@@ -14040,12 +14040,17 @@ class DockerService:
                         SSHCommandRunner(ssh_client, max_retries=0), self.redis_service, payload.pod_id
                     )
 
-                with _best_effort_delete_step(log, "prune_images"):
-                    await run_logged_rental_docker_sdk_operation(
-                        operation="prune_images",
-                        log_extra=default_extra,
-                        call=docker_client.prune_images,
-                    )
+                # a prune during a customer create's pull on this host drops the pull's containerd lease
+                # ("commit failed: lease does not exist"), failing the renter's create; the next delete prunes
+                if customer_creates.is_running(payload.miner_hotkey, payload.executor_id):
+                    log.info("Image prune skipped: a customer create is running on this executor")
+                else:
+                    with _best_effort_delete_step(log, "prune_images"):
+                        await run_logged_rental_docker_sdk_operation(
+                            operation="prune_images",
+                            log_extra=default_extra,
+                            call=docker_client.prune_images,
+                        )
 
                 # DAH-3467: after a removal confirmed by inspect, a volume dockerd still holds is
                 # retried before the step gives it up; every volume failure stays best-effort. A

@@ -1676,6 +1676,46 @@ async def test_delete_container_missing_volume_still_deleted(
 
 
 @pytest.mark.asyncio
+async def test_delete_container_skips_prune_while_customer_create_runs_on_executor(
+    docker_service,
+    monkeypatch,
+):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.remove_rented_machine = AsyncMock()
+
+    executor_id = str(uuid4())
+    filler_delete = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=executor_id,
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.FILLER,
+        container_name="filler_prune_skip",
+    )
+    customer_create = Mock(
+        miner_hotkey="miner", executor_id=executor_id, workload_kind=WorkloadKind.CUSTOMER_RENTAL
+    )
+    with docker_service_module.customer_creates.track(customer_create):
+        result = await docker_service.delete_container(
+            payload=filler_delete,
+            executor_info=_delete_container_executor_info(executor_id),
+            keypair=Mock(ss58_address="validator-hotkey"),
+            private_key="encrypted",
+        )
+
+    assert isinstance(result, ContainerDeleted)
+    # the renter's pull on this host is not raced by an image prune
+    assert docker_service.rental_docker_client_factory.client.pruned_images == 0
+
+
+@pytest.mark.asyncio
 async def test_delete_container_prune_images_failure_still_deleted(
     docker_service,
     monkeypatch,
