@@ -6167,6 +6167,7 @@ class DockerService:
         default_extra: dict,
         host_probe: PrerunHostProbe | None = None,
         killed_fillers: Iterable[str] = (),
+        trimmed_run_volumes: set[str] | None = None,
     ) -> bool:
         """Free filler cache volumes when a customer rental's volume does not fit beside them; True when
         volumes may have been removed.
@@ -6237,6 +6238,8 @@ class DockerService:
                 freed_gb = await self._trim_killed_filler_run_volume(
                     ssh_client, filler, killed, docker_root_dir, default_extra
                 )
+                if freed_gb and trimmed_run_volumes is not None:
+                    trimmed_run_volumes.add(_filler_run_volume_name(filler))  # only these leave the sizing pool
                 if fit.fresh_sizing:
                     # a trimmed run volume still counts its declared size among the pod volumes (existing_gb) while
                     # its disk is back in df: without this the rental would be counted on that disk twice
@@ -8314,8 +8317,8 @@ class DockerService:
     ) -> VolumeSizingResult:
         """Resolve effective volume/storage limits for a new pod volume (DAH-2183).
 
-        `excluded_volume_names` (killed fillers' run volumes, DAH-5798) stay out of the pool: their disk is
-        already back in df, so their declared size would count it twice.
+        `excluded_volume_names` (killed fillers' run volumes the trim freed, DAH-5798) stay out of the pool: their
+        disk is already back in df, so their declared size would count it twice. An untrimmed one still holds it.
 
         `flatten_copy_bytes` (a many-layer image on a Sysbox full node) caps the grant so a one-layer copy
         still fits beside it, never below `payload.min_volume_gb` or the ordered `payload.volume_limit_gb`.
@@ -10669,6 +10672,7 @@ class DockerService:
                 killed_fillers = (
                     [] if beside_fillers else [n for n in removed_containers if n.startswith(FILLER_CONTAINER_PREFIX)]
                 )
+                trimmed_run_volumes: set[str] = set()
                 reclaimed_cache_volumes = (
                     False
                     if beside_fillers
@@ -10678,6 +10682,7 @@ class DockerService:
                         default_extra=default_extra,
                         host_probe=docker_listing_probe,
                         killed_fillers=killed_fillers,
+                        trimmed_run_volumes=trimmed_run_volumes,
                     )
                 )
                 # the reclaim changes the order only when it clamps it: a cache removal failed or timed out
@@ -10855,7 +10860,7 @@ class DockerService:
                         locked_df_avail_bytes=locked_df_avail_bytes,
                         locked_df_error=locked_df_error,
                         flatten_copy_bytes=flatten_copy,
-                        excluded_volume_names={_filler_run_volume_name(f) for f in killed_fillers},
+                        excluded_volume_names=trimmed_run_volumes,
                     )
                     effective_volume_limit_gb = sizing.volume_limit_gb
                     effective_storage_limit_gb = sizing.storage_limit_gb

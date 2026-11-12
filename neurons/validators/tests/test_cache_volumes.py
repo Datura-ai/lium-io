@@ -687,10 +687,12 @@ def _full_node_rental(monkeypatch, docker_service):
 async def test_the_killed_filler_run_volume_is_trimmed_and_the_order_keeps_its_share(docker_service, monkeypatch):
     rental = _full_node_rental(monkeypatch, docker_service)
     ssh_client = KilledFillerRunVolumeHost(["filler_f9c9d1e7"], free_gb=262.2)
+    trimmed: set[str] = set()
 
     assert await docker_service.reclaim_dphn_cache_for_rental(
-        ssh_client, rental, {}, killed_fillers=["filler_f9c9d1e7"]
+        ssh_client, rental, {}, killed_fillers=["filler_f9c9d1e7"], trimmed_run_volumes=trimmed
     ) is True
+    assert trimmed == {_RUN_VOLUME}
     assert any('nsenter -t 1 -m -- fstrim "$p"' in command and _RUN_VOLUME in command for command in ssh_client.commands)
     # the trimmed volume is not counted twice: (262.2 + 74.5 + 37.3 free + 54.5 pod volumes - 74.5) x 242/363
     assert rental.volume_limit_gb == 235  # 95% of 242 is 229.9
@@ -700,10 +702,12 @@ async def test_the_killed_filler_run_volume_is_trimmed_and_the_order_keeps_its_s
 async def test_a_run_volume_a_live_container_mounts_is_not_trimmed(docker_service, monkeypatch):
     rental = _full_node_rental(monkeypatch, docker_service)
     ssh_client = KilledFillerRunVolumeHost(["filler_f9c9d1e7", "filler_live"], free_gb=262.2)
+    trimmed: set[str] = set()
 
     assert await docker_service.reclaim_dphn_cache_for_rental(
-        ssh_client, rental, {}, killed_fillers=["filler_f9c9d1e7"]
+        ssh_client, rental, {}, killed_fillers=["filler_f9c9d1e7"], trimmed_run_volumes=trimmed
     ) is True
+    assert trimmed == set()  # still holds its disk: it stays in the sizing pool
     assert ssh_client._free_bytes == int(262.2 * 1024**3)
     assert rental.volume_limit_gb < 242 * 0.95
 
@@ -737,9 +741,14 @@ class FailedTrimHost(KilledFillerRunVolumeHost):
 async def test_a_failed_run_volume_trim_is_logged_with_the_volume_and_its_output(docker_service, monkeypatch, caplog):
     rental = _full_node_rental(monkeypatch, docker_service)
     ssh_client = FailedTrimHost(["filler_f9c9d1e7"], free_gb=262.2)
+    trimmed: set[str] = set()
 
     with caplog.at_level("WARNING"):
-        await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}, killed_fillers=["filler_f9c9d1e7"])
+        await docker_service.reclaim_dphn_cache_for_rental(
+            ssh_client, rental, {}, killed_fillers=["filler_f9c9d1e7"], trimmed_run_volumes=trimmed
+        )
+
+    assert trimmed == set()
 
     [record] = [r for r in caplog.records if "run volume" in r.getMessage()]
     assert record.msg.extra["volume"] == _RUN_VOLUME and "cannot get realpath" in record.msg.extra["output"]
