@@ -32,14 +32,20 @@ _GATE = (
     f'case "$(tr "\\0" " " < /proc/$p/cmdline 2>/dev/null)" in *--watchdog-loop*) exit {WATCHDOG_ALIVE};; esac; '
     f"[ ! -e /var/lib/lium/ssh-login-seen ] || exit {RENTER_LOGGED_IN}; "
     f"[ ! -s /var/log/wtmp ] || exit {RENTER_LOGGED_IN}; "
-    f"cat > {IN_CONTAINER_SSH_BOOTSTRAP_PATH} && sh {IN_CONTAINER_SSH_BOOTSTRAP_PATH} --grace 0"
+    f"cat > {IN_CONTAINER_SSH_BOOTSTRAP_PATH}"
 )
+# a separate exec: under the gate's `sh -c`, whose command line names the sshd pidfile, the bootstrap's
+# `ps | grep sshd` fallback would see that shell as a running sshd and never start one
+_BOOTSTRAP = f"sh {IN_CONTAINER_SSH_BOOTSTRAP_PATH} --grace 0"
 
 
 def restart_command(name: str) -> str:
     """One host command: re-run the create's sshd bootstrap in the pod, behind the gate above."""
     script = base64.b64encode(_BOOTSTRAP_SCRIPT.read_bytes()).decode()
-    return f"printf %s {script} | base64 -d | " + DockerCommand.exec_command(name, _GATE)
+    return (
+        f"printf %s {script} | base64 -d | {DockerCommand.exec_command(name, _GATE)}"
+        f" && {DockerCommand.exec_command(name, _BOOTSTRAP)}"
+    )
 
 
 class PodSshdRestartCheck:

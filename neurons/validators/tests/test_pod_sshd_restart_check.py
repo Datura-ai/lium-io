@@ -152,3 +152,10 @@ async def test_a_restart_never_runs_past_the_time_the_later_checks_need(
         "2": "skipped: no cycle time left",
         "3": "skipped: no cycle time left",
     }
+
+
+def test_the_bootstrap_runs_outside_the_gate_shell_that_names_the_sshd_pidfile():
+    # the bootstrap's `ps -ef | grep [s]shd` fallback would take its own parent shell for a live sshd
+    gate, bootstrap = pod_sshd_restart.restart_command("pod_1").split(" && /usr/bin/docker exec ")
+    assert "sshd-watchdog.pid" in gate
+    assert "sshd" not in bootstrap
