@@ -273,6 +273,27 @@ async def test_the_engy_checkpoint_is_reclaimed_oldest_first_and_only_as_far_as_
 
 
 @pytest.mark.asyncio
+async def test_each_eviction_step_is_timed_in_one_log_line(cleanup, caplog):
+    # DAH-2498: a slow pod start must show whether the image removal or a cache volume cost it
+    ssh_client = EvictingSshClient(
+        {
+            "engy_cache_hf_kimi-k3": ("2026-10-22T10:00:00Z", 1500),
+            "dphn_cache_hf_x": ("2026-10-01T10:00:00Z", 80),
+        },
+        free_gb=40,
+    )
+
+    with caplog.at_level("INFO", logger="services.container_cleanup"):
+        await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1")
+
+    (record,) = [r for r in caplog.records if r.getMessage() == "Filler cache eviction timed"]
+    extra = record.msg.extra
+    assert [step["removed"] for step in extra["removals"]] == ["idle filler images", "dphn_cache_hf_x"]
+    assert all(step["seconds"] >= 0 for step in extra["removals"])
+    assert extra["executor_uuid"] == "exec-1"
+
+
+@pytest.mark.asyncio
 async def test_a_live_customer_pod_under_the_floor_gets_the_cache_back(cleanup):
     # DAH-6187: the rent keeps the cache when the pod's volume fits beside it, but the pod's writes
     # take real disk; once they push the node under the floor the cache gives way to the renter

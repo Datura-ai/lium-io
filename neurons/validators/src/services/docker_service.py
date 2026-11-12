@@ -6393,6 +6393,7 @@ class DockerService:
                     evict_first_prefix=ENGY_CACHE_VOLUME_PREFIX,
                     volume_remove=volume_remove,
                     keep_image=payload.docker_image,
+                    log_extra=default_extra,
                 )
             except asyncio.CancelledError:
                 raise
