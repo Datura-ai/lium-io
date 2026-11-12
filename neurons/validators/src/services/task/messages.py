@@ -2008,8 +2008,10 @@ class CapabilityMessages:
         event="GPU model check failed: the card is not the reported model",
         reason="GPU_MODEL_MISMATCH",
         severity="error",
-        category="gpu",
-        impact="Score set to 0",
+        # an availability error: the backend hides the node and refuses new rentals, a rental on it runs on
+        category=AVAILABILITY_CATEGORY,
+        impact="Score set to 0; node hidden and not rentable while the mismatch stands (a running "
+        "rental is kept)",
         remediation=(
             "The compute capability and SM count measured on the GPU do not match the GPU model "
             "the node reports. Report the model the card really is; a node is paid for the GPU "

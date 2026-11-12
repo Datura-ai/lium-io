@@ -3,7 +3,7 @@ from __future__ import annotations
 from ..messages import CapabilityMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 from .banned_provider import has_live_rental
-from .capability import stored_gpu_model_verdict
+from .capability import gpu_model_mismatch_result, stored_gpu_model_verdict
 
 
 class GpuModelVerdictCheck:
@@ -18,14 +18,10 @@ class GpuModelVerdictCheck:
         rented = has_live_rental(ctx)
         mismatches = (await stored_gpu_model_verdict(ctx))[1] if rented else []
         if mismatches:
-            event = render_message(
-                Msg.GPU_MODEL_MISMATCH,
-                ctx=ctx,
-                check_id=self.check_id,
-                what={**mismatches[0].as_dict(), "transport": "stored", "rented": True},
+            # the cycle goes on, so the rental is still verified; score 0 and hidden from new rentals
+            return gpu_model_mismatch_result(
+                ctx, self.check_id, {**mismatches[0].as_dict(), "transport": "stored", "rented": True}
             )
-            # the cycle goes on, so the rental is still verified and billed (as a ban does)
-            return CheckResult(passed=False, event=event, fatal=False)
         event = render_message(
             Msg.GPU_MODEL_VERDICT_OK, ctx=ctx, check_id=self.check_id, what={"rented": rented}
         )

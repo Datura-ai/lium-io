@@ -5,6 +5,7 @@ import json
 import pytest
 
 from neurons.validators.src.services.matrix_validation_service import ValidationResult
+from neurons.validators.src.services.task.availability import availability_errors
 from neurons.validators.src.services.task.checks import capability
 from neurons.validators.src.services.task.checks.capability import CapabilityCheck
 from neurons.validators.src.services.task.checks.gpu_model_verdict import GpuModelVerdictCheck
@@ -304,7 +305,10 @@ async def test_a_rented_node_with_a_stored_mismatch_fails_before_the_rented_halt
 
     assert result.passed is False
     assert result.event.reason_code == Msg.GPU_MODEL_MISMATCH.reason
-    assert result.fatal is False  # the rental is still verified and billed
+    # Rustam 12 Nov: the renter's pod keeps running (not fatal), score 0, hidden from new rentals
+    assert result.fatal is False
+    assert result.updates == {"gpu_model_passed": False, "clear_verified_job_info": True}
+    assert [e.reason_code for e in availability_errors([result.event])] == [Msg.GPU_MODEL_MISMATCH.reason]
     assert no_matmul.called_with is None  # nothing runs beside the renter's pod
 
 
@@ -394,3 +398,13 @@ async def test_a_filler_sample_passing_on_another_card_keeps_a_cards_stored_mism
     assert sampler.gpu_uuids == ["GPU-1"]
     assert result.passed is False
     assert result.event.what_we_saw["card_index"] == 0
+
+
+@pytest.mark.asyncio
+async def test_an_idle_faked_model_fails_fatally_and_is_hidden_from_new_rentals(context_factory):
+    result = await _run(context_factory, "NVIDIA H100 80GB HBM3", "8.0", 108)
+
+    assert result.fatal is True
+    assert result.updates == {"gpu_model_passed": False, "clear_verified_job_info": True}
+    (entry,) = availability_errors([result.event])
+    assert (entry.reach_source, entry.reach_target) == ("validator", "gpu")

@@ -13,6 +13,7 @@ from core.utils import _m, get_extra_info
 from services.const import SECONDS_PER_BLOCK
 from services.matrix_validation_service import UUID_MISMATCH_ERROR_PREFIX
 
+from ..availability import ReachSource, ReachTarget
 from ..messages import CapabilityMessages as Msg, MessageTemplate, render_message
 from ..pipeline import CheckResult, Context
 from .gpu_model_truth import (
@@ -76,13 +77,9 @@ class CapabilityCheck:
                 elif not seen:
                     await _store_gpu_model_verdict(ctx, [], GPU_MODEL_NO_VERDICT_TTL_SECONDS)
             if mismatches:
-                event = render_message(
-                    Msg.GPU_MODEL_MISMATCH,
-                    ctx=ctx,
-                    check_id=self.check_id,
-                    what={**mismatches[0].as_dict(), **what_filler, "transport": "filler"},
+                return gpu_model_mismatch_result(
+                    ctx, self.check_id, {**mismatches[0].as_dict(), **what_filler, "transport": "filler"}
                 )
-                return CheckResult(passed=False, event=event)
             event = render_message(
                 Msg.FILLER_SKIPPED,
                 ctx=ctx,
@@ -132,13 +129,9 @@ class CapabilityCheck:
                 judged_cards(result.metrics, card_metrics),
             )
             if mismatches:
-                event = render_message(
-                    Msg.GPU_MODEL_MISMATCH,
-                    ctx=ctx,
-                    check_id=self.check_id,
-                    what={**mismatches[0].as_dict(), "sealed": result.sealed, "transport": transport},
+                return gpu_model_mismatch_result(
+                    ctx, self.check_id, {**mismatches[0].as_dict(), "sealed": result.sealed, "transport": transport}
                 )
-                return CheckResult(passed=False, event=event)
             what: dict = {"metrics": result.metrics, "transport": transport}
             if sizing:
                 what["first_pass_vram_budget_mb"] = sizing["vram_budget_mb"]
@@ -414,6 +407,25 @@ async def _filler_matmul_sample(
         sample.update(passed=False, timed_out=False, error=str(exc), error_kind="validator_error")
     logger.warning(_m("FILLER_MATMUL_SAMPLE", extra=get_extra_info({**ctx.default_extra, **sample})))
     return sample, found
+
+
+def gpu_model_mismatch_result(ctx: Context, check_id: str, what: dict) -> CheckResult:
+    """DAH-6241 (Rustam, 12 Nov): a card below its reported model fails the node with score 0, clears its verified
+    job info and is an availability entry, so the node is hidden and not relisted once a rental ends. With a renter's
+    pod running it is not fatal: the rental runs on and is still verified."""
+    rental = rental_of_this_node(ctx)
+    event = render_message(
+        Msg.GPU_MODEL_MISMATCH,
+        ctx=ctx,
+        check_id=check_id,
+        what={**what, "reach_source": str(ReachSource.VALIDATOR), "reach_target": str(ReachTarget.GPU)},
+    )
+    return CheckResult(
+        passed=False,
+        event=event,
+        updates={"gpu_model_passed": False, "clear_verified_job_info": True},
+        fatal=not (rental is not None and rental.pods),
+    )
 
 
 def _gpu_model_verdict_key(ctx: Context) -> str:
