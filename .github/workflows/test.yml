@@ -38,8 +38,10 @@ concurrency:
 
 jobs:
   route:
-    # a comment or request-changes review starts a run too; it skips every job (no minutes)
-    if: github.event_name != 'pull_request_review' || github.event.review.state == 'approved'
+    # a comment, request-changes or outside review starts a run too; it skips every job (no minutes)
+    if: >-
+      github.event_name != 'pull_request_review' || (github.event.review.state == 'approved'
+      && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.review.author_association))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -60,8 +62,10 @@ jobs:
     # and ASYNC210/ASYNC251 (blocking HTTP call / time.sleep inside a coroutine). F541 stays
     # ignored and the other families stay out until each is at zero; add a family here in the
     # commit that fixes it. Config: the root pyproject.toml ([tool.ruff]).
-    # Runs before approval too; like route, a review other than an approval skips it.
-    if: github.event_name != 'pull_request_review' || github.event.review.state == 'approved'
+    # Runs before approval too; like route, a review other than a member's approval skips it.
+    if: >-
+      github.event_name != 'pull_request_review' || (github.event.review.state == 'approved'
+      && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.review.author_association))
     name: ruff check (pyflakes, blocking calls in coroutines)
     runs-on: ubuntu-latest
     timeout-minutes: 5
