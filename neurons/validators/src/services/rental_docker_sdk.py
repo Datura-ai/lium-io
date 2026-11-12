@@ -71,6 +71,8 @@ _T = TypeVar("_T")
 def docker_size(gb: float) -> str:
     """A Docker size string with no fraction: Docker refuses one like `36.5g`, so a half GiB goes as whole MiB."""
     return f"{int(gb)}g" if gb == int(gb) else f"{int(gb * 1024)}m"
+
+
 # DAH-2475: the Docker SDK is synchronous, so every call below has to run in a thread. It must not be
 # the event loop's default executor: asyncio resolves DNS there too (loop.getaddrinfo runs in it), and
 # a wave of filler creates fills that pool with minutes-long pulls. Name resolution then queues behind
