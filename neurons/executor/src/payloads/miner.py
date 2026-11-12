@@ -29,5 +29,5 @@ class MinerIdentityResponse(BaseModel):
     account_claim: str | None = None
     # the SSH port validators dial, sent only while its host keys survive recreation (portal records them)
     ssh_host_key_port: int | None = None
-    # base64 ed25519 signature by sshd's host key over nonce, hotkey and claim (routes/apis.py identity_proof_message)
-    host_key_proof: str | None = None
+    # `<type> <base64>` host key line -> base64 signature by that key over nonce, hotkey and claim (routes/apis.py)
+    host_key_proofs: dict[str, str] | None = None
