@@ -76,6 +76,42 @@ class PodRecoverer(Protocol):
         default_extra: dict[str, Any],
     ) -> bool: ...
 
+    async def recover_parked_pod_container(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_info: ExecutorSSHInfo,
+        miner_hotkey: str,
+        private_key: str,
+        container_name: str,
+        pod_id: str,
+        local_volume_path: str | None,
+        default_extra: dict[str, Any],
+        stopped_by_recovery: bool = False,
+    ) -> bool: ...
+
+    async def encrypted_volume_mount_missing(
+        self, ssh_client: asyncssh.SSHClientConnection, container_name: str, plaintext_path: str | None
+    ) -> bool: ...
+
+    async def restore_volume_mount_of_running_container(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_info: ExecutorSSHInfo,
+        private_key: str | None,
+        container_name: str,
+        pod_id: str,
+        local_volume_path: str | None,
+        default_extra: dict[str, Any],
+    ) -> bool: ...
+
+    async def unmounted_stop_outcome(self, pod_id: str) -> str | None: ...
+
+    async def forget_recovery_stop(self, pod_id: str) -> None: ...
+
+    async def recovery_stop_pending(self, pod_id: str) -> bool: ...
+
 
 @dataclass(frozen=True)
 class ContextServices:
@@ -344,6 +380,7 @@ class EventSink(Protocol):
 PROVIDER_STATE_REASON_CODES: frozenset[str] = frozenset(
     {
         "EXECUTOR_IMAGE_OUTDATED",
+        "EXECUTOR_IMAGE_UNOFFICIAL",
         "PROVIDER_BANNED",
         "PROVIDER_SIDE_LOAD_ABOVE_LIMIT",
     }
@@ -597,16 +634,22 @@ def _a_finding(ran: _RanCheck) -> bool:
     )
 
 
-def _session_lost(ran: list[_RanCheck], ctx: Context) -> _RanCheck:
-    failed = next(r for r in ran if not r.result.passed)
+def _session_lost(ran: list[_RanCheck], ctx: Context, step: "Check | ParallelStage | None" = None) -> _RanCheck:
+    # the failed check names the event; after a failed reconnect the run may have no failure (or nothing ran)
+    failed = next((r for r in ran if not r.result.passed), ran[-1] if ran else None)
+    if failed is None:
+        chk = step.checks[-1] if isinstance(step, ParallelStage) else step
+        before, at = ctx.state, time.perf_counter()
+    else:
+        chk, before, at = failed.check, failed.before_state, failed.finished
     event = render_message(
         TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE,
         ctx=ctx,
-        check_id=failed.check.check_id,
+        check_id=chk.check_id,
         what={"executor_uuid": ctx.executor.uuid, "transport_error": "SSH session closed under the check"},
     )
     result = CheckResult(passed=False, event=event, fatal=True)
-    return _RanCheck(failed.check, result, failed.before_state, failed.finished, failed.finished, in_steps=False)
+    return _RanCheck(chk, result, before, at, at, in_steps=False)
 
 
 def _replays_after_session_drop(step: "Check | ParallelStage") -> bool:
@@ -724,6 +767,9 @@ class Pipeline:
                         extra={**ctx.default_extra, "error": repr(exc)[:300]},
                     )
                 )
+                # the node refused the new session: the run ends here on the transport failure, whether the step
+                # passed or raised, never carrying on over the dead session or ending with no verdict
+                return [*(_not_terminal(r) for r in ran), _session_lost(ran, ctx, step)], ctx
             else:
                 logger.warning(
                     _m(
