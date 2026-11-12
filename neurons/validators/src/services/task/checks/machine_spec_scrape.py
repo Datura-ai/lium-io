@@ -590,8 +590,8 @@ class MachineSpecScrapeCheck:
 
             updated_state = replace(
                 updated_state,
-                liumd_facts_task=start_facts_after_scrape(ctx),
-                liumd_facts_attempted=True,
+                liumd_shadow_facts_task=start_facts_after_scrape(ctx),
+                liumd_shadow_facts_attempted=True,
             )
             updates: dict[str, object] = {"state": updated_state, "default_extra": {**ctx.default_extra, **extra_info}}
             return CheckResult(passed=True, event=event, updates=updates)

@@ -949,5 +949,5 @@ async def test_a_successful_scrape_starts_the_liumd_facts_read(context_factory, 
     result = await _scrape_ok_event_for(context_factory, {})
 
     assert result.passed is True
-    assert result.updates["state"].liumd_facts_task is started and len(seen) == 1
-    assert result.updates["state"].liumd_facts_attempted is True
+    assert result.updates["state"].liumd_shadow_facts_task is started and len(seen) == 1
+    assert result.updates["state"].liumd_shadow_facts_attempted is True

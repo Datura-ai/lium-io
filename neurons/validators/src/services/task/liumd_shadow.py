@@ -339,8 +339,8 @@ async def _compare(
         # here only for GPU steps. With GPU steps off there is no late fallback: a missing early
         # read would compare a different Docker moment.
         facts_only = matmul_challenge is None and verifyx_challenge is None
-        early = ctx.state.liumd_facts_task
-        if facts_only and ctx.state.liumd_facts_attempted and early is None:
+        early = ctx.state.liumd_shadow_facts_task
+        if facts_only and ctx.state.liumd_shadow_facts_attempted and early is None:
             return _skipped("no_facts_read", steps=steps)
         facts_answer = await early if early is not None else None
         try:

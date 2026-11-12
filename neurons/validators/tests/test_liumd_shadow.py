@@ -339,7 +339,7 @@ def _docker(*names):
 
 def _with_facts_task(ctx, early):
     task = start_facts_after_scrape(ctx, early.factory)
-    return task, ctx.model_copy(update={"state": replace(ctx.state, liumd_facts_task=task)})
+    return task, ctx.model_copy(update={"state": replace(ctx.state, liumd_shadow_facts_task=task)})
 
 
 @pytest.fixture
@@ -372,7 +372,7 @@ async def test_no_late_read_when_the_early_facts_task_is_missing(
     keypair, monkeypatch, verifyx_service, shadow_on
 ):
     ctx = _ctx(keypair, monkeypatch, verifyx_service)
-    ctx = ctx.model_copy(update={"state": replace(ctx.state, liumd_facts_attempted=True)})
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, liumd_shadow_facts_attempted=True)})
     late = FakeLiumd(facts=_docker("executor-1", "pod_x"))
 
     record = await _shadow(ctx, late)
