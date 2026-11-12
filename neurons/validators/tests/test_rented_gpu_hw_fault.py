@@ -113,8 +113,8 @@ def _ok(gpu=None, **extra):
     return _report("ok", flags=[], nvml=nvml, **extra)
 
 
-async def _read(context_factory, services, stdout):
-    ctx = _ctx(context_factory, services, listed=UUIDS).model_copy(update={"runner": FakeRunner(stdout)})
+async def _read(context_factory, services, stdout, listed=UUIDS):
+    ctx = _ctx(context_factory, services, listed=listed).model_copy(update={"runner": FakeRunner(stdout)})
     read = await gpu_memory_health.read_memory_health(ctx)
     return read, ctx.runner.calls[0]["cmd"]
 
@@ -169,6 +169,31 @@ async def test_a_reboot_heals_a_held_xid_even_when_a_card_is_missing_from_a_part
         context_factory, services, _ok(gpu={"uuid": None}, xid={"available": True, "count": 1}, boot_id="boot-b")
     )
     assert rebooted.report["card_faults"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_reboot_takes_the_new_xid_baseline_even_with_an_untied_card(context_factory):
+    services = _services()
+    await _read(context_factory, services, _ok(xid={"available": True, "count": 9}, boot_id="boot-a"))
+    # the new boot's log is shorter than the old baseline: keeping 9 would hide its next Xids (review)
+    await _read(
+        context_factory, services, _ok(gpu={"pci_bus_id": None}, xid={"available": True, "count": 2}, boot_id="boot-b")
+    )
+    assert _stored(services.redis)["xid_seen"] == 2
+
+
+@pytest.mark.asyncio
+async def test_a_held_fault_closes_on_absence_only_when_the_scrape_also_misses_the_card(context_factory):
+    services = _services()
+    other = {"uuid": UUIDS[4], "index": 4, "pci_bus_id": "00000000:04:00.0"}
+    await _read(context_factory, services, _ok(card_suspects=[NARROW_LINK]))
+    await _read(context_factory, services, _ok(card_suspects=[NARROW_LINK]))
+    # the card dropped out after this cycle's scrape listed it: no missing-card fault yet, so keep it (review)
+    still_scraped, _ = await _read(context_factory, services, _ok(gpu=other))
+    gone, _ = await _read(context_factory, services, _ok(gpu=other), listed=[u for u in UUIDS if u != UUIDS[3]])
+
+    assert still_scraped.report["card_faults"] == [NARROW_LINK]
+    assert gone.report["card_faults"] == []
 
 
 @pytest.mark.asyncio

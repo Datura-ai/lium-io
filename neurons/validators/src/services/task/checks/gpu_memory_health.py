@@ -87,10 +87,10 @@ def _fault_kind(fault: str) -> str:
 
 
 def _held_fault_proven_healed(
-    fault: str, gpus: dict[str, dict[str, Any]], every_card_named: bool, rebooted: bool
+    fault: str, gpus: dict[str, dict[str, Any]], every_card_named: bool, rebooted: bool, scraped: set[str]
 ) -> bool:
-    """Proof that a held card fault is over: the card is gone from a read naming every card (the
-    missing-card rule reports that), a PCIe downgrade reads its full link at full performance, an Xid a
+    """Proof that a held card fault is over: the card is gone from a read naming every card and from this
+    cycle's scrape (the missing-card rule reports that), a PCIe downgrade reads its full link at full performance, an Xid a
     new host boot. A read that merely shows nothing new, or lacks the values, proves nothing."""
     uuid = _card_uuid(fault)
     if uuid is None:
@@ -99,7 +99,8 @@ def _held_fault_proven_healed(
         return True
     gpu = gpus.get(uuid)
     if gpu is None:
-        return every_card_named
+        # a card that drops out after the scrape is still listed there, so no missing-card fault fires yet
+        return every_card_named and uuid not in scraped
     if ": PCIe link " in fault:
         link = [gpu.get(k) for k in ("pcie_width", "pcie_width_max", "pcie_gen", "pcie_gen_max")]
         return gpu.get("pstate") == 0 and None not in link and link[0] == link[1] and link[2] == link[3]
@@ -132,11 +133,13 @@ async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardH
     # a card read without its UUID or bus id had its new Xid lines skipped: keep them for the next read;
     # with no baseline yet no line was judged, so the count is the baseline
     every_card_tied = every_card_named and all(isinstance(gpu.get("pci_bus_id"), str) for gpu in listed)
-    takes_count = xid.get("available") and (every_card_tied or before.xid_seen is None)
+    # after a reboot the new log is shorter than the old baseline, so the probe judged no line either
+    takes_count = xid.get("available") and (every_card_tied or before.xid_seen is None or rebooted)
     xid_seen = xid.get("count") if takes_count else before.xid_seen
     downgraded_before = {_card_uuid(s) for s in before.pcie_downgrades} - {None}
     confirmed_this_read = xid_faults + [s for s in downgrades if _card_uuid(s) in downgraded_before]
-    held = [f for f in before.held if not _held_fault_proven_healed(f, gpus, every_card_named, rebooted)]
+    scraped = {str(d["uuid"]) for d in ctx.state.gpu_details or [] if isinstance(d, dict) and d.get("uuid")}
+    held = [f for f in before.held if not _held_fault_proven_healed(f, gpus, every_card_named, rebooted, scraped)]
     # one fault per card and kind, this read's first: a card repeating an Xid must not grow the stored state,
     # and a link fault healing must not close the same card's Xid, which needs its own proof
     fault_by_card_and_kind: dict[tuple[str, str], str] = {}
