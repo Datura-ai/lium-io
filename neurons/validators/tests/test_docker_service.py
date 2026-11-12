@@ -6489,6 +6489,30 @@ async def test_resolve_volume_sizing_fresh_df_guard_bound(docker_service):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("locked", [False, True])
+async def test_resolve_volume_sizing_reads_df_as_at_least_what_a_detached_cache_delete_will_free(docker_service, locked):
+    # DAH-2498: df 50 GB while a delete still frees 50 GB more: the df guard sizes on 100 GB (volume 90 GB), not 40 GB
+    payload = _make_sizing_payload(disk_share=0.9, storage_limit_gb=1)
+    ssh_client = _make_sizing_ssh_client(
+        df_avail_bytes=50 * _SIZING_GB,
+        volume_ls_stdout="volume_abc vloopback\n",
+        volume_inspect_stdout="<no value>|1000g\n",
+    )
+
+    result = await docker_service.resolve_volume_sizing(
+        ssh_client,
+        payload,
+        "tag",
+        {},
+        df_floor_bytes=100 * _SIZING_GB,
+        locked_df_avail_bytes=50 * _SIZING_GB if locked else None,
+    )
+
+    assert result.capped_by == "df_guard"
+    assert result.volume_limit_gb == (40 if locked else 90)
+
+
+@pytest.mark.asyncio
 async def test_resolve_volume_sizing_below_min_raises(docker_service):
     # Arrange: df_avail=30GB, no volumes, share=0.5 -> pool 10GB, slice 5GB,
     # volume 3GB < min_volume_gb=10.

@@ -6336,9 +6336,11 @@ class DockerService:
         default_extra: dict,
         host_probe: PrerunHostProbe | None = None,
         killed_fillers: Iterable[str] = (),
+        df_floor: list[int] | None = None,
     ) -> bool:
         """Free filler cache volumes when a customer rental's volume does not fit beside them; True when
-        volumes may have been removed.
+        volumes may have been removed. `df_floor` gets the free bytes the host will have once the detached
+        deletes finish (DAH-2498), for the volume sizing that follows.
 
         DAH-5260: the scrape lists the Engy checkpoint cache as free disk (the Dolphin cache stays used), and the
         backend sizes the renter's volume and container storage on that listing. So the caches stay while the
@@ -6405,7 +6407,8 @@ class DockerService:
 
             async def rental_fits() -> bool:
                 free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
-                return free_now_gb + detached_gb >= rental_needs_free_gb
+                # df already holds what the detached `rm` freed so far: never count those bytes twice
+                return max(free_now_gb, free_gb + detached_gb) >= rental_needs_free_gb
 
             killed: tuple[str, ...] = tuple(killed_fillers)
 
@@ -6442,6 +6445,8 @@ class DockerService:
                     ),
                     exc_info=True,
                 )
+            if df_floor is not None and detached_gb:
+                df_floor.append(int((free_gb + detached_gb) * (1024**3)))
             # a removal can fail silently (`|| true`) or time out: never size the pod volume on disk not freed.
             # Still short after every removal worked: the cache was not what was missing, so the size stays as ordered.
             if not payload.local_volume and not await rental_fits():
@@ -8435,8 +8440,12 @@ class DockerService:
         locked_df_avail_bytes: int | None = None,
         locked_df_error: Exception | None = None,
         flatten_copy_bytes: int | None = None,
+        df_floor_bytes: int | None = None,
     ) -> VolumeSizingResult:
         """Resolve effective volume/storage limits for a new pod volume (DAH-2183).
+
+        `df_floor_bytes` (DAH-2498) is the free disk once the cache reclaim's detached deletes finish; df is read
+        as at least that, so a delete still running does not shrink the grant. A locked measure ignores it.
 
         `flatten_copy_bytes` (a many-layer image on a Sysbox full node) caps the grant so a one-layer copy
         still fits beside it, never below `payload.min_volume_gb` or the ordered `payload.volume_limit_gb`.
@@ -8493,6 +8502,8 @@ class DockerService:
                 if df_avail_bytes is None:
                     df_avail_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
                 existing_volumes_bytes = await self._get_existing_vloopback_bytes(ssh_client)
+            if df_floor_bytes is not None and locked_df_avail_bytes is None:
+                df_avail_bytes = max(df_avail_bytes, df_floor_bytes)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -10833,6 +10844,7 @@ class DockerService:
                 # DAH-5260: the Engy cache is listed as free disk; the caches go only when the rental does not fit
                 # beside them, and every removal is awaited here, before the volume is sized and docker run.
                 ordered_volume_gb = payload.volume_limit_gb
+                cache_df_floor: list[int] = []
                 reclaimed_cache_volumes = (
                     False
                     if beside_fillers
@@ -10842,6 +10854,7 @@ class DockerService:
                         default_extra=default_extra,
                         host_probe=docker_listing_probe,
                         killed_fillers=[name for name in removed_containers if name.startswith(FILLER_CONTAINER_PREFIX)],
+                        df_floor=cache_df_floor,
                     )
                 )
                 # the reclaim changes the order only when it clamps it: a cache removal failed or timed out
@@ -11019,6 +11032,7 @@ class DockerService:
                         locked_df_avail_bytes=locked_df_avail_bytes,
                         locked_df_error=locked_df_error,
                         flatten_copy_bytes=flatten_copy,
+                        df_floor_bytes=max(cache_df_floor, default=None),
                     )
                     effective_volume_limit_gb = sizing.volume_limit_gb
                     effective_storage_limit_gb = sizing.storage_limit_gb

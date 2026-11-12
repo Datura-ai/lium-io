@@ -795,3 +795,22 @@ async def test_bytes_still_being_freed_in_the_background_count_toward_the_rental
     assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is True
     assert len(_removed_volumes(ssh_client)) == 1
     assert rental.volume_limit_gb == 2620
+
+
+@pytest.mark.asyncio
+async def test_bytes_the_background_delete_already_freed_are_not_counted_twice(docker_service):
+    # each cache detaches 150 GB and the delete finishes at once, so df already shows them: one cache is not enough
+    class FastDeleteSshClient(HostSshClient):
+        async def run(self, command: str, *args, **kwargs):
+            if "volume rm" in command:
+                self.commands.append(command)
+                self._free_bytes += 150 * 1024**3
+                return SimpleNamespace(exit_status=0, stdout=f"detached {150 * 1024**3}\n", stderr="")
+            return await super().run(command, *args, **kwargs)
+
+    ssh_client = FastDeleteSshClient(["dphn_cache_hf_x", _KIMI, "volume_pod"], free_gb=2389)
+    df_floor: list[int] = []
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, _rental(2620, 1310), {}, df_floor=df_floor) is True
+    assert len(_removed_volumes(ssh_client)) == 2
+    assert df_floor == [(2389 + 300) * 1024**3]
