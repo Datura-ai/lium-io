@@ -10,6 +10,7 @@ from typing import Any
 
 from pydantic import BaseModel
 from services.const import DEFAULT_JOB_OWNER_LIUM, FILLER_CONTAINER_PREFIX
+from services.gpu_spec_table import UNIFIED_MEMORY_GPU_MODELS
 from services.gpu_power_limit import (
     MIN_POWER_LIMIT_RATIO,
     RENTAL_START_RATIO_TTL_SECONDS,
@@ -137,6 +138,7 @@ class GpuPowerLimitCheck:
 
         measurements: list[GpuPowerMeasurement] = []
         incomplete: list[GpuPowerMeasurement] = []
+        unsupported: list[GpuPowerMeasurement] = []
         rejected: list[GpuPowerMeasurement] = []
         floors = await self._rented_floors(ctx)
 
@@ -154,6 +156,11 @@ class GpuPowerLimitCheck:
                 power_max_limit=max_limit,
             )
 
+            if current_limit is None and measurement.name in UNIFIED_MEMORY_GPU_MODELS:
+                # DAH-5863: the GB10 has no settable power limit (NVML answers Not Supported), so there is no cap
+                # to judge; every other model with no reading still fails below
+                unsupported.append(measurement)
+                continue
             if current_limit is None or default_limit is None or default_limit <= 0:
                 incomplete.append(measurement)
                 continue
@@ -240,6 +247,7 @@ class GpuPowerLimitCheck:
             what={
                 "threshold": MIN_POWER_LIMIT_RATIO,
                 "measurements": _dump_measurements(measurements),
+                "unsupported_gpus": _dump_measurements(unsupported),
             },
         )
         return CheckResult(passed=True, event=event)

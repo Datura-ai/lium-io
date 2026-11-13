@@ -53,6 +53,9 @@ RENTAL_PRICES_PER_HOUR["NVIDIA GB200"] = RENTAL_PRICES_PER_HOUR["NVIDIA B200"]  
 # DAH-5508: the RTX 4090 48GB, its own model and idle tier; only reachable with RTX_4090_48GB_MODEL_ENABLED on.
 # Anchor = the backend's MACHINE_PRICES: RTX 4090 0.30 x the same-chip Quadro RTX 8000/6000 ratio (0.21/0.13), 0.48.
 RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4090 48GB"] = 0.48
+# DAH-5863: `NVIDIA GB10` (DGX Spark), its own model and idle tier. Anchor = the backend's MACHINE_PRICES (DAH-5864):
+# 0.25, the 5 Nov Vast median 0.376 x the median Lium/Vast ratio 0.668.
+RENTAL_PRICES_PER_HOUR["NVIDIA GB10"] = 0.25
 
 # Unrented incentive for more GPU types (DAH-4042). Anchors are the backend's MACHINE_PRICES, the listing
 # price renters see; the rows are in lium-core's defaults too, so this override drops on the next lium-core release.
@@ -248,6 +251,7 @@ MAX_UNRENTED_GPUS_BY_TYPE: dict[str, dict[int, int]] = {
 MAX_UNRENTED_GPUS_BY_TYPE["GB300"] = dict(MAX_UNRENTED_GPUS_BY_TYPE["B300"])  # mirrors B300; revisit when GB300 market data exists
 MAX_UNRENTED_GPUS_BY_TYPE["GB200"] = dict(MAX_UNRENTED_GPUS_BY_TYPE["B200"])  # mirrors B200; revisit when GB200 market data exists
 MAX_UNRENTED_GPUS_BY_TYPE["RTX 4090 48GB"] = {1: 10, 8: 64}  # DAH-5508: the default tier (DAH-5070)
+MAX_UNRENTED_GPUS_BY_TYPE["GB10"] = {1: 10, 8: 64}  # DAH-5863: the default tier (DAH-5070)
 # Per-(gpu_model, gpu_count) hourly prices in USD.
 # Keys are full NVIDIA GPU names; values are dicts of {count_str: price_or_default}.
 # Use DEFAULT_PRICE sentinel to fall back to rental_prices_per_hour.
@@ -373,6 +377,7 @@ BASE_GPU_MAP["NVIDIA B300 SXM6 PC"] = BASE_GPU_MAP["NVIDIA B300 SXM6 AC"]  # der
 BASE_GPU_MAP["NVIDIA GB300"] = "GB300"  # own family, see RENTAL_PRICES_PER_HOUR
 BASE_GPU_MAP["NVIDIA GB200"] = "GB200"  # own family, see RENTAL_PRICES_PER_HOUR
 BASE_GPU_MAP["NVIDIA GeForce RTX 4090 48GB"] = "RTX 4090 48GB"  # own family, never fills the RTX 4090 tier
+BASE_GPU_MAP["NVIDIA GB10"] = "GB10"  # own family, see RENTAL_PRICES_PER_HOUR
 
 
 class IncentiveConfig(BaseModel):

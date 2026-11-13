@@ -32,6 +32,8 @@ DOWNLOADED_DEB=""
 # as root with the host's / mounted, so setup installs it by digest: the manifest of :latest (pushed 2019-02-13).
 VLOOPBACK_PLUGIN="vloopback"
 VLOOPBACK_PLUGIN_IMAGE="ashald/docker-volume-loopback@sha256:caafc80c60c3630812433c6e5ebb4df5ca514333cbec4af6a3a5164c150fd170"
+# the image above is x86-only and there is no arm64 build yet, so a rental with a disk limit fails on aarch64
+VLOOPBACK_ARM64_SKIP="the pinned plugin is x86-only and there is no arm64 build yet, so a rental with a disk limit fails on this host."
 VLOOPBACK_DOC_URL="https://github.com/Datura-ai/lium-io/blob/main/neurons/executor/README.md#volume-plugin-vloopback"
 VLOOPBACK_INSTALL_TIMEOUT=300
 VLOOPBACK_RUN_TIMEOUT=120
@@ -496,7 +498,10 @@ check_total_disk_for_vram() {
     # rootfs lives under Docker's data-root) with total GPU VRAM; free space is not the rule.
     local vram_mib vram_gb data_root total_kb total_gb needed_gb
     command -v nvidia-smi &>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — no NVIDIA driver, VRAM unknown."; return 0; }
-    vram_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | awk '{s += $1} END {print s + 0}')
+    # a unified-memory card (DGX Spark GB10) prints [N/A]; the validator's scrape counts the host RAM for it
+    vram_mib=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits 2>/dev/null \
+        | awk -F', *' -v host_mib="$(awk '/^MemTotal:/ {print int($2 / 1024)}' "$(host_path /proc/meminfo)" 2>/dev/null)" \
+            '$1 == "NVIDIA GB10" && $2 !~ /^[0-9]/ {s += host_mib; next} {s += $2} END {print s + 0}')
     [ "${vram_mib:-0}" -gt 0 ] 2>/dev/null || { pf_skip "Disk >= ${MIN_DISK_TO_VRAM_RATE}x VRAM — nvidia-smi reports no GPU memory."; return 0; }
     data_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
     if [ -z "$data_root" ] || [ ! -d "$data_root" ]; then data_root=/var/lib/docker; fi
@@ -837,6 +842,7 @@ check_vloopback() {
         return 0
     fi
     ! vloopback_storage_opt_unsupported || { pf_fix "$STORAGE_LIMIT_MISSING" "$STORAGE_LIMIT_FIX"; return 1; }
+    [ "$SYSBOX_ARCH" != arm64 ] || { pf_skip "vloopback volumes — $VLOOPBACK_ARM64_SKIP"; return 0; }
     state=$(vloopback_plugin_state)
     if [ "$state" = "absent" ]; then
         pf_fix "The $VLOOPBACK_PLUGIN volume plugin is not installed; the mount test cannot run until it is." \
@@ -870,6 +876,7 @@ fail_vloopback() {
 setup_vloopback() {
     # install mode: the plugin fix, then the mount test; on a failure the caller prints fail_vloopback
     ! vloopback_storage_opt_unsupported || { ok "vloopback: skipped. $VLOOPBACK_NOT_USED"; warn "$STORAGE_LIMIT_MISSING Fix: $STORAGE_LIMIT_FIX"; return 0; }
+    [ "$SYSBOX_ARCH" != arm64 ] || { warn "vloopback: skipped on aarch64: $VLOOPBACK_ARM64_SKIP"; return 0; }
     ensure_vloopback_plugin || return 1
     [ -z "$VLOOPBACK_CHANGED" ] || ok "vloopback: $VLOOPBACK_CHANGED."
     vloopback_mount_test || return 1

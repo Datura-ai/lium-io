@@ -218,6 +218,8 @@ A rental with a disk limit gets its volume from the `vloopback` Docker volume pl
 2. on a plugin whose `DATA_DIR` is not an absolute path, stops if a rental is running, then sets `DATA_DIR=<Docker data-root>/loopback` and enables the plugin;
 3. creates a 1 GB test volume, checks that `docker volume inspect` shows a `Mountpoint` starting with `/`, mounts the volume into a Sysbox container (`daturaai/compute-subnet-executor:latest`), writes a file and reads it back, lets the container exit (which unmounts the volume) and removes the container and the volume.
 
+On an ARM64 (aarch64) host the installer and `--check` skip all three steps: that plugin is built for x86 only, and there is no ARM64 build of the volume plugin yet. Until there is, a rental with a disk limit fails on an ARM64 host.
+
 The install has 300 seconds, the test container 120 and every other Docker command 30. When a step fails, the installer prints one message with the cause and this link, restarts the executor it stopped, and exits `1`; an interrupted run removes its test container and volume on exit. `--check` runs step 3 on an installed plugin and prints `FIX` lines for steps 1 and 2 without changing the plugin.
 
 The same commands by hand:

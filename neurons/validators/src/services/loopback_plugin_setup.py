@@ -29,6 +29,30 @@ LOOPBACK_PLUGIN_BUILDS = {
     ),
 }
 
+# the same builds for aarch64 hosts (GB10 / Grace): plugin images are single-arch, so each has its own tag.
+# Only the direct-I/O generation has one; an aarch64 host gets no v2 and never the x86 build.
+# shortcut: the arm64 tag is unpinned (no digest) until it is published to Docker Hub; until then an
+# aarch64 host gets no plugin at all. Pin its digest here once it is pushed.
+LOOPBACK_PLUGIN_ARM64_BUILDS = {
+    LOOPBACK_PLUGIN_V3_ALIAS: LoopbackPluginBuild("daturaai/docker-volume-loopback:1.0.0-lium11-arm64", "", "v3"),
+}
+
+
+def loopback_plugin_build(alias: str, arch: str | None) -> LoopbackPluginBuild | None:
+    """The pinned build under this alias for the executor's CPU (`uname -m` on the host, as
+    core.checksums.executor_arch reads it); None when that CPU has no pinned build. An unread CPU
+    gets the x86 build, as every host did before aarch64 ones joined."""
+    if arch == "aarch64":
+        build = LOOPBACK_PLUGIN_ARM64_BUILDS.get(alias)
+        return build if build is not None and build.digest else None
+    return LOOPBACK_PLUGIN_BUILDS[alias]
+
+
+def pinned_loopback_plugin_digests(alias: str) -> list[str]:
+    # every pinned build of this alias, whichever CPU it is for: a probe marker holds the one it proved
+    builds = (LOOPBACK_PLUGIN_BUILDS[alias], LOOPBACK_PLUGIN_ARM64_BUILDS.get(alias))
+    return [build.digest for build in builds if build is not None and build.digest]
+
 
 def current_loopback_plugin_alias() -> str:
     return LOOPBACK_PLUGIN_V3_ALIAS if settings.LOOPBACK_PLUGIN_V3_ENABLED else LOOPBACK_PLUGIN_ALIAS
@@ -289,8 +313,11 @@ except Exception as error:
 '''
 
 
-def loopback_plugin_setup_command(docker_root_dir: str, alias: str, deadline_seconds: int) -> str:
-    tag, digest, generation = LOOPBACK_PLUGIN_BUILDS[alias]
+def loopback_plugin_setup_command(
+    docker_root_dir: str, alias: str, deadline_seconds: int, arch: str | None = None
+) -> str:
+    # the caller checks loopback_plugin_build first: a CPU without a pinned build never gets here
+    tag, digest, generation = loopback_plugin_build(alias, arch)
     # v2 is set up exactly as before; only the direct-I/O generation mounts a probe volume
     probe_image = "" if alias == LOOPBACK_PLUGIN_ALIAS else ALPINE_HELPER_IMAGE
     arguments = (

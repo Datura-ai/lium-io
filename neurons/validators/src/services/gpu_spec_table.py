@@ -183,6 +183,9 @@ GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 PC"] = list(GPU_VRAM_SIZES_MB["NVIDIA B300 S
 # `NVIDIA GB300`: 288 GB HBM3e per GPU like the B300 (NVL72 trays), plus the DGX Station GB300 desktop, which
 # ships with 252 GB HBM3e; no GB300 reading observed yet. Multi-variant.
 GPU_VRAM_SIZES_MB["NVIDIA GB300"] = [258048, *GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 AC"]]
+# DAH-5863: `NVIDIA GB10` (DGX Spark) has no memory of its own; its GPU uses the host's 128 GB, which the
+# scrape reports as its capacity (machine_scrape read_gpu_memory_mb).
+GPU_VRAM_SIZES_MB["NVIDIA GB10"] = [131072]
 # `NVIDIA GB200` (DAH-6008): 192 GB HBM3e nominal per GPU like the B200 (~186 GB usable), so the B200 size; no reading yet.
 GPU_VRAM_SIZES_MB["NVIDIA GB200"] = list(GPU_VRAM_SIZES_MB["NVIDIA B200"])
 
@@ -325,6 +328,20 @@ def matmul_probe_vram_mb(model: str | None, reported_vram_mb: int | None = None)
             return round(reported_vram_mb * VRAM_FLOOR_RATIO)
         return None
     return round(min(sizes) * VRAM_FLOOR_RATIO)
+
+
+# DAH-5863: GPUs with no memory of their own that use the host RAM (UNIFIED_MEMORY_GPU_NAMES in the scrape)
+UNIFIED_MEMORY_GPU_MODELS = frozenset({"NVIDIA GB10"})
+# shortcut: a fixed share of the host RAM leaves room for the OS, docker and page cache; measure on a real GB10
+UNIFIED_MEMORY_MATMUL_SHARE = 0.75
+
+
+def matmul_memory_mb(model: str | None, capacity_mb: int | float | None) -> int | float | None:
+    """The memory (MB) a matmul is sized from: the card's capacity, or on a unified-memory card the matmul share
+    of it, since the host fills the rest of that memory."""
+    if capacity_mb and normalize_gpu_model(model) in UNIFIED_MEMORY_GPU_MODELS:
+        return int(capacity_mb * UNIFIED_MEMORY_MATMUL_SHARE)
+    return capacity_mb
 
 
 def get_expected_vram_windows(canonical_model: str) -> list[tuple[int, int]] | None:
