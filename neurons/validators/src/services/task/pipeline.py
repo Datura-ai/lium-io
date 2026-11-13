@@ -14,6 +14,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from core.utils import _m
 from clients.backend_client import BackendClient
 from services.ssh_service import SSHService
+from services.file_encrypt_service import ScrapeBinaryBuild
 from services.redis_service import RedisService
 from services.matrix_validation_service import ValidationService
 from services.verifyx_validation_service import VerifyXValidationService
@@ -153,6 +154,8 @@ class ContextConfig:
     # DAH-2794: obfuscated scrape source, piped to the executor's interpreter over stdin.
     # None => the legacy path, where the scrape is a binary uploaded by UploadFilesCheck.
     machine_scrape_source: Optional[str] = None
+    # DAH-5899: builds the cycle's binary on the first stdin failure; None => it is already built
+    machine_scrape_binary: ScrapeBinaryBuild | None = None
     # DAH-3011: True only for a never-validated executor's first, unscored verification
     # (set in PipelineFactory.build_context). The capability
     # matmul and VerifyX right-size their probes and the bandwidth gate is deferred to the first
