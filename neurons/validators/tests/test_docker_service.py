@@ -293,6 +293,8 @@ def mock_dependencies():
     """Mock all DockerService dependencies."""
     ssh_service = Mock()
     redis_service = Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True))
+    # the create lock every delete's prune takes (lio#2226): free, so deletes prune
+    redis_service.executor_create_lock = Mock(return_value=Mock(acquire=AsyncMock(return_value=True), release=AsyncMock()))
     attestation_service = Mock()
 
     # Mock the async context manager for Redis lock

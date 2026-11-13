@@ -2686,19 +2686,43 @@ def _prune_may_still_run(exc: Exception) -> bool:
     return getattr(cause, "status_code", None) == 409 or "already running" in str(cause)
 
 
-async def _prune_images_then_release(docker_client, log_extra: dict, miner_hotkey: str, executor_id: str) -> None:
+async def _take_create_lock_for_prune(redis_service, executor_id: str):
+    """The executor's create lock, taken without waiting; None when a create holds it or Redis cannot say."""
+    lock = redis_service.executor_create_lock(executor_id)
+    try:
+        return lock if await lock.acquire(blocking=False) else None
+    except Exception:
+        return None
+
+
+async def _prune_images_then_release(
+    docker_client, log_extra: dict, miner_hotkey: str, executor_id: str, redis_service
+) -> None:
     """Prune, releasing the executor's prune registration only once no prune is known to run (begin_prune taken).
 
+    Every prune call holds the executor's create lock, which a renter's create holds in any connector from before
+    its confirming prune until its pull is done: a retry here cannot prune beside a successor's pull (lio#2226).
     Run under asyncio.shield: a cancelled delete must not release it while the worker thread still prunes."""
     try:
         for attempt in range(PRUNE_CONFIRM_ATTEMPTS + 1):
             if attempt:
                 await asyncio.sleep(PRUNE_CONFIRM_INTERVAL_SECONDS)
+            lock = await _take_create_lock_for_prune(redis_service, executor_id)
+            if lock is None:
+                logger.info(
+                    _m("Image prune skipped: a create holds the executor or its lock is unreadable", extra=log_extra)
+                )
+                return
             started = customer_creates.prune_attempt_started()
             try:
-                await run_logged_rental_docker_sdk_operation(
-                    operation="prune_images", log_extra=log_extra, call=docker_client.prune_images
-                )
+                try:
+                    await run_logged_rental_docker_sdk_operation(
+                        operation="prune_images", log_extra=log_extra, call=docker_client.prune_images
+                    )
+                finally:
+                    # a prune whose reply was lost may outlive the lock: the next create's confirming prune catches it
+                    with contextlib.suppress(Exception):  # past its TTL the lock is no longer ours
+                        await lock.release()
             except Exception as exc:
                 if not _prune_may_still_run(exc):
                     # dockerd answered: it was running no prune when it took this one
@@ -14259,7 +14283,11 @@ class DockerService:
                     with _best_effort_delete_step(log, "prune_images"):
                         await asyncio.shield(
                             _prune_images_then_release(
-                                docker_client, default_extra, payload.miner_hotkey, payload.executor_id
+                                docker_client,
+                                default_extra,
+                                payload.miner_hotkey,
+                                payload.executor_id,
+                                self.redis_service,
                             )
                         )
 

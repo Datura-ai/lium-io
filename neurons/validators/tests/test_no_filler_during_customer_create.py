@@ -21,6 +21,35 @@ from services.rental_docker_sdk import RentalDockerOperationError
 from test_deploy_optimizations import _payload
 
 
+class _CreateLocks:
+    """Redis's per-executor create lock, one for every connector process (a renter's create holds it)."""
+
+    def __init__(self):
+        self.held = False
+
+    def executor_create_lock(self, executor_id):
+        return _CreateLock(self)
+
+
+class _CreateLock:
+    def __init__(self, locks: _CreateLocks):
+        self.locks = locks
+        self.mine = False
+
+    async def acquire(self, blocking=True):
+        if self.locks.held:
+            return False
+        self.locks.held = self.mine = True
+        return True
+
+    async def release(self):
+        if self.mine:
+            self.locks.held = self.mine = False
+
+
+_FREE = _CreateLocks()  # no create holds the executor: every prune may run
+
+
 @contextlib.contextmanager
 def _customer_create_that_reached_create_container(customer):
     with customer_creates.track(customer):
@@ -104,7 +133,7 @@ async def test_a_cancelled_delete_keeps_the_prune_registered_until_docker_return
     docker = _Prune()
     assert customer_creates.begin_prune(customer.miner_hotkey, customer.executor_id)
     prune = asyncio.shield(
-        docker_service._prune_images_then_release(docker, {}, customer.miner_hotkey, customer.executor_id)
+        docker_service._prune_images_then_release(docker, {}, customer.miner_hotkey, customer.executor_id, _FREE)
     )
     delete = asyncio.ensure_future(prune)
     await asyncio.sleep(0.01)
@@ -147,7 +176,7 @@ async def _fenced_after(docker, customer) -> bool:
     customer_creates = docker_service.customer_creates  # a test may swap in a fresh connector's registry
     assert customer_creates.begin_prune(customer.miner_hotkey, customer.executor_id)
     with contextlib.suppress(RentalDockerOperationError):
-        await docker_service._prune_images_then_release(docker, {}, customer.miner_hotkey, customer.executor_id)
+        await docker_service._prune_images_then_release(docker, {}, customer.miner_hotkey, customer.executor_id, _FREE)
     return customer_creates.is_fenced(customer.miner_hotkey, customer.executor_id)
 
 
@@ -184,7 +213,8 @@ async def test_an_older_prunes_late_success_does_not_lift_a_newer_prunes_fence(m
     late = _Prune()
     assert customer_creates.begin_prune(customer.miner_hotkey, customer.executor_id)
     prune_a = asyncio.ensure_future(
-        docker_service._prune_images_then_release(late, {}, customer.miner_hotkey, customer.executor_id)
+        # its create lock lapsed past the TTL while it ran, so B could take the lock and prune
+        docker_service._prune_images_then_release(late, {}, customer.miner_hotkey, customer.executor_id, _CreateLocks())
     )
     await asyncio.sleep(0.01)
 
@@ -242,3 +272,27 @@ async def test_a_waiting_customer_create_lifts_the_fence_with_its_own_prune(monk
         await confirm_no_prune_runs(_Prunes(None), {}, customer.miner_hotkey, customer.executor_id)
 
     assert not registry.is_fenced(customer.miner_hotkey, customer.executor_id)
+
+
+@pytest.mark.asyncio
+async def test_an_old_connectors_prune_retry_does_not_run_beside_a_successors_pull(monkeypatch) -> None:
+    # lio#2226 review 4562793819: the old connector's prune lost its reply and waits to retry; meanwhile its successor
+    # confirms no prune runs and admits a renter's create, which holds the executor's create lock through its pull
+    monkeypatch.setattr(docker_service, "PRUNE_CONFIRM_ATTEMPTS", 1)
+    monkeypatch.setattr(docker_service, "PRUNE_CONFIRM_INTERVAL_SECONDS", 0.05)
+    customer = _payload()
+    locks = _CreateLocks()
+    old = _Prunes(_prune_failure(_LOST_REPLY), None)
+    assert customer_creates.begin_prune(customer.miner_hotkey, customer.executor_id)
+    old_delete = asyncio.ensure_future(
+        docker_service._prune_images_then_release(old, {}, customer.miner_hotkey, customer.executor_id, locks)
+    )
+    await asyncio.sleep(0.01)  # the old prune's reply is lost; it waits to retry
+
+    successor_create = locks.executor_create_lock(customer.executor_id)
+    assert await successor_create.acquire(blocking=False)
+    await confirm_no_prune_runs(_Prunes(None), {}, customer.miner_hotkey, customer.executor_id)
+    await old_delete  # its retry comes while the successor's pull holds the lock
+
+    assert old.calls == 1  # the retry pruned nothing
+    await successor_create.release()
