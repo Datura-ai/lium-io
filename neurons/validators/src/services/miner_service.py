@@ -73,6 +73,7 @@ from services.docker_service import DockerService, create_steps_after_reply, cus
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.node_host import for_payload_miner, public_host_sock
 from services.redis_service import MACHINE_SPEC_CHANNEL, POD_STATES_CHANNEL, RedisService
+from services.efa_link_probe import measure_and_attach as measure_and_attach_efa
 from services.roce_link_probe import CYCLE_JOB_WAIT_SECONDS, PROBE_TAIL_MARGIN_SECONDS, measure_and_attach
 from services.ssh_service import SSHService
 from services.task.checks.duplicate_executor import _gpu_uuids
@@ -2244,14 +2245,12 @@ class MinerService:
                 # DAH-2667: while the miner's key is still installed and its idle hosts are free,
                 # measure every RoCE pair. Best effort — an unmeasured pair is simply not sold as a
                 # cluster.
-                await measure_and_attach(
-                    results,
-                    self.ssh_service.decrypt_payload(
-                        my_key.ss58_address, private_key.decode("utf-8")
-                    ),
-                    default_extra,
-                    job_started_at,
+                decrypted_key = self.ssh_service.decrypt_payload(
+                    my_key.ss58_address, private_key.decode("utf-8")
                 )
+                await measure_and_attach(results, decrypted_key, default_extra, job_started_at)
+                # DAH-5932: EFA pairs the same way, in whatever budget the RoCE sweep left.
+                await measure_and_attach_efa(results, decrypted_key, default_extra, job_started_at)
 
                 logger.info(
                     _m(
