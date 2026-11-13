@@ -2614,8 +2614,10 @@ class GpuKernelCountMessages:
         event="A reported GPU cannot be attached to a container",
         reason="GPU_KERNEL_UNATTACHABLE",
         severity="error",
-        category="env",
-        impact="Validation failed; score set to 0",
+        # an availability error: the backend hides the node and refuses new rentals, a rental on it runs on
+        category=AVAILABILITY_CATEGORY,
+        impact="Validation failed; score set to 0. Node hidden and not rentable until the GPU attaches again "
+        "(a running rental is kept)",
         remediation=(
             "Every rent on the listed GPU fails. Restart the executor container, or reboot the host "
             "if the GPU is still missing."
