@@ -958,6 +958,18 @@ class SysboxRequiredMessages:
             "toolkit; the sysbox check runs again on the next cycle."
         ),
     )
+    NVIDIA_TOOLKIT_CDI_MODE = MessageTemplate(
+        event="NVIDIA container toolkit is in CDI mode",
+        reason="NVIDIA_TOOLKIT_CDI_MODE",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0 for this cycle; verification is kept until repeated failures deactivate the executor",
+        remediation=(
+            'Set mode = "auto" under [nvidia-container-runtime] in /etc/nvidia-container-runtime/config.toml '
+            "(or run `nvidia-ctk runtime configure --runtime=docker`), then `sudo systemctl restart docker`; "
+            "the sysbox check runs again on the next cycle."
+        ),
+    )
     # DAH-5844: the test container started but its sshd never answered and its log names no cause
     # (dind_probe.DIND_SSHD_NOT_READY), so nothing about sysbox was measured. Same impact as SYSBOX_MISSING.
     DIND_PROBE_UNREACHABLE = MessageTemplate(

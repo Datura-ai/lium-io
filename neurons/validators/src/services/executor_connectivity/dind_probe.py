@@ -94,6 +94,9 @@ def describe_ssh_error(error: Exception, port: PortPair) -> str:
 # for the same host condition (watchtower/src/watchtower.py RUNTIME_PROBE_NVIDIA_MISMATCH).
 _HOOK_LINE_START = "nvidia-container-cli:"
 _SYSBOX_HOOK_ERROR = "nvidia-container-cli: mount error:"
+# The toolkit's CDI mode refuses `--gpus`; that line has no `nvidia-container-cli:` prefix.
+_CDI_HOOK_ERROR = "invoking the NVIDIA Container Runtime Hook directly"
+_HOOK_LINE_MARKERS = (_HOOK_LINE_START, _CDI_HOOK_ERROR)
 
 # /proc/self/uid_map inside the sysbox probe container (G21), logged as `uid_map` on "Sysbox check ok"
 UID_MAP_USER_NAMESPACE = "user_namespace"
@@ -101,6 +104,13 @@ UID_MAP_IDENTITY = "identity"
 UID_MAP_UNREADABLE = "unreadable"
 
 DOCKER_RUN_CAUSES: tuple[tuple[str, DindLogCause], ...] = (
+    (
+        _CDI_HOOK_ERROR,
+        DindLogCause(
+            "NVIDIA_TOOLKIT_CDI_MODE",
+            "the NVIDIA container toolkit is in CDI mode, which refuses GPU containers started with --gpus",
+        ),
+    ),
     (
         "nvml error: driver/library version mismatch",
         DindLogCause(
@@ -128,9 +138,9 @@ def diagnose_docker_run_error(stderr: str | None) -> DindLogCause | None:
     provider sees the hook's error in the event and not only the validator's reading of it.
     """
     hook_lines = [
-        line[line.find(_HOOK_LINE_START) :].strip()
+        line[min(line.find(m) for m in _HOOK_LINE_MARKERS if m in line) :].strip()
         for line in (stderr or "").splitlines()
-        if _HOOK_LINE_START in line and _SYSBOX_HOOK_ERROR not in line
+        if any(m in line for m in _HOOK_LINE_MARKERS) and _SYSBOX_HOOK_ERROR not in line
     ]
     for pattern, cause in DOCKER_RUN_CAUSES:
         line = next((ln for ln in hook_lines if pattern in ln), None)

@@ -231,6 +231,26 @@ async def test_other_nvml_failure_gets_the_generic_hook_code(context_factory):
 
 
 @pytest.mark.asyncio
+async def test_cdi_mode_toolkit_gets_its_own_code_and_the_config_fix(context_factory):
+    stderr = (
+        "docker: Error response from daemon: failed to create task for container: failed to create shim task: "
+        "OCI runtime create failed: container_linux.go:439: starting container process caused: process_linux.go:608: "
+        "container init caused: Running hook #0:: error running hook: exit status 1, stdout: , stderr: Using requested "
+        "mode 'cdi'\ninvoking the NVIDIA Container Runtime Hook directly (e.g. specifying the docker --gpus flag) is "
+        "not supported. Please use the NVIDIA Container Runtime (e.g. specify the --runtime=nvidia flag) instead: unknown"
+    )
+    ctx = context_factory(state=build_state(sysbox_runtime=False, dind_probe_error=_cause(stderr)))
+
+    result = await SysboxRequiredCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == "NVIDIA_TOOLKIT_CDI_MODE"
+    assert "docker said: invoking the NVIDIA Container Runtime Hook directly" in result.event.remediation
+    assert 'mode = "auto"' in result.event.remediation
+    assert "Install the sysbox runtime" not in result.event.remediation
+
+
+@pytest.mark.asyncio
 async def test_load_library_hook_error_gets_the_hook_code_not_sysbox_missing(context_factory):
     stderr = (
         "docker: Error response from daemon: OCI runtime create failed: error running prestart hook #0: exit status 1, "
