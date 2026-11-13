@@ -1,9 +1,9 @@
 """Spot-node pay and the secure floor.
 
-Spot: an idle spot node running Lium fillers is paid min(1.0 x its GPU configuration's average
+Spot: an idle spot node running Lium fillers is paid min(0.9 x its GPU configuration's average
 filler revenue per GPU-hour, 0.8 x its secure rate before secure cap dilution), outside the secure
 buckets, diluted above the secure cap of its GPU model and bucket in a spot pool of its own
-(DAH-5944), and a GPU model's spot nodes together at most what its fillers earn per hour (DAH-5128).
+(DAH-5944), and a GPU model's spot nodes together at most 0.9 x what its fillers earn per hour (DAH-5128).
 Secure floor: an idle secure node's cap-diluted rate is raised to 1.0 x that average, even
 above its listed rate. The two factors are separate constants. No cap (owner rule): spot pay and floor top-ups are paid on top of the
 burn-capped rental share, up to the whole incentive pool.
