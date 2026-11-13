@@ -341,6 +341,35 @@ async def test_a_published_express_result_is_recorded_under_the_cycles_job_batch
 
 
 @pytest.mark.asyncio
+async def test_a_failed_or_lost_express_run_is_not_recorded_under_the_cycles_job_batch_id(monkeypatch, wallet):
+    """Review 4558671509: failed and session-lost runs carry no pod check, so the cycle's result-missing
+    fallback must still publish for them, or billing never sees a silent pod and keeps charging."""
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+
+    def failed(payload, executor_id):
+        return {"miner_hotkey": "miner-a", "miner_coldkey": "c", "results": [_job_result(executor_id, score=0.0)]}
+
+    harness.job_for = failed
+    assert await harness.tick_and_settle() == 1
+    harness.miner_service.publish_machine_specs.assert_awaited()
+    assert harness.miner_service.express_published == {}
+
+    def lost(payload, executor_id):
+        result = _job_result(executor_id, score=0.0)
+        result.session_lost_in_port_check = True
+        result.availability_errors = [{"reason_code": "GPU_MEMORY_HEALTH_FAILED"}]
+        return {"miner_hotkey": "miner-a", "miner_coldkey": "c", "results": [result]}
+
+    harness.miner_service.publish_machine_specs.reset_mock()
+    harness.job_for = lost
+    harness.lane._pending[new_node].not_before = 0.0
+    assert await harness.tick_and_settle() == 1
+    harness.miner_service.publish_machine_specs.assert_awaited()
+    assert harness.miner_service.express_published == {}
+
+
+@pytest.mark.asyncio
 async def test_a_restart_keeps_the_first_sighting_from_redis(monkeypatch, wallet, caplog):
     """Regression: first_seen_at lived in memory only, so every validator rollout re-stamped it and
     the logged discovery wait (registration to first sighting) grew by the whole restart."""

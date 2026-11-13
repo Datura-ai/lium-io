@@ -663,7 +663,6 @@ class ExpressLane:
                 await self.miner_service.publish_machine_specs(
                     results, miner.hotkey, miner.coldkey, is_whole_miner_batch=False
                 )
-                self.miner_service.express_published[executor_id.lower()] = job_batch_id
             pending.attempts -= 1  # _verify counted this run
             pending.lost_sessions += 1
             if pending.requested:
@@ -685,7 +684,10 @@ class ExpressLane:
         await self.miner_service.publish_machine_specs(
             results, miner.hotkey, miner.coldkey, is_whole_miner_batch=False, remember_availability=True
         )
-        self.miner_service.express_published[executor_id.lower()] = job_batch_id
+        if passed:
+            # Only a pass has the pod check billing needs; a failed or lost run leaves the cycle's
+            # result-missing fallback in place (review 4558671509).
+            self.miner_service.express_published[executor_id.lower()] = job_batch_id
         pending.recheck_deadline = None
         if not should_run_first_pass_again:
             # A failed first pass that runs again keeps the request: the next tick selects it.
