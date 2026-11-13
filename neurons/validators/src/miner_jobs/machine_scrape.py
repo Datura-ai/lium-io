@@ -719,14 +719,27 @@ def docker_api_get(path):
 
 
 def get_executor_pid_mode():
-    # PidMode of the executor's own container (hostname = container id): "host", or "" when private.
-    # A missing or non-string value raises, so the scrape reports unknown instead of a failing mode.
-    inspection = docker_api_get(f"/containers/{socket.gethostname()}/json")
-    host_config = inspection.get("HostConfig") if isinstance(inspection, dict) else None
-    pid_mode = host_config.get("PidMode") if isinstance(host_config, dict) else None
-    if not isinstance(pid_mode, str):
-        raise ValueError(f"docker inspect has no HostConfig.PidMode: {pid_mode!r}")
-    return pid_mode
+    # PidMode of the container this scrape runs in: the one whose processes (listed by cgroup, like
+    # `docker top`) include this one. A hostname can name any container. Under `pid: host` the scrape sees
+    # its host pid, so its container is always found; in a private PID namespace the pid is not a host pid,
+    # which is reported as "" (not host).
+    # A missing or non-string PidMode raises, so the scrape reports unknown instead of a failing mode.
+    own_pid = str(os.getpid())
+    for summary in docker_api_get("/containers/json") or []:
+        container_id = summary.get("Id")
+        try:
+            top = docker_api_get(f"/containers/{container_id}/top?ps_args=-eo%20pid") or {}
+        except RuntimeError:
+            continue  # restarting (409) or gone (404): never this scrape's own container
+        if [own_pid] not in (top.get("Processes") or []):
+            continue
+        inspection = docker_api_get(f"/containers/{container_id}/json")
+        host_config = inspection.get("HostConfig") if isinstance(inspection, dict) else None
+        pid_mode = host_config.get("PidMode") if isinstance(host_config, dict) else None
+        if not isinstance(pid_mode, str):
+            raise ValueError(f"docker inspect has no HostConfig.PidMode: {pid_mode!r}")
+        return pid_mode
+    return ""
 
 
 def get_vloopback_volume_bytes(docker_root_dir, filler_only=False, sizes=None):
@@ -2539,7 +2552,7 @@ def get_machine_specs():
     except Exception as exc:
         data["data_disk_health_scrape_error"] = repr(exc)
 
-    # DAH: the executor's PID namespace mode, read from its own container (hostname = container id).
+    # DAH: the executor's PID namespace mode, read from the container this scrape runs in.
     # "host" is required: backups read /proc/<rental pid> of the host. Missing key = unknown, never fails.
     try:
         data["data_executor_pid_mode"] = get_executor_pid_mode()
