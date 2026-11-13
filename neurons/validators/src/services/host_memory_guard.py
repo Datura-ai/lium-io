@@ -50,7 +50,8 @@ _OOM_GROUP_SCRIPT = (
 def _host_memory_min_script() -> str:
     units = " ".join(f"{unit}={mib * MIB}" for unit, mib in UNIT_MEMORY_MIN_MIB.items())
     # sshd is ssh.service on Debian/Ubuntu and sshd.service elsewhere: count it once
-    total_mib = sum(UNIT_MEMORY_MIN_MIB.values()) - UNIT_MEMORY_MIN_MIB["ssh.service"] + EXECUTOR_MEMORY_MIN_MIB
+    units_mib = sum(UNIT_MEMORY_MIN_MIB.values()) - UNIT_MEMORY_MIN_MIB["ssh.service"]
+    ex_min = EXECUTOR_MEMORY_MIN_MIB * MIB
     inner = (
         "[ -d /run/systemd/system ] || { echo memory_min_skipped no_systemd; exit 0; }; "
         "[ -f /sys/fs/cgroup/cgroup.controllers ] || { echo memory_min_skipped no_cgroup_v2; exit 0; }; "
@@ -58,12 +59,18 @@ def _host_memory_min_script() -> str:
         'systemctl set-property --runtime "$1" MemoryMin="$2" >/dev/null 2>&1 && echo "memory_min_set $1" '
         '|| echo "memory_min_failed $1 set_property_failed"; }; '
         f"for kv in {units}; do u=${{kv%=*}}; systemctl is-active -q \"$u\" && set_min \"$u\" \"${{kv#*=}}\"; done; "
+        # cgroupfs driver (the documented daemon.json): not a unit, so memory.min is written directly; a
+        # child's protection never exceeds its parent's, so /docker gets at least the same
+        'set_cg_min() { f="/sys/fs/cgroup$1/memory.min"; [ "$(cat "$f" 2>/dev/null)" -ge "$2" ] 2>/dev/null && return; '
+        '{ echo "$2" > "$f"; } 2>/dev/null && echo "memory_min_set $1" || echo "memory_min_failed $1 write_denied"; }; '
         # this shell sits in the executor's cgroup; with the host cgroup namespace its path is absolute
-        "ex=$(sed -n 's#^0::/system.slice/\\(docker-[0-9a-f]*\\.scope\\)$#\\1#p' /proc/self/cgroup); "
-        f'if [ -n "$ex" ]; then set_min "$ex" {EXECUTOR_MEMORY_MIN_MIB * MIB}; '
-        "else echo memory_min_failed executor no_host_cgroup_path; fi; "
+        f"ex=$(sed -n 's#^0::##p' /proc/self/cgroup); sl={units_mib * MIB}; "
+        'case "$ex" in '
+        f'/system.slice/docker-*.scope) set_min "${{ex#/system.slice/}}" {ex_min}; sl=$((sl + {ex_min}));; '
+        f'/docker/*) set_cg_min /docker {ex_min}; set_cg_min "$ex" {ex_min};; '
+        '*) echo "memory_min_failed executor no_host_cgroup_path";; esac; '
         # a child's protection never exceeds its parent's
-        f"set_min system.slice {total_mib * MIB}; true"
+        'set_min system.slice "$sl"; true'
     )
     return (
         "if ! command -v nsenter >/dev/null 2>&1; then echo memory_min_skipped no_nsenter; "

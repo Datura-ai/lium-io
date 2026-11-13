@@ -30,14 +30,6 @@ def test_script_is_valid_sh_and_targets_each_pod_cgroup():
     assert "system.slice/docker-$id.scope" in script and "memory.oom.group" in script
 
 
-def test_system_slice_min_covers_every_unit_once():
-    script = host_memory_guard_script(["pod_1"])
-    total = sum(UNIT_MEMORY_MIN_MIB.values()) - UNIT_MEMORY_MIN_MIB["ssh.service"] + EXECUTOR_MEMORY_MIN_MIB
-
-    assert f"set_min system.slice {total * MIB}" in script
-    assert total * MIB < 4 * 1024 * MIB
-
-
 @pytest.mark.asyncio
 async def test_apply_never_raises_on_ssh_failure():
     async def run(*args, **kwargs):
@@ -72,29 +64,6 @@ def test_oom_group_is_set_once_on_the_pod_scope(tmp_path):
     assert second.stdout == ""
 
 
-def test_memory_min_is_set_on_active_units_and_system_slice_once(tmp_path):
-    state = tmp_path / "sd"
-    state.mkdir()
-    _fake_bin(
-        tmp_path,
-        "systemctl",
-        f'case "$1" in show) cat "{state}/$5" 2>/dev/null || echo 0;; '
-        'is-active) [ "$3" = docker.service ] || [ "$3" = ssh.service ];; '
-        f'set-property) echo "${{4#MemoryMin=}}" > "{state}/$3";; esac\n',
-    )
-    inner = shlex.split(_host_memory_min_script().split("sh -c ", 1)[1])[0]
-    inner = inner.split("[ -f /sys/fs/cgroup/cgroup.controllers ] || { echo memory_min_skipped no_cgroup_v2; exit 0; }; ", 1)[1]
-    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}"}
-
-    first = subprocess.run(["sh", "-c", inner], capture_output=True, text=True, env=env, check=False)
-    second = subprocess.run(["sh", "-c", inner], capture_output=True, text=True, env=env, check=False)
-
-    assert sorted(p.name for p in state.iterdir()) == ["docker.service", "ssh.service", "system.slice"]
-    assert (state / "docker.service").read_text().strip() == str(UNIT_MEMORY_MIN_MIB["docker.service"] * MIB)
-    assert "memory_min_set system.slice" in first.stdout
-    assert parse_guard_output(second.stdout)["set"] == []
-
-
 def test_oom_group_reports_a_pod_without_a_cgroup_v2_scope(tmp_path):
     (tmp_path / "root/sys/fs/cgroup").mkdir(parents=True)
     docker = _fake_bin(tmp_path, "docker", "echo abc\n")
@@ -106,21 +75,85 @@ def test_oom_group_reports_a_pod_without_a_cgroup_v2_scope(tmp_path):
     assert parse_guard_output(out) == {"set": [], "failed": ["oom_group abc no_cgroup_v2_scope"]}
 
 
-def test_memory_min_reports_a_refused_set_property(tmp_path):
+UNITS_MIB = sum(UNIT_MEMORY_MIN_MIB.values()) - UNIT_MEMORY_MIN_MIB["ssh.service"]
+EX = EXECUTOR_MEMORY_MIN_MIB * MIB
+
+
+def _run_memory_min(tmp_path, executor_cgroup: str, set_property: str = 'echo "${4#MemoryMin=}" > "$S/$3"'):
+    """Runs the memory.min script against a fake systemctl (docker.service and ssh.service active), a fake
+    cgroup tree and a fake /proc/self/cgroup placing this shell at executor_cgroup. Returns (state, cgroup root)."""
+    state, root = tmp_path / "sd", tmp_path / "cg"
+    state.mkdir(exist_ok=True)
+    (root / executor_cgroup.lstrip("/")).mkdir(parents=True, exist_ok=True)
+    (tmp_path / "self_cgroup").write_text(f"0::{executor_cgroup}\n")
     _fake_bin(
         tmp_path,
         "systemctl",
-        'case "$1" in show) echo 0;; is-active) [ "$3" = docker.service ];; set-property) exit 1;; esac\n',
+        f'S="{state}"; case "$1" in show) cat "$S/$5" 2>/dev/null || echo 0;; '
+        'is-active) [ "$3" = docker.service ] || [ "$3" = ssh.service ];; '
+        f"set-property) {set_property};; esac\n",
     )
-    inner = shlex.split(_host_memory_min_script().split("sh -c ", 1)[1].rsplit(" 2>/dev/null", 1)[0])[0]
+    inner = shlex.split(_host_memory_min_script().split("sh -c ", 1)[1])[0]
     inner = inner.split("exit 0; }; ", 2)[2]
+    inner = inner.replace("/proc/self/cgroup", str(tmp_path / "self_cgroup")).replace("/sys/fs/cgroup", str(root))
     env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}"}
+    return lambda: subprocess.run(["sh", "-c", inner], capture_output=True, text=True, env=env, check=False).stdout
 
-    out = subprocess.run(["sh", "-c", inner], capture_output=True, text=True, env=env, check=False).stdout
 
-    failed = parse_guard_output(out)["failed"]
+def _read(path):
+    return int(path.read_text().strip())
+
+
+def test_executor_in_a_systemd_scope_gets_memory_min_via_systemctl(tmp_path):
+    run = _run_memory_min(tmp_path, "/system.slice/docker-abc.scope")
+
+    first, second = run(), run()
+
+    state = tmp_path / "sd"
+    assert sorted(p.name for p in state.iterdir()) == [
+        "docker-abc.scope", "docker.service", "ssh.service", "system.slice"
+    ]
+    assert _read(state / "docker.service") == UNIT_MEMORY_MIN_MIB["docker.service"] * MIB
+    assert _read(state / "docker-abc.scope") == EX
+    assert _read(state / "system.slice") == UNITS_MIB * MIB + EX
+    assert "memory_min_set system.slice" in first
+    assert parse_guard_output(second)["set"] == []
+
+
+def test_executor_on_a_cgroupfs_host_gets_memory_min_written_with_its_parent(tmp_path):
+    run = _run_memory_min(tmp_path, "/docker/abc")
+
+    first, second = run(), run()
+
+    root, state = tmp_path / "cg", tmp_path / "sd"
+    assert _read(root / "docker/abc/memory.min") == EX
+    assert _read(root / "docker/memory.min") == EX
+    assert _read(state / "system.slice") == UNITS_MIB * MIB
+    assert "memory_min /docker/abc" in parse_guard_output(first)["set"]
+    assert parse_guard_output(second)["set"] == []
+
+
+def test_cgroupfs_parent_with_more_protection_is_not_lowered(tmp_path):
+    run = _run_memory_min(tmp_path, "/docker/abc")
+    (tmp_path / "cg/docker/memory.min").write_text(f"{EX * 2}\n")
+
+    run()
+
+    assert _read(tmp_path / "cg/docker/memory.min") == EX * 2
+
+
+def test_protected_total_stays_under_the_pod_reserve():
+    assert UNITS_MIB * MIB + EX < 4 * 1024 * MIB
+
+
+def test_memory_min_reports_a_refused_set_property_and_an_unknown_executor_path(tmp_path):
+    run = _run_memory_min(tmp_path, "/user.slice/x", set_property="exit 1")
+
+    failed = parse_guard_output(run())["failed"]
+
     assert "memory_min docker.service set_property_failed" in failed
     assert "memory_min system.slice set_property_failed" in failed
+    assert "memory_min executor no_host_cgroup_path" in failed
 
 
 @pytest.mark.asyncio
