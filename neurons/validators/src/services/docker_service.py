@@ -163,6 +163,7 @@ from services.loopback_plugin_setup import (
 from services.nvidia_devices import MissingRentedGpuError, build_gpu_docker_config_for_executor
 from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networking
 from services.redis_service import (
+    CREATE_IN_PROGRESS_RECHECK_SECONDS,
     GPU_CLOCKS_PENDING_KIND,
     GPU_RESET_PENDING_KIND,
     EDIT_PARKED_CONTAINER_AFTER_EDIT_SECONDS,
@@ -2695,9 +2696,12 @@ async def _take_create_lock_for_prune(redis_service, executor_id: str):
     except Exception:
         return None
     try:
-        # a create that went ahead without the lock, or outlived its TTL, holds no lock but is still pulling
+        # a create that went ahead without the lock, or outlived its TTL, holds no lock but is still pulling.
+        # An entry that lapsed while Redis was down is back within the renew retry: read again after it.
         if not await redis_service.creates_in_progress(executor_id):
-            return lock
+            await asyncio.sleep(CREATE_IN_PROGRESS_RECHECK_SECONDS)
+            if not await redis_service.creates_in_progress(executor_id):
+                return lock
     except Exception:
         pass
     with contextlib.suppress(Exception):

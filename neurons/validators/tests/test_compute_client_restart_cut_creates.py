@@ -1566,3 +1566,49 @@ async def test_a_renter_create_redis_cannot_record_fails_before_its_pull(monkeyp
             await create.__aenter__()
         assert not await redis_service.creates_in_progress("exec-1")
         assert not await redis_service.redis.exists("lock:executor-create:exec-1")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_renewal_retries_every_second_until_redis_answers(monkeypatch) -> None:
+    # lio#2226 review: a renewal that fails silently lets the entry lapse and a prune run beside the pull
+    sleeps = []
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) > 4:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(redis_service_module.asyncio, "sleep", sleep)
+    redis_service = _fakeredis_service()
+    write, calls = redis_service._write_create_in_progress, []
+
+    async def flaky_write(*args):
+        calls.append(1)
+        if len(calls) in (1, 2):
+            raise ConnectionError("redis down")
+        await write(*args)
+
+    redis_service._write_create_in_progress = flaky_write
+
+    with pytest.raises(asyncio.CancelledError):
+        await redis_service._keep_create_in_progress("exec-1", "token")
+
+    third = redis_service_module.CREATE_IN_PROGRESS_TTL_SECONDS / 3
+    assert sleeps == [third, 1, 1, third, third]
+    assert await redis_service.creates_in_progress("exec-1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("reads", "pruned"), [([False, True], False), ([False, False], True)])
+async def test_a_prune_reads_creates_again_after_the_renew_retry(monkeypatch, reads, pruned) -> None:
+    import services.docker_service as docker_service_module
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(docker_service_module.asyncio, "sleep", sleep)
+    redis_service = _fakeredis_service()
+    redis_service.creates_in_progress = AsyncMock(side_effect=reads)
+
+    lock = await docker_service_module._take_create_lock_for_prune(redis_service, "exec-1")
+
+    sleep.assert_awaited_once_with(redis_service_module.CREATE_IN_PROGRESS_RECHECK_SECONDS)
+    assert (lock is not None) is pruned

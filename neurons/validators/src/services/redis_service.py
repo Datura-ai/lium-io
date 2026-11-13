@@ -231,6 +231,10 @@ def _executor_create_lock_key(executor_id: str) -> str:
 CREATE_IN_PROGRESS_TTL_SECONDS = 60
 # a renter's create that Redis cannot record fails after these one-second retries, before its pull starts
 CREATE_IN_PROGRESS_REGISTER_ATTEMPTS = 5
+# a failed renewal retries this often, so the entry is back within this long of Redis answering again; a prune
+# re-reads an empty set after CREATE_IN_PROGRESS_RECHECK_SECONDS (longer) before it trusts it (lio#2226 review)
+CREATE_IN_PROGRESS_RENEW_RETRY_SECONDS = 1
+CREATE_IN_PROGRESS_RECHECK_SECONDS = 3
 
 
 def _creates_in_progress_key(executor_id: str) -> str:
@@ -565,14 +569,25 @@ class RedisService:
         message = f"Redis could not record the create on executor {executor_id}; create not started"
         raise RuntimeError(message) from error
 
-    async def _renew_create_in_progress(self, executor_id: str, token: str) -> None:
-        with suppress(redis.exceptions.RedisError, OSError):  # registered already: the next renewal retries
-            await self._write_create_in_progress(executor_id, token)
-
     async def _keep_create_in_progress(self, executor_id: str, token: str) -> None:
+        failing = False
         while True:
-            await asyncio.sleep(CREATE_IN_PROGRESS_TTL_SECONDS / 3)
-            await self._renew_create_in_progress(executor_id, token)
+            await asyncio.sleep(CREATE_IN_PROGRESS_RENEW_RETRY_SECONDS if failing else CREATE_IN_PROGRESS_TTL_SECONDS / 3)
+            try:
+                await self._write_create_in_progress(executor_id, token)
+            except (redis.exceptions.RedisError, OSError) as e:
+                if not failing:
+                    logger.warning(
+                        _m(
+                            f"Create on executor {executor_id} could not renew its in-progress entry; retrying",
+                            extra={"error": str(e)},
+                        )
+                    )
+                failing = True
+                continue
+            if failing:
+                logger.info(_m(f"Create on executor {executor_id} renewed its in-progress entry again"))
+            failing = False
 
     async def creates_in_progress(self, executor_id: str) -> bool:
         """Whether a renter create runs on the executor; raises when Redis cannot say."""

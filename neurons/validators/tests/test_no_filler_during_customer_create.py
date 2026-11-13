@@ -21,6 +21,12 @@ from services.rental_docker_sdk import RentalDockerOperationError
 from test_deploy_optimizations import _payload
 
 
+@pytest.fixture(autouse=True)
+def _no_recheck_wait(monkeypatch):
+    # the prune's re-read of an empty create set waits out the renew retry; these tests time prunes in milliseconds
+    monkeypatch.setattr(docker_service, "CREATE_IN_PROGRESS_RECHECK_SECONDS", 0)
+
+
 class _CreateLocks:
     """Redis's per-executor create lock, one for every connector process (a renter's create holds it)."""
 
