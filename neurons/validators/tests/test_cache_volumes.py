@@ -433,15 +433,18 @@ class KilledFillerHostSshClient(HostSshClient):
     """prod 4 Nov, 8x B300: the filler the create killed is still exiting and mounts kimi-k3, so `volume rm` fails.
     The wipe unlinks the files (disk freed) only when every user is in its allowed list; the volume stays listed."""
 
-    def __init__(self, users: list[str], **kwargs):
+    def __init__(self, users: list[str], freed_gb: float = 1561, **kwargs):
         super().__init__([_KIMI, "volume_pod"], **kwargs)
         self.users = users
+        self.freed_gb = freed_gb
 
     async def run(self, command: str, *args, **kwargs):
         if "volume rm" in command and "/proc/1/root" in command:
             allowed = command.split("ok=' ", 1)[1].split(" '", 1)[0].split()
             if all(user in allowed for user in self.users):
-                self._free_bytes += 1561 * 1024**3
+                self.commands.append(command)
+                self._free_bytes += int(self.freed_gb * 1024**3)
+                return SimpleNamespace(exit_status=0, stdout=f"wiped /x\ncache emptied: {_KIMI}\n", stderr="")
         return await super().run(command, *args, **kwargs)
 
 
@@ -467,6 +470,26 @@ async def test_a_cache_a_live_filler_mounts_is_not_wiped_and_the_order_clamps(do
         ssh_client, rental, {}, killed_fillers=killed_fillers
     ) is True
     assert rental.volume_limit_gb == 2389
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("users", "volume_gb"), [(["filler_79ba7fa2"], 1250), (["filler_79ba7fa2", "filler_live"], 290)]
+)
+async def test_a_cache_the_wipe_emptied_is_no_failed_removal_when_kept_volumes_leave_the_rent_short(
+    docker_service, monkeypatch, users, volume_gb
+):
+    # lio#2219 review: the wipe frees the cache's bytes but its empty volume stays listed. The kept volumes leave the
+    # whole-node rent short either way, so the order stays as placed; only a wipe refused (live filler) clamps it.
+    monkeypatch.setattr(docker_service, "_get_existing_vloopback_bytes", AsyncMock(return_value=1264 * 10**9))
+    rental = _rental(1250, 625)
+    rental.disk_share = 1.0
+    ssh_client = KilledFillerHostSshClient(users, freed_gb=355, free_gb=300)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(
+        ssh_client, rental, {}, killed_fillers=["filler_79ba7fa2"]
+    ) is True
+    assert rental.volume_limit_gb == volume_gb
 
 
 def test_the_wipe_refuses_a_volume_another_container_mounts():

@@ -3183,6 +3183,9 @@ def _vloopback_repair_helper_cmd(propagated_mount_dir: str, helper_command: str)
     )
 
 
+_CACHE_EMPTIED_MARK = "cache emptied: "
+
+
 def _wipe_volume_cmd(local_volume: str, *container_names: str) -> str:
     # unlink the volume's files on the host, through the executor's view of the host root: the
     # pod's open files stay writable until its processes die, and the kernel drops an unlinked
@@ -6308,11 +6311,18 @@ class DockerService:
                     }),
                 )
             )
+            # a cache the wipe emptied stays listed but holds no bytes, so it is not a failed removal (lio#2219 review)
+            emptied: set[str] = set()
+
             async def remove(command: str) -> object:
-                return await asyncio.wait_for(
+                result = await asyncio.wait_for(
                     retry_ssh_command(ssh_client, command, "reclaim_dphn_cache_for_rental"),
                     CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS,
                 )
+                for line in (getattr(result, "stdout", None) or "").splitlines():
+                    if line.startswith(_CACHE_EMPTIED_MARK):
+                        emptied.add(line[len(_CACHE_EMPTIED_MARK):].strip())
+                return result
 
             async def rental_fits() -> bool:
                 free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
@@ -6325,7 +6335,8 @@ class DockerService:
                     return DockerCommand.volume_remove(name)
                 return (
                     f"/usr/bin/docker volume rm {shlex.quote(name)} 2>/dev/null || "
-                    f"( {_wipe_volume_cmd(name, *killed)} ) || true"
+                    f"( ( {_wipe_volume_cmd(name, *killed)} ) && "
+                    f"echo {shlex.quote(_CACHE_EMPTIED_MARK + name)} ) || true"
                 )
 
             # Oldest first, only as much as the rental needs: a kept Engy checkpoint still restarts fast.
@@ -6367,7 +6378,7 @@ class DockerService:
                         raise
                     except Exception:
                         cache_volumes_still_listed = None
-                    removal_failed = cache_volumes_still_listed is None or bool(cache_volumes_still_listed)
+                    removal_failed = cache_volumes_still_listed is None or bool(cache_volumes_still_listed - emptied)
                 if removal_failed:
                     await self._clamp_rental_volume_to_free_disk(ssh_client, payload, docker_root_dir, fit)
             return True
