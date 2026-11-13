@@ -739,15 +739,21 @@ def test_the_idle_filler_removal_keeps_the_rented_image_under_any_docker_hub_pre
 # ---------------------------------------------------------------- DAH-2498: cache files deleted off the start path
 
 
-def _run_detach(tmp_path, users: str, other_filesystem: bool = False) -> tuple[str, str]:
+def _run_detach(
+    tmp_path, users: str, other_filesystem: bool = False, tools: dict[str, str] | None = None
+) -> tuple[str, str]:
     """Runs the real command against a fake docker and a temp dir standing in for the host root."""
     env = None
+    tools = dict(tools or {})
     if other_filesystem:
         # a stat that reports a different device per path: the trash dir is on another filesystem than the volume
+        tools["stat"] = "#!/bin/sh\necho ${#3}\n"
+    if tools:
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
-        (bin_dir / "stat").write_text('#!/bin/sh\necho ${#3}\n')
-        (bin_dir / "stat").chmod(0o755)
+        for name, script in tools.items():
+            (bin_dir / name).write_text(script)
+            (bin_dir / name).chmod(0o755)
         env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
     root = tmp_path / "host"
     data = root / "var/lib/docker/volumes/engy_cache_hf_x/_data"
@@ -792,6 +798,29 @@ def test_a_volume_on_another_filesystem_leaves_no_empty_trash_for_a_flatten_to_w
     assert out.split() == ["removed"]
     assert os.listdir(data) == ["model.safetensors"]  # left to the plain removal
     assert not (tmp_path / "host/var/lib/docker/lium-cache-trash").exists()
+
+
+def test_a_rename_refused_across_mounts_never_falls_back_to_copying_the_cache(tmp_path):
+    # review: a bind-mounted volumes dir has the same device but rename says EXDEV, and mv then copied the cache
+    exdev = "#!/bin/sh\necho 'OSError: [Errno 18] Invalid cross-device link' >&2\nexit 1\n"
+    copying_mv = '#!/bin/sh\nmkdir -p "$2" && cp -a "$1"/. "$2" && rm -rf "$1"\n'
+    out, data = _run_detach(tmp_path, "", tools={"python3": exdev, "mv": copying_mv})
+
+    assert out.split() == ["removed"]
+    assert os.listdir(data) == ["model.safetensors"]  # left to the plain removal, nothing copied
+    assert not (tmp_path / "host/var/lib/docker/lium-cache-trash").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_full_node_rental_counts_trash_an_earlier_create_left_deleting_before_evicting(docker_service):
+    # review: 2389 GB free plus 400 GB an earlier create still deletes covers the 2740 GB, so no cache goes
+    ssh_client = HostSshClient(["dphn_cache_hf_x", _KIMI, "volume_pod"], free_gb=2389)
+    ssh_client._trash_bytes = 400 * 1024**3
+    rental = _rental(2620, 1310)
+    rental.disk_share = 1.0
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is False
+    assert _removed_volumes(ssh_client) == []
 
 
 def test_a_cache_volume_a_container_still_uses_is_left_to_the_plain_removal(tmp_path):

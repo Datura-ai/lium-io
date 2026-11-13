@@ -3289,7 +3289,9 @@ def _detach_volume_data_cmd(volume_name: str, remove_cmd: str) -> str:
         f"u=$({docker} ps -aq --filter volume=$v) && [ -z \"$u\" ] && "
         f't=${{m%/volumes/*}}/{CACHE_TRASH_DIR} && mkdir -p "/proc/1/root$t" && '
         '[ "$(stat -c %d "/proc/1/root$m")" = "$(stat -c %d "/proc/1/root$t")" ] && '
-        'b=$(du -sxB1 "/proc/1/root$m" | cut -f1) && mv "/proc/1/root$m" "/proc/1/root$t/$v.$$" && '
+        # rename only: a plain mv copies the whole cache when rename says EXDEV (a bind-mounted volumes dir)
+        'b=$(du -sxB1 "/proc/1/root$m" | cut -f1) && '
+        'python3 -c \'import os,sys; os.rename(sys.argv[1], sys.argv[2])\' "/proc/1/root$m" "/proc/1/root$t/$v.$$" && '
         # a refused or failed move leaves no empty trash dir: a flatten would wait on it (image_flatten trash check)
         '{ mkdir "/proc/1/root$m" 2>/dev/null; true; } || { [ -n "$t" ] && rmdir "/proc/1/root$t" 2>/dev/null; t=; }; '
         f"{remove_cmd}; "
@@ -6378,7 +6380,24 @@ class DockerService:
                 return False
 
             docker_root_dir = await self.get_docker_root_dir(ssh_client)
-            free_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
+            # a partial or legacy rental's volume is fallocated right after this: it needs the bytes freed before
+            # the create, so only a full-node rental leaves the delete running in the background
+            detach = payload.disk_share is not None and payload.disk_share >= 1
+
+            async def free_with_trash_gb() -> float | None:
+                # a full-node rental counts trash an earlier create left deleting, read with df under one lock
+                if not detach:
+                    return None
+                try:
+                    return await free_bytes_with_trash(ssh_client) / (1024**3)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    return None
+
+            free_gb = await free_with_trash_gb()
+            if free_gb is None:
+                free_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
             fit = await self._rental_disk_fit(ssh_client, payload)
             rental_needs_free_gb = fit.needs_free_gb
             if free_gb >= rental_needs_free_gb:
@@ -6411,23 +6430,15 @@ class DockerService:
                 return result
 
             async def rental_fits() -> bool:
-                if detached_gb:
-                    # df and the trash still to free, read under one lock: nothing freed since is missed or doubled
-                    try:
-                        return await free_bytes_with_trash(ssh_client) / (1024**3) >= rental_needs_free_gb
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        pass
+                # df and the trash still to free, read under one lock: nothing freed since is missed or doubled
+                with_trash_gb = await free_with_trash_gb()
+                if with_trash_gb is not None:
+                    return with_trash_gb >= rental_needs_free_gb
                 free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
                 # df already holds what the detached `rm` freed so far: never count those bytes twice
                 return max(free_now_gb, free_gb + detached_gb) >= rental_needs_free_gb
 
             killed: tuple[str, ...] = tuple(killed_fillers)
-
-            # a partial or legacy rental's volume is fallocated right after this: it needs the bytes freed before
-            # the create, so only a full-node rental leaves the delete running in the background
-            detach = payload.disk_share is not None and payload.disk_share >= 1
 
             def volume_remove(name: str) -> str:
                 command = (
