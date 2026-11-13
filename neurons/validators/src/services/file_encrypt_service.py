@@ -117,10 +117,17 @@ ORIGINAL_KEYS = {
     'hard_disk_volumes': "volumes",
     'hard_disk_scrape_error': "hard_disk_scrape_error",
     'hard_disk_docker_scrape_error': "hard_disk_docker_scrape_error",
+    'hard_disk_content_scrape_error': "hard_disk_content_scrape_error",
     # DAH-3674: nvme | ssd | hdd | unknown for the disk under docker's data root
     'hard_disk_disk_type': "disk_type",
     # DAH-5045: used size of the engy_cache_* volumes, in GB
     'hard_disk_engy_cache_used_gb': "engy_cache_used_gb",
+    # the part of that cache counted as free disk (a non-filler container's mount stays used)
+    'hard_disk_engy_cache_released_gb': "engy_cache_released_gb",
+    # data-root's own used kB: the docker breakdown is measured there, whatever disk the reading above folds in
+    'hard_disk_data_root_used': "data_root_used",
+    # the part of the docker breakdown on data-root's filesystem: all of it, or volumes only when the store is apart
+    'hard_disk_data_root_docker_used': "data_root_docker_used",
     # DAH-5059: kB per container name (writable layer + its anonymous volumes) and per volume name
     'hard_disk_by_container': "by_container",
     'hard_disk_by_volume': "by_volume",
@@ -336,8 +343,12 @@ class FileEncryptService:
             'hard_disk_volumes': "",
             'hard_disk_scrape_error': "",
             'hard_disk_docker_scrape_error': "",
+            'hard_disk_content_scrape_error': "",
             'hard_disk_disk_type': "",
             'hard_disk_engy_cache_used_gb': "",
+            'hard_disk_engy_cache_released_gb': "",
+            'hard_disk_data_root_used': "",
+            'hard_disk_data_root_docker_used': "",
             'hard_disk_by_container': "",
             'hard_disk_by_volume': "",
             'data_os': "",

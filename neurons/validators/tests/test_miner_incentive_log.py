@@ -288,6 +288,7 @@ def test_insufficient_disk_reason_keeps_the_two_numbers_apart():
 
     assert line.fields["total_vram_gb"] == 1128.0
     assert line.fields["total_disk_gb"] == 500.0
+    assert line.fields["disk_unknown"] is False  # measured short: consumers may say "add disk"
     assert "500.0 GB of total disk but 1128.0 GB of GPU VRAM" in line.message
     assert "at least 1692.0 GB" in line.message
 

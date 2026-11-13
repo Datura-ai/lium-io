@@ -357,7 +357,8 @@ def compute_provider_side_load(
     across all cores) minus the core-percents of LIUM's containers only, in cores. A container
     Lium did not put there is the provider's own workload and stays in the total - subtracting
     it would let the provider mine another subnet with `docker run` and read as idle. Disk:
-    hard_disk.used minus the docker breakdown (images+containers+volumes, DAH-2514), in kB —
+    hard_disk.data_root_used minus data_root_docker_used (the docker breakdown on data-root's filesystem;
+    older scrapes: used minus images+containers+volumes, DAH-2514), in kB —
     includes the OS baseline, so thresholds must leave room for it.
 
     Each part needs all its inputs present, numeric and well-shaped, else stays None — never
@@ -383,8 +384,13 @@ def compute_provider_side_load(
 
     try:
         hard_disk = specs.get("hard_disk") or {}
-        used_kb = int(hard_disk.get("used"))
-        docker_parts_kb = [int(hard_disk.get(key)) for key in ("images", "containers", "volumes")]
+        if "data_root_docker_used" in hard_disk:
+            # data-root's own used kB less only the docker bytes on that filesystem (a split store holds the rest)
+            used_kb = int(hard_disk.get("data_root_used"))
+            docker_parts_kb = [int(hard_disk.get("data_root_docker_used"))]
+        else:
+            used_kb = int(hard_disk.get("used"))
+            docker_parts_kb = [int(hard_disk.get(key)) for key in ("images", "containers", "volumes")]
         if used_kb >= 0 and all(part_kb >= 0 for part_kb in docker_parts_kb):
             disk_kb = max(0, used_kb - sum(docker_parts_kb))
     except (TypeError, ValueError, AttributeError, OverflowError):

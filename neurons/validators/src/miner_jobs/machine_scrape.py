@@ -676,6 +676,8 @@ def run_cmd(cmd):
 
 
 DOCKER_SOCKET_PATH = "/var/run/docker.sock"
+# the validator's disk gate reads this marker in hard_disk_scrape_error: an unknown root is not a passed check
+CONTAINERD_ROOT_UNKNOWN = "containerd root unknown"
 # /system/df walks the graph driver, so it is slow on nodes with many images; cap it rather than
 # let a scrape round hang on it.
 DOCKER_API_TIMEOUT_SECONDS = 20
@@ -689,6 +691,8 @@ ENGY_CACHE_VOLUME_PREFIX = "engy_cache_"
 # the label a filler create puts on its own run volume (services/rental_docker_sdk.py FILLER_VOLUME_LABELS)
 FILLER_VOLUME_LABEL_KEY = "io.lium.workload"
 FILLER_VOLUME_LABEL_VALUE = "filler"
+# the filler container's name prefix (services/const.py FILLER_CONTAINER_PREFIX): the rental path removes these
+FILLER_CONTAINER_PREFIX = "filler_"
 
 
 class UnixSocketHTTPConnection(http.client.HTTPConnection):
@@ -743,6 +747,17 @@ def get_vloopback_volume_bytes(docker_root_dir, filler_only=False, sizes=None):
         and "/" not in volume.get("Name")
         and (not filler_only or (volume.get("Labels") or {}).get(FILLER_VOLUME_LABEL_KEY) == FILLER_VOLUME_LABEL_VALUE)
     ]
+    if filler_only and names:
+        # the label is free to set: the rental cleanup (docker_service clean_stale_vloopback_volumes) removes
+        # only unmounted `volume_*` vloopback volumes once the filler_* containers are gone, so only those count
+        names = [name for name in names if name.startswith("volume_")]
+        held = {
+            mount.get("Name")
+            for container in docker_api_get("/containers/json?all=1") or []
+            if not all(name.lstrip("/").startswith(FILLER_CONTAINER_PREFIX) for name in container.get("Names") or [""])
+            for mount in container.get("Mounts") or []
+        }
+        names = [name for name in names if name not in held]
     if not names:
         return 0
 
@@ -854,28 +869,176 @@ def get_container_log_bytes(docker_root_dir: str) -> int:
     return total
 
 
-def get_host_disk_usage():
+def get_host_disk_usage(data_root_too=False):
     # total/used/free of the filesystem that holds docker's data root — where rented containers,
     # images and volumes land — read through PID 1's root like the walks above. `/` is this
     # container's own overlay: on a host with /var/lib/docker on its own partition it reported the
     # root partition, so a 5 TB docker volume listed as 1.8 TB (ticket-0286, DAH-2771). Without a
     # docker answer, or outside the executor container, `/` stays the measurement.
     try:
-        docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
+        info = docker_api_get("/info") or {}
     except Exception:
-        docker_root_dir = "/var/lib/docker"
-    host_docker_root = f"/proc/1/root{docker_root_dir}"
-    if os.path.isdir(host_docker_root):
-        return shutil.disk_usage(host_docker_root)
-    return shutil.disk_usage("/")
+        info = {}
+    store = disk_root_dir(info)
+    host_disk_root = f"/proc/1/root{store}"
+    if not os.path.isdir(host_disk_root):
+        return (shutil.disk_usage("/"), None) if data_root_too else shutil.disk_usage("/")
+    usage = shutil.disk_usage(host_disk_root)
+    # containers' files land in <store>/snapshots/<id>/fs: a smaller disk mounted there binds the store too
+    snapshots = host_realpath(f"{store}/snapshots")
+    snapshots_usage = None
+    if os.path.isdir(f"/proc/1/root{snapshots}") and not on_one_filesystem(store, snapshots):
+        snapshots_usage = shutil.disk_usage(f"/proc/1/root{snapshots}")
+    # with snapshots/ on its own disk the containers' files live there, so that disk is the store's size; the
+    # parent only holds metadata, which still needs free room
+    store_usage = tighter_usage(usage, snapshots_usage, snapshots_usage)
+    if not data_root_too:
+        return store_usage
+    # rental volumes stay under data-root whatever store keeps the containers: its own reading when apart
+    data_root = info.get("DockerRootDir") or "/var/lib/docker"
+    if not os.path.isdir(f"/proc/1/root{data_root}"):
+        return store_usage, None
+    if on_one_filesystem(store, data_root):
+        # the filler cache is released from data-root's own bytes before the snapshots disk folds in (F-92)
+        return (snapshots_usage, usage) if snapshots_usage else (usage, None)
+    return store_usage, shutil.disk_usage(f"/proc/1/root{data_root}")
 
 
-def cache_volume_bytes(df, prefixes):
+def tighter_usage(a, b, sized=None):
+    # one reading for two filesystems a rental needs: the smaller size (or sized's, when given), the least free
+    # room and the fuller one's utilization (its used share of that size), so neither hides the other running full
+    if a is None or b is None:
+        return a or b
+    small = sized or (a if a.total <= b.total else b)
+    used = max(small.used, -(-a.used * small.total // a.total), -(-b.used * small.total // b.total))
+    return small._replace(used=used, free=min(a.free, b.free))
+
+
+def hard_disk_reading(usage):
+    return {
+        "hard_disk_total": usage.total // 1024,  # in kB
+        "hard_disk_used": usage.used // 1024,
+        "hard_disk_free": usage.free // 1024,
+        "hard_disk_utilization": (usage.used / usage.total) * 100,
+    }
+
+
+def report_tighter_store(hard_disk, store_usage, size_too=True):
+    # hard_disk is data-root's reading after its filler run volumes are released; a rental also needs room in
+    # the containerd store on its other filesystem, so the tighter of the two is what a renter can get:
+    # the smaller filesystem's size (what the disk gate measures), the least free room and the fuller of the two
+    if "hard_disk_used" in hard_disk:
+        # data-root's own used bytes, before a store folds in: the docker breakdown is measured there
+        hard_disk.setdefault("hard_disk_data_root_used", hard_disk["hard_disk_used"])
+    docker_kb = [hard_disk.get(key) for key in ("hard_disk_images", "hard_disk_containers", "hard_disk_volumes")]
+    if all(isinstance(kb, int) for kb in docker_kb):
+        hard_disk.setdefault("hard_disk_data_root_docker_used", sum(docker_kb))
+        if store_usage:
+            # images and container layers sit in the store on its other filesystem: only volumes are data-root's
+            hard_disk["hard_disk_data_root_docker_used"] = docker_kb[2]
+    if not store_usage or "hard_disk_total" not in hard_disk:
+        return
+    store = hard_disk_reading(store_usage)
+    free_kb = min(store["hard_disk_free"], hard_disk["hard_disk_free"])
+    if hard_disk.get("hard_disk_engy_cache_released_gb"):
+        # a tighter store hides part of data-root's released cache: only what still shows in free was credited
+        lost_gb = -(-(hard_disk["hard_disk_free"] - free_kb) * 1024 // 10**9)
+        hard_disk["hard_disk_engy_cache_released_gb"] = max(hard_disk["hard_disk_engy_cache_released_gb"] - lost_gb, 0)
+    utilization = max(store["hard_disk_utilization"], hard_disk["hard_disk_utilization"])
+    if size_too and store["hard_disk_total"] < hard_disk["hard_disk_total"]:
+        hard_disk.update(store)
+    hard_disk["hard_disk_free"] = free_kb
+    hard_disk["hard_disk_utilization"] = utilization
+
+
+def disk_root_dir(info):
+    # Docker's containerd image store (default on Docker 29+) keeps container root filesystems in
+    # containerd's root whatever data-root says: a 14 TB data-root over a 436 GB root disk (webg8845).
+    docker_root_dir = info.get("DockerRootDir") or "/var/lib/docker"
+    if not any("io.containerd.snapshotter" in str(row) for row in info.get("DriverStatus") or []):
+        return docker_root_dir
+    return containerd_store_root(info, f"io.containerd.snapshotter.v1.{info.get('Driver') or 'overlayfs'}")
+
+
+def get_content_store_usage():
+    # pulled image layers land in containerd's content store before they unpack: on its own filesystem, its free
+    # room limits a rental too (its size does not: the disk gate measures where containers live)
+    info = docker_api_get("/info") or {}
+    if not any("io.containerd.snapshotter" in str(row) for row in info.get("DriverStatus") or []):
+        return None
+    content = containerd_store_root(info, "io.containerd.content.v1.content")
+    # a pull also grows containerd's metadata file, so a full disk under it fails the pull too
+    metadata = containerd_store_root(info, "io.containerd.metadata.v1.bolt", "path")
+    measured = (disk_root_dir(info), info.get("DockerRootDir") or "/var/lib/docker")
+    tightest = None
+    # a pull writes to ingest/, then blobs/sha256/: a disk mounted on either limits it too
+    for path in (content, host_realpath(f"{content}/ingest"), host_realpath(f"{content}/blobs/sha256"), metadata):
+        if not os.path.isdir(f"/proc/1/root{path}") or any(on_one_filesystem(path, d) for d in measured):
+            continue
+        tightest = tighter_usage(tightest, shutil.disk_usage(f"/proc/1/root{path}"))
+    return tightest
+
+
+def containerd_store_root(info, plugin, export="root"):
+    # the root the containerd Docker talks to reports for plugin (its Exports root, or the directory of its Exports
+    # path for the metadata file), asked of that running daemon:
+    # its config files may already name a root it has not restarted onto. Unknown when it cannot be asked.
+    address = (info.get("Containerd") or {}).get("Address") or ""
+    if not re.fullmatch(r"[\w./+-]+", address):  # never handed to a shell
+        raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: Docker reports no containerd address")
+    try:
+        listing = run_cmd(f"timeout 20 chroot /proc/1/root ctr --address {address} plugins ls -d")
+    except Exception as exc:
+        if "proc.returncode=127" not in str(exc):
+            raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {exc!r}")
+        # without ctr only files on disk are left, and they cannot show what the running daemon loaded
+        raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: no ctr on the host, so containerd's loaded root cannot be asked")
+    kind = name = None
+    # maxsplit: ctr prints a root verbatim, and a root may hold spaces
+    for words in (line.split(maxsplit=1) for line in listing.splitlines()):
+        if words[:1] == ["Type:"]:
+            kind, name = words[-1], None
+        elif words[:1] == ["ID:"]:
+            name = f"{kind}.{words[-1]}"
+        elif name == plugin and len(words) == 2 and words[0] == export:
+            root = host_realpath(words[1] if export == "root" else os.path.dirname(words[1]))
+            if not os.path.isdir(f"/proc/1/root{root}"):
+                raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: {root!r} is not on the host")
+            return root
+    raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: containerd reports no root for {plugin}")
+
+
+def host_realpath(path):
+    # path with its symlinks resolved on the host: an absolute link read through /proc/1/root would land in this
+    # container (/var/lib/containerd -> /data/containerd), so each one is followed from the host's root instead
+    parts, resolved, links = path.split("/"), "", 0
+    while parts:
+        part = parts.pop(0)
+        if part in ("", "."):
+            continue
+        if part == "..":
+            resolved = os.path.dirname(resolved).rstrip("/")
+            continue
+        try:
+            target = os.readlink(f"/proc/1/root{resolved}/{part}")
+        except OSError:  # not a link, or not there: isdir answers for it
+            resolved = f"{resolved}/{part}"
+            continue
+        links += 1
+        if links > 40:
+            raise RuntimeError(f"{CONTAINERD_ROOT_UNKNOWN}: symlink loop at {path!r}")
+        parts = target.split("/") + parts
+        if target.startswith("/"):
+            resolved = ""
+    return resolved or "/"
+
+
+def cache_volume_bytes(df, prefixes, skip=()):
     # local-driver volumes: /system/df walks each one's _data, so this is what the files really hold
     return sum(
         max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
         for volume in df.get("Volumes") or []
-        if str(volume.get("Name") or "").startswith(prefixes)
+        if str(volume.get("Name") or "").startswith(prefixes) and volume.get("Name") not in skip
     )
 
 
@@ -896,6 +1059,14 @@ def get_docker_disk_usage():
     # (1561 GB on an 8x B300), which a customer create removes when the renter needs the space.
     # The Dolphin cache (~40 GB) stays used.
     engy_cache = cache_volume_bytes(df, ENGY_CACHE_VOLUME_PREFIX)
+    # a customer create cannot remove a cache volume another container still mounts, so that one stays used
+    held = {
+        mount.get("Name")
+        for container in df.get("Containers") or []
+        if not all(str(name).lstrip("/").startswith(FILLER_CONTAINER_PREFIX) for name in container.get("Names") or [""])
+        for mount in container.get("Mounts") or []
+    }
+    engy_released = cache_volume_bytes(df, ENGY_CACHE_VOLUME_PREFIX, held)
     filler_run_volumes = get_vloopback_volume_bytes(docker_root_dir, True)
     by_volume = {
         str(volume.get("Name")): max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
@@ -903,7 +1074,7 @@ def get_docker_disk_usage():
         if volume.get("Name")
     }
     volumes += get_vloopback_volume_bytes(docker_root_dir, False, by_volume) - filler_run_volumes
-    volumes -= engy_cache
+    volumes -= engy_released
     volumes += get_dmcrypt_volume_bytes(docker_root_dir, by_volume)
     containers += get_container_log_bytes(docker_root_dir)
 
@@ -931,7 +1102,8 @@ def get_docker_disk_usage():
         "hard_disk_images": (int(df.get("LayersSize") or 0) + build_cache) // 1024,
         "hard_disk_containers": containers // 1024,
         "hard_disk_volumes": volumes // 1024,
-        "filler_released_kb": (filler_run_volumes + engy_cache) // 1024,
+        "filler_released_kb": (filler_run_volumes + engy_released) // 1024,
+        "engy_released_kb": engy_released // 1024,
         # DAH-5045: how far the Engy checkpoint download has got, in GB (10**9 bytes)
         "hard_disk_engy_cache_used_gb": engy_cache // 10**9,
         "hard_disk_by_container": {name: size // 1024 for name, size in by_container.items()},
@@ -939,14 +1111,27 @@ def get_docker_disk_usage():
     }
 
 
+def on_one_filesystem(host_dir, other_host_dir):
+    if host_dir == other_host_dir:
+        return True
+    try:
+        return os.stat(f"/proc/1/root{host_dir}").st_dev == os.stat(f"/proc/1/root{other_host_dir}").st_dev
+    except OSError:
+        return False
+
+
 def release_filler_cache(hard_disk):
     # DAH-5192: report the filler run volumes and the Engy cache as free disk (a rental removes them), so the
     # listing floor, the disk a renter is offered and the filler fit checks see that space. The Dolphin cache
     # is not in it: it stays used. The key is dropped: not part of the reported block.
     cache_kb = hard_disk.pop("filler_released_kb", 0)
+    engy_kb = hard_disk.pop("engy_released_kb", 0)
+    # the Engy bytes really counted as free: the backend takes them back off for a job that keeps the cache
+    hard_disk["hard_disk_engy_cache_released_gb"] = 0
     if not cache_kb or not hard_disk.get("hard_disk_total"):
         return
     used_kb = max(hard_disk["hard_disk_used"] - cache_kb, 0)
+    hard_disk["hard_disk_engy_cache_released_gb"] = min(engy_kb, hard_disk["hard_disk_used"] - used_kb) * 1024 // 10**9
     hard_disk["hard_disk_free"] += hard_disk["hard_disk_used"] - used_kb
     hard_disk["hard_disk_used"] = used_kb
     hard_disk["hard_disk_utilization"] = used_kb / hard_disk["hard_disk_total"] * 100
@@ -2220,7 +2405,7 @@ def disk_type_of(device_name: str | None) -> str:
 
 
 def get_docker_root_disk_type() -> str:
-    """The disk type under docker's data root - the filesystem get_host_disk_usage measures."""
+    """The disk type under docker's data root, where rental volumes live."""
     try:
         docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
     except Exception:
@@ -2498,14 +2683,11 @@ def get_machine_specs():
         data["ram_scrape_error"] = repr(exc)
 
     data["data_hard_disk"] = {}
+    store_usage = None
     try:
-        disk_usage = get_host_disk_usage()
-        data["data_hard_disk"] = {
-            "hard_disk_total": disk_usage.total // 1024,  # in kB
-            "hard_disk_used": disk_usage.used // 1024,
-            "hard_disk_free": disk_usage.free // 1024,
-            "hard_disk_utilization": (disk_usage.used / disk_usage.total) * 100
-        }
+        store_usage, data_root_usage = get_host_disk_usage(True)
+        data["data_hard_disk"] = hard_disk_reading(data_root_usage or store_usage)
+        store_usage = store_usage if data_root_usage else None
     except Exception as exc:
         # print(f"Error getting disk_usage from shutil: {exc}", file=sys.stderr)
         data["hard_disk_scrape_error"] = repr(exc)
@@ -2517,6 +2699,11 @@ def get_machine_specs():
         # kept apart from hard_disk_scrape_error: the docker socket is the fragile half, and a
         # node that loses only the breakdown must keep reporting total/used/free.
         data["hard_disk_docker_scrape_error"] = repr(exc)
+    report_tighter_store(data["data_hard_disk"], store_usage)
+    try:
+        report_tighter_store(data["data_hard_disk"], get_content_store_usage(), False)
+    except Exception as exc:
+        data["hard_disk_content_scrape_error"] = repr(exc)
 
     try:
         data["data_hard_disk"]["hard_disk_disk_type"] = get_docker_root_disk_type()
