@@ -204,8 +204,20 @@ class BatchVerifier:
                 (reached, first_round), start_result = await asyncio.gather(*steps)
             except BaseException:
                 # a start left running would bind its listener after the cleanup and answer attempt 2 stale
+                # a second cancel would interrupt a step's own awaited cleanup (the outside container's removal)
                 for step in steps:
-                    step.cancel()
+                    if not step.cancelling():
+                        step.cancel()
+                # wait for that cleanup before attempt 2 publishes the same ports; asyncio.wait never cancels the
+                # steps, so the deadline firing meanwhile cannot cut it short either
+                deadline = None
+                while not all(step.done() for step in steps):
+                    try:
+                        await asyncio.wait(steps)
+                    except asyncio.CancelledError as exc:
+                        deadline = exc
+                if deadline:
+                    raise deadline
                 raise
         else:
             reached, first_round = await outside

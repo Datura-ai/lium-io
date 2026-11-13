@@ -16,7 +16,7 @@ from services.executor_connectivity.models import (
 )
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
 from services.executor_connectivity.port_probe import PortProbe
-from services.executor_connectivity.port_verifiers import BatchVerifier
+from services.executor_connectivity.port_verifiers import BatchVerifier, ContainerStartWatch
 from services.node_host import NodeHostError
 
 from core.config import settings
@@ -567,3 +567,47 @@ async def test_the_ready_host_ports_are_probed_while_the_missed_ports_listener_s
     result = await verifier.verify(TEN, ssh_client=mocker.Mock(), host="1.2.3.4")
 
     assert result.successful == TEN
+
+
+def _failing_host_start_with_slow_outside_cleanup(mocker):
+    # the host start fails while the outside reading waits on the prober; its container removal takes a while
+    async def reached(host, sample, token):
+        await asyncio.Event().wait()
+
+    verifier, runner = _parallel_verifier(mocker, reached)
+    cleaned = []
+
+    async def docker_run(_ssh, name, *_args):
+        await asyncio.sleep(0)
+        if name.startswith("port_test_out_"):
+            return ContainerStartResult(ok=True, container_id="c", status="Up")
+        raise RuntimeError("ssh dropped")
+
+    async def cleanup(_ssh, name):
+        await asyncio.sleep(0.05)
+        cleaned.append(name)
+
+    runner.run.side_effect = docker_run
+    runner.cleanup.side_effect = cleanup
+    attempt = verifier._attempt(TEN, "a" * 32, "port_test_aaaaaaaa", mocker.Mock(), "1.2.3.4", ContainerStartWatch())
+    return attempt, cleaned
+
+
+@pytest.mark.asyncio
+async def test_a_failed_host_start_waits_for_the_outside_container_removal_before_the_retry(mocker):
+    attempt, cleaned = _failing_host_start_with_slow_outside_cleanup(mocker)
+
+    with pytest.raises(RuntimeError):
+        await attempt
+
+    assert cleaned == ["port_test_out_aaaaaaaa"]  # gone before attempt 2 publishes the same ports
+
+
+@pytest.mark.asyncio
+async def test_the_deadline_during_the_outside_container_removal_does_not_cut_it_short(mocker):
+    attempt, cleaned = _failing_host_start_with_slow_outside_cleanup(mocker)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(attempt, timeout=0.02)  # fires while the failed attempt waits for the removal
+
+    assert cleaned == ["port_test_out_aaaaaaaa"]
