@@ -623,3 +623,31 @@ async def test_a_hung_outside_container_removal_does_not_hold_the_failed_attempt
         await asyncio.wait_for(attempt, timeout=1)  # the bounded wait gives up long before this
 
     assert cleaned == []
+
+
+@pytest.mark.asyncio
+async def test_a_host_start_failing_during_the_outside_removal_does_not_cut_the_removal_short(mocker):
+    # the outside reading is already in its own cleanup (not cancelling) when the host start raises
+    async def reached(host, sample, token):
+        return sample
+
+    verifier, runner = _parallel_verifier(mocker, reached)
+    cleaned = []
+
+    async def docker_run(_ssh, name, *_args):
+        if name.startswith("port_test_out_"):
+            return ContainerStartResult(ok=True, container_id="c", status="Up")
+        await asyncio.sleep(0.01)
+        raise RuntimeError("ssh dropped")
+
+    async def cleanup(_ssh, name):
+        await asyncio.sleep(0.05)
+        cleaned.append(name)
+
+    runner.run.side_effect = docker_run
+    runner.cleanup.side_effect = cleanup
+
+    with pytest.raises(RuntimeError):
+        await verifier._attempt(TEN, "a" * 32, "port_test_aaaaaaaa", mocker.Mock(), "1.2.3.4", ContainerStartWatch())
+
+    assert cleaned == ["port_test_out_aaaaaaaa"]  # removed before attempt 2 publishes the same ports

@@ -2,7 +2,7 @@ import asyncio
 import logging
 import random
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import aiohttp
 from asyncssh import SSHClientConnection
@@ -34,6 +34,8 @@ class ContainerStartWatch:
     missed_container: str | None = None  # the late host listener for sampled ports the outside reading missed
     # the ports that answered so far: an attempt whose deadline fires after they answered still returns them
     verified: BatchResult | None = None
+    # removals of the outside listener: shielded from cancellation, and awaited (bounded) before a retry
+    cleanups: list[asyncio.Future] = field(default_factory=list)
 
 
 class BatchVerifier:
@@ -211,7 +213,7 @@ class BatchVerifier:
                         step.cancel()
                 # wait (bounded) for that cleanup before attempt 2 publishes the same ports; asyncio.wait never
                 # cancels the steps, so a deadline or cancel here ends only the wait, not their cleanup
-                await asyncio.wait(steps, timeout=self.CLEANUP_WAIT_SEC)
+                await asyncio.wait([*steps, *start_watch.cleanups], timeout=self.CLEANUP_WAIT_SEC)
                 raise
         else:
             reached, first_round = await outside
@@ -359,12 +361,13 @@ class BatchVerifier:
         name = f"port_test_out_{token[:8]}"
         publish_flags = " ".join(f"-p {p.internal}:{p.internal}" for p in sample)
         began = asyncio.get_running_loop().time()
-        start = await self._start_container(
-            start_watch, ssh_client, name, NetcatScript.batch(sample, token, 0), publish_flags, 30
-        )
-        if timings is not None:
-            timings["outside_start"] = asyncio.get_running_loop().time() - began
         try:
+            # inside the try: a start cancelled half-way may still leave the published container behind
+            start = await self._start_container(
+                start_watch, ssh_client, name, NetcatScript.batch(sample, token, 0), publish_flags, 30
+            )
+            if timings is not None:
+                timings["outside_start"] = asyncio.get_running_loop().time() - began
             if not start.ok:
                 logger.debug(
                     _m(f"outside probe start failed: status={start.status}", extra=get_extra_info(log_ctx))
@@ -378,7 +381,10 @@ class BatchVerifier:
                 first_round, _ = await self.port_tester.test_many(session, host, remaining, token, log_ctx)
             return reached, first_round
         finally:
-            await self.runner.cleanup(ssh_client, name)
+            # shielded: a failed sibling start or the deadline cancels this reading, never the removal of its listener
+            removal = asyncio.ensure_future(self.runner.cleanup(ssh_client, name))
+            start_watch.cleanups.append(removal)
+            await asyncio.shield(removal)
 
 
 class FallbackVerifier:
