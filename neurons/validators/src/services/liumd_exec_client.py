@@ -147,8 +147,13 @@ class LiumdExecClient:
         except (asyncssh.Error, OSError) as exc:
             raise LocalVerifyUnavailable("transport", f"{type(exc).__name__}: {exc}")
         try:
-            process.stdin.write(json.dumps(signed).encode())
-            process.stdin.write_eof()
+            try:
+                process.stdin.write(json.dumps(signed).encode())
+                process.stdin.write_eof()
+            except BrokenPipeError:
+                # The command exited before reading the intent (126/127: no liumd); its exit
+                # status and stderr below say why.
+                pass
             stderr_task = asyncio.ensure_future(_drain_tail(process.stderr, STDERR_TAIL_BYTES, MAX_STDERR_BYTES, process.close)
             )
             try:

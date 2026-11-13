@@ -1,9 +1,11 @@
 """Tests for BackendClient."""
 
 import asyncio
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
+import bittensor
 import pytest
 from neurons.validators.src.clients.backend_client import BackendClient
 from pydantic import BaseModel
@@ -82,11 +84,12 @@ async def test_get_success(reset_session, client):
 async def test_get_pod_rental_active_uses_internal_endpoint(client):
     expected = MagicMock()
 
-    with patch.object(client, "get", AsyncMock(return_value=expected)) as mock_get:
+    with patch.object(client, "_signed_request", AsyncMock(return_value=expected)) as mock_get:
         result = await client.get_pod_rental_active("pod-1")
 
     assert result is expected
     mock_get.assert_awaited_once_with(
+        "GET",
         "/internal/pods/pod-1/rental-active",
         PodRentalActiveResponse,
         timeout=10,
@@ -99,11 +102,12 @@ async def test_get_filler_run_active_flags_missing_container(client):
     # reconciliation (DAH-2471) is fed by exactly this flag; a plain re-check sends none.
     expected = MagicMock()
 
-    with patch.object(client, "get", AsyncMock(return_value=expected)) as mock_get:
+    with patch.object(client, "_signed_request", AsyncMock(return_value=expected)) as mock_get:
         result = await client.get_filler_run_active("run-1", container_missing=True)
 
     assert result is expected
     mock_get.assert_awaited_once_with(
+        "GET",
         "/internal/filler-runs/run-1/active?container_missing=true",
         FillerRunActiveResponse,
         timeout=10,
@@ -112,10 +116,11 @@ async def test_get_filler_run_active_flags_missing_container(client):
 
 @pytest.mark.asyncio
 async def test_get_filler_run_active_without_flag_keeps_plain_path(client):
-    with patch.object(client, "get", AsyncMock(return_value=None)) as mock_get:
+    with patch.object(client, "_signed_request", AsyncMock(return_value=None)) as mock_get:
         await client.get_filler_run_active("run-1")
 
     mock_get.assert_awaited_once_with(
+        "GET",
         "/internal/filler-runs/run-1/active",
         FillerRunActiveResponse,
         timeout=10,
@@ -188,12 +193,41 @@ async def test_post_success(reset_session, client):
 
 @pytest.mark.asyncio
 async def test_check_executor_health_sends_loopback_plugin_only_when_given(client):
-    with patch.object(client, "post", AsyncMock(return_value=None)) as post:
+    with patch.object(client, "_signed_request", AsyncMock(return_value=None)) as post:
         await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001)
         await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001, loopback_plugin="vloopback:v2")
 
     assert "loopback_plugin" not in post.await_args_list[0].kwargs["json_data"]
     assert post.await_args_list[1].kwargs["json_data"]["loopback_plugin"] == "vloopback:v2"
+
+
+@pytest.mark.asyncio
+async def test_check_executor_health_bounds_the_whole_call_including_retries(reset_session, client):
+    # the first attempt drops late, the retry would start a fresh full-length wait
+    async def drop_late():
+        await asyncio.sleep(0.15)
+        raise aiohttp.ClientOSError(104, "Connection reset by peer")
+
+    async def hang():
+        await asyncio.sleep(10)
+
+    attempts = []
+    for enter in (drop_late, hang):
+        async_cm = AsyncMock()
+        async_cm.__aenter__ = AsyncMock(side_effect=enter)
+        async_cm.__aexit__ = AsyncMock(return_value=None)
+        attempts.append(async_cm)
+    mock_session = AsyncMock()
+    mock_session.closed = False
+    mock_session.request = MagicMock(side_effect=attempts)
+    client.CONNECTION_RETRY_BACKOFF_SECONDS = (0.0, 0.0)
+
+    with patch.object(BackendClient, "get_session", return_value=mock_session):
+        started = asyncio.get_running_loop().time()
+        result = await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001, timeout=0.2)
+
+    assert result is None
+    assert asyncio.get_running_loop().time() - started < 0.35
 
 
 @pytest.mark.asyncio
@@ -493,3 +527,90 @@ async def test_get_all_rented_executors_returns_none_after_three_empty_answers(c
 
     assert result is None
     assert rented_read_mock.await_count == 3
+
+
+SIGNED_CALLS = [
+    ("GET", "/internal/executors/rented", lambda c: c.get_rented_executors_now()),
+    ("GET", "/internal/executors/rented?light=true", lambda c: c.get_rented_pod_targets()),
+    ("GET", "/internal/pods/pod-1/rental-active", lambda c: c.get_pod_rental_active("pod-1")),
+    (
+        "POST",
+        "/internal/pods/pod-1/host-reboot-recovered",
+        lambda c: c.report_pod_host_reboot_recovered("pod-1", "2026-11-11T00:00:00Z"),
+    ),
+    (
+        "POST",
+        "/internal/pods/pod-1/gpu-drop",
+        lambda c: c.report_rented_gpu_drop(
+            "pod-1",
+            state="fault",
+            executor_id="e",
+            first_seen_at="t0",
+            consecutive_cycles=1,
+            expected_gpu_count=8,
+            visible_gpu_count=7,
+            missing_uuids=["GPU-1"],
+            nvml_error_code=None,
+            faults=[],
+            pod_gpu_count=8,
+            rented_gpu_count=8,
+            nvml_gpu_count=7,
+        ),
+    ),
+    (
+        "GET",
+        "/internal/filler-runs/run-1/active?container_missing=true",
+        lambda c: c.get_filler_run_active("run-1", container_missing=True),
+    ),
+    (
+        "POST",
+        "/validator/{hk}/executor-health-check",
+        lambda c: c.check_executor_health("1.2.3.4", 8001, "hotkey", 9001),
+    ),
+    (
+        "POST",
+        "/validator/{hk}/verification-started",
+        lambda c: c.report_verification_started(
+            job_batch_id="b",
+            miner_hotkey="5Miner",
+            executor_uuids=["3f2504e0-4f89-11d3-9a0c-0305e82c3301"],
+            started_at=datetime(2026, 11, 11, tzinfo=UTC),
+        ),
+    ),
+    ("POST", "/v1/nvml-driver/report-unknown", lambda c: c.report_unknown_driver("580.1")),
+    # calls through the plain get()/post() sign the whole request too (the 12 Nov storage-operations call did not)
+    ("GET", "/internal/storage-operations/op-1/active", lambda c: c.get_storage_operation_active("op-1")),
+    (
+        "POST",
+        "/internal/pods/pod-1/ssh-reachability",
+        lambda c: c.report_pod_ssh_reachability(
+            "pod-1", state="unreachable", since="t0", result="timeout", errno=None, observed_at="t1"
+        ),
+    ),
+    ("GET", "/data?x=1", lambda c: c.get("/data?x=1", SampleResponse)),
+    ("POST", "/submit", lambda c: c.post("/submit", SampleResponse, json_data={"b": 1, "a": 2})),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("method", "path", "call"), SIGNED_CALLS, ids=[p for _, p, _ in SIGNED_CALLS])
+async def test_backend_calls_sign_the_whole_request(reset_session, method, path, call):
+    # DAH-6169: the v1 signature covers method, path with query, body hash and timestamp, and the bytes sent are
+    # the bytes signed, so the backend's whole-request check accepts every one of these calls
+    keypair = bittensor.Keypair.create_from_uri("//DAH6169")
+    client = BackendClient(base_url="https://api.example.com/api", keypair=keypair)
+    mock_session = create_mock_session(create_mock_response(500))
+
+    with patch.object(BackendClient, "get_session", return_value=mock_session):
+        await call(client)
+
+    kwargs = mock_session.request.call_args.kwargs
+    path = path.format(hk=keypair.ss58_address)
+    body = kwargs["data"] or b""
+    assert mock_session.request.call_args.args == (method, f"https://api.example.com/api{path}")
+    assert kwargs["json"] is None
+    assert (method == "POST") == bool(body)
+    headers = kwargs["headers"]
+    message = BackendClient.signed_request_message(method, path, body, headers["timestamp"])
+    assert headers["hotkey"] == keypair.ss58_address
+    assert keypair.verify(message, bytes.fromhex(headers["signature"].removeprefix("0x")))

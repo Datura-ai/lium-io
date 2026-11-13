@@ -109,6 +109,24 @@ def no_docker_hub_digest_on_rent_path():
 
 
 @pytest.fixture(autouse=True)
+def no_registry_lookup_for_executor_build():
+    """The image check asks the registry whether an outdated digest is ours; no answer keeps tests offline."""
+    with patch(
+        "services.task.checks.executor_image.executor_build_published", AsyncMock(return_value=None)
+    ) as lookup:
+        yield lookup
+
+
+@pytest.fixture(autouse=True)
+def no_rental_start_record_on_fake_hosts():
+    """A customer create records each GPU's power at rental start and fails when the host cannot report
+    it; the create tests' fake hosts answer no nvidia-smi. test_gpu_power_limit.py tests the record
+    through `neurons.validators.src.services.gpu_power_limit`, a module this patch does not touch."""
+    with patch("services.gpu_power_limit._record_rental_start_ratios", AsyncMock()) as record:
+        yield record
+
+
+@pytest.fixture(autouse=True)
 def pod_ssh_answers_on_create_path(request):
     """create_container connects to the pod's mapped SSH port before ContainerCreated; tests have no pod there.
     test_pod_ssh_before_created.py covers the check itself (marker real_pod_ssh_check)."""
@@ -165,6 +183,37 @@ def setup_sql_logging():
     pool_logger.setLevel(logging.DEBUG)
 
     print("✅ SQL logging enabled for all tests")
+
+
+class InMemoryUnmarkedRecoveryStops:
+    """The validator DB table of unmarked recovery stops, in memory: survives a test's simulated restart."""
+
+    def __init__(self) -> None:
+        self.pod_ids: set[str] = set()
+
+    async def all_pod_ids(self) -> set[str]:
+        return set(self.pod_ids)
+
+    async def add(self, pod_id: str) -> bool:
+        self.pod_ids.add(pod_id)
+        return True
+
+    async def remove(self, pod_id: str) -> bool:
+        self.pod_ids.discard(pod_id)
+        return True
+
+
+@pytest.fixture(autouse=True)
+def unmarked_recovery_stop_db():
+    """docker_service writes its unmarked recovery stops through to the validator DB; tests keep it in memory."""
+    from services import docker_service
+
+    store = InMemoryUnmarkedRecoveryStops()
+    saved = docker_service._unmarked_recovery_stop_dao, docker_service._UNMARKED_RECOVERY_STOPS_LOADED
+    docker_service._unmarked_recovery_stop_dao, docker_service._UNMARKED_RECOVERY_STOPS_LOADED = store, False
+    docker_service._UNMARKED_RECOVERY_STOPS_DROPPED_UNLOADED.clear()
+    yield store
+    docker_service._unmarked_recovery_stop_dao, docker_service._UNMARKED_RECOVERY_STOPS_LOADED = saved
 
 
 @pytest.fixture(autouse=True)

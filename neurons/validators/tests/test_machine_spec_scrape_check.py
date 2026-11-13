@@ -925,3 +925,29 @@ def test_the_scrape_codes_split_into_host_side_and_undetermined():
         "SCRAPE_FAILED_ON_HOST",
     }
     assert SCRAPE_UNDETERMINED_FAILURE_REASONS == {"SCRAPE_TIMEOUT", "SCRAPE_TRANSPORT_FAILED"}
+
+
+@pytest.mark.asyncio
+async def test_a_provider_reported_host_power_limit_is_dropped(context_factory):
+    # DAH-5302: power_host_limit is GpuPowerLimitCheck's, written only under our Pearl cap
+    gpu = {**RAW_SPECS["gpu"], "details": [{**d, "power_host_limit": 999} for d in RAW_SPECS["gpu"]["details"]]}
+    result = await _scrape_ok_event_for(context_factory, {"gpu": gpu})
+
+    details = result.updates["state"].specs["gpu"]["details"]
+    assert details and all("power_host_limit" not in d for d in details)
+
+
+@pytest.mark.asyncio
+async def test_a_successful_scrape_starts_the_liumd_facts_read(context_factory, monkeypatch):
+    # The shadow's docker and ports read must start here, right after the scrape, so both see the same containers.
+    import neurons.validators.src.services.task.liumd_shadow as shadow
+
+    started = object()
+    seen = []
+    monkeypatch.setattr(shadow, "start_facts_after_scrape", lambda ctx: seen.append(ctx) or started)
+
+    result = await _scrape_ok_event_for(context_factory, {})
+
+    assert result.passed is True
+    assert result.updates["state"].liumd_shadow_facts_task is started and len(seen) == 1
+    assert result.updates["state"].liumd_shadow_facts_attempted is True

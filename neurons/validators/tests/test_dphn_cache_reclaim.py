@@ -7,6 +7,7 @@ reclaims, and it decides on real free space: below the rental listing floor the 
 """
 
 import asyncio
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -56,7 +57,12 @@ class FakeSshClient:
             stdout = "\n".join(self._volumes)
         elif "docker ps" in command:
             # Only `docker ps` without -a lists RUNNING containers; the reclaim guard uses that one.
-            stdout = "" if "-a" in command else self._containers
+            # `--filter name=X` keeps the names holding X (several filters OR)
+            names = re.findall(r'name=([^"\s]+)', command)
+            running = [c for c in self._containers.split("\n") if c]
+            stdout = "" if "-a" in command else "\n".join(
+                c for c in running if not names or any(n in c for n in names)
+            )
         else:
             stdout = ""
         return SimpleNamespace(exit_status=0, stdout=stdout, stderr="")
@@ -128,6 +134,17 @@ async def test_a_mounted_volume_or_a_listed_pod_is_never_a_candidate(cleanup, da
     ssh_client = VolumeHostSsh(dangling=dangling, created={f"volume_{POD}": "2026-09-10T08:00:00Z"}, volumes=[f"volume_{POD}"])
     is_orphan = AsyncMock(return_value=True)
     assert await cleanup.remove_orphan_rental_volumes(ssh_client, _snapshot([LIVE, *listed]), "exec-1", is_orphan) == 0
+    is_orphan.assert_not_called()
+    assert _removed(ssh_client) == []
+
+
+@pytest.mark.asyncio
+async def test_a_retained_volume_pod_is_never_a_candidate(cleanup):
+    # DAH-3333: a balance stop keeps the renter's disk while its pod is DELETING (not in the listed pods)
+    ssh_client = VolumeHostSsh(dangling=[f"volume_{POD}"], created={f"volume_{POD}": "2026-09-10T08:00:00Z"}, volumes=[f"volume_{POD}"])
+    snapshot = _snapshot([LIVE]).model_copy(update={"retained_volume_pod_ids": [POD]})
+    is_orphan = AsyncMock(return_value=True)
+    assert await cleanup.remove_orphan_rental_volumes(ssh_client, snapshot, "exec-1", is_orphan) == 0
     is_orphan.assert_not_called()
     assert _removed(ssh_client) == []
 
@@ -256,15 +273,26 @@ async def test_the_engy_checkpoint_is_reclaimed_oldest_first_and_only_as_far_as_
 
 
 @pytest.mark.asyncio
-async def test_a_live_customer_pod_keeps_the_cache_even_under_the_floor(cleanup):
-    # Fish 26 Oct: the cache is kept across rentals and listed as used, so a renter who took the
-    # listed free disk leaves the node under the floor by design
+async def test_a_live_customer_pod_under_the_floor_gets_the_cache_back(cleanup):
+    # DAH-6187: the rent keeps the cache when the pod's volume fits beside it, but the pod's writes
+    # take real disk; once they push the node under the floor the cache gives way to the renter
     ssh_client = FakeSshClient(["pod_abc"], ["engy_cache_hf_kimi-k3"], free_gb=10)
+
+    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 1
+    assert _removed(ssh_client) == ["engy_cache_hf_kimi-k3"]
+
+
+@pytest.mark.parametrize(
+    "containers, free_gb",
+    [(["pod_abc"], 500), (["pod_abc", "filler_x"], 10)],
+    ids=["pod_above_the_floor", "live_filler"],
+)
+@pytest.mark.asyncio
+async def test_the_cache_stays_above_the_floor_or_while_a_filler_runs(cleanup, containers, free_gb):
+    ssh_client = FakeSshClient(containers, ["engy_cache_hf_kimi-k3"], free_gb=free_gb)
 
     assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 0
     assert _removed(ssh_client) == []
-    (guard,) = [c for c in ssh_client.commands if "docker ps" in c]
-    assert 'name=filler_' in guard and 'name=pod_' in guard
 
 
 class CreatedSweepSshClient(FakeSshClient):
