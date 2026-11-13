@@ -1570,7 +1570,13 @@ class MinerService:
             await self._report_storage_dispatch_failure(payload, result)
             return result
         with inflight_creates.track(payload.pod_id), customer_creates.track(payload):
-            await customer_creates.wait_for_prunes(payload)
+            if not await customer_creates.wait_for_prunes(payload):
+                # a stuck prune can resume at any time, so a pull now could lose its image: fail, don't route
+                return self._handle_container_error(
+                    payload=payload,
+                    msg=f"Image cleanup still running on executor {payload.executor_id}; create not started",
+                    error_code=FailedContainerErrorCodes.RentingInProgress,
+                )
             return await self._route_container(payload)
 
     async def _report_storage_dispatch_failure(self, payload: ContainerBaseRequest, result: object) -> None:

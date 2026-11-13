@@ -71,3 +71,13 @@ async def test_customer_create_registered_during_an_in_flight_prune_waits_for_it
     assert may_prune
     assert waited_while_pruning
     assert not prune_beside_customer
+
+
+@pytest.mark.asyncio
+async def test_customer_create_reports_a_prune_still_running_at_the_deadline() -> None:
+    customer = _payload()
+    with customer_creates.prune_unless_customer_create(customer.miner_hotkey, customer.executor_id):
+        with customer_creates.track(customer):
+            cleared = await customer_creates.wait_for_prunes(customer, timeout_s=0.03, poll_s=0.01)
+
+    assert cleared is False

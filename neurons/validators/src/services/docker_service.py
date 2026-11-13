@@ -2579,20 +2579,21 @@ class _CustomerCreateRegistry:
 
     async def wait_for_prunes(
         self, payload: ContainerCreateRequest, timeout_s: float = 300, poll_s: float = 0.2
-    ) -> None:
-        """A customer create waits until no image prune started before it runs on its executor."""
+    ) -> bool:
+        """A customer create waits until no image prune started before it runs on its executor.
+
+        False when a prune is still registered after `timeout_s`: the create must fail, not pull beside it.
+        """
         if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL:
-            return
+            return True
         executor = (payload.miner_hotkey, payload.executor_id)
         deadline = time.monotonic() + timeout_s
         while True:
             with self._lock:
                 if executor not in self._prunes_by_executor:
-                    return
+                    return True
             if time.monotonic() >= deadline:
-                # a prune stuck on a dead SSH channel or daemon must not hold the renter's create forever
-                logger.warning(f"Customer create on executor {payload.executor_id} proceeds beside a stuck image prune")
-                return
+                return False
             await asyncio.sleep(poll_s)
 
     def others_running(self, payload: ContainerCreateRequest) -> bool:
