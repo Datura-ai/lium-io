@@ -1366,12 +1366,17 @@ class _FillerRemovalStuck(Exception):
 
 
 class _FillerBesideCustomerContainer(Exception):
-    """Raised by a customer create's running check: a `filler_*` on the host survived its removal, the host
-    could not be listed to confirm there is none, or the removed filler's GPU power restore did not finish."""
+    """Raised by a customer create's running check: a `filler_*` on the host survived its removal, or the host
+    could not be listed to confirm there is none."""
 
 
 class _FillerRestoreStateUnavailable(Exception):
     """A customer final check could not confirm platform GPU power restore state."""
+
+
+class _FillerPowerRestoreFailed(Exception):
+    """A customer final check could not restore or read the removed filler's GPU power on the host (nvidia-smi):
+    the host's failure, reported at `gpu_power_restore` so a known filler run does not excuse it."""
 
 
 class _FillerRefusedBesideUnlistedPod(_FillerRefusedForCustomerCreate):
@@ -5418,7 +5423,7 @@ class DockerService:
                     f"GPU power restore state after removing {name} could not be confirmed"
                 ) from exc
             except RuntimeError as exc:
-                raise _FillerBesideCustomerContainer(
+                raise _FillerPowerRestoreFailed(
                     f"GPU power restoration after removing {name} could not be confirmed"
                 ) from exc
 
@@ -5984,6 +5989,7 @@ class DockerService:
         rm_deadline = min(cleanup_deadline, asyncio.get_running_loop().time() + rm_timeout)
         started = time.monotonic()
         timeout_error: TimeoutError | None = None
+        rm_stderr = None
         try:
             # asyncssh's timeout= bounds only the command, not its channel open
             async with asyncio.timeout_at(rm_deadline):
@@ -5998,6 +6004,7 @@ class DockerService:
             rm_exit_status, listing_after = None, None
         else:
             rm_exit_status, listing_after = _parse_remove_and_list_containers(result.stdout or "")
+            rm_stderr = (result.stderr or "").strip()[:500]
             rm_error = Exception(
                 f"[clean_existing_containers] command: {command} exit_code {rm_exit_status}, "
                 f"stderr: {(result.stderr or '').strip()}"
@@ -6045,7 +6052,12 @@ class DockerService:
                     logger.info(
                         _m(
                             "docker rm -fv failed with containers still on the host; retrying those",
-                            extra=get_extra_info({**default_extra, "container_names": still_present}),
+                            # why dockerd refused: a retry that then hangs left no cause (9, 12 Nov)
+                            extra=get_extra_info({
+                                **default_extra,
+                                "container_names": still_present,
+                                "rm_stderr": rm_stderr,
+                            }),
                         ),
                     )
                     await self._rm_containers(
@@ -8409,9 +8421,18 @@ class DockerService:
             "--format '{{index .Status \"size-max\"}}|{{index .Options \"size\"}}'"
         )
         if getattr(inspect_result, "exit_status", 0) != 0:
-            raise Exception(
-                f"docker volume inspect failed: {getattr(inspect_result, 'stderr', '')}"
-            )
+            stderr = getattr(inspect_result, "stderr", "") or ""
+            errors = [line for line in stderr.splitlines() if line.strip()]
+            if not errors or not all("no such volume" in line.lower() for line in errors):
+                raise Exception(f"docker volume inspect failed: {stderr}")
+            # A listed volume was removed before this inspect (a renter deleting a pod while creating
+            # the next one): it holds no disk now, so size from the volumes that are still there.
+            if len(volume_names) == 1:
+                return 0
+            total_bytes = 0
+            for volume_name in volume_names:
+                total_bytes += await self._inspect_vloopback_volumes_bytes(ssh_client, [volume_name])
+            return total_bytes
 
         total_bytes = 0
         for volume_name, line in zip(volume_names, (inspect_result.stdout or "").splitlines()):
@@ -11474,6 +11495,9 @@ class DockerService:
                         )
                     except _FillerRestoreStateUnavailable:
                         current_step = "gpu_power_restore_state"
+                        raise
+                    except _FillerPowerRestoreFailed:
+                        current_step = "gpu_power_restore"  # the host's nvidia-smi, as in the pre-run restore
                         raise
                     except _FillerBesideCustomerContainer:
                         # the sweep's own rm and listing, failed after `docker run`: the backend counts this

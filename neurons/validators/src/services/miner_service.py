@@ -379,6 +379,9 @@ class MinerService:
         self.rented_missed_last_cycle: dict[str, set[str]] = {}
         # executor uuid -> GPU UUIDs of the spec this process last published for it (empty after a restart)
         self.published_gpu_uuids: dict[str, set[str]] = {}
+        # executor uuid (lower case) -> the job_batch_id the express lane last published it under. That cycle has no
+        # result of its own for the node, and its observations-only EXECUTOR_RESULT_MISSING would replace the lane's.
+        self.express_published: dict[str, str] = {}
         # DAH-5635: the running cycle's outage share for publish_unreachable_early; None = publish nothing early
         self.outage_tally: RunningOutageTally | None = None
         # DAH-5635: (miner hotkey, executor uuid) -> the availability errors this process's last cycle publish sent for
