@@ -78,9 +78,6 @@ class FakeRedis:
     async def delete(self, key: str) -> None:
         self.store.pop(key, None)
 
-    async def getdel(self, key: str) -> str | None:
-        return self.store.pop(key, None)
-
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [None, "timeout", "nonzero", "partial", "redis", "record_redis", "record", "missing_record", "mismatched_record", "index", "delete", "absent"])
@@ -180,9 +177,9 @@ async def test_pod_index_delete_failure_after_successful_restore(require_complet
             await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, require_complete=True)
     else:
         assert await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID) == 1
-    # Assert: the record was deleted after restoration; the strict path's index stays visible, the
-    # best-effort path claimed it (getdel) before restoring.
-    assert redis.store == ({_pod_index_key(POD_ID): '["GPU-a"]'} if require_complete else {})
+    # Assert: the record was deleted after restoration; the index the delete could not clear stays (the
+    # strict path retries it, the best-effort one logs it: with no records left it restores nothing).
+    assert redis.store == {_pod_index_key(POD_ID): '["GPU-a"]'}
 
 
 @pytest.mark.asyncio
@@ -220,16 +217,16 @@ async def test_apply_tells_a_host_refusal_from_our_own_error(failure, expected):
 
 
 @pytest.mark.asyncio
-async def test_pod_restore_raises_a_capped_gpu_without_record_to_its_default() -> None:
-    # The record is gone (lost Redis key): the pre-cap limit went with it, so the GPU goes back to
-    # its default rather than staying at Lium's cap for the next renter.
-    ssh = fake_ssh(FakeRun(stdout=STATE_CSV), *_set_ok(400))
+async def test_pod_restore_never_raises_a_gpu_of_an_index_without_caps() -> None:
+    # An index written before caps were stored cannot tell Lium's cap from the host's own limit, which
+    # another path's restore may already have set: a GPU with no record is left as it is.
+    ssh = fake_ssh(FakeRun(stdout=STATE_CSV))
     redis = FakeRedis({_pod_index_key(POD_ID): json.dumps(["GPU-a"])})
 
     restored = await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, executor_id=EXECUTOR_ID)
 
     assert restored == 0
-    assert _commands(ssh)[1:] == _set_commands("GPU-a", 400)
+    assert not any(" -pl " in command for command in _commands(ssh))
     assert _pod_index_key(POD_ID) not in redis.store
 
 
@@ -237,7 +234,7 @@ async def test_pod_restore_raises_a_capped_gpu_without_record_to_its_default() -
 async def test_pod_restore_raises_a_gpu_capped_above_the_floor_without_record() -> None:
     # 368 W of 400 W is Lium's 0.92 cap: above the check's floor, still not the renter's default.
     ssh = fake_ssh(FakeRun(stdout="GPU-a, 368, 400, 100, 400\n"), *_set_ok(400))
-    redis = FakeRedis({_pod_index_key(POD_ID): json.dumps(["GPU-a"])})
+    redis = FakeRedis({_pod_index_key(POD_ID): json.dumps({"GPU-a": 368})})
 
     await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, executor_id=EXECUTOR_ID)
 
@@ -249,10 +246,11 @@ async def test_pod_restore_leaves_a_recorded_gpu_to_its_record_and_raises_only_t
     # GPU-a's record holds the host's own 380 W and is restored to it; GPU-b lost its record and goes
     # to its default. A GPU already at its default is not touched.
     state = "GPU-a, 368, 400, 100, 400\nGPU-b, 230, 250, 100, 250\nGPU-c, 250, 250, 100, 250\n"
-    ssh = fake_ssh(FakeRun(stdout=state), *_set_ok(380), FakeRun(stdout=state), *_set_ok(250))
+    restored_state = state.replace("GPU-a, 368", "GPU-a, 380")
+    ssh = fake_ssh(FakeRun(stdout=state), *_set_ok(380), FakeRun(stdout=restored_state), *_set_ok(250))
     redis = FakeRedis({
         _restore_key("GPU-a"): _record("GPU-a", 380),
-        _pod_index_key(POD_ID): json.dumps(["GPU-a", "GPU-b", "GPU-c"]),
+        _pod_index_key(POD_ID): json.dumps({"GPU-a": 368, "GPU-b": 230, "GPU-c": None}),
     })
 
     restored = await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, executor_id=EXECUTOR_ID)
@@ -266,8 +264,8 @@ async def test_pod_restore_leaves_a_recorded_gpu_to_its_record_and_raises_only_t
 
 @pytest.mark.asyncio
 async def test_a_second_restore_of_the_same_pod_finds_no_index_and_raises_nothing() -> None:
-    # A customer create and the filler's own delete racing: the first claims the index and restores
-    # GPU-a to the host's 300 W; the second must not see GPU-a as record-less and raise it to 400 W.
+    # A customer create and the filler's own delete one after the other: the first restores GPU-a to the
+    # host's 300 W and drops the index; the second must not raise GPU-a to 400 W.
     redis = FakeRedis({
         _restore_key("GPU-a"): _record("GPU-a", 300),
         _pod_index_key(POD_ID): json.dumps(["GPU-a"]),
@@ -279,6 +277,30 @@ async def test_a_second_restore_of_the_same_pod_finds_no_index_and_raises_nothin
     assert await restore_filler_pod_gpu_power_limits(second, redis, POD_ID, executor_id=EXECUTOR_ID) == 0
 
     second.run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_parallel_strict_restore_sees_the_index_until_the_restore_is_done() -> None:
+    # The filler's own delete is restoring GPU-a when a customer create's strict restore of the same pod
+    # starts: while the GPU is still capped the strict path must find the index, not pass on a missing one.
+    redis = FakeRedis({
+        _restore_key("GPU-a"): _record("GPU-a", 300),
+        _pod_index_key(POD_ID): json.dumps({"GPU-a": 368}),
+    })
+    seen_during_restore: list[bool] = []
+    runs = iter([FakeRun(stdout="GPU-a, 368, 400, 100, 400\n"), *_set_ok(300), FakeRun(stdout="GPU-a, 300, 400, 100, 400\n")])
+
+    async def run(command, **kwargs):
+        if " -pl " in command:
+            seen_during_restore.append(_pod_index_key(POD_ID) in redis.store)
+        return next(runs)
+
+    ssh = AsyncMock(run=AsyncMock(side_effect=run))
+
+    assert await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, executor_id=EXECUTOR_ID) == 1
+
+    assert seen_during_restore == [True]
+    assert _pod_index_key(POD_ID) not in redis.store
 
 
 @pytest.mark.asyncio
