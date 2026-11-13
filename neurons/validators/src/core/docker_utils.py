@@ -168,6 +168,14 @@ class DockerCommand:
         return f"/usr/bin/docker ps -a {filters} --format {shlex.quote(output_format)}"
 
     @staticmethod
+    def host_port_bindings() -> str:
+        """Build a command printing each container's name and published host ports, stopped containers included."""
+        return (
+            "/usr/bin/docker ps -aq | xargs -r /usr/bin/docker inspect --format "
+            "'{{.Name}} {{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostPort}} {{end}}{{end}}'"
+        )
+
+    @staticmethod
     def inspect_status(container_id: str) -> str:
         """Build docker inspect command for status."""
         return f"/usr/bin/docker ps -a --filter id={container_id} --format '{{{{.Status}}}}|||{{{{.State}}}}' 2>&1"

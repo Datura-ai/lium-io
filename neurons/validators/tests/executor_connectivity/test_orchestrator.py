@@ -247,3 +247,70 @@ async def test_orchestrator_a_timed_out_sysbox_test_measured_nothing(sample_exec
 
     assert result.dind_ok is True
     assert result.sysbox_measured is None
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_dind_skips_port_a_pod_published_mid_job(
+    sample_executor_info, mock_ssh_client, mocker
+):
+    selected_ports = [PortPair(40000, 40000), PortPair(40001, 40001)]
+    port_selector = mocker.Mock(spec=PortSelector)
+    port_selector.select.return_value = selected_ports
+    port_probe = mocker.Mock(spec=PortProbe)
+    port_probe.probe = mocker.AsyncMock(
+        return_value=PortProbeResult(successful=tuple(selected_ports), failed=tuple())
+    )
+    dind_probe = mocker.Mock(spec=DindProbe)
+    dind_probe.verify = mocker.AsyncMock(
+        return_value=DindProbeResult(success=True, sysbox_runtime=True, port=selected_ports[1], log_text="ok")
+    )
+    # nothing held when the job starts; a rental created mid-job holds 40000 in an exited container
+    mock_ssh_client.run = mocker.AsyncMock(
+        side_effect=[
+            mocker.MagicMock(exit_status=0, stdout="", stderr=""),
+            mocker.MagicMock(exit_status=0, stdout="/pod_bac6 40000 40002 \n/port_test_pub_ab 40001 \n", stderr=""),
+        ]
+    )
+    orchestrator = ConnectivityOrchestrator(port_selector, port_probe, dind_probe)
+
+    result = await orchestrator.verify(
+        executor_info=sample_executor_info,
+        miner_hotkey="miner",
+        sysbox_runtime=True,
+        unavailable_ports=[],
+        ssh_client=mock_ssh_client,
+    )
+
+    assert dind_probe.verify.call_args.args[0] == PortPair(40001, 40001)
+    assert result.dind_port == PortPair(40001, 40001)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_skips_ports_held_by_stopped_container_at_start(
+    sample_executor_info, mock_ssh_client, mocker
+):
+    selected_ports = [PortPair(40000, 40000), PortPair(40001, 40001)]
+    port_selector = mocker.Mock(spec=PortSelector)
+    port_selector.select.return_value = selected_ports
+    port_probe = mocker.Mock(spec=PortProbe)
+    port_probe.probe = mocker.AsyncMock(
+        return_value=PortProbeResult(successful=(selected_ports[1],), failed=tuple())
+    )
+    dind_probe = mocker.Mock(spec=DindProbe)
+    dind_probe.verify = mocker.AsyncMock(
+        return_value=DindProbeResult(success=True, sysbox_runtime=True, port=selected_ports[1], log_text="ok")
+    )
+    mock_ssh_client.run = mocker.AsyncMock(
+        return_value=mocker.MagicMock(exit_status=0, stdout="/pod_bac6 40000 \n", stderr="")
+    )
+    orchestrator = ConnectivityOrchestrator(port_selector, port_probe, dind_probe)
+
+    await orchestrator.verify(
+        executor_info=sample_executor_info,
+        miner_hotkey="miner",
+        sysbox_runtime=True,
+        unavailable_ports=[],
+        ssh_client=mock_ssh_client,
+    )
+
+    assert port_probe.probe.call_args.args[0] == [PortPair(40001, 40001)]
