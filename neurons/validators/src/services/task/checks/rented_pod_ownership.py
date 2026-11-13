@@ -16,8 +16,20 @@ CONTAINER_RESTART_AFTER_BOOT_SECONDS = 600
 
 
 # sudo refuses to run when any of these is not owned by the pod's root, so a shift that spares / and /root
-# still breaks it
-PATHS = ("/", "/root", "/etc/sudoers", "/etc/sudoers.d", "/etc/sudoers.d/README", "/usr/bin/sudo")
+# still breaks it; a partial shift can also spare those and leave the package dirs to nobody, so apt and dpkg
+# fail
+PATHS = (
+    "/",
+    "/root",
+    "/etc/sudoers",
+    "/etc/sudoers.d",
+    "/etc/sudoers.d/README",
+    "/usr/bin/sudo",
+    "/usr",
+    "/usr/lib",
+    "/usr/share",
+    "/var/lib/dpkg",
+)
 
 
 def read_command(pids: list[int], proc: str = "/proc") -> str:
@@ -63,7 +75,7 @@ def judge(line: str) -> dict | None:
 
 
 class RentedPodOwnershipCheck:
-    """Warn when a rented sysbox pod's /, /root or sudo files are owned by a host uid outside its user namespace.
+    """Warn when a rented sysbox pod's key system files are owned by a host uid outside its user namespace.
 
     Sysbox without idmapped mounts chowns a container's files into its uid range on start and back on a clean
     stop. A host that loses power skips the revert, and the container docker restarts on boot gets a new range
