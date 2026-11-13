@@ -836,3 +836,10 @@ def test_the_locked_measure_reads_df_and_the_trash_under_the_trash_lock():
 
     assert command.index("lium-cache-trash.lock && flock -w 60 7") < command.index("df -P") < command.index("du -sxB1")
     assert "lium-cache-trash.lock" not in image_flatten.flatten_wait_command()
+
+
+def test_the_locked_measure_stops_when_the_trash_lock_is_not_had():
+    # review: a timed-out trash lock must not fall through to an unlocked df/du (the volume could shrink)
+    command = image_flatten.flatten_wait_command(with_trash=True)
+
+    assert command.index("flock -w 60 7; } || exit 1;") < command.index("df -P")
