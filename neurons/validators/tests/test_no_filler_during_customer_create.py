@@ -26,9 +26,13 @@ class _CreateLocks:
 
     def __init__(self):
         self.held = False
+        self.creating = False  # a renter's create runs, lock or not
 
     def executor_create_lock(self, executor_id):
         return _CreateLock(self)
+
+    async def creates_in_progress(self, executor_id):
+        return self.creating
 
 
 class _CreateLock:
@@ -296,3 +300,26 @@ async def test_an_old_connectors_prune_retry_does_not_run_beside_a_successors_pu
 
     assert old.calls == 1  # the retry pruned nothing
     await successor_create.release()
+
+
+@pytest.mark.asyncio
+async def test_an_old_connectors_prune_retry_does_not_run_beside_a_lockless_successors_pull(monkeypatch) -> None:
+    # lio#2226 review: the successor's create went ahead without the lock (taken elsewhere at its deadline, or its
+    # TTL ran out during the pull); the old retry takes the free lock but still sees the create in progress
+    monkeypatch.setattr(docker_service, "PRUNE_CONFIRM_ATTEMPTS", 1)
+    monkeypatch.setattr(docker_service, "PRUNE_CONFIRM_INTERVAL_SECONDS", 0.05)
+    customer = _payload()
+    locks = _CreateLocks()
+    old = _Prunes(_prune_failure(_LOST_REPLY), None)
+    assert customer_creates.begin_prune(customer.miner_hotkey, customer.executor_id)
+    old_delete = asyncio.ensure_future(
+        docker_service._prune_images_then_release(old, {}, customer.miner_hotkey, customer.executor_id, locks)
+    )
+    await asyncio.sleep(0.01)  # the old prune's reply is lost; it waits to retry
+
+    locks.creating = True
+    await confirm_no_prune_runs(_Prunes(None), {}, customer.miner_hotkey, customer.executor_id)
+    await old_delete
+
+    assert old.calls == 1  # the retry pruned nothing
+    assert not locks.held  # and gave the lock back

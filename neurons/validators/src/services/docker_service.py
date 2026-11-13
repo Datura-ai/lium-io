@@ -2687,12 +2687,22 @@ def _prune_may_still_run(exc: Exception) -> bool:
 
 
 async def _take_create_lock_for_prune(redis_service, executor_id: str):
-    """The executor's create lock, taken without waiting; None when a create holds it or Redis cannot say."""
+    """The executor's create lock, taken without waiting; None when a create holds it, still runs or Redis cannot say."""
     lock = redis_service.executor_create_lock(executor_id)
     try:
-        return lock if await lock.acquire(blocking=False) else None
+        if not await lock.acquire(blocking=False):
+            return None
     except Exception:
         return None
+    try:
+        # a create that went ahead without the lock, or outlived its TTL, holds no lock but is still pulling
+        if not await redis_service.creates_in_progress(executor_id):
+            return lock
+    except Exception:
+        pass
+    with contextlib.suppress(Exception):
+        await lock.release()
+    return None
 
 
 async def _prune_images_then_release(

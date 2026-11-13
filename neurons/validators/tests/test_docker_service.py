@@ -295,6 +295,7 @@ def mock_dependencies():
     redis_service = Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True))
     # the create lock every delete's prune takes (lio#2226): free, so deletes prune
     redis_service.executor_create_lock = Mock(return_value=Mock(acquire=AsyncMock(return_value=True), release=AsyncMock()))
+    redis_service.creates_in_progress = AsyncMock(return_value=False)
     attestation_service = Mock()
 
     # Mock the async context manager for Redis lock

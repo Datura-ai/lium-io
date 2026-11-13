@@ -1525,3 +1525,16 @@ async def test_a_cut_off_create_lock_release_that_redis_fails_is_logged_not_rais
     redis_service.redis.pipeline = lambda **_: _PipelineOnADownRedis()
 
     await redis_service.release_cut_off_create_lock("exec-1", "pod-1")
+
+
+@pytest.mark.asyncio
+async def test_a_renter_create_counts_as_in_progress_without_its_lock_until_it_ends() -> None:
+    # lio#2226 review: a create whose lock lapsed (or was never taken) still keeps a delete's prune off its pull
+    redis_service = _fakeredis_service()
+    create = redis_service.executor_create_exclusion("exec-1", "pod-1")
+    await create.__aenter__()
+    await redis_service.redis.delete("lock:executor-create:exec-1")  # its TTL ran out
+
+    assert await redis_service.creates_in_progress("exec-1")
+    await create.__aexit__(None, None, None)
+    assert not await redis_service.creates_in_progress("exec-1")

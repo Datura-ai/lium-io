@@ -226,6 +226,15 @@ def _executor_create_lock_key(executor_id: str) -> str:
     return f"lock:executor-create:{executor_id}"
 
 
+# Renter creates under way on an executor, held lock or not (lio#2226): a create that went ahead without the lock,
+# or outlived its TTL, still keeps a delete's image prune off its pull. Each create renews its entry while it runs.
+CREATE_IN_PROGRESS_TTL_SECONDS = 60
+
+
+def _creates_in_progress_key(executor_id: str) -> str:
+    return f"creates-in-progress:executor:{executor_id}"
+
+
 # the connector's id of the create execution being run (InflightBackendCreate.create_id), set around the create
 renter_create_id: ContextVar[str] = ContextVar("renter_create_id", default="")
 
@@ -501,9 +510,12 @@ class RedisService:
         (LockNotOwnedError) is expected for a slow create and ignored.
         """
         lock = self.executor_create_lock(executor_id)
+        token = _renter_create_lock_token(pod_id, renter_create_id.get())
+        await self._renew_create_in_progress(executor_id, token)  # before the pull can start
+        marking = asyncio.create_task(self._keep_create_in_progress(executor_id, token))
         held = False
         try:
-            held = bool(await lock.acquire(token=_renter_create_lock_token(pod_id, renter_create_id.get())))
+            held = bool(await lock.acquire(token=token))
             if not held:
                 logger.warning(
                     _m(f"Create lock for executor {executor_id} still held at the deadline; creating without it")
@@ -528,6 +540,26 @@ class RedisService:
                             extra={"error": str(e)},
                         )
                     )
+            marking.cancel()
+            with suppress(redis.exceptions.RedisError, OSError):
+                await self.redis.zrem(_creates_in_progress_key(executor_id), token)
+
+    async def _renew_create_in_progress(self, executor_id: str, token: str) -> None:
+        key = _creates_in_progress_key(executor_id)
+        with suppress(redis.exceptions.RedisError, OSError):  # a renter's create is never refused
+            await self.redis.zadd(key, {token: time.time() + CREATE_IN_PROGRESS_TTL_SECONDS})
+            await self.redis.expire(key, CREATE_IN_PROGRESS_TTL_SECONDS)
+
+    async def _keep_create_in_progress(self, executor_id: str, token: str) -> None:
+        while True:
+            await asyncio.sleep(CREATE_IN_PROGRESS_TTL_SECONDS / 3)
+            await self._renew_create_in_progress(executor_id, token)
+
+    async def creates_in_progress(self, executor_id: str) -> bool:
+        """Whether a renter create runs on the executor; raises when Redis cannot say."""
+        key = _creates_in_progress_key(executor_id)
+        await self.redis.zremrangebyscore(key, "-inf", time.time())
+        return bool(await self.redis.zcard(key))
 
     @asynccontextmanager
     async def rented_gpu_drop_lock(self, pod_id: str):

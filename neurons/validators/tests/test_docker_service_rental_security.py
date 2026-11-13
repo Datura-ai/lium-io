@@ -203,6 +203,7 @@ def docker_service():
     redis_service.acquire_executor_lock = Mock(return_value=lock)
     # the create lock every delete's prune takes (lio#2226): free, so deletes prune
     redis_service.executor_create_lock = Mock(return_value=Mock(acquire=AsyncMock(return_value=True), release=AsyncMock()))
+    redis_service.creates_in_progress = AsyncMock(return_value=False)
     service = DockerService(
         ssh_service=ssh_service,
         redis_service=redis_service,
