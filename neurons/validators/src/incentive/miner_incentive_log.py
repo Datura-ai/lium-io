@@ -86,7 +86,6 @@ if TYPE_CHECKING:
         MissingFull8xCapability,
         PortLimitedRemainder,
         PowerCapIncapable,
-        PowerCapReverted,
     )
     from services.task_service import JobResult
 
@@ -117,7 +116,6 @@ class ZeroIncentiveReason(StrEnum):
     CANNOT_APPLY_GPU_POWER_CAP = "cannot_apply_gpu_power_cap"
     OUTDATED_EXECUTOR_IMAGE = "outdated_executor_image"
     PORT_LIMITED_REMAINDER = "port_limited_remainder"
-    REVERTS_GPU_POWER_CAP = "reverts_gpu_power_cap"
     # Spot-node pay: an idle spot node that is not paid
     SPOT_WITHOUT_LIUM_FILLER = "spot_without_lium_filler"
     SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG = "spot_no_filler_revenue_for_gpu_config"
@@ -503,30 +501,6 @@ class MinerLogLine(BaseModel):
         )
 
     @staticmethod
-    def no_payout_because_reverts_gpu_power_cap(
-        result: JobResult, reverted: PowerCapReverted
-    ) -> MinerLogLine:
-        return MinerLogLine._no_payout(
-            result,
-            reason=ZeroIncentiveReason.REVERTS_GPU_POWER_CAP,
-            message=(
-                f"No unrented incentive: this executor raised the GPU power limit back "
-                f"{reverted.revert_count} times in the last {reverted.window_hours} hours while a "
-                f"Lium idle job was running. Lium caps the limit for the length of that job only, "
-                f"and restores your own value when it ends. Putting the limit back kills the job, "
-                f"so the node earns the unrented incentive without doing the work. Stop the script "
-                f"or service on the host that re-runs 'nvidia-smi -pl', or rent this executor out "
-                f"to earn."
-            ),
-            extra_fields={
-                "power_cap_revert_count": reverted.revert_count,
-                "power_cap_revert_window_hours": reverted.window_hours,
-                "capped_to_watts": reverted.capped_to_watts,
-                "found_watts": reverted.found_watts,
-            },
-        )
-
-    @staticmethod
     def no_payout_because_port_limited_remainder(
         result: JobResult, port_limited: PortLimitedRemainder
     ) -> MinerLogLine:
@@ -698,9 +672,7 @@ class MinerLogLine(BaseModel):
     # ── Calculation reports: the per-cycle lines every scored node gets ───────
 
     @staticmethod
-    def mining_score_calculated(
-        result: JobResult, is_rented_after_cutoff: bool, spot_rental_factor: float = 1.0
-    ) -> MinerLogLine:
+    def mining_score_calculated(result: JobResult, spot_rental_factor: float = 1.0) -> MinerLogLine:
         formula: str = (
             "score * gpu_portion * gpu_count / total_gpu_count * sysbox_multiplier * uptime_multiplier "
             "* driver_multiplier"
@@ -724,7 +696,6 @@ class MinerLogLine(BaseModel):
                 "gpu_portion": result.gpu_portion,
                 "total_gpu_count": result.total_gpu_count,
                 "rental_created": result.rental_created_at,
-                "is_rented_after_cutoff": is_rented_after_cutoff,
                 **spot_fields,
             },
         )

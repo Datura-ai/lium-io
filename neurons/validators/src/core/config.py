@@ -1,6 +1,5 @@
 import logging
 import pathlib
-from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
@@ -158,10 +157,6 @@ class Settings(BaseSettings):
     PORTION_FOR_UPTIME: float = 1
     UPTIME_REQUIRED_MINUTES: int = 60 * 24 * 14 # 14 days
 
-    PORTION_FOR_SYSBOX: float = 0.2
-    PORTION_FOR_SYSBOX_UNRENTED: float = 1
-    PORTION_FOR_SYSBOX_RENTED: float = 1
-    SYSBOX_RENTED_CUTOFF: datetime = datetime(2026, 4, 3, 12, 0, 0)
     # DAH-3597: first-miss grace for a DinD probe that never reached its container; the rule is
     # in PortConnectivityCheck, the TTL bounds the window between two misses.
     DIND_PROBE_FIRST_MISS_GRACE: bool = Field(env="DIND_PROBE_FIRST_MISS_GRACE", default=False)
@@ -673,15 +668,6 @@ class Settings(BaseSettings):
     # Root log level. DEBUG brings back the per-cycle check outcomes that repeat the previous cycle
     # and the per-executor job-result dump after scoring; asyncssh and sqlalchemy keep their own levels.
     LOG_LEVEL: str = Field(env="LOG_LEVEL", default="INFO", description="Root log level (DEBUG, INFO, WARNING, ...)")
-
-    # DAH-2786 — GPU power cap revert gate. When True, an unrented executor whose host put the
-    # GPU power limit back while a Lium idle job was running, often enough inside the window,
-    # loses the unrented rental incentive while staying active. Ships in shadow mode: unlike
-    # DAH-2715 this gate reads provider behaviour rather than a capability, so the prod numbers
-    # are read first. Set to True to enforce.
-    ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT: bool = Field(
-        env="ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT", default=False
-    )
 
     # DAH-4299: whether an idle provider-chosen spot node is paid is decided as for a secure node
     # (its GPU model is in the unrented program and every idle-pool gate passes), not by whether a

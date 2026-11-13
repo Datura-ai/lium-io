@@ -315,13 +315,13 @@ async def test_spot_is_paid_the_secure_side_when_it_is_lower():
 
 
 @pytest.mark.asyncio
-async def test_spot_secure_side_carries_the_nodes_own_sysbox_and_driver(monkeypatch):
-    monkeypatch.setattr(settings, "PORTION_FOR_SYSBOX_UNRENTED", 0.5)
+async def test_spot_secure_side_carries_the_nodes_own_sysbox_and_driver():
     spot = _spot(filler_revenue_per_gpu_hour=4 * HOURLY_RATE, sysbox_runtime=False)
 
     await _run([spot])
 
-    assert spot.effective_rate == pytest.approx(rental_price.SPOT_IDLE_SECURE_RATE_SHARE * 0.5 * HOURLY_RATE)
+    assert spot.sysbox_multiplier == 0
+    assert spot.effective_rate == 0
 
 
 @pytest.mark.asyncio
@@ -847,8 +847,7 @@ async def test_floor_without_an_average_changes_nothing():
 
 
 @pytest.mark.asyncio
-async def test_floor_keeps_the_nodes_own_penalties(monkeypatch):
-    monkeypatch.setattr(settings, "PORTION_FOR_SYSBOX_UNRENTED", 0.5)
+async def test_floor_keeps_the_nodes_own_penalties():
     incentive = await _run(
         [
             _node("secure-1", filler_revenue_per_gpu_hour=8.0, sysbox_runtime=False),
@@ -857,8 +856,8 @@ async def test_floor_keeps_the_nodes_own_penalties(monkeypatch):
     )
 
     penalised, full = incentive.job_results["hk"]
-    assert penalised.effective_rate == pytest.approx(HOURLY_RATE * 0.5 * 0.5)
-    assert _paid_rate(penalised) == pytest.approx(FLOOR_FACTOR * 8.0 * 0.5)
+    assert penalised.effective_rate == 0
+    assert _paid_rate(penalised) == 0
     assert _paid_rate(full) == pytest.approx(FLOOR_FACTOR * 8.0)
     _assert_pool_pays_exactly(incentive)
 

@@ -34,7 +34,6 @@ def incentive_redis_service():
 
 @pytest.fixture
 def mock_settings(monkeypatch):
-    monkeypatch.setattr(settings, "PORTION_FOR_SYSBOX", 0.1)
     monkeypatch.setattr(settings, "PORTION_FOR_UPTIME", 0.2)
     monkeypatch.setattr(settings, "UPTIME_REQUIRED_MINUTES", 120)
     monkeypatch.setattr(settings, "BURNERS", [0, 1])

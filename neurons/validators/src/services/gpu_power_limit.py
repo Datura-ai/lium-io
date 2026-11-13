@@ -14,7 +14,8 @@ Redis state (all keys written only by this validator):
   records.
 - ``gpu_power_cap_revert:<executor_id>`` — DAH-2786: the reverts observed on that executor inside
   ``CAP_REVERT_WINDOW_SECONDS``. A restore that finds the limit already back where the miner had it
-  proves the host raised it while our filler ran; the unrented incentive gate counts these.
+  proves the host raised it while our filler ran. Kept so each revert is logged once (Loki evidence);
+  no pay gate reads it: the backend holds idle pay until a later filler run keeps the cap.
 
 A record that outlives its filler (delete failed, SSH broke mid-teardown) is repaired by two safety
 nets, so a reduced limit can never stick:
@@ -88,8 +89,8 @@ NVIDIA_SMI_TIMEOUT_SECONDS = 30
 _RESTORE_KEY_PREFIX = "gpu_power_restore:"
 _POD_INDEX_KEY_PREFIX = "gpu_power_restore_pod:"
 _REVERT_KEY_PREFIX = "gpu_power_cap_revert:"
-# DAH-2786 — how long one observed revert stays on the executor's record. The unrented
-# incentive gate counts the reverts inside this window.
+# DAH-2786 — how long one observed revert stays on the executor's record, so a job's revert is
+# logged once.
 CAP_REVERT_WINDOW_SECONDS = 24 * 60 * 60
 # The gate only needs a count and the last evidence, so the history is bounded: a host that
 # reverts every filler run would otherwise grow the record for the whole window.
@@ -775,16 +776,6 @@ async def _read_revert_history(
     except (ValidationError, TypeError, ValueError):
         _log(logging.ERROR, f"gpu power cap revert: ignoring corrupt record {raw!r} for {executor_id}", {}, log_extra)
         return GpuPowerCapRevertReadResult(history=GpuPowerCapRevertHistory(), read_failed=False)
-
-
-async def read_gpu_power_cap_reverts(
-    redis: RedisService,
-    executor_id: str,
-    log_extra: dict[str, object] | None = None,
-) -> list[GpuPowerCapRevert]:
-    """Every revert observed on this executor inside the window, newest last. Empty on any unknown."""
-    read_result = await _read_revert_history(redis, executor_id, log_extra)
-    return _reverts_inside_window(read_result.history.reverts, time.time())
 
 
 def _reverts_of_jobs_not_already_recorded(
