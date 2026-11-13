@@ -739,8 +739,16 @@ def test_the_idle_filler_removal_keeps_the_rented_image_under_any_docker_hub_pre
 # ---------------------------------------------------------------- DAH-2498: cache files deleted off the start path
 
 
-def _run_detach(tmp_path, users: str) -> tuple[str, str]:
+def _run_detach(tmp_path, users: str, other_filesystem: bool = False) -> tuple[str, str]:
     """Runs the real command against a fake docker and a temp dir standing in for the host root."""
+    env = None
+    if other_filesystem:
+        # a stat that reports a different device per path: the trash dir is on another filesystem than the volume
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "stat").write_text('#!/bin/sh\necho ${#3}\n')
+        (bin_dir / "stat").chmod(0o755)
+        env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
     root = tmp_path / "host"
     data = root / "var/lib/docker/volumes/engy_cache_hf_x/_data"
     data.mkdir(parents=True)
@@ -759,7 +767,7 @@ def _run_detach(tmp_path, users: str) -> tuple[str, str]:
         .replace("/usr/bin/docker", str(docker))
         .replace("/proc/1/root", str(root))
     )
-    out = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=10).stdout
+    out = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=10, env=env).stdout
     return out, str(data)
 
 
@@ -775,6 +783,15 @@ def test_an_unused_cache_volume_is_emptied_at_once_and_its_files_deleted_in_the_
             break
         time.sleep(0.1)
     assert not trash.exists()
+
+
+def test_a_volume_on_another_filesystem_leaves_no_empty_trash_for_a_flatten_to_wait_on(tmp_path):
+    # review: the refused move left an empty lium-cache-trash, and the next flatten waited 300 s on it
+    out, data = _run_detach(tmp_path, "", other_filesystem=True)
+
+    assert out.split() == ["removed"]
+    assert os.listdir(data) == ["model.safetensors"]  # left to the plain removal
+    assert not (tmp_path / "host/var/lib/docker/lium-cache-trash").exists()
 
 
 def test_a_cache_volume_a_container_still_uses_is_left_to_the_plain_removal(tmp_path):

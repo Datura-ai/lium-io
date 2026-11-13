@@ -3290,7 +3290,8 @@ def _detach_volume_data_cmd(volume_name: str, remove_cmd: str) -> str:
         f't=${{m%/volumes/*}}/{CACHE_TRASH_DIR} && mkdir -p "/proc/1/root$t" && '
         '[ "$(stat -c %d "/proc/1/root$m")" = "$(stat -c %d "/proc/1/root$t")" ] && '
         'b=$(du -sxB1 "/proc/1/root$m" | cut -f1) && mv "/proc/1/root$m" "/proc/1/root$t/$v.$$" && '
-        '{ mkdir "/proc/1/root$m" 2>/dev/null; true; } || t=; '
+        # a refused or failed move leaves no empty trash dir: a flatten would wait on it (image_flatten trash check)
+        '{ mkdir "/proc/1/root$m" 2>/dev/null; true; } || { [ -n "$t" ] && rmdir "/proc/1/root$t" 2>/dev/null; t=; }; '
         f"{remove_cmd}; "
         f'if [ -n "$t" ]; then {delete}; '
         'echo "detached $b"; fi'
