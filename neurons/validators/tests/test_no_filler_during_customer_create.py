@@ -119,24 +119,56 @@ async def test_a_cancelled_delete_keeps_the_prune_registered_until_docker_return
     assert cleared is True
 
 
-@pytest.mark.parametrize(
-    ("cause", "fenced"),
-    [(TimeoutError("read timed out"), True), (APIError("409 conflict: prune already running"), False)],
-)
-@pytest.mark.asyncio
-async def test_a_prune_of_unknown_outcome_keeps_the_executor_fenced(monkeypatch, cause, fenced) -> None:
-    monkeypatch.setattr(docker_service, "PRUNE_UNKNOWN_COMPLETION_FENCE_SECONDS", 0.2)
-    customer = _payload()
-    docker = _Prune(error=RentalDockerOperationError("Docker SDK prune images failed"))
-    docker.error.__cause__ = cause
-    docker.release.set()
-    assert customer_creates.begin_prune(customer.miner_hotkey, customer.executor_id)
+class _Prunes:
+    """dockerd answering one prune call after another: an exception to raise, or None for a completed prune."""
 
-    with pytest.raises(RentalDockerOperationError):
+    def __init__(self, *outcomes: BaseException | None):
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    async def prune_images(self):
+        self.calls += 1
+        outcome = self.outcomes.pop(0)
+        if outcome is not None:
+            raise outcome
+
+
+def _prune_failure(cause: BaseException) -> RentalDockerOperationError:
+    error = RentalDockerOperationError("Docker SDK prune images failed")
+    error.__cause__ = cause
+    return error
+
+
+_LOST_REPLY = TimeoutError("read timed out")
+_PRUNE_RUNNING = APIError("409 Client Error: Conflict (a prune operation is already running)")
+
+
+async def _fenced_after(docker, customer) -> bool:
+    assert customer_creates.begin_prune(customer.miner_hotkey, customer.executor_id)
+    with contextlib.suppress(RentalDockerOperationError):
         await docker_service._prune_images_then_release(docker, {}, customer.miner_hotkey, customer.executor_id)
     with customer_creates.track(customer):
-        fenced_now = not await customer_creates.wait_for_prunes(customer, timeout_s=0.03, poll_s=0.01)
-        cleared_later = await customer_creates.wait_for_prunes(customer, timeout_s=1, poll_s=0.01)
+        return not await customer_creates.wait_for_prunes(customer, timeout_s=0.03, poll_s=0.01)
 
-    assert fenced_now is fenced
-    assert cleared_later is True
+
+@pytest.mark.parametrize(
+    ("outcomes", "fenced"),
+    [
+        # lio#2226 review: a lost reply, then dockerd still pruning and a lost reply again: no time lifts the fence
+        ((_prune_failure(_LOST_REPLY), _prune_failure(_PRUNE_RUNNING), _prune_failure(_LOST_REPLY)), True),
+        ((_prune_failure(_LOST_REPLY), _prune_failure(_PRUNE_RUNNING), None), False),  # a completed prune proves none runs
+        ((_prune_failure(APIError("500 Server Error: disk I/O")),), False),  # dockerd answered: this prune is over
+    ],
+)
+@pytest.mark.asyncio
+async def test_only_a_completed_prune_lifts_the_fence_of_one_that_may_still_run(monkeypatch, outcomes, fenced) -> None:
+    monkeypatch.setattr(docker_service, "PRUNE_CONFIRM_ATTEMPTS", 2)
+    monkeypatch.setattr(docker_service, "PRUNE_CONFIRM_INTERVAL_SECONDS", 0)
+    customer = _payload()
+    docker = _Prunes(*outcomes)
+
+    assert await _fenced_after(docker, customer) is fenced
+    assert docker.calls == len(outcomes)
+
+    # a later delete's prune that completes lifts a fence still standing
+    assert await _fenced_after(_Prunes(None), customer) is False

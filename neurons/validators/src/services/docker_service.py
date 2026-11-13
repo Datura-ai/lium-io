@@ -2517,6 +2517,9 @@ class _CustomerCreateRegistry:
         self._customer_create_reached_create_container: dict[int, bool] = {}
         # image prunes a delete has started per executor; a customer create waits them out before it pulls
         self._prunes_by_executor: Counter[tuple[str, str]] = Counter()
+        # executors where a prune may still run on the host (its Docker answer never came, or dockerd said a prune
+        # is already running); fenced until a later prune there completes, which dockerd allows only when none runs
+        self._unconfirmed_prunes: set[tuple[str, str]] = set()
         self._lock = threading.Lock()
 
     @contextlib.contextmanager
@@ -2586,6 +2589,15 @@ class _CustomerCreateRegistry:
             if self._prunes_by_executor[executor] <= 0:
                 del self._prunes_by_executor[executor]
 
+    def prune_may_still_run(self, miner_hotkey: str, executor_id: str, *, still_running: bool) -> None:
+        """Fence the executor while a prune may still run on its host, or lift the fence once one completed."""
+        executor = (miner_hotkey, executor_id)
+        with self._lock:
+            if still_running:
+                self._unconfirmed_prunes.add(executor)
+            else:
+                self._unconfirmed_prunes.discard(executor)
+
     async def wait_for_prunes(
         self, payload: ContainerCreateRequest, timeout_s: float = 300, poll_s: float = 0.2
     ) -> bool:
@@ -2599,7 +2611,7 @@ class _CustomerCreateRegistry:
         deadline = time.monotonic() + timeout_s
         while True:
             with self._lock:
-                if executor not in self._prunes_by_executor:
+                if executor not in self._prunes_by_executor and executor not in self._unconfirmed_prunes:
                     return True
             if time.monotonic() >= deadline:
                 return False
@@ -2626,33 +2638,46 @@ class _CustomerCreateRegistry:
 # validator that owns it.
 customer_creates = _CustomerCreateRegistry()
 
-# a prune whose Docker answer never came (a read timeout, a dropped transport) may still run on the host:
-# its executor stays fenced this long before a customer create pulls there (lio#2226 review)
-PRUNE_UNKNOWN_COMPLETION_FENCE_SECONDS = 120
+# a prune whose outcome is unknown is retried this many times, this far apart, while the executor stays fenced: only a
+# completed prune proves none runs on the host (lio#2226 review); still unproven, the fence stays until a later prune
+PRUNE_CONFIRM_ATTEMPTS = 3
+PRUNE_CONFIRM_INTERVAL_SECONDS = 20
+
+
+def _prune_may_still_run(exc: Exception) -> bool:
+    """False when dockerd answered that this prune is over; True when the reply was lost or another prune runs."""
+    from docker.errors import APIError
+
+    cause = exc.__cause__
+    if not isinstance(cause, APIError):
+        return True
+    # dockerd runs one prune at a time and refuses another with 409 "a prune operation is already running"
+    return getattr(cause, "status_code", None) == 409 or "already running" in str(cause)
 
 
 async def _prune_images_then_release(docker_client, log_extra: dict, miner_hotkey: str, executor_id: str) -> None:
-    """Prune, releasing the executor's prune registration only once the Docker call is over (begin_prune taken).
+    """Prune, releasing the executor's prune registration only once no prune is known to run (begin_prune taken).
 
     Run under asyncio.shield: a cancelled delete must not release it while the worker thread still prunes."""
-    from docker.errors import APIError
-
-    completion_unknown = False
     try:
-        await run_logged_rental_docker_sdk_operation(
-            operation="prune_images", log_extra=log_extra, call=docker_client.prune_images
-        )
-    except Exception as exc:
-        # dockerd answered an error: the prune is over. Anything else may have left it running.
-        completion_unknown = not isinstance(exc.__cause__, APIError)
-        raise
+        for attempt in range(PRUNE_CONFIRM_ATTEMPTS + 1):
+            if attempt:
+                await asyncio.sleep(PRUNE_CONFIRM_INTERVAL_SECONDS)
+            try:
+                await run_logged_rental_docker_sdk_operation(
+                    operation="prune_images", log_extra=log_extra, call=docker_client.prune_images
+                )
+            except Exception as exc:
+                if not _prune_may_still_run(exc):
+                    raise
+                customer_creates.prune_may_still_run(miner_hotkey, executor_id, still_running=True)
+                if attempt == PRUNE_CONFIRM_ATTEMPTS:
+                    raise
+                continue
+            customer_creates.prune_may_still_run(miner_hotkey, executor_id, still_running=False)
+            return
     finally:
-        if completion_unknown:
-            asyncio.get_running_loop().call_later(
-                PRUNE_UNKNOWN_COMPLETION_FENCE_SECONDS, customer_creates.end_prune, miner_hotkey, executor_id
-            )
-        else:
-            customer_creates.end_prune(miner_hotkey, executor_id)
+        customer_creates.end_prune(miner_hotkey, executor_id)
 
 
 def _is_filler_create_beside_customer_create(payload: ContainerCreateRequest) -> bool:

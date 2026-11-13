@@ -1731,9 +1731,9 @@ async def test_delete_container_prune_images_failure_still_deleted(
 
     docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
     docker_service.redis_service.remove_rented_machine = AsyncMock()
-    docker_service.rental_docker_client_factory.client.prune_images_error = Exception(
-        "Docker SDK prune images failed: 500 Server Error"
-    )
+    prune_error = Exception("Docker SDK prune images failed: 500 Server Error")
+    prune_error.__cause__ = APIError("500 Server Error")  # dockerd answered, so the prune is over
+    docker_service.rental_docker_client_factory.client.prune_images_error = prune_error
 
     payload = ContainerDeleteRequest(
         miner_hotkey="miner",
