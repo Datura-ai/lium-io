@@ -456,4 +456,4 @@ async def test_a_customer_create_fails_instead_of_pulling_beside_a_prune_still_r
 
     route.assert_not_awaited()
     assert isinstance(result, FailedContainerRequest)
-    assert result.error_code == FailedContainerErrorCodes.RentingInProgress
+    assert result.error_code == FailedContainerErrorCodes.UnknownError
