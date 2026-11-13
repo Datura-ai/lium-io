@@ -716,7 +716,7 @@ def _miner_on_the_executor_image() -> dict[str, object]:
 
 @pytest.mark.asyncio
 async def test_a_workload_started_from_the_executor_image_is_the_providers_load(context_factory):
-    # DAH-6251: the image digest excuses the executor and ONE more container (the monitor), never a third
+    # DAH-6251: with two other containers on the executor image, neither is excused
     ctx = context_factory(
         state=build_state(specs=_miner_on_the_executor_image(), rented_data=_no_rentals()),
         runner=confirming_runner(
@@ -730,10 +730,31 @@ async def test_a_workload_started_from_the_executor_image_is_the_providers_load(
         result = await ProviderSideLoadCheck().run(ctx)
 
     assert result.passed is False
-    assert result.event.what_we_saw["provider_cpu_cores"] == 9.7  # 11.2 host - 1.5 the stack
-    assert result.event.what_we_saw["executor_stack_containers"] == 2
-    assert result.event.what_we_saw["executor_stack_cores"] == 1.5
-    assert result.event.what_we_saw["executor_monitor_cores"] == 0.5
+    assert result.event.what_we_saw["provider_cpu_cores"] == 10.2  # 11.2 host - 1.0 the executor
+    assert result.event.what_we_saw["executor_stack_containers"] == 1
+    assert result.event.what_we_saw["executor_stack_cores"] == 1.0
+    assert result.event.what_we_saw["executor_monitor_cores"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_a_burner_kept_low_during_the_scrape_is_not_excused_as_the_monitor(context_factory):
+    # idle below the monitor in the scrape, nine cores by the resample: it must stay the provider's
+    specs = _miner_on_the_executor_image()
+    specs["docker"]["containers"][2]["cpu_percent"] = 10.0
+    ctx = context_factory(
+        state=build_state(specs=specs, rented_data=_no_rentals()),
+        runner=confirming_runner(
+            11.2,
+            32,
+            [("executor-id", "executor", 100.0), ("monitor-id", "monitor", 50.0), ("miner-id", "miner", 900.0)],
+        ),
+    )
+
+    with provider_load_gate(enforce=True):
+        result = await ProviderSideLoadCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["provider_cpu_cores"] == 10.2
 
 
 @pytest.mark.asyncio
@@ -754,8 +775,8 @@ async def test_the_executor_container_is_excused_by_its_id_however_busy(context_
     with provider_load_gate(enforce=True):
         result = await ProviderSideLoadCheck().run(ctx)
 
-    assert result.event.what_we_saw["executor_stack_cores"] == 12.5
-    assert result.event.what_we_saw["provider_cpu_cores"] == 8.9
+    assert result.event.what_we_saw["executor_stack_cores"] == 12.0
+    assert result.event.what_we_saw["provider_cpu_cores"] == 9.4
 
 
 @pytest.mark.asyncio

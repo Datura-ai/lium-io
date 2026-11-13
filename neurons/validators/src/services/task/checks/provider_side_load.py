@@ -320,9 +320,8 @@ def executor_stack_container_ids(specs: dict[str, Any]) -> set[str]:
     runs) and at most ONE other container on its image digest (the monitor).
 
     Any container started from the executor image carries its digest, so a match alone proves
-    nothing: every further match is the provider's load (DAH-6251). Of the matches the one
-    holding the fewest cores is excused, so a container started beside the stack is never the
-    one that goes free. The stack's other containers (postgres, autoheal) run other images and
+    nothing (DAH-6251). A single match is the monitor; with two or more, none is excused, since
+    their scrape-time load cannot say which one is the monitor. The stack's other containers (postgres, autoheal) run other images and
     stay on the provider's side, where their idle load belongs.
     """
     docker_info = specs.get("docker")
@@ -335,8 +334,9 @@ def executor_stack_container_ids(specs: dict[str, Any]) -> set[str]:
     others = [
         row for row in rows if executor_digest and row.digest == executor_digest and row.container_id != executor_id
     ]
-    if others:
-        ids.add(min(others, key=lambda row: row.cpu_percent or 0.0).container_id)
+    # two or more matches cannot tell the monitor from a burner on the same image: excuse none
+    if len(others) == 1:
+        ids.add(others[0].container_id)
     # an empty id is "the scrape did not say", never a container to excuse
     ids.discard("")
     return ids
