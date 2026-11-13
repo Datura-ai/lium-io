@@ -229,6 +229,8 @@ def _executor_create_lock_key(executor_id: str) -> str:
 # Renter creates under way on an executor, held lock or not (lio#2226): a create that went ahead without the lock,
 # or outlived its TTL, still keeps a delete's image prune off its pull. Each create renews its entry while it runs.
 CREATE_IN_PROGRESS_TTL_SECONDS = 60
+# a renter's create that Redis cannot record fails after these one-second retries, before its pull starts
+CREATE_IN_PROGRESS_REGISTER_ATTEMPTS = 5
 
 
 def _creates_in_progress_key(executor_id: str) -> str:
@@ -505,13 +507,15 @@ class RedisService:
         remove the renter's `pod_*` container) and makes a renter's create wait while the probe's create
         is on the host, at most EXECUTOR_CREATE_LOCK_BLOCKING_TIMEOUT (a second renter create on the same
         executor waits behind the first the same way). A lock that cannot be taken (Redis unreachable, or
-        still held at the deadline) is logged and the create goes ahead: the validator's own housekeeping
-        never refuses a renter. Yields whether the lock is held. A release after the TTL passed
-        (LockNotOwnedError) is expected for a slow create and ignored.
+        still held at the deadline) is logged and the create goes ahead. The create's in-progress entry is
+        not optional: an unrecorded create could have a delete's prune retry run beside its pull once Redis
+        answers again (lio#2226 review), so a create Redis cannot record raises before it pulls. Yields whether
+        the lock is held. A release after the TTL passed (LockNotOwnedError) is expected for a slow create and
+        ignored.
         """
         lock = self.executor_create_lock(executor_id)
         token = _renter_create_lock_token(pod_id, renter_create_id.get())
-        await self._renew_create_in_progress(executor_id, token)  # before the pull can start
+        await self._register_create_in_progress(executor_id, token)  # before the pull can start
         marking = asyncio.create_task(self._keep_create_in_progress(executor_id, token))
         held = False
         try:
@@ -544,11 +548,26 @@ class RedisService:
             with suppress(redis.exceptions.RedisError, OSError):
                 await self.redis.zrem(_creates_in_progress_key(executor_id), token)
 
-    async def _renew_create_in_progress(self, executor_id: str, token: str) -> None:
+    async def _write_create_in_progress(self, executor_id: str, token: str) -> None:
         key = _creates_in_progress_key(executor_id)
-        with suppress(redis.exceptions.RedisError, OSError):  # a renter's create is never refused
-            await self.redis.zadd(key, {token: time.time() + CREATE_IN_PROGRESS_TTL_SECONDS})
-            await self.redis.expire(key, CREATE_IN_PROGRESS_TTL_SECONDS)
+        await self.redis.zadd(key, {token: time.time() + CREATE_IN_PROGRESS_TTL_SECONDS})
+        await self.redis.expire(key, CREATE_IN_PROGRESS_TTL_SECONDS)
+
+    async def _register_create_in_progress(self, executor_id: str, token: str) -> None:
+        for attempt in range(CREATE_IN_PROGRESS_REGISTER_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(1)
+            try:
+                await self._write_create_in_progress(executor_id, token)
+                return
+            except (redis.exceptions.RedisError, OSError) as e:
+                error = e
+        message = f"Redis could not record the create on executor {executor_id}; create not started"
+        raise RuntimeError(message) from error
+
+    async def _renew_create_in_progress(self, executor_id: str, token: str) -> None:
+        with suppress(redis.exceptions.RedisError, OSError):  # registered already: the next renewal retries
+            await self._write_create_in_progress(executor_id, token)
 
     async def _keep_create_in_progress(self, executor_id: str, token: str) -> None:
         while True:

@@ -1538,3 +1538,31 @@ async def test_a_renter_create_counts_as_in_progress_without_its_lock_until_it_e
     assert await redis_service.creates_in_progress("exec-1")
     await create.__aexit__(None, None, None)
     assert not await redis_service.creates_in_progress("exec-1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("failures", "recorded"), [(1, True), (5, False)])
+async def test_a_renter_create_redis_cannot_record_fails_before_its_pull(monkeypatch, failures, recorded) -> None:
+    # lio#2226 review: an unrecorded create would let a prune retry run beside its pull once Redis answers again
+    monkeypatch.setattr(redis_service_module.asyncio, "sleep", AsyncMock())
+    redis_service = _fakeredis_service()
+    zadd, calls = redis_service.redis.zadd, []
+
+    async def flaky_zadd(*args, **kwargs):
+        calls.append(1)
+        if len(calls) <= failures:
+            raise ConnectionError("redis blip")
+        return await zadd(*args, **kwargs)
+
+    redis_service.redis.zadd = flaky_zadd
+    create = redis_service.executor_create_exclusion("exec-1", "pod-1")
+
+    if recorded:
+        await create.__aenter__()
+        assert await redis_service.creates_in_progress("exec-1")
+        await create.__aexit__(None, None, None)
+    else:
+        with pytest.raises(RuntimeError, match="create not started"):
+            await create.__aenter__()
+        assert not await redis_service.creates_in_progress("exec-1")
+        assert not await redis_service.redis.exists("lock:executor-create:exec-1")
