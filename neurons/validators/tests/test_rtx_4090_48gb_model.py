@@ -16,7 +16,7 @@ from services.gpu_spec_table import (
     driver_gpu_name,
     matmul_probe_vram_mb,
 )
-from services.task.checks.gpu_model_truth import EXPECTED_CC_ONLY
+from services.task.checks.gpu_model_truth import EXPECTED_CC_AND_SM, gpu_model_mismatch
 from services.task.checks.machine_spec_scrape import _normalize_gpu_details
 from services.task.result_handler import _canonicalize_published_gpu_names
 
@@ -74,7 +74,7 @@ def test_every_modded_model_has_its_own_economics_and_checks(model):
     assert RENTAL_PRICES_PER_HOUR[model] > RENTAL_PRICES_PER_HOUR[base]
     assert family != BASE_GPU_MAP[base]
     assert MAX_UNRENTED_GPUS_BY_TYPE[family] == {1: 10, 8: 64}  # the default tier
-    assert EXPECTED_CC_ONLY[model] == "8.9"
+    assert EXPECTED_CC_AND_SM[model] == EXPECTED_CC_AND_SM[base]
     assert driver_gpu_name(model) == base
     assert matmul_probe_vram_mb(model) == round(size_mb * 0.90)  # the all-card probe uses the modded size
 
@@ -133,3 +133,13 @@ async def test_published_estimates_cover_every_modded_model(monkeypatch):
     estimates = await rental_price.precompute_all_estimates(None, None, None)
     assert set(MODDED_VRAM_MODELS) <= set(estimates)
     assert len(estimates) == len(BASE_GPU_MAP)
+
+
+def test_a_4090_d_chip_cannot_pass_as_the_4090_48gb():
+    # lio#2234 review: 114 SMs under the 48GB name would be paid at the 48GB anchor
+    specs = {"gpu": {"count": 1, "details": [{"name": "NVIDIA GeForce RTX 4090 48GB"}]}}
+
+    mismatch = gpu_model_mismatch(specs, {"cc": "8.9", "sm_count": 114})
+
+    assert mismatch is not None
+    assert mismatch.expected_sm_count == 128
