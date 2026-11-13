@@ -355,6 +355,9 @@ class Context(BaseModel):
     # False once GpuKernelCountCheck finds a kernel list shorter than the reported count; the
     # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
     gpu_kernel_count_passed: bool = True
+    # False once a card is below its reported GPU model (DAH-6241); non-fatal on a live rental, so the score
+    # gate lives in calculate_scores.
+    gpu_model_passed: bool = True
     # G1 — NVIDIA CC GPU attestation outcome: True/False when verified, None when
     # not performed (non-CVM node, no evidence supplied, or NRAS undeterminable).
     gpu_attestation_passed: bool | None = None
