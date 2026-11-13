@@ -429,7 +429,7 @@ async def test_a_cancelled_all_cards_matmul_kills_every_card_run_in_one_session(
     service = ValidationService.__new__(ValidationService)
     shell = BlockingCardShell(cards=8)
     executor = MagicMock(python_path="/usr/bin/python3")
-    runs = asyncio.ensure_future(service._run_cards(shell, executor, "/tmp/s.py", ["params"] * 8))
+    runs = asyncio.ensure_future(service._run_cards(shell, executor, "/tmp/s.py", [MagicMock(params="params")] * 8))
     await asyncio.wait_for(shell.started.wait(), 5)
 
     runs.cancel()

@@ -37,8 +37,14 @@ from ..availability import ReachSource, ReachTarget
 from ..messages import GpuFaultProbeMessages, render_message
 from ..messages import PostRentalGpuRecheckMessages as Msg
 from ..pipeline import CheckResult, Context
-from .capability import get_filler_only_container
+from .capability import get_filler_only_container, judge_gpu_model
 from .gpu_fault_probe import GpuFaultProbeCheck
+from .gpu_model_truth import (
+    expected_cc_and_sm,
+    gpu_model_mismatches,
+    judged_cards,
+    reported_gpu_model,
+)
 from .sshd_bootstrap import remove_lium_fillers
 
 if TYPE_CHECKING:
@@ -270,6 +276,25 @@ class PostRentalGpuRecheckCheck:
                 inconclusive = True
             else:
                 failures.append(f"all-cards matmul: {all_cards_probe.failure_reason}")
+        if all_cards_probe is not None:
+            # DAH-6241: each card's sealed numbers against the model reported for it
+            card_metrics = {c["card_index"]: c["metrics"] for c in all_cards_probe.per_card if c.get("metrics")}
+            specs = ctx.state.specs or {}
+            measured = judged_cards(None, card_metrics)
+            # a card that did the work but gave no numbers is only logged: no prod data yet for this path
+            no_numbers = {
+                c["card_index"]
+                for c in all_cards_probe.per_card
+                if c.get("ok")
+                and c["card_index"] not in measured
+                and expected_cc_and_sm(reported_gpu_model(specs, c["card_index"])) is not None
+            }
+            if no_numbers:
+                what["gpu_model_no_numbers_cards"] = sorted(no_numbers)
+            mismatches = await judge_gpu_model(ctx, gpu_model_mismatches(specs, None, card_metrics), measured)
+            if mismatches:
+                what["gpu_model_mismatch"] = mismatches[0].as_dict()
+                failures.append(f"gpu model: card {mismatches[0].card_index} is below {mismatches[0].reported_gpu_model}")
         probe = await GpuFaultProbeCheck(is_post_rental_recheck=True).run(ctx)
         what["fault_probe"] = {
             "reason": probe.event.reason_code,

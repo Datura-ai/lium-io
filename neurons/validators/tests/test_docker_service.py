@@ -6370,7 +6370,7 @@ async def test_resolve_volume_sizing_legacy_passthrough(docker_service):
 @pytest.mark.asyncio
 async def test_resolve_volume_sizing_fresh_pool_bound(docker_service):
     # Arrange: df_avail=900GB, existing volumes=300GB, overhead 20 -> pool 1180GB,
-    # disk_share 0.5 -> slice 590GB -> volume 393GB, storage 196GB.
+    # disk_share 0.5 -> the volume takes 590GB of it (DAH-6187: the storage is a quota) -> storage 295GB.
     payload = _make_sizing_payload(disk_share=0.5, storage_limit_gb=1)
     ssh_client = _make_sizing_ssh_client(
         df_avail_bytes=900 * _SIZING_GB,
@@ -6384,10 +6384,46 @@ async def test_resolve_volume_sizing_fresh_pool_bound(docker_service):
     # Assert
     assert result.path == "fresh"
     assert result.capped_by == "pool"
-    assert result.volume_limit_gb == 393
-    assert result.storage_limit_gb == 196
+    assert result.volume_limit_gb == 590
+    assert result.storage_limit_gb == 295
     assert result.df_avail_bytes == 900 * _SIZING_GB
     assert result.existing_volumes_bytes == 300 * _SIZING_GB
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stderr", "path", "existing_gb"),
+    [
+        ("Error response from daemon: get volume_gone: no such volume\n", "fresh", 300),
+        ("Cannot connect to the Docker daemon\n", "fresh_fallback", None),
+    ],
+)
+async def test_resolve_volume_sizing_skips_a_volume_removed_before_the_inspect(
+    docker_service, stderr, path, existing_gb
+):
+    # The renter deleted one pod while creating the next: the listed volume_gone is gone by the inspect.
+    # Only that error sizes from the volumes still there; any other inspect error still falls back.
+    payload = _make_sizing_payload(disk_share=0.5, storage_limit_gb=1, volume_limit_gb=447)
+    ssh_client = _make_sizing_ssh_client(
+        df_avail_bytes=900 * _SIZING_GB,
+        volume_ls_stdout="volume_gone vloopback:latest\nvolume_kept vloopback:latest\n",
+    )
+    run = ssh_client.run.side_effect
+
+    def inspect(command, **kwargs):
+        if "volume inspect" not in command:
+            return run(command, **kwargs)
+        if "volume_gone" in command:
+            return Mock(stdout="", stderr=stderr, exit_status=1)
+        return Mock(stdout=f"{300 * _SIZING_GB}|<no value>\n", stderr="", exit_status=0)
+
+    ssh_client.run = AsyncMock(side_effect=inspect)
+
+    result = await docker_service.resolve_volume_sizing(ssh_client, payload, "tag", {})
+
+    assert result.path == path
+    if existing_gb is not None:
+        assert result.existing_volumes_bytes == existing_gb * _SIZING_GB
 
 
 @pytest.mark.asyncio
@@ -6575,7 +6611,7 @@ async def test_create_container_fresh_sizing_uses_effective_values(
     """disk_share set: effective fresh values (not payload echoes) must flow into
     create_local_volume, the docker run --storage-opt flag, and ContainerCreated."""
     # Arrange: df_avail=900GB, existing vloopback=300GB, share=0.5 -> pool 1180GB,
-    # slice 590GB (request cap 400*1.5=600GB does not bind) -> volume 393, storage 196.
+    # the volume takes 590GB (request cap 700GB does not bind; DAH-6187) -> volume 590, storage 295.
     def ssh_run(command, **kwargs):
         if "docker info" in command and "flock" not in command:
             return _make_ssh_command_result(stdout="/var/lib/docker\n")
@@ -6637,7 +6673,7 @@ async def test_create_container_fresh_sizing_uses_effective_values(
         gpu_uuids=["GPU-test"],
         cpu_count=1,
         memory_gb=1,
-        volume_limit_gb=400,
+        volume_limit_gb=700,
         storage_limit_gb=250,
         disk_share=0.5,
         available_ports=[PayloadPortMapping(internal_port=20001, external_port=20001)],
@@ -6666,13 +6702,13 @@ async def test_create_container_fresh_sizing_uses_effective_values(
     )
 
     # Assert: fresh-computed volume limit reaches local volume creation
-    assert docker_service.create_local_volume.await_args.kwargs["limit"] == 393
+    assert docker_service.create_local_volume.await_args.kwargs["limit"] == 590
     # Assert: fresh-computed storage limit reaches Docker SDK host config data
     run_spec = docker_service.rental_docker_client_factory.client.run_specs[-1]
-    assert run_spec.storage_limit_gb == 196
+    assert run_spec.storage_limit_gb == 295
     # Assert: ContainerCreated carries effective values, not payload echoes
-    assert result.volume_limit_gb == 393
-    assert result.storage_limit_gb == 196
+    assert result.volume_limit_gb == 590
+    assert result.storage_limit_gb == 295
 
 
 def test_should_encrypt_local_volume_requires_local_sysbox_customer_volume(monkeypatch):

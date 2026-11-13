@@ -402,8 +402,11 @@ def container_create_kwargs(client: docker.DockerClient, old: Container, image_r
     Name, command, entrypoint, environment, labels, working directory, user, the whole
     HostConfig (binds, restart policy, ports, privileges) and the network endpoints are
     copied from the old container, so a runner created by compose keeps its compose
-    labels, its `.env` bind and its restart policy. A Cmd or Entrypoint that the old
-    container inherited from its image is not copied: the new image decides it.
+    labels, its `.env` bind and its restart policy. A Cmd, Entrypoint, working directory,
+    user or Env entry that the old container inherited from its image is not copied: the
+    new image decides it. A runner that never ran (`docker compose create`) has an image
+    nobody verified; when that image cannot be inspected nothing is copied blindly and
+    the rebuild is refused.
     """
     attrs = old.attrs
     config = attrs.get("Config") or {}
@@ -411,7 +414,10 @@ def container_create_kwargs(client: docker.DockerClient, old: Container, image_r
     try:
         old_image_config = client.images.get(attrs["Image"]).attrs.get("Config") or {}
     except Exception as e:
+        if old.status == "created":
+            raise RuntimeError(f"Image of the never-started runner is not inspectable: {e}") from e
         logger.warning(_m("Old image not inspectable, copying Cmd/Entrypoint as they are", {"error": str(e)}))
+    image_env = set(old_image_config.get("Env") or [])
 
     networks = (attrs.get("NetworkSettings") or {}).get("Networks") or {}
     endpoints = {}
@@ -425,12 +431,11 @@ def container_create_kwargs(client: docker.DockerClient, old: Container, image_r
         "name": attrs.get("Name", "").lstrip("/") or None,
         "command": _inherited_or_none(config.get("Cmd"), old_image_config.get("Cmd")),
         "entrypoint": _inherited_or_none(config.get("Entrypoint"), old_image_config.get("Entrypoint")),
-        # Env is copied whole: compose-set variables must survive, and the image-provided
-        # part (PATH and the like) is the same in every runner build.
-        "environment": config.get("Env"),
+        # Compose-set variables survive; entries the old image set are left to the new image.
+        "environment": [e for e in config.get("Env") or [] if e not in image_env] or None,
         "labels": config.get("Labels"),
-        "working_dir": config.get("WorkingDir") or None,
-        "user": config.get("User") or None,
+        "working_dir": _inherited_or_none(config.get("WorkingDir") or None, old_image_config.get("WorkingDir") or None),
+        "user": _inherited_or_none(config.get("User") or None, old_image_config.get("User") or None),
         "host_config": attrs.get("HostConfig") or {},
         "networking_config": client.api.create_networking_config(endpoints) if endpoints else None,
     }
@@ -450,6 +455,8 @@ def recreate_container(client: docker.DockerClient, old: Container, image_refere
     name = kwargs["name"]
     previous_name = previous_runner_name(name, old.short_id)
     logger.info(_m("Renaming existing container aside", {"name": name, "id": old.short_id, "to": previous_name}))
+    # A runner that never ran (`docker compose create`) holds an image nobody verified: never start it.
+    never_started = old.status == "created"
     old.rename(previous_name)
     try:
         logger.info(_m("Creating new container with updated image", {"name": name, "image": image_reference}))
@@ -465,7 +472,8 @@ def recreate_container(client: docker.DockerClient, old: Container, image_refere
         logger.error(_m("Switch to the new container failed, restoring the old one", {"name": name, "image": image_reference}))
         client.api.remove_container(created["Id"], force=True)
         old.rename(name)
-        old.start()
+        if not never_started:
+            old.start()
         raise
     logger.info(_m("Removing old container", {"name": previous_name}))
     old.remove(force=True)
@@ -667,7 +675,9 @@ def check_and_update() -> None:
         # GPU container right now. The check repeats every cycle, so the update resumes on its
         # own once the host is fixed (reboot or driver reload). A first boot (no runner) has
         # nothing to break and skips the probe.
-        if container is not None:
+        # A runner that never ran has an unverified image: running even `true` from it is not safe,
+        # and nothing runs on it that an update could break.
+        if container is not None and container.status != "created":
             image_id = container.attrs.get("Image")
             probe = (
                 probe_nvidia_runtime(client, image_id)

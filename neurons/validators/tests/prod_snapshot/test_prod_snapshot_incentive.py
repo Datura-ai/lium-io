@@ -31,6 +31,7 @@ from incentive.base import BaseIncentive
 from incentive.config import IncentiveConfig
 from incentive.default import DefaultIncentive
 from incentive.rental_price import RentalPriceIncentive
+from services.const import FIXED_RATIO
 from services.task_service import JobResult
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -222,13 +223,13 @@ def _calc_hourly_emission_usd(prod_snapshot: dict) -> float:
 
     Mirrors compute-app SubtensorService.get_total_miner_rewards_in_usd:
       BLOCKS_PER_DAY * subnet.price * tao_price * MINER_EMISSION_PERCENTAGE / 24
+    with the miner share taken from the validator's FIXED_RATIO.
     """
     BLOCKS_PER_DAY = 7200  # 24 * 3600 / 12
-    MINER_EMISSION_PERCENTAGE = 0.41
     s = prod_snapshot["settings"]
     tao_price = s.get("tao_price_usd", 400.0)
     alpha_rate = s.get("alpha_rate", 0.001)
-    return BLOCKS_PER_DAY * alpha_rate * tao_price * MINER_EMISSION_PERCENTAGE / 24
+    return BLOCKS_PER_DAY * alpha_rate * tao_price * FIXED_RATIO / 24
 
 
 def _extract_actual_output(incentive: BaseIncentive) -> dict:

@@ -67,6 +67,13 @@ RENTAL_PROBE_FAILED_PREFIX = "rental_probe_failed"
 # filler container name -> JSON list of the image digests (bare sha256) the validator started it from
 FILLER_IMAGE_DIGESTS_PREFIX = "filler_image_digests:"
 FILLER_IMAGE_DIGESTS_TTL_SECONDS = 30 * 24 * 3600
+# A pod edit parks the pod's container under another name; the exact name this validator parked is
+# recorded per executor (key + parked name) so the GPU checks never take a self-named parked
+# container as ours. The edit's end shortens it to one GPU check's span; the TTL only backstops a
+# validator killed mid-edit.
+EDIT_PARKED_CONTAINER_PREFIX = "edit_parked_container:"
+EDIT_PARKED_CONTAINER_TTL_SECONDS = 30 * 60
+EDIT_PARKED_CONTAINER_AFTER_EDIT_SECONDS = 5 * 60
 # pod id -> set by the rented-pod recovery when it stops a pod or before it renames one back, cleared
 # once the pod is started again (no expiry: it is the only evidence the stop was ours): a stopped
 # pod_<id> it marked is its own to start next cycle, even when the rename's reply and its cleanup
@@ -81,11 +88,22 @@ RECENT_FILLER_PREFIX = "recent_filler:"
 # a filler stopped for a customer rent leaves the snapshot at once but stays on the host until its delete lands:
 # one cycle (~17 min) plus RENTAL_TEARDOWN_GRACE_MINUTES, with margin, from its create or the last cycle that listed it
 RECENT_FILLER_TTL_SECONDS = 45 * 60
+# filler container name -> set when the validator removed that filler itself (GPU recheck, failed sshd). The backend
+# closes the run only after ~30 min of missing reports; until then the container's absence is not a host kill.
+FILLER_REMOVED_BY_VALIDATOR_PREFIX = "filler_removed_by_validator:"
+FILLER_REMOVED_BY_VALIDATOR_TTL_SECONDS = 2 * 3600
 # set by a filler create whose sshd never came up in the container, cleared by one where it did
 SSHD_BOOTSTRAP_FAILED_PREFIX = "sshd_bootstrap_failed"
 # prod, 24 h: failed filler creates on a broken node came 5 min to 2.7 h apart, so 6 h outlives the
 # longest gap about twice over; a stale stamp ends by itself
 SSHD_BOOTSTRAP_FAILED_TTL_SECONDS = 6 * 3600
+# DAH-6066: the host's MemAvailable (KiB) read at a create with no pod or filler on it, per executor; it caps
+# later rentals' memory limits. Refreshed at every idle create; 30 days so a node rented for weeks keeps it.
+IDLE_MEM_AVAILABLE_PREFIX = "idle_mem_available_kib"
+IDLE_MEM_AVAILABLE_TTL_SECONDS = 30 * 24 * 3600
+# DAH-6066: share of the host's free-if-empty MemAvailable kept free: the kernel's free-page floor plus slab and
+# page-table growth while a rental runs, which scale with the host. The reserve clamp still bounds small hosts.
+IDLE_MEM_AVAILABLE_MARGIN_PERCENT = 3
 
 
 def create_started_at_key(miner_hotkey: str, executor_id: str) -> str:
@@ -189,6 +207,8 @@ EXPRESS_LANE_VALIDATED_SET = "express_lane_validated_executors"
 EXPRESS_LANE_RECHECK_REQUESTS_SET = "express_lane:recheck_requests"
 # shortcut: one TTL for the whole set, refreshed per request; per-id expiry if requests pile up.
 EXPRESS_LANE_RECHECK_REQUESTS_TTL_SECONDS = 30 * 60
+# DAH-6137: a node a check asked to recheck itself, so it asks once per window.
+EXPRESS_LANE_RECHECK_ONCE_PREFIX = "express_lane:recheck_once"
 # executor id -> how many times it was requested; a run ends only the request it started from (review 4510532999)
 EXPRESS_LANE_RECHECK_GENERATIONS_HASH = "express_lane:recheck_generations"
 RECHECK_POP_ATTEMPTS = 5
@@ -602,6 +622,15 @@ class RedisService:
             await self.redis.sadd(EXPRESS_LANE_RECHECK_REQUESTS_SET, executor_id)
             for key in (EXPRESS_LANE_RECHECK_REQUESTS_SET, EXPRESS_LANE_RECHECK_GENERATIONS_HASH):
                 await self.redis.expire(key, EXPRESS_LANE_RECHECK_REQUESTS_TTL_SECONDS)
+
+    async def request_executor_recheck_once(self, executor_id: str, ttl_seconds: int) -> bool:
+        """Queue a recheck unless this one already queued one in the last ttl_seconds; True when queued."""
+        async with self.lock:
+            key = f"{EXPRESS_LANE_RECHECK_ONCE_PREFIX}:{executor_id}"
+            fresh = await self.redis.set(key, "1", ex=ttl_seconds, nx=True)
+        if fresh:
+            await self.request_executor_recheck(executor_id)
+        return bool(fresh)
 
     async def get_executor_recheck_requests(self) -> set[str]:
         members = await self.smembers(EXPRESS_LANE_RECHECK_REQUESTS_SET)
