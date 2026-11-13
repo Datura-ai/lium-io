@@ -13,6 +13,7 @@ from middlewares.miner import MinerMiddleware
 from routes.apis import apis_router
 from services.cache_template_service import run_cache_template_prefetch
 from services.heartbeat_service import run_node_heartbeat
+from services.pod_oom_group_service import start_pod_oom_group_watcher
 from services.ssh_service import run_ssh_sources_refresh, run_uploaded_key_purge
 
 # Set up logging
@@ -45,6 +46,8 @@ async def lifespan(app: FastAPI):
     heartbeat_task = asyncio.create_task(run_node_heartbeat())
     # DAH-4631: the signed list uploads are pinned to, fetched off the upload path
     ssh_sources_task = asyncio.create_task(run_ssh_sources_refresh())
+    # DAH-6379: a restarted pod's new cgroup gets memory.oom.group again at once
+    start_pod_oom_group_watcher()
     try:
         yield
     finally:
