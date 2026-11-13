@@ -293,6 +293,9 @@ def mock_dependencies():
     """Mock all DockerService dependencies."""
     ssh_service = Mock()
     redis_service = Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True))
+    # the create lock every delete's prune takes (lio#2226): free, so deletes prune
+    redis_service.executor_create_lock = Mock(return_value=Mock(acquire=AsyncMock(return_value=True), release=AsyncMock()))
+    redis_service.creates_in_progress = AsyncMock(return_value=False)
     attestation_service = Mock()
 
     # Mock the async context manager for Redis lock
@@ -1676,6 +1679,46 @@ async def test_delete_container_missing_volume_still_deleted(
 
 
 @pytest.mark.asyncio
+async def test_delete_container_skips_prune_while_customer_create_runs_on_executor(
+    docker_service,
+    monkeypatch,
+):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result())
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock())
+    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
+    docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
+    docker_service.redis_service.remove_rented_machine = AsyncMock()
+
+    executor_id = str(uuid4())
+    filler_delete = ContainerDeleteRequest(
+        miner_hotkey="miner",
+        executor_id=executor_id,
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.FILLER,
+        container_name="filler_prune_skip",
+    )
+    customer_create = Mock(
+        miner_hotkey="miner", executor_id=executor_id, workload_kind=WorkloadKind.CUSTOMER_RENTAL
+    )
+    with docker_service_module.customer_creates.track(customer_create):
+        result = await docker_service.delete_container(
+            payload=filler_delete,
+            executor_info=_delete_container_executor_info(executor_id),
+            keypair=Mock(ss58_address="validator-hotkey"),
+            private_key="encrypted",
+        )
+
+    assert isinstance(result, ContainerDeleted)
+    # the renter's pull on this host is not raced by an image prune
+    assert docker_service.rental_docker_client_factory.client.pruned_images == 0
+
+
+@pytest.mark.asyncio
 async def test_delete_container_prune_images_failure_still_deleted(
     docker_service,
     monkeypatch,
@@ -1691,9 +1734,9 @@ async def test_delete_container_prune_images_failure_still_deleted(
 
     docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
     docker_service.redis_service.remove_rented_machine = AsyncMock()
-    docker_service.rental_docker_client_factory.client.prune_images_error = Exception(
-        "Docker SDK prune images failed: 500 Server Error"
-    )
+    prune_error = Exception("Docker SDK prune images failed: 500 Server Error")
+    prune_error.__cause__ = APIError("500 Server Error")  # dockerd answered, so the prune is over
+    docker_service.rental_docker_client_factory.client.prune_images_error = prune_error
 
     payload = ContainerDeleteRequest(
         miner_hotkey="miner",

@@ -122,6 +122,7 @@ class FakeDocker:
         self.create_calls: list[tuple] = []
         self.create_options: list[dict] = []
         self.delete_calls: list[tuple] = []
+        self.delete_options: list[dict] = []
 
     async def create_container(self, payload, executor_info, keypair, private_key, **options):
         self.create_calls.append((payload, executor_info, keypair, private_key))
@@ -130,8 +131,9 @@ class FakeDocker:
             raise self.create_result
         return self.create_result
 
-    async def delete_container(self, payload, executor_info, keypair, private_key):
+    async def delete_container(self, payload, executor_info, keypair, private_key, **kwargs):
         self.delete_calls.append((payload, executor_info, keypair, private_key))
+        self.delete_options.append(kwargs)
         return self.delete_result
 
     async def recover_pod_after_stale_vloopback_mount(self, **kwargs):  # PodRecoverer
@@ -692,7 +694,7 @@ async def test_the_probe_holds_the_create_lock_from_the_idleness_re_read_until_i
             events.append("create")
             return await super().create_container(payload, executor_info, keypair, private_key)
 
-        async def delete_container(self, payload, executor_info, keypair, private_key):
+        async def delete_container(self, payload, executor_info, keypair, private_key, **kwargs):
             events.append("delete")
             return await super().delete_container(payload, executor_info, keypair, private_key)
 
@@ -811,6 +813,8 @@ async def test_success_records_every_step_tears_down_and_stamps_the_interval():
     assert (
         delete_payload.container_name == "pod_pod" and delete_payload.local_volume == "volume_pod"
     )
+    # this process cannot see a renter's create in the connector, so the teardown never prunes images
+    assert docker.delete_options == [{"prune_images": False}]
     assert redis.stamped()
     assert redis.expiries[f"rental_probe_ok:{EXECUTOR.uuid}"] == module._REDIS_STAMP_TTL_SECONDS
     probe_pod_id = docker.create_calls[0][0].pod_id
@@ -1261,7 +1265,7 @@ async def test_a_cancel_during_the_teardown_finishes_it_and_still_ends_the_run_c
     class SlowDeleteDocker(FakeDocker):
         delete_finished = False
 
-        async def delete_container(self, payload, executor_info, keypair, private_key):
+        async def delete_container(self, payload, executor_info, keypair, private_key, **kwargs):
             self.delete_calls.append((payload, executor_info, keypair, private_key))
             await asyncio.sleep(0.2)
             self.delete_finished = True

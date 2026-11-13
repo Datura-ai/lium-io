@@ -1563,6 +1563,7 @@ async def _teardown(ctx: Context, created: ContainerCreated, pod_id: str) -> str
                 ctx.executor,
                 ctx.config.validator_keypair,
                 ctx.executor_ssh_private_key_encrypted,
+                prune_images=False,  # this process cannot see a renter's create in the connector (lio#2226 review)
             ),
             timeout=_teardown_deadline_seconds(),
         )

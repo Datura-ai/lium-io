@@ -443,3 +443,17 @@ def test_a_failed_stop_request_is_reported_as_a_stop_failure(miner_service):
 
     assert isinstance(result, FailedContainerRequest)
     assert result.error_type == FailedContainerErrorTypes.ContainerStopFailed
+
+
+@pytest.mark.asyncio
+async def test_a_customer_create_fails_instead_of_pulling_beside_a_prune_still_running(mocker, miner_service):
+    # review: a prune that outlasts the wait can resume during the pull and remove the renter's image
+    payload = _make_create_payload(str(uuid4()))
+    mocker.patch("services.miner_service.customer_creates.wait_for_prunes", AsyncMock(return_value=False))
+    route = mocker.patch.object(miner_service, "_route_container", AsyncMock())
+
+    result = await miner_service.handle_container(payload)
+
+    route.assert_not_awaited()
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == FailedContainerErrorCodes.UnknownError
