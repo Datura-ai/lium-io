@@ -217,6 +217,20 @@ pf_fix() {
 
 host_path() { echo "${SYSBOX_SETUP_HOST_ROOT:-}$1"; }
 
+keep_needrestart_off_the_container_runtime() {
+    # an apt upgrade's needrestart restarts services whose libraries changed; restarting sysbox-mgr/sysbox-fs (or Docker)
+    # under running pods drops their /proc (sysbox-fs FUSE) and the uid-shift state, and the next container restart
+    # leaves the pod's files owned by nobody inside it (sudo and apt break). The provider restarts them in a window.
+    local dir
+    dir=$(host_path /etc/needrestart/conf.d)
+    mkdir -p "$dir" && cat > "$dir/lium-container-runtime.conf" <<'NRCONF'
+# Lium: never restart the container runtime under running pods; restart it in a maintenance window.
+$nrconf{override_rc}->{qr(^sysbox)} = 0;
+$nrconf{override_rc}->{qr(^docker)} = 0;
+$nrconf{override_rc}->{qr(^containerd)} = 0;
+NRCONF
+}
+
 self_cmd() {
     # how to run this script again: the file when there is one, else the one-liner (curl | bash). A leading VAR=VALUE
     # argument goes after sudo (sudo's env_reset drops variables set before it); the rest are the script's options.
@@ -1140,6 +1154,8 @@ if [ "$SKIP_INSTALL" = false ]; then
 else
     ok "Sysbox already installed, skipping."
 fi
+keep_needrestart_off_the_container_runtime && ok "apt (needrestart) never restarts sysbox, Docker or containerd." \
+    || warn "Could not write /etc/needrestart/conf.d/lium-container-runtime.conf; apt upgrades may restart sysbox under pods."
 
 # ── 5. Configure Docker ────────────────────────────────
 
