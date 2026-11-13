@@ -84,6 +84,9 @@ class JobResult(BaseModel):
     has_lium_filler: bool = False  # the backend lists at least one active Lium filler container on the node
     # the node's GPU configuration's average filler USD per GPU-hour; None = no usable sample
     filler_revenue_per_gpu_hour: float | None = None
+    # the averages feed sent a usable average for at least one configuration this cycle. Without it a missing
+    # average is a failed feed, not an unmeasured configuration, so an idle spot node is not seeded (DAH-5721)
+    filler_revenue_feed_ok: bool = False
     # DAH-5128: what Lium's fillers earn per hour in total on the node's GPU model; the most all its
     # idle spot nodes are paid together. None = no usable sample
     filler_revenue_usd_per_hour: float | None = None

@@ -91,6 +91,7 @@ def _spot(uuid: str = "spot-1", **overrides) -> JobResult:
             "is_on_spot_pay_list": True,
             "has_lium_filler": True,
             "filler_revenue_usd_per_hour": AMPLE_FILLER_EARNINGS,
+            "filler_revenue_feed_ok": True,
             **overrides,
         },
     )
@@ -110,9 +111,11 @@ async def _run(
 
 
 def _without_filler_averages(results: list[JobResult]) -> list[JobResult]:
-    # the same cycle with no spot pay and no floor top-up: neither is paid without an average
+    # the same cycle with no spot pay and no floor top-up: no floor without an average, and the spot
+    # nodes off the pay list (an unmeasured one is seeded with its secure rate)
     for result in results:
         result.filler_revenue_per_gpu_hour = None
+        result.is_on_spot_pay_list = False
     return results
 
 
@@ -347,13 +350,61 @@ async def test_spot_without_a_lium_filler_gets_zero():
 
 
 @pytest.mark.asyncio
-async def test_spot_whose_config_has_no_average_gets_zero():
-    spot = _spot(filler_revenue_per_gpu_hour=None)
+async def test_spot_whose_config_earned_zero_is_not_seeded_with_its_secure_rate():
+    spot = _spot(filler_revenue_per_gpu_hour=0.0, filler_revenue_usd_per_hour=0.0)
+
+    await _run([spot])
+
+    assert spot.incentive == 0.0
+    assert _logged(spot, "Spot-tier rate seeded") == []
+    # a measured zero records its own reason, as before seeding
+    assert _codes(spot) == [ZeroIncentiveReason.SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG]
+    assert any("fillers earned nothing" in line for line in spot.incentive_logs)
+
+
+@pytest.mark.asyncio
+async def test_spot_with_no_average_from_a_failed_feed_is_not_seeded():
+    # no usable average for any configuration (failed fetch, backend outage, older backend): keep the old result
+    spot = _spot(filler_revenue_per_gpu_hour=None, filler_revenue_usd_per_hour=None, filler_revenue_feed_ok=False)
+
+    await _run([spot])
+
+    assert spot.incentive == 0
+    assert _logged(spot, "Spot-tier rate seeded") == []
+    assert _codes(spot) == [ZeroIncentiveReason.SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG]
+
+
+@pytest.mark.asyncio
+async def test_secure_decision_does_not_seed_from_a_failed_feed(secure_decision_on):
+    spot = _spot(has_lium_filler=False, filler_revenue_per_gpu_hour=None, filler_revenue_feed_ok=False)
 
     await _run([spot])
 
     assert spot.incentive == 0
     assert _codes(spot) == [ZeroIncentiveReason.SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG]
+
+
+@pytest.mark.asyncio
+async def test_spot_whose_config_has_no_average_is_seeded_with_its_spot_ceiling():
+    # Fish 23 Oct: every GPU model gets idle pay; the seed is not scaled down by the model's (tiny) earnings.
+    # The seed is the spot ceiling, SPOT_IDLE_SECURE_RATE_SHARE of the secure rate, like any spot rate
+    spot = _spot(filler_revenue_per_gpu_hour=None, filler_revenue_usd_per_hour=None)
+    measured = _spot("spot-2", filler_revenue_per_gpu_hour=2.0, filler_revenue_usd_per_hour=4.0)
+
+    incentive = await _run([spot, measured])
+
+    seed = rental_price.SPOT_IDLE_SECURE_RATE_SHARE * HOURLY_RATE
+    # the seeded node takes a Spot cap slot (lium-io#2133): 16 idle Spot GPUs in the 8-GPU cap halve both rates
+    assert incentive.spot_count_by_bucket[("H100", 8)] == 16
+    assert spot.spot_cap_multiplier == measured.spot_cap_multiplier == pytest.approx(0.5)
+    assert spot.effective_rate == pytest.approx(seed * 0.5)
+    assert spot.spot_pool_multiplier == pytest.approx(1.0)
+    assert spot.incentive > 0
+    assert _codes(spot) == []
+    assert _logged(spot, "Spot-tier rate seeded")[0]["spot_rate_seed"] == pytest.approx(seed)
+    # the measured node still shares only its model's filler earnings
+    assert measured.spot_pool_multiplier == pytest.approx(4.0 / 8.0)
+    _assert_pool_pays_exactly(incentive)
 
 
 @pytest.mark.asyncio
@@ -409,7 +460,8 @@ async def test_unpaid_spot_gpus_take_no_cap_slot():
 
     assert incentive.spot_count_by_bucket[("H100", 8)] == 8
     assert paid.effective_rate == pytest.approx(SPOT_FACTOR * 2.0)
-    assert old_driver.effective_rate == no_filler_pay.effective_rate == 0
+    assert old_driver.effective_rate == 0
+    assert not no_filler_pay.effective_rate  # a measured zero is not priced at all (DAH-5721)
 
 
 @pytest.mark.asyncio
@@ -495,13 +547,14 @@ async def test_secure_decision_pays_an_idle_spot_node_no_lium_filler_runs_on(sec
 
 
 @pytest.mark.asyncio
-async def test_secure_decision_keeps_the_spot_amount_and_its_missing_average(secure_decision_on):
-    spot = _spot(filler_revenue_per_gpu_hour=None)
+async def test_secure_decision_seeds_a_spot_node_with_no_average(secure_decision_on):
+    spot = _spot(has_lium_filler=False, filler_revenue_per_gpu_hour=None)
 
     await _run([spot])
 
-    assert spot.incentive == 0
-    assert _codes(spot) == [ZeroIncentiveReason.SPOT_NO_FILLER_REVENUE_FOR_GPU_CONFIG]
+    assert spot.effective_rate == pytest.approx(rental_price.SPOT_IDLE_SECURE_RATE_SHARE * HOURLY_RATE)
+    assert spot.incentive > 0
+    assert _codes(spot) == []
 
 
 @pytest.mark.asyncio
@@ -1316,8 +1369,10 @@ async def test_an_estimate_from_the_snapshot_is_not_scaled_by_spot_pay(caplog):
 # ── the backend's per-configuration average ──────────────────────────────────
 
 
-def _rented_data(*entries: FillerRevenueByGpuConfig) -> RentedExecutorsResponse:
-    return RentedExecutorsResponse(executors={}, filler_revenue_by_gpu_config=list(entries))
+def _rented_data(*entries: FillerRevenueByGpuConfig, complete: bool = True) -> RentedExecutorsResponse:
+    return RentedExecutorsResponse(
+        executors={}, filler_revenue_by_gpu_config=list(entries), filler_revenue_complete=complete
+    )
 
 
 def test_average_is_read_for_the_exact_configuration():
@@ -1346,7 +1401,7 @@ def test_thin_sample_reads_as_no_average():
     assert data.get_filler_revenue_per_gpu_hour("H100", 8, 24.5) is None
 
 
-@pytest.mark.parametrize("value", [0.0, -1.0, math.nan, math.inf])
+@pytest.mark.parametrize("value", [-1.0, math.nan, math.inf])
 def test_unusable_average_reads_as_no_average(value):
     data = _rented_data(
         FillerRevenueByGpuConfig(
@@ -1355,6 +1410,40 @@ def test_unusable_average_reads_as_no_average(value):
     )
 
     assert data.get_filler_revenue_per_gpu_hour("H100", 8, 24) is None
+
+
+@pytest.mark.parametrize(
+    ("entries", "expected"),
+    [
+        ([], False),  # an older backend's default, or nothing sent
+        ([FillerRevenueByGpuConfig(base_model="H100", gpu_count=8, usd_per_gpu_hour=1.0, gpu_hours=10)], False),
+        ([FillerRevenueByGpuConfig(base_model="H100", gpu_count=8, usd_per_gpu_hour=math.nan, gpu_hours=100)], False),
+        ([FillerRevenueByGpuConfig(base_model="H100", gpu_count=8, usd_per_gpu_hour=0.0, gpu_hours=100)], True),
+    ],
+)
+def test_the_feed_is_live_only_with_a_usable_average(entries, expected):
+    data = _rented_data(*entries)
+
+    assert data.has_filler_revenue_averages(24) is expected
+
+
+def test_a_partial_or_stale_feed_seeds_nobody():
+    # usable averages, but the backend did not mark the feed fresh and complete (a stale rate, the TSDB unread, an
+    # older backend): a configuration missing from it may be a gap, not unmeasured
+    data = _rented_data(
+        FillerRevenueByGpuConfig(base_model="H100", gpu_count=8, usd_per_gpu_hour=1.0, gpu_hours=100), complete=False
+    )
+
+    assert data.has_filler_revenue_averages(24) is False
+    assert RentedExecutorsResponse(executors={}).filler_revenue_complete is False
+
+
+def test_a_measured_zero_average_is_zero_not_unmeasured():
+    data = _rented_data(
+        FillerRevenueByGpuConfig(base_model="H100", gpu_count=8, usd_per_gpu_hour=0.0, gpu_hours=100)
+    )
+
+    assert data.get_filler_revenue_per_gpu_hour("H100", 8, 24) == 0.0
 
 
 async def _handled(

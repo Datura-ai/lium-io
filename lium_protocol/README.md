@@ -6,7 +6,7 @@ The validator↔backend wire, once. Pydantic v2 models for:
 - `lium_protocol.backend_to_validator` — every message the backend sends down that socket (`BackendMessageType`, 19 types: container lifecycle, ssh keys, backups, Jupyter, the estimate request, the staging-only forced cycle, the one-node recheck), plus the three typeless replies it sends there (`SOCKET_REPLIES`: `Response`, `RentedMachineResponse`, `RevenuePerGpuTypeResponse` — no `message_type`, told apart by the request the validator is waiting for).
 - `lium_protocol.http` — the bodies of the backend HTTP API the validator reads between cycles (`HTTP_MODELS`, 10 bodies).
 
-No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`2.13.0`) is semver over the wire.
+No application code: nothing here imports the validator or the backend. `PROTOCOL_VERSION` (`2.14.0`) is semver over the wire.
 
 ## Using it
 
@@ -71,6 +71,7 @@ Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The 
 - `2.10.0` — `ExecutorSpecRequest.host_runtime_fault` (optional): this cycle's DinD test container started on the host and its sshd never answered, so the host's container runtime is failing. False for a refused `docker run` or an error on the validator's side; None from an older validator.
 - `2.11.0` — `ExecutorSpecRequest.check_started_at` (optional): when an express recheck outside the cycle started. Its `job_batch_id` stays the cycle's, so the uptime and finished-jobs counters do not move; the backend judges the end of a provider maintenance window by this time instead of the cycle's start. None for a cycle's own report and from an older validator.
 - `2.13.0` — `ContainerCreated.command_id` (optional, default empty): the `ContainerCreateRequest`'s `command_id`, echoed. `ExecutorRentFinishedRequest.create_command_id` (optional, default empty): the backend names in it the `ContainerCreated.command_id` the receipt answers. It is not `command_id`, which the validator dedupes requests on. The backend applies a success only for the pod's current create; an older one gets its receipt alone. The validator clears only the pending state of the dispatch a receipt names, and the `ResumedCreatesReport` goes once every success replayed ahead of it has its receipt. Empty on either side: as before.
+- `2.14.0` — `RentedExecutorsResponse.filler_revenue_complete` (optional, default False): the backend computed `filler_revenue_by_gpu_config` now from every filler run of its window, each run priced. Only then does the validator treat a configuration missing from it as unmeasured and seed its spot pay; a partial or stale feed and an older backend send False, and such a configuration is not paid.
 - `1.0.0` — first release.
 
 ## Tests

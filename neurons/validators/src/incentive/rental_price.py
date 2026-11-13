@@ -287,6 +287,7 @@ class RentalPriceIncentive(DefaultIncentive):
         self.unbucketed_paid_fraction = 1.0
         # Idle spot nodes priced this cycle, scaled to their GPU model's filler earnings once all are known.
         self._spot_pay_candidates: list[tuple[str, JobResult]] = []
+        self._spot_seeded: list[JobResult] = []
         # DAH-5944: idle spot GPUs per (base_model, bucket), a pool of their own under the secure caps.
         self.spot_count_by_bucket: dict[tuple[str, int], int] = {}
         # every Spot node counted there, diluted by _dilute_spot_pay_over_cap whichever pay list it is on
@@ -1117,7 +1118,11 @@ class RentalPriceIncentive(DefaultIncentive):
                         hotkey,
                         result,
                         secure_rate=self._spot_secure_rate(result),
-                        filler_rate=FILLER_REVENUE_PAY_FACTOR * result.filler_revenue_per_gpu_hour,
+                        filler_rate=(
+                            self._spot_secure_rate(result)
+                            if result.filler_revenue_per_gpu_hour is None
+                            else FILLER_REVENUE_PAY_FACTOR * result.filler_revenue_per_gpu_hour
+                        ),
                         paid_fraction=self.unbucketed_paid_fraction,
                         pay_factor=FILLER_REVENUE_PAY_FACTOR,
                         secure_share=SPOT_IDLE_SECURE_RATE_SHARE,
@@ -1245,9 +1250,10 @@ class RentalPriceIncentive(DefaultIncentive):
     def _qualify_spot_node(job_result: JobResult, excluded_from_both_pools: bool) -> JobResult:
         """An idle spot node is never in the mining pool and never in a secure bucket. It is paid from
         unbucketed_share, on top of the burn-capped rental share, priced in _price_spot_node, only
-        while it runs a Lium filler and its GPU configuration has a filler revenue average. The
-        idle-pool gates do not apply: the node is paid for the filler work it does, not for being
-        listed for rent."""
+        while it runs a Lium filler. A configuration with no filler average yet is seeded with its spot
+        ceiling (DAH-5721); one whose average is a measured zero, or any node while the averages feed sent
+        nothing usable, is not paid (_spot_average_rules_out). The idle-pool gates do not apply: the node is
+        paid for the filler work it does, not for being listed for rent."""
         job_result.eligible_for_rental_share = False
         job_result.mining_score = 0
         if excluded_from_both_pools or not (job_result.score > 0 or job_result.job_score > 0):
@@ -1256,13 +1262,27 @@ class RentalPriceIncentive(DefaultIncentive):
         if not job_result.has_lium_filler:
             job_result.record_incentive_log(MinerLogLine.no_payout_because_spot_without_lium_filler(job_result))
             return job_result
-        if job_result.filler_revenue_per_gpu_hour is None:
-            job_result.record_incentive_log(
-                MinerLogLine.no_payout_because_spot_no_filler_revenue_for_gpu_config(job_result)
-            )
+        if RentalPriceIncentive._spot_average_rules_out(job_result):
             return job_result
         job_result.spot_pay_candidate = True
         return job_result
+
+    @staticmethod
+    def _spot_average_rules_out(job_result: JobResult) -> bool:
+        """Record why an idle spot node is not paid on its filler average, if it is not: a measured zero (its
+        configuration's fillers earned nothing), or no average while the feed sent no usable average at all (a failed
+        fetch, a backend data outage, an older backend), which keeps the result from before seeding."""
+        if job_result.filler_revenue_per_gpu_hour == 0:
+            job_result.record_incentive_log(
+                MinerLogLine.no_payout_because_spot_filler_revenue_is_zero_for_gpu_config(job_result)
+            )
+            return True
+        if job_result.filler_revenue_per_gpu_hour is None and not job_result.filler_revenue_feed_ok:
+            job_result.record_incentive_log(
+                MinerLogLine.no_payout_because_spot_no_filler_revenue_for_gpu_config(job_result)
+            )
+            return True
+        return False
 
     @staticmethod
     def _qualify_spot_node_by_the_secure_decision(job_result: JobResult) -> JobResult:
@@ -1271,10 +1291,7 @@ class RentalPriceIncentive(DefaultIncentive):
         would not be paid for takes the unrented not-paid path in calculate_executor_score."""
         job_result.eligible_for_rental_share = False
         job_result.mining_score = 0
-        if job_result.filler_revenue_per_gpu_hour is None:
-            job_result.record_incentive_log(
-                MinerLogLine.no_payout_because_spot_no_filler_revenue_for_gpu_config(job_result)
-            )
+        if RentalPriceIncentive._spot_average_rules_out(job_result):
             return job_result
         job_result.spot_pay_candidate = True
         return job_result
@@ -1287,7 +1304,10 @@ class RentalPriceIncentive(DefaultIncentive):
         runtime and driver is listed at, before secure bucket-cap dilution. It is 0 where a secure
         node of this configuration earns no idle pay, so the min() pays 0 there. Spot GPUs are
         then capped per (GPU model, bucket) at the secure caps, in a pool of their own
-        (_dilute_spot_pay_over_cap, DAH-5944).
+        (_dilute_spot_pay_over_cap, DAH-5944), seeded nodes included.
+        A configuration with no filler average yet is seeded with SPOT_IDLE_SECURE_RATE_SHARE x the secure
+        rate (Fish 23 Oct: every GPU model gets idle pay); the seed takes the spot cap but is not scaled to the
+        model's filler earnings.
         """
         base_model: str = self.get_base_model_for_gpu(result.gpu_model)
         cap_spec: dict[int, int] = self.config.max_unrented_gpus.get(base_model, {})
@@ -1309,15 +1329,22 @@ class RentalPriceIncentive(DefaultIncentive):
         else:
             result.hourly_rate = self._listed_hourly_rate(result)
         self._record_zero_driver_and_sysbox_reasons(result, result.driver_multiplier, result.sysbox_multiplier)
-        result.effective_rate = min(
-            FILLER_REVENUE_PAY_FACTOR * result.filler_revenue_per_gpu_hour,
-            self._spot_secure_rate(result),
+        seeded: bool = result.filler_revenue_per_gpu_hour is None
+        result.effective_rate = (
+            self._spot_secure_rate(result)
+            if seeded
+            else min(FILLER_REVENUE_PAY_FACTOR * result.filler_revenue_per_gpu_hour, self._spot_secure_rate(result))
         )
         # only paid GPUs take cap slots: a zero driver/sysbox multiplier or filler average pays 0 and dilutes nobody
         if result.effective_rate > 0 and result.spot_cap > 0:
             key: tuple[str, int] = (base_model, bucket)
             self.spot_count_by_bucket[key] = self.spot_count_by_bucket.get(key, 0) + result.gpu_count
             self._spot_cap_members.append((base_model, result))
+        if seeded:
+            result.spot_pool_multiplier = 1.0
+            result.record_incentive_log(MinerLogLine.spot_rate_seeded_from_secure_rate(result))
+            self._spot_seeded.append(result)
+            return
         self._spot_pay_candidates.append((base_model, result))
 
     def _dilute_spot_pay_over_cap(self) -> None:
@@ -1360,7 +1387,8 @@ class RentalPriceIncentive(DefaultIncentive):
             result.spot_pool_multiplier = multiplier
             result.effective_rate *= multiplier
             total += result.gpu_count * result.effective_rate
-        return total
+        # a seeded node's pool is its own seed x gpu_count, so the scaling above keeps it whole
+        return total + sum(r.gpu_count * r.effective_rate for r in self._spot_seeded)
 
     @staticmethod
     def _spot_secure_rate(result: JobResult) -> float:

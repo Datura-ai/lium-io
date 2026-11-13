@@ -213,8 +213,13 @@ class RentedExecutorsResponse(BaseModel):
     # field force-passes nobody (fail-closed) rather than everybody.
     manual_rental_executors: dict[str, ManualRentalInfo] = {}
     # Average filler revenue per GPU configuration: what the spot-node pay and the secure floor are
-    # measured against. Defaults to empty so an older backend pays spot nodes nothing, as before.
+    # measured against. Defaults to empty: an older backend (or a feed with no usable average) reads as a failed
+    # feed, so no spot node is seeded and none is paid, as before (has_filler_revenue_averages).
     filler_revenue_by_gpu_config: list[FillerRevenueByGpuConfig] = []
+    # True only when the backend computed the averages now from every filler run of the window with each run priced
+    # (fresh rates, the earnings TSDB read). A partial or stale feed, and an older backend, send False: then a missing
+    # configuration may be a gap in the feed rather than unmeasured, so it is not seeded.
+    filler_revenue_complete: bool = False
     # executor_id → the hotkey the backend lists the executor under. Only that hotkey may take over a
     # verified record stored under the bare executor id (RedisService.get_verified_job_info).
     executor_owner_hotkeys: dict[str, str] = {}
@@ -233,7 +238,8 @@ class RentedExecutorsResponse(BaseModel):
         self, base_model: str | None, gpu_count: int, min_gpu_hours: float
     ) -> float | None:
         """The configuration's average filler USD per GPU-hour, or None when there is no usable
-        sample: no entry, a sample under min_gpu_hours, or a value that is not a positive number."""
+        sample: no entry, a sample under min_gpu_hours, or a value that is negative or not finite. A measured
+        zero stays 0.0: that configuration's Default Jobs earned nothing, which is not "unmeasured"."""
         if not base_model:
             return None
         for entry in self.filler_revenue_by_gpu_config:
@@ -241,10 +247,19 @@ class RentedExecutorsResponse(BaseModel):
                 continue
             if not entry.gpu_hours >= min_gpu_hours:
                 return None
-            if not (entry.usd_per_gpu_hour > 0 and math.isfinite(entry.usd_per_gpu_hour)):
+            if not (entry.usd_per_gpu_hour >= 0 and math.isfinite(entry.usd_per_gpu_hour)):
                 return None
             return entry.usd_per_gpu_hour
         return None
+
+    def has_filler_revenue_averages(self, min_gpu_hours: float) -> bool:
+        """The backend marks the feed fresh and complete and it carries a usable average for at least one
+        configuration. Otherwise a configuration without an average may be a gap in a failed, partial or stale
+        feed, not an unmeasured configuration, so it is not seeded."""
+        return self.filler_revenue_complete and any(
+            entry.gpu_hours >= min_gpu_hours and entry.usd_per_gpu_hour >= 0 and math.isfinite(entry.usd_per_gpu_hour)
+            for entry in self.filler_revenue_by_gpu_config
+        )
 
     def get_filler_revenue_usd_per_hour(self, base_model: str | None, min_gpu_hours: float) -> float | None:
         """What Lium's fillers earned per hour in total on a GPU model, over every configuration with a

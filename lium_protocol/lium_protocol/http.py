@@ -111,6 +111,9 @@ class RentedExecutorsResponse(pydantic.BaseModel):
     manual_rental_executors: dict[str, ManualRentalInfo] = {}
     # average filler revenue per GPU configuration, read by the spot-node pay and the secure floor
     filler_revenue_by_gpu_config: list[FillerRevenueByGpuConfig] = []
+    # the averages above were computed now from every filler run of the window, each run priced: a configuration
+    # absent from a complete feed ran no filler, so it is unmeasured; False for a partial or stale feed, an older backend
+    filler_revenue_complete: bool = False
     # executor_id → the hotkey its node is listed under (pool hotkey for a custodied account), for
     # every listed executor; the validator's verified record treats a write by any other hotkey as foreign
     executor_owner_hotkeys: dict[str, str] = {}
