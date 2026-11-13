@@ -91,6 +91,7 @@ from .checks import (
     PidHostRequiredCheck,
     SysboxRequiredCheck,
     TdxHostCheck,
+    RentedMidCycleCheck,
     TenantEnforcementCheck,
     UploadFilesCheck,
     VerifyXCheck,
@@ -426,6 +427,8 @@ class PipelineFactory:
                 # DAH-4663: idle nodes only; resets a leftover clock lock or unlists the node
                 GpuClockLockCheck(),
                 GpuUsageCheck(),
+                # A node rented since the cycle started halts here, before the GPU and network tests.
+                RentedMidCycleCheck(),
                 # liumd phase 1 (DAH-2834): one signed `POST /verify` runs the VerifyX and matmul
                 # challenges on the executor side by side; the two checks below consume a judged,
                 # passing answer and run over SSH otherwise. Off by default, never fatal.
@@ -433,6 +436,8 @@ class PipelineFactory:
                 VerifyXCheck(),
                 # DAH-4961: the listing's disk floor, judged on the figure VerifyX just published (idle nodes only)
                 DiskSpaceCheck(),
+                # again before the matmul: VerifyX takes minutes, and a rent can land meanwhile
+                RentedMidCycleCheck(),
                 CapabilityCheck(),
                 # DAH-3035: the kernel-fault probe right after the matmul it complements — same idle,
                 # capability-verified population, same filler skip. Flag-gated, shadow-first, off by default.
@@ -563,9 +568,11 @@ class PipelineFactory:
                 # DAH-4663: idle nodes only; resets a leftover clock lock or unlists the node
                 GpuClockLockCheck(),
                 GpuUsageCheck(),
+                RentedMidCycleCheck(),
                 LocalVerifyCheck(),
                 VerifyXCheck(),
                 DiskSpaceCheck(),
+                RentedMidCycleCheck(),
                 ParallelStage(
                     [
                         [

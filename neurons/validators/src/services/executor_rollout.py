@@ -539,9 +539,13 @@ def has_renter_gpu_reset_holds(job_results: dict[str, list[JobResult]]) -> bool:
     return any(_held_for_renter_gpu_reset(result) for results in job_results.values() for result in results)
 
 
-# a cycle that cannot tell the node's state gives no verdict: the renter's GPU reset (DAH-4658), or a power tier
-# reading whose clear was not confirmed (F-43)
-_HELD_REASONS = (MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason, GpuPowerLimitMessages.TIER_STATE_UNKNOWN.reason)
+# a cycle that cannot tell the node's state gives no verdict: the renter's GPU reset (DAH-4658), a power tier
+# reading whose clear was not confirmed (F-43), or a pod created while the run was going
+_HELD_REASONS = (
+    MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason,
+    GpuPowerLimitMessages.TIER_STATE_UNKNOWN.reason,
+    TenantEnforcementMessages.RENTED_SINCE_CYCLE_START.reason,
+)
 
 
 def _held_for_renter_gpu_reset(result: JobResult) -> bool:
@@ -668,10 +672,12 @@ async def _last_scored_result(
         return None
 
 
-async def remember_rented_scored_results(
+async def remember_scored_results(
     job_results: dict[str, list[JobResult]], redis_service: RedisService
 ) -> None:
-    """DAH-4658: keep each rented node's scored result of this cycle for `carry_renter_gpu_reset_results`.
+    """DAH-4658: keep each node's scored result of this cycle for `carry_renter_gpu_reset_results`.
+
+    Idle nodes too: a node rented while its run goes on is held, and its idle result of the cycle before stands.
 
     Any other standing result drops the kept one, so only the cycle right before a reset is carried.
     A carried result is not kept again, so the TTL bounds how long one result can stand in. A Redis
@@ -683,7 +689,7 @@ async def remember_rented_scored_results(
             if result.carried_for_renter_gpu_reset:
                 continue
             key = last_scored_result_key(miner_hotkey, result.executor_info.uuid)
-            if result.is_rented and result.is_successful:
+            if result.is_successful:
                 writes.set(key, result.model_dump_json(), ex=LAST_SCORED_RESULT_TTL_SECONDS)
             else:
                 writes.delete(key)

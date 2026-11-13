@@ -57,6 +57,7 @@ from payload_models.payloads import (
     ResetPodGpuRequest,
     JupyterServerInstalled,
     JupyterInstallationFailed,
+    WorkloadKind,
 )
 from protocol.vc_protocol.compute_requests import (
     Error,
@@ -1224,6 +1225,7 @@ class ComputeClient:
             if inflight_creates.is_running(job_request.pod_id):
                 self.deleted_pod_ids.add(job_request.pod_id)
             await self._retire_backend_create_records_of_pod(job_request.pod_id)
+            await self._rent_requested(job_request, mark=False)
         if not isinstance(job_request, ContainerCreateRequest):
             return await self._drive_miner_job(job_request)
         with inflight_creates.track(job_request.pod_id):
@@ -1247,8 +1249,14 @@ class ComputeClient:
             if not await self._write_backend_create_record(pod_id, add):
                 retrying = asyncio.ensure_future(self._retry_backend_create_record(pod_id, add))
             create_id_token = renter_create_id.set(create_id)  # the create lock's owner, see executor_create_exclusion
+            if job_request.workload_kind == WorkloadKind.CUSTOMER_RENTAL:
+                # the validation cycle on this node stops its GPU and network tests for the renter
+                await self._rent_requested(job_request, mark=True)
             try:
                 return await self._drive_miner_job(job_request)
+            except BaseException:
+                await self._rent_requested(job_request, mark=False)
+                raise
             finally:
                 renter_create_id.reset(create_id_token)
                 if retrying is not None:
@@ -1414,6 +1422,15 @@ class ComputeClient:
         # after its pending mark and create lock expired, and a leftover one would veto it for good
         while not await self._write_backend_create_record(pod_id, write):
             await asyncio.sleep(BACKEND_CREATE_TRACKING_RETRY_SECONDS)
+
+    async def _rent_requested(self, job_request: ContainerCreateRequest | ContainerDeleteRequest, mark: bool) -> None:
+        """Mark a renter's create, or clear it once the create failed or the pod went; best effort, the TTL backs it."""
+        redis_service = self.miner_service.redis_service
+        args = (job_request.miner_hotkey, str(job_request.executor_id), job_request.pod_id)
+        try:
+            await (redis_service.mark_rent_requested(*args) if mark else redis_service.clear_rent_requested(*args))
+        except Exception as exc:
+            self._log_backend_create_tracking_error(job_request.pod_id, exc)
 
     def _log_backend_create_tracking_error(self, pod_id: str, exc: Exception) -> None:
         logger.error(
@@ -1629,6 +1646,7 @@ class ComputeClient:
                 # the backend fences a failure on the create it answers: a late failure of an earlier create (a
                 # reboot the backend already gave up on) must not fail or exempt the one that replaced it
                 response.command_id = job_request.command_id
+                await self._rent_requested(job_request, mark=False)
                 # kept before it is queued: a socket that replaces this one mid-command must already find it
                 if _is_host_fault_failure(raw := response.model_dump_json()):
                     try:

@@ -33,6 +33,9 @@ from .runner import SSHCommandResult, SSHCommandRunner
 
 logger = logging.getLogger(__name__)
 
+# how often a step with `stops_on_rent` looks for a renter's create on its node: a renter waits this long at most
+RENT_POLL_SECONDS = 5
+
 @runtime_checkable
 class PodRecoverer(Protocol):
     # The slice of DockerService the rented-machine check and the rental probe need. Declared here
@@ -552,6 +555,10 @@ class ParallelStage:
     def checks(self) -> list[Check]:
         return [chk for lane in self.lanes for chk in lane]
 
+    @property
+    def stops_on_rent(self) -> bool:
+        return any(getattr(chk, "stops_on_rent", False) for chk in self.checks)
+
     async def run(self, ctx: Context) -> CheckResult:
         # The pipeline runs the lanes itself (Pipeline._run_step); a stage is not a check of its own.
         raise NotImplementedError("ParallelStage is run by Pipeline, lane by lane")
@@ -814,7 +821,33 @@ class Pipeline:
             updates["state"] = merge_state(current_ctx.state, ran.before_state, updates["state"])
         return current_ctx.model_copy(update=updates)
 
+    async def _run_step_unless_rented(
+        self, step: Check | ParallelStage, ctx: Context
+    ) -> tuple[list[_RanCheck], Context, str | None]:
+        """Run the step; one with `stops_on_rent` is cancelled once a renter's create marks the node, and the pod is
+        returned. A cancelled step's own cleanup (the remote matmul kill) runs before this returns."""
+        from .checks.rented_mid_cycle import rent_requested_since_cycle_start  # the checks import this module
+
+        task = asyncio.ensure_future(self._run_step_surviving_a_dropped_session(step, ctx))
+        try:
+            while getattr(step, "stops_on_rent", False):
+                done, _ = await asyncio.wait({task}, timeout=RENT_POLL_SECONDS)
+                if done:
+                    break
+                pod = await rent_requested_since_cycle_start(ctx)
+                if pod:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    return [], ctx, pod
+            ran_checks, after = await task
+            return ran_checks, after, None
+        finally:
+            # this run cancelled from outside: the step goes with it
+            task.cancel()
+
     async def run(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
+        from .checks.rented_mid_cycle import rented_since_cycle_start_event
+
         events: list[ValidationEvent] = []
         current_ctx = ctx
         pipeline_start_time = time.perf_counter()
@@ -823,7 +856,12 @@ class Pipeline:
 
         for index, step in enumerate(self.checks):
             parallel = isinstance(step, ParallelStage)
-            ran_checks, current_ctx = await self._run_step_surviving_a_dropped_session(step, current_ctx)
+            ran_checks, current_ctx, rented_pod = await self._run_step_unless_rented(step, current_ctx)
+            if rented_pod:
+                event = rented_since_cycle_start_event(current_ctx, rented_pod)
+                await self.sink.emit(event)
+                events.append(event)
+                return False, events, current_ctx
             for ran in ran_checks:
                 ran.result.event.context["execution_time_ms"] = int((ran.finished - ran.started) * 1000)
                 ran.result.event.context["elapsed_time_ms"] = int((ran.finished - pipeline_start_time) * 1000)

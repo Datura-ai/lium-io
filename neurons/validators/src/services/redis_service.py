@@ -110,6 +110,18 @@ def create_started_at_key(miner_hotkey: str, executor_id: str) -> str:
     return f"{CREATE_STARTED_AT_PREFIX}:{miner_hotkey}:{executor_id}"
 
 
+# a renter's create, from the connector's receipt of it until it fails: the GPU and network tests stop for it
+RENT_REQUESTED_PREFIX = "rent_requested"
+# A run that began before the create lasts at most JOB_TIME_OUT, so it is stopped or over by then; one minute more
+# covers the poll. Longer would skip the next cycle, whose rented list already carries the pod, for nothing. A mark a
+# crash left behind ends with it.
+RENT_REQUESTED_TTL_SECONDS = settings.JOB_TIME_OUT + 60
+
+
+def rent_requested_key(miner_hotkey: str, executor_id: str) -> str:
+    return f"{RENT_REQUESTED_PREFIX}:{miner_hotkey}:{executor_id}"
+
+
 # VerifyX runs the validator cut off and could not clean up: hash of run_dir -> epoch, reaped before the next run
 VERIFYX_STALE_RUNS_PREFIX = "verifyx_stale_runs"
 VERIFYX_STALE_RUNS_TTL_SECONDS = 7 * 24 * 3600
@@ -1044,6 +1056,16 @@ class RedisService:
         await self._update_pending_pods(miner_hotkey, executor_id, lambda pending_pods: [*pending_pods, item], stamp)
         if superseded is not None and _saved_command_id(superseded) != command_id:
             await self.remove_unacked_container_created(pod_id, superseded)
+
+    async def mark_rent_requested(self, miner_hotkey: str, executor_id: str, pod_id: str) -> None:
+        await self.set(rent_requested_key(miner_hotkey, executor_id), pod_id, ex=RENT_REQUESTED_TTL_SECONDS)
+
+    async def clear_rent_requested(self, miner_hotkey: str, executor_id: str, pod_id: str) -> None:
+        """Only this pod's mark: a later create on the node keeps its own."""
+        key = rent_requested_key(miner_hotkey, executor_id)
+        held = await self.get(key)
+        if held is not None and (held.decode() if isinstance(held, bytes) else held) == pod_id:
+            await self.delete(key)
 
     async def remove_pending_pod(
         self, miner_hotkey: str, executor_id: str, pod_id: str, command_id: str = "", kind: str | None = None

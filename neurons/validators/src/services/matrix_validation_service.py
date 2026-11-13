@@ -340,18 +340,10 @@ class ValidationService:
         # One SSH channel per card on a single connection, so the fan-out has to stay under the
         # executor's sshd MaxSessions (OpenSSH defaults to 10). A 12-14 card host would otherwise
         # push the tail channels into the ssh_error branch and read as a failed work-proof.
-        gate = asyncio.Semaphore(MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS)
-
-        async def run_gated(index: int, challenge: MatmulChallenge) -> dict:
-            async with gate:
-                return await self._run_one_card(
-                    ssh_client, executor_info, script_path, index, challenge, card_uuids[index]
-                )
-
         start = time.perf_counter()
         try:
-            per_card = await asyncio.gather(
-                *(run_gated(index, challenge) for index, challenge in enumerate(challenges))
+            per_card = await self._run_cards(
+                ssh_client, executor_info, script_path, challenges, card_uuids
             )
         finally:
             for challenge in challenges:
@@ -439,6 +431,38 @@ class ValidationService:
             return None
         return challenge
 
+    async def _run_cards(
+        self,
+        ssh_client,
+        executor_info,
+        script_path: str,
+        challenges: list["MatmulChallenge"],
+        card_uuids: list[str] | None = None,
+    ) -> list[dict]:
+        gate = asyncio.Semaphore(MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS)
+        kills: list[str] = []
+
+        async def run_gated(index: int, challenge: "MatmulChallenge") -> dict:
+            async with gate:
+                card_uuid = card_uuids[index] if card_uuids else ""
+                return await self._run_one_card(
+                    ssh_client, executor_info, script_path, index, challenge, card_uuid, kills
+                )
+
+        try:
+            return await asyncio.gather(
+                *(run_gated(index, challenge) for index, challenge in enumerate(challenges))
+            )
+        except asyncio.CancelledError:
+            # a rent cancelled the recheck: one kill for every started card over ONE session, since the
+            # still-running card sessions hold the rest of sshd's MaxSessions (a kill per card is refused)
+            if kills:
+                try:
+                    await asyncio.shield(ssh_client.run("; ".join(kills), timeout=10))
+                except Exception:  # noqa: BLE001 — the cancel goes on whether the kill landed or not
+                    pass
+            raise
+
     async def _run_one_card(
         self,
         ssh_client,
@@ -447,6 +471,7 @@ class ValidationService:
         index: int,
         challenge: "MatmulChallenge",
         card_uuid: str = "",
+        kills: list[str] | None = None,
     ) -> dict:
         # run the challenge pinned to one card (its UUID; the index when the card has none); a count
         # lie fails device selection here or serialises onto the one real card, caught by the
@@ -456,6 +481,11 @@ class ValidationService:
         command = (
             f"CUDA_VISIBLE_DEVICES={pin} {executor_info.python_path} {script_path} {challenge.params}"
         )
+        from services.task.runner import pid_tagged  # services.task imports this module
+
+        command, kill = pid_tagged(command)
+        if kills is not None:
+            kills.append(kill)  # _run_cards sends every started card's kill at once on a cancel
         try:
             result = await ssh_client.run(command, timeout=MATRIX_VERIFY_TIMEOUT_SECONDS)
         except (TimeoutError, asyncssh.TimeoutError):

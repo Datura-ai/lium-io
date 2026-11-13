@@ -60,7 +60,7 @@ class _ProbeSequence:
         self.calls = 0
 
     async def validate_verifyx_and_process_job(
-        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None
+        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None, **_
     ):
         self.calls += 1
         self.run_dir = run_dir
@@ -379,6 +379,26 @@ async def test_a_retry_run_does_not_start_on_a_host_whose_timeout_lacks_k(tmp_pa
     assert not (tmp_path / ".vx-run").exists()
 
 
+@pytest.mark.parametrize("has_k", [True, False])
+@pytest.mark.asyncio
+async def test_the_first_sample_runs_with_or_without_timeout_k(tmp_path, monkeypatch, has_k):
+    # the first sample must not fail on a host whose `timeout` lacks -k: it runs as it did before run_dir
+    if not has_k:
+        _timeout_without_k(tmp_path, monkeypatch)
+    executor = _fake_python(tmp_path, "pwd; [ -f pid ] && echo has-pid; exit 3")
+    service = VerifyXValidationService()
+    command = service._verifyx_command(
+        executor, SimpleNamespace(seed=1, cipher_text="c"), "lib", ".vx-run", deadline_optional=True
+    )
+
+    capture = await service._run_ssh_command(_LocalShell(tmp_path), command)
+
+    assert capture.exit_status == 3
+    # either way in its own run dir with its PID on record, so a rent's cancel can kill it; only the -k deadline is dropped
+    assert capture.stdout.split() == [str(tmp_path / ".vx-run"), "has-pid"]
+    assert not (tmp_path / ".vx-run").exists()
+
+
 @pytest.mark.asyncio
 async def test_killing_a_cut_off_retry_during_the_disk_test_spares_other_processes(tmp_path):
     # the disk test writes ./temp_<ts>.dat and removes it only when it finishes; SIGKILL skips that
@@ -449,9 +469,10 @@ class _HungRetryService(VerifyXValidationService):
         self.run_dirs = []
 
     async def validate_verifyx_and_process_job(
-        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None
+        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None, **_
     ):
-        if run_dir is None:
+        if not (run_dir or "").startswith(".verifyx-retry-"):
+            # the first sample: canned (its own run_dir is only for a kill on cancel)
             return self.firsts.pop(0)
         self.run_dirs.append(run_dir)
         challenge = SimpleNamespace(seed=1, cipher_text="c")
