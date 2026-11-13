@@ -261,25 +261,33 @@ class BatchVerifier:
                 # re-probe the refused ports while the count is below what PortCountCheck needs to list the node;
                 # the published sample alone never ends it: with no host-listener answer the attempt fails below
                 rounds = self.SAMPLE_ONLY_REPROBE_ROUNDS if len(sampled_ok) >= min_ports else self.REPROBE_ROUNDS
-                for round_no in range(1, rounds + 1):
-                    if not failed or (successful and len(sampled_ok) + len(successful) >= min_ports):
-                        break
-                    await asyncio.sleep(self.REPROBE_DELAY_SEC)
-                    late, failed = await self.port_tester.test_many(
-                        session, host, failed + missed_ready(), token, log_ctx
-                    )
-                    successful = successful + late
-                    start_watch.verified = ports_answered_so_far() if successful else None
-                    logger.debug(
-                        _m(f"re-probe {round_no}/{rounds}: {len(late)} late", extra=get_extra_info(log_ctx))
-                    )
+
+                async def reprobe(refused: list[PortPair]) -> list[PortPair]:
+                    nonlocal successful
+                    for round_no in range(1, rounds + 1):
+                        if not refused or (successful and len(sampled_ok) + len(successful) >= min_ports):
+                            break
+                        await asyncio.sleep(self.REPROBE_DELAY_SEC)
+                        late, refused = await self.port_tester.test_many(
+                            session, host, refused + missed_ready(), token, log_ctx
+                        )
+                        successful = successful + late
+                        start_watch.verified = ports_answered_so_far() if successful else None
+                        logger.debug(
+                            _m(f"re-probe {round_no}/{rounds}: {len(late)} late", extra=get_extra_info(log_ctx))
+                        )
+                    return refused
+
+                failed = await reprobe(failed)
                 if missed_pending:
                     # the re-probes are done, so nothing waits behind the missed ports' start now
                     await asyncio.wait([missed_start])
                 if ready := missed_ready():
                     late, still = await self.port_tester.test_many(session, host, ready, token, log_ctx)
-                    successful, failed = successful + late, failed + still
+                    successful = successful + late
                     start_watch.verified = ports_answered_so_far() if successful else None
+                    # their listener started late too: a refused first probe gets the same re-probes
+                    failed = failed + await reprobe(still)
                 logger.info(
                     _m(f"progress: {len(successful)}/{len(ports)} verified", extra=get_extra_info(log_ctx))
                 )
