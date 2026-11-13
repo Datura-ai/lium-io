@@ -1610,6 +1610,8 @@ async def test_a_cache_sweep_cut_by_the_budget_does_not_run_again_next_cycle(mon
     await asyncio.wait_for(check.run(ctx), timeout=5)
 
     assert sweep.await_count == 1
+    # DAH-2498: a trash left by a reboot is resumed hourly, with or without cache volumes
+    assert ctx.services.container_cleanup.resume_cache_trash_delete.await_count == 1
 
 
 @pytest.mark.asyncio

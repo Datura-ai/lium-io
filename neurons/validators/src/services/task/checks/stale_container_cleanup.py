@@ -218,6 +218,8 @@ class StaleContainerCleanupCheck:
         if now - last_sweep_at >= DOWNLOAD_TEMPORARY_SWEEP_INTERVAL_SECONDS:
             # stamped first: a sweep cut by the step's budget must not run again next cycle ahead of the reclaim
             self._last_sweep_at[ctx.executor.uuid] = now
+            # a trash whose delete a reboot cut short has no volume left, so no cache reclaim would ever free it
+            await ctx.services.container_cleanup.resume_cache_trash_delete(ctx.ssh, ctx.executor.uuid)
             swept_download_temporaries = await ctx.services.container_cleanup.sweep_abandoned_download_temporaries(
                 ssh_client=ctx.ssh,
                 executor_uuid=ctx.executor.uuid,

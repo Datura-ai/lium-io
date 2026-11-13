@@ -449,6 +449,7 @@ def _flatten_script(
     export_factor=0,
     fixed_bytes=0,
     export_sleep=0,
+    trash_avail=None,
 ) -> list[str]:
     """The real shell line against a fake docker that logs its calls (one argv per line)."""
     log = tmp_path / "calls"
@@ -458,7 +459,8 @@ def _flatten_script(
         f'echo "$*" >> {log}\n'
         'case "$1" in\n'
         "  info) echo /var/lib/docker ;;\n"
-        f"  run) printf 'Filesystem 1-blocks Used Available Capacity Mounted\\n/dev/x 1 1 {avail} 1%% /hostfs\\n' ;;\n"
+        f"  run) a={avail}; [ -e {tmp_path}/var/lib/docker/lium-cache-trash ] && a={trash_avail or avail}\n"
+        "    printf 'Filesystem 1-blocks Used Available Capacity Mounted\\n/dev/x 1 1 %s 1%% /hostfs\\n' \"$a\" ;;\n"
         f'  image) if [ "$2" = ls ]; then cat {tmp_path}/copies 2>/dev/null; else [ -e {tmp_path}/tagged ]; fi ;;\n'
         "  create) echo cid1 ;;\n"
         f"  export) sleep {export_sleep}; head -c {export_bytes} /dev/zero; exit {export_rc} ;;\n"
@@ -478,6 +480,7 @@ def _flatten_script(
         (FLATTEN_USE_LOCK_PATH, tmp_path / "use.lock"),
         (FLATTEN_LEASE_DIR, tmp_path / "leases"),
         (image_flatten.FLATTEN_SIZED_PATH, tmp_path / "sized"),
+        ("/proc/1/root", tmp_path),
     ):
         script = script.replace(real, str(local))
     return ["sh", "-c", script]
@@ -509,6 +512,37 @@ def test_flatten_script_tags_only_a_complete_copy_and_always_removes_the_contain
     assert sorted(c.split()[0] for c in calls) == sorted(expected_calls)  # export and import run concurrently
     if "rm" in expected_calls:
         assert "rm -fv cid1" in calls  # -v: the container's anonymous volumes go with it
+
+
+def test_a_trash_left_by_a_reboot_is_deleted_without_any_cache_volume(tmp_path):
+    fake = tmp_path / "docker"
+    fake.write_text("#!/bin/sh\necho /var/lib/docker\n")
+    fake.chmod(0o755)
+    trash = tmp_path / "var/lib/docker/lium-cache-trash"
+    (trash / "lium_dphn_cache.123/_data").mkdir(parents=True)
+    (trash / "lium_dphn_cache.123/_data/weights").write_bytes(b"x" * 10)
+    script = image_flatten.cache_trash_resume_command().replace("/usr/bin/docker", str(fake))
+    script = script.replace("/proc/1/root", str(tmp_path))
+
+    out = subprocess.run(["sh", "-c", script], capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
+
+    assert out.stdout.strip() == "resumed"
+    deadline = time.monotonic() + 10
+    while trash.exists() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert not trash.exists()
+
+
+def test_the_flatten_waits_for_the_detached_cache_delete_before_its_disk_check(tmp_path):
+    # the reclaim's background delete still holds the bytes: 99 free until it removes its trash dir
+    trash = tmp_path / "var/lib/docker/lium-cache-trash"
+    trash.mkdir(parents=True)
+    argv = _flatten_script(tmp_path, avail=100, trash_avail=99)
+    deleter = subprocess.Popen(["sh", "-c", f"sleep 1; rm -rf {trash}"])
+    try:
+        assert subprocess.run(argv, capture_output=True, env={"PATH": os.environ["PATH"]}).returncode == 0
+    finally:
+        deleter.wait()
 
 
 @pytest.mark.parametrize(
@@ -729,6 +763,17 @@ async def test_a_node_without_flock_runs_no_flatten_and_gives_no_locked_measure(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("trash_line, expected_gib", [("trash 214748364800", 290), ("trash ", 90), (None, 90)])
+async def test_the_locked_measure_adds_the_cache_files_still_being_deleted(trash_line, expected_gib):
+    # review: a detached cache delete still running shrank every fresh-sized volume on flock hosts
+    df = f"Filesystem 1B-blocks Used Available Capacity Mounted\n/dev/x 1 1 {90 * 1024**3} 1% /hostfs\n"
+    ssh = Mock(run=AsyncMock(return_value=Mock(exit_status=0, stdout=df + (trash_line + "\n" if trash_line else ""))))
+
+    assert await image_flatten.wait_for_node_flatten(ssh, with_trash=trash_line is not None) == expected_gib * 1024**3
+    assert ("lium-cache-trash" in ssh.run.await_args.args[0]) == (trash_line is not None)
+
+
+@pytest.mark.asyncio
 async def test_a_failed_wait_for_a_running_flatten_stops_the_create():
     ssh = Mock(run=AsyncMock(return_value=Mock(exit_status=1)))
     with pytest.raises(RuntimeError, match="image copy") as raised:
@@ -817,3 +862,18 @@ async def test_the_flattens_own_disk_check_budgets_the_containerd_import_twice(d
     assert f"-ge {copies * 24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES + 79 * 1024**3} ]" in command
     # containerd also counts the real export bytes (a sparse file reports a small Size); overlay2's Size does not under-count
     assert ("| wc -c" in command) == (copies == 2)
+
+
+def test_the_locked_measure_reads_df_and_the_trash_under_the_trash_lock():
+    # review: the detached delete takes this lock per file, so df and du see the same deletes
+    command = image_flatten.flatten_wait_command(with_trash=True)
+
+    assert command.index("lium-cache-trash.lock && flock -w 60 7") < command.index("df -P") < command.index("du -sxB1")
+    assert "lium-cache-trash.lock" not in image_flatten.flatten_wait_command()
+
+
+def test_the_locked_measure_stops_when_the_trash_lock_is_not_had():
+    # review: a timed-out trash lock must not fall through to an unlocked df/du (the volume could shrink)
+    command = image_flatten.flatten_wait_command(with_trash=True)
+
+    assert command.index("flock -w 60 7; } || exit 1;") < command.index("df -P")

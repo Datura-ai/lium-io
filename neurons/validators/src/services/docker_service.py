@@ -144,14 +144,17 @@ from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, 
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.hung_gpu_reset import HungGpuResult, reset_hung_pod_gpus
 from services.image_flatten import (
+    CACHE_TRASH_DIR,
     FLATTEN_NO_DISK_RENTER_SENTENCE,
     FLATTEN_SIZING_SLACK_BYTES,
     FlattenMeasureFailed,
     ImageFlattenNoDisk,
+    cache_trash_delete_detached,
     flatten_copy_bytes,
     flatten_image_on_host,
     flatten_lease_release_command,
     flatten_sized_mark_command,
+    free_bytes_with_trash,
     wait_for_node_flatten,
 )
 from services.loopback_plugin_setup import (
@@ -3270,6 +3273,36 @@ def _wipe_volume_cmd(local_volume: str, *container_names: str) -> str:
     )
 
 
+def _detach_volume_data_cmd(volume_name: str, remove_cmd: str) -> str:
+    """`remove_cmd` with the volume's files moved out first and deleted in the background (DAH-2498).
+
+    Deleting a cache of hundreds of GB held a customer start for up to ~40 s. A rename within the docker root's
+    filesystem is instant, so `remove_cmd` then removes an empty volume, and a detached `rm` frees the disk while
+    the pod starts. Prints `detached <bytes>` for what is still being freed. Moves nothing (and `remove_cmd` does
+    the whole removal as before) unless the volume is a plain local one, no container uses it, and the trash
+    directory is on the same filesystem. The detached `rm` takes the whole trash directory, so files a lost
+    earlier `rm` left behind go too.
+    """
+    docker = "/usr/bin/docker"
+    delete = cache_trash_delete_detached('"/proc/1/root$t"')
+    return (
+        f"v={shlex.quote(volume_name)}; t=; b=0; "
+        f"dm=$({docker} volume inspect -f '{{{{.Driver}}}} {{{{.Mountpoint}}}}' $v 2>/dev/null) && "
+        '[ "${dm%% *}" = local ] && m=${dm#* } && case "$m" in */volumes/"$v"/_data) true;; *) false;; esac && '
+        f"u=$({docker} ps -aq --filter volume=$v) && [ -z \"$u\" ] && "
+        f't=${{m%/volumes/*}}/{CACHE_TRASH_DIR} && mkdir -p "/proc/1/root$t" && '
+        '[ "$(stat -c %d "/proc/1/root$m")" = "$(stat -c %d "/proc/1/root$t")" ] && '
+        # rename only: a plain mv copies the whole cache when rename says EXDEV (a bind-mounted volumes dir)
+        'b=$(du -sxB1 "/proc/1/root$m" | cut -f1) && '
+        'python3 -c \'import os,sys; os.rename(sys.argv[1], sys.argv[2])\' "/proc/1/root$m" "/proc/1/root$t/$v.$$" && '
+        # a refused or failed move leaves no empty trash dir: a flatten would wait on it (image_flatten trash check)
+        '{ mkdir "/proc/1/root$m" 2>/dev/null; true; } || { [ -n "$t" ] && rmdir "/proc/1/root$t" 2>/dev/null; t=; }; '
+        f"{remove_cmd}; "
+        f'if [ -n "$t" ]; then {delete}; '
+        'echo "detached $b"; fi'
+    )
+
+
 def _should_repair_stale_mountpoint(
     exc: Exception,
     local_volume: str | None,
@@ -6264,9 +6297,11 @@ class DockerService:
         default_extra: dict,
         host_probe: PrerunHostProbe | None = None,
         killed_fillers: Iterable[str] = (),
+        df_floor: list[int] | None = None,
     ) -> bool:
         """Free filler cache volumes when a customer rental's volume does not fit beside them; True when
-        volumes may have been removed.
+        volumes may have been removed. `df_floor` gets the free bytes the host will have once the detached
+        deletes finish (DAH-2498), for the volume sizing that follows.
 
         DAH-5260: the scrape lists the Engy checkpoint cache as free disk (the Dolphin cache stays used), and the
         backend sizes the renter's volume and container storage on that listing. So the caches stay while the
@@ -6299,7 +6334,24 @@ class DockerService:
                 return False
 
             docker_root_dir = await self.get_docker_root_dir(ssh_client)
-            free_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
+            # a partial or legacy rental's volume is fallocated right after this: it needs the bytes freed before
+            # the create, so only a full-node rental leaves the delete running in the background
+            detach = payload.disk_share is not None and payload.disk_share >= 1
+
+            async def free_with_trash_gb() -> float | None:
+                # a full-node rental counts trash an earlier create left deleting, read with df under one lock
+                if not detach:
+                    return None
+                try:
+                    return await free_bytes_with_trash(ssh_client) / (1024**3)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    return None
+
+            free_gb = await free_with_trash_gb()
+            if free_gb is None:
+                free_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
             fit = await self._rental_disk_fit(ssh_client, payload)
             rental_needs_free_gb = fit.needs_free_gb
             if free_gb >= rental_needs_free_gb:
@@ -6316,22 +6368,36 @@ class DockerService:
                     }),
                 )
             )
+            # DAH-2498: bytes a detached `rm` is still freeing; they count as free, the files are already unlinked
+            # from every volume
+            detached_gb = 0.0
             # a cache the wipe emptied stays listed but holds no bytes, so it is not a failed removal (lio#2219 review)
             emptied: set[str] = set()
 
             async def remove(command: str) -> object:
+                nonlocal detached_gb
                 result = await asyncio.wait_for(
                     retry_ssh_command(ssh_client, command, "reclaim_dphn_cache_for_rental"),
                     CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS,
                 )
-                for line in (getattr(result, "stdout", None) or "").splitlines():
+                stdout = getattr(result, "stdout", None) or ""
+                detached = re.search(r"^detached (\d+)$", stdout, re.MULTILINE)
+                if detached:
+                    detached_gb += int(detached.group(1)) / (1024**3)
+                for line in stdout.splitlines():
                     if line.startswith(_CACHE_EMPTIED_MARK):
                         emptied.add(line[len(_CACHE_EMPTIED_MARK):].strip())
                 return result
 
             async def free_now_gb() -> float:
-                # the one free-disk reading both the fit and the clamp use, so they never disagree (lio#2219 review)
-                return await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
+                # the one free-disk reading both the fit and the clamp use, so they never disagree (lio#2219 review);
+                # df and the trash still to free, read under one lock: nothing freed since is missed or doubled
+                with_trash_gb = await free_with_trash_gb()
+                if with_trash_gb is not None:
+                    return with_trash_gb
+                df_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
+                # df already holds what the detached `rm` freed so far: never count those bytes twice
+                return max(df_gb, free_gb + detached_gb)
 
             async def rental_fits() -> bool:
                 return await free_now_gb() >= rental_needs_free_gb
@@ -6340,17 +6406,19 @@ class DockerService:
 
             def volume_remove(name: str) -> str:
                 if not killed:
-                    return DockerCommand.volume_remove(name)
-                return (
-                    f"/usr/bin/docker volume rm {shlex.quote(name)} 2>/dev/null || "
-                    f"( ( {_wipe_volume_cmd(name, *killed)} ) && "
-                    # an exiting filler still running keeps the unlinked files open, so their blocks stay allocated:
-                    # emptied only once no running container mounts it (lio#2219 review)
-                    # a failed `docker ps` prints nothing too: gate on its exit status, not only its output
-                    f"holders=$(/usr/bin/docker ps -q --filter volume={shlex.quote(name)}) && "
-                    f'[ -z "$holders" ] && '
-                    f"echo {shlex.quote(_CACHE_EMPTIED_MARK + name)} ) || true"
-                )
+                    command = DockerCommand.volume_remove(name)
+                else:
+                    command = (
+                        f"/usr/bin/docker volume rm {shlex.quote(name)} 2>/dev/null || "
+                        f"( ( {_wipe_volume_cmd(name, *killed)} ) && "
+                        # an exiting filler still running keeps the unlinked files open, so their blocks stay
+                        # allocated: emptied only once no running container mounts it (lio#2219 review)
+                        # a failed `docker ps` prints nothing too: gate on its exit status, not only its output
+                        f"holders=$(/usr/bin/docker ps -q --filter volume={shlex.quote(name)}) && "
+                        f'[ -z "$holders" ] && '
+                        f"echo {shlex.quote(_CACHE_EMPTIED_MARK + name)} ) || true"
+                    )
+                return _detach_volume_data_cmd(name, command) if detach else command
 
             # Oldest first, only as much as the rental needs: a kept Engy checkpoint still restarts fast.
             removal_failed = False
@@ -6363,6 +6431,7 @@ class DockerService:
                     evict_first_prefix=ENGY_CACHE_VOLUME_PREFIX,
                     volume_remove=volume_remove,
                     keep_image=payload.docker_image,
+                    log_extra=default_extra,
                 )
             except asyncio.CancelledError:
                 raise
@@ -6375,6 +6444,8 @@ class DockerService:
                     ),
                     exc_info=True,
                 )
+            if df_floor is not None and detached_gb:
+                df_floor.append(int((free_gb + detached_gb) * (1024**3)))
             # a removal can fail silently (`|| true`) or time out: never size the pod volume on disk not freed.
             # Still short after every removal worked: the cache was not what was missing, so the size stays as ordered.
             # read once: the fit and the clamp must size on the same reading (lio#2219 review)
@@ -8367,8 +8438,13 @@ class DockerService:
         locked_df_avail_bytes: int | None = None,
         locked_df_error: Exception | None = None,
         flatten_copy_bytes: int | None = None,
+        df_floor_bytes: int | None = None,
     ) -> VolumeSizingResult:
         """Resolve effective volume/storage limits for a new pod volume (DAH-2183).
+
+        `df_floor_bytes` (DAH-2498) is the free disk once the cache reclaim's detached deletes finish; df is read
+        as at least that, so a delete still running does not shrink the grant. A locked measure ignores it: it adds
+        the bytes that delete is still freeing, read under the lock (`wait_for_node_flatten(with_trash=True)`).
 
         `flatten_copy_bytes` (a many-layer image on a Sysbox full node) caps the grant so a one-layer copy
         still fits beside it, never below `payload.min_volume_gb` or the ordered `payload.volume_limit_gb`.
@@ -8425,6 +8501,8 @@ class DockerService:
                 if df_avail_bytes is None:
                     df_avail_bytes = await self._get_fs_available_bytes(ssh_client, docker_root_dir)
                 existing_volumes_bytes = await self._get_existing_vloopback_bytes(ssh_client)
+            if df_floor_bytes is not None and locked_df_avail_bytes is None:
+                df_avail_bytes = max(df_avail_bytes, df_floor_bytes)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -10733,6 +10811,7 @@ class DockerService:
                 # DAH-5260: the Engy cache is listed as free disk; the caches go only when the rental does not fit
                 # beside them, and every removal is awaited here, before the volume is sized and docker run.
                 ordered_volume_gb = payload.volume_limit_gb
+                cache_df_floor: list[int] = []
                 reclaimed_cache_volumes = (
                     False
                     if beside_fillers
@@ -10742,6 +10821,7 @@ class DockerService:
                         default_extra=default_extra,
                         host_probe=docker_listing_probe,
                         killed_fillers=[name for name in removed_containers if name.startswith(FILLER_CONTAINER_PREFIX)],
+                        df_floor=cache_df_floor,
                     )
                 )
                 # the reclaim changes the order only when it clamps it: a cache removal failed or timed out
@@ -10871,7 +10951,12 @@ class DockerService:
                             await early_volume_probe
                         current_step = "flatten_wait"
                         try:
-                            locked_df_avail_bytes = await wait_for_node_flatten(ssh_client)
+                            # a full-node volume is sparse: any trash still being deleted is its disk, also one an
+                            # earlier attempt's reclaim left (this one then finds no cache to detach)
+                            full_node = payload.disk_share is not None and payload.disk_share >= 1
+                            locked_df_avail_bytes = await wait_for_node_flatten(
+                                ssh_client, with_trash=bool(cache_df_floor) or full_node
+                            )
                         except FlattenMeasureFailed as exc:
                             # lock held and mark written: the sizing's measurement-failure fallback;
                             # a lock or mark failure propagates and stops the create
@@ -10919,6 +11004,7 @@ class DockerService:
                         locked_df_avail_bytes=locked_df_avail_bytes,
                         locked_df_error=locked_df_error,
                         flatten_copy_bytes=flatten_copy,
+                        df_floor_bytes=max(cache_df_floor, default=None),
                     )
                     effective_volume_limit_gb = sizing.volume_limit_gb
                     effective_storage_limit_gb = sizing.storage_limit_gb

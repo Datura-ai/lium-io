@@ -1,15 +1,21 @@
 import asyncio
+import fcntl
+import os
+import subprocess
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from payload_models.payloads import CacheVolume, ContainerCreateRequest, WorkloadKind
+from services import image_flatten
 from services.container_cleanup import idle_filler_images_removal_command
 from services.docker_service import (
     DockerService,
     RentalDiskFit,
     _clamp_rental_volume_to_free_disk,
+    _detach_volume_data_cmd,
     _filler_run_volume_gb,
     _wipe_volume_cmd,
 )
@@ -64,13 +70,16 @@ class HostSshClient(FakeSshClient):
     def __init__(self, listed_volumes: list[str], free_gb: float):
         super().__init__(listed_volumes)
         self._free_bytes = int(free_gb * 1024**3)
+        self._trash_bytes = 0
 
     async def run(self, command: str, *args, **kwargs):
         self.commands.append(command)
-        if "docker info" in command:
+        if "docker info" in command and "df -P -B1" not in command:
             return SimpleNamespace(exit_status=0, stdout="/var/lib/docker\n", stderr="")
         if "df -P -B1" in command:
             body = f"Filesystem 1B-blocks Used Available Capacity\n/dev/sda1 1 1 {self._free_bytes} 1% /hostfs"
+            if 'echo "trash' in command:
+                body += f"\ntrash {self._trash_bytes}"
             return SimpleNamespace(exit_status=0, stdout=body, stderr="")
         stdout = self._listing if "volume ls" in command else ""
         return SimpleNamespace(exit_status=0, stdout=stdout, stderr="")
@@ -446,7 +455,7 @@ class KilledFillerHostSshClient(HostSshClient):
         self.held = held  # the exiting filler still runs and holds the unlinked files open: no block is freed yet
 
     async def run(self, command: str, *args, **kwargs):
-        if "volume rm" in command and "/proc/1/root" in command:
+        if "volume rm" in command and "ok=' " in command:
             allowed = command.split("ok=' ", 1)[1].split(" '", 1)[0].split()
             if all(user in allowed for user in self.users):
                 self.commands.append(command)
@@ -586,7 +595,7 @@ class KilledFillerDolphinHost(HostSshClient):
         self.wiped_gb = wiped_gb
 
     async def run(self, command: str, *args, **kwargs):
-        if "volume rm" in command and "/proc/1/root" in command:
+        if "volume rm" in command and "ok=' " in command:
             allowed = command.split("ok=' ", 1)[1].split(" '", 1)[0].split()
             if all(user in allowed for user in self.users):
                 self._free_bytes += int(self.wiped_gb * 1024**3)
@@ -830,3 +839,194 @@ def test_the_idle_filler_removal_keeps_the_rented_image_under_any_docker_hub_pre
 
     assert "reference=daturaai/dolphin " not in command
     assert "reference=daturaai/dlph " in command
+
+
+# ---------------------------------------------------------------- DAH-2498: cache files deleted off the start path
+
+
+def _run_detach(
+    tmp_path, users: str, other_filesystem: bool = False, tools: dict[str, str] | None = None
+) -> tuple[str, str]:
+    """Runs the real command against a fake docker and a temp dir standing in for the host root."""
+    env = None
+    tools = dict(tools or {})
+    if other_filesystem:
+        # a stat that reports a different device per path: the trash dir is on another filesystem than the volume
+        tools["stat"] = "#!/bin/sh\necho ${#3}\n"
+    if tools:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        for name, script in tools.items():
+            (bin_dir / name).write_text(script)
+            (bin_dir / name).chmod(0o755)
+        env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    root = tmp_path / "host"
+    data = root / "var/lib/docker/volumes/engy_cache_hf_x/_data"
+    data.mkdir(parents=True)
+    (data / "model.safetensors").write_bytes(b"x" * 8192)
+    docker = tmp_path / "docker"
+    docker.write_text(
+        "#!/bin/sh\n"
+        'case "$1 $2" in\n'
+        '"volume inspect") echo "local /var/lib/docker/volumes/engy_cache_hf_x/_data";;\n'
+        f'"ps -aq") printf "{users}";;\n'
+        "esac\n"
+    )
+    docker.chmod(0o755)
+    command = (
+        _detach_volume_data_cmd("engy_cache_hf_x", "echo removed")
+        .replace("/usr/bin/docker", str(docker))
+        .replace("/proc/1/root", str(root))
+    )
+    out = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=10, env=env).stdout
+    return out, str(data)
+
+
+def test_an_unused_cache_volume_is_emptied_at_once_and_its_files_deleted_in_the_background(tmp_path):
+    out, data = _run_detach(tmp_path, "")
+
+    assert out.splitlines()[0] == "removed"
+    assert out.splitlines()[1].startswith("detached ") and int(out.split()[-1]) >= 8192
+    assert os.listdir(data) == []  # the volume docker removes is empty
+    trash = tmp_path / "host/var/lib/docker/lium-cache-trash"
+    for _ in range(50):
+        if not trash.exists():
+            break
+        time.sleep(0.1)
+    assert not trash.exists()
+
+
+def test_a_volume_on_another_filesystem_leaves_no_empty_trash_for_a_flatten_to_wait_on(tmp_path):
+    # review: the refused move left an empty lium-cache-trash, and the next flatten waited 300 s on it
+    out, data = _run_detach(tmp_path, "", other_filesystem=True)
+
+    assert out.split() == ["removed"]
+    assert os.listdir(data) == ["model.safetensors"]  # left to the plain removal
+    assert not (tmp_path / "host/var/lib/docker/lium-cache-trash").exists()
+
+
+def test_a_rename_refused_across_mounts_never_falls_back_to_copying_the_cache(tmp_path):
+    # review: a bind-mounted volumes dir has the same device but rename says EXDEV, and mv then copied the cache
+    exdev = "#!/bin/sh\necho 'OSError: [Errno 18] Invalid cross-device link' >&2\nexit 1\n"
+    copying_mv = '#!/bin/sh\nmkdir -p "$2" && cp -a "$1"/. "$2" && rm -rf "$1"\n'
+    out, data = _run_detach(tmp_path, "", tools={"python3": exdev, "mv": copying_mv})
+
+    assert out.split() == ["removed"]
+    assert os.listdir(data) == ["model.safetensors"]  # left to the plain removal, nothing copied
+    assert not (tmp_path / "host/var/lib/docker/lium-cache-trash").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_full_node_rental_counts_trash_an_earlier_create_left_deleting_before_evicting(docker_service):
+    # review: 2389 GB free plus 400 GB an earlier create still deletes covers the 2740 GB, so no cache goes
+    ssh_client = HostSshClient(["dphn_cache_hf_x", _KIMI, "volume_pod"], free_gb=2389)
+    ssh_client._trash_bytes = 400 * 1024**3
+    rental = _rental(2620, 1310)
+    rental.disk_share = 1.0
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is False
+    assert _removed_volumes(ssh_client) == []
+
+
+def test_a_cache_volume_a_container_still_uses_is_left_to_the_plain_removal(tmp_path):
+    out, data = _run_detach(tmp_path, "abc123\\n")
+
+    assert out.split() == ["removed"]
+    assert os.listdir(data) == ["model.safetensors"]
+
+
+@pytest.mark.asyncio
+async def test_bytes_still_being_freed_in_the_background_count_toward_the_rental_fit(docker_service):
+    # 2389 GB free cannot hold the 2620 GB volume: the first cache's 1561 GB are detached, so the second stays
+    class DetachingSshClient(HostSshClient):
+        async def run(self, command: str, *args, **kwargs):
+            if "volume rm" in command:
+                self.commands.append(command)
+                self._trash_bytes += 1561 * 1024**3
+                return SimpleNamespace(exit_status=0, stdout=f"detached {1561 * 1024**3}\n", stderr="")
+            return await super().run(command, *args, **kwargs)
+
+    ssh_client = DetachingSshClient(["dphn_cache_hf_x", _KIMI, "volume_pod"], free_gb=2389)
+    rental = _rental(2620, 1310)
+    rental.disk_share = 1.0
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is True
+    assert len(_removed_volumes(ssh_client)) == 1
+    assert rental.volume_limit_gb == 2620
+
+
+@pytest.mark.asyncio
+async def test_disk_the_image_removal_freed_counts_beside_a_pending_background_delete(docker_service):
+    # 2000 GB free: the idle images free 500 GB at once, the first cache detaches 300 GB still being deleted.
+    # 2800 GB covers the 2740 GB the rental needs, so the second cache stays
+    class ImageThenDetachSshClient(HostSshClient):
+        async def run(self, command: str, *args, **kwargs):
+            if "docker image rm" in command:
+                self.commands.append(command)
+                self._free_bytes += 500 * 1024**3
+                return SimpleNamespace(exit_status=0, stdout="", stderr="")
+            if "volume rm" in command:
+                self.commands.append(command)
+                self._trash_bytes += 300 * 1024**3
+                return SimpleNamespace(exit_status=0, stdout=f"detached {300 * 1024**3}\n", stderr="")
+            return await super().run(command, *args, **kwargs)
+
+    ssh_client = ImageThenDetachSshClient(["dphn_cache_hf_x", _KIMI, "volume_pod"], free_gb=2000)
+    rental = _rental(2620, 1310)
+    rental.disk_share = 1.0
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is True
+    assert len(_removed_volumes(ssh_client)) == 1
+
+
+@pytest.mark.asyncio
+async def test_bytes_the_background_delete_already_freed_are_not_counted_twice(docker_service):
+    # each cache detaches 150 GB and the delete finishes at once, so df already shows them: one cache is not enough
+    class FastDeleteSshClient(HostSshClient):
+        async def run(self, command: str, *args, **kwargs):
+            if "volume rm" in command:
+                self.commands.append(command)
+                self._free_bytes += 150 * 1024**3
+                return SimpleNamespace(exit_status=0, stdout=f"detached {150 * 1024**3}\n", stderr="")
+            return await super().run(command, *args, **kwargs)
+
+    ssh_client = FastDeleteSshClient(["dphn_cache_hf_x", _KIMI, "volume_pod"], free_gb=2389)
+    df_floor: list[int] = []
+    rental = _rental(2620, 1310)
+    rental.disk_share = 1.0
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}, df_floor=df_floor) is True
+    assert len(_removed_volumes(ssh_client)) == 2
+    assert df_floor == [(2389 + 300) * 1024**3]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disk_share, detached", [(1.0, True), (0.5, False), (None, False)])
+async def test_only_a_full_node_rental_leaves_the_cache_delete_running(docker_service, disk_share, detached):
+    # review: a partial or legacy volume is fallocated right after the reclaim, so a delete still running hits ENOSPC
+    ssh_client = HostSshClient([_KIMI, "volume_pod"], free_gb=2389)
+    rental = _rental(2620, 1310)
+    rental.disk_share = disk_share
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is True
+    assert _removed_volumes(ssh_client) == [_KIMI]
+    assert any("lium-cache-trash" in command for command in ssh_client.commands) is detached
+
+
+def test_the_background_delete_frees_nothing_while_the_disk_measure_holds_the_trash_lock(tmp_path):
+    # review: a file deleted between the measure's df and du was counted in neither and shrank the volume
+    trash = tmp_path / "lium-cache-trash"
+    (trash / "v.1").mkdir(parents=True)
+    (trash / "v.1/model.safetensors").write_bytes(b"x" * 8192)
+    lock = open(f"{trash}.lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    delete = subprocess.Popen(["sh", "-c", image_flatten.CACHE_TRASH_DELETE, "_", str(trash)])
+    try:
+        time.sleep(1)
+        assert (trash / "v.1/model.safetensors").exists()
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        assert delete.wait(timeout=10) == 0
+        assert not trash.exists()
+    finally:
+        delete.kill()
+        lock.close()

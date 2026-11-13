@@ -48,6 +48,10 @@ FLATTEN_MAX_LEASES = 2
 FLATTEN_BUSY_EXIT = 92
 FLATTEN_NO_DISK_EXIT = 95
 FLATTEN_MEASURE_FAILED_EXIT = 90
+# under the Docker root dir: where a cache reclaim moves volume files for its detached delete (DAH-2498)
+CACHE_TRASH_DIR = "lium-cache-trash"
+# a flatten waits this long for a cache reclaim's detached delete to free its disk (DAH-2498)
+FLATTEN_TRASH_WAIT_SECONDS = 300
 
 FLATTEN_NO_DISK_RENTER_SENTENCE = (
     "not enough free disk on this node to prepare this image; choose another node or a smaller image"
@@ -185,10 +189,10 @@ def _flatten_command(
     change_args = " ".join(f"--change {shlex.quote(c)}" for c in changes)
     # an empty volume per VOLUME path: create would otherwise copy the image's files there (extra disk)
     mounts = " ".join(f"--mount {shlex.quote(f'type=volume,dst={v},volume-nocopy')}" for v in volumes)
-    root = "\"$(/usr/bin/docker info --format '{{.DockerRootDir}}')\""
+    root = '"$r"'
     return (
         # one flatten per node: concurrent rentals would each pass the disk check and copy at once
-        f"exec 9>>{FLATTEN_LOCK_PATH}; flock -w {t} 9 || exit 96; "
+        f"exec 9>>{FLATTEN_LOCK_PATH}; flock -w {t + FLATTEN_TRASH_WAIT_SECONDS} 9 || exit 96; "
         f"({_reuse_command(tag, lease)}) && exit 0; "
         f'[ "$(stat -c %y {FLATTEN_SIZED_PATH} 2>/dev/null)" = {shlex.quote(sized_mark)} ] || '
         f"{{ echo 'flatten refused: another create sized its disk meanwhile' >&2; exit {FLATTEN_NO_DISK_EXIT}; }}; "
@@ -207,6 +211,10 @@ def _flatten_command(
         f'do live=$(find {FLATTEN_LEASE_DIR} -maxdepth 1 -name "${{old#*:}}.*" ! -mmin +{FLATTEN_LEASE_MINUTES}) '
         '&& [ -z "$live" ] && /usr/bin/docker rmi "$old" >/dev/null 2>&1; done; '
         "else echo 'flatten: lease dir unreadable, cleanup skipped' >&2; fi; flock -u 8; "
+        "r=$(/usr/bin/docker info --format '{{.DockerRootDir}}'); "
+        # the delete a cache reclaim detached removes its trash dir last: its bytes are not free to copy into before
+        f'w=0; while [ -e "/proc/1/root$r/{CACHE_TRASH_DIR}" ] && [ "$w" -lt {FLATTEN_TRASH_WAIT_SECONDS} ]; '
+        'do sleep 2; w=$((w + 2)); done; '
         f"avail=$({df_command(root)} | awk 'NR==2{{print $4}}'); "
         'case "$avail" in ""|*[!0-9]*) echo "flatten failed: unexpected df output" >&2; exit 94;; esac; '
         f'[ "$avail" -ge {int(need_bytes)} ] || {{ echo "flatten avail=$avail" >&2; exit {FLATTEN_NO_DISK_EXIT}; }}; '
@@ -243,23 +251,75 @@ def _export_count_check(factor: int, fixed_bytes: int) -> str:
     )
 
 
+# one file at a time under the trash lock the locked disk measure holds (flatten_wait_command): df and the trash
+# size are read with no delete between them, so no freed byte is missed by both
+CACHE_TRASH_DELETE = (
+    'if command -v flock >/dev/null; then L="$1.lock"; '
+    'find "$1" -depth ! -type d -exec flock "$L" rm -f {} \\; ; flock "$L" rm -rf "$1"; else rm -rf "$1"; fi'
+)
+
+
+def cache_trash_delete_detached(trash_shell_word: str) -> str:
+    delete = shlex.quote(CACHE_TRASH_DELETE)
+    return f"(setsid nohup nice -n 19 sh -c {delete} _ {trash_shell_word} </dev/null >/dev/null 2>&1 &)"
+
+
+def cache_trash_resume_command() -> str:
+    """Restart the delete of a trash a reboot cut short: its volumes are gone, so no reclaim would ever see it.
+    A second delete beside a running one is harmless, both remove per file under the trash lock."""
+    delete = cache_trash_delete_detached('"$t"')
+    return (
+        "r=$(/usr/bin/docker info --format '{{.DockerRootDir}}') && "
+        f't="/proc/1/root$r/{CACHE_TRASH_DIR}" && [ -d "$t" ] && {delete} && echo resumed; true'
+    )
+
+
 def flatten_sized_mark_command() -> str:
     """Prints the mtime of FLATTEN_SIZED_PATH (empty when absent); `_flatten_command` refuses once it changed."""
     return f"stat -c %y {FLATTEN_SIZED_PATH} 2>/dev/null; true"
 
 
-def flatten_wait_command() -> str:
-    root = "\"$(/usr/bin/docker info --format '{{.DockerRootDir}}')\""
+_DOCKER_ROOT = "\"$(/usr/bin/docker info --format '{{.DockerRootDir}}')\""
+_TRASH = f'"/proc/1/root"{_DOCKER_ROOT}/{CACHE_TRASH_DIR}'
+# the cache files a detached `rm` is still deleting (DAH-2498) are free once it ends. They are read under the trash
+# lock that `rm` takes per file, so df and du see the same deletes. The lock is required: an unlocked read can miss
+# a byte freed in between and shrink the volume, so no lock in time fails the measure
+_TRASH_LOCK = f"{{ : >>{_TRASH}.lock 2>/dev/null && exec 7>>{_TRASH}.lock && flock -w 60 7; }} || exit 1; "
+_TRASH_SIZE = f'; echo "trash $(du -sxB1 {_TRASH} 2>/dev/null | cut -f1)"'
+
+
+def flatten_wait_command(with_trash: bool = False) -> str:
     # under the lock a copy holds for its whole run: no copy is half-written while df measures, and a
     # flatten that has not started copying refuses once it sees the mark (nothing to print without flock)
-    return (
+    command = (
         f"command -v flock >/dev/null || exit 0; exec 9>>{FLATTEN_LOCK_PATH}; "
-        f"flock -w {FLATTEN_TIMEOUT_SECONDS + 300} 9 || exit 1; touch {FLATTEN_SIZED_PATH} || exit 1; "
-        f"{df_command(root)} || exit {FLATTEN_MEASURE_FAILED_EXIT}"
+        f"flock -w {FLATTEN_TIMEOUT_SECONDS + FLATTEN_TRASH_WAIT_SECONDS + 300} 9 || exit 1; "
+        f"touch {FLATTEN_SIZED_PATH} || exit 1; {_TRASH_LOCK if with_trash else ''}"
+        f"{df_command(_DOCKER_ROOT)} || exit {FLATTEN_MEASURE_FAILED_EXIT}"
     )
+    return command + (_TRASH_SIZE if with_trash else "")
 
 
-async def wait_for_node_flatten(ssh_client: asyncssh.SSHClientConnection) -> int | None:
+def _free_and_trash_bytes(out: str) -> int:
+    trash = next((line.split()[1:] for line in out.splitlines() if line.startswith("trash")), [])
+    return parse_df_available_bytes(out) + (int(trash[0]) if trash and trash[0].isdigit() else 0)
+
+
+async def free_bytes_with_trash(ssh_client: asyncssh.SSHClientConnection) -> int:
+    """The Docker disk's free bytes plus what the detached cache delete is still freeing, read under the trash
+    lock only (DAH-2498): df alone misses the pending delete, a baseline plus the detached bytes misses what was
+    freed since. Raises when the lock or the measure failed."""
+    result = await ssh_client.run(
+        f"command -v flock >/dev/null || exit 1; {_TRASH_LOCK}{df_command(_DOCKER_ROOT)}{_TRASH_SIZE}",
+        check=False,
+        timeout=120,
+    )
+    if result.exit_status != 0:
+        raise RuntimeError(f"measuring the disk under the cache trash lock failed (exit {result.exit_status})")
+    return _free_and_trash_bytes(str(result.stdout or ""))
+
+
+async def wait_for_node_flatten(ssh_client: asyncssh.SSHClientConnection, with_trash: bool = False) -> int | None:
     """The Docker disk's free bytes, measured under the node flatten lock, for a create's sizing.
 
     A copy holds that lock from its disk check to its tag, so the measure waits for a running copy
@@ -268,15 +328,19 @@ async def wait_for_node_flatten(ssh_client: asyncssh.SSHClientConnection) -> int
     A disk probe taken before this, outside the lock, may predate a copy and must not size the create.
     None on a node without flock, which runs no flatten. Raises FlattenMeasureFailed when only the
     measure failed (lock held, mark written); any other error when the lock or the mark was not taken,
-    which must stop the create: no other sizing is safe then."""
-    result = await ssh_client.run(flatten_wait_command(), check=False, timeout=FLATTEN_TIMEOUT_SECONDS + 420)
+    which must stop the create: no other sizing is safe then. `with_trash` (the create's cache reclaim
+    detached a delete, or a full-node create) adds what any detached delete is still freeing."""
+    timeout = FLATTEN_TIMEOUT_SECONDS + FLATTEN_TRASH_WAIT_SECONDS + 420
+    result = await ssh_client.run(flatten_wait_command(with_trash), check=False, timeout=timeout)
     if result.exit_status == FLATTEN_MEASURE_FAILED_EXIT:
         raise FlattenMeasureFailed("measuring the disk under the node flatten lock failed")
     if result.exit_status != 0:
         raise RuntimeError(f"waiting for any image copy on this node failed (exit {result.exit_status})")
     out = str(result.stdout or "")
+    if not out.strip():
+        return None
     try:
-        return parse_df_available_bytes(out) if out.strip() else None
+        return _free_and_trash_bytes(out)
     except Exception as exc:
         raise FlattenMeasureFailed(str(exc)) from exc
 

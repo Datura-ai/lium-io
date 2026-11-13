@@ -594,6 +594,39 @@ async def test_create_container_sizes_on_the_disk_measured_under_the_flatten_loc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("disk_share", "detached", "with_trash"),
+    [
+        (0.5, True, True),
+        (0.5, False, False),
+        # review: an earlier attempt's reclaim detached the last cache, so this one finds none, but its trash
+        # still holds the disk: a full-node (sparse) volume counts any trash, not only this create's
+        (1.0, False, True),
+    ],
+)
+async def test_the_locked_measure_counts_a_pending_cache_delete(svc, monkeypatch, disk_share, detached, with_trash):
+    # review: on flock hosts the sizing takes the locked measure, so it must see the delete still freeing disk
+    ssh_client = _deploy_ssh_client()
+    _patch_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(svc, "probe_volume_host", AsyncMock(return_value=None))
+
+    async def reclaim(*, df_floor, **_):
+        if detached:
+            df_floor.append(200 * _SIZING_GB)
+        return False
+
+    monkeypatch.setattr(svc, "reclaim_dphn_cache_for_rental", reclaim)
+    wait = AsyncMock(return_value=90 * _SIZING_GB)
+    monkeypatch.setattr(docker_service_module, "wait_for_node_flatten", wait)
+
+    payload = _create_payload()
+    payload.disk_share = disk_share
+    await _run_create_container(svc, payload)
+
+    assert wait.await_args.kwargs == {"with_trash": with_trash}
+
+
+@pytest.mark.asyncio
 async def test_a_failed_measure_under_the_flatten_lock_takes_the_sizing_fallback(svc, monkeypatch):
     # review: a transient failure of the locked measure must not abort the create
     ssh_client = _deploy_ssh_client()
