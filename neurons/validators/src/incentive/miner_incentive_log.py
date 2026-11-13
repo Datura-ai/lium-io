@@ -807,7 +807,7 @@ class MinerLogLine(BaseModel):
                 "* spot_cap_multiplier (min(spot GPUs, spot_cap) / spot GPUs: idle Spot GPUs of the "
                 "GPU model and bucket share the Secure cap, in a pool of their own) "
                 "* spot_pool_multiplier (below 1 when the GPU model's spot nodes together would be paid "
-                "more than its fillers earn per hour, filler_revenue_usd_per_hour); "
+                f"more than {pay_factor:g} x what its fillers earn per hour, filler_revenue_usd_per_hour); "
                 "paid on top of the rental share (paid_fraction < 1: the pool had room for only "
                 "that part of spot pay and floor top-ups)" + cap_note
             ),

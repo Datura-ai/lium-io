@@ -1,9 +1,9 @@
 """Spot-node pay and the secure floor.
 
-Spot: an idle spot node running Lium fillers is paid min(1.0 x its GPU configuration's average
+Spot: an idle spot node running Lium fillers is paid min(0.9 x its GPU configuration's average
 filler revenue per GPU-hour, 0.8 x its secure rate before secure cap dilution), outside the secure
 buckets, diluted above the secure cap of its GPU model and bucket in a spot pool of its own
-(DAH-5944), and a GPU model's spot nodes together at most what its fillers earn per hour (DAH-5128).
+(DAH-5944), and a GPU model's spot nodes together at most 0.9 x what its fillers earn per hour (DAH-5128).
 Secure floor: an idle secure node's cap-diluted rate is raised to 1.0 x that average, even
 above its listed rate. The two factors are separate constants. No cap (owner rule): spot pay and floor top-ups are paid on top of the
 burn-capped rental share, up to the whole incentive pool.
@@ -40,7 +40,7 @@ TAO_PRICE = 1_000_000.0
 AT_CAP_TAO_PRICE = 1e-6
 ALPHA_RATE = 1.0
 # the owner's factors, written out rather than imported so that a change to either constant fails here
-SPOT_FACTOR = 1.0
+SPOT_FACTOR = 0.9
 FLOOR_FACTOR = 1.0
 SPOT_RENTAL_FACTOR = 0.5
 
@@ -224,6 +224,22 @@ async def test_spot_is_paid_the_filler_side_when_it_is_lower():
     _assert_pool_pays_exactly(incentive)
 
 
+def test_spot_is_paid_0p9x_default_job_earnings_and_the_secure_floor_1x():
+    # DAH-6328: Spot gets 0.9x what Default Jobs earn; the Secure floor stays at 1x
+    assert rental_price.FILLER_REVENUE_PAY_FACTOR == pytest.approx(0.9)
+    assert rental_price.SECURE_FILLER_REVENUE_FLOOR_FACTOR == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_a_crowded_model_s_spot_nodes_together_get_0p9x_its_filler_earnings():
+    earnings = 8 * 2.0
+    spots = [_spot(f"spot-{i}", filler_revenue_per_gpu_hour=2.0, filler_revenue_usd_per_hour=earnings) for i in range(4)]
+
+    await _run(spots, _config(cap=4 * 8))
+
+    assert sum(s.gpu_count * s.effective_rate for s in spots) == pytest.approx(0.9 * earnings)
+
+
 @pytest.mark.asyncio
 async def test_one_spot_node_keeps_its_rate_while_the_model_earns_more():
     spot = _spot(filler_revenue_per_gpu_hour=2.0, filler_revenue_usd_per_hour=8 * 2.0)
@@ -245,7 +261,7 @@ async def test_spot_nodes_of_a_model_share_what_its_fillers_earn(caplog):
     # a cap that fits all four spot nodes, so only the filler-earnings pool scales them
     incentive = await _run([*spots, secure], _config(cap=4 * 8))
 
-    assert sum(s.gpu_count * s.effective_rate for s in spots) == pytest.approx(earnings)
+    assert sum(s.gpu_count * s.effective_rate for s in spots) == pytest.approx(SPOT_FACTOR * earnings)
     for spot in spots:
         assert spot.spot_pool_multiplier == pytest.approx(0.25)
         assert spot.effective_rate == pytest.approx(SPOT_FACTOR * 2.0 / 4)
@@ -450,7 +466,7 @@ async def test_the_filler_earnings_pool_scales_the_cap_diluted_spot_rates():
         assert spot.spot_cap_multiplier == pytest.approx(0.5)
         assert spot.spot_pool_multiplier == pytest.approx(4.0 / 16.0)
         assert spot.effective_rate == pytest.approx(SPOT_FACTOR * 2.0 * 0.5 * 4.0 / 16.0)
-    assert sum(s.gpu_count * s.effective_rate for s in spots) == pytest.approx(4.0)
+    assert sum(s.gpu_count * s.effective_rate for s in spots) == pytest.approx(SPOT_FACTOR * 4.0)
     _assert_pool_pays_exactly(incentive)
 
 
@@ -1479,7 +1495,7 @@ async def test_a_spot_node_on_the_pay_list_is_paid(context_factory):
     assert result.spot_pay_candidate is True
     # the model's fillers earned 2.0 x 100 GPU-hours over 24 h: less than 8 GPUs at 2.0 an hour
     assert result.filler_revenue_usd_per_hour == pytest.approx(2.0 * 100 / 24)
-    assert result.effective_rate * result.gpu_count == pytest.approx(2.0 * 100 / 24)
+    assert result.effective_rate * result.gpu_count == pytest.approx(SPOT_FACTOR * 2.0 * 100 / 24)
     assert result.incentive > 0
     assert _codes(result) == []
 
@@ -1643,3 +1659,21 @@ async def test_secure_uses_an_average_taken_over_24_gpu_hours(context_factory):
 
     assert secure.filler_revenue_per_gpu_hour == 2.0
 
+
+def test_the_spot_line_names_the_pay_factor_the_pool_multiplier_uses() -> None:
+    # lio#2231 r4560801130: the text providers redo the sum with must say 0.9x, not 1x, of the filler earnings
+    class _Result(SimpleNamespace):
+        def __getattr__(self, name: str) -> None:  # the fields this test does not read
+            return None
+
+    result = _Result(executor_info=SimpleNamespace(uuid="ex-1"))
+    line = MinerLogLine.spot_pay_incentive_calculated(
+        hotkey="hk",
+        result=result,
+        secure_rate=1.0,
+        filler_rate=2.0,
+        paid_fraction=1.0,
+        pay_factor=SPOT_FACTOR,
+    )
+
+    assert "paid more than 0.9 x what its fillers earn per hour" in line.message
