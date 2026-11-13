@@ -31,6 +31,10 @@ SSHD_CONFIG="${LIUM_SSHD_CONFIG:-/etc/ssh/sshd_config}"
 
 WATCHDOG_PIDFILE="$RUN_DIR/sshd-watchdog.pid"
 WATCHDOG_LOG="/tmp/sshd-watchdog.log"
+# Written once the watchdog sees a logged-in SSH session; the validator restarts a dead
+# sshd only in a pod without it (services/task/checks/pod_sshd_restart.py).
+LOGIN_SEEN="${LIUM_LOGIN_SEEN:-/var/lib/lium/ssh-login-seen}"
+PROC_DIR="${LIUM_PROC_DIR:-/proc}"
 SLEEP_SECONDS=30
 SCRIPT_PATH="$0"
 
@@ -424,8 +428,18 @@ verify_sshd() {
     return 1
 }
 
+# An authenticated session's sshd process is titled "sshd: <user>@<tty|notty>" (OpenSSH 9.8+:
+# "sshd-session: ..."); listener and pre-auth titles carry no "@".
+note_login() {
+    [ ! -e "$LOGIN_SEEN" ] || return 0
+    if grep -qsE '^sshd(-session)?: [^ []+@' "$PROC_DIR"/[0-9]*/cmdline; then
+        mkdir -p "$(dirname "$LOGIN_SEEN")" && : > "$LOGIN_SEEN" && log "SSH login seen"
+    fi
+}
+
 watchdog_loop() {
     while true; do
+        note_login || true
         if ! is_sshd_running; then
             acquire_lock
             if ensure_sshd_installed; then

@@ -67,6 +67,7 @@ from .checks import (
     NvlinkFaultCheck,
     NvmlDigestCheck,
     PinnedMemoryProbeCheck,
+    PodSshdRestartCheck,
     PortConnectivityCheck,
     PortCountCheck,
     PostRentalGpuRecheckCheck,
@@ -418,6 +419,8 @@ class PipelineFactory:
                 RentedPodResourcesCheck(),
                 RentedPodNetworkCheck(),
                 RentedPodOwnershipCheck(),
+                # restarts a dead sshd in a never-logged-in rented pod, so never in the dry run
+                PodSshdRestartCheck(),
                 # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
                 RentedThroughputCheck(),
                 # DAH-6241: a rented node never reaches the matmul; its stored GPU model verdict judges it
@@ -555,6 +558,8 @@ class PipelineFactory:
                 RentedPodResourcesCheck(),
                 RentedPodNetworkCheck(),
                 RentedPodOwnershipCheck(),
+                # restarts a dead sshd in a never-logged-in rented pod, so never in the dry run
+                PodSshdRestartCheck(),
                 # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
                 RentedThroughputCheck(),
                 # DAH-6241: a rented node never reaches the matmul; its stored GPU model verdict judges it
