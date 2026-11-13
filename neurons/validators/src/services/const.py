@@ -176,7 +176,7 @@ VERIFY_JOB_REQUIRED_COUNT = 6 * 24 * 1
 # Rental Price Incentive Constants
 TEMPO = 360  # blocks per epoch (from subtensor)
 SECONDS_PER_BLOCK = 12  # seconds per block
-FIXED_RATIO = 0.41  # fixed constant for rental emission calculation
+FIXED_RATIO = 0.50  # miners' share of subnet emission; converts USD pay to emission share
 
 IS_NOT_DEPOSITED_SCORE_MULTIPLIER = 0.5
 DOCKER_DIND_IMAGE = "daturaai/dind:0.0.3"
@@ -328,6 +328,10 @@ EDIT_PARKED_SUFFIX = "__prev"
 # the name itself says the validator stopped it. Protected and reaped like EDIT_PARKED_SUFFIX.
 RECOVERY_STOPPED_SUFFIX = "__stopped"
 PARKED_SUFFIXES = (EDIT_PARKED_SUFFIX, RECOVERY_STOPPED_SUFFIX)
+# A parked container with renter files in its own layer under the encrypted volume's plaintext path (written
+# while dockerd ran it without the gocryptfs mount; a later remount only hides them) is kept under this prefix
+# after a successful edit, instead of removed: no sweep removes a name outside pod_/filler_.
+KEPT_UNMOUNTED_PREFIX = "kept_unmounted_"
 
 
 def unparked_name(name: str) -> str:

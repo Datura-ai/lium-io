@@ -599,10 +599,12 @@ def shared_device_nodes_command(*, is_whole_host_rental: bool, whole_host_only: 
     RDMA verbs devices and the caps/IMEX directories), in the order the full command prints them
     after the common nodes — the pre-run probe (DAH-3257) lists both parts once and picks later.
     """
+    # DAH-6184: $nvswitch_globs is set by the prefix below. This SSH runs inside the executor
+    # container, where nvidia-modprobe creates /dev/nvidia-nvswitchctl on every host with the
+    # driver loaded; the host dockerd has no such node without a switch and fails the create.
     common_globs = (
         "/dev/nvidiactl /dev/nvidia-modeset /dev/nvidia-uvm "
-        "/dev/nvidia-uvm-tools /dev/nvidia-nvswitchctl "
-        "/dev/nvidia-nvswitch[0-9]* /dev/nvidia-nvlink[0-9]*"
+        "/dev/nvidia-uvm-tools $nvswitch_globs /dev/nvidia-nvlink[0-9]*"
     )
     whole_host_globs = "/dev/infiniband/uverbs[0-9]* /dev/infiniband/rdma_cm"
     if whole_host_only:
@@ -611,8 +613,14 @@ def shared_device_nodes_command(*, is_whole_host_rental: bool, whole_host_only: 
         globs = f"{common_globs} {whole_host_globs}"
     else:
         globs = common_globs
+    # /proc is the host kernel's, so its switch list holds inside the container too.
+    nvswitch_prefix = (
+        'nvswitch_globs=""; '
+        '[ -n "$(ls -A /proc/driver/nvidia-nvswitch/devices 2>/dev/null)" ] && '
+        'nvswitch_globs="/dev/nvidia-nvswitchctl /dev/nvidia-nvswitch[0-9]*"; '
+    )
     cmd = (
-        f"for p in {globs}; do "
+        f"{'' if whole_host_only else nvswitch_prefix}for p in {globs}; do "
         '[ -e "$p" ] && printf "%s\\n" "$p"; '
         "done"
     )

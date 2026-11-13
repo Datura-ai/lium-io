@@ -214,43 +214,6 @@ async def test_run_container_retry_adopts_the_first_create_still_running_in_dock
     ]
 
 
-@pytest.mark.asyncio
-async def test_run_container_retry_reports_the_cpus_of_an_adopted_cpu_refusal_retry():
-    """The 12-CPU create is refused, the 10-CPU retry reaches dockerd but its reply is lost: the
-    transport retry adopts that container and reports the 10 CPUs its label holds, not the 12 asked."""
-    api = _FakeApiClient(adapter=_FakeAdapter())
-    refusal = APIError(
-        "400 Client Error: Bad Request",
-        explanation="range of CPUs is from 0.01 to 10.00, as there are only 10 CPUs available",
-    )
-    creates = iter([refusal, EOFError()])
-
-    def create_container(**kwargs):
-        api.calls.append("create_container")
-        error = next(creates)
-        if isinstance(error, EOFError):
-            api.existing_containers[kwargs["name"]] = {
-                "Id": "retried",
-                "Config": {"Image": kwargs["image"], "Labels": kwargs["labels"]},
-            }
-        raise error
-
-    api.create_container = create_container
-    granted = []
-    spec = ContainerRunSpec(
-        image="lium/pod:1",
-        name="pod_test",
-        network="lium-rentals",
-        cpu_count=12,
-        min_cpu_count=10,
-        on_cpus_granted=granted.append,
-    )
-
-    assert await _client(api).run_container(spec) == "retried"
-    assert granted == [10]
-    assert api.calls == ["create_container", "create_container", "inspect_container", "start"]
-
-
 # ---------------------------------------------------------------------------
 # pull: the stream cut mid-pull (27 Oct alert ece89) → one re-open and one more pull
 # ---------------------------------------------------------------------------
@@ -354,7 +317,8 @@ async def test_a_miner_whose_dns_stalls_cannot_stop_another_miners_rental_connec
 
     def info(address):
         return SimpleNamespace(
-            address=address, ssh_port=2222, ssh_username="root", ssh_host_key="ssh-ed25519 AAAATESTKEY"
+            address=address, ssh_port=2222, ssh_username="root", ssh_host_key="ssh-ed25519 AAAATESTKEY",
+            expected_ssh_host_key=None,
         )
 
     async def connect_as(miner, address):

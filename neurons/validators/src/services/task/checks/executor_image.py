@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable
 from dataclasses import replace
 
 from core.config import settings
+from core.utils import _m, get_extra_info
+from services.default_docker_image_digest_service import executor_build_published
 from services.executor_image_policy import (
     ImageVerdict,
     normalize_sha256_digest,
@@ -15,6 +18,8 @@ from ..messages import ExecutorImageMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .rental_owner import rental_of_this_node
+
+logger = logging.getLogger(__name__)
 
 _EXECUTOR_NAME = re.compile(r"(?:^|-)executor-\d+$")
 
@@ -77,13 +82,31 @@ class ExecutorImageCheck:
             return CheckResult(passed=True, event=event)
 
         report = snapshot.report(observed_executor_digest(ctx.state.specs))
+        if report.status is ImageVerdict.OUTDATED:
+            published = await executor_build_published(report.observed_digest)
+            # a plain line, outside the event sink's repeat demotion, so a Loki count per cycle is exact
+            logger.info(
+                _m(
+                    "EXECUTOR_BUILD",
+                    extra=get_extra_info(
+                        {
+                            **ctx.default_extra,
+                            "executor_build": {True: "official", False: "unofficial"}.get(published, "unknown"),
+                            "observed_digest": report.observed_digest,
+                            "executor_image_unofficial_enforced": settings.EXECUTOR_IMAGE_UNOFFICIAL_ENFORCE,
+                        }
+                    ),
+                )
+            )
+            if published is False and settings.EXECUTOR_IMAGE_UNOFFICIAL_ENFORCE:
+                report = replace(report, status=ImageVerdict.UNOFFICIAL)
         updated_state = replace(ctx.state, executor_image_report=report)
         what = report.as_dict()
 
         if report.status is ImageVerdict.CURRENT:
             event = render_message(Msg.CURRENT, ctx=ctx, check_id=self.check_id, what=what)
             passed = True
-        elif not settings.EXECUTOR_IMAGE_CHECK_ENFORCE:
+        elif report.status is ImageVerdict.OUTDATED and not settings.EXECUTOR_IMAGE_CHECK_ENFORCE:
             # Warning only (DAH-2701 paused until DAH-3419 restores auto-update): the verdict
             # and both digests are logged, the check passes, and the score is left alone.
             passed = True
@@ -103,7 +126,7 @@ class ExecutorImageCheck:
             is_rented = rented_executor is not None and len(rented_executor.pods) > 0
             passed = is_rented
             event = render_message(
-                Msg.OUTDATED,
+                Msg.UNOFFICIAL if report.status is ImageVerdict.UNOFFICIAL else Msg.OUTDATED,
                 ctx=ctx,
                 check_id=self.check_id,
                 what=what,

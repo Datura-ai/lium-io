@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from helpers import build_services, build_state
+from helpers import FakeRedis, build_services, build_state
 from neurons.validators.src.services import matrix_validation_service as mvs
 from neurons.validators.src.services.matrix_validation_service import ValidationResult
 from neurons.validators.src.services.task.checks import capability
@@ -55,6 +55,7 @@ def _offset(uuid: str) -> int:
 
 async def _filler_cycles(context_factory, service, cycles: int, specs=None, clock=None) -> list:
     results = []
+    redis = FakeRedis()  # one Redis across the cycles, as in the validator
     for i in range(cycles):
         if clock is not None:
             clock["now"] = i - _offset("executor-123")
@@ -66,7 +67,7 @@ async def _filler_cycles(context_factory, service, cycles: int, specs=None, cloc
                 filler_containers_by_executor={"executor-123": "filler_active"},
             ),
         )
-        ctx = context_factory(services=build_services(validation=service), state=state)
+        ctx = context_factory(services=build_services(validation=service, redis=redis), state=state)
         results.append(await CapabilityCheck().run(ctx))
     return results
 
