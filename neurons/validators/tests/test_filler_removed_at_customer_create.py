@@ -438,7 +438,8 @@ async def test_failed_late_filler_power_restore_fails_and_cleans_customer(svc, m
     result = await _run(svc, _payload(workload_kind=WorkloadKind.CUSTOMER_RENTAL))
     # Assert: use the cleanup failure and remove the customer's own container.
     assert isinstance(result, FailedContainerRequest)
-    assert result.failure_step == ("gpu_power_restore_state" if platform_state_failure else "container_cleanup")
+    # a host nvidia-smi failure is the node's step, not container_cleanup (excused while a filler run is known)
+    assert result.failure_step == ("gpu_power_restore_state" if platform_state_failure else "gpu_power_restore")
     assert restore.await_args.kwargs["require_complete"] is True
     assert f"/usr/bin/docker rm -fv {_CUSTOMER_CONTAINER_ID} 2>/dev/null || true" in _commands(ssh_client)
 

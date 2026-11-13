@@ -190,6 +190,26 @@ async def test_a_refusal_not_for_this_intent_is_not_echoed(
     assert (refusal.error, refusal.echoed) == (expected, False)
 
 
+class _ClosedWriter(_Writer):
+    def write(self, data: bytes) -> None:
+        raise BrokenPipeError("Channel not open for sending")
+
+
+@pytest.mark.asyncio
+async def test_a_command_that_exits_before_reading_the_intent_keeps_its_exit_status(
+    keypair, intent
+):
+    # Prod 11 Nov: the shell exited at once (no liumd), so writing the intent raised BrokenPipe
+    # and the 127 was lost as "transport".
+    process = FakeProcess(b"", 127, stderr=b"sh: /usr/local/bin/liumd: not found\n")
+    process.stdin = _ClosedWriter()
+
+    with pytest.raises(LocalVerifyUnavailable) as err:
+        await _run(keypair, intent, FakeConnection(process))
+
+    assert err.value.reason == "not_supported" and process.closed
+
+
 def _unavailable_cases(intent):
     return [
         ("malformed", FakeConnection(FakeProcess(b"{not json", 0))),
