@@ -1040,6 +1040,10 @@ def get_docker_info(content: bytes):
             data["docker_host_cpu_percent"] = host_cpu_percent
 
         containers = []
+        # docker names a container's host after its short id: the container this scrape runs in. The
+        # monitor (or any other container) on the executor image must not be reported as the executor
+        own_id = socket.gethostname()
+        own_id = own_id if len(own_id) >= 12 else ''
 
         for container_id in container_ids:
             # Get the image ID of the container
@@ -1062,7 +1066,9 @@ def get_docker_info(content: bytes):
             digest = None
             if repo_digests:
                 digest = repo_digests[0].split('@')[1]
-                if repo_digests[0].split('@')[0] == 'daturaai/compute-subnet-executor':
+                if repo_digests[0].split('@')[0] == 'daturaai/compute-subnet-executor' and not (
+                    own_id and data["docker_container_id"].startswith(own_id)
+                ):
                     data["docker_container_id"] = container_id
 
             container_entry = {'each_container_id': container_id, 'each_digest': digest or '', "each_name": container_name}

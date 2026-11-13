@@ -51,11 +51,21 @@ def _fake_run_cmd(outputs: dict[str, str | Exception]):
     return run_cmd
 
 
-def _scrape(outputs: dict[str, str | Exception], host_percent: float = 40.0) -> dict[str, object]:
+class _Socket:
+    def __init__(self, hostname: str) -> None:
+        self._hostname = hostname
+
+    def gethostname(self) -> str:
+        return self._hostname
+
+
+def _scrape(
+    outputs: dict[str, str | Exception], host_percent: float = 40.0, hostname: str = "node"
+) -> dict[str, object]:
     namespace = build_scrape_namespace(
         SRC / "miner_jobs" / "machine_scrape.py",
         CPU_HELPERS,
-        {"json": json, "os": os, "tempfile": tempfile, "psutil": _Psutil(host_percent)},
+        {"json": json, "os": os, "tempfile": tempfile, "psutil": _Psutil(host_percent), "socket": _Socket(hostname)},
     )
     namespace["run_cmd"] = _fake_run_cmd(outputs)
     return namespace
@@ -224,3 +234,14 @@ def test_the_traffic_and_cpu_readings_survive_the_production_obfuscation():
 
     assert (host, cpu) == (40.0, {RENTER[:12]: 158.0})
     assert net_io == {RENTER[:12]: (1_230_000_000_000, 456_000_000)}
+
+
+def test_the_executor_id_is_the_container_the_scrape_runs_in_not_the_last_on_its_image():
+    # DAH-6251: the monitor runs the executor image too; listed after the executor it must not take its id
+    monitor = "cccccccccccc" + "0" * 52
+    outputs = _docker_outputs(f"{EXECUTOR[:12]}|100.00%\n{monitor[:12]}|50.00%\n", [EXECUTOR, monitor])
+    outputs["json .RepoDigests"] = '["daturaai/compute-subnet-executor@sha256:exec"]\n'
+
+    data = _scrape(outputs, hostname=EXECUTOR[:12])["get_docker_info"](b"#!/bin/sh\n")
+
+    assert data["docker_container_id"] == EXECUTOR
