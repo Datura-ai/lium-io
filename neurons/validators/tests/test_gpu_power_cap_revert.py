@@ -1,19 +1,18 @@
-"""DAH-2786 — a host that puts its own GPU power limit back loses the unrented incentive.
+"""DAH-2786 — a host that puts its own GPU power limit back while Lium's job runs.
 
 Case 3 of the three power-cap problems: the cap applies, the validator reads it back, and
 then something on the provider's host raises the limit again. The PEARL filler is killed by
-the backend grace check, so the node runs no Lium job — and today it still collects the full
-unrented incentive.
+the backend grace check, and the backend holds idle pay until a later filler run keeps the cap;
+the validator only records and logs the revert (its 2-in-24h pay gate is gone, DAH-6092).
 
 The revert is observed WHILE the Lium job runs, in the validation check that already skips the
 power-limit penalty for a live filler. That is the only moment it can be told apart from a host
 that leaves our cap alone and merely resets the limit after the job ends, which harms nothing.
-This suite covers the three halves: the rule, the recording, and the incentive gate.
+This suite covers the rule and the recording, and that no validator pay gate reads them.
 """
 
 import asyncio
 import json
-import logging
 import time
 from unittest.mock import AsyncMock
 
@@ -22,10 +21,8 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 from helpers import build_services, build_state
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 
-from core.config import settings
 from incentive.config import IncentiveConfig
-from incentive.rental_price import MIN_POWER_CAP_REVERTS_TO_PENALIZE, NCU_PROFILING_UNRESTRICTED, RentalPriceIncentive
-from incentive.miner_incentive_log import ZeroIncentiveReason
+from incentive.rental_price import NCU_PROFILING_UNRESTRICTED, RentalPriceIncentive
 from payload_models.payloads import GpuPowerLimit
 from services.const import DEFAULT_JOB_OWNER_LIUM
 from services.gpu_power_limit import (
@@ -41,7 +38,6 @@ from services.gpu_power_limit import (
     apply_filler_gpu_power_limits,
     clear_filler_pod_applied_caps,
     detect_cap_revert,
-    read_gpu_power_cap_reverts,
     restore_filler_pod_applied_caps,
 )
 from services.task.checks import gpu_power_limit as check_module
@@ -618,30 +614,6 @@ async def test_history_is_bounded(context_factory, monkeypatch) -> None:
 # ---------------------------- the applied-cap stamp ----------------------------
 
 
-# ---------------------------- read_gpu_power_cap_reverts ----------------------------
-
-
-@pytest.mark.asyncio
-async def test_read_returns_only_reverts_inside_the_window() -> None:
-    now = time.time()
-    history = GpuPowerCapRevertHistory(
-        reverts=[
-            GpuPowerCapRevert(observed_at=now - CAP_REVERT_WINDOW_SECONDS - 1, pod_id="pod-old", gpu_uuid="GPU-a", capped_to_watts=280, found_watts=400),
-            GpuPowerCapRevert(observed_at=now - 10, pod_id="pod-new", gpu_uuid="GPU-b", capped_to_watts=280, found_watts=400),
-        ],
-    )
-    redis = FakeRedis({_revert_key(EXECUTOR_ID): history.model_dump_json()})
-
-    reverts = await read_gpu_power_cap_reverts(redis, EXECUTOR_ID)
-
-    assert [revert.gpu_uuid for revert in reverts] == ["GPU-b"]
-
-
-@pytest.mark.asyncio
-async def test_read_is_empty_without_a_record() -> None:
-    assert await read_gpu_power_cap_reverts(FakeRedis(), EXECUTOR_ID) == []
-
-
 @pytest.mark.asyncio
 async def test_the_stamp_moves_a_frozen_record_onto_the_capping_executor() -> None:
     # A GPU whose record was frozen under an earlier executor must not file its next breach
@@ -661,20 +633,7 @@ async def test_the_stamp_moves_a_frozen_record_onto_the_capping_executor() -> No
     assert stored.pod_id == POD_ID
 
 
-@pytest.mark.asyncio
-async def test_read_fails_open_when_redis_is_down() -> None:
-    # Redis resilience: our own outage must never zero an innocent provider's incentive.
-    assert await read_gpu_power_cap_reverts(BrokenRedis(), EXECUTOR_ID) == []
-
-
-@pytest.mark.asyncio
-async def test_read_fails_open_on_a_corrupt_record() -> None:
-    redis = FakeRedis({_revert_key(EXECUTOR_ID): json.dumps({"nonsense": True})})
-
-    assert await read_gpu_power_cap_reverts(redis, EXECUTOR_ID) == []
-
-
-# ---------------------------- the incentive gate ----------------------------
+# ---------------------------- no incentive gate ----------------------------
 
 
 def _build_incentive(redis: FakeRedis) -> RentalPriceIncentive:
@@ -723,97 +682,12 @@ def _make_job(is_rented: bool = False) -> JobResult:
 
 
 @pytest.mark.asyncio
-async def test_one_revert_does_not_reach_the_threshold() -> None:
-    # A driver reset can raise a limit on its own, so a single observation is not a breach.
-    incentive = _build_incentive(_redis_with_reverts(1))
-
-    assert await incentive._power_cap_reverted(_make_job()) is None
-
-
-@pytest.mark.asyncio
-async def test_repeated_reverts_are_flagged() -> None:
-    incentive = _build_incentive(_redis_with_reverts(MIN_POWER_CAP_REVERTS_TO_PENALIZE))
-
-    reverted = await incentive._power_cap_reverted(_make_job())
-
-    assert reverted is not None
-    assert reverted.revert_count == MIN_POWER_CAP_REVERTS_TO_PENALIZE
-    assert reverted.capped_to_watts == 280
-    assert reverted.found_watts == 400
-
-
-def test_the_rule_is_the_one_the_provider_docs_publish() -> None:
-    # lium-platform apps/docs providers/nodes/gpu-power-cap.md "Do not put the limit back":
-    # "After 2 such jobs in 24 hours ... the idle payout stops". Change the docs with these.
-    assert MIN_POWER_CAP_REVERTS_TO_PENALIZE == 2
-    assert CAP_REVERT_WINDOW_SECONDS == 24 * 60 * 60
-    assert ZeroIncentiveReason.REVERTS_GPU_POWER_CAP == "reverts_gpu_power_cap"
-
-
-@pytest.mark.asyncio
-async def test_gate_fails_open_when_redis_is_down() -> None:
-    incentive = _build_incentive(BrokenRedis())
-
-    assert await incentive._power_cap_reverted(_make_job()) is None
-
-
-@pytest.mark.asyncio
-async def test_shadow_mode_keeps_rental_eligibility(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT", False)
-    incentive = _build_incentive(_redis_with_reverts(MIN_POWER_CAP_REVERTS_TO_PENALIZE))
+async def test_recorded_reverts_do_not_withhold_idle_pay() -> None:
+    # DAH-6092: the backend holds idle pay until a later filler run keeps the cap; the validator
+    # gate misfired on split nodes at a filler swap, so recorded reverts no longer gate anything.
+    incentive = _build_incentive(_redis_with_reverts(5))
 
     result = await incentive.calculate_executor_score(_make_job())
 
     assert result.eligible_for_rental_share is True
     assert "reverts_gpu_power_cap" not in "\n".join(result.incentive_logs)
-
-
-@pytest.mark.asyncio
-async def test_shadow_mode_emits_the_measurement_log(monkeypatch, caplog) -> None:
-    # The shadow numbers are the whole deliverable of the first deploy.
-    monkeypatch.setattr(settings, "ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT", False)
-    incentive = _build_incentive(_redis_with_reverts(MIN_POWER_CAP_REVERTS_TO_PENALIZE))
-
-    with caplog.at_level(logging.INFO):
-        await incentive.calculate_executor_score(_make_job())
-
-    breach = next(
-        record.msg for record in caplog.records
-        if hasattr(record.msg, "extra") and record.msg.extra.get("reason") == "reverts_gpu_power_cap"
-    )
-    assert "shadow only - flag off" in breach.message
-    assert breach.extra["power_cap_revert_count"] == MIN_POWER_CAP_REVERTS_TO_PENALIZE
-    assert breach.extra["enforced"] is False
-    assert breach.extra["pool"] == "rental_kept_shadow"
-
-
-@pytest.mark.asyncio
-async def test_enforced_drops_rental_eligibility(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT", True)
-    incentive = _build_incentive(_redis_with_reverts(MIN_POWER_CAP_REVERTS_TO_PENALIZE))
-
-    result = await incentive.calculate_executor_score(_make_job())
-
-    assert result.eligible_for_rental_share is False
-    assert result.mining_score == 0
-    assert "reverts_gpu_power_cap" in "\n".join(result.incentive_logs)
-
-
-@pytest.mark.asyncio
-async def test_rented_executor_is_never_gated(monkeypatch) -> None:
-    # The gate only withholds the UNRENTED incentive; a rented node earns from the mining pool.
-    monkeypatch.setattr(settings, "ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT", True)
-    incentive = _build_incentive(_redis_with_reverts(MIN_POWER_CAP_REVERTS_TO_PENALIZE))
-
-    assert await incentive._power_cap_reverted(_make_job(is_rented=True)) is not None  # gate is state-only
-    result = await incentive.calculate_executor_score(_make_job(is_rented=True))
-
-    assert "reverts_gpu_power_cap" not in "\n".join(result.incentive_logs)
-
-
-@pytest.mark.asyncio
-async def test_enforcement_ships_off() -> None:
-    # Rollout contract: this gate infers provider intent, so it starts in shadow.
-    default = type(settings).model_fields["ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT"].default
-
-    assert default is False

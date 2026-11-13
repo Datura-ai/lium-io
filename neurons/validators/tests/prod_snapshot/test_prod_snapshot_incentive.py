@@ -128,7 +128,6 @@ def mock_redis_from_snapshot(prod_snapshot: dict) -> AsyncMock:
 def prod_settings(monkeypatch, prod_snapshot: dict) -> None:
     """Patch settings to match production config from snapshot."""
     s = prod_snapshot["settings"]
-    monkeypatch.setattr(settings, "PORTION_FOR_SYSBOX", s["PORTION_FOR_SYSBOX"])
     monkeypatch.setattr(settings, "PORTION_FOR_UPTIME", s["PORTION_FOR_UPTIME"])
     monkeypatch.setattr(settings, "UPTIME_REQUIRED_MINUTES", s["UPTIME_REQUIRED_MINUTES"])
     monkeypatch.setattr(settings, "BURNERS", s["BURNERS"])
@@ -165,9 +164,6 @@ def _build_job_results(prod_snapshot: dict) -> dict[str, list[JobResult]]:
                 collateral_deposited=r["collateral_deposited"],
                 sysbox_runtime=r["sysbox_runtime"],
                 is_rented=r["is_rented"],
-                # Decides which sysbox rule the rented executor falls under: a rental created
-                # on or after SYSBOX_RENTED_CUTOFF scores 0 without sysbox, an older one only
-                # loses PORTION_FOR_SYSBOX. Absent in a snapshot = the older, lenient rule.
                 rental_created_at=r.get("rental_created_at"),
                 rented_gpu_count=r.get("rented_gpu_count"),
                 job_batch_id=r["job_batch_id"],
@@ -453,6 +449,12 @@ async def _score_with_and_without_rented_gpu_counts(
     mock_redis: AsyncMock,
 ) -> tuple[BaseIncentive, BaseIncentive]:
     """The same pool scored as (mixed pools, whole-box) — the latter is today's behavior."""
+    # These captures predate required sysbox (a rented node without it scores 0 now); the split rule is
+    # measured on the fleet as it would run today, every node with sysbox.
+    prod_snapshot = copy.deepcopy(prod_snapshot)
+    for results in prod_snapshot["job_results"].values():
+        for r in results:
+            r["sysbox_runtime"] = True
     mixed = _create_incentive(prod_snapshot, mock_redis, "rental_price")
     await mixed.calculate_mining_scores()
     whole_box = _create_incentive(
@@ -510,14 +512,14 @@ async def test_prod_snapshot_split_node_earns_more_when_its_free_gpus_can_earn(
 ):
     """DAH-2467 — the goal of the change, on a real fleet rather than a mocked rental share.
 
-    Scoped to split nodes whose free GPUs are actually admitted to the unrented pool, which
-    under this snapshot's rules means running sysbox. Such a node must come out ahead of
+    Every node is scored with sysbox (see _score_with_and_without_rented_gpu_counts), so the free
+    GPUs of each split node are admitted to the unrented pool. Such a node must come out ahead of
     today's whole-box scoring: it gives up mining score for the rented GPUs and more than
     makes it back on the free ones.
     """
-    split_rows = [r for r in _partially_rented_split_rows(prod_snapshot) if r["sysbox_runtime"]]
+    split_rows = _partially_rented_split_rows(prod_snapshot)
     if not split_rows:
-        pytest.skip("no partially rented split node with sysbox in this snapshot")
+        pytest.skip("no partially rented split node in this snapshot")
 
     mixed, whole_box = await _score_with_and_without_rented_gpu_counts(
         prod_snapshot, mock_redis_from_snapshot
