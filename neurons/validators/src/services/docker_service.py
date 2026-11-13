@@ -143,6 +143,7 @@ from services.gpu_clocks import (
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, reset_pod_gpus
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.hung_gpu_reset import HungGpuResult, reset_hung_pod_gpus
+from services.host_memory_guard import apply_host_memory_guard
 from services.image_flatten import (
     FLATTEN_NO_DISK_RENTER_SENTENCE,
     FLATTEN_SIZING_SLACK_BYTES,
@@ -3682,7 +3683,7 @@ class DockerService:
         cancel (the copy is free for the next flatten's cleanup)."""
         flatten_lease: list[str] = []
         try:
-            return await self._run_rental_docker_create_attempts(
+            container_id = await self._run_rental_docker_create_attempts(
                 docker_client=docker_client,
                 ssh_client=ssh_client,
                 run_spec=run_spec,
@@ -3699,6 +3700,8 @@ class DockerService:
                 flatten_lease=flatten_lease,
                 pod_id=pod_id,
             )
+            await apply_host_memory_guard(ssh_client, [container_name], default_extra)
+            return container_id
         finally:
             for lease in flatten_lease:
                 try:

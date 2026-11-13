@@ -197,3 +197,18 @@ async def test_cgroup_written_directly_is_seen(context_factory, cgroup_cpuset, c
     result = await _run(_ctx(context_factory, ssh))
     assert _findings(result) == findings
     assert result.passed is (not findings)
+
+
+@pytest.mark.asyncio
+async def test_memory_guard_coverage_is_counted_in_the_result(context_factory):
+    ssh = _ssh(_container())
+    inner_run = ssh.run
+
+    async def run(cmd, *args, **kwargs):
+        if "memory.oom.group" in cmd:
+            return SimpleNamespace(exit_status=0, stdout="memory_min_skipped no_systemd\n", stderr="")
+        return await inner_run(cmd, *args, **kwargs)
+
+    result = await _run(_ctx(context_factory, SimpleNamespace(run=run)))
+
+    assert result.event.what_we_saw["memory_guard"] == {"set": 0, "failed": ["memory_min no_systemd"], "events": []}

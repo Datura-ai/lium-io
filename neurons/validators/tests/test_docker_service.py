@@ -10734,7 +10734,8 @@ async def test_the_flatten_lease_is_released_however_the_create_ends(
 async def test_no_flatten_no_lease_release(docker_service):
     ssh = _node_ssh()
     assert await _create_with_flatten(docker_service, _SysboxFailingRentalClient(set()), AsyncMock(), ssh=ssh) == "cid"
-    ssh.run.assert_not_awaited()
+    # only the host memory guard ran on the node
+    assert [c for c in ssh.run.await_args_list if "memory.oom.group" not in c.args[0]] == []
 
 
 @pytest.mark.asyncio
