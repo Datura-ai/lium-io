@@ -719,17 +719,19 @@ def docker_api_get(path):
 
 
 def get_executor_pid_mode():
-    # PidMode of the container this scrape runs in: the one whose init (docker's State.Pid) is an ancestor
-    # of this process. A hostname can name any container. Under `pid: host` that container is always found;
-    # in a private PID namespace no host pid is an ancestor, which is reported as "" (not host).
+    # PidMode of the container this scrape runs in: the one whose processes (listed by cgroup, like
+    # `docker top`) include this one. A hostname can name any container. Under `pid: host` the scrape sees
+    # its host pid, so its container is always found; in a private PID namespace the pid is not a host pid,
+    # which is reported as "" (not host).
     # A missing or non-string PidMode raises, so the scrape reports unknown instead of a failing mode.
-    ancestors = own_ancestor_pids()
+    own_pid = str(os.getpid())
     for summary in docker_api_get("/containers/json") or []:
-        inspection = docker_api_get(f"/containers/{summary.get('Id')}/json")
-        state = inspection.get("State") if isinstance(inspection, dict) else None
-        if not isinstance(state, dict) or state.get("Pid") not in ancestors:
+        container_id = summary.get("Id")
+        top = docker_api_get(f"/containers/{container_id}/top?ps_args=-eo%20pid") or {}
+        if [own_pid] not in (top.get("Processes") or []):
             continue
-        host_config = inspection.get("HostConfig")
+        inspection = docker_api_get(f"/containers/{container_id}/json")
+        host_config = inspection.get("HostConfig") if isinstance(inspection, dict) else None
         pid_mode = host_config.get("PidMode") if isinstance(host_config, dict) else None
         if not isinstance(pid_mode, str):
             raise ValueError(f"docker inspect has no HostConfig.PidMode: {pid_mode!r}")
