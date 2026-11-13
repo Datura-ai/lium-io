@@ -719,14 +719,22 @@ def docker_api_get(path):
 
 
 def get_executor_pid_mode():
-    # PidMode of the executor's own container (hostname = container id): "host", or "" when private.
-    # A missing or non-string value raises, so the scrape reports unknown instead of a failing mode.
-    inspection = docker_api_get(f"/containers/{socket.gethostname()}/json")
-    host_config = inspection.get("HostConfig") if isinstance(inspection, dict) else None
-    pid_mode = host_config.get("PidMode") if isinstance(host_config, dict) else None
-    if not isinstance(pid_mode, str):
-        raise ValueError(f"docker inspect has no HostConfig.PidMode: {pid_mode!r}")
-    return pid_mode
+    # PidMode of the container this scrape runs in: the one whose init (docker's State.Pid) is an ancestor
+    # of this process. A hostname can name any container. Under `pid: host` that container is always found;
+    # in a private PID namespace no host pid is an ancestor, which is reported as "" (not host).
+    # A missing or non-string PidMode raises, so the scrape reports unknown instead of a failing mode.
+    ancestors = own_ancestor_pids()
+    for summary in docker_api_get("/containers/json") or []:
+        inspection = docker_api_get(f"/containers/{summary.get('Id')}/json")
+        state = inspection.get("State") if isinstance(inspection, dict) else None
+        if not isinstance(state, dict) or state.get("Pid") not in ancestors:
+            continue
+        host_config = inspection.get("HostConfig")
+        pid_mode = host_config.get("PidMode") if isinstance(host_config, dict) else None
+        if not isinstance(pid_mode, str):
+            raise ValueError(f"docker inspect has no HostConfig.PidMode: {pid_mode!r}")
+        return pid_mode
+    return ""
 
 
 def get_vloopback_volume_bytes(docker_root_dir, filler_only=False, sizes=None):
@@ -2548,7 +2556,7 @@ def get_machine_specs():
     except Exception as exc:
         data["data_disk_health_scrape_error"] = repr(exc)
 
-    # DAH: the executor's PID namespace mode, read from its own container (hostname = container id).
+    # DAH: the executor's PID namespace mode, read from the container this scrape runs in.
     # "host" is required: backups read /proc/<rental pid> of the host. Missing key = unknown, never fails.
     try:
         data["data_executor_pid_mode"] = get_executor_pid_mode()
