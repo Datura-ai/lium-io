@@ -11002,7 +11002,12 @@ class DockerService:
                             await early_volume_probe
                         current_step = "flatten_wait"
                         try:
-                            locked_df_avail_bytes = await wait_for_node_flatten(ssh_client, with_trash=bool(cache_df_floor))
+                            # a full-node volume is sparse: any trash still being deleted is its disk, also one an
+                            # earlier attempt's reclaim left (this one then finds no cache to detach)
+                            full_node = payload.disk_share is not None and payload.disk_share >= 1
+                            locked_df_avail_bytes = await wait_for_node_flatten(
+                                ssh_client, with_trash=bool(cache_df_floor) or full_node
+                            )
                         except FlattenMeasureFailed as exc:
                             # lock held and mark written: the sizing's measurement-failure fallback;
                             # a lock or mark failure propagates and stops the create
