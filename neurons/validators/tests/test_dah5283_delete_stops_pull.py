@@ -120,3 +120,29 @@ async def test_a_delete_mid_custom_build_stops_the_build_before_its_export_and_t
     assert build_cancelled.is_set()
     assert not any("docker save" in c for c in seen)
     assert any("rm -f" in c and "lium-dind-build-" in c for c in ssh_client.calls)
+
+
+@pytest.mark.asyncio
+async def test_a_step_failing_after_the_delete_is_the_renters_cancel_and_holds_no_node(svc, monkeypatch):
+    """DAH-6410: a step that ends in an error after the renter's delete flagged the create (a long node
+    wait, then a failure) is the renter's cancel, not the provider's failure."""
+    payload = _payload()
+    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=1))
+    hold = AsyncMock()
+    monkeypatch.setattr(svc, "hold_node_until_probe_passes", hold)
+
+    async def deleted_then_failed(*args, **kwargs):
+        inflight_creates.cancel(payload.pod_id)
+        raise RuntimeError("volume plugin refused")
+
+    svc.create_local_volume = AsyncMock(side_effect=deleted_then_failed)
+
+    with inflight_creates.track(payload.pod_id):
+        result = await _run(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "cancelled_by_delete"
+    assert hold.await_args.args[1] == "cancelled_by_delete"
+    from services.docker_service import is_host_fault_create_failure
+
+    assert not is_host_fault_create_failure(hold.await_args.args[1], hold.await_args.kwargs["error"])
