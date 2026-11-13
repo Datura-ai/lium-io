@@ -126,7 +126,7 @@ class RentedPodResourcesCheck:
             )
 
         # a restarted pod or a rebooted host loses them (DAH-6379)
-        await apply_host_memory_guard(ctx.ssh, names, {"executor_uuid": ctx.executor.uuid})
+        memory_guard = await apply_host_memory_guard(ctx.ssh, names, {"executor_uuid": ctx.executor.uuid})
         try:
             pods = await self._inspect(ctx.ssh, names)
             init_reads_by_pid = await self._read_init(ctx.ssh, [p.pid for p in pods])
@@ -141,7 +141,11 @@ class RentedPodResourcesCheck:
         outcomes = [
             judge_pod(_with_init(pod, init_reads_by_pid.get(pod.pid)), host_cpus) for pod in pods
         ]
-        what = {"executor_uuid": ctx.executor.uuid, "pods": [asdict(o) for o in outcomes]}
+        what = {
+            "executor_uuid": ctx.executor.uuid,
+            "pods": [asdict(o) for o in outcomes],
+            "memory_guard": {"set": len(memory_guard["set"]), "failed": memory_guard["failed"]},
+        }
         if any(f in SCORED_FINDINGS for o in outcomes for f in o.findings):
             event = render_message(Msg.RESOURCES_REDUCED, ctx=ctx, check_id=self.check_id, what=what)
             return CheckResult(passed=False, event=event, updates={"rented_pod_resources_passed": False})

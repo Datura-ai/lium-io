@@ -10,7 +10,8 @@ again on every rented-pod resources check, so a restarted pod or a rebooted host
   dockerd, containerd, sysbox, the executor's own container) and on system.slice, so their pages are
   not reclaimed when a pod drives the host out of memory. `--runtime`: gone at reboot, set again here.
 
-Best-effort and silent on hosts without cgroup v2, systemd or a host view: nothing is changed there.
+Best-effort: never fails the caller. Every setting it cannot apply (no cgroup v2, systemd or host view, a
+denied write) is printed as a reason, logged as a WARNING with the node id and returned, so coverage is visible.
 """
 
 from __future__ import annotations
@@ -37,11 +38,12 @@ UNIT_MEMORY_MIN_MIB = {
 EXECUTOR_MEMORY_MIN_MIB = 1536
 
 _OOM_GROUP_SCRIPT = (
-    "for id in $(/usr/bin/docker inspect --format '{{.Id}}' %(names)s 2>/dev/null); do "
+    "for id in $(/usr/bin/docker inspect --format '{{.Id}}' %(names)s 2>/dev/null); do f=; "
     "for d in /proc/1/root/sys/fs/cgroup/system.slice/docker-$id.scope /proc/1/root/sys/fs/cgroup/docker/$id; do "
-    '[ -f "$d/memory.oom.group" ] || continue; '
-    '[ "$(cat "$d/memory.oom.group")" = 1 ] || { echo 1 > "$d/memory.oom.group" && echo "oom_group_set $id"; }; '
-    "done; done"
+    '[ -f "$d/memory.oom.group" ] || continue; f=1; '
+    '[ "$(cat "$d/memory.oom.group")" = 1 ] || { { echo 1 > "$d/memory.oom.group"; } 2>/dev/null '
+    '&& echo "oom_group_set $id" || echo "oom_group_failed $id write_denied"; }; '
+    'done; [ -n "$f" ] || echo "oom_group_failed $id no_cgroup_v2_scope"; done'
 )
 
 
@@ -50,17 +52,23 @@ def _host_memory_min_script() -> str:
     # sshd is ssh.service on Debian/Ubuntu and sshd.service elsewhere: count it once
     total_mib = sum(UNIT_MEMORY_MIN_MIB.values()) - UNIT_MEMORY_MIN_MIB["ssh.service"] + EXECUTOR_MEMORY_MIN_MIB
     inner = (
-        "[ -d /run/systemd/system ] && [ -f /sys/fs/cgroup/cgroup.controllers ] || exit 0; "
+        "[ -d /run/systemd/system ] || { echo memory_min_skipped no_systemd; exit 0; }; "
+        "[ -f /sys/fs/cgroup/cgroup.controllers ] || { echo memory_min_skipped no_cgroup_v2; exit 0; }; "
         "set_min() { [ \"$(systemctl show -p MemoryMin --value \"$1\")\" = \"$2\" ] && return; "
-        'systemctl set-property --runtime "$1" MemoryMin="$2" && echo "memory_min_set $1"; }; '
+        'systemctl set-property --runtime "$1" MemoryMin="$2" >/dev/null 2>&1 && echo "memory_min_set $1" '
+        '|| echo "memory_min_failed $1 set_property_failed"; }; '
         f"for kv in {units}; do u=${{kv%=*}}; systemctl is-active -q \"$u\" && set_min \"$u\" \"${{kv#*=}}\"; done; "
         # this shell sits in the executor's cgroup; with the host cgroup namespace its path is absolute
         "ex=$(sed -n 's#^0::/system.slice/\\(docker-[0-9a-f]*\\.scope\\)$#\\1#p' /proc/self/cgroup); "
-        f'[ -n "$ex" ] && set_min "$ex" {EXECUTOR_MEMORY_MIN_MIB * MIB}; '
+        f'if [ -n "$ex" ]; then set_min "$ex" {EXECUTOR_MEMORY_MIN_MIB * MIB}; '
+        "else echo memory_min_failed executor no_host_cgroup_path; fi; "
         # a child's protection never exceeds its parent's
         f"set_min system.slice {total_mib * MIB}; true"
     )
-    return "command -v nsenter >/dev/null 2>&1 || exit 0; nsenter -t 1 -m -C -- sh -c " + shlex.quote(inner)
+    return (
+        "if ! command -v nsenter >/dev/null 2>&1; then echo memory_min_skipped no_nsenter; "
+        "else nsenter -t 1 -m -C -- sh -c " + shlex.quote(inner) + " 2>/dev/null || echo memory_min_skipped nsenter_failed; fi"
+    )
 
 
 def host_memory_guard_script(container_names: list[str]) -> str:
@@ -69,12 +77,28 @@ def host_memory_guard_script(container_names: list[str]) -> str:
     return f"{oom_group}; {_host_memory_min_script()}; true"
 
 
-async def apply_host_memory_guard(ssh, container_names: list[str], log_extra: dict | None = None) -> None:
-    """Never raises: a host this cannot reach keeps running as before."""
+def parse_guard_output(stdout: str) -> dict:
+    """{"set": [...], "failed": [...]}: each item is the script's line without its verb."""
+    result: dict = {"set": [], "failed": []}
+    for line in stdout.splitlines():
+        verb, _, rest = line.strip().partition(" ")
+        if verb.endswith("_set"):
+            result["set"].append(f"{verb.removesuffix('_set')} {rest}")
+        elif verb.endswith(("_failed", "_skipped")):
+            result["failed"].append(f"{verb.rsplit('_', 1)[0]} {rest}")
+    return result
+
+
+async def apply_host_memory_guard(ssh, container_names: list[str], log_extra: dict | None = None) -> dict:
+    """Never raises: a host this cannot reach keeps running as before. Returns parse_guard_output's dict."""
+    extra = log_extra or {}
     try:
         res = await ssh.run(host_memory_guard_script(container_names), timeout=TIMEOUT_SECONDS)
-        changed = (getattr(res, "stdout", "") or "").split()
-        if changed:
-            logger.info(_m("HOST_MEMORY_GUARD_APPLIED", extra=get_extra_info({**(log_extra or {}), "changed": changed})))
+        result = parse_guard_output(getattr(res, "stdout", "") or "")
     except Exception as exc:  # noqa: BLE001
-        logger.warning(_m("HOST_MEMORY_GUARD_FAILED", extra=get_extra_info({**(log_extra or {}), "error": repr(exc)})))
+        result = {"set": [], "failed": [f"ssh {exc!r}"]}
+    if result["set"]:
+        logger.info(_m("HOST_MEMORY_GUARD_APPLIED", extra=get_extra_info({**extra, "changed": result["set"]})))
+    if result["failed"]:
+        logger.warning(_m("HOST_MEMORY_GUARD_NOT_APPLIED", extra=get_extra_info({**extra, "failed": result["failed"]})))
+    return result
