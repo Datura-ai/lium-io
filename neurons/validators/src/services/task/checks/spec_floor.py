@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-from collections import Counter
 
 from ..messages import SpecFloorMessages as Msg
 from ..messages import render_message
@@ -18,9 +17,10 @@ _ZERO_UUID = "GPU-00000000-0000-0000-0000-000000000000"
 
 
 def _int(value) -> int:
+    # Untrusted JSON: Infinity raises OverflowError, NaN ValueError; both read as invalid (0).
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 
@@ -35,16 +35,16 @@ def spec_floor_findings(specs: dict) -> list[str]:
         findings.append("ram_per_gpu")
     if gpu_count != len(uuids):
         findings.append("gpu_count_vs_cards")
+    # One card listed twice is a known scrape glitch on healthy nodes; the kernel-count check
+    # already fails a node whose distinct card set is short.
     if any(not _GPU_UUID.match(u) or u.upper() == _ZERO_UUID for u in uuids):
         findings.append("gpu_uuid_format")
-    elif any(n > 1 for n in Counter(u.lower() for u in uuids).values()):
-        findings.append("gpu_uuid_duplicate")
     return findings
 
 
 class SpecFloorCheck:
     """Hard floors on the scraped specs: CPU cores, RAM per GPU, GPU count against the listed cards, GPU UUID
-    format and uniqueness. Pure data, before the rented short-circuit. Fatal on an idle node; under a live
+    format. Pure data, before the rented short-circuit. Fatal on an idle node; under a live
     rental the run goes on to the rented-pod checks and the score is zeroed through spec_floor_passed."""
 
     check_id = "host.validate.spec_floor"

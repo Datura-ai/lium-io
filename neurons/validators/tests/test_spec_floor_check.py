@@ -58,7 +58,8 @@ async def test_healthy_h100x8_passes(context_factory):
             "gpu_uuid_format",
         ),
         ({"gpu_count": 2, "uuids": ["not-a-uuid", _uuid(2)]}, "gpu_uuid_format"),
-        ({"gpu_count": 2, "uuids": [_uuid(1), _uuid(1)]}, "gpu_uuid_duplicate"),
+        ({"cpu": float("inf")}, "cpu_count"),
+        ({"ram_gb": float("inf")}, "ram_per_gpu"),
     ],
 )
 @pytest.mark.asyncio
@@ -68,6 +69,14 @@ async def test_implausible_spec_fails_idle_node_fatally(kwargs, finding, context
     assert (result.passed, result.fatal) == (False, None)
     assert result.event.reason_code == Msg.REJECTED.reason
     assert finding in result.event.what_we_saw["findings"]
+
+
+@pytest.mark.asyncio
+async def test_one_card_read_twice_in_a_scrape_passes(context_factory):
+    # A healthy node's scrape can list one card twice; the kernel-count check owns a short set.
+    _, result = await _run(context_factory, gpu_count=2, uuids=[_uuid(1), _uuid(1)])
+
+    assert result.passed is True
 
 
 @pytest.mark.asyncio
