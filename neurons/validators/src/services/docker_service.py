@@ -3268,6 +3268,14 @@ def _wipe_volume_cmd(local_volume: str, *container_names: str) -> str:
     )
 
 
+# one file at a time under the trash lock the locked disk measure holds (flatten_wait_command): df and the trash
+# size are read with no delete between them, so no freed byte is missed by both
+_TRASH_DELETE = (
+    'if command -v flock >/dev/null; then L="$1.lock"; '
+    'find "$1" -depth ! -type d -exec flock "$L" rm -f {} \\; ; flock "$L" rm -rf "$1"; else rm -rf "$1"; fi'
+)
+
+
 def _detach_volume_data_cmd(volume_name: str, remove_cmd: str) -> str:
     """`remove_cmd` with the volume's files moved out first and deleted in the background (DAH-2498).
 
@@ -3289,7 +3297,8 @@ def _detach_volume_data_cmd(volume_name: str, remove_cmd: str) -> str:
         'b=$(du -sxB1 "/proc/1/root$m" | cut -f1) && mv "/proc/1/root$m" "/proc/1/root$t/$v.$$" && '
         '{ mkdir "/proc/1/root$m" 2>/dev/null; true; } || t=; '
         f"{remove_cmd}; "
-        'if [ -n "$t" ]; then (setsid nohup nice -n 19 rm -rf "/proc/1/root$t" </dev/null >/dev/null 2>&1 &); '
+        f'if [ -n "$t" ]; then (setsid nohup nice -n 19 sh -c {shlex.quote(_TRASH_DELETE)} _ "/proc/1/root$t" '
+        "</dev/null >/dev/null 2>&1 &); "
         'echo "detached $b"; fi'
     )
 
@@ -6413,14 +6422,18 @@ class DockerService:
 
             killed: tuple[str, ...] = tuple(killed_fillers)
 
+            # a partial or legacy rental's volume is fallocated right after this: it needs the bytes freed before
+            # the create, so only a full-node rental leaves the delete running in the background
+            detach = payload.disk_share is not None and payload.disk_share >= 1
+
             def volume_remove(name: str) -> str:
-                if not killed:
-                    return _detach_volume_data_cmd(name, DockerCommand.volume_remove(name))
-                return _detach_volume_data_cmd(
-                    name,
-                    f"/usr/bin/docker volume rm {shlex.quote(name)} 2>/dev/null || "
-                    f"( {_wipe_volume_cmd(name, *killed)} ) || true",
+                command = (
+                    DockerCommand.volume_remove(name)
+                    if not killed
+                    else f"/usr/bin/docker volume rm {shlex.quote(name)} 2>/dev/null || "
+                    f"( {_wipe_volume_cmd(name, *killed)} ) || true"
                 )
+                return _detach_volume_data_cmd(name, command) if detach else command
 
             # Oldest first, only as much as the rental needs: a kept Engy checkpoint still restarts fast.
             removal_failed = False

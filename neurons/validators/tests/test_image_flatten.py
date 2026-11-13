@@ -828,3 +828,11 @@ async def test_the_flattens_own_disk_check_budgets_the_containerd_import_twice(d
     assert f"-ge {copies * 24 * 1024**3 + FLATTEN_DISK_MARGIN_BYTES + 79 * 1024**3} ]" in command
     # containerd also counts the real export bytes (a sparse file reports a small Size); overlay2's Size does not under-count
     assert ("| wc -c" in command) == (copies == 2)
+
+
+def test_the_locked_measure_reads_df_and_the_trash_under_the_trash_lock():
+    # review: the detached delete takes this lock per file, so df and du see the same deletes
+    command = image_flatten.flatten_wait_command(with_trash=True)
+
+    assert command.index("lium-cache-trash.lock && flock -w 60 7") < command.index("df -P") < command.index("du -sxB1")
+    assert "lium-cache-trash.lock" not in image_flatten.flatten_wait_command()

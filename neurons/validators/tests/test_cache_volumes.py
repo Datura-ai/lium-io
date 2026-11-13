@@ -1,4 +1,5 @@
 import asyncio
+import fcntl
 import os
 import subprocess
 import time
@@ -8,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from payload_models.payloads import CacheVolume, ContainerCreateRequest, WorkloadKind
+from services import docker_service as docker_service_module
 from services.container_cleanup import idle_filler_images_removal_command
 from services.docker_service import DockerService, _detach_volume_data_cmd, _filler_run_volume_gb, _wipe_volume_cmd
 
@@ -791,6 +793,7 @@ async def test_bytes_still_being_freed_in_the_background_count_toward_the_rental
 
     ssh_client = DetachingSshClient(["dphn_cache_hf_x", _KIMI, "volume_pod"], free_gb=2389)
     rental = _rental(2620, 1310)
+    rental.disk_share = 1.0
 
     assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is True
     assert len(_removed_volumes(ssh_client)) == 1
@@ -810,7 +813,41 @@ async def test_bytes_the_background_delete_already_freed_are_not_counted_twice(d
 
     ssh_client = FastDeleteSshClient(["dphn_cache_hf_x", _KIMI, "volume_pod"], free_gb=2389)
     df_floor: list[int] = []
+    rental = _rental(2620, 1310)
+    rental.disk_share = 1.0
 
-    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, _rental(2620, 1310), {}, df_floor=df_floor) is True
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}, df_floor=df_floor) is True
     assert len(_removed_volumes(ssh_client)) == 2
     assert df_floor == [(2389 + 300) * 1024**3]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disk_share, detached", [(1.0, True), (0.5, False), (None, False)])
+async def test_only_a_full_node_rental_leaves_the_cache_delete_running(docker_service, disk_share, detached):
+    # review: a partial or legacy volume is fallocated right after the reclaim, so a delete still running hits ENOSPC
+    ssh_client = HostSshClient([_KIMI, "volume_pod"], free_gb=2389)
+    rental = _rental(2620, 1310)
+    rental.disk_share = disk_share
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is True
+    assert _removed_volumes(ssh_client) == [_KIMI]
+    assert any("lium-cache-trash" in command for command in ssh_client.commands) is detached
+
+
+def test_the_background_delete_frees_nothing_while_the_disk_measure_holds_the_trash_lock(tmp_path):
+    # review: a file deleted between the measure's df and du was counted in neither and shrank the volume
+    trash = tmp_path / "lium-cache-trash"
+    (trash / "v.1").mkdir(parents=True)
+    (trash / "v.1/model.safetensors").write_bytes(b"x" * 8192)
+    lock = open(f"{trash}.lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    delete = subprocess.Popen(["sh", "-c", docker_service_module._TRASH_DELETE, "_", str(trash)])
+    try:
+        time.sleep(1)
+        assert (trash / "v.1/model.safetensors").exists()
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        assert delete.wait(timeout=10) == 0
+        assert not trash.exists()
+    finally:
+        delete.kill()
+        lock.close()

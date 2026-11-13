@@ -254,16 +254,20 @@ def flatten_sized_mark_command() -> str:
 
 def flatten_wait_command(with_trash: bool = False) -> str:
     root = "\"$(/usr/bin/docker info --format '{{.DockerRootDir}}')\""
+    trash = f'"/proc/1/root"{root}/{CACHE_TRASH_DIR}'
+    # the cache files this create's detached `rm` is still deleting (DAH-2498) are free once it ends. They are read
+    # under the trash lock that `rm` takes per file, so df and du see the same deletes; a lock not had in time
+    # keeps df first: a byte freed in between is then missed, never counted twice
+    trash_lock = f': >>{trash}.lock 2>/dev/null && exec 7>>{trash}.lock && flock -w 60 7; ' if with_trash else ""
     # under the lock a copy holds for its whole run: no copy is half-written while df measures, and a
     # flatten that has not started copying refuses once it sees the mark (nothing to print without flock)
     command = (
         f"command -v flock >/dev/null || exit 0; exec 9>>{FLATTEN_LOCK_PATH}; "
-        f"flock -w {FLATTEN_TIMEOUT_SECONDS + 300} 9 || exit 1; touch {FLATTEN_SIZED_PATH} || exit 1; "
+        f"flock -w {FLATTEN_TIMEOUT_SECONDS + 300} 9 || exit 1; touch {FLATTEN_SIZED_PATH} || exit 1; {trash_lock}"
         f"{df_command(root)} || exit {FLATTEN_MEASURE_FAILED_EXIT}"
     )
     if with_trash:
-        # the cache files this create's detached `rm` is still deleting (DAH-2498): free once it ends
-        command += f'; echo "trash $(du -sxB1 "/proc/1/root"{root}/{CACHE_TRASH_DIR} 2>/dev/null | cut -f1)"'
+        command += f'; echo "trash $(du -sxB1 {trash} 2>/dev/null | cut -f1)"'
     return command
 
 
