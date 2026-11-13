@@ -22,6 +22,7 @@ DMI_FILES = " ".join(
 )
 HW_ID_FS_SEPARATOR = "--hw-id-fs--"
 HW_ID_VALUES_SEPARATOR = "--hw-id-values--"
+HW_ID_BOOT_SEPARATOR = "--hw-id-boot--"
 # One round-trip, the same shape as nvidia_devices.KERNEL_GPU_VIEW_CMD: mounts on any dmi path,
 # the filesystem each DMI file really lives on (`stat -f %T`: "sysfs"), its kind (no -L, so a
 # symlink shows), then the identity values.
@@ -33,6 +34,7 @@ HW_ID_CMD = (
     + "; ".join(
         f"printf '%s|' \"$(head -c 128 {DMI_ID_PATH}/{name} 2>/dev/null)\"" for name in DMI_IDENTITY_ATTRIBUTES
     )
+    + f"; echo; echo {HW_ID_BOOT_SEPARATOR}; head -c 64 /proc/sys/kernel/random/boot_id 2>/dev/null"
 )
 HW_ID_READ_TIMEOUT_SECONDS = 15
 # sysfs reports a 4096-byte size for its attributes, so `stat -c %F` reads "regular file"
@@ -83,14 +85,19 @@ def digest(values: list[str]) -> str:
     return hashlib.sha256("\n".join(values).encode()).hexdigest()[:16]
 
 
-def dmi_identity_drifted(previous: dict | None, gpus: list[str], dmi_identity: str) -> bool:
-    """DMI identity changed between checks while the GPU set stayed: the board did not change, the overlay did."""
+def dmi_identity_drifted(previous: dict | None, gpus: list[str], dmi_identity: str, boot_id: str = "") -> bool:
+    """DMI identity changed between checks while the GPU set stayed: the board did not change, the overlay did.
+
+    The boot id avoids a false positive after a host restart (a hypervisor may assign a new product_uuid).
+    """
+    restarted = bool(boot_id and previous and previous.get("boot") and previous.get("boot") != boot_id)
     return bool(
         previous
         and dmi_identity
         and previous.get("dmi")
         and previous.get("gpus") == gpus
         and previous.get("dmi") != dmi_identity
+        and not restarted
     )
 
 
@@ -118,17 +125,19 @@ class HardwareIdentityCheck:
         kernel = sorted(set(kernel_uuids)) if kernel_uuids is not None else None
         gpus = kernel or reported
 
-        mountinfo = file_fs = values = ""
+        mountinfo = file_fs = values = boot_id = ""
         if ctx.ssh is not None:
             try:
                 res = await asyncio.wait_for(ctx.ssh.run(HW_ID_CMD), timeout=HW_ID_READ_TIMEOUT_SECONDS)
                 mountinfo, _, rest = (res.stdout or "").partition(HW_ID_FS_SEPARATOR)
                 file_fs, _, values = rest.partition(HW_ID_VALUES_SEPARATOR)
+                values, _, boot_id = values.partition(HW_ID_BOOT_SEPARATOR)
             except Exception as exc:
                 logger.warning("hardware identity read failed: %s", repr(exc)[:500], extra=ctx.default_extra)
         overlays = dmi_overlay_findings(mountinfo, file_fs)
         # "<product_uuid>|<board_serial>|"; both unreadable reads as no identity
         dmi_identity = values.strip() if values.strip().strip("|") else ""
+        boot_id = boot_id.strip()
 
         previous = None
         key = f"{HW_ID_KEY_PREFIX}:{ctx.executor.uuid}"
@@ -137,7 +146,7 @@ class HardwareIdentityCheck:
             previous = json.loads(raw) if raw else None
             if gpus and dmi_identity and not overlays:
                 await ctx.services.redis.set(
-                    key, json.dumps({"gpus": gpus, "dmi": dmi_identity}), ex=HW_ID_TTL_SECONDS
+                    key, json.dumps({"gpus": gpus, "dmi": dmi_identity, "boot": boot_id}), ex=HW_ID_TTL_SECONDS
                 )
         except Exception:
             logger.warning("hardware identity record unavailable", exc_info=True, extra=ctx.default_extra)
@@ -153,7 +162,7 @@ class HardwareIdentityCheck:
             findings.append("dmi_overlaid")
         if gpu_sources_disagree(reported, host_kernel or kernel):
             findings.append("gpu_sources_disagree")
-        if dmi_identity_drifted(previous, gpus, dmi_identity):
+        if dmi_identity_drifted(previous, gpus, dmi_identity, boot_id):
             findings.append("dmi_changed_under_same_gpus")
 
         what = {

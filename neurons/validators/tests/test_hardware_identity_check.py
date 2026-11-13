@@ -9,6 +9,7 @@ from neurons.validators.src.services.nvidia_devices import KernelGpuView
 from neurons.validators.src.services.task.checks import hardware_identity
 from neurons.validators.src.services.task.checks.hardware_identity import (
     DMI_ID_PATH,
+    HW_ID_BOOT_SEPARATOR,
     HW_ID_FS_SEPARATOR,
     HW_ID_VALUES_SEPARATOR,
     HardwareIdentityCheck,
@@ -71,8 +72,9 @@ def _ctx(
     )
 
 
-def _stdout(mounts=SYS_MOUNT, rows=SYSFS_ROW, values="uuid-1|serial-1|"):
-    return f"{mounts}{HW_ID_FS_SEPARATOR}\n{rows}{HW_ID_VALUES_SEPARATOR}\n{values}"
+def _stdout(mounts=SYS_MOUNT, rows=SYSFS_ROW, values="uuid-1|serial-1|", boot=None):
+    out = f"{mounts}{HW_ID_FS_SEPARATOR}\n{rows}{HW_ID_VALUES_SEPARATOR}\n{values}"
+    return out if boot is None else f"{out}\n{HW_ID_BOOT_SEPARATOR}\n{boot}\n"
 
 
 async def _run(ctx):
@@ -138,6 +140,17 @@ async def test_dmi_change_under_same_gpus_is_flagged(context_factory):
     result = await _run(_ctx(context_factory, stdout=_stdout(values="uuid-2|serial-1|"), redis=redis))
     assert result.passed is False
     assert result.event.what_we_saw["findings"] == ["dmi_changed_under_same_gpus"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("boot_before", "boot_after", "flagged"), [("boot-1", "boot-1", True), ("boot-1", "boot-2", False)])
+async def test_host_restart_false_positive(context_factory, boot_before, boot_after, flagged):
+    ctx = _ctx(context_factory, stdout=_stdout(values="uuid-1|serial-1|", boot=boot_before))
+    redis = ctx.services.redis
+    assert (await _run(ctx)).passed is True
+
+    result = await _run(_ctx(context_factory, stdout=_stdout(values="uuid-2|serial-1|", boot=boot_after), redis=redis))
+    assert result.passed is (not flagged)
 
 
 @pytest.mark.asyncio
