@@ -11704,14 +11704,18 @@ class DockerService:
                         and not post_run_exc.log_tail
                         and payload.workload_kind == WorkloadKind.FILLER
                     ):
-                        # a restarting image's output can land after the first read: read once more before
-                        # the cleanup removes the container
-                        post_run_exc.log_tail = await _container_log_tail_or_empty(
-                            docker_client,
-                            container_name=container_id or container_name,
-                            environment=custom_options.environment if custom_options else None,
-                            log_extra=default_extra,
-                        )
+                        # a restarting image's output can land seconds after the first read: poll a bounded
+                        # few seconds before the cleanup removes the container
+                        for delay_s in (1, 2, 2):
+                            await asyncio.sleep(delay_s)
+                            post_run_exc.log_tail = await _container_log_tail_or_empty(
+                                docker_client,
+                                container_name=container_id or container_name,
+                                environment=custom_options.environment if custom_options else None,
+                                log_extra=default_extra,
+                            )
+                            if post_run_exc.log_tail:
+                                break
                     container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
                         default_extra=default_extra,
