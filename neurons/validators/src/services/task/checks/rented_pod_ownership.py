@@ -15,7 +15,7 @@ READ_TIMEOUT_SECONDS = 30
 
 # sudo refuses to run when any of these is not owned by the pod's root, so a shift that spares / and /root
 # still breaks it; a partial shift can also spare those and leave the package dirs to nobody, so apt and dpkg
-# fail (pod 71fc3916, 13 Nov)
+# fail
 PATHS = (
     "/",
     "/root",
