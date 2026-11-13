@@ -418,10 +418,11 @@ class GpuThermalThrottleMessages:
         severity="warning",
         category="env",
         impact="Proceed; score not changed (observation only)",
-        remediation="A busy GPU is held far below its clock by a thermal or hardware slowdown (see gpus[]: "
-        "temperature_c, graphics_clock_mhz, max_graphics_clock_mhz, reasons). Check `nvidia-smi -q -d "
-        "PERFORMANCE,TEMPERATURE`, the fans, airflow and the datacenter cooling; the renter is getting a "
-        "fraction of the card's speed.",
+        remediation="A busy GPU is held far below its clock by a thermal or hardware slowdown, or by a power cap "
+        "while its power limit is at the default (see gpus[]: temperature_c, graphics_clock_mhz, "
+        "max_graphics_clock_mhz, clocks_event_reasons, reasons). Check `nvidia-smi -q -d "
+        "PERFORMANCE,TEMPERATURE,POWER`, the fans, airflow, the power supply and the datacenter cooling; the "
+        "renter is getting a fraction of the card's speed.",
     )
     COLLAPSED = MessageTemplate(
         event="GPU clock collapsed by thermal throttling",
