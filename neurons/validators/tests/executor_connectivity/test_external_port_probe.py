@@ -478,6 +478,41 @@ async def test_a_missed_port_joining_a_re_probe_round_gets_as_many_retries_as_an
     assert sum(TEN[2] in t for t in tries) == verifier.REPROBE_ROUNDS + 2  # own try, first probe, 5 retries
 
 
+@pytest.mark.parametrize(
+    "missed_start",
+    [
+        ContainerStartResult(ok=False, container_id=None, status="Exited (1)"),  # refused
+        RuntimeError("SSH channel open failed"),  # raised
+        asyncio.TimeoutError(),  # timed out
+    ],
+    ids=["refused", "raised", "timed_out"],
+)
+@pytest.mark.asyncio
+async def test_a_failed_missed_port_start_keeps_the_ports_that_already_answered(mocker, missed_start):
+    # the main listener's ports already meet the minimum; the missed port's extra start must not void them
+    async def reached(host, sample, token):
+        return sample[:2]
+
+    def answer(tested):
+        return ([], tested) if tested == TEN[2:3] else (tested, [])
+
+    verifier, runner = _parallel_verifier(mocker, reached, answer=answer)
+
+    async def docker_run(_ssh, name, *_args):
+        if name.endswith("_s"):
+            if isinstance(missed_start, Exception):
+                raise missed_start
+            return missed_start
+        return ContainerStartResult(ok=True, container_id="c", status="Up")
+
+    runner.run.side_effect = docker_run
+
+    result = await verifier.verify(TEN, ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert result.successful == [p for p in TEN if p != TEN[2]]
+    assert runner.run.await_count == 3  # one attempt: no retry of the whole verification
+
+
 @pytest.mark.asyncio
 async def test_the_ready_host_ports_are_probed_while_the_missed_ports_listener_still_starts(mocker):
     # a slow start of the missed sampled port's listener must not spend the deadline the ready ports need

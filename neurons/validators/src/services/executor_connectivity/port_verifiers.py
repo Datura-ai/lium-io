@@ -183,6 +183,15 @@ class BatchVerifier:
                 start_watch, ssh_client, container, NetcatScript.batch(listen, token, idx), "host", 60
             ))
 
+        async def optional_start(listen: list[PortPair], container: str) -> ContainerStartResult:
+            # the missed ports' listener is extra: its failure must not discard the ports that already answered
+            try:
+                return await host_start(listen, container, 1, "missed_start")
+            except Exception as exc:  # not CancelledError: a cancelled start still ends the attempt
+                start_watch.in_progress -= 1  # it returned, by raising; only a cancelled start stays in progress
+                logger.warning(_m(f"missed-port listener start failed: {exc!r}", extra=get_extra_info(log_ctx)))
+                return ContainerStartResult(ok=False, container_id=None, status=repr(exc))
+
         outside = timed("outside", self._outside_reading(sample, token, ssh_client, host, log_ctx, start_watch, timings))
         # DAH-6133: on a busy host each `docker run` takes seconds, and run one after another they used most of the
         # 60 s; the host listener for the ports outside the sample starts alongside the outside reading. Not when
@@ -222,7 +231,7 @@ class BatchVerifier:
                 # the outside container held these ports; their host listener can bind now that it is gone.
                 # It starts beside the probe of `rest`: a slow start must not spend the deadline those ports need
                 start_watch.missed_container = f"{name}_s"
-                missed_start = asyncio.ensure_future(host_start(missed, start_watch.missed_container, 1, "missed_start"))
+                missed_start = asyncio.ensure_future(optional_start(missed, start_watch.missed_container))
         else:
             ports_left = [p for p in ports if p not in sampled_ok]
             if not ports_left:
