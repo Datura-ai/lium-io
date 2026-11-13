@@ -309,9 +309,13 @@ async def test_a_sampled_port_the_outside_reading_missed_gets_its_host_listener_
         return sample[:2]
 
     # the validator's own first try on the published listener misses the third sampled port too
-    verifier, runner = _parallel_verifier(
-        mocker, reached, answer=lambda tested: ([], tested) if tested == TEN[2:3] else (tested, [])
-    )
+    tries = []
+
+    def answer(tested):
+        tries.append(tested)
+        return ([], tested) if tries.count(TEN[2:3]) == 1 and tested == TEN[2:3] else (tested, [])
+
+    verifier, runner = _parallel_verifier(mocker, reached, answer=answer)
 
     result = await verifier.verify(TEN, ssh_client=mocker.Mock(), host="1.2.3.4")
 
@@ -333,3 +337,30 @@ async def test_a_split_node_needing_every_port_starts_its_host_listener_after_th
 
     assert result.successful == TEN
     assert "for port in 9003 9004 9005 9006 9007 9008 9009;" in runner.run.await_args_list[1].args[2]
+
+
+@pytest.mark.asyncio
+async def test_the_ready_host_ports_are_probed_while_the_missed_ports_listener_still_starts(mocker):
+    # a slow start of the missed sampled port's listener must not spend the deadline the ready ports need
+    rest_probed = asyncio.Event()
+
+    async def reached(host, sample, token):
+        return sample[:2]
+
+    def answer(tested):
+        if tested == TEN[3:]:
+            rest_probed.set()
+        return ([], tested) if tested == TEN[2:3] and not rest_probed.is_set() else (tested, [])
+
+    verifier, runner = _parallel_verifier(mocker, reached, answer=answer)
+
+    async def docker_run(_ssh, name, *_args):
+        if name.endswith("_s"):
+            await asyncio.wait_for(rest_probed.wait(), 1)  # starts only once the ready ports were probed
+        return ContainerStartResult(ok=True, container_id="c", status="Up")
+
+    runner.run.side_effect = docker_run
+
+    result = await verifier.verify(TEN, ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert result.successful == TEN
