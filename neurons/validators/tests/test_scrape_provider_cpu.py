@@ -51,23 +51,16 @@ def _fake_run_cmd(outputs: dict[str, str | Exception]):
     return run_cmd
 
 
-class _Socket:
-    def __init__(self, hostname: str) -> None:
-        self._hostname = hostname
-
-    def gethostname(self) -> str:
-        return self._hostname
-
-
 def _scrape(
-    outputs: dict[str, str | Exception], host_percent: float = 40.0, hostname: str = "node"
+    outputs: dict[str, str | Exception], host_percent: float = 40.0, ancestors: frozenset[int] = frozenset()
 ) -> dict[str, object]:
     namespace = build_scrape_namespace(
         SRC / "miner_jobs" / "machine_scrape.py",
         CPU_HELPERS,
-        {"json": json, "os": os, "tempfile": tempfile, "psutil": _Psutil(host_percent), "socket": _Socket(hostname)},
+        {"json": json, "os": os, "tempfile": tempfile, "psutil": _Psutil(host_percent)},
     )
     namespace["run_cmd"] = _fake_run_cmd(outputs)
+    namespace["own_ancestor_pids"] = lambda: set(ancestors)
     return namespace
 
 
@@ -236,12 +229,42 @@ def test_the_traffic_and_cpu_readings_survive_the_production_obfuscation():
     assert net_io == {RENTER[:12]: (1_230_000_000_000, 456_000_000)}
 
 
-def test_the_executor_id_is_the_container_the_scrape_runs_in_not_the_last_on_its_image():
-    # DAH-6251: the monitor runs the executor image too; listed after the executor it must not take its id
-    monitor = "cccccccccccc" + "0" * 52
-    outputs = _docker_outputs(f"{EXECUTOR[:12]}|100.00%\n{monitor[:12]}|50.00%\n", [EXECUTOR, monitor])
+def _three_on_the_executor_image(init_pid_by_id: dict[str, str]) -> dict[str, str | Exception]:
+    ids = list(init_pid_by_id)
+    outputs = _docker_outputs("".join(f"{i[:12]}|10.00%\n" for i in ids), ids)
     outputs["json .RepoDigests"] = '["daturaai/compute-subnet-executor@sha256:exec"]\n'
+    pids = iter(init_pid_by_id.values())
+    outputs["{{.State.Pid}}"] = None
+    run = _fake_run_cmd(outputs)
 
-    data = _scrape(outputs, hostname=EXECUTOR[:12])["get_docker_info"](b"#!/bin/sh\n")
+    def run_cmd(cmd):
+        return next(pids) + "\n" if "{{.State.Pid}}" in cmd else run(cmd)
 
-    assert data["docker_container_id"] == EXECUTOR
+    return run_cmd
+
+
+BURNER = "dddddddddddd" + "0" * 52
+MONITOR = "cccccccccccc" + "0" * 52
+
+
+def test_the_executor_is_the_image_container_whose_init_is_an_ancestor_of_the_scrape():
+    # DAH-6251: the burner and the monitor run the executor image too, listed before and after it;
+    # a hostname set to the burner's short id no longer matters
+    scrape = _scrape({}, ancestors=frozenset({4321, 4000, 812}))
+    scrape["run_cmd"] = _three_on_the_executor_image({BURNER: "900", EXECUTOR: "812", MONITOR: "950"})
+
+    assert scrape["get_docker_info"](b"#!/bin/sh\n")["docker_container_id"] == EXECUTOR
+
+
+def test_no_image_container_on_the_scrape_s_ancestry_reports_no_executor():
+    # never a fallback to some container on the image: an empty id excuses nothing
+    scrape = _scrape({}, ancestors=frozenset({4321, 4000}))
+    scrape["run_cmd"] = _three_on_the_executor_image({BURNER: "900", EXECUTOR: "812", MONITOR: "950"})
+
+    assert scrape["get_docker_info"](b"#!/bin/sh\n")["docker_container_id"] == ""
+
+
+def test_own_ancestor_pids_walks_up_from_this_process():
+    ns = build_scrape_namespace(SRC / "miner_jobs" / "machine_scrape.py", {"own_ancestor_pids"}, {"os": os})
+
+    assert {os.getpid(), os.getppid()} <= ns["own_ancestor_pids"]()

@@ -1002,6 +1002,20 @@ def parse_container_net_io(stats_output: str) -> dict[str, tuple[int, int]]:
     return net_io_by_short_id
 
 
+def own_ancestor_pids():
+    """This process and its ancestors. Under the required `pid: host` they are host pids, so the
+    executor container's init (docker's .State.Pid) is one of them; a hostname can be set to anything."""
+    pids, pid = set(), os.getpid()
+    try:
+        while pid > 1 and pid not in pids:
+            pids.add(pid)
+            with open(f'/proc/{pid}/stat') as stat:
+                pid = int(stat.read().rsplit(')', 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return pids
+
+
 def get_docker_info(content: bytes):
     data = {
         "docker_version": "",
@@ -1040,10 +1054,9 @@ def get_docker_info(content: bytes):
             data["docker_host_cpu_percent"] = host_cpu_percent
 
         containers = []
-        # docker names a container's host after its short id: the container this scrape runs in. The
-        # monitor (or any other container) on the executor image must not be reported as the executor
-        own_id = socket.gethostname()
-        own_id = own_id if len(own_id) >= 12 else ''
+        # the executor is the container this scrape runs in, never another one on its image (the monitor,
+        # or a burner); with no such match none is reported, which excuses nothing
+        ancestors = own_ancestor_pids()
 
         for container_id in container_ids:
             # Get the image ID of the container
@@ -1066,10 +1079,10 @@ def get_docker_info(content: bytes):
             digest = None
             if repo_digests:
                 digest = repo_digests[0].split('@')[1]
-                if repo_digests[0].split('@')[0] == 'daturaai/compute-subnet-executor' and not (
-                    own_id and data["docker_container_id"].startswith(own_id)
-                ):
-                    data["docker_container_id"] = container_id
+                if repo_digests[0].split('@')[0] == 'daturaai/compute-subnet-executor':
+                    init_pid = run_cmd(f'{docker_path} inspect --format "{{{{.State.Pid}}}}" {container_id}').strip()
+                    if init_pid.isdigit() and int(init_pid) in ancestors:
+                        data["docker_container_id"] = container_id
 
             container_entry = {'each_container_id': container_id, 'each_digest': digest or '', "each_name": container_name}
             cpu_percent = cpu_percents.get(container_id[:12])
