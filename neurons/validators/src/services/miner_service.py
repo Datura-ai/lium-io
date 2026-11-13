@@ -1075,7 +1075,9 @@ class MinerService:
                     )
                 )
             return []
-        skip = reached | manual
+        # The express lane verified it under this cycle's id after the miner's list came in (a node back from a
+        # reboot): that pass stands, or this stale row would hide the node until the next cycle.
+        skip = reached | manual | {uuid for uuid, batch in self.express_published.items() if batch == payload.job_batch_id}
         if rented_data:
             skip |= {str(uuid).lower() for uuid in rented_data.executors}
         results = []

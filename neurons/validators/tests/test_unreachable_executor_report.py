@@ -165,3 +165,18 @@ async def test_cycle_carries_listed_verdict_and_unreachable_row(rest_service, fl
     assert set(by_uuid) == {LISTED, UNREACHABLE}
     assert by_uuid[LISTED].score == 1.0
     assert by_uuid[UNREACHABLE].failure_reason_code == "EXECUTOR_UNREACHABLE_BY_MINER"
+
+
+def test_a_node_the_express_lane_passed_this_cycle_gets_no_unreachable_row(flag_on):
+    # A node back from a VM reboot: down when the miner answered the wave, verified by the express lane before
+    # the wave finished. The stale row would hide it until the next cycle.
+    msg = accepted([LISTED], [LISTED, UNREACHABLE])
+    service = make_service()
+    payload = make_payload()
+    service.express_published[UNREACHABLE] = payload.job_batch_id
+
+    assert service._build_unreachable_known_results(payload, RentedExecutorsResponse(executors={}), msg, None) == []
+
+    service.express_published[UNREACHABLE] = "an older cycle"
+    [result] = service._build_unreachable_known_results(payload, RentedExecutorsResponse(executors={}), msg, None)
+    assert result.executor_info.uuid == UNREACHABLE
