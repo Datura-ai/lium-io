@@ -40,3 +40,11 @@ def test_the_needrestart_override_keeps_the_container_runtime_and_is_valid_needr
         "sysbox.service:kept", "sysbox-mgr.service:kept", "sysbox-fs.service:kept", "docker.service:kept",
         "containerd.service:kept", "cron.service:restarted",
     ]
+
+
+def test_the_guard_is_written_before_the_already_working_exit():
+    # a host whose sysbox already works exits at "Already working?"; it runs pods, so it needs the guard most
+    text = open(SCRIPT).read()
+    call = text.index("\nkeep_needrestart_off_the_container_runtime &&")
+    assert text.count("\nkeep_needrestart_off_the_container_runtime &&") == 1
+    assert call < text.index("# ── 2. Already working?")

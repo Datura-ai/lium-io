@@ -992,6 +992,10 @@ if load_iptables_modules; then
     PREFLIGHT_FIX=$((PREFLIGHT_FIX - 1))
 fi
 
+# before "Already working?": a host that already runs pods needs it most, and that path exits early
+keep_needrestart_off_the_container_runtime && ok "apt (needrestart) never restarts sysbox, Docker or containerd." \
+    || warn "Could not write /etc/needrestart/conf.d/lium-container-runtime.conf; apt upgrades may restart sysbox under pods."
+
 # ── 2. Already working? ─────────────────────────────────
 
 INSTALLED_SYSBOX=$(sysbox_runc_version || true)
@@ -1154,8 +1158,6 @@ if [ "$SKIP_INSTALL" = false ]; then
 else
     ok "Sysbox already installed, skipping."
 fi
-keep_needrestart_off_the_container_runtime && ok "apt (needrestart) never restarts sysbox, Docker or containerd." \
-    || warn "Could not write /etc/needrestart/conf.d/lium-container-runtime.conf; apt upgrades may restart sysbox under pods."
 
 # ── 5. Configure Docker ────────────────────────────────
 
