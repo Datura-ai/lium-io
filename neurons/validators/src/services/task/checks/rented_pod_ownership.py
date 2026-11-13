@@ -162,8 +162,12 @@ class RentedPodOwnershipCheck:
             if uptime_s is not None and age_s is not None:
                 pod["started_after_boot_s"] = uptime_s - age_s
         after = [p.get("started_after_boot_s") for p in shifted]
-        if all(a is not None and a >= CONTAINER_RESTART_AFTER_BOOT_SECONDS for a in after):
+        late = [a is not None and a >= CONTAINER_RESTART_AFTER_BOOT_SECONDS for a in after]
+        if all(late):
             return Msg.SHIFTED_AFTER_CONTAINER_RESTART
+        if any(late) and None not in after:
+            # some pods restarted on a running host, others came back with it: neither cause fits every pod
+            return Msg.SHIFTED_MIXED
         return Msg.SHIFTED
 
     def _event(self, ctx: Context, template, what: dict) -> CheckResult:
