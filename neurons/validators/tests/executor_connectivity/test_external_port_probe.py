@@ -569,7 +569,7 @@ async def test_the_ready_host_ports_are_probed_while_the_missed_ports_listener_s
     assert result.successful == TEN
 
 
-def _failing_host_start_with_slow_outside_cleanup(mocker):
+def _failing_host_start_with_slow_outside_cleanup(mocker, cleanup_sec=0.05):
     # the host start fails while the outside reading waits on the prober; its container removal takes a while
     async def reached(host, sample, token):
         await asyncio.Event().wait()
@@ -584,7 +584,7 @@ def _failing_host_start_with_slow_outside_cleanup(mocker):
         raise RuntimeError("ssh dropped")
 
     async def cleanup(_ssh, name):
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(cleanup_sec)
         cleaned.append(name)
 
     runner.run.side_effect = docker_run
@@ -610,4 +610,16 @@ async def test_the_deadline_during_the_outside_container_removal_does_not_cut_it
     with pytest.raises(asyncio.TimeoutError):
         await asyncio.wait_for(attempt, timeout=0.02)  # fires while the failed attempt waits for the removal
 
-    assert cleaned == ["port_test_out_aaaaaaaa"]
+    await asyncio.sleep(0.1)
+    assert cleaned == ["port_test_out_aaaaaaaa"]  # the deadline ended the wait, not the removal
+
+
+@pytest.mark.asyncio
+async def test_a_hung_outside_container_removal_does_not_hold_the_failed_attempt(mocker):
+    mocker.patch.object(BatchVerifier, "CLEANUP_WAIT_SEC", 0.05)
+    attempt, cleaned = _failing_host_start_with_slow_outside_cleanup(mocker, cleanup_sec=3600)
+
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(attempt, timeout=1)  # the bounded wait gives up long before this
+
+    assert cleaned == []

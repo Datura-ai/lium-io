@@ -48,6 +48,7 @@ class BatchVerifier:
     # a start the attempt deadline cut off counts as hung only if it had this long: on a slow host the outside
     # probe's container can use most of the 60 s, leaving the batch start seconds before the deadline
     HUNG_START_MIN_SEC = 30
+    CLEANUP_WAIT_SEC = 30
 
     def __init__(
         self, port_tester: PortTester, runner: ContainerRunner, external_probe: ExternalPortProbe | None = None
@@ -208,16 +209,9 @@ class BatchVerifier:
                 for step in steps:
                     if not step.cancelling():
                         step.cancel()
-                # wait for that cleanup before attempt 2 publishes the same ports; asyncio.wait never cancels the
-                # steps, so the deadline firing meanwhile cannot cut it short either
-                deadline = None
-                while not all(step.done() for step in steps):
-                    try:
-                        await asyncio.wait(steps)
-                    except asyncio.CancelledError as exc:
-                        deadline = exc
-                if deadline:
-                    raise deadline
+                # wait (bounded) for that cleanup before attempt 2 publishes the same ports; asyncio.wait never
+                # cancels the steps, so a deadline or cancel here ends only the wait, not their cleanup
+                await asyncio.wait(steps, timeout=self.CLEANUP_WAIT_SEC)
                 raise
         else:
             reached, first_round = await outside
