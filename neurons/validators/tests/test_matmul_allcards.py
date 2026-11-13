@@ -94,13 +94,31 @@ async def test_a_filler_sample_skips_the_all_cards_probe(svc, monkeypatch):
     assert not result.error_message.startswith("All-cards GPU work-proof failed")
 
 
+@pytest.mark.parametrize(
+    ("model", "capacity", "budget"),
+    [
+        ("NVIDIA H100 80GB HBM3", 81920, 73728),
+        # memory-modded cards arrive under the base card's raw name; each card is sized to the modded memory
+        ("NVIDIA GeForce RTX 4090", 49140, 44237),
+        ("NVIDIA GeForce RTX 4080", 32760, 29491),
+        ("NVIDIA GeForce RTX 4080 SUPER", 32760, 29491),
+    ],
+)
 @pytest.mark.asyncio
-async def test_honest_eight_cards_probe_passes(svc):
-    probe = await svc.probe_all_claimed_cards(_ssh(real_cards=8), _executor(), {}, _spec(8))
+async def test_honest_eight_cards_probe_passes(svc, monkeypatch, model, capacity, budget):
+    spec = _spec(8, model)
+    for detail in spec["gpu"]["details"]:
+        detail["capacity"] = capacity
+    calls = MagicMock(wraps=svc._card_challenge)
+    monkeypatch.setattr(svc, "_card_challenge", calls)
+
+    probe = await svc.probe_all_claimed_cards(_ssh(real_cards=8), _executor(), {}, spec)
+
     assert probe is not None
     assert probe.passed is True
     assert len(probe.per_card) == 8
     assert all(card["ok"] for card in probe.per_card)
+    assert [call.args[1] for call in calls.call_args_list] == [budget] * 8
 
 
 
