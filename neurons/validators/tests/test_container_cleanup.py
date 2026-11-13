@@ -6,6 +6,7 @@ DAH-1991: cleanup must pick up `health_check_*` in addition to `pod_*` and
 DAH-2375: prune_dangling_anonymous_volumes must reap orphaned anonymous
 volumes left behind by historical `docker rm` without `-v`.
 """
+import asyncio
 import json
 import logging
 import random
@@ -176,6 +177,31 @@ async def test_a_volume_rm_error_after_a_successful_rm_still_counts_the_containe
 
     assert (removed_count, removed_names, unremovable) == (1, [name], [])
     assert any("docker rm -f" in c and name in c for c in rm_calls)
+
+
+@pytest.mark.asyncio
+async def test_on_removed_runs_before_a_volume_rm_that_hangs():
+    """Review 4521984351: a hang in the volume step after `docker rm` lost on_removed, so the gone
+    container's GPU processes still failed GpuUsageCheck."""
+    name = "pod_11655dc5-53ba-4a8d-a341-fe6c9d12bda7"
+    ssh, _ = _make_ssh_mock(containers=[name], ages_by_name={name: 30})
+    plain_handler = ssh.run.side_effect
+
+    async def handler(cmd, *args, **kwargs):
+        if "docker volume rm" in cmd:
+            await asyncio.sleep(60)
+        return await plain_handler(cmd, *args, **kwargs)
+
+    ssh.run.side_effect = handler
+    seen: list[str] = []
+
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.5):
+            await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+                ssh_client=ssh, rented_data=_listed(), executor_uuid=EXECUTOR_UUID, on_removed=seen.append
+            )
+
+    assert seen == [name]
 
 
 @pytest.mark.asyncio
@@ -800,6 +826,23 @@ async def test_a_non_empty_snapshot_removes_every_unlisted_container_and_no_list
 
 
 @pytest.mark.asyncio
+async def test_an_aged_retained_volume_pod_loses_its_container_but_keeps_its_volume():
+    # DAH-3333: a balance stop whose delete the host never answers keeps the renter's disk, not the running container
+    ssh, rm_calls = _host_with_live_and_stray()
+    rented_data = _real_rented_data(EXECUTOR_UUID, [LIVE_POD], fillers=[LIVE_FILLER]).model_copy(
+        update={"retained_volume_pod_ids": [STRAY_POD.removeprefix("pod_")]}
+    )
+
+    _, removed_names, _ = await ContainerCleanup(stale_threshold_minutes=15).cleanup(
+        ssh_client=ssh, rented_data=rented_data, executor_uuid=EXECUTOR_UUID
+    )
+
+    assert removed_names == [STRAY_POD]
+    assert any(STRAY_POD in c and "docker rm -f" in c for c in rm_calls)
+    assert not any("volume rm" in c for c in rm_calls)
+
+
+@pytest.mark.asyncio
 async def test_cleanup_logs_the_rented_count_not_the_fleet_set(caplog):
     fleet_pods = [f"pod_00000000-0000-4000-8000-{i:012d}" for i in range(500)]
     stale = [f"pod_00000000-0000-4000-9000-{i:012d}" for i in range(5)]
@@ -1416,3 +1459,196 @@ async def test_the_check_confirms_a_legacy_container_ended_from_the_backends_rec
         backend.get_filler_run_active.assert_awaited_once_with(record_id)
     else:
         backend.get_pod_rental_active.assert_awaited_once_with(record_id)
+
+
+@pytest.mark.asyncio
+async def test_a_hung_cleanup_gives_up_at_its_budget_and_the_cycle_goes_on(monkeypatch):
+    """A slow dockerd held this step past the executor task's own timeout, so the cycle had no result."""
+    from services.task.checks import stale_container_cleanup
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+
+    monkeypatch.setattr(stale_container_cleanup, "STALE_CLEANUP_BUDGET_SECONDS", 0.05)
+    ctx = _cleanup_check_ctx([], [])
+
+    async def hang(**kwargs):
+        await asyncio.sleep(60)
+
+    ctx.services.container_cleanup.cleanup.side_effect = hang
+
+    result = await asyncio.wait_for(StaleContainerCleanupCheck().run(ctx), timeout=5)
+
+    assert result.passed is True
+    assert result.event.reason_code == "STALE_CLEANUP_TIMED_OUT"
+    assert not result.updates
+
+
+@pytest.mark.asyncio
+async def test_a_removal_before_a_hang_still_drops_the_removed_containers_gpu_processes(monkeypatch):
+    """Review 4491995517: a timeout after an orphan with a GPU process was removed lost the exemption, so
+    the fatal GPU check judged a container that is gone and a healthy node scored 0 for the cycle."""
+    from protocol.vc_protocol.compute_requests import PodRentalActiveResponse
+    from services.task.checks import stale_container_cleanup
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+
+    monkeypatch.setattr(stale_container_cleanup, "STALE_CLEANUP_BUDGET_SECONDS", 0.05)
+    name = "pod_00000000-0000-4000-8000-0000000000a1"
+    backend = AsyncMock()
+    reaped = {"pid": 1, "container_name": name}
+    foreign = {"pid": 2, "container_name": "my_miner"}
+    ctx = _cleanup_check_ctx([], [reaped, foreign], backend=backend)
+    backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
+        active=False, rental_closed_at=CLOSED, executor_id=str(ctx.executor.uuid)
+    )
+
+    async def remove_then_hang(**kwargs):
+        assert kwargs["reserve_removal"](name)
+        kwargs["on_removed"](name)
+        await asyncio.sleep(60)  # a later docker call that never answers
+
+    ctx.services.container_cleanup.cleanup.side_effect = remove_then_hang
+
+    result = await asyncio.wait_for(StaleContainerCleanupCheck().run(ctx), timeout=5)
+
+    assert result.event.reason_code == "STALE_CLEANUP_TIMED_OUT"
+    assert result.updates["state"].gpu_processes == [foreign]
+
+
+@pytest.mark.asyncio
+async def test_slow_lookups_after_a_timeout_still_claim_what_is_already_confirmed(monkeypatch):
+    """Review 4534599627: a slow backend lookup used the whole exemption budget before the claim ran, so
+    the confirmed removal's GPU processes counted and GpuUsageCheck failed a healthy node."""
+    from protocol.vc_protocol.compute_requests import PodRentalActiveResponse
+    from services.task.checks import stale_container_cleanup
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+
+    monkeypatch.setattr(stale_container_cleanup, "STALE_CLEANUP_BUDGET_SECONDS", 0.05)
+    monkeypatch.setattr(stale_container_cleanup, "GPU_EXEMPTION_BUDGET_AFTER_TIMEOUT_SECONDS", 0.05)
+    fast = "pod_00000000-0000-4000-8000-0000000000a1"
+    slow = "pod_00000000-0000-4000-8000-0000000000a2"
+    backend = AsyncMock()
+    gone = {"pid": 1, "container_name": fast}
+    other = {"pid": 2, "container_name": slow}
+    ctx = _cleanup_check_ctx([], [gone, other], backend=backend)
+
+    async def lookup(record_id):
+        if record_id == slow.partition("_")[2]:
+            await asyncio.sleep(60)  # a backend that never answers
+        return PodRentalActiveResponse(active=False, rental_closed_at=CLOSED, executor_id=str(ctx.executor.uuid))
+
+    backend.get_pod_rental_active.side_effect = lookup
+
+    async def remove_both_then_hang(**kwargs):
+        for name in (fast, slow):
+            assert kwargs["reserve_removal"](name)
+            kwargs["on_removed"](name)
+        await asyncio.sleep(60)
+
+    ctx.services.container_cleanup.cleanup.side_effect = remove_both_then_hang
+
+    result = await asyncio.wait_for(StaleContainerCleanupCheck().run(ctx), timeout=5)
+
+    assert result.event.reason_code == "STALE_CLEANUP_TIMED_OUT"
+    assert result.updates["state"].gpu_processes == [other]
+
+
+@pytest.mark.asyncio
+async def test_a_claim_slower_than_the_budget_still_exempts_the_removed_container(monkeypatch):
+    """Rustam (lio#2075): a timeout during the claim left the exemption written, so the retry after it
+    refused it and GpuUsageCheck failed the node."""
+    from protocol.vc_protocol.compute_requests import PodRentalActiveResponse
+    from services.task.checks import stale_container_cleanup
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck, _ReapedPodStateQueue
+
+    monkeypatch.setattr(stale_container_cleanup, "STALE_CLEANUP_BUDGET_SECONDS", 0.05)
+    name = "pod_00000000-0000-4000-8000-0000000000a1"
+    backend = AsyncMock()
+    gone = {"pid": 1, "container_name": name}
+    foreign = {"pid": 2, "container_name": "my_miner"}
+    ctx = _cleanup_check_ctx([], [gone, foreign], backend=backend)
+    backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
+        active=False, rental_closed_at=CLOSED, executor_id=str(ctx.executor.uuid)
+    )
+    spent: set[str] = set()
+
+    async def claim_written_then_slow(self, names):
+        fresh = names - spent
+        spent.update(names)
+        await asyncio.sleep(0.1)  # the write landed; the answer comes after the budget
+        return fresh
+
+    monkeypatch.setattr(_ReapedPodStateQueue, "claim_gpu_exemptions", claim_written_then_slow)
+
+    async def remove(**kwargs):
+        assert kwargs["reserve_removal"](name)
+        kwargs["on_removed"](name)
+        return 1, [name], []
+
+    ctx.services.container_cleanup.cleanup.side_effect = remove
+
+    result = await asyncio.wait_for(StaleContainerCleanupCheck().run(ctx), timeout=5)
+
+    assert result.updates["state"].gpu_processes == [foreign]
+
+
+@pytest.mark.asyncio
+async def test_a_cache_sweep_cut_by_the_budget_does_not_run_again_next_cycle(monkeypatch):
+    """Review 4491995523: an unstamped sweep repeats on a slow node every cycle and the reclaim after it never runs."""
+    from services.task.checks import stale_container_cleanup
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+
+    monkeypatch.setattr(stale_container_cleanup, "STALE_CLEANUP_BUDGET_SECONDS", 0.05)
+    ctx = _cleanup_check_ctx([], [])
+    sweep = ctx.services.container_cleanup.sweep_abandoned_download_temporaries
+
+    async def hang(**kwargs):
+        await asyncio.sleep(60)
+
+    sweep.side_effect = hang
+    check = StaleContainerCleanupCheck()
+
+    await asyncio.wait_for(check.run(ctx), timeout=5)
+    await asyncio.wait_for(check.run(ctx), timeout=5)
+
+    assert sweep.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drops", [False, True])
+async def test_the_cleanup_runs_once_and_its_removed_filler_stays_excluded_when_the_session_drops(drops):
+    """Review 4491939667 on #2080: a replay finds the filler gone and the exemption spent, and drops the update
+    that removed its processes, so the tenant check would blame the stale busy-GPU reading on outside use."""
+    import asyncssh
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+    from services.task.pipeline import Pipeline
+
+    name = "filler_00000000-0000-4000-8000-0000000000a1"
+    redis = _DictRedis()
+    holder: dict = {}
+    ctx = holder["ctx"] = _cleanup_check_ctx(
+        [name], [{"pid": 1, "container_name": name}], backend=_ended_here_backend(holder), redis=redis
+    )
+    ssh = MagicMock(spec=asyncssh.SSHClientConnection)
+    ssh.is_closed.return_value = False
+    ctx = holder["ctx"] = ctx.model_copy(update={"ssh": ssh})
+    hset = redis.hset
+
+    async def hset_then_drop(*args):
+        await hset(*args)
+        ssh.is_closed.return_value = drops  # the session closes while the exemption is written
+
+    redis.hset = hset_then_drop
+    check = StaleContainerCleanupCheck()
+    runs = []
+    run = check.run
+
+    async def counted(c):
+        runs.append(1)
+        return await run(c)
+
+    check.run = counted
+    reconnect = AsyncMock()
+
+    _, _, after = await Pipeline([check], AsyncMock(), reconnect=reconnect).run(ctx)
+
+    assert len(runs) == 1 and not reconnect.called
+    assert after.state.gpu_processes == []

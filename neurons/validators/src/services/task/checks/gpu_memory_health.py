@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
 import re
 import shlex
+from dataclasses import asdict, dataclass, field
 from typing import Any
+
+import redis.exceptions
 
 from core.config import settings
 
@@ -11,7 +15,7 @@ from ..messages import GpuMemoryHealthMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context, MemoryHealthRead
 from .banned_provider import has_live_rental
-from .gpu_fault_probe import OUTPUT_TAIL_CHARS, PROBE_SOURCE, _cap, _parse_report
+from .gpu_fault_probe import OUTPUT_TAIL_CHARS, _cap, _parse_report, probe_source
 from .post_rental_gpu_recheck import RecheckMarker, record_marker
 
 # one NVML snapshot in a fork with its own 10 s deadline (miner_jobs/gpu_fault_probe.py), plus SSH
@@ -25,17 +29,149 @@ _FLAG_UUID = re.compile(r"^gpu \S+ \(([^()]+)\): ")
 RESET_REQUIRED_STREAK_LIMIT = 3
 _reset_required_streak: dict[tuple[str, str], int] = {}
 
+# DAH-5869: per executor, the kernel time of the last Xid line already judged, the host's boot id and one held Xid fault per
+# card: it closes only on proof it healed
+CARD_HEALTH_KEY_PREFIX = "gpu_card_health"
+CARD_HEALTH_TTL_SECONDS = 86400
+_REDIS_ERRORS: tuple[type[BaseException], ...] = (redis.exceptions.RedisError, OSError)
+# a state Redis failed to store: the next read judges against it, so a confirmed fault is not lost
+# shortcut: kept in this process only, so a validator restart during a Redis outage drops it; persist if it bites
+_unsaved_card_health: dict[str, "CardHealthState"] = {}
+
+
+@dataclass
+class CardHealthState:
+    xid_after: float | None = None
+    boot_id: str | None = None
+    held: list[str] = field(default_factory=list)
+
+
+def _card_health_key(ctx: Context) -> str:
+    return f"{CARD_HEALTH_KEY_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
+
+
+async def _load_card_health(ctx: Context) -> CardHealthState | None:
+    """The stored state, or None when Redis could not be read: then nothing is judged or written, so a held
+    fault is neither closed nor overwritten."""
+    if (unsaved := _unsaved_card_health.get(_card_health_key(ctx))) is not None:
+        return unsaved
+    try:
+        stored = json.loads(await ctx.services.redis.get(_card_health_key(ctx)) or "{}")
+    except (*_REDIS_ERRORS, TypeError, ValueError):
+        return None
+    if not isinstance(stored, dict):
+        return None
+    # a baseline stored as a line count (before the kernel-time baseline) is dropped: the next read sets one
+    xid_after = stored.get("xid_after")
+    boot_id = stored.get("boot_id")
+
+    def strings(key: str) -> list[str]:
+        value = stored.get(key)
+        return [s for s in value if isinstance(s, str)] if isinstance(value, list) else []
+
+    return CardHealthState(
+        xid_after=xid_after if type(xid_after) in (int, float) else None,
+        boot_id=boot_id if isinstance(boot_id, str) else None,
+        held=strings("held"),
+    )
+
+
+def _card_uuid(fault: str) -> str | None:
+    match = _FLAG_UUID.match(fault)
+    return match.group(1) if match and match.group(1) != "None" else None
+
+
+def _held_fault_proven_healed(
+    fault: str, gpus: dict[str, dict[str, Any]], every_card_named: bool, rebooted: bool, scraped_uuids: set[str]
+) -> bool:
+    """Proof that a held card fault is over: the card is gone from a read naming every card and from this
+    cycle's scrape (the missing-card rule reports that), or a new host boot. A read that merely shows nothing new
+    proves nothing."""
+    uuid = _card_uuid(fault)
+    if uuid is None:
+        return False
+    if rebooted:
+        return True
+    # a card that drops out after the scrape is still listed there, so no missing-card fault fires yet
+    # shortcut: a card reset without a reboot leaves an Xid fault held; add a reset proof if that bites
+    return uuid not in gpus and every_card_named and uuid not in scraped_uuids
+
+
+async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardHealthState) -> None:
+    """Put this cycle's per-card hardware faults into `report["card_faults"]`: the probe's new Xids and
+    every earlier fault not yet proven healed
+    (`_held_fault_proven_healed`); then keep the state for the next read. A dry run shares Redis with
+    the live validator, so it writes nothing."""
+    if report.get("status") not in ("ok", "flagged"):
+        # no NVML reading: the state stays as it was, and must not expire while NVML stays unreadable
+        if not settings.DRY_RUN:
+            try:
+                await ctx.services.redis.expire(_card_health_key(ctx), CARD_HEALTH_TTL_SECONDS)
+            except _REDIS_ERRORS:
+                pass
+        return
+    xid_faults = [s for s in report.get("xid_faults") or [] if isinstance(s, str)]
+    xid = report.get("xid") if isinstance(report.get("xid"), dict) else {}
+    boot_id = report.get("boot_id") if isinstance(report.get("boot_id"), str) else None
+    # the boot id, not the Xid lines: a cleared or wrapped kernel log drops lines on a faulty card
+    rebooted = before.boot_id is not None and boot_id is not None and boot_id != before.boot_id
+    listed = [gpu for gpu in (report.get("nvml") or {}).get("gpus") or [] if isinstance(gpu, dict)]
+    gpus = {gpu["uuid"]: gpu for gpu in listed if isinstance(gpu.get("uuid"), str)}
+    every_card_named = bool(listed) and len(gpus) == len(listed)
+    # a card read without its UUID or bus id had its new Xid lines skipped: keep them for the next read;
+    # with no baseline yet no line was judged, so the last line's time is the baseline
+    every_card_tied = every_card_named and all(isinstance(gpu.get("pci_bus_id"), str) for gpu in listed)
+    # after a reboot the kernel clock starts over, so the old baseline no longer orders the lines
+    last_ts = xid.get("last_ts") if type(xid.get("last_ts")) in (int, float) else None
+    uses_this_read_as_xid_baseline = xid.get("available") and (
+        every_card_tied or before.xid_after is None or rebooted
+    )
+    if uses_this_read_as_xid_baseline:
+        xid_after = last_ts
+    else:
+        # an old boot's time would skip this boot's early lines: start the new boot from its first line
+        xid_after = 0.0 if rebooted else before.xid_after
+    scraped_uuids = {str(d["uuid"]) for d in ctx.state.gpu_details or [] if isinstance(d, dict) and d.get("uuid")}
+    held = [f for f in before.held if not _held_fault_proven_healed(f, gpus, every_card_named, rebooted, scraped_uuids)]
+    # one fault per card, this read's first: a card repeating an Xid must not grow the stored state
+    fault_by_card: dict[str, str] = {}
+    for fault in xid_faults + held:
+        uuid = _card_uuid(fault)
+        if uuid is not None:
+            fault_by_card.setdefault(uuid, fault)
+    report["card_faults"] = list(fault_by_card.values())
+    if settings.DRY_RUN:
+        return
+    key = _card_health_key(ctx)
+    state = CardHealthState(
+        xid_after=xid_after, boot_id=boot_id or before.boot_id, held=report["card_faults"]
+    )
+    try:
+        await ctx.services.redis.set(key, json.dumps(asdict(state)), ex=CARD_HEALTH_TTL_SECONDS)
+    except _REDIS_ERRORS:
+        _unsaved_card_health[key] = state
+    else:
+        _unsaved_card_health.pop(key, None)
+
 
 async def read_memory_health(ctx: Context) -> MemoryHealthRead:
     """The NVML-only probe's run and report, read once per cycle: RentedGpuDropCheck reads it first
     on a rented node (and keeps it in `ctx.state.memory_health`), and GpuMemoryHealthCheck reuses it."""
     if ctx.state.memory_health is not None:
         return ctx.state.memory_health
+    before = await _load_card_health(ctx)
     command = f"{shlex.quote(ctx.executor.python_path)} -I - --nvml-only"
+    if before is not None and before.xid_after is not None:
+        command += f" --xid-after {before.xid_after}"
+        if before.boot_id is not None:
+            command += f" --xid-boot {shlex.quote(before.boot_id)}"
     run = await ctx.runner.run(
-        command, timeout=TIMEOUT_SECONDS, retryable=False, stdin_text=PROBE_SOURCE
+        command, timeout=TIMEOUT_SECONDS, retryable=False, stdin_text=probe_source()
     )
-    return MemoryHealthRead(run=run, report=_parse_report(run.stdout) or {})
+    report = _parse_report(run.stdout) or {}
+    if before is not None:
+        await _judge_card_faults(ctx, report, before)
+    return MemoryHealthRead(run=run, report=report)
 
 
 def flagged_uuids(report: dict[str, Any]) -> list[str]:
@@ -44,6 +180,14 @@ def flagged_uuids(report: dict[str, Any]) -> list[str]:
         return []
     found = (_FLAG_UUID.match(flag) for flag in report["flags"] if isinstance(flag, str))
     return sorted({match.group(1) for match in found if match and match.group(1) != "None"})
+
+
+def card_fault_uuids(report: dict[str, Any]) -> list[str] | None:
+    """The UUIDs of the cards with a hardware fault this cycle (`report["card_faults"]`): a new hardware
+    Xid, held until proven healed. None when the card state was not judged (unread)."""
+    if "card_faults" not in report:
+        return None
+    return sorted({u for f in report["card_faults"] if isinstance(f, str) and (u := _card_uuid(f))})
 
 
 class GpuMemoryHealthCheck:
@@ -66,6 +210,9 @@ class GpuMemoryHealthCheck:
     listed. A node NVML could not read passes. A card flagged under a live rental
     also owes a post-rental every-card recheck (post_rental_gpu_recheck.py).
     """
+
+    # a replay would count this cycle's reset warning twice toward RESET_REQUIRED_STREAK_LIMIT
+    replays_after_session_drop = False
 
     check_id = "gpu.validate.memory_health"
     fatal = True

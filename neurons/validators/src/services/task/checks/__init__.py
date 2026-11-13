@@ -23,6 +23,7 @@ from .gpu_power_limit import GpuPowerLimitCheck
 from .gpu_thermal_throttle import GpuThermalThrottleCheck
 from .gpu_usage import GpuUsageCheck
 from .gpu_vram_precheck import GpuVramPrecheck
+from .gpu_model_verdict import GpuModelVerdictCheck
 from .hardware_identity import HardwareIdentityCheck
 from .inspector import InspectorRentedCheck
 from .local_verify import LocalVerifyCheck
@@ -54,11 +55,12 @@ from .sshd_bootstrap import SshdBootstrapCheck
 from .sshd_auth_log import SshdAuthLogCheck
 from .stale_container_cleanup import StaleContainerCleanupCheck
 from .start_gpu_monitor import StartGPUMonitorCheck
+from .docker_cpu import DockerCpuCheck
 from .pid_host_required import PidHostRequiredCheck
 from .sysbox_required import SysboxRequiredCheck
 from .tdx_host import TdxHostCheck
 from .upload_files import UploadFilesCheck
-from .verifyx import VerifyXCheck
+from .verifyx import VerifyXCheck, VerifyXColdRetryCheck
 
 __all__ = [
     "BannedGpuCheck",
@@ -87,6 +89,7 @@ __all__ = [
     "GpuThermalThrottleCheck",
     "GpuUsageCheck",
     "GpuVramPrecheck",
+    "GpuModelVerdictCheck",
     "HardwareIdentityCheck",
     "InspectorRentedCheck",
     "RentedPodNetworkCheck",
@@ -116,6 +119,7 @@ __all__ = [
     "ScoreCheck",
     "StaleContainerCleanupCheck",
     "StartGPUMonitorCheck",
+    "DockerCpuCheck",
     "PidHostRequiredCheck",
     "SysboxRequiredCheck",
     "SpecChangeCheck",
@@ -123,4 +127,5 @@ __all__ = [
     "SshdBootstrapCheck",
     "UploadFilesCheck",
     "VerifyXCheck",
+    "VerifyXColdRetryCheck",
 ]

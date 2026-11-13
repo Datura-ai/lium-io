@@ -15,7 +15,8 @@ setup) is an error, not a fault: the validator does not penalise what it could n
 
 Prints one line `GPU_FAULT_PROBE_JSON: {...}`. Exit 0 ok, 1 fault, 2 could not run.
 `--nvml-only` (GpuMemoryHealthCheck) reads NVML once and runs no CUDA: status ok, flagged (see
-`flags`) or error, exit 0.
+`flags`) or error, exit 0. It also lists, per card, the new hardware Xids since `--xid-after` (`xid_faults`),
+which do not set the status.
 """
 
 from __future__ import annotations
@@ -55,6 +56,10 @@ DMESG_TIMEOUT_SECONDS = 5
 # Xid types an application raises on a healthy card (graphics exception, MMU fault, channel reset, preemptive
 # cleanup): a rented pod's own bug, not the hardware. The probe's own kernels report those through CUresult.
 SOFTWARE_XIDS = {13, 31, 43, 45}
+# On a rented card the renter's own work raises many more application Xids (32, 68, 69, 109, ...): there only
+# these, which NVIDIA documents as hardware, are a fault. DBE/uncontained ECC, internal microcontroller, row-remap
+# failure, NVLink, fell off the bus, GSP timeout/error, unrecovered ECC.
+HARDWARE_XIDS = {48, 61, 62, 64, 74, 79, 95, 119, 120, 140}
 
 # fmix32-style mixer whose every step is a bijection on [0, 2**k): (x + seed) mod 2**k, odd multiplier
 # mod 2**k, xorshift within k bits. Mirrored in PTX by k_perm; the host replays it to check the chase.
@@ -622,7 +627,7 @@ def probe_device(index: int, seconds: float, vram_mb: int, on_phase=None) -> dic
     )
     d_in, d_idx, d_out, d_aux = device_buffers
     if on_phase is not None:
-        on_phase("kernels")  # from here on a hang or a crash is the card's
+        on_phase("kernels")  # from here on a crash is the card's
 
     def launch(kernel: str, *args) -> None:
         _launch(cuda, funcs[kernel], stream, n, *args)
@@ -699,7 +704,7 @@ def _worker(index: int, seconds: float, vram_mb: int, conn) -> None:
     started = time.perf_counter()
 
     def on_phase(phase: str) -> None:
-        # the parent classifies a worker that never answers by the phase it reached: setup -> error, kernels -> fault
+        # the parent classifies a worker that dies by the phase it reached: setup -> error, kernels -> fault
         conn.send({"phase": phase})
 
     try:
@@ -952,7 +957,15 @@ def xid_lines() -> dict:
     if out.returncode != 0:
         return {"available": False, "error": (out.stderr or "").strip()[:200]}
     lines = [line.strip() for line in out.stdout.splitlines() if "NVRM: Xid" in line]
-    return {"available": True, "count": len(lines), "last": lines[-5:], "lines": lines}
+    # the next read's baseline: the last line's kernel time, 0 with no Xid yet, None when lines carry no time
+    last_ts = kernel_ts(lines[-1]) if lines else 0.0
+    return {"available": True, "count": len(lines), "last_ts": last_ts, "last": lines[-5:], "lines": lines}
+
+
+def kernel_ts(line: str) -> float | None:
+    """The kernel time of a dmesg line (`[  123.456789] ...`), or None without one."""
+    match = re.match(r"\[\s*(\d+(?:\.\d+)?)\]", line)
+    return float(match.group(1)) if match else None
 
 
 def pci_key(bus_id) -> str | None:
@@ -967,12 +980,15 @@ def pci_key(bus_id) -> str | None:
     return f"{parts[0][-4:].rjust(4, '0')}:{parts[1]}:{parts[2]}"
 
 
-def xid_faults(before: dict, after: dict, bus_ids: set) -> tuple[list[str], list[str]]:
+def xid_faults(
+    before: dict, after: dict, bus_ids: set, hardware_only: bool = False
+) -> tuple[list[str], list[str]]:
     """New Xid lines split into this executor's hardware faults and evidence about other cards.
 
     dmesg is host-wide: a rented pod's illegal address on another card, or a sibling executor's fault, must
     not be scored against this one. A new line counts as a fault only when its PCI id is one of the probed
-    devices and its Xid type is not an application error (SOFTWARE_XIDS); everything else is kept as evidence.
+    devices and its Xid type is not an application error (SOFTWARE_XIDS), or with hardware_only one of HARDWARE_XIDS;
+    everything else is kept as evidence.
     """
     if not (before.get("available") and after.get("available")):
         return [], []
@@ -987,7 +1003,7 @@ def xid_faults(before: dict, after: dict, bus_ids: set) -> tuple[list[str], list
             pci
             and pci_key(pci.group(1)) in bus_ids
             and xid is not None
-            and xid not in SOFTWARE_XIDS
+            and (xid in HARDWARE_XIDS if hardware_only else xid not in SOFTWARE_XIDS)
         ):
             faults.append(f"new NVRM Xid on a probed GPU: {line[:200]}")
         else:
@@ -995,13 +1011,16 @@ def xid_faults(before: dict, after: dict, bus_ids: set) -> tuple[list[str], list
     return faults, other
 
 
-def drain_workers(workers: list, deadline: float, budget_s: float) -> list[dict]:
+def drain_workers(
+    workers: list, deadline: float, budget_s: float, hang_in_kernels_is_fault: bool = False
+) -> list[dict]:
     """One report per worker, every pipe polled together until the deadline.
 
     Every worker gets the whole budget: a card that hangs does not eat the time of the ones after it, and a
     report a worker has already sent (a fault on GPU 3 while GPU 0 hangs) is read, not discarded. A worker
-    still in setup at the deadline did not get to measure anything: the host, the driver or the container's
-    limits kept it from starting, which is an error; once its kernels run, a hang or a crash is the card's.
+    still running at the deadline, in setup or in its kernels, has no verdict, which is an error (UNKNOWN); a
+    worker that dies once its kernels run is the card's fault. hang_in_kernels_is_fault (the post-rental
+    recheck) makes a hang in the kernels a fault too, so a card that hangs every cycle cannot list again.
     """
     pending = {
         index: {"process": process, "conn": conn, "phase": "setup"}
@@ -1009,43 +1028,53 @@ def drain_workers(workers: list, deadline: float, budget_s: float) -> list[dict]
     }
     reports: dict[int, dict] = {}
 
-    def no_verdict(index: int, describe) -> None:
+    def no_verdict(index: int, describe, status_if_in_kernels: str) -> None:
         worker = pending.pop(index)
         reports[index] = {
             "index": index,
-            "status": "fault" if worker["phase"] == "kernels" else "error",
+            "status": status_if_in_kernels if worker["phase"] == "kernels" else "error",
             "error": describe(worker["phase"]),
         }
 
     def died(index: int) -> None:
         code = _exit_code(pending[index]["process"])
-        no_verdict(index, lambda phase: f"worker died in {phase} with exit code {code}")
+        no_verdict(index, lambda phase: f"worker died in {phase} with exit code {code}", "fault")
 
-    def poll_worker_pipes(timeout: float) -> None:
-        by_conn = {worker["conn"]: index for index, worker in pending.items()}
-        for conn in multiprocessing.connection.wait(list(by_conn), timeout=timeout):
-            index = by_conn[conn]
-            try:
-                message = conn.recv()
-            except EOFError:  # the pipe closed without a report: the worker is gone
-                died(index)
-                continue
-            if "phase" in message:
-                pending[index]["phase"] = message["phase"]
-            else:
-                reports[index] = message
-                del pending[index]
+    def read_one_message(index: int) -> None:
+        try:
+            message = pending[index]["conn"].recv()
+        except EOFError:  # the pipe closed without a report: the worker is gone
+            died(index)
+            return
+        if "phase" in message:
+            pending[index]["phase"] = message["phase"]
+        else:
+            reports[index] = message
+            del pending[index]
+
+    def reap_dead() -> None:
         for index, worker in list(pending.items()):
             if not worker["process"].is_alive() and not worker["conn"].poll(0):
                 died(index)
 
     while pending and time.perf_counter() < deadline:
-        poll_worker_pipes(0.2)
-    if pending:
-        poll_worker_pipes(0)  # a message that landed as the deadline passed
+        by_conn = {worker["conn"]: index for index, worker in pending.items()}
+        for conn in multiprocessing.connection.wait(list(by_conn), timeout=0.2):
+            read_one_message(by_conn[conn])
+        reap_dead()
+    # every message that landed as the deadline passed: a phase change and the report behind it
+    for index in list(pending):
+        while index in pending and pending[index]["conn"].poll(0):
+            read_one_message(index)
+    reap_dead()
+    # out of time is no verdict even in the kernels: honest idle nodes ran out of it under GPU contention
+    # (1-4 Nov); a worker that died in its kernels is still the card's fault
+    hang_status = "fault" if hang_in_kernels_is_fault else "error"
     for index in list(pending):
         pending[index]["process"].kill()
-        no_verdict(index, lambda phase: f"hung in {phase}: no result after {int(budget_s)}s")
+        no_verdict(
+            index, lambda phase: f"hung in {phase}: no result after {int(budget_s)}s", hang_status
+        )
     # one reap grace for all of them, not 5 s each: a killed worker the driver still holds must not push
     # the verdict past the validator's SSH cap on an 8-GPU host
     reap_by = time.perf_counter() + WORKER_REAP_AFTER_KILL_SECONDS
@@ -1059,12 +1088,60 @@ def _exit_code(process):
     return process.exitcode
 
 
-def print_nvml_health_report(mp) -> None:
-    """The `--nvml-only` verdict: one NVML snapshot and its standing memory faults."""
+def card_xid_faults(snapshot: dict, xid: dict, xid_after: float | None) -> list[str]:
+    """The hardware Xids logged on each card since the validator's last read: lines whose kernel time is after
+    `xid_after`, the last judged line's. A wrapped ring buffer drops old lines, so a line count would slice off
+    new ones (review). No baseline yet, or lines without a kernel time, flag nothing."""
+    if not xid.get("available") or xid_after is None:
+        return []
+    # shortcut: a host booted with printk.time=0 logs no kernel time, so no Xid is judged there; parse the
+    # line order if such hosts show up
+    new = [line for line in xid["lines"] if (ts := kernel_ts(line)) is not None and ts > xid_after]
+    before, xid = {"available": True, "lines": []}, {"available": True, "lines": new}
+    faults = []
+    for gpu in snapshot.get("gpus") or []:
+        bus = pci_key(gpu.get("pci_bus_id"))
+        if bus is None:
+            continue
+        for fault in xid_faults(before, xid, {bus}, hardware_only=True)[0]:
+            faults.append(f"gpu {gpu.get('index')} ({gpu.get('uuid')}): {fault}")
+    return faults
+
+
+def boot_id() -> str | None:
+    """The host's boot id (the same inside a container): a new one proves the host rebooted."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def xid_after_for_this_boot(xid_after: float | None, xid_boot: str | None, this_boot: str | None) -> float | None:
+    """A baseline from another boot does not order this boot's lines: none of them is judged yet."""
+    if xid_after is not None and xid_boot is not None and this_boot not in (None, xid_boot):
+        return 0.0
+    return xid_after
+
+
+def print_nvml_health_report(mp, xid_after: float | None = None, xid_boot: str | None = None) -> None:
+    """The `--nvml-only` verdict: one NVML snapshot and its standing memory faults, plus the cards'
+    new hardware Xids."""
+    xid_after = xid_after_for_this_boot(xid_after, xid_boot, boot_id())
     snapshot = nvml_snapshot_forked(mp)
     flags, warnings = nvml_health(snapshot)
     status = "error" if not snapshot.get("available") else "flagged" if flags else "ok"
-    report = {"status": status, "flags": flags, "warnings": warnings, "nvml": snapshot}
+    xid = xid_lines()
+    report = {
+        "status": status,
+        "flags": flags,
+        "warnings": warnings,
+        "nvml": snapshot,
+        "xid_faults": card_xid_faults(snapshot, xid, xid_after),
+        # the kernel log is often not readable from the container: then no Xid is judged
+        "xid": {k: v for k, v in xid.items() if k in ("available", "count", "last_ts", "error")},
+        "boot_id": boot_id(),
+    }
     print(JSON_MARKER, json.dumps(report, sort_keys=True))
 
 
@@ -1084,6 +1161,20 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="read the cards' standing memory health from NVML; no CUDA, safe beside a rental",
     )
+    parser.add_argument(
+        "--xid-after",
+        type=float,
+        help="with --nvml-only: kernel time of the last Xid line already judged; only later ones are new",
+    )
+    parser.add_argument(
+        "--xid-boot",
+        help="with --xid-after: the boot id that kernel time belongs to; on another boot every line is new",
+    )
+    parser.add_argument(
+        "--hang-in-kernels-is-fault",
+        action="store_true",
+        help="a worker still in its kernels at the deadline is a fault, not an error (post-rental recheck)",
+    )
     args = parser.parse_args(argv)
 
     started = time.perf_counter()
@@ -1092,7 +1183,7 @@ def main(argv: list[str]) -> int:
     # in the driver takes the worker, not the verdict, and the parent never initialises CUDA itself
     mp = multiprocessing.get_context("fork")
     if args.nvml_only:
-        print_nvml_health_report(mp)
+        print_nvml_health_report(mp, args.xid_after, args.xid_boot)
         return 0
     try:
         indices = args.device if args.device else list(range(_device_count(mp)))
@@ -1120,7 +1211,9 @@ def main(argv: list[str]) -> int:
     # interpreters forking, JIT-compiling and allocating at once on a loaded host take longer than one
     grace = WORKER_GRACE_SECONDS + WORKER_GRACE_PER_GPU_SECONDS * (len(workers) - 1)
     budget = args.seconds + grace
-    result["devices"] = drain_workers(workers, time.perf_counter() + budget, budget)
+    result["devices"] = drain_workers(
+        workers, time.perf_counter() + budget, budget, args.hang_in_kernels_is_fault
+    )
 
     result["nvml_after"] = nvml_snapshot_forked(mp)
     xid_after = xid_lines()

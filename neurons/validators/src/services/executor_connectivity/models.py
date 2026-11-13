@@ -69,6 +69,9 @@ class DindProbeResult:
     error: DindLogCause | None = None
     # the in-container Sysbox test timed out: sysbox_runtime is False, but nothing was measured
     sysbox_timed_out: bool = False
+    # DAH-5651: the container started and its sshd never answered (or the node dropped the connection).
+    # False for a refused `docker run` and for an error on the validator's side.
+    sshd_never_answered: bool = False
 
 
 @dataclass(frozen=True)
@@ -117,6 +120,10 @@ class PortVerificationResult:
     # or did not test sysbox, or its in-container test timed out. PortConnectivityCheck remembers a True and
     # forgets on a False.
     sysbox_measured: bool | None = None
+    # DAH-5651: DindProbeResult.sshd_never_answered of this cycle's DinD probe
+    host_runtime_fault: bool = False
+    # DAH-5981: status "error" because the SSH connection to the node dropped mid-probe, not a probe or config fault
+    connection_lost: bool = False
 
 
 @dataclass(frozen=True)

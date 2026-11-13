@@ -1,4 +1,6 @@
+import asyncio
 import json
+import time
 from datetime import datetime, timedelta
 from unittest.mock import Mock, patch
 
@@ -53,7 +55,9 @@ class DummyBackendClient:
         gpu_uuids: list[str] | None = None,
         cpu_count: int | None = None,
         loopback_plugin: str | None = None,
+        timeout: int = 300,
     ):
+        self.timeout = timeout
         self.called_with = {
             "miner_address": miner_address,
             "miner_port": miner_port,
@@ -112,6 +116,69 @@ async def test_rental_verification_always_calls_backend(context_factory):
 
 
 @pytest.mark.asyncio
+async def test_rental_verification_health_check_waits_no_longer_than_the_task_has_left(context_factory):
+    # Arrange: 100 s before the executor task is cancelled
+    backend = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
+    services = build_services(backend=backend, container_cleanup=ContainerCleanup())
+    ctx = context_factory(services=services, state=build_state(specs={"verified_ports": [8080]}))
+    elapsed = settings.JOB_TIME_OUT - 120 - 100
+    ctx = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - elapsed})
+
+    # Act
+    await RentalVerificationCheck().run(ctx)
+
+    # Assert: the wait ends before the cancel, leaving the probe cleanup its time
+    assert 65 <= backend.timeout <= 70
+
+
+class StalledCleanup(ContainerCleanup):
+    """A cleanup whose ssh call never returns."""
+
+    async def force_remove_health_checks(self, ssh_client, executor_uuid):
+        await asyncio.sleep(3600)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seconds_left, cleanup_timeout", [(100, 20), (15, 5), (5, 1)])
+async def test_rental_verification_stalled_cleanup_is_cut_and_the_result_kept(context_factory, seconds_left, cleanup_timeout):
+    # Arrange: a cleanup that hangs, with 100 s left, then inside the 30 s reserve
+    backend = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
+    services = build_services(backend=backend, container_cleanup=StalledCleanup())
+    ctx = context_factory(services=services, state=build_state(specs={"verified_ports": [8080]}))
+    elapsed = settings.JOB_TIME_OUT - 120 - seconds_left
+    ctx = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - elapsed})
+    waits = []
+    real_wait_for = asyncio.wait_for
+
+    async def recording_wait_for(aw, timeout):
+        waits.append(timeout)
+        return await real_wait_for(aw, timeout=0.01)
+
+    # Act
+    with patch("neurons.validators.src.services.task.checks.rental_verification.asyncio.wait_for", recording_wait_for):
+        result = await RentalVerificationCheck().run(ctx)
+
+    # Assert: the cleanup wait is bounded and leaves time for the result, which still arrives
+    assert result.passed is True
+    assert len(waits) == 1 and cleanup_timeout - 1 <= waits[0] <= cleanup_timeout
+    assert backend.timeout == 1 or seconds_left == 100
+
+
+@pytest.mark.asyncio
+async def test_rental_verification_health_check_keeps_its_full_wait_early_in_the_task(context_factory):
+    # Arrange
+    backend = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
+    services = build_services(backend=backend, container_cleanup=ContainerCleanup())
+    ctx = context_factory(services=services, state=build_state(specs={"verified_ports": [8080]}))
+
+    # Act
+    await RentalVerificationCheck().run(ctx)
+
+    # Assert
+    assert backend.timeout == 300
+
+
+@pytest.mark.asyncio
 async def test_rental_verification_no_ports():
     """Test that check fails when no verified ports are available."""
     backend_client = DummyBackendClient(
@@ -130,6 +197,7 @@ async def test_rental_verification_no_ports():
     assert result.passed is False
     assert result.event.reason_code == Msg.FAILED.reason
     assert "No verified ports available" in result.event.what_we_saw["error"]
+    assert result.event.remediation.startswith("No renting port answered the validator from outside.")
     # Should not call API when no ports
     assert backend_client.called_with is None
 
@@ -633,6 +701,23 @@ async def test_rental_verification_filler_killed_enforcement_fails():
     assert result.event.reason_code == Msg.FILLER_KILLED.reason
     assert result.event.what_we_saw["enforced"] is True
     assert backend_client.called_with is None
+
+
+@pytest.mark.asyncio
+async def test_a_filler_the_validator_removed_itself_is_not_a_kill_and_is_still_reported_missing():
+    """The post-rental GPU recheck removes the node's fillers to probe the cards; until the backend closes the run,
+    the missing container must not fail the node, and the missing report must keep feeding that close."""
+    backend_client = _killed_filler_backend()
+    ssh_client = FillerSSHClient(running=False, removed_from_host=True)
+    ctx = _filler_context(backend_client=backend_client, ssh_client=ssh_client)
+    removed_filler = "filler_11111111-2222-3333-4444-555555555555"
+    ctx.services.redis.store[f"filler_removed_by_validator:{removed_filler}"] = "1"
+
+    result = await _run_filler_check(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.FILLER_STATE_UNKNOWN.reason
+    assert backend_client.filler_run_container_missing_flags == [True]
 
 
 @pytest.mark.asyncio
