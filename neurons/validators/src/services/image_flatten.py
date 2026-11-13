@@ -330,9 +330,8 @@ async def wait_for_node_flatten(ssh_client: asyncssh.SSHClientConnection, with_t
     measure failed (lock held, mark written); any other error when the lock or the mark was not taken,
     which must stop the create: no other sizing is safe then. `with_trash` (the create's cache reclaim
     detached a delete) adds what that delete is still freeing."""
-    result = await ssh_client.run(
-        flatten_wait_command(with_trash), check=False, timeout=FLATTEN_TIMEOUT_SECONDS + FLATTEN_TRASH_WAIT_SECONDS + 420
-    )
+    timeout = FLATTEN_TIMEOUT_SECONDS + FLATTEN_TRASH_WAIT_SECONDS + 420
+    result = await ssh_client.run(flatten_wait_command(with_trash), check=False, timeout=timeout)
     if result.exit_status == FLATTEN_MEASURE_FAILED_EXIT:
         raise FlattenMeasureFailed("measuring the disk under the node flatten lock failed")
     if result.exit_status != 0:
