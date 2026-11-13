@@ -409,6 +409,41 @@ async def test_a_missed_port_whose_listener_starts_after_the_re_probes_still_get
 
 
 @pytest.mark.asyncio
+async def test_a_missed_port_joining_the_last_re_probe_round_still_gets_retried(mocker):
+    # its start ends just before the last round, and its first probe there is refused too
+    tries = []
+    last_round_next = asyncio.Event()
+
+    async def reached(host, sample, token):
+        return sample[:2]
+
+    def answer(tested):
+        tries.append(tested)
+        if TEN[6] in tested and sum(TEN[6] in t for t in tries) == verifier.REPROBE_ROUNDS:
+            last_round_next.set()
+        if TEN[2] in tested and sum(TEN[2] in t for t in tries) < 3:
+            ok = [p for p in tested if p != TEN[2] and p.external < 9006]
+            return ok, [p for p in tested if p not in ok]  # own try, then the late bind
+        return [p for p in tested if p.external < 9006], [p for p in tested if p.external >= 9006]
+
+    verifier, runner = _parallel_verifier(mocker, reached, answer=answer)
+    verifier.REPROBE_DELAY_SEC = 0.01
+
+    async def docker_run(_ssh, name, *_args):
+        if name.endswith("_s"):
+            await asyncio.wait_for(last_round_next.wait(), 1)
+        return ContainerStartResult(ok=True, container_id="c", status="Up")
+
+    runner.run.side_effect = docker_run
+
+    result = await verifier.verify(TEN, ssh_client=mocker.Mock(), host="1.2.3.4", min_ports=7)
+
+    joined = next(i for i, t in enumerate(tries) if TEN[2] in t and t != TEN[2:3])
+    assert sum(TEN[6] in t for t in tries[: joined + 1]) == verifier.REPROBE_ROUNDS + 1  # joined the last round
+    assert TEN[2] in result.successful
+
+
+@pytest.mark.asyncio
 async def test_the_ready_host_ports_are_probed_while_the_missed_ports_listener_still_starts(mocker):
     # a slow start of the missed sampled port's listener must not spend the deadline the ready ports need
     rest_probed = asyncio.Event()

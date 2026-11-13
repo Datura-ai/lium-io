@@ -264,12 +264,17 @@ class BatchVerifier:
 
                 async def reprobe(refused: list[PortPair]) -> list[PortPair]:
                     nonlocal successful
-                    for round_no in range(1, rounds + 1):
+                    round_no = 0
+                    while round_no < rounds:
                         if not refused or (successful and len(sampled_ok) + len(successful) >= min_ports):
                             break
+                        round_no += 1
                         await asyncio.sleep(self.REPROBE_DELAY_SEC)
+                        joined = missed_ready()
+                        if joined:
+                            round_no = 1  # late listeners joining any round still get every re-probe after it
                         late, refused = await self.port_tester.test_many(
-                            session, host, refused + missed_ready(), token, log_ctx
+                            session, host, refused + joined, token, log_ctx
                         )
                         successful = successful + late
                         start_watch.verified = ports_answered_so_far() if successful else None
