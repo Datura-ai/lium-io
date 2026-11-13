@@ -272,7 +272,7 @@ class BatchVerifier:
                         await asyncio.sleep(self.REPROBE_DELAY_SEC)
                         joined = missed_ready()
                         if joined:
-                            round_no = 1  # late listeners joining any round still get every re-probe after it
+                            round_no = 0  # their first probe: late listeners joining any round get every re-probe after it
                         late, refused = await self.port_tester.test_many(
                             session, host, refused + joined, token, log_ctx
                         )
