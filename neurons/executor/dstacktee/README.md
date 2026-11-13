@@ -137,7 +137,7 @@ cd key-provider && docker compose logs -f
 ```bash
 sudo ./cvm_upgrade_guard.sh start      # pinned image; builds only on a host with no CVM disk
 sudo ./lium-cvm.sh inventory           # every CVM disk on the host
-sudo ./cvm_upgrade_guard.sh upgrade    # refused while any CVM disk exists; see docs/host-setup.md §6.1
+sudo ./cvm_upgrade_guard.sh upgrade    # refused while any CVM disk exists; see docs/host-setup.md §7.1
 ```
 
 **List running VMs:**
