@@ -517,6 +517,28 @@ async def test_the_emptied_mark_waits_for_every_running_holder_to_exit(docker_se
 
     wipe = next(command for command in ssh_client.commands if "/proc/1/root" in command)
     assert wipe.index(f"docker ps -q --filter volume={_KIMI}") < wipe.index("echo 'cache emptied: ")
+    # lio#2219 review: a failed `docker ps` also prints nothing, so the mark needs its exit status
+    assert f'holders=$(/usr/bin/docker ps -q --filter volume={_KIMI}) && [ -z "$holders" ] && ' in wipe
+
+
+@pytest.mark.asyncio
+async def test_the_clamp_uses_the_reading_that_found_the_rent_short(docker_service, monkeypatch):
+    # lio#2219 review: disk moving between the short check and the clamp must not resize the order on a second read
+    class ShrinkingHost(KilledFillerHostSshClient):
+        async def run(self, command: str, *args, **kwargs):
+            # the still-listed check runs after the wipe, between the short check and the clamp
+            if "volume ls" in command and any("/proc/1/root" in c for c in self.commands):
+                self._free_bytes -= 100 * 1024**3
+            return await super().run(command, *args, **kwargs)
+
+    monkeypatch.setattr(docker_service, "_get_existing_vloopback_bytes", AsyncMock(return_value=1264 * 10**9))
+    rental = _rental(1250, 625)
+    rental.disk_share = 1.0
+    ssh_client = ShrinkingHost(["filler_79ba7fa2"], freed_gb=355, free_gb=300, held=True)
+
+    await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}, killed_fillers=["filler_79ba7fa2"])
+
+    assert rental.volume_limit_gb == 290
 
 
 @pytest.mark.parametrize(

@@ -6354,7 +6354,9 @@ class DockerService:
                     f"( ( {_wipe_volume_cmd(name, *killed)} ) && "
                     # an exiting filler still running keeps the unlinked files open, so their blocks stay allocated:
                     # emptied only once no running container mounts it (lio#2219 review)
-                    f'[ -z "$(/usr/bin/docker ps -q --filter volume={shlex.quote(name)})" ] && '
+                    # a failed `docker ps` prints nothing too: gate on its exit status, not only its output
+                    f"holders=$(/usr/bin/docker ps -q --filter volume={shlex.quote(name)}) && "
+                    f'[ -z "$holders" ] && '
                     f"echo {shlex.quote(_CACHE_EMPTIED_MARK + name)} ) || true"
                 )
 
@@ -6383,7 +6385,9 @@ class DockerService:
                 )
             # a removal can fail silently (`|| true`) or time out: never size the pod volume on disk not freed.
             # Still short after every removal worked: the cache was not what was missing, so the size stays as ordered.
-            if not payload.local_volume and not await rental_fits():
+            # read once: the fit and the clamp must size on the same reading (lio#2219 review)
+            free_after_reclaim_gb = await free_now_gb()
+            if not payload.local_volume and free_after_reclaim_gb < rental_needs_free_gb:
                 if not removal_failed:
                     # a listing that fails cannot show the removals worked, so it counts as a failed removal
                     try:
@@ -6399,7 +6403,7 @@ class DockerService:
                         cache_volumes_still_listed = None
                     removal_failed = cache_volumes_still_listed is None or bool(cache_volumes_still_listed - emptied)
                 if removal_failed:
-                    _clamp_rental_volume_to_free_disk(payload, fit, await free_now_gb())
+                    _clamp_rental_volume_to_free_disk(payload, fit, free_after_reclaim_gb)
             return True
         except asyncio.CancelledError:
             raise
