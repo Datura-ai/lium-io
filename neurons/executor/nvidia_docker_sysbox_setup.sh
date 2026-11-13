@@ -398,6 +398,20 @@ check_fusermount3_apparmor() {
         "or by hand: printf '%s\\n' '$FUSERMOUNT3_RULE' 'umount /var/lib/sysboxfs/**,' | sudo tee -a $FUSERMOUNT3_LOCAL && sudo apparmor_parser -r $FUSERMOUNT3_PROFILE"
 }
 
+# sysbox-ce 0.7.1 ships sysbox-fs (10 s) and sysbox-mgr (45 s) start timeouts and no Restart=: a slow boot leaves
+# sysbox down until someone restarts it by hand, and the node fails every check meanwhile
+SYSBOX_DROPIN_NAME="lium-restart.conf"
+install_sysbox_restart_dropins() {
+    local svc dir
+    for svc in sysbox-fs sysbox-mgr; do
+        dir=$(host_path "/etc/systemd/system/${svc}.service.d")
+        mkdir -p "$dir"
+        printf '%s\n' "[Service]" "TimeoutStartSec=90" "Restart=on-failure" "RestartSec=5" > "$dir/$SYSBOX_DROPIN_NAME"
+    done
+    systemctl daemon-reload || { fail "systemctl daemon-reload failed after writing the sysbox restart drop-ins."; return 1; }
+    ok "sysbox-fs and sysbox-mgr restart on failure and get 90 s to start after a reboot."
+}
+
 allow_sysboxfs_in_fusermount3_apparmor() {
     fusermount3_profile_enforced || return 0
     if fusermount3_needs_sysboxfs_rule; then
@@ -671,6 +685,14 @@ check_sysbox() {
             "$(self_cmd)   # upgrades Sysbox; it refuses to run while the node has a rental"
         return 1
     fi
+    local svc
+    for svc in sysbox-fs sysbox-mgr; do
+        if [ ! -f "$(host_path "/etc/systemd/system/${svc}.service.d/$SYSBOX_DROPIN_NAME")" ]; then
+            pf_fix "$svc has no restart-on-failure drop-in: after a slow reboot Sysbox can stay down." \
+                "$(self_cmd)   # adds the drop-ins; restarts no service"
+            return 1
+        fi
+    done
     pf_pass "sysbox-runc ${installed:-installed} runs a container."
 }
 
@@ -996,6 +1018,7 @@ if [ "$SYSBOX_UP_TO_DATE" = true ] && docker info 2>/dev/null | grep -q sysbox-r
         docker pull "$VERIFY_IMAGE" &>/dev/null || true
     fi
     if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &>/dev/null; then
+        install_sysbox_restart_dropins || exit 1   # safe under rentals: no service restarts
         setup_vloopback || { fail_vloopback; exit 1; }
         if [ -n "$VLOOPBACK_CHANGED" ]; then
             ok "Sysbox is already working."
@@ -1140,6 +1163,7 @@ if [ "$SKIP_INSTALL" = false ]; then
 else
     ok "Sysbox already installed, skipping."
 fi
+install_sysbox_restart_dropins || exit 1
 
 # ── 5. Configure Docker ────────────────────────────────
 
