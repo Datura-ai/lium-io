@@ -223,11 +223,11 @@ def _ssh_with_uptime(proc: str, uptime_and_ages: str):
     ("uptime_and_ages", "template", "after_boot"),
     [
         # host up a day, pod container started 30 s ago: a `docker restart`, not a host reboot
-        ("86400.12\n30\n", Msg.SHIFTED_AFTER_CONTAINER_RESTART, 86370),
+        ("86400.12\n 4242    30\n", Msg.SHIFTED_AFTER_CONTAINER_RESTART, 86370),
         # host up 700 s, container started 50 s after boot: brought back by the reboot
-        ("700.50\n650\n", Msg.SHIFTED, 50),
+        ("700.50\n4242 650\n", Msg.SHIFTED, 50),
         # uptime not read: the cause is unknown, the host message stays
-        ("\n30\n", Msg.SHIFTED, None),
+        ("\n4242 30\n", Msg.SHIFTED, None),
     ],
 )
 @pytest.mark.asyncio
@@ -251,9 +251,9 @@ async def test_a_shift_after_a_container_only_restart_does_not_blame_the_host(
     ("uptime_and_ages", "template"),
     [
         # pod_1 restarted 30 s ago on a host up a day, pod_2 started 50 s after boot: one cause does not fit both
-        ("86400\n30\n86350\n", Msg.SHIFTED_MIXED),
+        ("86400\n4242 30\n4343 86350\n", Msg.SHIFTED_MIXED),
         # pod_2's age not read: the cause is unknown, the host message stays
-        ("86400\n30\n\n", Msg.SHIFTED),
+        ("86400\n4242 30\n", Msg.SHIFTED),
     ],
 )
 @pytest.mark.asyncio
@@ -267,3 +267,18 @@ async def test_shifted_pods_with_different_histories_are_not_all_blamed_on_the_h
         _ctx(context_factory, _ssh_with_uptime(str(tmp_path), uptime_and_ages))
     )
     assert result.event.remediation == template.remediation
+
+
+@pytest.mark.asyncio
+async def test_each_age_stays_with_its_own_pid_when_one_pid_prints_nothing(context_factory, tmp_path):
+    # stand case e: ps prints nothing for pid 4242 (gone since the read) and 30 s for 4343
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me + 200000}      65536\n")
+    _proc(tmp_path, 4343, f"         0     {me + 200000}      65536\n")
+    result = await RentedPodOwnershipCheck().run(
+        _ctx(context_factory, _ssh_with_uptime(str(tmp_path), "86400\n 4343    30\n"))
+    )
+    pods = {p["container"]: p for p in result.event.what_we_saw["pods"]}
+    assert "started_after_boot_s" not in pods["pod_1"]
+    assert pods["pod_2"]["started_after_boot_s"] == 86370
+    assert result.event.remediation == Msg.SHIFTED.remediation  # pod_1's history is unknown

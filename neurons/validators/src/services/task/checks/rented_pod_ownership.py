@@ -147,18 +147,23 @@ class RentedPodOwnershipCheck:
         try:
             res = await asyncio.wait_for(
                 ctx.ssh.run(
-                    "cut -d' ' -f1 /proc/uptime; "
-                    + "; ".join(f"ps -o etimes= -p {int(p['pid'])}" for p in shifted),
+                    # pid beside its age: a pid gone since the read prints nothing, so ages cannot pair by line
+                    "cut -d' ' -f1 /proc/uptime; ps -o pid=,etimes= -p "
+                    + ",".join(str(int(p["pid"])) for p in shifted),
                     check=False,
                 ),
                 timeout=READ_TIMEOUT_SECONDS,
             )
         except (asyncssh.Error, OSError, TimeoutError):
             return Msg.SHIFTED
-        uptime, *ages = ((res.stdout or "").splitlines() + [""] * (len(shifted) + 1))[: len(shifted) + 1]
+        uptime, *lines = (res.stdout or "").splitlines() or [""]
         uptime_s = _num(uptime.partition(".")[0])
-        for pod, age in zip(shifted, ages):
-            age_s = _num(age)
+        ages = {}
+        for line in lines:
+            pid, _, age = line.strip().partition(" ")
+            ages[_num(pid)] = _num(age.strip())
+        for pod in shifted:
+            age_s = ages.get(int(pod["pid"]))
             if uptime_s is not None and age_s is not None:
                 pod["started_after_boot_s"] = uptime_s - age_s
         after = [p.get("started_after_boot_s") for p in shifted]
