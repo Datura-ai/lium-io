@@ -174,9 +174,16 @@ def test_a_node_the_express_lane_passed_this_cycle_gets_no_unreachable_row(flag_
     service = make_service()
     payload = make_payload()
     service.express_published[UNREACHABLE] = payload.job_batch_id
+    service.express_published_miner[UNREACHABLE] = payload.miner_hotkey
 
     assert service._build_unreachable_known_results(payload, RentedExecutorsResponse(executors={}), msg, None) == []
 
+    # a pass for another miner that reports the same uuid hides nothing for this one
+    service.express_published_miner[UNREACHABLE] = "another miner"
+    [result] = service._build_unreachable_known_results(payload, RentedExecutorsResponse(executors={}), msg, None)
+    assert result.executor_info.uuid == UNREACHABLE
+
+    service.express_published_miner[UNREACHABLE] = payload.miner_hotkey
     service.express_published[UNREACHABLE] = "an older cycle"
     [result] = service._build_unreachable_known_results(payload, RentedExecutorsResponse(executors={}), msg, None)
     assert result.executor_info.uuid == UNREACHABLE

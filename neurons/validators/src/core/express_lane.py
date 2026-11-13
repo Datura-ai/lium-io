@@ -659,6 +659,7 @@ class ExpressLane:
         if not (result.score > 0 or result.job_score > 0) or result.session_lost_in_port_check:
             # An earlier pass in this batch must not keep the fallback off (review 4558893416).
             self.miner_service.express_published.pop(executor_id.lower(), None)
+            self.miner_service.express_published_miner.pop(executor_id.lower(), None)
         if result.session_lost_in_port_check:
             # The run has no verdict: its findings still go out, and it is retried without spending one of
             # MAX_ATTEMPTS (bounded by SESSION_LOST_MAX_RUNS), neither a failed first pass nor validated.
@@ -691,6 +692,7 @@ class ExpressLane:
             # Only a pass has the pod check billing needs; a failed or lost run leaves the cycle's
             # result-missing fallback in place (review 4558671509).
             self.miner_service.express_published[executor_id.lower()] = job_batch_id
+            self.miner_service.express_published_miner[executor_id.lower()] = miner.hotkey
         pending.recheck_deadline = None
         if not should_run_first_pass_again:
             # A failed first pass that runs again keeps the request: the next tick selects it.

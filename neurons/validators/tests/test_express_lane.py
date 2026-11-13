@@ -238,6 +238,7 @@ class _Harness:
             miner_service.miners_awaiting_wave_list = {}
             miner_service.express_queued = frozenset()
             miner_service.express_published = {}
+            miner_service.express_published_miner = {}
         self.miner_service = miner_service
         self.miner_service.publish_machine_specs = AsyncMock()
         # A self-hosted miner that does not answer its executor list (the portal-snapshot cases).

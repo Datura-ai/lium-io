@@ -382,6 +382,8 @@ class MinerService:
         # executor uuid (lower case) -> the job_batch_id the express lane last published it under. That cycle has no
         # result of its own for the node, and its observations-only EXECUTOR_RESULT_MISSING would replace the lane's.
         self.express_published: dict[str, str] = {}
+        # the same uuid -> the miner hotkey that pass was for: two miners can report one uuid (review 4565706519)
+        self.express_published_miner: dict[str, str] = {}
         # DAH-5635: the running cycle's outage share for publish_unreachable_early; None = publish nothing early
         self.outage_tally: RunningOutageTally | None = None
         # DAH-5635: (miner hotkey, executor uuid) -> the availability errors this process's last cycle publish sent for
@@ -1077,7 +1079,11 @@ class MinerService:
             return []
         # The express lane verified it under this cycle's id after the miner's list came in (a node back from a
         # reboot): that pass stands, or this stale row would hide the node until the next cycle.
-        skip = reached | manual | {uuid for uuid, batch in self.express_published.items() if batch == payload.job_batch_id}
+        skip = reached | manual | {
+            uuid
+            for uuid, batch in self.express_published.items()
+            if batch == payload.job_batch_id and self.express_published_miner.get(uuid) == payload.miner_hotkey
+        }
         if rented_data:
             skip |= {str(uuid).lower() for uuid in rented_data.executors}
         results = []
