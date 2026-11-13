@@ -568,6 +568,8 @@ class GpuResetErrorCode(enum.Enum):
     ExecutorUnreachable = "ExecutorUnreachable"
     # 2.4.0: sysbox or TEE pod, no supported clocks, or the driver refused the lock
     ClockLockNotSupported = "ClockLockNotSupported"
+    # 2.14.0: the host GPU listing failed, timed out or came back empty: the GPUs are gone from the host driver
+    GpusLostOnHost = "GpusLostOnHost"
 
 
 class GpuResetOutcome(pydantic.BaseModel):

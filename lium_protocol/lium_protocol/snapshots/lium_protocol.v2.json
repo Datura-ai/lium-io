@@ -3485,7 +3485,8 @@
         "ContainerNotFound",
         "OperationInProgress",
         "ExecutorUnreachable",
-        "ClockLockNotSupported"
+        "ClockLockNotSupported",
+        "GpusLostOnHost"
       ],
       "title": "GpuResetErrorCode",
       "type": "string"
@@ -6620,7 +6621,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "2.13.0",
+  "protocol_version": "2.14.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"
