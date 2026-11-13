@@ -9,7 +9,7 @@ from dataclasses import replace
 from typing import Any
 
 from pydantic import BaseModel
-from services.const import DEFAULT_JOB_OWNER_LIUM, FILLER_CONTAINER_PREFIX
+from services.const import DEFAULT_JOB_OWNER_LIUM, DEFAULT_JOB_OWNER_MINER, FILLER_CONTAINER_PREFIX
 from services.gpu_power_limit import (
     MIN_POWER_LIMIT_RATIO,
     RENTAL_START_RATIO_TTL_SECONDS,
@@ -242,7 +242,18 @@ class GpuPowerLimitCheck:
                 "measurements": _dump_measurements(measurements),
             },
         )
-        return CheckResult(passed=True, event=event)
+        updates: dict[str, Any] = {}
+        if default_job_owner == DEFAULT_JOB_OWNER_MINER:
+            # the provider's own capped job (DAH-5861): the badge judges the host's pre-cap limit, as under Pearl
+            read_result = await read_gpu_power_restore_records(
+                ctx.services.redis,
+                [m.uuid for m in measurements if m.uuid],
+                log_extra=ctx.default_extra,
+            )
+            updates = _with_host_limits(
+                ctx, [record for record in read_result.records if record.executor_id == ctx.executor.uuid]
+            )
+        return CheckResult(passed=True, event=event, updates=updates)
 
     async def _remember_tier_ratios(self, ctx: Context, measurements: list[GpuPowerMeasurement]) -> bool:
         """Keep each GPU's passing reading in the 80 % tier (and clear it at stock) for a rental-start
