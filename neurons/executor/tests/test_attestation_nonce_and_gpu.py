@@ -4,8 +4,7 @@ Executor-side tests for the CVM attestation gap remediation (DAH-2338, G1/G3).
 Covers:
 - G3 signature surface: validator_signature must cover public_key ‖ nonce when a
   nonce rides the request — swapping or stripping the nonce invalidates it; the
-  legacy (no-nonce) format keeps working; REQUIRE_ATTESTATION_NONCE gates the
-  enforcement phase on the upload route only.
+  an upload without a dated nonce is refused; removals keep the legacy (no-nonce) format.
 - G3 quote binding: TDX report_data becomes sha256 half ‖ nonce half, nonce-bound
   quotes bypass the cache, malformed nonces are rejected.
 - G1 topology guard: GPU evidence is emitted only in-CVM with the feature flag on;
@@ -129,8 +128,7 @@ def test_nonce_without_covering_signature_rejected(client, miner_keypair, valida
 def test_require_nonce_enforcement_upload_only(
     client, miner_keypair, validator_keypair, monkeypatch
 ):
-    # Arrange — enforcement phase: uploads without a nonce are rejected
-    monkeypatch.setattr(settings, "REQUIRE_ATTESTATION_NONCE", True)
+    # Arrange — uploads without a dated nonce are rejected
     no_nonce = _build_payload(miner_keypair, validator_keypair, nonce=None)
     undated = _build_payload(miner_keypair, validator_keypair, nonce=_NONCE)
     with_nonce = _build_payload(miner_keypair, validator_keypair, nonce=fresh_upload_nonce())

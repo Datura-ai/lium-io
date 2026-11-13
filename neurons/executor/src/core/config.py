@@ -179,10 +179,6 @@ class Settings(BaseSettings):
     # dstack guest marker; also what the dstack SDK talks to for TDX quotes. TDX quotes are
     # served exactly when it exists (inside a dstack CVM); a bare-metal executor has none.
     DSTACK_SOCKET_PATH: str = Field(env="DSTACK_SOCKET_PATH", default="/var/run/dstack.sock")
-    # G3 enforcement phase: reject SSH-key uploads without a validator attestation
-    # nonce. Leave off until the validator fleet mints nonces (migration order:
-    # executors accept optional nonce first, then validators send, then this).
-    REQUIRE_ATTESTATION_NONCE: bool = Field(env="REQUIRE_ATTESTATION_NONCE", default=False)
     # I-78: a dated upload nonce (datura fresh_upload_nonce) older or newer than this is refused, so a
     # captured upload signature is worth at most this window. Symmetric for host clock drift.
     UPLOAD_NONCE_MAX_AGE_SECONDS: int = Field(env="UPLOAD_NONCE_MAX_AGE_SECONDS", default=600)

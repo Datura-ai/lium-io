@@ -244,13 +244,13 @@ def _validate_validator_signature(payload: UploadSShKeyPayload, require_nonce: b
     When the request carries an attestation nonce the signature must cover
     public_key AND nonce (datura.ssh_pubkey_signing_blob) — stripping or swapping
     the nonce invalidates the signature. Legacy requests without a nonce keep
-    the bare-public-key format. `require_nonce` is the G3 enforcement phase:
-    attestation-relevant requests without a nonce are rejected outright.
+    the bare-public-key format. `require_nonce` (every upload; never a removal) is the
+    G3 enforcement: a request without a dated nonce is rejected outright.
     """
     issued_at = upload_nonce_issued_at(payload.nonce)
     # I-78: enforcement wants the dated nonce, so an old captured signature (none, or a bare one) is refused
     if require_nonce and issued_at is None:
-        logger.warning("Rejecting SSH-key upload without a dated validator nonce (enforcement on)")
+        logger.warning("Rejecting SSH-key upload without a dated validator nonce")
         raise HTTPException(status_code=401, detail="Attestation nonce required")
     if issued_at is not None and abs(time.time() - issued_at) > settings.UPLOAD_NONCE_MAX_AGE_SECONDS:
         logger.warning("Rejecting SSH-key upload with a nonce minted %ds away", int(time.time() - issued_at))
@@ -321,7 +321,7 @@ async def upload_ssh_key(
     logger.info("upload_ssh_key SSH key consistency validated")
     # The nonce requirement applies only to uploads (the attestation-bearing
     # request); removals never carry a nonce.
-    _validate_validator_signature(payload, require_nonce=settings.REQUIRE_ATTESTATION_NONCE)
+    _validate_validator_signature(payload, require_nonce=True)
     logger.info("upload_ssh_key validator signature validated")
     _check_miner_binding(payload)
     logger.info("upload_ssh_key service call started")
