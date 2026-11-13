@@ -3183,6 +3183,19 @@ def _vloopback_repair_helper_cmd(propagated_mount_dir: str, helper_command: str)
     )
 
 
+def _clamp_rental_volume_to_free_disk(
+    payload: ContainerCreateRequest, fit: RentalDiskFit, free_now_gb: float
+) -> None:
+    """Clamp a rental's volume to the disk free after the cache eviction (DAH-5260), as the fit measured it."""
+    rental_gets_gb = (free_now_gb + fit.existing_gb) * fit.disk_share
+    if fit.fresh_sizing:
+        # resolve_volume_sizing's df_guard never sizes past df free less its headroom, whatever other pods' kept
+        # volumes add above: without this a stuck cache leaves the rent short yet unclamped, and it goes through
+        rental_gets_gb = min(rental_gets_gb, free_now_gb - _FRESH_SIZING_HEADROOM_GB)
+    # a clamp only lowers: an unchanged order reads as unclamped and skips the rental_disk_short check
+    payload.volume_limit_gb = min(payload.volume_limit_gb, max(int(rental_gets_gb), 1))
+
+
 _CACHE_EMPTIED_MARK = "cache emptied: "
 
 
@@ -6324,9 +6337,12 @@ class DockerService:
                         emptied.add(line[len(_CACHE_EMPTIED_MARK):].strip())
                 return result
 
+            async def free_now_gb() -> float:
+                # the one free-disk reading both the fit and the clamp use, so they never disagree (lio#2219 review)
+                return await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
+
             async def rental_fits() -> bool:
-                free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
-                return free_now_gb >= rental_needs_free_gb
+                return await free_now_gb() >= rental_needs_free_gb
 
             killed: tuple[str, ...] = tuple(killed_fillers)
 
@@ -6336,6 +6352,9 @@ class DockerService:
                 return (
                     f"/usr/bin/docker volume rm {shlex.quote(name)} 2>/dev/null || "
                     f"( ( {_wipe_volume_cmd(name, *killed)} ) && "
+                    # an exiting filler still running keeps the unlinked files open, so their blocks stay allocated:
+                    # emptied only once no running container mounts it (lio#2219 review)
+                    f'[ -z "$(/usr/bin/docker ps -q --filter volume={shlex.quote(name)})" ] && '
                     f"echo {shlex.quote(_CACHE_EMPTIED_MARK + name)} ) || true"
                 )
 
@@ -6380,7 +6399,7 @@ class DockerService:
                         cache_volumes_still_listed = None
                     removal_failed = cache_volumes_still_listed is None or bool(cache_volumes_still_listed - emptied)
                 if removal_failed:
-                    await self._clamp_rental_volume_to_free_disk(ssh_client, payload, docker_root_dir, fit)
+                    _clamp_rental_volume_to_free_disk(payload, fit, await free_now_gb())
             return True
         except asyncio.CancelledError:
             raise
@@ -6420,23 +6439,6 @@ class DockerService:
         # if the listing floor is still free beside the volume
         needs_free_gb += DPHN_CACHE_LISTING_FLOOR_GB
         return RentalDiskFit(own_gb, existing_gb, disk_share, fresh_sizing, needs_free_gb)
-
-    async def _clamp_rental_volume_to_free_disk(
-        self,
-        ssh_client: asyncssh.SSHClientConnection,
-        payload: ContainerCreateRequest,
-        docker_root_dir: str,
-        fit: RentalDiskFit,
-    ) -> None:
-        """Clamp a rental's volume to the disk actually free after the cache eviction (DAH-5260)."""
-        free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
-        rental_gets_gb = (free_now_gb + fit.existing_gb) * fit.disk_share
-        if fit.fresh_sizing:
-            # resolve_volume_sizing's df_guard never sizes past df free less its headroom, whatever other pods' kept
-            # volumes add above: without this a stuck cache leaves the rent short yet unclamped, and it goes through
-            rental_gets_gb = min(rental_gets_gb, free_now_gb - _FRESH_SIZING_HEADROOM_GB)
-        # a clamp only lowers: an unchanged order reads as unclamped and skips the rental_disk_short check
-        payload.volume_limit_gb = min(payload.volume_limit_gb, max(int(rental_gets_gb), 1))
 
     async def select_affordable_cache_volumes(
         self,
