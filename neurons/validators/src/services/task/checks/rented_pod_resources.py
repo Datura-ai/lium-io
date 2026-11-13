@@ -9,6 +9,7 @@ import asyncssh
 from services.const import RENTAL_CPU_COUNT_LABEL
 
 from core.config import settings
+from services.host_memory_guard import apply_host_memory_guard
 
 from ..messages import RentedPodResourcesMessages as Msg
 from ..messages import render_message
@@ -124,6 +125,8 @@ class RentedPodResourcesCheck:
                 passed=True, event=render_message(Msg.NOT_RENTED, ctx=ctx, check_id=self.check_id)
             )
 
+        # a restarted pod or a rebooted host loses them (DAH-6379)
+        await apply_host_memory_guard(ctx.ssh, names, {"executor_uuid": ctx.executor.uuid})
         try:
             pods = await self._inspect(ctx.ssh, names)
             init_reads_by_pid = await self._read_init(ctx.ssh, [p.pid for p in pods])
