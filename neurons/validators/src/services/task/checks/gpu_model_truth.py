@@ -94,6 +94,8 @@ EXPECTED_CC_ONLY: dict[str, str] = {
     "NVIDIA GeForce RTX 3080 Ti": "8.6",
     "NVIDIA GeForce RTX 4060": "8.9",
     "NVIDIA GeForce RTX 4070": "8.9",
+    "NVIDIA GeForce RTX 4080 32GB": "8.9",  # memory-modded cards: cc-only until the fleet shows one
+    "NVIDIA GeForce RTX 4080 SUPER 32GB": "8.9",
     "NVIDIA GeForce RTX 4090 48GB": "8.9",
     "NVIDIA GeForce RTX 4090 D": "8.9",
     "NVIDIA GeForce RTX 5060": "12.0",

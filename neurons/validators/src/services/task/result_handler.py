@@ -48,9 +48,7 @@ def _canonicalize_published_gpu_names(specs: dict) -> dict:
     canonical_details = [
         {
             **detail,
-            "name": classify_gpu_model(
-                detail.get("name"), detail.get("capacity"), settings.RTX_4090_48GB_MODEL_ENABLED
-            ),
+            "name": classify_gpu_model(detail.get("name"), detail.get("capacity")),
         }
         if isinstance(detail, dict) and detail.get("name")
         else detail

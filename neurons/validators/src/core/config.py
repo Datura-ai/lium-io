@@ -491,11 +491,6 @@ class Settings(BaseSettings):
     # re-registers the node to list a different set. Off again = the mark stays in the record but is ignored.
     # Flip after reading a week of the warn-mode rows.
     GPU_ANCHOR_HARD_ENABLED: bool = Field(env="GPU_ANCHOR_HARD_ENABLED", default=False)
-    # DAH-5508: an RTX 4090 reporting ~48 GB is scored as its own model "NVIDIA GeForce RTX 4090 48GB" (own VRAM
-    # window, rate, anchor and idle tier) instead of failing the 24 GB window. Off: such a card is rejected as before.
-    # Ships off. Turned on only by the Lium product owner, once the native verifier accepts a 48 GB 4090, the provider
-    # preflight classifies it too, and the all-card probe is sized from the classified model.
-    RTX_4090_48GB_MODEL_ENABLED: bool = Field(env="RTX_4090_48GB_MODEL_ENABLED", default=False)
     # DockerCpuCheck: when disabled, a node whose Docker daemon sees fewer CPUs than the machine is logged only.
     DOCKER_CPU_MISMATCH_ENFORCEMENT_ENABLED: bool = Field(env="DOCKER_CPU_MISMATCH_ENFORCEMENT_ENABLED", default=False)
     PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED: bool = Field(
