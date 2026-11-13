@@ -79,9 +79,7 @@ def _normalize_gpu_details(gpu_details: list[dict[str, Any]]) -> list[dict[str, 
     return [
         {
             **detail,
-            "name": classify_gpu_model(
-                detail.get("name"), detail.get("capacity"), settings.RTX_4090_48GB_MODEL_ENABLED
-            ),
+            "name": classify_gpu_model(detail.get("name"), detail.get("capacity")),
         }
         if detail.get("name")
         else detail

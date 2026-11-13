@@ -89,9 +89,6 @@ GPU_VRAM_SIZES_MB: dict[str, list[int]] = {
     # Ada consumer
     "NVIDIA GeForce RTX 4090": [24576],  # 24 GB; observed: 24564 (99.6%), 23028 (0.4%)
     "NVIDIA GeForce RTX 4090 D": [24576],  # 24 GB
-    # DAH-5508: a 48 GB RTX 4090 reports the plain 4090 name; classify_gpu_model names it this, only
-    # while RTX_4090_48GB_MODEL_ENABLED is on. Not launched.
-    "NVIDIA GeForce RTX 4090 48GB": [49152],  # 48 GB
     "NVIDIA GeForce RTX 4080 SUPER": [16384],  # 16 GB
     "NVIDIA GeForce RTX 4080": [16384],  # 16 GB
     "NVIDIA GeForce RTX 4070 Ti SUPER": [16384],  # 16 GB
@@ -186,6 +183,19 @@ GPU_VRAM_SIZES_MB["NVIDIA GB300"] = [258048, *GPU_VRAM_SIZES_MB["NVIDIA B300 SXM
 # `NVIDIA GB200` (DAH-6008): 192 GB HBM3e nominal per GPU like the B200 (~186 GB usable), so the B200 size; no reading yet.
 GPU_VRAM_SIZES_MB["NVIDIA GB200"] = list(GPU_VRAM_SIZES_MB["NVIDIA B200"])
 
+# --- Memory-modded cards (DAH-5508) -------------------------------------------
+# Boards rebuilt with more memory than any factory SKU. The driver reports the base card's name, so
+# classify_gpu_model names one from its VRAM reading: model -> (base card, nominal VRAM MB). Each is its own
+# model with its own VRAM window, price, idle tier and rate; the base card is unchanged.
+RTX_4090_48GB = "NVIDIA GeForce RTX 4090 48GB"
+MODDED_VRAM_MODELS: dict[str, tuple[str, int]] = {
+    RTX_4090_48GB: ("NVIDIA GeForce RTX 4090", 49152),  # 48 GB; observed: 49140
+    "NVIDIA GeForce RTX 4080 32GB": ("NVIDIA GeForce RTX 4080", 32768),  # 32 GB
+    "NVIDIA GeForce RTX 4080 SUPER 32GB": ("NVIDIA GeForce RTX 4080 SUPER", 32768),  # 32 GB
+}
+for _modded, (_base, _size_mb) in MODDED_VRAM_MODELS.items():
+    GPU_VRAM_SIZES_MB[_modded] = [_size_mb]
+
 # --- Intentionally unranged models (passthrough) -----------------------------
 # Models that are in GPU_MODEL_RATES but for which we intentionally do not
 # enforce a VRAM range (e.g., legacy data, awaiting spec confirmation).
@@ -260,24 +270,28 @@ def list_sxm_on_pcie_adapter_as_pcie(specs: dict[str, Any], gpu_details: list[An
     if not is_sxm_on_pcie_adapter(specs):
         return gpu_details
     return [{**gpu, "name": H100_PCIE} if isinstance(gpu, dict) and gpu.get("name") else gpu for gpu in gpu_details]
-RTX_4090_48GB = "NVIDIA GeForce RTX 4090 48GB"
 
 
-def classify_gpu_model(name: str | None, capacity_mb: int | float | None, rtx_4090_48gb_enabled: bool) -> str:
-    """normalize_gpu_model, plus the RTX 4090 48GB split (DAH-5508).
+def classify_gpu_model(name: str | None, capacity_mb: int | float | None) -> str:
+    """normalize_gpu_model, plus the memory-modded models (MODDED_VRAM_MODELS; DAH-5508).
 
-    With the setting on, an RTX 4090 whose VRAM is in the 48 GB window is its own model. No driver
-    reports the 48GB name itself, so a card that does is treated as a plain RTX 4090: only its VRAM,
-    and only with the setting on, makes it the 48 GB model. Every other card is normalize_gpu_model.
+    A base card whose VRAM is in a modded model's window is that model. No driver reports a modded
+    name itself, so a card that does is treated as its base card: only its VRAM makes it the modded
+    model. Every other card is normalize_gpu_model.
     """
-    canonical = normalize_gpu_model(name)
-    if canonical == RTX_4090_48GB:
-        canonical = RTX_4090
-    if rtx_4090_48gb_enabled and canonical == RTX_4090 and isinstance(capacity_mb, (int, float)):
-        low, high = vram_window_for_size(GPU_VRAM_SIZES_MB[RTX_4090_48GB][0])
-        if low <= capacity_mb <= high:
-            return RTX_4090_48GB
+    canonical = driver_gpu_name(normalize_gpu_model(name))
+    if isinstance(capacity_mb, (int, float)):
+        for model, (base, size_mb) in MODDED_VRAM_MODELS.items():
+            low, high = vram_window_for_size(size_mb)
+            if base == canonical and low <= capacity_mb <= high:
+                return model
     return canonical
+
+
+def driver_gpu_name(model: str) -> str:
+    """The name the driver reports for `model`: a modded model's base card, else the model itself. The
+    native verifier keys its challenge on the driver's name, so machine_info must carry this one."""
+    return MODDED_VRAM_MODELS.get(model, (model, 0))[0]
 
 
 def vram_window_for_size(nominal_mb: int) -> tuple[int, int]:
@@ -317,8 +331,10 @@ def matmul_probe_vram_mb(model: str | None, reported_vram_mb: int | None = None)
     self-report, so a spoofing host still cannot shrink its own challenge. An unknown model scored as a
     reference model (DAH-5088) has no registry size, so it is sized from `reported_vram_mb`, floored the
     same way. Returns None for other unknown models — the caller then skips rather than guessing.
+    A memory-modded card arrives under its base card's raw name; its reading names it (classify_gpu_model), so
+    every card of a host claiming 48 GB 4090s gets a 48 GB-sized challenge, not a factory 24 GB one.
     """
-    canonical = normalize_gpu_model(model)
+    canonical = classify_gpu_model(model, reported_vram_mb) if reported_vram_mb else normalize_gpu_model(model)
     sizes = GPU_VRAM_SIZES_MB.get(canonical)
     if not sizes:
         if reported_vram_mb and reference_gpu_model(canonical, reported_vram_mb):

@@ -38,8 +38,11 @@ EXPECTED_CC_AND_SM: dict[str, tuple[str, int]] = {
     "NVIDIA GeForce RTX 4070 Ti": ("8.9", 60),
     "NVIDIA GeForce RTX 4070 Ti SUPER": ("8.9", 66),
     "NVIDIA GeForce RTX 4080": ("8.9", 76),
-    "NVIDIA GeForce RTX 4080 SUPER": ("8.9", 80),
+    "NVIDIA GeForce RTX 4080 32GB": ("8.9", 76),  # memory-modded cards keep their base chip's SM count, so a
+    "NVIDIA GeForce RTX 4080 SUPER": ("8.9", 80),  # smaller chip (a 4090 D's 114 SMs) cannot pass as the modded
+    "NVIDIA GeForce RTX 4080 SUPER 32GB": ("8.9", 80),  # name (lio#2234 review)
     "NVIDIA GeForce RTX 4090": ("8.9", 128),
+    "NVIDIA GeForce RTX 4090 48GB": ("8.9", 128),
     "NVIDIA GeForce RTX 5060 Ti": ("12.0", 36),
     "NVIDIA GeForce RTX 5070": ("12.0", 48),
     "NVIDIA GeForce RTX 5070 Ti": ("12.0", 70),
@@ -94,7 +97,6 @@ EXPECTED_CC_ONLY: dict[str, str] = {
     "NVIDIA GeForce RTX 3080 Ti": "8.6",
     "NVIDIA GeForce RTX 4060": "8.9",
     "NVIDIA GeForce RTX 4070": "8.9",
-    "NVIDIA GeForce RTX 4090 48GB": "8.9",
     "NVIDIA GeForce RTX 4090 D": "8.9",
     "NVIDIA GeForce RTX 5060": "12.0",
     "NVIDIA GeForce RTX 5090 D": "12.0",
