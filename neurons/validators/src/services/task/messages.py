@@ -2559,6 +2559,13 @@ class GpuKernelCountMessages:
             "(/proc/driver/nvidia/gpus) lists fewer cards than the node reports."
         ),
     )
+    COUNT_MISMATCH_HOST_SHADOW = MessageTemplate(
+        event="Reported GPU count exceeds the host kernel's GPU list",
+        reason="GPU_KERNEL_COUNT_HOST_VIEW_SHADOW",
+        severity="warning",
+        category="env",
+        impact="Shadow observation only: the validation result was NOT changed",
+    )
     UUID_MISMATCH = MessageTemplate(
         event="Reported GPU UUIDs are missing from the kernel's GPU list",
         reason="GPU_KERNEL_UUID_MISMATCH",
