@@ -178,17 +178,18 @@ class BatchVerifier:
             timings[key] = loop.time() - began
             return result
 
-        def host_start(listen: list[PortPair], container: str, idx: int, key: str):
+        def host_start(listen: list[PortPair], container: str, idx: int, key: str, watch=start_watch):
             return timed(key, self._start_container(
-                start_watch, ssh_client, container, NetcatScript.batch(listen, token, idx), "host", 60
+                watch, ssh_client, container, NetcatScript.batch(listen, token, idx), "host", 60
             ))
 
         async def optional_start(listen: list[PortPair], container: str) -> ContainerStartResult:
             # the missed ports' listener is extra: its failure must not discard the ports that already answered
             try:
-                return await host_start(listen, container, 1, "missed_start")
+                # its own watch: a slow extra start is not a hung main start, so it never makes `start_hung` skip
+                # the semi-batch and fallback tiers; cancel and cleanup still go through `missed_start`
+                return await host_start(listen, container, 1, "missed_start", ContainerStartWatch())
             except Exception as exc:  # not CancelledError: a cancelled start still ends the attempt
-                start_watch.in_progress -= 1  # it returned, by raising; only a cancelled start stays in progress
                 logger.warning(_m(f"missed-port listener start failed: {exc!r}", extra=get_extra_info(log_ctx)))
                 return ContainerStartResult(ok=False, container_id=None, status=repr(exc))
 

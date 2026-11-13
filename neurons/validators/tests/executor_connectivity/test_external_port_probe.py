@@ -112,7 +112,6 @@ async def test_a_host_that_answers_only_published_ports_still_reaches_the_semi_b
     external = mocker.Mock(spec=ExternalPortProbe)
     external.reached = mocker.AsyncMock(side_effect=lambda host, sample, token: sample if outside == "passed" else [])
     mocker.patch("services.executor_connectivity.port_verifiers.random.sample", lambda ps, k: ps[:k])
-    mocker.patch("services.executor_connectivity.port_verifiers.asyncio.sleep", mocker.AsyncMock())
     semi, fallback = mocker.Mock(), mocker.Mock()
     semi.verify = mocker.AsyncMock(return_value=(PORTS, []))
 
@@ -511,6 +510,36 @@ async def test_a_failed_missed_port_start_keeps_the_ports_that_already_answered(
 
     assert result.successful == [p for p in TEN if p != TEN[2]]
     assert runner.run.await_count == 3  # one attempt: no retry of the whole verification
+
+
+@pytest.mark.asyncio
+async def test_a_pending_missed_port_start_at_the_deadline_is_not_a_hung_start(mocker):
+    # both attempts start the main listeners, fewer than min_ports answer, and the deadline fires while only the
+    # missed port's extra start is still pending past HUNG_START_MIN_SEC: semi-batch and fallback must stay open
+    async def reached(host, sample, token):
+        return sample[:2]
+
+    def answer(tested):
+        ok = [p for p in tested if 9002 < p.external < 9006]  # the missed sampled port and 9006+ stay refused
+        return ok, [p for p in tested if p not in ok]
+
+    verifier, runner = _parallel_verifier(mocker, reached, answer=answer)
+    verifier.REPROBE_DELAY_SEC = 0
+    mocker.patch.object(BatchVerifier, "ATTEMPT_TIMEOUT_SEC", 0.2)
+    mocker.patch.object(BatchVerifier, "HUNG_START_MIN_SEC", 0.05)
+
+    async def docker_run(_ssh, name, *_args):
+        if name.endswith("_s"):
+            await asyncio.Event().wait()  # never returns: cancelled at the deadline
+        return ContainerStartResult(ok=True, container_id="c", status="Up")
+
+    runner.run.side_effect = docker_run
+
+    result = await verifier.verify(TEN, ssh_client=mocker.Mock(), host="1.2.3.4", min_ports=7)
+
+    assert result.successful == []
+    assert not result.start_hung
+    assert [c.args[1] for c in runner.cleanup.await_args_list if c.args[1].endswith("_s")]  # the extra start cleaned up
 
 
 @pytest.mark.asyncio
