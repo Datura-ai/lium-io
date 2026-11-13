@@ -656,6 +656,9 @@ class ExpressLane:
         """
         executor_id = pending.executor.id
         result = results[0]
+        if not (result.score > 0 or result.job_score > 0) or result.session_lost_in_port_check:
+            # An earlier pass in this batch must not keep the fallback off (review 4558893416).
+            self.miner_service.express_published.pop(executor_id.lower(), None)
         if result.session_lost_in_port_check:
             # The run has no verdict: its findings still go out, and it is retried without spending one of
             # MAX_ATTEMPTS (bounded by SESSION_LOST_MAX_RUNS), neither a failed first pass nor validated.
