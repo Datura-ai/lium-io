@@ -1040,6 +1040,9 @@ def get_docker_info(content: bytes):
             data["docker_host_cpu_percent"] = host_cpu_percent
 
         containers = []
+        # the executor is the container this scrape runs in, never another one on its image (the monitor,
+        # or a burner); with no such match none is reported, which excuses nothing
+        own_pid = str(os.getpid())
 
         for container_id in container_ids:
             # Get the image ID of the container
@@ -1063,7 +1066,14 @@ def get_docker_info(content: bytes):
             if repo_digests:
                 digest = repo_digests[0].split('@')[1]
                 if repo_digests[0].split('@')[0] == 'daturaai/compute-subnet-executor':
-                    data["docker_container_id"] = container_id
+                    # `docker top` lists the container's processes by cgroup, in host pids under the required
+                    # `pid: host`; a hostname can name any container, and a daemonized sshd leaves the init's tree
+                    try:
+                        in_container = own_pid in run_cmd(f'{docker_path} top {container_id} -eo pid').split()[1:]
+                    except RuntimeError:
+                        in_container = False
+                    if in_container:
+                        data["docker_container_id"] = container_id
 
             container_entry = {'each_container_id': container_id, 'each_digest': digest or '', "each_name": container_name}
             cpu_percent = cpu_percents.get(container_id[:12])

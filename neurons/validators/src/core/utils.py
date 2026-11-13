@@ -288,6 +288,7 @@ async def retry_ssh_command(
         result = await ssh_client.run(command)
         if result.exit_status != 0:
             raise Exception(f"[{tag}] command: {command} exit_code {result.exit_status}, stderr: {result.stderr.strip()}")
+        return result
 
-    await execute_command()
+    return await execute_command()
 
