@@ -169,10 +169,9 @@ class Settings(BaseSettings):
     TDX_QUOTE_TIMEOUT: int = Field(env="TDX_QUOTE_TIMEOUT", default=60)
     SSH_HOST_KEY_PATH: str = Field(env="SSH_HOST_KEY_PATH", default="/etc/ssh/ssh_host_ed25519_key.pub")
 
-    # G1 phase-0 — NVIDIA CC GPU evidence emission. Collected with TDX attestation on AND
-    # only inside a dstack CVM (socket below exists): in host-mode pynvml would attest a
-    # non-CC bare-metal GPU, which must never be emitted as confidential-compute evidence
-    # (topology guard).
+    # G1 phase-0 — NVIDIA CC GPU evidence emission. Collected only inside a dstack CVM
+    # (socket below exists): in host-mode pynvml would attest a non-CC bare-metal GPU,
+    # which must never be emitted as confidential-compute evidence (topology guard).
     # NVIDIA attestation SDK arch tag routing the evidence at NRAS ("HOPPER", "BLACKWELL").
     GPU_ATTESTATION_ARCH: str = Field(env="GPU_ATTESTATION_ARCH", default="HOPPER")
     # dstack guest marker; also what the dstack SDK talks to for TDX quotes. TDX quotes are
