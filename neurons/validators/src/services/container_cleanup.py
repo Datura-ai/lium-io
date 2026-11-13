@@ -12,6 +12,7 @@ import asyncssh
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from core.docker_utils import ALPINE_HELPER_IMAGE, DockerCommand, df_available_bytes
 from core.utils import _m, get_extra_info
+from services.image_flatten import cache_trash_resume_command
 from services.const import (
     DPHN_CACHE_LISTING_FLOOR_GB,
     CACHE_SWEEP_CONTAINER_NAME,
@@ -730,6 +731,22 @@ class ContainerCleanup:
             for name in (line.strip() for line in (result.stdout or "").splitlines())
             if name.startswith(name_prefixes)
         )
+
+    async def resume_cache_trash_delete(self, ssh_client: asyncssh.SSHClientConnection, executor_uuid: str) -> bool:
+        """DAH-2498: restart the detached cache delete a reboot cut short; True when one was started."""
+        if self.dry_run:
+            return False
+        try:
+            result = await ssh_client.run(cache_trash_resume_command(), check=False, timeout=60)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(_m("Cache trash resume failed", extra={"executor_uuid": executor_uuid, "error": str(e)}))
+            return False
+        resumed = "resumed" in str(result.stdout or "")
+        if resumed:
+            logger.info(_m("Resumed the detached cache delete", extra={"executor_uuid": executor_uuid}))
+        return resumed
 
     async def sweep_abandoned_download_temporaries(
         self,

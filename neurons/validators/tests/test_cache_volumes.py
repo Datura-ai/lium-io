@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from payload_models.payloads import CacheVolume, ContainerCreateRequest, WorkloadKind
-from services import docker_service as docker_service_module
+from services import image_flatten
 from services.container_cleanup import idle_filler_images_removal_command
 from services.docker_service import DockerService, _detach_volume_data_cmd, _filler_run_volume_gb, _wipe_volume_cmd
 
@@ -63,13 +63,16 @@ class HostSshClient(FakeSshClient):
     def __init__(self, listed_volumes: list[str], free_gb: float):
         super().__init__(listed_volumes)
         self._free_bytes = int(free_gb * 1024**3)
+        self._trash_bytes = 0
 
     async def run(self, command: str, *args, **kwargs):
         self.commands.append(command)
-        if "docker info" in command:
+        if "docker info" in command and "df -P -B1" not in command:
             return SimpleNamespace(exit_status=0, stdout="/var/lib/docker\n", stderr="")
         if "df -P -B1" in command:
             body = f"Filesystem 1B-blocks Used Available Capacity\n/dev/sda1 1 1 {self._free_bytes} 1% /hostfs"
+            if 'echo "trash' in command:
+                body += f"\ntrash {self._trash_bytes}"
             return SimpleNamespace(exit_status=0, stdout=body, stderr="")
         stdout = self._listing if "volume ls" in command else ""
         return SimpleNamespace(exit_status=0, stdout=stdout, stderr="")
@@ -788,6 +791,7 @@ async def test_bytes_still_being_freed_in_the_background_count_toward_the_rental
         async def run(self, command: str, *args, **kwargs):
             if "volume rm" in command:
                 self.commands.append(command)
+                self._trash_bytes += 1561 * 1024**3
                 return SimpleNamespace(exit_status=0, stdout=f"detached {1561 * 1024**3}\n", stderr="")
             return await super().run(command, *args, **kwargs)
 
@@ -798,6 +802,30 @@ async def test_bytes_still_being_freed_in_the_background_count_toward_the_rental
     assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is True
     assert len(_removed_volumes(ssh_client)) == 1
     assert rental.volume_limit_gb == 2620
+
+
+@pytest.mark.asyncio
+async def test_disk_the_image_removal_freed_counts_beside_a_pending_background_delete(docker_service):
+    # 2000 GB free: the idle images free 500 GB at once, the first cache detaches 300 GB still being deleted.
+    # 2800 GB covers the 2740 GB the rental needs, so the second cache stays
+    class ImageThenDetachSshClient(HostSshClient):
+        async def run(self, command: str, *args, **kwargs):
+            if "docker image rm" in command:
+                self.commands.append(command)
+                self._free_bytes += 500 * 1024**3
+                return SimpleNamespace(exit_status=0, stdout="", stderr="")
+            if "volume rm" in command:
+                self.commands.append(command)
+                self._trash_bytes += 300 * 1024**3
+                return SimpleNamespace(exit_status=0, stdout=f"detached {300 * 1024**3}\n", stderr="")
+            return await super().run(command, *args, **kwargs)
+
+    ssh_client = ImageThenDetachSshClient(["dphn_cache_hf_x", _KIMI, "volume_pod"], free_gb=2000)
+    rental = _rental(2620, 1310)
+    rental.disk_share = 1.0
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is True
+    assert len(_removed_volumes(ssh_client)) == 1
 
 
 @pytest.mark.asyncio
@@ -841,7 +869,7 @@ def test_the_background_delete_frees_nothing_while_the_disk_measure_holds_the_tr
     (trash / "v.1/model.safetensors").write_bytes(b"x" * 8192)
     lock = open(f"{trash}.lock", "w")
     fcntl.flock(lock, fcntl.LOCK_EX)
-    delete = subprocess.Popen(["sh", "-c", docker_service_module._TRASH_DELETE, "_", str(trash)])
+    delete = subprocess.Popen(["sh", "-c", image_flatten.CACHE_TRASH_DELETE, "_", str(trash)])
     try:
         time.sleep(1)
         assert (trash / "v.1/model.safetensors").exists()

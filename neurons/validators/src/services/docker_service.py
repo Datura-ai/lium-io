@@ -149,10 +149,12 @@ from services.image_flatten import (
     FLATTEN_SIZING_SLACK_BYTES,
     FlattenMeasureFailed,
     ImageFlattenNoDisk,
+    cache_trash_delete_detached,
     flatten_copy_bytes,
     flatten_image_on_host,
     flatten_lease_release_command,
     flatten_sized_mark_command,
+    free_bytes_with_trash,
     wait_for_node_flatten,
 )
 from services.loopback_plugin_setup import (
@@ -3268,14 +3270,6 @@ def _wipe_volume_cmd(local_volume: str, *container_names: str) -> str:
     )
 
 
-# one file at a time under the trash lock the locked disk measure holds (flatten_wait_command): df and the trash
-# size are read with no delete between them, so no freed byte is missed by both
-_TRASH_DELETE = (
-    'if command -v flock >/dev/null; then L="$1.lock"; '
-    'find "$1" -depth ! -type d -exec flock "$L" rm -f {} \\; ; flock "$L" rm -rf "$1"; else rm -rf "$1"; fi'
-)
-
-
 def _detach_volume_data_cmd(volume_name: str, remove_cmd: str) -> str:
     """`remove_cmd` with the volume's files moved out first and deleted in the background (DAH-2498).
 
@@ -3287,6 +3281,7 @@ def _detach_volume_data_cmd(volume_name: str, remove_cmd: str) -> str:
     earlier `rm` left behind go too.
     """
     docker = "/usr/bin/docker"
+    delete = cache_trash_delete_detached('"/proc/1/root$t"')
     return (
         f"v={shlex.quote(volume_name)}; t=; b=0; "
         f"dm=$({docker} volume inspect -f '{{{{.Driver}}}} {{{{.Mountpoint}}}}' $v 2>/dev/null) && "
@@ -3297,8 +3292,7 @@ def _detach_volume_data_cmd(volume_name: str, remove_cmd: str) -> str:
         'b=$(du -sxB1 "/proc/1/root$m" | cut -f1) && mv "/proc/1/root$m" "/proc/1/root$t/$v.$$" && '
         '{ mkdir "/proc/1/root$m" 2>/dev/null; true; } || t=; '
         f"{remove_cmd}; "
-        f'if [ -n "$t" ]; then (setsid nohup nice -n 19 sh -c {shlex.quote(_TRASH_DELETE)} _ "/proc/1/root$t" '
-        "</dev/null >/dev/null 2>&1 &); "
+        f'if [ -n "$t" ]; then {delete}; '
         'echo "detached $b"; fi'
     )
 
@@ -6416,6 +6410,14 @@ class DockerService:
                 return result
 
             async def rental_fits() -> bool:
+                if detached_gb:
+                    # df and the trash still to free, read under one lock: nothing freed since is missed or doubled
+                    try:
+                        return await free_bytes_with_trash(ssh_client) / (1024**3) >= rental_needs_free_gb
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass
                 free_now_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
                 # df already holds what the detached `rm` freed so far: never count those bytes twice
                 return max(free_now_gb, free_gb + detached_gb) >= rental_needs_free_gb
