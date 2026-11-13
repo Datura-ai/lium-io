@@ -225,6 +225,9 @@ class RentedExecutorsResponse(BaseModel):
     # removal time (it sends the delete then and drops them from this list); the stale reapers keep each one
     # and its volume_<pod_id>. An older backend names none.
     retained_container_names: list[str] = []
+    # DAH-3333: pod ids whose volume_<pod_id> the reapers keep while still removing the container (a balance stop
+    # keeps the renter's disk, never the running container). An older backend names none.
+    retained_volume_pod_ids: list[str] = []
 
     def get_filler_revenue_per_gpu_hour(
         self, base_model: str | None, gpu_count: int, min_gpu_hours: float
@@ -399,6 +402,24 @@ class RentedGpuDropResponse(BaseModel):
     delivery: str | None = None
 
 
+class RentedPodTarget(BaseModel):
+    """One row of `GET /internal/executors/rented?light=true` (DAH-5215 watch): only what the SSH probe dials."""
+    pod_id: str
+    ip: str
+    miner_hotkey: str = ""  # the probe's per-miner DNS quota; "" from an older backend
+    port: int | None = None  # the pod's mapped SSH port
+    status: str | None = None
+
+
+class RentedPodTargets(RootModel[list[RentedPodTarget] | RentedExecutorsResponse]):
+    """The light list, or the full rented list from a backend that ignores `light=true`."""
+
+
+class PodSshReachabilityResponse(BaseModel):
+    # False when nothing was written (no open rental, or the state was already recorded).
+    recorded: bool
+
+
 GPU_DROP_DELIVERY_DISABLED = "disabled"
 GPU_DROP_DELIVERY_NOT_RENTED = "not_rented"
 
@@ -417,6 +438,15 @@ class FillerRunActiveResponse(BaseModel):
     status: str | None = None
     started_at: datetime | None = None
 
+
+
+class StorageOperationActiveResponse(BaseModel):
+    """DAH-6148: whether the backend still has a storage operation open (pending or running), and
+    when its runner last reported progress (before the first report: when it was created)."""
+
+    active: bool
+    status: str | None = None
+    last_report_at: datetime | None = None
 
 # DAH-2757: the states in which the backend still owns the container. `active` is not enough — the
 # backend sets it for RUNNING alone, and a filler the snapshot missed is usually still STARTING.

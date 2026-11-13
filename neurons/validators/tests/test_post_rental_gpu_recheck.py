@@ -62,15 +62,6 @@ def _idle_ctx(context_factory, runner, validation, *, marker=MARKER, gpu_count=2
     )
 
 
-@pytest.fixture
-def probe_flags_off():
-    # global enforcement is off: the recheck enforces regardless
-    with (
-        patch.object(module.settings, "GPU_FAULT_PROBE_ENFORCEMENT_ENABLED", False),
-    ):
-        yield
-
-
 # --- the marker, set on a rented cycle ----------------------------------------------------------------------
 
 
@@ -119,7 +110,7 @@ async def test_an_idle_flagged_or_a_clean_rented_read_records_nothing(context_fa
 
 
 @pytest.mark.asyncio
-async def test_no_marker_runs_nothing(context_factory, probe_flags_off):
+async def test_no_marker_runs_nothing(context_factory):
     runner, validation = FakeRunner(), FakeValidation()
 
     result = await PostRentalGpuRecheckCheck().run(
@@ -131,7 +122,7 @@ async def test_no_marker_runs_nothing(context_factory, probe_flags_off):
 
 
 @pytest.mark.asyncio
-async def test_on_a_fault_fails_the_node_and_keeps_the_marker(context_factory, probe_flags_off):
+async def test_on_a_fault_fails_the_node_and_keeps_the_marker(context_factory):
     runner = FakeRunner(probe_stdout("fault", faults=["gpu 1: wrong result in gather"]))
     validation = FakeValidation(_all_cards("", ""))
     ctx = _idle_ctx(context_factory, runner, validation)
@@ -147,7 +138,7 @@ async def test_on_a_fault_fails_the_node_and_keeps_the_marker(context_factory, p
 
 
 @pytest.mark.asyncio
-async def test_on_a_failed_all_cards_matmul_fails_the_node(context_factory, probe_flags_off):
+async def test_on_a_failed_all_cards_matmul_fails_the_node(context_factory):
     runner = FakeRunner(probe_stdout("ok"))
     validation = FakeValidation(_all_cards("", "exit_status=1"))
     ctx = _idle_ctx(context_factory, runner, validation)
@@ -160,7 +151,7 @@ async def test_on_a_failed_all_cards_matmul_fails_the_node(context_factory, prob
 
 
 @pytest.mark.asyncio
-async def test_on_a_pass_clears_the_marker(context_factory, probe_flags_off, caplog):
+async def test_on_a_pass_clears_the_marker(context_factory, caplog):
     runner = FakeRunner(probe_stdout("ok"))
     validation = FakeValidation(_all_cards("", ""))
     ctx = _idle_ctx(context_factory, runner, validation)
@@ -174,9 +165,7 @@ async def test_on_a_pass_clears_the_marker(context_factory, probe_flags_off, cap
 
 
 @pytest.mark.asyncio
-async def test_on_a_probe_without_a_verdict_keeps_the_marker_and_skips_the_streak(
-    context_factory, probe_flags_off
-):
+async def test_on_a_probe_without_a_verdict_keeps_the_marker_and_skips_the_streak(context_factory):
     runner = FakeRunner("python: not found", exit_code=127)
     ctx = _idle_ctx(context_factory, runner, FakeValidation())
     probe_module._unknown_streak.clear()
@@ -193,7 +182,7 @@ async def test_on_a_probe_without_a_verdict_keeps_the_marker_and_skips_the_strea
 @pytest.mark.parametrize(("gpu_count", "cleared"), [(2, False), (1, True)])
 @pytest.mark.asyncio
 async def test_no_all_cards_matmul_is_inconclusive_on_a_multi_card_node(
-    context_factory, probe_flags_off, gpu_count, cleared
+    context_factory, gpu_count, cleared
 ):
     runner = FakeRunner(probe_stdout("ok"))
     ctx = _idle_ctx(context_factory, runner, FakeValidation(None), gpu_count=gpu_count)
@@ -214,9 +203,7 @@ async def test_no_all_cards_matmul_is_inconclusive_on_a_multi_card_node(
     ],
 )
 @pytest.mark.asyncio
-async def test_an_all_cards_matmul_lost_to_ssh_or_time_is_inconclusive(
-    context_factory, probe_flags_off, all_cards
-):
+async def test_an_all_cards_matmul_lost_to_ssh_or_time_is_inconclusive(context_factory, all_cards):
     ctx = _idle_ctx(context_factory, FakeRunner(probe_stdout("ok")), FakeValidation(all_cards))
 
     result = await PostRentalGpuRecheckCheck().run(ctx)
@@ -226,7 +213,7 @@ async def test_an_all_cards_matmul_lost_to_ssh_or_time_is_inconclusive(
 
 
 @pytest.mark.asyncio
-async def test_a_filler_cycle_renews_the_marker(context_factory, probe_flags_off):
+async def test_a_filler_cycle_renews_the_marker(context_factory):
     runner, validation = FakeRunner(), FakeValidation()
     ctx = _idle_ctx(context_factory, runner, validation)
 
@@ -240,13 +227,26 @@ async def test_a_filler_cycle_renews_the_marker(context_factory, probe_flags_off
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ps_stdout, rm_stdout, marked",
+    [
+        pytest.param("abc123\n", "filler_run-1\n", True, id="running-and-docker-removed-it"),
+        # `rm -f` exits 0 for a container already gone: the host removed it, not us
+        pytest.param("", "", False, id="already-gone"),
+        # a host-stopped filler is exited: `rm -f` removes and names it, but the stop was not ours
+        pytest.param("", "filler_run-1\n", False, id="stopped-before-removal"),
+    ],
+)
 async def test_a_node_that_always_runs_a_filler_is_probed_after_the_skip_limit(
-    context_factory, probe_flags_off
+    context_factory, ps_stdout, rm_stdout, marked
 ):
     filler = "filler_run-1"
     runner, validation = FakeRunner(probe_stdout("ok")), FakeValidation(_all_cards("", ""))
     ssh = AsyncMock()
-    ssh.run.return_value = SimpleNamespace(exit_status=0, stdout="", stderr="")
+    ssh.run.side_effect = [
+        SimpleNamespace(exit_status=0, stdout=ps_stdout, stderr=""),
+        SimpleNamespace(exit_status=0, stdout=rm_stdout, stderr=""),
+    ]
     services = build_services(validation=validation)
     services.redis.store[KEY] = json.dumps({**MARKER, "filler_skips": module.FILLER_SKIP_LIMIT})
     uuid = default_executor().uuid
@@ -269,15 +269,14 @@ async def test_a_node_that_always_runs_a_filler_is_probed_after_the_skip_limit(
 
     assert ctx.ssh.run.await_args.args[0] == f"/usr/bin/docker rm -fv {filler}"
     assert result.event.what_we_saw["removed_fillers"] == [filler]
+    assert (f"filler_removed_by_validator:{filler}" in ctx.services.redis.store) is marked
     assert validation.calls == 1
     assert result.passed and result.event.reason_code == Msg.PASSED.reason
     assert KEY not in ctx.services.redis.store
 
 
 @pytest.mark.asyncio
-async def test_a_filler_that_cannot_be_removed_is_inconclusive_not_a_failure(
-    context_factory, probe_flags_off
-):
+async def test_a_filler_that_cannot_be_removed_is_inconclusive_not_a_failure(context_factory):
     runner, validation = FakeRunner(probe_stdout("ok")), FakeValidation(_all_cards("", ""))
     services = build_services(validation=validation)
     services.redis.store[KEY] = json.dumps({**MARKER, "filler_skips": module.FILLER_SKIP_LIMIT})

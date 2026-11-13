@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import logging
 import secrets
 import time
@@ -26,7 +27,7 @@ from services.verifyx_validation_service import (
     _is_speed_reading,
 )
 
-from ..messages import VerifyXMessages as Msg, render_message
+from ..messages import VerifyXMessages as Msg, render_message, shown
 from ..pipeline import CheckResult, Context
 from .disk_space import DiskSpaceCheck
 from .network_ema import compute_ema
@@ -36,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS = 100.0
 MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS = 10.0
+_SPEED_NEXT_STEP = "Improve the node's network link; the average recovers on the next cycles once speeds improve."
 _EMA_KEYS = ("ema_verifyx_download_speed", "ema_verifyx_upload_speed")
 
 # A host can bring on a real Cloudflare 429 by flooding speed.cloudflare.com from its own IP just
@@ -90,13 +92,39 @@ async def _rented_executors_now_shared(backend) -> tuple[Any, float]:
         )
     # shield: one caller's timeout must not cancel the read the others wait on
     return await asyncio.shield(cached[3]), cached[2]
-# DAH-5742: an idle filler-only node keeps its stored EMA for at most this many skips in a row (~24 h of
-# job cycles); then it is probed once, so a slower link than the stored figure shows up.
-# shortcut: per process, so a validator restart starts the count again; a backend-held measured-at would survive it.
-MAX_FILLER_SKIPS = 96
-# (skips, the stored EMA they reused): the count restarts only once the backend stores a new reading, so a failed
-# day-probe (stored only on a passing cycle) probes again next cycle instead of skipping another day on the old speed
-_filler_skips: dict[tuple[str, str], tuple[int, tuple]] = {}
+# DAH-5742: an idle filler-only node reuses its stored EMA for at most this long, then it is probed once, so a slower
+# link than the stored figure shows up. The start of the reuse is kept in Redis: a skip count in the process was reset
+# by every validator deploy and a node is skipped far less often than once per job cycle, so it never reached a day.
+MAX_FILLER_REUSE_SECONDS = 24 * 3600
+_FILLER_REUSE_PREFIX = "verifyx:filler_reuse_since"
+# renewed on every check, so a key only lapses for a node that stopped being checked for this long
+_FILLER_REUSE_TTL_SECONDS = 7 * 24 * 3600
+
+
+async def _filler_reuse_is_due(ctx: Context, stored: tuple) -> bool:
+    """True once the node has reused this same stored EMA for a day. The clock restarts only when the backend stores
+    a new reading, so a failed day-probe (stored only on a passing cycle) probes again next cycle."""
+    key = f"{_FILLER_REUSE_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
+    redis = ctx.services.redis
+    now = time.time()
+    try:
+        raw = await redis.get(key)
+        mark = json.loads(raw) if raw is not None else None
+        if mark is None or tuple(mark.get("stored") or ()) != stored:
+            await redis.set(key, json.dumps({"since": now, "stored": list(stored)}), ex=_FILLER_REUSE_TTL_SECONDS)
+            return False
+        due = now - float(mark["since"]) >= MAX_FILLER_REUSE_SECONDS
+    except Exception:
+        # without the clock the stored EMA is reused, as before DAH-5742; probing every cycle is the cost to avoid
+        logger.warning(_m("VerifyX filler reuse clock unreadable in Redis", extra=get_extra_info(ctx.default_extra)))
+        return False
+    # renew on every check, so an expired mark cannot look new and grant another day of reuse; decided before the
+    # renewal, so a failed renewal never turns a due probe into a skip
+    try:
+        await redis.expire(key, _FILLER_REUSE_TTL_SECONDS)
+    except Exception:
+        logger.warning(_m("VerifyX filler reuse clock not renewed in Redis", extra=get_extra_info(ctx.default_extra)))
+    return due
 
 
 @dataclass(frozen=True)
@@ -136,6 +164,8 @@ class VerifyXCheck:
     """
 
     check_id = "gpu.validate.verifyx"
+    # a replay would advance this cycle's counters a second time
+    replays_after_session_drop = False
     fatal = True
 
     def _extract_errors(self, result) -> str | list | None:
@@ -162,13 +192,6 @@ class VerifyXCheck:
         # score 0 every cycle and stay hidden for as long as the filler runs.
         # A stored upload EMA below the floor is probed too: skipping would pass it while the
         # filler runs, and a fresh sample is what lets it recover.
-        skip_key = (ctx.miner_hotkey, ctx.executor.uuid)
-        stored = (
-            (stored_ema.ema_verifyx_download_speed, stored_ema.ema_verifyx_upload_speed) if stored_ema else None
-        )
-        skips, skipped_on = _filler_skips.get(skip_key, (0, stored))
-        if skipped_on != stored:
-            skips = 0
         reusable = (
             filler_container
             and stored_ema
@@ -179,9 +202,10 @@ class VerifyXCheck:
             )
         )
         # a day of reuse is up: this probe refreshes the network reading only (r4472607210)
-        filler_refresh = bool(reusable) and skips >= MAX_FILLER_SKIPS
+        filler_refresh = bool(reusable) and await _filler_reuse_is_due(
+            ctx, (stored_ema.ema_verifyx_download_speed, stored_ema.ema_verifyx_upload_speed)
+        )
         if reusable and not filler_refresh:
-            _filler_skips[skip_key] = (skips + 1, stored)
             updated_specs = specs_with_last_known_verifyx_ema(ctx)
             event = render_message(
                 Msg.FILLER_SKIPPED,
@@ -428,6 +452,10 @@ class VerifyXCheck:
                     Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW,
                     ctx=ctx,
                     check_id=self.check_id,
+                    remediation=(
+                        f"Average download speed {shown(ema_download, 1, failed_below=True)} Mbps, "
+                        f"{MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS:.0f} Mbps required. {_SPEED_NEXT_STEP}"
+                    ),
                     what={
                         "direction": "download",
                         "ema_verifyx_download_speed": ema_download,
@@ -447,6 +475,10 @@ class VerifyXCheck:
                     Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW,
                     ctx=ctx,
                     check_id=self.check_id,
+                    remediation=(
+                        f"Average upload speed {shown(ema_upload, 1, failed_below=True)} Mbps, "
+                        f"{MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS:.0f} Mbps required. {_SPEED_NEXT_STEP}"
+                    ),
                     what={
                         "direction": "upload",
                         "ema_verifyx_upload_speed": ema_upload,
@@ -504,10 +536,15 @@ FILLER_REFRESH_CHALLENGE_CONFIG = {
 }
 
 
-def _first_pass_challenge_config() -> dict[str, int]:
+def _first_pass_challenge_config() -> dict[str, float]:
     return {
         "memory_max_test_gb": settings.FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB,
         "storage_throughput_test_gb": settings.FIRST_PASS_VERIFYX_STORAGE_TEST_GB,
+        # the waits are sized in libverifyx.so, which knows the package and speed-test sizes
+        "network_floor_mbps": min(
+            settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS, settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS
+        ),
+        "network_min_timeout_seconds": settings.FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS,
     }
 
 
@@ -940,6 +977,8 @@ class VerifyXColdRetryCheck:
     first sample stands, and a gate it failed fails the node here."""
 
     check_id = "gpu.validate.verifyx_cold_retry"
+    # a replay would benchmark again from the first sample and could throw away a retry that passed
+    replays_after_session_drop = False
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:

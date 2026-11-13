@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import TYPE_CHECKING, Any
 
 from .models import AVAILABILITY_CATEGORY, build_msg
@@ -25,6 +26,17 @@ class MessageTemplate:
     impact: str
     remediation: str | None = None
     help_uri: str | None = None
+
+
+def shown(value: float, decimals: int, *, failed_below: bool) -> str:
+    """Format a failing reading so rounding never makes it look like it meets the limit.
+
+    A value below a minimum rounds down and a value above a maximum rounds up (49.96 GB free
+    shows as 49.9, not 50.0, against a 50 GB minimum).
+    """
+    # decimal from the shortest str(): no float noise (49.9 stays 49.9) and no pre-rounding (99.99999999 stays below 100)
+    step = Decimal(1).scaleb(-decimals)
+    return f"{Decimal(str(value)).quantize(step, rounding=ROUND_FLOOR if failed_below else ROUND_CEILING):.{decimals}f}"
 
 
 def render_message(
@@ -621,7 +633,7 @@ class PostRentalGpuRecheckMessages:
         remediation=(
             "A GPU showed a fault (during a rental, or it dropped out), and after it at least one card failed the "
             "all-cards matmul or the kernel-fault probe. Check `nvidia-smi -q` and the host `dmesg` for NVRM "
-            "Xid lines; reset the card (`nvidia-smi -r`) or reboot the host, replace a card that still fails, "
+            "Xid lines; reset the card once its processes stop (`nvidia-smi -r -i <index>`) or reboot the host, replace a card that still fails, "
             "and wait one cycle."
         ),
     )
@@ -660,8 +672,9 @@ class GpuPowerLimitMessages:
         category="policy",
         impact="Job skipped; score set to 0",
         remediation=(
-            "Restore the GPU power limit to at least 90% of the default limit "
-            "reported by NVML."
+            "Restore the GPU power limit to at least 80% of the default limit "
+            "reported by NVML, or during a rental to at least 90% (or the limit "
+            "the rental started on, if lower)."
         ),
     )
     DATA_INCOMPLETE_REJECTED = MessageTemplate(
@@ -678,6 +691,14 @@ class GpuPowerLimitMessages:
         severity="info",
         category="env",
         impact="Proceed",
+    )
+    # F-43: a kept 80 % tier reading whose clear is not confirmed (Redis failed): neither zero nor show stock
+    TIER_STATE_UNKNOWN = MessageTemplate(
+        event="GPU power limit at stock, but the validator could not clear its earlier tier reading",
+        reason="GPU_POWER_TIER_STATE_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Validation halted — no verdict this cycle, the previous result stands",
     )
     SKIPPED_ACTIVE_LIUM_FILLER = MessageTemplate(
         event="GPU power limit check skipped for active Lium default job",
@@ -883,6 +904,13 @@ class ExecutorImageMessages:
         severity="error",
         category="policy",
         impact="Score set to 0 until the image is current",
+    )
+    UNOFFICIAL = MessageTemplate(
+        event="Executor is not an official build",
+        reason="EXECUTOR_IMAGE_UNOFFICIAL",
+        severity="error",
+        category="policy",
+        impact="Score set to 0 until the node runs the official executor image",
     )
     # Same reason code as OUTDATED so log queries keep matching; severity says it is not scored.
     OUTDATED_WARNING = MessageTemplate(
@@ -1102,6 +1130,14 @@ class StaleContainerCleanupMessages:
         severity="warning",
         category="prep",
         impact="No rental container removed this cycle; live pods and fillers are left alone",
+    )
+    TIMED_OUT = MessageTemplate(
+        event="Stale container cleanup timed out",
+        reason="STALE_CLEANUP_TIMED_OUT",
+        severity="warning",
+        category="prep",
+        impact="Cleanup stopped for this cycle; the rest of the validation runs",
+        remediation="Docker on the node answers slowly; check that dockerd is responsive.",
     )
 
 
@@ -1327,8 +1363,9 @@ class TenantEnforcementMessages:
         category="transport",
         impact="No verdict for this cycle - pod state unknown",
         remediation=(
-            "Transient SSH transport failure (network blip, conntrack flush). "
-            "Persistent unreachability is handled by the stale-executor sweep."
+            "The validator's SSH session to the node dropped mid-check (`transport_error` names how), so this "
+            "cycle has no verdict and the next one retries. If it repeats, check that the node's SSH port answers "
+            "from outside and that the executor container is running."
         ),
     )
     GPU_OUTSIDE_TENANT = MessageTemplate(
@@ -1370,6 +1407,18 @@ class GpuUsageMessages:
         category="runtime",
         impact="Validation skipped; score set to 0",
         remediation="Stop all GPU processes and re-run your node. If using Docker, ensure no host processes are running.",
+    )
+    USAGE_HIGH_MEASURED_REMEDIATION = (
+        "GPU {gpu_index}: utilization {gpu_utilization} and memory utilization {vram_utilization}; "
+        "an idle node must stay below {gpu_limit}% utilization and at most {memory_limit}% memory "
+        "utilization. GPU processes on the node: {processes}. Stop these processes and re-run your "
+        "node. If using Docker, ensure no host processes are running."
+    )
+    USAGE_HIGH_BESIDE_A_FILLER_REMEDIATION = (
+        "GPU {gpu_index}: utilization {gpu_utilization} and memory utilization "
+        "{vram_utilization}, with Lium's filler running on the node. Stop the GPU processes "
+        "outside Lium's containers and re-run your node: {processes}. Leave Lium's own filler "
+        "running: {fillers}."
     )
     USAGE_HIGH_BESIDE_A_RENTAL_REMEDIATION = (
         "Stop the GPU processes outside Lium's containers and re-run your node: {outside_processes}. "
@@ -1554,13 +1603,25 @@ class PortCountMessages:
         category="runtime",
         impact="Proceed",
     )
+    # DAH-5851: an idle node's cycle whose port check was deferred for disk pressure: the run is withheld at the
+    # cycle's end (executor_rollout.withhold_renter_gpu_reset_verdicts), neither scored nor hidden
+    VERDICT_WITHHELD_PORT_CHECK_DEFERRED = MessageTemplate(
+        event="Port check deferred for disk pressure; this cycle's verdict is withheld",
+        reason="PORT_VERDICT_WITHHELD_DEFERRED",
+        severity="info",
+        category="runtime",
+        impact="No score this cycle; the listing stays as the last completed port check left it",
+    )
     INSUFFICIENT_PORTS = MessageTemplate(
         event="Insufficient available ports",
         reason="INSUFFICIENT_PORTS",
         severity="warning",
         category="runtime",
         impact="Score set to 0",
-        remediation="Increase port range or check port mappings configuration.",
+        remediation=(
+            "Widen RENTING_PORT_RANGE or add RENTING_PORT_MAPPINGS so enough renting ports answer from outside, "
+            "then run `docker compose restart executor-runner` in neurons/executor."
+        ),
     )
 
 
@@ -2009,8 +2070,8 @@ class GpuMemoryHealthMessages:
         remediation="NVML reports uncorrected ECC errors, a pending or failed row remap, or a "
         "required recovery action on the card(s) in flags; a rented card in this state faults the "
         "renter's jobs. Check `nvidia-smi -q -d ECC,ROW_REMAPPER`: a pending remap or a "
-        "DRAIN_AND_RESET / GPU_RESET action needs the card drained and reset (`nvidia-smi -r` with "
-        "no process on it, or a host reboot); a failed remap, or uncorrected errors that return "
+        "DRAIN_AND_RESET / GPU_RESET action needs the card drained and reset (`nvidia-smi -r -i <index>` "
+        "with no process on it, or a host reboot); a failed remap, or uncorrected errors that return "
         "after a reset, mean the card must be replaced. The node passes again on the first "
         "validation after NVML reads the card clean.",
     )
@@ -2023,7 +2084,7 @@ class GpuMemoryHealthMessages:
         remediation="NVML reports uncorrected ECC errors, a pending or failed row remap, or a "
         "required recovery action on the card(s) in flags. Check `nvidia-smi -q -d "
         "ECC,ROW_REMAPPER`: a pending remap or a DRAIN_AND_RESET / GPU_RESET action needs the card "
-        "drained and reset (`nvidia-smi -r` with no process on it, or a host reboot); a failed "
+        "drained and reset (`nvidia-smi -r -i <index>` with no process on it, or a host reboot); a failed "
         "remap, or uncorrected errors that return after a reset, mean the card should be replaced.",
     )
     UNKNOWN = MessageTemplate(
@@ -2041,8 +2102,8 @@ class GpuMemoryHealthMessages:
         impact="Proceed; score not changed",
         remediation="NVML reports a pending row remap or a recovery action from correctable errors "
         "on the card(s) in warnings. The card still works, but the remap takes effect only after "
-        "a reset: drain the card and reset it (`nvidia-smi -r` with no process on it, or a host "
-        "reboot) when it is free.",
+        "a reset: drain the card and reset it (`nvidia-smi -r -i <index>` with no process on it, "
+        "or a host reboot) when it is free.",
     )
     OK = MessageTemplate(
         event="GPU memory health ok",
@@ -2054,8 +2115,8 @@ class GpuMemoryHealthMessages:
 
 
 class GpuFaultProbeMessages:
-    """DAH-3035 — the kernel-fault probe that follows the matmul. Shadow (without enforcement) emits PROBE_FAILED as a warning and keeps passed=True; only
-    GPU_FAULT_PROBE_ENFORCEMENT_ENABLED renders it error/score-zeroing."""
+    """DAH-3035 — the kernel-fault probe that follows the matmul. It always runs; PROBE_FAILED is an
+    error and zeroes the score."""
 
     FILLER_SKIPPED = MessageTemplate(
         event="GPU kernel-fault probe skipped for active filler",
@@ -2063,13 +2124,6 @@ class GpuFaultProbeMessages:
         severity="info",
         category="policy",
         impact="Active filler runtime preserved; the probe would compete for VRAM.",
-    )
-    FIRST_PASS_SKIPPED = MessageTemplate(
-        event="GPU kernel-fault probe skipped on the first pass",
-        reason="GPU_FAULT_PROBE_SKIPPED_FIRST_PASS",
-        severity="info",
-        category="policy",
-        impact="Proceed; in shadow the verdict changes nothing, so the probe waits for the next cycle.",
     )
     PROBE_OK = MessageTemplate(
         event="GPU kernel-fault probe passed",
@@ -2087,7 +2141,7 @@ class GpuFaultProbeMessages:
         remediation=(
             "A GPU returned a CUDA error, wrong data or hung under indexed memory access, or NVML reported "
             "new uncorrected ECC errors / remapped rows. Check `nvidia-smi -q -d ECC,ROW_REMAPPER` and the host "
-            "`dmesg` for NVRM Xid lines; reseat or replace the card, or reset it (`nvidia-smi -r`) and wait one cycle."
+            "`dmesg` for NVRM Xid lines; reseat or replace the card, or stop its processes, reset only it (`nvidia-smi -r -i <index>`) and wait one cycle."
         ),
     )
     UNKNOWN = MessageTemplate(
@@ -2191,6 +2245,22 @@ class NvlinkFaultMessages:
             "sees the GPUs again. If the errors come back, service the board."
         ),
     )
+    MULTICAST_FAILED = MessageTemplate(
+        event="NVLink multicast is broken: a GPU cannot join a multicast object across the board",
+        reason="NVLINK_FAULT",
+        severity="error",
+        category="env",
+        impact="Score set to 0 until NVLink multicast works again",
+        remediation=(
+            "cuMulticastAddDevice returns CUDA_ERROR_UNKNOWN (999) on a full NVLink board whose GPUs report "
+            "multicast support, so NCCL NVLink SHARP (NVLS) cannot start. Check that nvidia-fabricmanager runs "
+            "the same version as the driver and that `nvidia-smi -q` shows Fabric State Completed on every "
+            "GPU, and check the host `dmesg` for NVRM Xid lines. Stop the workloads, restart "
+            "nvidia-fabricmanager or reboot, then restart the executor container "
+            "(`docker restart executor-executor-1`). If it comes back, update the driver and fabric manager "
+            "together or service the board."
+        ),
+    )
     MISSING = MessageTemplate(
         event="NVLink is down: a full SXM board reports no NVLink between its GPUs",
         reason="NVLINK_MISSING",
@@ -2239,7 +2309,10 @@ class RentalVerificationMessages:
         severity="error",
         category="policy",
         impact="Validation halted",
-        remediation="Check executor health with backend or review rental status",
+        remediation=(
+            "The rental check could not confirm this node; `error` in this event names what failed. If it "
+            "repeats, run `docker compose restart executor-runner` in neurons/executor."
+        ),
     )
     # Same verdict as FAILED; the kernel GPU list read from inside the executor container came back empty.
     GPU_LIST_EMPTY = MessageTemplate(
@@ -2435,6 +2508,32 @@ class CpuTruthMessages:
         severity="info",
         category="env",
         impact="Proceed without penalty",
+    )
+
+
+class DockerCpuMessages:
+    """The Docker daemon sees fewer CPUs than the machine reports. MISMATCH fails the validation."""
+
+    OK = MessageTemplate(
+        event="Docker CPU count check passed",
+        reason="DOCKER_CPU_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    MISMATCH = MessageTemplate(
+        event="Docker sees fewer CPUs than the machine",
+        reason="DOCKER_CPU_MISMATCH",
+        severity="error",
+        category="env",
+        impact="Score set to 0 for this cycle; rentals on this node fail until Docker sees every CPU",
+    )
+    WARNING = MessageTemplate(
+        event="Docker sees fewer CPUs than the machine",
+        reason="DOCKER_CPU_MISMATCH",
+        severity="warning",
+        category="env",
+        impact="Warning only: score unchanged",
     )
 
 
