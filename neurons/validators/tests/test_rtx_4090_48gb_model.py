@@ -8,6 +8,7 @@ from incentive.config import BASE_GPU_MAP, MAX_UNRENTED_GPUS_BY_TYPE, RENTAL_PRI
 from services.const import GPU_MODEL_RATES
 from services.gpu_precheck import VramRangeMismatchError, precheck_gpu_spec
 from services.gpu_spec_table import (
+    GPU_VRAM_SIZES_MB,
     MODDED_VRAM_MODELS,
     RTX_4090,
     RTX_4090_48GB,
@@ -76,6 +77,16 @@ def test_every_modded_model_has_its_own_economics_and_checks(model):
     assert EXPECTED_CC_ONLY[model] == "8.9"
     assert driver_gpu_name(model) == base
     assert matmul_probe_vram_mb(model) == round(size_mb * 0.90)  # the all-card probe uses the modded size
+
+
+@pytest.mark.parametrize("model", sorted(MODDED_VRAM_MODELS))
+def test_the_all_card_probe_sizes_a_raw_base_name_by_its_modded_reading(model):
+    # review: the probe gets the raw driver name, so a 32 GB claim was challenged as a factory 16 GB card
+    base, size_mb = MODDED_VRAM_MODELS[model]
+    factory_mb = min(GPU_VRAM_SIZES_MB[base])
+
+    assert matmul_probe_vram_mb(base, size_mb - 12) == round(size_mb * 0.90)
+    assert matmul_probe_vram_mb(base, factory_mb - 12) == round(factory_mb * 0.90)
 
 
 def test_the_standard_cards_keep_their_numbers():

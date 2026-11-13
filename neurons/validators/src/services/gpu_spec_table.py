@@ -331,8 +331,10 @@ def matmul_probe_vram_mb(model: str | None, reported_vram_mb: int | None = None)
     self-report, so a spoofing host still cannot shrink its own challenge. An unknown model scored as a
     reference model (DAH-5088) has no registry size, so it is sized from `reported_vram_mb`, floored the
     same way. Returns None for other unknown models — the caller then skips rather than guessing.
+    A memory-modded card arrives under its base card's raw name; its reading names it (classify_gpu_model), so
+    every card of a host claiming 48 GB 4090s gets a 48 GB-sized challenge, not a factory 24 GB one.
     """
-    canonical = normalize_gpu_model(model)
+    canonical = classify_gpu_model(model, reported_vram_mb) if reported_vram_mb else normalize_gpu_model(model)
     sizes = GPU_VRAM_SIZES_MB.get(canonical)
     if not sizes:
         if reported_vram_mb and reference_gpu_model(canonical, reported_vram_mb):
