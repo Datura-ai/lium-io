@@ -11,6 +11,8 @@ from ..pipeline import CheckResult, Context
 from .rented_pod_resources import running_rented_container_names
 
 READ_TIMEOUT_SECONDS = 30
+# docker starts a restart-policy container within a few minutes of boot; one started later was restarted alone
+CONTAINER_RESTART_AFTER_BOOT_SECONDS = 600
 
 
 # sudo refuses to run when any of these is not owned by the pod's root, so a shift that spares / and /root
@@ -125,8 +127,9 @@ class RentedPodOwnershipCheck:
         # is unknown, not healthy
         unread = sorted(set(names) - {p["container"] for p in pods.values()})
         what = {"pods": list(pods.values())}
-        if any(p["outside_namespace"] for p in pods.values()):
-            template = Msg.SHIFTED
+        shifted = [p for p in pods.values() if p["outside_namespace"]]
+        if shifted:
+            template = await self._shift_template(ctx, shifted)
         elif unread:
             template = Msg.UNREAD
             what.update(reason="pod not read back", unread=unread, exit_status=res.exit_status)
@@ -137,6 +140,31 @@ class RentedPodOwnershipCheck:
         if unread:
             what["unread"] = unread
         return self._event(ctx, template, what)
+
+    async def _shift_template(self, ctx: Context, shifted: list[dict]):
+        """A container restarted long after the host booted was not brought back by a host reboot: say so,
+        instead of blaming an unclean host shutdown. Sets `started_after_boot_s` on each pod read."""
+        try:
+            res = await asyncio.wait_for(
+                ctx.ssh.run(
+                    "cut -d' ' -f1 /proc/uptime; "
+                    + "; ".join(f"ps -o etimes= -p {int(p['pid'])}" for p in shifted),
+                    check=False,
+                ),
+                timeout=READ_TIMEOUT_SECONDS,
+            )
+        except (asyncssh.Error, OSError, TimeoutError):
+            return Msg.SHIFTED
+        uptime, *ages = ((res.stdout or "").splitlines() + [""] * (len(shifted) + 1))[: len(shifted) + 1]
+        uptime_s = _num(uptime.partition(".")[0])
+        for pod, age in zip(shifted, ages):
+            age_s = _num(age)
+            if uptime_s is not None and age_s is not None:
+                pod["started_after_boot_s"] = uptime_s - age_s
+        after = [p.get("started_after_boot_s") for p in shifted]
+        if all(a is not None and a >= CONTAINER_RESTART_AFTER_BOOT_SECONDS for a in after):
+            return Msg.SHIFTED_AFTER_CONTAINER_RESTART
+        return Msg.SHIFTED
 
     def _event(self, ctx: Context, template, what: dict) -> CheckResult:
         what = {"executor_uuid": ctx.executor.uuid, **what}

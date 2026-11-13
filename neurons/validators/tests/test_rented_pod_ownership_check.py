@@ -206,3 +206,42 @@ async def test_the_read_includes_sudo_files_and_an_image_without_sudo_is_ok(
         "/etc/sudoers.d/README": me,
     }
     assert pods["pod_2"]["host_owners"] == {"/": me, "/root": me}
+
+
+def _ssh_with_uptime(proc: str, uptime_and_ages: str):
+    inner = _ssh(proc)
+
+    async def run(cmd, check=False):
+        if cmd.startswith("cut -d' ' -f1 /proc/uptime"):
+            return SimpleNamespace(exit_status=0, stdout=uptime_and_ages, stderr="")
+        return await inner.run(cmd, check=check)
+
+    return SimpleNamespace(run=run)
+
+
+@pytest.mark.parametrize(
+    ("uptime_and_ages", "template", "after_boot"),
+    [
+        # host up a day, pod container started 30 s ago: a `docker restart`, not a host reboot
+        ("86400.12\n30\n", Msg.SHIFTED_AFTER_CONTAINER_RESTART, 86370),
+        # host up 700 s, container started 50 s after boot: brought back by the reboot
+        ("700.50\n650\n", Msg.SHIFTED, 50),
+        # uptime not read: the cause is unknown, the host message stays
+        ("\n30\n", Msg.SHIFTED, None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_shift_after_a_container_only_restart_does_not_blame_the_host(
+    context_factory, tmp_path, uptime_and_ages, template, after_boot
+):
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me + 200000}      65536\n")
+    _proc(tmp_path, 4343, f"         0     {me}      65536\n")
+    result = await RentedPodOwnershipCheck().run(
+        _ctx(context_factory, _ssh_with_uptime(str(tmp_path), uptime_and_ages))
+    )
+    assert result.event.reason_code == Msg.SHIFTED.reason
+    assert result.event.remediation == template.remediation
+    pods = {p["container"]: p for p in result.event.what_we_saw["pods"]}
+    assert pods["pod_1"].get("started_after_boot_s") == after_boot
+    assert "started_after_boot_s" not in pods["pod_2"]  # only the shifted pod is read
