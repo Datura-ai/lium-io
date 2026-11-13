@@ -133,6 +133,14 @@ def test_rented_pod_resources_flag_zeroes_a_rented_score():
     assert "below its deployed CPUs" in warning
 
 
+def test_spec_floor_flag_zeroes_a_rented_score():
+    """SpecFloorCheck is non-fatal under a live rental: only this flag zeroes it."""
+    ctx = _ctx(500.0).model_copy(update={"spec_floor_passed": False})
+    actual_score, _, warning = calculate_scores(ctx, rented=True)
+    assert actual_score == 0.0
+    assert "below the hardware floor" in warning
+
+
 def test_rented_throughput_flag_zeroes_a_rented_score():
     ctx = _ctx(500.0).model_copy(update={"rented_throughput_passed": False})
     actual_score, _, warning = calculate_scores(ctx, rented=True)
