@@ -2890,7 +2890,7 @@ class RentedPodOwnershipMessages:
         reason="RENTED_POD_OWNERSHIP_SHIFTED",
         severity="warning",
         category="runtime",
-        impact="Proceed; root login and sudo fail inside the pod until its files are repaired",
+        impact="Proceed; incorrect ownership can break package installation, root login, or sudo until repaired",
         remediation="The host stopped without a clean shutdown and the pod was restarted with a new "
         "user-namespace range, so its files now belong to nobody inside it. Tell the renter, and shift "
         "the ownership of the pod's root filesystem into its current uid_map/gid_map on the host "
