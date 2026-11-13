@@ -85,6 +85,9 @@ POWER_STATE_CMD = (
 )
 # Bound each nvidia-smi call so a hung driver can't stall filler deploy/undeploy (PoC #1120).
 NVIDIA_SMI_TIMEOUT_SECONDS = 30
+# A single unreadable readback can be an nvidia-smi glitch; only every read failing makes it the host's refusal.
+POWER_LIMIT_READBACK_ATTEMPTS = 3
+POWER_LIMIT_READBACK_RETRY_SECONDS = 3
 _RESTORE_KEY_PREFIX = "gpu_power_restore:"
 _POD_INDEX_KEY_PREFIX = "gpu_power_restore_pod:"
 _REVERT_KEY_PREFIX = "gpu_power_cap_revert:"
@@ -237,7 +240,7 @@ class PowerLimitSetOutcome:
 
     failure: str | None
     persistence_enabled: bool | None
-    # The host's nvidia-smi ran and refused the limit, or the limit did not stick: the node's fault, not ours.
+    # The host's nvidia-smi refused the limit, it did not stick, or it could not be read back: the node's fault.
     host_refused: bool = False
 
 
@@ -393,18 +396,13 @@ async def _enable_persistence_mode(
 
 async def _read_back_power_state(ssh: asyncssh.SSHClientConnection, uuid: str) -> GpuPowerReadback:
     """Read one GPU's power.limit and persistence mode. Both come from the same nvidia-smi query, so
-    verifying persistence costs no extra round trip. Unreadable -> all-None; raises only
-    ``asyncssh.ChannelOpenError`` (a refused session, retried by the caller)."""
+    verifying persistence costs no extra round trip. nvidia-smi failed or answered garbage -> all-None;
+    an SSH error (ours, not the host's nvidia-smi) propagates to the caller."""
     readback_command = (
         f"nvidia-smi -i {shlex.quote(uuid)} --query-gpu=power.limit,persistence_mode "
         f"--format=csv,noheader,nounits"
     )
-    try:
-        result = await ssh.run(readback_command, timeout=NVIDIA_SMI_TIMEOUT_SECONDS)
-    except asyncssh.ChannelOpenError:
-        raise
-    except Exception:
-        return _UNREADABLE_READBACK
+    result = await ssh.run(readback_command, timeout=NVIDIA_SMI_TIMEOUT_SECONDS)
     if result.exit_status != 0:
         return _UNREADABLE_READBACK
     return _parse_power_readback_csv(str(result.stdout))
@@ -432,11 +430,23 @@ async def _set_power_limit(
             persistence_enabled=None,
             host_refused=True,
         )
-    readback = await _read_back_power_state(ssh, uuid)
+    for attempt in range(POWER_LIMIT_READBACK_ATTEMPTS):
+        if attempt:
+            await asyncio.sleep(POWER_LIMIT_READBACK_RETRY_SECONDS)
+        try:
+            readback = await _read_back_power_state(ssh, uuid)
+        except asyncssh.ChannelOpenError:
+            raise
+        except Exception as exc:
+            return PowerLimitSetOutcome(failure=f"power-limit readback errored: {exc}", persistence_enabled=None)
+        if readback.watts is not None:
+            break
     if readback.watts is None:
+        # The host's nvidia-smi took -pl but then never reported the limit: unverified, so the host's.
         return PowerLimitSetOutcome(
             failure="nvidia-smi -pl reported success but the limit could not be read back for verification",
             persistence_enabled=readback.persistence_enabled,
+            host_refused=True,
         )
     if readback.watts != watts:
         return PowerLimitSetOutcome(
