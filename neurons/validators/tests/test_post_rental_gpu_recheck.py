@@ -50,14 +50,14 @@ def _all_cards(*reasons, over_wall_clock=False):
     )
 
 
-def _idle_ctx(context_factory, runner, validation, *, marker=MARKER, gpu_count=2):
+def _idle_ctx(context_factory, runner, validation, *, marker=MARKER, gpu_count=2, specs=None):
     services = build_services(validation=validation)
     if marker is not None:
         services.redis.store[KEY] = json.dumps(marker)
     return context_factory(
         services=services,
         config=build_context_config(),
-        state=build_state(specs={"gpu": {"count": gpu_count}}),
+        state=build_state(specs=specs or {"gpu": {"count": gpu_count}}),
         runner=runner,
     )
 
@@ -358,3 +358,40 @@ async def test_a_dropped_card_owes_a_recheck(context_factory):
     marker = json.loads(services.redis.store[KEY])
     assert marker["source"] == "gpu_details_mismatch"
     assert marker["cards"] == [{"uuid": "GPU-2", "verdict": "missing"}]
+
+
+@pytest.mark.asyncio
+async def test_a_card_below_its_reported_model_fails_the_recheck_and_stores_the_verdict(context_factory):
+    # DAH-6241: the all-cards matmul's sealed per-card numbers are judged against each card's model
+    probe = _all_cards("", "")
+    probe.per_card[0]["metrics"] = {"cc": "9.0", "sm_count": 132}
+    probe.per_card[1]["metrics"] = {"cc": "8.0", "sm_count": 108}
+    h100 = {"name": "NVIDIA H100 80GB HBM3"}
+    specs = {"gpu": {"count": 2, "details": [h100, h100]}}
+    ctx = _idle_ctx(context_factory, FakeRunner(probe_stdout("ok")), FakeValidation(probe), specs=specs)
+
+    result = await PostRentalGpuRecheckCheck().run(ctx)
+
+    assert result.passed is False and result.event.reason_code == Msg.FAILED.reason
+    assert result.event.what_we_saw["gpu_model_mismatch"]["card_index"] == 1
+    stored = json.loads(ctx.services.redis.store["gpu_model_verdict:miner-hotkey:" + default_executor().uuid])
+    assert [m["card_index"] for m in stored["mismatches"]] == [1]
+    assert KEY in ctx.services.redis.store
+
+
+
+@pytest.mark.asyncio
+async def test_a_judged_card_with_no_numbers_is_only_logged_by_the_recheck(context_factory):
+    # DAH-6241: no prod data yet on per-card numbers of the all-cards probe, so no fail on this path
+    probe = _all_cards("", "")
+    probe.per_card[0]["metrics"] = {"cc": "9.0", "sm_count": 132}
+    h100 = {"name": "NVIDIA H100 80GB HBM3"}
+    specs = {"gpu": {"count": 2, "details": [h100, h100]}}
+    ctx = _idle_ctx(context_factory, FakeRunner(probe_stdout("ok")), FakeValidation(probe), specs=specs)
+
+    result = await PostRentalGpuRecheckCheck().run(ctx)
+
+    assert result.event.what_we_saw["gpu_model_no_numbers_cards"] == [1]
+    assert "gpu_model_mismatch" not in result.event.what_we_saw
+    stored = json.loads(ctx.services.redis.store["gpu_model_verdict:miner-hotkey:" + default_executor().uuid])
+    assert stored["mismatches"] == []
