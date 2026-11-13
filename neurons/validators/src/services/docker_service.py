@@ -2523,8 +2523,10 @@ class _CustomerCreateRegistry:
         # image prunes a delete has started per executor; a customer create waits them out before it pulls
         self._prunes_by_executor: Counter[tuple[str, str]] = Counter()
         # executors where a prune may still run on the host (its Docker answer never came, or dockerd said a prune
-        # is already running); fenced until a later prune there completes, which dockerd allows only when none runs
-        self._unconfirmed_prunes: set[tuple[str, str]] = set()
+        # is already running); fenced until a prune started after the fence completes, which dockerd allows only
+        # when none runs. Value = _prune_seq when fenced: an older prune's late success must not lift a newer fence.
+        self._unconfirmed_prunes: dict[tuple[str, str], int] = {}
+        self._prune_seq = 0
         self._lock = threading.Lock()
 
     @contextlib.contextmanager
@@ -2594,14 +2596,24 @@ class _CustomerCreateRegistry:
             if self._prunes_by_executor[executor] <= 0:
                 del self._prunes_by_executor[executor]
 
-    def prune_may_still_run(self, miner_hotkey: str, executor_id: str, *, still_running: bool) -> None:
-        """Fence the executor while a prune may still run on its host, or lift the fence once one completed."""
+    def prune_attempt_started(self) -> int:
+        """A token for one prune call; pass it back to prune_may_still_run when its answer comes."""
+        with self._lock:
+            self._prune_seq += 1
+            return self._prune_seq
+
+    def prune_may_still_run(
+        self, miner_hotkey: str, executor_id: str, *, still_running: bool, started: int
+    ) -> None:
+        """Fence the executor while a prune may still run on its host, or lift the fence once a prune that
+        started after it (token `started`) completed."""
         executor = (miner_hotkey, executor_id)
         with self._lock:
             if still_running:
-                self._unconfirmed_prunes.add(executor)
-            else:
-                self._unconfirmed_prunes.discard(executor)
+                self._prune_seq += 1
+                self._unconfirmed_prunes[executor] = self._prune_seq
+            elif self._unconfirmed_prunes.get(executor, started) < started:
+                del self._unconfirmed_prunes[executor]
 
     async def wait_for_prunes(
         self, payload: ContainerCreateRequest, timeout_s: float = 300, poll_s: float = 0.2
@@ -2668,6 +2680,7 @@ async def _prune_images_then_release(docker_client, log_extra: dict, miner_hotke
         for attempt in range(PRUNE_CONFIRM_ATTEMPTS + 1):
             if attempt:
                 await asyncio.sleep(PRUNE_CONFIRM_INTERVAL_SECONDS)
+            started = customer_creates.prune_attempt_started()
             try:
                 await run_logged_rental_docker_sdk_operation(
                     operation="prune_images", log_extra=log_extra, call=docker_client.prune_images
@@ -2675,11 +2688,15 @@ async def _prune_images_then_release(docker_client, log_extra: dict, miner_hotke
             except Exception as exc:
                 if not _prune_may_still_run(exc):
                     raise
-                customer_creates.prune_may_still_run(miner_hotkey, executor_id, still_running=True)
+                customer_creates.prune_may_still_run(
+                    miner_hotkey, executor_id, still_running=True, started=started
+                )
                 if attempt == PRUNE_CONFIRM_ATTEMPTS:
                     raise
                 continue
-            customer_creates.prune_may_still_run(miner_hotkey, executor_id, still_running=False)
+            customer_creates.prune_may_still_run(
+                miner_hotkey, executor_id, still_running=False, started=started
+            )
             return
     finally:
         customer_creates.end_prune(miner_hotkey, executor_id)

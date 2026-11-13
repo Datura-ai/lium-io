@@ -172,3 +172,30 @@ async def test_only_a_completed_prune_lifts_the_fence_of_one_that_may_still_run(
 
     # a later delete's prune that completes lifts a fence still standing
     assert await _fenced_after(_Prunes(None), customer) is False
+
+
+@pytest.mark.asyncio
+async def test_an_older_prunes_late_success_does_not_lift_a_newer_prunes_fence(monkeypatch) -> None:
+    # lio#2226 review: prune A finished on the host but its reply is late; prune B started after it, its reply was
+    # lost and dockerd kept saying a prune runs. A's reply must not clear the fence B left.
+    monkeypatch.setattr(docker_service, "PRUNE_CONFIRM_ATTEMPTS", 1)
+    monkeypatch.setattr(docker_service, "PRUNE_CONFIRM_INTERVAL_SECONDS", 0)
+    customer = _payload()
+    late = _Prune()
+    assert customer_creates.begin_prune(customer.miner_hotkey, customer.executor_id)
+    prune_a = asyncio.ensure_future(
+        docker_service._prune_images_then_release(late, {}, customer.miner_hotkey, customer.executor_id)
+    )
+    await asyncio.sleep(0.01)
+
+    lost_then_running = _Prunes(_prune_failure(_LOST_REPLY), _prune_failure(_PRUNE_RUNNING))
+    assert await _fenced_after(lost_then_running, customer)
+    late.release.set()
+    await prune_a
+
+    with customer_creates.track(customer):
+        cleared = await customer_creates.wait_for_prunes(customer, timeout_s=0.03, poll_s=0.01)
+
+    assert cleared is False
+    # a prune started after the fence that completes still lifts it
+    assert await _fenced_after(_Prunes(None), customer) is False
