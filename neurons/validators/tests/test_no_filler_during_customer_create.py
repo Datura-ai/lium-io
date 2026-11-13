@@ -13,7 +13,11 @@ import pytest
 from payload_models.payloads import (
     WorkloadKind,
 )
+from docker.errors import APIError
+
+from services import docker_service
 from services.docker_service import customer_creates
+from services.rental_docker_sdk import RentalDockerOperationError
 from test_deploy_optimizations import _payload
 
 
@@ -81,3 +85,58 @@ async def test_customer_create_reports_a_prune_still_running_at_the_deadline() -
             cleared = await customer_creates.wait_for_prunes(customer, timeout_s=0.03, poll_s=0.01)
 
     assert cleared is False
+
+
+class _Prune:
+    def __init__(self, error: BaseException | None = None):
+        self.release = asyncio.Event()
+        self.error = error
+
+    async def prune_images(self):
+        await self.release.wait()
+        if self.error is not None:
+            raise self.error
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_delete_keeps_the_prune_registered_until_docker_returns(monkeypatch) -> None:
+    customer = _payload()
+    docker = _Prune()
+    assert customer_creates.begin_prune(customer.miner_hotkey, customer.executor_id)
+    prune = asyncio.shield(
+        docker_service._prune_images_then_release(docker, {}, customer.miner_hotkey, customer.executor_id)
+    )
+    delete = asyncio.ensure_future(prune)
+    await asyncio.sleep(0.01)
+    delete.cancel()
+
+    with customer_creates.track(customer):
+        held_after_cancel = not await customer_creates.wait_for_prunes(customer, timeout_s=0.03, poll_s=0.01)
+        docker.release.set()
+        cleared = await customer_creates.wait_for_prunes(customer, timeout_s=1, poll_s=0.01)
+
+    assert held_after_cancel
+    assert cleared is True
+
+
+@pytest.mark.parametrize(
+    ("cause", "fenced"),
+    [(TimeoutError("read timed out"), True), (APIError("409 conflict: prune already running"), False)],
+)
+@pytest.mark.asyncio
+async def test_a_prune_of_unknown_outcome_keeps_the_executor_fenced(monkeypatch, cause, fenced) -> None:
+    monkeypatch.setattr(docker_service, "PRUNE_UNKNOWN_COMPLETION_FENCE_SECONDS", 0.2)
+    customer = _payload()
+    docker = _Prune(error=RentalDockerOperationError("Docker SDK prune images failed"))
+    docker.error.__cause__ = cause
+    docker.release.set()
+    assert customer_creates.begin_prune(customer.miner_hotkey, customer.executor_id)
+
+    with pytest.raises(RentalDockerOperationError):
+        await docker_service._prune_images_then_release(docker, {}, customer.miner_hotkey, customer.executor_id)
+    with customer_creates.track(customer):
+        fenced_now = not await customer_creates.wait_for_prunes(customer, timeout_s=0.03, poll_s=0.01)
+        cleared_later = await customer_creates.wait_for_prunes(customer, timeout_s=1, poll_s=0.01)
+
+    assert fenced_now is fenced
+    assert cleared_later is True
