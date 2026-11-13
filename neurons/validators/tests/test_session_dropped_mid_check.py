@@ -344,3 +344,30 @@ async def test_a_gpu_loss_in_a_failed_checks_extra_events_stays_the_verdict_when
     assert not ok and events[-1].reason_code == "POST_RENTAL_GPU_RECHECK_FAILED"
     assert "GPU_LOST" in [e.reason_code for e in events] and TRANSPORT not in [e.reason_code for e in events]
     assert "POST_RENTAL_GPU_RECHECK_FAILED" not in ROLLOUT_FAILURE_REASONS and TRANSPORT in ROLLOUT_FAILURE_REASONS
+
+
+@pytest.mark.parametrize("outcome", ["passes", "raises"])
+async def test_a_failed_reconnect_ends_the_run_on_the_transport_failure_whatever_the_check_returned(outcome):
+    # lio#1827 review at f6eb625: a provider that closes SSH after a passing replayable check and refuses the
+    # reconnect must not carry the run on a dead session (or end it as an exception with no verdict)
+    class _DropsThen(_Check):
+        async def run(self, ctx: Context) -> CheckResult:
+            self.sessions.append(ctx.ssh)
+            ctx.ssh.is_closed.return_value = True
+            if outcome == "raises":
+                raise asyncssh.ChannelOpenError(asyncssh.OPEN_CONNECT_FAILED, "SSH connection closed")
+            return CheckResult(passed=True, event=_event("PORTS_OK"))
+
+    class _Later(_Check):
+        check_id = "host.observe.later"
+
+    later = _Later(drops=0)
+    reconnect, calls = _reconnect([OSError("connection refused")])
+
+    ok, events, _ = await Pipeline([_DropsThen(drops=0), later], _NullSink(), reconnect=reconnect).run(
+        _ctx(_session())
+    )
+
+    assert not ok and events[-1].reason_code == TRANSPORT
+    assert [e.reason_code for e in events] == (["PORTS_OK", TRANSPORT] if outcome == "passes" else [TRANSPORT])
+    assert len(calls) == 1 and not later.sessions

@@ -55,7 +55,19 @@ FLATTEN_NO_DISK_RENTER_SENTENCE = (
 
 
 class ImageFlattenNoDisk(RuntimeError):
-    renter_sentence = FLATTEN_NO_DISK_RENTER_SENTENCE
+    def __init__(self, renter_sentence: str = FLATTEN_NO_DISK_RENTER_SENTENCE, short_bytes: int | None = None):
+        super().__init__(renter_sentence)
+        self.renter_sentence = renter_sentence
+        self.short_bytes = short_bytes
+
+
+def flatten_no_disk_sentence(short_bytes: int) -> str:
+    """The refusal with the measured shortfall; a bigger node grows the pod disk too, so only the image can shrink it."""
+    gb = -(-short_bytes // 1024**3)
+    return (
+        f"not enough free disk on this node to prepare this image beside this pod's disk ({gb} GB short); "
+        "use a smaller image or one with fewer layers"
+    )
 
 
 class FlattenMeasureFailed(RuntimeError):
@@ -197,7 +209,7 @@ def _flatten_command(
         "else echo 'flatten: lease dir unreadable, cleanup skipped' >&2; fi; flock -u 8; "
         f"avail=$({df_command(root)} | awk 'NR==2{{print $4}}'); "
         'case "$avail" in ""|*[!0-9]*) echo "flatten failed: unexpected df output" >&2; exit 94;; esac; '
-        f'[ "$avail" -ge {int(need_bytes)} ] || exit {FLATTEN_NO_DISK_EXIT}; '
+        f'[ "$avail" -ge {int(need_bytes)} ] || {{ echo "flatten avail=$avail" >&2; exit {FLATTEN_NO_DISK_EXIT}; }}; '
         # the ID, not the tag: a pull may move the tag after inspect and the copy would not match its name
         f"cid=$(/usr/bin/docker create --entrypoint /lium-flatten-noop {mounts} {shlex.quote(image_id)}) || exit 97; "
         f"end=$(( $(date +%s) + {t} )); "
@@ -216,15 +228,17 @@ def _flatten_command(
 
 
 def _export_count_check(factor: int, fixed_bytes: int) -> str:
-    """Count the export, stopping one byte past what the free disk allows; refuse (container removed) past it."""
+    """Count the export, stopping one byte past what the free disk allows; refuse (container removed) past it.
+    The count stops early, so it never knows the real shortfall: the refusal names none."""
     t = FLATTEN_TIMEOUT_SECONDS
     gone = '/usr/bin/docker rm -fv "$cid" >/dev/null 2>&1'
     return (
         f'cap=$(( (avail - {int(fixed_bytes)}) / {int(factor)} )); st=$(mktemp); '
         f'eb=$( (timeout {t} /usr/bin/docker export "$cid"; echo $? > "$st") | head -c $((cap + 1)) | wc -c); '
         'erc=$(cat "$st"); rm -f "$st"; '
-        # a wc output test cannot read refuses too
-        f'[ "$eb" -le "$cap" ] 2>/dev/null || {{ {gone}; echo "flatten refused: the export is larger than the free disk allows" >&2; exit {FLATTEN_NO_DISK_EXIT}; }}; '
+        # a wc output test cannot read refuses too (an arithmetic error would end sh)
+        f'[ "$eb" -le "$cap" ] 2>/dev/null || {{ {gone}; '
+        f'echo "flatten refused: the export is larger than the free disk allows" >&2; exit {FLATTEN_NO_DISK_EXIT}; }}; '
         f'[ "$erc" = 0 ] || {{ {gone}; echo "flatten failed: counting export=$erc" >&2; exit 98; }}; '
     )
 
@@ -460,35 +474,35 @@ def docker_counts_unpacked_size(server_version: str) -> bool:
     return bool(match) and tuple(map(int, match.groups())) >= _CONTAINERD_SIZE_MIN_DOCKER
 
 
-async def containerd_store_on_data_root(ssh_client: asyncssh.SSHClientConnection) -> bool:
-    """Docker's containerd image store with containerd's root on the filesystem of Docker's data root, on a
-    Docker whose image Size counts the unpacked snapshots. False whenever either cannot be determined, so a
-    flatten never measures the wrong disk or budgets too little of it."""
+async def containerd_store_refusal(ssh_client: asyncssh.SSHClientConnection) -> str | None:
+    """None on Docker's containerd image store with containerd's root on the filesystem of Docker's data root, on a
+    Docker whose image Size counts the unpacked snapshots; else which of those could not be confirmed. Refused
+    whenever either cannot be determined, so a flatten never measures the wrong disk or budgets too little of it."""
     version = await ssh_client.run(
         "/usr/bin/docker version --format '{{.Server.Version}}'", check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS
     )
     if version.exit_status != 0 or not docker_counts_unpacked_size(str(version.stdout)):
-        return False
+        return f"docker version {str(version.stdout).strip()!r} does not count unpacked snapshots"
     daemons = await ssh_client.run(containerd_daemons_command(), check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS)
     if daemons.exit_status != 0 or not containerd_daemon_reads_etc_config(str(daemons.stdout)):
-        return False
+        return "not exactly one containerd reading /etc/containerd/config.toml"
     read = await ssh_client.run(containerd_config_command(), check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS)
     if read.exit_status not in (0, _CONTAINERD_NO_CONFIG_EXIT):
-        return False
+        return f"containerd config unreadable (exit {read.exit_status})"
     config = str(read.stdout) if read.exit_status == 0 else None
     root, address = containerd_root(config), containerd_address(config)
     if root is None or address is None:
-        return False
+        return "containerd root or socket not determinable from its config"
     # a config rewritten since the daemon started names a root it does not use
     plugins = await ssh_client.run(
         containerd_plugins_command(address), check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS
     )
     if plugins.exit_status != 0 or not containerd_runs_on_root(str(plugins.stdout), root):
-        return False
+        return f"running containerd plugins not under {root} (exit {plugins.exit_status})"
     same = await ssh_client.run(
         same_filesystem_as_data_root_command(root), check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS
     )
-    return same.exit_status == 0
+    return None if same.exit_status == 0 else f"containerd root {root} is not on Docker's data-root filesystem"
 
 
 async def flatten_image_on_host(
@@ -516,8 +530,13 @@ async def flatten_image_on_host(
     # the containerd store reports its snapshotter (e.g. overlayfs) and keeps images outside DockerRootDir
     if str(driver.stdout).strip() != "overlay2":
         # only the overlayfs snapshotter's directory is checked; any other snapshotter writes where nothing measures
-        if str(driver.stdout).strip() != "overlayfs" or not await containerd_store_on_data_root(ssh_client):
-            raise RuntimeError(f"not flattening on storage driver {str(driver.stdout).strip()!r}")
+        refusal = (
+            await containerd_store_refusal(ssh_client)
+            if str(driver.stdout).strip() == "overlayfs"
+            else "not the overlayfs snapshotter"
+        )
+        if refusal:
+            raise RuntimeError(f"not flattening on storage driver {str(driver.stdout).strip()!r}: {refusal}")
     inspect = await ssh_client.run(
         f"/usr/bin/docker image inspect --format '{{{{json .}}}}' {shlex.quote(image)}",
         check=True,
@@ -535,12 +554,13 @@ async def flatten_image_on_host(
     config = info.get("Config") or {}
     driver_name = str(driver.stdout).strip()
     fixed = FLATTEN_DISK_MARGIN_BYTES + reserved_bytes
+    need_bytes = _copy_bytes(int(info.get("Size") or 0), driver_name) + fixed
     command = _flatten_command(
         info["Id"],
         tag,
         image_flatten_changes(config),
         sorted(config.get("Volumes") or ()),
-        _copy_bytes(int(info.get("Size") or 0), driver_name) + fixed,
+        need_bytes,
         lease,
         sized_mark,
         # overlay2's Size sums apparent file sizes (sparse files at full length), so only containerd needs the count
@@ -550,6 +570,11 @@ async def flatten_image_on_host(
     # waits up to one flatten for the node lock, then runs its own
     result = await ssh_client.run(command, check=False, timeout=FLATTEN_TIMEOUT_SECONDS * 3 + 120)
     if result.exit_status == FLATTEN_NO_DISK_EXIT:
+        # only the Size check prints avail, against the need computed here; the containerd count names none
+        found = re.search(r"flatten avail=(\d+)", str(result.stderr or ""))
+        if found and int(found.group(1)) < need_bytes:
+            short = need_bytes - int(found.group(1))
+            raise ImageFlattenNoDisk(flatten_no_disk_sentence(short), short_bytes=short)
         raise ImageFlattenNoDisk(FLATTEN_NO_DISK_RENTER_SENTENCE)
     if result.exit_status != 0:
         raise RuntimeError(f"flatten exited {result.exit_status}: {str(result.stderr or '')[-2000:]}")

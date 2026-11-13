@@ -2,14 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import shlex
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 import aiohttp
 import asyncssh
+
+if TYPE_CHECKING:
+    from services.redis_service import RedisService
+
+logger = logging.getLogger(__name__)
 
 REMOTE_OPERATION_DIRECTORY = PurePosixPath("/root/app/storage-operations")
 REMOTE_RUNNER_PATH = "/root/app/src/storage_runner.py"
@@ -18,6 +26,144 @@ REMOTE_RUNNER_PATH = "/root/app/src/storage_runner.py"
 WRAPPER_LABEL = "lium.storage-wrapper"
 KILLED_EXIT = 137
 REMOTE_SECRETS_DIRECTORY = PurePosixPath("/root/app/storage-secrets")
+
+# DAH-6148: an operation runs restic in a `lium-storage-<operation id[:12]>` helper container on
+# the node, and reruns it under the same name when it renews credentials or retries an upload.
+# The operations this validator started are recorded per executor, and the provider-side load
+# check excuses a helper only by its exact name, only while the backend has that operation
+# open (never by files on the node, which the provider can write), and only up to the helper
+# cap: never a container that only wears the prefix, and never one after its operation ended.
+STORAGE_HELPER_PREFIX = "lium-storage-"
+STARTED_STORAGE_HELPERS_PREFIX = "started_storage_helpers:"
+# a docker container name cannot hold ":", so no container's name or id ever matches this key
+STORAGE_HELPER_KEY_MARK = "helper:"
+# the backend fails a backup still open after 4 h (BACKUP_AUTH_TOKEN_EXPIRY_HOURS): no helper
+# legitimately outlives that, so no record does either
+STARTED_STORAGE_HELPERS_TTL_SECONDS = 4 * 3600
+_STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC = 2
+
+
+def storage_helper_name(operation_id: UUID | str) -> str:
+    return f"{STORAGE_HELPER_PREFIX}{str(operation_id)[:12]}"
+
+
+def storage_helper_key(operation_id: UUID | str) -> str:
+    return f"{STORAGE_HELPER_KEY_MARK}{storage_helper_name(operation_id)}"
+
+
+@dataclass(frozen=True)
+class StorageHelperRecord:
+    """An operation this validator started on the executor, and when."""
+
+    operation_id: str
+    started: int
+
+    def format(self) -> str:
+        return f"{self.operation_id}|{self.started}"
+
+    @classmethod
+    def parse(cls, raw: str) -> StorageHelperRecord | None:
+        operation_id, _, started = raw.partition("|")
+        try:
+            return cls(str(UUID(operation_id)), int(started))
+        except ValueError:
+            return None
+
+
+def _key(executor_id: str) -> str:
+    return f"{STARTED_STORAGE_HELPERS_PREFIX}{executor_id}"
+
+
+async def _redis_call(what: str, call: Callable[[], Awaitable[None]]) -> bool:
+    """Best effort: Redis down or slow leaves the records as they are (an unrecorded helper's
+    cores stay on the provider, as before DAH-6148)."""
+    try:
+        await asyncio.wait_for(call(), timeout=_STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Storage helper records: %s failed: %s", what, exc)
+        return False
+
+
+async def _raw_records(redis: RedisService, executor_id: str) -> list[str]:
+    members = await redis.smembers(_key(executor_id))
+    return [m.decode() if isinstance(m, bytes) else str(m) for m in members or ()]
+
+
+async def note_started_storage_helper(
+    redis: RedisService, executor_id: str, operation_id: UUID | str
+) -> None:
+    """Records the operation starting its helper on this executor."""
+
+    async def note() -> None:
+        record = StorageHelperRecord(str(operation_id), int(time.time()))
+        await redis.sadd(_key(executor_id), record.format())
+        await redis.expire(_key(executor_id), STARTED_STORAGE_HELPERS_TTL_SECONDS)
+
+    await _redis_call(f"record {operation_id} on {executor_id}", note)
+
+
+async def forget_storage_helper(
+    redis: RedisService, executor_id: str, operation_id: UUID | str
+) -> None:
+    """The operation ended where the validator saw it end (launch failure, cancel, a bootstrap
+    restore it waited for): its helper is no longer Lium's."""
+
+    async def forget() -> None:
+        for raw in await _raw_records(redis, executor_id):
+            record = StorageHelperRecord.parse(raw)
+            if record and record.operation_id == str(operation_id):
+                await redis.srem(_key(executor_id), raw)
+
+    await _redis_call(f"forget {operation_id} on {executor_id}", forget)
+
+
+async def settle_excused_storage_helper_keys(
+    redis: RedisService,
+    executor_id: str,
+    is_open: Callable[[str], Awaitable[bool | None]],
+) -> set[str]:
+    """Drops the records whose operation ended and returns the helper keys to excuse.
+
+    `is_open` asks the backend whether the operation is still open (None: no answer, or open but
+    its runner went quiet). The node's
+    own runner files are never read: the provider can write them (DAH-6148). An open operation's
+    helper is excused by its exact name; an ended one, or one past the TTL, loses its record. An
+    operation the backend did not answer for keeps its record and excuses nothing this cycle, and
+    so does Redis not answering.
+    """
+    raw_records: list[str] = []
+
+    async def read_raw_records() -> None:
+        raw_records.extend(await _raw_records(redis, executor_id))
+
+    if not await _redis_call(f"read helpers of {executor_id}", read_raw_records):
+        return set()
+    now = int(time.time())
+    records = {raw: StorageHelperRecord.parse(raw) for raw in raw_records}
+    unexpired_records = {
+        raw: record
+        for raw, record in records.items()
+        if record and 0 <= now - record.started <= STARTED_STORAGE_HELPERS_TTL_SECONDS
+    }
+    ended = list(records.keys() - unexpired_records.keys())
+    keys: set[str] = set()
+    # outside the Redis timeout: the backend call has its own, longer one
+    operation_ids = sorted({r.operation_id for r in unexpired_records.values()})
+    answers = dict(zip(operation_ids, await asyncio.gather(*map(is_open, operation_ids))))
+    for raw, record in unexpired_records.items():
+        if answers[record.operation_id]:
+            keys.add(storage_helper_key(record.operation_id))
+        elif answers[record.operation_id] is False:
+            ended.append(raw)
+
+    async def drop_ended_records() -> None:
+        for raw in ended:
+            await redis.srem(_key(executor_id), raw)
+
+    if ended:
+        await _redis_call(f"drop ended helpers of {executor_id}", drop_ended_records)
+    return keys
 
 
 class StorageOperationLaunchError(RuntimeError):
@@ -397,7 +543,7 @@ async def _helper_owned_by_live_runner(
     operation_id: UUID,
     files: StorageOperationFiles,
 ) -> bool:
-    helper_name = f"lium-storage-{str(operation_id)[:12]}"
+    helper_name = storage_helper_name(operation_id)
     # "[-]-spec" keeps pgrep from matching this command's own shell
     runner_pattern = f"[-]-spec {files.spec}"
     # an executor before the wrapper helper (a running wrapper helper already reads as RUNNING)
@@ -413,7 +559,7 @@ async def _remove_stale_helper_container(
     ssh_client: asyncssh.SSHClientConnection,
     operation_id: UUID,
 ) -> None:
-    helper_name = f"lium-storage-{str(operation_id)[:12]}"
+    helper_name = storage_helper_name(operation_id)
     await ssh_client.run(
         f"/usr/bin/docker rm -f -- {shlex.quote(helper_name)} >/dev/null 2>&1 || true",
         check=False,
