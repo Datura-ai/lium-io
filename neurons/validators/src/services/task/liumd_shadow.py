@@ -138,6 +138,56 @@ def _workload_on_node(ctx: Context, today: dict[str, TodayStep]) -> bool:
     return bool(executor and executor.pods)
 
 
+def _reserved(ctx: Context) -> bool:
+    executor = ctx.executor
+    key = (ctx.miner_hotkey, executor.uuid, executor.address, executor.ssh_port)
+    reserved = settings.get_liumd_shadow_reserved_executors()
+    return reserved is None or key in reserved
+
+
+def start_facts_after_scrape(
+    ctx: Context, client_factory: Callable[[Context, float], Any] | None = None
+) -> asyncio.Task | None:
+    """Start liumd's docker and ports read in the background right after machine_scrape, so both
+    read the same containers; the shadow awaits it at the end of the run. None when no shadow
+    will compare this node."""
+    if not settings.VALIDATOR_LIUMD_SHADOW or settings.DRY_RUN or ctx.config.first_pass:
+        return None
+    # called from the fatal scrape check: a shadow error (e.g. a malformed reserved list) must never fail it
+    try:
+        if ctx.config.validator_keypair is None or not _reserved(ctx) or _workload_on_node(ctx, {}):
+            return None
+        return asyncio.create_task(_facts_only(ctx, client_factory or _default_client))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            _m(
+                "liumd shadow early facts read not started",
+                extra=get_extra_info({**ctx.default_extra, "error": f"{type(exc).__name__}: {exc}"[:DETAIL_MAX_CHARS]}),
+            )
+        )
+        return None
+
+
+async def _facts_only(ctx: Context, client_factory: Callable[[Context, float], Any]) -> Any:
+    """The liumd answer to a facts-only intent, or the LocalVerifyUnavailable it failed with."""
+    budget = float(settings.LIUMD_SHADOW_TIMEOUT_SECONDS)
+    intent = build_intent(
+        executor_uuid=ctx.executor.uuid,
+        miner_hotkey=ctx.miner_hotkey,
+        matmul=None,
+        verifyx=None,
+        parallel_gpu=False,
+        deadline_s=executor_deadline_s(int(budget)),
+    )
+    intent["steps"]["inspector"] = False
+    try:
+        return await client_factory(ctx, budget).run(ctx.ssh, intent)
+    except LocalVerifyUnavailable as exc:
+        return exc
+    except Exception as exc:  # noqa: BLE001 — the task is awaited later; never fail the cycle
+        return LocalVerifyUnavailable("internal_error", f"{type(exc).__name__}: {exc}"[:DETAIL_MAX_CHARS])
+
+
 def _default_client(ctx: Context, timeout_s: float) -> LiumdExecClient:
     return LiumdExecClient(ctx.config.validator_keypair, timeout_s=timeout_s)
 
@@ -201,10 +251,7 @@ async def _compare(
     # is meant to be reserved and non-rentable. `all` can include rentable nodes, so GPU steps are
     # refused with `all` until the rental-overlap guard exists.
     # Executor UUIDs are miner-chosen: an entry matches only its miner's executor at its endpoint.
-    executor = ctx.executor
-    key = (ctx.miner_hotkey, executor.uuid, executor.address, executor.ssh_port)
-    reserved = settings.get_liumd_shadow_reserved_executors()
-    if reserved is not None and key not in reserved:
+    if not _reserved(ctx):
         return _skipped("not_reserved", steps=steps)
     if _workload_on_node(ctx, today):
         return _skipped("workload", steps=steps)
@@ -298,9 +345,21 @@ async def _compare(
             deadline_s=executor_deadline_s(int(budget)),
         )
         intent["steps"]["inspector"] = False
-        client = client_factory(ctx, budget)
+        # The facts come from the read taken right after machine_scrape; liumd is called again
+        # here only for GPU steps. With GPU steps off there is no late fallback: a missing early
+        # read would compare a different Docker moment.
+        facts_only = matmul_challenge is None and verifyx_challenge is None
+        early = ctx.state.liumd_shadow_facts_task
+        if facts_only and ctx.state.liumd_shadow_facts_attempted and early is None:
+            return _skipped("no_facts_read", steps=steps)
+        facts_answer = await early if early is not None else None
         try:
-            answer = await client.run(ctx.ssh, intent)
+            if facts_only and facts_answer is not None:
+                answer = facts_answer
+            else:
+                answer = await client_factory(ctx, budget).run(ctx.ssh, intent)
+            if isinstance(answer, LocalVerifyUnavailable):
+                raise answer
         except LocalVerifyUnavailable as exc:
             return {
                 "outcome": "unavailable",
@@ -320,7 +379,30 @@ async def _compare(
                 "steps": steps,
                 "first_pass": first_pass,
             }
-        return _judged(ctx, answer, today, steps, matmul_challenge, verifyx_challenge, extra)
+        if isinstance(facts_answer, LocalVerifyUnavailable):
+            return {
+                "outcome": "unavailable",
+                "reason": facts_answer.reason,
+                "detail": facts_answer.detail[:DETAIL_MAX_CHARS],
+                "steps": steps,
+                "first_pass": first_pass,
+            }
+        if isinstance(facts_answer, LiumdRefusal):
+            return {
+                "outcome": "refused",
+                "reason": facts_answer.error,
+                "detail": facts_answer.detail,
+                "exit_status": facts_answer.exit_status,
+                "echoed": facts_answer.echoed,
+                "round_trip_ms": facts_answer.round_trip_ms,
+                "steps": steps,
+                "first_pass": first_pass,
+            }
+        if not isinstance(facts_answer, LocalVerifyAnswer):
+            facts_answer = answer
+        return _judged(
+            ctx, answer, today, steps, matmul_challenge, verifyx_challenge, extra, facts_answer
+        )
     finally:
         if matmul_challenge is not None:
             matmul_challenge.close()
@@ -365,6 +447,7 @@ def _judged(
     matmul_challenge,
     verifyx_challenge,
     extra: dict,
+    facts_answer: LocalVerifyAnswer,
 ) -> dict[str, Any]:
     if matmul_challenge is not None:
         step = answer.step("matmul")
@@ -422,7 +505,7 @@ def _judged(
             entry["agree"] = entry["liumd_verdict"] == today[name].verdict
             compared.append(entry["agree"])
     complete = len(compared) == len(requested)
-    facts = _facts(ctx, answer)
+    facts = _facts(ctx, facts_answer)
     return {
         "outcome": "compared",
         "reason": "ok",
