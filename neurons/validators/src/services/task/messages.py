@@ -2548,6 +2548,29 @@ class CpuTruthMessages:
     )
 
 
+class SpecFloorMessages:
+    """Scraped specs below the hardware floor no real GPU host is under. REJECTED fails the validation."""
+
+    OK = MessageTemplate(
+        event="Hardware specs above the floor",
+        reason="SPEC_FLOOR_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    REJECTED = MessageTemplate(
+        event="Hardware specs below the floor",
+        reason="SPEC_FLOOR_REJECTED",
+        severity="error",
+        category="env",
+        impact="Validation fails; under a live rental the score is set to 0",
+        remediation=(
+            "Report the machine's real specs: at least one CPU core, 4 GB of RAM per GPU, one card per "
+            "counted GPU, and each card's own GPU UUID."
+        ),
+    )
+
+
 class DockerCpuMessages:
     """The Docker daemon sees fewer CPUs than the machine reports. MISMATCH fails the validation."""
 
