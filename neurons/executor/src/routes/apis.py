@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import functools
 import ipaddress
 import json
@@ -13,6 +14,8 @@ from pathlib import Path
 from typing import Annotated, Any, Optional
 
 import docker
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa
 from datura.requests.validator_requests import ssh_pubkey_signing_blob, upload_nonce_issued_at
 from fastapi import APIRouter, Depends, Query, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -461,12 +464,63 @@ async def get_miner_identity(
     `account_claim`: every node of an e-mail or Google portal account reports the same pool hotkey, so
     the claim is what ties the node to the account that installed it. It is not a secret.
     """
+    claim = settings.MINER_ACCOUNT_CLAIM or None
+    port = _ssh_host_key_port()
     return MinerIdentityResponse(
         miner_hotkey=settings.MINER_HOTKEY_SS58_ADDRESS,
         nonce=nonce,
-        account_claim=settings.MINER_ACCOUNT_CLAIM or None,
-        ssh_host_key_port=_ssh_host_key_port(),
+        account_claim=claim,
+        ssh_host_key_port=port,
+        # off the event loop: an RSA signature still costs ~ms, and this endpoint is public
+        host_key_proofs=(
+            await asyncio.to_thread(_host_key_proofs, nonce, settings.MINER_HOTKEY_SS58_ADDRESS, claim) if port else None
+        ),
     )
+
+
+def identity_proof_message(nonce: str, miner_hotkey: str, account_claim: str | None) -> bytes:
+    """What each `host_key_proofs` signature signs; the portal (lium-platform node_control.py) builds the same bytes."""
+    return b"\n".join([b"lium-miner-identity-v1", nonce.encode(), miner_hotkey.encode(), (account_claim or "").encode()])
+
+
+# ECDSA signs with the hash its curve size calls for (RFC 5656), RSA with SHA-256 (rsa-sha2-256)
+_ECDSA_HASH = {256: hashes.SHA256, 384: hashes.SHA384, 521: hashes.SHA512}
+
+
+def _sign_with_host_key(key, message: bytes) -> bytes | None:
+    if isinstance(key, ed25519.Ed25519PrivateKey):
+        return key.sign(message)
+    if isinstance(key, ec.EllipticCurvePrivateKey) and key.curve.key_size in _ECDSA_HASH:
+        return key.sign(message, ec.ECDSA(_ECDSA_HASH[key.curve.key_size]()))
+    if isinstance(key, rsa.RSAPrivateKey):
+        return key.sign(message, padding.PKCS1v15(), hashes.SHA256())
+    return None
+
+
+@functools.lru_cache(maxsize=16)
+def _load_host_key(path: str, mtime_ns: int, size: int):
+    """Parsed once per key file version: loading (and checking) an RSA private key costs ~100 ms, signing does not."""
+    return serialization.load_ssh_private_key(Path(path).read_bytes(), password=None)
+
+
+def _host_key_proofs(nonce: str, miner_hotkey: str, account_claim: str | None) -> dict[str, str] | None:
+    """A signature by each of sshd's persisted host keys over this answer, keyed by its `<type> <base64>` public line
+    (DAH-5729). The portal binds a hostname node only when every key its SSH scan returned signed the check, so an SSH
+    port, or one key type of it, forwarded to another machine is refused. None when no key can be read."""
+    message = identity_proof_message(nonce, miner_hotkey, account_claim)
+    proofs: dict[str, str] = {}
+    for path in sorted(Path(settings.SSH_HOST_KEYS_DIR).glob("ssh_host_*_key")):
+        try:
+            stat = path.stat()
+            key = _load_host_key(str(path), stat.st_mtime_ns, stat.st_size)
+        except (OSError, ValueError, TypeError):
+            continue
+        signature = _sign_with_host_key(key, message)
+        if signature is None:
+            continue
+        public = key.public_key().public_bytes(serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH)
+        proofs[public.decode()] = base64.b64encode(signature).decode()
+    return proofs or None
 
 
 def _ssh_host_key_port() -> int | None:
