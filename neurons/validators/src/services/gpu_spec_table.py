@@ -185,6 +185,9 @@ GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 PC"] = list(GPU_VRAM_SIZES_MB["NVIDIA B300 S
 GPU_VRAM_SIZES_MB["NVIDIA GB300"] = [258048, *GPU_VRAM_SIZES_MB["NVIDIA B300 SXM6 AC"]]
 # `NVIDIA GB200` (DAH-6008): 192 GB HBM3e nominal per GPU like the B200 (~186 GB usable), so the B200 size; no reading yet.
 GPU_VRAM_SIZES_MB["NVIDIA GB200"] = list(GPU_VRAM_SIZES_MB["NVIDIA B200"])
+# DAH-6147: GH200 per-GPU HBM; the driver's "480GB" counts the Grace LPDDR5X too. No reading observed yet.
+GPU_VRAM_SIZES_MB["NVIDIA GH200 480GB"] = [98304]  # 96 GB HBM3
+GPU_VRAM_SIZES_MB["NVIDIA GH200 144G HBM3e"] = [147456]  # 144 GB HBM3e
 
 # --- Intentionally unranged models (passthrough) -----------------------------
 # Models that are in GPU_MODEL_RATES but for which we intentionally do not
@@ -260,6 +263,23 @@ def list_sxm_on_pcie_adapter_as_pcie(specs: dict[str, Any], gpu_details: list[An
     if not is_sxm_on_pcie_adapter(specs):
         return gpu_details
     return [{**gpu, "name": H100_PCIE} if isinstance(gpu, dict) and gpu.get("name") else gpu for gpu in gpu_details]
+GH200_MODELS = frozenset({"NVIDIA GH200 480GB", "NVIDIA GH200 144G HBM3e"})
+
+
+def list_gh200_off_grace_as_reference(specs: dict[str, Any], gpu_details: list[Any]) -> list[Any]:
+    """DAH-6147: a GH200 is always on a Grace (aarch64) host, and the arch is checked by the aarch64 verifier.
+    The name is self-reported and a 94 GB H100/H800 NVL sits in the 96 GB window, so a GH200 name on any
+    other host is scored as the card its VRAM references (what it was before GH200 was listed)."""
+    if specs.get("machine_arch") == "aarch64":
+        return gpu_details
+    return [
+        {**gpu, "name": pick_reference(gpu.get("capacity")) or gpu["name"]}
+        if isinstance(gpu, dict) and gpu.get("name") in GH200_MODELS
+        else gpu
+        for gpu in gpu_details
+    ]
+
+
 RTX_4090_48GB = "NVIDIA GeForce RTX 4090 48GB"
 
 
