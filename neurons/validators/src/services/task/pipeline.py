@@ -229,6 +229,8 @@ class ContextState:
     # the orphans the stale cleanup reaped (StaleContainerCleanupCheck). Reaches the backend as
     # ExecutorSpecRequest.pod_states.
     pod_states: list[PodContainerState] = field(default_factory=list)
+    # DAH-6073: pod id -> its short-granted volume's size after this cycle's grow, sent with its pod state
+    volume_sizes_gb: dict[str, int] = field(default_factory=dict)
     rented_data: RentedExecutorsResponse | None = None
     memory_health: MemoryHealthRead | None = None
     gpu_metrics: dict | None = None

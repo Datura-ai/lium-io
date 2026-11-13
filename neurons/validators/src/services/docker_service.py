@@ -77,6 +77,7 @@ from payload_models.payloads import (
     now_ms,
 )
 from daos.recovery_stop import UnmarkedRecoveryStopDao
+from services.volume_grow import order_labels
 from services.attestation_service import AttestationError, AttestationService
 from services import build_context as build_context_service
 from services.const import (
@@ -10871,6 +10872,7 @@ class DockerService:
                 effective_volume_limit_gb = payload.volume_limit_gb
                 effective_storage_limit_gb = payload.storage_limit_gb
                 local_volume_driver = None
+                grow_labels: dict[str, str] = {}
 
                 # Decided before the volume exists so a refusal below leaves nothing behind.
                 use_encrypted_volume = _should_encrypt_local_volume(
@@ -11030,6 +11032,8 @@ class DockerService:
                     full_node_rental = (
                         payload.disk_share is not None and payload.disk_share >= 1.0
                     )
+                    if payload.workload_kind != WorkloadKind.FILLER:
+                        grow_labels = order_labels(ordered_volume_gb, effective_volume_limit_gb)
                     local_volume_driver = await self.create_local_volume(
                         ssh_client=ssh_client,
                         docker_client=docker_client,
@@ -11040,7 +11044,12 @@ class DockerService:
                         limit=effective_volume_limit_gb,
                         sparse=full_node_rental,
                         host_probe=volume_probe,
-                        labels=FILLER_VOLUME_LABELS if payload.workload_kind == WorkloadKind.FILLER else None,
+                        # DAH-6073: a customer volume granted short of its order is grown on a later pass
+                        labels=(
+                            FILLER_VOLUME_LABELS
+                            if payload.workload_kind == WorkloadKind.FILLER
+                            else grow_labels or None
+                        ),
                     )
                     created_local_volume = True
 
@@ -11923,6 +11932,7 @@ class DockerService:
                     volume_limit_gb=effective_volume_limit_gb,
                     local_volume_path=local_volume_path,
                     volume_encryption_status=volume_encryption_status,
+                    volume_grows_to_order=bool(grow_labels),
                     command_id=payload.command_id,
                 )
                 # Last, so nothing can fail after it: the pod is usable, the reply goes now, and

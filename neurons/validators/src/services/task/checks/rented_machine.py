@@ -917,6 +917,7 @@ def _with_pod_states(
                 pod_id=pod.pod_id,
                 container_state=state_by_pod_id.get(pod.pod_id, ContainerState.UNKNOWN),
                 observed_at=observed_at,
+                volume_limit_gb=ctx.state.volume_sizes_gb.get(pod.pod_id),
             )
             for pod in rented_pods
         ),

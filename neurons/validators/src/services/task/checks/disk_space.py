@@ -69,6 +69,51 @@ def split_disk(ctx: Context, pods: list, free_kb: float) -> dict[str, Any] | Non
     }
 
 
+def specs_after_disk_taken(
+    ctx: Context,
+    taken_bytes: int,
+    free_now_bytes: int | None = None,
+    credit_volumes: dict[str, int | None] | None = None,
+) -> dict[str, Any] | None:
+    """The cycle's specs with `taken_bytes` more of the host disk used since the scrape (DAH-6073: the cleanup pass's
+    net change, a grow taking and a removal releasing; negative when more was released), and the split sizing redone
+    on that figure, so the listing, the paid GPU count and the disk floor all judge the disk as it is after the pass.
+    `free_now_bytes`, a read taken after the pass, caps the result: anything written since the scrape is in it, which
+    a delta on the older scrape cannot see. None when nothing changed or there is no disk reading."""
+    specs = ctx.state.specs or {}
+    hard_disk = specs.get("hard_disk")
+    free_kb = _as_float(hard_disk.get("free")) if isinstance(hard_disk, dict) else math.nan
+    if (taken_bytes == 0 and free_now_bytes is None) or not math.isfinite(free_kb):
+        return None
+    taken_kb = taken_bytes / 1024
+    if free_now_bytes is not None:
+        # the scrape counts the filler run volumes and the Engy cache as free (release_filler_cache); a raw read
+        # does not, except what they no longer hold. `credit_volumes`, read with it, gives the ones still there with
+        # their size now (None: the scraped size); unread, nothing is credited
+        credit_kb = 0.0
+        if credit_volumes is not None:
+            sizes = hard_disk.get("by_volume") or {}
+            held_kb = sum(
+                _as_float(sizes.get(name, 0)) if kb is None else kb
+                for name, kb in credit_volumes.items()
+            )
+            credit_kb = min(_as_float(hard_disk.get("filler_released")), held_kb)
+        cap_kb = free_now_bytes / 1024 + (credit_kb if math.isfinite(credit_kb) else 0)
+        taken_kb = max(taken_kb, free_kb - cap_kb)
+    if taken_kb == 0:
+        return None
+    used_kb = _as_float(hard_disk.get("used"))
+    updated = {**hard_disk, "free": max(free_kb - taken_kb, 0)}
+    if math.isfinite(used_kb) and used_kb + free_kb > 0:
+        used_after = min(max(used_kb + taken_kb, 0), used_kb + free_kb)
+        updated["free"] = used_kb + free_kb - used_after
+        updated["used"] = used_after
+        updated["utilization"] = used_after / (used_kb + free_kb) * 100
+    rental = rental_of_this_node(ctx)
+    per_split = split_disk(ctx, rental.pods, updated["free"]) if rental and rental.pods else None
+    return {**specs, "hard_disk": updated, **({"split_disk": per_split} if per_split is not None else {})}
+
+
 class SplitDiskCheck:
     """DAH-4961: writes ``specs.split_disk`` on a partly rented split node from the scraped disk figure.
 

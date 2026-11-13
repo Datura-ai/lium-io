@@ -743,6 +743,9 @@ class ContainerCreated(ContainerBaseResponse):
     volume_limit_gb: int | None = None
     local_volume_path: str | None = None
     volume_encryption_status: VolumeEncryptionStatus | None = None
+    # DAH-6073 (protocol 2.14.0): the volume was granted short of its order and labelled, so a later cleanup pass
+    # grows it online as disk frees; left off the wire when False
+    volume_grows_to_order: bool = Field(default=False, exclude_if=lambda value: not value)
     # protocol 2.13.0: the ContainerCreateRequest's command_id, so the backend can tell which dispatch this completes
     command_id: str = ""
 
