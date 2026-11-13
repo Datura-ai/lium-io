@@ -3,8 +3,7 @@
 The executor image installs the vendored `liumd-amd64` or `liumd-arm64` binary at
 `/usr/local/bin/liumd`.
 
-Both files are the unsigned CI artifacts built from the lium-platform main source head
-`53999a8d15b3`:
+Both files are the unsigned CI artifacts built from the liumd source head `53999a8d15b3`:
 
 | binary | sha256 |
 | --- | --- |
@@ -16,4 +15,4 @@ binaries for traceability only. The build emits no release manifest. There is no
 signature, or verification step at build or runtime; the image digest is the delivery trust
 boundary.
 
-Refresh both binaries and both provenance files from the same lium-platform main build.
+Refresh both binaries and both provenance files from the same liumd source build.
