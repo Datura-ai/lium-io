@@ -15,10 +15,13 @@ from functools import partial
 from pathlib import Path
 from typing import TypeVar
 
+import requests
+import urllib3
+
 from core.utils import _m, get_extra_info
 from datura.requests.miner_requests import ExecutorSSHInfo
 from services.const import RENTAL_CPU_COUNT_LABEL
-from services.node_host import NodeHostError, dial_validated, resolve_node_host
+from services.node_host import NodeHostError, dial_validated, reports_registered_host_key, resolve_node_host
 
 
 # 1 h: no rental pull that succeeded in 30 days took more than 44 min (DAH-3720).
@@ -120,6 +123,16 @@ class RentalDockerTransportDropped(RentalDockerConnectionError):
         super().__init__(f"SSH transport dropped: {detail}")
 
 
+# the typed errors of a Docker connection over SSH that dropped mid-call; a read timeout is not one
+_TRANSPORT_DROP_TYPES = (
+    RentalDockerTransportDropped,
+    *_TRANSPORT_ERROR_TYPES,
+    urllib3.exceptions.ProtocolError,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ChunkedEncodingError,
+)
+
+
 class RentalDockerTransportError(RentalDockerOperationError):
     """A Docker SDK call failed on a dropped SSH transport and its one retry did not recover it."""
 
@@ -149,7 +162,7 @@ def is_rental_docker_transport_error(exc: BaseException) -> bool:
     """True when `exc` (or anything in its cause chain) is a dropped-SSH-transport failure.
 
     Membership is by type (`RentalDockerTransportDropped`, paramiko's `EOFError`, http.client's
-    `RemoteDisconnected`, a reset or broken pipe, a cut-off body, a urllib3 read timeout) and by
+    `RemoteDisconnected`, a reset or broken pipe, a cut-off body, a urllib3 read timeout or protocol error) and by
     the exact texts those errors carry once wrapped into a string by the SDK
     client, so a `RentalDockerOperationError("Docker SDK run container failed: EOFError")` counts
     too. A Docker daemon answer (409, 500, no such image) is never a transport error.
@@ -157,13 +170,34 @@ def is_rental_docker_transport_error(exc: BaseException) -> bool:
     for item in _iter_exception_chain(exc):
         if isinstance(item, (RentalDockerTransportDropped, *_TRANSPORT_ERROR_TYPES)):
             return True
-        if item.__class__.__name__ in {"ReadTimeoutError", "ReadTimeout"}:
+        # urllib3/requests raise these when the reply over the SSH channel is cut off mid-body
+        # ("Connection broken: IncompleteRead", "Response ended prematurely"); by type, as a container's
+        # own output can carry the same words
+        if item.__class__.__name__ in {"ReadTimeoutError", "ReadTimeout", "ProtocolError", "ChunkedEncodingError"}:
             return True
         text = str(item)
         if text == "EOFError" or text.endswith(_TRANSPORT_EOF_SUFFIX):
             return True
         if any(marker in text for marker in _TRANSPORT_ERROR_TEXTS):
             return True
+    return False
+
+
+def is_rental_docker_transport_drop(exc: BaseException) -> bool:
+    """True only when a typed dropped-connection error caused `exc`: no text match, and no exception
+    merely raised while handling one, so a daemon answer or a command's own output never counts."""
+    seen: set[int] = set()
+    stack: list[BaseException | None] = [exc]
+    while stack:
+        item = stack.pop()
+        if item is None or id(item) in seen:
+            continue
+        seen.add(id(item))
+        if isinstance(item, _TRANSPORT_DROP_TYPES):
+            return True
+        stack.append(item.__cause__)
+        reason = getattr(item, "reason", None)
+        stack.extend(a for a in (reason, *getattr(item, "args", ())) if isinstance(a, BaseException))
     return False
 
 
@@ -244,6 +278,8 @@ def require_rental_docker_ssh_host_key(executor_info: ExecutorSSHInfo) -> str:
         raise RentalDockerConnectionError(
             "Executor is missing ssh_host_key; rental Docker operations require the executor SSH host public key"
         )
+    if not reports_registered_host_key(executor_info):
+        raise RentalDockerConnectionError("Executor ssh_host_key is not the host key registered for its hostname")
     return host_key
 
 

@@ -32,11 +32,17 @@ require_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command
 # =============== Guards ===============
 require_cmd apt-get
 
-# Must have sudo or be root, and sudo must be passwordless for non-interactive runs
+# Must be root or have sudo; every step runs `sudo -n`, so a password is asked at most once, here
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   require_cmd sudo
   if ! sudo -n true 2>/dev/null; then
-    die "Passwordless sudo required (or run as root). Aborting to remain non-interactive."
+    # sudo's cached password expired (or sudo needs one): at a terminal, ask once; sudo -v prompts on the tty
+    if [[ -t 0 ]]; then
+      log "sudo needs your password once for this install"
+      sudo -v || die "sudo did not accept the password."
+    fi
+    sudo -n true 2>/dev/null \
+      || die "sudo needs a password and there is no terminal to ask for it. Run 'sudo -v', then rerun within a few minutes (or run as root, or set up passwordless sudo)."
   fi
   SUDO="sudo -n"
 else
@@ -113,38 +119,60 @@ install_docker() {
   apt_refresh
   $APT install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
-  # Ensure daemon enabled/started on systemd hosts
+  ok "Docker installed"
+}
+
+# Runs whether or not Docker was preinstalled (a preinstalled docker.io never put the user in the group).
+start_docker_and_group() {
   if command -v systemctl >/dev/null 2>&1; then
     $SUDO systemctl enable --now docker || true
   fi
-
-  # Add current user to docker group if not root
-  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-    if ! id -nG "${SUDO_USER:-$USER}" | grep -qw docker; then
-      $SUDO usermod -aG docker "${SUDO_USER:-$USER}" || true
-      USER_ADDED_TO_DOCKER_GROUP=1
-      ok "Added ${SUDO_USER:-$USER} to docker group (activating for this session)"
-    fi
+  [[ ${EUID:-$(id -u)} -ne 0 ]] || return 0
+  local user="${SUDO_USER:-$USER}"
+  if ! id -nG "$user" | grep -qw docker; then
+    $SUDO groupadd -f docker
+    $SUDO usermod -aG docker "$user" || die "Could not add ${user} to the docker group: run 'sudo usermod -aG docker ${user}'"
+    ok "Added ${user} to docker group (activating for this session)"
   fi
-  ok "Docker installed"
+  # this shell keeps the groups it started with; until a re-login, reach Docker through sg
+  if ! id -nG | grep -qw docker; then
+    USER_ADDED_TO_DOCKER_GROUP=1
+  fi
+}
+
+ensure_compose() {
+  docker_cmd "docker compose version" && return 0
+  log "docker compose plugin missing; installing it"
+  # Docker's repo ships docker-compose-plugin; Ubuntu's docker.io pairs with docker-compose-v2
+  # --no-remove: docker-compose-v2 depends on docker.io, and apt would otherwise swap out a docker-ce install
+  $APT_INSTALL --no-remove docker-compose-plugin >/dev/null 2>&1 || $APT_INSTALL --no-remove docker-compose-v2 >/dev/null 2>&1 || true
+  docker_cmd "docker compose version" \
+    || die "docker compose plugin not available. Install it: 'sudo apt-get install docker-compose-v2' (Ubuntu docker.io) or 'docker-compose-plugin' (Docker's repo)."
+}
+
+docker_cmd() {
+  if [[ $USER_ADDED_TO_DOCKER_GROUP -eq 1 ]]; then
+    sg docker -c "$1" >/dev/null 2>&1
+  else
+    bash -c "$1" >/dev/null 2>&1
+  fi
 }
 
 verify_docker() {
   log "Verifying Docker daemon"
-
-  # If user was just added to docker group, use sg to activate it for verification
-  if [[ $USER_ADDED_TO_DOCKER_GROUP -eq 1 ]]; then
-    if ! sg docker -c "docker info" >/dev/null 2>&1; then
-      die "Docker daemon not reachable. Ensure 'systemctl status docker' is healthy."
-    fi
-    sg docker -c "docker compose version" >/dev/null 2>&1 || die "docker compose plugin not available."
-  else
-    if ! docker info >/dev/null 2>&1; then
-      die "Docker daemon not reachable. Ensure 'systemctl status docker' is healthy."
-    fi
-    docker compose version >/dev/null 2>&1 || die "docker compose plugin not available."
+  local cmd="docker info" err
+  if [[ $USER_ADDED_TO_DOCKER_GROUP -eq 1 ]]; then cmd="sg docker -c 'docker info'"; fi
+  if ! err=$(bash -c "$cmd" 2>&1 >/dev/null); then
+    case "$err" in
+      *"permission denied"*)
+        die "Docker is running but ${SUDO_USER:-$USER} may not use it (permission denied on the Docker socket). Run 'sudo usermod -aG docker ${SUDO_USER:-$USER} && newgrp docker', then rerun." ;;
+      *"Cannot connect"*|*"Is the docker daemon running"*|*"No such file"*)
+        die "Docker daemon not running. Start it: 'sudo systemctl enable --now docker', then check 'systemctl status docker'." ;;
+      *)
+        die "Docker daemon not reachable: ${err}" ;;
+    esac
   fi
-
+  ensure_compose
   ok "Docker daemon reachable & compose available"
 }
 
@@ -156,6 +184,7 @@ install_base
 pause_if_needed
 
 install_docker
+start_docker_and_group
 pause_if_needed
 
 verify_docker
@@ -165,6 +194,11 @@ ok "All required executor prerequisites are installed (non-interactive)."
 
 # If we added user to docker group, activate it for the current session
 if [[ $USER_ADDED_TO_DOCKER_GROUP -eq 1 ]]; then
-  log "Activating docker group for current session..."
-  exec sg docker -c "$SHELL"
+  # a new shell only makes sense at a terminal; under `lium mine` (output captured) it would hang
+  if [[ -t 0 && -t 1 ]]; then
+    log "Activating docker group for current session..."
+    exec sg docker -c "$SHELL"
+  fi
+  # non-zero so a caller that captures the output (lium mine) shows this instead of failing later on the socket
+  die "Added to the docker group, but this session does not have it yet: run 'newgrp docker' or log in again, then rerun."
 fi

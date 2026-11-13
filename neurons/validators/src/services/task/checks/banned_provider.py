@@ -49,6 +49,7 @@ def has_live_rental(ctx: Context) -> bool:
 
 class BannedProviderCheck:
     check_id = "gpu.validate.banned_provider"
+    replays_after_session_drop = True
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:

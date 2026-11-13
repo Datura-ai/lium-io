@@ -52,6 +52,8 @@ setup_backing_fs() {
         # check below is the validation ([ -b ] would be wrong here: the node
         # may legally not exist yet — ensure_loop_node creates it)
         loop=$(losetup -f 2>/dev/null)
+        # util-linux appends " (lost)" when the free device has no /dev node here
+        loop=${loop%% *}
         case "$loop" in
             /dev/loop[0-9]*) ;;
             *) log "losetup -f failed (no free loop device?)"; return 1 ;;

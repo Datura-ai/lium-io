@@ -4,7 +4,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # `project.version` in pyproject.toml (tests/test_watchtower.py holds the two equal). Sent as the
 # User-Agent of every digest request so the platform can count which watchtower versions poll it —
 # the fleet has no other watchtower-version signal (the executor's update-status report carries none).
-WATCHTOWER_VERSION: str = "1.2.0"
+WATCHTOWER_VERSION: str = "1.2.3"
 WATCHTOWER_USER_AGENT: str = f"lium-watchtower/{WATCHTOWER_VERSION}"
 
 WATCHTOWER_ENDPOINT_URL: str = "https://lium.io/api/watchtower/digest"

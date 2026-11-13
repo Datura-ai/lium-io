@@ -72,7 +72,7 @@ def test_gpu_model_rates_parity():
 _EXPECTED_WINDOWS: dict[str, list[tuple[int, int]]] = {
     "NVIDIA B300 SXM6 AC": [(265421, 309658)],
     "NVIDIA B300 SXM6 PC": [(265421, 309658)],
-    "NVIDIA GB300": [(265421, 309658)],  # the B300 size
+    "NVIDIA GB300": [(232243, 270950), (265421, 309658)],  # DGX Station 252 GB, then the B300 size
     "NVIDIA B200": [(176947, 206438)],
     "NVIDIA H200": [(129946, 151603)],
     "NVIDIA H200 NVL": [(129946, 151603)],
