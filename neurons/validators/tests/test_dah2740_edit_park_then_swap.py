@@ -25,6 +25,7 @@ from services import docker_service
 from services.docker_service import (
     EDIT_PARKED_SUFFIX,
     DockerService,
+    _MAX_KEPT_CONTAINERS_PER_POD,
     _layer_data_check,
     create_steps_after_reply,
     inflight_creates,
@@ -1129,11 +1130,11 @@ async def test_the_stopped_layer_read_reuses_the_upper_dir_the_running_read_foun
 
 
 @pytest.mark.asyncio
-async def test_a_write_during_the_stop_with_a_kept_container_on_the_host_fails_the_edit_before_the_replacement(svc, monkeypatch):
-    # the one-kept limit holds for a write seen only on the stopped layer: the edit fails and the pod comes back
+async def test_a_write_during_the_stop_with_the_most_kept_containers_on_the_host_fails_the_edit_before_the_replacement(svc, monkeypatch):
+    # the kept limit holds for a write seen only on the stopped layer: the edit fails and the pod comes back
     payload = _edit_payload()
     ssh = _ssh_recording()
-    ssh.kept = [f"kept_unmounted_{payload.pod_id}_1700000000"]
+    ssh.kept = [f"kept_unmounted_{payload.pod_id}_170000000{i}" for i in range(_MAX_KEPT_CONTAINERS_PER_POD)]
     answer = ssh.run.side_effect
     name = _pod_name(payload)
 
@@ -1141,9 +1142,9 @@ async def test_a_write_during_the_stop_with_a_kept_container_on_the_host_fails_t
         if "/usr/bin/docker diff" in cmd and f"id-{name}" in cmd:
             ssh.commands.append(cmd)
             return _ssh_result(stdout="")
-        if "/usr/bin/docker diff" in cmd and "1700000000" in cmd:
+        if "/usr/bin/docker diff" in cmd and "_170000000" in cmd:
             ssh.commands.append(cmd)
-            return _ssh_result(stdout="")  # the earlier kept one holds renter files
+            return _ssh_result(stdout="")  # the earlier kept ones hold renter files
         return answer(cmd, *args, **kwargs)
 
     ssh.run.side_effect = _side
@@ -1397,10 +1398,28 @@ async def test_a_failed_edit_restores_the_mount_the_pod_had(svc, monkeypatch, mo
 
 
 @pytest.mark.asyncio
-async def test_a_second_unmounted_edit_is_refused_while_a_kept_container_is_on_the_host(svc, monkeypatch):
+async def test_a_second_unmounted_edit_keeps_both_copies_and_reboots_the_pod(svc, monkeypatch):
+    # DAH-6226: pod 1625a2bb stayed REBOOT_FAILED while it ran and billed, every reboot refused by a one-kept limit
     payload = _edit_payload()
     ssh = _ssh_recording()
-    ssh.kept = [f"kept_unmounted_{payload.pod_id}_1700000000"]
+    old = f"kept_unmounted_{payload.pod_id}_1700000000"
+    ssh.kept = [old]
+    _report_unmounted(ssh)
+    _patch_happy(svc, monkeypatch, ssh)
+    name = _pod_name(payload)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated)
+    assert _docker(ssh.commands, "rename") == [f"/usr/bin/docker rename {name} {_kept(payload)}"]
+    assert _docker(ssh.commands, "rm -fv id-") == []  # neither copy holding renter files is removed
+
+
+@pytest.mark.asyncio
+async def test_an_unmounted_edit_is_refused_once_the_pod_has_the_most_kept_containers(svc, monkeypatch):
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    ssh.kept = [f"kept_unmounted_{payload.pod_id}_170000000{i}" for i in range(_MAX_KEPT_CONTAINERS_PER_POD)]
     _report_unmounted(ssh)
     _patch_happy(svc, monkeypatch, ssh)
 

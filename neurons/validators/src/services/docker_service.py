@@ -1791,6 +1791,9 @@ _PARK_COMMAND_TIMEOUT_SECONDS = 60
 _EDIT_PARKED_RECORD_TIMEOUT_SECONDS = 2
 # the undo's bring-up (start, gocryptfs remount, sshd bootstrap) is several SDK and SSH steps, not one command
 _RESTORE_BRING_UP_TIMEOUT_SECONDS = 300
+# DAH-6226: with a limit of one, a pod whose replacement also wrote renter files could never be rebooted again (it
+# stayed REBOOT_FAILED while running and billed); a few copies per pod bound the disk without stranding the pod
+_MAX_KEPT_CONTAINERS_PER_POD = 3
 
 
 class KeptContainersNotRemoved(RuntimeError):
@@ -2079,11 +2082,11 @@ class _EditSwap:
         )
         # the containerd store names the upper dir only in a running container's mounts: the stopped read reuses it
         upper_dir = self._upper_dir
-        if self.keep_parked and kept:
-            # one kept container per pod: repeated edits must not pile kept layers onto the host's disk
+        if self.keep_parked and len(kept) >= _MAX_KEPT_CONTAINERS_PER_POD:
+            # repeated edits must not pile kept layers onto the host's disk without bound
             raise Exception(
-                f"[park_current_container] a container kept from an earlier edit ({kept[0]}) is still on the host "
-                "and this one holds renter files under the volume path too; the pod was left as it was"
+                f"[park_current_container] {len(kept)} containers kept from earlier edits ({kept[0]}) are still on the "
+                "host and this one holds renter files under the volume path too; the pod was left as it was"
             )
         # every candidate is parked under the protected kept name, before the stop: no later rename can fail and leave
         # renter files written during the shutdown to a sweep; a clean one is removed by ID after the edit
@@ -2127,12 +2130,12 @@ class _EditSwap:
             container_id, upper_dir, already_kept=bool(recover_kept)
         ):
             # a write between the running read and the stop (or by its shutdown) shows only on the stopped layer:
-            # decided here, before the replacement exists, so the one-kept limit holds; a failed edit brings it back unmounted
+            # decided here, before the replacement exists, so the kept limit holds; a failed edit brings it back unmounted
             self.keep_parked = True
-            if kept:
+            if len(kept) >= _MAX_KEPT_CONTAINERS_PER_POD:
                 raise Exception(
-                    f"[park_current_container] a container kept from an earlier edit ({kept[0]}) is still on the host "
-                    "and this one wrote renter files under the volume path while it stopped; the pod was restored"
+                    f"[park_current_container] {len(kept)} containers kept from earlier edits ({kept[0]}) are still on "
+                    "the host and this one wrote renter files under the volume path while it stopped; the pod was restored"
                 )
         logger.info(_m("Parked current container for edit", extra=get_extra_info({**self.default_extra, "parked": parked})))
         return parked
