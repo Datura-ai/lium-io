@@ -8,7 +8,7 @@ from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutor
 
 from core.config import settings
 from services.docker_service import DockerService
-from services.redis_service import sshd_bootstrap_failed_key
+from services.redis_service import SSHD_BOOTSTRAP_FAILED_TTL_SECONDS, sshd_bootstrap_failed_key
 from services.task.checks.sshd_bootstrap import SshdBootstrapCheck
 from services.task.messages import SshdBootstrapMessages as Msg
 from tests.helpers import FakeRedis, build_services, build_state
@@ -162,7 +162,7 @@ async def test_sshd_not_serving_stamps_and_a_later_success_clears():
 
     assert await _bootstrap(service, failed) is False
     assert redis.store[KEY] == "1"
-    assert redis.ttl[KEY] is None  # DAH-6355: only a create that verifies sshd clears it
+    assert redis.ttl[KEY] == SSHD_BOOTSTRAP_FAILED_TTL_SECONDS
 
     assert await _bootstrap(service, SimpleNamespace(exit_status=0, stdout="", stderr="")) is True
     assert KEY not in redis.store
@@ -216,7 +216,7 @@ async def test_a_running_filler_without_sshd_past_the_grace_fails_stamps_and_is_
     assert result.passed is False
     assert result.event.reason_code == Msg.FAILED.reason
     assert redis.store[KEY] == "1"
-    assert redis.ttl[KEY] is None  # DAH-6355: only a create that verifies sshd clears it
+    assert redis.ttl[KEY] == SSHD_BOOTSTRAP_FAILED_TTL_SECONDS
     probe = ssh.run.await_args_list[0].args[0]
     assert f"inspect -f '{{{{.State.Running}}}} {{{{.State.StartedAt}}}}' {FILLER}" in probe
     assert f"| base64 -d | /usr/bin/docker exec -u 0 -i {FILLER} sh -c" in probe

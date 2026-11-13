@@ -92,8 +92,11 @@ RECENT_FILLER_TTL_SECONDS = 45 * 60
 # closes the run only after ~30 min of missing reports; until then the container's absence is not a host kill.
 FILLER_REMOVED_BY_VALIDATOR_PREFIX = "filler_removed_by_validator:"
 FILLER_REMOVED_BY_VALIDATOR_TTL_SECONDS = 2 * 3600
-# set by a filler create whose sshd never came up in the container, cleared only by one where it did (no TTL: DAH-6355)
+# set by a filler create whose sshd never came up in the container, cleared by one where it did
 SSHD_BOOTSTRAP_FAILED_PREFIX = "sshd_bootstrap_failed"
+# prod, 24 h: failed filler creates on a broken node came 5 min to 2.7 h apart, so 6 h outlives the
+# longest gap about twice over; a stale stamp ends by itself
+SSHD_BOOTSTRAP_FAILED_TTL_SECONDS = 6 * 3600
 # DAH-6066: the host's MemAvailable (KiB) read at a create with no pod or filler on it, per executor; it caps
 # later rentals' memory limits. Refreshed at every idle create; 30 days so a node rented for weeks keeps it.
 IDLE_MEM_AVAILABLE_PREFIX = "idle_mem_available_kib"
