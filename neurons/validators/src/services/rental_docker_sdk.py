@@ -360,6 +360,8 @@ class ContainerRunSpec:
     # whole-host rental mem_limit is host-sized.
     pids_limit: int | None = None
     shm_size: str | None = None
+    # json-file log options (max-size, max-file); empty keeps the daemon's log driver
+    log_opts: dict[str, str] = field(default_factory=dict)
     entrypoint: str | None = None
     # None keeps the daemon's default bridge (the CVM quote broker talks over unix sockets only)
     network: str | None = None
@@ -1852,6 +1854,7 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
             else None
         ),
         "shm_size": spec.shm_size,
+        "log_config": {"type": "json-file", "config": spec.log_opts} if spec.log_opts else None,
         "network_mode": spec.network,
     }
     return {key: value for key, value in kwargs.items() if value is not None}

@@ -597,13 +597,15 @@ async def test_customer_create_keeps_the_listings_but_not_the_volume_facts_after
     result = await _run_create_container(svc, payload)
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    # the fail-closed pid_max read every rental makes first and the host RAM read that clamps its memory limit,
+    # the fail-closed pid_max read every rental makes first, the host RAM read that clamps its memory limit and
+    # the CPU count read that leaves the host its reserve,
     # then the listing that finds the filler and the rm with its confirming listing in one command — the
     # removal starts only once the host reads succeed
     assert "pod_ssh_host_key" in _cmds(ssh_client)[-1]
     assert _cmds(ssh_client)[:-1] == [
         "cat /proc/sys/kernel/pid_max",
         "cat /proc/meminfo",
+        "grep -c ^processor /proc/cpuinfo",
         *([] if removal_lost_its_channel else [DOCKER_PS_ALL_NAMES_IDS_CMD, _FILLER_X_REMOVAL, DOCKER_PS_ALL_NAMES_IDS_CMD]),
         # the sizing measures the disk under the node flatten lock
         next((c for c in _cmds(ssh_client) if c.startswith(flatten_wait_command()[:40])), "no flatten wait"),
@@ -847,7 +849,12 @@ async def test_only_a_customer_create_removes_fillers_at_ssh_connect(
     # the fail-closed pid_max read every rental makes and the host RAM read come first; only then does the removal
     # run (at SSH connect for a customer create, at the cleanup step for a bootstrap restore), so it is always after
     assert "pod_ssh_host_key" in _cmds(ssh_client)[-1]
-    assert _cmds(ssh_client)[:-1] == ["cat /proc/sys/kernel/pid_max", "cat /proc/meminfo", *commands]
+    assert _cmds(ssh_client)[:-1] == [
+        "cat /proc/sys/kernel/pid_max",
+        "cat /proc/meminfo",
+        "grep -c ^processor /proc/cpuinfo",
+        *commands,
+    ]
     svc.probe_prerun_host.assert_awaited_once()
     # the restore's removal at the cleanup step changed the host: its volume facts are probed again
     assert svc.probe_volume_host.await_count == (2 if bootstrap_restore else 1)

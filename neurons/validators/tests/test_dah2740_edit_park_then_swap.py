@@ -51,6 +51,7 @@ def svc():
     # the pre-run kernel.pid_max read is mandatory and the SSH doubles here do not model /proc
     service._read_host_pid_max = AsyncMock(return_value=4_194_304)
     service._read_host_ram_kib = AsyncMock(return_value=None)
+    service._read_host_cpu_count = AsyncMock(return_value=None)
     return service
 
 
