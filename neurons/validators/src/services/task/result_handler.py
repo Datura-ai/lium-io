@@ -436,6 +436,7 @@ class ResultHandler:
                     reason=reason,
                     evidence=evidence,
                     reanchor_uuids=(context.state.gpu_uuids or '') if context.gpu_reanchor else '',
+                    respec=(context.state.gpu_model_count or '') if context.gpu_respec else '',
                 )
             else:
                 # a full set of other cards stays anchored when a later check failed, or it re-anchors every cycle

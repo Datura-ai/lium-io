@@ -1371,8 +1371,10 @@ class RedisService:
         evidence: dict | None = None,
         anchor_broken: bool = False,
         reanchor_uuids: str = '',
+        respec: str = '',
     ):
-        spec = prev_info.get('spec', '')
+        # a changed model:count is reset once, then verified from scratch as it is now
+        spec = respec or prev_info.get('spec', '')
         # a full set of other cards is anchored now, even on a cycle a later check failed
         uuids = reanchor_uuids or prev_info.get(GPU_ANCHOR_KEY, '')
 
