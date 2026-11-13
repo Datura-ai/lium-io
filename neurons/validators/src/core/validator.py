@@ -816,21 +816,7 @@ class Validator:
                     # node the cycle has no result for gets one carrying only them. A withheld
                     # executor has a result this cycle, held back, so it gets none.
                     pod_ssh = await pod_ssh_probe
-                    reported = (
-                        attach_pod_ssh(incentive.job_results, pod_ssh)
-                        | {str(withheld.result.executor_info.uuid).lower() for withheld in withheld_results}
-                        # the express lane's result under this cycle's id stands: no observations-only one over it
-                        | {
-                            uuid
-                            for uuid, batch in self.miner_service.express_published.items()
-                            if batch == job_batch_id
-                        }
-                    )
-                    result_missing = (
-                        pod_ssh_only_results(rented_executors, pod_ssh, reported, job_batch_id)
-                        if settings.RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED
-                        else {}
-                    )
+                    with_result = attach_pod_ssh(incentive.job_results, pod_ssh)
 
                     # Publish machine specs
                     published_executor_ids: list[str] = []
@@ -848,6 +834,22 @@ class Validator:
                                 if result.executor_info.uuid != FAILED_MINER_EXECUTOR_UUID
                             )
 
+                    # built after the spec publish awaits: an express pass landing meanwhile must count too
+                    reported = (
+                        with_result
+                        | {str(withheld.result.executor_info.uuid).lower() for withheld in withheld_results}
+                        # the express lane's result under this cycle's id stands: no observations-only one over it
+                        | {
+                            uuid
+                            for uuid, batch in self.miner_service.express_published.items()
+                            if batch == job_batch_id
+                        }
+                    )
+                    result_missing = (
+                        pod_ssh_only_results(rented_executors, pod_ssh, reported, job_batch_id)
+                        if settings.RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED
+                        else {}
+                    )
                     # Not the whole miner's batch, not scored: no scored_at, and not "validated" for
                     # the express lane below.
                     await self.publish_result_missing(result_missing, miners, miner_coldkeys, job_batch_id)
