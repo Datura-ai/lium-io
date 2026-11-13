@@ -239,16 +239,13 @@ class CachedTemplateVerificationCheck:
     the per-cycle Docker Hub digest snapshot fetched at job-cycle start (``ctx.config``),
     not the backend response.
 
-    Two-phase by ``settings.CACHED_TEMPLATE_CUTOFF``:
-      * Before the cutoff — advisory only: emits a structured event and publishes
-        ``recommended_image_cached`` / ``recommended_image_digest_match`` into
-        ``executor.specs`` via pipeline state. Never changes score.
-      * On/after the cutoff — critical (``fatal``): the two bad signals (image not pre-pulled,
-        or stale content under an unchanged tag) return ``passed=False`` so the pipeline halts
-        early, the executor scores 0, and the failure reason reaches the provider via
-        ``log_text``. This check sits after ``TenantEnforcementCheck`` (the rented
-        short-circuit), so it only ever gates *unrented* executors — an active customer rental
-        is never failed by it.
+    Emits a structured event and publishes ``recommended_image_cached`` /
+    ``recommended_image_digest_match`` into ``executor.specs`` via pipeline state.
+    It is critical (``fatal``): the two bad signals (image not pre-pulled, or stale content
+    under an unchanged tag) return ``passed=False`` so the pipeline halts early, the executor
+    scores 0, and the failure reason reaches the provider via ``log_text``. This check sits
+    after ``TenantEnforcementCheck`` (the rented short-circuit), so it only ever gates
+    *unrented* executors — an active customer rental is never failed by it.
 
     Fails open on every uncertainty (unknown GPU/driver, backend unreachable, empty
     recommendation, SSH error) by recording a skip and leaving score untouched.
@@ -265,7 +262,7 @@ class CachedTemplateVerificationCheck:
 
     check_id = "executor.validate.cached_template"
     # The DAH-2380 digest rollout is done, so the gate is live: a `passed=False` result
-    # (NOT_CACHED / DIGEST_MISMATCH on/after CACHED_TEMPLATE_CUTOFF) halts the pipeline and the
+    # (NOT_CACHED / DIGEST_MISMATCH) halts the pipeline and the
     # executor scores 0. Every uncertainty still fails open inside run() (passed=True).
     fatal = True
 
@@ -441,14 +438,12 @@ class CachedTemplateVerificationCheck:
             # Cached, but the backend published no digest to compare against.
             template = Msg.CACHED
 
-        # DAH-2265: on/after the cutoff this check turns critical. The two "bad" signals —
-        # image not pre-pulled (NOT_CACHED) or stale content under an unchanged tag
-        # (DIGEST_MISMATCH) — fail verification early, so the executor scores 0 and the reason
-        # reaches the provider via log_text (the pipeline surfaces the last event). Before the
-        # cutoff (and on every fail-open None path above) the check stays advisory: passed=True,
+        # DAH-2265: the two "bad" signals — image not pre-pulled (NOT_CACHED) or stale content
+        # under an unchanged tag (DIGEST_MISMATCH) — fail verification early, so the executor
+        # scores 0 and the reason reaches the provider via log_text (the pipeline surfaces the
+        # last event). On every fail-open None path above the check stays advisory: passed=True,
         # score untouched. The cached/digest signals are published to specs either way.
-        after_cutoff = datetime.utcnow() >= settings.CACHED_TEMPLATE_CUTOFF
-        should_fail = after_cutoff and template in (Msg.NOT_CACHED, Msg.DIGEST_MISMATCH)
+        should_fail = template in (Msg.NOT_CACHED, Msg.DIGEST_MISMATCH)
 
         what = {
             "recommended_image": image_ref,
@@ -458,7 +453,7 @@ class CachedTemplateVerificationCheck:
             "local_digest": local_digest,
             "gpu_model": gpu_model,
             "driver_version": driver_version,
-            "after_cutoff": after_cutoff,
+            "after_cutoff": True,  # kept on the wire; the date cutoff has passed and is gone
         }
         if first_inspect_miss:
             what["first_inspect_miss"] = first_inspect_miss

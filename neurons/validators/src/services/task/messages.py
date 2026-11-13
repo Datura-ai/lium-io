@@ -2690,8 +2690,7 @@ class CachedTemplateMessages:
 
     Confirms whether the executor has the recommended default image pre-pulled so
     DOCKER_PULL is a no-op for default-template rentals. Templates carry severity="info"
-    (advisory) by default; before ``settings.CACHED_TEMPLATE_CUTOFF`` the check is purely
-    observational. On/after the cutoff the check renders the two bad signals (NOT_CACHED,
+    (advisory) by default; the check renders the two bad signals (NOT_CACHED,
     DIGEST_MISMATCH) with a severity="error" override and fails verification — see
     ``CachedTemplateVerificationCheck``.
     """
