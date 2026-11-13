@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from neurons.validators.src.services.task.checks.rented_pod_ownership import (
+    PATHS,
     RentedPodOwnershipCheck,
     judge,
     read_command,
@@ -159,7 +160,7 @@ def test_read_command_reports_a_missing_pid_without_failing(tmp_path):
     out = subprocess.run(
         ["sh", "-c", read_command([999], proc=str(tmp_path))], capture_output=True, text=True
     )
-    assert out.stdout == "999|||||||\n"
+    assert out.stdout == "999|" + "|" * len(PATHS) + "\n"
 
 
 @pytest.mark.parametrize(
@@ -206,3 +207,11 @@ async def test_the_read_includes_sudo_files_and_an_image_without_sudo_is_ok(
         "/etc/sudoers.d/README": me,
     }
     assert pods["pod_2"]["host_owners"] == {"/": me, "/root": me}
+
+
+def test_a_shifted_package_dir_warns_although_slash_root_and_sudo_are_inside():
+    # a partial shift left /usr/share owned by nobody while /, /root and sudo were fine: dpkg fails
+    pod = judge(
+        "4242|0 100000 65536|100000|100000|100000|100000|100000|100000|100000|100000|0|100000"
+    )
+    assert pod["outside_namespace"] == ["/usr/share"]
