@@ -144,7 +144,11 @@ class RentedPodResourcesCheck:
         what = {
             "executor_uuid": ctx.executor.uuid,
             "pods": [asdict(o) for o in outcomes],
-            "memory_guard": {"set": len(memory_guard["set"]), "failed": memory_guard["failed"]},
+            "memory_guard": {
+                "set": len(memory_guard["set"]),
+                "failed": memory_guard["failed"],
+                "events": memory_guard["events"],
+            },
         }
         if any(f in SCORED_FINDINGS for o in outcomes for f in o.findings):
             event = render_message(Msg.RESOURCES_REDUCED, ctx=ctx, check_id=self.check_id, what=what)

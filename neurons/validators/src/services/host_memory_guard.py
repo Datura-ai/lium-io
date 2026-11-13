@@ -37,13 +37,21 @@ UNIT_MEMORY_MIN_MIB = {
 }
 EXECUTOR_MEMORY_MIN_MIB = 1536
 
+# A restarted pod gets a new cgroup with oom.group back at 0 until the next resources check sets it again
+# (one job interval); the restart count is printed so the log shows it. A group kill ends the pod's cgroup and
+# its counters, so kills are read from the pods' parent (/docker or system.slice): memory.events there is
+# hierarchical and survives pod restarts (not reboots).
 _OOM_GROUP_SCRIPT = (
-    "for id in $(/usr/bin/docker inspect --format '{{.Id}}' %(names)s 2>/dev/null); do f=; "
+    "p=; /usr/bin/docker inspect --format '{{.Id}} {{.RestartCount}}' %(names)s 2>/dev/null | { "
+    "while read -r id rc; do f=; "
     "for d in /proc/1/root/sys/fs/cgroup/system.slice/docker-$id.scope /proc/1/root/sys/fs/cgroup/docker/$id; do "
-    '[ -f "$d/memory.oom.group" ] || continue; f=1; '
+    '[ -f "$d/memory.oom.group" ] || continue; f=1; p=${d%%/*}; '
     '[ "$(cat "$d/memory.oom.group")" = 1 ] || { { echo 1 > "$d/memory.oom.group"; } 2>/dev/null '
-    '&& echo "oom_group_set $id" || echo "oom_group_failed $id write_denied"; }; '
-    'done; [ -n "$f" ] || echo "oom_group_failed $id no_cgroup_v2_scope"; done'
+    '&& { echo "oom_group_set $id"; [ "${rc:-0}" -gt 0 ] && echo "oom_group_reset_after_restart $id $rc"; true; } '
+    '|| echo "oom_group_failed $id write_denied"; }; '
+    'done; [ -n "$f" ] || echo "oom_group_failed $id no_cgroup_v2_scope"; done; '
+    '[ -n "$p" ] && k=$(sed -n "s/^oom_group_kill //p" "$p/memory.events" 2>/dev/null) && [ "${k:-0}" -gt 0 ] '
+    '&& echo "oom_group_kill_total ${p##*/} $k"; true; }'
 )
 
 
@@ -85,14 +93,17 @@ def host_memory_guard_script(container_names: list[str]) -> str:
 
 
 def parse_guard_output(stdout: str) -> dict:
-    """{"set": [...], "failed": [...]}: each item is the script's line without its verb."""
-    result: dict = {"set": [], "failed": []}
+    """{"set": [...], "failed": [...], "events": [...]}: each item is the script's line without its verb (events
+    keep it)."""
+    result: dict = {"set": [], "failed": [], "events": []}
     for line in stdout.splitlines():
         verb, _, rest = line.strip().partition(" ")
         if verb.endswith("_set"):
             result["set"].append(f"{verb.removesuffix('_set')} {rest}")
         elif verb.endswith(("_failed", "_skipped")):
             result["failed"].append(f"{verb.rsplit('_', 1)[0]} {rest}")
+        elif verb in ("oom_group_reset_after_restart", "oom_group_kill_total"):
+            result["events"].append(line.strip())
     return result
 
 
@@ -103,9 +114,12 @@ async def apply_host_memory_guard(ssh, container_names: list[str], log_extra: di
         res = await ssh.run(host_memory_guard_script(container_names), timeout=TIMEOUT_SECONDS)
         result = parse_guard_output(getattr(res, "stdout", "") or "")
     except Exception as exc:  # noqa: BLE001
-        result = {"set": [], "failed": [f"ssh {exc!r}"]}
+        result = {"set": [], "failed": [f"ssh {exc!r}"], "events": []}
     if result["set"]:
         logger.info(_m("HOST_MEMORY_GUARD_APPLIED", extra=get_extra_info({**extra, "changed": result["set"]})))
     if result["failed"]:
         logger.warning(_m("HOST_MEMORY_GUARD_NOT_APPLIED", extra=get_extra_info({**extra, "failed": result["failed"]})))
+    if result["events"]:
+        # docker's OOMKilled resets on restart; these are the record that a pod was OOM-killed as a whole
+        logger.warning(_m("POD_OOM_GROUP_EVENTS", extra=get_extra_info({**extra, "events": result["events"]})))
     return result

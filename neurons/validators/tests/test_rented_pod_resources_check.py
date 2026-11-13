@@ -211,4 +211,4 @@ async def test_memory_guard_coverage_is_counted_in_the_result(context_factory):
 
     result = await _run(_ctx(context_factory, SimpleNamespace(run=run)))
 
-    assert result.event.what_we_saw["memory_guard"] == {"set": 0, "failed": ["memory_min no_systemd"]}
+    assert result.event.what_we_saw["memory_guard"] == {"set": 0, "failed": ["memory_min no_systemd"], "events": []}

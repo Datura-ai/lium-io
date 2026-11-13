@@ -72,7 +72,7 @@ def test_oom_group_reports_a_pod_without_a_cgroup_v2_scope(tmp_path):
 
     out = subprocess.run(["sh", "-c", script], capture_output=True, text=True, check=False).stdout
 
-    assert parse_guard_output(out) == {"set": [], "failed": ["oom_group abc no_cgroup_v2_scope"]}
+    assert parse_guard_output(out) == {"set": [], "failed": ["oom_group abc no_cgroup_v2_scope"], "events": []}
 
 
 UNITS_MIB = sum(UNIT_MEMORY_MIN_MIB.values()) - UNIT_MEMORY_MIN_MIB["ssh.service"]
@@ -164,8 +164,39 @@ async def test_unapplied_settings_log_a_warning_with_the_node_and_reason(caplog)
     with caplog.at_level("WARNING"):
         result = await apply_host_memory_guard(SimpleNamespace(run=run), ["pod_1"], {"executor_uuid": "node-1"})
 
-    assert result == {"set": ["oom_group abc"], "failed": ["memory_min no_systemd"]}
+    assert result == {"set": ["oom_group abc"], "failed": ["memory_min no_systemd"], "events": []}
     warning = [r for r in caplog.records if r.levelname == "WARNING"]
     assert len(warning) == 1
     extra = warning[0].msg.extra
     assert extra["executor_uuid"] == "node-1" and extra["failed"] == ["memory_min no_systemd"]
+
+
+def _run_oom_group(tmp_path, inspect_line: str, parent_events: str | None = None):
+    scope = tmp_path / "root/sys/fs/cgroup/docker/abc"
+    scope.mkdir(parents=True, exist_ok=True)
+    (scope / "memory.oom.group").write_text("0\n")
+    if parent_events is not None:
+        (scope.parent / "memory.events").write_text(parent_events)
+    docker = _fake_bin(tmp_path, "docker", f"echo '{inspect_line}'\n")
+    script = _OOM_GROUP_SCRIPT % {"names": "pod_1"}
+    script = script.replace("/proc/1/root", str(tmp_path / "root")).replace("/usr/bin/docker", str(docker))
+    return parse_guard_output(subprocess.run(["sh", "-c", script], capture_output=True, text=True, check=False).stdout)
+
+
+def test_oom_group_reset_by_a_pod_restart_is_reported_with_the_restart_count(tmp_path):
+    result = _run_oom_group(tmp_path, "abc 3")
+
+    assert result["set"] == ["oom_group abc"]
+    assert result["events"] == ["oom_group_reset_after_restart abc 3"]
+
+
+def test_group_oom_kills_are_read_from_the_pods_parent_cgroup(tmp_path):
+    result = _run_oom_group(tmp_path, "abc 0", parent_events="low 0\nhigh 0\nmax 4\noom 2\noom_kill 2\noom_group_kill 2\n")
+
+    assert result["events"] == ["oom_group_kill_total docker 2"]
+
+
+def test_no_event_without_a_restart_or_a_kill(tmp_path):
+    result = _run_oom_group(tmp_path, "abc 0", parent_events="oom_group_kill 0\n")
+
+    assert result == {"set": ["oom_group abc"], "failed": [], "events": []}
