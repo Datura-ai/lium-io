@@ -239,7 +239,8 @@ async def test_a_rented_collapse_is_marked_and_only_warns(context_factory):
     assert result.event.reason_code == Msg.THROTTLED.reason
     key = _hold_key(context_factory)
     assert json.loads(redis.store[key])["gpus"] == ["GPU-aaaa"]
-    assert redis.ttl[key] == gpu_thermal_throttle.THERMAL_HOLD_SECONDS
+    # DAH-6355: no timer ends the hold, only a healthy busy reading or a replaced card
+    assert redis.ttl[key] is None
 
 
 @pytest.mark.asyncio
@@ -256,6 +257,21 @@ async def test_an_idle_cycle_after_a_collapse_is_held(context_factory, first_ren
     assert result.event.what_we_saw["held_from_rental"] is True
     assert result.event.what_we_saw["held_gpu_uuids"] == ["GPU-aaaa"]
     assert result.event.what_we_saw["held_since"]
+
+
+@pytest.mark.asyncio
+async def test_a_held_idle_cycle_drops_the_ttl_an_older_validator_set(context_factory):
+    # DAH-6355: no timer ends the hold, so a 7-day TTL left from before must not relist a card never proven
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+    key = _hold_key(context_factory)
+    redis.ttl[key] = 7 * 24 * 3600
+
+    result = await run(context_factory, IDLE_ROW, redis=redis)
+
+    assert result.passed is False
+    assert json.loads(redis.store[key])["gpus"] == ["GPU-aaaa"]
+    assert redis.ttl[key] is None
 
 
 @pytest.mark.asyncio

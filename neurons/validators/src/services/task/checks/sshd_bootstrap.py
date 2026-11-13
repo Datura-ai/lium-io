@@ -14,7 +14,6 @@ from services.redis_service import (
     FILLER_REMOVED_BY_VALIDATOR_PREFIX,
     FILLER_REMOVED_BY_VALIDATOR_TTL_SECONDS,
     IN_CONTAINER_SSH_BOOTSTRAP_PATH,
-    SSHD_BOOTSTRAP_FAILED_TTL_SECONDS,
     SSHD_VERIFY_FAILED_MARKER,
     sshd_bootstrap_failed_key,
 )
@@ -60,8 +59,8 @@ class SshdBootstrapCheck:
     """Fail an unrented node on which a filler create could not bring sshd up.
 
     The connector stamps the executor when the sshd bootstrap in Lium's own filler image ends with sshd
-    installed but not running or listening, and clears it when a later filler create verifies sshd; the
-    stamp lapses after SSHD_BOOTSTRAP_FAILED_TTL_SECONDS. A rented node is left alone: its stamp predates
+    installed but not running or listening, and clears it only when a later filler create verifies sshd; no
+    timer ends it (DAH-6355), so a node still broken is not relisted. A rented node is left alone: its stamp predates
     the rental and failing it would not help the renter.
 
     A running Lium filler does not exempt the node: the failed filler create is the only signal, so the
@@ -129,7 +128,7 @@ class SshdBootstrapCheck:
             return False
         if not settings.DRY_RUN:
             try:
-                await ctx.services.redis.set(key, "1", ex=SSHD_BOOTSTRAP_FAILED_TTL_SECONDS)
+                await ctx.services.redis.set(key, "1")
             except Exception:
                 logger.warning(
                     _m("sshd bootstrap stamp could not be written", extra=get_extra_info(ctx.default_extra)),

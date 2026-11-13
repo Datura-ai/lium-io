@@ -434,7 +434,7 @@ class GpuThermalThrottleMessages:
         "gpus[], held_gpu_uuids: temperature_c, graphics_clock_mhz, max_graphics_clock_mhz, reasons). Fix the "
         "cooling (fans, airflow, datacenter temperature; `nvidia-smi -q -d PERFORMANCE,TEMPERATURE`). The hold "
         "ends when the card runs busy at half its max clock or more with no thermal slowdown (for example under "
-        "the Lium filler or the host's own load), or after 7 days, or when the card is replaced.",
+        "the Lium filler or the host's own load) or when the card is replaced; it does not end on a timer.",
     )
     OK = MessageTemplate(
         event="GPU clocks not thermally throttled",

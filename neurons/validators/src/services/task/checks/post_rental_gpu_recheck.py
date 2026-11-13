@@ -6,7 +6,7 @@ rental can keep passing the single-card matmul once the renter leaves. GpuMemory
 read that runs on rented nodes (DAH-3110), records a per-executor marker when it flags a card under a live
 rental; on the node's next unrented cycle this check runs the all-cards matmul and the kernel-fault probe
 on every card, whatever the MATMUL_ALLCARDS_* / GPU_FAULT_PROBE_* flags say. A failure fails the node and keeps the marker; a pass
-clears it.
+clears it. The marker has no expiry (DAH-6355): only a pass ends it.
 
 A card that falls off the bus (GpuModelValidCheck's GPU_DETAILS_MISMATCH) also sets the marker.
 
@@ -52,8 +52,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# a few days: long enough to outlast a weekend rental's tail, short enough that a stale flag dies
-MARKER_TTL_SECONDS = 3 * 24 * 3600
 MAX_MARKED_CARDS = 16
 # filler cycles the recheck waits out before it removes the fillers and probes anyway
 FILLER_SKIP_LIMIT = 3
@@ -102,8 +100,8 @@ async def record_marker(ctx: Context, marker: RecheckMarker) -> None:
     try:
         await ctx.services.redis.set(
             marker_key(ctx.miner_hotkey, ctx.executor.uuid),
+            # DAH-6355: no TTL; only a pass ends it, however long the rental or the node's absence
             json.dumps(payload),
-            ex=MARKER_TTL_SECONDS,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -243,11 +241,11 @@ class PostRentalGpuRecheckCheck:
 
     @staticmethod
     async def _refresh_marker(ctx: Context, key: str, what: dict[str, Any]) -> None:
-        # keep the marker alive until a pass clears it, or the node re-lists unchecked
+        # keep the marker until a pass clears it, or the node re-lists unchecked; drops a TTL an older validator set
         if settings.DRY_RUN:
             return
         try:
-            await ctx.services.redis.expire(key, MARKER_TTL_SECONDS)
+            await ctx.services.redis.persist(key)
         except Exception as exc:  # noqa: BLE001 — the cycle's verdict stands either way
             what["marker_refresh_error"] = str(exc)
 

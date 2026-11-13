@@ -178,7 +178,6 @@ from services.redis_service import (
     RECENT_FILLER_TTL_SECONDS,
     RENTAL_PROBE_FAILED_PREFIX,
     RENTAL_PROBE_OK_PREFIX,
-    SSHD_BOOTSTRAP_FAILED_TTL_SECONDS,
     SSHD_VERIFY_FAILED_MARKER,
     STOPPED_BY_RECOVERY_PREFIX,
     STOPPED_BY_RECOVERY_RENAMING,
@@ -7544,7 +7543,7 @@ class DockerService:
             return
         try:
             if failed:
-                await self.redis_service.set(key, "1", ex=SSHD_BOOTSTRAP_FAILED_TTL_SECONDS)
+                await self.redis_service.set(key, "1")
             else:
                 await self.redis_service.delete(key)
         except Exception:  # noqa: BLE001 — the create's own result still goes out

@@ -27,12 +27,13 @@ nodes are judged too.
 
 A collapse is remembered, so the node cannot pass on an idle card (28 Oct, 8x H200 c63f453b: collapsed at 345 MHz
 on every rented cycle, read idle and scored 1.0 the cycle after the renter left). Every collapse, rented or not,
-writes the collapsed UUIDs to Redis (``gpu_thermal_hold:<hotkey>:<executor uuid>``, THERMAL_HOLD_SECONDS from the
-last collapse). An unrented cycle with marked GPUs still unproven fails as a collapse does (held_from_rental). A
-marked GPU is cleared by a busy reading that is not collapsed and carries the clocks and reasons judge_gpu needs, or
-when a scrape whose every row has a UUID no longer lists it (replaced); the reading is the scrape's, taken before
-the matmul, so on an idle node only a filler or the host's own load at scrape time clears it, otherwise the TTL does. A dry run
-writes nothing; a Redis that cannot be read is no hold.
+writes the collapsed UUIDs to Redis (``gpu_thermal_hold:<hotkey>:<executor uuid>``, no expiry: DAH-6355). An
+unrented cycle with marked GPUs still unproven fails as a collapse does (held_from_rental). A marked GPU is cleared
+only by state: a busy reading that is not collapsed and carries the clocks and reasons judge_gpu needs, or a scrape
+whose every row has a UUID no longer listing it (replaced). No timer ends the hold, so a card still broken is not
+relisted. The reading is the scrape's, taken before the matmul, so on an idle node only a filler or the host's own
+load at scrape time clears it (shortcut: no validator-run load probe reads clocks under load yet; add one if idle
+nodes wait too long for a filler). A dry run writes nothing; a Redis that cannot be read is no hold.
 
 A GPU whose clocks a renter locked (DAH-4663, a ``gpu_clock_lock:<uuid>`` record in Redis) is spared only the
 low-clock finding: the lock holds its clock down on purpose, but a thermal or hardware slowdown is still judged.
@@ -77,7 +78,6 @@ MIN_UTILIZATION_PCT = 80
 # Below half the max clock under load is a collapse, not boost variation (ticket-0492: ~17-33%).
 MIN_CLOCK_RATIO = 0.5
 THERMAL_HOLD_KEY_PREFIX = "gpu_thermal_hold"
-THERMAL_HOLD_SECONDS = 7 * 24 * 3600
 
 
 def _to_number(value: Any) -> float | None:
@@ -237,13 +237,14 @@ class GpuThermalThrottleCheck:
         held = (marked_now - (proven - collapsed_uuids)) | collapsed_uuids
         since = mark.get("since") if marked else datetime.now(UTC).isoformat()
         # A dry run shares Redis with the live validator, so it leaves the live hold alone.
-        if settings.DRY_RUN or (held == marked and not collapsed_uuids):
+        # a held mark is rewritten every cycle, so a TTL an older validator set on it is dropped (DAH-6355)
+        if settings.DRY_RUN or (not held and not marked):
             return sorted(held), since
         try:
             if held:
-                # every collapse renews the TTL
+                # no TTL: only a healthy busy reading or a replaced card ends the hold (DAH-6355)
                 mark = {"gpus": sorted(held), "since": since}
-                await ctx.services.redis.set(key, json.dumps(mark), ex=THERMAL_HOLD_SECONDS)
+                await ctx.services.redis.set(key, json.dumps(mark))
             else:
                 await ctx.services.redis.delete(key)
         except GPU_DROP_REDIS_ERRORS:
