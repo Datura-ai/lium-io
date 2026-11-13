@@ -16,7 +16,7 @@ from payload_models.payloads import (
 from docker.errors import APIError
 
 from services import docker_service
-from services.docker_service import customer_creates
+from services.docker_service import confirm_no_prune_runs, customer_creates
 from services.rental_docker_sdk import RentalDockerOperationError
 from test_deploy_optimizations import _payload
 
@@ -144,11 +144,11 @@ _PRUNE_RUNNING = APIError("409 Client Error: Conflict (a prune operation is alre
 
 
 async def _fenced_after(docker, customer) -> bool:
+    customer_creates = docker_service.customer_creates  # a test may swap in a fresh connector's registry
     assert customer_creates.begin_prune(customer.miner_hotkey, customer.executor_id)
     with contextlib.suppress(RentalDockerOperationError):
         await docker_service._prune_images_then_release(docker, {}, customer.miner_hotkey, customer.executor_id)
-    with customer_creates.track(customer):
-        return not await customer_creates.wait_for_prunes(customer, timeout_s=0.03, poll_s=0.01)
+    return customer_creates.is_fenced(customer.miner_hotkey, customer.executor_id)
 
 
 @pytest.mark.parametrize(
@@ -193,9 +193,52 @@ async def test_an_older_prunes_late_success_does_not_lift_a_newer_prunes_fence(m
     late.release.set()
     await prune_a
 
-    with customer_creates.track(customer):
-        cleared = await customer_creates.wait_for_prunes(customer, timeout_s=0.03, poll_s=0.01)
-
-    assert cleared is False
+    assert customer_creates.is_fenced(customer.miner_hotkey, customer.executor_id)
     # a prune started after the fence that completes still lifts it
     assert await _fenced_after(_Prunes(None), customer) is False
+
+
+def _fresh_connector(monkeypatch) -> docker_service._CustomerCreateRegistry:
+    """A replaced connector: a new process, so a new registry that knows nothing of the old one's prunes."""
+    registry = docker_service._CustomerCreateRegistry()
+    monkeypatch.setattr(docker_service, "customer_creates", registry)
+    return registry
+
+
+@pytest.mark.asyncio
+async def test_a_replaced_connector_proves_no_prune_runs_before_a_customer_pull(monkeypatch) -> None:
+    # lio#2226 review: the old connector's prune lost its reply and may still run; its replacement must not pull
+    monkeypatch.setattr(docker_service, "PRUNE_CONFIRM_ATTEMPTS", 1)
+    monkeypatch.setattr(docker_service, "PRUNE_CONFIRM_INTERVAL_SECONDS", 0)
+    registry = _fresh_connector(monkeypatch)
+    customer = _payload()
+    assert registry.is_fenced(customer.miner_hotkey, customer.executor_id)
+
+    still_pruning = _Prunes(_prune_failure(_PRUNE_RUNNING), _prune_failure(_PRUNE_RUNNING))
+    with pytest.raises(docker_service._PruneMayStillRun):
+        await confirm_no_prune_runs(still_pruning, {}, customer.miner_hotkey, customer.executor_id)
+    assert still_pruning.calls == 2
+
+    # once dockerd takes a prune and completes it, none is left: the create goes on, and the next one prunes nothing
+    done = _Prunes(None)
+    await confirm_no_prune_runs(done, {}, customer.miner_hotkey, customer.executor_id)
+    await confirm_no_prune_runs(done, {}, customer.miner_hotkey, customer.executor_id)
+    assert done.calls == 1
+    assert not registry.is_fenced(customer.miner_hotkey, customer.executor_id)
+
+
+@pytest.mark.asyncio
+async def test_a_waiting_customer_create_lifts_the_fence_with_its_own_prune(monkeypatch) -> None:
+    # lio#2226 review: while the create runs no delete may prune, so the create runs the confirming prune itself
+    monkeypatch.setattr(docker_service, "PRUNE_CONFIRM_ATTEMPTS", 1)
+    monkeypatch.setattr(docker_service, "PRUNE_CONFIRM_INTERVAL_SECONDS", 0)
+    registry = _fresh_connector(monkeypatch)
+    customer = _payload()
+    assert await _fenced_after(_Prunes(_prune_failure(_LOST_REPLY), _prune_failure(_LOST_REPLY)), customer)
+
+    with registry.track(customer):
+        assert not registry.begin_prune(customer.miner_hotkey, customer.executor_id)
+        assert await registry.wait_for_prunes(customer, timeout_s=0.03, poll_s=0.01)
+        await confirm_no_prune_runs(_Prunes(None), {}, customer.miner_hotkey, customer.executor_id)
+
+    assert not registry.is_fenced(customer.miner_hotkey, customer.executor_id)

@@ -15,7 +15,7 @@ import secrets
 import shlex
 import threading
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass, field
@@ -2526,6 +2526,12 @@ class _CustomerCreateRegistry:
         # is already running); fenced until a prune started after the fence completes, which dockerd allows only
         # when none runs. Value = _prune_seq when fenced: an older prune's late success must not lift a newer fence.
         self._unconfirmed_prunes: dict[tuple[str, str], int] = {}
+        # executors where a prune completed in THIS process with no fence after it. Any other executor is fenced too:
+        # a replaced connector's prune may still run there (lio#2226 review), so a customer create proves none runs
+        # (confirm_no_prune_runs) before it pulls. ponytail: one entry per executor, bounded by the fleet.
+        self._confirmed: set[tuple[str, str]] = set()
+        # one confirming prune per executor at a time: a second customer create must not prune beside the first's pull
+        self._confirm_locks: defaultdict[tuple[str, str], asyncio.Lock] = defaultdict(asyncio.Lock)
         self._prune_seq = 0
         self._lock = threading.Lock()
 
@@ -2612,15 +2618,23 @@ class _CustomerCreateRegistry:
             if still_running:
                 self._prune_seq += 1
                 self._unconfirmed_prunes[executor] = self._prune_seq
-            elif self._unconfirmed_prunes.get(executor, started) < started:
-                del self._unconfirmed_prunes[executor]
+            elif self._unconfirmed_prunes.get(executor, 0) < started:
+                self._unconfirmed_prunes.pop(executor, None)
+                self._confirmed.add(executor)
+
+    def is_fenced(self, miner_hotkey: str, executor_id: str) -> bool:
+        """A prune may still run on the executor's host: one of ours lost its answer, or none completed here yet."""
+        executor = (miner_hotkey, executor_id)
+        with self._lock:
+            return executor in self._unconfirmed_prunes or executor not in self._confirmed
 
     async def wait_for_prunes(
         self, payload: ContainerCreateRequest, timeout_s: float = 300, poll_s: float = 0.2
     ) -> bool:
-        """A customer create waits until no image prune started before it runs on its executor.
+        """A customer create waits until no image prune this connector started runs on its executor.
 
-        False when a prune is still registered after `timeout_s`: the create must fail, not pull beside it.
+        False when a prune is still registered after `timeout_s`: the create must fail, not pull beside it. A fence
+        (a prune of unknown outcome) is not waited out here: the create lifts it itself (confirm_no_prune_runs).
         """
         if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL:
             return True
@@ -2628,7 +2642,7 @@ class _CustomerCreateRegistry:
         deadline = time.monotonic() + timeout_s
         while True:
             with self._lock:
-                if executor not in self._prunes_by_executor and executor not in self._unconfirmed_prunes:
+                if executor not in self._prunes_by_executor:
                     return True
             if time.monotonic() >= deadline:
                 return False
@@ -2687,6 +2701,10 @@ async def _prune_images_then_release(docker_client, log_extra: dict, miner_hotke
                 )
             except Exception as exc:
                 if not _prune_may_still_run(exc):
+                    # dockerd answered: it was running no prune when it took this one
+                    customer_creates.prune_may_still_run(
+                        miner_hotkey, executor_id, still_running=False, started=started
+                    )
                     raise
                 customer_creates.prune_may_still_run(
                     miner_hotkey, executor_id, still_running=True, started=started
@@ -2700,6 +2718,38 @@ async def _prune_images_then_release(docker_client, log_extra: dict, miner_hotke
             return
     finally:
         customer_creates.end_prune(miner_hotkey, executor_id)
+
+
+class _PruneMayStillRun(Exception):
+    """A customer create could not prove that no image prune still runs on its executor, so it does not pull."""
+
+
+async def confirm_no_prune_runs(docker_client, log_extra: dict, miner_hotkey: str, executor_id: str) -> None:
+    """Before a customer create pulls on a fenced executor, run the confirming prune itself (nothing pulled yet).
+
+    dockerd runs one prune at a time, so one that completes proves none is left. Raises _PruneMayStillRun when
+    none completes within the confirm attempts."""
+    async with customer_creates._confirm_locks[(miner_hotkey, executor_id)]:
+        for attempt in range(PRUNE_CONFIRM_ATTEMPTS + 1):
+            if not customer_creates.is_fenced(miner_hotkey, executor_id):
+                return
+            if attempt:
+                await asyncio.sleep(PRUNE_CONFIRM_INTERVAL_SECONDS)
+            started = customer_creates.prune_attempt_started()
+            try:
+                await run_logged_rental_docker_sdk_operation(
+                    operation="prune_images", log_extra=log_extra, call=docker_client.prune_images
+                )
+            except Exception as exc:
+                if _prune_may_still_run(exc):
+                    customer_creates.prune_may_still_run(
+                        miner_hotkey, executor_id, still_running=True, started=started
+                    )
+                    continue
+                # dockerd answered with another error: it was running no prune when it took this one
+            customer_creates.prune_may_still_run(miner_hotkey, executor_id, still_running=False, started=started)
+        if customer_creates.is_fenced(miner_hotkey, executor_id):
+            raise _PruneMayStillRun(f"an image cleanup may still run on executor {executor_id}; create not started")
 
 
 def _is_filler_create_beside_customer_create(payload: ContainerCreateRequest) -> bool:
@@ -10373,6 +10423,13 @@ class DockerService:
                 # DAH-2728: cheapest place to notice the delete — the image pull/build below is
                 # where a cancelled create spends its minutes, and nothing is on the host yet.
                 await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+
+                if payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL and not synthetic_probe:
+                    # the validator-process probe sees no connector prunes, so it never prunes (lio#2226 review)
+                    current_step = "prune_fence"
+                    await confirm_no_prune_runs(
+                        docker_client, default_extra, payload.miner_hotkey, payload.executor_id
+                    )
 
                 # Read the host's real limits and decide fail-closed BEFORE any host side-effect —
                 # the edit-swap park, the stale-container/filler cleanup (an irreversible rm), the

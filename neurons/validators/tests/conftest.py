@@ -138,6 +138,14 @@ def pod_ssh_answers_on_create_path(request):
 
 
 @pytest.fixture(autouse=True)
+def no_prune_fence_on_create_path():
+    """A customer create first proves no image prune runs on its fresh executor; the create tests' fake hosts have
+    no dockerd. test_no_filler_during_customer_create.py covers the fence itself."""
+    with patch("services.docker_service.confirm_no_prune_runs", AsyncMock(return_value=None)) as confirm:
+        yield confirm
+
+
+@pytest.fixture(autouse=True)
 def no_leftover_clock_locks_on_create_path():
     """create_container resets leftover GPU clock locks (Redis + -rgc); test_gpu_clocks.py covers that step."""
     with patch("services.docker_service.reset_leftover_clock_locks", AsyncMock(return_value=[])) as reset:
