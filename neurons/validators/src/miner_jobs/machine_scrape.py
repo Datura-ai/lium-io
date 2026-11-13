@@ -727,7 +727,10 @@ def get_executor_pid_mode():
     own_pid = str(os.getpid())
     for summary in docker_api_get("/containers/json") or []:
         container_id = summary.get("Id")
-        top = docker_api_get(f"/containers/{container_id}/top?ps_args=-eo%20pid") or {}
+        try:
+            top = docker_api_get(f"/containers/{container_id}/top?ps_args=-eo%20pid") or {}
+        except RuntimeError:
+            continue  # restarting (409) or gone (404): never this scrape's own container
         if [own_pid] not in (top.get("Processes") or []):
             continue
         inspection = docker_api_get(f"/containers/{container_id}/json")
