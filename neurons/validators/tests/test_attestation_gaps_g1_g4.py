@@ -122,7 +122,6 @@ def _nras_response(
 def service(monkeypatch):
     monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
     monkeypatch.setattr(settings, "ENABLE_ATTESTATION_WHITELIST", False)
-    monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", False)
     return AttestationService()
 
 
@@ -131,10 +130,23 @@ def service(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_g4_bad_tcb_status_only_warns_on_rental_teardown(service):
+    # Arrange — rental teardown verifies with enforce_tcb=False: the pinned host key suffices
+    response = _verifier_response()
+    response["details"]["tcb_status"] = "OutOfDate"
+    expected = "0x" + response["details"]["report_data"][:64]
+
+    # Act — must not raise
+    service._validate_verifier_response(response, expected, _make_executor(), enforce_tcb=False)
+
+    # Assert — the validation path still rejects the same quote
+    with pytest.raises(AttestationError, match="tcb_status_not_allowed"):
+        service._validate_verifier_response(response, expected, _make_executor())
+
+
 @pytest.mark.parametrize("bad_status", ["OutOfDate", "SWHardeningNeeded", "ConfigurationNeeded"])
 def test_g4_bad_tcb_status_rejected_when_enforced(service, monkeypatch, bad_status):
     # Arrange
-    monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", True)
     response = _verifier_response()
     response["details"]["tcb_status"] = bad_status
     expected = "0x" + response["details"]["report_data"][:64]
@@ -144,19 +156,8 @@ def test_g4_bad_tcb_status_rejected_when_enforced(service, monkeypatch, bad_stat
         service._validate_verifier_response(response, expected, _make_executor())
 
 
-def test_g4_bad_tcb_status_warn_only_when_not_enforced(service):
-    # Arrange — enforcement off (fixture default): violations must not reject
-    response = _verifier_response()
-    response["details"]["tcb_status"] = "OutOfDate"
-    expected = "0x" + response["details"]["report_data"][:64]
-
-    # Act — must not raise
-    service._validate_verifier_response(response, expected, _make_executor())
-
-
 def test_g4_allowlisted_tcb_status_accepted(service, monkeypatch):
     # Arrange
-    monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", True)
     monkeypatch.setattr(settings, "TDX_ALLOWED_TCB_STATUSES", "UpToDate,SWHardeningNeeded")
     response = _verifier_response()
     response["details"]["tcb_status"] = "SWHardeningNeeded"
@@ -168,7 +169,6 @@ def test_g4_allowlisted_tcb_status_accepted(service, monkeypatch):
 
 def test_g4_unexpected_advisory_rejected_when_enforced(service, monkeypatch):
     # Arrange
-    monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", True)
     response = _verifier_response()
     response["details"]["advisory_ids"] = ["INTEL-SA-00837"]
     expected = "0x" + response["details"]["report_data"][:64]
@@ -180,7 +180,6 @@ def test_g4_unexpected_advisory_rejected_when_enforced(service, monkeypatch):
 
 def test_g4_allowlisted_advisory_accepted(service, monkeypatch):
     # Arrange
-    monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", True)
     monkeypatch.setattr(settings, "TDX_ALLOWED_ADVISORY_IDS", "INTEL-SA-00837")
     response = _verifier_response()
     response["details"]["advisory_ids"] = ["INTEL-SA-00837"]
@@ -193,7 +192,6 @@ def test_g4_allowlisted_advisory_accepted(service, monkeypatch):
 @pytest.mark.parametrize("flag", ["event_log_verified", "os_image_hash_verified"])
 def test_g4_unverified_flags_rejected_when_enforced(service, monkeypatch, flag):
     # Arrange
-    monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", True)
     response = _verifier_response()
     response["details"][flag] = False
     expected = "0x" + response["details"]["report_data"][:64]
@@ -519,7 +517,7 @@ async def test_g1_only_a_passed_verdict_bound_to_the_challenge_claims_gpu_cc(
     nonce = AttestationNonce(value_hex=CHALLENGE) if challenged else None
     executor = _make_executor(nvidia_payload=payload)
 
-    async def fake_tdx(executor_, nonce=None):
+    async def fake_tdx(executor_, nonce=None, enforce_tcb=True):
         return "digest", "dstack/tdx"
 
     async def fake_post(payload_, executor_):
@@ -542,7 +540,7 @@ async def test_g1_only_a_passed_verdict_bound_to_the_challenge_claims_gpu_cc(
 
 async def test_g1_gpu_is_not_verified_without_a_tdx_digest(service, monkeypatch):
     # Arrange — the verifier accepted the quote but sent no os_image_hash (no digest); the GPU evidence is garbage
-    async def fake_tdx(executor_, nonce=None):
+    async def fake_tdx(executor_, nonce=None, enforce_tcb=True):
         return None, "dstack/tdx"
 
     monkeypatch.setattr(service, "_verify_tdx", fake_tdx)
@@ -652,7 +650,6 @@ def test_g1_attestation_passed_invariant():
 async def test_g5_ratcheted_executor_omitting_quote_fails_closed(monkeypatch):
     # Arrange — executor previously attested (in the ratchet set), now no quote
     monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
-    monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", True)
     redis = FakeRedis()
     await redis.sadd(TDX_ATTESTED_EXECUTOR_SET, "test-executor")
     service = AttestationService(redis_service=redis)
@@ -663,10 +660,42 @@ async def test_g5_ratcheted_executor_omitting_quote_fails_closed(monkeypatch):
         await service.prepare_host_policy(executor)
 
 
+async def test_g5_ratcheted_executor_omitting_quote_can_be_torn_down_on_its_pinned_key(monkeypatch):
+    # Arrange — stop/delete/key removal must still reach a CVM whose quote collection failed
+    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
+    import asyncssh
+
+    pinned = object()
+    monkeypatch.setattr(asyncssh, "import_known_hosts", lambda value: pinned)
+    redis = FakeRedis()
+    await redis.sadd(TDX_ATTESTED_EXECUTOR_SET, "test-executor")
+    service = AttestationService(redis_service=redis)
+    executor = _make_executor(tdx_quote=None)
+
+    # Act
+    host_policy = await service.prepare_host_policy(executor, teardown=True)
+
+    # Assert — the host key stays pinned and nothing is claimed as attested
+    assert host_policy.known_hosts is pinned
+    assert host_policy.attestation_digest is None
+
+
+async def test_g5_ratcheted_executor_without_a_host_key_fails_closed_even_on_teardown(monkeypatch):
+    # Arrange
+    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
+    redis = FakeRedis()
+    await redis.sadd(TDX_ATTESTED_EXECUTOR_SET, "test-executor")
+    service = AttestationService(redis_service=redis)
+    executor = _make_executor(tdx_quote=None, ssh_host_key=None)
+
+    # Act / Assert — no unpinned SSH
+    with pytest.raises(AttestationError, match="omitted its TDX quote"):
+        await service.prepare_host_policy(executor, teardown=True)
+
+
 async def test_g5_unknown_executor_without_quote_unaffected(monkeypatch):
     # Arrange — bare-metal executor (never attested) stays on the legacy path
     monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
-    monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", True)
     import asyncssh
 
     monkeypatch.setattr(asyncssh, "import_known_hosts", lambda value: object())
@@ -709,7 +738,7 @@ def _score_ctx(tdx_quote, attestation_passed, gpu_attestation_passed=None):
 
 def test_g5_score_gate_zeroes_failed_cvm(monkeypatch):
     # Arrange
-    monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", True)
+    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
 
     # Act
     actual, job, warning = calculate_scores(_score_ctx('{"quote":"00"}', False), rented=False)
@@ -720,37 +749,39 @@ def test_g5_score_gate_zeroes_failed_cvm(monkeypatch):
     assert "CVM attestation not passed" in warning
 
 
-def test_g5_score_gate_passes_attested_cvm_and_bare_metal(monkeypatch):
-    # Arrange
-    monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", True)
+def test_g5_score_gate_needs_the_tdx_verifier(monkeypatch):
+    # Arrange — plain compose: no verifier, so nothing is attested
+    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", None)
 
+    # Act
+    actual, _, warning = calculate_scores(_score_ctx('{"quote":"00"}', False), rented=False)
+
+    # Assert
+    assert actual == 1.0
+    assert "CVM attestation not passed" not in warning
+
+
+def test_g5_score_gate_ignores_a_failed_gpu_verdict_alone(monkeypatch):
+    # Arrange — GPU-CC is observe-only: a bad GPU verdict alone never zeroes the score
+    monkeypatch.setattr(settings, "TDX_VERIFIER_URL", "https://verifier.example/verify")
+
+    # Act
+    actual, _, warning = calculate_scores(
+        _score_ctx('{"quote":"00"}', False, gpu_attestation_passed=False), rented=False
+    )
+
+    # Assert
+    assert actual == 1.0
+    assert "CVM attestation not passed" not in warning
+
+
+def test_g5_score_gate_passes_attested_cvm_and_bare_metal():
     # Act / Assert — attested CVM keeps its score
     actual, _, _ = calculate_scores(_score_ctx('{"quote":"00"}', True), rented=False)
     assert actual == 1.0
 
     # Act / Assert — bare-metal node (no quote) is untouched by the gate
     actual, _, _ = calculate_scores(_score_ctx(None, False), rented=False)
-    assert actual == 1.0
-
-
-def test_g5_score_gate_ignores_an_observe_only_bad_gpu_verdict(monkeypatch):
-    # Arrange — the TDX quote verified, the GPU evidence verified bad: attestation_passed is false
-    monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", True)
-
-    # Act
-    actual, job, warning = calculate_scores(_score_ctx('{"quote":"00"}', False, gpu_attestation_passed=False), rented=False)
-
-    # Assert — GPU attestation is observe-only, so the verdict alone never zeroes the score
-    assert (actual, job) == (1.0, 1.0)
-    assert "CVM attestation not passed" not in warning
-
-
-def test_g5_score_gate_inert_when_enforcement_off(monkeypatch):
-    # Arrange — safe-off default: gate must not fire
-    monkeypatch.setattr(settings, "ENABLE_TCB_ENFORCEMENT", False)
-
-    # Act / Assert
-    actual, _, _ = calculate_scores(_score_ctx('{"quote":"00"}', False), rented=False)
     assert actual == 1.0
 
 

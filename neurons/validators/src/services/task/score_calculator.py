@@ -61,13 +61,17 @@ def calculate_scores(
         )
 
     # Minimal-G5 CVM attestation gate: a CVM-flagged executor (it presented a TDX
-    # quote) whose TDX attestation did not pass earns nothing while TCB enforcement is
-    # on. Non-CVM executors (no quote) are untouched — omitted-quote bypass by a
-    # known CVM is rejected upstream by the attestation ratchet. GPU attestation is
-    # observe-only: tdx_attestation_passed also drops on a verified-bad GPU verdict
-    # (only verified beside a TDX digest, so False implies one), and that alone must not zero the score.
-    tdx_passed = ctx.tdx_attestation_passed or ctx.gpu_attestation_passed is False
-    if settings.ENABLE_TCB_ENFORCEMENT and ctx.executor.tdx_quote and not tdx_passed:
+    # quote) whose TDX attestation did not pass earns nothing. Non-CVM executors (no quote)
+    # are untouched — omitted-quote bypass by a known CVM is rejected upstream by the
+    # attestation ratchet. Only with the TDX verifier configured (otherwise nothing is
+    # attested). GPU attestation is observe-only: tdx_attestation_passed also drops on a
+    # verified-bad GPU verdict, and that alone must not zero the score.
+    if (
+        settings.TDX_VERIFIER_URL
+        and ctx.executor.tdx_quote
+        and not ctx.tdx_attestation_passed
+        and ctx.gpu_attestation_passed is not False
+    ):
         actual_score = 0.0
         job_score = 0.0
         warning_messages.append("CVM attestation not passed (TDX attestation required)")

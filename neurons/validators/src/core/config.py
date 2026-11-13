@@ -747,14 +747,9 @@ class Settings(BaseSettings):
     TDX_VERIFIER_URL: str | None = Field(env="TDX_VERIFIER_URL", default=None)
     ENABLE_ATTESTATION_WHITELIST: bool = Field(env="ENABLE_ATTESTATION_WHITELIST", default=False)
 
-    # G4 — TCB/advisory enforcement (CVM attestation gap remediation).
-    # Off = warn-only telemetry: violations are logged with structured reasons but do
-    # not reject the quote. On = fail closed with AttestationError naming the value.
-    # Also gates the minimal-G5 hooks: fail-closed on an omitted quote from a
-    # previously-attested (CVM-ratcheted) executor, and the CVM score gate.
-    ENABLE_TCB_ENFORCEMENT: bool = Field(env="ENABLE_TCB_ENFORCEMENT", default=False)
-    # Comma-separated allowlists. TCB statuses other than these reject (when enforced);
-    # advisory IDs (e.g. INTEL-SA-XXXXX) not listed here reject (when enforced).
+    # G4 — TCB/advisory enforcement is always on (fail closed). Comma-separated
+    # allowlists: TCB statuses other than these reject; advisory IDs
+    # (e.g. INTEL-SA-XXXXX) not listed here reject.
     TDX_ALLOWED_TCB_STATUSES: str = Field(env="TDX_ALLOWED_TCB_STATUSES", default="UpToDate")
     TDX_ALLOWED_ADVISORY_IDS: str = Field(env="TDX_ALLOWED_ADVISORY_IDS", default="")
 
