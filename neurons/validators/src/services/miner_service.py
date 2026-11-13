@@ -1570,6 +1570,7 @@ class MinerService:
             await self._report_storage_dispatch_failure(payload, result)
             return result
         with inflight_creates.track(payload.pod_id), customer_creates.track(payload):
+            await customer_creates.wait_for_prunes(payload)
             return await self._route_container(payload)
 
     async def _report_storage_dispatch_failure(self, payload: ContainerBaseRequest, result: object) -> None:

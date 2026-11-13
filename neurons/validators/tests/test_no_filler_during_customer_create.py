@@ -5,7 +5,10 @@ lapsed and the sweep already ran, the filler would run beside the renter.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+
+import pytest
 
 from payload_models.payloads import (
     WorkloadKind,
@@ -44,3 +47,27 @@ def test_filler_is_refused_by_a_customer_create_ending_after_its_start_not_by_ol
     assert refused_after_older_customer_creates is False
     assert refused_beside_a_retry_of_its_pod is True
     assert id(filler) not in customer_creates._ended_seen_by_filler_create
+
+
+@pytest.mark.asyncio
+async def test_customer_create_registered_during_an_in_flight_prune_waits_for_it() -> None:
+    customer = _payload()
+    pruning = contextlib.ExitStack()
+    may_prune = pruning.enter_context(
+        customer_creates.prune_unless_customer_create(customer.miner_hotkey, customer.executor_id)
+    )
+
+    with customer_creates.track(customer):
+        waiting = asyncio.ensure_future(customer_creates.wait_for_prunes(customer, poll_s=0.01))
+        await asyncio.sleep(0.05)
+        waited_while_pruning = not waiting.done()
+        pruning.close()
+        await asyncio.wait_for(waiting, 1)
+        with customer_creates.prune_unless_customer_create(
+            customer.miner_hotkey, customer.executor_id
+        ) as prune_beside_customer:
+            pass
+
+    assert may_prune
+    assert waited_while_pruning
+    assert not prune_beside_customer

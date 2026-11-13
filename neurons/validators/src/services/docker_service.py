@@ -2515,6 +2515,8 @@ class _CustomerCreateRegistry:
         # a customer request that failed before create_container (the miner left the executor out) touched
         # no host: it ends as no create, so a filler that started before it is not refused
         self._customer_create_reached_create_container: dict[int, bool] = {}
+        # image prunes a delete has started per executor; a customer create waits them out before it pulls
+        self._prunes_by_executor: Counter[tuple[str, str]] = Counter()
         self._lock = threading.Lock()
 
     @contextlib.contextmanager
@@ -2553,6 +2555,45 @@ class _CustomerCreateRegistry:
     def is_running(self, miner_hotkey: str, executor_id: str) -> bool:
         with self._lock:
             return (miner_hotkey, executor_id) in self._running_by_executor
+
+    @contextlib.contextmanager
+    def prune_unless_customer_create(self, miner_hotkey: str, executor_id: str) -> Iterator[bool]:
+        """Yield True and count a prune on the executor unless a customer create runs there (False).
+
+        Checked and counted under the lock track() takes, so either the prune sees the create and skips,
+        or the create sees the prune and waits it out (wait_for_prunes) before it touches images.
+        """
+        executor = (miner_hotkey, executor_id)
+        with self._lock:
+            allowed = executor not in self._running_by_executor
+            if allowed:
+                self._prunes_by_executor[executor] += 1
+        try:
+            yield allowed
+        finally:
+            if allowed:
+                with self._lock:
+                    self._prunes_by_executor[executor] -= 1
+                    if self._prunes_by_executor[executor] <= 0:
+                        del self._prunes_by_executor[executor]
+
+    async def wait_for_prunes(
+        self, payload: ContainerCreateRequest, timeout_s: float = 300, poll_s: float = 0.2
+    ) -> None:
+        """A customer create waits until no image prune started before it runs on its executor."""
+        if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL:
+            return
+        executor = (payload.miner_hotkey, payload.executor_id)
+        deadline = time.monotonic() + timeout_s
+        while True:
+            with self._lock:
+                if executor not in self._prunes_by_executor:
+                    return
+            if time.monotonic() >= deadline:
+                # a prune stuck on a dead SSH channel or daemon must not hold the renter's create forever
+                logger.warning(f"Customer create on executor {payload.executor_id} proceeds beside a stuck image prune")
+                return
+            await asyncio.sleep(poll_s)
 
     def others_running(self, payload: ContainerCreateRequest) -> bool:
         """Another customer create than `payload`'s runs on its executor now."""
@@ -14042,15 +14083,18 @@ class DockerService:
 
                 # a prune during a customer create's pull on this host drops the pull's containerd lease
                 # ("commit failed: lease does not exist"), failing the renter's create; the next delete prunes
-                if customer_creates.is_running(payload.miner_hotkey, payload.executor_id):
-                    log.info("Image prune skipped: a customer create is running on this executor")
-                else:
-                    with _best_effort_delete_step(log, "prune_images"):
-                        await run_logged_rental_docker_sdk_operation(
-                            operation="prune_images",
-                            log_extra=default_extra,
-                            call=docker_client.prune_images,
-                        )
+                with customer_creates.prune_unless_customer_create(
+                    payload.miner_hotkey, payload.executor_id
+                ) as may_prune:
+                    if not may_prune:
+                        log.info("Image prune skipped: a customer create is running on this executor")
+                    else:
+                        with _best_effort_delete_step(log, "prune_images"):
+                            await run_logged_rental_docker_sdk_operation(
+                                operation="prune_images",
+                                log_extra=default_extra,
+                                call=docker_client.prune_images,
+                            )
 
                 # DAH-3467: after a removal confirmed by inspect, a volume dockerd still holds is
                 # retried before the step gives it up; every volume failure stays best-effort. A
