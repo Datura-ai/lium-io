@@ -512,6 +512,7 @@ async def test_repeated_partial_reads_keep_failing_the_create_until_a_real_readi
         ("not_stuck", GpuPowerCapResult.HOST_REFUSED),
         ("unreadable", GpuPowerCapResult.HOST_REFUSED),
         ("garbled", GpuPowerCapResult.HOST_REFUSED),
+        ("unreadable_once", GpuPowerCapResult.APPLIED),
         ("timeout", GpuPowerCapResult.FAILED),
         ("refused_session", GpuPowerCapResult.FAILED),
         ("readback_timeout", GpuPowerCapResult.FAILED),
@@ -519,8 +520,10 @@ async def test_repeated_partial_reads_keep_failing_the_create_until_a_real_readi
         ("redis", GpuPowerCapResult.FAILED),
     ],
 )
-async def test_apply_tells_a_host_refusal_from_our_own_error(failure, expected):
+async def test_apply_tells_a_host_refusal_from_our_own_error(failure, expected, monkeypatch):
     # Arrange: one GPU to cap at 200 W; the host's -pl fails or does not stick, or our SSH or Redis fails.
+    monkeypatch.setattr(gpl, "POWER_LIMIT_READBACK_RETRY_SECONDS", 0)
+    readbacks = []
     redis = FakeRedis()
     if failure == "redis":
         redis.set = AsyncMock(side_effect=ConnectionError("redis down"))
@@ -539,7 +542,9 @@ async def test_apply_tells_a_host_refusal_from_our_own_error(failure, expected):
                 raise TimeoutError("hung")
             if failure == "readback_refused_session":
                 raise asyncssh.ChannelOpenError(asyncssh.OPEN_CONNECT_FAILED, "refused")
-            if failure == "unreadable":
+            readbacks.append(command)
+            # a one-off nvidia-smi glitch: the retry reads the target, so the cap counts as applied
+            if failure == "unreadable" or (failure == "unreadable_once" and len(readbacks) == 1):
                 return FakeRun(exit_status=9)
             if failure == "garbled":
                 return FakeRun(stdout="[N/A], [N/A]\n")
