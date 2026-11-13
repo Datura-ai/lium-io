@@ -237,6 +237,7 @@ class _Harness:
             miner_service.in_flight = {}
             miner_service.miners_awaiting_wave_list = {}
             miner_service.express_queued = frozenset()
+            miner_service.express_published = {}
         self.miner_service = miner_service
         self.miner_service.publish_machine_specs = AsyncMock()
         # A self-hosted miner that does not answer its executor list (the portal-snapshot cases).
@@ -324,6 +325,19 @@ async def test_a_never_validated_executor_is_verified_alone_and_published_spec_o
     assert extra["executor_uuid"] == new_node and extra["outcome"] == "passed" and extra["attempt"] == 1
     assert 40 <= extra["registration_to_publish_s"] < 60
     assert extra["first_seen_to_publish_s"] >= 0 and extra["verification_s"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_a_published_express_result_is_recorded_under_the_cycles_job_batch_id(monkeypatch, wallet):
+    """A rented node, 13 Nov: the lane published its pass under the cycle's id, the cycle had no result
+    of its own for it and published an observations-only EXECUTOR_RESULT_MISSING under the same id 2.5 min
+    later, which billing read as the host down. The cycle reads this record into its reported set."""
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node.upper())]}, [_Neuron("miner-a")])
+
+    assert await harness.tick_and_settle() == 1
+
+    assert harness.miner_service.express_published == {new_node: harness.inputs.job_batch_id}
 
 
 @pytest.mark.asyncio

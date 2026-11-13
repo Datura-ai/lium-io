@@ -614,7 +614,7 @@ class ExpressLane:
             for result in results:
                 # published under the cycle's id; the backend reads this against a maintenance window's end
                 result.check_started_at = check_started_at
-            await self._publish(pending, miner, results, extra, started)
+            await self._publish(pending, miner, results, extra, started, payload.job_batch_id)
         except Exception as exc:
             pending.attempts = attempt
             logger.error(
@@ -645,6 +645,7 @@ class ExpressLane:
         results: list[JobResult],
         extra: dict[str, object],
         started: float,
+        job_batch_id: str,
     ) -> None:
         """Publish the executor's own result spec-only, record it as validated, log the metric.
 
@@ -662,6 +663,7 @@ class ExpressLane:
                 await self.miner_service.publish_machine_specs(
                     results, miner.hotkey, miner.coldkey, is_whole_miner_batch=False
                 )
+                self.miner_service.express_published[executor_id.lower()] = job_batch_id
             pending.attempts -= 1  # _verify counted this run
             pending.lost_sessions += 1
             if pending.requested:
@@ -683,6 +685,7 @@ class ExpressLane:
         await self.miner_service.publish_machine_specs(
             results, miner.hotkey, miner.coldkey, is_whole_miner_batch=False, remember_availability=True
         )
+        self.miner_service.express_published[executor_id.lower()] = job_batch_id
         pending.recheck_deadline = None
         if not should_run_first_pass_again:
             # A failed first pass that runs again keeps the request: the next tick selects it.
