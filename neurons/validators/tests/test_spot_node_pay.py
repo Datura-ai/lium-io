@@ -1659,3 +1659,21 @@ async def test_secure_uses_an_average_taken_over_24_gpu_hours(context_factory):
 
     assert secure.filler_revenue_per_gpu_hour == 2.0
 
+
+def test_the_spot_line_names_the_pay_factor_the_pool_multiplier_uses() -> None:
+    # lio#2231 r4560801130: the text providers redo the sum with must say 0.9x, not 1x, of the filler earnings
+    class _Result(SimpleNamespace):
+        def __getattr__(self, name: str) -> None:  # the fields this test does not read
+            return None
+
+    result = _Result(executor_info=SimpleNamespace(uuid="ex-1"))
+    line = MinerLogLine.spot_pay_incentive_calculated(
+        hotkey="hk",
+        result=result,
+        secure_rate=1.0,
+        filler_rate=2.0,
+        paid_fraction=1.0,
+        pay_factor=SPOT_FACTOR,
+    )
+
+    assert "paid more than 0.9 x what its fillers earn per hour" in line.message
