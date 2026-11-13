@@ -259,7 +259,9 @@ def flatten_wait_command(with_trash: bool = False) -> str:
     # under the trash lock that `rm` takes per file, so df and du see the same deletes. The lock is required: an
     # unlocked read can miss a byte freed in between and shrink the volume, so no lock in time stops the create
     trash_lock = (
-        f'{{ : >>{trash}.lock 2>/dev/null && exec 7>>{trash}.lock && flock -w 60 7; }} || exit 1; ' if with_trash else ""
+        f"{{ : >>{trash}.lock 2>/dev/null && exec 7>>{trash}.lock && flock -w 60 7; }} || exit 1; "
+        if with_trash
+        else ""
     )
     # under the lock a copy holds for its whole run: no copy is half-written while df measures, and a
     # flatten that has not started copying refuses once it sees the mark (nothing to print without flock)
