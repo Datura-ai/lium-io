@@ -2823,6 +2823,18 @@ class RentedPodResourcesMessages:
             "cores in both its cpuset and its CPU quota; remove the script or loosen it to that."
         ),
     )
+    PROC_FUSE_DISCONNECTED = MessageTemplate(
+        event="A rented pod's /proc is disconnected on the host",
+        reason="RENTED_POD_PROC_FUSE_DISCONNECTED",
+        severity="warning",
+        category="runtime",
+        impact="Proceed without penalty; the renter's pod cannot read /proc/sys",
+        remediation=(
+            "The FUSE service behind the container's /proc (sysbox-fs) stopped or restarted, so the running "
+            "pod answers 'Transport endpoint is not connected'. Check `systemctl status sysbox`, restart it if "
+            "needed, then restart the pod container; tell the renter first."
+        ),
+    )
     RESOURCES_UNKNOWN = MessageTemplate(
         event="Rented pod CPU resources could not be read",
         reason="RENTED_POD_RESOURCES_UNKNOWN",
