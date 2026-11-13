@@ -6391,6 +6391,42 @@ async def test_resolve_volume_sizing_fresh_pool_bound(docker_service):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stderr", "path", "existing_gb"),
+    [
+        ("Error response from daemon: get volume_gone: no such volume\n", "fresh", 300),
+        ("Cannot connect to the Docker daemon\n", "fresh_fallback", None),
+    ],
+)
+async def test_resolve_volume_sizing_skips_a_volume_removed_before_the_inspect(
+    docker_service, stderr, path, existing_gb
+):
+    # The renter deleted one pod while creating the next: the listed volume_gone is gone by the inspect.
+    # Only that error sizes from the volumes still there; any other inspect error still falls back.
+    payload = _make_sizing_payload(disk_share=0.5, storage_limit_gb=1, volume_limit_gb=447)
+    ssh_client = _make_sizing_ssh_client(
+        df_avail_bytes=900 * _SIZING_GB,
+        volume_ls_stdout="volume_gone vloopback:latest\nvolume_kept vloopback:latest\n",
+    )
+    run = ssh_client.run.side_effect
+
+    def inspect(command, **kwargs):
+        if "volume inspect" not in command:
+            return run(command, **kwargs)
+        if "volume_gone" in command:
+            return Mock(stdout="", stderr=stderr, exit_status=1)
+        return Mock(stdout=f"{300 * _SIZING_GB}|<no value>\n", stderr="", exit_status=0)
+
+    ssh_client.run = AsyncMock(side_effect=inspect)
+
+    result = await docker_service.resolve_volume_sizing(ssh_client, payload, "tag", {})
+
+    assert result.path == path
+    if existing_gb is not None:
+        assert result.existing_volumes_bytes == existing_gb * _SIZING_GB
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("with_probe", [True, False])
 async def test_resolve_volume_sizing_takes_the_free_disk_measured_under_the_flatten_lock(docker_service, with_probe):
     # an earlier probe (or a df outside the lock) may predate an image copy; the locked measure wins

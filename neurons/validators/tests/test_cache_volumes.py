@@ -6,7 +6,13 @@ import pytest
 
 from payload_models.payloads import CacheVolume, ContainerCreateRequest, WorkloadKind
 from services.container_cleanup import idle_filler_images_removal_command
-from services.docker_service import DockerService, _filler_run_volume_gb, _wipe_volume_cmd
+from services.docker_service import (
+    DockerService,
+    RentalDiskFit,
+    _clamp_rental_volume_to_free_disk,
+    _filler_run_volume_gb,
+    _wipe_volume_cmd,
+)
 
 
 @pytest.fixture
@@ -433,15 +439,21 @@ class KilledFillerHostSshClient(HostSshClient):
     """prod 4 Nov, 8x B300: the filler the create killed is still exiting and mounts kimi-k3, so `volume rm` fails.
     The wipe unlinks the files (disk freed) only when every user is in its allowed list; the volume stays listed."""
 
-    def __init__(self, users: list[str], **kwargs):
+    def __init__(self, users: list[str], freed_gb: float = 1561, held: bool = False, **kwargs):
         super().__init__([_KIMI, "volume_pod"], **kwargs)
         self.users = users
+        self.freed_gb = freed_gb
+        self.held = held  # the exiting filler still runs and holds the unlinked files open: no block is freed yet
 
     async def run(self, command: str, *args, **kwargs):
         if "volume rm" in command and "/proc/1/root" in command:
             allowed = command.split("ok=' ", 1)[1].split(" '", 1)[0].split()
             if all(user in allowed for user in self.users):
-                self._free_bytes += 1561 * 1024**3
+                self.commands.append(command)
+                if self.held:
+                    return SimpleNamespace(exit_status=0, stdout="wiped /x\n", stderr="")
+                self._free_bytes += int(self.freed_gb * 1024**3)
+                return SimpleNamespace(exit_status=0, stdout=f"wiped /x\ncache emptied: {_KIMI}\n", stderr="")
         return await super().run(command, *args, **kwargs)
 
 
@@ -467,6 +479,80 @@ async def test_a_cache_a_live_filler_mounts_is_not_wiped_and_the_order_clamps(do
         ssh_client, rental, {}, killed_fillers=killed_fillers
     ) is True
     assert rental.volume_limit_gb == 2389
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("users", "held", "volume_gb"),
+    [
+        (["filler_79ba7fa2"], False, 1250),
+        (["filler_79ba7fa2", "filler_live"], False, 290),
+        # lio#2219 review: unlinked but still held open by the exiting filler, so df did not move: a failed removal
+        (["filler_79ba7fa2"], True, 290),
+    ],
+)
+async def test_a_cache_the_wipe_emptied_is_no_failed_removal_when_kept_volumes_leave_the_rent_short(
+    docker_service, monkeypatch, users, held, volume_gb
+):
+    # lio#2219 review: the wipe frees the cache's bytes but its empty volume stays listed. The kept volumes leave the
+    # whole-node rent short either way, so the order stays as placed; only a wipe refused (live filler) clamps it.
+    monkeypatch.setattr(docker_service, "_get_existing_vloopback_bytes", AsyncMock(return_value=1264 * 10**9))
+    rental = _rental(1250, 625)
+    rental.disk_share = 1.0
+    ssh_client = KilledFillerHostSshClient(users, freed_gb=355, free_gb=300, held=held)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(
+        ssh_client, rental, {}, killed_fillers=["filler_79ba7fa2"]
+    ) is True
+    assert rental.volume_limit_gb == volume_gb
+
+
+@pytest.mark.asyncio
+async def test_the_emptied_mark_waits_for_every_running_holder_to_exit(docker_service):
+    ssh_client = KilledFillerHostSshClient(["filler_79ba7fa2"], free_gb=2389)
+
+    await docker_service.reclaim_dphn_cache_for_rental(
+        ssh_client, _rental(2620, 1310), {}, killed_fillers=["filler_79ba7fa2"]
+    )
+
+    wipe = next(command for command in ssh_client.commands if "/proc/1/root" in command)
+    assert wipe.index(f"docker ps -q --filter volume={_KIMI}") < wipe.index("echo 'cache emptied: ")
+    # lio#2219 review: a failed `docker ps` also prints nothing, so the mark needs its exit status
+    assert f'holders=$(/usr/bin/docker ps -q --filter volume={_KIMI}) && [ -z "$holders" ] && ' in wipe
+
+
+@pytest.mark.asyncio
+async def test_the_clamp_uses_the_reading_that_found_the_rent_short(docker_service, monkeypatch):
+    # lio#2219 review: disk moving between the short check and the clamp must not resize the order on a second read
+    class ShrinkingHost(KilledFillerHostSshClient):
+        async def run(self, command: str, *args, **kwargs):
+            # the still-listed check runs after the wipe, between the short check and the clamp
+            if "volume ls" in command and any("/proc/1/root" in c for c in self.commands):
+                self._free_bytes -= 100 * 1024**3
+            return await super().run(command, *args, **kwargs)
+
+    monkeypatch.setattr(docker_service, "_get_existing_vloopback_bytes", AsyncMock(return_value=1264 * 10**9))
+    rental = _rental(1250, 625)
+    rental.disk_share = 1.0
+    ssh_client = ShrinkingHost(["filler_79ba7fa2"], freed_gb=355, free_gb=300, held=True)
+
+    await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}, killed_fillers=["filler_79ba7fa2"])
+
+    assert rental.volume_limit_gb == 290
+
+
+@pytest.mark.parametrize(
+    ("free_now_gb", "volume_gb"),
+    # the fit's own reading: plain df, or df plus pending trash once deferred deletion counts it (lio#2227)
+    [(1000, 990), (1300, 1250)],
+)
+def test_the_clamp_sizes_on_the_same_free_disk_the_fit_read(free_now_gb, volume_gb):
+    rental = _rental(1250, 625)
+    fit = RentalDiskFit(own_gb=1250, existing_gb=0, disk_share=1.0, fresh_sizing=True, needs_free_gb=1300)
+
+    _clamp_rental_volume_to_free_disk(rental, fit, free_now_gb)
+
+    assert rental.volume_limit_gb == volume_gb
 
 
 def test_the_wipe_refuses_a_volume_another_container_mounts():
@@ -591,6 +677,24 @@ async def test_a_timed_out_removal_still_clamps_the_rental_to_the_free_disk(dock
         docker_service.reclaim_dphn_cache_for_rental(HangingRemoval([_KIMI, "volume_pod"], free_gb=300), rental, {}), 5
     )
     assert rental.volume_limit_gb == 300
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("free_gb", "clamped_gb"), [(1300, 1250), (655, 645)])
+async def test_a_failed_removal_clamps_a_whole_node_order_to_df_free_and_never_above_it(
+    docker_service, monkeypatch, free_gb, clamped_gb
+):
+    # prod 12 Nov, 8x 5090: two stopped pods keep 1264 GB of volumes, the cache removal frees nothing. Counting those
+    # volumes raised the 1250 GB order to 1812; dropping that alone left it unclamped, so the fresh sizing's 645 GB
+    # went through short (lio#2219 review). The clamp follows df free less headroom, never above the order.
+    monkeypatch.setattr(docker_service, "_get_existing_vloopback_bytes", AsyncMock(return_value=1264 * 10**9))
+    rental = _rental(1250, 625)
+    rental.disk_share = 1.0
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(
+        HostSshClient([_KIMI, "volume_pod"], free_gb=free_gb), rental, {}
+    ) is True
+    assert rental.volume_limit_gb == clamped_gb
 
 
 @pytest.mark.asyncio

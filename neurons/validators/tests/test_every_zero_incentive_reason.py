@@ -68,13 +68,8 @@ def _codes(result: JobResult) -> list[str]:
     return [reason.reason for reason in result.zero_incentive_reasons]
 
 
-@pytest.fixture
-def discord_cutoff_passed(monkeypatch):
-    monkeypatch.setattr(settings, "DISCORD_INCENTIVE_CUTOFF", datetime(2020, 1, 1))
-
-
 @pytest.mark.asyncio
-async def test_full_8x_gate_is_recorded_even_when_discord_blocks(monkeypatch, discord_cutoff_passed):
+async def test_full_8x_gate_is_recorded_even_when_discord_blocks(monkeypatch):
 
     result = await _incentive().calculate_executor_score(_idle_full_8x(provider_discord_connected=False))
 
@@ -86,7 +81,7 @@ async def test_full_8x_gate_is_recorded_even_when_discord_blocks(monkeypatch, di
 
 @pytest.mark.asyncio
 async def test_every_hard_exclusion_and_every_enforced_gate_is_recorded_in_order(
-    monkeypatch, discord_cutoff_passed
+    monkeypatch
 ):
     new_cfg = shared_client.config.model_copy(update={"machine_prices_p90": {H200: 0.5}})
     monkeypatch.setattr(shared_client, "_config", new_cfg)
@@ -144,7 +139,7 @@ GATE_LOG_CASES = [
 @pytest.mark.parametrize("enforced", [False, True], ids=["shadow", "enforced"])
 @pytest.mark.parametrize(("flag", "node", "reason", "log_reason"), GATE_LOG_CASES, ids=lambda v: v if isinstance(v, str) else None)
 async def test_a_gate_logs_only_while_the_node_is_still_eligible(
-    monkeypatch, caplog, discord_cutoff_passed, enforced, flag, node, reason, log_reason
+    monkeypatch, caplog, enforced, flag, node, reason, log_reason
 ):
     # the gate lines count eligible nodes only, as before every reason was recorded; an enforced
     # gate still records its reason on the blocked node
@@ -170,9 +165,8 @@ async def test_a_gate_logs_only_while_the_node_is_still_eligible(
 
 @pytest.mark.asyncio
 async def test_driver_and_sysbox_are_recorded_on_a_node_blocked_before_pricing(
-    monkeypatch, discord_cutoff_passed
+    monkeypatch
 ):
-    monkeypatch.setattr(settings, "MIN_DRIVER_CUTOFF", datetime(2020, 1, 1))
     monkeypatch.setattr(settings, "PORTION_FOR_SYSBOX_UNRENTED", 1)
 
     result = await _incentive().calculate_executor_score(

@@ -2647,3 +2647,57 @@ async def test_tenant_enforcement_asks_again_until_a_running_pod_answers_its_pla
 
     assert backend.called_with == ["pod-1", "pod-1"]
     assert redis.store["plaintext_volume_path:pod-1"] == ""
+
+
+class _StatusBackend(DummyBackendClient):
+    """Answers every pod's rental as open (`active=True`) with that pod's own status."""
+
+    def __init__(self, statuses: dict[str, str]):
+        super().__init__()
+        self.statuses = statuses
+
+    async def get_pod_rental_active(self, pod_id: str):
+        self.called_with.append(pod_id)
+        return Mock(active=True, rental_closed_at=None, local_volume_path=None, status=self.statuses[pod_id])
+
+
+def _status_ctx(context_factory, statuses: dict[str, str], running: set[str]):
+    pods = [RentedPod(pod_id=pod_id, container_name=f"tenant-{pod_id}", rented_ports=[], gpu_count=1) for pod_id in statuses]
+    rented_data = RentedExecutorsResponse(
+        executors={
+            "executor-123": RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="22",
+                pods=pods,
+                owner_flag=False,
+            )
+        },
+        banned_guids=[],
+    )
+    ctx = _unknown_rental_ctx(context_factory, _StatusBackend(statuses), FakeRedis())
+    state = replace(ctx.state, rented_data=rented_data, gpu_processes=[], gpu_details=[])
+    return ctx.model_copy(update={"state": state, "ssh": _StatesSSH({f"tenant-{p}" for p in running})})
+
+
+@pytest.mark.parametrize(
+    "statuses,running,expected_pass,expected_reason",
+    [
+        # DAH-6340: a balance stop removes the container and leaves the pod STOPPED with its rental open
+        ({"a": "STOPPED"}, set(), True, Msg.STALE_POD_NOT_RUNNING.reason),
+        ({"a": "STOPPED", "b": "RUNNING"}, {"b"}, True, Msg.ALREADY_RENTED.reason),
+        ({"a": "RUNNING", "b": "STOPPED"}, {"a"}, True, Msg.ALREADY_RENTED.reason),
+        ({"a": "STOPPED", "b": "STOPPED"}, set(), True, Msg.STALE_POD_NOT_RUNNING.reason),
+        # a container that really died under a RUNNING pod still fails the node
+        ({"a": "RUNNING"}, set(), False, Msg.POD_NOT_RUNNING.reason),
+        ({"a": "STOPPED", "b": "RUNNING"}, set(), False, Msg.POD_NOT_RUNNING.reason),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_pod_stopped_for_the_renters_balance_is_not_a_node_fault(
+    context_factory, statuses, running, expected_pass, expected_reason
+):
+    result = await TenantEnforcementCheck().run(_status_ctx(context_factory, statuses, running))
+
+    assert result.passed is expected_pass
+    assert result.event.reason_code == expected_reason
