@@ -340,6 +340,42 @@ async def test_a_split_node_needing_every_port_starts_its_host_listener_after_th
 
 
 @pytest.mark.asyncio
+async def test_a_refused_host_port_is_re_probed_while_the_missed_ports_listener_still_starts(mocker):
+    # a loaded host binds late: the refused port's re-probe must not wait for the missed port's `docker run`
+    tries = []
+    reprobed = asyncio.Event()
+
+    async def reached(host, sample, token):
+        return sample[:2]
+
+    def answer(tested):
+        tries.append(tested)
+        if tested == TEN[2:3] and tries.count(TEN[2:3]) == 1:
+            return [], tested  # the validator's own first try misses the third sampled port too
+        if TEN[3] not in tested:
+            return tested, []
+        if sum(TEN[3] in t for t in tries) == 1:
+            return [], tested  # no host listener bound yet
+        reprobed.set()
+        return tested, []
+
+    verifier, runner = _parallel_verifier(mocker, reached, answer=answer)
+    verifier.REPROBE_DELAY_SEC = 0
+
+    async def docker_run(_ssh, name, *_args):
+        if name.endswith("_s"):
+            await asyncio.wait_for(reprobed.wait(), 1)  # starts only once the refused port was re-probed
+        return ContainerStartResult(ok=True, container_id="c", status="Up")
+
+    runner.run.side_effect = docker_run
+
+    result = await verifier.verify(TEN, ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert result.successful == TEN
+    assert runner.run.await_count == 3  # one attempt: outside, host and missed-port starts, none timed out
+
+
+@pytest.mark.asyncio
 async def test_the_ready_host_ports_are_probed_while_the_missed_ports_listener_still_starts(mocker):
     # a slow start of the missed sampled port's listener must not spend the deadline the ready ports need
     rest_probed = asyncio.Event()

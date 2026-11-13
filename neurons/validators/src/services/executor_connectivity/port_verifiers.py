@@ -245,12 +245,18 @@ class BatchVerifier:
                 )
             )
             async with aiohttp.ClientSession(connector=public_host_connector(limit=0)) as session:
+                missed_pending = missed_start is not None
+
+                def missed_ready() -> list[PortPair]:
+                    # never wait on the missed ports' start: the refused ports' re-probes run on schedule
+                    nonlocal missed_pending
+                    if not missed_pending or not missed_start.done():
+                        return []
+                    missed_pending = False
+                    return missed if missed_start.result().ok else []
+
                 successful, failed = await self.port_tester.test_many(session, host, ports_left, token, log_ctx)
                 start_watch.verified = ports_answered_so_far() if successful else None
-                if missed_start is not None and (await missed_start).ok:
-                    late, still = await self.port_tester.test_many(session, host, missed, token, log_ctx)
-                    successful, failed = successful + late, failed + still
-                    start_watch.verified = ports_answered_so_far() if successful else None
                 # a loaded host binds its nc listeners late; a refused port's listener is still waiting, so
                 # re-probe the refused ports while the count is below what PortCountCheck needs to list the node;
                 # the published sample alone never ends it: with no host-listener answer the attempt fails below
@@ -259,12 +265,21 @@ class BatchVerifier:
                     if not failed or (successful and len(sampled_ok) + len(successful) >= min_ports):
                         break
                     await asyncio.sleep(self.REPROBE_DELAY_SEC)
-                    late, failed = await self.port_tester.test_many(session, host, failed, token, log_ctx)
+                    late, failed = await self.port_tester.test_many(
+                        session, host, failed + missed_ready(), token, log_ctx
+                    )
                     successful = successful + late
                     start_watch.verified = ports_answered_so_far() if successful else None
                     logger.debug(
                         _m(f"re-probe {round_no}/{rounds}: {len(late)} late", extra=get_extra_info(log_ctx))
                     )
+                if missed_pending:
+                    # the re-probes are done, so nothing waits behind the missed ports' start now
+                    await asyncio.wait([missed_start])
+                if ready := missed_ready():
+                    late, still = await self.port_tester.test_many(session, host, ready, token, log_ctx)
+                    successful, failed = successful + late, failed + still
+                    start_watch.verified = ports_answered_so_far() if successful else None
                 logger.info(
                     _m(f"progress: {len(successful)}/{len(ports)} verified", extra=get_extra_info(log_ctx))
                 )
