@@ -1074,6 +1074,14 @@ async def test_a_backend_answer_slower_than_the_redis_timeout_still_excuses(monk
     assert keys == {storage_helper_key(OPERATION)}
 
 
+def test_the_helper_record_timeout_outlasts_the_redis_pool_wait():
+    from neurons.validators.src.services.redis_service import REDIS_POOL_WAIT_TIMEOUT_SECONDS
+
+    # a wave queues on the pool by design; a shorter cut fails every node's read in the wave
+    timeout = storage_operations._STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC
+    assert timeout >= REDIS_POOL_WAIT_TIMEOUT_SECONDS
+
+
 def test_a_helper_record_round_trips():
     assert StorageHelperRecord.parse(StorageHelperRecord(str(OPERATION), 5).format()) == (
         StorageHelperRecord(str(OPERATION), 5)

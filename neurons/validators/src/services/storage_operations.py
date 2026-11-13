@@ -36,7 +36,9 @@ STORAGE_HELPER_KEY_MARK = "helper:"
 # the backend fails a backup still open after 4 h (BACKUP_AUTH_TOKEN_EXPIRY_HOURS): no helper
 # legitimately outlives that, so no record does either
 STARTED_STORAGE_HELPERS_TTL_SECONDS = 4 * 3600
-_STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC = 2
+# a wave's burst queues on the bounded pool up to REDIS_POOL_WAIT_TIMEOUT_SECONDS (60 s) by
+# design: 2 s here cut nearly every node's read in a wave, so a running helper went unexcused
+_STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC = 60
 
 
 def storage_helper_name(operation_id: UUID | str) -> str:
@@ -77,7 +79,7 @@ async def _redis_call(what: str, call: Callable[[], Awaitable[None]]) -> bool:
         await asyncio.wait_for(call(), timeout=_STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC)
         return True
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Storage helper records: %s failed: %s", what, exc)
+        logger.warning("Storage helper records: %s failed: %r", what, exc)
         return False
 
 
