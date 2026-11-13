@@ -343,7 +343,11 @@ DPHN_CACHE_VOLUME_PREFIX = "dphn_cache_"
 # DAH-2805: only the download-temporary sweep looks at the ENGY cache — reclaiming a whole ENGY
 # volume is a separate decision nobody has made, so the DPHN-only paths keep using their own prefix.
 ENGY_CACHE_VOLUME_PREFIX = "engy_cache_"
-FILLER_CACHE_VOLUME_PREFIXES = (DPHN_CACHE_VOLUME_PREFIX, ENGY_CACHE_VOLUME_PREFIX)
+# A provider's own Custom Docker job keeps one cache volume across launches (job_cache_<N>gb_<job>). Its size in
+# the name is the provider's limit: an existing one over it is emptied at the next launch. Like the Lium caches it
+# is created only when the node can afford it, swept when the job asks for another, and evicted for a rental.
+JOB_CACHE_VOLUME_PREFIX = "job_cache_"
+FILLER_CACHE_VOLUME_PREFIXES = (DPHN_CACHE_VOLUME_PREFIX, ENGY_CACHE_VOLUME_PREFIX, JOB_CACHE_VOLUME_PREFIX)
 # DAH-2475: what one node's DPHN cache costs on disk, and how much room the node must keep free after
 # downloading it. The floor mirrors the backend's EXECUTORS_FILTER_MIN_GB — below it the node drops out
 # of the rental listing, where neither renters nor fillers can reach it — and the margin is headroom

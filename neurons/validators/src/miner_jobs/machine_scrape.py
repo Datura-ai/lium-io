@@ -686,6 +686,8 @@ VLOOPBACK_HOST_DATA_DIR_NAMES = ("vloopback-v2", "vloopback-v3")
 # DAH-5045: the Engy checkpoint cache, reported for its download progress. DAH-5260: unlike the Dolphin cache
 # it reads as free disk, since a customer create removes it when the renter needs the space.
 ENGY_CACHE_VOLUME_PREFIX = "engy_cache_"
+# a provider's own Custom Docker job cache reads as free disk for the same reason: a rental removes it
+JOB_CACHE_VOLUME_PREFIX = "job_cache_"
 # the label a filler create puts on its own run volume (services/rental_docker_sdk.py FILLER_VOLUME_LABELS)
 FILLER_VOLUME_LABEL_KEY = "io.lium.workload"
 FILLER_VOLUME_LABEL_VALUE = "filler"
@@ -903,7 +905,8 @@ def get_docker_disk_usage():
         if volume.get("Name")
     }
     volumes += get_vloopback_volume_bytes(docker_root_dir, False, by_volume) - filler_run_volumes
-    volumes -= engy_cache
+    job_cache = cache_volume_bytes(df, JOB_CACHE_VOLUME_PREFIX)
+    volumes -= engy_cache + job_cache
     volumes += get_dmcrypt_volume_bytes(docker_root_dir, by_volume)
     containers += get_container_log_bytes(docker_root_dir)
 
@@ -931,7 +934,7 @@ def get_docker_disk_usage():
         "hard_disk_images": (int(df.get("LayersSize") or 0) + build_cache) // 1024,
         "hard_disk_containers": containers // 1024,
         "hard_disk_volumes": volumes // 1024,
-        "filler_released_kb": (filler_run_volumes + engy_cache) // 1024,
+        "filler_released_kb": (filler_run_volumes + engy_cache + job_cache) // 1024,
         # DAH-5045: how far the Engy checkpoint download has got, in GB (10**9 bytes)
         "hard_disk_engy_cache_used_gb": engy_cache // 10**9,
         "hard_disk_by_container": {name: size // 1024 for name, size in by_container.items()},
