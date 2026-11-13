@@ -5361,7 +5361,7 @@ async def test_failed_create_removes_the_pods_volume_only_when_no_other_create_i
     async with _another_create_live("test", live_creates == 2):
         with registry.track("test"):
             await docker_service.cleanup_failed_container_creation(
-                ssh_client=Mock(), default_extra={}, container_name="pod_test", volume_name="volume_test",
+                ssh_client=AsyncMock(), default_extra={}, container_name="pod_test", volume_name="volume_test",
                 remove_volume=True, container_id="cid", pod_id="test",
             )
     assert any("volume rm volume_test" in str(call) for call in ssh_commands.call_args_list) is removed
@@ -6876,7 +6876,7 @@ async def test_create_container_bootstrap_restore_order_follows_the_volume_kind(
 
     async def _restore(**kwargs):
         order.append("restore")
-        return None
+        return kwargs["ssh_client"]
 
     async def _docker_run(*args, **kwargs):
         order.append("docker_run")
@@ -10845,3 +10845,36 @@ async def test_stop_container_success_replies_container_stopped(docker_service, 
 
     assert isinstance(result, ContainerStopped) and result.container_name == "pod_test"
     assert docker_service.rental_docker_client_factory.client.stopped_containers == ["pod_test"]
+
+
+@pytest.mark.asyncio
+async def test_create_continues_on_the_session_the_bootstrap_restore_reopened(docker_service, monkeypatch):
+    # DAH-5893: an executor restart during the restore closes the create's SSH session; the restore's wait
+    # reopens one, and the rest of the create, including the edit swap's undo, runs on that one
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    reopened = AsyncMock(name="reopened-ssh")
+    # a host that answers like the happy path's: an empty nvidia-smi read
+    reopened.run = AsyncMock(return_value=_make_ssh_command_result())
+    monkeypatch.setattr(docker_service, "_run_bootstrap_restore", AsyncMock(return_value=reopened))
+    swaps: list = []
+
+    class RecordingEditSwap(docker_service_module._EditSwap):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            swaps.append(self)
+
+    monkeypatch.setattr(docker_service_module, "_EditSwap", RecordingEditSwap)
+    docker_run = AsyncMock()
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", docker_run)
+    payload = _create_payload(str(uuid4()), encrypted=False)
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=_executor_info_for(payload, tdx_quote=None),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+    assert swaps and swaps[0].ssh_client is reopened
+    assert docker_run.await_args.kwargs["ssh_client"] is reopened

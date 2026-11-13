@@ -228,6 +228,7 @@ from services.ssh_connect_timing import connect_with_phase_timing
 from services.storage_operations import (
     forget_storage_helper,
     note_started_storage_helper,
+    remove_finished_helpers_mounting,
     start_storage_operation,
     supports_bootstrap_restore,
     supports_storage_operation,
@@ -6839,6 +6840,8 @@ class DockerService:
             # the pod's volume is shared by name too: another live create of the pod may have restored into it (F-78)
             if remove_volume and volume_name and (pod_id is None or inflight_creates.is_only_create(pod_id)):
                 volume = shlex.quote(volume_name)
+                # a failed bootstrap restore's exited helper still mounts the volume
+                await remove_finished_helpers_mounting(ssh_client, volume_name)
                 await retry_ssh_command(
                     ssh_client,
                     f"/usr/bin/docker volume rm {volume} 2>/dev/null || true",
@@ -7879,6 +7882,7 @@ class DockerService:
                 )
                 await self.remove_s3fs_volume_plugin(ssh_client, external_volume_name)
             if local_volume:
+                await remove_finished_helpers_mounting(ssh_client, local_volume)
                 await retry_ssh_command(
                     ssh_client,
                     f"/usr/bin/docker volume rm {shlex.quote(local_volume)} 2>/dev/null || true",
@@ -10234,6 +10238,9 @@ class DockerService:
                     on_ssh_connected=start_early_probes,
                     log_extra=default_extra,
                 )
+                # sessions reopened after an executor restart (bootstrap restore); entered before the edit swap so
+                # they close after its undo, which runs on them
+                reopened_ssh = await connections.enter_async_context(AsyncExitStack())
                 # DAH-2740: undoes a failed edit while this SSH session is still open
                 edit_swap = await connections.enter_async_context(
                     _EditSwap(
@@ -11060,7 +11067,8 @@ class DockerService:
                     # path is on hold (_ENCRYPTED_BOOTSTRAP_RESTORE_ON_HOLD): the preflight
                     # refused the create before this point.
                     current_step = "bootstrap_restore"
-                    await self._run_bootstrap_restore(
+                    # an executor restart during the restore replaces the session; the rest of the create uses the new one
+                    ssh_client = await self._run_bootstrap_restore(
                         ssh_client=ssh_client,
                         executor_info=executor_info,
                         payload=payload,
@@ -11068,7 +11076,11 @@ class DockerService:
                         local_volume=local_volume,
                         local_volume_path=local_volume_path,
                         encrypted=False,
+                        reconnect_ssh=lambda: reopened_ssh.enter_async_context(
+                            _connect_own_ssh(executor_info, pkey, known_hosts_policy)
+                        ),
                     )
+                    edit_swap.ssh_client = ssh_client  # its undo runs on the live session
                 # a fresh rental fails before its container exists rather than start without what it asked for
                 is_fresh_create = not payload.local_volume
                 if external_volume_info:
@@ -11558,7 +11570,7 @@ class DockerService:
                             # fresh mount, but the restore comes first, so it cannot erase the
                             # keys the injection puts under /root.
                             current_step = "bootstrap_restore"
-                            await self._run_bootstrap_restore(
+                            ssh_client = await self._run_bootstrap_restore(
                                 ssh_client=ssh_client,
                                 executor_info=executor_info,
                                 payload=payload,
@@ -11567,7 +11579,11 @@ class DockerService:
                                 local_volume_path=local_volume_path,
                                 encrypted=True,
                                 container_name=container_name,
+                                reconnect_ssh=lambda: reopened_ssh.enter_async_context(
+                                    _connect_own_ssh(executor_info, pkey, known_hosts_policy)
+                                ),
                             )
+                            edit_swap.ssh_client = ssh_client  # its undo runs on the live session
 
                     # DAH-2341: inject the customer's public keys before the sshd
                     # bootstrap. The keys are plain data (mkdir + append) with no
@@ -12116,7 +12132,9 @@ class DockerService:
         local_volume_path: str,
         encrypted: bool,
         container_name: str | None = None,
-    ) -> None:
+        reconnect_ssh: Callable[[], Awaitable[asyncssh.SSHClientConnection]] | None = None,
+    ) -> asyncssh.SSHClientConnection:
+        """Run the restore; return the SSH connection the create continues on (a new one after an executor restart)."""
         if encrypted and not container_name:
             # No mode exists that restores into an encrypted volume without the pod: the
             # only other way is to hand the executor the passphrase, which is the leak this
@@ -12135,7 +12153,7 @@ class DockerService:
                     local_volume=local_volume,
                     local_volume_path=local_volume_path,
                 )
-                return
+                return ssh_client
             raise RuntimeError(
                 f"executor does not support bootstrap restore engine {restore.backup_engine}"
             )
@@ -12193,7 +12211,8 @@ class DockerService:
                 spec,
                 retain_terminal_artifacts=True,
             )
-            await wait_for_storage_operation(ssh_client, files)
+            # an executor restart drops this SSH session; the restore keeps running and the wait reattaches to it
+            return await wait_for_storage_operation(ssh_client, files, reconnect=reconnect_ssh, spec=spec)
         finally:
             # the restore ended (or never started) here: its helper is no longer Lium's
             await forget_storage_helper(self.redis_service, executor_info.uuid, operation_id)
@@ -14087,6 +14106,7 @@ class DockerService:
                     with _best_effort_delete_step(
                         log, "remove_volume_local", volume_name=payload.local_volume
                     ):
+                        await remove_finished_helpers_mounting(ssh_client, payload.local_volume)
                         await self._remove_named_volume(
                             docker_client,
                             payload.local_volume,
@@ -14099,6 +14119,7 @@ class DockerService:
                     with _best_effort_delete_step(
                         log, "remove_volume_external", volume_name=payload.external_volume
                     ):
+                        await remove_finished_helpers_mounting(ssh_client, payload.external_volume)
                         await self._remove_named_volume(
                             docker_client,
                             payload.external_volume,

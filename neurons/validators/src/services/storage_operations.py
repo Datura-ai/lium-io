@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 
 REMOTE_OPERATION_DIRECTORY = PurePosixPath("/root/app/storage-operations")
 REMOTE_RUNNER_PATH = "/root/app/src/storage_runner.py"
+# Helpers with this label run storage_runner.py as their entrypoint: they run restic, retry and report by themselves
+# and outlive the executor container, so their docker state is the operation's state.
+WRAPPER_LABEL = "lium.storage-wrapper"
+KILLED_EXIT = 137
 REMOTE_SECRETS_DIRECTORY = PurePosixPath("/root/app/storage-secrets")
 
 # DAH-6148: an operation runs restic in a `lium-storage-<operation id[:12]>` helper container on
@@ -173,6 +177,8 @@ class StorageOperationFiles:
     pid: PurePosixPath
     status: PurePosixPath
     cancel: PurePosixPath
+    # the operation's helper container: it, not the files above, outlives an executor restart
+    helper: str = ""
 
     @classmethod
     def for_operation(cls, operation_id: UUID) -> StorageOperationFiles:
@@ -183,7 +189,12 @@ class StorageOperationFiles:
             pid=REMOTE_OPERATION_DIRECTORY / f"{stem}.pid",
             status=REMOTE_OPERATION_DIRECTORY / f"{stem}.status",
             cancel=REMOTE_OPERATION_DIRECTORY / f"{stem}.cancel",
+            helper=helper_container_name(operation_id),
         )
+
+
+def helper_container_name(operation_id: UUID) -> str:
+    return f"lium-storage-{str(operation_id)[:12]}"
 
 
 async def supports_storage_operation(
@@ -282,6 +293,14 @@ async def start_storage_operation(
                 existing_state = await _operation_state(ssh_client, files)
                 if existing_state != "STARTING":
                     break
+        if existing_state == f"STATUS:{KILLED_EXIT}":
+            await report_killed_helper(
+                operation_id, spec
+            )  # a killed helper could not report for itself
+        if existing_state.startswith("STATUS:") and not retain_terminal_artifacts:
+            # an online job's finished helper (its files are gone already): a new dispatch runs it again
+            await _remove_operation_artifacts(ssh_client, files)
+            existing_state = "STARTING"
         if existing_state == "RUNNING" or existing_state.startswith("STATUS:"):
             return files
         if await _helper_owned_by_live_runner(ssh_client, operation_id, files):
@@ -345,8 +364,47 @@ async def wait_for_storage_operation(
     files: StorageOperationFiles,
     poll_interval_seconds: float = 5.0,
     launch_grace_polls: int = 6,
+    *,
+    reconnect: Callable[[], Awaitable[asyncssh.SSHClientConnection]] | None = None,
+    reconnect_window_seconds: float = 600.0,
+    spec: Mapping[str, object] | None = None,
+) -> asyncssh.SSHClientConnection:
+    """Wait for the operation's terminal status; return the live connection the wait ended on.
+
+    With ``reconnect``, a lost SSH connection (the executor container restarting) is reopened and the wait
+    reattaches to the operation: its helper keeps running, and its state is read from that container.
+    The caller owns the reopened connection and continues on it.
+    """
+    try:
+        await _wait_for_storage_operation(
+            ssh_client, files, poll_interval_seconds, launch_grace_polls, False, spec
+        )
+        return ssh_client
+    except (asyncssh.Error, OSError):
+        if reconnect is None:
+            raise
+    deadline = asyncio.get_running_loop().time() + reconnect_window_seconds
+    while True:
+        await asyncio.sleep(poll_interval_seconds)
+        try:
+            fresh_client = await reconnect()
+            await _wait_for_storage_operation(
+                fresh_client, files, poll_interval_seconds, launch_grace_polls, True, spec
+            )
+            return fresh_client
+        except (asyncssh.Error, OSError):
+            if asyncio.get_running_loop().time() >= deadline:
+                raise
+
+
+async def _wait_for_storage_operation(
+    ssh_client: asyncssh.SSHClientConnection,
+    files: StorageOperationFiles,
+    poll_interval_seconds: float,
+    launch_grace_polls: int,
+    runner_seen: bool,
+    spec: Mapping[str, object] | None,
 ) -> None:
-    runner_seen = False
     starting_polls = 0
     while True:
         # Healthy large operations have no wall-clock deadline; only terminal
@@ -360,8 +418,10 @@ async def wait_for_storage_operation(
                 raise StorageOperationLaunchError(
                     "storage operation returned an invalid status"
                 ) from error
+            if exit_code == KILLED_EXIT and spec is not None:
+                await report_killed_helper(UUID(str(spec["operation_id"])), spec)
             if exit_code != 0:
-                detail = await _tail_operation_log(ssh_client, files.log)
+                detail = await _tail_operation_log(ssh_client, files.log, files.helper)
                 await _remove_operation_artifacts(ssh_client, files)
                 raise StorageOperationLaunchError(
                     f"storage operation failed with exit {exit_code}: {detail}"
@@ -371,7 +431,7 @@ async def wait_for_storage_operation(
         if state == "RUNNING":
             runner_seen = True
         elif state in {"EXITED", "INVALID"} or runner_seen:
-            detail = await _tail_operation_log(ssh_client, files.log)
+            detail = await _tail_operation_log(ssh_client, files.log, files.helper)
             await _remove_operation_artifacts(ssh_client, files)
             raise StorageOperationLaunchError(
                 f"storage operation runner disappeared without a terminal status: {detail}"
@@ -379,7 +439,7 @@ async def wait_for_storage_operation(
         else:
             starting_polls += 1
             if starting_polls >= launch_grace_polls:
-                detail = await _tail_operation_log(ssh_client, files.log)
+                detail = await _tail_operation_log(ssh_client, files.log, files.helper)
                 await _remove_operation_artifacts(ssh_client, files)
                 raise StorageOperationLaunchError(
                     f"storage operation runner did not start: {detail}"
@@ -393,8 +453,20 @@ async def _operation_state(
 ) -> str:
     status_path = shlex.quote(str(files.status))
     pid_path = shlex.quote(str(files.pid))
+    helper = shlex.quote(files.helper)
+    inspect_format = (
+        f'{{{{index .Config.Labels "{WRAPPER_LABEL}"}}}} {{{{.State.Status}}}} '
+        "{{.State.ExitCode}} {{.State.OOMKilled}}"
+    )
     command = (
-        f"if test -s {status_path}; then printf 'STATUS:'; cat {status_path}; "
+        # a helper running storage_runner.py is the operation: it survives an executor restart, the files do not.
+        # A killed one cannot report: OOMKilled reads as exit 137.
+        f"if state=$(/usr/bin/docker inspect -f {shlex.quote(inspect_format)} {helper} 2>/dev/null) "
+        '&& test "${state%% *}" = 1; then set -- $state; '
+        'case "$2" in (exited|dead) if test "$4" = true; then echo STATUS:137; else echo "STATUS:$3"; fi;; '
+        "(*) echo RUNNING;; esac; "
+        f"elif test -s {status_path}; then printf 'STATUS:'; cat {status_path}; "
+        # executors before the wrapper helper: their runner is a process in the executor container
         f"elif test -s {pid_path}; then pid=$(cat {pid_path}); "
         "case \"$pid\" in (*[!0-9]*|'') echo INVALID;; "
         '(*) if kill -0 "$pid" 2>/dev/null; then echo RUNNING; else echo EXITED; fi;; esac; '
@@ -410,36 +482,30 @@ async def cancel_storage_operation(
 ) -> None:
     files = StorageOperationFiles.for_operation(operation_id)
     spec = await _read_operation_spec(ssh_client, files.spec)
-    helper_name = storage_helper_name(operation_id)
-    cancel_path = shlex.quote(str(files.cancel))
-    pid_path = shlex.quote(str(files.pid))
-    # Let the runner terminate its Restic process and helper first. Direct
-    # process termination is only a bounded fallback for an unresponsive runner.
+    helper = shlex.quote(files.helper)
+    legacy_runner = shlex.quote(
+        f"[-]-spec {files.spec}"
+    )  # "[-]" keeps pgrep from matching this shell
+    # Targets are named, never a stored PID (the executor shares the host's PID namespace, so a stale PID
+    # could be an unrelated process). SIGTERM to the helper: its storage_runner.py stops restic and reports CANCELLED.
     command = (
-        f"touch {cancel_path}; "
-        f"if test -s {pid_path}; then "
-        f"pid=$(cat {pid_path}); "
-        "case \"$pid\" in (*[!0-9]*|'') exit 2;; esac; "
-        'attempt=0; while kill -0 "$pid" 2>/dev/null && test "$attempt" -lt 100; do '
+        f"touch {shlex.quote(str(files.cancel))}; "
+        f"/usr/bin/docker kill --signal TERM {helper} >/dev/null 2>&1 || true; "
+        f'attempt=0; while test "$(/usr/bin/docker inspect -f {{{{.State.Running}}}} {helper} 2>/dev/null)" = true '
+        '&& test "$attempt" -lt 120; do sleep 0.25; attempt=$((attempt + 1)); done; '
+        # an executor before the wrapper helper: its runner is a process found by its command line
+        f"pkill -TERM -f -- {legacy_runner} 2>/dev/null; "
+        f'attempt=0; while pgrep -f -- {legacy_runner} >/dev/null && test "$attempt" -lt 100; do '
         "sleep 0.25; attempt=$((attempt + 1)); done; "
-        'if kill -0 "$pid" 2>/dev/null; then '
-        f"/usr/bin/docker stop --time 5 {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
-        'kill -TERM "$pid" 2>/dev/null || true; sleep 2; '
-        'if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null || true; '
-        'attempt=0; while kill -0 "$pid" 2>/dev/null && test "$attempt" -lt 20; do '
-        "sleep 0.1; attempt=$((attempt + 1)); done; fi; "
+        f"pkill -KILL -f -- {legacy_runner} 2>/dev/null; "
+        f"/usr/bin/docker stop --time 5 {helper} >/dev/null 2>&1 || true; "
         # the stopped helper still holds the repository credentials; remove it, not just stop it
-        f"/usr/bin/docker rm -f -- {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
-        "fi; "
-        'kill -0 "$pid" 2>/dev/null && exit 3 || true; '
-        "else "
-        f"/usr/bin/docker stop --time 5 {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
-        f"/usr/bin/docker rm -f -- {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
-        "fi"
+        f"/usr/bin/docker rm -f -- {helper} >/dev/null 2>&1 || true; "
+        f'attempt=0; while pgrep -f -- {legacy_runner} >/dev/null && test "$attempt" -lt 40; do '
+        "sleep 0.25; attempt=$((attempt + 1)); done; "
+        f"! pgrep -f -- {legacy_runner} >/dev/null"
     )
     result = await ssh_client.run(command, check=False)
-    if result.exit_status == 2:
-        raise StorageOperationLaunchError("storage operation had an invalid process ID")
     if result.exit_status != 0:
         raise StorageOperationLaunchError("failed to cancel storage operation")
     if spec:
@@ -480,6 +546,7 @@ async def _helper_owned_by_live_runner(
     helper_name = storage_helper_name(operation_id)
     # "[-]-spec" keeps pgrep from matching this command's own shell
     runner_pattern = f"[-]-spec {files.spec}"
+    # an executor before the wrapper helper (a running wrapper helper already reads as RUNNING)
     result = await ssh_client.run(
         f"/usr/bin/docker ps -q --filter {shlex.quote(f'name=^{helper_name}$')} --filter status=running"
         f" | grep -q . && pgrep -f -- {shlex.quote(runner_pattern)} >/dev/null",
@@ -499,12 +566,33 @@ async def _remove_stale_helper_container(
     )
 
 
+async def remove_finished_helpers_mounting(
+    ssh_client: asyncssh.SSHClientConnection,
+    volume_name: str,
+) -> None:
+    """An exited plain-volume helper is kept for its exit status, and so keeps the pod volume in use:
+    a pod delete removes it first, or the volume (renter data) would stay on the host."""
+    listing = (
+        f"/usr/bin/docker ps -aq --filter label={WRAPPER_LABEL} --filter status=exited"
+        f" --filter volume={shlex.quote(volume_name)}"
+    )
+    await ssh_client.run(
+        f'ids=$({listing}); test -z "$ids" || /usr/bin/docker rm -f $ids >/dev/null 2>&1 || true',
+        check=False,
+    )
+
+
 async def _tail_operation_log(
     ssh_client: asyncssh.SSHClientConnection,
     log_path: PurePosixPath,
+    helper: str = "",
 ) -> str:
+    # the launcher's log, then the wrapper helper's own (redacted) event log, which outlives an executor restart
+    fallback = (
+        f" 2>/dev/null; /usr/bin/docker logs --tail 20 {shlex.quote(helper)} 2>&1" if helper else ""
+    )
     result = await ssh_client.run(
-        f"tail -n 20 {shlex.quote(str(log_path))}",
+        f"tail -n 20 {shlex.quote(str(log_path))}{fallback}",
         check=False,
     )
     compact = " ".join((result.stdout or result.stderr or "no operation log").split())
@@ -520,6 +608,11 @@ async def _remove_operation_artifacts(
         + " ".join(
             shlex.quote(str(path))
             for path in (files.status, files.log, files.pid, files.spec, files.cancel)
+        )
+        + (
+            f"; /usr/bin/docker rm -f -- {shlex.quote(files.helper)} >/dev/null 2>&1 || true"
+            if files.helper
+            else ""
         ),
         check=False,
     )
@@ -536,6 +629,18 @@ async def report_launch_failure(
         status="FAILED",
         stage="LAUNCH",
         message=f"Storage runner launch failed: {type(error).__name__}: {error}",
+    )
+
+
+async def report_killed_helper(operation_id: UUID, spec: Mapping[str, object]) -> None:
+    await _report_operation_status(
+        operation_id,
+        spec,
+        status="FAILED",
+        # the stage the helper was in: the executor reports backups under BACKUP and restores under RESTORING
+        stage="BACKUP" if spec.get("action") == "backup" else "RESTORING",
+        message="Storage helper was killed (often out of memory)",
+        attempts=3,
     )
 
 
@@ -602,14 +707,18 @@ async def _report_operation_status(
     return False
 
 
-async def upload_secrets_file(ssh_client: asyncssh.SSHClientConnection, auth_token: str, volume_info) -> str:
+async def upload_secrets_file(
+    ssh_client: asyncssh.SSHClientConnection, auth_token: str, volume_info
+) -> str:
     """Hand the legacy tar backup/restore scripts their credentials as a fresh 0600 file.
 
     Keeps the values out of the remote command line. The file is
     created exclusively with mode 0600 inside a 0700 directory; the script deletes it on read.
     """
     path = str(REMOTE_SECRETS_DIRECTORY / f"{uuid4().hex}.json")
-    await ssh_client.run(f"install -d -m 0700 {shlex.quote(str(REMOTE_SECRETS_DIRECTORY))}", check=True)
+    await ssh_client.run(
+        f"install -d -m 0700 {shlex.quote(str(REMOTE_SECRETS_DIRECTORY))}", check=True
+    )
     async with ssh_client.start_sftp_client() as sftp:
         async with sftp.open(path, "x", asyncssh.SFTPAttrs(permissions=0o600)) as remote_file:
             await remote_file.write(
