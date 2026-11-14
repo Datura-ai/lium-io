@@ -157,3 +157,40 @@ async def test_skipped_without_cadence_stamp_when_task_time_is_short(context_fac
     monkeypatch.setattr(rental_egress_guard, "task_seconds_left", lambda ctx: 600)
     await check.run(context_factory(ssh=ssh))
     assert len(_helper_calls(ssh)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_inspect_is_cut_off_before_the_deadline_and_the_run_is_kept(context_factory, monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from services.task.pipeline import CheckResult, Pipeline
+
+    margin = rental_egress_guard.BUDGET_MARGIN_SECONDS
+    # enough for the pre-check, then 0.2 s of budget for the remote calls
+    left = iter([rental_egress_guard.HELPER_TIMEOUT_SECONDS + margin, margin + 0.2])
+    monkeypatch.setattr(rental_egress_guard, "task_seconds_left", lambda ctx: next(left))
+
+    async def stalled(*a, **k):
+        await asyncio.Event().wait()
+
+    finalized = []
+
+    class _Finalize:
+        check_id = "finalize"
+        fatal = True
+
+        async def run(self, ctx):
+            finalized.append(True)
+            return CheckResult(passed=True, event=rental_egress_guard.render_message(
+                rental_egress_guard.Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what={}))
+
+    guard = RentalEgressGuardCheck()
+    ctx = context_factory(ssh=SimpleNamespace(run=stalled))
+    started = asyncio.get_running_loop().time()
+    ok, events, _ = await asyncio.wait_for(Pipeline([guard, _Finalize()], AsyncMock()).run(ctx), timeout=5)
+
+    assert asyncio.get_running_loop().time() - started < 2
+    assert ok is True and finalized == [True]
+    assert events[0].reason_code == "RENTAL_EGRESS_GUARD_SKIPPED"
+    assert guard._last_run == {}  # not a run: the next cycle tries again

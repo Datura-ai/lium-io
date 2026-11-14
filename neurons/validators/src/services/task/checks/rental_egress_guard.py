@@ -23,6 +23,7 @@ some hosts use a link-local resolver.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import logging
 import shlex
@@ -122,23 +123,23 @@ class RentalEgressGuardCheck:
         self._last_run[executor_uuid] = now
 
         try:
-            inspect = await ctx.ssh.run(
-                f"/usr/bin/docker network inspect {RENTAL_NETWORK_NAME} "
-                "-f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null",
-                check=False,
+            # Every remote call shares one deadline that ends BUDGET_MARGIN_SECONDS before the task is
+            # cancelled, so a stalled SSH call can never cost the cycle its validation result.
+            subnets, error = await asyncio.wait_for(
+                self._apply(ctx), timeout=task_seconds_left(ctx) - BUDGET_MARGIN_SECONDS
             )
-            subnets = rental_subnets(inspect.stdout if inspect.exit_status == 0 else "")
-            if not subnets:
-                # No rental network yet: nothing runs on it; the next interval checks again.
-                return self._skip(ctx, "no rental network")
-            helper = (
-                f"/usr/bin/docker run --rm --network=host --cap-add=NET_ADMIN --entrypoint /bin/sh "
-                f"{shlex.quote(settings.CUSTOM_DOCKERFILE_DIND_IMAGE)} -c {shlex.quote(link_local_drop_script(subnets))}"
-            )
-            result = await ctx.ssh.run(f"timeout -k 5 {HELPER_TIMEOUT_SECONDS} {helper}", check=False)
-            error = None if result.exit_status == 0 else (result.stderr or "").strip()[-300:] or f"exit {result.exit_status}"
+        except TimeoutError:
+            # Not a run: the next cycle tries again.
+            if last is None:
+                self._last_run.pop(executor_uuid, None)
+            else:
+                self._last_run[executor_uuid] = last
+            return self._skip(ctx, "out of task time")
         except Exception as exc:  # noqa: BLE001 — fail-open, see module docstring
             subnets, error = [], str(exc)
+        if subnets is None:
+            # No rental network yet: nothing runs on it; the next interval checks again.
+            return self._skip(ctx, "no rental network")
 
         if error is not None:
             logger.warning(
@@ -155,3 +156,21 @@ class RentalEgressGuardCheck:
             passed=True,
             event=render_message(Msg.APPLIED, ctx=ctx, check_id=self.check_id, what={"subnets": subnets}),
         )
+
+    async def _apply(self, ctx: Context) -> tuple[list[str] | None, str | None]:
+        """(subnets, error); subnets None when there is no rental network."""
+        inspect = await ctx.ssh.run(
+            f"/usr/bin/docker network inspect {RENTAL_NETWORK_NAME} "
+            "-f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null",
+            check=False,
+        )
+        subnets = rental_subnets(inspect.stdout if inspect.exit_status == 0 else "")
+        if not subnets:
+            return None, None
+        helper = (
+            f"/usr/bin/docker run --rm --network=host --cap-add=NET_ADMIN --entrypoint /bin/sh "
+            f"{shlex.quote(settings.CUSTOM_DOCKERFILE_DIND_IMAGE)} -c {shlex.quote(link_local_drop_script(subnets))}"
+        )
+        result = await ctx.ssh.run(f"timeout -k 5 {HELPER_TIMEOUT_SECONDS} {helper}", check=False)
+        error = None if result.exit_status == 0 else (result.stderr or "").strip()[-300:] or f"exit {result.exit_status}"
+        return subnets, error
