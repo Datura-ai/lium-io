@@ -7,16 +7,18 @@ RED→GREEN:
        kernel-vs-XML disagreement is emitted and the overwrite is refused
        (fail closed) so the kernel truth stands.
 """
+import json
 from unittest.mock import AsyncMock
 
 import pytest
+import services.nvidia_devices as nd
 from neurons.validators.src.services.nvidia_devices import (
     MissingRentedGpuError,
     _query_gpu_nodes_for_uuids,
     build_gpu_docker_config_for_executor,
 )
 
-import services.nvidia_devices as nd
+from core.utils import JSONFormatter
 
 _XML_BOTH = """\
 <?xml version="1.0" ?>
@@ -57,12 +59,13 @@ async def test_missing_rented_gpu_emits_structured_event_and_refuses_the_contain
             )
 
     rec = next(r for r in caplog.records if r.message == nd._KERNEL_GPU_VERDICT_MISSING_MSG)
-    assert rec.requested_gpu_count == 1
-    assert rec.visible_gpu_count == 1
-    assert rec.requested_uuids == ["GPU-bbb"]
-    assert rec.visible_uuids == ["GPU-aaa"]
-    assert rec.missing_uuids == ["GPU-bbb"]
-    assert rec.executor_id == "exec-9"
+    extra = rec.msg.extra
+    assert extra["requested_gpu_count"] == 1
+    assert extra["visible_gpu_count"] == 1
+    assert extra["requested_uuids"] == ["GPU-bbb"]
+    assert extra["visible_uuids"] == ["GPU-aaa"]
+    assert extra["missing_uuids"] == ["GPU-bbb"]
+    assert extra["executor_id"] == "exec-9"
 
 
 @pytest.mark.asyncio
@@ -78,11 +81,13 @@ async def test_disagreement_fails_closed_and_emits(caplog):
             )
 
     rec = next(r for r in caplog.records if r.message == nd._KERNEL_GPU_VERDICT_DISAGREE_MSG)
-    assert rec.proc_unreadable is False
-    assert rec.enforced is True
-    assert rec.xml_would_add_uuids == ["GPU-bbb"]
+    # the JSON log line (what Loki stores) carries the evidence: plain extra= kwargs were dropped
+    extra = json.loads(JSONFormatter(include_validator_hotkey=False).format(rec))["extra"]
+    assert extra["proc_unreadable"] is False
+    assert extra["enforced"] is True
+    assert extra["xml_would_add_uuids"] == ["GPU-bbb"]
     # the event has to be correlatable by miner/batch, not just by host:port
-    assert rec.executor_id == "exec-9"
-    assert rec.miner_hotkey == "hk-1"
+    assert extra["executor_id"] == "exec-9"
+    assert extra["miner_hotkey"] == "hk-1"
 
 
