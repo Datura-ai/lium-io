@@ -1868,6 +1868,13 @@ class VerifyXMessages:
         category="policy",
         impact="Active filler runtime preserved; reused last-known VerifyX EMA when available",
     )
+    STANDING_PROBE_FAILURE_SKIPPED = MessageTemplate(
+        event="VerifyX validation skipped",
+        reason="VERIFYX_SKIPPED_STANDING_PROBE_FAILURE",
+        severity="info",
+        category="policy",
+        impact="Rental probe gets this cycle's time to clear its standing failure; reused last-known VerifyX EMA",
+    )
     NO_SPECS = MessageTemplate(
         event="VerifyX validation skipped (no specs)",
         reason="VERIFYX_NO_SPECS",
