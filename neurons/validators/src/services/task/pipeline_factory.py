@@ -38,6 +38,7 @@ from .checks import (
     ContainerDownloadSpeedCheck,
     CpuTruthCheck,
     CustomBuildOrphanSweepCheck,
+    RentalEgressGuardCheck,
     DiskHealthCheck,
     DiskSpaceCheck,
     SplitDiskCheck,
@@ -120,6 +121,8 @@ JOB_LENGTH = 300
 # call would lose the "last swept at" timestamps. The check itself is stateless
 # wrt input data and only reads ctx, so a shared instance is safe.
 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON = CustomBuildOrphanSweepCheck()
+# Same reason: per-executor cadence state.
+_RENTAL_EGRESS_GUARD_SINGLETON = RentalEgressGuardCheck()
 
 # DAH-2805: same reason — the download-temporary sweep inside this check carries its own per-executor
 # cadence, and a fresh instance every cycle would sweep every cycle.
@@ -399,6 +402,7 @@ class PipelineFactory:
                 # instance so cadence state persists across `build_checks()`
                 # calls.
                 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON,
+                _RENTAL_EGRESS_GUARD_SINGLETON,
                 PortConnectivityCheck(),
                 PortCountCheck(),
                 # Before the rented short-circuit; it leaves a rented node alone itself (no pull beside a
@@ -550,6 +554,7 @@ class PipelineFactory:
                 _STALE_CONTAINER_CLEANUP_SINGLETON,
                 ProviderSideLoadCheck(),
                 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON,
+                _RENTAL_EGRESS_GUARD_SINGLETON,
                 ExecutorImageCheck(),
                 InspectorRentedCheck(),
                 RentedPodResourcesCheck(),
