@@ -993,3 +993,47 @@ async def test_an_average_speed_just_under_the_floor_never_shows_as_meeting_it(c
     result = await VerifyXCheck().run(ctx)
 
     assert result.event.remediation.startswith("Average download speed 99.9 Mbps, 100 Mbps required.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "standing,stored_ema,expect_skip",
+    [
+        ("rental_probe_failed", True, True),
+        (None, True, False),  # no standing failure: measured as before
+        ("rental_probe_failed", False, False),  # never measured: no EMA to reuse, so it runs
+        ("other_prefix", True, False),
+    ],
+)
+async def test_verifyx_gives_a_standing_rental_probe_failure_the_cycle_time(
+    context_factory, standing, stored_ema, expect_skip
+):
+    """A standing probe failure fails the cycle and holds the VerifyX sample anyway; skipping VerifyX leaves
+    the probe, the only check that clears it, enough cycle time on a slow link."""
+    verifyx_service = DummyVerifyXService(
+        success=True, updated_specs={"network": {"download_speed": 500.0, "upload_speed": 100.0}}
+    )
+    services = build_services(verifyx=verifyx_service)
+    state = build_state(
+        specs={"gpu": {"count": 8}},
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            banned_guids=[],
+            network_ema=(
+                {"executor-123": NetworkEMA(ema_verifyx_download_speed=80.0, ema_verifyx_upload_speed=70.0)}
+                if stored_ema
+                else {}
+            ),
+        ),
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+    if standing:
+        await services.redis.set(f"{standing}:{ctx.executor.uuid}", "container_create:gpu_flags")
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.passed is True
+    assert (result.event.reason_code == Msg.STANDING_PROBE_FAILURE_SKIPPED.reason) is expect_skip
+    assert (verifyx_service.called_with is None) is expect_skip
+    if expect_skip:
+        assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(80.0)

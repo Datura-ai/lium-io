@@ -762,6 +762,14 @@ async def _standing_failure(ctx: Context) -> _Failure | None:
     return _Failure(step, create_step or None) if step else None
 
 
+async def has_standing_failure(ctx: Context) -> bool:
+    """Does a standing probe failure fail this cycle? Not on a node a renter has (_may_probe skips it there)."""
+    rented = rental_of_this_node(ctx)
+    if rented and rented.pods:
+        return False
+    return await _standing_failure(ctx) is not None
+
+
 async def _stamp_failure(ctx: Context, failure: _Failure) -> None:
     # the failure stands until _clear_failure (see _REDIS_FAILED_PREFIX)
     try:

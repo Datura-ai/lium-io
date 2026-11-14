@@ -30,6 +30,7 @@ from services.verifyx_validation_service import (
 from ..messages import VerifyXMessages as Msg, render_message, shown
 from ..pipeline import CheckResult, Context
 from .disk_space import DiskSpaceCheck
+from .rental_probe import has_standing_failure
 from .network_ema import compute_ema
 from .task_time import task_seconds_left
 
@@ -213,6 +214,31 @@ class VerifyXCheck:
                 check_id=self.check_id,
                 what={
                     "filler_container": filler_container,
+                    "ema_verifyx_download_speed": (
+                        (updated_specs.get("network") or {}).get("ema_verifyx_download_speed")
+                    ),
+                },
+            )
+            return CheckResult(
+                passed=True,
+                event=event,
+                updates={"state": replace(ctx.state, specs=updated_specs)},
+            )
+
+        # The standing rental-probe failure fails this cycle and holds its VerifyX sample anyway
+        # (verifyx_ema_hold_reason); on a slow link VerifyX's minutes left the probe, the only check
+        # that clears the failure, too little cycle time to ever run again.
+        if (
+            stored_ema
+            and stored_ema.ema_verifyx_download_speed is not None
+            and await has_standing_failure(ctx)
+        ):
+            updated_specs = specs_with_last_known_verifyx_ema(ctx)
+            event = render_message(
+                Msg.STANDING_PROBE_FAILURE_SKIPPED,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={
                     "ema_verifyx_download_speed": (
                         (updated_specs.get("network") or {}).get("ema_verifyx_download_speed")
                     ),
