@@ -217,6 +217,23 @@ pf_fix() {
 
 host_path() { echo "${SYSBOX_SETUP_HOST_ROOT:-}$1"; }
 
+keep_needrestart_off_the_container_runtime() {
+    # an apt upgrade's needrestart restarts services whose libraries changed; restarting sysbox-mgr/sysbox-fs (or Docker)
+    # under running pods drops their /proc (sysbox-fs FUSE) and the uid-shift state, and the next container restart
+    # leaves the pod's files owned by nobody inside it (sudo and apt break). Restarting nvidia-fabricmanager under pods
+    # breaks NVLink multicast in them (CUDA 401). The provider restarts them in a window.
+    local dir
+    dir=$(host_path /etc/needrestart/conf.d)
+    mkdir -p "$dir" && cat > "$dir/lium-container-runtime.conf" <<'NRCONF'
+# Lium: never restart the container runtime under running pods; restart it in a maintenance window.
+$nrconf{override_rc}->{qr(^sysbox)} = 0;
+$nrconf{override_rc}->{qr(^docker)} = 0;
+$nrconf{override_rc}->{qr(^containerd)} = 0;
+$nrconf{override_rc}->{qr(^nvidia-fabricmanager)} = 0;
+$nrconf{override_rc}->{qr(^nvidia-persistenced)} = 0;
+NRCONF
+}
+
 self_cmd() {
     # how to run this script again: the file when there is one, else the one-liner (curl | bash). A leading VAR=VALUE
     # argument goes after sudo (sudo's env_reset drops variables set before it); the rest are the script's options.
@@ -977,6 +994,10 @@ if load_iptables_modules; then
     ok "Loaded the iptables modules (ip_tables iptable_nat iptable_filter) and made them load at boot."
     PREFLIGHT_FIX=$((PREFLIGHT_FIX - 1))
 fi
+
+# before "Already working?": a host that already runs pods needs it most, and that path exits early
+keep_needrestart_off_the_container_runtime && ok "apt (needrestart) never restarts sysbox, Docker, containerd or the NVIDIA fabric manager." \
+    || warn "Could not write /etc/needrestart/conf.d/lium-container-runtime.conf; apt upgrades may restart sysbox under pods."
 
 # ── 2. Already working? ─────────────────────────────────
 
