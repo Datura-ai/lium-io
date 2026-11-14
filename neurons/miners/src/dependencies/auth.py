@@ -251,6 +251,10 @@ async def verify_simple_validator_signature(
         try:
             if None in (x_validator_hotkey, x_miner_hotkey, x_timestamp) or x_validator_hotkey != validator_hotkey:
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incomplete signed headers")
+            # /executors returns this wallet's list, also in CENTRAL_MODE (where the header check skips the miner)
+            own_hotkey = core_config.settings.get_bittensor_wallet().get_hotkey().ss58_address
+            if x_miner_hotkey != own_hotkey:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Authentication names another miner")
             return await verify_validator_auth_from_headers(
                 x_validator_hotkey, x_miner_hotkey, x_timestamp, x_signature, validator_service
             )

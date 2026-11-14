@@ -17,11 +17,11 @@ MINER = bittensor.Keypair.create_from_uri("//LiumTestMinerExecList")
 OTHER = bittensor.Keypair.create_from_uri("//LiumTestOtherMinerExecList")
 
 
-@pytest.fixture(autouse=True)
-def this_miner(monkeypatch):
+@pytest.fixture(autouse=True, params=[False, True], ids=["standard", "central"])
+def this_miner(monkeypatch, request):
     wallet = MagicMock()
     wallet.get_hotkey.return_value = MINER
-    settings = MagicMock(CENTRAL_MODE=False)
+    settings = MagicMock(CENTRAL_MODE=request.param)
     settings.get_bittensor_wallet.return_value = wallet
     monkeypatch.setattr(auth_module.core_config, "settings", settings)
 
@@ -75,4 +75,12 @@ def test_legacy_body_signature_only_while_accepted(monkeypatch):
     monkeypatch.setattr(auth_module, "ACCEPT_UNBOUND_SIGNATURES", False)
     with pytest.raises(HTTPException) as err:
         _verify()
+    assert err.value.status_code == 401
+
+
+def test_headers_for_another_miner_with_a_bad_body_signature_are_refused():
+    # replayed headers: valid and fresh, but signed for another miner; the body signature is not valid
+    forged = SimpleValidatorRequest(signature="0x" + "00" * 64, validator_hotkey=VALIDATOR.ss58_address)
+    with pytest.raises(HTTPException) as err:
+        _verify(OTHER.ss58_address, int(time.time()), request=forged)
     assert err.value.status_code == 401
