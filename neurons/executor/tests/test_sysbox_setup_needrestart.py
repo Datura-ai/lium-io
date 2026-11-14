@@ -1,4 +1,4 @@
-"""nvidia_docker_sysbox_setup.sh: apt's needrestart never restarts sysbox, Docker or containerd under running pods."""
+"""nvidia_docker_sysbox_setup.sh: needrestart never restarts sysbox, Docker, containerd or NVIDIA fabric manager under pods."""
 
 import os
 import re
@@ -33,12 +33,13 @@ def test_the_needrestart_override_keeps_the_container_runtime_and_is_valid_needr
          ' for my $s (@ARGV[1..$#ARGV]) { my @m = grep { $s =~ $_ && !$nrconf{override_rc}{$_} }'
          ' keys %{$nrconf{override_rc}}; print "$s:", (@m ? "kept" : "restarted"), "\\n" }',
          str(conf), "sysbox.service", "sysbox-mgr.service", "sysbox-fs.service", "docker.service",
-         "containerd.service", "cron.service"],
+         "containerd.service", "nvidia-fabricmanager.service", "nvidia-persistenced.service", "cron.service"],
         capture_output=True, text=True, check=True,
     )
     assert out.stdout.split() == [
         "sysbox.service:kept", "sysbox-mgr.service:kept", "sysbox-fs.service:kept", "docker.service:kept",
-        "containerd.service:kept", "cron.service:restarted",
+        "containerd.service:kept", "nvidia-fabricmanager.service:kept", "nvidia-persistenced.service:kept",
+        "cron.service:restarted",
     ]
 
 

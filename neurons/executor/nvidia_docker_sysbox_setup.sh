@@ -220,7 +220,8 @@ host_path() { echo "${SYSBOX_SETUP_HOST_ROOT:-}$1"; }
 keep_needrestart_off_the_container_runtime() {
     # an apt upgrade's needrestart restarts services whose libraries changed; restarting sysbox-mgr/sysbox-fs (or Docker)
     # under running pods drops their /proc (sysbox-fs FUSE) and the uid-shift state, and the next container restart
-    # leaves the pod's files owned by nobody inside it (sudo and apt break). The provider restarts them in a window.
+    # leaves the pod's files owned by nobody inside it (sudo and apt break). Restarting nvidia-fabricmanager under pods
+    # breaks NVLink multicast in them (CUDA 401). The provider restarts them in a window.
     local dir
     dir=$(host_path /etc/needrestart/conf.d)
     mkdir -p "$dir" && cat > "$dir/lium-container-runtime.conf" <<'NRCONF'
@@ -228,6 +229,8 @@ keep_needrestart_off_the_container_runtime() {
 $nrconf{override_rc}->{qr(^sysbox)} = 0;
 $nrconf{override_rc}->{qr(^docker)} = 0;
 $nrconf{override_rc}->{qr(^containerd)} = 0;
+$nrconf{override_rc}->{qr(^nvidia-fabricmanager)} = 0;
+$nrconf{override_rc}->{qr(^nvidia-persistenced)} = 0;
 NRCONF
 }
 
@@ -993,7 +996,7 @@ if load_iptables_modules; then
 fi
 
 # before "Already working?": a host that already runs pods needs it most, and that path exits early
-keep_needrestart_off_the_container_runtime && ok "apt (needrestart) never restarts sysbox, Docker or containerd." \
+keep_needrestart_off_the_container_runtime && ok "apt (needrestart) never restarts sysbox, Docker, containerd or the NVIDIA fabric manager." \
     || warn "Could not write /etc/needrestart/conf.d/lium-container-runtime.conf; apt upgrades may restart sysbox under pods."
 
 # ── 2. Already working? ─────────────────────────────────
