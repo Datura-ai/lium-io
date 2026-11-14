@@ -22,6 +22,7 @@ from protocol.vc_protocol.compute_requests import (
     PodRentalActiveResponse,
     PodSshReachabilityResponse,
     RentedExecutor,
+    StorageOperationActiveResponse,
     RentedExecutorsResponse,
     RentedGpuDropResponse,
     RentedPod,
@@ -141,14 +142,6 @@ class BackendClient:
             await cls._session.close()
             cls._session = None
 
-    def _get_signature_headers(self) -> dict[str, str]:
-        timestamp = int(time.time())
-        return {
-            "hotkey": self.keypair.ss58_address,
-            "timestamp": str(timestamp),
-            "signature": f"0x{self.keypair.sign(str(timestamp)).hex()}",
-        }
-
     @staticmethod
     def signed_request_message(method: str, path_with_query: str, body: bytes, timestamp: str) -> str:
         """What the settlement routes verify (backend utils/auth.py validator_signed_message): the method, the path
@@ -174,6 +167,8 @@ class BackendClient:
         response_model: type[T],
         *,
         json_data: dict[str, Any] | None = None,
+        timeout: int = 30,
+        non_200_log_level: int = logging.ERROR,
         raise_on_4xx: bool = False,
     ) -> T | None:
         """A settlement call: the body is serialized once, and the signature covers these exact bytes."""
@@ -186,6 +181,8 @@ class BackendClient:
             add_signature=False,
             extra_headers=self._get_signed_request_headers(method, path, body),
             raw_body=body if json_data is not None else None,
+            timeout=timeout,
+            non_200_log_level=non_200_log_level,
             raise_on_4xx=raise_on_4xx,
         )
 
@@ -252,7 +249,12 @@ class BackendClient:
         context = {"url": url, "method": method}
 
         try:
-            headers = self._get_signature_headers() if add_signature else {}
+            headers = {}
+            if add_signature:
+                # DAH-6169: every signed call signs method, path?query, body hash and timestamp; the bytes signed are sent
+                if raw_body is None and json_data is not None:
+                    raw_body = json.dumps(json_data, separators=(",", ":"), sort_keys=True).encode()
+                headers = self._get_signed_request_headers(method, "/" + path.lstrip("/"), raw_body or b"")
             if extra_headers:
                 headers.update(extra_headers)
 
@@ -354,7 +356,8 @@ class BackendClient:
         answer within the 30 s timeout returns None, and the caller decides what that means;
         nothing waits 60 s for two more attempts inside a running pipeline.
         """
-        return await self.get(
+        return await self._signed_request(
+            "GET",
             "/internal/executors/rented",
             RentedExecutorsResponse,
             timeout=30,
@@ -381,7 +384,8 @@ class BackendClient:
 
     async def get_pod_rental_active(self, pod_id: str) -> PodRentalActiveResponse | None:
         """Fetch whether the backend still considers a pod rental active."""
-        return await self.get(
+        return await self._signed_request(
+            "GET",
             f"/internal/pods/{pod_id}/rental-active",
             PodRentalActiveResponse,
             timeout=10,
@@ -396,7 +400,8 @@ class BackendClient:
         the same downtime reported by a later cycle while keeping a genuine second reboot of the
         same pod a separate event. Older backends 404 and the caller treats that as nothing to do.
         """
-        return await self.post(
+        return await self._signed_request(
+            "POST",
             f"/internal/pods/{pod_id}/host-reboot-recovered",
             PodHostRebootRecoveredResponse,
             json_data={"container_finished_at": container_finished_at},
@@ -433,7 +438,8 @@ class BackendClient:
         ``gpu_details``: the scrape's card list, sent when the anchored cards are gone.
         ``observed_at``: when the check saw the fault or the clean result (a retried recovery keeps it).
         """
-        return await self.post(
+        return await self._signed_request(
+            "POST",
             f"/internal/pods/{quote(str(pod_id), safe='')}/gpu-drop",
             RentedGpuDropResponse,
             json_data={
@@ -461,7 +467,7 @@ class BackendClient:
         (`?light=true`), shaped as the rented list the probe takes. A 4xx (a backend without the
         parameter) falls back to the full list."""
         try:
-            answer = await self._request(
+            answer = await self._signed_request(
                 "GET", "/internal/executors/rented?light=true", RentedPodTargets, timeout=30, raise_on_4xx=True
             )
         except BackendRejected:
@@ -530,7 +536,17 @@ class BackendClient:
         path = f"/internal/filler-runs/{filler_run_id}/active"
         if container_missing:
             path += "?container_missing=true"
-        return await self.get(path, FillerRunActiveResponse, timeout=10)
+        return await self._signed_request("GET", path, FillerRunActiveResponse, timeout=10)
+
+    async def get_storage_operation_active(
+        self, operation_id: str
+    ) -> StorageOperationActiveResponse | None:
+        """Whether the backend still has this storage operation open; None when it did not say."""
+        return await self.get(
+            f"/internal/storage-operations/{operation_id}/active",
+            StorageOperationActiveResponse,
+            timeout=10,
+        )
 
     async def check_executor_health(
         self,
@@ -600,11 +616,11 @@ class BackendClient:
         try:
             # the whole call, retries included: a connection retry must not restart the wait
             return await asyncio.wait_for(
-                self.post(
+                self._signed_request(
+                    "POST",
                     path,
                     ExecutorHealthCheckResponse,
                     json_data=json_data,
-                    add_signature=True,  # Use standard signature headers
                     timeout=timeout,
                 ),
                 timeout,
@@ -648,7 +664,8 @@ class BackendClient:
         for start in range(0, len(uuids), VERIFICATION_STARTED_BATCH_MAX):
             chunk = uuids[start : start + VERIFICATION_STARTED_BATCH_MAX]
             try:
-                await self.post(
+                await self._signed_request(
+                    "POST",
                     path,
                     VerificationStartedResponse,
                     json_data={
@@ -657,7 +674,6 @@ class BackendClient:
                         "started_at": started_at.isoformat(),
                         "executor_uuids": chunk,
                     },
-                    add_signature=True,
                     timeout=10,
                     non_200_log_level=logging.WARNING,
                 )
@@ -682,11 +698,11 @@ class BackendClient:
         config. Never raises — a reporting failure must not disturb the pipeline.
         """
         try:
-            await self.post(
+            await self._signed_request(
+                "POST",
                 "/v1/nvml-driver/report-unknown",
                 NvmlReportAckResponse,
                 json_data={"driver_version": driver_version},
-                add_signature=True,
                 timeout=10,
             )
         except Exception as exc:

@@ -159,7 +159,7 @@ def test_read_command_reports_a_missing_pid_without_failing(tmp_path):
     out = subprocess.run(
         ["sh", "-c", read_command([999], proc=str(tmp_path))], capture_output=True, text=True
     )
-    assert out.stdout == "999|||\n"
+    assert out.stdout == "999|||||||\n"
 
 
 @pytest.mark.parametrize(
@@ -179,3 +179,106 @@ def test_an_unread_root_home_is_judged_from_slash_and_an_unread_slash_is_unknown
         assert pod is None
     else:
         assert pod["outside_namespace"] == outside
+
+
+def test_a_shifted_sudo_file_warns_although_slash_and_root_home_are_inside():
+    # a power loss left /etc/sudoers.d/README owned by nobody while / and /root were fine: sudo fails
+    pod = judge("4242|0 100000 65536|100000|100000|100000|100000|65534|100000")
+    assert pod["outside_namespace"] == ["/etc/sudoers.d/README"]
+
+
+@pytest.mark.asyncio
+async def test_the_read_includes_sudo_files_and_an_image_without_sudo_is_ok(
+    context_factory, tmp_path
+):
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me}      65536\n")
+    (tmp_path / "4242" / "root" / "etc" / "sudoers.d").mkdir(parents=True)
+    (tmp_path / "4242" / "root" / "etc" / "sudoers.d" / "README").write_text("")
+    _proc(tmp_path, 4343, f"         0     {me}      65536\n")  # no sudo in the image
+    result = await RentedPodOwnershipCheck().run(_ctx(context_factory, _ssh(str(tmp_path))))
+    assert result.event.reason_code == Msg.OK.reason
+    pods = {p["container"]: p for p in result.event.what_we_saw["pods"]}
+    assert pods["pod_1"]["host_owners"] == {
+        "/": me,
+        "/root": me,
+        "/etc/sudoers.d": me,
+        "/etc/sudoers.d/README": me,
+    }
+    assert pods["pod_2"]["host_owners"] == {"/": me, "/root": me}
+
+
+def _ssh_with_uptime(proc: str, uptime_and_ages: str):
+    inner = _ssh(proc)
+
+    async def run(cmd, check=False):
+        if cmd.startswith("cut -d' ' -f1 /proc/uptime"):
+            return SimpleNamespace(exit_status=0, stdout=uptime_and_ages, stderr="")
+        return await inner.run(cmd, check=check)
+
+    return SimpleNamespace(run=run)
+
+
+@pytest.mark.parametrize(
+    ("uptime_and_ages", "template", "after_boot"),
+    [
+        # host up a day, pod container started 30 s ago: a `docker restart`, not a host reboot
+        ("86400.12\n 4242    30\n", Msg.SHIFTED_AFTER_CONTAINER_RESTART, 86370),
+        # host up 700 s, container started 50 s after boot: brought back by the reboot
+        ("700.50\n4242 650\n", Msg.SHIFTED, 50),
+        # uptime not read: the cause is unknown, the host message stays
+        ("\n4242 30\n", Msg.SHIFTED, None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_shift_after_a_container_only_restart_does_not_blame_the_host(
+    context_factory, tmp_path, uptime_and_ages, template, after_boot
+):
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me + 200000}      65536\n")
+    _proc(tmp_path, 4343, f"         0     {me}      65536\n")
+    result = await RentedPodOwnershipCheck().run(
+        _ctx(context_factory, _ssh_with_uptime(str(tmp_path), uptime_and_ages))
+    )
+    assert result.event.reason_code == Msg.SHIFTED.reason
+    assert result.event.remediation == template.remediation
+    pods = {p["container"]: p for p in result.event.what_we_saw["pods"]}
+    assert pods["pod_1"].get("started_after_boot_s") == after_boot
+    assert "started_after_boot_s" not in pods["pod_2"]  # only the shifted pod is read
+
+
+@pytest.mark.parametrize(
+    ("uptime_and_ages", "template"),
+    [
+        # pod_1 restarted 30 s ago on a host up a day, pod_2 started 50 s after boot: one cause does not fit both
+        ("86400\n4242 30\n4343 86350\n", Msg.SHIFTED_MIXED),
+        # pod_2's age not read: the cause is unknown, the host message stays
+        ("86400\n4242 30\n", Msg.SHIFTED),
+    ],
+)
+@pytest.mark.asyncio
+async def test_shifted_pods_with_different_histories_are_not_all_blamed_on_the_host(
+    context_factory, tmp_path, uptime_and_ages, template
+):
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me + 200000}      65536\n")
+    _proc(tmp_path, 4343, f"         0     {me + 200000}      65536\n")
+    result = await RentedPodOwnershipCheck().run(
+        _ctx(context_factory, _ssh_with_uptime(str(tmp_path), uptime_and_ages))
+    )
+    assert result.event.remediation == template.remediation
+
+
+@pytest.mark.asyncio
+async def test_each_age_stays_with_its_own_pid_when_one_pid_prints_nothing(context_factory, tmp_path):
+    # stand case e: ps prints nothing for pid 4242 (gone since the read) and 30 s for 4343
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me + 200000}      65536\n")
+    _proc(tmp_path, 4343, f"         0     {me + 200000}      65536\n")
+    result = await RentedPodOwnershipCheck().run(
+        _ctx(context_factory, _ssh_with_uptime(str(tmp_path), "86400\n 4343    30\n"))
+    )
+    pods = {p["container"]: p for p in result.event.what_we_saw["pods"]}
+    assert "started_after_boot_s" not in pods["pod_1"]
+    assert pods["pod_2"]["started_after_boot_s"] == 86370
+    assert result.event.remediation == Msg.SHIFTED.remediation  # pod_1's history is unknown

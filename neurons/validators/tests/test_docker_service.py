@@ -3529,6 +3529,7 @@ async def test_create_container_missing_host_key_reports_sdk_host_key_failure_st
         payload.miner_hotkey,
         payload.executor_id,
         payload.pod_id,
+        command_id=payload.command_id,
     )
     assert docker_service.rental_docker_client_factory.connect_calls == []
     assert connect_mock.call_count == 0
@@ -3978,6 +3979,7 @@ async def test_create_container_clears_pending_pod_after_successful_filler_creat
         payload.miner_hotkey,
         payload.executor_id,
         payload.pod_id,
+        command_id=payload.command_id,
     )
 
 
@@ -4148,6 +4150,7 @@ async def test_create_container_reports_docker_pull_failure_step(
         payload.miner_hotkey,
         payload.executor_id,
         payload.pod_id,
+        command_id=payload.command_id,
     )
 
 
@@ -4474,6 +4477,90 @@ async def test_a_template_that_starts_its_own_sshd_is_checked_without_the_bootst
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ships_sshd", [True, False], ids=["cached_template", "bootstrap"])
+async def test_the_vulkan_icd_is_registered_before_the_create_replies(
+    docker_service, monkeypatch, pod_ssh_answers_on_create_path, ships_sshd
+):
+    """DAH-5847: a slow ICD registration still ends before ContainerCreated, on both create paths."""
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(docker_service, "generate_portMappings", AsyncMock(return_value=([(22, 20001, 20001)], None)))
+    registered = []
+
+    async def slow_registration(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        registered.append(True)
+        return True
+
+    # the cached template registers it on its own; the bootstrap script registers it inside the bootstrap
+    monkeypatch.setattr(docker_service, "register_vulkan_icd_with_rental_docker", slow_registration)
+    monkeypatch.setattr(
+        docker_service, "install_open_ssh_server_and_start_ssh_service_with_rental_docker", slow_registration
+    )
+    payload = _private_registry_create_payload().model_copy(update={"ships_sshd": ships_sshd})
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+    assert registered == [True]
+
+
+@pytest.mark.asyncio
+async def test_a_container_that_stops_during_the_icd_registration_is_not_reported_created(
+    docker_service, monkeypatch, pod_ssh_answers_on_create_path
+):
+    """Sergej (lio#2105 F-2): the running check read the container before the registration ended."""
+    from services.rental_docker_sdk import ContainerGoneBeforeExec
+
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    monkeypatch.setattr(docker_service, "generate_portMappings", AsyncMock(return_value=([(22, 20001, 20001)], None)))
+    stopped = []
+
+    async def registration_during_which_it_stops(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        stopped.append(True)
+
+    async def running_check(docker_client, *, container_name, container_id=None):
+        if stopped:
+            raise ContainerGoneBeforeExec("the container exited", container_name=container_name, state=None)
+
+    monkeypatch.setattr(docker_service, "register_vulkan_icd_with_rental_docker", registration_during_which_it_stops)
+    monkeypatch.setattr("services.docker_service._raise_unless_running_before_created", running_check)
+    payload = _private_registry_create_payload().model_copy(update={"ships_sshd": True})
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert not isinstance(result, ContainerCreated)
+@pytest.mark.asyncio
 async def test_create_container_reports_set_environment_failure_step(
     docker_service,
     monkeypatch,
@@ -4578,6 +4665,7 @@ async def test_create_container_reports_set_environment_failure_step(
         payload.miner_hotkey,
         payload.executor_id,
         payload.pod_id,
+        command_id=payload.command_id,
     )
 
 
@@ -6282,7 +6370,7 @@ async def test_resolve_volume_sizing_legacy_passthrough(docker_service):
 @pytest.mark.asyncio
 async def test_resolve_volume_sizing_fresh_pool_bound(docker_service):
     # Arrange: df_avail=900GB, existing volumes=300GB, overhead 20 -> pool 1180GB,
-    # disk_share 0.5 -> slice 590GB -> volume 393GB, storage 196GB.
+    # disk_share 0.5 -> the volume takes 590GB of it (DAH-6187: the storage is a quota) -> storage 295GB.
     payload = _make_sizing_payload(disk_share=0.5, storage_limit_gb=1)
     ssh_client = _make_sizing_ssh_client(
         df_avail_bytes=900 * _SIZING_GB,
@@ -6296,10 +6384,46 @@ async def test_resolve_volume_sizing_fresh_pool_bound(docker_service):
     # Assert
     assert result.path == "fresh"
     assert result.capped_by == "pool"
-    assert result.volume_limit_gb == 393
-    assert result.storage_limit_gb == 196
+    assert result.volume_limit_gb == 590
+    assert result.storage_limit_gb == 295
     assert result.df_avail_bytes == 900 * _SIZING_GB
     assert result.existing_volumes_bytes == 300 * _SIZING_GB
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stderr", "path", "existing_gb"),
+    [
+        ("Error response from daemon: get volume_gone: no such volume\n", "fresh", 300),
+        ("Cannot connect to the Docker daemon\n", "fresh_fallback", None),
+    ],
+)
+async def test_resolve_volume_sizing_skips_a_volume_removed_before_the_inspect(
+    docker_service, stderr, path, existing_gb
+):
+    # The renter deleted one pod while creating the next: the listed volume_gone is gone by the inspect.
+    # Only that error sizes from the volumes still there; any other inspect error still falls back.
+    payload = _make_sizing_payload(disk_share=0.5, storage_limit_gb=1, volume_limit_gb=447)
+    ssh_client = _make_sizing_ssh_client(
+        df_avail_bytes=900 * _SIZING_GB,
+        volume_ls_stdout="volume_gone vloopback:latest\nvolume_kept vloopback:latest\n",
+    )
+    run = ssh_client.run.side_effect
+
+    def inspect(command, **kwargs):
+        if "volume inspect" not in command:
+            return run(command, **kwargs)
+        if "volume_gone" in command:
+            return Mock(stdout="", stderr=stderr, exit_status=1)
+        return Mock(stdout=f"{300 * _SIZING_GB}|<no value>\n", stderr="", exit_status=0)
+
+    ssh_client.run = AsyncMock(side_effect=inspect)
+
+    result = await docker_service.resolve_volume_sizing(ssh_client, payload, "tag", {})
+
+    assert result.path == path
+    if existing_gb is not None:
+        assert result.existing_volumes_bytes == existing_gb * _SIZING_GB
 
 
 @pytest.mark.asyncio
@@ -6487,7 +6611,7 @@ async def test_create_container_fresh_sizing_uses_effective_values(
     """disk_share set: effective fresh values (not payload echoes) must flow into
     create_local_volume, the docker run --storage-opt flag, and ContainerCreated."""
     # Arrange: df_avail=900GB, existing vloopback=300GB, share=0.5 -> pool 1180GB,
-    # slice 590GB (request cap 400*1.5=600GB does not bind) -> volume 393, storage 196.
+    # the volume takes 590GB (request cap 700GB does not bind; DAH-6187) -> volume 590, storage 295.
     def ssh_run(command, **kwargs):
         if "docker info" in command and "flock" not in command:
             return _make_ssh_command_result(stdout="/var/lib/docker\n")
@@ -6549,7 +6673,7 @@ async def test_create_container_fresh_sizing_uses_effective_values(
         gpu_uuids=["GPU-test"],
         cpu_count=1,
         memory_gb=1,
-        volume_limit_gb=400,
+        volume_limit_gb=700,
         storage_limit_gb=250,
         disk_share=0.5,
         available_ports=[PayloadPortMapping(internal_port=20001, external_port=20001)],
@@ -6578,13 +6702,13 @@ async def test_create_container_fresh_sizing_uses_effective_values(
     )
 
     # Assert: fresh-computed volume limit reaches local volume creation
-    assert docker_service.create_local_volume.await_args.kwargs["limit"] == 393
+    assert docker_service.create_local_volume.await_args.kwargs["limit"] == 590
     # Assert: fresh-computed storage limit reaches Docker SDK host config data
     run_spec = docker_service.rental_docker_client_factory.client.run_specs[-1]
-    assert run_spec.storage_limit_gb == 196
+    assert run_spec.storage_limit_gb == 295
     # Assert: ContainerCreated carries effective values, not payload echoes
-    assert result.volume_limit_gb == 393
-    assert result.storage_limit_gb == 196
+    assert result.volume_limit_gb == 590
+    assert result.storage_limit_gb == 295
 
 
 def test_should_encrypt_local_volume_requires_local_sysbox_customer_volume(monkeypatch):

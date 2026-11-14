@@ -4,8 +4,6 @@ This implementation extracts the original score calculation and weight distribut
 logic to maintain backward compatibility with the existing system.
 """
 
-from datetime import UTC, datetime
-
 import bittensor
 from clients.referral_feed_client import ReferralFeedClient
 from services.executor_rollout import RUN_ENDED_WITHOUT_FAILING
@@ -34,14 +32,12 @@ def _parse_driver_version(value: str) -> tuple[int, ...] | None:
 def get_min_driver_multiplier(
     driver_version: str,
     is_rented: bool = False,
-    reference_time: datetime | None = None,
 ) -> float:
-    """Minimum NVIDIA driver multiplier with a grace period.
+    """Minimum NVIDIA driver multiplier.
 
     An executor whose reported driver is at least ``settings.MIN_NVIDIA_DRIVER_VERSION``
     (compared as a dotted version tuple) is unaffected (multiplier 1.0). A non-compliant
-    unrented executor gets a grace period until ``settings.MIN_DRIVER_CUTOFF`` (multiplier
-    1.0) and is fully gated on/after it (multiplier 0.0).
+    unrented executor is fully gated (multiplier 0.0).
 
     Currently-rented executors are always exempt — an active customer must not be
     penalised because their miner has not yet upgraded the host driver.
@@ -49,20 +45,12 @@ def get_min_driver_multiplier(
     A missing or unparseable ``driver_version`` means the value was not reported (a real
     GPU always reports a driver string), so the gate fails open rather than penalising an
     unknown reading.
-
-    ``reference_time`` is normalised to naive-UTC so it can be compared with the naive
-    cutoff (same convention as ``SYSBOX_RENTED_CUTOFF``); tests may inject it.
     """
     if is_rented:
         return 1.0
     reported = _parse_driver_version(driver_version)
     required = _parse_driver_version(settings.MIN_NVIDIA_DRIVER_VERSION)
     if reported is None or required is None or reported >= required:
-        return 1.0
-    now = reference_time or datetime.now(UTC)
-    if now.tzinfo is not None:
-        now = now.astimezone(UTC).replace(tzinfo=None)
-    if now < settings.MIN_DRIVER_CUTOFF:
         return 1.0
     return 0.0
 
@@ -108,15 +96,13 @@ class DefaultIncentive(BaseIncentive):
 
     @staticmethod
     def _record_outdated_image_reason(result: JobResult) -> bool:
-        """True when an OUTDATED executor image excludes this result from both pools.
-
-        Only when EXECUTOR_IMAGE_CHECK_ENFORCE is on (DAH-2701). Off, the report still
-        travels on the result and its specs, but no reason is recorded and nothing is zeroed.
+        """True when the executor image excludes this result from both pools: always for an UNOFFICIAL
+        image, and for an OUTDATED one only when EXECUTOR_IMAGE_CHECK_ENFORCE is on (DAH-2701). Off, an
+        OUTDATED report still travels on the result and its specs, but nothing is recorded or zeroed.
         """
-        if not settings.EXECUTOR_IMAGE_CHECK_ENFORCE:
-            return False
         report = result.executor_image_report or {}
-        if report.get("status") != "OUTDATED":
+        status = report.get("status")
+        if status != "UNOFFICIAL" and not (settings.EXECUTOR_IMAGE_CHECK_ENFORCE and status == "OUTDATED"):
             return False
         if not any(
             reason.reason == ZeroIncentiveReason.OUTDATED_EXECUTOR_IMAGE.value
@@ -139,11 +125,11 @@ class DefaultIncentive(BaseIncentive):
         reason_code: str = MinerLogLine.validation_failure_code(result)
         if reason_code in RUN_ENDED_WITHOUT_FAILING:
             return
-        if reason_code == ExecutorImageMessages.OUTDATED.reason and any(
+        if reason_code in (ExecutorImageMessages.OUTDATED.reason, ExecutorImageMessages.UNOFFICIAL.reason) and any(
             reason.reason == ZeroIncentiveReason.OUTDATED_EXECUTOR_IMAGE.value
             for reason in result.zero_incentive_reasons
         ):
-            # the image check failed on the outdated image: outdated_executor_image already says so
+            # the image check failed on the image: outdated_executor_image already says so
             return
         result.record_incentive_log(MinerLogLine.no_payout_because_validation_failed(result))
 
@@ -251,7 +237,7 @@ class DefaultIncentive(BaseIncentive):
 
             job_result.sysbox_multiplier = 1 - portion
 
-        # Minimum NVIDIA driver multiplier (phased gate); rented executors are exempt.
+        # Minimum NVIDIA driver multiplier; rented executors are exempt.
         job_result.driver_multiplier = get_min_driver_multiplier(
             job_result.nvidia_driver_version, is_rented=job_result.is_rented
         )

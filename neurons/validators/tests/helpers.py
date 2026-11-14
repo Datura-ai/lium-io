@@ -133,6 +133,9 @@ class FakeRedis:
         # it sits inside write_atomically
         self.fail_delete_of: set[str] = set()
         self.calls = 0
+        # request_executor_recheck_once: executor ids queued, and the ones still inside their window
+        self.recheck_requests: list[str] = []
+        self.recheck_claims: set[str] = set()
 
     def _touch(self):
         self.calls += 1
@@ -156,6 +159,14 @@ class FakeRedis:
                 del self.fail_set_of_after[key]
                 raise redis.exceptions.TimeoutError(f"Timeout writing {key}")
             self.fail_set_of_after[key] -= 1
+
+    async def request_executor_recheck_once(self, executor_id: str, ttl_seconds: int) -> bool:
+        self._touch()
+        if executor_id in self.recheck_claims:
+            return False
+        self.recheck_claims.add(executor_id)
+        self.recheck_requests.append(executor_id)
+        return True
 
     async def set(self, key: str, value: str, ex: int | None = None):
         self._touch()
@@ -228,6 +239,23 @@ class FakeRedis:
         self._touch()
         for field in fields:
             self.hashes.get(key, {}).pop(field, None)
+
+    async def _update_pending_pods(self, miner_hotkey: str, executor_id: str, change, also=None):
+        """`RedisService._update_pending_pods`: read, change and write with no await between, so atomic here;
+        `also()` first, so a batch that fails applies none of it"""
+        import json
+
+        from neurons.validators.src.services.redis_service import PENDING_PODS_PREFIX, _parse_pending_pods
+
+        self._touch()
+        field = f"{miner_hotkey}:{executor_id}"
+        pending_pods = change(_parse_pending_pods(self.hashes.get(PENDING_PODS_PREFIX, {}).get(field)))
+        if also:
+            await self.write_atomically(also())
+        if pending_pods:
+            self.hashes.setdefault(PENDING_PODS_PREFIX, {})[field] = json.dumps(pending_pods)
+        else:
+            self.hashes.get(PENDING_PODS_PREFIX, {}).pop(field, None)
 
     async def expire(self, key: str, seconds: int):
         self._touch()

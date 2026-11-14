@@ -411,7 +411,7 @@ async def test_the_backend_client_posts_observed_at():
     from neurons.validators.src.clients.backend_client import BackendClient
 
     client = BackendClient.__new__(BackendClient)
-    client.post = AsyncMock(return_value=None)
+    client._signed_request = AsyncMock(return_value=None)
     kwargs = dict(
         state="recovered",
         executor_id="e",
@@ -427,9 +427,9 @@ async def test_the_backend_client_posts_observed_at():
         nvml_gpu_count=8,
     )
     await client.report_rented_gpu_drop(POD_ID, observed_at="t1", **kwargs)
-    assert client.post.await_args.kwargs["json_data"]["observed_at"] == "t1"
+    assert client._signed_request.await_args.kwargs["json_data"]["observed_at"] == "t1"
     await client.report_rented_gpu_drop(POD_ID, **kwargs)
-    assert "observed_at" not in client.post.await_args.kwargs["json_data"]
+    assert "observed_at" not in client._signed_request.await_args.kwargs["json_data"]
 
 
 DUPLICATE_LISTED = UUIDS[:7] + [UUIDS[0]]

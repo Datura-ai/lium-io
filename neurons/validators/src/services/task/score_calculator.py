@@ -38,10 +38,9 @@ def calculate_scores(
     # Outdated executor image (DAH-2701). Enforcement is off by default until nodes
     # auto-update again (DAH-3419); off, ExecutorImageCheck logs the verdict as a warning.
     image_report = getattr(ctx.state, "executor_image_report", None)
-    if (
-        settings.EXECUTOR_IMAGE_CHECK_ENFORCE
-        and image_report
-        and image_report.status is ImageVerdict.OUTDATED
+    if image_report and (
+        image_report.status is ImageVerdict.UNOFFICIAL
+        or (settings.EXECUTOR_IMAGE_CHECK_ENFORCE and image_report.status is ImageVerdict.OUTDATED)
     ):
         actual_score = 0.0
         job_score = 0.0
@@ -153,6 +152,12 @@ def calculate_scores(
         actual_score = 0.0
         job_score = 0.0
         warning_messages.append("The kernel lists fewer GPUs than the node reports")
+
+    # GPU model gate (DAH-6241): same mechanics; the renter's pod keeps running, the provider is not paid.
+    if not ctx.gpu_model_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("A GPU is not the model the node reports")
 
     # EMA verifyx download speed check — threshold enforced upstream in VerifyXCheck
     ema_verifyx_download = ((ctx.state.specs or {}).get("network") or {}).get(
