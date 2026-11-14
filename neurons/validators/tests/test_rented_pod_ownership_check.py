@@ -282,3 +282,10 @@ async def test_each_age_stays_with_its_own_pid_when_one_pid_prints_nothing(conte
     assert "started_after_boot_s" not in pods["pod_1"]
     assert pods["pod_2"]["started_after_boot_s"] == 86370
     assert result.event.remediation == Msg.SHIFTED.remediation  # pod_1's history is unknown
+
+
+@pytest.mark.parametrize("template", [Msg.SHIFTED, Msg.SHIFTED_AFTER_CONTAINER_RESTART, Msg.SHIFTED_MIXED])
+def test_shifted_remediation_sends_provider_to_support_not_a_host_ownership_change(template):
+    assert "uid_map" not in template.remediation
+    assert "Contact support" in template.remediation
+    assert "free of charge" in template.remediation
