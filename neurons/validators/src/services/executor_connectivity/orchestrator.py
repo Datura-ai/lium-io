@@ -1,5 +1,6 @@
 import logging
 import random
+from datetime import UTC, datetime
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 
@@ -21,22 +22,27 @@ logger = logging.getLogger(__name__)
 PROBE_CONTAINER_PREFIXES = ("/port_test", "/container_")
 
 
-async def ports_held_by_containers(ssh_client) -> set[int]:
+async def ports_held_by_containers(ssh_client) -> set[int] | None:
     """Host ports published by any non-probe container on the host, stopped or restarting ones included.
 
     A rental created while a validation job runs publishes its ports after the job picked its own. If its
     container exits and Docker restarts it while our DinD container sits on one of them, the restart fails
-    with "port is already allocated" and the pod stays down. Read failures return an empty set."""
+    with "port is already allocated" and the pod stays down. None when the inventory is unknown: the read
+    raised, exited non-zero or printed a line it cannot parse."""
     try:
         result = await ssh_client.run(DockerCommand.host_port_bindings())
     except Exception:
-        return set()
+        return None
+    if result.exit_status != 0 or not isinstance(result.stdout, str):
+        return None
     held: set[int] = set()
-    for line in (result.stdout or "").splitlines():
+    for line in result.stdout.splitlines():
         name, _, ports = line.partition(" ")
+        if not name.startswith("/") or not all(port.isdigit() for port in ports.split()):
+            return None
         if name.startswith(PROBE_CONTAINER_PREFIXES):
             continue
-        held.update(int(port) for port in ports.split() if port.isdigit())
+        held.update(int(port) for port in ports.split())
     return held
 
 
@@ -71,16 +77,15 @@ class ConnectivityOrchestrator:
             "executor_ip": executor_info.address,
         }
         declared = declared_ports(executor_info)
-        unavailable = set(unavailable_ports or [])
+        # the validator's rental snapshot can miss a pod created or restarting since it was read
+        held_at_start = await ports_held_by_containers(ssh_client)
+        unavailable = set(unavailable_ports or []) | (held_at_start or set())
         ports = self.port_selector.select(
             executor_info,
             BATCH_PORT_VERIFICATION_SIZE,
             unavailable,
             declared=declared,
         )
-        # the validator's rental snapshot can miss a pod created or restarting since it was read
-        held_at_start = await ports_held_by_containers(ssh_client)
-        ports = [port for port in ports if port.internal not in held_at_start]
         declared_port_count = len(declared)
 
         if not ports:
@@ -107,23 +112,45 @@ class ConnectivityOrchestrator:
         successful = list(probe_result.successful)
         failed = list(probe_result.failed)
 
-        held = await ports_held_by_containers(ssh_client)
-        free_successful = [port for port in successful if port.internal not in held]
-        free_ports = [port for port in ports if port.internal not in held]
-        if held & {port.internal for port in ports}:
-            logger.info(
-                _m(
-                    "DinD port choice skips ports a container already publishes",
-                    extra=get_extra_info({**log_ctx, "held_ports": sorted(held & {p.internal for p in ports})}),
-                )
-            )
+        # read again right before the bind: a rental may have published a port while the batch probe ran.
+        # Residual race, not fixed: a container can still publish the chosen port between this read and the bind.
+        held = await ports_held_by_containers(ssh_client) if held_at_start is not None else None
+        free_successful = [port for port in successful if held is not None and port.internal not in held]
+        free_ports = [port for port in ports if held is not None and port.internal not in held]
         if free_successful:
             dind_port = free_successful[0]
             successful.remove(dind_port)
+        elif free_ports:
+            dind_port = random.choice(free_ports)
         else:
-            # shortcut: if every selected port is held we still bind one (old behaviour); skip DinD if this shows up
-            dind_port = random.choice(free_ports or ports)
+            dind_port = None
+        probe_log = {
+            **log_ctx,
+            "probe_container": f"container_{miner_hotkey}_{dind_port.external}" if dind_port else None,
+            "internal_port": dind_port.internal if dind_port else None,
+            "external_port": dind_port.external if dind_port else None,
+            "held_ports": sorted(held & {p.internal for p in ports}) if held is not None else None,
+            "inventory_known": held is not None,
+        }
+        if dind_port is None:
+            logger.info(_m("DinD probe skipped: no candidate port known free", extra=get_extra_info(probe_log)))
+            port_ranges = tally_port_ranges(declared, ports, successful)
+            return PortVerificationResult(
+                selected_ports=tuple(ports),
+                successful_ports=tuple(successful),
+                failed_ports=tuple(failed),
+                dind_port=None,
+                dind_ok=False,
+                sysbox_runtime=sysbox_runtime,
+                status="ok" if successful else "no_working_ports",
+                probe_tier=probe_result.tier,
+                external_probe=probe_result.external,
+                declared_port_count=declared_port_count,
+                port_ranges=port_ranges,
+                dind_skipped=True,
+            )
         sysbox_requested = sysbox_runtime
+        started_at = datetime.now(UTC).isoformat()
         dind_result = await self.dind_probe.verify(
             dind_port,
             ssh_client=ssh_client,
@@ -132,6 +159,15 @@ class ConnectivityOrchestrator:
             sysbox_runtime=sysbox_runtime,
             log_ctx=log_ctx,
             deadline_monotonic=dind_deadline_monotonic,
+        )
+        logger.info(
+            _m(
+                "DinD probe finished",
+                extra=get_extra_info(
+                    {**probe_log, "started_at": started_at, "ended_at": datetime.now(UTC).isoformat(),
+                     "dind_ok": dind_result.success}
+                ),
+            )
         )
 
         if dind_result.success:

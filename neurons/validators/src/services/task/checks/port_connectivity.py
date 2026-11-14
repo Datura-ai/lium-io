@@ -225,7 +225,10 @@ class PortConnectivityCheck:
                 extra=extra,
             )
             return CheckResult(passed=False, event=event, fatal=True)
-        if probe_sysbox and not ctx.state.sysbox_runtime:
+        if result.dind_skipped:
+            # DAH-6376: no DinD probe ran, so Sysbox keeps its last known value, neither a pass nor a miss
+            result = replace(result, sysbox_runtime=ctx.state.sysbox_runtime)
+        elif probe_sysbox and not ctx.state.sysbox_runtime:
             # F-16: the request alone is no verdict (a no-ports or errored run echoes it back); only the probe's
             # own in-container measurement may say Sysbox works
             result = replace(result, sysbox_runtime=result.sysbox_measured is True)
@@ -252,6 +255,7 @@ class PortConnectivityCheck:
             "declared_port_count": declared_port_count,
             "probe_tier": result.probe_tier,
             "dind_ok": result.dind_ok,
+            "dind_skipped": result.dind_skipped,
         }
         if result.dind_error:
             extra_info["dind_error"] = result.dind_error.text
@@ -319,7 +323,7 @@ class PortConnectivityCheck:
 
         total = len(result.successful_ports) + len(result.failed_ports)
         pct = (len(result.successful_ports) / total * 100) if total > 0 else 0
-        dind_status = "ok" if result.dind_ok else "failed"
+        dind_status = "skipped" if result.dind_skipped else "ok" if result.dind_ok else "failed"
         batch_count = len(result.successful_ports) - (1 if result.dind_ok else 0)
         batch_status = "ok" if batch_count > 0 else "failed"
         ok_sample = sorted([p.internal for p in result.successful_ports])[:5]
@@ -741,6 +745,8 @@ class PortConnectivityCheck:
         """
         redis = ctx.services.redis
         try:
+            if result.dind_skipped and not rented:
+                return _SysboxMemoryUpdate(is_saved=True)
             if result.sysbox_measured is True:
                 await redis.record_sysbox_verified(
                     ctx.miner_hotkey, ctx.executor.uuid, settings.SYSBOX_VERIFIED_TTL_SECONDS

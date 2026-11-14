@@ -170,9 +170,10 @@ class DockerCommand:
     @staticmethod
     def host_port_bindings() -> str:
         """Build a command printing each container's name and published host ports, stopped containers included."""
+        # no pipe: a failed `docker ps` must exit non-zero, not read as a host without containers
         return (
-            "/usr/bin/docker ps -aq | xargs -r /usr/bin/docker inspect --format "
-            "'{{.Name}} {{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostPort}} {{end}}{{end}}'"
+            'ids=$(/usr/bin/docker ps -aq) && { [ -z "$ids" ] || /usr/bin/docker inspect --format '
+            "'{{.Name}} {{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostPort}} {{end}}{{end}}' $ids; }"
         )
 
     @staticmethod
