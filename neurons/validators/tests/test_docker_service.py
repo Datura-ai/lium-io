@@ -10157,6 +10157,32 @@ async def test_a_filler_that_exits_at_start_sends_its_log_tail_as_its_own_detail
 
 
 @pytest.mark.asyncio
+async def test_a_restarting_filler_whose_first_log_read_is_empty_is_read_again_before_cleanup(
+    docker_service, monkeypatch
+) -> None:
+    """Docker's restart can print the image's output only after the first read (prod 9 Nov)."""
+    log_tail = AsyncMock(side_effect=["", "", "miner v2 starting\n"])
+    docker_service.rental_docker_client_factory.client.container_log_tail = log_tail
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(s):
+        sleep_calls.append(s)
+
+    monkeypatch.setattr("services.docker_service.asyncio.sleep", fake_sleep)
+
+    result = await _create_failing_at_add_public_keys(
+        docker_service,
+        monkeypatch,
+        state=_state(status="running", running=True, restart_count=1),
+        exec_error=_EXEC_KILLED_BY_EXIT,
+    )
+
+    assert json.loads(result.detail.split(" >>> ", 1)[1])["container_logs_tail"] == "miner v2 starting"
+    assert log_tail.await_count == 3
+    assert sleep_calls[:2] == [1, 2]  # every re-read waits for the restarting image first
+
+
+@pytest.mark.asyncio
 async def test_a_key_injection_that_fails_in_a_running_container_keeps_the_exec_error(
     docker_service, monkeypatch
 ):
