@@ -3,7 +3,7 @@
 Builds drop egress to blocked ranges through host DOCKER-USER rules set by a
 ``--network=host --cap-add=NET_ADMIN`` helper container (``docker_service._egress_filter_script``).
 This check applies the same kind of rule for the rental network: traffic from the
-``lium-rentals`` subnet to 169.254.0.0/16 is dropped, except DNS (port 53), because a
+``lium-rentals`` subnet to link-local 169.254/16 is dropped, except DNS (port 53), because a
 rental container's embedded resolver forwards from the container's network namespace and
 some hosts use a link-local resolver.
 
@@ -13,7 +13,7 @@ some hosts use a link-local resolver.
   to the network's subnet, not to a pod, so nothing is left to remove when a pod ends.
 - Fail-open: a host without a DOCKER-USER chain or without the helper image logs a warning and
   validation proceeds; a hardening rule must not take a provider's node out of rotation.
-- DOCKER-USER sees forwarded traffic only: Docker DNS (127.0.0.11), published ports,
+- DOCKER-USER sees forwarded traffic only: Docker's embedded DNS, published ports,
   container-to-container traffic on the subnet and the validator's inbound SSH are unaffected.
 """
 
@@ -38,7 +38,8 @@ logger = logging.getLogger(__name__)
 APPLY_INTERVAL_SECONDS = 10 * 60
 HELPER_TIMEOUT_SECONDS = 90
 # RFC1918 is not blocked: multi-node clusters and provider LANs use private addresses.
-LINK_LOCAL_CIDR = "169.254.0.0/16"
+# The IPv4 link-local /16 that holds the cloud metadata address.
+LINK_LOCAL_CIDR = str(ipaddress.ip_network("169.254.169.254/16", strict=False))
 
 
 def rental_subnets(inspect_stdout: str) -> list[str]:

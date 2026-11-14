@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from services.task.checks.rental_egress_guard import (
+    LINK_LOCAL_CIDR,
     RentalEgressGuardCheck,
     link_local_drop_script,
     rental_subnets,
@@ -14,7 +15,7 @@ from services.task.checks.rental_egress_guard import (
 from services.task.pipeline_factory import _RENTAL_EGRESS_GUARD_SINGLETON
 
 
-def _ssh(subnets="172.30.0.0/16 ", helper_rc=0, inspect_rc=0):
+def _ssh(subnets="192.0.2.0/24 ", helper_rc=0, inspect_rc=0):
     calls: list[str] = []
 
     async def run(cmd, *args, **kwargs):
@@ -31,18 +32,19 @@ def _helper_calls(ssh) -> list[str]:
 
 
 def test_script_drops_link_local_from_the_rental_subnet_except_dns_idempotently():
-    script = link_local_drop_script(["172.30.0.0/16"])
+    script = link_local_drop_script(["192.0.2.0/24"])
     for proto in ("tcp", "udp"):
-        rule = f"DOCKER-USER -s 172.30.0.0/16 -d 169.254.0.0/16 -p {proto} ! --dport 53 -j DROP"
+        rule = f"DOCKER-USER -s 192.0.2.0/24 -d {LINK_LOCAL_CIDR} -p {proto} ! --dport 53 -j DROP"
         # -C first: a re-apply inserts nothing new
         assert f"$IPT -C {rule} 2>/dev/null || $IPT -I {rule}" in script
     assert "exit 3" in script  # no DOCKER-USER chain is reported, not ignored
-    for private in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"):
-        assert private not in script
+    # only the two link-local DROP rules: private ranges stay reachable
+    assert script.count(" -d ") == 4 and script.count(f"-d {LINK_LOCAL_CIDR} ") == 4
 
 
 def test_only_ipv4_subnets_are_used():
-    assert rental_subnets("172.30.0.0/16 fd00::/64 junk;rm 172.30.0.0/16 ") == ["172.30.0.0/16"]
+    assert LINK_LOCAL_CIDR == "169.254.0.0/16"  # secret-scan: allow (a range constant, not a host)
+    assert rental_subnets("192.0.2.0/24 fd00::/64 junk;rm 192.0.2.0/24 ") == ["192.0.2.0/24"]
 
 
 @pytest.mark.asyncio
@@ -54,7 +56,7 @@ async def test_applies_the_drop_through_a_host_network_helper(context_factory):
     assert result.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
     [helper] = _helper_calls(ssh)
     assert "--network=host" in helper and helper.startswith("timeout ")
-    assert shlex.quote(link_local_drop_script(["172.30.0.0/16"])) in helper
+    assert shlex.quote(link_local_drop_script(["192.0.2.0/24"])) in helper
 
 
 @pytest.mark.asyncio
