@@ -6282,6 +6282,11 @@
     },
     "SshPubKeyRemoved": {
       "properties": {
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
         "executor_id": {
           "title": "Executor Id",
           "type": "string"
@@ -6620,7 +6625,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "2.13.0",
+  "protocol_version": "2.14.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"

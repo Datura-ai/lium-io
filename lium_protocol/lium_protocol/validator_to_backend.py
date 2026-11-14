@@ -479,6 +479,8 @@ class SshPubKeyAdded(PodContainerResponse):
 class SshPubKeyRemoved(PodContainerResponse):
     message_type: ValidatorMessageType = ValidatorMessageType.SshPubKeyRemoved
     user_public_keys: list[str] = []
+    # 2.14.0: the RemoveSshPublicKeysRequest's command_id, echoed so the backend can tell which send this confirms
+    command_id: str = ""
 
 
 @VALIDATOR_MESSAGES.register

@@ -1719,6 +1719,8 @@ class ComputeClient:
             response: (
                 SshPubKeyRemoved | FailedContainerRequest
             ) = await self.miner_service.handle_container(job_request)
+            # as for an add: a delayed answer to an earlier removal must not confirm a later one
+            response.command_id = job_request.command_id
 
             logger.info(
                 _m(
