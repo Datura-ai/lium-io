@@ -1872,7 +1872,8 @@ class MinerService:
     async def list_executor_ids(self, miner: bittensor.NeuronInfo) -> list[str] | None:
         """The executor uuids a miner lists for this validator, or None when it does not answer.
 
-        The miner's POST /executors (verify_simple_validator_signature: we sign our own hotkey) is
+        The miner's POST /executors (verify_simple_validator_signature: the signed headers, plus the
+        legacy signature over our own hotkey for miners that predate DAH-6430) is
         a read of its executor table that installs nothing on the nodes, unlike the cycle's
         ssh-pubkey-submit. The express lane asks self-hosted miners, whose new nodes the portal
         snapshot does not list.
@@ -1888,7 +1889,7 @@ class MinerService:
                 method="POST",
                 url=f"http://{miner.axon_info.ip}:{miner.axon_info.port}/executors",
                 json_data=request.model_dump(),
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/json", **self._generate_auth_headers(my_key, miner.hotkey)},
                 timeout=REST_EXECUTOR_LIST_TIMEOUT,
                 log_extra=extra,
                 operation_name="executor list",
