@@ -496,8 +496,8 @@ async def test_a_miner_that_missed_one_listing_is_asked_again_a_minute_later(mon
 
 @pytest.mark.asyncio
 async def test_a_miners_executor_list_is_its_executors_route(wallet):
-    """POST /executors on the miner (a DB read; installs no key), signed over our own hotkey as
-    verify_simple_validator_signature checks. No answer is None, never an exception."""
+    """POST /executors on the miner (a DB read; installs no key): the signed headers bound to the miner,
+    plus the legacy signature over our own hotkey (DAH-6430). No answer is None, never an exception."""
     executor_id = str(uuid4())
     service = MinerService.__new__(MinerService)
     service._make_rest_request = AsyncMock(
@@ -515,7 +515,9 @@ async def test_a_miners_executor_list_is_its_executors_route(wallet):
     assert (call["method"], call["url"]) == ("POST", "http://192.0.2.10:8091/executors")
     assert call["json_data"] == {"signature": "0x010203", "validator_hotkey": VALIDATOR_HOTKEY}
     assert call["timeout"] <= 10
-    wallet.sign.assert_called_with(VALIDATOR_HOTKEY)
+    wallet.sign.assert_any_call(VALIDATOR_HOTKEY)
+    assert call["headers"]["X-Miner-Hotkey"] == "miner-self"
+    assert call["headers"]["X-Validator-Hotkey"] == VALIDATOR_HOTKEY
 
     service._make_rest_request = AsyncMock(return_value=(404, {"detail": "Not Found"}))
     assert await service.list_executor_ids(_Neuron("miner-self")) is None

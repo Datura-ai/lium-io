@@ -215,9 +215,18 @@ def require_request_names_authenticated_miner(request_miner_hotkey: str, authent
         )
 
 
+# DAH-6430: the signature over the validator's own hotkey is still accepted from validators that do not
+# send the signed headers yet. Set False, then remove the body-signature path, once validators send them.
+ACCEPT_UNBOUND_SIGNATURES = True
+
+
 async def verify_simple_validator_signature(
     request: SimpleValidatorRequest,
     validator_service: Annotated[ValidatorService, Depends(ValidatorService)],
+    x_validator_hotkey: Annotated[str | None, Header(alias="X-Validator-Hotkey")] = None,
+    x_miner_hotkey: Annotated[str | None, Header(alias="X-Miner-Hotkey")] = None,
+    x_timestamp: Annotated[int | None, Header(alias="X-Timestamp")] = None,
+    x_signature: Annotated[str | None, Header(alias="X-Signature")] = None,
 ) -> str:
     """Verify simple validator signature and return validator_hotkey if valid.
 
@@ -235,6 +244,22 @@ async def verify_simple_validator_signature(
         HTTPException: 401 if signature invalid, 403 if validator not registered
     """
     validator_hotkey = request.validator_hotkey
+
+    # DAH-6430: the signed headers bind the request to this miner and a 10 s window; while
+    # ACCEPT_UNBOUND_SIGNATURES a refused header set falls back to the body signature (clock skew)
+    if x_signature is not None:
+        try:
+            if None in (x_validator_hotkey, x_miner_hotkey, x_timestamp) or x_validator_hotkey != validator_hotkey:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incomplete signed headers")
+            return await verify_validator_auth_from_headers(
+                x_validator_hotkey, x_miner_hotkey, x_timestamp, x_signature, validator_service
+            )
+        except HTTPException as refused:
+            if not ACCEPT_UNBOUND_SIGNATURES:
+                raise
+            logger.warning("Signed headers refused on /executors (%s); checking the body signature", refused.detail)
+    elif not ACCEPT_UNBOUND_SIGNATURES:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Signed headers are required")
 
     # Check validator registration
     if not validator_service.is_valid_validator(validator_hotkey):

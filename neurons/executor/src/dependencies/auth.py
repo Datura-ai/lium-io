@@ -1,10 +1,19 @@
-from fastapi import HTTPException
-from bittensor_wallet import Keypair
 import json
 import time
-from core.config import VALIDATOR_HOTKEYS_SS58, settings
+
+from bittensor_wallet import Keypair
 from core.logger import get_logger
-from payloads.backend import SignaturePayload, HardwareUtilizationPayload, PingPayload, ContainerUtilizationPayload
+from fastapi import HTTPException
+from payloads.backend import (
+    BoundSignaturePayload,
+    ContainerUtilizationPayload,
+    HardwareUtilizationPayload,
+    PingPayload,
+    SignaturePayload,
+)
+from services.local_verify_service import accepted_miner_hotkeys
+
+from core.config import VALIDATOR_HOTKEYS_SS58, settings
 
 logger = get_logger(__name__)
 
@@ -80,18 +89,58 @@ def require_fresh_timestamp(timestamp: int) -> None:
             f"the accepted window is {max_age}s. Check that this host's clock is NTP-synced."
         )
         # the 401 body goes back to the platform; this line is what the provider sees in `docker logs`
-        logger.warning("Refusing a signed /containers request: %s", detail)
+        logger.warning("Refusing a signed request: %s", detail)
         raise HTTPException(status_code=401, detail=detail)
 
 
+# DAH-6430: the fixed-string signature is still accepted while the backend sends both forms.
+# Set False, then remove the legacy path and the `signature` field, once the fleet runs this version.
+ACCEPT_UNBOUND_SIGNATURES = True
+
+
+def bound_signing_message(purpose: str, miner_hotkey: str, timestamp: int) -> str:
+    """What the backend signs for /hardware_utilization and /ping (lium-platform signs the same string)."""
+    return f"{purpose}:{miner_hotkey}:{timestamp}"
+
+
+async def verify_bound_signature(payload: BoundSignaturePayload, purpose: str) -> None:
+    """The bound form when sent; while ACCEPT_UNBOUND_SIGNATURES, a refused or absent bound form falls back
+    to the legacy one, so a host clock off by more than the window does not take the node offline."""
+    if payload.bound_signature is not None:
+        try:
+            await _verify_bound(payload, purpose)
+            return
+        except HTTPException as refused:
+            if not ACCEPT_UNBOUND_SIGNATURES:
+                raise
+            # counted before the legacy path is turned off: each line is a node that would then refuse
+            logger.warning("Bound %s signature refused (%s); accepting the legacy one", purpose, refused.detail)
+    elif not ACCEPT_UNBOUND_SIGNATURES:
+        raise HTTPException(status_code=401, detail="A bound signature is required")
+    await verify_signature(payload, purpose)
+
+
+async def _verify_bound(payload: BoundSignaturePayload, purpose: str) -> None:
+    if payload.miner_hotkey is None or payload.timestamp is None:
+        raise HTTPException(status_code=401, detail="A bound signature needs miner_hotkey and timestamp")
+    accepted = accepted_miner_hotkeys(
+        own=settings.MINER_HOTKEY_SS58_ADDRESS,
+        pool=settings.LIUM_POOL_HOTKEY,
+        shared_portal_hotkey=settings.DEFAULT_MINER_HOTKEY,
+    )
+    if payload.miner_hotkey not in accepted:
+        raise HTTPException(status_code=401, detail="Signature is for another miner's nodes")
+    require_fresh_timestamp(payload.timestamp)
+    message = bound_signing_message(purpose, payload.miner_hotkey, payload.timestamp)
+    await verify_signature(SignaturePayload(signature=payload.bound_signature), message)
+
+
 async def verify_allowed_hotkey_signature(payload: HardwareUtilizationPayload):
-    FIXED_MESSAGE = "hardware_utilization_request"
-    await verify_signature(payload, FIXED_MESSAGE)
+    await verify_bound_signature(payload, "hardware_utilization_request")
 
 
 async def verify_ping_signature(payload: PingPayload):
-    FIXED_MESSAGE = "ping_request"
-    await verify_signature(payload, FIXED_MESSAGE)
+    await verify_bound_signature(payload, "ping_request")
 
 
 async def verify_container_signature(payload: ContainerUtilizationPayload):
