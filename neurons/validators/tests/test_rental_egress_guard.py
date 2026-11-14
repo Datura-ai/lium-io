@@ -103,17 +103,29 @@ async def test_runs_once_per_interval(context_factory):
 
 
 @pytest.mark.asyncio
-async def test_nothing_left_to_guard_removes_our_rules_without_pulling(context_factory):
+async def test_nothing_left_to_guard_removes_our_rules_pulling_a_pruned_image(context_factory):
     ssh = _ssh(network="", inspect_rc=1)
     result = await RentalEgressGuardCheck().run(context_factory(ssh=ssh))
 
     assert result.passed is True
     [helper] = _helper_calls(ssh)
-    assert "--pull=never" in helper and shlex.quote(link_local_cleanup_script()) in helper
+    assert "--pull=never" not in helper and shlex.quote(link_local_cleanup_script()) in helper
     script = link_local_cleanup_script()
     for chain in CHAINS:
         assert f"$IPT -D DOCKER-USER -j {chain}" in script and f"$IPT -F {chain}" in script
     assert "-j DROP" not in script and script.endswith("exit 0")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_cleanup_is_retried_next_cycle(context_factory):
+    check = RentalEgressGuardCheck()
+    ssh = _ssh(network="", inspect_rc=1, helper_rc=3)
+    ctx = context_factory(ssh=ssh)
+    first = await check.run(ctx)
+    await check.run(ctx)
+
+    assert first.passed is True and first.event.reason_code == "RENTAL_EGRESS_GUARD_SKIPPED"
+    assert len(_helper_calls(ssh)) == 2
 
 
 @pytest.mark.asyncio

@@ -130,9 +130,9 @@ def link_local_cleanup_script() -> str:
     return "; ".join(lines) + "; exit 0"
 
 
-def _helper(script: str, pull: str = "") -> str:
+def _helper(script: str) -> str:
     return (
-        f"/usr/bin/docker run --rm {pull}--network=host --cap-add=NET_ADMIN --entrypoint /bin/sh "
+        f"/usr/bin/docker run --rm --network=host --cap-add=NET_ADMIN --entrypoint /bin/sh "
         f"{shlex.quote(settings.CUSTOM_DOCKERFILE_DIND_IMAGE)} -c {shlex.quote(script)}"
     )
 
@@ -195,7 +195,20 @@ class RentalEgressGuardCheck:
             guarded, error = {}, str(exc)
         if guarded is None:
             # No rental network and no legacy rental: nothing to guard; the next interval checks again.
-            return self._skip(ctx, "no rental network")
+            if error is None:
+                return self._skip(ctx, "no rental network")
+            # A failed cleanup may have left stale rules: not a run, so the next cycle retries.
+            if last is None:
+                self._last_run.pop(key, None)
+            else:
+                self._last_run[key] = last
+            logger.warning(
+                _m(
+                    "Rental egress guard: stale rule cleanup failed",
+                    extra=get_extra_info({"executor_uuid": executor_uuid, "error": error}),
+                )
+            )
+            return self._skip(ctx, "cleanup failed")
 
         if error is not None:
             logger.warning(
@@ -233,12 +246,15 @@ class RentalEgressGuardCheck:
             )
             sources = legacy_sources(pods.stdout)
         if bridge is None and not sources:
-            # rules from a rental that has since ended must not outlive it (Docker reuses its address); never pull
-            # the image just to clean: a host without it never ran the guard
-            cleanup = _helper(link_local_cleanup_script(), "--pull=never ")
-            await ctx.ssh.run(f"timeout -k 5 {HELPER_TIMEOUT_SECONDS} {cleanup}", check=False)
-            return None, None
+            # rules from a rental that has since ended must not outlive it (Docker reuses its address); the image
+            # is pulled if it was pruned, since its absence says nothing about rules left in DOCKER-USER
+            cleanup = _helper(link_local_cleanup_script())
+            result = await ctx.ssh.run(f"timeout -k 5 {HELPER_TIMEOUT_SECONDS} {cleanup}", check=False)
+            return None, _error(result)
         helper = _helper(link_local_drop_script(bridge, sources))
         result = await ctx.ssh.run(f"timeout -k 5 {HELPER_TIMEOUT_SECONDS} {helper}", check=False)
-        error = None if result.exit_status == 0 else (result.stderr or "").strip()[-300:] or f"exit {result.exit_status}"
-        return {"bridge": bridge, "legacy_endpoints": len(sources)}, error
+        return {"bridge": bridge, "legacy_endpoints": len(sources)}, _error(result)
+
+
+def _error(result) -> str | None:
+    return None if result.exit_status == 0 else (result.stderr or "").strip()[-300:] or f"exit {result.exit_status}"
