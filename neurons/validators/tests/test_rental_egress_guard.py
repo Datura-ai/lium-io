@@ -7,13 +7,19 @@ import shlex
 from types import SimpleNamespace
 
 import pytest
+from services.task import pipeline_factory
+from services.task.checks import rental_egress_guard
 from services.task.checks.rental_egress_guard import (
     LINK_LOCAL_CIDR,
     RentalEgressGuardCheck,
     link_local_drop_script,
     rental_subnets,
 )
-from services.task.pipeline_factory import _RENTAL_EGRESS_GUARD_SINGLETON
+from services.task.pipeline_factory import (
+    _RENTAL_EGRESS_GUARD_IDLE,
+    _RENTAL_EGRESS_GUARD_RENTED,
+    PipelineFactory,
+)
 
 
 def _ssh(subnets="192.0.2.0/24 ", helper_rc=0, inspect_rc=0):
@@ -102,11 +108,52 @@ async def test_ssh_error_is_fail_open(context_factory):
     assert result.event.reason_code == "RENTAL_EGRESS_GUARD_NOT_APPLIED"
 
 
-def test_runs_in_both_pipelines():
-    import inspect
+@pytest.mark.parametrize("build", [PipelineFactory.build_checks, PipelineFactory.build_fast_path_checks])
+def test_never_runs_before_a_scored_step(build):
+    checks = build()
+    names = [type(check).__name__ for check in checks]
+    # rented: right before TenantEnforcementCheck, which halts a rented node; idle: after ScoreCheck
+    assert names[checks.index(_RENTAL_EGRESS_GUARD_RENTED) + 1] == "TenantEnforcementCheck"
+    assert names[checks.index(_RENTAL_EGRESS_GUARD_IDLE) - 1] == "ScoreCheck"
+    assert names.count("RentalEgressGuardCheck") == 2
 
-    from services.task import pipeline_factory
 
-    source = inspect.getsource(pipeline_factory)
-    assert source.count("_RENTAL_EGRESS_GUARD_SINGLETON,") == 2
-    assert isinstance(_RENTAL_EGRESS_GUARD_SINGLETON, RentalEgressGuardCheck)
+def test_not_in_the_dry_run():
+    names = [type(check).__name__ for check in PipelineFactory.build_dry_run_checks()]
+    assert "RentalEgressGuardCheck" not in names
+
+
+def test_both_positions_share_one_cadence():
+    assert _RENTAL_EGRESS_GUARD_RENTED._last_run is _RENTAL_EGRESS_GUARD_IDLE._last_run
+    assert pipeline_factory._RENTAL_EGRESS_GUARD_LAST_RUN is _RENTAL_EGRESS_GUARD_IDLE._last_run
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rented", [True, False])
+async def test_each_position_guards_only_its_own_nodes(context_factory, monkeypatch, rented):
+    rental = SimpleNamespace(pods=["pod"]) if rented else None
+    monkeypatch.setattr(rental_egress_guard, "rental_of_this_node", lambda ctx: rental)
+    ssh = _ssh()
+    ctx = context_factory(ssh=ssh)
+
+    other = await RentalEgressGuardCheck(rented_only=not rented).run(ctx)
+    assert _helper_calls(ssh) == [] and other.event.reason_code == "RENTAL_EGRESS_GUARD_SKIPPED"
+    own = await RentalEgressGuardCheck(rented_only=rented).run(ctx)
+    assert len(_helper_calls(ssh)) == 1 and own.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
+
+
+@pytest.mark.asyncio
+async def test_skipped_without_cadence_stamp_when_task_time_is_short(context_factory, monkeypatch):
+    check = RentalEgressGuardCheck()
+    ssh = _ssh()
+    left = rental_egress_guard.HELPER_TIMEOUT_SECONDS + rental_egress_guard.BUDGET_MARGIN_SECONDS - 1
+    monkeypatch.setattr(rental_egress_guard, "task_seconds_left", lambda ctx: left)
+
+    result = await check.run(context_factory(ssh=ssh))
+
+    assert result.passed is True and result.event.reason_code == "RENTAL_EGRESS_GUARD_SKIPPED"
+    assert ssh.calls == [] and check._last_run == {}
+    # the next cycle with time left applies it
+    monkeypatch.setattr(rental_egress_guard, "task_seconds_left", lambda ctx: 600)
+    await check.run(context_factory(ssh=ssh))
+    assert len(_helper_calls(ssh)) == 1

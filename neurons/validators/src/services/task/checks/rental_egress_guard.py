@@ -7,6 +7,10 @@ This check applies the same kind of rule for the rental network: traffic from th
 rental container's embedded resolver forwards from the container's network namespace and
 some hosts use a link-local resolver.
 
+- Never before a scored step: on a rented node it runs just before TenantEnforcementCheck, which
+  halts the rented node, so only the halt waits for it; on an idle node it runs after ScoreCheck.
+  A first helper-image pull can take up to ``HELPER_TIMEOUT_SECONDS``, so it is skipped (and
+  retried next cycle) when less than that is left before the executor task is cancelled.
 - Periodic, not on the create path: host iptables are gone after a reboot while rental
   containers come back (``restart=unless-stopped``), and a rental create gains no extra step.
 - Idempotent: every rule is ``-C || -I``; nothing accumulates across cycles. Rules are scoped
@@ -32,11 +36,15 @@ from core.utils import _m, get_extra_info
 from ..messages import RentalEgressGuardMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .rental_owner import rental_of_this_node
+from .task_time import task_seconds_left
 
 logger = logging.getLogger(__name__)
 
 APPLY_INTERVAL_SECONDS = 10 * 60
 HELPER_TIMEOUT_SECONDS = 90
+# the inspect read and FinalizeCheck after the helper
+BUDGET_MARGIN_SECONDS = 30
 # RFC1918 is not blocked: multi-node clusters and provider LANs use private addresses.
 # The IPv4 link-local /16 that holds the cloud metadata address.
 LINK_LOCAL_CIDR = str(ipaddress.ip_network("169.254.169.254/16", strict=False))
@@ -80,19 +88,36 @@ class RentalEgressGuardCheck:
     check_id = "executor.network.rental_egress_guard"
     fatal = False
 
-    def __init__(self, interval_seconds: int = APPLY_INTERVAL_SECONDS) -> None:
+    def __init__(
+        self,
+        interval_seconds: int = APPLY_INTERVAL_SECONDS,
+        *,
+        rented_only: bool = False,
+        last_run: dict[str, float] | None = None,
+    ) -> None:
         self._interval = interval_seconds
-        self._last_run: dict[str, float] = {}
+        # rented_only: the instance before TenantEnforcementCheck; the other runs after ScoreCheck, idle nodes only
+        self._rented_only = rented_only
+        # shared by both instances so a node is guarded once per interval whichever one it reaches
+        self._last_run: dict[str, float] = {} if last_run is None else last_run
+
+    def _skip(self, ctx: Context, reason: str) -> CheckResult:
+        return CheckResult(
+            passed=True,
+            event=render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what={"reason": reason}),
+        )
 
     async def run(self, ctx: Context) -> CheckResult:
         executor_uuid = ctx.executor.uuid
+        rental = rental_of_this_node(ctx)
+        if self._rented_only != bool(rental and rental.pods):
+            return self._skip(ctx, "guarded at the other position")
+        if task_seconds_left(ctx) < HELPER_TIMEOUT_SECONDS + BUDGET_MARGIN_SECONDS:
+            return self._skip(ctx, "not enough task time left")
         now = time.monotonic()
         last = self._last_run.get(executor_uuid)
         if last is not None and now - last < self._interval:
-            return CheckResult(
-                passed=True,
-                event=render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what={"reason": "within cadence window"}),
-            )
+            return self._skip(ctx, "within cadence window")
         # Retry on the next interval whatever happens below, never every cycle.
         self._last_run[executor_uuid] = now
 
@@ -105,10 +130,7 @@ class RentalEgressGuardCheck:
             subnets = rental_subnets(inspect.stdout if inspect.exit_status == 0 else "")
             if not subnets:
                 # No rental network yet: nothing runs on it; the next interval checks again.
-                return CheckResult(
-                    passed=True,
-                    event=render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what={"reason": "no rental network"}),
-                )
+                return self._skip(ctx, "no rental network")
             helper = (
                 f"/usr/bin/docker run --rm --network=host --cap-add=NET_ADMIN --entrypoint /bin/sh "
                 f"{shlex.quote(settings.CUSTOM_DOCKERFILE_DIND_IMAGE)} -c {shlex.quote(link_local_drop_script(subnets))}"

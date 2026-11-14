@@ -1564,7 +1564,8 @@ def test_the_probe_runs_last_before_scoring_and_never_in_dry_run():
     ]
     assert "RentalProbeCheck" not in dry and "IdleDiskWriteCheck" not in dry
     fast = [type(check).__name__ for check in pipeline_factory.PipelineFactory.build_fast_path_checks()]
-    assert fast[-5:-2] == ["RentalProbeCheck", "IdleDiskWriteCheck", "VerifyXColdRetryCheck"]
+    # the rental egress guard sits between ScoreCheck and FinalizeCheck (DAH-6442)
+    assert fast[-6:-3] == ["RentalProbeCheck", "IdleDiskWriteCheck", "VerifyXColdRetryCheck"]
 
 
 @pytest.mark.asyncio
