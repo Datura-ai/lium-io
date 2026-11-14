@@ -310,7 +310,7 @@ def _ssh_with_runtime_ages(proc: str, ages: str):
     ],
 )
 @pytest.mark.asyncio
-async def test_a_runtime_process_younger_than_a_pod_is_listed_without_changing_the_verdict(
+async def test_a_runtime_process_younger_than_a_pod_is_listed_as_its_own_outcome_without_failing(
     context_factory, tmp_path, ages, restarted
 ):
     me = os.getuid()
@@ -320,5 +320,6 @@ async def test_a_runtime_process_younger_than_a_pod_is_listed_without_changing_t
         _ctx(context_factory, _ssh_with_runtime_ages(str(tmp_path), ages))
     )
     assert result.passed is True
-    assert result.event.reason_code == Msg.OK.reason
+    # its own outcome so the restart is logged at INFO even when the last cycle was OK
+    assert result.event.reason_code == (Msg.RUNTIME_RESTARTED if restarted else Msg.OK).reason
     assert result.event.what_we_saw.get("runtime_restarted_under_pods") == restarted

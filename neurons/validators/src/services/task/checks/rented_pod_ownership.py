@@ -143,6 +143,9 @@ class RentedPodOwnershipCheck:
             what.update(reason="pod not read back", unread=unread, exit_status=res.exit_status)
             if empty_reads:
                 what["empty_reads"] = empty_reads
+        elif "runtime_restarted_under_pods" in what:
+            # own outcome, not OK: a repeated OK is logged at DEBUG, so the restart would never surface
+            template = Msg.RUNTIME_RESTARTED
         else:
             template = Msg.OK
         if unread:
