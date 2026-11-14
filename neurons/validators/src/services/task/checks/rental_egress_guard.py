@@ -33,6 +33,7 @@ import re
 import shlex
 import time
 
+from services.const import LEGACY_LIUM_CONTAINER_NAME
 from services.rental_docker_sdk import RENTAL_NETWORK_NAME
 
 from core.config import settings
@@ -61,7 +62,9 @@ BRIDGE_NAME_OPTION = "com.docker.network.bridge.name"
 _IFNAME = re.compile(r"[A-Za-z0-9_.-]{1,15}")
 # One host-wide lock around every apply and cleanup: two miners can report the same host, and two interleaved
 # chain swaps could otherwise flush the chain the other just made active. The wait counts toward the helper timeout.
-HOST_LOCK = "/run/lock/lium-rental-egress.lock"
+# SSH lands in the executor container, whose own /run/lock is private to it; the executor runs with pid: host
+# (docker-compose.app.yml), so /proc/1 is the host's init and its root is the host filesystem every executor shares.
+HOST_LOCK = "/proc/1/root/run/lock/lium-rental-egress.lock"
 LOCK_WAIT_SECONDS = 30
 _ABSENT_NETWORK = re.compile(r"no such network|network \S+ not found", re.IGNORECASE)
 _ABSENT_CONTAINER = re.compile(r"no such (object|container)", re.IGNORECASE)
@@ -81,6 +84,13 @@ def network_inventory(result) -> str | None:
     if _ABSENT_NETWORK.search(result.stderr or ""):
         return None
     raise InventoryUnknown(_error(result) or "network inspect failed")
+
+
+def rental_containers(result) -> list[str]:
+    """Running pod and filler containers on the host from ``docker ps``, labelled or created before the label."""
+    if result.exit_status != 0:
+        raise InventoryUnknown(_error(result) or "docker ps failed")
+    return [name for name in (result.stdout or "").split() if LEGACY_LIUM_CONTAINER_NAME.fullmatch(name)]
 
 
 def pod_inventory(result) -> list[str]:
@@ -153,11 +163,14 @@ def link_local_cleanup_script() -> str:
         "$IPT -L DOCKER-USER -n >/dev/null 2>&1 || exit 0",
     ]
     for chain in CHAINS:
-        lines += [
-            f"while $IPT -D DOCKER-USER -j {chain} 2>/dev/null; do :; done",
-            f"$IPT -F {chain} 2>/dev/null",
-            f"$IPT -X {chain} 2>/dev/null",
-        ]
+        # a chain iptables says does not exist is done; one that exists must lose its jumps, rules and itself
+        lines.append(
+            f"if ERR=$($IPT -n -L {chain} 2>&1 >/dev/null); then "
+            f"while $IPT -D DOCKER-USER -j {chain} 2>/dev/null; do :; done; "
+            f"if $IPT -C DOCKER-USER -j {chain} 2>/dev/null; then echo 'jump to {chain} not removed' >&2; exit 4; fi; "
+            f"$IPT -F {chain} || exit 4; $IPT -X {chain} || exit 4; "
+            f'else case "$ERR" in *"No chain"*|*"does not exist"*) ;; *) echo "$ERR" >&2; exit 4;; esac; fi'
+        )
     return "; ".join(lines) + "; exit 0"
 
 
@@ -214,7 +227,7 @@ class RentalEgressGuardCheck:
             # Every remote call shares one deadline that ends BUDGET_MARGIN_SECONDS before the task is
             # cancelled, so a stalled SSH call can never cost the cycle its validation result.
             guarded, error = await asyncio.wait_for(
-                self._apply(ctx, rental), timeout=task_seconds_left(ctx) - BUDGET_MARGIN_SECONDS
+                self._apply(ctx), timeout=task_seconds_left(ctx) - BUDGET_MARGIN_SECONDS
             )
         except InventoryUnknown as exc:
             # Rules stay as they are: an unread host is never taken for an empty one. Not a run.
@@ -271,7 +284,7 @@ class RentalEgressGuardCheck:
             event=render_message(Msg.APPLIED, ctx=ctx, check_id=self.check_id, what=guarded),
         )
 
-    async def _apply(self, ctx: Context, rental) -> tuple[dict | None, str | None]:
+    async def _apply(self, ctx: Context) -> tuple[dict | None, str | None]:
         """(what was guarded, error); None when there is neither a rental network nor a legacy rental."""
         inspect = await ctx.ssh.run(
             f"/usr/bin/docker network inspect {RENTAL_NETWORK_NAME} "
@@ -280,7 +293,9 @@ class RentalEgressGuardCheck:
         )
         bridge = network_inventory(inspect)
         sources: list[str] = []
-        names = [pod.docker_container_name for pod in (rental.pods if rental else [])]
+        # host-wide, never this registration's rental: every miner reporting this host must reconcile the same set,
+        # or an idle registration would drop the /32 rules of another registration's legacy pod
+        names = rental_containers(await ctx.ssh.run("/usr/bin/docker ps --format '{{.Names}}'", check=False))
         if names:
             # running pods created before the rental network stay on their own network until they stop
             pods = await ctx.ssh.run(

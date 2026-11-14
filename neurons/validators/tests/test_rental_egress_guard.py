@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ipaddress
+import os
 import shlex
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -29,6 +31,7 @@ NET_ID = "0123456789abcdef" * 4
 
 
 ABSENT_NETWORK = "Error response from daemon: network lium-rentals not found"
+POD_A, POD_B = "pod_00000000-0000-4000-8000-00000000000a", "pod_00000000-0000-4000-8000-00000000000b"
 
 
 def _ssh(
@@ -39,6 +42,8 @@ def _ssh(
     network_stderr=None,
     pods_rc=0,
     pods_stderr="",
+    names="",
+    ps_rc=0,
 ):
     calls: list[str] = []
     if network_stderr is None:
@@ -46,6 +51,8 @@ def _ssh(
 
     async def run(cmd, *args, **kwargs):
         calls.append(cmd)
+        if "docker ps" in cmd:
+            return SimpleNamespace(exit_status=ps_rc, stdout=names, stderr="Cannot connect to the Docker daemon" if ps_rc else "")
         if "network inspect" in cmd:
             return SimpleNamespace(exit_status=inspect_rc, stdout=network, stderr=network_stderr)
         if "docker inspect" in cmd:
@@ -256,14 +263,16 @@ async def test_a_stalled_inspect_is_cut_off_before_the_deadline_and_the_run_is_k
 
 @pytest.mark.asyncio
 async def test_a_running_legacy_rental_off_the_rental_network_is_guarded(context_factory, monkeypatch):
-    rental = SimpleNamespace(pods=[SimpleNamespace(docker_container_name="pod-a"), SimpleNamespace(docker_container_name="pod b")])
-    monkeypatch.setattr(rental_egress_guard, "rental_of_this_node", lambda ctx: rental)
-    ssh = _ssh(network="", inspect_rc=1, legacy="198.51.100.7 ")
+    _legacy_rental(monkeypatch)
+    # pod and filler names, labelled or not, parked ones too; anything else on the host is not a rental
+    names = f"{POD_A} filler_00000000-0000-4000-8000-00000000000c {POD_B}__prev executor-executor-1 pod_x my-app "
+    ssh = _ssh(network="", inspect_rc=1, legacy="198.51.100.7 ", names=names)
 
     result = await RentalEgressGuardCheck(rented_only=True).run(context_factory(ssh=ssh))
 
     [inspect] = [c for c in ssh.calls if c.startswith("/usr/bin/docker inspect")]
-    assert "pod-a" in inspect and "'pod b'" in inspect and ".State.Running" in inspect
+    assert inspect.endswith(f"{POD_A} filler_00000000-0000-4000-8000-00000000000c {POD_B}__prev")
+    assert ".State.Running" in inspect
     [helper] = _helper_calls(ssh)
     assert shlex.quote(link_local_drop_script(None, ["198.51.100.7/32"])) in helper
     assert result.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
@@ -294,12 +303,49 @@ async def test_apply_and_cleanup_take_the_same_host_lock(context_factory):
     [apply_cmd], [cleanup_cmd] = _helper_calls(applied), _helper_calls(cleaned)
     prefix = f"flock -w {rental_egress_guard.LOCK_WAIT_SECONDS} {rental_egress_guard.HOST_LOCK} "
     assert prefix in apply_cmd and prefix in cleanup_cmd
-    assert rental_egress_guard.HOST_LOCK.startswith("/run/lock/")  # on the host, outside any container
+    # each executor container has its own /run/lock; the host's is reached through init under pid: host
+    assert rental_egress_guard.HOST_LOCK == "/proc/1/root/run/lock/lium-rental-egress.lock"
+
+
+def test_the_executor_shares_the_host_pid_namespace_the_lock_path_relies_on():
+    import yaml
+
+    path = os.path.join(os.path.dirname(__file__), "../../executor/docker-compose.app.yml")
+    with open(path) as f:
+        assert yaml.safe_load(f)["services"]["executor"]["pid"] == "host"
 
 
 def _legacy_rental(monkeypatch):
-    rental = SimpleNamespace(pods=[SimpleNamespace(docker_container_name=name) for name in ("pod-a", "pod-b")])
+    rental = SimpleNamespace(pods=[SimpleNamespace(docker_container_name=name) for name in (POD_A, POD_B)])
     monkeypatch.setattr(rental_egress_guard, "rental_of_this_node", lambda ctx: rental)
+
+
+@pytest.mark.parametrize("network_present", [True, False])
+@pytest.mark.parametrize("rented_first", [True, False])
+@pytest.mark.asyncio
+async def test_two_registrations_of_one_host_reconcile_the_same_host_wide_set(
+    context_factory, monkeypatch, network_present, rented_first
+):
+    """A registration with no rental of its own must not drop another registration's legacy pod rules."""
+    rented_ctx_key = "rented-miner"
+    monkeypatch.setattr(
+        rental_egress_guard,
+        "rental_of_this_node",
+        lambda ctx: SimpleNamespace(pods=[SimpleNamespace(docker_container_name=POD_A)])
+        if ctx.miner_hotkey == rented_ctx_key
+        else None,
+    )
+    network = dict(network=f"{NET_ID} <no value>") if network_present else dict(network="", inspect_rc=1)
+    ssh = _ssh(**network, legacy="198.51.100.7 ", names=f"{POD_A} ")  # one host, both registrations see it
+    rented = context_factory(ssh=ssh).model_copy(update={"miner_hotkey": rented_ctx_key})
+    idle = context_factory(ssh=ssh)
+    order = [(rented, True), (idle, False)] if rented_first else [(idle, False), (rented, True)]
+
+    for ctx, rented_only in order:
+        await RentalEgressGuardCheck(rented_only=rented_only).run(ctx)
+
+    expected = shlex.quote(link_local_drop_script("br-0123456789ab" if network_present else None, ["198.51.100.7/32"]))
+    assert [expected in helper for helper in _helper_calls(ssh)] == [True, True]
 
 
 @pytest.mark.parametrize(
@@ -313,6 +359,7 @@ def _legacy_rental(monkeypatch):
         (dict(network="", inspect_rc=1, network_stderr="Error: context deadline exceeded"), "kept"),
         (dict(network="", inspect_rc=1, network_stderr=""), "kept"),
         (dict(network="garbage", inspect_rc=0), "kept"),
+        (dict(ps_rc=1), "kept"),
     ],
     ids=[
         "inventory-read",
@@ -323,6 +370,7 @@ def _legacy_rental(monkeypatch):
         "network-inspect-failed",
         "network-inspect-failed-silently",
         "network-inspect-unreadable",
+        "container-list-failed",
     ],
 )
 @pytest.mark.asyncio
@@ -331,6 +379,7 @@ async def test_an_unknown_inventory_keeps_the_rules_and_is_retried(context_facto
     _legacy_rental(monkeypatch)
     if "network" not in ssh_kwargs:
         ssh_kwargs = dict(ssh_kwargs, network="", inspect_rc=1)  # legacy pods only, so the pods read decides
+    ssh_kwargs = dict(ssh_kwargs, names=f"{POD_A} {POD_B} ")
     check = RentalEgressGuardCheck(rented_only=True)
     ssh = _ssh(**ssh_kwargs)
 
@@ -346,3 +395,52 @@ async def test_an_unknown_inventory_keeps_the_rules_and_is_retried(context_facto
     else:
         [helper] = helpers
         assert "-j DROP" in helper and result.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
+
+
+# A stand-in for iptables: chains are files in $STATE, DOCKER-USER's jumps are lines of DOCKER-USER, and
+# FAIL=<flag> makes that operation fail the way a busy or broken xtables would.
+_IPTABLES_STUB = r"""#!/bin/sh
+op=$1; [ "$op" = -n ] && { op=$2; shift; }
+chain=$2
+[ "$op" = "${FAIL:-}" ] && [ "$chain" != DOCKER-USER ] && { echo "iptables: Resource temporarily unavailable." >&2; exit 4; }
+case "$op" in
+  -L) [ -f "$STATE/$chain" ] || { echo "iptables: No chain/target/match by that name." >&2; exit 1; } ;;
+  -C) grep -qx "$4" "$STATE/DOCKER-USER" ;;
+  -D) grep -qx "$4" "$STATE/DOCKER-USER" || exit 1; grep -vx "$4" "$STATE/DOCKER-USER" > "$STATE/t"; mv "$STATE/t" "$STATE/DOCKER-USER" ;;
+  -F) [ -f "$STATE/$chain" ] && : > "$STATE/$chain" ;;
+  -X) [ -s "$STATE/$chain" ] && exit 1; rm "$STATE/$chain" ;;
+  *) exit 2 ;;
+esac
+"""
+
+
+def _run_cleanup(tmp_path, chains_present: bool, fail: str = "") -> tuple[int, list[str]]:
+    bin_dir, state = tmp_path / "bin", tmp_path / "state"
+    bin_dir.mkdir()
+    state.mkdir()
+    for name in ("iptables-nft", "iptables-legacy"):
+        (bin_dir / name).write_text(_IPTABLES_STUB)
+        (bin_dir / name).chmod(0o755)
+    (state / "DOCKER-USER").write_text("".join(f"{chain}\n" for chain in CHAINS) if chains_present else "RETURN\n")
+    if chains_present:
+        for chain in CHAINS:
+            (state / chain).write_text("-j DROP\n")
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "STATE": str(state), "FAIL": fail}
+    done = subprocess.run(["sh", "-c", link_local_cleanup_script()], env=env, capture_output=True, text=True)
+    return done.returncode, sorted(p.name for p in state.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("chains_present", "fail", "rc", "left"),
+    [
+        (False, "", 0, ["DOCKER-USER"]),  # confirmed absent: nothing to do
+        (True, "", 0, ["DOCKER-USER"]),  # removed: jumps, rules and chains gone
+        (True, "-X", 4, ["DOCKER-USER", *CHAINS]),  # a chain that will not go is reported
+        (True, "-F", 4, ["DOCKER-USER", *CHAINS]),
+        (True, "-L", 4, ["DOCKER-USER", *CHAINS]),  # a failed read is not taken for absence
+    ],
+    ids=["absent", "removed", "delete-failed", "flush-failed", "read-failed"],
+)
+def test_cleanup_script_accepts_absence_and_reports_a_failed_removal(tmp_path, chains_present, fail, rc, left):
+    returncode, state = _run_cleanup(tmp_path, chains_present, fail)
+    assert returncode == rc and state == left
