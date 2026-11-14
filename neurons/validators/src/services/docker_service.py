@@ -103,6 +103,7 @@ from services.const import (
     GPU_WEDGE_SWEEP_SETTLE_SECONDS,
     MIN_POD_PORT_COUNT,
     POD_CONTAINER_PREFIX,
+    POD_PORTS_PENDING_TTL_SECONDS,
     PREFERRED_POD_PORTS,
 )
 from services.container_cleanup import REMOVE_CACHE_SWEEP_CONTAINER, evict_cache_volumes_oldest_first
@@ -4784,6 +4785,29 @@ class DockerService:
             )
             return None
 
+    async def _skip_probe_held_ports(self, executor_id: str, available_ports: dict, required_port_count: int) -> dict:
+        """The backend's free ports less those a running port check holds, unless too few would be left."""
+        try:
+            held = await self.redis_service.probe_held_ports(executor_id)
+        except Exception as e:
+            logger.warning(f"probe-held ports unknown for executor {executor_id}: {str(e)[:100]}")
+            return available_ports
+        free = {port: mapping for port, mapping in available_ports.items() if port not in held}
+        if len(free) == len(available_ports):
+            return available_ports
+        if len(free) < required_port_count:
+            # shortcut: the pod may then clash with the probe; waiting for the release would delay the rental
+            logger.warning(f"executor {executor_id}: a port check holds all but {len(free)} free ports, using them")
+            return available_ports
+        logger.info(f"executor {executor_id}: skipping {len(available_ports) - len(free)} ports a port check holds")
+        return free
+
+    async def _record_pending_pod_ports(self, executor_id: str, external_ports: list[int]) -> None:
+        try:
+            await self.redis_service.record_pending_pod_ports(executor_id, external_ports, POD_PORTS_PENDING_TTL_SECONDS)
+        except Exception as e:
+            logger.warning(f"pending pod ports not recorded for executor {executor_id}: {str(e)[:100]}")
+
     async def generate_portMappings(
         self,
         miner_hotkey: str,
@@ -4813,6 +4837,9 @@ class DockerService:
 
                 # SSH, plus Jupyter when enabled; the renter's other ports take what the backend offered
                 required_port_count = MIN_POD_PORT_COUNT + (1 if enable_jupyter else 0)
+                # DAH-6376: a running port check binds its ports on the host network, and a pod given one of
+                # them fails to bind it ("port is already allocated"). The backend's list does not know them.
+                available_ports = await self._skip_probe_held_ports(executor_id, available_ports, required_port_count)
                 if not pod_mapping and len(available_ports) < required_port_count:
                     logger.warning(
                         f"Insufficient ports available ({len(available_ports)}/{required_port_count}) "
@@ -4887,7 +4914,8 @@ class DockerService:
                     if mapping:
                         jupyter_port_map = (mapping[0], mapping[2])
 
-                # Port reservation now handled by backend
+                # Port reservation now handled by backend; a port check reads these until the backend lists them
+                await self._record_pending_pod_ports(executor_id, [mapping[2] for mapping in mappings])
 
                 return mappings, jupyter_port_map
 

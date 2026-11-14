@@ -1,5 +1,6 @@
 import logging
 import random
+import time
 from datetime import UTC, datetime
 
 from datura.requests.miner_requests import ExecutorSSHInfo
@@ -8,7 +9,7 @@ from core.docker_utils import DockerCommand
 from core.utils import _m, get_extra_info
 from services.const import BATCH_PORT_VERIFICATION_SIZE, MIN_PORT_COUNT
 from services.executor_connectivity.dind_probe import DindProbe
-from services.executor_connectivity.models import PortVerificationResult
+from services.executor_connectivity.models import PortPair, PortVerificationResult
 from services.executor_connectivity.port_probe import PortProbe
 from services.executor_connectivity.port_selector import (
     PortSelector,
@@ -17,6 +18,9 @@ from services.executor_connectivity.port_selector import (
 )
 
 logger = logging.getLogger(__name__)
+
+# a port check's hold outlives its own deadline only by this much if the release is lost
+PROBE_HOLD_TTL_SECONDS = 600
 
 # Our own short-lived probe containers; any other container's published port belongs to a pod or a filler.
 PROBE_CONTAINER_PREFIXES = ("/port_test", "/container_")
@@ -54,12 +58,31 @@ class ConnectivityOrchestrator:
         port_selector: PortSelector,
         port_probe: PortProbe,
         dind_probe: DindProbe,
+        port_claims=None,
     ):
         self.port_selector = port_selector
         self.port_probe = port_probe
         self.dind_probe = dind_probe
+        # RedisService: the probe publishes the ports it binds and reads the ports a new pod was just given
+        self.port_claims = port_claims
 
-    async def verify(
+    async def _claims(self, method: str, *args, default=None):
+        """A claims read or write that fails is logged and treated as nothing claimed: it never fails the check."""
+        if self.port_claims is None:
+            return default
+        try:
+            return await getattr(self.port_claims, method)(*args)
+        except Exception as e:
+            logger.warning(_m(f"port claims {method} failed: {str(e)[:100]}"))
+            return default
+
+    async def verify(self, **kwargs) -> PortVerificationResult:
+        try:
+            return await self._verify(**kwargs)
+        finally:
+            await self._claims("release_probe_ports", kwargs["executor_info"].uuid)
+
+    async def _verify(
         self,
         *,
         executor_info: ExecutorSSHInfo,
@@ -79,13 +102,20 @@ class ConnectivityOrchestrator:
         declared = declared_ports(executor_info)
         # the validator's rental snapshot can miss a pod created or restarting since it was read
         held_at_start = await ports_held_by_containers(ssh_client)
+        # a pod given its ports after the backend's rental list was read has no container yet, or a stopped one
+        pending = await self._claims("pending_pod_ports", executor_info.uuid, default=set())
         # the inventory lists host (internal) ports; the selector matches unavailable_ports on the external side
         ports = self.port_selector.select(
             executor_info,
             BATCH_PORT_VERIFICATION_SIZE,
-            set(unavailable_ports or []),
+            set(unavailable_ports or []) | pending,
             declared=[port for port in declared if port.internal not in (held_at_start or set())],
         )
+        # the batch test binds every selected port on the host network: a pod created meanwhile must not get one
+        hold_ttl = PROBE_HOLD_TTL_SECONDS
+        if dind_deadline_monotonic is not None:
+            hold_ttl = max(60, min(hold_ttl, int(dind_deadline_monotonic - time.monotonic()) + 60))
+        await self._claims("hold_probe_ports", executor_info.uuid, {port.external for port in ports}, hold_ttl)
         declared_port_count = len(declared)
 
         if not ports:
@@ -115,8 +145,13 @@ class ConnectivityOrchestrator:
         # read again right before the bind: a rental may have published a port while the batch probe ran.
         # Residual race, not fixed: a container can still publish the chosen port between this read and the bind.
         held = await ports_held_by_containers(ssh_client) if held_at_start is not None else None
-        free_successful = [port for port in successful if held is not None and port.internal not in held]
-        free_ports = [port for port in ports if held is not None and port.internal not in held]
+        pending = await self._claims("pending_pod_ports", executor_info.uuid, default=set())
+
+        def free(port: PortPair) -> bool:
+            return held is not None and port.internal not in held and port.external not in pending
+
+        free_successful = [port for port in successful if free(port)]
+        free_ports = [port for port in ports if free(port)]
         if free_successful:
             dind_port = free_successful[0]
             successful.remove(dind_port)

@@ -419,3 +419,105 @@ async def test_orchestrator_skips_dind_when_the_inventory_is_unknown_at_start(
     dind_probe.verify.assert_not_called()
     assert result.dind_skipped is True
     assert mock_ssh_client.run.call_count == 1
+
+
+class _Claims:
+    def __init__(self, pending=frozenset()):
+        self.pending = set(pending)
+        self.held: dict[str, set[int]] = {}
+        self.released: list[str] = []
+
+    async def pending_pod_ports(self, executor_id):
+        return self.pending
+
+    async def hold_probe_ports(self, executor_id, external_ports, ttl_seconds):
+        self.held[executor_id] = set(external_ports)
+
+    async def release_probe_ports(self, executor_id):
+        self.released.append(executor_id)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_holds_its_ports_skips_a_new_pods_ports_and_releases(
+    sample_executor_info, mock_ssh_client, mocker
+):
+    """DAH-6376 (58760e62, port 19898): a pod given its ports after the backend's rental list was read is skipped,
+    and the batch test publishes the ports it binds until it ends."""
+    selected = [PortPair(9001, 9001), PortPair(9002, 9002)]
+    port_selector = mocker.Mock(spec=PortSelector)
+    port_selector.select.return_value = selected
+    port_probe = mocker.Mock(spec=PortProbe)
+    port_probe.probe = mocker.AsyncMock(return_value=PortProbeResult(successful=tuple(selected), failed=()))
+    dind_probe = mocker.Mock(spec=DindProbe)
+    dind_probe.verify = mocker.AsyncMock(
+        return_value=DindProbeResult(success=True, sysbox_runtime=True, port=selected[1], log_text="ok")
+    )
+    mock_ssh_client.run = mocker.AsyncMock(return_value=mocker.MagicMock(exit_status=0, stdout="", stderr=""))
+    claims = _Claims(pending={19898})
+    orchestrator = ConnectivityOrchestrator(port_selector, port_probe, dind_probe, port_claims=claims)
+
+    await orchestrator.verify(
+        executor_info=sample_executor_info,
+        miner_hotkey="miner",
+        sysbox_runtime=True,
+        unavailable_ports=[40100],
+        ssh_client=mock_ssh_client,
+    )
+
+    assert port_selector.select.call_args.args[2] == {40100, 19898}
+    assert claims.held[sample_executor_info.uuid] == {9001, 9002}
+    assert claims.released == [sample_executor_info.uuid]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_dind_skips_a_port_a_new_pod_was_given_during_the_batch_test(
+    sample_executor_info, mock_ssh_client, mocker
+):
+    selected = [PortPair(9001, 9001), PortPair(9002, 9002)]
+    port_selector = mocker.Mock(spec=PortSelector)
+    port_selector.select.return_value = selected
+    port_probe = mocker.Mock(spec=PortProbe)
+    port_probe.probe = mocker.AsyncMock(return_value=PortProbeResult(successful=tuple(selected), failed=()))
+    dind_probe = mocker.Mock(spec=DindProbe)
+    dind_probe.verify = mocker.AsyncMock(
+        return_value=DindProbeResult(success=True, sysbox_runtime=True, port=selected[1], log_text="ok")
+    )
+    mock_ssh_client.run = mocker.AsyncMock(return_value=mocker.MagicMock(exit_status=0, stdout="", stderr=""))
+    claims = _Claims()
+    reads = iter([set(), {9001}])
+    claims.pending_pod_ports = mocker.AsyncMock(side_effect=lambda _: next(reads))
+    orchestrator = ConnectivityOrchestrator(port_selector, port_probe, dind_probe, port_claims=claims)
+
+    result = await orchestrator.verify(
+        executor_info=sample_executor_info,
+        miner_hotkey="miner",
+        sysbox_runtime=True,
+        unavailable_ports=[],
+        ssh_client=mock_ssh_client,
+    )
+
+    assert dind_probe.verify.call_args.args[0] == PortPair(9002, 9002)
+    assert result.dind_port == PortPair(9002, 9002)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_a_failing_claims_store_never_fails_the_check(sample_executor_info, mock_ssh_client, mocker):
+    port_selector = mocker.Mock(spec=PortSelector)
+    port_selector.select.return_value = []
+    claims = mocker.Mock()
+    claims.pending_pod_ports = mocker.AsyncMock(side_effect=ConnectionError("redis down"))
+    claims.hold_probe_ports = mocker.AsyncMock(side_effect=ConnectionError("redis down"))
+    claims.release_probe_ports = mocker.AsyncMock(side_effect=ConnectionError("redis down"))
+    orchestrator = ConnectivityOrchestrator(
+        port_selector, mocker.Mock(spec=PortProbe), mocker.Mock(spec=DindProbe), port_claims=claims
+    )
+
+    result = await orchestrator.verify(
+        executor_info=sample_executor_info,
+        miner_hotkey="miner",
+        sysbox_runtime=True,
+        unavailable_ports=[],
+        ssh_client=mock_ssh_client,
+    )
+
+    assert result.status == "no_ports"
