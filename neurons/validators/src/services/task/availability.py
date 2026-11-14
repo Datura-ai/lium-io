@@ -65,6 +65,8 @@ class AvailabilityErrorCode(StrEnum):
     VERIFICATION_FAILED = "VERIFICATION_FAILED"
     # DAH-5351: a busy card's clock collapsed by a thermal slowdown, or still unproven since (GpuThermalThrottleCheck).
     GPU_THERMAL_COLLAPSE = "GPU_THERMAL_COLLAPSE"
+    # A reported card the create step cannot attach, so every rent on it fails (GpuKernelCountCheck).
+    GPU_KERNEL_UNATTACHABLE = "GPU_KERNEL_UNATTACHABLE"
     # DAH-6241: a card measured below the GPU model the node reports (CapabilityCheck, GpuModelVerdictCheck).
     GPU_MODEL_MISMATCH = "GPU_MODEL_MISMATCH"
     # DAH-6241: a card of a judged model whose GPU check gave no numbers after its one tolerated miss.
@@ -77,6 +79,7 @@ NODE_GPU_FAULT_CODES = frozenset(
         AvailabilityErrorCode.GPU_LOST,
         AvailabilityErrorCode.GPU_MEMORY_HEALTH_FAILED,
         AvailabilityErrorCode.GPU_THERMAL_COLLAPSE,
+        AvailabilityErrorCode.GPU_KERNEL_UNATTACHABLE,
         AvailabilityErrorCode.GPU_MODEL_MISMATCH,
         AvailabilityErrorCode.GPU_MODEL_NOT_MEASURED,
         # only raised for REASONS_THAT_HIDE_AT_ONCE, all read off the node's own report or probe

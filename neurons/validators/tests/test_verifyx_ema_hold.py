@@ -1,11 +1,10 @@
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-from core.config import settings
 from neurons.validators.src.services.task.checks.cached_template_verification import (
     CachedTemplateVerificationCheck,
 )
@@ -190,7 +189,6 @@ async def _cycle_with_the_image_check(context_factory, probes, rented_data, redi
     ],
 )
 async def test_the_incident_with_the_fresh_node_grace(monkeypatch, context_factory, cycle_2_passes, cycle_2_ema):
-    monkeypatch.setattr(settings, "CACHED_TEMPLATE_CUTOFF", datetime.utcnow() - timedelta(days=1))
     redis = _fake_redis_service()
 
     # Cycle 1: a fresh node, its executor's first pre-pull still running; VerifyX samples 120.

@@ -51,7 +51,9 @@ def _fake_run_cmd(outputs: dict[str, str | Exception]):
     return run_cmd
 
 
-def _scrape(outputs: dict[str, str | Exception], host_percent: float = 40.0) -> dict[str, object]:
+def _scrape(
+    outputs: dict[str, str | Exception], host_percent: float = 40.0
+) -> dict[str, object]:
     namespace = build_scrape_namespace(
         SRC / "miner_jobs" / "machine_scrape.py",
         CPU_HELPERS,
@@ -224,3 +226,41 @@ def test_the_traffic_and_cpu_readings_survive_the_production_obfuscation():
 
     assert (host, cpu) == (40.0, {RENTER[:12]: 158.0})
     assert net_io == {RENTER[:12]: (1_230_000_000_000, 456_000_000)}
+
+
+def _three_on_the_executor_image(pids_by_id: dict[str, list[int]]):
+    ids = list(pids_by_id)
+    outputs = _docker_outputs("".join(f"{i[:12]}|10.00%\n" for i in ids), ids)
+    outputs["json .RepoDigests"] = '["daturaai/compute-subnet-executor@sha256:exec"]\n'
+    run = _fake_run_cmd(outputs)
+
+    def run_cmd(cmd):
+        for container_id, pids in pids_by_id.items():
+            if f" top {container_id} " in cmd:
+                return "PID\n" + "".join(f"{pid}\n" for pid in pids)
+        return run(cmd)
+
+    return run_cmd
+
+
+BURNER = "dddddddddddd" + "0" * 52
+MONITOR = "cccccccccccc" + "0" * 52
+
+
+def test_the_executor_is_the_image_container_that_lists_the_scrape_s_own_pid():
+    # DAH-6251: the burner and the monitor run the executor image too, listed before and after it. The scrape
+    # runs under a daemonized sshd, so only `docker top` (by cgroup) ties it to its container, not a hostname
+    scrape = _scrape({})
+    scrape["run_cmd"] = _three_on_the_executor_image(
+        {BURNER: [900, 901], EXECUTOR: [812, 4000, os.getpid()], MONITOR: [950]}
+    )
+
+    assert scrape["get_docker_info"](b"#!/bin/sh\n")["docker_container_id"] == EXECUTOR
+
+
+def test_no_image_container_listing_the_scrape_s_pid_reports_no_executor():
+    # never a fallback to some container on the image: an empty id excuses nothing
+    scrape = _scrape({})
+    scrape["run_cmd"] = _three_on_the_executor_image({BURNER: [900], EXECUTOR: [812], MONITOR: [950]})
+
+    assert scrape["get_docker_info"](b"#!/bin/sh\n")["docker_container_id"] == ""

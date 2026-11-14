@@ -2614,8 +2614,10 @@ class GpuKernelCountMessages:
         event="A reported GPU cannot be attached to a container",
         reason="GPU_KERNEL_UNATTACHABLE",
         severity="error",
-        category="env",
-        impact="Validation failed; score set to 0",
+        # an availability error: the backend hides the node and refuses new rentals, a rental on it runs on
+        category=AVAILABILITY_CATEGORY,
+        impact="Validation failed; score set to 0. Node hidden and not rentable until the GPU attaches again "
+        "(a running rental is kept)",
         remediation=(
             "Every rent on the listed GPU fails. Restart the executor container, or reboot the host "
             "if the GPU is still missing."
@@ -2688,8 +2690,7 @@ class CachedTemplateMessages:
 
     Confirms whether the executor has the recommended default image pre-pulled so
     DOCKER_PULL is a no-op for default-template rentals. Templates carry severity="info"
-    (advisory) by default; before ``settings.CACHED_TEMPLATE_CUTOFF`` the check is purely
-    observational. On/after the cutoff the check renders the two bad signals (NOT_CACHED,
+    (advisory) by default; the check renders the two bad signals (NOT_CACHED,
     DIGEST_MISMATCH) with a severity="error" override and fails verification — see
     ``CachedTemplateVerificationCheck``.
     """
@@ -2890,12 +2891,37 @@ class RentedPodOwnershipMessages:
         reason="RENTED_POD_OWNERSHIP_SHIFTED",
         severity="warning",
         category="runtime",
-        impact="Proceed; root login and sudo fail inside the pod until its files are repaired",
+        impact="Proceed; incorrect ownership can break package installation, root login, or sudo until repaired",
         remediation="The host stopped without a clean shutdown and the pod was restarted with a new "
         "user-namespace range, so its files now belong to nobody inside it. Tell the renter, and shift "
         "the ownership of the pod's root filesystem into its current uid_map/gid_map on the host "
         "(only ids inside the old range; keep setuid bits and file capabilities). Shut the host down "
         "cleanly to avoid this.",
+    )
+    SHIFTED_AFTER_CONTAINER_RESTART = MessageTemplate(
+        event="Rented pod files are owned outside its user namespace",
+        reason="RENTED_POD_OWNERSHIP_SHIFTED",
+        severity="warning",
+        category="runtime",
+        impact="Proceed; incorrect ownership can break package installation, root login, or sudo until repaired",
+        remediation="The pod's container was restarted while the host kept running (not a host reboot), and "
+        "it came back with a user-namespace range its files are not in, so they belong to nobody inside it. "
+        "Tell the renter, and shift the ownership of the pod's root filesystem into its current "
+        "uid_map/gid_map on the host (only ids outside the current range; keep setuid bits and file "
+        "capabilities). Do not restart a rented pod's container yourself; ask support first.",
+    )
+    SHIFTED_MIXED = MessageTemplate(
+        event="Rented pod files are owned outside its user namespace",
+        reason="RENTED_POD_OWNERSHIP_SHIFTED",
+        severity="warning",
+        category="runtime",
+        impact="Proceed; incorrect ownership can break package installation, root login, or sudo until repaired",
+        remediation="The shifted pods do not share one cause: a pod whose started_after_boot_s is 600 or more "
+        "had its container restarted while the host kept running; one started right after boot came back "
+        "after the host stopped without a clean shutdown. Tell the renters, and shift the ownership of each "
+        "pod's root filesystem into its current uid_map/gid_map on the host (only ids outside the current "
+        "range; keep setuid bits and file capabilities). Do not restart a rented pod's container yourself; "
+        "ask support first, and shut the host down cleanly.",
     )
     UNREAD = MessageTemplate(
         event="Rented pod file ownership not read",
