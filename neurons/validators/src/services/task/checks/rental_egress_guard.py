@@ -59,6 +59,37 @@ LINK_LOCAL_CIDR = str(ipaddress.ip_network("169.254.169.254/16", strict=False))
 CHAINS = ("LIUM-RENTAL-EGRESS-A", "LIUM-RENTAL-EGRESS-B")
 BRIDGE_NAME_OPTION = "com.docker.network.bridge.name"
 _IFNAME = re.compile(r"[A-Za-z0-9_.-]{1,15}")
+# One host-wide lock around every apply and cleanup: two miners can report the same host, and two interleaved
+# chain swaps could otherwise flush the chain the other just made active. The wait counts toward the helper timeout.
+HOST_LOCK = "/run/lock/lium-rental-egress.lock"
+LOCK_WAIT_SECONDS = 30
+_ABSENT_NETWORK = re.compile(r"no such network|network \S+ not found", re.IGNORECASE)
+_ABSENT_CONTAINER = re.compile(r"no such (object|container)", re.IGNORECASE)
+
+
+class InventoryUnknown(Exception):
+    """Docker could not say what the host runs: the current rules stay, and the next cycle reads it again."""
+
+
+def network_inventory(result) -> str | None:
+    """The rental bridge, or None when Docker says the network is absent; anything else is unknown."""
+    if result.exit_status == 0:
+        bridge = rental_bridge(result.stdout)
+        if bridge is None:
+            raise InventoryUnknown(f"unreadable network inspect: {(result.stdout or '').strip()[:100]}")
+        return bridge
+    if _ABSENT_NETWORK.search(result.stderr or ""):
+        return None
+    raise InventoryUnknown(_error(result) or "network inspect failed")
+
+
+def pod_inventory(result) -> list[str]:
+    """Legacy /32s of the listed pods; a pod Docker says is gone is absent, any other failure is unknown."""
+    if result.exit_status != 0:
+        lines = [line for line in (result.stderr or "").splitlines() if line.strip()]
+        if not lines or not all(_ABSENT_CONTAINER.search(line) for line in lines):
+            raise InventoryUnknown(_error(result) or "docker inspect failed")
+    return legacy_sources(result.stdout)
 _NETWORK_ID = re.compile(r"[0-9a-f]{12,64}")
 
 
@@ -132,6 +163,7 @@ def link_local_cleanup_script() -> str:
 
 def _helper(script: str) -> str:
     return (
+        f"timeout -k 5 {HELPER_TIMEOUT_SECONDS} flock -w {LOCK_WAIT_SECONDS} {HOST_LOCK} "
         f"/usr/bin/docker run --rm --network=host --cap-add=NET_ADMIN --entrypoint /bin/sh "
         f"{shlex.quote(settings.CUSTOM_DOCKERFILE_DIND_IMAGE)} -c {shlex.quote(script)}"
     )
@@ -184,6 +216,19 @@ class RentalEgressGuardCheck:
             guarded, error = await asyncio.wait_for(
                 self._apply(ctx, rental), timeout=task_seconds_left(ctx) - BUDGET_MARGIN_SECONDS
             )
+        except InventoryUnknown as exc:
+            # Rules stay as they are: an unread host is never taken for an empty one. Not a run.
+            if last is None:
+                self._last_run.pop(key, None)
+            else:
+                self._last_run[key] = last
+            logger.warning(
+                _m(
+                    "Rental egress guard: host inventory unknown, rules left as they are",
+                    extra=get_extra_info({"executor_uuid": executor_uuid, "error": str(exc)}),
+                )
+            )
+            return self._skip(ctx, "inventory unknown")
         except TimeoutError:
             # Not a run: the next cycle tries again.
             if last is None:
@@ -230,10 +275,10 @@ class RentalEgressGuardCheck:
         """(what was guarded, error); None when there is neither a rental network nor a legacy rental."""
         inspect = await ctx.ssh.run(
             f"/usr/bin/docker network inspect {RENTAL_NETWORK_NAME} "
-            f"-f '{{{{.Id}}}} {{{{index .Options \"{BRIDGE_NAME_OPTION}\"}}}}' 2>/dev/null",
+            f"-f '{{{{.Id}}}} {{{{index .Options \"{BRIDGE_NAME_OPTION}\"}}}}'",
             check=False,
         )
-        bridge = rental_bridge(inspect.stdout if inspect.exit_status == 0 else "")
+        bridge = network_inventory(inspect)
         sources: list[str] = []
         names = [pod.docker_container_name for pod in (rental.pods if rental else [])]
         if names:
@@ -241,18 +286,16 @@ class RentalEgressGuardCheck:
             pods = await ctx.ssh.run(
                 "/usr/bin/docker inspect -f '{{if .State.Running}}{{range $k, $v := .NetworkSettings.Networks}}"
                 f"{{{{if ne $k \"{RENTAL_NETWORK_NAME}\"}}}}{{{{$v.IPAddress}}}} {{{{end}}}}{{{{end}}}}{{{{end}}}}' "
-                f"{' '.join(shlex.quote(name) for name in names)} 2>/dev/null",
+                f"{' '.join(shlex.quote(name) for name in names)}",
                 check=False,
             )
-            sources = legacy_sources(pods.stdout)
+            sources = pod_inventory(pods)
         if bridge is None and not sources:
             # rules from a rental that has since ended must not outlive it (Docker reuses its address); the image
             # is pulled if it was pruned, since its absence says nothing about rules left in DOCKER-USER
-            cleanup = _helper(link_local_cleanup_script())
-            result = await ctx.ssh.run(f"timeout -k 5 {HELPER_TIMEOUT_SECONDS} {cleanup}", check=False)
+            result = await ctx.ssh.run(_helper(link_local_cleanup_script()), check=False)
             return None, _error(result)
-        helper = _helper(link_local_drop_script(bridge, sources))
-        result = await ctx.ssh.run(f"timeout -k 5 {HELPER_TIMEOUT_SECONDS} {helper}", check=False)
+        result = await ctx.ssh.run(_helper(link_local_drop_script(bridge, sources)), check=False)
         return {"bridge": bridge, "legacy_endpoints": len(sources)}, _error(result)
 
 

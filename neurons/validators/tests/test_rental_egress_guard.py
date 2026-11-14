@@ -28,15 +28,28 @@ from services.task.pipeline_factory import (
 NET_ID = "0123456789abcdef" * 4
 
 
-def _ssh(network=f"{NET_ID} <no value>", helper_rc=0, inspect_rc=0, legacy=""):
+ABSENT_NETWORK = "Error response from daemon: network lium-rentals not found"
+
+
+def _ssh(
+    network=f"{NET_ID} <no value>",
+    helper_rc=0,
+    inspect_rc=0,
+    legacy="",
+    network_stderr=None,
+    pods_rc=0,
+    pods_stderr="",
+):
     calls: list[str] = []
+    if network_stderr is None:
+        network_stderr = ABSENT_NETWORK if inspect_rc else ""
 
     async def run(cmd, *args, **kwargs):
         calls.append(cmd)
         if "network inspect" in cmd:
-            return SimpleNamespace(exit_status=inspect_rc, stdout=network, stderr="")
+            return SimpleNamespace(exit_status=inspect_rc, stdout=network, stderr=network_stderr)
         if "docker inspect" in cmd:
-            return SimpleNamespace(exit_status=0, stdout=legacy, stderr="")
+            return SimpleNamespace(exit_status=pods_rc, stdout=legacy, stderr=pods_stderr)
         return SimpleNamespace(exit_status=helper_rc, stdout="", stderr="DOCKER-USER chain not found" if helper_rc else "")
 
     return SimpleNamespace(run=run, calls=calls)
@@ -87,6 +100,9 @@ async def test_applies_the_drop_through_a_host_network_helper(context_factory):
     assert result.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
     [helper] = _helper_calls(ssh)
     assert "--network=host" in helper and helper.startswith("timeout ")
+    # the lock is taken inside the helper timeout and held around the whole docker run, so the apply is one unit
+    lock = f"flock -w {rental_egress_guard.LOCK_WAIT_SECONDS} {rental_egress_guard.HOST_LOCK} /usr/bin/docker run"
+    assert lock in helper and helper.index("timeout ") < helper.index("flock ")
     assert shlex.quote(link_local_drop_script("br-0123456789ab", [])) in helper
 
 
@@ -266,3 +282,67 @@ async def test_cadence_is_per_miner_and_endpoint_not_per_uuid(context_factory):
 
     # same UUID, three hosts: each guarded once; the repeat of the first is within its window
     assert len(_helper_calls(ssh)) == 3
+
+
+@pytest.mark.asyncio
+async def test_apply_and_cleanup_take_the_same_host_lock(context_factory):
+    """Two miners reporting one host serialize on one lock file, whichever of apply or cleanup each runs."""
+    applied, cleaned = _ssh(), _ssh(network="", inspect_rc=1)
+    await RentalEgressGuardCheck().run(context_factory(ssh=applied))
+    await RentalEgressGuardCheck().run(context_factory(ssh=cleaned))
+
+    [apply_cmd], [cleanup_cmd] = _helper_calls(applied), _helper_calls(cleaned)
+    prefix = f"flock -w {rental_egress_guard.LOCK_WAIT_SECONDS} {rental_egress_guard.HOST_LOCK} "
+    assert prefix in apply_cmd and prefix in cleanup_cmd
+    assert rental_egress_guard.HOST_LOCK.startswith("/run/lock/")  # on the host, outside any container
+
+
+def _legacy_rental(monkeypatch):
+    rental = SimpleNamespace(pods=[SimpleNamespace(docker_container_name=name) for name in ("pod-a", "pod-b")])
+    monkeypatch.setattr(rental_egress_guard, "rental_of_this_node", lambda ctx: rental)
+
+
+@pytest.mark.parametrize(
+    ("ssh_kwargs", "outcome"),
+    [
+        (dict(legacy="198.51.100.7 198.51.100.8 "), "applied"),
+        (dict(network="", inspect_rc=1), "cleaned"),
+        (dict(legacy="198.51.100.7 ", pods_rc=1, pods_stderr="Error: No such object: pod-b"), "applied"),
+        (dict(legacy="", pods_rc=1, pods_stderr="Cannot connect to the Docker daemon at unix:///var/run/docker.sock"), "kept"),
+        (dict(legacy="", pods_rc=1, pods_stderr=""), "kept"),
+        (dict(network="", inspect_rc=1, network_stderr="Error: context deadline exceeded"), "kept"),
+        (dict(network="", inspect_rc=1, network_stderr=""), "kept"),
+        (dict(network="garbage", inspect_rc=0), "kept"),
+    ],
+    ids=[
+        "inventory-read",
+        "network-absent-nothing-left",
+        "partial-one-pod-gone",
+        "pods-inspect-failed",
+        "pods-inspect-failed-silently",
+        "network-inspect-failed",
+        "network-inspect-failed-silently",
+        "network-inspect-unreadable",
+    ],
+)
+@pytest.mark.asyncio
+async def test_an_unknown_inventory_keeps_the_rules_and_is_retried(context_factory, monkeypatch, ssh_kwargs, outcome):
+    """Explicit absence may reconcile; a failed read must never be taken for an empty host."""
+    _legacy_rental(monkeypatch)
+    if "network" not in ssh_kwargs:
+        ssh_kwargs = dict(ssh_kwargs, network="", inspect_rc=1)  # legacy pods only, so the pods read decides
+    check = RentalEgressGuardCheck(rented_only=True)
+    ssh = _ssh(**ssh_kwargs)
+
+    result = await check.run(context_factory(ssh=ssh))
+
+    helpers = _helper_calls(ssh)
+    if outcome == "kept":
+        assert helpers == [] and check._last_run == {}
+        assert result.event.reason_code == "RENTAL_EGRESS_GUARD_SKIPPED"
+    elif outcome == "cleaned":
+        [helper] = helpers
+        assert shlex.quote(link_local_cleanup_script()) in helper
+    else:
+        [helper] = helpers
+        assert "-j DROP" in helper and result.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
