@@ -6144,6 +6144,13 @@ class DockerService:
                     name.strip() for name in (mounted_result.stdout or "").splitlines() if name.strip()
                 }
             stale_volumes = sorted(vloopback_volumes - mounted_volumes - skip_set)
+            if stale_volumes and not filler_volumes_only:
+                # an unmounted volume_<pod uuid> can still be an open rental's (a node moved to a new machine with
+                # its renter's volume, a pod the backend did not list): as for unlisted pods (DAH-5392), only a
+                # rental the backend confirms closed loses its volume; no answer keeps it
+                pod_names = {f"{POD_CONTAINER_PREFIX}{name.removeprefix('volume_')}": name for name in stale_volumes}
+                closed = await self._pods_with_closed_rental(list(pod_names), default_extra)
+                stale_volumes = [volume for pod_name, volume in pod_names.items() if pod_name in closed]
             if not stale_volumes:
                 return []
 

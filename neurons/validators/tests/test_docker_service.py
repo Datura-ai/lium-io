@@ -3780,6 +3780,45 @@ async def test_clean_stale_vloopback_volumes_skips_mounted_and_backend_known(
 
 
 @pytest.mark.asyncio
+async def test_clean_stale_vloopback_volumes_keeps_a_pod_volume_whose_rental_is_not_confirmed_closed(
+    docker_service,
+    retry_ssh_mock,
+):
+    """An unmounted pod volume goes only once the backend says its rental closed (node moved with the volume)."""
+    from protocol.vc_protocol.compute_requests import PodRentalActiveResponse
+
+    open_pod, closed_pod, unread_pod = (
+        "2926f2f4-b6fe-4dc7-944c-97556dd08b23",
+        "11111111-2222-4333-8444-555555555555",
+        "66666666-7777-4888-9999-000000000000",
+    )
+    answers = {
+        open_pod: PodRentalActiveResponse(active=True),
+        closed_pod: PodRentalActiveResponse(active=False),
+        unread_pod: None,
+    }
+    docker_service.backend_client = Mock(get_pod_rental_active=AsyncMock(side_effect=lambda pod_id: answers[pod_id]))
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            _make_ssh_command_result(
+                stdout="".join(
+                    f"volume_{name} vloopback:latest\n" for name in (open_pod, closed_pod, unread_pod, "orphan")
+                )
+            ),
+            _make_ssh_command_result(stdout=""),
+        ]
+    )
+
+    removed = await docker_service.clean_stale_vloopback_volumes(ssh_client=ssh_client, default_extra={})
+
+    assert sorted(removed) == sorted([f"volume_{closed_pod}", "volume_orphan"])
+    volume_command = retry_ssh_mock.call_args_list[0][0][1]
+    assert f"volume_{open_pod}" not in volume_command
+    assert f"volume_{unread_pod}" not in volume_command
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("driver", ["vloopback:latest", "vloopback:v2"])
 async def test_clean_stale_vloopback_volumes_accepts_tagged_driver(
     docker_service,
