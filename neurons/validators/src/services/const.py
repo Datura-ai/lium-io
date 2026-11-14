@@ -151,6 +151,8 @@ GPU_WEDGE_SWEEP_SETTLE_SECONDS = 5  # let GPU state settle after a container is 
 MIN_PORT_COUNT = 3
 # DAH-3698: a pod needs only its SSH port (plus one for Jupyter); generate_portMappings creates it from that many.
 MIN_POD_PORT_COUNT = 1
+# DAH-6376: a new pod's ports stay out of port checks this long, until the backend's rental list shows them
+POD_PORTS_PENDING_TTL_SECONDS = 900
 # DAH-4961: the disk floor the renter listing used to apply itself; an idle node past it now fails
 # validation instead of being hidden. The free-space floor is settings.MIN_FREE_DISK_GB (per environment).
 MAX_DISK_UTILIZATION_PERCENT = 90

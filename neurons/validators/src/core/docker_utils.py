@@ -168,6 +168,15 @@ class DockerCommand:
         return f"/usr/bin/docker ps -a {filters} --format {shlex.quote(output_format)}"
 
     @staticmethod
+    def host_port_bindings() -> str:
+        """Build a command printing each container's name and published host ports, stopped containers included."""
+        # no pipe: a failed `docker ps` must exit non-zero, not read as a host without containers
+        return (
+            'ids=$(/usr/bin/docker ps -aq) && { [ -z "$ids" ] || /usr/bin/docker inspect --format '
+            "'{{.Name}} {{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostPort}} {{end}}{{end}}' $ids; }"
+        )
+
+    @staticmethod
     def inspect_status(container_id: str) -> str:
         """Build docker inspect command for status."""
         return f"/usr/bin/docker ps -a --filter id={container_id} --format '{{{{.Status}}}}|||{{{{.State}}}}' 2>&1"

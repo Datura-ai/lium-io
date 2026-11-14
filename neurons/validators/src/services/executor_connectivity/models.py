@@ -124,6 +124,9 @@ class PortVerificationResult:
     host_runtime_fault: bool = False
     # DAH-5981: status "error" because the SSH connection to the node dropped mid-probe, not a probe or config fault
     connection_lost: bool = False
+    # DAH-6376: the DinD probe did not run because no candidate port was known free (all held, or the host's port
+    # inventory could not be read); measures nothing, so it counts neither for nor against the node
+    dind_skipped: bool = False
 
 
 @dataclass(frozen=True)
