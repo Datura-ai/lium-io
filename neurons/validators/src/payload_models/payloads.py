@@ -770,7 +770,7 @@ class SshPubKeyAdded(ContainerBaseResponse):
 class SshPubKeyRemoved(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.SshPubKeyRemoved
     user_public_keys: list[str] = []
-    # protocol 2.14.0: the RemoveSshPublicKeysRequest's command_id, so the backend can tell which send this confirms
+    # protocol 2.15.0: the RemoveSshPublicKeysRequest's command_id, so the backend can tell which send this confirms
     command_id: str = ""
 
 
