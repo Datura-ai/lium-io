@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import shlex
 from types import SimpleNamespace
 
@@ -43,7 +44,8 @@ def test_script_drops_link_local_from_the_rental_subnet_except_dns_idempotently(
 
 
 def test_only_ipv4_subnets_are_used():
-    assert LINK_LOCAL_CIDR == "169.254.0.0/16"  # secret-scan: allow (a range constant, not a host)
+    net = ipaddress.ip_network(LINK_LOCAL_CIDR)
+    assert net.is_link_local and net.prefixlen == 16
     assert rental_subnets("192.0.2.0/24 fd00::/64 junk;rm 192.0.2.0/24 ") == ["192.0.2.0/24"]
 
 
