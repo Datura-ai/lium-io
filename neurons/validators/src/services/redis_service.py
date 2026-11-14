@@ -739,15 +739,20 @@ class RedisService:
         return {int(port) for port in await self.redis.smembers(f"{PROBE_HELD_PORTS_PREFIX}:{executor_id}")}
 
     async def record_pending_pod_ports(self, executor_id: str, external_ports: list[int], ttl_seconds: int) -> None:
-        """A pod was just given these external ports; the backend's rental list may not show them yet."""
+        """A pod was just given these external ports; the backend's rental list may not show them yet.
+        Each port expires on its own (sorted-set score = expiry time), so a later pod never extends an earlier one's."""
         if not external_ports:
             return
         key = f"{POD_PORTS_PENDING_PREFIX}:{executor_id}"
-        await self.redis.sadd(key, *external_ports)
+        expires_at = time.time() + ttl_seconds
+        await self.redis.zadd(key, {str(port): expires_at for port in external_ports})
         await self.redis.expire(key, ttl_seconds)
 
     async def pending_pod_ports(self, executor_id: str) -> set[int]:
-        return {int(port) for port in await self.redis.smembers(f"{POD_PORTS_PENDING_PREFIX}:{executor_id}")}
+        key = f"{POD_PORTS_PENDING_PREFIX}:{executor_id}"
+        now = time.time()
+        await self.redis.zremrangebyscore(key, "-inf", now)
+        return {int(port) for port in await self.redis.zrangebyscore(key, now, "+inf")}
 
     @staticmethod
     def _verified_ports_key(miner_hotkey: str, executor_id: str) -> str:
