@@ -226,8 +226,9 @@ class PortConnectivityCheck:
             )
             return CheckResult(passed=False, event=event, fatal=True)
         if result.dind_skipped:
-            # DAH-6376: no DinD probe ran, so Sysbox keeps its last known value, neither a pass nor a miss
-            result = replace(result, sysbox_runtime=ctx.state.sysbox_runtime)
+            # DAH-6376: no DinD probe ran, so Sysbox is unmeasured, neither a pass nor a miss: it keeps the request
+            # (a provider-side scrape timeout is not turned into SYSBOX_REQUIRED_MISSING)
+            result = replace(result, sysbox_runtime=probe_sysbox)
         elif probe_sysbox and not ctx.state.sysbox_runtime:
             # F-16: the request alone is no verdict (a no-ports or errored run echoes it back); only the probe's
             # own in-container measurement may say Sysbox works

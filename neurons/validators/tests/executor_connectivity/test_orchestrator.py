@@ -311,7 +311,33 @@ async def test_orchestrator_does_not_select_ports_held_by_a_stopped_container_at
     )
 
     # our own probe containers' ports are not a pod's, so only the pod's port is excluded
-    assert port_selector.select.call_args.args[2] == {40000, 40100}
+    assert port_selector.select.call_args.args[2] == {40100}
+    assert 40000 not in {p.internal for p in port_selector.select.call_args.kwargs["declared"]}
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_drops_a_held_host_port_from_a_mapped_pair(sample_executor_info, mock_ssh_client, mocker):
+    """DAH-6376 review: the inventory lists host (internal) ports, so a held 46681 drops the pair [46681, 56681],
+    not a pair whose external port is 46681."""
+    sample_executor_info.port_mappings = "[[46681, 56681], [46682, 56682], [46683, 46681]]"
+    sample_executor_info.port_range = None
+    port_selector = mocker.Mock(spec=PortSelector)
+    port_selector.select.return_value = []
+    mock_ssh_client.run = mocker.AsyncMock(
+        return_value=mocker.MagicMock(exit_status=0, stdout="/pod_bac6 46681 \n", stderr="")
+    )
+    orchestrator = ConnectivityOrchestrator(port_selector, mocker.Mock(spec=PortProbe), mocker.Mock(spec=DindProbe))
+
+    await orchestrator.verify(
+        executor_info=sample_executor_info,
+        miner_hotkey="miner",
+        sysbox_runtime=True,
+        unavailable_ports=[40100],
+        ssh_client=mock_ssh_client,
+    )
+
+    assert port_selector.select.call_args.args[2] == {40100}
+    assert {p.internal for p in port_selector.select.call_args.kwargs["declared"]} == {46682, 46683}
 
 
 def _orchestrator_with_reads(mocker, mock_ssh_client, reads):

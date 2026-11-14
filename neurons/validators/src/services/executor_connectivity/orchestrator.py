@@ -79,12 +79,12 @@ class ConnectivityOrchestrator:
         declared = declared_ports(executor_info)
         # the validator's rental snapshot can miss a pod created or restarting since it was read
         held_at_start = await ports_held_by_containers(ssh_client)
-        unavailable = set(unavailable_ports or []) | (held_at_start or set())
+        # the inventory lists host (internal) ports; the selector matches unavailable_ports on the external side
         ports = self.port_selector.select(
             executor_info,
             BATCH_PORT_VERIFICATION_SIZE,
-            unavailable,
-            declared=declared,
+            set(unavailable_ports or []),
+            declared=[port for port in declared if port.internal not in (held_at_start or set())],
         )
         declared_port_count = len(declared)
 
