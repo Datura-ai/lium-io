@@ -14,6 +14,7 @@ from services.task.checks.rental_egress_guard import (
     LINK_LOCAL_CIDR,
     RentalEgressGuardCheck,
     legacy_sources,
+    link_local_cleanup_script,
     link_local_drop_script,
     rental_bridge,
 )
@@ -102,12 +103,17 @@ async def test_runs_once_per_interval(context_factory):
 
 
 @pytest.mark.asyncio
-async def test_no_rental_network_runs_no_helper(context_factory):
+async def test_nothing_left_to_guard_removes_our_rules_without_pulling(context_factory):
     ssh = _ssh(network="", inspect_rc=1)
     result = await RentalEgressGuardCheck().run(context_factory(ssh=ssh))
 
     assert result.passed is True
-    assert _helper_calls(ssh) == []
+    [helper] = _helper_calls(ssh)
+    assert "--pull=never" in helper and shlex.quote(link_local_cleanup_script()) in helper
+    script = link_local_cleanup_script()
+    for chain in CHAINS:
+        assert f"$IPT -D DOCKER-USER -j {chain}" in script and f"$IPT -F {chain}" in script
+    assert "-j DROP" not in script and script.endswith("exit 0")
 
 
 @pytest.mark.asyncio

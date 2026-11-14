@@ -114,6 +114,29 @@ def link_local_drop_script(bridge: str | None, sources: list[str]) -> str:
     return "; ".join(lines)
 
 
+def link_local_cleanup_script() -> str:
+    """Remove our chains and their DOCKER-USER jumps: run when a host has nothing left to guard."""
+    lines = [
+        "IPT=iptables-nft",
+        "$IPT -L DOCKER-USER -n >/dev/null 2>&1 || IPT=iptables-legacy",
+        "$IPT -L DOCKER-USER -n >/dev/null 2>&1 || exit 0",
+    ]
+    for chain in CHAINS:
+        lines += [
+            f"while $IPT -D DOCKER-USER -j {chain} 2>/dev/null; do :; done",
+            f"$IPT -F {chain} 2>/dev/null",
+            f"$IPT -X {chain} 2>/dev/null",
+        ]
+    return "; ".join(lines) + "; exit 0"
+
+
+def _helper(script: str, pull: str = "") -> str:
+    return (
+        f"/usr/bin/docker run --rm {pull}--network=host --cap-add=NET_ADMIN --entrypoint /bin/sh "
+        f"{shlex.quote(settings.CUSTOM_DOCKERFILE_DIND_IMAGE)} -c {shlex.quote(script)}"
+    )
+
+
 class RentalEgressGuardCheck:
     """Keeps the rental network's link-local egress drop in place, at most once per interval per executor."""
 
@@ -210,11 +233,12 @@ class RentalEgressGuardCheck:
             )
             sources = legacy_sources(pods.stdout)
         if bridge is None and not sources:
+            # rules from a rental that has since ended must not outlive it (Docker reuses its address); never pull
+            # the image just to clean: a host without it never ran the guard
+            cleanup = _helper(link_local_cleanup_script(), "--pull=never ")
+            await ctx.ssh.run(f"timeout -k 5 {HELPER_TIMEOUT_SECONDS} {cleanup}", check=False)
             return None, None
-        helper = (
-            f"/usr/bin/docker run --rm --network=host --cap-add=NET_ADMIN --entrypoint /bin/sh "
-            f"{shlex.quote(settings.CUSTOM_DOCKERFILE_DIND_IMAGE)} -c {shlex.quote(link_local_drop_script(bridge, sources))}"
-        )
+        helper = _helper(link_local_drop_script(bridge, sources))
         result = await ctx.ssh.run(f"timeout -k 5 {HELPER_TIMEOUT_SECONDS} {helper}", check=False)
         error = None if result.exit_status == 0 else (result.stderr or "").strip()[-300:] or f"exit {result.exit_status}"
         return {"bridge": bridge, "legacy_endpoints": len(sources)}, error
