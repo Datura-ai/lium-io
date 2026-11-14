@@ -15,6 +15,10 @@ READ_TIMEOUT_SECONDS = 30
 CONTAINER_RESTART_AFTER_BOOT_SECONDS = 600
 
 
+# a restart of these under a running pod breaks it while it looks healthy: sysbox-fs serves the pod's /proc
+# (ENOTCONN after it restarts), sysbox-mgr holds its uid shift, nv-fabricmanager its NVLink multicast (CUDA 401)
+RUNTIME_PROCESSES = ("sysbox-mgr", "sysbox-fs", "nv-fabricmanager")
+
 # sudo refuses to run when any of these is not owned by the pod's root, so a shift that spares / and /root
 # still breaks it
 PATHS = ("/", "/root", "/etc/sudoers", "/etc/sudoers.d", "/etc/sudoers.d/README", "/usr/bin/sudo")
@@ -127,6 +131,10 @@ class RentedPodOwnershipCheck:
         # is unknown, not healthy
         unread = sorted(set(names) - {p["container"] for p in pods.values()})
         what = {"pods": list(pods.values())}
+        if pods:
+            restarted = await self._runtime_restarted_under(ctx, list(pods.values()))
+            if restarted:
+                what["runtime_restarted_under_pods"] = restarted
         shifted = [p for p in pods.values() if p["outside_namespace"]]
         if shifted:
             template = await self._shift_template(ctx, shifted)
@@ -174,6 +182,42 @@ class RentedPodOwnershipCheck:
             # some pods restarted on a running host, others came back with it: neither cause fits every pod
             return Msg.SHIFTED_MIXED
         return Msg.SHIFTED
+
+    async def _runtime_restarted_under(self, ctx: Context, pods: list[dict]) -> dict[str, list[str]]:
+        """Each runtime process that started after a pod's container: {process: [containers]}. Observe-only,
+        for the support sweep; an unread age flags nothing."""
+        try:
+            res = await asyncio.wait_for(
+                ctx.ssh.run(
+                    # comm is cut to 15 characters (nv-fabricmanage)
+                    "ps -eo comm=,etimes= | grep -E '^("
+                    + "|".join(n[:15] for n in RUNTIME_PROCESSES)
+                    + ") '; echo --; ps -o pid=,etimes= -p "
+                    + ",".join(str(int(p["pid"])) for p in pods),
+                    check=False,
+                ),
+                timeout=READ_TIMEOUT_SECONDS,
+            )
+        except (asyncssh.Error, OSError, TimeoutError):
+            return {}
+        services, _, pod_lines = (res.stdout or "").partition("--")
+        youngest: dict[str, int] = {}
+        for line in services.splitlines():
+            comm, _, age = line.strip().partition(" ")
+            name = next((n for n in RUNTIME_PROCESSES if n[:15] == comm), None)
+            age_s = _num(age)
+            if name and age_s is not None:
+                youngest[name] = min(age_s, youngest.get(name, age_s))
+        pod_age = {}
+        for line in pod_lines.splitlines():
+            pid, _, age = line.strip().partition(" ")
+            pod_age[_num(pid)] = _num(age.strip())
+        restarted = {}
+        for name, age_s in sorted(youngest.items()):
+            under = sorted(p["container"] for p in pods if (pod_age.get(p["pid"]) or 0) > age_s)
+            if under:
+                restarted[name] = under
+        return restarted
 
     def _event(self, ctx: Context, template, what: dict) -> CheckResult:
         what = {"executor_uuid": ctx.executor.uuid, **what}
