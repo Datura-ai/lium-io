@@ -171,18 +171,11 @@ class Settings(BaseSettings):
     # ticket-0494: how long a DinD probe's sysbox pass is remembered for a rented executor whose later
     # probes cannot reach the host (PortConnectivityCheck). Refreshed by every passing probe.
     SYSBOX_VERIFIED_TTL_SECONDS: int = Field(env="SYSBOX_VERIFIED_TTL_SECONDS", default=24 * 3600, gt=0)
-    DISCORD_INCENTIVE_CUTOFF: datetime = datetime(2026, 6, 15, 12, 0, 0)
 
-    # DAH-2265: cached-template requirement. Before the cutoff the CachedTemplateVerificationCheck
-    # is purely advisory (publishes recommended_image_cached / recommended_image_digest_match to
-    # executor.specs, never changes score). On/after the cutoff that check turns critical: an
-    # unrented executor that has not pre-pulled the recommended default image, or holds stale
-    # content under the same tag, fails verification early (score 0, reason surfaced to the
-    # provider). Fails open: an unmeasured signal (None) is never penalised.
-    # The cutoff has elapsed and CachedTemplateVerificationCheck is fatal again, so the gate is
-    # live: unrented executors are enforced, rented ones are exempt (the check runs after the
-    # tenant short-circuit).
-    CACHED_TEMPLATE_CUTOFF: datetime = datetime(2026, 7, 14, 12, 0, 0)
+    # DAH-2265: cached-template requirement. An unrented executor that has not pre-pulled the
+    # recommended default image, or holds stale content under the same tag, fails
+    # CachedTemplateVerificationCheck (score 0, reason surfaced to the provider); rented ones are
+    # exempt. Fails open: an unmeasured signal (None) is never penalised.
     # A node this validator has just found without its recommended image is held as pending, not
     # failed, until the executor's first pre-pull sweep completes or GRACE_SECONDS after that first
     # sighting, whichever comes first. The express lane verifies a new node seconds after it is
@@ -193,11 +186,9 @@ class Settings(BaseSettings):
 
     # Minimum NVIDIA driver requirement. Compared as a dotted version tuple against the
     # executor's reported gpu.driver (e.g. "580.95.05"). 580.65.06 is the r580 floor that
-    # ships CUDA 13.0. Before MIN_DRIVER_CUTOFF providers get a grace period (no penalty);
-    # on/after the cutoff, non-compliant unrented executors are fully gated (multiplier 0).
+    # ships CUDA 13.0. Non-compliant unrented executors are fully gated (multiplier 0).
     # Currently-rented executors are always exempt.
     MIN_NVIDIA_DRIVER_VERSION: str = Field(env="MIN_NVIDIA_DRIVER_VERSION", default="580.65.06")
-    MIN_DRIVER_CUTOFF: datetime = datetime(2026, 6, 30, 12, 0, 0)
 
     TIME_DELTA_FOR_EMISSION: float = 0.01
 
@@ -396,6 +387,12 @@ class Settings(BaseSettings):
     # present and shorter than the reported GPU count fails the validation
     # (GPU_KERNEL_COUNT_MISMATCH). A missing kernel list never fails.
     GPU_KERNEL_COUNT_CHECK_ENABLED: bool = Field(env="GPU_KERNEL_COUNT_CHECK_ENABLED", default=True)
+    # When the container's kernel GPU list is unavailable, the check reads the host's list (PID 1's root) instead.
+    # Off: a host list shorter than the reported count is recorded on the event (would_fail) and the node passes.
+    # On: it fails like a short container list (GPU_KERNEL_COUNT_MISMATCH).
+    GPU_KERNEL_COUNT_HOST_FALLBACK_ENFORCEMENT_ENABLED: bool = Field(
+        env="GPU_KERNEL_COUNT_HOST_FALLBACK_ENFORCEMENT_ENABLED", default=False
+    )
     # The scrape mounts a size-limited vloopback volume the way a rental does and reports the verdict in
     # its SCRAPE_OK event. Kill switch: off, the scrape skips the test (baked in by FileEncryptService).
     VLOOPBACK_SCRAPE_CHECK_ENABLED: bool = Field(env="VLOOPBACK_SCRAPE_CHECK_ENABLED", default=True)
@@ -503,9 +500,6 @@ class Settings(BaseSettings):
     )
     PROVIDER_SIDE_LOAD_STACK_EXCUSE_CAP_ENABLED: bool = Field(
         env="PROVIDER_SIDE_LOAD_STACK_EXCUSE_CAP_ENABLED", default=False
-    )
-    FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED: bool = Field(
-        env="FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED", default=False
     )
     # DAH-3035 — a ~6 s kernel-fault probe after the matmul: indexed/scattered access, atomics, a pointer
     # chase and a pinned-memory copy round-trip over a ~2 GB working set, plus NVML before/after: a rise in

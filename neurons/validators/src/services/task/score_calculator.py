@@ -153,6 +153,12 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append("The kernel lists fewer GPUs than the node reports")
 
+    # GPU model gate (DAH-6241): same mechanics; the renter's pod keeps running, the provider is not paid.
+    if not ctx.gpu_model_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("A GPU is not the model the node reports")
+
     # EMA verifyx download speed check — threshold enforced upstream in VerifyXCheck
     ema_verifyx_download = ((ctx.state.specs or {}).get("network") or {}).get(
         "ema_verifyx_download_speed"
