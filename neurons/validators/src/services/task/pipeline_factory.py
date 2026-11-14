@@ -122,8 +122,8 @@ JOB_LENGTH = 300
 # wrt input data and only reads ctx, so a shared instance is safe.
 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON = CustomBuildOrphanSweepCheck()
 # Same reason: per-executor cadence state, shared by the two positions. Never before a scored step:
-# a rented node is guarded just before TenantEnforcementCheck halts it, an idle node after ScoreCheck.
-_RENTAL_EGRESS_GUARD_LAST_RUN: dict[str, float] = {}
+# a rented node is guarded inside TenantEnforcementCheck's rented halt, an idle node after ScoreCheck.
+_RENTAL_EGRESS_GUARD_LAST_RUN: dict[tuple, float] = {}
 _RENTAL_EGRESS_GUARD_RENTED = RentalEgressGuardCheck(rented_only=True, last_run=_RENTAL_EGRESS_GUARD_LAST_RUN)
 _RENTAL_EGRESS_GUARD_IDLE = RentalEgressGuardCheck(last_run=_RENTAL_EGRESS_GUARD_LAST_RUN)
 
@@ -428,8 +428,7 @@ class PipelineFactory:
                 RentedThroughputCheck(),
                 # DAH-6241: a rented node never reaches the matmul; its stored GPU model verdict judges it
                 GpuModelVerdictCheck(),
-                _RENTAL_EGRESS_GUARD_RENTED,
-                TenantEnforcementCheck(),
+                TenantEnforcementCheck(egress_guard=_RENTAL_EGRESS_GUARD_RENTED),
                 # DAH-4663: idle nodes only; resets a leftover clock lock or unlists the node
                 GpuClockLockCheck(),
                 GpuUsageCheck(),
@@ -567,8 +566,7 @@ class PipelineFactory:
                 RentedThroughputCheck(),
                 # DAH-6241: a rented node never reaches the matmul; its stored GPU model verdict judges it
                 GpuModelVerdictCheck(),
-                _RENTAL_EGRESS_GUARD_RENTED,
-                TenantEnforcementCheck(),
+                TenantEnforcementCheck(egress_guard=_RENTAL_EGRESS_GUARD_RENTED),
                 # DAH-4663: idle nodes only; resets a leftover clock lock or unlists the node
                 GpuClockLockCheck(),
                 GpuUsageCheck(),
