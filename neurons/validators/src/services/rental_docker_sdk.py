@@ -1538,14 +1538,16 @@ def build_authorized_keys_exec_spec(
     # `chmod 700` (DAH-2341), and sshd may come up in between.
     quoted_dir = shlex.quote(target_path.rsplit("/", 1)[0])
     # DAH-6441: the keys are read whole first and appended only within the deadline of this exec's own start, so an
-    # add whose connection stalled can never append later, after the backend has confirmed a removal of that key
+    # add whose connection stalled can never append later, after the backend has confirmed a removal of that key.
+    # Shell builtins only (read, printf, test) beside the cat/mkdir/chmod the add always needed: the clock is
+    # /proc/uptime, so images without date or mktemp still take keys.
     script = (
-        "start=$(date +%s); "
-        'keys=$(mktemp) || exit 1; trap \'rm -f "$keys"\' EXIT; '
-        f'mkdir -p {quoted_dir} && chmod 700 {quoted_dir} && cat > "$keys" || exit 1; '
-        f'if [ $(( $(date +%s) - start )) -gt {append_deadline_seconds} ]; then '
+        "read start _ < /proc/uptime || exit 1; "
+        f"mkdir -p {quoted_dir} && chmod 700 {quoted_dir} && keys=$(cat) || exit 1; "
+        "read now _ < /proc/uptime || exit 1; "
+        f'if [ $(( ${{now%.*}} - ${{start%.*}} )) -gt {append_deadline_seconds} ]; then '
         'echo "authorized_keys append deadline passed" >&2; exit 75; fi; '
-        f'cat "$keys" >> {shlex.quote(target_path)}'
+        f'printf "%s\\n" "$keys" >> {shlex.quote(target_path)}'
     )
     return ContainerExecSpec(
         container_name=container_name,
