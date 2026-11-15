@@ -859,6 +859,7 @@ async def test_a_refused_reset_logs_the_whole_host_output_the_report_cuts(caplog
         report, _ = await _reset(host, backend=U)
     logged = [r.getMessage() for r in caplog.records if "nvidia-smi -r refused" in r.getMessage()]
     assert len(logged) == 1 and FM in logged[0]
+    assert NAME in logged[0]
     assert "stdout" in logged[0] and "stderr" in logged[0]
 
 
