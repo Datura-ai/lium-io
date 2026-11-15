@@ -15,7 +15,8 @@ from services.task.checks.rental_egress_guard import (
     CHAINS,
     LINK_LOCAL_CIDR,
     RentalEgressGuardCheck,
-    legacy_sources,
+    legacy_bridge_inventory,
+    legacy_network_ids,
     link_local_cleanup_script,
     helper_command,
     link_local_drop_script,
@@ -30,6 +31,8 @@ from services.task.pipeline_factory import (
 
 
 NET_ID = "0123456789abcdef" * 4
+LEGACY_NET_ID = "fedcba9876543210" * 4
+LEGACY = f"{LEGACY_NET_ID} "  # the running legacy pod's network, as `docker inspect` lists it
 
 
 ABSENT_NETWORK = "Error response from daemon: network lium-rentals not found"
@@ -46,6 +49,9 @@ def _ssh(
     pods_stderr="",
     names="",
     ps_rc=0,
+    legacy_nets=f"{LEGACY_NET_ID} bridge docker0",
+    legacy_nets_rc=0,
+    legacy_nets_stderr="",
 ):
     calls: list[str] = []
     if network_stderr is None:
@@ -55,6 +61,8 @@ def _ssh(
         calls.append(cmd)
         if "docker ps" in cmd:
             return SimpleNamespace(exit_status=ps_rc, stdout=names, stderr="Cannot connect to the Docker daemon" if ps_rc else "")
+        if "network inspect" in cmd and ".Driver" in cmd:
+            return SimpleNamespace(exit_status=legacy_nets_rc, stdout=legacy_nets, stderr=legacy_nets_stderr)
         if "network inspect" in cmd:
             return SimpleNamespace(exit_status=inspect_rc, stdout=network, stderr=network_stderr)
         if "docker inspect" in cmd:
@@ -69,24 +77,24 @@ def _helper_calls(ssh) -> list[str]:
 
 
 def test_script_rebuilds_the_rules_in_a_fresh_chain_and_swaps_it_in():
-    script = link_local_drop_script("br-0123456789ab", ["198.51.100.7/32"])
-    for match in ("-i br-0123456789ab", "-s 198.51.100.7/32"):
+    script = link_local_drop_script("br-0123456789ab", ["docker0"])
+    for match in ("-i br-0123456789ab", "-i docker0"):
         for proto in ("tcp", "udp"):
             assert f"$IPT -A $NEW {match} -d {LINK_LOCAL_CIDR} -p {proto} ! --dport 53 -j DROP" in script
     # the new chain is flushed and filled before its jump goes in; then every jump to the old one is removed
     order = ["$IPT -F $NEW", "$IPT -A $NEW", "$IPT -I DOCKER-USER -j $NEW", "$IPT -D DOCKER-USER -j $OLD", "$IPT -F $OLD"]
     assert [script.index(step) for step in order] == sorted(script.index(step) for step in order)
     assert all(chain in script for chain in CHAINS)
-    assert "-s 192.0.2" not in script  # no subnet match: a subnet Docker reuses elsewhere is never caught
+    assert " -s " not in script  # never by source: a renter with NET_ADMIN can add another address
     assert "exit 3" in script  # no DOCKER-USER chain is reported, not ignored
     # only link-local DROP rules: private ranges stay reachable
     assert script.count(" -d ") == 4 and script.count(f"-d {LINK_LOCAL_CIDR} ") == 4
 
 
 def test_an_ended_legacy_pod_or_a_recreated_network_leaves_no_rule():
-    before = link_local_drop_script("br-aaaaaaaaaaaa", ["198.51.100.7/32"])
+    before = link_local_drop_script("br-aaaaaaaaaaaa", ["docker0"])
     after = link_local_drop_script("br-bbbbbbbbbbbb", [])
-    assert "br-aaaaaaaaaaaa" not in after and "198.51.100.7" not in after
+    assert "br-aaaaaaaaaaaa" not in after and "docker0" not in after
     assert "-i br-aaaaaaaaaaaa" in before
 
 
@@ -97,7 +105,11 @@ def test_bridge_name_and_legacy_sources_are_parsed_safely():
     assert rental_bridge(f"{NET_ID} lium0") == "lium0"  # com.docker.network.bridge.name is honoured
     assert rental_bridge(f"{NET_ID} bad;name") == "br-0123456789ab"
     assert rental_bridge("") is None and rental_bridge("Error: no such network") is None
-    assert legacy_sources("198.51.100.7 fd00::2 junk;rm 198.51.100.7  ") == ["198.51.100.7/32"]
+    assert legacy_network_ids(f"{LEGACY_NET_ID} junk;rm {LEGACY_NET_ID} 198.51.100.7 ") == [LEGACY_NET_ID]
+    nets = f"{LEGACY_NET_ID} bridge docker0\n{NET_ID} bridge <no value>\n{'a' * 64} host <no value>\n"
+    assert legacy_bridge_inventory(SimpleNamespace(exit_status=0, stdout=nets, stderr="")) == ["docker0", "br-0123456789ab"]
+    with pytest.raises(rental_egress_guard.InventoryUnknown):
+        legacy_bridge_inventory(SimpleNamespace(exit_status=0, stdout="garbage bridge docker0\n", stderr=""))
 
 
 @pytest.mark.asyncio
@@ -365,7 +377,7 @@ async def test_a_running_legacy_rental_off_the_rental_network_is_guarded(context
     _legacy_rental(monkeypatch)
     # pod and filler names, labelled or not, parked ones too; anything else on the host is not a rental
     names = f"{POD_A} filler_00000000-0000-4000-8000-00000000000c {POD_B}__prev executor-executor-1 pod_x my-app "
-    ssh = _ssh(network="", inspect_rc=1, legacy="198.51.100.7 ", names=names)
+    ssh = _ssh(network="", inspect_rc=1, legacy=LEGACY, names=names)
 
     result = await RentalEgressGuardCheck(rented_only=True).run(context_factory(ssh=ssh))
 
@@ -373,7 +385,7 @@ async def test_a_running_legacy_rental_off_the_rental_network_is_guarded(context
     assert inspect.endswith(f"{POD_A} filler_00000000-0000-4000-8000-00000000000c {POD_B}__prev")
     assert ".State.Running" in inspect
     [helper] = _helper_calls(ssh)
-    assert shlex.quote(helper_command(link_local_drop_script(None, ["198.51.100.7/32"]))) in helper
+    assert shlex.quote(helper_command(link_local_drop_script(None, ["docker0"]))) in helper
     assert result.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
 
 
@@ -427,7 +439,7 @@ async def test_two_registrations_of_one_host_reconcile_the_same_host_wide_set(
         else None,
     )
     network = dict(network=f"{NET_ID} <no value>") if network_present else dict(network="", inspect_rc=1)
-    ssh = _ssh(**network, legacy="198.51.100.7 ", names=f"{POD_A} ")  # one host, both registrations see it
+    ssh = _ssh(**network, legacy=LEGACY, names=f"{POD_A} ")  # one host, both registrations see it
     rented = context_factory(ssh=ssh).model_copy(update={"miner_hotkey": rented_ctx_key})
     idle = context_factory(ssh=ssh)
     order = [(rented, True), (idle, False)] if rented_first else [(idle, False), (rented, True)]
@@ -436,7 +448,7 @@ async def test_two_registrations_of_one_host_reconcile_the_same_host_wide_set(
         await RentalEgressGuardCheck(rented_only=rented_only).run(ctx)
 
     expected = shlex.quote(
-        helper_command(link_local_drop_script("br-0123456789ab" if network_present else None, ["198.51.100.7/32"]))
+        helper_command(link_local_drop_script("br-0123456789ab" if network_present else None, ["docker0"]))
     )
     assert [expected in helper for helper in _helper_calls(ssh)] == [True, True]
 
@@ -444,9 +456,9 @@ async def test_two_registrations_of_one_host_reconcile_the_same_host_wide_set(
 @pytest.mark.parametrize(
     ("ssh_kwargs", "outcome"),
     [
-        (dict(legacy="198.51.100.7 198.51.100.8 "), "applied"),
+        (dict(legacy=f"{LEGACY_NET_ID} {LEGACY_NET_ID} "), "applied"),
         (dict(network="", inspect_rc=1), "cleaned"),
-        (dict(legacy="198.51.100.7 ", pods_rc=1, pods_stderr="Error: No such object: pod-b"), "applied"),
+        (dict(legacy=LEGACY, pods_rc=1, pods_stderr="Error: No such object: pod-b"), "applied"),
         (dict(legacy="", pods_rc=1, pods_stderr="Cannot connect to the Docker daemon at unix:///var/run/docker.sock"), "kept"),
         (dict(legacy="", pods_rc=1, pods_stderr=""), "kept"),
         (dict(network="", inspect_rc=1, network_stderr="Error: context deadline exceeded"), "kept"),
@@ -497,13 +509,28 @@ op=$1; [ "$op" = -n ] && { op=$2; shift; }
 chain=$2
 [ "$op" = "${FAIL:-}" ] && [ "$chain" != DOCKER-USER ] && { echo "iptables: Resource temporarily unavailable." >&2; exit 4; }
 case "$op" in
+  -N|-F|-A|-I|-D|-X) mutating=1 ;;
+esac
+case "$op" in
   -L) [ -f "$STATE/$chain" ] || { echo "iptables: No chain/target/match by that name." >&2; exit 1; } ;;
+  -S) echo "-N DOCKER-USER"; grep -v RETURN "$STATE/DOCKER-USER" | sed 's/^/-A DOCKER-USER -j /' ;;
   -C) grep -qx "$4" "$STATE/DOCKER-USER" ;;
-  -D) grep -qx "$4" "$STATE/DOCKER-USER" || exit 1; grep -vx "$4" "$STATE/DOCKER-USER" > "$STATE/t"; mv "$STATE/t" "$STATE/DOCKER-USER" ;;
-  -F) [ -f "$STATE/$chain" ] && : > "$STATE/$chain" ;;
+  -D) grep -qx "$4" "$STATE/DOCKER-USER" || exit 1
+      awk -v c="$4" '$0 == c && !d { d = 1; next } 1' "$STATE/DOCKER-USER" > "$STATE/t"; mv "$STATE/t" "$STATE/DOCKER-USER" ;;
+  -N) [ -f "$STATE/$chain" ] && exit 1; : > "$STATE/$chain" ;;
+  -F) grep -qx "$chain" "$STATE/DOCKER-USER" && [ -s "$STATE/$chain" ] && touch "$STATE/FLUSHED_ACTIVE"
+      [ -f "$STATE/$chain" ] && : > "$STATE/$chain" ;;
+  -A) shift 2; echo "$*" >> "$STATE/$chain" ;;
+  -I) { echo "$4"; cat "$STATE/DOCKER-USER"; } > "$STATE/t"; mv "$STATE/t" "$STATE/DOCKER-USER" ;;
   -X) [ -s "$STATE/$chain" ] && exit 1; rm "$STATE/$chain" ;;
   *) exit 2 ;;
 esac
+rc=$?
+if [ -n "${mutating:-}" ] && [ -n "${DIE_AFTER:-}" ]; then
+  n=$(( $(cat "$STATE/count" 2>/dev/null || echo 0) + 1 )); echo $n > "$STATE/count"
+  [ "$n" -eq "$DIE_AFTER" ] && kill -9 $PPID
+fi
+exit $rc
 """
 
 
@@ -539,6 +566,60 @@ def test_cleanup_script_accepts_absence_and_reports_a_failed_removal(tmp_path, c
     assert returncode == rc and state == left
 
 
+def _jumps_and_rules(state) -> list[tuple[str, list[str]]]:
+    jumps = [j for j in (state / "DOCKER-USER").read_text().split() if j in CHAINS]
+    return [(j, (state / j).read_text().splitlines()) for j in jumps]
+
+
+@pytest.mark.parametrize("die_after", range(1, 11))
+def test_a_swap_killed_after_any_mutation_is_recovered_without_flushing_the_protection_in_force(tmp_path, die_after):
+    """A is in force for the old bridge; a swap to the recreated bridge dies after its n-th mutation, then the next
+    run completes. No run may flush a chain DOCKER-USER still jumps to, and the end state is one jump to a chain
+    holding exactly the new bridge's rules."""
+    bin_dir, state = tmp_path / "bin", tmp_path / "state"
+    bin_dir.mkdir()
+    state.mkdir()
+    for name in ("iptables-nft", "iptables-legacy"):
+        (bin_dir / name).write_text(_IPTABLES_STUB)
+        (bin_dir / name).chmod(0o755)
+    a, b = CHAINS
+    old_rules = [f"-i br-aaaaaaaaaaaa -d {LINK_LOCAL_CIDR} -p {p} ! --dport 53 -j DROP" for p in ("tcp", "udp")]
+    new_rules = [f"-i br-bbbbbbbbbbbb -d {LINK_LOCAL_CIDR} -p {p} ! --dport 53 -j DROP" for p in ("tcp", "udp")]
+    (state / "DOCKER-USER").write_text(f"{a}\nRETURN\n")
+    (state / a).write_text("".join(f"{r}\n" for r in old_rules))
+    (state / b).write_text("")
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "STATE": str(state)}
+    script = link_local_drop_script("br-bbbbbbbbbbbb", [])
+
+    first = subprocess.run(["sh", "-c", script], env={**env, "DIE_AFTER": str(die_after)}, capture_output=True)
+    in_force = _jumps_and_rules(state)
+    assert in_force and in_force[0][1] in (old_rules, new_rules)  # something still protects after the kill
+    second = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True)
+
+    assert first.returncode in (0, -9) and second.returncode == 0, second.stderr
+    assert not (state / "FLUSHED_ACTIVE").exists()
+    [(_, rules)] = _jumps_and_rules(state)
+    assert rules == new_rules
+
+
+def test_a_failed_read_of_docker_user_changes_nothing(tmp_path):
+    bin_dir, state = tmp_path / "bin", tmp_path / "state"
+    bin_dir.mkdir()
+    state.mkdir()
+    stub = _IPTABLES_STUB.replace('  -S) echo', '  -S) [ -n "${FAIL_S:-}" ] && exit 4; echo')
+    for name in ("iptables-nft", "iptables-legacy"):
+        (bin_dir / name).write_text(stub)
+        (bin_dir / name).chmod(0o755)
+    a, _b = CHAINS
+    (state / "DOCKER-USER").write_text(f"{a}\n")
+    (state / a).write_text("-j DROP\n")
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "STATE": str(state), "FAIL_S": "1"}
+
+    done = subprocess.run(["sh", "-c", link_local_drop_script("br-bbbbbbbbbbbb", [])], env=env, capture_output=True)
+
+    assert done.returncode == 4 and _jumps_and_rules(state) == [(a, ["-j DROP"])]
+
+
 # An iptables that records each call and whether the host lock was free at that moment; -C and -D find nothing.
 # With SLOW=<op>, that call marks its start, runs for 3 s and marks its end.
 _LOCK_PROBE_STUB = r"""#!/bin/sh
@@ -566,7 +647,7 @@ def _probe(tmp_path, monkeypatch, slow=""):
 @pytest.mark.parametrize("script", ["apply", "cleanup"])
 def test_every_iptables_call_of_the_helper_runs_under_the_host_lock(tmp_path, monkeypatch, script):
     state, _lock, env = _probe(tmp_path, monkeypatch)
-    body = link_local_drop_script("br-0123456789ab", ["198.51.100.7/32"]) if script == "apply" else ""
+    body = link_local_drop_script("br-0123456789ab", ["docker0"]) if script == "apply" else ""
     body = body or link_local_cleanup_script()
 
     done = subprocess.run(["sh", "-c", locked_script(body)], env=env, capture_output=True, text=True)

@@ -98,12 +98,35 @@ def rental_containers(result) -> list[str]:
 
 
 def pod_inventory(result) -> list[str]:
-    """Legacy /32s of the listed pods; a pod Docker says is gone is absent, any other failure is unknown."""
+    """Networks of the listed running pods other than the rental one; a pod Docker says is gone is absent, any other
+    failure is unknown."""
     if result.exit_status != 0:
         lines = [line for line in (result.stderr or "").splitlines() if line.strip()]
         if not lines or not all(_ABSENT_CONTAINER.search(line) for line in lines):
             raise InventoryUnknown(_error(result) or "docker inspect failed")
-    return legacy_sources(result.stdout)
+    return legacy_network_ids(result.stdout)
+
+
+def legacy_bridge_inventory(result) -> list[str]:
+    """Host interfaces of the legacy pods' bridge networks from ``docker network inspect`` ("<id> <driver> <bridge-name
+    option>" per line). Other drivers have no bridge to match; a network Docker says is gone is absent; any other
+    failure is unknown."""
+    if result.exit_status != 0:
+        lines = [line for line in (result.stderr or "").splitlines() if line.strip()]
+        if not lines or not all(_ABSENT_NETWORK.search(line) for line in lines):
+            raise InventoryUnknown(_error(result) or "legacy network inspect failed")
+    bridges: list[str] = []
+    for line in (result.stdout or "").splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        if len(parts) < 2 or not _NETWORK_ID.fullmatch(parts[0]):
+            raise InventoryUnknown(f"unreadable network inspect: {line.strip()[:100]}")
+        if parts[1] == "bridge":
+            bridge = rental_bridge(" ".join(parts[:1] + parts[2:]))
+            if bridge not in bridges:
+                bridges.append(bridge)
+    return bridges
 _NETWORK_ID = re.compile(r"[0-9a-f]{12,64}")
 
 
@@ -117,26 +140,26 @@ def rental_bridge(inspect_stdout: str) -> str | None:
     return None
 
 
-def legacy_sources(inspect_stdout: str) -> list[str]:
-    """IPv4 /32s of running rental containers on a network other than the rental one; anything else is dropped."""
-    sources: list[str] = []
+def legacy_network_ids(inspect_stdout: str) -> list[str]:
+    """IDs of the networks running rental containers are on other than the rental one; anything else is dropped."""
+    ids: list[str] = []
     for raw in (inspect_stdout or "").split():
-        try:
-            addr = ipaddress.ip_address(raw)
-        except ValueError:
-            continue
-        # IPv6 would need ip6tables; out of scope.
-        if addr.version == 4 and f"{addr}/32" not in sources:
-            sources.append(f"{addr}/32")
-    return sources
+        if _NETWORK_ID.fullmatch(raw) and raw not in ids:
+            ids.append(raw)
+    return ids
 
 
-def link_local_drop_script(bridge: str | None, sources: list[str]) -> str:
+def link_local_drop_script(bridge: str | None, legacy_bridges: list[str]) -> str:
     """Host DOCKER-USER rules: drop rental egress to link-local, except DNS, reconciled to exactly this set.
 
-    Two DROP rules (tcp and udp, both ``! --dport 53``) per match instead of a DROP plus an ACCEPT, so the
-    result does not depend on rule order. ``bridge`` and ``sources`` come from ``rental_bridge`` and
-    ``legacy_sources`` and are shell-safe.
+    Matched by the bridge the traffic comes in on, never by source address: a renter with NET_ADMIN can add
+    another address, but not move its veth to another bridge. Two DROP rules (tcp and udp, both ``! --dport 53``)
+    per bridge instead of a DROP plus an ACCEPT, so the result does not depend on rule order. ``bridge`` and
+    ``legacy_bridges`` come from ``rental_bridge`` and are shell-safe.
+
+    The first of our jumps in DOCKER-USER is the protection in force and stays until the other chain is rebuilt
+    and swapped in; a swap killed after its insert leaves two jumps, and the next run keeps the first one
+    (the newer) and takes the other out before flushing it.
     """
     a, b = CHAINS
     lines = [
@@ -144,10 +167,16 @@ def link_local_drop_script(bridge: str | None, sources: list[str]) -> str:
         "$IPT -L DOCKER-USER -n >/dev/null 2>&1 || IPT=iptables-legacy",
         '$IPT -L DOCKER-USER -n >/dev/null 2>&1 || { echo "DOCKER-USER chain not found" >&2; exit 3; }',
         f"$IPT -N {a} 2>/dev/null; $IPT -N {b} 2>/dev/null",
-        f"if $IPT -C DOCKER-USER -j {a} 2>/dev/null; then NEW={b}; OLD={a}; else NEW={a}; OLD={b}; fi",
+        'RULES=$($IPT -S DOCKER-USER) || { echo "DOCKER-USER not readable" >&2; exit 4; }',
+        f"ACTIVE=$(printf '%s\\n' \"$RULES\" | awk '$1 == \"-A\" && $3 == \"-j\" && ($4 == \"{a}\" || $4 == \"{b}\") "
+        "{ print $4; exit }')",
+        f'if [ "$ACTIVE" = {a} ]; then NEW={b}; OLD={a}; else NEW={a}; OLD={b}; fi',
+        "while $IPT -D DOCKER-USER -j $NEW 2>/dev/null; do :; done",
+        # 1 is "no such rule"; anything else is a failed read, never taken for an unreferenced chain
+        '$IPT -C DOCKER-USER -j $NEW 2>/dev/null; [ $? -eq 1 ] || { echo "jump to $NEW not removed" >&2; exit 4; }',
         "$IPT -F $NEW || exit 4",
     ]
-    matches = ([f"-i {bridge}"] if bridge else []) + [f"-s {source}" for source in sources]
+    matches = [f"-i {iface}" for iface in dict.fromkeys(([bridge] if bridge else []) + legacy_bridges)]
     for match in matches:
         for proto in ("tcp", "udp"):
             lines.append(f"$IPT -A $NEW {match} -d {LINK_LOCAL_CIDR} -p {proto} ! --dport 53 -j DROP || exit 4")
@@ -316,26 +345,34 @@ class RentalEgressGuardCheck:
             check=False,
         )
         bridge = network_inventory(inspect)
-        sources: list[str] = []
+        legacy: list[str] = []
         # host-wide, never this registration's rental: every miner reporting this host must reconcile the same set,
-        # or an idle registration would drop the /32 rules of another registration's legacy pod
+        # or an idle registration would drop the rules of another registration's legacy pod
         names = rental_containers(await ctx.ssh.run("/usr/bin/docker ps --format '{{.Names}}'", check=False))
         if names:
             # running pods created before the rental network stay on their own network until they stop
             pods = await ctx.ssh.run(
                 "/usr/bin/docker inspect -f '{{if .State.Running}}{{range $k, $v := .NetworkSettings.Networks}}"
-                f"{{{{if ne $k \"{RENTAL_NETWORK_NAME}\"}}}}{{{{$v.IPAddress}}}} {{{{end}}}}{{{{end}}}}{{{{end}}}}' "
+                f"{{{{if ne $k \"{RENTAL_NETWORK_NAME}\"}}}}{{{{$v.NetworkID}}}} {{{{end}}}}{{{{end}}}}{{{{end}}}}' "
                 f"{' '.join(shlex.quote(name) for name in names)}",
                 check=False,
             )
-            sources = pod_inventory(pods)
-        if bridge is None and not sources:
+            network_ids = pod_inventory(pods)
+            if network_ids:
+                nets = await ctx.ssh.run(
+                    "/usr/bin/docker network inspect "
+                    f"-f '{{{{.Id}}}} {{{{.Driver}}}} {{{{index .Options \"{BRIDGE_NAME_OPTION}\"}}}}' "
+                    f"{' '.join(network_ids)}",
+                    check=False,
+                )
+                legacy = legacy_bridge_inventory(nets)
+        if bridge is None and not legacy:
             # rules from a rental that has since ended must not outlive it (Docker reuses its address); the image
             # is pulled if it was pruned, since its absence says nothing about rules left in DOCKER-USER
             result = await ctx.ssh.run(_helper(link_local_cleanup_script()), check=False)
             return None, _error(result)
-        result = await ctx.ssh.run(_helper(link_local_drop_script(bridge, sources)), check=False)
-        return {"bridge": bridge, "legacy_endpoints": len(sources)}, _error(result)
+        result = await ctx.ssh.run(_helper(link_local_drop_script(bridge, legacy)), check=False)
+        return {"bridge": bridge, "legacy_bridges": legacy}, _error(result)
 
 
 def _error(result) -> str | None:
