@@ -510,8 +510,17 @@ class Validator:
                     # Cleared here and not at the read: every return above this line means no
                     # cycle started, and the operator's request must survive to the next tick.
                     # After cycle_inputs and the wave lists: a Redis drop here must not leave it naming
-                    # the removed directory the build above replaced.
-                    await self.redis_service.clear_forced_validation_cycle_request()
+                    # the removed directory the build above replaced. A failed clear must not abort the cycle:
+                    # the wave lists are already guarding these miners and only the wave jobs below release them.
+                    try:
+                        await self.redis_service.clear_forced_validation_cycle_request()
+                    except Exception as exc:
+                        logger.error(
+                            _m(
+                                "[sync] Forced cycle request clear failed; the cycle continues",
+                                extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                            ),
+                        )
                 if first_cycle and not settings.DRY_RUN:
                     # Queue the nodes a restart cut off before this wave asks their miners, or the
                     # wave takes them (minutes slower). The lane launches once each list is in.

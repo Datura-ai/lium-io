@@ -560,6 +560,31 @@ async def test_every_miner_is_asked_under_the_cycles_block_time_id(
 
 
 @pytest.mark.asyncio
+async def test_a_failed_forced_request_clear_still_sends_the_wave(validator_with_mocks, create_neuron_info):
+    """The wave lists already guard the miners when the clear runs; only the wave jobs release them."""
+    validator = validator_with_mocks
+    validator.subtensor_client.get_miners = AsyncMock(return_value=[create_neuron_info(1, "miner-a")])
+    validator.subtensor_client.get_time_from_block = AsyncMock(return_value=CYCLE_BATCH_ID)
+    validator.an_operator_asked_for_a_cycle_now = AsyncMock(return_value=True)
+    validator.redis_service.clear_forced_validation_cycle_request = AsyncMock(side_effect=ConnectionError("lost"))
+
+    async def no_results(payload, **_):
+        return {"miner_hotkey": payload.miner_hotkey, "miner_coldkey": "c", "results": []}
+
+    validator.miner_service.request_job_to_miner = AsyncMock(side_effect=no_results)
+    with (
+        patch("core.validator.fetch_default_image_digests", new=AsyncMock(return_value={})),
+        patch("core.validator.fetch_executor_image_digest", new=AsyncMock(return_value=None)),
+    ):
+        await validator.sync()
+
+    validator.redis_service.clear_forced_validation_cycle_request.assert_awaited_once()
+    assert [c.kwargs["payload"].miner_hotkey for c in validator.miner_service.request_job_to_miner.await_args_list] == [
+        "miner-a"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_a_result_produced_after_the_job_files_vanished_is_not_the_nodes_verdict(
     monkeypatch, wallet, caplog
 ):
