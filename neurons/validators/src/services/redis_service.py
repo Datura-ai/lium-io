@@ -663,14 +663,17 @@ class RedisService:
         token = await self.get(FORCED_VALIDATION_CYCLE_KEY)
         return token.decode() if isinstance(token, bytes) else token
 
-    async def clear_forced_validation_cycle_request(self, token: str) -> None:
-        # Only the request this cycle read: one made while the cycle was being prepared waits for the next tick.
-        await self.redis.eval(
-            "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0",
+    async def clear_forced_validation_cycle_request(self, token: str) -> str | None:
+        """Clear only the request this cycle read; returns a newer one's token (made while the cycle was being
+        prepared), which the caller keeps for its next tick: the newer key's TTL can run out during a long wave."""
+        newer = await self.redis.eval(
+            "local v = redis.call('GET', KEYS[1]) if v == ARGV[1] then redis.call('DEL', KEYS[1]) return false end"
+            " return v",
             1,
             FORCED_VALIDATION_CYCLE_KEY,
             token,
         )
+        return newer.decode() if isinstance(newer, bytes) else newer
 
     @staticmethod
     def _dind_probe_miss_key(miner_hotkey: str, executor_id: str) -> str:

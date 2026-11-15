@@ -155,6 +155,8 @@ class Validator:
         # DAH-2958: the current cycle's job files / digests / image snapshot, reused by the
         # express lane so its verifications are the cycle's pipeline. None before the first cycle.
         self.cycle_inputs: CycleInputs | None = None
+        # A forced request made while the last cycle was prepared; kept here because its Redis TTL can end mid-wave.
+        self.carried_forced_request: str | None = None
         # When the first cycle since start began (CycleInputs.fleet_known_since).
         self.first_cycle_started_at: datetime | None = None
 
@@ -304,7 +306,7 @@ class Validator:
         # This runs on every tick, before the cycle branch. Without the guard a Redis blip
         # would end the whole tick as a generic "[sync] Unknown error".
         try:
-            return await self.redis_service.forced_validation_cycle_request()
+            return await self.redis_service.forced_validation_cycle_request() or self.carried_forced_request
         except Exception as exc:
             logger.warning(
                 _m(
@@ -312,7 +314,7 @@ class Validator:
                     extra=get_extra_info({**self.default_extra, "error": str(exc)}),
                 ),
             )
-            return None
+            return self.carried_forced_request
 
     async def sync(self):
         try:
@@ -527,8 +529,11 @@ class Validator:
                     # After cycle_inputs and the wave lists: a Redis drop here must not leave it naming
                     # the removed directory the build above replaced. A failed clear must not abort the cycle:
                     # the wave lists are already guarding these miners and only the wave jobs below release them.
+                    self.carried_forced_request = None
                     try:
-                        await self.redis_service.clear_forced_validation_cycle_request(cycle_asked_for_now)
+                        self.carried_forced_request = await self.redis_service.clear_forced_validation_cycle_request(
+                            cycle_asked_for_now
+                        )
                     except Exception as exc:
                         logger.error(
                             _m(
