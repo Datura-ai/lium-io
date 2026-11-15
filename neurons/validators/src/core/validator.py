@@ -485,10 +485,6 @@ class Validator:
                     keep_directories=self.express_lane.directories_in_use()
                 )
                 self.last_job_run_blocks = current_block
-                if cycle_asked_for_now:
-                    # Cleared here and not at the read: every return above this line means no
-                    # cycle started, and the operator's request must survive to the next tick.
-                    await self.redis_service.clear_forced_validation_cycle_request()
 
                 first_cycle = self.first_cycle_started_at is None
                 if first_cycle:
@@ -506,6 +502,12 @@ class Validator:
                         ).items()
                     },
                 )
+                if cycle_asked_for_now:
+                    # Cleared here and not at the read: every return above this line means no
+                    # cycle started, and the operator's request must survive to the next tick.
+                    # After cycle_inputs: a Redis drop here must not leave it naming the removed
+                    # directory the build above replaced.
+                    await self.redis_service.clear_forced_validation_cycle_request()
                 self.miner_service.start_awaiting_wave_lists(
                     job_batch_id, [miner.hotkey for miner in miners]
                 )
