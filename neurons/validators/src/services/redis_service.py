@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import time
+import uuid
 from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
 from typing import Callable, Literal, NamedTuple
@@ -584,8 +585,9 @@ class RedisService:
         # The TTL is the backstop, not the normal path: the request is cleared when a cycle
         # starts. It bounds a request that outlives its purpose -- a validator that is down,
         # or a stale replica still serving the key after the delete.
+        # A distinct token per request: a cycle clears only the request it read, never a newer one.
         await self.redis.set(
-            FORCED_VALIDATION_CYCLE_KEY, "1", ex=FORCED_VALIDATION_CYCLE_TTL_SECONDS
+            FORCED_VALIDATION_CYCLE_KEY, uuid.uuid4().hex, ex=FORCED_VALIDATION_CYCLE_TTL_SECONDS
         )
 
     async def mark_executors_validated(self, executor_ids: list[str]) -> None:
@@ -656,11 +658,19 @@ class RedisService:
             if value is not None
         }
 
-    async def is_forced_validation_cycle_requested(self) -> bool:
-        return await self.get(FORCED_VALIDATION_CYCLE_KEY) is not None
+    async def forced_validation_cycle_request(self) -> str | None:
+        """The pending request's token, or None when no cycle was asked for."""
+        token = await self.get(FORCED_VALIDATION_CYCLE_KEY)
+        return token.decode() if isinstance(token, bytes) else token
 
-    async def clear_forced_validation_cycle_request(self) -> None:
-        await self.delete(FORCED_VALIDATION_CYCLE_KEY)
+    async def clear_forced_validation_cycle_request(self, token: str) -> None:
+        # Only the request this cycle read: one made while the cycle was being prepared waits for the next tick.
+        await self.redis.eval(
+            "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0",
+            1,
+            FORCED_VALIDATION_CYCLE_KEY,
+            token,
+        )
 
     @staticmethod
     def _dind_probe_miss_key(miner_hotkey: str, executor_id: str) -> str:

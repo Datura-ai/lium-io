@@ -288,8 +288,8 @@ class Validator:
         first cycle to finish instead kept new nodes out of the lane 8-14 minutes after every restart."""
         return self.cycle_inputs
 
-    async def an_operator_asked_for_a_cycle_now(self) -> bool:
-        """Whether an operator asked for a cycle. Reads only -- the request stays pending.
+    async def an_operator_asked_for_a_cycle_now(self) -> str | None:
+        """The token of an operator's pending cycle request, or None. Reads only -- the request stays pending.
 
         DAH-2090, staging only. The connector process writes the request; it runs beside this
         one and shares no memory with it, so Redis carries it across. The request is cleared
@@ -299,12 +299,12 @@ class Validator:
         # A production validator ignores the key entirely, so a stray one cannot start a cycle
         # there even if something wrote it.
         if settings.DEPLOY_ENV == "PROD":
-            return False
+            return None
 
         # This runs on every tick, before the cycle branch. Without the guard a Redis blip
         # would end the whole tick as a generic "[sync] Unknown error".
         try:
-            return await self.redis_service.is_forced_validation_cycle_requested()
+            return await self.redis_service.forced_validation_cycle_request()
         except Exception as exc:
             logger.warning(
                 _m(
@@ -312,7 +312,7 @@ class Validator:
                     extra=get_extra_info({**self.default_extra, "error": str(exc)}),
                 ),
             )
-            return False
+            return None
 
     async def sync(self):
         try:
@@ -528,7 +528,7 @@ class Validator:
                     # the removed directory the build above replaced. A failed clear must not abort the cycle:
                     # the wave lists are already guarding these miners and only the wave jobs below release them.
                     try:
-                        await self.redis_service.clear_forced_validation_cycle_request()
+                        await self.redis_service.clear_forced_validation_cycle_request(cycle_asked_for_now)
                     except Exception as exc:
                         logger.error(
                             _m(

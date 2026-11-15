@@ -566,7 +566,7 @@ async def test_a_failed_forced_request_clear_still_sends_the_wave(validator_with
     validator = validator_with_mocks
     validator.subtensor_client.get_miners = AsyncMock(return_value=[create_neuron_info(1, "miner-a")])
     validator.subtensor_client.get_time_from_block = AsyncMock(return_value=CYCLE_BATCH_ID)
-    validator.an_operator_asked_for_a_cycle_now = AsyncMock(return_value=True)
+    validator.an_operator_asked_for_a_cycle_now = AsyncMock(return_value="token-1")
     validator.redis_service.clear_forced_validation_cycle_request = AsyncMock(side_effect=ConnectionError("lost"))
 
     async def no_results(payload, **_):
@@ -579,7 +579,7 @@ async def test_a_failed_forced_request_clear_still_sends_the_wave(validator_with
     ):
         await validator.sync()
 
-    validator.redis_service.clear_forced_validation_cycle_request.assert_awaited_once()
+    validator.redis_service.clear_forced_validation_cycle_request.assert_awaited_once_with("token-1")
     assert [c.kwargs["payload"].miner_hotkey for c in validator.miner_service.request_job_to_miner.await_args_list] == [
         "miner-a"
     ]
