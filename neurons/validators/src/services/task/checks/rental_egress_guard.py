@@ -61,11 +61,12 @@ CHAINS = ("LIUM-RENTAL-EGRESS-A", "LIUM-RENTAL-EGRESS-B")
 BRIDGE_NAME_OPTION = "com.docker.network.bridge.name"
 _IFNAME = re.compile(r"[A-Za-z0-9_.-]{1,15}")
 # One host-wide lock around every apply and cleanup: two miners can report the same host, and two interleaved
-# chain swaps could otherwise flush the chain the other just made active. The wait counts toward the helper timeout.
-# SSH lands in the executor container, whose own /run/lock is private to it; the executor runs with pid: host
-# (docker-compose.app.yml), so /proc/1 is the host's init and its root is the host filesystem every executor shares.
-HOST_LOCK = "/proc/1/root/run/lock/lium-rental-egress.lock"
+# chain swaps could otherwise flush the chain the other just made active. The helper takes it itself: it runs on the
+# host's daemon, so `-v /run/lock:/run/lock` is the host's /run/lock, shared by every executor's helper.
+HOST_LOCK = "/run/lock/lium-rental-egress.lock"
 LOCK_WAIT_SECONDS = 30
+# The helper's own bound, inside the executor-side one: killing the docker client does not stop the container.
+HELPER_RUN_SECONDS = HELPER_TIMEOUT_SECONDS - 10
 _ABSENT_NETWORK = re.compile(r"no such network|network \S+ not found", re.IGNORECASE)
 _ABSENT_CONTAINER = re.compile(r"no such (object|container)", re.IGNORECASE)
 
@@ -174,11 +175,28 @@ def link_local_cleanup_script() -> str:
     return "; ".join(lines) + "; exit 0"
 
 
-def _helper(script: str) -> str:
+def locked_script(script: str) -> str:
+    """``script`` under the host lock. The lock is on fd 9 of the shell running the iptables calls, which inherit it,
+    so it is released only when the last of them exits: no timeout can free it while a mutation still runs."""
     return (
-        f"timeout -k 5 {HELPER_TIMEOUT_SECONDS} flock -w {LOCK_WAIT_SECONDS} {HOST_LOCK} "
-        f"/usr/bin/docker run --rm --network=host --cap-add=NET_ADMIN --entrypoint /bin/sh "
-        f"{shlex.quote(settings.CUSTOM_DOCKERFILE_DIND_IMAGE)} -c {shlex.quote(script)}"
+        f"exec 9>>{HOST_LOCK} || exit 5; "
+        f"timeout {LOCK_WAIT_SECONDS} flock 9 || {{ echo 'host lock not taken' >&2; exit 5; }}; {script}"
+    )
+
+
+def helper_command(script: str) -> str:
+    """What the helper container runs: ``script`` under the lock, killed at ``HELPER_RUN_SECONDS``."""
+    return f"exec timeout -s KILL {HELPER_RUN_SECONDS} /bin/sh -c {shlex.quote(locked_script(script))}"
+
+
+def _helper(script: str) -> str:
+    # --init: the shell is not the container's PID 1, which ignores a SIGKILL from inside its namespace; once it dies
+    # the init exits and the kernel kills whatever is left, so the lock goes with the helper
+    return (
+        f"timeout -k 5 {HELPER_TIMEOUT_SECONDS} "
+        f"/usr/bin/docker run --rm --init --network=host --cap-add=NET_ADMIN -v /run/lock:/run/lock "
+        f"--entrypoint /bin/sh {shlex.quote(settings.CUSTOM_DOCKERFILE_DIND_IMAGE)} "
+        f"-c {shlex.quote(helper_command(script))}"
     )
 
 

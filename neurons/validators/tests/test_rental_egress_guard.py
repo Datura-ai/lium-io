@@ -17,7 +17,9 @@ from services.task.checks.rental_egress_guard import (
     RentalEgressGuardCheck,
     legacy_sources,
     link_local_cleanup_script,
+    helper_command,
     link_local_drop_script,
+    locked_script,
     rental_bridge,
 )
 from services.task.pipeline_factory import (
@@ -107,10 +109,10 @@ async def test_applies_the_drop_through_a_host_network_helper(context_factory):
     assert result.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
     [helper] = _helper_calls(ssh)
     assert "--network=host" in helper and helper.startswith("timeout ")
-    # the lock is taken inside the helper timeout and held around the whole docker run, so the apply is one unit
-    lock = f"flock -w {rental_egress_guard.LOCK_WAIT_SECONDS} {rental_egress_guard.HOST_LOCK} /usr/bin/docker run"
-    assert lock in helper and helper.index("timeout ") < helper.index("flock ")
-    assert shlex.quote(link_local_drop_script("br-0123456789ab", [])) in helper
+    # the lock and the helper's own bound are inside the container, on the host's /run/lock; none is executor-side
+    assert "--init" in helper and "-v /run/lock:/run/lock" in helper
+    assert "flock" not in helper.split("/usr/bin/docker run")[0]
+    assert helper.endswith(shlex.quote(helper_command(link_local_drop_script("br-0123456789ab", []))))
 
 
 @pytest.mark.asyncio
@@ -132,7 +134,7 @@ async def test_nothing_left_to_guard_removes_our_rules_pulling_a_pruned_image(co
 
     assert result.passed is True
     [helper] = _helper_calls(ssh)
-    assert "--pull=never" not in helper and shlex.quote(link_local_cleanup_script()) in helper
+    assert "--pull=never" not in helper and shlex.quote(helper_command(link_local_cleanup_script())) in helper
     script = link_local_cleanup_script()
     for chain in CHAINS:
         assert f"$IPT -D DOCKER-USER -j {chain}" in script and f"$IPT -F {chain}" in script
@@ -274,7 +276,7 @@ async def test_a_running_legacy_rental_off_the_rental_network_is_guarded(context
     assert inspect.endswith(f"{POD_A} filler_00000000-0000-4000-8000-00000000000c {POD_B}__prev")
     assert ".State.Running" in inspect
     [helper] = _helper_calls(ssh)
-    assert shlex.quote(link_local_drop_script(None, ["198.51.100.7/32"])) in helper
+    assert shlex.quote(helper_command(link_local_drop_script(None, ["198.51.100.7/32"]))) in helper
     assert result.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
 
 
@@ -301,18 +303,10 @@ async def test_apply_and_cleanup_take_the_same_host_lock(context_factory):
     await RentalEgressGuardCheck().run(context_factory(ssh=cleaned))
 
     [apply_cmd], [cleanup_cmd] = _helper_calls(applied), _helper_calls(cleaned)
-    prefix = f"flock -w {rental_egress_guard.LOCK_WAIT_SECONDS} {rental_egress_guard.HOST_LOCK} "
-    assert prefix in apply_cmd and prefix in cleanup_cmd
-    # each executor container has its own /run/lock; the host's is reached through init under pid: host
-    assert rental_egress_guard.HOST_LOCK == "/proc/1/root/run/lock/lium-rental-egress.lock"
-
-
-def test_the_executor_shares_the_host_pid_namespace_the_lock_path_relies_on():
-    import yaml
-
-    path = os.path.join(os.path.dirname(__file__), "../../executor/docker-compose.app.yml")
-    with open(path) as f:
-        assert yaml.safe_load(f)["services"]["executor"]["pid"] == "host"
+    assert apply_cmd.endswith(shlex.quote(helper_command(link_local_drop_script("br-0123456789ab", []))))
+    assert cleanup_cmd.endswith(shlex.quote(helper_command(link_local_cleanup_script())))
+    assert rental_egress_guard.HOST_LOCK == "/run/lock/lium-rental-egress.lock"
+    assert rental_egress_guard.HELPER_RUN_SECONDS < rental_egress_guard.HELPER_TIMEOUT_SECONDS
 
 
 def _legacy_rental(monkeypatch):
@@ -344,7 +338,9 @@ async def test_two_registrations_of_one_host_reconcile_the_same_host_wide_set(
     for ctx, rented_only in order:
         await RentalEgressGuardCheck(rented_only=rented_only).run(ctx)
 
-    expected = shlex.quote(link_local_drop_script("br-0123456789ab" if network_present else None, ["198.51.100.7/32"]))
+    expected = shlex.quote(
+        helper_command(link_local_drop_script("br-0123456789ab" if network_present else None, ["198.51.100.7/32"]))
+    )
     assert [expected in helper for helper in _helper_calls(ssh)] == [True, True]
 
 
@@ -391,7 +387,7 @@ async def test_an_unknown_inventory_keeps_the_rules_and_is_retried(context_facto
         assert result.event.reason_code == "RENTAL_EGRESS_GUARD_SKIPPED"
     elif outcome == "cleaned":
         [helper] = helpers
-        assert shlex.quote(link_local_cleanup_script()) in helper
+        assert shlex.quote(helper_command(link_local_cleanup_script())) in helper
     else:
         [helper] = helpers
         assert "-j DROP" in helper and result.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
@@ -444,3 +440,84 @@ def _run_cleanup(tmp_path, chains_present: bool, fail: str = "") -> tuple[int, l
 def test_cleanup_script_accepts_absence_and_reports_a_failed_removal(tmp_path, chains_present, fail, rc, left):
     returncode, state = _run_cleanup(tmp_path, chains_present, fail)
     assert returncode == rc and state == left
+
+
+# An iptables that records each call and whether the host lock was free at that moment; -C and -D find nothing.
+# With SLOW=<op>, that call marks its start, runs for 3 s and marks its end.
+_LOCK_PROBE_STUB = r"""#!/bin/sh
+flock -n "$LOCK" true && echo UNLOCKED >> "$STATE/log"
+echo "$*" >> "$STATE/log"
+[ "$1" = "${SLOW:-}" ] && { echo $$ > "$STATE/started"; sleep 3; touch "$STATE/done"; }
+case "$1" in -C|-D) exit 1 ;; esac
+exit 0
+"""
+
+
+def _probe(tmp_path, monkeypatch, slow=""):
+    bin_dir, state = tmp_path / "bin", tmp_path / "state"
+    bin_dir.mkdir()
+    state.mkdir()
+    for name in ("iptables-nft", "iptables-legacy"):
+        (bin_dir / name).write_text(_LOCK_PROBE_STUB)
+        (bin_dir / name).chmod(0o755)
+    lock = str(tmp_path / "egress.lock")
+    monkeypatch.setattr(rental_egress_guard, "HOST_LOCK", lock)
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "STATE": str(state), "LOCK": lock, "SLOW": slow}
+    return state, lock, env
+
+
+@pytest.mark.parametrize("script", ["apply", "cleanup"])
+def test_every_iptables_call_of_the_helper_runs_under_the_host_lock(tmp_path, monkeypatch, script):
+    state, _lock, env = _probe(tmp_path, monkeypatch)
+    body = link_local_drop_script("br-0123456789ab", ["10.0.0.5/32"]) if script == "apply" else ""
+    body = body or link_local_cleanup_script()
+
+    done = subprocess.run(["sh", "-c", locked_script(body)], env=env, capture_output=True, text=True)
+
+    log = (state / "log").read_text().splitlines()
+    assert done.returncode == 0, done.stderr
+    assert len(log) > 3 and "UNLOCKED" not in log
+
+
+def test_a_held_lock_is_waited_for_and_never_skipped(tmp_path, monkeypatch):
+    state, lock, env = _probe(tmp_path, monkeypatch)
+    monkeypatch.setattr(rental_egress_guard, "LOCK_WAIT_SECONDS", 1)
+    with open(lock, "w") as held:
+        import fcntl
+
+        fcntl.flock(held, fcntl.LOCK_EX)
+        script = locked_script(link_local_cleanup_script())
+        done = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True)
+
+    assert done.returncode == 5 and not (state / "log").exists()
+
+
+@pytest.mark.parametrize("kills", ["group", "shell-only"])
+def test_the_helper_bound_cannot_free_the_lock_while_a_mutation_runs(tmp_path, monkeypatch, kills):
+    """Killed at its bound mid-swap: GNU timeout kills the whole group, busybox's (modelled by --foreground) only the
+    shell, leaving the running iptables call; that call still holds the lock until it ends, and in the container the
+    kernel ends it as soon as the init exits (--init). Either way the lock is never free while a mutation runs."""
+    import time
+
+    state, lock, env = _probe(tmp_path, monkeypatch, slow="-I")
+    monkeypatch.setattr(rental_egress_guard, "HELPER_RUN_SECONDS", 1)
+    command = helper_command(link_local_drop_script("br-0123456789ab", []))
+    if kills == "shell-only":
+        command = command.replace("timeout -s KILL", "timeout --foreground -s KILL", 1)
+
+    # no pipes: an orphaned call holding them would make run() wait for it
+    done = subprocess.run(["sh", "-c", command], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    assert done.returncode != 0 and (state / "started").exists()
+
+    deadline = time.monotonic() + 6
+    while subprocess.run(["flock", "-n", lock, "true"]).returncode != 0 and time.monotonic() < deadline:
+        time.sleep(0.05)
+    finished_when_freed = (state / "done").exists()
+    calls_when_freed = (state / "log").read_text()
+    time.sleep(3.5)  # past the slow call's own end
+
+    # once the lock is free nothing touches iptables any more: the call had ended, or it was killed with the helper
+    assert (state / "log").read_text() == calls_when_freed
+    assert finished_when_freed or not (state / "done").exists()
+    # busybox kills only the shell: the call outlived it and kept the lock until it ended
+    assert finished_when_freed == (kills == "shell-only")
