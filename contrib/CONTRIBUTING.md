@@ -230,18 +230,19 @@ Python 3.11 and [pdm](https://pdm-project.org). Each service is its own pdm proj
 (cd lium_protocol && pip install . pytest "pydantic==2.13.*" && python -m lium_protocol.schema --check && python -m pytest tests -v --tb=short)
 ```
 
-These are the commands `.github/workflows/test.yml` (**Tests**) runs on every pull request, every push to `main` and every merge-queue run. The workflow has no path filter; its jobs decide for themselves:
+These are the commands `.github/workflows/test.yml` (**Tests**) runs on every pull request, on an approving review, on every push to `main` and on every merge-queue run. The workflow has no path filter; its jobs decide for themselves:
 
-- `route` reads the changed files (`.github/actions/changed-packages`) — the PR's files, the merge group's diff, or on a push to `main` the commits the push adds (the merged PR already ran the rest) — after dropping `*.md`, `.gitignore` and the root `docs/` tree; a README-only PR runs no neuron job.
+- Until a review from an owner, member or collaborator approves the PR, only `route` and `ruff-check` run; the test jobs and `e2e-gate` run once it is approved and on every push after that. Before approval the e2e check reports under another name, so the required `e2e-gate` is missing and the PR cannot merge until it ran.
+- `route` reads the changed files (`.github/actions/changed-packages`) — the PR's files, the merge group's diff, or on a push to `main` the commits the push adds — after dropping `*.md`, `.gitignore` and the root `docs/` tree; a README-only PR runs no neuron job.
 - Each neuron's test job runs only when that neuron, `datura/` or `.github/` changed; the validators job also runs when `lium_protocol/` changed (its `tests/test_protocol_compat.py` replays the package's recordings).
 - `protocol` (the `lium_protocol` line above, pydantic pinned to `2.13.*` because the snapshot is pydantic's JSON Schema) runs when `lium_protocol/`, `datura/` or `.github/` changed.
-- `ruff-check` (`ruff check --select F,ASYNC210,ASYNC251 --ignore F541 --extend-exclude migrations neurons datura watchtower`) always runs and is part of `tests-ok`.
+- `ruff-check` (`ruff check --select F,ASYNC210,ASYNC251 --ignore F541 --extend-exclude migrations neurons datura watchtower`) runs as its own job on every push; a ruff failure fails it and, once the PR is approved, `tests-ok` and `e2e-gate`.
 - `e2e-gate` (`cd e2e && ./gate.sh`) runs when a neuron, `lium_protocol/`, `datura/`, `.github/` or `e2e/` changed; a change only under a neuron's own `tests/` does not count (the stack never runs those).
-- `tests-ok` is the one status check to require; it reports on every PR.
+- `e2e-gate` is the required status check, and it fails when ruff or a test job failed; `tests-ok` sums up every job once the PR is approved.
 
 Tests follow Arrange-Act-Assert, one behavior per function; `ruff format` (pre-commit hook in `.pre-commit-config.yaml`, not run in CI) is the formatter.
 
-Other checks: **image-pins** runs only when a compose file, an env template or its script changes, plus daily on `main`. **CodeQL** comes from default setup while it is on; `.github/workflows/codeql.yml` then runs only its preflight job and analyses once default setup is switched off.
+Other checks: **image-pins** runs only when a compose file, an env template or its script changes, plus daily on `main`. **CodeQL** comes from default setup while it is on; `.github/workflows/codeql.yml` then skips every job; once default setup is switched off and the repository variable `CODEQL_ADVANCED` is `true`, it analyses every PR, merge group and push to `main`.
 
 ## Releases
 

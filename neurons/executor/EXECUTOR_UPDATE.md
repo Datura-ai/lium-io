@@ -9,11 +9,11 @@ The stack runs two containers: `executor-executor-runner-1` and `executor-watcht
 1. At start, and then every 5 minutes, the updater (`executor-watchtower-1`, image `daturaai/lium-watchtower`, source `../../watchtower`) reads the digest of the current runner image from `https://lium.io/api/watchtower/digest`. A digest is the identity of an image: `sha256:` followed by 64 hex characters. The validator signs the response. The updater checks the signature.
 2. When the runner container runs a different digest, the updater first makes sure that the host can start a GPU container: it starts a throwaway container from the runner's own image with every GPU requested and the entrypoint `true`, then removes it. The throwaway container carries the label `io.lium.watchtower.probe=nvidia-runtime`. Before the updater starts a new one, it removes every container with that label that an earlier check left behind, so a held host never collects them. If the daemon cannot start that container, the updater does not pull. It logs `Update held` with the reason and tries again at the next check. The most common reason is `NVIDIA_RUNTIME_MISMATCH`: the host's NVIDIA driver and its libraries no longer match, which happens after a driver package update without a reboot. A new executor container cannot start on such a host, so an update would take the node offline.
 3. When the GPU container starts, the updater pulls `daturaai/compute-subnet-executor-runner@<digest>` and recreates the runner from it with the same name, labels, mounts and restart policy.
-4. The runner starts the executor containers from the compose file that is baked into its image. That file pins the executor image by digest. When an executor container is already running, the runner first runs the same GPU check with the executor's current image. If it fails, the runner keeps the running executor, logs `Update held, running executor kept` with the cause and the remedy, and exits; it tries again when Docker restarts it.
+4. The runner starts the executor containers from the compose file that is baked into its image. That file pins the executor image by digest. When an executor container is already running, the runner first runs the same GPU check with the executor's current image. If it fails, the runner keeps the running executor, logs `Update held, running executor kept` with the cause and the remedy, and exits; it tries again when Docker restarts it. It pulls the new images first, then waits while a validator SSH session is open in the running executor (a pod create or a check; only the executor's own sessions count, not a login on the host or in a pod), because the recreate would cut it; a volume backup or restore is not waited for; it retries every 30 seconds and recreates anyway after 30 tries.
 
 The updater never pulls by tag. A pull by tag (`runner:latest`) asks the host's Docker daemon, and the daemon asks a registry mirror first when `/etc/docker/daemon.json` has one. A mirror can keep an old copy of the tag, and the pull then "succeeds" with the old image. A pull by digest is content-addressed: the daemon checks the hash of what it receives, so a mirror can answer with the right image or with an error, never with an old one. When the daemon's path fails, the updater pulls the same digest from `registry-1.docker.io` directly, which the daemon's mirror setting does not cover.
 
-Stacks started before this change run `nickfedor/watchtower`, which pulls by tag. Those hosts keep it until the one-time restart below.
+Stacks started before this change run `nickfedor/watchtower` (or the older `containrrr/watchtower`), which pulls by tag. The runner replaces it: every time the runner starts, it checks the stack's updater container and, when it runs another image, starts `daturaai/lium-watchtower` in its place with the same name. When that container does not start, the runner puts the old updater back. The next runner release reaches those hosts through their old updater, so they need no step. The one-time restart below is for a host whose updater no longer runs.
 
 ## Make sure that a node is current
 
@@ -64,13 +64,21 @@ A later `docker compose up -d` without a service name recreates the runner from 
 
 If `git pull` stops because of local changes to tracked files, run `git stash && git pull && git stash pop`. Then run `docker compose pull watchtower && docker compose up -d watchtower`. If `git stash pop` reports a conflict, send the output to Lium support.
 
-After about two minutes, make sure that both containers are up:
+If the host has no runner at all (`docker compose ps -a executor-runner` lists nothing), the updater cannot make one for this stack. Create it without starting it:
 
 ```bash
-docker compose ps executor-runner watchtower
+docker compose create --no-recreate executor-runner
 ```
 
-The output must list `executor-executor-runner-1` and `executor-watchtower-1` with the state `Up`. Then run the `/update-status` command from the section above: `runner.update_pending` must be `false`. The node earns again at the next validation cycle after the executor image matches the current release.
+At its next check (within 5 minutes) the updater finds that container, verifies the signed digest, pulls the current runner by it and starts that in its place. The created container never runs: the updater does not probe with its image, and when the current runner fails to start it leaves the created one stopped (its log says `Switch to the new container failed`) and tries again at its next check. This needs `daturaai/lium-watchtower:1.2.3` or later, which the `git pull` above brings. If the runner then still shows `Created` and `docker logs executor-watchtower-1 --tail 5` says `Image is up to date`, the image on the host already is the signed one: `docker compose start executor-runner`.
+
+After about two minutes (five after the `create` step), make sure that both containers are up:
+
+```bash
+docker compose ps -a executor-runner watchtower
+```
+
+The output must list `executor-executor-runner-1` and `executor-watchtower-1` with the state `Up`. A runner in the state `Created` is waiting for the updater's next check: look again after 5 minutes. Then run the `/update-status` command from the section above: `runner.update_pending` must be `false`. The node earns again at the next validation cycle after the executor image matches the current release.
 
 ## If `update_pending` stays `true` after the restart
 

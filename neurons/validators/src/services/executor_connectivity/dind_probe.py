@@ -77,6 +77,17 @@ DIND_SSHD_NOT_READY_MESSAGE = (
 DIND_SSHD_NOT_READY = DindLogCause("DIND_SSHD_NOT_READY", DIND_SSHD_NOT_READY_MESSAGE)
 
 
+def describe_ssh_error(error: Exception, port: PortPair) -> str:
+    """The provider-facing ssh fact; a connect timeout has no text of its own."""
+    if isinstance(error, TimeoutError):
+        # a provider report: a router flood/DoS filter dropped this connect right after the port test
+        return (
+            f"ssh to port {port.external}: connect timed out; check the forwarding of that port, and that "
+            "no router or firewall flood protection blocks our checks"
+        )
+    return f"ssh to port {port.external}: {(str(error) or type(error).__name__)[:120]}"
+
+
 # DAH-3634: `docker run` itself refused by the NVIDIA container hook. Every hook line counts
 # except `mount error`: that is sysbox's shiftfs fallback (nvidia_docker_sysbox_setup.sh --check)
 # and keeps SYSBOX_REQUIRED_MISSING. `NVIDIA_RUNTIME_MISMATCH` is the executor updater's name
@@ -277,7 +288,7 @@ class DindVerifier:
                 )
             error: DindLogCause | None = None
             if created and not sshd_answered and sysbox:
-                error = await self._diagnose_unanswered_container(ssh_client, name, e, log_ctx)
+                error = await self._diagnose_unanswered_container(ssh_client, name, e, port, log_ctx)
             return DindProbeResult(
                 success=False,
                 log_text=f"dind: check failed port={port.internal}",
@@ -364,6 +375,7 @@ class DindVerifier:
         ssh_client: SSHClientConnection,
         name: str,
         ssh_error: Exception,
+        port: PortPair,
         log_ctx: dict[str, Any],
     ) -> DindLogCause:
         """Read the container's logs while it still exists and name the cause (DAH-2856).
@@ -383,7 +395,7 @@ class DindVerifier:
         cause = diagnose_dind_log(stdout)
         if cause.code == DIND_SSHD_NOT_READY.code:
             # the log said nothing, so the ssh error is the only fact left for the provider
-            cause = DindLogCause(cause.code, f"{cause.message} (ssh: {str(ssh_error)[:120]})")
+            cause = DindLogCause(cause.code, f"{cause.message} ({describe_ssh_error(ssh_error, port)})")
         logger.warning(
             _m(
                 "DinD container started but sshd never answered",

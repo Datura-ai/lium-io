@@ -18,6 +18,7 @@ from protocol.vc_protocol.compute_requests import (
     GPU_RUNTIME_NVML_MISMATCH_REASON,
     FillerRunActiveResponse,
 )
+from services.redis_service import FILLER_REMOVED_BY_VALIDATOR_PREFIX
 
 from ...const import (
     FILLER_CONTAINER_PREFIX,
@@ -105,6 +106,15 @@ _FILLER_VERDICT_SEVERITY: dict[str, int] = {
     Msg.FILLER_CONTAINER_EXITED.reason: 1,
     Msg.FILLER_VERIFIED.reason: 0,
 }
+
+
+async def _removed_by_validator(ctx: Context, filler_container: str) -> bool:
+    """We removed this filler ourselves (GPU recheck, failed sshd) and the backend has not closed its run yet."""
+    key = f"{FILLER_REMOVED_BY_VALIDATOR_PREFIX}{filler_container}"
+    try:
+        return await ctx.services.redis.get(key) is not None
+    except Exception:  # noqa: BLE001 — no mark readable: probe the container as before
+        return False
 
 
 class RentalVerificationCheck:
@@ -483,6 +493,12 @@ class RentalVerificationCheck:
         if filler_run is None:
             return self._filler_state_unknown_result(
                 ctx, filler_container, reason="filler-run re-check API unavailable"
+            )
+
+        if await _removed_by_validator(ctx, filler_container):
+            # the report above still feeds the backend's close of the run
+            return self._filler_state_unknown_result(
+                ctx, filler_container, reason="the validator removed this filler itself"
             )
 
         if not filler_run.active:

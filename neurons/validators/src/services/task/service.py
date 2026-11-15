@@ -175,6 +175,8 @@ class TaskService:
                 host_policy = await self.attestation_service.prepare_host_policy(
                     executor_info,
                     nonce=attestation_nonce,
+                    # NodeAccountCheck compares the key the node presents and reports NODE_ACCOUNT_MISMATCH
+                    check_registered_key=False,
                 )
                 known_hosts_policy = host_policy.known_hosts
                 attestation_digest = host_policy.attestation_digest

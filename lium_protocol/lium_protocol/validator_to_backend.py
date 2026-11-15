@@ -446,6 +446,8 @@ class ContainerCreated(PodContainerResponse):
     volume_limit_gb: int | None = None
     local_volume_path: str | None = None
     volume_encryption_status: VolumeEncryptionStatus | None = None
+    # the ContainerCreateRequest's command_id, echoed so the backend can tell which dispatch this completes
+    command_id: str = ""
 
 
 @VALIDATOR_MESSAGES.register
