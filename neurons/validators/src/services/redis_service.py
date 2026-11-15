@@ -3,7 +3,6 @@ import json
 import logging
 import math
 import time
-import uuid
 from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
 from typing import Callable, Literal, NamedTuple
@@ -157,8 +156,10 @@ INCENTIVE_SNAPSHOT_KEY = "incentive_snapshot"
 # gets one cycle without container removal (see StaleContainerCleanupCheck).
 CLEANUP_SEEN_EXECUTORS_SET = "cleanup_seen_executors"
 # Written by the connector process, read by the validator process: they share no memory, so
-# this key is how an operator's request for a cycle crosses between them.
-FORCED_VALIDATION_CYCLE_KEY = "forced_validation_cycle"
+# this key is how an operator's request for a cycle crosses between them. It counts requests; the
+# acknowledged key holds the count a started cycle read, so a request is pending while the count is higher.
+FORCED_VALIDATION_CYCLE_KEY = "forced_validation_cycle_count"
+FORCED_VALIDATION_CYCLE_ACKED_KEY = "forced_validation_cycle_acknowledged"
 # DAH-3597: one key per executor while a DinD probe miss is on record (expires with the grace TTL).
 DIND_PROBE_MISS_PREFIX = "dind_probe_miss"
 # DAH-3698: a port verification that failed once inside the window (first-miss grace, as DAH-3597)
@@ -177,9 +178,6 @@ DISK_PRESSURE_DEFERRALS_PREFIX = "disk_pressure_deferrals"
 CACHED_TEMPLATE_FIRST_UNCACHED_PREFIX = "cached_template_first_uncached"
 # One key per (miner hotkey, executor): what the rented GPU health read flagged and when (DAH-4482).
 POST_RENTAL_GPU_RECHECK_PREFIX = "post_rental_gpu_recheck"
-# One scheduled window is 75 blocks, about 15 minutes. A request older than a couple of sync
-# ticks is stale: the operator has moved on, or the scheduled cycle covered them anyway.
-FORCED_VALIDATION_CYCLE_TTL_SECONDS = 60
 # DAH-2958: every executor uuid this validator has ever published a spec for. The express lane
 # treats anything in the portal snapshot that is NOT here as never validated. Seeded by every
 # cycle's publish, so one completed cycle after deploy is enough to know the whole fleet.
@@ -582,13 +580,9 @@ class RedisService:
         return pubsub
 
     async def request_forced_validation_cycle(self) -> None:
-        # The TTL is the backstop, not the normal path: the request is cleared when a cycle
-        # starts. It bounds a request that outlives its purpose -- a validator that is down,
-        # or a stale replica still serving the key after the delete.
-        # A distinct token per request: a cycle clears only the request it read, never a newer one.
-        await self.redis.set(
-            FORCED_VALIDATION_CYCLE_KEY, uuid.uuid4().hex, ex=FORCED_VALIDATION_CYCLE_TTL_SECONDS
-        )
+        # No TTL (review 4580791049): a request stays until a cycle that read it starts, however long the
+        # cycle before it takes. A request made while the validator is down starts one cycle when it is back.
+        await self.redis.incr(FORCED_VALIDATION_CYCLE_KEY)
 
     async def mark_executors_validated(self, executor_ids: list[str]) -> None:
         """DAH-2958: remember that a spec was published for these executors (one round-trip)."""
@@ -659,18 +653,23 @@ class RedisService:
         }
 
     async def forced_validation_cycle_request(self) -> str | None:
-        """The pending request's token, or None when no cycle was asked for."""
-        token = await self.get(FORCED_VALIDATION_CYCLE_KEY)
-        return token.decode() if isinstance(token, bytes) else token
+        """The pending request's token (the request count), or None when no cycle was asked for since the last
+        acknowledged one."""
+        count, acked = await self.redis.mget(FORCED_VALIDATION_CYCLE_KEY, FORCED_VALIDATION_CYCLE_ACKED_KEY)
+        count = int(count or 0)
+        return str(count) if count > int(acked or 0) else None
 
     async def clear_forced_validation_cycle_request(self, token: str) -> str | None:
-        """Clear only the request this cycle read; returns a newer one's token (made while the cycle was being
-        prepared), which the caller keeps for its next tick: the newer key's TTL can run out during a long wave."""
+        """Acknowledge the requests up to the one this cycle read; returns a newer one's token (made while the cycle
+        was being prepared), which stays pending for the next tick."""
         newer = await self.redis.eval(
-            "local v = redis.call('GET', KEYS[1]) if v == ARGV[1] then redis.call('DEL', KEYS[1]) return false end"
-            " return v",
-            1,
+            "local count = tonumber(redis.call('GET', KEYS[1]) or '0')"
+            " local acked = math.max(tonumber(redis.call('GET', KEYS[2]) or '0'), tonumber(ARGV[1]))"
+            " redis.call('SET', KEYS[2], acked)"
+            " if count > acked then return tostring(count) end return false",
+            2,
             FORCED_VALIDATION_CYCLE_KEY,
+            FORCED_VALIDATION_CYCLE_ACKED_KEY,
             token,
         )
         return newer.decode() if isinstance(newer, bytes) else newer
