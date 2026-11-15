@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import runpy
 import shutil
 import signal
 import subprocess
@@ -39,6 +40,7 @@ from storage.restic import (
     BACKUP_SOURCE_SCRIPT,
     CA_BUNDLE,
     RENTAL_EXEC_SOURCE,
+    RESTIC_TMPFS_BYTES,
     JsonEventWriter,
     ResticOperationError,
     ResticResult,
@@ -567,6 +569,8 @@ def test_plain_backup_uses_read_only_volume_and_keeps_secrets_out_of_arguments()
     assert command[script + 2 : script + 4] == ["/workspace/checkpoints", runner._restic_binary]
     assert command[command.index("--log-driver") + 1] == "none"
     assert command[command.index("--tmpfs") + 1] == "/tmp:rw,nosuid,nodev,size=536870912"
+    launcher = runpy.run_path(str(Path(storage_runner.__file__).parent / "storage" / "rental_exec.py"))
+    assert launcher["TMPFS_BYTES"] == RESTIC_TMPFS_BYTES  # restic's temp packs get the same limit in the rental
     assert command[command.index("--memory") + 1] == "4g"
     assert "GOMAXPROCS=8" in command
     assert command[command.index("--oom-score-adj") + 1] == "1000"
@@ -2403,7 +2407,7 @@ def test_rental_launcher_checks_the_source_then_executes_restic_by_descriptor(
     if kind == "file":
         source.write_text("x")
     # /bin/sh stands in for restic (a static binary): prints where and how it was started
-    probe = 'echo "$(pwd -P) $PWD $SSL_CERT_FILE"'
+    probe = 'echo "$(pwd -P) $PWD $SSL_CERT_FILE $TMPDIR"'
     cwd = source if kind == "files" else tmp_path
     run = (
         "import os, runpy, sys; launcher = runpy.run_path(sys.argv[1]); "
@@ -2417,7 +2421,7 @@ def test_rental_launcher_checks_the_source_then_executes_restic_by_descriptor(
     )
 
     assert result.returncode == exit_code, result.stderr
-    assert result.stdout == (f"{cwd} {cwd} /proc/lium-ca.crt\n" if exit_code == 0 else "")
+    assert result.stdout == (f"{cwd} {cwd} /proc/lium-ca.crt /proc\n" if exit_code == 0 else "")
 
 
 def test_real_encrypted_restore_through_a_rental_symlink_stays_in_the_rental_root(

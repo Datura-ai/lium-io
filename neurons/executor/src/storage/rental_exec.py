@@ -6,7 +6,7 @@ It joins the rental's user, mount and network namespaces, never its PID namespac
 restic nor read its environment (the repository credentials). It roots itself in the rental's root, so every path,
 symlinks included, resolves there. Nothing is loaded from the rental's filesystem: every import happens first,
 restic is executed from a descriptor opened beforehand, and the CA bundle is written to a tmpfs that only this
-process's private mount namespace has.
+process's private mount namespace has; restic's temp files go there too.
 """
 
 import ctypes
@@ -19,6 +19,9 @@ SOURCE_MISSING_EXIT = 66
 # A rental cannot rename or unmount its /proc mount point, so this path keeps resolving to our tmpfs.
 CA_DIRECTORY = "/proc"
 CA_PATH = CA_DIRECTORY + "/lium-ca.crt"
+# restic's temp packs go to this tmpfs, not the rental's /tmp: they must not fail on, or count against, the
+# rental's full root disk. Same limit as the helper's own /tmp (restic.RESTIC_TMPFS_BYTES).
+TMPFS_BYTES = 512 * 1024 * 1024
 
 
 def check_source(path):
@@ -39,7 +42,8 @@ def exec_restic(restic, cwd, check, restic_arguments):
         if code:
             sys.exit(code)
     os.chdir(cwd)
-    os.execve(restic, ["restic", *restic_arguments], {**os.environ, "PWD": cwd, "SSL_CERT_FILE": CA_PATH})
+    environment = {**os.environ, "PWD": cwd, "SSL_CERT_FILE": CA_PATH, "TMPDIR": CA_DIRECTORY}
+    os.execve(restic, ["restic", *restic_arguments], environment)
 
 
 def _libc_call(libc, name, argtypes):
@@ -82,7 +86,8 @@ def main(argv):
     os.chroot(".")
     unshare(CLONE_NEWNS)
     mount(None, b"/", None, MS_REC | MS_PRIVATE, None)
-    mount(b"tmpfs", CA_DIRECTORY.encode(), b"tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, None)
+    options = f"size={TMPFS_BYTES},mode=0700".encode()
+    mount(b"tmpfs", CA_DIRECTORY.encode(), b"tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, options)
     with os.fdopen(os.open(CA_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb") as ca_file:
         ca_file.write(ca)
     exec_restic(restic, cwd, check, restic_arguments)
