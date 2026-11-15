@@ -8,6 +8,7 @@ reasons. The check is non-fatal and observe-only: a warning event, the score unc
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import json
@@ -51,8 +52,26 @@ def h100(**overrides: Any) -> dict[str, Any]:
     return row
 
 
+class ProbeRunner:
+    """The load probe's SSH run (DAH-6469): answers with a probe report carrying these thermal readings."""
+
+    def __init__(self, *readings: dict[str, Any], stdout: str | None = None):
+        report = {"status": "ok", "thermal": {"available": True, "gpus": list(readings)}}
+        self.stdout = stdout if stdout is not None else f"GPU_FAULT_PROBE_JSON: {json.dumps(report)}\n"
+        self.calls: list[str] = []
+
+    async def run(self, cmd, *, timeout=60, check=False, retryable=True, stdin_text=None):
+        self.calls.append(cmd)
+        return SimpleNamespace(stdout=self.stdout, stderr="", exit_code=0, error_type=None, duration_ms=1)
+
+
 async def run(
-    context_factory, *rows: dict[str, Any], rented: bool = False, rental_hotkey: str = "miner-hotkey", redis=None
+    context_factory,
+    *rows: dict[str, Any],
+    rented: bool = False,
+    rental_hotkey: str = "miner-hotkey",
+    redis=None,
+    runner=None,
 ):
     rented_data = None
     if rented:
@@ -69,6 +88,8 @@ async def run(
     ctx = context_factory(
         state=build_state(gpu_details=list(rows), rented_data=rented_data),
         services=build_services(redis=redis or FakeRedis()),
+        # a probe that reports nothing by default: the hold behaves as before DAH-6469
+        runner=runner or ProbeRunner(stdout=""),
     )
     return await GpuThermalThrottleCheck().run(ctx)
 
@@ -465,3 +486,127 @@ async def test_a_collapsed_gpu_under_another_miners_rental_on_a_different_endpoi
     result = await run(context_factory, row, rented=True, rental_hotkey="other-miner-hotkey")
 
     assert result.passed is False
+
+
+# --------------------------------------------------------------------------------------------------
+# DAH-6469: the validator loads a held node's cards itself
+# --------------------------------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_a_clean_reading_under_the_load_probe_clears_the_hold(context_factory):
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+    runner = ProbeRunner(h100())
+
+    result = await run(context_factory, IDLE_ROW, redis=redis, runner=runner)
+
+    assert result.passed is True
+    assert await redis.get(_hold_key(context_factory)) is None
+    (cmd,) = runner.calls
+    assert f"--seconds {gpu_thermal_throttle.LOAD_PROBE_SECONDS} --thermal" in cmd
+
+
+@pytest.mark.asyncio
+async def test_a_collapse_under_the_load_probe_keeps_the_node_out(context_factory):
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+
+    result = await run(context_factory, IDLE_ROW, redis=redis, runner=ProbeRunner(COLLAPSED_ROW))
+
+    assert result.passed is False
+    assert result.event.what_we_saw["collapsed_count"] == 1
+    assert result.event.what_we_saw["load_probe"]["still_held"] == ["GPU-aaaa"]
+    assert json.loads(redis.store[_hold_key(context_factory)])["gpus"] == ["GPU-aaaa"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "runner",
+    [
+        ProbeRunner(stdout=""),  # no report
+        ProbeRunner(h100(gpu_utilization=10)),  # the load never showed
+        ProbeRunner(h100(uuid="GPU-other")),  # another card's reading does not clear this one
+    ],
+)
+async def test_a_probe_that_proves_nothing_keeps_the_hold(context_factory, runner):
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+
+    result = await run(context_factory, IDLE_ROW, redis=redis, runner=runner)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["held_gpu_uuids"] == ["GPU-aaaa"]
+    assert _hold_key(context_factory) in redis.store
+
+
+@pytest.mark.asyncio
+async def test_no_load_probe_without_a_hold_or_under_a_rental(context_factory):
+    redis = FakeRedis()
+    runner = ProbeRunner(h100())
+    await run(context_factory, IDLE_ROW, redis=redis, runner=runner)
+    await run(context_factory, COLLAPSED_ROW, redis=redis, rented=True, runner=runner)
+    await run(context_factory, IDLE_ROW, redis=redis, rented=True, runner=runner)
+
+    assert runner.calls == []
+
+
+def test_the_load_probe_fits_the_fault_probes_ssh_cap():
+    from services.task.checks import gpu_fault_probe as check
+    from miner_jobs import gpu_fault_probe as probe
+
+    largest = gpu_thermal_throttle.LOAD_PROBE_SECONDS + probe.WORKER_GRACE_SECONDS + probe.WORKER_GRACE_PER_GPU_SECONDS * 13
+    # the parent's tail after the drain (reap, two NVML snapshots, two dmesg reads) plus the sampler's grace
+    tail = probe.WORKER_REAP_AFTER_KILL_SECONDS + 2 * probe.NVML_GRACE_SECONDS + 2 * probe.DMESG_TIMEOUT_SECONDS
+    assert largest + tail + probe.NVML_GRACE_SECONDS < check.PROBE_TIMEOUT_SECONDS
+
+
+def test_last_busy_readings_keeps_the_last_busy_row_per_card():
+    from miner_jobs.gpu_fault_probe import last_busy_readings
+
+    idle = {"index": 0, "uuid": "GPU-a", "gpu_utilization": 0}
+    busy1 = {"index": 0, "uuid": "GPU-a", "gpu_utilization": 99, "graphics_speed": 1900}
+    busy2 = {"index": 0, "uuid": "GPU-a", "gpu_utilization": 97, "graphics_speed": 1500}
+    never = {"index": 1, "uuid": "GPU-b", "gpu_utilization": 3}
+
+    assert last_busy_readings([[idle, never], [busy1, never], [busy2, never], [idle, never]]) == [busy2, never]
+
+
+def test_the_thermal_sampler_reports_each_cards_busy_reading(monkeypatch):
+    import multiprocessing
+    import sys
+
+    from miner_jobs import gpu_fault_probe as probe
+
+    fake = SimpleNamespace(
+        NVML_CLOCK_GRAPHICS=0,
+        NVML_TEMPERATURE_GPU=0,
+        nvmlInit=lambda: None,
+        nvmlShutdown=lambda: None,
+        nvmlDeviceGetCount=lambda: 1,
+        nvmlDeviceGetHandleByIndex=lambda i: i,
+        nvmlDeviceGetUUID=lambda h: b"GPU-a",
+        nvmlDeviceGetUtilizationRates=lambda h: SimpleNamespace(gpu=99),
+        nvmlDeviceGetClockInfo=lambda h, c: 1900,
+        nvmlDeviceGetMaxClockInfo=lambda h, c: 1980,
+        nvmlDeviceGetCurrentClocksThrottleReasons=lambda h: 0,  # an old binding: only the old name
+        nvmlDeviceGetTemperature=lambda h, t: 70,
+    )
+    monkeypatch.setitem(sys.modules, "pynvml", fake)
+    monkeypatch.setattr(probe, "_quiet_child", lambda: None)
+
+    reply = probe.finish_thermal_sampler(probe.start_thermal_sampler(multiprocessing.get_context("fork")))
+
+    assert reply == {
+        "available": True,
+        "gpus": [
+            {
+                "index": 0,
+                "uuid": "GPU-a",
+                "gpu_utilization": 99,
+                "graphics_speed": 1900,
+                "max_graphics_speed": 1980,
+                "clocks_event_reasons": 0,
+                "temperature": 70,
+            }
+        ],
+    }
+    assert gpu_thermal_throttle._judgeable_busy(reply["gpus"][0])

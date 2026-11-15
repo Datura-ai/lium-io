@@ -31,8 +31,11 @@ writes the collapsed UUIDs to Redis (``gpu_thermal_hold:<hotkey>:<executor uuid>
 last collapse). An unrented cycle with marked GPUs still unproven fails as a collapse does (held_from_rental). A
 marked GPU is cleared by a busy reading that is not collapsed and carries the clocks and reasons judge_gpu needs, or
 when a scrape whose every row has a UUID no longer lists it (replaced); the reading is the scrape's, taken before
-the matmul, so on an idle node only a filler or the host's own load at scrape time clears it, otherwise the TTL does. A dry run
-writes nothing; a Redis that cannot be read is no hold.
+the matmul, so on an idle node only a filler or the host's own load at scrape time clears it. DAH-6469: an unrented
+node held with no new collapse and no filler gets that load from the validator: the kernel-fault probe runs
+LOAD_PROBE_SECONDS on its cards with ``--thermal`` and reports each card's last busy reading under it, judged
+like a scrape reading (clean clears, collapsed renews). A probe with no readings leaves the hold, and the TTL
+stays the fallback. A dry run writes nothing; a Redis that cannot be read is no hold.
 
 A GPU whose clocks a renter locked (DAH-4663, a ``gpu_clock_lock:<uuid>`` record in Redis) is spared only the
 low-clock finding: the lock holds its clock down on purpose, but a thermal or hardware slowdown is still judged.
@@ -43,6 +46,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 from datetime import UTC, datetime
 from typing import Any
 
@@ -55,6 +59,8 @@ from ..availability import ReachSource, ReachTarget
 from ..messages import GpuThermalThrottleMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .capability import get_filler_only_container
+from .gpu_fault_probe import MAX_NVML_GPUS, PROBE_TIMEOUT_SECONDS, _parse_report, probe_source
 from .rental_owner import rental_of_this_node
 from .rented_gpu_drop import GPU_DROP_REDIS_ERRORS
 
@@ -78,6 +84,9 @@ MIN_UTILIZATION_PCT = 80
 MIN_CLOCK_RATIO = 0.5
 THERMAL_HOLD_KEY_PREFIX = "gpu_thermal_hold"
 THERMAL_HOLD_SECONDS = 7 * 24 * 3600
+# DAH-6469: the validator's own load on a held node's cards, long enough for a card whose cooling still fails to
+# heat into its slowdown; inside the fault probe's SSH cap with the largest per-GPU grace
+LOAD_PROBE_SECONDS = 20
 
 
 def _to_number(value: Any) -> float | None:
@@ -169,6 +178,15 @@ class GpuThermalThrottleCheck:
         rented = bool(rented_executor and rented_executor.pods)
         collapsed = [finding for finding in throttled if finding["collapsed"]]
         held, since = await self._update_hold(ctx, collapsed)
+        load_probe: dict[str, Any] | None = None
+        if held and not collapsed and not rented and not get_filler_only_container(ctx):
+            readings = await self._load_probe(ctx)
+            probe_findings = [finding for finding in map(judge_gpu, readings) if finding is not None]
+            collapsed = [finding for finding in probe_findings if finding["collapsed"]]
+            throttled = throttled + probe_findings
+            if readings:
+                held, since = await self._update_hold(ctx, collapsed, readings)
+            load_probe = {"seconds": LOAD_PROBE_SECONDS, "readings": len(readings), "still_held": held}
         if (collapsed or held) and not rented:
             what: dict[str, Any] = {
                 # an availability entry, as GpuLossHoldCheck's: the backend hides the node this cycle
@@ -181,6 +199,8 @@ class GpuThermalThrottleCheck:
             }
             if not collapsed:
                 what.update(held_from_rental=True, held_gpu_uuids=held, held_since=since)
+            if load_probe is not None:
+                what["load_probe"] = load_probe
             event = render_message(Msg.COLLAPSED, ctx=ctx, check_id=self.check_id, what=what)
             return CheckResult(
                 passed=False,
@@ -209,10 +229,26 @@ class GpuThermalThrottleCheck:
         )
         return CheckResult(passed=True, event=event)
 
+    async def _load_probe(self, ctx: Context) -> list[dict[str, Any]]:
+        """Each card's last busy reading under the fault probe's load, in gpu_details keys; [] when none came back."""
+        command = f"{shlex.quote(ctx.executor.python_path)} -I - --seconds {LOAD_PROBE_SECONDS} --thermal"
+        run = await ctx.runner.run(
+            command, timeout=PROBE_TIMEOUT_SECONDS, retryable=False, stdin_text=probe_source()
+        )
+        thermal = (_parse_report(run.stdout) or {}).get("thermal")
+        gpus = thermal.get("gpus") if isinstance(thermal, dict) else None
+        # executor-controlled: bounded, and only rows
+        return [gpu for gpu in gpus[:MAX_NVML_GPUS] if isinstance(gpu, dict)] if isinstance(gpus, list) else []
+
     async def _update_hold(
-        self, ctx: Context, collapsed: list[dict[str, Any]]
+        self,
+        ctx: Context,
+        collapsed: list[dict[str, Any]],
+        readings: list[dict[str, Any]] | None = None,
     ) -> tuple[list[str], str | None]:
-        """The marked GPUs still unproven after this reading, and since when; keeps the Redis mark in step."""
+        """The marked GPUs still unproven after this reading, and since when; keeps the Redis mark in step.
+
+        readings: the load probe's rows instead of the scrape's (DAH-6469)."""
         key = f"{THERMAL_HOLD_KEY_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
         mark: dict[str, Any] = {}
         try:
@@ -224,13 +260,15 @@ class GpuThermalThrottleCheck:
             self._log_redis_unavailable(ctx, "read")
         marked = {uuid for uuid in mark.get("gpus") or [] if isinstance(uuid, str)}
         collapsed_uuids = {f["uuid"] for f in collapsed if isinstance(f["uuid"], str)}
-        details = [detail for detail in ctx.state.gpu_details or [] if isinstance(detail, dict)]
+        rows = ctx.state.gpu_details if readings is None else readings
+        details = [detail for detail in rows or [] if isinstance(detail, dict)]
         # only a busy reading judge_gpu can judge proves a card; one missing a clock or the reasons is not clean
         proven = {detail.get("uuid") for detail in details if _judgeable_busy(detail)}
         present = [detail.get("uuid") for detail in details]
         # a marked card the scrape no longer lists was replaced (a lost card is GpuLossHoldCheck's);
         # a row without a uuid could be any marked card, so then none counts as replaced
-        if present and all(isinstance(uuid, str) and uuid for uuid in present):
+        # the probe's rows only clear a card by its own clean reading: replacement is the scrape's call
+        if readings is None and present and all(isinstance(uuid, str) and uuid for uuid in present):
             marked_now = marked & set(present)
         else:
             marked_now = marked
