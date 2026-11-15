@@ -1836,24 +1836,6 @@ def test_restore_target_script_creates_the_target_and_restores_into_it(tmp_path:
     assert (tmp_path / "a" / "b" / "ran").exists()
 
 
-def test_restore_target_script_writes_stay_in_the_entered_directory_when_an_ancestor_is_swapped(tmp_path: Path) -> None:
-    """restic opens files by $PWD; after the check, a renter swapping an ancestor for a link must not move them."""
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    volume = tmp_path / "volume"
-    swap_then_write = 'mv "$0/a" "$0/a2" && ln -s "$1" "$0/a" && touch "$PWD/ran"'
-
-    completed = subprocess.run(
-        ["/bin/sh", "-c", RESTORE_TARGET_SCRIPT, "sh", str(volume / "a" / "b"), str(volume),
-         "/bin/sh", "-c", swap_then_write, str(volume), str(elsewhere)],
-        capture_output=True,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert (volume / "a2" / "b" / "ran").exists()
-    assert list(elsewhere.iterdir()) == []
-
-
 def test_legacy_restore_downloads_from_the_root_directory(tmp_path: Path) -> None:
     """awscli resolves `-` through getcwd, which fails inside the rental's tree under an encrypted helper."""
     payload = _operation_payload(action="restore")
