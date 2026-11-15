@@ -351,6 +351,8 @@ DOCKER_VOLUME_PLUGINS = {
 }
 
 S3FS_PLUGIN_IMAGE = "mochoa/s3fs-volume-plugin"
+S3FS_PLUGIN_INSTALL_RETRIES = 2
+S3FS_PLUGIN_INSTALL_RETRY_WAIT_SECONDS = 5
 
 
 LEGACY_S3FS_PLUGIN_ALIAS = "s3fs"
@@ -7773,9 +7775,18 @@ class DockerService:
         mount_options: str,
     ) -> list[asyncssh.SSHCompletedProcess]:
         """Install and configure the plugin instance that serves this one volume."""
-        commands: list[str] = [
+        install_command: str = (
             f"/usr/bin/docker plugin install {S3FS_PLUGIN_IMAGE} "
-            f"--alias {plugin_alias} --grant-all-permissions --disable",
+            f"--alias {plugin_alias} --grant-all-permissions --disable"
+        )
+        # the install pulls the plugin from Docker Hub every time; one TLS timeout there failed the whole rental
+        install_result = await ssh_client.run(install_command)
+        for _ in range(S3FS_PLUGIN_INSTALL_RETRIES):
+            if install_result.exit_status == 0 or "already exists" in (install_result.stderr or ""):
+                break
+            await asyncio.sleep(S3FS_PLUGIN_INSTALL_RETRY_WAIT_SECONDS)
+            install_result = await ssh_client.run(install_command)
+        commands: list[str] = [
             f"/usr/bin/docker plugin disable {plugin_alias} -f",
             f"/usr/bin/docker plugin set {plugin_alias} "
             f"AWSACCESSKEYID={volume_info.iam_user_access_key} "
@@ -7783,7 +7794,7 @@ class DockerService:
             f'/usr/bin/docker plugin set {plugin_alias} DEFAULT_S3FSOPTS="{mount_options}"',
             f"/usr/bin/docker plugin enable {plugin_alias}",
         ]
-        return [await ssh_client.run(command) for command in commands]
+        return [install_result] + [await ssh_client.run(command) for command in commands]
 
     async def _drop_legacy_shared_s3fs_volume(
         self,
