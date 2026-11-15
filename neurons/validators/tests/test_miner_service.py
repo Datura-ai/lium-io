@@ -477,3 +477,16 @@ async def test_a_pod_logs_failure_message_carries_no_miner_address(mocker, miner
 
     assert isinstance(result, FailedGetPodLogs)
     assert "192.0.2.7" not in result.msg and "8123" not in result.msg
+
+
+def test_a_start_request_failing_before_docker_is_reported_as_a_start_failure(miner_service):
+    from payload_models.payloads import ContainerStartRequest, FailedContainerErrorTypes
+
+    payload = ContainerStartRequest(
+        miner_hotkey="m", executor_id="e", pod_id="p", container_name="pod_p", local_volume_path="/root"
+    )
+
+    result = miner_service._handle_container_error(payload, "Error", FailedContainerErrorCodes.UnknownError)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_type == FailedContainerErrorTypes.ContainerStartFailed

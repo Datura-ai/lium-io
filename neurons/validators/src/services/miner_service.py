@@ -1506,6 +1506,17 @@ class MinerService:
                 error_type=FailedContainerErrorTypes.ContainerStopFailed,
                 error_code=error_code,
             )
+        elif isinstance(payload, ContainerStartRequest):
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                msg=headline,
+                detail=detail,
+                error_type=FailedContainerErrorTypes.ContainerStartFailed,
+                error_code=error_code,
+            )
         elif isinstance(payload, AddSshPublicKeyRequest):
             return FailedContainerRequest(
                 miner_hotkey=payload.miner_hotkey,

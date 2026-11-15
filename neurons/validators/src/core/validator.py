@@ -459,11 +459,6 @@ class Validator:
                     )
                     return
 
-                # DAH-3405: a push between two cycles opens the grace window here, after the last
-                # early return and before the first job of this cycle runs against the new digest,
-                # so an aborted iteration does not count as a cycle of the window.
-                rollout_window = await self.observe_executor_rollout(executor_digest, job_block)
-
                 logger.info(
                     _m(
                         "[sync] Send jobs to miners",
@@ -508,6 +503,10 @@ class Validator:
                     # After cycle_inputs: a Redis drop here must not leave it naming the removed
                     # directory the build above replaced.
                     await self.redis_service.clear_forced_validation_cycle_request()
+                # DAH-3405: a push between two cycles opens the grace window here, after the job-files
+                # build and the last pre-wave failure point and before the first job of this cycle runs
+                # against the new digest, so an aborted iteration does not count as a cycle of the window.
+                rollout_window = await self.observe_executor_rollout(executor_digest, job_block)
                 self.miner_service.start_awaiting_wave_lists(
                     job_batch_id, [miner.hotkey for miner in miners]
                 )
