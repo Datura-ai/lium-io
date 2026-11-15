@@ -56,14 +56,10 @@ STALE_HELPER_AGE = timedelta(minutes=10)
 # restic starts, so nothing is uploaded (DAH-2002); a path that is not a directory fails.
 BACKUP_SOURCE_SCRIPT = '[ -e "$1" ] || exit 66; cd "$1" 2>/dev/null || exit 1; [ -n "$(ls -A)" ] || exit 66; shift; exec "$@"'
 BACKUP_SOURCE_MISSING_EXIT = 66
-# DAH-6447: restic runs as a process of the rental (its user, mount, PID and network namespaces), so every path,
-# symlinks included, resolves in the rental's own root. restic and the CA bundle are opened here, before nsenter:
-# nothing from the rental's filesystem is executed. $1 is the helper's view of the backup path, checked only for the
-# missing/empty no-op (racy, but restic itself runs confined); "" skips it. PWD keeps the snapshot path stable.
-ENCRYPTED_RESTIC_SCRIPT = (
-    'if [ -n "$1" ]; then [ -e "$1" ] || exit 66; [ -d "$1" ] || exit 1; [ -n "$(ls -A "$1")" ] || exit 66; fi; '
-    'exec 3< "$2" 4< "$3"; cwd="$4"; shift 4; PWD="$cwd" SSL_CERT_FILE=/proc/self/fd/4 exec "$@"'
-)
+# DAH-6447: encrypted backups and restores run restic as a process of the rental (its user, mount and network
+# namespaces, not its PID namespace) through this launcher; see storage/rental_exec.py.
+with open(os.path.join(os.path.dirname(__file__), "rental_exec.py"), encoding="utf-8") as _launcher:
+    RENTAL_EXEC_SOURCE = _launcher.read()
 # the rental image may have no CA bundle; Go reads SSL_CERT_FILE
 CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 
@@ -349,8 +345,9 @@ class ResticStorageRunner:
             and getattr(self._workspace, "image", None)
             and _dns_lookup_failed(result.stderr or result.stdout)
         ):
-            # The executor's compose-network DNS (127.0.0.11) can fail while the default bridge
-            # resolves fine; the backup itself already runs in a default-bridge helper.
+            # The executor's compose-network DNS (127.0.0.11) can fail while the default bridge resolves fine, so
+            # repository commands retry in a default-bridge helper. Encrypted backups and restores themselves use the
+            # rental's own network (DAH-6447).
             print("Repository DNS lookup failed in the executor; using a helper container", file=sys.stderr, flush=True)
             self._repository_via_helper = True
             return self._run_repository_helper(restic_arguments)
@@ -971,27 +968,17 @@ class ResticStorageRunner:
             "--security-opt",
             "label=disable",
             "--entrypoint",
-            "/bin/sh",
+            "/usr/local/bin/python3",
             workspace.image,
+            "-I",
+            "-S",
             "-c",
-            ENCRYPTED_RESTIC_SCRIPT,
-            "sh",
-            str(workspace.helper_path) if working_directory else "",
+            RENTAL_EXEC_SOURCE,
+            str(workspace.pid),
+            cwd,
+            cwd if working_directory else "",  # the missing/empty check runs inside the rental, after joining
             self._restic_binary,
             CA_BUNDLE,
-            cwd,
-            "/usr/bin/nsenter",
-            "-t",
-            str(workspace.pid),
-            "-U",
-            "-m",
-            "-p",  # nsenter forks into the rental's PID namespace, where the rental's /proc/self is valid
-            "-n",
-            "--root",
-            # always set: with --root and no working directory, nsenter would keep the helper's cwd outside the root
-            f"--wdns={cwd}",
-            "--",
-            "/proc/self/fd/3",
             *restic_arguments,
         ]
 

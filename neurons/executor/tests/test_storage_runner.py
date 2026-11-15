@@ -38,7 +38,7 @@ from storage.reporting import (
 from storage.restic import (
     BACKUP_SOURCE_SCRIPT,
     CA_BUNDLE,
-    ENCRYPTED_RESTIC_SCRIPT,
+    RENTAL_EXEC_SOURCE,
     JsonEventWriter,
     ResticOperationError,
     ResticResult,
@@ -1166,8 +1166,8 @@ def _encrypted_workspace(path: str, read_only: bool = True) -> DockerUserNamespa
 
 
 def test_encrypted_backup_runs_restic_inside_the_rental_namespaces() -> None:
-    """DAH-6447: restic joins the rental's user, mount, PID and network namespaces, so a symlink the rental swaps in
-    mid-backup resolves in the rental's root, never the privileged helper's"""
+    """DAH-6447: the launcher joins the rental's user, mount and network namespaces (not its PID namespace, where the
+    rental could read restic's environment), so a symlink the rental swaps in mid-backup resolves in its own root"""
     operation = StorageOperationSpec.from_mapping(_operation_payload(mode="encrypted_running"))
     runner = ResticStorageRunner(operation, _encrypted_workspace("/root/checkpoints"))
 
@@ -1177,20 +1177,15 @@ def test_encrypted_backup_runs_restic_inside_the_rental_namespaces() -> None:
     assert command[command.index("--pid") + 1] == "host"
     assert "--privileged" in command
     assert command[command.index("--security-opt") + 1] == "label=disable"
-    assert command[command.index("--entrypoint") + 1] == "/bin/sh"
-    script = command.index(ENCRYPTED_RESTIC_SCRIPT)
-    nsenter = command.index("/usr/bin/nsenter")
-    # helper-side pre-check path, restic and CA bundle opened before nsenter, the rental-side working directory
-    assert command[script + 2 : nsenter] == [
-        "/proc/4321/root/root/checkpoints",
-        "/usr/local/bin/restic",
-        CA_BUNDLE,
-        "/root/checkpoints",
+    assert command[command.index("--entrypoint") + 1] == "/usr/local/bin/python3"
+    launcher = command.index(RENTAL_EXEC_SOURCE)
+    assert command[launcher - 3 : launcher] == ["-I", "-S", "-c"]
+    # pid, rental-side working directory, the same path checked inside the rental, restic and CA opened beforehand
+    assert command[launcher + 1 :] == [
+        "4321", "/root/checkpoints", "/root/checkpoints", "/usr/local/bin/restic", CA_BUNDLE,
+        "--no-cache", "backup", "--json", ".",
     ]
-    assert command[nsenter:] == [
-        "/usr/bin/nsenter", "-t", "4321", "-U", "-m", "-p", "-n", "--root", "--wdns=/root/checkpoints",
-        "--", "/proc/self/fd/3", "--no-cache", "backup", "--json", ".",
-    ]
+    assert not any("/proc/" in argument for argument in command[launcher + 1 :])
     assert not any(argument.startswith("s3.connections=") for argument in command)
 
 
@@ -1204,10 +1199,9 @@ def test_encrypted_restore_preserves_user_xattrs(monkeypatch: pytest.MonkeyPatch
     command, cwd = runner._restore_execution_command(SNAPSHOT_ID)
 
     assert cwd is None
-    nsenter = command.index("/usr/bin/nsenter")
+    launcher = command.index(RENTAL_EXEC_SOURCE)
     # no backup pre-check; restic creates the target inside the rental's root, from the rental's /
-    assert command[nsenter - 4] == ""
-    assert command[nsenter + 1 : nsenter + 10] == ["-t", "4321", "-U", "-m", "-p", "-n", "--root", "--wdns=/", "--"]
+    assert command[launcher + 1 : launcher + 4] == ["4321", "/", ""]
     assert command[command.index("--target") + 1] == "/root/restored"
     assert not any("/proc/4321" in argument for argument in command)
     assert command[command.index("--memory") + 1] == "16384m"  # backups and legacy tar restores keep 4g
@@ -2396,9 +2390,11 @@ def test_encrypted_legacy_tar_restore_still_writes_through_the_helper_view() -> 
     ("kind", "exit_code"),
     [("missing", 66), ("empty", 66), ("file", 1), ("files", 0), ("unchecked", 0)],
 )
-def test_encrypted_restic_script_checks_the_source_then_hands_restic_its_fds(
+def test_rental_launcher_checks_the_source_then_executes_restic_by_descriptor(
     tmp_path: Path, kind: str, exit_code: int
 ) -> None:
+    """The launcher's last step, run for real: the missing/empty check, then restic executed from its descriptor
+    (no path the rental could replace) with PWD and the CA path set. Joining the namespaces needs a root helper."""
     source = tmp_path / "source"
     if kind in ("empty", "files"):
         source.mkdir()
@@ -2406,35 +2402,32 @@ def test_encrypted_restic_script_checks_the_source_then_hands_restic_its_fds(
         (source / "data").write_text("x")
     if kind == "file":
         source.write_text("x")
-    restic, ca = tmp_path / "restic", tmp_path / "ca.crt"
-    restic.write_text("restic")
-    ca.write_text("ca")
-    # stands in for nsenter + restic: fd 3 must be restic, SSL_CERT_FILE the CA bundle, PWD the rental-side path
-    probe = (
-        "import os; read = lambda path: open(path).read(); "
-        "assert (read('/proc/self/fd/3'), read(os.environ['SSL_CERT_FILE'])) == ('restic', 'ca'); "
-        "print(os.environ['PWD'])"
+    # /bin/sh stands in for restic (a static binary): prints where and how it was started
+    probe = 'echo "$(pwd -P) $PWD $SSL_CERT_FILE"'
+    cwd = source if kind == "files" else tmp_path
+    run = (
+        "import os, runpy, sys; launcher = runpy.run_path(sys.argv[1]); "
+        "launcher['exec_restic'](os.open('/bin/sh', os.O_RDONLY | os.O_CLOEXEC), *sys.argv[2:4], ['-c', sys.argv[4]])"
     )
     result = subprocess.run(
-        ["/bin/sh", "-c", ENCRYPTED_RESTIC_SCRIPT, "sh", "" if kind == "unchecked" else str(source),
-         str(restic), str(ca), "/root/checkpoints", sys.executable, "-c", probe],
+        [sys.executable, "-c", run, str(Path(storage_runner.__file__).parent / "storage" / "rental_exec.py"),
+         str(cwd), "" if kind == "unchecked" else str(source), probe],
         capture_output=True,
         text=True,
     )
 
     assert result.returncode == exit_code, result.stderr
-    assert result.stdout == ("/root/checkpoints\n" if exit_code == 0 else "")
+    assert result.stdout == (f"{cwd} {cwd} /proc/lium-ca.crt\n" if exit_code == 0 else "")
 
 
 def test_real_encrypted_restore_through_a_rental_symlink_stays_in_the_rental_root(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restic_binary: str
 ) -> None:
-    """DAH-6447 end to end, unprivileged: the runner's own helper script and nsenter argv run the real restic, by
-    fd, inside a chrooted rental; an absolute symlink in the target resolves in the rental's root, not the caller's"""
-    nsenter, unshare = shutil.which("nsenter"), shutil.which("unshare")
-    nsenter_help = subprocess.run([nsenter or "nsenter", "--help"], capture_output=True, text=True).stdout
-    if not nsenter or not unshare or "--wdns" not in nsenter_help:
-        pytest.skip("util-linux nsenter with --wdns is not available")
+    """DAH-6447 end to end, unprivileged: the runner's own launcher argv runs the real restic, by descriptor, inside
+    a chrooted rental; an absolute symlink in the target resolves in the rental's root, not the caller's"""
+    unshare = shutil.which("unshare")
+    if not unshare:
+        pytest.skip("util-linux unshare is not available")
     probe = [unshare, "--user", "--map-root-user", "--mount", "--pid", "--net", "--fork", "true"]
     if subprocess.run(probe, capture_output=True).returncode != 0:
         pytest.skip("unprivileged user namespaces are not available")
@@ -2484,10 +2477,7 @@ def test_real_encrypted_restore_through_a_rental_symlink_stays_in_the_rental_roo
             restic_binary=restic_binary,
         )
         command, _ = runner._restore_execution_command(snapshot_id)
-        helper = ["/bin/sh", *command[command.index("executor:test") + 1 :]]
-        # an unprivileged caller cannot allow setgroups in the rental's user namespace; the real helper is root
-        at = helper.index("/usr/bin/nsenter")
-        helper[at : at + 1] = [nsenter, "--preserve-credentials"]
+        helper = [sys.executable, *command[command.index("executor:test") + 1 :]]
 
         result = subprocess.run(helper, env={**env, "RESTIC_REPOSITORY": "/repo"}, capture_output=True, text=True)
     finally:
@@ -2498,3 +2488,4 @@ def test_real_encrypted_restore_through_a_rental_symlink_stays_in_the_rental_roo
     assert result.returncode in (0, 1), result.stdout + result.stderr
     assert (rental_side / "restored" / "file0").read_text() == "0"
     assert list(caller_side.iterdir()) == []
+    assert not (rental / "proc" / "lium-ca.crt").exists()  # the CA tmpfs lived only in restic's own mount namespace
