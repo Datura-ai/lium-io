@@ -633,7 +633,7 @@ class PostRentalGpuRecheckMessages:
         remediation=(
             "A GPU showed a fault (during a rental, or it dropped out), and after it at least one card failed the "
             "all-cards matmul or the kernel-fault probe. Check `nvidia-smi -q` and the host `dmesg` for NVRM "
-            "Xid lines; reset the card (`nvidia-smi -r`) or reboot the host, replace a card that still fails, "
+            "Xid lines; reset the card once its processes stop (`nvidia-smi -r -i <index>`) or reboot the host, replace a card that still fails, "
             "and wait one cycle."
         ),
     )
@@ -672,8 +672,9 @@ class GpuPowerLimitMessages:
         category="policy",
         impact="Job skipped; score set to 0",
         remediation=(
-            "Restore the GPU power limit to at least 90% of the default limit "
-            "reported by NVML."
+            "Restore the GPU power limit to at least 80% of the default limit "
+            "reported by NVML, or during a rental to at least 90% (or the limit "
+            "the rental started on, if lower)."
         ),
     )
     DATA_INCOMPLETE_REJECTED = MessageTemplate(
@@ -690,6 +691,14 @@ class GpuPowerLimitMessages:
         severity="info",
         category="env",
         impact="Proceed",
+    )
+    # F-43: a kept 80 % tier reading whose clear is not confirmed (Redis failed): neither zero nor show stock
+    TIER_STATE_UNKNOWN = MessageTemplate(
+        event="GPU power limit at stock, but the validator could not clear its earlier tier reading",
+        reason="GPU_POWER_TIER_STATE_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Validation halted — no verdict this cycle, the previous result stands",
     )
     SKIPPED_ACTIVE_LIUM_FILLER = MessageTemplate(
         event="GPU power limit check skipped for active Lium default job",
@@ -895,6 +904,13 @@ class ExecutorImageMessages:
         severity="error",
         category="policy",
         impact="Score set to 0 until the image is current",
+    )
+    UNOFFICIAL = MessageTemplate(
+        event="Executor is not an official build",
+        reason="EXECUTOR_IMAGE_UNOFFICIAL",
+        severity="error",
+        category="policy",
+        impact="Score set to 0 until the node runs the official executor image",
     )
     # Same reason code as OUTDATED so log queries keep matching; severity says it is not scored.
     OUTDATED_WARNING = MessageTemplate(
@@ -1114,6 +1130,14 @@ class StaleContainerCleanupMessages:
         severity="warning",
         category="prep",
         impact="No rental container removed this cycle; live pods and fillers are left alone",
+    )
+    TIMED_OUT = MessageTemplate(
+        event="Stale container cleanup timed out",
+        reason="STALE_CLEANUP_TIMED_OUT",
+        severity="warning",
+        category="prep",
+        impact="Cleanup stopped for this cycle; the rest of the validation runs",
+        remediation="Docker on the node answers slowly; check that dockerd is responsive.",
     )
 
 
@@ -1384,6 +1408,18 @@ class GpuUsageMessages:
         impact="Validation skipped; score set to 0",
         remediation="Stop all GPU processes and re-run your node. If using Docker, ensure no host processes are running.",
     )
+    USAGE_HIGH_MEASURED_REMEDIATION = (
+        "GPU {gpu_index}: utilization {gpu_utilization} and memory utilization {vram_utilization}; "
+        "an idle node must stay below {gpu_limit}% utilization and at most {memory_limit}% memory "
+        "utilization. GPU processes on the node: {processes}. Stop these processes and re-run your "
+        "node. If using Docker, ensure no host processes are running."
+    )
+    USAGE_HIGH_BESIDE_A_FILLER_REMEDIATION = (
+        "GPU {gpu_index}: utilization {gpu_utilization} and memory utilization "
+        "{vram_utilization}, with Lium's filler running on the node. Stop the GPU processes "
+        "outside Lium's containers and re-run your node: {processes}. Leave Lium's own filler "
+        "running: {fillers}."
+    )
     USAGE_HIGH_BESIDE_A_RENTAL_REMEDIATION = (
         "Stop the GPU processes outside Lium's containers and re-run your node: {outside_processes}. "
         "Do not stop the pod container of the rental on this node ({pod_containers}): Lium stops or "
@@ -1566,6 +1602,15 @@ class PortCountMessages:
         severity="info",
         category="runtime",
         impact="Proceed",
+    )
+    # DAH-5851: an idle node's cycle whose port check was deferred for disk pressure: the run is withheld at the
+    # cycle's end (executor_rollout.withhold_renter_gpu_reset_verdicts), neither scored nor hidden
+    VERDICT_WITHHELD_PORT_CHECK_DEFERRED = MessageTemplate(
+        event="Port check deferred for disk pressure; this cycle's verdict is withheld",
+        reason="PORT_VERDICT_WITHHELD_DEFERRED",
+        severity="info",
+        category="runtime",
+        impact="No score this cycle; the listing stays as the last completed port check left it",
     )
     INSUFFICIENT_PORTS = MessageTemplate(
         event="Insufficient available ports",
@@ -1957,6 +2002,43 @@ class CapabilityMessages:
         impact="Score set to 0",
         remediation="Run Docker GPU diagnostics (nvidia-smi) and ensure containers can access GPUs.",
     )
+    # DAH-6241: the matmul answered, but the card it ran on has another compute capability or SM
+    # count than the reported model has
+    GPU_MODEL_MISMATCH = MessageTemplate(
+        event="GPU model check failed: the card is not the reported model",
+        reason="GPU_MODEL_MISMATCH",
+        severity="error",
+        # an availability error: the backend hides the node and refuses new rentals, a rental on it runs on
+        category=AVAILABILITY_CATEGORY,
+        impact="Score set to 0; node hidden and not rentable while the mismatch stands (a running "
+        "rental is kept)",
+        remediation=(
+            "The compute capability and SM count measured on the GPU do not match the GPU model "
+            "the node reports. Report the model the card really is; a node is paid for the GPU "
+            "it has."
+        ),
+    )
+    # DAH-6241: a card of a judged model whose GPU check gave no numbers twice in a row
+    GPU_MODEL_NOT_MEASURED = MessageTemplate(
+        event="GPU model check failed: the card's model could not be measured",
+        reason="GPU_MODEL_NOT_MEASURED",
+        severity="error",
+        category=AVAILABILITY_CATEGORY,
+        impact="Score set to 0; node hidden and not rentable until the card is measured (a running "
+        "rental is kept)",
+        remediation=(
+            "The GPU check finished but returned no compute capability or SM count for the card. Run "
+            "the current executor image with its default environment; the next measured pass clears it."
+        ),
+    )
+    # DAH-6241: a rented node has no stored GPU model mismatch (or is not rented: judged later)
+    GPU_MODEL_VERDICT_OK = MessageTemplate(
+        event="GPU model verdict: no stored mismatch",
+        reason="GPU_MODEL_VERDICT_OK",
+        severity="info",
+        category="gpu",
+        impact="Proceed",
+    )
     # One reason code per CUDA failure the probe can hit (DAH-3362, ticket-0318), as
     # GPU_VERIFY_TIMEOUT and the VERIFYX_FAILED_* family already do; the full steps live in the
     # reason-code table the default help_uri points at. Wording is provider-facing; no backticks,
@@ -2025,8 +2107,8 @@ class GpuMemoryHealthMessages:
         remediation="NVML reports uncorrected ECC errors, a pending or failed row remap, or a "
         "required recovery action on the card(s) in flags; a rented card in this state faults the "
         "renter's jobs. Check `nvidia-smi -q -d ECC,ROW_REMAPPER`: a pending remap or a "
-        "DRAIN_AND_RESET / GPU_RESET action needs the card drained and reset (`nvidia-smi -r` with "
-        "no process on it, or a host reboot); a failed remap, or uncorrected errors that return "
+        "DRAIN_AND_RESET / GPU_RESET action needs the card drained and reset (`nvidia-smi -r -i <index>` "
+        "with no process on it, or a host reboot); a failed remap, or uncorrected errors that return "
         "after a reset, mean the card must be replaced. The node passes again on the first "
         "validation after NVML reads the card clean.",
     )
@@ -2039,7 +2121,7 @@ class GpuMemoryHealthMessages:
         remediation="NVML reports uncorrected ECC errors, a pending or failed row remap, or a "
         "required recovery action on the card(s) in flags. Check `nvidia-smi -q -d "
         "ECC,ROW_REMAPPER`: a pending remap or a DRAIN_AND_RESET / GPU_RESET action needs the card "
-        "drained and reset (`nvidia-smi -r` with no process on it, or a host reboot); a failed "
+        "drained and reset (`nvidia-smi -r -i <index>` with no process on it, or a host reboot); a failed "
         "remap, or uncorrected errors that return after a reset, mean the card should be replaced.",
     )
     UNKNOWN = MessageTemplate(
@@ -2057,8 +2139,8 @@ class GpuMemoryHealthMessages:
         impact="Proceed; score not changed",
         remediation="NVML reports a pending row remap or a recovery action from correctable errors "
         "on the card(s) in warnings. The card still works, but the remap takes effect only after "
-        "a reset: drain the card and reset it (`nvidia-smi -r` with no process on it, or a host "
-        "reboot) when it is free.",
+        "a reset: drain the card and reset it (`nvidia-smi -r -i <index>` with no process on it, "
+        "or a host reboot) when it is free.",
     )
     OK = MessageTemplate(
         event="GPU memory health ok",
@@ -2070,8 +2152,8 @@ class GpuMemoryHealthMessages:
 
 
 class GpuFaultProbeMessages:
-    """DAH-3035 — the kernel-fault probe that follows the matmul. Shadow (without enforcement) emits PROBE_FAILED as a warning and keeps passed=True; only
-    GPU_FAULT_PROBE_ENFORCEMENT_ENABLED renders it error/score-zeroing."""
+    """DAH-3035 — the kernel-fault probe that follows the matmul. It always runs; PROBE_FAILED is an
+    error and zeroes the score."""
 
     FILLER_SKIPPED = MessageTemplate(
         event="GPU kernel-fault probe skipped for active filler",
@@ -2079,13 +2161,6 @@ class GpuFaultProbeMessages:
         severity="info",
         category="policy",
         impact="Active filler runtime preserved; the probe would compete for VRAM.",
-    )
-    FIRST_PASS_SKIPPED = MessageTemplate(
-        event="GPU kernel-fault probe skipped on the first pass",
-        reason="GPU_FAULT_PROBE_SKIPPED_FIRST_PASS",
-        severity="info",
-        category="policy",
-        impact="Proceed; in shadow the verdict changes nothing, so the probe waits for the next cycle.",
     )
     PROBE_OK = MessageTemplate(
         event="GPU kernel-fault probe passed",
@@ -2103,7 +2178,7 @@ class GpuFaultProbeMessages:
         remediation=(
             "A GPU returned a CUDA error, wrong data or hung under indexed memory access, or NVML reported "
             "new uncorrected ECC errors / remapped rows. Check `nvidia-smi -q -d ECC,ROW_REMAPPER` and the host "
-            "`dmesg` for NVRM Xid lines; reseat or replace the card, or reset it (`nvidia-smi -r`) and wait one cycle."
+            "`dmesg` for NVRM Xid lines; reseat or replace the card, or stop its processes, reset only it (`nvidia-smi -r -i <index>`) and wait one cycle."
         ),
     )
     UNKNOWN = MessageTemplate(
@@ -2473,6 +2548,32 @@ class CpuTruthMessages:
     )
 
 
+class DockerCpuMessages:
+    """The Docker daemon sees fewer CPUs than the machine reports. MISMATCH fails the validation."""
+
+    OK = MessageTemplate(
+        event="Docker CPU count check passed",
+        reason="DOCKER_CPU_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    MISMATCH = MessageTemplate(
+        event="Docker sees fewer CPUs than the machine",
+        reason="DOCKER_CPU_MISMATCH",
+        severity="error",
+        category="env",
+        impact="Score set to 0 for this cycle; rentals on this node fail until Docker sees every CPU",
+    )
+    WARNING = MessageTemplate(
+        event="Docker sees fewer CPUs than the machine",
+        reason="DOCKER_CPU_MISMATCH",
+        severity="warning",
+        category="env",
+        impact="Warning only: score unchanged",
+    )
+
+
 class GpuKernelCountMessages:
     """Reported GPU list against the kernel's list (/proc/driver/nvidia/gpus). COUNT_MISMATCH
     fails the validation; UUID_MISMATCH is logged only."""
@@ -2495,6 +2596,13 @@ class GpuKernelCountMessages:
             "(/proc/driver/nvidia/gpus) lists fewer cards than the node reports."
         ),
     )
+    COUNT_MISMATCH_HOST_SHADOW = MessageTemplate(
+        event="Reported GPU count exceeds the host kernel's GPU list",
+        reason="GPU_KERNEL_COUNT_HOST_VIEW_SHADOW",
+        severity="warning",
+        category="env",
+        impact="Shadow observation only: the validation result was NOT changed",
+    )
     UUID_MISMATCH = MessageTemplate(
         event="Reported GPU UUIDs are missing from the kernel's GPU list",
         reason="GPU_KERNEL_UUID_MISMATCH",
@@ -2506,8 +2614,10 @@ class GpuKernelCountMessages:
         event="A reported GPU cannot be attached to a container",
         reason="GPU_KERNEL_UNATTACHABLE",
         severity="error",
-        category="env",
-        impact="Validation failed; score set to 0",
+        # an availability error: the backend hides the node and refuses new rentals, a rental on it runs on
+        category=AVAILABILITY_CATEGORY,
+        impact="Validation failed; score set to 0. Node hidden and not rentable until the GPU attaches again "
+        "(a running rental is kept)",
         remediation=(
             "Every rent on the listed GPU fails. Restart the executor container, or reboot the host "
             "if the GPU is still missing."
@@ -2580,8 +2690,7 @@ class CachedTemplateMessages:
 
     Confirms whether the executor has the recommended default image pre-pulled so
     DOCKER_PULL is a no-op for default-template rentals. Templates carry severity="info"
-    (advisory) by default; before ``settings.CACHED_TEMPLATE_CUTOFF`` the check is purely
-    observational. On/after the cutoff the check renders the two bad signals (NOT_CACHED,
+    (advisory) by default; the check renders the two bad signals (NOT_CACHED,
     DIGEST_MISMATCH) with a severity="error" override and fails verification — see
     ``CachedTemplateVerificationCheck``.
     """
@@ -2782,12 +2891,37 @@ class RentedPodOwnershipMessages:
         reason="RENTED_POD_OWNERSHIP_SHIFTED",
         severity="warning",
         category="runtime",
-        impact="Proceed; root login and sudo fail inside the pod until its files are repaired",
+        impact="Proceed; incorrect ownership can break package installation, root login, or sudo until repaired",
         remediation="The host stopped without a clean shutdown and the pod was restarted with a new "
         "user-namespace range, so its files now belong to nobody inside it. Tell the renter, and shift "
         "the ownership of the pod's root filesystem into its current uid_map/gid_map on the host "
         "(only ids inside the old range; keep setuid bits and file capabilities). Shut the host down "
         "cleanly to avoid this.",
+    )
+    SHIFTED_AFTER_CONTAINER_RESTART = MessageTemplate(
+        event="Rented pod files are owned outside its user namespace",
+        reason="RENTED_POD_OWNERSHIP_SHIFTED",
+        severity="warning",
+        category="runtime",
+        impact="Proceed; incorrect ownership can break package installation, root login, or sudo until repaired",
+        remediation="The pod's container was restarted while the host kept running (not a host reboot), and "
+        "it came back with a user-namespace range its files are not in, so they belong to nobody inside it. "
+        "Tell the renter, and shift the ownership of the pod's root filesystem into its current "
+        "uid_map/gid_map on the host (only ids outside the current range; keep setuid bits and file "
+        "capabilities). Do not restart a rented pod's container yourself; ask support first.",
+    )
+    SHIFTED_MIXED = MessageTemplate(
+        event="Rented pod files are owned outside its user namespace",
+        reason="RENTED_POD_OWNERSHIP_SHIFTED",
+        severity="warning",
+        category="runtime",
+        impact="Proceed; incorrect ownership can break package installation, root login, or sudo until repaired",
+        remediation="The shifted pods do not share one cause: a pod whose started_after_boot_s is 600 or more "
+        "had its container restarted while the host kept running; one started right after boot came back "
+        "after the host stopped without a clean shutdown. Tell the renters, and shift the ownership of each "
+        "pod's root filesystem into its current uid_map/gid_map on the host (only ids outside the current "
+        "range; keep setuid bits and file capabilities). Do not restart a rented pod's container yourself; "
+        "ask support first, and shut the host down cleanly.",
     )
     UNREAD = MessageTemplate(
         event="Rented pod file ownership not read",

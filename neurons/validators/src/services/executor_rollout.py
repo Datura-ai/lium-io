@@ -41,6 +41,7 @@ from services.task.checks.executor_image import observed_executor_digest
 from services.task.messages import (
     ExecutorImageMessages,
     FinalizeMessages,
+    GpuPowerLimitMessages,
     MachineSpecMessages,
     PortConnectivityMessages,
     PortCountMessages,
@@ -464,18 +465,24 @@ def withhold_rollout_verdicts(
     return standing_by_miner, withheld
 
 
+_PORT_CHECK_DEFERRED = PortCountMessages.VERDICT_WITHHELD_PORT_CHECK_DEFERRED.reason
+
+
 def withhold_renter_gpu_reset_verdicts(
     job_results: dict[str, list[JobResult]],
 ) -> tuple[dict[str, list[JobResult]], list[WithheldVerdict]]:
     """DAH-4658: a scrape held for the renter's own GPU reset gets no verdict, as a rollout failure gets none.
-    DAH-5805: neither does a run the validator's own Redis ended; the node is not scored 0 for it."""
+    DAH-5805: neither does a run the validator's own Redis ended; the node is not scored 0 for it.
+    DAH-5851: neither does an idle node's port check deferred for disk pressure; it is never carried, so no
+    idle pay comes from the republished ports."""
     standing_by_miner: dict[str, list[JobResult]] = {}
     withheld: list[WithheldVerdict] = []
     for miner_hotkey, results in job_results.items():
         standing_by_miner[miner_hotkey] = []
         for result in results:
             redis_fault = result.failure_reason_code == VALIDATOR_REDIS_UNAVAILABLE
-            if not (redis_fault or _held_for_renter_gpu_reset(result)):
+            port_check_deferred = result.failure_reason_code == _PORT_CHECK_DEFERRED
+            if not (redis_fault or port_check_deferred or _held_for_renter_gpu_reset(result)):
                 standing_by_miner[miner_hotkey].append(result)
                 continue
             withheld.append(WithheldVerdict(miner_hotkey=miner_hotkey, result=result))
@@ -483,7 +490,9 @@ def withhold_renter_gpu_reset_verdicts(
                 _m(
                     "Verdict withheld: the validator's Redis was unavailable"
                     if redis_fault
-                    else "Verdict withheld: the renter is resetting the node's GPUs",
+                    else "Verdict withheld: the port check was deferred for disk pressure"
+                    if port_check_deferred
+                    else "Verdict withheld: the renter is resetting the node's GPUs, or its power tier is unknown",
                     extra={
                         "miner_hotkey": miner_hotkey,
                         "executor_uuid": result.executor_info.uuid,
@@ -494,12 +503,49 @@ def withhold_renter_gpu_reset_verdicts(
     return standing_by_miner, withheld
 
 
+def withhold_session_lost_verdicts(
+    job_results: dict[str, list[JobResult]],
+) -> tuple[dict[str, list[JobResult]], list[WithheldVerdict]]:
+    """DAH-5718: the validator's session died in the port check, so the cycle is unscored, in a rollout or not."""
+    standing_by_miner: dict[str, list[JobResult]] = {}
+    withheld: list[WithheldVerdict] = []
+    for miner_hotkey, results in job_results.items():
+        standing_by_miner[miner_hotkey] = []
+        for result in results:
+            if not result.session_lost_in_port_check:
+                standing_by_miner[miner_hotkey].append(result)
+                continue
+            withheld.append(WithheldVerdict(miner_hotkey=miner_hotkey, result=result))
+            logger.info(
+                _m(
+                    "Verdict withheld: the validator's SSH session closed during the port check",
+                    extra={
+                        "miner_hotkey": miner_hotkey,
+                        "executor_uuid": result.executor_info.uuid,
+                        "job_batch_id": result.job_batch_id,
+                    },
+                )
+            )
+    return standing_by_miner, withheld
+
+
+def session_kept_hotkeys(withheld_results: list[WithheldVerdict]) -> set[str]:
+    """The miners a withheld verdict keeps active this cycle. Not one whose session died in the port check (review
+    4469609776): a miner can close SSH itself, and that must not earn the eligibility floor."""
+    return {withheld.miner_hotkey for withheld in withheld_results if not withheld.result.session_lost_in_port_check}
+
+
 def has_renter_gpu_reset_holds(job_results: dict[str, list[JobResult]]) -> bool:
     return any(_held_for_renter_gpu_reset(result) for results in job_results.values() for result in results)
 
 
+# a cycle that cannot tell the node's state gives no verdict: the renter's GPU reset (DAH-4658), or a power tier
+# reading whose clear was not confirmed (F-43)
+_HELD_REASONS = (MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason, GpuPowerLimitMessages.TIER_STATE_UNKNOWN.reason)
+
+
 def _held_for_renter_gpu_reset(result: JobResult) -> bool:
-    return result.failure_reason_code == MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason
+    return result.failure_reason_code in _HELD_REASONS
 
 
 # rental and pay flags the held result of this cycle reads fresh from the cycle's rental snapshot

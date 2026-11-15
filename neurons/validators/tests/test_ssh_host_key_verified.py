@@ -44,7 +44,7 @@ def _service(known_hosts: asyncssh.SSHKnownHosts | None) -> TaskService:
     return service
 
 
-async def _run(known_hosts: asyncssh.SSHKnownHosts | None) -> JobResult:
+async def _run(known_hosts: asyncssh.SSHKnownHosts | None, service: TaskService | None = None) -> JobResult:
     executor = ExecutorSSHInfo(
         uuid="node-9", address="10.0.0.5", port=8080, ssh_username="root", ssh_port=2200,
         python_path="/usr/bin/python3", root_dir="/root/app", ssh_host_key=HOST_KEY,
@@ -65,7 +65,7 @@ async def _run(known_hosts: asyncssh.SSHKnownHosts | None) -> JobResult:
         patch("services.task.service.settings") as settings,
     ):
         settings.DRY_RUN = True
-        return await _service(known_hosts).create_task(
+        return await (service or _service(known_hosts)).create_task(
             miner_info=miner, executor_info=executor, keypair=MagicMock(ss58_address="5Val"),
             private_key="key", public_key="pub", encrypted_files=MagicMock(),
             rented_data=MagicMock(), default_docker_image_digests={},
@@ -86,3 +86,12 @@ async def test_a_connect_with_a_pinned_host_key_is_verified() -> None:
     result = await _run(pinned)
 
     assert result.ssh_host_key_verified is True
+
+
+@pytest.mark.asyncio
+async def test_the_cycle_leaves_a_hostnames_registered_key_to_node_account_check() -> None:
+    service = _service(None)
+
+    await _run(None, service)
+
+    assert service.attestation_service.prepare_host_policy.await_args.kwargs["check_registered_key"] is False

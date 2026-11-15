@@ -11,7 +11,8 @@ set -e
 # with a doc link when that fails.
 # Env:
 #   SYSBOX_SKIP_KERNEL_CHECK=1  install even when the ID-mapped mounts check rejects the host
-#   EXECUTOR_PORT / SSH_PORT    the ports the preflight checks (else neurons/executor/.env next to this script, else 8080 / 2200)
+#   EXECUTOR_PORT / SSH_PORT    the ports the preflight checks (else neurons/executor/.env next to this script or under
+#                               the current directory, else 8080 / 2200, assumed: a busy assumed port is a note, not a FIX)
 #   SYSBOX_SETUP_HOST_ROOT      test-only: prefix for the host files the preflight reads (/proc/modules, /etc/os-release, ...)
 
 # 0.7.1 (DAH-3833): 0.6.6 cannot start an image with 44+ layers under Docker 29's containerd image store,
@@ -166,7 +167,7 @@ failure_diagnostics() {
 
 abort_on_active_rentals() {
     # a rental blocks every path below, so check before anything that costs the node time or bandwidth;
-    # -a: a renter's stopped pod is still a rental, and the install removes every stopped container
+    # -a: a renter's stopped pod is still a rental
     docker ps -a --filter "name=pod_" --format '{{.Names}}' 2>/dev/null | grep -q . || return 0
     fail "Rentals found (pod_* containers, running or stopped). Cannot proceed."
     docker ps -a --filter "name=pod_" --format "    - {{.Names}} ({{.Status}})" 2>/dev/null
@@ -246,6 +247,32 @@ daemon_feature_off() {
     else
         grep -Eq "\"$1\"[[:space:]]*:[[:space:]]*false" "$file"
     fi
+}
+
+# The sysbox .deb's config script exits 1 when dockerd runs, daemon.json lacks bip / default-address-pools
+# (matched line by line, so the file must be indented) and any container exists, before its postinst runs.
+# Write the .deb's own subnets ($1 bip, $2 pool base) first, so the provider's containers stay; same overlap
+# rule as its postinst (Docker is restarted in step 5).
+seed_sysbox_network_config() {
+    local file gw subnet
+    file=$(host_path /etc/docker/daemon.json)
+    docker ps -a --format '{{.ID}}' 2>/dev/null | grep -q . || return 0
+    [ -n "$1" ] && [ -n "$2" ] || { fail "Could not read sysbox's Docker subnets from its package."; return 1; }
+    mkdir -p "$(dirname "$file")"
+    [ -s "$file" ] || echo '{}' > "$file"
+    if ! jq -e '(.bip // "") != "" and ((."default-address-pools" // []) | length) > 0' "$file" > /dev/null 2>&1; then
+        gw=$(ip route | awk '/default/ {print $3; exit}')
+        for subnet in "${1%/*}" "${2%/*}"; do
+            if ! ip route get "$subnet" | grep -q "via $gw"; then
+                fail "$subnet overlaps a local network: set \"bip\" and \"default-address-pools\" in /etc/docker/daemon.json yourself, then re-run."
+                return 1
+            fi
+        done
+    fi
+    jq --indent 4 --arg bip "$1" --arg pool "$2" 'if (.bip // "") == "" then .bip = $bip else . end
+        | if ((."default-address-pools" // []) | length) == 0 then ."default-address-pools" = [{"base": $pool, "size": 24}] else . end' \
+        "$file" > "$file.tmp" && mv "$file.tmp" "$file" || { fail "Failed to update $file (invalid JSON?)."; return 1; }
+    ok "Docker network settings for sysbox are in daemon.json (applied at the Docker restart below)."
 }
 
 check_root() {
@@ -530,16 +557,20 @@ check_free_disk_for_node() {
 }
 
 resolve_preflight_ports() {
-    # EXECUTOR_PORT / SSH_PORT from the environment, else the executor .env next to this script, else the defaults
-    local env_file=""
-    [ -f "$0" ] && env_file="$(dirname "$0")/.env"   # piped from curl there is no file next to the script
-    if [ -z "${EXECUTOR_PORT:-}" ] && [ -n "$env_file" ] && [ -r "$env_file" ]; then
+    # "<executor> <ssh> <executor assumed 0/1> <ssh assumed 0/1>": the environment, else the executor .env next to
+    # this script, else one under the current directory (piped from curl there is no file next to the script),
+    # else the defaults, marked assumed because the provider may run the executor on another port
+    local env_file="" candidate
+    for candidate in "$([ -f "$0" ] && dirname "$0")/.env" "$PWD/neurons/executor/.env" "$PWD/.env"; do
+        [ "$candidate" != "/.env" ] && grep -qs '^EXTERNAL_PORT=' "$candidate" && { env_file=$candidate; break; }
+    done
+    if [ -z "${EXECUTOR_PORT:-}" ] && [ -n "$env_file" ]; then
         EXECUTOR_PORT=$(sed -n 's/^EXTERNAL_PORT=\([0-9]*\).*/\1/p' "$env_file" | head -1)
     fi
-    if [ -z "${SSH_PORT:-}" ] && [ -n "$env_file" ] && [ -r "$env_file" ]; then
+    if [ -z "${SSH_PORT:-}" ] && [ -n "$env_file" ]; then
         SSH_PORT=$(sed -n 's/^SSH_PORT=\([0-9]*\).*/\1/p' "$env_file" | head -1)
     fi
-    echo "${EXECUTOR_PORT:-8080} ${SSH_PORT:-2200}"
+    echo "${EXECUTOR_PORT:-8080} ${SSH_PORT:-2200} $([ -n "${EXECUTOR_PORT:-}" ] && echo 0 || echo 1) $([ -n "${SSH_PORT:-}" ] && echo 0 || echo 1)"
 }
 
 port_listener() {
@@ -570,10 +601,11 @@ ufw_blocks_port() {
 }
 
 check_ports() {
-    local ports p listener container label has_fix=0
+    local ports p listener container label is_default_port has_fix=0
     read -r -a ports <<< "$(resolve_preflight_ports)"
     command -v ss &>/dev/null || { pf_skip "Ports — 'ss' (iproute2) is missing, cannot tell what listens."; return 0; }
-    for p in "${ports[0]}:executor" "${ports[1]}:SSH"; do
+    for p in "${ports[0]}:executor:${ports[2]}" "${ports[1]}:SSH:${ports[3]}"; do
+        is_default_port=${p##*:} p=${p%:*}
         label=${p#*:} p=${p%%:*}
         listener=$(port_listener "$p")
         container=""
@@ -581,11 +613,18 @@ check_ports() {
             container=$(port_container "$p")
             case "$container" in
                 executor-*|executor_*) ;;   # the executor itself, from an earlier install
-                *) pf_fix "TCP $p ($label port) is published by container ${container:-unknown} — the executor cannot bind it." \
+                *) if [ "$is_default_port" = 1 ]; then
+                       pf_skip "TCP $p (default $label port, assumed: no .env found) is published by container ${container:-unknown}. If your executor uses another port, re-run with EXECUTOR_PORT=<port> SSH_PORT=<port> to check that one instead."
+                       continue
+                   fi
+                   pf_fix "TCP $p ($label port) is published by container ${container:-unknown} — the executor cannot bind it." \
                        "docker stop ${container:-<name>}, or choose another port (EXTERNAL_PORT / SSH_PORT in neurons/executor/.env) and open it instead."
                    has_fix=1
                    continue ;;
             esac
+        elif [ -n "$listener" ] && [ "$is_default_port" = 1 ]; then
+            pf_skip "TCP $p (default $label port, assumed: no .env found) is in use by $listener. If your executor uses another port, re-run with EXECUTOR_PORT=<port> SSH_PORT=<port> to check that one instead."
+            continue
         elif [ -n "$listener" ]; then
             pf_fix "TCP $p ($label port) is already in use by $listener — the executor cannot bind it." \
                 "Stop that process, or choose another port (EXTERNAL_PORT / SSH_PORT in neurons/executor/.env) and open it instead."
@@ -1064,16 +1103,8 @@ if [ -n "$filler_list" ]; then
     docker stop $filler_list > /dev/null 2>&1 || true
 fi
 
-# Remove stopped containers so Docker can restart cleanly; keep Lium's Default Job (filler_*), which the
-# validator would otherwise report as missing and stop idle pay for until it starts a new one
-stopped=$(docker ps -a --format '{{.ID}} {{.Names}}' 2>/dev/null | awk '$2 !~ /^filler_/ {print $1}' || true)
-if [ -n "$stopped" ]; then
-    warn "Removing stopped containers (sysbox requires none)..."
-    # shellcheck disable=SC2086  # one id per word
-    docker rm -f $stopped > /dev/null 2>&1
-    ok "Stopped containers removed."
-fi
-
+# Stopped containers are left alone: they are the provider's own, Docker restarts fine with them (the stopped
+# Default Job above proves it), and removing them deleted unrelated user containers
 ok "Docker is clear for sysbox installation."
 
 # ── 4. Install ──────────────────────────────────────────
@@ -1099,6 +1130,11 @@ if [ "$SKIP_INSTALL" = false ]; then
         actual=$(sha256sum "$SYSBOX_DEB" | cut -d' ' -f1)
         [ "$actual" = "$SYSBOX_SHA" ] || { fail "Checksum mismatch!"; exit 1; }
     fi
+    SYSBOX_CTL=$(mktemp -d)
+    dpkg-deb -e "$SYSBOX_DEB" "$SYSBOX_CTL"
+    seed_sysbox_network_config "$(sed -n 's/^bip_subnet="\(.*\)"$/\1/p' "$SYSBOX_CTL/postinst")" \
+        "$(sed -n 's/^pool_subnet="\(.*\)"$/\1/p' "$SYSBOX_CTL/postinst")" || { rm -rf "$SYSBOX_CTL"; exit 1; }
+    rm -rf "$SYSBOX_CTL"
     apt_install install -y -qq "$SYSBOX_DEB" || exit 1
     ok "Sysbox v${SYSBOX_VERSION} installed."
 else

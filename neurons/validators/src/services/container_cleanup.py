@@ -15,7 +15,8 @@ from core.utils import _m
 from services.const import (
     DPHN_CACHE_LISTING_FLOOR_GB,
     CACHE_SWEEP_CONTAINER_NAME,
-    EDIT_PARKED_SUFFIX,
+    PARKED_SUFFIXES,
+    unparked_name,
     FILLER_CACHE_VOLUME_PREFIXES,
     FILLER_CONTAINER_GRACE_MINUTES,
     FILLER_CONTAINER_PREFIX,
@@ -76,11 +77,27 @@ REMOVE_CACHE_SWEEP_CONTAINER = f"/usr/bin/docker rm -f {CACHE_SWEEP_CONTAINER_NA
 # The images of the fillers whose caches the reclaims below give back (Engy's alone is ~32 GB). No
 # `-f`: dockerd refuses an image any container still uses, running or stopped, so a live filler keeps it.
 FILLER_IMAGE_REPOSITORIES = ("ghcr.io/hanlinai/engy-golden-serve", "daturaai/dolphin", "daturaai/dlph")
-REMOVE_IDLE_FILLER_IMAGES = (
-    "/usr/bin/docker image ls "
-    + " ".join(f"--filter reference={repository}" for repository in FILLER_IMAGE_REPOSITORIES)
-    + " --format '{{.Repository}}:{{.Tag}}' | xargs -r /usr/bin/docker image rm >/dev/null 2>&1 || true"
-)
+
+
+def _image_repository(image: str) -> str:
+    reference = image.split("@", 1)[0]
+    name, _, tag = reference.rpartition(":")
+    repository = name if name and "/" not in tag else reference
+    return repository.removeprefix("index.docker.io/").removeprefix("docker.io/")
+
+
+def idle_filler_images_removal_command(keep_image: str | None = None) -> str:
+    """The idle filler images' removal; `keep_image` is the image a create is about to run, whose repository
+    is left alone: a renter may rent the Engy image itself, and it has no container until docker run."""
+    keep = _image_repository(keep_image) if keep_image else None
+    repositories = [repository for repository in FILLER_IMAGE_REPOSITORIES if repository != keep]
+    if not repositories:  # `docker image ls` without a filter would list every image
+        return "true"
+    return (
+        "/usr/bin/docker image ls "
+        + " ".join(f"--filter reference={repository}" for repository in repositories)
+        + " --format '{{.Repository}}:{{.Tag}}' | xargs -r /usr/bin/docker image rm >/dev/null 2>&1 || true"
+    )
 
 
 async def evict_cache_volumes_oldest_first(
@@ -90,6 +107,7 @@ async def evict_cache_volumes_oldest_first(
     has_room: Callable[[], Awaitable[bool]],
     evict_first_prefix: str | None = None,
     volume_remove: Callable[[str], str] = DockerCommand.volume_remove,
+    keep_image: str | None = None,
 ) -> None:
     """Remove filler cache volumes oldest first, stopping as soon as `has_room()` says the disk is enough.
 
@@ -111,7 +129,7 @@ async def evict_cache_volumes_oldest_first(
     except Exception:
         pass
     # the image first: a pull brings it back far faster than a checkpoint download
-    await run_removal(REMOVE_IDLE_FILLER_IMAGES)
+    await run_removal(idle_filler_images_removal_command(keep_image))
     if await has_room():
         return
     # DAH-5260: a rental passes the Engy prefix, the cache its listing offered as free disk
@@ -148,7 +166,7 @@ def listed_container_names(rented_data: Optional[RentedExecutorsResponse]) -> se
         names.update(pod.docker_container_name for pod in executor.pods)
         # An edit parks the pod's current container under <name>__prev while the replacement
         # is created; it is the customer's only copy until then, whatever its age
-        names.update(f"{pod.docker_container_name}{EDIT_PARKED_SUFFIX}" for pod in executor.pods)
+        names.update(f"{pod.docker_container_name}{suffix}" for pod in executor.pods for suffix in PARKED_SUFFIXES)
     # Every filler is protected — a GPU-split node runs one per VRAM bundle, and reaping a
     # sibling kills a live worker mid-cycle. The legacy single map covers an older backend.
     for fillers in rented_data.all_filler_containers_by_executor.values():
@@ -200,7 +218,7 @@ def _bound_pod_id_label(container_name: str, label: str) -> str:
     A renter's image can carry an inherited label naming another live pod, so the label counts only
     when it matches the name: the id after pod_/filler_ (ignoring __prev), or a probe's own name.
     """
-    base = container_name.removesuffix(EDIT_PARKED_SUFFIX)
+    base = unparked_name(container_name)
     if base.startswith((POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX)):
         return label if label == base.partition("_")[2] else ""
     return label if label == container_name else ""
@@ -245,6 +263,7 @@ class ContainerCleanup:
         on_before_remove: Callable[[str], Awaitable[None]] | None = None,
         lium_workload_ended: Callable[[str], Awaitable[bool]] | None = None,
         reserve_removal: Callable[[str], bool] | None = None,
+        on_removed: Callable[[str], None] | None = None,
     ) -> tuple[int, list[str], list[str]]:
         """Remove Lium's containers whose pod is no longer live and that are older than threshold.
 
@@ -259,6 +278,9 @@ class ContainerCleanup:
 
         ``reserve_removal(container_name)`` is asked before removing a labelled pod_/filler_
         container; False defers it to a later cycle (the caller's per-cycle lookup budget is spent).
+
+        ``on_removed(container_name)`` is called right after each successful removal, so a caller that
+        times out mid-sweep still knows what is gone.
 
         Returns:
             Tuple of (number_removed, removed container names, orphaned containers that survived
@@ -334,7 +356,9 @@ class ContainerCleanup:
                     if on_before_remove is not None:
                         await on_before_remove(stripped_name)
                     keep_volume = stripped_name.partition("_")[2] in kept_volumes
-                    if await self._remove_container(ssh_client, stripped_name, keep_volume=keep_volume):
+                    if await self._remove_container(
+                        ssh_client, stripped_name, on_removed, keep_volume=keep_volume
+                    ):
                         removed_names.append(stripped_name)
                         logger.info(
                             _m(
@@ -454,8 +478,9 @@ class ContainerCleanup:
 
         Gated on NO live filler container: a cache a sibling still mounts is in use (docker refuses to
         remove it anyway), and a node still filling bundles is not the node this is meant to rescue.
-        Nor a live customer pod (Fish 26 Oct): the cache is kept across rentals and listed as used, so
-        a renter who took the listed free disk leaves the node under the floor by design.
+        A live customer pod does not hold it back (DAH-6187): the rent keeps the cache when the
+        pod's volume fits beside it, but the pod's container writes take real disk, so once they
+        push the node under the floor the cache gives way to the renter.
         Returns how many volumes were removed.
         """
         extra = {"executor_uuid": executor_uuid}
@@ -471,7 +496,7 @@ class ContainerCleanup:
 
             # RUNNING only: _get_all_rental_containers uses `docker ps -a`, so one long-exited
             # filler_* would make "no live filler" false forever and the reclaim would never fire.
-            if await self._has_running_filler_or_pod(ssh_client):
+            if await self._has_running_filler(ssh_client):
                 return 0
 
             free_gb = await self._get_free_disk_gb(ssh_client)
@@ -630,10 +655,10 @@ class ContainerCleanup:
             return None
         return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
 
-    async def _has_running_filler_or_pod(self, ssh_client: asyncssh.SSHClientConnection) -> bool:
-        # A cache a live filler still mounts is in use; a live rental keeps it (two name filters OR).
+    async def _has_running_filler(self, ssh_client: asyncssh.SSHClientConnection) -> bool:
+        # A cache a live filler still mounts is in use.
         result = await ssh_client.run(
-            f'/usr/bin/docker ps --filter "name={FILLER_CONTAINER_PREFIX}" --filter "name={POD_CONTAINER_PREFIX}" '
+            f'/usr/bin/docker ps --filter "name={FILLER_CONTAINER_PREFIX}" '
             '--format "{{.Names}}"'
         )
         if getattr(result, "exit_status", 0) != 0:
@@ -897,7 +922,13 @@ class ContainerCleanup:
             )
             return None
 
-    async def _remove_container(self, ssh_client, container_name: str, keep_volume: bool = False) -> bool:
+    async def _remove_container(
+        self,
+        ssh_client,
+        container_name: str,
+        on_removed: Callable[[str], None] | None = None,
+        keep_volume: bool = False,
+    ) -> bool:
         """Remove a container and its associated resources.
 
         True once the container itself is gone. The pod volume removal after it is best-effort:
@@ -943,6 +974,9 @@ class ContainerCleanup:
             )
             return False
 
+        # before the volume step: a hang there must not keep the gone container's GPU processes judged
+        if on_removed is not None:
+            on_removed(container_name)
         # A create names both the container and its volume after payload.pod_id (the pod id or the
         # filler run id), so `volume_<id>` is this container's own volume and no one else's.
         for prefix in (POD_CONTAINER_PREFIX, FILLER_CONTAINER_PREFIX):

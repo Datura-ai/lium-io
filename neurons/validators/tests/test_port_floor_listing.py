@@ -246,7 +246,7 @@ async def test_declared_40000_65535_publishes_two_when_the_host_network_batch_re
     ("deferred", "prefix"),
     [
         (False, f"2 renting ports answered, {MIN_PORT_COUNT} required."),
-        (True, "Renting-port check deferred; no current measurement. Wait for the next check."),
+        (True, None),  # DAH-5851: an idle node's deferred cycle is withheld, it states no measurement
     ],
 )
 async def test_the_port_message_states_a_measurement_only_when_one_was_taken(context_factory, deferred, prefix):
@@ -257,7 +257,10 @@ async def test_the_port_message_states_a_measurement_only_when_one_was_taken(con
     result = await PortCountCheck().run(ctx)
 
     assert result.passed is False
-    assert result.event.remediation.startswith(prefix)
+    if prefix is None:
+        assert result.event.reason_code == PortCountMessages.VERDICT_WITHHELD_PORT_CHECK_DEFERRED.reason
+    else:
+        assert result.event.remediation.startswith(prefix)
 
 @pytest.mark.asyncio
 async def test_a_stale_listed_pod_carries_two_ports_through_to_validation_completed(context_factory):
@@ -325,6 +328,34 @@ async def test_stale_pod_fails_insufficient_ports_with_the_enforcement_flag(cont
 
 
 @pytest.mark.asyncio
+async def test_a_stale_pod_on_a_deferred_port_check_withholds_the_verdict(context_factory, monkeypatch):
+    """DAH-5851: every listed pod stale makes the node idle: its deferred cycle is withheld and, like an idle
+    node's, is the only one in a row."""
+    from dataclasses import replace
+
+    monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
+    ctx = run_context(
+        context_factory,
+        connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
+        rented_data=rented_with_one_pod(),
+        ssh=DummySSHClient(pod_running=False),
+        backend=DummyBackendClient(active=False),
+    )
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    _, ctx = await apply(ctx, PortCountCheck())
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, port_check_deferred=True)})
+    ctx.services.redis.record_disk_pressure_deferral.side_effect = [1, 2, 3]
+    tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
+
+    assert tenant_result.passed is False
+    assert tenant_result.event.reason_code == PortCountMessages.VERDICT_WITHHELD_PORT_CHECK_DEFERRED.reason
+    assert tenant_result.event.what_we_saw["stale_pod"]["pod_id"] == "pod-1"
+    # idle now, so it defers once in a row: the streak is spent and the next pressured cycle runs the check
+    assert ctx.services.redis.record_disk_pressure_deferral.await_count == 3
+
+
+@pytest.mark.asyncio
 async def test_stale_pod_with_enough_ports_is_unchanged(context_factory, monkeypatch):
     monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
     ctx = run_context(
@@ -372,10 +403,10 @@ async def test_a_live_rental_keeps_the_exemption_beside_a_stale_pod_with_the_enf
 
     assert ctx.state.specs["available_port_count"] == 2
     assert count_result.passed is True
-    # main's verdict for this node, flag or no flag: the stale pod is reported and the run goes on
+    # DAH-6141: a closed pod never decides the node beside a live rental; it stays rented, floor not enforced
     assert tenant_result.passed is True
-    assert tenant_result.event.reason_code == TenantEnforcementMessages.STALE_POD_NOT_RUNNING.reason
-    assert tenant_result.event.what_we_saw["pod_id"] == "pod-stale"
+    assert tenant_result.event.reason_code == TenantEnforcementMessages.ALREADY_RENTED.reason
+    assert tenant_result.updates["default_extra"]["pods_rental_closed"] == ["pod-stale"]
 
 
 @pytest.mark.asyncio
@@ -415,8 +446,8 @@ async def test_a_stale_pod_beside_a_down_pod_with_an_open_rental_is_not_enforced
     _, ctx = await apply(ctx, PortCountCheck())
     tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
 
-    assert tenant_result.passed is True
-    assert tenant_result.event.reason_code == TenantEnforcementMessages.STALE_POD_NOT_RUNNING.reason
+    # DAH-6141: the closed pod no longer hides the down pod with an open rental; that pod is judged, not the floor
+    assert tenant_result.event.reason_code == TenantEnforcementMessages.POD_NOT_RUNNING.reason
 
 
 @pytest.mark.asyncio
@@ -434,8 +465,9 @@ async def test_a_stale_pod_beside_a_running_pod_with_a_closed_rental_is_not_enfo
     _, ctx = await apply(ctx, PortCountCheck())
     tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
 
+    # DAH-6141: a running sibling keeps the node rented, as the loop treats every running pod
     assert tenant_result.passed is True
-    assert tenant_result.event.reason_code == TenantEnforcementMessages.STALE_POD_NOT_RUNNING.reason
+    assert tenant_result.event.reason_code == TenantEnforcementMessages.ALREADY_RENTED.reason
 
 
 @pytest.mark.asyncio
@@ -459,7 +491,9 @@ async def test_a_stale_pod_beside_a_down_pod_without_a_rental_record_is_not_enfo
     tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
 
     assert tenant_result.passed is True
-    assert tenant_result.event.reason_code == TenantEnforcementMessages.STALE_POD_NOT_RUNNING.reason
+    # DAH-6141: the unanswered sibling holds the verdict, so the node stays rented, not idle
+    assert tenant_result.event.reason_code == TenantEnforcementMessages.ALREADY_RENTED.reason
+    assert tenant_result.updates["default_extra"]["pods_rental_state_unknown"] == ["pod-unknown"]
 
 
 @pytest.mark.asyncio
@@ -891,7 +925,7 @@ async def test_a_stale_split_nodes_reprobe_keeps_crediting_its_idle_fillers_port
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reprobe_ok", [True, False])
 async def test_a_deferred_stale_split_node_states_a_reprobe_as_a_measurement(context_factory, monkeypatch, reprobe_ok):
-    """A deferred cycle whose re-probe completes reports that reading; a failed re-probe has none to report."""
+    """A deferred cycle on a node whose every listed pod is stale is idle: withheld before any re-probe (DAH-5851)."""
     from dataclasses import replace
 
     ctx = stale_split_ctx(context_factory, Firewalled(blocked=set()), 40020)
@@ -904,11 +938,7 @@ async def test_a_deferred_stale_split_node_states_a_reprobe_as_a_measurement(con
     tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
 
     assert tenant_result.passed is False
-    if reprobe_ok:
-        assert tenant_result.event.remediation.startswith("21 renting ports answered, 24 required.")
-        assert tenant_result.updates["state"].port_check_deferred is True  # the pipeline flag is untouched
-    else:
-        assert tenant_result.event.remediation.startswith("Renting-port check deferred; no current measurement.")
+    assert tenant_result.event.reason_code == PortCountMessages.VERDICT_WITHHELD_PORT_CHECK_DEFERRED.reason
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("since_snapshot, passed", [("nothing", False), ("rental", True), ("filler", True)])

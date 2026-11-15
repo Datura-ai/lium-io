@@ -162,6 +162,11 @@ class JobResult(BaseModel):
     # the share of its own spot rate a spot node is paid: below 1 when its GPU model's spot nodes would
     # together be paid more than the model's fillers earn per hour (filler_revenue_usd_per_hour)
     spot_pool_multiplier: float | None = None
+    # DAH-5944: idle spot GPUs have their own cap per (GPU model, bucket) at the secure numbers. Kept apart
+    # from max_cap / total_unrented_by_gpu_type / unrented_cap_multiplier, which mean a secure tier.
+    spot_cap: int | None = None
+    spot_gpus_in_bucket: int | None = None
+    spot_cap_multiplier: float | None = None
     # Spot pay and secure-floor top-ups are paid on top of the burn-capped rental share:
     # unbucketed_share is the emission share that pays them, unbucketed_rental_cost their USD/hour,
     # floor_top_up_rate the per-GPU USD/hour the floor added to this node (after its multipliers),

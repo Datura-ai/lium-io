@@ -317,7 +317,8 @@ async def test_a_miner_whose_dns_stalls_cannot_stop_another_miners_rental_connec
 
     def info(address):
         return SimpleNamespace(
-            address=address, ssh_port=2222, ssh_username="root", ssh_host_key="ssh-ed25519 AAAATESTKEY"
+            address=address, ssh_port=2222, ssh_username="root", ssh_host_key="ssh-ed25519 AAAATESTKEY",
+            expected_ssh_host_key=None,
         )
 
     async def connect_as(miner, address):
@@ -352,3 +353,25 @@ async def test_a_miner_whose_dns_stalls_cannot_stop_another_miners_rental_connec
 # ---------------------------------------------------------------------------
 
 
+
+
+@pytest.mark.asyncio
+async def test_pull_whose_reply_ends_prematurely_is_retried_once_after_reopen():
+    import requests
+    import urllib3
+
+    adapter = _FakeAdapter()
+    client = _client(_FakeApiClient(adapter=adapter))
+    errors = [requests.exceptions.ChunkedEncodingError(urllib3.exceptions.ProtocolError("Response ended prematurely"))]
+    pulls = []
+
+    def pull_sync(image):
+        pulls.append(image)
+        if errors:
+            raise errors.pop(0)
+
+    client._pull_sync = pull_sync
+    await client.pull(image="daturaai/pytorch:x")
+
+    assert pulls == ["daturaai/pytorch:x", "daturaai/pytorch:x"]
+    assert adapter.reopen_calls == 1

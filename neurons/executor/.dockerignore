@@ -11,3 +11,5 @@ sysbox-ce_*
 # CVM runtime dir (guest disk images, tens of GB) — never part of the build
 # context, and COPY . . must not bake it into the executor image.
 dstacktee/
+# The liumd binaries arrive as the `liumd` named build context.
+liumd/

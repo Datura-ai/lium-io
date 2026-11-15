@@ -12,6 +12,7 @@ _SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 class ImageVerdict(StrEnum):
     CURRENT = "CURRENT"
     OUTDATED = "OUTDATED"
+    UNOFFICIAL = "UNOFFICIAL"
 
 
 @dataclass(frozen=True)
