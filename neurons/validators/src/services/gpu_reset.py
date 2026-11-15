@@ -756,6 +756,18 @@ async def reset_pod_gpus(
                     )
                 if fabric_manager_problem:
                     notes.append(fabric_manager_problem)
+        if reset is not None and reset.exit_code != 0:
+            # the report keeps only a short tail; the whole host output is what explains a refusal, logged before a
+            # holder that did not come back ends the reset early
+            logger.warning(
+                "nvidia-smi -r refused: exit %s, host services %s, holder containers %s, stdout %r, stderr %r",
+                reset.exit_code,
+                plan.host_services,
+                plan.holder_containers,
+                (reset.stdout or "")[-_LOG_OUTPUT_CHARS:],
+                (reset.stderr or "")[-_LOG_OUTPUT_CHARS:],
+            )
+        if plan.owns_host:
             if fabric_manager_problem:
                 raise GpuResetRefused(
                     GpuResetErrorCode.ResetNotSupported, "no latch cure while a host GPU service is down"
@@ -771,15 +783,6 @@ async def reset_pod_gpus(
             # ~45% of the Blackwell fleet refuses `nvidia-smi -r` (gpu_wedge.py); the context cycle at
             # least clears the DAH-2427 latch, on the pod's GPUs only
             report.error_code = GpuResetErrorCode.ResetNotSupported
-            # the report keeps only a short tail; the whole host output is what explains a refusal
-            logger.warning(
-                "nvidia-smi -r refused: exit %s, host services %s, holder containers %s, stdout %r, stderr %r",
-                reset.exit_code,
-                plan.host_services,
-                plan.holder_containers,
-                (reset.stdout or "")[-_LOG_OUTPUT_CHARS:],
-                (reset.stderr or "")[-_LOG_OUTPUT_CHARS:],
-            )
             notes.append(f"nvidia-smi -r refused, the GPUs were not reset: {_tail(reset.stdout or reset.stderr)}")
             for cure in await cure_wedged_gpus(runner, plan.targets):
                 report.gpus.append(
