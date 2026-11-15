@@ -35,8 +35,13 @@ class DockerUserNamespaceWorkspace:
     container_name: str
     container_id: str
     pid: int
-    path: PurePosixPath
+    path: PurePosixPath  # as the rental sees it (DAH-6447): restic runs inside the rental's own root
     read_only: bool
+
+    @property
+    def helper_path(self) -> PurePosixPath:
+        """the same path seen from a host-PID helper; resolves outside the rental's root, so never give it to restic"""
+        return PurePosixPath("/proc", str(self.pid), "root", self.path.relative_to("/"))
 
 
 ResolvedWorkspace = LocalWorkspace | DockerVolumeWorkspace | DockerUserNamespaceWorkspace
@@ -117,7 +122,7 @@ class WorkspaceResolver:
             container_name=container_name,
             container_id=identity.container_id,
             pid=identity.pid,
-            path=visible_path,
+            path=requested_path,
             read_only=operation.action is StorageAction.BACKUP,
         )
 

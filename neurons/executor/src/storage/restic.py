@@ -56,6 +56,16 @@ STALE_HELPER_AGE = timedelta(minutes=10)
 # restic starts, so nothing is uploaded (DAH-2002); a path that is not a directory fails.
 BACKUP_SOURCE_SCRIPT = '[ -e "$1" ] || exit 66; cd "$1" 2>/dev/null || exit 1; [ -n "$(ls -A)" ] || exit 66; shift; exec "$@"'
 BACKUP_SOURCE_MISSING_EXIT = 66
+# DAH-6447: restic runs as a process of the rental (its user, mount, PID and network namespaces), so every path,
+# symlinks included, resolves in the rental's own root. restic and the CA bundle are opened here, before nsenter:
+# nothing from the rental's filesystem is executed. $1 is the helper's view of the backup path, checked only for the
+# missing/empty no-op (racy, but restic itself runs confined); "" skips it. PWD keeps the snapshot path stable.
+ENCRYPTED_RESTIC_SCRIPT = (
+    'if [ -n "$1" ]; then [ -e "$1" ] || exit 66; [ -d "$1" ] || exit 1; [ -n "$(ls -A "$1")" ] || exit 66; fi; '
+    'exec 3< "$2" 4< "$3"; cwd="$4"; shift 4; PWD="$cwd" SSL_CERT_FILE=/proc/self/fd/4 exec "$@"'
+)
+# the rental image may have no CA bundle; Go reads SSL_CERT_FILE
+CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 
 # restic 0.19.1 prints this as the exit_error JSON "message" with --json, else as a plain stderr line
 SNAPSHOT_EMPTY_MESSAGE = "Fatal: unable to save snapshot: snapshot is empty"
@@ -858,18 +868,7 @@ class ResticStorageRunner:
             return restic_command, cwd
 
         if isinstance(self._workspace, DockerUserNamespaceWorkspace):
-            if working_directory:
-                namespace_command = [
-                    "/bin/sh",
-                    "-c",
-                    BACKUP_SOURCE_SCRIPT,
-                    "sh",
-                    str(self._workspace.path),
-                    *restic_command,
-                ]
-            else:
-                namespace_command = restic_command
-            return self._encrypted_helper_command(namespace_command), None
+            return self._encrypted_restic_command(restic_command[1:], working_directory), None
 
         volume_mode = "ro" if self._workspace.read_only else "rw"
         command = [
@@ -938,7 +937,10 @@ class ResticStorageRunner:
             "/usr/bin/aws",
             self._operation.repository.bucket,
             object_key,
-            self._workspace_path(),
+            # awscli is not static, so the legacy tar restore still writes through the helper's /proc view
+            str(self._workspace.helper_path)
+            if isinstance(self._workspace, DockerUserNamespaceWorkspace)
+            else self._workspace_path(),
         ]
         if isinstance(self._workspace, LocalWorkspace):
             return pipeline_command, None
@@ -955,6 +957,43 @@ class ResticStorageRunner:
             self._workspace.image,
             *pipeline_command[1:],
         ], None
+
+    def _encrypted_restic_command(self, restic_arguments: list[str], working_directory: bool) -> list[str]:
+        workspace = self._workspace
+        if not isinstance(workspace, DockerUserNamespaceWorkspace):
+            raise ResticOperationError("encrypted helper requested for a non-encrypted workspace")
+        cwd = str(workspace.path) if working_directory else "/"
+        return [
+            *self._docker_helper_base(),
+            "--pid",
+            "host",
+            "--privileged",
+            "--security-opt",
+            "label=disable",
+            "--entrypoint",
+            "/bin/sh",
+            workspace.image,
+            "-c",
+            ENCRYPTED_RESTIC_SCRIPT,
+            "sh",
+            str(workspace.helper_path) if working_directory else "",
+            self._restic_binary,
+            CA_BUNDLE,
+            cwd,
+            "/usr/bin/nsenter",
+            "-t",
+            str(workspace.pid),
+            "-U",
+            "-m",
+            "-p",  # nsenter forks into the rental's PID namespace, where the rental's /proc/self is valid
+            "-n",
+            "--root",
+            # always set: with --root and no working directory, nsenter would keep the helper's cwd outside the root
+            f"--wdns={cwd}",
+            "--",
+            "/proc/self/fd/3",
+            *restic_arguments,
+        ]
 
     def _encrypted_helper_command(self, namespace_command: list[str]) -> list[str]:
         if not isinstance(self._workspace, DockerUserNamespaceWorkspace):
