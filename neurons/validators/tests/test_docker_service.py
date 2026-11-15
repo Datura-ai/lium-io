@@ -10826,6 +10826,31 @@ def test_a_trailing_slash_on_the_template_path_selects_the_same_mount(template_v
 
 
 @pytest.mark.asyncio
+async def test_start_container_success_replies_container_started(docker_service, monkeypatch):
+    # a sender of ContainerStartRequest must learn the start succeeded (review 4579627719)
+    from payload_models.payloads import ContainerStarted, ContainerStartRequest
+
+    docker_service.ssh_service.decrypt_payload.return_value = "private-key"
+    docker_service._prepare_known_hosts_policy = AsyncMock(return_value=None)
+    docker_service.start_existing_container = AsyncMock(return_value=None)
+    payload = ContainerStartRequest(
+        miner_hotkey="miner-hotkey",
+        executor_id=str(uuid4()),
+        pod_id="pod-id",
+        container_name="pod_test",
+        local_volume_path="/data/pod_test",
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=str(uuid4()), address="127.0.0.1", port=8001, ssh_username="root", ssh_port=2200,
+        python_path="/usr/bin/python3", root_dir="/root/app", ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.start_container(payload, executor_info, Mock(ss58_address="v"), "encrypted")
+
+    assert isinstance(result, ContainerStarted) and result.container_name == "pod_test"
+
+
+@pytest.mark.asyncio
 async def test_stop_container_success_replies_container_stopped(docker_service, monkeypatch):
     # DAH-5510: the backend's stop of a moved pod's old container waits for this reply
     from payload_models.payloads import ContainerStopped

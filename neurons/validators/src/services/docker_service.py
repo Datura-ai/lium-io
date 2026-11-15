@@ -48,6 +48,7 @@ from payload_models.payloads import (
     ContainerCreated,
     ContainerCreateRequest,
     ContainerDeleted,
+    ContainerStarted,
     ContainerStopped,
     ContainerDeleteRequest,
     ContainerStartRequest,
@@ -12367,6 +12368,13 @@ class DockerService:
                 error_type=FailedContainerErrorTypes.ContainerStartFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
             )
+        return ContainerStarted(
+            miner_hotkey=payload.miner_hotkey,
+            executor_id=payload.executor_id,
+            pod_id=payload.pod_id,
+            workload_kind=payload.workload_kind,
+            container_name=payload.container_name,
+        )
 
     async def start_existing_container(
         self,

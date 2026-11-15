@@ -478,6 +478,12 @@ class Validator:
                     ),
                 )
 
+                # Built before the cycle counts: a failed build (obfuscator exit) leaves the cycle
+                # and an operator's forced request to the next tick. A fresh job-files directory for
+                # this cycle; the ones an express verification still reads are kept (DAH-2958).
+                encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files(
+                    keep_directories=self.express_lane.directories_in_use()
+                )
                 self.last_job_run_blocks = current_block
                 if cycle_asked_for_now:
                     # Cleared here and not at the read: every return above this line means no
@@ -487,11 +493,6 @@ class Validator:
                 first_cycle = self.first_cycle_started_at is None
                 if first_cycle:
                     self.first_cycle_started_at = datetime.now(UTC)
-                # A fresh job-files directory for this cycle; the ones an express verification
-                # still reads are kept (DAH-2958). The express lane uses the new one from here on.
-                encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files(
-                    keep_directories=self.express_lane.directories_in_use()
-                )
                 self.cycle_inputs = CycleInputs(
                     encrypted_files=encrypted_files,
                     default_image_digests=default_image_digests,

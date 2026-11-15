@@ -481,8 +481,6 @@ class FileEncryptService:
 
         Returns: MinerJobEnryptedFiles
         """
-        tmp_directory = self.fresh_job_files_directory(keep_directories)
-
         # file pathes
         machine_scrape_file_path = str(
             Path(__file__).parent / ".." / "miner_jobs/machine_scrape.py"
@@ -502,6 +500,8 @@ class FileEncryptService:
 
         with open(obfuscated_machine_scrape_file_path) as file:
             obfuscated_content = file.read()
+        # only after the obfuscator succeeded: a failed run keeps the previous cycle's files for the express lane
+        tmp_directory = self.fresh_job_files_directory(keep_directories)
 
         # replace dictionary keys with random names
         all_keys, encryption_key = self.generate_key_mappings()
