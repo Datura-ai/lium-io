@@ -64,8 +64,9 @@ def _confined_to(volume_root_argument: str) -> str:
     """Shell that refuses a working directory off the volume's filesystem.
 
     A symbolic link in the pod's volume resolves in the helper, so it could lead to the helper's own root, its
-    /proc or a privileged helper's /dev. The cwd is pinned once entered, so swapping the link afterwards changes
-    nothing."""
+    /proc or a privileged helper's /dev. This checks links planted before the operation. tar extracts relative to
+    the pinned cwd, but restic resolves its path from $PWD and again on every write, so a running rental that swaps
+    a link during a restic backup or restore is not covered here (DAH-6447)."""
     return (
         f'[ "$(stat -c %d .)" = "$(stat -c %d -- "{volume_root_argument}")" ] '
         f'|| {{ echo "the path leaves the pod volume" >&2; exit {PATH_OUTSIDE_VOLUME_EXIT}; }}; '
