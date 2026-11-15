@@ -481,6 +481,12 @@ class Validator:
                 )
                 self.last_job_run_blocks = current_block
 
+                # DAH-3405: a push between two cycles opens the grace window here, after the job-files
+                # build and the last pre-wave failure point and before the first job of this cycle runs
+                # against the new digest, so an aborted iteration does not count as a cycle of the window.
+                # Before cycle_inputs: no await may sit between publishing them and start_awaiting_wave_lists,
+                # or an express tick verifies a new executor that the wave verifies again under the same batch ID.
+                rollout_window = await self.observe_executor_rollout(executor_digest, job_block)
                 first_cycle = self.first_cycle_started_at is None
                 if first_cycle:
                     self.first_cycle_started_at = datetime.now(UTC)
@@ -497,19 +503,15 @@ class Validator:
                         ).items()
                     },
                 )
-                if cycle_asked_for_now:
-                    # Cleared here and not at the read: every return above this line means no
-                    # cycle started, and the operator's request must survive to the next tick.
-                    # After cycle_inputs: a Redis drop here must not leave it naming the removed
-                    # directory the build above replaced.
-                    await self.redis_service.clear_forced_validation_cycle_request()
-                # DAH-3405: a push between two cycles opens the grace window here, after the job-files
-                # build and the last pre-wave failure point and before the first job of this cycle runs
-                # against the new digest, so an aborted iteration does not count as a cycle of the window.
-                rollout_window = await self.observe_executor_rollout(executor_digest, job_block)
                 self.miner_service.start_awaiting_wave_lists(
                     job_batch_id, [miner.hotkey for miner in miners]
                 )
+                if cycle_asked_for_now:
+                    # Cleared here and not at the read: every return above this line means no
+                    # cycle started, and the operator's request must survive to the next tick.
+                    # After cycle_inputs and the wave lists: a Redis drop here must not leave it naming
+                    # the removed directory the build above replaced.
+                    await self.redis_service.clear_forced_validation_cycle_request()
                 if first_cycle and not settings.DRY_RUN:
                     # Queue the nodes a restart cut off before this wave asks their miners, or the
                     # wave takes them (minutes slower). The lane launches once each list is in.
