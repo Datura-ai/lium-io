@@ -34,7 +34,7 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Build before the login: the base image is a public docker.io image, and once the OIDC
       # token is the docker.io credential every pull uses it.
@@ -44,7 +44,7 @@ jobs:
           docker build -f Dockerfile.preflight -t daturaai/compute-subnet-validator:preflight .
 
       - name: Log in to Docker Hub (OIDC, no stored token)
-        uses: docker/login-action@v4   # >= 4.5.0 for Docker Hub OIDC
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0 (>= 4.5.0 for Docker Hub OIDC)
         env:
           DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
           DOCKERHUB_OIDC_EXPIREIN: "1800"

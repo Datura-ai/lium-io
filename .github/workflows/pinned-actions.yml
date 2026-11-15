@@ -1,0 +1,34 @@
+name: Pinned actions
+
+on:
+  pull_request:
+    paths: [".github/workflows/**"]
+  push:
+    branches: [main]
+    paths: [".github/workflows/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # a workflow that can mint an OIDC token must pin every action to a commit, never to a movable tag
+      - name: Actions in workflows with id-token write are pinned to commit SHAs
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, sys
+          bad = []
+          for path in sorted(pathlib.Path(".github/workflows").glob("*.y*ml")):
+              text = path.read_text()
+              if not re.search(r"id-token:\s*write", text):
+                  continue
+              for number, line in enumerate(text.splitlines(), 1):
+                  match = re.search(r"uses:\s*([^\s#]+)", line)
+                  if match and not match.group(1).startswith("./") and not re.search(r"@[0-9a-f]{40}$", match.group(1)):
+                      bad.append(f"{path}:{number}: {match.group(1)}")
+          print("\n".join(bad) or "all pinned")
+          sys.exit(1 if bad else 0)
+          PY
