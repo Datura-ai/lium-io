@@ -332,6 +332,14 @@ async def test_the_download_sweep_removes_its_helper_container_after_the_run_too
     assert "docker rm -f lium_cache_sweep" in before and "docker rm -f lium_cache_sweep" in after
 
 
+@pytest.mark.asyncio
+async def test_the_download_sweep_leaves_a_provider_job_cache_alone(cleanup):
+    ssh_client = FakeSshClient(containers=[], volumes=["job_cache_50gb_42"], free_gb=40)
+
+    assert await cleanup.sweep_abandoned_download_temporaries(ssh_client, "exec-1") == 0
+    assert not [c for c in ssh_client.commands if "docker run" in c]
+
+
 def test_only_never_started_capability_checks_are_picked():
     listing = "\n".join(
         [
