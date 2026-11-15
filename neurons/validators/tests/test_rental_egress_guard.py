@@ -469,7 +469,7 @@ def _probe(tmp_path, monkeypatch, slow=""):
 @pytest.mark.parametrize("script", ["apply", "cleanup"])
 def test_every_iptables_call_of_the_helper_runs_under_the_host_lock(tmp_path, monkeypatch, script):
     state, _lock, env = _probe(tmp_path, monkeypatch)
-    body = link_local_drop_script("br-0123456789ab", ["10.0.0.5/32"]) if script == "apply" else ""
+    body = link_local_drop_script("br-0123456789ab", ["198.51.100.7/32"]) if script == "apply" else ""
     body = body or link_local_cleanup_script()
 
     done = subprocess.run(["sh", "-c", locked_script(body)], env=env, capture_output=True, text=True)
