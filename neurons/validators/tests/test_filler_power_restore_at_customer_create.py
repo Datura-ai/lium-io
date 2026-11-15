@@ -26,9 +26,9 @@ async def test_customer_create_restores_the_power_of_a_filler_it_removed(svc, mo
     result = await _run(svc, payload)
 
     assert isinstance(result, ContainerCreated)
-    restore.assert_awaited_once()
-    assert restore.await_args.args[2] == "pod-9"
-    assert restore.await_args.kwargs["executor_id"] == payload.executor_id
+    # the early parallel restore and the one before `docker run` (which then finds the index gone)
+    assert restore.await_count >= 1
+    assert {(c.args[2], c.kwargs["executor_id"]) for c in restore.await_args_list} == {("pod-9", payload.executor_id)}
 
 
 @pytest.mark.asyncio

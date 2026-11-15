@@ -5183,6 +5183,7 @@ class DockerService:
         timeout: int = 10,
         remove_every_filler: bool = False,
         default_extra: dict | None = None,
+        executor_id: str = "",
     ):
         """Check if the container is running.
 
@@ -5214,7 +5215,7 @@ class DockerService:
                 running, listing = _parse_running_check_with_listing(result.stdout or "")
                 if running:
                     await self._remove_fillers_beside_customer_container(
-                        ssh_client, default_extra or {}, container_name, listing
+                        ssh_client, default_extra or {}, container_name, listing, executor_id
                     )
                     return True
             await asyncio.sleep(1)
@@ -5272,6 +5273,7 @@ class DockerService:
         default_extra: dict,
         pod_name: str,
         listing: ContainerListing | None,
+        executor_id: str,
     ) -> None:
         # the `filler_*` on a listing taken while the customer's container runs
         if listing is None:
@@ -5321,6 +5323,7 @@ class DockerService:
                     self.redis_service,
                     name.removeprefix(FILLER_CONTAINER_PREFIX),
                     log_extra=default_extra,
+                    executor_id=executor_id,
                     require_complete=True,
                 )
             except GpuPowerRestoreStateError as exc:
@@ -9750,8 +9753,19 @@ class DockerService:
         concurrency: int = POWER_LIMIT_SET_CONCURRENCY,
         record_rental_start: bool = False,
         executor_info: ExecutorSSHInfo | None = None,
+        removed_filler_pod_ids: list[str] | None = None,
     ) -> None:
         # GPUs of a pod that brings no power cap of its own (a customer, an uncapped filler)
+        # Fillers this create removed first, each from its own pod index (incl. raising a GPU left at its cap);
+        # a second call finds the index gone and costs one Redis read.
+        for removed_filler in removed_filler_pod_ids or []:
+            await restore_filler_pod_gpu_power_limits(
+                ssh_client,
+                self.redis_service,
+                removed_filler,
+                log_extra=default_extra,
+                executor_id=payload.executor_id,
+            )
         # DAH-2356 safety net: restore any leftover pre-cap records BEFORE a container
         # without its own cap starts, so a customer (or an uncapped filler) never
         # inherits a reduced limit. Best-effort, never blocks the rental.
@@ -10789,19 +10803,13 @@ class DockerService:
                         removed_containers,
                         [f"volume_{name.removeprefix(FILLER_CONTAINER_PREFIX)}" for name in removed_containers],
                     )
-                if payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL:
-                    # A filler this create removed had no delete of its own yet (overlapped rent
-                    # preemption): restore its GPUs the way that delete would, including raising a
-                    # capped GPU whose restore record is gone to its default, before the renter's
-                    # container starts.
-                    for removed_filler in _removed_filler_pod_ids(removed_containers):
-                        await restore_filler_pod_gpu_power_limits(
-                            ssh_client,
-                            self.redis_service,
-                            removed_filler,
-                            log_extra=default_extra,
-                            executor_id=payload.executor_id,
-                        )
+                # A filler this create removed had no delete of its own yet (overlapped rent preemption):
+                # the power restore below gives its GPUs back the way that delete would.
+                removed_filler_pod_ids = (
+                    _removed_filler_pod_ids(removed_containers)
+                    if payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
+                    else []
+                )
 
                 # A filler sweeps filler volumes only: a customer's fresh volume is unmounted until its
                 # `docker run`, and a lapsed create lock or a second connector would let a filler remove it.
@@ -10878,6 +10886,7 @@ class DockerService:
                                 host_probe,
                                 default_extra,
                                 concurrency=POWER_LIMIT_SET_CONCURRENCY - 2,
+                                removed_filler_pod_ids=removed_filler_pod_ids,
                             ),
                             ProfilerStepName.GPU_POWER_RESTORE_PARALLEL,
                         )
@@ -11214,6 +11223,7 @@ class DockerService:
                                 default_extra,
                                 record_rental_start=payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL,
                                 executor_info=executor_info,
+                                removed_filler_pod_ids=removed_filler_pod_ids,
                             )
                         except GpuPowerRestoreStateError:
                             current_step = "gpu_power_restore_state"  # our Redis, not the host's fault
@@ -11414,6 +11424,7 @@ class DockerService:
                             container_name,
                             remove_every_filler=removes_every_filler,
                             default_extra=default_extra,
+                            executor_id=payload.executor_id,
                         )
                     except _FillerRestoreStateUnavailable:
                         current_step = "gpu_power_restore_state"
@@ -11495,7 +11506,11 @@ class DockerService:
                         # DAH-2356: the PEARL cap applied above must not stay on the GPUs the customer
                         # is about to get; lifted only after the container is removed.
                         await restore_filler_pod_gpu_power_limits(
-                            ssh_client, self.redis_service, payload.pod_id, log_extra=default_extra
+                            ssh_client,
+                            self.redis_service,
+                            payload.pod_id,
+                            log_extra=default_extra,
+                            executor_id=payload.executor_id,
                         )
                         # A run that failed because the customer's sweep removed the container (create
                         # lock lapsed), before its start or before the running-state check, is that

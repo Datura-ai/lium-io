@@ -258,7 +258,7 @@ class GpuPowerCapResult(StrEnum):
 
 
 @dataclass(frozen=True)
-class _BelowFloorGpu:
+class _GpuToRaiseToDefault:
     """One GPU a raise lifts to its default: below ``MIN_POWER_LIMIT_RATIO`` x the default for
     ``raise_low_power_limits_to_default``, below the default itself for a filler-capped GPU whose
     restore record is gone."""
@@ -1138,7 +1138,7 @@ async def _raise_below_floor(
     concurrency: int,
 ) -> int:
     target_uuids: list[str] = gpu_uuids if gpu_uuids else list(state_by_uuid)
-    below_floor: list[_BelowFloorGpu] = []
+    below_floor: list[_GpuToRaiseToDefault] = []
     for gpu_uuid in target_uuids:
         state = state_by_uuid.get(gpu_uuid)
         if state is None or state.default_watts is None:
@@ -1146,7 +1146,7 @@ async def _raise_below_floor(
         if state.current_watts >= MIN_POWER_LIMIT_RATIO * state.default_watts:
             continue
         below_floor.append(
-            _BelowFloorGpu(
+            _GpuToRaiseToDefault(
                 gpu_uuid=gpu_uuid,
                 current_watts=state.current_watts,
                 default_watts=state.default_watts,
@@ -1158,7 +1158,7 @@ async def _raise_below_floor(
 async def _raise_to_default(
     ssh: asyncssh.SSHClientConnection,
     executor_id: str,
-    targets: list[_BelowFloorGpu],
+    targets: list[_GpuToRaiseToDefault],
     log_extra: dict[str, object] | None,
     *,
     concurrency: int = POWER_LIMIT_SET_CONCURRENCY,
@@ -1167,7 +1167,7 @@ async def _raise_to_default(
         return 0
 
     # Side by side, like the restore: this runs before the customer's `docker run`.
-    async def raise_one(target: _BelowFloorGpu, setter: _Setter) -> bool:
+    async def raise_one(target: _GpuToRaiseToDefault, setter: _Setter) -> bool:
         raise_outcome = await setter(
             ssh,
             "raise",
@@ -1209,7 +1209,7 @@ async def _raise_gpus_left_at_lium_cap(
     except Exception as exc:
         _log(logging.ERROR, f"gpu power raise: state query failed: {exc}; leaving limits as-is", {}, log_extra)
         return 0
-    targets: list[_BelowFloorGpu] = []
+    targets: list[_GpuToRaiseToDefault] = []
     for gpu_uuid, cap_watts in cap_watts_by_uuid.items():
         state = state_by_uuid.get(gpu_uuid)
         if state is None or state.default_watts is None or state.current_watts >= state.default_watts:
@@ -1217,7 +1217,7 @@ async def _raise_gpus_left_at_lium_cap(
         if abs(state.current_watts - cap_watts) > LIUM_CAP_MATCH_WATTS:
             continue
         targets.append(
-            _BelowFloorGpu(gpu_uuid=gpu_uuid, current_watts=state.current_watts, default_watts=state.default_watts)
+            _GpuToRaiseToDefault(gpu_uuid=gpu_uuid, current_watts=state.current_watts, default_watts=state.default_watts)
         )
     if targets:
         _log(
@@ -1247,7 +1247,7 @@ async def restore_filler_pod_gpu_power_limits(
     pod_id: str,
     log_extra: dict[str, object] | None = None,
     *,
-    executor_id: str = "",
+    executor_id: str,
     require_complete: bool = False,
 ) -> int:
     """Restore exactly the GPUs this filler pod capped (its pod index), then drop the index.
@@ -1407,23 +1407,23 @@ async def apply_filler_gpu_power_limits(
     target_uuids = [target.gpu_uuid for target in gpu_power_limits]
     cap_watts_by_uuid: dict[str, int] = planned.clamped_watts_by_uuid
     # Persist every restore record BEFORE lowering anything: never cap a GPU without a stored way back.
-    restored_watts_by_uuid: dict[str, int] = {}
+    watts_to_restore_by_uuid: dict[str, int] = {}
     for target in gpu_power_limits:
         pre_cap_watts = planned.state_by_uuid[target.gpu_uuid].current_watts
-        restored_watts = await _ensure_restore_record(
+        watts_to_restore = await _ensure_restore_record(
             redis, target.gpu_uuid, pre_cap_watts, pod_id, executor_id, log_extra
         )
-        if restored_watts is None:
+        if watts_to_restore is None:
             await _undo_partial_apply(ssh, redis, target_uuids, pod_id, log_extra)
             return GpuPowerCapResult.FAILED
-        restored_watts_by_uuid[target.gpu_uuid] = restored_watts
+        watts_to_restore_by_uuid[target.gpu_uuid] = watts_to_restore
     # A GPU whose restore writes back a limit within LIUM_CAP_MATCH_WATTS of the cap cannot be told from
     # Lium's cap afterwards, so no cap is kept for it and it is never raised. The comparison is with what
     # the restore writes back (a leftover record's watts, else the current limit), not with what the GPU
     # reads now, which after a failed restore can be an old cap. Every other GPU keeps its cap, including
     # one the cap raised (a host under the floor): left at the cap with its record lost, it goes to default.
     index_by_uuid: dict[str, int | None] = {
-        gpu_uuid: None if abs(cap - restored_watts_by_uuid[gpu_uuid]) <= LIUM_CAP_MATCH_WATTS else cap
+        gpu_uuid: None if abs(cap - watts_to_restore_by_uuid[gpu_uuid]) <= LIUM_CAP_MATCH_WATTS else cap
         for gpu_uuid, cap in cap_watts_by_uuid.items()
     }
     try:

@@ -123,7 +123,7 @@ async def test_strict_pod_restore_requires_every_record_to_be_restored(failure):
     if failure not in (None, "absent"):
         error_type = RuntimeError if failure in ("timeout", "nonzero", "partial") else GpuPowerRestoreStateError
         with pytest.raises(error_type) as caught:
-            await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, require_complete=True)
+            await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, executor_id=EXECUTOR_ID, require_complete=True)
         assert type(caught.value) is error_type
         # Assert: failed records and the index survive for a later retry.
         assert _pod_index_key(POD_ID) in redis.store
@@ -132,7 +132,7 @@ async def test_strict_pod_restore_requires_every_record_to_be_restored(failure):
             ssh.run.assert_not_awaited()
             assert redis.store == initial_records
     else:
-        assert await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, require_complete=True) == (0 if failure else 2)
+        assert await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, executor_id=EXECUTOR_ID, require_complete=True) == (0 if failure else 2)
         assert not redis.store
 
 
@@ -143,7 +143,7 @@ async def test_strict_pod_restore_accepts_a_record_already_restored():
     redis = FakeRedis({_pod_index_key(POD_ID): '["GPU-a", "GPU-b"]', _restore_key("GPU-b"): _record("GPU-b", 250)})
     ssh = fake_ssh(FakeRun(stdout="GPU-a, 400, 400, 100, 400\nGPU-b, 175, 250, 100, 250\n"), *_set_ok(250))
     # Act / Assert: GPU-a reads its default, so the create goes on; GPU-b is restored; nothing is left.
-    assert await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, require_complete=True) == 1
+    assert await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, executor_id=EXECUTOR_ID, require_complete=True) == 1
     assert not redis.store
 
 
@@ -155,10 +155,10 @@ async def test_strict_pod_restore_without_record_holds_the_floor(current_watts, 
     ssh = fake_ssh(FakeRun(stdout=f"GPU-a, {current_watts}, 1000, 100, 1000\n"))
     # Act / Assert: below the 80 % floor fails the create; a host's own 80-90 % setting does not.
     if accepted:
-        assert await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, require_complete=True) == 0
+        assert await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, executor_id=EXECUTOR_ID, require_complete=True) == 0
     else:
         with pytest.raises(GpuPowerRestoreStateError):
-            await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, require_complete=True)
+            await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, executor_id=EXECUTOR_ID, require_complete=True)
 
 
 @pytest.mark.asyncio
@@ -167,7 +167,7 @@ async def test_strict_pod_restore_with_an_unreadable_host_is_the_hosts_failure()
     redis = FakeRedis({_pod_index_key(POD_ID): '["GPU-a"]'})
     ssh = AsyncMock(run=AsyncMock(side_effect=TimeoutError()))
     with pytest.raises(RuntimeError) as caught:
-        await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, require_complete=True)
+        await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, executor_id=EXECUTOR_ID, require_complete=True)
     assert type(caught.value) is RuntimeError  # not GpuPowerRestoreStateError (platform state)
 
 
@@ -188,9 +188,9 @@ async def test_pod_index_delete_failure_after_successful_restore(require_complet
     # Act: strict customer checks fail, while existing best-effort cleanup still returns.
     if require_complete:
         with pytest.raises(GpuPowerRestoreStateError):
-            await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, require_complete=True)
+            await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, executor_id=EXECUTOR_ID, require_complete=True)
     else:
-        assert await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID) == 1
+        assert await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, executor_id=EXECUTOR_ID) == 1
     # Assert: the record was deleted after restoration; the index the delete could not clear stays (the
     # strict path retries it, the best-effort one logs it: with no records left it restores nothing).
     assert redis.store == {_pod_index_key(POD_ID): '["GPU-a"]'}
