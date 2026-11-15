@@ -217,10 +217,10 @@ class RentalEgressGuardCheck:
         last_run: dict[tuple, float] | None = None,
     ) -> None:
         self._interval = interval_seconds
-        # rented_only: the instance before TenantEnforcementCheck; the other runs when the pipeline ends, idle nodes only
+        # rented_only: the instance before TenantEnforcementCheck, rented nodes only; the other runs when the
+        # pipeline ends, whichever way, for every node: neither a running rental after a reboot nor the cleanup
+        # after the last legacy rental may wait behind a fatal check that ends every cycle early
         self._rented_only = rented_only
-        # the idle instance runs once the pipeline has ended, whichever way: the cleanup after the last legacy
-        # rental must not wait behind a fatal check (a node short of ports fails PortCountCheck every cycle)
         self.on_completion = not rented_only
         # shared by both instances so a node is guarded once per interval whichever one it reaches; keyed by
         # the miner and the endpoint too, since two miners can report one UUID for different hosts
@@ -236,7 +236,7 @@ class RentalEgressGuardCheck:
         executor_uuid = ctx.executor.uuid
         key = (ctx.miner_hotkey, executor_uuid, ctx.executor.address, ctx.executor.ssh_port)
         rental = rental_of_this_node(ctx)
-        if self._rented_only != bool(rental and rental.pods):
+        if self._rented_only and not (rental and rental.pods):
             return self._skip(ctx, "guarded at the other position")
         if task_seconds_left(ctx) < HELPER_TIMEOUT_SECONDS + BUDGET_MARGIN_SECONDS:
             return self._skip(ctx, "not enough task time left")

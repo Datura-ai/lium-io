@@ -199,16 +199,25 @@ def test_both_positions_share_one_cadence():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("rented", [True, False])
-async def test_each_position_guards_only_its_own_nodes(context_factory, monkeypatch, rented):
+async def test_the_rented_position_guards_only_rented_nodes_and_completion_guards_every_node(
+    context_factory, monkeypatch, rented
+):
     rental = SimpleNamespace(pods=[SimpleNamespace(docker_container_name="pod")]) if rented else None
     monkeypatch.setattr(rental_egress_guard, "rental_of_this_node", lambda ctx: rental)
     ssh = _ssh()
     ctx = context_factory(ssh=ssh)
 
-    other = await RentalEgressGuardCheck(rented_only=not rented).run(ctx)
-    assert _helper_calls(ssh) == [] and other.event.reason_code == "RENTAL_EGRESS_GUARD_SKIPPED"
-    own = await RentalEgressGuardCheck(rented_only=rented).run(ctx)
-    assert len(_helper_calls(ssh)) == 1 and own.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
+    last_run: dict = {}  # shared, as the factory's two instances share it
+    at_tenant_enforcement = await RentalEgressGuardCheck(rented_only=True, last_run=last_run).run(ctx)
+    assert len(_helper_calls(ssh)) == (1 if rented else 0)
+    assert at_tenant_enforcement.event.reason_code == (
+        "RENTAL_EGRESS_GUARD_APPLIED" if rented else "RENTAL_EGRESS_GUARD_SKIPPED"
+    )
+    at_completion = await RentalEgressGuardCheck(last_run=last_run).run(ctx)
+    assert len(_helper_calls(ssh)) == 1
+    assert at_completion.event.reason_code == (
+        "RENTAL_EGRESS_GUARD_SKIPPED" if rented else "RENTAL_EGRESS_GUARD_APPLIED"
+    )  # a rented node guarded at TenantEnforcementCheck is within the shared cadence at completion
 
 
 @pytest.mark.asyncio
@@ -266,19 +275,23 @@ async def test_a_stalled_inspect_is_cut_off_before_the_deadline_and_the_run_is_k
     assert guard._last_run == {}  # not a run: the next cycle tries again
 
 
-@pytest.mark.parametrize("exit_", ["passed", "fatal", "rented-halt"])
+@pytest.mark.parametrize("rented", [True, False])
+@pytest.mark.parametrize("exit_", ["passed", "fatal", "halt"])
 @pytest.mark.asyncio
-async def test_the_idle_guard_runs_when_the_pipeline_ends_however_it_ends(context_factory, monkeypatch, exit_):
-    """The last legacy rental's /32 rules come off even when a fatal check (a node short of ports fails
-    PortCountCheck every cycle) ends the run before the guard's place in the list; its event never becomes the
-    run's verdict. A rented halt leaves the node to the rented instance, which ran inside TenantEnforcementCheck."""
+async def test_the_guard_runs_once_per_cycle_however_the_pipeline_ends(context_factory, monkeypatch, rented, exit_):
+    """A fatal check that ends every cycle early (a node short of ports, a GPU count without its details) must not
+    leave a rebooted rented node unguarded or keep the last legacy rental's rules: completion guards every node.
+    A rented halt has guarded it inside TenantEnforcementCheck, so completion is within the shared cadence. The
+    guard's event never becomes the run's, so the verdict is the run's own."""
     from unittest.mock import AsyncMock
 
     from services.task.pipeline import CheckResult, Pipeline
 
-    rental = SimpleNamespace(pods=[SimpleNamespace(docker_container_name="pod")]) if exit_ == "rented-halt" else None
+    rental = SimpleNamespace(pods=[SimpleNamespace(docker_container_name="pod")]) if rented else None
     monkeypatch.setattr(rental_egress_guard, "rental_of_this_node", lambda ctx: rental)
-    ssh = _ssh(network="", inspect_rc=1)  # no rental network, no legacy rental left: the stale rules come off
+    ssh = _ssh()
+    last_run: dict = {}
+    rented_guard = RentalEgressGuardCheck(rented_only=True, last_run=last_run)
     ran = []
 
     class _Step:
@@ -287,9 +300,11 @@ async def test_the_idle_guard_runs_when_the_pipeline_ends_however_it_ends(contex
 
         async def run(self, ctx):
             ran.append(self.check_id)
+            if self.check_id == "step" and exit_ == "halt":
+                await rented_guard.run(ctx)  # TenantEnforcementCheck's own guard call before its halt
             return CheckResult(
                 passed=exit_ != "fatal" or self.check_id != "step",
-                halt=exit_ == "rented-halt" and self.check_id == "step",
+                halt=exit_ == "halt" and self.check_id == "step",
                 event=rental_egress_guard.render_message(
                     rental_egress_guard.Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what={}
                 ),
@@ -299,16 +314,50 @@ async def test_the_idle_guard_runs_when_the_pipeline_ends_however_it_ends(contex
         check_id = "scored"
 
     sink = AsyncMock()
-    _, events, _ = await Pipeline([_Step(), RentalEgressGuardCheck(), _Scored()], sink).run(context_factory(ssh=ssh))
+    completion = RentalEgressGuardCheck(last_run=last_run)
+    ok, events, _ = await Pipeline([_Step(), completion, _Scored()], sink).run(context_factory(ssh=ssh))
 
+    assert ok is (exit_ != "fatal")
     assert ran == (["step", "scored"] if exit_ == "passed" else ["step"])
-    assert RentalEgressGuardCheck.check_id not in [event.check_id for event in events]
+    assert [event.check_id for event in events] == ran
     assert sink.emit.await_args_list[-1].args[0].check_id == RentalEgressGuardCheck.check_id
-    if exit_ == "rented-halt":
-        assert _helper_calls(ssh) == []
-    else:
-        [cleanup] = _helper_calls(ssh)
-        assert cleanup.endswith(shlex.quote(helper_command(link_local_cleanup_script())))
+    [helper] = _helper_calls(ssh)
+    assert helper.endswith(shlex.quote(helper_command(link_local_drop_script("br-0123456789ab", []))))
+    assert len(last_run) == 1
+
+
+@pytest.mark.parametrize("rented", [True, False])
+@pytest.mark.asyncio
+async def test_no_completion_step_touches_a_host_refused_as_another_accounts(context_factory, monkeypatch, rented):
+    """A hostname pointed at another provider's machine is refused by NodeAccountCheck; that machine may still accept
+    the validator's key, so the guard's NET_ADMIN helper must never run there."""
+    from unittest.mock import AsyncMock
+
+    from services.task.messages import NodeAccountMessages
+    from services.task.pipeline import CheckResult, Pipeline
+
+    rental = SimpleNamespace(pods=[SimpleNamespace(docker_container_name="pod")]) if rented else None
+    monkeypatch.setattr(rental_egress_guard, "rental_of_this_node", lambda ctx: rental)
+    ssh = _ssh()
+
+    class _NodeAccount:
+        check_id = "node.account"
+        fatal = True
+
+        async def run(self, ctx):
+            return CheckResult(
+                passed=False,
+                event=rental_egress_guard.render_message(
+                    NodeAccountMessages.MISMATCH, ctx=ctx, check_id=self.check_id, what={}
+                ),
+            )
+
+    sink = AsyncMock()
+    ok, events, _ = await Pipeline([_NodeAccount(), RentalEgressGuardCheck()], sink).run(context_factory(ssh=ssh))
+
+    assert ok is False and events[-1].reason_code == "NODE_ACCOUNT_MISMATCH"
+    assert ssh.calls == []
+    assert RentalEgressGuardCheck.check_id not in [call.args[0].check_id for call in sink.emit.await_args_list]
 
 
 @pytest.mark.asyncio

@@ -27,7 +27,7 @@ from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import PodContainerState
 from .availability import REASONS_THAT_HIDE_AT_ONCE
-from .messages import RentalVerificationMessages, TenantEnforcementMessages, render_message
+from .messages import NodeAccountMessages, RentalVerificationMessages, TenantEnforcementMessages, render_message
 from .models import ValidationEvent
 from .runner import SSHCommandResult, SSHCommandRunner
 
@@ -825,6 +825,8 @@ class Pipeline:
 
     async def run(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
         passed, events, end_ctx = await self._run_checks(ctx)
+        if any(event.reason_code == NodeAccountMessages.MISMATCH.reason for event in events):
+            return passed, events, end_ctx  # another account's machine answered: no completion step touches it
         for chk in self.on_completion:
             try:
                 res = await chk.run(end_ctx)
