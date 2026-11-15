@@ -1,7 +1,10 @@
 import ast
 import json
+import multiprocessing
+import os
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from unittest.mock import patch
@@ -462,7 +465,7 @@ def test_a_verdict_already_queued_is_read_after_the_deadline():
             return True
 
     fault = {"index": 1, "status": "fault", "error": "wrong data"}
-    workers = [(0, Process(), Pipe([])), (1, Process(), Pipe([{"phase": "copy"}, fault]))]
+    workers = [(0, Process(), Pipe([])), (1, Process(), Pipe([{"phase": "copy", "at": 0.0}, fault]))]
 
     reports = namespace["drain_workers"](workers, setup_deadline=0.0)
 
@@ -472,10 +475,6 @@ def test_a_verdict_already_queued_is_read_after_the_deadline():
 
 def _forked_probe(fake_probe_device, setup_budget: float, copy_budget: float) -> tuple[list, float]:
     """The probe's own worker and drain, forked for real, around a fake probe_device (no GPU on CI)."""
-    import multiprocessing
-    import os
-    import time
-
     probe = _load_probe_symbols("_worker", "_quiet_child", "drain_workers", "_reap", "CopyFault", "ProbeError")
     probe.update(os=os, time=time, COPY_BUDGET_SECONDS=copy_budget, probe_device=fake_probe_device)
     mp = multiprocessing.get_context("fork")
@@ -494,8 +493,6 @@ def _forked_probe(fake_probe_device, setup_budget: float, copy_budget: float) ->
 def test_slow_setup_and_teardown_around_a_fast_copy_pass():
     # DAH-6451: an 8-GPU TDX guest spends ~16 s in cuInit and ~8 s in cuCtxDestroy, one GPU at a time; the copy
     # itself takes milliseconds. Setup longer than the copy budget and a teardown that never ends still pass.
-    import time
-
     def slow_setup_and_teardown(index, size_mb, on_phase, on_verdict):
         time.sleep(1.5 + index)  # beyond the copy budget, each card later than the last
         on_phase("copy")
@@ -509,8 +506,6 @@ def test_slow_setup_and_teardown_around_a_fast_copy_pass():
 
 
 def test_a_copy_that_never_ends_is_a_fault():
-    import time
-
     def hung_copy(index, size_mb, on_phase, on_verdict):
         on_phase("copy")
         time.sleep(600)
@@ -519,3 +514,18 @@ def test_a_copy_that_never_ends_is_a_fault():
 
     assert [(r["status"], r["error"]) for r in reports] == [("fault", "worker hung during copy")] * 2
     assert elapsed < 8  # each card's deadline runs from its own copy start, not from the setup budget
+
+
+def test_a_copy_starting_after_the_setup_deadline_gets_no_fresh_budget():
+    # a copy starting late is timed from the setup deadline, so hung copies cannot chain past the SSH cap
+    def late_hung_copy(index, size_mb, on_phase, on_verdict):
+        time.sleep(0.1 if index == 0 else 3.0)  # card 1 starts its copy after the 0.5 s setup budget
+        on_phase("copy")
+        time.sleep(600)
+
+    reports, elapsed = _forked_probe(late_hung_copy, setup_budget=0.5, copy_budget=3.0)
+
+    assert [(r["status"], r["error"]) for r in reports] == [("fault", "worker hung during copy")] * 2
+    # card 0 ends at 3.1 s and takes ~1 s to reap; card 1's copy is already past 0.5 + 3.0 s, so only its ~1 s reap
+    # remains (~5.1 s). Timed from its own start it would run to 6.0 s, then the reap (~7 s).
+    assert elapsed < 6.0

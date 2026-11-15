@@ -215,7 +215,7 @@ def _quiet_child() -> None:
 def _worker(index: int, size_mb: int, conn) -> None:
     _quiet_child()
 
-    sent = []
+    verdict_sent = False
 
     def on_phase(phase: str) -> None:
         # the parent classifies a worker that never answers by the phase it reached: setup -> error, copy -> fault.
@@ -223,8 +223,9 @@ def _worker(index: int, size_mb: int, conn) -> None:
         conn.send({"phase": phase, "at": time.monotonic()})
 
     def on_verdict(report: dict) -> None:
+        nonlocal verdict_sent
         conn.send({**report, "status": "ok"})
-        sent.append(True)
+        verdict_sent = True
 
     try:
         report = {**probe_device(index, size_mb, on_phase, on_verdict), "status": "ok"}
@@ -235,7 +236,7 @@ def _worker(index: int, size_mb: int, conn) -> None:
     except Exception as exc:  # noqa: BLE001 - the parent must always get a verdict
         report = {"index": index, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
     # a teardown failure after the verdict changes nothing: the copy already passed
-    if not sent:
+    if not verdict_sent:
         conn.send(report)
     conn.close()
 
@@ -288,7 +289,8 @@ def _device_count(mp) -> int:
 
 def drain_workers(workers: list, setup_deadline: float) -> list[dict]:
     """Collect one verdict per worker: setup has until the shared `setup_deadline`, then each copy has
-    COPY_BUDGET_SECONDS from its own start (time.monotonic). A worker that dies or hangs in the copy is a fault;
+    COPY_BUDGET_SECONDS from its own start (time.monotonic), or from `setup_deadline` if it started later, so all
+    copies end by setup_deadline + COPY_BUDGET_SECONDS. A worker that dies or hangs in the copy is a fault;
     one that never got past setup is an error."""
     reports = []
     for index, process, conn in workers:
@@ -307,7 +309,7 @@ def drain_workers(workers: list, setup_deadline: float) -> list[dict]:
             if "phase" in message:
                 phase = message["phase"]
                 if phase == "copy":
-                    deadline = message.get("at", time.monotonic()) + COPY_BUDGET_SECONDS
+                    deadline = min(message["at"], setup_deadline) + COPY_BUDGET_SECONDS
             else:
                 report = message
         if report is None:
