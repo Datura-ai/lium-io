@@ -438,7 +438,7 @@ def test_mismatches_counts_chunks_and_finds_the_first_wrong_byte():
 
 def test_a_verdict_already_queued_is_read_after_the_deadline():
     # one card hung in setup used the whole budget; the next card's fault is in its pipe and must not become "error"
-    namespace: dict = {"time": __import__("time")}
+    namespace: dict = {"time": __import__("time"), "COPY_BUDGET_SECONDS": 10.0}
     kept = [
         node
         for node in ast.parse(PROBE_SOURCE).body
@@ -464,7 +464,58 @@ def test_a_verdict_already_queued_is_read_after_the_deadline():
     fault = {"index": 1, "status": "fault", "error": "wrong data"}
     workers = [(0, Process(), Pipe([])), (1, Process(), Pipe([{"phase": "copy"}, fault]))]
 
-    reports = namespace["drain_workers"](workers, deadline=0.0)
+    reports = namespace["drain_workers"](workers, setup_deadline=0.0)
 
     assert reports[0]["status"] == "error"
     assert reports[1] == fault
+
+
+def _forked_probe(fake_probe_device, setup_budget: float, copy_budget: float) -> tuple[list, float]:
+    """The probe's own worker and drain, forked for real, around a fake probe_device (no GPU on CI)."""
+    import multiprocessing
+    import os
+    import time
+
+    probe = _load_probe_symbols("_worker", "_quiet_child", "drain_workers", "_reap", "CopyFault", "ProbeError")
+    probe.update(os=os, time=time, COPY_BUDGET_SECONDS=copy_budget, probe_device=fake_probe_device)
+    mp = multiprocessing.get_context("fork")
+    workers = []
+    for index in range(2):
+        parent_conn, child_conn = mp.Pipe(duplex=False)
+        process = mp.Process(target=probe["_worker"], args=(index, 64, child_conn))
+        process.start()
+        child_conn.close()
+        workers.append((index, process, parent_conn))
+    started = time.monotonic()
+    reports = probe["drain_workers"](workers, started + setup_budget)
+    return reports, time.monotonic() - started
+
+
+def test_slow_setup_and_teardown_around_a_fast_copy_pass():
+    # DAH-6451: an 8-GPU TDX guest spends ~16 s in cuInit and ~8 s in cuCtxDestroy, one GPU at a time; the copy
+    # itself takes milliseconds. Setup longer than the copy budget and a teardown that never ends still pass.
+    import time
+
+    def slow_setup_and_teardown(index, size_mb, on_phase, on_verdict):
+        time.sleep(1.5 + index)  # beyond the copy budget, each card later than the last
+        on_phase("copy")
+        on_verdict({"index": index, "copy_ms": 30.0})
+        time.sleep(600)  # teardown: the verdict is already sent, nobody waits for it
+
+    reports, elapsed = _forked_probe(slow_setup_and_teardown, setup_budget=10.0, copy_budget=1.0)
+
+    assert [r["status"] for r in reports] == ["ok", "ok"]
+    assert elapsed < 8
+
+
+def test_a_copy_that_never_ends_is_a_fault():
+    import time
+
+    def hung_copy(index, size_mb, on_phase, on_verdict):
+        on_phase("copy")
+        time.sleep(600)
+
+    reports, elapsed = _forked_probe(hung_copy, setup_budget=10.0, copy_budget=0.5)
+
+    assert [(r["status"], r["error"]) for r in reports] == [("fault", "worker hung during copy")] * 2
+    assert elapsed < 8  # each card's deadline runs from its own copy start, not from the setup budget
