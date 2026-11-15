@@ -15,7 +15,7 @@ OWN_NS = os.stat("/proc/self/ns/pid").st_ino
 OTHER_NS = OWN_NS + 1
 
 
-def _read(containers: dict[str, tuple[list[int | tuple[int, int]] | None, object]]):
+def _read(containers: dict[str, tuple[list[int | tuple[int, int]] | None, object]], no_pidns=(), notes=None):
     def docker_api_get(path):
         if path == "/containers/json":
             return [{"Id": container_id} for container_id in containers]
@@ -23,6 +23,10 @@ def _read(containers: dict[str, tuple[list[int | tuple[int, int]] | None, object
         pids, inspection = containers[container_id]
         if "/top" in path and pids is None:
             raise RuntimeError(f"docker api {path} returned HTTP 409")
+        if "/top" in path and "pidns" not in path:
+            return {"Titles": ["PID"], "Processes": [[str(pid if isinstance(pid, int) else pid[0])] for pid in pids]}
+        if "/top" in path and container_id in no_pidns:
+            raise RuntimeError(f"docker api {path} returned HTTP 500")  # host ps has no pidns column
         if "/top" in path:
             # a bare pid is in this process's own pid namespace; (pid, ns) names another one
             rows = [pid if isinstance(pid, tuple) else (pid, OWN_NS) for pid in pids]
@@ -31,7 +35,7 @@ def _read(containers: dict[str, tuple[list[int | tuple[int, int]] | None, object
 
     ns = build_scrape_namespace(SRC / "miner_jobs" / "machine_scrape.py", {"get_executor_pid_mode"}, {"os": os})
     ns["docker_api_get"] = docker_api_get
-    return ns["get_executor_pid_mode"]()
+    return ns["get_executor_pid_mode"](notes)
 
 
 def _mode(pid_mode: object) -> dict[str, object]:
@@ -56,6 +60,13 @@ def test_no_container_listing_the_scrape_s_pid_is_a_private_pid_namespace():
 def test_the_same_pid_in_another_pid_namespace_is_not_the_scrape():
     # a private-namespace pid can equal a host pid in another pid-host container (review 4579148174)
     assert _read({"monitor": ([(OWN, OTHER_NS)], _mode("host")), "executor": ([812], _mode(""))}) == ""
+
+
+def test_a_host_ps_without_pidns_falls_back_to_the_pid_only_match_and_notes_it():
+    # old procps: docker top with pidns fails; the executor must still be found, not read as private
+    notes = []
+    assert _read({"executor": ([812, OWN], _mode("host"))}, no_pidns={"executor"}, notes=notes) == "host"
+    assert notes == ["pidns not listed for executor; matched by pid only"]
 
 
 def test_a_container_whose_top_fails_is_skipped_not_turned_into_unknown():
