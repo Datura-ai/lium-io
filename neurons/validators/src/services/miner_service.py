@@ -39,6 +39,7 @@ from payload_models.payloads import (
     ContainerBaseRequest,
     ContainerCreateRequest,
     ContainerDeleteRequest,
+    ContainerStartRequest,
     ContainerStopRequest,
     AddSshPublicKeyRequest,
     RemoveSshPublicKeysRequest,
@@ -2575,6 +2576,8 @@ class MinerService:
                 elif isinstance(payload, ContainerStopRequest):
                     # DAH-5510: the platform stops a moved pod's old container on the node it left
                     result = await docker_service.stop_container(payload, executor, my_key, private_key.decode("utf-8"))
+                elif isinstance(payload, ContainerStartRequest):
+                    result = await docker_service.start_container(payload, executor, my_key, private_key.decode("utf-8"))
                 elif isinstance(payload, AddSshPublicKeyRequest):
                     logger.info(
                         _m(
@@ -2722,7 +2725,7 @@ class MinerService:
                     pod_id=payload.pod_id,
                     executor_id=payload.executor_id,
                     container_name=payload.container_name,
-                    msg=log_text.to_full_string(),
+                    msg=str(log_text),
                 )
 
             msg = _parse_miner_response(response_data)
@@ -2754,7 +2757,7 @@ class MinerService:
                     pod_id=payload.pod_id,
                     executor_id=payload.executor_id,
                     container_name=payload.container_name,
-                    msg=log_text.to_full_string(),
+                    msg=str(log_text),
                 )
 
             else:
@@ -2769,7 +2772,7 @@ class MinerService:
                     pod_id=payload.pod_id,
                     executor_id=payload.executor_id,
                     container_name=payload.container_name,
-                    msg=log_text.to_full_string(),
+                    msg=str(log_text),
                 )
 
         except Exception as e:
@@ -2783,7 +2786,7 @@ class MinerService:
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 container_name=payload.container_name,
-                msg=log_text.to_full_string(),
+                msg=str(log_text),
             )
 
     async def _add_debug_ssh_key(self, payload: AddDebugSshKeyRequest) -> DebugSshKeyAdded:
@@ -2840,7 +2843,7 @@ class MinerService:
                 return FailedAddDebugSshKey(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
-                    msg=log_text.to_full_string(),
+                    msg=str(log_text),
                 )
 
             msg = _parse_miner_response(response_data)
@@ -2880,7 +2883,7 @@ class MinerService:
                     return FailedAddDebugSshKey(
                         miner_hotkey=payload.miner_hotkey,
                         executor_id=payload.executor_id,
-                        msg=log_text.to_full_string(),
+                        msg=str(log_text),
                     )
 
                 logger.info(
@@ -2909,7 +2912,7 @@ class MinerService:
                 return FailedAddDebugSshKey(
                     miner_hotkey=payload.miner_hotkey,
                     executor_id=payload.executor_id,
-                    msg=log_text.to_full_string(),
+                    msg=str(log_text),
                 )
 
         except Exception as e:
@@ -2922,7 +2925,7 @@ class MinerService:
             return FailedAddDebugSshKey(
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
-                msg=log_text.to_full_string(),
+                msg=str(log_text),
             )
 
 MinerServiceDep = Annotated[MinerService, Depends(MinerService)]

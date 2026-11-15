@@ -443,3 +443,37 @@ def test_a_failed_stop_request_is_reported_as_a_stop_failure(miner_service):
 
     assert isinstance(result, FailedContainerRequest)
     assert result.error_type == FailedContainerErrorTypes.ContainerStopFailed
+
+
+@pytest.mark.asyncio
+async def test_a_container_start_request_reaches_start_container(mocker, miner_service):
+    from payload_models.payloads import ContainerStartRequest
+
+    executor_id = str(uuid4())
+    _wire_common_mocks(mocker, miner_service, executor_id)
+    start_mock = mocker.patch("services.miner_service.DockerService.start_container", AsyncMock(return_value=Mock()))
+    payload = ContainerStartRequest(
+        miner_hotkey="5TestMiner", executor_id=executor_id, miner_address="10.0.0.1", miner_port=8000,
+        pod_id=str(uuid4()), container_name="pod_x", local_volume_path="/root",
+    )
+
+    await miner_service._handle_container(payload)
+
+    start_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_pod_logs_failure_message_carries_no_miner_address(mocker, miner_service):
+    from payload_models.payloads import FailedGetPodLogs, GetPodLogsRequestFromServer
+
+    _wire_common_mocks(mocker, miner_service, "executor")
+    miner_service._make_rest_request.return_value = (500, None)
+    payload = GetPodLogsRequestFromServer(
+        miner_hotkey="5TestMiner", executor_id="executor", miner_address="192.0.2.7", miner_port=8123,
+        pod_id="pod", container_name="pod_x",
+    )
+
+    result = await miner_service._get_pod_logs(payload)
+
+    assert isinstance(result, FailedGetPodLogs)
+    assert "192.0.2.7" not in result.msg and "8123" not in result.msg

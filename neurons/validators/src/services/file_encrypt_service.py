@@ -496,7 +496,9 @@ class FileEncryptService:
 
         # run obfuscator.py to generate obfuscated_machine_scrape.py
         command = [sys.executable, obfuscator_machine_scrape_file_path, machine_scrape_file_path]
-        subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)  # noqa
+        # a failed run must not leave the previous build's output to be read below
+        Path(obfuscated_machine_scrape_file_path).unlink(missing_ok=True)
+        subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)  # noqa
 
         with open(obfuscated_machine_scrape_file_path) as file:
             obfuscated_content = file.read()
