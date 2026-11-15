@@ -345,7 +345,7 @@ class ResticStorageRunner:
             and getattr(self._workspace, "image", None)
             and _dns_lookup_failed(result.stderr or result.stdout)
         ):
-            # The executor's compose-network DNS (127.0.0.11) can fail while the default bridge resolves fine, so
+            # The executor's compose-network DNS (Docker's embedded resolver) can fail while the default bridge resolves fine, so
             # repository commands retry in a default-bridge helper. Encrypted backups and restores themselves use the
             # rental's own network (DAH-6447).
             print("Repository DNS lookup failed in the executor; using a helper container", file=sys.stderr, flush=True)
