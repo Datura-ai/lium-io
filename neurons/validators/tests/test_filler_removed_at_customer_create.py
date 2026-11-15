@@ -41,7 +41,7 @@ from services.docker_service import (
 def svc():
     # local fixtures rather than imports, which pyflakes reads as names every parameter below
     # redefines (F811); same services test_deploy_optimizations / test_docker_service build
-    return DockerService(ssh_service=Mock(), redis_service=Mock(get=AsyncMock(return_value=None)), attestation_service=Mock())
+    return DockerService(ssh_service=Mock(), redis_service=Mock(get=AsyncMock(return_value=None), mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True)), attestation_service=Mock())
 
 
 @pytest.fixture
@@ -438,7 +438,8 @@ async def test_failed_late_filler_power_restore_fails_and_cleans_customer(svc, m
     result = await _run(svc, _payload(workload_kind=WorkloadKind.CUSTOMER_RENTAL))
     # Assert: use the cleanup failure and remove the customer's own container.
     assert isinstance(result, FailedContainerRequest)
-    assert result.failure_step == ("gpu_power_restore_state" if platform_state_failure else "container_cleanup")
+    # a host nvidia-smi failure is the node's step, not container_cleanup (excused while a filler run is known)
+    assert result.failure_step == ("gpu_power_restore_state" if platform_state_failure else "gpu_power_restore")
     assert restore.await_args.kwargs["require_complete"] is True
     assert f"/usr/bin/docker rm -fv {_CUSTOMER_CONTAINER_ID} 2>/dev/null || true" in _commands(ssh_client)
 
@@ -660,3 +661,29 @@ async def test_the_running_check_leaves_a_killed_exiting_filler_to_dockerd(svc, 
 
     assert isinstance(result, ContainerCreated)
     assert not [cmd for cmd in _commands(ssh_client) if _FILLER_ID in cmd and "docker rm" in cmd]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_rm_logs_dockerds_reason_before_retrying(
+    docker_service, retry_ssh_mock, caplog
+):
+    """9 and 12 Nov: a create cut by a validator rollout left a container whose `docker rm -fv`
+    exited 1 and whose retry ran past the cleanup bound; nothing logged why dockerd refused."""
+    refusal = "Error response from daemon: removal of container pod_target is in progress"
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(
+        side_effect=[
+            _listing("pod_target\n"),
+            _removal("pod_target", rm_exit=1, stderr=refusal),
+            _listing(""),
+        ]
+    )
+
+    with caplog.at_level(logging.INFO):
+        await _clean_for_customer(docker_service, ssh_client)
+
+    assert retry_ssh_mock.await_count >= 1
+    [retrying] = [
+        r for r in caplog.records if "retrying those" in str(getattr(r.msg, "message", r.msg))
+    ]
+    assert retrying.msg.extra["rm_stderr"] == refusal

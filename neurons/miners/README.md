@@ -83,6 +83,16 @@ Fill in your information for:
 cd neurons/miners && docker compose up -d
 ```
 
+#### Updates
+
+The miner updates itself. The stack runs `miner-runner` and `watchtower`. Every 60 seconds `watchtower` checks for a new runner image and recreates the runner, and the runner pulls the current miner image and recreates the miner. A stack started from an older compose file may still run `containrrr/watchtower`, which stops on Docker Engine 29 and later; the runner replaces it with the `nickfedor/watchtower` release that `docker-compose.yml` pins by digest when it starts.
+
+A miner run without this stack (from source or from your own compose file) does not update itself. If yours is behind, run this once in the checkout:
+
+```
+cd neurons/miners && git pull && docker compose pull && docker compose up -d
+```
+
 ## Managing Ethereum Address
 
 ### Associating Your Ethereum Address into Subnet
@@ -161,7 +171,7 @@ Executors are machines running on GPUs that you can add to your central miner. T
     **Optional parameters:**
     - `<validator-hotkey>`: The validator hotkey that you want to give access to this executor. If not provided, our validator_hotkey will be used as default.
 
-    **Tier:** a node added with this command starts on the **Spot** tier; the command has no tier option. A node you deleted in the Provider Portal and add again at the same IP and port within 7 days keeps its earlier tier. To move it to **Secure**, open the node's page in the Provider Portal and click **Change Tier** once the node has been listed for 7 days.
+    **Tier:** a node added with this command starts on the **Spot** tier; the command has no tier option. A node you deleted in the Provider Portal and add again at the same IP and port within 7 days keeps its earlier tier. To move it to **Secure**, open the node's page in the Provider Portal and click **Change Tier**; a node can change tier once every 24 hours.
 
 ### List Executors
 

@@ -138,6 +138,8 @@ class BootstrapHarness:
         self.nvidia_lib_dir = tmp_path / "lib"
         self.nvidia_lib_dir.mkdir()
         self.vulkan_icd_dir = tmp_path / "icd.d"
+        self.apt_etc = tmp_path / "apt"
+        (self.apt_etc / "sources.list.d").mkdir(parents=True)
 
         for name, body in (
             ("pgrep", PGREP_SHIM),
@@ -195,6 +197,7 @@ class BootstrapHarness:
             "LIUM_SSH_LOCK_TIMEOUT_SECS": "1",
             "LIUM_NVIDIA_LIB_DIRS": str(self.nvidia_lib_dir),
             "LIUM_VULKAN_ICD_DIR": str(self.vulkan_icd_dir),
+            "LIUM_APT_ETC": str(self.apt_etc),
         }
         return subprocess.run(
             ["sh", str(SCRIPT), *args],
@@ -416,3 +419,253 @@ def test_vulkan_icd_only_registers_the_driver_and_leaves_sshd_alone(harness):
     assert result.returncode == 0, result.stdout + result.stderr
     assert (harness.vulkan_icd_dir / "nvidia_egl_icd.json").exists()
     assert harness.sshd_start_attempts() == []
+
+
+# DAH-6029: records the narrowed sources apt-get was pointed at (the temp dir is gone afterwards)
+APT_GET_CAPTURES_SOURCES = """#!/bin/sh
+for a in "$@"; do
+    case "$a" in
+        Dir::Etc::SourceList=*) cat "${a#*=}" >> "$SHIM_STATE/main_list" ;;
+        Dir::Etc::SourceParts=*) cat "${a#*=}"/* >> "$SHIM_STATE/main_parts" 2>/dev/null ;;
+    esac
+done
+""" + APT_GET_SHIM.split("\n", 1)[1]
+
+UBUNTU_SOURCES = """Types: deb
+URIs: http://archive.ubuntu.com/ubuntu/
+Suites: noble noble-updates noble-backports
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb-src
+URIs: http://archive.ubuntu.com/ubuntu/
+Suites: noble
+Components: main
+"""
+
+
+@pytest.mark.parametrize("awk", ["mawk", "gawk"])
+@pytest.mark.parametrize(
+    "sources",
+    [
+        UBUNTU_SOURCES,
+        # deb822 multi-line values: the continuation lines belong to the field above
+        UBUNTU_SOURCES.replace("Types: deb\n", "Types: deb\n deb-src\n", 1).replace(
+            "Components: main restricted universe multiverse", "Components: main\n restricted universe multiverse"
+        ),
+        UBUNTU_SOURCES.replace("Components: main restricted universe multiverse", "Components: restricted\n main universe"),
+        # field names are case-insensitive
+        UBUNTU_SOURCES.replace("Types: deb\n", "types: deb\n", 1).replace(
+            "Components: main restricted universe multiverse", "COMPONENTS: main restricted universe multiverse"
+        ),
+        # a comment line inside a multi-line value does not end it
+        UBUNTU_SOURCES.replace("Types: deb\n", "Types: deb\n# sources too\n deb-src\n", 1).replace(
+            "Components: main restricted universe multiverse", "Components: main\n# the rest\n restricted universe multiverse"
+        ),
+    ],
+)
+def test_sshd_install_reads_only_the_main_package_lists(harness, awk, sources):
+    if not any(Path(d, awk).exists() for d in os.environ["PATH"].split(":")):
+        pytest.skip(f"{awk} not installed")
+    os.symlink(next(Path(d, awk) for d in os.environ["PATH"].split(":") if Path(d, awk).exists()), harness.shims / "awk")
+    harness.stage_sshd_payload(SSHD_STARTS)
+    harness._write_executable(harness.shims / "apt-get", APT_GET_CAPTURES_SOURCES)
+    (harness.apt_etc / "sources.list").write_text(
+        "# comment main\n"
+        "deb http://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware\n"
+        "deb-src http://http.kali.org/kali kali-rolling main\n"
+    )
+    (harness.apt_etc / "sources.list.d" / "cuda.list").write_text(
+        "deb [signed-by=/usr/share/keyrings/cuda.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/ /\n"
+    )
+    (harness.apt_etc / "sources.list.d" / "ubuntu.sources").write_text(sources)
+
+    result = harness.run("--grace", "0")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = harness.apt_calls()
+    assert len(calls) == 2 and calls[0].startswith("update -o Dir::Etc::SourceList=")
+    # update and install both read the narrowed lists: kali main only, no CUDA, no deb-src
+    assert (harness.state / "main_list").read_text() == "deb http://http.kali.org/kali kali-rolling main\n" * 2
+    parts = (harness.state / "main_parts").read_text()
+    assert parts.count("Components: main\n") == 2 and "universe" not in parts and "deb-src" not in parts
+    assert "restricted" not in parts and parts.count("Types: deb\n") == 2
+    assert "Suites: noble noble-updates noble-backports" in parts and "Signed-By:" in parts
+    assert harness.sshd_start_attempts() == ["started"]
+
+
+def test_failed_main_only_install_falls_back_to_all_sources(harness):
+    harness.stage_sshd_payload(SSHD_STARTS)
+    (harness.apt_etc / "sources.list").write_text("deb http://deb.debian.org/debian trixie main\n")
+    harness._write_executable(
+        harness.shims / "apt-get",
+        APT_GET_SHIM.replace("case", 'case "$*" in install*SourceList*) exit 100 ;; esac\ncase', 1),
+    )
+
+    result = harness.run("--grace", "0")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = harness.apt_calls()
+    assert "SourceList" in calls[1] and calls[2:] == [
+        "update",
+        "install -y --no-install-recommends openssh-server ncurses-term xauth python3 wget ca-certificates",
+    ]
+    assert "retrying with all of the image's apt sources" in result.stdout
+
+
+def test_waits_out_the_images_apt_lock_on_the_main_only_install(harness):
+    harness.stage_sshd_payload(SSHD_STARTS)
+    (harness.apt_etc / "sources.list").write_text("deb http://deb.debian.org/debian trixie main\n")
+    # the image's own apt-get holds the lists lock for the first two updates
+    lock_twice = (
+        'case "$*" in update*) n=$(cat "$SHIM_STATE/locked" 2>/dev/null || echo 0); '
+        'if [ "$n" -lt 2 ]; then echo $((n + 1)) > "$SHIM_STATE/locked"; '
+        'echo "E: Could not get lock /var/lib/apt/lists/lock. It is held by process 98 (apt-get)" >&2; exit 100; fi ;; esac\ncase'
+    )
+    harness._write_executable(harness.shims / "apt-get", APT_GET_SHIM.replace("case", lock_twice, 1))
+
+    result = harness.run("--grace", "0")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = harness.apt_calls()
+    assert len(calls) == 4 and all("SourceList" in c for c in calls), calls  # 3 updates, 1 install: main only
+    assert "retrying with all of the image's apt sources" not in result.stdout
+
+
+def test_a_non_lock_apt_failure_is_not_retried(harness):
+    harness.stage_sshd_payload(SSHD_STARTS)
+    (harness.apt_etc / "sources.list").write_text("deb http://deb.debian.org/debian trixie main\n")
+    fail = 'case "$*" in update*SourceList*) echo "E: Some index files failed to download" >&2; exit 100 ;; esac\ncase'
+    harness._write_executable(harness.shims / "apt-get", APT_GET_SHIM.replace("case", fail, 1))
+
+    result = harness.run("--grace", "0")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert [c for c in harness.apt_calls() if "SourceList" in c] and len(harness.apt_calls()) == 3
+
+
+@pytest.mark.parametrize(
+    "failed, falls_back",
+    [
+        ([("E", "noble-backports")], False),
+        ([("E", "noble-updates")], False),  # Ubuntu mirror mid-sync: noble + noble-security still carry openssh's fixes
+        ([("E", "noble-updates"), ("W", "noble-backports")], False),
+        ([("E", "noble-security")], True),  # the security pocket is the one that must arrive
+        ([("E", "noble-updates"), ("W", "noble-security")], True),  # an unreachable security InRelease counts too
+        ([("E", "noble")], True),
+        # a fatal repository error suppresses the later fetch summaries (the unreachable -security one)
+        ([("E", "trixie-updates"), ("RAW", "E: The repository http://deb.debian.org/debian trixie-updates InRelease is not signed.")], True),
+    ],
+)
+def test_a_failed_list_fetch_installs_from_the_lists_that_arrived(harness, failed, falls_back):
+    harness.stage_sshd_payload(SSHD_STARTS)
+    (harness.apt_etc / "sources.list").write_text("deb http://archive.ubuntu.com/ubuntu noble main\n")
+    errs = "".join(
+        f"E: Failed to fetch http://archive.ubuntu.com/ubuntu/dists/{s}/main/binary-amd64/Packages.gz"
+        "  File has unexpected size (1 != 2). Mirror sync in progress?\n"
+        if level == "E"
+        else f"{s}\n"
+        if level == "RAW"
+        else f"W: Failed to fetch http://archive.ubuntu.com/ubuntu/dists/{s}/InRelease  Temporary failure resolving x\n"
+        for level, s in failed
+    )
+    fail = f"case \"$*\" in update*SourceList*) printf '%s' '{errs}' >&2; exit 100 ;; esac\ncase"
+    harness._write_executable(harness.shims / "apt-get", APT_GET_SHIM.replace("case", fail, 1))
+
+    result = harness.run("--grace", "0")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = harness.apt_calls()
+    if falls_back:
+        assert [c.split()[0] for c in calls] == ["update", "update", "install"] and "SourceList" not in calls[2], calls
+        assert "retrying with all of the image's apt sources" in result.stdout
+    else:
+        assert len(calls) == 2 and "install" in calls[1] and "SourceList" in calls[1], calls
+        assert "retrying with all of the image's apt sources" not in result.stdout
+
+
+# DAH-6029: one fixture across the deb822 / one-line grammar, checked against apt's own parser.
+GRAMMAR_LIST = """# deb http://commented.example/debian stable main
+deb http://http.kali.org/kali kali-rolling main contrib non-free
+deb-src http://http.kali.org/kali kali-rolling main
+deb [arch=amd64 signed-by=/etc/apt/keyrings/x.gpg] https://ppa.example/ubuntu noble main
+"""
+GRAMMAR_FLAT = "deb [signed-by=/usr/share/keyrings/cuda.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/ /\n"
+GRAMMAR_SOURCES = """## a comment paragraph before the first stanza
+
+types: deb deb-src
+URIs: http://archive.ubuntu.com/ubuntu/
+Suites: noble noble-updates
+# a comment inside the stanza
+COMPONENTS: restricted
+ main
+# a comment between continuation lines
+ universe
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: http://security.ubuntu.com/ubuntu/
+suites: noble-security
+components: main universe
+signed-by: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: http://disabled.example/
+Suites: s
+Components: main
+Enabled: no
+
+Types: deb
+URIs: http://universe-only.example/
+Suites: s
+Components: universe multiverse
+"""
+
+
+def _apt_targets(source_list: Path, parts: Path, lists: Path) -> set[str]:
+    out = subprocess.run(
+        [
+            "apt-get", "indextargets", "--no-release-info",
+            "-o", f"Dir::Etc::SourceList={source_list}", "-o", f"Dir::Etc::SourceParts={parts}",
+            "-o", f"Dir::State::Lists={lists}",
+            "--format", "$(TARGET_OF) $(REPO_URI) $(RELEASE) $(COMPONENT) $(IDENTIFIER)",
+        ],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    return {line for line in out.splitlines() if line.strip()}
+
+
+@pytest.mark.parametrize("awk", ["mawk", "gawk"])
+def test_main_only_sources_match_apts_own_parse(tmp_path, awk):
+    awk_bin = next((Path(d, awk) for d in os.environ["PATH"].split(":") if Path(d, awk).exists()), None)
+    if awk_bin is None or not any(Path(d, "apt-get").exists() for d in os.environ["PATH"].split(":")):
+        pytest.skip(f"needs {awk} and apt-get")
+    etc = tmp_path / "etc"
+    (etc / "sources.list.d").mkdir(parents=True)
+    (etc / "sources.list").write_text(GRAMMAR_LIST)
+    (etc / "sources.list.d" / "cuda.list").write_text(GRAMMAR_FLAT)
+    (etc / "sources.list.d" / "ubuntu.sources").write_text(GRAMMAR_SOURCES)
+    shims = tmp_path / "shims"
+    shims.mkdir()
+    os.symlink(awk_bin, shims / "awk")
+    script = SCRIPT.read_text()
+    func = script[script.index("apt_main_only_dir() {"):]
+    func = func[: func.index("\n}\n") + 3]
+    narrowed = Path(
+        subprocess.run(
+            ["sh", "-c", f'APT_ETC="$1"\n{func}apt_main_only_dir', "sh", str(etc)],
+            capture_output=True, text=True, check=True,
+            env={**os.environ, "PATH": f"{shims}:{os.environ['PATH']}"},
+        ).stdout.strip()
+    )
+
+    original = _apt_targets(etc / "sources.list", etc / "sources.list.d", tmp_path / "l1")
+    wanted = {t for t in original if t.startswith("deb ") and t.split()[3] == "main"}
+    got = _apt_targets(narrowed / "sources.list", narrowed / "parts", tmp_path / "l2")
+
+    assert wanted and got == wanted
+    # the kept stanzas keep their own keys
+    parts = "".join(p.read_text() for p in (narrowed / "parts").iterdir())
+    assert parts.count("Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg") == 1
+    assert parts.count("signed-by: /usr/share/keyrings/ubuntu-archive-keyring.gpg") == 1
+    assert "signed-by=/etc/apt/keyrings/x.gpg" in (narrowed / "sources.list").read_text()

@@ -95,8 +95,8 @@ Outcome = Literal[
     "not_run",
 ]
 # what fails a node (twice in a row): the registry path is broken, the way it broke the ticket-0361 node's rents.
-# `unreachable` is a firewall or proxy that rejects the connection rather than dropping it; a renter's
-# uncached pull fails on it just the same
+# `unreachable` is a firewall or proxy that rejects or resets the connection rather than dropping it; a
+# renter's uncached pull fails on it just the same
 FAILING_OUTCOMES = frozenset({"timeout", "dns_error", "unreachable", "manifest_unknown"})
 # no verdict either way: a Docker Hub 429 says the IP's anonymous quota is spent, not that the path is
 # broken, and an auth or unclassified error, or a probe that did not run, measured nothing about it
@@ -121,9 +121,11 @@ _AUTH_MARKERS = ("unauthorized", "authentication required", "is denied", "access
 # a TCP connect to the registry, or to the daemon's proxy (`proxyconnect tcp: dial tcp ...`), that was
 # rejected: a REJECT --reject-with tcp-reset, icmp-host-unreachable or icmp-net-unreachable, or no route.
 # Only `dial tcp`: the CLI failing to reach dockerd's own socket is `dial unix ...`, which says nothing
-# about the registry path
+# about the registry path. A TCP connection to the registry that the path resets (`read tcp ...: read:
+# connection reset by peer`) fails a renter's uncached pull the same way, so it counts too
 _UNREACHABLE_RX = re.compile(
     r"dial tcp [^\s]+: connect: (connection refused|no route to host|network is unreachable)"
+    r"|(dial|read|write) tcp [^\s]+: (connect|read|write): connection reset by peer"
 )
 _TIMEOUT_MARKERS = (
     "i/o timeout",

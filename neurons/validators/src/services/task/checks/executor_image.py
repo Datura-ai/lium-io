@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import shlex
 from collections.abc import Callable
 from dataclasses import replace
 
+from core.config import settings
+from core.utils import _m, get_extra_info
+from services.default_docker_image_digest_service import executor_build_published
 from services.executor_connectivity.dind_probe import diagnose_docker_run_error
 from services.executor_image_policy import (
     ImageVerdict,
@@ -17,6 +21,8 @@ from ..messages import ExecutorImageMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .rental_owner import rental_of_this_node
+
+logger = logging.getLogger(__name__)
 
 _EXECUTOR_NAME = re.compile(r"(?:^|-)executor-\d+$")
 # Same GPU probe the executor updater runs before an update (neurons/executor/EXECUTOR_UPDATE.md),
@@ -87,6 +93,7 @@ def observed_executor_digest(specs: dict[str, object]) -> str | None:
 
 class ExecutorImageCheck:
     check_id = "executor.validate.image_version"
+    replays_after_session_drop = True
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
@@ -105,6 +112,24 @@ class ExecutorImageCheck:
             return CheckResult(passed=True, event=event)
 
         report = snapshot.report(observed_executor_digest(ctx.state.specs))
+        if report.status is ImageVerdict.OUTDATED:
+            published = await executor_build_published(report.observed_digest)
+            # a plain line, outside the event sink's repeat demotion, so a Loki count per cycle is exact
+            logger.info(
+                _m(
+                    "EXECUTOR_BUILD",
+                    extra=get_extra_info(
+                        {
+                            **ctx.default_extra,
+                            "executor_build": {True: "official", False: "unofficial"}.get(published, "unknown"),
+                            "observed_digest": report.observed_digest,
+                            "executor_image_unofficial_enforced": settings.EXECUTOR_IMAGE_UNOFFICIAL_ENFORCE,
+                        }
+                    ),
+                )
+            )
+            if published is False and settings.EXECUTOR_IMAGE_UNOFFICIAL_ENFORCE:
+                report = replace(report, status=ImageVerdict.UNOFFICIAL)
         updated_state = replace(ctx.state, executor_image_report=report)
         what = report.as_dict()
 
@@ -115,12 +140,16 @@ class ExecutorImageCheck:
             rented_executor = rental_of_this_node(ctx)
             is_rented = rented_executor is not None and len(rented_executor.pods) > 0
             passed = is_rented
-            if is_rented and await updater_holds_on_nvidia_mismatch(ctx):
+            if (
+                is_rented
+                and report.status is ImageVerdict.OUTDATED
+                and await updater_holds_on_nvidia_mismatch(ctx)
+            ):
                 report = replace(report, update_held=True)
                 updated_state = replace(updated_state, executor_image_report=report)
                 what = report.as_dict()
             event = render_message(
-                Msg.OUTDATED,
+                Msg.UNOFFICIAL if report.status is ImageVerdict.UNOFFICIAL else Msg.OUTDATED,
                 ctx=ctx,
                 check_id=self.check_id,
                 what=what,

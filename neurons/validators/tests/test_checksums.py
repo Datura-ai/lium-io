@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import asyncssh
 import pytest
 
 from neurons.validators.src.services.interactive_shell_service import InteractiveShellService
@@ -61,8 +62,18 @@ async def test_an_unread_or_unsupported_cpu_is_unknown_and_read_again(stdout):
 async def test_executor_arch_is_unknown_when_the_read_fails():
     from neurons.validators.src.core.checksums import executor_arch
 
-    shell = SimpleNamespace(ssh_client=SimpleNamespace(run=AsyncMock(side_effect=OSError("closed"))))
+    shell = SimpleNamespace(ssh_client=SimpleNamespace(run=AsyncMock(side_effect=RuntimeError("bad"))))
     assert await executor_arch(shell) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [OSError("closed"), asyncssh.ConnectionLost("lost")])
+async def test_executor_arch_raises_when_the_connection_is_lost(error):
+    from neurons.validators.src.core.checksums import executor_arch
+
+    shell = SimpleNamespace(ssh_client=SimpleNamespace(run=AsyncMock(side_effect=error)))
+    with pytest.raises(type(error)):
+        await executor_arch(shell)
 
 
 def test_aarch64_lib_path_only_when_the_build_is_on_the_validator(tmp_path):

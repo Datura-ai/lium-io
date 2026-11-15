@@ -327,6 +327,9 @@ class ExecutorSpecRequest(ValidatorMessage):
     # This cycle's DinD test container started on the host and its sshd never answered (a failing container
     # runtime). None from a publisher that predates the field.
     host_runtime_fault: bool | None = None
+    # When an express recheck outside the cycle started; its `job_batch_id` is still the cycle's. None for a cycle's
+    # own report and from a publisher that predates the field.
+    check_started_at: datetime | None = None
 
 
 @VALIDATOR_MESSAGES.register
@@ -443,6 +446,8 @@ class ContainerCreated(PodContainerResponse):
     volume_limit_gb: int | None = None
     local_volume_path: str | None = None
     volume_encryption_status: VolumeEncryptionStatus | None = None
+    # the ContainerCreateRequest's command_id, echoed so the backend can tell which dispatch this completes
+    command_id: str = ""
 
 
 @VALIDATOR_MESSAGES.register

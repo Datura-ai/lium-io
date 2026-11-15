@@ -597,6 +597,30 @@ async def test_a_set_change_under_a_rental_posts_the_renters_incident_and_a_pod_
     rented_gpu_drop._LOCAL_MARKS.clear()
 
 
+@pytest.mark.asyncio
+async def test_a_pod_left_on_the_old_cards_asks_for_a_recheck_once_instead_of_waiting_a_cycle(context_factory):
+    """DAH-6137 (d1a7498a, 10 Nov): the backend recreated the pod on the new cards seconds after this cycle failed,
+    and the node waited 15 min for the next one. Ask the express lane to check it again, once per window."""
+    redis = FakeRedis()
+
+    with patch.object(gpu_loss_hold.settings, "DRY_RUN", False):
+        first = await _cycle(context_factory, redis, listed=OTHER_CARDS, pods=(4,), pod_gpus=UUIDS)
+        again = await _cycle(context_factory, redis, listed=OTHER_CARDS, pods=(4,), pod_gpus=UUIDS)
+
+    assert first.event.event == again.event.event == Msg.POD_GPUS_GONE.event
+    assert redis.recheck_requests == [default_executor().uuid]
+
+
+@pytest.mark.asyncio
+async def test_a_dry_run_asks_for_no_recheck(context_factory):
+    redis = FakeRedis()
+
+    with patch.object(gpu_loss_hold.settings, "DRY_RUN", True):
+        await _cycle(context_factory, redis, listed=OTHER_CARDS, pods=(4,), pod_gpus=UUIDS)
+
+    assert redis.recheck_requests == []
+
+
 HELD_BY_A_DROPOUT = {
     "held": True, "since": "2026-10-29T10:28:46+00:00", "last_seen": "2026-10-29T10:28:46+00:00", "replaced": False,
 }
@@ -679,3 +703,45 @@ async def test_a_pod_given_every_gpu_is_served_by_the_new_cards(context_factory)
     ctx.ssh.run = run
 
     assert (await GpuLossHoldCheck().run(ctx)).passed
+
+
+class _DroppingDockerHost(_DockerHost):
+    def __init__(self, closed: bool):
+        super().__init__(DUPLICATED["listed"], ["container_pod1"])
+        self.closed = closed
+
+    def is_closed(self) -> bool:
+        return self.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cycles_before", "dropped", "replays", "hidden"),
+    [
+        (0, False, False, False),
+        (0, True, False, False),
+        (1, False, False, True),
+        (1, True, False, True),
+        # were it replayed, one observation would read its own new mark and hide the node a cycle early
+        (0, True, True, True),
+    ],
+)
+async def test_one_cycle_advances_the_weak_evidence_count_at_most_once(
+    context_factory, monkeypatch, cycles_before, dropped, replays, hidden
+):
+    # review r4481978335: a session that drops during the mark write must not count the scrape twice
+    redis = FakeRedis()
+    for _ in range(cycles_before):
+        await _cycle(context_factory, redis, **DUPLICATED)
+    ctx = _ctx(context_factory, redis, **DUPLICATED).model_copy(update={"ssh": _DroppingDockerHost(dropped)})
+    if replays:  # the real check says False
+        monkeypatch.setattr(GpuLossHoldCheck, "replays_after_session_drop", True)
+
+    async def reconnect():
+        return _DroppingDockerHost(False)
+
+    ok, events, _ = await Pipeline([GpuLossHoldCheck()], _ListSink(), reconnect=reconnect).run(ctx)
+
+    assert any(e.reason_code == AvailabilityErrorCode.GPU_LOST for e in availability_errors(events)) is hidden
+    if not hidden:
+        assert ok and events[-1].reason_code == Msg.PENDING.reason

@@ -110,5 +110,6 @@ class ExecutorConnectivityService:
                 sysbox_runtime=sysbox_runtime,
                 status="error",
                 error=str(e),
+                connection_lost=isinstance(e, (asyncssh.ChannelOpenError, asyncssh.DisconnectError, ConnectionError)),
                 elapsed_sec=time.monotonic() - t1,
             )

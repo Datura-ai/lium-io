@@ -125,6 +125,7 @@ class RentedPodNetworkCheck:
     """
 
     check_id = "host.observe.rented_pod_network"
+    replays_after_session_drop = True
     fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:

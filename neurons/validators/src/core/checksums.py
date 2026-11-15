@@ -4,6 +4,8 @@ import asyncio
 import hashlib
 import os
 
+import asyncssh
+
 
 def sha256_from_path(file_path: str) -> str:
     with open(file_path, "rb") as f:
@@ -34,13 +36,16 @@ _ARCHES = {"aarch64": "aarch64", "arm64": "aarch64", "x86_64": "x86_64", "amd64"
 
 async def executor_arch(shell) -> str | None:
     """"aarch64" or "x86_64" from `uname -m`, read once per shell. None when the read fails or names another CPU:
-    never guessed, so a failed read cannot put the wrong build on a host; only a supported answer is cached."""
+    never guessed, so a failed read cannot put the wrong build on a host; only a supported answer is cached.
+    A lost SSH connection raises instead: it is the connection's failure, not an unknown CPU."""
     arch = getattr(shell, "executor_arch", None)
     if arch in ("aarch64", "x86_64"):
         return arch
     try:
         result = await shell.ssh_client.run("uname -m", timeout=15)
         arch = _ARCHES.get(str(getattr(result, "stdout", "") or "").strip())
+    except (asyncssh.Error, OSError):
+        raise
     except Exception:
         arch = None
     if arch is not None:

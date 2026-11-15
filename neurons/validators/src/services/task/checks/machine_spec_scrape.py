@@ -367,6 +367,8 @@ class MachineSpecScrapeCheck:
     """
 
     check_id = "gpu.scrape.machine_spec"
+    # a replay would advance this cycle's counters a second time
+    replays_after_session_drop = False
     fatal = True
 
     DEFAULT_TIMEOUT = 300
@@ -528,6 +530,10 @@ class MachineSpecScrapeCheck:
             gpu_info = specs.get("gpu", {}) or {}
             gpu_count = gpu_info.get("count", 0) or 0
             raw_gpu_details = gpu_info.get("details", []) or []
+            # DAH-5302: GpuPowerLimitCheck writes the host limit under our Pearl cap; a provider must never report it
+            for detail in raw_gpu_details:
+                if isinstance(detail, dict):
+                    detail.pop("power_host_limit", None)
             # The native capability challenge derives its key from the raw NVML name in
             # specs. Policy and scoring use the canonicalized state fields below.
             gpu_details = list_sxm_on_pcie_adapter_as_pcie(specs, _normalize_gpu_details(raw_gpu_details))
@@ -579,6 +585,13 @@ class MachineSpecScrapeCheck:
                 gpu_splitting_min_count=gpu_splitting_min_count,
                 gpu_model_count=gpu_model_count,
                 gpu_uuids=gpu_uuids,
+            )
+            from ..liumd_shadow import start_facts_after_scrape  # liumd_shadow imports checks
+
+            updated_state = replace(
+                updated_state,
+                liumd_shadow_facts_task=start_facts_after_scrape(ctx),
+                liumd_shadow_facts_attempted=True,
             )
             updates: dict[str, object] = {"state": updated_state, "default_extra": {**ctx.default_extra, **extra_info}}
             return CheckResult(passed=True, event=event, updates=updates)

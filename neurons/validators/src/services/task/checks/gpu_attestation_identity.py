@@ -272,6 +272,8 @@ class GpuAttestationIdentityCheck:
     """
 
     check_id = "gpu.validate.attestation_identity"
+    # a replay would read the baseline the first run wrote and pass over the swap it found
+    replays_after_session_drop = False
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:

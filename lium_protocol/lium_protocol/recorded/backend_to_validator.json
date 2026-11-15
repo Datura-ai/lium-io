@@ -234,7 +234,8 @@
         "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
         "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
         "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
-        "workload_kind": "CUSTOMER_RENTAL"
+        "workload_kind": "CUSTOMER_RENTAL",
+        "create_command_id": "5d6e7f80-9a1b-4c2d-8e3f-405162738495"
       }
     },
     {
