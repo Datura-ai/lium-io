@@ -109,8 +109,10 @@ async def test_applies_the_drop_through_a_host_network_helper(context_factory):
     assert result.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
     [helper] = _helper_calls(ssh)
     assert "--network=host" in helper and helper.startswith("timeout ")
-    # the lock and the helper's own bound are inside the container, on the host's /run/lock; none is executor-side
-    assert "--init" in helper and "-v /run/lock:/run/lock" in helper
+    # the lock and the helper's own bound are inside the container, in one dedicated host lock directory (never all
+    # of the host's /run/lock); none is executor-side
+    assert "--init" in helper and "-v /run/lock/lium-rental-egress:/lium-rental-egress-lock " in helper
+    assert "/run/lock:" not in helper
     assert "flock" not in helper.split("/usr/bin/docker run")[0]
     assert helper.endswith(shlex.quote(helper_command(link_local_drop_script("br-0123456789ab", []))))
 
@@ -305,7 +307,7 @@ async def test_apply_and_cleanup_take_the_same_host_lock(context_factory):
     [apply_cmd], [cleanup_cmd] = _helper_calls(applied), _helper_calls(cleaned)
     assert apply_cmd.endswith(shlex.quote(helper_command(link_local_drop_script("br-0123456789ab", []))))
     assert cleanup_cmd.endswith(shlex.quote(helper_command(link_local_cleanup_script())))
-    assert rental_egress_guard.HOST_LOCK == "/run/lock/lium-rental-egress.lock"
+    assert rental_egress_guard.HOST_LOCK == "/lium-rental-egress-lock/apply.lock"
     assert rental_egress_guard.HELPER_RUN_SECONDS < rental_egress_guard.HELPER_TIMEOUT_SECONDS
 
 

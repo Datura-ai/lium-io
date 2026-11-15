@@ -62,8 +62,11 @@ BRIDGE_NAME_OPTION = "com.docker.network.bridge.name"
 _IFNAME = re.compile(r"[A-Za-z0-9_.-]{1,15}")
 # One host-wide lock around every apply and cleanup: two miners can report the same host, and two interleaved
 # chain swaps could otherwise flush the chain the other just made active. The helper takes it itself: it runs on the
-# host's daemon, so `-v /run/lock:/run/lock` is the host's /run/lock, shared by every executor's helper.
-HOST_LOCK = "/run/lock/lium-rental-egress.lock"
+# host's daemon, so the bind of HOST_LOCK_DIR is one host directory shared by every executor's helper. Only that
+# directory is mounted, never all of /run/lock: the DinD image's shell must not reach other services' locks.
+HOST_LOCK_DIR = "/run/lock/lium-rental-egress"  # `-v` creates it on the host when missing
+LOCK_MOUNT = "/lium-rental-egress-lock"
+HOST_LOCK = f"{LOCK_MOUNT}/apply.lock"
 LOCK_WAIT_SECONDS = 30
 # The helper's own bound, inside the executor-side one: killing the docker client does not stop the container.
 HELPER_RUN_SECONDS = HELPER_TIMEOUT_SECONDS - 10
@@ -194,7 +197,7 @@ def _helper(script: str) -> str:
     # the init exits and the kernel kills whatever is left, so the lock goes with the helper
     return (
         f"timeout -k 5 {HELPER_TIMEOUT_SECONDS} "
-        f"/usr/bin/docker run --rm --init --network=host --cap-add=NET_ADMIN -v /run/lock:/run/lock "
+        f"/usr/bin/docker run --rm --init --network=host --cap-add=NET_ADMIN -v {HOST_LOCK_DIR}:{LOCK_MOUNT} "
         f"--entrypoint /bin/sh {shlex.quote(settings.CUSTOM_DOCKERFILE_DIND_IMAGE)} "
         f"-c {shlex.quote(helper_command(script))}"
     )
