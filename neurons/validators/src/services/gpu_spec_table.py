@@ -207,6 +207,9 @@ NORMALIZATION_MAP: dict[str, str] = {
     "Tesla V100-PCIE-32GB": "NVIDIA Tesla V100 Tensor Core GPU",
     # H100 — some driver/OS combos report without the "NVIDIA " prefix
     "Tesla H100 80GB HBM3": "NVIDIA H100 80GB HBM3",
+    # 80 GB HBM2e H100 (PCI 10de:2336, board 900-21010) the driver names bare "NVIDIA H100": paid as the PCIe
+    # card; a bigger SXM card under the PCIe name still passes gpu_model_truth and is not paid more (15 Nov)
+    "NVIDIA H100": "NVIDIA H100 PCIe",
     # T4 / A10 — CUDA sometimes drops the "Tensor Core GPU" suffix
     "Tesla T4": "NVIDIA T4 Tensor Core GPU",
     "NVIDIA T4": "NVIDIA T4 Tensor Core GPU",

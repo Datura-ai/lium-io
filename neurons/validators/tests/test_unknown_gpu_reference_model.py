@@ -231,3 +231,10 @@ def test_an_unknown_card_has_no_hard_price_limit(context_factory):
     )
 
     assert calculate_scores(context_factory(executor=executor, state=state), rented=True)[0] == 1.0
+
+
+def test_a_bare_nvidia_h100_is_scored_as_the_h100_pcie_not_by_vram():
+    # 80 GB HBM2e H100 (10de:2336) the driver names bare "NVIDIA H100" fell to the 80 GB VRAM reference (15 Nov)
+    from services.gpu_spec_table import reference_gpu_model
+
+    assert reference_gpu_model("NVIDIA H100", 81559) == "NVIDIA H100 PCIe"
