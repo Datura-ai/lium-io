@@ -4,6 +4,8 @@ import pytest
 
 from services.redis_service import FORCED_VALIDATION_CYCLE_KEY, RedisService
 
+pytest_plugins = ["fixtures.incentive_fixtures"]
+
 
 class _Redis:
     """Just enough Redis for the forced-cycle request: SET, GET and the compare-and-delete script."""
