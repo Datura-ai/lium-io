@@ -6396,8 +6396,9 @@ class DockerService:
                 if with_trash_gb is not None:
                     return with_trash_gb
                 df_gb = await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
-                # df already holds what the detached `rm` freed so far: never count those bytes twice
-                return max(df_gb, free_gb + detached_gb)
+                # df already holds what the detached `rm` freed so far: never count those bytes twice; with nothing
+                # detached (a partial rental) df alone, so a df that dropped mid-reclaim still reads short (review)
+                return max(df_gb, free_gb + detached_gb) if detached_gb else df_gb
 
             async def rental_fits() -> bool:
                 return await free_now_gb() >= rental_needs_free_gb
