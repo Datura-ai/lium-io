@@ -79,7 +79,13 @@ BACKUP_SOURCE_SCRIPT = (
     + '[ -n "$(ls -A)" ] || exit 66; shift 2; exec "$@"'
 )
 # $1 is the restore target, $2 the volume root, then the restic command (restoring into `.`).
-RESTORE_TARGET_SCRIPT = 'mkdir -p -- "$1" && cd -- "$1" || exit 1; ' + _confined_to("$2") + 'shift 2; exec "$@"'
+# restic makes `--target .` absolute through $PWD (Go's os.Getwd) and opens every file by that path, so an ancestor
+# link swapped mid-restore would redirect it; /proc/self/cwd is the pinned directory itself, never re-resolved.
+RESTORE_TARGET_SCRIPT = (
+    'mkdir -p -- "$1" && cd -- "$1" || exit 1; '
+    + _confined_to("$2")
+    + 'export PWD=/proc/self/cwd; shift 2; exec "$@"'
+)
 
 # restic 0.19.1 prints this as the exit_error JSON "message" with --json, else as a plain stderr line
 SNAPSHOT_EMPTY_MESSAGE = "Fatal: unable to save snapshot: snapshot is empty"
@@ -959,7 +965,8 @@ class ResticStorageRunner:
         pipeline_script = (
             'mkdir -p -- "$4" && cd -- "$4" || exit 1; '
             + _confined_to("$5")
-            + '"$1" s3 cp "s3://$2/$3" - --no-progress | '
+            # from /: awscli (Python) needs a getcwd, which fails in the rental's tree under an encrypted helper
+            + '(cd / && exec "$1" s3 cp "s3://$2/$3" - --no-progress) | '
             'tar --extract --gzip --file - --directory . --strip-components=1 '
             "--preserve-permissions --same-owner --numeric-owner --xattrs --acls "
             f"--blocking-factor=20 --checkpoint={TAR_CHECKPOINT_RECORDS} "
