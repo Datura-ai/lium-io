@@ -217,8 +217,11 @@ class RentalEgressGuardCheck:
         last_run: dict[tuple, float] | None = None,
     ) -> None:
         self._interval = interval_seconds
-        # rented_only: the instance before TenantEnforcementCheck; the other runs after ScoreCheck, idle nodes only
+        # rented_only: the instance before TenantEnforcementCheck; the other runs when the pipeline ends, idle nodes only
         self._rented_only = rented_only
+        # the idle instance runs once the pipeline has ended, whichever way: the cleanup after the last legacy
+        # rental must not wait behind a fatal check (a node short of ports fails PortCountCheck every cycle)
+        self.on_completion = not rented_only
         # shared by both instances so a node is guarded once per interval whichever one it reaches; keyed by
         # the miner and the endpoint too, since two miners can report one UUID for different hosts
         self._last_run: dict[tuple, float] = {} if last_run is None else last_run

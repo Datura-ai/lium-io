@@ -675,7 +675,10 @@ class Pipeline:
         reconnect: Callable[[], Awaitable[asyncssh.SSHClientConnection]] | None = None,
     ):
         """`reconnect` opens a fresh session to the same node; without it a dropped session ends the run as before."""
-        self.checks = checks
+        # DAH-6442: a check with `on_completion` runs once the run has ended, however it ended (passed, a fatal
+        # failure or a halt), so a fatal check before it can never leave its host-side cleanup undone
+        self.checks = [chk for chk in checks if not getattr(chk, "on_completion", False)]
+        self.on_completion = [chk for chk in checks if getattr(chk, "on_completion", False)]
         self.sink = sink
         self.reconnect = reconnect
         # one reconnect per run: a session that drops again stands as the transport failure it is
@@ -821,6 +824,18 @@ class Pipeline:
         return current_ctx.model_copy(update=updates)
 
     async def run(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
+        passed, events, end_ctx = await self._run_checks(ctx)
+        for chk in self.on_completion:
+            try:
+                res = await chk.run(end_ctx)
+            except Exception as exc:  # noqa: BLE001 — a completion step never changes the run's verdict
+                logger.warning(_m("Completion check failed", extra={**end_ctx.default_extra, "error": repr(exc)[:300]}))
+                continue
+            # reported, but not one of the run's events: the verdict and its publication read the last of those
+            await self.sink.emit(res.event)
+        return passed, events, end_ctx
+
+    async def _run_checks(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
         events: list[ValidationEvent] = []
         current_ctx = ctx
         pipeline_start_time = time.perf_counter()

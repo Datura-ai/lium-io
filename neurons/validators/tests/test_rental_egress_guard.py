@@ -256,13 +256,59 @@ async def test_a_stalled_inspect_is_cut_off_before_the_deadline_and_the_run_is_k
 
     guard = RentalEgressGuardCheck()
     ctx = context_factory(ssh=SimpleNamespace(run=stalled))
+    sink = AsyncMock()
     started = asyncio.get_running_loop().time()
-    ok, events, _ = await asyncio.wait_for(Pipeline([guard, _Finalize()], AsyncMock()).run(ctx), timeout=5)
+    ok, events, _ = await asyncio.wait_for(Pipeline([guard, _Finalize()], sink).run(ctx), timeout=5)
 
     assert asyncio.get_running_loop().time() - started < 2
     assert ok is True and finalized == [True]
-    assert events[0].reason_code == "RENTAL_EGRESS_GUARD_SKIPPED"
+    assert sink.emit.await_args_list[-1].args[0].reason_code == "RENTAL_EGRESS_GUARD_SKIPPED"
     assert guard._last_run == {}  # not a run: the next cycle tries again
+
+
+@pytest.mark.parametrize("exit_", ["passed", "fatal", "rented-halt"])
+@pytest.mark.asyncio
+async def test_the_idle_guard_runs_when_the_pipeline_ends_however_it_ends(context_factory, monkeypatch, exit_):
+    """The last legacy rental's /32 rules come off even when a fatal check (a node short of ports fails
+    PortCountCheck every cycle) ends the run before the guard's place in the list; its event never becomes the
+    run's verdict. A rented halt leaves the node to the rented instance, which ran inside TenantEnforcementCheck."""
+    from unittest.mock import AsyncMock
+
+    from services.task.pipeline import CheckResult, Pipeline
+
+    rental = SimpleNamespace(pods=[SimpleNamespace(docker_container_name="pod")]) if exit_ == "rented-halt" else None
+    monkeypatch.setattr(rental_egress_guard, "rental_of_this_node", lambda ctx: rental)
+    ssh = _ssh(network="", inspect_rc=1)  # no rental network, no legacy rental left: the stale rules come off
+    ran = []
+
+    class _Step:
+        check_id = "step"
+        fatal = True
+
+        async def run(self, ctx):
+            ran.append(self.check_id)
+            return CheckResult(
+                passed=exit_ != "fatal" or self.check_id != "step",
+                halt=exit_ == "rented-halt" and self.check_id == "step",
+                event=rental_egress_guard.render_message(
+                    rental_egress_guard.Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what={}
+                ),
+            )
+
+    class _Scored(_Step):
+        check_id = "scored"
+
+    sink = AsyncMock()
+    _, events, _ = await Pipeline([_Step(), RentalEgressGuardCheck(), _Scored()], sink).run(context_factory(ssh=ssh))
+
+    assert ran == (["step", "scored"] if exit_ == "passed" else ["step"])
+    assert RentalEgressGuardCheck.check_id not in [event.check_id for event in events]
+    assert sink.emit.await_args_list[-1].args[0].check_id == RentalEgressGuardCheck.check_id
+    if exit_ == "rented-halt":
+        assert _helper_calls(ssh) == []
+    else:
+        [cleanup] = _helper_calls(ssh)
+        assert cleanup.endswith(shlex.quote(helper_command(link_local_cleanup_script())))
 
 
 @pytest.mark.asyncio
