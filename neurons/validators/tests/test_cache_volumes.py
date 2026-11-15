@@ -211,6 +211,14 @@ async def test_a_lium_filler_create_sweeps_a_provider_jobs_leftover_cache_and_a_
     assert await docker_service.sweep_stale_cache_volumes(ssh_client, payload, {}) == ["job_cache_200gb_0123456789ab"]
 
 
+
+@pytest.mark.asyncio
+async def test_a_cacheless_filler_create_sweeps_only_a_provider_jobs_leftover_cache(docker_service):
+    ssh_client = FakeSshClient(["dphn_cache_hf_old", "engy_cache_hf_x", "job_cache_200gb_0123456789ab", "volume_pod"])
+    payload = _make_payload(workload_kind=WorkloadKind.FILLER, cache_volumes=None)
+
+    assert await docker_service.sweep_stale_cache_volumes(ssh_client, payload, {}) == ["job_cache_200gb_0123456789ab"]
+
 # ---------------------------------------------------------------- DAH-5192: partial caches, thresholds, rentals
 
 _KIMI = "engy_cache_hf_1561gb_kimi-k3-1a2b3c4d"

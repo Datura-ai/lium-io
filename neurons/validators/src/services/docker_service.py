@@ -6680,15 +6680,13 @@ class DockerService:
 
         Returns the volumes it asked docker to remove (empty when nothing was swept).
         """
-        if payload.workload_kind != WorkloadKind.FILLER or not payload.cache_volumes:
-            # No cache requested -> this is version GC with nothing to compare against, NOT a reclaim.
-            # Deleting here would thrash: the backend denies the cache to a node whose free disk sits
-            # under its threshold, but a node's free disk is LOWER precisely because the cache is
-            # already downloaded — so deny would delete it, free disk would rise back over the
-            # threshold, the next cycle would grant it again, and the node would re-download ~37 GB
-            # every cycle. Reclaiming a cache the node can no longer afford is the rental/disk-pressure
-            # path's job, where the decision is made against real free space.
+        if payload.workload_kind != WorkloadKind.FILLER:
             return []
+        # No cache requested -> no own family, so only a provider job's leftover cache is swept below (the
+        # backend asks for a job's cache whenever the job has one). Lium's caches are NOT swept here: the backend
+        # denies them to a node whose free disk sits under its threshold, which is LOWER precisely because the
+        # cache is downloaded, so deleting would free disk, re-grant the cache and re-download ~37 GB every cycle.
+        # Reclaiming a cache the node can no longer afford is the rental/disk-pressure path's job.
         # A live filler SIBLING holds this node's cache and docker cannot remove an in-use volume, so
         # the listing round-trip would be a no-op. The run being created is already STARTING in the
         # backend by the time it builds this request, so its OWN container name is in the list too —
@@ -6700,7 +6698,7 @@ class DockerService:
         ):
             return []
 
-        keep_names: set[str] = {cache_volume.name for cache_volume in payload.cache_volumes}
+        keep_names: set[str] = {cache_volume.name for cache_volume in payload.cache_volumes or []}
         cache_prefixes_to_sweep: tuple[str, ...] = self._cache_volume_families(sorted(keep_names))
         if (
             ENGY_CACHE_VOLUME_PREFIX in cache_prefixes_to_sweep
