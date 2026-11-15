@@ -11,10 +11,11 @@ import json
 import logging
 import shutil
 import tempfile
+from pathlib import Path
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 from uuid import uuid4
 
 import bittensor
@@ -582,6 +583,49 @@ async def test_a_failed_forced_request_clear_still_sends_the_wave(validator_with
     assert [c.kwargs["payload"].miner_hotkey for c in validator.miner_service.request_job_to_miner.await_args_list] == [
         "miner-a"
     ]
+
+
+@pytest.mark.asyncio
+async def test_the_previous_cycles_job_files_stay_until_the_new_cycle_inputs_are_published(
+    validator_with_mocks, create_neuron_info
+):
+    """An express tick during the awaits before cycle_inputs still reads the previous cycle's directory."""
+    validator = validator_with_mocks
+    validator.subtensor_client.get_miners = AsyncMock(return_value=[create_neuron_info(1, "miner-a")])
+    validator.subtensor_client.get_time_from_block = AsyncMock(return_value=CYCLE_BATCH_ID)
+    previous = _cycle_inputs()
+    validator.cycle_inputs = previous
+    new_directory = _cycle_inputs().encrypted_files
+
+    def build(keep_directories=()):
+        file_encrypt_service.FileEncryptService.remove_earlier_job_files_directories(
+            Path(new_directory.tmp_directory), keep_directories
+        )
+        return new_directory
+
+    validator.file_encrypt_service.ecrypt_miner_job_files = MagicMock(side_effect=build)
+    validator.file_encrypt_service.remove_earlier_job_files_directories = (
+        file_encrypt_service.FileEncryptService.remove_earlier_job_files_directories
+    )
+    seen_during_rollout = []
+
+    async def observe(*_):
+        seen_during_rollout.append(Path(previous.encrypted_files.tmp_directory).is_dir())
+        return MagicMock(covers=MagicMock(return_value=False))
+
+    validator.observe_executor_rollout = observe
+    validator.miner_service.request_job_to_miner = AsyncMock(
+        side_effect=lambda payload, **_: {"miner_hotkey": payload.miner_hotkey, "miner_coldkey": "c", "results": []}
+    )
+    with (
+        patch("core.validator.fetch_default_image_digests", new=AsyncMock(return_value={})),
+        patch("core.validator.fetch_executor_image_digest", new=AsyncMock(return_value=None)),
+    ):
+        await validator.sync()
+
+    assert seen_during_rollout == [True]
+    assert not Path(previous.encrypted_files.tmp_directory).exists()
+    assert Path(new_directory.tmp_directory).is_dir()
 
 
 @pytest.mark.asyncio

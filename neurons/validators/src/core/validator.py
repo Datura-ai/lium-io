@@ -4,6 +4,7 @@ import json
 import os
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 
 from clients.backend_client import BackendClient, BackendRejected
 from clients.subtensor_client import ProviderPortalDataUnavailable, SubtensorClient
@@ -476,8 +477,11 @@ class Validator:
                 # Built before the cycle counts: a failed build (obfuscator exit) leaves the cycle
                 # and an operator's forced request to the next tick. A fresh job-files directory for
                 # this cycle; the ones an express verification still reads are kept (DAH-2958).
+                # The current cycle's directory is kept too: an express tick reads it until the new
+                # cycle_inputs below replace it, and the awaits before them can stall on Redis.
+                previous_directory = self.cycle_inputs.encrypted_files.tmp_directory if self.cycle_inputs else None
                 encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files(
-                    keep_directories=self.express_lane.directories_in_use()
+                    keep_directories={*self.express_lane.directories_in_use(), previous_directory} - {None}
                 )
                 self.last_job_run_blocks = current_block
 
@@ -506,6 +510,17 @@ class Validator:
                 self.miner_service.start_awaiting_wave_lists(
                     job_batch_id, [miner.hotkey for miner in miners]
                 )
+                try:
+                    self.file_encrypt_service.remove_earlier_job_files_directories(
+                        Path(encrypted_files.tmp_directory), self.express_lane.directories_in_use()
+                    )
+                except Exception as exc:
+                    logger.error(
+                        _m(
+                            "[sync] Earlier job-files directories not removed; the next cycle retries",
+                            extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                        ),
+                    )
                 if cycle_asked_for_now:
                     # Cleared here and not at the read: every return above this line means no
                     # cycle started, and the operator's request must survive to the next tick.
