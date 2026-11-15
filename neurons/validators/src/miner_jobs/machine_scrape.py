@@ -722,16 +722,17 @@ def get_executor_pid_mode():
     # PidMode of the container this scrape runs in: the one whose processes (listed by cgroup, like
     # `docker top`) include this one. A hostname can name any container. Under `pid: host` the scrape sees
     # its host pid, so its container is always found; in a private PID namespace the pid is not a host pid,
-    # which is reported as "" (not host).
+    # which is reported as "" (not host). The pid namespace must match too: a private-namespace pid can
+    # equal a host pid in another `pid: host` container.
     # A missing or non-string PidMode raises, so the scrape reports unknown instead of a failing mode.
-    own_pid = str(os.getpid())
+    own = [str(os.getpid()), str(os.stat("/proc/self/ns/pid").st_ino)]
     for summary in docker_api_get("/containers/json") or []:
         container_id = summary.get("Id")
         try:
-            top = docker_api_get(f"/containers/{container_id}/top?ps_args=-eo%20pid") or {}
+            top = docker_api_get(f"/containers/{container_id}/top?ps_args=-eo%20pid,pidns") or {}
         except RuntimeError:
             continue  # restarting (409) or gone (404): never this scrape's own container
-        if [own_pid] not in (top.get("Processes") or []):
+        if own not in (top.get("Processes") or []):
             continue
         inspection = docker_api_get(f"/containers/{container_id}/json")
         host_config = inspection.get("HostConfig") if isinstance(inspection, dict) else None

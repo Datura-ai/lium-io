@@ -11,9 +11,11 @@ from neurons.validators.tests.helpers import build_scrape_namespace
 SRC = Path(__file__).resolve().parents[1] / "src"
 
 OWN = os.getpid()
+OWN_NS = os.stat("/proc/self/ns/pid").st_ino
+OTHER_NS = OWN_NS + 1
 
 
-def _read(containers: dict[str, tuple[list[int] | None, object]]):
+def _read(containers: dict[str, tuple[list[int | tuple[int, int]] | None, object]]):
     def docker_api_get(path):
         if path == "/containers/json":
             return [{"Id": container_id} for container_id in containers]
@@ -22,7 +24,9 @@ def _read(containers: dict[str, tuple[list[int] | None, object]]):
         if "/top" in path and pids is None:
             raise RuntimeError(f"docker api {path} returned HTTP 409")
         if "/top" in path:
-            return {"Titles": ["PID"], "Processes": [[str(pid)] for pid in pids]}
+            # a bare pid is in this process's own pid namespace; (pid, ns) names another one
+            rows = [pid if isinstance(pid, tuple) else (pid, OWN_NS) for pid in pids]
+            return {"Titles": ["PID", "PIDNS"], "Processes": [[str(pid), str(ns)] for pid, ns in rows]}
         return inspection
 
     ns = build_scrape_namespace(SRC / "miner_jobs" / "machine_scrape.py", {"get_executor_pid_mode"}, {"os": os})
@@ -47,6 +51,11 @@ def test_a_container_named_by_the_hostname_but_not_listing_the_scrape_is_not_rea
 def test_no_container_listing_the_scrape_s_pid_is_a_private_pid_namespace():
     # in a private namespace this process's pid is not the host pid docker lists
     assert _read({"executor": ([812], _mode("host"))}) == ""
+
+
+def test_the_same_pid_in_another_pid_namespace_is_not_the_scrape():
+    # a private-namespace pid can equal a host pid in another pid-host container (review 4579148174)
+    assert _read({"monitor": ([(OWN, OTHER_NS)], _mode("host")), "executor": ([812], _mode(""))}) == ""
 
 
 def test_a_container_whose_top_fails_is_skipped_not_turned_into_unknown():
