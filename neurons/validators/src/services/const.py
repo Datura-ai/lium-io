@@ -173,7 +173,8 @@ BATCH_HEALTH_CHECK_TIMEOUT = 10  # seconds to wait for batch verifier to become 
 # Rental Price Incentive Constants
 TEMPO = 360  # blocks per epoch (from subtensor)
 SECONDS_PER_BLOCK = 12  # seconds per block
-FIXED_RATIO = 0.50  # miners' share of subnet emission; converts USD pay to emission share
+# SN51 emits 1 alpha/block: 9% owner, 45.5% miners, 45.5% validators (chain since ~13 Nov)
+FIXED_RATIO = 0.455  # miners' share of subnet emission; converts USD pay to emission share
 
 DOCKER_DIND_IMAGE = "daturaai/dind:0.0.3"
 
