@@ -2,7 +2,7 @@
 
 The privileged storage helper (host PID namespace) runs this file's source as
 `python3 -I -S -c <source> <pid> <cwd> <check path or ""> <restic> <ca bundle> <restic arguments...>`.
-It joins the rental's user, mount and network namespaces, never its PID namespace, so the rental can neither see
+It joins the rental's network, mount and user namespaces, never its PID namespace, so the rental can neither see
 restic nor read its environment (the repository credentials). It roots itself in the rental's root, so every path,
 symlinks included, resolves there. Nothing is loaded from the rental's filesystem: every import happens first,
 restic is executed from a descriptor opened beforehand, and the CA bundle is written to a tmpfs that only this
@@ -18,7 +18,10 @@ MS_NOSUID, MS_NODEV, MS_NOEXEC, MS_REC, MS_PRIVATE = 2, 4, 8, 16384, 1 << 18
 SOURCE_MISSING_EXIT = 66
 # A rental cannot rename or unmount its /proc mount point, so this path keeps resolving to our tmpfs.
 CA_DIRECTORY = "/proc"
-CA_PATH = CA_DIRECTORY + "/lium-ca.crt"
+# Go reads SSL_CERT_DIR as well as SSL_CERT_FILE; left unset it would trust CAs in the rental's /etc/ssl/certs.
+# A directory of its own, so restic's temp packs beside it are never read as certificates.
+CERT_DIRECTORY = CA_DIRECTORY + "/certs"
+CA_PATH = CERT_DIRECTORY + "/lium-ca.crt"
 # restic's temp packs go to this tmpfs, not the rental's /tmp: they must not fail on, or count against, the
 # rental's full root disk. Same limit as the helper's own /tmp (restic.RESTIC_TMPFS_BYTES).
 TMPFS_BYTES = 512 * 1024 * 1024
@@ -42,8 +45,22 @@ def exec_restic(restic, cwd, check, restic_arguments):
         if code:
             sys.exit(code)
     os.chdir(cwd)
-    environment = {**os.environ, "PWD": cwd, "SSL_CERT_FILE": CA_PATH, "TMPDIR": CA_DIRECTORY}
+    environment = {**os.environ, "PWD": cwd, "SSL_CERT_FILE": CA_PATH, "SSL_CERT_DIR": CERT_DIRECTORY, "TMPDIR": CA_DIRECTORY}
     os.execve(restic, ["restic", *restic_arguments], environment)
+
+
+def join_namespaces(setns, namespaces):
+    """Two passes, as nsenter does; the user namespace is last in `namespaces`. Privileged, it is joined last: joining
+    it first drops the capability to join a network namespace an ancestor user namespace owns (Sysbox). Unprivileged,
+    the others are refused until it is joined, so they are retried after it."""
+    pending = []
+    for namespace, flag in namespaces[:-1]:
+        try:
+            setns(namespace, flag)
+        except PermissionError:
+            pending.append((namespace, flag))
+    for namespace, flag in [namespaces[-1], *pending]:
+        setns(namespace, flag)
 
 
 def _libc_call(libc, name, argtypes):
@@ -71,10 +88,9 @@ def main(argv):
     root = os.open(f"/proc/{pid}/root", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     namespaces = [
         (os.open(f"/proc/{pid}/ns/{name}", os.O_RDONLY | os.O_CLOEXEC), flag)
-        for name, flag in (("user", CLONE_NEWUSER), ("mnt", CLONE_NEWNS), ("net", CLONE_NEWNET))
+        for name, flag in (("net", CLONE_NEWNET), ("mnt", CLONE_NEWNS), ("user", CLONE_NEWUSER))
     ]
-    for namespace, flag in namespaces:
-        setns(namespace, flag)
+    join_namespaces(setns, namespaces)
     # as nsenter does: become the rental's root, so restored files get the rental's ownership
     try:
         os.setgroups([])
@@ -88,6 +104,7 @@ def main(argv):
     mount(None, b"/", None, MS_REC | MS_PRIVATE, None)
     options = f"size={TMPFS_BYTES},mode=0700".encode()
     mount(b"tmpfs", CA_DIRECTORY.encode(), b"tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, options)
+    os.mkdir(CERT_DIRECTORY, 0o700)
     with os.fdopen(os.open(CA_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb") as ca_file:
         ca_file.write(ca)
     exec_restic(restic, cwd, check, restic_arguments)

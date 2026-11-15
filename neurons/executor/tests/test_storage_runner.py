@@ -2407,7 +2407,7 @@ def test_rental_launcher_checks_the_source_then_executes_restic_by_descriptor(
     if kind == "file":
         source.write_text("x")
     # /bin/sh stands in for restic (a static binary): prints where and how it was started
-    probe = 'echo "$(pwd -P) $PWD $SSL_CERT_FILE $TMPDIR"'
+    probe = 'echo "$(pwd -P) $PWD $SSL_CERT_FILE $SSL_CERT_DIR $TMPDIR"'
     cwd = source if kind == "files" else tmp_path
     run = (
         "import os, runpy, sys; launcher = runpy.run_path(sys.argv[1]); "
@@ -2421,7 +2421,7 @@ def test_rental_launcher_checks_the_source_then_executes_restic_by_descriptor(
     )
 
     assert result.returncode == exit_code, result.stderr
-    assert result.stdout == (f"{cwd} {cwd} /proc/lium-ca.crt /proc\n" if exit_code == 0 else "")
+    assert result.stdout == (f"{cwd} {cwd} /proc/certs/lium-ca.crt /proc/certs /proc\n" if exit_code == 0 else "")
 
 
 def test_real_encrypted_restore_through_a_rental_symlink_stays_in_the_rental_root(
@@ -2492,4 +2492,111 @@ def test_real_encrypted_restore_through_a_rental_symlink_stays_in_the_rental_roo
     assert result.returncode in (0, 1), result.stdout + result.stderr
     assert (rental_side / "restored" / "file0").read_text() == "0"
     assert list(caller_side.iterdir()) == []
-    assert not (rental / "proc" / "lium-ca.crt").exists()  # the CA tmpfs lived only in restic's own mount namespace
+    assert not (rental / "proc" / "certs").exists()  # the CA tmpfs lived only in restic's own mount namespace
+
+
+@pytest.mark.parametrize(
+    ("privileged", "joined"),
+    [(True, ["net", "mnt", "user"]), (False, ["user", "net", "mnt"])],
+)
+def test_launcher_joins_the_user_namespace_last_unless_only_it_grants_the_others(
+    privileged: bool, joined: list[str]
+) -> None:
+    """Privileged (the helper), net and mnt go first: after joining the rental's user namespace the helper can no
+    longer join a network namespace an ancestor user namespace owns. Unprivileged, they are retried after it."""
+    launcher = runpy.run_path(str(Path(storage_runner.__file__).parent / "storage" / "rental_exec.py"))
+    calls: list[str] = []
+
+    def setns(name: str, flag: int) -> None:
+        if not privileged and "user" not in calls and name != "user":
+            raise PermissionError(1, "setns: Operation not permitted")
+        calls.append(name)
+
+    launcher["join_namespaces"](setns, [("net", 1), ("mnt", 2), ("user", 3)])
+
+    assert calls == joined
+
+
+def test_launcher_fails_when_the_user_namespace_itself_is_refused() -> None:
+    launcher = runpy.run_path(str(Path(storage_runner.__file__).parent / "storage" / "rental_exec.py"))
+
+    def setns(name: str, flag: int) -> None:
+        raise PermissionError(1, "setns: Operation not permitted")
+
+    with pytest.raises(PermissionError):
+        launcher["join_namespaces"](setns, [("net", 1), ("mnt", 2), ("user", 3)])
+
+
+# Runs as root of a user namespace that owns the network namespace: starts the rental in a child user namespace that
+# keeps that network (owned by its ancestor, as under Sysbox), serves TLS on its loopback with a certificate the
+# rental trusts in its own /etc/ssl/certs, and runs the launcher as the privileged helper does.
+ANCESTOR_NET_DRIVER = r"""
+import http.server, ssl, subprocess, sys, threading
+launcher, rental, restic, ca, cert, key = sys.argv[1:]
+subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
+server = http.server.HTTPServer(("127.0.0.1", 0), http.server.BaseHTTPRequestHandler)
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain(cert, key)
+server.socket = context.wrap_socket(server.socket, server_side=True)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+keep_alive = "import os, sys, time; os.chroot(sys.argv[1]); print('ready', flush=True); time.sleep(600)"
+rental_process = subprocess.Popen(
+    ["unshare", "--user", "--map-root-user", "--mount", "--pid", "--fork", "--kill-child", "/bin/sh", "-c",
+     'mount -t proc proc "$1/proc" && exec "$2" -c "$3" "$1"', "sh", rental, sys.executable, keep_alive],
+    stdout=subprocess.PIPE, text=True,
+)
+try:
+    assert rental_process.stdout.readline().strip() == "ready"
+    (pid,) = open(f"/proc/{rental_process.pid}/task/{rental_process.pid}/children").read().split()
+    repository = f"rest:https://127.0.0.1:{server.server_port}/"
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", launcher, pid, "/", "", restic, ca, "--no-cache", "-r", repository, "cat", "config"],
+        capture_output=True, text=True, env={"RESTIC_PASSWORD": "test"}, timeout=60,
+    )
+finally:
+    rental_process.kill()
+print(result.returncode)
+print(result.stdout + result.stderr)
+"""
+
+
+def test_real_launcher_joins_an_ancestor_owned_network_and_ignores_the_rentals_cas(
+    tmp_path: Path, restic_binary: str
+) -> None:
+    """DAH-6447: the network namespace belongs to an ancestor of the rental's user namespace (joining the user
+    namespace first would drop the right to join it), and a CA the rental installed in /etc/ssl/certs must not
+    authenticate a server on that network: restic trusts only the helper's CA."""
+    unshare = shutil.which("unshare")
+    if not unshare:
+        pytest.skip("util-linux unshare is not available")
+    outer = [unshare, "--user", "--map-root-user", "--net", "--mount", "--fork"]
+    if subprocess.run([*outer, unshare, "--user", "--map-root-user", "--pid", "--fork", "true"]).returncode != 0:
+        pytest.skip("unprivileged user namespaces are not available")
+    if not (shutil.which("ip") and shutil.which("openssl")):
+        pytest.skip("ip and openssl are needed")
+
+    rental = tmp_path / "rental"
+    (rental / "proc").mkdir(parents=True)
+    (rental / "etc" / "ssl" / "certs").mkdir(parents=True)
+    cert, key = tmp_path / "server.pem", tmp_path / "server.key"
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=127.0.0.1",
+         "-addext", "subjectAltName=IP:127.0.0.1", "-keyout", str(key), "-out", str(cert)],
+        check=True, capture_output=True,
+    )
+    shutil.copy(cert, rental / "etc" / "ssl" / "certs" / "rental-installed.pem")
+    ca = tmp_path / "ca.crt"
+    ca.write_text("the helper's CA bundle, which trusts nothing here")
+    launcher = Path(storage_runner.__file__).parent / "storage" / "rental_exec.py"
+
+    driver = subprocess.run(
+        [*outer, sys.executable, "-c", ANCESTOR_NET_DRIVER, str(launcher), str(rental), restic_binary, str(ca),
+         str(cert), str(key)],
+        capture_output=True, text=True, timeout=120,
+    )
+
+    assert driver.returncode == 0, driver.stderr
+    code, output = driver.stdout.split("\n", 1)
+    assert "setns" not in output, output  # joined the ancestor-owned network
+    assert "certificate signed by unknown authority" in output, output
+    assert code != "0"
