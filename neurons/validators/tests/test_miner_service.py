@@ -453,7 +453,7 @@ async def test_a_container_start_request_reaches_start_container(mocker, miner_s
     _wire_common_mocks(mocker, miner_service, executor_id)
     start_mock = mocker.patch("services.miner_service.DockerService.start_container", AsyncMock(return_value=Mock()))
     payload = ContainerStartRequest(
-        miner_hotkey="5TestMiner", executor_id=executor_id, miner_address="10.0.0.1", miner_port=8000,
+        miner_hotkey="5TestMiner", executor_id=executor_id, miner_address="192.0.2.1", miner_port=8000,
         pod_id=str(uuid4()), container_name="pod_x", local_volume_path="/root",
     )
 
