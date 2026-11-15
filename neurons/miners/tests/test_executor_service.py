@@ -344,6 +344,29 @@ async def test_register_pubkey_answers_by_the_deadline_with_the_uploads_that_fin
 
 
 @pytest.mark.asyncio
+async def test_register_pubkey_warns_with_the_ids_of_executors_cut_off_at_the_deadline(
+    executor_service, test_executor, monkeypatch
+):
+    """A cut-off upload logs nothing itself; the provider needs the executor ids to find the slow node."""
+    dead = Executor(uuid=uuid4(), validator="//TestValidator", address="192.0.2.2", port=8001)
+
+    async def upload(executor, *_args, **_kwargs):
+        if executor is dead:
+            await asyncio.sleep(10)
+        return None
+
+    monkeypatch.setattr(es, "UPLOAD_SSH_KEY_BUDGET_SECONDS", 0.2)
+    es.settings.RENTAL_REQUEST_HOOK = None
+    executor_service.get_executors_for_validator = AsyncMock(return_value=[test_executor, dead])
+    executor_service.send_pubkey_to_executor = upload
+
+    with patch.object(es.logger, "warning") as warning:
+        await executor_service.register_pubkey("v", "m", _SSH_KEY.encode(), "0xaa")
+
+    assert warning.call_args.args[0].extra["cut_off_executor_ids"] == [str(dead.uuid)]
+
+
+@pytest.mark.asyncio
 async def test_register_pubkey_counts_the_deadline_from_the_validators_signed_timestamp(
     executor_service, test_executor, monkeypatch
 ):

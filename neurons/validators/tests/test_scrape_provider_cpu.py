@@ -21,7 +21,7 @@ from neurons.validators.tests.test_scrape_disk_breakdown import _obfuscation_tab
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 
-CPU_HELPERS = {"get_container_cpu_percents", "get_docker_info"}
+CPU_HELPERS = {"get_container_cpu_percents", "get_docker_info", "parse_container_net_io", "docker_size_bytes", "_DOCKER_SIZE_UNITS"}
 
 RENTER = "aaaaaaaaaaaa" + "0" * 52
 EXECUTOR = "bbbbbbbbbbbb" + "0" * 52
@@ -51,7 +51,9 @@ def _fake_run_cmd(outputs: dict[str, str | Exception]):
     return run_cmd
 
 
-def _scrape(outputs: dict[str, str | Exception], host_percent: float = 40.0) -> dict[str, object]:
+def _scrape(
+    outputs: dict[str, str | Exception], host_percent: float = 40.0
+) -> dict[str, object]:
     namespace = build_scrape_namespace(
         SRC / "miner_jobs" / "machine_scrape.py",
         CPU_HELPERS,
@@ -146,3 +148,119 @@ def test_a_container_whose_image_is_gone_is_listed_without_a_digest_and_the_scra
     assert data["docker_containers"][0]["each_digest"] == ""
     assert data["docker_containers"][0]["each_cpu_percent"] == 5.0
     assert data["docker_version"] == "24.0.7"
+
+
+def test_container_traffic_is_attached_in_bytes():
+    # Arrange — docker prints NetIO as "<received> / <sent>" since the container started, decimal units
+    scrape = _scrape(_docker_outputs(f"{RENTER[:12]}|158.00%|1.23TB / 456MB\n", [RENTER]))
+
+    # Act
+    container = scrape["get_docker_info"](b"#!/bin/sh\n")["docker_containers"][0]
+
+    # Assert
+    assert container["each_net_rx_bytes"] == 1_230_000_000_000
+    assert container["each_net_tx_bytes"] == 456_000_000
+    assert container["each_cpu_percent"] == 158.0
+
+
+def test_an_unparsable_traffic_reading_is_left_out_and_keeps_the_cpu_reading():
+    scrape = _scrape(_docker_outputs(f"{RENTER[:12]}|5.00%|-- / --\n", [RENTER]), host_percent=40.0)
+
+    data = scrape["get_docker_info"](b"#!/bin/sh\n")
+
+    assert "each_net_rx_bytes" not in data["docker_containers"][0]
+    assert data["docker_containers"][0]["each_cpu_percent"] == 5.0
+    assert data["docker_host_cpu_percent"] == 40.0
+
+
+def test_the_traffic_keys_are_registered_in_both_obfuscation_tables():
+    original_keys, mapped_keys = _obfuscation_tables()
+    emitted = {"each_net_rx_bytes", "each_net_tx_bytes"}
+
+    assert emitted <= original_keys
+    assert emitted <= mapped_keys
+
+
+def test_the_traffic_and_cpu_readings_survive_the_production_obfuscation():
+    # ecrypt_miner_job_files runs obfuscator.py and the key replacement over the whole script before it
+    # ships; a nested helper came out of that with its body renamed and its signature not (lium-io#2146).
+    import ast
+    import contextlib
+    import io
+    import sys
+
+    sys.path.insert(0, str(SRC))
+    from miner_jobs.obfuscator import obfuscate_code
+    from services.file_encrypt_service import FileEncryptService
+
+    source_text = (SRC / "miner_jobs" / "machine_scrape.py").read_text()
+    with contextlib.redirect_stdout(io.StringIO()):
+        obfuscated = obfuscate_code(source_text)
+        key_mapping, _ = FileEncryptService.generate_key_mappings(FileEncryptService.__new__(FileEncryptService))
+    for original_key, random_name in key_mapping.items():
+        obfuscated = obfuscated.replace(original_key, random_name)
+
+    def top_level_name(node: ast.AST) -> str:
+        if isinstance(node, ast.FunctionDef | ast.ClassDef):
+            return node.name
+        if isinstance(node, ast.Assign):
+            return getattr(node.targets[0], "id", "")
+        return ""
+
+    source_tree, obfuscated_tree = ast.parse(source_text), ast.parse(obfuscated)
+    kept = {
+        top_level_name(node): obfuscated_tree.body[index]
+        for index, node in enumerate(source_tree.body)
+        if top_level_name(node) in CPU_HELPERS
+    }
+    namespace = {"json": json, "os": os, "tempfile": tempfile, "psutil": _Psutil(40.0)}
+    exec(ast.unparse(ast.Module(body=list(kept.values()), type_ignores=[])), namespace)  # noqa: S102
+    run_cmd_name = next(
+        obfuscated_tree.body[index].name
+        for index, node in enumerate(source_tree.body)
+        if isinstance(node, ast.FunctionDef) and node.name == "run_cmd"
+    )
+    namespace[run_cmd_name] = _fake_run_cmd({"stats --no-stream": f"{RENTER[:12]}|158.00%|1.23TB / 456MB\n"})
+
+    host, cpu, net_io = namespace[kept["get_container_cpu_percents"].name]("/tmp/docker")
+
+    assert (host, cpu) == (40.0, {RENTER[:12]: 158.0})
+    assert net_io == {RENTER[:12]: (1_230_000_000_000, 456_000_000)}
+
+
+def _three_on_the_executor_image(pids_by_id: dict[str, list[int]]):
+    ids = list(pids_by_id)
+    outputs = _docker_outputs("".join(f"{i[:12]}|10.00%\n" for i in ids), ids)
+    outputs["json .RepoDigests"] = '["daturaai/compute-subnet-executor@sha256:exec"]\n'
+    run = _fake_run_cmd(outputs)
+
+    def run_cmd(cmd):
+        for container_id, pids in pids_by_id.items():
+            if f" top {container_id} " in cmd:
+                return "PID\n" + "".join(f"{pid}\n" for pid in pids)
+        return run(cmd)
+
+    return run_cmd
+
+
+BURNER = "dddddddddddd" + "0" * 52
+MONITOR = "cccccccccccc" + "0" * 52
+
+
+def test_the_executor_is_the_image_container_that_lists_the_scrape_s_own_pid():
+    # DAH-6251: the burner and the monitor run the executor image too, listed before and after it. The scrape
+    # runs under a daemonized sshd, so only `docker top` (by cgroup) ties it to its container, not a hostname
+    scrape = _scrape({})
+    scrape["run_cmd"] = _three_on_the_executor_image(
+        {BURNER: [900, 901], EXECUTOR: [812, 4000, os.getpid()], MONITOR: [950]}
+    )
+
+    assert scrape["get_docker_info"](b"#!/bin/sh\n")["docker_container_id"] == EXECUTOR
+
+
+def test_no_image_container_listing_the_scrape_s_pid_reports_no_executor():
+    # never a fallback to some container on the image: an empty id excuses nothing
+    scrape = _scrape({})
+    scrape["run_cmd"] = _three_on_the_executor_image({BURNER: [900], EXECUTOR: [812], MONITOR: [950]})
+
+    assert scrape["get_docker_info"](b"#!/bin/sh\n")["docker_container_id"] == ""

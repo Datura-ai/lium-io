@@ -227,6 +227,17 @@ async def test_an_unreadable_cpu_never_writes_a_library(libraries, executor_dige
 
 
 @pytest.mark.asyncio
+async def test_a_lost_connection_is_reported_as_ssh_transport_not_as_an_unknown_cpu(libraries):
+    shell = executor_shell({LIB_PATH: STALE_SHA256})
+    shell.executor_arch = None
+    shell.ssh_client.run = AsyncMock(side_effect=OSError("closed"))
+    with _refresh_on():
+        result = await gated_run(shell)
+    assert result.diagnostics["failure_class"] == "SSH_TRANSPORT"
+    assert not result.error.startswith("EXECUTOR_ARCH_UNKNOWN")
+
+
+@pytest.mark.asyncio
 async def test_an_arm_host_holding_the_x86_build_is_caught_and_sent_the_aarch64_build(libraries, tmp_path):
     """The CPU is read before the hashes: the x86 build on an ARM host matches the native digest and must not pass."""
     arm_lib = tmp_path / "libverifyx-aarch64.so"

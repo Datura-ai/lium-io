@@ -16,6 +16,7 @@ class PidHostRequiredCheck:
     """
 
     check_id = "executor.validate.pid_host_required"
+    replays_after_session_drop = True
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:

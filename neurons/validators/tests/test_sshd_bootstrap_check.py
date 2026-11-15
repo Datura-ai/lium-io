@@ -195,9 +195,10 @@ def _probe_ctx(context_factory, redis, stdout="", error=None, rented=False):
     if error:
         ssh.run.side_effect = error
     else:
-        # the probe answers first; any later call is the filler removal
+        # the probe answers first, then the running check, then the filler removal
         ssh.run.side_effect = [
             SimpleNamespace(exit_status=1 if stdout else 0, stdout=stdout, stderr=""),
+            SimpleNamespace(exit_status=0, stdout="abc123\n", stderr=""),  # docker ps: still running
             SimpleNamespace(exit_status=0, stdout="", stderr=""),
         ]
     backend = build_services().backend
@@ -219,7 +220,8 @@ async def test_a_running_filler_without_sshd_past_the_grace_fails_stamps_and_is_
     probe = ssh.run.await_args_list[0].args[0]
     assert f"inspect -f '{{{{.State.Running}}}} {{{{.State.StartedAt}}}}' {FILLER}" in probe
     assert f"| base64 -d | /usr/bin/docker exec -u 0 -i {FILLER} sh -c" in probe
-    assert ssh.run.await_args_list[1].args[0] == f"/usr/bin/docker rm -fv {FILLER}"
+    assert ssh.run.await_args_list[1].args[0].startswith("/usr/bin/docker ps -q -f ")
+    assert ssh.run.await_args_list[2].args[0] == f"/usr/bin/docker rm -fv {FILLER}"
     backend.get_filler_run_active.assert_awaited_once_with("run-1", container_missing=True)
 
 

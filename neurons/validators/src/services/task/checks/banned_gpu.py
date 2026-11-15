@@ -19,6 +19,7 @@ class BannedGpuCheck:
     """
 
     check_id = "gpu.validate.banned"
+    replays_after_session_drop = True
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:

@@ -17,7 +17,8 @@ from test_deploy_optimizations import _docker_client, _patch_happy, _payload, _r
 
 @pytest.fixture
 def svc():
-    service = DockerService(ssh_service=Mock(), redis_service=Mock(), attestation_service=Mock())
+    redis_service = Mock(get=AsyncMock(return_value=None), mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True))
+    service = DockerService(ssh_service=Mock(), redis_service=redis_service, attestation_service=Mock())
     service._read_host_pid_max = AsyncMock(return_value=4_194_304)
     return service
 

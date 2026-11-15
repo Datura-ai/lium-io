@@ -79,9 +79,13 @@ def parse_container_listing(lines) -> tuple[tuple[str, ...], dict[str, str]]:
             ids[parts[0]] = parts[1]
     return tuple(names), ids
 DOCKER_VOLUME_LS_NAME_DRIVER_CMD = '/usr/bin/docker volume ls --format "{{.Name}} {{.Driver}}"'
+# A container `docker ps -a` lists but `docker inspect` cannot find ("no such object", a daemon
+# ghost that outlives restarts) is skipped: it failed this listing on every create, so the stale
+# volume sweep never ran and full-node rents failed short of disk. Any other inspect error still fails.
 DOCKER_MOUNTED_VOLUME_NAMES_CMD = (
-    "/usr/bin/docker ps -a -q | xargs -r /usr/bin/docker inspect --format "
+    "{ /usr/bin/docker ps -a -q | xargs -r /usr/bin/docker inspect --format "
     '\'{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{"\\n"}}{{end}}{{end}}\''
+    " 2>&1 >&3 | { ! grep -vi '^error: no such object: ' >&2; }; } 3>&1"
 )
 # Printed (untagged) when the awk that prefixes a section's lines fails: an untagged line makes
 # the parser raise, so a prefixing failure is a whole-probe fallback, never an empty listing.
@@ -89,11 +93,14 @@ PREFIX_FAILED_MARKER = "PRERUN_PROBE_PREFIX_FAILED"
 
 
 def port_check_container_filters(miner_hotkey: str) -> str:
-    """`docker ps` filters for validator probes (`container_{hotkey}_*`) and backend `health_check_*`."""
-    # docker ps OR-s multiple --filter name= flags
+    """`docker ps` filters for validator probes (`container_{hotkey}_*`, the port verifier's
+    `port_test_*`) and backend `health_check_*`."""
+    # docker ps OR-s multiple --filter name= flags. port_test_ runs --network=host, so neither
+    # `ss` in the executor nor `docker ps` Ports shows the host ports it holds (DAH-5797)
     return (
         f"--filter {shlex.quote(f'name=^container_{miner_hotkey}_')} "
-        f"--filter {shlex.quote('name=^health_check_')}"
+        f"--filter {shlex.quote('name=^health_check_')} "
+        f"--filter {shlex.quote('name=^port_test_')}"
     )
 
 

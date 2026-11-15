@@ -70,7 +70,8 @@ RUN arch="${TARGETARCH:-amd64}" \
 # pdm downloads Python 3.11.11 here (the base ships another 3.11 patch); pbs-installer 2026.10.25
 # moved that download to httpx2 and fails with "You must install httpx2 to use this function"
 # pdm/unearth pinned: unearth 0.19 (httpx2) breaks pdm install (executor-v1.157 build).
-RUN pip install "pdm==2.29.3" "unearth<0.19" "pbs-installer<2026.10.25"
+# pdm[locked]: pdm's own dependency pins; plain pdm took hishel 2.0.0, which crashes `pdm install` (DAH-5825)
+RUN pip install "pdm[locked]==2.29.3" "unearth<0.19" "pbs-installer<2026.10.25"
 ENV PDM_CHECK_UPDATE=false
 
 COPY pyproject.toml pdm.lock README.md ./
@@ -95,6 +96,19 @@ RUN if [ "$INSTALL_GPU_ATTESTATION" = "true" ]; then \
     fi
 
 COPY . .
+
+# The liumd binary is the vendored CI artifact under neurons/executor/liumd, installed at the path
+# the validator's SSH client runs. It arrives as the `liumd` named build context, so the per-arch
+# binaries never enter an image layer. There is no manifest or source check at runtime; the image
+# digest is the delivery trust boundary.
+RUN --mount=type=bind,from=liumd,source=.,target=/tmp/liumd \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) artifact=/tmp/liumd/liumd-amd64 ;; \
+      arm64) artifact=/tmp/liumd/liumd-arm64 ;; \
+      *) echo "no liumd artifact for ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+  && install -m 0755 "$artifact" /usr/local/bin/liumd \
+  && /usr/local/bin/liumd version
 
 # arm64 takes the aarch64 builds (lib*-aarch64.so, from celium-gpu-verifier's aarch64 build) once they are
 # vendored; until then the validator refuses ARM hosts with ARM_VERIFIER_NOT_AVAILABLE.

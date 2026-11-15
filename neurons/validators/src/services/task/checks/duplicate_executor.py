@@ -37,6 +37,7 @@ class DuplicateExecutorCheck:
     """
 
     check_id = "executor.validate.duplicate"
+    replays_after_session_drop = True
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:

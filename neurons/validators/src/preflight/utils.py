@@ -2,6 +2,7 @@
 
 import os
 import sys
+import time
 import logging
 from contextlib import contextmanager
 from typing import Optional
@@ -39,6 +40,43 @@ def suppress_library_output():
         os.dup2(stderr_dup, stderr_fd)
         os.close(stdout_dup)
         os.close(stderr_dup)
+
+
+UTILIZATION_SAMPLES = 5
+UTILIZATION_SAMPLE_INTERVAL_S = 1.0
+
+
+def _sample_utilization(pynvml, gpu_details: list, samples: int = UTILIZATION_SAMPLES,
+                        interval_s: float = UTILIZATION_SAMPLE_INTERVAL_S) -> None:
+    """Store several paired (gpu, memory) NVML utilization reads per GPU in utilization_samples.
+
+    The first read right after nvmlInit in a fresh container can report a spike on an idle
+    GPU (driver/context init when persistence mode is off), so a single sample refused idle
+    hosts (ticket-0996, RTX 3090). Reads stay paired: the check needs one whole idle sample.
+    A failed utilization read counts as 0, as before; a failed process-list read
+    keeps the strict memory check for that sample.
+    """
+    for detail in gpu_details:
+        detail["utilization_samples"] = []
+        detail["compute_process_samples"] = []
+    for n in range(samples):
+        if n:
+            time.sleep(interval_s)
+        for detail in gpu_details:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(detail["index"])
+            try:
+                rates = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                detail["utilization_samples"].append((rates.gpu, rates.memory))
+            except Exception:
+                detail["utilization_samples"].append((0, 0))
+            # Read after the utilization read: the process list changes over time, so a compute
+            # process starting mid-window must void the display exemption for that sample.
+            try:
+                detail["compute_process_samples"].append(len(pynvml.nvmlDeviceGetComputeRunningProcesses(handle)))
+            except Exception:
+                detail["compute_process_samples"].append(None)
+    for detail in gpu_details:
+        logger.debug(f"GPU {detail['index']} utilization samples (gpu, memory): {detail['utilization_samples']}")
 
 
 def get_gpu_info(include_utilization: bool = False, include_memory: bool = False) -> Optional[dict]:
@@ -86,15 +124,6 @@ def get_gpu_info(include_utilization: bool = False, include_memory: bool = False
             uuids.append(uuid)
 
             if include_utilization:
-                # Get utilization
-                try:
-                    utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                    gpu_util = utilization.gpu
-                    mem_util = utilization.memory
-                except:
-                    gpu_util = 0
-                    mem_util = 0
-
                 # Get memory info
                 try:
                     memory_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
@@ -102,14 +131,25 @@ def get_gpu_info(include_utilization: bool = False, include_memory: bool = False
                 except:
                     memory_total = 0
 
+                # A card driving a monitor shows display memory traffic while idle (ticket-0996);
+                # unreadable values keep the strict check.
+                try:
+                    display_active = pynvml.nvmlDeviceGetDisplayActive(handle) == 1
+                except Exception:
+                    display_active = False
+
                 gpu_details.append({
                     "index": i,
                     "name": pynvml.nvmlDeviceGetName(handle),
                     "uuid": uuid,
-                    "utilization": gpu_util,
-                    "memory_utilization": mem_util,
-                    "memory_total_mb": memory_total
+                    "utilization": 0,
+                    "memory_utilization": 0,
+                    "memory_total_mb": memory_total,
+                    "display_active": display_active,
                 })
+
+        if include_utilization:
+            _sample_utilization(pynvml, gpu_details)
 
         pynvml.nvmlShutdown()
 

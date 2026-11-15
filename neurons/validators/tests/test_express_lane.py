@@ -24,8 +24,12 @@ from clients.validator_portal_api import PortalExecutor, portal_miner_auth_blob
 from core.express_lane import (
     EXPRESS_FAILED_EVENT,
     EXPRESS_PUBLISHED_EVENT,
+    MAX_ATTEMPTS,
+    SESSION_LOST_MAX_RUNS,
     CycleInputs,
     ExpressLane,
+    _LaneOwnedNodes,
+    _Pending,
 )
 from fakeredis.aioredis import FakeRedis
 from fixtures.rest_miner_fixtures import VALIDATOR_HOTKEY
@@ -33,7 +37,7 @@ from fixtures.rest_miner_fixtures import executor_info as _executor_info
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.miner_service import CYCLE_DONE, MinerService
-from services.redis_service import RedisService
+from services.redis_service import EXPRESS_REDIS_SLOT, RedisService, _CommandLock
 from services.task.models import JobResult
 
 pytest_plugins = ["fixtures.incentive_fixtures", "fixtures.rest_miner_fixtures"]
@@ -181,6 +185,38 @@ async def test_the_wave_leaves_a_node_the_express_lane_has_queued_to_it(rest_min
     assert queued not in rest_miner_service.in_flight
 
 
+
+def _queued(executor_id: str, failed_runs: int = 0, not_before: float = 0.0) -> _Pending:
+    return _Pending(
+        executor=_portal_executor(executor_id),
+        miner_hotkey="miner-a",
+        first_seen_at=datetime.now(UTC),
+        failed_runs=failed_runs,
+        not_before=not_before,
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_wave_takes_a_node_whose_failed_first_pass_retry_is_due(rest_miner_service):
+    """DAH-6185: the lane launches nothing for a miner the wave has not listed, and each cycle
+    start marks every miner so; leaving a due retry to the lane could starve it cycle after
+    cycle. The wave runs it; a retry not due yet, or a node never run, stays the lane's."""
+    due, waiting, never_run = str(uuid4()), str(uuid4()), str(uuid4())
+    rest_miner_service.miner_returns(due, waiting, never_run)
+    rest_miner_service.express_queued = _LaneOwnedNodes(
+        {
+            due: _queued(due, failed_runs=1, not_before=time.monotonic() - 1),
+            waiting: _queued(waiting, failed_runs=1, not_before=time.monotonic() + 60),
+            never_run: _queued(never_run),
+        }
+    )
+
+    job = await _request(rest_miner_service)
+
+    assert {r.executor_info.uuid for r in job["results"]} == {due}
+    assert set(rest_miner_service.express_queued) == {waiting, never_run}
+
+
 # --- ExpressLane: discovery, caps, publish, retries -----------------------------------------
 
 
@@ -201,6 +237,7 @@ class _Harness:
             miner_service.in_flight = {}
             miner_service.miners_awaiting_wave_list = {}
             miner_service.express_queued = frozenset()
+            miner_service.express_published = {}
         self.miner_service = miner_service
         self.miner_service.publish_machine_specs = AsyncMock()
         # A self-hosted miner that does not answer its executor list (the portal-snapshot cases).
@@ -288,6 +325,100 @@ async def test_a_never_validated_executor_is_verified_alone_and_published_spec_o
     assert extra["executor_uuid"] == new_node and extra["outcome"] == "passed" and extra["attempt"] == 1
     assert 40 <= extra["registration_to_publish_s"] < 60
     assert extra["first_seen_to_publish_s"] >= 0 and extra["verification_s"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_a_published_express_result_is_recorded_under_the_cycles_job_batch_id(monkeypatch, wallet):
+    """A rented node, 13 Nov: the lane published its pass under the cycle's id, the cycle had no result
+    of its own for it and published an observations-only EXECUTOR_RESULT_MISSING under the same id 2.5 min
+    later, which billing read as the host down. The cycle reads this record into its reported set."""
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node.upper())]}, [_Neuron("miner-a")])
+
+    assert await harness.tick_and_settle() == 1
+
+    assert harness.miner_service.express_published == {new_node: harness.inputs.job_batch_id}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_or_lost_express_run_is_not_recorded_under_the_cycles_job_batch_id(monkeypatch, wallet):
+    """Review 4558671509: failed and session-lost runs carry no pod check, so the cycle's result-missing
+    fallback must still publish for them, or billing never sees a silent pod and keeps charging."""
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+
+    def failed(payload, executor_id):
+        return {"miner_hotkey": "miner-a", "miner_coldkey": "c", "results": [_job_result(executor_id, score=0.0)]}
+
+    harness.job_for = failed
+    assert await harness.tick_and_settle() == 1
+    harness.miner_service.publish_machine_specs.assert_awaited()
+    assert harness.miner_service.express_published == {}
+
+    def lost(payload, executor_id):
+        result = _job_result(executor_id, score=0.0)
+        result.session_lost_in_port_check = True
+        result.availability_errors = [{"reason_code": "GPU_MEMORY_HEALTH_FAILED"}]
+        return {"miner_hotkey": "miner-a", "miner_coldkey": "c", "results": [result]}
+
+    harness.miner_service.publish_machine_specs.reset_mock()
+    harness.job_for = lost
+    harness.lane._pending[new_node].not_before = 0.0
+    assert await harness.tick_and_settle() == 1
+    harness.miner_service.publish_machine_specs.assert_awaited()
+    assert harness.miner_service.express_published == {}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_or_lost_recheck_after_a_pass_drops_the_cycles_record(monkeypatch, wallet):
+    """Review 4558893416: a pass recorded earlier in the same batch must not keep the cycle's
+    result-missing fallback off once a later run of that node fails or loses its session."""
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+
+    def failed(payload, executor_id):
+        return {"miner_hotkey": "miner-a", "miner_coldkey": "c", "results": [_job_result(executor_id, score=0.0)]}
+
+    harness.miner_service.express_published[new_node] = harness.inputs.job_batch_id
+    harness.job_for = failed
+    assert await harness.tick_and_settle() == 1
+    assert harness.miner_service.express_published == {}
+
+    def lost(payload, executor_id):
+        result = _job_result(executor_id, score=0.0)
+        result.session_lost_in_port_check = True
+        return {"miner_hotkey": "miner-a", "miner_coldkey": "c", "results": [result]}
+
+    harness.miner_service.express_published[new_node] = harness.inputs.job_batch_id
+    harness.job_for = lost
+    harness.lane._pending[new_node].not_before = 0.0
+    assert await harness.tick_and_settle() == 1
+    assert harness.miner_service.express_published == {}
+
+
+@pytest.mark.asyncio
+async def test_a_restart_keeps_the_first_sighting_from_redis(monkeypatch, wallet, caplog):
+    """Regression: first_seen_at lived in memory only, so every validator rollout re-stamped it and
+    the logged discovery wait (registration to first sighting) grew by the whole restart."""
+    new_node = str(uuid4())
+    snapshot = {"miner-a": [_portal_executor(new_node, registered_seconds_ago=40)]}
+    before = _Harness(monkeypatch, snapshot, [_Neuron("miner-a")])
+    before.release.clear()  # the first process is cut off mid-run, before it publishes
+    assert await before.lane.tick() == 1
+    first_seen = before.lane._pending[new_node].first_seen_at
+    for task in before.lane._tasks:
+        task.cancel()
+    await asyncio.gather(*before.lane._tasks, return_exceptions=True)
+
+    after = _Harness(monkeypatch, snapshot, [_Neuron("miner-a")])
+    after.redis_service = before.redis_service  # the same Redis outlives the pod
+    after.lane.redis_service = before.redis_service
+    with caplog.at_level(logging.INFO):
+        assert await after.tick_and_settle() == 1
+
+    assert after.lane._pending.get(new_node) is None
+    published = [r for r in caplog.records if r.getMessage() == EXPRESS_PUBLISHED_EVENT]
+    assert published[0].msg.extra["first_seen_at"] == first_seen.isoformat()
 
 
 # --- Self-hosted miners: their new nodes are not in the portal snapshot --------------------
@@ -469,6 +600,29 @@ async def test_a_result_produced_after_the_job_files_vanished_is_not_the_nodes_v
     assert harness.lane._pending[new_node].failed_runs == 1
 
 
+
+@pytest.mark.asyncio
+async def test_a_failed_first_pass_is_the_waves_once_its_retry_is_due(monkeypatch, wallet):
+    """DAH-6185: after a failed first pass the node stays queued to the lane until its retry is
+    due; from then a wave that lists its miner takes it (the lane may still be waiting for that
+    list), so the retry is never starved."""
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+    monkeypatch.setattr(harness.settings, "EXPRESS_LANE_FAILED_FIRST_PASS_RETRY_ENABLED", True)
+
+    def failed_job(payload, executor_id, **_):
+        results = [_job_result(executor_id, score=0.0)]
+        return {"miner_hotkey": "miner-a", "miner_coldkey": "c", "results": results}
+
+    harness.miner_service.request_job_to_miner = AsyncMock(side_effect=failed_job)
+    assert await harness.tick_and_settle() == 1
+    assert harness.lane._pending[new_node].failed_runs == 1
+    assert new_node in harness.miner_service.express_queued  # retry not due: the lane's
+
+    harness.lane._pending[new_node].not_before = time.monotonic() - 1
+    assert new_node not in harness.miner_service.express_queued  # due: the wave's
+
+
 @pytest.mark.asyncio
 async def test_a_restart_queues_a_recently_added_unvalidated_node_again(monkeypatch, wallet):
     """A restart drops the queue and kills an express check in flight. The new process's first
@@ -511,6 +665,87 @@ async def test_a_failed_first_pass_logs_as_failed(monkeypatch, wallet, caplog):
     assert not [r for r in caplog.records if r.getMessage() == EXPRESS_PUBLISHED_EVENT]
     (failed,) = [r for r in caplog.records if r.getMessage() == EXPRESS_FAILED_EVENT]
     assert failed.msg.extra["outcome"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_a_session_lost_in_the_port_check_is_retried_not_a_failed_first_pass(monkeypatch, wallet):
+    """The validator's own session closed in the port check: no verdict. Its findings go out, the run is
+    retried as a deferral and never spends a failed first pass or marks the node validated."""
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+    finding = {"reason_code": "GPU_MEMORY_HEALTH_FAILED"}
+
+    def lost(payload, executor_id, findings):
+        result = _job_result(executor_id, score=0.0)
+        result.session_lost_in_port_check = True
+        result.availability_errors = findings
+        return {"miner_hotkey": "miner-a", "miner_coldkey": "c", "results": [result]}
+
+    harness.job_for = lambda payload, executor_id: lost(payload, executor_id, [finding])
+    assert await harness.tick_and_settle() == 1
+    (results, *_), _ = harness.miner_service.publish_machine_specs.await_args
+    assert results[0].availability_errors == [finding]
+    pending = harness.lane._pending[new_node]
+    assert (pending.failed_runs, pending.attempts) == (0, 0) and pending.not_before > 0
+    assert await harness.redis_service.get_validated_executors() == set()
+
+    # no finding: nothing is published
+    harness.miner_service.publish_machine_specs.reset_mock()
+    harness.job_for = lambda payload, executor_id: lost(payload, executor_id, None)
+    pending.not_before = 0.0
+    assert await harness.tick_and_settle() == 1
+    harness.miner_service.publish_machine_specs.assert_not_awaited()
+    assert (pending.failed_runs, pending.attempts, pending.lost_sessions) == (0, 0, 2)
+
+    # review 4482976707: no finding but a container the stale cleanup reaped: its state is published
+    from protocol.vc_protocol.validator_requests import ContainerState, PodContainerState
+
+    reaped = PodContainerState(pod_id="orphan-1", container_state=ContainerState.REAPED, observed_at=datetime.now(UTC))
+
+    def lost_with_reaped(payload, executor_id):
+        job = lost(payload, executor_id, None)
+        job["results"][0].pod_states = [reaped]
+        return job
+
+    harness.job_for = lost_with_reaped
+    pending.not_before = 0.0
+    assert await harness.tick_and_settle() == 1
+    (results, *_), _ = harness.miner_service.publish_machine_specs.await_args
+    assert results[0].pod_states == [reaped]
+    harness.miner_service.publish_machine_specs.reset_mock()
+    harness.job_for = lambda payload, executor_id: lost(payload, executor_id, None)
+
+    # more lost sessions than MAX_ATTEMPTS keep the node queued, up to SESSION_LOST_MAX_RUNS
+    for _ in range(SESSION_LOST_MAX_RUNS - 4):
+        pending.not_before = 0.0
+        assert await harness.tick_and_settle() == 1
+    assert harness.lane._pending[new_node] is pending and pending.attempts == 0
+    pending.not_before = 0.0
+    assert await harness.tick_and_settle() == 1
+    assert new_node not in harness.lane._pending and new_node in harness.lane._left_to_cycle
+
+
+@pytest.mark.asyncio
+async def test_a_session_lost_after_snapshot_misses_used_max_attempts_keeps_the_node_queued(
+    monkeypatch, wallet
+):
+    """Snapshot misses (which the fast path allows past MAX_ATTEMPTS) do not make a later lost session
+    leave the node to the cycle: that run is bounded only by SESSION_LOST_MAX_RUNS."""
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+
+    def lost(payload, executor_id):
+        result = _job_result(executor_id, score=0.0)
+        result.session_lost_in_port_check = True
+        return {"miner_hotkey": "miner-a", "miner_coldkey": "c", "results": [result]}
+
+    harness.job_for = lost
+    assert await harness.tick_and_settle() == 1
+    pending = harness.lane._pending[new_node]
+    pending.attempts, pending.not_before = MAX_ATTEMPTS, 0.0  # three earlier snapshot misses
+    assert await harness.tick_and_settle() == 1
+    assert harness.lane._pending[new_node] is pending and new_node not in harness.lane._left_to_cycle
+    assert (pending.attempts, pending.lost_sessions) == (MAX_ATTEMPTS, 2)
 
 
 @pytest.mark.asyncio
@@ -592,6 +827,45 @@ async def test_wave_publishes_nothing_at_pass_while_the_validated_set_is_cold():
     service.publish_machine_specs.assert_not_awaited()
 
 
+# --- The first pass's Redis commands do not queue behind the wave's ------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_first_pass_redis_read_is_not_blocked_by_the_wave_holding_the_command_lock():
+    service = _redis_service()
+    service.lock = _CommandLock()
+    # single commands no longer lock (DAH-5723); the two-command methods still do
+    async with service.lock:  # the wave's slot is held
+        wave_read = asyncio.create_task(service.first_uncached_at("wave", 1.0, 60))
+
+        async def first_pass_read():
+            EXPRESS_REDIS_SLOT.set(True)
+            return await service.first_uncached_at("new", 2.0, 60)
+
+        assert await asyncio.wait_for(asyncio.create_task(first_pass_read()), timeout=1) == 2.0
+        await asyncio.sleep(0)
+        assert not wave_read.done()  # the wave's own commands still wait their turn
+    assert await wave_read == 1.0
+
+
+@pytest.mark.asyncio
+async def test_the_express_lane_runs_its_first_pass_in_the_express_redis_slot(monkeypatch, wallet):
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node, registered_seconds_ago=40)]}, [_Neuron("miner-a")])
+    slot_seen = []
+    job_for = harness.job_for
+
+    def record_slot(payload, executor_id):
+        slot_seen.append(EXPRESS_REDIS_SLOT.get())
+        return job_for(payload, executor_id)
+
+    harness.job_for = record_slot
+
+    assert await harness.tick_and_settle() == 1
+    assert slot_seen == [True]
+    assert EXPRESS_REDIS_SLOT.get() is False  # set in the lane's own task only
+
+
 # --- DAH-5716: a provider-requested recheck of one node ------------------------------------
 
 
@@ -615,6 +889,97 @@ async def test_a_recheck_request_is_queued_and_a_bad_id_is_ignored():
 
     assert await redis_service.get_executor_recheck_requests() == {node}
     assert await redis_service.redis.ttl("express_lane:recheck_requests") > 0
+
+
+@pytest.mark.asyncio
+async def test_a_recheck_asked_once_per_window_is_queued_only_the_first_time():
+    redis_service = _redis_service()
+    node = str(uuid4())
+
+    first = await redis_service.request_executor_recheck_once(node, 1800)
+    await redis_service.srem("express_lane:recheck_requests", node)  # the lane picked it
+    again = await redis_service.request_executor_recheck_once(node, 1800)
+
+    assert (first, again) == (True, False)
+    assert await redis_service.get_executor_recheck_requests() == set()
+
+
+@pytest.mark.asyncio
+async def test_a_recheck_request_landing_while_the_old_one_ends_survives():
+    """Review 4512796524: a request made after the finishing run read the generation is not removed by it."""
+    redis_service = _redis_service()
+    node = str(uuid4())
+    await redis_service.request_executor_recheck(node)
+    generation = await redis_service.get_executor_recheck_generation(node)
+
+    make_pipeline = redis_service.redis.pipeline
+
+    def pipeline(*args, **kwargs):
+        pipe = make_pipeline(*args, **kwargs)
+        read = pipe.hget
+
+        async def hget_then_new_request(*a):
+            value = await read(*a)
+            if value is not None and int(value) == generation:
+                await redis_service.request_executor_recheck(node)  # lands between the read and the removal
+            return value
+
+        pipe.hget = hget_then_new_request
+        return pipe
+
+    redis_service.redis.pipeline = pipeline
+    await redis_service.pop_executor_recheck_request(node, generation)
+    assert await redis_service.get_executor_recheck_requests() == {node}
+
+    redis_service.redis.pipeline = make_pipeline
+    await redis_service.pop_executor_recheck_request(node, generation + 1)
+    assert await redis_service.get_executor_recheck_requests() == set()
+
+
+@pytest.mark.asyncio
+async def test_another_nodes_request_does_not_keep_this_ones_queued():
+    """Review 4523252183: B's request touches the shared generations hash while A ends; A's own request still goes."""
+    redis_service = _redis_service()
+    node_a, node_b = str(uuid4()), str(uuid4())
+    await redis_service.request_executor_recheck(node_a)
+    generation = await redis_service.get_executor_recheck_generation(node_a)
+
+    make_pipeline = redis_service.redis.pipeline
+    landed = []
+
+    def pipeline(*args, **kwargs):
+        pipe = make_pipeline(*args, **kwargs)
+        read = pipe.hget
+
+        async def hget_then_other_request(*a):
+            value = await read(*a)
+            if not landed:
+                landed.append(True)
+                await redis_service.request_executor_recheck(node_b)
+            return value
+
+        pipe.hget = hget_then_other_request
+        return pipe
+
+    redis_service.redis.pipeline = pipeline
+    await redis_service.pop_executor_recheck_request(node_a, generation)
+
+    assert await redis_service.get_executor_recheck_requests() == {node_b}
+
+
+@pytest.mark.asyncio
+async def test_a_request_made_during_an_unrequested_first_pass_survives_it(monkeypatch, wallet):
+    """Review 4523252174: the ordinary first pass of a new node did not select the request, so it does not end it."""
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+    harness.release.clear()
+
+    assert await harness.lane.tick() == 1
+    await harness.redis_service.request_executor_recheck(new_node)
+    harness.release.set()
+    await asyncio.gather(*harness.lane._tasks)
+
+    assert await harness.redis_service.get_executor_recheck_requests() == {new_node}
 
 
 @pytest.mark.asyncio
@@ -643,6 +1008,67 @@ async def test_a_requested_validated_executor_is_rechecked_once_under_the_caps(m
     assert await harness.tick_and_settle() == 1
     assert await harness.redis_service.get_executor_recheck_requests() == set()
     assert await harness.tick_and_settle() == 0  # each request runs once
+
+
+@pytest.mark.asyncio
+async def test_a_central_miner_hotkey_runs_past_the_per_miner_cap_under_the_global_cap(monkeypatch, wallet):
+    central = [str(uuid4()) for _ in range(6)]
+    self_hosted = [str(uuid4()) for _ in range(3)]
+    harness = _Harness(
+        monkeypatch,
+        {
+            "miner-central": [_portal_executor(n) for n in central],
+            "miner-a": [_portal_executor(n, registered_seconds_ago=60) for n in self_hosted],
+        },
+        [_Neuron("miner-central"), _Neuron("miner-a")],
+    )
+    harness.lane.subtensor_client.hotkeys_routed_via_central_miner = frozenset({"miner-central"})
+    monkeypatch.setattr(harness.settings, "EXPRESS_LANE_MAX_IN_FLIGHT", 7)
+    monkeypatch.setattr(harness.settings, "EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER", 2)
+    harness.release.clear()
+
+    # The self-hosted nodes are older: 2 of them (its cap), then 5 central ones fill the global 7.
+    assert await harness.lane.tick() == 7
+    running = set(harness.miner_service.in_flight)
+    assert len(running & set(self_hosted)) == 2
+    assert len(running & set(central)) == 5
+    assert await harness.lane.tick() == 0  # the global cap still holds
+
+    harness.release.set()
+    await asyncio.gather(*harness.lane._tasks)
+    assert await harness.tick_and_settle() == 2  # the rest: one central, one self-hosted
+
+
+@pytest.mark.asyncio
+async def test_a_node_is_rechecked_once_when_its_maintenance_window_ends(monkeypatch, wallet):
+    node, others_node = str(uuid4()), str(uuid4())
+    harness = _Harness(
+        monkeypatch,
+        {
+            "miner-a": [
+                _portal_executor(node, registered_seconds_ago=7 * 86400),
+                _portal_executor(others_node, registered_seconds_ago=7 * 86400, validator="another-validator"),
+            ]
+        },
+        [_Neuron("miner-a")],
+    )
+    await harness.redis_service.mark_executors_validated([node, others_node])
+    ends_at = datetime.now(UTC) + timedelta(minutes=10)
+    harness.inputs.maintenance_ends = {node: ends_at, others_node: ends_at}
+
+    assert await harness.tick_and_settle() == 0  # the window is still running
+
+    ends_at = datetime.now(UTC) - timedelta(seconds=1)
+    harness.inputs.maintenance_ends = {node: ends_at, others_node: ends_at}
+    assert await harness.tick_and_settle() == 1
+
+    (results, _, _), _ = harness.miner_service.publish_machine_specs.await_args
+    assert [r.executor_info.uuid for r in results] == [node]
+    # still the cycle's id, so no counter moves; the backend reads the recheck's start against the window's end
+    assert results[0].job_batch_id == CYCLE_BATCH_ID
+    assert results[0].check_started_at > ends_at
+    assert await harness.redis_service.get_executor_recheck_requests() == set()
+    assert await harness.tick_and_settle() == 0  # one recheck per window
 
 
 @pytest.mark.asyncio
@@ -695,10 +1121,40 @@ async def test_a_recheck_survives_a_deferral_and_ends_with_its_run_budget(monkey
     assert node not in harness.lane._pending  # never queued: the wave keeps scoring it
 
     for _ in range(express_lane.RECHECK_MAX_RUNS - 1):
+        harness.lane._recheck_pending[node].not_before = 0.0  # the deferral holds it until then
         assert await harness.tick_and_settle() == 1
     assert await harness.redis_service.get_executor_recheck_requests() == set()
     assert await harness.tick_and_settle() == 0
     harness.miner_service.publish_machine_specs.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_request_made_during_the_budgets_last_run_stays_queued(monkeypatch, wallet):
+    """Review 4510532999: the last run ended the request after it finished, so a provider's new request made while
+    it ran was deleted with it when the run came back with no executor."""
+    import core.express_lane as express_lane
+
+    node = str(uuid4())
+    harness = _Harness(
+        monkeypatch,
+        {"miner-a": [_portal_executor(node, registered_seconds_ago=7 * 86400)]},
+        [_Neuron("miner-a")],
+    )
+    harness.job_for = lambda payload, executor_id: {"results": []}  # the miner did not return it
+    await harness.redis_service.mark_executors_validated([node])
+    await harness.redis_service.request_executor_recheck(node)
+    for _ in range(express_lane.RECHECK_MAX_RUNS - 1):
+        assert await harness.tick_and_settle() == 1
+        harness.lane._recheck_pending[node].not_before = 0.0
+
+    harness.release.clear()
+    assert await harness.lane.tick() == 1  # the budget's last run, held open
+    await harness.redis_service.request_executor_recheck(node)
+    harness.release.set()
+    await asyncio.gather(*harness.lane._tasks)
+
+    assert await harness.redis_service.get_executor_recheck_requests() == {node}
+    assert await harness.tick_and_settle() == 1  # the new request gets its own runs
 
 
 @pytest.mark.asyncio
@@ -741,7 +1197,54 @@ async def test_a_failed_recheck_runs_again_when_the_first_pass_retry_is_on(monke
 
     assert await harness.tick_and_settle() == 1
     assert await harness.redis_service.get_executor_recheck_requests() == {node}
+    harness.lane._recheck_pending[node].not_before = 0.0  # FIRST_PASS_FAILED_RETRY_SECONDS later
     assert await harness.tick_and_settle() == 1  # the retry, the budget's last run
     assert harness.miner_service.publish_machine_specs.await_count == 2
+    assert await harness.redis_service.get_executor_recheck_requests() == set()
+    assert await harness.tick_and_settle() == 0
+
+
+@pytest.mark.asyncio
+async def test_a_recheck_whose_sessions_are_lost_keeps_its_runs_for_a_verdict(monkeypatch, wallet):
+    """Review 4491025356: a lost session in the port check is no verdict, so it spends none of the
+    recheck's runs; the request still ends after SESSION_LOST_MAX_RUNS lost sessions."""
+    import core.express_lane as express_lane
+
+    node = str(uuid4())
+    harness = _Harness(
+        monkeypatch,
+        {"miner-a": [_portal_executor(node, registered_seconds_ago=7 * 86400)]},
+        [_Neuron("miner-a")],
+    )
+
+    def lost(payload, executor_id):
+        result = _job_result(executor_id, score=0.0)
+        result.session_lost_in_port_check = True
+        return {"miner_hotkey": "miner-a", "miner_coldkey": "c", "results": [result]}
+
+    harness.job_for = lost
+    await harness.redis_service.mark_executors_validated([node])
+    await harness.redis_service.request_executor_recheck(node)
+
+    for _ in range(express_lane.RECHECK_MAX_RUNS):
+        assert await harness.tick_and_settle() == 1
+        pending = harness.lane._recheck_pending[node]
+        assert pending.not_before > 0  # the deferral outlives the tick
+        pending.not_before = 0.0
+    assert await harness.redis_service.get_executor_recheck_requests() == {node}
+
+    harness.job_for = lambda payload, executor_id: {
+        "results": [_job_result(executor_id, job_batch_id=payload.job_batch_id)]
+    }
+    assert await harness.tick_and_settle() == 1
+    harness.miner_service.publish_machine_specs.assert_awaited_once()
+    assert await harness.redis_service.get_executor_recheck_requests() == set()
+
+    harness.job_for = lost
+    await harness.redis_service.request_executor_recheck(node)
+    for _ in range(SESSION_LOST_MAX_RUNS):
+        assert await harness.tick_and_settle() == 1
+        if node in harness.lane._recheck_pending:
+            harness.lane._recheck_pending[node].not_before = 0.0
     assert await harness.redis_service.get_executor_recheck_requests() == set()
     assert await harness.tick_and_settle() == 0

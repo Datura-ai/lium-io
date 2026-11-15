@@ -8,7 +8,8 @@ RUN apt-get update \
   && apt-get install -y wget git \
   && rm -rf /var/lib/apt/lists/*
 
-RUN pip install "pdm==2.29.3" "unearth<0.19"
+# pdm[locked]: pdm's own dependency pins; plain pdm took hishel 2.0.0, which crashes `pdm install` (DAH-5825)
+RUN pip install "pdm[locked]==2.29.3" "unearth<0.19"
 ENV PDM_CHECK_UPDATE=false
 
 COPY pyproject.toml pdm.lock README.md ./
