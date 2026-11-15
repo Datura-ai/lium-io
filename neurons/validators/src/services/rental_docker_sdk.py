@@ -1520,11 +1520,16 @@ def build_gpu_docker_config(
     )
 
 
+# The backend's add fence (lium-platform DAH-6441) expires after an hour; this bound is what makes that expiry safe.
+AUTHORIZED_KEYS_APPEND_DEADLINE_SECONDS = 60
+
+
 def build_authorized_keys_exec_spec(
     *,
     container_name: str,
     public_keys: list[str] | tuple[str, ...],
     target_path: str = "/root/.ssh/authorized_keys",
+    append_deadline_seconds: int = AUTHORIZED_KEYS_APPEND_DEADLINE_SECONDS,
 ) -> ContainerExecSpec:
     import shlex
 
@@ -1532,14 +1537,19 @@ def build_authorized_keys_exec_spec(
     # chmod up front: key injection now runs before the sshd bootstrap's own
     # `chmod 700` (DAH-2341), and sshd may come up in between.
     quoted_dir = shlex.quote(target_path.rsplit("/", 1)[0])
+    # DAH-6441: the keys are read whole first and appended only within the deadline of this exec's own start, so an
+    # add whose connection stalled can never append later, after the backend has confirmed a removal of that key
+    script = (
+        "start=$(date +%s); "
+        'keys=$(mktemp) || exit 1; trap \'rm -f "$keys"\' EXIT; '
+        f'mkdir -p {quoted_dir} && chmod 700 {quoted_dir} && cat > "$keys" || exit 1; '
+        f'if [ $(( $(date +%s) - start )) -gt {append_deadline_seconds} ]; then '
+        'echo "authorized_keys append deadline passed" >&2; exit 75; fi; '
+        f'cat "$keys" >> {shlex.quote(target_path)}'
+    )
     return ContainerExecSpec(
         container_name=container_name,
-        argv=(
-            "sh",
-            "-c",
-            f"mkdir -p {quoted_dir} && chmod 700 {quoted_dir} "
-            f"&& cat >> {shlex.quote(target_path)}",
-        ),
+        argv=("sh", "-c", script),
         stdin=key_data,
     )
 

@@ -3,6 +3,7 @@ import json
 import os
 import socket
 import struct
+import subprocess
 import threading
 from unittest.mock import Mock
 
@@ -1720,3 +1721,50 @@ def test_rental_ssh_adapter_hands_paramiko_a_socket_to_the_pinned_address(tmp_pa
     finally:
         connected["sock"].close()
         listener.close()
+
+
+def _run_key_append(spec) -> subprocess.CompletedProcess:
+    return subprocess.run(list(spec.argv), input=spec.stdin, capture_output=True, text=True)
+
+
+def test_authorized_keys_append_adds_the_keys_within_the_deadline(tmp_path):
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("existing\n")
+
+    completed = _run_key_append(
+        build_authorized_keys_exec_spec(container_name="pod_key", public_keys=["k1", "k2"], target_path=str(target))
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == "existing\nk1\nk2\n"
+
+
+def test_authorized_keys_append_past_its_deadline_appends_nothing(tmp_path):
+    # DAH-6441: a stalled add must never append after the backend confirmed a removal
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("existing\n")
+
+    completed = _run_key_append(
+        build_authorized_keys_exec_spec(
+            container_name="pod_key", public_keys=["k1"], target_path=str(target), append_deadline_seconds=-1
+        )
+    )
+
+    assert completed.returncode == 75
+    assert target.read_text() == "existing\n"
+
+
+def test_authorized_keys_append_that_cannot_read_its_keys_appends_nothing(tmp_path):
+    blocker = tmp_path / "ssh"
+    blocker.write_text("a file where the directory should be")
+
+    completed = _run_key_append(
+        build_authorized_keys_exec_spec(
+            container_name="pod_key", public_keys=["k1"], target_path=str(blocker / "authorized_keys")
+        )
+    )
+
+    assert completed.returncode == 1
+    assert blocker.read_text() == "a file where the directory should be"
