@@ -1527,6 +1527,8 @@ def build_gpu_docker_config(
 # The backend's add fence (lium-platform DAH-6441) expires after an hour; this bound is what makes that expiry safe.
 AUTHORIZED_KEYS_APPEND_DEADLINE_SECONDS = 60
 AUTHORIZED_KEYS_LOCK_WAIT_SECONDS = 30
+# the lium CLI's transfer-key lock (TRANSFER_KEY_LOCK, ~/.ssh/.lium-cp.lock): its cp grant and revoke wait for these edits
+AUTHORIZED_KEYS_LOCK_FILE = ".lium-cp.lock"
 
 
 def _authorized_keys_lock(quoted_dir: str, busy_exit: int) -> str:
@@ -1534,7 +1536,7 @@ def _authorized_keys_lock(quoted_dir: str, busy_exit: int) -> str:
     and a delayed remove never writes back over a later one. BusyBox's flock has no -w, so poll -n. An image without
     flock edits unlocked, as before: a lock that survives a killed holder would block every later edit."""
     return (
-        f"if command -v flock >/dev/null 2>&1; then exec 9>>{quoted_dir}/.authorized_keys.lock || exit {busy_exit}; "
+        f"if command -v flock >/dev/null 2>&1; then exec 9>>{quoted_dir}/{AUTHORIZED_KEYS_LOCK_FILE} || exit {busy_exit}; "
         f"waited=0; until flock -n 9; do if [ $waited -ge {AUTHORIZED_KEYS_LOCK_WAIT_SECONDS} ]; then exit "
         f"{busy_exit}; fi; waited=$((waited + 1)); sleep 1; done; fi; "
     )

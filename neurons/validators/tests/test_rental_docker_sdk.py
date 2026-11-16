@@ -1824,7 +1824,7 @@ def test_authorized_keys_edit_waits_for_the_other_edit_and_never_writes_past_it(
     target = tmp_path / "ssh" / "authorized_keys"
     target.parent.mkdir()
     target.write_text("k1\n")
-    lock = str(target.parent / ".authorized_keys.lock")
+    lock = str(target.parent / ".lium-cp.lock")
     build = build_remove_authorized_keys_exec_spec if remove else build_authorized_keys_exec_spec
     spec = build(container_name="pod_key", public_keys=["k1"], target_path=str(target))
     holder = subprocess.Popen(["flock", "-o", lock, "sleep", "30"])
