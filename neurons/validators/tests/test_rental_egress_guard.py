@@ -697,5 +697,7 @@ def test_the_helper_bound_cannot_free_the_lock_while_a_mutation_runs(tmp_path, m
     # once the lock is free nothing touches iptables any more: the call had ended, or it was killed with the helper
     assert (state / "log").read_text() == calls_when_freed
     assert finished_when_freed or not (state / "done").exists()
-    # busybox kills only the shell: the call outlived it and kept the lock until it ended
-    assert finished_when_freed == (kills == "shell-only")
+    # busybox kills only the shell: the call outlived it and kept the lock until it ended. Whether a plain timeout
+    # kills the group depends on the host's timeout (the uutils one on Ubuntu 26.04 does not); both are safe above
+    if kills == "shell-only":
+        assert finished_when_freed
