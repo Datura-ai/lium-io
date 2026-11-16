@@ -220,10 +220,15 @@ async def credit_volumes_on_host(
     return volumes
 
 
+# endpoint -> index of the volume the next pass starts at, so a resize that eats every pass cannot starve the others
+_next_start: dict[str, int] = {}
+
+
 async def grow_short_volumes(
     ssh_client: asyncssh.SSHClientConnection,
     live_pod_ids: set[str],
     budget_seconds: float = GROW_PASS_MAX_SECONDS,
+    endpoint: str = "",
 ) -> GrowPass:
     """Grow each live pod's short volume as far as free disk allows. Never raises and never runs past
     `budget_seconds`: out of time, it returns what it has, and a volume not grown this pass is tried again on the
@@ -231,7 +236,7 @@ async def grow_short_volumes(
     grow = GrowPass()
     try:
         async with asyncio.timeout(budget_seconds):
-            await _grow_short_volumes(ssh_client, live_pod_ids, grow)
+            await _grow_short_volumes(ssh_client, live_pod_ids, grow, endpoint)
     except TimeoutError:
         logger.warning(
             _m(
@@ -243,7 +248,7 @@ async def grow_short_volumes(
 
 
 async def _grow_short_volumes(
-    ssh_client: asyncssh.SSHClientConnection, live_pod_ids: set[str], grow: GrowPass
+    ssh_client: asyncssh.SSHClientConnection, live_pod_ids: set[str], grow: GrowPass, endpoint: str
 ) -> None:
     try:
         listing = await ssh_client.run(
@@ -275,7 +280,9 @@ async def _grow_short_volumes(
         return
 
     plugin_ids: dict[str, str] = {}
-    for line in (inspect.stdout or "").splitlines():
+    lines = (inspect.stdout or "").splitlines()
+    start = _next_start.get(endpoint, 0) % max(len(lines), 1)
+    for index, line in enumerate(lines[start:] + lines[:start]):
         name, order_gb, driver, sparse = (line.strip().split("|") + ["", "", "", ""])[:4]
         if not order_gb.isdigit() or not driver.startswith("vloopback"):
             continue
@@ -307,6 +314,8 @@ async def _grow_short_volumes(
             + " grow "
             + " ".join(map(shlex.quote, args))
         )
+        # advanced before the await: a pass cancelled mid-resize still starts the next one after this volume
+        _next_start[endpoint] = start + index + 1
         grow.attempted = True
         grow.unreported_bytes += int(order_gb) * _GB  # until its report comes back (a cancel leaves it counted)
         try:

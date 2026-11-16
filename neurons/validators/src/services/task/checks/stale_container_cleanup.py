@@ -281,7 +281,7 @@ class StaleContainerCleanupCheck:
         # bounded by the shared budget above, keeping two reads' worth for the measurement after it
         grow_budget = grow_deadline - time.monotonic() - 2 * SSH_CALL_TIMEOUT_SECONDS
         grown = (
-            await grow_short_volumes(ctx.ssh, grow_pod_ids, grow_budget)
+            await grow_short_volumes(ctx.ssh, grow_pod_ids, grow_budget, str(ctx.executor.uuid))
             if grow_pod_ids and grow_budget > 0
             else GrowPass()
         )

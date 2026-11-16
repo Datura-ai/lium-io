@@ -26,6 +26,8 @@ GB = 1024**3
 def _host_lock(tmp_path, monkeypatch):
     # the host script's lock lives in /run on a node; here a writable path
     monkeypatch.setenv("VOLUME_GROW_LOCK", str(tmp_path / "grow.lock"))
+    # each test starts its passes at the first volume
+    monkeypatch.setattr("services.volume_grow._next_start", {})
 
 
 def test_only_a_volume_granted_short_of_its_order_is_labelled():
@@ -457,6 +459,33 @@ async def test_a_stalled_resize_ends_the_pass_at_its_budget_with_the_sizes_it_ha
     # the stalled grow may still allocate on the host: its order stays counted as taken
     assert grown.unreported_bytes == 466 * GB
     assert all("timeout" in call.kwargs for call in ssh.run.await_args_list)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order", [("stuck", "healthy"), ("healthy", "stuck")])
+async def test_a_resize_that_stalls_every_pass_does_not_starve_the_other_volume(order):
+    async def run(command, **kwargs):
+        if command.startswith("timeout "):
+            if "volume_stuck" in command:
+                await asyncio.Event().wait()
+            return _ran(f"grown {466 * GB}\n")
+        if "volume ls" in command:
+            return _ran("".join(f"volume_{name}\n" for name in order))
+        if "volume inspect" in command:
+            return _ran("".join(f"volume_{name}|466|vloopback:v3|\n" for name in order))
+        if "docker info" in command:
+            return _ran("/var/lib/docker\n")
+        return _ran("abc\n")
+
+    ssh = SimpleNamespace(run=AsyncMock(side_effect=run))
+    endpoint = f"executor-{'-'.join(order)}"
+
+    passes = [
+        await asyncio.wait_for(grow_short_volumes(ssh, set(order), budget_seconds=0.2, endpoint=endpoint), 5)
+        for _ in range(3)
+    ]
+
+    assert any(grown.sizes_gb == {"healthy": 466} for grown in passes)
 
 
 def test_an_unreadable_filesystem_size_reports_no_size_and_grows_nothing(tmp_path):
