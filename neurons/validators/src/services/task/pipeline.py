@@ -115,7 +115,7 @@ class PodRecoverer(Protocol):
         private_key: str | None,
         pod_id: str,
         default_extra: dict[str, Any],
-        recorded: tuple[str, str] | None = None,
+        recorded: tuple[str, str, str] | None = None,
     ) -> bool | None: ...
 
     async def forget_recovery_stop(self, pod_id: str) -> None: ...
