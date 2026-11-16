@@ -9,14 +9,14 @@ import pytest
 from neurons.validators.src.services.nvidia_devices import KernelGpuView
 from neurons.validators.src.services.task.checks import hardware_identity
 from neurons.validators.src.services.task.checks.hardware_identity import (
-    DMI_ID_PATH,
     BOOT_ID_PATH,
+    DMI_ID_PATH,
     HW_ID_BOOT_FS_SEPARATOR,
     HW_ID_BOOT_SEPARATOR,
     HW_ID_BOOT_VALUE_SEPARATOR,
     HW_ID_FS_SEPARATOR,
-    HW_ID_VALUES_SEPARATOR,
     HW_ID_KEY_PREFIX,
+    HW_ID_VALUES_SEPARATOR,
     HardwareIdentityCheck,
     dmi_overlay_findings,
     gpu_sources_disagree,
