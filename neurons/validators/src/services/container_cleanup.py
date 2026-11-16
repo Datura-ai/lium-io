@@ -102,6 +102,19 @@ def idle_filler_images_removal_command(keep_image: str | None = None) -> str:
     )
 
 
+def idle_filler_images_size_command(keep_image: str | None = None) -> str:
+    """Prints the byte size of each image `idle_filler_images_removal_command` would remove, one per line."""
+    keep = _image_repository(keep_image) if keep_image else None
+    repositories = [repository for repository in FILLER_IMAGE_REPOSITORIES if repository != keep]
+    if not repositories:
+        return "true"
+    return (
+        "/usr/bin/docker image ls "
+        + " ".join(f"--filter reference={repository}" for repository in repositories)
+        + " -q | sort -u | xargs -r /usr/bin/docker image inspect --format '{{.Size}}'"
+    )
+
+
 async def evict_cache_volumes_oldest_first(
     ssh_client: asyncssh.SSHClientConnection,
     volume_names: list[str],

@@ -853,6 +853,26 @@ async def test_a_refused_reset_on_a_whole_host_pod_is_not_ok_and_every_holder_is
 
 
 @pytest.mark.asyncio
+async def test_a_refused_reset_logs_the_whole_host_output_the_report_cuts(caplog):
+    host = _b300(reset_exit=1)
+    with caplog.at_level("WARNING", logger="services.gpu_reset"):
+        report, _ = await _reset(host, backend=U)
+    logged = [r.getMessage() for r in caplog.records if "nvidia-smi -r refused" in r.getMessage()]
+    assert len(logged) == 1 and FM in logged[0]
+    assert NAME in logged[0]
+    assert "stdout" in logged[0] and "stderr" in logged[0]
+
+
+@pytest.mark.asyncio
+async def test_a_refused_reset_whose_holder_does_not_come_back_still_logs_the_host_output(caplog):
+    host = _b300(reset_exit=1, fm_start_ok=False)
+    with caplog.at_level("WARNING", logger="services.gpu_reset"):
+        report, _ = await _reset(host, backend=U)
+    assert not report.ok and "nvidia-fabricmanager is not active" in report.detail
+    assert len([r for r in caplog.records if "nvidia-smi -r refused" in r.getMessage()]) == 1
+
+
+@pytest.mark.asyncio
 async def test_every_host_gpu_holder_comes_back_when_the_reset_raises():
     host = _b300()
     host.reset_raises = True
