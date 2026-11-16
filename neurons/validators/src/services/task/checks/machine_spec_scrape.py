@@ -402,30 +402,28 @@ class MachineSpecScrapeCheck:
     async def run(self, ctx: Context) -> CheckResult:
         liumd_specs = settings.VALIDATOR_LIUMD_SPECS and not settings.DRY_RUN
         if liumd_specs:
-            result = await self._scrape_with_liumd(ctx)
-            if result is not None:
-                return result
+            return await self._scrape_with_liumd(ctx)
 
         timeout = ctx.config.machine_scrape_timeout or self.DEFAULT_TIMEOUT
 
         if ctx.config.machine_scrape_source:
-            return await self._scrape_from_source(ctx, timeout, start_shadow=not liumd_specs)
-        return await self._scrape_uploaded_binary(ctx, timeout, start_shadow=not liumd_specs)
+            return await self._scrape_from_source(ctx, timeout, start_shadow=True)
+        return await self._scrape_uploaded_binary(ctx, timeout, start_shadow=True)
 
-    async def _scrape_with_liumd(self, ctx: Context) -> CheckResult | None:
-        """Use the full machine-scrape document from the same early `liumd run`.
-
-        None means liumd delivered no usable document; the caller runs the Python scrape.
-        """
+    async def _scrape_with_liumd(self, ctx: Context) -> CheckResult:
+        """Use the full machine-scrape document from the same early `liumd run`."""
         from services.local_verify_client import LocalVerifyAnswer
 
         from ..liumd_shadow import start_facts_after_scrape
 
         task = start_facts_after_scrape(ctx)
-        answer = await task if task is not None else None
-        if not isinstance(answer, LocalVerifyAnswer) or not answer.specs:
-            self._log_liumd_fallback(ctx, answer)
-            return None
+        if task is None:
+            return self._fail_liumd(ctx, None, "no early liumd read")
+        answer = await task
+        if not isinstance(answer, LocalVerifyAnswer):
+            return self._fail_liumd(ctx, answer)
+        if not answer.specs:
+            return self._fail_liumd(ctx, answer, "empty liumd specs")
 
         specs = _normalize_liumd_document(answer.specs)
         gpu_info = specs.get("gpu")
@@ -433,8 +431,7 @@ class MachineSpecScrapeCheck:
         if not isinstance(gpu_info, dict) or not isinstance(raw_gpu_details, list) or not all(
             isinstance(detail, dict) for detail in raw_gpu_details
         ):
-            self._log_liumd_fallback(ctx, answer, "malformed liumd specs")
-            return None
+            return self._fail_liumd(ctx, answer, "malformed liumd specs")
         vloopback = specs.pop("vloopback_check", None)
         specs.pop("port_verify_first_miss", None)
         specs.pop("split_disk", None)
@@ -525,20 +522,30 @@ class MachineSpecScrapeCheck:
         return CheckResult(passed=False, event=event, updates=reset, extra_events=gpu_lost_events)
 
     @staticmethod
-    def _log_liumd_fallback(ctx: Context, answer: Any, detail: str | None = None) -> None:
-        if detail is None:
-            detail = (
-                getattr(answer, "detail", None)
-                or getattr(answer, "reason", None)
-                or getattr(answer, "error", None)
-                or ("no liumd specs" if answer is not None else "no early liumd read")
-            )
-        logger.warning(
-            _m(
-                "machine scrape: liumd specs unavailable, falling back to the Python scrape",
-                extra=get_extra_info({**ctx.default_extra, "detail": str(detail)[:300]}),
-            )
+    def _fail_liumd(ctx: Context, answer: Any, detail: str | None = None) -> CheckResult:
+        from services.local_verify_client import LocalVerifyUnavailable
+
+        if isinstance(answer, LocalVerifyUnavailable):
+            reason = answer.reason or "unavailable"
+            detail = detail or answer.detail
+        elif answer is None:
+            reason = "no_early_read"
+        else:
+            reason = "malformed"
+        detail = (detail or reason)[:300]
+        template = Msg.SCRAPE_TIMEOUT if reason == "timeout" else Msg.SCRAPE_FAILED_ON_HOST
+        event = render_message(
+            template,
+            ctx=ctx,
+            check_id=MachineSpecScrapeCheck.check_id,
+            what={
+                "delivery": "liumd",
+                "liumd_reason": reason,
+                "scrape_error": reason,
+                "detail": detail,
+            },
         )
+        return CheckResult(passed=False, event=event)
 
     async def _scrape_from_source(
         self, ctx: Context, timeout: int, *, start_shadow: bool = True

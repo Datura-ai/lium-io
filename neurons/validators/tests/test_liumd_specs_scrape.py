@@ -1,8 +1,9 @@
-"""DAH-4689: the liumd machine-scrape document, with the Python scrape as fallback."""
+"""DAH-4689: the liumd machine-scrape document, without a Python fallback in specs mode."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -10,7 +11,7 @@ from helpers import build_context_config, build_services, build_state, make_cont
 from services.local_verify_client import LocalVerifyAnswer, LocalVerifyUnavailable
 from services.task import liumd_shadow
 from services.task.checks import machine_spec_scrape
-from services.task.checks.machine_spec_scrape import MachineSpecScrapeCheck
+from services.task.checks.machine_spec_scrape import MachineSpecScrapeCheck, normalize_liumd_specs
 from services.task.messages import MachineSpecMessages as Msg
 from test_machine_spec_scrape_check import (
     FERNET_TOKEN,
@@ -106,18 +107,18 @@ async def test_the_liumd_document_replaces_the_python_scrape(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "outcome",
+    ("outcome", "reason"),
     [
-        None,
-        LocalVerifyUnavailable("not_supported", "exit 127: no liumd on this host"),
-        _answer({}),
-        _answer({"cpu": {}}),
+        (None, "no_early_read"),
+        (LocalVerifyUnavailable("not_supported", "exit 127: no liumd on this host"), "not_supported"),
+        (_answer({}), "malformed"),
+        (_answer({"cpu": {}}), "malformed"),
     ],
-    ids=["no-early-read", "not-supported", "no-specs", "no-gpu-key"],
+    ids=["no-early-read", "not-supported", "empty-specs", "no-gpu-key"],
 )
 @pytest.mark.asyncio
-async def test_an_unusable_liumd_document_falls_back_to_the_python_scrape(
-    monkeypatch, outcome
+async def test_an_unusable_liumd_document_fails_without_the_python_scrape(
+    monkeypatch, outcome, reason
 ):
     _liumd_on(monkeypatch)
     start = _start_reading(monkeypatch, outcome)
@@ -125,13 +126,12 @@ async def test_an_unusable_liumd_document_falls_back_to_the_python_scrape(
 
     result = await MachineSpecScrapeCheck().run(_ctx(runner))
 
-    assert result.passed is True
-    assert result.event.what_we_saw["delivery"] == "stdin"
-    updated = result.updates["state"]
-    assert updated.scrape_specs == RAW_SPECS
-    assert updated.liumd_shadow_facts_task is None
-    assert updated.liumd_shadow_facts_attempted is True
-    assert len(runner.calls) == 1
+    assert result.passed is False
+    assert result.event.reason_code == Msg.SCRAPE_FAILED_ON_HOST.reason
+    assert result.event.what_we_saw["delivery"] == "liumd"
+    assert result.event.what_we_saw["liumd_reason"] == reason
+    assert result.updates == {}
+    assert len(runner.calls) == 0
     assert len(start) == 1
 
 
@@ -190,3 +190,30 @@ async def test_a_liumd_nvml_error_is_reported_as_a_driver_failure(monkeypatch):
     assert result.event.reason_code == Msg.SCRAPE_FAILED_DRIVER.reason
     assert result.event.what_we_saw["gpu_scrape_error"] == "NVMLError(16)"
     assert runner.calls == []
+
+
+def test_normalization_maps_the_liumd_contract_without_mutating_the_snapshot():
+    raw = {
+        "data_gpu": {
+            "gpu_count": 1,
+            "gpu_details": [{"gpu.name": "NVIDIA A10", "gpu.uuid": "GPU-1", "gpu.capacity": 24576.0}],
+        },
+        "data_processes": [{"processes_pid": 7, "processes_info": "info", "processes_container_name": None}],
+        "data_ram": {"ram_total": 1024.0, "ram_free": 512.0, "ram_used": 512.0, "ram_available": 900.0, "ram_utilization": 12.5},
+        "data_os": "Ubuntu 24.04 LTS",
+        "data_network": {},
+        "data_vloopback_check": {"vc_verdict": "pass"},
+    }
+    snapshot = json.loads(json.dumps(raw))
+
+    normalized = normalize_liumd_specs(raw)
+
+    assert "data_gpu" not in normalized
+    assert normalized["gpu"]["count"] == 1
+    assert normalized["gpu"]["details"][0] == {"name": "NVIDIA A10", "uuid": "GPU-1", "capacity": 24576.0}
+    assert normalized["gpu_processes"][0]["pid"] == 7
+    assert normalized["gpu_processes"][0]["container_name"] is None
+    assert normalized["ram"]["total"] == 1024.0
+    assert normalized["os"] == "Ubuntu 24.04 LTS"
+    assert "vloopback_check" not in normalized
+    assert raw == snapshot
