@@ -12444,13 +12444,17 @@ class DockerService:
 
             async def _stop_after_starts() -> None:
                 await asyncio.gather(*starts, return_exceptions=True)
+                # read before the stops: it lets a later retry tell this run from a pod started again since
+                identity = ""
+                with contextlib.suppress(Exception):
+                    identity = await docker_client.container_identity(container_name=container_name) or ""
                 try:
                     await self._stop_half_started_container(docker_client, container_name, default_extra)
                 except RentalDockerOperationError:
                     self._stop_half_started_container_later(
-                        executor_info, private_key, container_name, pod_id, default_extra
+                        executor_info, private_key, container_name, identity, pod_id, default_extra
                     )
-                    await self._mark_half_started_stop_pending(pod_id, container_name, default_extra)
+                    await self._mark_half_started_stop_pending(pod_id, container_name, identity, default_extra)
                     raise
 
             stale_mount_error: Exception | None = None
@@ -12538,6 +12542,7 @@ class DockerService:
         executor_info: ExecutorSSHInfo,
         private_key: str,
         container_name: str,
+        identity: str,
         pod_id: str,
         default_extra: dict[str, Any],
     ) -> None:
@@ -12549,7 +12554,7 @@ class DockerService:
                     private_key=private_key,
                     pod_id=pod_id,
                     default_extra=default_extra,
-                    container_name=container_name,
+                    recorded=(container_name, identity),
                 ):
                     return
 
@@ -12562,13 +12567,13 @@ class DockerService:
         )
 
     async def _mark_half_started_stop_pending(
-        self, pod_id: str, container_name: str, default_extra: dict[str, Any]
+        self, pod_id: str, container_name: str, identity: str, default_extra: dict[str, Any]
     ) -> None:
         try:
             await asyncio.wait_for(
                 self.redis_service.set(
                     f"{HALF_STARTED_STOP_PENDING_PREFIX}{pod_id}",
-                    container_name,
+                    json.dumps({"container_name": container_name, "identity": identity}),
                     ex=HALF_STARTED_STOP_PENDING_TTL_SECONDS,
                 ),
                 timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
@@ -12604,44 +12609,53 @@ class DockerService:
         private_key: str | None,
         pod_id: str,
         default_extra: dict[str, Any],
-        container_name: str | None = None,
+        recorded: tuple[str, str] | None = None,
     ) -> bool | None:
         """Stop a pod whose failed start left it possibly running without its mount (F-31/F-37/F-15).
-        None when none is pending; True once Docker says it is stopped; False (logged) while it still may run."""
+        Only the very run recorded at the failure is stopped: a pod started or re-created since is left running.
+        None when none is pending; True once it is stopped or no longer that run (record dropped); False (logged)
+        while it still may run."""
         extra = {**default_extra, "pod_id": pod_id}
-        if container_name is None:
+        if recorded is None:
             try:
-                recorded = await asyncio.wait_for(
+                raw = await asyncio.wait_for(
                     self.redis_service.get(f"{HALF_STARTED_STOP_PENDING_PREFIX}{pod_id}"),
                     timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
                 )
+                if raw is None:
+                    return None
+                record = json.loads(raw)
+                recorded = (record["container_name"], record["identity"])
             except Exception as exc:  # noqa: BLE001
                 logger.error(
                     _m("POD_HALF_STARTED_STOP_MARK_UNREADABLE", extra=get_extra_info({**extra, "error": str(exc)}))
                 )
                 return None
-            if recorded is None:
-                return None
-            container_name = recorded.decode() if isinstance(recorded, bytes) else recorded
+        container_name, identity = recorded
+        extra["container_name"] = container_name
         try:
             if not private_key:
                 raise RentalDockerOperationError("no executor key to reach Docker")
             async with self.rental_docker_client_factory.connect(
                 executor_info=executor_info, private_key=private_key
             ) as docker_client:
-                await self._stop_half_started_container(docker_client, container_name, extra)
+                if not identity:
+                    raise RentalDockerOperationError("the failed run's container identity was not recorded")
+                current = await docker_client.container_identity(container_name=container_name)
+                if current != identity:
+                    logger.info(
+                        _m(
+                            "POD_HALF_STARTED_STOP_DROPPED_NOT_SAME_RUN",
+                            extra=get_extra_info({**extra, "container_gone": current is None}),
+                        )
+                    )
+                else:
+                    await self._stop_half_started_container(docker_client, container_name, extra)
+                    logger.info(_m("POD_HALF_STARTED_STOP_CONFIRMED", extra=get_extra_info(extra)))
         except Exception as exc:  # noqa: BLE001
-            logger.error(
-                _m(
-                    "POD_HALF_STARTED_STOP_STILL_PENDING",
-                    extra=get_extra_info({**extra, "container_name": container_name, "error": str(exc)}),
-                )
-            )
+            logger.error(_m("POD_HALF_STARTED_STOP_STILL_PENDING", extra=get_extra_info({**extra, "error": str(exc)})))
             return False
         await self._forget_half_started_stop(pod_id, extra)
-        logger.info(
-            _m("POD_HALF_STARTED_STOP_CONFIRMED", extra=get_extra_info({**extra, "container_name": container_name}))
-        )
         return True
 
     async def _bring_up_existing_container(

@@ -125,6 +125,8 @@ class _FakeRentalDockerClient:
         self.stop_error = None
         self.kill_error = None
         self.killed_containers = []
+        self.identity = "cid@t1"
+        self.identity_error = None
         self.remove_error = None
         self.remove_volume_error = None
         # per-call answers for remove_volume, consumed in order (None = success); once empty,
@@ -177,6 +179,11 @@ class _FakeRentalDockerClient:
     async def exec_in_container(self, spec) -> ContainerExecResult:
         self.exec_specs.append(spec)
         return ContainerExecResult(exit_status=0)
+
+    async def container_identity(self, *, container_name: str) -> str | None:
+        if self.identity_error is not None:
+            raise self.identity_error
+        return self.identity
 
     async def inspect_container_state(self, *, container_name: str) -> ContainerStateSnapshot:
         return ContainerStateSnapshot(
@@ -3456,7 +3463,9 @@ async def test_a_half_started_pod_that_refuses_stop_and_kill_fails_the_start_as_
         await _start_existing(docker_service)
 
     docker_service.redis_service.set.assert_any_await(
-        "half_started_stop_pending:pod-id", "pod_test", ex=docker_service_module.HALF_STARTED_STOP_PENDING_TTL_SECONDS
+        "half_started_stop_pending:pod-id",
+        json.dumps({"container_name": "pod_test", "identity": "cid@t1"}),
+        ex=docker_service_module.HALF_STARTED_STOP_PENDING_TTL_SECONDS,
     )
     docker_service_module._HALF_STARTED_STOP_LATER.pop("pod-id").cancel()
 
@@ -3490,7 +3499,7 @@ async def test_a_half_started_pod_that_refused_stop_and_kill_is_stopped_by_the_p
 @pytest.mark.asyncio
 async def test_retry_half_started_stop_stops_the_recorded_container_and_clears_its_mark(docker_service, monkeypatch):
     monkeypatch.setattr("services.docker_service._HALF_STARTED_STOP_RETRY_SEC", 0)
-    docker_service.redis_service.get = AsyncMock(return_value=b"pod_test")
+    docker_service.redis_service.get = AsyncMock(return_value=json.dumps({"container_name": "pod_test", "identity": "cid@t1"}))
     docker_service.redis_service.delete = AsyncMock()
     client = docker_service.rental_docker_client_factory.client
     client.running = True
@@ -3507,7 +3516,7 @@ async def test_retry_half_started_stop_stops_the_recorded_container_and_clears_i
 @pytest.mark.asyncio
 async def test_retry_half_started_stop_keeps_the_mark_while_docker_refuses(docker_service, monkeypatch):
     monkeypatch.setattr("services.docker_service._HALF_STARTED_STOP_RETRY_SEC", 0)
-    docker_service.redis_service.get = AsyncMock(return_value="pod_test")
+    docker_service.redis_service.get = AsyncMock(return_value=json.dumps({"container_name": "pod_test", "identity": "cid@t1"}))
     docker_service.redis_service.delete = AsyncMock()
     client = docker_service.rental_docker_client_factory.client
     client.running = True
@@ -3519,6 +3528,44 @@ async def test_retry_half_started_stop_keeps_the_mark_while_docker_refuses(docke
     )
 
     assert stopped is False
+    docker_service.redis_service.delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retry_half_started_stop_leaves_a_pod_started_again_since_running_and_drops_its_mark(docker_service):
+    docker_service.redis_service.get = AsyncMock(
+        return_value=json.dumps({"container_name": "pod_test", "identity": "cid@t1"})
+    )
+    docker_service.redis_service.delete = AsyncMock()
+    client = docker_service.rental_docker_client_factory.client
+    client.running = True
+    client.identity = "cid@t2"
+
+    stopped = await docker_service.retry_half_started_stop(
+        executor_info=Mock(), private_key="private-key", pod_id="pod-id", default_extra={}
+    )
+
+    assert stopped is True
+    assert client.stopped_containers == [] and client.killed_containers == []
+    docker_service.redis_service.delete.assert_awaited_once_with("half_started_stop_pending:pod-id")
+
+
+@pytest.mark.asyncio
+async def test_retry_half_started_stop_does_not_stop_and_keeps_the_mark_when_the_inspect_fails(docker_service):
+    docker_service.redis_service.get = AsyncMock(
+        return_value=json.dumps({"container_name": "pod_test", "identity": "cid@t1"})
+    )
+    docker_service.redis_service.delete = AsyncMock()
+    client = docker_service.rental_docker_client_factory.client
+    client.running = True
+    client.identity_error = RuntimeError("docker down")
+
+    stopped = await docker_service.retry_half_started_stop(
+        executor_info=Mock(), private_key="private-key", pod_id="pod-id", default_extra={}
+    )
+
+    assert stopped is False
+    assert client.stopped_containers == []
     docker_service.redis_service.delete.assert_not_awaited()
 
 

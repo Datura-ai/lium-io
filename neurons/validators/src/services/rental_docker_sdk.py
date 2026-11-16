@@ -742,6 +742,20 @@ class RentalDockerSdkClient:
                 _wrap_error_message("Docker SDK inspect container failed", exc)
             ) from exc
 
+    async def container_identity(self, *, container_name: str) -> str | None:
+        """"<Id>@<StartedAt>": a re-create changes the id, a re-start the start time. None once the container is gone."""
+        try:
+            info = await _in_docker_thread(self._api_client.inspect_container, container_name)
+        except Exception as exc:
+            if _is_docker_not_found_error(exc):
+                return None
+            raise RentalDockerOperationError(_wrap_error_message("Docker SDK inspect container failed", exc)) from exc
+        container_id = info.get("Id") if isinstance(info, dict) else None
+        started_at = (info.get("State") or {}).get("StartedAt") if isinstance(info, dict) else None
+        if not container_id or not started_at:
+            raise RentalDockerOperationError("Docker inspect did not include the container's Id and StartedAt")
+        return f"{container_id}@{started_at}"
+
     async def container_log_tail(self, *, container_name: str, lines: int) -> str:
         """The container's last `lines` of stdout+stderr, decoded with replacement characters."""
         try:
