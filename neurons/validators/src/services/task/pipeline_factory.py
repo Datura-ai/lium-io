@@ -57,6 +57,7 @@ from .checks import (
     GpuThermalThrottleCheck,
     GpuUsageCheck,
     GpuVramPrecheck,
+    SpecFloorCheck,
     GpuModelVerdictCheck,
     HardwareIdentityCheck,
     IdleDiskWriteCheck,
@@ -342,6 +343,8 @@ class PipelineFactory:
                 # here — before the rented short-circuit (TenantEnforcementCheck)
                 # — to gate rented and idle executors alike.
                 GpuVramPrecheck(),
+                # pure-data hard floors on the scraped specs, before the rented short-circuit like the VRAM gate
+                SpecFloorCheck(),
                 # DAH-2928: pure-data, non-fatal report on specs.disk_health from the scrape. A
                 # docker root that refuses writes cannot start a container; placed before the rented
                 # short-circuit so a rented host that has just lost its disk is reported too. The
@@ -529,6 +532,7 @@ class PipelineFactory:
                 GpuCountCheck(),
                 GpuModelValidCheck(),
                 GpuVramPrecheck(),
+                SpecFloorCheck(),
                 DiskHealthCheck(),
                 GpuMemoryHealthCheck(),
                 CpuTruthCheck(),
@@ -632,6 +636,7 @@ class PipelineFactory:
                 GpuCountCheck(),
                 GpuModelValidCheck(),
                 GpuVramPrecheck(),
+                SpecFloorCheck(),
                 # DAH-2928: pure-data report on specs.disk_health, same place as in build_checks.
                 DiskHealthCheck(),
                 # one NVML read, no CUDA: safe in dry run, and a broken card is not rented out

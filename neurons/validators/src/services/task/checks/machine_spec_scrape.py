@@ -354,7 +354,7 @@ def _storage_limit_summary(specs: dict[str, Any], vloopback: Any) -> dict[str, A
 
 
 def _binary_command(remote_dir: str, script_filename: str) -> str:
-    script_path = f"{remote_dir.rstrip('/')}/{script_filename.lstrip('/')}"
+    script_path = shlex.quote(f"{remote_dir.rstrip('/')}/{script_filename.lstrip('/')}")
     return f"chmod +x {script_path} && {script_path}"
 
 

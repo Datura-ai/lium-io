@@ -64,6 +64,9 @@ RENTAL_SUCCEED_MACHINE_SET = "rental_succeed_machines"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
 RENTAL_PROBE_OK_PREFIX = "rental_probe_ok"
 RENTAL_PROBE_FAILED_PREFIX = "rental_probe_failed"
+# executor uuid -> the backend's last VerifyX EMA; the backend sends it for active and filler nodes only
+VERIFYX_LAST_EMA_PREFIX = "verifyx_last_ema"
+VERIFYX_LAST_EMA_TTL_SECONDS = 30 * 24 * 3600
 # filler container name -> JSON list of the image digests (bare sha256) the validator started it from
 FILLER_IMAGE_DIGESTS_PREFIX = "filler_image_digests:"
 FILLER_IMAGE_DIGESTS_TTL_SECONDS = 30 * 24 * 3600

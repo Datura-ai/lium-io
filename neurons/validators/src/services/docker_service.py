@@ -12182,9 +12182,9 @@ class DockerService:
                 f"executor does not support bootstrap restore engine {restore.backup_engine}"
             )
         operation_id = UUID(restore.restore_log_id)
-        # The spec is SFTP'd into the executor container — a file on the provider's disk — so
-        # it carries what the executor needs to reach the data and nothing that unlocks it.
-        # `encrypted_running` restores through the pod's live gocryptfs mount; the passphrase
+        # The spec is SFTP'd into the executor container (mode 0600) and carries the repository
+        # credentials and password; once read, the runner leaves only the progress reporter in it (DAH-6463).
+        # `encrypted_running` restores through the pod's live gocryptfs mount; the volume passphrase
         # never appears here (DAH-3274 — the former `encrypted_bootstrap` mode put it in the
         # helper's `docker run -e`, i.e. in `docker inspect` for the life of the pod).
         workspace: dict[str, object] = {

@@ -1869,6 +1869,13 @@ class VerifyXMessages:
         category="policy",
         impact="Active filler runtime preserved; reused last-known VerifyX EMA when available",
     )
+    STANDING_PROBE_FAILURE_SKIPPED = MessageTemplate(
+        event="VerifyX validation skipped",
+        reason="VERIFYX_SKIPPED_STANDING_PROBE_FAILURE",
+        severity="info",
+        category="policy",
+        impact="Rental probe gets this cycle's time to clear its standing failure; reused last-known VerifyX EMA",
+    )
     NO_SPECS = MessageTemplate(
         event="VerifyX validation skipped (no specs)",
         reason="VERIFYX_NO_SPECS",
@@ -2502,6 +2509,13 @@ class RentalProbeMessages:
         category="runtime",
         impact="Proceed",
     )
+    CYCLE_WITHOUT_VERIFYX = MessageTemplate(
+        event="Cycle not passed: VerifyX did not run this cycle",
+        reason="RENTAL_PROBE_CYCLE_WITHOUT_VERIFYX",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0 for this cycle; VerifyX runs next cycle",
+    )
     PROBE_FAILED = MessageTemplate(
         event="Rental probe failed: a renter could not use this node",
         reason="RENTAL_PROBE_FAILED",
@@ -2546,6 +2560,36 @@ class CpuTruthMessages:
         severity="info",
         category="env",
         impact="Proceed without penalty",
+    )
+
+
+class SpecFloorMessages:
+    """Scraped specs below the hardware floor no real GPU host is under. REJECTED fails the validation."""
+
+    OK = MessageTemplate(
+        event="Hardware specs above the floor",
+        reason="SPEC_FLOOR_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    REJECTED = MessageTemplate(
+        event="Hardware specs below the floor",
+        reason="SPEC_FLOOR_REJECTED",
+        severity="error",
+        category="env",
+        impact="Validation fails; under a live rental the score is set to 0",
+        remediation=(
+            "Report the machine's real specs: at least one CPU core, 4 GB of RAM per GPU, one card per "
+            "counted GPU, and each card's own GPU UUID."
+        ),
+    )
+    WARNING = MessageTemplate(
+        event="Hardware specs below the floor",
+        reason="SPEC_FLOOR_REJECTED",
+        severity="warning",
+        category="env",
+        impact="Warning only: score unchanged",
     )
 
 
