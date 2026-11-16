@@ -23,11 +23,15 @@ def _function(name: str) -> str:
 
 def _install(root) -> None:
     script = (
-        'host_path() { echo "${SYSBOX_SETUP_HOST_ROOT:-}$1"; }\n'
+        'host_path() { echo "${SYSBOX_SETUP_HOST_ROOT:-}$1"; }\nwarn() { echo "WARN $*"; }\n'
+        + _function("docker_containerd_address")
         + _function("shift_sysbox_layers_back_at_boot")
         + "shift_sysbox_layers_back_at_boot\n"
     )
-    subprocess.run(["bash", "-c", script], check=True, env={**os.environ, "SYSBOX_SETUP_HOST_ROOT": str(root)})
+    return subprocess.run(
+        ["bash", "-c", script], check=True, capture_output=True, text=True,
+        env={**os.environ, "SYSBOX_SETUP_HOST_ROOT": str(root)},
+    ).stdout
 
 
 def _container(root, cid: str, runtime: str, mount: str) -> str:
@@ -52,9 +56,16 @@ def _base() -> int:
 
 
 def _run(root, *args: str, path: str = "") -> subprocess.CompletedProcess:
+    unit = (root / "etc/systemd/system/lium-sysbox-layer-reset.service").read_text()
+    address = re.search(r"^Environment=LIUM_CONTAINERD_ADDRESS=(.*)$", unit, re.M).group(1)
     return subprocess.run(
         [sys.executable, "-I", str(root / "usr/local/sbin/lium-sysbox-layer-reset"), *args],
-        env={**os.environ, "LIUM_LAYER_RESET_ROOT": str(root), "PATH": path + os.environ["PATH"]},
+        env={
+            **os.environ,
+            "LIUM_LAYER_RESET_ROOT": str(root),
+            "LIUM_CONTAINERD_ADDRESS": address,
+            "PATH": path + os.environ["PATH"],
+        },
         capture_output=True,
         text=True,
     )
@@ -78,20 +89,30 @@ def test_a_shifted_sysbox_layer_is_found_and_a_runc_container_is_left_alone(tmp_
     assert out.stdout.splitlines() == [f"would shift 4 entries of {'a' * 12} back from {_base()}"]
 
 
-def test_a_containerd_store_layer_is_found_through_its_snapshot(tmp_path):
-    # Docker 29's containerd image store has no layerdb mount-id; ctr names the snapshot's upperdir
-    _install(tmp_path)
-    cid = "c" * 64
+def _containerd_store(tmp_path, cid: str) -> None:
     upper = Path(_container(tmp_path, cid, "sysbox-runc", "m1"))
     (tmp_path / "var/lib/docker/image/overlay2/layerdb/mounts" / cid / "mount-id").unlink()
     snap = tmp_path / "var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/7/fs"
     snap.parent.mkdir(parents=True)
     upper.rename(snap)
+
+
+@pytest.mark.parametrize("address", ["/run/containerd/containerd.sock", "/run/lium-containerd/containerd.sock"])
+def test_a_containerd_store_layer_is_found_through_its_snapshot(tmp_path, address):
+    # Docker 29's containerd image store has no layerdb mount-id; ctr, asked at Docker's containerd address,
+    # names the snapshot's upperdir
+    (tmp_path / "etc/docker").mkdir(parents=True)
+    (tmp_path / "etc/docker/daemon.json").write_text(json.dumps({"containerd": address}))
+    (tmp_path / address.lstrip("/")).parent.mkdir(parents=True)
+    (tmp_path / address.lstrip("/")).touch()  # the socket is up
+    _install(tmp_path)
+    cid = "c" * 64
+    _containerd_store(tmp_path, cid)
     bindir = tmp_path / "bin"
     bindir.mkdir()
     (bindir / "ctr").write_text(
         "#!/bin/sh\n"
-        f'[ "$*" = "-n moby snapshots --snapshotter overlayfs mounts / {cid}" ] || exit 1\n'
+        f'[ "$*" = "--address {address} -n moby snapshots --snapshotter overlayfs mounts / {cid}" ] || exit 1\n'
         "echo mount -t overlay overlay / -o index=off,workdir=/x/7/work,"
         "upperdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/7/fs,lowerdir=/x/6/fs\n"
     )
@@ -99,6 +120,16 @@ def test_a_containerd_store_layer_is_found_through_its_snapshot(tmp_path):
     out = _run(tmp_path, "--dry-run", path=f"{bindir}:")
     assert out.returncode == 0, out.stderr
     assert out.stdout.splitlines() == [f"would shift 4 entries of {'c' * 12} back from {_base()}"]
+
+
+def test_docker_managed_containerd_is_named_at_install_and_at_boot(tmp_path):
+    # no --containerd, no daemon.json "containerd", no system containerd socket: Docker starts its own containerd
+    assert "Docker runs its own containerd" in _install(tmp_path)
+    _containerd_store(tmp_path, "d" * 64)
+    out = _run(tmp_path, "--dry-run")
+    assert out.returncode == 0, out.stderr
+    assert out.stdout == ""
+    assert "Docker runs its own containerd" in out.stderr
 
 
 @pytest.mark.parametrize("cut_after", [None, 0, 1, 3])
