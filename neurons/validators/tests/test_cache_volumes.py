@@ -897,3 +897,43 @@ def test_the_idle_filler_removal_keeps_the_rented_image_under_any_docker_hub_pre
 
     assert "reference=daturaai/dolphin " not in command
     assert "reference=daturaai/dlph " in command
+
+
+class CacheDuHostSshClient(RemovingHostSshClient):
+    """The helper's `du -sk /cache/0 /cache/1 ...` answers with these KB per cache, in mount order."""
+
+    def __init__(self, listed_volumes: list[str], free_gb: float, cache_gb: list[float] | None):
+        super().__init__(listed_volumes, free_gb)
+        self._cache_gb = cache_gb
+
+    async def run(self, command: str, *args, **kwargs):
+        if "du -sk" in command:
+            self.commands.append(command)
+            if self._cache_gb is None:
+                return SimpleNamespace(exit_status=125, stdout="", stderr="no such image")
+            stdout = "".join(f"{int(gb * 1024**2)}\t/cache/{i}\n" for i, gb in enumerate(self._cache_gb))
+            return SimpleNamespace(exit_status=0, stdout=stdout, stderr="")
+        return await super().run(command, *args, **kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("free_gb", "cache_gb", "removed"),
+    [
+        (1300, [20, 13], []),  # ~1 TB short, the caches free 33 GB: never a cold start for nothing
+        (2340, [20, 13], _DPHN),  # 2373 GB once they go: the volume fits, so they go
+        (1300, None, _DPHN),  # sizes unreadable: removed as before
+    ],
+)
+async def test_the_caches_stay_when_removing_them_cannot_make_the_rental_fit(
+    docker_service, monkeypatch, free_gb, cache_gb, removed
+):
+    # Rustam (lio#2272): skip the delete when the rental is short by more than the caches on disk can free
+    ssh_client = CacheDuHostSshClient([*_DPHN, "volume_pod"], free_gb=free_gb, cache_gb=cache_gb)
+    rental = _whole_node_rental(monkeypatch, docker_service)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is bool(removed)
+    assert _removed_volumes(ssh_client) == sorted(removed)
+    if not removed:
+        assert rental.volume_limit_gb == 2300
+        assert not any("image rm" in command for command in ssh_client.commands)  # nor the idle filler images

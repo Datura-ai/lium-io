@@ -6325,6 +6325,25 @@ class DockerService:
                 )
                 return False
 
+            # Rustam (lio#2272): a rental short by more than every cache holds never fits by deleting them, so a
+            # cold start would buy nothing (230 of 281 prod reclaims dropped ~33 GB for a volume ~1 TB short).
+            # Unmeasurable caches are removed as before.
+            caches_gb = await self._cache_volumes_held_gb(ssh_client, cache_volumes)
+            if caches_gb is not None and free_gb + caches_gb < volume_needs_free_gb:
+                logger.info(
+                    _m(
+                        "Keeping the filler caches: removing them cannot free enough for the customer rental",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "volumes": cache_volumes,
+                            "free_gb": round(free_gb, 1),
+                            "caches_gb": round(caches_gb, 1),
+                            "volume_needs_free_gb": round(volume_needs_free_gb, 1),
+                        }),
+                    )
+                )
+                return False
+
             logger.info(
                 _m(
                     "Reclaiming filler cache volumes for the customer rental",
@@ -6562,6 +6581,27 @@ class DockerService:
             )
             return present
         return list(payload.cache_volumes)
+
+    async def _cache_volumes_held_gb(
+        self, ssh_client: asyncssh.SSHClientConnection, volume_names: list[str]
+    ) -> float | None:
+        """GB the cache volumes hold together (one `du` in a helper container); None when it cannot be read."""
+        mounts = " ".join(f"-v {shlex.quote(name)}:/cache/{index}:ro" for index, name in enumerate(volume_names))
+        try:
+            result = await ssh_client.run(
+                f"{REMOVE_CACHE_SWEEP_CONTAINER}; timeout 60 /usr/bin/docker run --rm --name {CACHE_SWEEP_CONTAINER_NAME} "
+                f"{mounts} {ALPINE_HELPER_IMAGE} du -sk "
+                + " ".join(f"/cache/{index}" for index in range(len(volume_names)))
+                + f"; {REMOVE_CACHE_SWEEP_CONTAINER}"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return None
+        sizes = [line.split()[0] for line in (result.stdout or "").splitlines() if line.strip()]
+        if len(sizes) != len(volume_names) or not all(kb.isdigit() for kb in sizes):
+            return None
+        return sum(int(kb) for kb in sizes) * 1024 / 1024**3
 
     async def _cache_missing_gb(
         self, ssh_client: asyncssh.SSHClientConnection, volume_name: str, default_extra: dict
