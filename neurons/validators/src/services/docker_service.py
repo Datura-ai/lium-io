@@ -6306,11 +6306,12 @@ class DockerService:
                 return False
             # DAH-6481: the listing floor is write room, not the renter's volume. The listing never counts the
             # Dolphin cache as free, so the volume never needs it gone: a Dolphin cache goes only while the volume
-            # itself does not fit; the tight-disk sweep evicts it later if the pod's writes need the room. The
-            # Engy cache is listed as free disk, so it still gives way until the floor fits too.
-            volume_needs_free_gb = rental_needs_free_gb - DPHN_CACHE_LISTING_FLOOR_GB
-            engy_left: set[str] = {name for name in cache_volumes if name.startswith(ENGY_CACHE_VOLUME_PREFIX)}
-            if not engy_left and free_gb >= volume_needs_free_gb:
+            # itself does not fit with the cache's free margin beside it (the container must start on a disk that is
+            # not full); the tight-disk sweep evicts it later if the pod's writes need the room. The Engy cache is
+            # listed as free disk, so it still gives way until the floor fits too.
+            volume_needs_free_gb = rental_needs_free_gb - DPHN_CACHE_LISTING_FLOOR_GB + DPHN_CACHE_FREE_MARGIN_GB
+            engy_volumes: set[str] = {name for name in cache_volumes if name.startswith(ENGY_CACHE_VOLUME_PREFIX)}
+            if not engy_volumes and free_gb >= volume_needs_free_gb:
                 logger.info(
                     _m(
                         "Keeping the Dolphin cache: the customer rental's volume fits beside it",
@@ -6352,14 +6353,26 @@ class DockerService:
                 # the one free-disk reading both the fit and the clamp use, so they never disagree (lio#2219 review)
                 return await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
 
+            async def engy_gone() -> bool:
+                # `volume rm ... || true` exits 0 either way: an Engy cache is gone only once docker no longer lists it
+                # (or the wipe emptied it), so a failed removal never lets the Dolphin cache stay (lio#2272 review)
+                try:
+                    listed = await ssh_client.run('/usr/bin/docker volume ls --format "{{.Name}}"')
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    return False
+                return listed.exit_status == 0 and not (set((listed.stdout or "").split()) & engy_volumes) - emptied
+
             async def rental_fits() -> bool:
                 free_now = await free_now_gb()
-                return free_now >= rental_needs_free_gb or (not engy_left and free_now >= volume_needs_free_gb)
+                if free_now >= rental_needs_free_gb:
+                    return True
+                return free_now >= volume_needs_free_gb and (not engy_volumes or await engy_gone())
 
             killed: tuple[str, ...] = tuple(killed_fillers)
 
             def volume_remove(name: str) -> str:
-                engy_left.discard(name)  # built right before its removal runs
                 if not killed:
                     return DockerCommand.volume_remove(name)
                 return (
