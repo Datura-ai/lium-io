@@ -2,7 +2,7 @@ import asyncio
 import contextlib
 import contextvars
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import logging
 import os
 import shutil
@@ -137,6 +137,8 @@ class _FakeRentalDockerClient:
         self.killed_containers = []
         self.identity = _RUN
         self.identity_error = None
+        self.host_clock_offset = timedelta(0)
+        self.host_time_error = None
         self.remove_error = None
         self.remove_volume_error = None
         # per-call answers for remove_volume, consumed in order (None = success); once empty,
@@ -189,6 +191,11 @@ class _FakeRentalDockerClient:
     async def exec_in_container(self, spec) -> ContainerExecResult:
         self.exec_specs.append(spec)
         return ContainerExecResult(exit_status=0)
+
+    async def host_time(self) -> str:
+        if self.host_time_error is not None:
+            raise self.host_time_error
+        return (datetime.now(timezone.utc) + self.host_clock_offset).isoformat().replace("+00:00", "Z")
 
     async def container_identity(self, *, container_name: str) -> str | None:
         if self.identity_error is not None:
@@ -3599,6 +3606,44 @@ async def test_retry_half_started_stop_without_a_recorded_id_judges_the_run_by_i
     assert client.stopped_containers == (["pod_test"] if expect_stop else [])
     assert client.running is not expect_stop
     docker_service.redis_service.delete.assert_awaited_once_with("half_started_stop_pending:exec-1:pod-id")
+
+
+@pytest.mark.asyncio
+async def test_retry_half_started_stop_without_a_recorded_id_corrects_for_a_host_clock_behind_ours(docker_service):
+    # host 5 min behind: a restart at host 13:57 is 14:02 on our clock, after the 14:00:05 failure, so it is not stopped
+    docker_service.redis_service.get = AsyncMock(return_value=_pending_record(identity=""))
+    docker_service.redis_service.delete = AsyncMock()
+    client = docker_service.rental_docker_client_factory.client
+    client.running = True
+    client.identity = "cid@2026-11-16T13:57:00.5Z"
+    client.host_clock_offset = timedelta(minutes=-5)
+
+    stopped = await docker_service.retry_half_started_stop(
+        executor_info=Mock(uuid="exec-1"), private_key="private-key", pod_id="pod-id", default_extra={}
+    )
+
+    assert stopped is True
+    assert client.stopped_containers == [] and client.running is True
+    docker_service.redis_service.delete.assert_awaited_once_with("half_started_stop_pending:exec-1:pod-id")
+
+
+@pytest.mark.asyncio
+async def test_retry_half_started_stop_without_a_recorded_id_keeps_the_mark_when_the_host_clock_is_unreadable(
+    docker_service,
+):
+    docker_service.redis_service.get = AsyncMock(return_value=_pending_record(identity=""))
+    docker_service.redis_service.delete = AsyncMock()
+    client = docker_service.rental_docker_client_factory.client
+    client.running = True
+    client.host_time_error = RuntimeError("info refused")
+
+    stopped = await docker_service.retry_half_started_stop(
+        executor_info=Mock(uuid="exec-1"), private_key="private-key", pod_id="pod-id", default_extra={}
+    )
+
+    assert stopped is False
+    assert client.stopped_containers == []
+    docker_service.redis_service.delete.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -11229,3 +11274,12 @@ async def test_stop_container_success_replies_container_stopped(docker_service, 
 
     assert isinstance(result, ContainerStopped) and result.container_name == "pod_test"
     assert docker_service.rental_docker_client_factory.client.stopped_containers == ["pod_test"]
+
+
+def test_docker_time_reads_nanoseconds_and_offsets():
+    assert docker_service_module._docker_time("2026-11-16T14:00:00.123456789Z") == datetime(
+        2026, 11, 16, 14, 0, 0, 123456, tzinfo=timezone.utc
+    )
+    assert docker_service_module._docker_time("2026-11-16T16:00:00+02:00") == datetime(
+        2026, 11, 16, 14, 0, tzinfo=timezone.utc
+    )

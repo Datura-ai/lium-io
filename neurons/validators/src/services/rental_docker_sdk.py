@@ -756,6 +756,17 @@ class RentalDockerSdkClient:
             raise RentalDockerOperationError("Docker inspect did not include the container's Id and StartedAt")
         return f"{container_id}@{started_at}"
 
+    async def host_time(self) -> str:
+        """The Docker host's clock (`docker info` SystemTime, RFC 3339)."""
+        try:
+            info = await _in_docker_thread(self._api_client.info)
+        except Exception as exc:
+            raise RentalDockerOperationError(_wrap_error_message("Docker SDK info failed", exc)) from exc
+        system_time = info.get("SystemTime") if isinstance(info, dict) else None
+        if not system_time:
+            raise RentalDockerOperationError("Docker info did not include SystemTime")
+        return system_time
+
     async def container_log_tail(self, *, container_name: str, lines: int) -> str:
         """The container's last `lines` of stdout+stderr, decoded with replacement characters."""
         try:

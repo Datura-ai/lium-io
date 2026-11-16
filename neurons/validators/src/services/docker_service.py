@@ -2883,10 +2883,13 @@ def _half_started_stop_slot(executor_info: ExecutorSSHInfo, pod_id: str) -> str:
     return f"{executor_info.uuid}:{pod_id}"
 
 
-def _docker_started_at(identity: str) -> datetime:
-    # "<Id>@<StartedAt>"; Docker's RFC 3339 time carries nanoseconds, datetime takes microseconds
-    head, _, fraction = identity.rpartition("@")[2].rstrip("Z").partition(".")
-    return datetime.fromisoformat(f"{head}.{(fraction + '000000')[:6]}+00:00")
+def _docker_time(value: str) -> datetime:
+    # Docker's RFC 3339 time carries nanoseconds, datetime takes microseconds
+    match = re.fullmatch(r"(.+T\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)", value)
+    if match is None:
+        raise ValueError(f"not an RFC 3339 time: {value!r}")
+    head, fraction, zone = match.groups()
+    return datetime.fromisoformat(f"{head}.{((fraction or '') + '000000')[:6]}{'+00:00' if zone == 'Z' else zone}")
 
 
 async def _cleanup_to_completion(cleanup: Awaitable[Any]) -> Any:
@@ -12655,11 +12658,13 @@ class DockerService:
                 executor_info=executor_info, private_key=private_key
             ) as docker_client:
                 current = await docker_client.container_identity(container_name=container_name)
-                same_run = current is not None and (
-                    current == identity
-                    if identity
-                    else _docker_started_at(current) <= datetime.fromisoformat(recorded_at)
-                )
+                if current is None or identity:
+                    same_run = current is not None and current == identity
+                else:
+                    # StartedAt is on the host's clock, recorded_at on ours: undo the offset before comparing
+                    skew = _docker_time(await docker_client.host_time()) - datetime.now(timezone.utc)
+                    started_at = _docker_time(current.rpartition("@")[2]) - skew
+                    same_run = started_at <= datetime.fromisoformat(recorded_at)
                 if not same_run:
                     logger.info(
                         _m(
