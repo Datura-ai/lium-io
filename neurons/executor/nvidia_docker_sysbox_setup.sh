@@ -237,13 +237,14 @@ NRCONF
 docker_containerd_address() {
     # the containerd Docker talks to: its --containerd flag, else daemon.json "containerd", else the system containerd
     # when its socket is up (dockerd uses it then); otherwise Docker starts its own containerd, which runs only with it
-    local a=""
-    [ -z "${SYSBOX_SETUP_HOST_ROOT:-}" ] \
-        && a=$(systemctl show -p ExecStart --value docker 2>/dev/null | grep -o -- '--containerd[= ][^ ;]*' | head -1)
-    a=${a#--containerd}; a=${a#[= ]}
+    local a="" exec="" cfg=""
+    [ -z "${SYSBOX_SETUP_HOST_ROOT:-}" ] && exec=$(systemctl show -p ExecStart --value docker 2>/dev/null)
+    a=$(grep -o -- '--containerd[= ][^ ;]*' <<<"$exec" | head -1); a=${a#--containerd}; a=${a#[= ]}
+    # the daemon.json dockerd reads: its --config-file, else the default
+    cfg=$(grep -o -- '--config-file[= ][^ ;]*' <<<"$exec" | head -1); cfg=${cfg#--config-file}; cfg=${cfg#[= ]}
     # python3, not jq: this runs before the installer installs jq
     [ -n "$a" ] || a=$(python3 -Ic 'import json, sys; print(json.load(open(sys.argv[1])).get("containerd") or "")' \
-        "$(host_path /etc/docker/daemon.json)" 2>/dev/null)
+        "$(host_path "${cfg:-/etc/docker/daemon.json}")" 2>/dev/null)
     [ -n "$a" ] || { [ -S "$(host_path /run/containerd/containerd.sock)" ] && a=/run/containerd/containerd.sock; }
     echo "${a:-docker-managed}"  # Docker starts its own: the boot reset runs one on Docker's store itself
 }
@@ -484,7 +485,7 @@ def main():
         print("no sysbox range in /etc/subuid or /etc/subgid; nothing to reset", flush=True)
         return
     d = data_root()
-    for hc in glob.glob(f"{d}/containers/*/hostconfig.json"):
+    for hc in glob.glob(f"{glob.escape(d)}/containers/*/hostconfig.json"):
         try:
             if json.load(open(hc)).get("Runtime") != "sysbox-runc":
                 continue

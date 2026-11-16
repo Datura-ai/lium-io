@@ -130,6 +130,23 @@ def _fake_ctr(tmp_path, cid: str, address: str) -> str:
     return f"{bindir}:"
 
 
+@pytest.mark.parametrize("flag", ["--config-file=/srv/docker.json", "--config-file /srv/docker.json"])
+def test_the_containerd_address_comes_from_the_daemon_json_dockerd_is_given(tmp_path, flag):
+    (tmp_path / "srv").mkdir()
+    (tmp_path / "srv/docker.json").write_text(json.dumps({"containerd": "/run/lium-containerd/containerd.sock"}))
+    (tmp_path / "etc/docker").mkdir(parents=True)
+    (tmp_path / "etc/docker/daemon.json").write_text("{}")
+    script = (
+        f'host_path() {{ echo "{tmp_path}$1"; }}\n'
+        f'systemctl() {{ echo "{{ path=/usr/bin/dockerd ; argv[]=/usr/bin/dockerd -H fd:// {flag} ; }}"; }}\n'
+        + _function("docker_containerd_address")
+        + "docker_containerd_address\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "SYSBOX_SETUP_HOST_ROOT"}
+    out = subprocess.run(["bash", "-c", script], check=True, capture_output=True, text=True, env=env).stdout
+    assert out.strip() == "/run/lium-containerd/containerd.sock"
+
+
 @pytest.mark.parametrize("jq_available", [True, False])
 @pytest.mark.parametrize("address", ["/run/containerd/containerd.sock", "/run/lium-containerd/containerd.sock"])
 def test_a_containerd_store_layer_is_found_through_its_snapshot(tmp_path, address, jq_available, monkeypatch):
@@ -450,14 +467,16 @@ def test_a_failing_reset_keeps_docker_down_and_a_docker_restart_never_reruns_it(
     reset["main"]()
 
 
-def test_a_data_root_from_dockers_launch_settings_is_used(tmp_path):
-    # --data-root=/srv/docker on dockerd's command line, nothing in daemon.json: install records docker info's root
+@pytest.mark.parametrize("root", ["/srv/docker", "/srv/docker[1]", "/srv/docker data"])
+def test_a_data_root_from_dockers_launch_settings_is_used(tmp_path, root):
+    # --data-root on dockerd's command line, nothing in daemon.json: install records docker info's root; glob
+    # characters and spaces in it are taken literally
     _install(tmp_path)
     cid = "e" * 64
     _container(tmp_path, cid, "sysbox-runc", "m1")
     os.makedirs(tmp_path / "srv")
-    os.rename(tmp_path / "var/lib/docker", tmp_path / "srv/docker")
-    out = _run(tmp_path, "--dry-run", env={"LIUM_DOCKER_DATA_ROOT": "/srv/docker"})
+    os.rename(tmp_path / "var/lib/docker", tmp_path / root.lstrip("/"))
+    out = _run(tmp_path, "--dry-run", env={"LIUM_DOCKER_DATA_ROOT": root})
     assert out.returncode == 0, out.stderr
     assert out.stdout.splitlines() == [f"would shift 4 entries of {'e' * 12} back from {_base()}"]
 
