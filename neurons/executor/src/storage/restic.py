@@ -951,7 +951,8 @@ class ResticStorageRunner:
     def _legacy_restore_execution_command(self, object_key: str) -> tuple[list[str], str | None]:
         pipeline_script = (
             'mkdir -p -- "$4"; '
-            '"$1" s3 cp "s3://$2/$3" - --no-progress | '
+            # from /: awscli resolves `-` through getcwd, which fails in the rental's tree under an encrypted helper
+            '(cd / && exec "$1" s3 cp "s3://$2/$3" - --no-progress) | '
             'tar --extract --gzip --file - --directory "$4" --strip-components=1 '
             "--preserve-permissions --same-owner --numeric-owner --xattrs --acls "
             f"--blocking-factor=20 --checkpoint={TAR_CHECKPOINT_RECORDS} "

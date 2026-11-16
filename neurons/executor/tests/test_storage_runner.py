@@ -2570,3 +2570,33 @@ def test_real_launcher_joins_an_ancestor_owned_network_and_ignores_the_rentals_c
     assert "setns" not in output, output  # joined the ancestor-owned network
     assert "certificate signed by unknown authority" in output, output
     assert code != "0"
+
+
+@pytest.mark.parametrize("encrypted", [False, True])
+def test_legacy_restore_downloads_from_the_root_directory(tmp_path: Path, encrypted: bool) -> None:
+    """awscli resolves `-` through getcwd, which fails inside the rental's tree under an encrypted helper."""
+    payload = _operation_payload(action="restore")
+    payload.update(engine="tar_aws_cli", snapshot_id=None, legacy_object_key="legacy/object.tgz")
+    workspace = (
+        _encrypted_workspace("/root/r", read_only=False)
+        if encrypted
+        else DockerVolumeWorkspace(
+            image="executor:test", volume_name="customer-volume", path=PurePosixPath("/workspace/r"), read_only=False
+        )
+    )
+    command, _ = ResticStorageRunner(
+        StorageOperationSpec.from_mapping(payload), workspace
+    )._legacy_restore_execution_command("legacy/object.tgz")
+    script = command[command.index("/bin/bash") + 4]  # after "-o pipefail -c"
+    record, fake_aws, target = tmp_path / "aws_cwd", tmp_path / "aws", tmp_path / "r"
+    target.mkdir()
+    fake_aws.write_text(f'#!/bin/sh\npwd > "{record}"\n')
+    fake_aws.chmod(0o755)
+
+    subprocess.run(
+        ["/bin/bash", "-o", "pipefail", "-c", script, "bash", str(fake_aws), "bucket", "k", "."],
+        cwd=target,
+        capture_output=True,
+    )
+
+    assert record.read_text().strip() == "/"
