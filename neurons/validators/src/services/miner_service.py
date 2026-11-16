@@ -79,6 +79,7 @@ from services.ssh_service import SSHService
 from services.task.checks.duplicate_executor import _gpu_uuids
 from services.task.checks.rental_probe import wait_for_teardowns_after_verdict
 from services.task.availability import (
+    AvailabilityErrorCode,
     availability_errors,
     build_executor_unreachable_by_miner_event,
     build_rented_executor_not_listed_event,
@@ -401,6 +402,8 @@ class MinerService:
         # executor uuid (lower case) -> the job_batch_id the express lane last published it under. That cycle has no
         # result of its own for the node, and its observations-only EXECUTOR_RESULT_MISSING would replace the lane's.
         self.express_published: dict[str, str] = {}
+        # the same uuid -> the miner hotkey that pass was for: two miners can report one uuid (review 4565706519)
+        self.express_published_miner: dict[str, str] = {}
         # DAH-5635: the running cycle's outage share for publish_unreachable_early; None = publish nothing early
         self.outage_tally: RunningOutageTally | None = None
         # DAH-5635: (miner hotkey, executor uuid) -> the availability errors this process's last cycle publish sent for
@@ -1118,6 +1121,17 @@ class MinerService:
             failure_reason_code=event.reason_code,
         )
 
+    def _express_passed(self, executor_uuid: str, job_batch_id: str, miner_hotkey: str) -> bool:
+        uuid = str(executor_uuid).lower()
+        return (
+            self.express_published.get(uuid) == job_batch_id and self.express_published_miner.get(uuid) == miner_hotkey
+        )
+
+    def _express_passed_after_unreachable(self, result: JobResult, miner_hotkey: str) -> bool:
+        return result.failure_reason_code == AvailabilityErrorCode.EXECUTOR_UNREACHABLE_BY_MINER and (
+            self._express_passed(result.executor_info.uuid, result.job_batch_id, miner_hotkey)
+        )
+
     def _build_unreachable_known_results(
         self,
         payload: MinerJobRequestPayload,
@@ -1161,7 +1175,11 @@ class MinerService:
                     )
                 )
             return []
-        skip = reached | manual
+        # The express lane verified it under this cycle's id after the miner's list came in (a node back from a
+        # reboot): that pass stands, or this stale row would hide the node until the next cycle.
+        skip = reached | manual | {
+            uuid for uuid in known if self._express_passed(uuid, payload.job_batch_id, payload.miner_hotkey)
+        }
         if rented_data:
             skip |= {str(uuid).lower() for uuid in rented_data.executors}
         results = []
@@ -1366,6 +1384,8 @@ class MinerService:
         default_extra = {
             "miner_hotkey": miner_hotkey,
         }
+        # checked again here: an express pass can land after the wave built the row (review 4582945951)
+        results = [result for result in results if not self._express_passed_after_unreachable(result, miner_hotkey)]
         if not results:
             return
 
