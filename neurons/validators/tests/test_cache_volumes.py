@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from payload_models.payloads import CacheVolume, ContainerCreateRequest, WorkloadKind
+from services.const import DPHN_CACHE_LISTING_FLOOR_GB
 from services.container_cleanup import idle_filler_images_removal_command
 from services.docker_service import (
     DockerService,
@@ -617,7 +618,8 @@ async def test_dolphin_caches_the_killed_filler_still_mounts_are_wiped_and_the_o
     docker_service, monkeypatch, filler, volume_gb, storage_gb, existing_bytes, free_gb
 ):
     rental = _one_eighth_rental(monkeypatch, docker_service, volume_gb, storage_gb, existing_bytes)
-    gap_gb = (await docker_service._rental_disk_fit(None, rental)).needs_free_gb - free_gb
+    # DAH-6481: the Dolphin cache goes only until the volume fits, so each wipe frees half the volume's gap
+    gap_gb = (await docker_service._rental_disk_fit(None, rental)).needs_free_gb - DPHN_CACHE_LISTING_FLOOR_GB - free_gb
     ssh_client = KilledFillerDolphinHost([filler], wiped_gb=gap_gb / 2 + 1, free_gb=free_gb)
 
     assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}, killed_fillers=[filler]) is True
@@ -710,6 +712,42 @@ async def test_a_recreate_on_its_existing_volume_needs_no_free_disk_and_is_never
     assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is bool(removed)
     assert _removed_volumes(ssh_client) == removed
     assert rental.volume_limit_gb == 2620
+
+
+def _whole_node_rental(monkeypatch, docker_service) -> ContainerCreateRequest:
+    # a 2300 GB fresh-sized volume needs 2320 GB free (+20 GB sizing overhead), 2420 GB with the listing floor
+    monkeypatch.setattr(docker_service, "_get_existing_vloopback_bytes", AsyncMock(return_value=0))
+    rental = _rental(2300, 1150)
+    rental.disk_share = 1.0
+    return rental
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("free_gb", "removed"), [(2420, []), (2389, []), (2320, []), (2319, _DPHN)])
+async def test_a_dolphin_cache_stays_while_the_rental_volume_fits_beside_it(docker_service, monkeypatch, free_gb, removed):
+    # DAH-6481: the listing never counts the Dolphin cache as free, so the renter's volume never needs it gone;
+    # the listing floor is write room the tight-disk sweep gives back later. It goes only when the volume is short.
+    ssh_client = HostSshClient([*_DPHN, "volume_pod"], free_gb=free_gb)
+    rental = _whole_node_rental(monkeypatch, docker_service)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is bool(removed)
+    assert _removed_volumes(ssh_client) == sorted(removed)
+    if not removed:
+        assert rental.volume_limit_gb == 2300  # kept: never clamped
+
+
+@pytest.mark.asyncio
+async def test_the_engy_cache_still_gives_way_to_the_floor_but_the_dolphin_cache_beside_it_stays(
+    docker_service, monkeypatch
+):
+    # the Engy cache was listed as free disk, so it still goes until the floor fits; the Dolphin cache stays
+    # once the volume fits (2389 GB: volume yes, floor no)
+    ssh_client = HostSshClient([_KIMI, *_DPHN, "volume_pod"], free_gb=2389)
+    rental = _whole_node_rental(monkeypatch, docker_service)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is True
+    assert _removed_volumes(ssh_client) == [_KIMI]
+    assert rental.volume_limit_gb == 2300
 
 
 @pytest.mark.asyncio

@@ -6304,6 +6304,25 @@ class DockerService:
             rental_needs_free_gb = fit.needs_free_gb
             if free_gb >= rental_needs_free_gb:
                 return False
+            # DAH-6481: the listing floor is write room, not the renter's volume. The listing never counts the
+            # Dolphin cache as free, so the volume never needs it gone: a Dolphin cache goes only while the volume
+            # itself does not fit; the tight-disk sweep evicts it later if the pod's writes need the room. The
+            # Engy cache is listed as free disk, so it still gives way until the floor fits too.
+            volume_needs_free_gb = rental_needs_free_gb - DPHN_CACHE_LISTING_FLOOR_GB
+            engy_left: set[str] = {name for name in cache_volumes if name.startswith(ENGY_CACHE_VOLUME_PREFIX)}
+            if not engy_left and free_gb >= volume_needs_free_gb:
+                logger.info(
+                    _m(
+                        "Keeping the Dolphin cache: the customer rental's volume fits beside it",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "volumes": cache_volumes,
+                            "free_gb": round(free_gb, 1),
+                            "volume_needs_free_gb": round(volume_needs_free_gb, 1),
+                        }),
+                    )
+                )
+                return False
 
             logger.info(
                 _m(
@@ -6334,11 +6353,13 @@ class DockerService:
                 return await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
 
             async def rental_fits() -> bool:
-                return await free_now_gb() >= rental_needs_free_gb
+                free_now = await free_now_gb()
+                return free_now >= rental_needs_free_gb or (not engy_left and free_now >= volume_needs_free_gb)
 
             killed: tuple[str, ...] = tuple(killed_fillers)
 
             def volume_remove(name: str) -> str:
+                engy_left.discard(name)  # built right before its removal runs
                 if not killed:
                     return DockerCommand.volume_remove(name)
                 return (
@@ -6379,7 +6400,7 @@ class DockerService:
             # Still short after every removal worked: the cache was not what was missing, so the size stays as ordered.
             # read once: the fit and the clamp must size on the same reading (lio#2219 review)
             free_after_reclaim_gb = await free_now_gb()
-            if not payload.local_volume and free_after_reclaim_gb < rental_needs_free_gb:
+            if not payload.local_volume and free_after_reclaim_gb < volume_needs_free_gb:
                 if not removal_failed:
                     # a listing that fails cannot show the removals worked, so it counts as a failed removal
                     try:
