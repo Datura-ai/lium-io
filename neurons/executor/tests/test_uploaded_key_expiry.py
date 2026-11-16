@@ -8,6 +8,7 @@ past that route and is dropped too; comments and blank lines the purge never tou
 stamp of lines the previous release wrote is test_legacy_uploaded_key_stamp.py).
 """
 
+import asyncio
 import base64
 import hashlib
 import logging
@@ -152,3 +153,41 @@ def test_a_public_key_with_an_embedded_newline_is_refused_by_the_writer(authoriz
     assert authorized_keys.read_text() == ""
 
 
+
+
+def test_a_failed_legacy_stamp_skips_the_purge_and_the_keys_expire_only_a_full_ttl_after_the_retry(
+    authorized_keys, monkeypatch
+):
+    legacy = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILegacyValidatorKeyNoMarker validator@old\n"
+    authorized_keys.write_text(legacy)
+    real_stamp = ssh_service.stamp_legacy_uploaded_keys
+    calls = []
+
+    def stamp_failing_once():
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError(28, "No space left on device")
+        return real_stamp()
+
+    # pass 1 at NOW fails the stamp, pass 2 at NOW+60 stamps, then the clock reaches the TTL edges
+    clock = iter([NOW, NOW + 60, NOW + 60 + TTL - 5, NOW + 60 + TTL + 5])
+    now = [next(clock)]
+    seen = []
+
+    async def fake_sleep(_):
+        seen.append(authorized_keys.read_text())
+        now[0] = next(clock, None)
+        if now[0] is None:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(ssh_service, "stamp_legacy_uploaded_keys", stamp_failing_once)
+    monkeypatch.setattr(ssh_service.time, "time", lambda: now[0])
+    monkeypatch.setattr(ssh_service.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(ssh_service.settings, "EXECUTOR_UPLOADED_KEY_TTL_S", TTL)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(ssh_service.run_uploaded_key_purge())
+
+    assert seen[0] == legacy  # the failed stamp skipped the purge
+    assert seen[1].startswith(legacy.strip() + " " + MARKER) and seen[2] == seen[1]
+    assert seen[3] == ""

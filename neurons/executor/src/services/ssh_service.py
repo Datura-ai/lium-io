@@ -314,21 +314,19 @@ async def run_uploaded_key_purge() -> None:
     ttl_s = settings.EXECUTOR_UPLOADED_KEY_TTL_S
     interval_s = settings.EXECUTOR_UPLOADED_KEY_PURGE_INTERVAL_S
     logger.info("uploaded ssh keys expire after %ss (checked every %ss)", ttl_s, interval_s)
-    try:
-        stamped = stamp_legacy_uploaded_keys()
-        if stamped is not None:
-            # the count is the record that the upgrade closed the legacy access on this node
-            (logger.warning if stamped else logger.info)("legacy keys stamped: %d", stamped)
-    except Exception:
-        logger.exception("legacy ssh key stamp failed; the purge still runs")
     while True:
         try:
+            # every pass until it has run once: a failed stamp skips the purge, which would drop the unstamped keys
+            stamped = stamp_legacy_uploaded_keys()
+            if stamped is not None:
+                # the count is the record that the upgrade closed the legacy access on this node
+                (logger.warning if stamped else logger.info)("legacy keys stamped: %d", stamped)
             removed = purge_expired_uploaded_keys(ttl_s)
             if removed:
                 # the count only: a key still present after its TTL is what this line reports
                 logger.warning("removed %d ssh key line(s): expired after %ss or unmarked", removed, ttl_s)
         except Exception:
-            logger.exception("uploaded ssh key purge failed; retrying next interval")
+            logger.exception("uploaded ssh key stamp or purge failed; retrying next interval")
         await asyncio.sleep(interval_s)
 
 
