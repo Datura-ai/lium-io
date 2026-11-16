@@ -284,8 +284,9 @@ async def start_storage_operation(
                     break
         if existing_state == "RUNNING" or existing_state.startswith("STATUS:"):
             return files
-        if await _helper_owned_by_live_runner(ssh_client, operation_id, files):
-            # an earlier dispatch's helper is still working; removing it would kill that run.
+        if await _runner_alive(ssh_client, files):
+            # an earlier dispatch's runner is still working, even before it wrote its PID or started
+            # its helper (it deletes the spec once read); a second runner would interrupt it.
             # A helper whose runner died is an orphan: it is removed below and the run relaunched.
             return files
         if existing_state in {"EXITED", "INVALID"} or await _remote_file_exists(
@@ -472,17 +473,14 @@ async def _remote_file_exists(
     return result.exit_status == 0
 
 
-async def _helper_owned_by_live_runner(
+async def _runner_alive(
     ssh_client: asyncssh.SSHClientConnection,
-    operation_id: UUID,
     files: StorageOperationFiles,
 ) -> bool:
-    helper_name = storage_helper_name(operation_id)
     # "[-]-spec" keeps pgrep from matching this command's own shell
     runner_pattern = f"[-]-spec {files.spec}"
     result = await ssh_client.run(
-        f"/usr/bin/docker ps -q --filter {shlex.quote(f'name=^{helper_name}$')} --filter status=running"
-        f" | grep -q . && pgrep -f -- {shlex.quote(runner_pattern)} >/dev/null",
+        f"pgrep -f -- {shlex.quote(runner_pattern)} >/dev/null",
         check=False,
     )
     return result.exit_status == 0
