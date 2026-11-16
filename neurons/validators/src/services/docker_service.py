@@ -166,6 +166,8 @@ from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networkin
 from services.redis_service import (
     GPU_CLOCKS_PENDING_KIND,
     GPU_RESET_PENDING_KIND,
+    HALF_STARTED_STOP_PENDING_PREFIX,
+    HALF_STARTED_STOP_PENDING_TTL_SECONDS,
     EDIT_PARKED_CONTAINER_AFTER_EDIT_SECONDS,
     EDIT_PARKED_CONTAINER_PREFIX,
     EDIT_PARKED_CONTAINER_TTL_SECONDS,
@@ -2870,6 +2872,10 @@ def _is_stale_vloopback_mountpoint_error(error_text: str) -> bool:
 # a half-started pod's stop, retried until Docker reports it stopped
 _HALF_STARTED_STOP_ATTEMPTS = 3
 _HALF_STARTED_STOP_RETRY_SEC = 2
+# a pod that refused stop and kill is retried in the background this soon, before the next cycle's check (F-31)
+_HALF_STARTED_STOP_LATER_DELAYS_SEC = (10, 20, 30)
+# pod_id -> that background retry, cancelled by the pod's next start
+_HALF_STARTED_STOP_LATER: dict[str, asyncio.Task] = {}
 
 
 async def _cleanup_to_completion(cleanup: Awaitable[Any]) -> Any:
@@ -12400,6 +12406,11 @@ class DockerService:
         # safe for a pod without an encrypted volume: mounting gocryptfs at a guessed path would
         # leave the customer's real path an ordinary container dir, writing plaintext to the host.
         pkey = asyncssh.import_private_key(private_key)
+        # this start takes the pod over: a pending stop of an earlier failed start must not stop it afterwards
+        task = _HALF_STARTED_STOP_LATER.pop(pod_id, None)
+        if task:
+            task.cancel()
+        await self._forget_half_started_stop(pod_id, default_extra)
         async with self.rental_docker_client_factory.connect(
             executor_info=executor_info,
             private_key=private_key,
@@ -12433,7 +12444,14 @@ class DockerService:
 
             async def _stop_after_starts() -> None:
                 await asyncio.gather(*starts, return_exceptions=True)
-                await self._stop_half_started_container(docker_client, container_name, default_extra)
+                try:
+                    await self._stop_half_started_container(docker_client, container_name, default_extra)
+                except RentalDockerOperationError:
+                    self._stop_half_started_container_later(
+                        executor_info, private_key, container_name, pod_id, default_extra
+                    )
+                    await self._mark_half_started_stop_pending(pod_id, container_name, default_extra)
+                    raise
 
             stale_mount_error: Exception | None = None
             try:
@@ -12514,6 +12532,117 @@ class DockerService:
         raise RentalDockerOperationError(
             f"pod {container_name} may still be running without its mount: stop and kill failed ({error})"
         )
+
+    def _stop_half_started_container_later(
+        self,
+        executor_info: ExecutorSSHInfo,
+        private_key: str,
+        container_name: str,
+        pod_id: str,
+        default_extra: dict[str, Any],
+    ) -> None:
+        async def retry() -> None:
+            for delay in _HALF_STARTED_STOP_LATER_DELAYS_SEC:
+                await asyncio.sleep(delay)
+                if await self.retry_half_started_stop(
+                    executor_info=executor_info,
+                    private_key=private_key,
+                    pod_id=pod_id,
+                    default_extra=default_extra,
+                    container_name=container_name,
+                ):
+                    return
+
+        if pod_id in _HALF_STARTED_STOP_LATER:
+            return
+        task = asyncio.create_task(retry())
+        _HALF_STARTED_STOP_LATER[pod_id] = task
+        task.add_done_callback(
+            lambda done: _HALF_STARTED_STOP_LATER.get(pod_id) is done and _HALF_STARTED_STOP_LATER.pop(pod_id)
+        )
+
+    async def _mark_half_started_stop_pending(
+        self, pod_id: str, container_name: str, default_extra: dict[str, Any]
+    ) -> None:
+        try:
+            await asyncio.wait_for(
+                self.redis_service.set(
+                    f"{HALF_STARTED_STOP_PENDING_PREFIX}{pod_id}",
+                    container_name,
+                    ex=HALF_STARTED_STOP_PENDING_TTL_SECONDS,
+                ),
+                timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
+            )
+        except Exception as exc:  # noqa: BLE001 — the background retry still runs; only a restart loses it
+            logger.error(
+                _m(
+                    "POD_HALF_STARTED_STOP_MARK_FAILED",
+                    extra=get_extra_info({**default_extra, "pod_id": pod_id, "error": str(exc)}),
+                )
+            )
+
+    async def _forget_half_started_stop(self, pod_id: str, default_extra: dict[str, Any]) -> bool:
+        try:
+            await asyncio.wait_for(
+                self.redis_service.delete(f"{HALF_STARTED_STOP_PENDING_PREFIX}{pod_id}"),
+                timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                _m(
+                    "POD_HALF_STARTED_STOP_CLEAR_FAILED",
+                    extra=get_extra_info({**default_extra, "pod_id": pod_id, "error": str(exc)}),
+                )
+            )
+            return False
+
+    async def retry_half_started_stop(
+        self,
+        *,
+        executor_info: ExecutorSSHInfo,
+        private_key: str | None,
+        pod_id: str,
+        default_extra: dict[str, Any],
+        container_name: str | None = None,
+    ) -> bool | None:
+        """Stop a pod whose failed start left it possibly running without its mount (F-31/F-37/F-15).
+        None when none is pending; True once Docker says it is stopped; False (logged) while it still may run."""
+        extra = {**default_extra, "pod_id": pod_id}
+        if container_name is None:
+            try:
+                recorded = await asyncio.wait_for(
+                    self.redis_service.get(f"{HALF_STARTED_STOP_PENDING_PREFIX}{pod_id}"),
+                    timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    _m("POD_HALF_STARTED_STOP_MARK_UNREADABLE", extra=get_extra_info({**extra, "error": str(exc)}))
+                )
+                return None
+            if recorded is None:
+                return None
+            container_name = recorded.decode() if isinstance(recorded, bytes) else recorded
+        try:
+            if not private_key:
+                raise RentalDockerOperationError("no executor key to reach Docker")
+            async with self.rental_docker_client_factory.connect(
+                executor_info=executor_info, private_key=private_key
+            ) as docker_client:
+                await self._stop_half_started_container(docker_client, container_name, extra)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                _m(
+                    "POD_HALF_STARTED_STOP_STILL_PENDING",
+                    extra=get_extra_info({**extra, "container_name": container_name, "error": str(exc)}),
+                )
+            )
+            return False
+        await self._forget_half_started_stop(pod_id, extra)
+        logger.info(
+            _m("POD_HALF_STARTED_STOP_CONFIRMED", extra=get_extra_info({**extra, "container_name": container_name}))
+        )
+        return True
 
     async def _bring_up_existing_container(
         self,

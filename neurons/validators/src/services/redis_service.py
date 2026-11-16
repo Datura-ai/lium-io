@@ -83,6 +83,10 @@ STOPPED_BY_RECOVERY_PREFIX = "stopped_by_recovery:"
 # still judged down); STOPPED also means the recovery itself stopped the pod
 STOPPED_BY_RECOVERY_RENAMING = "renaming"
 STOPPED_BY_RECOVERY_STOPPED = "stopped"
+# pod id -> container name, set when a failed start's stop and kill both failed, so the pod may still run without its
+# mount (F-31/F-37/F-15): the next rented-pod check retries the stop first; a later start of the pod drops it
+HALF_STARTED_STOP_PENDING_PREFIX = "half_started_stop_pending:"
+HALF_STARTED_STOP_PENDING_TTL_SECONDS = 24 * 3600
 # DAH-5904: "<executor uuid>:<filler container name>" while the cycle snapshot lists that filler on that node
 RECENT_FILLER_PREFIX = "recent_filler:"
 # a filler stopped for a customer rent leaves the snapshot at once but stays on the host until its delete lands:

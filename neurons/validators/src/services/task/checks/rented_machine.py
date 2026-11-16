@@ -326,6 +326,20 @@ class TenantEnforcementCheck:
         for pod_index, pod in enumerate(rented_pods):
             pod_container_name = pod.docker_container_name
             pod_id = pod.pod_id
+            if self.recover_stale_pods:
+                # F-31: a failed start whose stop and kill failed may have left the pod running without its mount
+                try:
+                    async with asyncio.timeout(
+                        min(_HALF_STARTED_STOP_CHECK_SEC, max(1.0, task_seconds_left(ctx) - POD_READ_RESERVE_SECONDS))
+                    ):
+                        await ctx.services.pod_recovery.retry_half_started_stop(
+                            executor_info=ctx.executor,
+                            private_key=ctx.executor_ssh_private_key,
+                            pod_id=pod_id,
+                            default_extra=ctx.default_extra,
+                        )
+                except Exception as exc:  # noqa: BLE001 — its own failures are logged inside; the check goes on
+                    _log_recovery_failed("POD_HALF_STARTED_STOP_STILL_PENDING", ctx, pod_container_name, pod_id, exc)
             try:
                 # bounded by the cycle time budget: a read hung on a dead shell ends as a TimeoutError (an OSError),
                 # so the cycle reports the node unreachable instead of being dropped without a result
@@ -1033,6 +1047,8 @@ _RECOVERY_DEADLINE_SEC = EXECUTOR_CREATE_LOCK_TIMEOUT - 120
 _RECOVERY_MARK_CLEAR_TIMEOUT_SEC = 5
 # the running-pod mount probe: the backend's path lookup (10 s) and the docker probe (30 s)
 _MOUNT_PROBE_SECONDS = 40
+# three stops, a kill and their inspects of a pod left possibly running unmounted (F-31)
+_HALF_STARTED_STOP_CHECK_SEC = 45
 # a restore cut by the deadline still marks, records, parks and stops the pod: the 5 s mark, the 5 s DB record, three
 # 30 s commands and the record's 5 s drop after a park or stop that did not take
 _MOUNT_RESTORE_CLEANUP_RESERVE_SEC = 105

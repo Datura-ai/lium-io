@@ -1438,6 +1438,20 @@ async def test_tenant_enforcement_defers_a_pod_its_own_restore_stopped_to_the_ne
     assert _pod_states(result)["pod-1"] == "exited"
 
 
+@pytest.mark.asyncio
+async def test_tenant_enforcement_retries_a_pending_half_started_stop_before_reading_the_pod(context_factory):
+    # F-31: a failed start whose stop and kill failed left the pod possibly running unmounted; the check stops it first
+    ssh = DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa renter"])
+    docker = AsyncMock()
+    docker.encrypted_volume_mount_missing.return_value = False
+    ctx = build_recovery_context(context_factory, ssh, docker)
+
+    await TenantEnforcementCheck().run(ctx)
+
+    docker.retry_half_started_stop.assert_awaited_once()
+    assert docker.retry_half_started_stop.await_args.kwargs["pod_id"] == "pod-1"
+
+
 @pytest.mark.parametrize("stop_outcome", ["failed", "unknown"])
 @pytest.mark.asyncio
 async def test_tenant_enforcement_defers_only_a_confirmed_stop_of_an_unmounted_pod(context_factory, stop_outcome):
