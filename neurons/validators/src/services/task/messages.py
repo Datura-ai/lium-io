@@ -2508,6 +2508,13 @@ class RentalProbeMessages:
         category="runtime",
         impact="Proceed",
     )
+    CYCLE_WITHOUT_VERIFYX = MessageTemplate(
+        event="Cycle not passed: VerifyX did not run this cycle",
+        reason="RENTAL_PROBE_CYCLE_WITHOUT_VERIFYX",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0 for this cycle; VerifyX runs next cycle",
+    )
     PROBE_FAILED = MessageTemplate(
         event="Rental probe failed: a renter could not use this node",
         reason="RENTAL_PROBE_FAILED",

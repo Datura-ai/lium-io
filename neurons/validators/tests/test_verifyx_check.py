@@ -1040,3 +1040,4 @@ async def test_verifyx_skips_while_a_standing_rental_probe_failure_fails_the_cyc
     assert (verifyx_service.called_with is None) is expect_skip
     if expect_skip:
         assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(500.0)
+    assert result.updates.get("state", ctx.state).verifyx_skipped_for_standing_probe_failure is expect_skip

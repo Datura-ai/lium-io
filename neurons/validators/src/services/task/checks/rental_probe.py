@@ -255,6 +255,19 @@ class RentalProbeCheck:
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
+        result = await self._probe_and_judge(ctx)
+        if result.passed and ctx.state.verifyx_skipped_for_standing_probe_failure:
+            # VerifyX did not judge the node this cycle: it relists after the next cycle runs it
+            return CheckResult(
+                passed=False,
+                event=render_message(
+                    Msg.CYCLE_WITHOUT_VERIFYX, ctx=ctx, check_id=self.check_id, what=result.event.what_we_saw
+                ),
+                updates={"score": 0.0, "job_score": 0.0},
+            )
+        return result
+
+    async def _probe_and_judge(self, ctx: Context) -> CheckResult:
         gate = await self._may_probe(ctx)
         if isinstance(gate, CheckResult):
             return gate

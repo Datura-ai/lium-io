@@ -252,7 +252,11 @@ class VerifyXCheck:
             return CheckResult(
                 passed=True,
                 event=event,
-                updates={"state": replace(ctx.state, specs=updated_specs)},
+                updates={
+                    "state": replace(
+                        ctx.state, specs=updated_specs, verifyx_skipped_for_standing_probe_failure=True
+                    )
+                },
             )
 
         # DAH-3011: a first, unscored verification writes less RAM/disk (the measurements are still

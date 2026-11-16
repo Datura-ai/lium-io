@@ -208,6 +208,8 @@ class ContextState:
     # DAH-5244: this cycle's verified ports and sysbox were republished from the last completed check's memory,
     # not measured; a consumer that keeps "last good ports" must not store them as fresh.
     port_check_deferred: bool = False
+    # VerifyXCheck skipped its run for a standing rental-probe failure; RentalProbeCheck then never passes the cycle
+    verifyx_skipped_for_standing_probe_failure: bool = False
     # DAH-5981: the error of this cycle's port probe when the SSH connection dropped mid-probe; None otherwise.
     # PortCountCheck then reports the lost connection, not a port shortfall it never measured.
     port_probe_connection_lost: str | None = None
