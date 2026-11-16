@@ -234,6 +234,115 @@ $nrconf{override_rc}->{qr(^nvidia-persistenced)} = 0;
 NRCONF
 }
 
+shift_sysbox_layers_back_at_boot() {
+    # Sysbox chowns a pod's writable layer into its uid range on start and back on a stop it sees. After an unclean
+    # stop (power loss, hard reset) the layer stays shifted, and the restart-policy start at boot mounts the image
+    # layers unmapped: every image file is host uid 0, nobody inside the pod, so sudo and apt break (DAH-6503;
+    # reproduced: a hard reset always, a clean reboot never). A boot oneshot before Docker shifts such a layer back.
+    local bin unit
+    bin=$(host_path /usr/local/sbin/lium-sysbox-layer-reset)
+    unit=$(host_path /etc/systemd/system/lium-sysbox-layer-reset.service)
+    mkdir -p "$(dirname "$bin")" "$(dirname "$unit")" || return 1
+    cat > "$bin" <<'PY' || return 1
+#!/usr/bin/python3 -I
+# Lium (nvidia_docker_sysbox_setup.sh): shift back the writable layer a sysbox pod kept after an unclean stop, the way
+# sysbox's own stop does. Runs at boot before Docker; --dry-run only prints. Setuid bits and file capabilities kept.
+import glob, json, os, stat, sys
+
+DRY = "--dry-run" in sys.argv
+ROOT = os.environ.get("LIUM_LAYER_RESET_ROOT", "")
+RANGE = 65536
+
+
+def data_root():
+    try:
+        return ROOT + json.load(open(ROOT + "/etc/docker/daemon.json")).get("data-root", "/var/lib/docker")
+    except (OSError, ValueError):
+        return ROOT + "/var/lib/docker"
+
+
+def docker_running():
+    try:
+        os.kill(int(open(ROOT + "/var/run/docker.pid").read()), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def back(i, base):
+    return i - base if base <= i < base + RANGE else i
+
+
+def shift_back(path, base):
+    st = os.lstat(path)
+    uid, gid = back(st.st_uid, base), back(st.st_gid, base)
+    if (uid, gid) == (st.st_uid, st.st_gid):
+        return 0
+    if DRY:
+        return 1
+    link = stat.S_ISLNK(st.st_mode)
+    caps = None
+    if not link:
+        try:
+            caps = os.getxattr(path, "security.capability", follow_symlinks=False)
+        except OSError:
+            pass
+    os.lchown(path, uid, gid)
+    if not link:
+        os.chmod(path, stat.S_IMODE(st.st_mode))  # chown clears setuid/setgid
+        if caps:
+            os.setxattr(path, "security.capability", caps, follow_symlinks=False)
+    return 1
+
+
+def main():
+    # a running pod's layer is shifted on purpose: only act while Docker is down, before it starts any pod
+    if docker_running() and not DRY:
+        sys.exit("Docker is running; not touching any layer")
+    d = data_root()
+    for hc in glob.glob(f"{d}/containers/*/hostconfig.json"):
+        try:
+            if json.load(open(hc)).get("Runtime") != "sysbox-runc":
+                continue
+        except (OSError, ValueError):
+            continue
+        cid = os.path.basename(os.path.dirname(hc))
+        try:
+            mount = open(f"{d}/image/overlay2/layerdb/mounts/{cid}/mount-id").read().strip()
+        except OSError:
+            continue  # shortcut: the classic overlay2 store only; the containerd image store keeps layers elsewhere
+        upper = f"{d}/overlay2/{mount}/diff"
+        if not os.path.isdir(upper) or os.lstat(upper).st_uid == 0:
+            continue
+        base = os.lstat(upper).st_uid
+        n = 0
+        for top, dirs, files in os.walk(upper):
+            n += shift_back(top, base)
+            for name in files + [x for x in dirs if os.path.islink(os.path.join(top, x))]:
+                n += shift_back(os.path.join(top, name), base)
+        print(f"{'would shift' if DRY else 'shifted'} {n} entries of {cid[:12]} back from {base}", flush=True)
+
+
+main()
+PY
+    chmod 755 "$bin" || return 1
+    cat > "$unit" <<'UNIT' || return 1
+[Unit]
+Description=Lium: shift sysbox pods' layers back after an unclean stop
+After=local-fs.target sysbox.service sysbox-mgr.service
+Before=docker.service containerd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/sbin/lium-sysbox-layer-reset
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] && return 0
+    systemctl daemon-reload && systemctl enable lium-sysbox-layer-reset.service >/dev/null 2>&1
+}
+
 self_cmd() {
     # how to run this script again: the file when there is one, else the one-liner (curl | bash). A leading VAR=VALUE
     # argument goes after sudo (sudo's env_reset drops variables set before it); the rest are the script's options.
@@ -998,6 +1107,9 @@ fi
 # before "Already working?": a host that already runs pods needs it most, and that path exits early
 keep_needrestart_off_the_container_runtime && ok "apt (needrestart) never restarts sysbox, Docker, containerd or the NVIDIA fabric manager." \
     || warn "Could not write /etc/needrestart/conf.d/lium-container-runtime.conf; apt upgrades may restart sysbox under pods."
+
+shift_sysbox_layers_back_at_boot && ok "After an unclean stop, each pod's files are shifted back at boot before Docker starts it." \
+    || warn "Could not install lium-sysbox-layer-reset.service; after a power loss rented pods may lose sudo and apt."
 
 # ── 2. Already working? ─────────────────────────────────
 
