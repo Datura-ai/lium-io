@@ -95,7 +95,7 @@ async def test_a_filler_sample_skips_the_all_cards_probe(svc, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("model", "capacity", "budget"),
+    ("model", "capacity", "challenge_vram_mb"),
     [
         ("NVIDIA H100 80GB HBM3", 81920, 73728),
         # memory-modded cards arrive under the base card's raw name; each card is sized to the modded memory
@@ -105,7 +105,7 @@ async def test_a_filler_sample_skips_the_all_cards_probe(svc, monkeypatch):
     ],
 )
 @pytest.mark.asyncio
-async def test_honest_eight_cards_probe_passes(svc, monkeypatch, model, capacity, budget):
+async def test_honest_eight_cards_probe_passes(svc, monkeypatch, model, capacity, challenge_vram_mb):
     spec = _spec(8, model)
     for detail in spec["gpu"]["details"]:
         detail["capacity"] = capacity
@@ -118,7 +118,7 @@ async def test_honest_eight_cards_probe_passes(svc, monkeypatch, model, capacity
     assert probe.passed is True
     assert len(probe.per_card) == 8
     assert all(card["ok"] for card in probe.per_card)
-    assert [call.args[1] for call in calls.call_args_list] == [budget] * 8
+    assert [call.args[1] for call in calls.call_args_list] == [challenge_vram_mb] * 8
 
 
 
