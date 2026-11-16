@@ -2569,6 +2569,13 @@ class SpecFloorMessages:
             "counted GPU, and each card's own GPU UUID."
         ),
     )
+    WARNING = MessageTemplate(
+        event="Hardware specs below the floor",
+        reason="SPEC_FLOOR_REJECTED",
+        severity="warning",
+        category="env",
+        impact="Warning only: score unchanged",
+    )
 
 
 class DockerCpuMessages:
