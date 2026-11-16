@@ -105,7 +105,10 @@ def _load_operation(spec_path: str) -> Mapping[str, object]:
     mode = stat.S_IMODE(path.stat().st_mode)
     if mode & 0o077:
         raise OperationSpecError(f"operation spec must not be group/world accessible: {oct(mode)}")
-    return _parse_object(path.read_text())
+    text = path.read_text()
+    # the spec holds the repository credentials; it must not outlive the read on the provider's disk
+    path.unlink(missing_ok=True)
+    return _parse_object(text)
 
 
 def _parse_object(value: str) -> Mapping[str, object]:

@@ -2362,3 +2362,14 @@ def test_real_restic_finds_the_parent_when_the_backup_path_changes(
     assert summaries[0]["files_new"] == 20
     assert (summaries[1]["files_new"], summaries[1]["files_unmodified"]) == (0, 20)
 
+
+
+def test_load_operation_deletes_the_spec_file_once_read(tmp_path: Path) -> None:
+    spec = tmp_path / "spec.json"
+    spec.write_text('{"action": "restore"}')
+    spec.chmod(0o600)
+
+    payload = storage_runner._load_operation(str(spec))
+
+    assert payload == {"action": "restore"}
+    assert not spec.exists()
