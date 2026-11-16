@@ -3273,7 +3273,45 @@ async def test_start_container_fails_when_encrypted_setup_fails(docker_service, 
 
     assert isinstance(result, FailedContainerRequest)
     assert docker_service.rental_docker_client_factory.client.started_containers == ["pod_test"]
-    assert docker_service.rental_docker_client_factory.client.stopped_containers == []
+    # a pod up without its plaintext mount would write renter data unencrypted: it is put back down
+    assert docker_service.rental_docker_client_factory.client.stopped_containers == ["pod_test"]
+
+
+@pytest.mark.asyncio
+async def test_a_start_cancelled_during_the_remount_stops_the_container(docker_service, monkeypatch):
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(stdout=""))
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect",
+        Mock(return_value=DummySSHConnectionManager(ssh_client)),
+    )
+    docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker = AsyncMock(return_value=True)
+    docker_service.setup_encrypted_local_volume = AsyncMock(side_effect=asyncio.CancelledError())
+    monkeypatch.setattr(docker_service, "_encrypted_local_volume_name", AsyncMock(return_value="volume_test"))
+    executor_info = ExecutorSSHInfo(
+        uuid=str(uuid4()),
+        address="127.0.0.1",
+        port=8001,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await docker_service.start_existing_container(
+            executor_info=executor_info,
+            private_key="private-key",
+            known_hosts_policy=None,
+            container_name="pod_test",
+            local_volume_path="/workspace",
+            pod_id="pod-id",
+            default_extra={},
+        )
+
+    assert docker_service.rental_docker_client_factory.client.stopped_containers == ["pod_test"]
 
 
 @pytest.mark.asyncio

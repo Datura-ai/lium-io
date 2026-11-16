@@ -12422,32 +12422,51 @@ class DockerService:
                 if not _is_stale_vloopback_mountpoint_error(str(exc)):
                     raise
                 stale_mount_error = exc
-            async with asyncssh.connect(
-                host=executor_info.address,
-                port=executor_info.ssh_port,
-                **await public_host_sock(executor_info.address, executor_info.ssh_port),
-                username=executor_info.ssh_username,
-                client_keys=[pkey],
-                known_hosts=known_hosts_policy,
-            ) as ssh_client:
-                if stale_mount_error is not None:
-                    # a GPU reset's restart of a stopped pod hit "file exists" and left the pod down
-                    # (5 Nov): the same repair as the edit undo, rmdir only an empty, unmounted
-                    # mountpoint, then start once more
-                    if not await self._repair_stale_mountpoint_of_container_volume(
-                        ssh_client, container_name, default_extra
-                    ):
-                        raise stale_mount_error
-                    await _start()
-                await self._restore_mount_and_sshd_after_start(
-                    docker_client=docker_client,
-                    ssh_client=ssh_client,
-                    container_name=container_name,
-                    local_volume_path=local_volume_path,
-                    pod_id=pod_id,
-                    default_extra=default_extra,
-                    record_start=stopped_before,
+            try:
+                async with asyncssh.connect(
+                    host=executor_info.address,
+                    port=executor_info.ssh_port,
+                    **await public_host_sock(executor_info.address, executor_info.ssh_port),
+                    username=executor_info.ssh_username,
+                    client_keys=[pkey],
+                    known_hosts=known_hosts_policy,
+                ) as ssh_client:
+                    if stale_mount_error is not None:
+                        # a GPU reset's restart of a stopped pod hit "file exists" and left the pod down
+                        # (5 Nov): the same repair as the edit undo, rmdir only an empty, unmounted
+                        # mountpoint, then start once more
+                        if not await self._repair_stale_mountpoint_of_container_volume(
+                            ssh_client, container_name, default_extra
+                        ):
+                            raise stale_mount_error
+                        await _start()
+                    await self._restore_mount_and_sshd_after_start(
+                        docker_client=docker_client,
+                        ssh_client=ssh_client,
+                        container_name=container_name,
+                        local_volume_path=local_volume_path,
+                        pod_id=pod_id,
+                        default_extra=default_extra,
+                        record_start=stopped_before,
+                    )
+            except (asyncio.CancelledError, Exception):
+                # a pod left up without its plaintext mount writes the renter's data unencrypted into the
+                # container layer: put it back down, even when the start is cancelled
+                await _cleanup_to_completion(self._stop_half_started_container(docker_client, container_name, default_extra))
+                raise
+
+    async def _stop_half_started_container(
+        self, docker_client: RentalDockerSdkClient, container_name: str, default_extra: dict[str, Any]
+    ) -> None:
+        try:
+            await docker_client.stop(container_name=container_name)
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "POD_HALF_STARTED_STOP_FAILED",
+                    extra=get_extra_info({**default_extra, "container_name": container_name, "error": str(exc)}),
                 )
+            )
 
     async def _bring_up_existing_container(
         self,
