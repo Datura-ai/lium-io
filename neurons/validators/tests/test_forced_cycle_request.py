@@ -2,29 +2,42 @@ from unittest.mock import patch
 
 import pytest
 
-from services.redis_service import FORCED_VALIDATION_CYCLE_ACKED_KEY, FORCED_VALIDATION_CYCLE_KEY, RedisService
+from services.redis_service import (
+    FORCED_VALIDATION_CYCLE_ACKED_KEY,
+    FORCED_VALIDATION_CYCLE_KEY,
+    LEGACY_FORCED_VALIDATION_CYCLE_KEY,
+    RedisService,
+)
 
 pytest_plugins = ["fixtures.incentive_fixtures"]
 
 
 class _Redis:
-    """Just enough Redis for the forced-cycle request: INCR, MGET and the acknowledge script. No TTL support, so a
-    request that relied on one would fail here."""
+    """Just enough Redis for the forced-cycle request: INCR, SET, MGET and the acknowledge script. TTLs are recorded,
+    never applied: only the legacy key may carry one."""
 
     def __init__(self):
         self.kv: dict[str, str] = {}
+        self.ttl: dict[str, int] = {}
 
     async def incr(self, key):
         self.kv[key] = str(int(self.kv.get(key, 0)) + 1)
 
+    async def set(self, key, value, ex=None):
+        self.kv[key] = value
+        self.ttl[key] = ex
+
     async def mget(self, *keys):
         return [self.kv.get(key) for key in keys]
 
-    async def eval(self, script, numkeys, count_key, acked_key, token):
-        count = int(self.kv.get(count_key, 0))
-        acked = max(int(self.kv.get(acked_key, 0)), int(token))
+    async def eval(self, script, numkeys, count_key, acked_key, legacy_key, token):
+        read_count, read_legacy = token.split(":", 1)
+        acked = max(int(self.kv.get(acked_key, 0)), int(read_count))
         self.kv[acked_key] = str(acked)
-        return str(count) if count > acked else None
+        if self.kv.get(legacy_key) == read_legacy:
+            del self.kv[legacy_key]
+        count, legacy = int(self.kv.get(count_key, 0)), self.kv.get(legacy_key)
+        return f"{count}:{legacy or ''}" if count > acked or legacy else None
 
 
 def _service() -> RedisService:
@@ -51,10 +64,43 @@ async def test_acknowledging_the_request_the_cycle_read_ends_it():
     service = _service()
     await service.request_forced_validation_cycle()
 
-    assert await service.clear_forced_validation_cycle_request(await service.forced_validation_cycle_request()) is None
+    assert (
+        await service.clear_forced_validation_cycle_request(
+            await service.forced_validation_cycle_request()
+        )
+        is None
+    )
 
     assert await service.forced_validation_cycle_request() is None
-    assert service.redis.kv[FORCED_VALIDATION_CYCLE_ACKED_KEY] == service.redis.kv[FORCED_VALIDATION_CYCLE_KEY]
+    assert (
+        service.redis.kv[FORCED_VALIDATION_CYCLE_ACKED_KEY]
+        == service.redis.kv[FORCED_VALIDATION_CYCLE_KEY]
+    )
+    assert LEGACY_FORCED_VALIDATION_CYCLE_KEY not in service.redis.kv
+
+
+@pytest.mark.asyncio
+async def test_a_request_from_a_connector_on_the_old_version_still_starts_a_cycle():
+    # review 4580868787: mid-rollout the old connector writes only the legacy key
+    service = _service()
+    service.redis.kv[LEGACY_FORCED_VALIDATION_CYCLE_KEY] = "old-token"
+
+    read = await service.forced_validation_cycle_request()
+
+    assert read is not None
+    assert await service.clear_forced_validation_cycle_request(read) is None
+    assert await service.forced_validation_cycle_request() is None
+
+
+@pytest.mark.asyncio
+async def test_a_request_also_writes_the_legacy_key_an_old_validator_reads_with_its_ttl():
+    service = _service()
+
+    await service.request_forced_validation_cycle()
+
+    assert service.redis.kv[LEGACY_FORCED_VALIDATION_CYCLE_KEY]
+    assert service.redis.ttl[LEGACY_FORCED_VALIDATION_CYCLE_KEY] == 60
+    assert service.redis.ttl.get(FORCED_VALIDATION_CYCLE_KEY) is None
 
 
 @pytest.mark.asyncio
@@ -68,7 +114,9 @@ async def test_a_request_made_while_the_cycle_was_prepared_starts_the_next_cycle
     with patch("core.validator.settings.DEPLOY_ENV", "STAGE"):
         read = await validator.an_operator_asked_for_a_cycle_now()
         await validator.redis_service.request_forced_validation_cycle()
-        validator.carried_forced_request = await validator.redis_service.clear_forced_validation_cycle_request(read)
+        validator.carried_forced_request = (
+            await validator.redis_service.clear_forced_validation_cycle_request(read)
+        )
         validator.carried_forced_request = None  # in-memory copy lost too, e.g. a restart
 
         assert await validator.an_operator_asked_for_a_cycle_now() not in (None, read)

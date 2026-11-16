@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import time
+import uuid
 from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
 from typing import Callable, Literal, NamedTuple
@@ -160,6 +161,10 @@ CLEANUP_SEEN_EXECUTORS_SET = "cleanup_seen_executors"
 # acknowledged key holds the count a started cycle read, so a request is pending while the count is higher.
 FORCED_VALIDATION_CYCLE_KEY = "forced_validation_cycle_count"
 FORCED_VALIDATION_CYCLE_ACKED_KEY = "forced_validation_cycle_acknowledged"
+# The key the connector and validator used before the count (review 4580868787): both are still written and read, so a
+# request crosses a rollout in which one process runs the old version. Remove once every validator runs the count.
+LEGACY_FORCED_VALIDATION_CYCLE_KEY = "forced_validation_cycle"
+LEGACY_FORCED_VALIDATION_CYCLE_TTL_SECONDS = 60
 # DAH-3597: one key per executor while a DinD probe miss is on record (expires with the grace TTL).
 DIND_PROBE_MISS_PREFIX = "dind_probe_miss"
 # DAH-3698: a port verification that failed once inside the window (first-miss grace, as DAH-3597)
@@ -582,7 +587,11 @@ class RedisService:
     async def request_forced_validation_cycle(self) -> None:
         # No TTL (review 4580791049): a request stays until a cycle that read it starts, however long the
         # cycle before it takes. A request made while the validator is down starts one cycle when it is back.
+        # The legacy key carries it to an old validator. A read between the two writes costs one extra cycle at most.
         await self.redis.incr(FORCED_VALIDATION_CYCLE_KEY)
+        await self.redis.set(
+            LEGACY_FORCED_VALIDATION_CYCLE_KEY, uuid.uuid4().hex, ex=LEGACY_FORCED_VALIDATION_CYCLE_TTL_SECONDS
+        )
 
     async def mark_executors_validated(self, executor_ids: list[str]) -> None:
         """DAH-2958: remember that a spec was published for these executors (one round-trip)."""
@@ -653,23 +662,32 @@ class RedisService:
         }
 
     async def forced_validation_cycle_request(self) -> str | None:
-        """The pending request's token (the request count), or None when no cycle was asked for since the last
-        acknowledged one."""
-        count, acked = await self.redis.mget(FORCED_VALIDATION_CYCLE_KEY, FORCED_VALIDATION_CYCLE_ACKED_KEY)
+        """The pending request's token, "<request count>:<legacy key value>", or None when no cycle was asked for
+        since the last acknowledged one and no old connector wrote the legacy key."""
+        count, acked, legacy = await self.redis.mget(
+            FORCED_VALIDATION_CYCLE_KEY, FORCED_VALIDATION_CYCLE_ACKED_KEY, LEGACY_FORCED_VALIDATION_CYCLE_KEY
+        )
         count = int(count or 0)
-        return str(count) if count > int(acked or 0) else None
+        legacy = legacy.decode() if isinstance(legacy, bytes) else legacy
+        return f"{count}:{legacy or ''}" if count > int(acked or 0) or legacy else None
 
     async def clear_forced_validation_cycle_request(self, token: str) -> str | None:
-        """Acknowledge the requests up to the one this cycle read; returns a newer one's token (made while the cycle
-        was being prepared), which stays pending for the next tick."""
+        """Acknowledge the requests up to the one this cycle read, and the legacy key if it still holds the value read;
+        returns a newer request's token (made while the cycle was being prepared), which stays pending for the next
+        tick."""
         newer = await self.redis.eval(
-            "local count = tonumber(redis.call('GET', KEYS[1]) or '0')"
-            " local acked = math.max(tonumber(redis.call('GET', KEYS[2]) or '0'), tonumber(ARGV[1]))"
+            "local sep = string.find(ARGV[1], ':', 1, true)"
+            " local acked = tonumber(redis.call('GET', KEYS[2]) or '0')"
+            " acked = math.max(acked, tonumber(string.sub(ARGV[1], 1, sep - 1)))"
             " redis.call('SET', KEYS[2], acked)"
-            " if count > acked then return tostring(count) end return false",
-            2,
+            " local legacy = redis.call('GET', KEYS[3])"
+            " if legacy == string.sub(ARGV[1], sep + 1) then redis.call('DEL', KEYS[3]) legacy = false end"
+            " local count = tonumber(redis.call('GET', KEYS[1]) or '0')"
+            " if count > acked or legacy then return tostring(count) .. ':' .. (legacy or '') end return false",
+            3,
             FORCED_VALIDATION_CYCLE_KEY,
             FORCED_VALIDATION_CYCLE_ACKED_KEY,
+            LEGACY_FORCED_VALIDATION_CYCLE_KEY,
             token,
         )
         return newer.decode() if isinstance(newer, bytes) else newer
