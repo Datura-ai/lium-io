@@ -1814,3 +1814,40 @@ def test_authorized_keys_append_runs_under_busybox_ash(tmp_path):
 
     assert completed.returncode == 0, completed.stderr
     assert target.read_text() == "k1\n"
+
+
+@pytest.mark.skipif(shutil.which("flock") is None, reason="flock not installed")
+@pytest.mark.parametrize("remove", [False, True])
+def test_authorized_keys_edit_waits_for_the_other_edit_and_never_writes_past_it(tmp_path, monkeypatch, remove):
+    # DAH-6441: a remove's read-filter-write must not interleave with an add, or it writes back a file missing the add
+    monkeypatch.setattr(rental_docker_sdk, "AUTHORIZED_KEYS_LOCK_WAIT_SECONDS", 1)
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("k1\n")
+    lock = str(target.parent / ".authorized_keys.lock")
+    build = build_remove_authorized_keys_exec_spec if remove else build_authorized_keys_exec_spec
+    spec = build(container_name="pod_key", public_keys=["k1"], target_path=str(target))
+    holder = subprocess.Popen(["flock", "-o", lock, "sleep", "30"])
+    try:
+        while subprocess.run(["flock", "-n", lock, "true"]).returncode == 0:
+            pass
+        completed = _run_key_append(spec)
+    finally:
+        holder.kill()
+        holder.wait()
+
+    assert completed.returncode == (1 if remove else 75)
+    assert target.read_text() == "k1\n"
+
+
+def test_authorized_keys_remove_drops_only_the_listed_keys(tmp_path):
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("k1\nk2\nk3\n")
+
+    completed = _run_key_append(
+        build_remove_authorized_keys_exec_spec(container_name="pod_key", public_keys=["k1", "k3"], target_path=str(target))
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == "k2\n"
