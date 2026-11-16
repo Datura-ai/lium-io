@@ -537,8 +537,39 @@ def _logged_fact(value: Any) -> Any:
     return value if len(text) <= DETAIL_MAX_CHARS else text[:DETAIL_MAX_CHARS]
 
 
+# Readings the two scrapes take at different moments; equality is not expected.
+LIVE_SPEC_PATHS = frozenset(
+    {
+        "cpu.utilization",
+        "ram.free",
+        "ram.used",
+        "ram.available",
+        "ram.utilization",
+        "hard_disk.used",
+        "hard_disk.free",
+        "hard_disk.utilization",
+        "hard_disk.engy_cache_used_gb",
+        "docker.host_cpu_percent",
+    }
+)
+LIVE_DOCKER_CONTAINER_FIELDS = frozenset({"cpu_percent", "net_rx_bytes", "net_tx_bytes"})
+
+
+def _is_live_reading(path: str) -> bool:
+    if path in LIVE_SPEC_PATHS:
+        return True
+    parent, _, leaf = path.rpartition(".")
+    return (
+        leaf in LIVE_DOCKER_CONTAINER_FIELDS
+        and parent.startswith("docker.containers[")
+        and parent.endswith("]")
+    )
+
+
 def _spec_diffs(python: Any, liumd: Any, path: str = "") -> list[dict[str, Any]]:
     """Every differing leaf in the two normalized specs documents, capped for logging."""
+    if path and _is_live_reading(path):
+        return []
     diffs: list[dict[str, Any]] = []
     if type(python) is not type(liumd) and not (
         isinstance(python, (int, float)) and isinstance(liumd, (int, float))
@@ -546,10 +577,19 @@ def _spec_diffs(python: Any, liumd: Any, path: str = "") -> list[dict[str, Any]]
         return [{"path": path or "$", "python": repr(python)[:120], "liumd": repr(liumd)[:120]}]
     if isinstance(python, dict):
         for key in sorted(set(python) | set(liumd)):
+            child = f"{path}.{key}" if path else key
+            if _is_live_reading(child):
+                continue
             if key not in python or key not in liumd:
-                diffs.append({"path": f"{path}.{key}" if path else key, "python": repr(python.get(key))[:120], "liumd": repr(liumd.get(key))[:120]})
+                diffs.append(
+                    {
+                        "path": child,
+                        "python": repr(python.get(key))[:120],
+                        "liumd": repr(liumd.get(key))[:120],
+                    }
+                )
             else:
-                diffs.extend(_spec_diffs(python[key], liumd[key], f"{path}.{key}" if path else key))
+                diffs.extend(_spec_diffs(python[key], liumd[key], child))
     elif isinstance(python, list):
         if len(python) != len(liumd):
             diffs.append({"path": path or "$", "python": len(python), "liumd": len(liumd)})
@@ -563,7 +603,7 @@ def _spec_diffs(python: Any, liumd: Any, path: str = "") -> list[dict[str, Any]]
 
 def _facts(ctx: Context, answer: LocalVerifyAnswer) -> dict[str, Any]:
     """Compare the facts both paths collect. Missing or skipped data is not a mismatch."""
-    specs = ctx.state.specs or {}
+    specs = ctx.state.scrape_specs if ctx.state.scrape_specs is not None else (ctx.state.specs or {})
     checks: list[dict[str, Any]] = []
 
     def check(field: str, liumd: Any, python: Any) -> None:
@@ -607,10 +647,12 @@ def _facts(ctx: Context, answer: LocalVerifyAnswer) -> dict[str, Any]:
 
     raw_specs = answer.specs
     liumd_specs = normalize_liumd_specs(raw_specs) if isinstance(raw_specs, dict) and raw_specs else {}
-    diffs = _spec_diffs(specs, liumd_specs) if liumd_specs else []
+    python_specs = ctx.state.scrape_specs
+    compared = python_specs is not None and bool(liumd_specs)
+    diffs = _spec_diffs(python_specs, liumd_specs) if compared else []
     return {
         "agree": all(c["agree"] for c in checks) if checks else None,
         "checks": checks,
-        "specs_agree": not diffs if liumd_specs else None,
+        "specs_agree": (not diffs) if compared else None,
         "specs_diff": diffs,
     }
