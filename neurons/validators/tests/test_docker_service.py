@@ -3646,25 +3646,102 @@ async def test_retry_half_started_stop_without_a_recorded_id_keeps_the_mark_when
     docker_service.redis_service.delete.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_a_start_cancels_only_its_own_executors_pending_stop_retry(docker_service, monkeypatch):
-    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
-    monkeypatch.setattr("services.docker_service.asyncssh.connect", Mock(side_effect=OSError("ssh refused")))
-    docker_service.redis_service.delete = AsyncMock()
-    pending = asyncio.create_task(asyncio.sleep(3600))
-    monkeypatch.setitem(docker_service_module._HALF_STARTED_STOP_LATER, "exec-1:pod-id", pending)
+@pytest.fixture
+def fresh_half_started_stop_state(monkeypatch):
+    monkeypatch.setattr(docker_service_module, "_HALF_STARTED_STOP_LATER", {})
+    monkeypatch.setattr(docker_service_module, "_HALF_STARTED_STOP_LOCKS", {})
 
-    with pytest.raises(OSError):
-        await _start_existing(docker_service, executor_uuid="exec-2")
+
+def _let_starts_succeed(docker_service, monkeypatch):
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect", Mock(return_value=DummySSHConnectionManager(AsyncMock()))
+    )
+    monkeypatch.setattr("services.docker_service.public_host_sock", AsyncMock(return_value={}))
+    docker_service._restore_mount_and_sshd_after_start = AsyncMock()
+    docker_service.redis_service.delete = AsyncMock()
+
+
+@pytest.mark.asyncio
+async def test_a_start_ends_only_its_own_executors_pending_stop_retry(
+    docker_service, monkeypatch, fresh_half_started_stop_state
+):
+    _let_starts_succeed(docker_service, monkeypatch)
+    pending = asyncio.create_task(asyncio.sleep(3600))
+    docker_service_module._HALF_STARTED_STOP_LATER["exec-1:pod-id"] = pending
+
+    await _start_existing(docker_service, executor_uuid="exec-2")
     await asyncio.sleep(0)
     assert not pending.cancelled()
-    docker_service.redis_service.delete.assert_any_await("half_started_stop_pending:exec-2:pod-id")
     assert call("half_started_stop_pending:exec-1:pod-id") not in docker_service.redis_service.delete.await_args_list
+
+    await _start_existing(docker_service, executor_uuid="exec-1")
+    await asyncio.sleep(0)
+    assert pending.cancelled()
+    docker_service.redis_service.delete.assert_any_await("half_started_stop_pending:exec-1:pod-id")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_start_keeps_an_earlier_failed_starts_pending_stop_and_its_retry(
+    docker_service, monkeypatch, fresh_half_started_stop_state
+):
+    # start B failing must not leave start A's possibly unmounted run without its record and retry
+    _let_starts_succeed(docker_service, monkeypatch)
+    monkeypatch.setattr("services.docker_service.asyncssh.connect", Mock(side_effect=OSError("ssh refused")))
+    pending = asyncio.create_task(asyncio.sleep(3600))
+    docker_service_module._HALF_STARTED_STOP_LATER["exec-1:pod-id"] = pending
+    docker_service.rental_docker_client_factory.client.running = False
 
     with pytest.raises(OSError):
         await _start_existing(docker_service, executor_uuid="exec-1")
     await asyncio.sleep(0)
-    assert pending.cancelled()
+
+    assert not pending.cancelled()
+    docker_service.redis_service.delete.assert_not_awaited()
+    pending.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_pending_stop_retry_racing_a_start_does_not_stop_the_new_run(
+    docker_service, monkeypatch, fresh_half_started_stop_state
+):
+    # the retry matched the old run and is about to stop it: the start waits for that stop, so its run survives
+    _let_starts_succeed(docker_service, monkeypatch)
+    monkeypatch.setattr("services.docker_service._HALF_STARTED_STOP_RETRY_SEC", 0)
+    client = docker_service.rental_docker_client_factory.client
+    client.running = True
+    checked = asyncio.Event()
+    release = asyncio.Event()
+    read_identity = client.container_identity
+
+    async def paused_identity(**kwargs):
+        identity = await read_identity(**kwargs)
+        checked.set()
+        await release.wait()
+        return identity
+
+    client.container_identity = paused_identity
+    retry = asyncio.create_task(
+        docker_service.retry_half_started_stop(
+            executor_info=Mock(uuid="exec-1"),
+            private_key="private-key",
+            pod_id="pod-id",
+            default_extra={},
+            recorded=("pod_test", _RUN, _RECORDED_AT),
+        )
+    )
+    await checked.wait()
+    start = asyncio.create_task(_start_existing(docker_service, executor_uuid="exec-1"))
+    await asyncio.sleep(0.01)
+    assert client.started_containers == []  # the start waits on the retry's lock
+
+    client.container_identity = read_identity
+    release.set()
+    assert await retry is True
+    await start
+
+    assert client.stopped_containers == ["pod_test"]  # the old run only
+    assert client.started_containers == ["pod_test"] and client.running is True
 
 
 @pytest.mark.asyncio

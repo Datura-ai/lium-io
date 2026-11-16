@@ -2890,6 +2890,15 @@ def _half_started_stop_slot(executor_info: ExecutorSSHInfo, pod_id: str) -> str:
     return f"{executor_info.uuid}:{pod_id}"
 
 
+# executor uuid:pod_id -> held by a pod's start and by its pending stop's retry, from inspect to stop
+# shortcut: never pruned (one small lock per pod this process started); prune if that ever shows in memory
+_HALF_STARTED_STOP_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _half_started_stop_lock(slot: str) -> asyncio.Lock:
+    return _HALF_STARTED_STOP_LOCKS.setdefault(slot, asyncio.Lock())
+
+
 def _docker_time(value: str) -> datetime:
     # Docker's RFC 3339 time carries nanoseconds, datetime takes microseconds
     match = re.fullmatch(r"(.+T\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)", value)
@@ -12554,14 +12563,10 @@ class DockerService:
         # safe for a pod without an encrypted volume: mounting gocryptfs at a guessed path would
         # leave the customer's real path an ordinary container dir, writing plaintext to the host.
         pkey = asyncssh.import_private_key(private_key)
-        # this start takes the pod over: a pending stop of an earlier failed start must not stop it afterwards
-        # keyed by executor too: a pod id moves between nodes, and a start on one must not cancel another's stop
+        # keyed by executor too: a pod id moves between nodes, and a start on one must not touch another's stop
         slot = _half_started_stop_slot(executor_info, pod_id)
-        task = _HALF_STARTED_STOP_LATER.pop(slot, None)
-        if task:
-            task.cancel()
-        await self._forget_half_started_stop(slot, default_extra)
-        async with self.rental_docker_client_factory.connect(
+        # held through the start, so a pending stop's retry can neither act mid-start nor on a run checked before it
+        async with _half_started_stop_lock(slot), self.rental_docker_client_factory.connect(
             executor_info=executor_info,
             private_key=private_key,
         ) as docker_client:
@@ -12647,6 +12652,11 @@ class DockerService:
                 if not running_before:
                     await _cleanup_to_completion(_stop_after_starts())
                 raise
+            # only a start that mounted the pod ends an earlier failed start's pending stop; a failed one leaves it
+            task = _HALF_STARTED_STOP_LATER.pop(slot, None)
+            if task:
+                task.cancel()
+            await self._forget_half_started_stop(slot, default_extra)
 
     async def _stop_half_started_container(
         self, docker_client: RentalDockerSdkClient, container_name: str, default_extra: dict[str, Any]
@@ -12707,8 +12717,9 @@ class DockerService:
                     return
 
         slot = _half_started_stop_slot(executor_info, pod_id)
-        if slot in _HALF_STARTED_STOP_LATER:
-            return
+        # a newer failure's record replaces an older one's
+        if earlier := _HALF_STARTED_STOP_LATER.pop(slot, None):
+            earlier.cancel()
         task = asyncio.create_task(retry())
         _HALF_STARTED_STOP_LATER[slot] = task
         task.add_done_callback(
@@ -12760,6 +12771,25 @@ class DockerService:
         pod_id: str,
         default_extra: dict[str, Any],
         recorded: tuple[str, str, str] | None = None,
+    ) -> bool | None:
+        # under the pod's lock from record read to stop: a start cannot slip in between the check and the stop
+        async with _half_started_stop_lock(_half_started_stop_slot(executor_info, pod_id)):
+            return await self._retry_half_started_stop_locked(
+                executor_info=executor_info,
+                private_key=private_key,
+                pod_id=pod_id,
+                default_extra=default_extra,
+                recorded=recorded,
+            )
+
+    async def _retry_half_started_stop_locked(
+        self,
+        *,
+        executor_info: ExecutorSSHInfo,
+        private_key: str | None,
+        pod_id: str,
+        default_extra: dict[str, Any],
+        recorded: tuple[str, str, str] | None,
     ) -> bool | None:
         """Stop a pod whose failed start left it possibly running without its mount (F-31/F-37/F-15).
         Only the very run recorded at the failure is stopped: a pod started or re-created since is left running.
