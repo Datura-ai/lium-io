@@ -24,6 +24,7 @@ from core.utils import _m, get_extra_info
 from incentive.config import BASE_GPU_MAP
 
 from .checks.verifyx import hold_verifyx_ema, verifyx_ema_hold_reason
+from .event_report_fit import fit_event_report
 from .models import JobResult
 from .pipeline import Context
 
@@ -447,10 +448,8 @@ class ResultHandler:
             return ResetVerifiedJobReason.DEFAULT
 
     async def _publish_inspector_event(self, event: dict, miner_hotkey: str) -> None:
-        payload = {
-            **event,
-            "miner_hotkey": miner_hotkey,
-        }
+        # DAH-6478: capped here, before Redis; an oversized message drops the connector's whole subscription
+        payload = fit_event_report({**event, "miner_hotkey": miner_hotkey})
         try:
             await self.redis_service.publish(
                 INSPECTOR_EVENT_CHANNEL,
