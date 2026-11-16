@@ -332,9 +332,14 @@ async def test_the_download_sweep_removes_its_helper_container_after_the_run_too
     assert "docker rm -f lium_cache_sweep" in before and "docker rm -f lium_cache_sweep" in after
 
 
+CHECK_ID = "a1" * 32
+
+
 def test_only_never_started_capability_checks_are_picked():
     listing = "\n".join(
         [
+            f"{CHECK_ID} lium_capability_check_12_0a1b2c",
+            # a short or non-hex id is not a container id docker prints, so it is never removed
             "a1 lium_capability_check_12_0a1b2c",
             # a provider's container: a lookalike name, or an unnamed executor-image diagnostic, survives
             "b2 lium_capability_check_backup",
@@ -344,7 +349,7 @@ def test_only_never_started_capability_checks_are_picked():
         ]
     )
 
-    assert never_started_check_containers(listing) == ["a1"]
+    assert never_started_check_containers(listing) == [CHECK_ID]
 
 
 @pytest.mark.asyncio
@@ -353,11 +358,11 @@ async def test_the_stale_cleanup_removes_never_started_check_containers(cleanup)
         async def run(self, command: str, *args, **kwargs):
             if "status=created" in command:
                 self.commands.append(command)
-                body = "a1 lium_capability_check_12_0a1b2c"
+                body = f"{CHECK_ID} lium_capability_check_12_0a1b2c"
                 return SimpleNamespace(exit_status=0, stdout=body, stderr="")
             return await super().run(command, *args, **kwargs)
 
     ssh_client = CreatedChecksSshClient(containers=[], volumes=[], free_gb=900)
 
     assert await cleanup.remove_never_started_check_containers(ssh_client, "exec-1") == 1
-    assert any(c.startswith("/usr/bin/docker rm -f a1 ") for c in ssh_client.commands)
+    assert any(c.startswith(f"/usr/bin/docker rm -f {CHECK_ID} ") for c in ssh_client.commands)
