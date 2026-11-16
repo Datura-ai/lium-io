@@ -12,6 +12,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+from pathlib import PurePosixPath
 from typing import IO
 
 from storage.models import (
@@ -53,6 +54,7 @@ SIGKILL_EXIT = 137
 HELPER_LABEL = "lium.backup-helper"
 # Set on helpers whose entrypoint is storage_runner.py: they report for themselves and outlive the executor.
 WRAPPER_LABEL = "lium.storage-wrapper"
+HELPER_VOLUME_ROOT = "/workspace"
 # The operation spec, by name only: its value comes from the launching process's environment, never argv.
 SPEC_ENV = "LIUM_STORAGE_SPEC"
 CGROUP_MEMORY_EVENTS = "/sys/fs/cgroup/memory.events"
@@ -61,8 +63,31 @@ STALE_HELPER_AGE = timedelta(minutes=10)
 # sh's own cd error is dropped: StorageEventReporter keeps the first diagnostic, which must be ours.
 # Runs the backup inside a helper (docker volume or encrypted namespace). A missing or empty path exits 66 before
 # restic starts, so nothing is uploaded (DAH-2002); a path that is not a directory fails.
-BACKUP_SOURCE_SCRIPT = '[ -e "$1" ] || exit 66; cd "$1" 2>/dev/null || exit 1; [ -n "$(ls -A)" ] || exit 66; shift; exec "$@"'
 BACKUP_SOURCE_MISSING_EXIT = 66
+PATH_OUTSIDE_VOLUME_EXIT = 67
+
+
+def _confined_to(volume_root_argument: str) -> str:
+    """Shell that refuses a working directory off the volume's filesystem.
+
+    A symbolic link in the pod's volume resolves in the helper, so it could lead to the helper's own root, its
+    /proc or a privileged helper's /dev. This checks links planted before the operation. tar extracts relative to
+    the pinned cwd, but restic resolves its path from $PWD and again on every write, so a running rental that swaps
+    a link during a restic backup or restore is not covered here (DAH-6447)."""
+    return (
+        f'[ "$(stat -c %d .)" = "$(stat -c %d -- "{volume_root_argument}")" ] '
+        f'|| {{ echo "the path leaves the pod volume" >&2; exit {PATH_OUTSIDE_VOLUME_EXIT}; }}; '
+    )
+
+
+# $1 is the backup path, $2 the volume root, then the restic command.
+BACKUP_SOURCE_SCRIPT = (
+    '[ -e "$1" ] || exit 66; cd "$1" 2>/dev/null || exit 1; '
+    + _confined_to("$2")
+    + '[ -n "$(ls -A)" ] || exit 66; shift 2; exec "$@"'
+)
+# $1 is the restore target, $2 the volume root, then the restic command (restoring into `.`).
+RESTORE_TARGET_SCRIPT = 'mkdir -p -- "$1" && cd -- "$1" || exit 1; ' + _confined_to("$2") + 'shift 2; exec "$@"'
 
 # restic 0.19.1 prints this as the exit_error JSON "message" with --json, else as a plain stderr line
 SNAPSHOT_EMPTY_MESSAGE = "Fatal: unable to save snapshot: snapshot is empty"
@@ -492,6 +517,8 @@ class ResticStorageRunner:
             return ResticResult("COMPLETED", OperationResultQuality.PARTIAL, snapshot_id, exit_code)
         if exit_code == SIGKILL_EXIT:
             raise ResticOperationError(self._killed_helper_message("backup"))
+        if exit_code == PATH_OUTSIDE_VOLUME_EXIT and not snapshot_id:
+            raise ResticOperationError("the backup path leaves the pod volume (through a symbolic link)")
         raise ResticOperationError(
             f"restic backup failed with exit {exit_code}"
             + (" without a snapshot ID" if not snapshot_id else "")
@@ -518,6 +545,8 @@ class ResticStorageRunner:
         exit_code, summary = self._stream_command(command, cwd)
         if exit_code == SIGKILL_EXIT:
             raise ResticOperationError(self._killed_helper_message("restore"))
+        if exit_code == PATH_OUTSIDE_VOLUME_EXIT:
+            raise ResticOperationError("the restore path leaves the pod volume (through a symbolic link)")
         # restic exits 1 when some files failed (e.g. the live workload removed a dir mid-restore), but also on
         # disk-full and repository errors: only vanished-file errors count as PARTIAL, however many
         # restic counts files it wrote, even ones removed afterwards: the files left are the total less the distinct
@@ -547,6 +576,8 @@ class ResticStorageRunner:
         )
         command, cwd = self._legacy_restore_execution_command(object_key)
         exit_code, _ = self._stream_command(command, cwd, restore_stats=restore_stats)
+        if exit_code == PATH_OUTSIDE_VOLUME_EXIT:
+            raise ResticOperationError("the restore path leaves the pod volume (through a symbolic link)")
         if exit_code != 0:
             raise ResticOperationError(f"legacy restore failed with exit {exit_code}")
         self._events.restic_event(
@@ -735,32 +766,31 @@ class ResticStorageRunner:
         self,
         restic_arguments: list[str],
         working_directory: bool,
+        script: str = BACKUP_SOURCE_SCRIPT,
     ) -> tuple[list[str], str | None]:
         restic_command = self._restic_command(restic_arguments)
-        if isinstance(self._workspace, LocalWorkspace):
-            cwd = str(self._workspace.path) if working_directory else None
-            return restic_command, cwd
-
-        # an encrypted workspace: restic runs inside the rental's user namespace
         if working_directory:
-            namespace_command = [
+            # the helper enters the path and checks it stays on the volume (DAH-6446) before restic runs
+            restic_command = [
                 "/bin/sh",
                 "-c",
-                BACKUP_SOURCE_SCRIPT,
+                script,
                 "sh",
                 str(self._workspace.path),
+                self._volume_root(),
                 *restic_command,
             ]
-        else:
-            namespace_command = restic_command
-        return self._nsenter_command(namespace_command), None
+        if isinstance(self._workspace, LocalWorkspace):
+            return restic_command, None
+        # an encrypted workspace: restic runs inside the rental's user namespace
+        return self._nsenter_command(restic_command), None
 
     def _restore_execution_command(self, snapshot_id: str) -> tuple[list[str], str | None]:
         arguments = [
             "restore",
             "--json",
             "--target",
-            self._workspace_path(),
+            ".",
             "--sparse",
         ]
         if isinstance(self._workspace, NamespaceWorkspace):
@@ -768,13 +798,15 @@ class ResticStorageRunner:
             # that cannot be written from the rental user namespace are skipped.
             arguments.extend(["--exclude-xattr", "security.*", "--exclude-xattr", "trusted.*"])
         arguments.extend(["--", snapshot_id])
-        return self._execution_command(arguments, working_directory=False)
+        return self._execution_command(arguments, working_directory=True, script=RESTORE_TARGET_SCRIPT)
 
     def _legacy_restore_execution_command(self, object_key: str) -> tuple[list[str], str | None]:
         pipeline_script = (
-            'mkdir -p -- "$4"; '
-            '"$1" s3 cp "s3://$2/$3" - --no-progress | '
-            'tar --extract --gzip --file - --directory "$4" --strip-components=1 '
+            'mkdir -p -- "$4" && cd -- "$4" || exit 1; '
+            + _confined_to("$5")
+            # from /: awscli (Python) needs a getcwd, which fails in the rental's tree under an encrypted helper
+            + '(cd / && exec "$1" s3 cp "s3://$2/$3" - --no-progress) | '
+            'tar --extract --gzip --file - --directory . --strip-components=1 '
             "--preserve-permissions --same-owner --numeric-owner --xattrs --acls "
             f"--blocking-factor=20 --checkpoint={TAR_CHECKPOINT_RECORDS} "
             f"--checkpoint-action=echo={RESTORE_CHECKPOINT_PREFIX}%u"
@@ -790,6 +822,7 @@ class ResticStorageRunner:
             self._operation.repository.bucket,
             object_key,
             self._workspace_path(),
+            self._volume_root(),
         ]
         if isinstance(self._workspace, LocalWorkspace):
             return pipeline_command, None
@@ -885,6 +918,16 @@ class ResticStorageRunner:
 
     def _workspace_path(self) -> str:
         return str(self._workspace.path)
+
+    def _volume_root(self) -> str:
+        """The volume's root as the helper sees it, for the filesystem check on the path it enters."""
+        if isinstance(self._workspace, NamespaceWorkspace):
+            parts = self._workspace.path.parts  # <proc>/<pid>/root/<path in the container>
+            container_root = PurePosixPath(*parts[: parts.index(str(self._workspace.pid)) + 2])
+            return str(container_root / self._operation.workspace.volume_path.relative_to("/"))
+        # a plain volume is mounted at /workspace in the helper
+        path = PurePosixPath(str(self._workspace.path))
+        return HELPER_VOLUME_ROOT if path.is_relative_to(HELPER_VOLUME_ROOT) else str(path)
 
     def _build_environment(self) -> dict[str, str]:
         repository = self._operation.repository

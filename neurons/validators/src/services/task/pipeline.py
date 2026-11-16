@@ -247,6 +247,12 @@ class ContextState:
     # not attempted or fell back entirely; the capability and VerifyX checks consume a judged
     # step when present and run over SSH otherwise.
     local_verify: LocalVerifyOutcome | None = None
+    # The liumd shadow's docker and ports read, started right after machine_scrape so both see the
+    # same containers; awaited by the shadow at the end of the run. None = no shadow for this node.
+    liumd_shadow_facts_task: Any = None
+    # True once machine_scrape has tried to start that read, so a later shadow never falls back
+    # to a different Docker moment.
+    liumd_shadow_facts_attempted: bool = False
     # DAH-5462: VerifyX's cold first sample, re-measured by VerifyXColdRetryCheck just before scoring
     verifyx_cold_retry: Any = None
 
@@ -300,6 +306,8 @@ class Context(BaseModel):
     # Set by GpuFingerprintCheck when the node lists a full set of other GPUs (full_set_changed): ResultHandler
     # makes this cycle's set the anchor.
     gpu_reanchor: bool = False
+    # Set by SpecChangeCheck: the reset records this cycle's model:count, so the next cycle audits the node as it is now
+    gpu_respec: bool = False
     collateral_deposited: bool = False
     contract_version: str | None = None
     is_rental_succeed: bool = False

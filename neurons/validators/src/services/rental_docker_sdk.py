@@ -66,6 +66,13 @@ _TRANSPORT_ERROR_TYPES = (
 # paramiko's EOFError has no text; the SDK client wraps it as "<operation> failed: EOFError".
 _TRANSPORT_EOF_SUFFIX = ": EOFError"
 _T = TypeVar("_T")
+
+
+def docker_size(gb: float) -> str:
+    """A Docker size string with no fraction: Docker refuses one like `36.5g`, so a half GiB goes as whole MiB."""
+    return f"{int(gb)}g" if gb == int(gb) else f"{int(gb * 1024)}m"
+
+
 # DAH-2475: the Docker SDK is synchronous, so every call below has to run in a thread. It must not be
 # the event loop's default executor: asyncio resolves DNS there too (loop.getaddrinfo runs in it), and
 # a wave of filler creates fills that pool with minutes-long pulls. Name resolution then queues behind
@@ -464,6 +471,8 @@ class RentalDockerSdkClient:
     ):
         self._api_client = api_client
         self._pull_timeout_seconds = pull_timeout_seconds
+        # DAH-6025: layer id -> [bytes downloaded, done], filled by the running pull for the renter log
+        self.pull_progress: dict[str, list] = {}
 
     async def login(self, *, username: str, password: str, image: str) -> None:
         # docker-py stores the credential under docker.io unless the registry
@@ -1291,8 +1300,10 @@ class RentalDockerSdkClient:
         )
         self._api_client._raise_for_status(response)
 
+        self.pull_progress = {}
         for event in self._api_client._stream_helper(response, decode=True) or ():
             _raise_pull_event_error(event)
+            _track_pull_progress(self.pull_progress, event)
 
     def _normalized_pull_timeout_seconds(self) -> int | float | None:
         if self._pull_timeout_seconds is None or self._pull_timeout_seconds <= 0:
@@ -1847,7 +1858,7 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
         "oom_score_adj": spec.oom_score_adj,
         "pids_limit": spec.pids_limit if spec.pids_limit else None,
         "storage_opt": (
-            {"size": f"{spec.storage_limit_gb:.10g}g"}
+            {"size": docker_size(spec.storage_limit_gb)}
             if spec.storage_limit_gb
             else None
         ),
@@ -2059,6 +2070,37 @@ def _raise_pull_event_error(event) -> None:
     from docker.errors import APIError
 
     raise APIError("Docker image pull failed", explanation=str(message))
+
+
+# "Download complete" comes before extraction; a layer is done once registered
+_LAYER_DONE_STATUSES = ("Pull complete", "Already exists")
+
+
+def _track_pull_progress(progress: dict[str, list], event) -> None:
+    if not isinstance(event, dict) or not event.get("id"):
+        return
+    status = str(event.get("status") or "")
+    if status in ("Pulling fs layer", "Waiting"):
+        progress.setdefault(event["id"], [0, False])
+    elif status == "Downloading":
+        current = (event.get("progressDetail") or {}).get("current")
+        if isinstance(current, int):
+            progress.setdefault(event["id"], [0, False])[0] = current
+    elif status == "Extracting":
+        # a cached blob can still need unpacking: Already exists -> Extracting -> Pull complete
+        progress.setdefault(event["id"], [0, False])[1] = False
+    elif status in _LAYER_DONE_STATUSES:
+        progress.setdefault(event["id"], [0, False])[1] = True
+
+
+def pull_progress_text(progress: dict[str, list] | None) -> str | None:
+    """'3 of 7 layers done, 1.2 GB downloaded', or None before Docker has listed any layer."""
+    if not progress:
+        return None
+    layers = list(progress.values())
+    done = sum(1 for _, finished in layers if finished)
+    downloaded_gb = sum(nbytes for nbytes, _ in layers) / 1e9
+    return f"{done} of {len(layers)} layers done, {downloaded_gb:.1f} GB downloaded"
 
 
 def _with_default_tag(driver: str) -> str:
