@@ -1527,18 +1527,31 @@ def build_gpu_docker_config(
 # The backend's add fence (lium-platform DAH-6441) expires after an hour; this bound is what makes that expiry safe.
 AUTHORIZED_KEYS_APPEND_DEADLINE_SECONDS = 60
 AUTHORIZED_KEYS_LOCK_WAIT_SECONDS = 30
+# past both edits' deadline (AUTHORIZED_KEYS_APPEND_DEADLINE_SECONDS), so a lock this old has no live writer
+AUTHORIZED_KEYS_STALE_LOCK_MINUTES = 2
 
 
-def _authorized_keys_lock(quoted_dir: str, busy_exit: int, required: bool = False) -> str:
-    """Serializes the add and the remove on one lock file, so a remove's read-filter-write never drops a key an add
-    appended in between. Without flock an add appends unlocked as before; a remove refuses, since a delayed unlocked
-    write-back could restore a key a later remove revoked."""
-    no_flock = f"else echo 'flock not available' >&2; exit {busy_exit}; " if required else ""
+def _authorized_keys_lock(quoted_dir: str, busy_exit: int) -> str:
+    """Serializes the add and the remove, so a remove's read-filter-write never drops a key an add appended in between
+    and a delayed remove never writes back over a later one. flock where the image has it (BusyBox's has no -w, so
+    poll -n); else an atomic mkdir, which a crashed holder leaves behind: it is taken over once older than every
+    edit's deadline, since past that its holder can no longer write. Sets $unlock for the caller's own EXIT trap."""
+    lock_dir = f"{quoted_dir}/.authorized_keys.lockdir"
+    poll = (
+        f"waited=0; until {{take}}; do if [ $waited -ge {AUTHORIZED_KEYS_LOCK_WAIT_SECONDS} ]; then {{stale}}exit "
+        f"{busy_exit}; fi; waited=$((waited + 1)); sleep 1; done; "
+    )
+    stale = (
+        f'if [ -n "$(find {lock_dir} -maxdepth 0 -mmin +{AUTHORIZED_KEYS_STALE_LOCK_MINUTES} 2>/dev/null)" ] && '
+        f"rmdir {lock_dir} 2>/dev/null && mkdir {lock_dir} 2>/dev/null; then break; fi; "
+    )
     return (
+        "unlock=:; "
         f"if command -v flock >/dev/null 2>&1; then exec 9>>{quoted_dir}/.authorized_keys.lock || exit {busy_exit}; "
-        # BusyBox flock (Alpine) has no -w: poll with -n, which both flocks take
-        f"waited=0; until flock -n 9; do [ $waited -ge {AUTHORIZED_KEYS_LOCK_WAIT_SECONDS} ] && exit {busy_exit}; "
-        f"waited=$((waited + 1)); sleep 1; done; {no_flock}fi; "
+        + poll.format(take="flock -n 9", stale="")
+        + "else "
+        + poll.format(take=f"mkdir {lock_dir} 2>/dev/null", stale=stale)
+        + f'unlock="rmdir {lock_dir}"; trap \'eval "$unlock"\' EXIT; fi; '
     )
 
 
@@ -1591,16 +1604,20 @@ def build_remove_authorized_keys_exec_spec(
     # stdin and matched from a temp file, so key contents are never interpolated
     # into host-side Docker shell text or into this argv.
     script = (
-        "set -e; "
+        "set -e; start=$(cat /proc/uptime); "
         f"mkdir -p {quoted_dir}; "
-        + _authorized_keys_lock(quoted_dir, 1, required=True)
+        + _authorized_keys_lock(quoted_dir, 1)
         + f"touch {quoted_path} && "
         "keys=$(mktemp) && filtered=$(mktemp) && "
-        "trap 'rm -f \"$keys\" \"$filtered\"' EXIT && "
+        "trap 'rm -f \"$keys\" \"$filtered\"; eval \"$unlock\"' EXIT && "
         "cat > \"$keys\" && "
         f"if grep -vxF -f \"$keys\" {quoted_path} > \"$filtered\"; then "
         ":; else status=$?; "
         "[ \"$status\" -eq 1 ] || exit \"$status\"; fi; "
+        # the same deadline as the add's: what lets a stale mkdir lock be taken over safely
+        "now=$(cat /proc/uptime); "
+        f'if [ $(( ${{now%%.*}} - ${{start%%.*}} )) -gt {AUTHORIZED_KEYS_APPEND_DEADLINE_SECONDS} ]; then '
+        'echo "authorized_keys remove deadline passed" >&2; exit 1; fi; '
         f"cat \"$filtered\" > {quoted_path}"
     )
     return ContainerExecSpec(
