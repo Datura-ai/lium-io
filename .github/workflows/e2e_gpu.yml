@@ -1,0 +1,68 @@
+name: e2e GPU (daily)
+
+# The e2e gate with E2E_GPU=1 on a real GPU, once a day (not per PR). The GPU pod exists only for the run: it is
+# rented before the gate and removed after it, pass or fail, and --ttl caps it if this job is killed first.
+# Needs: secret LIUM_API_KEY (the account the pod bills to), secret E2E_GPU_FAILURE_WEBHOOKS (space-separated
+# Discord webhook URLs told about a failure), variable E2E_GPU_TEMPLATE_ID (a Docker-in-Docker pod template; the
+# GPU path uses the pod's dockerd, e2e/README.md), optional variable E2E_GPU_MODEL (default RTX4090).
+on:
+  schedule:
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-gpu
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  e2e-gpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      LIUM_API_KEY: ${{ secrets.LIUM_API_KEY }}
+      POD: e2e-gpu-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install the lium CLI
+        run: pip install lium.io && lium init --json
+
+      - name: Rent the GPU pod
+        run: >
+          lium up --gpu "${{ vars.E2E_GPU_MODEL || 'RTX4090' }}" --template_id "${{ vars.E2E_GPU_TEMPLATE_ID }}"
+          --name "$POD" --ttl 2h --no-ssh --yes
+
+      - name: Run the gate with E2E_GPU=1
+        run: |
+          tar czf /tmp/src.tgz --exclude=.git .
+          lium scp "$POD" /tmp/src.tgz /root/src.tgz
+          # detached: an SSH session held open for the whole gate would fail the run on any network blip
+          lium exec "$POD" -d "mkdir -p /root/lio && tar xzf /root/src.tgz -C /root/lio && cd /root/lio/e2e && (E2E_GPU=1 make e2e-full > /root/gate.log 2>&1; echo \$? > /root/gate.rc)"
+          for _ in $(seq 1 90); do
+            sleep 60
+            rc=$(lium exec "$POD" --json "cat /root/gate.rc 2>/dev/null || true" | python3 -c 'import json,sys; print(json.load(sys.stdin)["stdout"].strip())') || continue
+            [ -n "$rc" ] && break
+          done
+          lium exec "$POD" "tail -n 200 /root/gate.log; cat /root/lio/e2e/artifacts/summary.md" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "gate exit code: ${rc:-none (timed out)}"
+          [ "$rc" = 0 ]
+
+      - name: Remove the GPU pod
+        if: always()
+        run: lium rm "$POD" --name-only --yes
+
+      - name: Report a failure
+        if: failure()
+        env:
+          WEBHOOKS: ${{ secrets.E2E_GPU_FAILURE_WEBHOOKS }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          body=$(python3 -c 'import json,os; print(json.dumps({"content": "Daily GPU e2e failed: " + os.environ["RUN_URL"]}))')
+          for hook in $WEBHOOKS; do curl -fsS -H 'Content-Type: application/json' -d "$body" "$hook"; done
