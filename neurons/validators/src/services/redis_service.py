@@ -3,7 +3,6 @@ import json
 import logging
 import math
 import time
-import uuid
 from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
 from typing import Callable, Literal, NamedTuple
@@ -157,14 +156,8 @@ INCENTIVE_SNAPSHOT_KEY = "incentive_snapshot"
 # gets one cycle without container removal (see StaleContainerCleanupCheck).
 CLEANUP_SEEN_EXECUTORS_SET = "cleanup_seen_executors"
 # Written by the connector process, read by the validator process: they share no memory, so
-# this key is how an operator's request for a cycle crosses between them. It counts requests; the
-# acknowledged key holds the count a started cycle read, so a request is pending while the count is higher.
-FORCED_VALIDATION_CYCLE_KEY = "forced_validation_cycle_count"
-FORCED_VALIDATION_CYCLE_ACKED_KEY = "forced_validation_cycle_acknowledged"
-# The key the connector and validator used before the count (review 4580868787): both are still written and read, so a
-# request crosses a rollout in which one process runs the old version. Remove once every validator runs the count.
-LEGACY_FORCED_VALIDATION_CYCLE_KEY = "forced_validation_cycle"
-LEGACY_FORCED_VALIDATION_CYCLE_TTL_SECONDS = 60
+# this key is how an operator's request for a cycle crosses between them.
+FORCED_VALIDATION_CYCLE_KEY = "forced_validation_cycle"
 # DAH-3597: one key per executor while a DinD probe miss is on record (expires with the grace TTL).
 DIND_PROBE_MISS_PREFIX = "dind_probe_miss"
 # DAH-3698: a port verification that failed once inside the window (first-miss grace, as DAH-3597)
@@ -183,6 +176,9 @@ DISK_PRESSURE_DEFERRALS_PREFIX = "disk_pressure_deferrals"
 CACHED_TEMPLATE_FIRST_UNCACHED_PREFIX = "cached_template_first_uncached"
 # One key per (miner hotkey, executor): what the rented GPU health read flagged and when (DAH-4482).
 POST_RENTAL_GPU_RECHECK_PREFIX = "post_rental_gpu_recheck"
+# One scheduled window is 75 blocks, about 15 minutes. A request older than a couple of sync
+# ticks is stale: the operator has moved on, or the scheduled cycle covered them anyway.
+FORCED_VALIDATION_CYCLE_TTL_SECONDS = 60
 # DAH-2958: every executor uuid this validator has ever published a spec for. The express lane
 # treats anything in the portal snapshot that is NOT here as never validated. Seeded by every
 # cycle's publish, so one completed cycle after deploy is enough to know the whole fleet.
@@ -585,12 +581,11 @@ class RedisService:
         return pubsub
 
     async def request_forced_validation_cycle(self) -> None:
-        # No TTL (review 4580791049): a request stays until a cycle that read it starts, however long the
-        # cycle before it takes. A request made while the validator is down starts one cycle when it is back.
-        # The legacy key carries it to an old validator. A read between the two writes costs one extra cycle at most.
-        await self.redis.incr(FORCED_VALIDATION_CYCLE_KEY)
+        # The TTL is the backstop, not the normal path: the request is cleared when a cycle
+        # starts. It bounds a request that outlives its purpose -- a validator that is down,
+        # or a stale replica still serving the key after the delete.
         await self.redis.set(
-            LEGACY_FORCED_VALIDATION_CYCLE_KEY, uuid.uuid4().hex, ex=LEGACY_FORCED_VALIDATION_CYCLE_TTL_SECONDS
+            FORCED_VALIDATION_CYCLE_KEY, "1", ex=FORCED_VALIDATION_CYCLE_TTL_SECONDS
         )
 
     async def mark_executors_validated(self, executor_ids: list[str]) -> None:
@@ -661,36 +656,11 @@ class RedisService:
             if value is not None
         }
 
-    async def forced_validation_cycle_request(self) -> str | None:
-        """The pending request's token, "<request count>:<legacy key value>", or None when no cycle was asked for
-        since the last acknowledged one and no old connector wrote the legacy key."""
-        count, acked, legacy = await self.redis.mget(
-            FORCED_VALIDATION_CYCLE_KEY, FORCED_VALIDATION_CYCLE_ACKED_KEY, LEGACY_FORCED_VALIDATION_CYCLE_KEY
-        )
-        count = int(count or 0)
-        legacy = legacy.decode() if isinstance(legacy, bytes) else legacy
-        return f"{count}:{legacy or ''}" if count > int(acked or 0) or legacy else None
+    async def is_forced_validation_cycle_requested(self) -> bool:
+        return await self.get(FORCED_VALIDATION_CYCLE_KEY) is not None
 
-    async def clear_forced_validation_cycle_request(self, token: str) -> str | None:
-        """Acknowledge the requests up to the one this cycle read, and the legacy key if it still holds the value read;
-        returns a newer request's token (made while the cycle was being prepared), which stays pending for the next
-        tick."""
-        newer = await self.redis.eval(
-            "local sep = string.find(ARGV[1], ':', 1, true)"
-            " local acked = tonumber(redis.call('GET', KEYS[2]) or '0')"
-            " acked = math.max(acked, tonumber(string.sub(ARGV[1], 1, sep - 1)))"
-            " redis.call('SET', KEYS[2], acked)"
-            " local legacy = redis.call('GET', KEYS[3])"
-            " if legacy == string.sub(ARGV[1], sep + 1) then redis.call('DEL', KEYS[3]) legacy = false end"
-            " local count = tonumber(redis.call('GET', KEYS[1]) or '0')"
-            " if count > acked or legacy then return tostring(count) .. ':' .. (legacy or '') end return false",
-            3,
-            FORCED_VALIDATION_CYCLE_KEY,
-            FORCED_VALIDATION_CYCLE_ACKED_KEY,
-            LEGACY_FORCED_VALIDATION_CYCLE_KEY,
-            token,
-        )
-        return newer.decode() if isinstance(newer, bytes) else newer
+    async def clear_forced_validation_cycle_request(self) -> None:
+        await self.delete(FORCED_VALIDATION_CYCLE_KEY)
 
     @staticmethod
     def _dind_probe_miss_key(miner_hotkey: str, executor_id: str) -> str:

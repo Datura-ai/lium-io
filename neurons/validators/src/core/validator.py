@@ -4,7 +4,6 @@ import json
 import os
 import time
 from datetime import UTC, datetime
-from pathlib import Path
 
 from clients.backend_client import BackendClient, BackendRejected
 from clients.subtensor_client import ProviderPortalDataUnavailable, SubtensorClient
@@ -155,8 +154,6 @@ class Validator:
         # DAH-2958: the current cycle's job files / digests / image snapshot, reused by the
         # express lane so its verifications are the cycle's pipeline. None before the first cycle.
         self.cycle_inputs: CycleInputs | None = None
-        # A forced request made while the last cycle was prepared; kept here because its Redis TTL can end mid-wave.
-        self.carried_forced_request: str | None = None
         # When the first cycle since start began (CycleInputs.fleet_known_since).
         self.first_cycle_started_at: datetime | None = None
 
@@ -290,8 +287,8 @@ class Validator:
         first cycle to finish instead kept new nodes out of the lane 8-14 minutes after every restart."""
         return self.cycle_inputs
 
-    async def an_operator_asked_for_a_cycle_now(self) -> str | None:
-        """The token of an operator's pending cycle request, or None. Reads only -- the request stays pending.
+    async def an_operator_asked_for_a_cycle_now(self) -> bool:
+        """Whether an operator asked for a cycle. Reads only -- the request stays pending.
 
         DAH-2090, staging only. The connector process writes the request; it runs beside this
         one and shares no memory with it, so Redis carries it across. The request is cleared
@@ -301,12 +298,12 @@ class Validator:
         # A production validator ignores the key entirely, so a stray one cannot start a cycle
         # there even if something wrote it.
         if settings.DEPLOY_ENV == "PROD":
-            return None
+            return False
 
         # This runs on every tick, before the cycle branch. Without the guard a Redis blip
         # would end the whole tick as a generic "[sync] Unknown error".
         try:
-            return await self.redis_service.forced_validation_cycle_request() or self.carried_forced_request
+            return await self.redis_service.is_forced_validation_cycle_requested()
         except Exception as exc:
             logger.warning(
                 _m(
@@ -314,7 +311,7 @@ class Validator:
                     extra=get_extra_info({**self.default_extra, "error": str(exc)}),
                 ),
             )
-            return self.carried_forced_request
+            return False
 
     async def sync(self):
         try:
@@ -462,6 +459,11 @@ class Validator:
                     )
                     return
 
+                # DAH-3405: a push between two cycles opens the grace window here, after the last
+                # early return and before the first job of this cycle runs against the new digest,
+                # so an aborted iteration does not count as a cycle of the window.
+                rollout_window = await self.observe_executor_rollout(executor_digest, job_block)
+
                 logger.info(
                     _m(
                         "[sync] Send jobs to miners",
@@ -476,23 +478,18 @@ class Validator:
                     ),
                 )
 
-                # Built before the cycle counts: a failed build (obfuscator exit) leaves the cycle
-                # and an operator's forced request to the next tick. A fresh job-files directory for
-                # this cycle; the ones an express verification still reads are kept (DAH-2958).
-                # The current cycle's directory is kept too: an express tick reads it until the new
-                # cycle_inputs below replace it, and the awaits before them can stall on Redis.
-                previous_directory = self.cycle_inputs.encrypted_files.tmp_directory if self.cycle_inputs else None
+                # A fresh job-files directory for this cycle; the ones an express verification
+                # still reads are kept (DAH-2958). The express lane uses the new one from here on.
+                # Built before the cycle counts: a failed build (obfuscator exit) retries next tick.
                 encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files(
-                    keep_directories={*self.express_lane.directories_in_use(), previous_directory} - {None}
+                    keep_directories=self.express_lane.directories_in_use()
                 )
                 self.last_job_run_blocks = current_block
+                if cycle_asked_for_now:
+                    # Cleared here and not at the read: every return above this line means no
+                    # cycle started, and the operator's request must survive to the next tick.
+                    await self.redis_service.clear_forced_validation_cycle_request()
 
-                # DAH-3405: a push between two cycles opens the grace window here, after the job-files
-                # build and the last pre-wave failure point and before the first job of this cycle runs
-                # against the new digest, so an aborted iteration does not count as a cycle of the window.
-                # Before cycle_inputs: no await may sit between publishing them and start_awaiting_wave_lists,
-                # or an express tick verifies a new executor that the wave verifies again under the same batch ID.
-                rollout_window = await self.observe_executor_rollout(executor_digest, job_block)
                 first_cycle = self.first_cycle_started_at is None
                 if first_cycle:
                     self.first_cycle_started_at = datetime.now(UTC)
@@ -512,35 +509,6 @@ class Validator:
                 self.miner_service.start_awaiting_wave_lists(
                     job_batch_id, [miner.hotkey for miner in miners]
                 )
-                try:
-                    self.file_encrypt_service.remove_earlier_job_files_directories(
-                        Path(encrypted_files.tmp_directory), self.express_lane.directories_in_use()
-                    )
-                except Exception as exc:
-                    logger.error(
-                        _m(
-                            "[sync] Earlier job-files directories not removed; the next cycle retries",
-                            extra=get_extra_info({**self.default_extra, "error": str(exc)}),
-                        ),
-                    )
-                if cycle_asked_for_now:
-                    # Cleared here and not at the read: every return above this line means no
-                    # cycle started, and the operator's request must survive to the next tick.
-                    # After cycle_inputs and the wave lists: a Redis drop here must not leave it naming
-                    # the removed directory the build above replaced. A failed clear must not abort the cycle:
-                    # the wave lists are already guarding these miners and only the wave jobs below release them.
-                    self.carried_forced_request = None
-                    try:
-                        self.carried_forced_request = await self.redis_service.clear_forced_validation_cycle_request(
-                            cycle_asked_for_now
-                        )
-                    except Exception as exc:
-                        logger.error(
-                            _m(
-                                "[sync] Forced cycle request clear failed; the cycle continues",
-                                extra=get_extra_info({**self.default_extra, "error": str(exc)}),
-                            ),
-                        )
                 if first_cycle and not settings.DRY_RUN:
                     # Queue the nodes a restart cut off before this wave asks their miners, or the
                     # wave takes them (minutes slower). The lane launches once each list is in.
