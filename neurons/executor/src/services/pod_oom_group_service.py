@@ -1,6 +1,6 @@
 """DAH-6379: a rental pod's memory.oom.group=1 makes an OOM kill take the whole pod. Docker gives a restarted pod a
-new cgroup with it back at 0, so with POD_OOM_GROUP_ENABLED it is set on every pod start here (the executor runs privileged in the host PID
-namespace); the validator also sets it on create and on each rented-pod check."""
+new cgroup with it back at 0, so with POD_OOM_GROUP_ENABLED it is set on every pod start here (the executor runs
+privileged in the host PID namespace); the validator also sets it on create and on each rented-pod check."""
 
 import threading
 import time
