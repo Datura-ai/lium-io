@@ -14,11 +14,12 @@ So for every node the miner lists with the account's hotkeys, the check reads th
 machine itself is set up for (`/etc/liumd/miner_hotkey`, `/etc/liumd/account_claim`, written by the executor) with a
 fixed command, and refuses a machine set up for another hotkey, or reporting another account's claim. The portal
 requires both at registration (DAH-4375), so an honest node matches. An executor that predates the files, or a node
-without a claim, is not refused for it.
+without a claim, is not refused for it. Until NODE_ACCOUNT_BINDING_ENFORCE is on, a mismatch is only logged.
 """
 
 from __future__ import annotations
 
+from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
 from services.node_host import host_key_body, is_ip_literal, registered_host_keys
 
@@ -91,5 +92,9 @@ class NodeAccountCheck:
         if not (other_hotkey or other_claim):
             return None
         what["claim_mismatch"] = other_claim
+        if not settings.NODE_ACCOUNT_BINDING_ENFORCE:
+            # shadow run first (Sergej, lio#2288): count would-be refusals in prod before any node is refused
+            logger.warning(_m("NODE_ACCOUNT_BINDING_WOULD_REFUSE", extra=get_extra_info(what)))
+            return None
         event = render_message(Msg.MISMATCH, ctx=ctx, check_id=self.check_id, what=what)
         return CheckResult(passed=False, event=event, updates={"clear_verified_job_info": True})

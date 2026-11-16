@@ -13,6 +13,7 @@ import pytest
 import pytest_asyncio
 from datura.requests.miner_requests import ExecutorSSHInfo
 
+from services.task.checks import node_account
 from services.task.checks.node_account import NodeAccountCheck
 from tests.helpers import make_context
 
@@ -179,7 +180,8 @@ def _relay_ctx(runner, hotkeys=("5Account", POOL), claim=CLAIM, address="203.0.1
         ("hotkey=\nclaim=\n", "NODE_ACCOUNT_SKIPPED"),  # an executor that predates the host files
     ],
 )
-async def test_ip_node_is_refused_on_a_machine_set_up_for_another_account(files, reason):
+async def test_ip_node_is_refused_on_a_machine_set_up_for_another_account(files, reason, monkeypatch):
+    monkeypatch.setattr(node_account.settings, "NODE_ACCOUNT_BINDING_ENFORCE", True)
     runner = _HostFiles(files)
     result = await NodeAccountCheck().run(_relay_ctx(runner))
     assert result.event.reason_code == reason
@@ -197,3 +199,12 @@ async def test_unread_files_or_an_older_miner_do_not_refuse():
     runner = _HostFiles("hotkey=5Victim\n")
     assert (await NodeAccountCheck().run(_relay_ctx(runner, hotkeys=None))).passed
     assert runner.commands == []
+
+
+async def test_until_enforced_another_accounts_machine_is_only_logged(monkeypatch, caplog):
+    """Shadow run first: prod counts the would-be refusals before any node is refused."""
+    monkeypatch.setattr(node_account.settings, "NODE_ACCOUNT_BINDING_ENFORCE", False)
+    result = await NodeAccountCheck().run(_relay_ctx(_HostFiles("hotkey=5Victim\nclaim=\n")))
+    assert result.passed
+    assert result.event.reason_code == "NODE_ACCOUNT_SKIPPED"
+    assert "NODE_ACCOUNT_BINDING_WOULD_REFUSE" in caplog.text
