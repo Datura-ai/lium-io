@@ -966,7 +966,7 @@ class SysboxRequiredMessages:
         impact="Score set to 0 for this cycle; verification is kept until repeated failures deactivate the executor",
         remediation=(
             'Set mode = "auto" under [nvidia-container-runtime] in /etc/nvidia-container-runtime/config.toml '
-            "(or run `nvidia-ctk runtime configure --runtime=docker`), then `sudo systemctl restart docker`; "
+            "then `sudo systemctl restart docker`; "
             "the sysbox check runs again on the next cycle."
         ),
     )
