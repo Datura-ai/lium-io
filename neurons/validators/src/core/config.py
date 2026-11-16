@@ -342,6 +342,10 @@ class Settings(BaseSettings):
     # `[liumd_shadow] comparison` line per node (per-step verdicts, agreement, durations). Nothing
     # it finds is scored or stored: the result is built before it starts. Off: nothing new runs.
     VALIDATOR_LIUMD_SHADOW: bool = Field(env="VALIDATOR_LIUMD_SHADOW", default=False)
+    # Use the full machine-scrape document returned by the same early `liumd run` instead of
+    # running the Python machine scrape. Off: Python remains authoritative and the early run is
+    # only compared in the shadow.
+    VALIDATOR_LIUMD_SPECS: bool = Field(env="VALIDATOR_LIUMD_SPECS", default=False)
     # The shadow's whole-call budget (seconds), clipped to what the executor task has left; the
     # intent's `deadline_s` is this − 30. Sized for a scored cycle, where VerifyX (p90 about 150 s)
     # and the matmul (at most 120 s) run one after the other.

@@ -52,6 +52,7 @@ from core.utils import _m, get_extra_info
 
 from .checks.capability import CapabilityCheck
 from .checks.local_verify import _step_reason
+from .checks.machine_spec_scrape import normalize_liumd_specs
 from .checks.provider_side_load import docker_containers
 from .checks.verifyx import (
     MAX_KEPT_UPLOAD_PROBES,
@@ -151,11 +152,18 @@ def start_facts_after_scrape(
     """Start liumd's docker and ports read in the background right after machine_scrape, so both
     read the same containers; the shadow awaits it at the end of the run. None when no shadow
     will compare this node."""
-    if not settings.VALIDATOR_LIUMD_SHADOW or settings.DRY_RUN or ctx.config.first_pass:
+    specs_mode = settings.VALIDATOR_LIUMD_SPECS
+    if not (settings.VALIDATOR_LIUMD_SHADOW or specs_mode) or settings.DRY_RUN:
+        return None
+    if ctx.config.first_pass and not specs_mode:
         return None
     # called from the fatal scrape check: a shadow error (e.g. a malformed reserved list) must never fail it
     try:
-        if ctx.config.validator_keypair is None or not _reserved(ctx) or _workload_on_node(ctx, {}):
+        if ctx.config.validator_keypair is None:
+            return None
+        # A shadow only compares reserved idle nodes. The specs path replaces the Python scrape
+        # for every node, so it must not be excluded by the shadow's replay filters.
+        if not specs_mode and (not _reserved(ctx) or _workload_on_node(ctx, {})):
             return None
         return asyncio.create_task(_facts_only(ctx, client_factory or _default_client))
     except Exception as exc:  # noqa: BLE001
@@ -512,6 +520,8 @@ def _judged(
         "agree": all(compared) if complete and compared else None,
         "facts_agree": facts["agree"],
         "facts": facts["checks"],
+        "specs_agree": facts["specs_agree"],
+        "specs_diff": facts["specs_diff"],
         "round_trip_ms": answer.round_trip_ms,
         "executor_elapsed_ms": answer.elapsed_ms,
         "executor_version": answer.executor_version,
@@ -525,6 +535,30 @@ def _logged_fact(value: Any) -> Any:
     """A fact value as logged: keep the value when its text fits, else cap the text."""
     text = value if isinstance(value, str) else str(value)
     return value if len(text) <= DETAIL_MAX_CHARS else text[:DETAIL_MAX_CHARS]
+
+
+def _spec_diffs(python: Any, liumd: Any, path: str = "") -> list[dict[str, Any]]:
+    """Every differing leaf in the two normalized specs documents, capped for logging."""
+    diffs: list[dict[str, Any]] = []
+    if type(python) is not type(liumd) and not (
+        isinstance(python, (int, float)) and isinstance(liumd, (int, float))
+    ):
+        return [{"path": path or "$", "python": repr(python)[:120], "liumd": repr(liumd)[:120]}]
+    if isinstance(python, dict):
+        for key in sorted(set(python) | set(liumd)):
+            if key not in python or key not in liumd:
+                diffs.append({"path": f"{path}.{key}" if path else key, "python": repr(python.get(key))[:120], "liumd": repr(liumd.get(key))[:120]})
+            else:
+                diffs.extend(_spec_diffs(python[key], liumd[key], f"{path}.{key}" if path else key))
+    elif isinstance(python, list):
+        if len(python) != len(liumd):
+            diffs.append({"path": path or "$", "python": len(python), "liumd": len(liumd)})
+        else:
+            for i, (a, b) in enumerate(zip(python, liumd)):
+                diffs.extend(_spec_diffs(a, b, f"{path}[{i}]"))
+    elif python != liumd:
+        diffs.append({"path": path or "$", "python": repr(python)[:120], "liumd": repr(liumd)[:120]})
+    return diffs[:DETAIL_MAX_CHARS]
 
 
 def _facts(ctx: Context, answer: LocalVerifyAnswer) -> dict[str, Any]:
@@ -571,4 +605,12 @@ def _facts(ctx: Context, answer: LocalVerifyAnswer) -> dict[str, Any]:
     if data and local_checksum:
         check("inspector.lib_sha256", data.get("lib_sha256"), local_checksum)
 
-    return {"agree": all(c["agree"] for c in checks) if checks else None, "checks": checks}
+    raw_specs = answer.specs
+    liumd_specs = normalize_liumd_specs(raw_specs) if isinstance(raw_specs, dict) and raw_specs else {}
+    diffs = _spec_diffs(specs, liumd_specs) if liumd_specs else []
+    return {
+        "agree": all(c["agree"] for c in checks) if checks else None,
+        "checks": checks,
+        "specs_agree": not diffs if liumd_specs else None,
+        "specs_diff": diffs,
+    }

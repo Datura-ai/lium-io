@@ -8,15 +8,17 @@ from collections.abc import Iterator
 from dataclasses import dataclass, fields, replace
 from typing import Any, Literal
 
-from core.config import settings
+from services.file_encrypt_service import ORIGINAL_KEYS
+from services.gpu_spec_table import classify_gpu_model, list_sxm_on_pcie_adapter_as_pcie
 
-from ..messages import MachineSpecMessages as Msg, MessageTemplate, render_message
+from core.config import settings
+from core.utils import _m, get_extra_info
+
+from ..messages import MachineSpecMessages as Msg
+from ..messages import MessageTemplate, render_message
 from ..models import ValidationEvent
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
-from core.utils import _m, get_extra_info
-from services.file_encrypt_service import ORIGINAL_KEYS
-from services.gpu_spec_table import classify_gpu_model, list_sxm_on_pcie_adapter_as_pcie
 from .gpu_loss_hold import GpuLossHoldCheck
 from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
 from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
@@ -73,6 +75,11 @@ def _deobfuscate(spec: dict[str, Any], obfuscation_keys: dict[str, str] | None) 
     reverse = {v: k for k, v in obfuscation_keys.items()}
     first_pass = _update_keys(spec, reverse)
     return _update_keys(first_pass, ORIGINAL_KEYS)
+
+
+def normalize_liumd_specs(raw: dict[str, Any]) -> dict[str, Any]:
+    """The liumd machine-scrape document in the validator's normalized specs shape."""
+    return _update_keys(_deobfuscate(raw, None), ORIGINAL_KEYS)
 
 
 def _normalize_gpu_details(gpu_details: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -374,11 +381,95 @@ class MachineSpecScrapeCheck:
     DEFAULT_TIMEOUT = 300
 
     async def run(self, ctx: Context) -> CheckResult:
+        if settings.VALIDATOR_LIUMD_SPECS:
+            return await self._scrape_with_liumd(ctx)
+
         timeout = ctx.config.machine_scrape_timeout or self.DEFAULT_TIMEOUT
 
         if ctx.config.machine_scrape_source:
             return await self._scrape_from_source(ctx, timeout)
         return await self._scrape_uploaded_binary(ctx, timeout)
+
+    async def _scrape_with_liumd(self, ctx: Context) -> CheckResult:
+        """Use the full machine-scrape document from the same early `liumd run`."""
+        from services.local_verify_client import LocalVerifyAnswer
+
+        from ..liumd_shadow import start_facts_after_scrape
+
+        task = start_facts_after_scrape(ctx)
+        answer = await task if task is not None else None
+        if not isinstance(answer, LocalVerifyAnswer) or not answer.specs:
+            detail = getattr(answer, "detail", None) or getattr(answer, "reason", None) or "no liumd specs"
+            event = render_message(
+                Msg.SCRAPE_PARSE_FAILED,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"delivery": "liumd", "exception": str(detail)[:300]},
+            )
+            return CheckResult(passed=False, event=event)
+
+        raw = answer.specs
+        specs = normalize_liumd_specs(raw)
+        specs.pop("port_verify_first_miss", None)
+        specs.pop("split_disk", None)
+
+        gpu_info = specs.get("gpu", {}) or {}
+        gpu_count = gpu_info.get("count", 0) or 0
+        raw_gpu_details = gpu_info.get("details", []) or []
+        for detail in raw_gpu_details:
+            if isinstance(detail, dict):
+                detail.pop("power_host_limit", None)
+        gpu_details = list_sxm_on_pcie_adapter_as_pcie(specs, _normalize_gpu_details(raw_gpu_details))
+        gpu_model = None
+        if gpu_count > 0 and gpu_details:
+            gpu_model = gpu_details[0].get("name")
+        gpu_model_count = f"{gpu_model}:{gpu_count}" if gpu_model is not None else None
+        gpu_uuids = ",".join(detail.get("uuid", "") for detail in gpu_details if detail.get("uuid"))
+        sysbox_runtime = specs.get("sysbox_runtime", False)
+        hardware_supports = specs.get("storage_limit_supported", False)
+        gpu_splitting_config = ctx.state.rented_data.gpu_splitting_config if ctx.state.rented_data else {}
+        gpu_splitting_min_count = gpu_splitting_config.get(ctx.executor.uuid)
+        supports_gpu_splitting = hardware_supports and gpu_splitting_min_count is not None
+        vloopback = specs.pop("vloopback_check", None)
+        extra_info = {
+            "sysbox_runtime": sysbox_runtime,
+            "supports_gpu_splitting": supports_gpu_splitting,
+            "gpu_splitting_min_count": gpu_splitting_min_count,
+        }
+        event = render_message(
+            Msg.SCRAPE_OK,
+            ctx=ctx,
+            check_id=self.check_id,
+            what={
+                "delivery": "liumd",
+                "gpu_count": gpu_count,
+                "gpu_model": gpu_model,
+                "network": specs.get("network"),
+                "interconnect": _interconnect_summary(specs),
+                "storage_limit": _storage_limit_summary(specs, vloopback),
+            },
+            extra=extra_info,
+        )
+        updated_state = replace(
+            ctx.state,
+            specs=specs,
+            gpu_model=gpu_model,
+            gpu_count=gpu_count,
+            gpu_details=gpu_details,
+            gpu_processes=specs.get("gpu_processes", []) or [],
+            sysbox_runtime=sysbox_runtime,
+            supports_gpu_splitting=supports_gpu_splitting,
+            gpu_splitting_min_count=gpu_splitting_min_count,
+            gpu_model_count=gpu_model_count,
+            gpu_uuids=gpu_uuids,
+            liumd_shadow_facts_task=task,
+            liumd_shadow_facts_attempted=True,
+        )
+        return CheckResult(
+            passed=True,
+            event=event,
+            updates={"state": updated_state, "default_extra": {**ctx.default_extra, **extra_info}},
+        )
 
     async def _scrape_from_source(self, ctx: Context, timeout: int) -> CheckResult:
         # pipe the obfuscated source into the executor's own interpreter; binary on failure
