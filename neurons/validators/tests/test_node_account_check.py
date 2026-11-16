@@ -166,7 +166,7 @@ def _relay_ctx(runner, hotkeys=("5Account", POOL), claim=CLAIM, address="203.0.1
         uuid="node-1", address=address, port=8001, ssh_username="root", ssh_port=22, python_path="/usr/bin/python3",
         root_dir="/root", expected_node_hotkeys=list(hotkeys) if hotkeys else None, expected_account_claim=claim,
     )
-    return make_context(executor=executor, runner=runner)
+    return make_context(executor=executor, runner=runner, miner_hotkey=POOL)  # the validator reaches it via the pool hotkey
 
 
 @pytest.mark.parametrize(
@@ -176,8 +176,8 @@ def _relay_ctx(runner, hotkeys=("5Account", POOL), claim=CLAIM, address="203.0.1
         (f"hotkey={POOL}\nclaim=claim-of-another-account\n", "NODE_ACCOUNT_MISMATCH"),  # another account's pool node
         (f"hotkey={POOL}\nclaim={CLAIM}\n", "NODE_ACCOUNT_SKIPPED"),  # its own pool node
         ("hotkey=5Account\nclaim=\n", "NODE_ACCOUNT_SKIPPED"),  # its own own-key node
-        (f"hotkey={POOL}\nclaim=\n", "NODE_ACCOUNT_SKIPPED"),  # a pool node installed without a claim
-        ("hotkey=\nclaim=\n", "NODE_ACCOUNT_SKIPPED"),  # an executor that predates the host files
+        (f"hotkey={POOL}\nclaim=\n", "NODE_ACCOUNT_MISMATCH"),  # a pool node without this account's claim
+        ("hotkey=\nclaim=\n", "NODE_ACCOUNT_MISMATCH"),  # an executor without the host files
     ],
 )
 async def test_ip_node_is_refused_on_a_machine_set_up_for_another_account(files, reason, monkeypatch):
@@ -194,8 +194,19 @@ async def test_ip_node_is_refused_on_a_machine_set_up_for_another_account(files,
     ]
 
 
-async def test_unread_files_or_an_older_miner_do_not_refuse():
-    assert (await NodeAccountCheck().run(_relay_ctx(_HostFiles("", success=False)))).passed
+async def test_a_failed_read_is_refused_when_enforced(monkeypatch):
+    monkeypatch.setattr(node_account.settings, "NODE_ACCOUNT_BINDING_ENFORCE", True)
+    result = await NodeAccountCheck().run(_relay_ctx(_HostFiles("", success=False)))
+    assert not result.passed and result.event.reason_code == "NODE_ACCOUNT_MISMATCH"
+
+
+async def test_an_own_key_account_expects_no_claim(monkeypatch):
+    monkeypatch.setattr(node_account.settings, "NODE_ACCOUNT_BINDING_ENFORCE", True)
+    result = await NodeAccountCheck().run(_relay_ctx(_HostFiles("hotkey=5Account\nclaim=\n"), claim=None))
+    assert result.passed
+
+
+async def test_an_older_miner_is_not_checked():
     runner = _HostFiles("hotkey=5Victim\n")
     assert (await NodeAccountCheck().run(_relay_ctx(runner, hotkeys=None))).passed
     assert runner.commands == []
@@ -204,7 +215,8 @@ async def test_unread_files_or_an_older_miner_do_not_refuse():
 async def test_until_enforced_another_accounts_machine_is_only_logged(monkeypatch, caplog):
     """Shadow run first: prod counts the would-be refusals before any node is refused."""
     monkeypatch.setattr(node_account.settings, "NODE_ACCOUNT_BINDING_ENFORCE", False)
-    result = await NodeAccountCheck().run(_relay_ctx(_HostFiles("hotkey=5Victim\nclaim=\n")))
-    assert result.passed
-    assert result.event.reason_code == "NODE_ACCOUNT_SKIPPED"
-    assert "NODE_ACCOUNT_BINDING_WOULD_REFUSE" in caplog.text
+    for files, success in (("hotkey=5Victim\nclaim=\n", True), ("", False)):
+        result = await NodeAccountCheck().run(_relay_ctx(_HostFiles(files, success=success)))
+        assert result.passed
+        assert result.event.reason_code == "NODE_ACCOUNT_SKIPPED"
+    assert caplog.text.count("NODE_ACCOUNT_BINDING_WOULD_REFUSE") == 2
