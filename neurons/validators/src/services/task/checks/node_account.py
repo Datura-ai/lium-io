@@ -100,5 +100,6 @@ class NodeAccountCheck:
             # shadow run first (Sergej, lio#2288): count would-be refusals in prod before any node is refused
             logger.warning(_m("NODE_ACCOUNT_BINDING_WOULD_REFUSE", extra=get_extra_info(what)))
             return None
-        event = render_message(Msg.BINDING_MISMATCH, ctx=ctx, check_id=self.check_id, what=what)
+        template = Msg.BINDING_UNVERIFIED if what["binding_mismatch"] == "unread" else Msg.BINDING_MISMATCH
+        event = render_message(template, ctx=ctx, check_id=self.check_id, what=what)
         return CheckResult(passed=False, event=event, updates={"clear_verified_job_info": True})

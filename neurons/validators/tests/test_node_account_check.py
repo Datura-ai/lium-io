@@ -189,6 +189,8 @@ async def test_ip_node_is_refused_on_a_machine_set_up_for_another_account(files,
     if not result.passed:
         assert result.updates == {"clear_verified_job_info": True}
         assert "hostname" not in result.event.remediation
+    if files == "hotkey=\nclaim=\n":
+        assert result.event.event == "Node account ownership could not be verified at this address"
     assert runner.commands == [
         "printf 'hotkey=%s\\nclaim=%s\\n' \"$(cat /etc/liumd/miner_hotkey 2>/dev/null)\" "
         "\"$(cat /etc/liumd/account_claim 2>/dev/null)\""
