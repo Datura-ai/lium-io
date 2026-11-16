@@ -16,6 +16,11 @@ CGROUP_DIRS = (
     "/proc/1/root/sys/fs/cgroup/system.slice/docker-{id}.scope",  # systemd cgroup driver
     "/proc/1/root/sys/fs/cgroup/docker/{id}",  # cgroupfs driver (the documented daemon.json)
 )
+# Written by the validator's create; absent on a pod's first start, so only a restart re-runs it. A restart reruns
+# only the image CMD, so the sshd the validator started with `docker exec` (lost to an OOM group kill) needs this.
+# The script adopts a running sshd and locks against a concurrent run, so a validator re-bootstrap is harmless.
+SSH_BOOTSTRAP = "/tmp/lium-ssh-bootstrap.sh"
+RESTART_SSHD = ["sh", "-c", f"[ -f {SSH_BOOTSTRAP} ] || exit 0; exec sh {SSH_BOOTSTRAP}"]
 
 
 def set_oom_group(container_id: str, dirs: tuple[str, ...] = CGROUP_DIRS) -> str:
@@ -36,7 +41,14 @@ def set_oom_group(container_id: str, dirs: tuple[str, ...] = CGROUP_DIRS) -> str
     return "no_cgroup_v2_scope"
 
 
-def handle_event(event: dict, dirs: tuple[str, ...] = CGROUP_DIRS) -> str | None:
+def restart_sshd(client, container_id: str) -> None:
+    try:
+        client.containers.get(container_id).exec_run(RESTART_SSHD, detach=True)
+    except Exception as e:  # noqa: BLE001 - a pod gone again or a dockerd hiccup must not stop the watcher
+        logger.warning(f"POD_SSHD_RESTART_FAILED {container_id[:12]} {type(e).__name__}: {e}")
+
+
+def handle_event(event: dict, dirs: tuple[str, ...] = CGROUP_DIRS, client=None) -> str | None:
     actor = event.get("Actor") or {}
     name = (actor.get("Attributes") or {}).get("name") or ""
     if event.get("Type") != "container" or event.get("Action") != "start" or not name.startswith(POD_PREFIX):
@@ -47,6 +59,8 @@ def handle_event(event: dict, dirs: tuple[str, ...] = CGROUP_DIRS) -> str | None
         logger.info(f"POD_OOM_GROUP_SET {name} {container_id[:12]}")
     elif result != "already":
         logger.warning(f"POD_OOM_GROUP_NOT_SET {name} {container_id[:12]} {result}")
+    if client is not None:
+        restart_sshd(client, container_id)
     return result
 
 
@@ -55,7 +69,7 @@ def _watch_forever() -> None:
         try:
             client = docker.from_env()
             for event in client.events(decode=True, filters={"type": "container", "event": "start"}):
-                handle_event(event)
+                handle_event(event, client=client)
         except Exception as e:  # noqa: BLE001 - the stream drops with dockerd restarts; reconnect
             logger.warning(f"pod oom.group watcher reconnecting: {type(e).__name__}: {e}")
             time.sleep(5)
