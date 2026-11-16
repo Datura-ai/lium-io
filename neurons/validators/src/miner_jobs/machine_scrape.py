@@ -939,6 +939,8 @@ def report_tighter_store(hard_disk, store_usage, size_too=True):
     if not store_usage or "hard_disk_total" not in hard_disk:
         return
     store = hard_disk_reading(store_usage)
+    # data-root's own free before the fold: a volume grow takes from it alone, the published free is the tighter
+    hard_disk.setdefault("hard_disk_data_root_free", hard_disk["hard_disk_free"])
     free_kb = min(store["hard_disk_free"], hard_disk["hard_disk_free"])
     if hard_disk.get("hard_disk_engy_cache_released_gb"):
         # a tighter store hides part of data-root's released cache: only what still shows in free was credited

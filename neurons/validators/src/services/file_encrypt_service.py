@@ -128,6 +128,8 @@ ORIGINAL_KEYS = {
     'hard_disk_data_root_used': "data_root_used",
     # the part of the docker breakdown on data-root's filesystem: all of it, or volumes only when the store is apart
     'hard_disk_data_root_docker_used': "data_root_docker_used",
+    # data-root's own free kB, only when a store apart folds in: a volume grow takes from data-root alone
+    'hard_disk_data_root_free': "data_root_free",
     # DAH-5059: kB per container name (writable layer + its anonymous volumes) and per volume name
     'hard_disk_by_container': "by_container",
     'hard_disk_by_volume': "by_volume",
@@ -349,6 +351,7 @@ class FileEncryptService:
             'hard_disk_engy_cache_released_gb': "",
             'hard_disk_data_root_used': "",
             'hard_disk_data_root_docker_used': "",
+            'hard_disk_data_root_free': "",
             'hard_disk_by_container': "",
             'hard_disk_by_volume': "",
             'data_os': "",

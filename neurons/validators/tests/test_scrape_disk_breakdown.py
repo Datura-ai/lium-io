@@ -770,9 +770,12 @@ def test_a_renter_gets_the_room_both_the_store_and_data_root_have(
     store_usage, data_root_usage = scrape["get_host_disk_usage"](True)
     hard_disk = {**scrape["hard_disk_reading"](data_root_usage or store_usage), "filler_released_kb": 100 * 1024**2}
     scrape["release_filler_cache"](hard_disk)
+    data_root_free_kb = hard_disk["hard_disk_free"]
     scrape["report_tighter_store"](hard_disk, store_usage if data_root_usage else None)
 
     assert (data_root_usage is None) == same_device
+    # a volume grow takes from data-root alone: its own free is kept apart when a store folds in
+    assert hard_disk.get("hard_disk_data_root_free") == (None if same_device else data_root_free_kb)
     assert (hard_disk["hard_disk_total"], hard_disk["hard_disk_free"]) == (
         expected_total_gib * 1024**2,
         expected_free_gib * 1024**2,
