@@ -432,65 +432,9 @@ class MachineSpecScrapeCheck:
             isinstance(detail, dict) for detail in raw_gpu_details
         ):
             return self._fail_liumd(ctx, answer, "malformed liumd specs")
-        vloopback = specs.pop("vloopback_check", None)
-        specs.pop("port_verify_first_miss", None)
-        specs.pop("split_disk", None)
         if not raw_gpu_details:
             return await self._fail_without_gpus(ctx, answer, specs)
-
-        gpu_count = gpu_info.get("count", 0) or 0
-        for detail in raw_gpu_details:
-            detail.pop("power_host_limit", None)
-        gpu_details = list_sxm_on_pcie_adapter_as_pcie(specs, _normalize_gpu_details(raw_gpu_details))
-        gpu_model = None
-        if gpu_count > 0 and gpu_details:
-            gpu_model = gpu_details[0].get("name")
-        gpu_model_count = f"{gpu_model}:{gpu_count}" if gpu_model is not None else None
-        gpu_uuids = ",".join(detail.get("uuid", "") for detail in gpu_details if detail.get("uuid"))
-        sysbox_runtime = specs.get("sysbox_runtime", False)
-        hardware_supports = specs.get("storage_limit_supported", False)
-        gpu_splitting_config = ctx.state.rented_data.gpu_splitting_config if ctx.state.rented_data else {}
-        gpu_splitting_min_count = gpu_splitting_config.get(ctx.executor.uuid)
-        supports_gpu_splitting = hardware_supports and gpu_splitting_min_count is not None
-        extra_info = {
-            "sysbox_runtime": sysbox_runtime,
-            "supports_gpu_splitting": supports_gpu_splitting,
-            "gpu_splitting_min_count": gpu_splitting_min_count,
-        }
-        event = render_message(
-            Msg.SCRAPE_OK,
-            ctx=ctx,
-            check_id=self.check_id,
-            what={
-                "delivery": "liumd",
-                "gpu_count": gpu_count,
-                "gpu_model": gpu_model,
-                "network": specs.get("network"),
-                "interconnect": _interconnect_summary(specs),
-                "storage_limit": _storage_limit_summary(specs, vloopback),
-            },
-            extra=extra_info,
-        )
-        updated_state = replace(
-            ctx.state,
-            specs=specs,
-            gpu_model=gpu_model,
-            gpu_count=gpu_count,
-            gpu_details=gpu_details,
-            gpu_processes=specs.get("gpu_processes", []) or [],
-            sysbox_runtime=sysbox_runtime,
-            supports_gpu_splitting=supports_gpu_splitting,
-            gpu_splitting_min_count=gpu_splitting_min_count,
-            gpu_model_count=gpu_model_count,
-            gpu_uuids=gpu_uuids,
-            liumd_shadow_facts_task=task,
-            liumd_shadow_facts_attempted=True,
-        )
-        return CheckResult(
-            passed=True,
-            event=event,
-            updates={"state": updated_state, "default_extra": {**ctx.default_extra, **extra_info}},
-        )
+        return self._result_from_specs(ctx, specs, delivery="liumd", task=task)
 
     async def _fail_without_gpus(
         self, ctx: Context, answer: Any, specs: dict[str, Any]
@@ -520,6 +464,75 @@ class MachineSpecScrapeCheck:
             },
         )
         return CheckResult(passed=False, event=event, updates=reset, extra_events=gpu_lost_events)
+
+    def _result_from_specs(
+        self,
+        ctx: Context,
+        specs: dict[str, Any],
+        *,
+        delivery: Literal["stdin", "upload", "liumd"],
+        task: Any = None,
+        what: dict[str, Any] | None = None,
+    ) -> CheckResult:
+        specs.pop("port_verify_first_miss", None)
+        specs.pop("split_disk", None)
+        vloopback = specs.pop("vloopback_check", None)
+        gpu_info = specs.get("gpu", {}) or {}
+        gpu_count = gpu_info.get("count", 0) or 0
+        raw_gpu_details = gpu_info.get("details", []) or []
+        for detail in raw_gpu_details:
+            if isinstance(detail, dict):
+                detail.pop("power_host_limit", None)
+        gpu_details = list_sxm_on_pcie_adapter_as_pcie(specs, _normalize_gpu_details(raw_gpu_details))
+        gpu_model = gpu_details[0].get("name") if gpu_count > 0 and gpu_details else None
+        gpu_model_count = f"{gpu_model}:{gpu_count}" if gpu_model is not None else None
+        gpu_uuids = ",".join(detail.get("uuid", "") for detail in gpu_details if detail.get("uuid"))
+        sysbox_runtime = specs.get("sysbox_runtime", False)
+        hardware_supports = specs.get("storage_limit_supported", False)
+        gpu_splitting_config = ctx.state.rented_data.gpu_splitting_config if ctx.state.rented_data else {}
+        gpu_splitting_min_count = gpu_splitting_config.get(ctx.executor.uuid)
+        supports_gpu_splitting = hardware_supports and gpu_splitting_min_count is not None
+        scrape_specs = copy.deepcopy(specs)
+        extra_info = {
+            "sysbox_runtime": sysbox_runtime,
+            "supports_gpu_splitting": supports_gpu_splitting,
+            "gpu_splitting_min_count": gpu_splitting_min_count,
+        }
+        event = render_message(
+            Msg.SCRAPE_OK,
+            ctx=ctx,
+            check_id=self.check_id,
+            what={
+                **(what or {"delivery": delivery}),
+                "gpu_count": gpu_count,
+                "gpu_model": gpu_model,
+                "network": specs.get("network"),
+                "interconnect": _interconnect_summary(specs),
+                "storage_limit": _storage_limit_summary(specs, vloopback),
+            },
+            extra=extra_info,
+        )
+        updated_state = replace(
+            ctx.state,
+            specs=specs,
+            scrape_specs=scrape_specs,
+            gpu_model=gpu_model,
+            gpu_count=gpu_count,
+            gpu_details=gpu_details,
+            gpu_processes=specs.get("gpu_processes", []) or [],
+            sysbox_runtime=sysbox_runtime,
+            supports_gpu_splitting=supports_gpu_splitting,
+            gpu_splitting_min_count=gpu_splitting_min_count,
+            gpu_model_count=gpu_model_count,
+            gpu_uuids=gpu_uuids,
+            liumd_shadow_facts_task=task,
+            liumd_shadow_facts_attempted=True,
+        )
+        return CheckResult(
+            passed=True,
+            event=event,
+            updates={"state": updated_state, "default_extra": {**ctx.default_extra, **extra_info}},
+        )
 
     @staticmethod
     def _fail_liumd(ctx: Context, answer: Any, detail: str | None = None) -> CheckResult:
@@ -703,82 +716,15 @@ class MachineSpecScrapeCheck:
             raw = json.loads(decrypted)
             obfuscation_keys = ctx.config.obfuscation_keys
             specs = _deobfuscate(raw, obfuscation_keys)
-            # DAH-3698: PortConnectivityCheck's grace marker is validator-owned; a provider must never report it
-            specs.pop("port_verify_first_miss", None)
-            # the disk check writes the split disk sizing; a provider must never report it
-            specs.pop("split_disk", None)
-
-            gpu_info = specs.get("gpu", {}) or {}
-            gpu_count = gpu_info.get("count", 0) or 0
-            raw_gpu_details = gpu_info.get("details", []) or []
-            # DAH-5302: GpuPowerLimitCheck writes the host limit under our Pearl cap; a provider must never report it
-            for detail in raw_gpu_details:
-                if isinstance(detail, dict):
-                    detail.pop("power_host_limit", None)
-            # The native capability challenge derives its key from the raw NVML name in
-            # specs. Policy and scoring use the canonicalized state fields below.
-            gpu_details = list_sxm_on_pcie_adapter_as_pcie(specs, _normalize_gpu_details(raw_gpu_details))
-            gpu_model = None
-            if gpu_count > 0 and gpu_details:
-                gpu_model = gpu_details[0].get("name")
-
-            gpu_model_count = f"{gpu_model}:{gpu_count}" if gpu_model is not None else None
-            gpu_uuids = ",".join(detail.get("uuid", "") for detail in gpu_details if detail.get("uuid"))
-            sysbox_runtime = specs.get("sysbox_runtime", False)
-            hardware_supports = specs.get("storage_limit_supported", False)
-            gpu_splitting_config = ctx.state.rented_data.gpu_splitting_config if ctx.state.rented_data else {}
-            gpu_splitting_min_count = gpu_splitting_config.get(ctx.executor.uuid)
-            supports_gpu_splitting = hardware_supports and gpu_splitting_min_count is not None
-            # the vloopback mount test is reported in this event only; the stored specs do not carry it
-            vloopback = specs.pop("vloopback_check", None)
-            # later checks write into `specs`; the shadow compares the scrape as it arrived
-            scrape_specs = copy.deepcopy(specs)
-
-            extra_info = {
-                "sysbox_runtime": sysbox_runtime,
-                "supports_gpu_splitting": supports_gpu_splitting,
-                "gpu_splitting_min_count": gpu_splitting_min_count,
-            }
-
-            event = render_message(
-                Msg.SCRAPE_OK,
-                ctx=ctx,
-                check_id=self.check_id,
-                what={
-                    **what,
-                    "gpu_count": gpu_count,
-                    "gpu_model": gpu_model,
-                    "network": specs.get("network"),
-                    # DAH-2922: the NVLink/P2P verdict per cycle, without the 8x8 matrix
-                    "interconnect": _interconnect_summary(specs),
-                    # whether rentals with a disk limit get one here, and the vloopback mount test's verdict
-                    "storage_limit": _storage_limit_summary(specs, vloopback),
-                },
-                extra=extra_info,
-            )
-            updated_state = replace(
-                ctx.state,
-                specs=specs,
-                scrape_specs=scrape_specs,
-                gpu_model=gpu_model,
-                gpu_count=gpu_count,
-                gpu_details=gpu_details,
-                gpu_processes=specs.get("gpu_processes", []) or [],
-                sysbox_runtime=sysbox_runtime,
-                supports_gpu_splitting=supports_gpu_splitting,
-                gpu_splitting_min_count=gpu_splitting_min_count,
-                gpu_model_count=gpu_model_count,
-                gpu_uuids=gpu_uuids,
-            )
             from ..liumd_shadow import start_facts_after_scrape  # liumd_shadow imports checks
 
-            updated_state = replace(
-                updated_state,
-                liumd_shadow_facts_task=start_facts_after_scrape(ctx) if start_shadow else None,
-                liumd_shadow_facts_attempted=True,
+            return self._result_from_specs(
+                ctx,
+                specs,
+                delivery=delivery,
+                task=start_facts_after_scrape(ctx) if start_shadow else None,
+                what=what,
             )
-            updates: dict[str, object] = {"state": updated_state, "default_extra": {**ctx.default_extra, **extra_info}}
-            return CheckResult(passed=True, event=event, updates=updates)
 
         except Exception as exc:
             event = render_message(

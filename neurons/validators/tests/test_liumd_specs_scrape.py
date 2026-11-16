@@ -99,7 +99,7 @@ async def test_the_liumd_document_replaces_the_python_scrape(monkeypatch):
     assert state.gpu_count == 2
     assert [detail["uuid"] for detail in state.gpu_details] == ["GPU-1", "GPU-2"]
     assert "vloopback_check" not in state.specs
-    assert state.scrape_specs is None
+    assert state.scrape_specs == state.specs
     assert state.liumd_shadow_facts_attempted is True
     assert state.liumd_shadow_facts_task is not None
     assert len(start) == 1
