@@ -10,6 +10,7 @@ not one validation row. With UNREACHABLE_EXECUTOR_REPORT_ENABLED the wave writes
 per such node (EXECUTOR_UNREACHABLE_BY_MINER). Flag off: nothing is added.
 """
 
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -187,3 +188,24 @@ def test_a_node_the_express_lane_passed_this_cycle_gets_no_unreachable_row(flag_
     service.express_published[UNREACHABLE] = "an older cycle"
     [result] = service._build_unreachable_known_results(payload, RentedExecutorsResponse(executors={}), msg, None)
     assert result.executor_info.uuid == UNREACHABLE
+
+
+@pytest.mark.asyncio
+async def test_an_express_pass_after_the_row_was_built_keeps_it_off_the_publish(flag_on):
+    # Review 4582945951: the row is published later (early publish, then the cycle's), so a pass landing in
+    # between is checked again there.
+    msg = accepted([LISTED], [LISTED, UNREACHABLE])
+    service = make_service()
+    service.redis_service.publish = AsyncMock(return_value=1)
+    payload = make_payload()
+    [row] = service._build_unreachable_known_results(payload, RentedExecutorsResponse(executors={}), msg, None)
+    service.express_published[UNREACHABLE] = payload.job_batch_id
+    service.express_published_miner[UNREACHABLE] = "another miner"
+
+    await service.publish_machine_specs([row], payload.miner_hotkey, payload.miner_coldkey)
+    assert service.redis_service.publish.await_count == 1
+
+    service.redis_service.publish.reset_mock()
+    service.express_published_miner[UNREACHABLE] = payload.miner_hotkey
+    await service.publish_machine_specs([row], payload.miner_hotkey, payload.miner_coldkey)
+    service.redis_service.publish.assert_not_awaited()
