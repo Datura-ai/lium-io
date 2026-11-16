@@ -274,8 +274,9 @@ RANGE = 65536
 # starts its own, which is not up before Docker: then this starts one on Docker's store for the lookup and stops it
 ADDRESS = os.environ.get("LIUM_CONTAINERD_ADDRESS", "/run/containerd/containerd.sock")
 _socket = None
-# mode and file capabilities of each entry whose chown clears them, written before the chown and replayed first
+# mode and file capabilities of each entry of a batch whose chown clears them, written before its chowns, replayed first
 JOURNAL = ROOT + "/var/lib/lium-sysbox-layer-reset/pending.jsonl"
+BATCH = 512  # entries per journal write: bounds its size and the fsyncs a layer with many files costs
 ACLS = ("system.posix_acl_access", "system.posix_acl_default")
 # set on tmpfs each time Docker starts (unit drop-in): a reset belongs only before Docker's first start of a boot
 STARTED = ROOT + "/run/lium-docker-started"
@@ -355,54 +356,79 @@ def shift_acls(path, base):
     return n
 
 
-def journal(entry):
+def journal(entries):
+    # one fsync per batch, and the file never holds more than one batch: its size stays bounded by BATCH paths
     os.makedirs(os.path.dirname(JOURNAL), exist_ok=True)
-    with open(JOURNAL, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+    with open(JOURNAL, "w") as f:
+        f.write("".join(json.dumps(e) + "\n" for e in entries))
         f.flush()
         os.fsync(f.fileno())
+    d = os.open(os.path.dirname(JOURNAL), os.O_RDONLY)
+    try:
+        os.fsync(d)  # the journal's own directory entry is durable before any chown
+    finally:
+        os.close(d)
+
+
+def restore(e):
+    os.chmod(e["p"], e["m"])
+    if e["c"]:
+        os.setxattr(e["p"], "security.capability", bytes.fromhex(e["c"]), follow_symlinks=False)
 
 
 def replay_journal():
     # a run cut off between a chown and the mode/capability restore left them stripped: restore them first
     try:
         lines = open(JOURNAL).read().splitlines()
-    except OSError:
+    except FileNotFoundError:
         return
     for line in lines:
         try:
             e = json.loads(line)
-            os.chmod(e["p"], e["m"])
-            if e["c"]:
-                os.setxattr(e["p"], "security.capability", bytes.fromhex(e["c"]), follow_symlinks=False)
-        except (OSError, ValueError, KeyError):
-            pass  # a torn last line, or an entry gone with its container
+        except ValueError:
+            continue  # torn while written: its batch had not reached any chown yet
+        try:
+            restore(e)
+        except FileNotFoundError:
+            pass  # gone with its container
+        # any other error fails the unit with the journal kept, so Docker stays down and the next boot retries
+    os.sync()  # restored metadata is on disk before the journal that describes it goes
     os.remove(JOURNAL)
 
 
-def shift_back(path, base):
-    st = os.lstat(path)
-    link = stat.S_ISLNK(st.st_mode)
-    acl = 0 if link else shift_acls(path, base)
-    uid, gid = back(st.st_uid, base), back(st.st_gid, base)
-    if (uid, gid) == (st.st_uid, st.st_gid):
-        return acl
-    if DRY:
-        return 1
-    caps = None
-    if not link:
-        try:
-            caps = os.getxattr(path, "security.capability", follow_symlinks=False)
-        except OSError:
-            pass
-        if caps or st.st_mode & (stat.S_ISUID | stat.S_ISGID):
-            journal({"p": path, "m": stat.S_IMODE(st.st_mode), "c": caps.hex() if caps else None})
-    os.lchown(path, uid, gid)
-    if not link:
-        os.chmod(path, stat.S_IMODE(st.st_mode))  # chown clears setuid/setgid
-        if caps:
-            os.setxattr(path, "security.capability", caps, follow_symlinks=False)
-    return 1
+def shift_batch(paths, base):
+    n = 0
+    todo = []
+    for path in paths:
+        st = os.lstat(path)
+        link = stat.S_ISLNK(st.st_mode)
+        changed = 0 if link else shift_acls(path, base)
+        uid, gid = back(st.st_uid, base), back(st.st_gid, base)
+        if (uid, gid) != (st.st_uid, st.st_gid):
+            changed = 1
+            if not DRY:
+                caps = None
+                if not link:
+                    try:
+                        caps = os.getxattr(path, "security.capability", follow_symlinks=False)
+                    except OSError:
+                        pass
+                todo.append((path, uid, gid, link, stat.S_IMODE(st.st_mode), caps))
+        n += changed
+    entries = [{"p": p, "m": m, "c": c.hex() if c else None}
+               for p, _, _, link, m, c in todo if not link and (c or m & (stat.S_ISUID | stat.S_ISGID))]
+    if entries:
+        journal(entries)
+    for path, uid, gid, link, mode, caps in todo:
+        os.lchown(path, uid, gid)
+        if not link:
+            os.chmod(path, mode)  # chown clears setuid/setgid
+            if caps:
+                os.setxattr(path, "security.capability", caps, follow_symlinks=False)
+    if entries:
+        os.sync()  # the batch's restored metadata is on disk before its journal goes
+        os.remove(JOURNAL)
+    return n
 
 
 def main():
@@ -433,15 +459,17 @@ def main():
             continue
         base = os.lstat(upper).st_uid
         n = 0
+        batch = []
         for top, dirs, files in os.walk(upper):
-            if top != upper:
-                n += shift_back(top, base)
-            for name in files + [x for x in dirs if os.path.islink(os.path.join(top, x))]:
-                n += shift_back(os.path.join(top, name), base)
-        n += shift_back(upper, base)  # last: its owner marks the layer done, so a cut-off run is redone next boot
+            links = [x for x in dirs if os.path.islink(os.path.join(top, x))]
+            for path in ([top] if top != upper else []) + [os.path.join(top, x) for x in files + links]:
+                batch.append(path)
+                if len(batch) >= BATCH:
+                    n += shift_batch(batch, base)
+                    batch = []
+        batch.append(upper)  # last: its owner marks the layer done, so a cut-off run is redone next boot
+        n += shift_batch(batch, base)
         print(f"{'would shift' if DRY else 'shifted'} {n} entries of {cid[:12]} back from {base}", flush=True)
-    if not DRY and os.path.exists(JOURNAL):
-        os.remove(JOURNAL)  # every journaled entry got its mode and capabilities back above
 
 
 main()

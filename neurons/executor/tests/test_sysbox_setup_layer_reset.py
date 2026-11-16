@@ -197,6 +197,10 @@ def _fake_fs(tmp_path):
         environ={},
         makedirs=os.makedirs,
         fsync=os.fsync,
+        open=os.open,
+        close=os.close,
+        O_RDONLY=os.O_RDONLY,
+        sync=lambda: None,
         remove=os.remove,
         lstat=lambda p: SimpleNamespace(st_uid=fs.owners[p], st_gid=fs.owners[p], st_mode=fs.modes[p]),
         lchown=lchown,
@@ -207,29 +211,63 @@ def _fake_fs(tmp_path):
     return reset, fs
 
 
+@pytest.mark.parametrize("batch", [512, 1])
 @pytest.mark.parametrize("cut_after", [None, 0, 1, 3])
-def test_a_reset_cut_off_part_way_is_finished_on_the_next_boot(tmp_path, cut_after):
+def test_a_reset_cut_off_part_way_is_finished_on_the_next_boot(tmp_path, cut_after, batch):
     # the layer's top directory is shifted last: until it is, the next boot sees the layer as shifted and redoes it
     reset, fs = _fake_fs(tmp_path)
-    original = reset["shift_back"]
+    reset["BATCH"] = batch
+    real = reset["os"].lchown
     calls = 0
 
-    def interrupted(path, base):
+    def interrupted(*a):
         nonlocal calls
         if calls == cut_after:
             raise InterruptedError()
         calls += 1
-        return original(path, base)
+        return real(*a)
 
-    reset["shift_back"] = interrupted
+    reset["os"].lchown = interrupted
     if cut_after is None:
         reset["main"]()
     else:
         with pytest.raises(InterruptedError):
             reset["main"]()
-    reset["shift_back"] = original
+    reset["os"].lchown = real
     reset["main"]()
     assert fs.owners == {p: 1000 if p.endswith("renterfile") else 0 for p in fs.modes}
+    assert stat.S_IMODE(fs.modes[str(fs.upper / "sudo")]) == 0o4755
+
+
+def test_the_journal_holds_one_batch_at_most(tmp_path):
+    # a layer full of setuid files never grows the journal past one batch, and each batch costs one fsync
+    reset, fs = _fake_fs(tmp_path)
+    for i in range(7):
+        f = fs.upper / f"suid{i}"
+        f.touch()
+        fs.modes[str(f)], fs.owners[str(f)], fs.xattrs[str(f)] = stat.S_IFREG | 0o4755, POD_BASE, {}
+    reset["BATCH"] = 3
+    written = []
+    real = reset["journal"]
+    reset["journal"] = lambda entries: (written.append(len(entries)), real(entries))
+    reset["main"]()
+    assert max(written) <= 3 and sum(written) == 8  # the 7 files and sudo
+    assert all(stat.S_IMODE(fs.modes[str(fs.upper / f"suid{i}")]) == 0o4755 for i in range(7))
+    assert not os.path.exists(reset["JOURNAL"])
+
+
+def test_a_replay_that_cannot_restore_keeps_the_journal_and_fails(tmp_path):
+    reset, fs = _fake_fs(tmp_path)
+    sudo = str(fs.upper / "sudo")
+    reset["journal"]([{"p": sudo, "m": 0o4755, "c": None}])
+
+    def eio(p, m):
+        raise OSError(5, "Input/output error")
+
+    reset["os"].chmod = eio
+    with pytest.raises(OSError):
+        reset["main"]()
+    assert os.path.exists(reset["JOURNAL"])  # the unit fails, Docker stays down, the next boot retries
 
 
 @pytest.mark.parametrize("cut", ["after_journal", "after_chown", "after_chmod"])
