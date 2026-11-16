@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from core.config import settings
 from services.host_memory_guard import (
     EXECUTOR_MEMORY_MIN_MIB,
     MIB,
@@ -22,12 +23,22 @@ from services.host_memory_guard import (
 )
 
 
-def test_script_is_valid_sh_and_targets_each_pod_cgroup():
+def test_script_is_valid_sh_and_targets_each_pod_cgroup(monkeypatch):
+    monkeypatch.setattr(settings, "POD_OOM_GROUP_ENABLED", True)
     script = host_memory_guard_script(["pod_1", "pod_$(x)"])
 
     assert subprocess.run(["sh", "-n", "-c", script], check=False).returncode == 0
     assert "'pod_$(x)'" in script
     assert "system.slice/docker-$id.scope" in script and "memory.oom.group" in script
+
+
+def test_oom_group_off_by_default_writes_only_memory_min(monkeypatch):
+    monkeypatch.setattr(settings, "POD_OOM_GROUP_ENABLED", False)
+
+    script = host_memory_guard_script(["pod_1"])
+
+    assert "memory.oom.group" not in script
+    assert _host_memory_min_script() in script
 
 
 @pytest.mark.asyncio

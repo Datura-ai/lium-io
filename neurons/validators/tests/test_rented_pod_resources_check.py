@@ -206,7 +206,7 @@ async def test_memory_guard_coverage_is_counted_in_the_result(context_factory):
     inner_run = ssh.run
 
     async def run(cmd, *args, **kwargs):
-        if "memory.oom.group" in cmd:
+        if "MemoryMin" in cmd:
             return SimpleNamespace(exit_status=0, stdout="memory_min_skipped no_systemd\n", stderr="")
         return await inner_run(cmd, *args, **kwargs)
 

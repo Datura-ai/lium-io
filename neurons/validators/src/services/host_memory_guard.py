@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import shlex
 
+from core.config import settings
 from core.utils import _m, get_extra_info
 
 logger = logging.getLogger(__name__)
@@ -90,7 +91,7 @@ def _host_memory_min_script() -> str:
 
 def host_memory_guard_script(container_names: list[str]) -> str:
     names = " ".join(shlex.quote(n) for n in container_names)
-    oom_group = _OOM_GROUP_SCRIPT % {"names": names} if names else "true"
+    oom_group = _OOM_GROUP_SCRIPT % {"names": names} if names and settings.POD_OOM_GROUP_ENABLED else "true"
     return f"{oom_group}; {_host_memory_min_script()}; true"
 
 
