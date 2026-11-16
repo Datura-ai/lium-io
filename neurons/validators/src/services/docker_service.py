@@ -11854,6 +11854,10 @@ class DockerService:
                 )
                 return container_created_reply
         except Exception as e:
+            # DAH-6410: a step that ends in an error after this pod's delete flagged the create (a node flatten
+            # wait runs for minutes) is the renter's cancel too, not the step's, the node's or the provider's failure
+            if not isinstance(e, _CreateCancelledByDelete) and inflight_creates.is_cancelled(payload.pod_id):
+                e = _CreateCancelledByDelete(f"delete for pod {payload.pod_id} arrived during {current_step}: {e}")
             if isinstance(e, _CreateCancelledByDelete):
                 current_step = "cancelled_by_delete"
             elif isinstance(e, _FillerRefusedForCustomerCreate):
