@@ -2517,9 +2517,11 @@ try:
     assert rental_process.stdout.readline().strip() == "ready"
     (pid,) = open(f"/proc/{rental_process.pid}/task/{rental_process.pid}/children").read().split()
     repository = f"rest:https://127.0.0.1:{server.server_port}/"
+    # restic retries a TLS failure with backoff for minutes: its first retry line already names the cause
     result = subprocess.run(
-        [sys.executable, "-I", "-S", launcher, pid, "/", "", restic, ca, "--no-cache", "-r", repository, "cat", "config"],
-        capture_output=True, text=True, env={"RESTIC_PASSWORD": "test"}, timeout=60,
+        ["timeout", "10", sys.executable, "-I", "-S", launcher, pid, "/", "", restic, ca, "--no-cache", "-r",
+         repository, "cat", "config"],
+        capture_output=True, text=True, env={"RESTIC_PASSWORD": "test"},
     )
 finally:
     rental_process.kill()
