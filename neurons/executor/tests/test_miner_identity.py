@@ -173,3 +173,39 @@ def test_host_keys_are_parsed_once_per_file_version(monkeypatch, tmp_path):
     os.utime(rsa_key, ns=(rsa_key.stat().st_atime_ns, rsa_key.stat().st_mtime_ns + 1))
     _client().get("/miner-identity", params={"nonce": NONCE})
     assert apis._load_host_key.cache_info().misses == 4  # a rewritten key file is read again
+
+
+def _sk_ed25519_private_key() -> bytes:
+    """An OpenSSH `sk-ssh-ed25519@openssh.com` (FIDO) private key file, a type `cryptography` cannot load."""
+    import base64
+    import os
+    import struct
+
+    def string(b: bytes) -> bytes:
+        return struct.pack(">I", len(b)) + b
+
+    key_type, pk, app = b"sk-ssh-ed25519@openssh.com", os.urandom(32), b"ssh:"
+    public = string(key_type) + string(pk) + string(app)
+    private = struct.pack(">II", 7, 7) + public + b"\x01" + string(os.urandom(64)) + string(b"") + string(b"")
+    private += bytes(range(1, 1 + (-len(private)) % 8))
+    blob = b"openssh-key-v1\x00" + string(b"none") + string(b"none") + string(b"") + struct.pack(">I", 1)
+    blob += string(public) + string(private)
+    body = base64.b64encode(blob).decode()
+    lines = "\n".join(body[i : i + 70] for i in range(0, len(body), 70))
+    label = "OPENSSH " + "PRIVATE KEY"
+    return f"-----BEGIN {label}-----\n{lines}\n-----END {label}-----\n".encode()
+
+
+def test_an_unloadable_key_file_is_skipped_not_a_500(monkeypatch, tmp_path):
+    from routes import apis
+
+    publics = _signing_keys_dir(monkeypatch, tmp_path, mounted=True)
+    apis._load_host_key.cache_clear()
+    (tmp_path / "ssh_host_ed25519-sk_key").write_bytes(_sk_ed25519_private_key())
+    (tmp_path / "ssh_host_empty_key").write_bytes(b"")
+    (tmp_path / "ssh_host_garbage_key").write_bytes(b"not a key")
+
+    response = _client().get("/miner-identity", params={"nonce": NONCE})
+
+    assert response.status_code == 200
+    assert set(response.json()["host_key_proofs"]) == set(publics)  # the loadable keys still sign

@@ -513,7 +513,7 @@ def _host_key_proofs(nonce: str, miner_hotkey: str, account_claim: str | None) -
         try:
             stat = path.stat()
             key = _load_host_key(str(path), stat.st_mtime_ns, stat.st_size)
-        except (OSError, ValueError, TypeError):
+        except Exception:  # any odd file in the keys dir (e.g. an sk-* FIDO key) is skipped, never a 500
             continue
         signature = _sign_with_host_key(key, message)
         if signature is None:
