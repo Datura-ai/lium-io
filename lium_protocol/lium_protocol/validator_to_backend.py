@@ -177,7 +177,7 @@ class PodContainerState(pydantic.BaseModel):
     pod_id: str
     container_state: ContainerState
     observed_at: datetime
-    # 2.14.0: the size in GB of a pod's /root volume granted short of its order, after this cycle's grow; left off
+    # 2.16.0: the size in GB of a pod's /root volume granted short of its order, after this cycle's grow; left off
     # the wire when None, so every other pod's state reads as before
     volume_limit_gb: int | None = pydantic.Field(default=None, exclude_if=lambda value: value is None)
 
@@ -449,7 +449,7 @@ class ContainerCreated(PodContainerResponse):
     volume_limit_gb: int | None = None
     local_volume_path: str | None = None
     volume_encryption_status: VolumeEncryptionStatus | None = None
-    # DAH-6073 (protocol 2.14.0): the volume was granted short of its order and labelled, so a later cleanup pass
+    # DAH-6073 (protocol 2.16.0): the volume was granted short of its order and labelled, so a later cleanup pass
     # grows it online as disk frees; left off the wire when False
     volume_grows_to_order: bool = pydantic.Field(default=False, exclude_if=lambda value: not value)
     # the ContainerCreateRequest's command_id, echoed so the backend can tell which dispatch this completes
@@ -485,6 +485,8 @@ class SshPubKeyAdded(PodContainerResponse):
 class SshPubKeyRemoved(PodContainerResponse):
     message_type: ValidatorMessageType = ValidatorMessageType.SshPubKeyRemoved
     user_public_keys: list[str] = []
+    # 2.15.0: the RemoveSshPublicKeysRequest's command_id, echoed so the backend can tell which send this confirms
+    command_id: str = ""
 
 
 @VALIDATOR_MESSAGES.register
