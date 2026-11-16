@@ -6,7 +6,6 @@ import socket
 import struct
 import subprocess
 import threading
-import time
 from unittest.mock import Mock
 
 import pytest
@@ -1857,13 +1856,14 @@ def test_authorized_keys_remove_drops_only_the_listed_keys(tmp_path):
 def _path_without_flock(tmp_path) -> str:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    for tool in ("sh", "mkdir", "rmdir", "find", "cat", "chmod", "touch", "mktemp", "rm", "grep", "sleep"):
+    for tool in ("sh", "mkdir", "cat", "chmod", "touch", "mktemp", "rm", "grep"):
         (bin_dir / tool).symlink_to(shutil.which(tool))
     return str(bin_dir)
 
 
 @pytest.mark.parametrize("remove", [False, True])
-def test_authorized_keys_edit_without_flock_takes_a_mkdir_lock_and_releases_it(tmp_path, remove):
+def test_authorized_keys_edit_without_flock_runs_unlocked_as_before(tmp_path, remove):
+    # no lock that a killed edit could leave behind and so block every later edit on the pod
     target = tmp_path / "ssh" / "authorized_keys"
     target.parent.mkdir()
     target.write_text("k1\nk2\n")
@@ -1874,31 +1874,7 @@ def test_authorized_keys_edit_without_flock_takes_a_mkdir_lock_and_releases_it(t
 
     assert completed.returncode == 0, completed.stderr
     assert target.read_text() == ("k2\n" if remove else "k1\nk2\nk1\n")
-    assert not (target.parent / ".authorized_keys.lockdir").exists()
-
-
-@pytest.mark.parametrize("stale", [False, True])
-def test_authorized_keys_remove_without_flock_waits_for_a_live_mkdir_lock_and_takes_over_a_stale_one(
-    tmp_path, monkeypatch, stale
-):
-    # DAH-6441: a delayed remove must not write back while another edit holds the lock; a crashed holder's lock is
-    # taken over only once it is older than every edit's deadline
-    monkeypatch.setattr(rental_docker_sdk, "AUTHORIZED_KEYS_LOCK_WAIT_SECONDS", 1)
-    target = tmp_path / "ssh" / "authorized_keys"
-    target.parent.mkdir()
-    target.write_text("k1\nk2\n")
-    lock_dir = target.parent / ".authorized_keys.lockdir"
-    lock_dir.mkdir()
-    if stale:
-        old = time.time() - 600
-        os.utime(lock_dir, (old, old))
-    spec = build_remove_authorized_keys_exec_spec(container_name="pod_key", public_keys=["k1"], target_path=str(target))
-
-    completed = _run_key_append(spec, env={"PATH": _path_without_flock(tmp_path)})
-
-    assert completed.returncode == (0 if stale else 1)
-    assert target.read_text() == ("k2\n" if stale else "k1\nk2\n")
-    assert lock_dir.exists() is not stale
+    assert sorted(p.name for p in target.parent.iterdir()) == ["authorized_keys"]
 
 
 @pytest.mark.skipif(shutil.which("flock") is None, reason="flock not installed")
