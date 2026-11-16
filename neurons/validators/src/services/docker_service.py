@@ -12480,7 +12480,8 @@ class DockerService:
     async def _stop_half_started_container(
         self, docker_client: RentalDockerSdkClient, container_name: str, default_extra: dict[str, Any]
     ) -> None:
-        """Stop until Docker's own state says stopped: a stop call that failed or was dropped proves nothing."""
+        """Stop until Docker's own state says stopped: a stop call that failed or was dropped proves nothing.
+        Raises when stop and kill both fail, so the caller reports a pod that may still run unmounted."""
         error = "still running after stop"
         for attempt in range(_HALF_STARTED_STOP_ATTEMPTS):
             if attempt:
@@ -12496,11 +12497,22 @@ class DockerService:
                 continue
             if not state.running and not state.restarting:
                 return
+        # a host that refused every stop gets a SIGKILL with no grace before we give up
+        try:
+            await docker_client.kill(container_name=container_name)
+            state = await docker_client.inspect_container_state(container_name=container_name)
+            if not state.running and not state.restarting:
+                return
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc)
         logger.error(
             _m(
                 "POD_HALF_STARTED_STOP_FAILED",
                 extra=get_extra_info({**default_extra, "container_name": container_name, "error": error}),
             )
+        )
+        raise RentalDockerOperationError(
+            f"pod {container_name} may still be running without its mount: stop and kill failed ({error})"
         )
 
     async def _bring_up_existing_container(

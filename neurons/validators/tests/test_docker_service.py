@@ -123,6 +123,8 @@ class _FakeRentalDockerClient:
         self.run_error = None
         self.start_error = None
         self.stop_error = None
+        self.kill_error = None
+        self.killed_containers = []
         self.remove_error = None
         self.remove_volume_error = None
         # per-call answers for remove_volume, consumed in order (None = success); once empty,
@@ -195,6 +197,12 @@ class _FakeRentalDockerClient:
         self.container_call_order.append(("stop", container_name))
         if self.stop_error is not None:
             raise self.stop_error
+        self.running = False
+
+    async def kill(self, *, container_name: str) -> None:
+        self.killed_containers.append(container_name)
+        if self.kill_error is not None:
+            raise self.kill_error
         self.running = False
 
     async def remove_container(
@@ -3428,6 +3436,24 @@ async def test_a_half_started_pod_whose_stop_fails_is_stopped_again_until_docker
         await _start_existing(docker_service)
 
     assert client.stopped_containers == ["pod_test"] * 3
+    assert client.killed_containers == ["pod_test"]
+    assert client.running is False
+
+
+@pytest.mark.asyncio
+async def test_a_half_started_pod_that_refuses_stop_and_kill_fails_the_start_as_possibly_still_running(
+    docker_service, monkeypatch
+):
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    monkeypatch.setattr("services.docker_service.asyncssh.connect", Mock(side_effect=OSError("ssh refused")))
+    monkeypatch.setattr("services.docker_service._HALF_STARTED_STOP_RETRY_SEC", 0)
+    client = docker_service.rental_docker_client_factory.client
+    client.running = False
+    client.stop_error = RuntimeError("stop refused")
+    client.kill_error = RuntimeError("kill refused")
+
+    with pytest.raises(RentalDockerOperationError, match="may still be running without its mount"):
+        await _start_existing(docker_service)
 
 
 @pytest.mark.asyncio

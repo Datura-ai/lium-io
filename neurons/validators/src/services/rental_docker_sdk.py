@@ -708,6 +708,9 @@ class RentalDockerSdkClient:
             timeout=stop_grace_seconds,
         )
 
+    async def kill(self, *, container_name: str) -> None:
+        await self._call_api(container_name, operation_label="kill", api_method=self._api_client.kill)
+
     async def remove_container(
         self,
         *,
