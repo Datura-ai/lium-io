@@ -12111,6 +12111,7 @@ class DockerService:
                 operation_id,
                 spec,
                 retain_terminal_artifacts=True,
+                redis=self.redis_service,
             )
             await wait_for_storage_operation(ssh_client, files)
         finally:

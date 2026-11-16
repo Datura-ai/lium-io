@@ -97,3 +97,30 @@ async def test_a_repeated_dispatch_never_starts_a_second_runner(
     assert f"[-]-spec {storage_operations.StorageOperationFiles.for_operation(OPERATION_ID).spec}" in probe
     assert any("docker rm -f" in c for c in commands) is not runner_alive
     assert any("nohup" in c for c in commands) is False  # never launched a second wrapper
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_after_the_runner_deleted_its_spec_still_reports_cancelled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    report = AsyncMock(return_value=True)
+    monkeypatch.setattr(storage_operations, "_report_cancelled", report)
+    store: dict[str, str] = {}
+    redis = SimpleNamespace(
+        set=AsyncMock(side_effect=lambda key, value, ex=None: store.__setitem__(key, value)),
+        get=AsyncMock(side_effect=lambda key: store.get(key)),
+        delete=AsyncMock(side_effect=lambda key: store.pop(key, None)),
+    )
+    reporter = {"api_url": "https://api.example", "auth_token": "t", "resource": "restore"}
+    await storage_operations.note_storage_reporter(redis, OPERATION_ID, {"reporter": reporter, "repository": {}})
+
+    async def run_locally(command: str, check: bool = False) -> SimpleNamespace:
+        # no spec and no runner PID on the node: the runner read and deleted its spec, then ended
+        result = subprocess.run(["sh", "-c", command.replace("/usr/bin/docker", "true")], capture_output=True, text=True)
+        return SimpleNamespace(exit_status=result.returncode, stdout=result.stdout, stderr=result.stderr)
+
+    await storage_operations.cancel_storage_operation(SimpleNamespace(run=run_locally), OPERATION_ID, redis)
+
+    report.assert_awaited_once_with(OPERATION_ID, {"reporter": reporter})
+    assert store == {}  # only the reporter was kept, and it is dropped once reported
