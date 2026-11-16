@@ -37,7 +37,6 @@ from storage.reporting import (
     _newest_within_bytes,
 )
 from storage.restic import (
-    BACKUP_SOURCE_SCRIPT,
     CA_BUNDLE,
     RENTAL_EXEC_SOURCE,
     RESTIC_TMPFS_BYTES,
@@ -51,6 +50,7 @@ from storage.restic import (
     kernel_kill_note,
     restic_restore_helper_memory,
 )
+from storage.safe_path import SAFE_ENTER_SCRIPT
 from storage.workspace import (
     DockerUserNamespaceWorkspace,
     DockerVolumeWorkspace,
@@ -565,8 +565,8 @@ def test_plain_backup_uses_read_only_volume_and_keeps_secrets_out_of_arguments()
 
     assert cwd is None
     assert "customer-volume:/workspace:ro" in command
-    script = command.index(BACKUP_SOURCE_SCRIPT)
-    assert command[script + 2 : script + 4] == ["/workspace/checkpoints", runner._restic_binary]
+    script = command.index(SAFE_ENTER_SCRIPT)
+    assert command[script + 1 : script + 5] == ["/workspace", "checkpoints", "backup", runner._restic_binary]
     assert command[command.index("--log-driver") + 1] == "none"
     assert command[command.index("--tmpfs") + 1] == "/tmp:rw,nosuid,nodev,size=536870912"
     launcher = runpy.run_path(str(Path(storage_runner.__file__).parent / "storage" / "rental_exec.py"))
@@ -709,8 +709,10 @@ def test_bootstrap_encrypted_restore_skips_the_emptiness_preflight(
         if command[1] == "inspect":
             return SimpleNamespace(returncode=0, stdout=inspection, stderr="")
         scripts.append(command[command.index("-c") + 1])
+        modes.append(command[command.index("-c") + 4])
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
+    modes: list[str] = []
     monkeypatch.setattr("storage.workspace.subprocess.run", run_docker)
 
     workspace = WorkspaceResolver(
@@ -719,9 +721,8 @@ def test_bootstrap_encrypted_restore_skips_the_emptiness_preflight(
 
     assert workspace.read_only is False
     (preflight,) = scripts
-    assert "exit 20" in preflight          # a file where the directory should be still fails
-    assert "find" not in preflight         # emptiness is not required
-    assert "-mindepth" not in preflight
+    assert preflight == SAFE_ENTER_SCRIPT
+    assert modes == ["check-restore"]  # only the shape is checked, emptiness is not required
 
 
 def test_bootstrap_flag_is_refused_outside_encrypted_running() -> None:
@@ -1151,7 +1152,9 @@ def test_docker_restore_uses_native_json_restore_to_requested_directory() -> Non
     assert "customer-volume:/workspace:rw" in command
     assert "--workdir" not in command
     assert command[-2:] == ["--", SNAPSHOT_ID]
-    assert "/workspace/restored" in command
+    script = command.index(SAFE_ENTER_SCRIPT)
+    assert command[script + 1 : script + 4] == ["/workspace", "restored", "restore"]
+    assert command[command.index("--target") + 1] == "."
     assert "restore" in command
     assert "--json" in command
     assert "--sparse" in command
@@ -1761,46 +1764,6 @@ def test_reporter_uses_backup_summary_counters() -> None:
     assert terminal_payload["processed_bytes"] == 268_483_487
 
 
-def test_encrypted_backup_script_stops_when_the_backup_path_is_missing(tmp_path: Path) -> None:
-    marker = tmp_path / "ran"
-
-    completed = subprocess.run(
-        ["/bin/sh", "-c", BACKUP_SOURCE_SCRIPT, "sh", str(tmp_path / "missing"), "touch", str(marker)],
-        capture_output=True,
-    )
-
-    assert completed.returncode == 66
-    assert not marker.exists()
-    # the reporter keeps the first diagnostic, so sh's own cd error must not reach it ahead of ours
-    assert completed.stderr == b""
-
-
-def test_backup_source_script_stops_when_the_backup_path_is_empty(tmp_path: Path) -> None:
-    marker = tmp_path / "ran"
-    (tmp_path / "backup").mkdir()
-
-    completed = subprocess.run(
-        ["/bin/sh", "-c", BACKUP_SOURCE_SCRIPT, "sh", str(tmp_path / "backup"), "touch", str(marker)],
-        capture_output=True,
-    )
-
-    assert completed.returncode == 66
-    assert not marker.exists()
-
-
-def test_backup_source_script_fails_when_the_backup_path_is_a_file(tmp_path: Path) -> None:
-    marker = tmp_path / "ran"
-    (tmp_path / "backup").write_text("x")
-
-    completed = subprocess.run(
-        ["/bin/sh", "-c", BACKUP_SOURCE_SCRIPT, "sh", str(tmp_path / "backup"), "touch", str(marker)],
-        capture_output=True,
-    )
-
-    assert completed.returncode == 1
-    assert not marker.exists()
-
-
 def test_local_backup_of_a_file_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     path = tmp_path / "backup"
     path.write_text("x")
@@ -1990,13 +1953,14 @@ def test_encrypted_backup_preflight_lets_an_absent_path_through(
     real_run = subprocess.run
 
     def run_locally(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        script = command[command.index("-c") + 1]
-        return real_run(["/bin/sh", "-c", script, "sh", str(target)], capture_output=True, text=True)
+        start = command.index("python3")
+        return real_run([sys.executable, *command[start + 1 :]], capture_output=True, text=True)
 
     monkeypatch.setattr("storage.workspace.subprocess.run", run_locally)
     validate = lambda: WorkspaceResolver(docker_binary="docker")._validate_encrypted_path(  # noqa: E731
         image="executor:test",
         pid=1,
+        visible_root=PurePosixPath(str(tmp_path)),
         visible_path=PurePosixPath(str(target)),
         requested_path=PurePosixPath("/root/backup"),
         action=StorageAction.BACKUP,
@@ -2005,7 +1969,7 @@ def test_encrypted_backup_preflight_lets_an_absent_path_through(
     if passes:
         validate()
     else:
-        with pytest.raises(WorkspaceResolutionError, match=str(target)):  # the ls -ld output names what is there
+        with pytest.raises(WorkspaceResolutionError, match="not a directory"):
             validate()
 
 
@@ -2014,8 +1978,9 @@ def test_encrypted_backup_preflight_lets_an_absent_path_through(
     ("returncode", "stderr", "message"),
     [
         (20, "", "backup source is not a directory: /root"),
-        (20, "-rw-r--r-- 1 0 0 0 Nov  5 04:01 /proc/123/root/root\n",
-         "backup source is not a directory: /root: -rw-r--r-- 1 0 0 0 Nov  5 04:01 /proc/123/root/root"),
+        (20, "not a directory: root\n", "backup source is not a directory: /root: not a directory: root"),
+        (67, "symlink in path: root\n",
+         "backup path /root leads through a symlink, which is not followed: symlink in path: root"),
         (1, "nsenter: cannot open /proc/123/ns/user: No such file\n",
          "could not check backup path /root: exit 1: nsenter: cannot open /proc/123/ns/user: No such file"),
     ],
@@ -2032,6 +1997,7 @@ def test_encrypted_path_check_reports_the_real_failure(
         WorkspaceResolver(docker_binary="docker")._validate_encrypted_path(
             image="executor:test",
             pid=123,
+            visible_root=PurePosixPath("/proc/123/root"),
             visible_path=PurePosixPath("/proc/123/root/root"),
             requested_path=PurePosixPath("/root"),
             action=StorageAction.BACKUP,
@@ -2375,8 +2341,8 @@ def test_real_restic_finds_the_parent_when_the_backup_path_changes(
 
 
 
-def test_encrypted_legacy_tar_restore_still_writes_through_the_helper_view() -> None:
-    """awscli is not a static binary and cannot run inside the rental: the legacy path is unchanged"""
+def test_encrypted_legacy_tar_restore_enters_the_target_without_following_links() -> None:
+    """awscli is not a static binary and cannot run inside the rental: the helper enters the target through safe_path"""
     payload = _operation_payload(action="restore", mode="encrypted_running")
     payload.update(engine="tar_aws_cli", snapshot_id=None, legacy_object_key="legacy/object.tgz")
     runner = ResticStorageRunner(
@@ -2387,7 +2353,9 @@ def test_encrypted_legacy_tar_restore_still_writes_through_the_helper_view() -> 
 
     nsenter = command.index("--entrypoint") + 1
     assert command[nsenter : nsenter + 6] == ["/usr/bin/nsenter", "executor:test", "-t", "4321", "-U", "--"]
-    assert command[-1] == "/proc/4321/root/root/restored"
+    script = command.index(SAFE_ENTER_SCRIPT)
+    assert command[script + 1 : script + 4] == ["/proc/4321/root", "root/restored", "restore"]
+    assert command[-1] == "."
 
 
 @pytest.mark.parametrize(
