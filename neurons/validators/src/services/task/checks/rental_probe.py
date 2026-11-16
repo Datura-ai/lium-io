@@ -198,7 +198,8 @@ class _ProbeGate:
     standing: _Failure | None
     # the fillers the backend listed under the lock, which the probe runs beside and leaves alone
     fillers_beside: frozenset[str] = frozenset()
-    # volume_<pod_id> names the backend keeps without their container; the probe's create must not sweep them
+    # volume_<pod_id> names the backend keeps without their container, and the paused pods' volumes; the
+    # probe's create must not sweep them
     kept_volumes: frozenset[str] = frozenset()
 
 
@@ -588,7 +589,7 @@ class _BusyNow:
     busy: str | None
     # the fillers on it the probe runs beside
     fillers_beside: frozenset[str] = frozenset()
-    # retained volume_<pod_id> names, from the cycle's snapshot and this re-read
+    # retained volume_<pod_id> names, from the cycle's snapshot and this re-read, and the paused pods' volumes
     kept_volumes: frozenset[str] = frozenset()
 
 
@@ -612,7 +613,8 @@ async def _busy_now(ctx: Context) -> _BusyNow:
         _read_failed(ctx, "its pending-pod marks in Redis")
         return _BusyNow(None)
     kept_ids = retained_volume_pod_ids(ctx.state.rented_data) | retained_volume_pod_ids(rented)
-    return _BusyNow("", fillers, frozenset(f"volume_{pod_id}" for pod_id in kept_ids))
+    kept = {f"volume_{pod_id}" for pod_id in kept_ids} | set(rented.get_kept_volume_names(ctx.executor.uuid))
+    return _BusyNow("", fillers, frozenset(kept))
 
 
 def _missing_inputs(ctx: Context) -> str | None:
@@ -873,6 +875,10 @@ def _probe_memory_gb(ctx: Context) -> int | None:
 def _probe_payload(
     ctx: Context, *, pod_id: str, image_ref: str, public_key: str, kept_volumes: frozenset[str] = frozenset()
 ) -> ContainerCreateRequest:
+    # the cycle's snapshot and the fresh read under the lock: a pod paused since the snapshot is only in the
+    # fresh read, and its volume must survive the create's sweep too
+    rented_data = ctx.state.rented_data
+    snapshot = rented_data.get_kept_volume_names(ctx.executor.uuid) if rented_data else []
     return ContainerCreateRequest(
         miner_hotkey=ctx.miner_hotkey,
         miner_address=ctx.miner_address,
@@ -894,9 +900,10 @@ def _probe_payload(
         ],
         pod_mapping=[],
         # no container to protect: the backend lists no pod here, and create_container's `beside_fillers`
-        # keeps every filler_* on the node, not only the ones listed at this moment
+        # keeps every filler_* on the node, not only the ones listed at this moment. A paused pod's
+        # volume stays (DAH-2348).
         active_container_names=[],
-        active_volume_names=sorted(kept_volumes),
+        active_volume_names=sorted({*snapshot, *kept_volumes}),
     )
 
 
