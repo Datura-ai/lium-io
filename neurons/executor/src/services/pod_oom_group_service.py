@@ -41,9 +41,17 @@ def set_oom_group(container_id: str, dirs: tuple[str, ...] = CGROUP_DIRS) -> str
     return "no_cgroup_v2_scope"
 
 
+CIPHER_MOUNT = "/lium-cipher"  # an encrypted pod's gocryptfs volume, as the validator and storage/workspace.py read it
+
+
 def restart_sshd(client, container_id: str) -> None:
     try:
-        client.containers.get(container_id).exec_run(RESTART_SSHD, detach=True)
+        container = client.containers.get(container_id)
+        # SSH before the validator remounts gocryptfs would let renter writes land unencrypted on the host disk;
+        # the validator's mount-then-SSH recovery restores an encrypted pod.
+        if any(m.get("Destination") == CIPHER_MOUNT for m in container.attrs.get("Mounts") or []):
+            return
+        container.exec_run(RESTART_SSHD, detach=True, user="0")  # a non-root image USER cannot start sshd
     except Exception as e:  # noqa: BLE001 - a pod gone again or a dockerd hiccup must not stop the watcher
         logger.warning(f"POD_SSHD_RESTART_FAILED {container_id[:12]} {type(e).__name__}: {e}")
 

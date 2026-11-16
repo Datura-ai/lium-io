@@ -52,14 +52,24 @@ def test_only_rental_pod_starts_are_touched(tmp_path):
     assert f.read_text().strip() == "0"
 
 
-def test_a_restarted_pod_gets_its_sshd_bootstrap_rerun(tmp_path):
+def test_a_restarted_pod_gets_its_sshd_bootstrap_rerun_as_root(tmp_path):
     client = MagicMock()
+    client.containers.get.return_value.attrs = {"Mounts": [{"Destination": "/workspace"}]}
 
     handle_event(_start(), _dirs(tmp_path), client=client)
 
     client.containers.get.assert_called_once_with("abc")
-    client.containers.get.return_value.exec_run.assert_called_once_with(RESTART_SSHD, detach=True)
+    client.containers.get.return_value.exec_run.assert_called_once_with(RESTART_SSHD, detach=True, user="0")
     assert "[ -f /tmp/lium-ssh-bootstrap.sh ] || exit 0" in RESTART_SSHD[2]
+
+
+def test_an_encrypted_pod_is_left_to_the_validators_mount_then_ssh_recovery(tmp_path):
+    client = MagicMock()
+    client.containers.get.return_value.attrs = {"Mounts": [{"Destination": "/lium-cipher"}]}
+
+    handle_event(_start(), _dirs(tmp_path), client=client)
+
+    client.containers.get.return_value.exec_run.assert_not_called()
 
 
 def test_a_filler_start_runs_no_sshd_bootstrap(tmp_path):
