@@ -1,6 +1,6 @@
 """The cycle's job files are built before anything counts the cycle, and a lost forced-request clear does not stop it."""
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -38,3 +38,18 @@ async def test_a_failed_forced_request_clear_still_publishes_the_new_job_files(v
         await validator.sync()
 
     assert validator.cycle_inputs.encrypted_files == {"dir": "new"}
+
+
+@pytest.mark.asyncio
+async def test_the_build_keeps_the_published_job_files_while_no_express_verification_holds_them(validator_with_mocks):
+    validator = validator_with_mocks
+    validator.cycle_inputs = MagicMock()
+    validator.cycle_inputs.encrypted_files.tmp_directory = "/jobs/previous"
+    validator.express_lane.directories_in_use = MagicMock(return_value=set())
+    validator.observe_executor_rollout = AsyncMock(return_value=None)
+    first, second = _digests()
+    with first, second:
+        await validator.sync()
+
+    kept = validator.file_encrypt_service.ecrypt_miner_job_files.call_args.kwargs["keep_directories"]
+    assert "/jobs/previous" in kept
