@@ -17,17 +17,37 @@ def _size(value) -> int:
     return len(json.dumps(value).encode())
 
 
-def fit_event_report(event: dict) -> dict:
+def fit_event_report(event: dict) -> dict | None:
     """Keeps the leading findings of an oversized event report that fit one frame; counts the rest.
 
     Runs before the report is published to Redis: a message over the pub/sub output buffer limit closes the connector's
     subscription and drops everything queued for it. Measured as `RedisService.publish` encodes it, which is never
     smaller than the connector's compact frame. Not split into several reports: the backend stores one row per cycle.
+    Returns None when the report is still too big without its findings; the caller then does not publish it.
     """
+    if _size(event) <= EVENT_REPORT_MAX_BYTES:
+        return event
     report = event.get("report")
     findings = report.get("findings") if isinstance(report, dict) else None
-    if not isinstance(findings, list) or _size(event) <= EVENT_REPORT_MAX_BYTES:
-        return event
+    result = _trim_findings(event, report, findings) if isinstance(findings, list) else event
+    if _size(result) > EVENT_REPORT_MAX_BYTES:
+        logger.error(
+            _m(
+                "Dropped an event report bigger than one frame",
+                extra=get_extra_info(
+                    {
+                        "executor_id": event.get("executor_id"),
+                        "miner_hotkey": event.get("miner_hotkey"),
+                        "bytes": _size(result),
+                    }
+                ),
+            )
+        )
+        return None
+    return result
+
+
+def _trim_findings(event: dict, report: dict, findings: list) -> dict:
     empty = {**report, "findings": [], "findings_omitted": len(findings)}
     room = EVENT_REPORT_MAX_BYTES - _size({**event, "report": empty})
     kept = 0

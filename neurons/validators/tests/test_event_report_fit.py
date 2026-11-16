@@ -59,3 +59,14 @@ def test_a_trimmed_reports_verdict_hash_matches_the_report_published():
     assert fitted["context"]["verdict"]["report_sha256"] == canonical_sha256(fitted["report"])
     assert fitted["context"]["verdict"]["kind"] == "v"
     assert event["context"]["verdict"]["report_sha256"] == canonical_sha256(event["report"])
+
+
+def test_a_report_too_big_outside_its_findings_is_not_published(caplog):
+    event = _event([{"kind": "a"}])
+    event["context"] = {"error": "x" * MAX_FRAME_BYTES}
+
+    with caplog.at_level(logging.ERROR, logger="services.task.event_report_fit"):
+        assert fit_event_report(event) is None
+
+    (drop,) = [r.msg.extra for r in caplog.records if "Dropped" in r.getMessage()]
+    assert (drop["executor_id"], drop["miner_hotkey"]) == ("ex", "hk")

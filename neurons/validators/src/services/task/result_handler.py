@@ -450,6 +450,8 @@ class ResultHandler:
     async def _publish_inspector_event(self, event: dict, miner_hotkey: str) -> None:
         # DAH-6478: capped here, before Redis; an oversized message drops the connector's whole subscription
         payload = fit_event_report({**event, "miner_hotkey": miner_hotkey})
+        if payload is None:
+            return
         try:
             await self.redis_service.publish(
                 INSPECTOR_EVENT_CHANNEL,
