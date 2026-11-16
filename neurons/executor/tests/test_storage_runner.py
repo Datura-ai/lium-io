@@ -2600,3 +2600,16 @@ def test_legacy_restore_downloads_from_the_root_directory(tmp_path: Path, encryp
     )
 
     assert record.read_text().strip() == "/"
+
+
+def test_load_operation_leaves_only_the_reporter_in_the_spec_file(tmp_path: Path) -> None:
+    spec = tmp_path / "spec.json"
+    reporter = {"api_url": "https://api.example", "auth_token": "t", "resource": "restore"}
+    spec.write_text(json.dumps({"action": "restore", "repository": {"password": "p"}, "reporter": reporter}))
+    spec.chmod(0o600)
+
+    payload = storage_runner._load_operation(str(spec))
+
+    assert payload["repository"] == {"password": "p"}
+    assert json.loads(spec.read_text()) == {"reporter": reporter}
+    assert spec.stat().st_mode & 0o777 == 0o600
