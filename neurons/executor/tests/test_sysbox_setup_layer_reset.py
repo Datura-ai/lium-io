@@ -274,6 +274,21 @@ def test_a_renter_path_the_host_cannot_reach_is_skipped_and_the_rest_is_shifted(
     assert fs.owners[str(fs.upper)] == 0  # the layer is done: the unit succeeds and Docker starts
 
 
+def test_an_io_error_on_an_entry_fails_the_reset_and_leaves_the_layer_for_the_next_boot(tmp_path):
+    reset, fs = _fake_fs(tmp_path)
+    real = reset["os"].lstat
+
+    def lstat(p):
+        if p.endswith("renterfile"):
+            raise OSError(5, "Input/output error", p)
+        return real(p)
+
+    reset["os"].lstat = lstat
+    with pytest.raises(OSError):
+        reset["main"]()
+    assert fs.owners[str(fs.upper)] == POD_BASE  # not marked done: the unit fails, Docker stays down, next boot retries
+
+
 def test_a_replay_that_cannot_restore_keeps_the_journal_and_fails(tmp_path):
     reset, fs = _fake_fs(tmp_path)
     sudo = str(fs.upper / "sudo")

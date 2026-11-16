@@ -265,7 +265,7 @@ shift_sysbox_layers_back_at_boot() {
 #!/usr/bin/python3 -I
 # Lium (nvidia_docker_sysbox_setup.sh): shift back the writable layer a sysbox pod kept after an unclean stop, the way
 # sysbox's own stop does. Runs at boot before Docker; --dry-run only prints. Setuid bits and file capabilities kept.
-import atexit, glob, json, os, re, stat, struct, subprocess, sys, time
+import atexit, errno, glob, json, os, re, stat, struct, subprocess, sys, time
 
 DRY = "--dry-run" in sys.argv
 ROOT = os.environ.get("LIUM_LAYER_RESET_ROOT", "")
@@ -405,8 +405,10 @@ def shift_batch(paths, base):
             link = stat.S_ISLNK(st.st_mode)
             changed = 0 if link else shift_acls(path, base)
         except OSError as e:
-            # an entry the renter made (a path past PATH_MAX on the host: ENAMETOOLONG) stays as it is in that pod;
-            # it must never fail the unit, which holds Docker down for every pod on the host
+            # a renter's path past PATH_MAX on the host (ENAMETOOLONG) stays as it is in that pod and must not hold
+            # Docker down for every pod; any other error fails the unit, so the next boot retries the layer
+            if e.errno != errno.ENAMETOOLONG:
+                raise
             print(f"skipped ...{path[-80:]}: {e.strerror}", file=sys.stderr, flush=True)
             continue
         uid, gid = back(st.st_uid, base), back(st.st_gid, base)
@@ -467,6 +469,8 @@ def main():
         n = 0
         batch = []
         def unreadable(e):
+            if e.errno != errno.ENAMETOOLONG:
+                raise e
             print(f"skipped ...{(e.filename or '')[-80:]}: {e.strerror}", file=sys.stderr, flush=True)
 
         for top, dirs, files in os.walk(upper, onerror=unreadable):
