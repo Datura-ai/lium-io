@@ -588,3 +588,30 @@ async def test_read_host_pid_max_logs_why_it_missed(svc, caplog, result, why):
     with caplog.at_level("WARNING", logger="services.docker_service"):
         assert await svc._read_host_pid_max(ssh_client) is None
     assert why in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("volumes", "path"), [(None, "/root"), (["/workspace"], "/workspace")])
+async def test_an_image_that_runs_its_own_start_sh_is_told_where_the_pod_volume_is(svc, monkeypatch, volumes, path):
+    """DAH-6522: start.sh opens Jupyter in LIUM_VOLUME_PATH, so a template's /workspace volume is where
+    notebooks land, not a /root a reboot wipes."""
+    from payload_models.payloads import CustomOptions
+
+    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
+
+    result = await _run(svc, _payload(ships_sshd=True, custom_options=CustomOptions(volumes=volumes)))
+
+    assert isinstance(result, ContainerCreated)
+    assert _created_run_spec(svc).environment["LIUM_VOLUME_PATH"] == path
+
+
+@pytest.mark.asyncio
+async def test_an_image_whose_start_sh_is_replaced_gets_no_volume_path(svc, monkeypatch):
+    """A renter's startup command replaces start.sh, which is the only reader of LIUM_VOLUME_PATH."""
+    from payload_models.payloads import CustomOptions
+
+    _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=0))
+
+    await _run(svc, _payload(ships_sshd=True, custom_options=CustomOptions(startup_commands="sleep infinity")))
+
+    assert "LIUM_VOLUME_PATH" not in _created_run_spec(svc).environment
