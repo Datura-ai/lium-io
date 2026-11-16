@@ -192,7 +192,7 @@ def _fake_fs(tmp_path):
     )
     reset["os"] = SimpleNamespace(
         path=os.path,
-        walk=os.walk,
+        scandir=os.scandir,
         kill=os.kill,
         environ={},
         makedirs=os.makedirs,
@@ -287,6 +287,24 @@ def test_an_io_error_on_an_entry_fails_the_reset_and_leaves_the_layer_for_the_ne
     with pytest.raises(OSError):
         reset["main"]()
     assert fs.owners[str(fs.upper)] == POD_BASE  # not marked done: the unit fails, Docker stays down, next boot retries
+
+
+def test_a_tree_deeper_than_the_recursion_limit_is_walked(tmp_path):
+    # Python 3.10's os.walk recursed once per level: a renter's deep tree ended the reset in RecursionError
+    reset, fs = _fake_fs(tmp_path)
+    deep = fs.upper
+    for _ in range(300):
+        deep = deep / "a"
+        deep.mkdir()
+        fs.modes[str(deep)], fs.owners[str(deep)], fs.xattrs[str(deep)] = stat.S_IFDIR | 0o755, POD_BASE, {}
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(200)
+    try:
+        reset["main"]()
+    finally:
+        sys.setrecursionlimit(limit)
+    assert fs.owners[str(deep)] == 0
+    assert fs.owners[str(fs.upper)] == 0
 
 
 def test_a_replay_that_cannot_restore_keeps_the_journal_and_fails(tmp_path):

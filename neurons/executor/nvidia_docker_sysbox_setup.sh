@@ -473,9 +473,19 @@ def main():
                 raise e
             print(f"skipped ...{(e.filename or '')[-80:]}: {e.strerror}", file=sys.stderr, flush=True)
 
-        for top, dirs, files in os.walk(upper, onerror=unreadable):
-            links = [x for x in dirs if os.path.islink(os.path.join(top, x))]
-            for path in ([top] if top != upper else []) + [os.path.join(top, x) for x in files + links]:
+        # an explicit stack, not os.walk: before Python 3.12 (22.04 ships 3.10) os.walk recurses once per level, and a
+        # renter's tree ~1000 levels deep would end it in RecursionError
+        stack = [upper]
+        while stack:
+            top = stack.pop()
+            try:
+                with os.scandir(top) as it:
+                    entries = [(e.path, e.is_dir(follow_symlinks=False)) for e in it]
+            except OSError as e:
+                unreadable(e)
+                continue
+            stack += [path for path, is_dir in entries if is_dir]
+            for path in ([top] if top != upper else []) + [path for path, is_dir in entries if not is_dir]:
                 batch.append(path)
                 if len(batch) >= BATCH:
                     n += shift_batch(batch, base)
