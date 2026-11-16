@@ -80,6 +80,18 @@ def test_the_umad_device_is_found_by_its_device_and_port(tmp_path: Path):
     assert ns["umad_device_of"]("mlx5_9", "1") == ""
 
 
+def test_an_issm_device_of_the_same_port_is_never_picked(tmp_path: Path):
+    # issmN sorts before umadN and shares its ibdev/port; opening it would claim the port's IsSM bit
+    ns = _scrape("umad_device_of")
+    for name in ("issm0", "umad0"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "ibdev").write_text("mlx5_0\n")
+        (tmp_path / name / "port").write_text("1\n")
+    ns["INFINIBAND_MAD_SYSFS_PATH"] = str(tmp_path)
+
+    assert ns["umad_device_of"]("mlx5_0", "1") == "/dev/infiniband/umad0"
+
+
 def test_only_active_infiniband_ports_with_an_sm_are_asked():
     ns = _scrape("query_sm_guids")
     asked = []

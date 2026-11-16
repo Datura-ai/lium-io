@@ -1744,6 +1744,8 @@ def umad_device_of(device: str, port: str) -> str:
     """The /dev/infiniband/umadN that sends MADs out of this device's port, "" if there is none."""
     try:
         for name in sorted(os.listdir(INFINIBAND_MAD_SYSFS_PATH)):
+            if not name.startswith("umad"):
+                continue  # issmN: opening it claims the port's IsSM bit, or blocks while a local SM holds it
             mad_path = f"{INFINIBAND_MAD_SYSFS_PATH}/{name}"
             if read_sysfs_value(f"{mad_path}/ibdev") == device and read_sysfs_value(f"{mad_path}/port") == port:
                 return f"{INFINIBAND_DEV_PATH}/{name}"
@@ -1806,7 +1808,7 @@ def query_sm_guid(umad_path: str, sm_lid: int) -> str:
         os.close(fd)
 
 
-def query_sm_guids(ports: list) -> None:
+def query_sm_guids(ports: list[InfinibandPort]) -> None:
     for port in ports:
         if port.link_layer.lower() != "infiniband" or not port.state.upper().endswith("ACTIVE"):
             continue
@@ -1819,7 +1821,7 @@ def query_sm_guids(ports: list) -> None:
             port.sm_guid = ""
 
 
-def fill_sm_guids(ports: list) -> None:
+def fill_sm_guids(ports: list[InfinibandPort]) -> None:
     """Sets sm_guid on every active InfiniBand port whose SM answers, within SM_GUID_QUERY_BUDGET_SECONDS."""
     # module-level target, not a nested def: the obfuscator renames a call's Name but not a nested def's own name
     worker = threading.Thread(target=query_sm_guids, args=(ports,), daemon=True)
