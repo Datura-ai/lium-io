@@ -88,6 +88,8 @@ from services.task_service import TaskService, JobResult
 from services.storage_operations import (
     cancel_storage_operation,
     report_launch_failure,
+    forget_storage_helper,
+    note_started_storage_helper,
     start_storage_operation,
     supports_workspace_field,
 )
@@ -377,6 +379,9 @@ class MinerService:
         self.rented_missed_last_cycle: dict[str, set[str]] = {}
         # executor uuid -> GPU UUIDs of the spec this process last published for it (empty after a restart)
         self.published_gpu_uuids: dict[str, set[str]] = {}
+        # executor uuid (lower case) -> the job_batch_id the express lane last published it under. That cycle has no
+        # result of its own for the node, and its observations-only EXECUTOR_RESULT_MISSING would replace the lane's.
+        self.express_published: dict[str, str] = {}
         # DAH-5635: the running cycle's outage share for publish_unreachable_early; None = publish nothing early
         self.outage_tally: RunningOutageTally | None = None
         # DAH-5635: (miner hotkey, executor uuid) -> the availability errors this process's last cycle publish sent for
@@ -1651,13 +1656,22 @@ class MinerService:
                     raise error
                 if payload.volume_encrypted and payload.container_name:
                     await _remount_dropped_gocryptfs(ssh_client, payload, docker_service)
-                await start_storage_operation(
-                    ssh_client,
-                    executor_info.python_path,
-                    operation_id,
-                    self._restic_backup_operation_spec(payload),
-                    retain_terminal_artifacts=False,
+                await note_started_storage_helper(
+                    self.redis_service, executor_info.uuid, operation_id
                 )
+                try:
+                    await start_storage_operation(
+                        ssh_client,
+                        executor_info.python_path,
+                        operation_id,
+                        self._restic_backup_operation_spec(payload),
+                        retain_terminal_artifacts=False,
+                    )
+                except Exception:
+                    await forget_storage_helper(
+                        self.redis_service, executor_info.uuid, operation_id
+                    )
+                    raise
                 return
 
             remote_script_path = "/root/app/backup_storage.py"
@@ -1707,13 +1721,22 @@ class MinerService:
 
             if payload.backup_engine == "restic":
                 operation_id = UUID(payload.restore_log_id)
-                await start_storage_operation(
-                    ssh_client,
-                    executor_info.python_path,
-                    operation_id,
-                    self._restic_restore_operation_spec(payload),
-                    retain_terminal_artifacts=False,
+                await note_started_storage_helper(
+                    self.redis_service, executor_info.uuid, operation_id
                 )
+                try:
+                    await start_storage_operation(
+                        ssh_client,
+                        executor_info.python_path,
+                        operation_id,
+                        self._restic_restore_operation_spec(payload),
+                        retain_terminal_artifacts=False,
+                    )
+                except Exception:
+                    await forget_storage_helper(
+                        self.redis_service, executor_info.uuid, operation_id
+                    )
+                    raise
                 return
 
             remote_script_path = "/root/app/restore_storage.py"
@@ -1766,6 +1789,9 @@ class MinerService:
             known_hosts=await _storage_known_hosts(docker_service, executor_info, payload),
         ) as ssh_client:
             await cancel_storage_operation(ssh_client, UUID(payload.operation_id))
+            await forget_storage_helper(
+                self.redis_service, executor_info.uuid, payload.operation_id
+            )
 
     @staticmethod
     def _restic_backup_operation_spec(payload: BackupContainerRequest) -> dict[str, object]:
@@ -1846,7 +1872,8 @@ class MinerService:
     async def list_executor_ids(self, miner: bittensor.NeuronInfo) -> list[str] | None:
         """The executor uuids a miner lists for this validator, or None when it does not answer.
 
-        The miner's POST /executors (verify_simple_validator_signature: we sign our own hotkey) is
+        The miner's POST /executors (verify_simple_validator_signature: the signed headers, plus the
+        legacy signature over our own hotkey for miners that predate DAH-6430) is
         a read of its executor table that installs nothing on the nodes, unlike the cycle's
         ssh-pubkey-submit. The express lane asks self-hosted miners, whose new nodes the portal
         snapshot does not list.
@@ -1862,7 +1889,7 @@ class MinerService:
                 method="POST",
                 url=f"http://{miner.axon_info.ip}:{miner.axon_info.port}/executors",
                 json_data=request.model_dump(),
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/json", **self._generate_auth_headers(my_key, miner.hotkey)},
                 timeout=REST_EXECUTOR_LIST_TIMEOUT,
                 log_extra=extra,
                 operation_name="executor list",

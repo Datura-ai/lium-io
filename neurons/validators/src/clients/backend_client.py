@@ -22,6 +22,7 @@ from protocol.vc_protocol.compute_requests import (
     PodRentalActiveResponse,
     PodSshReachabilityResponse,
     RentedExecutor,
+    StorageOperationActiveResponse,
     RentedExecutorsResponse,
     RentedGpuDropResponse,
     RentedPod,
@@ -141,14 +142,6 @@ class BackendClient:
             await cls._session.close()
             cls._session = None
 
-    def _get_signature_headers(self) -> dict[str, str]:
-        timestamp = int(time.time())
-        return {
-            "hotkey": self.keypair.ss58_address,
-            "timestamp": str(timestamp),
-            "signature": f"0x{self.keypair.sign(str(timestamp)).hex()}",
-        }
-
     @staticmethod
     def signed_request_message(method: str, path_with_query: str, body: bytes, timestamp: str) -> str:
         """What the settlement routes verify (backend utils/auth.py validator_signed_message): the method, the path
@@ -256,7 +249,12 @@ class BackendClient:
         context = {"url": url, "method": method}
 
         try:
-            headers = self._get_signature_headers() if add_signature else {}
+            headers = {}
+            if add_signature:
+                # DAH-6169: every signed call signs method, path?query, body hash and timestamp; the bytes signed are sent
+                if raw_body is None and json_data is not None:
+                    raw_body = json.dumps(json_data, separators=(",", ":"), sort_keys=True).encode()
+                headers = self._get_signed_request_headers(method, "/" + path.lstrip("/"), raw_body or b"")
             if extra_headers:
                 headers.update(extra_headers)
 
@@ -539,6 +537,16 @@ class BackendClient:
         if container_missing:
             path += "?container_missing=true"
         return await self._signed_request("GET", path, FillerRunActiveResponse, timeout=10)
+
+    async def get_storage_operation_active(
+        self, operation_id: str
+    ) -> StorageOperationActiveResponse | None:
+        """Whether the backend still has this storage operation open; None when it did not say."""
+        return await self.get(
+            f"/internal/storage-operations/{operation_id}/active",
+            StorageOperationActiveResponse,
+            timeout=10,
+        )
 
     async def check_executor_health(
         self,

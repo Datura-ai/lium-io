@@ -57,6 +57,7 @@ from .checks import (
     GpuThermalThrottleCheck,
     GpuUsageCheck,
     GpuVramPrecheck,
+    GpuModelVerdictCheck,
     HardwareIdentityCheck,
     IdleDiskWriteCheck,
     InspectorRentedCheck,
@@ -419,6 +420,8 @@ class PipelineFactory:
                 RentedPodOwnershipCheck(),
                 # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
                 RentedThroughputCheck(),
+                # DAH-6241: a rented node never reaches the matmul; its stored GPU model verdict judges it
+                GpuModelVerdictCheck(),
                 TenantEnforcementCheck(),
                 # DAH-4663: idle nodes only; resets a leftover clock lock or unlists the node
                 GpuClockLockCheck(),
@@ -554,6 +557,8 @@ class PipelineFactory:
                 RentedPodOwnershipCheck(),
                 # RentedThroughputCheck starts a container beside the renter's pod, so never in the dry run.
                 RentedThroughputCheck(),
+                # DAH-6241: a rented node never reaches the matmul; its stored GPU model verdict judges it
+                GpuModelVerdictCheck(),
                 TenantEnforcementCheck(),
                 # DAH-4663: idle nodes only; resets a leftover clock lock or unlists the node
                 GpuClockLockCheck(),
@@ -671,6 +676,8 @@ class PipelineFactory:
                 ExecutorImageCheck(),
                 # recover_stale_pods=False: dry run still reports a pod as down, but must not rmdir
                 # a stale mountpoint on the host or start a customer's container (DAH-2306).
+                # DAH-6241: a rented node never reaches the matmul; its stored GPU model verdict judges it
+                GpuModelVerdictCheck(),
                 TenantEnforcementCheck(recover_stale_pods=False),
                 # dry_run=True: reports a ghost GPU but runs no pkill + nvidia-smi reset on the
                 # executor and leaves the shared wedge timers the production pipeline relies on.

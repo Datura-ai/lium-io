@@ -702,6 +702,7 @@ def _score_ctx(tdx_quote, attestation_passed, gpu_attestation_passed=None):
         inspector_host_write_passed=True,
         kernel_gpu_view_passed=True,
         gpu_kernel_count_passed=True,
+        gpu_model_passed=True,
         hardware_identity_passed=True,
     )
 
