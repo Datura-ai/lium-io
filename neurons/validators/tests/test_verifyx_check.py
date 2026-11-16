@@ -997,16 +997,19 @@ async def test_an_average_speed_just_under_the_floor_never_shows_as_meeting_it(c
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "standing,stored_ema,expect_skip",
+    "failure_key_prefix,stored_ema,expect_skip",
     [
-        ("rental_probe_failed", True, True),
-        (None, True, False),  # no standing failure: measured as before
-        ("rental_probe_failed", False, False),  # never measured: no EMA to reuse, so it runs
-        ("other_prefix", True, False),
+        ("rental_probe_failed", (500.0, 70.0), True),
+        (None, (500.0, 70.0), False),  # no standing failure: measured as before
+        ("rental_probe_failed", None, False),  # never measured: no EMA to reuse, so it runs
+        ("other_prefix", (500.0, 70.0), False),
+        # a stored EMA under a floor is judged: a skip would pass it the cycle the probe clears
+        ("rental_probe_failed", (80.0, 70.0), False),
+        ("rental_probe_failed", (500.0, 5.0), False),
     ],
 )
-async def test_verifyx_gives_a_standing_rental_probe_failure_the_cycle_time(
-    context_factory, standing, stored_ema, expect_skip
+async def test_verifyx_skips_while_a_standing_rental_probe_failure_fails_the_cycle(
+    context_factory, failure_key_prefix, stored_ema, expect_skip
 ):
     """A standing probe failure fails the cycle and holds the VerifyX sample anyway; skipping VerifyX leaves
     the probe, the only check that clears it, enough cycle time on a slow link."""
@@ -1020,15 +1023,15 @@ async def test_verifyx_gives_a_standing_rental_probe_failure_the_cycle_time(
             executors={},
             banned_guids=[],
             network_ema=(
-                {"executor-123": NetworkEMA(ema_verifyx_download_speed=80.0, ema_verifyx_upload_speed=70.0)}
+                {"executor-123": NetworkEMA(ema_verifyx_download_speed=stored_ema[0], ema_verifyx_upload_speed=stored_ema[1])}
                 if stored_ema
                 else {}
             ),
         ),
     )
     ctx = context_factory(services=services, config=build_context_config(), state=state)
-    if standing:
-        await services.redis.set(f"{standing}:{ctx.executor.uuid}", "container_create:gpu_flags")
+    if failure_key_prefix:
+        await services.redis.set(f"{failure_key_prefix}:{ctx.executor.uuid}", "container_create:gpu_flags")
 
     result = await VerifyXCheck().run(ctx)
 
@@ -1036,4 +1039,4 @@ async def test_verifyx_gives_a_standing_rental_probe_failure_the_cycle_time(
     assert (result.event.reason_code == Msg.STANDING_PROBE_FAILURE_SKIPPED.reason) is expect_skip
     assert (verifyx_service.called_with is None) is expect_skip
     if expect_skip:
-        assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(80.0)
+        assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(500.0)

@@ -231,6 +231,11 @@ class VerifyXCheck:
         if (
             stored_ema
             and stored_ema.ema_verifyx_download_speed is not None
+            and stored_ema.ema_verifyx_download_speed >= MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
+            and (
+                stored_ema.ema_verifyx_upload_speed is None
+                or stored_ema.ema_verifyx_upload_speed >= MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS
+            )
             and await has_standing_failure(ctx)
         ):
             updated_specs = specs_with_last_known_verifyx_ema(ctx)
