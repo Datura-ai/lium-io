@@ -247,7 +247,7 @@ shift_sysbox_layers_back_at_boot() {
 #!/usr/bin/python3 -I
 # Lium (nvidia_docker_sysbox_setup.sh): shift back the writable layer a sysbox pod kept after an unclean stop, the way
 # sysbox's own stop does. Runs at boot before Docker; --dry-run only prints. Setuid bits and file capabilities kept.
-import glob, json, os, stat, sys
+import glob, json, os, re, stat, subprocess, sys
 
 DRY = "--dry-run" in sys.argv
 ROOT = os.environ.get("LIUM_LAYER_RESET_ROOT", "")
@@ -259,6 +259,18 @@ def data_root():
         return ROOT + json.load(open(ROOT + "/etc/docker/daemon.json")).get("data-root", "/var/lib/docker")
     except (OSError, ValueError):
         return ROOT + "/var/lib/docker"
+
+
+def containerd_upper(cid):
+    # Docker 29's containerd image store: the container's snapshot (key = container id, namespace moby) holds the
+    # writable layer; containerd runs before this unit and answers without starting any container
+    try:
+        out = subprocess.run(["ctr", "-n", "moby", "snapshots", "--snapshotter", "overlayfs", "mounts", "/", cid],
+                             capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"upperdir=([^,\s]+)", out)
+    return ROOT + m.group(1) if m else None
 
 
 def docker_running():
@@ -308,18 +320,22 @@ def main():
             continue
         cid = os.path.basename(os.path.dirname(hc))
         try:
-            mount = open(f"{d}/image/overlay2/layerdb/mounts/{cid}/mount-id").read().strip()
+            upper = f"{d}/overlay2/" + open(f"{d}/image/overlay2/layerdb/mounts/{cid}/mount-id").read().strip() + "/diff"
         except OSError:
-            continue  # shortcut: the classic overlay2 store only; the containerd image store keeps layers elsewhere
-        upper = f"{d}/overlay2/{mount}/diff"
-        if not os.path.isdir(upper) or os.lstat(upper).st_uid == 0:
+            upper = containerd_upper(cid)
+        if not upper or not os.path.isdir(upper):
+            print(f"no writable layer found for sysbox container {cid[:12]}", file=sys.stderr, flush=True)
+            continue
+        if os.lstat(upper).st_uid == 0:
             continue
         base = os.lstat(upper).st_uid
         n = 0
         for top, dirs, files in os.walk(upper):
-            n += shift_back(top, base)
+            if top != upper:
+                n += shift_back(top, base)
             for name in files + [x for x in dirs if os.path.islink(os.path.join(top, x))]:
                 n += shift_back(os.path.join(top, name), base)
+        n += shift_back(upper, base)  # last: its owner marks the layer done, so a cut-off run is redone next boot
         print(f"{'would shift' if DRY else 'shifted'} {n} entries of {cid[:12]} back from {base}", flush=True)
 
 
@@ -329,8 +345,8 @@ PY
     cat > "$unit" <<'UNIT' || return 1
 [Unit]
 Description=Lium: shift sysbox pods' layers back after an unclean stop
-After=local-fs.target sysbox.service sysbox-mgr.service
-Before=docker.service containerd.service
+After=local-fs.target sysbox.service sysbox-mgr.service containerd.service
+Before=docker.service
 
 [Service]
 Type=oneshot
