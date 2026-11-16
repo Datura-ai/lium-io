@@ -1661,7 +1661,7 @@ async def test_secure_uses_an_average_taken_over_24_gpu_hours(context_factory):
 
 
 def test_the_spot_line_names_the_pay_factor_the_pool_multiplier_uses() -> None:
-    # lio#2231 r4560801130: the text providers redo the sum with must say 0.9x, not 1x, of the filler earnings
+    # the text providers redo the sum with must say 0.9x, not 1x, of the filler earnings
     class _Result(SimpleNamespace):
         def __getattr__(self, name: str) -> None:  # the fields this test does not read
             return None
