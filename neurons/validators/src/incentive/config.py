@@ -51,11 +51,10 @@ RENTAL_PRICES_PER_HOUR["NVIDIA GB300"] = RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM
 # DAH-6008: `NVIDIA GB200` (Grace Blackwell superchip GPU) is priced like B200 for now, its own base model as GB300 is.
 RENTAL_PRICES_PER_HOUR["NVIDIA GB200"] = RENTAL_PRICES_PER_HOUR["NVIDIA B200"]  # mirrors B200; revisit when GB200 market data exists
 # DAH-5508: memory-modded cards (gpu_spec_table.MODDED_VRAM_MODELS), each its own model and idle tier. Anchor = the
-# backend's MACHINE_PRICES: the base card x the same-chip Quadro RTX 8000/6000 double-memory ratio (0.21/0.13):
-# RTX 4090 0.30 -> 0.48, RTX 4080 / 4080 SUPER 0.16 -> 0.26.
-RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4090 48GB"] = 0.48
-RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4080 32GB"] = 0.26
-RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4080 SUPER 32GB"] = 0.26
+# backend's MACHINE_PRICES, at the base card's rate: a modded card's idle rate is never above its base card's.
+RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4090 48GB"] = 0.30
+RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4080 32GB"] = 0.16
+RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4080 SUPER 32GB"] = 0.16
 
 # Unrented incentive for more GPU types (DAH-4042). Anchors are the backend's MACHINE_PRICES, the listing
 # price renters see; the rows are in lium-core's defaults too, so this override drops on the next lium-core release.
