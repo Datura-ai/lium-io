@@ -1869,6 +1869,13 @@ class VerifyXMessages:
         category="policy",
         impact="Active filler runtime preserved; reused last-known VerifyX EMA when available",
     )
+    STANDING_PROBE_FAILURE_SKIPPED = MessageTemplate(
+        event="VerifyX validation skipped",
+        reason="VERIFYX_SKIPPED_STANDING_PROBE_FAILURE",
+        severity="info",
+        category="policy",
+        impact="Rental probe gets this cycle's time to clear its standing failure; reused last-known VerifyX EMA",
+    )
     NO_SPECS = MessageTemplate(
         event="VerifyX validation skipped (no specs)",
         reason="VERIFYX_NO_SPECS",
@@ -2501,6 +2508,13 @@ class RentalProbeMessages:
         severity="info",
         category="runtime",
         impact="Proceed",
+    )
+    CYCLE_WITHOUT_VERIFYX = MessageTemplate(
+        event="Cycle not passed: VerifyX did not run this cycle",
+        reason="RENTAL_PROBE_CYCLE_WITHOUT_VERIFYX",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0 for this cycle; VerifyX runs next cycle",
     )
     PROBE_FAILED = MessageTemplate(
         event="Rental probe failed: a renter could not use this node",
