@@ -1115,6 +1115,16 @@ class NodeAccountMessages:
         impact="Verification failed; verification cleared",
         remediation="Point the node's hostname at the machine registered under this account, or register the node again.",
     )
+    # DAH-6539: the address leads to a machine set up for another account (or one whose account files cannot be read)
+    BINDING_MISMATCH = MessageTemplate(
+        event="Node at this address is not set up for the account that lists it",
+        reason="NODE_ACCOUNT_MISMATCH",
+        severity="warning",
+        category="policy",
+        impact="Verification failed; verification cleared",
+        remediation="Ensure this address reaches a node configured for this account, update the node if needed, and retry "
+        "verification.",
+    )
 
 
 class StaleContainerCleanupMessages:

@@ -188,6 +188,7 @@ async def test_ip_node_is_refused_on_a_machine_set_up_for_another_account(files,
     assert result.passed is (reason != "NODE_ACCOUNT_MISMATCH")
     if not result.passed:
         assert result.updates == {"clear_verified_job_info": True}
+        assert "hostname" not in result.event.remediation
     assert runner.commands == [
         "printf 'hotkey=%s\\nclaim=%s\\n' \"$(cat /etc/liumd/miner_hotkey 2>/dev/null)\" "
         "\"$(cat /etc/liumd/account_claim 2>/dev/null)\""
