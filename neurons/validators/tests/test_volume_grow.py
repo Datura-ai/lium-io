@@ -664,6 +664,86 @@ def test_a_filler_is_credited_its_backing_allocation_not_its_filesystem_usage(co
     assert specs["split_disk"]["listable_gpu_count"] == 1
 
 
+@pytest.mark.parametrize(
+    ("data_root_gb", "store_gb", "free_published_gb", "listable_gpus"),
+    [
+        # one filesystem: no separate data-root reading, the grow takes from the published free
+        (None, None, 10, 0),
+        # r4583203046: 500 GB free under data-root, 70 in a containerd store apart; the grow leaves 440/70
+        (500, 70, 70, 1),
+        # the store apart is roomy, data-root the limiting one: 100/300, the grow leaves 40/300
+        (100, 300, 40, 0),
+    ],
+)
+def test_a_grow_takes_from_data_root_and_the_tighter_filesystem_is_published(
+    context_factory, data_root_gb, store_gb, free_published_gb, listable_gpus
+):
+    from services.task.checks.disk_space import KB_PER_GB, rental_of_this_node, specs_after_disk_taken, split_disk
+
+    from tests.test_disk_space_check import _split_state
+
+    free_gb = 70 if data_root_gb is None else min(data_root_gb, store_gb)
+    state = _split_state(free_gb, gpu_count=2, gpu_splitting_min_count=1, pods=(1,))
+    state.specs["hard_disk"]["used"] = 30 * KB_PER_GB
+    if data_root_gb is not None:
+        state.specs["hard_disk"]["data_root_free"] = data_root_gb * KB_PER_GB
+    ctx = context_factory(state=state, rented=True)
+    root_now_gb = (70 if data_root_gb is None else data_root_gb) - 60
+
+    specs = specs_after_disk_taken(ctx, 60 * GB, free_now_bytes=root_now_gb * GB, credit_volumes={})
+
+    # None: the scrape's figure and its split sizing stand
+    free_kb = (specs or ctx.state.specs)["hard_disk"]["free"]
+    assert free_kb == free_published_gb * KB_PER_GB
+    assert split_disk(ctx, rental_of_this_node(ctx).pods, free_kb)["listable_gpu_count"] == listable_gpus
+
+
+@pytest.mark.parametrize("family", ["filler_vol", "engy_cache_c", "job_cache_c"])
+@pytest.mark.parametrize(
+    ("cache", "free_now_gb"),
+    [
+        # retained intact: r4583203053, 110 GB raw free plus the 200 GB cache the scrape counted free
+        ("retained", 110),
+        # emptied or removed by the pass: the raw read has its 200 GB already
+        ("emptied", 310),
+        ("removed", 310),
+        # the inventory was unread: nothing is credited, the raw read is all that is known free
+        ("unread", 110),
+    ],
+)
+def test_every_credited_cache_family_keeps_its_credit_after_a_grow(context_factory, family, cache, free_now_gb):
+    from services.task.checks.disk_space import KB_PER_GB, specs_after_disk_taken
+
+    from tests.test_disk_space_check import _split_state
+
+    state = _split_state(370, gpu_count=2, gpu_splitting_min_count=1, pods=(1,))
+    state.specs["hard_disk"]["used"] = 0
+    state.specs["hard_disk"]["filler_released"] = 200 * KB_PER_GB
+    ctx = context_factory(state=state, rented=True)
+    credit = {
+        "retained": {family: 200 * KB_PER_GB},
+        "emptied": {family: 0},
+        "removed": {},
+        "unread": None,
+    }[cache]
+
+    specs = specs_after_disk_taken(ctx, 60 * GB, free_now_bytes=free_now_gb * GB, credit_volumes=credit)
+
+    assert specs["hard_disk"]["free"] == (110 if cache == "unread" else 310) * KB_PER_GB
+
+
+@pytest.mark.asyncio
+async def test_credit_volumes_on_host_lists_and_measures_custom_job_caches():
+    # r4583203053: release_filler_cache credits job_cache_ volumes as it does engy_cache_ ones
+    ssh = MagicMock()
+    stdout = "F 0 filler_vol\nE 5 engy_cache_a\nE 7 job_cache_b\nE 9 old_job_cache_x\n"
+    ssh.run = AsyncMock(return_value=MagicMock(exit_status=0, stdout=stdout))
+
+    assert await credit_volumes_on_host(ssh) == {"filler_vol": 0, "engy_cache_a": 5, "job_cache_b": 7}
+    command = ssh.run.await_args.args[0]
+    assert "--filter name=engy_cache_ --filter name=job_cache_" in command
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("free_reads_gb", "reported_gb", "unreported_gb", "free_after_gb"),

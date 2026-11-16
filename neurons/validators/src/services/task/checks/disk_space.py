@@ -85,6 +85,10 @@ def specs_after_disk_taken(
     free_kb = _as_float(hard_disk.get("free")) if isinstance(hard_disk, dict) else math.nan
     if (taken_bytes == 0 and free_now_bytes is None) or not math.isfinite(free_kb):
         return None
+    # free folds data-root with a containerd store on its own filesystem (DAH-5238); a grow and the raw read are
+    # data-root's alone, so they move its own reading and the published free is the tighter of the two again
+    root_kb = _as_float(hard_disk.get("data_root_free"))
+    root_kb = root_kb if math.isfinite(root_kb) else free_kb
     taken_kb = taken_bytes / 1024
     if free_now_bytes is not None:
         # the scrape counts the filler run volumes and the Engy cache as free (release_filler_cache); a raw read
@@ -99,11 +103,16 @@ def specs_after_disk_taken(
             )
             credit_kb = min(_as_float(hard_disk.get("filler_released")), held_kb)
         cap_kb = free_now_bytes / 1024 + (credit_kb if math.isfinite(credit_kb) else 0)
-        taken_kb = max(taken_kb, free_kb - cap_kb)
+        taken_kb = max(taken_kb, root_kb - cap_kb)
+    root_after_kb = max(root_kb - taken_kb, 0)
+    # the store's own free is the published figure when it was the tighter, at least that when data-root was
+    taken_kb = free_kb - min(root_after_kb, free_kb) if "data_root_free" in hard_disk else taken_kb
     if taken_kb == 0:
         return None
     used_kb = _as_float(hard_disk.get("used"))
     updated = {**hard_disk, "free": max(free_kb - taken_kb, 0)}
+    if "data_root_free" in hard_disk:
+        updated["data_root_free"] = root_after_kb
     if math.isfinite(used_kb) and used_kb + free_kb > 0:
         used_after = min(max(used_kb + taken_kb, 0), used_kb + free_kb)
         updated["free"] = used_kb + free_kb - used_after
