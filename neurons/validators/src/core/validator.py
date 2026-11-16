@@ -459,6 +459,13 @@ class Validator:
                     )
                     return
 
+                # A fresh job-files directory for this cycle; the ones an express verification
+                # still reads are kept (DAH-2958). The express lane uses the new one from here on.
+                # Built before the cycle and the rollout window count: a failed build (obfuscator exit) retries next tick.
+                encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files(
+                    keep_directories=self.express_lane.directories_in_use()
+                )
+
                 # DAH-3405: a push between two cycles opens the grace window here, after the last
                 # early return and before the first job of this cycle runs against the new digest,
                 # so an aborted iteration does not count as a cycle of the window.
@@ -478,17 +485,20 @@ class Validator:
                     ),
                 )
 
-                # A fresh job-files directory for this cycle; the ones an express verification
-                # still reads are kept (DAH-2958). The express lane uses the new one from here on.
-                # Built before the cycle counts: a failed build (obfuscator exit) retries next tick.
-                encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files(
-                    keep_directories=self.express_lane.directories_in_use()
-                )
                 self.last_job_run_blocks = current_block
                 if cycle_asked_for_now:
                     # Cleared here and not at the read: every return above this line means no
                     # cycle started, and the operator's request must survive to the next tick.
-                    await self.redis_service.clear_forced_validation_cycle_request()
+                    try:
+                        await self.redis_service.clear_forced_validation_cycle_request()
+                    except Exception as exc:
+                        # the cycle has started and its job files are built; a lost clear only means one more forced cycle
+                        logger.error(
+                            _m(
+                                "[sync] Failed to clear the forced validation cycle request",
+                                extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                            ),
+                        )
 
                 first_cycle = self.first_cycle_started_at is None
                 if first_cycle:
