@@ -3,11 +3,14 @@
 The validator uploads a fresh keypair per job and removes it afterwards; a key that is still in the
 executor's authorized_keys after EXECUTOR_UPLOADED_KEY_TTL_S is a leak (I-78: keys planted through a
 validator-hotkey-signed upload stayed for months). The executor now appends every upload with a marker
-carrying the upload time and purges marked lines past the TTL. Everything else in the file — a template's
-key, a key the provider added by hand, comments, blank lines — the purge never touches (the one-time
-startup stamp of lines the previous release wrote is test_legacy_uploaded_key_stamp.py).
+carrying the upload time and purges marked lines past the TTL. A key line without the marker was written
+past that route and is dropped too; comments and blank lines the purge never touches (the one-time startup
+stamp of lines the previous release wrote is test_legacy_uploaded_key_stamp.py).
 """
 
+import base64
+import hashlib
+import logging
 import time
 
 import pytest
@@ -47,21 +50,38 @@ def authorized_keys(tmp_path, monkeypatch):
     return path
 
 
-def test_purge_keeps_every_unmarked_line_byte_for_byte(authorized_keys):
-    # regression: the purge re-serialises the file (strip(), split/join, dropped comments or
-    # blank lines) and a renter's or template's key is altered or lost with the stale one
+def test_purge_keeps_comments_and_blank_lines_byte_for_byte(authorized_keys):
+    # regression: the purge re-serialises the file (strip(), split/join) and a comment or blank line is
+    # altered or lost with the keys it drops
     stale = _marked("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIStaleValidatorJobKey", NOW - 2 * TTL)
-    untouchable = (RENTER_KEY + COMMENT + "\n").encode() + FOREIGN_BYTES + (TEMPLATE_KEY + ODDLY_SPACED).encode()
+    fresh = _marked("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFreshValidatorJobKey", NOW - 5)
+    untouchable = (COMMENT + "\n").encode() + b"# Jos\xe9's key\n" + fresh.encode()
     authorized_keys.write_bytes(
-        (RENTER_KEY + COMMENT + stale + "\n").encode() + FOREIGN_BYTES + (TEMPLATE_KEY + ODDLY_SPACED).encode()
+        (RENTER_KEY + COMMENT + stale + "\n").encode() + FOREIGN_BYTES + (TEMPLATE_KEY + ODDLY_SPACED + fresh).encode()
     )
     before_mode = authorized_keys.stat().st_mode
 
     removed = purge_expired_uploaded_keys(TTL, now=NOW)
 
-    assert removed == 1
+    assert removed == 5  # the stale upload and the four unmarked key lines
     assert authorized_keys.read_bytes() == untouchable
     assert authorized_keys.stat().st_mode == before_mode
+
+
+def test_an_unmarked_key_is_dropped_and_logged_by_fingerprint_only(authorized_keys, caplog):
+    # a key written into the file past /upload_ssh_key carries no marker and so never expired
+    blob = b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20" + bytes(range(32))
+    body = base64.b64encode(blob).decode()
+    authorized_keys.write_text(f"ssh-ed25519 {body} someone@host\n")
+    fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+
+    with caplog.at_level(logging.WARNING, logger=ssh_service.logger.name):
+        removed = purge_expired_uploaded_keys(TTL, now=NOW)
+
+    assert removed == 1
+    assert authorized_keys.read_text() == ""
+    assert f"removed 1 unmarked ssh key line(s): {fingerprint}" in caplog.text
+    assert body not in caplog.text
 
 
 # --- through the real writer -----------------------------------------------------------------------
@@ -91,8 +111,9 @@ def test_an_upload_onto_a_file_without_a_trailing_newline_does_not_merge_with_th
     SSHService().add_pubkey_to_host(key)
     assert authorized_keys.read_text().startswith(RENTER_KEY + key + " ")
 
-    assert purge_expired_uploaded_keys(TTL, now=time.time() + TTL + 5) == 1
-    assert authorized_keys.read_text() == RENTER_KEY
+    # two lines, not one merged marked line; the unmarked provider key goes with the expired upload
+    assert purge_expired_uploaded_keys(TTL, now=time.time() + TTL + 5) == 2
+    assert authorized_keys.read_text() == ""
 
 
 
