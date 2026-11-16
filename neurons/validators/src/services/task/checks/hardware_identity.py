@@ -141,8 +141,11 @@ def dmi_identity_drifted(previous: dict | None, gpus: list[str], dmi_identity: s
     A trusted boot id never seen on this node excuses the change (a hypervisor may assign a new product_uuid on a
     restart). A boot id already in the history does not, so two machines alternating behind one node are flagged
     on the return. The history always holds the previous boot id, so "not in it" also means "differs from it".
+    With no history to compare against, nothing is excused.
     """
-    restarted = bool(boot_id and boot_id not in boot_history(previous))
+    # a record with no boot history (written before it existed) keeps the old rule: the change is flagged
+    history = boot_history(previous)
+    restarted = bool(boot_id and history and boot_id not in history)
     return bool(
         previous
         and dmi_identity

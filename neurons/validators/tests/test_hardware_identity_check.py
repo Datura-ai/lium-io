@@ -207,6 +207,14 @@ async def test_an_existing_records_boot_id_seeds_the_history(context_factory, re
 
 
 @pytest.mark.asyncio
+async def test_a_record_without_boot_history_keeps_flagging_a_dmi_change(context_factory, redis):
+    key = f"{HW_ID_KEY_PREFIX}:{default_executor().uuid}"
+    await redis.set(key, json.dumps({"gpus": ["GPU-a"], "dmi": A}))
+    assert await _seen(context_factory, redis, B, B2) is False
+    assert json.loads(await redis.get(key))["boots"] == [B2]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("boot", ["", "not-a-boot-id", B2.upper()])
 async def test_a_missing_or_invalid_boot_id_excuses_nothing(context_factory, redis, boot):
     assert await _seen(context_factory, redis, A, B1)
