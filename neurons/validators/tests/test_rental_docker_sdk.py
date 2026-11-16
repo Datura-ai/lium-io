@@ -1851,3 +1851,23 @@ def test_authorized_keys_remove_drops_only_the_listed_keys(tmp_path):
 
     assert completed.returncode == 0, completed.stderr
     assert target.read_text() == "k2\n"
+
+
+def test_authorized_keys_remove_without_flock_refuses_and_leaves_the_file(tmp_path):
+    # DAH-6441: an unlocked remove's delayed write-back could restore a key a later remove revoked
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("k1\nk2\n")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for tool in ("sh", "mkdir"):
+        (bin_dir / tool).symlink_to(shutil.which(tool))
+
+    completed = _run_key_append(
+        build_remove_authorized_keys_exec_spec(container_name="pod_key", public_keys=["k1"], target_path=str(target)),
+        env={"PATH": str(bin_dir)},
+    )
+
+    assert completed.returncode == 1
+    assert "flock not available" in completed.stderr
+    assert target.read_text() == "k1\nk2\n"

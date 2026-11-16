@@ -1529,12 +1529,14 @@ AUTHORIZED_KEYS_APPEND_DEADLINE_SECONDS = 60
 AUTHORIZED_KEYS_LOCK_WAIT_SECONDS = 30
 
 
-def _authorized_keys_lock(quoted_dir: str, busy_exit: int) -> str:
+def _authorized_keys_lock(quoted_dir: str, busy_exit: int, required: bool = False) -> str:
     """Serializes the add and the remove on one lock file, so a remove's read-filter-write never drops a key an add
-    appended in between. An image without flock runs unlocked, as before."""
+    appended in between. Without flock an add appends unlocked as before; a remove refuses, since a delayed unlocked
+    write-back could restore a key a later remove revoked."""
+    no_flock = f"else echo 'flock not available' >&2; exit {busy_exit}; " if required else ""
     return (
         f"if command -v flock >/dev/null 2>&1; then exec 9>>{quoted_dir}/.authorized_keys.lock && "
-        f"flock -w {AUTHORIZED_KEYS_LOCK_WAIT_SECONDS} 9 || exit {busy_exit}; fi; "
+        f"flock -w {AUTHORIZED_KEYS_LOCK_WAIT_SECONDS} 9 || exit {busy_exit}; {no_flock}fi; "
     )
 
 
@@ -1589,7 +1591,7 @@ def build_remove_authorized_keys_exec_spec(
     script = (
         "set -e; "
         f"mkdir -p {quoted_dir}; "
-        + _authorized_keys_lock(quoted_dir, 1)
+        + _authorized_keys_lock(quoted_dir, 1, required=True)
         + f"touch {quoted_path} && "
         "keys=$(mktemp) && filtered=$(mktemp) && "
         "trap 'rm -f \"$keys\" \"$filtered\"' EXIT && "
