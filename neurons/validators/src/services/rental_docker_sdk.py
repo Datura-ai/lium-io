@@ -1539,13 +1539,14 @@ def build_authorized_keys_exec_spec(
     quoted_dir = shlex.quote(target_path.rsplit("/", 1)[0])
     # DAH-6441: the keys are read whole first and appended only within the deadline of this exec's own start, so an
     # add whose connection stalled can never append later, after the backend has confirmed a removal of that key.
-    # Shell builtins only (read, printf, test) beside the cat/mkdir/chmod the add always needed: the clock is
-    # /proc/uptime, so images without date or mktemp still take keys.
+    # Shell builtins (printf, test) beside the cat/mkdir/chmod the add always needed: the clock is /proc/uptime, so
+    # images without date or mktemp still take keys. Read whole with cat: in a Sysbox pod it is a FUSE file that
+    # fails the shell's byte-wise `read`.
     script = (
-        "read start _ < /proc/uptime || exit 1; "
+        "start=$(cat /proc/uptime) || exit 1; "
         f"mkdir -p {quoted_dir} && chmod 700 {quoted_dir} && keys=$(cat) || exit 1; "
-        "read now _ < /proc/uptime || exit 1; "
-        f'if [ $(( ${{now%.*}} - ${{start%.*}} )) -gt {append_deadline_seconds} ]; then '
+        "now=$(cat /proc/uptime) || exit 1; "
+        f'if [ $(( ${{now%%.*}} - ${{start%%.*}} )) -gt {append_deadline_seconds} ]; then '
         'echo "authorized_keys append deadline passed" >&2; exit 75; fi; '
         f'printf "%s\\n" "$keys" >> {shlex.quote(target_path)}'
     )

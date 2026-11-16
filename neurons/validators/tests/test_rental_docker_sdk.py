@@ -1789,6 +1789,20 @@ def test_authorized_keys_append_needs_no_date_or_mktemp_in_the_image(tmp_path):
     assert "date" not in spec.argv[2] and "mktemp" not in spec.argv[2]
 
 
+def test_authorized_keys_append_reads_the_clock_whole_as_sysboxfs_needs(tmp_path):
+    # DAH-6441: in a Sysbox pod /proc/uptime fails the shell's byte-wise `read` (rc 1, empty) but a whole read works;
+    # a `read` that always fails stands in for it, so the clock must come from cat alone
+    target = tmp_path / "ssh" / "authorized_keys"
+    spec = build_authorized_keys_exec_spec(container_name="pod_key", public_keys=["k1"], target_path=str(target))
+
+    completed = subprocess.run(
+        ["sh", "-c", "read() { return 1; }; " + spec.argv[2]], input=spec.stdin, capture_output=True, text=True
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == "k1\n"
+
+
 @pytest.mark.skipif(shutil.which("busybox") is None, reason="busybox not installed")
 def test_authorized_keys_append_runs_under_busybox_ash(tmp_path):
     target = tmp_path / "ssh" / "authorized_keys"
