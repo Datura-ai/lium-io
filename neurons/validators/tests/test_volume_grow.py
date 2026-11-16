@@ -821,6 +821,56 @@ async def test_the_cleanup_pass_judges_the_disk_it_measured_around_the_grow(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("hard_disk_gb", "credit", "free_reads_gb", "reported_gb", "unreported_gb", "free_after_gb"),
+    [
+        # r4585421107: 300 scraped, renters wrote 200 before the pass, a 20->100 resize timed out after 20: the
+        # raw read sees 80, but the resize may still take its order, so nothing is left to publish
+        ({"free": 300, "used": 0}, None, (100, 80), 0, 100, 0),
+        # the same with writes before the pass and a grow that reported: the read after it stands
+        ({"free": 300, "used": 0}, None, (100, 80), 20, 0, 80),
+        # data-root on its own filesystem, the store apart roomy: data-root's read is the cap
+        ({"free": 300, "used": 0, "data_root_free": 300}, None, (100, 80), 0, 100, 0),
+        # 50 of the scraped free is a retained cache the raw read does not count: credited on top of the cap
+        ({"free": 300, "used": 0, "filler_released": 50, "by_volume": {"engy_cache_a": 50}}, {"engy_cache_a": None},
+         (50, 30), 0, 20, 60),
+    ],
+)
+async def test_an_unreported_grow_keeps_its_reservation_under_the_raw_read(
+    monkeypatch, hard_disk_gb, credit, free_reads_gb, reported_gb, unreported_gb, free_after_gb
+):
+    from dataclasses import replace
+
+    from services.task.checks import stale_container_cleanup as module
+    from services.task.checks.disk_space import KB_PER_GB
+
+    from tests.test_container_cleanup import _cleanup_check_ctx
+
+    monkeypatch.setattr(module, "pod_ids_at_endpoint", lambda *_: {"live"})
+    monkeypatch.setattr(module, "host_free_bytes", AsyncMock(side_effect=[gb * GB for gb in free_reads_gb]))
+    monkeypatch.setattr(module, "credit_volumes_on_host", AsyncMock(return_value=credit))
+    monkeypatch.setattr(
+        module,
+        "grow_short_volumes",
+        AsyncMock(
+            return_value=GrowPass(
+                allocated_bytes=reported_gb * GB, attempted=True, unreported_bytes=unreported_gb * GB
+            )
+        ),
+    )
+    hard_disk = {
+        k: ({n: kb * KB_PER_GB for n, kb in v.items()} if isinstance(v, dict) else v * KB_PER_GB)
+        for k, v in hard_disk_gb.items()
+    }
+    ctx = _cleanup_check_ctx([], [])
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, specs={"hard_disk": hard_disk})})
+
+    result = await module.StaleContainerCleanupCheck().run(ctx)
+
+    assert result.updates["state"].specs["hard_disk"]["free"] == free_after_gb * KB_PER_GB
+
+
+@pytest.mark.asyncio
 async def test_a_grow_that_finished_keeps_its_sizes_when_the_reclaim_after_it_hangs_past_the_budget(monkeypatch):
     from dataclasses import replace
 

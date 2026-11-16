@@ -315,14 +315,15 @@ class StaleContainerCleanupCheck:
         )
         measured = free_before - free_after if free_after is not None else grown.allocated_bytes
         taken = measured + grown.unreported_bytes
-        # free_after also caps it: what the renters wrote since the scrape is in that read, not in the delta.
+        # free_after also caps it: what the renters wrote since the scrape is in that read, not in the delta; an
+        # unreported grow may still allocate after it, so its order comes off the cap too.
         # No read after a grow: the scrape can't bound what was written since, so publish no free disk this cycle
         # (the next scrape restores it) rather than a figure that may sit above the floor when the disk does not
         specs_after_grow = (
             specs_after_disk_taken(
                 ctx,
                 taken,
-                free_after if free_after is not None else 0,
+                free_after - grown.unreported_bytes if free_after is not None else 0,
                 credit_volumes=credit_volumes,
             )
             if grown.attempted
