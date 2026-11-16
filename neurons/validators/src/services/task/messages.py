@@ -418,10 +418,11 @@ class GpuThermalThrottleMessages:
         severity="warning",
         category="env",
         impact="Proceed; score not changed (observation only)",
-        remediation="A busy GPU is held far below its clock by a thermal or hardware slowdown (see gpus[]: "
-        "temperature_c, graphics_clock_mhz, max_graphics_clock_mhz, reasons). Check `nvidia-smi -q -d "
-        "PERFORMANCE,TEMPERATURE`, the fans, airflow and the datacenter cooling; the renter is getting a "
-        "fraction of the card's speed.",
+        remediation="A busy GPU is held far below its clock by a thermal or hardware slowdown, or by a power cap "
+        "while its power limit is at the default (see gpus[]: temperature_c, graphics_clock_mhz, "
+        "max_graphics_clock_mhz, clocks_event_reasons, reasons). Check `nvidia-smi -q -d "
+        "PERFORMANCE,TEMPERATURE,POWER`, the fans, airflow, the power supply and the datacenter cooling; the "
+        "renter is getting a fraction of the card's speed.",
     )
     COLLAPSED = MessageTemplate(
         event="GPU clock collapsed by thermal throttling",
@@ -1868,6 +1869,13 @@ class VerifyXMessages:
         category="policy",
         impact="Active filler runtime preserved; reused last-known VerifyX EMA when available",
     )
+    STANDING_PROBE_FAILURE_SKIPPED = MessageTemplate(
+        event="VerifyX validation skipped",
+        reason="VERIFYX_SKIPPED_STANDING_PROBE_FAILURE",
+        severity="info",
+        category="policy",
+        impact="Rental probe gets this cycle's time to clear its standing failure; reused last-known VerifyX EMA",
+    )
     NO_SPECS = MessageTemplate(
         event="VerifyX validation skipped (no specs)",
         reason="VERIFYX_NO_SPECS",
@@ -2501,6 +2509,13 @@ class RentalProbeMessages:
         category="runtime",
         impact="Proceed",
     )
+    CYCLE_WITHOUT_VERIFYX = MessageTemplate(
+        event="Cycle not passed: VerifyX did not run this cycle",
+        reason="RENTAL_PROBE_CYCLE_WITHOUT_VERIFYX",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0 for this cycle; VerifyX runs next cycle",
+    )
     PROBE_FAILED = MessageTemplate(
         event="Rental probe failed: a renter could not use this node",
         reason="RENTAL_PROBE_FAILED",
@@ -2545,6 +2560,36 @@ class CpuTruthMessages:
         severity="info",
         category="env",
         impact="Proceed without penalty",
+    )
+
+
+class SpecFloorMessages:
+    """Scraped specs below the hardware floor no real GPU host is under. REJECTED fails the validation."""
+
+    OK = MessageTemplate(
+        event="Hardware specs above the floor",
+        reason="SPEC_FLOOR_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    REJECTED = MessageTemplate(
+        event="Hardware specs below the floor",
+        reason="SPEC_FLOOR_REJECTED",
+        severity="error",
+        category="env",
+        impact="Validation fails; under a live rental the score is set to 0",
+        remediation=(
+            "Report the machine's real specs: at least one CPU core, 4 GB of RAM per GPU, one card per "
+            "counted GPU, and each card's own GPU UUID."
+        ),
+    )
+    WARNING = MessageTemplate(
+        event="Hardware specs below the floor",
+        reason="SPEC_FLOOR_REJECTED",
+        severity="warning",
+        category="env",
+        impact="Warning only: score unchanged",
     )
 
 
@@ -2893,10 +2938,9 @@ class RentedPodOwnershipMessages:
         category="runtime",
         impact="Proceed; incorrect ownership can break package installation, root login, or sudo until repaired",
         remediation="The host stopped without a clean shutdown and the pod was restarted with a new "
-        "user-namespace range, so its files now belong to nobody inside it. Tell the renter, and shift "
-        "the ownership of the pod's root filesystem into its current uid_map/gid_map on the host "
-        "(only ids inside the old range; keep setuid bits and file capabilities). Shut the host down "
-        "cleanly to avoid this.",
+        "user-namespace range, so its files now belong to nobody inside it. A restart does not repair it. "
+        "Contact support: the renter is moved to a fresh pod free of charge. Do not change file ownership "
+        "on the host yourself, and shut the host down cleanly to avoid this.",
     )
     SHIFTED_AFTER_CONTAINER_RESTART = MessageTemplate(
         event="Rented pod files are owned outside its user namespace",
@@ -2906,9 +2950,8 @@ class RentedPodOwnershipMessages:
         impact="Proceed; incorrect ownership can break package installation, root login, or sudo until repaired",
         remediation="The pod's container was restarted while the host kept running (not a host reboot), and "
         "it came back with a user-namespace range its files are not in, so they belong to nobody inside it. "
-        "Tell the renter, and shift the ownership of the pod's root filesystem into its current "
-        "uid_map/gid_map on the host (only ids outside the current range; keep setuid bits and file "
-        "capabilities). Do not restart a rented pod's container yourself; ask support first.",
+        "A restart does not repair it. Contact support: the renter is moved to a fresh pod free of charge. "
+        "Do not change file ownership on the host or restart a rented pod's container yourself.",
     )
     SHIFTED_MIXED = MessageTemplate(
         event="Rented pod files are owned outside its user namespace",
@@ -2918,10 +2961,9 @@ class RentedPodOwnershipMessages:
         impact="Proceed; incorrect ownership can break package installation, root login, or sudo until repaired",
         remediation="The shifted pods do not share one cause: a pod whose started_after_boot_s is 600 or more "
         "had its container restarted while the host kept running; one started right after boot came back "
-        "after the host stopped without a clean shutdown. Tell the renters, and shift the ownership of each "
-        "pod's root filesystem into its current uid_map/gid_map on the host (only ids outside the current "
-        "range; keep setuid bits and file capabilities). Do not restart a rented pod's container yourself; "
-        "ask support first, and shut the host down cleanly.",
+        "after the host stopped without a clean shutdown. A restart does not repair it. Contact support: the "
+        "renters are moved to fresh pods free of charge. Do not change file ownership on the host or restart "
+        "a rented pod's container yourself, and shut the host down cleanly.",
     )
     UNREAD = MessageTemplate(
         event="Rented pod file ownership not read",

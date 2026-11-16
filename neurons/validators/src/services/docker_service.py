@@ -107,7 +107,11 @@ from services.const import (
     POD_CONTAINER_PREFIX,
     PREFERRED_POD_PORTS,
 )
-from services.container_cleanup import REMOVE_CACHE_SWEEP_CONTAINER, evict_cache_volumes_oldest_first
+from services.container_cleanup import (
+    REMOVE_CACHE_SWEEP_CONTAINER,
+    evict_cache_volumes_oldest_first,
+    idle_filler_images_size_command,
+)
 from services.cvm_quote_broker import ensure_quote_broker, quote_socket_pod_mount
 from services.node_host import node_owner, public_host_sock
 from services.default_docker_image_digest_service import fetch_docker_hub_digest
@@ -223,6 +227,7 @@ from services.rental_docker_sdk import (
     is_rental_docker_transport_drop,
     build_environment_exec_spec,
     build_remove_authorized_keys_exec_spec,
+    pull_progress_text,
     rental_docker_error_class,
     require_rental_docker_ssh_host_key,
 )
@@ -574,6 +579,8 @@ RENTAL_DISK_SHORT_STEP = "rental_disk_short"
 # DAH-5260: `docker volume rm` of the 1561 GB kimi-k3 cache unlinks ~1.5 TB; ext4 frees ~180 GB/s of
 # extents (22 GB in 0.12 s measured), so ~10 s. The bound only stops a wedged dockerd holding the create.
 CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS = 600
+# the helper's `du` has `timeout 60`; this bounds the whole size read, `docker rm -f` included
+CACHE_SIZE_READ_TIMEOUT_SECONDS = 90
 # Floor for a rental container's pids.max when it is clamped to a low host kernel.pid_max: a value
 # of 0 or below would read as "unlimited" to Docker, so never emit one.
 _MIN_RENTAL_PIDS_LIMIT = 512
@@ -6330,6 +6337,47 @@ class DockerService:
             rental_needs_free_gb = fit.needs_free_gb
             if free_gb >= rental_needs_free_gb:
                 return False
+            # DAH-6481: the listing floor is write room, not the renter's volume. The listing never counts the
+            # Dolphin cache as free, so the volume never needs it gone: a Dolphin cache goes only while the volume
+            # itself does not fit with the cache's free margin beside it (the container must start on a disk that is
+            # not full); the tight-disk sweep evicts it later if the pod's writes need the room. The Engy cache is
+            # listed as free disk, so it still gives way until the floor fits too.
+            volume_needs_free_gb = rental_needs_free_gb - DPHN_CACHE_LISTING_FLOOR_GB + DPHN_CACHE_FREE_MARGIN_GB
+            engy_volumes: set[str] = {name for name in cache_volumes if name.startswith(ENGY_CACHE_VOLUME_PREFIX)}
+            if not engy_volumes and free_gb >= volume_needs_free_gb:
+                logger.info(
+                    _m(
+                        "Keeping the Dolphin cache: the customer rental's volume fits beside it",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "volumes": cache_volumes,
+                            "free_gb": round(free_gb, 1),
+                            "volume_needs_free_gb": round(volume_needs_free_gb, 1),
+                        }),
+                    )
+                )
+                return False
+
+            # Rustam (lio#2272): a rental short by more than every cache holds never fits by deleting them, so a
+            # cold start would buy nothing (230 of 281 prod reclaims dropped ~33 GB for a volume ~1 TB short).
+            # Unmeasurable caches are removed as before.
+            # the eviction removes the idle filler images first, so they count as freeable too (lio#2272 review);
+            # the volume alone is the test: the free margin is for a kept cache, and none would be kept
+            caches_gb = await self._cache_volumes_held_gb(ssh_client, cache_volumes, payload.docker_image)
+            if caches_gb is not None and free_gb + caches_gb < volume_needs_free_gb - DPHN_CACHE_FREE_MARGIN_GB:
+                logger.info(
+                    _m(
+                        "Keeping the filler caches: removing them and the idle filler images cannot free enough for the customer rental",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "volumes": cache_volumes,
+                            "free_gb": round(free_gb, 1),
+                            "caches_gb": round(caches_gb, 1),
+                            "volume_needs_free_gb": round(volume_needs_free_gb, 1),
+                        }),
+                    )
+                )
+                return False
 
             logger.info(
                 _m(
@@ -6359,8 +6407,22 @@ class DockerService:
                 # the one free-disk reading both the fit and the clamp use, so they never disagree (lio#2219 review)
                 return await self._get_fs_available_bytes(ssh_client, docker_root_dir) / (1024**3)
 
+            async def engy_gone() -> bool:
+                # `volume rm ... || true` exits 0 either way: an Engy cache is gone only once docker no longer lists it
+                # (or the wipe emptied it), so a failed removal never lets the Dolphin cache stay (lio#2272 review)
+                try:
+                    listed = await ssh_client.run('/usr/bin/docker volume ls --format "{{.Name}}"')
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    return False
+                return listed.exit_status == 0 and not (set((listed.stdout or "").split()) & engy_volumes) - emptied
+
             async def rental_fits() -> bool:
-                return await free_now_gb() >= rental_needs_free_gb
+                free_now = await free_now_gb()
+                if free_now >= rental_needs_free_gb:
+                    return True
+                return free_now >= volume_needs_free_gb and (not engy_volumes or await engy_gone())
 
             killed: tuple[str, ...] = tuple(killed_fillers)
 
@@ -6405,7 +6467,7 @@ class DockerService:
             # Still short after every removal worked: the cache was not what was missing, so the size stays as ordered.
             # read once: the fit and the clamp must size on the same reading (lio#2219 review)
             free_after_reclaim_gb = await free_now_gb()
-            if not payload.local_volume and free_after_reclaim_gb < rental_needs_free_gb:
+            if not payload.local_volume and free_after_reclaim_gb < volume_needs_free_gb:
                 if not removal_failed:
                     # a listing that fails cannot show the removals worked, so it counts as a failed removal
                     try:
@@ -6554,6 +6616,38 @@ class DockerService:
             )
             return present
         return list(payload.cache_volumes)
+
+    async def _cache_volumes_held_gb(
+        self, ssh_client: asyncssh.SSHClientConnection, volume_names: list[str], keep_image: str | None = None
+    ) -> float | None:
+        """GB the cache volumes (one `du` in a helper container) and the idle filler images hold together; None when
+        it cannot be read."""
+        mounts = " ".join(f"-v {shlex.quote(name)}:/cache/{index}:ro" for index, name in enumerate(volume_names))
+        paths = " ".join(f"/cache/{index}" for index in range(len(volume_names)))
+        try:
+            # only `docker run` has its own timeout: a hung `docker rm -f` must not stall the create either
+            volumes, images = await asyncio.wait_for(
+                asyncio.gather(
+                    ssh_client.run(
+                        f"{REMOVE_CACHE_SWEEP_CONTAINER}; timeout 60 /usr/bin/docker run --rm "
+                        f"--name {CACHE_SWEEP_CONTAINER_NAME} {mounts} {ALPINE_HELPER_IMAGE} du -sk {paths}; "
+                        f"{REMOVE_CACHE_SWEEP_CONTAINER}"
+                    ),
+                    ssh_client.run(idle_filler_images_size_command(keep_image)),
+                ),
+                CACHE_SIZE_READ_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return None
+        sizes_kb = [line.split()[0] for line in (volumes.stdout or "").splitlines() if line.strip()]
+        if len(sizes_kb) != len(volume_names) or not all(kb.isdigit() for kb in sizes_kb):
+            return None
+        image_bytes = [line.strip() for line in (images.stdout or "").splitlines() if line.strip()]
+        if images.exit_status != 0 or not all(size.isdigit() for size in image_bytes):
+            return None
+        return (sum(int(kb) for kb in sizes_kb) * 1024 + sum(int(size) for size in image_bytes)) / 1024**3
 
     async def _cache_missing_gb(
         self, ssh_client: asyncssh.SSHClientConnection, volume_name: str, default_extra: dict
@@ -9305,20 +9399,26 @@ class DockerService:
                 f"/usr/bin/docker exec {shlex.quote(dind_name)} "
                 f"docker save {shlex.quote(image_tag)} | /usr/bin/docker load"
             )
-            ok, err = await self._unless_cancelled_by_delete(
-                ssh_client,
-                payload,
-                default_extra,
-                self.execute_and_stream_logs(
-                    ssh_client=ssh_client,
-                    command=export_cmd,
-                    log_tag=log_tag,
-                    log_text=f"Exporting custom image {image_tag}",
-                    log_extra={**default_extra, "build_image_tag": image_tag, "image_size_bytes": size_bytes},
-                    timeout=export_timeout_s,
-                    raise_exception=False,
-                ),
+            export_reporter = asyncio.ensure_future(
+                self._report_export_progress(image_tag, size_bytes, log_tag)
             )
+            try:
+                ok, err = await self._unless_cancelled_by_delete(
+                    ssh_client,
+                    payload,
+                    default_extra,
+                    self.execute_and_stream_logs(
+                        ssh_client=ssh_client,
+                        command=export_cmd,
+                        log_tag=log_tag,
+                        log_text=f"Exporting custom image {image_tag}",
+                        log_extra={**default_extra, "build_image_tag": image_tag, "image_size_bytes": size_bytes},
+                        timeout=export_timeout_s,
+                        raise_exception=False,
+                    ),
+                )
+            finally:
+                export_reporter.cancel()
             if not ok:
                 if stream_timed_out(err):
                     return CustomBuildOutcome(False, "build_timeout", f"image export exceeded {export_timeout_s} s")
@@ -10490,6 +10590,9 @@ class DockerService:
                             "success",
                             log_tag,
                         )
+                        progress_reporter = asyncio.ensure_future(
+                            self._report_pull_progress(docker_client, payload.docker_image, log_tag)
+                        )
                         try:
                             await self._unless_cancelled_by_delete(
                                 ssh_client,
@@ -10517,6 +10620,8 @@ class DockerService:
                                 f"Docker login failed: {login_error} (pull without login then failed: {exc})",
                                 login_error,
                             ) from exc
+                        finally:
+                            progress_reporter.cancel()
 
                         # Add profiler for docker pull
                         profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_PULL, prev_timestamp))
@@ -11880,6 +11985,10 @@ class DockerService:
                 )
                 return container_created_reply
         except Exception as e:
+            # DAH-6410: a step that ends in an error after this pod's delete flagged the create (a node flatten
+            # wait runs for minutes) is the renter's cancel too, not the step's, the node's or the provider's failure
+            if not isinstance(e, _CreateCancelledByDelete) and inflight_creates.is_cancelled(payload.pod_id):
+                e = _CreateCancelledByDelete(f"delete for pod {payload.pod_id} arrived during {current_step}: {e}")
             if isinstance(e, _CreateCancelledByDelete):
                 current_step = "cancelled_by_delete"
             elif isinstance(e, _FillerRefusedForCustomerCreate):
@@ -12081,9 +12190,9 @@ class DockerService:
                 f"executor does not support bootstrap restore engine {restore.backup_engine}"
             )
         operation_id = UUID(restore.restore_log_id)
-        # The spec is SFTP'd into the executor container — a file on the provider's disk — so
-        # it carries what the executor needs to reach the data and nothing that unlocks it.
-        # `encrypted_running` restores through the pod's live gocryptfs mount; the passphrase
+        # The spec is SFTP'd into the executor container (mode 0600) and carries the repository
+        # credentials and password; once read, the runner leaves only the progress reporter in it (DAH-6463).
+        # `encrypted_running` restores through the pod's live gocryptfs mount; the volume passphrase
         # never appears here (DAH-3274 — the former `encrypted_bootstrap` mode put it in the
         # helper's `docker run -e`, i.e. in `docker inspect` for the life of the pod).
         workspace: dict[str, object] = {
@@ -12175,6 +12284,31 @@ class DockerService:
             local_volume_path,
         ]
         await ssh_client.run(shlex.join(command), check=True)
+
+    async def _report_pull_progress(self, docker_client, image: str, log_tag: str, every: float = 15) -> None:
+        """DAH-6025: a big pull showed one 'Pulling' line for minutes, and renters cancelled pods that were
+        still downloading. Tell them how far it has got every `every` seconds until the pull ends."""
+        last = None
+        while True:
+            await asyncio.sleep(every)
+            text = pull_progress_text(getattr(docker_client, "pull_progress", None))
+            if text and text != last:
+                last = text
+                await self.stream_log(f"Pulling docker image {image}: {text}", "success", log_tag)
+
+    async def _report_export_progress(
+        self, image_tag: str, size_bytes: int | None, log_tag: str, every: float = 30
+    ) -> None:
+        """DAH-6025: `docker save | docker load` prints nothing until it ends, often minutes for a big
+        image; renters cancelled pods mid-export. Say it is still going every `every` seconds."""
+        started = time.monotonic()
+        size = f"{size_bytes / 1e9:.1f} GB image, " if size_bytes else ""
+        while True:
+            await asyncio.sleep(every)
+            elapsed = int(time.monotonic() - started)
+            await self.stream_log(
+                f"Still loading built image {image_tag} onto host ({size}{elapsed} s so far)", "success", log_tag
+            )
 
     async def stream_log(self, log_msg:str, log_status: str, log_tag: str):
         async with self.lock:
