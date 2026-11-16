@@ -573,6 +573,11 @@ class ExpressLane:
                 miner_address=miner.axon_info.ip,
                 miner_port=miner.axon_info.port,
             )
+            job_timeout = (
+                settings.JOB_TIME_OUT
+                if pending.recheck_deadline is None
+                else min(settings.JOB_TIME_OUT, max(0.0, pending.recheck_deadline - started))
+            )
             job = await asyncio.wait_for(
                 self.miner_service.request_job_to_miner(
                     payload=payload,
@@ -583,10 +588,9 @@ class ExpressLane:
                     executor_id=executor_id,
                     # Never scored, so the pipeline right-sizes its probes (DAH-3011).
                     first_pass=True,
+                    job_timeout=job_timeout,
                 ),
-                timeout=settings.JOB_TIME_OUT
-                if pending.recheck_deadline is None
-                else min(settings.JOB_TIME_OUT, max(0.0, pending.recheck_deadline - started)),
+                timeout=job_timeout,
             )
             if not os.path.isdir(directory):
                 # The hold keeps this directory across cycles, so it went away by another hand.
@@ -614,7 +618,7 @@ class ExpressLane:
             for result in results:
                 # published under the cycle's id; the backend reads this against a maintenance window's end
                 result.check_started_at = check_started_at
-            await self._publish(pending, miner, results, extra, started)
+            await self._publish(pending, miner, results, extra, started, payload.job_batch_id)
         except Exception as exc:
             pending.attempts = attempt
             logger.error(
@@ -645,6 +649,7 @@ class ExpressLane:
         results: list[JobResult],
         extra: dict[str, object],
         started: float,
+        job_batch_id: str,
     ) -> None:
         """Publish the executor's own result spec-only, record it as validated, log the metric.
 
@@ -655,6 +660,10 @@ class ExpressLane:
         """
         executor_id = pending.executor.id
         result = results[0]
+        if not (result.score > 0 or result.job_score > 0) or result.session_lost_in_port_check:
+            # An earlier pass in this batch must not keep the fallback off (review 4558893416).
+            self.miner_service.express_published.pop(executor_id.lower(), None)
+            self.miner_service.express_published_miner.pop(executor_id.lower(), None)
         if result.session_lost_in_port_check:
             # The run has no verdict: its findings still go out, and it is retried without spending one of
             # MAX_ATTEMPTS (bounded by SESSION_LOST_MAX_RUNS), neither a failed first pass nor validated.
@@ -683,6 +692,11 @@ class ExpressLane:
         await self.miner_service.publish_machine_specs(
             results, miner.hotkey, miner.coldkey, is_whole_miner_batch=False, remember_availability=True
         )
+        if passed:
+            # Only a pass has the pod check billing needs; a failed or lost run leaves the cycle's
+            # result-missing fallback in place (review 4558671509).
+            self.miner_service.express_published[executor_id.lower()] = job_batch_id
+            self.miner_service.express_published_miner[executor_id.lower()] = miner.hotkey
         pending.recheck_deadline = None
         if not should_run_first_pass_again:
             # A failed first pass that runs again keeps the request: the next tick selects it.

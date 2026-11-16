@@ -352,7 +352,7 @@ def _storage_limit_summary(specs: dict[str, Any], vloopback: Any) -> dict[str, A
 
 
 def _binary_command(remote_dir: str, script_filename: str) -> str:
-    script_path = f"{remote_dir.rstrip('/')}/{script_filename.lstrip('/')}"
+    script_path = shlex.quote(f"{remote_dir.rstrip('/')}/{script_filename.lstrip('/')}")
     return f"chmod +x {script_path} && {script_path}"
 
 
@@ -583,6 +583,13 @@ class MachineSpecScrapeCheck:
                 gpu_splitting_min_count=gpu_splitting_min_count,
                 gpu_model_count=gpu_model_count,
                 gpu_uuids=gpu_uuids,
+            )
+            from ..liumd_shadow import start_facts_after_scrape  # liumd_shadow imports checks
+
+            updated_state = replace(
+                updated_state,
+                liumd_shadow_facts_task=start_facts_after_scrape(ctx),
+                liumd_shadow_facts_attempted=True,
             )
             updates: dict[str, object] = {"state": updated_state, "default_extra": {**ctx.default_extra, **extra_info}}
             return CheckResult(passed=True, event=event, updates=updates)

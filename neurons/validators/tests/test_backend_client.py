@@ -578,6 +578,17 @@ SIGNED_CALLS = [
         ),
     ),
     ("POST", "/v1/nvml-driver/report-unknown", lambda c: c.report_unknown_driver("580.1")),
+    # calls through the plain get()/post() sign the whole request too (the 12 Nov storage-operations call did not)
+    ("GET", "/internal/storage-operations/op-1/active", lambda c: c.get_storage_operation_active("op-1")),
+    (
+        "POST",
+        "/internal/pods/pod-1/ssh-reachability",
+        lambda c: c.report_pod_ssh_reachability(
+            "pod-1", state="unreachable", since="t0", result="timeout", errno=None, observed_at="t1"
+        ),
+    ),
+    ("GET", "/data?x=1", lambda c: c.get("/data?x=1", SampleResponse)),
+    ("POST", "/submit", lambda c: c.post("/submit", SampleResponse, json_data={"b": 1, "a": 2})),
 ]
 
 
