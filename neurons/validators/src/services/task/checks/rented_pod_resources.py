@@ -126,7 +126,12 @@ class RentedPodResourcesCheck:
             )
 
         # a restarted pod or a rebooted host loses them (DAH-6379)
-        memory_guard = await apply_host_memory_guard(ctx.ssh, names, {"executor_uuid": ctx.executor.uuid})
+        # a DRY_RUN validator must not write oom.group or MemoryMin on hosts
+        memory_guard = (
+            {"set": [], "failed": [], "events": []}
+            if settings.DRY_RUN
+            else await apply_host_memory_guard(ctx.ssh, names, {"executor_uuid": ctx.executor.uuid})
+        )
         try:
             pods = await self._inspect(ctx.ssh, names)
             init_reads_by_pid = await self._read_init(ctx.ssh, [p.pid for p in pods])
