@@ -1871,3 +1871,24 @@ def test_authorized_keys_remove_without_flock_refuses_and_leaves_the_file(tmp_pa
     assert completed.returncode == 1
     assert "flock not available" in completed.stderr
     assert target.read_text() == "k1\nk2\n"
+
+
+@pytest.mark.skipif(shutil.which("flock") is None, reason="flock not installed")
+@pytest.mark.parametrize("remove", [False, True])
+def test_authorized_keys_edit_takes_the_lock_with_a_flock_that_has_no_wait_option(tmp_path, remove):
+    # Alpine images have BusyBox flock, which takes -n but no -w
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("k1\nk2\n")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    busybox_like = bin_dir / "flock"
+    busybox_like.write_text(f'#!/bin/sh\ncase " $* " in *" -w "*) exit 1;; esac\nexec {shutil.which("flock")} "$@"\n')
+    busybox_like.chmod(0o755)
+    build = build_remove_authorized_keys_exec_spec if remove else build_authorized_keys_exec_spec
+    spec = build(container_name="pod_key", public_keys=["k1"], target_path=str(target))
+
+    completed = _run_key_append(spec, env={"PATH": f"{bin_dir}:/usr/bin:/bin"})
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == ("k2\n" if remove else "k1\nk2\nk1\n")

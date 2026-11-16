@@ -1535,8 +1535,10 @@ def _authorized_keys_lock(quoted_dir: str, busy_exit: int, required: bool = Fals
     write-back could restore a key a later remove revoked."""
     no_flock = f"else echo 'flock not available' >&2; exit {busy_exit}; " if required else ""
     return (
-        f"if command -v flock >/dev/null 2>&1; then exec 9>>{quoted_dir}/.authorized_keys.lock && "
-        f"flock -w {AUTHORIZED_KEYS_LOCK_WAIT_SECONDS} 9 || exit {busy_exit}; {no_flock}fi; "
+        f"if command -v flock >/dev/null 2>&1; then exec 9>>{quoted_dir}/.authorized_keys.lock || exit {busy_exit}; "
+        # BusyBox flock (Alpine) has no -w: poll with -n, which both flocks take
+        f"waited=0; until flock -n 9; do [ $waited -ge {AUTHORIZED_KEYS_LOCK_WAIT_SECONDS} ] && exit {busy_exit}; "
+        f"waited=$((waited + 1)); sleep 1; done; {no_flock}fi; "
     )
 
 
