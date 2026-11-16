@@ -2867,6 +2867,11 @@ def _is_stale_vloopback_mountpoint_error(error_text: str) -> bool:
     return all(phrase in error_text for phrase in _VLOOPBACK_MOUNT_ERROR_PHRASES)
 
 
+# a half-started pod's stop, retried until Docker reports it stopped
+_HALF_STARTED_STOP_ATTEMPTS = 3
+_HALF_STARTED_STOP_RETRY_SEC = 2
+
+
 async def _cleanup_to_completion(cleanup: Awaitable[Any]) -> Any:
     """Await recovery cleanup that a cancellation (the recovery deadline) must not cut short: a
     cancel waits for the cleanup to finish and then propagates."""
@@ -12399,7 +12404,13 @@ class DockerService:
             executor_info=executor_info,
             private_key=private_key,
         ) as docker_client:
-            stopped_before = await _stopped_before_start(docker_client, container_name)
+            try:
+                before = await docker_client.inspect_container_state(container_name=container_name)
+            except Exception:  # noqa: BLE001 — unknown state: a failed start is put back down below
+                before = None
+            stopped_before = before is not None and not before.running and not before.restarting
+            # Docker accepts a start of a running container as a no-op: a failure after it is not this start's to undo
+            running_before = before is not None and (before.running or before.restarting)
             # the start goes through the docker SDK; the SSH session is opened only once it
             # succeeded, for the remount (no shell fallback for a failed start), or for the
             # stale-mountpoint repair below
@@ -12417,12 +12428,13 @@ class DockerService:
 
             stale_mount_error: Exception | None = None
             try:
-                await _start()
-            except Exception as exc:
-                if not _is_stale_vloopback_mountpoint_error(str(exc)):
-                    raise
-                stale_mount_error = exc
-            try:
+                # inside the cleanup: the SDK call runs in a thread, so a cancel can land after Docker started the pod
+                try:
+                    await _start()
+                except Exception as exc:
+                    if not _is_stale_vloopback_mountpoint_error(str(exc)):
+                        raise
+                    stale_mount_error = exc
                 async with asyncssh.connect(
                     host=executor_info.address,
                     port=executor_info.ssh_port,
@@ -12452,21 +12464,37 @@ class DockerService:
             except (asyncio.CancelledError, Exception):
                 # a pod left up without its plaintext mount writes the renter's data unencrypted into the
                 # container layer: put it back down, even when the start is cancelled
-                await _cleanup_to_completion(self._stop_half_started_container(docker_client, container_name, default_extra))
+                if not running_before:
+                    await _cleanup_to_completion(
+                        self._stop_half_started_container(docker_client, container_name, default_extra)
+                    )
                 raise
 
     async def _stop_half_started_container(
         self, docker_client: RentalDockerSdkClient, container_name: str, default_extra: dict[str, Any]
     ) -> None:
-        try:
-            await docker_client.stop(container_name=container_name)
-        except Exception as exc:
-            logger.error(
-                _m(
-                    "POD_HALF_STARTED_STOP_FAILED",
-                    extra=get_extra_info({**default_extra, "container_name": container_name, "error": str(exc)}),
-                )
+        """Stop until Docker's own state says stopped: a stop call that failed or was dropped proves nothing."""
+        error = "still running after stop"
+        for attempt in range(_HALF_STARTED_STOP_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(_HALF_STARTED_STOP_RETRY_SEC)
+            try:
+                await docker_client.stop(container_name=container_name)
+            except Exception as exc:  # noqa: BLE001 — the inspect below decides
+                error = str(exc)
+            try:
+                state = await docker_client.inspect_container_state(container_name=container_name)
+            except Exception as exc:  # noqa: BLE001
+                error = str(exc)
+                continue
+            if not state.running and not state.restarting:
+                return
+        logger.error(
+            _m(
+                "POD_HALF_STARTED_STOP_FAILED",
+                extra=get_extra_info({**default_extra, "container_name": container_name, "error": error}),
             )
+        )
 
     async def _bring_up_existing_container(
         self,

@@ -109,6 +109,8 @@ class _FakeRentalDockerClient:
         self.started_containers = []
         self.start_networks = []
         self.stopped_containers = []
+        # what inspect_container_state reports; start sets it, a successful stop clears it
+        self.running = True
         self.stop_grace_seconds_calls = []
         self.removed_containers = []
         # (operation, container_name) tuples shared by stop/remove, so tests can assert ordering
@@ -176,8 +178,8 @@ class _FakeRentalDockerClient:
 
     async def inspect_container_state(self, *, container_name: str) -> ContainerStateSnapshot:
         return ContainerStateSnapshot(
-            status="running", running=True, restarting=False, exit_code=0, restart_count=0, error=None,
-            oom_killed=False,
+            status="running" if self.running else "exited", running=self.running, restarting=False, exit_code=0,
+            restart_count=0, error=None, oom_killed=False,
         )
 
     async def start(self, *, container_name: str, network: str | None = None) -> None:
@@ -185,6 +187,7 @@ class _FakeRentalDockerClient:
         self.start_networks.append(network)
         if self.start_error is not None:
             raise self.start_error
+        self.running = True
 
     async def stop(self, *, container_name: str, stop_grace_seconds: int | None = None) -> None:
         self.stopped_containers.append(container_name)
@@ -192,6 +195,7 @@ class _FakeRentalDockerClient:
         self.container_call_order.append(("stop", container_name))
         if self.stop_error is not None:
             raise self.stop_error
+        self.running = False
 
     async def remove_container(
         self,
@@ -3243,6 +3247,7 @@ async def test_start_container_fails_when_encrypted_setup_fails(docker_service, 
     )
     docker_service.setup_encrypted_local_volume = AsyncMock(side_effect=RuntimeError("mount failed"))
     monkeypatch.setattr(docker_service, "_encrypted_local_volume_name", AsyncMock(return_value="volume_test"))
+    docker_service.rental_docker_client_factory.client.running = False
 
     payload = ContainerStartRequest(
         miner_hotkey="miner-hotkey",
@@ -3289,6 +3294,7 @@ async def test_a_start_cancelled_during_the_remount_stops_the_container(docker_s
     docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker = AsyncMock(return_value=True)
     docker_service.setup_encrypted_local_volume = AsyncMock(side_effect=asyncio.CancelledError())
     monkeypatch.setattr(docker_service, "_encrypted_local_volume_name", AsyncMock(return_value="volume_test"))
+    docker_service.rental_docker_client_factory.client.running = False
     executor_info = ExecutorSSHInfo(
         uuid=str(uuid4()),
         address="127.0.0.1",
@@ -3312,6 +3318,69 @@ async def test_a_start_cancelled_during_the_remount_stops_the_container(docker_s
         )
 
     assert docker_service.rental_docker_client_factory.client.stopped_containers == ["pod_test"]
+
+
+def _start_existing(docker_service):
+    return docker_service.start_existing_container(
+        executor_info=ExecutorSSHInfo(
+            uuid=str(uuid4()),
+            address="127.0.0.1",
+            port=8001,
+            ssh_username="root",
+            ssh_port=2200,
+            python_path="/usr/bin/python3",
+            root_dir="/root/app",
+            ssh_host_key=FAKE_SSH_HOST_KEY,
+        ),
+        private_key="private-key",
+        known_hosts_policy=None,
+        container_name="pod_test",
+        local_volume_path="/workspace",
+        pod_id="pod-id",
+        default_extra={},
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_start_of_an_already_running_pod_leaves_it_running(docker_service, monkeypatch):
+    # Docker's start of a running container is a no-op: an SSH failure after it must not stop the renter's pod
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    monkeypatch.setattr("services.docker_service.asyncssh.connect", Mock(side_effect=OSError("ssh refused")))
+
+    with pytest.raises(OSError):
+        await _start_existing(docker_service)
+
+    assert docker_service.rental_docker_client_factory.client.stopped_containers == []
+
+
+@pytest.mark.asyncio
+async def test_a_start_cancelled_inside_the_docker_call_stops_the_container(docker_service, monkeypatch):
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    client = docker_service.rental_docker_client_factory.client
+    client.running = False
+    client.start_error = asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await _start_existing(docker_service)
+
+    assert client.stopped_containers == ["pod_test"]
+
+
+@pytest.mark.asyncio
+async def test_a_half_started_pod_whose_stop_fails_is_stopped_again_until_docker_reports_it_stopped(
+    docker_service, monkeypatch
+):
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    monkeypatch.setattr("services.docker_service.asyncssh.connect", Mock(side_effect=OSError("ssh refused")))
+    monkeypatch.setattr("services.docker_service._HALF_STARTED_STOP_RETRY_SEC", 0)
+    client = docker_service.rental_docker_client_factory.client
+    client.running = False
+    client.stop_error = RuntimeError("stop refused")
+
+    with pytest.raises(OSError):
+        await _start_existing(docker_service)
+
+    assert client.stopped_containers == ["pod_test"] * 3
 
 
 @pytest.mark.asyncio
