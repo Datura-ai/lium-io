@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Literal
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.const import DEFAULT_JOB_OWNER_LIUM, SECONDS_PER_BLOCK
-from services.gpu_spec_table import normalize_gpu_model
+from services.gpu_spec_table import MODDED_VRAM_MODELS, normalize_gpu_model
 from services.matrix_validation_service import UUID_MISMATCH_ERROR_PREFIX
 
 from ..availability import ReachSource, ReachTarget
@@ -44,6 +44,9 @@ logger = logging.getLogger(__name__)
 GPU_MODEL_VERDICT_KEY = "gpu_model_verdict:{miner_hotkey}:{executor_uuid}"
 GPU_MODEL_VERDICT_TTL_SECONDS = 7 * 24 * 60 * 60
 GPU_MODEL_NO_VERDICT_TTL_SECONDS = 24 * 60 * 60
+# DAH-6353: the cards whose memory the all-cards probe last proved, so a filler node (no full probe)
+# keeps its memory-modded model only on those cards
+MODDED_MEMORY_PROOF_KEY = "modded_memory_proof:{miner_hotkey}:{executor_uuid}"
 
 
 class CapabilityCheck:
@@ -82,15 +85,14 @@ class CapabilityCheck:
                 elif not seen:
                     await _store_gpu_model_verdict(ctx, [], GPU_MODEL_NO_VERDICT_TTL_SECONDS)
             if mismatches:
-                # the node earns nothing, so Lium's filler no longer runs on it (as SshdBootstrapCheck)
-                rented_data = ctx.state.rented_data
-                if not settings.DRY_RUN and rented_data.get_default_job_owner(ctx.executor.uuid) == DEFAULT_JOB_OWNER_LIUM:
-                    what_filler["removed_fillers"] = await remove_lium_fillers(
-                        ctx, rented_data.get_filler_containers(ctx.executor.uuid)
-                    )
+                await _remove_lium_fillers_from_unpaid_node(ctx, what_filler)
                 return gpu_model_mismatch_result(
                     ctx, self.check_id, {**mismatches[0].as_dict(), **what_filler, "transport": "filler"}
                 )
+            if _is_memory_modded(specs) and not await _modded_memory_proven_on_these_cards(ctx, specs):
+                # removing the filler lets the next cycle run the full probe
+                await _remove_lium_fillers_from_unpaid_node(ctx, what_filler)
+                return _modded_memory_unproven_result(ctx, self.check_id, {**what_filler, "transport": "filler"})
             event = render_message(
                 Msg.FILLER_SKIPPED,
                 ctx=ctx,
@@ -151,6 +153,10 @@ class CapabilityCheck:
                     self.check_id,
                     {**mismatches[0].as_dict(), "sealed": result.sealed, "transport": transport, **logged},
                 )
+            if _is_memory_modded(specs):
+                if not result.memory_proven_on_every_card:
+                    return _modded_memory_unproven_result(ctx, self.check_id, {"transport": transport})
+                await _store_modded_memory_proof(ctx, specs)
             what: dict = {"metrics": result.metrics, "transport": transport, **logged}
             if sizing:
                 what["first_pass_vram_budget_mb"] = sizing["vram_budget_mb"]
@@ -560,6 +566,54 @@ async def _store_gpu_model_verdict(
         await ctx.services.redis.set(_gpu_model_verdict_key(ctx), payload, ex=ttl_seconds)
     except Exception as exc:
         logger.warning(_m("GPU model verdict write failed", extra=get_extra_info({**ctx.default_extra, "error": str(exc)})))
+
+
+def modded_memory_proof_key(ctx: Context) -> str:
+    return MODDED_MEMORY_PROOF_KEY.format(miner_hotkey=ctx.miner_hotkey, executor_uuid=ctx.executor.uuid)
+
+
+def _is_memory_modded(specs: dict) -> bool:
+    # a node with mixed models fails GpuModelValidCheck first, so card 0 names them all
+    return reported_gpu_model(specs, 0) in MODDED_VRAM_MODELS
+
+
+def _card_uuids(specs: dict) -> list[str]:
+    return sorted(str(card.get("uuid") or "") for card in (specs.get("gpu") or {}).get("details") or [])
+
+
+async def _store_modded_memory_proof(ctx: Context, specs: dict) -> None:
+    if settings.DRY_RUN:
+        return
+    try:
+        await ctx.services.redis.set(
+            modded_memory_proof_key(ctx), json.dumps(_card_uuids(specs)), ex=GPU_MODEL_VERDICT_TTL_SECONDS
+        )
+    except Exception as exc:
+        logger.warning(_m("Modded memory proof write failed", extra=get_extra_info({**ctx.default_extra, "error": str(exc)})))
+
+
+async def _modded_memory_proven_on_these_cards(ctx: Context, specs: dict) -> bool:
+    """A failed read proves nothing: the modded model needs the proof (DAH-6353)."""
+    try:
+        stored = await ctx.services.redis.get(modded_memory_proof_key(ctx))
+        return stored is not None and json.loads(stored) == _card_uuids(specs)
+    except Exception as exc:
+        logger.warning(_m("Modded memory proof read failed", extra=get_extra_info({**ctx.default_extra, "error": str(exc)})))
+        return False
+
+
+def _modded_memory_unproven_result(ctx: Context, check_id: str, what: dict) -> CheckResult:
+    event = render_message(Msg.MODDED_MEMORY_UNPROVEN, ctx=ctx, check_id=check_id, what=what)
+    return CheckResult(passed=False, event=event)
+
+
+async def _remove_lium_fillers_from_unpaid_node(ctx: Context, what_filler: dict) -> None:
+    # the node earns nothing, so Lium's filler no longer runs on it (as SshdBootstrapCheck)
+    rented_data = ctx.state.rented_data
+    if not settings.DRY_RUN and rented_data.get_default_job_owner(ctx.executor.uuid) == DEFAULT_JOB_OWNER_LIUM:
+        what_filler["removed_fillers"] = await remove_lium_fillers(
+            ctx, rented_data.get_filler_containers(ctx.executor.uuid)
+        )
 
 
 def _sample_error_kind(result: ValidationResult) -> str:

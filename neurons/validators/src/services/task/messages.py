@@ -2002,6 +2002,14 @@ class CapabilityMessages:
         impact="Score set to 0",
         remediation="Run Docker GPU diagnostics (nvidia-smi) and ensure containers can access GPUs.",
     )
+    MODDED_MEMORY_UNPROVEN = MessageTemplate(
+        event="Memory-modded GPU not verified",
+        reason="GPU_MODDED_MEMORY_UNPROVEN",
+        severity="warning",
+        category="policy",
+        impact="Score set to 0",
+        remediation="A memory-modded GPU is paid only after the validator verifies the memory of every card.",
+    )
     # DAH-6241: the matmul answered, but the card it ran on has another compute capability or SM
     # count than the reported model has
     GPU_MODEL_MISMATCH = MessageTemplate(

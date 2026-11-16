@@ -13,7 +13,7 @@ import asyncssh
 
 from core.config import settings
 from core.utils import _m, get_extra_info
-from services.gpu_spec_table import driver_gpu_name, matmul_probe_vram_mb
+from services.gpu_spec_table import MODDED_VRAM_MODELS, driver_gpu_name, matmul_probe_vram_mb
 
 logger = logging.getLogger(__name__)
 _rng = secrets.SystemRandom()
@@ -198,6 +198,8 @@ class ValidationResult:
     # DAH-6241: card index -> the sealed metrics the all-cards probe read off that card alone
     # (None when the probe did not run); device 0's own are in `metrics`.
     card_metrics: dict[int, dict] | None = None
+    # DAH-6353: the all-cards probe gave a sealed pass on every card; a memory-modded model needs it
+    memory_proven_on_every_card: bool = False
 
     def __bool__(self) -> bool:
         """Allow using ValidationResult in boolean context for backward compatibility."""
@@ -219,6 +221,10 @@ class AllCardsProbe:
     elapsed_seconds: float
     over_wall_clock: bool
     per_card: list[dict]
+
+    @property
+    def proves_memory_of_every_card(self) -> bool:
+        return self.passed and bool(self.per_card) and all(card.get("seal_ok") for card in self.per_card)
 
 
 class ValidationService:
@@ -303,10 +309,13 @@ class ValidationService:
         gpu = machine_spec.get("gpu", {}) or {}
         gpu_count = gpu.get("count", 0) or 0
         details = gpu.get("details", []) or []
-        if gpu_count <= 1 or not details:
+        if not details:
+            return None
+        gpu_model = details[0].get("name", "") or ""
+        # a memory-modded card needs this proof even alone (DAH-6353)
+        if gpu_count == 0 or (gpu_count == 1 and gpu_model not in MODDED_VRAM_MODELS):
             return None
 
-        gpu_model = details[0].get("name", "") or ""
         sized_vram_mb = matmul_probe_vram_mb(gpu_model, details[0].get("capacity"))
         if not sized_vram_mb:
             return None
@@ -870,6 +879,7 @@ class ValidationService:
                     for outcome in all_cards.per_card
                     if outcome.get("metrics")
                 }
+            judged.memory_proven_on_every_card = all_cards is not None and all_cards.proves_memory_of_every_card
             return judged
 
         except Exception as e:
