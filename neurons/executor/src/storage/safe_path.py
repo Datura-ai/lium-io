@@ -32,8 +32,9 @@ import os, stat, sys
 root, rel, mode = sys.argv[1:4]
 command = sys.argv[4:]
 fd = os.open(root, os.O_PATH | os.O_DIRECTORY)
-for part in [p for p in rel.split("/") if p]:
-    if part in (".", ".."):
+# "." is the root itself: a whole-volume backup or restore maps the volume path to the root
+for part in [p for p in rel.split("/") if p not in ("", ".")]:
+    if part == "..":
         sys.stderr.write("path component not allowed: %s\n" % part)
         sys.exit(67)
     try:

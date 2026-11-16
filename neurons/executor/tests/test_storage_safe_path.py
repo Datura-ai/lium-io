@@ -104,3 +104,11 @@ def test_dot_dot_is_refused(rental: Path) -> None:
     )
     argv[6] = "root/../.."
     assert subprocess.run([sys.executable, *argv[1:]]).returncode == SYMLINK_EXIT
+
+
+def test_the_whole_volume_is_the_root_itself(rental: Path, tmp_path: Path) -> None:
+    out = tmp_path / "cwd"
+    for mode in ("backup", "restore", "check-backup", "check-restore"):
+        done = _run(rental, rental, mode, _pwd(out))
+        assert done.returncode == 0, (mode, done.stderr)
+        assert out.read_text() == str(rental), mode
