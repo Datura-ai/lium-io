@@ -76,7 +76,22 @@ runs:
             const latest = {};
             // the repo is public: only a member's or collaborator's review counts, not any GitHub user's
             const TEAM = ['OWNER', 'MEMBER', 'COLLABORATOR'];
-            for (const r of reviews) if (r.user && r.state !== 'COMMENTED' && TEAM.includes(r.author_association)) latest[r.user.login] = r.state;
+            // DAH-6518: a member whose org membership is private shows as CONTRIBUTOR to this job's token, so a
+            // review outside TEAM counts when its author can write to the repo (asked once per login)
+            const canWrite = {};
+            const writes = async login => {
+              if (!(login in canWrite)) {
+                const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner: context.repo.owner, repo: context.repo.repo, username: login,
+                }).catch(() => ({ data: {} }));
+                canWrite[login] = ['admin', 'maintain', 'write'].includes(data.permission);
+              }
+              return canWrite[login];
+            };
+            for (const r of reviews) {
+              if (!r.user || r.state === 'COMMENTED') continue;
+              if (TEAM.includes(r.author_association) || await writes(r.user.login)) latest[r.user.login] = r.state;
+            }
             approved = Object.values(latest).includes('APPROVED');
           } else {
             // merge group: base..head; push: before..after (all zeros on a new branch: no diff, every package)
