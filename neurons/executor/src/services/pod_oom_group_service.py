@@ -1,5 +1,5 @@
 """DAH-6379: a rental pod's memory.oom.group=1 makes an OOM kill take the whole pod. Docker gives a restarted pod a
-new cgroup with it back at 0, so it is set on every pod start here (the executor runs privileged in the host PID
+new cgroup with it back at 0, so with POD_OOM_GROUP_ENABLED it is set on every pod start here (the executor runs privileged in the host PID
 namespace); the validator also sets it on create and on each rented-pod check."""
 
 import threading
@@ -7,6 +7,7 @@ import time
 
 import docker
 
+from core.config import settings
 from core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -62,10 +63,10 @@ def handle_event(event: dict, dirs: tuple[str, ...] = CGROUP_DIRS, client=None) 
     if event.get("Type") != "container" or event.get("Action") != "start" or not name.startswith(POD_PREFIX):
         return None
     container_id = event.get("id") or actor.get("ID") or ""
-    result = set_oom_group(container_id, dirs)
+    result = set_oom_group(container_id, dirs) if settings.POD_OOM_GROUP_ENABLED else "disabled"
     if result == "set":
         logger.info(f"POD_OOM_GROUP_SET {name} {container_id[:12]}")
-    elif result != "already":
+    elif result not in ("already", "disabled"):
         logger.warning(f"POD_OOM_GROUP_NOT_SET {name} {container_id[:12]} {result}")
     if client is not None:
         restart_sshd(client, container_id)

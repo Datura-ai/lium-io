@@ -2,7 +2,16 @@
 
 from unittest.mock import MagicMock
 
+import pytest
+
+from core.config import settings
+
 from services.pod_oom_group_service import RESTART_SSHD, handle_event, set_oom_group
+
+
+@pytest.fixture(autouse=True)
+def _oom_group_enabled(monkeypatch):
+    monkeypatch.setattr(settings, "POD_OOM_GROUP_ENABLED", True)
 
 
 def _dirs(tmp_path):
@@ -86,3 +95,11 @@ def test_a_failed_sshd_rerun_does_not_raise(tmp_path):
     _scope(tmp_path, "docker/abc")
 
     assert handle_event(_start(), _dirs(tmp_path), client=client) == "set"
+
+
+def test_oom_group_is_left_at_0_while_the_setting_is_off(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "POD_OOM_GROUP_ENABLED", False)
+    f = _scope(tmp_path, "docker/abc")
+
+    assert handle_event(_start(), _dirs(tmp_path)) == "disabled"
+    assert f.read_text().strip() == "0"
