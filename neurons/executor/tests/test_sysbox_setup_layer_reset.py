@@ -109,22 +109,25 @@ def test_a_shifted_sysbox_layer_is_found_and_a_runc_container_is_left_alone(tmp_
     assert out.stdout.splitlines() == [f"would shift 4 entries of {'a' * 12} back from {_base()}"]
 
 
-def _containerd_store(tmp_path, cid: str) -> None:
+SNAPSHOT = "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/7/fs"
+
+
+def _containerd_store(tmp_path, cid: str, snapshot: str = SNAPSHOT) -> None:
     upper = Path(_container(tmp_path, cid, "sysbox-runc", "m1"))
     (tmp_path / "var/lib/docker/image/overlay2/layerdb/mounts" / cid / "mount-id").unlink()
-    snap = tmp_path / "var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/7/fs"
+    snap = tmp_path / snapshot.lstrip("/")
     snap.parent.mkdir(parents=True)
     upper.rename(snap)
 
 
-def _fake_ctr(tmp_path, cid: str, address: str) -> str:
+def _fake_ctr(tmp_path, cid: str, address: str, snapshot: str = SNAPSHOT, failure: str = "") -> str:
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     (bindir / "ctr").write_text(
         "#!/bin/sh\n"
         f'[ "$*" = "--address {tmp_path}{address} -n moby snapshots --snapshotter overlayfs mounts / {cid}" ] || exit 1\n'
-        "echo mount -t overlay overlay / -o index=off,workdir=/x/7/work,"
-        "upperdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/7/fs,lowerdir=/x/6/fs\n"
+        + (f'echo "{failure}" >&2; exit 1\n' if failure else "")
+        + f'echo "mount -t overlay overlay / -o index=off,workdir=/x/7/work,upperdir={snapshot},lowerdir=/x/6/fs"\n'
     )
     (bindir / "ctr").chmod(0o755)
     return f"{bindir}:"
@@ -164,6 +167,47 @@ def test_a_containerd_store_layer_is_found_through_its_snapshot(tmp_path, addres
     out = _run(tmp_path, "--dry-run", path=_fake_ctr(tmp_path, cid, address))
     assert out.returncode == 0, out.stderr
     assert out.stdout.splitlines() == [f"would shift 4 entries of {'c' * 12} back from {_base()}"]
+
+
+def _containerd_host(tmp_path, cid: str, snapshot: str = SNAPSHOT) -> None:
+    address = "/run/containerd/containerd.sock"
+    (tmp_path / "etc/docker").mkdir(parents=True)
+    (tmp_path / "etc/docker/daemon.json").write_text(json.dumps({"containerd": address}))
+    (tmp_path / address.lstrip("/")).parent.mkdir(parents=True)
+    (tmp_path / address.lstrip("/")).touch()
+    _install(tmp_path)
+    _containerd_store(tmp_path, cid, snapshot)
+
+
+def test_a_snapshot_path_with_a_space_is_read_whole(tmp_path):
+    cid = "c" * 64
+    snapshot = "/srv/docker data/containerd/snapshots/7/fs"
+    _containerd_host(tmp_path, cid, snapshot)
+    out = _run(tmp_path, "--dry-run", path=_fake_ctr(tmp_path, cid, "/run/containerd/containerd.sock", snapshot))
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.splitlines() == [f"would shift 4 entries of {'c' * 12} back from {_base()}"]
+
+
+def test_a_snapshot_containerd_says_is_missing_is_skipped(tmp_path):
+    cid = "c" * 64
+    _containerd_host(tmp_path, cid)
+    path = _fake_ctr(tmp_path, cid, "/run/containerd/containerd.sock", failure=f'ctr: snapshot "{cid}": not found')
+    out = _run(tmp_path, "--dry-run", path=path)
+    assert out.returncode == 0, out.stderr
+    assert "no writable layer found" in out.stderr
+
+
+@pytest.mark.parametrize("failure", ["ctr: failed to dial: connection refused", None])
+def test_a_snapshot_lookup_that_fails_fails_the_reset(tmp_path, failure):
+    # nonzero exit for another reason, or ctr not runnable (the same branch a timeout takes): Docker must stay down
+    cid = "c" * 64
+    _containerd_host(tmp_path, cid)
+    path = _fake_ctr(tmp_path, cid, "/run/containerd/containerd.sock", failure=failure or "")
+    if failure is None:
+        (tmp_path / "bin/ctr").write_text("not an executable format\n")
+    out = _run(tmp_path, "--dry-run", path=path)
+    assert out.returncode != 0
+    assert "ctr could not read the snapshot" in out.stderr
 
 
 def test_a_docker_managed_containerd_store_is_read_through_a_containerd_started_for_it(tmp_path):

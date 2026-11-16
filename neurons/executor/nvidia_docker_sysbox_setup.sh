@@ -322,13 +322,19 @@ def containerd_socket():
 def containerd_upper(cid):
     # Docker 29's containerd image store: the container's snapshot (key = container id, namespace moby) holds the
     # writable layer; containerd answers before Docker starts any container
+    # a lookup that fails (no ctr, timeout, containerd down) fails the reset, so Docker stays down and the next boot
+    # retries; only a snapshot containerd says is missing is skipped
     try:
-        out = subprocess.run(["ctr", "--address", containerd_socket(), "-n", "moby", "snapshots",
-                              "--snapshotter", "overlayfs", "mounts", "/", cid],
-                             capture_output=True, text=True, timeout=60).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-    m = re.search(r"upperdir=([^,\s]+)", out)
+        r = subprocess.run(["ctr", "--address", containerd_socket(), "-n", "moby", "snapshots",
+                            "--snapshotter", "overlayfs", "mounts", "/", cid],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        sys.exit(f"ctr could not read the snapshot of {cid[:12]}: {e}")
+    if r.returncode != 0:
+        if "not found" in r.stderr:
+            return None
+        sys.exit(f"ctr could not read the snapshot of {cid[:12]} (exit {r.returncode}): {r.stderr.strip()[-300:]}")
+    m = re.search(r"upperdir=([^,\n]+)", r.stdout)  # ctr prints the options verbatim: a space is part of the path
     return ROOT + m.group(1) if m else None
 
 
