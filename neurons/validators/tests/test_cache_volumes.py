@@ -900,11 +900,15 @@ def test_the_idle_filler_removal_keeps_the_rented_image_under_any_docker_hub_pre
 
 
 class CacheDuHostSshClient(RemovingHostSshClient):
-    """The helper's `du -sk /cache/0 /cache/1 ...` answers with these KB per cache, in mount order."""
+    """The helper's `du -sk /cache/0 /cache/1 ...` answers with these GB per cache, in mount order; the idle filler
+    images' `docker image inspect` with `image_gb`."""
 
-    def __init__(self, listed_volumes: list[str], free_gb: float, cache_gb: list[float] | None):
+    def __init__(
+        self, listed_volumes: list[str], free_gb: float, cache_gb: list[float] | None, image_gb: list[float] = ()
+    ):
         super().__init__(listed_volumes, free_gb)
         self._cache_gb = cache_gb
+        self._image_gb = list(image_gb)
 
     async def run(self, command: str, *args, **kwargs):
         if "du -sk" in command:
@@ -913,23 +917,28 @@ class CacheDuHostSshClient(RemovingHostSshClient):
                 return SimpleNamespace(exit_status=125, stdout="", stderr="no such image")
             stdout = "".join(f"{int(gb * 1024**2)}\t/cache/{i}\n" for i, gb in enumerate(self._cache_gb))
             return SimpleNamespace(exit_status=0, stdout=stdout, stderr="")
+        if "image inspect" in command:
+            self.commands.append(command)
+            return SimpleNamespace(exit_status=0, stdout="".join(f"{int(gb * 1024**3)}\n" for gb in self._image_gb))
         return await super().run(command, *args, **kwargs)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("free_gb", "cache_gb", "removed"),
+    ("free_gb", "cache_gb", "image_gb", "removed"),
     [
-        (1300, [20, 13], []),  # ~1 TB short, the caches free 33 GB: never a cold start for nothing
-        (2340, [20, 13], _DPHN),  # 2373 GB once they go: the volume fits, so they go
-        (1300, None, _DPHN),  # sizes unreadable: removed as before
+        (1300, [20, 13], [], []),  # ~1 TB short, the caches free 33 GB: never a cold start for nothing
+        (2290, [20, 13], [], _DPHN),  # 2323 GB once they go: the 2320 GB volume fits (no margin: nothing is kept)
+        (2280, [20, 13], [], []),  # 2313 GB: still short
+        (2280, [20, 13], [10], _DPHN),  # the idle filler images go first and make up the rest
+        (1300, None, [], _DPHN),  # sizes unreadable: removed as before
     ],
 )
 async def test_the_caches_stay_when_removing_them_cannot_make_the_rental_fit(
-    docker_service, monkeypatch, free_gb, cache_gb, removed
+    docker_service, monkeypatch, free_gb, cache_gb, image_gb, removed
 ):
     # Rustam (lio#2272): skip the delete when the rental is short by more than the caches on disk can free
-    ssh_client = CacheDuHostSshClient([*_DPHN, "volume_pod"], free_gb=free_gb, cache_gb=cache_gb)
+    ssh_client = CacheDuHostSshClient([*_DPHN, "volume_pod"], free_gb=free_gb, cache_gb=cache_gb, image_gb=image_gb)
     rental = _whole_node_rental(monkeypatch, docker_service)
 
     assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is bool(removed)
@@ -937,3 +946,20 @@ async def test_the_caches_stay_when_removing_them_cannot_make_the_rental_fit(
     if not removed:
         assert rental.volume_limit_gb == 2300
         assert not any("image rm" in command for command in ssh_client.commands)  # nor the idle filler images
+
+
+class HangingDuHostSshClient(RemovingHostSshClient):
+    async def run(self, command: str, *args, **kwargs):
+        if "du -sk" in command:
+            await asyncio.sleep(3600)  # a hung `docker rm -f` before the helper
+        return await super().run(command, *args, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_a_hung_size_read_does_not_stall_the_create(docker_service, monkeypatch):
+    monkeypatch.setattr("services.docker_service.CACHE_SIZE_READ_TIMEOUT_SECONDS", 0.01)
+    ssh_client = HangingDuHostSshClient([*_DPHN, "volume_pod"], free_gb=1300)
+    rental = _whole_node_rental(monkeypatch, docker_service)
+
+    assert await docker_service.reclaim_dphn_cache_for_rental(ssh_client, rental, {}) is True  # unreadable: as before
+    assert _removed_volumes(ssh_client) == sorted(_DPHN)

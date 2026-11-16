@@ -105,7 +105,11 @@ from services.const import (
     POD_CONTAINER_PREFIX,
     PREFERRED_POD_PORTS,
 )
-from services.container_cleanup import REMOVE_CACHE_SWEEP_CONTAINER, evict_cache_volumes_oldest_first
+from services.container_cleanup import (
+    REMOVE_CACHE_SWEEP_CONTAINER,
+    evict_cache_volumes_oldest_first,
+    idle_filler_images_size_command,
+)
 from services.cvm_quote_broker import ensure_quote_broker, quote_socket_pod_mount
 from services.node_host import node_owner, public_host_sock
 from services.default_docker_image_digest_service import fetch_docker_hub_digest
@@ -570,6 +574,8 @@ RENTAL_DISK_SHORT_STEP = "rental_disk_short"
 # DAH-5260: `docker volume rm` of the 1561 GB kimi-k3 cache unlinks ~1.5 TB; ext4 frees ~180 GB/s of
 # extents (22 GB in 0.12 s measured), so ~10 s. The bound only stops a wedged dockerd holding the create.
 CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS = 600
+# the helper's `du` has `timeout 60`; this bounds the whole size read, `docker rm -f` included
+CACHE_SIZE_READ_TIMEOUT_SECONDS = 90
 # Floor for a rental container's pids.max when it is clamped to a low host kernel.pid_max: a value
 # of 0 or below would read as "unlimited" to Docker, so never emit one.
 _MIN_RENTAL_PIDS_LIMIT = 512
@@ -6328,11 +6334,13 @@ class DockerService:
             # Rustam (lio#2272): a rental short by more than every cache holds never fits by deleting them, so a
             # cold start would buy nothing (230 of 281 prod reclaims dropped ~33 GB for a volume ~1 TB short).
             # Unmeasurable caches are removed as before.
-            caches_gb = await self._cache_volumes_held_gb(ssh_client, cache_volumes)
-            if caches_gb is not None and free_gb + caches_gb < volume_needs_free_gb:
+            # the eviction removes the idle filler images first, so they count as freeable too (lio#2272 review);
+            # the volume alone is the test: the free margin is for a kept cache, and none would be kept
+            caches_gb = await self._cache_volumes_held_gb(ssh_client, cache_volumes, payload.docker_image)
+            if caches_gb is not None and free_gb + caches_gb < volume_needs_free_gb - DPHN_CACHE_FREE_MARGIN_GB:
                 logger.info(
                     _m(
-                        "Keeping the filler caches: removing them cannot free enough for the customer rental",
+                        "Keeping the filler caches: removing them and the idle filler images cannot free enough for the customer rental",
                         extra=get_extra_info({
                             **default_extra,
                             "volumes": cache_volumes,
@@ -6583,25 +6591,36 @@ class DockerService:
         return list(payload.cache_volumes)
 
     async def _cache_volumes_held_gb(
-        self, ssh_client: asyncssh.SSHClientConnection, volume_names: list[str]
+        self, ssh_client: asyncssh.SSHClientConnection, volume_names: list[str], keep_image: str | None = None
     ) -> float | None:
-        """GB the cache volumes hold together (one `du` in a helper container); None when it cannot be read."""
+        """GB the cache volumes (one `du` in a helper container) and the idle filler images hold together; None when
+        it cannot be read."""
         mounts = " ".join(f"-v {shlex.quote(name)}:/cache/{index}:ro" for index, name in enumerate(volume_names))
+        paths = " ".join(f"/cache/{index}" for index in range(len(volume_names)))
         try:
-            result = await ssh_client.run(
-                f"{REMOVE_CACHE_SWEEP_CONTAINER}; timeout 60 /usr/bin/docker run --rm --name {CACHE_SWEEP_CONTAINER_NAME} "
-                f"{mounts} {ALPINE_HELPER_IMAGE} du -sk "
-                + " ".join(f"/cache/{index}" for index in range(len(volume_names)))
-                + f"; {REMOVE_CACHE_SWEEP_CONTAINER}"
+            # only `docker run` has its own timeout: a hung `docker rm -f` must not stall the create either
+            volumes, images = await asyncio.wait_for(
+                asyncio.gather(
+                    ssh_client.run(
+                        f"{REMOVE_CACHE_SWEEP_CONTAINER}; timeout 60 /usr/bin/docker run --rm "
+                        f"--name {CACHE_SWEEP_CONTAINER_NAME} {mounts} {ALPINE_HELPER_IMAGE} du -sk {paths}; "
+                        f"{REMOVE_CACHE_SWEEP_CONTAINER}"
+                    ),
+                    ssh_client.run(idle_filler_images_size_command(keep_image)),
+                ),
+                CACHE_SIZE_READ_TIMEOUT_SECONDS,
             )
         except asyncio.CancelledError:
             raise
         except Exception:
             return None
-        sizes = [line.split()[0] for line in (result.stdout or "").splitlines() if line.strip()]
-        if len(sizes) != len(volume_names) or not all(kb.isdigit() for kb in sizes):
+        sizes_kb = [line.split()[0] for line in (volumes.stdout or "").splitlines() if line.strip()]
+        if len(sizes_kb) != len(volume_names) or not all(kb.isdigit() for kb in sizes_kb):
             return None
-        return sum(int(kb) for kb in sizes) * 1024 / 1024**3
+        image_bytes = [line.strip() for line in (images.stdout or "").splitlines() if line.strip()]
+        if images.exit_status != 0 or not all(size.isdigit() for size in image_bytes):
+            return None
+        return (sum(int(kb) for kb in sizes_kb) * 1024 + sum(int(size) for size in image_bytes)) / 1024**3
 
     async def _cache_missing_gb(
         self, ssh_client: asyncssh.SSHClientConnection, volume_name: str, default_extra: dict
