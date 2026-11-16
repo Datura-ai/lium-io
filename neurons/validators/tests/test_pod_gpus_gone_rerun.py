@@ -90,3 +90,39 @@ async def test_an_express_recheck_waits_for_the_moved_pod_and_returns_its_pass(r
     assert rest_service.task_service.create_task.await_count == 2
     assert [r.score for r in out["results"] if r.executor_info.uuid == LISTED] == [1.0]
     rest_service.publish_machine_specs.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_rerun_keeps_the_first_results_pod_gpus_gone(rest_service):  # noqa: F811
+    rest_service.miner_returns(LISTED)
+    other = _job_result(LISTED, score=0.0)
+    other.availability_errors = [{"reason_code": "GPU_LOST", "what_we_saw": {"faults": ["nvml_error"]}}]
+    _runs(rest_service, _pod_gpus_gone(LISTED), other)
+
+    out = await request(rest_service, RentedExecutorsResponse(executors={LISTED: rented()}))
+
+    (result,) = [r for r in out["results"] if r.executor_info.uuid == LISTED]
+    assert result.availability_errors[0]["what_we_saw"]["faults"] == ["pod_gpus_gone"]
+
+
+@pytest.mark.asyncio
+async def test_an_express_recheck_with_a_short_deadline_skips_the_rerun(rest_service):  # noqa: F811
+    rest_service.miner_returns(LISTED)
+    _runs(rest_service, _pod_gpus_gone(LISTED))
+    too_short = (
+        miner_service.CYCLE_JOB_WAIT_SECONDS
+        + miner_service.PROBE_TAIL_MARGIN_SECONDS
+        + miner_service.POD_GPUS_GONE_RERUN_MIN_SECONDS
+        - 1
+    )
+
+    await rest_service.request_job_to_miner(
+        payload=make_payload(),
+        encrypted_files=_cycle_inputs().encrypted_files,
+        rented_data=RentedExecutorsResponse(executors={LISTED: rented()}),
+        default_docker_image_digests={},
+        executor_id=LISTED,
+        job_timeout=too_short,
+    )
+
+    assert rest_service.task_service.create_task.await_count == 1

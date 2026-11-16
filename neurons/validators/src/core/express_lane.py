@@ -573,6 +573,11 @@ class ExpressLane:
                 miner_address=miner.axon_info.ip,
                 miner_port=miner.axon_info.port,
             )
+            job_timeout = (
+                settings.JOB_TIME_OUT
+                if pending.recheck_deadline is None
+                else min(settings.JOB_TIME_OUT, max(0.0, pending.recheck_deadline - started))
+            )
             job = await asyncio.wait_for(
                 self.miner_service.request_job_to_miner(
                     payload=payload,
@@ -583,10 +588,9 @@ class ExpressLane:
                     executor_id=executor_id,
                     # Never scored, so the pipeline right-sizes its probes (DAH-3011).
                     first_pass=True,
+                    job_timeout=job_timeout,
                 ),
-                timeout=settings.JOB_TIME_OUT
-                if pending.recheck_deadline is None
-                else min(settings.JOB_TIME_OUT, max(0.0, pending.recheck_deadline - started)),
+                timeout=job_timeout,
             )
             if not os.path.isdir(directory):
                 # The hold keeps this directory across cycles, so it went away by another hand.

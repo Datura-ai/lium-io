@@ -507,6 +507,7 @@ class MinerService:
         job_started_at: float,
         default_extra: dict,
         publish_early: bool = True,
+        job_timeout: float | None = None,
     ) -> None:
         """DAH-6137: check once more, in place in ``raw_results``, each node whose pod was left on
         its old GPUs, once the backend has had time to recreate the pod on the new cards, and
@@ -517,7 +518,7 @@ class MinerService:
         if not stranded:
             return
         budget = (
-            settings.JOB_TIME_OUT
+            (job_timeout or settings.JOB_TIME_OUT)
             - CYCLE_JOB_WAIT_SECONDS
             - PROBE_TAIL_MARGIN_SECONDS
             - (time.monotonic() - job_started_at)
@@ -533,7 +534,8 @@ class MinerService:
             *(run(executors[i], timeout) for i in stranded), return_exceptions=True
         )
         for i, rerun in zip(stranded, reruns):
-            if isinstance(rerun, JobResult):
+            # a failed rerun keeps the first result: its pod_gpus_gone event moves the pod off the cycle report
+            if isinstance(rerun, JobResult) and rerun.is_successful:
                 raw_results[i] = rerun
         passed = [r for r in reruns if isinstance(r, JobResult) and r.is_successful]
         logger.info(
@@ -664,6 +666,7 @@ class MinerService:
         executor_image_snapshot: ExpectedImageSnapshot | None = None,
         executor_id: str | None = None,
         first_pass: bool = False,
+        job_timeout: float | None = None,
     ):
         """See _route_job_to_miner. A wave request that ends before the miner's list arrived
         (unreachable, refused, timed out) settles its miners_awaiting_wave_list entry too."""
@@ -676,6 +679,7 @@ class MinerService:
                 executor_image_snapshot,
                 executor_id=executor_id,
                 first_pass=first_pass,
+                job_timeout=job_timeout,
             )
             if executor_id is None:
                 await self.publish_gpu_set_changes(job)
@@ -693,6 +697,7 @@ class MinerService:
         executor_image_snapshot: ExpectedImageSnapshot | None = None,
         executor_id: str | None = None,
         first_pass: bool = False,
+        job_timeout: float | None = None,
     ):
         """Request job to miner over the miner's REST API.
 
@@ -701,6 +706,8 @@ class MinerService:
         filters register_pubkey on it, exactly as it does for the rental key-submit.
         first_pass (DAH-3011): this is the executor's first, unscored verification; handed to
         TaskService.create_task, where it shrinks the probes. The cycle never sets it.
+        job_timeout: the caller's own timeout around this call when shorter than JOB_TIME_OUT (an express recheck's
+        deadline); the pod-left-on-old-GPUs rerun must finish inside it.
         """
         logger.info(
             _m(
@@ -718,6 +725,7 @@ class MinerService:
             executor_image_snapshot,
             executor_id=executor_id,
             first_pass=first_pass,
+            job_timeout=job_timeout,
         )
 
     def _filter_task_results(
@@ -2176,6 +2184,7 @@ class MinerService:
         executor_image_snapshot: ExpectedImageSnapshot | None = None,
         executor_id: str | None = None,
         first_pass: bool = False,
+        job_timeout: float | None = None,
     ):
         """REST API version of request_job_to_miner."""
         # DAH-2667: what the RoCE probe subtracts from the cycle's own wait, so a job that already
@@ -2305,6 +2314,7 @@ class MinerService:
                         job_started_at,
                         default_extra,
                         publish_early=executor_id is None,
+                        job_timeout=job_timeout,
                     )
                 finally:
                     self._release_cycle_claims(executors)
