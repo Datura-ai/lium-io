@@ -3354,6 +3354,53 @@ async def test_a_failed_start_of_an_already_running_pod_leaves_it_running(docker
 
 
 @pytest.mark.asyncio
+async def test_an_unreadable_state_fails_the_start_before_docker_is_asked(docker_service, monkeypatch):
+    # unknown state could be a running pod: a later stop would cut the renter's workload
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    client = docker_service.rental_docker_client_factory.client
+    client.inspect_container_state = AsyncMock(side_effect=RuntimeError("inspect timed out"))
+
+    with pytest.raises(RuntimeError):
+        await _start_existing(docker_service)
+
+    assert client.started_containers == []
+    assert client.stopped_containers == []
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_waits_for_the_docker_start_still_in_flight_before_stopping(docker_service, monkeypatch):
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    client = docker_service.rental_docker_client_factory.client
+    client.running = False
+    release = asyncio.Event()
+    in_flight = asyncio.Event()
+
+    async def _thread_start():
+        await release.wait()
+        client.started_containers.append("pod_test")
+        client.running = True
+
+    async def start(*, container_name, network=None):
+        # the SDK call runs in a thread a cancel cannot stop: model it as work that outlives the await
+        in_flight.set()
+        await asyncio.shield(asyncio.ensure_future(_thread_start()))
+
+    client.start = start
+    task = asyncio.ensure_future(_start_existing(docker_service))
+    await in_flight.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert client.started_containers == ["pod_test"]
+    assert client.stopped_containers == ["pod_test"]
+    assert client.running is False
+
+
+@pytest.mark.asyncio
 async def test_a_start_cancelled_inside_the_docker_call_stops_the_container(docker_service, monkeypatch):
     monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
     client = docker_service.rental_docker_client_factory.client

@@ -12404,27 +12404,36 @@ class DockerService:
             executor_info=executor_info,
             private_key=private_key,
         ) as docker_client:
-            try:
-                before = await docker_client.inspect_container_state(container_name=container_name)
-            except Exception:  # noqa: BLE001 — unknown state: a failed start is put back down below
-                before = None
-            stopped_before = before is not None and not before.running and not before.restarting
+            # an unreadable state fails the request before any start: cleanup could otherwise stop a running pod
+            before = await docker_client.inspect_container_state(container_name=container_name)
+            stopped_before = not before.running and not before.restarting
             # Docker accepts a start of a running container as a no-op: a failure after it is not this start's to undo
-            running_before = before is not None and (before.running or before.restarting)
+            running_before = not stopped_before
+            starts: list[asyncio.Future] = []
             # the start goes through the docker SDK; the SSH session is opened only once it
             # succeeded, for the remount (no shell fallback for a failed start), or for the
             # stale-mountpoint repair below
             async def _start() -> None:
-                await run_logged_rental_docker_sdk_operation(
-                    operation="start_container",
-                    log_extra=default_extra,
-                    # a pod created before rentals ran on RENTAL_NETWORK_NAME would keep docker0 across
-                    # every `docker start`; start moves it onto the rental network
-                    call=lambda: docker_client.start(
-                        container_name=container_name, network=RENTAL_NETWORK_NAME
-                    ),
-                    container_name=container_name,
+                # shielded: the SDK call runs in a thread a cancel cannot stop, so cleanup waits for it (below)
+                starts.append(
+                    asyncio.ensure_future(
+                        run_logged_rental_docker_sdk_operation(
+                            operation="start_container",
+                            log_extra=default_extra,
+                            # a pod created before rentals ran on RENTAL_NETWORK_NAME would keep docker0 across
+                            # every `docker start`; start moves it onto the rental network
+                            call=lambda: docker_client.start(
+                                container_name=container_name, network=RENTAL_NETWORK_NAME
+                            ),
+                            container_name=container_name,
+                        )
+                    )
                 )
+                await asyncio.shield(starts[-1])
+
+            async def _stop_after_starts() -> None:
+                await asyncio.gather(*starts, return_exceptions=True)
+                await self._stop_half_started_container(docker_client, container_name, default_extra)
 
             stale_mount_error: Exception | None = None
             try:
@@ -12465,9 +12474,7 @@ class DockerService:
                 # a pod left up without its plaintext mount writes the renter's data unencrypted into the
                 # container layer: put it back down, even when the start is cancelled
                 if not running_before:
-                    await _cleanup_to_completion(
-                        self._stop_half_started_container(docker_client, container_name, default_extra)
-                    )
+                    await _cleanup_to_completion(_stop_after_starts())
                 raise
 
     async def _stop_half_started_container(
