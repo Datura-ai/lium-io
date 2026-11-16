@@ -3075,6 +3075,23 @@ class SshdBootstrapMessages:
     )
 
 
+class ExecutorKeyCleanupMessages:
+    CHECKED = MessageTemplate(
+        event="Executor authorized_keys checked for foreign keys",
+        reason="EXECUTOR_KEY_CLEANUP_CHECKED",
+        severity="info",
+        category="runtime",
+        impact="Proceed; cleanup only",
+    )
+    UNREAD = MessageTemplate(
+        event="Executor authorized_keys not checked",
+        reason="EXECUTOR_KEY_CLEANUP_UNREAD",
+        severity="info",
+        category="runtime",
+        impact="Proceed; cleanup only",
+    )
+
+
 class SshdAuthLogMessages:
     LOGINS = MessageTemplate(
         event="Executor sshd logins since the last cycle",

@@ -84,6 +84,7 @@ from .checks import (
     ScoreCheck,
     SpecChangeCheck,
     SshdAuthLogCheck,
+    ExecutorKeyCleanupCheck,
     StorageLimitCheck,
     StaleContainerCleanupCheck,
     StartGPUMonitorCheck,
@@ -314,6 +315,9 @@ class PipelineFactory:
                 SshdAuthLogCheck(),
                 # DAH-5729: before any work on the node, the node must be the registering account's
                 NodeAccountCheck(),
+                # non-fatal: removes known foreign keys, logs unmarked ones; after the account check so only the
+                # registered node is touched
+                ExecutorKeyCleanupCheck(),
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
@@ -518,6 +522,9 @@ class PipelineFactory:
                 SshdAuthLogCheck(),
                 # DAH-5729: before any work on the node, the node must be the registering account's
                 NodeAccountCheck(),
+                # non-fatal: removes known foreign keys, logs unmarked ones; after the account check so only the
+                # registered node is touched
+                ExecutorKeyCleanupCheck(),
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
