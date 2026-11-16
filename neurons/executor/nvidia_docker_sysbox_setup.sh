@@ -400,9 +400,15 @@ def shift_batch(paths, base):
     n = 0
     todo = []
     for path in paths:
-        st = os.lstat(path)
-        link = stat.S_ISLNK(st.st_mode)
-        changed = 0 if link else shift_acls(path, base)
+        try:
+            st = os.lstat(path)
+            link = stat.S_ISLNK(st.st_mode)
+            changed = 0 if link else shift_acls(path, base)
+        except OSError as e:
+            # an entry the renter made (a path past PATH_MAX on the host: ENAMETOOLONG) stays as it is in that pod;
+            # it must never fail the unit, which holds Docker down for every pod on the host
+            print(f"skipped ...{path[-80:]}: {e.strerror}", file=sys.stderr, flush=True)
+            continue
         uid, gid = back(st.st_uid, base), back(st.st_gid, base)
         if (uid, gid) != (st.st_uid, st.st_gid):
             changed = 1
@@ -460,7 +466,10 @@ def main():
         base = os.lstat(upper).st_uid
         n = 0
         batch = []
-        for top, dirs, files in os.walk(upper):
+        def unreadable(e):
+            print(f"skipped ...{(e.filename or '')[-80:]}: {e.strerror}", file=sys.stderr, flush=True)
+
+        for top, dirs, files in os.walk(upper, onerror=unreadable):
             links = [x for x in dirs if os.path.islink(os.path.join(top, x))]
             for path in ([top] if top != upper else []) + [os.path.join(top, x) for x in files + links]:
                 batch.append(path)

@@ -256,6 +256,24 @@ def test_the_journal_holds_one_batch_at_most(tmp_path):
     assert not os.path.exists(reset["JOURNAL"])
 
 
+def test_a_renter_path_the_host_cannot_reach_is_skipped_and_the_rest_is_shifted(tmp_path):
+    # a path inside the pod below PATH_MAX can pass it on the host, after the upperdir prefix: ENAMETOOLONG
+    reset, fs = _fake_fs(tmp_path)
+    deep = str(fs.upper / "renterfile")
+    real = reset["os"].lstat
+
+    def lstat(p):
+        if p == deep:
+            raise OSError(36, "File name too long", p)
+        return real(p)
+
+    reset["os"].lstat = lstat
+    reset["main"]()
+    assert fs.owners[deep] == POD_BASE + 1000  # left as it is
+    assert fs.owners[str(fs.upper / "sudo")] == 0
+    assert fs.owners[str(fs.upper)] == 0  # the layer is done: the unit succeeds and Docker starts
+
+
 def test_a_replay_that_cannot_restore_keeps_the_journal_and_fails(tmp_path):
     reset, fs = _fake_fs(tmp_path)
     sudo = str(fs.upper / "sudo")
