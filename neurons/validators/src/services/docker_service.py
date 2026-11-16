@@ -77,7 +77,7 @@ from payload_models.payloads import (
     now_ms,
 )
 from daos.recovery_stop import UnmarkedRecoveryStopDao
-from services.volume_grow import order_labels
+from services.volume_grow import order_labels, reused_volume_grows_to_order
 from services.attestation_service import AttestationError, AttestationService
 from services import build_context as build_context_service
 from services.const import (
@@ -10657,6 +10657,7 @@ class DockerService:
                 effective_storage_limit_gb = payload.storage_limit_gb
                 local_volume_driver = None
                 grow_labels: dict[str, str] = {}
+                volume_grows_to_order = False
 
                 # Decided before the volume exists so a refusal below leaves nothing behind.
                 use_encrypted_volume = _should_encrypt_local_volume(
@@ -10818,6 +10819,7 @@ class DockerService:
                     )
                     if payload.workload_kind != WorkloadKind.FILLER:
                         grow_labels = order_labels(ordered_volume_gb, effective_volume_limit_gb)
+                        volume_grows_to_order = bool(grow_labels)
                     local_volume_driver = await self.create_local_volume(
                         ssh_client=ssh_client,
                         docker_client=docker_client,
@@ -10842,6 +10844,12 @@ class DockerService:
                     # "container creation" bucket and looks like `docker run`.
                     profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_VOLUME_CREATION, prev_timestamp))
                     prev_timestamp = now_ms()
+                elif payload.workload_kind != WorkloadKind.FILLER:
+                    # DAH-6073 review: a reboot mounts a volume granted short as it is, and the cleanup pass still
+                    # grows it: the reply says so too (its label carries the order)
+                    volume_grows_to_order = await reused_volume_grows_to_order(
+                        ssh_client, local_volume, effective_volume_limit_gb
+                    )
 
                 external_volume_name = None
                 if payload.bootstrap_restore and not use_encrypted_volume:
@@ -11712,7 +11720,7 @@ class DockerService:
                     volume_limit_gb=effective_volume_limit_gb,
                     local_volume_path=local_volume_path,
                     volume_encryption_status=volume_encryption_status,
-                    volume_grows_to_order=bool(grow_labels),
+                    volume_grows_to_order=volume_grows_to_order,
                     command_id=payload.command_id,
                 )
                 # Last, so nothing can fail after it: the pod is usable, the reply goes now, and

@@ -38,7 +38,18 @@ set -eu
 mp=$1 order=$2 headroom=$3 sparse=$4
 dev=$(findmnt -n -o SOURCE --target "$mp")
 case "$dev" in /dev/loop*) ;; *) echo not-loop; exit 0 ;; esac
-file=$(losetup -n -O BACK-FILE "$dev")
+if ! file=$(losetup -n -O BACK-FILE "$dev" 2>/dev/null); then
+  # no usable /dev/loopN node in the host's /dev (a host without udev, see setup_disk_reserve.sh; stand 16 Nov:
+  # "failed to use device: No such device"): the kernel's sysfs names the backing file, and losetup -c gets a node
+  # of its own made from the device's numbers, removed on exit
+  sysfs=${VOLUME_GROW_SYSFS:-/sys}/block/loop${dev#/dev/loop}
+  file=$(cat "$sysfs/loop/backing_file")
+  node=/dev/lium-volume-grow-loop${dev#/dev/loop}
+  rm -f "$node"
+  mknod "$node" b $(tr : ' ' < "$sysfs/dev")
+  trap 'rm -f "$node"' EXIT
+  dev=$node
+fi
 # the plugin opens it from its own rootfs, where the host's / is /srv
 [ -e "$file" ] || file=${file#/srv}
 # one pass at a time per host (a node can sit in two pipelines at once): another pass's stale target must never
@@ -96,6 +107,25 @@ def order_labels(ordered_gb: int | None, granted_gb: int | None) -> dict[str, st
     if ordered_gb is None or granted_gb is None or granted_gb >= ordered_gb:
         return {}
     return {ORDER_LABEL: str(ordered_gb)}
+
+
+async def reused_volume_grows_to_order(
+    ssh_client: asyncssh.SSHClientConnection, volume_name: str, size_gb: int | None
+) -> bool:
+    """A re-create (a reboot) mounts the pod's volume as it is: it still grows when its order label says it was granted
+    short and the size the backend sent is under that order. False when unread: never claim a grow."""
+    if size_gb is None:
+        return False
+    try:
+        result = await ssh_client.run(
+            f"/usr/bin/docker volume inspect {shlex.quote(volume_name)} "
+            + shlex.quote(f'--format={{{{index .Labels "{ORDER_LABEL}"}}}}'),
+            timeout=SSH_CALL_TIMEOUT_SECONDS,
+        )
+    except Exception:  # noqa: BLE001 - unread: the reply says no grow, as before
+        return False
+    order = (result.stdout or "").strip()
+    return result.exit_status == 0 and order.isdigit() and size_gb < int(order)
 
 
 @dataclass

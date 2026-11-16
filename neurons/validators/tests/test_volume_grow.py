@@ -16,6 +16,7 @@ from services.volume_grow import (
     credit_volumes_on_host,
     host_free_bytes,
     order_labels,
+    reused_volume_grows_to_order,
 )
 
 GB = 1024**3
@@ -212,6 +213,75 @@ def test_a_create_reply_says_the_volume_grows_only_when_it_was_labelled_short():
 
     assert reply(True)["volume_grows_to_order"] is True
     assert "volume_grows_to_order" not in reply(False)
+
+
+def test_a_host_with_no_usable_loop_node_reads_sysfs_and_resizes_through_a_node_of_its_own(tmp_path):
+    # stand 16 Nov (lio#2183 review): the host's /dev had no usable /dev/loop4, so every pass failed at losetup with
+    # "failed to use device: No such device". The kernel's sysfs still names the backing file and the device numbers.
+    log = tmp_path / "calls"
+    sysfs = tmp_path / "sys" / "block" / "loop4"
+    (sysfs / "loop").mkdir(parents=True)
+    (sysfs / "loop" / "backing_file").write_text("/data/volume_live\n")
+    (sysfs / "dev").write_text("7:4\n")
+    _stub(tmp_path, "findmnt", "echo /dev/loop4")
+    _stub(
+        tmp_path,
+        "losetup",
+        f'[ "$1" = -c ] && {{ echo "losetup $*" >> {log}; exit 0; }}; '
+        'echo "losetup: $3: failed to use device: No such device" >&2; exit 1',
+    )
+    _stub(tmp_path, "mknod", f'echo "mknod $*" >> {log}')
+    _stub(
+        tmp_path,
+        "stat",
+        f'case "$2" in %s) echo {110 * GB};; %b) echo {110 * GB // 512};; %B) echo 512;; esac',
+    )
+    _stub(tmp_path, "df", f'echo "Filesystem 1-blocks Used Available Use% Mounted"; echo "/dev/x 0 0 {500 * GB} 0% /"')
+    _stub(tmp_path, "fallocate", f'echo "fallocate $*" >> {log}')
+    _xfs(tmp_path, log, before=110 * GB, after=466 * GB)
+
+    result = subprocess.run(
+        ["sh", "-c", GROW_SCRIPT, "grow", "/mnt/volume_live", str(466 * GB), str(10 * GB), "false"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}", "VOLUME_GROW_SYSFS": str(tmp_path / "sys")},
+    )
+
+    assert result.stdout.strip().splitlines() == [f"allocated {356 * GB}", f"grown {466 * GB}"], result.stderr
+    assert log.read_text().splitlines() == [
+        "mknod /dev/lium-volume-grow-loop4 b 7 4",
+        f"fallocate -o {110 * GB} -l {356 * GB} /data/volume_live",
+        "losetup -c /dev/lium-volume-grow-loop4",
+        "xfs_growfs /mnt/volume_live",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stdout", "exit_status", "size_gb", "grows"),
+    [
+        ("36\n", 0, 28, True),  # the stand's reboot: 28 of 36 GB
+        ("36\n", 0, 36, False),  # grown to its order
+        ("<no value>\n", 0, 28, False),  # never granted short: no label
+        ("", 1, 28, False),  # unread
+        ("36\n", 0, None, False),  # no size sent: never claim a grow
+    ],
+)
+async def test_a_reboot_says_the_volume_grows_while_it_is_still_short_of_its_order(stdout, exit_status, size_gb, grows):
+    ssh = SimpleNamespace(run=AsyncMock(return_value=SimpleNamespace(exit_status=exit_status, stdout=stdout, stderr="")))
+
+    assert await reused_volume_grows_to_order(ssh, "volume_pod", size_gb) is grows
+    if size_gb is not None:
+        assert ssh.run.await_args.args[0] == (
+            f"/usr/bin/docker volume inspect volume_pod '--format={{{{index .Labels \"{ORDER_LABEL}\"}}}}'"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_reboot_whose_label_read_fails_says_no_grow():
+    ssh = SimpleNamespace(run=AsyncMock(side_effect=OSError("ssh closed")))
+
+    assert await reused_volume_grows_to_order(ssh, "volume_pod", 28) is False
 
 
 def test_the_host_script_finds_the_backing_file_outside_the_plugins_srv_view(tmp_path):
