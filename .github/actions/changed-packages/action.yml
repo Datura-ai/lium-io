@@ -93,6 +93,12 @@ runs:
               if (TEAM.includes(r.author_association) || await writes(r.user.login)) latest[r.user.login] = r.state;
             }
             approved = Object.values(latest).includes('APPROVED');
+            // an outside approval also starts route (test.yml); it must not launch the suites on a trusted reviewer's
+            // earlier approval, so on a review event the reviewer who triggered the run must count too
+            const trigger = context.payload.review;
+            if (approved && context.eventName === 'pull_request_review' && trigger?.user) {
+              approved = TEAM.includes(trigger.author_association) || await writes(trigger.user.login);
+            }
           } else {
             // merge group: base..head; push: before..after (all zeros on a new branch: no diff, every package)
             const mg = context.payload.merge_group;
