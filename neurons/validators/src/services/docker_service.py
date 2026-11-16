@@ -7361,7 +7361,13 @@ class DockerService:
                 operation="exec_register_vulkan_icd",
                 exec_spec=ContainerExecSpec(
                     container_name=container_name,
-                    argv=("sh", "-s", "--", "--vulkan-icd-only"),
+                    # kept on disk: the sshd watchdog it leaves re-runs the script (DAH-6042)
+                    argv=(
+                        "sh",
+                        "-c",
+                        f"cat > {shlex.quote(IN_CONTAINER_SSH_BOOTSTRAP_PATH)} "
+                        f"&& exec sh {shlex.quote(IN_CONTAINER_SSH_BOOTSTRAP_PATH)} --vulkan-icd-only",
+                    ),
                     stdin=self._ssh_bootstrap_script_path().read_text(),
                     idempotent=True,
                 ),

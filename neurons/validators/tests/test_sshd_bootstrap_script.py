@@ -420,6 +420,8 @@ def test_vulkan_icd_only_registers_the_driver_and_leaves_sshd_alone(harness):
     assert result.returncode == 0, result.stdout + result.stderr
     assert (harness.vulkan_icd_dir / "nvidia_egl_icd.json").exists()
     assert harness.sshd_start_attempts() == []
+    # DAH-6042: the image starts sshd once; the watchdog brings it back (spawned in the background)
+    assert "Started sshd watchdog" in result.stdout
 
 
 # DAH-6029: records the narrowed sources apt-get was pointed at (the temp dir is gone afterwards)
@@ -699,7 +701,8 @@ def test_watchdog_leaves_a_serving_sshd_alone(harness):
 
 
 def test_watchdog_restarts_sshd_when_nothing_listens_on_22_though_an_sshd_process_is_left(harness):
-    # a session process left behind is named sshd too; the listener is what the renter needs
+    # a session process left behind, or a killed sshd that a non-reaping PID 1 (sleep infinity) keeps as a
+    # zombie, is named sshd too; the listener is what the renter needs
     _watchdog_harness(harness, running=True, listening=False)
 
     result = harness.run("--watchdog-loop", LIUM_WATCHDOG_PASSES="2")

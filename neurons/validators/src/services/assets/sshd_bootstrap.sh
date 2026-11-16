@@ -432,6 +432,8 @@ watchdog_loop() {
     set +e
     passes=0
     while true; do
+        # first check one interval in: the bootstrap has just verified sshd, or the image is still starting it
+        sleep "$SLEEP_SECONDS"
         if ! is_sshd_running || ! is_sshd_listening; then
             acquire_lock
             if ensure_sshd_installed; then
@@ -452,7 +454,6 @@ watchdog_loop() {
         passes=$((passes + 1))
         # tests only: stop after N passes
         [ "$passes" = "${LIUM_WATCHDOG_PASSES:-}" ] && return 0
-        sleep "$SLEEP_SECONDS"
     done
 }
 
@@ -521,8 +522,12 @@ ensure_vulkan_egl_icd() {
     done
 }
 ensure_vulkan_egl_icd || true
-# an image that starts its own sshd gets only the ICD step (docker_service: image_manages_services)
-[ -z "${VULKAN_ICD_ONLY:-}" ] || exit 0
+# an image that starts its own sshd (docker_service: image_manages_services) gets the ICD step and
+# the watchdog: its start-up script starts sshd once and nothing brings it back (DAH-6042)
+if [ -n "${VULKAN_ICD_ONLY:-}" ]; then
+    spawn_watchdog
+    exit 0
+fi
 
 # 1. Somebody already brought sshd up (image entrypoint won outright, or this
 #    is a re-run) — adopt it, never touch host keys.
