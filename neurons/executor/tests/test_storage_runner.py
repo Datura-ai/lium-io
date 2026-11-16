@@ -2429,7 +2429,7 @@ def test_real_encrypted_restore_through_a_rental_symlink_stays_in_the_rental_roo
         "import os, sys, time; os.chroot(sys.argv[1]); os.chdir('/'); print('ready', flush=True); time.sleep(600)"
     )
     rental_process = subprocess.Popen(
-        [*probe[:-1], "--kill-child", "/bin/sh", "-c", 'mount -t proc proc "$1/proc" && exec "$2" -c "$3" "$1"',
+        [*probe[:-1], "--kill-child", "/bin/sh", "-c", 'mount --bind "$1" "$1" && mount -t proc proc "$1/proc" && exec "$2" -c "$3" "$1"',
          "sh", str(rental), sys.executable, keep_alive],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -2510,7 +2510,7 @@ threading.Thread(target=server.serve_forever, daemon=True).start()
 keep_alive = "import os, sys, time; os.chroot(sys.argv[1]); print('ready', flush=True); time.sleep(600)"
 rental_process = subprocess.Popen(
     ["unshare", "--user", "--map-root-user", "--mount", "--pid", "--fork", "--kill-child", "/bin/sh", "-c",
-     'mount -t proc proc "$1/proc" && exec "$2" -c "$3" "$1"', "sh", rental, sys.executable, keep_alive],
+     'mount --bind "$1" "$1" && mount -t proc proc "$1/proc" && exec "$2" -c "$3" "$1"', "sh", rental, sys.executable, keep_alive],
     stdout=subprocess.PIPE, text=True,
 )
 try:
