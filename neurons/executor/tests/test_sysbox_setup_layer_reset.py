@@ -3,6 +3,8 @@
 import json
 import os
 import re
+import stat
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -55,7 +57,7 @@ def _base() -> int:
     return POD_BASE if os.getuid() == 0 else os.getuid()
 
 
-def _run(root, *args: str, path: str = "") -> subprocess.CompletedProcess:
+def _run(root, *args: str, path: str = "", env: dict | None = None) -> subprocess.CompletedProcess:
     unit = (root / "etc/systemd/system/lium-sysbox-layer-reset.service").read_text()
     address = re.search(r"^Environment=LIUM_CONTAINERD_ADDRESS=(.*)$", unit, re.M).group(1)
     return subprocess.run(
@@ -65,6 +67,7 @@ def _run(root, *args: str, path: str = "") -> subprocess.CompletedProcess:
             "LIUM_LAYER_RESET_ROOT": str(root),
             "LIUM_CONTAINERD_ADDRESS": address,
             "PATH": path + os.environ["PATH"],
+            **(env or {}),
         },
         capture_output=True,
         text=True,
@@ -147,29 +150,67 @@ def test_a_docker_managed_containerd_store_is_read_through_a_containerd_started_
     assert out.stdout.splitlines() == [f"would shift 4 entries of {'d' * 12} back from {_base()}"]
 
 
-@pytest.mark.parametrize("cut_after", [None, 0, 1, 3])
-def test_a_reset_cut_off_part_way_is_finished_on_the_next_boot(tmp_path, cut_after):
-    # the layer's top directory is shifted last: until it is, the next boot sees the layer as shifted and redoes it
+def _acl(*entries) -> bytes:
+    # version 2, then (tag, perm, id) per entry: USER_OBJ, a named USER, GROUP_OBJ, a named GROUP, MASK, OTHER
+    return b"\x02\x00\x00\x00" + b"".join(struct.pack("<HHI", *e) for e in entries)
+
+
+def _fake_fs(tmp_path):
+    """The installed reset over an in-memory layer: owners, modes and xattrs per path; chown clears set-id bits and
+    file capabilities the way the kernel does."""
     _install(tmp_path)
     upper = Path(_container(tmp_path, "a" * 64, "sysbox-runc", "m1"))
-    renterfile = upper / "renterfile"
-    renterfile.touch()
-    modes = {str(p): os.lstat(p).st_mode for p in [upper, *upper.rglob("*")]}
-    owners = dict.fromkeys(modes, POD_BASE)
-    owners[str(renterfile)] = POD_BASE + 1000
+    for name in ("renterfile", "sudo"):
+        (upper / name).touch()
+    fs = SimpleNamespace(upper=upper, modes={}, owners={}, xattrs={})
+    for p in [upper, *upper.rglob("*")]:
+        fs.modes[str(p)] = os.lstat(p).st_mode
+        fs.owners[str(p)] = POD_BASE
+        fs.xattrs[str(p)] = {}
+    fs.owners[str(upper / "renterfile")] = POD_BASE + 1000
+    fs.modes[str(upper / "sudo")] = stat.S_IFREG | 0o4755
+    fs.xattrs[str(upper / "sudo")]["security.capability"] = b"cap-bytes"
+
+    def getxattr(p, name, **kw):
+        if name not in fs.xattrs[p]:
+            raise OSError(61, "No data available")
+        return fs.xattrs[p][name]
+
+    def lchown(p, u, g):
+        fs.owners[p] = u
+        fs.modes[p] &= ~(stat.S_ISUID | stat.S_ISGID)
+        fs.xattrs[p].pop("security.capability", None)
+
     reset = {}
     program = (tmp_path / "usr/local/sbin/lium-sysbox-layer-reset").read_text().rsplit("\nmain()", 1)[0]
     exec(program, reset)
-    reset.update(ROOT=str(tmp_path), DRY=False)
+    reset.update(
+        ROOT=str(tmp_path),
+        DRY=False,
+        JOURNAL=str(tmp_path / "var/lib/lium-sysbox-layer-reset/pending.jsonl"),
+        STARTED=str(tmp_path / "run/lium-docker-started"),
+    )
     reset["os"] = SimpleNamespace(
         path=os.path,
         walk=os.walk,
         kill=os.kill,
-        lstat=lambda p: SimpleNamespace(st_uid=owners[p], st_gid=owners[p], st_mode=modes[p]),
-        lchown=lambda p, u, g: owners.__setitem__(p, u),
-        chmod=lambda *a: None,
-        getxattr=lambda *a, **kw: None,
+        environ={},
+        makedirs=os.makedirs,
+        fsync=os.fsync,
+        remove=os.remove,
+        lstat=lambda p: SimpleNamespace(st_uid=fs.owners[p], st_gid=fs.owners[p], st_mode=fs.modes[p]),
+        lchown=lchown,
+        chmod=lambda p, m: fs.modes.__setitem__(p, stat.S_IFMT(fs.modes[p]) | m),
+        getxattr=getxattr,
+        setxattr=lambda p, name, value, **kw: fs.xattrs[p].__setitem__(name, value),
     )
+    return reset, fs
+
+
+@pytest.mark.parametrize("cut_after", [None, 0, 1, 3])
+def test_a_reset_cut_off_part_way_is_finished_on_the_next_boot(tmp_path, cut_after):
+    # the layer's top directory is shifted last: until it is, the next boot sees the layer as shifted and redoes it
+    reset, fs = _fake_fs(tmp_path)
     original = reset["shift_back"]
     calls = 0
 
@@ -188,7 +229,81 @@ def test_a_reset_cut_off_part_way_is_finished_on_the_next_boot(tmp_path, cut_aft
             reset["main"]()
     reset["shift_back"] = original
     reset["main"]()
-    assert owners == {p: 1000 if p == str(renterfile) else 0 for p in modes}
+    assert fs.owners == {p: 1000 if p.endswith("renterfile") else 0 for p in fs.modes}
+
+
+@pytest.mark.parametrize("cut", ["after_journal", "after_chown", "after_chmod"])
+def test_a_reset_cut_off_between_chown_and_restore_gets_the_setuid_bit_and_capabilities_back(tmp_path, cut):
+    reset, fs = _fake_fs(tmp_path)
+    sudo = str(fs.upper / "sudo")
+    real = SimpleNamespace(**vars(reset["os"]))
+    step = {"after_journal": "lchown", "after_chown": "chmod", "after_chmod": "setxattr"}[cut]
+
+    def cut_off(*a, **kw):
+        if a[0] == sudo:
+            raise InterruptedError()
+        return getattr(real, step)(*a, **kw)
+
+    if step == "lchown":
+        reset["os"].lchown = cut_off
+    elif step == "chmod":
+        reset["os"].chmod = cut_off
+    else:
+        reset["os"].setxattr = lambda p, n, v, **kw: cut_off(p) if n == "security.capability" else real.setxattr(p, n, v, **kw)
+    with pytest.raises(InterruptedError):
+        reset["main"]()
+    reset["os"] = real
+    reset["main"]()
+    assert fs.owners[sudo] == 0
+    assert stat.S_IMODE(fs.modes[sudo]) == 0o4755
+    assert fs.xattrs[sudo]["security.capability"] == b"cap-bytes"
+    assert not os.path.exists(reset["JOURNAL"])
+
+
+def test_named_acl_entries_are_shifted_back_also_when_the_owner_already_matches(tmp_path):
+    reset, fs = _fake_fs(tmp_path)
+    renter, etc = str(fs.upper / "renterfile"), str(fs.upper / "etc")
+    acl = _acl((0x01, 6, 0), (0x02, 6, POD_BASE + 1000), (0x04, 4, 0), (0x08, 4, POD_BASE + 1000), (0x10, 6, 0), (0x20, 4, 0))
+    fs.xattrs[renter]["system.posix_acl_access"] = acl
+    fs.xattrs[etc]["system.posix_acl_default"] = acl
+    fs.owners[etc] = 0  # an owner already shifted back by a cut-off run
+    reset["main"]()
+    want = _acl((0x01, 6, 0), (0x02, 6, 1000), (0x04, 4, 0), (0x08, 4, 1000), (0x10, 6, 0), (0x20, 4, 0))
+    assert fs.xattrs[renter]["system.posix_acl_access"] == want
+    assert fs.xattrs[etc]["system.posix_acl_default"] == want
+
+
+def test_a_failing_reset_keeps_docker_down_and_a_docker_restart_never_reruns_it(tmp_path):
+    reset, fs = _fake_fs(tmp_path)
+
+    def broken(*a):
+        raise OSError(5, "Input/output error")
+
+    reset["os"].lchown = broken
+    with pytest.raises(OSError):  # the unit fails, and with it Docker's start (Requires=)
+        reset["main"]()
+    dropin = (tmp_path / "etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf").read_text()
+    assert "Requires=lium-sysbox-layer-reset.service" in dropin
+    assert "After=lium-sysbox-layer-reset.service" in dropin
+    assert "ExecStartPost=/bin/touch /run/lium-docker-started" in dropin
+    assert "RemainAfterExit=yes" in (tmp_path / "etc/systemd/system/lium-sysbox-layer-reset.service").read_text()
+    # once Docker has started this boot, a rerun (Docker restart under live-restore) touches nothing
+    reset["os"].lchown = lambda *a: pytest.fail("touched a layer after Docker started")
+    os.makedirs(os.path.dirname(reset["STARTED"]), exist_ok=True)
+    open(reset["STARTED"], "w").close()
+    reset["main"]()
+
+
+def test_a_data_root_from_dockers_launch_settings_is_used(tmp_path):
+    # --data-root=/srv/docker on dockerd's command line, nothing in daemon.json: install records docker info's root
+    _install(tmp_path)
+    cid = "e" * 64
+    _container(tmp_path, cid, "sysbox-runc", "m1")
+    os.makedirs(tmp_path / "srv")
+    os.rename(tmp_path / "var/lib/docker", tmp_path / "srv/docker")
+    out = _run(tmp_path, "--dry-run", env={"LIUM_DOCKER_DATA_ROOT": "/srv/docker"})
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.splitlines() == [f"would shift 4 entries of {'e' * 12} back from {_base()}"]
 
 
 def test_nothing_is_touched_while_docker_runs(tmp_path):

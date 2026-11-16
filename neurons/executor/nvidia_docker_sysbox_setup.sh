@@ -253,16 +253,19 @@ shift_sysbox_layers_back_at_boot() {
     # stop (power loss, hard reset) the layer stays shifted, and the restart-policy start at boot mounts the image
     # layers unmapped: every image file is host uid 0, nobody inside the pod, so sudo and apt break (DAH-6503;
     # reproduced: a hard reset always, a clean reboot never). A boot oneshot before Docker shifts such a layer back.
-    local bin unit address
+    local bin unit dropin address root=""
     address=$(docker_containerd_address)
+    # Docker's effective data-root (its --data-root flag or --config-file included), as check_total_disk_for_vram reads it
+    [ -z "${SYSBOX_SETUP_HOST_ROOT:-}" ] && root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
     bin=$(host_path /usr/local/sbin/lium-sysbox-layer-reset)
     unit=$(host_path /etc/systemd/system/lium-sysbox-layer-reset.service)
-    mkdir -p "$(dirname "$bin")" "$(dirname "$unit")" || return 1
+    dropin=$(host_path /etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf)
+    mkdir -p "$(dirname "$bin")" "$(dirname "$unit")" "$(dirname "$dropin")" || return 1
     cat > "$bin" <<'PY' || return 1
 #!/usr/bin/python3 -I
 # Lium (nvidia_docker_sysbox_setup.sh): shift back the writable layer a sysbox pod kept after an unclean stop, the way
 # sysbox's own stop does. Runs at boot before Docker; --dry-run only prints. Setuid bits and file capabilities kept.
-import atexit, glob, json, os, re, stat, subprocess, sys, time
+import atexit, glob, json, os, re, stat, struct, subprocess, sys, time
 
 DRY = "--dry-run" in sys.argv
 ROOT = os.environ.get("LIUM_LAYER_RESET_ROOT", "")
@@ -271,9 +274,16 @@ RANGE = 65536
 # starts its own, which is not up before Docker: then this starts one on Docker's store for the lookup and stops it
 ADDRESS = os.environ.get("LIUM_CONTAINERD_ADDRESS", "/run/containerd/containerd.sock")
 _socket = None
+# mode and file capabilities of each entry whose chown clears them, written before the chown and replayed first
+JOURNAL = ROOT + "/var/lib/lium-sysbox-layer-reset/pending.jsonl"
+ACLS = ("system.posix_acl_access", "system.posix_acl_default")
+# set on tmpfs each time Docker starts (unit drop-in): a reset belongs only before Docker's first start of a boot
+STARTED = ROOT + "/run/lium-docker-started"
 
 
 def data_root():
+    if os.environ.get("LIUM_DOCKER_DATA_ROOT"):
+        return ROOT + os.environ["LIUM_DOCKER_DATA_ROOT"]
     try:
         return ROOT + json.load(open(ROOT + "/etc/docker/daemon.json")).get("data-root", "/var/lib/docker")
     except (OSError, ValueError):
@@ -325,20 +335,68 @@ def back(i, base):
     return i - base if base <= i < base + RANGE else i
 
 
+def shift_acls(path, base):
+    # named user/group entries of a POSIX ACL (version 2, then tag u16, perm u16, id u32 each) carry ids too
+    n = 0
+    for name in ACLS:
+        try:
+            raw = os.getxattr(path, name, follow_symlinks=False)
+        except OSError:
+            continue
+        out = bytearray(raw)
+        for off in range(4, len(raw) - 7, 8):
+            tag, perm, qid = struct.unpack_from("<HHI", raw, off)
+            if tag in (0x02, 0x08):  # ACL_USER, ACL_GROUP
+                struct.pack_into("<HHI", out, off, tag, perm, back(qid, base))
+        if out != raw:
+            n = 1
+            if not DRY:
+                os.setxattr(path, name, bytes(out), follow_symlinks=False)
+    return n
+
+
+def journal(entry):
+    os.makedirs(os.path.dirname(JOURNAL), exist_ok=True)
+    with open(JOURNAL, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def replay_journal():
+    # a run cut off between a chown and the mode/capability restore left them stripped: restore them first
+    try:
+        lines = open(JOURNAL).read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        try:
+            e = json.loads(line)
+            os.chmod(e["p"], e["m"])
+            if e["c"]:
+                os.setxattr(e["p"], "security.capability", bytes.fromhex(e["c"]), follow_symlinks=False)
+        except (OSError, ValueError, KeyError):
+            pass  # a torn last line, or an entry gone with its container
+    os.remove(JOURNAL)
+
+
 def shift_back(path, base):
     st = os.lstat(path)
+    link = stat.S_ISLNK(st.st_mode)
+    acl = 0 if link else shift_acls(path, base)
     uid, gid = back(st.st_uid, base), back(st.st_gid, base)
     if (uid, gid) == (st.st_uid, st.st_gid):
-        return 0
+        return acl
     if DRY:
         return 1
-    link = stat.S_ISLNK(st.st_mode)
     caps = None
     if not link:
         try:
             caps = os.getxattr(path, "security.capability", follow_symlinks=False)
         except OSError:
             pass
+        if caps or st.st_mode & (stat.S_ISUID | stat.S_ISGID):
+            journal({"p": path, "m": stat.S_IMODE(st.st_mode), "c": caps.hex() if caps else None})
     os.lchown(path, uid, gid)
     if not link:
         os.chmod(path, stat.S_IMODE(st.st_mode))  # chown clears setuid/setgid
@@ -351,6 +409,11 @@ def main():
     # a running pod's layer is shifted on purpose: only act while Docker is down, before it starts any pod
     if docker_running() and not DRY:
         sys.exit("Docker is running; not touching any layer")
+    if os.path.exists(STARTED) and not DRY:
+        print("Docker already ran this boot (its pods may still run under live-restore); nothing to reset", flush=True)
+        return
+    if not DRY:
+        replay_journal()
     d = data_root()
     for hc in glob.glob(f"{d}/containers/*/hostconfig.json"):
         try:
@@ -377,6 +440,8 @@ def main():
                 n += shift_back(os.path.join(top, name), base)
         n += shift_back(upper, base)  # last: its owner marks the layer done, so a cut-off run is redone next boot
         print(f"{'would shift' if DRY else 'shifted'} {n} entries of {cid[:12]} back from {base}", flush=True)
+    if not DRY and os.path.exists(JOURNAL):
+        os.remove(JOURNAL)  # every journaled entry got its mode and capabilities back above
 
 
 main()
@@ -390,13 +455,20 @@ Before=docker.service
 
 [Service]
 Type=oneshot
+# active for the rest of the boot: a later Docker restart (live-restore keeps pods running) never reruns it
+RemainAfterExit=yes
 Environment=LIUM_CONTAINERD_ADDRESS=$address
+Environment=LIUM_DOCKER_DATA_ROOT=$root
 ExecStart=/usr/bin/python3 -I /usr/local/sbin/lium-sysbox-layer-reset
 
 [Install]
 WantedBy=multi-user.target
 UNIT
+    # Docker starts only after a successful reset: never a pod on a half-reset layer (the reset log names the failure)
+    printf '[Unit]\nRequires=lium-sysbox-layer-reset.service\nAfter=lium-sysbox-layer-reset.service\n[Service]\nExecStartPost=/bin/touch /run/lium-docker-started\n' \
+        > "$dropin" || return 1
     [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] && return 0
+    systemctl is-active -q docker && touch /run/lium-docker-started  # this boot's Docker already started
     systemctl daemon-reload && systemctl enable lium-sysbox-layer-reset.service >/dev/null 2>&1
 }
 
