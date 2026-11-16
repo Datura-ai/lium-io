@@ -1455,6 +1455,26 @@ INFINIBAND_SYSFS_PATH = "/sys/class/infiniband"
 # IPV4_MAPPED_GID_PREFIX below, never on a position.
 GID_TABLE_ENTRIES_READ = 4
 IPV4_MAPPED_GID_PREFIX = "0000:0000:0000:0000:0000:ffff:"
+# DAH-6480: the subnet manager's GUID is not in sysfs; it is asked for with one SMInfo Get per port, as
+# `sminfo` does. umadN names its device and port here; /dev/infiniband/umadN sends the query.
+INFINIBAND_MAD_SYSFS_PATH = "/sys/class/infiniband_mad"
+INFINIBAND_DEV_PATH = "/dev/infiniband"
+# _IOWR(0x1b, 1, struct ib_user_mad_reg_req): registers a sender of LID-routed SMPs on the port
+UMAD_REGISTER_AGENT_IOCTL = 0xC01C1B01
+UMAD_REGISTER_REQUEST_BYTES = 28
+# struct ib_user_mad_hdr without the pkey_index tail, which only IB_USER_MAD_ENABLE_PKEY switches on
+UMAD_HEADER_BYTES = 56
+MAD_BYTES = 256
+SMP_LID_ROUTED_CLASS = 0x01
+SM_INFO_ATTRIBUTE = 0x0020
+MAD_METHOD_GET = 0x01
+MAD_METHOD_GET_RESPONSE = 0x81
+# an LID-routed SMP carries its attribute 64 bytes into the MAD; SMInfo starts with the SM port's GUID
+SMP_DATA_OFFSET = 64
+SM_INFO_TIMEOUT_MS = 500
+SM_INFO_RETRIES = 2
+# the whole walk's budget: a fabric that never answers must not hold up the machine scrape
+SM_GUID_QUERY_BUDGET_SECONDS = 15
 
 
 class NcuProfilingObservation:
@@ -1662,6 +1682,8 @@ class InfinibandPort:
         self.pkey = pkey
         self.gids = gids
         self.driver = driver
+        # filled by get_infiniband_ports: "" when the port is not InfiniBand or its SM did not answer
+        self.sm_guid = ""
 
     def as_payload(self) -> dict[str, str | list[str]]:
         return {
@@ -1678,6 +1700,7 @@ class InfinibandPort:
             "ib_pkey": self.pkey,
             "ib_gids": self.gids,
             "ib_driver": self.driver,
+            "ib_sm_guid": self.sm_guid,
         }
 
 
@@ -1715,6 +1738,93 @@ def read_infiniband_port(
         [gid for gid in gids if gid],
         read_driver_name(device_path),
     )
+
+
+def umad_device_of(device: str, port: str) -> str:
+    """The /dev/infiniband/umadN that sends MADs out of this device's port, "" if there is none."""
+    try:
+        for name in sorted(os.listdir(INFINIBAND_MAD_SYSFS_PATH)):
+            mad_path = f"{INFINIBAND_MAD_SYSFS_PATH}/{name}"
+            if read_sysfs_value(f"{mad_path}/ibdev") == device and read_sysfs_value(f"{mad_path}/port") == port:
+                return f"{INFINIBAND_DEV_PATH}/{name}"
+    except Exception:
+        pass
+    return ""
+
+
+def sm_info_request(agent_id: int, sm_lid: int) -> bytes:
+    """One umad write: the send header, then a LID-routed SMP Get(SMInfo) addressed to the SM's LID."""
+    header = (
+        agent_id.to_bytes(4, sys.byteorder)
+        + bytes(4)  # status
+        + SM_INFO_TIMEOUT_MS.to_bytes(4, sys.byteorder)
+        + SM_INFO_RETRIES.to_bytes(4, sys.byteorder)
+        + bytes(4)  # length
+        + bytes(8)  # qpn 0 (subnet management), qkey
+        + sm_lid.to_bytes(2, "big")
+    )
+    mad = (
+        bytes([1, SMP_LID_ROUTED_CLASS, 1, MAD_METHOD_GET])
+        + bytes(4)  # status, class-specific
+        + (0x5C11).to_bytes(8, "big")  # transaction id; the kernel puts the agent in its high half
+        + SM_INFO_ATTRIBUTE.to_bytes(2, "big")
+    )
+    return header + bytes(UMAD_HEADER_BYTES - len(header)) + mad + bytes(MAD_BYTES - len(mad))
+
+
+def sm_guid_of_response(response: bytes) -> str:
+    """The SM's port GUID from a Get(SMInfo) answer, written as sysfs writes a node_guid; "" if none came."""
+    if len(response) < UMAD_HEADER_BYTES + SMP_DATA_OFFSET + 8:
+        return ""
+    if int.from_bytes(response[4:8], sys.byteorder):
+        return ""  # the kernel handed the request back unanswered (timeout)
+    mad = response[UMAD_HEADER_BYTES:]
+    if mad[3] != MAD_METHOD_GET_RESPONSE or mad[4:6] != bytes(2):
+        return ""
+    if int.from_bytes(mad[16:18], "big") != SM_INFO_ATTRIBUTE:
+        return ""
+    guid = mad[SMP_DATA_OFFSET : SMP_DATA_OFFSET + 8].hex()
+    if guid == "0" * 16:
+        return ""
+    return ":".join(guid[i : i + 4] for i in range(0, 16, 4))
+
+
+def query_sm_guid(umad_path: str, sm_lid: int) -> str:
+    """Asks the port's subnet manager for its GUID. Read-only, the query `sminfo` sends; "" on any failure."""
+    fd = os.open(umad_path, os.O_RDWR)
+    try:
+        register = create_string_buffer(
+            bytes(21) + bytes([SMP_LID_ROUTED_CLASS, 1]) + bytes(5), UMAD_REGISTER_REQUEST_BYTES
+        )
+        if CDLL(None).ioctl(fd, c_ulonglong(UMAD_REGISTER_AGENT_IOCTL), register) != 0:
+            return ""
+        agent_id = int.from_bytes(register.raw[0:4], sys.byteorder)
+        os.write(fd, sm_info_request(agent_id, sm_lid))
+        # blocks for the answer or for the kernel to hand the request back once its retries time out
+        return sm_guid_of_response(os.read(fd, UMAD_HEADER_BYTES + MAD_BYTES))
+    finally:
+        os.close(fd)
+
+
+def query_sm_guids(ports: list) -> None:
+    for port in ports:
+        if port.link_layer.lower() != "infiniband" or not port.state.upper().endswith("ACTIVE"):
+            continue
+        try:
+            sm_lid = int(port.sm_lid, 16)
+            umad_path = umad_device_of(port.device, port.port)
+            if sm_lid and umad_path:
+                port.sm_guid = query_sm_guid(umad_path, sm_lid)
+        except Exception:
+            port.sm_guid = ""
+
+
+def fill_sm_guids(ports: list) -> None:
+    """Sets sm_guid on every active InfiniBand port whose SM answers, within SM_GUID_QUERY_BUDGET_SECONDS."""
+    # module-level target, not a nested def: the obfuscator renames a call's Name but not a nested def's own name
+    worker = threading.Thread(target=query_sm_guids, args=(ports,), daemon=True)
+    worker.start()
+    worker.join(SM_GUID_QUERY_BUDGET_SECONDS)
 
 
 class InfinibandObservation:
@@ -1765,6 +1875,7 @@ def get_infiniband_ports() -> InfinibandObservation:
         return InfinibandObservation([], f"{INFINIBAND_SYSFS_PATH} lists no devices")
     if not ports:
         return InfinibandObservation([], f"{len(device_names)} device(s) present, none exposing a port")
+    fill_sm_guids(ports)
     return InfinibandObservation(ports, "")
 
 
