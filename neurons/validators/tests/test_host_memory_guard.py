@@ -142,6 +142,18 @@ def test_cgroupfs_parent_with_more_protection_is_not_lowered(tmp_path):
     assert _read(tmp_path / "cg/docker/memory.min") == EX * 2
 
 
+def test_systemd_unit_with_more_protection_is_not_lowered(tmp_path):
+    run = _run_memory_min(tmp_path, "/system.slice/docker-abc.scope")
+    (tmp_path / "sd/system.slice").write_text(f"{UNITS_MIB * MIB * 4}\n")
+    (tmp_path / "sd/docker.service").write_text("infinity\n")
+
+    out = run()
+
+    assert _read(tmp_path / "sd/system.slice") == UNITS_MIB * MIB * 4
+    assert (tmp_path / "sd/docker.service").read_text().strip() == "infinity"
+    assert "memory_min_set system.slice" not in out
+
+
 def test_protected_total_stays_under_the_pod_reserve():
     assert UNITS_MIB * MIB + EX < 4 * 1024 * MIB
 

@@ -63,7 +63,9 @@ def _host_memory_min_script() -> str:
     inner = (
         "[ -d /run/systemd/system ] || { echo memory_min_skipped no_systemd; exit 0; }; "
         "[ -f /sys/fs/cgroup/cgroup.controllers ] || { echo memory_min_skipped no_cgroup_v2; exit 0; }; "
-        "set_min() { [ \"$(systemctl show -p MemoryMin --value \"$1\")\" = \"$2\" ] && return; "
+        # never lower a unit that already has more protection (infinity included), as set_cg_min below
+        "set_min() { v=$(systemctl show -p MemoryMin --value \"$1\"); "
+        "{ [ \"$v\" = infinity ] || [ \"$v\" -ge \"$2\" ]; } 2>/dev/null && return; "
         'systemctl set-property --runtime "$1" MemoryMin="$2" >/dev/null 2>&1 && echo "memory_min_set $1" '
         '|| echo "memory_min_failed $1 set_property_failed"; }; '
         f"for kv in {units}; do u=${{kv%=*}}; systemctl is-active -q \"$u\" && set_min \"$u\" \"${{kv#*=}}\"; done; "
