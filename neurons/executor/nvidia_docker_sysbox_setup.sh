@@ -248,6 +248,13 @@ docker_containerd_address() {
     echo "${a:-docker-managed}"  # Docker starts its own: the boot reset runs one on Docker's store itself
 }
 
+systemd_env() {
+    # a quoted Environment= line: systemd splits an unquoted one at a space ("/srv/docker data") and expands %
+    local v=$2
+    v=${v//\\/\\\\}; v=${v//\"/\\\"}; v=${v//%/%%}
+    printf 'Environment="%s=%s"\n' "$1" "$v"
+}
+
 shift_sysbox_layers_back_at_boot() {
     # Sysbox chowns a pod's writable layer into its uid range on start and back on a stop it sees. After an unclean
     # stop (power loss, hard reset) the layer stays shifted, and the restart-policy start at boot mounts the image
@@ -336,19 +343,48 @@ def back(i, base):
     return i - base if base <= i < base + RANGE else i
 
 
+def subid(name):
+    # the host id range sysbox maps pods into: the "sysbox:start:count" line of /etc/subuid or /etc/subgid
+    try:
+        lines = open(ROOT + name).read().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        parts = line.strip().split(":")
+        if len(parts) == 3 and parts[0] == "sysbox" and parts[1].isdigit() and parts[2].isdigit():
+            return int(parts[1]), int(parts[2])
+    return None
+
+
+def pod_base(i, ids):
+    # the start of the RANGE-sized slice of sysbox's range that id i falls in; None outside it (not shifted)
+    start, count = ids
+    return start + (i - start) // RANGE * RANGE if start <= i < start + count else None
+
+
+def xattr(path, name):
+    # None only when the attribute is absent or the filesystem has none; any other read error must stop the reset
+    # before a chown drops what could not be read
+    try:
+        return os.getxattr(path, name, follow_symlinks=False)
+    except OSError as e:
+        if e.errno in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP):
+            return None
+        raise
+
+
 def shift_acls(path, base):
     # named user/group entries of a POSIX ACL (version 2, then tag u16, perm u16, id u32 each) carry ids too
     n = 0
     for name in ACLS:
-        try:
-            raw = os.getxattr(path, name, follow_symlinks=False)
-        except OSError:
+        raw = xattr(path, name)
+        if raw is None:
             continue
         out = bytearray(raw)
         for off in range(4, len(raw) - 7, 8):
             tag, perm, qid = struct.unpack_from("<HHI", raw, off)
             if tag in (0x02, 0x08):  # ACL_USER, ACL_GROUP
-                struct.pack_into("<HHI", out, off, tag, perm, back(qid, base))
+                struct.pack_into("<HHI", out, off, tag, perm, back(qid, base[0] if tag == 0x02 else base[1]))
         if out != raw:
             n = 1
             if not DRY:
@@ -411,16 +447,11 @@ def shift_batch(paths, base):
                 raise
             print(f"skipped ...{path[-80:]}: {e.strerror}", file=sys.stderr, flush=True)
             continue
-        uid, gid = back(st.st_uid, base), back(st.st_gid, base)
+        uid, gid = back(st.st_uid, base[0]), back(st.st_gid, base[1])
         if (uid, gid) != (st.st_uid, st.st_gid):
             changed = 1
             if not DRY:
-                caps = None
-                if not link:
-                    try:
-                        caps = os.getxattr(path, "security.capability", follow_symlinks=False)
-                    except OSError:
-                        pass
+                caps = None if link else xattr(path, "security.capability")
                 todo.append((path, uid, gid, link, stat.S_IMODE(st.st_mode), caps))
         n += changed
     entries = [{"p": p, "m": m, "c": c.hex() if c else None}
@@ -448,6 +479,10 @@ def main():
         return
     if not DRY:
         replay_journal()
+    uids, gids = subid("/etc/subuid"), subid("/etc/subgid")
+    if not uids or not gids:
+        print("no sysbox range in /etc/subuid or /etc/subgid; nothing to reset", flush=True)
+        return
     d = data_root()
     for hc in glob.glob(f"{d}/containers/*/hostconfig.json"):
         try:
@@ -463,36 +498,50 @@ def main():
         if not upper or not os.path.isdir(upper):
             print(f"no writable layer found for sysbox container {cid[:12]}", file=sys.stderr, flush=True)
             continue
-        if os.lstat(upper).st_uid == 0:
+        # shifted = the top's owner lies in sysbox's range; the pod's slice comes from that range, not from the owner
+        # itself, which a renter's `chown 1000 /` moves (a top outside the range is unshifted, or already done)
+        top = os.lstat(upper)
+        bu = pod_base(top.st_uid, uids)
+        if bu is None:
             continue
-        base = os.lstat(upper).st_uid
+        base = (bu, pod_base(top.st_gid, gids) or gids[0] + (bu - uids[0]))
         n = 0
         batch = []
+
         def unreadable(e):
             if e.errno != errno.ENAMETOOLONG:
                 raise e
             print(f"skipped ...{(e.filename or '')[-80:]}: {e.strerror}", file=sys.stderr, flush=True)
 
-        # an explicit stack, not os.walk: before Python 3.12 (22.04 ships 3.10) os.walk recurses once per level, and a
-        # renter's tree ~1000 levels deep would end it in RecursionError
-        stack = [upper]
-        while stack:
-            top = stack.pop()
+        # one open directory per level, read entry by entry: memory stays at the depth plus one batch, however many
+        # entries a directory holds, and no recursion (os.walk before Python 3.12 recursed once per level)
+        dirs = []
+
+        def enter(path):
             try:
-                with os.scandir(top) as it:
-                    entries = [(e.path, e.is_dir(follow_symlinks=False)) for e in it]
+                dirs.append(os.scandir(path))
             except OSError as e:
                 unreadable(e)
+
+        enter(upper)
+        while dirs:
+            try:
+                entry = next(dirs[-1], None)
+            except OSError as e:
+                unreadable(e)
+                entry = None
+            if entry is None:
+                dirs.pop().close()
                 continue
-            stack += [path for path, is_dir in entries if is_dir]
-            for path in ([top] if top != upper else []) + [path for path, is_dir in entries if not is_dir]:
-                batch.append(path)
-                if len(batch) >= BATCH:
-                    n += shift_batch(batch, base)
-                    batch = []
+            batch.append(entry.path)
+            if len(batch) >= BATCH:
+                n += shift_batch(batch, base)
+                batch = []
+            if entry.is_dir(follow_symlinks=False):
+                enter(entry.path)
         batch.append(upper)  # last: its owner marks the layer done, so a cut-off run is redone next boot
         n += shift_batch(batch, base)
-        print(f"{'would shift' if DRY else 'shifted'} {n} entries of {cid[:12]} back from {base}", flush=True)
+        print(f"{'would shift' if DRY else 'shifted'} {n} entries of {cid[:12]} back from {bu}", flush=True)
 
 
 main()
@@ -508,8 +557,10 @@ Before=docker.service
 Type=oneshot
 # active for the rest of the boot: a later Docker restart (live-restore keeps pods running) never reruns it
 RemainAfterExit=yes
-Environment=LIUM_CONTAINERD_ADDRESS=$address
-Environment=LIUM_DOCKER_DATA_ROOT=$root
+# the walk holds one open directory per level of a layer (PATH_MAX allows ~2048)
+LimitNOFILE=65536
+$(systemd_env LIUM_CONTAINERD_ADDRESS "$address")
+$(systemd_env LIUM_DOCKER_DATA_ROOT "$root")
 ExecStart=/usr/bin/python3 -I /usr/local/sbin/lium-sysbox-layer-reset
 
 [Install]

@@ -27,6 +27,7 @@ def _install(root) -> None:
     script = (
         'host_path() { echo "${SYSBOX_SETUP_HOST_ROOT:-}$1"; }\nwarn() { echo "WARN $*"; }\n'
         + _function("docker_containerd_address")
+        + _function("systemd_env")
         + _function("shift_sysbox_layers_back_at_boot")
         + "shift_sysbox_layers_back_at_boot\n"
     )
@@ -37,6 +38,7 @@ def _install(root) -> None:
 
 
 def _container(root, cid: str, runtime: str, mount: str) -> str:
+    _subids(root)
     docker = root / "var/lib/docker"
     (docker / "containers" / cid).mkdir(parents=True)
     (docker / "containers" / cid / "hostconfig.json").write_text(json.dumps({"Runtime": runtime}))
@@ -57,9 +59,24 @@ def _base() -> int:
     return POD_BASE if os.getuid() == 0 else os.getuid()
 
 
+def _unit_env(unit: str, name: str) -> str:
+    # the value systemd reads from a quoted Environment= line
+    quoted = re.search(rf'^Environment="{name}=((?:[^"\\]|\\.)*)"$', unit, re.M).group(1)
+    return re.sub(r"\\(.)", r"\1", quoted).replace("%%", "%")
+
+
+def _subids(root, uid_base=None, gid_base=None) -> None:
+    # sysbox's host range, the way its installer writes it
+    (root / "etc").mkdir(parents=True, exist_ok=True)
+    uid = uid_base if uid_base is not None else _base()
+    gid = gid_base if gid_base is not None else (POD_BASE if os.getuid() == 0 else os.getgid())
+    (root / "etc/subuid").write_text(f"ubuntu:100000:65536\nsysbox:{uid}:65536\n")
+    (root / "etc/subgid").write_text(f"ubuntu:100000:65536\nsysbox:{gid}:65536\n")
+
+
 def _run(root, *args: str, path: str = "", env: dict | None = None) -> subprocess.CompletedProcess:
     unit = (root / "etc/systemd/system/lium-sysbox-layer-reset.service").read_text()
-    address = re.search(r"^Environment=LIUM_CONTAINERD_ADDRESS=(.*)$", unit, re.M).group(1)
+    address = _unit_env(unit, "LIUM_CONTAINERD_ADDRESS")
     return subprocess.run(
         [sys.executable, "-I", str(root / "usr/local/sbin/lium-sysbox-layer-reset"), *args],
         env={
@@ -160,6 +177,7 @@ def _fake_fs(tmp_path):
     file capabilities the way the kernel does."""
     _install(tmp_path)
     upper = Path(_container(tmp_path, "a" * 64, "sysbox-runc", "m1"))
+    _subids(tmp_path, POD_BASE, POD_BASE)
     for name in ("renterfile", "sudo"):
         (upper / name).touch()
     fs = SimpleNamespace(upper=upper, modes={}, owners={}, xattrs={})
@@ -305,6 +323,55 @@ def test_a_tree_deeper_than_the_recursion_limit_is_walked(tmp_path):
         sys.setrecursionlimit(limit)
     assert fs.owners[str(deep)] == 0
     assert fs.owners[str(fs.upper)] == 0
+
+
+@pytest.mark.parametrize(
+    ("top", "renterfile", "top_after", "renterfile_after"),
+    [
+        (POD_BASE, POD_BASE + 1000, 0, 1000),  # shifted, / owned by root in the pod
+        (POD_BASE + 1000, POD_BASE + 1000, 1000, 1000),  # shifted, the renter ran `chown 1000 /`
+        (0, 1000, 0, 1000),  # unshifted, / owned by root
+        (1000, 1000, 1000, 1000),  # unshifted (a clean stop), / owned by 1000 in the pod
+    ],
+)
+def test_the_pod_slice_comes_from_sysboxs_range_not_from_the_tops_owner(tmp_path, top, renterfile, top_after, renterfile_after):
+    reset, fs = _fake_fs(tmp_path)
+    shifted = top >= POD_BASE
+    for p in fs.owners:
+        fs.owners[p] = POD_BASE if shifted else 0
+    fs.owners[str(fs.upper)] = top
+    fs.owners[str(fs.upper / "renterfile")] = renterfile
+    reset["main"]()
+    assert fs.owners[str(fs.upper)] == top_after
+    assert fs.owners[str(fs.upper / "renterfile")] == renterfile_after
+    assert fs.owners[str(fs.upper / "sudo")] == 0
+
+
+@pytest.mark.parametrize("name", ["security.capability", "system.posix_acl_access"])
+def test_an_xattr_that_cannot_be_read_stops_the_reset_before_any_chown(tmp_path, name):
+    reset, fs = _fake_fs(tmp_path)
+    sudo = str(fs.upper / "sudo")
+    real = reset["os"].getxattr
+
+    def getxattr(p, n, **kw):
+        if p == sudo and n == name:
+            raise OSError(5, "Input/output error", p)
+        return real(p, n, **kw)
+
+    reset["os"].getxattr = getxattr
+    with pytest.raises(OSError):
+        reset["main"]()
+    assert fs.xattrs[sudo]["security.capability"] == b"cap-bytes"  # never dropped by a chown
+    assert fs.owners[str(fs.upper)] == POD_BASE  # the next boot retries the layer
+
+
+@pytest.mark.parametrize("value", ["/srv/docker data", 'a"b\\c%d', "/var/lib/docker"])
+def test_the_unit_environment_carries_a_data_root_with_spaces_unchanged(value):
+    line = subprocess.run(
+        ["bash", "-c", _function("systemd_env") + 'systemd_env LIUM_DOCKER_DATA_ROOT "$1"', "-", value],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert _unit_env(line, "LIUM_DOCKER_DATA_ROOT") == value
 
 
 def test_a_replay_that_cannot_restore_keeps_the_journal_and_fails(tmp_path):
