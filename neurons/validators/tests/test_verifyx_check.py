@@ -1069,3 +1069,30 @@ async def test_verifyx_skip_uses_the_kept_ema_once_the_backend_stops_sending_it(
     assert result.event.reason_code == Msg.STANDING_PROBE_FAILURE_SKIPPED.reason
     assert verifyx_service.called_with is None
     assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(500.0)
+
+
+@pytest.mark.asyncio
+async def test_a_measured_run_seeds_the_kept_ema_for_a_node_already_inactive(context_factory):
+    """A node inactive at deploy never got the backend's EMA: its own measured run seeds the copy."""
+    verifyx_service = DummyVerifyXService(
+        success=True, updated_specs={"network": {"download_speed": 500.0, "upload_speed": 100.0}}
+    )
+    services = build_services(verifyx=verifyx_service)
+
+    def inactive_run():
+        state = build_state(
+            specs={"gpu": {"count": 8}},
+            rented_data=RentedExecutorsResponse(executors={}, banned_guids=[], network_ema={}),
+        )
+        return context_factory(services=services, config=build_context_config(), state=state)
+
+    await VerifyXCheck().run(inactive_run())  # measured with no EMA from the backend
+    verifyx_service.called_with = None
+    standing = inactive_run()
+    await services.redis.set(f"rental_probe_failed:{standing.executor.uuid}", "container_create:gpu_flags")
+
+    result = await VerifyXCheck().run(standing)
+
+    assert result.event.reason_code == Msg.STANDING_PROBE_FAILURE_SKIPPED.reason
+    assert verifyx_service.called_with is None
+    assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(500.0)

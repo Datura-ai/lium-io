@@ -299,7 +299,18 @@ class VerifyXCheck:
         )
 
         if not _is_cold_sample_below_gate(ctx, result, prev_ema):
-            return self._judge(ctx, result, transport=transport, sizing=sizing, prev_ema=prev_ema)
+            judged = self._judge(ctx, result, transport=transport, sizing=sizing, prev_ema=prev_ema)
+            if prev_ema is None:
+                # the backend sends no EMA for an inactive node: its measured one seeds the copy the skip reads
+                network = (judged.updates or {}).get("state", ctx.state).specs.get("network") or {}
+                await _keep_ema_copy(
+                    ctx,
+                    NetworkEMA(
+                        ema_verifyx_download_speed=network.get("ema_verifyx_download_speed"),
+                        ema_verifyx_upload_speed=network.get("ema_verifyx_upload_speed"),
+                    ),
+                )
+            return judged
         # DAH-2959: a node's first sample decides its first cycle on its own (the EMA bootstraps
         # from it). 11 of 80 fresh nodes (2–5 Sep) measured 32–88 Mbps on that one sample — one
         # single-stream 260–500 MB CDN object, cold (the scrape's own speedtest read 0.7–1.7 Gbps
