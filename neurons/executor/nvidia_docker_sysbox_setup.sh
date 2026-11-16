@@ -241,9 +241,11 @@ docker_containerd_address() {
     [ -z "${SYSBOX_SETUP_HOST_ROOT:-}" ] \
         && a=$(systemctl show -p ExecStart --value docker 2>/dev/null | grep -o -- '--containerd[= ][^ ;]*' | head -1)
     a=${a#--containerd}; a=${a#[= ]}
-    [ -n "$a" ] || a=$(jq -r '.containerd // empty' "$(host_path /etc/docker/daemon.json)" 2>/dev/null)
+    # python3, not jq: this runs before the installer installs jq
+    [ -n "$a" ] || a=$(python3 -Ic 'import json, sys; print(json.load(open(sys.argv[1])).get("containerd") or "")' \
+        "$(host_path /etc/docker/daemon.json)" 2>/dev/null)
     [ -n "$a" ] || { [ -S "$(host_path /run/containerd/containerd.sock)" ] && a=/run/containerd/containerd.sock; }
-    echo "${a:-docker-managed}"
+    echo "${a:-docker-managed}"  # Docker starts its own: the boot reset runs one on Docker's store itself
 }
 
 shift_sysbox_layers_back_at_boot() {
@@ -260,14 +262,15 @@ shift_sysbox_layers_back_at_boot() {
 #!/usr/bin/python3 -I
 # Lium (nvidia_docker_sysbox_setup.sh): shift back the writable layer a sysbox pod kept after an unclean stop, the way
 # sysbox's own stop does. Runs at boot before Docker; --dry-run only prints. Setuid bits and file capabilities kept.
-import glob, json, os, re, stat, subprocess, sys, time
+import atexit, glob, json, os, re, stat, subprocess, sys, time
 
 DRY = "--dry-run" in sys.argv
 ROOT = os.environ.get("LIUM_LAYER_RESET_ROOT", "")
 RANGE = 65536
 # Docker's containerd, taken from its effective settings at install (unit Environment=); "docker-managed" when Docker
-# starts its own, which is not up before Docker
+# starts its own, which is not up before Docker: then this starts one on Docker's store for the lookup and stops it
 ADDRESS = os.environ.get("LIUM_CONTAINERD_ADDRESS", "/run/containerd/containerd.sock")
+_socket = None
 
 
 def data_root():
@@ -277,19 +280,32 @@ def data_root():
         return ROOT + "/var/lib/docker"
 
 
+def containerd_socket():
+    global _socket
+    if _socket is None:
+        _socket = ROOT + ADDRESS
+        if ADDRESS == "docker-managed" and docker_running():
+            _socket = ROOT + "/var/run/docker/containerd/containerd.sock"  # a dry run: Docker's own is up, never a second
+        elif ADDRESS == "docker-managed":
+            # the store Docker's own containerd keeps under its data-root; containerd restarts no container by itself
+            state = ROOT + "/run/lium-sysbox-layer-reset"
+            _socket = state + "/containerd.sock"
+            proc = subprocess.Popen(["containerd", "--config", "/dev/null", "--root", data_root() + "/containerd/daemon",
+                                     "--state", state + "/state", "--address", _socket],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            atexit.register(lambda: (proc.terminate(), proc.wait(30)))
+        deadline = time.monotonic() + 60
+        while not os.path.exists(_socket) and time.monotonic() < deadline:
+            time.sleep(1)  # ordered after containerd.service; a socket from another unit may come up later
+    return _socket
+
+
 def containerd_upper(cid):
     # Docker 29's containerd image store: the container's snapshot (key = container id, namespace moby) holds the
-    # writable layer; containerd runs before this unit and answers without starting any container
-    if ADDRESS == "docker-managed":
-        print(f"{cid[:12]}: Docker runs its own containerd, which is down before Docker; layer not checked",
-              file=sys.stderr, flush=True)
-        return None
-    deadline = time.monotonic() + 60
-    while not os.path.exists(ROOT + ADDRESS) and time.monotonic() < deadline:
-        time.sleep(1)  # the unit is ordered after containerd.service; a socket from another unit may come up later
+    # writable layer; containerd answers before Docker starts any container
     try:
-        out = subprocess.run(["ctr", "--address", ADDRESS, "-n", "moby", "snapshots", "--snapshotter", "overlayfs",
-                              "mounts", "/", cid],
+        out = subprocess.run(["ctr", "--address", containerd_socket(), "-n", "moby", "snapshots",
+                              "--snapshotter", "overlayfs", "mounts", "/", cid],
                              capture_output=True, text=True, timeout=60).stdout
     except (OSError, subprocess.SubprocessError):
         return None
@@ -380,7 +396,6 @@ ExecStart=/usr/bin/python3 -I /usr/local/sbin/lium-sysbox-layer-reset
 [Install]
 WantedBy=multi-user.target
 UNIT
-    [ "$address" != docker-managed ] || warn "Docker runs its own containerd: pods on the containerd image store are not checked at boot (run containerd as its own service to cover them)."
     [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] && return 0
     systemctl daemon-reload && systemctl enable lium-sysbox-layer-reset.service >/dev/null 2>&1
 }
