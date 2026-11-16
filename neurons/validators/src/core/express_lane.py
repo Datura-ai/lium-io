@@ -24,7 +24,7 @@ import logging
 import os
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -150,6 +150,28 @@ class _Pending:
     recheck_generation: int | None = None
 
 
+class _LaneOwnedNodes:
+    """What the wave leaves to the lane (MinerService.express_queued): the lane's queue, minus a
+    node whose failed-first-pass retry is due. The lane launches nothing for a miner the wave has
+    not listed yet, and each cycle start marks every miner so, so a due retry could wait cycle
+    after cycle while the wave kept leaving the node to the lane (DAH-6185); the wave runs it.
+    A live view of the queue, never a copy."""
+
+    def __init__(self, pending: dict[str, _Pending]):
+        self._pending: dict[str, _Pending] = pending
+
+    def _is_lane_owned(self, executor_id: str, now: float) -> bool:
+        pending = self._pending.get(executor_id)
+        return pending is not None and not (pending.failed_runs and pending.not_before <= now)
+
+    def __contains__(self, executor_id: object) -> bool:
+        return isinstance(executor_id, str) and self._is_lane_owned(executor_id, time.monotonic())
+
+    def __iter__(self) -> Iterator[str]:
+        now = time.monotonic()
+        return iter([e for e in self._pending if self._is_lane_owned(e, now)])
+
+
 class ExpressLane:
     def __init__(
         self,
@@ -171,9 +193,9 @@ class ExpressLane:
         self.cycle_inputs = cycle_inputs
         self.portal_api = portal_api
         self._pending: dict[str, _Pending] = {}
-        # The wave leaves what this lane has queued to it (MinerService._claim_for_cycle). The
-        # same dict, never rebound, so the wave always reads the current queue.
-        self.miner_service.express_queued = self._pending
+        # The wave leaves what this lane has queued to it (MinerService._claim_for_cycle), through
+        # a view of this dict, never rebound, so the wave always reads the current queue.
+        self.miner_service.express_queued = _LaneOwnedNodes(self._pending)
         self._tasks: set[asyncio.Task] = set()
         self._my_hotkey: str | None = None
         # Given up on this process's watch (MAX_ATTEMPTS without the miner returning them); the
@@ -551,6 +573,11 @@ class ExpressLane:
                 miner_address=miner.axon_info.ip,
                 miner_port=miner.axon_info.port,
             )
+            job_timeout = (
+                settings.JOB_TIME_OUT
+                if pending.recheck_deadline is None
+                else min(settings.JOB_TIME_OUT, max(0.0, pending.recheck_deadline - started))
+            )
             job = await asyncio.wait_for(
                 self.miner_service.request_job_to_miner(
                     payload=payload,
@@ -561,10 +588,9 @@ class ExpressLane:
                     executor_id=executor_id,
                     # Never scored, so the pipeline right-sizes its probes (DAH-3011).
                     first_pass=True,
+                    job_timeout=job_timeout,
                 ),
-                timeout=settings.JOB_TIME_OUT
-                if pending.recheck_deadline is None
-                else min(settings.JOB_TIME_OUT, max(0.0, pending.recheck_deadline - started)),
+                timeout=job_timeout,
             )
             if not os.path.isdir(directory):
                 # The hold keeps this directory across cycles, so it went away by another hand.
@@ -592,7 +618,7 @@ class ExpressLane:
             for result in results:
                 # published under the cycle's id; the backend reads this against a maintenance window's end
                 result.check_started_at = check_started_at
-            await self._publish(pending, miner, results, extra, started)
+            await self._publish(pending, miner, results, extra, started, payload.job_batch_id)
         except Exception as exc:
             pending.attempts = attempt
             logger.error(
@@ -623,6 +649,7 @@ class ExpressLane:
         results: list[JobResult],
         extra: dict[str, object],
         started: float,
+        job_batch_id: str,
     ) -> None:
         """Publish the executor's own result spec-only, record it as validated, log the metric.
 
@@ -633,6 +660,10 @@ class ExpressLane:
         """
         executor_id = pending.executor.id
         result = results[0]
+        if not (result.score > 0 or result.job_score > 0) or result.session_lost_in_port_check:
+            # An earlier pass in this batch must not keep the fallback off (review 4558893416).
+            self.miner_service.express_published.pop(executor_id.lower(), None)
+            self.miner_service.express_published_miner.pop(executor_id.lower(), None)
         if result.session_lost_in_port_check:
             # The run has no verdict: its findings still go out, and it is retried without spending one of
             # MAX_ATTEMPTS (bounded by SESSION_LOST_MAX_RUNS), neither a failed first pass nor validated.
@@ -661,14 +692,19 @@ class ExpressLane:
         await self.miner_service.publish_machine_specs(
             results, miner.hotkey, miner.coldkey, is_whole_miner_batch=False, remember_availability=True
         )
+        if passed:
+            # Only a pass has the pod check billing needs; a failed or lost run leaves the cycle's
+            # result-missing fallback in place (review 4558671509).
+            self.miner_service.express_published[executor_id.lower()] = job_batch_id
+            self.miner_service.express_published_miner[executor_id.lower()] = miner.hotkey
         pending.recheck_deadline = None
         if not should_run_first_pass_again:
             # A failed first pass that runs again keeps the request: the next tick selects it.
             with suppress(Exception):
                 await self._end_recheck(pending)
         if should_run_first_pass_again:
-            # Not recorded as validated, so the lane runs it again; a wave that starts meanwhile
-            # claims it through in_flight and its publish records it.
+            # Not recorded as validated, so the lane runs it again; a wave that lists its miner
+            # once the retry is due takes it instead (_LaneOwnedNodes) and its publish records it.
             pending.failed_runs += 1
             pending.not_before = time.monotonic() + FIRST_PASS_FAILED_RETRY_SECONDS
             self._log_published(pending, result, passed, extra, started)
