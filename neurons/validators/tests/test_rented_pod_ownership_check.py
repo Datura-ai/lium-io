@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from neurons.validators.src.services.task.checks.rented_pod_ownership import (
+    PATHS,
     RentedPodOwnershipCheck,
     judge,
     read_command,
@@ -159,7 +160,7 @@ def test_read_command_reports_a_missing_pid_without_failing(tmp_path):
     out = subprocess.run(
         ["sh", "-c", read_command([999], proc=str(tmp_path))], capture_output=True, text=True
     )
-    assert out.stdout == "999|||||||\n"
+    assert out.stdout == "999|" + "|" * len(PATHS) + "\n"
 
 
 @pytest.mark.parametrize(
@@ -206,6 +207,14 @@ async def test_the_read_includes_sudo_files_and_an_image_without_sudo_is_ok(
         "/etc/sudoers.d/README": me,
     }
     assert pods["pod_2"]["host_owners"] == {"/": me, "/root": me}
+
+
+def test_a_shifted_package_dir_warns_although_slash_root_and_sudo_are_inside():
+    # a partial shift left /usr/share owned by nobody while /, /root and sudo were fine: dpkg fails
+    pod = judge(
+        "4242|0 100000 65536|100000|100000|100000|100000|100000|100000|100000|100000|0|100000"
+    )
+    assert pod["outside_namespace"] == ["/usr/share"]
 
 
 def _ssh_with_uptime(proc: str, uptime_and_ages: str):
@@ -323,3 +332,10 @@ async def test_a_runtime_process_younger_than_a_pod_is_listed_as_its_own_outcome
     # its own outcome so the restart is logged at INFO even when the last cycle was OK
     assert result.event.reason_code == (Msg.RUNTIME_RESTARTED if restarted else Msg.OK).reason
     assert result.event.what_we_saw.get("runtime_restarted_under_pods") == restarted
+
+
+@pytest.mark.parametrize("template", [Msg.SHIFTED, Msg.SHIFTED_AFTER_CONTAINER_RESTART, Msg.SHIFTED_MIXED])
+def test_shifted_remediation_sends_provider_to_support_not_a_host_ownership_change(template):
+    assert "uid_map" not in template.remediation
+    assert "Contact support" in template.remediation
+    assert "free of charge" in template.remediation

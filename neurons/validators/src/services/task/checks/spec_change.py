@@ -35,7 +35,7 @@ class SpecChangeCheck:
             return CheckResult(
                 passed=False,
                 event=event,
-                updates={"clear_verified_job_info": True},
+                updates={"clear_verified_job_info": True, "gpu_respec": True},
                 # a live-rental GPU set change already failed GpuFingerprintCheck non-fatally: let the run reach the pod checks
                 fatal=ctx.gpu_fingerprint_passed,
             )
