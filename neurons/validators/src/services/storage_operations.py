@@ -37,10 +37,6 @@ STORAGE_HELPER_KEY_MARK = "helper:"
 # legitimately outlives that, so no record does either
 STARTED_STORAGE_HELPERS_TTL_SECONDS = 4 * 3600
 _STARTED_STORAGE_HELPERS_REDIS_TIMEOUT_SEC = 2
-# the runner deletes its spec once read (DAH-6463), so a cancel reports with the reporter kept here;
-# the operation's progress token lives at most 7 days, and so does this record
-STORAGE_REPORTER_PREFIX = "storage_reporter:"
-STORAGE_REPORTER_TTL_SECONDS = 7 * 24 * 3600
 
 
 def storage_helper_name(operation_id: UUID | str) -> str:
@@ -101,38 +97,6 @@ async def note_started_storage_helper(
         await redis.expire(_key(executor_id), STARTED_STORAGE_HELPERS_TTL_SECONDS)
 
     await _redis_call(f"record {operation_id} on {executor_id}", note)
-
-
-async def note_storage_reporter(
-    redis: RedisService, operation_id: UUID | str, spec: Mapping[str, object]
-) -> None:
-    reporter = spec.get("reporter")
-    if isinstance(reporter, Mapping):
-        await _redis_call(
-            f"keep the reporter of {operation_id}",
-            lambda: redis.set(
-                f"{STORAGE_REPORTER_PREFIX}{operation_id}",
-                json.dumps(dict(reporter)),
-                ex=STORAGE_REPORTER_TTL_SECONDS,
-            ),
-        )
-
-
-async def _stored_reporter_spec(
-    redis: RedisService, operation_id: UUID | str
-) -> Mapping[str, object] | None:
-    raw: list[object] = []
-
-    async def read() -> None:
-        raw.append(await redis.get(f"{STORAGE_REPORTER_PREFIX}{operation_id}"))
-
-    if not await _redis_call(f"read the reporter of {operation_id}", read) or not raw[0]:
-        return None
-    try:
-        reporter = json.loads(raw[0])
-    except (TypeError, json.JSONDecodeError):
-        return None
-    return {"reporter": reporter} if isinstance(reporter, Mapping) else None
 
 
 async def forget_storage_helper(
@@ -297,7 +261,6 @@ async def start_storage_operation(
     spec: Mapping[str, object],
     *,
     retain_terminal_artifacts: bool,
-    redis: RedisService | None = None,
 ) -> StorageOperationFiles:
     files = StorageOperationFiles.for_operation(operation_id)
     try:
@@ -323,7 +286,7 @@ async def start_storage_operation(
             return files
         if await _runner_alive(ssh_client, files):
             # an earlier dispatch's runner is still working, even before it wrote its PID or started
-            # its helper (it deletes the spec once read); a second runner would interrupt it.
+            # its helper; a second runner would interrupt it.
             # A helper whose runner died is an orphan: it is removed below and the run relaunched.
             return files
         if existing_state in {"EXITED", "INVALID"} or await _remote_file_exists(
@@ -338,8 +301,6 @@ async def start_storage_operation(
                     json.dumps(dict(spec), separators=(",", ":"), sort_keys=True)
                 )
             await sftp.chmod(str(files.spec), 0o600)
-        if redis is not None:
-            await note_storage_reporter(redis, operation_id, spec)
 
         runner = " ".join(
             shlex.quote(item)
@@ -447,12 +408,10 @@ async def _operation_state(
 async def cancel_storage_operation(
     ssh_client: asyncssh.SSHClientConnection,
     operation_id: UUID,
-    redis: RedisService | None = None,
 ) -> None:
     files = StorageOperationFiles.for_operation(operation_id)
+    # once the runner has read it, the spec holds only the reporter (DAH-6463)
     spec = await _read_operation_spec(ssh_client, files.spec)
-    if spec is None and redis is not None:
-        spec = await _stored_reporter_spec(redis, operation_id)
     helper_name = storage_helper_name(operation_id)
     cancel_path = shlex.quote(str(files.cancel))
     pid_path = shlex.quote(str(files.pid))
@@ -487,11 +446,6 @@ async def cancel_storage_operation(
         raise StorageOperationLaunchError("failed to cancel storage operation")
     if spec:
         await _report_cancelled(operation_id, spec)
-    if redis is not None:
-        await _redis_call(
-            f"drop the reporter of {operation_id}",
-            lambda: redis.delete(f"{STORAGE_REPORTER_PREFIX}{operation_id}"),
-        )
     await _remove_operation_artifacts(ssh_client, files)
 
 

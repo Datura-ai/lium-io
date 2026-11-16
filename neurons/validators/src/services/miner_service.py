@@ -1666,7 +1666,6 @@ class MinerService:
                         operation_id,
                         self._restic_backup_operation_spec(payload),
                         retain_terminal_artifacts=False,
-                        redis=self.redis_service,
                     )
                 except Exception:
                     await forget_storage_helper(
@@ -1732,7 +1731,6 @@ class MinerService:
                         operation_id,
                         self._restic_restore_operation_spec(payload),
                         retain_terminal_artifacts=False,
-                        redis=self.redis_service,
                     )
                 except Exception:
                     await forget_storage_helper(
@@ -1790,7 +1788,7 @@ class MinerService:
             client_keys=[pkey],
             known_hosts=await _storage_known_hosts(docker_service, executor_info, payload),
         ) as ssh_client:
-            await cancel_storage_operation(ssh_client, UUID(payload.operation_id), self.redis_service)
+            await cancel_storage_operation(ssh_client, UUID(payload.operation_id))
             await forget_storage_helper(
                 self.redis_service, executor_info.uuid, payload.operation_id
             )

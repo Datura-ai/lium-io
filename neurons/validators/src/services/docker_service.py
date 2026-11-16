@@ -12060,7 +12060,7 @@ class DockerService:
             )
         operation_id = UUID(restore.restore_log_id)
         # The spec is SFTP'd into the executor container (mode 0600) and carries the repository
-        # credentials and password; the runner deletes it as soon as it has read it (DAH-6463).
+        # credentials and password; once read, the runner leaves only the progress reporter in it (DAH-6463).
         # `encrypted_running` restores through the pod's live gocryptfs mount; the volume passphrase
         # never appears here (DAH-3274 — the former `encrypted_bootstrap` mode put it in the
         # helper's `docker run -e`, i.e. in `docker inspect` for the life of the pod).
@@ -12111,7 +12111,6 @@ class DockerService:
                 operation_id,
                 spec,
                 retain_terminal_artifacts=True,
-                redis=self.redis_service,
             )
             await wait_for_storage_operation(ssh_client, files)
         finally:
