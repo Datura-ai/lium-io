@@ -135,3 +135,65 @@ async def test_unrecorded_host_key_fails(recorded_machine, tmp_path):
     result = await _check_against(other, recorded)
     assert not result.passed
     assert result.event.reason_code == "NODE_ACCOUNT_MISMATCH"
+
+
+# DAH-6539: an IP node behind a relay forwarding to another account's machine
+POOL, CLAIM = "5Pool", "claim-of-this-account"
+
+
+class _HostFiles:
+    """The validator's SSH runner on a machine whose /etc/liumd files read `stdout` (fixed command only)."""
+
+    def __init__(self, stdout: str, success: bool = True):
+        self.stdout, self.success, self.commands = stdout, success, []
+
+    async def run(self, cmd, *, timeout=60, check=False, retryable=True, stdin_text=None):  # noqa: ASYNC109
+        from datetime import UTC, datetime
+
+        from services.task.runner import SSHCommandResult
+
+        self.commands.append(cmd)
+        now = datetime.now(UTC)
+        return SSHCommandResult(
+            command=cmd, command_id="c", exit_code=0 if self.success else 1, stdout=self.stdout, stderr="",
+            duration_ms=1, started_at=now, finished_at=now, success=self.success,
+        )
+
+
+def _relay_ctx(runner, hotkeys=("5Account", POOL), claim=CLAIM, address="203.0.113.7"):
+    executor = ExecutorSSHInfo(
+        uuid="node-1", address=address, port=8001, ssh_username="root", ssh_port=22, python_path="/usr/bin/python3",
+        root_dir="/root", expected_node_hotkeys=list(hotkeys) if hotkeys else None, expected_account_claim=claim,
+    )
+    return make_context(executor=executor, runner=runner)
+
+
+@pytest.mark.parametrize(
+    "files, reason",
+    [
+        ("hotkey=5Victim\nclaim=\n", "NODE_ACCOUNT_MISMATCH"),  # another provider's own-key machine
+        (f"hotkey={POOL}\nclaim=claim-of-another-account\n", "NODE_ACCOUNT_MISMATCH"),  # another account's pool node
+        (f"hotkey={POOL}\nclaim={CLAIM}\n", "NODE_ACCOUNT_SKIPPED"),  # its own pool node
+        ("hotkey=5Account\nclaim=\n", "NODE_ACCOUNT_SKIPPED"),  # its own own-key node
+        (f"hotkey={POOL}\nclaim=\n", "NODE_ACCOUNT_SKIPPED"),  # a pool node installed without a claim
+        ("hotkey=\nclaim=\n", "NODE_ACCOUNT_SKIPPED"),  # an executor that predates the host files
+    ],
+)
+async def test_ip_node_is_refused_on_a_machine_set_up_for_another_account(files, reason):
+    runner = _HostFiles(files)
+    result = await NodeAccountCheck().run(_relay_ctx(runner))
+    assert result.event.reason_code == reason
+    assert result.passed is (reason != "NODE_ACCOUNT_MISMATCH")
+    if not result.passed:
+        assert result.updates == {"clear_verified_job_info": True}
+    assert runner.commands == [
+        "printf 'hotkey=%s\\nclaim=%s\\n' \"$(cat /etc/liumd/miner_hotkey 2>/dev/null)\" "
+        "\"$(cat /etc/liumd/account_claim 2>/dev/null)\""
+    ]
+
+
+async def test_unread_files_or_an_older_miner_do_not_refuse():
+    assert (await NodeAccountCheck().run(_relay_ctx(_HostFiles("", success=False)))).passed
+    runner = _HostFiles("hotkey=5Victim\n")
+    assert (await NodeAccountCheck().run(_relay_ctx(runner, hotkeys=None))).passed
+    assert runner.commands == []
