@@ -15,6 +15,8 @@ from protocol.vc_protocol.compute_requests import NetworkEMA
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.redis_service import (
+    VERIFYX_LAST_EMA_PREFIX,
+    VERIFYX_LAST_EMA_TTL_SECONDS,
     VERIFYX_STALE_RUNS_TTL_SECONDS,
     create_started_at_key,
     verifyx_stale_runs_key,
@@ -189,6 +191,7 @@ class VerifyXCheck:
         await _reap_stale_runs(ctx)
         filler_container = _get_filler_only_container(ctx)
         stored_ema = _stored_network_ema(ctx)
+        await _keep_ema_copy(ctx, stored_ema)
         # A never-measured node is probed even under a filler: with no EMA to reuse it would
         # score 0 every cycle and stay hidden for as long as the filler runs.
         # A stored upload EMA below the floor is probed too: skipping would pass it while the
@@ -228,17 +231,19 @@ class VerifyXCheck:
         # The standing rental-probe failure fails this cycle and holds its VerifyX sample anyway
         # (verifyx_ema_hold_reason); on a slow link VerifyX's minutes left the probe, the only check
         # that clears the failure, too little cycle time to ever run again.
+        # The backend stops sending the EMA once the failed cycles make the node inactive: the copy kept here stands in.
+        last_ema = stored_ema or await _ema_copy(ctx)
         if (
-            stored_ema
-            and stored_ema.ema_verifyx_download_speed is not None
-            and stored_ema.ema_verifyx_download_speed >= MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
+            last_ema
+            and last_ema.ema_verifyx_download_speed is not None
+            and last_ema.ema_verifyx_download_speed >= MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
             and (
-                stored_ema.ema_verifyx_upload_speed is None
-                or stored_ema.ema_verifyx_upload_speed >= MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS
+                last_ema.ema_verifyx_upload_speed is None
+                or last_ema.ema_verifyx_upload_speed >= MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS
             )
             and await has_standing_failure(ctx)
         ):
-            updated_specs = specs_with_last_known_verifyx_ema(ctx)
+            updated_specs = specs_with_last_known_verifyx_ema(ctx, last_ema)
             event = render_message(
                 Msg.STANDING_PROBE_FAILURE_SKIPPED,
                 ctx=ctx,
@@ -891,6 +896,26 @@ def _stored_network_ema(ctx: Context) -> NetworkEMA | None:
     return rented_data.network_ema.get(ctx.executor.uuid) if rented_data else None
 
 
+async def _keep_ema_copy(ctx: Context, ema: NetworkEMA | None) -> None:
+    if ema is None or ema.ema_verifyx_download_speed is None:
+        return
+    try:
+        await ctx.services.redis.set(
+            f"{VERIFYX_LAST_EMA_PREFIX}:{ctx.executor.uuid}", ema.model_dump_json(), ex=VERIFYX_LAST_EMA_TTL_SECONDS
+        )
+    except Exception:
+        logger.warning(_m("Could not keep a copy of the VerifyX EMA", extra=get_extra_info(ctx.default_extra)))
+
+
+async def _ema_copy(ctx: Context) -> NetworkEMA | None:
+    try:
+        raw = await ctx.services.redis.get(f"{VERIFYX_LAST_EMA_PREFIX}:{ctx.executor.uuid}")
+        return NetworkEMA.model_validate_json(raw) if raw else None
+    except Exception:
+        logger.warning(_m("Could not read the copy of the VerifyX EMA", extra=get_extra_info(ctx.default_extra)))
+        return None
+
+
 def hold_verifyx_ema(ctx: Context, specs: dict[str, Any]) -> dict[str, Any]:
     """``specs`` with the VerifyX EMA put back to what the backend held before this cycle.
 
@@ -977,10 +1002,9 @@ def _get_filler_only_container(ctx: Context) -> str | None:
     return filler_container if filler_container and not has_customer_rental else None
 
 
-def specs_with_last_known_verifyx_ema(ctx: Context) -> dict:
+def specs_with_last_known_verifyx_ema(ctx: Context, network_ema: NetworkEMA | None = None) -> dict:
     specs = dict(ctx.state.specs or {})
-    rented_data = ctx.state.rented_data
-    network_ema = rented_data.network_ema.get(ctx.executor.uuid) if rented_data else None
+    network_ema = network_ema or _stored_network_ema(ctx)
     if not network_ema or network_ema.ema_verifyx_download_speed is None:
         return specs
 
