@@ -10817,7 +10817,7 @@ def test_pod_volume_path(volumes, existing_volume, expected):
     assert _pod_volume_path(volumes, existing_volume=existing_volume) == expected
 
 
-@pytest.mark.parametrize("template_volume", ["/workspace", "/workspace/", " /workspace/ "])
+@pytest.mark.parametrize("template_volume", ["/workspace", "/workspace/", " /workspace/ ", "//workspace", "/./workspace"])
 @pytest.mark.parametrize(("existing_volume", "expected"), [(False, "/workspace"), (True, "/root")])
 def test_a_trailing_slash_on_the_template_path_selects_the_same_mount(template_volume, existing_volume, expected):
     volumes = CustomOptions.sanitize(CustomOptions(volumes=[template_volume])).volumes
@@ -10837,6 +10837,12 @@ def test_a_trailing_slash_on_the_template_path_selects_the_same_mount(template_v
         "/data:/lium-cipher",
         "volume::/mnt",
         "volume::/lium-cipher",
+        "//mnt",
+        "//lium-cipher",
+        "/./mnt",
+        "/workspace/../mnt",
+        "///lium-cipher/x/",
+        "volume:://mnt",
     ],
 )
 async def test_create_refuses_a_reserved_volume_path_instead_of_moving_the_volume_to_root(

@@ -1,4 +1,5 @@
 import enum
+import posixpath
 import re
 from datetime import datetime
 from typing import Literal
@@ -11,6 +12,11 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_s
 # `/mnt` (where an attached Volume mounts) are reserved
 _BARE_VOLUME_PATH_RE = re.compile(r"^(?:/(?!\.{1,2}(?:/|$))[A-Za-z0-9._-]+)+$")
 _RESERVED_VOLUME_ROOTS = ('lium-cipher', 'mnt')
+
+
+def _normalized_path(path: str) -> str:
+    # "//mnt", "/./mnt" and "/x/../mnt" are /mnt to Docker: the reserved check and the mount read this one form
+    return posixpath.normpath('/' + path.lstrip('/')) if path.startswith('/') else path
 
 
 class CustomOptions(BaseModel):
@@ -60,7 +66,7 @@ class CustomOptions(BaseModel):
             if not volume or not volume.strip():
                 continue
             # the same last component _pod_volume_path mounts: "volume::/mnt" must not pass as ":/mnt"
-            container_path = volume.strip().split()[0].split(':')[-1].rstrip('/')
+            container_path = _normalized_path(volume.strip().split()[0].split(':')[-1])
             if container_path.startswith('/') and container_path.split('/')[1] in _RESERVED_VOLUME_ROOTS:
                 reserved.append(container_path)
         return reserved
@@ -81,7 +87,7 @@ class CustomOptions(BaseModel):
             # that came with flags is refused whole rather than stripped.
             if ':' not in clean_volume:
                 # the backend's template check accepts "/workspace/"; it is the same mount as "/workspace"
-                bare = volume.strip().rstrip('/')
+                bare = _normalized_path(volume.strip())
                 if (
                     _BARE_VOLUME_PATH_RE.fullmatch(bare)
                     and bare.split('/')[1] not in _RESERVED_VOLUME_ROOTS
