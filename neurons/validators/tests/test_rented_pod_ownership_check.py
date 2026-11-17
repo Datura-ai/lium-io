@@ -339,3 +339,41 @@ def test_shifted_remediation_sends_provider_to_support_not_a_host_ownership_chan
     assert "uid_map" not in template.remediation
     assert "Contact support" in template.remediation
     assert "free of charge" in template.remediation
+
+
+def _ctx_with_statuses(context_factory, ssh, statuses):
+    ctx = _ctx(context_factory, ssh)
+    for pod, status in zip(ctx.state.rented_data.executors["executor-123"].pods, statuses):
+        pod.status = status
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_each_read_pod_gets_its_verdict_for_billing(context_factory, tmp_path):
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me + 200000}      65536\n")
+    _proc(tmp_path, 4343, f"         0     {me}      65536\n")
+    result = await RentedPodOwnershipCheck().run(_ctx(context_factory, _ssh(str(tmp_path))))
+    assert result.updates["state"].rented_pod_faults == {"1": [Msg.SHIFTED.reason], "2": []}
+
+
+@pytest.mark.asyncio
+async def test_a_pod_whose_reboot_failed_is_judged_while_its_container_runs(context_factory, tmp_path):
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me + 200000}      65536\n")
+    _proc(tmp_path, 4343, f"         0     {me}      65536\n")
+    ctx = _ctx_with_statuses(context_factory, _ssh(str(tmp_path)), ["REBOOT_FAILED", "RUNNING"])
+    result = await RentedPodOwnershipCheck().run(ctx)
+    assert result.event.reason_code == Msg.SHIFTED.reason
+    assert result.updates["state"].rented_pod_faults == {"1": [Msg.SHIFTED.reason], "2": []}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_reboot_with_no_container_is_not_judged_and_not_unread(context_factory):
+    async def run(cmd, check=False):
+        return SimpleNamespace(exit_status=1, stdout="", stderr="No such object")
+
+    ctx = _ctx_with_statuses(context_factory, SimpleNamespace(run=run), ["REBOOT_FAILED", "STOPPED"])
+    result = await RentedPodOwnershipCheck().run(ctx)
+    assert result.event.reason_code == Msg.NOT_RENTED.reason
+    assert result.updates == {}

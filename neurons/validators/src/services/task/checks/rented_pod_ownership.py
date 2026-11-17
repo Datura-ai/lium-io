@@ -8,7 +8,7 @@ import asyncssh
 from ..messages import RentedPodOwnershipMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .rented_pod_resources import running_rented_container_names
+from .rented_pod_resources import pod_verdict_updates, running_rented_container_names
 
 READ_TIMEOUT_SECONDS = 30
 # docker starts a restart-policy container within a few minutes of boot; one started later was restarted alone
@@ -95,7 +95,10 @@ class RentedPodOwnershipCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         names = running_rented_container_names(ctx)
-        if not names:
+        # a pod whose reboot failed is read too when its container runs: a shift there is the host's, not the
+        # renter's; one with no running container is not judged and not counted as unread
+        reboot_failed = running_rented_container_names(ctx, statuses=("REBOOT_FAILED",))
+        if not names and not reboot_failed:
             return self._event(ctx, Msg.NOT_RENTED, {})
         # /proc/<pid> of a pod is visible only when the executor shares the host PID namespace
         if (ctx.state.specs or {}).get("executor_pid_mode") != "host":
@@ -106,7 +109,7 @@ class RentedPodOwnershipCheck:
             res = await asyncio.wait_for(
                 ctx.ssh.run(
                     "/usr/bin/docker inspect --format '{{.Name}} {{.State.Pid}}' "
-                    + " ".join(shlex.quote(n) for n in names),
+                    + " ".join(shlex.quote(n) for n in names + reboot_failed),
                     check=False,
                 ),
                 timeout=READ_TIMEOUT_SECONDS,
@@ -117,6 +120,8 @@ class RentedPodOwnershipCheck:
                 name, _, pid = line.partition(" ")
                 if (_num(pid) or 0) > 0:
                     pid_by_name[name.lstrip("/")] = _num(pid)
+            if not pid_by_name and not names:
+                return self._event(ctx, Msg.NOT_RENTED, {})
             if not pid_by_name:
                 return self._event(
                     ctx, Msg.UNREAD, {"reason": "no running rented container", "pods": names}
@@ -142,6 +147,9 @@ class RentedPodOwnershipCheck:
         # a requested pod not read back (missing from inspect, restarted before the read, or a garbled line)
         # is unknown, not healthy
         unread = sorted(set(names) - {p["container"] for p in pods.values()})
+        verdicts = pod_verdict_updates(
+            ctx, {p["container"]: [Msg.SHIFTED.reason] if p["outside_namespace"] else [] for p in pods.values()}
+        )
         what = {"pods": list(pods.values())}
         if pods:
             restarted = await self._runtime_restarted_under(ctx, list(pods.values()))
@@ -162,7 +170,7 @@ class RentedPodOwnershipCheck:
             template = Msg.OK
         if unread:
             what["unread"] = unread
-        return self._event(ctx, template, what)
+        return self._event(ctx, template, what, verdicts)
 
     async def _shift_template(self, ctx: Context, shifted: list[dict]):
         """A container restarted long after the host booted was not brought back by a host reboot: say so,
@@ -234,8 +242,10 @@ class RentedPodOwnershipCheck:
                 restarted[name] = under
         return restarted
 
-    def _event(self, ctx: Context, template, what: dict) -> CheckResult:
+    def _event(self, ctx: Context, template, what: dict, updates: dict | None = None) -> CheckResult:
         what = {"executor_uuid": ctx.executor.uuid, **what}
         return CheckResult(
-            passed=True, event=render_message(template, ctx=ctx, check_id=self.check_id, what=what)
+            passed=True,
+            event=render_message(template, ctx=ctx, check_id=self.check_id, what=what),
+            updates=updates or {},
         )
