@@ -13,7 +13,7 @@ import asyncssh
 
 from core.config import settings
 from core.utils import _m, get_extra_info
-from services.gpu_spec_table import matmul_probe_vram_mb
+from services.gpu_spec_table import name_reported_by_driver, matmul_probe_vram_mb
 
 logger = logging.getLogger(__name__)
 _rng = secrets.SystemRandom()
@@ -413,7 +413,7 @@ class ValidationService:
         # the same machine_info a run pinned to one card builds (prepare_matmul_challenge with
         # gpu_uuid), so the executor's key matches and the answer comes back sealed
         machine_info = json.dumps(
-            {"uuids": card_uuid, "gpu_count": 1, "gpu_model": gpu_model}, sort_keys=True
+            {"uuids": card_uuid, "gpu_count": 1, "gpu_model": name_reported_by_driver(gpu_model)}, sort_keys=True
         )
         params = VerifierParams()
         params.generate()
@@ -454,7 +454,7 @@ class ValidationService:
         # CUDA_VISIBLE_DEVICES env prefix, and never reveals which card/signal disagreed (anti-treadmill).
         pin = shlex.quote(card_uuid) if card_uuid else str(index)
         command = (
-            f"CUDA_VISIBLE_DEVICES={pin} {executor_info.python_path} {script_path} {challenge.params}"
+            f"CUDA_VISIBLE_DEVICES={pin} {shlex.quote(executor_info.python_path)} {shlex.quote(script_path)} {challenge.params}"
         )
         try:
             result = await ssh_client.run(command, timeout=MATRIX_VERIFY_TIMEOUT_SECONDS)
@@ -525,7 +525,8 @@ class ValidationService:
         gpu_info = {
             "uuids": gpu_uuids,
             "gpu_count": gpu_count,
-            "gpu_model": gpu_model,
+            # a modded model's classified name is not what the executor's driver reports (DAH-5508)
+            "gpu_model": name_reported_by_driver(gpu_model),
         }
         machine_info = json.dumps(gpu_info, sort_keys=True)
 
@@ -791,7 +792,7 @@ class ValidationService:
                     validator_error=True,
                 )
 
-            command = f"{executor_info.python_path} {script_path} {verifier_params}"
+            command = f"{shlex.quote(executor_info.python_path)} {shlex.quote(script_path)} {verifier_params}"
             if gpu_uuid is not None:
                 # gpu_uuid comes from host-reported specs, so it is quoted
                 command = f"CUDA_VISIBLE_DEVICES={shlex.quote(gpu_uuid)} {command}"

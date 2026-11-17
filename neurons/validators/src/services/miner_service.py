@@ -73,11 +73,13 @@ from services.docker_service import DockerService, create_steps_after_reply, cus
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.node_host import for_payload_miner, public_host_sock
 from services.redis_service import MACHINE_SPEC_CHANNEL, POD_STATES_CHANNEL, RedisService
+from services.efa_link_probe import measure_and_attach as measure_and_attach_efa
 from services.roce_link_probe import CYCLE_JOB_WAIT_SECONDS, PROBE_TAIL_MARGIN_SECONDS, measure_and_attach
 from services.ssh_service import SSHService
 from services.task.checks.duplicate_executor import _gpu_uuids
 from services.task.checks.rental_probe import wait_for_teardowns_after_verdict
 from services.task.availability import (
+    AvailabilityErrorCode,
     availability_errors,
     build_executor_unreachable_by_miner_event,
     build_rented_executor_not_listed_event,
@@ -304,6 +306,24 @@ EXPRESS_LANE = "express"
 # seeds that set once, after scoring and publishing — minutes after the miner's wave returned).
 # Kept in in_flight so the express lane does not run the same node a second time meanwhile.
 CYCLE_DONE = "cycle-done"
+# DAH-6137: a rented node whose pod was left on its old GPUs fails the check; the backend
+# moves the pod to the new cards and recreates it within ~30 s, so the wave (or a provider's
+# express recheck) checks it once more after this wait (12 Nov: the express recheck could not run beside the wave's claim, and the node
+# waited ~19 min for the next wave's publish).
+POD_GPUS_GONE_RERUN_DELAY_SECONDS = 60
+# A rerun starts only with at least this much of the miner's job budget left.
+POD_GPUS_GONE_RERUN_MIN_SECONDS = 240
+
+
+def _pod_left_on_old_gpus(result) -> bool:
+    """The result failed because a rented pod still runs on GPUs the node no longer has."""
+    if not isinstance(result, JobResult) or result.is_successful:
+        return False
+    return any(
+        error.get("reason_code") == "GPU_LOST"
+        and "pod_gpus_gone" in ((error.get("what_we_saw") or {}).get("faults") or [])
+        for error in result.availability_errors or []
+    )
 
 
 async def _gocryptfs_mount_is_live(ssh_client, container_name: str, plaintext_path: str) -> bool:
@@ -382,6 +402,8 @@ class MinerService:
         # executor uuid (lower case) -> the job_batch_id the express lane last published it under. That cycle has no
         # result of its own for the node, and its observations-only EXECUTOR_RESULT_MISSING would replace the lane's.
         self.express_published: dict[str, str] = {}
+        # the same uuid -> the miner hotkey that pass was for: two miners can report one uuid (review 4565706519)
+        self.express_published_miner: dict[str, str] = {}
         # DAH-5635: the running cycle's outage share for publish_unreachable_early; None = publish nothing early
         self.outage_tally: RunningOutageTally | None = None
         # DAH-5635: (miner hotkey, executor uuid) -> the availability errors this process's last cycle publish sent for
@@ -482,6 +504,67 @@ class MinerService:
                 )
             )
         return self._first_entry_per_uuid(requested, default_extra)
+
+    async def _rerun_pods_left_on_old_gpus(
+        self,
+        payload: MinerJobRequestPayload,
+        executors: list[ExecutorSSHInfo],
+        raw_results: list,
+        run,
+        job_started_at: float,
+        default_extra: dict,
+        publish_early: bool = True,
+        job_timeout: float | None = None,
+    ) -> None:
+        """DAH-6137: check once more, in place in ``raw_results``, each node whose pod was left on
+        its old GPUs, once the backend has had time to recreate the pod on the new cards, and
+        (a wave only: an express run publishes its own result next) publish a pass at once
+        (spec-only, as publish_gpu_set_changes; the cycle's publish carries the same result).
+        Kept to the miner's job budget; a rerun with no result keeps the first."""
+        stranded = [i for i, result in enumerate(raw_results) if _pod_left_on_old_gpus(result)]
+        if not stranded:
+            return
+        budget = (
+            (job_timeout or settings.JOB_TIME_OUT)
+            - CYCLE_JOB_WAIT_SECONDS
+            - PROBE_TAIL_MARGIN_SECONDS
+            - (time.monotonic() - job_started_at)
+            - POD_GPUS_GONE_RERUN_DELAY_SECONDS
+        )
+        extra = {**default_extra, "executor_uuids": [str(executors[i].uuid) for i in stranded]}
+        if budget < POD_GPUS_GONE_RERUN_MIN_SECONDS:
+            logger.info(_m("Pod left on old GPUs: no time to check again", extra=get_extra_info(extra)))
+            return
+        await asyncio.sleep(POD_GPUS_GONE_RERUN_DELAY_SECONDS)
+        timeout = min(settings.JOB_TIME_OUT - 120, budget)
+        reruns = await asyncio.gather(
+            *(run(executors[i], timeout) for i in stranded), return_exceptions=True
+        )
+        for i, rerun in zip(stranded, reruns):
+            # a failed rerun keeps the first result: its pod_gpus_gone event moves the pod off the cycle report
+            if isinstance(rerun, JobResult) and rerun.is_successful:
+                raw_results[i] = rerun
+        passed = [r for r in reruns if isinstance(r, JobResult) and r.is_successful]
+        logger.info(
+            _m(
+                "Pod left on old GPUs: checked again",
+                extra=get_extra_info({**extra, "passed": [str(r.executor_info.uuid) for r in passed]}),
+            )
+        )
+        if not passed or not publish_early:
+            return
+        try:
+            await self.publish_machine_specs(
+                passed, payload.miner_hotkey, payload.miner_coldkey, is_whole_miner_batch=False
+            )
+        except Exception as exc:
+            # never costs the miner its wave: the cycle still publishes the node
+            logger.error(
+                _m(
+                    "Pod left on old GPUs: early publish failed",
+                    extra=get_extra_info({**extra, "error": str(exc)}),
+                )
+            )
 
     def _release_cycle_claims(self, executors: list[ExecutorSSHInfo]) -> None:
         """The wave is done with these executors; they stay in in_flight as CYCLE_DONE until the
@@ -590,6 +673,7 @@ class MinerService:
         executor_image_snapshot: ExpectedImageSnapshot | None = None,
         executor_id: str | None = None,
         first_pass: bool = False,
+        job_timeout: float | None = None,
     ):
         """See _route_job_to_miner. A wave request that ends before the miner's list arrived
         (unreachable, refused, timed out) settles its miners_awaiting_wave_list entry too."""
@@ -602,6 +686,7 @@ class MinerService:
                 executor_image_snapshot,
                 executor_id=executor_id,
                 first_pass=first_pass,
+                job_timeout=job_timeout,
             )
             if executor_id is None:
                 await self.publish_gpu_set_changes(job)
@@ -619,6 +704,7 @@ class MinerService:
         executor_image_snapshot: ExpectedImageSnapshot | None = None,
         executor_id: str | None = None,
         first_pass: bool = False,
+        job_timeout: float | None = None,
     ):
         """Request job to miner over the miner's REST API.
 
@@ -627,6 +713,8 @@ class MinerService:
         filters register_pubkey on it, exactly as it does for the rental key-submit.
         first_pass (DAH-3011): this is the executor's first, unscored verification; handed to
         TaskService.create_task, where it shrinks the probes. The cycle never sets it.
+        job_timeout: the caller's own timeout around this call when shorter than JOB_TIME_OUT (an express recheck's
+        deadline); the pod-left-on-old-GPUs rerun must finish inside it.
         """
         logger.info(
             _m(
@@ -644,6 +732,7 @@ class MinerService:
             executor_image_snapshot,
             executor_id=executor_id,
             first_pass=first_pass,
+            job_timeout=job_timeout,
         )
 
     def _filter_task_results(
@@ -1032,6 +1121,17 @@ class MinerService:
             failure_reason_code=event.reason_code,
         )
 
+    def _express_passed(self, executor_uuid: str, job_batch_id: str, miner_hotkey: str) -> bool:
+        uuid = str(executor_uuid).lower()
+        return (
+            self.express_published.get(uuid) == job_batch_id and self.express_published_miner.get(uuid) == miner_hotkey
+        )
+
+    def _express_passed_after_unreachable(self, result: JobResult, miner_hotkey: str) -> bool:
+        return result.failure_reason_code == AvailabilityErrorCode.EXECUTOR_UNREACHABLE_BY_MINER and (
+            self._express_passed(result.executor_info.uuid, result.job_batch_id, miner_hotkey)
+        )
+
     def _build_unreachable_known_results(
         self,
         payload: MinerJobRequestPayload,
@@ -1075,7 +1175,11 @@ class MinerService:
                     )
                 )
             return []
-        skip = reached | manual
+        # The express lane verified it under this cycle's id after the miner's list came in (a node back from a
+        # reboot): that pass stands, or this stale row would hide the node until the next cycle.
+        skip = reached | manual | {
+            uuid for uuid in known if self._express_passed(uuid, payload.job_batch_id, payload.miner_hotkey)
+        }
         if rented_data:
             skip |= {str(uuid).lower() for uuid in rented_data.executors}
         results = []
@@ -1280,6 +1384,8 @@ class MinerService:
         default_extra = {
             "miner_hotkey": miner_hotkey,
         }
+        # checked again here: an express pass can land after the wave built the row (review 4582945951)
+        results = [result for result in results if not self._express_passed_after_unreachable(result, miner_hotkey)]
         if not results:
             return
 
@@ -1872,7 +1978,8 @@ class MinerService:
     async def list_executor_ids(self, miner: bittensor.NeuronInfo) -> list[str] | None:
         """The executor uuids a miner lists for this validator, or None when it does not answer.
 
-        The miner's POST /executors (verify_simple_validator_signature: we sign our own hotkey) is
+        The miner's POST /executors (verify_simple_validator_signature: the signed headers, plus the
+        legacy signature over our own hotkey for miners that predate DAH-6430) is
         a read of its executor table that installs nothing on the nodes, unlike the cycle's
         ssh-pubkey-submit. The express lane asks self-hosted miners, whose new nodes the portal
         snapshot does not list.
@@ -1888,7 +1995,7 @@ class MinerService:
                 method="POST",
                 url=f"http://{miner.axon_info.ip}:{miner.axon_info.port}/executors",
                 json_data=request.model_dump(),
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/json", **self._generate_auth_headers(my_key, miner.hotkey)},
                 timeout=REST_EXECUTOR_LIST_TIMEOUT,
                 log_extra=extra,
                 operation_name="executor list",
@@ -2102,6 +2209,7 @@ class MinerService:
         executor_image_snapshot: ExpectedImageSnapshot | None = None,
         executor_id: str | None = None,
         first_pass: bool = False,
+        job_timeout: float | None = None,
     ):
         """REST API version of request_job_to_miner."""
         # DAH-2667: what the RoCE probe subtracts from the cycle's own wait, so a job that already
@@ -2200,30 +2308,39 @@ class MinerService:
                 )
                 # DAH-3019: one start report for the whole miner, as its executors are launched.
                 self.task_service.report_verification_started(payload, executors)
-                try:
-                    tasks = [
-                        asyncio.create_task(
-                            asyncio.wait_for(
-                                self.task_service.create_task(
-                                    miner_info=payload,
-                                    executor_info=executor_info,
-                                    keypair=my_key,
-                                    private_key=private_key.decode("utf-8"),
-                                    public_key=public_key.decode("utf-8"),
-                                    encrypted_files=encrypted_files,
-                                    rented_data=rented_data,
-                                    default_docker_image_digests=default_docker_image_digests,
-                                    executor_image_snapshot=executor_image_snapshot,
-                                    attestation_nonce=attestation_nonce,
-                                    first_pass=first_pass,
-                                ),
-                                timeout=settings.JOB_TIME_OUT - 120
-                            )
-                        )
-                        for executor_info in executors
-                    ]
+                def run(executor_info, timeout: float = settings.JOB_TIME_OUT - 120):
+                    return asyncio.wait_for(
+                        self.task_service.create_task(
+                            miner_info=payload,
+                            executor_info=executor_info,
+                            keypair=my_key,
+                            private_key=private_key.decode("utf-8"),
+                            public_key=public_key.decode("utf-8"),
+                            encrypted_files=encrypted_files,
+                            rented_data=rented_data,
+                            default_docker_image_digests=default_docker_image_digests,
+                            executor_image_snapshot=executor_image_snapshot,
+                            attestation_nonce=attestation_nonce,
+                            first_pass=first_pass,
+                        ),
+                        timeout=timeout,
+                    )
 
+                try:
+                    tasks = [asyncio.create_task(run(executor_info)) for executor_info in executors]
                     raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+                    # the wave holds its claim (the express lane cannot run these nodes meanwhile); an express
+                    # run (a provider's recheck) waits in place too, so its one result is the moved pod's
+                    await self._rerun_pods_left_on_old_gpus(
+                        payload,
+                        executors,
+                        raw_results,
+                        run,
+                        job_started_at,
+                        default_extra,
+                        publish_early=executor_id is None,
+                        job_timeout=job_timeout,
+                    )
                 finally:
                     self._release_cycle_claims(executors)
                 results = self._filter_task_results(executors, raw_results, default_extra)
@@ -2244,14 +2361,12 @@ class MinerService:
                 # DAH-2667: while the miner's key is still installed and its idle hosts are free,
                 # measure every RoCE pair. Best effort — an unmeasured pair is simply not sold as a
                 # cluster.
-                await measure_and_attach(
-                    results,
-                    self.ssh_service.decrypt_payload(
-                        my_key.ss58_address, private_key.decode("utf-8")
-                    ),
-                    default_extra,
-                    job_started_at,
+                decrypted_key = self.ssh_service.decrypt_payload(
+                    my_key.ss58_address, private_key.decode("utf-8")
                 )
+                await measure_and_attach(results, decrypted_key, default_extra, job_started_at)
+                # DAH-5932: EFA pairs the same way, in whatever budget the RoCE sweep left.
+                await measure_and_attach_efa(results, decrypted_key, default_extra, job_started_at)
 
                 logger.info(
                     _m(

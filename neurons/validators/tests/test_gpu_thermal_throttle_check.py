@@ -179,6 +179,36 @@ async def test_a_low_clock_explained_by_a_power_cap_is_left_to_the_power_limit_c
 
 
 @pytest.mark.asyncio
+async def test_a_low_clock_explained_by_a_lowered_power_limit_is_left_to_the_power_limit_check(context_factory):
+    row = h100(graphics_speed=800, clocks_event_reasons=SW_POWER_CAP, power_limit=350, power_default_limit=700)
+
+    result = await run(context_factory, row)
+
+    assert result.event.reason_code == Msg.OK.reason
+
+
+@pytest.mark.asyncio
+async def test_a_power_cap_at_the_default_limit_holding_the_clock_under_half_is_flagged(context_factory):
+    # ticket-1219: two of eight cards at SW power cap, ~720 MHz of ~2000, power limit 600 W = default
+    row = h100(graphics_speed=720, clocks_event_reasons=SW_POWER_CAP, power_limit=600, power_default_limit=600)
+
+    result = await run(context_factory, row)
+
+    assert result.event.reason_code == Msg.THROTTLED.reason
+    assert result.event.what_we_saw["gpus"][0]["reasons"] == ["clock_below_half_of_max"]
+
+
+@pytest.mark.asyncio
+async def test_a_power_cap_at_the_default_limit_is_never_a_collapse(context_factory):
+    row = h100(graphics_speed=720, clocks_event_reasons=SW_POWER_CAP, power_limit=600, power_default_limit=600)
+
+    result = await run(context_factory, row)
+
+    assert result.passed
+    assert result.event.reason_code != Msg.COLLAPSED.reason
+
+
+@pytest.mark.asyncio
 async def test_an_old_scrape_without_the_new_fields_passes(context_factory):
     # the rows a scrape from before this change leaves: no temperature, max clock or reasons
     row = h100(graphics_speed=345)
