@@ -15,6 +15,7 @@ from dataclasses import dataclass, replace
 
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 
+from core.docker_utils import DockerCommand
 from core.utils import _m, get_extra_info
 
 from ..messages import PortCountMessages, render_message
@@ -148,10 +149,14 @@ async def _reprobe(
     # DAH-4537: one outside miss per cycle; a blocked re-probe after this cycle's blocked reading keeps its verdict
     if result.external_probe == "blocked" and ctx.state.external_probe_blocked:
         unreachable = ctx.state.externally_unreachable
+    elif result.external_probe is None:
+        # no outside reading in the re-probe: the cycle's outside verdict stands
+        unreachable = ctx.state.externally_unreachable
     else:
         unreachable = await port_connectivity.PortConnectivityCheck._outside_failure_confirmed(ctx, result)
     successful = [] if unreachable else list(result.successful_ports)
-    after = _without_pods(after, ctx, ended)
+    # a stale pod restarted during the re-probe keeps its id: it holds the node again, it has not ended
+    after = _without_pods(after, ctx, ended - await _running_again(ctx, after, ended))
     sysbox_runtime = ctx.state.sysbox_runtime or result.sysbox_measured is True
     return (
         replace(
@@ -175,6 +180,17 @@ async def _reprobe(
         ),
         None,
     )
+
+
+async def _running_again(ctx: Context, rented_data: RentedExecutorsResponse, pod_ids: set[str]) -> set[str]:
+    rental = rental_of_this_node(ctx, rented_data=rented_data)
+    running = set()
+    for pod in rental.pods if rental else []:
+        if pod.pod_id in pod_ids:
+            ps = await ctx.ssh.run(DockerCommand.ps_running(pod.container_name))
+            if ps.stdout.strip():
+                running.add(pod.pod_id)
+    return running
 
 
 async def _withhold_or_none(ctx: Context, why: str | None, extra: dict) -> Reprobe | None:

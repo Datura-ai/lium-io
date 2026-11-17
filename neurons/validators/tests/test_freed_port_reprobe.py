@@ -245,3 +245,43 @@ def test_a_run_whose_reprobe_did_not_finish_still_publishes_an_earlier_checks_re
     standing, withheld = withhold_renter_gpu_reset_verdicts({"5Miner": [reprobe]})
 
     assert (standing, withheld) == ({"5Miner": [reprobe]}, [])
+
+
+@pytest.mark.asyncio
+async def test_a_reprobe_with_no_outside_reading_keeps_the_cycles_outside_verdict(monkeypatch):
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "EXTERNAL_PORT_PROBE_ENFORCE", True)
+    ctx = _ctx()  # _result's re-probe has no outside reading (external_probe None)
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, externally_unreachable=True)})
+
+    result = await PortCountCheck().run(ctx)
+
+    assert result.passed is False and result.updates["port_count"] == 0
+    assert result.updates["state"].externally_unreachable is True
+    assert result.updates["state"].verified_port_pairs == []
+
+
+@pytest.mark.asyncio
+async def test_a_stale_pod_restarted_during_the_reprobe_still_holds_the_node():
+    from types import SimpleNamespace
+
+    from neurons.validators.src.services.task.checks.freed_port_reprobe import reprobe_freed_ports
+
+    def _stale_pod_listed() -> RentedExecutorsResponse:
+        listed = _rented(pod_ports=FREED)
+        pod = listed.executors[UUID].pods[0].model_copy(update={"pod_id": "pod-stale"})
+        return listed.model_copy(
+            update={"executors": {UUID: listed.executors[UUID].model_copy(update={"pods": [pod]})}}
+        )
+
+    ctx = _ctx(now=_stale_pod_listed())
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, rented_data=_stale_pod_listed())})
+    ssh = AsyncMock()
+    ssh.run.return_value = SimpleNamespace(stdout="container_pod-new\n")  # docker ps: running again
+    ctx = ctx.model_copy(update={"ssh": ssh})
+
+    reprobe = await reprobe_freed_ports(ctx, min_ports=len(FREED), ended_pod_ids={"pod-stale"})
+
+    pods = reprobe.state.rented_data.executors[UUID].pods
+    assert [pod.pod_id for pod in pods] == ["pod-stale"]
