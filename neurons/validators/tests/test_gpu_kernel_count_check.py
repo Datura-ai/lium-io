@@ -25,6 +25,11 @@ from services.nvidia_devices import (
     PROC_GPU_INFO_CMD,
 )
 
+from neurons.validators.src.services.task.availability import (
+    AvailabilityErrorCode,
+    availability_errors,
+    silence_availability_errors_on_our_own_outage,
+)
 from neurons.validators.src.services.task.checks.gpu_kernel_count import (
     GpuKernelCountCheck,
     evaluate_kernel_view,
@@ -37,6 +42,7 @@ from protocol.vc_protocol.compute_requests import (
     RentedPod,
 )
 
+from services.task.models import JobResult
 from tests.helpers import build_state
 
 REAL = [f"GPU-0000000{i}-5281-aabc-1a90-c91764f90d1{i}" for i in range(8)]
@@ -656,6 +662,15 @@ async def test_an_unattachable_card_on_a_rented_node_fails_but_does_not_stop_the
     assert result.passed is False
     assert result.fatal is False
     assert result.event.reason_code == Msg.UNATTACHABLE.reason
+    # node 134c6496: the live pod kept the run going, so the dead free card stayed listed and a rent on it
+    # failed at gpu_flags. The availability entry hides the node from new rentals; the live pod is untouched.
+    [entry] = availability_errors([result.event])
+    assert entry.reason_code == AvailabilityErrorCode.GPU_KERNEL_UNATTACHABLE
+    assert (entry.reach_source, entry.reach_target) == ("validator", "gpu")
+    assert entry.what_we_saw["unattachable_uuids"] == [REAL[3]]
+    # the node's own fault: never counted or silenced as our outage
+    results = [JobResult.model_construct(availability_errors=[entry.model_dump(mode="json")]) for _ in range(6)]
+    assert silence_availability_errors_on_our_own_outage(results) == 0
 
 
 @pytest.mark.parametrize("attachable", [REAL[:4], []], ids=["all-attachable", "lookup-empty"])

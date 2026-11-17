@@ -701,7 +701,7 @@ async def test_pod_restore_raises_a_gpu_whose_restore_failed_while_still_at_the_
 
 @pytest.mark.asyncio
 async def test_apply_keeps_the_cap_of_a_gpu_it_lowered() -> None:
-    ssh = fake_ssh(FakeRun(stdout="GPU-a, 400, 400, 100, 400\n"), *_set_ok(368))
+    ssh = fake_ssh(FakeRun(stdout="GPU-a, 400, 400, 100, 400\n"), FakeRun(stdout="boot-1\n"), *_set_ok(368))
     redis = FakeRedis()
 
     assert await apply_filler_gpu_power_limits(ssh, _limits(GPU_a=368), redis, POD_ID, EXECUTOR_ID) is GpuPowerCapResult.APPLIED
@@ -712,7 +712,7 @@ async def test_apply_keeps_the_cap_of_a_gpu_it_lowered() -> None:
 @pytest.mark.asyncio
 async def test_apply_keeps_no_cap_for_a_host_limit_within_a_watt_of_it() -> None:
     # 369 W against a 368 W cap would read as Lium's cap after the restore and be raised to default.
-    ssh = fake_ssh(FakeRun(stdout="GPU-a, 369, 400, 100, 400\n"), *_set_ok(368))
+    ssh = fake_ssh(FakeRun(stdout="GPU-a, 369, 400, 100, 400\n"), FakeRun(stdout="boot-1\n"), *_set_ok(368))
     redis = FakeRedis()
 
     assert await apply_filler_gpu_power_limits(ssh, _limits(GPU_a=368), redis, POD_ID, EXECUTOR_ID) is GpuPowerCapResult.APPLIED
@@ -724,7 +724,7 @@ async def test_apply_keeps_no_cap_for_a_host_limit_within_a_watt_of_it() -> None
 async def test_a_gpu_the_cap_raised_is_raised_to_default_when_its_record_is_lost() -> None:
     # A host under the floor (360 W of 400 W) was capped up to 368 W; its record is gone and it still
     # reads 368 W, so the renter must not start there.
-    apply_ssh = fake_ssh(FakeRun(stdout="GPU-a, 360, 400, 100, 400\n"), *_set_ok(368))
+    apply_ssh = fake_ssh(FakeRun(stdout="GPU-a, 360, 400, 100, 400\n"), FakeRun(stdout="boot-1\n"), *_set_ok(368))
     redis = FakeRedis()
     assert await apply_filler_gpu_power_limits(apply_ssh, _limits(GPU_a=368), redis, POD_ID, EXECUTOR_ID) is GpuPowerCapResult.APPLIED
     del redis.store[_restore_key("GPU-a")]
@@ -741,7 +741,7 @@ async def test_a_leftover_record_near_the_cap_keeps_the_host_limit_after_a_reboo
     # The next filler caps at 368 W: what the restore writes back (369 W) is within a watt of the cap, so
     # no cap is kept and the delete leaves the host's 369 W in place.
     redis = FakeRedis({_restore_key("GPU-a"): _record("GPU-a", 369)})
-    apply_ssh = fake_ssh(FakeRun(stdout="GPU-a, 400, 400, 100, 400\n"), *_set_ok(368))
+    apply_ssh = fake_ssh(FakeRun(stdout="GPU-a, 400, 400, 100, 400\n"), FakeRun(stdout="boot-1\n"), *_set_ok(368))
     assert await apply_filler_gpu_power_limits(apply_ssh, _limits(GPU_a=368), redis, POD_ID, EXECUTOR_ID) is GpuPowerCapResult.APPLIED
     assert json.loads(redis.store[_pod_index_key(POD_ID)]) == {"GPU-a": None}
     delete_ssh = fake_ssh(FakeRun(stdout="GPU-a, 368, 400, 100, 400\n"), *_set_ok(369))
@@ -756,7 +756,7 @@ async def test_a_gpu_still_at_an_old_cap_keeps_the_new_cap_when_its_record_says_
     # The GPU still reads an old 368 W cap, but its leftover record holds the host's real 400 W: the cap
     # is kept, so if that record is later lost the GPU is raised instead of reaching a renter at 368 W.
     redis = FakeRedis({_restore_key("GPU-a"): _record("GPU-a", 400)})
-    ssh = fake_ssh(FakeRun(stdout="GPU-a, 368, 400, 100, 400\n"), *_set_ok(368))
+    ssh = fake_ssh(FakeRun(stdout="GPU-a, 368, 400, 100, 400\n"), FakeRun(stdout="boot-1\n"), *_set_ok(368))
 
     assert await apply_filler_gpu_power_limits(ssh, _limits(GPU_a=368), redis, POD_ID, EXECUTOR_ID) is GpuPowerCapResult.APPLIED
 

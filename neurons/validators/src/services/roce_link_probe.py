@@ -204,7 +204,9 @@ def measured_gigabits_per_second(ib_write_bw_output: str) -> float | None:
     return float(match.group(1))
 
 
-def attach_measurement(result: JobResult, measurement: RoceLinkMeasurement) -> None:
+def attach_measurement(
+    result: JobResult, measurement: RoceLinkMeasurement, spec_key: str = SPEC_KEY
+) -> None:
     """Add one peer's result to this host's specs, where the backend's grouping reads them.
 
     Appended, never assigned: a host is measured against every other host of its segment in one
@@ -216,10 +218,11 @@ def attach_measurement(result: JobResult, measurement: RoceLinkMeasurement) -> N
         result.spec = {}
     kept: list[dict] = [
         entry
-        for entry in result.spec.get(SPEC_KEY) or []
-        if entry.get("peer_address") != measurement.peer_address
+        for entry in result.spec.get(spec_key) or []
+        # by identity, not address: hosts in different networks can share a private address
+        if entry.get("peer_executor_uuid") != measurement.peer_executor_uuid
     ]
-    result.spec[SPEC_KEY] = kept + [measurement.model_dump(mode="json")]
+    result.spec[spec_key] = kept + [measurement.model_dump(mode="json")]
 
 
 def _server_command() -> str:

@@ -1,10 +1,11 @@
 """A sysbox pod's /var/lib/docker is a capped, sparse vloopback volume, not an uncapped host volume."""
 
+import re
 from unittest.mock import AsyncMock
 
 import pytest
 from payload_models.payloads import ContainerCreateRequest, CustomOptions
-from services.docker_service import _parse_volume_host_probe
+from services.docker_service import _parse_volume_host_probe, _parse_volume_size_to_bytes
 from services.rental_docker_sdk import GpuDockerConfig, _build_host_config_kwargs
 
 from tests.test_deploy_optimizations import svc  # noqa: F401  (pytest fixture)
@@ -52,9 +53,9 @@ def test_sysbox_pod_mounts_a_capped_sparse_loopback_volume_at_var_lib_docker(svc
     "path,storage,dind,writable",
     [
         ("/root", 40, "20g", 20),  # DinD and the writable layer split the one allowance
-        ("/root", 41, "20.5g", 20.5),
+        ("/root", 41, "20992m", 20.5),  # Docker refuses a fractional size like 20.5g
         ("/root", 2, "1g", 1),
-        ("/root", 1, "0.5g", 0.5),  # a 1 GiB allowance still caps DinD, not drops its mount
+        ("/root", 1, "512m", 0.5),  # a 1 GiB allowance still caps DinD, not drops its mount
         ("/root", 32766, "16383g", 16383),
         ("/root", 40946, "16383g", 24563),  # DinD held at the ext4 16 TiB file limit
         ("/root", None, None, None),  # storage-opt unsupported: no cap to share
@@ -70,7 +71,9 @@ def test_dind_mount(svc, path, storage, dind, writable):  # noqa: F811
     else:
         [mount] = kwargs["mounts"]
         assert mount["VolumeOptions"]["DriverConfig"]["Options"]["size"] == dind
-        assert kwargs["storage_opt"] == {"size": f"{writable}g"}
+        size = kwargs["storage_opt"]["size"]
+        assert re.fullmatch(r"\d+[gm]", dind) and re.fullmatch(r"\d+[gm]", size)
+        assert _parse_volume_size_to_bytes(size) == writable * 1024**3
 
 
 _DIND = "a1" * 32

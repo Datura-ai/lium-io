@@ -10157,6 +10157,40 @@ async def test_a_filler_that_exits_at_start_sends_its_log_tail_as_its_own_detail
 
 
 @pytest.mark.asyncio
+async def test_a_restarting_filler_whose_first_log_read_is_empty_is_read_again_before_cleanup(
+    docker_service, monkeypatch
+) -> None:
+    """Docker's restart can print the image's output only after the first read (prod 9 Nov)."""
+    log_tail = AsyncMock(side_effect=["", "", "miner v2 starting\n"])
+    docker_service.rental_docker_client_factory.client.container_log_tail = log_tail
+    sleep_calls: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay_seconds: float) -> None:
+        # patching asyncio.sleep reaches every coroutine: still yield, or a polling loop never lets the test run
+        sleep_calls.append(delay_seconds)
+        await real_sleep(0)
+
+    monkeypatch.setattr("services.docker_service.asyncio.sleep", fake_sleep)
+    # other tasks in the loop sleep through the same stub (CI saw their 15 s waits): give the re-reads
+    # delays nothing else uses and count only those
+    reread_delays = (0.101, 0.102, 0.103)
+    monkeypatch.setattr("services.docker_service.FILLER_LOG_TAIL_REREAD_DELAYS_S", reread_delays)
+
+    result = await _create_failing_at_add_public_keys(
+        docker_service,
+        monkeypatch,
+        state=_state(status="running", running=True, restart_count=1),
+        exec_error=_EXEC_KILLED_BY_EXIT,
+    )
+
+    assert json.loads(result.detail.split(" >>> ", 1)[1])["container_logs_tail"] == "miner v2 starting"
+    assert log_tail.await_count == 3
+    # every re-read waits for the restarting image first
+    assert [d for d in sleep_calls if d in reread_delays] == [0.101, 0.102]
+
+
+@pytest.mark.asyncio
 async def test_a_key_injection_that_fails_in_a_running_container_keeps_the_exec_error(
     docker_service, monkeypatch
 ):
@@ -10845,3 +10879,36 @@ async def test_stop_container_success_replies_container_stopped(docker_service, 
 
     assert isinstance(result, ContainerStopped) and result.container_name == "pod_test"
     assert docker_service.rental_docker_client_factory.client.stopped_containers == ["pod_test"]
+
+
+@pytest.mark.asyncio
+async def test_generate_portMappings_skips_ports_a_port_check_holds_and_records_its_own(
+    docker_service, test_executor_id, test_miner_hotkey
+):
+    """DAH-6376 (4d077631): the batch port test held host port 20000 on the host network while a pod was given it.
+    A pod skips the ports a running check holds, and its own ports are recorded for the next check."""
+    docker_service.redis_service.probe_held_ports = AsyncMock(return_value={20000})
+    docker_service.redis_service.record_pending_pod_ports = AsyncMock()
+    available_raw = [PayloadPortMapping(internal_port=p, external_port=p, docker_port=None) for p in [20000, 20001]]
+
+    result, _ = await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, uuid4(), None, 1, available_ports_raw=available_raw, pod_mapping_raw=[]
+    )
+
+    assert {mapping[2] for mapping in result} == {20001}
+    docker_service.redis_service.record_pending_pod_ports.assert_awaited_once()
+    assert docker_service.redis_service.record_pending_pod_ports.await_args.args[:2] == (test_executor_id, [20001])
+
+
+@pytest.mark.asyncio
+async def test_generate_portMappings_keeps_held_ports_when_no_other_port_is_free(
+    docker_service, test_executor_id, test_miner_hotkey
+):
+    docker_service.redis_service.probe_held_ports = AsyncMock(return_value={20000})
+    available_raw = [PayloadPortMapping(internal_port=20000, external_port=20000, docker_port=None)]
+
+    result, _ = await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, uuid4(), None, 1, available_ports_raw=available_raw, pod_mapping_raw=[]
+    )
+
+    assert {mapping[2] for mapping in result} == {20000}
