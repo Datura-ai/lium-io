@@ -218,6 +218,19 @@ async def test_an_all_cards_matmul_lost_to_ssh_or_time_is_inconclusive(context_f
 
 
 @pytest.mark.asyncio
+async def test_a_card_that_times_out_again_on_the_retry_fails_the_recheck(context_factory):
+    # lio#2305: the probe retries a run with a timeout once; a card that times out again is a verdict here, whatever
+    # the MATMUL_ALLCARDS flags say (the recheck always runs the probe)
+    all_cards = _all_cards("", "timeout_after_retry")
+    ctx = _idle_ctx(context_factory, FakeRunner(probe_stdout("ok")), FakeValidation(all_cards))
+
+    result = await PostRentalGpuRecheckCheck().run(ctx)
+
+    assert result.passed is False and result.event.reason_code == Msg.FAILED.reason
+    assert KEY in ctx.services.redis.store
+
+
+@pytest.mark.asyncio
 async def test_a_filler_cycle_renews_the_marker(context_factory):
     runner, validation = FakeRunner(), FakeValidation()
     ctx = _idle_ctx(context_factory, runner, validation)

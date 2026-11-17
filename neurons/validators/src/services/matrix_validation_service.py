@@ -23,11 +23,8 @@ _rng = secrets.SystemRandom()
 # the outer JOB_TIME_OUT cancellation, which dies silently without a reason_code (DAH-2365).
 MATRIX_VERIFY_TIMEOUT_SECONDS = 120
 
-# DAH-2671 item 3 — wide aggregate wall-clock (seconds) per wave of MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS
-# cards for the all-claimed-cards work-proof. N honest cards run concurrently in ~single-card time; a
-# count lie that serialises onto one real card blows out to ~N*single-card. Deliberately wide so honest
-# slowdowns do not trip it (prod 10-16 Nov: an honest 8x B300 took 85 s). A 9-14 card host runs in two
-# waves (the gate below), so it gets two of these; up to 8 cards it is the flat 90 it always was.
+# DAH-2671 item 3: aggregate wall-clock (seconds) per wave of MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS cards for the
+# all-claimed-cards work-proof; a 9-14 card host runs in two waves (the gate below). Rationale: DAH-6576.
 MATMUL_ALLCARDS_WALL_CLOCK_SECONDS = 90
 
 # Cards probed at once. Each card takes an SSH channel on one connection and MAX_GPU_COUNT is 14,
@@ -35,12 +32,9 @@ MATMUL_ALLCARDS_WALL_CLOCK_SECONDS = 90
 # serialises) and stays clear of that ceiling on the widest honest hosts.
 MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS = 8
 
-# When a card times out and no card answered wrong, the WHOLE run is retried once: every card again, together,
-# with fresh challenges, after the first run's processes are killed, and timed on its own against the same
-# wall-clock. Retrying all cards together keeps the serialisation signal (a lone card retried after the
-# others finished would have the real card to itself). A timeout is never a pass: the retry decides, and a
-# card that times out again fails (`timeout_after_retry`). A wrong answer is never retried. Worst case:
-# two runs of MATRIX_VERIFY_TIMEOUT_SECONDS per wave plus the kill in between.
+# A run with a timeout and no wrong answer is retried once as a whole, after the first run's processes are killed;
+# the retry decides, and a card that times out again fails (`timeout_after_retry`). Worst case: two runs of
+# MATRIX_VERIFY_TIMEOUT_SECONDS per wave plus the kill in between. Rationale: DAH-6576.
 
 # VRAM (MB) the work-proof leaves untouched: a quarter of the card, clamped between the two.
 # The reserve must clear what an idle card may legally hold (GPU_HELD_VRAM_MB_LIMIT, 2048 MB —
@@ -356,9 +350,7 @@ class ValidationService:
         waves = -(-gpu_count // MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS)
         wall_clock_threshold = MATMUL_ALLCARDS_WALL_CLOCK_SECONDS * waves
         timed_out = any(outcome["reason"] == "timeout" for outcome in per_card)
-        # a run over the wall clock where every card answered right is retried like a timeout: honest runs come
-        # close to the limit (8x B300 85 s of 90 in prod, 10-17 Nov), so one slow run is measured again and the
-        # retry decides; cards that share fewer real GPUs are slow on the retry too
+        # a slow run where every card answered right is retried the same way (DAH-6576)
         slow = elapsed > wall_clock_threshold and all(outcome["ok"] for outcome in per_card)
         if (timed_out or slow) and all(outcome["reason"] != "wrong_answer" for outcome in per_card):
             # the whole run again, together, so the retry is as concurrent as the first try
@@ -835,7 +827,7 @@ class ValidationService:
         # local_verify.py) calls the same two functions around `POST /verify`.
         # DAH-2671 item 3: all-claimed-cards work-proof. Shadow (MATMUL_ALLCARDS_CHECK_ENABLED
         # without enforcement) logs timing + per-card outcome and NEVER changes the returned result;
-        # enforcement fails any claimed card without its own right answer, and a serialised aggregate
+        # enforcement fails any claimed card without its own right answer, and the aggregate
         # wall-clock. Only a single-card host skips it (probe returns None): the single-card run
         # below is that card's proof. A filler-node sample runs beside the filler, so it pins one
         # card per sample instead (checks/capability.py, enforced there).
