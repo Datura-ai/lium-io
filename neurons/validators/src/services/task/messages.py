@@ -1869,6 +1869,13 @@ class VerifyXMessages:
         category="policy",
         impact="Active filler runtime preserved; reused last-known VerifyX EMA when available",
     )
+    STANDING_PROBE_FAILURE_SKIPPED = MessageTemplate(
+        event="VerifyX validation skipped",
+        reason="VERIFYX_SKIPPED_STANDING_PROBE_FAILURE",
+        severity="info",
+        category="policy",
+        impact="Rental probe gets this cycle's time to clear its standing failure; reused last-known VerifyX EMA",
+    )
     NO_SPECS = MessageTemplate(
         event="VerifyX validation skipped (no specs)",
         reason="VERIFYX_NO_SPECS",
@@ -2502,6 +2509,13 @@ class RentalProbeMessages:
         category="runtime",
         impact="Proceed",
     )
+    CYCLE_WITHOUT_VERIFYX = MessageTemplate(
+        event="Cycle not passed: VerifyX did not run this cycle",
+        reason="RENTAL_PROBE_CYCLE_WITHOUT_VERIFYX",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0 for this cycle; VerifyX runs next cycle",
+    )
     PROBE_FAILED = MessageTemplate(
         event="Rental probe failed: a renter could not use this node",
         reason="RENTAL_PROBE_FAILED",
@@ -2855,6 +2869,18 @@ class RentedPodResourcesMessages:
             "cores in both its cpuset and its CPU quota; remove the script or loosen it to that."
         ),
     )
+    PROC_FUSE_DISCONNECTED = MessageTemplate(
+        event="A rented pod's /proc is disconnected on the host",
+        reason="RENTED_POD_PROC_FUSE_DISCONNECTED",
+        severity="warning",
+        category="runtime",
+        impact="Proceed without penalty; the renter's pod cannot read /proc/sys",
+        remediation=(
+            "The FUSE service behind the container's /proc (sysbox-fs) stopped or restarted, so the running "
+            "pod answers 'Transport endpoint is not connected'. Check `systemctl status sysbox`, restart it if "
+            "needed, then restart the pod container; tell the renter first."
+        ),
+    )
     RESOURCES_UNKNOWN = MessageTemplate(
         event="Rented pod CPU resources could not be read",
         reason="RENTED_POD_RESOURCES_UNKNOWN",
@@ -2950,6 +2976,15 @@ class RentedPodOwnershipMessages:
         "after the host stopped without a clean shutdown. A restart does not repair it. Contact support: the "
         "renters are moved to fresh pods free of charge. Do not change file ownership on the host or restart "
         "a rented pod's container yourself, and shut the host down cleanly.",
+    )
+    RUNTIME_RESTARTED = MessageTemplate(
+        event="Container runtime restarted under running rented pods",
+        reason="RENTED_POD_OWNERSHIP_RUNTIME_RESTARTED",
+        severity="warning",
+        category="runtime",
+        impact="Proceed; pods running across a sysbox or NVIDIA fabric manager restart can lose /proc paths or NVLink",
+        remediation="A runtime service listed in runtime_restarted_under_pods started after the listed pods. "
+        "Contact support before changing anything on the host; restarting the pod alone does not repair it.",
     )
     UNREAD = MessageTemplate(
         event="Rented pod file ownership not read",

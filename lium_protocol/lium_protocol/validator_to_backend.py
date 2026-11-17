@@ -177,7 +177,7 @@ class PodContainerState(pydantic.BaseModel):
     pod_id: str
     container_state: ContainerState
     observed_at: datetime
-    # 2.16.0: the size in GB of a pod's /root volume granted short of its order, after this cycle's grow; left off
+    # 2.17.0: the size in GB of a pod's /root volume granted short of its order, after this cycle's grow; left off
     # the wire when None, so every other pod's state reads as before
     volume_limit_gb: int | None = pydantic.Field(default=None, exclude_if=lambda value: value is None)
 
@@ -449,7 +449,7 @@ class ContainerCreated(PodContainerResponse):
     volume_limit_gb: int | None = None
     local_volume_path: str | None = None
     volume_encryption_status: VolumeEncryptionStatus | None = None
-    # DAH-6073 (protocol 2.16.0): the volume was granted short of its order and labelled, so a later cleanup pass
+    # DAH-6073 (protocol 2.17.0): the volume was granted short of its order and labelled, so a later cleanup pass
     # grows it online as disk frees; left off the wire when False
     volume_grows_to_order: bool = pydantic.Field(default=False, exclude_if=lambda value: not value)
     # the ContainerCreateRequest's command_id, echoed so the backend can tell which dispatch this completes
@@ -576,6 +576,8 @@ class GpuResetErrorCode(enum.Enum):
     ExecutorUnreachable = "ExecutorUnreachable"
     # 2.4.0: sysbox or TEE pod, no supported clocks, or the driver refused the lock
     ClockLockNotSupported = "ClockLockNotSupported"
+    # 2.16.0: the host GPU listing failed, timed out or came back empty: the GPUs are gone from the host driver
+    GpusLostOnHost = "GpusLostOnHost"
 
 
 class GpuResetOutcome(pydantic.BaseModel):
