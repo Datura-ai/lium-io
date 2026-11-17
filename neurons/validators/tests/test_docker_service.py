@@ -3224,6 +3224,8 @@ async def test_start_container_remounts_when_container_state_is_encrypted(docker
         # here means the ciphertext is gone, and re-initialising would hide that
         allow_init=False,
     )
+    # the executor's start watcher skips encrypted pods, so the validator restarts platform Jupyter after the remount
+    assert any("lium-jupyter-restart.sh" in c.args[0] for c in ssh_client.run.await_args_list)
 
 
 @pytest.mark.asyncio
@@ -10768,7 +10770,8 @@ async def test_the_flatten_lease_is_released_however_the_create_ends(
 async def test_no_flatten_no_lease_release(docker_service):
     ssh = _node_ssh()
     assert await _create_with_flatten(docker_service, _SysboxFailingRentalClient(set()), AsyncMock(), ssh=ssh) == "cid"
-    ssh.run.assert_not_awaited()
+    # only the host memory guard ran on the node
+    assert [c for c in ssh.run.await_args_list if "MemoryMin" not in c.args[0]] == []
 
 
 @pytest.mark.asyncio

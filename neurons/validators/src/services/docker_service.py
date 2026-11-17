@@ -148,6 +148,7 @@ from services.gpu_clocks import (
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, reset_pod_gpus
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.hung_gpu_reset import HungGpuResult, reset_hung_pod_gpus
+from services.host_memory_guard import apply_host_memory_guard
 from services.image_flatten import (
     FLATTEN_NO_DISK_RENTER_SENTENCE,
     FLATTEN_SIZING_SLACK_BYTES,
@@ -1927,6 +1928,10 @@ async def _record_validator_start(ssh_client: asyncssh.SSHClientConnection, cont
             check=False,
             timeout=30,
         )
+
+
+# written by run_jupyter.sh when the validator installs Jupyter; absent on a pod without platform Jupyter
+_JUPYTER_RESTART_CMD = "[ -f /tmp/lium-jupyter-restart.sh ] || exit 0; exec sh /tmp/lium-jupyter-restart.sh"
 
 
 class _UnkillableParkedContainer(Exception):
@@ -3721,7 +3726,7 @@ class DockerService:
         cancel (the copy is free for the next flatten's cleanup)."""
         flatten_lease: list[str] = []
         try:
-            return await self._run_rental_docker_create_attempts(
+            container_id = await self._run_rental_docker_create_attempts(
                 docker_client=docker_client,
                 ssh_client=ssh_client,
                 run_spec=run_spec,
@@ -3738,6 +3743,8 @@ class DockerService:
                 flatten_lease=flatten_lease,
                 pod_id=pod_id,
             )
+            await apply_host_memory_guard(ssh_client, default_extra)
+            return container_id
         finally:
             for lease in flatten_lease:
                 try:
@@ -12788,6 +12795,16 @@ class DockerService:
             log_tag=f"start_container_{pod_id}",
             log_extra=default_extra,
         )
+        if encrypted_volume_name:
+            # the executor's start watcher skips encrypted pods (no SSH before the remount): bring the platform
+            # Jupyter back here, after it, with the token and port run_jupyter.sh saved (DAH-6379)
+            with contextlib.suppress(asyncssh.Error, OSError, TimeoutError):
+                await ssh_client.run(
+                    f"/usr/bin/docker exec -d -u 0 {shlex.quote(container_name)} sh -c "
+                    f"{shlex.quote(_JUPYTER_RESTART_CMD)}",
+                    check=False,
+                    timeout=30,
+                )
         if not ssh_bootstrap_ok:
             logger.warning(
                 _m(
