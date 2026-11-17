@@ -675,7 +675,7 @@ async def test_a_delete_cancels_a_create_before_taking_the_pod_lock_its_clock_re
     create_go = asyncio.Event()
 
     async def create():
-        with ds.inflight_creates.track("pod1"):
+        with ds.inflight_creates.track("pod1", ("hk", "ex")):
             await create_go.wait()
             await service._reset_leftover_clock_locks_before_create(None, _create_payload(), {})
 
@@ -773,8 +773,8 @@ async def test_a_reboot_its_delete_cancelled_runs_no_hung_gpu_reset(monkeypatch)
     reset = AsyncMock()
     monkeypatch.setattr(ds, "reset_hung_pod_gpus", reset)
 
-    with ds.inflight_creates.track("pod1"):
-        ds.inflight_creates.cancel("pod1")
+    with ds.inflight_creates.track("pod1", ("hk", "ex")):
+        ds.inflight_creates.cancel("pod1", ("hk", "ex"))
         assert await service._reset_hung_gpus_before_run(None, _create_payload(), {}) is None
 
     reset.assert_not_awaited()  # the GPUs may already be the next renter's
@@ -793,8 +793,8 @@ async def test_a_create_its_delete_cancelled_runs_no_clock_reset(monkeypatch):
     payload = _create_payload()
     payload.workload_kind = WorkloadKind.CUSTOMER_RENTAL
 
-    with ds.inflight_creates.track("pod1"):
-        ds.inflight_creates.cancel("pod1")
+    with ds.inflight_creates.track("pod1", ("hk", "ex")):
+        ds.inflight_creates.cancel("pod1", ("hk", "ex"))
         # no raise: the create's next cancel check, inside its cleanup block, removes its volume and image
         await service._reset_leftover_clock_locks_before_create(None, payload, {})
 
