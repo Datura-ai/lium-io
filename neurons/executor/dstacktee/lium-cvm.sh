@@ -118,8 +118,8 @@ download_os_image() {
 # The PCI slots `new` passes through: CVM_GPUS from .env, or every NVIDIA GPU and NVSwitch for "all"
 passthrough_slots() {
     local gpus="${CVM_GPUS:-}"
-    if [ -z "$gpus" ] && [ -f .env ]; then
-        # read it the way `new` does (source), so inline comments and quoting parse the same
+    if [ -f .env ]; then
+        # read it the way `new` does (sources .env over the environment), so the same devices are checked
         gpus=$(set +u; source ./.env >/dev/null 2>&1; echo "${CVM_GPUS:-}")
     fi
     [ -z "$gpus" ] && return 0
@@ -205,8 +205,11 @@ check_requirements() {
     # Check QEMU: the binary the launcher runs ([qemu] path in client.conf), not whatever is on PATH
     log_info "Checking QEMU installation..."
     local qemu_path qemu_version
-    qemu_path=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import dstack; print(dstack.DStackConfig.load().qemu_path)' "$SCRIPTS_DIR" 2>/dev/null) || qemu_path=qemu-system-x86_64
-    if command_exists "$qemu_path"; then
+    # no fallback: a client.conf that new/run cannot load must fail check too (the loader supplies the default path)
+    if ! qemu_path=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import dstack; print(dstack.DStackConfig.load().qemu_path)' "$SCRIPTS_DIR"); then
+        log_error "Cannot read the [qemu] path from the dstack client.conf (error above); new and run would fail the same way"
+        all_good=false
+    elif command_exists "$qemu_path"; then
         qemu_version=$("$qemu_path" --version | head -n1)
         if [[ "$qemu_version" == *"version 9.2.1"* ]]; then
             log_success "QEMU used for CVMs ($qemu_path): $qemu_version"

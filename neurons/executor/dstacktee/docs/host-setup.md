@@ -46,7 +46,7 @@ Then `sudo update-grub && sudo reboot`, and verify:
 cat /sys/module/kvm_intel/parameters/tdx     # Y
 ls /sys/kernel/iommu_groups | wc -l           # more than 0; 0 means the IOMMU is off (VT-d in BIOS, intel_iommu=on)
 lspci -nnk -s <gpu-addr>                      # Kernel driver in use: vfio-pci
-ls /dev/vfio                                  # one number per IOMMU group, besides vfio
+ls /dev/vfio                                  # vfio plus one numbered group per device bound to vfio-pci
 ```
 
 ## 3. QEMU — the dstack 9.2.1 build (required for attestation)

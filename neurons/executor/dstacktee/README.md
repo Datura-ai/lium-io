@@ -118,7 +118,7 @@ EXECUTOR_RUNNER_IMAGE_DIGEST=sha256:...
 # Resources
 CVM_VCPUS=16
 CVM_MEMORY=64G
-CVM_DISK=1100G  # at least 1.5x total GPU VRAM (see below)
+CVM_DISK=1100G  # at least 1.5x total GPU VRAM (see above)
 CVM_GPUS=all  # or "19:00.0,3b:00.0"
 ```
 
