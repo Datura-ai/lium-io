@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import shutil
 import stat
 import struct
 import subprocess
@@ -273,6 +274,7 @@ def _fake_fs(tmp_path):
     reset["os"] = SimpleNamespace(
         path=os.path,
         scandir=os.scandir,
+        stat=os.stat,
         kill=os.kill,
         environ={},
         makedirs=os.makedirs,
@@ -569,6 +571,38 @@ def test_a_discovery_input_that_cannot_be_read_fails_the_reset(tmp_path, unreada
 
     assert out.returncode != 0
     assert "would shift" not in out.stdout
+
+
+@pytest.mark.parametrize(
+    ("listing", "layer", "fails", "shifted"),
+    [
+        ("readable", "readable", False, True),
+        ("missing", "readable", False, False),
+        ("eio", "readable", True, False),
+        ("readable", "missing", False, False),
+        ("readable", "eio", True, False),
+    ],
+)
+def test_listing_the_containers_and_finding_the_layer_fail_only_on_a_read_error(tmp_path, listing, layer, fails, shifted):
+    # review 4602552409: glob() and os.path.isdir() turned EIO into "no containers" or "no layer" and the reset succeeded;
+    # a file in a directory's place stands for EIO (a read error other than "not there")
+    _install(tmp_path)
+    cid = "a" * 64
+    _container(tmp_path, cid, "sysbox-runc", "m1")
+    docker = tmp_path / "var/lib/docker"
+    if listing != "readable":
+        shutil.rmtree(docker / "containers")
+        if listing == "eio":
+            (docker / "containers").write_text("")
+    if layer != "readable":
+        shutil.rmtree(docker / "overlay2/m1")
+        if layer == "eio":
+            (docker / "overlay2/m1").write_text("")
+
+    out = _run(tmp_path, "--dry-run")
+
+    assert (out.returncode != 0) == fails, out.stderr
+    assert ("would shift" in out.stdout) == shifted
 
 
 def test_inputs_that_are_not_there_are_still_skipped(tmp_path):

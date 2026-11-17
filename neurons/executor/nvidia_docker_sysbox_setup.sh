@@ -281,7 +281,7 @@ shift_sysbox_layers_back_at_boot() {
 #!/usr/bin/python3 -I
 # Lium (nvidia_docker_sysbox_setup.sh): shift back the writable layer a sysbox pod kept after an unclean stop, the way
 # sysbox's own stop does. Runs at boot before Docker; --dry-run only prints. Setuid bits and file capabilities kept.
-import atexit, errno, glob, json, os, re, stat, struct, subprocess, sys, time
+import atexit, errno, json, os, re, stat, struct, subprocess, sys, time
 
 DRY = "--dry-run" in sys.argv
 ROOT = os.environ.get("LIUM_LAYER_RESET_ROOT", "")
@@ -501,22 +501,31 @@ def main():
         print("no sysbox range in /etc/subuid or /etc/subgid; nothing to reset", flush=True)
         return
     d = data_root()
-    for hc in glob.glob(f"{glob.escape(d)}/containers/*/hostconfig.json"):
-        # only an input that is not there is skipped: a read error (EIO) fails the unit, so Docker stays down and never
-        # starts a pod whose layer was left shifted
+    # only an input that is not there is skipped: a read error (EIO) fails the unit, so Docker stays down and never
+    # starts a pod whose layer was left shifted. Not glob: it swallows a directory read error into "no containers".
+    try:
+        cids = sorted(e.name for e in os.scandir(f"{d}/containers"))
+    except FileNotFoundError:
+        cids = []
+    for cid in cids:
+        hc = f"{d}/containers/{cid}/hostconfig.json"
         try:
             if json.load(open(hc)).get("Runtime") != "sysbox-runc":
                 continue
         except FileNotFoundError:
-            continue  # removed since the glob
+            continue  # no hostconfig (yet), or removed since the listing
         except ValueError:
             continue  # unparsable: Docker does not load such a container either
-        cid = os.path.basename(os.path.dirname(hc))
         try:
             upper = f"{d}/overlay2/" + open(f"{d}/image/overlay2/layerdb/mounts/{cid}/mount-id").read().strip() + "/diff"
         except FileNotFoundError:
             upper = containerd_upper(cid)  # not in the overlay2 store: the containerd image store holds it
-        if not upper or not os.path.isdir(upper):
+        try:
+            # not os.path.isdir: it turns a read error into "no layer"
+            is_dir = bool(upper) and stat.S_ISDIR(os.stat(upper).st_mode)
+        except FileNotFoundError:
+            is_dir = False
+        if not is_dir:
             print(f"no writable layer found for sysbox container {cid[:12]}", file=sys.stderr, flush=True)
             continue
         # shifted = the top's owner lies in sysbox's range; the pod's slice comes from that range, not from the owner
