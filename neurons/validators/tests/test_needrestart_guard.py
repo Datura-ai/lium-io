@@ -33,6 +33,7 @@ def _read(host_root: Path):
             "needrestart_data_line",
             "NEEDRESTART_GUARD_FILE",
             "NEEDRESTART_GUARD_SERVICES",
+            "NEEDRESTART_GUARD_UNITS",
         },
         {"os": os, "re": re},
     )
@@ -321,6 +322,33 @@ def test_an_overlapping_rule_in_any_delimiter_in_an_earlier_block_unguards_the_u
     )
 
     assert _read(host) == ("partial", ["containerd"])
+
+
+@pytest.mark.parametrize(
+    ("entry", "unguarded"),
+    [
+        # a string key is its own Perl hash key: the guard's qr(^containerd) does not overwrite it
+        ("'^containerd' => 1,", ["containerd"]),
+        ('"^docker" => 1,', ["docker"]),
+        # rules that match the sysbox package's real units, not the name sysbox.service
+        ("qr(^sysbox-) => 1,", ["sysbox"]),
+        ("qr(mgr) => 1,", ["sysbox"]),
+        ("qr(-fs\\.service$) => 1,", ["sysbox"]),
+    ],
+)
+def test_an_earlier_rule_the_guard_does_not_overwrite_unguards_its_unit(tmp_path, entry, unguarded):
+    host = _host(tmp_path, _setup_script_guard())
+    (host / "etc/needrestart/needrestart.conf").write_text("$nrconf{override_rc} = {\n    " + entry + "\n};\n" + LOADER)
+
+    assert _read(host) == ("partial", unguarded)
+
+
+@pytest.mark.parametrize("entry", ["qr(^containerd) => 1,", "qr<^containerd> => 1,", "qr{^sysbox} => 1,"])
+def test_an_earlier_qr_key_the_guard_sets_again_is_overwritten(tmp_path, entry):
+    host = _host(tmp_path, _setup_script_guard())
+    (host / "etc/needrestart/needrestart.conf").write_text("$nrconf{override_rc} = {\n    " + entry + "\n};\n" + LOADER)
+
+    assert _read(host) == ("present", [])
 
 
 def test_an_overlapping_entry_outside_override_rc_is_not_a_restart_rule(tmp_path):

@@ -732,11 +732,19 @@ def get_executor_pid_mode():
 NEEDRESTART_GUARD_FILE = "/etc/needrestart/conf.d/lium-container-runtime.conf"
 # the services nvidia_docker_sysbox_setup.sh keeps needrestart from restarting under running pods (DAH-6384)
 NEEDRESTART_GUARD_SERVICES = ("sysbox", "docker", "containerd", "nvidia-fabricmanager", "nvidia-persistenced")
+# the units needrestart matches each guard against: qr(^sysbox) covers the sysbox package's three units
+NEEDRESTART_GUARD_UNITS = {
+    "sysbox": ("sysbox.service", "sysbox-mgr.service", "sysbox-fs.service"),
+    "docker": ("docker.service",),
+    "containerd": ("containerd.service",),
+    "nvidia-fabricmanager": ("nvidia-fabricmanager.service",),
+    "nvidia-persistenced": ("nvidia-persistenced.service",),
+}
 
 
 def needrestart_data_line(line, literal, plain_setting):
     # What Perl stores on a data-only line, or None if the line may run code: ("set",), ("open", key) for
-    # $nrconf{key} = { or [, ("close",), or ("entry", pattern, value) for one hash/list entry, where the key is a
+    # $nrconf{key} = { or [, ("close",), or ("entry", pattern, value, is_qr) for one hash/list entry, where the key is a
     # literal or a qr<delim>...<delim> that neither interpolates (@x, $x, ${...}) nor runs code ((?{...}))
     if re.fullmatch(plain_setting, line):
         return ("set",)
@@ -748,7 +756,7 @@ def needrestart_data_line(line, literal, plain_setting):
     rest = r"\s*(?:=>\s*" + literal + r"\s*)?,?\s*(#.*)?"
     entry = re.fullmatch(r"[ \t]*" + literal + rest, line)
     if entry:
-        return ("entry", entry.group(1).strip("'\""), entry.group(3))
+        return ("entry", entry.group(1).strip("'\""), entry.group(3), False)
     start = re.match(r"[ \t]*qr([^\w\s])", line)
     if not start:
         return None
@@ -766,7 +774,7 @@ def needrestart_data_line(line, literal, plain_setting):
                 after = re.fullmatch(rest, line[i + 1 :])
                 if re.search(r"[@$]#?[\w{:$]|\(\?\??\{", body) or not after:  # @. and a closing $ do not interpolate
                     return None
-                return ("entry", body, after.group(1))
+                return ("entry", body, after.group(1), True)
         elif line[i] == opening and opening != closing:
             depth += 1
         i += 1
@@ -850,8 +858,10 @@ def get_needrestart_guard(host_root="/proc/1/root"):
             elif data[0] == "close":
                 block = None
             elif data[0] == "entry" and block == "override_rc":
-                # the parser that accepted the line also gives its rule, so no delimiter is read one way and kept another
-                if data[1] not in ["^" + s for s in NEEDRESTART_GUARD_SERVICES]:  # the guard file sets those keys
+                # the parser that accepted the line also gives its rule, so no delimiter is read one way and kept another.
+                # The guard file overwrites only the same Perl key: qr(^<service>) with any delimiter stringifies alike,
+                # while the string '^<service>' is another key that stays next to it.
+                if not (data[3] and data[1] in ["^" + s for s in NEEDRESTART_GUARD_SERVICES]):
                     other_rules.append((data[1], data[2]))
     unguarded = []
     for service in NEEDRESTART_GUARD_SERVICES:
@@ -860,7 +870,7 @@ def get_needrestart_guard(host_root="/proc/1/root"):
             if value in zero:
                 continue
             try:
-                overlapping = overlapping or re.search(pattern, service + ".service") is not None
+                overlapping = overlapping or any(re.search(pattern, unit) for unit in NEEDRESTART_GUARD_UNITS[service])
             except re.error:
                 overlapping = True  # a pattern Python cannot read may still match in Perl
         if overlapping or last_values.get(service) not in zero:
