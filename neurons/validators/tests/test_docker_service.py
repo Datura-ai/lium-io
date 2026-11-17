@@ -111,6 +111,15 @@ def _pending_record(identity=_RUN, plaintext_path=None):
     return json.dumps(record)
 
 
+def _mount_reads(docker_service, monkeypatch, exit_status=2):
+    """The host-side mount read of a pending stop over a pinned policy: 0 mounted, 1 not, 2 no encrypted volume."""
+    docker_service._prepare_known_hosts_policy = AsyncMock(return_value=Mock())
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    run = AsyncMock(return_value=_make_ssh_command_result(exit_status))
+    monkeypatch.setattr(docker_service_module, "_run_on_own_ssh_connection", run)
+    return run
+
+
 class _FakeRentalDockerClient:
     def __init__(self):
         self.login_calls = []
@@ -3513,10 +3522,7 @@ async def test_a_half_started_pod_that_refused_stop_and_kill_is_stopped_by_the_p
 
     client.kill_error = None
     # the host reads the pod's mount table again by the retry: not mounted
-    docker_service._prepare_known_hosts_policy = AsyncMock(return_value=None)
-    monkeypatch.setattr(
-        docker_service_module, "_run_on_own_ssh_connection", AsyncMock(return_value=_make_ssh_command_result(1))
-    )
+    _mount_reads(docker_service, monkeypatch, 1)
     await retry
 
     assert client.running is False
@@ -3526,6 +3532,7 @@ async def test_a_half_started_pod_that_refused_stop_and_kill_is_stopped_by_the_p
 
 @pytest.mark.asyncio
 async def test_retry_half_started_stop_stops_the_recorded_container_and_clears_its_mark(docker_service, monkeypatch):
+    _mount_reads(docker_service, monkeypatch)
     monkeypatch.setattr("services.docker_service._HALF_STARTED_STOP_RETRY_SEC", 0)
     docker_service.redis_service.hget = AsyncMock(return_value=_pending_record())
     client = docker_service.rental_docker_client_factory.client
@@ -3542,6 +3549,7 @@ async def test_retry_half_started_stop_stops_the_recorded_container_and_clears_i
 
 @pytest.mark.asyncio
 async def test_retry_half_started_stop_keeps_the_mark_while_docker_refuses(docker_service, monkeypatch):
+    _mount_reads(docker_service, monkeypatch)
     monkeypatch.setattr("services.docker_service._HALF_STARTED_STOP_RETRY_SEC", 0)
     docker_service.redis_service.hget = AsyncMock(return_value=_pending_record())
     client = docker_service.rental_docker_client_factory.client
@@ -3558,7 +3566,8 @@ async def test_retry_half_started_stop_keeps_the_mark_while_docker_refuses(docke
 
 
 @pytest.mark.asyncio
-async def test_retry_half_started_stop_leaves_a_pod_started_again_since_running_and_drops_its_mark(docker_service):
+async def test_retry_half_started_stop_leaves_a_pod_started_again_since_running_and_drops_its_mark(docker_service, monkeypatch):
+    _mount_reads(docker_service, monkeypatch)
     docker_service.redis_service.hget = AsyncMock(return_value=_pending_record())
     client = docker_service.rental_docker_client_factory.client
     client.running = True
@@ -3599,6 +3608,7 @@ async def test_retry_half_started_stop_without_a_recorded_id_judges_the_run_by_i
 ):
     # the id read failed at the failure: a run started by the failure time is the same one, a later start is a restart
     monkeypatch.setattr("services.docker_service._HALF_STARTED_STOP_RETRY_SEC", 0)
+    _mount_reads(docker_service, monkeypatch)
     docker_service.redis_service.hget = AsyncMock(return_value=_pending_record(identity=""))
     client = docker_service.rental_docker_client_factory.client
     client.running = True
@@ -3615,7 +3625,8 @@ async def test_retry_half_started_stop_without_a_recorded_id_judges_the_run_by_i
 
 
 @pytest.mark.asyncio
-async def test_retry_half_started_stop_without_a_recorded_id_corrects_for_a_host_clock_behind_ours(docker_service):
+async def test_retry_half_started_stop_without_a_recorded_id_corrects_for_a_host_clock_behind_ours(docker_service, monkeypatch):
+    _mount_reads(docker_service, monkeypatch)
     # host 5 min behind: a restart at host 13:57 is 14:02 on our clock, after the 14:00:05 failure, so it is not stopped
     docker_service.redis_service.hget = AsyncMock(return_value=_pending_record(identity=""))
     client = docker_service.rental_docker_client_factory.client
@@ -3634,8 +3645,9 @@ async def test_retry_half_started_stop_without_a_recorded_id_corrects_for_a_host
 
 @pytest.mark.asyncio
 async def test_retry_half_started_stop_without_a_recorded_id_keeps_the_mark_when_the_host_clock_is_unreadable(
-    docker_service,
+    docker_service, monkeypatch
 ):
+    _mount_reads(docker_service, monkeypatch)
     docker_service.redis_service.hget = AsyncMock(return_value=_pending_record(identity=""))
     client = docker_service.rental_docker_client_factory.client
     client.running = True
@@ -3710,6 +3722,7 @@ async def test_a_pending_stop_retry_racing_a_start_does_not_stop_the_new_run(
 ):
     # the retry matched the old run and is about to stop it: the start waits for that stop, so its run survives
     _let_starts_succeed(docker_service, monkeypatch)
+    _mount_reads(docker_service, monkeypatch)
     monkeypatch.setattr("services.docker_service._HALF_STARTED_STOP_RETRY_SEC", 0)
     client = docker_service.rental_docker_client_factory.client
     client.running = True
@@ -3821,7 +3834,7 @@ async def test_a_pending_stop_reads_the_pods_mount_on_the_host_and_never_stops_o
     # gateway review: a start of the still-running pod remounted it (same run id) but its record outlived it; the
     # mount is read from the host, not from a program the renter controls inside the pod
     docker_service.redis_service.hget = AsyncMock(return_value=_pending_record(plaintext_path="/workspace"))
-    docker_service._prepare_known_hosts_policy = AsyncMock(return_value=None)
+    docker_service._prepare_known_hosts_policy = AsyncMock(return_value=Mock())
     monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
     run = AsyncMock(side_effect=probe) if isinstance(probe, Exception) else AsyncMock(return_value=probe)
     monkeypatch.setattr(docker_service_module, "_run_on_own_ssh_connection", run)
@@ -3837,6 +3850,121 @@ async def test_a_pending_stop_reads_the_pods_mount_on_the_host_and_never_stops_o
     assert client.exec_specs == []  # nothing run inside the pod
     assert run.await_args.args[1] == docker_service_module._encrypted_mount_probe("pod_test", "/workspace")
     assert (docker_service.redis_service.hdel.await_count == 0) is kept
+
+
+@pytest.mark.asyncio
+async def test_a_pending_stop_never_trusts_a_mount_read_over_an_unpinned_connection(docker_service, monkeypatch):
+    # gateway review: a policy that could not be built (fail-open default) let an impersonating host report the mount
+    run = _mount_reads(docker_service, monkeypatch, 0)
+    docker_service._prepare_known_hosts_policy = AsyncMock(return_value=None)
+    docker_service.redis_service.hget = AsyncMock(return_value=_pending_record(plaintext_path="/workspace"))
+    client = docker_service.rental_docker_client_factory.client
+    client.running = True
+
+    result = await docker_service.retry_half_started_stop(
+        executor_info=Mock(uuid="exec-1"), private_key="private-key", pod_id="pod-id", default_extra={}
+    )
+
+    assert result is False
+    run.assert_not_awaited()
+    assert client.stopped_containers == []
+    docker_service.redis_service.hdel.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("exit_status", "stops", "kept"),
+    [
+        pytest.param(1, ["pod_test"], False, id="restarted_unmounted_stopped"),
+        pytest.param(0, [], False, id="restarted_remounted_left_running"),
+        pytest.param(3, [], True, id="restarted_unread_kept_pending"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_pending_stop_follows_its_container_across_a_docker_restart(
+    docker_service, monkeypatch, exit_status, stops, kept
+):
+    # gateway review: unless-stopped restarted the half-started run (same id, new StartedAt) before the retry
+    monkeypatch.setattr("services.docker_service._HALF_STARTED_STOP_RETRY_SEC", 0)
+    _mount_reads(docker_service, monkeypatch, exit_status)
+    docker_service.redis_service.hget = AsyncMock(return_value=_pending_record(plaintext_path="/workspace"))
+    client = docker_service.rental_docker_client_factory.client
+    client.running = True
+    client.identity = "cid@2026-11-16T14:03:00Z"
+
+    await docker_service.retry_half_started_stop(
+        executor_info=Mock(uuid="exec-1"), private_key="private-key", pod_id="pod-id", default_extra={}
+    )
+
+    assert client.stopped_containers == stops
+    assert (docker_service.redis_service.hdel.await_count == 0) is kept
+
+
+@pytest.mark.asyncio
+async def test_a_pending_stop_drops_a_container_re_created_under_its_name_without_reading_it(
+    docker_service, monkeypatch
+):
+    run = _mount_reads(docker_service, monkeypatch, 1)
+    docker_service.redis_service.hget = AsyncMock(return_value=_pending_record(plaintext_path="/workspace"))
+    client = docker_service.rental_docker_client_factory.client
+    client.running = True
+    client.identity = "other-cid@2026-11-16T14:03:00Z"
+
+    assert await docker_service.retry_half_started_stop(
+        executor_info=Mock(uuid="exec-1"), private_key="private-key", pod_id="pod-id", default_extra={}
+    )
+
+    run.assert_not_awaited()
+    assert client.stopped_containers == []
+    docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id")
+
+
+@pytest.mark.parametrize(
+    ("exit_status", "stops", "kept"),
+    [
+        pytest.param(0, [], False, id="remounted_at_its_path_left_running"),
+        pytest.param(1, ["pod_test"], False, id="encrypted_volume_unmounted_stopped"),
+        pytest.param(3, [], True, id="unread_kept_pending"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_pending_stop_without_a_recorded_path_reads_the_mount_at_any_path(
+    docker_service, monkeypatch, exit_status, stops, kept
+):
+    # gateway review: a stale-mount recovery recorded "" and a later start remounted the same run at the real path
+    monkeypatch.setattr("services.docker_service._HALF_STARTED_STOP_RETRY_SEC", 0)
+    run = _mount_reads(docker_service, monkeypatch, exit_status)
+    docker_service.redis_service.hget = AsyncMock(return_value=_pending_record(plaintext_path=""))
+    client = docker_service.rental_docker_client_factory.client
+    client.running = True
+
+    await docker_service.retry_half_started_stop(
+        executor_info=Mock(uuid="exec-1"), private_key="private-key", pod_id="pod-id", default_extra={}
+    )
+
+    assert run.await_args.args[1] == docker_service_module._encrypted_mount_probe("pod_test", "")
+    assert client.stopped_containers == stops
+    assert (docker_service.redis_service.hdel.await_count == 0) is kept
+
+
+@pytest.mark.parametrize(
+    ("mounts", "exit_status"),
+    [
+        pytest.param("/lium-cipher /lium-cipher ext4 rw 0 0\n/lium-cipher /data fuse.gocryptfs rw 0 0\n", 0, id="mounted"),
+        pytest.param("/dev/vda1 /lium-cipher ext4 rw 0 0\n", 1, id="encrypted_volume_unmounted"),
+        pytest.param("/dev/vda1 /etc/hosts ext4 rw 0 0\n", 2, id="no_encrypted_volume"),
+    ],
+)
+def test_the_mount_probe_without_a_path_tells_mounted_unmounted_and_no_encrypted_volume(tmp_path, mounts, exit_status):
+    docker = tmp_path / "docker"
+    docker.write_text("#!/bin/sh\necho 4242\n")
+    docker.chmod(0o755)
+    (tmp_path / "4242").write_text(mounts)
+    probe = docker_service_module._encrypted_mount_probe("pod_test", "")
+    probe = probe.replace("/usr/bin/docker", str(docker)).replace('"/proc/$p/mounts"', f'"{tmp_path}/$p"')
+
+    completed = subprocess.run(["sh", "-c", probe], capture_output=True, check=False)
+
+    assert completed.returncode == exit_status, completed.stderr
 
 
 @pytest.mark.parametrize(
@@ -3871,6 +3999,7 @@ async def test_a_cancelled_pending_stop_keeps_the_pod_lock_until_its_stop_is_don
 ):
     # gateway review: the check's deadline cancelled the retry mid-stop and a start remounted before that stop landed
     _let_starts_succeed(docker_service, monkeypatch)
+    _mount_reads(docker_service, monkeypatch)
     client = docker_service.rental_docker_client_factory.client
     client.running = True
     in_stop = asyncio.Event()

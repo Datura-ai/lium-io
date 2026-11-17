@@ -2908,12 +2908,20 @@ _HALF_STARTED_STOPS_IN_FLIGHT: set[asyncio.Task] = set()
 
 def _encrypted_mount_probe(container_name: str, plaintext_path: str) -> str:
     """Host-side read of the pod's mount table (kernel-written, nothing run inside the renter's container): exit 0 when
-    it holds its own /lium-cipher gocryptfs mount at the recorded path, 1 when it does not, anything else unknown."""
+    it holds its own /lium-cipher gocryptfs mount at the recorded path, 1 when it does not, anything else unknown.
+    With no recorded path: 0 for that mount at any path, 1 for an encrypted volume without it, 2 for a pod that has
+    no encrypted volume (no /lium-cipher in its mount table)."""
+    check = (
+        _gocryptfs_mount_check(plaintext_path, "/dev/stdin")
+        if plaintext_path
+        else f"awk -v source={_LIUM_CIPHER_MOUNT} "
+        "'$1 == source && $3 == \"fuse.gocryptfs\" {m=1} $2 == source {c=1} END {exit m ? 0 : (c ? 1 : 2)}' /dev/stdin"
+    )
     return (
         f"p=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}}' {shlex.quote(container_name)}) || exit 3; "
         '[ "$p" -gt 0 ] 2>/dev/null || exit 1; '
         'm=$(cat "/proc/$p/mounts") || exit 3; '
-        f"printf '%s\\n' \"$m\" | {_gocryptfs_mount_check(plaintext_path, '/dev/stdin')}"
+        f"printf '%s\\n' \"$m\" | {check}"
     )
 
 
@@ -12910,11 +12918,14 @@ class DockerService:
 
     async def _holds_its_encrypted_mount(
         self, executor_info: ExecutorSSHInfo, private_key: str, container_name: str, plaintext_path: str
-    ) -> bool | None:
-        """Whether the pod's own mount table holds its gocryptfs mount at the recorded path, read on the host over
-        the executor's pinned SSH; None when it could not be read."""
+    ) -> int | None:
+        """_encrypted_mount_probe's 0 (mounted), 1 (not mounted) or 2 (no encrypted volume), read on the host over the
+        executor's pinned SSH; None when it could not be read."""
         try:
             policy = await self._prepare_known_hosts_policy(executor_info, None, {"container_name": container_name})
+            if policy is None:
+                # an unpinned endpoint could report the mount present while the real pod runs without it
+                return None
             result = await _run_on_own_ssh_connection(
                 partial(_connect_own_ssh, executor_info, asyncssh.import_private_key(private_key), policy),
                 _encrypted_mount_probe(container_name, plaintext_path),
@@ -12924,7 +12935,7 @@ class DockerService:
             raise
         except Exception:  # noqa: BLE001 - unread is unknown, never unmounted
             return None
-        return {0: True, 1: False}.get(result.exit_status)
+        return result.exit_status if result.exit_status in (0, 1, 2) else None
 
     async def _retry_half_started_stop_locked(
         self,
@@ -12936,8 +12947,9 @@ class DockerService:
         recorded: tuple[str, str, str, str] | None,
     ) -> bool | None:
         """Stop a pod whose failed start left it possibly running without its mount (F-31/F-37/F-15).
-        Only the very run recorded at the failure is stopped: a pod started or re-created since is left running.
-        Without its recorded id, the run is the same while its StartedAt is not after the failure.
+        The recorded container is stopped while its encrypted volume is unmounted, across restarts (same id); a
+        re-created one is left alone, a mounted one kept, an unread mount stays pending. A pod with no encrypted volume
+        is stopped only in the very run recorded (without its id: while its StartedAt is not after the failure).
         None when none is pending; True once it is stopped or no longer that run (record dropped); False (logged)
         while it still may run."""
         extra = {**default_extra, "pod_id": pod_id}
@@ -12971,28 +12983,36 @@ class DockerService:
                 executor_info=executor_info, private_key=private_key
             ) as docker_client:
                 current = await docker_client.container_identity(container_name=container_name)
-                if current is None or identity:
-                    same_run = current is not None and current == identity
-                else:
-                    # StartedAt is on the host's clock, recorded_at on ours: undo the offset before comparing
-                    skew = _docker_time(await docker_client.host_time()) - datetime.now(timezone.utc)
-                    started_at = _docker_time(current.rpartition("@")[2]) - skew
-                    same_run = started_at <= datetime.fromisoformat(recorded_at)
-                if not same_run:
+                # names are unique on a host: another id under it means the recorded container was removed
+                replaced = current is None or bool(identity) and current.partition("@")[0] != identity.partition("@")[0]
+                # a Docker auto-restart (unless-stopped) keeps the id and changes StartedAt: the mount decides
+                mount = (
+                    None
+                    if replaced
+                    else await self._holds_its_encrypted_mount(
+                        executor_info, private_key, container_name, plaintext_path
+                    )
+                )
+                if mount == 2:
+                    # no encrypted volume, nothing it could write unencrypted: only the very run recorded is stopped
+                    if identity:
+                        same_run = current == identity
+                    else:
+                        # StartedAt is on the host's clock, recorded_at on ours: undo the offset before comparing
+                        skew = _docker_time(await docker_client.host_time()) - datetime.now(timezone.utc)
+                        started_at = _docker_time(current.rpartition("@")[2]) - skew
+                        same_run = started_at <= datetime.fromisoformat(recorded_at)
+                if replaced or (mount == 2 and not same_run):
                     logger.info(
                         _m(
                             "POD_HALF_STARTED_STOP_DROPPED_NOT_SAME_RUN",
                             extra=get_extra_info({**extra, "container_gone": current is None}),
                         )
                     )
-                elif plaintext_path and (
-                    mounted := await self._holds_its_encrypted_mount(
-                        executor_info, private_key, container_name, plaintext_path
-                    )
-                ):
-                    # a later start remounted this very run (a start of a running pod keeps its id): nothing to stop
+                elif mount == 0:
+                    # a later start remounted this container (a start of a running pod keeps its id): nothing to stop
                     logger.info(_m("POD_HALF_STARTED_STOP_DROPPED_MOUNTED", extra=get_extra_info(extra)))
-                elif plaintext_path and mounted is None:
+                elif mount is None:
                     # unknown is not unmounted: stopping here could stop a restored pod; the record stays for next check
                     raise RentalDockerOperationError("the pod's encrypted mount could not be read")
                 else:
