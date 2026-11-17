@@ -257,6 +257,36 @@ async def test_a_shift_after_a_container_only_restart_does_not_blame_the_host(
 
 
 @pytest.mark.parametrize(
+    ("created", "template", "before_boot"),
+    [
+        # created 36 min before the host booted at 20:20:03Z, started by the validator's stale-mount
+        # recovery 1358 s after boot: it was on the host when it stopped, so the host message stays
+        ("2026-11-17T19:44:26.034526789Z", Msg.SHIFTED, True),
+        # created 30 s after boot and restarted later on the running host: a container-only restart
+        ("2026-11-17T20:20:33.5Z", Msg.SHIFTED_AFTER_CONTAINER_RESTART, False),
+        # a creation time that is not one: the age alone decides, as before
+        ("yesterday", Msg.SHIFTED_AFTER_CONTAINER_RESTART, None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_pod_created_before_the_boot_is_blamed_on_the_host_however_late_it_started(
+    context_factory, tmp_path, created, template, before_boot
+):
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me + 200000}      65536\n")
+    _proc(tmp_path, 4343, f"         0     {me}      65536\n")
+    boot = 1794946803  # 2026-11-17T20:20:03Z
+    out = f"1400.25\n4242 42\n--\n{boot + 1400}\n/pod_1 {created}\n"
+    result = await RentedPodOwnershipCheck().run(
+        _ctx(context_factory, _ssh_with_uptime(str(tmp_path), out))
+    )
+    assert result.event.remediation == template.remediation
+    pods = {p["container"]: p for p in result.event.what_we_saw["pods"]}
+    assert pods["pod_1"]["started_after_boot_s"] == 1358
+    assert pods["pod_1"].get("created_before_boot") is before_boot
+
+
+@pytest.mark.parametrize(
     ("uptime_and_ages", "template"),
     [
         # pod_1 restarted 30 s ago on a host up a day, pod_2 started 50 s after boot: one cause does not fit both

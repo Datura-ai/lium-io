@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import shlex
+from datetime import datetime, timezone
 
 import asyncssh
 
@@ -51,6 +52,19 @@ def _num(text: str) -> int | None:
     # of at most 10 (a uid or pid fits in 32 bits; a huge string hits int()'s digit limit and raises)
     text = text.strip()
     return int(text) if len(text) <= 10 and text.isascii() and text.isdigit() else None
+
+
+def _epoch(stamp: str) -> int | None:
+    """Seconds since the epoch of docker's `.Created` (UTC, `2026-11-17T19:44:26.123456789Z`); None when it is not
+    one (the provider controls the SSH endpoint)."""
+    try:
+        return int(
+            datetime.strptime(stamp.strip()[:19], "%Y-%m-%dT%H:%M:%S")
+            .replace(tzinfo=timezone.utc)
+            .timestamp()
+        )
+    except ValueError:
+        return None
 
 
 def judge(line: str) -> dict | None:
@@ -166,31 +180,50 @@ class RentedPodOwnershipCheck:
 
     async def _shift_template(self, ctx: Context, shifted: list[dict]):
         """A container restarted long after the host booted was not brought back by a host reboot: say so,
-        instead of blaming an unclean host shutdown. Sets `started_after_boot_s` on each pod read."""
+        instead of blaming an unclean host shutdown. One created before this boot was already there when the host
+        stopped, however late it was started again (the validator's own stale-mount recovery starts it minutes
+        after boot). Sets `started_after_boot_s` and `created_before_boot` on each pod read."""
         try:
             res = await asyncio.wait_for(
                 ctx.ssh.run(
                     # pid beside its age: a pid gone since the read prints nothing, so ages cannot pair by line
                     "cut -d' ' -f1 /proc/uptime; ps -o pid=,etimes= -p "
-                    + ",".join(str(int(p["pid"])) for p in shifted),
+                    + ",".join(str(int(p["pid"])) for p in shifted)
+                    + "; echo --; date +%s; /usr/bin/docker inspect --format '{{.Name}} {{.Created}}' "
+                    + " ".join(shlex.quote(p["container"]) for p in shifted),
                     check=False,
                 ),
                 timeout=READ_TIMEOUT_SECONDS,
             )
         except (asyncssh.Error, OSError, TimeoutError):
             return Msg.SHIFTED
-        uptime, *lines = (res.stdout or "").splitlines() or [""]
+        head, _, tail = (res.stdout or "").partition("\n--\n")
+        uptime, *lines = head.splitlines() or [""]
         uptime_s = _num(uptime.partition(".")[0])
         ages = {}
         for line in lines:
             pid, _, age = line.strip().partition(" ")
             ages[_num(pid)] = _num(age.strip())
+        now, *created_lines = tail.splitlines() or [""]
+        now_s = _num(now)
+        created = {}
+        for line in created_lines:
+            name, _, stamp = line.strip().partition(" ")
+            created[name.lstrip("/")] = _epoch(stamp)
         for pod in shifted:
             age_s = ages.get(int(pod["pid"]))
             if uptime_s is not None and age_s is not None:
                 pod["started_after_boot_s"] = uptime_s - age_s
+            created_s = created.get(pod["container"])
+            if uptime_s is not None and now_s is not None and created_s is not None:
+                pod["created_before_boot"] = created_s < now_s - uptime_s
         after = [p.get("started_after_boot_s") for p in shifted]
-        late = [a is not None and a >= CONTAINER_RESTART_AFTER_BOOT_SECONDS for a in after]
+        late = [
+            a is not None
+            and a >= CONTAINER_RESTART_AFTER_BOOT_SECONDS
+            and not p.get("created_before_boot")
+            for a, p in zip(after, shifted)
+        ]
         if all(late):
             return Msg.SHIFTED_AFTER_CONTAINER_RESTART
         if any(late) and None not in after:
