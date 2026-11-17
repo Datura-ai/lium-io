@@ -3012,8 +3012,8 @@ class RentedPodOwnershipMessages:
         severity="warning",
         category="runtime",
         impact="Proceed; incorrect ownership can break package installation, root login, or sudo until repaired",
-        remediation="The pod's container was restarted while the host kept running (not a host reboot), and "
-        "it came back with a user-namespace range its files are not in, so they belong to nobody inside it. "
+        remediation="The pod's container was created or restarted while the host kept running (not a host "
+        "reboot), and it came back with a user-namespace range its files are not in, so they belong to nobody inside it. "
         "A restart does not repair it. Contact support: the renter is moved to a fresh pod free of charge. "
         "Do not change file ownership on the host or restart a rented pod's container yourself.",
     )
@@ -3023,10 +3023,10 @@ class RentedPodOwnershipMessages:
         severity="warning",
         category="runtime",
         impact="Proceed; incorrect ownership can break package installation, root login, or sudo until repaired",
-        remediation="The shifted pods do not share one cause: a pod that started 600 seconds or more after the "
-        "boot had its container restarted while the host kept running, unless the pod was created before the boot; "
-        "a pod created before the boot, or started sooner after it, came back after the host stopped without a "
-        "clean shutdown. A restart does not repair it. Contact support: the "
+        remediation="The shifted pods do not share one cause. A pod created after the boot, or started 600 seconds "
+        "or more after it when its creation time is unknown, was created or restarted while the host kept running. "
+        "A pod created before the boot, or started sooner after it when its creation time is unknown, came back "
+        "after the host stopped without a clean shutdown. A restart does not repair it. Contact support: the "
         "renters are moved to fresh pods free of charge. Do not change file ownership on the host or restart "
         "a rented pod's container yourself, and shut the host down cleanly.",
     )

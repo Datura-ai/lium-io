@@ -14,6 +14,8 @@ from .rented_pod_resources import running_rented_container_names
 READ_TIMEOUT_SECONDS = 30
 # docker starts a restart-policy container within a few minutes of boot; one started later was restarted alone
 CONTAINER_RESTART_AFTER_BOOT_SECONDS = 600
+# a creation time this close to the boot (whole seconds on both sides, clock slew) tells neither side of it
+BOOT_TIME_UNCERTAINTY_SECONDS = 5
 
 
 # a restart of these under a running pod breaks it while it looks healthy: sysbox-fs serves the pod's /proc
@@ -65,6 +67,19 @@ def _epoch(stamp: str) -> int | None:
         )
     except ValueError:
         return None
+
+
+def _shift_cause(pod: dict) -> str | None:
+    """"host" when the pod's container was on the host when it stopped (created before the boot) or came back right
+    after the boot; "container" when it was created after the boot, or started long after it with its creation time
+    unknown (created or restarted on the running host); None when neither is read."""
+    before = pod.get("created_before_boot")
+    if before is not None:
+        return "host" if before else "container"
+    after = pod.get("started_after_boot_s")
+    if after is None:
+        return None
+    return "container" if after >= CONTAINER_RESTART_AFTER_BOOT_SECONDS else "host"
 
 
 def judge(line: str) -> dict | None:
@@ -189,7 +204,8 @@ class RentedPodOwnershipCheck:
                     # pid beside its age: a pid gone since the read prints nothing, so ages cannot pair by line
                     "cut -d' ' -f1 /proc/uptime; ps -o pid=,etimes= -p "
                     + ",".join(str(int(p["pid"])) for p in shifted)
-                    + "; echo --; date +%s; /usr/bin/docker inspect --format '{{.Name}} {{.Created}}' "
+                    # btime: the kernel's boot epoch, taken in one read (not a clock and an uptime sampled apart)
+                    + "; echo --; awk '/^btime /{print $2}' /proc/stat; /usr/bin/docker inspect --format '{{.Name}} {{.Created}}' "
                     + " ".join(shlex.quote(p["container"]) for p in shifted),
                     check=False,
                 ),
@@ -204,8 +220,8 @@ class RentedPodOwnershipCheck:
         for line in lines:
             pid, _, age = line.strip().partition(" ")
             ages[_num(pid)] = _num(age.strip())
-        now, *created_lines = tail.splitlines() or [""]
-        now_s = _num(now)
+        btime, *created_lines = tail.splitlines() or [""]
+        boot_s = _num(btime)
         created = {}
         for line in created_lines:
             name, _, stamp = line.strip().partition(" ")
@@ -215,19 +231,16 @@ class RentedPodOwnershipCheck:
             if uptime_s is not None and age_s is not None:
                 pod["started_after_boot_s"] = uptime_s - age_s
             created_s = created.get(pod["container"])
-            if uptime_s is not None and now_s is not None and created_s is not None:
-                pod["created_before_boot"] = created_s < now_s - uptime_s
-        after = [p.get("started_after_boot_s") for p in shifted]
-        late = [
-            a is not None
-            and a >= CONTAINER_RESTART_AFTER_BOOT_SECONDS
-            and not p.get("created_before_boot")
-            for a, p in zip(after, shifted)
-        ]
-        if all(late):
+            if boot_s is not None and created_s is not None:
+                if created_s < boot_s - BOOT_TIME_UNCERTAINTY_SECONDS:
+                    pod["created_before_boot"] = True
+                elif created_s > boot_s + BOOT_TIME_UNCERTAINTY_SECONDS:
+                    pod["created_before_boot"] = False
+        causes = [_shift_cause(p) for p in shifted]
+        if all(c == "container" for c in causes):
             return Msg.SHIFTED_AFTER_CONTAINER_RESTART
-        if any(late) and None not in after:
-            # some pods restarted on a running host, others came back with it: neither cause fits every pod
+        if None not in causes and "container" in causes:
+            # some pods were created or restarted on a running host, others came back with it
             return Msg.SHIFTED_MIXED
         return Msg.SHIFTED
 
