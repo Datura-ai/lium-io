@@ -15,7 +15,7 @@ Redis state (all keys written only by this validator):
 - ``gpu_power_cap_revert:<executor_id>`` — DAH-2786: the reverts observed on that executor inside
   ``CAP_REVERT_WINDOW_SECONDS``. A restore that finds the limit already back where the miner had it
   proves the host raised it while our filler ran. Kept so each revert is logged once (Loki evidence);
-  no pay gate reads it: the backend holds idle pay until a later filler run keeps the cap.
+  no pay gate reads it.
 
 A record that outlives its filler (delete failed, SSH broke mid-teardown) is repaired by two safety
 nets, so a reduced limit can never stick:
@@ -92,8 +92,8 @@ _REVERT_KEY_PREFIX = "gpu_power_cap_revert:"
 # DAH-2786 — how long one observed revert stays on the executor's record, so a job's revert is
 # logged once.
 CAP_REVERT_WINDOW_SECONDS = 24 * 60 * 60
-# The gate only needs a count and the last evidence, so the history is bounded: a host that
-# reverts every filler run would otherwise grow the record for the whole window.
+# The history only dedupes the revert log lines, so it is bounded: a host that reverts every filler
+# run would otherwise grow the record for the whole window.
 MAX_TRACKED_CAP_REVERTS = 50
 # A record younger than this may belong to a filler the check's backend snapshot doesn't report yet
 # (backend marks owner="lium" from STARTING, but the snapshot is taken at cycle start) — the check
