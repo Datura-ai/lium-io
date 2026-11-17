@@ -1841,31 +1841,12 @@ def _layer_data_check(
     when no upper dir was readable) is never released by a startup window."""
     name = shlex.quote(container_name)
     under = shlex.quote(f"{plaintext_path.rstrip('/')}/")
-    upper_under = shlex.quote(plaintext_path.rstrip("/"))
     awk = (
         '$0 == "diff-failed" {f=1} ($1 == "A" || $1 == "C") && index(substr($0, 3), p) == 1 {k=1} '
         f'END {{if (!f && !k) print "{_DROP_MARK}"}}'
     )
-    root_mount_upper = (
-        "awk '$5 == \"/\" {for (i = 7; i < NF; i++) if ($i == \"-\") {n = split($(i + 3), o, \",\"); "
-        "for (j = 1; j <= n; j++) if (o[j] ~ /^upperdir=/) print substr(o[j], 10); exit}}' \"/proc/$p/mountinfo\""
-    )
-    given = f"u={shlex.quote(upper_dir)}; d=$(v \"$u\")" if upper_dir else "false"
     shortcut = (
-        'v() { [ -n "$1" ] || return 1; [ -d "/proc/1/root$1" ] && { echo "/proc/1/root$1"; return 0; }; '
-        '[ -d "$1" ] && echo "$1"; }; '
-        f"c=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}} {{{{.GraphDriver.Data.UpperDir}}}}' {name} 2>/dev/null) "
-        f"&& p=\"${{c%% *}}\" && u=\"${{c#* }}\" "
-        f"&& {{ d=$(v \"$u\") || {{ u=$({root_mount_upper} 2>/dev/null) && d=$(v \"$u\"); }} || {{ {given}; }}; }} "
-        f"&& echo \"upper $u\" && x=\"$d\"{upper_under} && [ -d \"$x\" ] "
-        # one window per recorded start, cut short by a later start of Docker's own: its files are the renter's
-        f"&& {{ i=$(/usr/bin/docker inspect -f '{{{{.Id}}}} {{{{.State.StartedAt}}}}' {name} 2>/dev/null); "
-        "g=$(date -d \"${i#* }\" +%s%N 2>/dev/null) || g=0; w=; "
-        "n() { printf '@%d.%09d' $(($1 / 1000000000)) $(($1 % 1000000000)); }; "
-        "while read -r s e; do [ -n \"$e\" ] || continue; case \"$s$e\" in *[!0-9]*) continue;; esac; "
-        "[ \"$g\" -gt \"$s\" ] && [ \"$g\" -lt \"$e\" ] && e=$g; "
-        "w=\"$w ! ( -newerct $(n $s) ! -newerct $(n $e) )\"; "
-        f"done 2>/dev/null < {_VALIDATOR_STARTS_DIR}/\"${{i%% *}}\"; true; }} "
+        f"{_layer_upper_scope(name, plaintext_path, upper_dir)} && [ -d \"$x\" ] "
         "&& f=$(find \"$x\" -mindepth 1 \\( -type f -o -type l \\) $w -print -quit 2>/dev/null) && [ -z \"$f\" ] && { echo " + _DROP_MARK + "; exit 0; }; "
     )
     return (
@@ -1873,6 +1854,34 @@ def _layer_data_check(
         f"printf '%s\\n' \"$m\" | grep -qxF {_LIUM_CIPHER_MOUNT} || {{ echo {_DROP_MARK}; exit 0; }}; "
         f"{shortcut if startup_shortcut else ''}"
         f"{{ /usr/bin/docker diff {name} || echo diff-failed; }} | awk -v p={under} {shlex.quote(awk)}"
+    )
+
+
+def _layer_upper_scope(name: str, plaintext_path: str, upper_dir: str | None) -> str:
+    """Shell that sets ``x`` to the container layer's own copy of the plaintext path (its overlay upper dir, see
+    ``_layer_data_check``) and ``w`` to the find tests that leave out every recorded validator start window; it
+    fails when no upper dir is readable. ``name`` is shell-quoted."""
+    upper_under = shlex.quote(plaintext_path.rstrip("/"))
+    root_mount_upper = (
+        "awk '$5 == \"/\" {for (i = 7; i < NF; i++) if ($i == \"-\") {n = split($(i + 3), o, \",\"); "
+        "for (j = 1; j <= n; j++) if (o[j] ~ /^upperdir=/) print substr(o[j], 10); exit}}' \"/proc/$p/mountinfo\""
+    )
+    given = f"u={shlex.quote(upper_dir)}; d=$(v \"$u\")" if upper_dir else "false"
+    return (
+        'v() { [ -n "$1" ] || return 1; [ -d "/proc/1/root$1" ] && { echo "/proc/1/root$1"; return 0; }; '
+        '[ -d "$1" ] && echo "$1"; }; '
+        f"c=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}} {{{{.GraphDriver.Data.UpperDir}}}}' {name} 2>/dev/null) "
+        f"&& p=\"${{c%% *}}\" && u=\"${{c#* }}\" "
+        f"&& {{ d=$(v \"$u\") || {{ u=$({root_mount_upper} 2>/dev/null) && d=$(v \"$u\"); }} || {{ {given}; }}; }} "
+        f"&& echo \"upper $u\" && x=\"$d\"{upper_under} "
+        # one window per recorded start, cut short by a later start of Docker's own: its files are the renter's
+        f"&& {{ i=$(/usr/bin/docker inspect -f '{{{{.Id}}}} {{{{.State.StartedAt}}}}' {name} 2>/dev/null); "
+        "g=$(date -d \"${i#* }\" +%s%N 2>/dev/null) || g=0; w=; "
+        "n() { printf '@%d.%09d' $(($1 / 1000000000)) $(($1 % 1000000000)); }; "
+        "while read -r s e; do [ -n \"$e\" ] || continue; case \"$s$e\" in *[!0-9]*) continue;; esac; "
+        "[ \"$g\" -gt \"$s\" ] && [ \"$g\" -lt \"$e\" ] && e=$g; "
+        "w=\"$w ! ( -newerct $(n $s) ! -newerct $(n $e) )\"; "
+        f"done 2>/dev/null < {_VALIDATOR_STARTS_DIR}/\"${{i%% *}}\"; true; }}"
     )
 
 
@@ -2119,18 +2128,22 @@ class _EditSwap:
             self.keep_parked = True
         if self.keep_parked and kept:
             # one rolling kept copy per pod: an earlier one takes these files too, so the count never grows
-            await self._copy_into_kept(parked, ids_by_name.get(kept[-1]) or kept[-1])
+            await self._copy_into_kept(parked, ids_by_name.get(kept[-1]) or kept[-1], upper_dir)
         logger.info(_m("Parked current container for edit", extra=get_extra_info({**self.default_extra, "parked": parked})))
         return parked
 
-    async def _copy_into_kept(self, parked: str, kept: str) -> None:
-        """Copy the parked layer's files under the plaintext path onto the earlier kept copy, newer files over older.
-        Both are stopped, so each path is its layer, not the FUSE mount. A failure fails the edit; the pod comes back."""
+    async def _copy_into_kept(self, parked: str, kept: str, upper_dir: str | None) -> None:
+        """Copy the files the parked layer itself added or changed under the plaintext path, outside the validator start
+        windows (the ones its layer check counts), onto the earlier kept copy, newer over older. Read from the upper dir:
+        the stopped container's merged path would carry image files over older renter files. No readable upper dir or
+        any other failure fails the edit; the pod comes back."""
         if not self.plaintext_path:
             raise Exception("[park_current_container] the pod's volume path is unknown; the pod was restored")
         path = self.plaintext_path.rstrip("/")
         copy = (
-            f"set -o pipefail; /usr/bin/docker cp {shlex.quote(f'{parked}:{path}/.')} - "
+            f"set -o pipefail; {_layer_upper_scope(shlex.quote(parked), path, upper_dir)} "
+            "|| { echo 'the parked layer could not be read' >&2; exit 1; }; [ -d \"$x\" ] || exit 0; "
+            "cd \"$x\" && find . -mindepth 1 \\( -type f -o -type l \\) $w -print0 | tar --null -T - -cf - "
             f"| /usr/bin/docker cp - {shlex.quote(f'{kept}:{path}')}"
         )
         copied = await _run_with_host_timeout(self.ssh_client, f"bash -c {shlex.quote(copy)}", _KEPT_COPY_TIMEOUT_SECONDS)
