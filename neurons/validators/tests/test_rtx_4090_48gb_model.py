@@ -13,7 +13,7 @@ from services.gpu_spec_table import (
     RTX_4090,
     RTX_4090_48GB,
     classify_gpu_model,
-    driver_gpu_name,
+    name_reported_by_driver,
     matmul_probe_vram_mb,
 )
 from services.task.checks.gpu_model_truth import EXPECTED_CC_AND_SM, gpu_model_mismatch
@@ -75,7 +75,7 @@ def test_every_modded_model_has_its_own_economics_and_checks(model):
     assert family != BASE_GPU_MAP[base]
     assert MAX_UNRENTED_GPUS_BY_TYPE[family] == {1: 10, 8: 64}  # the default tier
     assert EXPECTED_CC_AND_SM[model] == EXPECTED_CC_AND_SM[base]
-    assert driver_gpu_name(model) == base
+    assert name_reported_by_driver(model) == base
     assert matmul_probe_vram_mb(model) == round(size_mb * 0.90)  # the all-card probe uses the modded size
 
 
@@ -94,7 +94,7 @@ def test_the_standard_cards_keep_their_numbers():
     assert RENTAL_PRICES_PER_HOUR[RTX_4090_48GB] == 0.48
     assert RENTAL_PRICES_PER_HOUR[RTX_4080_32GB] == RENTAL_PRICES_PER_HOUR[RTX_4080_SUPER_32GB] == 0.26
     assert MAX_UNRENTED_GPUS_BY_TYPE["RTX 4090"] == {1: 10, 8: 64}
-    assert driver_gpu_name(RTX_4090) == RTX_4090
+    assert name_reported_by_driver(RTX_4090) == RTX_4090
 
 
 def test_scrape_state_and_published_specs_name_the_modded_card():

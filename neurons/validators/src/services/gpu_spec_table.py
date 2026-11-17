@@ -279,7 +279,7 @@ def classify_gpu_model(name: str | None, capacity_mb: int | float | None) -> str
     name itself, so a card that does is treated as its base card: only its VRAM makes it the modded
     model. Every other card is normalize_gpu_model.
     """
-    canonical = driver_gpu_name(normalize_gpu_model(name))
+    canonical = name_reported_by_driver(normalize_gpu_model(name))
     if isinstance(capacity_mb, (int, float)):
         for model, (base, size_mb) in MODDED_VRAM_MODELS.items():
             low, high = vram_window_for_size(size_mb)
@@ -288,7 +288,7 @@ def classify_gpu_model(name: str | None, capacity_mb: int | float | None) -> str
     return canonical
 
 
-def driver_gpu_name(model: str) -> str:
+def name_reported_by_driver(model: str) -> str:
     """The name the driver reports for `model`: a modded model's base card, else the model itself. The
     native verifier keys its challenge on the driver's name, so machine_info must carry this one."""
     return MODDED_VRAM_MODELS.get(model, (model, 0))[0]
