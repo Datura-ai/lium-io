@@ -312,3 +312,93 @@ def test_only_a_no_answer_all_cards_failure_is_open_to_the_live_workload_waiver(
     failed = "All-cards GPU work-proof failed: 7/8 card(s) failed device work-proof"
     assert _probe_gave_no_answer(mvs.ValidationResult(success=False, error_message=failed, all_cards_no_answer=True))
     assert not _probe_gave_no_answer(mvs.ValidationResult(success=False, error_message=failed))
+
+
+def _ssh_scripted(card: int, answers: list[str]):
+    # card `card` answers each pinned run from `answers` in turn ("timeout" raises the run's timeout);
+    # every other card answers right; kills are recorded
+    calls = {"runs": 0, "kills": []}
+
+    async def run(cmd, *args, **kwargs):
+        if cmd.startswith("pkill"):
+            calls["kills"].append(cmd)
+            return SimpleNamespace(exit_status=0, stdout="", stderr="")
+        if "CUDA_VISIBLE_DEVICES=" in cmd and _card_index(cmd) == card:
+            answer = answers[calls["runs"]]
+            calls["runs"] += 1
+            if answer == "timeout":
+                raise TimeoutError()
+            return SimpleNamespace(exit_status=0, stdout=answer, stderr="")
+        return SimpleNamespace(exit_status=0, stdout=ANSWER, stderr="")
+
+    return SimpleNamespace(run=run), calls
+
+
+@pytest.mark.asyncio
+async def test_a_timeout_then_a_right_answer_on_the_retry_passes(svc, monkeypatch):
+    _flags(monkeypatch, enforce=True)
+    ssh, calls = _ssh_scripted(0, ["timeout", ANSWER])
+
+    probe = await svc.probe_all_claimed_cards(ssh, _executor(), {}, _spec(8))
+
+    assert probe.passed is True
+    assert probe.per_card[0]["ok"] is True and probe.per_card[0]["retried"] is True
+    assert calls["runs"] == 2
+    # only the timed-out card's own run is killed before the retry
+    assert len(calls["kills"]) == 1 and "deadbeef" in calls["kills"][0]
+
+
+@pytest.mark.asyncio
+async def test_a_timeout_then_another_timeout_fails_the_card_and_the_node(svc, monkeypatch):
+    _flags(monkeypatch, enforce=True)
+    ssh, calls = _ssh_scripted(0, ["timeout", "timeout"])
+
+    probe = await svc.probe_all_claimed_cards(ssh, _executor(), {}, _spec(8))
+
+    assert probe.passed is False
+    assert probe.per_card[0]["reason"] == "timeout_after_retry"
+    assert calls["runs"] == 2
+    result = await svc.validate_gpu_model_and_process_job(
+        ssh_client=_ssh_scripted(0, ["timeout", "timeout"])[0],
+        executor_info=_executor(),
+        default_extra={},
+        machine_spec=_spec(8),
+    )
+    assert result.success is False
+    assert result.error_message.startswith("All-cards GPU work-proof failed")
+
+
+@pytest.mark.asyncio
+async def test_a_timeout_then_a_wrong_answer_fails(svc, monkeypatch):
+    _flags(monkeypatch, enforce=True)
+    ssh, calls = _ssh_scripted(0, ["timeout", "UUID: someone-elses"])
+
+    probe = await svc.probe_all_claimed_cards(ssh, _executor(), {}, _spec(8))
+
+    assert probe.passed is False
+    assert probe.per_card[0]["reason"] == "wrong_answer"
+    assert probe.no_answer_only is False
+
+
+@pytest.mark.asyncio
+async def test_a_wrong_answer_on_the_first_try_fails_with_no_retry(svc, monkeypatch):
+    _flags(monkeypatch, enforce=True)
+    ssh, calls = _ssh_scripted(0, ["UUID: someone-elses", ANSWER])
+
+    probe = await svc.probe_all_claimed_cards(ssh, _executor(), {}, _spec(8))
+
+    assert probe.passed is False
+    assert probe.per_card[0]["reason"] == "wrong_answer"
+    assert "retried" not in probe.per_card[0]
+    assert calls["runs"] == 1 and calls["kills"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_retried_wave_gets_the_retry_budget_on_the_wall_clock(svc, monkeypatch):
+    ticks = iter([0.0, 200.0])
+    monkeypatch.setattr(mvs.time, "perf_counter", lambda: next(ticks))
+    ssh, _ = _ssh_scripted(0, ["timeout", ANSWER])
+
+    probe = await svc.probe_all_claimed_cards(ssh, _executor(), {}, _spec(8))
+
+    assert probe.over_wall_clock is False and probe.passed is True

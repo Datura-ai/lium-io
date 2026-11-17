@@ -35,6 +35,13 @@ MATMUL_ALLCARDS_WALL_CLOCK_SECONDS = 120
 # serialises) and stays clear of that ceiling on the widest honest hosts.
 MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS = 8
 
+# A card that times out gets ONE retry, of that card only, with a fresh challenge, after its own run is
+# killed. A timeout is never a pass: a retry that times out again, or answers wrong or not at all,
+# fails the card (reason `timeout_after_retry` or the retry's own reason). A wrong answer is never
+# retried. Worst case per card: two runs under MATRIX_VERIFY_TIMEOUT_SECONDS plus the kill's 10 s.
+MATMUL_ALLCARDS_CARD_KILL_TIMEOUT_SECONDS = 10
+MATMUL_ALLCARDS_RETRY_BUDGET_SECONDS = MATRIX_VERIFY_TIMEOUT_SECONDS + MATMUL_ALLCARDS_CARD_KILL_TIMEOUT_SECONDS
+
 # VRAM (MB) the work-proof leaves untouched: a quarter of the card, clamped between the two.
 # The reserve must clear what an idle card may legally hold (GPU_HELD_VRAM_MB_LIMIT, 2048 MB —
 # a B200 in confidential-computing mode sits just under it at 1766 MB) plus the probe's own CUDA
@@ -362,8 +369,14 @@ class ValidationService:
 
         async def run_gated(index: int, challenge: MatmulChallenge) -> dict:
             async with gate:
-                return await self._run_one_card(
+                outcome = await self._run_one_card(
                     ssh_client, executor_info, script_path, index, challenge, card_uuids[index]
+                )
+                if outcome["reason"] != "timeout":
+                    return outcome
+                return await self._retry_timed_out_card(
+                    ssh_client, executor_info, script_path, index, challenge, card_uuids[index],
+                    gpu_model, sized_vram_mb, default_extra,
                 )
 
         start = time.perf_counter()
@@ -378,7 +391,10 @@ class ValidationService:
 
         failed_cards = [outcome for outcome in per_card if not outcome["ok"]]
         waves = -(-gpu_count // MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS)
-        wall_clock_threshold = MATMUL_ALLCARDS_WALL_CLOCK_SECONDS * waves
+        # a retried card's own budget is not serialisation: a wave with a retry gets the retry's budget too
+        retried = any(outcome.get("retried") for outcome in per_card)
+        per_wave = MATMUL_ALLCARDS_WALL_CLOCK_SECONDS + (MATMUL_ALLCARDS_RETRY_BUDGET_SECONDS if retried else 0)
+        wall_clock_threshold = per_wave * waves
         over_wall_clock = elapsed > wall_clock_threshold
         passed = not failed_cards and not over_wall_clock
         if failed_cards:
@@ -420,12 +436,48 @@ class ValidationService:
             per_card=per_card,
         )
 
+    async def _retry_timed_out_card(
+        self,
+        ssh_client,
+        executor_info,
+        script_path: str,
+        index: int,
+        timed_out: "MatmulChallenge",
+        card_uuid: str,
+        gpu_model: str,
+        sized_vram_mb: int,
+        default_extra: dict,
+    ) -> dict:
+        # kill only this card's run (its cipher text is on its command line; the other cards keep going),
+        # so the retry does not find the card's VRAM still held by the first run
+        try:
+            await ssh_client.run(
+                f"pkill -9 -f -- {shlex.quote(timed_out.params.cipher_text[:64])}",
+                timeout=MATMUL_ALLCARDS_CARD_KILL_TIMEOUT_SECONDS,
+            )
+        except Exception as e:
+            logger.warning("All-cards per-card kill before retry failed: %s", str(e))
+        challenge = self._card_challenge(gpu_model, sized_vram_mb, card_uuid, default_extra)
+        if challenge is None:
+            # our cipher failed: the card is still unproven, so it fails
+            return {"card_index": index, "ok": False, "reason": "timeout_after_retry", "retried": True}
+        try:
+            outcome = await self._run_one_card(
+                ssh_client, executor_info, script_path, index, challenge, card_uuid
+            )
+        finally:
+            challenge.close()
+        if outcome["reason"] == "timeout":
+            outcome["reason"] = "timeout_after_retry"
+        outcome["retried"] = True
+        return outcome
+
     @staticmethod
     def _leaves_matmul_running(outcome: dict) -> bool:
         # the per-card failures where the remote matmul may still hold VRAM: a timeout abandons only
         # the local wait, and a channel that dies mid-run (ssh_error) leaves the process untouched
         reason = outcome.get("reason") or ""
-        return reason == "timeout" or reason.startswith("ssh_error")
+        return reason in ("timeout", "timeout_after_retry") or reason.startswith("ssh_error")
 
     def _card_challenge(
         self, gpu_model: str, sized_vram_mb: int, card_uuid: str, default_extra: dict
