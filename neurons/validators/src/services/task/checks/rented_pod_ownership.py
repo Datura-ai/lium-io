@@ -205,9 +205,9 @@ class RentedPodOwnershipCheck:
             res = await asyncio.wait_for(
                 ctx.ssh.run(
                     # comm is cut to 15 characters (nv-fabricmanage)
-                    "ps -eo comm=,etimes= | grep -E '^("
+                    "ps -eo pid=,ppid=,comm=,etimes= | grep -E ' ("
                     + "|".join(n[:15] for n in RUNTIME_PROCESSES)
-                    + ") '; echo --; ps -o pid=,etimes= -p "
+                    + ") +[0-9]+$'; echo --; ps -o pid=,etimes= -p "
                     + ",".join(str(int(p["pid"])) for p in pods),
                     check=False,
                 ),
@@ -216,12 +216,21 @@ class RentedPodOwnershipCheck:
         except (asyncssh.Error, OSError, TimeoutError):
             return {}
         services, _, pod_lines = (res.stdout or "").partition("--")
-        youngest: dict[str, int] = {}
+        procs = []
         for line in services.splitlines():
-            comm, _, age = line.strip().partition(" ")
+            fields = line.split()
+            if len(fields) != 4:
+                continue
+            pid, ppid, comm, age = fields
             name = next((n for n in RUNTIME_PROCESSES if n[:15] == comm), None)
-            age_s = _num(age)
-            if name and age_s is not None:
+            if name and None not in (_num(pid), _num(ppid), _num(age)):
+                procs.append((name, _num(pid), _num(ppid), _num(age)))
+        pids = {(name, pid) for name, pid, _, _ in procs}
+        youngest: dict[str, int] = {}
+        for name, _, ppid, age_s in procs:
+            # sysbox-fs and sysbox-mgr re-exec themselves for short-lived helpers (nsenter into a pod on each
+            # /proc read): a child of the same daemon is not a restart of it
+            if (name, ppid) not in pids:
                 youngest[name] = min(age_s, youngest.get(name, age_s))
         pod_age = {}
         for line in pod_lines.splitlines():

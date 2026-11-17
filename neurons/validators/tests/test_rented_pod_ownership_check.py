@@ -297,7 +297,7 @@ def _ssh_with_runtime_ages(proc: str, ages: str):
     inner = _ssh(proc)
 
     async def run(cmd, check=False):
-        if cmd.startswith("ps -eo comm=,etimes="):
+        if cmd.startswith("ps -eo pid=,ppid=,comm=,etimes="):
             return SimpleNamespace(exit_status=0, stdout=ages, stderr="")
         return await inner.run(cmd, check=check)
 
@@ -309,13 +309,22 @@ def _ssh_with_runtime_ages(proc: str, ages: str):
     [
         # needrestart restarted sysbox-fs and the fabric manager 100 s ago; pod_1 runs for a day, pod_2 for 50 s
         (
-            "sysbox-mgr 90000\nsysbox-fs     100\nnv-fabricmanage 100\n--\n 4242 86400\n 4343 50\n",
+            "  10     1 sysbox-mgr 90000\n  11     1 sysbox-fs     100\n  12 1 nv-fabricmanage 100\n"
+            "--\n 4242 86400\n 4343 50\n",
             {"nv-fabricmanager": ["pod_1"], "sysbox-fs": ["pod_1"]},
         ),
         # every runtime process is older than both pods (a reboot brings them up first): nothing to flag
-        ("sysbox-mgr 90000\nsysbox-fs 90000\n--\n4242 86400\n4343 50\n", None),
+        ("10 1 sysbox-mgr 90000\n11 1 sysbox-fs 90000\n--\n4242 86400\n4343 50\n", None),
         # a pod age not read flags nothing for that pod
-        ("sysbox-fs 100\n--\n4343 50\n", None),
+        ("11 1 sysbox-fs 100\n--\n4343 50\n", None),
+        # the daemons run since boot; their own helpers (nsenter re-execs, seconds old) are not a restart
+        (
+            "10 1 sysbox-mgr 90000\n11 1 sysbox-fs 90000\n900 11 sysbox-fs 1\n901 10 sysbox-mgr 2\n"
+            "--\n4242 86400\n4343 50\n",
+            None,
+        ),
+        # a restarted daemon is flagged even beside an orphaned helper of the old one
+        ("11 1 sysbox-fs 100\n77 1 sysbox-fs 90000\n--\n4242 86400\n4343 50\n", {"sysbox-fs": ["pod_1"]}),
     ],
 )
 @pytest.mark.asyncio
