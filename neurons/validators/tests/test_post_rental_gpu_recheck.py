@@ -200,6 +200,11 @@ async def test_no_all_cards_matmul_is_inconclusive_on_a_multi_card_node(
         _all_cards("", "timeout"),
         _all_cards("ssh_error: channel closed", ""),
         _all_cards("", "", over_wall_clock=True),
+        # review (17 Nov): a multi-card claim the probe could not run (no card details or size, our own cipher
+        # failed) ran no card, so it says nothing about them: inconclusive as before, whatever the flags
+        SimpleNamespace(
+            passed=False, failure_reason="not probed: no card details", over_wall_clock=False, per_card=[]
+        ),
     ],
 )
 @pytest.mark.asyncio

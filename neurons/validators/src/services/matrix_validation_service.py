@@ -353,8 +353,14 @@ class ValidationService:
         if run is None:
             return _not_probed("cipher text generation failed (native error)")
         per_card, elapsed = run
+        waves = -(-gpu_count // MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS)
+        wall_clock_threshold = MATMUL_ALLCARDS_WALL_CLOCK_SECONDS * waves
         timed_out = any(outcome["reason"] == "timeout" for outcome in per_card)
-        if timed_out and all(outcome["reason"] != "wrong_answer" for outcome in per_card):
+        # a run over the wall clock where every card answered right is retried like a timeout: honest runs come
+        # close to the limit (8x B300 85 s of 90 in prod, 10-17 Nov), so one slow run is measured again and the
+        # retry decides; cards that share fewer real GPUs are slow on the retry too
+        slow = elapsed > wall_clock_threshold and all(outcome["ok"] for outcome in per_card)
+        if (timed_out or slow) and all(outcome["reason"] != "wrong_answer" for outcome in per_card):
             # the whole run again, together, so the retry is as concurrent as the first try
             await self._kill_remote_matmul(ssh_client, script_path, {**default_extra, "retry": "all_cards"})
             retry = await self._run_all_cards(
@@ -369,8 +375,6 @@ class ValidationService:
                     outcome["reason"] = "timeout_after_retry"
 
         failed_cards = [outcome for outcome in per_card if not outcome["ok"]]
-        waves = -(-gpu_count // MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS)
-        wall_clock_threshold = MATMUL_ALLCARDS_WALL_CLOCK_SECONDS * waves
         over_wall_clock = elapsed > wall_clock_threshold
         passed = not failed_cards and not over_wall_clock
         if failed_cards:
@@ -457,6 +461,14 @@ class ValidationService:
             per_card = await asyncio.gather(
                 *(run_gated(index, challenge) for index, challenge in enumerate(challenges))
             )
+        except asyncio.CancelledError:
+            # the cycle's deadline or the fast path cancelled us: the remote matmuls keep the cards
+            # busy into the next run, so kill them (shielded: a second cancel must not stop the kill)
+            # and stay cancelled, as the single-card run does
+            await asyncio.shield(
+                self._kill_remote_matmul(ssh_client, script_path, {**default_extra, "cancelled": "all_cards"})
+            )
+            raise
         finally:
             for challenge in challenges:
                 challenge.close()

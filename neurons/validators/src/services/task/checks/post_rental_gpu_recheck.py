@@ -128,6 +128,9 @@ async def record_gpu_drop(ctx: Context, missing_uuids: list[str]) -> None:
 
 def _all_cards_no_verdict(probe: AllCardsProbe) -> bool:
     # SSH errors, timeouts and the wall clock say nothing about the cards, as the fault probe treats them
+    if not probe.per_card:
+        # not probed (no card details or size, our own cipher failed): no card was run, inconclusive as before
+        return True
     reasons = [c.get("reason") or "" for c in probe.per_card if not c.get("ok")]
     if not reasons:
         return probe.over_wall_clock

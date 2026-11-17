@@ -284,7 +284,9 @@ async def test_a_single_card_host_is_proven_by_the_single_card_run(svc):
 @pytest.mark.asyncio
 async def test_the_wall_clock_is_the_flat_90_s_per_wave(svc, monkeypatch, cards, threshold, over):
     _flags(monkeypatch, enforce=True)
-    ticks = iter([0.0, threshold + (1.0 if over else -1.0)])
+    # over: the first run and its retry are both over the limit
+    elapsed = threshold + (1.0 if over else -1.0)
+    ticks = iter([0.0, elapsed, 0.0, elapsed])
     monkeypatch.setattr(mvs.time, "perf_counter", lambda: next(ticks))
 
     probe = await svc.probe_all_claimed_cards(_ssh(real_cards=cards), _executor(), {}, _spec(cards))
@@ -424,3 +426,45 @@ async def test_the_retry_run_is_timed_on_its_own_against_the_same_wall_clock(svc
     probe = await svc.probe_all_claimed_cards(ssh, _executor(), {}, _spec(8))
 
     assert probe.over_wall_clock is True and probe.passed is False
+
+
+@pytest.mark.parametrize(("retry_elapsed", "passed"), [(85.0, True), (91.0, False)])
+@pytest.mark.asyncio
+async def test_a_run_over_the_wall_clock_with_every_card_right_is_run_again_and_the_retry_decides(
+    svc, monkeypatch, retry_elapsed, passed
+):
+    """Review (17 Nov): honest 8x B300 took 85 s of the 90 s in prod, so one slow run must not fail the node alone."""
+    _flags(monkeypatch, enforce=True)
+    ticks = iter([0.0, 92.0, 0.0, retry_elapsed])
+    monkeypatch.setattr(mvs.time, "perf_counter", lambda: next(ticks))
+    ssh, calls = _ssh_scripted({0: [ANSWER, ANSWER]})
+
+    probe = await svc.probe_all_claimed_cards(ssh, _executor(), {}, _spec(8))
+
+    assert calls["runs"] == {0: 2}
+    assert all(card["ok"] and card["retried"] for card in probe.per_card)
+    assert probe.passed is passed and probe.over_wall_clock is not passed
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_all_cards_run_kills_the_remote_matmuls_and_stays_cancelled(svc, monkeypatch):
+    """Review (17 Nov): a cancel (cycle deadline, fast path) left every card's remote matmul running."""
+    import asyncio
+
+    _flags(monkeypatch, enforce=True)
+    started, kills = asyncio.Event(), []
+
+    async def run(cmd, *args, **kwargs):
+        if cmd.startswith("pkill"):
+            kills.append(cmd)
+            return SimpleNamespace(exit_status=0, stdout="", stderr="")
+        started.set()
+        await asyncio.sleep(3600)
+
+    task = asyncio.create_task(svc.probe_all_claimed_cards(SimpleNamespace(run=run), _executor(), {}, _spec(8)))
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(kills) == 1

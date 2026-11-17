@@ -668,3 +668,21 @@ async def test_a_faked_model_on_a_filler_node_removes_lium_filler_only(context_f
 
     assert result.event.reason_code == Msg.GPU_MODEL_MISMATCH.reason
     assert result.event.what_we_saw.get("removed_fillers") == (["filler_active"] if removed else None)
+
+
+@pytest.mark.asyncio
+async def test_a_carried_work_proof_failure_clears_on_a_right_answer_with_no_numbers(context_factory, monkeypatch):
+    """Review (17 Nov): a filler-sample work-proof failure on card 1, the filler then removed. The normal path's pinned
+    remeasure of card 1 gets a right answer without numbers: that clears the failure, as the filler sample does."""
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", True)
+    redis = FakeRedis()
+    failed = capability.work_proof_failed(_two_card_specs(), 1)
+    redis.store[_verdict_key()] = json.dumps({"mismatches": [failed.as_dict()]})
+    service = _PinnedCardService(REAL_H100[1], {"GPU-1": {}})
+
+    result = await _idle_run(context_factory, redis, service)
+
+    assert service.gpu_uuids == ["GPU-1"]
+    assert result.passed is True
+    assert json.loads(redis.store[_verdict_key()])["mismatches"] == []

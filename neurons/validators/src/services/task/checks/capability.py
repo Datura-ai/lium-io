@@ -483,6 +483,11 @@ async def _remeasure_carried_mismatch(
     logger.warning(_m("GPU_MODEL_MISMATCH_REMEASURE", extra=get_extra_info({**ctx.default_extra, **sample})))
     if found is not None:
         return await judge_gpu_model(ctx, found, {carried[0]})
+    if sample.get("passed") and any(m.card_index == carried[0] and m.kind == WORK_PROOF_FAILED for m in mismatches):
+        # a right answer from a card whose work-proof failed clears that failure, numbers or not (as the filler
+        # path does); any other verdict on the card stands
+        kept = [m for m in mismatches if m.card_index == carried[0] and m.kind != WORK_PROOF_FAILED]
+        return await judge_gpu_model(ctx, kept, {carried[0]})
     return mismatches  # no_numbers is only logged here: no prod data yet for a pinned sample
 
 
