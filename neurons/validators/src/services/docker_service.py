@@ -14182,7 +14182,8 @@ class DockerService:
                 # DAH-4663: give the GPUs a renter locked back their clocks (one Redis read when none)
                 with _best_effort_delete_step(log, "reset_gpu_clock_locks"):
                     await reset_pod_clock_locks(
-                        SSHCommandRunner(ssh_client, max_retries=0), self.redis_service, payload.pod_id
+                        SSHCommandRunner(ssh_client, max_retries=0), self.redis_service, payload.pod_id,
+                        payload.executor_id,
                     )
 
                 with _best_effort_delete_step(log, "prune_images"):

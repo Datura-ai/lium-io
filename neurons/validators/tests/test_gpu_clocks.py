@@ -96,7 +96,7 @@ async def test_locks_the_pods_gpus_and_records_them():
     assert f"nvidia-smi -i {U[0]} -lgc 1200,1500" in host.commands
     assert host.commands.index(f"nvidia-smi -i {U[0]} -pm 1") < host.commands.index(f"nvidia-smi -i {U[0]} -lgc 1200,1500")
     assert json.loads(redis.store[f"gpu_clock_lock:{U[0]}"])["pod_id"] == "pod1"
-    assert set(json.loads(redis.store["gpu_clock_lock_pod:pod1"])) == {U[0], U[1]}
+    assert set(json.loads(redis.store["gpu_clock_lock_pod:pod1:ex"])) == {U[0], U[1]}
     # gateway review: no lock record ever expires, so a long rental keeps the next one fail-closed
     assert redis.ttl.get(f"gpu_clock_lock:{U[0]}") is None
 
@@ -219,7 +219,7 @@ async def test_a_lock_whose_answer_was_lost_and_whose_reset_failed_keeps_its_rec
     report, redis = await _lock(host)
     assert not report.ok
 
-    assert await reset_pod_clock_locks(host, redis, "pod1") == 0  # teardown -rgc fails as well
+    assert await reset_pod_clock_locks(host, redis, "pod1", "ex") == 0  # teardown -rgc fails as well
     assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [U[0], U[1]], "the next renter is refused"
 
 
@@ -230,7 +230,7 @@ async def test_no_supported_clocks_fails_without_running_lgc_and_leaves_no_lock_
     assert not report.ok and not any(" -lgc" in c for c in host.commands)
     # nothing was changed, so nothing for a create to refuse on, even where -rgc is unsupported too
     assert not any(k.startswith("gpu_clock_lock:") for k in redis.store)
-    assert await reset_pod_clock_locks(host, redis, "pod1") == 0
+    assert await reset_pod_clock_locks(host, redis, "pod1", "ex") == 0
     assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == []
 
 
@@ -251,7 +251,7 @@ async def test_reset_runs_rgc_per_gpu_and_clears_the_records():
     assert report.ok and [(g.uuid, g.result) for g in report.gpus] == [(U[1], "reset")]
     assert any(c.startswith(f"nvidia-smi -i {U[1]} -rgc ") for c in host.commands)
     assert f"gpu_clock_lock:{U[1]}" not in redis.store and f"gpu_clock_lock:{U[0]}" in redis.store
-    assert json.loads(redis.store["gpu_clock_lock_pod:pod1"]) == [U[0]]
+    assert json.loads(redis.store["gpu_clock_lock_pod:pod1:ex"]) == [U[0]]
 
 
 @pytest.mark.asyncio
@@ -259,8 +259,8 @@ async def test_the_pods_delete_resets_its_locks_and_a_failed_reset_is_caught_by_
     host = FakeHost()
     _, redis = await _lock(host)
     host.rgc_exit = 1
-    assert await reset_pod_clock_locks(host, redis, "pod1") == 0
-    assert "gpu_clock_lock_pod:pod1" not in redis.store and f"gpu_clock_lock:{U[0]}" in redis.store
+    assert await reset_pod_clock_locks(host, redis, "pod1", "ex") == 0
+    assert "gpu_clock_lock_pod:pod1:ex" not in redis.store and f"gpu_clock_lock:{U[0]}" in redis.store
 
     host.rgc_exit, host.commands = 0, []
     # U[2] has no record (a lost one looks the same): reset too
@@ -272,17 +272,22 @@ async def test_the_pods_delete_resets_its_locks_and_a_failed_reset_is_caught_by_
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("record", "reset"),
-    [(None, False), ({"pod_id": "pod1"}, True), ({"pod_id": "pod2"}, False)],
-    ids=["missing", "own", "foreign"],
+    [
+        (None, False),
+        ({"pod_id": "pod1", "executor_id": "ex"}, True),
+        ({"pod_id": "pod2", "executor_id": "ex"}, False),
+        ({"pod_id": "pod1", "executor_id": "new-node"}, False),
+    ],
+    ids=["missing", "own", "foreign", "same-pod-on-the-node-it-moved-to"],
 )
 async def test_teardown_resets_only_the_gpus_whose_record_still_names_the_pod(record, reset):
     host, redis = FakeHost(), FakeRedis()
-    redis.store["gpu_clock_lock_pod:pod1"] = json.dumps([U[0]])
+    redis.store["gpu_clock_lock_pod:pod1:ex"] = json.dumps([U[0]])
     if record:
         redis.store[f"gpu_clock_lock:{U[0]}"] = json.dumps(record)
 
-    assert await reset_pod_clock_locks(host, redis, "pod1") == int(reset)
-    assert bool(host.commands) == reset and "gpu_clock_lock_pod:pod1" not in redis.store
+    assert await reset_pod_clock_locks(host, redis, "pod1", "ex") == int(reset)
+    assert bool(host.commands) == reset and "gpu_clock_lock_pod:pod1:ex" not in redis.store
     assert (f"gpu_clock_lock:{U[0]}" in redis.store) == (record is not None and not reset), "another pod's record stays"
 
 
@@ -291,20 +296,20 @@ async def test_a_delete_retried_after_its_redis_cleanup_failed_leaves_the_next_r
     host, redis = FakeHost(), FakeRedis()
     await lock_pod_gpu_clocks(host, redis, container_name=NAME, pod_id="podA", executor_id="ex", pod_gpu_uuids=[U[0]],
                               gpu_indices=None, min_mhz=1200, max_mhz=1500, reset=False)
-    redis.fail_delete_of = {"gpu_clock_lock_pod:podA"}
+    redis.fail_delete_of = {"gpu_clock_lock_pod:podA:ex"}
     with pytest.raises(Exception):
-        await reset_pod_clock_locks(host, redis, "podA")  # -rgc ran and the record went; then Redis failed
-    assert "gpu_clock_lock_pod:podA" in redis.store and f"gpu_clock_lock:{U[0]}" not in redis.store
+        await reset_pod_clock_locks(host, redis, "podA", "ex")  # -rgc ran and the record went; then Redis failed
+    assert "gpu_clock_lock_pod:podA:ex" in redis.store and f"gpu_clock_lock:{U[0]}" not in redis.store
 
     assert await reset_leftover_clock_locks(host, redis, [U[0]]) == []  # B's create
     await lock_pod_gpu_clocks(host, redis, container_name=NAME, pod_id="podB", executor_id="ex", pod_gpu_uuids=[U[0]],
                               gpu_indices=None, min_mhz=1200, max_mhz=1500, reset=False)
     host.commands.clear()
 
-    assert await reset_pod_clock_locks(host, redis, "podA") == 0  # A's delete, re-sent
+    assert await reset_pod_clock_locks(host, redis, "podA", "ex") == 0  # A's delete, re-sent
     assert not any(" -rgc " in c for c in host.commands), "B's clocks stay locked"
     assert json.loads(redis.store[f"gpu_clock_lock:{U[0]}"])["pod_id"] == "podB"
-    assert json.loads(redis.store["gpu_clock_lock_pod:podB"]) == [U[0]]
+    assert json.loads(redis.store["gpu_clock_lock_pod:podB:ex"]) == [U[0]]
 
 
 @pytest.mark.asyncio
@@ -325,7 +330,7 @@ async def test_another_pods_lock_during_a_late_teardowns_reset_waits_and_keeps_i
         return await answer(cmd, **kw)
 
     host.run = slow_rgc
-    teardown = asyncio.create_task(reset_pod_clock_locks(host, redis, "podA"))
+    teardown = asyncio.create_task(reset_pod_clock_locks(host, redis, "podA", "ex"))
     await in_reset.wait()
     lock_b = asyncio.create_task(lock_pod_gpu_clocks(
         host, redis, container_name=NAME, pod_id="podB", executor_id="ex", pod_gpu_uuids=[U[0]],
@@ -341,14 +346,59 @@ async def test_another_pods_lock_during_a_late_teardowns_reset_waits_and_keeps_i
     rgc, lgc = (max(i for i, c in enumerate(host.commands) if flag in c) for flag in (" -rgc ", " -lgc "))
     assert rgc < lgc, "A's -rgc never undoes B's -lgc"
     assert json.loads(redis.store[f"gpu_clock_lock:{U[0]}"])["pod_id"] == "podB"
-    assert json.loads(redis.store["gpu_clock_lock_pod:podB"]) == [U[0]]
+    assert json.loads(redis.store["gpu_clock_lock_pod:podB:ex"]) == [U[0]]
+
+
+@pytest.mark.asyncio
+async def test_a_moved_pods_old_node_delete_keeps_its_new_node_lock_and_index():
+    """DAH-6540 (gateway review): the old node's delete is resetting while the renter locks the pod's GPU on the
+    node it moved to; the new lock keeps its index, so the new node's delete still resets it."""
+    import asyncio
+
+    host, redis = FakeHost(device_ids=(U[0], U[1])), FakeRedis()
+    await lock_pod_gpu_clocks(host, redis, container_name=NAME, pod_id="pod1", executor_id="old", pod_gpu_uuids=[U[0]],
+                              gpu_indices=None, min_mhz=1200, max_mhz=1500, reset=False)
+    in_reset, release = asyncio.Event(), asyncio.Event()
+    answer = host.run
+
+    async def slow_rgc(cmd, **kw):
+        if " -rgc " in cmd and not release.is_set():
+            in_reset.set()
+            await release.wait()
+        return await answer(cmd, **kw)
+
+    host.run = slow_rgc
+    old_delete = asyncio.create_task(reset_pod_clock_locks(host, redis, "pod1", "old"))
+    await in_reset.wait()
+    assert (await lock_pod_gpu_clocks(
+        host, redis, container_name=NAME, pod_id="pod1", executor_id="new", pod_gpu_uuids=[U[1]],
+        gpu_indices=None, min_mhz=1200, max_mhz=1500, reset=False,
+    )).ok
+    release.set()
+    assert await old_delete == 1
+
+    assert json.loads(redis.store["gpu_clock_lock_pod:pod1:new"]) == [U[1]], "the new node's index survives"
+    host.commands.clear()
+    assert await reset_pod_clock_locks(host, redis, "pod1", "new") == 1
+    assert any(" -rgc " in c and U[1] in c for c in host.commands), "the new node's delete resets the renter's lock"
+
+
+@pytest.mark.asyncio
+async def test_a_lock_indexed_before_dah6540_is_still_reset_by_its_delete():
+    host, redis = FakeHost(), FakeRedis()
+    redis.store["gpu_clock_lock_pod:pod1"] = json.dumps([U[0], U[1]])
+    redis.store[f"gpu_clock_lock:{U[0]}"] = json.dumps({"pod_id": "pod1", "executor_id": "ex"})
+    redis.store[f"gpu_clock_lock:{U[1]}"] = json.dumps({"pod_id": "pod1", "executor_id": "other"})
+
+    assert await reset_pod_clock_locks(host, redis, "pod1", "ex") == 1
+    assert json.loads(redis.store["gpu_clock_lock_pod:pod1"]) == [U[1]], "the other executor's entry stays"
 
 
 @pytest.mark.asyncio
 async def test_teardown_without_a_lock_costs_no_ssh_and_a_whole_node_create_checks_every_host_gpu():
     host = FakeHost()
     redis = FakeRedis()
-    assert await reset_pod_clock_locks(host, redis, "pod1") == 0 and host.commands == []
+    assert await reset_pod_clock_locks(host, redis, "pod1", "ex") == 0 and host.commands == []
     redis.store[f"gpu_clock_lock:{U[3]}"] = json.dumps({"pod_id": "old"})
     assert await reset_leftover_clock_locks(host, redis, []) == []
     assert len(host.commands) == 2 and _reset_uuids(host.commands[1]) == U
