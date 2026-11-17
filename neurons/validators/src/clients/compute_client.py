@@ -90,7 +90,7 @@ from clients.subtensor_client import SubtensorClient
 from services.docker_service import create_steps_after_reply, inflight_creates
 from services.gpu_reset import renter_gpu_reset_in_progress, renter_gpu_reset_recent, reset_caused
 from services.miner_service import MinerService
-from services.task.inspector_verdict import canonical_sha256
+from services.task.event_report_fit import MAX_FRAME_BYTES
 from incentive.rental_price import ExecutorEstimateParams, RentalPriceSnapshot, estimate_executor
 from services.redis_service import (
     BackendCommand,
@@ -115,10 +115,6 @@ logger = logging.getLogger(__name__)
 # mirrors ws_ping_* in compute-app apps/server/src/core/uvicorn_worker.py, which holds the burst.
 WS_PING_INTERVAL = 20
 WS_PING_TIMEOUT = 40
-# the backend closes the socket with 1009 on a bigger frame (its ws_max_size); resending that frame can never succeed
-MAX_FRAME_BYTES = 4 * 1024 * 1024
-# room left for the delivery stamps send_model adds to an event report
-EVENT_REPORT_MAX_BYTES = MAX_FRAME_BYTES - 64 * 1024
 # not an executor step, so the backend never counts it against the host
 CREATE_CUT_OFF_BY_RESTART_STEP = "validator_restarted"
 BACKEND_CREATE_TRACKING_RETRY_SECONDS = 5
@@ -182,48 +178,6 @@ def _is_host_fault_failure(raw: str) -> bool:
         and bool(reply.get("command_id"))
         and reply.get("error_code") in HOST_FAULT_ERROR_CODES
     )
-
-
-def fit_event_report(event: InspectorEventRequest) -> InspectorEventRequest:
-    """Keeps the leading findings of an oversized report that fit one frame; counts the rest.
-
-    Not split into several requests: the backend stores each request as one row, one per cycle.
-    """
-    findings = (event.report or {}).get("findings")
-    if not isinstance(findings, list):
-        return event
-    if len(event.model_dump_json().encode()) <= EVENT_REPORT_MAX_BYTES:
-        return event
-    empty = {**event.report, "findings": [], "findings_omitted": len(findings)}
-    room = EVENT_REPORT_MAX_BYTES - len(
-        event.model_copy(update={"report": empty}).model_dump_json().encode()
-    )
-    kept = 0
-    for finding in findings:
-        # json.dumps escapes non-ASCII and adds spaces, so it never undercounts the compact frame
-        room -= len(json.dumps(finding).encode()) + 1
-        if room < 0:
-            break
-        kept += 1
-    report = {**event.report, "findings": findings[:kept], "findings_omitted": len(findings) - kept}
-    logger.warning(
-        _m(
-            "Trimmed an event report to fit one frame",
-            extra=get_extra_info({
-                "executor_id": event.executor_id,
-                "miner_hotkey": event.miner_hotkey,
-                "findings_kept": kept,
-                "findings_omitted": len(findings) - kept,
-            }),
-        )
-    )
-    update = {"report": report}
-    verdict = event.context.get("verdict")
-    if isinstance(verdict, dict) and "report_sha256" in verdict:
-        # the verdict hashed the full report; it must match the report actually stored
-        verdict = {**verdict, "report_sha256": canonical_sha256(report)}
-        update["context"] = {**event.context, "verdict": verdict}
-    return event.model_copy(update=update)
 
 
 class FrameTooBig(Exception):
@@ -627,7 +581,7 @@ class ComputeClient:
                         )
 
                         async with self.lock:
-                            self.message_queue.append(fit_event_report(inspector_event))
+                            self.message_queue.append(inspector_event)
                     elif channel == RESET_VERIFIED_JOB_CHANNEL:
                         # DAH-4658: the renter is resetting the node's GPUs, or did a moment ago; what a reset can
                         # cause is the renter's doing, never the provider's fault (an unreadable mark sends it)
@@ -1719,6 +1673,8 @@ class ComputeClient:
             response: (
                 SshPubKeyRemoved | FailedContainerRequest
             ) = await self.miner_service.handle_container(job_request)
+            # as for an add: a delayed answer to an earlier removal must not confirm a later one
+            response.command_id = job_request.command_id
 
             logger.info(
                 _m(

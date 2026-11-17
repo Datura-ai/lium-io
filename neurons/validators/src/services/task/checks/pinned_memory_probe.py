@@ -17,10 +17,12 @@ from .capability import get_filler_only_container, lium_workload_live_now
 PROBE_SOURCE_PATH = Path(__file__).resolve().parents[3] / "miner_jobs" / "pinned_memory_probe.py"
 PROBE_SOURCE = PROBE_SOURCE_PATH.read_text()
 PROBE_JSON_MARKER = "PINNED_MEMORY_PROBE_JSON:"
-# The probe bounds itself: 20 s to count the devices, `nvidia-smi conf-compute` capped at 10 s, one 30 s
-# budget for every card's setup and copy together. This cap sits above that sum and only catches an
-# interpreter that never printed or an SSH channel that stalled (scored UNKNOWN, not a fault).
-PROBE_TIMEOUT_SECONDS = 90
+# The probe bounds itself: 20 s to count the devices, `nvidia-smi conf-compute` capped at 10 s, 60 s for every
+# card's setup, then 10 s per card from its own copy start, ending at the latest 10 s after the setup budget
+# (DAH-6451), plus up to 6 s per card to reap a worker still in teardown (about 2 s per card on a real 8x H200 TDX
+# node). This cap sits above that sum (148 s for 8 cards) and only catches an interpreter that never printed or an SSH
+# channel that stalled (scored UNKNOWN, not a fault).
+PROBE_TIMEOUT_SECONDS = 150
 OUTPUT_TAIL_CHARS = 800
 # the report is executor-controlled: bound what is copied into the event
 MAX_FAULT_LINES = 16

@@ -70,7 +70,8 @@ NVIDIACTL_ROOT_UID = 0
 # The share of a GPU configuration's average filler revenue per GPU-hour that a node is paid:
 # spot-node pay and the secure floor.
 # Two constants on purpose: the owner sets each on its own, so changing one must not move the other.
-FILLER_REVENUE_PAY_FACTOR = 1.0
+# Spot is paid 0.9x what Default Jobs earn (DAH-6328), per node and for a GPU model's spot nodes together.
+FILLER_REVENUE_PAY_FACTOR = 0.9
 SECURE_FILLER_REVENUE_FLOOR_FACTOR = 1.0
 # The share of an idle secure node's rate that an idle spot node of the same configuration earns at most
 # (Fish, 6 Nov 2026, DAH-5930): spot idle pay stays below secure idle pay, to keep secure supply worth offering.
@@ -1331,9 +1332,9 @@ class RentalPriceIncentive(DefaultIncentive):
             result.effective_rate *= result.spot_cap_multiplier
 
     def _spot_pay_within_filler_earnings(self) -> float:
-        """DAH-5128 (Fish): a GPU model's idle spot nodes share what the model's fillers earn per hour;
-        they are not each paid an expected rate. When their spot rates add up to more, every one is
-        scaled by the same multiplier, so a new spot node dilutes the others and the total stays put.
+        """DAH-5128 (Fish): a GPU model's idle spot nodes share FILLER_REVENUE_PAY_FACTOR x what the model's
+        fillers earn per hour; they are not each paid an expected rate. When their spot rates add up to more,
+        every one is scaled by the same multiplier, so a new spot node dilutes the others and the total stays put.
         Returns the USD/hour they are paid in all."""
         rate_sum_by_model: dict[str, float] = {}
         pool_by_model: dict[str, float] = {}
@@ -1348,7 +1349,9 @@ class RentalPriceIncentive(DefaultIncentive):
                         "base_model": base_model,
                         "filler_revenue_usd_per_hour": pool_by_model[base_model],
                         "spot_rate_sum_usd_per_hour": rate_sum,
-                        "spot_pool_multiplier": min(1.0, pool_by_model[base_model] / rate_sum) if rate_sum > 0 else 1.0,
+                        "spot_pool_multiplier": min(1.0, FILLER_REVENUE_PAY_FACTOR * pool_by_model[base_model] / rate_sum)
+                        if rate_sum > 0
+                        else 1.0,
                         "spot_gpu_count": sum(r.gpu_count for m, r in self._spot_pay_candidates if m == base_model),
                     },
                 )
@@ -1356,7 +1359,9 @@ class RentalPriceIncentive(DefaultIncentive):
         total: float = 0.0
         for base_model, result in self._spot_pay_candidates:
             rate_sum: float = rate_sum_by_model[base_model]
-            multiplier: float = min(1.0, pool_by_model[base_model] / rate_sum) if rate_sum > 0 else 1.0
+            multiplier: float = (
+                min(1.0, FILLER_REVENUE_PAY_FACTOR * pool_by_model[base_model] / rate_sum) if rate_sum > 0 else 1.0
+            )
             result.spot_pool_multiplier = multiplier
             result.effective_rate *= multiplier
             total += result.gpu_count * result.effective_rate

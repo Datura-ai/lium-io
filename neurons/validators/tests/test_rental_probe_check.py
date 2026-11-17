@@ -652,6 +652,19 @@ async def test_a_standing_failure_ends_with_a_passed_probe():
 
 
 @pytest.mark.asyncio
+async def test_a_probe_that_clears_a_standing_failure_in_a_cycle_without_verifyx_does_not_pass_the_cycle():
+    """VerifyX skipped this cycle for the standing failure: the cycle must not relist the node unjudged."""
+    redis = FakeRedis(failed_step=STEP_GPU_COUNT)
+    ctx, docker, _ = make_probe_context(redis=redis)
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, verifyx_skipped_for_standing_probe_failure=True)})
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False and result.event.reason_code == Msg.CYCLE_WITHOUT_VERIFYX.reason
+    assert "clear_verified_job_info" not in result.updates
+    assert redis.standing_failure() is None and redis.stamped()
+
+
+@pytest.mark.asyncio
 async def test_a_standing_failure_holds_through_cycles_without_a_verdict_until_a_probe_passes():
     """The failure is carried by every cycle that reaches no verdict and never lapses on its own: a broken
     node relisted without a clean probe fails a renter's pod first."""
