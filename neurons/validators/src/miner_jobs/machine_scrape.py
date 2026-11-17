@@ -734,6 +734,39 @@ NEEDRESTART_GUARD_FILE = "/etc/needrestart/conf.d/lium-container-runtime.conf"
 NEEDRESTART_GUARD_SERVICES = ("sysbox", "docker", "containerd", "nvidia-fabricmanager", "nvidia-persistenced")
 
 
+def needrestart_data_line(line, literal, plain_setting):
+    # True if Perl only stores data on this line: a literal setting, a {/[ opener or closer, or one entry that is a
+    # literal or a qr<delim>...<delim> that neither interpolates (@x, $x, ${...}) nor runs code ((?{...}))
+    if re.fullmatch(plain_setting, line) or re.fullmatch(r"[ \t]*\$nrconf\{\w+\}\s*=\s*[\[{]\s*([}\]]\s*;\s*)?(#.*)?", line):
+        return True
+    if re.fullmatch(r"[ \t]*[}\]]\s*;\s*(#.*)?", line):
+        return True
+    rest = r"\s*(=>\s*" + literal + r"\s*)?,?\s*(#.*)?"
+    if re.fullmatch(r"[ \t]*" + literal + rest, line):
+        return True
+    start = re.match(r"[ \t]*qr([^\w\s])", line)
+    if not start:
+        return False
+    opening = start.group(1)
+    closing = {"(": ")", "{": "}", "[": "]", "<": ">"}.get(opening, opening)
+    depth, i = 1, start.end()
+    while i < len(line):  # Perl nests bracketing delimiters and skips backslash escapes
+        if line[i] == "\\":
+            i += 2
+            continue
+        if line[i] == closing:
+            depth -= 1
+            if depth == 0:
+                body = line[start.end() : i]
+                if re.search(r"[@$]#?[\w{:$]|\(\?\??\{", body):  # @. and a closing $ do not interpolate
+                    return False
+                return re.fullmatch(rest, line[i + 1 :]) is not None
+        elif line[i] == opening and opening != closing:
+            depth += 1
+        i += 1
+    return False
+
+
 def get_needrestart_guard(host_root="/proc/1/root"):
     # "present", "partial", "missing" or "no_needrestart", plus the services the host file leaves unguarded.
     # Hosts set up before the setup script wrote the file (16 Nov) have needrestart and no guard.
@@ -760,28 +793,46 @@ def get_needrestart_guard(host_root="/proc/1/root"):
         last_values[match.group(1)] = match.group(2)  # Perl keeps the last assignment
         if match.group(1) not in NEEDRESTART_GUARD_SERVICES:
             other_rules.append(("^" + match.group(1), match.group(2)))
-    # needrestart reads needrestart.conf, then conf.d/*.conf in name order: a later file can undo the guard
-    # with Perl (%nrconf = (), a delete, an eval), so a live line there that is not a plain literal setting
-    # of another key ($nrconf{restart} = 'a'; is common) leaves the result unknowable; earlier files can
-    # only add rules under other keys, which still count when they overlap a guarded unit
+    # needrestart evals needrestart.conf, whose stock loader block then evals conf.d/*.conf in name order. Config
+    # is Perl, and code anywhere (a tie on %nrconf, a sub, %nrconf = ()) can undo the guard in ways no text scan
+    # rules out, so every file must be data only: literal settings, {/[ structures of qr// and literal entries,
+    # and the loader. A later file may only set other keys to literals; anything else leaves it unknowable.
+    unknowable = ("partial", list(NEEDRESTART_GUARD_SERVICES))
+    literal = r"""(-?\d+(\.\d+)?|'[^'\\]*'|"[^"\\$@]*")"""
+    plain_setting = r"[ \t]*\$nrconf\{(\w+)\}\s*=\s*" + literal + r"\s*;\s*(#.*)?"
+    loader = [
+        "if(-d q(/etc/needrestart/conf.d)) {",
+        "foreach my $fn (sort </etc/needrestart/conf.d/*.conf>) {",
+        'print STDERR "$LOGPREF eval $fn\\n" if($nrconf{verbosity} > 1);',
+        "eval do { local(@ARGV, $/) = $fn; <>};",
+        'die "Error parsing $fn: $@" if($@);',
+        "}",
+        "}",
+    ]
     conf_dir = host_root + "/etc/needrestart/conf.d"
     guard_name = os.path.basename(NEEDRESTART_GUARD_FILE)
+    try:
+        with open(host_root + "/etc/needrestart/needrestart.conf") as conf_file:
+            main = [ln for ln in conf_file.read().splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    except FileNotFoundError:
+        return unknowable  # no main config, so nothing loads conf.d and the guard file is never read
+    flat = [" ".join(ln.split()) for ln in main]
+    at = next((i for i in range(len(flat)) if flat[i : i + len(loader)] == loader), None)
+    if at is None or at + len(loader) != len(main):
+        return unknowable  # conf.d is not loaded the stock way, or main config code runs after the guard file
+    earlier = [main[:at]]
     names = sorted(n for n in os.listdir(conf_dir) if n.endswith(".conf") and n != guard_name)
-    for path in [host_root + "/etc/needrestart/needrestart.conf"] + [conf_dir + "/" + n for n in names]:
-        try:
-            with open(path) as conf_file:
-                lines = [ln for ln in conf_file.read().splitlines() if not ln.lstrip().startswith("#")]
-        except (FileNotFoundError, NotADirectoryError):
-            continue
-        loaded_later = path.startswith(conf_dir) and os.path.basename(path) > guard_name
-        # the value must be a literal (number, '...' or "..." without escapes or interpolation): a bareword
-        # is Perl code (a sub defined in an earlier file, reset 'n', do 'file') that can clear the guard
-        plain_setting = r"""[ \t]*\$nrconf\{(\w+)\}\s*=\s*(-?\d+(\.\d+)?|'[^'\\]*'|"[^"\\$@]*")\s*;\s*(#.*)?"""
-        if loaded_later and any(
-            ln.strip() and not ((m := re.fullmatch(plain_setting, ln)) and m.group(1) != "override_rc") for ln in lines
-        ):
-            return "partial", list(NEEDRESTART_GUARD_SERVICES)
+    for name in names:
+        with open(conf_dir + "/" + name) as conf_file:
+            lines = [ln for ln in conf_file.read().splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+        if name < guard_name:
+            earlier.append(lines)
+        elif not all((m := re.fullmatch(plain_setting, ln)) and m.group(1) != "override_rc" for ln in lines):
+            return unknowable
+    for lines in earlier:
         for ln in lines:
+            if not needrestart_data_line(ln, literal, plain_setting):
+                return unknowable
             for rule in re.finditer(r"qr(?:\((.*?)\)|/(.*?)/|\{(.*?)\}|\[(.*?)\])\}?\s*(?:=>|=)\s*([^,;\s)]+)", ln):
                 pattern = next(g for g in rule.groups()[:4] if g is not None)
                 if pattern not in ["^" + s for s in NEEDRESTART_GUARD_SERVICES]:  # the guard file sets those keys

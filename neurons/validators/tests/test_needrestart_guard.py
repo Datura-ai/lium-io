@@ -17,12 +17,23 @@ from tests.test_sysbox_required_check import _rented_data
 SRC = Path(__file__).resolve().parents[1] / "src"
 SETUP_SCRIPT = Path(__file__).resolve().parents[2] / "executor" / "nvidia_docker_sysbox_setup.sh"
 GUARD = "/etc/needrestart/conf.d/lium-container-runtime.conf"
+# Ubuntu 24.04's needrestart 3.6 config, verbatim: data, then the block that evals conf.d/*.conf
+STOCK_MAIN = (
+    Path(__file__).resolve().parent / "fixtures" / "needrestart_ubuntu2404.conf"
+).read_text()
+LOADER = STOCK_MAIN[STOCK_MAIN.index("if(-d q(/etc/needrestart/conf.d))") :]
+ALL = ["sysbox", "docker", "containerd", "nvidia-fabricmanager", "nvidia-persistenced"]
 
 
 def _read(host_root: Path):
     ns = build_scrape_namespace(
         SRC / "miner_jobs" / "machine_scrape.py",
-        {"get_needrestart_guard", "NEEDRESTART_GUARD_FILE", "NEEDRESTART_GUARD_SERVICES"},
+        {
+            "get_needrestart_guard",
+            "needrestart_data_line",
+            "NEEDRESTART_GUARD_FILE",
+            "NEEDRESTART_GUARD_SERVICES",
+        },
         {"os": os, "re": re},
     )
     return ns["get_needrestart_guard"](str(host_root))
@@ -31,6 +42,7 @@ def _read(host_root: Path):
 def _host(tmp_path: Path, guard_text: str | None, needrestart: bool = True) -> Path:
     if needrestart:
         (tmp_path / "etc/needrestart/conf.d").mkdir(parents=True)
+        (tmp_path / "etc/needrestart/needrestart.conf").write_text(STOCK_MAIN)
     if guard_text is not None:
         (tmp_path / GUARD.lstrip("/")).write_text(guard_text)
     return tmp_path
@@ -157,6 +169,7 @@ def test_an_overlapping_restart_rule_in_an_earlier_file_unguards_the_unit(tmp_pa
     host = _host(tmp_path, _setup_script_guard())
     (host / "etc/needrestart/needrestart.conf").write_text(
         "$nrconf{override_rc} = {\n    qr(^dbus) => 0,\n    qr(^nvidia) => 1,\n    qr(^containerd) => 1,\n};\n"
+        + LOADER
     )
 
     # qr(^containerd) is the guard file's own key, which it overrides; qr(^nvidia) is not
@@ -167,7 +180,7 @@ def test_a_stock_main_config_with_only_zero_rules_keeps_the_guard(tmp_path):
     host = _host(tmp_path, _setup_script_guard())
     (host / "etc/needrestart/needrestart.conf").write_text(
         "$nrconf{override_rc} = {\n    qr(^dbus) => 0,\n    qr(^docker) => 0,\n    qr(^systemd-) => 0,\n};\n"
-        "$nrconf{restart} = 'i';\n"
+        "$nrconf{restart} = 'i';\n$nrconf{override_cont} = {};\n" + LOADER
     )
 
     assert _read(host) == ("present", [])
@@ -218,3 +231,48 @@ async def test_guarded_or_unknown_hosts_pass_quietly(context_factory, specs, rea
 
     assert result.passed is True
     assert result.event.reason_code == reason
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "tie %nrconf, 'T';",  # a STORE can then drop the guard when a later file writes any key
+        "package T;",
+        "sub STORE { }",
+        "BEGIN { %nrconf = () }",
+        "$nrconf{override_rc} = {\n    qr(^dbus) => 0, tie(%nrconf, 'T'),\n};",
+        "$nrconf{override_rc} = {\n    qr(^a(?{ %nrconf = () })) => 0,\n};",
+        "$nrconf{override_rc} = {\n    qr(^${\\ undef}) => 0,\n};",
+        "$nrconf{blacklist} = [\n    qr(^@{[ %nrconf = () ]}),\n];",
+    ],
+)
+@pytest.mark.parametrize("where", ["main", "earlier conf.d"])
+def test_code_in_config_loaded_before_the_guard_makes_it_partial(tmp_path, code, where):
+    host = _host(tmp_path, _setup_script_guard())
+    if where == "main":
+        (host / "etc/needrestart/needrestart.conf").write_text(code + "\n" + STOCK_MAIN)
+    else:
+        (host / "etc/needrestart/conf.d/00-local.conf").write_text(code + "\n")
+
+    assert _read(host) == ("partial", ALL)
+
+
+@pytest.mark.parametrize(
+    "main",
+    [
+        None,  # needrestart has no config to load conf.d from
+        "$nrconf{restart} = 'a';\n",  # no loader: conf.d, and so the guard, is never read
+        STOCK_MAIN.replace(
+            "sort </etc/needrestart/conf.d/*.conf>", "sort </etc/needrestart/other/*.conf>"
+        ),
+        STOCK_MAIN + "%nrconf = ();\n",  # runs after the guard file
+    ],
+)
+def test_a_main_config_that_does_not_load_the_guard_last_makes_it_partial(tmp_path, main):
+    host = _host(tmp_path, _setup_script_guard())
+    path = host / "etc/needrestart/needrestart.conf"
+    path.unlink()
+    if main is not None:
+        path.write_text(main)
+
+    assert _read(host) == ("partial", ALL)
