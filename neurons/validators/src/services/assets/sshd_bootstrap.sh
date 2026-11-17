@@ -184,21 +184,61 @@ apt_main_only_dir() {
     return 1
 }
 
+# The image's own start-up can be running apt-get when this script starts (DAH-6029: lock held
+# by the container's early apt-get). Wait that out instead of failing into the slow all-sources
+# fallback; any other apt failure returns at once.
+APT_LOCK_WAIT_TRIES="$(int_or "${LIUM_APT_LOCK_WAIT_TRIES:-}" 36 120)"
+apt_get() {
+    tries=0
+    while :; do
+        if apt-get "$@" 2>"$RUN_DIR/lium-apt.err"; then
+            cat "$RUN_DIR/lium-apt.err" >&2
+            return 0
+        fi
+        cat "$RUN_DIR/lium-apt.err" >&2
+        if ! grep -q 'Could not get lock' "$RUN_DIR/lium-apt.err" || [ "$tries" -ge "$APT_LOCK_WAIT_TRIES" ]; then
+            return 1
+        fi
+        tries=$((tries + 1))
+        sleep 5
+    done
+}
+
+# A failed index fetch (Ubuntu's "Mirror sync in progress?", a dead backports mirror) leaves the
+# other lists usable: install from them when only -updates or -backports failed. The base suite
+# and -security (the pocket that carries openssh's security fixes) must have arrived. Both E:
+# (bad index) and W: (unreachable InRelease) failures count. Reads the last apt_get's stderr.
+apt_lists_usable() {
+    # any other fatal line (an unsigned or 403'd repository) makes apt stop summarising later fetches
+    if grep '^E: ' "$RUN_DIR/lium-apt.err" | grep -qv -e '^E: Failed to fetch ' -e '^E: Some index files failed to download'; then
+        return 1
+    fi
+    failed="$(sed -n 's|^[EW]: Failed to fetch .*/dists/\([^/ ]*\)/.*|\1|p' "$RUN_DIR/lium-apt.err" | sort -u)"
+    [ -n "$failed" ] || return 1
+    for suite in $failed; do
+        case "$suite" in
+            *-backports | *-updates) ;;
+            *) return 1 ;;
+        esac
+    done
+    log "Some package lists failed to download; installing from the rest"
+}
+
 install_sshd() {
     if command -v apt-get >/dev/null 2>&1; then
         export DEBIAN_FRONTEND=noninteractive
         # shellcheck disable=SC2086 # APT_PACKAGES is a word list
         if main_dir="$(apt_main_only_dir)"; then
             apt_main="-o Dir::Etc::SourceList=$main_dir/sources.list -o Dir::Etc::SourceParts=$main_dir/parts"
-            if apt-get update $apt_main && apt-get install -y --no-install-recommends $APT_PACKAGES $apt_main; then
+            if { apt_get update $apt_main || apt_lists_usable; } && apt_get install -y --no-install-recommends $APT_PACKAGES $apt_main; then
                 rm -rf "$main_dir"
                 return 0
             fi
             rm -rf "$main_dir"
             log "Install from the main package lists failed; retrying with all of the image's apt sources"
         fi
-        apt-get update
-        apt-get install -y --no-install-recommends $APT_PACKAGES
+        apt_get update
+        apt_get install -y --no-install-recommends $APT_PACKAGES
         return 0
     fi
 

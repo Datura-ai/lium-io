@@ -7,6 +7,7 @@ reclaims, and it decides on real free space: below the rental listing floor the 
 """
 
 import asyncio
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
@@ -56,7 +57,12 @@ class FakeSshClient:
             stdout = "\n".join(self._volumes)
         elif "docker ps" in command:
             # Only `docker ps` without -a lists RUNNING containers; the reclaim guard uses that one.
-            stdout = "" if "-a" in command else self._containers
+            # `--filter name=X` keeps the names holding X (several filters OR)
+            names = re.findall(r'name=([^"\s]+)', command)
+            running = [c for c in self._containers.split("\n") if c]
+            stdout = "" if "-a" in command else "\n".join(
+                c for c in running if not names or any(n in c for n in names)
+            )
         else:
             stdout = ""
         return SimpleNamespace(exit_status=0, stdout=stdout, stderr="")
@@ -267,15 +273,26 @@ async def test_the_engy_checkpoint_is_reclaimed_oldest_first_and_only_as_far_as_
 
 
 @pytest.mark.asyncio
-async def test_a_live_customer_pod_keeps_the_cache_even_under_the_floor(cleanup):
-    # Fish 26 Oct: the cache is kept across rentals and listed as used, so a renter who took the
-    # listed free disk leaves the node under the floor by design
+async def test_a_live_customer_pod_under_the_floor_gets_the_cache_back(cleanup):
+    # DAH-6187: the rent keeps the cache when the pod's volume fits beside it, but the pod's writes
+    # take real disk; once they push the node under the floor the cache gives way to the renter
     ssh_client = FakeSshClient(["pod_abc"], ["engy_cache_hf_kimi-k3"], free_gb=10)
+
+    assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 1
+    assert _removed(ssh_client) == ["engy_cache_hf_kimi-k3"]
+
+
+@pytest.mark.parametrize(
+    "containers, free_gb",
+    [(["pod_abc"], 500), (["pod_abc", "filler_x"], 10)],
+    ids=["pod_above_the_floor", "live_filler"],
+)
+@pytest.mark.asyncio
+async def test_the_cache_stays_above_the_floor_or_while_a_filler_runs(cleanup, containers, free_gb):
+    ssh_client = FakeSshClient(containers, ["engy_cache_hf_kimi-k3"], free_gb=free_gb)
 
     assert await cleanup.reclaim_dphn_cache_when_disk_is_tight(ssh_client, "exec-1") == 0
     assert _removed(ssh_client) == []
-    (guard,) = [c for c in ssh_client.commands if "docker ps" in c]
-    assert 'name=filler_' in guard and 'name=pod_' in guard
 
 
 class CreatedSweepSshClient(FakeSshClient):
@@ -315,9 +332,14 @@ async def test_the_download_sweep_removes_its_helper_container_after_the_run_too
     assert "docker rm -f lium_cache_sweep" in before and "docker rm -f lium_cache_sweep" in after
 
 
+CHECK_ID = "a1" * 32
+
+
 def test_only_never_started_capability_checks_are_picked():
     listing = "\n".join(
         [
+            f"{CHECK_ID} lium_capability_check_12_0a1b2c",
+            # a short or non-hex id is not a container id docker prints, so it is never removed
             "a1 lium_capability_check_12_0a1b2c",
             # a provider's container: a lookalike name, or an unnamed executor-image diagnostic, survives
             "b2 lium_capability_check_backup",
@@ -327,7 +349,7 @@ def test_only_never_started_capability_checks_are_picked():
         ]
     )
 
-    assert never_started_check_containers(listing) == ["a1"]
+    assert never_started_check_containers(listing) == [CHECK_ID]
 
 
 @pytest.mark.asyncio
@@ -336,11 +358,11 @@ async def test_the_stale_cleanup_removes_never_started_check_containers(cleanup)
         async def run(self, command: str, *args, **kwargs):
             if "status=created" in command:
                 self.commands.append(command)
-                body = "a1 lium_capability_check_12_0a1b2c"
+                body = f"{CHECK_ID} lium_capability_check_12_0a1b2c"
                 return SimpleNamespace(exit_status=0, stdout=body, stderr="")
             return await super().run(command, *args, **kwargs)
 
     ssh_client = CreatedChecksSshClient(containers=[], volumes=[], free_gb=900)
 
     assert await cleanup.remove_never_started_check_containers(ssh_client, "exec-1") == 1
-    assert any(c.startswith("/usr/bin/docker rm -f a1 ") for c in ssh_client.commands)
+    assert any(c.startswith(f"/usr/bin/docker rm -f {CHECK_ID} ") for c in ssh_client.commands)

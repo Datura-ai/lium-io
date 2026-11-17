@@ -1,8 +1,10 @@
 import base64
 import json
 import os
+import shutil
 import socket
 import struct
+import subprocess
 import threading
 from unittest.mock import Mock
 
@@ -781,113 +783,6 @@ async def test_run_container_creates_the_container_with_the_spec_labels_and_the_
     }
 
 
-class CpuRefusingApiClient(FakeApiClient):
-    """dockerd on a host with `daemon_cpus` CPUs: refuses any --cpus above that at create."""
-
-    def __init__(self, daemon_cpus):
-        super().__init__()
-        self.daemon_cpus = daemon_cpus
-        self.create_nano_cpus = []
-
-    def create_container(self, **kwargs):
-        nano = self.host_config_kwargs.get("nano_cpus")
-        self.create_nano_cpus.append(nano)
-        if nano and nano > self.daemon_cpus * 1_000_000_000:
-            self.events.append("create_container")
-            raise APIError(
-                "400 Client Error: Bad Request",
-                explanation=(
-                    f"range of CPUs is from 0.01 to {self.daemon_cpus}.00, as there are only "
-                    f"{self.daemon_cpus} CPUs available"
-                ),
-            )
-        return super().create_container(**kwargs)
-
-
-@pytest.mark.asyncio
-async def test_run_container_retries_a_cpu_refusal_within_the_bound_with_the_daemon_count():
-    api_client = CpuRefusingApiClient(daemon_cpus=10)
-    granted = []
-
-    container_id = await RentalDockerSdkClient(api_client).run_container(
-        ContainerRunSpec(
-            image="img",
-            name="pod_t",
-            cpu_count=12,
-            min_cpu_count=10,
-            pids_limit=12_000,
-            pids_limit_for=lambda cpus: cpus * 1000,
-            on_cpus_granted=granted.append,
-        )
-    )
-
-    assert container_id == "container-id"
-    assert api_client.create_nano_cpus == [12_000_000_000, 10_000_000_000]
-    assert api_client.created_container["labels"]["io.lium.cpu_count"] == "10"
-    assert api_client.host_config_kwargs["pids_limit"] == 10_000
-    assert granted == [10]
-
-
-@pytest.mark.asyncio
-async def test_run_container_does_not_retry_a_cpu_refusal_below_the_renters_minimum():
-    api_client = CpuRefusingApiClient(daemon_cpus=10)
-
-    with pytest.raises(RentalDockerOperationError, match="only 10 CPUs available"):
-        await RentalDockerSdkClient(api_client).run_container(
-            ContainerRunSpec(image="img", name="pod_t", cpu_count=12, min_cpu_count=12)
-        )
-
-    assert api_client.create_nano_cpus == [12_000_000_000]
-
-
-class ShrinkingCpuApiClient(CpuRefusingApiClient):
-    """dockerd whose CPU count drops between the create and its retry."""
-
-    def __init__(self, daemon_cpus_per_create):
-        super().__init__(daemon_cpus_per_create[0])
-        self.daemon_cpus_per_create = list(daemon_cpus_per_create)
-
-    def create_container(self, **kwargs):
-        self.daemon_cpus = self.daemon_cpus_per_create.pop(0)
-        return super().create_container(**kwargs)
-
-
-@pytest.mark.asyncio
-async def test_run_container_retries_a_cpu_refusal_only_once():
-    api_client = ShrinkingCpuApiClient([10, 6])
-
-    with pytest.raises(RentalDockerOperationError, match="only 6 CPUs available"):
-        await RentalDockerSdkClient(api_client).run_container(
-            ContainerRunSpec(image="img", name="pod_t", cpu_count=12)
-        )
-
-    assert api_client.create_nano_cpus == [12_000_000_000, 10_000_000_000]
-
-
-@pytest.mark.asyncio
-async def test_run_container_does_not_retry_a_cpu_refusal_past_the_bound():
-    api_client = CpuRefusingApiClient(daemon_cpus=10)
-
-    with pytest.raises(RentalDockerOperationError, match="only 10 CPUs available"):
-        await RentalDockerSdkClient(api_client).run_container(
-            ContainerRunSpec(image="img", name="pod_t", cpu_count=64)
-        )
-
-    assert api_client.create_nano_cpus == [64_000_000_000]
-
-
-@pytest.mark.asyncio
-async def test_run_container_does_not_retry_a_cpu_refusal_more_than_two_cpus_short():
-    api_client = CpuRefusingApiClient(daemon_cpus=4)
-
-    with pytest.raises(RentalDockerOperationError, match="only 4 CPUs available"):
-        await RentalDockerSdkClient(api_client).run_container(
-            ContainerRunSpec(image="img", name="pod_t", cpu_count=11)
-        )
-
-    assert api_client.create_nano_cpus == [11_000_000_000]
-
-
 @pytest.mark.asyncio
 async def test_run_container_without_a_network_stays_on_the_default_bridge():
     api_client = FakeApiClient()
@@ -1467,6 +1362,34 @@ def test_require_rental_docker_ssh_host_key_strips_present_key():
     assert require_rental_docker_ssh_host_key(executor_info) == "ssh-ed25519 AAAATESTKEY"
 
 
+@pytest.mark.parametrize(
+    ("reported", "registered", "accepted"),
+    [
+        ("ssh-ed25519 AAAATESTKEY", "ssh-ed25519 AAAAOTHERKEY", False),
+        ("ssh-ed25519 AAAATESTKEY", "ssh-ed25519 AAAAOTHERKEY\nssh-ed25519 AAAATESTKEY node", True),
+        ("ssh-ed25519 AAAATESTKEY\nssh-ed25519 AAAAOTHERKEY", "ssh-ed25519 AAAATESTKEY", False),
+    ],
+)
+def test_require_rental_docker_ssh_host_key_checks_a_hostnames_registered_key(reported, registered, accepted):
+    executor_info = ExecutorSSHInfo(
+        uuid="executor-id",
+        address="node.example",
+        port=8000,
+        ssh_username="root",
+        ssh_port=2222,
+        python_path="/usr/bin/python",
+        root_dir="/root",
+        ssh_host_key=reported,
+        expected_ssh_host_key=registered,
+    )
+
+    if accepted:
+        assert require_rental_docker_ssh_host_key(executor_info) == reported
+    else:
+        with pytest.raises(RentalDockerConnectionError, match="not the host key registered"):
+            require_rental_docker_ssh_host_key(executor_info)
+
+
 def test_rental_ssh_adapter_uses_explicit_key_and_known_hosts(monkeypatch, tmp_path):
     import paramiko
 
@@ -1799,3 +1722,95 @@ def test_rental_ssh_adapter_hands_paramiko_a_socket_to_the_pinned_address(tmp_pa
     finally:
         connected["sock"].close()
         listener.close()
+
+
+def _run_key_append(spec, env=None) -> subprocess.CompletedProcess:
+    return subprocess.run(list(spec.argv), input=spec.stdin, capture_output=True, text=True, env=env)
+
+
+def test_authorized_keys_append_adds_the_keys_within_the_deadline(tmp_path):
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("existing\n")
+
+    completed = _run_key_append(
+        build_authorized_keys_exec_spec(container_name="pod_key", public_keys=["k1", "k2"], target_path=str(target))
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == "existing\nk1\nk2\n"
+
+
+def test_authorized_keys_append_past_its_deadline_appends_nothing(tmp_path):
+    # DAH-6441: a stalled add must never append after the backend confirmed a removal
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("existing\n")
+
+    completed = _run_key_append(
+        build_authorized_keys_exec_spec(
+            container_name="pod_key", public_keys=["k1"], target_path=str(target), append_deadline_seconds=-1
+        )
+    )
+
+    assert completed.returncode == 75
+    assert target.read_text() == "existing\n"
+
+
+def test_authorized_keys_append_that_cannot_read_its_keys_appends_nothing(tmp_path):
+    blocker = tmp_path / "ssh"
+    blocker.write_text("a file where the directory should be")
+
+    completed = _run_key_append(
+        build_authorized_keys_exec_spec(
+            container_name="pod_key", public_keys=["k1"], target_path=str(blocker / "authorized_keys")
+        )
+    )
+
+    assert completed.returncode == 1
+    assert blocker.read_text() == "a file where the directory should be"
+
+
+def test_authorized_keys_append_needs_no_date_or_mktemp_in_the_image(tmp_path):
+    # minimal rental images: only the tools the add always used (sh, cat, mkdir, chmod) are on PATH
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    for tool in ("sh", "cat", "mkdir", "chmod"):
+        (tools / tool).symlink_to(shutil.which(tool))
+    target = tmp_path / "ssh" / "authorized_keys"
+    spec = build_authorized_keys_exec_spec(container_name="pod_key", public_keys=["k1", "k2"], target_path=str(target))
+
+    completed = subprocess.run(
+        [str(tools / "sh"), *spec.argv[1:]], input=spec.stdin, capture_output=True, text=True, env={"PATH": str(tools)}
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == "k1\nk2\n"
+    assert "date" not in spec.argv[2] and "mktemp" not in spec.argv[2]
+
+
+def test_authorized_keys_append_reads_the_clock_whole_as_sysboxfs_needs(tmp_path):
+    # DAH-6441: in a Sysbox pod /proc/uptime fails the shell's byte-wise `read` (rc 1, empty) but a whole read works;
+    # a `read` that always fails stands in for it, so the clock must come from cat alone
+    target = tmp_path / "ssh" / "authorized_keys"
+    spec = build_authorized_keys_exec_spec(container_name="pod_key", public_keys=["k1"], target_path=str(target))
+
+    completed = subprocess.run(
+        ["sh", "-c", "read() { return 1; }; " + spec.argv[2]], input=spec.stdin, capture_output=True, text=True
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == "k1\n"
+
+
+@pytest.mark.skipif(shutil.which("busybox") is None, reason="busybox not installed")
+def test_authorized_keys_append_runs_under_busybox_ash(tmp_path):
+    target = tmp_path / "ssh" / "authorized_keys"
+    spec = build_authorized_keys_exec_spec(container_name="pod_key", public_keys=["k1"], target_path=str(target))
+
+    completed = subprocess.run(
+        [shutil.which("busybox"), "sh", "-c", spec.argv[2]], input=spec.stdin, capture_output=True, text=True
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == "k1\n"

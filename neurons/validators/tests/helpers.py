@@ -133,6 +133,9 @@ class FakeRedis:
         # it sits inside write_atomically
         self.fail_delete_of: set[str] = set()
         self.calls = 0
+        # request_executor_recheck_once: executor ids queued, and the ones still inside their window
+        self.recheck_requests: list[str] = []
+        self.recheck_claims: set[str] = set()
 
     def _touch(self):
         self.calls += 1
@@ -156,6 +159,14 @@ class FakeRedis:
                 del self.fail_set_of_after[key]
                 raise redis.exceptions.TimeoutError(f"Timeout writing {key}")
             self.fail_set_of_after[key] -= 1
+
+    async def request_executor_recheck_once(self, executor_id: str, ttl_seconds: int) -> bool:
+        self._touch()
+        if executor_id in self.recheck_claims:
+            return False
+        self.recheck_claims.add(executor_id)
+        self.recheck_requests.append(executor_id)
+        return True
 
     async def set(self, key: str, value: str, ex: int | None = None):
         self._touch()

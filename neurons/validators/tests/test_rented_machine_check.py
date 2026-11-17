@@ -2647,3 +2647,114 @@ async def test_tenant_enforcement_asks_again_until_a_running_pod_answers_its_pla
 
     assert backend.called_with == ["pod-1", "pod-1"]
     assert redis.store["plaintext_volume_path:pod-1"] == ""
+
+
+class _StatusBackend(DummyBackendClient):
+    """Answers every pod's rental as open (`active=True`) with that pod's own status."""
+
+    def __init__(self, statuses: dict[str, str]):
+        super().__init__()
+        self.statuses = statuses
+
+    async def get_pod_rental_active(self, pod_id: str):
+        self.called_with.append(pod_id)
+        return Mock(active=True, rental_closed_at=None, local_volume_path=None, status=self.statuses[pod_id])
+
+
+def _status_ctx(context_factory, statuses: dict[str, str], running: set[str]):
+    pods = [RentedPod(pod_id=pod_id, container_name=f"tenant-{pod_id}", rented_ports=[], gpu_count=1) for pod_id in statuses]
+    rented_data = RentedExecutorsResponse(
+        executors={
+            "executor-123": RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="22",
+                pods=pods,
+                owner_flag=False,
+            )
+        },
+        banned_guids=[],
+    )
+    ctx = _unknown_rental_ctx(context_factory, _StatusBackend(statuses), FakeRedis())
+    state = replace(ctx.state, rented_data=rented_data, gpu_processes=[], gpu_details=[])
+    return ctx.model_copy(update={"state": state, "ssh": _StatesSSH({f"tenant-{p}" for p in running})})
+
+
+@pytest.mark.parametrize(
+    "statuses,running,expected_pass,expected_reason",
+    [
+        # DAH-6340: a balance stop removes the container and leaves the pod STOPPED with its rental open
+        ({"a": "STOPPED"}, set(), True, Msg.STALE_POD_NOT_RUNNING.reason),
+        ({"a": "STOPPED", "b": "RUNNING"}, {"b"}, True, Msg.ALREADY_RENTED.reason),
+        ({"a": "RUNNING", "b": "STOPPED"}, {"a"}, True, Msg.ALREADY_RENTED.reason),
+        ({"a": "STOPPED", "b": "STOPPED"}, set(), True, Msg.STALE_POD_NOT_RUNNING.reason),
+        # a container that really died under a RUNNING pod still fails the node
+        ({"a": "RUNNING"}, set(), False, Msg.POD_NOT_RUNNING.reason),
+        ({"a": "STOPPED", "b": "RUNNING"}, set(), False, Msg.POD_NOT_RUNNING.reason),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_pod_stopped_for_the_renters_balance_is_not_a_node_fault(
+    context_factory, statuses, running, expected_pass, expected_reason
+):
+    result = await TenantEnforcementCheck().run(_status_ctx(context_factory, statuses, running))
+
+    assert result.passed is expected_pass
+    assert result.event.reason_code == expected_reason
+
+
+class _GuardStub:
+    check_id = "executor.network.rental_egress_guard"
+
+    def __init__(self):
+        self.calls = 0
+
+    async def run(self, ctx):
+        from neurons.validators.src.services.task.messages import RentalEgressGuardMessages, render_message
+        from neurons.validators.src.services.task.pipeline import CheckResult
+
+        self.calls += 1
+        return CheckResult(
+            passed=True,
+            event=render_message(RentalEgressGuardMessages.APPLIED, ctx=ctx, check_id=self.check_id, what={}),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "containers,pod_running,rental_active,guarded",
+    [
+        # active rental: the halt branch, the only place the guard runs on a rented node
+        ([{"name": "tenant-123", "pod_id": "pod-1"}], True, True, True),
+        # every listed pod stale: the node goes on to scored steps, so no guard here
+        ([{"name": "tenant-123", "pod_id": "pod-1"}], False, False, False),
+        # no rental: the idle guard after ScoreCheck covers it
+        ([], True, True, False),
+    ],
+)
+async def test_egress_guard_runs_only_in_the_rented_halt(context_factory, containers, pod_running, rental_active, guarded):
+    guard = _GuardStub()
+    ctx = context_factory(
+        services=build_services(
+            score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
+            container_cleanup=MockContainerCleanup(),
+            backend=DummyBackendClient(active=rental_active),
+        ),
+        config=build_context_config(),
+        state=build_state(
+            gpu_processes=[],
+            gpu_details=[],
+            gpu_model="NVIDIA RTX 4090",
+            rented_data=build_rented_data("executor-123", {"containers": containers}),
+        ),
+        ssh=DummySSHClient(pod_running=pod_running),
+        collateral_deposited=True,
+        is_rental_succeed=True,
+        contract_version="v1.0.0",
+    )
+
+    result = await TenantEnforcementCheck(egress_guard=guard).run(ctx)
+
+    assert result.halt is guarded
+    assert guard.calls == int(guarded)
+    assert [e.reason_code for e in result.extra_events] == (["RENTAL_EGRESS_GUARD_APPLIED"] if guarded else [])

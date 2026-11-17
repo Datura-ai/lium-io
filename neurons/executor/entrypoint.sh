@@ -6,7 +6,7 @@ set -eu
 # which pull by tag (DAH-3419); the runner is the one container every updater recreates. Only an updater
 # container of the runner's own compose project is replaced, never created: a stack without one (the dstack
 # TEE) is left alone. If the new updater cannot start, the old one is put back.
-UPDATER_IMAGE="daturaai/lium-watchtower:1.2.2"
+UPDATER_IMAGE="daturaai/lium-watchtower:1.2.3"
 ensure_updater() {
     # The runner's own container, by the ID in its mount paths (/var/lib/docker/containers/<id>/hostname), not
     # $HOSTNAME (an updater that recreates the runner copies the old hostname) and not a label lookup (that can
@@ -100,6 +100,7 @@ ensure_updater
 # again; a probe that hangs past RUNNER_PROBE_TIMEOUT_SECONDS counts as failed. A first install (no executor
 # running) has nothing to break and skips the probe.
 running_executor=$(docker compose ps --quiet executor 2>/dev/null || true)
+pull=always
 if [ -n "$running_executor" ]; then
     # `timeout` stops only the docker client: a hung probe container outlives it, and every retry would add one.
     leftovers=$(docker ps --all --quiet --filter label=io.lium.executor-runner.probe=nvidia-runtime 2>/dev/null || true)
@@ -122,9 +123,36 @@ if [ -n "$running_executor" ]; then
         sleep "${RUNNER_PROBE_RETRY_SECONDS:-300}"
         exit 1
     fi
+    # Pull the new images before the session check: a pull can take minutes, and a session the validator opens
+    # during it would be cut by the recreate below, which then only checks the registry.
+    if ! docker compose pull --quiet >/dev/null 2>&1; then
+        echo "Update held, running executor kept: the new images cannot be pulled. Retrying in ${RUNNER_PROBE_RETRY_SECONDS:-300}s."
+        sleep "${RUNNER_PROBE_RETRY_SECONDS:-300}"
+        exit 1
+    fi
+    # The images are local now, so `up` below does not wait on the registry after the session check.
+    pull=missing
+    # sshd runs inside the executor, so a recreate cuts every open session. A root session is the validator
+    # creating a pod or checking the node; cutting it fails that create (12 Nov 2026: a pod create lost SSH in
+    # encrypted_volume_setup). Wait for it to close, at most RUNNER_SSH_HOLD_MAX_TRIES retries, so an update
+    # still lands while the validator's rollout grace covers the node. A volume backup or restore is not held
+    # (updates are never held for one). The executor runs with pid: host, so list only its own processes
+    # (docker top): a host or renter-pod root login must not hold the update.
+    hold_file=${RUNNER_SSH_HOLD_FILE:-/tmp/runner-ssh-hold-tries}
+    tries=$(cat "$hold_file" 2>/dev/null || true)
+    tries=${tries:-0}
+    if [ "$tries" -lt "${RUNNER_SSH_HOLD_MAX_TRIES:-30}" ] \
+        && docker top "$running_executor" -eo pid,args 2>/dev/null \
+            | grep -qE '^[[:space:]]*[0-9]+[[:space:]]+sshd[^:]*: root@'; then
+        echo $((tries + 1)) > "$hold_file"
+        echo "Update held, running executor kept: a validator SSH session is open in it. Retrying in ${RUNNER_SSH_HOLD_RETRY_SECONDS:-30}s."
+        sleep "${RUNNER_SSH_HOLD_RETRY_SECONDS:-30}"
+        exit 1
+    fi
+    : > "$hold_file"
 fi
 
-docker compose up --pull always --detach --wait --force-recreate
+docker compose up --pull "$pull" --detach --wait --force-recreate
 
 # The executor is pulled by digest, so its old images are not dangling and `image prune` keeps them
 # (2-5 GB per release, every past release too). Remove every executor image but the one now running;

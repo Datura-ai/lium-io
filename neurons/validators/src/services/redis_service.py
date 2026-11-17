@@ -64,9 +64,19 @@ RENTAL_SUCCEED_MACHINE_SET = "rental_succeed_machines"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
 RENTAL_PROBE_OK_PREFIX = "rental_probe_ok"
 RENTAL_PROBE_FAILED_PREFIX = "rental_probe_failed"
+# executor uuid -> the backend's last VerifyX EMA; the backend sends it for active and filler nodes only
+VERIFYX_LAST_EMA_PREFIX = "verifyx_last_ema"
+VERIFYX_LAST_EMA_TTL_SECONDS = 30 * 24 * 3600
 # filler container name -> JSON list of the image digests (bare sha256) the validator started it from
 FILLER_IMAGE_DIGESTS_PREFIX = "filler_image_digests:"
 FILLER_IMAGE_DIGESTS_TTL_SECONDS = 30 * 24 * 3600
+# A pod edit parks the pod's container under another name; the exact name this validator parked is
+# recorded per executor (key + parked name) so the GPU checks never take a self-named parked
+# container as ours. The edit's end shortens it to one GPU check's span; the TTL only backstops a
+# validator killed mid-edit.
+EDIT_PARKED_CONTAINER_PREFIX = "edit_parked_container:"
+EDIT_PARKED_CONTAINER_TTL_SECONDS = 30 * 60
+EDIT_PARKED_CONTAINER_AFTER_EDIT_SECONDS = 5 * 60
 # pod id -> set by the rented-pod recovery when it stops a pod or before it renames one back, cleared
 # once the pod is started again (no expiry: it is the only evidence the stop was ours): a stopped
 # pod_<id> it marked is its own to start next cycle, even when the rename's reply and its cleanup
@@ -81,6 +91,10 @@ RECENT_FILLER_PREFIX = "recent_filler:"
 # a filler stopped for a customer rent leaves the snapshot at once but stays on the host until its delete lands:
 # one cycle (~17 min) plus RENTAL_TEARDOWN_GRACE_MINUTES, with margin, from its create or the last cycle that listed it
 RECENT_FILLER_TTL_SECONDS = 45 * 60
+# filler container name -> set when the validator removed that filler itself (GPU recheck, failed sshd). The backend
+# closes the run only after ~30 min of missing reports; until then the container's absence is not a host kill.
+FILLER_REMOVED_BY_VALIDATOR_PREFIX = "filler_removed_by_validator:"
+FILLER_REMOVED_BY_VALIDATOR_TTL_SECONDS = 2 * 3600
 # set by a filler create whose sshd never came up in the container, cleared by one where it did
 SSHD_BOOTSTRAP_FAILED_PREFIX = "sshd_bootstrap_failed"
 # prod, 24 h: failed filler creates on a broken node came 5 min to 2.7 h apart, so 6 h outlives the
@@ -158,6 +172,9 @@ SYSBOX_VERIFIED_PREFIX = "sysbox_verified"
 # DAH-5244: one key per executor with the port pairs its last completed port check verified, under which
 # address/range/mappings, so a cycle deferred for disk pressure can republish them.
 VERIFIED_PORTS_PREFIX = "verified_ports"
+# DAH-6376: external ports a port check is probing on an executor, and ports a pod was just given there
+PROBE_HELD_PORTS_PREFIX = "probe_held_ports"
+POD_PORTS_PENDING_PREFIX = "pod_ports_pending"
 # DAH-5244: one key per executor counting port checks deferred in a row (":shadow" for the simulated count).
 DISK_PRESSURE_DEFERRALS_PREFIX = "disk_pressure_deferrals"
 # One key per executor: when this validator first found it without its recommended default image
@@ -177,6 +194,8 @@ EXPRESS_LANE_VALIDATED_SET = "express_lane_validated_executors"
 EXPRESS_LANE_RECHECK_REQUESTS_SET = "express_lane:recheck_requests"
 # shortcut: one TTL for the whole set, refreshed per request; per-id expiry if requests pile up.
 EXPRESS_LANE_RECHECK_REQUESTS_TTL_SECONDS = 30 * 60
+# DAH-6137: a node a check asked to recheck itself, so it asks once per window.
+EXPRESS_LANE_RECHECK_ONCE_PREFIX = "express_lane:recheck_once"
 # executor id -> how many times it was requested; a run ends only the request it started from (review 4510532999)
 EXPRESS_LANE_RECHECK_GENERATIONS_HASH = "express_lane:recheck_generations"
 RECHECK_POP_ATTEMPTS = 5
@@ -591,6 +610,15 @@ class RedisService:
             for key in (EXPRESS_LANE_RECHECK_REQUESTS_SET, EXPRESS_LANE_RECHECK_GENERATIONS_HASH):
                 await self.redis.expire(key, EXPRESS_LANE_RECHECK_REQUESTS_TTL_SECONDS)
 
+    async def request_executor_recheck_once(self, executor_id: str, ttl_seconds: int) -> bool:
+        """Queue a recheck unless this one already queued one in the last ttl_seconds; True when queued."""
+        async with self.lock:
+            key = f"{EXPRESS_LANE_RECHECK_ONCE_PREFIX}:{executor_id}"
+            fresh = await self.redis.set(key, "1", ex=ttl_seconds, nx=True)
+        if fresh:
+            await self.request_executor_recheck(executor_id)
+        return bool(fresh)
+
     async def get_executor_recheck_requests(self) -> set[str]:
         members = await self.smembers(EXPRESS_LANE_RECHECK_REQUESTS_SET)
         return {m.decode() if isinstance(m, bytes) else m for m in members}
@@ -698,6 +726,36 @@ class RedisService:
 
     async def is_sysbox_verified(self, miner_hotkey: str, executor_id: str) -> bool:
         return await self.get(self._sysbox_verified_key(miner_hotkey, executor_id)) is not None
+
+    async def hold_probe_ports(self, executor_id: str, external_ports: set[int], ttl_seconds: int) -> None:
+        """A port check binds these external ports on the executor until it releases them (or the TTL ends)."""
+        key = f"{PROBE_HELD_PORTS_PREFIX}:{executor_id}"
+        await self.redis.delete(key)
+        if external_ports:
+            await self.redis.sadd(key, *external_ports)
+            await self.redis.expire(key, ttl_seconds)
+
+    async def release_probe_ports(self, executor_id: str) -> None:
+        await self.redis.delete(f"{PROBE_HELD_PORTS_PREFIX}:{executor_id}")
+
+    async def probe_held_ports(self, executor_id: str) -> set[int]:
+        return {int(port) for port in await self.redis.smembers(f"{PROBE_HELD_PORTS_PREFIX}:{executor_id}")}
+
+    async def record_pending_pod_ports(self, executor_id: str, external_ports: list[int], ttl_seconds: int) -> None:
+        """A pod was just given these external ports; the backend's rental list may not show them yet.
+        Each port expires on its own (sorted-set score = expiry time), so a later pod never extends an earlier one's."""
+        if not external_ports:
+            return
+        key = f"{POD_PORTS_PENDING_PREFIX}:{executor_id}"
+        expires_at = time.time() + ttl_seconds
+        await self.redis.zadd(key, {str(port): expires_at for port in external_ports})
+        await self.redis.expire(key, ttl_seconds)
+
+    async def pending_pod_ports(self, executor_id: str) -> set[int]:
+        key = f"{POD_PORTS_PENDING_PREFIX}:{executor_id}"
+        now = time.time()
+        await self.redis.zremrangebyscore(key, "-inf", now)
+        return {int(port) for port in await self.redis.zrangebyscore(key, now, "+inf")}
 
     @staticmethod
     def _verified_ports_key(miner_hotkey: str, executor_id: str) -> str:
@@ -1342,8 +1400,10 @@ class RedisService:
         evidence: dict | None = None,
         anchor_broken: bool = False,
         reanchor_uuids: str = '',
+        respec: str = '',
     ):
-        spec = prev_info.get('spec', '')
+        # a changed model:count is reset once, then verified from scratch as it is now
+        spec = respec or prev_info.get('spec', '')
         # a full set of other cards is anchored now, even on a cycle a later check failed
         uuids = reanchor_uuids or prev_info.get(GPU_ANCHOR_KEY, '')
 

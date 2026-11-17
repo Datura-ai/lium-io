@@ -169,7 +169,7 @@ failure_diagnostics() {
 
 abort_on_active_rentals() {
     # a rental blocks every path below, so check before anything that costs the node time or bandwidth;
-    # -a: a renter's stopped pod is still a rental, and the install removes every stopped container
+    # -a: a renter's stopped pod is still a rental
     docker ps -a --filter "name=pod_" --format '{{.Names}}' 2>/dev/null | grep -q . || return 0
     fail "Rentals found (pod_* containers, running or stopped). Cannot proceed."
     docker ps -a --filter "name=pod_" --format "    - {{.Names}} ({{.Status}})" 2>/dev/null
@@ -219,6 +219,23 @@ pf_fix() {
 
 host_path() { echo "${SYSBOX_SETUP_HOST_ROOT:-}$1"; }
 
+keep_needrestart_off_the_container_runtime() {
+    # an apt upgrade's needrestart restarts services whose libraries changed; restarting sysbox-mgr/sysbox-fs (or Docker)
+    # under running pods drops their /proc (sysbox-fs FUSE) and the uid-shift state, and the next container restart
+    # leaves the pod's files owned by nobody inside it (sudo and apt break). Restarting nvidia-fabricmanager under pods
+    # breaks NVLink multicast in them (CUDA 401). The provider restarts them in a window.
+    local dir
+    dir=$(host_path /etc/needrestart/conf.d)
+    mkdir -p "$dir" && cat > "$dir/lium-container-runtime.conf" <<'NRCONF'
+# Lium: never restart the container runtime under running pods; restart it in a maintenance window.
+$nrconf{override_rc}->{qr(^sysbox)} = 0;
+$nrconf{override_rc}->{qr(^docker)} = 0;
+$nrconf{override_rc}->{qr(^containerd)} = 0;
+$nrconf{override_rc}->{qr(^nvidia-fabricmanager)} = 0;
+$nrconf{override_rc}->{qr(^nvidia-persistenced)} = 0;
+NRCONF
+}
+
 self_cmd() {
     # how to run this script again: the file when there is one, else the one-liner (curl | bash). A leading VAR=VALUE
     # argument goes after sudo (sudo's env_reset drops variables set before it); the rest are the script's options.
@@ -249,6 +266,32 @@ daemon_feature_off() {
     else
         grep -Eq "\"$1\"[[:space:]]*:[[:space:]]*false" "$file"
     fi
+}
+
+# The sysbox .deb's config script exits 1 when dockerd runs, daemon.json lacks bip / default-address-pools
+# (matched line by line, so the file must be indented) and any container exists, before its postinst runs.
+# Write the .deb's own subnets ($1 bip, $2 pool base) first, so the provider's containers stay; same overlap
+# rule as its postinst (Docker is restarted in step 5).
+seed_sysbox_network_config() {
+    local file gw subnet
+    file=$(host_path /etc/docker/daemon.json)
+    docker ps -a --format '{{.ID}}' 2>/dev/null | grep -q . || return 0
+    [ -n "$1" ] && [ -n "$2" ] || { fail "Could not read sysbox's Docker subnets from its package."; return 1; }
+    mkdir -p "$(dirname "$file")"
+    [ -s "$file" ] || echo '{}' > "$file"
+    if ! jq -e '(.bip // "") != "" and ((."default-address-pools" // []) | length) > 0' "$file" > /dev/null 2>&1; then
+        gw=$(ip route | awk '/default/ {print $3; exit}')
+        for subnet in "${1%/*}" "${2%/*}"; do
+            if ! ip route get "$subnet" | grep -q "via $gw"; then
+                fail "$subnet overlaps a local network: set \"bip\" and \"default-address-pools\" in /etc/docker/daemon.json yourself, then re-run."
+                return 1
+            fi
+        done
+    fi
+    jq --indent 4 --arg bip "$1" --arg pool "$2" 'if (.bip // "") == "" then .bip = $bip else . end
+        | if ((."default-address-pools" // []) | length) == 0 then ."default-address-pools" = [{"base": $pool, "size": 24}] else . end' \
+        "$file" > "$file.tmp" && mv "$file.tmp" "$file" || { fail "Failed to update $file (invalid JSON?)."; return 1; }
+    ok "Docker network settings for sysbox are in daemon.json (applied at the Docker restart below)."
 }
 
 check_root() {
@@ -959,6 +1002,10 @@ if load_iptables_modules; then
     PREFLIGHT_FIX=$((PREFLIGHT_FIX - 1))
 fi
 
+# before "Already working?": a host that already runs pods needs it most, and that path exits early
+keep_needrestart_off_the_container_runtime && ok "apt (needrestart) never restarts sysbox, Docker, containerd or the NVIDIA fabric manager." \
+    || warn "Could not write /etc/needrestart/conf.d/lium-container-runtime.conf; apt upgrades may restart sysbox under pods."
+
 # ── 2. Already working? ─────────────────────────────────
 
 INSTALLED_SYSBOX=$(sysbox_runc_version || true)
@@ -1111,6 +1158,11 @@ if [ "$SKIP_INSTALL" = false ]; then
         actual=$(sha256sum "$SYSBOX_DEB" | cut -d' ' -f1)
         [ "$actual" = "$SYSBOX_SHA" ] || { fail "Checksum mismatch!"; exit 1; }
     fi
+    SYSBOX_CTL=$(mktemp -d)
+    dpkg-deb -e "$SYSBOX_DEB" "$SYSBOX_CTL"
+    seed_sysbox_network_config "$(sed -n 's/^bip_subnet="\(.*\)"$/\1/p' "$SYSBOX_CTL/postinst")" \
+        "$(sed -n 's/^pool_subnet="\(.*\)"$/\1/p' "$SYSBOX_CTL/postinst")" || { rm -rf "$SYSBOX_CTL"; exit 1; }
+    rm -rf "$SYSBOX_CTL"
     apt_install install -y -qq "$SYSBOX_DEB" || exit 1
     ok "Sysbox v${SYSBOX_VERSION} installed."
 else

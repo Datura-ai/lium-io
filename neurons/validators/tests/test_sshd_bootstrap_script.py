@@ -513,6 +513,77 @@ def test_failed_main_only_install_falls_back_to_all_sources(harness):
     assert "retrying with all of the image's apt sources" in result.stdout
 
 
+def test_waits_out_the_images_apt_lock_on_the_main_only_install(harness):
+    harness.stage_sshd_payload(SSHD_STARTS)
+    (harness.apt_etc / "sources.list").write_text("deb http://deb.debian.org/debian trixie main\n")
+    # the image's own apt-get holds the lists lock for the first two updates
+    lock_twice = (
+        'case "$*" in update*) n=$(cat "$SHIM_STATE/locked" 2>/dev/null || echo 0); '
+        'if [ "$n" -lt 2 ]; then echo $((n + 1)) > "$SHIM_STATE/locked"; '
+        'echo "E: Could not get lock /var/lib/apt/lists/lock. It is held by process 98 (apt-get)" >&2; exit 100; fi ;; esac\ncase'
+    )
+    harness._write_executable(harness.shims / "apt-get", APT_GET_SHIM.replace("case", lock_twice, 1))
+
+    result = harness.run("--grace", "0")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = harness.apt_calls()
+    assert len(calls) == 4 and all("SourceList" in c for c in calls), calls  # 3 updates, 1 install: main only
+    assert "retrying with all of the image's apt sources" not in result.stdout
+
+
+def test_a_non_lock_apt_failure_is_not_retried(harness):
+    harness.stage_sshd_payload(SSHD_STARTS)
+    (harness.apt_etc / "sources.list").write_text("deb http://deb.debian.org/debian trixie main\n")
+    fail = 'case "$*" in update*SourceList*) echo "E: Some index files failed to download" >&2; exit 100 ;; esac\ncase'
+    harness._write_executable(harness.shims / "apt-get", APT_GET_SHIM.replace("case", fail, 1))
+
+    result = harness.run("--grace", "0")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert [c for c in harness.apt_calls() if "SourceList" in c] and len(harness.apt_calls()) == 3
+
+
+@pytest.mark.parametrize(
+    "failed, falls_back",
+    [
+        ([("E", "noble-backports")], False),
+        ([("E", "noble-updates")], False),  # Ubuntu mirror mid-sync: noble + noble-security still carry openssh's fixes
+        ([("E", "noble-updates"), ("W", "noble-backports")], False),
+        ([("E", "noble-security")], True),  # the security pocket is the one that must arrive
+        ([("E", "noble-updates"), ("W", "noble-security")], True),  # an unreachable security InRelease counts too
+        ([("E", "noble")], True),
+        # a fatal repository error suppresses the later fetch summaries (the unreachable -security one)
+        ([("E", "trixie-updates"), ("RAW", "E: The repository http://deb.debian.org/debian trixie-updates InRelease is not signed.")], True),
+    ],
+)
+def test_a_failed_list_fetch_installs_from_the_lists_that_arrived(harness, failed, falls_back):
+    harness.stage_sshd_payload(SSHD_STARTS)
+    (harness.apt_etc / "sources.list").write_text("deb http://archive.ubuntu.com/ubuntu noble main\n")
+    errs = "".join(
+        f"E: Failed to fetch http://archive.ubuntu.com/ubuntu/dists/{s}/main/binary-amd64/Packages.gz"
+        "  File has unexpected size (1 != 2). Mirror sync in progress?\n"
+        if level == "E"
+        else f"{s}\n"
+        if level == "RAW"
+        else f"W: Failed to fetch http://archive.ubuntu.com/ubuntu/dists/{s}/InRelease  Temporary failure resolving x\n"
+        for level, s in failed
+    )
+    fail = f"case \"$*\" in update*SourceList*) printf '%s' '{errs}' >&2; exit 100 ;; esac\ncase"
+    harness._write_executable(harness.shims / "apt-get", APT_GET_SHIM.replace("case", fail, 1))
+
+    result = harness.run("--grace", "0")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = harness.apt_calls()
+    if falls_back:
+        assert [c.split()[0] for c in calls] == ["update", "update", "install"] and "SourceList" not in calls[2], calls
+        assert "retrying with all of the image's apt sources" in result.stdout
+    else:
+        assert len(calls) == 2 and "install" in calls[1] and "SourceList" in calls[1], calls
+        assert "retrying with all of the image's apt sources" not in result.stdout
+
+
 # DAH-6029: one fixture across the deb822 / one-line grammar, checked against apt's own parser.
 GRAMMAR_LIST = """# deb http://commented.example/debian stable main
 deb http://http.kali.org/kali kali-rolling main contrib non-free

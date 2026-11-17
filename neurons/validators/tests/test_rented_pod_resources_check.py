@@ -33,7 +33,7 @@ def _container(cpuset="", nano=8_000_000_000, oom=500, label="8", quota=0, perio
     }
 
 
-def _ssh(container=None, init_oom=500, raise_exc=None, cgroup_cpuset="", cpu_max=""):
+def _ssh(container=None, init_oom=500, raise_exc=None, cgroup_cpuset="", cpu_max="", proc_err=""):
     async def run(cmd, *args, **kwargs):
         if raise_exc is not None:
             raise raise_exc
@@ -41,7 +41,9 @@ def _ssh(container=None, init_oom=500, raise_exc=None, cgroup_cpuset="", cpu_max
             out = json.dumps(container) if container else ""
             return SimpleNamespace(exit_status=0 if container else 1, stdout=out, stderr="")
         return SimpleNamespace(
-            exit_status=0, stdout=f"4242|{init_oom}|{cgroup_cpuset}|{cpu_max}\n", stderr=""
+            exit_status=0,
+            stdout=f"4242|{init_oom}|{cgroup_cpuset}|{cpu_max}|{proc_err}\n",
+            stderr="",
         )
 
     return SimpleNamespace(run=run)
@@ -197,3 +199,21 @@ async def test_cgroup_written_directly_is_seen(context_factory, cgroup_cpuset, c
     result = await _run(_ctx(context_factory, ssh))
     assert _findings(result) == findings
     assert result.passed is (not findings)
+
+
+@pytest.mark.asyncio
+async def test_dead_proc_fuse_mount_is_reported_never_failed(context_factory):
+    err = "cat: /proc/4242/root/proc/sys/kernel/hostname: Transport endpoint is not connected"
+    result = await _run(_ctx(context_factory, _ssh(_container(), proc_err=err)))
+    assert result.passed is True
+    assert result.updates == {}
+    assert result.event.reason_code == Msg.PROC_FUSE_DISCONNECTED.reason
+    assert _findings(result) == ["proc_fuse_disconnected"]
+
+
+@pytest.mark.asyncio
+async def test_scored_finding_wins_over_dead_proc_fuse_mount(context_factory):
+    err = "Transport endpoint is not connected"
+    result = await _run(_ctx(context_factory, _ssh(_container(cpuset="2-7"), proc_err=err)))
+    assert result.passed is False
+    assert result.event.reason_code == Msg.RESOURCES_REDUCED.reason

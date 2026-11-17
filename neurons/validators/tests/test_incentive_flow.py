@@ -1650,3 +1650,38 @@ async def test_sync_passes_active_hotkeys_to_set_weights(
 
     call = validator.subtensor_client.set_weights.call_args
     assert call.kwargs["active_hotkeys"] == {"live_miner"}
+
+
+@pytest.mark.asyncio
+async def test_an_express_pass_during_the_spec_publish_is_in_the_cycles_reported_set(
+    validator_with_mocks, mock_settings, create_job_result, create_neuron_info, monkeypatch
+):
+    """Review 4559156751: a lane pass that lands while the spec-publish loop awaits must still keep
+    the cycle's observations-only EXECUTOR_RESULT_MISSING off that node."""
+    validator = validator_with_mocks
+    validator.miner_scores = {}
+    job_batch_id = "2024-01-01 00:00:00"
+    express_node = "express-node-1"
+    validator.miner_service.express_published = {}
+
+    async def lane_pass_lands(*args, **kwargs):
+        validator.miner_service.express_published[express_node] = job_batch_id
+
+    validator.miner_service.publish_machine_specs = AsyncMock(side_effect=lane_pass_lands)
+    validator.publish_result_missing = AsyncMock()
+    monkeypatch.setattr(mock_settings, "RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED", True)
+    seen_reported = []
+
+    def spy(rented, observations, reported, batch_id):
+        seen_reported.append(set(reported))
+        return {}
+
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner1"),
+        create_neuron_info(uid=101, hotkey="burner2"),
+        create_neuron_info(uid=2, hotkey="miner1"),
+    ]
+    with patch("core.validator.pod_ssh_only_results", side_effect=spy):
+        await _run_sync_with_jobs(validator, miners, {"miner1": [create_job_result()]}, job_batch_id=job_batch_id)
+
+    assert seen_reported and express_node in seen_reported[-1]
