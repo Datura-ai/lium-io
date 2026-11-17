@@ -4243,6 +4243,41 @@ async def test_create_container_reports_docker_login_failure_step_when_pull_also
     assert result.msg == "Docker login refused by the image registry: check the template's registry credentials"
 
 
+@pytest.mark.asyncio
+async def test_create_container_reports_a_refused_ssh_reopen_after_a_failed_login_as_ssh_connect(
+    docker_service,
+    monkeypatch,
+):
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    docker_client = docker_service.rental_docker_client_factory.client
+    docker_client.login_error = Exception(
+        "Docker SDK login for registry.digitalocean.com failed: 401 Client Error: Unauthorized"
+    )
+    docker_client.pull_error = _pull_wrapped_not_reopened()
+    payload = _private_registry_create_payload()
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "ssh_connect"
+    assert "registry" not in result.msg
+
+
 @pytest.mark.parametrize(
     ("login_error", "expected"),
     [

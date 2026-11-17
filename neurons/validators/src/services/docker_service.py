@@ -10695,7 +10695,8 @@ class DockerService:
                         except _CreateCancelledByDelete:
                             raise
                         except Exception as exc:
-                            if login_error is None:
+                            # a node that stopped answering is not the login's fault: report the dead transport
+                            if login_error is None or is_transport_not_reopened(exc):
                                 raise
                             # docker-py pulls anonymously after a failed login, so the
                             # pull failure is most likely the login's fault — attribute it,
