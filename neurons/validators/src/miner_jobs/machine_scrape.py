@@ -774,7 +774,9 @@ def get_needrestart_guard(host_root="/proc/1/root"):
         except (FileNotFoundError, NotADirectoryError):
             continue
         loaded_later = path.startswith(conf_dir) and os.path.basename(path) > guard_name
-        plain_setting = r"[ \t]*\$nrconf\{(\w+)\}\s*=\s*[^;{}()\[\]%@$&\\`]*;\s*(#.*)?"
+        # the value must be a literal (number, '...' or "..." without escapes or interpolation): a bareword
+        # is Perl code (a sub defined in an earlier file, reset 'n', do 'file') that can clear the guard
+        plain_setting = r"""[ \t]*\$nrconf\{(\w+)\}\s*=\s*(-?\d+(\.\d+)?|'[^'\\]*'|"[^"\\$@]*")\s*;\s*(#.*)?"""
         if loaded_later and any(
             ln.strip() and not ((m := re.fullmatch(plain_setting, ln)) and m.group(1) != "override_rc") for ln in lines
         ):
