@@ -649,6 +649,7 @@ async def _set_applied_cap_on_restore_record(
     capped_to_watts: int | None,
     capped_by: CappingJob | None,
     log_extra: dict[str, object] | None,
+    boot_id: str | None = None,
 ) -> None:
     """Write the watts we verifiably applied onto the GPU's restore record, or None to say no
     cap of ours is standing (DAH-2786).
@@ -660,7 +661,8 @@ async def _set_applied_cap_on_restore_record(
     the executor and pod that FIRST capped the GPU — the revert is deduplicated per pod and
     charged to the executor, so a stale identity would file the breach against the wrong
     provider. Best-effort: a miss only costs the revert signal, never the way back, so it must
-    not fail the filler.
+    not fail the filler. The host's ``boot_id`` is stamped too when given (DAH-6555): a frozen record keeps the one
+    of the boot it was first capped in, which would read a raise in this boot as a reboot and set the cap again free.
     """
     key = _restore_key(gpu_uuid)
     try:
@@ -671,7 +673,8 @@ async def _set_applied_cap_on_restore_record(
         identity = (
             {"pod_id": capped_by.pod_id, "executor_id": capped_by.executor_id} if capped_by else {}
         )
-        refreshed = record.model_copy(update={"capped_to_watts": capped_to_watts, **identity})
+        boot = {"boot_id": boot_id} if boot_id else {}
+        refreshed = record.model_copy(update={"capped_to_watts": capped_to_watts, **identity, **boot})
         await redis.set(key, refreshed.model_dump_json())
     except (ValidationError, TypeError, ValueError) as exc:
         _log(logging.ERROR, f"gpu power cap: cannot stamp the applied cap on {gpu_uuid}: {exc}", {"gpu_uuid": gpu_uuid}, log_extra)
@@ -1430,5 +1433,6 @@ async def apply_filler_gpu_power_limits(
             planned.clamped_watts_by_uuid[gpu_uuid],
             CappingJob(executor_id=executor_id, pod_id=pod_id),
             log_extra,
+            boot_id,
         )
     return GpuPowerCapResult.APPLIED

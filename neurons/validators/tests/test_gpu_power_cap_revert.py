@@ -679,6 +679,19 @@ async def test_the_cap_records_the_hosts_boot_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_the_cap_stamps_this_boot_on_a_frozen_record() -> None:
+    # DAH-6555 review: a record frozen in an older boot must take this boot's id, or a raise in this boot would read
+    # as a reboot and get a free re-cap instead of a revert
+    ssh = fake_ssh(FakeRun(stdout="GPU-a, 400, 400, 100, 400\n"), FakeRun(stdout="boot-1\n"), *_set_ok(280))
+    frozen = GpuPowerRestoreRecord.model_validate_json(_stored_restore_record()).model_copy(update={"boot_id": "boot-0"})
+    redis = FakeRedis({_restore_key("GPU-a"): frozen.model_dump_json()})
+
+    await apply_filler_gpu_power_limits(ssh, [GpuPowerLimit(gpu_uuid="GPU-a", watts=280)], redis, POD_ID, EXECUTOR_ID)
+
+    assert GpuPowerRestoreRecord.model_validate_json(redis.store[_restore_key("GPU-a")]).boot_id == "boot-1"
+
+
+@pytest.mark.asyncio
 async def test_read_fails_open_when_redis_is_down() -> None:
     # Redis resilience: our own outage must never zero an innocent provider's incentive.
     assert await read_gpu_power_cap_reverts(BrokenRedis(), EXECUTOR_ID) == []
