@@ -543,9 +543,12 @@ async def test_a_malformed_port_range_keeps_a_rented_node_on_its_rented_score(co
 
 @pytest.mark.asyncio
 async def test_a_dind_miss_on_a_batch_of_three_publishes_two(context_factory):
+    # an empty port inventory: no container holds a port, so the DinD probe runs (DAH-6376 skips it otherwise)
+    ssh = SimpleNamespace(run=AsyncMock(return_value=SimpleNamespace(exit_status=0, stdout="", stderr="")))
     ctx = run_context(
         context_factory,
         connectivity(HostNetworkBatch(reachable=MIN_PORT_COUNT), PublishedPorts(), PublishedPorts(), dind=DindFails()),
+        ssh=ssh,
     )
 
     _, ctx = await apply(ctx, PortConnectivityCheck())

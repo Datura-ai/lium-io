@@ -11,7 +11,8 @@ when it is at least ``MIN_UTILIZATION_PCT`` busy and either
 
 - a thermal or hardware slowdown bit of the clocks-event reasons is set, or
 - its graphics clock is below ``MIN_CLOCK_RATIO`` of its max clock while no SW power-cap bit explains it
-  (a power cap set on purpose also holds the clock down; GpuPowerLimitCheck judges that).
+  (a power cap set on purpose also holds the clock down; GpuPowerLimitCheck judges that). A power-cap bit
+  with the power limit still at the card's default explains nothing: that is a host power fault.
 
 An idle card is not judged: an idle card downclocks by design. A scrape that predates these readings, or a
 driver that lacks the calls, leaves the fields missing and the GPU is not judged either.
@@ -76,6 +77,8 @@ THERMAL_REASON_NAMES = {
 MIN_UTILIZATION_PCT = 80
 # Below half the max clock under load is a collapse, not boost variation (ticket-0492: ~17-33%).
 MIN_CLOCK_RATIO = 0.5
+# A power limit at least this share of the card's default counts as the default (not lowered on purpose).
+POWER_CAP_DEFAULT_RATIO = 0.98
 THERMAL_HOLD_KEY_PREFIX = "gpu_thermal_hold"
 THERMAL_HOLD_SECONDS = 7 * 24 * 3600
 
@@ -107,7 +110,21 @@ def judge_gpu(detail: dict[str, Any]) -> dict[str, Any] | None:
     )
     clock_ratio = clock / max_clock if clock is not None and max_clock else None
     power_capped = reasons is not None and bool(reasons & CLOCKS_EVENT_REASON_SW_POWER_CAP)
-    low_clock = clock_ratio is not None and clock_ratio < MIN_CLOCK_RATIO and not power_capped
+    # A power cap excuses a low clock only when the limit was set below the card's default (GpuPowerLimitCheck
+    # judges that). At the default limit, a cap holding a busy card under half its clock is a host power fault.
+    limit = _to_number(detail.get("power_limit"))
+    default_limit = _to_number(detail.get("power_default_limit"))
+    cap_at_default = (
+        power_capped
+        and limit is not None
+        and bool(default_limit)
+        and limit >= default_limit * POWER_CAP_DEFAULT_RATIO
+    )
+    low_clock = (
+        clock_ratio is not None
+        and clock_ratio < MIN_CLOCK_RATIO
+        and (not power_capped or cap_at_default)
+    )
 
     if not thermal_reasons and not low_clock:
         return None

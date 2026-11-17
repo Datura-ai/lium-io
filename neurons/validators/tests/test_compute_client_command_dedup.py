@@ -14,7 +14,9 @@ from payload_models.payloads import (
     FailedContainerErrorCodes,
     FailedContainerErrorTypes,
     FailedContainerRequest,
+    RemoveSshPublicKeysRequest,
     SshPubKeyAdded,
+    SshPubKeyRemoved,
 )
 from services.redis_service import BACKEND_COMMAND_PREFIX, RedisService
 
@@ -259,6 +261,36 @@ async def test_ssh_key_add_answer_echoes_the_request_command_id(client, answer):
     await client.miner_driver(add)
 
     assert [json.loads(m.model_dump_json())["command_id"] for m in client.message_queue] == ["restore:1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "answer",
+    [
+        SshPubKeyRemoved(miner_hotkey="miner", executor_id="executor", pod_id="pod", user_public_keys=["k"]),
+        FailedContainerRequest(
+            miner_hotkey="miner",
+            executor_id="executor",
+            pod_id="pod",
+            error_type=FailedContainerErrorTypes.AddSSkeyFailed,
+            msg="failed",
+        ),
+    ],
+)
+async def test_ssh_key_remove_answer_echoes_the_request_command_id(client, answer):
+    client.miner_service.handle_container.return_value = answer
+    remove = RemoveSshPublicKeysRequest(
+        command_id="remove:1",
+        miner_hotkey="miner",
+        executor_id="executor",
+        pod_id="pod",
+        container_name="container",
+        user_public_keys=["k"],
+    )
+
+    await client.miner_driver(remove)
+
+    assert [json.loads(m.model_dump_json())["command_id"] for m in client.message_queue] == ["remove:1"]
 
 
 @pytest.mark.asyncio

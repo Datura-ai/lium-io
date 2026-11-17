@@ -208,6 +208,8 @@ class ContextState:
     # DAH-5244: this cycle's verified ports and sysbox were republished from the last completed check's memory,
     # not measured; a consumer that keeps "last good ports" must not store them as fresh.
     port_check_deferred: bool = False
+    # VerifyXCheck skipped its run for a standing rental-probe failure; RentalProbeCheck then never passes the cycle
+    verifyx_skipped_for_standing_probe_failure: bool = False
     # DAH-5981: the error of this cycle's port probe when the SSH connection dropped mid-probe; None otherwise.
     # PortCountCheck then reports the lost connection, not a port shortfall it never measured.
     port_probe_connection_lost: str | None = None
@@ -306,6 +308,8 @@ class Context(BaseModel):
     # Set by GpuFingerprintCheck when the node lists a full set of other GPUs (full_set_changed): ResultHandler
     # makes this cycle's set the anchor.
     gpu_reanchor: bool = False
+    # Set by SpecChangeCheck: the reset records this cycle's model:count, so the next cycle audits the node as it is now
+    gpu_respec: bool = False
     collateral_deposited: bool = False
     contract_version: str | None = None
     is_rental_succeed: bool = False
@@ -324,6 +328,8 @@ class Context(BaseModel):
     # False only once CpuTruthCheck sees a mismatch under enforcement; the score gate lives in
     # calculate_scores because the check is non-fatal and ScoreCheck runs after it.
     cpu_truth_passed: bool = True
+    # False only once SpecFloorCheck fails a node under a live rental (fatal otherwise); gated in calculate_scores.
+    spec_floor_passed: bool = True
     # False only once ProviderSideLoadCheck sees provider-side CPU/disk above the floors under
     # enforcement; the score gate lives in calculate_scores for the same reason as above.
     provider_side_load_passed: bool = True

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import TYPE_CHECKING
 
 from core.config import settings
@@ -12,10 +11,7 @@ if TYPE_CHECKING:
 
 
 def is_missing_discord_after_cutoff(job_result: JobResult) -> bool:
-    return (
-        datetime.utcnow() >= settings.DISCORD_INCENTIVE_CUTOFF
-        and not job_result.provider_discord_connected
-    )
+    return not job_result.provider_discord_connected
 
 
 def earns_spot_rental_incentive(job_result: JobResult) -> bool:
