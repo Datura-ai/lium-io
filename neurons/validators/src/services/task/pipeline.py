@@ -643,6 +643,11 @@ def _not_terminal(ran: _RanCheck) -> _RanCheck:
     return replace(ran, result=ran.result.model_copy(update={"fatal": False, "halt": False}))
 
 
+_NOT_THE_ACCOUNTS_MACHINE = frozenset(
+    {NodeAccountMessages.MISMATCH.reason, NodeAccountMessages.BINDING_UNVERIFIED.reason}
+)
+
+
 def _a_finding(ran: _RanCheck) -> bool:
     # a fault the check finished reading stays the run's verdict: hiding the node and publishing it key on the last event;
     # its extra events count too (the GPU recheck's failure carries GPU_LOST there)
@@ -837,8 +842,10 @@ class Pipeline:
 
     async def run(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
         passed, events, end_ctx = await self._run_checks(ctx)
-        if any(event.reason_code == NodeAccountMessages.MISMATCH.reason for event in events):
-            return passed, events, end_ctx  # another account's machine answered: no completion step touches it
+        # another account's machine answered, or the machine could not be confirmed as the account's (a read that
+        # still failed after the reconnect, which a relay can cause): no completion step touches it (DAH-6539)
+        if any(event.reason_code in _NOT_THE_ACCOUNTS_MACHINE for event in events):
+            return passed, events, end_ctx
         for chk in self.on_completion:
             try:
                 res = await chk.run(end_ctx)

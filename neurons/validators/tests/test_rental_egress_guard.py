@@ -338,11 +338,15 @@ async def test_the_guard_runs_once_per_cycle_however_the_pipeline_ends(context_f
     assert len(last_run) == 1
 
 
+@pytest.mark.parametrize("template", ["MISMATCH", "BINDING_UNVERIFIED"])
 @pytest.mark.parametrize("rented", [True, False])
 @pytest.mark.asyncio
-async def test_no_completion_step_touches_a_host_refused_as_another_accounts(context_factory, monkeypatch, rented):
+async def test_no_completion_step_touches_a_host_refused_as_another_accounts(
+    context_factory, monkeypatch, rented, template
+):
     """A hostname pointed at another provider's machine is refused by NodeAccountCheck; that machine may still accept
-    the validator's key, so the guard's NET_ADMIN helper must never run there."""
+    the validator's key, so the guard's NET_ADMIN helper must never run there. The same when the machine could not be
+    confirmed as the account's (DAH-6539: the account read failed, which a relay can cause)."""
     from unittest.mock import AsyncMock
 
     from services.task.messages import NodeAccountMessages
@@ -360,14 +364,14 @@ async def test_no_completion_step_touches_a_host_refused_as_another_accounts(con
             return CheckResult(
                 passed=False,
                 event=rental_egress_guard.render_message(
-                    NodeAccountMessages.MISMATCH, ctx=ctx, check_id=self.check_id, what={}
+                    getattr(NodeAccountMessages, template), ctx=ctx, check_id=self.check_id, what={}
                 ),
             )
 
     sink = AsyncMock()
     ok, events, _ = await Pipeline([_NodeAccount(), RentalEgressGuardCheck()], sink).run(context_factory(ssh=ssh))
 
-    assert ok is False and events[-1].reason_code == "NODE_ACCOUNT_MISMATCH"
+    assert ok is False and events[-1].reason_code == getattr(NodeAccountMessages, template).reason
     assert ssh.calls == []
     assert RentalEgressGuardCheck.check_id not in [call.args[0].check_id for call in sink.emit.await_args_list]
 
