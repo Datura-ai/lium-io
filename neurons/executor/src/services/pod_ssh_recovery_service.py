@@ -46,10 +46,21 @@ def handle_event(event: dict, client) -> bool:
 
 
 def _watch_forever() -> None:
+    # a reconnect resumes from the last event's second, so a pod restarted while the stream was down is still
+    # recovered; the events of that second it replays are skipped by (id, timeNano)
+    since = None
+    seen: set = set()
     while True:
         try:
             client = docker.from_env()
-            for event in client.events(decode=True, filters={"type": "container", "event": "start"}):
+            for event in client.events(decode=True, since=since, filters={"type": "container", "event": "start"}):
+                t = event.get("time")
+                if t != since:
+                    since, seen = t, set()
+                key = (event.get("id"), event.get("timeNano"))
+                if key in seen:
+                    continue
+                seen.add(key)
                 handle_event(event, client)
         except Exception as e:  # noqa: BLE001 - the stream drops with dockerd restarts; reconnect
             logger.warning(f"pod ssh recovery watcher reconnecting: {type(e).__name__}: {e}")

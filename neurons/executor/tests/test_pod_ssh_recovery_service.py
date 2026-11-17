@@ -47,3 +47,34 @@ def test_a_failed_sshd_rerun_does_not_raise():
     client.containers.get.side_effect = RuntimeError("gone")
 
     assert handle_event(_start(), client) is True
+
+
+def test_a_reconnect_resumes_from_the_last_event_and_skips_the_replayed_one(monkeypatch):
+    import services.pod_ssh_recovery_service as svc
+
+    first = {**_start(cid="a"), "time": 100, "timeNano": 100_000_000_001}
+    missed = {**_start(cid="b"), "time": 101, "timeNano": 101_000_000_002}
+    sinces, handled = [], []
+
+    def events(decode, since, filters):
+        sinces.append(since)
+        if len(sinces) == 1:
+            yield first
+            raise ConnectionError("stream dropped")
+        yield first  # the second `since` covers is replayed
+        yield missed
+        raise KeyboardInterrupt  # ends the test's watcher
+
+    client = MagicMock()
+    client.events.side_effect = events
+    monkeypatch.setattr(svc.docker, "from_env", lambda: client)
+    monkeypatch.setattr(svc.time, "sleep", lambda s: None)
+    monkeypatch.setattr(svc, "handle_event", lambda e, c: handled.append(e["id"]))
+
+    try:
+        svc._watch_forever()
+    except KeyboardInterrupt:
+        pass
+
+    assert sinces == [None, 100]
+    assert handled == ["a", "b"]
