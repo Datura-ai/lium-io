@@ -24,7 +24,7 @@ from payload_models.payloads import (
     WorkloadKind,
 )
 import services.docker_service as docker_service_module
-from helpers import shared_pod_start_stop_lock
+from helpers import no_host_start_lock, shared_pod_start_stop_lock
 from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService, _is_vloopback_driver, _s3fs_plugin_alias
 from services.rental_docker_sdk import (
     ContainerExecResult,
@@ -115,6 +115,9 @@ class RecordingRentalDockerClient:
     async def exec_in_container(self, spec) -> ContainerExecResult:
         self.exec_specs.append(spec)
         return ContainerExecResult(exit_status=0)
+
+    async def container_identity(self, *, container_name: str) -> str | None:
+        return "cid@2026-11-16T14:00:00Z"
 
     async def inspect_container_state(self, *, container_name: str) -> ContainerStateSnapshot:
         return ContainerStateSnapshot(
@@ -211,6 +214,7 @@ def docker_service():
     )
     # the pre-run kernel.pid_max read is mandatory and the SSH doubles here do not model /proc
     service._read_host_pid_max = AsyncMock(return_value=4_194_304)
+    service._hold_pod_start_host_lock = no_host_start_lock
     return service
 
 

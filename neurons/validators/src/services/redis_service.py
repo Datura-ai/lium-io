@@ -539,9 +539,10 @@ class RedisService:
     @asynccontextmanager
     async def pod_start_stop_lock(self, slot: str):
         """Held by every start and remount of one pod and by its pending half-started stop's retry, in the validator
-        and the connector alike (separate processes): a retry that read the pod unmounted can then never stop a run
-        the other process started and remounted meanwhile. Waits while another holder has it. Yields False when Redis
-        is unreachable: a start goes ahead (it never refuses a renter), a stop's retry stays pending."""
+        and the connector alike (separate processes), so their work on one pod runs in turn. Waits while another
+        holder has it. Yields False when Redis is unreachable: a start goes ahead (it never refuses a renter), a stop's
+        retry stays pending. Not the safety of the stop itself, which a lapsed lease cannot break: that is the pod's
+        host start lock, which the retry's fenced stop must take (docker_service._fenced_stop_command)."""
         lock = aioredis.lock.Lock(self.redis, f"lock:pod_start_stop:{slot}", timeout=POD_START_STOP_LOCK_TTL, sleep=0.2)
         try:
             held = bool(await lock.acquire())

@@ -459,3 +459,10 @@ def shared_pod_start_stop_lock(locks: dict[str, asyncio.Lock]):
             yield True
 
     return pod_start_stop_lock
+
+
+@asynccontextmanager
+async def no_host_start_lock(*args):
+    """DockerService._hold_pod_start_host_lock for doubles that model no host shell: the host lock is tested on its
+    own with a real shell (test_docker_service: the fenced stop and its hold command)."""
+    yield
