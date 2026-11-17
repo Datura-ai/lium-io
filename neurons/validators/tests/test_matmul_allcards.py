@@ -294,12 +294,13 @@ async def test_the_wall_clock_is_the_flat_90_s_per_wave(svc, monkeypatch, cards,
     assert probe.passed is not over
 
 
-def test_both_flags_default_on():
+def test_both_flags_default_off():
+    # validators on the public image pull a release at once: they must not enforce before prod's shadow step
     from core.config import Settings
 
     fields = Settings.model_fields if hasattr(Settings, "model_fields") else Settings.__fields__
-    assert fields["MATMUL_ALLCARDS_CHECK_ENABLED"].default is True
-    assert fields["MATMUL_ALLCARDS_ENFORCEMENT_ENABLED"].default is True
+    assert fields["MATMUL_ALLCARDS_CHECK_ENABLED"].default is False
+    assert fields["MATMUL_ALLCARDS_ENFORCEMENT_ENABLED"].default is False
 
 
 def test_every_scored_model_has_a_work_proof_size():

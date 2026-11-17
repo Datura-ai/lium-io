@@ -227,6 +227,8 @@ def _no_answer(stderr: str) -> ValidationResult:
 )
 async def test_a_failed_sample_names_why(context_factory, monkeypatch, result, kind):
     monkeypatch.setattr(capability.settings, "FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES", 1)
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", True)
 
     (check,) = await _filler_cycles(
         context_factory, SamplingValidationService(result=result), 1, specs=_cards(2)
@@ -244,6 +246,7 @@ async def test_a_sampled_card_cuda_cannot_see_fails_the_filler_node_under_enforc
 ):
     monkeypatch.setattr(capability.settings, "FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES", 1)
     monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", enforced)
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
 
     (check,) = await _filler_cycles(
         context_factory,
@@ -275,6 +278,7 @@ async def test_a_failed_card_is_stored_and_resampled_every_cycle_until_it_passes
     samples too, and that card is sampled every cycle until a right answer from it clears it."""
     monkeypatch.setattr(capability.settings, "FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES", 96)
     monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", True)
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_CHECK_ENABLED", True)
     blind = _no_answer("no CUDA-capable device is detected")
     service = ScriptedSamplingService([blind, blind, ValidationResult(success=True)])
 
