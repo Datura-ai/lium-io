@@ -2977,6 +2977,15 @@ class RentedPodOwnershipMessages:
         "renters are moved to fresh pods free of charge. Do not change file ownership on the host or restart "
         "a rented pod's container yourself, and shut the host down cleanly.",
     )
+    RUNTIME_RESTARTED = MessageTemplate(
+        event="Container runtime restarted under running rented pods",
+        reason="RENTED_POD_OWNERSHIP_RUNTIME_RESTARTED",
+        severity="warning",
+        category="runtime",
+        impact="Proceed; pods running across a sysbox or NVIDIA fabric manager restart can lose /proc paths or NVLink",
+        remediation="A runtime service listed in runtime_restarted_under_pods started after the listed pods. "
+        "Contact support before changing anything on the host; restarting the pod alone does not repair it.",
+    )
     UNREAD = MessageTemplate(
         event="Rented pod file ownership not read",
         reason="RENTED_POD_OWNERSHIP_UNREAD",
