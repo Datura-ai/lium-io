@@ -64,6 +64,9 @@ RENTAL_SUCCEED_MACHINE_SET = "rental_succeed_machines"
 AVAILABLE_PORT_MAPS_PREFIX = "available_port_maps"
 RENTAL_PROBE_OK_PREFIX = "rental_probe_ok"
 RENTAL_PROBE_FAILED_PREFIX = "rental_probe_failed"
+# executor uuid -> the backend's last VerifyX EMA; the backend sends it for active and filler nodes only
+VERIFYX_LAST_EMA_PREFIX = "verifyx_last_ema"
+VERIFYX_LAST_EMA_TTL_SECONDS = 30 * 24 * 3600
 # filler container name -> JSON list of the image digests (bare sha256) the validator started it from
 FILLER_IMAGE_DIGESTS_PREFIX = "filler_image_digests:"
 FILLER_IMAGE_DIGESTS_TTL_SECONDS = 30 * 24 * 3600
@@ -97,13 +100,6 @@ SSHD_BOOTSTRAP_FAILED_PREFIX = "sshd_bootstrap_failed"
 # prod, 24 h: failed filler creates on a broken node came 5 min to 2.7 h apart, so 6 h outlives the
 # longest gap about twice over; a stale stamp ends by itself
 SSHD_BOOTSTRAP_FAILED_TTL_SECONDS = 6 * 3600
-# DAH-6066: the host's MemAvailable (KiB) read at a create with no pod or filler on it, per executor; it caps
-# later rentals' memory limits. Refreshed at every idle create; 30 days so a node rented for weeks keeps it.
-IDLE_MEM_AVAILABLE_PREFIX = "idle_mem_available_kib"
-IDLE_MEM_AVAILABLE_TTL_SECONDS = 30 * 24 * 3600
-# DAH-6066: share of the host's free-if-empty MemAvailable kept free: the kernel's free-page floor plus slab and
-# page-table growth while a rental runs, which scale with the host. The reserve clamp still bounds small hosts.
-IDLE_MEM_AVAILABLE_MARGIN_PERCENT = 3
 
 
 def create_started_at_key(miner_hotkey: str, executor_id: str) -> str:
@@ -188,6 +184,9 @@ SYSBOX_VERIFIED_PREFIX = "sysbox_verified"
 # DAH-5244: one key per executor with the port pairs its last completed port check verified, under which
 # address/range/mappings, so a cycle deferred for disk pressure can republish them.
 VERIFIED_PORTS_PREFIX = "verified_ports"
+# DAH-6376: external ports a port check is probing on an executor, and ports a pod was just given there
+PROBE_HELD_PORTS_PREFIX = "probe_held_ports"
+POD_PORTS_PENDING_PREFIX = "pod_ports_pending"
 # DAH-5244: one key per executor counting port checks deferred in a row (":shadow" for the simulated count).
 DISK_PRESSURE_DEFERRALS_PREFIX = "disk_pressure_deferrals"
 # One key per executor: when this validator first found it without its recommended default image
@@ -739,6 +738,36 @@ class RedisService:
 
     async def is_sysbox_verified(self, miner_hotkey: str, executor_id: str) -> bool:
         return await self.get(self._sysbox_verified_key(miner_hotkey, executor_id)) is not None
+
+    async def hold_probe_ports(self, executor_id: str, external_ports: set[int], ttl_seconds: int) -> None:
+        """A port check binds these external ports on the executor until it releases them (or the TTL ends)."""
+        key = f"{PROBE_HELD_PORTS_PREFIX}:{executor_id}"
+        await self.redis.delete(key)
+        if external_ports:
+            await self.redis.sadd(key, *external_ports)
+            await self.redis.expire(key, ttl_seconds)
+
+    async def release_probe_ports(self, executor_id: str) -> None:
+        await self.redis.delete(f"{PROBE_HELD_PORTS_PREFIX}:{executor_id}")
+
+    async def probe_held_ports(self, executor_id: str) -> set[int]:
+        return {int(port) for port in await self.redis.smembers(f"{PROBE_HELD_PORTS_PREFIX}:{executor_id}")}
+
+    async def record_pending_pod_ports(self, executor_id: str, external_ports: list[int], ttl_seconds: int) -> None:
+        """A pod was just given these external ports; the backend's rental list may not show them yet.
+        Each port expires on its own (sorted-set score = expiry time), so a later pod never extends an earlier one's."""
+        if not external_ports:
+            return
+        key = f"{POD_PORTS_PENDING_PREFIX}:{executor_id}"
+        expires_at = time.time() + ttl_seconds
+        await self.redis.zadd(key, {str(port): expires_at for port in external_ports})
+        await self.redis.expire(key, ttl_seconds)
+
+    async def pending_pod_ports(self, executor_id: str) -> set[int]:
+        key = f"{POD_PORTS_PENDING_PREFIX}:{executor_id}"
+        now = time.time()
+        await self.redis.zremrangebyscore(key, "-inf", now)
+        return {int(port) for port in await self.redis.zrangebyscore(key, now, "+inf")}
 
     @staticmethod
     def _verified_ports_key(miner_hotkey: str, executor_id: str) -> str:
@@ -1393,8 +1422,10 @@ class RedisService:
         evidence: dict | None = None,
         anchor_broken: bool = False,
         reanchor_uuids: str = '',
+        respec: str = '',
     ):
-        spec = prev_info.get('spec', '')
+        # a changed model:count is reset once, then verified from scratch as it is now
+        spec = respec or prev_info.get('spec', '')
         # a full set of other cards is anchored now, even on a cycle a later check failed
         uuids = reanchor_uuids or prev_info.get(GPU_ANCHOR_KEY, '')
 

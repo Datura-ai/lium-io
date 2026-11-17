@@ -632,7 +632,7 @@ class VerifyXValidationService:
         deadline_optional: bool = False,
     ) -> str:
         command = (
-            f"{executor_info.python_path} {executor_info.root_dir}/src/verifyx_executor.py "
+            f"{shlex.quote(executor_info.python_path)} {shlex.quote(executor_info.root_dir + '/src/verifyx_executor.py')} "
             f"--seed {challenge.seed} --cipher_text {challenge.cipher_text}"
         )
         if run_dir is None:

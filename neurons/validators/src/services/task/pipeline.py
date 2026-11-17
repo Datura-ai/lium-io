@@ -27,7 +27,7 @@ from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import PodContainerState
 from .availability import REASONS_THAT_HIDE_AT_ONCE
-from .messages import RentalVerificationMessages, TenantEnforcementMessages, render_message
+from .messages import NodeAccountMessages, RentalVerificationMessages, TenantEnforcementMessages, render_message
 from .models import ValidationEvent
 from .runner import SSHCommandResult, SSHCommandRunner
 
@@ -211,6 +211,8 @@ class ContextState:
     # DAH-5244: this cycle's verified ports and sysbox were republished from the last completed check's memory,
     # not measured; a consumer that keeps "last good ports" must not store them as fresh.
     port_check_deferred: bool = False
+    # VerifyXCheck skipped its run for a standing rental-probe failure; RentalProbeCheck then never passes the cycle
+    verifyx_skipped_for_standing_probe_failure: bool = False
     # DAH-5981: the error of this cycle's port probe when the SSH connection dropped mid-probe; None otherwise.
     # PortCountCheck then reports the lost connection, not a port shortfall it never measured.
     port_probe_connection_lost: str | None = None
@@ -250,6 +252,12 @@ class ContextState:
     # not attempted or fell back entirely; the capability and VerifyX checks consume a judged
     # step when present and run over SSH otherwise.
     local_verify: LocalVerifyOutcome | None = None
+    # The liumd shadow's docker and ports read, started right after machine_scrape so both see the
+    # same containers; awaited by the shadow at the end of the run. None = no shadow for this node.
+    liumd_shadow_facts_task: Any = None
+    # True once machine_scrape has tried to start that read, so a later shadow never falls back
+    # to a different Docker moment.
+    liumd_shadow_facts_attempted: bool = False
     # DAH-5462: VerifyX's cold first sample, re-measured by VerifyXColdRetryCheck just before scoring
     verifyx_cold_retry: Any = None
 
@@ -303,6 +311,8 @@ class Context(BaseModel):
     # Set by GpuFingerprintCheck when the node lists a full set of other GPUs (full_set_changed): ResultHandler
     # makes this cycle's set the anchor.
     gpu_reanchor: bool = False
+    # Set by SpecChangeCheck: the reset records this cycle's model:count, so the next cycle audits the node as it is now
+    gpu_respec: bool = False
     collateral_deposited: bool = False
     contract_version: str | None = None
     is_rental_succeed: bool = False
@@ -321,6 +331,8 @@ class Context(BaseModel):
     # False only once CpuTruthCheck sees a mismatch under enforcement; the score gate lives in
     # calculate_scores because the check is non-fatal and ScoreCheck runs after it.
     cpu_truth_passed: bool = True
+    # False only once SpecFloorCheck fails a node under a live rental (fatal otherwise); gated in calculate_scores.
+    spec_floor_passed: bool = True
     # False only once ProviderSideLoadCheck sees provider-side CPU/disk above the floors under
     # enforcement; the score gate lives in calculate_scores for the same reason as above.
     provider_side_load_passed: bool = True
@@ -676,7 +688,10 @@ class Pipeline:
         reconnect: Callable[[], Awaitable[asyncssh.SSHClientConnection]] | None = None,
     ):
         """`reconnect` opens a fresh session to the same node; without it a dropped session ends the run as before."""
-        self.checks = checks
+        # DAH-6442: a check with `on_completion` runs once the run has ended, however it ended (passed, a fatal
+        # failure or a halt), so a fatal check before it can never leave its host-side cleanup undone
+        self.checks = [chk for chk in checks if not getattr(chk, "on_completion", False)]
+        self.on_completion = [chk for chk in checks if getattr(chk, "on_completion", False)]
         self.sink = sink
         self.reconnect = reconnect
         # one reconnect per run: a session that drops again stands as the transport failure it is
@@ -846,6 +861,20 @@ class Pipeline:
             task.cancel()
 
     async def run(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
+        passed, events, end_ctx = await self._run_checks(ctx)
+        if any(event.reason_code == NodeAccountMessages.MISMATCH.reason for event in events):
+            return passed, events, end_ctx  # another account's machine answered: no completion step touches it
+        for chk in self.on_completion:
+            try:
+                res = await chk.run(end_ctx)
+            except Exception as exc:  # noqa: BLE001 — a completion step never changes the run's verdict
+                logger.warning(_m("Completion check failed", extra={**end_ctx.default_extra, "error": repr(exc)[:300]}))
+                continue
+            # reported, but not one of the run's events: the verdict and its publication read the last of those
+            await self.sink.emit(res.event)
+        return passed, events, end_ctx
+
+    async def _run_checks(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
         from .checks.rented_mid_cycle import rented_since_cycle_start_event
 
         events: list[ValidationEvent] = []

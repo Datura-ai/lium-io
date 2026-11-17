@@ -17,19 +17,14 @@ from services.gpu_spec_table import (
     list_sxm_on_pcie_adapter_as_pcie,
     reference_gpu_model,
 )
-from services.redis_service import (
-    GPU_ANCHOR_KEY,
-    IDLE_MEM_AVAILABLE_MARGIN_PERCENT,
-    IDLE_MEM_AVAILABLE_PREFIX,
-    INSPECTOR_EVENT_CHANNEL,
-    RedisService,
-)
+from services.redis_service import GPU_ANCHOR_KEY, INSPECTOR_EVENT_CHANNEL, RedisService
 
 from core.config import settings
 from core.utils import _m, get_extra_info
 from incentive.config import BASE_GPU_MAP
 
 from .checks.verifyx import hold_verifyx_ema, verifyx_ema_hold_reason
+from .event_report_fit import fit_event_report
 from .models import JobResult
 from .pipeline import Context
 
@@ -48,9 +43,7 @@ def _canonicalize_published_gpu_names(specs: dict) -> dict:
     canonical_details = [
         {
             **detail,
-            "name": classify_gpu_model(
-                detail.get("name"), detail.get("capacity"), settings.RTX_4090_48GB_MODEL_ENABLED
-            ),
+            "name": classify_gpu_model(detail.get("name"), detail.get("capacity")),
         }
         if isinstance(detail, dict) and detail.get("name")
         else detail
@@ -247,12 +240,6 @@ class ResultHandler:
         if context.state.recommended_image_digest_match is not None:
             specs["recommended_image_digest_match"] = context.state.recommended_image_digest_match
 
-        # DAH-6066: the ceiling (KiB) all tenants on the host get together, as the rental memory limit applies it, so
-        # the backend lists the RAM a pod will actually get without computing the margin itself
-        idle_available_kib = await self._idle_mem_available_kib(executor_info.uuid)
-        if idle_available_kib and isinstance(specs.get("ram"), dict):
-            specs["ram"] = {**specs["ram"], "tenant_ceiling": idle_available_kib * (100 - IDLE_MEM_AVAILABLE_MARGIN_PERCENT) // 100}
-
         executor_image_report = (
             context.state.executor_image_report.as_dict()
             if context.state.executor_image_report
@@ -311,14 +298,6 @@ class ResultHandler:
             pod_states=list(context.state.pod_states) or None,
             host_runtime_fault=context.state.host_runtime_fault,
         )
-
-    async def _idle_mem_available_kib(self, executor_uuid: str) -> int | None:
-        """The idle MemAvailable DockerService stored for this host, or None when none is known or unreadable."""
-        try:
-            raw = await self.redis_service.get(f"{IDLE_MEM_AVAILABLE_PREFIX}:{executor_uuid}")
-            return int(raw) if isinstance(raw, (str, bytes)) else None
-        except Exception:  # noqa: BLE001 — no figure is sent as none: the listing keeps its MemTotal-based RAM
-            return None
 
     @staticmethod
     def _specs_with_verifyx_ema_hold(
@@ -436,6 +415,7 @@ class ResultHandler:
                     reason=reason,
                     evidence=evidence,
                     reanchor_uuids=(context.state.gpu_uuids or '') if context.gpu_reanchor else '',
+                    respec=(context.state.gpu_model_count or '') if context.gpu_respec else '',
                 )
             else:
                 # a full set of other cards stays anchored when a later check failed, or it re-anchors every cycle
@@ -466,10 +446,10 @@ class ResultHandler:
             return ResetVerifiedJobReason.DEFAULT
 
     async def _publish_inspector_event(self, event: dict, miner_hotkey: str) -> None:
-        payload = {
-            **event,
-            "miner_hotkey": miner_hotkey,
-        }
+        # DAH-6478: capped here, before Redis; an oversized message drops the connector's whole subscription
+        payload = fit_event_report({**event, "miner_hotkey": miner_hotkey})
+        if payload is None:
+            return
         try:
             await self.redis_service.publish(
                 INSPECTOR_EVENT_CHANNEL,

@@ -479,6 +479,8 @@ class SshPubKeyAdded(PodContainerResponse):
 class SshPubKeyRemoved(PodContainerResponse):
     message_type: ValidatorMessageType = ValidatorMessageType.SshPubKeyRemoved
     user_public_keys: list[str] = []
+    # 2.15.0: the RemoveSshPublicKeysRequest's command_id, echoed so the backend can tell which send this confirms
+    command_id: str = ""
 
 
 @VALIDATOR_MESSAGES.register
@@ -568,6 +570,8 @@ class GpuResetErrorCode(enum.Enum):
     ExecutorUnreachable = "ExecutorUnreachable"
     # 2.4.0: sysbox or TEE pod, no supported clocks, or the driver refused the lock
     ClockLockNotSupported = "ClockLockNotSupported"
+    # 2.16.0: the host GPU listing failed, timed out or came back empty: the GPUs are gone from the host driver
+    GpusLostOnHost = "GpusLostOnHost"
 
 
 class GpuResetOutcome(pydantic.BaseModel):

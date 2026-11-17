@@ -7,6 +7,7 @@ from .cpu_truth import CpuTruthCheck
 from .disk_health import DiskHealthCheck
 from .disk_space import DiskSpaceCheck, SplitDiskCheck
 from .custom_build_orphan_sweep import CustomBuildOrphanSweepCheck
+from .rental_egress_guard import RentalEgressGuardCheck
 from .duplicate_executor import DuplicateExecutorCheck
 from .executor_image import ExecutorImageCheck
 from .finalize import FinalizeCheck
@@ -23,6 +24,7 @@ from .gpu_power_limit import GpuPowerLimitCheck
 from .gpu_thermal_throttle import GpuThermalThrottleCheck
 from .gpu_usage import GpuUsageCheck
 from .gpu_vram_precheck import GpuVramPrecheck
+from .spec_floor import SpecFloorCheck
 from .gpu_model_verdict import GpuModelVerdictCheck
 from .hardware_identity import HardwareIdentityCheck
 from .inspector import InspectorRentedCheck
@@ -74,6 +76,7 @@ __all__ = [
     "DiskSpaceCheck",
     "SplitDiskCheck",
     "CustomBuildOrphanSweepCheck",
+    "RentalEgressGuardCheck",
     "DuplicateExecutorCheck",
     "ExecutorImageCheck",
     "FinalizeCheck",
@@ -90,6 +93,7 @@ __all__ = [
     "GpuThermalThrottleCheck",
     "GpuUsageCheck",
     "GpuVramPrecheck",
+    "SpecFloorCheck",
     "GpuModelVerdictCheck",
     "HardwareIdentityCheck",
     "InspectorRentedCheck",
