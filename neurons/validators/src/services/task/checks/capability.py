@@ -30,6 +30,7 @@ from .gpu_model_truth import (
     work_proof_failed,
 )
 from .matmul_speed_log import log_matmul_speed
+from .rental_probe import has_standing_failure
 from .rental_owner import uuid_listed_under_another_miner, rental_of_this_node
 from .sshd_bootstrap import remove_lium_fillers
 
@@ -122,18 +123,25 @@ class CapabilityCheck:
         # liumd phase 1: LocalVerifyCheck already ran this challenge through `POST /verify` and
         # judged it with evaluate_matmul_output — the same function the SSH path ends in. Only a
         # PASSING local result is consumed; anything else runs over SSH exactly as before.
+        allcards_deferred = False
         local = getattr(ctx.state, "local_verify", None)
         transport = "ssh"
         if local is not None and local.matmul is not None:
             result = local.matmul
             transport = "local_verify"
         else:
+            # A standing rental-probe failure: the all-cards run (up to minutes on a large node) would leave the
+            # probe, the only check that clears it, too little cycle time to ever run (review). The single-card
+            # run still proves card 0, and RentalProbeCheck does not pass this cycle, so every card proves
+            # itself before the node relists, as with VerifyX.
+            allcards_deferred = allcards_enforced() and await has_standing_failure(ctx)
             try:
                 result = await validation_service.validate_gpu_model_and_process_job(
                     ssh_client=ctx.ssh,
                     executor_info=ctx.executor,
                     default_extra=ctx.default_extra,
                     machine_spec=specs,
+                    **({"probe_all_cards": False} if allcards_deferred else {}),
                     **sizing,
                 )
             except Exception as exc:
@@ -174,9 +182,12 @@ class CapabilityCheck:
             # Carry FP32 TFLOPS metrics into pipeline state so ResultHandler can nest them
             # in the published specs. Only on success and only when present (fail-safe:
             # None leaves state untouched and no gpu_metrics key is ever published).
-            updates: dict = {}
+            state_changes: dict = {}
             if result.metrics is not None:
-                updates["state"] = replace(ctx.state, gpu_metrics=result.metrics)
+                state_changes["gpu_metrics"] = result.metrics
+            if allcards_deferred:
+                state_changes["allcards_skipped_for_standing_probe_failure"] = True
+            updates: dict = {"state": replace(ctx.state, **state_changes)} if state_changes else {}
             return CheckResult(passed=True, event=event, updates=updates)
 
         # Build detailed failure information
@@ -510,7 +521,12 @@ async def _read_gpu_model_verdict(ctx: Context) -> tuple[bool, list[GpuModelMism
         if raw is None:
             return False, [], set(), True
         stored = json.loads(raw)
-        mismatches = [GpuModelMismatch(**m) for m in stored.get("mismatches") or []]
+        # a work-proof failure stored under enforcement stops failing the node the moment either flag is off
+        mismatches = [
+            m
+            for m in (GpuModelMismatch(**m) for m in stored.get("mismatches") or [])
+            if m.kind != WORK_PROOF_FAILED or allcards_enforced()
+        ]
         measured_ok = {int(i) for i in stored.get("measured_ok") or []}
     except Exception as exc:
         logger.warning(_m("GPU model verdict read failed", extra=get_extra_info({**ctx.default_extra, "error": str(exc)})))
@@ -602,7 +618,12 @@ def _filler_sample_failed_card(sample: dict) -> bool:
     a real card. Prod 10-17 Nov: 16 of 1197 samples on 497 filler nodes, every one on a node whose
     claimed cards CUDA did not see; 0 elsewhere.
     """
-    return settings.MATMUL_ALLCARDS_ENFORCEMENT_ENABLED and sample.get("error_kind") in ("no_answer", "wrong_answer")
+    return allcards_enforced() and sample.get("error_kind") in ("no_answer", "wrong_answer")
+
+
+def allcards_enforced() -> bool:
+    """The all-cards work proof runs and fails nodes: enforcement means nothing while the check itself is off."""
+    return settings.MATMUL_ALLCARDS_CHECK_ENABLED and settings.MATMUL_ALLCARDS_ENFORCEMENT_ENABLED
 
 
 def get_filler_only_container(ctx: Context) -> str | None:

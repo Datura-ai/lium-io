@@ -2522,6 +2522,13 @@ class RentalProbeMessages:
         category="runtime",
         impact="Proceed",
     )
+    CYCLE_WITHOUT_ALLCARDS = MessageTemplate(
+        event="Cycle not passed: the all-cards GPU work proof did not run this cycle",
+        reason="RENTAL_PROBE_CYCLE_WITHOUT_ALLCARDS",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0 for this cycle; every card proves itself next cycle",
+    )
     CYCLE_WITHOUT_VERIFYX = MessageTemplate(
         event="Cycle not passed: VerifyX did not run this cycle",
         reason="RENTAL_PROBE_CYCLE_WITHOUT_VERIFYX",
