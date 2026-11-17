@@ -208,6 +208,9 @@ class ContextState:
     # DAH-5244: this cycle's verified ports and sysbox were republished from the last completed check's memory,
     # not measured; a consumer that keeps "last good ports" must not store them as fresh.
     port_check_deferred: bool = False
+    # DAH-6548: the ports this cycle's probe skipped as held by a rental or filler at the batch-start snapshot; when
+    # a later read shows them freed, the node is re-probed before an idle verdict (freed_port_reprobe.py)
+    probe_excluded_ports: list[int] = field(default_factory=list)
     # VerifyXCheck skipped its run for a standing rental-probe failure; RentalProbeCheck then never passes the cycle
     verifyx_skipped_for_standing_probe_failure: bool = False
     # DAH-5981: the error of this cycle's port probe when the SSH connection dropped mid-probe; None otherwise.

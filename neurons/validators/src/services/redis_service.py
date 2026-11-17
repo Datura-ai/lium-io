@@ -167,6 +167,8 @@ DIND_PROBE_MISS_PREFIX = "dind_probe_miss"
 PORT_VERIFY_MISS_PREFIX = "port_verify_miss"
 # DAH-4537: one key per executor while an outside port probe failure is on record (a second one in a row fails it)
 EXTERNAL_PROBE_MISS_PREFIX = "external_probe_miss"
+# DAH-6548: one key per executor while a verdict withheld for an unfinished freed-port re-probe is on record
+FREED_PORT_REPROBE_WITHHELD_PREFIX = "freed_port_reprobe_withheld"
 # ticket-0494: one key per executor while its last DinD probe that reached the container found sysbox.
 SYSBOX_VERIFIED_PREFIX = "sysbox_verified"
 # DAH-5244: one key per executor with the port pairs its last completed port check verified, under which
@@ -704,6 +706,15 @@ class RedisService:
                 return True
             await self.redis.expire(key, ttl_seconds)
             return False
+
+    async def record_freed_port_reprobe_withheld(self, miner_hotkey: str, executor_id: str, ttl_seconds: int) -> bool:
+        """DAH-6548: True when no withheld re-probe verdict was on record, so this cycle may withhold one."""
+        key = f"{FREED_PORT_REPROBE_WITHHELD_PREFIX}:{miner_hotkey}:{executor_id}"
+        return bool(await self.redis.set(key, "1", ex=ttl_seconds, nx=True))
+
+    async def clear_freed_port_reprobe_withheld(self, miner_hotkey: str, executor_id: str) -> None:
+        """A cycle on the freed-port path reached a verdict: the next one may withhold again."""
+        await self.delete(f"{FREED_PORT_REPROBE_WITHHELD_PREFIX}:{miner_hotkey}:{executor_id}")
 
     async def clear_external_probe_miss(self, miner_hotkey: str, executor_id: str) -> None:
         """The outside prober reached the node: forget the failure on record."""

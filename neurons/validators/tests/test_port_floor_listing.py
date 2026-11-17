@@ -122,7 +122,7 @@ class PerPodBackendClient(DummyBackendClient):
         self.rented_now = rented_now
 
     async def get_rented_executors_now(self):
-        return self.rented_now
+        return await super().get_rented_executors_now() if self.rented_now is None else self.rented_now
 
     async def get_pod_rental_active(self, pod_id: str):
         record = await super().get_pod_rental_active(pod_id)
@@ -907,7 +907,9 @@ async def test_a_stale_split_nodes_reprobe_keeps_crediting_its_idle_fillers_port
     """Reviewer's case: 40000-40023 declared, the closed rental held 40000-40002 and our idle filler holds
     40020-40023. The re-probe skips the filler's four like the first probe; they still count, so 20 + 4 = 24."""
     probe = Firewalled(blocked=set())
-    ctx = stale_split_ctx(context_factory, probe, 40023, filler_ports=[40020, 40021, 40022, 40023])
+    fillers = [40020, 40021, 40022, 40023]
+    still_running = RentedExecutorsResponse(executors={}, filler_ports_by_executor={EXECUTOR_UUID: fillers})
+    ctx = stale_split_ctx(context_factory, probe, 40023, filler_ports=fillers, rented_now=still_running)
 
     _, ctx = await apply(ctx, PortConnectivityCheck())
     _, ctx = await apply(ctx, PortCountCheck())
@@ -1211,3 +1213,49 @@ async def test_an_ssh_drop_during_the_port_probe_is_reported_as_a_lost_connectio
     if reason == "PORT_VERIFY_FAILED":
         assert "SSH connection closed" in count_result.event.what_we_saw["details"]
         assert "lost its connection" in count_result.event.remediation
+
+
+def stale_ctx(context_factory, probe, rented_now=None):
+    """Not a split node; declares 40000-40010 and its only rental, on 40000-40002, closed during the cycle."""
+    from dataclasses import replace
+
+    ctx = stale_split_ctx(context_factory, probe, 40010, rented_now=rented_now)
+    state = replace(ctx.state, supports_gpu_splitting=False, gpu_splitting_min_count=None)
+    return ctx.model_copy(update={"state": state})
+
+
+@pytest.mark.asyncio
+async def test_dah6548_a_node_forwarding_only_the_stale_rentals_ports_is_reprobed_and_verified(context_factory):
+    """The probe skipped the rental's 40000-40002, the only ports that answer, and read 0; every pod is stale after
+    the port step. The node is re-probed, so rental verification gets ports instead of "No verified ports"."""
+    probe = Firewalled(blocked=set(range(40003, 40011)))
+    ctx = stale_ctx(context_factory, probe)
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    count_result, ctx = await apply(ctx, PortCountCheck())
+    assert count_result.passed is True  # rented at the snapshot: exempt
+    assert ctx.state.specs["available_port_count"] < MIN_PORT_COUNT
+    tenant_result, ctx = await apply(ctx, TenantEnforcementCheck())
+
+    assert tenant_result.passed is True
+    assert tenant_result.event.reason_code == TenantEnforcementMessages.STALE_POD_NOT_RUNNING.reason
+    assert ctx.state.specs["verified_ports"] and set(ctx.state.specs["verified_ports"]) <= {40000, 40001, 40002}
+    assert ctx.state.specs["available_port_count"] == tenant_result.updates["port_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_dah6548_a_stale_node_whose_rented_list_cannot_be_read_is_withheld(context_factory):
+    ctx = stale_ctx(context_factory, Firewalled(blocked=set(range(40003, 40011))))
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    _, ctx = await apply(ctx, PortCountCheck())
+    ctx.services.backend.rented_now = None
+
+    async def unreadable():
+        return None
+
+    ctx.services.backend.get_rented_executors_now = unreadable
+    tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
+
+    assert tenant_result.passed is False
+    assert tenant_result.event.reason_code == PortCountMessages.VERDICT_WITHHELD_FREED_PORT_REPROBE.reason
+    assert tenant_result.updates["rented"] is False

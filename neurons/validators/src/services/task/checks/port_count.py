@@ -11,6 +11,7 @@ from services.port_utils import DEFAULT_PORT_RANGE_TEXT
 from ..availability import AVAILABILITY_CATEGORY, ReachSource, ReachTarget
 from ..messages import PortConnectivityMessages, PortCountMessages as Msg, render_message
 from ..pipeline import CheckResult, Context, ContextState
+from .freed_port_reprobe import reprobe_freed_ports, withheld_result
 from .rental_owner import uuid_listed_under_another_miner, rental_of_this_node
 
 logger = logging.getLogger(__name__)
@@ -222,6 +223,16 @@ class PortCountCheck:
             )
 
         split_need = split_port_requirement(ctx.state)
+        required = split_need[1] if split_need else MIN_PORT_COUNT
+        if not is_rented and port_count < required:
+            # DAH-6548: a rental or filler that ended during the cycle freed ports the probe skipped
+            reprobe = await reprobe_freed_ports(ctx, min_ports=required)
+            if reprobe is not None and reprobe.withheld:
+                return withheld_result(ctx, self.check_id, reprobe.withheld)
+            if reprobe is not None:
+                ctx = ctx.model_copy(update={"state": reprobe.state})
+                port_count, is_rented, updated_state = self._count(ctx, reprobe.state.rented_data)
+
         if not is_rented and split_need and MIN_PORT_COUNT <= port_count < split_need[1]:
             # a rent or filler that started after the cycle's rental snapshot holds ports the probe found
             # busy; re-read the backend once before failing, and a backend that does not answer keeps it

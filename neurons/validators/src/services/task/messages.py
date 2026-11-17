@@ -1613,6 +1613,15 @@ class PortCountMessages:
         category="runtime",
         impact="No score this cycle; the listing stays as the last completed port check left it",
     )
+    # DAH-6548: a rental or filler ended during the cycle and freed ports its probe skipped; the re-probe of those
+    # ports could not run or finish, so the cycle is withheld like the deferral above (once in a row per node)
+    VERDICT_WITHHELD_FREED_PORT_REPROBE = MessageTemplate(
+        event="Ports freed during the cycle could not be re-probed; this cycle's verdict is withheld",
+        reason="PORT_VERDICT_WITHHELD_REPROBE",
+        severity="info",
+        category="runtime",
+        impact="No score this cycle; the listing stays as the last completed port check left it",
+    )
     INSUFFICIENT_PORTS = MessageTemplate(
         event="Insufficient available ports",
         reason="INSUFFICIENT_PORTS",

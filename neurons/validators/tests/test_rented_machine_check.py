@@ -213,6 +213,10 @@ class DummyBackendClient:
             status=self.status,
         )
 
+    async def get_rented_executors_now(self):
+        # DAH-6548: the freed-port re-probe reads the rented list; nothing is rented now
+        return RentedExecutorsResponse(executors={})
+
     async def report_pod_host_reboot_recovered(self, pod_id: str, container_finished_at: str):
         self.host_reboot_recoveries.append((pod_id, container_finished_at))
         return Mock(recorded=True)
