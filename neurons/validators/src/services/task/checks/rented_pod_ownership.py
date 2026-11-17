@@ -228,8 +228,8 @@ class RentedPodOwnershipCheck:
         pids = {(name, pid) for name, pid, _, _ in procs}
         youngest: dict[str, int] = {}
         for name, _, ppid, age_s in procs:
-            # sysbox-fs and sysbox-mgr re-exec themselves for short-lived helpers (nsenter into a pod on each
-            # /proc read): a child of the same daemon is not a restart of it
+            # sysbox-fs and sysbox-mgr re-exec themselves for short-lived helpers (nsenter into a pod
+            # on each /proc read): a child of the same daemon is not a restart of it
             if (name, ppid) not in pids:
                 youngest[name] = min(age_s, youngest.get(name, age_s))
         pod_age = {}
