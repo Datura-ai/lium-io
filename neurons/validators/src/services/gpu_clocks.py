@@ -360,7 +360,10 @@ async def reset_pod_clock_locks(
     indexed = list(dict.fromkeys(str(u) for raw in (raw_index, raw_legacy) if raw for u in json.loads(raw)))
     # hold only the GPUs this pod owns (review): the legacy index is per pod only, so holding all of it made the old
     # node's delete wait on the new node's GPU lock
-    candidates = [uuid for uuid in indexed if _owned_by(await _record(redis, uuid), pod_id, miner_hotkey, executor_id)]
+    records = {uuid: await _record(redis, uuid) for uuid in indexed}
+    candidates = [uuid for uuid in indexed if _owned_by(records[uuid], pod_id, miner_hotkey, executor_id)]
+    if any("miner_hotkey" not in records[uuid] for uuid in candidates):
+        candidates = await _on_this_host(runner, candidates, records)
     async with _holding(candidates):  # re-read under the lock: no other pod's lock between the owner read and the reset
         owned = [u for u in candidates if _owned_by(await _record(redis, u), pod_id, miner_hotkey, executor_id)]
         failures = await _reset_gpu_clocks(runner, redis, owned)
@@ -369,6 +372,17 @@ async def reset_pod_clock_locks(
         left = [u for u in json.loads(raw_legacy) if u not in owned]
         await (redis.set(_legacy_pod_key(pod_id), json.dumps(left)) if left else redis.delete(_legacy_pod_key(pod_id)))
     return sum(1 for failure in failures.values() if failure is None)
+
+
+async def _on_this_host(runner: SSHCommandRunner, candidates: list[str], records: dict[str, dict]) -> list[str]:
+    """A legacy record has no miner hotkey, so it cannot tell two miners' same executor id apart (review): keep it
+    only for a GPU on the addressed host. An unread host keeps every legacy record for the next create's reset."""
+    try:
+        host = await _run(runner, HOST_GPUS_COMMAND)
+        on_host = {gpu.uuid for gpu in parse_host_gpus(host.stdout or "")} if host.exit_code == 0 else set()
+    except Exception:
+        on_host = set()
+    return [uuid for uuid in candidates if "miner_hotkey" in records[uuid] or uuid in on_host]
 
 
 async def _record(redis: RedisService, uuid: str) -> dict:

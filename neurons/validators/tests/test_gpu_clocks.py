@@ -428,6 +428,37 @@ async def test_a_legacy_indexed_delete_does_not_wait_on_the_moved_pods_new_node_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("host_read", ["lists_only_own_gpu", "fails"])
+async def test_a_legacy_record_of_another_miners_same_executor_id_is_neither_held_nor_reset(host_read):
+    """Review: a legacy record has no hotkey; only a GPU on the addressed host is taken, an unread host takes none."""
+    import asyncio
+
+    from services.gpu_clocks import _holding
+
+    host, redis = FakeHost(), FakeRedis()
+    host.gpus = "0, " + U[0] + ", " + BUS[0] + ", Disabled"
+    if host_read == "fails":
+        answer = host.run
+
+        async def failing_host_read(cmd, **kw):
+            if cmd.startswith("nvidia-smi --query-gpu=index,uuid"):
+                return make_command_result(False, "", exit_code=1)
+            return await answer(cmd, **kw)
+
+        host.run = failing_host_read
+    redis.store["gpu_clock_lock_pod:pod1"] = json.dumps([U[0], U[1]])
+    for uuid in (U[0], U[1]):  # U[1] is miner B's GPU behind the same executor id
+        redis.store[f"gpu_clock_lock:{uuid}"] = json.dumps({"pod_id": "pod1", "executor_id": "ex"})
+
+    async with _holding([U[1]]):  # B's GPU is busy
+        reset = await asyncio.wait_for(reset_pod_clock_locks(host, redis, "pod1", "hk", "ex"), 1)
+
+    assert reset == (1 if host_read == "lists_only_own_gpu" else 0)
+    assert not any(" -rgc " in c and U[1] in c for c in host.commands)
+    assert f"gpu_clock_lock:{U[1]}" in redis.store
+
+
+@pytest.mark.asyncio
 async def test_teardown_without_a_lock_costs_no_ssh_and_a_whole_node_create_checks_every_host_gpu():
     host = FakeHost()
     redis = FakeRedis()
