@@ -1814,3 +1814,13 @@ def test_authorized_keys_append_runs_under_busybox_ash(tmp_path):
 
     assert completed.returncode == 0, completed.stderr
     assert target.read_text() == "k1\n"
+
+
+# --- DAH-6302: a CPU share of 0 never means no CPU limit ---
+
+
+@pytest.mark.parametrize(("cpu_count", "nano_cpus"), [(0, 1_000_000_000), (3, 3_000_000_000), (None, None)])
+def test_a_cpu_share_that_rounded_down_to_0_gets_one_core_not_no_limit(cpu_count, nano_cpus):
+    spec = ContainerRunSpec(image="registry.example/app:tag", name="pod_test", cpu_count=cpu_count)
+
+    assert rental_docker_sdk._build_host_config_kwargs(spec).get("nano_cpus") == nano_cpus

@@ -378,6 +378,11 @@ class ContainerRunSpec:
     # on the host; may raise ContainerCreateRefused, and the created container is then left unstarted
     before_start: Callable[[list[str]], None] | None = field(default=None, repr=False, compare=False)
 
+    def __post_init__(self) -> None:
+        # DAH-6302: Docker reads nano_cpus 0 as no limit, so a share that rounded down to 0 gets one core
+        if self.cpu_count is not None:
+            self.cpu_count = max(self.cpu_count, 1)
+
 
 @dataclass(slots=True)
 class ContainerExecSpec:
