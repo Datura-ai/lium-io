@@ -4074,6 +4074,16 @@ async def test_create_container_uses_keepalives_and_sdk_pull(
     ]
 
 
+def _pull_wrapped_not_reopened() -> Exception:
+    refused = RentalDockerTransportNotReopened(
+        "Docker SDK pull failed on a dropped SSH transport and the transport could not be re-opened"
+    )
+    try:
+        raise RentalDockerOperationError("Docker SDK pull failed") from refused
+    except RentalDockerOperationError as wrapped:
+        return wrapped
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("pull_error", "expected_step"),
@@ -4087,6 +4097,8 @@ async def test_create_container_uses_keepalives_and_sdk_pull(
             ),
             "ssh_connect",
         ),
+        # as the real pull() raises it: wrapped, with the refusal as its __cause__
+        (_pull_wrapped_not_reopened(), "ssh_connect"),
     ],
 )
 async def test_create_container_reports_docker_pull_failure_step(

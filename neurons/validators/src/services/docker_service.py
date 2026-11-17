@@ -215,13 +215,13 @@ from services.rental_docker_sdk import (
     RentalDockerOperationError,
     RentalDockerSdkClient,
     RentalDockerSdkClientFactory,
-    RentalDockerTransportNotReopened,
     VolumeMount,
     build_authorized_keys_exec_spec,
     build_container_command_argv,
     keep_alive_command_for,
     is_docker_container_not_running_error,
     is_docker_not_found_error,
+    is_transport_not_reopened,
     is_rental_docker_transport_drop,
     build_environment_exec_spec,
     build_remove_authorized_keys_exec_spec,
@@ -12096,7 +12096,7 @@ class DockerService:
             last_exc = _last_attempt_exception(e)
             # a new SSH connection to the node failed mid-step: the node stopped answering whatever the step ran,
             # so the step in progress (docker_pull: "check the image") would point the renter at their image
-            reported_step = "ssh_connect" if isinstance(last_exc, RentalDockerTransportNotReopened) else current_step
+            reported_step = "ssh_connect" if is_transport_not_reopened(last_exc) else current_step
             log_tail = last_exc.log_tail if isinstance(last_exc, ImageExitedDuringKeyInjection) else ""
             log_text = _m(
                 "Failed create_container",

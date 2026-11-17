@@ -269,6 +269,18 @@ def is_docker_not_found_error(exc: BaseException) -> bool:
     return False
 
 
+def is_transport_not_reopened(exc: BaseException) -> bool:
+    """True when `exc` or an explicit cause under it is a transport that could not be re-opened."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, RentalDockerTransportNotReopened):
+            return True
+        current = current.__cause__  # e.g. pull() wraps it in RentalDockerOperationError
+    return False
+
+
 def is_docker_container_not_running_error(exc: BaseException) -> bool:
     """True when the exception, or any cause under it, is Docker's 409 refusing an exec on a stopped container."""
     seen: set[int] = set()
