@@ -9,6 +9,7 @@ import uvicorn
 
 from core.config import settings
 from core.logger import get_logger
+from middlewares.body_limit import BodySizeLimitMiddleware
 from middlewares.miner import MinerMiddleware
 from routes.apis import apis_router
 from services.cache_template_service import run_cache_template_prefetch
@@ -76,6 +77,8 @@ app = FastAPI(
 
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
 app.add_middleware(MinerMiddleware)
+# added last, so it runs first: no body past the ceiling reaches the auth check that reads it
+app.add_middleware(BodySizeLimitMiddleware)
 app.include_router(apis_router)
 
 reload = True if settings.ENV == "dev" else False
