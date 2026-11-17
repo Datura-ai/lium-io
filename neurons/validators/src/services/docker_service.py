@@ -3700,7 +3700,7 @@ class DockerService:
                 flatten_lease=flatten_lease,
                 pod_id=pod_id,
             )
-            await apply_host_memory_guard(ssh_client, [container_name], default_extra)
+            await apply_host_memory_guard(ssh_client, default_extra)
             return container_id
         finally:
             for lease in flatten_lease:

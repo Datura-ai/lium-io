@@ -1,5 +1,5 @@
-"""DAH-6379: the host memory guard sets memory.oom.group on the pod's cgroup and MemoryMin on the host
-services, in a script that parses, and never fails the caller."""
+"""DAH-6379: the host memory guard sets MemoryMin on the host services, in a script that parses, and never
+fails the caller."""
 
 from __future__ import annotations
 
@@ -10,12 +10,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from core.config import settings
 from services.host_memory_guard import (
     EXECUTOR_MEMORY_MIN_MIB,
     MIB,
     UNIT_MEMORY_MIN_MIB,
-    _OOM_GROUP_SCRIPT,
     _host_memory_min_script,
     apply_host_memory_guard,
     host_memory_guard_script,
@@ -23,22 +21,12 @@ from services.host_memory_guard import (
 )
 
 
-def test_script_is_valid_sh_and_targets_each_pod_cgroup(monkeypatch):
-    monkeypatch.setattr(settings, "POD_OOM_GROUP_ENABLED", True)
-    script = host_memory_guard_script(["pod_1", "pod_$(x)"])
+def test_script_is_valid_sh_and_writes_only_memory_min():
+    script = host_memory_guard_script()
 
     assert subprocess.run(["sh", "-n", "-c", script], check=False).returncode == 0
-    assert "'pod_$(x)'" in script
-    assert "system.slice/docker-$id.scope" in script and "memory.oom.group" in script
-
-
-def test_oom_group_off_by_default_writes_only_memory_min(monkeypatch):
-    monkeypatch.setattr(settings, "POD_OOM_GROUP_ENABLED", False)
-
-    script = host_memory_guard_script(["pod_1"])
-
-    assert "memory.oom.group" not in script
     assert _host_memory_min_script() in script
+    assert "memory.oom.group" not in script
 
 
 @pytest.mark.asyncio
@@ -46,7 +34,7 @@ async def test_apply_never_raises_on_ssh_failure():
     async def run(*args, **kwargs):
         raise OSError("connection lost")
 
-    result = await apply_host_memory_guard(SimpleNamespace(run=run), ["pod_1"])
+    result = await apply_host_memory_guard(SimpleNamespace(run=run))
 
     assert result["failed"] == ["ssh OSError('connection lost')"]
 
@@ -57,33 +45,6 @@ def _fake_bin(tmp_path, name, body):
     path.write_text("#!/bin/sh\n" + body)
     path.chmod(0o755)
     return path
-
-
-def test_oom_group_is_set_once_on_the_pod_scope(tmp_path):
-    scope = tmp_path / "root/sys/fs/cgroup/system.slice/docker-abc.scope"
-    scope.mkdir(parents=True)
-    (scope / "memory.oom.group").write_text("0\n")
-    docker = _fake_bin(tmp_path, "docker", "echo abc\n")
-    script = _OOM_GROUP_SCRIPT % {"names": "pod_1"}
-    script = script.replace("/proc/1/root", str(tmp_path / "root")).replace("/usr/bin/docker", str(docker))
-
-    first = subprocess.run(["sh", "-c", script], capture_output=True, text=True, check=False)
-    second = subprocess.run(["sh", "-c", script], capture_output=True, text=True, check=False)
-
-    assert (scope / "memory.oom.group").read_text().strip() == "1"
-    assert first.stdout.split() == ["oom_group_set", "abc"]
-    assert second.stdout == ""
-
-
-def test_oom_group_reports_a_pod_without_a_cgroup_v2_scope(tmp_path):
-    (tmp_path / "root/sys/fs/cgroup").mkdir(parents=True)
-    docker = _fake_bin(tmp_path, "docker", "echo abc\n")
-    script = _OOM_GROUP_SCRIPT % {"names": "pod_1"}
-    script = script.replace("/proc/1/root", str(tmp_path / "root")).replace("/usr/bin/docker", str(docker))
-
-    out = subprocess.run(["sh", "-c", script], capture_output=True, text=True, check=False).stdout
-
-    assert parse_guard_output(out) == {"set": [], "failed": ["oom_group abc no_cgroup_v2_scope"], "events": []}
 
 
 UNITS_MIB = sum(UNIT_MEMORY_MIN_MIB.values()) - UNIT_MEMORY_MIN_MIB["ssh.service"]
@@ -182,44 +143,13 @@ def test_memory_min_reports_a_refused_set_property_and_an_unknown_executor_path(
 @pytest.mark.asyncio
 async def test_unapplied_settings_log_a_warning_with_the_node_and_reason(caplog):
     async def run(*args, **kwargs):
-        return SimpleNamespace(stdout="oom_group_set abc\nmemory_min_skipped no_systemd\n")
+        return SimpleNamespace(stdout="memory_min_set docker.service\nmemory_min_skipped no_systemd\n")
 
     with caplog.at_level("WARNING"):
-        result = await apply_host_memory_guard(SimpleNamespace(run=run), ["pod_1"], {"executor_uuid": "node-1"})
+        result = await apply_host_memory_guard(SimpleNamespace(run=run), {"executor_uuid": "node-1"})
 
-    assert result == {"set": ["oom_group abc"], "failed": ["memory_min no_systemd"], "events": []}
+    assert result == {"set": ["memory_min docker.service"], "failed": ["memory_min no_systemd"]}
     warning = [r for r in caplog.records if r.levelname == "WARNING"]
     assert len(warning) == 1
     extra = warning[0].msg.extra
     assert extra["executor_uuid"] == "node-1" and extra["failed"] == ["memory_min no_systemd"]
-
-
-def _run_oom_group(tmp_path, inspect_line: str, parent_events: str | None = None):
-    scope = tmp_path / "root/sys/fs/cgroup/docker/abc"
-    scope.mkdir(parents=True, exist_ok=True)
-    (scope / "memory.oom.group").write_text("0\n")
-    if parent_events is not None:
-        (scope.parent / "memory.events").write_text(parent_events)
-    docker = _fake_bin(tmp_path, "docker", f"echo '{inspect_line}'\n")
-    script = _OOM_GROUP_SCRIPT % {"names": "pod_1"}
-    script = script.replace("/proc/1/root", str(tmp_path / "root")).replace("/usr/bin/docker", str(docker))
-    return parse_guard_output(subprocess.run(["sh", "-c", script], capture_output=True, text=True, check=False).stdout)
-
-
-def test_oom_group_reset_by_a_pod_restart_is_reported_with_the_restart_count(tmp_path):
-    result = _run_oom_group(tmp_path, "abc 3")
-
-    assert result["set"] == ["oom_group abc"]
-    assert result["events"] == ["oom_group_reset_after_restart abc 3"]
-
-
-def test_group_oom_kills_are_read_from_the_pods_parent_cgroup(tmp_path):
-    result = _run_oom_group(tmp_path, "abc 0", parent_events="low 0\nhigh 0\nmax 4\noom 2\noom_kill 2\noom_group_kill 2\n")
-
-    assert result["events"] == ["oom_group_kill_total docker 2"]
-
-
-def test_no_event_without_a_restart_or_a_kill(tmp_path):
-    result = _run_oom_group(tmp_path, "abc 0", parent_events="oom_group_kill 0\n")
-
-    assert result == {"set": ["oom_group abc"], "failed": [], "events": []}
