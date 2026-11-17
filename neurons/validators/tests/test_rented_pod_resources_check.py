@@ -11,6 +11,7 @@ from unittest.mock import ANY, patch
 import asyncssh
 import pytest
 from neurons.validators.src.services.task.checks.rented_pod_resources import (
+    _INIT_READ_SCRIPT,
     RentedPodResourcesCheck,
     pod_verdict_updates,
 )
@@ -273,3 +274,8 @@ def test_a_later_checks_verdict_keeps_the_earlier_checks_codes(context_factory):
     second = pod_verdict_updates(ctx, {"pod_1": [], "pod_x": ["CODE"]})["state"]
     assert second.rented_pod_faults == {"1": [Msg.PROC_FUSE_DISCONNECTED.reason]}
     assert pod_verdict_updates(context_factory(state=build_state(), ssh=None), {"pod_1": []}) == {}
+
+
+def test_the_newest_sysbox_fs_is_timed_against_the_pod():
+    # an old sysbox-fs left running beside a restarted one would read as older than the pod and hide the restart
+    assert "pgrep -xn sysbox-fs" in _INIT_READ_SCRIPT

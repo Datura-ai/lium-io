@@ -35,12 +35,13 @@ MIN_RENTAL_CPU_SHARE = 0.95
 _DEFAULT_CPU_PERIOD_US = 100_000
 # Per init PID: oom_score_adj, then (cgroup v2) the effective cpuset and every cpu.max from the pod's
 # cgroup up to the root, so a host that writes the cgroup directly (not via docker update) is seen too.
-# Then 1 when the host's sysbox-fs is gone or younger than the pod's init (it died or restarted under the pod),
+# Then 1 when the host's newest sysbox-fs is gone or younger than the pod's init (it died or restarted under the pod;
+# the newest, as an old one left running beside a restarted one would read as older than the pod),
 # and last the error of one read of the pod's own /proc/sys, which a dead sysbox-fs FUSE mount answers with
 # "Transport endpoint is not connected" while the container keeps running. Only both together are a host fault:
 # a renter can stack and kill their own FUSE mount on /proc/sys, but cannot restart the host's sysbox-fs.
 _INIT_READ_SCRIPT = (
-    "se=$(ps -o etimes= -p \"$(pgrep -xo sysbox-fs)\" 2>/dev/null | tr -d ' '); "
+    "se=$(ps -o etimes= -p \"$(pgrep -xn sysbox-fs)\" 2>/dev/null | tr -d ' '); "
     "sb=$(command -v sysbox-fs >/dev/null 2>&1 && echo 1); "
     "for p in {pids}; do "
     "o=$(cat /proc/$p/oom_score_adj 2>/dev/null); cs=; cm=; "
