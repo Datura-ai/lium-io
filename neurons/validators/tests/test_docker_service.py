@@ -11730,9 +11730,11 @@ async def test_retry_half_started_stop_without_a_recorded_id_does_not_take_a_slo
     docker_service, monkeypatch
 ):
     # F-66/F-64: synchronized clocks, created 14:00:04.5, failure recorded 14:00:05, Docker's clock reply arrives 1 s
-    # after it was read: taking the delay as skew moved creation past the failure and dropped the stop unread
+    # after it was read: taking the delay as skew moved creation past the failure and dropped the stop unread. The
+    # delay spans the failure, so the stop stays pending; a prompt reply on the next check stops the unmounted run
     run = _mount_reads(docker_service, monkeypatch, 1)
     docker_service.redis_service.hget = AsyncMock(return_value=_pending_record(identity="", plaintext_path="/workspace"))
+    docker_service.redis_service.hdel = AsyncMock()
     client = docker_service.rental_docker_client_factory.client
     client.running = True
     client.identity = "cid@2026-11-16T14:00:04.5Z"
@@ -11745,10 +11747,46 @@ async def test_retry_half_started_stop_without_a_recorded_id_does_not_take_a_slo
         return sampled
 
     client.host_time = slow_reply
+    kwargs = dict(executor_info=Mock(uuid="exec-1"), private_key="private-key", pod_id="pod-id", default_extra={})
 
-    stopped = await docker_service.retry_half_started_stop(
-        executor_info=Mock(uuid="exec-1"), private_key="private-key", pod_id="pod-id", default_extra={}
-    )
+    first = await docker_service.retry_half_started_stop(**kwargs)
+    stopped_after_first = list(client.stopped_containers)
+    client.host_time = read_host_time
+    second = await docker_service.retry_half_started_stop(**kwargs)
 
-    run.assert_awaited()
-    assert stopped is True and client.stopped_containers == ["pod_test"]
+    assert first is False and stopped_after_first == []
+    run.assert_awaited_once()
+    assert second is True and client.stopped_containers == ["pod_test"]
+
+
+@pytest.mark.asyncio
+async def test_retry_half_started_stop_without_a_recorded_id_keeps_a_replacement_inside_the_reply_delay_pending(
+    docker_service, monkeypatch
+):
+    # synchronized clocks, failure recorded 14:00:05, a replacement created 14:00:05.5 whose mount has not landed, and
+    # Docker samples its clock 1 s after our send: the delay spans the failure, so the replacement is neither taken
+    # for the recorded run and stopped mid-start nor is the stop dropped; a prompt reply next check shows it re-created
+    run = _mount_reads(docker_service, monkeypatch, 1)
+    docker_service.redis_service.hget = AsyncMock(return_value=_pending_record(identity="", plaintext_path="/workspace"))
+    docker_service.redis_service.hdel = AsyncMock()
+    client = docker_service.rental_docker_client_factory.client
+    client.running = True
+    client.identity = "cid2@2026-11-16T14:00:05.5Z"
+    client.created = "2026-11-16T14:00:05.5Z"
+    read_host_time = client.host_time
+
+    async def delayed_sample():
+        await asyncio.sleep(1)
+        return await read_host_time()
+
+    client.host_time = delayed_sample
+    kwargs = dict(executor_info=Mock(uuid="exec-1"), private_key="private-key", pod_id="pod-id", default_extra={})
+
+    first = await docker_service.retry_half_started_stop(**kwargs)
+    pending_after_first = docker_service.redis_service.hdel.await_count
+    client.host_time = read_host_time
+    second = await docker_service.retry_half_started_stop(**kwargs)
+
+    assert first is False and pending_after_first == 0 and client.stopped_containers == []
+    run.assert_not_awaited()
+    assert second is True and docker_service.redis_service.hdel.await_count == 1

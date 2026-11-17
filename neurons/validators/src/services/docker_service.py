@@ -12950,7 +12950,8 @@ class DockerService:
         The recorded container is stopped while its encrypted volume is unmounted, across restarts (same id); a
         re-created one is left alone, a mounted one kept, an unread mount stays pending. A pod with no encrypted volume
         is stopped only in the very run recorded (without its id: while its StartedAt is not after the failure; a
-        container created after the failure is a re-created one).
+        container created after the failure is a re-created one; one the clock offset's bounds put on both sides of the
+        failure stays pending).
         None when none is pending; True once it is stopped or no longer that run (record dropped); False (logged)
         while it still may run."""
         extra = {**default_extra, "pod_id": pod_id}
@@ -12999,6 +13000,10 @@ class DockerService:
                     # mount read) only when created after the failure at the earliest our clock allows
                     created_at = _docker_time(await docker_client.container_created(container_name=container_name))
                     replaced = created_at - skew_high > failed_at
+                    if not replaced and created_at - skew_low > failed_at:
+                        # the reply's delay spans the failure: either verdict could stop a replacement mid-start or drop
+                        # the recorded run's stop, so neither is taken; the next check measures the offset afresh
+                        raise RentalDockerOperationError("the container's creation is within the clock offset's bounds")
                 # a Docker auto-restart (unless-stopped) keeps the container and changes StartedAt: the mount decides
                 mount = (
                     None
