@@ -47,8 +47,9 @@ def handle_event(event: dict, client) -> bool:
 
 def _watch_forever() -> None:
     # a reconnect resumes from the last event's second, so a pod restarted while the stream was down is still
-    # recovered; the events of that second it replays are skipped by (id, timeNano)
-    since = None
+    # recovered; the events of that second it replays are skipped by (id, timeNano). The cursor starts at the
+    # watcher's start, so a drop before the first event still resumes from there, not from "now"
+    since = int(time.time())
     seen: set = set()
     while True:
         try:

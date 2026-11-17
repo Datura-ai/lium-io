@@ -69,6 +69,7 @@ def test_a_reconnect_resumes_from_the_last_event_and_skips_the_replayed_one(monk
     client.events.side_effect = events
     monkeypatch.setattr(svc.docker, "from_env", lambda: client)
     monkeypatch.setattr(svc.time, "sleep", lambda s: None)
+    monkeypatch.setattr(svc.time, "time", lambda: 90.5)  # the watcher's start: its first cursor
     monkeypatch.setattr(svc, "handle_event", lambda e, c: handled.append(e["id"]))
 
     try:
@@ -76,5 +77,5 @@ def test_a_reconnect_resumes_from_the_last_event_and_skips_the_replayed_one(monk
     except KeyboardInterrupt:
         pass
 
-    assert sinces == [None, 100]
+    assert sinces == [90, 100]
     assert handled == ["a", "b"]
