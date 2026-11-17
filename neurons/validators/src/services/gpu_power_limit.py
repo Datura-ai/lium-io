@@ -654,6 +654,46 @@ async def _set_applied_cap_on_restore_record(
         _log(logging.ERROR, f"gpu power cap: redis failed while stamping the applied cap on {gpu_uuid}: {exc}", {"gpu_uuid": gpu_uuid}, log_extra)
 
 
+async def reapply_filler_cap_after_restart(
+    ssh: asyncssh.SSHClientConnection,
+    redis: RedisService,
+    record: GpuPowerRestoreRecord,
+    found_watts: int | None,
+    log_extra: dict[str, object] | None,
+) -> bool:
+    """Set our cap again on a GPU whose filler container started after we capped it (DAH-6555): a host reboot
+    resets the limit and docker restarts the filler by its restart policy, uncapped. That is not a host revert.
+    True when the set stuck; the record's ``capped_at`` then moves to now, so a later raise without a restart
+    is judged as a revert again. False (nothing changed on the record) when the cap could not be set."""
+    if record.capped_to_watts is None:
+        return False
+    outcome = await _set_alone(
+        ssh, "cap", record.executor_id, record.gpu_uuid, found_watts, record.capped_to_watts, log_extra
+    )
+    if outcome.failure is not None:
+        return False
+    _log(
+        logging.INFO,
+        f"gpu power cap re-applied after the host restarted the filler: executor={record.executor_id} "
+        f"pod={record.pod_id} gpu={record.gpu_uuid} watts {found_watts} -> {record.capped_to_watts}",
+        {"executor_uuid": record.executor_id, "gpu_uuid": record.gpu_uuid, "pod_id": record.pod_id},
+        log_extra,
+    )
+    key = _restore_key(record.gpu_uuid)
+    try:
+        raw: str | bytes | None = await redis.get(key)
+        if raw:
+            stored = GpuPowerRestoreRecord.model_validate_json(raw)
+            # same rule as the first cap: only a cap that holds with persistence on can accuse later (DAH-2702)
+            applied = record.capped_to_watts if outcome.persistence_enabled else None
+            await redis.set(
+                key, stored.model_copy(update={"capped_at": time.time(), "capped_to_watts": applied}).model_dump_json()
+            )
+    except Exception as exc:
+        _log(logging.ERROR, f"gpu power cap: could not refresh the record of {record.gpu_uuid} after a re-cap: {exc}", {"gpu_uuid": record.gpu_uuid}, log_extra)
+    return True
+
+
 async def read_gpu_power_restore_records(
     redis: RedisService,
     gpu_uuids: list[str],

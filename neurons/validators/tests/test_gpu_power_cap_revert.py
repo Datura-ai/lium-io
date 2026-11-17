@@ -12,6 +12,7 @@ This suite covers the three halves: the rule, the recording, and the incentive g
 """
 
 import asyncio
+import dataclasses
 import json
 import logging
 import time
@@ -817,3 +818,96 @@ async def test_enforcement_ships_off() -> None:
     default = type(settings).model_fields["ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT"].default
 
     assert default is False
+
+
+# ---------------------------- DAH-6555: a host reboot under our live cap ----------------------------
+
+
+def _docker_time(unix: float) -> str:
+    """What docker inspect prints for .State.StartedAt: RFC 3339 in UTC with nanoseconds."""
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(unix)) + ".123456789Z"
+
+
+def host_that_restarted_the_filler(started_at: float, set_exit_status: int = 0, readback_watts: int = 280) -> AsyncMock:
+    """SSH to a host whose filler container started at `started_at` and that answers nvidia-smi -pm/-pl/readback."""
+    commands: list[str] = []
+
+    async def run(command: str, **_kwargs) -> FakeRun:
+        commands.append(command)
+        if command.startswith("/usr/bin/docker inspect"):
+            return FakeRun(stdout=f"/filler_{POD_ID} true {_docker_time(started_at)}\n")
+        if " -pl " in command:
+            return FakeRun(exit_status=set_exit_status, stderr="" if set_exit_status == 0 else "not permitted")
+        if "--query-gpu=power.limit,persistence_mode" in command:
+            return FakeRun(stdout=f"{readback_watts}.00, Enabled\n")
+        return FakeRun()
+
+    ssh = AsyncMock()
+    ssh.run.side_effect = run
+    ssh.commands = commands
+    return ssh
+
+
+async def _check_after_reboot(context_factory, monkeypatch, ssh: AsyncMock, capped_hours_ago: float = 1.0):
+    record = _record().model_copy(update={"capped_at": time.time() - capped_hours_ago * 3600})
+    redis = FakeRedis({_restore_key("GPU-a"): record.model_dump_json()})
+    monkeypatch.setattr(
+        check_module,
+        "read_gpu_power_restore_records",
+        AsyncMock(return_value=GpuPowerRestoreReadResult(records=[record], read_failed=False)),
+    )
+    details = [{
+        "name": "NVIDIA L40S", "uuid": "GPU-a",
+        "power_limit": 400.0, "power_default_limit": 400.0, "power_max_limit": 450.0,
+    }]
+    state = _running_filler_state(("GPU-a", 400.0))
+    state = dataclasses.replace(state, specs={"gpu": {"count": 1, "details": details}})
+    ctx = context_factory(state=state, services=build_services(redis=redis), ssh=ssh)
+
+    result = await GpuPowerLimitCheck().run(ctx)
+
+    assert result.passed is True
+    return result, redis
+
+
+@pytest.mark.asyncio
+async def test_a_filler_restarted_after_our_cap_gets_the_cap_again_and_no_revert(context_factory, monkeypatch) -> None:
+    # 136 of 171 PEARL power-cap stops in 14 days (to 17 Nov) followed a host reboot: the reboot reset the limit and
+    # docker started the filler again by its restart policy, uncapped. That is no host revert: we cap it again.
+    ssh = host_that_restarted_the_filler(started_at=time.time() - 600)
+
+    result, redis = await _check_after_reboot(context_factory, monkeypatch, ssh)
+
+    assert any(" -pl 280" in command for command in ssh.commands)
+    assert _revert_key(CHECK_EXECUTOR_UUID) not in redis.store
+    published = result.updates["state"].specs["gpu"]["details"][0]
+    assert published["power_limit"] == 280
+    assert published["power_host_limit"] == 400
+    refreshed = GpuPowerRestoreRecord.model_validate_json(redis.store[_restore_key("GPU-a")])
+    assert refreshed.capped_at > time.time() - 60  # a later revert without a reboot is judged from now
+    assert refreshed.capped_to_watts == 280
+    assert refreshed.watts == 400
+
+
+@pytest.mark.asyncio
+async def test_a_raised_cap_with_the_filler_running_since_before_it_is_still_a_revert(
+    context_factory, monkeypatch
+) -> None:
+    ssh = host_that_restarted_the_filler(started_at=time.time() - 2 * 3600)
+
+    result, redis = await _check_after_reboot(context_factory, monkeypatch, ssh)
+
+    assert not any(" -pl " in command for command in ssh.commands)
+    assert len(_stored_history(redis).reverts) == 1
+    assert result.updates["state"].specs["gpu"]["details"][0]["power_limit"] == 400.0
+
+
+@pytest.mark.asyncio
+async def test_a_cap_that_cannot_be_set_again_after_a_reboot_is_still_a_revert(context_factory, monkeypatch) -> None:
+    ssh = host_that_restarted_the_filler(started_at=time.time() - 600, set_exit_status=1)
+
+    result, redis = await _check_after_reboot(context_factory, monkeypatch, ssh)
+
+    assert any(" -pl 280" in command for command in ssh.commands)
+    assert len(_stored_history(redis).reverts) == 1
+    assert result.updates["state"].specs["gpu"]["details"][0]["power_limit"] == 400.0
