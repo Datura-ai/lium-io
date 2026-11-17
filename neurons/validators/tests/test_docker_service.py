@@ -10164,9 +10164,12 @@ async def test_a_restarting_filler_whose_first_log_read_is_empty_is_read_again_b
     log_tail = AsyncMock(side_effect=["", "", "miner v2 starting\n"])
     docker_service.rental_docker_client_factory.client.container_log_tail = log_tail
     sleep_calls: list[float] = []
+    real_sleep = asyncio.sleep
 
     async def fake_sleep(delay_seconds: float) -> None:
+        # patching asyncio.sleep reaches every coroutine: still yield, or a polling loop never lets the test run
         sleep_calls.append(delay_seconds)
+        await real_sleep(0)
 
     monkeypatch.setattr("services.docker_service.asyncio.sleep", fake_sleep)
 
