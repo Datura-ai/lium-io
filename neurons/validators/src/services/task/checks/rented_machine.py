@@ -273,6 +273,22 @@ class TenantEnforcementCheck:
         filler_container = filler_containers[0] if filler_containers else None
         await _remember_fillers(ctx, filler_containers)
 
+        if self.recover_stale_pods:
+            # F-31: a failed start whose stop and kill failed may have left a pod running without its mount. Every
+            # such stop on this node is retried before anything else, rented or not: the pod may be gone from the
+            # rental since (deleted, reassigned) while its old run still writes the renter's data unencrypted
+            try:
+                async with asyncio.timeout(
+                    min(_HALF_STARTED_STOP_CHECK_SEC, max(1.0, task_seconds_left(ctx) - POD_READ_RESERVE_SECONDS))
+                ):
+                    await ctx.services.pod_recovery.retry_pending_half_started_stops(
+                        executor_info=ctx.executor,
+                        private_key=ctx.executor_ssh_private_key,
+                        default_extra=ctx.default_extra,
+                    )
+            except Exception as exc:  # noqa: BLE001 — its own failures are logged inside; the check goes on
+                _log_recovery_failed("POD_HALF_STARTED_STOP_STILL_PENDING", ctx, None, None, exc)
+
         if not rented_executor or not rented_executor.pods:
             extra = {**ctx.default_extra, "rented": False}
             if filler_container:
@@ -326,20 +342,6 @@ class TenantEnforcementCheck:
         for pod_index, pod in enumerate(rented_pods):
             pod_container_name = pod.docker_container_name
             pod_id = pod.pod_id
-            if self.recover_stale_pods:
-                # F-31: a failed start whose stop and kill failed may have left the pod running without its mount
-                try:
-                    async with asyncio.timeout(
-                        min(_HALF_STARTED_STOP_CHECK_SEC, max(1.0, task_seconds_left(ctx) - POD_READ_RESERVE_SECONDS))
-                    ):
-                        await ctx.services.pod_recovery.retry_half_started_stop(
-                            executor_info=ctx.executor,
-                            private_key=ctx.executor_ssh_private_key,
-                            pod_id=pod_id,
-                            default_extra=ctx.default_extra,
-                        )
-                except Exception as exc:  # noqa: BLE001 — its own failures are logged inside; the check goes on
-                    _log_recovery_failed("POD_HALF_STARTED_STOP_STILL_PENDING", ctx, pod_container_name, pod_id, exc)
             try:
                 # bounded by the cycle time budget: a read hung on a dead shell ends as a TimeoutError (an OSError),
                 # so the cycle reports the node unreachable instead of being dropped without a result
@@ -1205,7 +1207,7 @@ async def _clear_leftover_recovery_mark(
         return absence_confirmed
 
 
-def _log_recovery_failed(event: str, ctx: Context, container_name: str, pod_id: str, exc: Exception) -> None:
+def _log_recovery_failed(event: str, ctx: Context, container_name: str | None, pod_id: str | None, exc: Exception) -> None:
     logger.warning(
         _m(
             event,

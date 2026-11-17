@@ -1439,8 +1439,8 @@ async def test_tenant_enforcement_defers_a_pod_its_own_restore_stopped_to_the_ne
 
 
 @pytest.mark.asyncio
-async def test_tenant_enforcement_retries_a_pending_half_started_stop_before_reading_the_pod(context_factory):
-    # F-31: a failed start whose stop and kill failed left the pod possibly running unmounted; the check stops it first
+async def test_tenant_enforcement_retries_the_nodes_pending_half_started_stops_before_reading_the_pod(context_factory):
+    # F-31: a failed start whose stop and kill failed left a pod possibly running unmounted; the check stops it first
     ssh = DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa renter"])
     docker = AsyncMock()
     docker.encrypted_volume_mount_missing.return_value = False
@@ -1448,8 +1448,23 @@ async def test_tenant_enforcement_retries_a_pending_half_started_stop_before_rea
 
     await TenantEnforcementCheck().run(ctx)
 
-    docker.retry_half_started_stop.assert_awaited_once()
-    assert docker.retry_half_started_stop.await_args.kwargs["pod_id"] == "pod-1"
+    docker.retry_pending_half_started_stops.assert_awaited_once()
+    assert docker.retry_pending_half_started_stops.await_args.kwargs["executor_info"] is ctx.executor
+
+
+@pytest.mark.asyncio
+async def test_a_node_no_longer_rented_still_retries_its_pending_half_started_stops(context_factory):
+    # gateway review: the pod was deleted or reassigned after its failed start, so the rental lists no pod, while its
+    # old run may still write without its mount; the stop is retried before the not-rented early return
+    ssh = DummySSHClient(pod_running=True, ssh_keys=[])
+    docker = AsyncMock()
+    ctx = build_recovery_context(context_factory, ssh, docker)
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, rented_data=build_rented_data("executor-123", {"containers": []}))})
+
+    result = await TenantEnforcementCheck().run(ctx)
+
+    assert result.updates["rented"] is False
+    docker.retry_pending_half_started_stops.assert_awaited_once()
 
 
 @pytest.mark.parametrize("stop_outcome", ["failed", "unknown"])

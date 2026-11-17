@@ -173,7 +173,7 @@ from services.redis_service import (
     GPU_CLOCKS_PENDING_KIND,
     GPU_RESET_PENDING_KIND,
     HALF_STARTED_STOP_PENDING_PREFIX,
-    HALF_STARTED_STOP_PENDING_TTL_SECONDS,
+    HALF_STARTED_STOP_INDEX_PREFIX,
     EDIT_PARKED_CONTAINER_AFTER_EDIT_SECONDS,
     EDIT_PARKED_CONTAINER_PREFIX,
     EDIT_PARKED_CONTAINER_TTL_SECONDS,
@@ -12683,7 +12683,7 @@ class DockerService:
                 except RentalDockerOperationError:
                     recorded = (container_name, identity, datetime.now(timezone.utc).isoformat())
                     self._stop_half_started_container_later(executor_info, private_key, recorded, pod_id, default_extra)
-                    await self._mark_half_started_stop_pending(slot, recorded, default_extra)
+                    await self._mark_half_started_stop_pending(executor_info, pod_id, recorded, default_extra)
                     raise
 
             stale_mount_error: Exception | None = None
@@ -12731,7 +12731,7 @@ class DockerService:
             task = _HALF_STARTED_STOP_LATER.pop(slot, None)
             if task:
                 task.cancel()
-            await self._forget_half_started_stop(slot, default_extra)
+            await self._forget_half_started_stop(executor_info, pod_id, default_extra)
 
     async def _stop_half_started_container(
         self, docker_client: RentalDockerSdkClient, container_name: str, default_extra: dict[str, Any]
@@ -12802,16 +12802,24 @@ class DockerService:
         )
 
     async def _mark_half_started_stop_pending(
-        self, slot: str, recorded: tuple[str, str, str], default_extra: dict[str, Any]
+        self,
+        executor_info: ExecutorSSHInfo,
+        pod_id: str,
+        recorded: tuple[str, str, str],
+        default_extra: dict[str, Any],
     ) -> None:
         container_name, identity, recorded_at = recorded
+        slot = _half_started_stop_slot(executor_info, pod_id)
         try:
             await asyncio.wait_for(
                 self.redis_service.set(
                     f"{HALF_STARTED_STOP_PENDING_PREFIX}{slot}",
                     json.dumps({"container_name": container_name, "identity": identity, "recorded_at": recorded_at}),
-                    ex=HALF_STARTED_STOP_PENDING_TTL_SECONDS,
                 ),
+                timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
+            )
+            await asyncio.wait_for(
+                self.redis_service.sadd(f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}", pod_id),
                 timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
             )
         except Exception as exc:  # noqa: BLE001 — the background retry still runs; only a restart loses it
@@ -12822,10 +12830,18 @@ class DockerService:
                 )
             )
 
-    async def _forget_half_started_stop(self, slot: str, default_extra: dict[str, Any]) -> bool:
+    async def _forget_half_started_stop(
+        self, executor_info: ExecutorSSHInfo, pod_id: str, default_extra: dict[str, Any]
+    ) -> bool:
+        slot = _half_started_stop_slot(executor_info, pod_id)
         try:
             await asyncio.wait_for(
                 self.redis_service.delete(f"{HALF_STARTED_STOP_PENDING_PREFIX}{slot}"),
+                timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
+            )
+            # the record first: an index entry without one is dropped by the next check, never the reverse
+            await asyncio.wait_for(
+                self.redis_service.srem(f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}", pod_id),
                 timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
             )
             return True
@@ -12917,8 +12933,23 @@ class DockerService:
         except Exception as exc:  # noqa: BLE001
             logger.error(_m("POD_HALF_STARTED_STOP_STILL_PENDING", extra=get_extra_info({**extra, "error": str(exc)})))
             return False
-        await self._forget_half_started_stop(slot, extra)
+        await self._forget_half_started_stop(executor_info, pod_id, extra)
         return True
+
+    async def retry_pending_half_started_stops(
+        self, *, executor_info: ExecutorSSHInfo, private_key: str | None, default_extra: dict[str, Any]
+    ) -> None:
+        """Retry every pending stop on this executor, whatever the node's current rental: a pod deleted or reassigned
+        since its failed start is no longer listed, but its old run may still write without its mount."""
+        index = f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}"
+        members = await asyncio.wait_for(self.redis_service.smembers(index), timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC)
+        for member in sorted(members or ()):
+            pod_id = member.decode() if isinstance(member, bytes) else str(member)
+            if await self.retry_half_started_stop(
+                executor_info=executor_info, private_key=private_key, pod_id=pod_id, default_extra=default_extra
+            ) is None:
+                # no record: nothing pending for that pod (its stop was confirmed by an earlier forget)
+                await asyncio.wait_for(self.redis_service.srem(index, pod_id), timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC)
 
     async def _bring_up_existing_container(
         self,

@@ -108,15 +108,9 @@ class PodRecoverer(Protocol):
 
     async def unmounted_stop_outcome(self, pod_id: str) -> str | None: ...
 
-    async def retry_half_started_stop(
-        self,
-        *,
-        executor_info: ExecutorSSHInfo,
-        private_key: str | None,
-        pod_id: str,
-        default_extra: dict[str, Any],
-        recorded: tuple[str, str, str] | None = None,
-    ) -> bool | None: ...
+    async def retry_pending_half_started_stops(
+        self, *, executor_info: ExecutorSSHInfo, private_key: str | None, default_extra: dict[str, Any]
+    ) -> None: ...
 
     async def forget_recovery_stop(self, pod_id: str) -> None: ...
 
