@@ -746,14 +746,14 @@ def get_needrestart_guard(host_root="/proc/1/root"):
             text = guard_file.read()
     except FileNotFoundError:
         return "missing", list(NEEDRESTART_GUARD_SERVICES)
-    unguarded = [
-        service
-        for service in NEEDRESTART_GUARD_SERVICES
-        # only a live assignment at the start of a line: Perl ignores a commented-out rule
-        if not re.search(
-            r"^[ \t]*\$nrconf\{override_rc\}->\{qr\(\^" + re.escape(service) + r"\)\}\s*=\s*0\s*;", text, re.M
+    unguarded = []
+    for service in NEEDRESTART_GUARD_SERVICES:
+        # Perl keeps the last live assignment; a commented-out line is no assignment at all
+        values = re.findall(
+            r"^[ \t]*\$nrconf\{override_rc\}->\{qr\(\^" + re.escape(service) + r"\)\}\s*=\s*(\w+)\s*;", text, re.M
         )
-    ]
+        if not values or values[-1] != "0":
+            unguarded.append(service)
     return ("partial" if unguarded else "present"), unguarded
 
 

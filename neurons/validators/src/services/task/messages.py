@@ -991,9 +991,13 @@ class NeedrestartGuardMessages:
         remediation=(
             "An apt upgrade's needrestart may restart sysbox, Docker, containerd or the NVIDIA fabric manager "
             "under running pods, which breaks those pods. Hosts set up before 16 Nov 2026 lack the guard. Create "
-            "/etc/needrestart/conf.d/lium-container-runtime.conf with the lines that "
-            "neurons/executor/nvidia_docker_sysbox_setup.sh writes (keep_needrestart_off_the_container_runtime). "
-            "Writing the file restarts nothing."
+            "/etc/needrestart/conf.d/lium-container-runtime.conf containing these five lines: "
+            "$nrconf{override_rc}->{qr(^sysbox)} = 0; "
+            "$nrconf{override_rc}->{qr(^docker)} = 0; "
+            "$nrconf{override_rc}->{qr(^containerd)} = 0; "
+            "$nrconf{override_rc}->{qr(^nvidia-fabricmanager)} = 0; "
+            "$nrconf{override_rc}->{qr(^nvidia-persistenced)} = 0; "
+            "(one per line). Writing the file restarts nothing."
         ),
     )
     UNKNOWN = MessageTemplate(

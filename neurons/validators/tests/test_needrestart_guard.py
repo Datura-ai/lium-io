@@ -65,6 +65,18 @@ def test_a_commented_out_rule_does_not_count(tmp_path):
     assert _read(_host(tmp_path, text)) == ("partial", ["containerd"])
 
 
+def test_a_later_assignment_that_re_enables_a_restart_wins(tmp_path):
+    text = _setup_script_guard() + "\n$nrconf{override_rc}->{qr(^containerd)} = 1;\n"
+
+    assert _read(_host(tmp_path, text)) == ("partial", ["containerd"])
+
+
+def test_the_remediation_carries_every_line_the_setup_script_writes():
+    for line in _setup_script_guard().splitlines():
+        if line.startswith("$nrconf"):
+            assert line in Msg.MISSING.remediation
+
+
 def test_a_host_without_needrestart_needs_no_guard(tmp_path):
     assert _read(_host(tmp_path, None, needrestart=False)) == ("no_needrestart", [])
 
