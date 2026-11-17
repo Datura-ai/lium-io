@@ -370,6 +370,9 @@ class Context(BaseModel):
     # False once a card is below its reported GPU model (DAH-6241); non-fatal on a live rental, so the score
     # gate lives in calculate_scores.
     gpu_model_passed: bool = True
+    # False once NodeAccountCheck finds the node on another account's machine (DAH-6539); non-fatal on a live
+    # rental, so the score gate lives in calculate_scores.
+    node_account_passed: bool = True
     # G1 — NVIDIA CC GPU attestation outcome: True/False when verified, None when
     # not performed (non-CVM node, no evidence supplied, or NRAS undeterminable).
     gpu_attestation_passed: bool | None = None

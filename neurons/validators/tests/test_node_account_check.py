@@ -78,7 +78,7 @@ async def test_hostname_re_pointed_to_another_machine_is_refused(two_machines):
     result = await NodeAccountCheck().run(_ctx("node.example.com", await dial(IP_B), registered_key))
     assert not result.passed
     assert result.event.reason_code == "NODE_ACCOUNT_MISMATCH"
-    assert result.updates == {"clear_verified_job_info": True}
+    assert result.updates == {"node_account_passed": False, "clear_verified_job_info": True}
 
 
 async def test_ip_addressed_node_is_unchanged(two_machines):
@@ -185,7 +185,7 @@ async def test_ip_node_is_refused_on_a_machine_set_up_for_another_account(files,
     assert result.event.reason_code == reason
     assert result.passed is (reason != "NODE_ACCOUNT_MISMATCH")
     if not result.passed:
-        assert result.updates == {"clear_verified_job_info": True}
+        assert result.updates == {"node_account_passed": False, "clear_verified_job_info": True}
         assert "hostname" not in result.event.remediation
     assert runner.commands == [
         "printf 'hotkey=%s\\nclaim=%s\\n' \"$(cat /etc/liumd/miner_hotkey 2>/dev/null)\" "
@@ -223,6 +223,8 @@ async def test_a_rented_node_on_another_accounts_machine_finishes_its_rental(ren
     result = await NodeAccountCheck().run(_relay_ctx(_HostFiles("hotkey=5Victim\nclaim=\n")))
     assert not result.passed and result.event.reason_code == "NODE_ACCOUNT_MISMATCH"
     assert result.fatal is (not rented)
+    # score 0 either way: a rented node finishes its rental unpaid (calculate_scores reads node_account_passed)
+    assert result.updates["node_account_passed"] is False
     # an availability entry: the backend hides the node, so a partly rented one takes no rental on its free GPUs
     from services.task.availability import NODE_GPU_FAULT_CODES, availability_errors
 
