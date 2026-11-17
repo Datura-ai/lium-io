@@ -87,6 +87,7 @@ class ExecutorConnectivityService:
                 declared_port_count=verification.declared_port_count,
                 sysbox_measured=verification.sysbox_measured,
                 host_runtime_fault=verification.host_runtime_fault,
+                dind_skipped=verification.dind_skipped,
             )
 
             return result

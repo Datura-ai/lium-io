@@ -244,6 +244,7 @@ def _bound_pod_id_label(container_name: str, label: str) -> str:
 # diagnostic of theirs, is never removed. Only never-started (Created) ones go: a running one is a check
 # in progress.
 CAPABILITY_CHECK_NAME = re.compile(r"^lium_capability_check_[0-9]+_[0-9a-f]{6}$")
+FULL_CONTAINER_ID = re.compile(r"[0-9a-f]{64}")
 LIST_CREATED_CONTAINERS = "/usr/bin/docker ps -a --no-trunc --filter status=created --format '{{.ID}} {{.Names}}'"
 
 
@@ -251,7 +252,8 @@ def never_started_check_containers(listing: str) -> list[str]:
     return [
         fields[0]
         for fields in (line.split() for line in listing.splitlines())
-        if len(fields) == 2 and CAPABILITY_CHECK_NAME.match(fields[1])
+        # the id is node output that goes into `docker rm`: only a full container id is accepted
+        if len(fields) == 2 and CAPABILITY_CHECK_NAME.match(fields[1]) and FULL_CONTAINER_ID.fullmatch(fields[0])
     ]
 
 

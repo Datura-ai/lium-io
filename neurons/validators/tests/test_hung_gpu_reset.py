@@ -43,7 +43,10 @@ class HungHost(FakeHost):
 async def _reset(host: HungHost, pod=POD):
     result = await reset_hung_pod_gpus(host, list(pod))
     for cmd in host.commands:
-        if cmd.startswith("nvidia-smi -r"):
+        if cmd == "nvidia-smi -r":
+            # the whole fabric: only for a pod holding every host GPU while Fabric Manager is stopped
+            assert host.active_during_reset.get(FM) is False and set(pod) == set(U)
+        elif cmd.startswith("nvidia-smi -r"):
             assert " -i " in cmd
             assert set(cmd.split(" -i ")[1].strip("'").split(",")) <= set(pod), "never reset a GPU outside the pod"
     return result
@@ -230,7 +233,8 @@ async def test_a_fabric_manager_pod_owning_every_gpu_stops_fm_around_the_reset()
     host = HungHost(query=_query({U[0]: None}), device_ids=(), count=-1, fabric_manager=True)
     result = await _reset(host, pod=U)
     assert result.warning == W.HungGpuReset
-    assert _resets(host) == [f"nvidia-smi -r -i {','.join(U)}"]
+    # Fabric Manager stopped: the whole baseboard resets, NVSwitches included (no -i)
+    assert _resets(host) == ["nvidia-smi -r"]
     assert host.active_during_reset[FM] is False and host.active[FM] is True
     # stop, reset and start run as one host unit (as in reset_pod_gpus)
     assert ("stop", FM) in host.fm_log and ("start", FM) in host.fm_log
