@@ -315,6 +315,18 @@ async def test_a_cap_that_holds_records_nothing(context_factory, monkeypatch) ->
 
 
 @pytest.mark.asyncio
+async def test_a_cap_applied_after_the_cycles_scrape_is_not_a_revert(context_factory, monkeypatch) -> None:
+    # DAH-6571: the filler capped the GPU after this cycle had read it at the card default; that older
+    # reading is not the host raising the cap back
+    redis = FakeRedis()
+    record = _record().model_copy(update={"capped_at": time.time() + 30})
+
+    await _run_check_while_filler_runs(context_factory, monkeypatch, redis, [record], [("GPU-a", 400.0)])
+
+    assert _revert_key(CHECK_EXECUTOR_UUID) not in redis.store
+
+
+@pytest.mark.asyncio
 async def test_a_reset_after_the_job_is_never_seen(context_factory, monkeypatch) -> None:
     # The whole reason detection lives here: a host that leaves our cap alone while the job runs
     # and only resets the limit once the container is gone has harmed nothing. With no Lium job
