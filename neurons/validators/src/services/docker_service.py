@@ -2906,19 +2906,19 @@ _ENCRYPTED_MOUNT_PROBE_TIMEOUT_SEC = 30
 _HALF_STARTED_STOPS_IN_FLIGHT: set[asyncio.Task] = set()
 
 
-def _encrypted_mount_probe(container_name: str, plaintext_path: str) -> str:
-    """Host-side read of the pod's mount table (kernel-written, nothing run inside the renter's container): exit 0 when
-    it holds its own /lium-cipher gocryptfs mount at the recorded path, 1 when it does not, anything else unknown.
-    With no recorded path: unknown (3) for that mount, since its destination cannot be checked, 1 for an encrypted
-    volume without it, 2 for a pod that has no encrypted volume (no /lium-cipher in its mount table)."""
+def _encrypted_mount_probe(container_id: str, plaintext_path: str) -> str:
+    """Host-side read of the container's mount table (kernel-written, nothing run inside the renter's container): exit 0
+    when it holds its own /lium-cipher gocryptfs mount at the recorded path, 2 when it has no encrypted volume (no
+    /lium-cipher in its mount table, e.g. a plain local volume at that path), 1 for an encrypted volume without that
+    mount, anything else unknown. With no recorded path a gocryptfs mount is unknown (3): its destination cannot be
+    checked."""
     check = (
-        _gocryptfs_mount_check(plaintext_path, "/dev/stdin")
-        if plaintext_path
-        else f"awk -v source={_LIUM_CIPHER_MOUNT} "
-        "'$1 == source && $3 == \"fuse.gocryptfs\" {m=1} $2 == source {c=1} END {exit m ? 3 : (c ? 1 : 2)}' /dev/stdin"
+        f"awk -v target={shlex.quote(plaintext_path)} -v source={_LIUM_CIPHER_MOUNT} "
+        "'$1 == source && $3 == \"fuse.gocryptfs\" {g=1; if ($2 == target) t=1} $2 == source {c=1} "
+        "END {exit t ? 0 : (target == \"\" && g ? 3 : (c ? 1 : 2))}' /dev/stdin"
     )
     return (
-        f"p=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}}' {shlex.quote(container_name)}) || exit 3; "
+        f"p=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}}' {shlex.quote(container_id)}) || exit 3; "
         '[ "$p" -gt 0 ] 2>/dev/null || exit 1; '
         'm=$(cat "/proc/$p/mounts") || exit 3; '
         f"printf '%s\\n' \"$m\" | {check}"
@@ -10808,6 +10808,7 @@ class DockerService:
                     # the parked container back the way start_container does (remount, sshd), at the
                     # pod's volume path.
                     edit_swap.bring_up = lambda name, remount: self._bring_up_existing_container(
+                        executor_info=executor_info,
                         docker_client=docker_client,
                         ssh_client=ssh_client,
                         container_name=name,
@@ -12917,18 +12918,18 @@ class DockerService:
         return await asyncio.shield(task)
 
     async def _holds_its_encrypted_mount(
-        self, executor_info: ExecutorSSHInfo, private_key: str, container_name: str, plaintext_path: str
+        self, executor_info: ExecutorSSHInfo, private_key: str, container_id: str, plaintext_path: str
     ) -> int | None:
         """_encrypted_mount_probe's 0 (mounted), 1 (not mounted) or 2 (no encrypted volume), read on the host over the
         executor's pinned SSH; None when it could not be read."""
         try:
-            policy = await self._prepare_known_hosts_policy(executor_info, None, {"container_name": container_name})
+            policy = await self._prepare_known_hosts_policy(executor_info, None, {"container_id": container_id})
             if policy is None:
                 # an unpinned endpoint could report the mount present while the real pod runs without it
                 return None
             result = await _run_on_own_ssh_connection(
                 partial(_connect_own_ssh, executor_info, asyncssh.import_private_key(private_key), policy),
-                _encrypted_mount_probe(container_name, plaintext_path),
+                _encrypted_mount_probe(container_id, plaintext_path),
                 _ENCRYPTED_MOUNT_PROBE_TIMEOUT_SEC,
             )
         except asyncio.CancelledError:
@@ -12985,8 +12986,11 @@ class DockerService:
                 executor_info=executor_info, private_key=private_key
             ) as docker_client:
                 current = await docker_client.container_identity(container_name=container_name)
+                # probed and stopped by this id, never by name: a container that takes the name meanwhile (an edit's
+                # replacement, a re-create after a delete) cannot be reached by this retry's stop
+                container_id = current.partition("@")[0] if current else ""
                 # names are unique on a host: another id under it means the recorded container was removed
-                replaced = current is None or bool(identity) and current.partition("@")[0] != identity.partition("@")[0]
+                replaced = current is None or bool(identity) and container_id != identity.partition("@")[0]
                 failed_at = datetime.fromisoformat(recorded_at)
                 if not replaced and not identity:
                     # Created/StartedAt are on the host's clock, recorded_at on ours. The host read its clock between
@@ -13008,9 +13012,7 @@ class DockerService:
                 mount = (
                     None
                     if replaced
-                    else await self._holds_its_encrypted_mount(
-                        executor_info, private_key, container_name, plaintext_path
-                    )
+                    else await self._holds_its_encrypted_mount(executor_info, private_key, container_id, plaintext_path)
                 )
                 # no encrypted volume, nothing it could write unencrypted: only the very run recorded is stopped
                 if not replaced and mount == 2:
@@ -13033,7 +13035,7 @@ class DockerService:
                     # unknown is not unmounted: stopping here could stop a restored pod; the record stays for next check
                     raise RentalDockerOperationError("the pod's encrypted mount could not be read")
                 else:
-                    await self._stop_half_started_container(docker_client, container_name, extra)
+                    await self._stop_half_started_container(docker_client, container_id, extra)
                     logger.info(_m("POD_HALF_STARTED_STOP_CONFIRMED", extra=get_extra_info(extra)))
         except Exception as exc:  # noqa: BLE001
             logger.error(_m("POD_HALF_STARTED_STOP_STILL_PENDING", extra=get_extra_info({**extra, "error": str(exc)})))
@@ -13064,6 +13066,7 @@ class DockerService:
     async def _bring_up_existing_container(
         self,
         *,
+        executor_info: ExecutorSSHInfo,
         docker_client: RentalDockerSdkClient,
         ssh_client: asyncssh.SSHClientConnection,
         container_name: str,
@@ -13085,29 +13088,34 @@ class DockerService:
                 container_name=container_name,
             )
 
-        stopped_before = await _stopped_before_start(docker_client, container_name)
-        try:
-            await _start()
-        except Exception as exc:
-            # park's `docker stop` can leave the vloopback mountpoint dir behind, so the parked
-            # container's own start fails on "file exists" and the customer's pod stays down
-            # (pod 6577912c, 22 Oct). Same repair as the create retry: rmdir only an empty,
-            # unmounted mountpoint, then start once more.
-            if not _is_stale_vloopback_mountpoint_error(str(exc)) or not await self._repair_stale_mountpoint_of_container_volume(
-                ssh_client, container_name, default_extra
-            ):
-                raise
-            await _start()
-        await self._restore_mount_and_sshd_after_start(
-            docker_client=docker_client,
-            ssh_client=ssh_client,
-            container_name=container_name,
-            local_volume_path=local_volume_path,
-            pod_id=pod_id,
-            default_extra=default_extra,
-            remount=remount,
-            record_start=stopped_before,
-        )
+        # under the pod's lock like start_existing_container: a pending stop's retry cannot probe the container
+        # unmounted and then stop it after this undo restarted and remounted it
+        async with _half_started_stop_lock(_half_started_stop_slot(executor_info, pod_id)):
+            stopped_before = await _stopped_before_start(docker_client, container_name)
+            try:
+                await _start()
+            except Exception as exc:
+                # park's `docker stop` can leave the vloopback mountpoint dir behind, so the parked
+                # container's own start fails on "file exists" and the customer's pod stays down
+                # (pod 6577912c, 22 Oct). Same repair as the create retry: rmdir only an empty,
+                # unmounted mountpoint, then start once more.
+                if not _is_stale_vloopback_mountpoint_error(str(exc)):
+                    raise
+                if not await self._repair_stale_mountpoint_of_container_volume(
+                    ssh_client, container_name, default_extra
+                ):
+                    raise
+                await _start()
+            await self._restore_mount_and_sshd_after_start(
+                docker_client=docker_client,
+                ssh_client=ssh_client,
+                container_name=container_name,
+                local_volume_path=local_volume_path,
+                pod_id=pod_id,
+                default_extra=default_extra,
+                remount=remount,
+                record_start=stopped_before,
+            )
 
     async def _restore_mount_and_sshd_after_start(
         self,

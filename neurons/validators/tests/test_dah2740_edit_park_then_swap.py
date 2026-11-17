@@ -905,6 +905,7 @@ async def test_the_undo_repairs_a_stale_vloopback_mountpoint_left_by_park_and_st
 
     async def bring_up():
         await svc._bring_up_existing_container(
+            executor_info=Mock(uuid="exec-1"),
             docker_client=docker_client,
             ssh_client=ssh,
             container_name="pod_abc",
@@ -1559,7 +1560,8 @@ async def test_only_a_start_of_a_stopped_container_records_a_validator_start(svc
     ssh = Mock(run=AsyncMock())
 
     await svc._bring_up_existing_container(
-        docker_client=docker_client, ssh_client=ssh, container_name="pod_x", local_volume_path="/root",
+        executor_info=Mock(uuid="exec-1"), docker_client=docker_client, ssh_client=ssh, container_name="pod_x",
+        local_volume_path="/root",
         pod_id="x", default_extra={}, remount=remount,
     )
 

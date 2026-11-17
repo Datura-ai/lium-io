@@ -3547,7 +3547,7 @@ async def test_retry_half_started_stop_stops_the_recorded_container_and_clears_i
     )
 
     assert stopped is True
-    assert client.stopped_containers == ["pod_test"]
+    assert client.stopped_containers == ["cid"]
     docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id")
 
 
@@ -3627,7 +3627,7 @@ async def test_retry_half_started_stop_without_a_recorded_id_judges_the_run_by_i
     )
 
     assert stopped is True
-    assert client.stopped_containers == (["pod_test"] if expect_stop else [])
+    assert client.stopped_containers == (["cid"] if expect_stop else [])
     assert client.running is not expect_stop
     docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id")
 
@@ -3656,7 +3656,7 @@ async def test_retry_half_started_stop_without_a_recorded_id_lets_the_mount_deci
     )
 
     assert stopped is expect_dropped
-    assert client.stopped_containers == (["pod_test"] if expect_stop else [])
+    assert client.stopped_containers == (["cid"] if expect_stop else [])
     if expect_dropped:
         docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id")
     else:
@@ -3795,7 +3795,7 @@ async def test_a_pending_stop_retry_racing_a_start_does_not_stop_the_new_run(
     assert await retry is True
     await start
 
-    assert client.stopped_containers == ["pod_test"]  # the old run only
+    assert client.stopped_containers == ["cid"]  # the old run only
     assert client.started_containers == ["pod_test"] and client.running is True
 
 
@@ -3861,7 +3861,7 @@ async def test_a_confirmed_half_started_stop_leaves_the_nodes_index(docker_servi
     ("probe", "stopped", "kept", "stops"),
     [
         pytest.param(_make_ssh_command_result(exit_status=0), True, False, [], id="remounted_left_running"),
-        pytest.param(_make_ssh_command_result(exit_status=1), True, False, ["pod_test"], id="unmounted_stopped"),
+        pytest.param(_make_ssh_command_result(exit_status=1), True, False, ["cid"], id="unmounted_stopped"),
         pytest.param(_make_ssh_command_result(exit_status=3), False, True, [], id="unreadable_kept_pending"),
         pytest.param(OSError("ssh down"), False, True, [], id="unreachable_kept_pending"),
     ],
@@ -3887,7 +3887,7 @@ async def test_a_pending_stop_reads_the_pods_mount_on_the_host_and_never_stops_o
     assert result is stopped
     assert client.stopped_containers == stops
     assert client.exec_specs == []  # nothing run inside the pod
-    assert run.await_args.args[1] == docker_service_module._encrypted_mount_probe("pod_test", "/workspace")
+    assert run.await_args.args[1] == docker_service_module._encrypted_mount_probe("cid", "/workspace")
     assert (docker_service.redis_service.hdel.await_count == 0) is kept
 
 
@@ -3913,9 +3913,11 @@ async def test_a_pending_stop_never_trusts_a_mount_read_over_an_unpinned_connect
 @pytest.mark.parametrize(
     ("exit_status", "stops", "kept"),
     [
-        pytest.param(1, ["pod_test"], False, id="restarted_unmounted_stopped"),
+        pytest.param(1, ["cid"], False, id="restarted_unmounted_stopped"),
         pytest.param(0, [], False, id="restarted_remounted_left_running"),
         pytest.param(3, [], True, id="restarted_unread_kept_pending"),
+        # gateway review: a plain local volume at the recorded path, restarted by Docker, is another run: left running
+        pytest.param(2, [], False, id="restarted_plain_volume_left_running"),
     ],
 )
 @pytest.mark.asyncio
@@ -3936,6 +3938,73 @@ async def test_a_pending_stop_follows_its_container_across_a_docker_restart(
 
     assert client.stopped_containers == stops
     assert (docker_service.redis_service.hdel.await_count == 0) is kept
+
+
+@pytest.mark.asyncio
+async def test_a_pending_stop_stops_the_container_it_read_not_one_that_took_its_name_since(docker_service, monkeypatch):
+    # gateway review: a replacement created under the pod's name between the mount read and the stop is not reached
+    monkeypatch.setattr("services.docker_service._HALF_STARTED_STOP_RETRY_SEC", 0)
+    run = _mount_reads(docker_service, monkeypatch, 1)
+    docker_service.redis_service.hget = AsyncMock(return_value=_pending_record(plaintext_path="/workspace"))
+    client = docker_service.rental_docker_client_factory.client
+    client.running = True
+
+    async def replaced_after_the_read(*args, **kwargs):
+        client.identity = "replacement-cid@2026-11-16T14:05:00Z"
+        return _make_ssh_command_result(1)
+
+    run.side_effect = replaced_after_the_read
+
+    await docker_service.retry_half_started_stop(
+        executor_info=Mock(uuid="exec-1"), private_key="private-key", pod_id="pod-id", default_extra={}
+    )
+
+    assert run.await_args.args[1] == docker_service_module._encrypted_mount_probe("cid", "/workspace")
+    assert client.stopped_containers == ["cid"]
+
+
+@pytest.mark.asyncio
+async def test_a_pending_stop_retry_waits_for_an_edit_undo_bringing_the_pod_back(
+    docker_service, monkeypatch, fresh_half_started_stop_state
+):
+    # gateway review: the undo of a failed edit restarts and remounts the container; the retry must not read it
+    # unmounted before the undo and stop it after
+    _mount_reads(docker_service, monkeypatch, 0)
+    docker_service.redis_service.hget = AsyncMock(return_value=_pending_record(plaintext_path="/workspace"))
+    client = docker_service.rental_docker_client_factory.client
+    in_undo = asyncio.Event()
+    release = asyncio.Event()
+
+    async def remount_after_start(**kwargs):
+        in_undo.set()
+        await release.wait()
+
+    docker_service._restore_mount_and_sshd_after_start = remount_after_start
+    undo = asyncio.create_task(
+        docker_service._bring_up_existing_container(
+            executor_info=Mock(uuid="exec-1"),
+            docker_client=client,
+            ssh_client=AsyncMock(),
+            container_name="pod_test",
+            local_volume_path="/workspace",
+            pod_id="pod-id",
+            default_extra={},
+        )
+    )
+    await in_undo.wait()
+    retry = asyncio.create_task(
+        docker_service.retry_half_started_stop(
+            executor_info=Mock(uuid="exec-1"), private_key="private-key", pod_id="pod-id", default_extra={}
+        )
+    )
+    await asyncio.sleep(0.01)
+    assert not retry.done() and docker_service.redis_service.hget.await_count == 0  # waits on the undo's lock
+
+    release.set()
+    await undo
+    assert await retry is True
+
+    assert client.stopped_containers == []  # read after the undo: mounted, left running
 
 
 @pytest.mark.asyncio
@@ -3960,7 +4029,7 @@ async def test_a_pending_stop_drops_a_container_re_created_under_its_name_withou
 @pytest.mark.parametrize(
     ("exit_status", "stops", "kept"),
     [
-        pytest.param(1, ["pod_test"], False, id="encrypted_volume_unmounted_stopped"),
+        pytest.param(1, ["cid"], False, id="encrypted_volume_unmounted_stopped"),
         pytest.param(3, [], True, id="mounted_somewhere_or_unread_kept_pending"),
     ],
 )
@@ -3979,7 +4048,7 @@ async def test_a_pending_stop_without_a_recorded_path_never_takes_a_mount_as_its
         executor_info=Mock(uuid="exec-1"), private_key="private-key", pod_id="pod-id", default_extra={}
     )
 
-    assert run.await_args.args[1] == docker_service_module._encrypted_mount_probe("pod_test", "")
+    assert run.await_args.args[1] == docker_service_module._encrypted_mount_probe("cid", "")
     assert client.stopped_containers == stops
     assert (docker_service.redis_service.hdel.await_count == 0) is kept
 
@@ -4009,9 +4078,25 @@ def test_the_mount_probe_without_a_path_tells_unmounted_no_encrypted_volume_and_
 @pytest.mark.parametrize(
     ("pid", "mounts", "exit_status"),
     [
-        pytest.param("4242", "/lium-cipher /workspace fuse.gocryptfs rw 0 0\n", 0, id="own_mount"),
-        pytest.param("4242", "/lium-cipher /elsewhere fuse.gocryptfs rw 0 0\n", 1, id="other_target"),
-        pytest.param("4242", "/lium-cipher /workspace ext4 rw 0 0\n", 1, id="not_gocryptfs"),
+        pytest.param(
+            "4242",
+            "/dev/vda1 /lium-cipher ext4 rw 0 0\n/lium-cipher /workspace fuse.gocryptfs rw 0 0\n",
+            0,
+            id="own_mount",
+        ),
+        pytest.param(
+            "4242",
+            "/dev/vda1 /lium-cipher ext4 rw 0 0\n/lium-cipher /elsewhere fuse.gocryptfs rw 0 0\n",
+            1,
+            id="other_target",
+        ),
+        pytest.param(
+            "4242", "/dev/vda1 /lium-cipher ext4 rw 0 0\n/lium-cipher /workspace ext4 rw 0 0\n", 1, id="not_gocryptfs"
+        ),
+        # a Docker restart keeps the ciphertext volume at /lium-cipher and drops the gocryptfs mount
+        pytest.param("4242", "/dev/vda1 /lium-cipher ext4 rw 0 0\n", 1, id="encrypted_restarted_unmounted"),
+        # gateway review: a plain local volume at the recorded path has no /lium-cipher: nothing written unencrypted
+        pytest.param("4242", "/dev/vda1 /workspace ext4 rw 0 0\n", 2, id="plain_volume"),
         pytest.param("0", None, 1, id="not_running"),
         pytest.param(None, None, 3, id="inspect_failed"),
         pytest.param("4242", None, 3, id="mount_table_unreadable"),
@@ -4023,7 +4108,7 @@ def test_the_encrypted_mount_probe_reads_the_pods_mount_table_on_the_host(tmp_pa
     docker.chmod(0o755)
     if mounts is not None:
         (tmp_path / "4242").write_text(mounts)
-    probe = docker_service_module._encrypted_mount_probe("pod_test", "/workspace")
+    probe = docker_service_module._encrypted_mount_probe("cid", "/workspace")
     assert '"/proc/$p/mounts"' in probe and probe.startswith("p=$(/usr/bin/docker inspect")
     probe = probe.replace("/usr/bin/docker", str(docker)).replace('"/proc/$p/mounts"', f'"{tmp_path}/$p"')
 
@@ -4070,7 +4155,7 @@ async def test_a_cancelled_pending_stop_keeps_the_pod_lock_until_its_stop_is_don
 
     release.set()
     await start
-    assert client.stopped_containers == ["pod_test"] and client.started_containers == ["pod_test"]
+    assert client.stopped_containers == ["cid"] and client.started_containers == ["pod_test"]
     assert client.running is True
 
 
@@ -11756,7 +11841,7 @@ async def test_retry_half_started_stop_without_a_recorded_id_does_not_take_a_slo
 
     assert first is False and stopped_after_first == []
     run.assert_awaited_once()
-    assert second is True and client.stopped_containers == ["pod_test"]
+    assert second is True and client.stopped_containers == ["cid"]
 
 
 @pytest.mark.asyncio
