@@ -934,7 +934,11 @@ class RentalDockerSdkClient:
             raise RentalDockerTransportError(
                 f"Docker SDK {operation} failed on a dropped SSH transport and the transport could "
                 f"not be re-opened: {first_error}; re-open: {_error_text(exc)}"
-            ) from first_error  # the drop, not the re-open's bare timeout, is what the host-fault classifier follows
+            ) from (
+                # the host-fault classifier follows the strict drop: the first error when it is one (a silent host's
+                # re-open only times out), else the re-open's own error (a read timeout, then a reset while re-opening)
+                first_error if is_rental_docker_transport_drop(first_error) else exc
+            )
         return True
 
     async def remove_volume(self, *, volume_name: str, force: bool = False) -> None:

@@ -410,3 +410,22 @@ async def test_a_host_gone_silent_fails_the_inspect_as_a_dropped_transport_not_a
     from services.docker_service import is_host_fault_create_failure
 
     assert is_host_fault_create_failure("container_health_check", raised.value)
+
+
+@pytest.mark.asyncio
+async def test_a_read_timeout_then_a_reset_while_reopening_still_holds_the_node():
+    # the first error is a read timeout (a transport error, not a strict drop); the re-open then hits a reset
+    import requests
+
+    from services.docker_service import is_host_fault_create_failure
+
+    class _TimeoutApiClient(_FakeApiClient):
+        def inspect_container(self, name):
+            raise requests.exceptions.ReadTimeout("read timed out")
+
+    api_client = _TimeoutApiClient(adapter=_FakeAdapter(reopen_error=ConnectionResetError("reset by peer")))
+
+    with pytest.raises(RentalDockerOperationError) as raised:
+        await _client(api_client).inspect_container_state(container_name="pod_test")
+
+    assert is_host_fault_create_failure("container_health_check", raised.value)
