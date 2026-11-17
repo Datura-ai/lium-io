@@ -192,8 +192,7 @@ async def test_a_card_whose_answer_is_not_sealed_gives_no_metrics_and_still_pass
 
 
 def _ssh_cuda_blind(real_cards: int):
-    # the 17 Nov case: nvidia-smi lists every claimed card, CUDA sees only `real_cards`; a run pinned
-    # to an unseen card still exits 0 and prints `UUID:  None`
+    # a run pinned to a card CUDA cannot see still exits 0 and prints `UUID:  None`
     async def run(cmd, *args, **kwargs):
         if "CUDA_VISIBLE_DEVICES=" in cmd and _card_index(cmd) < real_cards:
             return SimpleNamespace(exit_status=0, stdout=ANSWER, stderr="")
@@ -357,7 +356,6 @@ async def test_a_timeout_retries_every_card_together_and_a_right_answer_then_pas
 
 @pytest.mark.asyncio
 async def test_one_card_that_times_out_again_while_the_others_answer_fails_with_no_waiver(svc, monkeypatch):
-    """Node 4bba0106 (10-16 Nov): card 0 timed out every recheck while the other 7 finished in seconds."""
     _flags(monkeypatch, enforce=True)
     ssh, calls = _ssh_scripted({0: ["timeout", "timeout"]})
 
@@ -433,7 +431,6 @@ async def test_the_retry_run_is_timed_on_its_own_against_the_same_wall_clock(svc
 async def test_a_run_over_the_wall_clock_with_every_card_right_is_run_again_and_the_retry_decides(
     svc, monkeypatch, retry_elapsed, passed
 ):
-    """Review (17 Nov): honest 8x B300 took 85 s of the 90 s in prod, so one slow run must not fail the node alone."""
     _flags(monkeypatch, enforce=True)
     ticks = iter([0.0, 92.0, 0.0, retry_elapsed])
     monkeypatch.setattr(mvs.time, "perf_counter", lambda: next(ticks))

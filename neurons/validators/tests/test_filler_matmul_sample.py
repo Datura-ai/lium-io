@@ -242,7 +242,6 @@ async def test_a_failed_sample_names_why(context_factory, monkeypatch, result, k
 async def test_a_sampled_card_cuda_cannot_see_fails_the_filler_node_under_enforcement(
     context_factory, monkeypatch, enforced
 ):
-    # prod 10-17 Nov: claimed cards CUDA did not see answered exactly this beside the filler
     monkeypatch.setattr(capability.settings, "FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES", 1)
     monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", enforced)
 

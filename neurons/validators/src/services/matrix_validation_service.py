@@ -224,10 +224,8 @@ class AllCardsProbe:
 
     @property
     def no_card_answered(self) -> bool:
-        """True when NO card answered: every card timed out, lost its channel or gave no answer (the
-        busy-node symptoms), so a workload the backend started after the cycle's snapshot may explain
-        it and CapabilityCheck may waive it. One card failing while the others answer is the card's
-        own fault (a stuck card, a card CUDA cannot see) and fails; a wrong answer never qualifies."""
+        """True when NO card answered (every card timed out, lost its channel or gave no answer); only then may
+        CapabilityCheck apply its live-workload waiver. A wrong answer never qualifies. Rationale: DAH-6576."""
         return bool(self.per_card) and all(
             not c.get("ok") and c.get("reason") != "wrong_answer" for c in self.per_card
         )

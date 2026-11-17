@@ -618,10 +618,7 @@ def _sample_error_kind(result: ValidationResult) -> str:
 def _filler_sample_failed_card(sample: dict) -> bool:
     """A filler sample whose pinned card gave no answer or a wrong one, under all-cards enforcement.
 
-    The filler holds the cards, so a busy card is `no_memory` (or `timeout`) and stays a record
-    only. A card CUDA cannot see at all (`no_answer`) or a wrong answer is not what a filler does to
-    a real card. Prod 10-17 Nov: 16 of 1197 samples on 497 filler nodes, every one on a node whose
-    claimed cards CUDA did not see; 0 elsewhere.
+    `no_memory` and `timeout` stay a record only. Rationale: DAH-6576.
     """
     return allcards_enforced() and sample.get("error_kind") in ("no_answer", "wrong_answer")
 
