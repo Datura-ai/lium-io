@@ -144,6 +144,9 @@ class GpuPowerRestoreRecord(BaseModel):
     # DAH-2786 — the limit we actually applied, so a restore can tell a held cap from a
     # reverted one. None on records written before this field existed: those never accuse.
     capped_to_watts: int | None = None
+    # DAH-6555: the host's boot id when we capped (/proc/sys/kernel/random/boot_id); another one in a later scan means a
+    # reboot reset the limit, not the host raising it. None = unreadable then, or a record from before the field.
+    boot_id: str | None = None
 
 
 class GpuPowerCapRevert(BaseModel):
@@ -583,6 +586,22 @@ async def _set_side_by_side(
     return done
 
 
+BOOT_ID_READ_TIMEOUT_SECONDS = 10
+
+
+async def _read_host_boot_id(ssh: asyncssh.SSHClientConnection) -> str | None:
+    """The host's boot id (the same inside a container), None when unreadable: a record without one is judged as
+    before DAH-6555."""
+    try:
+        result = await asyncio.wait_for(
+            ssh.run("cat /proc/sys/kernel/random/boot_id"), timeout=BOOT_ID_READ_TIMEOUT_SECONDS
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    boot_id = (getattr(result, "stdout", "") or "").strip()
+    return boot_id if getattr(result, "exit_status", 0) == 0 and boot_id else None
+
+
 async def _ensure_restore_record(
     redis: RedisService,
     gpu_uuid: str,
@@ -590,6 +609,7 @@ async def _ensure_restore_record(
     pod_id: str,
     executor_id: str,
     log_extra: dict[str, object] | None,
+    boot_id: str | None = None,
 ) -> bool:
     key = _restore_key(gpu_uuid)
     try:
@@ -608,7 +628,12 @@ async def _ensure_restore_record(
         )
         return True
     record = GpuPowerRestoreRecord(
-        gpu_uuid=gpu_uuid, watts=pre_cap_watts, pod_id=pod_id, executor_id=executor_id, capped_at=time.time()
+        gpu_uuid=gpu_uuid,
+        watts=pre_cap_watts,
+        pod_id=pod_id,
+        executor_id=executor_id,
+        capped_at=time.time(),
+        boot_id=boot_id,
     )
     try:
         await redis.set(key, record.model_dump_json())
@@ -654,17 +679,18 @@ async def _set_applied_cap_on_restore_record(
         _log(logging.ERROR, f"gpu power cap: redis failed while stamping the applied cap on {gpu_uuid}: {exc}", {"gpu_uuid": gpu_uuid}, log_extra)
 
 
-async def reapply_filler_cap_after_restart(
+async def reapply_filler_cap_after_reboot(
     ssh: asyncssh.SSHClientConnection,
     redis: RedisService,
     record: GpuPowerRestoreRecord,
     found_watts: int | None,
+    boot_id: str,
     log_extra: dict[str, object] | None,
 ) -> bool:
-    """Set our cap again on a GPU whose filler container started after we capped it (DAH-6555): a host reboot
-    resets the limit and docker restarts the filler by its restart policy, uncapped. That is not a host revert.
-    True when the set stuck; the record's ``capped_at`` then moves to now, so a later raise without a restart
-    is judged as a revert again. False (nothing changed on the record) when the cap could not be set."""
+    """Set our cap again on a GPU whose host booted again since we capped it (DAH-6555): a reboot resets the limit
+    and docker restarts the filler by its restart policy, uncapped. That is not a host revert. True when the set
+    stuck; the record then carries the new ``boot_id`` and ``capped_at`` now, so a later raise in this boot is judged
+    as a revert again. False (nothing changed on the record) when the cap could not be set."""
     if record.capped_to_watts is None:
         return False
     outcome = await _set_alone(
@@ -674,7 +700,7 @@ async def reapply_filler_cap_after_restart(
         return False
     _log(
         logging.INFO,
-        f"gpu power cap re-applied after the host restarted the filler: executor={record.executor_id} "
+        f"gpu power cap re-applied after a host reboot: executor={record.executor_id} "
         f"pod={record.pod_id} gpu={record.gpu_uuid} watts {found_watts} -> {record.capped_to_watts}",
         {"executor_uuid": record.executor_id, "gpu_uuid": record.gpu_uuid, "pod_id": record.pod_id},
         log_extra,
@@ -686,9 +712,8 @@ async def reapply_filler_cap_after_restart(
             stored = GpuPowerRestoreRecord.model_validate_json(raw)
             # same rule as the first cap: only a cap that holds with persistence on can accuse later (DAH-2702)
             applied = record.capped_to_watts if outcome.persistence_enabled else None
-            await redis.set(
-                key, stored.model_copy(update={"capped_at": time.time(), "capped_to_watts": applied}).model_dump_json()
-            )
+            refreshed = {"capped_at": time.time(), "capped_to_watts": applied, "boot_id": boot_id}
+            await redis.set(key, stored.model_copy(update=refreshed).model_dump_json())
     except Exception as exc:
         _log(logging.ERROR, f"gpu power cap: could not refresh the record of {record.gpu_uuid} after a re-cap: {exc}", {"gpu_uuid": record.gpu_uuid}, log_extra)
     return True
@@ -1355,11 +1380,12 @@ async def apply_filler_gpu_power_limits(
     if planned is None:
         return GpuPowerCapResult.FAILED
     target_uuids = [target.gpu_uuid for target in gpu_power_limits]
+    boot_id: str | None = await _read_host_boot_id(ssh)
     # Persist every restore record BEFORE lowering anything: never cap a GPU without a stored way back.
     for target in gpu_power_limits:
         pre_cap_watts = planned.state_by_uuid[target.gpu_uuid].current_watts
         restore_record_stored: bool = await _ensure_restore_record(
-            redis, target.gpu_uuid, pre_cap_watts, pod_id, executor_id, log_extra
+            redis, target.gpu_uuid, pre_cap_watts, pod_id, executor_id, log_extra, boot_id
         )
         if not restore_record_stored:
             await _undo_partial_apply(ssh, redis, target_uuids, pod_id, log_extra)
