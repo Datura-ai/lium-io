@@ -34,7 +34,7 @@ from tests.test_rental_price_incentive_flow import _make_pcc_job
 UNKNOWN = "NVIDIA RTX Future 9000"
 # lium-platform keeps a byte-identical apps/lium/backend/apps/server/src/core/gpu_reference_table.py
 # and pins the same hash
-GPU_REFERENCE_TABLE_SHA256 = "1082a78e5d85cbed2646436decdafd7d132b801c28e801f027cc4e71c3b5fe0c"
+GPU_REFERENCE_TABLE_SHA256 = "65e60281e1d4c05c30f893557bddf6535cca4be46b5bc01cfa5836313260d7ef"
 PRICES = {model: price for model, (price, _) in GPU_REFERENCE_TABLE.items()}
 CANDIDATES = list(GPU_REFERENCE_TABLE)
 
@@ -75,7 +75,7 @@ PARITY_CASES = [
     (24564, "NVIDIA Tesla P40"),
     (30000, "NVIDIA GeForce RTX 5090 D"),
     (40960, "NVIDIA CMP 170HX"),
-    (49140, "NVIDIA Quadro RTX 8000"),
+    (49140, "NVIDIA GeForce RTX 4090 D 48GB"),  # DAH-6595: the cheapest 48 GB card (0.18 < Quadro RTX 8000 0.21)
     (81559, "NVIDIA A800 80GB PCIe"),
     (97871, "NVIDIA H800 NVL"),
     (143771, "NVIDIA H200 NVL"),
