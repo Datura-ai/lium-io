@@ -752,8 +752,8 @@ def get_needrestart_guard(host_root="/proc/1/root"):
         values = re.findall(
             r"^[ \t]*\$nrconf\{override_rc\}->\{qr\(\^" + re.escape(service) + r"\)\}\s*=\s*([^;\n]+?)\s*;", text, re.M
         )
-        # any value but a plain or quoted 0 (1, '1', "1", an expression) lets needrestart restart it
-        if not values or values[-1].strip("'\"") != "0":
+        # only exactly 0, '0' or "0" is guarded; anything else (1, '1', "'0'", an expression) may be true in Perl
+        if not values or values[-1] not in ("0", "'0'", '"0"'):
             unguarded.append(service)
     return ("partial" if unguarded else "present"), unguarded
 
