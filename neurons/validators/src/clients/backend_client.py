@@ -559,6 +559,7 @@ class BackendClient:
         gpu_uuids: list[str] | None = None,
         cpu_count: int | None = None,
         loopback_plugin: str | None = None,
+        upload_nonce: str | None = None,
         timeout: int = 300,
     ) -> ExecutorHealthCheckResponse | None:
         """Check executor health via backend API.
@@ -582,6 +583,9 @@ class BackendClient:
             loopback_plugin: The plugin alias this validator creates rental volumes on. The backend
                 probes that plugin; without it (or on an older backend, which ignores it) only the
                 legacy plugin is probed. None omits the field.
+            upload_nonce: The dated nonce (datura fresh_upload_nonce) the backend signs into its SSH-key upload
+                with the miner binding, as this validator's own uploads do (DAH-6606), so a captured upload
+                signature goes stale. None for a miner that does not relay the field (upload_nonce_for_miner).
             timeout: Seconds to wait; the backend needs time to SSH and verify the container.
 
         Returns:
@@ -612,6 +616,9 @@ class BackendClient:
 
         if executor_id:
             json_data["executor_id"] = executor_id
+
+        if upload_nonce is not None:
+            json_data["upload_nonce"] = upload_nonce
 
         try:
             # the whole call, retries included: a connection retry must not restart the wait
