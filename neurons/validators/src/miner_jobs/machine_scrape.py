@@ -746,15 +746,18 @@ def get_needrestart_guard(host_root="/proc/1/root"):
             text = guard_file.read()
     except FileNotFoundError:
         return "missing", list(NEEDRESTART_GUARD_SERVICES)
-    unguarded = []
-    for service in NEEDRESTART_GUARD_SERVICES:
-        # Perl keeps the last live assignment; a commented-out line is no assignment at all
-        values = re.findall(
-            r"^[ \t]*\$nrconf\{override_rc\}->\{qr\(\^" + re.escape(service) + r"\)\}\s*=\s*([^;\n]+?)\s*;", text, re.M
-        )
-        # only exactly 0, '0' or "0" is guarded; anything else (1, '1', "'0'", an expression) may be true in Perl
-        if not values or values[-1] not in ("0", "'0'", '"0"'):
-            unguarded.append(service)
+    last_values = {}
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        # only the exact line the setup script writes is understood; any other live Perl (another
+        # delimiter, two statements on a line, a map reset) may undo a guard, so it guards nothing
+        match = re.fullmatch(r"[ \t]*\$nrconf\{override_rc\}->\{qr\(\^([\w.-]+)\)\}\s*=\s*([^;#]+?)\s*;\s*(#.*)?", line)
+        if not match:
+            return "partial", list(NEEDRESTART_GUARD_SERVICES)
+        last_values[match.group(1)] = match.group(2)  # Perl keeps the last assignment
+    # only exactly 0, '0' or "0" is guarded; anything else (1, '1', "'0'", an expression) may be true in Perl
+    unguarded = [s for s in NEEDRESTART_GUARD_SERVICES if last_values.get(s) not in ("0", "'0'", '"0"')]
     return ("partial" if unguarded else "present"), unguarded
 
 

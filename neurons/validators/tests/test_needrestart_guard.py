@@ -54,7 +54,9 @@ def test_a_host_set_up_before_the_guard_reads_as_missing(tmp_path):
 
 
 def test_a_guard_without_one_service_reads_as_partial(tmp_path):
-    text = "\n".join(line for line in _setup_script_guard().splitlines() if "containerd" not in line)
+    text = "\n".join(
+        line for line in _setup_script_guard().splitlines() if "containerd" not in line
+    )
 
     assert _read(_host(tmp_path, text)) == ("partial", ["containerd"])
 
@@ -67,16 +69,43 @@ def test_a_later_zero_in_any_quoting_keeps_the_guard(tmp_path, value):
 
 
 def test_a_commented_out_rule_does_not_count(tmp_path):
-    text = _setup_script_guard().replace("$nrconf{override_rc}->{qr(^containerd)}", "# $nrconf{override_rc}->{qr(^containerd)}")
+    text = _setup_script_guard().replace(
+        "$nrconf{override_rc}->{qr(^containerd)}", "# $nrconf{override_rc}->{qr(^containerd)}"
+    )
 
     assert _read(_host(tmp_path, text)) == ("partial", ["containerd"])
 
 
-@pytest.mark.parametrize("value", ["1", "'1'", '"1"', '"\'0\'"', "'\"0\"'"])
+@pytest.mark.parametrize("value", ["1", "'1'", '"1"', "\"'0'\"", "'\"0\"'"])
 def test_a_later_assignment_that_re_enables_a_restart_wins(tmp_path, value):
     text = _setup_script_guard() + f"\n$nrconf{{override_rc}}->{{qr(^containerd)}} = {value};\n"
 
     assert _read(_host(tmp_path, text)) == ("partial", ["containerd"])
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "$nrconf{override_rc}->{qr/^containerd/} = 1;",  # another delimiter, same hash key in Perl
+        "$nrconf{override_rc}->{qr(^sysbox)} = 0; $nrconf{override_rc}->{qr(^containerd)} = 1;",  # same line
+        "$nrconf{override_rc} = {};",  # whole-map reset
+        "$nrconf{override_rc}{qr(^docker)} = 1;",  # arrow omitted
+        "%nrconf = ();",
+    ],
+)
+def test_live_perl_the_parser_does_not_recognise_guards_nothing(tmp_path, extra):
+    text = _setup_script_guard() + "\n" + extra + "\n"
+
+    assert _read(_host(tmp_path, text)) == (
+        "partial",
+        list(("sysbox", "docker", "containerd", "nvidia-fabricmanager", "nvidia-persistenced")),
+    )
+
+
+def test_blank_lines_comments_and_trailing_comments_keep_the_guard(tmp_path):
+    text = "# lium\n\n" + _setup_script_guard().replace(" = 0;", " = 0;  # keep pods up") + "\n\n"
+
+    assert _read(_host(tmp_path, text)) == ("present", [])
 
 
 def test_the_remediation_carries_every_line_the_setup_script_writes():
