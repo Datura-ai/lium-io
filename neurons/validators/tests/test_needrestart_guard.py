@@ -58,6 +58,20 @@ def test_the_file_the_setup_script_writes_reads_as_present(tmp_path):
     assert _read(_host(tmp_path, _setup_script_guard())) == ("present", [])
 
 
+@pytest.mark.parametrize(
+    "release",
+    # each distro's stock needrestart.conf from its needrestart package, verbatim
+    ["ubuntu2004", "ubuntu2204", "ubuntu2404", "debian11", "debian12"],
+)
+def test_the_guard_reads_as_present_under_each_stock_main_config(tmp_path, release):
+    host = _host(tmp_path, _setup_script_guard())
+    (host / "etc/needrestart/needrestart.conf").write_text(
+        (Path(__file__).resolve().parent / "fixtures" / f"needrestart_{release}.conf").read_text()
+    )
+
+    assert _read(host) == ("present", [])
+
+
 def test_a_host_set_up_before_the_guard_reads_as_missing(tmp_path):
     status, unguarded = _read(_host(tmp_path, None))
 

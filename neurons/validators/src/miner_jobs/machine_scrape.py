@@ -803,7 +803,7 @@ def get_needrestart_guard(host_root="/proc/1/root"):
     loader = [
         "if(-d q(/etc/needrestart/conf.d)) {",
         "foreach my $fn (sort </etc/needrestart/conf.d/*.conf>) {",
-        'print STDERR "$LOGPREF eval $fn\\n" if($nrconf{verbosity} > 1);',
+        'print STDERR "$LOGPREF eval $fn\\n" if($nrconf{verbosity} > 1);',  # needrestart 3.4 (Ubuntu 20.04): verbose
         "eval do { local(@ARGV, $/) = $fn; <>};",
         'die "Error parsing $fn: $@" if($@);',
         "}",
@@ -816,11 +816,14 @@ def get_needrestart_guard(host_root="/proc/1/root"):
             main = [ln for ln in conf_file.read().splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
     except FileNotFoundError:
         return unknowable  # no main config, so nothing loads conf.d and the guard file is never read
-    flat = [" ".join(ln.split()) for ln in main]
+    # the stock files differ only in 3.4's log condition and its one computed setting, matched exactly
+    old_log = 'print STDERR "$LOGPREF eval $fn\\n" if($nrconf{verbose});'
+    stock_code = ["$nrconf{skip_mapfiles} = (-d '/proc/sys/kernel/grsecurity' ? -1 : 0);"]
+    flat = [" ".join(ln.split()).replace(old_log, loader[2]) for ln in main]
     at = next((i for i in range(len(flat)) if flat[i : i + len(loader)] == loader), None)
     if at is None or at + len(loader) != len(main):
         return unknowable  # conf.d is not loaded the stock way, or main config code runs after the guard file
-    earlier = [main[:at]]
+    earlier = [[ln for ln, f in zip(main[:at], flat) if f not in stock_code]]
     names = sorted(n for n in os.listdir(conf_dir) if n.endswith(".conf") and n != guard_name)
     for name in names:
         with open(conf_dir + "/" + name) as conf_file:
