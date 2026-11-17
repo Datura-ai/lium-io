@@ -626,6 +626,9 @@ class Settings(BaseSettings):
     UNREACHABLE_EXECUTOR_REPORT_ENABLED: bool = Field(
         env="UNREACHABLE_EXECUTOR_REPORT_ENABLED", default=False
     )
+    # DAH-6379: memory.oom.group=1 on rental pods (an OOM kill takes the whole pod). Off until the renter notice is
+    # out; the validator operator turns it on then. MemoryMin on host services is applied regardless.
+    POD_OOM_GROUP_ENABLED: bool = Field(env="POD_OOM_GROUP_ENABLED", default=False)
     SKIP_COLLATERAL_PENALTY: bool = Field(env="SKIP_COLLATERAL_PENALTY", default=True)
     DRY_RUN: bool = Field(env="DRY_RUN", default=False, description="Run validation without publishing scores/weights")
     # DAH-4001 — delayed idle settlement. off: today's behaviour, nothing reported. shadow: post every cycle's
