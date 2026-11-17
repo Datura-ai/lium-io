@@ -213,15 +213,15 @@ async def test_a_claimed_card_cuda_cannot_see_fails_even_though_its_run_exits_ze
     assert probe.passed is False
     assert probe.failure_reason == "7/8 card(s) failed device work-proof"
     assert [c["reason"] for c in probe.per_card] == [""] + ["no_answer"] * 7
-    assert probe.no_answer_only is True
+    # card 0 answered, so the others' silence is theirs: no live-workload waiver (lio#2305 review)
+    assert probe.no_card_answered is False
 
     result = await svc.validate_gpu_model_and_process_job(
         ssh_client=_ssh_cuda_blind(real_cards=1), executor_info=_executor(), default_extra={}, machine_spec=_spec(8)
     )
     assert result.success is False
     assert result.error_message.startswith("All-cards GPU work-proof failed")
-    # CapabilityCheck waives it only when the backend lists a workload live on the node right now
-    assert result.all_cards_no_answer is True
+    assert result.all_cards_no_answer is False
 
 
 @pytest.mark.asyncio
@@ -237,7 +237,7 @@ async def test_a_wrong_answer_on_one_card_is_never_a_no_answer(svc, monkeypatch)
 
     assert probe.passed is False
     assert probe.per_card[5]["reason"] == "wrong_answer"
-    assert probe.no_answer_only is False
+    assert probe.no_card_answered is False
 
 
 @pytest.mark.parametrize(
@@ -279,16 +279,18 @@ async def test_a_single_card_host_is_proven_by_the_single_card_run(svc):
     assert await svc.probe_all_claimed_cards(_ssh(real_cards=1), _executor(), {}, _spec(1)) is None
 
 
-@pytest.mark.parametrize(("cards", "threshold"), [(8, 120), (12, 240), (14, 240)])
+@pytest.mark.parametrize(("cards", "threshold"), [(8, 90), (12, 180), (14, 180)])
+@pytest.mark.parametrize("over", [False, True])
 @pytest.mark.asyncio
-async def test_the_wall_clock_allows_one_per_card_cap_per_wave(svc, monkeypatch, cards, threshold):
-    ticks = iter([0.0, threshold - 1.0])
+async def test_the_wall_clock_is_the_flat_90_s_per_wave(svc, monkeypatch, cards, threshold, over):
+    _flags(monkeypatch, enforce=True)
+    ticks = iter([0.0, threshold + (1.0 if over else -1.0)])
     monkeypatch.setattr(mvs.time, "perf_counter", lambda: next(ticks))
 
     probe = await svc.probe_all_claimed_cards(_ssh(real_cards=cards), _executor(), {}, _spec(cards))
 
-    assert probe.passed is True
-    assert probe.over_wall_clock is False
+    assert probe.over_wall_clock is over
+    assert probe.passed is not over
 
 
 def test_both_flags_default_on():
@@ -306,7 +308,7 @@ def test_every_scored_model_has_a_work_proof_size():
     assert [m for m in GPU_MODEL_RATES if not mvs.matmul_probe_vram_mb(m)] == []
 
 
-def test_only_a_no_answer_all_cards_failure_is_open_to_the_live_workload_waiver():
+def test_only_an_all_cards_failure_with_no_card_answering_is_open_to_the_live_workload_waiver():
     from services.task.checks.capability import _probe_gave_no_answer
 
     failed = "All-cards GPU work-proof failed: 7/8 card(s) failed device work-proof"
@@ -314,91 +316,111 @@ def test_only_a_no_answer_all_cards_failure_is_open_to_the_live_workload_waiver(
     assert not _probe_gave_no_answer(mvs.ValidationResult(success=False, error_message=failed))
 
 
-def _ssh_scripted(card: int, answers: list[str]):
-    # card `card` answers each pinned run from `answers` in turn ("timeout" raises the run's timeout);
-    # every other card answers right; kills are recorded
-    calls = {"runs": 0, "kills": []}
+def _ssh_scripted(answers_by_card: dict[int, list[str]]):
+    # each card in `answers_by_card` answers its pinned runs from its list in turn ("timeout" raises the
+    # run's timeout); every other card answers right; kills are recorded
+    calls = {"runs": {card: 0 for card in answers_by_card}, "kills": []}
 
     async def run(cmd, *args, **kwargs):
         if cmd.startswith("pkill"):
             calls["kills"].append(cmd)
             return SimpleNamespace(exit_status=0, stdout="", stderr="")
-        if "CUDA_VISIBLE_DEVICES=" in cmd and _card_index(cmd) == card:
-            answer = answers[calls["runs"]]
-            calls["runs"] += 1
+        if "CUDA_VISIBLE_DEVICES=" in cmd and _card_index(cmd) in answers_by_card:
+            card = _card_index(cmd)
+            answer = answers_by_card[card][calls["runs"][card]]
+            calls["runs"][card] += 1
             if answer == "timeout":
                 raise TimeoutError()
             return SimpleNamespace(exit_status=0, stdout=answer, stderr="")
-        return SimpleNamespace(exit_status=0, stdout=ANSWER, stderr="")
+        if "CUDA_VISIBLE_DEVICES=" in cmd:
+            return SimpleNamespace(exit_status=0, stdout=ANSWER, stderr="")
+        return SimpleNamespace(exit_status=0, stdout="UUID: x", stderr="")
 
     return SimpleNamespace(run=run), calls
 
 
 @pytest.mark.asyncio
-async def test_a_timeout_then_a_right_answer_on_the_retry_passes(svc, monkeypatch):
+async def test_a_timeout_retries_every_card_together_and_a_right_answer_then_passes(svc, monkeypatch):
     _flags(monkeypatch, enforce=True)
-    ssh, calls = _ssh_scripted(0, ["timeout", ANSWER])
+    ssh, calls = _ssh_scripted({0: ["timeout", ANSWER], 7: [ANSWER, ANSWER]})
 
     probe = await svc.probe_all_claimed_cards(ssh, _executor(), {}, _spec(8))
 
     assert probe.passed is True
-    assert probe.per_card[0]["ok"] is True and probe.per_card[0]["retried"] is True
-    assert calls["runs"] == 2
-    # only the timed-out card's own run is killed before the retry
-    assert len(calls["kills"]) == 1 and "deadbeef" in calls["kills"][0]
+    assert all(card["ok"] and card["retried"] for card in probe.per_card)
+    # the whole run again (card 7 answered right the first time and still ran again), after one sweep
+    assert calls["runs"] == {0: 2, 7: 2}
+    assert len(calls["kills"]) == 1
 
 
 @pytest.mark.asyncio
-async def test_a_timeout_then_another_timeout_fails_the_card_and_the_node(svc, monkeypatch):
+async def test_one_card_that_times_out_again_while_the_others_answer_fails_with_no_waiver(svc, monkeypatch):
+    """Node 4bba0106 (10-16 Nov): card 0 timed out every recheck while the other 7 finished in seconds."""
     _flags(monkeypatch, enforce=True)
-    ssh, calls = _ssh_scripted(0, ["timeout", "timeout"])
+    ssh, calls = _ssh_scripted({0: ["timeout", "timeout"]})
 
     probe = await svc.probe_all_claimed_cards(ssh, _executor(), {}, _spec(8))
 
     assert probe.passed is False
     assert probe.per_card[0]["reason"] == "timeout_after_retry"
-    assert calls["runs"] == 2
+    assert probe.no_card_answered is False
+    assert calls["runs"] == {0: 2}
     result = await svc.validate_gpu_model_and_process_job(
-        ssh_client=_ssh_scripted(0, ["timeout", "timeout"])[0],
+        ssh_client=_ssh_scripted({0: ["timeout", "timeout"]})[0],
         executor_info=_executor(),
         default_extra={},
         machine_spec=_spec(8),
     )
     assert result.success is False
     assert result.error_message.startswith("All-cards GPU work-proof failed")
+    assert result.all_cards_no_answer is False
+
+
+@pytest.mark.asyncio
+async def test_every_card_timing_out_twice_is_no_answer_left_to_the_live_workload_waiver(svc, monkeypatch):
+    _flags(monkeypatch, enforce=True)
+    ssh, _ = _ssh_scripted({card: ["timeout", "timeout"] for card in range(8)})
+
+    probe = await svc.probe_all_claimed_cards(ssh, _executor(), {}, _spec(8))
+
+    assert probe.passed is False
+    assert {card["reason"] for card in probe.per_card} == {"timeout_after_retry"}
+    assert probe.no_card_answered is True
 
 
 @pytest.mark.asyncio
 async def test_a_timeout_then_a_wrong_answer_fails(svc, monkeypatch):
     _flags(monkeypatch, enforce=True)
-    ssh, calls = _ssh_scripted(0, ["timeout", "UUID: someone-elses"])
+    ssh, _ = _ssh_scripted({0: ["timeout", "UUID: someone-elses"]})
 
     probe = await svc.probe_all_claimed_cards(ssh, _executor(), {}, _spec(8))
 
     assert probe.passed is False
     assert probe.per_card[0]["reason"] == "wrong_answer"
-    assert probe.no_answer_only is False
+    assert probe.no_card_answered is False
 
 
 @pytest.mark.asyncio
-async def test_a_wrong_answer_on_the_first_try_fails_with_no_retry(svc, monkeypatch):
+async def test_a_wrong_answer_anywhere_fails_with_no_retry_even_beside_a_timeout(svc, monkeypatch):
     _flags(monkeypatch, enforce=True)
-    ssh, calls = _ssh_scripted(0, ["UUID: someone-elses", ANSWER])
+    ssh, calls = _ssh_scripted({0: ["UUID: someone-elses", ANSWER], 1: ["timeout", ANSWER]})
 
     probe = await svc.probe_all_claimed_cards(ssh, _executor(), {}, _spec(8))
 
     assert probe.passed is False
     assert probe.per_card[0]["reason"] == "wrong_answer"
     assert "retried" not in probe.per_card[0]
-    assert calls["runs"] == 1 and calls["kills"] == []
+    assert calls["runs"] == {0: 1, 1: 1}
 
 
 @pytest.mark.asyncio
-async def test_a_retried_wave_gets_the_retry_budget_on_the_wall_clock(svc, monkeypatch):
-    ticks = iter([0.0, 200.0])
+async def test_the_retry_run_is_timed_on_its_own_against_the_same_wall_clock(svc, monkeypatch):
+    _flags(monkeypatch, enforce=True)
+    # first run 0 -> 130 s (timed out), retry 130 -> 221 s: 91 s, over the 90 s of one wave
+    ticks = iter([0.0, 130.0, 130.0, 221.0])
     monkeypatch.setattr(mvs.time, "perf_counter", lambda: next(ticks))
-    ssh, _ = _ssh_scripted(0, ["timeout", ANSWER])
+    ssh, _ = _ssh_scripted({0: ["timeout", ANSWER]})
 
     probe = await svc.probe_all_claimed_cards(ssh, _executor(), {}, _spec(8))
 
-    assert probe.over_wall_clock is False and probe.passed is True
+    assert probe.over_wall_clock is True and probe.passed is False

@@ -25,22 +25,22 @@ MATRIX_VERIFY_TIMEOUT_SECONDS = 120
 
 # DAH-2671 item 3 — wide aggregate wall-clock (seconds) per wave of MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS
 # cards for the all-claimed-cards work-proof. N honest cards run concurrently in ~single-card time; a
-# count lie that serialises onto one real card blows out to ~N*single-card, which also trips each run's
-# own MATRIX_VERIFY_TIMEOUT_SECONDS cap. Prod 10-16 Nov: an honest 8x B300 took 85 s against the old
-# flat 90, so a wave gets the per-card cap itself and a 12-14 card host (two waves) twice that.
-MATMUL_ALLCARDS_WALL_CLOCK_SECONDS = 120
+# count lie that serialises onto one real card blows out to ~N*single-card. Deliberately wide so honest
+# slowdowns do not trip it (prod 10-16 Nov: an honest 8x B300 took 85 s). A 9-14 card host runs in two
+# waves (the gate below), so it gets two of these; up to 8 cards it is the flat 90 it always was.
+MATMUL_ALLCARDS_WALL_CLOCK_SECONDS = 90
 
 # Cards probed at once. Each card takes an SSH channel on one connection and MAX_GPU_COUNT is 14,
 # while OpenSSH defaults to MaxSessions 10 — 8 keeps the concurrency signal (a count lie still
 # serialises) and stays clear of that ceiling on the widest honest hosts.
 MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS = 8
 
-# A card that times out gets ONE retry, of that card only, with a fresh challenge, after its own run is
-# killed. A timeout is never a pass: a retry that times out again, or answers wrong or not at all,
-# fails the card (reason `timeout_after_retry` or the retry's own reason). A wrong answer is never
-# retried. Worst case per card: two runs under MATRIX_VERIFY_TIMEOUT_SECONDS plus the kill's 10 s.
-MATMUL_ALLCARDS_CARD_KILL_TIMEOUT_SECONDS = 10
-MATMUL_ALLCARDS_RETRY_BUDGET_SECONDS = MATRIX_VERIFY_TIMEOUT_SECONDS + MATMUL_ALLCARDS_CARD_KILL_TIMEOUT_SECONDS
+# When a card times out and no card answered wrong, the WHOLE run is retried once: every card again, together,
+# with fresh challenges, after the first run's processes are killed, and timed on its own against the same
+# wall-clock. Retrying all cards together keeps the serialisation signal (a lone card retried after the
+# others finished would have the real card to itself). A timeout is never a pass: the retry decides, and a
+# card that times out again fails (`timeout_after_retry`). A wrong answer is never retried. Worst case:
+# two runs of MATRIX_VERIFY_TIMEOUT_SECONDS per wave plus the kill in between.
 
 # VRAM (MB) the work-proof leaves untouched: a quarter of the card, clamped between the two.
 # The reserve must clear what an idle card may legally hold (GPU_HELD_VRAM_MB_LIMIT, 2048 MB —
@@ -204,7 +204,7 @@ class ValidationResult:
     # DAH-6241: card index -> the sealed metrics the all-cards probe read off that card alone
     # (None when the probe did not run); device 0's own are in `metrics`.
     card_metrics: dict[int, dict] | None = None
-    # The all-cards work-proof failed with no wrong answer (see AllCardsProbe.no_answer_only).
+    # The all-cards work-proof failed with no card answering at all (see AllCardsProbe.no_card_answered).
     all_cards_no_answer: bool = False
 
     def __bool__(self) -> bool:
@@ -229,12 +229,14 @@ class AllCardsProbe:
     per_card: list[dict]
 
     @property
-    def no_answer_only(self) -> bool:
-        """True when no card answered wrong: every failed card timed out, lost its channel or gave
-        no answer (the busy-card symptoms), so a workload the backend started after the cycle's
-        snapshot may explain it. A wrong answer is the anti-spoof case and never qualifies."""
-        failed = [c for c in self.per_card if not c.get("ok")]
-        return bool(failed) and all(c.get("reason") != "wrong_answer" for c in failed)
+    def no_card_answered(self) -> bool:
+        """True when NO card answered: every card timed out, lost its channel or gave no answer (the
+        busy-node symptoms), so a workload the backend started after the cycle's snapshot may explain
+        it and CapabilityCheck may waive it. One card failing while the others answer is the card's
+        own fault (a stuck card, a card CUDA cannot see) and fails; a wrong answer never qualifies."""
+        return bool(self.per_card) and all(
+            not c.get("ok") and c.get("reason") != "wrong_answer" for c in self.per_card
+        )
 
 
 def _not_probed(reason: str) -> AllCardsProbe:
@@ -345,56 +347,30 @@ class ValidationService:
             (details[index].get("uuid", "") or "") if index < len(details) else ""
             for index in range(gpu_count)
         ]
-        challenges: list[MatmulChallenge] = []
-        for card_uuid in card_uuids:
-            challenge = self._card_challenge(gpu_model, sized_vram_mb, card_uuid, default_extra)
-            # A native error yields an empty cipher. Nothing is sent; the cards stay unproven, so the
-            # probe fails closed, as the single-card path does on the same error.
-            if challenge is None:
-                for prepared in challenges:
-                    prepared.close()
-                logger.warning(
-                    _m(
-                        "All-cards matmul not run: cipher text generation failed (native error)",
-                        extra=get_extra_info(default_extra),
-                    )
-                )
-                return _not_probed("cipher text generation failed (native error)")
-            challenges.append(challenge)
-
-        # One SSH channel per card on a single connection, so the fan-out has to stay under the
-        # executor's sshd MaxSessions (OpenSSH defaults to 10). A 12-14 card host would otherwise
-        # push the tail channels into the ssh_error branch and read as a failed work-proof.
-        gate = asyncio.Semaphore(MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS)
-
-        async def run_gated(index: int, challenge: MatmulChallenge) -> dict:
-            async with gate:
-                outcome = await self._run_one_card(
-                    ssh_client, executor_info, script_path, index, challenge, card_uuids[index]
-                )
-                if outcome["reason"] != "timeout":
-                    return outcome
-                return await self._retry_timed_out_card(
-                    ssh_client, executor_info, script_path, index, challenge, card_uuids[index],
-                    gpu_model, sized_vram_mb, default_extra,
-                )
-
-        start = time.perf_counter()
-        try:
-            per_card = await asyncio.gather(
-                *(run_gated(index, challenge) for index, challenge in enumerate(challenges))
+        run = await self._run_all_cards(
+            ssh_client, executor_info, script_path, gpu_model, sized_vram_mb, card_uuids, default_extra
+        )
+        if run is None:
+            return _not_probed("cipher text generation failed (native error)")
+        per_card, elapsed = run
+        timed_out = any(outcome["reason"] == "timeout" for outcome in per_card)
+        if timed_out and all(outcome["reason"] != "wrong_answer" for outcome in per_card):
+            # the whole run again, together, so the retry is as concurrent as the first try
+            await self._kill_remote_matmul(ssh_client, script_path, {**default_extra, "retry": "all_cards"})
+            retry = await self._run_all_cards(
+                ssh_client, executor_info, script_path, gpu_model, sized_vram_mb, card_uuids, default_extra
             )
-        finally:
-            for challenge in challenges:
-                challenge.close()
-        elapsed = time.perf_counter() - start
+            if retry is None:
+                return _not_probed("cipher text generation failed (native error)")
+            per_card, elapsed = retry
+            for outcome in per_card:
+                outcome["retried"] = True
+                if outcome["reason"] == "timeout":
+                    outcome["reason"] = "timeout_after_retry"
 
         failed_cards = [outcome for outcome in per_card if not outcome["ok"]]
         waves = -(-gpu_count // MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS)
-        # a retried card's own budget is not serialisation: a wave with a retry gets the retry's budget too
-        retried = any(outcome.get("retried") for outcome in per_card)
-        per_wave = MATMUL_ALLCARDS_WALL_CLOCK_SECONDS + (MATMUL_ALLCARDS_RETRY_BUDGET_SECONDS if retried else 0)
-        wall_clock_threshold = per_wave * waves
+        wall_clock_threshold = MATMUL_ALLCARDS_WALL_CLOCK_SECONDS * waves
         over_wall_clock = elapsed > wall_clock_threshold
         passed = not failed_cards and not over_wall_clock
         if failed_cards:
@@ -436,41 +412,55 @@ class ValidationService:
             per_card=per_card,
         )
 
-    async def _retry_timed_out_card(
+    async def _run_all_cards(
         self,
         ssh_client,
         executor_info,
         script_path: str,
-        index: int,
-        timed_out: "MatmulChallenge",
-        card_uuid: str,
         gpu_model: str,
         sized_vram_mb: int,
+        card_uuids: list[str],
         default_extra: dict,
-    ) -> dict:
-        # kill only this card's run (its cipher text is on its command line; the other cards keep going),
-        # so the retry does not find the card's VRAM still held by the first run
+    ) -> tuple[list[dict], float] | None:
+        """Every claimed card's own challenge, concurrently, timed on the validator: (per-card
+        outcomes, elapsed seconds), or None when our own cipher failed (nothing was sent)."""
+        challenges: list[MatmulChallenge] = []
+        for card_uuid in card_uuids:
+            challenge = self._card_challenge(gpu_model, sized_vram_mb, card_uuid, default_extra)
+            # A native error yields an empty cipher. Nothing is sent; the cards stay unproven, so the
+            # probe fails closed, as the single-card path does on the same error.
+            if challenge is None:
+                for prepared in challenges:
+                    prepared.close()
+                logger.warning(
+                    _m(
+                        "All-cards matmul not run: cipher text generation failed (native error)",
+                        extra=get_extra_info(default_extra),
+                    )
+                )
+                return None
+            challenges.append(challenge)
+
+        # One SSH channel per card on a single connection, so the fan-out has to stay under the
+        # executor's sshd MaxSessions (OpenSSH defaults to 10). A 12-14 card host would otherwise
+        # push the tail channels into the ssh_error branch and read as a failed work-proof.
+        gate = asyncio.Semaphore(MATMUL_ALLCARDS_MAX_CONCURRENT_CARDS)
+
+        async def run_gated(index: int, challenge: MatmulChallenge) -> dict:
+            async with gate:
+                return await self._run_one_card(
+                    ssh_client, executor_info, script_path, index, challenge, card_uuids[index]
+                )
+
+        start = time.perf_counter()
         try:
-            await ssh_client.run(
-                f"pkill -9 -f -- {shlex.quote(timed_out.params.cipher_text[:64])}",
-                timeout=MATMUL_ALLCARDS_CARD_KILL_TIMEOUT_SECONDS,
-            )
-        except Exception as e:
-            logger.warning("All-cards per-card kill before retry failed: %s", str(e))
-        challenge = self._card_challenge(gpu_model, sized_vram_mb, card_uuid, default_extra)
-        if challenge is None:
-            # our cipher failed: the card is still unproven, so it fails
-            return {"card_index": index, "ok": False, "reason": "timeout_after_retry", "retried": True}
-        try:
-            outcome = await self._run_one_card(
-                ssh_client, executor_info, script_path, index, challenge, card_uuid
+            per_card = await asyncio.gather(
+                *(run_gated(index, challenge) for index, challenge in enumerate(challenges))
             )
         finally:
-            challenge.close()
-        if outcome["reason"] == "timeout":
-            outcome["reason"] = "timeout_after_retry"
-        outcome["retried"] = True
-        return outcome
+            for challenge in challenges:
+                challenge.close()
+        return list(per_card), time.perf_counter() - start
 
     @staticmethod
     def _leaves_matmul_running(outcome: dict) -> bool:
@@ -850,7 +840,7 @@ class ValidationService:
                 return ValidationResult(
                     success=False,
                     error_message=f"All-cards GPU work-proof failed: {all_cards.failure_reason}",
-                    all_cards_no_answer=all_cards.no_answer_only,
+                    all_cards_no_answer=all_cards.no_card_answered,
                 )
 
         # Per-call verifier object: its key MUST survive the SSH round-trip so we can

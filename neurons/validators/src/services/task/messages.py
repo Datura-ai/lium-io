@@ -2039,6 +2039,19 @@ class CapabilityMessages:
             "the current executor image with its default environment; the next measured pass clears it."
         ),
     )
+    # lio#2305: a claimed card gave no right answer to its own work-proof; stored until a run on it passes
+    GPU_WORK_PROOF_FAILED = MessageTemplate(
+        event="GPU check failed: a claimed card gave no right answer to its own work-proof",
+        reason="GPU_WORK_PROOF_FAILED",
+        severity="error",
+        category=AVAILABILITY_CATEGORY,
+        impact="Score set to 0; node hidden and not rentable until a GPU check on that card passes (a "
+        "running rental is kept)",
+        remediation=(
+            "Every GPU the node reports must run the GPU check itself. Make sure CUDA sees each listed card "
+            "(nvidia-smi and a CUDA sample inside a container); the next passing check on that card clears it."
+        ),
+    )
     # DAH-6241: a rented node has no stored GPU model mismatch (or is not rented: judged later)
     GPU_MODEL_VERDICT_OK = MessageTemplate(
         event="GPU model verdict: no stored mismatch",

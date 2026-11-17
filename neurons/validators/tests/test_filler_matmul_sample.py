@@ -256,8 +256,35 @@ async def test_a_sampled_card_cuda_cannot_see_fails_the_filler_node_under_enforc
     assert check.event.what_we_saw["matmul_sample"]["error_kind"] == "no_answer"
     assert check.passed is (not enforced)
     if enforced:
-        assert check.event.reason_code == Msg.VERIFY_FAILED.reason
+        assert check.event.reason_code == Msg.GPU_WORK_PROOF_FAILED.reason
         assert check.event.what_we_saw["transport"] == "filler"
+
+
+class ScriptedSamplingService(SamplingValidationService):
+    def __init__(self, results: list):
+        super().__init__()
+        self.results = results
+
+    async def validate_gpu_model_and_process_job(self, **kwargs):
+        self.result = self.results[len(self.gpu_uuids)]
+        return await super().validate_gpu_model_and_process_job(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_card_is_stored_and_resampled_every_cycle_until_it_passes(context_factory, monkeypatch):
+    """lio#2305 review: the failed card lives in the GPU model verdict, so the node fails on the cycles between
+    samples too, and that card is sampled every cycle until a right answer from it clears it."""
+    monkeypatch.setattr(capability.settings, "FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES", 96)
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", True)
+    blind = _no_answer("no CUDA-capable device is detected")
+    service = ScriptedSamplingService([blind, blind, ValidationResult(success=True)])
+
+    results = await _filler_cycles(context_factory, service, 4, specs=_cards(8))
+
+    # cycle 1 samples the unjudged node (card 0) and fails it; cycles 2-3 resample card 0, the 3rd answers right
+    assert service.gpu_uuids == ["GPU-0", "GPU-0", "GPU-0"]
+    assert [r.passed for r in results] == [False, False, True, True]
+    assert results[1].event.reason_code == Msg.GPU_WORK_PROOF_FAILED.reason
 
 
 @pytest.mark.asyncio
