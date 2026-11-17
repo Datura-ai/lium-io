@@ -2,7 +2,7 @@
 
 Builds drop egress to blocked ranges through host DOCKER-USER rules (``docker_service._egress_filter_script``).
 This check applies the same kind of rule for rentals, from a shell in the host's mount and network namespaces
-(``nsenter -t 1 -m -n``; the executor runs privileged with ``pid: host``), so it needs no image and no registry: traffic entering from the ``lium-rentals``
+(``nsenter -t 1 -m -n -r``; the executor runs privileged with ``pid: host``), so it needs no image and no registry: traffic entering from the ``lium-rentals``
 bridge, and from a running legacy rental still on another network (the default bridge; a running
 pod is never moved), to link-local 169.254/16 is dropped, except DNS (port 53), because a rental
 container's embedded resolver forwards from the container's network namespace and some hosts use
@@ -222,10 +222,11 @@ def helper_command(script: str) -> str:
 
 def _helper(script: str) -> str:
     # The host's own iptables in its network namespace: no helper container, so no image pull that a registry
-    # (Docker Hub's anonymous rate limit) can refuse
+    # (Docker Hub's anonymous rate limit) can refuse. -r: the lock file, /bin/sh and iptables resolve in the host's
+    # root, so every executor on one host takes the same lock instead of one in its own container root
     return (
         f"timeout -k 5 {HELPER_TIMEOUT_SECONDS} "
-        f"nsenter -t 1 -m -n -- /bin/sh -c {shlex.quote(helper_command(script))}"
+        f"nsenter -t 1 -m -n -r -- /bin/sh -c {shlex.quote(helper_command(script))}"
     )
 
 

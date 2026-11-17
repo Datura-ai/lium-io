@@ -120,12 +120,23 @@ async def test_applies_the_drop_in_the_hosts_namespaces_without_any_image(contex
     assert result.passed is True
     assert result.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
     [helper] = _helper_calls(ssh)
-    assert helper.startswith("timeout ") and " nsenter -t 1 -m -n -- /bin/sh -c " in helper
+    assert helper.startswith("timeout ") and " nsenter -t 1 -m -n -r -- /bin/sh -c " in helper
     # no container: a registry refusing an anonymous pull (Docker Hub's rate limit) can never leave a node unguarded
     assert not any("docker run" in call or "docker pull" in call for call in ssh.calls)
     # the lock and the helper's own bound are host-side; none is executor-side
     assert "flock" not in helper.split("nsenter")[0]
     assert helper.endswith(shlex.quote(helper_command(link_local_drop_script("br-0123456789ab", []))))
+
+
+@pytest.mark.asyncio
+async def test_the_lock_and_shell_resolve_in_the_hosts_root_not_the_executors(context_factory):
+    ssh = _ssh()
+    await RentalEgressGuardCheck().run(context_factory(ssh=ssh))
+
+    [helper] = _helper_calls(ssh)
+    nsenter_flags = shlex.split(helper.split("nsenter", 1)[1].split(" -- ", 1)[0])
+    # without -r two executors on one host resolve the lock path in their own roots: two locks, interleaved swaps
+    assert "-r" in nsenter_flags
 
 
 @pytest.mark.asyncio
