@@ -28,7 +28,6 @@ from ...const import (
     PARKED_SUFFIXES,
     POD_CONTAINER_NAME_GRACE_MINUTES,
 )
-from core.config import settings
 from services.gpu_reset import renter_gpu_reset_in_progress
 from services.redis_service import (
     EXECUTOR_CREATE_LOCK_TIMEOUT,
@@ -48,7 +47,6 @@ from .provider_maintenance import maintenance_failure, maintenance_window_at_cyc
 from .rental_owner import rental_of_this_node
 from .task_time import task_seconds_left
 from .port_count import (
-    hidden_from_renters_text,
     port_count_below_listing_floor,
     port_floor_what,
     split_port_shortfall,
@@ -462,7 +460,7 @@ class TenantEnforcementCheck:
                     # Every listed pod is stale here (the check above): the floor applies to an idle node.
                     port_count_below_floor = port_count_below_listing_floor(ctx.state)
                     # DAH-3698 (owner rule): only a rented split node is exempt from its per-split ports, so a
-                    # node whose every listed pod is stale is idle and needs them, with or without the floor flag
+                    # node whose every listed pod is stale is idle and needs them
                     split_short = split_port_shortfall(ctx.state)
                     reprobed: dict[str, Any] = {}
                     if split_short is not None:
@@ -497,10 +495,7 @@ class TenantEnforcementCheck:
                                 updates={"default_extra": extra, "rented": False, "ssh_pub_keys": None, **reprobed},
                             )
                         )
-                    if (
-                        port_count_below_floor is not None
-                        and settings.ENFORCE_PORT_FLOOR_ON_STALE_POD
-                    ):
+                    if port_count_below_floor is not None:
                         event = render_message(
                             PortCountMessages.INSUFFICIENT_PORTS,
                             ctx=ctx,
@@ -515,19 +510,10 @@ class TenantEnforcementCheck:
                                 updates={"default_extra": extra, "rented": False, "ssh_pub_keys": None},
                             )
                         )
-                    impact = None
-                    if port_count_below_floor is not None:
-                        stale_what["port_floor"] = port_floor_what(ctx.state, port_count_below_floor)
-                        impact = (
-                            f"{hidden_from_renters_text(port_count_below_floor)}; "
-                            "the port floor applied only while the pod was listed"
-                        )
                     event = render_message(
                         Msg.STALE_POD_NOT_RUNNING,
                         ctx=ctx,
                         check_id=self.check_id,
-                        severity="warning" if port_count_below_floor is not None else None,
-                        impact=impact,
                         what=stale_what,
                         extra=extra,
                     )
@@ -844,13 +830,13 @@ async def _host_gpu_container_failure(
 
     The container runs the executor's own image, already on the host, with `nvidia-smi -L`: nothing the
     renter wrote is in it, so a refusal is the Docker daemon's or the NVIDIA runtime's. None when the
-    check is off, the pod is not REBOOT_FAILED, the rental is another miner's, the image is unknown,
+    pod is not REBOOT_FAILED, the rental is another miner's, the image is unknown,
     the host started the container, or the transport gave no exit status. Only on a node with this
     one pod: the verdict resets the whole node, and on a split box it would stop billing a healthy
     neighbour pod too. A negative exit code (asyncssh's -1 when a signal killed the `docker` client)
     says nothing about the host.
     """
-    if not settings.REBOOT_FAILED_HOST_CHECK_ENABLED or pod_status != REBOOT_FAILED_POD_STATUS:
+    if pod_status != REBOOT_FAILED_POD_STATUS:
         return None
     rented_data = ctx.state.rented_data
     rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None

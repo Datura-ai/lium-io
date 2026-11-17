@@ -3,7 +3,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from neurons.validators.src.services.task.checks import docker_cpu
 from neurons.validators.src.services.task.checks.docker_cpu import DockerCpuCheck
 from neurons.validators.src.services.task.messages import DockerCpuMessages as Msg
 from tests.helpers import build_state
@@ -20,19 +19,17 @@ def _ssh(ncpu: str, exit_status: int = 0):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "enforce,host,ncpu,exit_status,rented,passed,reason",
+    "host,ncpu,exit_status,rented,passed,reason",
     [
-        (True, 12, "10", 0, False, False, Msg.MISMATCH.reason),
-        (False, 12, "10", 0, False, True, Msg.WARNING.reason),
-        (True, 12, "10", 0, True, True, Msg.WARNING.reason),
-        (True, 12, "12", 0, False, True, Msg.OK.reason),
-        (True, 12, "", 1, False, True, Msg.OK.reason),
-        (True, None, "10", 0, False, True, Msg.OK.reason),
+        (12, "10", 0, False, False, Msg.MISMATCH.reason),
+        (12, "10", 0, True, True, Msg.WARNING.reason),
+        (12, "12", 0, False, True, Msg.OK.reason),
+        (12, "", 1, False, True, Msg.OK.reason),
+        (None, "10", 0, False, True, Msg.OK.reason),
     ],
-    ids=["mismatch-refused", "switch-off-logged-only", "rented-warned", "equal-passes", "unreadable-passes", "no-host-count-passes"],
+    ids=["mismatch-refused", "rented-warned", "equal-passes", "unreadable-passes", "no-host-count-passes"],
 )
-async def test_docker_cpu_check(context_factory, monkeypatch, enforce, host, ncpu, exit_status, rented, passed, reason):
-    monkeypatch.setattr(docker_cpu.settings, "DOCKER_CPU_MISMATCH_ENFORCEMENT_ENABLED", enforce)
+async def test_docker_cpu_check(context_factory, host, ncpu, exit_status, rented, passed, reason):
     state = build_state(specs={"cpu": {"count": host}}, rented_data=_rented_data() if rented else None)
     ctx = context_factory(state=state, ssh=_ssh(ncpu, exit_status))
 

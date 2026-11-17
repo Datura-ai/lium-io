@@ -24,7 +24,6 @@ from neurons.validators.src.services.task.checks.port_count import (
 )
 from neurons.validators.src.services.task.checks.rented_machine import TenantEnforcementCheck
 from neurons.validators.src.services.task.messages import (
-    FinalizeMessages,
     PortConnectivityMessages,
     PortCountMessages,
     TenantEnforcementMessages,
@@ -263,51 +262,7 @@ async def test_the_port_message_states_a_measurement_only_when_one_was_taken(con
         assert result.event.remediation.startswith(prefix)
 
 @pytest.mark.asyncio
-async def test_a_stale_listed_pod_carries_two_ports_through_to_validation_completed(context_factory):
-    """A wide-range host shape: 2 ports, a pod in the batch-start rented list that has since ended."""
-    batch = HostNetworkBatch(reachable=2)
-    ctx = run_context(
-        context_factory,
-        connectivity(batch, PublishedPorts(), PublishedPorts()),
-        rented_data=rented_with_one_pod(),
-        ssh=DummySSHClient(pod_running=False),
-        backend=DummyBackendClient(active=False),
-    )
-
-    _, ctx = await apply(ctx, PortConnectivityCheck())
-    count_result, ctx = await apply(ctx, PortCountCheck())
-    tenant_result, ctx = await apply(ctx, TenantEnforcementCheck())
-    final_result, ctx = await apply(ctx, FinalizeCheck())
-
-    assert ctx.state.specs["available_port_count"] == 2
-    # exempt at the port check because the list still named the pod
-    assert count_result.passed is True
-    assert count_result.event.severity == "warning"
-    assert count_result.event.reason_code == PortCountMessages.PORT_COUNT_RECORDED.reason
-    what = count_result.event.what_we_saw
-    assert what["listing_hidden"] is True and what["exempt_because_rented"] is True
-    assert what["port_range"] == DECLARED_RANGE
-    assert "Hidden from renters: only 2 verified ports, need 3" in count_result.event.impact
-    # the pod is gone, the run goes on as unrented and completes
-    assert tenant_result.passed is True
-    assert tenant_result.event.reason_code == TenantEnforcementMessages.STALE_POD_NOT_RUNNING.reason
-    assert tenant_result.event.what_we_saw["port_floor"]["available_port_count"] == 2
-    assert final_result.event.reason_code == FinalizeMessages.COMPLETED.reason
-    assert final_result.event.impact.startswith("Hidden from renters: only 2 verified ports, need 3.")
-    assert final_result.event.what_we_saw["port_floor"] == {
-        "available_port_count": 2,
-        "required": MIN_PORT_COUNT,
-        "listing_hidden": True,
-        "listing_check": "INSUFFICIENT_PORTS",
-        "port_range": "40000-65535",
-        "probed_port_count": BATCH_PORT_VERIFICATION_SIZE,
-        "declared_port_count": 25536,
-    }
-
-
-@pytest.mark.asyncio
-async def test_stale_pod_fails_insufficient_ports_with_the_enforcement_flag(context_factory, monkeypatch):
-    monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
+async def test_stale_pod_fails_insufficient_ports(context_factory):
     ctx = run_context(
         context_factory,
         connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
@@ -328,12 +283,11 @@ async def test_stale_pod_fails_insufficient_ports_with_the_enforcement_flag(cont
 
 
 @pytest.mark.asyncio
-async def test_a_stale_pod_on_a_deferred_port_check_withholds_the_verdict(context_factory, monkeypatch):
+async def test_a_stale_pod_on_a_deferred_port_check_withholds_the_verdict(context_factory):
     """DAH-5851: every listed pod stale makes the node idle: its deferred cycle is withheld and, like an idle
     node's, is the only one in a row."""
     from dataclasses import replace
 
-    monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
     ctx = run_context(
         context_factory,
         connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
@@ -356,8 +310,7 @@ async def test_a_stale_pod_on_a_deferred_port_check_withholds_the_verdict(contex
 
 
 @pytest.mark.asyncio
-async def test_stale_pod_with_enough_ports_is_unchanged(context_factory, monkeypatch):
-    monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
+async def test_stale_pod_with_enough_ports_is_unchanged(context_factory):
     ctx = run_context(
         context_factory,
         connectivity(HostNetworkBatch(reachable=50), PublishedPorts(), PublishedPorts()),
@@ -385,10 +338,9 @@ async def test_stale_pod_with_enough_ports_is_unchanged(context_factory, monkeyp
     [("pod-live", "pod-stale"), ("pod-stale", "pod-live")],
     ids=["live-then-stale", "stale-then-live"],
 )
-async def test_a_live_rental_keeps_the_exemption_beside_a_stale_pod_with_the_enforcement_flag(
-    context_factory, monkeypatch, pod_order
+async def test_a_live_rental_keeps_the_exemption_beside_a_stale_pod(
+    context_factory, pod_order
 ):
-    monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
     ctx = run_context(
         context_factory,
         connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
@@ -410,10 +362,9 @@ async def test_a_live_rental_keeps_the_exemption_beside_a_stale_pod_with_the_enf
 
 
 @pytest.mark.asyncio
-async def test_every_listed_pod_stale_fails_insufficient_ports_with_the_enforcement_flag(
-    context_factory, monkeypatch
+async def test_every_listed_pod_stale_fails_insufficient_ports(
+    context_factory
 ):
-    monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
     ctx = run_context(
         context_factory,
         connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
@@ -432,8 +383,7 @@ async def test_every_listed_pod_stale_fails_insufficient_ports_with_the_enforcem
 
 
 @pytest.mark.asyncio
-async def test_a_stale_pod_beside_a_down_pod_with_an_open_rental_is_not_enforced(context_factory, monkeypatch):
-    monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
+async def test_a_stale_pod_beside_a_down_pod_with_an_open_rental_is_not_enforced(context_factory):
     ctx = run_context(
         context_factory,
         connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
@@ -451,8 +401,7 @@ async def test_a_stale_pod_beside_a_down_pod_with_an_open_rental_is_not_enforced
 
 
 @pytest.mark.asyncio
-async def test_a_stale_pod_beside_a_running_pod_with_a_closed_rental_is_not_enforced(context_factory, monkeypatch):
-    monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
+async def test_a_stale_pod_beside_a_running_pod_with_a_closed_rental_is_not_enforced(context_factory):
     ctx = run_context(
         context_factory,
         connectivity(HostNetworkBatch(reachable=2), PublishedPorts(), PublishedPorts()),
@@ -471,8 +420,7 @@ async def test_a_stale_pod_beside_a_running_pod_with_a_closed_rental_is_not_enfo
 
 
 @pytest.mark.asyncio
-async def test_a_stale_pod_beside_a_down_pod_without_a_rental_record_is_not_enforced(context_factory, monkeypatch):
-    monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", True)
+async def test_a_stale_pod_beside_a_down_pod_without_a_rental_record_is_not_enforced(context_factory):
 
     class NoRecordForSecondPod(PerPodBackendClient):
         async def get_pod_rental_active(self, pod_id: str):
@@ -669,7 +617,6 @@ async def test_ports_held_by_our_filler_are_not_reported_as_answering(context_fa
     )
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("enforce_floor", [True, False])
 @pytest.mark.parametrize(
     "rental, ports, expected",
     [
@@ -688,13 +635,10 @@ async def test_ports_held_by_our_filler_are_not_reported_as_answering(context_fa
     ],
 )
 async def test_an_8_gpu_split_node_needs_its_ports_once_every_listed_pod_is_stale(
-    context_factory, monkeypatch, rental, ports, expected, enforce_floor
+    context_factory, rental, ports, expected
 ):
     from dataclasses import replace
 
-    if ports < MIN_PORT_COUNT and not enforce_floor:
-        expected = None  # the plain floor on a stale pod stays behind its flag
-    monkeypatch.setattr(settings, "ENFORCE_PORT_FLOOR_ON_STALE_POD", enforce_floor)
 
     class NoRecordForSecondPod(PerPodBackendClient):
         async def get_pod_rental_active(self, pod_id: str):

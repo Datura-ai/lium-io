@@ -2,13 +2,9 @@ from __future__ import annotations
 
 import functools
 import json
-import logging
 import shlex
 from pathlib import Path
 from typing import Any
-
-from core.config import settings
-from core.utils import _m, get_extra_info
 
 from ..messages import GpuFaultProbeMessages as Msg
 from ..messages import render_message
@@ -52,12 +48,11 @@ MAX_NVML_GPUS = 16
 MAX_XID_LINES = 5
 MAX_XID_CHARS = 200
 
-logger = logging.getLogger(__name__)
 
 # A probe with no verdict passes: the timeout, the missing report and the report that is not ok or
 # fault are each innocent once. They are also all a host can produce at will (kill the interpreter,
 # print another status), so a node could sit on "no verdict" for good. Cycles in a row without a
-# verdict are counted per (miner hotkey, executor uuid), per process, and logged from this many on.
+# verdict are counted per (miner hotkey, executor uuid), per process, and judged like a fault from this many on.
 UNKNOWN_STREAK_LIMIT = 5
 _unknown_streak: dict[tuple[str, str], int] = {}
 
@@ -153,8 +148,7 @@ class GpuFaultProbeCheck:
     def _no_verdict(
         self, ctx: Context, what: dict[str, Any], counts_toward_streak: bool = True
     ) -> CheckResult:
-        """UNKNOWN, counted. From UNKNOWN_STREAK_LIMIT cycles in a row it is logged, and under
-        GPU_FAULT_PROBE_UNKNOWN_STREAK_ENFORCEMENT_ENABLED it is judged like a fault. A post-rental recheck is a
+        """UNKNOWN, counted. From UNKNOWN_STREAK_LIMIT cycles in a row it is judged like a fault. A post-rental recheck is a
         second probe in the same cycle, and a card too busy to probe (counts_toward_streak=False) is not
         a silent one, so neither counts: the streak is left as it was."""
         if self.is_post_rental_recheck or not counts_toward_streak:
@@ -166,19 +160,9 @@ class GpuFaultProbeCheck:
         streak = _unknown_streak.get(key, 0) + 1
         _unknown_streak[key] = streak
         if streak >= UNKNOWN_STREAK_LIMIT:
-            enforced = settings.GPU_FAULT_PROBE_UNKNOWN_STREAK_ENFORCEMENT_ENABLED
             what["unknown_streak"] = streak
-            logger.warning(
-                _m(
-                    "GPU_FAULT_PROBE_UNKNOWN_STREAK",
-                    extra=get_extra_info(
-                        {**ctx.default_extra, "unknown_streak": streak, "enforced": enforced}
-                    ),
-                )
-            )
-            if enforced:
-                error = f"probe gave no verdict {streak} cycles in a row: {what.get('error')}"
-                return self._fault_verdict(ctx, what, error=error, report=None)
+            error = f"probe gave no verdict {streak} cycles in a row: {what.get('error')}"
+            return self._fault_verdict(ctx, what, error=error, report=None)
         return CheckResult(
             passed=True,
             event=render_message(Msg.UNKNOWN, ctx=ctx, check_id=self.check_id, what=what),

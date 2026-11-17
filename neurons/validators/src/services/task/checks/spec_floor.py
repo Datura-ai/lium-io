@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import re
 
-from core.config import settings
-
 from ..messages import SpecFloorMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -46,8 +44,7 @@ def spec_floor_findings(specs: dict) -> list[str]:
 
 class SpecFloorCheck:
     """Hard floors on the scraped specs: CPU cores, RAM per GPU, GPU count against the listed cards, GPU UUID
-    format. Pure data, before the rented short-circuit. With SPEC_FLOOR_ENFORCEMENT_ENABLED off, a node below
-    the floors is logged with its findings only. On: fatal on an idle node; under a live rental the run goes on
+    format. Pure data, before the rented short-circuit. Fatal on an idle node; under a live rental the run goes on
     to the rented-pod checks and the score is zeroed through spec_floor_passed."""
 
     check_id = "host.validate.spec_floor"
@@ -58,11 +55,7 @@ class SpecFloorCheck:
         if not findings:
             event = render_message(Msg.OK, ctx=ctx, check_id=self.check_id, what={})
             return CheckResult(passed=True, event=event)
-        what = {"findings": findings}
-        if not settings.SPEC_FLOOR_ENFORCEMENT_ENABLED:
-            event = render_message(Msg.WARNING, ctx=ctx, check_id=self.check_id, what=what)
-            return CheckResult(passed=True, event=event)
-        event = render_message(Msg.REJECTED, ctx=ctx, check_id=self.check_id, what=what)
+        event = render_message(Msg.REJECTED, ctx=ctx, check_id=self.check_id, what={"findings": findings})
         if not has_live_rental(ctx):
             return CheckResult(passed=False, event=event)
         return CheckResult(
