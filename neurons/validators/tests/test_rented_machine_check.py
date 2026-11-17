@@ -16,6 +16,7 @@ from neurons.validators.src.core.docker_utils import DockerCommand, _collect_hos
 from neurons.validators.src.services.task.checks.rented_machine import (
     RENTAL_STATE_UNKNOWN_MAX_HELD,
     RENTAL_STATE_UNKNOWN_PREFIX,
+    HalfStartedStopRetryCheck,
     TenantEnforcementCheck,
     _collect_pod_diagnostics,
 )
@@ -1439,32 +1440,25 @@ async def test_tenant_enforcement_defers_a_pod_its_own_restore_stopped_to_the_ne
 
 
 @pytest.mark.asyncio
-async def test_tenant_enforcement_retries_the_nodes_pending_half_started_stops_before_reading_the_pod(context_factory):
-    # F-31: a failed start whose stop and kill failed left a pod possibly running unmounted; the check stops it first
-    ssh = DummySSHClient(pod_running=True, ssh_keys=["ssh-rsa renter"])
+async def test_the_half_started_stop_check_retries_the_nodes_pending_stops_and_never_fails(context_factory):
+    # F-31: a failed start whose stop and kill failed left a pod possibly running unmounted, rented or not
     docker = AsyncMock()
-    docker.encrypted_volume_mount_missing.return_value = False
-    ctx = build_recovery_context(context_factory, ssh, docker)
+    docker.retry_pending_half_started_stops.side_effect = ConnectionError("redis down")
+    ctx = build_recovery_context(context_factory, DummySSHClient(pod_running=True, ssh_keys=[]), docker)
 
-    await TenantEnforcementCheck().run(ctx)
+    result = await HalfStartedStopRetryCheck().run(ctx)
 
-    docker.retry_pending_half_started_stops.assert_awaited_once()
+    assert result.passed and not result.halt
     assert docker.retry_pending_half_started_stops.await_args.kwargs["executor_info"] is ctx.executor
 
 
-@pytest.mark.asyncio
-async def test_a_node_no_longer_rented_still_retries_its_pending_half_started_stops(context_factory):
-    # gateway review: the pod was deleted or reassigned after its failed start, so the rental lists no pod, while its
-    # old run may still write without its mount; the stop is retried before the not-rented early return
-    ssh = DummySSHClient(pod_running=True, ssh_keys=[])
-    docker = AsyncMock()
-    ctx = build_recovery_context(context_factory, ssh, docker)
-    ctx = ctx.model_copy(update={"state": replace(ctx.state, rented_data=build_rented_data("executor-123", {"containers": []}))})
-
-    result = await TenantEnforcementCheck().run(ctx)
-
-    assert result.updates["rented"] is False
-    docker.retry_pending_half_started_stops.assert_awaited_once()
+@pytest.mark.parametrize("build", [PipelineFactory.build_checks, PipelineFactory.build_fast_path_checks])
+def test_pending_half_started_stops_are_retried_before_any_check_that_can_halt_the_cycle(build):
+    # gateway review: a fatal check before TenantEnforcementCheck (a maintenance window) skipped the retry all window
+    checks = build()
+    at = next(i for i, check in enumerate(checks) if isinstance(check, HalfStartedStopRetryCheck))
+    assert not any(getattr(check, "fatal", True) for check in checks[:at])
+    assert not any(isinstance(check, HalfStartedStopRetryCheck) for check in PipelineFactory.build_dry_run_checks())
 
 
 @pytest.mark.parametrize("stop_outcome", ["failed", "unknown"])

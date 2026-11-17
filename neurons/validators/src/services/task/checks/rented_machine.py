@@ -240,6 +240,33 @@ class _DownedPodOutcome:
     container_state: ContainerState
 
 
+class HalfStartedStopRetryCheck:
+    """F-31: a failed start whose stop and kill failed may have left a pod running without its mount. Every such stop
+    on this node is retried first in the cycle, before any check that can halt it, rented or not: the pod may be gone
+    from the rental since (deleted, reassigned) while its old run still writes the renter's data unencrypted.
+    Never fails or halts the cycle; a stop still refused stays pending for the next one."""
+
+    check_id = "executor.recover.half_started_stops"
+    fatal = False
+
+    async def run(self, ctx: Context) -> CheckResult:
+        try:
+            async with asyncio.timeout(
+                min(_HALF_STARTED_STOP_CHECK_SEC, max(1.0, task_seconds_left(ctx) - POD_READ_RESERVE_SECONDS))
+            ):
+                await ctx.services.pod_recovery.retry_pending_half_started_stops(
+                    executor_info=ctx.executor,
+                    private_key=ctx.executor_ssh_private_key,
+                    default_extra=ctx.default_extra,
+                )
+        except Exception as exc:  # noqa: BLE001 — its own failures are logged inside; the cycle goes on
+            _log_recovery_failed("POD_HALF_STARTED_STOP_STILL_PENDING", ctx, None, None, exc)
+        event = render_message(
+            Msg.HALF_STARTED_STOPS_RETRIED, ctx=ctx, check_id=self.check_id, what={"executor_uuid": ctx.executor.uuid}
+        )
+        return CheckResult(passed=True, event=event)
+
+
 class TenantEnforcementCheck:
     """Handle the specialised flow when the executor is already rented to a tenant.
 
@@ -272,22 +299,6 @@ class TenantEnforcementCheck:
         filler_containers = rented_data.get_filler_containers(ctx.executor.uuid) if rented_data else []
         filler_container = filler_containers[0] if filler_containers else None
         await _remember_fillers(ctx, filler_containers)
-
-        if self.recover_stale_pods:
-            # F-31: a failed start whose stop and kill failed may have left a pod running without its mount. Every
-            # such stop on this node is retried before anything else, rented or not: the pod may be gone from the
-            # rental since (deleted, reassigned) while its old run still writes the renter's data unencrypted
-            try:
-                async with asyncio.timeout(
-                    min(_HALF_STARTED_STOP_CHECK_SEC, max(1.0, task_seconds_left(ctx) - POD_READ_RESERVE_SECONDS))
-                ):
-                    await ctx.services.pod_recovery.retry_pending_half_started_stops(
-                        executor_info=ctx.executor,
-                        private_key=ctx.executor_ssh_private_key,
-                        default_extra=ctx.default_extra,
-                    )
-            except Exception as exc:  # noqa: BLE001 — its own failures are logged inside; the check goes on
-                _log_recovery_failed("POD_HALF_STARTED_STOP_STILL_PENDING", ctx, None, None, exc)
 
         if not rented_executor or not rented_executor.pods:
             extra = {**ctx.default_extra, "rented": False}

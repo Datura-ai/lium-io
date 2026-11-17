@@ -3797,6 +3797,65 @@ async def test_a_confirmed_half_started_stop_leaves_the_nodes_index(docker_servi
 
 
 @pytest.mark.asyncio
+async def test_a_pending_stop_of_a_run_a_later_start_remounted_leaves_it_running(docker_service):
+    # gateway review: a start of the still-running pod remounted it (same run id) but its record outlived it
+    docker_service.redis_service.hget = AsyncMock(return_value=_pending_record())
+    client = docker_service.rental_docker_client_factory.client
+    client.running = True
+    mounts = "overlay / overlay rw 0 0\n/lium-cipher /workspace fuse.gocryptfs rw,nosuid,nodev 0 0\n"
+    client.exec_in_container = AsyncMock(return_value=ContainerExecResult(exit_status=0, stdout=mounts))
+
+    stopped = await docker_service.retry_half_started_stop(
+        executor_info=Mock(uuid="exec-1"), private_key="private-key", pod_id="pod-id", default_extra={}
+    )
+
+    assert stopped is True
+    assert client.stopped_containers == []
+    docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id")
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_pending_stop_keeps_the_pod_lock_until_its_stop_is_done(
+    docker_service, monkeypatch, fresh_half_started_stop_state
+):
+    # gateway review: the check's deadline cancelled the retry mid-stop and a start remounted before that stop landed
+    _let_starts_succeed(docker_service, monkeypatch)
+    client = docker_service.rental_docker_client_factory.client
+    client.running = True
+    in_stop = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_stop(*, container_name, stop_grace_seconds=None):
+        in_stop.set()
+        await release.wait()
+        client.stopped_containers.append(container_name)
+        client.running = False
+
+    client.stop = slow_stop
+    retry = asyncio.create_task(
+        docker_service.retry_half_started_stop(
+            executor_info=Mock(uuid="exec-1"),
+            private_key="private-key",
+            pod_id="pod-id",
+            default_extra={},
+            recorded=("pod_test", _RUN, _RECORDED_AT),
+        )
+    )
+    await in_stop.wait()
+    retry.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await retry
+    start = asyncio.create_task(_start_existing(docker_service, executor_uuid="exec-1"))
+    await asyncio.sleep(0.01)
+    assert client.started_containers == []  # the start waits for the stop still in flight
+
+    release.set()
+    await start
+    assert client.stopped_containers == ["pod_test"] and client.started_containers == ["pod_test"]
+    assert client.running is True
+
+
+@pytest.mark.asyncio
 async def test_retry_half_started_stop_does_nothing_without_a_mark(docker_service):
     docker_service.redis_service.hget = AsyncMock(return_value=None)
 

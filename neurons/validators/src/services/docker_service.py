@@ -2899,6 +2899,24 @@ def _half_started_stop_lock(slot: str) -> asyncio.Lock:
     return _HALF_STARTED_STOP_LOCKS.setdefault(slot, asyncio.Lock())
 
 
+# retries whose caller was cancelled, kept referenced until their stop is done
+_HALF_STARTED_STOPS_IN_FLIGHT: set[asyncio.Task] = set()
+
+
+async def _holds_its_encrypted_mount(docker_client: RentalDockerSdkClient, container_name: str) -> bool:
+    """True when the running pod has the gocryptfs mount of its encrypted volume; an unreadable answer is False."""
+    try:
+        read = await docker_client.exec_in_container(
+            ContainerExecSpec(container_name=container_name, argv=("cat", "/proc/mounts"), idempotent=True)
+        )
+    except Exception:  # noqa: BLE001 — unknown: the run is stopped as before
+        return False
+    return read.exit_status == 0 and any(
+        fields[:1] == [_LIUM_CIPHER_MOUNT] and fields[2:3] == ["fuse.gocryptfs"]
+        for fields in (line.split() for line in (read.stdout or "").splitlines())
+    )
+
+
 def _docker_time(value: str) -> datetime:
     # Docker's RFC 3339 time carries nanoseconds, datetime takes microseconds
     match = re.fullmatch(r"(.+T\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)", value)
@@ -12856,14 +12874,27 @@ class DockerService:
         recorded: tuple[str, str, str] | None = None,
     ) -> bool | None:
         # under the pod's lock from record read to stop: a start cannot slip in between the check and the stop
-        async with _half_started_stop_lock(_half_started_stop_slot(executor_info, pod_id)):
-            return await self._retry_half_started_stop_locked(
-                executor_info=executor_info,
-                private_key=private_key,
-                pod_id=pod_id,
-                default_extra=default_extra,
-                recorded=recorded,
-            )
+        lock = _half_started_stop_lock(_half_started_stop_slot(executor_info, pod_id))
+        await lock.acquire()
+
+        async def locked() -> bool | None:
+            try:
+                return await self._retry_half_started_stop_locked(
+                    executor_info=executor_info,
+                    private_key=private_key,
+                    pod_id=pod_id,
+                    default_extra=default_extra,
+                    recorded=recorded,
+                )
+            finally:
+                lock.release()
+
+        # a cancel (the check's deadline) leaves the lock with the retry until its stop is done: the SDK stop runs on
+        # in its thread, and a start let in meanwhile would have its new run stopped by it
+        task = asyncio.ensure_future(locked())
+        _HALF_STARTED_STOPS_IN_FLIGHT.add(task)
+        task.add_done_callback(_HALF_STARTED_STOPS_IN_FLIGHT.discard)
+        return await asyncio.shield(task)
 
     async def _retry_half_started_stop_locked(
         self,
@@ -12919,6 +12950,9 @@ class DockerService:
                             extra=get_extra_info({**extra, "container_gone": current is None}),
                         )
                     )
+                elif await _holds_its_encrypted_mount(docker_client, container_name):
+                    # a later start remounted this very run (a start of a running pod keeps its id): nothing to stop
+                    logger.info(_m("POD_HALF_STARTED_STOP_DROPPED_MOUNTED", extra=get_extra_info(extra)))
                 else:
                     await self._stop_half_started_container(docker_client, container_name, extra)
                     logger.info(_m("POD_HALF_STARTED_STOP_CONFIRMED", extra=get_extra_info(extra)))

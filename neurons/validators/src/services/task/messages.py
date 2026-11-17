@@ -1312,6 +1312,13 @@ class InspectorMessages:
 
 
 class TenantEnforcementMessages:
+    HALF_STARTED_STOPS_RETRIED = MessageTemplate(
+        event="Pending stops of half-started pods retried",
+        reason="HALF_STARTED_STOPS_RETRIED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
     NOT_RENTED = MessageTemplate(
         event="Executor not rented",
         reason="EXECUTOR_NOT_RENTED",
