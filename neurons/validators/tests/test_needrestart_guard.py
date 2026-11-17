@@ -108,11 +108,18 @@ def test_blank_lines_comments_and_trailing_comments_keep_the_guard(tmp_path):
     assert _read(_host(tmp_path, text)) == ("present", [])
 
 
-def test_a_conf_file_loaded_after_the_guard_that_touches_override_rc_makes_it_partial(tmp_path):
+@pytest.mark.parametrize(
+    "later",
+    [
+        "$nrconf{override_rc}->{qr(^containerd)} = 1;",
+        "%nrconf = ();",
+        "undef %nrconf;",
+        "$nrconf{restart} = 'a';",
+    ],
+)
+def test_any_live_perl_in_a_conf_file_loaded_after_the_guard_makes_it_partial(tmp_path, later):
     host = _host(tmp_path, _setup_script_guard())
-    (host / "etc/needrestart/conf.d/zz-local.conf").write_text(
-        "$nrconf{override_rc}->{qr(^containerd)} = 1;\n"
-    )
+    (host / "etc/needrestart/conf.d/zz-local.conf").write_text(later + "\n")
 
     assert _read(host) == (
         "partial",
@@ -120,11 +127,9 @@ def test_a_conf_file_loaded_after_the_guard_that_touches_override_rc_makes_it_pa
     )
 
 
-def test_a_conf_file_loaded_after_the_guard_that_leaves_override_rc_alone_keeps_it(tmp_path):
+def test_a_conf_file_loaded_after_the_guard_with_only_comments_keeps_it(tmp_path):
     host = _host(tmp_path, _setup_script_guard())
-    (host / "etc/needrestart/conf.d/zz-local.conf").write_text(
-        "$nrconf{restart} = 'a';\n# override_rc untouched\n"
-    )
+    (host / "etc/needrestart/conf.d/zz-local.conf").write_text("# $nrconf{override_rc} = {};\n\n")
 
     assert _read(host) == ("present", [])
 
