@@ -42,6 +42,8 @@ _REFRESH_DETAIL_CHARS = 400
 # the collector's start may wait 75 s for health and 10 s for the container index on a busy host, plus its canary
 INSPECTOR_COMMAND_TIMEOUT_SECONDS = 120
 INSPECTOR_STDERR_CAPTURE_TIMEOUT_SECONDS = 10
+# each step of ending a stream whose reply was not read whole waits this long for the channel to close
+PROCESS_CLOSE_WAIT_SECONDS = 5
 INSPECTOR_STDERR_CAPTURE_MAX_BYTES = 8192
 # One protocol response is one line. asyncssh's readline() hands back a PARTIAL line once a single
 # line outgrows the channel receive window (2 MiB by default: the session pauses reading and
@@ -248,7 +250,9 @@ class InspectorValidationService:
             # measured against TDX_WHITELIST; asking the provider's shell for a sha256sum on
             # top proves nothing (the shell is theirs), so the shell read is skipped there and
             # every other host is marked as what it is.
-            "sensor_integrity": SENSOR_INTEGRITY_MEASURED if sensor_attested else SENSOR_INTEGRITY_SHELL,
+            "sensor_integrity": SENSOR_INTEGRITY_MEASURED
+            if sensor_attested
+            else SENSOR_INTEGRITY_SHELL,
         }
 
         try:
@@ -263,7 +267,10 @@ class InspectorValidationService:
                         return self._failure_response(
                             error=ARM_VERIFIER_NOT_AVAILABLE_ERROR,
                             message=Msg.FAILED_LIB_MISMATCH,
-                            diagnostics={**diagnostics, "library_refresh": ARM_VERIFIER_NOT_AVAILABLE},
+                            diagnostics={
+                                **diagnostics,
+                                "library_refresh": ARM_VERIFIER_NOT_AVAILABLE,
+                            },
                             default_extra=default_extra,
                         )
                     if sha256_from_path(source) != executor_checksum:
@@ -272,7 +279,10 @@ class InspectorValidationService:
                         return self._failure_response(
                             error="Executor libinspector.so is not the validator's aarch64 build; update the executor image",
                             message=Msg.FAILED_LIB_MISMATCH,
-                            diagnostics={**diagnostics, "executor_sha256": executor_checksum or None},
+                            diagnostics={
+                                **diagnostics,
+                                "executor_sha256": executor_checksum or None,
+                            },
                             default_extra=default_extra,
                         )
                 elif self.local_checksum != executor_checksum and arch is None:
@@ -305,7 +315,7 @@ class InspectorValidationService:
                 diagnostics["collector_ensure_error"] = str(exc)
                 if not isinstance(exc, InspectorInteractiveError):
                     # its reply was not read whole and may still arrive: on this stream it would answer the handshake
-                    self._terminate(process)
+                    await self._end_process(process)
                     process = await ssh.create_process(command)
 
             open_json = validator.handshake_start()
@@ -368,7 +378,10 @@ class InspectorValidationService:
             return self._failure_response(
                 error=outdated,
                 message=Msg.FAILED_LIB_MISMATCH,
-                diagnostics={**mismatch, "library_refresh": "INSPECTOR_LIBRARY_MISMATCH_NO_REFRESH"},
+                diagnostics={
+                    **mismatch,
+                    "library_refresh": "INSPECTOR_LIBRARY_MISMATCH_NO_REFRESH",
+                },
                 default_extra=default_extra,
             )
         if not await self._executor_can_write_lib(shell):
@@ -429,10 +442,10 @@ class InspectorValidationService:
         return (
             f"tmp=$(mktemp {template}) || {{ echo MKTEMP_FAILED; exit 0; }}; "
             "trap 'rm -f -- \"$tmp\"' EXIT; trap 'exit 1' HUP INT TERM PIPE; echo TMP:$tmp; "
-            f"curl -fsSL --max-time 60 -o \"$tmp\" {shlex.quote(url)}; rc=$?; echo CURL_RC:$rc; "
+            f'curl -fsSL --max-time 60 -o "$tmp" {shlex.quote(url)}; rc=$?; echo CURL_RC:$rc; '
             "got=$(sha256sum < \"$tmp\" | cut -d' ' -f1); echo SHA256:$got; "
-            f"if [ \"$rc\" -eq 0 ] && [ \"$got\" = {shlex.quote(self.local_checksum)} ]; then "
-            f"chmod 644 \"$tmp\" && mv -f -- \"$tmp\" {shlex.quote(self.lib_path)}; echo MV_RC:$?; fi"
+            f'if [ "$rc" -eq 0 ] && [ "$got" = {shlex.quote(self.local_checksum)} ]; then '
+            f'chmod 644 "$tmp" && mv -f -- "$tmp" {shlex.quote(self.lib_path)}; echo MV_RC:$?; fi'
         )
 
     async def _refresh_executor_library(
@@ -501,7 +514,9 @@ class InspectorValidationService:
         try:
             result = await shell.ssh_client.run(command, timeout=timeout)
         except Exception as exc:
-            return _ShellCapture(transport_error=f"{type(exc).__name__}: {str(exc)[:_REFRESH_DETAIL_CHARS]}")
+            return _ShellCapture(
+                transport_error=f"{type(exc).__name__}: {str(exc)[:_REFRESH_DETAIL_CHARS]}"
+            )
         if result is None:
             return _ShellCapture(transport_error="SSH command returned no result")
         # the markers come first on stdout, and the reason a command failed is at the end of stderr
@@ -553,7 +568,10 @@ class InspectorValidationService:
             # DAH-3593: the unclassified branch covers our own library too (InspectorValidator
             # before create_process); only a transport error there is the node's.
             validator_fault=message is Msg.VALIDATION_ERROR
-            or (message is Msg.FAILED_SSH_TRANSPORT and not isinstance(exc, (asyncssh.Error, OSError))),
+            or (
+                message is Msg.FAILED_SSH_TRANSPORT
+                and not isinstance(exc, (asyncssh.Error, OSError))
+            ),
         )
 
     def _failure_response(
@@ -590,7 +608,9 @@ class InspectorValidationService:
             logger.warning(
                 _m(
                     "Inspector validation failed",
-                    extra=get_extra_info({**default_extra, **payload, "reason_class": "node_verdict"}),
+                    extra=get_extra_info(
+                        {**default_extra, **payload, "reason_class": "node_verdict"}
+                    ),
                 ),
             )
         return InspectorValidationResponse(
@@ -722,6 +742,19 @@ class InspectorValidationService:
         terminate = getattr(process, "terminate", None)
         if terminate:
             terminate()
+
+    async def _end_process(self, process) -> None:
+        """End `process` without another command and wait until its channel is closed: a host allowing one
+        session at a time refuses the next one while it is open. TERM, then KILL, then a local channel close."""
+        for escalate in ("terminate", "kill", "close"):
+            step = getattr(process, escalate, None)
+            if step:
+                step()
+            try:
+                await asyncio.wait_for(process.wait_closed(), timeout=PROCESS_CLOSE_WAIT_SECONDS)
+                return
+            except TimeoutError:
+                continue
 
     async def _close_process(self, process) -> None:
         try:
