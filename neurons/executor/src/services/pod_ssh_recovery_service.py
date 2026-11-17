@@ -1,6 +1,6 @@
-"""DAH-6379: a restarted rental pod gets its sshd back. A restart reruns only the image CMD, so the sshd the
-validator started with `docker exec` is gone; the executor (privileged, host PID namespace) re-runs the
-validator's SSH bootstrap on every pod start."""
+"""DAH-6379: a restarted rental pod gets its sshd and platform Jupyter back. A restart reruns only the image CMD,
+so the sshd and Jupyter the validator started with `docker exec` are gone; the executor (privileged, host PID
+namespace) re-runs the validator's SSH bootstrap and the Jupyter launch on every pod start."""
 
 import threading
 import time
@@ -16,6 +16,9 @@ POD_PREFIX = "pod_"
 # The script adopts a running sshd and locks against a concurrent run, so a validator re-bootstrap is harmless.
 SSH_BOOTSTRAP = "/tmp/lium-ssh-bootstrap.sh"
 RESTART_SSHD = ["sh", "-c", f"[ -f {SSH_BOOTSTRAP} ] || exit 0; exec sh {SSH_BOOTSTRAP}"]
+# Written by run_jupyter.sh when the validator installs Jupyter, with the same token and port, so the link still works
+JUPYTER_RESTART = "/tmp/lium-jupyter-restart.sh"
+RESTART_JUPYTER = ["sh", "-c", f"[ -f {JUPYTER_RESTART} ] || exit 0; exec sh {JUPYTER_RESTART}"]
 CIPHER_MOUNT = "/lium-cipher"  # an encrypted pod's gocryptfs volume, as the validator and storage/workspace.py read it
 
 
@@ -27,6 +30,7 @@ def restart_sshd(client, container_id: str) -> None:
         if any(m.get("Destination") == CIPHER_MOUNT for m in container.attrs.get("Mounts") or []):
             return
         container.exec_run(RESTART_SSHD, detach=True, user="0")  # a non-root image USER cannot start sshd
+        container.exec_run(RESTART_JUPYTER, detach=True, user="0")
     except Exception as e:  # noqa: BLE001 - a pod gone again or a dockerd hiccup must not stop the watcher
         logger.warning(f"POD_SSHD_RESTART_FAILED {container_id[:12]} {type(e).__name__}: {e}")
 
