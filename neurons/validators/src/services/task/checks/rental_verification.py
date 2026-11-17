@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import asyncssh
@@ -30,9 +30,8 @@ from ..messages import MessageTemplate, render_message
 from ..messages import RentalVerificationMessages as Msg
 from ..pipeline import CheckResult, Context
 from .cpu_truth import advertised_cpu_count
-from .rental_owner import rental_of_this_node, uuid_listed_under_another_miner
+from .rental_owner import rental_of_this_node
 from .task_time import task_seconds_left
-from .verifyx import _rented_executors_now_shared
 
 
 @dataclass(frozen=True)
@@ -326,9 +325,6 @@ class RentalVerificationCheck:
                     updates={},
                 )
             else:
-                owned_now = await self._owned_since_the_snapshot(ctx)
-                if owned_now is not None:
-                    return owned_now
                 # Verification failed - this is fatal
                 event = render_message(
                     Msg.FAILED,
@@ -405,33 +401,6 @@ class RentalVerificationCheck:
             "score_warning": "Advertised CPU cores exceed the host's physical cores",
         }
         return CheckResult(passed=False, event=event, updates=updates)
-
-    async def _owned_since_the_snapshot(self, ctx: Context) -> CheckResult | None:
-        """DAH-6564: the idle-node probe failed; a rent or filler started on the node after the cycle's snapshot
-        is judged by the ownership read now. None (the failure stands) when the node is still idle or the backend
-        does not answer."""
-        try:
-            fresh, _ = await _rented_executors_now_shared(ctx.services.backend)
-        except Exception:  # noqa: BLE001
-            return None
-        if fresh is None:
-            return None
-        state = replace(ctx.state, rented_data=fresh)
-        rental = rental_of_this_node(ctx, rented_data=fresh)
-        if rental and rental.pods:
-            event = render_message(
-                Msg.RENTED_AT_CHECK_TIME,
-                ctx=ctx,
-                check_id=self.check_id,
-                what={"executor_uuid": ctx.executor.uuid, "pod_count": len(rental.pods)},
-            )
-            return CheckResult(passed=True, event=event, updates={"state": state})
-        fillers = [] if uuid_listed_under_another_miner(ctx, fresh) else fresh.get_filler_containers(ctx.executor.uuid)
-        if not fillers:
-            return None
-        result = await self._verify_every_filler_alive(ctx.model_copy(update={"state": state}), fillers)
-        result.updates = {**result.updates, "state": state}
-        return result
 
     async def _verify_every_filler_alive(
         self, ctx: Context, filler_containers: list[str]

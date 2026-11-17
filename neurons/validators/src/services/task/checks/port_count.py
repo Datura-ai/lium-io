@@ -12,7 +12,6 @@ from ..availability import AVAILABILITY_CATEGORY, ReachSource, ReachTarget
 from ..messages import PortConnectivityMessages, PortCountMessages as Msg, render_message
 from ..pipeline import CheckResult, Context, ContextState
 from .rental_owner import uuid_listed_under_another_miner, rental_of_this_node
-from .verifyx import _rented_executors_now_shared
 
 logger = logging.getLogger(__name__)
 
@@ -223,28 +222,17 @@ class PortCountCheck:
             )
 
         split_need = split_port_requirement(ctx.state)
-        need = split_need[1] if split_need else MIN_PORT_COUNT
-        if not is_rented and port_count < need:
+        if not is_rented and split_need and MIN_PORT_COUNT <= port_count < split_need[1]:
             # a rent or filler that started after the cycle's rental snapshot holds ports the probe found
-            # busy; re-read the backend once before failing (DAH-6564: the plain floor too), and a backend
-            # that does not answer keeps it
+            # busy; re-read the backend once before failing, and a backend that does not answer keeps it
             try:
-                fresh, _ = await _rented_executors_now_shared(ctx.services.backend)
+                fresh = await ctx.services.backend.get_rented_executors_now()
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Rented-executors re-read failed; the port verdict stands: %s", exc)
+                logger.warning("Rented-executors re-read failed; the split port verdict stands: %s", exc)
                 fresh = None
             if fresh is not None:
-                probed = port_count
                 port_count, is_rented, updated_state = self._count(ctx, fresh)
                 updated_state = replace(updated_state, rented_data=fresh)
-                if is_rented or port_count >= need:
-                    logger.info(
-                        "Port failure excused at check time for %s: %d ports at the snapshot, %d now, rented now: %s",
-                        ctx.executor.uuid,
-                        probed,
-                        port_count,
-                        is_rented,
-                    )
 
         # below MIN_PORT_COUNT the plain floor below reports it; a rented node keeps its exemption
         if not is_rented and split_need and MIN_PORT_COUNT <= port_count < split_need[1]:
