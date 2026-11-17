@@ -146,6 +146,7 @@ KILL_WAIT_SECONDS = 30
 _QUERY_TIMEOUT_SECONDS = 30
 _RESET_TIMEOUT_SECONDS = 120
 _DETAIL_TAIL_CHARS = 300
+_LOG_OUTPUT_CHARS = 4000
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _GPU_LABEL = re.compile(r"GPU\d+")
 
@@ -755,6 +756,19 @@ async def reset_pod_gpus(
                     )
                 if fabric_manager_problem:
                     notes.append(fabric_manager_problem)
+        if reset is not None and reset.exit_code != 0:
+            # the report keeps only a short tail; the whole host output is what explains a refusal, logged before a
+            # holder that did not come back ends the reset early
+            logger.warning(
+                "nvidia-smi -r refused for %s: exit %s, host services %s, holder containers %s, stdout %r, stderr %r",
+                container_name,
+                reset.exit_code,
+                plan.host_services,
+                plan.holder_containers,
+                (reset.stdout or "")[-_LOG_OUTPUT_CHARS:],
+                (reset.stderr or "")[-_LOG_OUTPUT_CHARS:],
+            )
+        if plan.owns_host:
             if fabric_manager_problem:
                 raise GpuResetRefused(
                     GpuResetErrorCode.ResetNotSupported, "no latch cure while a host GPU service is down"

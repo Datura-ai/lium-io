@@ -8,6 +8,7 @@ import os
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
@@ -35,6 +36,8 @@ from storage.reporting import (
 )
 from storage.restic import (
     BACKUP_SOURCE_SCRIPT,
+    PATH_OUTSIDE_VOLUME_EXIT,
+    RESTORE_TARGET_SCRIPT,
     JsonEventWriter,
     ResticOperationError,
     ResticResult,
@@ -560,7 +563,7 @@ def test_plain_backup_uses_read_only_volume_and_keeps_secrets_out_of_arguments()
     assert cwd is None
     assert "customer-volume:/workspace:ro" in command
     script = command.index(BACKUP_SOURCE_SCRIPT)
-    assert command[script + 2 : script + 4] == ["/workspace/checkpoints", runner._restic_binary]
+    assert command[script + 2 : script + 5] == ["/workspace/checkpoints", "/workspace", runner._restic_binary]
     assert command[command.index("--log-driver") + 1] == "none"
     assert command[command.index("--tmpfs") + 1] == "/tmp:rw,nosuid,nodev,size=536870912"
     assert command[command.index("--memory") + 1] == "4g"
@@ -1754,7 +1757,7 @@ def test_encrypted_backup_script_stops_when_the_backup_path_is_missing(tmp_path:
     marker = tmp_path / "ran"
 
     completed = subprocess.run(
-        ["/bin/sh", "-c", BACKUP_SOURCE_SCRIPT, "sh", str(tmp_path / "missing"), "touch", str(marker)],
+        ["/bin/sh", "-c", BACKUP_SOURCE_SCRIPT, "sh", str(tmp_path / "missing"), str(tmp_path), "touch", str(marker)],
         capture_output=True,
     )
 
@@ -1769,7 +1772,7 @@ def test_backup_source_script_stops_when_the_backup_path_is_empty(tmp_path: Path
     (tmp_path / "backup").mkdir()
 
     completed = subprocess.run(
-        ["/bin/sh", "-c", BACKUP_SOURCE_SCRIPT, "sh", str(tmp_path / "backup"), "touch", str(marker)],
+        ["/bin/sh", "-c", BACKUP_SOURCE_SCRIPT, "sh", str(tmp_path / "backup"), str(tmp_path), "touch", str(marker)],
         capture_output=True,
     )
 
@@ -1782,12 +1785,157 @@ def test_backup_source_script_fails_when_the_backup_path_is_a_file(tmp_path: Pat
     (tmp_path / "backup").write_text("x")
 
     completed = subprocess.run(
-        ["/bin/sh", "-c", BACKUP_SOURCE_SCRIPT, "sh", str(tmp_path / "backup"), "touch", str(marker)],
+        ["/bin/sh", "-c", BACKUP_SOURCE_SCRIPT, "sh", str(tmp_path / "backup"), str(tmp_path), "touch", str(marker)],
         capture_output=True,
     )
 
     assert completed.returncode == 1
     assert not marker.exists()
+
+
+def _another_filesystem_dir() -> str:
+    # /proc is never on the test volume's filesystem; nothing below writes into it
+    assert os.stat("/proc").st_dev != os.stat(tempfile.gettempdir()).st_dev
+    return "/proc"
+
+
+def test_backup_source_script_runs_inside_the_volume(tmp_path: Path) -> None:
+    (tmp_path / "backup").mkdir()
+    (tmp_path / "backup" / "data").write_text("x")
+
+    completed = subprocess.run(
+        ["/bin/sh", "-c", BACKUP_SOURCE_SCRIPT, "sh", str(tmp_path / "backup"), str(tmp_path), "touch", "ran"],
+        capture_output=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert (tmp_path / "backup" / "ran").exists()
+
+
+def test_backup_source_script_refuses_a_symlink_out_of_the_volume(tmp_path: Path) -> None:
+    marker = tmp_path / "ran"
+    (tmp_path / "backup").symlink_to(_another_filesystem_dir())
+
+    completed = subprocess.run(
+        ["/bin/sh", "-c", BACKUP_SOURCE_SCRIPT, "sh", str(tmp_path / "backup"), str(tmp_path), "touch", str(marker)],
+        capture_output=True,
+    )
+
+    assert completed.returncode == PATH_OUTSIDE_VOLUME_EXIT
+    assert b"leaves the pod volume" in completed.stderr
+    assert not marker.exists()
+
+
+def test_restore_target_script_creates_the_target_and_restores_into_it(tmp_path: Path) -> None:
+    completed = subprocess.run(
+        ["/bin/sh", "-c", RESTORE_TARGET_SCRIPT, "sh", str(tmp_path / "a" / "b"), str(tmp_path), "touch", "ran"],
+        capture_output=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert (tmp_path / "a" / "b" / "ran").exists()
+
+
+def test_legacy_restore_downloads_from_the_root_directory(tmp_path: Path) -> None:
+    """awscli resolves `-` through getcwd, which fails inside the rental's tree under an encrypted helper."""
+    payload = _operation_payload(action="restore")
+    payload.update(engine="tar_aws_cli", snapshot_id=None, legacy_object_key="legacy/object.tgz")
+    workspace = DockerVolumeWorkspace(
+        image="executor:test", volume_name="customer-volume", path=PurePosixPath("/workspace/r"), read_only=False
+    )
+    command, _ = ResticStorageRunner(StorageOperationSpec.from_mapping(payload), workspace)._legacy_restore_execution_command(
+        "legacy/object.tgz"
+    )
+    script = command[command.index("-c") + 1]
+    record = tmp_path / "aws_cwd"
+    fake_aws = tmp_path / "aws"
+    fake_aws.write_text(f'#!/bin/sh\npwd > "{record}"\n')
+    fake_aws.chmod(0o755)
+
+    subprocess.run(
+        ["/bin/bash", "-o", "pipefail", "-c", script, "bash", str(fake_aws), "bucket", "k", str(tmp_path / "r"), str(tmp_path)],
+        capture_output=True,
+    )
+
+    assert record.read_text().strip() == "/"
+
+
+def test_restore_target_script_refuses_a_symlink_out_of_the_volume(tmp_path: Path) -> None:
+    marker = tmp_path / "ran"
+    (tmp_path / "link").symlink_to(_another_filesystem_dir())
+
+    completed = subprocess.run(
+        ["/bin/sh", "-c", RESTORE_TARGET_SCRIPT, "sh", str(tmp_path / "link"), str(tmp_path), "touch", str(marker)],
+        capture_output=True,
+    )
+
+    assert completed.returncode == PATH_OUTSIDE_VOLUME_EXIT
+    assert not marker.exists()
+
+
+def test_legacy_restore_script_refuses_a_symlink_out_of_the_volume(tmp_path: Path) -> None:
+    payload = _operation_payload(action="restore")
+    payload.update(engine="tar_aws_cli", snapshot_id=None, legacy_object_key="legacy/object.tgz")
+    workspace = DockerVolumeWorkspace(
+        image="executor:test", volume_name="customer-volume", path=PurePosixPath("/workspace/r"), read_only=False
+    )
+    command, _ = ResticStorageRunner(StorageOperationSpec.from_mapping(payload), workspace)._legacy_restore_execution_command(
+        "legacy/object.tgz"
+    )
+    assert command[-2:] == ["/workspace/r", "/workspace"]
+    script = command[command.index("-c") + 1]
+    marker = tmp_path / "ran"
+    (tmp_path / "link").symlink_to(_another_filesystem_dir())
+
+    completed = subprocess.run(
+        ["/bin/bash", "-o", "pipefail", "-c", script, "bash", "touch", str(marker), "k", str(tmp_path / "link"), str(tmp_path)],
+        capture_output=True,
+    )
+
+    assert completed.returncode == PATH_OUTSIDE_VOLUME_EXIT
+    assert not marker.exists()
+
+
+def test_restores_enter_the_target_and_check_it_against_the_volume_root() -> None:
+    plain = ResticStorageRunner(
+        StorageOperationSpec.from_mapping(_operation_payload(action="restore")),
+        DockerVolumeWorkspace(
+            image="executor:test", volume_name="customer-volume", path=PurePosixPath("/workspace/r"), read_only=False
+        ),
+    )
+    encrypted = ResticStorageRunner(
+        StorageOperationSpec.from_mapping(_operation_payload(action="restore", mode="encrypted_running")),
+        DockerUserNamespaceWorkspace(
+            image="executor:test",
+            container_name="rental-pod",
+            container_id=CONTAINER_ID,
+            pid=4321,
+            path=PurePosixPath("/proc/4321/root/root/r"),
+            read_only=False,
+        ),
+    )
+    for runner, target, root in (
+        (plain, "/workspace/r", "/workspace"),
+        (encrypted, "/proc/4321/root/root/r", "/proc/4321/root/root"),
+    ):
+        command, cwd = runner._restore_execution_command(SNAPSHOT_ID)
+        script = command.index(RESTORE_TARGET_SCRIPT)
+        assert cwd is None
+        assert command[script + 2 : script + 4] == [target, root]
+        assert command[command.index("--target") + 1] == "."
+
+
+def test_a_restore_out_of_the_volume_fails_with_a_clear_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = ResticStorageRunner(
+        StorageOperationSpec.from_mapping(_operation_payload(action="restore")),
+        DockerVolumeWorkspace(
+            image="executor:test", volume_name="customer-volume", path=PurePosixPath("/workspace/r"), read_only=False
+        ),
+    )
+    monkeypatch.setattr(runner, "_stream_command", lambda *a, **k: (PATH_OUTSIDE_VOLUME_EXIT, None))
+
+    with pytest.raises(ResticOperationError, match="leaves the pod volume"):
+        runner._restore()
 
 
 def test_local_backup_of_a_file_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -2362,3 +2510,16 @@ def test_real_restic_finds_the_parent_when_the_backup_path_changes(
     assert summaries[0]["files_new"] == 20
     assert (summaries[1]["files_new"], summaries[1]["files_unmodified"]) == (0, 20)
 
+
+
+def test_load_operation_leaves_only_the_reporter_in_the_spec_file(tmp_path: Path) -> None:
+    spec = tmp_path / "spec.json"
+    reporter = {"api_url": "https://api.example", "auth_token": "t", "resource": "restore"}
+    spec.write_text(json.dumps({"action": "restore", "repository": {"password": "p"}, "reporter": reporter}))
+    spec.chmod(0o600)
+
+    payload = storage_runner._load_operation(str(spec))
+
+    assert payload["repository"] == {"password": "p"}
+    assert json.loads(spec.read_text()) == {"reporter": reporter}
+    assert spec.stat().st_mode & 0o777 == 0o600
