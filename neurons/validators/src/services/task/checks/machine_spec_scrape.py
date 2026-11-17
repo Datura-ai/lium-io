@@ -430,6 +430,13 @@ class MachineSpecScrapeCheck:
                         extra=get_extra_info({**ctx.default_extra, "build_sha": refresh.build_sha}),
                     )
                 )
+            elif refresh is not None and refresh.detail:
+                logger.warning(
+                    _m(
+                        "liumd binary refresh degraded; using the local binary",
+                        extra=get_extra_info({**ctx.default_extra, "detail": refresh.detail[:300]}),
+                    )
+                )
         if liumd_specs:
             return await self._scrape_with_liumd(ctx)
 

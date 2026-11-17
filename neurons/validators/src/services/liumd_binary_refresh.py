@@ -196,16 +196,23 @@ async def ensure_liumd_binary(
 
 async def _ensure(ctx: Any, budget: float, started: float) -> LiumdRefresh:
     try:
+        version = await _read_version(ctx)
+        if not version.checked:
+            return LiumdRefresh(False, None, "local liumd version could not be read")
+
         manifest, error = await _manifest(ctx, min(MANIFEST_TIMEOUT_SECONDS, budget))
         if manifest is None:
+            if version.build_sha:
+                return LiumdRefresh(
+                    True,
+                    version.build_sha,
+                    f"manifest unavailable, using local liumd: {error or 'unknown error'}",
+                )
             return LiumdRefresh(False, None, error or "manifest unavailable")
         expected_build = manifest.get("build_sha")
         if not isinstance(expected_build, str) or not expected_build:
             return LiumdRefresh(False, None, "manifest has no build_sha")
 
-        version = await _read_version(ctx)
-        if not version.checked:
-            return LiumdRefresh(False, None, "local liumd version could not be read")
         if version.build_sha == expected_build:
             return LiumdRefresh(True, expected_build)
 

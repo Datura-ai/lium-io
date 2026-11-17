@@ -158,8 +158,23 @@ async def test_a_wrong_download_hash_does_not_install(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_manifest_fetch_failure_does_not_touch_the_executor(monkeypatch):
+async def test_a_manifest_fetch_failure_keeps_a_usable_local_binary(monkeypatch):
     runner = Runner()
+    fetch, _ = _manifest_fetcher(error="manifest timeout")
+    monkeypatch.setattr(liumd_binary_refresh, "_fetch_manifest", fetch)
+
+    result = await ensure_liumd_binary(_ctx(runner), budget_seconds=60)
+
+    assert result.ok is True
+    assert result.changed is False
+    assert "manifest timeout" in result.detail
+    assert runner.calls[0].endswith(" version")
+    assert not any(c.startswith("curl ") or c.startswith("install ") for c in runner.calls)
+
+
+@pytest.mark.asyncio
+async def test_a_manifest_fetch_failure_without_a_local_binary_fails(monkeypatch):
+    runner = Runner(local_present=False)
     fetch, _ = _manifest_fetcher(error="manifest timeout")
     monkeypatch.setattr(liumd_binary_refresh, "_fetch_manifest", fetch)
 
@@ -167,7 +182,7 @@ async def test_a_manifest_fetch_failure_does_not_touch_the_executor(monkeypatch)
 
     assert result.ok is False
     assert result.detail == "manifest timeout"
-    assert runner.calls == []
+    assert runner.calls[0].endswith(" version")
 
 
 @pytest.mark.asyncio
