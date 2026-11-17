@@ -2899,21 +2899,21 @@ def _half_started_stop_lock(slot: str) -> asyncio.Lock:
     return _HALF_STARTED_STOP_LOCKS.setdefault(slot, asyncio.Lock())
 
 
+# bounds the host-side mount read of a half-started pod before its stop is decided
+_ENCRYPTED_MOUNT_PROBE_TIMEOUT_SEC = 30
+
 # retries whose caller was cancelled, kept referenced until their stop is done
 _HALF_STARTED_STOPS_IN_FLIGHT: set[asyncio.Task] = set()
 
 
-async def _holds_its_encrypted_mount(docker_client: RentalDockerSdkClient, container_name: str) -> bool:
-    """True when the running pod has the gocryptfs mount of its encrypted volume; an unreadable answer is False."""
-    try:
-        read = await docker_client.exec_in_container(
-            ContainerExecSpec(container_name=container_name, argv=("cat", "/proc/mounts"), idempotent=True)
-        )
-    except Exception:  # noqa: BLE001 — unknown: the run is stopped as before
-        return False
-    return read.exit_status == 0 and any(
-        fields[:1] == [_LIUM_CIPHER_MOUNT] and fields[2:3] == ["fuse.gocryptfs"]
-        for fields in (line.split() for line in (read.stdout or "").splitlines())
+def _encrypted_mount_probe(container_name: str, plaintext_path: str) -> str:
+    """Host-side read of the pod's mount table (kernel-written, nothing run inside the renter's container): exit 0 when
+    it holds its own /lium-cipher gocryptfs mount at the recorded path, 1 when it does not, anything else unknown."""
+    return (
+        f"p=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}}' {shlex.quote(container_name)}) || exit 3; "
+        '[ "$p" -gt 0 ] 2>/dev/null || exit 1; '
+        'm=$(cat "/proc/$p/mounts") || exit 3; '
+        f"printf '%s\\n' \"$m\" | {_gocryptfs_mount_check(plaintext_path, '/dev/stdin')}"
     )
 
 
@@ -12698,7 +12698,12 @@ class DockerService:
                 try:
                     await self._stop_half_started_container(docker_client, container_name, default_extra)
                 except RentalDockerOperationError:
-                    recorded = (container_name, identity, datetime.now(timezone.utc).isoformat())
+                    recorded = (
+                        container_name,
+                        identity,
+                        datetime.now(timezone.utc).isoformat(),
+                        local_volume_path or "",
+                    )
                     self._stop_half_started_container_later(executor_info, private_key, recorded, pod_id, default_extra)
                     await self._mark_half_started_stop_pending(executor_info, pod_id, recorded, default_extra)
                     raise
@@ -12792,7 +12797,7 @@ class DockerService:
         self,
         executor_info: ExecutorSSHInfo,
         private_key: str,
-        recorded: tuple[str, str, str],
+        recorded: tuple[str, str, str, str],
         pod_id: str,
         default_extra: dict[str, Any],
     ) -> None:
@@ -12822,10 +12827,10 @@ class DockerService:
         self,
         executor_info: ExecutorSSHInfo,
         pod_id: str,
-        recorded: tuple[str, str, str],
+        recorded: tuple[str, str, str, str],
         default_extra: dict[str, Any],
     ) -> None:
-        container_name, identity, recorded_at = recorded
+        container_name, identity, recorded_at, plaintext_path = recorded
         slot = _half_started_stop_slot(executor_info, pod_id)
         try:
             # one write: a lost reply leaves the field either set and indexed or absent, never a record the check misses
@@ -12833,7 +12838,14 @@ class DockerService:
                 self.redis_service.hset(
                     f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}",
                     pod_id,
-                    json.dumps({"container_name": container_name, "identity": identity, "recorded_at": recorded_at}),
+                    json.dumps(
+                        {
+                            "container_name": container_name,
+                            "identity": identity,
+                            "recorded_at": recorded_at,
+                            "plaintext_path": plaintext_path,
+                        }
+                    ),
                 ),
                 timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
             )
@@ -12871,7 +12883,7 @@ class DockerService:
         private_key: str | None,
         pod_id: str,
         default_extra: dict[str, Any],
-        recorded: tuple[str, str, str] | None = None,
+        recorded: tuple[str, str, str, str] | None = None,
     ) -> bool | None:
         # under the pod's lock from record read to stop: a start cannot slip in between the check and the stop
         lock = _half_started_stop_lock(_half_started_stop_slot(executor_info, pod_id))
@@ -12896,6 +12908,24 @@ class DockerService:
         task.add_done_callback(_HALF_STARTED_STOPS_IN_FLIGHT.discard)
         return await asyncio.shield(task)
 
+    async def _holds_its_encrypted_mount(
+        self, executor_info: ExecutorSSHInfo, private_key: str, container_name: str, plaintext_path: str
+    ) -> bool | None:
+        """Whether the pod's own mount table holds its gocryptfs mount at the recorded path, read on the host over
+        the executor's pinned SSH; None when it could not be read."""
+        try:
+            policy = await self._prepare_known_hosts_policy(executor_info, None, {"container_name": container_name})
+            result = await _run_on_own_ssh_connection(
+                partial(_connect_own_ssh, executor_info, asyncssh.import_private_key(private_key), policy),
+                _encrypted_mount_probe(container_name, plaintext_path),
+                _ENCRYPTED_MOUNT_PROBE_TIMEOUT_SEC,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - unread is unknown, never unmounted
+            return None
+        return {0: True, 1: False}.get(result.exit_status)
+
     async def _retry_half_started_stop_locked(
         self,
         *,
@@ -12903,7 +12933,7 @@ class DockerService:
         private_key: str | None,
         pod_id: str,
         default_extra: dict[str, Any],
-        recorded: tuple[str, str, str] | None,
+        recorded: tuple[str, str, str, str] | None,
     ) -> bool | None:
         """Stop a pod whose failed start left it possibly running without its mount (F-31/F-37/F-15).
         Only the very run recorded at the failure is stopped: a pod started or re-created since is left running.
@@ -12920,14 +12950,19 @@ class DockerService:
                 if raw is None:
                     return None
                 record = json.loads(raw)
-                recorded = (record["container_name"], record["identity"], record["recorded_at"])
+                recorded = (
+                    record["container_name"],
+                    record["identity"],
+                    record["recorded_at"],
+                    record.get("plaintext_path", ""),
+                )
             except Exception as exc:  # noqa: BLE001
                 # an unread record is not an absent one: still pending, retried next check
                 logger.error(
                     _m("POD_HALF_STARTED_STOP_MARK_UNREADABLE", extra=get_extra_info({**extra, "error": str(exc)}))
                 )
                 return False
-        container_name, identity, recorded_at = recorded
+        container_name, identity, recorded_at, plaintext_path = recorded
         extra["container_name"] = container_name
         try:
             if not private_key:
@@ -12950,9 +12985,16 @@ class DockerService:
                             extra=get_extra_info({**extra, "container_gone": current is None}),
                         )
                     )
-                elif await _holds_its_encrypted_mount(docker_client, container_name):
+                elif plaintext_path and (
+                    mounted := await self._holds_its_encrypted_mount(
+                        executor_info, private_key, container_name, plaintext_path
+                    )
+                ):
                     # a later start remounted this very run (a start of a running pod keeps its id): nothing to stop
                     logger.info(_m("POD_HALF_STARTED_STOP_DROPPED_MOUNTED", extra=get_extra_info(extra)))
+                elif plaintext_path and mounted is None:
+                    # unknown is not unmounted: stopping here could stop a restored pod; the record stays for next check
+                    raise RentalDockerOperationError("the pod's encrypted mount could not be read")
                 else:
                     await self._stop_half_started_container(docker_client, container_name, extra)
                     logger.info(_m("POD_HALF_STARTED_STOP_CONFIRMED", extra=get_extra_info(extra)))
