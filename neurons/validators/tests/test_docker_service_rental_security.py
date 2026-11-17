@@ -681,6 +681,61 @@ async def test_create_s3fs_volume_uses_a_plugin_instance_of_its_own(
     assert not any(command.startswith(forbidden) for command in ssh_client.commands)
 
 
+class InstallFailsSSHClient(RecordingSSHClient):
+    def __init__(self, install_failures: int, install_stderr: str):
+        super().__init__()
+        self.install_failures = install_failures
+        self.install_stderr = install_stderr
+
+    async def run(self, command, *args, **kwargs):
+        self.commands.append(command)
+        if "plugin install" in command and self.install_failures:
+            self.install_failures -= 1
+            return SimpleNamespace(stdout="", stderr=self.install_stderr, exit_status=1)
+        return SimpleNamespace(stdout="", stderr="", exit_status=0)
+
+
+def _s3fs_install_count(ssh_client) -> int:
+    return sum("plugin install" in command for command in ssh_client.commands)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("install_failures", "install_stderr", "expected_installs"),
+    [
+        # a Docker Hub TLS timeout on the plugin pull (node 72d90b60, 15 Nov) is tried again
+        (1, 'failed to do request: Get "https://registry-1.docker.io/v2/": net/http: TLS handshake timeout', 2),
+        # the retries stop after two
+        (5, "net/http: TLS handshake timeout", 3),
+        # an instance already installed for this volume is not pulled again
+        (1, "Error response from daemon: plugin s3fs-celium-volume-safe:latest already exists", 1),
+    ],
+)
+async def test_create_s3fs_volume_retries_a_failed_plugin_install(
+    docker_service,
+    monkeypatch,
+    install_failures,
+    install_stderr,
+    expected_installs,
+):
+    ssh_client = InstallFailsSSHClient(install_failures, install_stderr)
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
+    monkeypatch.setattr(docker_service_module, "S3FS_PLUGIN_INSTALL_RETRY_WAIT_SECONDS", 0)
+
+    result = await docker_service.create_s3fs_volume(
+        ssh_client=ssh_client,
+        log_extra={},
+        volume_info=_s3fs_volume_info(),
+        log_tag="tag",
+        sysbox_subuid_base=None,
+    )
+
+    assert result == (True, "")
+    assert _s3fs_install_count(ssh_client) == expected_installs
+    # the instance is still configured and enabled after the retried install
+    assert any("plugin enable s3fs-celium-volume-safe" in command for command in ssh_client.commands)
+
+
 @pytest.mark.asyncio
 async def test_create_s3fs_volume_frees_a_name_held_by_the_legacy_instance(
     docker_service,
