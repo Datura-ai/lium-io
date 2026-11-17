@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import shlex
 import time
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -40,7 +41,13 @@ if TYPE_CHECKING:
     from services.redis_service import RedisService
     from services.task.runner import SSHCommandRunner
 
+logger = logging.getLogger(__name__)
+
 CLOCK_LOCK_KEY_PREFIX = "gpu_clock_lock:"
+# its own budget, after the -rgc batch: a stalled -rac/-rmc never costs the -rgc results (review)
+APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS = 30
+# 3 = "not supported": a GPU without application or memory clock control
+_APP_MEM_RESET_OK_EXITS = {"0", "3"}
 CLOCK_LOCK_POD_KEY_PREFIX = "gpu_clock_lock_pod:"
 # one per GPU uuid this validator ever changed; a few thousand at most, never freed
 _GPU_LOCKS: dict[str, asyncio.Lock] = {}
@@ -92,7 +99,30 @@ def build_clock_command(
 
 def _reset_app_and_memory_clocks(uuid: str) -> str:
     q = shlex.quote(uuid)
-    return f"nvidia-smi -i {q} -rac >/dev/null 2>&1; nvidia-smi -i {q} -rmc >/dev/null 2>&1"
+    return "; ".join(f"nvidia-smi -i {q} {flag} >/dev/null 2>&1; echo {q} {flag} $?" for flag in ("-rac", "-rmc"))
+
+
+async def _reset_app_and_memory_clocks_of(runner: SSHCommandRunner, uuids: list[str]) -> None:
+    """Application clocks (-ac, or any process once the host ran -acp UNRESTRICTED) and locked memory clocks (-lmc)
+    back to default, so a create never hands a renter clocks the host or the last pod lowered. Best effort, after the
+    -rgc batch and in its own call: it never changes a GPU's -rgc verdict or its lock record. Exits other than 0 and 3
+    (not supported), a timeout and a lost answer are logged."""
+    try:
+        result = await _run(
+            runner,
+            "; ".join(_reset_app_and_memory_clocks(u) for u in uuids),
+            timeout=APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS,
+        )
+        stdout = result.stdout or ""
+    except Exception as exc:
+        stdout = ""
+        logger.warning("gpu_clock_action=rac_rmc_failed error=%s", exc)
+    exits = {(p[0], p[1]): p[2] for p in (line.split() for line in stdout.splitlines()) if len(p) >= 3}
+    for uuid in uuids:
+        for flag in ("-rac", "-rmc"):
+            code = exits.get((uuid, flag), "unknown")
+            if code not in _APP_MEM_RESET_OK_EXITS:
+                logger.warning("gpu_clock_action=rac_rmc_failed gpu=%s flag=%s exit=%s", uuid, flag, code)
 
 
 def clamp_range(min_mhz: int | None, max_mhz: int | None, supported: list[int]) -> tuple[int, int]:
@@ -173,12 +203,8 @@ async def _reset_gpu_clocks(
     succeeded (forget=False: the caller drops it). uuid -> failure (None = reset)."""
     if not uuids:
         return {}
-    # each reset echoes "<uuid> <exit>", so one GPU's failure never hides another's result. Application clocks
-    # (-ac, or any process once the host ran -acp UNRESTRICTED) and locked memory clocks (-lmc) go back to default
-    # first, so a create never hands a renter clocks the host or the last pod lowered; a GPU without either reports
-    # "not supported", and only -rgc's exit is judged.
+    # each reset echoes "<uuid> <exit>", so one GPU's failure never hides another's result
     cmd = "; ".join(
-        f"{_reset_app_and_memory_clocks(uuid)}; "
         f"{build_clock_command('reset', uuid, pod_gpu_uuids=pod_gpu_uuids)} >/dev/null 2>&1; echo {shlex.quote(uuid)} $?"
         for uuid in uuids
     )
@@ -188,6 +214,7 @@ async def _reset_gpu_clocks(
         uuid: None if exits.get(uuid) == "0" else f"nvidia-smi -rgc failed (exit {exits.get(uuid, 'unknown')})"
         for uuid in uuids
     }
+    await _reset_app_and_memory_clocks_of(runner, uuids)
     if forget:
         await _forget(redis, [uuid for uuid, failure in failures.items() if failure is None])
     return failures
