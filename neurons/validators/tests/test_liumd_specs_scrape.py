@@ -224,7 +224,10 @@ def test_normalization_maps_the_liumd_contract_without_mutating_the_snapshot():
 async def test_a_failed_binary_refresh_fails_specs_mode_before_the_scrape(monkeypatch):
     _liumd_on(monkeypatch)
 
-    async def failed_refresh(ctx):
+    seen = []
+
+    async def failed_refresh(ctx, *, budget_seconds=None):
+        seen.append(budget_seconds)
         return LiumdRefresh(False, None, "manifest unavailable")
 
     monkeypatch.setattr(machine_spec_scrape, "ensure_liumd_binary", failed_refresh)
@@ -236,6 +239,7 @@ async def test_a_failed_binary_refresh_fails_specs_mode_before_the_scrape(monkey
     assert result.event.reason_code == Msg.SCRAPE_FAILED_ON_HOST.reason
     assert result.event.what_we_saw["liumd_reason"] == "binary_refresh_failed"
     assert runner.calls == []
+    assert seen and 0 < seen[0] <= 60
 
 
 @pytest.mark.asyncio
@@ -244,7 +248,7 @@ async def test_a_failed_binary_refresh_does_not_fail_shadow_mode(monkeypatch):
     monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_SHADOW", True)
     monkeypatch.setattr(machine_spec_scrape.settings, "DRY_RUN", False)
 
-    async def failed_refresh(ctx):
+    async def failed_refresh(ctx, *, budget_seconds=None):
         return LiumdRefresh(False, None, "manifest unavailable")
 
     monkeypatch.setattr(machine_spec_scrape, "ensure_liumd_binary", failed_refresh)

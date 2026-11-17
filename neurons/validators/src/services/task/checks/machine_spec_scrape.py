@@ -23,6 +23,7 @@ from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
 from .gpu_loss_hold import GpuLossHoldCheck
 from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
+from .task_time import task_seconds_left
 from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,8 @@ logger = logging.getLogger(__name__)
 # per-executor timeout. The upload gets one attempt for exactly that reason.
 STDIN_FAILURE_RETRY_WINDOW_MS = 120_000
 FALLBACK_UPLOAD_ATTEMPTS = 1
+# The scrape's own worst case from above; the liumd refresh must not eat the time this needs.
+SCRAPE_BUDGET_SECONDS = 720
 
 # The scrape says only two things on stdout: a Fernet token when it worked, and a JSON object
 # with an "error" key when it ran but had nothing to report. Every Fernet token is base64url of
@@ -403,7 +406,9 @@ class MachineSpecScrapeCheck:
     async def run(self, ctx: Context) -> CheckResult:
         liumd_specs = settings.VALIDATOR_LIUMD_SPECS and not settings.DRY_RUN
         if settings.VALIDATOR_LIUMD_SHADOW or liumd_specs:
-            refresh = await ensure_liumd_binary(ctx)
+            refresh = await ensure_liumd_binary(
+                ctx, budget_seconds=task_seconds_left(ctx) - SCRAPE_BUDGET_SECONDS
+            )
             if refresh is not None and not refresh.ok:
                 if liumd_specs:
                     return self._fail_liumd(
