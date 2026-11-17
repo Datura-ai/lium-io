@@ -26,7 +26,7 @@ from services.inspector_validation_service import InspectorValidationService
 from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import PodContainerState
-from .availability import REASONS_THAT_HIDE_AT_ONCE
+from .availability import REASONS_THAT_HIDE_AT_ONCE, AvailabilityErrorCode
 from .messages import RentalVerificationMessages, TenantEnforcementMessages, render_message
 from .models import ValidationEvent
 from .runner import SSHCommandResult, SSHCommandRunner
@@ -646,8 +646,11 @@ def _not_terminal(ran: _RanCheck) -> _RanCheck:
 def _a_finding(ran: _RanCheck) -> bool:
     # a fault the check finished reading stays the run's verdict: hiding the node and publishing it key on the last event;
     # its extra events count too (the GPU recheck's failure carries GPU_LOST there)
+    # NODE_ACCOUNT_UNVERIFIED is a read that did not finish, not a fault read off the node: a dropped session is
+    # reconnected and the read run again (DAH-6539, Sergej lio#2288 at 72215ea)
     return any(
-        event.is_availability_error or event.reason_code in REASONS_THAT_HIDE_AT_ONCE
+        (event.is_availability_error or event.reason_code in REASONS_THAT_HIDE_AT_ONCE)
+        and event.reason_code != AvailabilityErrorCode.NODE_ACCOUNT_UNVERIFIED
         for event in [ran.result.event, *ran.result.extra_events]
     )
 

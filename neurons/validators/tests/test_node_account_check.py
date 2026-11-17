@@ -304,3 +304,74 @@ def _no_wait(sleep):
         await sleep(0 if delay < 60 else delay)
 
     return fast
+
+
+class _DropsTheSession(_HostFiles):
+    """The account read on a session that closes under it (a recreated executor container, or a relay)."""
+
+    def __init__(self, ssh):
+        super().__init__("", success=False)
+        self.ssh = ssh
+
+    async def run(self, cmd, **kwargs):
+        self.ssh.is_closed.return_value = True
+        return await super().run(cmd, **kwargs)
+
+
+@pytest.mark.parametrize("rented", [True, False])
+@pytest.mark.parametrize(
+    "case, drops, reconnects, files, reasons, account_passed",
+    [
+        # the session dropped and the reconnect worked: the read runs again on the new session and stands
+        ("reconnected, own machine", True, True, f"hotkey={POOL}\nclaim={CLAIM}\n", ["NODE_ACCOUNT_SKIPPED"], True),
+        ("reconnected, mismatch", True, True, "hotkey=5Victim\nclaim=\n", ["NODE_ACCOUNT_MISMATCH"], False),
+        # the reconnect failed: the run ends on the dead session, as for any other check
+        (
+            "reconnect failed",
+            True,
+            False,
+            None,
+            ["NODE_ACCOUNT_UNVERIFIED", "EXECUTOR_TRANSPORT_UNREACHABLE"],
+            False,
+        ),
+        # a mismatch read on a session that stayed open: no reconnect
+        ("confirmed mismatch", False, None, "hotkey=5Victim\nclaim=\n", ["NODE_ACCOUNT_MISMATCH"], False),
+    ],
+)
+async def test_a_dropped_session_during_the_account_read_is_reconnected_through_the_pipeline(
+    case, drops, reconnects, files, reasons, account_passed, rented, monkeypatch
+):
+    """Through Pipeline: a read that failed on a dropped session is retried, never taken as evidence; only the
+    refusal of a free node clears its verified job (a rented one keeps it, its rental runs on and is billed)."""
+    from unittest.mock import MagicMock
+
+    from services.task import pipeline as pipeline_module
+    from services.task.pipeline import Pipeline
+
+    class _Sink:
+        async def emit(self, event):
+            pass
+
+    def _session():
+        ssh = MagicMock(spec=asyncssh.SSHClientConnection)
+        ssh.is_closed.return_value = False
+        return ssh
+
+    monkeypatch.setattr("services.task.checks.node_account.has_live_rental", lambda ctx: rented)
+    monkeypatch.setattr(pipeline_module, "SSHCommandRunner", lambda conn, max_retries=1: _HostFiles(files))
+    calls = []
+
+    async def reconnect():
+        calls.append(1)
+        if not reconnects:
+            raise OSError("connection refused")
+        return _session()
+
+    first = _session()
+    ctx = _relay_ctx(_DropsTheSession(first) if drops else _HostFiles(files)).model_copy(update={"ssh": first})
+    _, events, end = await Pipeline([NodeAccountCheck()], _Sink(), reconnect=reconnect).run(ctx)
+
+    assert [e.reason_code for e in events] == reasons, case
+    assert len(calls) == (1 if drops else 0)
+    assert end.node_account_passed is account_passed
+    assert end.clear_verified_job_info is (not account_passed and not rented)
