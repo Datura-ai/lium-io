@@ -164,8 +164,8 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append("A GPU is not the model the node reports")
 
-    # Node account gate (DAH-6539): same mechanics; a rented node on another account's machine finishes its rental
-    # unpaid.
+    # Node account gate (DAH-6539): a rented node on another account's machine scores 0; its renter's pod runs on and
+    # is billed as usual.
     if not ctx.node_account_passed:
         actual_score = 0.0
         job_score = 0.0

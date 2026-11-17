@@ -111,13 +111,16 @@ class NodeAccountCheck:
 
 def _refused(ctx: Context, check_id: str, template, what: dict) -> CheckResult:
     """Like GPU_MODEL_MISMATCH: an availability entry, so the backend hides the node and refuses new rentals on its
-    free GPUs too, and score 0. Fatal only without a live rental, so a renter's pod runs on and is still verified:
-    clearing the verified job resets the node inactive in the backend, which stops the rental."""
+    free GPUs too (the node stays active), and score 0. With a live rental the renter's pod runs on and is billed as
+    usual: the verified job is kept and the run is not fatal, because clearing it resets the node inactive in the
+    backend, which would end the rental. Without one the verified job is cleared and the run ends here."""
     what = {**what, "reach_source": str(ReachSource.VALIDATOR), "reach_target": str(ReachTarget.NODE)}
     event = render_message(template, ctx=ctx, check_id=check_id, what=what)
+    if has_live_rental(ctx):
+        return CheckResult(passed=False, event=event, updates={"node_account_passed": False}, fatal=False)
     return CheckResult(
         passed=False,
         event=event,
         updates={"node_account_passed": False, "clear_verified_job_info": True},
-        fatal=not has_live_rental(ctx),
+        fatal=True,
     )

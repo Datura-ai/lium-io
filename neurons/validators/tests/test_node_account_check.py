@@ -217,14 +217,16 @@ async def test_an_older_miner_is_not_checked():
 
 
 @pytest.mark.parametrize("rented", [True, False])
-async def test_a_rented_node_on_another_accounts_machine_finishes_its_rental(rented, monkeypatch):
-    """Like the ban checks: fatal only without a live rental, so a renter's pod is not cut off mid-rental."""
+async def test_a_rented_node_on_another_accounts_machine_keeps_its_rental(rented, monkeypatch):
+    """Rented: score 0 only (calculate_scores reads node_account_passed); the verified job is kept and the run goes on,
+    so the renter's pod runs on and is billed. Free: the verified job is cleared and the run ends (Sergej, lio#2288)."""
     monkeypatch.setattr("services.task.checks.node_account.has_live_rental", lambda ctx: rented)
     result = await NodeAccountCheck().run(_relay_ctx(_HostFiles("hotkey=5Victim\nclaim=\n")))
     assert not result.passed and result.event.reason_code == "NODE_ACCOUNT_MISMATCH"
-    assert result.fatal is (not rented)
-    # score 0 either way: a rented node finishes its rental unpaid (calculate_scores reads node_account_passed)
-    assert result.updates["node_account_passed"] is False
+    if rented:
+        assert (result.updates, result.fatal) == ({"node_account_passed": False}, False)
+    else:
+        assert (result.updates, result.fatal) == ({"node_account_passed": False, "clear_verified_job_info": True}, True)
     # an availability entry: the backend hides the node, so a partly rented one takes no rental on its free GPUs
     from services.task.availability import NODE_GPU_FAULT_CODES, availability_errors
 
