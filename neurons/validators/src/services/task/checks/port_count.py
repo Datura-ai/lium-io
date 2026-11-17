@@ -223,7 +223,8 @@ class PortCountCheck:
             )
 
         split_need = split_port_requirement(ctx.state)
-        if not is_rented and port_count < (split_need[1] if split_need else MIN_PORT_COUNT):
+        need = split_need[1] if split_need else MIN_PORT_COUNT
+        if not is_rented and port_count < need:
             # a rent or filler that started after the cycle's rental snapshot holds ports the probe found
             # busy; re-read the backend once before failing (DAH-6564: the plain floor too), and a backend
             # that does not answer keeps it
@@ -233,8 +234,17 @@ class PortCountCheck:
                 logger.warning("Rented-executors re-read failed; the port verdict stands: %s", exc)
                 fresh = None
             if fresh is not None:
+                probed = port_count
                 port_count, is_rented, updated_state = self._count(ctx, fresh)
                 updated_state = replace(updated_state, rented_data=fresh)
+                if is_rented or port_count >= need:
+                    logger.info(
+                        "Port failure excused at check time for %s: %d ports at the snapshot, %d now, rented now: %s",
+                        ctx.executor.uuid,
+                        probed,
+                        port_count,
+                        is_rented,
+                    )
 
         # below MIN_PORT_COUNT the plain floor below reports it; a rented node keeps its exemption
         if not is_rented and split_need and MIN_PORT_COUNT <= port_count < split_need[1]:

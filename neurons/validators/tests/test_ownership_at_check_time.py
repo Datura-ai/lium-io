@@ -62,17 +62,21 @@ async def test_a_rent_started_after_the_snapshot_keeps_the_rented_exemption_belo
 
 
 @pytest.mark.asyncio
-async def test_a_filler_started_after_the_snapshot_counts_its_ports_toward_the_floor():
+async def test_a_filler_started_after_the_snapshot_counts_its_ports_toward_the_floor(caplog):
+    caplog.set_level("INFO")
     result = await PortCountCheck().run(_port_ctx(MIN_PORT_COUNT - 2, _listed(filler_ports=[61000, 61001])))
     assert result.passed is True
     assert result.updates["port_count"] == MIN_PORT_COUNT
+    assert "Port failure excused at check time" in caplog.text
 
 
 @pytest.mark.parametrize("now", [None, _listed()], ids=["no-answer", "still-idle"])
 @pytest.mark.asyncio
-async def test_a_floor_failure_on_a_node_still_idle_stands(now):
+async def test_a_floor_failure_on_a_node_still_idle_stands(now, caplog):
+    caplog.set_level("INFO")
     result = await PortCountCheck().run(_port_ctx(MIN_PORT_COUNT - 2, now))
     assert result.passed is False
+    assert "excused" not in caplog.text
     assert result.event.reason_code == PortCountMessages.INSUFFICIENT_PORTS.reason
 
 
@@ -145,10 +149,12 @@ async def _usage(context_factory, filler_run: FillerRunActiveResponse | None):
 
 
 @pytest.mark.asyncio
-async def test_load_from_a_filler_started_after_the_snapshot_is_the_filler(context_factory):
+async def test_load_from_a_filler_started_after_the_snapshot_is_the_filler(context_factory, caplog):
+    caplog.set_level("INFO")
     result, services = await _usage(context_factory, FillerRunActiveResponse(active=True, status="RUNNING"))
     assert result.passed is True
     services.backend.get_filler_run_active.assert_awaited_with(LATE_FILLER_RUN)
+    assert f"excused for fillers started after the snapshot: ['{LATE_FILLER}']" in caplog.text
 
 
 @pytest.mark.parametrize(

@@ -240,7 +240,12 @@ class GpuUsageCheck:
         violation = _find_violation(gpu_details, gpu_processes)
         if violation:
             # DAH-6564: a filler started after the cycle's snapshot is judged by the backend's word at check time
-            filler_containers |= await _late_fillers_the_backend_owns(ctx, process_names - filler_containers)
+            late = await _late_fillers_the_backend_owns(ctx, process_names - filler_containers)
+            if late:
+                logger.info(
+                    "GPU usage on %s excused for fillers started after the snapshot: %s", ctx.executor.uuid, sorted(late)
+                )
+            filler_containers |= late
         fillers_only = bool(filler_containers) and all(name in filler_containers for name in process_names)
         # judged at any load, also beside a rental pod: a swapped filler can hold VRAM while staying
         # under the utilization limits
