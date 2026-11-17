@@ -13,7 +13,7 @@ import asyncssh
 
 from core.config import settings
 from core.utils import _m, get_extra_info
-from services.gpu_spec_table import matmul_probe_vram_mb
+from services.gpu_spec_table import name_reported_by_driver, matmul_probe_vram_mb
 
 logger = logging.getLogger(__name__)
 _rng = secrets.SystemRandom()
@@ -413,7 +413,7 @@ class ValidationService:
         # the same machine_info a run pinned to one card builds (prepare_matmul_challenge with
         # gpu_uuid), so the executor's key matches and the answer comes back sealed
         machine_info = json.dumps(
-            {"uuids": card_uuid, "gpu_count": 1, "gpu_model": gpu_model}, sort_keys=True
+            {"uuids": card_uuid, "gpu_count": 1, "gpu_model": name_reported_by_driver(gpu_model)}, sort_keys=True
         )
         params = VerifierParams()
         params.generate()
@@ -525,7 +525,8 @@ class ValidationService:
         gpu_info = {
             "uuids": gpu_uuids,
             "gpu_count": gpu_count,
-            "gpu_model": gpu_model,
+            # a modded model's classified name is not what the executor's driver reports (DAH-5508)
+            "gpu_model": name_reported_by_driver(gpu_model),
         }
         machine_info = json.dumps(gpu_info, sort_keys=True)
 

@@ -1696,6 +1696,34 @@ async def _attach_filler_log_tail(
         )
 
 
+# a restarting image's output can land seconds after the first read: re-read a bounded few seconds before cleanup
+FILLER_LOG_TAIL_REREAD_DELAYS_S = (1, 2, 2)
+
+
+async def _reread_empty_filler_log_tail(
+    explained_failure: Exception,
+    docker_client: RentalDockerSdkClient,
+    *,
+    container_name: str,
+    workload_kind: WorkloadKind,
+    environment: dict[str, str] | None,
+    log_extra: dict,
+) -> None:
+    if not (
+        isinstance(explained_failure, ImageExitedDuringKeyInjection)
+        and not explained_failure.log_tail
+        and workload_kind == WorkloadKind.FILLER
+    ):
+        return
+    for delay_s in FILLER_LOG_TAIL_REREAD_DELAYS_S:
+        await asyncio.sleep(delay_s)
+        explained_failure.log_tail = await _container_log_tail_or_empty(
+            docker_client, container_name=container_name, environment=environment, log_extra=log_extra
+        )
+        if explained_failure.log_tail:
+            return
+
+
 async def _explain_add_public_keys_failure(
     docker_client: RentalDockerSdkClient,
     *,
@@ -3264,14 +3292,17 @@ def _wipe_volume_cmd(local_volume: str, *container_names: str) -> str:
     return (
         f"v={volume}; dm=$({docker} volume inspect -f '{{{{.Driver}}}} {{{{.Mountpoint}}}}' $v) || exit 2; "
         'd=${dm%% *}; m=${dm#* }; '
-        f"users=$({docker} ps -a --filter volume=$v --format '{{{{.Names}}}}') || exit 2; "
+        f"users=$({docker} ps -a --filter volume=\"$v\" --format '{{{{.Names}}}}') || exit 2; "
         f'ok={allowed}; for u in $users; do case "$ok" in *" $u "*) ;; *) echo "volume in use by $u"; exit 6;; esac; done; '
         'case "$d" in '
         'local) case "$m" in */volumes/"$v"/_data) p=$m;; *) echo "unexpected mountpoint $m"; exit 5;; esac;; '
         f'vloopback|vloopback:*) [ "$m" = "/mnt/$v" ] || {{ echo "unexpected mountpoint $m"; exit 5; }}; '
         f"root=$({docker} info -f '{{{{.DockerRootDir}}}}') || exit 3; "
         f"id=$({docker} plugin inspect -f '{{{{.Id}}}}' \"$d\") || exit 3; "
-        'p=$root/plugins/$id/propagated-mount/$v;; '
+        # root and id are the node's own answers: the id must be a plugin id, the root a plain path
+        'case "$id" in *[!0-9a-f]*|"") echo "unexpected plugin id"; exit 3;; esac; '
+        'case "$root" in /*) ;; *) echo "unexpected docker root"; exit 3;; esac; '
+        'p="$root/plugins/$id/propagated-mount/$v";; '
         '*) echo "unexpected driver $d"; exit 5;; esac; '
         '[ -d "/proc/1/root$p" ] || { echo "no dir $p"; exit 4; }; '
         'find "/proc/1/root$p" -mindepth 1 -maxdepth 1 -exec rm -rf {} + && echo "wiped $p"'
@@ -6788,8 +6819,11 @@ class DockerService:
             if listed.exit_status != 0:
                 return []
             names = tuple(line.strip() for line in (listed.stdout or "").splitlines())
+        # names are the node's `docker volume ls` output and go into `-v` and the wipe: only plain names
         return sorted(
-            name for name in names if name.startswith(name_prefixes) and name not in keep_names
+            name
+            for name in names
+            if name.startswith(name_prefixes) and name not in keep_names and _is_safe_docker_volume_name(name)
         )
 
     async def sweep_stale_cache_volumes(
@@ -7946,10 +7980,11 @@ class DockerService:
             f"/usr/bin/docker plugin install {S3FS_PLUGIN_IMAGE} "
             f"--alias {plugin_alias} --grant-all-permissions --disable",
             f"/usr/bin/docker plugin disable {plugin_alias} -f",
+            # backend-sent keys and options: each assignment is one quoted word
             f"/usr/bin/docker plugin set {plugin_alias} "
-            f"AWSACCESSKEYID={volume_info.iam_user_access_key} "
-            f"AWSSECRETACCESSKEY={volume_info.iam_user_secret_key}",
-            f'/usr/bin/docker plugin set {plugin_alias} DEFAULT_S3FSOPTS="{mount_options}"',
+            f"{shlex.quote(f'AWSACCESSKEYID={volume_info.iam_user_access_key}')} "
+            f"{shlex.quote(f'AWSSECRETACCESSKEY={volume_info.iam_user_secret_key}')}",
+            f"/usr/bin/docker plugin set {plugin_alias} {shlex.quote(f'DEFAULT_S3FSOPTS={mount_options}')}",
             f"/usr/bin/docker plugin enable {plugin_alias}",
         ]
         return [await ssh_client.run(command) for command in commands]
@@ -8047,7 +8082,8 @@ class DockerService:
                 # (a FIFO would block the open forever) is unlinked, not opened; the timeout is the
                 # backstop, after which the `rm -fv` below kills the container.
                 command = (
-                    f"/usr/bin/docker run --rm -v {local_volume}:/mnt "
+                    f"/usr/bin/docker run --rm -v "
+                    f"{_quote_safe_docker_volume_name(local_volume, field_name='local_volume')}:/mnt "
                     f"--name {temp_container_name} --entrypoint sh "
                     f"daturaai/compute-subnet-executor:latest -c "
                     + shlex.quote(
@@ -11879,6 +11915,14 @@ class DockerService:
                 except Exception as post_run_exc:
                     if vulkan_icd is not None:
                         await vulkan_icd  # best effort, never raises: let its exec end before cleanup removes the pod
+                    await _reread_empty_filler_log_tail(
+                        post_run_exc,
+                        docker_client,
+                        container_name=container_id or container_name,
+                        workload_kind=payload.workload_kind,
+                        environment=custom_options.environment if custom_options else None,
+                        log_extra=default_extra,
+                    )
                     container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
                         default_extra=default_extra,
