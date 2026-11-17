@@ -358,3 +358,16 @@ def test_an_overlapping_entry_outside_override_rc_is_not_a_restart_rule(tmp_path
     )
 
     assert _read(host) == ("present", [])
+
+
+def test_a_host_without_the_guard_reads_present_once_the_validator_writes_it(tmp_path):
+    import subprocess
+
+    from services.host_memory_guard import _needrestart_guard_inner
+
+    host = _host(tmp_path, None)
+    assert _read(host)[0] == "missing"
+
+    subprocess.run(["sh", "-c", _needrestart_guard_inner(str(host))], check=True)
+
+    assert _read(host) == ("present", [])

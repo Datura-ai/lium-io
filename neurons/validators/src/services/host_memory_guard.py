@@ -6,6 +6,10 @@ to stay reachable and manageable (sshd, dockerd, containerd, sysbox, the executo
 system.slice, so their pages are not reclaimed when a pod drives the host out of memory. `--runtime`: gone at
 reboot, set again here.
 
+It also writes the needrestart guard the setup script writes since 16 Nov 2026 (DAH-6566) on hosts set up before
+then: an unattended apt upgrade's needrestart otherwise restarts sysbox-fs under running pods and leaves their /proc
+dead (ENOTCONN). A file write only; nothing is restarted.
+
 Best-effort: never fails the caller. Every setting it cannot apply (no cgroup v2, systemd or host view, a
 denied write) is printed as a reason, logged as a WARNING with the node id and returned, so coverage is visible.
 """
@@ -66,8 +70,42 @@ def _host_memory_min_script() -> str:
     )
 
 
+# the exact file nvidia_docker_sysbox_setup.sh's keep_needrestart_off_the_container_runtime writes
+NEEDRESTART_GUARD_FILE = "/etc/needrestart/conf.d/lium-container-runtime.conf"
+NEEDRESTART_GUARD_TEXT = """# Lium: never restart the container runtime under running pods; restart it in a maintenance window.
+$nrconf{override_rc}->{qr(^sysbox)} = 0;
+$nrconf{override_rc}->{qr(^docker)} = 0;
+$nrconf{override_rc}->{qr(^containerd)} = 0;
+$nrconf{override_rc}->{qr(^nvidia-fabricmanager)} = 0;
+$nrconf{override_rc}->{qr(^nvidia-persistenced)} = 0;"""
+
+
+def _needrestart_guard_inner(root: str = "") -> str:
+    """Runs in the host mount namespace; root prefixes every path (tests only)."""
+    f = shlex.quote(root + NEEDRESTART_GUARD_FILE)
+    return (
+        f"{{ [ -e {shlex.quote(root + '/usr/sbin/needrestart')} ] || "
+        f"[ -f {shlex.quote(root + '/etc/needrestart/needrestart.conf')} ]; }} "
+        "|| { echo needrestart_guard_skipped no_needrestart; exit 0; }; "
+        f"c={shlex.quote(NEEDRESTART_GUARD_TEXT)}; "
+        f'[ "$(cat {f} 2>/dev/null)" = "$c" ] && exit 0; '
+        # tmp + mv: needrestart never evals a half-written file (it reads conf.d/*.conf only)
+        f"{{ mkdir -p \"$(dirname {f})\" && printf '%s\\n' \"$c\" > {f}.tmp && mv {f}.tmp {f}; }} 2>/dev/null "
+        "&& echo needrestart_guard_set host || echo needrestart_guard_failed host write_denied"
+    )
+
+
+def _needrestart_guard_script() -> str:
+    return (
+        "if command -v nsenter >/dev/null 2>&1; then nsenter -t 1 -m -- sh -c "
+        + shlex.quote(_needrestart_guard_inner())
+        + " 2>/dev/null || echo needrestart_guard_skipped nsenter_failed; "
+        "else echo needrestart_guard_skipped no_nsenter; fi"
+    )
+
+
 def host_memory_guard_script() -> str:
-    return f"{_host_memory_min_script()}; true"
+    return f"{_host_memory_min_script()}; {_needrestart_guard_script()}; true"
 
 
 def parse_guard_output(stdout: str) -> dict:
