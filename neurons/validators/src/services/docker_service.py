@@ -12949,8 +12949,8 @@ class DockerService:
         """Stop a pod whose failed start left it possibly running without its mount (F-31/F-37/F-15).
         The recorded container is stopped while its encrypted volume is unmounted, across restarts (same id); a
         re-created one is left alone, a mounted one kept, an unread mount stays pending. A pod with no encrypted volume
-        is stopped only in the very run recorded (without its id: while its StartedAt is not after the failure; a container
-        created after the failure is a re-created one).
+        is stopped only in the very run recorded (without its id: while its StartedAt is not after the failure; a
+        container created after the failure is a re-created one).
         None when none is pending; True once it is stopped or no longer that run (record dropped); False (logged)
         while it still may run."""
         extra = {**default_extra, "pod_id": pod_id}
