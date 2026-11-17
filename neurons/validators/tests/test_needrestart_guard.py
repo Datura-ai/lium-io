@@ -114,10 +114,13 @@ def test_blank_lines_comments_and_trailing_comments_keep_the_guard(tmp_path):
         "$nrconf{override_rc}->{qr(^containerd)} = 1;",
         "%nrconf = ();",
         "undef %nrconf;",
-        "$nrconf{restart} = 'a';",
+        "delete $nrconf{override_rc};",
+        "$nrconf{override_rc} = {};",
+        "$nrconf{restart} = do { %nrconf = (); 'a' };",
+        "$nrconf{restart} = 'a'; %nrconf = ();",
     ],
 )
-def test_any_live_perl_in_a_conf_file_loaded_after_the_guard_makes_it_partial(tmp_path, later):
+def test_perl_that_may_reach_the_guard_in_a_later_conf_file_makes_it_partial(tmp_path, later):
     host = _host(tmp_path, _setup_script_guard())
     (host / "etc/needrestart/conf.d/zz-local.conf").write_text(later + "\n")
 
@@ -127,9 +130,12 @@ def test_any_live_perl_in_a_conf_file_loaded_after_the_guard_makes_it_partial(tm
     )
 
 
-def test_a_conf_file_loaded_after_the_guard_with_only_comments_keeps_it(tmp_path):
+def test_a_later_conf_file_with_only_comments_or_plain_settings_of_other_keys_keeps_it(tmp_path):
     host = _host(tmp_path, _setup_script_guard())
-    (host / "etc/needrestart/conf.d/zz-local.conf").write_text("# $nrconf{override_rc} = {};\n\n")
+    # the usual non-interactive setup: restart automatically, kernel hints off
+    (host / "etc/needrestart/conf.d/zz-local.conf").write_text(
+        "# $nrconf{override_rc} = {};\n\n$nrconf{restart} = 'a';\n$nrconf{kernelhints} = 0;  # quiet\n"
+    )
 
     assert _read(host) == ("present", [])
 

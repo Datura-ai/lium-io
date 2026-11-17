@@ -761,8 +761,9 @@ def get_needrestart_guard(host_root="/proc/1/root"):
         if match.group(1) not in NEEDRESTART_GUARD_SERVICES:
             other_rules.append(("^" + match.group(1), match.group(2)))
     # needrestart reads needrestart.conf, then conf.d/*.conf in name order: a later file can undo the guard
-    # with any Perl (%nrconf = (), a delete, an eval), so any live line in one leaves the result unknowable;
-    # earlier files can only add rules under other keys, which still count when they overlap a guarded unit
+    # with Perl (%nrconf = (), a delete, an eval), so a live line there that is not a plain literal setting
+    # of another key ($nrconf{restart} = 'a'; is common) leaves the result unknowable; earlier files can
+    # only add rules under other keys, which still count when they overlap a guarded unit
     conf_dir = host_root + "/etc/needrestart/conf.d"
     guard_name = os.path.basename(NEEDRESTART_GUARD_FILE)
     names = sorted(n for n in os.listdir(conf_dir) if n.endswith(".conf") and n != guard_name)
@@ -773,7 +774,10 @@ def get_needrestart_guard(host_root="/proc/1/root"):
         except (FileNotFoundError, NotADirectoryError):
             continue
         loaded_later = path.startswith(conf_dir) and os.path.basename(path) > guard_name
-        if loaded_later and any(ln.strip() for ln in lines):
+        plain_setting = r"[ \t]*\$nrconf\{(\w+)\}\s*=\s*[^;{}()\[\]%@$&\\`]*;\s*(#.*)?"
+        if loaded_later and any(
+            ln.strip() and not ((m := re.fullmatch(plain_setting, ln)) and m.group(1) != "override_rc") for ln in lines
+        ):
             return "partial", list(NEEDRESTART_GUARD_SERVICES)
         for ln in lines:
             for rule in re.finditer(r"qr(?:\((.*?)\)|/(.*?)/|\{(.*?)\}|\[(.*?)\])\}?\s*(?:=>|=)\s*([^,;\s)]+)", ln):
