@@ -981,6 +981,37 @@ class SysboxRequiredMessages:
     )
 
 
+class NeedrestartGuardMessages:
+    MISSING = MessageTemplate(
+        event="Host apt can restart the container runtime under running pods",
+        reason="NEEDRESTART_GUARD_MISSING",
+        severity="warning",
+        category="env",
+        impact="Proceed; score not changed",
+        remediation=(
+            "An apt upgrade's needrestart may restart sysbox, Docker, containerd or the NVIDIA fabric manager "
+            "under running pods, which breaks those pods. Hosts set up before 16 Nov 2026 lack the guard. Create "
+            "/etc/needrestart/conf.d/lium-container-runtime.conf with the lines that "
+            "neurons/executor/nvidia_docker_sysbox_setup.sh writes (keep_needrestart_off_the_container_runtime). "
+            "Writing the file restarts nothing."
+        ),
+    )
+    UNKNOWN = MessageTemplate(
+        event="Host needrestart guard not reported",
+        reason="NEEDRESTART_GUARD_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    OK = MessageTemplate(
+        event="Host needrestart guard ok",
+        reason="NEEDRESTART_GUARD_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+
+
 class PidHostRequiredMessages:
     MISSING = MessageTemplate(
         event="Executor not in the host PID namespace",

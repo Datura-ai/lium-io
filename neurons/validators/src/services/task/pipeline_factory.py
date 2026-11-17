@@ -89,6 +89,7 @@ from .checks import (
     StartGPUMonitorCheck,
     SshdBootstrapCheck,
     DockerCpuCheck,
+    NeedrestartGuardCheck,
     PidHostRequiredCheck,
     SysboxRequiredCheck,
     TdxHostCheck,
@@ -350,6 +351,8 @@ class PipelineFactory:
                 # short-circuit so a rented host that has just lost its disk is reported too. The
                 # score is not changed until the reading is proven on live executors.
                 DiskHealthCheck(),
+                # hosts set up before 16 Nov lack the needrestart guard: pure data, non-fatal, rented hosts too
+                NeedrestartGuardCheck(),
                 # one NVML read, no CUDA: a card with uncorrected ECC or a pending row remap fails
                 # the node like a GPU ban (not fatal under a live pod), so it sits before the rented
                 # short-circuit
@@ -534,6 +537,8 @@ class PipelineFactory:
                 GpuVramPrecheck(),
                 SpecFloorCheck(),
                 DiskHealthCheck(),
+                # hosts set up before 16 Nov lack the needrestart guard: pure data, non-fatal, rented hosts too
+                NeedrestartGuardCheck(),
                 GpuMemoryHealthCheck(),
                 CpuTruthCheck(),
                 GpuPowerLimitCheck(),
@@ -639,6 +644,8 @@ class PipelineFactory:
                 SpecFloorCheck(),
                 # DAH-2928: pure-data report on specs.disk_health, same place as in build_checks.
                 DiskHealthCheck(),
+                # hosts set up before 16 Nov lack the needrestart guard: pure data, non-fatal, rented hosts too
+                NeedrestartGuardCheck(),
                 # one NVML read, no CUDA: safe in dry run, and a broken card is not rented out
                 GpuMemoryHealthCheck(),
                 # DAH-2671 item 2a: read-only SSH corroboration, safe in dry run (mutates nothing).

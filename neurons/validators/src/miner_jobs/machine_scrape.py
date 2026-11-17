@@ -729,6 +729,31 @@ def get_executor_pid_mode():
     return pid_mode
 
 
+NEEDRESTART_GUARD_FILE = "/etc/needrestart/conf.d/lium-container-runtime.conf"
+# the services nvidia_docker_sysbox_setup.sh keeps needrestart from restarting under running pods (DAH-6384)
+NEEDRESTART_GUARD_SERVICES = ("sysbox", "docker", "containerd", "nvidia-fabricmanager", "nvidia-persistenced")
+
+
+def get_needrestart_guard(host_root="/proc/1/root"):
+    # "present", "partial", "missing" or "no_needrestart", plus the services the host file leaves unguarded.
+    # Hosts set up before the setup script wrote the file (16 Nov) have needrestart and no guard.
+    if os.path.samefile(host_root + "/", "/"):  # as docker_utils' [ /proc/1/root/ -ef / ]
+        raise RuntimeError("no host view: the executor is not in the host PID namespace")
+    if not (os.path.exists(host_root + "/usr/sbin/needrestart") or os.path.isdir(host_root + "/etc/needrestart")):
+        return "no_needrestart", []
+    try:
+        with open(host_root + NEEDRESTART_GUARD_FILE) as guard_file:
+            text = guard_file.read()
+    except FileNotFoundError:
+        return "missing", list(NEEDRESTART_GUARD_SERVICES)
+    unguarded = [
+        service
+        for service in NEEDRESTART_GUARD_SERVICES
+        if not re.search(r"qr\(\^" + re.escape(service) + r"\)\}\s*=\s*0\s*;", text)
+    ]
+    return ("partial" if unguarded else "present"), unguarded
+
+
 def get_vloopback_volume_bytes(docker_root_dir, filler_only=False, sizes=None):
     # disk held by loopback-backed volumes, which /system/df misses entirely: it only accounts for
     # the `local` driver. The plugin keeps one backing file per volume, named after the volume.
@@ -2545,6 +2570,12 @@ def get_machine_specs():
         data["data_executor_pid_mode"] = get_executor_pid_mode()
     except Exception as exc:
         data["data_executor_pid_mode_scrape_error"] = repr(exc)
+
+    # DAH: hosts set up before 16 Nov lack the needrestart guard; missing key = unknown, never fails
+    try:
+        data["data_needrestart_guard"], data["data_needrestart_guard_unguarded"] = get_needrestart_guard()
+    except Exception as exc:
+        data["data_needrestart_guard_scrape_error"] = repr(exc)
 
     data["data_os"] = ""
     try:
