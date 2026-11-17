@@ -223,6 +223,9 @@ class Settings(BaseSettings):
     # Signed node heartbeat (services/heartbeat_service.py): POST {COMPUTE_REST_API_URL}/v1/node-heartbeat every
     # interval, signed with this host's SSH ed25519 host key. Off by default.
     NODE_HEARTBEAT_ENABLED: bool = Field(env="NODE_HEARTBEAT_ENABLED", default=False)
+    # DAH-6379: memory.oom.group=1 on every rental pod start (services/pod_oom_group_service.py). Off until the renter
+    # notice, like the validator's POD_OOM_GROUP_ENABLED; both are turned on together after it.
+    POD_OOM_GROUP_ENABLED: bool = Field(env="POD_OOM_GROUP_ENABLED", default=False)
     # No lower bound here: a bad value must never stop the executor. The service clamps it to 10 with a warning.
     NODE_HEARTBEAT_INTERVAL_SECONDS: int = Field(env="NODE_HEARTBEAT_INTERVAL_SECONDS", default=60)
 
