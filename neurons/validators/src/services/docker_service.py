@@ -1688,6 +1688,34 @@ async def _attach_filler_log_tail(
         )
 
 
+# a restarting image's output can land seconds after the first read: re-read a bounded few seconds before cleanup
+FILLER_LOG_TAIL_REREAD_DELAYS_S = (1, 2, 2)
+
+
+async def _reread_empty_filler_log_tail(
+    explained_failure: Exception,
+    docker_client: RentalDockerSdkClient,
+    *,
+    container_name: str,
+    workload_kind: WorkloadKind,
+    environment: dict[str, str] | None,
+    log_extra: dict,
+) -> None:
+    if not (
+        isinstance(explained_failure, ImageExitedDuringKeyInjection)
+        and not explained_failure.log_tail
+        and workload_kind == WorkloadKind.FILLER
+    ):
+        return
+    for delay_s in FILLER_LOG_TAIL_REREAD_DELAYS_S:
+        await asyncio.sleep(delay_s)
+        explained_failure.log_tail = await _container_log_tail_or_empty(
+            docker_client, container_name=container_name, environment=environment, log_extra=log_extra
+        )
+        if explained_failure.log_tail:
+            return
+
+
 async def _explain_add_public_keys_failure(
     docker_client: RentalDockerSdkClient,
     *,
@@ -11699,23 +11727,14 @@ class DockerService:
                 except Exception as post_run_exc:
                     if vulkan_icd is not None:
                         await vulkan_icd  # best effort, never raises: let its exec end before cleanup removes the pod
-                    if (
-                        isinstance(post_run_exc, ImageExitedDuringKeyInjection)
-                        and not post_run_exc.log_tail
-                        and payload.workload_kind == WorkloadKind.FILLER
-                    ):
-                        # a restarting image's output can land seconds after the first read: poll a bounded
-                        # few seconds before the cleanup removes the container
-                        for delay_s in (1, 2, 2):
-                            await asyncio.sleep(delay_s)
-                            post_run_exc.log_tail = await _container_log_tail_or_empty(
-                                docker_client,
-                                container_name=container_id or container_name,
-                                environment=custom_options.environment if custom_options else None,
-                                log_extra=default_extra,
-                            )
-                            if post_run_exc.log_tail:
-                                break
+                    await _reread_empty_filler_log_tail(
+                        post_run_exc,
+                        docker_client,
+                        container_name=container_id or container_name,
+                        workload_kind=payload.workload_kind,
+                        environment=custom_options.environment if custom_options else None,
+                        log_extra=default_extra,
+                    )
                     container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
                         default_extra=default_extra,

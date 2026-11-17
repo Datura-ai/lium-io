@@ -10165,8 +10165,8 @@ async def test_a_restarting_filler_whose_first_log_read_is_empty_is_read_again_b
     docker_service.rental_docker_client_factory.client.container_log_tail = log_tail
     sleep_calls: list[float] = []
 
-    async def fake_sleep(s):
-        sleep_calls.append(s)
+    async def fake_sleep(delay_seconds: float) -> None:
+        sleep_calls.append(delay_seconds)
 
     monkeypatch.setattr("services.docker_service.asyncio.sleep", fake_sleep)
 
