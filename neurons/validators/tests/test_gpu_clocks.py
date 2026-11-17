@@ -607,7 +607,7 @@ async def test_a_gpu_operation_past_its_deadline_is_cancelled_and_frees_the_pod(
 def _create_payload():
     from payload_models.payloads import ContainerCreateRequest
 
-    return ContainerCreateRequest.model_construct(pod_id="pod1", gpu_uuids=U[:2])
+    return ContainerCreateRequest.model_construct(pod_id="pod1", gpu_uuids=U[:2], miner_hotkey="hk", executor_id="ex")
 
 
 @pytest.mark.asyncio
@@ -758,7 +758,7 @@ async def test_a_reboot_whose_lock_wait_runs_out_runs_no_hung_gpu_reset(monkeypa
     monkeypatch.setattr(ds, "reset_hung_pod_gpus", reset)
     monkeypatch.setattr(ds, "POD_GPU_OPERATION_DEADLINE_SECONDS", 0)
 
-    async with ds.pod_gpu_operation_locks.hold("pod1", 0):  # another GPU operation holds the pod
+    async with ds.pod_gpu_operation_locks.hold("pod1", ("hk", "ex"), 0):  # another GPU operation holds the pod
         assert await service._reset_hung_gpus_before_run(None, _create_payload(), {}) is None
 
     reset.assert_not_awaited()  # never beside the other operation

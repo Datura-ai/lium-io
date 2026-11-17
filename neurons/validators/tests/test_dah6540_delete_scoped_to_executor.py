@@ -4,7 +4,7 @@ wait for, the pod's create on the new node."""
 import asyncio
 
 import pytest
-from services.docker_service import create_steps_after_reply, inflight_creates
+from services.docker_service import create_steps_after_reply, inflight_creates, pod_gpu_operation_locks
 
 OLD, NEW = ("miner-hk", "exec-old"), ("miner-hk", "exec-new")
 
@@ -51,3 +51,13 @@ async def test_a_delete_on_the_old_node_does_not_cut_the_new_nodes_steps_after_r
     assert await create_steps_after_reply.wait_until_done("pod-6540", OLD, 0.01)
     release.set()
     assert await create_steps_after_reply.wait_until_done("pod-6540", NEW, 1)
+
+
+@pytest.mark.asyncio
+async def test_a_delete_on_the_old_node_does_not_wait_for_the_new_nodes_gpu_operation():
+    async with pod_gpu_operation_locks.hold("pod-6540", NEW, 0) as new_node_reset:
+        assert new_node_reset
+        async with pod_gpu_operation_locks.hold("pod-6540", OLD, 0.01) as old_node_delete:
+            assert old_node_delete  # took its own lock at once instead of timing out into DeletionInProgress
+        async with pod_gpu_operation_locks.hold("pod-6540", NEW, 0) as same_node:
+            assert not same_node

@@ -2800,7 +2800,7 @@ POD_GPU_OPERATION_DEADLINE_SECONDS = 600
 
 
 class _PodGpuOperationLocks:
-    """One lock per pod shared by a renter's GPU operations (reset, clock lock), the pod's delete and the clock
+    """One lock per pod on one executor shared by a renter's GPU operations (reset, clock lock), the pod's delete and the clock
     reset before its (re)create.
 
     The pending-pod check and its mark are separate steps, and a delete takes no mark, so a clock lock and a
@@ -2810,14 +2810,18 @@ class _PodGpuOperationLocks:
     """
 
     def __init__(self) -> None:
-        self._locks: dict[str, asyncio.Lock] = {}
-        self._holders: dict[str, int] = {}
+        self._locks: dict[tuple[str, ExecutorKey], asyncio.Lock] = {}
+        self._holders: dict[tuple[str, ExecutorKey], int] = {}
 
     @contextlib.asynccontextmanager
-    async def hold(self, pod_id: str, wait: float):
-        """Yields whether the lock was taken. wait=0: take it only if free, with no await in between."""
-        lock = self._locks.setdefault(pod_id, asyncio.Lock())
-        self._holders[pod_id] = self._holders.get(pod_id, 0) + 1
+    async def hold(self, pod_id: str, executor: ExecutorKey, wait: float):
+        """Yields whether the lock was taken. wait=0: take it only if free, with no await in between.
+
+        DAH-6540 (review): per executor, so a delete on the node a moved pod left never waits for its GPU work on
+        the new node."""
+        key = (pod_id, executor)
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        self._holders[key] = self._holders.get(key, 0) + 1
         acquired = False
         try:
             if wait == 0:
@@ -2831,9 +2835,9 @@ class _PodGpuOperationLocks:
         finally:
             if acquired:
                 lock.release()
-            self._holders[pod_id] -= 1
-            if not self._holders[pod_id]:
-                del self._holders[pod_id], self._locks[pod_id]
+            self._holders[key] -= 1
+            if not self._holders[key]:
+                del self._holders[key], self._locks[key]
 
 
 pod_gpu_operation_locks = _PodGpuOperationLocks()
@@ -13942,7 +13946,9 @@ class DockerService:
         try); anything else here is best-effort and never blocks the rental."""
         # DAH-4663 (review): after a renter's clock lock in flight on this pod (a reboot), so its -lgc never lands
         # after this reset dropped its record. Only around this step, so a delete still cancels the create at once.
-        async with pod_gpu_operation_locks.hold(payload.pod_id, POD_GPU_OPERATION_DEADLINE_SECONDS) as held:
+        async with pod_gpu_operation_locks.hold(
+            payload.pod_id, executor_key(payload), POD_GPU_OPERATION_DEADLINE_SECONDS
+        ) as held:
             if not held:
                 logger.warning(_m("A GPU operation on the pod outlasted its wait", extra=get_extra_info(default_extra)))
             # DAH-4663 (review): a create its delete cancelled during a long pull or build runs no -rgc on GPUs the
@@ -13978,7 +13984,9 @@ class DockerService:
             return refused
         # DAH-4663 (review): after a renter's GPU operation on the pod, so the clock reset below runs after any -lgc.
         # Taken only once the cancelled create is done: its own clock reset waits on this lock.
-        async with pod_gpu_operation_locks.hold(payload.pod_id, POD_GPU_OPERATION_DELETE_WAIT_SECONDS) as held:
+        async with pod_gpu_operation_locks.hold(
+            payload.pod_id, executor_key(payload), POD_GPU_OPERATION_DELETE_WAIT_SECONDS
+        ) as held:
             if not held:
                 logger.warning(
                     _m(
@@ -14420,7 +14428,9 @@ class DockerService:
         Never raises: any error is logged and the reboot goes on as before (None)."""
         try:
             # as _reset_leftover_clock_locks_before_create: a renter's Reset GPU or clock lock never overlaps it
-            async with pod_gpu_operation_locks.hold(payload.pod_id, POD_GPU_OPERATION_DEADLINE_SECONDS) as held:
+            async with pod_gpu_operation_locks.hold(
+                payload.pod_id, executor_key(payload), POD_GPU_OPERATION_DEADLINE_SECONDS
+            ) as held:
                 if not held:
                     # best-effort: skipping it is safe, running it beside the other GPU operation is not
                     logger.warning(
@@ -14491,7 +14501,7 @@ class DockerService:
         }
         logger.info(_m(label, extra=get_extra_info({**default_extra, "payload": str(payload)})))
         # DAH-4663 (review): never alongside the pod's delete or another GPU operation
-        async with pod_gpu_operation_locks.hold(payload.pod_id, 0) as held:
+        async with pod_gpu_operation_locks.hold(payload.pod_id, executor_key(payload), 0) as held:
             if not held:
                 logger.info(_m(f"{label}: another operation on the pod is running", extra=get_extra_info(default_extra)))
                 return dataclasses.replace(
