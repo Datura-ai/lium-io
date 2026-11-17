@@ -52,6 +52,8 @@ cp .env.example .env
 ./lium-cvm.sh run my-executor
 ```
 
+`run` keeps QEMU in the foreground: closing the terminal or pressing Ctrl+C stops the CVM. Start it inside `tmux` (or a systemd unit) so it outlives your SSH session. The CVM does not start by itself after a host reboot; run it again.
+
 `lium-cvm.sh` subcommands: `check`, `download`, `new <name> [--env local|staging|prod] [--enable-logs] [--enable-sysinfo]`
 (`--env` picks `app/docker-compose.local.yml`, `app/docker-compose.staging.yml` or `app/docker-compose.yml`; default `prod`),
 `run <name> [--dry-run]`, `stop <name> [--timeout N] [--force]`, `list`, `lsgpu`, `help`.
