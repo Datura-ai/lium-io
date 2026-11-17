@@ -14,6 +14,10 @@ from typing import Any, Dict, NamedTuple, Optional, Tuple, List
 import asyncssh
 
 from core.config import FeatureFlag, settings
+from services.verifyx_network_probe import (
+    is_cloudflare_probe_failure as _is_cloudflare_probe_failure,
+    is_positive_number as _is_positive_number,
+)
 from core.utils import _m, get_extra_info
 from core.checksums import (
     ARM_VERIFIER_NOT_AVAILABLE,
@@ -47,13 +51,6 @@ VERIFYX_KILL_TIMEOUT_SECONDS = 10
 
 # LIB_PATH is the Cloudflare capacity build (celium-gpu-verifier#25).
 LIB_PATH = "/usr/lib/libverifyx.so"
-# Transport / Cloudflare-side faults only. The word "cloudflare" in an error is not enough:
-# a host that failed the probe for its own reason can mention that URL.
-_CLOUDFLARE_PROBE_FAIL_RX = re.compile(
-    r"429|timeout|timed out|outage|connection refused|rate.?limit"
-    r"|\bDownload request failed for https://speed\.cloudflare\.com/\S*: error sending request\b",
-    re.I,
-)
 # Cloudflare's own 429 on either direction, in the verifier's words (celium-gpu-verifier network.rs
 # validate_speedtest_response). A download 429 means the verifier skipped the upload; an upload 429
 # came after a measured download. The reqwest transport error is left out on purpose: it prints no
@@ -828,21 +825,6 @@ def _verify_network_package_test(challenge_data: dict, response_data: dict) -> T
     return stats, errors
 
 
-def _is_cloudflare_probe_failure(network_execution: dict) -> bool:
-    """True only for a probe-side transport or Cloudflare fault in the probe's own error.
-
-    A failed probe with no error, or an error that only names the Cloudflare URL, is a
-    host-caused failure and does not fall back to the package download.
-    """
-    capacity = (network_execution.get("speedtest") or {}).get("download_mbps")
-    if _is_positive_number(capacity):
-        return False
-    err = str(network_execution.get("error") or "").strip()
-    if not err:
-        return False
-    return bool(_CLOUDFLARE_PROBE_FAIL_RX.search(err))
-
-
 def _cloudflare_upload_mark(network_execution: dict) -> dict:
     """`{"cloudflare_upload_fallback": True}` when the upload of 0.0 the probe reports is no
     measurement of the host: Cloudflare answered 429 on the upload, or on the download so the
@@ -1077,10 +1059,6 @@ def _verify_xet_test(challenge_data: dict, response_data: dict) -> Tuple[dict, L
         "hash": xet_execution.get("hash", ""),
         "error": xet_execution.get("error"),
     }, errors
-
-
-def _is_positive_number(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
 
 
 def _is_speed_reading(value: object) -> bool:
