@@ -274,6 +274,8 @@ class VerifyXCheck:
             if filler_refresh
             else {}
         )
+        # read before the probe: a renter who arrives after it did not share the link the reading was taken on
+        renter_on_node = _renter_on_node(ctx)
         # liumd phase 1: LocalVerifyCheck already ran this challenge through `POST /verify` and
         # judged it with evaluate_verifyx_capture — the same function the SSH path ends in. Only a
         # PASSING local result is consumed; anything else (and the cold-sample retry below) runs
@@ -299,7 +301,9 @@ class VerifyXCheck:
         )
 
         if not _is_cold_sample_below_gate(ctx, result, prev_ema):
-            judged = self._judge(ctx, result, transport=transport, sizing=sizing, prev_ema=prev_ema)
+            judged = self._judge(
+                ctx, result, transport=transport, sizing=sizing, prev_ema=prev_ema, renter_on_node=renter_on_node
+            )
             if prev_ema is None:
                 # the backend sends no EMA for an inactive node: its measured one seeds the copy the skip reads
                 network = (judged.updates or {}).get("state", ctx.state).specs.get("network") or {}
@@ -353,9 +357,11 @@ class VerifyXCheck:
         cold_sample_retry: ColdSampleRetry | None = None,
         counted: bool = True,
         tally: NetworkGateTally | None = None,
+        renter_on_node: bool = False,
     ) -> CheckResult:
         """Judge one VerifyX result: the specs it updates, the EMA it feeds and the download gate.
-        `counted=False` leaves the per-host probe counters and the gate tally as they were."""
+        `counted=False` leaves the per-host probe counters and the gate tally as they were.
+        `renter_on_node`: a renter's pod was on the node when the probe ran, so a slow reading is held, not failed."""
         if not counted:
             key = (ctx.miner_hotkey, ctx.executor.uuid)
             saved = [(c, c.get(key)) for c in (_package_fallback_probes, _kept_upload_probes)]
@@ -368,6 +374,7 @@ class VerifyXCheck:
                     prev_ema=prev_ema,
                     cold_sample_retry=cold_sample_retry,
                     tally=NetworkGateTally(),
+                    renter_on_node=renter_on_node,
                 )
             finally:
                 for counter, value in saved:
@@ -517,6 +524,8 @@ class VerifyXCheck:
                     slow_event.what_we_saw["cold_sample_retry"] = asdict(cold_sample_retry)
                 if network_gate is not None:
                     slow_event.what_we_saw["network_gate"] = network_gate
+                if renter_on_node:
+                    return _held_for_renter_traffic(ctx, event, slow_event, updated_specs)
                 return CheckResult(passed=False, event=slow_event, updates={"state": updated_state})
 
             if upload_too_slow(
@@ -538,6 +547,8 @@ class VerifyXCheck:
                 )
                 if network_gate is not None:
                     slow_event.what_we_saw["network_gate"] = network_gate
+                if renter_on_node:
+                    return _held_for_renter_traffic(ctx, event, slow_event, updated_specs)
                 return CheckResult(passed=False, event=slow_event, updates={"state": updated_state})
 
             return CheckResult(
@@ -1000,6 +1011,23 @@ async def _reap_stale_runs(ctx: Context) -> None:
                 extra=get_extra_info({**ctx.default_extra, "error": repr(e)}),
             )
         )
+
+
+def _renter_on_node(ctx: Context) -> bool:
+    rented_data = ctx.state.rented_data
+    rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+    # a self-rent is the provider's own traffic: it must not hold their speed reading
+    return bool(rented_executor and rented_executor.pods and not rented_executor.self_rent)
+
+
+def _held_for_renter_traffic(ctx: Context, event, slow_event, updated_specs: dict) -> CheckResult:
+    """A split node with a renter on it: the speed test shares the link with the renter's own traffic, so a slow
+    reading says nothing about the node. No fail, and the stored EMA stands instead of taking the contended sample."""
+    event.what_we_saw["network_gate_held"] = "renter_traffic_on_node"
+    event.what_we_saw["held_slow_reading"] = slow_event.what_we_saw
+    return CheckResult(
+        passed=True, event=event, updates={"state": replace(ctx.state, specs=hold_verifyx_ema(ctx, updated_specs))}
+    )
 
 
 def _get_filler_only_container(ctx: Context) -> str | None:

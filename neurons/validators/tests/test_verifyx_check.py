@@ -8,7 +8,7 @@ from neurons.validators.src.services.task.messages import (
     VERIFYX_DEBUG_DOC_URL,
     VerifyXMessages as Msg,
 )
-from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsResponse
+from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutor, RentedExecutorsResponse, RentedPod
 
 from tests.helpers import FakeRedis, build_context_config, build_services, build_state
 
@@ -1096,3 +1096,81 @@ async def test_a_measured_run_seeds_the_kept_ema_for_a_node_already_inactive(con
     assert result.event.reason_code == Msg.STANDING_PROBE_FAILURE_SKIPPED.reason
     assert verifyx_service.called_with is None
     assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(500.0)
+
+
+def _renter_on_split_node(executor_uuid: str, *, download: float, upload: float) -> RentedExecutorsResponse:
+    rented = _rented_data_with_ema(executor_uuid, download=download, upload=upload)
+    rented.executors = {
+        executor_uuid: RentedExecutor(
+            miner_hotkey="miner-hotkey",
+            executor_ip_address="192.0.2.10",
+            executor_ip_port="8080",
+            pods=[RentedPod(pod_id="pod-1", container_name="pod_p1")],
+        )
+    }
+    return rented
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reading", "direction"),
+    [({"download_speed": 40.0, "upload_speed": 100.0}, "download"), ({"download_speed": 2000.0, "upload_speed": 1.0}, "upload")],
+)
+async def test_a_slow_reading_with_a_renter_on_the_node_does_not_fail_and_keeps_the_stored_ema(
+    context_factory, reading, direction
+):
+    """A split node's free GPUs are checked while a renter uses the same link: a slow reading is the renter's
+    traffic, so the cycle passes and the stored EMA stands instead of taking the contended sample."""
+    service = DummyVerifyXService(success=True, updated_specs={"network": reading})
+    ctx = context_factory(
+        services=build_services(verifyx=service),
+        config=build_context_config(),
+        state=build_state(
+            specs={"gpu": {"count": 1}},
+            rented_data=_renter_on_split_node("executor-123", download=101.0, upload=10.5),
+        ),
+    )
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["network_gate_held"] == "renter_traffic_on_node"
+    assert result.event.what_we_saw["held_slow_reading"]["direction"] == direction
+    network = result.updates["state"].specs["network"]
+    assert network["ema_verifyx_download_speed"] == pytest.approx(101.0)
+    assert network["ema_verifyx_upload_speed"] == pytest.approx(10.5)
+
+
+@pytest.mark.asyncio
+async def test_the_same_slow_reading_on_an_idle_node_still_fails(context_factory):
+    service = DummyVerifyXService(success=True, updated_specs={"network": {"download_speed": 40.0, "upload_speed": 100.0}})
+    ctx = context_factory(
+        services=build_services(verifyx=service),
+        config=build_context_config(),
+        state=build_state(
+            specs={"gpu": {"count": 1}},
+            rented_data=_rented_data_with_ema("executor-123", download=101.0, upload=10.5),
+        ),
+    )
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
+
+
+@pytest.mark.asyncio
+async def test_a_slow_reading_under_the_providers_own_self_rent_still_fails(context_factory):
+    rented = _renter_on_split_node("executor-123", download=101.0, upload=10.5)
+    rented.executors["executor-123"].self_rent = True
+    service = DummyVerifyXService(success=True, updated_specs={"network": {"download_speed": 40.0, "upload_speed": 100.0}})
+    ctx = context_factory(
+        services=build_services(verifyx=service),
+        config=build_context_config(),
+        state=build_state(specs={"gpu": {"count": 1}}, rented_data=rented),
+    )
+
+    result = await VerifyXCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.VERIFY_FAILED_NETWORK_SPEED_TOO_SLOW.reason
