@@ -59,7 +59,8 @@ class CustomOptions(BaseModel):
         for volume in volumes or []:
             if not volume or not volume.strip():
                 continue
-            container_path = volume.strip().split()[0].split(':', 1)[-1].rstrip('/')
+            # the same last component _pod_volume_path mounts: "volume::/mnt" must not pass as ":/mnt"
+            container_path = volume.strip().split()[0].split(':')[-1].rstrip('/')
             if container_path.startswith('/') and container_path.split('/')[1] in _RESERVED_VOLUME_ROOTS:
                 reserved.append(container_path)
         return reserved

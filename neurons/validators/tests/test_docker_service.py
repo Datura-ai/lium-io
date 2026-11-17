@@ -10827,7 +10827,17 @@ def test_a_trailing_slash_on_the_template_path_selects_the_same_mount(template_v
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "volume", ["/mnt", "/mnt/data/", "/lium-cipher", "/lium-cipher/x", "volume_pod:/mnt/data", "/data:/lium-cipher"]
+    "volume",
+    [
+        "/mnt",
+        "/mnt/data/",
+        "/lium-cipher",
+        "/lium-cipher/x",
+        "volume_pod:/mnt/data",
+        "/data:/lium-cipher",
+        "volume::/mnt",
+        "volume::/lium-cipher",
+    ],
 )
 async def test_create_refuses_a_reserved_volume_path_instead_of_moving_the_volume_to_root(
     docker_service, monkeypatch, volume
