@@ -1145,10 +1145,36 @@ class NodeAccountMessages:
     MISMATCH = MessageTemplate(
         event="Node at this address is not the one its account registered",
         reason="NODE_ACCOUNT_MISMATCH",
-        severity="warning",
-        category="policy",
-        impact="Verification failed; verification cleared",
+        severity="error",
+        # an availability error: the backend hides the node and refuses new rentals, a rental on it runs on
+        category=AVAILABILITY_CATEGORY,
+        impact="Verification failed; node hidden and not rentable while the mismatch stands (a running rental is "
+        "kept)",
         remediation="Point the node's hostname at the machine registered under this account, or register the node again.",
+    )
+    # DAH-6539: the address leads to a machine set up for another account
+    BINDING_MISMATCH = MessageTemplate(
+        event="Node at this address is not set up for the account that lists it",
+        reason="NODE_ACCOUNT_MISMATCH",
+        severity="error",
+        # an availability error: the backend hides the node and refuses new rentals, a rental on it runs on
+        category=AVAILABILITY_CATEGORY,
+        impact="Verification failed; node hidden and not rentable while the mismatch stands (a running rental is "
+        "kept)",
+        remediation="Ensure this address reaches a node configured for this account, update the node if needed, and retry "
+        "verification.",
+    )
+    # DAH-6539: the read of the node's account files failed, timed out or closed without an exit status
+    BINDING_UNVERIFIED = MessageTemplate(
+        event="Node account ownership could not be verified at this address",
+        reason="NODE_ACCOUNT_UNVERIFIED",
+        severity="error",
+        # an availability error: hidden and not rentable until a cycle reads the files, a running rental runs on
+        category=AVAILABILITY_CATEGORY,
+        impact="Verification failed; node hidden and not rentable until the next check reads it (a running rental "
+        "is kept)",
+        remediation="The validator could not read this node's account files over SSH. Make sure the executor is up "
+        "and reachable at this address; the node is listed again after the next successful check.",
     )
 
 
@@ -1196,6 +1222,32 @@ class CustomBuildOrphanSweepMessages:
         severity="info",
         category="prep",
         impact="Proceed",
+    )
+
+
+class RentalEgressGuardMessages:
+    """Link-local egress drop for the rental network (see checks/rental_egress_guard.py)."""
+
+    SKIPPED = MessageTemplate(
+        event="Rental egress guard skipped",
+        reason="RENTAL_EGRESS_GUARD_SKIPPED",
+        severity="info",
+        category="prep",
+        impact="Proceed",
+    )
+    APPLIED = MessageTemplate(
+        event="Rental egress guard applied",
+        reason="RENTAL_EGRESS_GUARD_APPLIED",
+        severity="info",
+        category="prep",
+        impact="Proceed",
+    )
+    NOT_APPLIED = MessageTemplate(
+        event="Rental egress guard not applied",
+        reason="RENTAL_EGRESS_GUARD_NOT_APPLIED",
+        severity="warning",
+        category="prep",
+        impact="Proceed; retried at the next interval",
     )
 
 
@@ -2904,6 +2956,18 @@ class RentedPodResourcesMessages:
             "cores in both its cpuset and its CPU quota; remove the script or loosen it to that."
         ),
     )
+    PROC_FUSE_DISCONNECTED = MessageTemplate(
+        event="A rented pod's /proc is disconnected on the host",
+        reason="RENTED_POD_PROC_FUSE_DISCONNECTED",
+        severity="warning",
+        category="runtime",
+        impact="Proceed without penalty; the renter's pod cannot read /proc/sys",
+        remediation=(
+            "The FUSE service behind the container's /proc (sysbox-fs) stopped or restarted, so the running "
+            "pod answers 'Transport endpoint is not connected'. Check `systemctl status sysbox`, restart it if "
+            "needed, then restart the pod container; tell the renter first."
+        ),
+    )
     RESOURCES_UNKNOWN = MessageTemplate(
         event="Rented pod CPU resources could not be read",
         reason="RENTED_POD_RESOURCES_UNKNOWN",
@@ -2999,6 +3063,15 @@ class RentedPodOwnershipMessages:
         "after the host stopped without a clean shutdown. A restart does not repair it. Contact support: the "
         "renters are moved to fresh pods free of charge. Do not change file ownership on the host or restart "
         "a rented pod's container yourself, and shut the host down cleanly.",
+    )
+    RUNTIME_RESTARTED = MessageTemplate(
+        event="Container runtime restarted under running rented pods",
+        reason="RENTED_POD_OWNERSHIP_RUNTIME_RESTARTED",
+        severity="warning",
+        category="runtime",
+        impact="Proceed; pods running across a sysbox or NVIDIA fabric manager restart can lose /proc paths or NVLink",
+        remediation="A runtime service listed in runtime_restarted_under_pods started after the listed pods. "
+        "Contact support before changing anything on the host; restarting the pod alone does not repair it.",
     )
     UNREAD = MessageTemplate(
         event="Rented pod file ownership not read",

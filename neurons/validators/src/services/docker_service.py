@@ -103,6 +103,7 @@ from services.const import (
     GPU_WEDGE_SWEEP_SETTLE_SECONDS,
     MIN_POD_PORT_COUNT,
     POD_CONTAINER_PREFIX,
+    POD_PORTS_PENDING_TTL_SECONDS,
     PREFERRED_POD_PORTS,
 )
 from services.container_cleanup import (
@@ -147,6 +148,7 @@ from services.gpu_clocks import (
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, reset_pod_gpus
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.hung_gpu_reset import HungGpuResult, reset_hung_pod_gpus
+from services.host_memory_guard import apply_host_memory_guard
 from services.image_flatten import (
     FLATTEN_NO_DISK_RENTER_SENTENCE,
     FLATTEN_SIZING_SLACK_BYTES,
@@ -356,6 +358,8 @@ DOCKER_VOLUME_PLUGINS = {
 }
 
 S3FS_PLUGIN_IMAGE = "mochoa/s3fs-volume-plugin"
+S3FS_PLUGIN_INSTALL_RETRIES = 2
+S3FS_PLUGIN_INSTALL_RETRY_WAIT_SECONDS = 5
 
 
 LEGACY_S3FS_PLUGIN_ALIAS = "s3fs"
@@ -1695,6 +1699,34 @@ async def _attach_filler_log_tail(
         )
 
 
+# a restarting image's output can land seconds after the first read: re-read a bounded few seconds before cleanup
+FILLER_LOG_TAIL_REREAD_DELAYS_S = (1, 2, 2)
+
+
+async def _reread_empty_filler_log_tail(
+    explained_failure: Exception,
+    docker_client: RentalDockerSdkClient,
+    *,
+    container_name: str,
+    workload_kind: WorkloadKind,
+    environment: dict[str, str] | None,
+    log_extra: dict,
+) -> None:
+    if not (
+        isinstance(explained_failure, ImageExitedDuringKeyInjection)
+        and not explained_failure.log_tail
+        and workload_kind == WorkloadKind.FILLER
+    ):
+        return
+    for delay_s in FILLER_LOG_TAIL_REREAD_DELAYS_S:
+        await asyncio.sleep(delay_s)
+        explained_failure.log_tail = await _container_log_tail_or_empty(
+            docker_client, container_name=container_name, environment=environment, log_extra=log_extra
+        )
+        if explained_failure.log_tail:
+            return
+
+
 async def _explain_add_public_keys_failure(
     docker_client: RentalDockerSdkClient,
     *,
@@ -1898,6 +1930,10 @@ async def _record_validator_start(ssh_client: asyncssh.SSHClientConnection, cont
             check=False,
             timeout=30,
         )
+
+
+# written by run_jupyter.sh when the validator installs Jupyter; absent on a pod without platform Jupyter
+_JUPYTER_RESTART_CMD = "[ -f /tmp/lium-jupyter-restart.sh ] || exit 0; exec sh /tmp/lium-jupyter-restart.sh"
 
 
 class _UnkillableParkedContainer(Exception):
@@ -2351,6 +2387,14 @@ class _InflightCreate:
     cancelled: asyncio.Event = field(default_factory=asyncio.Event)
 
 
+# (miner hotkey, executor id): an executor id is unique only within its miner
+ExecutorKey = tuple[str, str]
+
+
+def executor_key(payload) -> ExecutorKey:
+    return (payload.miner_hotkey, payload.executor_id)
+
+
 class _InflightCreateRegistry:
     """Creates running right now, and whether a delete has already cancelled them.
 
@@ -2359,67 +2403,76 @@ class _InflightCreateRegistry:
     the host ports minutes later. That orphan then blocks the next paying rental with "port is
     already allocated". Only the create can undo itself, so the delete flips the flag here and the
     create tears itself down at its next checkpoint.
+
+    DAH-6540: keyed by pod and executor. A rent moved to another node keeps its pod id, so a delete sent to the
+    node it left must not cancel, or wait for, the pod's create on the new node. A create's own reads name no
+    executor and take the one its `track` holds.
     """
 
     def __init__(self) -> None:
-        self._creates_by_pod_id: dict[str, _InflightCreate] = {}
-        # Pods this task's create already holds: the job runner and the miner handler both
+        self._creates: dict[tuple[str, ExecutorKey], _InflightCreate] = {}
+        # Pods this task's create already holds, with their executor: the job runner and the miner handler both
         # register one create, and that must count once so `running` counts distinct creates.
-        self._held_pod_ids: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
-            "inflight_create_held_pod_ids", default=frozenset()
+        self._held: contextvars.ContextVar[dict[str, ExecutorKey]] = contextvars.ContextVar(
+            "inflight_create_held_pods", default={}
         )
 
     @contextlib.contextmanager
-    def track(self, pod_id: str) -> Iterator[None]:
-        held = self._held_pod_ids.get()
-        if pod_id in held:
+    def track(self, pod_id: str, executor: ExecutorKey) -> Iterator[None]:
+        held = self._held.get()
+        if held.get(pod_id) == executor:
             yield
             return
-        token = self._held_pod_ids.set(held | {pod_id})
-        create = self._creates_by_pod_id.setdefault(pod_id, _InflightCreate())
+        token = self._held.set({**held, pod_id: executor})
+        key = (pod_id, executor)
+        create = self._creates.setdefault(key, _InflightCreate())
         create.running += 1
         try:
             yield
         finally:
-            self._held_pod_ids.reset(token)
+            self._held.reset(token)
             create.running -= 1
             if create.running <= 0:
-                self._creates_by_pod_id.pop(pod_id, None)
+                self._creates.pop(key, None)
                 create.done.set()
 
-    def cancel(self, pod_id: str) -> bool:
-        """Flag the in-flight create for this pod. False when no create is running."""
-        create = self._creates_by_pod_id.get(pod_id)
-        if create is None:
-            return False
-        create.cancelled_by_delete = True
-        create.cancelled.set()
-        return True
+    def _matching(self, pod_id: str, executor: ExecutorKey | None) -> list[_InflightCreate]:
+        executor = executor or self._held.get().get(pod_id)
+        if executor is not None:
+            create = self._creates.get((pod_id, executor))
+            return [create] if create is not None else []
+        return [create for (pod, _), create in self._creates.items() if pod == pod_id]
 
-    async def wait_cancelled(self, pod_id: str) -> None:
+    def cancel(self, pod_id: str, executor: ExecutorKey) -> bool:
+        """Flag the in-flight create for this pod on this executor. False when no create is running there."""
+        creates = self._matching(pod_id, executor)
+        for create in creates:
+            create.cancelled_by_delete = True
+            create.cancelled.set()
+        return bool(creates)
+
+    async def wait_cancelled(self, pod_id: str, executor: ExecutorKey | None = None) -> None:
         """Return once a delete cancels this pod's create; never while no create is tracked for it."""
-        create = self._creates_by_pod_id.get(pod_id)
-        await (create.cancelled if create is not None else asyncio.Event()).wait()
+        creates = self._matching(pod_id, executor)
+        await (creates[0].cancelled if creates else asyncio.Event()).wait()
 
-    def is_cancelled(self, pod_id: str) -> bool:
-        create = self._creates_by_pod_id.get(pod_id)
-        return create is not None and create.cancelled_by_delete
+    def is_cancelled(self, pod_id: str, executor: ExecutorKey | None = None) -> bool:
+        return any(create.cancelled_by_delete for create in self._matching(pod_id, executor))
 
-    def is_running(self, pod_id: str) -> bool:
-        return pod_id in self._creates_by_pod_id
+    def is_running(self, pod_id: str, executor: ExecutorKey | None = None) -> bool:
+        return bool(self._matching(pod_id, executor))
 
-    def is_only_create(self, pod_id: str) -> bool:
+    def is_only_create(self, pod_id: str, executor: ExecutorKey | None = None) -> bool:
         """Exactly one create for this pod is registered (the caller's): no other attempt is live."""
-        create = self._creates_by_pod_id.get(pod_id)
-        return create is not None and create.running == 1
+        return sum(create.running for create in self._matching(pod_id, executor)) == 1
 
-    async def wait_until_done(self, pod_id: str, timeout: float) -> bool:
+    async def wait_until_done(self, pod_id: str, timeout: float, executor: ExecutorKey | None = None) -> bool:
         """Wait for the create(s) on this pod to leave. False when the wait ran out."""
-        create = self._creates_by_pod_id.get(pod_id)
-        if create is None:
+        creates = self._matching(pod_id, executor)
+        if not creates:
             return True
         try:
-            await asyncio.wait_for(create.done.wait(), timeout)
+            await asyncio.wait_for(asyncio.gather(*(create.done.wait() for create in creates)), timeout)
         except asyncio.TimeoutError:
             return False
         return True
@@ -2431,39 +2484,38 @@ inflight_creates = _InflightCreateRegistry()
 
 
 class _CreateStepsAfterReplyRegistry:
-    """Create steps the backend's reply does not wait for, by pod.
+    """Create steps the backend's reply does not wait for, by pod and executor.
 
     DAH-3980: the inspector start, the create's session close and the validator key removal run
     after the reply. Held here so the tasks are not collected, and so a delete of the pod waits for
     them first: an inspector start landing after the delete's stop would leave the collector running.
-    Each step logs its own failure.
+    Each step logs its own failure. DAH-6540: a delete on a node the pod left does not wait for the new node's.
     """
 
     def __init__(self) -> None:
-        self._tasks_by_pod_id: dict[str, set[asyncio.Task]] = {}
+        self._tasks: dict[tuple[str, ExecutorKey], set[asyncio.Task]] = {}
 
-    def start(self, pod_id: str, steps: Awaitable[None]) -> None:
+    def start(self, pod_id: str, executor: ExecutorKey, steps: Awaitable[None]) -> None:
+        key = (pod_id, executor)
         task = asyncio.ensure_future(steps)
-        self._tasks_by_pod_id.setdefault(pod_id, set()).add(task)
-        task.add_done_callback(lambda done: self._forget(pod_id, done))
+        self._tasks.setdefault(key, set()).add(task)
+        task.add_done_callback(lambda done: self._forget(key, done))
 
-    def _forget(self, pod_id: str, task: asyncio.Task) -> None:
-        tasks = self._tasks_by_pod_id.get(pod_id, set())
+    def _forget(self, key: tuple[str, ExecutorKey], task: asyncio.Task) -> None:
+        tasks = self._tasks.get(key, set())
         tasks.discard(task)
         if not tasks:
-            self._tasks_by_pod_id.pop(pod_id, None)
+            self._tasks.pop(key, None)
 
-    async def wait_until_done(self, pod_id: str, timeout: float) -> bool:
-        """Wait for this pod's steps; cancel what is left after the timeout and wait for it once more
-        as long. False on a cancel."""
-        return await self._wait_or_cancel(set(self._tasks_by_pod_id.get(pod_id, ())), timeout)
+    async def wait_until_done(self, pod_id: str, executor: ExecutorKey, timeout: float) -> bool:
+        """Wait for this pod's steps on this executor; cancel what is left after the timeout and wait for it once
+        more as long. False on a cancel."""
+        return await self._wait_or_cancel(set(self._tasks.get((pod_id, executor), ())), timeout)
 
     async def wait_until_all_done(self) -> bool:
         """The same for every pod's steps, bounded as a delete's wait: the connector's shutdown, so it does
         not cut a key removal."""
-        return await self._wait_or_cancel(
-            set().union(*self._tasks_by_pod_id.values()), _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS
-        )
+        return await self._wait_or_cancel(set().union(*self._tasks.values()), _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS)
 
     @staticmethod
     async def _wait_or_cancel(tasks: set[asyncio.Task], timeout: float) -> bool:
@@ -2784,7 +2836,7 @@ POD_GPU_OPERATION_DEADLINE_SECONDS = 600
 
 
 class _PodGpuOperationLocks:
-    """One lock per pod shared by a renter's GPU operations (reset, clock lock), the pod's delete and the clock
+    """One lock per pod on one executor shared by a renter's GPU operations (reset, clock lock), the pod's delete and the clock
     reset before its (re)create.
 
     The pending-pod check and its mark are separate steps, and a delete takes no mark, so a clock lock and a
@@ -2794,14 +2846,18 @@ class _PodGpuOperationLocks:
     """
 
     def __init__(self) -> None:
-        self._locks: dict[str, asyncio.Lock] = {}
-        self._holders: dict[str, int] = {}
+        self._locks: dict[tuple[str, ExecutorKey], asyncio.Lock] = {}
+        self._holders: dict[tuple[str, ExecutorKey], int] = {}
 
     @contextlib.asynccontextmanager
-    async def hold(self, pod_id: str, wait: float):
-        """Yields whether the lock was taken. wait=0: take it only if free, with no await in between."""
-        lock = self._locks.setdefault(pod_id, asyncio.Lock())
-        self._holders[pod_id] = self._holders.get(pod_id, 0) + 1
+    async def hold(self, pod_id: str, executor: ExecutorKey, wait: float):
+        """Yields whether the lock was taken. wait=0: take it only if free, with no await in between.
+
+        DAH-6540 (review): per executor, so a delete on the node a moved pod left never waits for its GPU work on
+        the new node."""
+        key = (pod_id, executor)
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        self._holders[key] = self._holders.get(key, 0) + 1
         acquired = False
         try:
             if wait == 0:
@@ -2815,9 +2871,9 @@ class _PodGpuOperationLocks:
         finally:
             if acquired:
                 lock.release()
-            self._holders[pod_id] -= 1
-            if not self._holders[pod_id]:
-                del self._holders[pod_id], self._locks[pod_id]
+            self._holders[key] -= 1
+            if not self._holders[key]:
+                del self._holders[key], self._locks[key]
 
 
 pod_gpu_operation_locks = _PodGpuOperationLocks()
@@ -3263,14 +3319,17 @@ def _wipe_volume_cmd(local_volume: str, *container_names: str) -> str:
     return (
         f"v={volume}; dm=$({docker} volume inspect -f '{{{{.Driver}}}} {{{{.Mountpoint}}}}' $v) || exit 2; "
         'd=${dm%% *}; m=${dm#* }; '
-        f"users=$({docker} ps -a --filter volume=$v --format '{{{{.Names}}}}') || exit 2; "
+        f"users=$({docker} ps -a --filter volume=\"$v\" --format '{{{{.Names}}}}') || exit 2; "
         f'ok={allowed}; for u in $users; do case "$ok" in *" $u "*) ;; *) echo "volume in use by $u"; exit 6;; esac; done; '
         'case "$d" in '
         'local) case "$m" in */volumes/"$v"/_data) p=$m;; *) echo "unexpected mountpoint $m"; exit 5;; esac;; '
         f'vloopback|vloopback:*) [ "$m" = "/mnt/$v" ] || {{ echo "unexpected mountpoint $m"; exit 5; }}; '
         f"root=$({docker} info -f '{{{{.DockerRootDir}}}}') || exit 3; "
         f"id=$({docker} plugin inspect -f '{{{{.Id}}}}' \"$d\") || exit 3; "
-        'p=$root/plugins/$id/propagated-mount/$v;; '
+        # root and id are the node's own answers: the id must be a plugin id, the root a plain path
+        'case "$id" in *[!0-9a-f]*|"") echo "unexpected plugin id"; exit 3;; esac; '
+        'case "$root" in /*) ;; *) echo "unexpected docker root"; exit 3;; esac; '
+        'p="$root/plugins/$id/propagated-mount/$v";; '
         '*) echo "unexpected driver $d"; exit 5;; esac; '
         '[ -d "/proc/1/root$p" ] || { echo "no dir $p"; exit 4; }; '
         'find "/proc/1/root$p" -mindepth 1 -maxdepth 1 -exec rm -rf {} + && echo "wiped $p"'
@@ -3689,7 +3748,7 @@ class DockerService:
         cancel (the copy is free for the next flatten's cleanup)."""
         flatten_lease: list[str] = []
         try:
-            return await self._run_rental_docker_create_attempts(
+            container_id = await self._run_rental_docker_create_attempts(
                 docker_client=docker_client,
                 ssh_client=ssh_client,
                 run_spec=run_spec,
@@ -3706,6 +3765,8 @@ class DockerService:
                 flatten_lease=flatten_lease,
                 pod_id=pod_id,
             )
+            await apply_host_memory_guard(ssh_client, default_extra)
+            return container_id
         finally:
             for lease in flatten_lease:
                 try:
@@ -4838,6 +4899,29 @@ class DockerService:
             )
             return None
 
+    async def _skip_probe_held_ports(self, executor_id: str, available_ports: dict, required_port_count: int) -> dict:
+        """The backend's free ports less those a running port check holds, unless too few would be left."""
+        try:
+            held = await self.redis_service.probe_held_ports(executor_id)
+        except Exception as e:
+            logger.warning(f"probe-held ports unknown for executor {executor_id}: {str(e)[:100]}")
+            return available_ports
+        free = {port: mapping for port, mapping in available_ports.items() if port not in held}
+        if len(free) == len(available_ports):
+            return available_ports
+        if len(free) < required_port_count:
+            # shortcut: the pod may then clash with the probe; waiting for the release would delay the rental
+            logger.warning(f"executor {executor_id}: a port check holds all but {len(free)} free ports, using them")
+            return available_ports
+        logger.info(f"executor {executor_id}: skipping {len(available_ports) - len(free)} ports a port check holds")
+        return free
+
+    async def _record_pending_pod_ports(self, executor_id: str, external_ports: list[int]) -> None:
+        try:
+            await self.redis_service.record_pending_pod_ports(executor_id, external_ports, POD_PORTS_PENDING_TTL_SECONDS)
+        except Exception as e:
+            logger.warning(f"pending pod ports not recorded for executor {executor_id}: {str(e)[:100]}")
+
     async def generate_portMappings(
         self,
         miner_hotkey: str,
@@ -4867,6 +4951,9 @@ class DockerService:
 
                 # SSH, plus Jupyter when enabled; the renter's other ports take what the backend offered
                 required_port_count = MIN_POD_PORT_COUNT + (1 if enable_jupyter else 0)
+                # DAH-6376: a running port check binds its ports on the host network, and a pod given one of
+                # them fails to bind it ("port is already allocated"). The backend's list does not know them.
+                available_ports = await self._skip_probe_held_ports(executor_id, available_ports, required_port_count)
                 if not pod_mapping and len(available_ports) < required_port_count:
                     logger.warning(
                         f"Insufficient ports available ({len(available_ports)}/{required_port_count}) "
@@ -4941,7 +5028,8 @@ class DockerService:
                     if mapping:
                         jupyter_port_map = (mapping[0], mapping[2])
 
-                # Port reservation now handled by backend
+                # Port reservation now handled by backend; a port check reads these until the backend lists them
+                await self._record_pending_pod_ports(executor_id, [mapping[2] for mapping in mappings])
 
                 return mappings, jupyter_port_map
 
@@ -6760,8 +6848,11 @@ class DockerService:
             if listed.exit_status != 0:
                 return []
             names = tuple(line.strip() for line in (listed.stdout or "").splitlines())
+        # names are the node's `docker volume ls` output and go into `-v` and the wipe: only plain names
         return sorted(
-            name for name in names if name.startswith(name_prefixes) and name not in keep_names
+            name
+            for name in names
+            if name.startswith(name_prefixes) and name not in keep_names and _is_safe_docker_volume_name(name)
         )
 
     async def sweep_stale_cache_volumes(
@@ -7408,7 +7499,13 @@ class DockerService:
                 operation="exec_register_vulkan_icd",
                 exec_spec=ContainerExecSpec(
                     container_name=container_name,
-                    argv=("sh", "-s", "--", "--vulkan-icd-only"),
+                    # kept on disk: the sshd watchdog it leaves re-runs the script (DAH-6042)
+                    argv=(
+                        "sh",
+                        "-c",
+                        f"cat > {shlex.quote(IN_CONTAINER_SSH_BOOTSTRAP_PATH)} "
+                        f"&& exec sh {shlex.quote(IN_CONTAINER_SSH_BOOTSTRAP_PATH)} --vulkan-icd-only",
+                    ),
                     stdin=self._ssh_bootstrap_script_path().read_text(),
                     idempotent=True,
                 ),
@@ -7914,17 +8011,27 @@ class DockerService:
         mount_options: str,
     ) -> list[asyncssh.SSHCompletedProcess]:
         """Install and configure the plugin instance that serves this one volume."""
-        commands: list[str] = [
+        install_command: str = (
             f"/usr/bin/docker plugin install {S3FS_PLUGIN_IMAGE} "
-            f"--alias {plugin_alias} --grant-all-permissions --disable",
+            f"--alias {plugin_alias} --grant-all-permissions --disable"
+        )
+        # the install pulls the plugin from Docker Hub every time; one TLS timeout there failed the whole rental
+        install_result = await ssh_client.run(install_command)
+        for _ in range(S3FS_PLUGIN_INSTALL_RETRIES):
+            if install_result.exit_status == 0 or "already exists" in (install_result.stderr or ""):
+                break
+            await asyncio.sleep(S3FS_PLUGIN_INSTALL_RETRY_WAIT_SECONDS)
+            install_result = await ssh_client.run(install_command)
+        commands: list[str] = [
             f"/usr/bin/docker plugin disable {plugin_alias} -f",
+            # backend-sent keys and options: each assignment is one quoted word
             f"/usr/bin/docker plugin set {plugin_alias} "
-            f"AWSACCESSKEYID={volume_info.iam_user_access_key} "
-            f"AWSSECRETACCESSKEY={volume_info.iam_user_secret_key}",
-            f'/usr/bin/docker plugin set {plugin_alias} DEFAULT_S3FSOPTS="{mount_options}"',
+            f"{shlex.quote(f'AWSACCESSKEYID={volume_info.iam_user_access_key}')} "
+            f"{shlex.quote(f'AWSSECRETACCESSKEY={volume_info.iam_user_secret_key}')}",
+            f"/usr/bin/docker plugin set {plugin_alias} {shlex.quote(f'DEFAULT_S3FSOPTS={mount_options}')}",
             f"/usr/bin/docker plugin enable {plugin_alias}",
         ]
-        return [await ssh_client.run(command) for command in commands]
+        return [install_result] + [await ssh_client.run(command) for command in commands]
 
     async def _drop_legacy_shared_s3fs_volume(
         self,
@@ -8019,7 +8126,8 @@ class DockerService:
                 # (a FIFO would block the open forever) is unlinked, not opened; the timeout is the
                 # backstop, after which the `rm -fv` below kills the container.
                 command = (
-                    f"/usr/bin/docker run --rm -v {local_volume}:/mnt "
+                    f"/usr/bin/docker run --rm -v "
+                    f"{_quote_safe_docker_volume_name(local_volume, field_name='local_volume')}:/mnt "
                     f"--name {temp_container_name} --entrypoint sh "
                     f"daturaai/compute-subnet-executor:latest -c "
                     + shlex.quote(
@@ -10066,6 +10174,31 @@ class DockerService:
                 failure_step=current_step,
             )
 
+        reserved_paths = CustomOptions.reserved_volume_paths(
+            payload.custom_options.volumes if payload.custom_options else None
+        )
+        if reserved_paths:
+            current_step = "reserved_volume_path"
+            log_text = _m(
+                f"Volume path {reserved_paths[0]} is reserved: /mnt is where an attached Volume mounts and "
+                "/lium-cipher holds the encrypted data. Use another folder, such as /workspace.",
+                extra=get_extra_info(default_extra),
+            )
+            logger.error(log_text)
+            await self.redis_service.remove_pending_pod(
+                payload.miner_hotkey, payload.executor_id, payload.pod_id, command_id=payload.command_id
+            )
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                msg=str(log_text),
+                error_type=FailedContainerErrorTypes.ContainerCreationFailed,
+                error_code=FailedContainerErrorCodes.UnknownError,
+                failure_step=current_step,
+            )
+
         try:
             current_step = "prepare_request"
             custom_options = CustomOptions.sanitize(payload.custom_options)
@@ -10733,7 +10866,7 @@ class DockerService:
                     # DAH-3980: an earlier edit's steps after its reply finish first: its inspector start, and
                     # its removal of the container it parked, by that one's ID (never the one this edit parks)
                     if not await create_steps_after_reply.wait_until_done(
-                        payload.pod_id, _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS
+                        payload.pod_id, executor_key(payload), _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS
                     ):
                         logger.warning(
                             _m(
@@ -11851,6 +11984,14 @@ class DockerService:
                 except Exception as post_run_exc:
                     if vulkan_icd is not None:
                         await vulkan_icd  # best effort, never raises: let its exec end before cleanup removes the pod
+                    await _reread_empty_filler_log_tail(
+                        post_run_exc,
+                        docker_client,
+                        container_name=container_id or container_name,
+                        workload_kind=payload.workload_kind,
+                        environment=custom_options.environment if custom_options else None,
+                        log_extra=default_extra,
+                    )
                     container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
                         default_extra=default_extra,
@@ -11997,6 +12138,7 @@ class DockerService:
                 edit_swap.replacement_is_up = True
                 create_steps_after_reply.start(
                     payload.pod_id,
+                    executor_key(payload),
                     self._run_create_steps_after_reply(
                         connections.pop_all(),
                         ssh_client=ssh_client,
@@ -12716,6 +12858,16 @@ class DockerService:
             log_tag=f"start_container_{pod_id}",
             log_extra=default_extra,
         )
+        if encrypted_volume_name:
+            # the executor's start watcher skips encrypted pods (no SSH before the remount): bring the platform
+            # Jupyter back here, after it, with the token and port run_jupyter.sh saved (DAH-6379)
+            with contextlib.suppress(asyncssh.Error, OSError, TimeoutError):
+                await ssh_client.run(
+                    f"/usr/bin/docker exec -d -u 0 {shlex.quote(container_name)} sh -c "
+                    f"{shlex.quote(_JUPYTER_RESTART_CMD)}",
+                    check=False,
+                    timeout=30,
+                )
         if not ssh_bootstrap_ok:
             logger.warning(
                 _m(
@@ -13925,7 +14077,9 @@ class DockerService:
         try); anything else here is best-effort and never blocks the rental."""
         # DAH-4663 (review): after a renter's clock lock in flight on this pod (a reboot), so its -lgc never lands
         # after this reset dropped its record. Only around this step, so a delete still cancels the create at once.
-        async with pod_gpu_operation_locks.hold(payload.pod_id, POD_GPU_OPERATION_DEADLINE_SECONDS) as held:
+        async with pod_gpu_operation_locks.hold(
+            payload.pod_id, executor_key(payload), POD_GPU_OPERATION_DEADLINE_SECONDS
+        ) as held:
             if not held:
                 logger.warning(_m("A GPU operation on the pod outlasted its wait", extra=get_extra_info(default_extra)))
             # DAH-4663 (review): a create its delete cancelled during a long pull or build runs no -rgc on GPUs the
@@ -13961,7 +14115,9 @@ class DockerService:
             return refused
         # DAH-4663 (review): after a renter's GPU operation on the pod, so the clock reset below runs after any -lgc.
         # Taken only once the cancelled create is done: its own clock reset waits on this lock.
-        async with pod_gpu_operation_locks.hold(payload.pod_id, POD_GPU_OPERATION_DELETE_WAIT_SECONDS) as held:
+        async with pod_gpu_operation_locks.hold(
+            payload.pod_id, executor_key(payload), POD_GPU_OPERATION_DELETE_WAIT_SECONDS
+        ) as held:
             if not held:
                 logger.warning(
                     _m(
@@ -13995,20 +14151,20 @@ class DockerService:
         # DAH-2728: a create still in flight would otherwise finish behind our back and leave an
         # orphan container holding the ports. Past the validation above, so a delete this validator
         # refuses cannot kill a healthy create.
-        if inflight_creates.cancel(payload.pod_id):
+        if inflight_creates.cancel(payload.pod_id, executor_key(payload)):
             log.info("Cancelled the in-flight create for this pod")
             # Let the create finish tearing itself down before this teardown runs, so the last
             # actor on the host is never a create that ran after we answered "deleted". On timeout
             # we tear the container down ourselves, which is what this delete did before DAH-2728.
             create_aborted = await inflight_creates.wait_until_done(
-                payload.pod_id, CANCELLED_CREATE_ABORT_TIMEOUT_SECONDS
+                payload.pod_id, CANCELLED_CREATE_ABORT_TIMEOUT_SECONDS, executor_key(payload)
             )
             if not create_aborted:
                 log.warning("The cancelled create is still running; deleting without it")
         # DAH-3980: the create's steps after its reply (inspector start, session close) end before
         # this teardown, so its inspector stop is the last word on the host.
         if not await create_steps_after_reply.wait_until_done(
-            payload.pod_id, _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS
+            payload.pod_id, executor_key(payload), _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS
         ):
             log.warning("Cancelled the create's steps after its reply; deleting without them")
 
@@ -14157,7 +14313,8 @@ class DockerService:
                 # DAH-4663: give the GPUs a renter locked back their clocks (one Redis read when none)
                 with _best_effort_delete_step(log, "reset_gpu_clock_locks"):
                     await reset_pod_clock_locks(
-                        SSHCommandRunner(ssh_client, max_retries=0), self.redis_service, payload.pod_id
+                        SSHCommandRunner(ssh_client, max_retries=0), self.redis_service, payload.pod_id,
+                        payload.miner_hotkey, payload.executor_id,
                     )
 
                 with _best_effort_delete_step(log, "prune_images"):
@@ -14403,7 +14560,9 @@ class DockerService:
         Never raises: any error is logged and the reboot goes on as before (None)."""
         try:
             # as _reset_leftover_clock_locks_before_create: a renter's Reset GPU or clock lock never overlaps it
-            async with pod_gpu_operation_locks.hold(payload.pod_id, POD_GPU_OPERATION_DEADLINE_SECONDS) as held:
+            async with pod_gpu_operation_locks.hold(
+                payload.pod_id, executor_key(payload), POD_GPU_OPERATION_DEADLINE_SECONDS
+            ) as held:
                 if not held:
                     # best-effort: skipping it is safe, running it beside the other GPU operation is not
                     logger.warning(
@@ -14474,7 +14633,7 @@ class DockerService:
         }
         logger.info(_m(label, extra=get_extra_info({**default_extra, "payload": str(payload)})))
         # DAH-4663 (review): never alongside the pod's delete or another GPU operation
-        async with pod_gpu_operation_locks.hold(payload.pod_id, 0) as held:
+        async with pod_gpu_operation_locks.hold(payload.pod_id, executor_key(payload), 0) as held:
             if not held:
                 logger.info(_m(f"{label}: another operation on the pod is running", extra=get_extra_info(default_extra)))
                 return dataclasses.replace(
@@ -14679,6 +14838,7 @@ class DockerService:
                 self.redis_service,
                 container_name=payload.container_name,
                 pod_id=payload.pod_id,
+                miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 pod_gpu_uuids=payload.gpu_uuids,
                 gpu_indices=payload.gpu_indices,

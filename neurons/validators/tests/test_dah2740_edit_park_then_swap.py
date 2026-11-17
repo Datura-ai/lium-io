@@ -27,6 +27,7 @@ from services.docker_service import (
     DockerService,
     _layer_data_check,
     create_steps_after_reply,
+    executor_key,
     inflight_creates,
 )
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS
@@ -130,7 +131,7 @@ async def _run(svc, payload):
         private_key="encrypted",
     )
     # a successful edit removes the parked container after its reply, with the create's session close
-    await create_steps_after_reply.wait_until_done(payload.pod_id, timeout=10)
+    await create_steps_after_reply.wait_until_done(payload.pod_id, executor_key(payload), timeout=10)
     return result
 
 
@@ -222,6 +223,9 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         " --format=csv,noheader,nounits",
         # DAH-4663: the clock-lock safety net resets the pod's GPUs, inside the failed-create cleanup, before docker run
         "nvidia-smi -i GPU-test -rgc >/dev/null 2>&1; echo GPU-test $?",
+        # then, in its own call: application and memory clocks back to default
+        "nvidia-smi -i GPU-test -rac >/dev/null 2>&1; echo GPU-test -rac $?; "
+        "nvidia-smi -i GPU-test -rmc >/dev/null 2>&1; echo GPU-test -rmc $?",
         host_key,
         "nohup /usr/bin/python /root/app/src/inspector_executor.py --start-collector >/dev/null 2>&1 &",
         f"/usr/bin/docker rm -fv id-{name}",
@@ -249,7 +253,7 @@ async def test_a_cancelled_step_after_the_reply_keeps_the_edit(svc, monkeypatch)
         private_key="encrypted",
     )
     await asyncio.sleep(0)
-    steps_finished = await create_steps_after_reply.wait_until_done(payload.pod_id, timeout=0.01)
+    steps_finished = await create_steps_after_reply.wait_until_done(payload.pod_id, executor_key(payload), timeout=0.01)
 
     assert isinstance(result, ContainerCreated)
     assert steps_finished is False
@@ -283,7 +287,7 @@ async def test_a_second_edit_parks_only_after_the_first_edits_steps_after_reply(
     await asyncio.sleep(0.1)
     inspector_may_start.set()
     second_edit_result = await asyncio.wait_for(second_edit, 10)
-    await create_steps_after_reply.wait_until_done(payload.pod_id, timeout=10)
+    await create_steps_after_reply.wait_until_done(payload.pod_id, executor_key(payload), timeout=10)
 
     assert isinstance(first_edit, ContainerCreated)
     assert isinstance(second_edit_result, ContainerCreated)
@@ -313,16 +317,16 @@ async def test_a_second_edit_cancelled_by_a_delete_while_it_waits_never_parks(sv
     )
 
     async def tracked_edit():
-        with inflight_creates.track(payload.pod_id):
+        with inflight_creates.track(payload.pod_id, executor_key(payload)):
             return await svc.create_container(**create)
 
     await svc.create_container(**create)
     second_edit = asyncio.create_task(tracked_edit())
     await asyncio.sleep(0.1)
-    inflight_creates.cancel(payload.pod_id)
+    inflight_creates.cancel(payload.pod_id, executor_key(payload))
     inspector_may_start.set()
     second_edit_result = await asyncio.wait_for(second_edit, 10)
-    await create_steps_after_reply.wait_until_done(payload.pod_id, timeout=10)
+    await create_steps_after_reply.wait_until_done(payload.pod_id, executor_key(payload), timeout=10)
 
     assert isinstance(second_edit_result, FailedContainerRequest)
     assert ssh.commands.count(f"/usr/bin/docker rename {name} {parked}") == 1

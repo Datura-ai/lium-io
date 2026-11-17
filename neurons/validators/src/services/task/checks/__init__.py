@@ -7,6 +7,7 @@ from .cpu_truth import CpuTruthCheck
 from .disk_health import DiskHealthCheck
 from .disk_space import DiskSpaceCheck, SplitDiskCheck
 from .custom_build_orphan_sweep import CustomBuildOrphanSweepCheck
+from .rental_egress_guard import RentalEgressGuardCheck
 from .duplicate_executor import DuplicateExecutorCheck
 from .executor_image import ExecutorImageCheck
 from .finalize import FinalizeCheck
@@ -75,6 +76,7 @@ __all__ = [
     "DiskSpaceCheck",
     "SplitDiskCheck",
     "CustomBuildOrphanSweepCheck",
+    "RentalEgressGuardCheck",
     "DuplicateExecutorCheck",
     "ExecutorImageCheck",
     "FinalizeCheck",
