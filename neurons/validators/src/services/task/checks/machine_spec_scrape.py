@@ -23,7 +23,6 @@ from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
 from .gpu_loss_hold import GpuLossHoldCheck
 from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
-from .task_time import task_seconds_left
 from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
 
 logger = logging.getLogger(__name__)
@@ -404,15 +403,8 @@ class MachineSpecScrapeCheck:
     async def run(self, ctx: Context) -> CheckResult:
         liumd_specs = settings.VALIDATOR_LIUMD_SPECS and not settings.DRY_RUN
         if settings.VALIDATOR_LIUMD_SHADOW or liumd_specs:
-            refresh = await ensure_liumd_binary(ctx, seconds_left=task_seconds_left(ctx))
-            if refresh is not None and refresh.skipped:
-                logger.warning(
-                    _m(
-                        "liumd binary refresh skipped; using the local binary",
-                        extra=get_extra_info({**ctx.default_extra, "detail": refresh.detail[:300]}),
-                    )
-                )
-            elif refresh is not None and not refresh.ok:
+            refresh = await ensure_liumd_binary(ctx)
+            if refresh is not None and not refresh.ok:
                 if liumd_specs:
                     return self._fail_liumd(
                         ctx,

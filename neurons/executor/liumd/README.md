@@ -13,8 +13,6 @@ Both files are the unsigned CI artifacts built from the liumd source head `25f8f
 `provenance-amd64.json`/`provenance-arm64.json` are the same run's metadata, kept beside the
 binaries for traceability. `manifest.json` is the validator refresh manifest: it names the
 `build_sha` and the sha256 of each binary. The image digest is still the normal delivery trust
-boundary. The validator pins a copy in `PINNED_MANIFEST`
-(`neurons/validators/src/services/liumd_binary_refresh.py`); update both together, and point
-`LIUMD_BINARY_FETCH_BASE_URL` at the commit that vendors them.
+boundary.
 
 Refresh both binaries and both provenance files from the same liumd source build.

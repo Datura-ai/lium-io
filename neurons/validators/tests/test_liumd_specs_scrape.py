@@ -224,7 +224,7 @@ def test_normalization_maps_the_liumd_contract_without_mutating_the_snapshot():
 async def test_a_failed_binary_refresh_fails_specs_mode_before_the_scrape(monkeypatch):
     _liumd_on(monkeypatch)
 
-    async def failed_refresh(ctx, *, seconds_left=None):
+    async def failed_refresh(ctx):
         return LiumdRefresh(False, None, "manifest unavailable")
 
     monkeypatch.setattr(machine_spec_scrape, "ensure_liumd_binary", failed_refresh)
@@ -239,33 +239,12 @@ async def test_a_failed_binary_refresh_fails_specs_mode_before_the_scrape(monkey
 
 
 @pytest.mark.asyncio
-async def test_a_skipped_binary_refresh_does_not_fail_specs_mode(monkeypatch):
-    _liumd_on(monkeypatch)
-    _start_reading(monkeypatch, _answer(LIUMD_SPECS))
-    seen = []
-
-    async def skipped_refresh(ctx, *, seconds_left=None):
-        seen.append(seconds_left)
-        return LiumdRefresh(False, None, "refresh budget 0s is too small", skipped=True)
-
-    monkeypatch.setattr(machine_spec_scrape, "ensure_liumd_binary", skipped_refresh)
-    runner = DummySSHCommandRunner(result=make_command_result(success=False))
-
-    result = await MachineSpecScrapeCheck().run(_ctx(runner))
-
-    assert result.passed is True
-    assert result.event.what_we_saw["delivery"] == "liumd"
-    assert runner.calls == []
-    assert seen and seen[0] is not None
-
-
-@pytest.mark.asyncio
 async def test_a_failed_binary_refresh_does_not_fail_shadow_mode(monkeypatch):
     monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_SPECS", False)
     monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_SHADOW", True)
     monkeypatch.setattr(machine_spec_scrape.settings, "DRY_RUN", False)
 
-    async def failed_refresh(ctx, *, seconds_left=None):
+    async def failed_refresh(ctx):
         return LiumdRefresh(False, None, "manifest unavailable")
 
     monkeypatch.setattr(machine_spec_scrape, "ensure_liumd_binary", failed_refresh)
