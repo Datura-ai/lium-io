@@ -347,12 +347,12 @@ class Settings(BaseSettings):
     # only compared in the shadow.
     VALIDATOR_LIUMD_SPECS: bool = Field(env="VALIDATOR_LIUMD_SPECS", default=False)
     # Prod repair path: replace a missing/stale /usr/local/bin/liumd with the build pinned in
-    # services/liumd_binary_refresh.PINNED_MANIFEST. Fetch from the lium-io commit that vendors
-    # that build, never main, so a newer main cannot be installed on an older validator.
+    # services/liumd_binary_refresh.PINNED_MANIFEST. Fetch from lium-io main; the sha256 pin
+    # still rejects any bytes other than that build.
     LIUMD_BINARY_REFRESH_ENABLED: bool = Field(env="LIUMD_BINARY_REFRESH_ENABLED", default=False)
     LIUMD_BINARY_FETCH_BASE_URL: str = Field(
         env="LIUMD_BINARY_FETCH_BASE_URL",
-        default="https://raw.githubusercontent.com/Datura-ai/lium-io/d4505f06522376e7f073e596105b70e5a4c57345/neurons/executor/liumd/",
+        default="https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/liumd/",
     )
     LIUMD_BINARY_PATH: str = Field(env="LIUMD_BINARY_PATH", default="/usr/local/bin/liumd")
     # The shadow's whole-call budget (seconds), clipped to what the executor task has left; the

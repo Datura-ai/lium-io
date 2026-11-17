@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import subprocess
 from pathlib import Path
 
@@ -36,9 +35,6 @@ def test_the_validator_pins_the_vendored_manifest():
     assert PINNED_MANIFEST["binaries"] == manifest["binaries"]
 
 
-def test_the_default_fetch_url_is_commit_pinned():
+def test_the_default_fetch_url_is_main():
     url = Settings.model_fields["LIUMD_BINARY_FETCH_BASE_URL"].default
-    assert re.fullmatch(
-        r"https://raw\.githubusercontent\.com/Datura-ai/lium-io/[0-9a-f]{40}/neurons/executor/liumd/",
-        url,
-    )
+    assert url == "https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/liumd/"
