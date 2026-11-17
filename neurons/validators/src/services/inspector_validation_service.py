@@ -303,6 +303,10 @@ class InspectorValidationService:
                 await self._send_message(process, {"cmd": "start-collector"})
             except Exception as exc:
                 diagnostics["collector_ensure_error"] = str(exc)
+                if not isinstance(exc, InspectorInteractiveError):
+                    # its reply was not read whole and may still arrive: on this stream it would answer the handshake
+                    self._terminate(process)
+                    process = await ssh.create_process(command)
 
             open_json = validator.handshake_start()
             handshake_reply = await self._send_message(
@@ -713,13 +717,17 @@ class InspectorValidationService:
         stderr_text = "".join(captured).strip()
         return stderr_text or None
 
+    @staticmethod
+    def _terminate(process) -> None:
+        terminate = getattr(process, "terminate", None)
+        if terminate:
+            terminate()
+
     async def _close_process(self, process) -> None:
         try:
             await self._send_message(process, {"cmd": "quit"})
         except Exception:
-            terminate = getattr(process, "terminate", None)
-            if terminate:
-                terminate()
+            self._terminate(process)
         wait = getattr(process, "wait", None)
         if wait:
             try:

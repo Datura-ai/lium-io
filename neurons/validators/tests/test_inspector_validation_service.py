@@ -255,6 +255,36 @@ async def test_validate_rented_executor_continues_after_collector_ensure_failure
 
 
 @pytest.mark.asyncio
+async def test_a_start_reply_that_comes_after_its_timeout_is_never_read_as_the_handshake_reply():
+    service = InspectorValidationService(command_timeout=0.05)
+    late = FakeProcess()
+    late.stdout = FakeStdout(_interactive_stdout(), delay_first=1)
+    late.terminated = False
+    late.terminate = lambda: setattr(late, "terminated", True)
+    fresh = FakeProcess()
+    fresh.stdout = FakeStdout(_interactive_stdout()[1:])  # nothing sends start-collector on it
+
+    class TwoProcessSSH:
+        processes = [late, fresh]
+
+        async def create_process(self, _command: str):
+            return self.processes.pop(0)
+
+    result = await service.validate_rented_executor(
+        FakeShell(),
+        TwoProcessSSH(),
+        SimpleNamespace(uuid="exec-1", python_path="/usr/bin/python3", root_dir="/root/app"),
+        {"executor_uuid": "exec-1"},
+    )
+
+    assert result.error is None
+    assert result.report is not None
+    assert late.terminated is True
+    assert late.stdin.messages == [{"cmd": "start-collector"}]
+    assert [m["cmd"] for m in fresh.stdin.messages] == ["handshake-reply", "execute", "quit"]
+
+
+@pytest.mark.asyncio
 async def test_validate_rented_executor_returns_interactive_error():
     service = InspectorValidationService()
     ssh = FakeSSH()
