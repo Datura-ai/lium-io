@@ -317,7 +317,7 @@ def _ssh_with_runtime_ages(proc: str, ages: str):
         ("10 1 sysbox-mgr 90000\n11 1 sysbox-fs 90000\n--\n4242 86400\n4343 50\n", None),
         # a pod age not read flags nothing for that pod
         ("11 1 sysbox-fs 100\n--\n4343 50\n", None),
-        # the daemons run since boot; their own helpers (nsenter re-execs, seconds old): no restart
+        # the daemons run since boot; their own helpers (re-execs, seconds old): no restart
         (
             "10 1 sysbox-mgr 90000\n11 1 sysbox-fs 90000\n900 11 sysbox-fs 1\n901 10 sysbox-mgr 2\n"
             "--\n4242 86400\n4343 50\n",
