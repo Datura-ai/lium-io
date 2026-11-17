@@ -1256,13 +1256,13 @@ async def test_delete_helpers_call_sdk_volume_apis():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("repo_tags", "removed"), [([], True), (["daturaai/pytorch:latest"], False)])
-async def test_an_image_is_removed_by_id_only_once_no_tag_names_it(repo_tags, removed):
+@pytest.mark.parametrize(("repo_tags", "expect_removed"), [([], True), (["daturaai/pytorch:latest"], False)])
+async def test_an_image_is_removed_by_id_only_once_no_tag_names_it(repo_tags, expect_removed):
     api_client = FakeApiClient()
     api_client.repo_tags = repo_tags
 
-    assert await RentalDockerSdkClient(api_client).remove_image_if_untagged(image_id="sha256:pod") is removed
-    assert api_client.removed_images == (["sha256:pod"] if removed else [])
+    assert await RentalDockerSdkClient(api_client).remove_image_if_untagged(image_id="sha256:pod") is expect_removed
+    assert api_client.removed_images == (["sha256:pod"] if expect_removed else [])
 
 
 @pytest.mark.asyncio

@@ -87,7 +87,6 @@ class RecordingRentalDockerClient:
         self.removed_containers = []
         self.created_volumes = []
         self.removed_volumes = []
-        self.pruned_images = 0
         self.removed_untagged_images = []
         self.run_container_error = None
 
@@ -170,9 +169,6 @@ class RecordingRentalDockerClient:
         self, *, container_name: str, destination: str
     ) -> str | None:
         return None
-
-    async def prune_images(self) -> None:
-        self.pruned_images += 1
 
     async def container_image_id(self, *, container: str) -> str:
         return "sha256:pod-image"
@@ -1159,7 +1155,6 @@ async def test_lifecycle_operations_pass_container_names_as_sdk_data(
         }
     ]
     # DAH-6314: no host-wide prune (it broke a renter's concurrent pull); only the pod's own image, by ID
-    assert docker_client.pruned_images == 0
     assert docker_client.removed_untagged_images == ["sha256:pod-image"]
     assert docker_client.removed_volumes == [
         {"volume_name": "volume_lifecycle", "force": False}
