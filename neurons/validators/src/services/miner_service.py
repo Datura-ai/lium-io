@@ -545,9 +545,10 @@ class MinerService:
             *(run(executors[i], timeout) for i in stranded), return_exceptions=True
         )
         for i, rerun in zip(stranded, reruns):
-            # DAH-6546: the rerun is the latest verdict, failed or not; a pod still on the old GPUs fails it with its
-            # own pod_gpus_gone event, and its rented-GPU drop report moves the pod as the first run's did
-            if isinstance(rerun, JobResult):
+            # DAH-6546: a rerun that ran its checks is the latest verdict, failed or not; a pod still on the old GPUs
+            # fails it with its own pod_gpus_gone event, and its rented-GPU drop report moves the pod as the first run's
+            # did. An errored run (create_task's log_status "error") has no verdict: the first stands.
+            if isinstance(rerun, JobResult) and rerun.log_status != "error":
                 raw_results[i] = rerun
         passed = [r for r in reruns if isinstance(r, JobResult) and r.is_successful]
         logger.info(

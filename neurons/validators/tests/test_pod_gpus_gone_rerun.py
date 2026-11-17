@@ -110,14 +110,20 @@ async def test_a_failed_rerun_is_the_result_not_the_stale_first_one(rest_service
 
 
 @pytest.mark.asyncio
-async def test_a_rerun_with_no_result_keeps_the_first(rest_service):  # noqa: F811
+@pytest.mark.parametrize("rerun", ["timeout", "errored"])
+async def test_a_rerun_with_no_verdict_keeps_the_first(rest_service, rerun):  # noqa: F811
+    # review 4601760468: create_task turns an exception into a log_status "error" result, which has no verdict either
     rest_service.miner_returns(LISTED)
     first = _pod_gpus_gone(LISTED)
+    errored = _job_result(LISTED, score=0.0)
+    errored.log_status = "error"
     queue = [first]
 
     async def create_task(miner_info, executor_info, **_):
         if queue:
             return queue.pop(0)
+        if rerun == "errored":
+            return errored
         raise TimeoutError
 
     rest_service.task_service.create_task = AsyncMock(side_effect=create_task)
