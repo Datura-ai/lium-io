@@ -137,6 +137,10 @@ check_vfio_devices() {
         log_warning "CVM_GPUS is not set in .env; no GPU will be passed through"
         return 0
     fi
+    if [ -z "$(ls -A /sys/kernel/iommu_groups 2>/dev/null)" ]; then
+        log_error "No IOMMU groups: the IOMMU is off (enable VT-d in BIOS and intel_iommu=on, docs/host-setup.md section 2)"
+        return 1
+    fi
     for slot in $slots; do
         dev="/sys/bus/pci/devices/$slot"
         [ -e "$dev" ] || dev="/sys/bus/pci/devices/0000:$slot"
@@ -145,10 +149,16 @@ check_vfio_devices() {
             ok=false
             continue
         fi
-        driver=$(basename "$(readlink -f "$dev/driver" 2>/dev/null)" 2>/dev/null)
-        group=$(basename "$(readlink -f "$dev/iommu_group" 2>/dev/null)" 2>/dev/null)
+        driver=""
+        group=""
+        [ -e "$dev/driver" ] && driver=$(basename "$(readlink -f "$dev/driver")")
+        [ -e "$dev/iommu_group" ] && group=$(basename "$(readlink -f "$dev/iommu_group")")
         if [ "$driver" != "vfio-pci" ]; then
-            log_error "$slot uses driver '${driver:-none}', not vfio-pci (docs/host-setup.md section 2: vfio-pci.ids, then reboot)"
+            if [ -z "$driver" ] && [ ! -d /sys/module/vfio_pci ]; then
+                log_error "$slot has no driver: the vfio-pci module is not loaded (docs/host-setup.md section 2: load it at boot)"
+            else
+                log_error "$slot uses driver '${driver:-none}', not vfio-pci (docs/host-setup.md section 2: vfio-pci.ids, then reboot)"
+            fi
             ok=false
         elif [ -z "$group" ] || [ ! -e "/dev/vfio/$group" ]; then
             log_error "$slot has no /dev/vfio/${group:-<group>} (IOMMU off? docs/host-setup.md section 2)"
