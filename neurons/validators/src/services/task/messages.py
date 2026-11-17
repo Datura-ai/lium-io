@@ -1129,6 +1129,18 @@ class NodeAccountMessages:
         remediation="Ensure this address reaches a node configured for this account, update the node if needed, and retry "
         "verification.",
     )
+    # DAH-6539: the read of the node's account files failed, timed out or closed without an exit status
+    BINDING_UNVERIFIED = MessageTemplate(
+        event="Node account ownership could not be verified at this address",
+        reason="NODE_ACCOUNT_UNVERIFIED",
+        severity="error",
+        # an availability error: hidden and not rentable until a cycle reads the files, a running rental runs on
+        category=AVAILABILITY_CATEGORY,
+        impact="Verification failed; node hidden and not rentable until the next check reads it (a running rental "
+        "is kept)",
+        remediation="The validator could not read this node's account files over SSH. Make sure the executor is up "
+        "and reachable at this address; the node is listed again after the next successful check.",
+    )
 
 
 class StaleContainerCleanupMessages:

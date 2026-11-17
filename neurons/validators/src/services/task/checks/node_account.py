@@ -14,8 +14,9 @@ So for every node the miner lists with the account's hotkeys, the check reads th
 machine itself is set up for (`/etc/liumd/miner_hotkey`, `/etc/liumd/account_claim`, written by the executor) with a
 fixed command. It refuses only on direct evidence of another account: a machine set up for a hotkey that is not one
 of the account's, or a pool node reporting another account's claim. The portal requires both at registration
-(DAH-4375), so an honest node matches. Files that cannot be read and an empty claim prove nothing either way (executors
-write the claim file from this release on): the node passes and the read is logged (NODE_ACCOUNT_BINDING_UNVERIFIED).
+(DAH-4375), so an honest node matches. Missing files and an empty claim prove nothing either way (executors write the claim
+file from this release on): the node passes and the read is logged (NODE_ACCOUNT_BINDING_UNVERIFIED). A read that
+fails, times out or closes without an exit status (a relay can stall it) is refused as NODE_ACCOUNT_UNVERIFIED.
 """
 
 from __future__ import annotations
@@ -85,8 +86,13 @@ class NodeAccountCheck:
         hotkey, claim = found.get("hotkey", "").strip(), found.get("claim", "").strip()
         what = {**what, "node_hotkey": hotkey, "expected_node_hotkeys": executor.expected_node_hotkeys}
         expected_claim = executor.expected_account_claim
-        if not result.success or not hotkey:
-            # an executor without the host files, or a read that failed or was stalled: no evidence either way
+        if not result.success:
+            # failed, timed out or closed without an exit status: a relay could stall it on purpose, so ownership is
+            # not proven and the node is hidden until a cycle reads it
+            what["read_error"] = result.error_type or f"exit {result.exit_code}"
+            return _refused(ctx, self.check_id, Msg.BINDING_UNVERIFIED, what)
+        if not hotkey:
+            # the read worked and found no host files: an older executor, no evidence either way
             logger.info(_m("NODE_ACCOUNT_BINDING_UNVERIFIED", extra=get_extra_info({**what, "unread": "hotkey"})))
             return None
         if hotkey not in executor.expected_node_hotkeys:

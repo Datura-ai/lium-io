@@ -195,10 +195,10 @@ async def test_ip_node_is_refused_on_a_machine_set_up_for_another_account(files,
 
 @pytest.mark.parametrize(
     "files, success, unread",
-    [("", False, "hotkey"), ("hotkey=\nclaim=\n", True, "hotkey"), (f"hotkey={POOL}\nclaim=\n", True, "claim")],
+    [("hotkey=\nclaim=\n", True, "hotkey"), (f"hotkey={POOL}\nclaim=\n", True, "claim")],
 )
 async def test_no_evidence_passes_and_is_logged(files, success, unread, caplog):
-    """A failed read, missing files or an empty pool claim prove nothing: the node passes, the read is logged."""
+    """Missing files or an empty pool claim (a read that worked) prove nothing: the node passes, the read is logged."""
     result = await NodeAccountCheck().run(_relay_ctx(_HostFiles(files, success=success)))
     assert result.passed
     [record] = [r for r in caplog.records if "NODE_ACCOUNT_BINDING_UNVERIFIED" in r.getMessage()]
@@ -229,3 +229,17 @@ async def test_a_rented_node_on_another_accounts_machine_finishes_its_rental(ren
     [entry] = availability_errors([result.event])
     assert (entry.reason_code, entry.reach_target) == ("NODE_ACCOUNT_MISMATCH", "node")
     assert entry.reason_code in NODE_GPU_FAULT_CODES  # never silenced as our own outage
+
+
+@pytest.mark.parametrize("rented", [True, False])
+async def test_a_failed_or_stalled_read_hides_the_node_until_a_cycle_reads_it(rented, monkeypatch):
+    """A relay can stall the read: a read that does not succeed is refused like a mismatch, under its own reason."""
+    from services.task.availability import NODE_GPU_FAULT_CODES, availability_errors
+
+    monkeypatch.setattr("services.task.checks.node_account.has_live_rental", lambda ctx: rented)
+    result = await NodeAccountCheck().run(_relay_ctx(_HostFiles("", success=False)))
+    assert not result.passed and result.fatal is (not rented)
+    assert result.event.event == "Node account ownership could not be verified at this address"
+    [entry] = availability_errors([result.event])
+    assert (entry.reason_code, entry.reach_target) == ("NODE_ACCOUNT_UNVERIFIED", "node")
+    assert entry.reason_code not in NODE_GPU_FAULT_CODES  # a reach failure: silenced with our own outage, like one

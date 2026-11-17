@@ -73,6 +73,8 @@ class AvailabilityErrorCode(StrEnum):
     GPU_MODEL_NOT_MEASURED = "GPU_MODEL_NOT_MEASURED"
     # DAH-6539: the node at this address is not the account's (NodeAccountCheck); hidden, a running rental runs on.
     NODE_ACCOUNT_MISMATCH = "NODE_ACCOUNT_MISMATCH"
+    # DAH-6539: the account read failed or stalled; a reach failure, so silenced with our own outage like one.
+    NODE_ACCOUNT_UNVERIFIED = "NODE_ACCOUNT_UNVERIFIED"
 
 
 # Faults the node itself proved: never a sign of our own outage, and never silenced with one.
