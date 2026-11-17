@@ -91,7 +91,7 @@ def test_the_all_card_probe_sizes_a_raw_base_name_by_its_modded_reading(model):
 
 def test_the_standard_cards_keep_their_numbers():
     assert GPU_MODEL_RATES[RTX_4090] == 0.05
-    assert RENTAL_PRICES_PER_HOUR[RTX_4090_48GB] == 0.48
+    assert RENTAL_PRICES_PER_HOUR[RTX_4090_48GB] == 0.42
     assert RENTAL_PRICES_PER_HOUR[RTX_4080_32GB] == RENTAL_PRICES_PER_HOUR[RTX_4080_SUPER_32GB] == 0.26
     assert MAX_UNRENTED_GPUS_BY_TYPE["RTX 4090"] == {1: 10, 8: 64}
     assert name_reported_by_driver(RTX_4090) == RTX_4090
