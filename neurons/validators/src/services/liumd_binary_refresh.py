@@ -27,7 +27,7 @@ MAX_MANIFEST_BYTES = 64 * 1024
 # The manifest is the same for every executor in a cycle; the batch id keeps one fetch per cycle.
 MANIFEST_CACHE_TTL_SECONDS = 15 * 60
 MANIFEST_FALLBACK_CACHE_SECONDS = 60
-DEFAULT_REFRESH_BUDGET_SECONDS = 60
+DEFAULT_REFRESH_BUDGET_SECONDS = 20
 MIN_DOWNLOAD_BUDGET_SECONDS = 5
 
 _MANIFEST_CACHE: dict[tuple[str, str], tuple[dict[str, Any] | None, str | None, float]] = {}
@@ -40,6 +40,7 @@ class LiumdRefresh:
     build_sha: str | None
     detail: str = ""
     changed: bool = False
+    skipped: bool = False
 
 
 @dataclass(frozen=True)
@@ -183,15 +184,19 @@ async def ensure_liumd_binary(
     """
     if not settings.LIUMD_BINARY_REFRESH_ENABLED:
         return None
-    budget = DEFAULT_REFRESH_BUDGET_SECONDS if budget_seconds is None else budget_seconds
+    budget = (
+        DEFAULT_REFRESH_BUDGET_SECONDS
+        if budget_seconds is None
+        else min(DEFAULT_REFRESH_BUDGET_SECONDS, budget_seconds)
+    )
     if budget <= 0:
-        return LiumdRefresh(False, None, "no task budget for the liumd refresh")
+        return LiumdRefresh(False, None, "no task budget for the liumd refresh", skipped=True)
     started = time.monotonic()
     try:
         async with asyncio.timeout(budget):
             return await _ensure(ctx, budget, started)
     except TimeoutError:
-        return LiumdRefresh(False, None, "liumd refresh budget spent")
+        return LiumdRefresh(False, None, "liumd refresh budget spent", skipped=True)
 
 
 async def _ensure(ctx: Any, budget: float, started: float) -> LiumdRefresh:
@@ -226,13 +231,22 @@ async def _ensure(ctx: Any, budget: float, started: float) -> LiumdRefresh:
 
         remaining = budget - (time.monotonic() - started)
         if remaining < MIN_DOWNLOAD_BUDGET_SECONDS:
-            return LiumdRefresh(False, version.build_sha, "no task budget for the liumd download")
+            return LiumdRefresh(
+                False, version.build_sha, "no task budget for the liumd download", skipped=True
+            )
         url = urljoin(settings.LIUMD_BINARY_MANIFEST_URL, filename)
         fetched_sha, error = await _download(ctx, url, max(1, int(remaining)))
         if fetched_sha is None:
-            return LiumdRefresh(False, version.build_sha, error or "download failed")
+            return LiumdRefresh(
+                False, version.build_sha, error or "download failed", skipped=bool(version.build_sha)
+            )
         if fetched_sha != expected_sha:
-            return LiumdRefresh(False, version.build_sha, "downloaded sha256 does not match manifest")
+            return LiumdRefresh(
+                False,
+                version.build_sha,
+                "downloaded sha256 does not match manifest",
+                skipped=bool(version.build_sha),
+            )
 
         install = await _run(
             ctx,
@@ -241,7 +255,10 @@ async def _ensure(ctx: Any, budget: float, started: float) -> LiumdRefresh:
         )
         if not install.success:
             return LiumdRefresh(
-                False, version.build_sha, (install.stderr or install.stdout or "install failed")[-300:]
+                False,
+                version.build_sha,
+                (install.stderr or install.stdout or "install failed")[-300:],
+                skipped=bool(version.build_sha),
             )
         installed_build = await _read_version(ctx)
         if installed_build.build_sha != expected_build:

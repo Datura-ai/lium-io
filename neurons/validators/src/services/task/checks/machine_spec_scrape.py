@@ -11,7 +11,7 @@ from typing import Any, Literal
 
 from services.file_encrypt_service import ORIGINAL_KEYS
 from services.gpu_spec_table import classify_gpu_model, list_sxm_on_pcie_adapter_as_pcie
-from services.liumd_binary_refresh import ensure_liumd_binary
+from services.liumd_binary_refresh import DEFAULT_REFRESH_BUDGET_SECONDS, ensure_liumd_binary
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -407,9 +407,19 @@ class MachineSpecScrapeCheck:
         liumd_specs = settings.VALIDATOR_LIUMD_SPECS and not settings.DRY_RUN
         if settings.VALIDATOR_LIUMD_SHADOW or liumd_specs:
             refresh = await ensure_liumd_binary(
-                ctx, budget_seconds=task_seconds_left(ctx) - SCRAPE_BUDGET_SECONDS
+                ctx,
+                budget_seconds=min(
+                    DEFAULT_REFRESH_BUDGET_SECONDS, task_seconds_left(ctx) - SCRAPE_BUDGET_SECONDS
+                ),
             )
-            if refresh is not None and not refresh.ok:
+            if refresh is not None and refresh.skipped:
+                logger.warning(
+                    _m(
+                        "liumd binary refresh skipped; using the local binary",
+                        extra=get_extra_info({**ctx.default_extra, "detail": refresh.detail[:300]}),
+                    )
+                )
+            elif refresh is not None and not refresh.ok:
                 if liumd_specs:
                     return self._fail_liumd(
                         ctx,

@@ -239,7 +239,25 @@ async def test_a_failed_binary_refresh_fails_specs_mode_before_the_scrape(monkey
     assert result.event.reason_code == Msg.SCRAPE_FAILED_ON_HOST.reason
     assert result.event.what_we_saw["liumd_reason"] == "binary_refresh_failed"
     assert runner.calls == []
-    assert seen and 0 < seen[0] <= 60
+    assert seen and 0 < seen[0] <= 20
+
+
+@pytest.mark.asyncio
+async def test_a_skipped_binary_refresh_does_not_fail_specs_mode(monkeypatch):
+    _liumd_on(monkeypatch)
+    _start_reading(monkeypatch, _answer(LIUMD_SPECS))
+
+    async def skipped_refresh(ctx, *, budget_seconds=None):
+        return LiumdRefresh(False, None, "refresh budget spent", skipped=True)
+
+    monkeypatch.setattr(machine_spec_scrape, "ensure_liumd_binary", skipped_refresh)
+    runner = DummySSHCommandRunner(result=make_command_result(success=False))
+
+    result = await MachineSpecScrapeCheck().run(_ctx(runner))
+
+    assert result.passed is True
+    assert result.event.what_we_saw["delivery"] == "liumd"
+    assert runner.calls == []
 
 
 @pytest.mark.asyncio

@@ -194,6 +194,7 @@ async def test_no_task_budget_skips_before_any_ssh(monkeypatch):
     result = await ensure_liumd_binary(_ctx(runner), budget_seconds=0)
 
     assert result.ok is False
+    assert result.skipped is True
     assert "budget" in result.detail
     assert runner.calls == []
     assert fetches == []
@@ -210,6 +211,7 @@ async def test_no_room_for_the_download_does_not_start_it(monkeypatch):
     )
 
     assert result.ok is False
+    assert result.skipped is True
     assert "no task budget" in result.detail
     assert not any(c.startswith("curl ") for c in runner.calls)
 
