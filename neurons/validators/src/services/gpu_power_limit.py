@@ -423,7 +423,7 @@ async def _set_power_limit(
     Raises only ``asyncssh.ChannelOpenError`` (the host refused the session; the caller retries)."""
     try:
         result = await ssh.run(
-            f"nvidia-smi -i {shlex.quote(uuid)} -pl {watts}", timeout=NVIDIA_SMI_TIMEOUT_SECONDS
+            f"nvidia-smi -i {shlex.quote(uuid)} -pl {int(watts)}", timeout=NVIDIA_SMI_TIMEOUT_SECONDS
         )
     except asyncssh.ChannelOpenError:
         raise
