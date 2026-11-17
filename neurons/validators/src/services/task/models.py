@@ -1,3 +1,4 @@
+import time
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -126,6 +127,9 @@ class JobResult(BaseModel):
     # Such a copy under the keeper's own executor UUID: one backend row, so it is not published
     # and the row hears only the copy that kept the score.
     duplicate_shares_kept_row: bool = Field(default=False, exclude=True)
+    # DAH-6596: when this process built the result (time.monotonic()); a miner-answer row built before an express
+    # pass of the same node under the same cycle id is older news than that pass and is not published
+    built_at: float = Field(default_factory=time.monotonic, exclude=True)
     # DAH-4658: the node's last scored result, standing in for a scrape the renter's GPU reset hid the cards
     # from; scored like the cycle it came from, never published
     carried_for_renter_gpu_reset: bool = Field(default=False, exclude=True)

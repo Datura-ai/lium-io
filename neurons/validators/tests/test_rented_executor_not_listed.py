@@ -306,3 +306,45 @@ async def test_a_miner_whose_only_rented_node_is_down_gets_a_row_for_the_node_no
 
     assert [r.executor_info.uuid for r in out["results"]] == [MISSING]
     assert out["results"][0].failure_reason_code == "RENTED_EXECUTOR_NOT_LISTED"
+
+
+# --- DAH-6596: a row older than an express pass in the same wave ----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_not_listed_row_built_before_a_same_wave_express_pass_is_not_published():
+    """16 Nov: the wave built the row at 19:09:53, the express lane passed the node at 19:13:54 and 19:14:48 under the
+    same cycle id, and the row published at 19:17:23 turned the node red again while its pod kept running."""
+    service = missed_last_cycle(make_service(), MISSING)
+    service.redis_service.publish = AsyncMock(return_value=1)
+    payload = make_payload()
+    [row] = build(service, RentedExecutorsResponse(executors={MISSING: rented(), LISTED: rented()}))
+    service.express_published[MISSING] = payload.job_batch_id
+    service.express_published_miner[MISSING] = payload.miner_hotkey
+    service.express_passed_at[MISSING] = row.built_at + 1
+
+    await service.publish_machine_specs([row], payload.miner_hotkey, payload.miner_coldkey)
+
+    service.redis_service.publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["built_after_the_pass", "pass_in_an_older_cycle", "pass_for_another_miner"])
+async def test_a_not_listed_row_newer_than_any_express_pass_still_publishes(case):
+    service = missed_last_cycle(make_service(), MISSING)
+    service.redis_service.publish = AsyncMock(return_value=1)
+    payload = make_payload()
+    [row] = build(service, RentedExecutorsResponse(executors={MISSING: rented(), LISTED: rented()}))
+    service.express_published[MISSING] = payload.job_batch_id
+    service.express_published_miner[MISSING] = payload.miner_hotkey
+    service.express_passed_at[MISSING] = row.built_at + 1
+    if case == "built_after_the_pass":
+        service.express_passed_at[MISSING] = row.built_at - 1
+    elif case == "pass_in_an_older_cycle":
+        service.express_published[MISSING] = "2026-09-16 13:06:48"
+    else:
+        service.express_published_miner[MISSING] = OTHER_MINER_HOTKEY
+
+    await service.publish_machine_specs([row], payload.miner_hotkey, payload.miner_coldkey)
+
+    assert service.redis_service.publish.await_count == 1
