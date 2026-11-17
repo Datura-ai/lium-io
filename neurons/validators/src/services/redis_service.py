@@ -349,6 +349,10 @@ class RedisWrites:
         self.ops.append(RedisWrite("hset", (key, field, value), {}))
         return self
 
+    def hdel(self, key: str, field: str) -> "RedisWrites":
+        self.ops.append(RedisWrite("hdel", (key, field), {}))
+        return self
+
     def expire(self, key: str, seconds: int) -> "RedisWrites":
         self.ops.append(RedisWrite("expire", (key, seconds), {}))
         return self
