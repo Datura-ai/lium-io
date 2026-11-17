@@ -2385,6 +2385,14 @@ class _InflightCreate:
     cancelled: asyncio.Event = field(default_factory=asyncio.Event)
 
 
+# (miner hotkey, executor id): an executor id is unique only within its miner
+ExecutorKey = tuple[str, str]
+
+
+def executor_key(payload) -> ExecutorKey:
+    return (payload.miner_hotkey, payload.executor_id)
+
+
 class _InflightCreateRegistry:
     """Creates running right now, and whether a delete has already cancelled them.
 
@@ -2393,67 +2401,76 @@ class _InflightCreateRegistry:
     the host ports minutes later. That orphan then blocks the next paying rental with "port is
     already allocated". Only the create can undo itself, so the delete flips the flag here and the
     create tears itself down at its next checkpoint.
+
+    DAH-6540: keyed by pod and executor. A rent moved to another node keeps its pod id, so a delete sent to the
+    node it left must not cancel, or wait for, the pod's create on the new node. A create's own reads name no
+    executor and take the one its `track` holds.
     """
 
     def __init__(self) -> None:
-        self._creates_by_pod_id: dict[str, _InflightCreate] = {}
-        # Pods this task's create already holds: the job runner and the miner handler both
+        self._creates: dict[tuple[str, ExecutorKey], _InflightCreate] = {}
+        # Pods this task's create already holds, with their executor: the job runner and the miner handler both
         # register one create, and that must count once so `running` counts distinct creates.
-        self._held_pod_ids: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
-            "inflight_create_held_pod_ids", default=frozenset()
+        self._held: contextvars.ContextVar[dict[str, ExecutorKey]] = contextvars.ContextVar(
+            "inflight_create_held_pods", default={}
         )
 
     @contextlib.contextmanager
-    def track(self, pod_id: str) -> Iterator[None]:
-        held = self._held_pod_ids.get()
-        if pod_id in held:
+    def track(self, pod_id: str, executor: ExecutorKey) -> Iterator[None]:
+        held = self._held.get()
+        if held.get(pod_id) == executor:
             yield
             return
-        token = self._held_pod_ids.set(held | {pod_id})
-        create = self._creates_by_pod_id.setdefault(pod_id, _InflightCreate())
+        token = self._held.set({**held, pod_id: executor})
+        key = (pod_id, executor)
+        create = self._creates.setdefault(key, _InflightCreate())
         create.running += 1
         try:
             yield
         finally:
-            self._held_pod_ids.reset(token)
+            self._held.reset(token)
             create.running -= 1
             if create.running <= 0:
-                self._creates_by_pod_id.pop(pod_id, None)
+                self._creates.pop(key, None)
                 create.done.set()
 
-    def cancel(self, pod_id: str) -> bool:
-        """Flag the in-flight create for this pod. False when no create is running."""
-        create = self._creates_by_pod_id.get(pod_id)
-        if create is None:
-            return False
-        create.cancelled_by_delete = True
-        create.cancelled.set()
-        return True
+    def _matching(self, pod_id: str, executor: ExecutorKey | None) -> list[_InflightCreate]:
+        executor = executor or self._held.get().get(pod_id)
+        if executor is not None:
+            create = self._creates.get((pod_id, executor))
+            return [create] if create is not None else []
+        return [create for (pod, _), create in self._creates.items() if pod == pod_id]
 
-    async def wait_cancelled(self, pod_id: str) -> None:
+    def cancel(self, pod_id: str, executor: ExecutorKey) -> bool:
+        """Flag the in-flight create for this pod on this executor. False when no create is running there."""
+        creates = self._matching(pod_id, executor)
+        for create in creates:
+            create.cancelled_by_delete = True
+            create.cancelled.set()
+        return bool(creates)
+
+    async def wait_cancelled(self, pod_id: str, executor: ExecutorKey | None = None) -> None:
         """Return once a delete cancels this pod's create; never while no create is tracked for it."""
-        create = self._creates_by_pod_id.get(pod_id)
-        await (create.cancelled if create is not None else asyncio.Event()).wait()
+        creates = self._matching(pod_id, executor)
+        await (creates[0].cancelled if creates else asyncio.Event()).wait()
 
-    def is_cancelled(self, pod_id: str) -> bool:
-        create = self._creates_by_pod_id.get(pod_id)
-        return create is not None and create.cancelled_by_delete
+    def is_cancelled(self, pod_id: str, executor: ExecutorKey | None = None) -> bool:
+        return any(create.cancelled_by_delete for create in self._matching(pod_id, executor))
 
-    def is_running(self, pod_id: str) -> bool:
-        return pod_id in self._creates_by_pod_id
+    def is_running(self, pod_id: str, executor: ExecutorKey | None = None) -> bool:
+        return bool(self._matching(pod_id, executor))
 
-    def is_only_create(self, pod_id: str) -> bool:
+    def is_only_create(self, pod_id: str, executor: ExecutorKey | None = None) -> bool:
         """Exactly one create for this pod is registered (the caller's): no other attempt is live."""
-        create = self._creates_by_pod_id.get(pod_id)
-        return create is not None and create.running == 1
+        return sum(create.running for create in self._matching(pod_id, executor)) == 1
 
-    async def wait_until_done(self, pod_id: str, timeout: float) -> bool:
+    async def wait_until_done(self, pod_id: str, timeout: float, executor: ExecutorKey | None = None) -> bool:
         """Wait for the create(s) on this pod to leave. False when the wait ran out."""
-        create = self._creates_by_pod_id.get(pod_id)
-        if create is None:
+        creates = self._matching(pod_id, executor)
+        if not creates:
             return True
         try:
-            await asyncio.wait_for(create.done.wait(), timeout)
+            await asyncio.wait_for(asyncio.gather(*(create.done.wait() for create in creates)), timeout)
         except asyncio.TimeoutError:
             return False
         return True
@@ -2465,39 +2482,38 @@ inflight_creates = _InflightCreateRegistry()
 
 
 class _CreateStepsAfterReplyRegistry:
-    """Create steps the backend's reply does not wait for, by pod.
+    """Create steps the backend's reply does not wait for, by pod and executor.
 
     DAH-3980: the inspector start, the create's session close and the validator key removal run
     after the reply. Held here so the tasks are not collected, and so a delete of the pod waits for
     them first: an inspector start landing after the delete's stop would leave the collector running.
-    Each step logs its own failure.
+    Each step logs its own failure. DAH-6540: a delete on a node the pod left does not wait for the new node's.
     """
 
     def __init__(self) -> None:
-        self._tasks_by_pod_id: dict[str, set[asyncio.Task]] = {}
+        self._tasks: dict[tuple[str, ExecutorKey], set[asyncio.Task]] = {}
 
-    def start(self, pod_id: str, steps: Awaitable[None]) -> None:
+    def start(self, pod_id: str, executor: ExecutorKey, steps: Awaitable[None]) -> None:
+        key = (pod_id, executor)
         task = asyncio.ensure_future(steps)
-        self._tasks_by_pod_id.setdefault(pod_id, set()).add(task)
-        task.add_done_callback(lambda done: self._forget(pod_id, done))
+        self._tasks.setdefault(key, set()).add(task)
+        task.add_done_callback(lambda done: self._forget(key, done))
 
-    def _forget(self, pod_id: str, task: asyncio.Task) -> None:
-        tasks = self._tasks_by_pod_id.get(pod_id, set())
+    def _forget(self, key: tuple[str, ExecutorKey], task: asyncio.Task) -> None:
+        tasks = self._tasks.get(key, set())
         tasks.discard(task)
         if not tasks:
-            self._tasks_by_pod_id.pop(pod_id, None)
+            self._tasks.pop(key, None)
 
-    async def wait_until_done(self, pod_id: str, timeout: float) -> bool:
-        """Wait for this pod's steps; cancel what is left after the timeout and wait for it once more
-        as long. False on a cancel."""
-        return await self._wait_or_cancel(set(self._tasks_by_pod_id.get(pod_id, ())), timeout)
+    async def wait_until_done(self, pod_id: str, executor: ExecutorKey, timeout: float) -> bool:
+        """Wait for this pod's steps on this executor; cancel what is left after the timeout and wait for it once
+        more as long. False on a cancel."""
+        return await self._wait_or_cancel(set(self._tasks.get((pod_id, executor), ())), timeout)
 
     async def wait_until_all_done(self) -> bool:
         """The same for every pod's steps, bounded as a delete's wait: the connector's shutdown, so it does
         not cut a key removal."""
-        return await self._wait_or_cancel(
-            set().union(*self._tasks_by_pod_id.values()), _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS
-        )
+        return await self._wait_or_cancel(set().union(*self._tasks.values()), _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS)
 
     @staticmethod
     async def _wait_or_cancel(tasks: set[asyncio.Task], timeout: float) -> bool:
@@ -2818,7 +2834,7 @@ POD_GPU_OPERATION_DEADLINE_SECONDS = 600
 
 
 class _PodGpuOperationLocks:
-    """One lock per pod shared by a renter's GPU operations (reset, clock lock), the pod's delete and the clock
+    """One lock per pod on one executor shared by a renter's GPU operations (reset, clock lock), the pod's delete and the clock
     reset before its (re)create.
 
     The pending-pod check and its mark are separate steps, and a delete takes no mark, so a clock lock and a
@@ -2828,14 +2844,18 @@ class _PodGpuOperationLocks:
     """
 
     def __init__(self) -> None:
-        self._locks: dict[str, asyncio.Lock] = {}
-        self._holders: dict[str, int] = {}
+        self._locks: dict[tuple[str, ExecutorKey], asyncio.Lock] = {}
+        self._holders: dict[tuple[str, ExecutorKey], int] = {}
 
     @contextlib.asynccontextmanager
-    async def hold(self, pod_id: str, wait: float):
-        """Yields whether the lock was taken. wait=0: take it only if free, with no await in between."""
-        lock = self._locks.setdefault(pod_id, asyncio.Lock())
-        self._holders[pod_id] = self._holders.get(pod_id, 0) + 1
+    async def hold(self, pod_id: str, executor: ExecutorKey, wait: float):
+        """Yields whether the lock was taken. wait=0: take it only if free, with no await in between.
+
+        DAH-6540 (review): per executor, so a delete on the node a moved pod left never waits for its GPU work on
+        the new node."""
+        key = (pod_id, executor)
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        self._holders[key] = self._holders.get(key, 0) + 1
         acquired = False
         try:
             if wait == 0:
@@ -2849,9 +2869,9 @@ class _PodGpuOperationLocks:
         finally:
             if acquired:
                 lock.release()
-            self._holders[pod_id] -= 1
-            if not self._holders[pod_id]:
-                del self._holders[pod_id], self._locks[pod_id]
+            self._holders[key] -= 1
+            if not self._holders[key]:
+                del self._holders[key], self._locks[key]
 
 
 pod_gpu_operation_locks = _PodGpuOperationLocks()
@@ -10804,7 +10824,7 @@ class DockerService:
                     # DAH-3980: an earlier edit's steps after its reply finish first: its inspector start, and
                     # its removal of the container it parked, by that one's ID (never the one this edit parks)
                     if not await create_steps_after_reply.wait_until_done(
-                        payload.pod_id, _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS
+                        payload.pod_id, executor_key(payload), _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS
                     ):
                         logger.warning(
                             _m(
@@ -12076,6 +12096,7 @@ class DockerService:
                 edit_swap.replacement_is_up = True
                 create_steps_after_reply.start(
                     payload.pod_id,
+                    executor_key(payload),
                     self._run_create_steps_after_reply(
                         connections.pop_all(),
                         ssh_client=ssh_client,
@@ -14014,7 +14035,9 @@ class DockerService:
         try); anything else here is best-effort and never blocks the rental."""
         # DAH-4663 (review): after a renter's clock lock in flight on this pod (a reboot), so its -lgc never lands
         # after this reset dropped its record. Only around this step, so a delete still cancels the create at once.
-        async with pod_gpu_operation_locks.hold(payload.pod_id, POD_GPU_OPERATION_DEADLINE_SECONDS) as held:
+        async with pod_gpu_operation_locks.hold(
+            payload.pod_id, executor_key(payload), POD_GPU_OPERATION_DEADLINE_SECONDS
+        ) as held:
             if not held:
                 logger.warning(_m("A GPU operation on the pod outlasted its wait", extra=get_extra_info(default_extra)))
             # DAH-4663 (review): a create its delete cancelled during a long pull or build runs no -rgc on GPUs the
@@ -14050,7 +14073,9 @@ class DockerService:
             return refused
         # DAH-4663 (review): after a renter's GPU operation on the pod, so the clock reset below runs after any -lgc.
         # Taken only once the cancelled create is done: its own clock reset waits on this lock.
-        async with pod_gpu_operation_locks.hold(payload.pod_id, POD_GPU_OPERATION_DELETE_WAIT_SECONDS) as held:
+        async with pod_gpu_operation_locks.hold(
+            payload.pod_id, executor_key(payload), POD_GPU_OPERATION_DELETE_WAIT_SECONDS
+        ) as held:
             if not held:
                 logger.warning(
                     _m(
@@ -14084,20 +14109,20 @@ class DockerService:
         # DAH-2728: a create still in flight would otherwise finish behind our back and leave an
         # orphan container holding the ports. Past the validation above, so a delete this validator
         # refuses cannot kill a healthy create.
-        if inflight_creates.cancel(payload.pod_id):
+        if inflight_creates.cancel(payload.pod_id, executor_key(payload)):
             log.info("Cancelled the in-flight create for this pod")
             # Let the create finish tearing itself down before this teardown runs, so the last
             # actor on the host is never a create that ran after we answered "deleted". On timeout
             # we tear the container down ourselves, which is what this delete did before DAH-2728.
             create_aborted = await inflight_creates.wait_until_done(
-                payload.pod_id, CANCELLED_CREATE_ABORT_TIMEOUT_SECONDS
+                payload.pod_id, CANCELLED_CREATE_ABORT_TIMEOUT_SECONDS, executor_key(payload)
             )
             if not create_aborted:
                 log.warning("The cancelled create is still running; deleting without it")
         # DAH-3980: the create's steps after its reply (inspector start, session close) end before
         # this teardown, so its inspector stop is the last word on the host.
         if not await create_steps_after_reply.wait_until_done(
-            payload.pod_id, _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS
+            payload.pod_id, executor_key(payload), _INSPECTOR_LIFECYCLE_TIMEOUT_SECONDS
         ):
             log.warning("Cancelled the create's steps after its reply; deleting without them")
 
@@ -14246,7 +14271,8 @@ class DockerService:
                 # DAH-4663: give the GPUs a renter locked back their clocks (one Redis read when none)
                 with _best_effort_delete_step(log, "reset_gpu_clock_locks"):
                     await reset_pod_clock_locks(
-                        SSHCommandRunner(ssh_client, max_retries=0), self.redis_service, payload.pod_id
+                        SSHCommandRunner(ssh_client, max_retries=0), self.redis_service, payload.pod_id,
+                        payload.miner_hotkey, payload.executor_id,
                     )
 
                 with _best_effort_delete_step(log, "prune_images"):
@@ -14492,7 +14518,9 @@ class DockerService:
         Never raises: any error is logged and the reboot goes on as before (None)."""
         try:
             # as _reset_leftover_clock_locks_before_create: a renter's Reset GPU or clock lock never overlaps it
-            async with pod_gpu_operation_locks.hold(payload.pod_id, POD_GPU_OPERATION_DEADLINE_SECONDS) as held:
+            async with pod_gpu_operation_locks.hold(
+                payload.pod_id, executor_key(payload), POD_GPU_OPERATION_DEADLINE_SECONDS
+            ) as held:
                 if not held:
                     # best-effort: skipping it is safe, running it beside the other GPU operation is not
                     logger.warning(
@@ -14563,7 +14591,7 @@ class DockerService:
         }
         logger.info(_m(label, extra=get_extra_info({**default_extra, "payload": str(payload)})))
         # DAH-4663 (review): never alongside the pod's delete or another GPU operation
-        async with pod_gpu_operation_locks.hold(payload.pod_id, 0) as held:
+        async with pod_gpu_operation_locks.hold(payload.pod_id, executor_key(payload), 0) as held:
             if not held:
                 logger.info(_m(f"{label}: another operation on the pod is running", extra=get_extra_info(default_extra)))
                 return dataclasses.replace(
@@ -14768,6 +14796,7 @@ class DockerService:
                 self.redis_service,
                 container_name=payload.container_name,
                 pod_id=payload.pod_id,
+                miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 pod_gpu_uuids=payload.gpu_uuids,
                 gpu_indices=payload.gpu_indices,

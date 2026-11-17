@@ -2565,7 +2565,7 @@ async def test_create_customer_rental_starts_inspector_collector(docker_service,
     # the reply does not wait for the collector or the session close: both come after the return
     lifecycle_spy.assert_not_awaited()
     assert ssh_session.closed is False
-    await _drain_create_steps_after_reply(pod_id)
+    await _drain_create_steps_after_reply(payload)
     lifecycle_spy.assert_awaited_once()
     assert ssh_session.closed is True
     assert lifecycle_spy.await_args.kwargs["action"] == "start"
@@ -2588,8 +2588,10 @@ class RecordingSSHConnectionManager(DummySSHConnectionManager):
         self.closed = True
 
 
-async def _drain_create_steps_after_reply(pod_id: str) -> None:
-    assert await docker_service_module.create_steps_after_reply.wait_until_done(pod_id, 5)
+async def _drain_create_steps_after_reply(payload) -> None:
+    assert await docker_service_module.create_steps_after_reply.wait_until_done(
+        payload.pod_id, docker_service_module.executor_key(payload), 5
+    )
 
 
 @pytest.mark.asyncio
@@ -2609,10 +2611,11 @@ async def test_delete_waits_for_the_create_steps_after_reply_before_its_teardown
         return DummySSHConnectionManager(AsyncMock(run=AsyncMock(return_value=_make_ssh_command_result())))
 
     monkeypatch.setattr("services.docker_service.asyncssh.connect", Mock(side_effect=connect_for_delete))
-    docker_service_module.create_steps_after_reply.start(pod_id, inspector_start_after_reply())
+    executor_id = str(uuid4())
+    docker_service_module.create_steps_after_reply.start(pod_id, ("miner", executor_id), inspector_start_after_reply())
     payload = ContainerDeleteRequest(
         miner_hotkey="miner",
-        executor_id=str(uuid4()),
+        executor_id=executor_id,
         pod_id=pod_id,
         workload_kind=WorkloadKind.CUSTOMER_RENTAL,
         container_name=f"pod_{pod_id}",
@@ -2639,13 +2642,13 @@ async def test_create_steps_after_reply_past_the_timeout_are_cancelled_and_close
         finally:
             closed.set()
 
-    docker_service_module.create_steps_after_reply.start(pod_id, hung_inspector_start())
+    docker_service_module.create_steps_after_reply.start(pod_id, ("miner", "exec"), hung_inspector_start())
 
-    finished = await docker_service_module.create_steps_after_reply.wait_until_done(pod_id, 0.01)
+    finished = await docker_service_module.create_steps_after_reply.wait_until_done(pod_id, ("miner", "exec"), 0.01)
 
     assert finished is False
     assert closed.is_set()
-    assert await docker_service_module.create_steps_after_reply.wait_until_done(pod_id, 0.01) is True
+    assert await docker_service_module.create_steps_after_reply.wait_until_done(pod_id, ("miner", "exec"), 0.01) is True
 
 
 def _cvm_socket_payload(workload_kind: WorkloadKind = WorkloadKind.CUSTOMER_RENTAL) -> ContainerCreateRequest:
@@ -2802,7 +2805,7 @@ async def test_create_filler_starts_inspector_collector(docker_service, monkeypa
         private_key="encrypted",
     )
 
-    await _drain_create_steps_after_reply(payload.pod_id)
+    await _drain_create_steps_after_reply(payload)
     lifecycle_spy.assert_awaited_once()
     assert lifecycle_spy.await_args.kwargs["action"] == "start"
     inspector_step = next(
@@ -5133,7 +5136,7 @@ async def _another_create_live(pod_id: str, live: bool):
     registered, release = asyncio.Event(), asyncio.Event()
 
     async def other_create():
-        with docker_service_module.inflight_creates.track(pod_id):
+        with docker_service_module.inflight_creates.track(pod_id, ("miner", "exec")):
             registered.set()
             await release.wait()
 
@@ -5191,7 +5194,7 @@ async def test_rental_create_removes_only_its_own_leftover_container_on_a_name_c
     registry = docker_service_module.inflight_creates
     async with _another_create_live("test", live_creates == 2):
         # production registers one create twice: the job runner, then the miner handler
-        with registry.track("test"), registry.track("test"):
+        with registry.track("test", ("miner", "exec")), registry.track("test", ("miner", "exec")):
             run = docker_service._run_rental_docker_create_with_port_retry(
                 docker_client=FakeRentalClient(),
                 ssh_client=Mock(),
@@ -5232,7 +5235,7 @@ async def test_rental_create_keeps_a_same_name_pod_that_changed_after_its_status
                     registered, release = asyncio.Event(), asyncio.Event()
 
                     async def other_create():
-                        with registry.track("test"):
+                        with registry.track("test", ("miner", "exec")):
                             registered.set()
                             await release.wait()
 
@@ -5252,7 +5255,7 @@ async def test_rental_create_keeps_a_same_name_pod_that_changed_after_its_status
                     raise Exception("409 Conflict: cannot remove a running container")
 
         monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
-        with registry.track("test"):
+        with registry.track("test", ("miner", "exec")):
             with pytest.raises(docker_service_module._SameNameContainerKept):
                 await docker_service._run_rental_docker_create_with_port_retry(
                     docker_client=FakeRentalClient(),
@@ -5281,7 +5284,7 @@ async def test_failed_create_without_container_id_removes_by_name_only_when_no_o
     monkeypatch.setattr(docker_service_module, "retry_ssh_command", ssh_commands)
     registry = docker_service_module.inflight_creates
     async with _another_create_live("test", live_creates == 2):
-        with registry.track("test"), registry.track("test"):
+        with registry.track("test", ("miner", "exec")), registry.track("test", ("miner", "exec")):
             await docker_service.cleanup_failed_container_creation(
                 ssh_client=Mock(), default_extra={}, container_name="pod_test", pod_id="test",
             )
@@ -5339,7 +5342,7 @@ async def test_redelivered_create_leaves_a_running_same_name_pod_untouched(
         root_dir="/root/app",
         ssh_host_key=FAKE_SSH_HOST_KEY,
     )
-    with docker_service_module.inflight_creates.track(pod_id):
+    with docker_service_module.inflight_creates.track(pod_id, docker_service_module.executor_key(payload)):
         result = await docker_service.create_container(
             payload=payload, executor_info=executor_info, keypair=Mock(ss58_address="v"), private_key="encrypted",
         )
@@ -5361,7 +5364,7 @@ async def test_failed_create_removes_the_pods_volume_only_when_no_other_create_i
     monkeypatch.setattr(docker_service_module, "retry_ssh_command", ssh_commands)
     registry = docker_service_module.inflight_creates
     async with _another_create_live("test", live_creates == 2):
-        with registry.track("test"):
+        with registry.track("test", ("miner", "exec")):
             await docker_service.cleanup_failed_container_creation(
                 ssh_client=Mock(), default_extra={}, container_name="pod_test", volume_name="volume_test",
                 remove_volume=True, container_id="cid", pod_id="test",
