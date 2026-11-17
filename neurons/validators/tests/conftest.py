@@ -141,7 +141,7 @@ def pod_ssh_answers_on_create_path(request):
 def no_prune_fence_on_create_path():
     """A customer create first proves no image prune runs on its fresh executor; the create tests' fake hosts have
     no dockerd. test_no_filler_during_customer_create.py covers the fence itself."""
-    with patch("services.docker_service.confirm_no_prune_runs", AsyncMock(return_value=None)) as confirm:
+    with patch("services.docker_service.run_confirming_prune", AsyncMock(return_value=None)) as confirm:
         yield confirm
 
 

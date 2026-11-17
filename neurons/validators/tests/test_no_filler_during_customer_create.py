@@ -16,7 +16,7 @@ from payload_models.payloads import (
 from docker.errors import APIError
 
 from services import docker_service
-from services.docker_service import confirm_no_prune_runs, customer_creates
+from services.docker_service import run_confirming_prune, customer_creates
 from services.rental_docker_sdk import RentalDockerOperationError
 from test_deploy_optimizations import _payload
 
@@ -95,21 +95,15 @@ def test_filler_is_refused_by_a_customer_create_ending_after_its_start_not_by_ol
 @pytest.mark.asyncio
 async def test_customer_create_registered_during_an_in_flight_prune_waits_for_it() -> None:
     customer = _payload()
-    pruning = contextlib.ExitStack()
-    may_prune = pruning.enter_context(
-        customer_creates.prune_unless_customer_create(customer.miner_hotkey, customer.executor_id)
-    )
+    may_prune = customer_creates.begin_prune(customer.miner_hotkey, customer.executor_id)
 
     with customer_creates.track(customer):
         waiting = asyncio.ensure_future(customer_creates.wait_for_prunes(customer, poll_s=0.01))
         await asyncio.sleep(0.05)
         waited_while_pruning = not waiting.done()
-        pruning.close()
+        customer_creates.end_prune(customer.miner_hotkey, customer.executor_id)
         await asyncio.wait_for(waiting, 1)
-        with customer_creates.prune_unless_customer_create(
-            customer.miner_hotkey, customer.executor_id
-        ) as prune_beside_customer:
-            pass
+        prune_beside_customer = customer_creates.begin_prune(customer.miner_hotkey, customer.executor_id)
 
     assert may_prune
     assert waited_while_pruning
@@ -119,9 +113,12 @@ async def test_customer_create_registered_during_an_in_flight_prune_waits_for_it
 @pytest.mark.asyncio
 async def test_customer_create_reports_a_prune_still_running_at_the_deadline() -> None:
     customer = _payload()
-    with customer_creates.prune_unless_customer_create(customer.miner_hotkey, customer.executor_id):
+    customer_creates.begin_prune(customer.miner_hotkey, customer.executor_id)
+    try:
         with customer_creates.track(customer):
             cleared = await customer_creates.wait_for_prunes(customer, timeout_s=0.03, poll_s=0.01)
+    finally:
+        customer_creates.end_prune(customer.miner_hotkey, customer.executor_id)
 
     assert cleared is False
 
@@ -256,13 +253,13 @@ async def test_a_replaced_connector_proves_no_prune_runs_before_a_customer_pull(
 
     still_pruning = _Prunes(_prune_failure(_PRUNE_RUNNING), _prune_failure(_PRUNE_RUNNING))
     with pytest.raises(docker_service._PruneMayStillRun):
-        await confirm_no_prune_runs(still_pruning, {}, customer.miner_hotkey, customer.executor_id)
+        await run_confirming_prune(still_pruning, {}, customer.miner_hotkey, customer.executor_id)
     assert still_pruning.calls == 2
 
     # once dockerd takes a prune and completes it, none is left: the create goes on, and the next one prunes nothing
     done = _Prunes(None)
-    await confirm_no_prune_runs(done, {}, customer.miner_hotkey, customer.executor_id)
-    await confirm_no_prune_runs(done, {}, customer.miner_hotkey, customer.executor_id)
+    await run_confirming_prune(done, {}, customer.miner_hotkey, customer.executor_id)
+    await run_confirming_prune(done, {}, customer.miner_hotkey, customer.executor_id)
     assert done.calls == 1
     assert not registry.is_fenced(customer.miner_hotkey, customer.executor_id)
 
@@ -279,7 +276,7 @@ async def test_a_waiting_customer_create_lifts_the_fence_with_its_own_prune(monk
     with registry.track(customer):
         assert not registry.begin_prune(customer.miner_hotkey, customer.executor_id)
         assert await registry.wait_for_prunes(customer, timeout_s=0.03, poll_s=0.01)
-        await confirm_no_prune_runs(_Prunes(None), {}, customer.miner_hotkey, customer.executor_id)
+        await run_confirming_prune(_Prunes(None), {}, customer.miner_hotkey, customer.executor_id)
 
     assert not registry.is_fenced(customer.miner_hotkey, customer.executor_id)
 
@@ -301,7 +298,7 @@ async def test_an_old_connectors_prune_retry_does_not_run_beside_a_successors_pu
 
     successor_create = locks.executor_create_lock(customer.executor_id)
     assert await successor_create.acquire(blocking=False)
-    await confirm_no_prune_runs(_Prunes(None), {}, customer.miner_hotkey, customer.executor_id)
+    await run_confirming_prune(_Prunes(None), {}, customer.miner_hotkey, customer.executor_id)
     await old_delete  # its retry comes while the successor's pull holds the lock
 
     assert old.calls == 1  # the retry pruned nothing
@@ -324,7 +321,7 @@ async def test_an_old_connectors_prune_retry_does_not_run_beside_a_lockless_succ
     await asyncio.sleep(0.01)  # the old prune's reply is lost; it waits to retry
 
     locks.creating = True
-    await confirm_no_prune_runs(_Prunes(None), {}, customer.miner_hotkey, customer.executor_id)
+    await run_confirming_prune(_Prunes(None), {}, customer.miner_hotkey, customer.executor_id)
     await old_delete
 
     assert old.calls == 1  # the retry pruned nothing

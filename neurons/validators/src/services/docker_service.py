@@ -2529,7 +2529,7 @@ class _CustomerCreateRegistry:
         self._unconfirmed_prunes: dict[tuple[str, str], int] = {}
         # executors where a prune completed in THIS process with no fence after it. Any other executor is fenced too:
         # a replaced connector's prune may still run there (lio#2226 review), so a customer create proves none runs
-        # (confirm_no_prune_runs) before it pulls. ponytail: one entry per executor, bounded by the fleet.
+        # (run_confirming_prune) before it pulls. ponytail: one entry per executor, bounded by the fleet.
         self._confirmed: set[tuple[str, str]] = set()
         # one confirming prune per executor at a time: a second customer create must not prune beside the first's pull
         self._confirm_locks: defaultdict[tuple[str, str], asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -2573,20 +2573,6 @@ class _CustomerCreateRegistry:
         with self._lock:
             return (miner_hotkey, executor_id) in self._running_by_executor
 
-    @contextlib.contextmanager
-    def prune_unless_customer_create(self, miner_hotkey: str, executor_id: str) -> Iterator[bool]:
-        """Yield True and count a prune on the executor unless a customer create runs there (False).
-
-        Checked and counted under the lock track() takes, so either the prune sees the create and skips,
-        or the create sees the prune and waits it out (wait_for_prunes) before it touches images.
-        """
-        allowed = self.begin_prune(miner_hotkey, executor_id)
-        try:
-            yield allowed
-        finally:
-            if allowed:
-                self.end_prune(miner_hotkey, executor_id)
-
     def begin_prune(self, miner_hotkey: str, executor_id: str) -> bool:
         """Count a prune on the executor unless a customer create runs there; the caller owes one end_prune."""
         executor = (miner_hotkey, executor_id)
@@ -2604,12 +2590,12 @@ class _CustomerCreateRegistry:
                 del self._prunes_by_executor[executor]
 
     def prune_attempt_started(self) -> int:
-        """A token for one prune call; pass it back to prune_may_still_run when its answer comes."""
+        """A token for one prune call; pass it back to record_prune_outcome when its answer comes."""
         with self._lock:
             self._prune_seq += 1
             return self._prune_seq
 
-    def prune_may_still_run(
+    def record_prune_outcome(
         self, miner_hotkey: str, executor_id: str, *, still_running: bool, started: int
     ) -> None:
         """Fence the executor while a prune may still run on its host, or lift the fence once a prune that
@@ -2635,7 +2621,7 @@ class _CustomerCreateRegistry:
         """A customer create waits until no image prune this connector started runs on its executor.
 
         False when a prune is still registered after `timeout_s`: the create must fail, not pull beside it. A fence
-        (a prune of unknown outcome) is not waited out here: the create lifts it itself (confirm_no_prune_runs).
+        (a prune of unknown outcome) is not waited out here: the create lifts it itself (run_confirming_prune).
         """
         if payload.workload_kind != WorkloadKind.CUSTOMER_RENTAL:
             return True
@@ -2740,17 +2726,17 @@ async def _prune_images_then_release(
             except Exception as exc:
                 if not _prune_may_still_run(exc):
                     # dockerd answered: it was running no prune when it took this one
-                    customer_creates.prune_may_still_run(
+                    customer_creates.record_prune_outcome(
                         miner_hotkey, executor_id, still_running=False, started=started
                     )
                     raise
-                customer_creates.prune_may_still_run(
+                customer_creates.record_prune_outcome(
                     miner_hotkey, executor_id, still_running=True, started=started
                 )
                 if attempt == PRUNE_CONFIRM_ATTEMPTS:
                     raise
                 continue
-            customer_creates.prune_may_still_run(
+            customer_creates.record_prune_outcome(
                 miner_hotkey, executor_id, still_running=False, started=started
             )
             return
@@ -2762,7 +2748,7 @@ class _PruneMayStillRun(Exception):
     """A customer create could not prove that no image prune still runs on its executor, so it does not pull."""
 
 
-async def confirm_no_prune_runs(docker_client, log_extra: dict, miner_hotkey: str, executor_id: str) -> None:
+async def run_confirming_prune(docker_client, log_extra: dict, miner_hotkey: str, executor_id: str) -> None:
     """Before a customer create pulls on a fenced executor, run the confirming prune itself (nothing pulled yet).
 
     dockerd runs one prune at a time, so one that completes proves none is left. Raises _PruneMayStillRun when
@@ -2780,12 +2766,12 @@ async def confirm_no_prune_runs(docker_client, log_extra: dict, miner_hotkey: st
                 )
             except Exception as exc:
                 if _prune_may_still_run(exc):
-                    customer_creates.prune_may_still_run(
+                    customer_creates.record_prune_outcome(
                         miner_hotkey, executor_id, still_running=True, started=started
                     )
                     continue
                 # dockerd answered with another error: it was running no prune when it took this one
-            customer_creates.prune_may_still_run(miner_hotkey, executor_id, still_running=False, started=started)
+            customer_creates.record_prune_outcome(miner_hotkey, executor_id, still_running=False, started=started)
         if customer_creates.is_fenced(miner_hotkey, executor_id):
             raise _PruneMayStillRun(f"an image cleanup may still run on executor {executor_id}; create not started")
 
@@ -10465,7 +10451,7 @@ class DockerService:
                 if payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL and not synthetic_probe:
                     # the validator-process probe sees no connector prunes, so it never prunes (lio#2226 review)
                     current_step = "prune_fence"
-                    await confirm_no_prune_runs(
+                    await run_confirming_prune(
                         docker_client, default_extra, payload.miner_hotkey, payload.executor_id
                     )
 
