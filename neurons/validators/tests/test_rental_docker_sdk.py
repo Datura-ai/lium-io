@@ -1825,7 +1825,7 @@ def test_rental_ssh_adapter_failed_reconnect_reads_as_a_transport_not_reopened(m
     key_path = tmp_path / "id_executor"
     known_hosts_path = tmp_path / "known_hosts"
     key_path.write_text("PRIVATE KEY")
-    known_hosts_path.write_text("[127.0.0.1]:2222 ssh-ed25519 AAAATESTKEY\n")
+    known_hosts_path.write_text("[192.0.2.10]:2222 ssh-ed25519 AAAATESTKEY\n")
 
     class FakeSSHClient:
         def load_host_keys(self, path):
@@ -1843,9 +1843,9 @@ def test_rental_ssh_adapter_failed_reconnect_reads_as_a_transport_not_reopened(m
     monkeypatch.setattr(paramiko, "SSHClient", FakeSSHClient)
     adapter_class = _build_rental_ssh_http_adapter_class(key_path=key_path, known_hosts_path=known_hosts_path)
     adapter = adapter_class.__new__(adapter_class)
-    adapter._create_paramiko_client("ssh://root@127.0.0.1:2222")
+    adapter._create_paramiko_client("ssh://root@192.0.2.10:2222")
     adapter.pools = RecentlyUsedContainer(1)
-    adapter.ssh_host = "127.0.0.1"
+    adapter.ssh_host = "192.0.2.10"
     adapter._connect_deferred = False
 
     with pytest.raises(rental_docker_sdk.RentalDockerReconnectFailed) as raised:
