@@ -1517,6 +1517,8 @@ async def _raise_unless_running_before_created(
                     state=None,
                 ) from inspect_exc
             if attempt == FINAL_STATE_INSPECT_ATTEMPTS:
+                if is_transport_not_reopened(inspect_exc):
+                    raise  # the node stopped answering: that is the diagnosis, not an unread State
                 raise RuntimeError(
                     f"could not read the container State before caching the pod "
                     f"({FINAL_STATE_INSPECT_ATTEMPTS} attempts): {inspect_exc}"

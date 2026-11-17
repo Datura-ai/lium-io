@@ -10996,3 +10996,23 @@ async def test_generate_portMappings_keeps_held_ports_when_no_other_port_is_free
     )
 
     assert {mapping[2] for mapping in result} == {20000}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("inspect_error", "expected"),
+    [
+        (RentalDockerTransportNotReopened("transport could not be re-opened"), RentalDockerTransportNotReopened),
+        (Exception("read timed out"), RuntimeError),
+    ],
+)
+async def test_final_state_inspect_keeps_a_refused_ssh_reopen_as_the_diagnosis(monkeypatch, inspect_error, expected):
+    from services import docker_service as module
+
+    monkeypatch.setattr(module, "FINAL_STATE_INSPECT_RETRY_DELAY_S", 0)
+    client = Mock(inspect_container_state=AsyncMock(side_effect=inspect_error))
+
+    with pytest.raises(expected) as raised:
+        await module._raise_unless_running_before_created(client, container_name="pod_x", container_id="abc")
+
+    assert module.is_transport_not_reopened(raised.value) is (expected is RentalDockerTransportNotReopened)
