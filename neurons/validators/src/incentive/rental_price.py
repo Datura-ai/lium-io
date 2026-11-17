@@ -28,7 +28,6 @@ if TYPE_CHECKING:
 from incentive.utils import get_hourly_rate
 from incentive.default import DefaultIncentive, get_min_driver_multiplier
 from incentive.price_provider import PriceProvider
-from services.gpu_spec_table import RTX_4090_48GB
 from services.const import (
     DEFAULT_JOB_OWNER_MINER,
     FIXED_RATIO,
@@ -70,7 +69,8 @@ NVIDIACTL_ROOT_UID = 0
 # The share of a GPU configuration's average filler revenue per GPU-hour that a node is paid:
 # spot-node pay and the secure floor.
 # Two constants on purpose: the owner sets each on its own, so changing one must not move the other.
-FILLER_REVENUE_PAY_FACTOR = 1.0
+# Spot is paid 0.9x what Default Jobs earn (DAH-6328), per node and for a GPU model's spot nodes together.
+FILLER_REVENUE_PAY_FACTOR = 0.9
 SECURE_FILLER_REVENUE_FLOOR_FACTOR = 1.0
 # The share of an idle secure node's rate that an idle spot node of the same configuration earns at most
 # (Fish, 6 Nov 2026, DAH-5930): spot idle pay stays below secure idle pay, to keep secure supply worth offering.
@@ -454,8 +454,7 @@ class RentalPriceIncentive(DefaultIncentive):
         # unreachable by construction; a verified TDX quote is that machine's capability path.
         # The quote alone, not JobResult.tdx_attestation_passed: that flag also drops on a failed
         # GPU-CC verdict, which is observe-only today, so a CVM submitting failing GPU evidence
-        # would earn less than one submitting none. Bad GPU evidence is the GPU-attestation
-        # enforcement flag's job; once it is on, evidence is mandatory and no digest reaches here.
+        # would earn less than one submitting none. GPU attestation is observe-only (DAH-4904).
         attested_cvm: bool = result.attestation_digest is not None
         if (
             ncu_profiling_access == NCU_PROFILING_UNRESTRICTED
@@ -1332,9 +1331,9 @@ class RentalPriceIncentive(DefaultIncentive):
             result.effective_rate *= result.spot_cap_multiplier
 
     def _spot_pay_within_filler_earnings(self) -> float:
-        """DAH-5128 (Fish): a GPU model's idle spot nodes share what the model's fillers earn per hour;
-        they are not each paid an expected rate. When their spot rates add up to more, every one is
-        scaled by the same multiplier, so a new spot node dilutes the others and the total stays put.
+        """DAH-5128 (Fish): a GPU model's idle spot nodes share FILLER_REVENUE_PAY_FACTOR x what the model's
+        fillers earn per hour; they are not each paid an expected rate. When their spot rates add up to more,
+        every one is scaled by the same multiplier, so a new spot node dilutes the others and the total stays put.
         Returns the USD/hour they are paid in all."""
         rate_sum_by_model: dict[str, float] = {}
         pool_by_model: dict[str, float] = {}
@@ -1349,7 +1348,9 @@ class RentalPriceIncentive(DefaultIncentive):
                         "base_model": base_model,
                         "filler_revenue_usd_per_hour": pool_by_model[base_model],
                         "spot_rate_sum_usd_per_hour": rate_sum,
-                        "spot_pool_multiplier": min(1.0, pool_by_model[base_model] / rate_sum) if rate_sum > 0 else 1.0,
+                        "spot_pool_multiplier": min(1.0, FILLER_REVENUE_PAY_FACTOR * pool_by_model[base_model] / rate_sum)
+                        if rate_sum > 0
+                        else 1.0,
                         "spot_gpu_count": sum(r.gpu_count for m, r in self._spot_pay_candidates if m == base_model),
                     },
                 )
@@ -1357,7 +1358,9 @@ class RentalPriceIncentive(DefaultIncentive):
         total: float = 0.0
         for base_model, result in self._spot_pay_candidates:
             rate_sum: float = rate_sum_by_model[base_model]
-            multiplier: float = min(1.0, pool_by_model[base_model] / rate_sum) if rate_sum > 0 else 1.0
+            multiplier: float = (
+                min(1.0, FILLER_REVENUE_PAY_FACTOR * pool_by_model[base_model] / rate_sum) if rate_sum > 0 else 1.0
+            )
             result.spot_pool_multiplier = multiplier
             result.effective_rate *= multiplier
             total += result.gpu_count * result.effective_rate
@@ -1689,11 +1692,6 @@ class RentalPriceIncentive(DefaultIncentive):
         gpu_count = params.gpu_count
         is_rented = params.is_rented
 
-        if gpu_model == RTX_4090_48GB and not settings.RTX_4090_48GB_MODEL_ENABLED:
-            # DAH-5508: off, the card is rejected, so no estimate at all (0.0 would read as an available $0)
-            return RentalPriceEstimate(
-                gpu_model=gpu_model, base_model=gpu_model, gpu_count=gpu_count, is_rented=is_rented, usd_per_epoch=None
-            )
         base_model = BASE_GPU_MAP.get(gpu_model)
         cap_spec = self.config.max_unrented_gpus.get(base_model, {}) if base_model else {}
         eligible_for_unrented_estimate = (
@@ -1923,9 +1921,6 @@ async def precompute_all_estimates(
     on-demand request to the validator.
     """
     gpu_models = list(BASE_GPU_MAP.keys())
-    if not settings.RTX_4090_48GB_MODEL_ENABLED:
-        # DAH-5508: the validator rejects this card while off, so publish no estimate for it.
-        gpu_models.remove(RTX_4090_48GB)
     estimates: dict[str, dict] = {}
     for gpu_model in gpu_models:
         estimates[gpu_model] = {

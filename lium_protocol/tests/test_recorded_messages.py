@@ -65,7 +65,7 @@ def test_command_id_is_optional_and_ignored_by_old_message_model(entry: dict) ->
         assert "command_id" not in type(model).model_fields
 
 
-@pytest.mark.parametrize("message_type", ["SshPubKeyAdded", "FailedRequest"])
+@pytest.mark.parametrize("message_type", ["SshPubKeyAdded", "SshPubKeyRemoved", "FailedRequest"])
 def test_ssh_key_answer_command_id_is_optional(message_type: str) -> None:
     message = {"message_type": message_type, "miner_hotkey": "m", "executor_id": "e", "pod_id": "p", "msg": "x"}
 

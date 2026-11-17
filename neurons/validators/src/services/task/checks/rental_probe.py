@@ -255,6 +255,19 @@ class RentalProbeCheck:
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
+        result = await self._probe_and_judge(ctx)
+        if result.passed and ctx.state.verifyx_skipped_for_standing_probe_failure:
+            # VerifyX did not judge the node this cycle: it relists after the next cycle runs it
+            return CheckResult(
+                passed=False,
+                event=render_message(
+                    Msg.CYCLE_WITHOUT_VERIFYX, ctx=ctx, check_id=self.check_id, what=result.event.what_we_saw
+                ),
+                updates={"score": 0.0, "job_score": 0.0},
+            )
+        return result
+
+    async def _probe_and_judge(self, ctx: Context) -> CheckResult:
         gate = await self._may_probe(ctx)
         if isinstance(gate, CheckResult):
             return gate
@@ -762,6 +775,14 @@ async def _standing_failure(ctx: Context) -> _Failure | None:
     return _Failure(step, create_step or None) if step else None
 
 
+async def has_standing_failure(ctx: Context) -> bool:
+    """Does a standing probe failure fail this cycle? Not on a node a renter has (_may_probe skips it there)."""
+    rented = rental_of_this_node(ctx)
+    if rented and rented.pods:
+        return False
+    return await _standing_failure(ctx) is not None
+
+
 async def _stamp_failure(ctx: Context, failure: _Failure) -> None:
     # the failure stands until _clear_failure (see _REDIS_FAILED_PREFIX)
     try:
@@ -1203,6 +1224,7 @@ async def _step_teardown(
 
 # Passed probes' teardowns still running: the loop keeps only a weak reference to a task.
 _TEARDOWNS_AFTER_VERDICT: set[asyncio.Task] = set()
+_TEARDOWN_TASK_PREFIX = "rental-probe-teardown:"
 
 
 def _teardown_after_verdict(ctx: Context, outcome: _ProbeOutcome) -> None:
@@ -1212,9 +1234,21 @@ def _teardown_after_verdict(ctx: Context, outcome: _ProbeOutcome) -> None:
     A teardown that does not finish clears the pass stamp, so the next cycle probes the node again, as
     an inconclusive run would; the leftover goes to the by-name removal and the stale-container sweep.
     """
-    task = asyncio.ensure_future(_teardown_passed_probe(ctx, outcome))
+    task = asyncio.create_task(_teardown_passed_probe(ctx, outcome), name=f"{_TEARDOWN_TASK_PREFIX}{ctx.miner_hotkey}")
     _TEARDOWNS_AFTER_VERDICT.add(task)
     task.add_done_callback(_TEARDOWNS_AFTER_VERDICT.discard)
+
+
+async def wait_for_teardowns_after_verdict(miner_hotkey: str, max_seconds: float) -> None:
+    """Wait for the miner's background teardowns, so they end before the cycle removes the validator's SSH key.
+
+    A teardown still running when the key goes fails with Permission denied and leaves its container to the
+    stale-container sweep. The wait is capped at the teardown's deadline and at max_seconds, the time the miner's job
+    has left; a teardown past either is left running.
+    """
+    pending = [t for t in _TEARDOWNS_AFTER_VERDICT if t.get_name() == f"{_TEARDOWN_TASK_PREFIX}{miner_hotkey}"]
+    if pending and max_seconds > 0:
+        await asyncio.wait(pending, timeout=min(_teardown_deadline_seconds(), max_seconds))
 
 
 async def _teardown_passed_probe(ctx: Context, outcome: _ProbeOutcome) -> None:
@@ -1325,7 +1359,7 @@ async def _remove_over_shell(ctx: Context, *, container_name: str, volume_name: 
     try:
         removed = await asyncio.wait_for(
             ctx.ssh.run(
-                DockerCommand.remove_with_volumes(shlex.quote(container_name)), check=False
+                DockerCommand.remove_with_volumes(container_name), check=False
             ),
             timeout=_SHELL_COMMAND_TIMEOUT_SECONDS,
         )

@@ -650,6 +650,19 @@ async def test_a_standing_failure_ends_with_a_passed_probe():
 
 
 @pytest.mark.asyncio
+async def test_a_probe_that_clears_a_standing_failure_in_a_cycle_without_verifyx_does_not_pass_the_cycle():
+    """VerifyX skipped this cycle for the standing failure: the cycle must not relist the node unjudged."""
+    redis = FakeRedis(failed_step=STEP_GPU_COUNT)
+    ctx, docker, _ = make_probe_context(redis=redis)
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, verifyx_skipped_for_standing_probe_failure=True)})
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False and result.event.reason_code == Msg.CYCLE_WITHOUT_VERIFYX.reason
+    assert "clear_verified_job_info" not in result.updates
+    assert redis.standing_failure() is None and redis.stamped()
+
+
+@pytest.mark.asyncio
 async def test_a_standing_failure_holds_through_cycles_without_a_verdict_until_a_probe_passes():
     """The failure is carried by every cycle that reaches no verdict and never lapses on its own: a broken
     node relisted without a clean probe fails a renter's pod first."""
@@ -1564,7 +1577,8 @@ def test_the_probe_runs_last_before_scoring_and_never_in_dry_run():
     ]
     assert "RentalProbeCheck" not in dry and "IdleDiskWriteCheck" not in dry
     fast = [type(check).__name__ for check in pipeline_factory.PipelineFactory.build_fast_path_checks()]
-    assert fast[-5:-2] == ["RentalProbeCheck", "IdleDiskWriteCheck", "VerifyXColdRetryCheck"]
+    # the rental egress guard sits between ScoreCheck and FinalizeCheck (DAH-6442)
+    assert fast[-6:-3] == ["RentalProbeCheck", "IdleDiskWriteCheck", "VerifyXColdRetryCheck"]
 
 
 @pytest.mark.asyncio
@@ -1836,3 +1850,44 @@ async def test_another_miners_rental_neither_skips_the_probe_nor_excuses_its_fai
         result = await RentalProbeCheck().run(ctx)
     assert result.passed is False
     assert len(docker.create_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_key_removal_waits_for_this_miners_teardowns_only():
+    # DAH-5699: a teardown still running when the cycle removes the validator's key fails with Permission denied
+    done: list[str] = []
+
+    async def teardown(name: str, seconds: float):
+        await asyncio.sleep(seconds)
+        done.append(name)
+
+    for hotkey, seconds in (("miner-a", 0.05), ("miner-b", 5)):
+        task = asyncio.create_task(teardown(hotkey, seconds), name=f"{module._TEARDOWN_TASK_PREFIX}{hotkey}")
+        module._TEARDOWNS_AFTER_VERDICT.add(task)
+        task.add_done_callback(module._TEARDOWNS_AFTER_VERDICT.discard)
+
+    started = asyncio.get_running_loop().time()
+    await module.wait_for_teardowns_after_verdict("miner-a", max_seconds=60)
+
+    assert done == ["miner-a"]
+    assert asyncio.get_running_loop().time() - started < 1
+    for task in list(module._TEARDOWNS_AFTER_VERDICT):
+        task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_the_teardown_wait_never_outlasts_the_job():
+    async def stuck():
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(stuck(), name=f"{module._TEARDOWN_TASK_PREFIX}miner-a")
+    module._TEARDOWNS_AFTER_VERDICT.add(task)
+    task.add_done_callback(module._TEARDOWNS_AFTER_VERDICT.discard)
+
+    started = asyncio.get_running_loop().time()
+    await module.wait_for_teardowns_after_verdict("miner-a", max_seconds=0.05)
+    await module.wait_for_teardowns_after_verdict("miner-a", max_seconds=-5)  # no time left: no wait
+
+    assert asyncio.get_running_loop().time() - started < 1
+    assert not task.done()
+    task.cancel()

@@ -21,7 +21,7 @@ import urllib3
 from core.utils import _m, get_extra_info
 from datura.requests.miner_requests import ExecutorSSHInfo
 from services.const import RENTAL_CPU_COUNT_LABEL
-from services.node_host import NodeHostError, dial_validated, resolve_node_host
+from services.node_host import NodeHostError, dial_validated, reports_registered_host_key, resolve_node_host
 
 
 # 1 h: no rental pull that succeeded in 30 days took more than 44 min (DAH-3720).
@@ -66,6 +66,13 @@ _TRANSPORT_ERROR_TYPES = (
 # paramiko's EOFError has no text; the SDK client wraps it as "<operation> failed: EOFError".
 _TRANSPORT_EOF_SUFFIX = ": EOFError"
 _T = TypeVar("_T")
+
+
+def docker_size(gb: float) -> str:
+    """A Docker size string with no fraction: Docker refuses one like `36.5g`, so a half GiB goes as whole MiB."""
+    return f"{int(gb)}g" if gb == int(gb) else f"{int(gb * 1024)}m"
+
+
 # DAH-2475: the Docker SDK is synchronous, so every call below has to run in a thread. It must not be
 # the event loop's default executor: asyncio resolves DNS there too (loop.getaddrinfo runs in it), and
 # a wave of filler creates fills that pool with minutes-long pulls. Name resolution then queues behind
@@ -278,6 +285,8 @@ def require_rental_docker_ssh_host_key(executor_info: ExecutorSSHInfo) -> str:
         raise RentalDockerConnectionError(
             "Executor is missing ssh_host_key; rental Docker operations require the executor SSH host public key"
         )
+    if not reports_registered_host_key(executor_info):
+        raise RentalDockerConnectionError("Executor ssh_host_key is not the host key registered for its hostname")
     return host_key
 
 
@@ -462,6 +471,8 @@ class RentalDockerSdkClient:
     ):
         self._api_client = api_client
         self._pull_timeout_seconds = pull_timeout_seconds
+        # DAH-6025: layer id -> [bytes downloaded, done], filled by the running pull for the renter log
+        self.pull_progress: dict[str, list] = {}
 
     async def login(self, *, username: str, password: str, image: str) -> None:
         # docker-py stores the credential under docker.io unless the registry
@@ -1289,8 +1300,10 @@ class RentalDockerSdkClient:
         )
         self._api_client._raise_for_status(response)
 
+        self.pull_progress = {}
         for event in self._api_client._stream_helper(response, decode=True) or ():
             _raise_pull_event_error(event)
+            _track_pull_progress(self.pull_progress, event)
 
     def _normalized_pull_timeout_seconds(self) -> int | float | None:
         if self._pull_timeout_seconds is None or self._pull_timeout_seconds <= 0:
@@ -1511,11 +1524,16 @@ def build_gpu_docker_config(
     )
 
 
+# The backend's add fence (lium-platform DAH-6441) expires after an hour; this bound is what makes that expiry safe.
+AUTHORIZED_KEYS_APPEND_DEADLINE_SECONDS = 60
+
+
 def build_authorized_keys_exec_spec(
     *,
     container_name: str,
     public_keys: list[str] | tuple[str, ...],
     target_path: str = "/root/.ssh/authorized_keys",
+    append_deadline_seconds: int = AUTHORIZED_KEYS_APPEND_DEADLINE_SECONDS,
 ) -> ContainerExecSpec:
     import shlex
 
@@ -1523,14 +1541,22 @@ def build_authorized_keys_exec_spec(
     # chmod up front: key injection now runs before the sshd bootstrap's own
     # `chmod 700` (DAH-2341), and sshd may come up in between.
     quoted_dir = shlex.quote(target_path.rsplit("/", 1)[0])
+    # DAH-6441: the keys are read whole first and appended only within the deadline of this exec's own start, so an
+    # add whose connection stalled can never append later, after the backend has confirmed a removal of that key.
+    # Shell builtins (printf, test) beside the cat/mkdir/chmod the add always needed: the clock is /proc/uptime, so
+    # images without date or mktemp still take keys. Read whole with cat: in a Sysbox pod it is a FUSE file that
+    # fails the shell's byte-wise `read`.
+    script = (
+        "start=$(cat /proc/uptime) || exit 1; "
+        f"mkdir -p {quoted_dir} && chmod 700 {quoted_dir} && keys=$(cat) || exit 1; "
+        "now=$(cat /proc/uptime) || exit 1; "
+        f'if [ $(( ${{now%%.*}} - ${{start%%.*}} )) -gt {append_deadline_seconds} ]; then '
+        'echo "authorized_keys append deadline passed" >&2; exit 75; fi; '
+        f'printf "%s\\n" "$keys" >> {shlex.quote(target_path)}'
+    )
     return ContainerExecSpec(
         container_name=container_name,
-        argv=(
-            "sh",
-            "-c",
-            f"mkdir -p {quoted_dir} && chmod 700 {quoted_dir} "
-            f"&& cat >> {shlex.quote(target_path)}",
-        ),
+        argv=("sh", "-c", script),
         stdin=key_data,
     )
 
@@ -1845,7 +1871,7 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
         "oom_score_adj": spec.oom_score_adj,
         "pids_limit": spec.pids_limit if spec.pids_limit else None,
         "storage_opt": (
-            {"size": f"{spec.storage_limit_gb:.10g}g"}
+            {"size": docker_size(spec.storage_limit_gb)}
             if spec.storage_limit_gb
             else None
         ),
@@ -2057,6 +2083,37 @@ def _raise_pull_event_error(event) -> None:
     from docker.errors import APIError
 
     raise APIError("Docker image pull failed", explanation=str(message))
+
+
+# "Download complete" comes before extraction; a layer is done once registered
+_LAYER_DONE_STATUSES = ("Pull complete", "Already exists")
+
+
+def _track_pull_progress(progress: dict[str, list], event) -> None:
+    if not isinstance(event, dict) or not event.get("id"):
+        return
+    status = str(event.get("status") or "")
+    if status in ("Pulling fs layer", "Waiting"):
+        progress.setdefault(event["id"], [0, False])
+    elif status == "Downloading":
+        current = (event.get("progressDetail") or {}).get("current")
+        if isinstance(current, int):
+            progress.setdefault(event["id"], [0, False])[0] = current
+    elif status == "Extracting":
+        # a cached blob can still need unpacking: Already exists -> Extracting -> Pull complete
+        progress.setdefault(event["id"], [0, False])[1] = False
+    elif status in _LAYER_DONE_STATUSES:
+        progress.setdefault(event["id"], [0, False])[1] = True
+
+
+def pull_progress_text(progress: dict[str, list] | None) -> str | None:
+    """'3 of 7 layers done, 1.2 GB downloaded', or None before Docker has listed any layer."""
+    if not progress:
+        return None
+    layers = list(progress.values())
+    done = sum(1 for _, finished in layers if finished)
+    downloaded_gb = sum(nbytes for nbytes, _ in layers) / 1e9
+    return f"{done} of {len(layers)} layers done, {downloaded_gb:.1f} GB downloaded"
 
 
 def _with_default_tag(driver: str) -> str:

@@ -25,12 +25,17 @@ _INSPECT_FORMAT = (
 )
 # The failing findings; oom_priority_raised is recorded only, a root renter can raise it themselves.
 SCORED_FINDINGS = ("cpuset_pinned", "cpu_quota_reduced")
+# A host fault the renter cannot fix; reported with its own warning, never scored.
+PROC_FUSE_FINDING = "proc_fuse_disconnected"
+
 # Owner (19 Oct): a host may keep a little CPU back, but the rental must keep at least this share of
 # its advertised cores, in both the cpuset and the CPU quota.
 MIN_RENTAL_CPU_SHARE = 0.95
 _DEFAULT_CPU_PERIOD_US = 100_000
 # Per init PID: oom_score_adj, then (cgroup v2) the effective cpuset and every cpu.max from the pod's
 # cgroup up to the root, so a host that writes the cgroup directly (not via docker update) is seen too.
+# Last field: the error of one read of the pod's own /proc/sys, which a dead sysbox-fs FUSE mount answers
+# with "Transport endpoint is not connected" while the container keeps running.
 _INIT_READ_SCRIPT = (
     "for p in {pids}; do "
     "o=$(cat /proc/$p/oom_score_adj 2>/dev/null); cs=; cm=; "
@@ -39,7 +44,8 @@ _INIT_READ_SCRIPT = (
     'd="/sys/fs/cgroup$g"; cs=$(cat "$d/cpuset.cpus.effective" 2>/dev/null); '
     'while [ "$d" != /sys/fs/cgroup ] && [ -n "$d" ]; do '
     'm=$(cat "$d/cpu.max" 2>/dev/null) && cm="$cm;$m"; d="${{d%/*}}"; done; fi; '
-    'echo "$p|$o|$cs|$cm"; done'
+    "pf=$(cat /proc/$p/root/proc/sys/kernel/hostname 2>&1 >/dev/null | head -c 200); "
+    'echo "$p|$o|$cs|$cm|$pf"; done'
 )
 
 
@@ -58,6 +64,7 @@ class InspectedPod:
     init_oom_score_adj: int | None = None
     cgroup_cpuset: str = ""
     cgroup_quota_cpus: float | None = None
+    proc_fuse_disconnected: bool = False
 
 
 @dataclass(frozen=True)
@@ -65,6 +72,7 @@ class InitReading:
     oom_score_adj: int | None
     cgroup_cpuset: str
     cgroup_quota_cpus: float | None
+    proc_fuse_disconnected: bool = False
 
 
 @dataclass(frozen=True)
@@ -142,6 +150,11 @@ class RentedPodResourcesCheck:
         if any(f in SCORED_FINDINGS for o in outcomes for f in o.findings):
             event = render_message(Msg.RESOURCES_REDUCED, ctx=ctx, check_id=self.check_id, what=what)
             return CheckResult(passed=False, event=event, updates={"rented_pod_resources_passed": False})
+        if any(PROC_FUSE_FINDING in o.findings for o in outcomes):
+            event = render_message(
+                Msg.PROC_FUSE_DISCONNECTED, ctx=ctx, check_id=self.check_id, what=what
+            )
+            return CheckResult(passed=True, event=event)
 
         event = render_message(Msg.RESOURCES_OK, ctx=ctx, check_id=self.check_id, what=what)
         return CheckResult(passed=True, event=event)
@@ -172,11 +185,14 @@ class RentedPodResourcesCheck:
         )
         reads = {}
         for line in (getattr(res, "stdout", "") or "").splitlines():
-            parts = line.strip().split("|")
-            if len(parts) != 4 or not parts[0].isdigit():
+            parts = line.strip().split("|", 4)
+            if len(parts) < 4 or not parts[0].isdigit():
                 continue
             oom = int(parts[1]) if parts[1].lstrip("-").isdigit() else None
-            reads[int(parts[0])] = InitReading(oom, parts[2].strip(), _cpu_max_cpus(parts[3]))
+            fuse_dead = len(parts) == 5 and "not connected" in parts[4]
+            reads[int(parts[0])] = InitReading(
+                oom, parts[2].strip(), _cpu_max_cpus(parts[3]), fuse_dead
+            )
         return reads
 
     def _unknown(self, ctx: Context, *, reason: str, details: dict | None = None) -> CheckResult:
@@ -216,6 +232,7 @@ def _with_init(pod: InspectedPod, read: InitReading | None) -> InspectedPod:
             "init_oom_score_adj": read.oom_score_adj,
             "cgroup_cpuset": read.cgroup_cpuset,
             "cgroup_quota_cpus": read.cgroup_quota_cpus,
+            "proc_fuse_disconnected": read.proc_fuse_disconnected,
         }
     )
 
@@ -266,6 +283,8 @@ def judge_pod(pod: InspectedPod, host_cpus: int | None) -> PodVerdict:
         and init_oom > pod.oom_score_adj_deployed
     ):
         findings.append("oom_priority_raised")
+    if pod.proc_fuse_disconnected:
+        findings.append(PROC_FUSE_FINDING)
     return PodVerdict(
         container=pod.name,
         cpuset=cpuset,

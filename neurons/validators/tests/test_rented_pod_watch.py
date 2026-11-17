@@ -383,7 +383,7 @@ async def test_the_light_list_becomes_probe_targets_and_a_4xx_falls_back(monkeyp
         calls.append("full")
         return full
 
-    monkeypatch.setattr(BackendClient, "_request", fake_request)
+    monkeypatch.setattr(BackendClient, "_signed_request", fake_request)
     monkeypatch.setattr(BackendClient, "get_rented_executors_now", fake_full)
     client = object.__new__(BackendClient)
 

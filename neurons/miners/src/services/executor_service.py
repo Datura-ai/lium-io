@@ -589,8 +589,10 @@ class ExecutorService:
             # no portal read here: the uploads can outlast the snapshot cache, and the reply must meet its deadline
             if isinstance(info, ExecutorSSHInfo):
                 info.expected_ssh_host_key = host_keys.get(str(info.uuid))
-        logger.info(
-            _m( 
+        # a cut-off upload logs nothing itself, so name its executors here or the validator's miss looks unexplained
+        cut_off_ids = [str(executor.uuid) for executor, task in zip(executors, tasks) if task in pending]
+        (logger.warning if cut_off_ids else logger.info)(
+            _m(
                 "Sent pubkey register to executors",
                 extra=get_extra_info({
                     "miner_hotkey": miner_hotkey,
@@ -599,6 +601,8 @@ class ExecutorService:
                     "executors": len(executors),
                     "accepted_executors": len(results),
                     "cut_off_at_deadline": len(pending),
+                    "cut_off_executor_ids": cut_off_ids,
+                    "budget_seconds": round(budget, 1),
                 }),
             ),
         )

@@ -25,6 +25,7 @@ from core.utils import _m, get_extra_info
 from incentive.config import BASE_GPU_MAP
 
 from .checks.verifyx import hold_verifyx_ema, verifyx_ema_hold_reason
+from .event_report_fit import fit_event_report
 from .models import JobResult
 from .pipeline import Context
 
@@ -43,9 +44,7 @@ def _canonicalize_published_gpu_names(specs: dict) -> dict:
     canonical_details = [
         {
             **detail,
-            "name": classify_gpu_model(
-                detail.get("name"), detail.get("capacity"), settings.RTX_4090_48GB_MODEL_ENABLED
-            ),
+            "name": classify_gpu_model(detail.get("name"), detail.get("capacity")),
         }
         if isinstance(detail, dict) and detail.get("name")
         else detail
@@ -418,6 +417,7 @@ class ResultHandler:
                     reason=reason,
                     evidence=evidence,
                     reanchor_uuids=(context.state.gpu_uuids or '') if context.gpu_reanchor else '',
+                    respec=(context.state.gpu_model_count or '') if context.gpu_respec else '',
                 )
             else:
                 # a full set of other cards stays anchored when a later check failed, or it re-anchors every cycle
@@ -448,10 +448,10 @@ class ResultHandler:
             return ResetVerifiedJobReason.DEFAULT
 
     async def _publish_inspector_event(self, event: dict, miner_hotkey: str) -> None:
-        payload = {
-            **event,
-            "miner_hotkey": miner_hotkey,
-        }
+        # DAH-6478: capped here, before Redis; an oversized message drops the connector's whole subscription
+        payload = fit_event_report({**event, "miner_hotkey": miner_hotkey})
+        if payload is None:
+            return
         try:
             await self.redis_service.publish(
                 INSPECTOR_EVENT_CHANNEL,
