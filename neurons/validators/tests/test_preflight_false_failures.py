@@ -9,6 +9,7 @@ import pytest
 
 from preflight.base import CheckStatus
 from preflight.checks.gpu_check import GPUCheck
+from preflight.checks.matrix_check import MatrixValidationCheck
 from preflight.checks.verifyx_check import VerifyXCheck
 from test_verifyx_capacity_probe import (
     DOWNLOAD_RATE_LIMITED_ERROR,
@@ -54,6 +55,18 @@ def test_an_nvml_failure_reports_the_driver_error_not_no_gpus():
         result = asyncio.run(GPUCheck().run({"gpu": {"max_gpu_count": 8}}))
     assert result.status == CheckStatus.FAILED
     assert result.message == "NVIDIA driver query (NVML) failed: RuntimeError: NVML_ERROR_DRIVER_NOT_LOADED"
+
+
+@pytest.mark.parametrize("check", [MatrixValidationCheck, VerifyXCheck])
+def test_the_gpu_using_checks_report_the_nvml_error_too(check):
+    def init():
+        raise RuntimeError("NVML_ERROR_DRIVER_NOT_LOADED")
+
+    with patch.dict(sys.modules, {"pynvml": SimpleNamespace(nvmlInit=init, nvmlShutdown=lambda: None)}):
+        result = asyncio.run(check().run({}))
+    assert result.status == CheckStatus.FAILED
+    assert "NVML_ERROR_DRIVER_NOT_LOADED" in result.message
+    assert "No GPUs detected" not in result.message
 
 
 def test_no_devices_still_reads_as_no_gpus():

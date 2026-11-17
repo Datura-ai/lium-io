@@ -167,7 +167,7 @@ class VerifyXCheck(PreflightCheck):
             network_timeout_seconds = verifyx_config.get('network_timeout_seconds')
 
             # 1) Detect GPU
-            gpu_info = get_gpu_info(include_memory=True)
+            gpu_info = get_gpu_info(include_memory=True, raise_errors=True)
             if not gpu_info:
                 raise NoGpuError("No GPUs detected for verifyx test")
 
