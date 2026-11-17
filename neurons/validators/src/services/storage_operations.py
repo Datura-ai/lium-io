@@ -100,21 +100,32 @@ async def _all_raw_records(redis: RedisService) -> dict[str, list[str]]:
     executor_ids = _texts(await redis.smembers(STARTED_STORAGE_HELPER_EXECUTORS_KEY))
     sets = await redis.smembers_many([_key(executor_id) for executor_id in executor_ids])
     records = {executor_id: _texts(members) for executor_id, members in zip(executor_ids, sets)}
-    for executor_id in [e for e, raw in records.items() if not raw]:
-        await redis.srem(STARTED_STORAGE_HELPER_EXECUTORS_KEY, executor_id)  # its records expired
+    expired = [e for e, raw in records.items() if not raw]
+    try:
+        for executor_id in expired:
+            await redis.srem(STARTED_STORAGE_HELPER_EXECUTORS_KEY, executor_id)
+    except Exception as exc:  # noqa: BLE001 - a failed cleanup must not lose the records already read
+        logger.warning("Storage helper records: dropping expired executors failed: %r", exc)
     return records
 
 
-# (wave id, its one read of every executor's records): the wave's checks share it
-_wave_read: tuple[str, asyncio.Future] | None = None
+@dataclass(frozen=True)
+class WaveRead:
+    """The wave's one read of every executor's records: the wave's checks share it."""
+
+    wave_id: str
+    records: asyncio.Future
+
+
+_wave_read: WaveRead | None = None
 
 
 def _wave_raw_records(redis: RedisService, wave_id: str) -> Awaitable[dict[str, list[str]]]:
     global _wave_read
-    if _wave_read is None or _wave_read[0] != wave_id:
-        _wave_read = (wave_id, asyncio.ensure_future(_all_raw_records(redis)))
+    if _wave_read is None or _wave_read.wave_id != wave_id:
+        _wave_read = WaveRead(wave_id, asyncio.ensure_future(_all_raw_records(redis)))
     # one check timing out must not cancel the read the rest of the wave awaits
-    return asyncio.shield(_wave_read[1])
+    return asyncio.shield(_wave_read.records)
 
 
 async def note_started_storage_helper(
@@ -173,10 +184,10 @@ async def settle_excused_storage_helper_keys(
         else:
             raw_records.extend(await _raw_records(redis, executor_id))
 
-    read = await _redis_call(
+    records_were_read = await _redis_call(
         f"read helpers of {executor_id}", read_raw_records, _STARTED_STORAGE_HELPERS_READ_TIMEOUT_SEC
     )
-    if not read:
+    if not records_were_read:
         return set()
     now = int(time.time())
     records = {raw: StorageHelperRecord.parse(raw) for raw in raw_records}

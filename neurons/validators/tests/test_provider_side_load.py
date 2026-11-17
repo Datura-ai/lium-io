@@ -1190,6 +1190,22 @@ async def test_a_wave_reads_every_executors_helper_records_once():
 
 
 @pytest.mark.asyncio
+async def test_a_failed_cleanup_of_expired_executors_keeps_the_waves_records():
+    sets: dict[str, set[str]] = {}
+    redis = _sets_redis(sets)
+    await note_started_storage_helper(redis, "executor-1", OPERATION)
+    sets["started_storage_helper_executors"].add("executor-gone")  # its records expired: cleanup runs
+    redis.srem.side_effect = ConnectionError("redis down")
+
+    async def running(op):
+        return True
+
+    assert await settle_excused_storage_helper_keys(redis, "executor-1", running, wave_id="wave-1") == {
+        storage_helper_key(OPERATION)
+    }
+
+
+@pytest.mark.asyncio
 async def test_a_fresh_read_sees_a_helper_started_after_the_waves_read():
     sets: dict[str, set[str]] = {}
     redis = _sets_redis(sets)
