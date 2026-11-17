@@ -365,8 +365,9 @@ class GpuPowerLimitCheck:
         verified for the Lium job running right now (DAH-2786).
 
         It records what it saw and changes no limit, so the filler keeps running either way; the
-        unrented incentive gate counts these later. The one exception, DAH-6555: a GPU whose host booted again since we capped it (the scan's boot id differs from the one on its
-        record: a reboot reset the limit and docker restarted the filler) gets the cap set again instead; only a pod
+        unrented incentive gate counts these later. The one exception, DAH-6555: a GPU whose host booted
+        again since we capped it (the scan's boot id differs from the one on its record: a reboot reset the
+        limit and docker restarted the filler) gets the cap set again instead; only a pod
         whose every raised GPU took it again is left unrecorded. A record with no boot id is judged as before.
         """
         live_watts_by_uuid: dict[str, GpuPowerMeasurement] = {
