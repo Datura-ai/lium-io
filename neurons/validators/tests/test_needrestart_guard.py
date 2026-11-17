@@ -108,6 +108,54 @@ def test_blank_lines_comments_and_trailing_comments_keep_the_guard(tmp_path):
     assert _read(_host(tmp_path, text)) == ("present", [])
 
 
+def test_a_conf_file_loaded_after_the_guard_that_touches_override_rc_makes_it_partial(tmp_path):
+    host = _host(tmp_path, _setup_script_guard())
+    (host / "etc/needrestart/conf.d/zz-local.conf").write_text(
+        "$nrconf{override_rc}->{qr(^containerd)} = 1;\n"
+    )
+
+    assert _read(host) == (
+        "partial",
+        ["sysbox", "docker", "containerd", "nvidia-fabricmanager", "nvidia-persistenced"],
+    )
+
+
+def test_a_conf_file_loaded_after_the_guard_that_leaves_override_rc_alone_keeps_it(tmp_path):
+    host = _host(tmp_path, _setup_script_guard())
+    (host / "etc/needrestart/conf.d/zz-local.conf").write_text(
+        "$nrconf{restart} = 'a';\n# override_rc untouched\n"
+    )
+
+    assert _read(host) == ("present", [])
+
+
+@pytest.mark.parametrize("value", ["1", "'1'"])
+def test_an_overlapping_restart_rule_in_the_guard_file_unguards_the_unit(tmp_path, value):
+    text = _setup_script_guard() + f"\n$nrconf{{override_rc}}->{{qr(^container)}} = {value};\n"
+
+    assert _read(_host(tmp_path, text)) == ("partial", ["containerd"])
+
+
+def test_an_overlapping_restart_rule_in_an_earlier_file_unguards_the_unit(tmp_path):
+    host = _host(tmp_path, _setup_script_guard())
+    (host / "etc/needrestart/needrestart.conf").write_text(
+        "$nrconf{override_rc} = {\n    qr(^dbus) => 0,\n    qr(^nvidia) => 1,\n    qr(^containerd) => 1,\n};\n"
+    )
+
+    # qr(^containerd) is the guard file's own key, which it overrides; qr(^nvidia) is not
+    assert _read(host) == ("partial", ["nvidia-fabricmanager", "nvidia-persistenced"])
+
+
+def test_a_stock_main_config_with_only_zero_rules_keeps_the_guard(tmp_path):
+    host = _host(tmp_path, _setup_script_guard())
+    (host / "etc/needrestart/needrestart.conf").write_text(
+        "$nrconf{override_rc} = {\n    qr(^dbus) => 0,\n    qr(^docker) => 0,\n    qr(^systemd-) => 0,\n};\n"
+        "$nrconf{restart} = 'i';\n"
+    )
+
+    assert _read(host) == ("present", [])
+
+
 def test_the_remediation_carries_every_line_the_setup_script_writes():
     for line in _setup_script_guard().splitlines():
         if line.startswith("$nrconf"):

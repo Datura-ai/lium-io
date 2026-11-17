@@ -746,7 +746,9 @@ def get_needrestart_guard(host_root="/proc/1/root"):
             text = guard_file.read()
     except FileNotFoundError:
         return "missing", list(NEEDRESTART_GUARD_SERVICES)
+    zero = ("0", "'0'", '"0"')  # anything else (1, '1', "'0'", an expression) may be true in Perl
     last_values = {}
+    other_rules = []  # (pattern, value) of every rule that is not one of the five exact keys
     for line in text.splitlines():
         if not line.strip() or line.lstrip().startswith("#"):
             continue
@@ -756,8 +758,40 @@ def get_needrestart_guard(host_root="/proc/1/root"):
         if not match:
             return "partial", list(NEEDRESTART_GUARD_SERVICES)
         last_values[match.group(1)] = match.group(2)  # Perl keeps the last assignment
-    # only exactly 0, '0' or "0" is guarded; anything else (1, '1', "'0'", an expression) may be true in Perl
-    unguarded = [s for s in NEEDRESTART_GUARD_SERVICES if last_values.get(s) not in ("0", "'0'", '"0"')]
+        if match.group(1) not in NEEDRESTART_GUARD_SERVICES:
+            other_rules.append(("^" + match.group(1), match.group(2)))
+    # needrestart reads needrestart.conf, then conf.d/*.conf in name order: a later file can undo the guard
+    # in any Perl, so one that touches override_rc at all leaves the result unknowable; earlier files can
+    # only add rules under other keys, which still count when they overlap a guarded unit
+    conf_dir = host_root + "/etc/needrestart/conf.d"
+    guard_name = os.path.basename(NEEDRESTART_GUARD_FILE)
+    names = sorted(n for n in os.listdir(conf_dir) if n.endswith(".conf") and n != guard_name)
+    for path in [host_root + "/etc/needrestart/needrestart.conf"] + [conf_dir + "/" + n for n in names]:
+        try:
+            with open(path) as conf_file:
+                lines = [ln for ln in conf_file.read().splitlines() if not ln.lstrip().startswith("#")]
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        loaded_later = path.startswith(conf_dir) and os.path.basename(path) > guard_name
+        if loaded_later and any("override_rc" in ln for ln in lines):
+            return "partial", list(NEEDRESTART_GUARD_SERVICES)
+        for ln in lines:
+            for rule in re.finditer(r"qr(?:\((.*?)\)|/(.*?)/|\{(.*?)\}|\[(.*?)\])\}?\s*(?:=>|=)\s*([^,;\s)]+)", ln):
+                pattern = next(g for g in rule.groups()[:4] if g is not None)
+                if pattern not in ["^" + s for s in NEEDRESTART_GUARD_SERVICES]:  # the guard file sets those keys
+                    other_rules.append((pattern, rule.group(5)))
+    unguarded = []
+    for service in NEEDRESTART_GUARD_SERVICES:
+        overlapping = False
+        for pattern, value in other_rules:
+            if value in zero:
+                continue
+            try:
+                overlapping = overlapping or re.search(pattern, service + ".service") is not None
+            except re.error:
+                overlapping = True  # a pattern Python cannot read may still match in Perl
+        if overlapping or last_values.get(service) not in zero:
+            unguarded.append(service)
     return ("partial" if unguarded else "present"), unguarded
 
 
