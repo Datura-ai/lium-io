@@ -388,10 +388,11 @@ class Settings(BaseSettings):
     # (GPU_KERNEL_COUNT_MISMATCH). A missing kernel list never fails.
     GPU_KERNEL_COUNT_CHECK_ENABLED: bool = Field(env="GPU_KERNEL_COUNT_CHECK_ENABLED", default=True)
     # When the container's kernel GPU list is unavailable, the check reads the host's list (PID 1's root) instead.
-    # Off: a host list shorter than the reported count is recorded on the event (would_fail) and the node passes.
-    # On: it fails like a short container list (GPU_KERNEL_COUNT_MISMATCH).
+    # On (DAH-6573): a host list shorter than the reported count fails like a short container list
+    # (GPU_KERNEL_COUNT_MISMATCH); in 24 h of shadow it fired only on hosts that overlay /proc/driver/nvidia/gpus
+    # with 8 cards while CUDA sees 1. Off: it is recorded on the event (would_fail) and the node passes.
     GPU_KERNEL_COUNT_HOST_FALLBACK_ENFORCEMENT_ENABLED: bool = Field(
-        env="GPU_KERNEL_COUNT_HOST_FALLBACK_ENFORCEMENT_ENABLED", default=False
+        env="GPU_KERNEL_COUNT_HOST_FALLBACK_ENFORCEMENT_ENABLED", default=True
     )
     # The scrape mounts a size-limited vloopback volume the way a rental does and reports the verdict in
     # its SCRAPE_OK event. Kill switch: off, the scrape skips the test (baked in by FileEncryptService).

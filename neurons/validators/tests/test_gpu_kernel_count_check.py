@@ -479,14 +479,15 @@ def host_fallback_enforced(monkeypatch):
     monkeypatch.setattr(settings, "GPU_KERNEL_COUNT_HOST_FALLBACK_ENFORCEMENT_ENABLED", True)
 
 
-def test_the_host_fallback_is_shadow_by_default():
-    assert type(settings).model_fields["GPU_KERNEL_COUNT_HOST_FALLBACK_ENFORCEMENT_ENABLED"].default is False
+def test_the_host_fallback_is_enforced_by_default():
+    assert type(settings).model_fields["GPU_KERNEL_COUNT_HOST_FALLBACK_ENFORCEMENT_ENABLED"].default is True
 
 
 @pytest.mark.asyncio
-async def test_container_list_missing_and_a_short_host_list_is_recorded_and_passes_by_default(
-    context_factory, check_enabled
+async def test_container_list_missing_and_a_short_host_list_is_recorded_and_passes_when_switched_off(
+    context_factory, check_enabled, monkeypatch
 ):
+    monkeypatch.setattr(settings, "GPU_KERNEL_COUNT_HOST_FALLBACK_ENFORCEMENT_ENABLED", False)
     ctx = _ctx(context_factory, reported=REAL[:4], kernel=None, host=_host_stdout(REAL[:1]))
 
     result = await GpuKernelCountCheck().run(ctx)
@@ -834,3 +835,22 @@ async def test_an_unattachable_card_still_fails_when_the_host_list_covers_every_
     assert result.passed is False
     assert result.event.reason_code == Msg.UNATTACHABLE.reason
     assert result.event.what_we_saw["unattachable_uuids"] == [REAL[3]]
+
+
+@pytest.mark.asyncio
+async def test_eight_overlaid_cards_on_a_one_card_host_fail_by_default(context_factory, check_enabled):
+    # As seen in prod: 8 cards reported, /proc/driver/nvidia/gpus overlaid so all 8 look attachable, the host
+    # list has 1 and CUDA sees 1. No enforcement setting is patched here: the default must fail it.
+    ctx = _behind_a_foreign_mount(
+        _ctx(context_factory, reported=REAL, kernel=None, host=_host_stdout(REAL[:1]), attachable=REAL)
+    )
+
+    result = await GpuKernelCountCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.fatal is True
+    assert result.updates == {"gpu_kernel_count_passed": False}
+    assert result.event.reason_code == Msg.COUNT_MISMATCH.reason
+    what = result.event.what_we_saw
+    assert what["kernel_verdict"] == "count_lower_host_view"
+    assert what["host_kernel_gpu_count"] == 1
