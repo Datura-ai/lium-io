@@ -566,6 +566,7 @@ LIVE_GPU_DETAIL_FIELDS = frozenset(
     }
 )
 LIVE_DOCKER_CONTAINER_FIELDS = frozenset({"cpu_percent", "net_rx_bytes", "net_tx_bytes"})
+MAX_SPEC_DIFFS = 50
 
 
 def _is_not_comparable(path: str) -> bool:
@@ -613,7 +614,7 @@ def _spec_diffs(python: Any, liumd: Any, path: str = "") -> list[dict[str, Any]]
                 diffs.extend(_spec_diffs(a, b, f"{path}[{i}]"))
     elif python != liumd:
         diffs.append({"path": path or "$", "python": repr(python)[:120], "liumd": repr(liumd)[:120]})
-    return diffs[:DETAIL_MAX_CHARS]
+    return diffs[:MAX_SPEC_DIFFS]
 
 
 def _facts(ctx: Context, answer: LocalVerifyAnswer) -> dict[str, Any]:

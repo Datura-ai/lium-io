@@ -2,104 +2,239 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
-from services import liumd_binary_refresh
 from services.liumd_binary_refresh import ensure_liumd_binary
 
-MANIFEST = {
-    "build_sha": "new-build",
-    "binaries": {
-        "x86_64": {"file": "liumd-amd64", "sha256": "a" * 64},
-        "aarch64": {"file": "liumd-arm64", "sha256": "b" * 64},
-    },
-}
-VERSION = '{"build_sha": "old-build"}'
+from services import liumd_binary_refresh
+
+PINNED = liumd_binary_refresh.PINNED_MANIFEST
+NEW_BUILD = PINNED["build_sha"]
+X86_SHA = PINNED["binaries"]["x86_64"]["sha256"]
 
 
 class Runner:
-    def __init__(self, *, arch="x86_64", local="old-build", manifest=None, download_sha="a" * 64):
+    def __init__(
+        self,
+        *,
+        arch="x86_64",
+        local="old-build",
+        target=None,
+        local_present=True,
+        outcome="ok",
+    ):
         self.arch = arch
         self.local = local
-        self.manifest = manifest if manifest is not None else MANIFEST
-        self.download_sha = download_sha
-        self.calls: list[str] = []
+        self.target = target if target is not None else f"{arch}-unknown-linux-gnu"
+        self.local_present = local_present
+        self.outcome = outcome
         self.installed = False
+        self.calls: list[str] = []
 
     async def run(self, command, timeout, retryable):
         self.calls.append(command)
-        if command == "uname -m":
-            return SimpleNamespace(success=True, stdout=self.arch + "\n", stderr="", exit_status=0)
         if command.endswith(" version"):
-            build = "new-build" if self.installed else self.local
+            build = NEW_BUILD if self.installed else (self.local if self.local_present else None)
+            if build is None:
+                return SimpleNamespace(
+                    success=False, stdout="", stderr="No such file", exit_status=127
+                )
             return SimpleNamespace(
-                success=build is not None,
-                stdout=f'{{"build_sha": "{build}"}}' if build is not None else "",
+                success=True,
+                stdout=json.dumps({"build_sha": build, "target": self.target}),
                 stderr="",
-                exit_status=0 if build is not None else 127,
+                exit_status=0,
             )
-        if "manifest.json" in command:
-            return SimpleNamespace(success=True, stdout=__import__("json").dumps(self.manifest), stderr="", exit_status=0)
-        if "liumd-amd64" in command or "liumd-arm64" in command:
-            return SimpleNamespace(success=True, stdout=f"RC:0\n{self.download_sha}  /tmp/liumd.binary.fetch\n", stderr="", exit_status=0)
-        if command.startswith("install -m 0755"):
+        if command == "uname -m":
+            return SimpleNamespace(
+                success=True, stdout=self.arch + "\n", stderr="", exit_status=0
+            )
+        if "mktemp /tmp/liumd." in command:
+            if self.outcome == "download_failed":
+                return SimpleNamespace(
+                    success=False,
+                    stdout="CURL_RC:7\n",
+                    stderr="curl: (7) Failed to connect",
+                    exit_status=10,
+                )
+            if self.outcome == "wrong_hash":
+                return SimpleNamespace(
+                    success=False,
+                    stdout=f"{X86_SHA}  /tmp/liumd.abc: FAILED\nSHA_RC:1\n",
+                    stderr="",
+                    exit_status=11,
+                )
+            if self.outcome == "install_failed":
+                return SimpleNamespace(
+                    success=False,
+                    stdout="CURL_RC:0\nSHA_RC:0\nINSTALL_RC:1\n",
+                    stderr="install: cannot create",
+                    exit_status=1,
+                )
             self.installed = True
-            return SimpleNamespace(success=True, stdout="", stderr="", exit_status=0)
+            return SimpleNamespace(
+                success=True,
+                stdout="CURL_RC:0\nSHA_RC:0\nINSTALL_RC:0\n",
+                stderr="",
+                exit_status=0,
+            )
         raise AssertionError(command)
+
+
+def _ctx(runner):
+    return SimpleNamespace(
+        runner=runner,
+        miner_hotkey="5Miner",
+        executor=SimpleNamespace(uuid="exec-1", address="10.0.0.5", ssh_port=2200),
+    )
 
 
 @pytest.fixture(autouse=True)
 def enabled(monkeypatch):
+    liumd_binary_refresh._VERIFIED_BUILDS.clear()
     monkeypatch.setattr(liumd_binary_refresh.settings, "LIUMD_BINARY_REFRESH_ENABLED", True)
-    monkeypatch.setattr(liumd_binary_refresh.settings, "LIUMD_BINARY_MANIFEST_URL", "https://example.test/manifest.json")
-    monkeypatch.setattr(liumd_binary_refresh.settings, "LIUMD_BINARY_PATH", "/usr/local/bin/liumd")
+    monkeypatch.setattr(
+        liumd_binary_refresh.settings, "LIUMD_BINARY_FETCH_BASE_URL", "https://example.test/liumd/"
+    )
+    monkeypatch.setattr(
+        liumd_binary_refresh.settings, "LIUMD_BINARY_PATH", "/usr/local/bin/liumd"
+    )
+    yield
+    liumd_binary_refresh._VERIFIED_BUILDS.clear()
 
 
 @pytest.mark.asyncio
 async def test_an_up_to_date_binary_is_not_downloaded():
-    runner = Runner(local="new-build")
+    runner = Runner(local=NEW_BUILD)
 
-    result = await ensure_liumd_binary(SimpleNamespace(runner=runner))
+    result = await ensure_liumd_binary(_ctx(runner))
 
     assert result.ok is True
     assert result.changed is False
-    assert not any("liumd-amd64" in c for c in runner.calls)
+    assert len(runner.calls) == 1
+    assert runner.calls[0].endswith(" version")
+    assert not any("mktemp" in c for c in runner.calls)
 
 
 @pytest.mark.asyncio
-async def test_a_stale_binary_is_downloaded_only_after_the_hash_matches():
+async def test_a_stale_binary_is_downloaded_and_installed_in_one_command():
     runner = Runner()
 
-    result = await ensure_liumd_binary(SimpleNamespace(runner=runner))
+    result = await ensure_liumd_binary(_ctx(runner))
 
     assert result.ok is True
     assert result.changed is True
-    assert result.build_sha == "new-build"
+    assert result.build_sha == NEW_BUILD
     assert runner.installed is True
-    assert any(c.startswith("install -m 0755") for c in runner.calls)
+    [install] = [c for c in runner.calls if "mktemp" in c]
+    assert "sha256sum -c -" in install
+    assert "install -m 0755" in install
+    assert "trap 'rm -f \"$tmp\"' EXIT" in install
+    assert "/tmp/liumd.binary.fetch" not in install
+    assert "liumd-amd64" in install
 
 
 @pytest.mark.asyncio
 async def test_a_wrong_download_hash_does_not_install():
-    runner = Runner(download_sha="c" * 64)
+    runner = Runner(outcome="wrong_hash")
 
-    result = await ensure_liumd_binary(SimpleNamespace(runner=runner))
+    result = await ensure_liumd_binary(_ctx(runner))
 
     assert result.ok is False
-    assert "does not match" in result.detail
+    assert "does not match the pinned build" in result.detail
     assert runner.installed is False
 
 
 @pytest.mark.asyncio
-async def test_an_unsupported_arch_does_not_fetch():
-    runner = Runner(arch="riscv64")
+async def test_a_failed_download_does_not_install():
+    runner = Runner(outcome="download_failed")
 
-    result = await ensure_liumd_binary(SimpleNamespace(runner=runner))
+    result = await ensure_liumd_binary(_ctx(runner))
+
+    assert result.ok is False
+    assert "download failed (curl exit 7)" in result.detail
+    assert runner.installed is False
+
+
+@pytest.mark.asyncio
+async def test_a_failed_install_does_not_report_success():
+    runner = Runner(outcome="install_failed")
+
+    result = await ensure_liumd_binary(_ctx(runner))
+
+    assert result.ok is False
+    assert "install failed (exit 1)" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_a_missing_binary_uses_the_host_arch():
+    runner = Runner(local_present=False)
+
+    result = await ensure_liumd_binary(_ctx(runner))
+
+    assert result.ok is True
+    assert result.changed is True
+    assert "uname -m" in runner.calls
+
+
+@pytest.mark.asyncio
+async def test_the_binary_target_arch_avoids_uname():
+    runner = Runner()
+
+    result = await ensure_liumd_binary(_ctx(runner))
+
+    assert result.ok is True
+    assert "uname -m" not in runner.calls
+
+
+@pytest.mark.asyncio
+async def test_an_unsupported_arch_does_not_install():
+    runner = Runner(local_present=False, arch="riscv64")
+
+    result = await ensure_liumd_binary(_ctx(runner))
 
     assert result.ok is False
     assert "architecture" in result.detail
-    assert not any("manifest.json" in c for c in runner.calls)
+    assert runner.installed is False
+
+
+@pytest.mark.asyncio
+async def test_a_verified_build_is_cached_per_executor():
+    runner = Runner(local=NEW_BUILD)
+    ctx = _ctx(runner)
+
+    assert (await ensure_liumd_binary(ctx)).ok is True
+    calls = len(runner.calls)
+    second = await ensure_liumd_binary(ctx)
+
+    assert second.ok is True and second.changed is False
+    assert len(runner.calls) == calls
+
+
+@pytest.mark.asyncio
+async def test_a_cached_build_expires(monkeypatch):
+    runner = Runner(local=NEW_BUILD)
+    ctx = _ctx(runner)
+    assert (await ensure_liumd_binary(ctx)).ok is True
+    calls = len(runner.calls)
+
+    monkeypatch.setattr(liumd_binary_refresh.time, "monotonic", lambda: 10**9)
+
+    assert (await ensure_liumd_binary(ctx)).ok is True
+    assert len(runner.calls) == calls + 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_refresh_is_not_cached():
+    runner = Runner(outcome="wrong_hash")
+    ctx = _ctx(runner)
+
+    assert (await ensure_liumd_binary(ctx)).ok is False
+    runner.outcome = "ok"
+
+    assert (await ensure_liumd_binary(ctx)).ok is True
 
 
 @pytest.mark.asyncio
@@ -107,5 +242,5 @@ async def test_the_feature_is_off_by_default(monkeypatch):
     monkeypatch.setattr(liumd_binary_refresh.settings, "LIUMD_BINARY_REFRESH_ENABLED", False)
     runner = Runner()
 
-    assert await ensure_liumd_binary(SimpleNamespace(runner=runner)) is None
+    assert await ensure_liumd_binary(_ctx(runner)) is None
     assert runner.calls == []
