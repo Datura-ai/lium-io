@@ -27,6 +27,7 @@ def _install(root) -> None:
     script = (
         'host_path() { echo "${SYSBOX_SETUP_HOST_ROOT:-}$1"; }\nwarn() { echo "WARN $*"; }\n'
         + _function("docker_containerd_address")
+        + _function("systemd_quote")
         + _function("systemd_env")
         + _function("shift_sysbox_layers_back_at_boot")
         + "shift_sysbox_layers_back_at_boot\n"
@@ -429,7 +430,7 @@ def test_an_xattr_that_cannot_be_read_stops_the_reset_before_any_chown(tmp_path,
 @pytest.mark.parametrize("value", ["/srv/docker data", 'a"b\\c%d', "/var/lib/docker"])
 def test_the_unit_environment_carries_a_data_root_with_spaces_unchanged(value):
     line = subprocess.run(
-        ["bash", "-c", _function("systemd_env") + 'systemd_env LIUM_DOCKER_DATA_ROOT "$1"', "-", value],
+        ["bash", "-c", _function("systemd_quote") + _function("systemd_env") + 'systemd_env LIUM_DOCKER_DATA_ROOT "$1"', "-", value],
         check=True, capture_output=True, text=True,
     ).stdout
     assert _unit_env(line, "LIUM_DOCKER_DATA_ROOT") == value
@@ -541,3 +542,59 @@ def test_the_unit_is_installed_before_the_already_working_exit():
     text = open(SCRIPT).read()
     assert text.count("\nshift_sysbox_layers_back_at_boot &&") == 1
     assert text.index("\nshift_sysbox_layers_back_at_boot &&") < text.index("# ── 2. Already working?")
+
+
+@pytest.mark.parametrize(
+    "unreadable",
+    [
+        "var/lib/docker/containers/{cid}/hostconfig.json",
+        "var/lib/docker/image/overlay2/layerdb/mounts/{cid}/mount-id",
+        "etc/subuid",
+        "etc/subgid",
+        "etc/docker/daemon.json",
+    ],
+)
+def test_a_discovery_input_that_cannot_be_read_fails_the_reset(tmp_path, unreadable):
+    # review 4601860269: a read error (EIO here stands as a directory in the file's place) used to skip the pod or the
+    # whole reset and report success, so Docker started the pod with its layer still shifted
+    _install(tmp_path)
+    cid = "f" * 64
+    _container(tmp_path, cid, "sysbox-runc", "m1")
+    path = tmp_path / unreadable.format(cid=cid)
+    if path.exists():
+        path.unlink()
+    path.mkdir(parents=True)
+
+    out = _run(tmp_path, "--dry-run")
+
+    assert out.returncode != 0
+    assert "would shift" not in out.stdout
+
+
+def test_inputs_that_are_not_there_are_still_skipped(tmp_path):
+    _install(tmp_path)
+    _container(tmp_path, "a" * 64, "sysbox-runc", "m1")
+    os.makedirs(tmp_path / "var/lib/docker/containers" / ("c" * 64))  # a container dir without its hostconfig yet
+
+    out = _run(tmp_path, "--dry-run")
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.splitlines() == [f"would shift 4 entries of {'a' * 12} back from {_base()}"]
+
+    (tmp_path / "etc/subuid").unlink()
+    out = _run(tmp_path, "--dry-run")
+    assert out.returncode == 0 and "nothing to reset" in out.stdout
+
+
+@pytest.mark.parametrize(("data_root", "expected"), [(None, "/var/lib/docker"), ("/srv/docker data%1", "/srv/docker data%1")])
+def test_the_reset_waits_for_the_disk_dockers_data_root_is_on(tmp_path, data_root, expected):
+    # review 4601860262: a nofail data-disk mount is not part of local-fs.target; the reset scanned an empty
+    # /var/lib/docker, succeeded, and Docker restarted the pods once the disk mounted
+    if data_root is not None:
+        (tmp_path / "etc/docker").mkdir(parents=True)
+        (tmp_path / "etc/docker/daemon.json").write_text(json.dumps({"data-root": data_root}))
+    _install(tmp_path)
+    unit = (tmp_path / "etc/systemd/system/lium-sysbox-layer-reset.service").read_text()
+
+    quoted = re.search(r'^RequiresMountsFor="((?:[^"\\]|\\.)*)"$', unit, re.M).group(1)
+    assert re.sub(r"\\(.)", r"\1", quoted).replace("%%", "%") == expected
+    assert unit.index("RequiresMountsFor=") < unit.index("[Service]")

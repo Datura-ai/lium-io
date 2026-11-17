@@ -249,11 +249,15 @@ docker_containerd_address() {
     echo "${a:-docker-managed}"  # Docker starts its own: the boot reset runs one on Docker's store itself
 }
 
-systemd_env() {
-    # a quoted Environment= line: systemd splits an unquoted one at a space ("/srv/docker data") and expands %
-    local v=$2
+systemd_quote() {
+    # one quoted word of a unit setting: systemd splits an unquoted one at a space ("/srv/docker data") and expands %
+    local v=$1
     v=${v//\\/\\\\}; v=${v//\"/\\\"}; v=${v//%/%%}
-    printf 'Environment="%s=%s"\n' "$1" "$v"
+    printf '"%s"' "$v"
+}
+
+systemd_env() {
+    printf 'Environment=%s\n' "$(systemd_quote "$1=$2")"
 }
 
 shift_sysbox_layers_back_at_boot() {
@@ -261,10 +265,14 @@ shift_sysbox_layers_back_at_boot() {
     # stop (power loss, hard reset) the layer stays shifted, and the restart-policy start at boot mounts the image
     # layers unmapped: every image file is host uid 0, nobody inside the pod, so sudo and apt break (DAH-6503;
     # reproduced: a hard reset always, a clean reboot never). A boot oneshot before Docker shifts such a layer back.
-    local bin unit dropin address root=""
+    local bin unit dropin address mounts root=""
     address=$(docker_containerd_address)
     # Docker's effective data-root (its --data-root flag or --config-file included), as check_total_disk_for_vram reads it
     [ -z "${SYSBOX_SETUP_HOST_ROOT:-}" ] && root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+    # the disk the reset reads: Docker's own unit waits for a nofail data-disk mount, local-fs.target does not
+    mounts=$root
+    [ -n "$mounts" ] || mounts=$(python3 -Ic 'import json, sys; print(json.load(open(sys.argv[1])).get("data-root") or "")' \
+        "$(host_path /etc/docker/daemon.json)" 2>/dev/null)
     bin=$(host_path /usr/local/sbin/lium-sysbox-layer-reset)
     unit=$(host_path /etc/systemd/system/lium-sysbox-layer-reset.service)
     dropin=$(host_path /etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf)
@@ -293,9 +301,11 @@ STARTED = ROOT + "/run/lium-docker-started"
 def data_root():
     if os.environ.get("LIUM_DOCKER_DATA_ROOT"):
         return ROOT + os.environ["LIUM_DOCKER_DATA_ROOT"]
+    # only a missing or unparsable file means Docker's default (Docker itself would not start on an unparsable one);
+    # any other read error fails the reset rather than scan the wrong root and succeed
     try:
         return ROOT + json.load(open(ROOT + "/etc/docker/daemon.json")).get("data-root", "/var/lib/docker")
-    except (OSError, ValueError):
+    except (FileNotFoundError, ValueError):
         return ROOT + "/var/lib/docker"
 
 
@@ -342,8 +352,8 @@ def docker_running():
     try:
         os.kill(int(open(ROOT + "/var/run/docker.pid").read()), 0)
         return True
-    except (OSError, ValueError):
-        return False
+    except (FileNotFoundError, ProcessLookupError, ValueError):
+        return False  # no pid file, a stale pid, or an empty file: Docker is not running
 
 
 def back(i, base):
@@ -354,8 +364,8 @@ def subid(name):
     # the host id range sysbox maps pods into: the "sysbox:start:count" line of /etc/subuid or /etc/subgid
     try:
         lines = open(ROOT + name).read().splitlines()
-    except OSError:
-        return None
+    except FileNotFoundError:
+        return None  # no sysbox range at all; any other read error fails the reset (Docker stays down, next boot retries)
     for line in lines:
         parts = line.strip().split(":")
         if len(parts) == 3 and parts[0] == "sysbox" and parts[1].isdigit() and parts[2].isdigit():
@@ -492,16 +502,20 @@ def main():
         return
     d = data_root()
     for hc in glob.glob(f"{glob.escape(d)}/containers/*/hostconfig.json"):
+        # only an input that is not there is skipped: a read error (EIO) fails the unit, so Docker stays down and never
+        # starts a pod whose layer was left shifted
         try:
             if json.load(open(hc)).get("Runtime") != "sysbox-runc":
                 continue
-        except (OSError, ValueError):
-            continue
+        except FileNotFoundError:
+            continue  # removed since the glob
+        except ValueError:
+            continue  # unparsable: Docker does not load such a container either
         cid = os.path.basename(os.path.dirname(hc))
         try:
             upper = f"{d}/overlay2/" + open(f"{d}/image/overlay2/layerdb/mounts/{cid}/mount-id").read().strip() + "/diff"
-        except OSError:
-            upper = containerd_upper(cid)
+        except FileNotFoundError:
+            upper = containerd_upper(cid)  # not in the overlay2 store: the containerd image store holds it
         if not upper or not os.path.isdir(upper):
             print(f"no writable layer found for sysbox container {cid[:12]}", file=sys.stderr, flush=True)
             continue
@@ -559,6 +573,7 @@ PY
 Description=Lium: shift sysbox pods' layers back after an unclean stop
 After=local-fs.target sysbox.service sysbox-mgr.service containerd.service
 Before=docker.service
+RequiresMountsFor=$(systemd_quote "${mounts:-/var/lib/docker}")
 
 [Service]
 Type=oneshot
