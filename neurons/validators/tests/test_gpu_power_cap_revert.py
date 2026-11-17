@@ -2,8 +2,8 @@
 
 Case 3 of the three power-cap problems: the cap applies, the validator reads it back, and
 then something on the provider's host raises the limit again. The PEARL filler is killed by
-the backend grace check, and the backend holds idle pay until a later filler run keeps the cap;
-the validator only records and logs the revert (its 2-in-24h pay gate is gone, DAH-6092).
+the backend grace check; the validator only records and logs the revert, and reverts no longer
+gate pay (its 2-in-24h pay gate is gone).
 
 The revert is observed WHILE the Lium job runs, in the validation check that already skips the
 power-limit penalty for a live filler. That is the only moment it can be told apart from a host
@@ -708,8 +708,7 @@ def _make_job(is_rented: bool = False) -> JobResult:
 
 @pytest.mark.asyncio
 async def test_recorded_reverts_do_not_withhold_idle_pay() -> None:
-    # DAH-6092: the backend holds idle pay until a later filler run keeps the cap; the validator
-    # gate misfired on split nodes at a filler swap, so recorded reverts no longer gate anything.
+    # the validator gate misfired on split nodes at a filler swap, so recorded reverts no longer gate pay
     incentive = _build_incentive(_redis_with_reverts(5))
 
     result = await incentive.calculate_executor_score(_make_job())
