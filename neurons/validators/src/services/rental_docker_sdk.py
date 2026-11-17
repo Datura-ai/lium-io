@@ -1828,7 +1828,15 @@ def _build_rental_ssh_http_adapter_class(
                     return pool
                 transport = self.ssh_client.get_transport()
                 if transport is None or not transport.is_active():
-                    self._connect()
+                    # the build connected once, so the session dropped: a host gone silent fails
+                    # this re-connect with a bare "timed out" that must still read as the drop
+                    try:
+                        self._connect()
+                    except Exception as exc:
+                        raise RentalDockerTransportDropped(
+                            "the SSH session to the executor dropped and could not be re-opened: "
+                            f"{_error_text(exc)}"
+                        ) from exc
                 pool = RentalSSHConnectionPool(
                     ssh_client=self.ssh_client,
                     timeout=self.timeout,
