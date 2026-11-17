@@ -214,3 +214,12 @@ async def test_an_older_miner_is_not_checked():
     runner = _HostFiles("hotkey=5Victim\n")
     assert (await NodeAccountCheck().run(_relay_ctx(runner, hotkeys=None))).passed
     assert runner.commands == []
+
+
+@pytest.mark.parametrize("rented", [True, False])
+async def test_a_rented_node_on_another_accounts_machine_finishes_its_rental(rented, monkeypatch):
+    """Like the ban checks: fatal only without a live rental, so a renter's pod is not cut off mid-rental."""
+    monkeypatch.setattr("services.task.checks.node_account.has_live_rental", lambda ctx: rented)
+    result = await NodeAccountCheck().run(_relay_ctx(_HostFiles("hotkey=5Victim\nclaim=\n")))
+    assert not result.passed and result.event.reason_code == "NODE_ACCOUNT_MISMATCH"
+    assert result.fatal is (not rented)

@@ -25,6 +25,7 @@ from services.node_host import host_key_body, is_ip_literal, registered_host_key
 
 from ..messages import NodeAccountMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
+from .banned_provider import has_live_rental
 
 logger = get_logger(__name__)
 
@@ -73,7 +74,9 @@ class NodeAccountCheck:
 
         if presented_host_key(ctx) not in expected:
             event = render_message(Msg.MISMATCH, ctx=ctx, check_id=self.check_id, what=what)
-            return CheckResult(passed=False, event=event, updates={"clear_verified_job_info": True})
+            return CheckResult(
+                passed=False, event=event, updates={"clear_verified_job_info": True}, fatal=not has_live_rental(ctx)
+            )
         return CheckResult(passed=True, event=render_message(Msg.MATCH, ctx=ctx, check_id=self.check_id, what=what))
 
     async def _other_account(self, ctx: Context, what: dict) -> CheckResult | None:
@@ -99,4 +102,7 @@ class NodeAccountCheck:
                 logger.info(_m("NODE_ACCOUNT_BINDING_UNVERIFIED", extra=get_extra_info({**what, "unread": "claim"})))
             return None
         event = render_message(Msg.BINDING_MISMATCH, ctx=ctx, check_id=self.check_id, what=what)
-        return CheckResult(passed=False, event=event, updates={"clear_verified_job_info": True})
+        # like the ban checks: a rented node finishes its rental and, failing fatally once it is free, takes no new one
+        return CheckResult(
+            passed=False, event=event, updates={"clear_verified_job_info": True}, fatal=not has_live_rental(ctx)
+        )
