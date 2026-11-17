@@ -41,6 +41,7 @@ jobs:
     # a comment, request-changes or outside review starts a run too; it skips every job (no minutes).
     # DAH-6518: a CONTRIBUTOR approval runs route too: a member with private org membership shows as CONTRIBUTOR
     # here, and changed-packages counts the approval only if its author can write to the repo.
+    # Known limit: a writer shown as NONE or FIRST_TIME_CONTRIBUTOR still skips; make the org membership public or have a member approve.
     if: >-
       github.event_name != 'pull_request_review' || (github.event.review.state == 'approved'
       && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"]'), github.event.review.author_association))
