@@ -434,7 +434,7 @@ class MachineSpecScrapeCheck:
             return self._fail_liumd(ctx, answer, "malformed liumd specs")
         if not raw_gpu_details:
             return await self._fail_without_gpus(ctx, answer, specs)
-        return self._result_from_specs(ctx, specs, delivery="liumd", task=task)
+        return self._result_from_specs(ctx, specs, delivery="liumd", task=task, snapshot=False)
 
     async def _fail_without_gpus(
         self, ctx: Context, answer: Any, specs: dict[str, Any]
@@ -473,6 +473,7 @@ class MachineSpecScrapeCheck:
         delivery: Literal["stdin", "upload", "liumd"],
         task: Any = None,
         what: dict[str, Any] | None = None,
+        snapshot: bool = True,
     ) -> CheckResult:
         specs.pop("port_verify_first_miss", None)
         specs.pop("split_disk", None)
@@ -492,7 +493,8 @@ class MachineSpecScrapeCheck:
         gpu_splitting_config = ctx.state.rented_data.gpu_splitting_config if ctx.state.rented_data else {}
         gpu_splitting_min_count = gpu_splitting_config.get(ctx.executor.uuid)
         supports_gpu_splitting = hardware_supports and gpu_splitting_min_count is not None
-        scrape_specs = copy.deepcopy(specs)
+        # only the Python scrape has a second read to compare against
+        scrape_specs = copy.deepcopy(specs) if snapshot else None
         extra_info = {
             "sysbox_runtime": sysbox_runtime,
             "supports_gpu_splitting": supports_gpu_splitting,

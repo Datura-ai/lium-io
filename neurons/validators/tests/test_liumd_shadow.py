@@ -340,12 +340,47 @@ def _docker(*names):
     return {"docker": {"data": {"containers": [{"name": n, "status": "running"} for n in names]}}}
 
 
+PYTHON_GPU_DETAILS = [
+    {
+        "uuid": "GPU-1",
+        "name": "H100",
+        "capacity": 81559,
+        "temperature": 34,
+        "gpu_utilization": 1,
+        "memory_utilization": 2,
+        "memory_used_mb": 3,
+        "graphics_speed": 4,
+        "memory_speed": 5,
+    }
+]
+LIUMD_GPU_DETAILS = [
+    {
+        "uuid": "GPU-1",
+        "name": "H100",
+        "capacity": 81559,
+        "temperature": 35,
+        "gpu_utilization": 91,
+        "memory_utilization": 92,
+        "memory_used_mb": 93,
+        "graphics_speed": 94,
+        "memory_speed": 95,
+    }
+]
 PYTHON_SCRAPE = {
     **SPECS,
+    "gpu": {"count": 1, "details": PYTHON_GPU_DETAILS},
     "cpu": {"utilization": 10},
     "ram": {"free": 1, "used": 2, "available": 3, "utilization": 4},
-    "hard_disk": {"used": 5, "free": 6, "utilization": 7, "engy_cache_used_gb": 8},
+    "hard_disk": {
+        "used": 5,
+        "free": 6,
+        "utilization": 7,
+        "engy_cache_used_gb": 8,
+        "containers": 210288,
+        "by_container": {"c1": 100},
+    },
     "docker": {
+        "version": "29.10.0",
         "host_cpu_percent": 9,
         "containers": [
             {"name": "c1", "cpu_percent": 10, "net_rx_bytes": 11, "net_tx_bytes": 12}
@@ -354,10 +389,19 @@ PYTHON_SCRAPE = {
 }
 LIUMD_SCRAPE = {
     **SPECS,
+    "gpu": {"count": 1, "details": LIUMD_GPU_DETAILS},
     "cpu": {"utilization": 90},
     "ram": {"free": 91, "used": 92, "available": 93, "utilization": 94},
-    "hard_disk": {"used": 95, "free": 96, "utilization": 97, "engy_cache_used_gb": 98},
+    "hard_disk": {
+        "used": 95,
+        "free": 96,
+        "utilization": 97,
+        "engy_cache_used_gb": 98,
+        "containers": 210300,
+        "by_container": {"c1": 112},
+    },
     "docker": {
+        "version": "29.9.3",
         "host_cpu_percent": 99,
         "containers": [
             {"name": "c1", "cpu_percent": 100, "net_rx_bytes": 101, "net_tx_bytes": 102}

@@ -537,9 +537,12 @@ def _logged_fact(value: Any) -> Any:
     return value if len(text) <= DETAIL_MAX_CHARS else text[:DETAIL_MAX_CHARS]
 
 
-# Readings the two scrapes take at different moments; equality is not expected.
-LIVE_SPEC_PATHS = frozenset(
+# Fields the two paths read at different moments, or read as different facts. `docker.version`:
+# Python reports its bundled CLI's client version, liumd the daemon's; nothing reads it.
+NOT_COMPARABLE_SPEC_PATHS = frozenset(
     {
+        "docker.version",
+        "docker.host_cpu_percent",
         "cpu.utilization",
         "ram.free",
         "ram.used",
@@ -549,26 +552,38 @@ LIVE_SPEC_PATHS = frozenset(
         "hard_disk.free",
         "hard_disk.utilization",
         "hard_disk.engy_cache_used_gb",
-        "docker.host_cpu_percent",
+        "hard_disk.containers",
+    }
+)
+LIVE_GPU_DETAIL_FIELDS = frozenset(
+    {
+        "temperature",
+        "gpu_utilization",
+        "memory_utilization",
+        "memory_used_mb",
+        "graphics_speed",
+        "memory_speed",
     }
 )
 LIVE_DOCKER_CONTAINER_FIELDS = frozenset({"cpu_percent", "net_rx_bytes", "net_tx_bytes"})
 
 
-def _is_live_reading(path: str) -> bool:
-    if path in LIVE_SPEC_PATHS:
+def _is_not_comparable(path: str) -> bool:
+    if path in NOT_COMPARABLE_SPEC_PATHS:
+        return True
+    if path == "hard_disk.by_container" or path.startswith("hard_disk.by_container."):
         return True
     parent, _, leaf = path.rpartition(".")
-    return (
-        leaf in LIVE_DOCKER_CONTAINER_FIELDS
-        and parent.startswith("docker.containers[")
-        and parent.endswith("]")
-    )
+    if not parent.endswith("]"):
+        return False
+    if leaf in LIVE_GPU_DETAIL_FIELDS and parent.startswith("gpu.details["):
+        return True
+    return leaf in LIVE_DOCKER_CONTAINER_FIELDS and parent.startswith("docker.containers[")
 
 
 def _spec_diffs(python: Any, liumd: Any, path: str = "") -> list[dict[str, Any]]:
     """Every differing leaf in the two normalized specs documents, capped for logging."""
-    if path and _is_live_reading(path):
+    if path and _is_not_comparable(path):
         return []
     diffs: list[dict[str, Any]] = []
     if type(python) is not type(liumd) and not (
@@ -578,7 +593,7 @@ def _spec_diffs(python: Any, liumd: Any, path: str = "") -> list[dict[str, Any]]
     if isinstance(python, dict):
         for key in sorted(set(python) | set(liumd)):
             child = f"{path}.{key}" if path else key
-            if _is_live_reading(child):
+            if _is_not_comparable(child):
                 continue
             if key not in python or key not in liumd:
                 diffs.append(
