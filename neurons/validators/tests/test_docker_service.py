@@ -328,7 +328,7 @@ def create_mock_port_dict(
 def mock_dependencies():
     """Mock all DockerService dependencies."""
     ssh_service = Mock()
-    redis_service = Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True), delete=AsyncMock(), sadd=AsyncMock(), srem=AsyncMock(), smembers=AsyncMock(return_value=set()))
+    redis_service = Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True), delete=AsyncMock(), sadd=AsyncMock(), srem=AsyncMock(), smembers=AsyncMock(return_value=set()), hset=AsyncMock(), hget=AsyncMock(return_value=None), hdel=AsyncMock(), hgetall=AsyncMock(return_value={}))
     attestation_service = Mock()
 
     # Mock the async context manager for Redis lock
@@ -3479,11 +3479,11 @@ async def test_a_half_started_pod_that_refuses_stop_and_kill_fails_the_start_as_
     with pytest.raises(RentalDockerOperationError, match="may still be running without its mount"):
         await _start_existing(docker_service)
 
-    key, value = docker_service.redis_service.set.await_args.args
-    assert key == "half_started_stop_pending:exec-1:pod-id"
-    # no expiry: the record goes only once that run is confirmed stopped or changed (gateway review)
-    assert "ex" not in docker_service.redis_service.set.await_args.kwargs
-    docker_service.redis_service.sadd.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id")
+    # one field in the node's index holds the record: no write can leave a record the node check cannot find
+    key, field, value = docker_service.redis_service.hset.await_args.args
+    assert (key, field) == ("half_started_stop_index:exec-1", "pod-id")
+    docker_service.redis_service.set.assert_not_awaited()
+    docker_service.redis_service.sadd.assert_not_awaited()
     record = json.loads(value)
     assert (record["container_name"], record["identity"]) == ("pod_test", _RUN)
     assert datetime.fromisoformat(record["recorded_at"]).tzinfo is not None
@@ -3498,7 +3498,6 @@ async def test_a_half_started_pod_that_refused_stop_and_kill_is_stopped_by_the_p
     monkeypatch.setattr("services.docker_service.asyncssh.connect", Mock(side_effect=OSError("ssh refused")))
     monkeypatch.setattr("services.docker_service._HALF_STARTED_STOP_RETRY_SEC", 0)
     monkeypatch.setattr("services.docker_service._HALF_STARTED_STOP_LATER_DELAYS_SEC", (0,))
-    docker_service.redis_service.delete = AsyncMock()
     client = docker_service.rental_docker_client_factory.client
     client.running = False
     client.stop_error = RuntimeError("stop refused")
@@ -3506,21 +3505,20 @@ async def test_a_half_started_pod_that_refused_stop_and_kill_is_stopped_by_the_p
     with pytest.raises(RentalDockerOperationError):
         await _start_existing(docker_service)
     retry = docker_service_module._HALF_STARTED_STOP_LATER["exec-1:pod-id"]
-    docker_service.redis_service.delete.reset_mock()
+    docker_service.redis_service.hdel.reset_mock()
 
     client.kill_error = None
     await retry
 
     assert client.running is False
-    docker_service.redis_service.delete.assert_awaited_once_with("half_started_stop_pending:exec-1:pod-id")
+    docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id")
     assert "exec-1:pod-id" not in docker_service_module._HALF_STARTED_STOP_LATER
 
 
 @pytest.mark.asyncio
 async def test_retry_half_started_stop_stops_the_recorded_container_and_clears_its_mark(docker_service, monkeypatch):
     monkeypatch.setattr("services.docker_service._HALF_STARTED_STOP_RETRY_SEC", 0)
-    docker_service.redis_service.get = AsyncMock(return_value=_pending_record())
-    docker_service.redis_service.delete = AsyncMock()
+    docker_service.redis_service.hget = AsyncMock(return_value=_pending_record())
     client = docker_service.rental_docker_client_factory.client
     client.running = True
 
@@ -3530,14 +3528,13 @@ async def test_retry_half_started_stop_stops_the_recorded_container_and_clears_i
 
     assert stopped is True
     assert client.stopped_containers == ["pod_test"]
-    docker_service.redis_service.delete.assert_awaited_once_with("half_started_stop_pending:exec-1:pod-id")
+    docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id")
 
 
 @pytest.mark.asyncio
 async def test_retry_half_started_stop_keeps_the_mark_while_docker_refuses(docker_service, monkeypatch):
     monkeypatch.setattr("services.docker_service._HALF_STARTED_STOP_RETRY_SEC", 0)
-    docker_service.redis_service.get = AsyncMock(return_value=_pending_record())
-    docker_service.redis_service.delete = AsyncMock()
+    docker_service.redis_service.hget = AsyncMock(return_value=_pending_record())
     client = docker_service.rental_docker_client_factory.client
     client.running = True
     client.stop_error = RuntimeError("stop refused")
@@ -3548,13 +3545,12 @@ async def test_retry_half_started_stop_keeps_the_mark_while_docker_refuses(docke
     )
 
     assert stopped is False
-    docker_service.redis_service.delete.assert_not_awaited()
+    docker_service.redis_service.hdel.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_retry_half_started_stop_leaves_a_pod_started_again_since_running_and_drops_its_mark(docker_service):
-    docker_service.redis_service.get = AsyncMock(return_value=_pending_record())
-    docker_service.redis_service.delete = AsyncMock()
+    docker_service.redis_service.hget = AsyncMock(return_value=_pending_record())
     client = docker_service.rental_docker_client_factory.client
     client.running = True
     client.identity = "cid@2026-11-16T14:03:00Z"
@@ -3565,13 +3561,12 @@ async def test_retry_half_started_stop_leaves_a_pod_started_again_since_running_
 
     assert stopped is True
     assert client.stopped_containers == [] and client.killed_containers == []
-    docker_service.redis_service.delete.assert_awaited_once_with("half_started_stop_pending:exec-1:pod-id")
+    docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id")
 
 
 @pytest.mark.asyncio
 async def test_retry_half_started_stop_does_not_stop_and_keeps_the_mark_when_the_inspect_fails(docker_service):
-    docker_service.redis_service.get = AsyncMock(return_value=_pending_record())
-    docker_service.redis_service.delete = AsyncMock()
+    docker_service.redis_service.hget = AsyncMock(return_value=_pending_record())
     client = docker_service.rental_docker_client_factory.client
     client.running = True
     client.identity_error = RuntimeError("docker down")
@@ -3582,7 +3577,7 @@ async def test_retry_half_started_stop_does_not_stop_and_keeps_the_mark_when_the
 
     assert stopped is False
     assert client.stopped_containers == []
-    docker_service.redis_service.delete.assert_not_awaited()
+    docker_service.redis_service.hdel.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -3595,8 +3590,7 @@ async def test_retry_half_started_stop_without_a_recorded_id_judges_the_run_by_i
 ):
     # the id read failed at the failure: a run started by the failure time is the same one, a later start is a restart
     monkeypatch.setattr("services.docker_service._HALF_STARTED_STOP_RETRY_SEC", 0)
-    docker_service.redis_service.get = AsyncMock(return_value=_pending_record(identity=""))
-    docker_service.redis_service.delete = AsyncMock()
+    docker_service.redis_service.hget = AsyncMock(return_value=_pending_record(identity=""))
     client = docker_service.rental_docker_client_factory.client
     client.running = True
     client.identity = f"cid@{started_at}"
@@ -3608,14 +3602,13 @@ async def test_retry_half_started_stop_without_a_recorded_id_judges_the_run_by_i
     assert stopped is True
     assert client.stopped_containers == (["pod_test"] if expect_stop else [])
     assert client.running is not expect_stop
-    docker_service.redis_service.delete.assert_awaited_once_with("half_started_stop_pending:exec-1:pod-id")
+    docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id")
 
 
 @pytest.mark.asyncio
 async def test_retry_half_started_stop_without_a_recorded_id_corrects_for_a_host_clock_behind_ours(docker_service):
     # host 5 min behind: a restart at host 13:57 is 14:02 on our clock, after the 14:00:05 failure, so it is not stopped
-    docker_service.redis_service.get = AsyncMock(return_value=_pending_record(identity=""))
-    docker_service.redis_service.delete = AsyncMock()
+    docker_service.redis_service.hget = AsyncMock(return_value=_pending_record(identity=""))
     client = docker_service.rental_docker_client_factory.client
     client.running = True
     client.identity = "cid@2026-11-16T13:57:00.5Z"
@@ -3627,15 +3620,14 @@ async def test_retry_half_started_stop_without_a_recorded_id_corrects_for_a_host
 
     assert stopped is True
     assert client.stopped_containers == [] and client.running is True
-    docker_service.redis_service.delete.assert_awaited_once_with("half_started_stop_pending:exec-1:pod-id")
+    docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id")
 
 
 @pytest.mark.asyncio
 async def test_retry_half_started_stop_without_a_recorded_id_keeps_the_mark_when_the_host_clock_is_unreadable(
     docker_service,
 ):
-    docker_service.redis_service.get = AsyncMock(return_value=_pending_record(identity=""))
-    docker_service.redis_service.delete = AsyncMock()
+    docker_service.redis_service.hget = AsyncMock(return_value=_pending_record(identity=""))
     client = docker_service.rental_docker_client_factory.client
     client.running = True
     client.host_time_error = RuntimeError("info refused")
@@ -3646,7 +3638,7 @@ async def test_retry_half_started_stop_without_a_recorded_id_keeps_the_mark_when
 
     assert stopped is False
     assert client.stopped_containers == []
-    docker_service.redis_service.delete.assert_not_awaited()
+    docker_service.redis_service.hdel.assert_not_awaited()
 
 
 @pytest.fixture
@@ -3662,7 +3654,6 @@ def _let_starts_succeed(docker_service, monkeypatch):
     )
     monkeypatch.setattr("services.docker_service.public_host_sock", AsyncMock(return_value={}))
     docker_service._restore_mount_and_sshd_after_start = AsyncMock()
-    docker_service.redis_service.delete = AsyncMock()
 
 
 @pytest.mark.asyncio
@@ -3676,12 +3667,12 @@ async def test_a_start_ends_only_its_own_executors_pending_stop_retry(
     await _start_existing(docker_service, executor_uuid="exec-2")
     await asyncio.sleep(0)
     assert not pending.cancelled()
-    assert call("half_started_stop_pending:exec-1:pod-id") not in docker_service.redis_service.delete.await_args_list
+    assert call("half_started_stop_index:exec-1", "pod-id") not in docker_service.redis_service.hdel.await_args_list
 
     await _start_existing(docker_service, executor_uuid="exec-1")
     await asyncio.sleep(0)
     assert pending.cancelled()
-    docker_service.redis_service.delete.assert_any_await("half_started_stop_pending:exec-1:pod-id")
+    docker_service.redis_service.hdel.assert_any_await("half_started_stop_index:exec-1", "pod-id")
 
 
 @pytest.mark.asyncio
@@ -3700,7 +3691,7 @@ async def test_a_failed_start_keeps_an_earlier_failed_starts_pending_stop_and_it
     await asyncio.sleep(0)
 
     assert not pending.cancelled()
-    docker_service.redis_service.delete.assert_not_awaited()
+    docker_service.redis_service.hdel.assert_not_awaited()
     pending.cancel()
 
 
@@ -3748,8 +3739,10 @@ async def test_a_pending_stop_retry_racing_a_start_does_not_stop_the_new_run(
 
 
 @pytest.mark.asyncio
-async def test_pending_half_started_stops_of_the_node_are_retried_and_a_stale_index_entry_is_dropped(docker_service):
-    docker_service.redis_service.smembers = AsyncMock(return_value={b"pod-a", b"pod-b"})
+async def test_pending_half_started_stops_of_the_node_are_all_retried_and_none_is_dropped_without_its_stop(
+    docker_service,
+):
+    docker_service.redis_service.hgetall = AsyncMock(return_value={b"pod-a": b"{}", b"pod-b": b"{}"})
     outcomes = {"pod-a": False, "pod-b": None}  # a still refuses its stop; b has no record left
     docker_service.retry_half_started_stop = AsyncMock(side_effect=lambda **kw: outcomes[kw["pod_id"]])
 
@@ -3758,20 +3751,54 @@ async def test_pending_half_started_stops_of_the_node_are_retried_and_a_stale_in
     )
 
     assert sorted(c.kwargs["pod_id"] for c in docker_service.retry_half_started_stop.await_args_list) == ["pod-a", "pod-b"]
-    docker_service.redis_service.smembers.assert_awaited_once_with("half_started_stop_index:exec-1")
-    docker_service.redis_service.srem.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-b")
+    docker_service.redis_service.hgetall.assert_awaited_once_with("half_started_stop_index:exec-1")
+    docker_service.redis_service.hdel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_slow_pending_stop_does_not_hold_back_the_nodes_other_pending_stops(docker_service):
+    # gateway review: one deadline over a sorted loop let pod-a's stop starve pod-b every cycle
+    docker_service.redis_service.hgetall = AsyncMock(return_value={b"pod-a": b"{}", b"pod-b": b"{}"})
+    reached = []
+
+    async def retry(**kw):
+        reached.append(kw["pod_id"])
+        if kw["pod_id"] == "pod-a":
+            await asyncio.sleep(3600)
+        return True
+
+    docker_service.retry_half_started_stop = retry
+
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.05):
+            await docker_service.retry_pending_half_started_stops(
+                executor_info=Mock(uuid="exec-1"), private_key="private-key", default_extra={}
+            )
+
+    assert sorted(reached) == ["pod-a", "pod-b"]
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_pending_stop_record_is_kept_pending_not_read_as_absent(docker_service):
+    docker_service.redis_service.hget = AsyncMock(side_effect=ConnectionError("redis down"))
+
+    stopped = await docker_service.retry_half_started_stop(
+        executor_info=Mock(uuid="exec-1"), private_key="private-key", pod_id="pod-id", default_extra={}
+    )
+
+    assert stopped is False
+    docker_service.redis_service.hdel.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_a_confirmed_half_started_stop_leaves_the_nodes_index(docker_service, monkeypatch):
     assert await docker_service._forget_half_started_stop(Mock(uuid="exec-1"), "pod-id", {})
-    docker_service.redis_service.delete.assert_awaited_once_with("half_started_stop_pending:exec-1:pod-id")
-    docker_service.redis_service.srem.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id")
+    docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id")
 
 
 @pytest.mark.asyncio
 async def test_retry_half_started_stop_does_nothing_without_a_mark(docker_service):
-    docker_service.redis_service.get = AsyncMock(return_value=None)
+    docker_service.redis_service.hget = AsyncMock(return_value=None)
 
     assert (
         await docker_service.retry_half_started_stop(

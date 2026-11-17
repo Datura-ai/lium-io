@@ -172,7 +172,6 @@ from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networkin
 from services.redis_service import (
     GPU_CLOCKS_PENDING_KIND,
     GPU_RESET_PENDING_KIND,
-    HALF_STARTED_STOP_PENDING_PREFIX,
     HALF_STARTED_STOP_INDEX_PREFIX,
     EDIT_PARKED_CONTAINER_AFTER_EDIT_SECONDS,
     EDIT_PARKED_CONTAINER_PREFIX,
@@ -12811,15 +12810,13 @@ class DockerService:
         container_name, identity, recorded_at = recorded
         slot = _half_started_stop_slot(executor_info, pod_id)
         try:
+            # one write: a lost reply leaves the field either set and indexed or absent, never a record the check misses
             await asyncio.wait_for(
-                self.redis_service.set(
-                    f"{HALF_STARTED_STOP_PENDING_PREFIX}{slot}",
+                self.redis_service.hset(
+                    f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}",
+                    pod_id,
                     json.dumps({"container_name": container_name, "identity": identity, "recorded_at": recorded_at}),
                 ),
-                timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
-            )
-            await asyncio.wait_for(
-                self.redis_service.sadd(f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}", pod_id),
                 timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
             )
         except Exception as exc:  # noqa: BLE001 — the background retry still runs; only a restart loses it
@@ -12836,12 +12833,7 @@ class DockerService:
         slot = _half_started_stop_slot(executor_info, pod_id)
         try:
             await asyncio.wait_for(
-                self.redis_service.delete(f"{HALF_STARTED_STOP_PENDING_PREFIX}{slot}"),
-                timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
-            )
-            # the record first: an index entry without one is dropped by the next check, never the reverse
-            await asyncio.wait_for(
-                self.redis_service.srem(f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}", pod_id),
+                self.redis_service.hdel(f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}", pod_id),
                 timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
             )
             return True
@@ -12888,11 +12880,10 @@ class DockerService:
         None when none is pending; True once it is stopped or no longer that run (record dropped); False (logged)
         while it still may run."""
         extra = {**default_extra, "pod_id": pod_id}
-        slot = _half_started_stop_slot(executor_info, pod_id)
         if recorded is None:
             try:
                 raw = await asyncio.wait_for(
-                    self.redis_service.get(f"{HALF_STARTED_STOP_PENDING_PREFIX}{slot}"),
+                    self.redis_service.hget(f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}", pod_id),
                     timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
                 )
                 if raw is None:
@@ -12900,10 +12891,11 @@ class DockerService:
                 record = json.loads(raw)
                 recorded = (record["container_name"], record["identity"], record["recorded_at"])
             except Exception as exc:  # noqa: BLE001
+                # an unread record is not an absent one: still pending, retried next check
                 logger.error(
                     _m("POD_HALF_STARTED_STOP_MARK_UNREADABLE", extra=get_extra_info({**extra, "error": str(exc)}))
                 )
-                return None
+                return False
         container_name, identity, recorded_at = recorded
         extra["container_name"] = container_name
         try:
@@ -12942,14 +12934,19 @@ class DockerService:
         """Retry every pending stop on this executor, whatever the node's current rental: a pod deleted or reassigned
         since its failed start is no longer listed, but its old run may still write without its mount."""
         index = f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}"
-        members = await asyncio.wait_for(self.redis_service.smembers(index), timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC)
-        for member in sorted(members or ()):
-            pod_id = member.decode() if isinstance(member, bytes) else str(member)
-            if await self.retry_half_started_stop(
-                executor_info=executor_info, private_key=private_key, pod_id=pod_id, default_extra=default_extra
-            ) is None:
-                # no record: nothing pending for that pod (its stop was confirmed by an earlier forget)
-                await asyncio.wait_for(self.redis_service.srem(index, pod_id), timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC)
+        pending = await asyncio.wait_for(self.redis_service.hgetall(index), timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC)
+        # all at once, each under its own pod lock: one slow stop cannot use up the check's budget for the others
+        await asyncio.gather(
+            *(
+                self.retry_half_started_stop(
+                    executor_info=executor_info,
+                    private_key=private_key,
+                    pod_id=member.decode() if isinstance(member, bytes) else str(member),
+                    default_extra=default_extra,
+                )
+                for member in pending or {}
+            )
+        )
 
     async def _bring_up_existing_container(
         self,
