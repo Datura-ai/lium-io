@@ -245,6 +245,23 @@ async def test_a_failed_or_stalled_read_hides_the_node_until_a_cycle_reads_it(re
     assert entry.reason_code not in NODE_GPU_FAULT_CODES  # a reach failure: silenced with our own outage, like one
 
 
+async def test_another_machines_host_key_is_a_mismatch_even_when_the_account_read_stalls(monkeypatch):
+    """The host-key comparison needs no read, so it runs first: a stalled read cannot turn this direct evidence into
+    NODE_ACCOUNT_UNVERIFIED, which our own-outage silencing would drop (Sergej, lio#2288 at a81b1b9)."""
+    from services.task.availability import NODE_GPU_FAULT_CODES, availability_errors
+
+    monkeypatch.setattr("services.task.checks.node_account.has_live_rental", lambda ctx: True)
+    monkeypatch.setattr("services.task.checks.node_account.presented_host_key", lambda ctx: "ssh-ed25519 AAAAother")
+    runner = _HostFiles("", success=False)
+    ctx = _relay_ctx(runner, address="node.example.test")
+    ctx.executor.expected_ssh_host_key = "ssh-ed25519 AAAAregistered"
+    result = await NodeAccountCheck().run(ctx)
+    assert not result.passed and result.event.reason_code == "NODE_ACCOUNT_MISMATCH"
+    [entry] = availability_errors([result.event])
+    assert entry.reason_code in NODE_GPU_FAULT_CODES  # kept through an outage cycle, so a rented node stays hidden
+    assert runner.commands == []
+
+
 class _Ssh:
     """An asyncssh connection whose every command ends `outcome`: an exit status, None (no exit status) or a stall."""
 

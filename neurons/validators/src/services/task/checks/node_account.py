@@ -57,12 +57,15 @@ class NodeAccountCheck:
     async def run(self, ctx: Context) -> CheckResult:
         executor = ctx.executor
         what = {"executor_uuid": executor.uuid, "address": executor.address}
+        # the portal records every host key the node presented, one `<type> <base64>` per line
+        expected = registered_host_keys(executor)
+        # compared first: it needs no read, so a stalled account read cannot hide this direct evidence
+        if expected and presented_host_key(ctx) not in expected:
+            return _refused(ctx, self.check_id, Msg.MISMATCH, what)
         if executor.expected_node_hotkeys and ctx.runner is not None:
             refused = await self._other_account(ctx, what)
             if refused is not None:
                 return refused
-        # the portal records every host key the node presented, one `<type> <base64>` per line
-        expected = registered_host_keys(executor)
         if not expected:
             if not is_ip_literal(executor.address) and executor.uuid not in _logged_without_expected:
                 _logged_without_expected.add(executor.uuid)
@@ -74,8 +77,6 @@ class NodeAccountCheck:
                 )
             return CheckResult(passed=True, event=render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what=what))
 
-        if presented_host_key(ctx) not in expected:
-            return _refused(ctx, self.check_id, Msg.MISMATCH, what)
         return CheckResult(passed=True, event=render_message(Msg.MATCH, ctx=ctx, check_id=self.check_id, what=what))
 
     async def _other_account(self, ctx: Context, what: dict) -> CheckResult | None:
