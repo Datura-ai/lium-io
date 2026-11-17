@@ -119,7 +119,8 @@ download_os_image() {
 passthrough_slots() {
     local gpus="${CVM_GPUS:-}"
     if [ -z "$gpus" ] && [ -f .env ]; then
-        gpus=$(sed -n 's/^CVM_GPUS=//p' .env | tail -n1 | tr -d '"'"'"' ')
+        # read it the way `new` does (source), so inline comments and quoting parse the same
+        gpus=$(set +u; source ./.env >/dev/null 2>&1; echo "${CVM_GPUS:-}")
     fi
     [ -z "$gpus" ] && return 0
     if [ "$gpus" = "all" ]; then
