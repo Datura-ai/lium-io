@@ -903,6 +903,21 @@ async def test_a_stale_split_nodes_freed_ports_that_no_longer_answer_are_not_cre
 
 
 @pytest.mark.asyncio
+async def test_a_stale_split_node_with_no_port_before_its_reprobe_is_judged_on_the_reprobe(context_factory):
+    """Reviewer's case: the stale rental held every declared port (40000-40002), so the first probe counted 0. The
+    re-probe finds those 3; an 8-way split node needs 24, so it is short, not passed on the floor of the old count."""
+    ctx = stale_split_ctx(context_factory, Firewalled(blocked=set()), 40002)
+
+    _, ctx = await apply(ctx, PortConnectivityCheck())
+    _, ctx = await apply(ctx, PortCountCheck())
+    tenant_result, _ = await apply(ctx, TenantEnforcementCheck())
+
+    assert ctx.state.specs["available_port_count"] == 0
+    assert tenant_result.passed is False
+    assert tenant_result.event.reason_code == PortCountMessages.INSUFFICIENT_PORTS.reason
+
+
+@pytest.mark.asyncio
 async def test_a_stale_split_nodes_reprobe_keeps_crediting_its_idle_fillers_ports(context_factory):
     """Reviewer's case: 40000-40023 declared, the closed rental held 40000-40002 and our idle filler holds
     40020-40023. The re-probe skips the filler's four like the first probe; they still count, so 20 + 4 = 24."""

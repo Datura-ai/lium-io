@@ -88,6 +88,19 @@ async def test_a_rental_that_ended_during_the_cycle_frees_ports_that_pass_on_the
 
 
 @pytest.mark.asyncio
+async def test_the_reprobe_measures_sysbox_again_after_a_filler_stop_failed_the_scrapes_test():
+    # the scrape's Sysbox test (its first DinD) failed while the filler held the node: state says no Sysbox
+    measured = replace(_result(FREED), sysbox_measured=True)
+    ctx = _ctx(probe=lambda *a, **k: measured)
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, sysbox_runtime=False)})
+
+    result = await PortCountCheck().run(ctx)
+
+    assert ctx.services.connectivity.verify_ports.call_args.args[3] is True  # sysbox-runc requested
+    assert result.updates["state"].sysbox_runtime is True
+
+
+@pytest.mark.asyncio
 async def test_freed_ports_that_do_not_answer_still_fail_insufficient_ports():
     result = await PortCountCheck().run(_ctx(probe=lambda *a, **k: _result([])))
 

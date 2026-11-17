@@ -122,7 +122,8 @@ async def _reprobe(
         ctx.ssh,
         ctx.miner_hotkey,
         ctx.executor,
-        ctx.state.sysbox_runtime,
+        # a filler stop can fail the scrape's own Sysbox test (its first DinD); the re-probe measures it again
+        True,
         rented_ports=pod_ports,
         rented_pod_names=pod_names,
         filler_ports=filler_ports,
@@ -165,6 +166,7 @@ async def _reprobe(
             port_probe_connection_lost=None,
             probe_excluded_ports=sorted(set(pod_ports) | set(filler_ports)),
             rented_data=after,
+            sysbox_runtime=ctx.state.sysbox_runtime or result.sysbox_measured is True,
         ),
         None,
     )

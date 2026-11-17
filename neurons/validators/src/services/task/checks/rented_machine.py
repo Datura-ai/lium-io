@@ -499,8 +499,11 @@ class TenantEnforcementCheck:
                     port_count_below_floor = port_count_below_listing_floor(judged)
                     # DAH-3698 (owner rule): only a rented split node is exempt from its per-split ports, so a
                     # node whose every listed pod is stale is idle and needs them, with or without the floor flag
-                    # gated on the count before the re-probe, as before it: below the floor, the floor reports it
-                    split_short = split_port_shortfall(ctx.state, reprobed.get("port_count"))
+                    # short when the node had the floor before or after its re-probe (0 then 3, or 21 then 0); below
+                    # the floor both times, the floor reports it
+                    split_short = split_port_shortfall(judged) or split_port_shortfall(
+                        ctx.state, reprobed.get("port_count")
+                    )
                     if split_short is not None:
                         event = split_ports_event(
                             ctx,
