@@ -59,6 +59,12 @@ def test_a_guard_without_one_service_reads_as_partial(tmp_path):
     assert _read(_host(tmp_path, text)) == ("partial", ["containerd"])
 
 
+def test_a_commented_out_rule_does_not_count(tmp_path):
+    text = _setup_script_guard().replace("$nrconf{override_rc}->{qr(^containerd)}", "# $nrconf{override_rc}->{qr(^containerd)}")
+
+    assert _read(_host(tmp_path, text)) == ("partial", ["containerd"])
+
+
 def test_a_host_without_needrestart_needs_no_guard(tmp_path):
     assert _read(_host(tmp_path, None, needrestart=False)) == ("no_needrestart", [])
 

@@ -749,7 +749,10 @@ def get_needrestart_guard(host_root="/proc/1/root"):
     unguarded = [
         service
         for service in NEEDRESTART_GUARD_SERVICES
-        if not re.search(r"qr\(\^" + re.escape(service) + r"\)\}\s*=\s*0\s*;", text)
+        # only a live assignment at the start of a line: Perl ignores a commented-out rule
+        if not re.search(
+            r"^[ \t]*\$nrconf\{override_rc\}->\{qr\(\^" + re.escape(service) + r"\)\}\s*=\s*0\s*;", text, re.M
+        )
     ]
     return ("partial" if unguarded else "present"), unguarded
 
