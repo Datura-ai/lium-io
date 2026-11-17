@@ -1,8 +1,9 @@
 """DAH-6379: the executor re-runs a restarted rental pod's sshd bootstrap, leaving encrypted pods to the validator."""
 
+import re
 from unittest.mock import MagicMock, call
 
-from services.pod_ssh_recovery_service import RESTART_JUPYTER, RESTART_SSHD, handle_event
+from services.pod_ssh_recovery_service import RESTART_JUPYTER, RESTART_SSHD, handle_event, sweep_running_pods
 
 
 def _start(name="pod_1", cid="abc", action="start"):
@@ -79,3 +80,49 @@ def test_a_reconnect_resumes_from_the_last_event_and_skips_the_replayed_one(monk
 
     assert sinces == [90, 100]
     assert handled == ["a", "b"]
+
+
+def test_a_live_jupyter_is_left_alone_and_the_guard_never_matches_its_own_command():
+    pattern = re.search(r"grep -qs '([^']+)'", RESTART_JUPYTER[2]).group(1)
+
+    assert re.search(pattern, "/opt/jupyter-env/bin/jupyter\0lab\0--port=8888")
+    assert not re.search(pattern, RESTART_JUPYTER[2])
+    assert RESTART_JUPYTER[2].index("&& exit 0") < RESTART_JUPYTER[2].index("exec sh")
+
+
+def test_the_startup_sweep_reruns_the_bootstrap_on_pods_started_before_the_watcher():
+    pod, filler = MagicMock(id="p1"), MagicMock(id="f1")
+    pod.name, filler.name = "pod_1", "filler_pod_1"
+    client = MagicMock()
+    client.containers.list.return_value = [pod, filler]
+    client.containers.get.return_value.attrs = {"Mounts": []}
+
+    sweep_running_pods(client)
+
+    client.containers.list.assert_called_once_with(filters={"name": "pod_", "status": "running"})
+    client.containers.get.assert_called_once_with("p1")
+
+
+def test_the_watcher_sweeps_once_not_on_every_reconnect(monkeypatch):
+    import services.pod_ssh_recovery_service as svc
+
+    calls, swept = [], []
+
+    def events(decode, since, filters):
+        calls.append(since)
+        if len(calls) == 1:
+            raise ConnectionError("stream dropped")
+        raise KeyboardInterrupt
+
+    client = MagicMock()
+    client.events.side_effect = events
+    monkeypatch.setattr(svc.docker, "from_env", lambda: client)
+    monkeypatch.setattr(svc.time, "sleep", lambda s: None)
+    monkeypatch.setattr(svc, "sweep_running_pods", lambda c: swept.append(c))
+
+    try:
+        svc._watch_forever()
+    except KeyboardInterrupt:
+        pass
+
+    assert len(calls) == 2 and swept == [client]

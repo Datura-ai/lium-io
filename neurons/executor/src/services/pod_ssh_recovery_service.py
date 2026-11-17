@@ -18,7 +18,13 @@ SSH_BOOTSTRAP = "/tmp/lium-ssh-bootstrap.sh"
 RESTART_SSHD = ["sh", "-c", f"[ -f {SSH_BOOTSTRAP} ] || exit 0; exec sh {SSH_BOOTSTRAP}"]
 # Written by run_jupyter.sh when the validator installs Jupyter, with the same token and port, so the link still works
 JUPYTER_RESTART = "/tmp/lium-jupyter-restart.sh"
-RESTART_JUPYTER = ["sh", "-c", f"[ -f {JUPYTER_RESTART} ] || exit 0; exec sh {JUPYTER_RESTART}"]
+# a live Jupyter (the startup sweep reaches pods that never stopped) is left alone; [j] keeps grep off its own cmdline
+RESTART_JUPYTER = [
+    "sh",
+    "-c",
+    f"[ -f {JUPYTER_RESTART} ] || exit 0; grep -qs '/opt/jupyter-env/bin/[j]upyter' /proc/[0-9]*/cmdline && exit 0; "
+    f"exec sh {JUPYTER_RESTART}",
+]
 CIPHER_MOUNT = "/lium-cipher"  # an encrypted pod's gocryptfs volume, as the validator and storage/workspace.py read it
 
 
@@ -45,15 +51,26 @@ def handle_event(event: dict, client) -> bool:
     return True
 
 
+def sweep_running_pods(client) -> None:
+    """A host or dockerd restart starts pods before the executor's watcher runs, so their starts predate its cursor."""
+    for container in client.containers.list(filters={"name": POD_PREFIX, "status": "running"}):
+        if container.name.startswith(POD_PREFIX):  # the name filter is a substring match
+            restart_sshd(client, container.id)
+
+
 def _watch_forever() -> None:
     # a reconnect resumes from the last event's second, so a pod restarted while the stream was down is still
     # recovered; the events of that second it replays are skipped by (id, timeNano). The cursor starts at the
     # watcher's start, so a drop before the first event still resumes from there, not from "now"
     since = int(time.time())
     seen: set = set()
+    swept = False
     while True:
         try:
             client = docker.from_env()
+            if not swept:
+                sweep_running_pods(client)
+                swept = True
             for event in client.events(decode=True, since=since, filters={"type": "container", "event": "start"}):
                 t = event.get("time")
                 if t != since:
