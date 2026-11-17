@@ -1164,6 +1164,32 @@ class CustomBuildOrphanSweepMessages:
     )
 
 
+class RentalEgressGuardMessages:
+    """Link-local egress drop for the rental network (see checks/rental_egress_guard.py)."""
+
+    SKIPPED = MessageTemplate(
+        event="Rental egress guard skipped",
+        reason="RENTAL_EGRESS_GUARD_SKIPPED",
+        severity="info",
+        category="prep",
+        impact="Proceed",
+    )
+    APPLIED = MessageTemplate(
+        event="Rental egress guard applied",
+        reason="RENTAL_EGRESS_GUARD_APPLIED",
+        severity="info",
+        category="prep",
+        impact="Proceed",
+    )
+    NOT_APPLIED = MessageTemplate(
+        event="Rental egress guard not applied",
+        reason="RENTAL_EGRESS_GUARD_NOT_APPLIED",
+        severity="warning",
+        category="prep",
+        impact="Proceed; retried at the next interval",
+    )
+
+
 class InspectorMessages:
     SKIPPED = MessageTemplate(
         event="Inspector validation skipped",
