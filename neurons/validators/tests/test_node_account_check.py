@@ -243,3 +243,43 @@ async def test_a_failed_or_stalled_read_hides_the_node_until_a_cycle_reads_it(re
     [entry] = availability_errors([result.event])
     assert (entry.reason_code, entry.reach_target) == ("NODE_ACCOUNT_UNVERIFIED", "node")
     assert entry.reason_code not in NODE_GPU_FAULT_CODES  # a reach failure: silenced with our own outage, like one
+
+
+class _Ssh:
+    """An asyncssh connection whose every command ends `outcome`: an exit status, None (no exit status) or a stall."""
+
+    def __init__(self, outcome):
+        self.outcome = outcome
+
+    async def run(self, cmd, input=None):  # noqa: A002
+        import asyncio
+        from types import SimpleNamespace
+
+        if self.outcome == "stall":
+            await asyncio.sleep(3600)
+        return SimpleNamespace(stdout="", stderr="", exit_status=self.outcome)
+
+
+@pytest.mark.parametrize("outcome, read_error", [(1, "exit 1"), (None, "no_exit_status"), ("stall", "timeout")])
+async def test_every_way_the_read_can_fail_is_refused(outcome, read_error, monkeypatch):
+    """Through the real runner: a nonzero exit, a channel closed without an exit status and a timeout (after its
+    retry) are all NODE_ACCOUNT_UNVERIFIED; the read that worked on an older executor passes (above)."""
+    from services.task import runner as runner_module
+    from services.task.checks import node_account as module
+
+    monkeypatch.setattr(module, "READ_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(runner_module.asyncio, "sleep", _no_wait(runner_module.asyncio.sleep))
+    monkeypatch.setattr(module, "has_live_rental", lambda ctx: False)
+    result = await NodeAccountCheck().run(_relay_ctx(runner_module.SSHCommandRunner(_Ssh(outcome))))
+    assert not result.passed and result.fatal
+    assert result.event.reason_code == "NODE_ACCOUNT_UNVERIFIED"
+    assert result.event.what_we_saw["read_error"] == read_error
+
+
+def _no_wait(sleep):
+    """The runner's back-off between attempts, skipped; the fake connection's own stall still sleeps."""
+
+    async def fast(delay):
+        await sleep(0 if delay < 60 else delay)
+
+    return fast
