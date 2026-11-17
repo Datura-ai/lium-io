@@ -454,7 +454,7 @@ class ValidationService:
         # CUDA_VISIBLE_DEVICES env prefix, and never reveals which card/signal disagreed (anti-treadmill).
         pin = shlex.quote(card_uuid) if card_uuid else str(index)
         command = (
-            f"CUDA_VISIBLE_DEVICES={pin} {executor_info.python_path} {script_path} {challenge.params}"
+            f"CUDA_VISIBLE_DEVICES={pin} {shlex.quote(executor_info.python_path)} {shlex.quote(script_path)} {challenge.params}"
         )
         try:
             result = await ssh_client.run(command, timeout=MATRIX_VERIFY_TIMEOUT_SECONDS)
@@ -791,7 +791,7 @@ class ValidationService:
                     validator_error=True,
                 )
 
-            command = f"{executor_info.python_path} {script_path} {verifier_params}"
+            command = f"{shlex.quote(executor_info.python_path)} {shlex.quote(script_path)} {verifier_params}"
             if gpu_uuid is not None:
                 # gpu_uuid comes from host-reported specs, so it is quoted
                 command = f"CUDA_VISIBLE_DEVICES={shlex.quote(gpu_uuid)} {command}"

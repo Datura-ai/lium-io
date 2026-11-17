@@ -11360,3 +11360,36 @@ def test_docker_time_reads_nanoseconds_and_offsets():
     assert docker_service_module._docker_time("2026-11-16T16:00:00+02:00") == datetime(
         2026, 11, 16, 14, 0, tzinfo=timezone.utc
     )
+
+
+@pytest.mark.asyncio
+async def test_generate_portMappings_skips_ports_a_port_check_holds_and_records_its_own(
+    docker_service, test_executor_id, test_miner_hotkey
+):
+    """DAH-6376 (4d077631): the batch port test held host port 20000 on the host network while a pod was given it.
+    A pod skips the ports a running check holds, and its own ports are recorded for the next check."""
+    docker_service.redis_service.probe_held_ports = AsyncMock(return_value={20000})
+    docker_service.redis_service.record_pending_pod_ports = AsyncMock()
+    available_raw = [PayloadPortMapping(internal_port=p, external_port=p, docker_port=None) for p in [20000, 20001]]
+
+    result, _ = await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, uuid4(), None, 1, available_ports_raw=available_raw, pod_mapping_raw=[]
+    )
+
+    assert {mapping[2] for mapping in result} == {20001}
+    docker_service.redis_service.record_pending_pod_ports.assert_awaited_once()
+    assert docker_service.redis_service.record_pending_pod_ports.await_args.args[:2] == (test_executor_id, [20001])
+
+
+@pytest.mark.asyncio
+async def test_generate_portMappings_keeps_held_ports_when_no_other_port_is_free(
+    docker_service, test_executor_id, test_miner_hotkey
+):
+    docker_service.redis_service.probe_held_ports = AsyncMock(return_value={20000})
+    available_raw = [PayloadPortMapping(internal_port=20000, external_port=20000, docker_port=None)]
+
+    result, _ = await docker_service.generate_portMappings(
+        test_miner_hotkey, test_executor_id, uuid4(), None, 1, available_ports_raw=available_raw, pod_mapping_raw=[]
+    )
+
+    assert {mapping[2] for mapping in result} == {20000}

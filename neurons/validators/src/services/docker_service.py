@@ -105,6 +105,7 @@ from services.const import (
     GPU_WEDGE_SWEEP_SETTLE_SECONDS,
     MIN_POD_PORT_COUNT,
     POD_CONTAINER_PREFIX,
+    POD_PORTS_PENDING_TTL_SECONDS,
     PREFERRED_POD_PORTS,
 )
 from services.container_cleanup import (
@@ -3798,7 +3799,11 @@ class DockerService:
         to `_PORT_COLLISION_REMAP_CAP` remaps. `port_maps` is updated in place so the create's answer
         carries the port the pod really got. With no free candidate a refused extra port (not SSH or
         Jupyter) is dropped from the pod and the run retried; otherwise no free candidate, or a refusal
-        after the last remap, fails the create as `RentalPortCollisionError`.
+        after the last remap, fails the create as `RentalPortCollisionError`. A refused SSH or Jupyter
+        mapping with no free candidate instead takes the pair of the last extra port whose host port is
+        not listening, dropping that extra port, and the run is retried; with no such extra port it
+        fails as `RentalPortCollisionError`. Each dropped mapping writes a warning to the pod's creation
+        log naming its container port.
 
         `remove_port_checks_listed_live` runs once, on the first bind refusal, before either retry;
         when it removed a port check, the run is retried at once on the same mapping.
@@ -3951,6 +3956,7 @@ class DockerService:
                         port_maps=port_maps,
                         spare_port_pairs=spare_port_pairs,
                         default_extra=default_extra,
+                        log_tag=log_tag,
                     )
                     if remapped_spec is not None:
                         ssh_port_map = self._find_mapping_by_docker_port(port_maps, 22)
@@ -4109,6 +4115,12 @@ class DockerService:
             )
             return False
 
+    async def _stream_port_dropped(self, docker_port: int, log_tag: str) -> None:
+        # the renter otherwise only sees the port missing from the pod's mappings
+        await self.stream_log(
+            f"TCP port {docker_port} is not published: no spare host-port pair was available.", "warning", log_tag
+        )
+
     async def _remap_colliding_port(
         self,
         *,
@@ -4118,13 +4130,14 @@ class DockerService:
         port_maps: list[tuple[int, int, int]],
         spare_port_pairs: list[PayloadPortMapping],
         default_extra: dict,
+        log_tag: str = "container_creation",
     ) -> ContainerRunSpec | None:
         """Move the mapping dockerd could not bind, and every other mapping of the pod whose host port the
         host's live listing shows taken, to the next free advertised pairs.
 
         Returns the run spec with the new host port, having rewritten `port_maps` in place and
         taken the pair out of `spare_port_pairs`; a mapping with no free pair left (not SSH or Jupyter)
-        is dropped from both instead. Returns None when the refusal names no host port
+        is dropped from both instead, and SSH or Jupyter then takes a free extra port's pair. Returns None when the refusal names no host port
         of this pod (the caller keeps the same-command wait). Raises `RentalPortCollisionError`
         when every candidate (≤ `_PORT_COLLISION_CANDIDATE_CAP`) is already listening on the host.
         """
@@ -4153,6 +4166,7 @@ class DockerService:
         ]
         moved: dict[int, int] = {}
         dropped: set[int] = set()
+        dropped_indices: set[int] = set()
         for i in to_move:
             docker_port, old_internal, old_external = port_maps[i]
             candidates = _port_collision_candidates(spare_port_pairs, after_host_port=old_internal)
@@ -4164,6 +4178,7 @@ class DockerService:
                 # DAH-6186: the pod already holds the node's whole range, so nothing is left to move
                 # to; one fewer extra port beats failing the rental
                 dropped.add(old_internal)
+                dropped_indices.add(i)
                 logger.warning(
                     _m(
                         "PORT_COLLISION_DROPPED",
@@ -4177,7 +4192,40 @@ class DockerService:
                         }),
                     )
                 )
+                await self._stream_port_dropped(docker_port, log_tag)
                 continue
+            if chosen is None and not candidates and i == index:
+                # SSH or Jupyter with the whole range held: take a free extra port's pair instead of failing
+                donor = next(
+                    (
+                        j
+                        for j in reversed(range(len(port_maps)))
+                        if j != index
+                        and port_maps[j][0] not in _PORT_COLLISION_KEPT_DOCKER_PORTS
+                        and (listening is None or port_maps[j][1] not in listening)
+                    ),
+                    None,
+                )
+                if donor is not None:
+                    donor_docker_port, donor_internal, donor_external = port_maps[donor]
+                    chosen = PayloadPortMapping(internal_port=donor_internal, external_port=donor_external)
+                    spare_port_pairs.append(chosen)  # the shared path below takes it out again
+                    dropped.add(donor_internal)
+                    dropped_indices.add(donor)
+                    logger.warning(
+                        _m(
+                            "PORT_COLLISION_DROPPED",
+                            extra=get_extra_info({
+                                **default_extra,
+                                "error_class": PORT_COLLISION_ERROR_CLASS,
+                                "docker_port": donor_docker_port,
+                                "old_host_port": donor_internal,
+                                "old_external_port": donor_external,
+                                "given_to_docker_port": docker_port,
+                            }),
+                        )
+                    )
+                    await self._stream_port_dropped(donor_docker_port, log_tag)
             if chosen is None:
                 if i != index:
                     continue  # docker run refuses it next and the following remap tries again
@@ -4205,7 +4253,7 @@ class DockerService:
                     }),
                 )
             )
-        port_maps[:] = [mapping for mapping in port_maps if mapping[1] not in dropped]
+        port_maps[:] = [mapping for j, mapping in enumerate(port_maps) if j not in dropped_indices]
         return dataclasses.replace(
             run_spec,
             ports=tuple(
@@ -4826,6 +4874,29 @@ class DockerService:
             )
             return None
 
+    async def _skip_probe_held_ports(self, executor_id: str, available_ports: dict, required_port_count: int) -> dict:
+        """The backend's free ports less those a running port check holds, unless too few would be left."""
+        try:
+            held = await self.redis_service.probe_held_ports(executor_id)
+        except Exception as e:
+            logger.warning(f"probe-held ports unknown for executor {executor_id}: {str(e)[:100]}")
+            return available_ports
+        free = {port: mapping for port, mapping in available_ports.items() if port not in held}
+        if len(free) == len(available_ports):
+            return available_ports
+        if len(free) < required_port_count:
+            # shortcut: the pod may then clash with the probe; waiting for the release would delay the rental
+            logger.warning(f"executor {executor_id}: a port check holds all but {len(free)} free ports, using them")
+            return available_ports
+        logger.info(f"executor {executor_id}: skipping {len(available_ports) - len(free)} ports a port check holds")
+        return free
+
+    async def _record_pending_pod_ports(self, executor_id: str, external_ports: list[int]) -> None:
+        try:
+            await self.redis_service.record_pending_pod_ports(executor_id, external_ports, POD_PORTS_PENDING_TTL_SECONDS)
+        except Exception as e:
+            logger.warning(f"pending pod ports not recorded for executor {executor_id}: {str(e)[:100]}")
+
     async def generate_portMappings(
         self,
         miner_hotkey: str,
@@ -4855,6 +4926,9 @@ class DockerService:
 
                 # SSH, plus Jupyter when enabled; the renter's other ports take what the backend offered
                 required_port_count = MIN_POD_PORT_COUNT + (1 if enable_jupyter else 0)
+                # DAH-6376: a running port check binds its ports on the host network, and a pod given one of
+                # them fails to bind it ("port is already allocated"). The backend's list does not know them.
+                available_ports = await self._skip_probe_held_ports(executor_id, available_ports, required_port_count)
                 if not pod_mapping and len(available_ports) < required_port_count:
                     logger.warning(
                         f"Insufficient ports available ({len(available_ports)}/{required_port_count}) "
@@ -4929,7 +5003,8 @@ class DockerService:
                     if mapping:
                         jupyter_port_map = (mapping[0], mapping[2])
 
-                # Port reservation now handled by backend
+                # Port reservation now handled by backend; a port check reads these until the backend lists them
+                await self._record_pending_pod_ports(executor_id, [mapping[2] for mapping in mappings])
 
                 return mappings, jupyter_port_map
 
