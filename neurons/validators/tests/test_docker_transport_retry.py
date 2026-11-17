@@ -406,3 +406,7 @@ async def test_a_host_gone_silent_fails_the_inspect_as_a_dropped_transport_not_a
         await _client(api_client).inspect_container_state(container_name="pod_test")
 
     assert "Docker SDK inspect container failed on a dropped SSH transport" in str(raised.value)
+    # and it holds the node: the re-open's own timeout must not hide the drop from the strict classifier
+    from services.docker_service import is_host_fault_create_failure
+
+    assert is_host_fault_create_failure("container_health_check", raised.value)
