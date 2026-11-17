@@ -3598,17 +3598,19 @@ async def test_retry_half_started_stop_does_not_stop_and_keeps_the_mark_when_the
     docker_service.redis_service.hdel.assert_not_awaited()
 
 
+@pytest.mark.parametrize("mount_exit", [2, 1], ids=["no_encrypted_volume", "encrypted_volume_unmounted"])
 @pytest.mark.parametrize(
     ("started_at", "expect_stop"),
     [("2026-11-16T14:00:00.123456789Z", True), ("2026-11-16T14:02:00Z", False)],
 )
 @pytest.mark.asyncio
 async def test_retry_half_started_stop_without_a_recorded_id_judges_the_run_by_its_start_time(
-    docker_service, monkeypatch, started_at, expect_stop
+    docker_service, monkeypatch, started_at, expect_stop, mount_exit
 ):
     # the id read failed at the failure: a run started by the failure time is the same one, a later start is a restart
+    # or a re-created container (gateway review: its mount may not have landed yet, it must not be stopped)
     monkeypatch.setattr("services.docker_service._HALF_STARTED_STOP_RETRY_SEC", 0)
-    _mount_reads(docker_service, monkeypatch)
+    _mount_reads(docker_service, monkeypatch, mount_exit)
     docker_service.redis_service.hget = AsyncMock(return_value=_pending_record(identity=""))
     client = docker_service.rental_docker_client_factory.client
     client.running = True
@@ -3921,13 +3923,12 @@ async def test_a_pending_stop_drops_a_container_re_created_under_its_name_withou
 @pytest.mark.parametrize(
     ("exit_status", "stops", "kept"),
     [
-        pytest.param(0, [], False, id="remounted_at_its_path_left_running"),
         pytest.param(1, ["pod_test"], False, id="encrypted_volume_unmounted_stopped"),
-        pytest.param(3, [], True, id="unread_kept_pending"),
+        pytest.param(3, [], True, id="mounted_somewhere_or_unread_kept_pending"),
     ],
 )
 @pytest.mark.asyncio
-async def test_a_pending_stop_without_a_recorded_path_reads_the_mount_at_any_path(
+async def test_a_pending_stop_without_a_recorded_path_never_takes_a_mount_as_its_own(
     docker_service, monkeypatch, exit_status, stops, kept
 ):
     # gateway review: a stale-mount recovery recorded "" and a later start remounted the same run at the real path
@@ -3949,12 +3950,13 @@ async def test_a_pending_stop_without_a_recorded_path_reads_the_mount_at_any_pat
 @pytest.mark.parametrize(
     ("mounts", "exit_status"),
     [
-        pytest.param("/lium-cipher /lium-cipher ext4 rw 0 0\n/lium-cipher /data fuse.gocryptfs rw 0 0\n", 0, id="mounted"),
+        # gateway review: with no recorded path a mount cannot be checked against the rental's destination
+        pytest.param("/lium-cipher /lium-cipher ext4 rw 0 0\n/lium-cipher /data fuse.gocryptfs rw 0 0\n", 3, id="mounted_at_an_unchecked_path"),
         pytest.param("/dev/vda1 /lium-cipher ext4 rw 0 0\n", 1, id="encrypted_volume_unmounted"),
         pytest.param("/dev/vda1 /etc/hosts ext4 rw 0 0\n", 2, id="no_encrypted_volume"),
     ],
 )
-def test_the_mount_probe_without_a_path_tells_mounted_unmounted_and_no_encrypted_volume(tmp_path, mounts, exit_status):
+def test_the_mount_probe_without_a_path_tells_unmounted_no_encrypted_volume_and_unchecked_mount(tmp_path, mounts, exit_status):
     docker = tmp_path / "docker"
     docker.write_text("#!/bin/sh\necho 4242\n")
     docker.chmod(0o755)

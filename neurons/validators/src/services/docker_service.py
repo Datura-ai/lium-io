@@ -2909,13 +2909,13 @@ _HALF_STARTED_STOPS_IN_FLIGHT: set[asyncio.Task] = set()
 def _encrypted_mount_probe(container_name: str, plaintext_path: str) -> str:
     """Host-side read of the pod's mount table (kernel-written, nothing run inside the renter's container): exit 0 when
     it holds its own /lium-cipher gocryptfs mount at the recorded path, 1 when it does not, anything else unknown.
-    With no recorded path: 0 for that mount at any path, 1 for an encrypted volume without it, 2 for a pod that has
-    no encrypted volume (no /lium-cipher in its mount table)."""
+    With no recorded path: unknown (3) for that mount, since its destination cannot be checked, 1 for an encrypted
+    volume without it, 2 for a pod that has no encrypted volume (no /lium-cipher in its mount table)."""
     check = (
         _gocryptfs_mount_check(plaintext_path, "/dev/stdin")
         if plaintext_path
         else f"awk -v source={_LIUM_CIPHER_MOUNT} "
-        "'$1 == source && $3 == \"fuse.gocryptfs\" {m=1} $2 == source {c=1} END {exit m ? 0 : (c ? 1 : 2)}' /dev/stdin"
+        "'$1 == source && $3 == \"fuse.gocryptfs\" {m=1} $2 == source {c=1} END {exit m ? 3 : (c ? 1 : 2)}' /dev/stdin"
     )
     return (
         f"p=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}}' {shlex.quote(container_name)}) || exit 3; "
@@ -12993,8 +12993,9 @@ class DockerService:
                         executor_info, private_key, container_name, plaintext_path
                     )
                 )
-                if mount == 2:
-                    # no encrypted volume, nothing it could write unencrypted: only the very run recorded is stopped
+                # no encrypted volume, nothing it could write unencrypted: only the very run recorded is stopped. With
+                # no recorded id a container under the name may be a re-created one not yet mounted: start time decides
+                if not replaced and (mount == 2 or not identity):
                     if identity:
                         same_run = current == identity
                     else:
@@ -13002,7 +13003,7 @@ class DockerService:
                         skew = _docker_time(await docker_client.host_time()) - datetime.now(timezone.utc)
                         started_at = _docker_time(current.rpartition("@")[2]) - skew
                         same_run = started_at <= datetime.fromisoformat(recorded_at)
-                if replaced or (mount == 2 and not same_run):
+                if replaced or ((mount == 2 or not identity) and not same_run):
                     logger.info(
                         _m(
                             "POD_HALF_STARTED_STOP_DROPPED_NOT_SAME_RUN",
