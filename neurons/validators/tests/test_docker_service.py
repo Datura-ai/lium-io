@@ -10172,6 +10172,10 @@ async def test_a_restarting_filler_whose_first_log_read_is_empty_is_read_again_b
         await real_sleep(0)
 
     monkeypatch.setattr("services.docker_service.asyncio.sleep", fake_sleep)
+    # other tasks in the loop sleep through the same stub (CI saw their 15 s waits): give the re-reads
+    # delays nothing else uses and count only those
+    reread_delays = (0.101, 0.102, 0.103)
+    monkeypatch.setattr("services.docker_service.FILLER_LOG_TAIL_REREAD_DELAYS_S", reread_delays)
 
     result = await _create_failing_at_add_public_keys(
         docker_service,
@@ -10182,7 +10186,8 @@ async def test_a_restarting_filler_whose_first_log_read_is_empty_is_read_again_b
 
     assert json.loads(result.detail.split(" >>> ", 1)[1])["container_logs_tail"] == "miner v2 starting"
     assert log_tail.await_count == 3
-    assert sleep_calls[:2] == [1, 2]  # every re-read waits for the restarting image first
+    # every re-read waits for the restarting image first
+    assert [d for d in sleep_calls if d in reread_delays] == [0.101, 0.102]
 
 
 @pytest.mark.asyncio
