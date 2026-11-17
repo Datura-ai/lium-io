@@ -735,18 +735,23 @@ NEEDRESTART_GUARD_SERVICES = ("sysbox", "docker", "containerd", "nvidia-fabricma
 
 
 def needrestart_data_line(line, literal, plain_setting):
-    # True if Perl only stores data on this line: a literal setting, a {/[ opener or closer, or one entry that is a
+    # What Perl stores on a data-only line, or None if the line may run code: ("set",), ("open", key) for
+    # $nrconf{key} = { or [, ("close",), or ("entry", pattern, value) for one hash/list entry, where the key is a
     # literal or a qr<delim>...<delim> that neither interpolates (@x, $x, ${...}) nor runs code ((?{...}))
-    if re.fullmatch(plain_setting, line) or re.fullmatch(r"[ \t]*\$nrconf\{\w+\}\s*=\s*[\[{]\s*([}\]]\s*;\s*)?(#.*)?", line):
-        return True
+    if re.fullmatch(plain_setting, line):
+        return ("set",)
+    opener = re.fullmatch(r"[ \t]*\$nrconf\{(\w+)\}\s*=\s*[\[{]\s*([}\]]\s*;\s*)?(#.*)?", line)
+    if opener:
+        return ("set",) if opener.group(2) else ("open", opener.group(1))
     if re.fullmatch(r"[ \t]*[}\]]\s*;\s*(#.*)?", line):
-        return True
-    rest = r"\s*(=>\s*" + literal + r"\s*)?,?\s*(#.*)?"
-    if re.fullmatch(r"[ \t]*" + literal + rest, line):
-        return True
+        return ("close",)
+    rest = r"\s*(?:=>\s*" + literal + r"\s*)?,?\s*(#.*)?"
+    entry = re.fullmatch(r"[ \t]*" + literal + rest, line)
+    if entry:
+        return ("entry", entry.group(1).strip("'\""), entry.group(3))
     start = re.match(r"[ \t]*qr([^\w\s])", line)
     if not start:
-        return False
+        return None
     opening = start.group(1)
     closing = {"(": ")", "{": "}", "[": "]", "<": ">"}.get(opening, opening)
     depth, i = 1, start.end()
@@ -758,13 +763,14 @@ def needrestart_data_line(line, literal, plain_setting):
             depth -= 1
             if depth == 0:
                 body = line[start.end() : i]
-                if re.search(r"[@$]#?[\w{:$]|\(\?\??\{", body):  # @. and a closing $ do not interpolate
-                    return False
-                return re.fullmatch(rest, line[i + 1 :]) is not None
+                after = re.fullmatch(rest, line[i + 1 :])
+                if re.search(r"[@$]#?[\w{:$]|\(\?\??\{", body) or not after:  # @. and a closing $ do not interpolate
+                    return None
+                return ("entry", body, after.group(1))
         elif line[i] == opening and opening != closing:
             depth += 1
         i += 1
-    return False
+    return None
 
 
 def get_needrestart_guard(host_root="/proc/1/root"):
@@ -833,13 +839,19 @@ def get_needrestart_guard(host_root="/proc/1/root"):
         elif not all((m := re.fullmatch(plain_setting, ln)) and m.group(1) != "override_rc" for ln in lines):
             return unknowable
     for lines in earlier:
+        block = None
         for ln in lines:
-            if not needrestart_data_line(ln, literal, plain_setting):
+            data = needrestart_data_line(ln, literal, plain_setting)
+            if data is None:
                 return unknowable
-            for rule in re.finditer(r"qr(?:\((.*?)\)|/(.*?)/|\{(.*?)\}|\[(.*?)\])\}?\s*(?:=>|=)\s*([^,;\s)]+)", ln):
-                pattern = next(g for g in rule.groups()[:4] if g is not None)
-                if pattern not in ["^" + s for s in NEEDRESTART_GUARD_SERVICES]:  # the guard file sets those keys
-                    other_rules.append((pattern, rule.group(5)))
+            if data[0] == "open":
+                block = data[1]
+            elif data[0] == "close":
+                block = None
+            elif data[0] == "entry" and block == "override_rc":
+                # the parser that accepted the line also gives its rule, so no delimiter is read one way and kept another
+                if data[1] not in ["^" + s for s in NEEDRESTART_GUARD_SERVICES]:  # the guard file sets those keys
+                    other_rules.append((data[1], data[2]))
     unguarded = []
     for service in NEEDRESTART_GUARD_SERVICES:
         overlapping = False

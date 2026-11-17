@@ -290,3 +290,34 @@ def test_a_main_config_that_does_not_load_the_guard_last_makes_it_partial(tmp_pa
         path.write_text(main)
 
     assert _read(host) == ("partial", ALL)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "qr<^container> => 1,",
+        "qr!^container! => 1,",
+        "qr(^container) => 1,",
+        "qr{^container} => '1',",
+        "'^container' => 1,",  # needrestart matches each key as a regex, a plain string too
+        "qr(^container),",  # no value: not a zero
+    ],
+)
+def test_an_overlapping_rule_in_any_delimiter_in_an_earlier_block_unguards_the_unit(
+    tmp_path, entry
+):
+    host = _host(tmp_path, _setup_script_guard())
+    (host / "etc/needrestart/needrestart.conf").write_text(
+        "$nrconf{override_rc} = {\n    qr(^dbus) => 0,\n    " + entry + "\n};\n" + LOADER
+    )
+
+    assert _read(host) == ("partial", ["containerd"])
+
+
+def test_an_overlapping_entry_outside_override_rc_is_not_a_restart_rule(tmp_path):
+    host = _host(tmp_path, _setup_script_guard())
+    (host / "etc/needrestart/needrestart.conf").write_text(
+        "$nrconf{override_cont} = {\n    qr<^container> => 1,\n};\n" + LOADER
+    )
+
+    assert _read(host) == ("present", [])
