@@ -26,7 +26,7 @@ from services.inspector_validation_service import InspectorValidationService
 from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import PodContainerState
-from .availability import REASONS_THAT_HIDE_AT_ONCE
+from .availability import REASONS_THAT_HIDE_AT_ONCE, AvailabilityErrorCode
 from .messages import NodeAccountMessages, RentalVerificationMessages, TenantEnforcementMessages, render_message
 from .models import ValidationEvent
 from .runner import SSHCommandResult, SSHCommandRunner
@@ -370,6 +370,9 @@ class Context(BaseModel):
     # False once a card is below its reported GPU model (DAH-6241); non-fatal on a live rental, so the score
     # gate lives in calculate_scores.
     gpu_model_passed: bool = True
+    # False once NodeAccountCheck finds the node on another account's machine (DAH-6539); non-fatal on a live
+    # rental, so the score gate lives in calculate_scores.
+    node_account_passed: bool = True
     # G1 — NVIDIA CC GPU attestation outcome: True/False when verified, None when
     # not performed (non-CVM node, no evidence supplied, or NRAS undeterminable).
     gpu_attestation_passed: bool | None = None
@@ -640,11 +643,19 @@ def _not_terminal(ran: _RanCheck) -> _RanCheck:
     return replace(ran, result=ran.result.model_copy(update={"fatal": False, "halt": False}))
 
 
+_NOT_THE_ACCOUNTS_MACHINE = frozenset(
+    {NodeAccountMessages.MISMATCH.reason, NodeAccountMessages.BINDING_UNVERIFIED.reason}
+)
+
+
 def _a_finding(ran: _RanCheck) -> bool:
     # a fault the check finished reading stays the run's verdict: hiding the node and publishing it key on the last event;
     # its extra events count too (the GPU recheck's failure carries GPU_LOST there)
+    # NODE_ACCOUNT_UNVERIFIED is a read that did not finish, not a fault read off the node: a dropped session is
+    # reconnected and the read run again (DAH-6539, Sergej lio#2288 at 72215ea)
     return any(
-        event.is_availability_error or event.reason_code in REASONS_THAT_HIDE_AT_ONCE
+        (event.is_availability_error or event.reason_code in REASONS_THAT_HIDE_AT_ONCE)
+        and event.reason_code != AvailabilityErrorCode.NODE_ACCOUNT_UNVERIFIED
         for event in [ran.result.event, *ran.result.extra_events]
     )
 
@@ -831,8 +842,10 @@ class Pipeline:
 
     async def run(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
         passed, events, end_ctx = await self._run_checks(ctx)
-        if any(event.reason_code == NodeAccountMessages.MISMATCH.reason for event in events):
-            return passed, events, end_ctx  # another account's machine answered: no completion step touches it
+        # another account's machine answered, or the machine could not be confirmed as the account's (a read that
+        # still failed after the reconnect, which a relay can cause): no completion step touches it (DAH-6539)
+        if any(event.reason_code in _NOT_THE_ACCOUNTS_MACHINE for event in events):
+            return passed, events, end_ctx
         for chk in self.on_completion:
             try:
                 res = await chk.run(end_ctx)

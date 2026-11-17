@@ -164,6 +164,13 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append("A GPU is not the model the node reports")
 
+    # Node account gate (DAH-6539): a rented node on another account's machine scores 0; its renter's pod runs on and
+    # is billed as usual.
+    if not ctx.node_account_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("The node is not on the machine its account registered")
+
     # EMA verifyx download speed check — threshold enforced upstream in VerifyXCheck
     ema_verifyx_download = ((ctx.state.specs or {}).get("network") or {}).get(
         "ema_verifyx_download_speed"
