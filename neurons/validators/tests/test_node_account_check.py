@@ -223,3 +223,9 @@ async def test_a_rented_node_on_another_accounts_machine_finishes_its_rental(ren
     result = await NodeAccountCheck().run(_relay_ctx(_HostFiles("hotkey=5Victim\nclaim=\n")))
     assert not result.passed and result.event.reason_code == "NODE_ACCOUNT_MISMATCH"
     assert result.fatal is (not rented)
+    # an availability entry: the backend hides the node, so a partly rented one takes no rental on its free GPUs
+    from services.task.availability import NODE_GPU_FAULT_CODES, availability_errors
+
+    [entry] = availability_errors([result.event])
+    assert (entry.reason_code, entry.reach_target) == ("NODE_ACCOUNT_MISMATCH", "node")
+    assert entry.reason_code in NODE_GPU_FAULT_CODES  # never silenced as our own outage

@@ -24,6 +24,7 @@ from core.utils import _m, get_extra_info, get_logger
 from services.node_host import host_key_body, is_ip_literal, registered_host_keys
 
 from ..messages import NodeAccountMessages as Msg, render_message
+from ..availability import ReachSource, ReachTarget
 from ..pipeline import CheckResult, Context
 from .banned_provider import has_live_rental
 
@@ -73,10 +74,7 @@ class NodeAccountCheck:
             return CheckResult(passed=True, event=render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what=what))
 
         if presented_host_key(ctx) not in expected:
-            event = render_message(Msg.MISMATCH, ctx=ctx, check_id=self.check_id, what=what)
-            return CheckResult(
-                passed=False, event=event, updates={"clear_verified_job_info": True}, fatal=not has_live_rental(ctx)
-            )
+            return _refused(ctx, self.check_id, Msg.MISMATCH, what)
         return CheckResult(passed=True, event=render_message(Msg.MATCH, ctx=ctx, check_id=self.check_id, what=what))
 
     async def _other_account(self, ctx: Context, what: dict) -> CheckResult | None:
@@ -101,8 +99,14 @@ class NodeAccountCheck:
             if expected_claim and hotkey == ctx.miner_hotkey and not claim:
                 logger.info(_m("NODE_ACCOUNT_BINDING_UNVERIFIED", extra=get_extra_info({**what, "unread": "claim"})))
             return None
-        event = render_message(Msg.BINDING_MISMATCH, ctx=ctx, check_id=self.check_id, what=what)
-        # like the ban checks: a rented node finishes its rental and, failing fatally once it is free, takes no new one
-        return CheckResult(
-            passed=False, event=event, updates={"clear_verified_job_info": True}, fatal=not has_live_rental(ctx)
-        )
+        return _refused(ctx, self.check_id, Msg.BINDING_MISMATCH, what)
+
+
+def _refused(ctx: Context, check_id: str, template, what: dict) -> CheckResult:
+    """Like GPU_MODEL_MISMATCH: an availability entry, so the backend hides the node and refuses new rentals on its
+    free GPUs too; fatal only without a live rental, so a renter's pod runs on and is still verified."""
+    what = {**what, "reach_source": str(ReachSource.VALIDATOR), "reach_target": str(ReachTarget.NODE)}
+    event = render_message(template, ctx=ctx, check_id=check_id, what=what)
+    return CheckResult(
+        passed=False, event=event, updates={"clear_verified_job_info": True}, fatal=not has_live_rental(ctx)
+    )
