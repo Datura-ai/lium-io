@@ -1781,9 +1781,8 @@ _PARK_COMMAND_TIMEOUT_SECONDS = 60
 _EDIT_PARKED_RECORD_TIMEOUT_SECONDS = 2
 # the undo's bring-up (start, gocryptfs remount, sshd bootstrap) is several SDK and SSH steps, not one command
 _RESTORE_BRING_UP_TIMEOUT_SECONDS = 300
-# DAH-6226: with a limit of one, a pod whose replacement also wrote renter files could never be rebooted again (it
-# stayed REBOOT_FAILED while running and billed); a few copies per pod bound the disk without stranding the pod
-_MAX_KEPT_CONTAINERS_PER_POD = 3
+# copying the renter files of a parked layer onto the pod's kept copy: a renter may have written gigabytes unmounted
+_KEPT_COPY_TIMEOUT_SECONDS = 900
 
 
 class KeptContainersNotRemoved(RuntimeError):
@@ -1971,6 +1970,8 @@ class _EditSwap:
         self.plaintext_path: str | None = None
         # the parked container's layer holds renter files under the plaintext path: kept, never removed, after a successful edit
         self.keep_parked = False
+        # DAH-6226: those files were copied onto the pod's one earlier kept copy, so the parked one goes like a clean one
+        self.copied_to_kept = False
         # the overlay upper dir the last layer read used
         self._upper_dir: str | None = None
         # the plaintext path was mounted when parked (None: unknown); a failed edit restores that, kept or not
@@ -2072,12 +2073,6 @@ class _EditSwap:
         )
         # the containerd store names the upper dir only in a running container's mounts: the stopped read reuses it
         upper_dir = self._upper_dir
-        if self.keep_parked and len(kept) >= _MAX_KEPT_CONTAINERS_PER_POD:
-            # repeated edits must not pile kept layers onto the host's disk without bound
-            raise Exception(
-                f"[park_current_container] {len(kept)} containers kept from earlier edits ({kept[0]}) are still on the "
-                "host and this one holds renter files under the volume path too; the pod was left as it was"
-            )
         # every candidate is parked under the protected kept name, before the stop: no later rename can fail and leave
         # renter files written during the shutdown to a sweep; a clean one is removed by ID after the edit
         parked = recover_kept or f"{kept_prefix}{int(time.time())}"
@@ -2120,15 +2115,31 @@ class _EditSwap:
             container_id, upper_dir, already_kept=bool(recover_kept)
         ):
             # a write between the running read and the stop (or by its shutdown) shows only on the stopped layer:
-            # decided here, before the replacement exists, so the kept limit holds; a failed edit brings it back unmounted
+            # decided here, before the replacement exists; a failed edit brings it back unmounted
             self.keep_parked = True
-            if len(kept) >= _MAX_KEPT_CONTAINERS_PER_POD:
-                raise Exception(
-                    f"[park_current_container] {len(kept)} containers kept from earlier edits ({kept[0]}) are still on "
-                    "the host and this one wrote renter files under the volume path while it stopped; the pod was restored"
-                )
+        if self.keep_parked and kept:
+            # one rolling kept copy per pod: an earlier one takes these files too, so the count never grows
+            await self._copy_into_kept(parked, ids_by_name.get(kept[-1]) or kept[-1])
         logger.info(_m("Parked current container for edit", extra=get_extra_info({**self.default_extra, "parked": parked})))
         return parked
+
+    async def _copy_into_kept(self, parked: str, kept: str) -> None:
+        """Copy the parked layer's files under the plaintext path onto the earlier kept copy, newer files over older.
+        Both are stopped, so each path is its layer, not the FUSE mount. A failure fails the edit; the pod comes back."""
+        if not self.plaintext_path:
+            raise Exception("[park_current_container] the pod's volume path is unknown; the pod was restored")
+        path = self.plaintext_path.rstrip("/")
+        copy = (
+            f"set -o pipefail; /usr/bin/docker cp {shlex.quote(f'{parked}:{path}/.')} - "
+            f"| /usr/bin/docker cp - {shlex.quote(f'{kept}:{path}')}"
+        )
+        copied = await _run_with_host_timeout(self.ssh_client, f"bash -c {shlex.quote(copy)}", _KEPT_COPY_TIMEOUT_SECONDS)
+        if copied.exit_status != 0:
+            raise Exception(
+                f"[park_current_container] the renter files could not be copied onto the pod's kept copy ({kept}): "
+                f"{(copied.stderr or '').strip() or f'exit {copied.exit_status}'}; the pod was restored"
+            )
+        self.copied_to_kept = True
 
     async def _plaintext_mounted(self, container: str) -> bool | None:
         """Whether the container has a mount at the plaintext path (a stopped one has none); None when that cannot be read."""
@@ -2252,7 +2263,7 @@ class _EditSwap:
             if exc is None or self.replacement_is_up or isinstance(exc, _CreateCancelledByDelete):
                 # Replacement is up (or the pod was deleted meanwhile): the old container is now the
                 # stale one. Best effort — a wedged remove is left to the next edit's clean-leftover removal.
-                if self.keep_parked:
+                if self.keep_parked and not self.copied_to_kept:
                     # the renter's files written while the volume was unmounted live only in this container's layer
                     logger.error(
                         _m("PARKED_CONTAINER_KEPT_VOLUME_UNMOUNTED", extra=get_extra_info({**self.default_extra, "kept_as": self.parked_name}))
