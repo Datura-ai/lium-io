@@ -4084,6 +4084,28 @@ def _pull_wrapped_not_reopened() -> Exception:
         return wrapped
 
 
+def test_a_failure_diagnosed_above_an_unreopened_transport_keeps_its_own_step():
+    """The key injection lost its transport, then an inspect found the container OOM-killed or its image exited:
+    that diagnosis is the cause, not the node's SSH endpoint."""
+    from services.docker_service import ContainerKilledDuringBootstrap, ImageExitedDuringKeyInjection
+    from services.rental_docker_sdk import is_transport_not_reopened
+
+    def raised_from_refusal(diagnosis: Exception) -> Exception:
+        try:
+            raise diagnosis from _pull_wrapped_not_reopened()
+        except Exception as exc:
+            return exc
+
+    killed = ContainerKilledDuringBootstrap(
+        container_name="pod_x", bootstrap_step="inject_keys", state=None, detail="OOM-killed"
+    )
+    exited = ImageExitedDuringKeyInjection("image exited")
+
+    assert not is_transport_not_reopened(raised_from_refusal(killed))
+    assert not is_transport_not_reopened(raised_from_refusal(exited))
+    assert is_transport_not_reopened(_pull_wrapped_not_reopened())
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("pull_error", "expected_step"),

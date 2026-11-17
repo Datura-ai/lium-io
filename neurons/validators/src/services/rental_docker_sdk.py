@@ -149,6 +149,11 @@ class RentalDockerTransportNotReopened(RentalDockerTransportError):
     answering, as at the connect step, whatever the call was doing."""
 
 
+class RentalDockerReconnectFailed(RentalDockerTransportDropped):
+    """The adapter found the SSH session dead and could not connect again (docker-py asked for a connection
+    during a call's retry): the node stopped answering, like `RentalDockerTransportNotReopened`."""
+
+
 def _iter_exception_chain(exc: BaseException) -> Iterator[BaseException]:
     seen: set[int] = set()
     stack: list[BaseException | None] = [exc]
@@ -270,13 +275,18 @@ def is_docker_not_found_error(exc: BaseException) -> bool:
 
 
 def is_transport_not_reopened(exc: BaseException) -> bool:
-    """True when `exc` or an explicit cause under it is a transport that could not be re-opened."""
+    """True when `exc` is a transport that could not be re-opened, or only plain Docker-call wrappers over one.
+
+    The walk stops at anything else: a failure diagnosed above the transport (the container was OOM-killed, its
+    image exited) is the cause even when its own cause is the dropped transport."""
     seen: set[int] = set()
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if isinstance(current, RentalDockerTransportNotReopened):
+        if isinstance(current, (RentalDockerTransportNotReopened, RentalDockerReconnectFailed)):
             return True
+        if type(current) not in (RentalDockerOperationError, RentalDockerTransportError):
+            return False
         current = current.__cause__  # e.g. pull() wraps it in RentalDockerOperationError
     return False
 
@@ -1854,7 +1864,7 @@ def _build_rental_ssh_http_adapter_class(
                     try:
                         self._connect()
                     except Exception as exc:
-                        raise RentalDockerTransportDropped(
+                        raise RentalDockerReconnectFailed(
                             "the SSH session to the executor dropped and could not be re-opened: "
                             f"{_error_text(exc)}"
                         ) from exc
