@@ -33,7 +33,7 @@ cp .env.example .env
 # Edit .env with your settings:
 # - MINER_HOTKEY_SS58_ADDRESS
 # - SSH_PORT
-# - RENTING_PORT_RANGE
+# - RENTING_PORT_RANGE (comma list, e.g. "19001,19002,19003"; no dash ranges)
 # - CVM_VCPUS, CVM_MEMORY, CVM_DISK
 # - CVM_GPUS (e.g., "all" or "19:00.0,3b:00.0")
 ```

@@ -391,9 +391,9 @@ new_cvm() {
             fi
         done
     elif [ -n "$RENTING_PORT_RANGE" ]; then
-        # Parse RENTING_PORT_RANGE: "40000-65535" or "9001,9002,9003"
+        # Comma list only: each port becomes its own QEMU forward
         if [[ "$RENTING_PORT_RANGE" == *"-"* ]]; then
-            log_error "Range format is not supported"
+            log_error "RENTING_PORT_RANGE takes a comma list (e.g. \"19001,19002,19003\"), not a dash range"
             return 1
         else
             # Comma-separated format: "9001,9002,9003"
