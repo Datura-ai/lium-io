@@ -116,6 +116,19 @@ GPU_REFERENCE_TABLE: dict[str, tuple[float, tuple[int, ...]]] = {
 }
 
 
+# memory-modded cards (DAH-5508/DAH-6595) are priced for the mod, not the memory: never an unknown card's reference
+NEVER_A_REFERENCE = frozenset(
+    {
+        "NVIDIA GeForce RTX 2080 Ti 22GB",
+        "NVIDIA GeForce RTX 3080 20GB",
+        "NVIDIA GeForce RTX 4080 32GB",
+        "NVIDIA GeForce RTX 4080 SUPER 32GB",
+        "NVIDIA GeForce RTX 4090 48GB",
+        "NVIDIA GeForce RTX 4090 D 48GB",
+    }
+)
+
+
 def pick_reference(vram_mib: float | None) -> str | None:
     """The cheapest candidate with a nominal size within REFERENCE_VRAM_BAND of `vram_mib` (MiB, as
     nvidia-smi reports it), else the cheapest with the largest size below it; a price tie goes to
@@ -126,6 +139,7 @@ def pick_reference(vram_mib: float | None) -> str | None:
     sizes = [
         (size_gb * 1024, price, model)
         for model, (price, sizes_gb) in GPU_REFERENCE_TABLE.items()
+        if model not in NEVER_A_REFERENCE
         for size_gb in sizes_gb
     ]
     in_band = [(price, model) for size, price, model in sizes if low <= size / vram_mib <= high]

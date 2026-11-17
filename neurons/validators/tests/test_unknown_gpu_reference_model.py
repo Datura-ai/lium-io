@@ -21,6 +21,7 @@ from services.gpu_precheck import UnsupportedGpuModelError, precheck_gpu_spec
 from services.gpu_reference_table import GPU_REFERENCE_TABLE
 from services.gpu_spec_table import (
     GPU_VRAM_SIZES_MB,
+    MODDED_VRAM_MODELS,
     VRAM_FLOOR_RATIO,
     matmul_probe_vram_mb,
     reference_gpu_model,
@@ -34,9 +35,9 @@ from tests.test_rental_price_incentive_flow import _make_pcc_job
 UNKNOWN = "NVIDIA RTX Future 9000"
 # lium-platform keeps a byte-identical apps/lium/backend/apps/server/src/core/gpu_reference_table.py
 # and pins the same hash
-GPU_REFERENCE_TABLE_SHA256 = "65e60281e1d4c05c30f893557bddf6535cca4be46b5bc01cfa5836313260d7ef"
+GPU_REFERENCE_TABLE_SHA256 = "5cf72997587855b88e122d8e8b3d5575395ae99714e56cc706eca681534aa355"
 PRICES = {model: price for model, (price, _) in GPU_REFERENCE_TABLE.items()}
-CANDIDATES = list(GPU_REFERENCE_TABLE)
+CANDIDATES = [m for m in GPU_REFERENCE_TABLE if m not in gpu_reference_table.NEVER_A_REFERENCE]
 
 
 def _in_band(model: str, vram_mb: int) -> bool:
@@ -75,7 +76,7 @@ PARITY_CASES = [
     (24564, "NVIDIA Tesla P40"),
     (30000, "NVIDIA GeForce RTX 5090 D"),
     (40960, "NVIDIA CMP 170HX"),
-    (49140, "NVIDIA GeForce RTX 4090 D 48GB"),  # DAH-6595: the cheapest 48 GB card (0.18 < Quadro RTX 8000 0.21)
+    (49140, "NVIDIA Quadro RTX 8000"),
     (81559, "NVIDIA A800 80GB PCIe"),
     (97871, "NVIDIA H800 NVL"),
     (143771, "NVIDIA H200 NVL"),
@@ -86,6 +87,24 @@ PARITY_CASES = [
 
 @pytest.mark.parametrize(("vram_mb", "reference"), PARITY_CASES)
 def test_the_reference_matches_the_backends(vram_mb, reference):
+    assert reference_gpu_model(UNKNOWN, vram_mb) == reference
+
+
+def test_the_modded_models_are_exactly_the_ones_never_a_reference():
+    assert gpu_reference_table.NEVER_A_REFERENCE == set(MODDED_VRAM_MODELS)
+
+
+# DAH-6595: an unknown card with a modded card's memory keeps the reference it had before the modded models
+@pytest.mark.parametrize(
+    ("vram_mb", "reference"),
+    [
+        (20480, "NVIDIA RTX A4500"),
+        (22528, "NVIDIA Tesla P40"),
+        (32768, "NVIDIA GeForce RTX 5090 D"),
+        (49140, "NVIDIA Quadro RTX 8000"),
+    ],
+)
+def test_an_unknown_card_of_a_modded_size_is_never_paid_as_a_modded_model(vram_mb, reference):
     assert reference_gpu_model(UNKNOWN, vram_mb) == reference
 
 
