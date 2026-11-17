@@ -12988,12 +12988,17 @@ class DockerService:
                 replaced = current is None or bool(identity) and current.partition("@")[0] != identity.partition("@")[0]
                 failed_at = datetime.fromisoformat(recorded_at)
                 if not replaced and not identity:
-                    # Created/StartedAt are on the host's clock, recorded_at on ours: undo the offset before comparing
-                    skew = _docker_time(await docker_client.host_time()) - datetime.now(timezone.utc)
+                    # Created/StartedAt are on the host's clock, recorded_at on ours. The host read its clock between
+                    # our send and our receipt, so the offset lies in [host - received, host - sent]: the reply's delay
+                    # is not offset. Each verdict below takes the bound that errs to its safe side (F-66/F-64).
+                    sent = datetime.now(timezone.utc)
+                    host_now = _docker_time(await docker_client.host_time())
+                    skew_low, skew_high = host_now - datetime.now(timezone.utc), host_now - sent
                     # with no recorded id, creation time tells a re-created container (its mount may not have landed
-                    # yet) from the recorded one restarted by Docker, which keeps its creation time
+                    # yet) from the recorded one restarted by Docker, which keeps its creation time; re-created (no
+                    # mount read) only when created after the failure at the earliest our clock allows
                     created_at = _docker_time(await docker_client.container_created(container_name=container_name))
-                    replaced = created_at - skew > failed_at
+                    replaced = created_at - skew_high > failed_at
                 # a Docker auto-restart (unless-stopped) keeps the container and changes StartedAt: the mount decides
                 mount = (
                     None
@@ -13007,7 +13012,8 @@ class DockerService:
                     if identity:
                         same_run = current == identity
                     else:
-                        same_run = _docker_time(current.rpartition("@")[2]) - skew <= failed_at
+                        # stopped only when started by the failure at the latest our clock allows
+                        same_run = _docker_time(current.rpartition("@")[2]) - skew_low <= failed_at
                 if replaced or (mount == 2 and not same_run):
                     logger.info(
                         _m(

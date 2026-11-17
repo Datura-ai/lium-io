@@ -11723,3 +11723,32 @@ async def test_generate_portMappings_keeps_held_ports_when_no_other_port_is_free
     )
 
     assert {mapping[2] for mapping in result} == {20000}
+
+
+@pytest.mark.asyncio
+async def test_retry_half_started_stop_without_a_recorded_id_does_not_take_a_slow_host_time_reply_for_clock_skew(
+    docker_service, monkeypatch
+):
+    # F-66/F-64: synchronized clocks, created 14:00:04.5, failure recorded 14:00:05, Docker's clock reply arrives 1 s
+    # after it was read: taking the delay as skew moved creation past the failure and dropped the stop unread
+    run = _mount_reads(docker_service, monkeypatch, 1)
+    docker_service.redis_service.hget = AsyncMock(return_value=_pending_record(identity="", plaintext_path="/workspace"))
+    client = docker_service.rental_docker_client_factory.client
+    client.running = True
+    client.identity = "cid@2026-11-16T14:00:04.5Z"
+    client.created = "2026-11-16T14:00:04.5Z"
+    read_host_time = client.host_time
+
+    async def slow_reply():
+        sampled = await read_host_time()
+        await asyncio.sleep(1)
+        return sampled
+
+    client.host_time = slow_reply
+
+    stopped = await docker_service.retry_half_started_stop(
+        executor_info=Mock(uuid="exec-1"), private_key="private-key", pod_id="pod-id", default_extra={}
+    )
+
+    run.assert_awaited()
+    assert stopped is True and client.stopped_containers == ["pod_test"]
