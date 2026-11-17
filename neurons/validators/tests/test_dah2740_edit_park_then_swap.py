@@ -33,6 +33,7 @@ from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS
 from services.hung_gpu_reset import HUNG_GPU_QUERY_COMMAND, HungGpuResult
 from services.redis_service import GPU_RESET_PENDING_KIND
 from services.prerun_host_probe import prerun_host_probe_command
+from helpers import shared_pod_start_stop_lock
 
 
 @pytest.fixture(autouse=True)
@@ -48,6 +49,7 @@ def svc():
     # the same service test_deploy_optimizations builds; a local fixture rather than an import, which
     # pyflakes reads as a name every `svc` parameter below redefines (F811)
     service = DockerService(ssh_service=Mock(), redis_service=Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True)), attestation_service=Mock())
+    service.redis_service.pod_start_stop_lock = shared_pod_start_stop_lock({})
     # the pre-run kernel.pid_max read is mandatory and the SSH doubles here do not model /proc
     service._read_host_pid_max = AsyncMock(return_value=4_194_304)
     service._read_host_ram_kib = AsyncMock(return_value=None)
@@ -906,6 +908,7 @@ async def test_the_undo_repairs_a_stale_vloopback_mountpoint_left_by_park_and_st
     async def bring_up():
         await svc._bring_up_existing_container(
             executor_info=Mock(uuid="exec-1"),
+            private_key="private-key",
             docker_client=docker_client,
             ssh_client=ssh,
             container_name="pod_abc",
@@ -1560,7 +1563,8 @@ async def test_only_a_start_of_a_stopped_container_records_a_validator_start(svc
     ssh = Mock(run=AsyncMock())
 
     await svc._bring_up_existing_container(
-        executor_info=Mock(uuid="exec-1"), docker_client=docker_client, ssh_client=ssh, container_name="pod_x",
+        executor_info=Mock(uuid="exec-1"), private_key="private-key", docker_client=docker_client, ssh_client=ssh,
+        container_name="pod_x",
         local_volume_path="/root",
         pod_id="x", default_extra={}, remount=remount,
     )

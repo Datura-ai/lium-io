@@ -24,6 +24,7 @@ from payload_models.payloads import (
     WorkloadKind,
 )
 import services.docker_service as docker_service_module
+from helpers import shared_pod_start_stop_lock
 from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService, _is_vloopback_driver, _s3fs_plugin_alias
 from services.rental_docker_sdk import (
     ContainerExecResult,
@@ -201,6 +202,7 @@ def docker_service():
     lock.__aenter__ = AsyncMock(return_value=lock)
     lock.__aexit__ = AsyncMock(return_value=None)
     redis_service.acquire_executor_lock = Mock(return_value=lock)
+    redis_service.pod_start_stop_lock = shared_pod_start_stop_lock({})
     service = DockerService(
         ssh_service=ssh_service,
         redis_service=redis_service,

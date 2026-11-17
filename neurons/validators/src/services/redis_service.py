@@ -212,6 +212,9 @@ EXPRESS_LANE_FIRST_SEEN_TTL_SECONDS = 2 * 3600
 # Distributed lock settings
 EXECUTOR_LOCK_TIMEOUT = 30  # TTL for lock auto-release (seconds)
 EXECUTOR_LOCK_BLOCKING_TIMEOUT = 10  # Time to wait for lock acquisition (seconds)
+# a pod's start/remount and its pending stop's retry (pod_start_stop_lock): renewed while held, so only a dead
+# holder's lock lapses, this long after it died
+POD_START_STOP_LOCK_TTL = 30
 # DAH-3436 (review): the per-executor CREATE lock. `create_container` sweeps every `pod_*` container it
 # is not told about, so two creates on one node must not overlap: a renter's create holds this lock from
 # before its call until create_container returns (executor_create_exclusion); the rental probe takes it
@@ -532,6 +535,39 @@ class RedisService:
                             extra={"error": str(e)},
                         )
                     )
+
+    @asynccontextmanager
+    async def pod_start_stop_lock(self, slot: str):
+        """Held by every start and remount of one pod and by its pending half-started stop's retry, in the validator
+        and the connector alike (separate processes): a retry that read the pod unmounted can then never stop a run
+        the other process started and remounted meanwhile. Waits while another holder has it. Yields False when Redis
+        is unreachable: a start goes ahead (it never refuses a renter), a stop's retry stays pending."""
+        lock = aioredis.lock.Lock(self.redis, f"lock:pod_start_stop:{slot}", timeout=POD_START_STOP_LOCK_TTL, sleep=0.2)
+        try:
+            held = bool(await lock.acquire())
+        except (redis.exceptions.RedisError, OSError) as e:
+            logger.warning(_m(f"Pod start/stop lock {slot} could not be taken", extra={"error": str(e)}))
+            held = False
+        renewer = asyncio.create_task(self._renew_pod_start_stop_lock(lock, slot)) if held else None
+        try:
+            yield held
+        finally:
+            if renewer is not None:
+                renewer.cancel()
+            if held:
+                with suppress(redis.exceptions.RedisError, OSError):  # lapsed: no longer ours to release
+                    await lock.release()
+
+    async def _renew_pod_start_stop_lock(self, lock: aioredis.lock.Lock, slot: str) -> None:
+        while True:
+            await asyncio.sleep(POD_START_STOP_LOCK_TTL / 3)
+            try:
+                await lock.reacquire()
+            except redis.exceptions.LockNotOwnedError:
+                logger.error(_m(f"Pod start/stop lock {slot} lapsed while held"))
+                return
+            except (redis.exceptions.RedisError, OSError) as e:
+                logger.warning(_m(f"Pod start/stop lock {slot} renewal failed", extra={"error": str(e)}))
 
     @asynccontextmanager
     async def rented_gpu_drop_lock(self, pod_id: str):

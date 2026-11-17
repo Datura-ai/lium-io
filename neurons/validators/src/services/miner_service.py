@@ -70,7 +70,14 @@ from core.utils import _m, _StructuredMessage, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import bound_pod_states, chunk_pod_states
 from services.attestation_service import AttestationService
-from services.docker_service import DockerService, create_steps_after_reply, customer_creates, inflight_creates
+from services.docker_service import (
+    DockerService,
+    _cleanup_to_completion,
+    create_steps_after_reply,
+    customer_creates,
+    half_started_stop_retry,
+    inflight_creates,
+)
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.node_host import for_payload_miner, public_host_sock
 from services.redis_service import MACHINE_SPEC_CHANNEL, POD_STATES_CHANNEL, RedisService
@@ -99,6 +106,20 @@ from services.storage_operations import (
 from services.storage_operations import upload_secrets_file
 
 logger = logging.getLogger(__name__)
+
+# key removals waiting for a pod's background stop retry, kept referenced until they finish
+_KEY_REMOVALS_AFTER_STOP_RETRY: set[asyncio.Task] = set()
+
+
+async def _remove_ssh_key_after_stop_retry(stop_retry: asyncio.Task, remove_ssh_key: Awaitable[bool]) -> bool:
+    """A failed start's background stop retry reconnects with the request's key: the key goes once that retry is done,
+    and at once if this wait is cancelled, so it never outlives the request's steps."""
+    try:
+        await asyncio.wait({stop_retry})
+    except asyncio.CancelledError:
+        await _cleanup_to_completion(remove_ssh_key)
+        raise
+    return await remove_ssh_key
 
 # I-78: bittensor packs a.b.c into axon_info.version as a*1000**2 + b*1000 + c. 10.5.0 is what
 # miner-v1.003+ announces; the upload nonce field shipped in miner-v1.002 (fbfbde79, DAH-2338).
@@ -2756,11 +2777,20 @@ class MinerService:
                         executor_id=payload.executor_id,
                         log_extra=default_extra,
                     )
+                    # a failed start's (or edit undo's) background stop retry reconnects with this key
+                    stop_retry = half_started_stop_retry(executor.uuid, payload.pod_id)
+                    if stop_retry is not None:
+                        remove_ssh_key = _remove_ssh_key_after_stop_retry(stop_retry, remove_ssh_key)
                     if isinstance(payload, ContainerCreateRequest):
                         # DAH-3980: a create's reply does not wait for the miner
                         create_steps_after_reply.start(
                             payload.pod_id, self._log_ssh_key_removal_after_reply(remove_ssh_key, default_extra)
                         )
+                    elif stop_retry is not None:
+                        # the reply does not wait out the retry's backoff
+                        removal = asyncio.create_task(self._log_ssh_key_removal_after_reply(remove_ssh_key, default_extra))
+                        _KEY_REMOVALS_AFTER_STOP_RETRY.add(removal)
+                        removal.add_done_callback(_KEY_REMOVALS_AFTER_STOP_RETRY.discard)
                     else:
                         await remove_ssh_key
 
