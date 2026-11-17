@@ -145,7 +145,7 @@ class FakeHost:
             for unit in units:
                 self.active[unit] = False
                 self.fm_log.append(("stop", unit))
-            self.commands.append(re.search(r"\{ (nvidia-smi -r [^;]*);", script).group(1))
+            self.commands.append(re.search(r"\{ (nvidia-smi -r\b[^;]*);", script).group(1))
             self.active_during_reset = dict(self.active)
             if self.reset_hangs:
                 # the SSH timeout fires while the host unit still holds the fabric down
@@ -222,7 +222,11 @@ def _assert_invariants(host: FakeHost, backend, report) -> None:
     container = set(json.loads(host.inspect)["HostConfig"]["DeviceRequests"][0]["DeviceIDs"] or U)
     for cmd in host.commands:
         assert "docker exec" not in cmd, "never trust output from inside the pod"
-        if cmd.startswith("nvidia-smi -r"):
+        if cmd == "nvidia-smi -r":
+            # the whole fabric: only for a pod holding every host GPU while Fabric Manager is stopped
+            assert host.active_during_reset.get(FM) is False, "never nvidia-smi -r without -i outside a fabric reset"
+            assert container == set(backend) == set(U)
+        elif cmd.startswith("nvidia-smi -r"):
             assert " -i " in cmd, "never nvidia-smi -r without -i"
             reset_set = set(cmd.split(" -i ")[1].strip("'").split(","))
             assert reset_set <= container and reset_set <= set(backend)
@@ -353,6 +357,30 @@ async def test_a_fabric_manager_node_the_pod_owns_whole_stops_fm_around_the_rese
     assert _fm_commands(host) == [*CHECK_BOTH, ("stop", FM), ("start", FM), ("is-active", FM)]
     assert sum("systemd-run" in cmd for cmd in host.commands) == 1
     start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_fabric_manager_node_the_pod_owns_whole_resets_gpus_and_nvswitches_together():
+    # HGX B300: with Fabric Manager stopped, `-r -i <every GPU>` was refused "in use" with no holder left
+    host = FakeHost(device_ids=(), count=-1, fabric_manager=True)
+    report, _ = await _reset(host, backend=U, indices=[2])
+    assert report.ok and [c for c in host.commands if c.startswith("nvidia-smi -r")] == ["nvidia-smi -r"]
+
+
+@pytest.mark.asyncio
+async def test_an_nvswitch_node_without_fabric_manager_keeps_the_per_gpu_reset():
+    host = FakeHost(device_ids=(), count=-1, nvswitch=True)
+    await _reset(host, backend=U, indices=[0])
+    resets = [c for c in host.commands if c.startswith("nvidia-smi -r")]
+    assert len(resets) == 1 and set(resets[0].split(" -i ")[1].split(",")) == set(U)
+
+
+def test_a_whole_fabric_reset_refuses_a_partial_gpu_set():
+    with pytest.raises(ValueError):
+        build_reset_command(U[:2], container_uuids=U, pod_gpu_uuids=U, whole_fabric=True)
+    with pytest.raises(ValueError):
+        build_reset_command(U[:2], container_uuids=U[:2], pod_gpu_uuids=U, whole_fabric=True)
+    assert build_reset_command(U, container_uuids=U, pod_gpu_uuids=U, whole_fabric=True) == "nvidia-smi -r"
 
 
 @pytest.mark.asyncio
@@ -850,6 +878,26 @@ async def test_a_refused_reset_on_a_whole_host_pod_is_not_ok_and_every_holder_is
     assert {g.result for g in report.gpus} == {"latch_cleared"}
     assert all(host.active[u] for u in (FM, DCGM, PERSISTENCED, EXPORTER))
     start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_refused_reset_logs_the_whole_host_output_the_report_cuts(caplog):
+    host = _b300(reset_exit=1)
+    with caplog.at_level("WARNING", logger="services.gpu_reset"):
+        report, _ = await _reset(host, backend=U)
+    logged = [r.getMessage() for r in caplog.records if "nvidia-smi -r refused" in r.getMessage()]
+    assert len(logged) == 1 and FM in logged[0]
+    assert NAME in logged[0]
+    assert "stdout" in logged[0] and "stderr" in logged[0]
+
+
+@pytest.mark.asyncio
+async def test_a_refused_reset_whose_holder_does_not_come_back_still_logs_the_host_output(caplog):
+    host = _b300(reset_exit=1, fm_start_ok=False)
+    with caplog.at_level("WARNING", logger="services.gpu_reset"):
+        report, _ = await _reset(host, backend=U)
+    assert not report.ok and "nvidia-fabricmanager is not active" in report.detail
+    assert len([r for r in caplog.records if "nvidia-smi -r refused" in r.getMessage()]) == 1
 
 
 @pytest.mark.asyncio

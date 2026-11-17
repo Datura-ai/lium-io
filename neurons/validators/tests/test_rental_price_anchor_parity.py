@@ -110,7 +110,9 @@ def test_overrides_change_only_the_server_edition_and_b300_entries():
         "NVIDIA GeForce GTX 1070",
         "NVIDIA GeForce GTX 1060",
         "NVIDIA Tesla M40",
-        "NVIDIA GeForce RTX 4090 48GB",  # DAH-5508, behind RTX_4090_48GB_MODEL_ENABLED
+        "NVIDIA GeForce RTX 4090 48GB",  # DAH-5508: memory-modded cards
+        "NVIDIA GeForce RTX 4080 32GB",
+        "NVIDIA GeForce RTX 4080 SUPER 32GB",
     }
     # one-way ratchet: every upstream GPU stays priced; a newly added model is reported, not failed
     assert upstream.keys() <= RENTAL_PRICES_PER_HOUR.keys()

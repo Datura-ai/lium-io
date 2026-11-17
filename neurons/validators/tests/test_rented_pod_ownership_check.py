@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from neurons.validators.src.services.task.checks.rented_pod_ownership import (
+    PATHS,
     RentedPodOwnershipCheck,
     judge,
     read_command,
@@ -159,7 +160,7 @@ def test_read_command_reports_a_missing_pid_without_failing(tmp_path):
     out = subprocess.run(
         ["sh", "-c", read_command([999], proc=str(tmp_path))], capture_output=True, text=True
     )
-    assert out.stdout == "999|||||||\n"
+    assert out.stdout == "999|" + "|" * len(PATHS) + "\n"
 
 
 @pytest.mark.parametrize(
@@ -206,6 +207,14 @@ async def test_the_read_includes_sudo_files_and_an_image_without_sudo_is_ok(
         "/etc/sudoers.d/README": me,
     }
     assert pods["pod_2"]["host_owners"] == {"/": me, "/root": me}
+
+
+def test_a_shifted_package_dir_warns_although_slash_root_and_sudo_are_inside():
+    # a partial shift left /usr/share owned by nobody while /, /root and sudo were fine: dpkg fails
+    pod = judge(
+        "4242|0 100000 65536|100000|100000|100000|100000|100000|100000|100000|100000|0|100000"
+    )
+    assert pod["outside_namespace"] == ["/usr/share"]
 
 
 def _ssh_with_uptime(proc: str, uptime_and_ages: str):
@@ -282,3 +291,51 @@ async def test_each_age_stays_with_its_own_pid_when_one_pid_prints_nothing(conte
     assert "started_after_boot_s" not in pods["pod_1"]
     assert pods["pod_2"]["started_after_boot_s"] == 86370
     assert result.event.remediation == Msg.SHIFTED.remediation  # pod_1's history is unknown
+
+
+def _ssh_with_runtime_ages(proc: str, ages: str):
+    inner = _ssh(proc)
+
+    async def run(cmd, check=False):
+        if cmd.startswith("ps -eo comm=,etimes="):
+            return SimpleNamespace(exit_status=0, stdout=ages, stderr="")
+        return await inner.run(cmd, check=check)
+
+    return SimpleNamespace(run=run)
+
+
+@pytest.mark.parametrize(
+    ("ages", "restarted"),
+    [
+        # needrestart restarted sysbox-fs and the fabric manager 100 s ago; pod_1 runs for a day, pod_2 for 50 s
+        (
+            "sysbox-mgr 90000\nsysbox-fs     100\nnv-fabricmanage 100\n--\n 4242 86400\n 4343 50\n",
+            {"nv-fabricmanager": ["pod_1"], "sysbox-fs": ["pod_1"]},
+        ),
+        # every runtime process is older than both pods (a reboot brings them up first): nothing to flag
+        ("sysbox-mgr 90000\nsysbox-fs 90000\n--\n4242 86400\n4343 50\n", None),
+        # a pod age not read flags nothing for that pod
+        ("sysbox-fs 100\n--\n4343 50\n", None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_runtime_process_younger_than_a_pod_is_listed_as_its_own_outcome_without_failing(
+    context_factory, tmp_path, ages, restarted
+):
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me}      65536\n")
+    _proc(tmp_path, 4343, f"         0     {me}      65536\n")
+    result = await RentedPodOwnershipCheck().run(
+        _ctx(context_factory, _ssh_with_runtime_ages(str(tmp_path), ages))
+    )
+    assert result.passed is True
+    # its own outcome so the restart is logged at INFO even when the last cycle was OK
+    assert result.event.reason_code == (Msg.RUNTIME_RESTARTED if restarted else Msg.OK).reason
+    assert result.event.what_we_saw.get("runtime_restarted_under_pods") == restarted
+
+
+@pytest.mark.parametrize("template", [Msg.SHIFTED, Msg.SHIFTED_AFTER_CONTAINER_RESTART, Msg.SHIFTED_MIXED])
+def test_shifted_remediation_sends_provider_to_support_not_a_host_ownership_change(template):
+    assert "uid_map" not in template.remediation
+    assert "Contact support" in template.remediation
+    assert "free of charge" in template.remediation

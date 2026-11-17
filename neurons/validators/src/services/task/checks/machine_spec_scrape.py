@@ -79,9 +79,7 @@ def _normalize_gpu_details(gpu_details: list[dict[str, Any]]) -> list[dict[str, 
     return [
         {
             **detail,
-            "name": classify_gpu_model(
-                detail.get("name"), detail.get("capacity"), settings.RTX_4090_48GB_MODEL_ENABLED
-            ),
+            "name": classify_gpu_model(detail.get("name"), detail.get("capacity")),
         }
         if detail.get("name")
         else detail
@@ -354,7 +352,7 @@ def _storage_limit_summary(specs: dict[str, Any], vloopback: Any) -> dict[str, A
 
 
 def _binary_command(remote_dir: str, script_filename: str) -> str:
-    script_path = f"{remote_dir.rstrip('/')}/{script_filename.lstrip('/')}"
+    script_path = shlex.quote(f"{remote_dir.rstrip('/')}/{script_filename.lstrip('/')}")
     return f"chmod +x {script_path} && {script_path}"
 
 
