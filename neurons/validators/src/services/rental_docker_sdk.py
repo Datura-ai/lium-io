@@ -758,6 +758,17 @@ class RentalDockerSdkClient:
             raise RentalDockerOperationError("Docker inspect did not include the container's Id and StartedAt")
         return f"{container_id}@{started_at}"
 
+    async def container_created(self, *, container_name: str) -> str:
+        """The container's Created time (RFC 3339, host clock): a re-create changes it, a re-start does not."""
+        try:
+            info = await _in_docker_thread(self._api_client.inspect_container, container_name)
+        except Exception as exc:
+            raise RentalDockerOperationError(_wrap_error_message("Docker SDK inspect container failed", exc)) from exc
+        created = info.get("Created") if isinstance(info, dict) else None
+        if not created:
+            raise RentalDockerOperationError("Docker inspect did not include the container's Created time")
+        return created
+
     async def host_time(self) -> str:
         """The Docker host's clock (`docker info` SystemTime, RFC 3339)."""
         try:

@@ -149,6 +149,7 @@ class _FakeRentalDockerClient:
         self.killed_containers = []
         self.identity = _RUN
         self.identity_error = None
+        self.created = "2026-11-16T13:59:00Z"
         self.host_clock_offset = timedelta(0)
         self.host_time_error = None
         self.remove_error = None
@@ -213,6 +214,9 @@ class _FakeRentalDockerClient:
         if self.identity_error is not None:
             raise self.identity_error
         return self.identity
+
+    async def container_created(self, *, container_name: str) -> str:
+        return self.created
 
     async def inspect_container_state(self, *, container_name: str) -> ContainerStateSnapshot:
         return ContainerStateSnapshot(
@@ -3615,6 +3619,8 @@ async def test_retry_half_started_stop_without_a_recorded_id_judges_the_run_by_i
     client = docker_service.rental_docker_client_factory.client
     client.running = True
     client.identity = f"cid@{started_at}"
+    if not expect_stop:
+        client.created = started_at  # re-created after the failure
 
     stopped = await docker_service.retry_half_started_stop(
         executor_info=Mock(uuid="exec-1"), private_key="private-key", pod_id="pod-id", default_extra={}
@@ -3624,6 +3630,37 @@ async def test_retry_half_started_stop_without_a_recorded_id_judges_the_run_by_i
     assert client.stopped_containers == (["pod_test"] if expect_stop else [])
     assert client.running is not expect_stop
     docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id")
+
+
+@pytest.mark.parametrize(
+    ("mount_exit", "expect_stop", "expect_dropped"),
+    [(1, True, True), (3, False, False), (2, False, True)],
+    ids=["encrypted_volume_unmounted", "mount_unread", "no_encrypted_volume"],
+)
+@pytest.mark.asyncio
+async def test_retry_half_started_stop_without_a_recorded_id_lets_the_mount_decide_after_an_auto_restart(
+    docker_service, monkeypatch, mount_exit, expect_stop, expect_dropped
+):
+    # the id read failed at the failure, then Docker restarted the same container (created before the failure, started
+    # after it): an unmounted encrypted volume is stopped, an unread one stays pending, no encrypted volume is not
+    # that run any more
+    monkeypatch.setattr("services.docker_service._HALF_STARTED_STOP_RETRY_SEC", 0)
+    _mount_reads(docker_service, monkeypatch, mount_exit)
+    docker_service.redis_service.hget = AsyncMock(return_value=_pending_record(identity=""))
+    client = docker_service.rental_docker_client_factory.client
+    client.running = True
+    client.identity = "cid@2026-11-16T14:02:00Z"
+
+    stopped = await docker_service.retry_half_started_stop(
+        executor_info=Mock(uuid="exec-1"), private_key="private-key", pod_id="pod-id", default_extra={}
+    )
+
+    assert stopped is expect_dropped
+    assert client.stopped_containers == (["pod_test"] if expect_stop else [])
+    if expect_dropped:
+        docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id")
+    else:
+        docker_service.redis_service.hdel.assert_not_awaited()
 
 
 @pytest.mark.asyncio

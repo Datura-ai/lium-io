@@ -12949,7 +12949,8 @@ class DockerService:
         """Stop a pod whose failed start left it possibly running without its mount (F-31/F-37/F-15).
         The recorded container is stopped while its encrypted volume is unmounted, across restarts (same id); a
         re-created one is left alone, a mounted one kept, an unread mount stays pending. A pod with no encrypted volume
-        is stopped only in the very run recorded (without its id: while its StartedAt is not after the failure).
+        is stopped only in the very run recorded (without its id: while its StartedAt is not after the failure; a container
+        created after the failure is a re-created one).
         None when none is pending; True once it is stopped or no longer that run (record dropped); False (logged)
         while it still may run."""
         extra = {**default_extra, "pod_id": pod_id}
@@ -12985,7 +12986,15 @@ class DockerService:
                 current = await docker_client.container_identity(container_name=container_name)
                 # names are unique on a host: another id under it means the recorded container was removed
                 replaced = current is None or bool(identity) and current.partition("@")[0] != identity.partition("@")[0]
-                # a Docker auto-restart (unless-stopped) keeps the id and changes StartedAt: the mount decides
+                failed_at = datetime.fromisoformat(recorded_at)
+                if not replaced and not identity:
+                    # Created/StartedAt are on the host's clock, recorded_at on ours: undo the offset before comparing
+                    skew = _docker_time(await docker_client.host_time()) - datetime.now(timezone.utc)
+                    # with no recorded id, creation time tells a re-created container (its mount may not have landed
+                    # yet) from the recorded one restarted by Docker, which keeps its creation time
+                    created_at = _docker_time(await docker_client.container_created(container_name=container_name))
+                    replaced = created_at - skew > failed_at
+                # a Docker auto-restart (unless-stopped) keeps the container and changes StartedAt: the mount decides
                 mount = (
                     None
                     if replaced
@@ -12993,17 +13002,13 @@ class DockerService:
                         executor_info, private_key, container_name, plaintext_path
                     )
                 )
-                # no encrypted volume, nothing it could write unencrypted: only the very run recorded is stopped. With
-                # no recorded id a container under the name may be a re-created one not yet mounted: start time decides
-                if not replaced and (mount == 2 or not identity):
+                # no encrypted volume, nothing it could write unencrypted: only the very run recorded is stopped
+                if not replaced and mount == 2:
                     if identity:
                         same_run = current == identity
                     else:
-                        # StartedAt is on the host's clock, recorded_at on ours: undo the offset before comparing
-                        skew = _docker_time(await docker_client.host_time()) - datetime.now(timezone.utc)
-                        started_at = _docker_time(current.rpartition("@")[2]) - skew
-                        same_run = started_at <= datetime.fromisoformat(recorded_at)
-                if replaced or ((mount == 2 or not identity) and not same_run):
+                        same_run = _docker_time(current.rpartition("@")[2]) - skew <= failed_at
+                if replaced or (mount == 2 and not same_run):
                     logger.info(
                         _m(
                             "POD_HALF_STARTED_STOP_DROPPED_NOT_SAME_RUN",

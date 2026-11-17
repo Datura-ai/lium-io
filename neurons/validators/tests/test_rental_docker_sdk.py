@@ -1736,6 +1736,19 @@ async def test_container_identity_is_id_and_start_time_and_none_once_the_contain
     assert await client.container_identity(container_name="pod_x") is None
 
 
+@pytest.mark.asyncio
+async def test_container_created_is_the_inspected_created_time_and_an_error_without_it():
+    api_client = Mock()
+    api_client.inspect_container = Mock(return_value={"Id": "cid", "Created": "t0", "State": {"StartedAt": "t1"}})
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.container_created(container_name="pod_x") == "t0"
+
+    api_client.inspect_container = Mock(return_value={"Id": "cid"})
+    with pytest.raises(RentalDockerOperationError):
+        await client.container_created(container_name="pod_x")
+
+
 def _run_key_append(spec, env=None) -> subprocess.CompletedProcess:
     return subprocess.run(list(spec.argv), input=spec.stdin, capture_output=True, text=True, env=env)
 
