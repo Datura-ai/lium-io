@@ -144,6 +144,11 @@ class RentalDockerTransportError(RentalDockerOperationError):
     """A Docker SDK call failed on a dropped SSH transport and its one retry did not recover it."""
 
 
+class RentalDockerTransportNotReopened(RentalDockerTransportError):
+    """A Docker SDK call's SSH transport dropped and a new SSH connection to the node failed: the node stopped
+    answering, as at the connect step, whatever the call was doing."""
+
+
 def _iter_exception_chain(exc: BaseException) -> Iterator[BaseException]:
     seen: set[int] = set()
     stack: list[BaseException | None] = [exc]
@@ -931,7 +936,7 @@ class RentalDockerSdkClient:
         try:
             await _in_docker_thread(reopen)
         except Exception as exc:
-            raise RentalDockerTransportError(
+            raise RentalDockerTransportNotReopened(
                 f"Docker SDK {operation} failed on a dropped SSH transport and the transport could "
                 f"not be re-opened: {first_error}; re-open: {_error_text(exc)}"
             ) from (

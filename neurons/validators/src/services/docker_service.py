@@ -215,6 +215,7 @@ from services.rental_docker_sdk import (
     RentalDockerOperationError,
     RentalDockerSdkClient,
     RentalDockerSdkClientFactory,
+    RentalDockerTransportNotReopened,
     VolumeMount,
     build_authorized_keys_exec_spec,
     build_container_command_argv,
@@ -12093,6 +12094,9 @@ class DockerService:
             error_class = rental_docker_error_class(e) or port_collision_error_class(e)
             # DAH-5037: its own field, never in `error`, which the backend's GPU-fault check reads
             last_exc = _last_attempt_exception(e)
+            # a new SSH connection to the node failed mid-step: the node stopped answering whatever the step ran,
+            # so the step in progress (docker_pull: "check the image") would point the renter at their image
+            reported_step = "ssh_connect" if isinstance(last_exc, RentalDockerTransportNotReopened) else current_step
             log_tail = last_exc.log_tail if isinstance(last_exc, ImageExitedDuringKeyInjection) else ""
             log_text = _m(
                 "Failed create_container",
@@ -12100,7 +12104,7 @@ class DockerService:
                     **default_extra,
                     # DAH-2740: a tenacity RetryError says nothing; the last attempt's text is the cause
                     "error": "; ".join(_exception_texts(e)),
-                    "failure_step": current_step,
+                    "failure_step": reported_step,
                     **({"error_class": error_class} if error_class else {}),
                     **({"container_logs_tail": log_tail} if log_tail else {}),
                 }),
@@ -12208,7 +12212,7 @@ class DockerService:
                     if isinstance(e, _FillerRefusedForCustomerCreate)
                     else FailedContainerErrorCodes.UnknownError
                 ),
-                failure_step=current_step,
+                failure_step=reported_step,
                 volume_encryption_status=(
                     VolumeEncryptionStatus.FAILED
                     if current_step

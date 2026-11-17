@@ -47,6 +47,7 @@ from services.rental_docker_sdk import (
     ContainerRunSpec,
     ContainerStateSnapshot,
     RentalDockerOperationError,
+    RentalDockerTransportNotReopened,
     _wrap_error_message,
     build_gpu_docker_config,
 )
@@ -4074,9 +4075,25 @@ async def test_create_container_uses_keepalives_and_sdk_pull(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pull_error", "expected_step"),
+    [
+        (Exception("[Errno 104] Connection reset by peer"), "docker_pull"),
+        # the node refused a new SSH connection after the pull's dropped: the node, not the renter's image
+        (
+            RentalDockerTransportNotReopened(
+                "Docker SDK pull failed on a dropped SSH transport and the transport could not be re-opened: "
+                "IncompleteRead; re-open: Connection refused"
+            ),
+            "ssh_connect",
+        ),
+    ],
+)
 async def test_create_container_reports_docker_pull_failure_step(
     docker_service,
     monkeypatch,
+    pull_error,
+    expected_step,
 ):
     ssh_client = AsyncMock()
 
@@ -4098,9 +4115,7 @@ async def test_create_container_reports_docker_pull_failure_step(
     docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
     docker_service.redis_service.add_pending_pod = AsyncMock()
     docker_service.redis_service.remove_pending_pod = AsyncMock()
-    docker_service.rental_docker_client_factory.client.pull_error = Exception(
-        "[Errno 104] Connection reset by peer"
-    )
+    docker_service.rental_docker_client_factory.client.pull_error = pull_error
     monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
     monkeypatch.setattr(
         docker_service,
@@ -4145,7 +4160,7 @@ async def test_create_container_reports_docker_pull_failure_step(
         private_key="encrypted",
     )
 
-    assert result.failure_step == "docker_pull"
+    assert result.failure_step == expected_step
     docker_service.redis_service.remove_pending_pod.assert_awaited_once_with(
         payload.miner_hotkey,
         payload.executor_id,

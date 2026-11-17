@@ -22,6 +22,7 @@ from services.rental_docker_sdk import (
     RentalDockerOperationError,
     RentalDockerSdkClient,
     RentalDockerSdkClientFactory,
+    RentalDockerTransportNotReopened,
 )
 
 # The three error texts of the cluster, as the validator logged them.
@@ -429,3 +430,5 @@ async def test_a_read_timeout_then_a_reset_while_reopening_still_holds_the_node(
         await _client(api_client).inspect_container_state(container_name="pod_test")
 
     assert is_host_fault_create_failure("container_health_check", raised.value)
+    # the create reports it at ssh_connect: the node refused the new connection
+    assert isinstance(raised.value, RentalDockerTransportNotReopened)
