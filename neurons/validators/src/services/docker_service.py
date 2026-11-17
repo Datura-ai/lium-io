@@ -1894,6 +1894,10 @@ async def _record_validator_start(ssh_client: asyncssh.SSHClientConnection, cont
         )
 
 
+# written by run_jupyter.sh when the validator installs Jupyter; absent on a pod without platform Jupyter
+_JUPYTER_RESTART_CMD = "[ -f /tmp/lium-jupyter-restart.sh ] || exit 0; exec sh /tmp/lium-jupyter-restart.sh"
+
+
 class _UnkillableParkedContainer(Exception):
     """Park could not end the container even by killing its processes directly: a wedged host process (F-1633)."""
 
@@ -12538,6 +12542,16 @@ class DockerService:
             log_tag=f"start_container_{pod_id}",
             log_extra=default_extra,
         )
+        if encrypted_volume_name:
+            # the executor's start watcher skips encrypted pods (no SSH before the remount): bring the platform
+            # Jupyter back here, after it, with the token and port run_jupyter.sh saved (DAH-6379)
+            with contextlib.suppress(asyncssh.Error, OSError, TimeoutError):
+                await ssh_client.run(
+                    f"/usr/bin/docker exec -d -u 0 {shlex.quote(container_name)} sh -c "
+                    f"{shlex.quote(_JUPYTER_RESTART_CMD)}",
+                    check=False,
+                    timeout=30,
+                )
         if not ssh_bootstrap_ok:
             logger.warning(
                 _m(
