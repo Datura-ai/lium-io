@@ -90,6 +90,11 @@ def build_clock_command(
     return f"nvidia-smi -i {shlex.quote(uuid)} -lgc {int(min_mhz)},{int(max_mhz)}"
 
 
+def _reset_app_and_memory_clocks(uuid: str) -> str:
+    q = shlex.quote(uuid)
+    return f"nvidia-smi -i {q} -rac >/dev/null 2>&1; nvidia-smi -i {q} -rmc >/dev/null 2>&1"
+
+
 def clamp_range(min_mhz: int | None, max_mhz: int | None, supported: list[int]) -> tuple[int, int]:
     low, high = min(supported), max(supported)
     lo = low if min_mhz is None else max(low, min(high, min_mhz))
@@ -168,8 +173,12 @@ async def _reset_gpu_clocks(
     succeeded (forget=False: the caller drops it). uuid -> failure (None = reset)."""
     if not uuids:
         return {}
-    # each reset echoes "<uuid> <exit>", so one GPU's failure never hides another's result
+    # each reset echoes "<uuid> <exit>", so one GPU's failure never hides another's result. Application clocks
+    # (-ac, or any process once the host ran -acp UNRESTRICTED) and locked memory clocks (-lmc) go back to default
+    # first, so a create never hands a renter clocks the host or the last pod lowered; a GPU without either reports
+    # "not supported", and only -rgc's exit is judged.
     cmd = "; ".join(
+        f"{_reset_app_and_memory_clocks(uuid)}; "
         f"{build_clock_command('reset', uuid, pod_gpu_uuids=pod_gpu_uuids)} >/dev/null 2>&1; echo {shlex.quote(uuid)} $?"
         for uuid in uuids
     )

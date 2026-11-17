@@ -55,7 +55,7 @@ class FakeHost:
         if "--query-gpu=clocks.gr" in cmd:
             return make_command_result(True, "1410")
         if " -rgc " in cmd:  # the batched resets: one "<uuid> <exit>" line per GPU
-            uuids = [part.split()[2] for part in cmd.split("; ") if part.startswith("nvidia-smi -i ")]
+            uuids = _reset_uuids(cmd)
             return make_command_result(True, "\n".join(f"{u} {self.rgc_exit}" for u in uuids))
         raise AssertionError(f"unexpected command {cmd}")
 
@@ -64,8 +64,8 @@ def _assert_invariants(host: FakeHost, allowed) -> None:
     for cmd in host.commands:
         assert "docker exec" not in cmd and " -pl" not in cmd, "never inside the pod, never the power limit"
         for part in cmd.split("; "):
-            if " -lgc" in part or " -rgc" in part:
-                assert part.startswith("nvidia-smi -i GPU-"), "never -lgc/-rgc without -i"
+            if any(flag in part for flag in (" -lgc", " -rgc", " -rac", " -rmc")):
+                assert part.startswith("nvidia-smi -i GPU-"), "never a clock change without -i"
                 assert part.split()[2] in set(allowed)
 
 
@@ -249,9 +249,29 @@ async def test_reset_runs_rgc_per_gpu_and_clears_the_records():
     host.commands.clear()
     report, _ = await _lock(host, redis, reset=True, indices=[0])
     assert report.ok and [(g.uuid, g.result) for g in report.gpus] == [(U[1], "reset")]
-    assert any(c.startswith(f"nvidia-smi -i {U[1]} -rgc ") for c in host.commands)
+    assert any(_reset_uuids(c) == [U[1]] for c in host.commands)
     assert f"gpu_clock_lock:{U[1]}" not in redis.store and f"gpu_clock_lock:{U[0]}" in redis.store
     assert json.loads(redis.store["gpu_clock_lock_pod:pod1"]) == [U[0]]
+
+
+@pytest.mark.asyncio
+async def test_a_create_resets_application_and_memory_clocks_before_the_graphics_lock_of_every_gpu():
+    """A host's -ac/-lmc (or a pod's -ac once the host ran -acp UNRESTRICTED) never reaches the next renter; a GPU
+    without application or memory clock control answers non-zero there, and only -rgc's exit decides."""
+    host, redis = FakeHost(), FakeRedis()
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == []
+    _assert_invariants(host, [U[0], U[1]])
+    (cmd,) = host.commands
+    assert cmd.split("; ") == [
+        part
+        for u in (U[0], U[1])
+        for part in (
+            f"nvidia-smi -i {u} -rac >/dev/null 2>&1",
+            f"nvidia-smi -i {u} -rmc >/dev/null 2>&1",
+            f"nvidia-smi -i {u} -rgc >/dev/null 2>&1",
+            f"echo {u} $?",
+        )
+    ]
 
 
 @pytest.mark.asyncio
