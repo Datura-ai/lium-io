@@ -952,6 +952,26 @@ async def test_a_job_cache_over_its_size_is_removed_and_charged_as_a_new_one(doc
     assert bool(affordable) is granted
 
 
+class RefusingDuHostSshClient(DuHostSshClient):
+    """docker refuses the `volume rm` (exit 1)."""
+
+    async def run(self, command: str, *args, **kwargs):
+        if "volume rm" in command:
+            self.commands.append(command)
+            return SimpleNamespace(exit_status=1, stdout="", stderr="volume is in use")
+        return await super().run(command, *args, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_a_job_cache_over_its_size_that_docker_cannot_remove_stays_mounted(docker_service):
+    ssh_client = RefusingDuHostSshClient([_JOB_CACHE], free_gb=10, du_stdout=_kb(250))
+
+    affordable = await docker_service.select_affordable_cache_volumes(ssh_client, _job_with_cache(), {})
+
+    assert any("volume rm" in command and _JOB_CACHE in command for command in ssh_client.commands)
+    assert [volume.name for volume in affordable] == [_JOB_CACHE]
+
+
 class CacheDuHostSshClient(RemovingHostSshClient):
     """The helper's `du -sk /cache/0 /cache/1 ...` answers with these GB per cache, in mount order; the idle filler
     images' `docker image inspect` with `image_gb`."""

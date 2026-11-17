@@ -6662,7 +6662,7 @@ class DockerService:
             return unmeasured_missing_gb
         held_gb: float = int(used_kb) * 1024 / 10**9
         if volume_name.startswith(JOB_CACHE_VOLUME_PREFIX):
-            return await self._job_cache_missing_gb(ssh_client, volume_name, held_gb, expected_gb, default_extra)
+            return await self._remove_oversized_job_cache_and_get_gb_to_charge(ssh_client, volume_name, held_gb, expected_gb, default_extra)
         if is_dphn_cache:
             # du of an empty directory is a few KB
             return expected_gb if int(used_kb) < _DPHN_CACHE_EMPTY_KB else 0
@@ -6676,7 +6676,7 @@ class DockerService:
         )
         return expected_gb - held_gb
 
-    async def _job_cache_missing_gb(
+    async def _remove_oversized_job_cache_and_get_gb_to_charge(
         self,
         ssh_client: asyncssh.SSHClientConnection,
         volume_name: str,
