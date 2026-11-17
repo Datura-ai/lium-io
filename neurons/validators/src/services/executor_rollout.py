@@ -484,7 +484,7 @@ def withhold_renter_gpu_reset_verdicts(
         for result in results:
             redis_fault = result.failure_reason_code == VALIDATOR_REDIS_UNAVAILABLE
             port_check_deferred = result.failure_reason_code == _PORT_CHECK_DEFERRED
-            freed_port_reprobe = result.failure_reason_code == _FREED_PORT_REPROBE
+            freed_port_reprobe = result.failure_reason_code == _FREED_PORT_REPROBE and not result.availability_errors
             if not (redis_fault or port_check_deferred or freed_port_reprobe or _held_for_renter_gpu_reset(result)):
                 standing_by_miner[miner_hotkey].append(result)
                 continue

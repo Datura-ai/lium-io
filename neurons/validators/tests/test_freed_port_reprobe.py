@@ -98,6 +98,7 @@ async def test_the_reprobe_measures_sysbox_again_after_a_filler_stop_failed_the_
 
     assert ctx.services.connectivity.verify_ports.call_args.args[3] is True  # sysbox-runc requested
     assert result.updates["state"].sysbox_runtime is True
+    assert result.updates["state"].specs["sysbox_runtime"] is True  # the backend rents from specs
 
 
 @pytest.mark.asyncio
@@ -232,3 +233,15 @@ def test_the_cycle_withholds_a_run_whose_reprobe_did_not_finish():
 
     assert standing == {"5Miner": [node_fault, scored]}
     assert [w.result for w in withheld] == [reprobe]
+
+
+def test_a_run_whose_reprobe_did_not_finish_still_publishes_an_earlier_checks_recorded_failure():
+    from services.executor_rollout import withhold_renter_gpu_reset_verdicts
+    from test_executor_rollout_grace import _failed
+
+    reprobe = _failed("node-1", WITHHELD)
+    reprobe.availability_errors = [{"code": "GPU_COUNT_MISMATCH"}]
+
+    standing, withheld = withhold_renter_gpu_reset_verdicts({"5Miner": [reprobe]})
+
+    assert (standing, withheld) == ({"5Miner": [reprobe]}, [])

@@ -152,11 +152,16 @@ async def _reprobe(
         unreachable = await port_connectivity.PortConnectivityCheck._outside_failure_confirmed(ctx, result)
     successful = [] if unreachable else list(result.successful_ports)
     after = _without_pods(after, ctx, ended)
+    sysbox_runtime = ctx.state.sysbox_runtime or result.sysbox_measured is True
     return (
         replace(
             ctx.state,
             # probed ports only: PortCountCheck._count adds the filler's
-            specs={**ctx.state.specs, "verified_ports": [p.external for p in successful]},
+            specs={
+                **ctx.state.specs,
+                "verified_ports": [p.external for p in successful],
+                "sysbox_runtime": sysbox_runtime,
+            },
             verified_port_count=len(successful),
             probed_port_count=len(result.selected_ports),
             declared_port_count=result.declared_port_count,
@@ -166,7 +171,7 @@ async def _reprobe(
             port_probe_connection_lost=None,
             probe_excluded_ports=sorted(set(pod_ports) | set(filler_ports)),
             rented_data=after,
-            sysbox_runtime=ctx.state.sysbox_runtime or result.sysbox_measured is True,
+            sysbox_runtime=sysbox_runtime,
         ),
         None,
     )
