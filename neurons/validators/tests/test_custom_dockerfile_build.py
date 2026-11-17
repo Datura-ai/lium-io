@@ -82,7 +82,6 @@ class _FakeRentalDockerClient:
         self.exec_specs = []
         self.created_volumes = []
         self.removed_volumes = []
-        self.pruned_images = 0
         self.pull_error = None
         self.run_error = None
 
@@ -131,9 +130,6 @@ class _FakeRentalDockerClient:
         self.removed_volumes.append(
             {"volume_name": volume_name, "force": force}
         )
-
-    async def prune_images(self) -> None:
-        self.pruned_images += 1
 
 
 class _FakeRentalDockerFactory:

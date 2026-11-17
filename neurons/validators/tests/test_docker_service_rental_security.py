@@ -88,6 +88,7 @@ class RecordingRentalDockerClient:
         self.created_volumes = []
         self.removed_volumes = []
         self.pruned_images = 0
+        self.removed_untagged_images = []
         self.run_container_error = None
 
     async def login(self, *, username: str, password: str, image: str) -> None:
@@ -173,6 +174,13 @@ class RecordingRentalDockerClient:
     async def prune_images(self) -> None:
         self.pruned_images += 1
 
+    async def container_image_id(self, *, container: str) -> str:
+        return "sha256:pod-image"
+
+    async def remove_image_if_untagged(self, *, image_id: str) -> bool:
+        self.removed_untagged_images.append(image_id)
+        return True
+
 
 class RecordingRentalDockerFactory:
     def __init__(self):
@@ -201,9 +209,6 @@ def docker_service():
     lock.__aenter__ = AsyncMock(return_value=lock)
     lock.__aexit__ = AsyncMock(return_value=None)
     redis_service.acquire_executor_lock = Mock(return_value=lock)
-    # the create lock every delete's prune takes (lio#2226): free, so deletes prune
-    redis_service.executor_create_lock = Mock(return_value=Mock(acquire=AsyncMock(return_value=True), release=AsyncMock()))
-    redis_service.creates_in_progress = AsyncMock(return_value=False)
     service = DockerService(
         ssh_service=ssh_service,
         redis_service=redis_service,
@@ -1153,7 +1158,9 @@ async def test_lifecycle_operations_pass_container_names_as_sdk_data(
             "remove_volumes": True,
         }
     ]
-    assert docker_client.pruned_images == 1
+    # DAH-6314: no host-wide prune (it broke a renter's concurrent pull); only the pod's own image, by ID
+    assert docker_client.pruned_images == 0
+    assert docker_client.removed_untagged_images == ["sha256:pod-image"]
     assert docker_client.removed_volumes == [
         {"volume_name": "volume_lifecycle", "force": False}
     ]
