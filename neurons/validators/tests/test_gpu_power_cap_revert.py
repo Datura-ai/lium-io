@@ -674,6 +674,21 @@ async def test_the_stamp_moves_a_frozen_record_onto_the_capping_executor() -> No
 
 
 @pytest.mark.asyncio
+async def test_a_reused_record_takes_the_time_of_the_new_cap() -> None:
+    # DAH-6571: an old capped_at would let a scrape taken before this cap read its pre-cap limit as a revert
+    ssh = fake_ssh(FakeRun(stdout="GPU-a, 400, 400, 100, 400\n"), *_set_ok(280))
+    old = _restore_record(watts=400, capped_to_watts=None).model_copy(update={"capped_at": time.time() - 3600})
+    redis = FakeRedis({_restore_key("GPU-a"): old.model_dump_json()})
+    before = time.time()
+
+    await apply_filler_gpu_power_limits(
+        ssh, [GpuPowerLimit(gpu_uuid="GPU-a", watts=280)], redis, POD_ID, EXECUTOR_ID
+    )
+
+    assert GpuPowerRestoreRecord.model_validate_json(redis.store[_restore_key("GPU-a")]).capped_at >= before
+
+
+@pytest.mark.asyncio
 async def test_read_fails_open_when_redis_is_down() -> None:
     # Redis resilience: our own outage must never zero an innocent provider's incentive.
     assert await read_gpu_power_cap_reverts(BrokenRedis(), EXECUTOR_ID) == []

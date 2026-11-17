@@ -643,8 +643,12 @@ async def _set_applied_cap_on_restore_record(
         if not raw:
             return
         record = GpuPowerRestoreRecord.model_validate_json(raw)
+        # DAH-6571: a reused (frozen) record's capped_at predates this apply; the check reads it to skip scrapes
+        # taken before the cap
         identity = (
-            {"pod_id": capped_by.pod_id, "executor_id": capped_by.executor_id} if capped_by else {}
+            {"pod_id": capped_by.pod_id, "executor_id": capped_by.executor_id, "capped_at": time.time()}
+            if capped_by
+            else {}
         )
         refreshed = record.model_copy(update={"capped_to_watts": capped_to_watts, **identity})
         await redis.set(key, refreshed.model_dump_json())
