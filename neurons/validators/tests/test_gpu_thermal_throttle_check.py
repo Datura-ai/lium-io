@@ -59,9 +59,11 @@ class ProbeRunner:
         report = {"status": "ok", "thermal": {"available": True, "gpus": list(readings)}}
         self.stdout = stdout if stdout is not None else f"GPU_FAULT_PROBE_JSON: {json.dumps(report)}\n"
         self.calls: list[str] = []
+        self.timeouts: list[float] = []
 
     async def run(self, cmd, *, timeout=60, check=False, retryable=True, stdin_text=None):
         self.calls.append(cmd)
+        self.timeouts.append(timeout)
         return SimpleNamespace(stdout=self.stdout, stderr="", exit_code=0, error_type=None, duration_ms=1)
 
 
@@ -502,7 +504,8 @@ async def test_a_clean_reading_under_the_load_probe_clears_the_hold(context_fact
     assert result.passed is True
     assert await redis.get(_hold_key(context_factory)) is None
     (cmd,) = runner.calls
-    assert f"--seconds {gpu_thermal_throttle.LOAD_PROBE_SECONDS} --thermal" in cmd
+    assert f"--heat-seconds {gpu_thermal_throttle.LOAD_PROBE_SECONDS} --thermal" in cmd
+    assert runner.timeouts == [gpu_thermal_throttle.LOAD_PROBE_TIMEOUT_SECONDS]
 
 
 @pytest.mark.asyncio
@@ -525,6 +528,9 @@ async def test_a_collapse_under_the_load_probe_keeps_the_node_out(context_factor
         ProbeRunner(stdout=""),  # no report
         ProbeRunner(h100(gpu_utilization=10)),  # the load never showed
         ProbeRunner(h100(uuid="GPU-other")),  # another card's reading does not clear this one
+        # busy above half its clock but still braking for heat (H100, 7 Nov: cleared at 0.682 with the bit set)
+        ProbeRunner(h100(graphics_speed=1350, clocks_event_reasons=SW_THERMAL)),
+        ProbeRunner(h100(graphics_speed=1350, clocks_event_reasons=HW_THERMAL)),
     ],
 )
 async def test_a_probe_that_proves_nothing_keeps_the_hold(context_factory, runner):
@@ -536,6 +542,43 @@ async def test_a_probe_that_proves_nothing_keeps_the_hold(context_factory, runne
     assert result.passed is False
     assert result.event.what_we_saw["held_gpu_uuids"] == ["GPU-aaaa"]
     assert _hold_key(context_factory) in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_busy_scrape_reading_with_the_thermal_bit_does_not_clear_the_hold(context_factory):
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+
+    result = await run(context_factory, h100(graphics_speed=1350, clocks_event_reasons=SW_THERMAL), redis=redis)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["held_gpu_uuids"] == ["GPU-aaaa"]
+
+
+@pytest.mark.asyncio
+async def test_a_busy_scrape_reading_without_the_thermal_bit_clears_the_hold(context_factory):
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+
+    result = await run(context_factory, h100(clocks_event_reasons=SW_POWER_CAP), redis=redis)
+
+    assert result.passed is True
+    assert await redis.get(_hold_key(context_factory)) is None
+
+
+@pytest.mark.asyncio
+async def test_no_load_probe_when_the_task_has_not_the_loads_ssh_cap_left(context_factory, monkeypatch):
+    redis = FakeRedis()
+    await run(context_factory, COLLAPSED_ROW, redis=redis)
+    monkeypatch.setattr(
+        gpu_thermal_throttle, "task_seconds_left", lambda _ctx: gpu_thermal_throttle.LOAD_PROBE_TIMEOUT_SECONDS - 1
+    )
+    runner = ProbeRunner(h100())
+
+    result = await run(context_factory, IDLE_ROW, redis=redis, runner=runner)
+
+    assert runner.calls == []
+    assert result.event.what_we_saw["held_gpu_uuids"] == ["GPU-aaaa"]
 
 
 @pytest.mark.asyncio
@@ -553,10 +596,20 @@ def test_the_load_probe_fits_the_fault_probes_ssh_cap():
     from services.task.checks import gpu_fault_probe as check
     from miner_jobs import gpu_fault_probe as probe
 
-    largest = gpu_thermal_throttle.LOAD_PROBE_SECONDS + probe.WORKER_GRACE_SECONDS + probe.WORKER_GRACE_PER_GPU_SECONDS * 13
+    # the workers' budget: fault rounds, the heat phase and the grace of the largest card count (14)
+    largest = (
+        check.PROBE_SECONDS
+        + gpu_thermal_throttle.LOAD_PROBE_SECONDS
+        + probe.WORKER_GRACE_SECONDS
+        + probe.WORKER_GRACE_PER_GPU_SECONDS * 13
+    )
     # the parent's tail after the drain (reap, two NVML snapshots, two dmesg reads) plus the sampler's grace
     tail = probe.WORKER_REAP_AFTER_KILL_SECONDS + 2 * probe.NVML_GRACE_SECONDS + 2 * probe.DMESG_TIMEOUT_SECONDS
-    assert largest + tail + probe.NVML_GRACE_SECONDS < check.PROBE_TIMEOUT_SECONDS
+    assert largest + tail + probe.NVML_GRACE_SECONDS < gpu_thermal_throttle.LOAD_PROBE_TIMEOUT_SECONDS
+    # and the executor task has room for it: the probe is skipped otherwise, never cut off
+    from core.config import settings
+
+    assert gpu_thermal_throttle.LOAD_PROBE_TIMEOUT_SECONDS < settings.JOB_TIME_OUT - 120
 
 
 def test_last_busy_readings_keeps_the_last_busy_row_per_card():
@@ -610,3 +663,31 @@ def test_the_thermal_sampler_reports_each_cards_busy_reading(monkeypatch):
         ],
     }
     assert gpu_thermal_throttle._judgeable_busy(reply["gpus"][0])
+
+
+def test_the_heat_phase_runs_dense_launches_until_its_seconds_are_up(monkeypatch):
+    from miner_jobs import gpu_fault_probe as probe
+
+    calls: list[str] = []
+    cuda = SimpleNamespace(call=lambda name, *args, **kwargs: calls.append(name))
+    monkeypatch.setattr(probe, "_load_kernels", lambda _cuda, ptx, kernels: {"k_heat": object()})
+    monkeypatch.setattr(probe, "_launch", lambda *args: calls.append("launch"))
+
+    report = probe.heat(cuda, None, 1 << 20, 0, 0.05)
+
+    assert report["heat_launches"] >= 1
+    assert report["heat_s"] >= 0.05
+    assert calls.count("launch") == report["heat_launches"]
+
+
+def test_a_heat_kernel_that_does_not_compile_is_reported_not_raised(monkeypatch):
+    from miner_jobs import gpu_fault_probe as probe
+
+    def refuse(*_args):
+        raise probe.ProbeError("PTX JIT failed: CUDA_ERROR_INVALID_PTX")
+
+    monkeypatch.setattr(probe, "_load_kernels", refuse)
+
+    assert probe.heat(SimpleNamespace(call=None), None, 1 << 20, 0, 0.05) == {
+        "heat_error": "PTX JIT failed: CUDA_ERROR_INVALID_PTX"
+    }
