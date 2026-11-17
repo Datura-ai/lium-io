@@ -32,11 +32,13 @@ last collapse). An unrented cycle with marked GPUs still unproven fails as a col
 marked GPU is cleared by a busy reading that is not collapsed and carries the clocks and reasons judge_gpu needs, or
 when a scrape whose every row has a UUID no longer lists it (replaced); the reading is the scrape's, taken before
 the matmul, so on an idle node only a filler or the host's own load at scrape time clears it. DAH-6469: an unrented
-node held with no new collapse and no filler gets that load from the validator: the kernel-fault probe runs its
-fault rounds, then LOAD_PROBE_SECONDS of dense FMA work per card (``--heat-seconds``), sampling with ``--thermal``,
-and reports each card's last busy reading under it, judged like a scrape reading (collapsed renews). A card clears,
-from the scrape or the probe, only on a busy judgeable reading without a thermal slowdown bit; a cycle with less
-than the load's SSH cap left skips it. A probe with no readings leaves the hold, and the TTL
+node held with no new collapse and no filler gets that load from the validator, every such cycle: the kernel-fault
+probe runs dense FMA work on every card (``--heat-seconds``), and after LOAD_WARMUP_SECONDS, with the load still
+running, a fresh encrypted machine scrape reads the cards (``scrape_gpu_details``); its rows are judged like the
+cycle's scrape (collapsed renews). The load is then killed and its exit awaited, within LOAD_KILL_SECONDS, so the
+usage checks after this one see neither it nor its rows: ctx.state keeps the pre-load scrape. A card clears only on a
+busy judgeable reading without a thermal slowdown bit; a load that ended before the reading came back proves
+nothing, and a cycle with less time left than the whole sequence skips it. No reading leaves the hold, and the TTL
 stays the fallback. A dry run writes nothing; a Redis that cannot be read is no hold.
 
 A GPU whose clocks a renter locked (DAH-4663, a ``gpu_clock_lock:<uuid>`` record in Redis) is spared only the
@@ -46,6 +48,7 @@ The record is read only when a GPU was flagged.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import shlex
@@ -62,7 +65,8 @@ from ..messages import GpuThermalThrottleMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .capability import get_filler_only_container
-from .gpu_fault_probe import MAX_NVML_GPUS, PROBE_SECONDS, PROBE_TIMEOUT_SECONDS, _parse_report, probe_source
+from .gpu_fault_probe import PROBE_SECONDS, PROBE_TIMEOUT_SECONDS, probe_source
+from .machine_spec_scrape import MachineSpecScrapeCheck, scrape_gpu_details
 from .rental_owner import rental_of_this_node
 from .rented_gpu_drop import GPU_DROP_REDIS_ERRORS
 from .task_time import task_seconds_left
@@ -89,10 +93,21 @@ THERMAL_HOLD_KEY_PREFIX = "gpu_thermal_hold"
 THERMAL_HOLD_SECONDS = 7 * 24 * 3600
 # DAH-6469: the validator's own load on a held node's cards: dense FMA work (the probe's --heat-seconds) after the
 # fault rounds. Under real filler load the first collapsed scrape came 3 min after the start at the fastest, so the
-# load runs that long; a card whose cooling still fails heats into its slowdown inside it.
+# cards are read after that long under it; a card whose cooling still fails heats into its slowdown inside it.
 LOAD_PROBE_SECONDS = 180
-# the fault probe's own SSH cap, which covers its largest deadline, plus the heat phase every worker adds to it
-LOAD_PROBE_TIMEOUT_SECONDS = PROBE_TIMEOUT_SECONDS + LOAD_PROBE_SECONDS
+# the probe's fault rounds plus its workers' fork, JIT and allocation (seconds on a healthy node) before the heat
+LOAD_START_SECONDS = PROBE_SECONDS + 30
+LOAD_WARMUP_SECONDS = LOAD_START_SECONDS + LOAD_PROBE_SECONDS
+# the remote kill and the wait for every load process to exit, then the same again for the SSH call to return
+LOAD_KILL_SECONDS = 30
+# the load's processes: the probe and its forked workers share the command line; the bracket keeps the pattern from
+# matching the shell that runs pkill
+LOAD_PROCESS_PATTERN = "-I - --seconds [0-9.]* --heat-second[s] "
+LOAD_KILL_COMMAND = (
+    f"pkill -9 -f -- {shlex.quote(LOAD_PROCESS_PATTERN)};"
+    f" for _ in $(seq {LOAD_KILL_SECONDS}); do pgrep -f -- {shlex.quote(LOAD_PROCESS_PATTERN)} >/dev/null || exit 0;"
+    " sleep 1; done; exit 1"
+)
 # a thermal slowdown bit on a busy reading: the card is still braking for heat, so the reading proves nothing
 THERMAL_SLOWDOWN_REASONS = CLOCKS_EVENT_REASON_SW_THERMAL_SLOWDOWN | CLOCKS_EVENT_REASON_HW_THERMAL_SLOWDOWN
 
@@ -145,12 +160,6 @@ def judge_gpu(detail: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def _heated(device: Any) -> bool:
-    """A probe worker that ran the whole heat phase (DAH-6469)."""
-    heat_s = _to_number(device.get("heat_s")) if isinstance(device, dict) else None
-    return device.get("status") == "ok" and heat_s is not None and heat_s >= LOAD_PROBE_SECONDS
-
-
 def _clears_hold(detail: dict[str, Any]) -> bool:
     """A busy, judgeable reading with no thermal slowdown bit: only that proves a held card's cooling (DAH-6469).
     A ratio at or above MIN_CLOCK_RATIO with the bit set is a card still braking (H100, 7 Nov: 0.682 with the bit,
@@ -168,6 +177,15 @@ def _judgeable_busy(detail: dict[str, Any]) -> bool:
         and bool(_to_number(detail.get("max_graphics_speed")))
         and _to_number(detail.get("clocks_event_reasons")) is not None
     )
+
+
+def _scrape_timeout(ctx: Context) -> int:
+    return ctx.config.machine_scrape_timeout or MachineSpecScrapeCheck.DEFAULT_TIMEOUT
+
+
+def _load_probe_seconds(ctx: Context) -> int:
+    """The whole load sequence: the warm-up, the scrape under the load, then the kill and its exit."""
+    return LOAD_WARMUP_SECONDS + _scrape_timeout(ctx) + 2 * LOAD_KILL_SECONDS + 10
 
 
 class GpuThermalThrottleCheck:
@@ -205,8 +223,8 @@ class GpuThermalThrottleCheck:
             and not collapsed
             and not rented
             and not get_filler_only_container(ctx)
-            # the load needs its whole SSH cap; a cycle without it leaves the hold to the next one (or the TTL)
-            and task_seconds_left(ctx) >= LOAD_PROBE_TIMEOUT_SECONDS
+            # the load needs its whole sequence; a cycle without it leaves the hold to the next one (or the TTL)
+            and task_seconds_left(ctx) >= _load_probe_seconds(ctx)
         ):
             readings = await self._load_probe(ctx)
             probe_findings = [finding for finding in map(judge_gpu, readings) if finding is not None]
@@ -258,28 +276,47 @@ class GpuThermalThrottleCheck:
         return CheckResult(passed=True, event=event)
 
     async def _load_probe(self, ctx: Context) -> list[dict[str, Any]]:
-        """Each card's last busy reading under the fault probe's load, in gpu_details keys; [] when none came back."""
-        command = (
-            f"{shlex.quote(ctx.executor.python_path)} -I - --seconds {PROBE_SECONDS}"
-            f" --heat-seconds {LOAD_PROBE_SECONDS} --thermal"
+        """The cards' rows from an encrypted scrape taken under the validator's load; [] when there is no such reading.
+
+        The load is killed, and its exit awaited, before this returns, whatever happened."""
+        scrape_timeout = _scrape_timeout(ctx)
+        # the load outlasts the warm-up and the whole scrape; it is killed as soon as the reading is back
+        heat_seconds = LOAD_PROBE_SECONDS + (LOAD_START_SECONDS - PROBE_SECONDS) + scrape_timeout + LOAD_KILL_SECONDS
+        load = asyncio.create_task(
+            ctx.runner.run(
+                f"{shlex.quote(ctx.executor.python_path)} -I - --seconds {PROBE_SECONDS} --heat-seconds {heat_seconds}",
+                timeout=PROBE_TIMEOUT_SECONDS + heat_seconds,
+                retryable=False,
+                stdin_text=probe_source(),
+            )
         )
-        run = await ctx.runner.run(
-            command, timeout=LOAD_PROBE_TIMEOUT_SECONDS, retryable=False, stdin_text=probe_source()
-        )
-        report = _parse_report(run.stdout) or {}
-        devices = report.get("devices")
-        # only a run whose every card finished the heat phase speaks for the cooling: after a heat error, a faulted
-        # or a hung worker, the last busy reading can be one from the short fault rounds, which never heat a card
-        if not (
-            isinstance(devices, list)
-            and devices
-            and all(_heated(device) for device in devices[:MAX_NVML_GPUS])
-        ):
-            return []
-        thermal = report.get("thermal")
-        gpus = thermal.get("gpus") if isinstance(thermal, dict) else None
-        # executor-controlled: bounded, and only rows
-        return [gpu for gpu in gpus[:MAX_NVML_GPUS] if isinstance(gpu, dict)] if isinstance(gpus, list) else []
+        try:
+            await asyncio.sleep(LOAD_WARMUP_SECONDS)
+            if load.done():
+                return []
+            readings = await scrape_gpu_details(ctx, scrape_timeout)
+            # a load that ended (a fault, an error, a killed probe) before the reading came back may not have been on
+            # the cards when they were read
+            return [] if load.done() else readings
+        finally:
+            await asyncio.shield(self._stop_load(ctx, load))
+
+    async def _stop_load(self, ctx: Context, load: asyncio.Task) -> None:
+        if not load.done():
+            kill = await ctx.runner.run(LOAD_KILL_COMMAND, timeout=LOAD_KILL_SECONDS + 10, retryable=False)
+            if not kill.success:
+                logger.warning(
+                    _m(
+                        "GPU_THERMAL_LOAD_KILL_FAILED",
+                        extra=get_extra_info(
+                            {**ctx.default_extra, "exit_code": kill.exit_code, "stderr": kill.stderr[-200:]}
+                        ),
+                    )
+                )
+        try:
+            await asyncio.wait_for(load, LOAD_KILL_SECONDS)
+        except asyncio.TimeoutError:
+            pass  # wait_for cancelled the SSH call; the remote processes are already gone or logged above
 
     async def _update_hold(
         self,
@@ -289,7 +326,7 @@ class GpuThermalThrottleCheck:
     ) -> tuple[list[str], str | None]:
         """The marked GPUs still unproven after this reading, and since when; keeps the Redis mark in step.
 
-        readings: the load probe's rows instead of the scrape's (DAH-6469)."""
+        readings: the rows of the scrape under the validator's load instead of the cycle's scrape (DAH-6469)."""
         key = f"{THERMAL_HOLD_KEY_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
         mark: dict[str, Any] = {}
         try:
@@ -308,7 +345,7 @@ class GpuThermalThrottleCheck:
         present = [detail.get("uuid") for detail in details]
         # a marked card the scrape no longer lists was replaced (a lost card is GpuLossHoldCheck's);
         # a row without a uuid could be any marked card, so then none counts as replaced
-        # the probe's rows only clear a card by its own clean reading: replacement is the scrape's call
+        # the rows under load only clear a card by its own clean reading: replacement is the cycle's scrape's call
         if readings is None and present and all(isinstance(uuid, str) and uuid for uuid in present):
             marked_now = marked & set(present)
         else:

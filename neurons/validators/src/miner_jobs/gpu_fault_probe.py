@@ -14,10 +14,8 @@ context creation, an allocation the card or the container's limits refuse, a wor
 setup) is an error, not a fault: the validator does not penalise what it could not measure.
 
 Prints one line `GPU_FAULT_PROBE_JSON: {...}`. Exit 0 ok, 1 fault, 2 could not run.
-`--thermal` (GpuThermalThrottleCheck, DAH-6469) also reads each card's clocks, utilisation and clocks-event
-reasons every second while the workers run, and reports per card the last busy reading (`thermal`), so a
-card held for a thermal collapse can prove its cooling under the validator's own load. `--heat-seconds` adds that
-load: dense FMA work per card after the fault rounds (HEAT_PTX), compute-bound so it heats the card.
+`--heat-seconds` (GpuThermalThrottleCheck, DAH-6469) adds dense FMA work per card after the fault rounds
+(HEAT_PTX), compute-bound so it heats the card; the validator reads the cards with its own scrape meanwhile.
 `--nvml-only` (GpuMemoryHealthCheck) reads NVML once and runs no CUDA: status ok, flagged (see
 `flags`) or error, exit 0. It also lists, per card, the new hardware Xids since `--xid-after` (`xid_faults`),
 which do not set the status.
@@ -949,103 +947,6 @@ def nvml_snapshot_forked(mp) -> dict:
     return snapshot
 
 
-# GpuThermalThrottleCheck.MIN_UTILIZATION_PCT: only a reading at least this busy can prove a card
-THERMAL_BUSY_PCT = 80
-THERMAL_SAMPLE_INTERVAL_SECONDS = 1.0
-
-
-def thermal_readings(pynvml) -> list[dict]:
-    """One reading per card in the scrape's gpu_details keys, so the validator judges it as it judges the scrape."""
-
-    def reasons(h):
-        # renamed from "ThrottleReasons" in driver 535; an older binding only has the old name, same bits
-        read = getattr(pynvml, "nvmlDeviceGetCurrentClocksEventReasons", None) or getattr(
-            pynvml, "nvmlDeviceGetCurrentClocksThrottleReasons"
-        )
-        return read(h)
-
-    rows = []
-    for i in range(pynvml.nvmlDeviceGetCount()):
-        handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-        row: dict = {"index": i}
-        for key, read in (
-            ("uuid", lambda h: pynvml.nvmlDeviceGetUUID(h)),
-            ("gpu_utilization", lambda h: pynvml.nvmlDeviceGetUtilizationRates(h).gpu),
-            ("graphics_speed", lambda h: pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_GRAPHICS)),
-            ("max_graphics_speed", lambda h: pynvml.nvmlDeviceGetMaxClockInfo(h, pynvml.NVML_CLOCK_GRAPHICS)),
-            ("clocks_event_reasons", reasons),
-            ("temperature", lambda h: pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU)),
-        ):
-            try:
-                value = read(handle)
-                row[key] = value.decode() if isinstance(value, bytes) else value
-            except Exception:  # noqa: BLE001 - a field the card or binding lacks stays None: not judgeable
-                row[key] = None
-        rows.append(row)
-    return rows
-
-
-def last_busy_readings(samples: list[list[dict]]) -> list[dict]:
-    """Per card, its last reading at THERMAL_BUSY_PCT or more (the hottest point of the load), else its last one."""
-    last: dict = {}
-    busy: dict = {}
-    for rows in samples:
-        for row in rows:
-            key = row.get("uuid") or row["index"]
-            last[key] = row
-            if (row.get("gpu_utilization") or 0) >= THERMAL_BUSY_PCT:
-                busy[key] = row
-    return [busy.get(key, row) for key, row in last.items()]
-
-
-def _thermal_sampler(stop, conn) -> None:
-    _quiet_child()
-    try:
-        import pynvml
-
-        pynvml.nvmlInit()
-        samples: list[list[dict]] = []
-        try:
-            while True:
-                samples.append(thermal_readings(pynvml))
-                if stop.wait(THERMAL_SAMPLE_INTERVAL_SECONDS):
-                    break
-        finally:
-            pynvml.nvmlShutdown()
-        conn.send({"available": True, "gpus": last_busy_readings(samples)})
-    except Exception as exc:  # noqa: BLE001 - the parent must always get a reply
-        conn.send({"available": False, "error": f"{type(exc).__name__}: {exc}"})
-    conn.close()
-
-
-def start_thermal_sampler(mp):
-    stop = mp.Event()
-    parent_conn, child_conn = mp.Pipe(duplex=False)
-    process = mp.Process(target=_thermal_sampler, args=(stop, child_conn))
-    process.start()
-    child_conn.close()
-    return stop, process, parent_conn
-
-
-def finish_thermal_sampler(sampler) -> dict:
-    # stopped once the workers are drained; a read that hangs on a wedged card must not hold the verdict
-    stop, process, conn = sampler
-    stop.set()
-    try:
-        reply = (
-            conn.recv()
-            if conn.poll(NVML_GRACE_SECONDS)
-            else {"available": False, "error": f"thermal sampler hung for {NVML_GRACE_SECONDS}s"}
-        )
-    except EOFError:
-        reply = {"available": False, "error": f"thermal sampler died with exit code {_exit_code(process)}"}
-    process.join(1)
-    if process.is_alive():
-        process.kill()
-        process.join(5)
-    return reply
-
-
 def nvml_faults(before: dict, after: dict) -> list[str]:
     # an after-snapshot that hung or died has no cards in it: that says nothing about them, and reading it
     # as "every card missing" failed honest nodes (8x H200, 2 Nov); the CUDA workers' verdicts still stand
@@ -1372,15 +1273,10 @@ def main(argv: list[str]) -> int:
         help="with --xid-after: the boot id that kernel time belongs to; on another boot every line is new",
     )
     parser.add_argument(
-        "--thermal",
-        action="store_true",
-        help="also report each card's last busy clock reading under the load (thermal hold release)",
-    )
-    parser.add_argument(
         "--heat-seconds",
         type=float,
         default=0.0,
-        help="after the fault rounds, dense compute per GPU for this long (thermal load, with --thermal)",
+        help="after the fault rounds, dense compute per GPU for this long (the thermal load)",
     )
     parser.add_argument(
         "--hang-in-kernels-is-fault",
@@ -1420,8 +1316,6 @@ def main(argv: list[str]) -> int:
         process.start()
         child_conn.close()
         workers.append((index, process, parent_conn))
-    # after the workers fork: the sampler initialises NVML, and none of them may inherit it
-    sampler = start_thermal_sampler(mp) if args.thermal else None
 
     # one wall-clock budget for the concurrent workers, with grace that grows with their number: eight
     # interpreters forking, JIT-compiling and allocating at once on a loaded host take longer than one
@@ -1431,8 +1325,6 @@ def main(argv: list[str]) -> int:
         workers, time.perf_counter() + budget, budget, args.hang_in_kernels_is_fault
     )
 
-    if sampler is not None:
-        result["thermal"] = finish_thermal_sampler(sampler)
     result["nvml_after"] = nvml_snapshot_forked(mp)
     xid_after = xid_lines()
     # the cards this run speaks for: the workers' own PCI ids, plus NVML's when every device was probed
