@@ -1140,13 +1140,13 @@ class MinerService:
         )
 
     def _express_passed_after_miner_answer(self, result: JobResult, miner_hotkey: str) -> bool:
-        """A row built from the miner's answer (it could not reach the node, or left the rented node out), before an
-        express pass of that node under the same cycle id and miner: the pass is newer and stands (DAH-6596)."""
+        """A row from the miner's answer (it could not reach the node, or left the rented node out) that the miner gave
+        before an express pass of that node under the same cycle id and miner: the pass is newer and stands (DAH-6596)."""
         uuid = str(result.executor_info.uuid).lower()
         return (
             result.failure_reason_code in MINER_ANSWER_REASON_CODES
             and self._express_passed(uuid, result.job_batch_id, miner_hotkey)
-            and self.express_passed_at.get(uuid, float("-inf")) > result.built_at
+            and self.express_passed_at.get(uuid, float("-inf")) > result.observed_at
         )
 
     def _build_unreachable_known_results(
@@ -2286,6 +2286,8 @@ class MinerService:
                 )
 
             msg = _parse_miner_response(response_data)
+            # DAH-6596: what the miner's answer says is as old as the answer, not as the rows built from it after the run
+            answered_at = time.monotonic()
             
             # Track whether SSH key was successfully accepted
             ssh_key_accepted = False
@@ -2366,14 +2368,12 @@ class MinerService:
                 )
                 # DAH-3558: a rented node the miner left out of msg.executors gets a failed
                 # result, so the wave records the outage instead of nothing.
-                results.extend(
-                    self._build_not_listed_rented_results(
-                        payload, rented_data, msg.executors, executor_id
-                    )
-                )
-                results.extend(
-                    self._build_unreachable_known_results(payload, rented_data, msg, executor_id)
-                )
+                answer_rows = self._build_not_listed_rented_results(
+                    payload, rented_data, msg.executors, executor_id
+                ) + self._build_unreachable_known_results(payload, rented_data, msg, executor_id)
+                for row in answer_rows:
+                    row.observed_at = answered_at
+                results.extend(answer_rows)
 
                 # DAH-2667: while the miner's key is still installed and its idle hosts are free,
                 # measure every RoCE pair. Best effort — an unmeasured pair is simply not sold as a
