@@ -827,7 +827,7 @@ async def test_create_s3fs_volume_mount_options(
     )
 
     assert any(
-        f'DEFAULT_S3FSOPTS="{expected_options}"' in command
+        shlex.quote(f"DEFAULT_S3FSOPTS={expected_options}") in command
         for command in ssh_client.commands
     )
 

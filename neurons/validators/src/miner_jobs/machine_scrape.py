@@ -99,7 +99,9 @@ COMMANDS = {
         "docker", "run", "--rm",
         "--runtime=sysbox-runc",
         "--gpus", "all",
-        "daturaai/compute-subnet-executor:latest", "nvidia-smi"
+        # the P2P matrix as a rental sees it under this runtime; `|| true` keeps the GPU verdict on `nvidia-smi`
+        "daturaai/compute-subnet-executor:latest",
+        "sh", "-c", "nvidia-smi && echo LIUM_RENTAL_P2P && (nvidia-smi topo -p2p r || true)",
     ],
     "CHECK_STORAGE_LIMIT_ABILITY": [
         "docker", "run", "--rm",
@@ -1187,7 +1189,18 @@ def run_capability_check(command):
         run_storage_probe(["docker", "rm", "-f", name], VLOOPBACK_CLEANUP_TIMEOUT_SECONDS)
 
 
-def check_sysbox_gpu_compatibility() -> tuple[bool, str]:
+RENTAL_P2P_MARKER = "LIUM_RENTAL_P2P"
+
+
+def rental_p2p_output(stdout):
+    """The `topo -p2p r` table printed inside the sysbox check container, or None when it printed none."""
+    if RENTAL_P2P_MARKER not in stdout:
+        return None
+    table = stdout.split(RENTAL_P2P_MARKER, 1)[1]
+    return table if table.strip() else None
+
+
+def check_sysbox_gpu_compatibility() -> tuple[bool, str, str | None]:
     """
     Checks if the system supports running Docker containers with the sysbox-runc runtime
     and NVIDIA GPU access (--gpus all).
@@ -1201,18 +1214,18 @@ def check_sysbox_gpu_compatibility() -> tuple[bool, str]:
         result = run_capability_check(test_command)
 
         if result.returncode == 0:
-            return True, "Sysbox runtime supports GPU access."
+            return True, "Sysbox runtime supports GPU access.", rental_p2p_output(result.stdout)
         else:
-            return False, "Sysbox runtime does not support GPU access."
+            return False, "Sysbox runtime does not support GPU access.", None
 
     except subprocess.TimeoutExpired:
-        return False, "Test command timed out."
+        return False, "Test command timed out.", None
 
     except FileNotFoundError:
-        return False, "Docker is not installed or not found in PATH."
+        return False, "Docker is not installed or not found in PATH.", None
 
     except Exception as e:
-        return False, f"An unexpected error occurred: {e}"
+        return False, f"An unexpected error occurred: {e}", None
 
 
 # ticket-0331 (22 Sep 2026): the `--storage-opt` probe passed on a host where every rental volume failed to
@@ -1383,6 +1396,26 @@ def vloopback_check_payload(storage_opt_supported, sysbox_supported):
 
 SYSBOX_RUNC_CANDIDATES = ("sysbox-runc", "/usr/bin/sysbox-runc", "/usr/local/bin/sysbox-runc")
 SYSBOX_VERSION_PATTERN = re.compile(r"^\s*version:\s*([0-9A-Za-z.+~_-]{1,32})", re.MULTILINE)
+
+
+# A VM whose CPUID hides the brand string (a TDX guest, some clouds) makes lscpu print "Model name: 06/cf",
+# the raw family/model in hex. Intel family 6 ids from arch/x86/include/asm/intel-family.h; the raw id stays
+# in the name, so the validator's TDX host check still reads it.
+INTEL_FAMILY6_SERVER_CPUS = {
+    "8f": "Intel Xeon 4th Gen Scalable (Sapphire Rapids)",
+    "cf": "Intel Xeon 5th Gen Scalable (Emerald Rapids)",
+    "ad": "Intel Xeon 6 (Granite Rapids)",
+    "ae": "Intel Xeon 6 (Granite Rapids-D)",
+    "af": "Intel Xeon 6 (Sierra Forest)",
+}
+
+
+def cpu_model_name(lscpu_model: str) -> str:
+    raw = re.fullmatch(r"\s*0*([0-9a-fA-F]+)/([0-9a-fA-F]+)\s*", lscpu_model or "")
+    if not raw or int(raw.group(1), 16) != 6:
+        return lscpu_model
+    name = INTEL_FAMILY6_SERVER_CPUS.get(raw.group(2).lower())
+    return f"{name}, CPUID {lscpu_model.strip()}" if name else lscpu_model
 
 
 def get_sysbox_version() -> str | None:
@@ -1898,7 +1931,7 @@ def summarize_gpu_interconnect(topo_output, p2p_output, nvlink_output):
     }
 
 
-def get_gpu_interconnect():
+def get_gpu_interconnect(rental_p2p=None):
     """Run the three nvidia-smi topology tables and summarize them; never fails the scrape.
 
     `topo -m` is required - without it there is nothing to report and the reason travels in
@@ -1911,11 +1944,13 @@ def get_gpu_interconnect():
     except Exception as exc:
         return GpuInterconnectObservation(None, f"{NVIDIA_SMI_TOPO_MATRIX_CMD}: {exc!r}"[:400])
 
-    p2p_output = None
-    try:
-        p2p_output = run_cmd(NVIDIA_SMI_TOPO_P2P_READ_CMD)
-    except Exception as exc:
-        errors.append(f"{NVIDIA_SMI_TOPO_P2P_READ_CMD}: {exc!r}"[:200])
+    # a sysbox rental can read NS on pairs this scrape container reads OK: list what the rental sees
+    p2p_output = rental_p2p
+    if p2p_output is None:
+        try:
+            p2p_output = run_cmd(NVIDIA_SMI_TOPO_P2P_READ_CMD)
+        except Exception as exc:
+            errors.append(f"{NVIDIA_SMI_TOPO_P2P_READ_CMD}: {exc!r}"[:200])
 
     nvlink_output = None
     try:
@@ -2437,7 +2472,7 @@ def get_machine_specs():
     sysbox_check, storage_limit_check = run_checks_concurrently(
         [check_sysbox_gpu_compatibility, check_storage_limit_ability]
     )
-    is_supported, log_text = sysbox_check
+    is_supported, log_text, rental_p2p = sysbox_check
     data["data_sysbox_runtime"] = is_supported
     if not is_supported:
         data["data_sysbox_runtime_scrape_error"] = log_text
@@ -2467,14 +2502,14 @@ def get_machine_specs():
     if infiniband.scrape_error:
         data["data_infiniband_scrape_error"] = infiniband.scrape_error
 
-    interconnect = get_gpu_interconnect()
+    interconnect = get_gpu_interconnect(rental_p2p)
     data["data_interconnect"] = interconnect.payload
     if interconnect.scrape_error:
         data["data_interconnect_scrape_error"] = interconnect.scrape_error
 
     try:
         lscpu_output = run_cmd("lscpu")
-        data["data_cpu"]["cpu_model"] = re.search(r"Model name:\s*(.*)$", lscpu_output, re.M).group(1)
+        data["data_cpu"]["cpu_model"] = cpu_model_name(re.search(r"Model name:\s*(.*)$", lscpu_output, re.M).group(1))
         data["data_cpu"]["cpu_count"] = int(re.search(r"CPU\(s\):\s*(.*)", lscpu_output).group(1))
         data["data_cpu"]["cpu_utilization"] = psutil.cpu_percent(interval=1)
     except Exception as exc:
