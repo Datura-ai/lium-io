@@ -33,9 +33,10 @@ class SamplingValidationService:
             raise RuntimeError("ssh went away")
         if self.result is not None:
             return self.result
-        return ValidationResult(
-            success=self.success, error_message="" if self.success else "no card"
-        )
+        if self.success:
+            return ValidationResult(success=True)
+        # a failure that reads as a busy card: the filler holds the VRAM
+        return _no_answer("Failed to allocate d_A: out of memory")
 
 
 _real_cycle_index = capability._filler_cycle_index
@@ -231,8 +232,32 @@ async def test_a_failed_sample_names_why(context_factory, monkeypatch, result, k
         context_factory, SamplingValidationService(result=result), 1, specs=_cards(2)
     )
 
-    assert check.passed is True
+    # a busy card (or our own fault) stays a record; a wrong answer fails the node under enforcement
+    assert check.passed is (kind != "wrong_answer")
     assert check.event.what_we_saw["matmul_sample"]["error_kind"] == kind
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforced", [True, False])
+async def test_a_sampled_card_cuda_cannot_see_fails_the_filler_node_under_enforcement(
+    context_factory, monkeypatch, enforced
+):
+    # prod 10-17 Nov: claimed cards CUDA did not see answered exactly this beside the filler
+    monkeypatch.setattr(capability.settings, "FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES", 1)
+    monkeypatch.setattr(capability.settings, "MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", enforced)
+
+    (check,) = await _filler_cycles(
+        context_factory,
+        SamplingValidationService(result=_no_answer("no CUDA-capable device is detected")),
+        1,
+        specs=_cards(8),
+    )
+
+    assert check.event.what_we_saw["matmul_sample"]["error_kind"] == "no_answer"
+    assert check.passed is (not enforced)
+    if enforced:
+        assert check.event.reason_code == Msg.VERIFY_FAILED.reason
+        assert check.event.what_we_saw["transport"] == "filler"
 
 
 @pytest.mark.asyncio

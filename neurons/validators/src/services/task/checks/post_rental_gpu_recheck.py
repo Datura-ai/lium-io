@@ -258,7 +258,7 @@ class PostRentalGpuRecheckCheck:
         all_cards_probe = await ctx.services.validation.probe_all_claimed_cards(
             ctx.ssh, ctx.executor, ctx.default_extra, ctx.state.specs or {}
         )
-        # None: one card (the capability matmul covers it) or an unsized model (inconclusive)
+        # None: one card (the capability matmul covers it); an unsized multi-card claim is a failed probe
         what["all_cards_matmul"] = (
             None
             if all_cards_probe is None

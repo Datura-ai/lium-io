@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from neurons.validators.src.services.matrix_validation_service import ValidationResult
+from neurons.validators.src.services.matrix_validation_service import UUID_MISMATCH_ERROR_PREFIX, ValidationResult
 from neurons.validators.src.services.task.availability import availability_errors
 from neurons.validators.src.services.task.checks import capability
 from neurons.validators.src.services.task.checks.capability import CapabilityCheck
@@ -140,7 +140,14 @@ REAL_H100 = ("NVIDIA H100 80GB HBM3", {"cc": "9.0", "sm_count": 132})
 
 def _filler_ctx(context_factory, redis, metrics, *, success=True, specs=None):
     service = SamplingValidationService(
-        result=ValidationResult(success=success, error_message="" if success else "no memory", metrics=metrics)
+        result=ValidationResult(success=True, metrics=metrics)
+        if success
+        else ValidationResult(  # a busy card: the filler holds the VRAM
+            success=False,
+            returned_uuid="None",
+            stderr="Failed to allocate d_A: out of memory",
+            error_message=f"{UUID_MISMATCH_ERROR_PREFIX}: expected 'nonce', got 'None'",
+        )
     )
     state = build_state(
         specs=specs or _specs(FAKE_H100[0]),

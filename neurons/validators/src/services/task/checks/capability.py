@@ -74,20 +74,30 @@ class CapabilityCheck:
             seen, mismatches = await stored_gpu_model_verdict(ctx)
             # a node with no verdict yet is sampled now, not at its turn up to a day later
             unjudged = not seen and settings.FILLER_MATMUL_SAMPLE_EVERY_N_CYCLES > 0
+            failed_card = False
             if unjudged or _filler_matmul_sample_due(ctx, cycle):
                 sample, found = await _filler_matmul_sample(ctx, specs, cycle)
                 what_filler["matmul_sample"] = sample
+                failed_card = _filler_sample_failed_card(sample)
                 if found is not None:
                     mismatches = await judge_gpu_model(ctx, found, {sample.get("card_index", 0)})
                 elif not seen:
                     await _store_gpu_model_verdict(ctx, [], GPU_MODEL_NO_VERDICT_TTL_SECONDS)
-            if mismatches:
+            if mismatches or failed_card:
                 # the node earns nothing, so Lium's filler no longer runs on it (as SshdBootstrapCheck)
                 rented_data = ctx.state.rented_data
                 if not settings.DRY_RUN and rented_data.get_default_job_owner(ctx.executor.uuid) == DEFAULT_JOB_OWNER_LIUM:
                     what_filler["removed_fillers"] = await remove_lium_fillers(
                         ctx, rented_data.get_filler_containers(ctx.executor.uuid)
                     )
+                if failed_card:
+                    event = render_message(
+                        Msg.VERIFY_FAILED,
+                        ctx=ctx,
+                        check_id=self.check_id,
+                        what={**what_filler, "transport": "filler"},
+                    )
+                    return CheckResult(passed=False, event=event)
                 return gpu_model_mismatch_result(
                     ctx, self.check_id, {**mismatches[0].as_dict(), **what_filler, "transport": "filler"}
                 )
@@ -228,7 +238,7 @@ def _probe_gave_no_answer(result: ValidationResult | None) -> bool:
     """
     if result is None:
         return False
-    if result.timed_out:
+    if result.timed_out or result.all_cards_no_answer:
         return True
     if not (result.error_message or "").startswith(UUID_MISMATCH_ERROR_PREFIX):
         return False
@@ -576,6 +586,17 @@ def _sample_error_kind(result: ValidationResult) -> str:
     if template is Msg.VERIFY_FAILED:
         return "wrong_answer"
     return "no_answer"  # no CUDA device / CUDA not ready
+
+
+def _filler_sample_failed_card(sample: dict) -> bool:
+    """A filler sample whose pinned card gave no answer or a wrong one, under all-cards enforcement.
+
+    The filler holds the cards, so a busy card is `no_memory` (or `timeout`) and stays a record
+    only. A card CUDA cannot see at all (`no_answer`) or a wrong answer is not what a filler does to
+    a real card. Prod 10-17 Nov: 16 of 1197 samples on 497 filler nodes, every one on a node whose
+    claimed cards CUDA did not see; 0 elsewhere.
+    """
+    return settings.MATMUL_ALLCARDS_ENFORCEMENT_ENABLED and sample.get("error_kind") in ("no_answer", "wrong_answer")
 
 
 def get_filler_only_container(ctx: Context) -> str | None:

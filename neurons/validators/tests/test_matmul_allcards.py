@@ -4,9 +4,11 @@ RED→GREEN: before this change the work-proof ran ONE process with no device se
 1..N-1 were never touched and a 1-GPU host advertising 8 passed. Now every claimed card gets its
 own challenge, pinned with CUDA_VISIBLE_DEVICES=<card UUID>, timed in aggregate on the validator:
   - a 1-real-card host under an 8-GPU claim fails device selection → fails under enforcement;
+  - a claimed card CUDA cannot see exits 0 with `UUID:  None` → that card fails (no exit-status pass);
   - an honest 8-card host passes;
   - an aggregate wall-clock over threshold fails under enforcement, only emits under shadow;
-  - a single-card (legacy) executor is never judged by the all-cards path (probe returns None).
+  - a single-card (legacy) executor is never judged by the all-cards path (probe returns None);
+  - a multi-card claim the probe cannot run (unsized model, no details, our cipher) fails closed.
 """
 import json
 from types import SimpleNamespace
@@ -24,7 +26,20 @@ def svc(monkeypatch):
     wrapper.DMCompVerify_new.return_value = "ptr"
     wrapper.getCipherText.return_value = "deadbeef"
     monkeypatch.setattr(mvs, "DMCompVerifyWrapper", lambda *a, **k: wrapper)
-    return mvs.ValidationService()
+    service = mvs.ValidationService()
+    real_evaluate = service.evaluate_matmul_output
+
+    def evaluate(challenge, *, stdout, stderr=""):
+        # a real card's right answer to its own challenge; anything else is judged for real
+        if stdout == ANSWER:
+            return mvs.ValidationResult(success=True, sealed=True)
+        return real_evaluate(challenge, stdout=stdout, stderr=stderr)
+
+    monkeypatch.setattr(service, "evaluate_matmul_output", evaluate)
+    return service
+
+
+ANSWER = "RIGHT_ANSWER"
 
 
 def _executor():
@@ -53,7 +68,7 @@ def _ssh(real_cards: int):
     async def run(cmd, *args, **kwargs):
         if "CUDA_VISIBLE_DEVICES=" in cmd:
             if _card_index(cmd) < real_cards:
-                return SimpleNamespace(exit_status=0, stdout="RESULT_JSON: {}", stderr="")
+                return SimpleNamespace(exit_status=0, stdout=ANSWER, stderr="")
             return SimpleNamespace(exit_status=1, stdout="", stderr="invalid device ordinal")
         # single-card fallback path (no device prefix) — benign output.
         return SimpleNamespace(exit_status=0, stdout="UUID: x", stderr="")
@@ -174,3 +189,126 @@ async def test_a_card_whose_answer_is_not_sealed_gives_no_metrics_and_still_pass
 
     assert probe.passed is True
     assert all(card["seal_ok"] is False and "metrics" not in card for card in probe.per_card)
+
+
+def _ssh_cuda_blind(real_cards: int):
+    # the 17 Nov case: nvidia-smi lists every claimed card, CUDA sees only `real_cards`; a run pinned
+    # to an unseen card still exits 0 and prints `UUID:  None`
+    async def run(cmd, *args, **kwargs):
+        if "CUDA_VISIBLE_DEVICES=" in cmd and _card_index(cmd) < real_cards:
+            return SimpleNamespace(exit_status=0, stdout=ANSWER, stderr="")
+        return SimpleNamespace(
+            exit_status=0, stdout="UUID:  None", stderr="CUDA error: no CUDA-capable device is detected"
+        )
+
+    return SimpleNamespace(run=run)
+
+
+@pytest.mark.asyncio
+async def test_a_claimed_card_cuda_cannot_see_fails_even_though_its_run_exits_zero(svc, monkeypatch):
+    _flags(monkeypatch, enforce=True)
+
+    probe = await svc.probe_all_claimed_cards(_ssh_cuda_blind(real_cards=1), _executor(), {}, _spec(8))
+
+    assert probe.passed is False
+    assert probe.failure_reason == "7/8 card(s) failed device work-proof"
+    assert [c["reason"] for c in probe.per_card] == [""] + ["no_answer"] * 7
+    assert probe.no_answer_only is True
+
+    result = await svc.validate_gpu_model_and_process_job(
+        ssh_client=_ssh_cuda_blind(real_cards=1), executor_info=_executor(), default_extra={}, machine_spec=_spec(8)
+    )
+    assert result.success is False
+    assert result.error_message.startswith("All-cards GPU work-proof failed")
+    # CapabilityCheck waives it only when the backend lists a workload live on the node right now
+    assert result.all_cards_no_answer is True
+
+
+@pytest.mark.asyncio
+async def test_a_wrong_answer_on_one_card_is_never_a_no_answer(svc, monkeypatch):
+    _flags(monkeypatch, enforce=True)
+
+    async def run(cmd, *args, **kwargs):
+        if _card_index(cmd) == 5:
+            return SimpleNamespace(exit_status=0, stdout="UUID: someone-elses", stderr="")
+        return SimpleNamespace(exit_status=0, stdout=ANSWER, stderr="")
+
+    probe = await svc.probe_all_claimed_cards(SimpleNamespace(run=run), _executor(), {}, _spec(8))
+
+    assert probe.passed is False
+    assert probe.per_card[5]["reason"] == "wrong_answer"
+    assert probe.no_answer_only is False
+
+
+@pytest.mark.parametrize(
+    ("spec", "reason"),
+    [
+        (_spec(8, model="NVIDIA Imaginary 9000"), "no work-proof size"),
+        ({"gpu": {"count": 8, "details": []}}, "no card details"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_multi_card_claim_the_probe_cannot_run_fails_closed(svc, monkeypatch, spec, reason):
+    _flags(monkeypatch, enforce=True)
+    for detail in spec["gpu"]["details"]:
+        detail["capacity"] = 1
+
+    probe = await svc.probe_all_claimed_cards(_ssh(real_cards=8), _executor(), {}, spec)
+
+    assert probe is not None and probe.passed is False
+    assert reason in probe.failure_reason
+    result = await svc.validate_gpu_model_and_process_job(
+        ssh_client=_ssh(real_cards=8), executor_info=_executor(), default_extra={}, machine_spec=spec
+    )
+    assert result.error_message.startswith("All-cards GPU work-proof failed: not probed")
+
+
+@pytest.mark.asyncio
+async def test_our_own_cipher_failure_fails_the_probe_rather_than_skipping_it(svc, monkeypatch):
+    _flags(monkeypatch, enforce=True)
+    svc.wrapper.getCipherText.return_value = ""
+
+    probe = await svc.probe_all_claimed_cards(_ssh(real_cards=8), _executor(), {}, _spec(8))
+
+    assert probe.passed is False
+    assert "cipher" in probe.failure_reason
+
+
+@pytest.mark.asyncio
+async def test_a_single_card_host_is_proven_by_the_single_card_run(svc):
+    assert await svc.probe_all_claimed_cards(_ssh(real_cards=1), _executor(), {}, _spec(1)) is None
+
+
+@pytest.mark.parametrize(("cards", "threshold"), [(8, 120), (12, 240), (14, 240)])
+@pytest.mark.asyncio
+async def test_the_wall_clock_allows_one_per_card_cap_per_wave(svc, monkeypatch, cards, threshold):
+    ticks = iter([0.0, threshold - 1.0])
+    monkeypatch.setattr(mvs.time, "perf_counter", lambda: next(ticks))
+
+    probe = await svc.probe_all_claimed_cards(_ssh(real_cards=cards), _executor(), {}, _spec(cards))
+
+    assert probe.passed is True
+    assert probe.over_wall_clock is False
+
+
+def test_both_flags_default_on():
+    from core.config import Settings
+
+    fields = Settings.model_fields if hasattr(Settings, "model_fields") else Settings.__fields__
+    assert fields["MATMUL_ALLCARDS_CHECK_ENABLED"].default is True
+    assert fields["MATMUL_ALLCARDS_ENFORCEMENT_ENABLED"].default is True
+
+
+def test_every_scored_model_has_a_work_proof_size():
+    # an unsized model fails the probe closed, so a model added to the rates needs a size too
+    from services.const import GPU_MODEL_RATES
+
+    assert [m for m in GPU_MODEL_RATES if not mvs.matmul_probe_vram_mb(m)] == []
+
+
+def test_only_a_no_answer_all_cards_failure_is_open_to_the_live_workload_waiver():
+    from services.task.checks.capability import _probe_gave_no_answer
+
+    failed = "All-cards GPU work-proof failed: 7/8 card(s) failed device work-proof"
+    assert _probe_gave_no_answer(mvs.ValidationResult(success=False, error_message=failed, all_cards_no_answer=True))
+    assert not _probe_gave_no_answer(mvs.ValidationResult(success=False, error_message=failed))
