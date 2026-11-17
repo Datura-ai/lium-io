@@ -23,6 +23,8 @@ from .gpu_power_limit import GpuPowerLimitCheck
 from .gpu_thermal_throttle import GpuThermalThrottleCheck
 from .gpu_usage import GpuUsageCheck
 from .gpu_vram_precheck import GpuVramPrecheck
+from .spec_floor import SpecFloorCheck
+from .gpu_model_verdict import GpuModelVerdictCheck
 from .hardware_identity import HardwareIdentityCheck
 from .inspector import InspectorRentedCheck
 from .local_verify import LocalVerifyCheck
@@ -88,6 +90,8 @@ __all__ = [
     "GpuThermalThrottleCheck",
     "GpuUsageCheck",
     "GpuVramPrecheck",
+    "SpecFloorCheck",
+    "GpuModelVerdictCheck",
     "HardwareIdentityCheck",
     "InspectorRentedCheck",
     "RentedPodNetworkCheck",

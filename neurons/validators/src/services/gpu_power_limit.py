@@ -944,7 +944,8 @@ async def restore_tracked_gpu_power_limits(
         state_by_uuid = await _query_power_state(ssh, host_probe=host_probe)
     except Exception as exc:
         if check_missing:
-            raise GpuPowerRestoreStateError("GPU power state could not be read to confirm a restore") from exc
+            # the host's nvidia-smi, not platform state: the create fails as the node's and the renter is moved
+            raise RuntimeError(f"GPU power state could not be read to confirm a restore: {exc!r}") from exc
         _log(logging.WARNING, f"gpu power restore: state query failed: {exc}; restoring without before-values", {}, log_extra)
         state_by_uuid = {}
     if check_missing:

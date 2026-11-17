@@ -128,8 +128,6 @@ DOWNLOAD_SPEED_WEIGHT = 0.05
 
 MAX_GPU_COUNT = 14
 
-UNRENTED_MULTIPLIER = 1
-
 GPU_UTILIZATION_LIMIT = 5  # percent
 GPU_MEMORY_UTILIZATION_LIMIT = 5  # percent
 
@@ -166,7 +164,6 @@ PORT_RANGE_BUCKET_WIDTH = 5000
 BATCH_PORT_TIMEOUT = 40
 BATCH_PORT_CONCURRENCY = 200
 BATCH_HEALTH_CHECK_TIMEOUT = 10  # seconds to wait for batch verifier to become healthy
-VERIFY_JOB_REQUIRED_COUNT = 6 * 24 * 1
 
 # Emission split between the rented "mining" pool and the unrented + burn pool is
 # sourced from shared config at runtime via core.config.get_total_burn_emission()
@@ -176,9 +173,8 @@ VERIFY_JOB_REQUIRED_COUNT = 6 * 24 * 1
 # Rental Price Incentive Constants
 TEMPO = 360  # blocks per epoch (from subtensor)
 SECONDS_PER_BLOCK = 12  # seconds per block
-FIXED_RATIO = 0.41  # fixed constant for rental emission calculation
+FIXED_RATIO = 0.50  # miners' share of subnet emission; converts USD pay to emission share
 
-IS_NOT_DEPOSITED_SCORE_MULTIPLIER = 0.5
 DOCKER_DIND_IMAGE = "daturaai/dind:0.0.3"
 
 LIB_NVIDIA_ML_DIGESTS = {

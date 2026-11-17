@@ -419,7 +419,7 @@ class TenantEnforcementCheck:
                         continue
                 elif self.recover_stale_pods:  # a dry run never changes the count
                     await _forget_unknown_rental_state(ctx, pod_id)
-                if rental_active and not rental_active.active:
+                if rental_active and _rental_ended(rental_active):
                     if not await _every_listed_pod_stale(ctx, rented_pods, pod_index, closed_pod_ids):
                         # one rule (DAH-6141): a closed pod never decides the node while a sibling is running, down
                         # with an open rental or unanswered; the loop judges that sibling, the node stays rented
@@ -431,6 +431,7 @@ class TenantEnforcementCheck:
                         "pod_id": pod_id,
                         "container_name": pod_container_name,
                         "executor_uuid": ctx.executor.uuid,
+                        "pod_status": rental_active.status,
                         "rental_closed_at": (
                             rental_active.rental_closed_at.isoformat()
                             if rental_active.rental_closed_at
@@ -1392,9 +1393,14 @@ async def _every_listed_pod_stale(
         if other_state.running:
             return False
         rental_active = await ctx.services.backend.get_pod_rental_active(other.pod_id)
-        if not rental_active or rental_active.active:
+        if not rental_active or not _rental_ended(rental_active):
             return False
     return True
+
+
+def _rental_ended(rental_active) -> bool:
+    # DAH-6340: a balance stop removes the container but keeps the rental open (active) with the pod STOPPED
+    return not rental_active.active or rental_active.status == "STOPPED"
 
 
 _DOCKER_DAEMON_ERROR = "Error response from daemon"
