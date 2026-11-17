@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -24,18 +25,32 @@ class Runner:
         target=None,
         local_present=True,
         outcome="ok",
+        version_delay=0.0,
+        version_error=False,
     ):
         self.arch = arch
         self.local = local
         self.target = target if target is not None else f"{arch}-unknown-linux-gnu"
         self.local_present = local_present
         self.outcome = outcome
+        self.version_delay = version_delay
+        self.version_error = version_error
         self.installed = False
         self.calls: list[str] = []
 
     async def run(self, command, timeout, retryable):
         self.calls.append(command)
         if command.endswith(" version"):
+            if self.version_delay:
+                await asyncio.sleep(self.version_delay)
+            if self.version_error:
+                return SimpleNamespace(
+                    success=False,
+                    stdout="",
+                    stderr="",
+                    exit_status=None,
+                    error_type="timeout",
+                )
             build = NEW_BUILD if self.installed else (self.local if self.local_present else None)
             if build is None:
                 return SimpleNamespace(
@@ -224,6 +239,45 @@ async def test_a_cached_build_expires(monkeypatch):
 
     assert (await ensure_liumd_binary(ctx)).ok is True
     assert len(runner.calls) == calls + 1
+
+
+@pytest.mark.asyncio
+async def test_a_version_read_timeout_skips_without_fetching():
+    runner = Runner(version_error=True)
+
+    result = await ensure_liumd_binary(_ctx(runner))
+
+    assert result.skipped is True
+    assert "could not be read" in result.detail
+    assert not any("mktemp" in c for c in runner.calls)
+
+
+@pytest.mark.asyncio
+async def test_a_low_task_budget_skips_without_ssh():
+    runner = Runner()
+    budget_left = (
+        liumd_binary_refresh.REFRESH_TASK_RESERVE_SECONDS
+        + liumd_binary_refresh.MIN_REFRESH_BUDGET_SECONDS
+        - 1
+    )
+
+    result = await ensure_liumd_binary(_ctx(runner), seconds_left=budget_left)
+
+    assert result.skipped is True
+    assert runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_slow_refresh_is_bounded(monkeypatch):
+    monkeypatch.setattr(liumd_binary_refresh, "REFRESH_BUDGET_SECONDS", 0.2)
+    monkeypatch.setattr(liumd_binary_refresh, "MIN_REFRESH_BUDGET_SECONDS", 0.1)
+    runner = Runner(version_delay=1.0)
+
+    result = await ensure_liumd_binary(_ctx(runner))
+
+    assert result.skipped is True
+    assert "budget" in result.detail
+    assert not any("mktemp" in c for c in runner.calls)
 
 
 @pytest.mark.asyncio

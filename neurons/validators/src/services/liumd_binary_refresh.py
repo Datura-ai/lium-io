@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import shlex
@@ -19,6 +20,10 @@ LIUMD_FILE_RX = re.compile(r"^liumd-(amd64|arm64)$")
 SHA256_RX = re.compile(r"^[0-9a-f]{64}$")
 # A verified build is trusted for this long; a reimaged host at the same endpoint re-checks after it.
 VERIFIED_BUILD_TTL_SECONDS = 30 * 60
+# The whole refresh is capped from the executor task's remaining time, keeping this much for the scrape.
+REFRESH_BUDGET_SECONDS = 60
+REFRESH_TASK_RESERVE_SECONDS = 60
+MIN_REFRESH_BUDGET_SECONDS = 20
 
 # The liumd build this validator release expects. test_liumd_binary_manifest.py keeps this equal
 # to neurons/executor/liumd/manifest.json.
@@ -45,12 +50,14 @@ class LiumdRefresh:
     build_sha: str | None
     detail: str = ""
     changed: bool = False
+    skipped: bool = False
 
 
 @dataclass(frozen=True)
 class LiumdVersion:
     build_sha: str | None
     target: str | None
+    checked: bool = True
 
 
 def _version_doc(stdout: str) -> LiumdVersion:
@@ -75,6 +82,8 @@ async def _run(ctx: Any, command: str, timeout: int) -> Any:
 async def _read_version(ctx: Any) -> LiumdVersion:
     result = await _run(ctx, f"{shlex.quote(settings.LIUMD_BINARY_PATH)} version", 15)
     if not result.success:
+        if getattr(result, "error_type", None) is not None:
+            return LiumdVersion(None, None, checked=False)
         return LiumdVersion(None, None)
     return _version_doc(result.stdout or "")
 
@@ -179,8 +188,20 @@ def _forget_build(ctx: Any) -> None:
     _VERIFIED_BUILDS.pop(_cache_key(ctx), None)
 
 
-async def ensure_liumd_binary(ctx: Any) -> LiumdRefresh | None:
-    """Repair liumd from the pinned build when enabled. None means the feature is off."""
+def _refresh_budget(seconds_left: float | None) -> float:
+    if seconds_left is None:
+        return float(REFRESH_BUDGET_SECONDS)
+    return min(float(REFRESH_BUDGET_SECONDS), seconds_left - REFRESH_TASK_RESERVE_SECONDS)
+
+
+async def ensure_liumd_binary(
+    ctx: Any, *, seconds_left: float | None = None
+) -> LiumdRefresh | None:
+    """Repair liumd from the pinned build when enabled. None means the feature is off.
+
+    The whole attempt is capped from the executor task's remaining time; a node whose local build
+    already matches is checked with one short SSH command and never fetches.
+    """
     if not settings.LIUMD_BINARY_REFRESH_ENABLED:
         return None
     expected_build = PINNED_MANIFEST.get("build_sha")
@@ -188,8 +209,25 @@ async def ensure_liumd_binary(ctx: Any) -> LiumdRefresh | None:
         return LiumdRefresh(False, None, "pinned manifest has no build_sha")
     if _cached_build(ctx, expected_build):
         return LiumdRefresh(True, expected_build)
+    budget = _refresh_budget(seconds_left)
+    if budget < MIN_REFRESH_BUDGET_SECONDS:
+        return LiumdRefresh(
+            False, None, f"refresh budget {budget:.0f}s is too small", skipped=True
+        )
+    try:
+        async with asyncio.timeout(budget):
+            return await _ensure(ctx, expected_build)
+    except TimeoutError:
+        _forget_build(ctx)
+        return LiumdRefresh(False, None, f"refresh budget {budget:.0f}s spent", skipped=True)
+
+
+async def _ensure(ctx: Any, expected_build: str) -> LiumdRefresh:
     try:
         version = await _read_version(ctx)
+        if not version.checked:
+            _forget_build(ctx)
+            return LiumdRefresh(False, None, "local liumd version could not be read", skipped=True)
         if version.build_sha == expected_build:
             _remember_build(ctx, expected_build)
             return LiumdRefresh(True, expected_build)
