@@ -392,7 +392,7 @@ async def test_a_standing_rental_probe_failure_defers_the_all_cards_run_and_mark
 
     result = await CapabilityCheck().run(ctx)
 
-    deferred = standing and enforced
+    # in shadow the run is skipped too (it still takes the time) but decides nothing, so the cycle is not marked
     assert result.passed is True
-    assert service.probe_all_cards == [not deferred]
-    assert result.updates.get("state", ctx.state).allcards_skipped_for_standing_probe_failure is deferred
+    assert service.probe_all_cards == [not standing]
+    assert result.updates.get("state", ctx.state).allcards_skipped_for_standing_probe_failure is (standing and enforced)

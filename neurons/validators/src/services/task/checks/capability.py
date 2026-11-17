@@ -133,8 +133,8 @@ class CapabilityCheck:
             # A standing rental-probe failure: the all-cards run (up to minutes on a large node) would leave the
             # probe, the only check that clears it, too little cycle time to ever run (review). The single-card
             # run still proves card 0, and RentalProbeCheck does not pass this cycle, so every card proves
-            # itself before the node relists, as with VerifyX.
-            allcards_deferred = allcards_enforced() and await has_standing_failure(ctx)
+            # itself before the node relists, as with VerifyX. In shadow the run decides nothing, so it is only skipped.
+            allcards_deferred = settings.MATMUL_ALLCARDS_CHECK_ENABLED and await has_standing_failure(ctx)
             try:
                 result = await validation_service.validate_gpu_model_and_process_job(
                     ssh_client=ctx.ssh,
@@ -185,7 +185,7 @@ class CapabilityCheck:
             state_changes: dict = {}
             if result.metrics is not None:
                 state_changes["gpu_metrics"] = result.metrics
-            if allcards_deferred:
+            if allcards_deferred and allcards_enforced():
                 state_changes["allcards_skipped_for_standing_probe_failure"] = True
             updates: dict = {"state": replace(ctx.state, **state_changes)} if state_changes else {}
             return CheckResult(passed=True, event=event, updates=updates)
