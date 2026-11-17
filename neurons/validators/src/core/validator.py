@@ -450,7 +450,7 @@ class Validator:
 
                 # Fetch all rented executors from backend API
                 rented_executors = await self.backend_client.get_all_rented_executors(
-                    cycle_snapshot=True
+                    cycle_snapshot_block=job_block
                 )
                 if rented_executors is None:
                     logger.error(
