@@ -1,14 +1,14 @@
 {
   "schema": "liumd.binary-manifest/1",
-  "build_sha": "53999a8d15b3",
+  "build_sha": "25f8f05508ac",
   "binaries": {
     "x86_64": {
       "file": "liumd-amd64",
-      "sha256": "3566c44a3f0814351254f74d45eee4e1185737e3f4770003276a78e43d2e8f6b"
+      "sha256": "1b88754fd33a515cd98e68c94a21b0aaa833f1a0e06d56e5176da3876b6d1555"
     },
     "aarch64": {
       "file": "liumd-arm64",
-      "sha256": "276f72398dea9bb07025f2255c5a613cb8d9e9009bd0ea82b07706dfd516e8a6"
+      "sha256": "cc12eda4fb8042a6aa60d957e52a8ed674d67d9bda29f26ec6d4a765ccba4625"
     }
   }
 }
