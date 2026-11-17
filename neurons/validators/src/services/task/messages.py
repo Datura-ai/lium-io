@@ -1110,10 +1110,36 @@ class NodeAccountMessages:
     MISMATCH = MessageTemplate(
         event="Node at this address is not the one its account registered",
         reason="NODE_ACCOUNT_MISMATCH",
-        severity="warning",
-        category="policy",
-        impact="Verification failed; verification cleared",
+        severity="error",
+        # an availability error: the backend hides the node and refuses new rentals, a rental on it runs on
+        category=AVAILABILITY_CATEGORY,
+        impact="Verification failed; node hidden and not rentable while the mismatch stands (a running rental is "
+        "kept)",
         remediation="Point the node's hostname at the machine registered under this account, or register the node again.",
+    )
+    # DAH-6539: the address leads to a machine set up for another account
+    BINDING_MISMATCH = MessageTemplate(
+        event="Node at this address is not set up for the account that lists it",
+        reason="NODE_ACCOUNT_MISMATCH",
+        severity="error",
+        # an availability error: the backend hides the node and refuses new rentals, a rental on it runs on
+        category=AVAILABILITY_CATEGORY,
+        impact="Verification failed; node hidden and not rentable while the mismatch stands (a running rental is "
+        "kept)",
+        remediation="Ensure this address reaches a node configured for this account, update the node if needed, and retry "
+        "verification.",
+    )
+    # DAH-6539: the read of the node's account files failed, timed out or closed without an exit status
+    BINDING_UNVERIFIED = MessageTemplate(
+        event="Node account ownership could not be verified at this address",
+        reason="NODE_ACCOUNT_UNVERIFIED",
+        severity="error",
+        # an availability error: hidden and not rentable until a cycle reads the files, a running rental runs on
+        category=AVAILABILITY_CATEGORY,
+        impact="Verification failed; node hidden and not rentable until the next check reads it (a running rental "
+        "is kept)",
+        remediation="The validator could not read this node's account files over SSH. Make sure the executor is up "
+        "and reachable at this address; the node is listed again after the next successful check.",
     )
 
 
@@ -1161,6 +1187,32 @@ class CustomBuildOrphanSweepMessages:
         severity="info",
         category="prep",
         impact="Proceed",
+    )
+
+
+class RentalEgressGuardMessages:
+    """Link-local egress drop for the rental network (see checks/rental_egress_guard.py)."""
+
+    SKIPPED = MessageTemplate(
+        event="Rental egress guard skipped",
+        reason="RENTAL_EGRESS_GUARD_SKIPPED",
+        severity="info",
+        category="prep",
+        impact="Proceed",
+    )
+    APPLIED = MessageTemplate(
+        event="Rental egress guard applied",
+        reason="RENTAL_EGRESS_GUARD_APPLIED",
+        severity="info",
+        category="prep",
+        impact="Proceed",
+    )
+    NOT_APPLIED = MessageTemplate(
+        event="Rental egress guard not applied",
+        reason="RENTAL_EGRESS_GUARD_NOT_APPLIED",
+        severity="warning",
+        category="prep",
+        impact="Proceed; retried at the next interval",
     )
 
 
