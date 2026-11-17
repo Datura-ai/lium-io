@@ -775,10 +775,11 @@ def needrestart_data_line(line, literal, plain_setting):
 
 def get_needrestart_guard(host_root="/proc/1/root"):
     # "present", "partial", "missing" or "no_needrestart", plus the services the host file leaves unguarded.
-    # Hosts set up before the setup script wrote the file (16 Nov) have needrestart and no guard.
+    # Hosts set up before the setup script wrote the file (16 Nov) have needrestart and no guard. The setup script
+    # writes the guard file on hosts without needrestart too, so only the binary or the stock config counts.
     if os.path.samefile(host_root + "/", "/"):  # as docker_utils' [ /proc/1/root/ -ef / ]
         raise RuntimeError("no host view: the executor is not in the host PID namespace")
-    if not (os.path.exists(host_root + "/usr/sbin/needrestart") or os.path.isdir(host_root + "/etc/needrestart")):
+    if not (os.path.exists(host_root + "/usr/sbin/needrestart") or os.path.isfile(host_root + "/etc/needrestart/needrestart.conf")):
         return "no_needrestart", []
     try:
         with open(host_root + NEEDRESTART_GUARD_FILE) as guard_file:

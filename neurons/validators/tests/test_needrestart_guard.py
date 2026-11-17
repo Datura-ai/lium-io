@@ -210,6 +210,12 @@ def test_a_host_without_needrestart_needs_no_guard(tmp_path):
     assert _read(_host(tmp_path, None, needrestart=False)) == ("no_needrestart", [])
 
 
+def test_the_setup_script_guard_on_a_host_without_needrestart_needs_no_guard(tmp_path):
+    # the setup script creates conf.d and writes the guard whether or not needrestart is installed
+    (tmp_path / "etc/needrestart/conf.d").mkdir(parents=True)
+    assert _read(_host(tmp_path, _setup_script_guard(), needrestart=False)) == ("no_needrestart", [])
+
+
 def test_no_host_view_raises_so_the_scrape_reports_unknown():
     with pytest.raises(RuntimeError):
         _read(Path("/"))
@@ -288,6 +294,9 @@ def test_a_main_config_that_does_not_load_the_guard_last_makes_it_partial(tmp_pa
     path.unlink()
     if main is not None:
         path.write_text(main)
+    else:  # needrestart is installed, its config is not
+        (host / "usr/sbin").mkdir(parents=True)
+        (host / "usr/sbin/needrestart").write_text("")
 
     assert _read(host) == ("partial", ALL)
 
