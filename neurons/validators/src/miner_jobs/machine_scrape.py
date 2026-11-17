@@ -750,9 +750,10 @@ def get_needrestart_guard(host_root="/proc/1/root"):
     for service in NEEDRESTART_GUARD_SERVICES:
         # Perl keeps the last live assignment; a commented-out line is no assignment at all
         values = re.findall(
-            r"^[ \t]*\$nrconf\{override_rc\}->\{qr\(\^" + re.escape(service) + r"\)\}\s*=\s*(\w+)\s*;", text, re.M
+            r"^[ \t]*\$nrconf\{override_rc\}->\{qr\(\^" + re.escape(service) + r"\)\}\s*=\s*([^;\n]+?)\s*;", text, re.M
         )
-        if not values or values[-1] != "0":
+        # any value but a plain or quoted 0 (1, '1', "1", an expression) lets needrestart restart it
+        if not values or values[-1].strip("'\"") != "0":
             unguarded.append(service)
     return ("partial" if unguarded else "present"), unguarded
 

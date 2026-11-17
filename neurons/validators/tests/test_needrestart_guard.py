@@ -65,8 +65,9 @@ def test_a_commented_out_rule_does_not_count(tmp_path):
     assert _read(_host(tmp_path, text)) == ("partial", ["containerd"])
 
 
-def test_a_later_assignment_that_re_enables_a_restart_wins(tmp_path):
-    text = _setup_script_guard() + "\n$nrconf{override_rc}->{qr(^containerd)} = 1;\n"
+@pytest.mark.parametrize("value", ["1", "'1'", '"1"'])
+def test_a_later_assignment_that_re_enables_a_restart_wins(tmp_path, value):
+    text = _setup_script_guard() + f"\n$nrconf{{override_rc}}->{{qr(^containerd)}} = {value};\n"
 
     assert _read(_host(tmp_path, text)) == ("partial", ["containerd"])
 
