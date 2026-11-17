@@ -55,8 +55,13 @@ def h100(**overrides: Any) -> dict[str, Any]:
 class ProbeRunner:
     """The load probe's SSH run (DAH-6469): answers with a probe report carrying these thermal readings."""
 
-    def __init__(self, *readings: dict[str, Any], stdout: str | None = None):
-        report = {"status": "ok", "thermal": {"available": True, "gpus": list(readings)}}
+    def __init__(self, *readings: dict[str, Any], stdout: str | None = None, devices: list[dict] | None = None):
+        heated = {"status": "ok", "heat_s": gpu_thermal_throttle.LOAD_PROBE_SECONDS}
+        report = {
+            "status": "ok",
+            "devices": devices if devices is not None else [heated],
+            "thermal": {"available": True, "gpus": list(readings)},
+        }
         self.stdout = stdout if stdout is not None else f"GPU_FAULT_PROBE_JSON: {json.dumps(report)}\n"
         self.calls: list[str] = []
         self.timeouts: list[float] = []
@@ -531,6 +536,11 @@ async def test_a_collapse_under_the_load_probe_keeps_the_node_out(context_factor
         # busy above half its clock but still braking for heat (H100, 7 Nov: cleared at 0.682 with the bit set)
         ProbeRunner(h100(graphics_speed=1350, clocks_event_reasons=SW_THERMAL)),
         ProbeRunner(h100(graphics_speed=1350, clocks_event_reasons=HW_THERMAL)),
+        # a clean busy reading, but not from a finished heat phase: from the short fault rounds only
+        ProbeRunner(h100(), devices=[{"status": "ok", "heat_error": "PTX JIT failed: CUDA_ERROR_INVALID_PTX"}]),
+        ProbeRunner(h100(), devices=[{"status": "fault", "error": "gather: 3 of 1048576 elements wrong"}]),
+        ProbeRunner(h100(), devices=[{"status": "ok", "heat_s": 180}, {"status": "error", "error": "hung"}]),
+        ProbeRunner(h100(), devices=[]),
     ],
 )
 async def test_a_probe_that_proves_nothing_keeps_the_hold(context_factory, runner):

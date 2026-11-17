@@ -145,6 +145,12 @@ def judge_gpu(detail: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _heated(device: Any) -> bool:
+    """A probe worker that ran the whole heat phase (DAH-6469)."""
+    heat_s = _to_number(device.get("heat_s")) if isinstance(device, dict) else None
+    return device.get("status") == "ok" and heat_s is not None and heat_s >= LOAD_PROBE_SECONDS
+
+
 def _clears_hold(detail: dict[str, Any]) -> bool:
     """A busy, judgeable reading with no thermal slowdown bit: only that proves a held card's cooling (DAH-6469).
     A ratio at or above MIN_CLOCK_RATIO with the bit set is a card still braking (H100, 7 Nov: 0.682 with the bit,
@@ -260,7 +266,17 @@ class GpuThermalThrottleCheck:
         run = await ctx.runner.run(
             command, timeout=LOAD_PROBE_TIMEOUT_SECONDS, retryable=False, stdin_text=probe_source()
         )
-        thermal = (_parse_report(run.stdout) or {}).get("thermal")
+        report = _parse_report(run.stdout) or {}
+        devices = report.get("devices")
+        # only a run whose every card finished the heat phase speaks for the cooling: after a heat error, a faulted
+        # or a hung worker, the last busy reading can be one from the short fault rounds, which never heat a card
+        if not (
+            isinstance(devices, list)
+            and devices
+            and all(_heated(device) for device in devices[:MAX_NVML_GPUS])
+        ):
+            return []
+        thermal = report.get("thermal")
         gpus = thermal.get("gpus") if isinstance(thermal, dict) else None
         # executor-controlled: bounded, and only rows
         return [gpu for gpu in gpus[:MAX_NVML_GPUS] if isinstance(gpu, dict)] if isinstance(gpus, list) else []
