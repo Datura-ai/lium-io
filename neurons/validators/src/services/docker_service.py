@@ -10157,6 +10157,31 @@ class DockerService:
                 failure_step=current_step,
             )
 
+        reserved_paths = CustomOptions.reserved_volume_paths(
+            payload.custom_options.volumes if payload.custom_options else None
+        )
+        if reserved_paths:
+            current_step = "reserved_volume_path"
+            log_text = _m(
+                f"Volume path {reserved_paths[0]} is reserved: /mnt is where an attached Volume mounts and "
+                "/lium-cipher holds the encrypted data. Use another folder, such as /workspace.",
+                extra=get_extra_info(default_extra),
+            )
+            logger.error(log_text)
+            await self.redis_service.remove_pending_pod(
+                payload.miner_hotkey, payload.executor_id, payload.pod_id, command_id=payload.command_id
+            )
+            return FailedContainerRequest(
+                miner_hotkey=payload.miner_hotkey,
+                executor_id=payload.executor_id,
+                pod_id=payload.pod_id,
+                workload_kind=payload.workload_kind,
+                msg=str(log_text),
+                error_type=FailedContainerErrorTypes.ContainerCreationFailed,
+                error_code=FailedContainerErrorCodes.UnknownError,
+                failure_step=current_step,
+            )
+
         try:
             current_step = "prepare_request"
             custom_options = CustomOptions.sanitize(payload.custom_options)

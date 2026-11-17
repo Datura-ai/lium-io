@@ -10866,6 +10866,74 @@ def test_a_trailing_slash_on_the_template_path_selects_the_same_mount(template_v
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "volume",
+    [
+        "/mnt",
+        "/mnt/data/",
+        "/lium-cipher",
+        "/lium-cipher/x",
+        "volume_pod:/mnt/data",
+        "/data:/lium-cipher",
+        "volume::/mnt",
+        "volume::/lium-cipher",
+        "//mnt",
+        "//lium-cipher",
+        "/./mnt",
+        "/workspace/../mnt",
+        "///lium-cipher/x/",
+        "volume:://mnt",
+    ],
+)
+async def test_create_refuses_a_reserved_volume_path_instead_of_moving_the_volume_to_root(
+    docker_service, monkeypatch, volume
+):
+    # DAH-6579: the path was dropped and the encrypted volume made at /root while the pod showed encryption on
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        docker_image="daturaai/dlph:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+        custom_options=CustomOptions(volumes=[volume]),
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload, executor_info=executor_info, keypair=Mock(ss58_address="validator-hotkey"), private_key="k"
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "reserved_volume_path"
+    assert "Use another folder, such as /workspace" in str(result.msg)
+
+
+@pytest.mark.parametrize("volume", ["/workspace", "/data/mnt", "/mntx", "volume_pod:/workspace", "/mnt/x:/data"])
+def test_a_path_outside_mnt_and_lium_cipher_is_not_reserved(volume):
+    assert CustomOptions.reserved_volume_paths([volume]) == []
+
+
+@pytest.mark.asyncio
 async def test_stop_container_success_replies_container_stopped(docker_service, monkeypatch):
     # DAH-5510: the backend's stop of a moved pod's old container waits for this reply
     from payload_models.payloads import ContainerStopped
