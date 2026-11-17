@@ -86,8 +86,9 @@ class CustomOptions(BaseModel):
             # container side of the pod's own named volume. Only a plain absolute path is taken, and one
             # that came with flags is refused whole rather than stripped.
             if ':' not in clean_volume:
-                # the backend's template check accepts "/workspace/"; it is the same mount as "/workspace"
-                bare = _normalized_path(volume.strip())
+                # the backend's template check accepts "/workspace/"; it is the same mount as "/workspace". Not
+                # normalized: a "." or ".." form stays refused here; reserved_volume_paths reads the normalized form
+                bare = volume.strip().rstrip('/')
                 if (
                     _BARE_VOLUME_PATH_RE.fullmatch(bare)
                     and bare.split('/')[1] not in _RESERVED_VOLUME_ROOTS
