@@ -18,9 +18,7 @@ from neurons.validators.src.services.inspector_validation_service import (
 from neurons.validators.src.services.task.messages import InspectorMessages as Msg
 
 
-FETCH_URL = (
-    "https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/libinspector.so"
-)
+FETCH_URL = "https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/libinspector.so"
 VALIDATOR_SHA256 = "abc123"
 
 
@@ -52,9 +50,7 @@ class FakeSSHClient:
     def __init__(self, respond=None, arch: str = "x86_64") -> None:
         self.commands: list[str] = []
         self.arch = arch
-        self.respond = respond or (
-            lambda _command: SimpleNamespace(stdout="", stderr="", exit_status=0)
-        )
+        self.respond = respond or (lambda _command: SimpleNamespace(stdout="", stderr="", exit_status=0))
 
     async def run(self, command: str, timeout: float | None = None):
         self.commands.append(command)
@@ -64,9 +60,7 @@ class FakeSSHClient:
 
 
 class FakeShell:
-    def __init__(
-        self, *, sha256: str = VALIDATOR_SHA256, respond=None, arch: str = "x86_64"
-    ) -> None:
+    def __init__(self, *, sha256: str = VALIDATOR_SHA256, respond=None, arch: str = "x86_64") -> None:
         self.sha256 = sha256
         self.scp_checksum_calls = 0
         self.remote_checksum_calls = 0
@@ -157,13 +151,11 @@ def _interactive_stdout(*, ensure_ok: bool = True) -> list[str]:
         lines.append(json.dumps({"ok": True, "result": ""}) + "\n")
     else:
         lines.append(json.dumps({"ok": False, "error": "collector_start failed"}) + "\n")
-    lines.extend(
-        [
-            json.dumps({"ok": True, "result": '{"hello": "executor"}'}) + "\n",
-            json.dumps({"ok": True, "result": "response-cipher"}) + "\n",
-            json.dumps({"ok": True, "result": ""}) + "\n",
-        ]
-    )
+    lines.extend([
+        json.dumps({"ok": True, "result": '{"hello": "executor"}'}) + "\n",
+        json.dumps({"ok": True, "result": "response-cipher"}) + "\n",
+        json.dumps({"ok": True, "result": ""}) + "\n",
+    ])
     return lines
 
 
@@ -297,28 +289,22 @@ async def test_a_start_reply_that_comes_after_its_timeout_is_never_read_as_the_h
 
 
 @pytest.mark.asyncio
-async def test_a_host_with_one_session_gets_the_fresh_stream_once_the_timed_out_one_has_closed(
-    monkeypatch,
-):
-    monkeypatch.setattr(
-        "neurons.validators.src.services.inspector_validation_service.PROCESS_CLOSE_WAIT_SECONDS",
-        0.05,
-    )
+async def test_a_host_with_one_session_gets_the_fresh_stream_once_the_timed_out_one_has_closed(monkeypatch):
+    monkeypatch.setattr("neurons.validators.src.services.inspector_validation_service.PROCESS_CLOSE_WAIT_SECONDS", 0.05)
     service = InspectorValidationService(command_timeout=0.05)
     late = FakeProcess()
     late.stdout = FakeStdout(_interactive_stdout(), delay_first=1)
     late.terminate = lambda: None  # the host ignores TERM for a while
 
     def kill():
-        asyncio.get_running_loop().call_later(
-            0.02, late.closed.set
-        )  # KILL takes effect a moment later
+        asyncio.get_running_loop().call_later(0.02, late.closed.set)  # KILL takes effect a moment later
 
     late.kill = kill
     fresh = FakeProcess()
     fresh.stdout = FakeStdout(_interactive_stdout()[1:])
 
     class OneSessionSSH:
+        opened: list = []
         processes = [late, fresh]
 
         async def create_process(self, _command: str):
@@ -327,8 +313,6 @@ async def test_a_host_with_one_session_gets_the_fresh_stream_once_the_timed_out_
             process = self.processes.pop(0)
             self.opened.append(process)
             return process
-
-        opened: list = []
 
     result = await service.validate_rented_executor(
         FakeShell(),
@@ -347,18 +331,14 @@ async def test_a_host_with_one_session_gets_the_fresh_stream_once_the_timed_out_
 async def test_validate_rented_executor_returns_interactive_error():
     service = InspectorValidationService()
     ssh = FakeSSH()
-    ssh.process.stdout = FakeStdout(
-        [
-            json.dumps({"ok": True, "result": ""}) + "\n",
-            json.dumps({"ok": False, "error": "bad handshake"}) + "\n",
-            json.dumps({"ok": True, "result": ""}) + "\n",
-        ]
-    )
-    ssh.process.stderr = FakeStderr(
-        [
-            "return_string: decrypt failed\n",
-        ]
-    )
+    ssh.process.stdout = FakeStdout([
+        json.dumps({"ok": True, "result": ""}) + "\n",
+        json.dumps({"ok": False, "error": "bad handshake"}) + "\n",
+        json.dumps({"ok": True, "result": ""}) + "\n",
+    ])
+    ssh.process.stderr = FakeStderr([
+        "return_string: decrypt failed\n",
+    ])
     shell = FakeShell()
     executor = SimpleNamespace(
         uuid="exec-1",
@@ -726,11 +706,7 @@ def refreshing_executor(
         if "mktemp" in command:
             if install_raises:
                 raise install_raises
-            stdout = (
-                install_stdout
-                if install_stdout is not None
-                else _install_stdout(f"{VALIDATOR_SHA256:0>64}")
-            )
+            stdout = install_stdout if install_stdout is not None else _install_stdout(f"{VALIDATOR_SHA256:0>64}")
             if "MV_RC:0" in stdout:
                 shell.sha256 = installs_as
             return _ok(stdout, install_stderr)
@@ -755,11 +731,8 @@ class LocalExecutor:
     async def run(self, command: str, timeout: float | None = None):
         self.commands.append(command)
         proc = await asyncio.create_subprocess_exec(
-            "/bin/sh",
-            "-c",
-            self.limits + command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            "/bin/sh", "-c", self.limits + command,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         out, err = await asyncio.wait_for(proc.communicate(), timeout)
         self.outputs.append(out.decode())
@@ -771,14 +744,7 @@ class LocalExecutor:
         return hashlib.sha256(file.read_bytes()).hexdigest() if file.exists() else ""
 
     def temp_used(self) -> pathlib.Path:
-        return pathlib.Path(
-            next(
-                line[4:]
-                for out in self.outputs
-                for line in out.splitlines()
-                if line.startswith("TMP:")
-            )
-        )
+        return pathlib.Path(next(line[4:] for out in self.outputs for line in out.splitlines() if line.startswith("TMP:")))
 
 
 @pytest.fixture
@@ -815,10 +781,7 @@ def local_library(tmp_path, monkeypatch, refresh_on):
         lambda _path: sha,
     )
     return SimpleNamespace(
-        lib=lib,
-        source=source,
-        sha=sha,
-        settings=refresh_on,
+        lib=lib, source=source, sha=sha, settings=refresh_on,
         service=InspectorValidationService(lib_path=str(lib)),
         leftovers=lambda: sorted(p.name for p in lib_dir.iterdir() if p.name != "libinspector.so"),
     )
@@ -826,19 +789,13 @@ def local_library(tmp_path, monkeypatch, refresh_on):
 
 def _kinds(shell) -> list[str]:
     return [
-        "write-check"
-        if command.startswith("if ")
-        else "install"
-        if "mktemp" in command
-        else command.split()[0]
+        "write-check" if command.startswith("if ") else "install" if "mktemp" in command else command.split()[0]
         for command in shell.ssh_client.commands
         if command != "uname -m"
     ]
 
 
-async def _validate(
-    shell, ssh: FakeSSH | None = None, service: InspectorValidationService | None = None
-):
+async def _validate(shell, ssh: FakeSSH | None = None, service: InspectorValidationService | None = None):
     return await (service or InspectorValidationService()).validate_rented_executor(
         shell, ssh or FakeSSH(), EXECUTOR, {"executor_uuid": "exec-1"}
     )
@@ -848,31 +805,22 @@ def test_both_refresh_switches_are_off_by_default_and_the_fetch_url_tracks_main(
     assert VerifyXSettings.model_fields["LIBRARY_REFRESH_ENABLED"].default is False
     assert Settings.model_fields["INSPECTOR_LIBRARY_REFRESH_ENABLED"].default is False
     assert Settings.model_fields["INSPECTOR_LIBRARY_FETCH_URL"].default == FETCH_URL
-    assert (
-        FETCH_URL.replace("libinspector.so", "libverifyx.so")
-        == VerifyXSettings.model_fields["LIBRARY_FETCH_URL"].default
-    )
+    assert FETCH_URL.replace("libinspector.so", "libverifyx.so") == VerifyXSettings.model_fields["LIBRARY_FETCH_URL"].default
     # the default serves main's executor copy, which is installed only if it matches the validator's
     validator_lib = (REPO / "neurons/validators/libinspector.so").read_bytes()
     assert (REPO / "neurons/executor/libinspector.so").read_bytes() == validator_lib
 
 
 @pytest.mark.asyncio
-async def test_the_shared_verifyx_switch_on_writes_nothing_on_a_rented_host(
-    fake_inspector_settings,
-):
+async def test_the_shared_verifyx_switch_on_writes_nothing_on_a_rented_host(fake_inspector_settings):
     # prod sets VERIFYX_LIBRARY_REFRESH_ENABLED=true and leaves INSPECTOR_LIBRARY_REFRESH_ENABLED unset
     fake_inspector_settings.verifyx.LIBRARY_REFRESH_ENABLED = True
-    fake_inspector_settings.INSPECTOR_LIBRARY_REFRESH_ENABLED = Settings.model_fields[
-        "INSPECTOR_LIBRARY_REFRESH_ENABLED"
-    ].default
+    fake_inspector_settings.INSPECTOR_LIBRARY_REFRESH_ENABLED = Settings.model_fields["INSPECTOR_LIBRARY_REFRESH_ENABLED"].default
     shell = refreshing_executor()
     result = await _validate(shell)
     assert result.message.reason == Msg.FAILED_LIB_MISMATCH.reason
     assert result.diagnostics["library_refresh"] == "INSPECTOR_LIBRARY_MISMATCH_NO_REFRESH"
-    assert shell.ssh_client.commands == [
-        "uname -m"
-    ]  # the CPU read only: no write check, no curl, no rename
+    assert shell.ssh_client.commands == ["uname -m"]  # the CPU read only: no write check, no curl, no rename
 
 
 @needs_shell_tools
@@ -908,36 +856,17 @@ async def test_mismatch_fetches_installs_by_rename_and_the_check_passes(local_li
 @pytest.mark.parametrize(
     ("setup", "limits", "fetch_error"),
     [
-        pytest.param(
-            lambda lib: setattr(lib.service, "local_checksum", "f" * 64),
-            "",
-            "fetched sha256 {sha} != validator " + "f" * 64,
-            id="fetched-hash-differs",
-        ),
-        pytest.param(
-            lambda lib: setattr(
-                lib.settings,
-                "INSPECTOR_LIBRARY_FETCH_URL",
-                lib.source.with_name("missing.so").as_uri(),
-            ),
-            "",
-            "curl exit 37: ",
-            id="fetch-fails",
-        ),
+        pytest.param(lambda lib: setattr(lib.service, "local_checksum", "f" * 64), "",
+                     "fetched sha256 {sha} != validator " + "f" * 64, id="fetched-hash-differs"),
+        pytest.param(lambda lib: setattr(lib.settings, "INSPECTOR_LIBRARY_FETCH_URL", lib.source.with_name("missing.so").as_uri()),
+                     "", "curl exit 37: ", id="fetch-fails"),
         # a full disk: `ulimit -f 32` stops writes far below the 256 KiB download
         pytest.param(None, "ulimit -f 32; ", "curl exit ", id="full-disk"),
         # curl wrote every byte (the hash matches) but reported an error, e.g. --max-time at the end
-        pytest.param(
-            None,
-            'curl() { command curl "$@"; return 28; }; ',
-            "curl exit 28: ",
-            id="curl-error-at-end",
-        ),
+        pytest.param(None, 'curl() { command curl "$@"; return 28; }; ', "curl exit 28: ", id="curl-error-at-end"),
     ],
 )
-async def test_a_failed_fetch_installs_nothing_and_is_logged(
-    local_library, caplog, setup, limits, fetch_error
-):
+async def test_a_failed_fetch_installs_nothing_and_is_logged(local_library, caplog, setup, limits, fetch_error):
     if setup:
         setup(local_library)
     shell, ssh = LocalExecutor(limits=limits), FakeSSH()
@@ -960,12 +889,8 @@ async def test_a_failed_fetch_installs_nothing_and_is_logged(
 async def test_a_dropped_ssh_session_removes_the_download(local_library, sig):
     in_flight = "curl() { sleep 2; }; "  # a download that is still running when the signal lands
     proc = await asyncio.create_subprocess_exec(
-        "/bin/sh",
-        "-c",
-        in_flight + local_library.service._install_command(local_library.source.as_uri()),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
+        "/bin/sh", "-c", in_flight + local_library.service._install_command(local_library.source.as_uri()),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True,
     )
     assert (await asyncio.wait_for(proc.stdout.readline(), 10)).startswith(b"TMP:")  # traps are set
     assert local_library.leftovers(), "the temp file exists while the download runs"
@@ -1004,93 +929,26 @@ async def test_a_stray_stdout_line_is_not_read_as_the_fetched_hash(refresh_on, f
 @pytest.mark.parametrize(
     ("executor", "outcome", "field", "expected", "checksum_calls"),
     [
-        (
-            lambda: refreshing_executor(
-                install_stdout="TMP:/usr/lib/.x\nCURL_RC:0\nSHA256:sha256sum: not found\n"
-            ),
-            "FETCH_FAILED",
-            "fetch_error",
-            "fetched sha256 None != validator {sha}",
-            1,
-        ),
-        (
-            lambda: refreshing_executor(install_raises=OSError("connection reset " + "x" * 5000)),
-            "FETCH_FAILED",
-            "fetch_error",
-            "OSError: connection reset",
-            1,
-        ),
-        (
-            lambda: refreshing_executor(writable=False),
-            "WRITE_DENIED",
-            "error",
-            "Executor libinspector.so hash mismatch and /usr/lib is not writable",
-            1,
-        ),
-        (
-            lambda: refreshing_executor(
-                install_stdout="MKTEMP_FAILED\n", install_stderr="mktemp: No space left on device"
-            ),
-            "FETCH_FAILED",
-            "fetch_error",
-            "mktemp next to /usr/lib/libinspector.so failed",
-            1,
-        ),
-        (
-            lambda: refreshing_executor(
-                install_stdout=_install_stdout(f"{VALIDATOR_SHA256:0>64}", mv_rc=1)
-            ),
-            "FETCH_FAILED",
-            "fetch_error",
-            "mv exit 1",
-            1,
-        ),
-        (
-            lambda: refreshing_executor(installs_as="e" * 64),
-            "STILL_MISMATCHED",
-            "executor_sha256",
-            "e" * 64,
-            2,
-        ),
-        (
-            lambda: refreshing_executor(
-                install_stdout=f"TMP:/usr/lib/.x\nCURL_RC:{'9' * 5000}\nSHA256:{VALIDATOR_SHA256:0>64}\n"
-            ),
-            "FETCH_FAILED",
-            "fetch_error",
-            "curl exit None: ",
-            1,
-        ),
-        (
-            lambda: refreshing_executor(
-                install_stdout=_install_stdout(f"{VALIDATOR_SHA256:0>64}", mv_rc="0 " + "x" * 5000)
-            ),
-            "FETCH_FAILED",
-            "fetch_error",
-            "mv exit None: ",
-            1,
-        ),
-        (
-            lambda: refreshing_executor(
-                install_stdout=_install_stdout("", curl_rc=22), install_stderr="y" * 100_000
-            ),
-            "FETCH_FAILED",
-            "fetch_error",
-            "curl exit 22: ",
-            1,
-        ),
+        (lambda: refreshing_executor(install_stdout="TMP:/usr/lib/.x\nCURL_RC:0\nSHA256:sha256sum: not found\n"),
+         "FETCH_FAILED", "fetch_error", "fetched sha256 None != validator {sha}", 1),
+        (lambda: refreshing_executor(install_raises=OSError("connection reset " + "x" * 5000)),
+         "FETCH_FAILED", "fetch_error", "OSError: connection reset", 1),
+        (lambda: refreshing_executor(writable=False), "WRITE_DENIED", "error",
+         "Executor libinspector.so hash mismatch and /usr/lib is not writable", 1),
+        (lambda: refreshing_executor(install_stdout="MKTEMP_FAILED\n", install_stderr="mktemp: No space left on device"),
+         "FETCH_FAILED", "fetch_error", "mktemp next to /usr/lib/libinspector.so failed", 1),
+        (lambda: refreshing_executor(install_stdout=_install_stdout(f"{VALIDATOR_SHA256:0>64}", mv_rc=1)),
+         "FETCH_FAILED", "fetch_error", "mv exit 1", 1),
+        (lambda: refreshing_executor(installs_as="e" * 64), "STILL_MISMATCHED", "executor_sha256", "e" * 64, 2),
+        (lambda: refreshing_executor(install_stdout=f"TMP:/usr/lib/.x\nCURL_RC:{'9' * 5000}\nSHA256:{VALIDATOR_SHA256:0>64}\n"),
+         "FETCH_FAILED", "fetch_error", "curl exit None: ", 1),
+        (lambda: refreshing_executor(install_stdout=_install_stdout(f"{VALIDATOR_SHA256:0>64}", mv_rc="0 " + "x" * 5000)),
+         "FETCH_FAILED", "fetch_error", "mv exit None: ", 1),
+        (lambda: refreshing_executor(install_stdout=_install_stdout("", curl_rc=22), install_stderr="y" * 100_000),
+         "FETCH_FAILED", "fetch_error", "curl exit 22: ", 1),
     ],
-    ids=[
-        "hash-marker-not-a-sha256",
-        "transport-error",
-        "read-only-usr-lib",
-        "mktemp-fails",
-        "rename-fails",
-        "still-mismatched-after-install",
-        "curl-rc-not-a-number",
-        "mv-rc-not-a-number",
-        "long-stderr",
-    ],
+    ids=["hash-marker-not-a-sha256", "transport-error", "read-only-usr-lib", "mktemp-fails", "rename-fails",
+         "still-mismatched-after-install", "curl-rc-not-a-number", "mv-rc-not-a-number", "long-stderr"],
 )
 async def test_a_refresh_that_does_not_end_on_the_validators_hash_fails_the_check(
     refresh_on, full_sha_validator, executor, outcome, field, expected, checksum_calls
@@ -1100,21 +958,15 @@ async def test_a_refresh_that_does_not_end_on_the_validators_hash_fails_the_chec
     assert result.message.reason == Msg.FAILED_LIB_MISMATCH.reason
     assert result.diagnostics["library_refresh"] == f"INSPECTOR_LIBRARY_{outcome}"
     detail = result.error if field == "error" else result.diagnostics[field]
-    assert (
-        detail.startswith(expected.format(sha=full_sha_validator)) and len(detail) <= 420
-    )  # peer text is capped
-    assert _kinds(shell) == (
-        ["write-check"] if outcome == "WRITE_DENIED" else ["write-check", "install"]
-    )
+    assert detail.startswith(expected.format(sha=full_sha_validator)) and len(detail) <= 420  # peer text is capped
+    assert _kinds(shell) == (["write-check"] if outcome == "WRITE_DENIED" else ["write-check", "install"])
     assert shell.remote_checksum_calls == checksum_calls
     assert ssh.command == ""
 
 
 @pytest.mark.asyncio
 async def test_the_hosts_output_is_capped_when_captured():
-    shell = FakeShell(
-        sha256=STALE_SHA256, respond=lambda _command: _ok("S" * 1_000_000, "E" * 1_000_000)
-    )
+    shell = FakeShell(sha256=STALE_SHA256, respond=lambda _command: _ok("S" * 1_000_000, "E" * 1_000_000))
     capture = await InspectorValidationService._run_shell_command(shell, "anything", timeout=1)
     assert len(capture.stdout) == len(capture.stderr) == 4096
 
@@ -1149,10 +1001,7 @@ async def test_arm_executor_is_checked_against_the_aarch64_build(refresh_on, mon
     arm_lib.write_bytes(b"arm")
     service = "neurons.validators.src.services.inspector_validation_service"
     monkeypatch.setattr(f"{service}.aarch64_lib_path", lambda _path: str(arm_lib))
-    monkeypatch.setattr(
-        f"{service}.sha256_from_path",
-        lambda path: "arm-build" if path == str(arm_lib) else VALIDATOR_SHA256,
-    )
+    monkeypatch.setattr(f"{service}.sha256_from_path", lambda path: "arm-build" if path == str(arm_lib) else VALIDATOR_SHA256)
     result = await _validate(_arm_executor("arm-build"))
     assert result.error is None and result.report is not None
 
@@ -1180,10 +1029,7 @@ async def test_an_arm_host_holding_the_x86_build_is_caught(refresh_on, monkeypat
     arm_lib.write_bytes(b"arm")
     service = "neurons.validators.src.services.inspector_validation_service"
     monkeypatch.setattr(f"{service}.aarch64_lib_path", lambda _path: str(arm_lib))
-    monkeypatch.setattr(
-        f"{service}.sha256_from_path",
-        lambda path: "arm-build" if path == str(arm_lib) else VALIDATOR_SHA256,
-    )
+    monkeypatch.setattr(f"{service}.sha256_from_path", lambda path: "arm-build" if path == str(arm_lib) else VALIDATOR_SHA256)
     shell = _arm_executor(VALIDATOR_SHA256)
     result = await _validate(shell)
     assert result.message.reason == Msg.FAILED_LIB_MISMATCH.reason
