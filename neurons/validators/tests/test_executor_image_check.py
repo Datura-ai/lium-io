@@ -231,3 +231,26 @@ def test_score_calculator_zeroes_an_unofficial_build_even_warn_only(warn_only, r
     actual_score, _, _ = calculate_scores(context, rented)
 
     assert actual_score == 0.0
+
+
+@pytest.mark.asyncio
+async def test_with_enforcement_the_previous_release_in_its_grace_passes_and_keeps_incentive(enforce):
+    # DAH-6560: CURRENT feeds the image check and the incentive, not only the portal card
+    in_grace = replace(policy(), rollout_previous_digest=STALE_DIGEST)
+    context = make_context(
+        config=build_context_config(executor_image_snapshot=in_grace),
+        state=build_state(specs=specs(executor_digest=STALE_DIGEST), rented_data=SimpleNamespace(executors={})),
+    )
+
+    result = await ExecutorImageCheck().run(context)
+    report = result.updates["state"].executor_image_report
+    scored = make_context(
+        state=build_state(gpu_model="NVIDIA H200", executor_image_report=report), collateral_deposited=True
+    )
+    _, _, warning = calculate_scores(scored, False)
+
+    assert result.passed is True
+    assert report.status is ImageVerdict.CURRENT
+    assert "outdated" not in (warning or "")
+    # after the grace the same node is OUTDATED again
+    assert policy().report(STALE_DIGEST).status is ImageVerdict.OUTDATED
