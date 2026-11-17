@@ -71,6 +71,7 @@ from neurons.validators.src.services.task.checks.machine_spec_scrape import Mach
 from neurons.validators.src.services.task.checks.rented_machine import TenantEnforcementCheck
 from neurons.validators.src.services.task.messages import MachineSpecMessages as Msg
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as TenantMsg
+from neurons.validators.src.services.task.messages import GpuPowerLimitMessages as PowerMsg
 from neurons.validators.src.services.task.pipeline import Pipeline
 from neurons.validators.src.services.task.result_handler import ResultHandler
 
@@ -473,6 +474,19 @@ async def test_a_node_rented_mid_cycle_keeps_its_idle_score_of_the_cycle_before(
     [carried] = kept["5Miner"]
     assert carried.is_successful and carried.carried_for_renter_gpu_reset
     assert withheld == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", [Msg.SCRAPE_GPU_RESET_IN_PROGRESS.reason, PowerMsg.TIER_STATE_UNKNOWN.reason])
+async def test_an_idle_score_stands_only_for_a_node_rented_mid_cycle(reason):
+    # a renter's GPU reset or an unknown power tier after an idle cycle stays withheld, as before
+    service = _redis_service()
+    await remember_scored_results({"5Miner": [_scored("node-1")]}, service)
+
+    kept, withheld = await _carry_then_withhold(service, [_failed("node-1", reason)])
+
+    assert kept == {"5Miner": []}
+    assert [w.result.executor_info.uuid for w in withheld] == ["node-1"]
 
 
 @pytest.mark.asyncio

@@ -548,6 +548,9 @@ _HELD_REASONS = (
 )
 
 
+_RENTED_MID_CYCLE = TenantEnforcementMessages.RENTED_SINCE_CYCLE_START.reason
+
+
 def _held_for_renter_gpu_reset(result: JobResult) -> bool:
     return result.failure_reason_code in _HELD_REASONS
 
@@ -586,6 +589,9 @@ async def carry_renter_gpu_reset_results(
                 continue
             previous = await _last_scored_result(redis_service, miner_hotkey, held)
             if previous is None:
+                continue
+            # an idle score stands only for a node rented mid-cycle; the other holds keep carrying rented scores only
+            if not previous.is_rented and held.failure_reason_code != _RENTED_MID_CYCLE:
                 continue
             results[index] = previous.model_copy(
                 update={
