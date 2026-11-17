@@ -14183,7 +14183,7 @@ class DockerService:
                 with _best_effort_delete_step(log, "reset_gpu_clock_locks"):
                     await reset_pod_clock_locks(
                         SSHCommandRunner(ssh_client, max_retries=0), self.redis_service, payload.pod_id,
-                        payload.executor_id,
+                        payload.miner_hotkey, payload.executor_id,
                     )
 
                 with _best_effort_delete_step(log, "prune_images"):
@@ -14707,6 +14707,7 @@ class DockerService:
                 self.redis_service,
                 container_name=payload.container_name,
                 pod_id=payload.pod_id,
+                miner_hotkey=payload.miner_hotkey,
                 executor_id=payload.executor_id,
                 pod_gpu_uuids=payload.gpu_uuids,
                 gpu_indices=payload.gpu_indices,

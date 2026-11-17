@@ -9,8 +9,8 @@ services/gpu_reset.py), the PEARL power-cap pattern of services/gpu_power_limit.
 Safety invariants, each pinned by a test:
 - the GPUs touched are a subset of BOTH the container's DeviceRequests GPUs and the backend's GPUs;
 - `-lgc` / `-rgc` never run without `-i`, and the power limit (`-pl`) is never touched;
-- every lock is recorded (`gpu_clock_lock:<uuid>`, `gpu_clock_lock_pod:<pod_id>:<executor_id>`) before it is set,
-  so the pod's delete and the safety net before any create can `-rgc` it;
+- every lock is recorded (`gpu_clock_lock:<uuid>`, `gpu_clock_lock_pod:<pod_id>:<miner_hotkey>:<executor_id>`) before
+  it is set, so the pod's delete and the safety net before any create can `-rgc` it;
 - one clock change per GPU at a time (`_holding`): an owner read, its `-rgc`/`-lgc` and its record write run
   under the GPU's lock, so a late delete of one pod never resets or forgets another pod's lock.
 """
@@ -68,10 +68,20 @@ def _lock_key(uuid: str) -> str:
     return f"{CLOCK_LOCK_KEY_PREFIX}{uuid}"
 
 
-def _pod_key(pod_id: str, executor_id: str) -> str:
-    # DAH-6540 (review): one index per pod on one executor, the same scope as its pod GPU operation lock, so a moved
-    # pod's delete on the old node and its clock lock on the new node never write the same index
-    return f"{CLOCK_LOCK_POD_KEY_PREFIX}{pod_id}:{executor_id}"
+def _pod_key(pod_id: str, miner_hotkey: str, executor_id: str) -> str:
+    # DAH-6540 (review): one index per pod on one executor of one miner (an executor id is unique per miner only), the
+    # scope of its pod GPU operation lock, so a moved pod's delete and its lock on the new node never share an index
+    return f"{CLOCK_LOCK_POD_KEY_PREFIX}{pod_id}:{miner_hotkey}:{executor_id}"
+
+
+def _owned_by(record: dict, pod_id: str, miner_hotkey: str, executor_id: str) -> bool:
+    # shortcut: a record written before the hotkey was recorded has none and matches any miner; drop it with the
+    # legacy index once its 30-day rentals are gone
+    return (
+        record.get("pod_id") == pod_id
+        and record.get("executor_id") == executor_id
+        and record.get("miner_hotkey", miner_hotkey) == miner_hotkey
+    )
 
 
 def _legacy_pod_key(pod_id: str) -> str:
@@ -153,9 +163,9 @@ async def _forget(redis: RedisService, uuids: list[str]) -> None:
         raw = await redis.get(_lock_key(uuid))
         await redis.delete(_lock_key(uuid))
         record = json.loads(raw) if raw else {}
-        if not record.get("pod_id") or not record.get("executor_id"):
+        if not record.get("pod_id") or not record.get("executor_id") or not record.get("miner_hotkey"):
             continue
-        key = _pod_key(record["pod_id"], record["executor_id"])
+        key = _pod_key(record["pod_id"], record["miner_hotkey"], record["executor_id"])
         raw_index = await redis.get(key)
         left = [u for u in (json.loads(raw_index) if raw_index else []) if u != uuid]
         if left:
@@ -198,6 +208,7 @@ async def lock_pod_gpu_clocks(
     *,
     container_name: str,
     pod_id: str,
+    miner_hotkey: str,
     executor_id: str,
     pod_gpu_uuids: list[str],
     gpu_indices: list[int] | None,
@@ -225,16 +236,16 @@ async def lock_pod_gpu_clocks(
         return GpuClocksReport(ok=ok, error_code=None if ok else GpuResetErrorCode.ClockLockNotSupported, gpus=gpus)
 
     # the pod's index first, so its delete resets every GPU this request may lock (a GPU never locked costs one -rgc)
-    raw_index = await redis.get(_pod_key(pod_id, executor_id))
+    raw_index = await redis.get(_pod_key(pod_id, miner_hotkey, executor_id))
     pod_uuids = list(dict.fromkeys([*(json.loads(raw_index) if raw_index else []), *targets]))
-    await redis.set(_pod_key(pod_id, executor_id), json.dumps(pod_uuids))
+    await redis.set(_pod_key(pod_id, miner_hotkey, executor_id), json.dumps(pod_uuids))
 
     gpus: list[GpuClockOutcome] = []
     for uuid in targets:
         try:
             gpus.append(await _lock_one_gpu(
                 runner, redis, uuid, index_by_uuid[uuid], pod_gpu_uuids, min_mhz, max_mhz, pod_id=pod_id,
-                executor_id=executor_id,
+                miner_hotkey=miner_hotkey, executor_id=executor_id,
             ))
         except Exception:
             # Redis failed mid-request (review): answer the GPUs already locked, stop before the rest. A GPU whose
@@ -265,6 +276,7 @@ async def _lock_one_gpu(
     max_mhz: int | None,
     *,
     pod_id: str,
+    miner_hotkey: str,
     executor_id: str,
 ) -> GpuClockOutcome:
     """-pm 1, clamp to the GPU's supported clocks, record the lock, -lgc, read the clock back."""
@@ -281,7 +293,9 @@ async def _lock_one_gpu(
         return outcome
     low, high = clamp_range(min_mhz, max_mhz, supported_mhz)
     async with _holding([uuid]):
-        return await _record_and_lock(runner, redis, outcome, uuid, pod_gpu_uuids, low, high, pod_id, executor_id)
+        return await _record_and_lock(
+            runner, redis, outcome, uuid, pod_gpu_uuids, low, high, pod_id, miner_hotkey, executor_id
+        )
 
 
 async def _record_and_lock(
@@ -293,11 +307,13 @@ async def _record_and_lock(
     low: int,
     high: int,
     pod_id: str,
+    miner_hotkey: str,
     executor_id: str,
 ) -> GpuClockOutcome:
     # record first, as the power cap does: never change a GPU without a stored way back. Only right before the
     # -lgc, so a GPU this request never changes gets no record a create would then refuse on (review F-46)
-    record = {"gpu_uuid": uuid, "pod_id": pod_id, "executor_id": executor_id, "locked_at": time.time()}
+    record = {"gpu_uuid": uuid, "pod_id": pod_id, "miner_hotkey": miner_hotkey, "executor_id": executor_id,
+              "locked_at": time.time()}
     previous = await redis.get(_lock_key(uuid))
     # no expiry (gateway review): a record goes only once an -rgc succeeded, so a GPU whose reset keeps failing, maybe
     # still locked, stays refused rather than handed on
@@ -329,29 +345,35 @@ async def _record_and_lock(
     return outcome
 
 
-async def reset_pod_clock_locks(runner: SSHCommandRunner, redis: RedisService, pod_id: str, executor_id: str) -> int:
+async def reset_pod_clock_locks(
+    runner: SSHCommandRunner, redis: RedisService, pod_id: str, miner_hotkey: str, executor_id: str
+) -> int:
     """Teardown on one executor: `-rgc` every GPU the pod locked there; the reset count. The caller makes it
     best-effort."""
-    raw_index, raw_legacy = await redis.get(_pod_key(pod_id, executor_id)), await redis.get(_legacy_pod_key(pod_id))
+    pod_key = _pod_key(pod_id, miner_hotkey, executor_id)
+    raw_index, raw_legacy = await redis.get(pod_key), await redis.get(_legacy_pod_key(pod_id))
     if not raw_index and not raw_legacy:
         return 0  # the pod locked nothing: no SSH
     # only GPUs whose record still names this pod on this executor (review): a stale index left by a failed cleanup,
     # or the pod's lock on the node it moved to, must not be reset or dropped; an unrecorded GPU is reset by the next
     # create's safety net
     indexed = list(dict.fromkeys(str(u) for raw in (raw_index, raw_legacy) if raw for u in json.loads(raw)))
-    async with _holding(indexed):  # the owner read and the reset as one step: no other pod's lock between them
-        owned = []
-        for uuid in indexed:
-            raw = await redis.get(_lock_key(uuid))
-            record = json.loads(raw) if raw else {}
-            if record.get("pod_id") == pod_id and record.get("executor_id") == executor_id:
-                owned.append(uuid)
+    # hold only the GPUs this pod owns (review): the legacy index is per pod only, so holding all of it made the old
+    # node's delete wait on the new node's GPU lock
+    candidates = [uuid for uuid in indexed if _owned_by(await _record(redis, uuid), pod_id, miner_hotkey, executor_id)]
+    async with _holding(candidates):  # re-read under the lock: no other pod's lock between the owner read and the reset
+        owned = [u for u in candidates if _owned_by(await _record(redis, u), pod_id, miner_hotkey, executor_id)]
         failures = await _reset_gpu_clocks(runner, redis, owned)
-    await redis.delete(_pod_key(pod_id, executor_id))  # a GPU whose reset failed keeps its own record for the next create
+    await redis.delete(pod_key)  # a GPU whose reset failed keeps its own record for the next create
     if raw_legacy:
         left = [u for u in json.loads(raw_legacy) if u not in owned]
         await (redis.set(_legacy_pod_key(pod_id), json.dumps(left)) if left else redis.delete(_legacy_pod_key(pod_id)))
     return sum(1 for failure in failures.values() if failure is None)
+
+
+async def _record(redis: RedisService, uuid: str) -> dict:
+    raw = await redis.get(_lock_key(uuid))
+    return json.loads(raw) if raw else {}
 
 
 async def reset_leftover_clock_locks(
