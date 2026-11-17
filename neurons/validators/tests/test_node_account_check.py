@@ -13,7 +13,6 @@ import pytest
 import pytest_asyncio
 from datura.requests.miner_requests import ExecutorSSHInfo
 
-from services.task.checks import node_account
 from services.task.checks.node_account import NodeAccountCheck
 from tests.helpers import make_context
 
@@ -176,12 +175,11 @@ def _relay_ctx(runner, hotkeys=("5Account", POOL), claim=CLAIM, address="203.0.1
         (f"hotkey={POOL}\nclaim=claim-of-another-account\n", "NODE_ACCOUNT_MISMATCH"),  # another account's pool node
         (f"hotkey={POOL}\nclaim={CLAIM}\n", "NODE_ACCOUNT_SKIPPED"),  # its own pool node
         ("hotkey=5Account\nclaim=\n", "NODE_ACCOUNT_SKIPPED"),  # its own own-key node
-        (f"hotkey={POOL}\nclaim=\n", "NODE_ACCOUNT_MISMATCH"),  # a pool node without this account's claim
-        ("hotkey=\nclaim=\n", "NODE_ACCOUNT_MISMATCH"),  # an executor without the host files
+        (f"hotkey={POOL}\nclaim=\n", "NODE_ACCOUNT_SKIPPED"),  # a pool node from before the claim file: no evidence
+        ("hotkey=\nclaim=\n", "NODE_ACCOUNT_SKIPPED"),  # an executor without the host files: no evidence
     ],
 )
-async def test_ip_node_is_refused_on_a_machine_set_up_for_another_account(files, reason, monkeypatch):
-    monkeypatch.setattr(node_account.settings, "NODE_ACCOUNT_BINDING_ENFORCE", True)
+async def test_ip_node_is_refused_on_a_machine_set_up_for_another_account(files, reason):
     runner = _HostFiles(files)
     result = await NodeAccountCheck().run(_relay_ctx(runner))
     assert result.event.reason_code == reason
@@ -189,22 +187,25 @@ async def test_ip_node_is_refused_on_a_machine_set_up_for_another_account(files,
     if not result.passed:
         assert result.updates == {"clear_verified_job_info": True}
         assert "hostname" not in result.event.remediation
-    if files == "hotkey=\nclaim=\n":
-        assert result.event.event == "Node account ownership could not be verified at this address"
     assert runner.commands == [
         "printf 'hotkey=%s\\nclaim=%s\\n' \"$(cat /etc/liumd/miner_hotkey 2>/dev/null)\" "
         "\"$(cat /etc/liumd/account_claim 2>/dev/null)\""
     ]
 
 
-async def test_a_failed_read_is_refused_when_enforced(monkeypatch):
-    monkeypatch.setattr(node_account.settings, "NODE_ACCOUNT_BINDING_ENFORCE", True)
-    result = await NodeAccountCheck().run(_relay_ctx(_HostFiles("", success=False)))
-    assert not result.passed and result.event.reason_code == "NODE_ACCOUNT_MISMATCH"
+@pytest.mark.parametrize(
+    "files, success, unread",
+    [("", False, "hotkey"), ("hotkey=\nclaim=\n", True, "hotkey"), (f"hotkey={POOL}\nclaim=\n", True, "claim")],
+)
+async def test_no_evidence_passes_and_is_logged(files, success, unread, caplog):
+    """A failed read, missing files or an empty pool claim prove nothing: the node passes, the read is logged."""
+    result = await NodeAccountCheck().run(_relay_ctx(_HostFiles(files, success=success)))
+    assert result.passed
+    [record] = [r for r in caplog.records if "NODE_ACCOUNT_BINDING_UNVERIFIED" in r.getMessage()]
+    assert record.msg.extra["unread"] == unread
 
 
-async def test_an_own_key_account_expects_no_claim(monkeypatch):
-    monkeypatch.setattr(node_account.settings, "NODE_ACCOUNT_BINDING_ENFORCE", True)
+async def test_an_own_key_account_expects_no_claim():
     result = await NodeAccountCheck().run(_relay_ctx(_HostFiles("hotkey=5Account\nclaim=\n"), claim=None))
     assert result.passed
 
@@ -213,13 +214,3 @@ async def test_an_older_miner_is_not_checked():
     runner = _HostFiles("hotkey=5Victim\n")
     assert (await NodeAccountCheck().run(_relay_ctx(runner, hotkeys=None))).passed
     assert runner.commands == []
-
-
-async def test_until_enforced_another_accounts_machine_is_only_logged(monkeypatch, caplog):
-    """Shadow run first: prod counts the would-be refusals before any node is refused."""
-    monkeypatch.setattr(node_account.settings, "NODE_ACCOUNT_BINDING_ENFORCE", False)
-    for files, success in (("hotkey=5Victim\nclaim=\n", True), ("", False)):
-        result = await NodeAccountCheck().run(_relay_ctx(_HostFiles(files, success=success)))
-        assert result.passed
-        assert result.event.reason_code == "NODE_ACCOUNT_SKIPPED"
-    assert caplog.text.count("NODE_ACCOUNT_BINDING_WOULD_REFUSE") == 2

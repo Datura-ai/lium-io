@@ -12,15 +12,14 @@ DAH-6539: an IP:port can be re-pointed too, by a relay that forwards it to anoth
 11-16 Nov 2026: every executor also accepts the shared pool hotkey, so the victim installed our key).
 So for every node the miner lists with the account's hotkeys, the check reads the hotkey and account claim the
 machine itself is set up for (`/etc/liumd/miner_hotkey`, `/etc/liumd/account_claim`, written by the executor) with a
-fixed command, and refuses a machine set up for another hotkey, or reporting another account's claim. The portal
-requires both at registration (DAH-4375), so an honest node matches. Files that cannot be read, or a claim missing where
-one is expected, establish no ownership and count as a mismatch too. Until NODE_ACCOUNT_BINDING_ENFORCE is on, a
-mismatch is only logged (NODE_ACCOUNT_BINDING_WOULD_REFUSE with `binding_mismatch`), so the shadow run counts each kind.
+fixed command. It refuses only on direct evidence of another account: a machine set up for a hotkey that is not one
+of the account's, or a pool node reporting another account's claim. The portal requires both at registration
+(DAH-4375), so an honest node matches. Files that cannot be read and an empty claim prove nothing either way (executors
+write the claim file from this release on): the node passes and the read is logged (NODE_ACCOUNT_BINDING_UNVERIFIED).
 """
 
 from __future__ import annotations
 
-from core.config import settings
 from core.utils import _m, get_extra_info, get_logger
 from services.node_host import host_key_body, is_ip_literal, registered_host_keys
 
@@ -86,20 +85,18 @@ class NodeAccountCheck:
         what = {**what, "node_hotkey": hotkey, "expected_node_hotkeys": executor.expected_node_hotkeys}
         expected_claim = executor.expected_account_claim
         if not result.success or not hotkey:
-            # an executor without the host files, or a read that failed or was stalled: ownership not established
-            what["binding_mismatch"] = "unread"
-        elif hotkey not in executor.expected_node_hotkeys:
+            # an executor without the host files, or a read that failed or was stalled: no evidence either way
+            logger.info(_m("NODE_ACCOUNT_BINDING_UNVERIFIED", extra=get_extra_info({**what, "unread": "hotkey"})))
+            return None
+        if hotkey not in executor.expected_node_hotkeys:
             what["binding_mismatch"] = "hotkey"
-        elif expected_claim and hotkey == ctx.miner_hotkey and claim != expected_claim:
-            # as node control: a node set up for the listing (pool) hotkey proves its account only by the claim, so a
-            # missing claim fails too; one set up for the account's own hotkey needs none
+        elif expected_claim and hotkey == ctx.miner_hotkey and claim and claim != expected_claim:
+            # a node set up for the listing (pool) hotkey proves its account only by the claim; one set up for the
+            # account's own hotkey needs none
             what["binding_mismatch"] = "claim"
         else:
+            if expected_claim and hotkey == ctx.miner_hotkey and not claim:
+                logger.info(_m("NODE_ACCOUNT_BINDING_UNVERIFIED", extra=get_extra_info({**what, "unread": "claim"})))
             return None
-        if not settings.NODE_ACCOUNT_BINDING_ENFORCE:
-            # shadow run first (Sergej, lio#2288): count would-be refusals in prod before any node is refused
-            logger.warning(_m("NODE_ACCOUNT_BINDING_WOULD_REFUSE", extra=get_extra_info(what)))
-            return None
-        template = Msg.BINDING_UNVERIFIED if what["binding_mismatch"] == "unread" else Msg.BINDING_MISMATCH
-        event = render_message(template, ctx=ctx, check_id=self.check_id, what=what)
+        event = render_message(Msg.BINDING_MISMATCH, ctx=ctx, check_id=self.check_id, what=what)
         return CheckResult(passed=False, event=event, updates={"clear_verified_job_info": True})
