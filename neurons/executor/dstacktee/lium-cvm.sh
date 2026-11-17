@@ -146,12 +146,20 @@ check_requirements() {
         all_good=false
     fi
 
-    # Check QEMU
+    # Check QEMU: the binary the launcher runs ([qemu] path in client.conf), not whatever is on PATH
     log_info "Checking QEMU installation..."
-    if command_exists qemu-system-x86_64; then
-        log_success "QEMU is installed: $(qemu-system-x86_64 --version | head -n1)"
+    local qemu_path qemu_version
+    qemu_path=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import dstack; print(dstack.DStackConfig.load().qemu_path)' "$SCRIPTS_DIR" 2>/dev/null) || qemu_path=qemu-system-x86_64
+    if command_exists "$qemu_path"; then
+        qemu_version=$("$qemu_path" --version | head -n1)
+        if [[ "$qemu_version" == *"version 9.2.1"* ]]; then
+            log_success "QEMU used for CVMs ($qemu_path): $qemu_version"
+        else
+            log_warning "QEMU used for CVMs ($qemu_path) is not the dstack 9.2.1 build: $qemu_version"
+            log_warning "Attestation will fail on this QEMU. Build it and set [qemu] path in /etc/dstack/client.conf (docs/host-setup.md section 3)"
+        fi
     else
-        log_error "QEMU (qemu-system-x86_64) is not installed"
+        log_error "QEMU ($qemu_path) is not installed"
         all_good=false
     fi
 

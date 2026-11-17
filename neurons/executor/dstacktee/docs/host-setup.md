@@ -73,7 +73,7 @@ path = /opt/qemu-dstack/bin/qemu-system-x86_64
 
 (`dstack.py` merges `/etc/dstack/client.conf`, `~/.config/dstack/client.conf`, and any `.dstack/client.conf` at or above the working directory, later files overriding earlier ones. `/etc/dstack/client.conf` is recommended because `lium-cvm.sh` runs under sudo.)
 
-Optionally symlink it so `lium-cvm.sh check` finds a QEMU on PATH:
+`lium-cvm.sh check` reads the same `client.conf` and warns unless that QEMU reports version 9.2.1. Optionally also symlink it onto PATH:
 
 ```bash
 sudo ln -s /opt/qemu-dstack/bin/qemu-system-x86_64 /usr/local/bin/qemu-system-x86_64
@@ -176,4 +176,4 @@ sudo ./lium-cvm.sh new my-executor && sudo ./lium-cvm.sh run my-executor
 | Attestation fails on RTMR0 / quote not whitelisted, image and compose correct | host running distro QEMU instead of the dstack 9.2.1 build | §3 — install the fork and set `client.conf`; confirm with `--version` |
 | QEMU launch error mentioning `iommufd` / `VFIO_DEVICE_BIND_IOMMUFD` EINVAL | launcher predates the QEMU-version-gated VFIO backend | update to the current release — `dstack.py` now selects type1 automatically for QEMU < 10 |
 | Validation fails `CHECK_SYSBOX_COMPATIBILITY` inside the guest | compose not the released one (pre-launch sysbox force-install missing or altered) | redeploy with the unmodified released compose (§5) |
-| `lium-cvm.sh check` reports QEMU missing although §3 is done | `check` looks for `qemu-system-x86_64` on PATH; the launcher itself uses `client.conf` | add the §3 symlink, or ignore this one check line |
+| `lium-cvm.sh check` warns the QEMU is not the dstack 9.2.1 build | `check` tests the QEMU the launcher will run: `[qemu] path` from `client.conf`, else `qemu-system-x86_64` on PATH | §3 — build the fork and set `[qemu] path`; `check` names the binary it tested |

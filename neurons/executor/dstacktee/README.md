@@ -38,6 +38,8 @@ cp .env.example .env
 # - CVM_GPUS (e.g., "all" or "19:00.0,3b:00.0")
 ```
 
+**Disk size.** `CVM_DISK` must be at least 1.5x the total VRAM of the GPUs you pass through, or the validator pays no idle incentive for the node. It compares the filesystem size the CVM reports, so leave about 10% headroom: 8x H100 needs about 1100G, 8x H200 about 1900G, 8x B200 about 2400G. The CVM disk is `run/vms/<name>/hda.img` inside this checkout, so clone the repository on the disk that has the space (for example under `/data`) before `new`.
+
 ### 4. Create CVM Instance
 
 ```bash
@@ -114,7 +116,7 @@ EXECUTOR_RUNNER_IMAGE_DIGEST=sha256:...
 # Resources
 CVM_VCPUS=16
 CVM_MEMORY=64G
-CVM_DISK=200G
+CVM_DISK=1100G  # at least 1.5x total GPU VRAM (see below)
 CVM_GPUS=all  # or "19:00.0,3b:00.0"
 ```
 
