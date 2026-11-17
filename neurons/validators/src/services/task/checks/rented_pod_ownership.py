@@ -14,7 +14,9 @@ from .rented_pod_resources import running_rented_container_names
 READ_TIMEOUT_SECONDS = 30
 # docker starts a restart-policy container within a few minutes of boot; one started later was restarted alone
 CONTAINER_RESTART_AFTER_BOOT_SECONDS = 600
-# a creation time this close to the boot (whole seconds on both sides, clock slew) tells neither side of it
+# a creation time up to this long after the boot (whole seconds on both sides, clock slew) is read as before it: no
+# container is created seconds after the kernel boots (dockerd and the validator come up later), so it is one
+# created just before the stop
 BOOT_TIME_UNCERTAINTY_SECONDS = 5
 
 
@@ -232,10 +234,7 @@ class RentedPodOwnershipCheck:
                 pod["started_after_boot_s"] = uptime_s - age_s
             created_s = created.get(pod["container"])
             if boot_s is not None and created_s is not None:
-                if created_s < boot_s - BOOT_TIME_UNCERTAINTY_SECONDS:
-                    pod["created_before_boot"] = True
-                elif created_s > boot_s + BOOT_TIME_UNCERTAINTY_SECONDS:
-                    pod["created_before_boot"] = False
+                pod["created_before_boot"] = created_s <= boot_s + BOOT_TIME_UNCERTAINTY_SECONDS
         causes = [_shift_cause(p) for p in shifted]
         if all(c == "container" for c in causes):
             return Msg.SHIFTED_AFTER_CONTAINER_RESTART

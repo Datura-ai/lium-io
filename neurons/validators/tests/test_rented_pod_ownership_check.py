@@ -266,9 +266,11 @@ async def test_a_shift_after_a_container_only_restart_does_not_blame_the_host(
         ("2026-11-17T20:20:33.5Z", Msg.SHIFTED_AFTER_CONTAINER_RESTART, False),
         # a creation time that is not one: the age alone decides, as before
         ("yesterday", Msg.SHIFTED_AFTER_CONTAINER_RESTART, None),
-        # created 0.3 s after the boot: whole seconds and clock slew cannot place it, so the age decides
-        ("2026-11-17T20:20:03.3Z", Msg.SHIFTED_AFTER_CONTAINER_RESTART, None),
-        ("2026-11-17T20:19:59.9Z", Msg.SHIFTED_AFTER_CONTAINER_RESTART, None),
+        # within seconds of the boot either side: rounding and clock slew, and no container is created that soon
+        # after a boot, so it was there at the stop however late the recovery started it
+        ("2026-11-17T20:20:03.3Z", Msg.SHIFTED, True),
+        ("2026-11-17T20:19:59.9Z", Msg.SHIFTED, True),
+        ("2026-11-17T20:20:09Z", Msg.SHIFTED_AFTER_CONTAINER_RESTART, False),
     ],
 )
 @pytest.mark.asyncio
