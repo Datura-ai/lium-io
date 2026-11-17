@@ -346,6 +346,14 @@ class Settings(BaseSettings):
     # running the Python machine scrape. Off: Python remains authoritative and the early run is
     # only compared in the shadow.
     VALIDATOR_LIUMD_SPECS: bool = Field(env="VALIDATOR_LIUMD_SPECS", default=False)
+    # Prod repair path: fetch the liumd manifest from lium-io main and replace a missing/stale
+    # /usr/local/bin/liumd only after the manifest sha256 matches.
+    LIUMD_BINARY_REFRESH_ENABLED: bool = Field(env="LIUMD_BINARY_REFRESH_ENABLED", default=False)
+    LIUMD_BINARY_MANIFEST_URL: str = Field(
+        env="LIUMD_BINARY_MANIFEST_URL",
+        default="https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/liumd/manifest.json",
+    )
+    LIUMD_BINARY_PATH: str = Field(env="LIUMD_BINARY_PATH", default="/usr/local/bin/liumd")
     # The shadow's whole-call budget (seconds), clipped to what the executor task has left; the
     # intent's `deadline_s` is this − 30. Sized for a scored cycle, where VerifyX (p90 about 150 s)
     # and the matmul (at most 120 s) run one after the other.

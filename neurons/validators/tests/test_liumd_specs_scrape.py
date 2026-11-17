@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from helpers import build_context_config, build_services, build_state, make_context
+from services.liumd_binary_refresh import LiumdRefresh
 from services.local_verify_client import LocalVerifyAnswer, LocalVerifyUnavailable
 from services.task import liumd_shadow
 from services.task.checks import machine_spec_scrape
@@ -217,3 +218,40 @@ def test_normalization_maps_the_liumd_contract_without_mutating_the_snapshot():
     assert normalized["os"] == "Ubuntu 24.04 LTS"
     assert "vloopback_check" not in normalized
     assert raw == snapshot
+
+
+@pytest.mark.asyncio
+async def test_a_failed_binary_refresh_fails_specs_mode_before_the_scrape(monkeypatch):
+    _liumd_on(monkeypatch)
+
+    async def failed_refresh(ctx):
+        return LiumdRefresh(False, None, "manifest unavailable")
+
+    monkeypatch.setattr(machine_spec_scrape, "ensure_liumd_binary", failed_refresh)
+    runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=FERNET_TOKEN))
+
+    result = await MachineSpecScrapeCheck().run(_ctx(runner))
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.SCRAPE_FAILED_ON_HOST.reason
+    assert result.event.what_we_saw["liumd_reason"] == "binary_refresh_failed"
+    assert runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_binary_refresh_does_not_fail_shadow_mode(monkeypatch):
+    monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_SPECS", False)
+    monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_SHADOW", True)
+    monkeypatch.setattr(machine_spec_scrape.settings, "DRY_RUN", False)
+
+    async def failed_refresh(ctx):
+        return LiumdRefresh(False, None, "manifest unavailable")
+
+    monkeypatch.setattr(machine_spec_scrape, "ensure_liumd_binary", failed_refresh)
+    runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=FERNET_TOKEN))
+
+    result = await MachineSpecScrapeCheck().run(_ctx(runner))
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.SCRAPE_OK.reason
+    assert len(runner.calls) == 1

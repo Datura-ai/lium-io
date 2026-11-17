@@ -11,6 +11,7 @@ from typing import Any, Literal
 
 from services.file_encrypt_service import ORIGINAL_KEYS
 from services.gpu_spec_table import classify_gpu_model, list_sxm_on_pcie_adapter_as_pcie
+from services.liumd_binary_refresh import ensure_liumd_binary
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -401,6 +402,29 @@ class MachineSpecScrapeCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         liumd_specs = settings.VALIDATOR_LIUMD_SPECS and not settings.DRY_RUN
+        if settings.VALIDATOR_LIUMD_SHADOW or liumd_specs:
+            refresh = await ensure_liumd_binary(ctx)
+            if refresh is not None and not refresh.ok:
+                if liumd_specs:
+                    return self._fail_liumd(
+                        ctx,
+                        None,
+                        f"liumd binary refresh failed: {refresh.detail}",
+                        reason="binary_refresh_failed",
+                    )
+                logger.warning(
+                    _m(
+                        "liumd binary refresh failed; shadow continues",
+                        extra=get_extra_info({**ctx.default_extra, "detail": refresh.detail[:300]}),
+                    )
+                )
+            elif refresh is not None and refresh.changed:
+                logger.info(
+                    _m(
+                        "liumd binary refreshed",
+                        extra=get_extra_info({**ctx.default_extra, "build_sha": refresh.build_sha}),
+                    )
+                )
         if liumd_specs:
             return await self._scrape_with_liumd(ctx)
 
@@ -537,16 +561,23 @@ class MachineSpecScrapeCheck:
         )
 
     @staticmethod
-    def _fail_liumd(ctx: Context, answer: Any, detail: str | None = None) -> CheckResult:
+    def _fail_liumd(
+        ctx: Context,
+        answer: Any,
+        detail: str | None = None,
+        *,
+        reason: str | None = None,
+    ) -> CheckResult:
         from services.local_verify_client import LocalVerifyUnavailable
 
-        if isinstance(answer, LocalVerifyUnavailable):
-            reason = answer.reason or "unavailable"
-            detail = detail or answer.detail
-        elif answer is None:
-            reason = "no_early_read"
-        else:
-            reason = "malformed"
+        if reason is None:
+            if isinstance(answer, LocalVerifyUnavailable):
+                reason = answer.reason or "unavailable"
+                detail = detail or answer.detail
+            elif answer is None:
+                reason = "no_early_read"
+            else:
+                reason = "malformed"
         detail = (detail or reason)[:300]
         template = Msg.SCRAPE_TIMEOUT if reason == "timeout" else Msg.SCRAPE_FAILED_ON_HOST
         event = render_message(
