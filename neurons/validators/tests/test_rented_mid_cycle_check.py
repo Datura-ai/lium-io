@@ -269,6 +269,35 @@ async def test_a_rent_during_the_gpu_and_network_tests_stops_them_with_no_verdic
     assert events[-1].reason_code == Msg.RENTED_SINCE_CYCLE_START.reason
 
 
+class SlowCleanupStep(HeavyStep):
+    """Its cancel cleanup (the remote kill) takes an await of its own."""
+
+    def __init__(self):
+        super().__init__()
+        self.cleaned_up = False
+
+    async def run(self, ctx):
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.05)
+            self.cleaned_up = True
+            raise
+
+
+@pytest.mark.asyncio
+async def test_an_outside_cancel_returns_only_after_the_steps_own_cleanup_ran():
+    # JOB_TIME_OUT cancels the run; SSH closes right after, so the remote kill must have run before the run returns
+    step = SlowCleanupStep()
+    run = asyncio.ensure_future(Pipeline([step], AsyncMock()).run(make_ctx()))
+    await asyncio.sleep(0.05)
+
+    run.cancel()
+    await asyncio.gather(run, return_exceptions=True)
+
+    assert step.cleaned_up
+
+
 @pytest.mark.asyncio
 async def test_an_expired_mark_does_not_stop_the_tests():
     ctx = make_ctx()

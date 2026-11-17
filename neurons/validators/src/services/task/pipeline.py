@@ -857,8 +857,11 @@ class Pipeline:
             ran_checks, after = await task
             return ran_checks, after, None
         finally:
-            # this run cancelled from outside: the step goes with it
-            task.cancel()
+            # this run cancelled from outside (JOB_TIME_OUT): the step goes with it, and its own cleanup (the remote
+            # kill) finishes before the caller closes the SSH session
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
     async def run(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
         passed, events, end_ctx = await self._run_checks(ctx)
