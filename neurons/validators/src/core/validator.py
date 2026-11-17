@@ -449,7 +449,9 @@ class Validator:
                 executor_image_snapshot = build_expected_image_snapshot(executor_digest)
 
                 # Fetch all rented executors from backend API
-                rented_executors = await self.backend_client.get_all_rented_executors()
+                rented_executors = await self.backend_client.get_all_rented_executors(
+                    cycle_snapshot=True
+                )
                 if rented_executors is None:
                     logger.error(
                         _m(

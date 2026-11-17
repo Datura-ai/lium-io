@@ -340,16 +340,21 @@ class BackendClient:
         # without this, tenacity raises RetryError after the last None
         retry_error_callback=lambda retry_state: None,
     )
-    async def get_all_rented_executors(self) -> RentedExecutorsResponse | None:
+    async def get_all_rented_executors(
+        self, cycle_snapshot: bool = False
+    ) -> RentedExecutorsResponse | None:
         """Fetch all rented executors with their ports from the backend.
 
         Retried three times, 30 s apart: this is the cycle's snapshot, and a cycle without it
         cannot start. None when all three fail. A check that asks mid-cycle uses
-        `get_rented_executors_now` instead.
+        `get_rented_executors_now` instead. `cycle_snapshot` marks the one read per cycle
+        (DAH-6400): only that read counts as a resumed node's list read for its idle-pay hold.
         """
-        return await self.get_rented_executors_now()
+        return await self.get_rented_executors_now(cycle_snapshot=cycle_snapshot)
 
-    async def get_rented_executors_now(self) -> RentedExecutorsResponse | None:
+    async def get_rented_executors_now(
+        self, cycle_snapshot: bool = False
+    ) -> RentedExecutorsResponse | None:
         """One un-retried read of the rented executors and fillers as the backend sees them now.
 
         For a check that re-asks after the cycle snapshot (DAH-3480): a backend that does not
@@ -358,7 +363,9 @@ class BackendClient:
         """
         return await self._signed_request(
             "GET",
-            "/internal/executors/rented",
+            "/internal/executors/rented?cycle_snapshot=true"
+            if cycle_snapshot
+            else "/internal/executors/rented",
             RentedExecutorsResponse,
             timeout=30,
         )

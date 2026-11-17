@@ -388,6 +388,26 @@ async def test_get_all_rented_executors_parses_filler_mapping(reset_session, cli
     }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cycle_snapshot", "path"),
+    [
+        (True, "/internal/executors/rented?cycle_snapshot=true"),
+        (False, "/internal/executors/rented"),
+    ],
+)
+async def test_only_the_cycle_snapshot_read_says_so(reset_session, client, cycle_snapshot, path):
+    # DAH-6400: the backend counts only the cycle's read toward a resumed node's idle-pay hold
+    mock_session = create_mock_session(create_mock_response(200, {"executors": {}}))
+
+    with patch.object(BackendClient, "get_session", return_value=mock_session):
+        await client.get_all_rented_executors(cycle_snapshot=cycle_snapshot)
+
+    call = mock_session.request.call_args
+    url = str(call.args[1] if len(call.args) > 1 else call.kwargs.get("url"))
+    assert url.endswith(path)
+
+
 def create_mock_session_with_attempts(side_effects):
     """Session whose request yields one side effect per attempt (exception or response)."""
     mock_session = AsyncMock()
