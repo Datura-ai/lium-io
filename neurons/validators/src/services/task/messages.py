@@ -3023,9 +3023,10 @@ class RentedPodOwnershipMessages:
         severity="warning",
         category="runtime",
         impact="Proceed; incorrect ownership can break package installation, root login, or sudo until repaired",
-        remediation="The shifted pods do not share one cause: a pod whose started_after_boot_s is 600 or more "
-        "had its container restarted while the host kept running; one started right after boot came back "
-        "after the host stopped without a clean shutdown. A restart does not repair it. Contact support: the "
+        remediation="The shifted pods do not share one cause: a pod created after the boot "
+        "(created_before_boot false) whose started_after_boot_s is 600 or more had its container restarted "
+        "while the host kept running; any other pod (created before the boot, or started right after it) came "
+        "back after the host stopped without a clean shutdown. A restart does not repair it. Contact support: the "
         "renters are moved to fresh pods free of charge. Do not change file ownership on the host or restart "
         "a rented pod's container yourself, and shut the host down cleanly.",
     )
