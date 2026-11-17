@@ -274,7 +274,7 @@ async def lium_containers(ctx: Context) -> set[str] | None:
         containers.update(f"{BUILD_DIND_PREFIX}{pod.pod_id}" for pod in rented_executor.pods)
     specs = ctx.state.specs or {}
     containers.update(await late_started_containers_the_backend_owns(ctx, containers))
-    containers.update(await excused_storage_helper_keys(ctx))
+    containers.update(await excused_storage_helper_keys(ctx, fresh=False))
     stack_ids: set[str] = executor_stack_container_ids(specs)
     if settings.PROVIDER_SIDE_LOAD_STACK_EXCUSE_CAP_ENABLED and stack_excuse_is_over_its_cap(specs):
         # like the name tier: over the cap the whole tier excuses nothing
@@ -285,9 +285,12 @@ async def lium_containers(ctx: Context) -> set[str] | None:
     return containers
 
 
-async def excused_storage_helper_keys(ctx: Context) -> set[str]:
+async def excused_storage_helper_keys(ctx: Context, fresh: bool = True) -> set[str]:
     return await settle_excused_storage_helper_keys(
-        ctx.services.redis, ctx.executor.uuid, lambda op: storage_operation_open(ctx, op)
+        ctx.services.redis,
+        ctx.executor.uuid,
+        lambda op: storage_operation_open(ctx, op),
+        wave_id=None if fresh else ctx.config.job_batch_id,
     )
 
 
