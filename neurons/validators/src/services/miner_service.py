@@ -69,7 +69,13 @@ from core.utils import _m, _StructuredMessage, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import bound_pod_states, chunk_pod_states
 from services.attestation_service import AttestationService
-from services.docker_service import DockerService, create_steps_after_reply, customer_creates, inflight_creates
+from services.docker_service import (
+    DockerService,
+    create_steps_after_reply,
+    customer_creates,
+    executor_key,
+    inflight_creates,
+)
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.node_host import for_payload_miner, public_host_sock
 from services.redis_service import MACHINE_SPEC_CHANNEL, POD_STATES_CHANNEL, RedisService
@@ -254,7 +260,7 @@ def _bypasses_renting_in_progress(payload: ContainerBaseRequest) -> bool:
     # DAH-2728: the pending-pod flag this guard reads is set by the very create this delete is
     # about to cancel, so declining here would leave that create to finish and orphan its
     # container — the exact failure the delete was sent to prevent.
-    return inflight_creates.is_running(payload.pod_id)
+    return inflight_creates.is_running(payload.pod_id, executor_key(payload))
 
 
 def _ssh_key_not_accepted_text(executors: list[ExecutorSSHInfo], default_extra: dict) -> _StructuredMessage:
@@ -1678,7 +1684,7 @@ class MinerService:
             result = await self._route_container(payload)
             await self._report_storage_dispatch_failure(payload, result)
             return result
-        with inflight_creates.track(payload.pod_id), customer_creates.track(payload):
+        with inflight_creates.track(payload.pod_id, executor_key(payload)), customer_creates.track(payload):
             return await self._route_container(payload)
 
     async def _report_storage_dispatch_failure(self, payload: ContainerBaseRequest, result: object) -> None:
@@ -2745,7 +2751,9 @@ class MinerService:
                     if isinstance(payload, ContainerCreateRequest):
                         # DAH-3980: a create's reply does not wait for the miner
                         create_steps_after_reply.start(
-                            payload.pod_id, self._log_ssh_key_removal_after_reply(remove_ssh_key, default_extra)
+                            payload.pod_id,
+                            executor_key(payload),
+                            self._log_ssh_key_removal_after_reply(remove_ssh_key, default_extra),
                         )
                     else:
                         await remove_ssh_key

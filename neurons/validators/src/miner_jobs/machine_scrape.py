@@ -1398,6 +1398,26 @@ SYSBOX_RUNC_CANDIDATES = ("sysbox-runc", "/usr/bin/sysbox-runc", "/usr/local/bin
 SYSBOX_VERSION_PATTERN = re.compile(r"^\s*version:\s*([0-9A-Za-z.+~_-]{1,32})", re.MULTILINE)
 
 
+# A VM whose CPUID hides the brand string (a TDX guest, some clouds) makes lscpu print "Model name: 06/cf",
+# the raw family/model in hex. Intel family 6 ids from arch/x86/include/asm/intel-family.h; the raw id stays
+# in the name, so the validator's TDX host check still reads it.
+INTEL_FAMILY6_SERVER_CPUS = {
+    "8f": "Intel Xeon 4th Gen Scalable (Sapphire Rapids)",
+    "cf": "Intel Xeon 5th Gen Scalable (Emerald Rapids)",
+    "ad": "Intel Xeon 6 (Granite Rapids)",
+    "ae": "Intel Xeon 6 (Granite Rapids-D)",
+    "af": "Intel Xeon 6 (Sierra Forest)",
+}
+
+
+def cpu_model_name(lscpu_model: str) -> str:
+    raw = re.fullmatch(r"\s*0*([0-9a-fA-F]+)/([0-9a-fA-F]+)\s*", lscpu_model or "")
+    if not raw or int(raw.group(1), 16) != 6:
+        return lscpu_model
+    name = INTEL_FAMILY6_SERVER_CPUS.get(raw.group(2).lower())
+    return f"{name}, CPUID {lscpu_model.strip()}" if name else lscpu_model
+
+
 def get_sysbox_version() -> str | None:
     """The host's `sysbox-runc --version` (e.g. "0.6.4"), telemetry only. None when Sysbox is absent
     or the command fails or cannot run. The absolute paths are tried through PID 1's root, since the
@@ -2489,7 +2509,7 @@ def get_machine_specs():
 
     try:
         lscpu_output = run_cmd("lscpu")
-        data["data_cpu"]["cpu_model"] = re.search(r"Model name:\s*(.*)$", lscpu_output, re.M).group(1)
+        data["data_cpu"]["cpu_model"] = cpu_model_name(re.search(r"Model name:\s*(.*)$", lscpu_output, re.M).group(1))
         data["data_cpu"]["cpu_count"] = int(re.search(r"CPU\(s\):\s*(.*)", lscpu_output).group(1))
         data["data_cpu"]["cpu_utilization"] = psutil.cpu_percent(interval=1)
     except Exception as exc:

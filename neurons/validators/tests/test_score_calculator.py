@@ -224,3 +224,12 @@ def test_gpu_model_flag_zeroes_a_rented_score(passed):
     actual_score, _, warning = calculate_scores(ctx, rented=True)
     assert actual_score == (1.0 if passed else 0.0)
     assert ("A GPU is not the model the node reports" in warning) is not passed
+
+
+@pytest.mark.parametrize("passed", [True, False])
+def test_node_account_flag_zeroes_a_rented_score(passed):
+    """DAH-6539: a node on another account's machine is non-fatal on a live rental; only this flag zeroes its score."""
+    ctx = _ctx(500.0).model_copy(update={"node_account_passed": passed})
+    actual_score, _, warning = calculate_scores(ctx, rented=True)
+    assert actual_score == (1.0 if passed else 0.0)
+    assert ("not on the machine its account registered" in warning) is not passed
