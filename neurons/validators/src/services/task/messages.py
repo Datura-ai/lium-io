@@ -2359,6 +2359,14 @@ class RentalVerificationMessages:
             "repeats, run `docker compose restart executor-runner` in neurons/executor."
         ),
     )
+    # DAH-6564: the probe failed on a node the backend lists as rented when re-read at check time
+    RENTED_AT_CHECK_TIME = MessageTemplate(
+        event="Rental verification skipped: node rented during the cycle",
+        reason="RENTAL_CHECK_RENTED_AT_CHECK_TIME",
+        severity="info",
+        category="policy",
+        impact="Proceed; the node is judged as rented from the next cycle",
+    )
     # Same verdict as FAILED; the kernel GPU list read from inside the executor container came back empty.
     GPU_LIST_EMPTY = MessageTemplate(
         event="Rental verification failed",

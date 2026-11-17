@@ -237,11 +237,14 @@ class GpuUsageCheck:
         # every process belongs to ONE OF the node's fillers, not a single expected container.
         filler_containers = set(rented_data.get_filler_containers(ctx.executor.uuid)) if rented_data else set()
         process_names = {process.get("container_name") for process in gpu_processes}
+        violation = _find_violation(gpu_details, gpu_processes)
+        if violation:
+            # DAH-6564: a filler started after the cycle's snapshot is judged by the backend's word at check time
+            filler_containers |= await _late_fillers_the_backend_owns(ctx, process_names - filler_containers)
         fillers_only = bool(filler_containers) and all(name in filler_containers for name in process_names)
         # judged at any load, also beside a rental pod: a swapped filler can hold VRAM while staying
         # under the utilization limits
         off_image = await _fillers_off_their_image(ctx, process_names & filler_containers)
-        violation = _find_violation(gpu_details, gpu_processes)
         if violation and "gpu_index" in violation:
             # the card's index on the node, not in the list left after a reset dropped some
             busy = gpu_details[violation["gpu_index"]]
@@ -583,6 +586,25 @@ async def _drop_containers_the_backend_still_owns(
         name for name, is_ours in zip(lium_named_containers, ownership_verdicts) if is_ours
     }
     return [process for process in foreign_processes if process.container_name not in still_ours]
+
+
+async def _late_fillers_the_backend_owns(ctx: Context, names: set[str | None]) -> set[str]:
+    """Filler containers outside the snapshot that the backend lists as a live run on this node now. Unlike
+    the_backend_still_owns this is fail-closed: it excuses load, so an unanswered question excuses nothing."""
+    late = {
+        name: run_id
+        for name in names
+        if name and name.startswith(FILLER_CONTAINER_PREFIX)
+        and (run_id := _uuid_after_prefix(name, FILLER_CONTAINER_PREFIX))
+    }
+    runs = await asyncio.gather(*(ctx.services.backend.get_filler_run_active(run_id) for run_id in late.values()))
+    return {
+        name
+        for name, run in zip(late, runs)
+        if run is not None
+        and _the_answer_is_about_this_node(ctx, run.executor_id)
+        and (run.active or run.status in LIVE_FILLER_RUN_STATUSES)
+    }
 
 
 async def the_backend_still_owns(ctx: Context, container_name: str) -> bool:
