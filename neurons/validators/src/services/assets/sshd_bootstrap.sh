@@ -424,14 +424,26 @@ verify_sshd() {
     return 1
 }
 
+# The pod heals its own SSH (DAH-6042): every pass checks the bootstrap's invariant, an sshd
+# listening on :22, not only an sshd process (a leftover session process is named sshd too).
+# `set -e` is off here: one failed step (a log write on a full disk, a keygen error) must not
+# end the only thing that brings sshd back.
 watchdog_loop() {
+    set +e
+    passes=0
     while true; do
-        if ! is_sshd_running; then
+        # first check one interval in: the bootstrap has just verified sshd, or the image is still starting it
+        sleep "$SLEEP_SECONDS"
+        if ! is_sshd_running || ! is_sshd_listening; then
             acquire_lock
             if ensure_sshd_installed; then
                 prepare_sshd_runtime
-                if ! start_sshd_if_needed; then
+                if is_sshd_listening && is_sshd_running; then
+                    :
+                elif ! "$(get_sshd_binary)"; then
                     log "Failed to restart sshd from watchdog"
+                else
+                    log "Watchdog restarted sshd"
                 fi
             else
                 log "Watchdog could not install sshd"
@@ -439,7 +451,9 @@ watchdog_loop() {
             release_lock
         fi
 
-        sleep "$SLEEP_SECONDS"
+        passes=$((passes + 1))
+        # tests only: stop after N passes
+        [ "$passes" = "${LIUM_WATCHDOG_PASSES:-}" ] && return 0
     done
 }
 
@@ -508,8 +522,12 @@ ensure_vulkan_egl_icd() {
     done
 }
 ensure_vulkan_egl_icd || true
-# an image that starts its own sshd gets only the ICD step (docker_service: image_manages_services)
-[ -z "${VULKAN_ICD_ONLY:-}" ] || exit 0
+# an image that starts its own sshd (docker_service: image_manages_services) gets the ICD step and
+# the watchdog: its start-up script starts sshd once and nothing brings it back (DAH-6042)
+if [ -n "${VULKAN_ICD_ONLY:-}" ]; then
+    spawn_watchdog
+    exit 0
+fi
 
 # 1. Somebody already brought sshd up (image entrypoint won outright, or this
 #    is a re-run) — adopt it, never touch host keys.
