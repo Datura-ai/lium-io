@@ -165,6 +165,7 @@ sudo ./lium-cvm.sh new my-executor && sudo ./lium-cvm.sh run my-executor
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| `run` fails: QEMU `Could not open /dev/vfio/<N>` | that GPU or NVSwitch is still on the `nvidia` driver (not bound to `vfio-pci`) | §2 — add its PCI ID to `vfio-pci.ids`, reboot, confirm with `lspci -nnk -s <gpu-addr>`; `./lium-cvm.sh check` now lists every passthrough device and its driver |
 | QEMU exits during guest boot: `VFIO_MAP_DMA failed: No space left on device` | default `dma_entry_limit` (65 535) exhausted by TDX page conversions | §2 — set `vfio_iommu_type1.dma_entry_limit=16777216` (runtime echo + GRUB persist) |
 | Guest reboot-loops; console shows `Failed to open encrypted data disk` | measurements changed under an existing `hda.img` (QEMU/image/compose changed), or the key provider was rebuilt outside `cvm_upgrade_guard.sh` | if a `lium-key-provider:pre-upgrade-*` or `pinned-*` tag holds the old image, `docker tag <that> lium-key-provider:local`, write its id to `/var/lib/lium-cvm/key-provider.image` and `sudo ./cvm_upgrade_guard.sh start`; otherwise recreate the VM (`stop`, remove `run/vms/<name>`, `new`, `run`) |
 | `cvm_upgrade_guard.sh upgrade` exits 3 | CVM disks exist on the host (the list names each `hda.img`, stopped CVMs included) | §6.1 — remove each listed disk by hand once its data is not needed; the guard never deletes |

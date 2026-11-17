@@ -115,6 +115,51 @@ download_os_image() {
     return 0
 }
 
+# The PCI slots `new` passes through: CVM_GPUS from .env, or every NVIDIA GPU and NVSwitch for "all"
+passthrough_slots() {
+    local gpus="${CVM_GPUS:-}"
+    if [ -z "$gpus" ] && [ -f .env ]; then
+        gpus=$(sed -n 's/^CVM_GPUS=//p' .env | tail -n1 | tr -d '"'"'"' ')
+    fi
+    [ -z "$gpus" ] && return 0
+    if [ "$gpus" = "all" ]; then
+        lspci -d 10de: -nn 2>/dev/null | grep -E "3D controller|Bridge" | awk '{print $1}'
+    else
+        tr ',' '\n' <<<"$gpus" | xargs -n1
+    fi
+}
+
+check_vfio_devices() {
+    local slot dev driver group ok=true
+    local slots
+    slots=$(passthrough_slots)
+    if [ -z "$slots" ]; then
+        log_warning "CVM_GPUS is not set in .env; no GPU will be passed through"
+        return 0
+    fi
+    for slot in $slots; do
+        dev="/sys/bus/pci/devices/$slot"
+        [ -e "$dev" ] || dev="/sys/bus/pci/devices/0000:$slot"
+        if [ ! -e "$dev" ]; then
+            log_error "Passthrough device $slot not found (check CVM_GPUS against 'lspci -d 10de:')"
+            ok=false
+            continue
+        fi
+        driver=$(basename "$(readlink -f "$dev/driver" 2>/dev/null)" 2>/dev/null)
+        group=$(basename "$(readlink -f "$dev/iommu_group" 2>/dev/null)" 2>/dev/null)
+        if [ "$driver" != "vfio-pci" ]; then
+            log_error "$slot uses driver '${driver:-none}', not vfio-pci (docs/host-setup.md section 2: vfio-pci.ids, then reboot)"
+            ok=false
+        elif [ -z "$group" ] || [ ! -e "/dev/vfio/$group" ]; then
+            log_error "$slot has no /dev/vfio/${group:-<group>} (IOMMU off? docs/host-setup.md section 2)"
+            ok=false
+        else
+            log_success "$slot is bound to vfio-pci (/dev/vfio/$group)"
+        fi
+    done
+    [ "$ok" = true ]
+}
+
 # Check command - verify system requirements
 check_requirements() {
     log_info "Checking system requirements for DStack CVM..."
@@ -227,6 +272,10 @@ check_requirements() {
         log_error "Python3 is not installed"
         all_good=false
     fi
+
+    # Check passthrough devices: QEMU opens /dev/vfio/<group> for each one, so each must be bound to vfio-pci
+    log_info "Checking GPU passthrough (vfio-pci)..."
+    check_vfio_devices || all_good=false
 
     # Summary
     echo
