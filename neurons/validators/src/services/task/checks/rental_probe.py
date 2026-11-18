@@ -255,6 +255,19 @@ class RentalProbeCheck:
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
+        result = await self._probe_and_judge(ctx)
+        if result.passed and ctx.state.verifyx_skipped_for_standing_probe_failure:
+            # VerifyX did not judge the node this cycle: it relists after the next cycle runs it
+            return CheckResult(
+                passed=False,
+                event=render_message(
+                    Msg.CYCLE_WITHOUT_VERIFYX, ctx=ctx, check_id=self.check_id, what=result.event.what_we_saw
+                ),
+                updates={"score": 0.0, "job_score": 0.0},
+            )
+        return result
+
+    async def _probe_and_judge(self, ctx: Context) -> CheckResult:
         gate = await self._may_probe(ctx)
         if isinstance(gate, CheckResult):
             return gate
@@ -760,6 +773,14 @@ async def _standing_failure(ctx: Context) -> _Failure | None:
         # enforcement switched off after the failure was stamped: the egress step fails nothing any more
         return None
     return _Failure(step, create_step or None) if step else None
+
+
+async def has_standing_failure(ctx: Context) -> bool:
+    """Does a standing probe failure fail this cycle? Not on a node a renter has (_may_probe skips it there)."""
+    rented = rental_of_this_node(ctx)
+    if rented and rented.pods:
+        return False
+    return await _standing_failure(ctx) is not None
 
 
 async def _stamp_failure(ctx: Context, failure: _Failure) -> None:
