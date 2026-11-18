@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime
 import subprocess
 from types import SimpleNamespace
 
@@ -332,6 +333,14 @@ async def test_a_runtime_process_younger_than_a_pod_is_listed_as_its_own_outcome
     # its own outcome so the restart is logged at INFO even when the last cycle was OK
     assert result.event.reason_code == (Msg.RUNTIME_RESTARTED if restarted else Msg.OK).reason
     assert result.event.what_we_saw.get("runtime_restarted_under_pods") == restarted
+    if restarted:
+        # each restarted process's start time (UTC), so a fault window can start there
+        started = result.event.what_we_saw["runtime_started_at"]
+        assert set(started) == set(restarted)
+        age = datetime.now(UTC) - datetime.strptime(started["sysbox-fs"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+        assert 99 <= age.total_seconds() <= 105
+    else:
+        assert "runtime_started_at" not in result.event.what_we_saw
 
 
 @pytest.mark.parametrize("template", [Msg.SHIFTED, Msg.SHIFTED_AFTER_CONTAINER_RESTART, Msg.SHIFTED_MIXED])
