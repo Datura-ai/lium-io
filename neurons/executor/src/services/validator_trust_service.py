@@ -124,24 +124,26 @@ class ValidatorTrust:
         logger.info("Validator trust at start: %s", self.report())
 
     def _select(self) -> None:
-        """Hold the best known message: one the current owner signed (highest revision). Without one, a held message
-        stays held; at start the highest revision is taken. Run at start and after every owner change."""
-        best = None
+        """Hold the current owner's highest revision among the image copy and the kept message; without one, the kept
+        message (what this node last held), else the image copy. Revisions are only compared within one signer. The
+        held message is always the kept one, so a restart starts from it. Run at start and after every owner change."""
+        verified = {}
         for name, (signed, signer) in self._candidates.items():
-            current = signer == self.owner
-            if not current and self.held is not None:
-                continue  # an owner change alone never swaps the held validator for another former-owner message
             try:
-                trusted = verify_trust_message(signed, signer)
+                verified[name] = (verify_trust_message(signed, signer), signer, signed)
             except Exception as exc:
                 logger.warning("Validator trust: %s message refused: %s", name, exc)
-                continue
-            rank = (current, trusted.revision, name == "kept")
-            if best is None or rank > best[0]:
-                best = (rank, trusted, signer)
-        if best is not None and (best[1], best[2]) != (self.held, self.held_owner):
-            self.held, self.held_owner = best[1], best[2]
-            logger.warning("Validator trust: now trusting %s (revision %d)", self.held.validator, self.held.revision)
+        current = [entry for entry in verified.values() if entry[1] == self.owner]
+        best = max(current, key=lambda entry: entry[0].revision) if current else verified.get("kept") or verified.get("image")
+        if best is None:
+            return
+        trusted, signer, signed = best
+        if (trusted, signer) != (self.held, self.held_owner):
+            self.held, self.held_owner = trusted, signer
+            logger.warning("Validator trust: now trusting %s (revision %d)", trusted.validator, trusted.revision)
+        if self._candidates.get("kept") != (signed, signer):
+            self._candidates["kept"] = (signed, signer)
+            self._save(MESSAGE_FILE, {**signed._asdict(), "owner": signer})
 
     def offer(self, signed: SignedTrustMessage) -> bool:
         """Take a served message: signed by the current owner, and a higher revision than the held one unless the

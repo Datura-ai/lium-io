@@ -256,3 +256,26 @@ def test_an_owner_change_never_restores_an_older_message_of_the_former_owner(
     restarted.load()
     assert restarted.owner == owner_b.ss58_address
     assert (restarted.held.validator, restarted.held.revision) == (new_validator.ss58_address, 8)
+
+
+def test_a_restart_never_compares_revisions_of_different_owners(
+    tmp_path, monkeypatch, owner, old_validator, new_validator
+):
+    # review finding: image copy A revision 8 (old validator), B then signs revision 1 (new validator), the chain
+    # names C, who has published nothing; the node restarts
+    owner_b = Keypair.create_from_uri("//LiumTrustNewOwner")
+    owner_c = Keypair.create_from_uri("//LiumTrustThirdOwner")
+    monkeypatch.setattr(trust_service, "RELEASE_SUBNET_OWNER_HOTKEY", owner.ss58_address)
+    image = tmp_path / "image.json"
+    image.write_text(_dump(_signed(owner, old_validator, 8)))
+    trust = _trust(tmp_path, owner, image)
+    for new_owner in (owner_b, owner_c):
+        monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout, o=new_owner: o.ss58_address)
+        trust.refresh_owner()
+        if new_owner is owner_b:
+            assert trust.offer(_signed(owner_b, new_validator, 1))
+    assert trust.held.validator == new_validator.ss58_address
+    restarted = ValidatorTrust(state_dir=tmp_path, image_message=image)
+    restarted.load()
+    assert restarted.owner == owner_c.ss58_address
+    assert (restarted.held.validator, restarted.held.revision) == (new_validator.ss58_address, 1)
