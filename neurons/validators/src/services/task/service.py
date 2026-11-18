@@ -32,7 +32,7 @@ from .availability import (
     ReachTarget,
     availability_errors,
     build_ssh_unreachable_event,
-    failed_check_event,
+    run_availability_errors,
 )
 from .liumd_shadow import run_liumd_shadow, shadow_deadline
 from .messages import (
@@ -270,11 +270,7 @@ class TaskService:
                 # DAH-2748: any check that could not reach something hides the node. The whole
                 # event list is read, so a new reachability check needs no change here.
                 # DAH-5395: a run ended by a failure in REASONS_THAT_HIDE_AT_ONCE hides the node too
-                failed = failed_check_event(ok, events)
-                result.availability_errors = [
-                    error.model_dump(mode="json")
-                    for error in availability_errors([*events, failed] if failed else events)
-                ]
+                result.availability_errors = run_availability_errors(ok, events)
                 if not ok and last_event.reason_code == TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason:
                     # DAH-5718: the checks after the one whose session died never ran, so [] would clear holds only
                     # they re-read (a GPU-loss hold the scrape cleared waits for its recheck); None leaves the stored ones

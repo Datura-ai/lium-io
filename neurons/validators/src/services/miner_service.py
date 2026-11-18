@@ -91,6 +91,7 @@ from services.task.availability import (
     build_rented_executor_not_listed_event,
     RunningOutageTally,
 )
+from services.task.messages import TenantEnforcementMessages
 from incentive.config import BASE_GPU_MAP
 from services.task_service import TaskService, JobResult
 from services.storage_operations import (
@@ -326,9 +327,13 @@ POD_GPUS_GONE_RERUN_MIN_SECONDS = 240
 
 
 def _pod_left_on_old_gpus(result) -> bool:
-    """The result failed because a rented pod still runs on GPUs the node no longer has."""
+    """The result failed because a rented pod still runs on GPUs the node no longer has, or its container could not
+    be read right after the node's GPUs changed (DAH-6546: the backend is often recreating it then)."""
     if not isinstance(result, JobResult) or result.is_successful:
         return False
+    event = result.validation_event
+    if event is not None and event.reason_code == "GPU_LOST_POD_UNREAD":
+        return True
     return any(
         error.get("reason_code") == "GPU_LOST"
         and "pod_gpus_gone" in ((error.get("what_we_saw") or {}).get("faults") or [])
@@ -532,7 +537,7 @@ class MinerService:
         its old GPUs, once the backend has had time to recreate the pod on the new cards, and
         (a wave only: an express run publishes its own result next) publish a pass at once
         (spec-only, as publish_gpu_set_changes; the cycle's publish carries the same result).
-        Kept to the miner's job budget; a rerun with no result keeps the first."""
+        Kept to the miner's job budget; a rerun with no result (an error or a timeout) keeps the first."""
         stranded = [i for i, result in enumerate(raw_results) if _pod_left_on_old_gpus(result)]
         if not stranded:
             return
@@ -553,8 +558,15 @@ class MinerService:
             *(run(executors[i], timeout) for i in stranded), return_exceptions=True
         )
         for i, rerun in zip(stranded, reruns):
-            # a failed rerun keeps the first result: its pod_gpus_gone event moves the pod off the cycle report
-            if isinstance(rerun, JobResult) and rerun.is_successful:
+            # DAH-6546: a rerun that ran its checks is the latest verdict, failed or not; a pod still on the old GPUs
+            # fails it with its own pod_gpus_gone event, and its rented-GPU drop report moves the pod as the first run's
+            # did. An errored run (create_task's log_status "error") has no verdict, nor has one whose SSH session died
+            # (its later checks never ran, review 4602277079): the first stands.
+            if (
+                isinstance(rerun, JobResult)
+                and rerun.log_status != "error"
+                and rerun.failure_reason_code != TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason
+            ):
                 raw_results[i] = rerun
         passed = [r for r in reruns if isinstance(r, JobResult) and r.is_successful]
         logger.info(
