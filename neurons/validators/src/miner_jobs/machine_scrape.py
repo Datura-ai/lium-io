@@ -851,14 +851,19 @@ def get_needrestart_guard(host_root="/proc/1/root"):
     flat = [" ".join(ln.split()).replace(old_log, loader[2]) for _, ln in main]
     at = next((i for i in range(len(flat)) if flat[i : i + len(loader)] == loader), None)
     if at is None:
-        start = next((i for i in range(len(flat)) if flat[i] == loader[0]), None)
-        if start is None:
+        # a recognisable loader that was changed: align it on any of its distinctive (non-brace) lines, take the
+        # alignment that matches most loader lines, and name its first changed line, not only the file
+        def matched(start):
+            return sum(0 <= start + j < len(flat) and flat[start + j] == loader[j] for j in range(len(loader)))
+
+        starts = {i - j for i in range(len(flat)) for j in range(len(loader) - 2) if flat[i] == loader[j]}
+        if not starts:
             return unknowable(f"{main_path} has no stock conf.d loader")
-        # a recognisable loader that was changed: name its first changed line, not only the file
-        off = next(j for j in range(len(loader)) if start + j >= len(flat) or flat[start + j] != loader[j])
+        start = max(sorted(starts), key=matched)
+        off = next(j for j in range(len(loader)) if not 0 <= start + j < len(flat) or flat[start + j] != loader[j])
         if start + off >= len(flat):
             return unknowable(f"{main_path} line {main[-1][0]} ends inside the conf.d loader")
-        return unknowable(f"{main_path} line {main[start + off][0]} differs from the stock conf.d loader")
+        return unknowable(f"{main_path} line {main[max(start + off, 0)][0]} differs from the stock conf.d loader")
     if at + len(loader) != len(main):
         return unknowable(f"{main_path} line {main[at + len(loader)][0]} runs code after the conf.d loader")
     earlier = [(main_path, [line for line, f in zip(main[:at], flat) if f not in stock_code])]

@@ -564,5 +564,10 @@ def test_a_changed_loader_line_is_named_and_a_missing_loader_names_the_file(tmp_
     main.write_text(STOCK_MAIN.replace("conf.d/*.conf>", "other/*.conf>"))
     assert _reason(host) == f"/etc/needrestart/needrestart.conf line {glob_line} differs from the stock conf.d loader"
 
-    main.write_text("$nrconf{restart} = 'a';\n")
+    # the opener itself edited: the rest of the loader still anchors it, so the opener's line is named
+    opener = next(n for n, ln in enumerate(STOCK_MAIN.splitlines(), 1) if "q(/etc/needrestart/conf.d))" in ln)
+    main.write_text(STOCK_MAIN.replace("q(/etc/needrestart/conf.d))", "'/etc/needrestart/conf.d')"))
+    assert _reason(host) == f"/etc/needrestart/needrestart.conf line {opener} differs from the stock conf.d loader"
+
+    main.write_text("$nrconf{restart} = 'a';\nif (1) {\n}\n}\n")  # stray braces are not a loader
     assert _reason(host) == "/etc/needrestart/needrestart.conf has no stock conf.d loader"
