@@ -84,6 +84,12 @@ def reserved_executor(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def allcards_off(monkeypatch):
+    """The one call carries the matmul only while the all-cards check (on by default) is off."""
+    monkeypatch.setattr(settings, "MATMUL_ALLCARDS_CHECK_ENABLED", False)
+
+
 @pytest.fixture
 def gpu_steps(monkeypatch):
     """The shadow's GPU steps are off by default; these tests cover what they compare."""
