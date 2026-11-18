@@ -49,8 +49,14 @@ def run(files: tuple[str, ...]) -> str:
 
 
 def run_once(purpose: str, files: tuple[str, ...], args: str, env: str = "") -> str:
-    """Install, run with `args` (and `env` assignments before the interpreter), remove; the run's exit status."""
-    return f'{install(purpose, files)}; {env}{run(files)} {args}; rc=$?; rm -rf "$d"; exit $rc'
+    """Install, run with `args` (`env` assignments before the interpreter); the directory goes when the shell ends,
+    also on a hangup or kill signal of the session. The exit status is the run's."""
+    return f"{install(purpose, files)}; trap 'rm -rf \"$d\"' EXIT; trap 'exit 1' HUP INT TERM; {env}{run(files)} {args}"
+
+
+def label(files: tuple[str, ...], args: str) -> str:
+    """What a log or event names instead of the command, which carries the script itself."""
+    return f"{EXECUTOR_PYTHON} <validator>/{files[0]} {args}"
 
 
 def process_pattern(purpose: str, files: tuple[str, ...]) -> str:

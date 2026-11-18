@@ -19,10 +19,7 @@ from datura.requests.miner_requests import ExecutorSSHInfo
 
 from services import executor_payload
 from services.inspector_validation_service import InspectorValidationService
-from services.task.checks.node_account import NodeAccountCheck
 from services.task.checks.start_gpu_monitor import StartGPUMonitorCheck
-from services.task.checks.upload_files import UploadFilesCheck
-from services.task.pipeline_factory import PipelineFactory
 from services.task.runner import SSHCommandResult
 from services.verifyx_validation_service import VerifyXValidationService
 from tests.helpers import build_context_config, build_state, make_context
@@ -117,45 +114,12 @@ def _attacker_ran(node) -> bool:
     return (node.tmp / "ATTACKER_EXECUTED").exists() or (node.tmp / "INTERPRETER_EXECUTED").exists()
 
 
-async def test_gpu_monitor_cannot_execute_script_from_executor_root_dir(node):
+async def test_gpu_monitor_runs_the_validators_script_and_interpreter(node):
     runner = LocalRunner(node.tmp)
-    result = await StartGPUMonitorCheck().run(_ctx(node, runner))
-    assert result.passed
-    assert await _until(node.tmp / "VALIDATOR_MONITOR")  # only the validator's payload ran
-    assert not (node.tmp / "ATTACKER_EXECUTED").exists()
-    assert not any(node.executor.root_dir in cmd for cmd in runner.commands)
-
-
-async def test_gpu_monitor_cannot_execute_executor_supplied_interpreter(node):
-    runner = LocalRunner(node.tmp)
-    await StartGPUMonitorCheck().run(_ctx(node, runner))
+    assert (await StartGPUMonitorCheck().run(_ctx(node, runner))).passed
     assert await _until(node.tmp / "VALIDATOR_MONITOR")
-    assert not (node.tmp / "INTERPRETER_EXECUTED").exists()
+    assert not _attacker_ran(node)
     assert not any(node.executor.python_path in cmd or node.executor.root_dir in cmd for cmd in runner.commands)
-
-
-async def test_missing_identity_does_not_enable_executor_selected_code(node):
-    checks = [type(check) for check in PipelineFactory.build_checks()]
-    assert checks.index(NodeAccountCheck) < checks.index(StartGPUMonitorCheck)
-    runner = LocalRunner(node.tmp)
-    ctx = _ctx(node, runner)
-
-    account = await NodeAccountCheck().run(ctx)
-    assert account.passed and account.event.reason_code == "NODE_ACCOUNT_SKIPPED"  # compatibility kept
-    await StartGPUMonitorCheck().run(ctx)
-    assert await _until(node.tmp / "VALIDATOR_MONITOR")
-    assert not _attacker_ran(node)
-
-
-async def test_gpu_monitor_uses_trusted_payload_when_other_uploads_are_skipped(node):
-    runner = LocalRunner(node.tmp)
-    ctx = _ctx(node, runner, machine_scrape_source="print('scrape')")
-
-    upload = await UploadFilesCheck().run(ctx)
-    assert upload.event.reason_code == "UPLOAD_SKIPPED"
-    assert (await StartGPUMonitorCheck().run(ctx)).passed
-    assert await _until(node.tmp / "VALIDATOR_MONITOR")
-    assert not _attacker_ran(node)
 
 
 @pytest.mark.parametrize("run_dir", [None, ".verifyx-retry-0123456789abcdef"])

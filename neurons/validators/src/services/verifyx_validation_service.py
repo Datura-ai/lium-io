@@ -632,9 +632,8 @@ class VerifyXValidationService:
             f"--seed {challenge.seed} --cipher_text {challenge.cipher_text}"
         )
         if run_dir is None:
-            return (
-                f"{executor_payload.install('verifyx', executor_payload.VERIFYX)}; "
-                f'{command}; rc=$?; rm -rf "$d"; exit $rc'
+            return executor_payload.run_once(
+                "verifyx", executor_payload.VERIFYX, f"--seed {challenge.seed} --cipher_text {challenge.cipher_text}"
             )
         # A run the validator may cut off: its own scratch dir (cwd, so the disk-test file lands in
         # it on the same filesystem) and its PID on record, for kill_remote_verifyx.
