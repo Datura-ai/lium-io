@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 from neurons.validators.src.services.task.checks.rented_pod_ownership import (
+    NVLINK_FABRIC_RESTARTED,
     PATHS,
     RentedPodOwnershipCheck,
     judge,
@@ -386,3 +387,42 @@ async def test_a_failed_reboot_with_no_container_is_not_judged_and_not_unread(co
     result = await RentedPodOwnershipCheck().run(ctx)
     assert result.event.reason_code == Msg.NOT_RENTED.reason
     assert result.updates == {}
+
+
+_FULL_NVLINK = {"nvlink": True, "gpu_count": 8, "gpu_pairs": 28, "nvlink_pairs": 28}
+# the fabric manager restarted 100 s ago; pod_1 runs for a day, pod_2 for 50 s
+_FM_RESTART_AGES = "sysbox-mgr 90000\nsysbox-fs 90000\nnv-fabricmanage 100\n--\n 4242 86400\n 4343 50\n"
+
+
+@pytest.mark.parametrize(
+    ("interconnect", "gpu_count", "faults"),
+    [
+        # 465b7a95, 18 Nov: 8x H200 rented whole; NVLink multicast failed from the first idle probe after the rental
+        (_FULL_NVLINK, None, {"1": [NVLINK_FABRIC_RESTARTED], "2": []}),
+        (_FULL_NVLINK, 8, {"1": [NVLINK_FABRIC_RESTARTED], "2": []}),
+        # a one-GPU pod has no NVLink to lose
+        (_FULL_NVLINK, 1, {"1": [], "2": []}),
+        # a PCIe board, or one where only some GPU pairs are NVLink-connected
+        ({"nvlink": False, "gpu_pairs": 28, "nvlink_pairs": 0}, 8, {"1": [], "2": []}),
+        ({"nvlink": True, "gpu_pairs": 28, "nvlink_pairs": 12}, 8, {"1": [], "2": []}),
+        (None, 8, {"1": [], "2": []}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_fabric_manager_restart_under_a_multi_gpu_pod_on_an_nvlink_board_is_the_pods_fault(
+    context_factory, tmp_path, interconnect, gpu_count, faults
+):
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me}      65536\n")
+    _proc(tmp_path, 4343, f"         0     {me}      65536\n")
+    ctx = _ctx(context_factory, _ssh_with_runtime_ages(str(tmp_path), _FM_RESTART_AGES))
+    if interconnect is not None:
+        ctx.state.specs["interconnect"] = interconnect
+    for pod in ctx.state.rented_data.executors["executor-123"].pods:
+        pod.gpu_count = gpu_count
+
+    result = await RentedPodOwnershipCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.what_we_saw["runtime_restarted_under_pods"] == {"nv-fabricmanager": ["pod_1"]}
+    assert result.updates["state"].rented_pod_faults == faults

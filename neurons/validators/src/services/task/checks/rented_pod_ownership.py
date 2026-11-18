@@ -9,7 +9,7 @@ import asyncssh
 from ..messages import RentedPodOwnershipMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
-from .rented_pod_resources import pod_verdict_updates, running_rented_container_names
+from .rented_pod_resources import _rented_pods, pod_verdict_updates, running_rented_container_names
 
 READ_TIMEOUT_SECONDS = 30
 # docker starts a restart-policy container within a few minutes of boot; one started later was restarted alone
@@ -19,6 +19,10 @@ CONTAINER_RESTART_AFTER_BOOT_SECONDS = 600
 # a restart of these under a running pod breaks it while it looks healthy: sysbox-fs serves the pod's /proc
 # (ENOTCONN after it restarts), sysbox-mgr holds its uid shift, nv-fabricmanager its NVLink multicast (CUDA 401)
 RUNTIME_PROCESSES = ("sysbox-mgr", "sysbox-fs", "nv-fabricmanager")
+FABRIC_MANAGER_PROCESS = "nv-fabricmanager"
+# DAH-6618: a fabric manager restart under a multi-GPU pod on an NVLink board leaves its NVLink multicast unable to
+# bind (CUDA 401) until the GPUs are reset; NvlinkFaultCheck cannot probe a rented node, so this is the pod's verdict
+NVLINK_FABRIC_RESTARTED = "RENTED_POD_NVLINK_FABRIC_RESTARTED"
 
 # sudo refuses to run when any of these is not owned by the pod's root, so a shift that spares / and /root
 # still breaks it; a partial shift can also spare those and leave the package dirs to nobody, so apt and dpkg
@@ -35,6 +39,18 @@ PATHS = (
     "/usr/share",
     "/var/lib/dpkg",
 )
+
+
+def _nvlink_pods(ctx: Context, containers: list[str]) -> list[str]:
+    """The containers among these that hold more than one GPU of a board whose GPUs are all NVLink-connected: the
+    pods a fabric manager restart cuts off from NVLink. A pod with an unknown GPU count holds the whole node."""
+    interconnect = (ctx.state.specs or {}).get("interconnect")
+    if not (isinstance(interconnect, dict) and interconnect.get("nvlink") is True):
+        return []
+    if (interconnect.get("gpu_pairs") or 0) < 1 or interconnect.get("nvlink_pairs") != interconnect.get("gpu_pairs"):
+        return []
+    gpus = {pod.docker_container_name: pod.gpu_count for pod in _rented_pods(ctx)}
+    return [c for c in containers if c in gpus and (gpus[c] is None or gpus[c] > 1)]
 
 
 def read_command(pids: list[int], proc: str = "/proc") -> str:
@@ -148,15 +164,16 @@ class RentedPodOwnershipCheck:
         # a requested pod not read back (missing from inspect, restarted before the read, or a garbled line)
         # is unknown, not healthy
         unread = sorted(set(names) - {p["container"] for p in pods.values()})
-        verdicts = pod_verdict_updates(
-            ctx, {p["container"]: [Msg.SHIFTED.reason] if p["outside_namespace"] else [] for p in pods.values()}
-        )
+        codes = {p["container"]: [Msg.SHIFTED.reason] if p["outside_namespace"] else [] for p in pods.values()}
         what = {"pods": list(pods.values())}
         if pods:
             restarted, started_at = await self._runtime_restarted_under(ctx, list(pods.values()))
             if restarted:
                 what["runtime_restarted_under_pods"] = restarted
                 what["runtime_started_at"] = started_at
+            for container in _nvlink_pods(ctx, restarted.get(FABRIC_MANAGER_PROCESS, [])):
+                codes[container].append(NVLINK_FABRIC_RESTARTED)
+        verdicts = pod_verdict_updates(ctx, codes)
         shifted = [p for p in pods.values() if p["outside_namespace"]]
         if shifted:
             template = await self._shift_template(ctx, shifted)
