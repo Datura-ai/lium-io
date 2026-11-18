@@ -13,8 +13,10 @@ What lives here:
   SSH-key submission, SSH-key removal and pod-log requests authenticate with signed HTTP
   headers built from `AuthenticationPayload`; their successful responses are
   `AcceptSSHKeyRequest`, `SSHKeyRemoved` and `PodLogsResponse`. The handlers return
-  `FailedRequest` for operation errors they catch; authentication and miner-name refusals
-  return an HTTP 400/401/403 error with a `detail` field.
+  `FailedRequest` for operation errors they catch. A missing or malformed auth header (for
+  example a non-numeric `X-Timestamp`) is refused by FastAPI's header validation with HTTP 422
+  and a validation-error list in `detail`; authentication and miner-name refusals of
+  well-formed headers return HTTP 400/401/403 with a `detail` field.
 - `datura/errors/protocol.py` — the protocol-level exceptions.
 
 Adding a message type means adding a model in the right `*_requests.py` and a
