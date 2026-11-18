@@ -189,16 +189,62 @@ async def test_a_reboot_takes_the_new_xid_baseline_even_with_an_untied_card(cont
 
 
 @pytest.mark.asyncio
-async def test_a_held_fault_closes_on_absence_only_when_the_scrape_also_misses_the_card(context_factory):
+async def test_a_card_missing_from_the_read_keeps_its_hold(context_factory):
     services = _services()
     other = {"uuid": UUIDS[4], "index": 4, "pci_bus_id": "00000000:04:00.0"}
     await _read(context_factory, services, _ok(xid_faults=[XID_FAULT]))
-    # the card dropped out after this cycle's scrape listed it: no missing-card fault yet, so keep it (review)
-    still_scraped, _ = await _read(context_factory, services, _ok(gpu=other))
-    gone, _ = await _read(context_factory, services, _ok(gpu=other), listed=[u for u in UUIDS if u != UUIDS[3]])
+    # the card dropped out after this cycle's scrape listed it
+    missing, _ = await _read(context_factory, services, _ok(gpu=other))
 
-    assert still_scraped.report["card_faults"] == [XID_FAULT]
-    assert gone.report["card_faults"] == []
+    assert missing.report["card_faults"] == [XID_FAULT]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "listed",
+    [
+        pytest.param([u for u in UUIDS if u != UUIDS[3]], id="scrape-misses-the-card-too"),
+        pytest.param([], id="scrape-listed-nothing"),
+    ],
+)
+async def test_a_card_gone_from_the_read_and_the_scrape_keeps_its_hold_when_it_comes_back(
+    context_factory, listed, caplog
+):
+    # 0d0c64ef, 18 Nov 12:22Z: one cycle without the held card closed the hold, with no reboot or reset;
+    # the card came back on the next cycle, took new rentals and faulted again at 14:07Z
+    services = _services()
+    other = {"uuid": UUIDS[4], "index": 4, "pci_bus_id": "00000000:04:00.0"}
+    boot = {"boot_id": "boot-a", "xid": {"available": True, "last_ts": 5}}
+    await _read(context_factory, services, _ok(xid_faults=[XID_FAULT], **boot))
+    caplog.set_level("INFO")
+    gone, _ = await _read(context_factory, services, _ok(gpu=other, **boot), listed=listed)
+    back, _ = await _read(context_factory, services, _ok(**boot))
+
+    assert gone.report["card_faults"] == [XID_FAULT]
+    assert back.report["card_faults"] == [XID_FAULT]
+    assert "GPU card hold judged" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stored", "now"),
+    [
+        pytest.param("boot-a", "", id="empty-now"),
+        pytest.param("boot-a", "  ", id="blank-now"),
+        pytest.param("", "boot-b", id="empty-stored"),
+        pytest.param(None, "boot-b", id="none-stored"),
+        pytest.param("boot-a", None, id="none-now"),
+    ],
+)
+async def test_a_missing_or_empty_boot_id_is_never_a_reboot(context_factory, stored, now):
+    services = _services()
+    await _read(context_factory, services, _ok(xid={"available": True, "last_ts": 5}))
+    key = next(k for k in services.redis.store if k.startswith("gpu_card_health:"))
+    services.redis.store[key] = json.dumps({"xid_after": 5, "boot_id": stored, "held": [XID_FAULT], "reset_marks": {}})
+
+    read, _ = await _read(context_factory, services, _ok(xid={"available": True, "last_ts": 5}, boot_id=now))
+
+    assert read.report["card_faults"] == [XID_FAULT]
 
 
 @pytest.mark.asyncio

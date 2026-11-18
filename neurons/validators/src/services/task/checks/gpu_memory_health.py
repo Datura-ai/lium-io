@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shlex
 from dataclasses import asdict, dataclass, field
@@ -9,6 +10,7 @@ from typing import Any
 import redis.exceptions
 
 from core.config import settings
+from core.utils import _m, get_extra_info
 
 from ..availability import ReachSource, ReachTarget
 from ..messages import GpuMemoryHealthMessages as Msg
@@ -17,6 +19,8 @@ from ..pipeline import CheckResult, Context, MemoryHealthRead
 from .banned_provider import has_live_rental
 from .gpu_fault_probe import OUTPUT_TAIL_CHARS, _cap, _parse_report, probe_source
 from .post_rental_gpu_recheck import RecheckMarker, record_marker
+
+logger = logging.getLogger(__name__)
 
 # one NVML snapshot in a fork with its own 10 s deadline (miner_jobs/gpu_fault_probe.py), plus SSH
 TIMEOUT_SECONDS = 30
@@ -49,6 +53,11 @@ class CardHealthState:
     reset_marks: dict[str, list[str]] | None = None
 
 
+def _boot_id(value: Any) -> str | None:
+    """A boot id, or None when it is missing or blank: an empty id is no boot, so it never proves a reboot."""
+    return (value.strip() or None) if isinstance(value, str) else None
+
+
 def _card_health_key(ctx: Context) -> str:
     return f"{CARD_HEALTH_KEY_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
 
@@ -66,7 +75,6 @@ async def _load_card_health(ctx: Context) -> CardHealthState | None:
         return None
     # a baseline stored as a line count (before the kernel-time baseline) is dropped: the next read sets one
     xid_after = stored.get("xid_after")
-    boot_id = stored.get("boot_id")
 
     def strings(key: str) -> list[str]:
         value = stored.get(key)
@@ -75,7 +83,7 @@ async def _load_card_health(ctx: Context) -> CardHealthState | None:
     marks = stored.get("reset_marks")
     return CardHealthState(
         xid_after=xid_after if type(xid_after) in (int, float) else None,
-        boot_id=boot_id if isinstance(boot_id, str) else None,
+        boot_id=_boot_id(stored.get("boot_id")),
         held=strings("held"),
         reset_marks={
             uuid: [c for c in counters if c in RESET_CLEARED_COUNTERS]
@@ -126,31 +134,26 @@ def _card_uuid(fault: str) -> str | None:
     return match.group(1) if match and match.group(1) != "None" else None
 
 
-def _held_fault_proven_healed(
-    fault: str,
-    gpus: dict[str, dict[str, Any]],
-    every_card_named: bool,
-    rebooted: bool,
-    scraped_uuids: set[str],
-    before: CardHealthState,
-) -> bool:
-    """Proof that a held card fault is over: the card is gone from a read naming every card and from this
-    cycle's scrape (the missing-card rule reports that), a new host boot, or a reset of the card itself
-    (`_card_was_reset`). A read that merely shows nothing new proves nothing."""
+def _held_fault_proof(
+    fault: str, gpus: dict[str, dict[str, Any]], every_card_named: bool, rebooted: bool, before: CardHealthState
+) -> str | None:
+    """What proves a held card fault over: "reboot" (a new host boot) or "reset" (`_card_was_reset`), else None.
+    A card missing from the read, or with its counters unread, is no proof: a card that drops out for a cycle
+    comes back as faulty as it left (0d0c64ef, 18 Nov)."""
     uuid = _card_uuid(fault)
     if uuid is None:
-        return False
-    if rebooted or _card_was_reset(fault, uuid, gpus, every_card_named, before):
-        return True
-    # a card that drops out after the scrape is still listed there, so no missing-card fault fires yet
-    # shortcut: a reset of a card whose read never showed a reset-only counter set still waits for a reboot
-    return uuid not in gpus and every_card_named and uuid not in scraped_uuids
+        return None
+    if rebooted:
+        return "reboot"
+    if _card_was_reset(fault, uuid, gpus, every_card_named, before):
+        return "reset"
+    return None
 
 
 async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardHealthState) -> None:
     """Put this cycle's per-card hardware faults into `report["card_faults"]`: the probe's new Xids and
     every earlier fault not yet proven healed
-    (`_held_fault_proven_healed`); then keep the state for the next read. A dry run shares Redis with
+    (`_held_fault_proof`); then keep the state for the next read. A dry run shares Redis with
     the live validator, so it writes nothing."""
     if report.get("status") not in ("ok", "flagged"):
         # no NVML reading: the state stays as it was, and must not expire while NVML stays unreadable
@@ -162,7 +165,7 @@ async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardH
         return
     xid_faults = [s for s in report.get("xid_faults") or [] if isinstance(s, str)]
     xid = report.get("xid") if isinstance(report.get("xid"), dict) else {}
-    boot_id = report.get("boot_id") if isinstance(report.get("boot_id"), str) else None
+    boot_id = _boot_id(report.get("boot_id"))
     # the boot id, not the Xid lines: a cleared or wrapped kernel log drops lines on a faulty card
     rebooted = before.boot_id is not None and boot_id is not None and boot_id != before.boot_id
     listed = [gpu for gpu in (report.get("nvml") or {}).get("gpus") or [] if isinstance(gpu, dict)]
@@ -181,10 +184,8 @@ async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardH
     else:
         # an old boot's time would skip this boot's early lines: start the new boot from its first line
         xid_after = 0.0 if rebooted else before.xid_after
-    scraped_uuids = {str(d["uuid"]) for d in ctx.state.gpu_details or [] if isinstance(d, dict) and d.get("uuid")}
-    held = [
-        f for f in before.held if not _held_fault_proven_healed(f, gpus, every_card_named, rebooted, scraped_uuids, before)
-    ]
+    proofs = {f: _held_fault_proof(f, gpus, every_card_named, rebooted, before) for f in before.held}
+    held = [f for f, proof in proofs.items() if proof is None]
     # one fault per card, this read's first: a card repeating an Xid must not grow the stored state
     fault_by_card: dict[str, str] = {}
     for fault in xid_faults + held:
@@ -192,6 +193,23 @@ async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardH
         if uuid is not None:
             fault_by_card.setdefault(uuid, fault)
     report["card_faults"] = list(fault_by_card.values())
+    if before.held or xid_faults:
+        what = {
+            "executor_uuid": ctx.executor.uuid,
+            "decisions": {_card_uuid(f): proof or "held" for f, proof in proofs.items()},
+            "new_xid_faults": xid_faults,
+            "card_faults": report["card_faults"],
+            "boot_id_before": before.boot_id,
+            "boot_id_now": boot_id,
+            "rebooted": rebooted,
+            "xid_after_before": before.xid_after,
+            "xid_after_now": xid_after,
+            "cards_listed": sorted(gpus),
+            "cards_read": len(listed),
+            "every_card_named": every_card_named,
+            "reset_marks_before": before.reset_marks,
+        }
+        logger.info(_m("GPU card hold judged", extra=get_extra_info({**ctx.default_extra, **what})))
     if settings.DRY_RUN:
         return
     key = _card_health_key(ctx)
