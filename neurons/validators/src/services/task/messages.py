@@ -546,6 +546,18 @@ class GpuLossHoldMessages:
         "missing_uuids). The pod cannot use the new cards until it is recreated; the node is verified on its new "
         "cards on the first check after that, or after the rental ends.",
     )
+    # DAH-6546: no verdict on the pod's GPUs, so not GPU_LOST; the run stops (nothing re-anchors) and is checked again
+    POD_UNREAD = MessageTemplate(
+        event="A rented pod's container could not be read after the node's GPUs changed; checked again shortly",
+        reason="GPU_LOST_POD_UNREAD",
+        severity="warning",
+        category="env",
+        impact="This check scores 0 and the node is checked again within minutes; a pod being recreated on the new "
+        "GPUs reads clean then",
+        remediation="Usually the pod is being recreated on the new GPUs and nothing is needed. If it repeats, run "
+        "`docker inspect <container>` on the host for the pods in pods_unread (see inspect_exit_status and "
+        "inspect_stderr).",
+    )
     CLEAN_AGAIN = MessageTemplate(
         event="Every GPU is listed again; each card is load-tested before the node is listed",
         reason="GPU_LOST_CLEAN_AGAIN",
