@@ -11,11 +11,11 @@ import bittensor
 import pytest
 from datura.requests.validator_requests import VerifyXStep
 from services.liumd_exec_client import (
-    LIUMD_COMMAND,
     MAX_STDERR_BYTES,
     REFUSAL_ERRORS_BY_EXIT,
     LiumdExecClient,
     LiumdRefusal,
+    liumd_command,
 )
 from services.local_verify_client import (
     MAX_ANSWER_BYTES,
@@ -146,7 +146,7 @@ async def test_the_exec_request_is_the_command_alone(keypair, intent):
     await _run(keypair, intent, conn)
 
     [(command, kwargs)] = conn.calls
-    assert command == LIUMD_COMMAND == "/usr/local/bin/liumd run"
+    assert command == liumd_command() and command.endswith('exec "$b" run')
     # {} and [] replace the connection's defaults; () would inherit them.
     assert kwargs["env"] == {} and kwargs["send_env"] == []
     assert kwargs["request_pty"] is False
@@ -282,3 +282,43 @@ async def test_a_host_that_never_answers_times_out_and_closes_the_channel(keypai
 
     assert err.value.reason == "timeout"
     assert process.closed == (hang_at == "answer")
+
+
+@pytest.mark.parametrize(
+    ("uid", "user_copy", "run", "target"),
+    [
+        ("0", False, "SYS", "SYS"),
+        ("0", True, "SYS", "SYS"),
+        ("1000", False, "SYS", "USER"),
+        ("1000", True, "USER", "USER"),
+    ],
+)
+def test_root_uses_the_system_liumd_and_a_non_root_user_its_own_copy(
+    tmp_path, monkeypatch, uid, user_copy, run, target
+):
+    """A non-root SSH user cannot write /usr/local/bin (prod 18 Nov, Permission denied)."""
+    import os
+    import subprocess
+
+    from services import liumd_exec_client
+
+    system = tmp_path / "sys" / "liumd"
+    home = tmp_path / "home"
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    (stub / "id").write_text(f"#!/bin/sh\necho {uid}\n")
+    (stub / "id").chmod(0o755)
+    if user_copy:
+        (home / ".local" / "bin").mkdir(parents=True)
+        (home / ".local" / "bin" / "liumd").write_text("#!/bin/sh\n")
+        (home / ".local" / "bin" / "liumd").chmod(0o755)
+    monkeypatch.setattr(liumd_exec_client.settings, "LIUMD_BINARY_PATH", str(system))
+    out = subprocess.run(
+        ["sh", "-c", liumd_exec_client.liumd_paths_sh() + 'echo "$b|$t"'],
+        env={"HOME": str(home), "PATH": f"{stub}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    paths = {"SYS": str(system), "USER": str(home / ".local" / "bin" / "liumd")}
+    assert out == f"{paths[run]}|{paths[target]}"
