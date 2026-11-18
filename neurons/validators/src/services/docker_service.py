@@ -1919,6 +1919,15 @@ def _layer_upper_scope(name: str, plaintext_path: str, upper_dir: str | None) ->
     )
 
 
+async def _container_id_to_start(docker_client: RentalDockerSdkClient, container_name: str) -> str:
+    """The id a start of ``container_name`` runs and a failed start's cleanup stops. Raises when the container is gone:
+    starting by name could then run another container that took the name, which the cleanup could not follow."""
+    identity = await docker_client.container_identity(container_name=container_name)
+    if not identity:
+        raise RentalDockerOperationError(f"container {container_name} no longer exists")
+    return identity.partition("@")[0]
+
+
 async def _record_validator_start(ssh_client: asyncssh.SSHClientConnection, container_name: str) -> None:
     """Record [the container's current start, now] as the validator's start window, just after its mount: the layer
     read counts files changed in it as the entrypoint's. Call only for a start the validator verifiably made itself.
@@ -12848,7 +12857,7 @@ class DockerService:
             # an unreadable state fails the request before any start: cleanup could otherwise stop a running pod
             before = await docker_client.inspect_container_state(container_name=container_name)
             # the id a failed start's pending stop follows (a start keeps it; an edit's park renames the container)
-            container_id = (await docker_client.container_identity(container_name=container_name) or "").partition("@")[0]
+            container_id = await _container_id_to_start(docker_client, container_name)
             stopped_before = not before.running and not before.restarting
             # Docker accepts a start of a running container as a no-op: a failure after it is not this start's to undo
             running_before = not stopped_before
@@ -12865,8 +12874,9 @@ class DockerService:
                             log_extra=default_extra,
                             # a pod created before rentals ran on RENTAL_NETWORK_NAME would keep docker0 across
                             # every `docker start`; start moves it onto the rental network
+                            # by id: a container that took the name since the read is not this start's to run
                             call=lambda: docker_client.start(
-                                container_name=container_name, network=RENTAL_NETWORK_NAME
+                                container_name=container_id, network=RENTAL_NETWORK_NAME
                             ),
                             container_name=container_name,
                         )
@@ -13336,7 +13346,8 @@ class DockerService:
                     run_logged_rental_docker_sdk_operation(
                         operation="start_container",
                         log_extra=default_extra,
-                        call=lambda: docker_client.start(container_name=container_name, network=RENTAL_NETWORK_NAME),
+                        # by id: a container that took the name since the read is not this undo's to run
+                        call=lambda: docker_client.start(container_name=container_id, network=RENTAL_NETWORK_NAME),
                         container_name=container_name,
                     )
                 )
@@ -13349,7 +13360,7 @@ class DockerService:
             # unreadable state or id fails the undo before any start, like start_existing_container: a start the
             # cleanup below could not follow by id would leave the pod up without its remount
             before = await docker_client.inspect_container_state(container_name=container_name)
-            container_id = (await docker_client.container_identity(container_name=container_name) or "").partition("@")[0]
+            container_id = await _container_id_to_start(docker_client, container_name)
             stopped_before = not before.running and not before.restarting
             try:
                 try:

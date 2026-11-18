@@ -3114,7 +3114,7 @@ async def test_start_container_restarts_ssh_after_docker_start(docker_service, m
     await docker_service.start_container(payload, executor_info, keypair, "encrypted-private-key")
 
     assert docker_service.rental_docker_client_factory.client.started_containers == [
-        "pod_test"
+        "cid"  # started by the id read before the start
     ]
     assert docker_service.rental_docker_client_factory.client.start_networks == ["lium-rentals"]
     docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once_with(
@@ -3176,7 +3176,7 @@ async def test_start_container_sdk_failure_returns_failed_request_without_shell_
     assert isinstance(result, FailedContainerRequest)
     assert connect_mock.call_count == 0
     assert docker_service.rental_docker_client_factory.client.started_containers == [
-        "pod_test"
+        "cid"  # started by the id read before the start
     ]
 
 
@@ -3343,7 +3343,7 @@ async def test_start_container_fails_when_encrypted_setup_fails(docker_service, 
     )
 
     assert isinstance(result, FailedContainerRequest)
-    assert docker_service.rental_docker_client_factory.client.started_containers == ["pod_test"]
+    assert docker_service.rental_docker_client_factory.client.started_containers == ["cid"]
     # a pod up without its plaintext mount would write renter data unencrypted: it is put back down
     assert docker_service.rental_docker_client_factory.client.stopped_containers == ["cid"]
 
@@ -3431,6 +3431,20 @@ async def test_an_unreadable_state_fails_the_start_before_docker_is_asked(docker
 
     assert client.started_containers == []
     assert client.stopped_containers == []
+
+
+@pytest.mark.asyncio
+async def test_a_container_gone_before_the_start_fails_it_before_docker_is_asked(docker_service, monkeypatch):
+    # a start by name could run another container that took the name, which the cleanup (by id) cannot follow
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    client = docker_service.rental_docker_client_factory.client
+    client.running = False
+    client.identity = None
+
+    with pytest.raises(RentalDockerOperationError, match="no longer exists"):
+        await _start_existing(docker_service)
+
+    assert client.started_containers == []
 
 
 @pytest.mark.asyncio
@@ -3763,7 +3777,7 @@ async def test_a_pending_stop_retry_racing_a_start_does_not_stop_the_new_run(
     await start
 
     assert client.stopped_containers == ["cid"]  # the old run only
-    assert client.started_containers == ["pod_test"] and client.running is True
+    assert client.started_containers == ["cid"] and client.running is True
 
 
 @pytest.mark.asyncio
@@ -4306,7 +4320,7 @@ async def test_a_cancelled_pending_stop_keeps_the_pod_lock_until_its_stop_is_don
 
     release.set()
     await start
-    assert client.stopped_containers == ["cid"] and client.started_containers == ["pod_test"]
+    assert client.stopped_containers == ["cid"] and client.started_containers == ["cid"]
     assert client.running is True
 
 

@@ -1270,8 +1270,8 @@ async def test_a_failed_edit_brings_a_kept_container_back_unmounted(
 
     assert isinstance(result, FailedContainerRequest)
     kept = _docker(ssh.commands, "rename")[0].split()[3]
-    # the real bring-up, under the kept name: start, sshd, never the remount
-    assert docker_client.start.await_args.kwargs["container_name"] == kept
+    # the real bring-up of the kept container, by the id read before it: start, sshd, never the remount
+    assert docker_client.start.await_args.kwargs["container_name"] == "cid"
     svc._encrypted_local_volume_name.assert_not_awaited()
     svc.setup_encrypted_local_volume.assert_not_awaited()
     sshd = svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker
