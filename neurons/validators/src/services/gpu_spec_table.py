@@ -49,6 +49,7 @@ Pre-check policy:
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from services.const import GPU_MODEL_RATES
@@ -210,11 +211,7 @@ KNOWN_UNRANGED: set[str] = set()
 # logs. Unmapped names pass through unchanged (and will likely produce
 # UnsupportedGpuModelError until added here).
 NORMALIZATION_MAP: dict[str, str] = {
-    # Tesla V100 family — CUDA reports "Tesla V100-..." in some driver versions
-    "Tesla V100-SXM2-16GB": "NVIDIA Tesla V100 Tensor Core GPU",
-    "Tesla V100-SXM2-32GB": "NVIDIA Tesla V100 Tensor Core GPU",
-    "Tesla V100-PCIE-16GB": "NVIDIA Tesla V100 Tensor Core GPU",
-    "Tesla V100-PCIE-32GB": "NVIDIA Tesla V100 Tensor Core GPU",
+    # Tesla V100 boards ("Tesla V100-SXM2-32GB", ...): V100_BOARD_NAME_RE below
     # H100 — some driver/OS combos report without the "NVIDIA " prefix
     "Tesla H100 80GB HBM3": "NVIDIA H100 80GB HBM3",
     # T4 / A10 — CUDA sometimes drops the "Tensor Core GPU" suffix
@@ -228,17 +225,26 @@ NORMALIZATION_MAP: dict[str, str] = {
 }
 
 
+# Every V100 board the driver names "Tesla V100-<board>-<16|32>GB[-LS]": SXM2, SXM3 (DGX-2), PCIE, FHHL, DGXS (DGX
+# Station). Listing boards one by one refused each one not listed yet (DGXS, 18 Nov); the VRAM range still judges the
+# card. V100S is another card ("Tesla V100S-PCIE-32GB") and does not match.
+V100_BOARD_NAME_RE = re.compile(r"Tesla V100-[A-Z0-9]+-(16|32)GB(-LS)?")
+V100 = "NVIDIA Tesla V100 Tensor Core GPU"
+
+
 def normalize_gpu_model(name: str | None) -> str:
     """Map a CUDA-reported GPU name to a canonical GPU_MODEL_RATES key.
 
     Returns:
         - "" if `name` is empty/None.
-        - The mapped canonical name if `name.strip()` is in NORMALIZATION_MAP.
+        - The mapped canonical name if `name.strip()` is in NORMALIZATION_MAP or names a V100 board.
         - Otherwise `name.strip()` unchanged (caller decides what to do).
     """
     if not name:
         return ""
     stripped = name.strip()
+    if V100_BOARD_NAME_RE.fullmatch(stripped):
+        return V100
     return NORMALIZATION_MAP.get(stripped, stripped)
 
 
