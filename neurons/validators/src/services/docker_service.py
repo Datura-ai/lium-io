@@ -664,11 +664,6 @@ _FILLER_ONLY_RM_TIMEOUT_SECONDS = 5
 # failure_step of a customer create whose filler (our own container) is still alive after the kill:
 # not `container_cleanup`, which the backend counts against the provider's node
 FILLER_REMOVAL_STUCK_STEP = "filler_removal_stuck"
-# failure_step of a create whose SSH transport to the node dropped mid-step and could not be re-opened. Not
-# `ssh_connect`: the create had reached the host, so the rental probe still removes its container by name; not the
-# step that was running either (`docker_pull` would point the renter at their image). That step rides in
-# `dropped_during_step`.
-SSH_TRANSPORT_DROPPED_STEP = "ssh_transport_dropped"
 # Linux task flag set by do_exit(): the process was killed and is tearing down (/proc/<pid>/stat field 9)
 _PF_EXITING = 0x4
 
@@ -12199,8 +12194,6 @@ class DockerService:
             error_class = rental_docker_error_class(e) or port_collision_error_class(e)
             # DAH-5037: its own field, never in `error`, which the backend's GPU-fault check reads
             last_exc = _last_attempt_exception(e)
-            transport_dropped = is_transport_not_reopened(last_exc)
-            reported_step = SSH_TRANSPORT_DROPPED_STEP if transport_dropped else current_step
             log_tail = last_exc.log_tail if isinstance(last_exc, ImageExitedDuringKeyInjection) else ""
             log_text = _m(
                 "Failed create_container",
@@ -12208,8 +12201,7 @@ class DockerService:
                     **default_extra,
                     # DAH-2740: a tenacity RetryError says nothing; the last attempt's text is the cause
                     "error": "; ".join(_exception_texts(e)),
-                    "failure_step": reported_step,
-                    **({"dropped_during_step": current_step} if transport_dropped else {}),
+                    "failure_step": current_step,
                     **({"error_class": error_class} if error_class else {}),
                     **({"container_logs_tail": log_tail} if log_tail else {}),
                 }),
@@ -12317,7 +12309,7 @@ class DockerService:
                     if isinstance(e, _FillerRefusedForCustomerCreate)
                     else FailedContainerErrorCodes.UnknownError
                 ),
-                failure_step=reported_step,
+                failure_step=current_step,
                 volume_encryption_status=(
                     VolumeEncryptionStatus.FAILED
                     if current_step

@@ -26,7 +26,6 @@ from services.image_flatten import FLATTEN_NO_DISK_RENTER_SENTENCE, ImageFlatten
 import services.image_flatten as image_flatten_module
 from services.cvm_quote_broker import DSTACK_GUEST_SOCKET_PATH, QUOTE_BROKER_SOCKET_PATH
 from services.docker_service import (
-    SSH_TRANSPORT_DROPPED_STEP,
     CONTAINER_STOP_GRACE_SECONDS,
     FILLER_CONTAINER_STOP_GRACE_SECONDS,
     DockerService,
@@ -4117,16 +4116,17 @@ def test_a_failure_diagnosed_above_an_unreopened_transport_keeps_its_own_step():
     ("pull_error", "expected_step"),
     [
         (Exception("[Errno 104] Connection reset by peer"), "docker_pull"),
-        # the node refused a new SSH connection after the pull's dropped: the node, not the renter's image
+        # the node refused a new SSH connection after the pull's dropped: still the step that was running, which
+        # every backend rule keyed on the step reads; the error text names the dropped transport
         (
             RentalDockerTransportNotReopened(
                 "Docker SDK pull failed on a dropped SSH transport and the transport could not be re-opened: "
                 "IncompleteRead; re-open: Connection refused"
             ),
-            SSH_TRANSPORT_DROPPED_STEP,
+            "docker_pull",
         ),
         # as the real pull() raises it: wrapped, with the refusal as its __cause__
-        (_pull_wrapped_not_reopened(), SSH_TRANSPORT_DROPPED_STEP),
+        (_pull_wrapped_not_reopened(), "docker_pull"),
     ],
 )
 async def test_create_container_reports_docker_pull_failure_step(
@@ -4302,16 +4302,17 @@ async def test_create_container_reports_a_refused_ssh_reopen_after_a_failed_logi
     )
 
     assert isinstance(result, FailedContainerRequest)
-    assert result.failure_step == SSH_TRANSPORT_DROPPED_STEP
+    assert result.failure_step == "docker_pull"
     assert "registry" not in result.msg
 
 
 @pytest.mark.asyncio
-async def test_a_create_whose_transport_drops_after_docker_run_is_not_reported_as_before_the_host(
+async def test_a_create_whose_transport_drops_at_docker_run_keeps_docker_run_as_its_step(
     docker_service,
     monkeypatch,
 ):
-    # `ssh_connect` tells the rental probe the create never reached the host, so it skipped the by-name removal
+    # the real step: `ssh_connect` would tell the rental probe the create never reached the host (no by-name removal),
+    # and a new step name would drop out of every backend rule keyed on the step (host failure, renter hint)
     from services.task.checks.rental_probe import _CREATE_STEPS_BEFORE_THE_HOST
 
     _patch_create_container_happy_path(docker_service, monkeypatch)
@@ -4338,9 +4339,10 @@ async def test_a_create_whose_transport_drops_after_docker_run_is_not_reported_a
     )
 
     assert isinstance(result, FailedContainerRequest)
-    assert result.failure_step == SSH_TRANSPORT_DROPPED_STEP
+    assert result.failure_step == "docker_run"
     assert result.failure_step not in _CREATE_STEPS_BEFORE_THE_HOST
-    assert '"dropped_during_step": "docker_run"' in result.detail
+    assert "dropped_during_step" not in result.detail
+    assert "could not be re-opened" in result.detail
 
 
 @pytest.mark.parametrize(
