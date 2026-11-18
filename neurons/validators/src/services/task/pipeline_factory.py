@@ -38,6 +38,7 @@ from .checks import (
     ContainerDownloadSpeedCheck,
     CpuTruthCheck,
     CustomBuildOrphanSweepCheck,
+    S3fsPluginCopyCheck,
     RentalEgressGuardCheck,
     DiskHealthCheck,
     DiskSpaceCheck,
@@ -123,6 +124,8 @@ JOB_LENGTH = 300
 # call would lose the "last swept at" timestamps. The check itself is stateless
 # wrt input data and only reads ctx, so a shared instance is safe.
 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON = CustomBuildOrphanSweepCheck()
+# DAH-6466: same reason, per-executor cadence of the s3fs plugin copy staging.
+_S3FS_PLUGIN_COPY_SINGLETON = S3fsPluginCopyCheck()
 # Same reason: per-executor cadence state, shared by the two positions. Never before a scored step:
 # a rented node is guarded inside TenantEnforcementCheck's rented halt, an idle node after ScoreCheck.
 _RENTAL_EGRESS_GUARD_LAST_RUN: dict[tuple, float] = {}
@@ -412,6 +415,9 @@ class PipelineFactory:
                 # instance so cadence state persists across `build_checks()`
                 # calls.
                 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON,
+                # DAH-6466: the node's local s3fs plugin copy, so a Volume rental makes no registry round trip.
+                # Non-fatal, throttled per executor, leaves rented nodes alone.
+                _S3FS_PLUGIN_COPY_SINGLETON,
                 PortConnectivityCheck(),
                 PortCountCheck(),
                 # Before the rented short-circuit; it leaves a rented node alone itself (no pull beside a
