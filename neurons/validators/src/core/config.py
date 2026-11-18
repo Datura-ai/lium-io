@@ -399,10 +399,8 @@ class Settings(BaseSettings):
     # Item 3 — run the GPU work-proof on every claimed card concurrently (own challenge per card,
     # sized from the registry SKU) and time the aggregate on the validator, so a count lie either
     # fails device selection or serialises past a wide wall-clock threshold.
-    # Defaults to False: "shadow" here only means the verdict is
-    # not scored — the GPU work itself is real, so an 8-card host would run 8 near-full-VRAM matmuls
-    # on top of the legacy single-card one every cycle. Flip it on once elapsed/VRAM/host-RSS numbers
-    # from a real 8-GPU box show what that costs an honest miner.
+    # Off by default until enforcement is on in prod: a validator on the public image pulls each release at once,
+    # so a true default would enforce there before the shadow step. It never runs beside a renter. Details: DAH-6576.
     MATMUL_ALLCARDS_CHECK_ENABLED: bool = Field(env="MATMUL_ALLCARDS_CHECK_ENABLED", default=False)
     MATMUL_ALLCARDS_ENFORCEMENT_ENABLED: bool = Field(env="MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", default=False)
     # Item 2b — send the advertised CPU-core count in the rental-verification health check so the
@@ -482,11 +480,9 @@ class Settings(BaseSettings):
     # re-registers the node to list a different set. Off again = the mark stays in the record but is ignored.
     # Flip after reading a week of the warn-mode rows.
     GPU_ANCHOR_HARD_ENABLED: bool = Field(env="GPU_ANCHOR_HARD_ENABLED", default=False)
-    # DAH-5508: an RTX 4090 reporting ~48 GB is scored as its own model "NVIDIA GeForce RTX 4090 48GB" (own VRAM
-    # window, rate, anchor and idle tier) instead of failing the 24 GB window. Off: such a card is rejected as before.
-    # Ships off. Turned on only by the Lium product owner, once the native verifier accepts a 48 GB 4090, the provider
-    # preflight classifies it too, and the all-card probe is sized from the classified model.
-    RTX_4090_48GB_MODEL_ENABLED: bool = Field(env="RTX_4090_48GB_MODEL_ENABLED", default=False)
+    # SpecFloorCheck (DAH-6343): off, a node with specs below the floors is logged with its findings only. Turned on
+    # by a separate PR once real cases show no false positives.
+    SPEC_FLOOR_ENFORCEMENT_ENABLED: bool = Field(env="SPEC_FLOOR_ENFORCEMENT_ENABLED", default=False)
     # DockerCpuCheck: when disabled, a node whose Docker daemon sees fewer CPUs than the machine is logged only.
     DOCKER_CPU_MISMATCH_ENFORCEMENT_ENABLED: bool = Field(env="DOCKER_CPU_MISMATCH_ENFORCEMENT_ENABLED", default=False)
     PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED: bool = Field(

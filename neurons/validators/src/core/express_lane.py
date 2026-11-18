@@ -573,6 +573,11 @@ class ExpressLane:
                 miner_address=miner.axon_info.ip,
                 miner_port=miner.axon_info.port,
             )
+            job_timeout = (
+                settings.JOB_TIME_OUT
+                if pending.recheck_deadline is None
+                else min(settings.JOB_TIME_OUT, max(0.0, pending.recheck_deadline - started))
+            )
             job = await asyncio.wait_for(
                 self.miner_service.request_job_to_miner(
                     payload=payload,
@@ -583,10 +588,9 @@ class ExpressLane:
                     executor_id=executor_id,
                     # Never scored, so the pipeline right-sizes its probes (DAH-3011).
                     first_pass=True,
+                    job_timeout=job_timeout,
                 ),
-                timeout=settings.JOB_TIME_OUT
-                if pending.recheck_deadline is None
-                else min(settings.JOB_TIME_OUT, max(0.0, pending.recheck_deadline - started)),
+                timeout=job_timeout,
             )
             if not os.path.isdir(directory):
                 # The hold keeps this directory across cycles, so it went away by another hand.
@@ -659,6 +663,8 @@ class ExpressLane:
         if not (result.score > 0 or result.job_score > 0) or result.session_lost_in_port_check:
             # An earlier pass in this batch must not keep the fallback off (review 4558893416).
             self.miner_service.express_published.pop(executor_id.lower(), None)
+            self.miner_service.express_published_miner.pop(executor_id.lower(), None)
+            self.miner_service.express_passed_at.pop(executor_id.lower(), None)
         if result.session_lost_in_port_check:
             # The run has no verdict: its findings still go out, and it is retried without spending one of
             # MAX_ATTEMPTS (bounded by SESSION_LOST_MAX_RUNS), neither a failed first pass nor validated.
@@ -691,6 +697,8 @@ class ExpressLane:
             # Only a pass has the pod check billing needs; a failed or lost run leaves the cycle's
             # result-missing fallback in place (review 4558671509).
             self.miner_service.express_published[executor_id.lower()] = job_batch_id
+            self.miner_service.express_published_miner[executor_id.lower()] = miner.hotkey
+            self.miner_service.express_passed_at[executor_id.lower()] = time.monotonic()
         pending.recheck_deadline = None
         if not should_run_first_pass_again:
             # A failed first pass that runs again keeps the request: the next tick selects it.

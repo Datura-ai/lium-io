@@ -37,3 +37,23 @@ def test_bootstrap_installs_only_missing_python_support(tmp_path: Path, manager:
     calls = (tmp_path / "calls").read_text().splitlines()
     assert any(call.startswith("packages ") for call in calls) == (support != "working")
     assert (calls[-1] == "venv") == expected[1]
+
+
+def test_the_jupyter_launch_is_kept_as_a_root_only_restart_script(tmp_path: Path) -> None:
+    # Arrange: the validator rewrites root_dir as it copies the script; installs and the launch itself are stubbed.
+    source = (Path(__file__).parents[1] / "run_jupyter.sh").read_text()
+    source = source.replace("--ServerApp.root_dir=/root ", "--ServerApp.root_dir=/workspace ")
+    restart = tmp_path / "restart.sh"
+    program = source.replace("JUPYTER_RESTART_SCRIPT=/tmp/lium-jupyter-restart.sh", f"JUPYTER_RESTART_SCRIPT={restart}")
+    program = program.replace('# Parse command line arguments\n', 'install_python_jupyter() { :; }\nsleep() { :; }\npgrep() { return 0; }\nsh() { echo "LAUNCH $1"; }\n')
+    # Act
+    token = "0123abcd"
+    result = subprocess.run(["/bin/sh", "-c", program, "run_jupyter.sh", "--pass" + f"word={token}", "--port=9001"],
+                            capture_output=True, text=True, timeout=5)
+    # Assert: launched through the kept script, which carries the same token, port and root and is readable by root only.
+    assert f"LAUNCH {restart}" in result.stdout, result.stdout + result.stderr
+    kept = restart.read_text()
+    assert f"--IdentityProvider.token='{token}'" in kept and "--port=9001" in kept
+    assert "--ServerApp.root_dir=/workspace" in kept
+    assert restart.stat().st_mode & 0o777 == 0o600
+    assert subprocess.run(["/bin/sh", "-n", str(restart)]).returncode == 0
