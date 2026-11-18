@@ -12,6 +12,7 @@ from neurons.validators.src.services.task.checks.rented_gpu_drop import FAULT_GP
 from neurons.validators.src.services.task.messages import RentedGpuDropMessages as Msg
 
 from core.config import settings
+from services.gpu_reset import record_card_resets
 from tests.test_gpu_fault_probe_check import FakeRunner, _probe_namespace
 from tests.test_gpu_memory_health_check import PROBE_SOURCE, _report
 from tests.test_rented_gpu_drop_check import UUIDS, _clear_local_marks, _ctx, _services, _states  # noqa: F401
@@ -223,6 +224,80 @@ async def test_an_xid_fault_holds_until_the_host_boots_again(context_factory):
     assert cleared.report["card_faults"] == [xid_fault]
     assert no_boot_id.report["card_faults"] == [xid_fault]
     assert rebooted.report["card_faults"] == []
+
+
+async def _reset(context_factory, services, *uuids):
+    """A validator `nvidia-smi -r` of these cards (services/gpu_reset.py) on the node the reads below judge."""
+    ctx = _ctx(context_factory, services, listed=UUIDS)
+    await record_card_resets(services.redis, ctx.miner_hotkey, ctx.executor.uuid, list(uuids))
+
+
+@pytest.mark.asyncio
+async def test_a_validator_reset_and_a_clean_read_of_the_card_lift_its_held_xid(context_factory):
+    services = _services()
+    boot = {"boot_id": "boot-a", "xid": {"available": True, "last_ts": 5}}
+    await _read(context_factory, services, _ok(xid_faults=[XID_FAULT], **boot))
+    quiet, _ = await _read(context_factory, services, _ok(**boot))
+    await _reset(context_factory, services, UUIDS[3])
+    lifted, _ = await _read(context_factory, services, _ok(**boot))
+
+    assert quiet.report["card_faults"] == [XID_FAULT]
+    assert lifted.report["card_faults"] == []
+    assert _stored(services.redis)["held"] == []
+    # the reset is judged once: it is gone after the read that lifted the fault
+    assert not any(services.redis.hashes.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "after_reset",
+    [
+        pytest.param({"xid_faults": [XID_FAULT]}, id="a-new-xid-on-the-card"),
+        pytest.param({"status": "flagged", "flags": [f"gpu 3 ({UUIDS[3]}): 2 uncorrected ECC error(s)"]}, id="nvml-flags-it"),
+        pytest.param({"warnings": [f"gpu 3 ({UUIDS[3]}): NVML recovery action GPU_RESET required"]}, id="nvml-warns-on-it"),
+        pytest.param({"xid": {"available": False, "error": "denied"}}, id="kernel-log-not-readable"),
+        pytest.param({"gpu": {"pci_bus_id": None}}, id="card-not-tied-to-its-log-lines"),
+    ],
+)
+async def test_a_reset_lifts_nothing_unless_the_next_read_of_the_card_is_clean(context_factory, after_reset):
+    services = _services()
+    boot = {"boot_id": "boot-a", "xid": {"available": True, "last_ts": 5}}
+    await _read(context_factory, services, _ok(xid_faults=[XID_FAULT], **boot))
+    await _reset(context_factory, services, UUIDS[3])
+    extra = {**boot, **after_reset}
+    status, gpu = extra.pop("status", "ok"), extra.pop("gpu", None)
+    card = {"index": 3, "uuid": UUIDS[3], "pci_bus_id": "00000000:03:00.0", "ecc_uncorrected": 0, **(gpu or {})}
+    extra.setdefault("flags", [])
+    after, _ = await _read(context_factory, services, _report(status, nvml={"available": True, "gpus": [card]}, **extra))
+    # that read used the reset up: a quiet read after it is no proof
+    quiet, _ = await _read(context_factory, services, _ok(**boot))
+
+    assert after.report["card_faults"] == [XID_FAULT]
+    assert quiet.report["card_faults"] == [XID_FAULT]
+
+
+@pytest.mark.asyncio
+async def test_a_reset_judged_before_a_fault_does_not_lift_that_later_fault(context_factory):
+    services = _services()
+    boot = {"boot_id": "boot-a", "xid": {"available": True, "last_ts": 5}}
+    await _reset(context_factory, services, UUIDS[3])
+    await _read(context_factory, services, _ok(**boot))
+    await _read(context_factory, services, _ok(xid_faults=[XID_FAULT], **boot))
+    quiet, _ = await _read(context_factory, services, _ok(**boot))
+
+    assert quiet.report["card_faults"] == [XID_FAULT]
+
+
+@pytest.mark.asyncio
+async def test_a_reset_of_another_card_lifts_nothing_and_waits_for_a_read_of_that_card(context_factory):
+    services = _services()
+    boot = {"boot_id": "boot-a", "xid": {"available": True, "last_ts": 5}}
+    await _read(context_factory, services, _ok(xid_faults=[XID_FAULT], **boot))
+    await _reset(context_factory, services, UUIDS[4])
+    other, _ = await _read(context_factory, services, _ok(**boot))
+    # a card this read does not list is not judged: its reset waits for a read that lists it
+    assert other.report["card_faults"] == [XID_FAULT]
+    assert any(UUIDS[4] in fields for fields in services.redis.hashes.values())
 
 
 @pytest.mark.asyncio

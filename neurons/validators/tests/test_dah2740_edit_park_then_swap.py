@@ -30,7 +30,7 @@ from services.docker_service import (
     executor_key,
     inflight_creates,
 )
-from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS
+from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, card_reset_key
 from services.hung_gpu_reset import HUNG_GPU_QUERY_COMMAND, HungGpuResult
 from services.redis_service import GPU_RESET_PENDING_KIND
 from services.prerun_host_probe import prerun_host_probe_command
@@ -535,6 +535,7 @@ async def test_a_reboot_resets_a_hung_gpu_while_the_old_container_is_parked(svc,
     calls: list = []
     monkeypatch.setattr("services.docker_service.reset_hung_pod_gpus", _hung_reset(outcome, calls))
     svc.redis_service.mark_gpu_reset_recent = AsyncMock()
+    svc.redis_service.hset, svc.redis_service.expire = AsyncMock(), AsyncMock()
 
     result = await _run(svc, payload)
 
@@ -545,8 +546,13 @@ async def test_a_reboot_resets_a_hung_gpu_while_the_old_container_is_parked(svc,
         svc.redis_service.mark_gpu_reset_recent.assert_awaited_once_with(
             payload.miner_hotkey, payload.executor_id, payload.pod_id, ["GPU-test"], RECENT_RENTER_GPU_RESET_SECONDS
         )
+        # DAH-6646: and its next clean memory read lifts a held Xid fault on it
+        svc.redis_service.hset.assert_awaited_once_with(
+            card_reset_key(payload.miner_hotkey, payload.executor_id), "GPU-test", "1"
+        )
     else:
         svc.redis_service.mark_gpu_reset_recent.assert_not_awaited()
+        svc.redis_service.hset.assert_not_awaited()
 
 
 @pytest.mark.asyncio

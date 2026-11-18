@@ -145,7 +145,7 @@ from services.gpu_clocks import (
     reset_leftover_clock_locks,
     reset_pod_clock_locks,
 )
-from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, reset_pod_gpus
+from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, record_card_resets, reset_pod_gpus
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.hung_gpu_reset import HungGpuResult, reset_hung_pod_gpus
 from services.host_memory_guard import apply_host_memory_guard
@@ -14539,6 +14539,9 @@ class DockerService:
                         payload.gpu_uuids,
                         RECENT_RENTER_GPU_RESET_SECONDS,
                     )
+                    await record_card_resets(
+                        self.redis_service, payload.miner_hotkey, payload.executor_id, reset_result_holder[0].hung_uuids
+                    )
                 except Exception as exc:
                     logger.warning(
                         _m("Hung GPU reset: recent reset mark not written", extra=get_extra_info({**default_extra, "error": str(exc)}))
@@ -14750,6 +14753,13 @@ class DockerService:
                         payload.gpu_uuids,
                         RECENT_RENTER_GPU_RESET_SECONDS,
                     )
+                    if report is not None:
+                        await record_card_resets(
+                            self.redis_service,
+                            payload.miner_hotkey,
+                            payload.executor_id,
+                            [gpu.uuid for gpu in report.gpus if gpu.result == "reset"],
+                        )
             except Exception as exc:
                 logger.warning(
                     _m("Reset pod GPUs: recent reset mark not written", extra=get_extra_info({**default_extra, "error": str(exc)}))

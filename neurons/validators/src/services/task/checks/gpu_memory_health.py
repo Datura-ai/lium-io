@@ -9,6 +9,7 @@ from typing import Any
 import redis.exceptions
 
 from core.config import settings
+from services.gpu_reset import card_reset_key
 
 from ..availability import ReachSource, ReachTarget
 from ..messages import GpuMemoryHealthMessages as Msg
@@ -82,26 +83,43 @@ def _card_uuid(fault: str) -> str | None:
 
 
 def _held_fault_proven_healed(
-    fault: str, gpus: dict[str, dict[str, Any]], every_card_named: bool, rebooted: bool, scraped_uuids: set[str]
+    fault: str,
+    gpus: dict[str, dict[str, Any]],
+    every_card_named: bool,
+    rebooted: bool,
+    scraped_uuids: set[str],
+    reset_clean: set[str],
 ) -> bool:
     """Proof that a held card fault is over: the card is gone from a read naming every card and from this
-    cycle's scrape (the missing-card rule reports that), or a new host boot. A read that merely shows nothing new
-    proves nothing."""
+    cycle's scrape (the missing-card rule reports that), a new host boot, or a validator `nvidia-smi -r` of the card
+    followed by a clean read of it (`reset_clean`). A read that merely shows nothing new proves nothing."""
     uuid = _card_uuid(fault)
     if uuid is None:
         return False
-    if rebooted:
+    if rebooted or uuid in reset_clean:
         return True
     # a card that drops out after the scrape is still listed there, so no missing-card fault fires yet
-    # shortcut: a card reset without a reboot leaves an Xid fault held; add a reset proof if that bites
     return uuid not in gpus and every_card_named and uuid not in scraped_uuids
 
 
-async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardHealthState) -> None:
+async def _load_card_resets(ctx: Context) -> set[str]:
+    """The cards a validator `nvidia-smi -r` reset since their last judged read (services/gpu_reset.py); none when
+    Redis could not be read, so nothing is lifted on it."""
+    try:
+        fields = await ctx.services.redis.hgetall(card_reset_key(ctx.miner_hotkey, ctx.executor.uuid)) or {}
+    except _REDIS_ERRORS:
+        return set()
+    return {f.decode() if isinstance(f, bytes) else str(f) for f in fields}
+
+
+async def _judge_card_faults(
+    ctx: Context, report: dict[str, Any], before: CardHealthState, resets: set[str]
+) -> None:
     """Put this cycle's per-card hardware faults into `report["card_faults"]`: the probe's new Xids and
     every earlier fault not yet proven healed
-    (`_held_fault_proven_healed`); then keep the state for the next read. A dry run shares Redis with
-    the live validator, so it writes nothing."""
+    (`_held_fault_proven_healed`); then keep the state for the next read. `resets` are the cards a validator reset
+    before this read began: each one this read lists is judged once, so a reset never lifts a later fault. A dry run
+    shares Redis with the live validator, so it writes nothing."""
     if report.get("status") not in ("ok", "flagged"):
         # no NVML reading: the state stays as it was, and must not expire while NVML stays unreadable
         if not settings.DRY_RUN:
@@ -132,7 +150,19 @@ async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardH
         # an old boot's time would skip this boot's early lines: start the new boot from its first line
         xid_after = 0.0 if rebooted else before.xid_after
     scraped_uuids = {str(d["uuid"]) for d in ctx.state.gpu_details or [] if isinstance(d, dict) and d.get("uuid")}
-    held = [f for f in before.held if not _held_fault_proven_healed(f, gpus, every_card_named, rebooted, scraped_uuids)]
+    # a clean read of a reset card: listed and tied to its kernel-log lines, in a read that sees the log, with no
+    # NVML flag or warning and no new Xid naming it
+    named = {_card_uuid(s) for s in [*(report.get("flags") or []), *(report.get("warnings") or []), *xid_faults] if isinstance(s, str)}
+    reset_clean = {
+        uuid
+        for uuid in resets
+        if uuid in gpus and isinstance(gpus[uuid].get("pci_bus_id"), str) and xid.get("available") and uuid not in named
+    }
+    held = [
+        f
+        for f in before.held
+        if not _held_fault_proven_healed(f, gpus, every_card_named, rebooted, scraped_uuids, reset_clean)
+    ]
     # one fault per card, this read's first: a card repeating an Xid must not grow the stored state
     fault_by_card: dict[str, str] = {}
     for fault in xid_faults + held:
@@ -152,6 +182,11 @@ async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardH
         _unsaved_card_health[key] = state
     else:
         _unsaved_card_health.pop(key, None)
+    if judged_resets := [uuid for uuid in resets if uuid in gpus]:
+        try:
+            await ctx.services.redis.hdel(card_reset_key(ctx.miner_hotkey, ctx.executor.uuid), *judged_resets)
+        except _REDIS_ERRORS:
+            pass
 
 
 async def read_memory_health(ctx: Context) -> MemoryHealthRead:
@@ -160,6 +195,8 @@ async def read_memory_health(ctx: Context) -> MemoryHealthRead:
     if ctx.state.memory_health is not None:
         return ctx.state.memory_health
     before = await _load_card_health(ctx)
+    # read before the probe runs: a reset that ends during this read is judged on the next one
+    resets = await _load_card_resets(ctx) if before is not None else set()
     command = f"{shlex.quote(ctx.executor.python_path)} -I - --nvml-only"
     if before is not None and before.xid_after is not None:
         command += f" --xid-after {before.xid_after}"
@@ -170,7 +207,7 @@ async def read_memory_health(ctx: Context) -> MemoryHealthRead:
     )
     report = _parse_report(run.stdout) or {}
     if before is not None:
-        await _judge_card_faults(ctx, report, before)
+        await _judge_card_faults(ctx, report, before, resets)
     return MemoryHealthRead(run=run, report=report)
 
 

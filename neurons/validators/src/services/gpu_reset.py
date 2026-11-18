@@ -865,6 +865,26 @@ async def _wait_exited(runner: SSHCommandRunner, container_name: str) -> None:
 # a scrape this soon after a renter's reset can still miss the cards the driver is bringing back
 RECENT_RENTER_GPU_RESET_SECONDS = 5 * 60
 
+# DAH-6646: the cards a validator `nvidia-smi -r` reset, per node, until the next memory read judges them: one that
+# reads clean there lifts its held Xid fault (checks/gpu_memory_health.py). The expiry only cleans up a gone node:
+# an unconsumed record lifts nothing.
+CARD_RESET_KEY_PREFIX = "gpu_card_reset"
+CARD_RESET_TTL_SECONDS = 86400
+
+
+def card_reset_key(miner_hotkey: str, executor_id: str) -> str:
+    return f"{CARD_RESET_KEY_PREFIX}:{miner_hotkey}:{executor_id}"
+
+
+async def record_card_resets(redis, miner_hotkey: str, executor_id: str, gpu_uuids: list[str]) -> None:
+    """Record cards an `nvidia-smi -r` of this validator reset (exit 0); never a latch clear or a refused reset."""
+    if not gpu_uuids:
+        return
+    key = card_reset_key(miner_hotkey, executor_id)
+    for uuid in gpu_uuids:
+        await redis.hset(key, uuid, "1")
+    await redis.expire(key, CARD_RESET_TTL_SECONDS)
+
 # the checks a renter's own reset can trip (the pod is stopped, its GPUs drop out for a moment); a reset of
 # the verified job by any other check (a GPU swap, a duplicate node) is still sent during the reset
 RESET_CAUSED_CHECK_IDS = frozenset({

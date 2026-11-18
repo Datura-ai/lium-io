@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import redis.asyncio as aioredis
-from payload_models.payloads import GpuResetErrorCode, ResetPodGpuRequest
+from payload_models.payloads import GpuResetErrorCode, GpuResetOutcome, ResetPodGpuRequest
 from incentive.config import IncentiveConfig
 from incentive.rental_price import RentalPriceIncentive
 from services.docker_service import DockerService
@@ -23,7 +23,7 @@ from services.executor_rollout import (
     carry_renter_gpu_reset_results,
     remember_rented_scored_results,
 )
-from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, renter_gpu_reset_recent
+from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, card_reset_key, renter_gpu_reset_recent
 from services.redis_service import (
     GPU_RESET_PENDING_KIND,
     LAST_SCORED_RESULT_TTL_SECONDS,
@@ -549,6 +549,27 @@ async def test_the_reset_leaves_a_recent_mark_when_its_pending_mark_goes():
     assert result.ok is True
     assert await service.gpu_reset_marks(RENTAL_OWNER, EXECUTOR) == []
     assert await renter_gpu_reset_recent(service, RENTAL_OWNER, EXECUTOR, POD_ID) is True
+
+
+@pytest.mark.asyncio
+async def test_only_the_cards_the_reset_actually_reset_are_recorded_for_the_memory_read():
+    # DAH-6646: a card reset with exit 0 can lift its held Xid fault on its next clean read; a latch clear cannot
+    service = _redis_service()
+    connection = MagicMock(__aenter__=AsyncMock(), __aexit__=AsyncMock(return_value=False))
+    report = GpuResetReport(
+        ok=False,
+        pod_stopped=True,
+        container_restarted=True,
+        gpus=[
+            GpuResetOutcome(index=0, uuid="GPU-1", result="reset"),
+            GpuResetOutcome(index=1, uuid="GPU-2", result="latch_cleared"),
+        ],
+    )
+
+    with patch("services.docker_service.reset_pod_gpus", AsyncMock(return_value=report)):
+        await _run_reset(service, return_value=connection)
+
+    assert set(await service.hgetall(card_reset_key(RENTAL_OWNER, EXECUTOR))) == {b"GPU-1"}
 
 
 @pytest.mark.asyncio
