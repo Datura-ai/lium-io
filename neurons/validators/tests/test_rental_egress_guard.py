@@ -593,6 +593,32 @@ def test_a_failed_chain_probe_is_reported_not_taken_for_an_absent_chain(tmp_path
     assert "Operation not permitted" in done.stderr
 
 
+_DENIED = "#!/bin/sh\necho 'nsenter: reassociate to namespace: Operation not permitted' >&2\nexit 1\n"
+_NO_CHAIN = "#!/bin/sh\necho 'iptables: No chain/target/match by that name.' >&2\nexit 1\n"
+
+
+@pytest.mark.parametrize(
+    ("nft", "script", "rc"),
+    [(_DENIED, "apply", 4), (_DENIED, "cleanup", 4), (_NO_CHAIN, "apply", 3), (_NO_CHAIN, "cleanup", 0)],
+    ids=["denied-apply", "denied-cleanup", "absent-apply", "absent-cleanup"],
+)
+def test_a_later_backends_absence_never_hides_an_earlier_failed_probe(tmp_path, nft, script, rc):
+    """The last legacy rental stops and the nft probe is refused: legacy and plain iptables saying "no chain" is not
+    proof the host has none of our jumps, so cleanup reports it and is retried. Only absence on every backend is 0."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, body in (("iptables-nft", nft), ("iptables-legacy", _NO_CHAIN), ("iptables", _NO_CHAIN)):
+        (bin_dir / name).write_text(body)
+        (bin_dir / name).chmod(0o755)
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    body = link_local_drop_script("br-0123456789ab", []) if script == "apply" else link_local_cleanup_script()
+
+    done = subprocess.run(["sh", "-c", body], env=env, capture_output=True, text=True)
+
+    assert done.returncode == rc, done.stderr
+    assert ("Operation not permitted" in done.stderr) == (nft is _DENIED)
+
+
 @pytest.mark.parametrize("script", ["apply", "cleanup"])
 def test_a_host_iptables_without_the_nft_or_legacy_names_is_used(tmp_path, script):
     """The rules run with the host's own binaries now: an older host ships plain `iptables` only."""
