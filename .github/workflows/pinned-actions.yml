@@ -2,10 +2,10 @@ name: Pinned actions
 
 on:
   pull_request:
-    paths: [".github/workflows/**"]
+    paths: [".github/workflows/**", ".github/actions/**"]
   push:
     branches: [main]
-    paths: [".github/workflows/**"]
+    paths: [".github/workflows/**", ".github/actions/**"]
 
 permissions:
   contents: read
@@ -15,20 +15,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      # a workflow that can mint an OIDC token must pin every action to a commit, never to a movable tag
-      - name: Actions in workflows with id-token write are pinned to commit SHAs
+      # every workflow and local action pins third-party actions to a commit, never to a movable tag;
+      # the files are parsed as YAML so quoting and spacing cannot hide a reference
+      - name: All actions are pinned to commit SHAs
         run: |
-          python3 - <<'PY'
-          import pathlib, re, sys
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install -q pyyaml==6.0.3
+          /tmp/venv/bin/python - <<'PY'
+          import pathlib, re, sys, yaml
+          files = sorted(pathlib.Path(".github/workflows").glob("*.y*ml")) + sorted(pathlib.Path(".github/actions").glob("**/action.y*ml"))
           bad = []
-          for path in sorted(pathlib.Path(".github/workflows").glob("*.y*ml")):
-              text = path.read_text()
-              if not re.search(r"id-token:\s*write", text):
-                  continue
-              for number, line in enumerate(text.splitlines(), 1):
-                  match = re.search(r"uses:\s*([^\s#]+)", line)
-                  if match and not match.group(1).startswith("./") and not re.search(r"@[0-9a-f]{40}$", match.group(1)):
-                      bad.append(f"{path}:{number}: {match.group(1)}")
-          print("\n".join(bad) or "all pinned")
+          for path in files:
+              doc = yaml.safe_load(path.read_text()) or {}
+              jobs = list((doc.get("jobs") or {}).values())
+              steps = [step for job in jobs for step in job.get("steps") or []] + list((doc.get("runs") or {}).get("steps") or [])
+              for ref in [job.get("uses") for job in jobs] + [step.get("uses") for step in steps]:
+                  if ref is not None and not str(ref).startswith("./") and not re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", str(ref)):
+                      bad.append(f"{path}: {ref}")
+          print("\n".join(bad) or f"all pinned ({len(files)} files)")
           sys.exit(1 if bad else 0)
           PY
