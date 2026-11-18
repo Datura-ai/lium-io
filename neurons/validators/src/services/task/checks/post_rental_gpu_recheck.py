@@ -127,10 +127,18 @@ async def record_gpu_drop(ctx: Context, missing_uuids: list[str]) -> None:
 
 
 def _all_cards_no_verdict(probe: AllCardsProbe) -> bool:
-    # SSH errors, timeouts and the wall clock say nothing about the cards, as the fault probe treats them
+    # SSH errors, a first-run timeout and the wall clock say nothing about the cards, as the fault probe treats them,
+    # except a timeout on a run where another card finished: the channel worked, so that card is stuck
+    # (an 8x node's GPU 0 timed out every recheck 10-16 Nov and re-listed each time);
+    # a card that timed out again on the probe's retry (`timeout_after_retry`) is a verdict and fails the recheck
+    if not probe.per_card:
+        # not probed (no card details or size, our own cipher failed): no card was run, inconclusive as before
+        return True
     reasons = [c.get("reason") or "" for c in probe.per_card if not c.get("ok")]
     if not reasons:
         return probe.over_wall_clock
+    if any(c.get("ok") for c in probe.per_card) and "timeout" in reasons:
+        return False
     return all(r == "timeout" or r.startswith("ssh_error") for r in reasons)
 
 
@@ -260,7 +268,7 @@ class PostRentalGpuRecheckCheck:
         all_cards_probe = await ctx.services.validation.probe_all_claimed_cards(
             ctx.ssh, ctx.executor, ctx.default_extra, ctx.state.specs or {}
         )
-        # None: one card (the capability matmul covers it) or an unsized model (inconclusive)
+        # None: one card (the capability matmul covers it); an unsized multi-card claim is a failed probe
         what["all_cards_matmul"] = (
             None
             if all_cards_probe is None

@@ -71,6 +71,8 @@ class AvailabilityErrorCode(StrEnum):
     GPU_MODEL_MISMATCH = "GPU_MODEL_MISMATCH"
     # DAH-6241: a card of a judged model whose GPU check gave no numbers after its one tolerated miss.
     GPU_MODEL_NOT_MEASURED = "GPU_MODEL_NOT_MEASURED"
+    # lio#2305: a claimed card whose own work-proof gave no right answer, until a run on it passes.
+    GPU_WORK_PROOF_FAILED = "GPU_WORK_PROOF_FAILED"
     # DAH-6539: the node at this address is not the account's (NodeAccountCheck); hidden, a running rental runs on.
     NODE_ACCOUNT_MISMATCH = "NODE_ACCOUNT_MISMATCH"
     # DAH-6539: the account read failed or stalled; a reach failure, so silenced with our own outage like one.
@@ -86,6 +88,7 @@ NODE_GPU_FAULT_CODES = frozenset(
         AvailabilityErrorCode.GPU_KERNEL_UNATTACHABLE,
         AvailabilityErrorCode.GPU_MODEL_MISMATCH,
         AvailabilityErrorCode.GPU_MODEL_NOT_MEASURED,
+        AvailabilityErrorCode.GPU_WORK_PROOF_FAILED,
         # read off the machine itself (its host key or account files)
         AvailabilityErrorCode.NODE_ACCOUNT_MISMATCH,
         # only raised for REASONS_THAT_HIDE_AT_ONCE, all read off the node's own report or probe

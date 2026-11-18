@@ -70,6 +70,11 @@ ROLLOUT_GRACE = "ROLLOUT_GRACE"
 # only once one uncovered cycle has published (`cycles_seen >= grace_cycles + 2`), so two pushes
 # back to back cannot chain windows either.
 MAX_ROLLOUT_GRACE_CYCLES = 2
+# DAH-6560: how long the release just replaced still reads CURRENT, counted like the window (the cycle
+# the change is seen is cycle 1) and restarted by every change, a second push inside the window too.
+# Separate from the window: it changes only the image verdict, never withholds a result, so it has no
+# 1-hour cap. Many more nodes are still on the previous image after 2 cycles than after 8.
+PREVIOUS_RELEASE_CURRENT_CYCLES = 8
 
 # What a watchtower container recreate makes a running validation look like, in the order the
 # pipeline meets them: the connect never opens; the shell dies under the upload, under a check
@@ -128,6 +133,8 @@ class RolloutState:
     cycles_seen: int = 0
     withheld: int = 0
     closed: bool = False
+    # cycles since the last digest change, that cycle included; 0 until a change is seen
+    previous_current_cycles_seen: int = 0
 
     @classmethod
     def from_json(cls, raw: str | bytes) -> RolloutState:
@@ -147,6 +154,7 @@ class RolloutState:
             cycles_seen=int(fields.get("cycles_seen", 0)),
             withheld=int(fields.get("withheld", 0)),
             closed=bool(fields.get("closed", False)),
+            previous_current_cycles_seen=int(fields.get("previous_current_cycles_seen", 0)),
         )
 
     def to_json(self) -> str:
@@ -160,6 +168,7 @@ class RolloutState:
                 "cycles_seen": self.cycles_seen,
                 "withheld": self.withheld,
                 "closed": self.closed,
+                "previous_current_cycles_seen": self.previous_current_cycles_seen,
             }
         )
 
@@ -189,11 +198,18 @@ class RolloutWindow:
     opened_job_block: int | None
     cycles_seen: int
     grace_cycles: int
+    previous_current_cycles_seen: int = 0
 
     def covers(self, job_block: int) -> bool:
         if self.grace_cycles <= 0 or self.opened_job_block is None:
             return False
         return job_block >= self.opened_job_block and 0 < self.cycles_seen <= self.grace_cycles
+
+    def previous_reads_current(self, job_block: int) -> bool:
+        """DAH-6560: a node still on the release just replaced reads CURRENT, not OUTDATED, in this cycle."""
+        if self.previous_digest is None or self.opened_job_block is None or job_block < self.opened_job_block:
+            return False
+        return 0 < self.previous_current_cycles_seen <= PREVIOUS_RELEASE_CURRENT_CYCLES
 
     def as_extra(self) -> dict[str, object]:
         return {
@@ -203,6 +219,7 @@ class RolloutWindow:
             "rollout_opened_job_block": self.opened_job_block,
             "rollout_cycles_seen": self.cycles_seen,
             "rollout_grace_cycles": self.grace_cycles,
+            "rollout_previous_current_cycles_seen": self.previous_current_cycles_seen,
         }
 
 
@@ -266,7 +283,13 @@ class ExecutorRolloutTracker:
         """
         if state.opened_job_block is None or job_block == state.last_job_block:
             return state
-        counted = replace(state, last_job_block=job_block, cycles_seen=state.cycles_seen + 1)
+        counted = replace(
+            state,
+            last_job_block=job_block,
+            cycles_seen=state.cycles_seen + 1,
+            previous_current_cycles_seen=state.previous_current_cycles_seen
+            + (1 if state.previous_current_cycles_seen else 0),
+        )
         await self._save(counted)
         return counted
 
@@ -287,6 +310,7 @@ class ExecutorRolloutTracker:
                 opened_job_block=job_block,
                 last_job_block=job_block,
                 cycles_seen=1,
+                previous_current_cycles_seen=1,
             )
             await self._save(opened)
             return self._log_window(
@@ -300,7 +324,8 @@ class ExecutorRolloutTracker:
         # cycle has published: the new digest is what "current" means from here on, but the
         # window is NOT reopened or extended — withheld cycles would chain, and three in a row
         # are what trips the backend's 1-hour inactive sweep.
-        chained = replace(state, digest=digest, previous_digest=state.digest)
+        # its previous release (the one just replaced) gets a fresh CURRENT grace of its own
+        chained = replace(state, digest=digest, previous_digest=state.digest, previous_current_cycles_seen=1)
         await self._save(chained)
         return self._log_window(
             "[rollout-grace] executor image changed again before one cycle after the "
@@ -358,6 +383,7 @@ class ExecutorRolloutTracker:
             opened_job_block=state.opened_job_block,
             cycles_seen=state.cycles_seen,
             grace_cycles=self.grace_cycles,
+            previous_current_cycles_seen=state.previous_current_cycles_seen,
         )
 
     async def _load(self) -> RolloutState:
