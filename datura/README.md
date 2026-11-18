@@ -8,12 +8,12 @@ picked up by all three on their next `pdm install`.
 
 What lives here:
 
-- `datura/requests/` — the message types the validator and the miner
-  exchange over the miner's REST API, as pydantic models: `validator_requests.py` (what the validator
-  sends: authentication, SSH-key submit/remove, pod-log requests) and
-  `miner_requests.py` (what the miner answers: accept/decline job, executor SSH
-  info, generic error). `base.py` holds `BaseRequest`, which parses an incoming
-  JSON frame into the right subclass by its `message_type`.
+- `datura/requests/` — pydantic models shared by the neurons. The miner's
+  `POST /executors` accepts `SimpleValidatorRequest` and returns `ExecutorListResponse`.
+  SSH-key submission, SSH-key removal and pod-log requests authenticate with signed HTTP
+  headers built from `AuthenticationPayload`; their successful responses are
+  `AcceptSSHKeyRequest`, `SSHKeyRemoved` and `PodLogsResponse`, and a refused request
+  answers `FailedRequest`.
 - `datura/errors/protocol.py` — the protocol-level exceptions.
 
 Adding a message type means adding a model in the right `*_requests.py` and a
