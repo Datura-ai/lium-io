@@ -385,16 +385,18 @@ async def collect_container_death_diagnostics(
     except Exception as exc:
         capture_errors.append(f"inspect: {exc}")
 
-    try:
-        logs_result = await ssh_client.run(
-            f"/usr/bin/docker logs --tail {_CONTAINER_DEATH_LOG_TAIL_LINES} {quoted_name} 2>&1 || true"
-        )
-        tail = (logs_result.stdout or "")[-_CONTAINER_DEATH_LOG_MAX_CHARS:]
-        diagnostics.logs_tail = tail or None
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        capture_errors.append(f"logs: {exc}")
+    # a removed container's log went with it: `2>&1` would store docker's "No such container" as its output
+    if not diagnostics.container_missing:
+        try:
+            logs_result = await ssh_client.run(
+                f"/usr/bin/docker logs --tail {_CONTAINER_DEATH_LOG_TAIL_LINES} {quoted_name} 2>&1 || true"
+            )
+            tail = (logs_result.stdout or "")[-_CONTAINER_DEATH_LOG_MAX_CHARS:]
+            diagnostics.logs_tail = tail or None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            capture_errors.append(f"logs: {exc}")
 
     host_context = await _collect_host_context(ssh_client)
     diagnostics.host_context = host_context or None
