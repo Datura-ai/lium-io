@@ -35,8 +35,8 @@ validator_router = APIRouter()
 
 @validator_router.websocket("/websocket/{validator_key}")
 async def validator_interface(consumer: Annotated[ValidatorConsumer, Depends(ValidatorConsumer)]):
-    await consumer.connect()
-    await consumer.handle()
+    if await consumer.connect():
+        await consumer.handle()
 
 
 @validator_router.post("/executors", response_model=ExecutorListResponse)

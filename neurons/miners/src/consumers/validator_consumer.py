@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from collections import Counter
 from typing import Annotated
 
 import bittensor
@@ -24,6 +25,7 @@ from datura.requests.validator_requests import (
     GetPodLogsRequest,
 )
 from fastapi import Depends, WebSocket
+from starlette import status
 
 from core.config import settings
 from services.executor_service import ExecutorService
@@ -32,6 +34,16 @@ from services.validator_service import ValidatorService
 
 AUTH_MESSAGE_MAX_AGE = 10
 MAX_MESSAGE_COUNT = 10
+# Until a connection has signed in it is bounded: a deadline, a frame size that fits a sign-in, and a share
+# of a fixed number of pre-sign-in slots (in total and per source address). Signed-in sessions are not counted.
+SIGN_IN_DEADLINE_SECONDS = 10
+MAX_PRE_SIGN_IN_MESSAGE_BYTES = 8 * 1024
+MAX_PRE_SIGN_IN_CONNECTIONS = 256
+MAX_PRE_SIGN_IN_CONNECTIONS_PER_SOURCE = 32
+# Largest frame any validator message may have after sign-in (uvicorn's ws_max_size, miner.py)
+WS_MAX_MESSAGE_BYTES = 1024 * 1024
+
+_pre_sign_in_by_source: Counter[str] = Counter()
 
 logger = logging.getLogger(__name__)
 
@@ -55,13 +67,68 @@ class ValidatorConsumer(BaseConsumer):
         # the miner hotkey the validator's signed sign-in named; every later message must name it too
         self.authenticated_miner_hotkey: str | None = None
         self.msg_queue = []
+        self._pre_sign_in_source: str | None = None
+        self._sign_in_deadline = 0.0
 
     def accepted_request_type(self):
         return BaseValidatorRequest
 
+    async def connect(self) -> bool:
+        """Accept the socket only for a validator this miner serves and while a pre-sign-in slot is free."""
+        source = self.websocket.client.host if self.websocket.client else ""
+        if (
+            not self.validator_service.is_valid_validator(self.validator_key)
+            or sum(_pre_sign_in_by_source.values()) >= MAX_PRE_SIGN_IN_CONNECTIONS
+            or _pre_sign_in_by_source[source] >= MAX_PRE_SIGN_IN_CONNECTIONS_PER_SOURCE
+        ):
+            await self.websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return False
+        _pre_sign_in_by_source[source] += 1
+        self._pre_sign_in_source = source
+        self._sign_in_deadline = time.monotonic() + SIGN_IN_DEADLINE_SECONDS
+        try:
+            await self.websocket.accept()
+        except BaseException:
+            self._release_pre_sign_in_slot()
+            raise
+        return True
+
+    def _release_pre_sign_in_slot(self):
+        source, self._pre_sign_in_source = self._pre_sign_in_source, None
+        if source is not None:
+            _pre_sign_in_by_source[source] -= 1
+            if _pre_sign_in_by_source[source] <= 0:
+                del _pre_sign_in_by_source[source]
+
+    async def _close_unsigned(self, reason: str):
+        logger.info("Validator %s: closing connection before sign-in: %s", self.validator_key, reason)
+        await self.websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        raise ConnectionAbortedError(reason)
+
+    async def receive_message(self) -> BaseValidatorRequest:
+        if self.validator_authenticated:
+            return await super().receive_message()
+        try:
+            data = await asyncio.wait_for(
+                self.websocket.receive_text(), max(self._sign_in_deadline - time.monotonic(), 0)
+            )
+        except asyncio.TimeoutError:
+            await self._close_unsigned("sign-in deadline passed")
+        if len(data) > MAX_PRE_SIGN_IN_MESSAGE_BYTES:
+            await self._close_unsigned("message too large before sign-in")
+        return self.accepted_request_type().parse(data)
+
+    async def handle(self):
+        try:
+            await super().handle()
+        finally:
+            self._release_pre_sign_in_slot()
+
     def verify_auth_msg(self, msg: AuthenticateRequest) -> tuple[bool, str]:
         if msg.payload.timestamp < time.time() - AUTH_MESSAGE_MAX_AGE:
             return False, "msg too old"
+        if msg.payload.timestamp > time.time() + AUTH_MESSAGE_MAX_AGE:
+            return False, "msg timestamp in the future"
         # The signed payload names the miner it is for. A standard miner serves one hotkey and
         # refuses a sign-in made for another; the central miner serves many portal hotkeys and
         # cannot compare here — its later messages are bound to this name instead (handle_message).
@@ -95,6 +162,7 @@ class ValidatorConsumer(BaseConsumer):
 
         self.validator_authenticated = True
         self.authenticated_miner_hotkey = msg.payload.miner_hotkey
+        self._release_pre_sign_in_slot()
         for queued in list(self.msg_queue):
             await self.handle_message(queued)
             if not self.validator_authenticated:
@@ -153,8 +221,9 @@ class ValidatorConsumer(BaseConsumer):
         #     await self.send_message(AcceptJobRequest())
 
         if not self.validator_authenticated:
-            if len(self.msg_queue) <= MAX_MESSAGE_COUNT:
-                self.msg_queue.append(msg)
+            if len(self.msg_queue) >= MAX_MESSAGE_COUNT:
+                await self._close_unsigned("too many messages before sign-in")
+            self.msg_queue.append(msg)
             return
 
         # every request after the sign-in carries a miner_hotkey; it must be the one the sign-in named
@@ -261,7 +330,8 @@ class ValidatorConsumerManger:
             validator_service=validator_service,
             executor_service=executor_service,
         )
-        await consumer.connect()
+        if not await consumer.connect():
+            return
 
         # In CENTRAL_MODE, allow multiple concurrent connections from same validator
         if settings.CENTRAL_MODE:
