@@ -906,6 +906,10 @@ _STALE_MOUNT_START_ERROR = (
 async def test_the_undo_repairs_a_stale_vloopback_mountpoint_left_by_park_and_starts_again(svc, start_error, repaired, starts, raises):
     docker_client = Mock()
     docker_client.start = AsyncMock(side_effect=[RuntimeError(start_error), None])
+    # the parked container reads as stopped, with its id; the put-back-down of a failed start is tested elsewhere
+    docker_client.inspect_container_state = AsyncMock(return_value=Mock(running=False, restarting=False))
+    docker_client.container_identity = AsyncMock(return_value="cid@2026-11-16T14:03:00Z")
+    svc._stop_after_failed_start = AsyncMock()
     svc._repair_stale_mountpoint_of_container_volume = AsyncMock(return_value=repaired)
     svc._restore_mount_and_sshd_after_start = AsyncMock()
     ssh = Mock()
@@ -1552,7 +1556,7 @@ def test_the_layer_read_skips_only_files_written_in_a_recorded_validator_start(
         (SimpleNamespace(running=False, restarting=False), True, True),  # the validator's own start, then its mount
         (SimpleNamespace(running=True, restarting=False), True, False),  # Docker accepts a start of a running one
         (SimpleNamespace(running=False, restarting=True), True, False),  # Docker is starting it itself
-        (RuntimeError("inspect failed"), True, False),  # unknown: no window, the layer read keeps the copy
+        (RuntimeError("inspect failed"), True, False),  # unknown: no start at all, so no window
         (SimpleNamespace(running=False, restarting=False), False, False),  # no mount, no window
     ],
 )
@@ -1565,14 +1569,21 @@ async def test_only_a_start_of_a_stopped_container_records_a_validator_start(svc
     docker_client.inspect_container_state = AsyncMock(
         **({"side_effect": state_before} if isinstance(state_before, Exception) else {"return_value": state_before})
     )
+    docker_client.container_identity = AsyncMock(return_value="cid@2026-11-16T14:03:00Z")
     ssh = Mock(run=AsyncMock())
 
-    await svc._bring_up_existing_container(
+    bring_up = svc._bring_up_existing_container(
         executor_info=Mock(uuid="exec-1"), private_key="private-key", docker_client=docker_client, ssh_client=ssh,
         container_name="pod_x",
         local_volume_path="/root",
         pod_id="x", default_extra={}, remount=remount,
     )
+    if isinstance(state_before, Exception):
+        with pytest.raises(RuntimeError):
+            await bring_up
+        docker_client.start.assert_not_awaited()
+    else:
+        await bring_up
 
     recorded = [c for c in ssh.run.await_args_list if docker_service._VALIDATOR_STARTS_DIR in c.args[0]]
     assert len(recorded) == records

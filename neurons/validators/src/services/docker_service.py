@@ -1908,16 +1908,6 @@ def _layer_data_check(
     )
 
 
-async def _stopped_before_start(docker_client: RentalDockerSdkClient, container_name: str) -> bool:
-    """True only when Docker says the container is stopped: the start that follows is then the validator's. Docker
-    accepts a start of a running container as success, so an unreadable state counts as running."""
-    try:
-        state = await docker_client.inspect_container_state(container_name=container_name)
-    except Exception:  # noqa: BLE001 — unknown: no start window, so the layer read keeps the copy
-        return False
-    return state.running is False and state.restarting is False
-
-
 async def _record_validator_start(ssh_client: asyncssh.SSHClientConnection, container_name: str) -> None:
     """Record [the container's current start, now] as the validator's start window, just after its mount: the layer
     read counts files changed in it as the entrypoint's. Call only for a start the validator verifiably made itself.
@@ -13329,12 +13319,11 @@ class DockerService:
         # under the pod's lock like start_existing_container: a pending stop's retry cannot probe the container
         # unmounted and then stop it after this undo restarted and remounted it
         async with self._pod_start_exclusion(executor_info, private_key, pod_id):
-            stopped_before = await _stopped_before_start(docker_client, container_name)
-            container_id = ""
-            if stopped_before:
-                # unreadable: treated like an unreadable state, a start not known to be the validator's
-                with contextlib.suppress(Exception):
-                    container_id = (await docker_client.container_identity(container_name=container_name) or "").partition("@")[0]
+            # unreadable state or id fails the undo before any start, like start_existing_container: a start the
+            # cleanup below could not follow by id would leave the pod up without its remount
+            before = await docker_client.inspect_container_state(container_name=container_name)
+            container_id = (await docker_client.container_identity(container_name=container_name) or "").partition("@")[0]
+            stopped_before = not before.running and not before.restarting
             try:
                 try:
                     await _start()
@@ -13363,7 +13352,7 @@ class DockerService:
             except (asyncio.CancelledError, Exception):
                 # a start that lands after the cancel would leave the pod up without its remount: drained and put
                 # back down before the lock is released, like start_existing_container
-                if stopped_before and container_id:
+                if stopped_before:
                     await _cleanup_to_completion(
                         self._stop_after_failed_start(
                             docker_client=docker_client,

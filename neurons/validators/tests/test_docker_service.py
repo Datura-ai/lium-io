@@ -4138,6 +4138,25 @@ async def test_an_edit_undo_cancelled_mid_start_keeps_the_pod_lock_until_the_sta
     assert client.running is False and client.stopped_containers[0] == "cid"
 
 
+@pytest.mark.parametrize("unreadable", ["identity", "state"])
+@pytest.mark.asyncio
+async def test_an_edit_undo_that_cannot_read_the_parked_container_does_not_start_it(
+    docker_service, fresh_half_started_stop_state, unreadable
+):
+    # a start the cleanup could not follow by its id would be left up without its remount
+    client = docker_service.rental_docker_client_factory.client
+    client.running = False
+    if unreadable == "identity":
+        client.identity_error = RuntimeError("docker down")
+    else:
+        client.inspect_container_state = AsyncMock(side_effect=RuntimeError("docker down"))
+
+    with pytest.raises(RuntimeError, match="docker down"):
+        await _hold_pod(docker_service, "edit_rollback", client)
+
+    assert client.started_containers == [] and client.running is False
+
+
 @pytest.mark.asyncio
 async def test_a_pending_stop_drops_a_container_re_created_under_its_name_without_reading_it(
     docker_service, monkeypatch
