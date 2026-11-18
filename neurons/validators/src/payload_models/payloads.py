@@ -1,4 +1,5 @@
 import enum
+import posixpath
 import re
 from datetime import datetime
 from typing import Literal
@@ -10,6 +11,12 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_s
 # absolute, no `.`/`..` segment, no shell metacharacter; `/lium-cipher` (the encrypted volume's ciphertext mount) and
 # `/mnt` (where an attached Volume mounts) are reserved
 _BARE_VOLUME_PATH_RE = re.compile(r"^(?:/(?!\.{1,2}(?:/|$))[A-Za-z0-9._-]+)+$")
+_RESERVED_VOLUME_ROOTS = ('lium-cipher', 'mnt')
+
+
+def _normalized_path(path: str) -> str:
+    # "//mnt", "/./mnt" and "/x/../mnt" are /mnt to Docker: the reserved check and the mount read this one form
+    return posixpath.normpath('/' + path.lstrip('/')) if path.startswith('/') else path
 
 
 class CustomOptions(BaseModel):
@@ -51,6 +58,20 @@ class CustomOptions(BaseModel):
         )
 
     @staticmethod
+    def reserved_volume_paths(volumes: list[str] | None) -> list[str]:
+        """Container paths at or under /mnt or /lium-cipher. A create refuses them: dropping one put the encrypted
+        volume at /root while the pod showed encryption on."""
+        reserved = []
+        for volume in volumes or []:
+            if not volume or not volume.strip():
+                continue
+            # the same last component _pod_volume_path mounts: "volume::/mnt" must not pass as ":/mnt"
+            container_path = _normalized_path(volume.strip().split()[0].split(':')[-1])
+            if container_path.startswith('/') and container_path.split('/')[1] in _RESERVED_VOLUME_ROOTS:
+                reserved.append(container_path)
+        return reserved
+
+    @staticmethod
     def _sanitize_volumes(volumes: list[str]) -> list[str]:
         """Sanitize volume mounts to prevent command injection."""
         sanitized = []
@@ -65,11 +86,12 @@ class CustomOptions(BaseModel):
             # container side of the pod's own named volume. Only a plain absolute path is taken, and one
             # that came with flags is refused whole rather than stripped.
             if ':' not in clean_volume:
-                # the backend's template check accepts "/workspace/"; it is the same mount as "/workspace"
+                # the backend's template check accepts "/workspace/"; it is the same mount as "/workspace". Not
+                # normalized: a "." or ".." form stays refused here; reserved_volume_paths reads the normalized form
                 bare = volume.strip().rstrip('/')
                 if (
                     _BARE_VOLUME_PATH_RE.fullmatch(bare)
-                    and bare.split('/')[1] not in ('lium-cipher', 'mnt')
+                    and bare.split('/')[1] not in _RESERVED_VOLUME_ROOTS
                     and not CustomOptions._is_dangerous_path(bare)
                 ):
                     sanitized.append(bare)
