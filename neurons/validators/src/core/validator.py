@@ -853,11 +853,7 @@ class Validator:
                             if batch == job_batch_id
                         }
                     )
-                    result_missing = (
-                        pod_ssh_only_results(rented_executors, pod_ssh, reported, job_batch_id)
-                        if settings.RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED
-                        else {}
-                    )
+                    result_missing = pod_ssh_only_results(rented_executors, pod_ssh, reported, job_batch_id)
                     # Not the whole miner's batch, not scored: no scored_at, and not "validated" for
                     # the express lane below.
                     await self.publish_result_missing(result_missing, miners, miner_coldkeys, job_batch_id)

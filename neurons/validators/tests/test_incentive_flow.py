@@ -1669,7 +1669,6 @@ async def test_an_express_pass_during_the_spec_publish_is_in_the_cycles_reported
 
     validator.miner_service.publish_machine_specs = AsyncMock(side_effect=lane_pass_lands)
     validator.publish_result_missing = AsyncMock()
-    monkeypatch.setattr(mock_settings, "RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED", True)
     seen_reported = []
 
     def spy(rented, observations, reported, batch_id):
