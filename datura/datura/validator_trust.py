@@ -4,15 +4,13 @@ The subnet owner signs one line, `lium-validator:<validator hotkey ss58>:<revisi
 `trust_line` so every component signs and checks the same text. A node accepts a message whose
 signature matches the owner hotkey and whose revision is higher than the one it holds; on any error
 it keeps the last good one. The owner hotkey is read from chain (`SubtensorModule.SubnetOwnerHotkey`)
-on public nodes only, with one plain `state_getStorage` request, so a validator key change needs a new
+on public nodes only, with one plain `state_getStorage` request (the caller sends it and bounds it), so a validator key change needs a new
 signed message and no release.
 """
 
 from __future__ import annotations
 
-import json
 import re
-import urllib.request
 from typing import NamedTuple
 
 NETUID = 51
@@ -72,16 +70,16 @@ def subnet_owner_storage_key(netuid: int = NETUID) -> str:
     return _SUBNET_OWNER_HOTKEY_PREFIX + netuid.to_bytes(2, "little").hex()
 
 
-def read_subnet_owner_hotkey(url: str, netuid: int = NETUID, timeout: float = 10.0) -> str:
-    """The SN `netuid` owner hotkey (ss58) as one chain node reports it. Raises on any failure."""
+def subnet_owner_request(netuid: int = NETUID) -> dict:
+    """The JSON-RPC request a chain node answers with the SN `netuid` owner hotkey."""
+    return {"jsonrpc": "2.0", "id": 1, "method": "state_getStorage", "params": [subnet_owner_storage_key(netuid)]}
+
+
+def subnet_owner_from_reply(reply: dict) -> str:
+    """The owner hotkey (ss58) in a chain node's reply to `subnet_owner_request`. Raises ValueError on anything else."""
     from scalecodec.utils.ss58 import ss58_encode
 
-    body = json.dumps(
-        {"jsonrpc": "2.0", "id": 1, "method": "state_getStorage", "params": [subnet_owner_storage_key(netuid)]}
-    ).encode()
-    request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - fixed https URLs
-        result = json.loads(response.read(64 * 1024)).get("result")
+    result = reply.get("result") if isinstance(reply, dict) else None
     if not isinstance(result, str) or not re.fullmatch(r"0x[0-9a-fA-F]{64}", result):
         raise ValueError(f"unexpected SubnetOwnerHotkey value: {result!r}")
     return ss58_encode(result, 42)

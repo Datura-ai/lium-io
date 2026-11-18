@@ -31,7 +31,7 @@ import tempfile
 from http import HTTPStatus
 from pathlib import Path
 
-import requests
+import aiohttp
 from bittensor_wallet import Keypair
 
 from datura.validator_trust import (
@@ -39,7 +39,8 @@ from datura.validator_trust import (
     RELEASE_SUBNET_OWNER_HOTKEY,
     SignedTrustMessage,
     TrustedValidator,
-    read_subnet_owner_hotkey,
+    subnet_owner_from_reply,
+    subnet_owner_request,
     verify_trust_message,
 )
 
@@ -52,7 +53,30 @@ STATE_FILE = "validator_trust.json"
 IMAGE_MESSAGE_PATH = Path(__file__).resolve().parents[1] / "validator_trust_message.json"
 MESSAGE_REFRESH_SECONDS = 300
 OWNER_REFRESH_SECONDS = 3600
+# each request as a whole (connect, headers and body), so a server that answers slowly cannot hold the loop
 FETCH_TIMEOUT_SECONDS = 5.0
+FETCH_LIMIT_BYTES = 64 * 1024
+
+
+async def fetch_json(url: str, body: dict | None = None) -> dict | None:
+    """The JSON a GET (or, with `body`, a POST) returns; None on a 404. Ends within FETCH_TIMEOUT_SECONDS and reads at
+    most FETCH_LIMIT_BYTES; raises on anything else."""
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=FETCH_TIMEOUT_SECONDS)) as session:
+        async with session.request("GET" if body is None else "POST", url, json=body) as response:
+            if response.status == HTTPStatus.NOT_FOUND:
+                return None
+            response.raise_for_status()
+            data = bytearray()
+            async for chunk in response.content.iter_any():
+                data += chunk
+                if len(data) > FETCH_LIMIT_BYTES:
+                    raise ValueError(f"reply over {FETCH_LIMIT_BYTES} bytes")
+            return json.loads(data)
+
+
+async def read_subnet_owner_hotkey(url: str) -> str:
+    """The subnet owner hotkey as one chain node reports it. Raises on any failure."""
+    return subnet_owner_from_reply(await fetch_json(url, subnet_owner_request()))
 
 
 def _write_json(path: Path, data: dict) -> None:
@@ -183,8 +207,8 @@ class ValidatorTrust:
             "subnet_owner": self.owner if self.enabled else None,
         }
 
-    def refresh_message(self) -> None:
-        """Blocking: run it off the event loop. A 404 or any failure keeps the message held."""
+    async def refresh_message(self) -> None:
+        """A 404 or any failure keeps the message held."""
         if not self.enabled:
             return
         if self._unsaved:
@@ -193,17 +217,15 @@ class ValidatorTrust:
             return
         url = settings.COMPUTE_REST_API_URL.rstrip("/") + "/watchtower/validator-message"
         try:
-            response = requests.get(url, timeout=FETCH_TIMEOUT_SECONDS)
-            if response.status_code == HTTPStatus.NOT_FOUND:
+            data = await fetch_json(url)
+            if data is None:
                 return
-            response.raise_for_status()
-            data = response.json()
             self.offer(SignedTrustMessage(message=str(data["message"]), signature=str(data["signature"])))
         except Exception as exc:
             logger.warning("Validator trust: message not refreshed from %s: %s: %s", url, type(exc).__name__, exc)
 
-    def refresh_owner(self) -> None:
-        """Blocking: a new owner is taken only when every public chain node answers with it (at least two), so one
+    async def refresh_owner(self) -> None:
+        """A new owner is taken only when every public chain node answers with it (at least two), so one
         node cannot name an owner by itself; any failure or disagreement keeps the last one and takes no served
         message until a later read agrees."""
         if not self.enabled:
@@ -212,7 +234,7 @@ class ValidatorTrust:
         answers = set()
         for url in PUBLIC_CHAIN_NODES:
             try:
-                answers.add(read_subnet_owner_hotkey(url, timeout=FETCH_TIMEOUT_SECONDS))
+                answers.add(await read_subnet_owner_hotkey(url))
             except Exception as exc:
                 logger.warning("Validator trust: subnet owner not read from %s: %s: %s", url, type(exc).__name__, exc)
                 return
@@ -239,8 +261,8 @@ async def run_validator_trust_refresh() -> None:
     owner_due = asyncio.get_running_loop().time()
     while True:
         if asyncio.get_running_loop().time() >= owner_due:
-            await asyncio.to_thread(validator_trust.refresh_owner)
+            await validator_trust.refresh_owner()
             if validator_trust.owner_confirmed:
                 owner_due = asyncio.get_running_loop().time() + random.uniform(0.5, 1.5) * OWNER_REFRESH_SECONDS
-        await asyncio.to_thread(validator_trust.refresh_message)
+        await validator_trust.refresh_message()
         await asyncio.sleep(MESSAGE_REFRESH_SECONDS)

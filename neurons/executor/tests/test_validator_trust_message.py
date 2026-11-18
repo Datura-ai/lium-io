@@ -3,11 +3,11 @@
 Real signatures with ephemeral keypairs; a temp dir stands in for the reserve_data volume.
 """
 
+import asyncio
 import json
 from unittest.mock import MagicMock
 
 import pytest
-import requests
 from bittensor_wallet import Keypair
 
 import dependencies.auth as auth
@@ -34,6 +34,25 @@ def new_validator():
 def _signed(owner: Keypair, validator: Keypair, revision: int) -> SignedTrustMessage:
     line = trust_line(validator.ss58_address, revision)
     return SignedTrustMessage(message=line, signature="0x" + owner.sign(line).hex())
+
+
+def _backend(monkeypatch, get) -> None:
+    """The backend answers with `get()`: a response-like object with `status_code` and `json()`, or it raises."""
+
+    async def fetch(url, body=None):
+        response = get(url)
+        return None if response.status_code == 404 else response.json()
+
+    monkeypatch.setattr(trust_service, "fetch_json", fetch)
+
+
+def _chain(monkeypatch, read) -> None:
+    """Every public chain node answers `read(url)`, or it raises."""
+
+    async def owner(url):
+        return read(url)
+
+    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", owner)
 
 
 def _state(tmp_path) -> dict:
@@ -78,20 +97,20 @@ def test_acceptance_new_validator_survives_recreate_without_backend_or_chain(
     # the backend serves the owner's message naming the new validator
     answer = MagicMock(status_code=200)
     answer.json.return_value = _signed(owner, new_validator, 1)._asdict()
-    monkeypatch.setattr(trust_service.requests, "get", lambda *a, **k: answer)
-    running.refresh_message()
+    _backend(monkeypatch, lambda *a, **k: answer)
+    asyncio.run(running.refresh_message())
     assert _accepts(monkeypatch, running, new_validator, baked) == "signed"
     assert _accepts(monkeypatch, running, old_validator, baked) is None
 
     # container recreated; backend and chain both unreachable
     def down(*args, **kwargs):
-        raise requests.ConnectionError("down")
+        raise ConnectionError("down")
 
-    monkeypatch.setattr(trust_service.requests, "get", down)
-    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", down)
+    _backend(monkeypatch, down)
+    _chain(monkeypatch, down)
     recreated = _trust(tmp_path, owner)
-    recreated.refresh_message()
-    recreated.refresh_owner()
+    asyncio.run(recreated.refresh_message())
+    asyncio.run(recreated.refresh_owner())
     assert recreated.report() == {
         "validator": new_validator.ss58_address,
         "revision": 1,
@@ -127,16 +146,16 @@ def test_a_404_or_garbage_keeps_the_held_message(tmp_path, monkeypatch, owner, n
     trust = _trust(tmp_path, owner)
     trust.offer(_signed(owner, new_validator, 1))
     for answer in (MagicMock(status_code=404), MagicMock(status_code=200, json=MagicMock(return_value={"x": 1}))):
-        monkeypatch.setattr(trust_service.requests, "get", lambda *a, **k: answer)
-        trust.refresh_message()
+        _backend(monkeypatch, lambda *a, **k: answer)
+        asyncio.run(trust.refresh_message())
         assert trust.held.validator == new_validator.ss58_address
 
 
 def test_owner_change_is_kept_and_checks_the_next_message(tmp_path, monkeypatch, owner, new_validator):
     new_owner = Keypair.create_from_uri("//LiumTrustNewOwner")
     trust = _trust(tmp_path, owner)
-    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout: new_owner.ss58_address)
-    trust.refresh_owner()
+    _chain(monkeypatch, lambda url: new_owner.ss58_address)
+    asyncio.run(trust.refresh_owner())
     assert _trust(tmp_path, new_owner).owner == new_owner.ss58_address  # kept on the volume
     assert trust.offer(_signed(new_owner, new_validator, 1))
 
@@ -172,8 +191,8 @@ def test_an_owner_change_keeps_the_held_validator_across_a_restart(tmp_path, mon
     new_owner = Keypair.create_from_uri("//LiumTrustNewOwner")
     trust = _trust(tmp_path, owner)
     assert trust.offer(_signed(owner, new_validator, 7))
-    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout: new_owner.ss58_address)
-    trust.refresh_owner()
+    _chain(monkeypatch, lambda url: new_owner.ss58_address)
+    asyncio.run(trust.refresh_owner())
     restarted = ValidatorTrust(state_dir=tmp_path, image_message=tmp_path / "absent.json")
     restarted.load()
     assert restarted.owner == new_owner.ss58_address
@@ -185,8 +204,8 @@ def test_a_new_owner_starts_its_own_revisions(tmp_path, monkeypatch, owner, old_
     new_owner = Keypair.create_from_uri("//LiumTrustNewOwner")
     trust = _trust(tmp_path, owner)
     assert trust.offer(_signed(owner, new_validator, 50))
-    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout: new_owner.ss58_address)
-    trust.refresh_owner()
+    _chain(monkeypatch, lambda url: new_owner.ss58_address)
+    asyncio.run(trust.refresh_owner())
     assert not trust.offer(_signed(owner, old_validator, 51))  # the old owner no longer signs
     assert trust.offer(_signed(new_owner, old_validator, 1))
     assert not trust.offer(_signed(new_owner, new_validator, 1))  # and the floor holds within the new owner
@@ -204,8 +223,8 @@ def test_a_failed_write_is_written_once_the_volume_takes_it(tmp_path, monkeypatc
     assert trust.offer(_signed(owner, new_validator, 7))
     assert _state(tmp_path)["messages"] == {}
     monkeypatch.setattr(trust_service, "_write_json", real_write)
-    monkeypatch.setattr(trust_service.requests, "get", lambda *a, **k: MagicMock(status_code=404))
-    trust.refresh_message()
+    _backend(monkeypatch, lambda *a, **k: MagicMock(status_code=404))
+    asyncio.run(trust.refresh_message())
     restarted = _trust(tmp_path, owner)
     assert restarted.held == trust.held
 
@@ -214,17 +233,17 @@ def test_one_public_node_cannot_name_an_owner(tmp_path, monkeypatch, owner):
     trust = _trust(tmp_path, owner)
     liar = Keypair.create_from_uri("//LiumTrustLiar").ss58_address
     answers = iter([liar, owner.ss58_address])
-    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout: next(answers))
-    trust.refresh_owner()
+    _chain(monkeypatch, lambda url: next(answers))
+    asyncio.run(trust.refresh_owner())
     assert trust.owner == owner.ss58_address
 
-    def one_down(url, timeout):
+    def one_down(url):
         if url == trust_service.PUBLIC_CHAIN_NODES[0]:
-            raise requests.ConnectionError("down")
+            raise ConnectionError("down")
         return liar
 
-    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", one_down)
-    trust.refresh_owner()
+    _chain(monkeypatch, one_down)
+    asyncio.run(trust.refresh_owner())
     assert trust.owner == owner.ss58_address
 
 
@@ -244,9 +263,9 @@ def test_owner_a_b_a_prefers_the_current_owners_message(tmp_path, monkeypatch, o
     trust = _trust(tmp_path, owner_b, image)
     assert trust.held.validator == old_validator.ss58_address  # B is still the owner the node knows
     # the chain names A again: the image message A signed is held at once, with no backend
-    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout: owner.ss58_address)
-    monkeypatch.setattr(trust_service.requests, "get", lambda *a, **k: (_ for _ in ()).throw(requests.ConnectionError()))
-    trust.refresh_owner()
+    _chain(monkeypatch, lambda url: owner.ss58_address)
+    _backend(monkeypatch, lambda *a, **k: (_ for _ in ()).throw(ConnectionError()))
+    asyncio.run(trust.refresh_owner())
     assert (trust.held.validator, trust.held.revision) == (new_validator.ss58_address, 8)
     # a restart with the owner file now saying A keeps it, and A's lower revisions stay refused
     restarted = _trust(tmp_path, owner, image)
@@ -265,8 +284,8 @@ def test_an_owner_change_never_restores_an_older_message_of_the_former_owner(
     _keep(tmp_path, owner, _signed(owner, old_validator, 3), held=False)
     trust = _trust(tmp_path, owner, image)
     assert (trust.held.validator, trust.held.revision) == (new_validator.ss58_address, 8)
-    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout: owner_b.ss58_address)
-    trust.refresh_owner()
+    _chain(monkeypatch, lambda url: owner_b.ss58_address)
+    asyncio.run(trust.refresh_owner())
     assert (trust.held.validator, trust.held.revision) == (new_validator.ss58_address, 8)
     restarted = ValidatorTrust(state_dir=tmp_path, image_message=image)
     restarted.load()
@@ -286,8 +305,8 @@ def test_a_restart_never_compares_revisions_of_different_owners(
     image.write_text(_dump(_signed(owner, old_validator, 8)))
     trust = _trust(tmp_path, owner, image)
     for new_owner in (owner_b, owner_c):
-        monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout, o=new_owner: o.ss58_address)
-        trust.refresh_owner()
+        _chain(monkeypatch, lambda url, o=new_owner: o.ss58_address)
+        asyncio.run(trust.refresh_owner())
         if new_owner is owner_b:
             assert trust.offer(_signed(owner_b, new_validator, 1))
     assert trust.held.validator == new_validator.ss58_address
@@ -306,8 +325,8 @@ def test_a_returning_owner_keeps_its_highest_revision(tmp_path, monkeypatch, own
     trust = _trust(tmp_path, owner, image)
     assert trust.offer(_signed(owner, new_validator, 8))
     for chain_owner in (owner_b, owner):
-        monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout, o=chain_owner: o.ss58_address)
-        trust.refresh_owner()
+        _chain(monkeypatch, lambda url, o=chain_owner: o.ss58_address)
+        asyncio.run(trust.refresh_owner())
         if chain_owner is owner_b:
             assert trust.offer(_signed(owner_b, old_validator, 1))
     assert (trust.held.validator, trust.held.revision) == (new_validator.ss58_address, 8)
@@ -326,24 +345,24 @@ def test_a_restarted_node_reads_the_owner_before_taking_a_served_message(
     trust = _trust(tmp_path, owner, confirmed=False)
     answer = MagicMock(status_code=200)
     answer.json.return_value = _signed(owner, old_validator, 9)._asdict()
-    monkeypatch.setattr(trust_service.requests, "get", lambda *a, **k: answer)
+    _backend(monkeypatch, lambda *a, **k: answer)
     monkeypatch.setattr(trust_service.settings, "COMPUTE_REST_API_URL", "http://backend")
-    trust.refresh_message()  # no chain read yet: nothing is taken
+    asyncio.run(trust.refresh_message())  # no chain read yet: nothing is taken
     assert (trust.held.validator, trust.held.revision) == (new_validator.ss58_address, 2)
 
-    def down(url, timeout):
-        raise requests.ConnectionError("down")
+    def down(url):
+        raise ConnectionError("down")
 
-    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", down)
-    trust.refresh_owner()  # the chain unreachable: the last held message stays, still nothing taken
-    trust.refresh_message()
+    _chain(monkeypatch, down)
+    asyncio.run(trust.refresh_owner())  # the chain unreachable: the last held message stays, still nothing taken
+    asyncio.run(trust.refresh_message())
     assert (trust.held.validator, trust.held.revision) == (new_validator.ss58_address, 2)
-    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout: owner_b.ss58_address)
-    trust.refresh_owner()
-    trust.refresh_message()  # A no longer signs
+    _chain(monkeypatch, lambda url: owner_b.ss58_address)
+    asyncio.run(trust.refresh_owner())
+    asyncio.run(trust.refresh_message())  # A no longer signs
     assert (trust.held.validator, trust.held.revision) == (new_validator.ss58_address, 2)
     answer.json.return_value = _signed(owner_b, old_validator, 1)._asdict()
-    trust.refresh_message()
+    asyncio.run(trust.refresh_message())
     assert (trust.held.validator, trust.held_owner) == (old_validator.ss58_address, owner_b.ss58_address)
 
 
@@ -354,8 +373,8 @@ def test_the_owner_and_the_held_message_are_kept_together(tmp_path, monkeypatch,
     assert trust.offer(_signed(owner, new_validator, 3))
     real_write = trust_service._write_json
     monkeypatch.setattr(trust_service, "_write_json", lambda path, data: (_ for _ in ()).throw(OSError(28, "full")))
-    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout: owner_b.ss58_address)
-    trust.refresh_owner()
+    _chain(monkeypatch, lambda url: owner_b.ss58_address)
+    asyncio.run(trust.refresh_owner())
     assert _state(tmp_path)["owner"] == owner.ss58_address  # nothing of the change landed
     monkeypatch.setattr(trust_service, "_write_json", real_write)
     assert trust.offer(_signed(owner_b, old_validator, 1))
@@ -374,29 +393,138 @@ def test_a_failed_owner_read_after_a_good_one_takes_no_served_message(
     other = Keypair.create_from_uri("//LiumTrustNewOwner")
     _keep(tmp_path, owner, _signed(owner, new_validator, 2))
     trust = _trust(tmp_path, owner, confirmed=False)
-    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout: owner.ss58_address)
-    trust.refresh_owner()
+    _chain(monkeypatch, lambda url: owner.ss58_address)
+    asyncio.run(trust.refresh_owner())
     assert trust.owner_confirmed
     if second_read == "down":
 
-        def read(url, timeout):
-            raise requests.ConnectionError("down")
+        def read(url):
+            raise ConnectionError("down")
     else:
         answers = iter([owner.ss58_address, other.ss58_address] * 4)
 
-        def read(url, timeout):
+        def read(url):
             return next(answers)
 
-    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", read)
-    trust.refresh_owner()
+    _chain(monkeypatch, read)
+    asyncio.run(trust.refresh_owner())
     assert not trust.owner_confirmed
     answer = MagicMock(status_code=200)
     answer.json.return_value = _signed(owner, old_validator, 9)._asdict()
-    monkeypatch.setattr(trust_service.requests, "get", lambda *a, **k: answer)
+    _backend(monkeypatch, lambda *a, **k: answer)
     monkeypatch.setattr(trust_service.settings, "COMPUTE_REST_API_URL", "http://backend")
-    trust.refresh_message()
+    asyncio.run(trust.refresh_message())
     assert (trust.held.validator, trust.held.revision) == (new_validator.ss58_address, 2)
-    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout: owner.ss58_address)
-    trust.refresh_owner()  # the next round reads the owner again
-    trust.refresh_message()
+    _chain(monkeypatch, lambda url: owner.ss58_address)
+    asyncio.run(trust.refresh_owner())  # the next round reads the owner again
+    asyncio.run(trust.refresh_message())
     assert (trust.held.validator, trust.held.revision) == (old_validator.ss58_address, 9)
+
+
+async def _serve(handler):
+    """A local HTTP server answering every request with `handler`; returns (runner, url)."""
+    from aiohttp import web
+
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    return runner, f"http://127.0.0.1:{port}"
+
+
+async def _dribble(request):
+    """Keeps the reply open: one byte at a time, each well inside any per-read timeout."""
+    from aiohttp import web
+
+    response = web.StreamResponse()
+    await response.prepare(request)
+    for _ in range(1000):
+        await response.write(b" ")
+        await asyncio.sleep(0.05)
+    return response
+
+
+def test_a_slowly_streamed_reply_ends_at_the_deadline(monkeypatch):
+    monkeypatch.setattr(trust_service, "FETCH_TIMEOUT_SECONDS", 0.3)
+
+    async def run():
+        runner, url = await _serve(_dribble)
+        try:
+            started = asyncio.get_running_loop().time()
+            with pytest.raises(asyncio.TimeoutError):
+                await trust_service.fetch_json(url)
+            return asyncio.get_running_loop().time() - started
+        finally:
+            await runner.cleanup()
+
+    assert asyncio.run(run()) < 1.0
+
+
+def test_an_oversized_reply_is_refused(monkeypatch):
+    from aiohttp import web
+
+    async def big(request):
+        return web.Response(body=b"[" + b"1," * trust_service.FETCH_LIMIT_BYTES + b"1]")
+
+    async def run():
+        runner, url = await _serve(big)
+        try:
+            with pytest.raises(ValueError, match="bytes"):
+                await trust_service.fetch_json(url)
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+
+
+def test_the_owner_read_posts_the_storage_request(monkeypatch, owner):
+    from aiohttp import web
+    from scalecodec.utils.ss58 import ss58_decode
+
+    from datura.validator_trust import subnet_owner_request
+
+    sent = []
+
+    async def node(request):
+        sent.append(await request.json())
+        return web.json_response({"result": "0x" + ss58_decode(owner.ss58_address)})
+
+    async def run():
+        runner, url = await _serve(node)
+        try:
+            return await trust_service.read_subnet_owner_hotkey(url)
+        finally:
+            await runner.cleanup()
+
+    assert asyncio.run(run()) == owner.ss58_address
+    assert sent == [subnet_owner_request()]
+
+
+def test_a_slow_backend_does_not_stop_later_refreshes(tmp_path, monkeypatch, owner):
+    monkeypatch.setattr(trust_service, "FETCH_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(trust_service, "MESSAGE_REFRESH_SECONDS", 0)
+    monkeypatch.setattr(trust_service, "OWNER_REFRESH_SECONDS", 0)
+    trust = _trust(tmp_path, owner)
+    monkeypatch.setattr(trust_service, "validator_trust", trust)
+    owner_reads, message_reads = [], []
+    _chain(monkeypatch, lambda url: owner_reads.append(url) or owner.ss58_address)
+
+    async def dribble(request):
+        message_reads.append(request.path)
+        return await _dribble(request)
+
+    async def run():
+        runner, url = await _serve(dribble)
+        monkeypatch.setattr(trust_service.settings, "COMPUTE_REST_API_URL", url)
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(trust_service.run_validator_trust_refresh(), 1.0)
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert len(message_reads) >= 3
+    assert len(owner_reads) >= 3 * len(trust_service.PUBLIC_CHAIN_NODES)
