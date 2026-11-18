@@ -272,7 +272,9 @@ class Settings(BaseSettings):
     LOOPBACK_PLUGIN_V2_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V2_ENABLED", default=True)
     # DAH-5101: new size-limited volumes go on vloopback:v3 (direct I/O loop, no host page cache of
     # the volume image); off = vloopback:v2 as before. Volumes already created keep their plugin.
-    LOOPBACK_PLUGIN_V3_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V3_ENABLED", default=False)
+    # On by default: on v2 a hard host stop loses the gigabytes of volume writes the host still held
+    # in its page cache, which tore encrypted-volume blocks (I/O errors in the pod after the reboot).
+    LOOPBACK_PLUGIN_V3_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V3_ENABLED", default=True)
     # DAH-5101: unlink the pod's volume files before the stop so a delete does not wait for the disk
     # to absorb unwritten data. Off = delete exactly as before; turned on per environment.
     POD_VOLUME_WIPE_BEFORE_STOP_ENABLED: bool = Field(env="POD_VOLUME_WIPE_BEFORE_STOP_ENABLED", default=False)

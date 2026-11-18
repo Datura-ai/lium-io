@@ -55,7 +55,7 @@ from ..messages import GpuLossHoldMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .gpu_fingerprint import full_set_changed, split_uuids
-from .post_rental_gpu_recheck import MARKER_TTL_SECONDS, SOURCE_GPU_LOSS_HOLD, RecheckMarker, record_marker
+from .post_rental_gpu_recheck import SOURCE_GPU_LOSS_HOLD, RecheckMarker, record_marker
 from .rented_gpu_drop import (
     FAULT_NVML_ERROR,
     GPU_DROP_REDIS_ERRORS,
@@ -71,9 +71,9 @@ logger = logging.getLogger(__name__)
 GPU_LOSS_HOLD_KEY_PREFIX = "gpu_loss_hold"
 # A weak first sighting waits this long for the next cycle (15 min apart) to confirm it.
 GPU_LOSS_CONFIRM_SECONDS = 45 * 60
-# shortcut: not a hold window, only how long Redis keeps the mark of a node no cycle sees any more (every held cycle
-# renews it, like the load-test marker); the hold itself ends only on a clean read.
-GPU_LOSS_MARK_TTL_SECONDS = MARKER_TTL_SECONDS
+# DAH-6355: a held mark has no TTL (None), like the load-test marker: the hold ends only on a clean read, also for a
+# node that no cycle sees for days
+GPU_LOSS_MARK_TTL_SECONDS = None
 # DAH-6137: at most one early recheck per node in this window while a pod is left on the old cards.
 POD_GPUS_GONE_RECHECK_SECONDS = 30 * 60
 
@@ -311,7 +311,7 @@ class GpuLossHoldCheck:
         except GPU_DROP_REDIS_ERRORS:
             self._log_redis_unavailable(ctx, "recheck request")
 
-    async def _save(self, ctx: Context, key: str, mark: DropMark, ttl: int) -> None:
+    async def _save(self, ctx: Context, key: str, mark: DropMark, ttl: int | None) -> None:
         # A dry run shares Redis with the live validator, so it leaves the live hold alone.
         if settings.DRY_RUN:
             return
