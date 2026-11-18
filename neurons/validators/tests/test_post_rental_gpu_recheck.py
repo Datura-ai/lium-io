@@ -197,8 +197,9 @@ async def test_no_all_cards_matmul_is_inconclusive_on_a_multi_card_node(
 @pytest.mark.parametrize(
     "all_cards",
     [
-        _all_cards("", "timeout"),
+        _all_cards("timeout", "timeout"),
         _all_cards("ssh_error: channel closed", ""),
+        _all_cards("ssh_error: channel closed", "timeout"),
         _all_cards("", "", over_wall_clock=True),
     ],
 )
@@ -210,6 +211,19 @@ async def test_an_all_cards_matmul_lost_to_ssh_or_time_is_inconclusive(context_f
 
     assert result.passed and result.event.reason_code == Msg.INCONCLUSIVE.reason
     assert ctx.services.redis.ttl[KEY] == module.MARKER_TTL_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_a_card_that_times_out_while_another_finishes_fails_the_recheck(context_factory):
+    # the channel worked (card 1 finished), so card 0 is stuck: an 8x node re-listed this way every recheck
+    ctx = _idle_ctx(
+        context_factory, FakeRunner(probe_stdout("ok")), FakeValidation(_all_cards("timeout", "", over_wall_clock=True))
+    )
+
+    result = await PostRentalGpuRecheckCheck().run(ctx)
+
+    assert result.passed is False and result.event.reason_code == Msg.FAILED.reason
+    assert KEY in ctx.services.redis.store
 
 
 @pytest.mark.asyncio

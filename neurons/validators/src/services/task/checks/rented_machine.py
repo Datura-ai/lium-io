@@ -40,7 +40,7 @@ from services.redis_service import (
 
 from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
-from ..pipeline import CheckResult, Context
+from ..pipeline import Check, CheckResult, Context
 from . import port_connectivity
 from .gpu_usage import _fillers_off_their_image
 from .port_connectivity import PortConnectivityCheck
@@ -253,10 +253,12 @@ class TenantEnforcementCheck:
     replays_after_session_drop = False
     fatal = True
 
-    def __init__(self, recover_stale_pods: bool = True):
+    def __init__(self, recover_stale_pods: bool = True, egress_guard: Check | None = None):
         # A dry run reports a pod as down but must not touch the executor: the DAH-2306 recovery
         # rmdirs a host path and starts a customer's container.
         self.recover_stale_pods = recover_stale_pods
+        # DAH-6442: run only in the confirmed-rented halt below, so it never delays a scored step
+        self.egress_guard = egress_guard
 
     async def run(self, ctx: Context) -> CheckResult:
         # NOTE: stale-container cleanup now runs earlier, in StaleContainerCleanupCheck
@@ -632,11 +634,13 @@ class TenantEnforcementCheck:
             what=what,
             extra=extra
         )
+        guard_events = [(await self.egress_guard.run(ctx)).event] if self.egress_guard else []
 
         return with_pod_states(
             CheckResult(
                 passed=True,
                 event=event,
+                extra_events=guard_events,
                 updates={
                     "default_extra": extra,
                     "rented": True,

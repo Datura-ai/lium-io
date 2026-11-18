@@ -5,11 +5,14 @@ import hashlib
 import io
 import json
 import os
+import runpy
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -34,7 +37,9 @@ from storage.reporting import (
     _newest_within_bytes,
 )
 from storage.restic import (
-    BACKUP_SOURCE_SCRIPT,
+    CA_BUNDLE,
+    RENTAL_EXEC_SOURCE,
+    RESTIC_TMPFS_BYTES,
     JsonEventWriter,
     ResticOperationError,
     ResticResult,
@@ -45,6 +50,7 @@ from storage.restic import (
     kernel_kill_note,
     restic_restore_helper_memory,
 )
+from storage.safe_path import SAFE_ENTER_SCRIPT
 from storage.workspace import (
     DockerUserNamespaceWorkspace,
     DockerVolumeWorkspace,
@@ -559,10 +565,12 @@ def test_plain_backup_uses_read_only_volume_and_keeps_secrets_out_of_arguments()
 
     assert cwd is None
     assert "customer-volume:/workspace:ro" in command
-    script = command.index(BACKUP_SOURCE_SCRIPT)
-    assert command[script + 2 : script + 4] == ["/workspace/checkpoints", runner._restic_binary]
+    script = command.index(SAFE_ENTER_SCRIPT)
+    assert command[script + 1 : script + 5] == ["/workspace", "checkpoints", "backup", runner._restic_binary]
     assert command[command.index("--log-driver") + 1] == "none"
     assert command[command.index("--tmpfs") + 1] == "/tmp:rw,nosuid,nodev,size=536870912"
+    launcher = runpy.run_path(str(Path(storage_runner.__file__).parent / "storage" / "rental_exec.py"))
+    assert launcher["TMPFS_BYTES"] == RESTIC_TMPFS_BYTES  # restic's temp packs get the same limit in the rental
     assert command[command.index("--memory") + 1] == "4g"
     assert "GOMAXPROCS=8" in command
     assert command[command.index("--oom-score-adj") + 1] == "1000"
@@ -631,7 +639,7 @@ def test_encrypted_workspace_resolves_verified_plaintext_view(
         container_name="rental-pod",
         container_id=CONTAINER_ID,
         pid=4321,
-        path=PurePosixPath(str(plaintext)),
+        path=PurePosixPath("/root/checkpoints"),
         read_only=True,
     )
     preflight = next(command for command in commands if command[1] == "run")
@@ -701,8 +709,10 @@ def test_bootstrap_encrypted_restore_skips_the_emptiness_preflight(
         if command[1] == "inspect":
             return SimpleNamespace(returncode=0, stdout=inspection, stderr="")
         scripts.append(command[command.index("-c") + 1])
+        modes.append(command[command.index("-c") + 4])
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
+    modes: list[str] = []
     monkeypatch.setattr("storage.workspace.subprocess.run", run_docker)
 
     workspace = WorkspaceResolver(
@@ -711,9 +721,8 @@ def test_bootstrap_encrypted_restore_skips_the_emptiness_preflight(
 
     assert workspace.read_only is False
     (preflight,) = scripts
-    assert "exit 20" in preflight          # a file where the directory should be still fails
-    assert "find" not in preflight         # emptiness is not required
-    assert "-mindepth" not in preflight
+    assert preflight == SAFE_ENTER_SCRIPT
+    assert modes == ["check-restore"]  # only the shape is checked, emptiness is not required
 
 
 def test_bootstrap_flag_is_refused_outside_encrypted_running() -> None:
@@ -1143,24 +1152,31 @@ def test_docker_restore_uses_native_json_restore_to_requested_directory() -> Non
     assert "customer-volume:/workspace:rw" in command
     assert "--workdir" not in command
     assert command[-2:] == ["--", SNAPSHOT_ID]
-    assert "/workspace/restored" in command
+    script = command.index(SAFE_ENTER_SCRIPT)
+    assert command[script + 1 : script + 4] == ["/workspace", "restored", "restore"]
+    assert command[command.index("--target") + 1] == "."
     assert "restore" in command
     assert "--json" in command
     assert "--sparse" in command
     assert "dump" not in command
 
 
-def test_encrypted_backup_enters_only_the_rental_user_namespace() -> None:
-    operation = StorageOperationSpec.from_mapping(_operation_payload(mode="encrypted_running"))
-    workspace = DockerUserNamespaceWorkspace(
+def _encrypted_workspace(path: str, read_only: bool = True) -> DockerUserNamespaceWorkspace:
+    return DockerUserNamespaceWorkspace(
         image="executor:test",
         container_name="rental-pod",
         container_id=CONTAINER_ID,
         pid=4321,
-        path=PurePosixPath("/proc/4321/root/root/checkpoints"),
-        read_only=True,
+        path=PurePosixPath(path),
+        read_only=read_only,
     )
-    runner = ResticStorageRunner(operation, workspace)
+
+
+def test_encrypted_backup_runs_restic_inside_the_rental_namespaces() -> None:
+    """DAH-6447: the launcher joins the rental's user, mount and network namespaces (not its PID namespace, where the
+    rental could read restic's environment), so a symlink the rental swaps in mid-backup resolves in its own root"""
+    operation = StorageOperationSpec.from_mapping(_operation_payload(mode="encrypted_running"))
+    runner = ResticStorageRunner(operation, _encrypted_workspace("/root/checkpoints"))
 
     command, cwd = runner._execution_command(["backup", "--json", "."], working_directory=True)
 
@@ -1168,11 +1184,15 @@ def test_encrypted_backup_enters_only_the_rental_user_namespace() -> None:
     assert command[command.index("--pid") + 1] == "host"
     assert "--privileged" in command
     assert command[command.index("--security-opt") + 1] == "label=disable"
-    assert command[command.index("--entrypoint") + 1] == "/usr/bin/nsenter"
-    assert command[command.index("-t") + 1] == "4321"
-    assert "-U" in command
-    assert "-m" not in command
-    assert "/proc/4321/root/root/checkpoints" in command
+    assert command[command.index("--entrypoint") + 1] == "/usr/local/bin/python3"
+    launcher = command.index(RENTAL_EXEC_SOURCE)
+    assert command[launcher - 3 : launcher] == ["-I", "-S", "-c"]
+    # pid, rental-side working directory, the same path checked inside the rental, restic and CA opened beforehand
+    assert command[launcher + 1 :] == [
+        "4321", "/root/checkpoints", "/root/checkpoints", "/usr/local/bin/restic", CA_BUNDLE,
+        "--no-cache", "backup", "--json", ".",
+    ]
+    assert not any("/proc/" in argument for argument in command[launcher + 1 :])
     assert not any(argument.startswith("s3.connections=") for argument in command)
 
 
@@ -1181,22 +1201,16 @@ def test_encrypted_restore_preserves_user_xattrs(monkeypatch: pytest.MonkeyPatch
     operation = StorageOperationSpec.from_mapping(
         _operation_payload(action="restore", mode="encrypted_running")
     )
-    workspace = DockerUserNamespaceWorkspace(
-        image="executor:test",
-        container_name="rental-pod",
-        container_id=CONTAINER_ID,
-        pid=4321,
-        path=PurePosixPath("/proc/4321/root/root/restored"),
-        read_only=False,
-    )
-    runner = ResticStorageRunner(operation, workspace)
+    runner = ResticStorageRunner(operation, _encrypted_workspace("/root/restored", read_only=False))
 
     command, cwd = runner._restore_execution_command(SNAPSHOT_ID)
 
     assert cwd is None
-    assert command[command.index("--entrypoint") + 1] == "/usr/bin/nsenter"
-    assert command[command.index("-t") + 1] == "4321"
-    assert "/proc/4321/root/root/restored" in command
+    launcher = command.index(RENTAL_EXEC_SOURCE)
+    # no backup pre-check; restic creates the target inside the rental's root, from the rental's /
+    assert command[launcher + 1 : launcher + 4] == ["4321", "/", ""]
+    assert command[command.index("--target") + 1] == "/root/restored"
+    assert not any("/proc/4321" in argument for argument in command)
     assert command[command.index("--memory") + 1] == "16384m"  # backups and legacy tar restores keep 4g
     assert "restore" in command
     assert "--json" in command
@@ -1240,7 +1254,7 @@ def test_encrypted_bootstrap_mode_no_longer_exists() -> None:
             container_name="rental-pod",
             container_id=CONTAINER_ID,
             pid=4321,
-            path=PurePosixPath("/proc/4321/root/root"),
+            path=PurePosixPath("/root"),
             read_only=False,
         ),
     ],
@@ -1750,46 +1764,6 @@ def test_reporter_uses_backup_summary_counters() -> None:
     assert terminal_payload["processed_bytes"] == 268_483_487
 
 
-def test_encrypted_backup_script_stops_when_the_backup_path_is_missing(tmp_path: Path) -> None:
-    marker = tmp_path / "ran"
-
-    completed = subprocess.run(
-        ["/bin/sh", "-c", BACKUP_SOURCE_SCRIPT, "sh", str(tmp_path / "missing"), "touch", str(marker)],
-        capture_output=True,
-    )
-
-    assert completed.returncode == 66
-    assert not marker.exists()
-    # the reporter keeps the first diagnostic, so sh's own cd error must not reach it ahead of ours
-    assert completed.stderr == b""
-
-
-def test_backup_source_script_stops_when_the_backup_path_is_empty(tmp_path: Path) -> None:
-    marker = tmp_path / "ran"
-    (tmp_path / "backup").mkdir()
-
-    completed = subprocess.run(
-        ["/bin/sh", "-c", BACKUP_SOURCE_SCRIPT, "sh", str(tmp_path / "backup"), "touch", str(marker)],
-        capture_output=True,
-    )
-
-    assert completed.returncode == 66
-    assert not marker.exists()
-
-
-def test_backup_source_script_fails_when_the_backup_path_is_a_file(tmp_path: Path) -> None:
-    marker = tmp_path / "ran"
-    (tmp_path / "backup").write_text("x")
-
-    completed = subprocess.run(
-        ["/bin/sh", "-c", BACKUP_SOURCE_SCRIPT, "sh", str(tmp_path / "backup"), "touch", str(marker)],
-        capture_output=True,
-    )
-
-    assert completed.returncode == 1
-    assert not marker.exists()
-
-
 def test_local_backup_of_a_file_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     path = tmp_path / "backup"
     path.write_text("x")
@@ -1979,13 +1953,14 @@ def test_encrypted_backup_preflight_lets_an_absent_path_through(
     real_run = subprocess.run
 
     def run_locally(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        script = command[command.index("-c") + 1]
-        return real_run(["/bin/sh", "-c", script, "sh", str(target)], capture_output=True, text=True)
+        start = command.index("python3")
+        return real_run([sys.executable, *command[start + 1 :]], capture_output=True, text=True)
 
     monkeypatch.setattr("storage.workspace.subprocess.run", run_locally)
     validate = lambda: WorkspaceResolver(docker_binary="docker")._validate_encrypted_path(  # noqa: E731
         image="executor:test",
         pid=1,
+        visible_root=PurePosixPath(str(tmp_path)),
         visible_path=PurePosixPath(str(target)),
         requested_path=PurePosixPath("/root/backup"),
         action=StorageAction.BACKUP,
@@ -1994,7 +1969,7 @@ def test_encrypted_backup_preflight_lets_an_absent_path_through(
     if passes:
         validate()
     else:
-        with pytest.raises(WorkspaceResolutionError, match=str(target)):  # the ls -ld output names what is there
+        with pytest.raises(WorkspaceResolutionError, match="not a directory"):
             validate()
 
 
@@ -2003,8 +1978,9 @@ def test_encrypted_backup_preflight_lets_an_absent_path_through(
     ("returncode", "stderr", "message"),
     [
         (20, "", "backup source is not a directory: /root"),
-        (20, "-rw-r--r-- 1 0 0 0 Nov  5 04:01 /proc/123/root/root\n",
-         "backup source is not a directory: /root: -rw-r--r-- 1 0 0 0 Nov  5 04:01 /proc/123/root/root"),
+        (20, "not a directory: root\n", "backup source is not a directory: /root: not a directory: root"),
+        (67, "symlink in path: root\n",
+         "backup path /root leads through a symlink, which is not followed: symlink in path: root"),
         (1, "nsenter: cannot open /proc/123/ns/user: No such file\n",
          "could not check backup path /root: exit 1: nsenter: cannot open /proc/123/ns/user: No such file"),
     ],
@@ -2021,6 +1997,7 @@ def test_encrypted_path_check_reports_the_real_failure(
         WorkspaceResolver(docker_binary="docker")._validate_encrypted_path(
             image="executor:test",
             pid=123,
+            visible_root=PurePosixPath("/proc/123/root"),
             visible_path=PurePosixPath("/proc/123/root/root"),
             requested_path=PurePosixPath("/root"),
             action=StorageAction.BACKUP,
@@ -2362,3 +2339,277 @@ def test_real_restic_finds_the_parent_when_the_backup_path_changes(
     assert summaries[0]["files_new"] == 20
     assert (summaries[1]["files_new"], summaries[1]["files_unmodified"]) == (0, 20)
 
+
+
+def test_encrypted_legacy_tar_restore_enters_the_target_without_following_links() -> None:
+    """awscli is not a static binary and cannot run inside the rental: the helper enters the target through safe_path"""
+    payload = _operation_payload(action="restore", mode="encrypted_running")
+    payload.update(engine="tar_aws_cli", snapshot_id=None, legacy_object_key="legacy/object.tgz")
+    runner = ResticStorageRunner(
+        StorageOperationSpec.from_mapping(payload), _encrypted_workspace("/root/restored", read_only=False)
+    )
+
+    command, _ = runner._legacy_restore_execution_command("legacy/object.tgz")
+
+    nsenter = command.index("--entrypoint") + 1
+    assert command[nsenter : nsenter + 6] == ["/usr/bin/nsenter", "executor:test", "-t", "4321", "-U", "--"]
+    script = command.index(SAFE_ENTER_SCRIPT)
+    assert command[script + 1 : script + 4] == ["/proc/4321/root", "root/restored", "restore"]
+    assert command[-1] == "."
+
+
+@pytest.mark.parametrize(
+    ("kind", "exit_code"),
+    [("missing", 66), ("empty", 66), ("file", 1), ("files", 0), ("unchecked", 0)],
+)
+def test_rental_launcher_checks_the_source_then_executes_restic_by_descriptor(
+    tmp_path: Path, kind: str, exit_code: int
+) -> None:
+    """The launcher's last step, run for real: the missing/empty check, then restic executed from its descriptor
+    (no path the rental could replace) with PWD and the CA path set. Joining the namespaces needs a root helper."""
+    source = tmp_path / "source"
+    if kind in ("empty", "files"):
+        source.mkdir()
+    if kind == "files":
+        (source / "data").write_text("x")
+    if kind == "file":
+        source.write_text("x")
+    # /bin/sh stands in for restic (a static binary): prints where and how it was started
+    probe = 'echo "$(pwd -P) $PWD $SSL_CERT_FILE $SSL_CERT_DIR $TMPDIR"'
+    cwd = source if kind == "files" else tmp_path
+    run = (
+        "import os, runpy, sys; launcher = runpy.run_path(sys.argv[1]); "
+        "launcher['exec_restic'](os.open('/bin/sh', os.O_RDONLY | os.O_CLOEXEC), *sys.argv[2:4], ['-c', sys.argv[4]])"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", run, str(Path(storage_runner.__file__).parent / "storage" / "rental_exec.py"),
+         str(cwd), "" if kind == "unchecked" else str(source), probe],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == exit_code, result.stderr
+    assert result.stdout == (f"{cwd} {cwd} /proc/certs/lium-ca.crt /proc/certs /proc\n" if exit_code == 0 else "")
+
+
+def test_real_encrypted_restore_through_a_rental_symlink_stays_in_the_rental_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, restic_binary: str
+) -> None:
+    """DAH-6447 end to end, unprivileged: the runner's own launcher argv runs the real restic, by descriptor, inside
+    a chrooted rental; an absolute symlink in the target resolves in the rental's root, not the caller's"""
+    unshare = shutil.which("unshare")
+    if not unshare:
+        pytest.skip("util-linux unshare is not available")
+    probe = [unshare, "--user", "--map-root-user", "--mount", "--pid", "--net", "--fork", "true"]
+    if subprocess.run(probe, capture_output=True).returncode != 0:
+        pytest.skip("unprivileged user namespaces are not available")
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "file0").write_text("0")
+    rental = tmp_path / "rental"
+    (rental / "proc").mkdir(parents=True)
+    env = {**os.environ, "RESTIC_REPOSITORY": str(rental / "repo"), "RESTIC_PASSWORD": "test"}
+    subprocess.run([restic_binary, "init"], env=env, check=True, capture_output=True)
+    backup = subprocess.run(
+        [restic_binary, "--no-cache", "backup", "--json", "."],
+        cwd=source, env=env, check=True, capture_output=True, text=True,
+    )
+    messages = map(json.loads, backup.stdout.splitlines())
+    snapshot_id = next(m for m in messages if m.get("message_type") == "summary")["snapshot_id"]
+    caller_side = tmp_path / "caller-side"
+    caller_side.mkdir()
+    rental_side = rental / str(caller_side).lstrip("/")
+    rental_side.mkdir(parents=True)
+    (rental / "data").mkdir()
+    (rental / "data" / "link").symlink_to(caller_side)  # absolute: the escape the helper's own root would allow
+
+    # the rental: own user, mount, PID and network namespaces, its /proc, chrooted into its root
+    keep_alive = (
+        "import os, sys, time; os.chroot(sys.argv[1]); os.chdir('/'); print('ready', flush=True); time.sleep(600)"
+    )
+    rental_process = subprocess.Popen(
+        [*probe[:-1], "--kill-child", "/bin/sh", "-c", 'mount --bind "$1" "$1" && mount -t proc proc "$1/proc" && exec "$2" -c "$3" "$1"',
+         "sh", str(rental), sys.executable, keep_alive],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        if rental_process.stdout.readline().strip() != "ready":
+            pytest.skip(f"could not start a test rental: {rental_process.stderr.read()[-300:]}")
+        (pid,) = Path(f"/proc/{rental_process.pid}/task/{rental_process.pid}/children").read_text().split()
+        ca = tmp_path / "ca.crt"
+        ca.write_text("unused by a local repository")
+        monkeypatch.setattr("storage.restic.CA_BUNDLE", str(ca))
+        workspace = replace(_encrypted_workspace("/data/link/restored", read_only=False), pid=int(pid))
+        runner = ResticStorageRunner(
+            StorageOperationSpec.from_mapping(_operation_payload(action="restore", mode="encrypted_running")),
+            workspace,
+            restic_binary=restic_binary,
+        )
+        command, _ = runner._restore_execution_command(snapshot_id)
+        helper = [sys.executable, *command[command.index("executor:test") + 1 :]]
+
+        result = subprocess.run(helper, env={**env, "RESTIC_REPOSITORY": "/repo"}, capture_output=True, text=True)
+    finally:
+        rental_process.kill()
+        rental_process.wait()
+
+    # exit 1 is fine: restic cannot restore the caller's uid, which the rental's user namespace does not map
+    assert result.returncode in (0, 1), result.stdout + result.stderr
+    assert (rental_side / "restored" / "file0").read_text() == "0"
+    assert list(caller_side.iterdir()) == []
+    assert not (rental / "proc" / "certs").exists()  # the CA tmpfs lived only in restic's own mount namespace
+
+
+@pytest.mark.parametrize(
+    ("privileged", "joined"),
+    [(True, ["net", "mnt", "user"]), (False, ["user", "net", "mnt"])],
+)
+def test_launcher_joins_the_user_namespace_last_unless_only_it_grants_the_others(
+    privileged: bool, joined: list[str]
+) -> None:
+    """Privileged (the helper), net and mnt go first: after joining the rental's user namespace the helper can no
+    longer join a network namespace an ancestor user namespace owns. Unprivileged, they are retried after it."""
+    launcher = runpy.run_path(str(Path(storage_runner.__file__).parent / "storage" / "rental_exec.py"))
+    calls: list[str] = []
+
+    def setns(name: str, flag: int) -> None:
+        if not privileged and "user" not in calls and name != "user":
+            raise PermissionError(1, "setns: Operation not permitted")
+        calls.append(name)
+
+    launcher["join_namespaces"](setns, [("net", 1), ("mnt", 2), ("user", 3)])
+
+    assert calls == joined
+
+
+def test_launcher_fails_when_the_user_namespace_itself_is_refused() -> None:
+    launcher = runpy.run_path(str(Path(storage_runner.__file__).parent / "storage" / "rental_exec.py"))
+
+    def setns(name: str, flag: int) -> None:
+        raise PermissionError(1, "setns: Operation not permitted")
+
+    with pytest.raises(PermissionError):
+        launcher["join_namespaces"](setns, [("net", 1), ("mnt", 2), ("user", 3)])
+
+
+# Runs as root of a user namespace that owns the network namespace: starts the rental in a child user namespace that
+# keeps that network (owned by its ancestor, as under Sysbox), serves TLS on its loopback with a certificate the
+# rental trusts in its own /etc/ssl/certs, and runs the launcher as the privileged helper does.
+ANCESTOR_NET_DRIVER = r"""
+import http.server, ssl, subprocess, sys, threading
+launcher, rental, restic, ca, cert, key = sys.argv[1:]
+subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
+server = http.server.HTTPServer(("127.0.0.1", 0), http.server.BaseHTTPRequestHandler)
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain(cert, key)
+server.socket = context.wrap_socket(server.socket, server_side=True)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+keep_alive = "import os, sys, time; os.chroot(sys.argv[1]); print('ready', flush=True); time.sleep(600)"
+rental_process = subprocess.Popen(
+    ["unshare", "--user", "--map-root-user", "--mount", "--pid", "--fork", "--kill-child", "/bin/sh", "-c",
+     'mount --bind "$1" "$1" && mount -t proc proc "$1/proc" && exec "$2" -c "$3" "$1"', "sh", rental, sys.executable, keep_alive],
+    stdout=subprocess.PIPE, text=True,
+)
+try:
+    assert rental_process.stdout.readline().strip() == "ready"
+    (pid,) = open(f"/proc/{rental_process.pid}/task/{rental_process.pid}/children").read().split()
+    repository = f"rest:https://127.0.0.1:{server.server_port}/"
+    # restic retries a TLS failure with backoff for minutes: its first retry line already names the cause
+    result = subprocess.run(
+        ["timeout", "10", sys.executable, "-I", "-S", launcher, pid, "/", "", restic, ca, "--no-cache", "-r",
+         repository, "cat", "config"],
+        capture_output=True, text=True, env={"RESTIC_PASSWORD": "test"},
+    )
+finally:
+    rental_process.kill()
+print(result.returncode)
+print(result.stdout + result.stderr)
+"""
+
+
+def test_real_launcher_joins_an_ancestor_owned_network_and_ignores_the_rentals_cas(
+    tmp_path: Path, restic_binary: str
+) -> None:
+    """DAH-6447: the network namespace belongs to an ancestor of the rental's user namespace (joining the user
+    namespace first would drop the right to join it), and a CA the rental installed in /etc/ssl/certs must not
+    authenticate a server on that network: restic trusts only the helper's CA."""
+    unshare = shutil.which("unshare")
+    if not unshare:
+        pytest.skip("util-linux unshare is not available")
+    outer = [unshare, "--user", "--map-root-user", "--net", "--mount", "--fork"]
+    if subprocess.run([*outer, unshare, "--user", "--map-root-user", "--pid", "--fork", "true"]).returncode != 0:
+        pytest.skip("unprivileged user namespaces are not available")
+    if not (shutil.which("ip") and shutil.which("openssl")):
+        pytest.skip("ip and openssl are needed")
+
+    rental = tmp_path / "rental"
+    (rental / "proc").mkdir(parents=True)
+    (rental / "etc" / "ssl" / "certs").mkdir(parents=True)
+    cert, key = tmp_path / "server.pem", tmp_path / "server.key"
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=127.0.0.1",
+         "-addext", "subjectAltName=IP:127.0.0.1", "-keyout", str(key), "-out", str(cert)],
+        check=True, capture_output=True,
+    )
+    shutil.copy(cert, rental / "etc" / "ssl" / "certs" / "rental-installed.pem")
+    ca = tmp_path / "ca.crt"
+    ca.write_text("the helper's CA bundle, which trusts nothing here")
+    launcher = Path(storage_runner.__file__).parent / "storage" / "rental_exec.py"
+
+    driver = subprocess.run(
+        [*outer, sys.executable, "-c", ANCESTOR_NET_DRIVER, str(launcher), str(rental), restic_binary, str(ca),
+         str(cert), str(key)],
+        capture_output=True, text=True, timeout=120,
+    )
+
+    assert driver.returncode == 0, driver.stderr
+    code, output = driver.stdout.split("\n", 1)
+    assert "setns" not in output, output  # joined the ancestor-owned network
+    assert "certificate signed by unknown authority" in output, output
+    assert code != "0"
+
+
+@pytest.mark.parametrize("encrypted", [False, True])
+def test_legacy_restore_downloads_from_the_root_directory(tmp_path: Path, encrypted: bool) -> None:
+    """awscli resolves `-` through getcwd, which fails inside the rental's tree under an encrypted helper."""
+    payload = _operation_payload(action="restore")
+    payload.update(engine="tar_aws_cli", snapshot_id=None, legacy_object_key="legacy/object.tgz")
+    workspace = (
+        _encrypted_workspace("/root/r", read_only=False)
+        if encrypted
+        else DockerVolumeWorkspace(
+            image="executor:test", volume_name="customer-volume", path=PurePosixPath("/workspace/r"), read_only=False
+        )
+    )
+    command, _ = ResticStorageRunner(
+        StorageOperationSpec.from_mapping(payload), workspace
+    )._legacy_restore_execution_command("legacy/object.tgz")
+    script = command[command.index("/bin/bash") + 4]  # after "-o pipefail -c"
+    record, fake_aws, target = tmp_path / "aws_cwd", tmp_path / "aws", tmp_path / "r"
+    target.mkdir()
+    fake_aws.write_text(f'#!/bin/sh\npwd > "{record}"\n')
+    fake_aws.chmod(0o755)
+
+    subprocess.run(
+        ["/bin/bash", "-o", "pipefail", "-c", script, "bash", str(fake_aws), "bucket", "k", "."],
+        cwd=target,
+        capture_output=True,
+    )
+
+    assert record.read_text().strip() == "/"
+
+
+def test_load_operation_leaves_only_the_reporter_in_the_spec_file(tmp_path: Path) -> None:
+    spec = tmp_path / "spec.json"
+    reporter = {"api_url": "https://api.example", "auth_token": "t", "resource": "restore"}
+    spec.write_text(json.dumps({"action": "restore", "repository": {"password": "p"}, "reporter": reporter}))
+    spec.chmod(0o600)
+
+    payload = storage_runner._load_operation(str(spec))
+
+    assert payload["repository"] == {"password": "p"}
+    assert json.loads(spec.read_text()) == {"reporter": reporter}
+    assert spec.stat().st_mode & 0o777 == 0o600

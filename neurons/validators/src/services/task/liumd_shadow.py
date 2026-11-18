@@ -85,7 +85,7 @@ WORKLOAD_REASONS = frozenset(
     }
 )
 # Reason codes of a check that did not run its probe for any other reason.
-SKIP_REASONS = WORKLOAD_REASONS | {"VERIFYX_DISABLED"}
+SKIP_REASONS = WORKLOAD_REASONS | {"VERIFYX_DISABLED", "VERIFYX_SKIPPED_STANDING_PROBE_FAILURE"}
 RAN = ("pass", "fail")
 
 
