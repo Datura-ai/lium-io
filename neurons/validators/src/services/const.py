@@ -508,6 +508,9 @@ TDX_WHITELIST = {
             # DAH-5243 — runner sha256:f8421a1d… (executor-v1.156, 2026-10-26)
             # includes /miner-identity for portal registration. Measured files unchanged.
             "0cc30085543511090db2952809f104dd30ec7d8630abb9fc4cde8590068ec104": 7,
+            # DAH-6549 — the same runner digest with pre_launch_script.sh keeping the guest's own rsync (the
+            # sysbox installer's static rsync crashed in __libc_early_init). Version 8.
+            "24ddd0868ee11bb38981420c157f00013651491002333c7f90d0ffc30d56377e": 8,
             # Version 3 (ab4d1433…, July runner sha256:f85b948b…) is gone and its number burned:
             # that runner bakes the STAGING validator hotkey via config_override.py and answers every
             # prod validator with 401. Removed, not demoted: TDX_MINIMUM_COMPOSE_VERSION defaults to 0.

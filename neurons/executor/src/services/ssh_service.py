@@ -11,6 +11,7 @@ from collections.abc import Callable
 from http import HTTPStatus
 
 import requests
+from cryptography.hazmat.primitives.serialization import load_ssh_public_key
 from pydantic import BaseModel
 
 from core.config import VALIDATOR_SSH_SOURCES, settings
@@ -80,6 +81,26 @@ SSH_SOURCES_CACHE_SECONDS = 300
 SSH_SOURCES_TIMEOUT_SECONDS = 5.0
 SSH_SOURCES_MAX_SKEW_SECONDS = 10 * 60
 
+
+
+AUTHORIZED_KEY_TYPES = frozenset(
+    {"ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa"}
+)
+
+
+def check_authorized_key(pub_key: str) -> None:
+    """Raise ValueError unless `pub_key` is `<type> <base64> [comment]` holding a real public key.
+
+    sshd reads anything before the key type as options (command=, environment=, ...), so a line
+    must start with an allowed type and the key must parse.
+    """
+    parts = pub_key.split()
+    if len(parts) < 2 or parts[0] not in AUTHORIZED_KEY_TYPES:
+        raise ValueError("an authorized_keys entry is a public key of an allowed type, with no options")
+    try:
+        load_ssh_public_key(f"{parts[0]} {parts[1]}".encode())
+    except Exception as exc:
+        raise ValueError(f"not a valid {parts[0]} public key") from exc
 
 class SshSourcesAnswer(BaseModel):
     """The `/watchtower/ssh-sources` answer (lium-platform SignedSshSourcesResponse)."""
@@ -308,6 +329,7 @@ class SSHService:
         if "\n" in pub_key or "\r" in pub_key:
             # a second line would be a second, unmarked key that no TTL reaches
             raise ValueError("an authorized_keys entry is one line")
+        check_authorized_key(pub_key)
         line = _validator_source_pin_option() + pub_key.encode() + b" " + UPLOADED_KEY_MARKER + str(int(time.time())).encode() + b"\n"
         with _authorized_keys_lock:
             path = authorized_keys_path()

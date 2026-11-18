@@ -10,6 +10,7 @@ are extracted by ast and executed in their own namespace (same pattern as test_s
 
 import ast
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,8 @@ INTERCONNECT_HELPERS = {
     "GpuInterconnectObservation",
     "summarize_gpu_interconnect",
     "get_gpu_interconnect",
+    "RENTAL_P2P_MARKER",
+    "rental_p2p_output",
 }
 
 
@@ -486,3 +489,77 @@ def test_the_obfuscated_scrape_still_summarizes_the_topology() -> None:
     assert values.count(True) == 2  # nvlink and p2p
     assert 18 in values and 28 in values
     assert not any(key.startswith("ic_") for key in payload)
+
+
+def test_probe_lists_the_p2p_table_read_under_the_rental_runtime(scrape: dict[str, Any]) -> None:
+    # Arrange: the scrape container reads OK on every pair, the sysbox check container reads NS on one
+    in_rental = uniform(8, "OK")
+    in_rental[0][1] = in_rental[1][0] = "NS"
+    check_stdout = "+---- nvidia-smi ----+\nLIUM_RENTAL_P2P\n" + p2p_table(in_rental)
+    scrape["run_cmd"] = _stub_run_cmd(
+        {
+            "nvidia-smi topo -m": topo_table(HGX_H200),
+            "nvidia-smi topo -p2p r": p2p_table(uniform(8, "OK")),
+            "nvidia-smi nvlink -s": nvlink_status([18] * 8),
+        }
+    )
+
+    # Act
+    observation = scrape["get_gpu_interconnect"](scrape["rental_p2p_output"](check_stdout))
+
+    # Assert
+    assert observation.payload["ic_p2p"] is False
+    assert observation.payload["ic_p2p_ok_pairs"] == 27
+    assert scrape["rental_p2p_output"]("+---- nvidia-smi ----+\n") is None
+
+
+def test_sysbox_probe_returns_the_p2p_table_its_shipped_command_prints(tmp_path) -> None:
+    # review on lio#2205: run the probe's own `sh -c` script, so a dropped marker fails here instead of
+    # silently falling back to the host read
+    table = p2p_table(uniform(2, "NS"))
+    (tmp_path / "table").write_text(table)
+    fake = tmp_path / "nvidia-smi"
+    fake.write_text(f'#!/bin/sh\n[ "$1" = topo ] && cat {tmp_path / "table"} || echo "+---- nvidia-smi ----+"\n')
+    fake.chmod(0o755)
+    scrape = build_scrape_namespace(
+        SRC / "miner_jobs" / "machine_scrape.py",
+        {"COMMANDS", "RENTAL_P2P_MARKER", "rental_p2p_output", "check_sysbox_gpu_compatibility"},
+        {"subprocess": subprocess},
+    )
+    script = scrape["COMMANDS"]["CHECK_SYSBOX_COMPATIBILITY"][-3:]  # sh -c "<script>", run as the container would
+    scrape["run_capability_check"] = lambda command: subprocess.run(
+        script, capture_output=True, text=True, env={"PATH": f"{tmp_path}:/usr/bin:/bin"}
+    )
+
+    ok, _message, rental_table = scrape["check_sysbox_gpu_compatibility"]()
+
+    assert ok is True
+    assert rental_table.strip() == table.strip()
+
+
+@pytest.mark.parametrize(
+    ("capture", "devices", "ok_pairs", "p2p", "pcie_class"),
+    [
+        ("rental_p2p_rtx3090x8_sysbox_pod.txt", 8, 0, False, "SYS"),  # every pair GNS
+        ("rental_p2p_rtxa6000x4_sysbox_pod.txt", 4, 6, True, "NODE"),  # every pair OK
+    ],
+)
+def test_real_rental_capture_parses(scrape: dict[str, Any], capture, devices, ok_pairs, p2p, pcie_class) -> None:
+    # review on lio#2205: real nvidia-smi output (driver tables keep ESC[4m/ESC[0m in the header and a trailing tab
+    # per row) captured inside a sysbox rental with the probe's own `sh -c` script, then `topo -m` and `nvlink -s`
+    raw = (SRC.parent / "tests" / "fixtures" / capture).read_text()
+    check_stdout, rest = raw.split("===TOPO_M\n", 1)
+    topo, nvlink = rest.split("===NVLINK\n", 1)
+    rental = scrape["rental_p2p_output"](check_stdout)
+    assert rental is not None
+    scrape["run_cmd"] = _stub_run_cmd(
+        {"nvidia-smi topo -m": topo, "nvidia-smi topo -p2p r": rental, "nvidia-smi nvlink -s": nvlink}
+    )
+
+    for observation in (scrape["get_gpu_interconnect"](rental), scrape["get_gpu_interconnect"]()):
+        payload = observation.payload
+        assert observation.scrape_error == ""
+        assert payload["ic_devices"] == devices
+        assert payload["ic_p2p_pairs"] == devices * (devices - 1) // 2
+        assert (payload["ic_p2p"], payload["ic_p2p_ok_pairs"]) == (p2p, ok_pairs)
+        assert (payload["ic_nvlink"], payload["ic_pcie_class"]) == (False, pcie_class)
