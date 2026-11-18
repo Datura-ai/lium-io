@@ -39,6 +39,7 @@ from dependencies.auth import (
     verify_container_logs_signature,
     verify_signature,
 )
+from services.validator_trust_service import validator_trust
 from services.local_verify_service import (
     BusyError,
     LocalVerifyService,
@@ -448,6 +449,8 @@ async def get_version():
         "version": _get_version(),
         "capabilities": [LOCAL_VERIFY_CAPABILITY],
         "local_verify_port": settings.INTERNAL_PORT,
+        # DAH-6590: the validator address and revision this node trusts, so a switch is measured per node
+        "validator_trust": validator_trust.report(),
     }
 
 
@@ -646,7 +649,7 @@ async def local_verify(request: Request):
         result.deadline_hit,
         {name: step.status for name, step in result.steps.items()},
     )
-    return result.model_dump(by_alias=True)
+    return {**result.model_dump(by_alias=True), "validator_trust": validator_trust.report()}
 
 
 _expected_digest_cache = ExpectedDigestCache()
