@@ -76,3 +76,13 @@ def test_self_rent_arrived_in_2_1_and_is_false_from_an_older_backend() -> None:
     )
     assert older.executors[executor].self_rent is False
     assert newer.executors[executor].self_rent is True
+
+
+def test_filler_strategy_by_container_arrived_in_2_17_and_is_empty_from_an_older_backend() -> None:
+    major, minor, _patch = (int(part) for part in PROTOCOL_VERSION.split("."))
+    assert (major, minor) >= (2, 17)
+    assert RentedExecutorsResponse.model_validate(OLDER_BACKEND_REPLY).filler_strategy_by_container == {}
+    reply = RentedExecutorsResponse.model_validate(
+        {**OLDER_BACKEND_REPLY, "filler_strategy_by_container": {"filler_x": "ENGY_TEE"}}
+    )
+    assert reply.filler_strategy_by_container == {"filler_x": "ENGY_TEE"}
