@@ -26,6 +26,7 @@ from services.image_flatten import FLATTEN_NO_DISK_RENTER_SENTENCE, ImageFlatten
 import services.image_flatten as image_flatten_module
 from services.cvm_quote_broker import DSTACK_GUEST_SOCKET_PATH, QUOTE_BROKER_SOCKET_PATH
 from services.docker_service import (
+    SSH_TRANSPORT_DROPPED_STEP,
     CONTAINER_STOP_GRACE_SECONDS,
     FILLER_CONTAINER_STOP_GRACE_SECONDS,
     DockerService,
@@ -4122,10 +4123,10 @@ def test_a_failure_diagnosed_above_an_unreopened_transport_keeps_its_own_step():
                 "Docker SDK pull failed on a dropped SSH transport and the transport could not be re-opened: "
                 "IncompleteRead; re-open: Connection refused"
             ),
-            "ssh_connect",
+            SSH_TRANSPORT_DROPPED_STEP,
         ),
         # as the real pull() raises it: wrapped, with the refusal as its __cause__
-        (_pull_wrapped_not_reopened(), "ssh_connect"),
+        (_pull_wrapped_not_reopened(), SSH_TRANSPORT_DROPPED_STEP),
     ],
 )
 async def test_create_container_reports_docker_pull_failure_step(
@@ -4271,7 +4272,7 @@ async def test_create_container_reports_docker_login_failure_step_when_pull_also
 
 
 @pytest.mark.asyncio
-async def test_create_container_reports_a_refused_ssh_reopen_after_a_failed_login_as_ssh_connect(
+async def test_create_container_reports_a_refused_ssh_reopen_after_a_failed_login_as_the_dropped_transport(
     docker_service,
     monkeypatch,
 ):
@@ -4301,8 +4302,45 @@ async def test_create_container_reports_a_refused_ssh_reopen_after_a_failed_logi
     )
 
     assert isinstance(result, FailedContainerRequest)
-    assert result.failure_step == "ssh_connect"
+    assert result.failure_step == SSH_TRANSPORT_DROPPED_STEP
     assert "registry" not in result.msg
+
+
+@pytest.mark.asyncio
+async def test_a_create_whose_transport_drops_after_docker_run_is_not_reported_as_before_the_host(
+    docker_service,
+    monkeypatch,
+):
+    # `ssh_connect` tells the rental probe the create never reached the host, so it skipped the by-name removal
+    from services.task.checks.rental_probe import _CREATE_STEPS_BEFORE_THE_HOST
+
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    docker_service.rental_docker_client_factory.client.run_error = RentalDockerTransportNotReopened(
+        "Docker SDK run container failed on a dropped SSH transport and the transport could not be re-opened"
+    )
+    payload = _private_registry_create_payload()
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == SSH_TRANSPORT_DROPPED_STEP
+    assert result.failure_step not in _CREATE_STEPS_BEFORE_THE_HOST
+    assert '"dropped_during_step": "docker_run"' in result.detail
 
 
 @pytest.mark.parametrize(

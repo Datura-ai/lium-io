@@ -940,7 +940,8 @@ async def test_a_create_that_fails_after_docker_run_still_removes_the_container_
     `cleanup_failed_container_creation` is best effort (a failed `docker rm` is logged and swallowed), and
     the settle sees no ContainerCreated and returns early, so a `pod_<id>` that cleanup missed keeps running
     on the node with the GPUs and the verified ports until the stale sweep."""
-    for step in ("add_public_keys", "set_environment", "finalize"):
+    # ssh_transport_dropped: the node stopped answering mid-create (docker_service.SSH_TRANSPORT_DROPPED_STEP)
+    for step in ("add_public_keys", "set_environment", "finalize", "ssh_transport_dropped"):
         ctx, docker, redis = make_probe_context(
             docker=FakeDocker(create_result=create_failed(step))
         )
