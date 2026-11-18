@@ -168,7 +168,7 @@ def link_local_drop_script(bridge: str | None, legacy_bridges: list[str]) -> str
         'IPT="$HOST_NS iptables-nft"',
         '$IPT -L DOCKER-USER -n >/dev/null 2>&1 || IPT="$HOST_NS iptables-legacy"',
         '$IPT -L DOCKER-USER -n >/dev/null 2>&1 || IPT="$HOST_NS iptables"',  # a host iptables without -nft/-legacy
-        '$IPT -L DOCKER-USER -n >/dev/null 2>&1 || { echo "DOCKER-USER chain not found" >&2; exit 3; }',
+        '$IPT -L DOCKER-USER -n >/dev/null || exit 3',  # its own error says why it failed
         f"$IPT -N {a} 2>/dev/null; $IPT -N {b} 2>/dev/null",
         'RULES=$($IPT -S DOCKER-USER) || { echo "DOCKER-USER not readable" >&2; exit 4; }',
         f"ACTIVE=$(printf '%s\\n' \"$RULES\" | awk '$1 == \"-A\" && $3 == \"-j\" && ($4 == \"{a}\" || $4 == \"{b}\") "
@@ -198,7 +198,10 @@ def link_local_cleanup_script() -> str:
         'IPT="$HOST_NS iptables-nft"',
         '$IPT -L DOCKER-USER -n >/dev/null 2>&1 || IPT="$HOST_NS iptables-legacy"',
         '$IPT -L DOCKER-USER -n >/dev/null 2>&1 || IPT="$HOST_NS iptables"',  # a host iptables without -nft/-legacy
-        "$IPT -L DOCKER-USER -n >/dev/null 2>&1 || exit 0",
+        # only iptables' own "no such chain" proves there is nothing to clean; a probe that failed otherwise
+        # leaves the old jumps in place and is reported
+        'ERR=$($IPT -L DOCKER-USER -n 2>&1 >/dev/null) || case "$ERR" in '
+        '*"No chain"*|*"does not exist"*) exit 0;; *) echo "$ERR" >&2; exit 4;; esac',
     ]
     for chain in CHAINS:
         # a chain iptables says does not exist is done; one that exists must lose its jumps, rules and itself

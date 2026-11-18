@@ -578,6 +578,22 @@ def test_cleanup_script_accepts_absence_and_reports_a_failed_removal(tmp_path, c
 
 
 @pytest.mark.parametrize("script", ["apply", "cleanup"])
+def test_a_failed_chain_probe_is_reported_not_taken_for_an_absent_chain(tmp_path, script):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in ("iptables-nft", "iptables-legacy", "iptables"):
+        (bin_dir / name).write_text("#!/bin/sh\necho 'nsenter: reassociate to namespace: Operation not permitted' >&2\nexit 1\n")
+        (bin_dir / name).chmod(0o755)
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    body = link_local_drop_script("br-0123456789ab", []) if script == "apply" else link_local_cleanup_script()
+
+    done = subprocess.run(["sh", "-c", body], env=env, capture_output=True, text=True)
+
+    assert done.returncode != 0
+    assert "Operation not permitted" in done.stderr
+
+
+@pytest.mark.parametrize("script", ["apply", "cleanup"])
 def test_a_host_iptables_without_the_nft_or_legacy_names_is_used(tmp_path, script):
     """The rules run with the host's own binaries now: an older host ships plain `iptables` only."""
     bin_dir, state = tmp_path / "bin", tmp_path / "state"
