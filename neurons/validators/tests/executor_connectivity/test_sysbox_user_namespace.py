@@ -151,23 +151,29 @@ class _ProcSysSSH:
     ],
 )
 async def test_a_broken_sysbox_fs_is_named(stderr):
-    cause = await DindVerifier._read_sysbox_fs(_ProcSysSSH(stderr, exit_status=1), {})
+    clean, cause = await DindVerifier._read_sysbox_fs(_ProcSysSSH(stderr, exit_status=1), {})
 
+    assert clean is False
     assert cause.code == dind_probe.HOST_SYSBOX_FS_BROKEN
     assert stderr in cause.message
+
+
+@pytest.mark.asyncio
+async def test_a_clean_sysbox_fs_read_is_clean():
+    assert await DindVerifier._read_sysbox_fs(_ProcSysSSH(), {}) == (True, None)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "inner",
     [
-        _ProcSysSSH(),
         _ProcSysSSH("cat: /proc/sys/kernel/hostname: Permission denied", exit_status=1),
         _ProcSysSSH(hangs=True),
     ],
 )
-async def test_a_clean_or_unanswered_sysbox_fs_read_decides_nothing(inner):
-    assert await DindVerifier._read_sysbox_fs(inner, {}) is None
+async def test_an_unanswered_sysbox_fs_read_decides_nothing(inner):
+    """Neither broken nor clean: a hold stays as it is."""
+    assert await DindVerifier._read_sysbox_fs(inner, {}) == (False, None)
 
 
 class _BrokenFsSSH(_InnerSSH):
@@ -205,3 +211,4 @@ async def test_a_passed_probe_carries_the_broken_sysbox_fs(mocker):
 
     assert (result.success, result.sysbox_runtime) == (True, True)
     assert result.error.code == dind_probe.HOST_SYSBOX_FS_BROKEN
+    assert result.sysbox_fs_read_clean is False

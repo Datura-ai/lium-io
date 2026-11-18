@@ -228,6 +228,7 @@ class ConnectivityOrchestrator:
             declared_port_count=declared_port_count,
             port_ranges=port_ranges,
             host_runtime_fault=dind_result.sshd_never_answered,
+            sysbox_fs_read_clean=dind_result.sysbox_fs_read_clean,
             sysbox_measured=dind_result.sysbox_runtime
             if dind_result.success and sysbox_requested and not dind_result.sysbox_timed_out
             else None,

@@ -220,6 +220,7 @@ class DindVerifier:
         sshd_answered = False
         sysbox_timed_out = False
         sysbox_fs_error: DindLogCause | None = None
+        sysbox_fs_clean = False
 
         try:
             logger.info(_m("DinD start", extra=get_extra_info(log_ctx)))
@@ -266,7 +267,7 @@ class DindVerifier:
                     sysbox_timed_out = measured is None
                     sysbox = measured is True
                     if sysbox:
-                        sysbox_fs_error = await self._read_sysbox_fs(ssh, log_ctx)
+                        sysbox_fs_clean, sysbox_fs_error = await self._read_sysbox_fs(ssh, log_ctx)
 
             logger.info(_m("DinD check ok", extra=get_extra_info({**log_ctx, "sysbox_result": sysbox})))
 
@@ -277,6 +278,7 @@ class DindVerifier:
                 port=port,
                 sysbox_timed_out=sysbox_timed_out,
                 error=sysbox_fs_error,
+                sysbox_fs_read_clean=sysbox_fs_clean,
             )
 
         except Exception as e:
@@ -369,18 +371,23 @@ class DindVerifier:
         return UID_MAP_USER_NAMESPACE
 
     @staticmethod
-    async def _read_sysbox_fs(ssh: SSHClientConnection, log_ctx: dict[str, Any]) -> DindLogCause | None:
-        """HOST_SYSBOX_FS_BROKEN when a sysbox-fs file inside the probe container answers with a broken-FUSE
-        error; None for a clean read, a timeout or any other error (no answer decides nothing)."""
+    async def _read_sysbox_fs(
+        ssh: SSHClientConnection, log_ctx: dict[str, Any]
+    ) -> tuple[bool, DindLogCause | None]:
+        """(clean, cause) of a sysbox-fs file read inside the probe container: (True, None) for a clean read;
+        (False, HOST_SYSBOX_FS_BROKEN) for a broken-FUSE error; (False, None) for a timeout or any other error,
+        which decides nothing."""
         try:
             result = await asyncio.wait_for(ssh.run(f"cat {SYSBOX_FS_PATH}"), timeout=SYSBOX_FS_READ_TIMEOUT_SECONDS)
         except (asyncio.TimeoutError, asyncssh.Error, OSError):
-            return None
+            return False, None
+        if result.exit_status == 0:
+            return True, None
         stderr = result.stderr.strip() if isinstance(result.stderr, str) else ""
-        if result.exit_status == 0 or not any(error in stderr for error in SYSBOX_FS_BROKEN_ERRORS):
-            return None
+        if not any(error in stderr for error in SYSBOX_FS_BROKEN_ERRORS):
+            return False, None
         logger.warning(_m(HOST_SYSBOX_FS_BROKEN, extra=get_extra_info({**log_ctx, "error": stderr})))
-        return DindLogCause(
+        return False, DindLogCause(
             HOST_SYSBOX_FS_BROKEN,
             f"reading {SYSBOX_FS_PATH} in a new sysbox container failed: {stderr[:DOCKER_RUN_ERROR_LINE_MAX_CHARS]}",
         )

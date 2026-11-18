@@ -221,6 +221,8 @@ class ContextState:
     # DIND_PROBE_UNREACHABLE for DIND_SSHD_NOT_READY (DAH-5844). DAH-6637: HOST_SYSBOX_FS_BROKEN on a passed
     # probe; SysboxRequiredCheck turns it into an availability entry.
     dind_probe_error: DindLogCause | None = None
+    # DAH-6637: this cycle's DinD probe read a sysbox-fs file clean; lifts SysboxRequiredCheck's sysbox-fs hold
+    sysbox_fs_read_clean: bool = False
     # the outside prober could not reach the ports: our filler's ports are behind the same firewall
     externally_unreachable: bool = False
     # DAH-5651: this cycle's DinD test container was started on the host and never answered, so the host's

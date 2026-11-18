@@ -23,7 +23,7 @@ from protocol.vc_protocol.compute_requests import (
 )
 
 from services.executor_connectivity.models import DindLogCause
-from tests.helpers import build_state
+from tests.helpers import FakeRedis, build_services, build_state
 
 
 def _rented_data(miner_hotkey: str = "test-miner", port: str = "22") -> RentedExecutorsResponse:
@@ -342,8 +342,43 @@ async def test_a_broken_sysbox_fs_hides_the_node_without_failing_the_run(context
 
 @pytest.mark.asyncio
 async def test_a_clean_sysbox_fs_read_sends_no_entry(context_factory):
-    """The next clean cycle's empty list lists the node again."""
-    result = await SysboxRequiredCheck().run(context_factory(state=build_state(sysbox_runtime=True)))
+    """No hold and a clean read: no entry."""
+    state = build_state(sysbox_runtime=True, sysbox_fs_read_clean=True)
+
+    result = await SysboxRequiredCheck().run(context_factory(state=state))
 
     assert result.passed is True
     assert availability_errors([result.event]) == []
+
+
+async def _cycle(context_factory, redis, **state):
+    ctx = context_factory(state=build_state(sysbox_runtime=True, **state), services=build_services(redis=redis))
+    return await SysboxRequiredCheck().run(ctx)
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_without_a_read_keeps_the_hold_until_a_clean_read(context_factory):
+    """Review on #2327: a skipped, deferred or timed-out probe must not list the node again; only a clean read does."""
+    redis = FakeRedis()
+
+    broken = await _cycle(context_factory, redis, dind_probe_error=_SYSBOX_FS_BROKEN)
+    unread = await _cycle(context_factory, redis)
+    clean = await _cycle(context_factory, redis, sysbox_fs_read_clean=True)
+    after = await _cycle(context_factory, redis)
+
+    assert (broken.passed, unread.passed, unread.fatal) == (False, False, False)
+    [entry] = availability_errors([unread.event])
+    assert entry.reason_code == AvailabilityErrorCode.HOST_SYSBOX_FS_BROKEN
+    assert "no clean read yet" in entry.what_we_saw["dind_probe_error"]
+    assert (clean.passed, after.passed) == (True, True)
+    assert redis.store == {}
+
+
+@pytest.mark.asyncio
+async def test_a_redis_outage_holds_nothing_but_still_reports_a_broken_read(context_factory):
+    redis = FakeRedis(failing=True)
+
+    broken = await _cycle(context_factory, redis, dind_probe_error=_SYSBOX_FS_BROKEN)
+    unread = await _cycle(context_factory, redis)
+
+    assert (broken.passed, unread.passed) == (False, True)

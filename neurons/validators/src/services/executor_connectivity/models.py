@@ -73,6 +73,8 @@ class DindProbeResult:
     # DAH-5651: the container started and its sshd never answered (or the node dropped the connection).
     # False for a refused `docker run` and for an error on the validator's side.
     sshd_never_answered: bool = False
+    # DAH-6637: a sysbox-fs file read clean inside the probe container (the only reading that lifts a sysbox-fs hold)
+    sysbox_fs_read_clean: bool = False
 
 
 @dataclass(frozen=True)
@@ -128,6 +130,8 @@ class PortVerificationResult:
     # DAH-6376: the DinD probe did not run because no candidate port was known free (all held, or the host's port
     # inventory could not be read); measures nothing, so it counts neither for nor against the node
     dind_skipped: bool = False
+    # DAH-6637: DindProbeResult.sysbox_fs_read_clean of this cycle's DinD probe
+    sysbox_fs_read_clean: bool = False
 
 
 @dataclass(frozen=True)
