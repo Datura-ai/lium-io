@@ -257,6 +257,41 @@ async def test_a_shift_after_a_container_only_restart_does_not_blame_the_host(
 
 
 @pytest.mark.parametrize(
+    ("created", "template", "before_boot"),
+    [
+        # created 36 min before the host booted at 20:20:03Z, started by the validator's stale-mount
+        # recovery 1358 s after boot: it was on the host when it stopped, so the host message stays
+        ("2026-11-17T19:44:26.034526789Z", Msg.SHIFTED, True),
+        # created 30 s after boot and restarted later on the running host: a container-only restart
+        ("2026-11-17T20:20:33.5Z", Msg.SHIFTED_AFTER_CONTAINER_RESTART, False),
+        # a creation time that is not one: the age alone decides, as before
+        ("yesterday", Msg.SHIFTED_AFTER_CONTAINER_RESTART, None),
+        # within seconds of the boot either side: rounding and clock slew, and no container is created that soon
+        # after a boot, so it was there at the stop however late the recovery started it
+        ("2026-11-17T20:20:03.3Z", Msg.SHIFTED, True),
+        ("2026-11-17T20:19:59.9Z", Msg.SHIFTED, True),
+        ("2026-11-17T20:20:09Z", Msg.SHIFTED_AFTER_CONTAINER_RESTART, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_pod_created_before_the_boot_is_blamed_on_the_host_however_late_it_started(
+    context_factory, tmp_path, created, template, before_boot
+):
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me + 200000}      65536\n")
+    _proc(tmp_path, 4343, f"         0     {me}      65536\n")
+    boot = 1794946803  # 2026-11-17T20:20:03Z
+    out = f"1400.25\n4242 42\n--\n{boot}\n/pod_1 {created}\n"
+    result = await RentedPodOwnershipCheck().run(
+        _ctx(context_factory, _ssh_with_uptime(str(tmp_path), out))
+    )
+    assert result.event.remediation == template.remediation
+    pods = {p["container"]: p for p in result.event.what_we_saw["pods"]}
+    assert pods["pod_1"]["started_after_boot_s"] == 1358
+    assert pods["pod_1"].get("created_before_boot") is before_boot
+
+
+@pytest.mark.parametrize(
     ("uptime_and_ages", "template"),
     [
         # pod_1 restarted 30 s ago on a host up a day, pod_2 started 50 s after boot: one cause does not fit both
@@ -293,8 +328,77 @@ async def test_each_age_stays_with_its_own_pid_when_one_pid_prints_nothing(conte
     assert result.event.remediation == Msg.SHIFTED.remediation  # pod_1's history is unknown
 
 
+def _ssh_with_runtime_ages(proc: str, ages: str):
+    inner = _ssh(proc)
+
+    async def run(cmd, check=False):
+        if cmd.startswith("ps -eo comm=,etimes="):
+            return SimpleNamespace(exit_status=0, stdout=ages, stderr="")
+        return await inner.run(cmd, check=check)
+
+    return SimpleNamespace(run=run)
+
+
+@pytest.mark.parametrize(
+    ("ages", "restarted"),
+    [
+        # needrestart restarted sysbox-fs and the fabric manager 100 s ago; pod_1 runs for a day, pod_2 for 50 s
+        (
+            "sysbox-mgr 90000\nsysbox-fs     100\nnv-fabricmanage 100\n--\n 4242 86400\n 4343 50\n",
+            {"nv-fabricmanager": ["pod_1"], "sysbox-fs": ["pod_1"]},
+        ),
+        # every runtime process is older than both pods (a reboot brings them up first): nothing to flag
+        ("sysbox-mgr 90000\nsysbox-fs 90000\n--\n4242 86400\n4343 50\n", None),
+        # a pod age not read flags nothing for that pod
+        ("sysbox-fs 100\n--\n4343 50\n", None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_runtime_process_younger_than_a_pod_is_listed_as_its_own_outcome_without_failing(
+    context_factory, tmp_path, ages, restarted
+):
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me}      65536\n")
+    _proc(tmp_path, 4343, f"         0     {me}      65536\n")
+    result = await RentedPodOwnershipCheck().run(
+        _ctx(context_factory, _ssh_with_runtime_ages(str(tmp_path), ages))
+    )
+    assert result.passed is True
+    # its own outcome so the restart is logged at INFO even when the last cycle was OK
+    assert result.event.reason_code == (Msg.RUNTIME_RESTARTED if restarted else Msg.OK).reason
+    assert result.event.what_we_saw.get("runtime_restarted_under_pods") == restarted
+
+
 @pytest.mark.parametrize("template", [Msg.SHIFTED, Msg.SHIFTED_AFTER_CONTAINER_RESTART, Msg.SHIFTED_MIXED])
 def test_shifted_remediation_sends_provider_to_support_not_a_host_ownership_change(template):
     assert "uid_map" not in template.remediation
     assert "Contact support" in template.remediation
     assert "free of charge" in template.remediation
+
+
+@pytest.mark.parametrize(
+    ("created_1", "age_1", "created_2", "age_2", "template"),
+    [
+        # both created before the boot, one started late by the stale-mount recovery: the host stop
+        ("2026-11-17T19:00:00Z", 42, "2026-11-17T19:00:00Z", 1390, Msg.SHIFTED),
+        # one created 30 s after the boot and started 50 s after it: not there at the stop, so not the host's alone
+        ("2026-11-17T20:20:33Z", 1350, "2026-11-17T19:00:00Z", 1390, Msg.SHIFTED_MIXED),
+        # both created after the boot, early and late starts: created or restarted on the running host
+        ("2026-11-17T20:20:33Z", 1350, "2026-11-17T20:30:00Z", 42, Msg.SHIFTED_AFTER_CONTAINER_RESTART),
+        # creation unknown: early start reads as the host stop, late start as a restart
+        ("?", 1350, "?", 42, Msg.SHIFTED_MIXED),
+        ("?", 1350, "2026-11-17T19:00:00Z", 1390, Msg.SHIFTED),
+        ("?", 42, "2026-11-17T20:20:33Z", 1390, Msg.SHIFTED_AFTER_CONTAINER_RESTART),
+    ],
+)
+@pytest.mark.asyncio
+async def test_every_shifted_pod_gets_the_cause_its_creation_and_start_show(
+    context_factory, tmp_path, created_1, age_1, created_2, age_2, template
+):
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me + 200000}      65536\n")
+    _proc(tmp_path, 4343, f"         0     {me + 200000}      65536\n")
+    boot = 1794946803  # 2026-11-17T20:20:03Z, uptime 1400 s
+    out = f"1400.25\n4242 {age_1}\n4343 {age_2}\n--\n{boot}\n/pod_1 {created_1}\n/pod_2 {created_2}\n"
+    result = await RentedPodOwnershipCheck().run(_ctx(context_factory, _ssh_with_uptime(str(tmp_path), out)))
+    assert result.event.remediation == template.remediation

@@ -12,6 +12,7 @@ set -e
 # Default values
 JUPYTER_PORT=8888
 JUPYTER_PASSWORD=""
+JUPYTER_RESTART_SCRIPT=/tmp/lium-jupyter-restart.sh
 
 # Parse command line arguments
 parse_arguments() {
@@ -191,22 +192,28 @@ start_jupyter() {
     shell_cmd=$(detect_shell)
     echo "Using shell: $shell_cmd"
     
-    # Start Jupyter lab using virtual environment
-    nohup /opt/jupyter-env/bin/jupyter lab \
-        --allow-root \
-        --no-browser \
-        --port=$JUPYTER_PORT \
-        --ip=0.0.0.0 \
-        --FileContentsManager.delete_to_trash=False \
-        --ServerApp.terminado_settings="{\"shell_command\":[\"$shell_cmd\"]}" \
-        --IdentityProvider.token=$JUPYTER_PASSWORD \
-        --ServerApp.allow_origin=* \
-        --ServerApp.root_dir=/root \
-        --ServerApp.disable_check_xsrf=True \
-        --ServerApp.tornado_settings="{\"max_body_size\": 536870912}" \
-        --ServerApp.log_level=ERROR \
-        --LabApp.log_level=ERROR \
-        &> /jupyter.log &
+    # DAH-6379: the launch is kept as a root-only script; a pod restart keeps the container's files but not its
+    # processes, and the executor runs this script on the pod's start, so Jupyter is back with the same token and port
+    (umask 077; cat > "$JUPYTER_RESTART_SCRIPT" <<EOF
+#!/bin/sh
+nohup /opt/jupyter-env/bin/jupyter lab \\
+    --allow-root \\
+    --no-browser \\
+    --port=$JUPYTER_PORT \\
+    --ip=0.0.0.0 \\
+    --FileContentsManager.delete_to_trash=False \\
+    --ServerApp.terminado_settings='{"shell_command":["$shell_cmd"]}' \\
+    --IdentityProvider.token='$JUPYTER_PASSWORD' \\
+    --ServerApp.allow_origin='*' \\
+    --ServerApp.root_dir=/root \\
+    --ServerApp.disable_check_xsrf=True \\
+    --ServerApp.tornado_settings='{"max_body_size": 536870912}' \\
+    --ServerApp.log_level=ERROR \\
+    --LabApp.log_level=ERROR \\
+    > /jupyter.log 2>&1 &
+EOF
+    )
+    sh "$JUPYTER_RESTART_SCRIPT"
     
     # Wait a moment for Jupyter to start
     sleep 3

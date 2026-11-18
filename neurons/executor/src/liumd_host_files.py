@@ -12,6 +12,8 @@ which only a keyless dev build honours). `host` writes:
 - `/etc/liumd/validator_hotkeys`: the validator hotkeys this image trusts (`core.config`, fixed at
   build like the executor's own trust anchor), one SS58 per line;
 - `/etc/liumd/miner_hotkey`: `MINER_HOTKEY_SS58_ADDRESS`;
+- `/etc/liumd/account_claim`: `MINER_ACCOUNT_CLAIM` (empty when unset), the portal account this node was
+  registered for; the validator compares it with the account listing the node (DAH-6539);
 - `/etc/liumd/pool_hotkey`: `LIUM_POOL_HOTKEY`, empty when it is `DEFAULT_MINER_HOTKEY` (empty = liumd accepts only the miner hotkey);
 - `/etc/liumd/ports.json`: `{"port_range", "port_mappings", "ssh_port"}` from `RENTING_PORT_RANGE`,
   `RENTING_PORT_MAPPINGS` and `SSH_PORT`;
@@ -107,6 +109,7 @@ def write_host_files(
     validator_hotkeys: dict[str, str],
     miner_hotkey: str,
     pool_hotkey: str,
+    account_claim: str | None = None,
     port_range: str | None,
     port_mappings: str | None,
     ssh_port: int,
@@ -114,6 +117,7 @@ def write_host_files(
     write_atomic(etc_dir / "validator_hotkeys", validator_hotkeys_text(validator_hotkeys))
     write_atomic(etc_dir / "miner_hotkey", miner_hotkey_text(miner_hotkey))
     write_atomic(etc_dir / "pool_hotkey", miner_hotkey_text(pool_hotkey))
+    write_atomic(etc_dir / "account_claim", miner_hotkey_text(account_claim or ""))
     write_atomic(etc_dir / "ports.json", ports_json_text(port_range, port_mappings, ssh_port))
     nonce_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(nonce_dir, 0o700)
@@ -137,6 +141,7 @@ def main(argv: list[str]) -> int:
             pool_hotkey=""
             if settings.LIUM_POOL_HOTKEY.strip() == settings.DEFAULT_MINER_HOTKEY
             else settings.LIUM_POOL_HOTKEY,
+            account_claim=settings.MINER_ACCOUNT_CLAIM,
             port_range=settings.RENTING_PORT_RANGE,
             port_mappings=settings.RENTING_PORT_MAPPINGS,
             ssh_port=settings.SSH_PORT,
