@@ -218,7 +218,9 @@ async def test_validate_rented_executor_uses_interactive_json_protocol():
     assert result.report is not None
     assert result.report["canary_ok"] is True
     assert result.report["findings"] == []
-    assert "python3 /root/app/src/inspector_executor.py --interactive" in ssh.command
+    # the validator's own script and interpreter, not the executor's reported paths
+    assert '/root/app/.venv/bin/python -E -s "$d"/inspector_executor.py --interactive' in ssh.command
+    assert "/usr/bin/python3" not in ssh.command and "/root/app/src" not in ssh.command
     assert result.diagnostics is not None
     assert "collector_ensure_error" not in result.diagnostics
     assert ssh.process.stdin.messages == [

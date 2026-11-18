@@ -33,6 +33,7 @@ from neurons.validators.src.services.verifyx_validation_service import (
 )
 from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsResponse
 
+from services import executor_payload
 from tests.helpers import FakeRedis, build_context_config, build_services, build_state
 from tests.test_verifyx_check import MockVerifyXResponse
 
@@ -335,16 +336,18 @@ class _LocalShell:
         return SimpleNamespace(stdout=out.decode(), stderr=err.decode(), exit_status=proc.returncode)
 
 
-def _fake_python(tmp_path, body: str):
+def _fake_python(tmp_path, body: str, monkeypatch):
+    # the interpreter the validator names (services.executor_payload), never the executor's python_path
     path = tmp_path / "python"
     path.write_text(f"#!/bin/sh\n{body}\n")
     path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setattr(executor_payload, "EXECUTOR_PYTHON", str(path))
     return SimpleNamespace(python_path=str(path), root_dir=str(tmp_path / "app"))
 
 
 @pytest.mark.asyncio
-async def test_a_retry_run_cleans_its_scratch_dir_and_keeps_its_exit_status(tmp_path):
-    executor = _fake_python(tmp_path, "touch temp_1.dat; echo answer; exit 3")
+async def test_a_retry_run_cleans_its_scratch_dir_and_keeps_its_exit_status(tmp_path, monkeypatch):
+    executor = _fake_python(tmp_path, "touch temp_1.dat; echo answer; exit 3", monkeypatch)
     service = VerifyXValidationService()
     command = service._verifyx_command(executor, SimpleNamespace(seed=1, cipher_text="c"), "lib", ".vx-run")
 
@@ -368,7 +371,7 @@ def _timeout_without_k(tmp_path, monkeypatch):
 async def test_a_retry_run_does_not_start_on_a_host_whose_timeout_lacks_k(tmp_path, monkeypatch):
     # without a remote deadline a run whose cleanup failed could outlive every reap
     _timeout_without_k(tmp_path, monkeypatch)
-    executor = _fake_python(tmp_path, f"touch {tmp_path}/started")
+    executor = _fake_python(tmp_path, f"touch {tmp_path}/started", monkeypatch)
     service = VerifyXValidationService()
     command = service._verifyx_command(executor, SimpleNamespace(seed=1, cipher_text="c"), "lib", ".vx-run")
 
@@ -380,9 +383,9 @@ async def test_a_retry_run_does_not_start_on_a_host_whose_timeout_lacks_k(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_killing_a_cut_off_retry_during_the_disk_test_spares_other_processes(tmp_path):
+async def test_killing_a_cut_off_retry_during_the_disk_test_spares_other_processes(tmp_path, monkeypatch):
     # the disk test writes ./temp_<ts>.dat and removes it only when it finishes; SIGKILL skips that
-    executor = _fake_python(tmp_path, "touch temp_1.dat; exec sleep 60")
+    executor = _fake_python(tmp_path, "touch temp_1.dat; exec sleep 60", monkeypatch)
     service = VerifyXValidationService()
     shell = _LocalShell(tmp_path)
     # the same command line in another container (the executor shares the host PID namespace)
@@ -467,7 +470,7 @@ async def test_a_cut_off_retry_whose_cleanup_timed_out_is_reaped_on_the_next_run
     monkeypatch.setattr(verifyx_check, "task_seconds_left", lambda ctx: 900.0)
     monkeypatch.setattr(verifyx_check, "VERIFYX_COMMAND_TIMEOUT_SECONDS", 1.0)
     monkeypatch.setattr(verifyx_validation_service, "VERIFYX_KILL_TIMEOUT_SECONDS", 0.2)
-    executor = _fake_python(tmp_path, "touch temp_1.dat; exec sleep 60")
+    executor = _fake_python(tmp_path, "touch temp_1.dat; exec sleep 60", monkeypatch)
     service = _HungRetryService(executor, _probe(88.0), _probe(900.0))
     shell = _FlakyCleanupShell(tmp_path)
     ctx = context_factory(
@@ -509,7 +512,7 @@ async def test_no_timeout_k_with_failed_cleanup_and_pruning_leaves_no_forgotten_
     monkeypatch.setattr(verifyx_check, "task_seconds_left", lambda ctx: 900.0)
     monkeypatch.setattr(verifyx_validation_service, "VERIFYX_KILL_TIMEOUT_SECONDS", 0.2)
     _timeout_without_k(tmp_path, monkeypatch)
-    executor = _fake_python(tmp_path, f"touch {tmp_path}/started; exec sleep 60")
+    executor = _fake_python(tmp_path, f"touch {tmp_path}/started; exec sleep 60", monkeypatch)
     service = _HungRetryService(executor, _probe(88.0))
     ctx = context_factory(
         services=build_services(verifyx=service, shell=_FlakyCleanupShell(tmp_path)),

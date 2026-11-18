@@ -85,7 +85,7 @@ class DummySSHCommandRunner:
         from datetime import datetime, UTC
 
         # Mock successful responses for different commands
-        if "ps aux | grep" in command:
+        if "ps auxww | grep" in command:
             # GPU monitor not running initially
             stdout = ""
         elif "pip install" in command:
