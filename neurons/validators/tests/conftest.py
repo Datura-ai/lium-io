@@ -279,22 +279,6 @@ def sample_executor_info():
     )
 
 
-@pytest.fixture
-def mock_aiohttp_session():
-    """Mock aiohttp session for testing HTTP requests."""
-    with patch("aiohttp.ClientSession") as mock_session_class:
-        session = AsyncMock()
-        mock_session_class.return_value.__aenter__.return_value = session
-
-        response = AsyncMock()
-        response.status = 200
-        response.json = AsyncMock(return_value={"status": "ok"})
-        session.get.return_value.__aenter__.return_value = response
-        session.post.return_value.__aenter__.return_value = response
-
-        yield session
-
-
 @pytest_asyncio.fixture(scope="session")
 async def test_engine():
     """Create an async engine for testing with SQLite in-memory database."""
