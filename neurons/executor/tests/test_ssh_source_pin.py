@@ -12,8 +12,8 @@ import core.config as config
 import services.ssh_service as ssh_service
 from services.ssh_service import SSHService, purge_expired_uploaded_keys
 
-KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIValidatorJobKey validator@lium"
-RENTER_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIRenterOwnKey renter@laptop\n"
+KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAGgl6IerZSFlcnlYw/g6d4kaTRkeDbu/Jqg2B0fxXOP validator@lium"
+RENTER_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMPiNQZzC99jSRSaT5Q9XUouCSEr8F7vAXVao0zrgvg8 renter@laptop\n"
 
 
 @pytest.fixture(autouse=True)
