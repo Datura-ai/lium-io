@@ -30,10 +30,12 @@ def service_dir_glob(purpose: str, parent: str | None = None) -> str:
     return f"{(parent or SERVICE_DIR_PARENT).rstrip('/')}/.lium-validator-{purpose}."
 
 
-def install(purpose: str, files: tuple[str, ...], parent: str | None = None) -> str:
+def install(purpose: str, files: tuple[str, ...], parent: str | None = None, cleanup: bool = False) -> str:
     """Shell that makes a fresh 0700 directory under `parent`, sets `$d` to it and writes `files` into it; exits 1 on
-    any failure."""
+    any failure. `cleanup`: the directory goes when the shell ends (also on HUP/INT/TERM), set before the first write."""
     steps = [f"d=$(mktemp -d {shlex.quote(service_dir_glob(purpose, parent) + 'XXXXXXXX')})"]
+    if cleanup:
+        steps += ["trap 'rm -rf \"$d\"' EXIT", "trap 'exit 1' HUP INT TERM"]
     for name in files:
         if "/" in name:
             steps.append(f'mkdir -p "$d"/{shlex.quote(str(Path(name).parent))}')
@@ -50,7 +52,7 @@ def run(files: tuple[str, ...]) -> str:
 def run_once(purpose: str, files: tuple[str, ...], args: str, env: str = "") -> str:
     """Install, run with `args` (`env` assignments before the interpreter); the directory goes when the shell ends,
     also on a hangup or kill signal of the session. The exit status is the run's."""
-    return f"{install(purpose, files)}; trap 'rm -rf \"$d\"' EXIT; trap 'exit 1' HUP INT TERM; {env}{run(files)} {args}"
+    return f"{install(purpose, files, cleanup=True)}; {env}{run(files)} {args}"
 
 
 def label(files: tuple[str, ...], args: str) -> str:

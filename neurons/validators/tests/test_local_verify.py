@@ -29,6 +29,7 @@ from aiohttp.test_utils import TestServer
 from datura.requests.miner_requests import ExecutorSSHInfo
 from datura.requests.validator_requests import MatmulStep, VerifyXStep
 from neurons.validators.src.services.task.checks.capability import CapabilityCheck
+import neurons.validators.src.services.task.checks.local_verify as local_verify
 from neurons.validators.src.services.task.checks.local_verify import (
     ROUND_TRIP_CAP_MS_BY_STEP,
     LocalVerifyCheck,
@@ -67,13 +68,19 @@ EXECUTOR_UUID = "executor-123"
 MINER_HOTKEY = "5MinerHotkeyOfTheExecutorUnderTest"
 
 
+REAL_MATMUL_SSH_REASON = local_verify._matmul_ssh_reason
+
 # --- fakes -------------------------------------------------------------------------------------
 
 
 @pytest.fixture(autouse=True)
 def allcards_off(monkeypatch):
-    """The one call carries the matmul only while the all-cards check (on by default) is off."""
+    """The one call carries the matmul only while the all-cards check (on by default) is off. The tests below exercise
+    the one-call path as if it were asked for; `test_the_first_pass_matmul_runs_the_validators_script` the real choice."""
     monkeypatch.setattr(settings, "MATMUL_ALLCARDS_CHECK_ENABLED", False)
+    monkeypatch.setattr(
+        local_verify, "_matmul_ssh_reason", lambda: "allcards_ssh" if settings.MATMUL_ALLCARDS_CHECK_ENABLED else None
+    )
 
 
 @pytest.fixture
@@ -1061,6 +1068,30 @@ async def test_all_cards_check_keeps_the_matmul_on_ssh(
     assert executor.intents == []
     assert validation.wrapper.generateChallenge.call_count == 0  # no challenge built for nothing
     assert local.event.reason_code == "LOCAL_VERIFY_SKIPPED"
+    assert capability.event.what_we_saw["transport"] == "ssh"
+    ssh_matmul.assert_awaited_once()
+    assert verifyx.event.what_we_saw["transport"] == "ssh"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("advertise", [True, False])
+async def test_the_first_pass_matmul_runs_the_validators_script(
+    keypair, monkeypatch, short_local_verify_timeouts, verifyx_service, advertise
+):
+    """On a first pass, advertised or not, the matmul runs over SSH with the validator's own script."""
+    monkeypatch.setattr(local_verify, "_matmul_ssh_reason", REAL_MATMUL_SSH_REASON)
+    validation = matmul_service(monkeypatch)
+    ssh_matmul = AsyncMock(return_value=mvs.ValidationResult(success=True, metrics={"from": "ssh"}))
+    validation.validate_gpu_model_and_process_job = ssh_matmul
+    verifyx_service.validate_verifyx_and_process_job = AsyncMock(
+        return_value=vvs.VerifyXResponse(data={"success": True, "network": {}})
+    )
+    async with FakeExecutor(keypair, advertise=advertise) as executor:
+        ctx = context(keypair, executor.executor_info, validation=validation, verifyx=verifyx_service)
+        local, verifyx, capability = await run_local_then_consumers(
+            ctx, LocalVerifyCheck(client_factory=client_factory(keypair))
+        )
+    assert executor.intents == []
     assert capability.event.what_we_saw["transport"] == "ssh"
     ssh_matmul.assert_awaited_once()
     assert verifyx.event.what_we_saw["transport"] == "ssh"

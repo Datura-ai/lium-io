@@ -96,7 +96,9 @@ def _matmul_ssh_reason() -> str | None:
     """
     if settings.MATMUL_ALLCARDS_CHECK_ENABLED:
         return "allcards_ssh"
-    return None
+    # shortcut: the matmul runs over SSH with the validator's own script (services.executor_payload); ask for it
+    # here again once the intent carries that script
+    return "validator_payload"
 
 
 class _NothingToSend(Exception):

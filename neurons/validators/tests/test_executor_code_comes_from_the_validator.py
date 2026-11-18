@@ -167,6 +167,13 @@ def test_every_payload_is_found():
         assert (executor_payload.PAYLOAD_DIR / name).read_bytes() == (EXECUTOR_SOURCES / name).read_bytes(), name
 
 
+async def test_one_shot_payload_is_removed_when_its_write_fails(node):
+    command = executor_payload.run_once("inspector", executor_payload.INSPECTOR, "--x").replace("base64 -d", "false")
+    done = subprocess.run(["sh", "-c", command], cwd=node.tmp, capture_output=True, text=True, timeout=20)
+    assert done.returncode == 1
+    assert not list((node.tmp / "service").iterdir())
+
+
 def test_scripts_are_written_where_the_disk_reserve_holds():
     # a renter filling the host disk must not stop the validator writing its scripts
     reserve = (EXECUTOR_SOURCES.parent / "setup_disk_reserve.sh").read_text()
