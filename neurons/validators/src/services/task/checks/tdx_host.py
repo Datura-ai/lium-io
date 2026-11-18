@@ -35,7 +35,8 @@ _TDX_CAPABLE_PATTERNS: list[re.Pattern] = [
 # In a TDX guest lscpu has no marketing name and prints the raw CPUID as "family/model" in hex
 # ("06/cf" on the H200 CVMs, "06/ad" on the B200). One model id per generation the name patterns
 # above accept, from arch/x86/include/asm/intel-family.h: SPR 8f, EMR cf, GNR ad, GNR-D ae, SRF af.
-_TDX_CAPABLE_RAW_CPUID = re.compile(r"^\s*0*6/(?:8f|cf|ad|ae|af)\s*$", re.IGNORECASE)
+# The scrape now names it ("Intel Xeon 6 (Granite Rapids), CPUID 06/ad"), keeping the raw id at the end.
+_TDX_CAPABLE_RAW_CPUID = re.compile(r"(?:^|CPUID)\s*0*6/(?:8f|cf|ad|ae|af)\s*$", re.IGNORECASE)
 
 
 class TdxHostCheck:
@@ -58,7 +59,7 @@ class TdxHostCheck:
     @staticmethod
     def is_tdx_capable(cpu_model: str) -> bool:
         """Return True if the model name or raw CPUID belongs to a TDX-capable Intel processor."""
-        if _TDX_CAPABLE_RAW_CPUID.match(cpu_model):
+        if _TDX_CAPABLE_RAW_CPUID.search(cpu_model):
             return True
         return any(p.search(cpu_model) for p in _TDX_CAPABLE_PATTERNS)
 

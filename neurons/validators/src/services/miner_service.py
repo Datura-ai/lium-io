@@ -69,7 +69,13 @@ from core.utils import _m, _StructuredMessage, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import bound_pod_states, chunk_pod_states
 from services.attestation_service import AttestationService
-from services.docker_service import DockerService, create_steps_after_reply, customer_creates, inflight_creates
+from services.docker_service import (
+    DockerService,
+    create_steps_after_reply,
+    customer_creates,
+    executor_key,
+    inflight_creates,
+)
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.node_host import for_payload_miner, public_host_sock
 from services.redis_service import MACHINE_SPEC_CHANNEL, POD_STATES_CHANNEL, RedisService
@@ -102,6 +108,10 @@ logger = logging.getLogger(__name__)
 # I-78: bittensor packs a.b.c into axon_info.version as a*1000**2 + b*1000 + c. 10.5.0 is what
 # miner-v1.003+ announces; the upload nonce field shipped in miner-v1.002 (fbfbde79, DAH-2338).
 MIN_DATED_NONCE_MINER_AXON_VERSION = 10_005_000
+# rows the wave builds from the miner's answer alone, without checking the node (DAH-6596)
+MINER_ANSWER_REASON_CODES = frozenset(
+    {AvailabilityErrorCode.EXECUTOR_UNREACHABLE_BY_MINER, AvailabilityErrorCode.RENTED_EXECUTOR_NOT_LISTED}
+)
 
 
 def _miner_job_script_path(script_name: str) -> str:
@@ -254,7 +264,7 @@ def _bypasses_renting_in_progress(payload: ContainerBaseRequest) -> bool:
     # DAH-2728: the pending-pod flag this guard reads is set by the very create this delete is
     # about to cancel, so declining here would leave that create to finish and orphan its
     # container — the exact failure the delete was sent to prevent.
-    return inflight_creates.is_running(payload.pod_id)
+    return inflight_creates.is_running(payload.pod_id, executor_key(payload))
 
 
 def _ssh_key_not_accepted_text(executors: list[ExecutorSSHInfo], default_extra: dict) -> _StructuredMessage:
@@ -404,6 +414,8 @@ class MinerService:
         self.express_published: dict[str, str] = {}
         # the same uuid -> the miner hotkey that pass was for: two miners can report one uuid (review 4565706519)
         self.express_published_miner: dict[str, str] = {}
+        # the same uuid -> time.monotonic() of that pass: a miner-answer row of the wave built before it is stale
+        self.express_passed_at: dict[str, float] = {}
         # DAH-5635: the running cycle's outage share for publish_unreachable_early; None = publish nothing early
         self.outage_tally: RunningOutageTally | None = None
         # DAH-5635: (miner hotkey, executor uuid) -> the availability errors this process's last cycle publish sent for
@@ -1127,9 +1139,14 @@ class MinerService:
             self.express_published.get(uuid) == job_batch_id and self.express_published_miner.get(uuid) == miner_hotkey
         )
 
-    def _express_passed_after_unreachable(self, result: JobResult, miner_hotkey: str) -> bool:
-        return result.failure_reason_code == AvailabilityErrorCode.EXECUTOR_UNREACHABLE_BY_MINER and (
-            self._express_passed(result.executor_info.uuid, result.job_batch_id, miner_hotkey)
+    def _express_passed_after_miner_answer(self, result: JobResult, miner_hotkey: str) -> bool:
+        """A row from the miner's answer (it could not reach the node, or left the rented node out) that the miner gave
+        before an express pass of that node under the same cycle id and miner: the pass is newer and stands (DAH-6596)."""
+        uuid = str(result.executor_info.uuid).lower()
+        return (
+            result.failure_reason_code in MINER_ANSWER_REASON_CODES
+            and self._express_passed(uuid, result.job_batch_id, miner_hotkey)
+            and self.express_passed_at.get(uuid, float("-inf")) > result.observed_at
         )
 
     def _build_unreachable_known_results(
@@ -1385,7 +1402,7 @@ class MinerService:
             "miner_hotkey": miner_hotkey,
         }
         # checked again here: an express pass can land after the wave built the row (review 4582945951)
-        results = [result for result in results if not self._express_passed_after_unreachable(result, miner_hotkey)]
+        results = [result for result in results if not self._express_passed_after_miner_answer(result, miner_hotkey)]
         if not results:
             return
 
@@ -1678,7 +1695,7 @@ class MinerService:
             result = await self._route_container(payload)
             await self._report_storage_dispatch_failure(payload, result)
             return result
-        with inflight_creates.track(payload.pod_id), customer_creates.track(payload):
+        with inflight_creates.track(payload.pod_id, executor_key(payload)), customer_creates.track(payload):
             return await self._route_container(payload)
 
     async def _report_storage_dispatch_failure(self, payload: ContainerBaseRequest, result: object) -> None:
@@ -2269,6 +2286,8 @@ class MinerService:
                 )
 
             msg = _parse_miner_response(response_data)
+            # DAH-6596: what the miner's answer says is as old as the answer, not as the rows built from it after the run
+            answered_at = time.monotonic()
             
             # Track whether SSH key was successfully accepted
             ssh_key_accepted = False
@@ -2349,14 +2368,12 @@ class MinerService:
                 )
                 # DAH-3558: a rented node the miner left out of msg.executors gets a failed
                 # result, so the wave records the outage instead of nothing.
-                results.extend(
-                    self._build_not_listed_rented_results(
-                        payload, rented_data, msg.executors, executor_id
-                    )
-                )
-                results.extend(
-                    self._build_unreachable_known_results(payload, rented_data, msg, executor_id)
-                )
+                answer_rows = self._build_not_listed_rented_results(
+                    payload, rented_data, msg.executors, executor_id
+                ) + self._build_unreachable_known_results(payload, rented_data, msg, executor_id)
+                for row in answer_rows:
+                    row.observed_at = answered_at
+                results.extend(answer_rows)
 
                 # DAH-2667: while the miner's key is still installed and its idle hosts are free,
                 # measure every RoCE pair. Best effort — an unmeasured pair is simply not sold as a
@@ -2745,7 +2762,9 @@ class MinerService:
                     if isinstance(payload, ContainerCreateRequest):
                         # DAH-3980: a create's reply does not wait for the miner
                         create_steps_after_reply.start(
-                            payload.pod_id, self._log_ssh_key_removal_after_reply(remove_ssh_key, default_extra)
+                            payload.pod_id,
+                            executor_key(payload),
+                            self._log_ssh_key_removal_after_reply(remove_ssh_key, default_extra),
                         )
                     else:
                         await remove_ssh_key
