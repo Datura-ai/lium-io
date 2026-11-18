@@ -19,7 +19,9 @@ sysbox_setup_failed() {
     exit 1
 }
 SYSBOX_INSTALLER=dstacktee/dstack-sysbox-installer:1.0.0@sha256:2f5dbea99176f3ea0362b85346b31b1160bfb70c1d98d1c8d375d57782127dd1
-out=$(docker pull "$SYSBOX_INSTALLER" 2>&1) || sysbox_setup_failed "docker pull $SYSBOX_INSTALLER" "$out"
+# pulled only when not cached: a registry outage must not stop a CVM whose installer is already on disk
+docker image inspect "$SYSBOX_INSTALLER" >/dev/null 2>&1 \
+    || out=$(docker pull "$SYSBOX_INSTALLER" 2>&1) || sysbox_setup_failed "docker pull $SYSBOX_INSTALLER" "$out"
 out=$(docker run --rm --privileged --pid=host --net=host -v /:/host "$SYSBOX_INSTALLER" bash -c "sed -i -e '/^check_existing() {/,/^}/c\\check_existing() { return 0; }' -e 's#cp /usr/local/bin/rsync /host/usr/bin/#:#' /usr/local/bin/install-sysbox-complete.sh && /usr/local/bin/install-sysbox-complete.sh" 2>&1) || sysbox_setup_failed "installer run" "$out"
 out=$(systemctl restart docker 2>&1) || sysbox_setup_failed "docker restart" "$out"
 docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"sysbox-runc"' \
