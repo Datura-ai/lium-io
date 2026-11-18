@@ -44,6 +44,8 @@ class CardHealthState:
     xid_after: float | None = None
     boot_id: str | None = None
     held: list[str] = field(default_factory=list)
+    # per card UUID, the NVML counters only a GPU reset (or a driver reload) clears that the last read saw set
+    reset_marks: dict[str, list[str]] = field(default_factory=dict)
 
 
 def _card_health_key(ctx: Context) -> str:
@@ -69,11 +71,31 @@ async def _load_card_health(ctx: Context) -> CardHealthState | None:
         value = stored.get(key)
         return [s for s in value if isinstance(s, str)] if isinstance(value, list) else []
 
+    marks = stored.get("reset_marks")
     return CardHealthState(
         xid_after=xid_after if type(xid_after) in (int, float) else None,
         boot_id=boot_id if isinstance(boot_id, str) else None,
         held=strings("held"),
+        reset_marks={
+            uuid: [c for c in counters if c in RESET_CLEARED_COUNTERS]
+            for uuid, counters in (marks.items() if isinstance(marks, dict) else [])
+            if isinstance(uuid, str) and isinstance(counters, list)
+        },
     )
+
+
+# volatile uncorrected ECC and the recovery action: a card reset or a driver reload is the only thing that zeroes them
+RESET_CLEARED_COUNTERS = ("ecc_uncorrected", "recovery_action")
+
+
+def _reset_marks(gpu: dict[str, Any]) -> list[str]:
+    return [c for c in RESET_CLEARED_COUNTERS if type(gpu.get(c)) is int and gpu[c] != 0]
+
+
+def _card_was_reset(uuid: str, gpus: dict[str, dict[str, Any]], before: CardHealthState) -> bool:
+    """Every reset-only counter the last read saw set on the card now reads 0: the card was reset since."""
+    marked = before.reset_marks.get(uuid)
+    return bool(marked) and uuid in gpus and all(gpus[uuid].get(c) == 0 for c in marked)
 
 
 def _card_uuid(fault: str) -> str | None:
@@ -82,18 +104,23 @@ def _card_uuid(fault: str) -> str | None:
 
 
 def _held_fault_proven_healed(
-    fault: str, gpus: dict[str, dict[str, Any]], every_card_named: bool, rebooted: bool, scraped_uuids: set[str]
+    fault: str,
+    gpus: dict[str, dict[str, Any]],
+    every_card_named: bool,
+    rebooted: bool,
+    scraped_uuids: set[str],
+    before: CardHealthState,
 ) -> bool:
     """Proof that a held card fault is over: the card is gone from a read naming every card and from this
-    cycle's scrape (the missing-card rule reports that), or a new host boot. A read that merely shows nothing new
-    proves nothing."""
+    cycle's scrape (the missing-card rule reports that), a new host boot, or a reset of the card itself
+    (`_card_was_reset`). A read that merely shows nothing new proves nothing."""
     uuid = _card_uuid(fault)
     if uuid is None:
         return False
-    if rebooted:
+    if rebooted or _card_was_reset(uuid, gpus, before):
         return True
     # a card that drops out after the scrape is still listed there, so no missing-card fault fires yet
-    # shortcut: a card reset without a reboot leaves an Xid fault held; add a reset proof if that bites
+    # shortcut: a reset of a card whose read never showed a reset-only counter set still waits for a reboot
     return uuid not in gpus and every_card_named and uuid not in scraped_uuids
 
 
@@ -132,7 +159,9 @@ async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardH
         # an old boot's time would skip this boot's early lines: start the new boot from its first line
         xid_after = 0.0 if rebooted else before.xid_after
     scraped_uuids = {str(d["uuid"]) for d in ctx.state.gpu_details or [] if isinstance(d, dict) and d.get("uuid")}
-    held = [f for f in before.held if not _held_fault_proven_healed(f, gpus, every_card_named, rebooted, scraped_uuids)]
+    held = [
+        f for f in before.held if not _held_fault_proven_healed(f, gpus, every_card_named, rebooted, scraped_uuids, before)
+    ]
     # one fault per card, this read's first: a card repeating an Xid must not grow the stored state
     fault_by_card: dict[str, str] = {}
     for fault in xid_faults + held:
@@ -143,8 +172,11 @@ async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardH
     if settings.DRY_RUN:
         return
     key = _card_health_key(ctx)
+    # a card this read did not name keeps its marks: its next read still proves a reset
+    reset_marks = {u: m for u, m in before.reset_marks.items() if u not in gpus and not rebooted}
+    reset_marks.update({u: m for u, gpu in gpus.items() if (m := _reset_marks(gpu))})
     state = CardHealthState(
-        xid_after=xid_after, boot_id=boot_id or before.boot_id, held=report["card_faults"]
+        xid_after=xid_after, boot_id=boot_id or before.boot_id, held=report["card_faults"], reset_marks=reset_marks
     )
     try:
         await ctx.services.redis.set(key, json.dumps(asdict(state)), ex=CARD_HEALTH_TTL_SECONDS)
