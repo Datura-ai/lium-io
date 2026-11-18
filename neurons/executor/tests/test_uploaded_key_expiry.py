@@ -18,12 +18,12 @@ from services.ssh_service import SSHService, purge_expired_uploaded_keys
 TTL = 900
 NOW = 1_800_000_000  # a fixed clock: the tests never read time.time() for the ages they assert on
 
-RENTER_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIRenterOwnKeyNotOursToTouch renter@laptop\n"
+RENTER_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJm96GoibO7Tqp4/aMTDItExnAQDTXWiByXDQXVD5wRv renter@laptop\n"
 TEMPLATE_KEY = 'command="/usr/bin/tunnel",no-pty ssh-rsa AAAAB3NzaC1yc2ETemplateKey template\n'
 COMMENT = "# keys below this line were installed by the image\n"
-ODDLY_SPACED = "ssh-ed25519   AAAAC3NzaC1lZDI1NTE5AAAAIKeyWithTabsAndSpaces\t  \n"
+ODDLY_SPACED = "ssh-ed25519   AAAAC3NzaC1lZDI1NTE5AAAAIE2SSg2OW1LVkJplLWN5VjIo6fIwhr3bXIVmcGciSUbh\t  \n"
 # a CRLF line and a comment that is not UTF-8 (a key pasted from a Windows box, a latin-1 name)
-FOREIGN_BYTES = b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIWindowsPastedKey user@pc\r\n# Jos\xe9's key\n"
+FOREIGN_BYTES = b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILZtEKC4QnQmpIcaRB/PGs/w/go4UMu0/t2Wekz1Y2/u user@pc\r\n# Jos\xe9's key\n"
 
 
 MARKER = ssh_service.UPLOADED_KEY_MARKER.decode()
@@ -50,7 +50,7 @@ def authorized_keys(tmp_path, monkeypatch):
 def test_purge_keeps_every_unmarked_line_byte_for_byte(authorized_keys):
     # regression: the purge re-serialises the file (strip(), split/join, dropped comments or
     # blank lines) and a renter's or template's key is altered or lost with the stale one
-    stale = _marked("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIStaleValidatorJobKey", NOW - 2 * TTL)
+    stale = _marked("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOKkPQzAplh/+woVCo4K3R4UvBK3rSqYCwtQDdFKEcsd", NOW - 2 * TTL)
     untouchable = (RENTER_KEY + COMMENT + "\n").encode() + FOREIGN_BYTES + (TEMPLATE_KEY + ODDLY_SPACED).encode()
     authorized_keys.write_bytes(
         (RENTER_KEY + COMMENT + stale + "\n").encode() + FOREIGN_BYTES + (TEMPLATE_KEY + ODDLY_SPACED).encode()
@@ -70,7 +70,7 @@ def test_purge_keeps_every_unmarked_line_byte_for_byte(authorized_keys):
 def test_an_uploaded_key_expires_after_the_ttl_and_not_before(authorized_keys):
     # regression: the writer and the purge disagree on the marker (format, position, units) —
     # uploads are written but never recognised, so nothing ever expires
-    key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIUploadedThroughTheRoute validator@lium"
+    key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFuEaUMojWO6jd3EorXLg/kyt6oiIyzyoE+1Xw5mUVV+ validator@lium"
     uploaded_at = time.time()
     SSHService().add_pubkey_to_host(key)
     assert authorized_keys.read_text().startswith(key + " ")
@@ -86,7 +86,7 @@ def test_an_upload_onto_a_file_without_a_trailing_newline_does_not_merge_with_th
     # regression: the upload is appended straight after a provider key that has no newline; the
     # merged line carries the marker and the purge deletes the provider's key with ours
     authorized_keys.write_text(RENTER_KEY.rstrip("\n"))
-    key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIUploadedAfterNoNewline validator@lium"
+    key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBzeUy9ipww+CN1oJ51zPvAM04/oS8Ps5n3FmBHT3Zs5 validator@lium"
 
     SSHService().add_pubkey_to_host(key)
     assert authorized_keys.read_text().startswith(RENTER_KEY + key + " ")
@@ -100,7 +100,7 @@ def test_remove_ssh_key_still_removes_a_key_uploaded_with_the_marker(authorized_
     # regression: /remove_ssh_key compares the whole line to the bare key, so a marked line is
     # never matched and every validator key stays until the TTL — 15 minutes of access it did
     # not ask for, on every job
-    key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIValidatorJobKey validator@lium"
+    key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAGgl6IerZSFlcnlYw/g6d4kaTRkeDbu/Jqg2B0fxXOP validator@lium"
     authorized_keys.write_text(RENTER_KEY)
     service = SSHService()
     service.add_pubkey_to_host(key)
@@ -114,7 +114,7 @@ def test_remove_ssh_key_removes_a_key_the_previous_release_wrote_without_a_marke
     # regression: authorized_keys lives on the disk reserve (setup_disk_reserve.sh mount_ssh) and
     # survives the restart onto this release, so a key the previous release appended (no marker)
     # is still there when the validator asks to remove it
-    key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKeyFromTheOldRelease validator@lium"
+    key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDE19e79FjEfwVyfX0MeovSOipEmFuvguBBljNtq2Ag+ validator@lium"
     authorized_keys.write_text(RENTER_KEY + key + "\n")
 
     SSHService().remove_pubkey_from_host(key)

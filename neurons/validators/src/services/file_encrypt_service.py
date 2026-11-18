@@ -188,6 +188,9 @@ ORIGINAL_KEYS = {
     'data_container_cap_eff': "container_cap_eff",
     'data_executor_pid_mode_scrape_error': "executor_pid_mode_scrape_error",
     'data_executor_pid_mode': "executor_pid_mode",
+    'data_needrestart_guard_scrape_error': "needrestart_guard_scrape_error",
+    'data_needrestart_guard_unguarded': "needrestart_guard_unguarded",
+    'data_needrestart_guard': "needrestart_guard",
     'data_nvidiactl_owner_uid': "nvidiactl_owner_uid",
     'data_power_cap_probe_error': "power_cap_probe_error",
     # DAH-2922: GPU interconnect summary (nvidia-smi topo). The scrape
@@ -407,6 +410,9 @@ class FileEncryptService:
             'data_container_cap_eff': "",
             'data_executor_pid_mode_scrape_error': "",
             'data_executor_pid_mode': "",
+            'data_needrestart_guard_scrape_error': "",
+            'data_needrestart_guard_unguarded': "",
+            'data_needrestart_guard': "",
             'data_nvidiactl_owner_uid': "",
             'data_power_cap_probe_error': "",
             # DAH-2922 - longer keys before the key they extend (prefix rule above)
