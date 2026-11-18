@@ -273,9 +273,20 @@ def _created_run_spec(svc):
 
 
 def test_a_rental_sent_without_a_memory_limit_is_capped_below_host_ram():
-    """A legacy pod row (ram_total 0) arrives as memory_gb 0; the limit becomes host RAM less the 4 GiB host
-    reserve, so the renter cannot starve the executor of memory. 64 GiB host - 4 GiB = 60 GiB."""
-    assert DockerService._rental_memory_gb(0, 64 * 1024 * 1024) == 60
+    """A legacy pod row (ram_total 0) arrives as memory_gb 0; the limit becomes host RAM less the 16 GiB host
+    reserve, so the renter cannot starve the executor of memory. 64 GiB host - 16 GiB = 48 GiB."""
+    assert DockerService._rental_memory_gb(0, 64 * 1024 * 1024) == 48
+
+
+def test_the_host_reserve_is_max_16_gib_or_10_percent_of_host_ram():
+    """The reserve covers what the host uses outside the pod's cgroup: an idle 376.5 GiB 8-GPU host used 14.2 GiB,
+    more than the old 3 % (11.3 GiB). Now 10 %, 37.65 GiB, leaves the pod 338 GiB; a 64 GiB host keeps the 16 GiB
+    floor. The backend lists the same figures (models.executor.pod_ram_total_kib), so a pod at the listed RAM is
+    never cut below it: the backend's 338 GiB for the 376.5 GiB host passes unclamped."""
+    host_kib = int(376.5 * 1024 * 1024)
+    assert DockerService._rental_memory_gb(0, host_kib) == 338
+    assert DockerService._rental_memory_gb(338, host_kib) == 338
+    assert DockerService._rental_memory_gb(0, 64 * 1024 * 1024) == 64 - 16
 
 
 def test_a_rental_with_a_memory_limit_keeps_the_backend_value():
@@ -286,15 +297,15 @@ def test_a_rental_with_a_memory_limit_keeps_the_backend_value():
 
 def test_a_backend_memory_limit_at_or_above_host_ram_is_clamped_below_it():
     """ticket-0903: a pod limit of 64 GiB on a host with 65290844 KiB (~62.3 GiB) let the renter push the host into
-    a global OOM. The limit is clamped to host RAM less the reserve: 62.3 - 4 = 58 GiB."""
-    assert DockerService._rental_memory_gb(64, 65290844) == 58
-    assert DockerService._rental_memory_gb(62, 65290844) == 58
+    a global OOM. The limit is clamped to host RAM less the reserve: 62.3 - 16 = 46 GiB."""
+    assert DockerService._rental_memory_gb(64, 65290844) == 46
+    assert DockerService._rental_memory_gb(62, 65290844) == 46
 
 
 def test_a_split_host_backend_memory_limit_is_clamped_to_its_gpu_share():
     """Review 5713873335: two 4-of-8-GPU pods sized on 68 GiB saved specs get 32 GiB each; on a 62.3 GiB host
-    they sum above its RAM. Each is clamped to its share: (62.3 - 4) * 4/8 = 29 GiB."""
-    assert DockerService._rental_memory_gb(32, 65290844, 0.5) == 29
+    they sum above its RAM. Each is clamped to its share: (62.3 - 16) * 4/8 = 23 GiB."""
+    assert DockerService._rental_memory_gb(32, 65290844, 0.5) == 23
     # a limit already under its share is kept
     assert DockerService._rental_memory_gb(16, 65290844, 0.5) == 16
 
@@ -307,17 +318,17 @@ def test_an_unreadable_host_ram_leaves_a_limitless_rental_as_it_was():
 
 def test_a_split_host_legacy_rental_gets_its_gpu_share_of_host_ram():
     """Review finding #1534: on a split host the fallback follows the backend's (host - reserve) * share
-    (models.executor.pod_ram_total_kib). A 4-of-8 rental on a 64 GiB host gets (64 - 4) * 0.5 = 30 GiB, so
-    two such legacy pods sum to 60 GiB — the whole host less the reserve — and cannot together exceed it
+    (models.executor.pod_ram_total_kib). A 4-of-8 rental on a 64 GiB host gets (64 - 16) * 0.5 = 24 GiB, so
+    two such legacy pods sum to 48 GiB — the whole host less the reserve — and cannot together exceed it
     and OOM the executor, as they would if each were capped near the full host RAM."""
     half = DockerService._rental_memory_gb(0, 64 * 1024 * 1024, 0.5)
-    assert half == 30
+    assert half == 24
     assert half * 2 <= DockerService._rental_memory_gb(0, 64 * 1024 * 1024, 1.0)
 
 
 def test_the_gpu_share_is_clamped_into_range():
     # a share over 1 (never expected) cannot exceed the whole-host cap; a non-positive share floors at 1 GiB
-    assert DockerService._rental_memory_gb(0, 64 * 1024 * 1024, 2.0) == 60
+    assert DockerService._rental_memory_gb(0, 64 * 1024 * 1024, 2.0) == 48
     assert DockerService._rental_memory_gb(0, 64 * 1024 * 1024, 0.0) == 1
 
 
@@ -479,7 +490,7 @@ async def test_a_split_legacy_rental_is_refused_when_the_host_gpu_count_cannot_b
 @pytest.mark.asyncio
 async def test_a_split_legacy_rental_is_sized_to_its_gpu_share(svc, monkeypatch):
     """The create flow reads host RAM and host GPU count for a legacy ram_total 0 split rental and sizes
-    the mem_limit to the rented GPUs' share: 4 of 8 GPUs on a 64 GiB host -> (64 - 4) * 4/8 = 30 GiB."""
+    the mem_limit to the rented GPUs' share: 4 of 8 GPUs on a 64 GiB host -> (64 - 16) * 4/8 = 24 GiB."""
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
 
@@ -496,13 +507,13 @@ async def test_a_split_legacy_rental_is_sized_to_its_gpu_share(svc, monkeypatch)
     result = await _run(svc, _payload(memory_gb=0, gpu_uuids=["GPU-a", "GPU-b", "GPU-c", "GPU-d"]))
 
     assert isinstance(result, ContainerCreated)
-    assert _created_run_spec(svc).memory_gb == 30
+    assert _created_run_spec(svc).memory_gb == 24
 
 
 @pytest.mark.asyncio
 async def test_a_sent_split_memory_limit_above_its_share_of_host_ram_is_clamped_in_the_run_spec(svc, monkeypatch):
     """Review 5713873335: the create flow reads host RAM and GPU count for a rental sent WITH a limit too, and
-    the run spec carries the clamped value: 32 GiB sent for 4 of 8 GPUs on a 62.3 GiB host -> 29 GiB."""
+    the run spec carries the clamped value: 32 GiB sent for 4 of 8 GPUs on a 62.3 GiB host -> 23 GiB."""
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
 
@@ -519,12 +530,12 @@ async def test_a_sent_split_memory_limit_above_its_share_of_host_ram_is_clamped_
     result = await _run(svc, _payload(memory_gb=32, gpu_uuids=["GPU-a", "GPU-b", "GPU-c", "GPU-d"]))
 
     assert isinstance(result, ContainerCreated)
-    assert _created_run_spec(svc).memory_gb == 29
+    assert _created_run_spec(svc).memory_gb == 23
 
 
 @pytest.mark.asyncio
 async def test_a_sent_whole_host_memory_limit_above_host_ram_is_clamped_in_the_run_spec(svc, monkeypatch):
-    """ticket-0903 wiring: 64 GiB sent on a 62.3 GiB host -> the run spec carries 58 GiB."""
+    """ticket-0903 wiring: 64 GiB sent on a 62.3 GiB host -> the run spec carries 46 GiB."""
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
 
@@ -539,7 +550,7 @@ async def test_a_sent_whole_host_memory_limit_above_host_ram_is_clamped_in_the_r
     result = await _run(svc, _payload(memory_gb=64))
 
     assert isinstance(result, ContainerCreated)
-    assert _created_run_spec(svc).memory_gb == 58
+    assert _created_run_spec(svc).memory_gb == 46
 
 
 # ------------------------------------------------------------------
