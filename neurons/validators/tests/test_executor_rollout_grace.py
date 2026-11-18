@@ -380,3 +380,44 @@ def test_an_ssh_drop_under_the_port_probe_during_the_rollout_is_withheld() -> No
     still_on_old = _failed("node-3", "PORT_VERIFY_FAILED", observed_digest=OLD)
 
     assert rollout_grace_reason(still_on_old, _open_window(), J1) == "PORT_VERIFY_FAILED"
+
+
+# --- DAH-6560: the release just replaced reads CURRENT for 8 cycles ---------------------------
+
+NEWER = "sha256:" + "d" * 64
+
+
+@pytest.mark.asyncio
+async def test_the_previous_release_reads_current_through_cycle_8_and_the_verdict_window_stays_at_2() -> None:
+    """Regression: the OUTDATED card ended with the 2-cycle verdict window, while 4-31 nodes per release
+    were still on the previous image then; withholding verdicts longer would trip the 1-hour inactive sweep."""
+    tracker = _tracker(_FakeRedis())
+    await tracker.observe(OLD, J0 - BPC, now=T0)
+
+    seen = []
+    for cycle in range(1, 10):  # the cycle the change is seen is cycle 1
+        window = await tracker.observe(NEW, J0 + (cycle - 1) * BPC, now=T0)
+        job_block = J0 + (cycle - 1) * BPC
+        seen.append((cycle, window.previous_reads_current(job_block), window.covers(job_block)))
+
+    assert seen == [(c, c <= 8, c <= 2) for c in range(1, 10)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("push", [3, 5])
+async def test_a_second_release_inside_the_8_cycles_gives_its_previous_release_a_fresh_grace(push) -> None:
+    tracker = _tracker(_FakeRedis())
+    await tracker.observe(OLD, J0 - BPC, now=T0)
+    for cycle in range(1, push):
+        await tracker.observe(NEW, J0 + (cycle - 1) * BPC, now=T0)
+
+    seen = []
+    for cycle in range(push, push + 9):  # NEWER is pushed in cycle `push`, its own cycle 1
+        window = await tracker.observe(NEWER, J0 + (cycle - 1) * BPC, now=T0)
+        job_block = J0 + (cycle - 1) * BPC
+        seen.append((cycle, window.previous_digest, window.previous_reads_current(job_block), window.covers(job_block)))
+
+    # NEW, the release just replaced, reads CURRENT for 8 cycles from the push; the verdict window keeps its
+    # own rules: not reopened in cycle 3 (no uncovered cycle has published yet), a fresh 2 cycles in cycle 5
+    reopened = push >= 5
+    assert seen == [(c, NEW, c < push + 8, reopened and c < push + 2) for c in range(push, push + 9)]
