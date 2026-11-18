@@ -100,10 +100,11 @@ def test_the_signed_list_is_what_gets_pinned(authorized_keys, signed_sources):
     assert authorized_keys.read_text().startswith(RENTER_KEY + 'from="198.51.100.7" ')
 
 
-def test_an_empty_signed_list_keeps_the_pin_off(authorized_keys, signed_sources):
+def test_without_a_signed_list_the_builds_own_list_is_pinned(authorized_keys, signed_sources):
+    # never fetched (first-boot fetch failure) or a 404: a replayed upload must not log in from anywhere
     signed_sources.value = ""
     SSHService().add_pubkey_to_host(KEY)
-    assert authorized_keys.read_text().startswith(RENTER_KEY + KEY + " ")
+    assert authorized_keys.read_text().startswith(RENTER_KEY + f'from="{config.VALIDATOR_SSH_SOURCES}" {KEY} ')
 
 
 @pytest.fixture()
