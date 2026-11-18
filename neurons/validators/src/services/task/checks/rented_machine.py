@@ -30,6 +30,7 @@ from ...const import (
 )
 from core.config import settings
 from services.gpu_reset import renter_gpu_reset_in_progress
+from services.rental_docker_sdk import _authorized_keys_lock
 from services.redis_service import (
     EXECUTOR_CREATE_LOCK_TIMEOUT,
     RECENT_FILLER_PREFIX,
@@ -1463,7 +1464,9 @@ async def _strip_foreign_pod_keys(
     # cat into the same file keeps its owner and mode; copy only on grep exit 0 or 1 (1 = every line went), never on
     # an error such as a full disk, which would leave an empty temp file and wipe the renter's keys.
     script = (
-        "f=/root/.ssh/authorized_keys; t=$(mktemp) || exit 1; "
+        # DAH-6441: under the add/remove lock, or a key removed between this grep and the cat comes back
+        _authorized_keys_lock("/root/.ssh", 1)
+        + "f=/root/.ssh/authorized_keys; t=$(mktemp) || exit 1; "
         f'grep -vF {patterns} "$f" > "$t" || [ $? -eq 1 ] && cat "$t" > "$f"; s=$?; rm -f "$t"; exit $s'
     )
     try:

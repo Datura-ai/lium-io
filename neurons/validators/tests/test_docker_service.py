@@ -2566,7 +2566,7 @@ async def test_create_customer_rental_starts_inspector_collector(docker_service,
     # the reply does not wait for the collector or the session close: both come after the return
     lifecycle_spy.assert_not_awaited()
     assert ssh_session.closed is False
-    await _drain_create_steps_after_reply(pod_id)
+    await _drain_create_steps_after_reply(payload)
     lifecycle_spy.assert_awaited_once()
     assert ssh_session.closed is True
     assert lifecycle_spy.await_args.kwargs["action"] == "start"
@@ -2589,8 +2589,10 @@ class RecordingSSHConnectionManager(DummySSHConnectionManager):
         self.closed = True
 
 
-async def _drain_create_steps_after_reply(pod_id: str) -> None:
-    assert await docker_service_module.create_steps_after_reply.wait_until_done(pod_id, 5)
+async def _drain_create_steps_after_reply(payload) -> None:
+    assert await docker_service_module.create_steps_after_reply.wait_until_done(
+        payload.pod_id, docker_service_module.executor_key(payload), 5
+    )
 
 
 @pytest.mark.asyncio
@@ -2610,10 +2612,11 @@ async def test_delete_waits_for_the_create_steps_after_reply_before_its_teardown
         return DummySSHConnectionManager(AsyncMock(run=AsyncMock(return_value=_make_ssh_command_result())))
 
     monkeypatch.setattr("services.docker_service.asyncssh.connect", Mock(side_effect=connect_for_delete))
-    docker_service_module.create_steps_after_reply.start(pod_id, inspector_start_after_reply())
+    executor_id = str(uuid4())
+    docker_service_module.create_steps_after_reply.start(pod_id, ("miner", executor_id), inspector_start_after_reply())
     payload = ContainerDeleteRequest(
         miner_hotkey="miner",
-        executor_id=str(uuid4()),
+        executor_id=executor_id,
         pod_id=pod_id,
         workload_kind=WorkloadKind.CUSTOMER_RENTAL,
         container_name=f"pod_{pod_id}",
@@ -2640,13 +2643,13 @@ async def test_create_steps_after_reply_past_the_timeout_are_cancelled_and_close
         finally:
             closed.set()
 
-    docker_service_module.create_steps_after_reply.start(pod_id, hung_inspector_start())
+    docker_service_module.create_steps_after_reply.start(pod_id, ("miner", "exec"), hung_inspector_start())
 
-    finished = await docker_service_module.create_steps_after_reply.wait_until_done(pod_id, 0.01)
+    finished = await docker_service_module.create_steps_after_reply.wait_until_done(pod_id, ("miner", "exec"), 0.01)
 
     assert finished is False
     assert closed.is_set()
-    assert await docker_service_module.create_steps_after_reply.wait_until_done(pod_id, 0.01) is True
+    assert await docker_service_module.create_steps_after_reply.wait_until_done(pod_id, ("miner", "exec"), 0.01) is True
 
 
 def _cvm_socket_payload(workload_kind: WorkloadKind = WorkloadKind.CUSTOMER_RENTAL) -> ContainerCreateRequest:
@@ -2803,7 +2806,7 @@ async def test_create_filler_starts_inspector_collector(docker_service, monkeypa
         private_key="encrypted",
     )
 
-    await _drain_create_steps_after_reply(payload.pod_id)
+    await _drain_create_steps_after_reply(payload)
     lifecycle_spy.assert_awaited_once()
     assert lifecycle_spy.await_args.kwargs["action"] == "start"
     inspector_step = next(
@@ -3225,6 +3228,8 @@ async def test_start_container_remounts_when_container_state_is_encrypted(docker
         # here means the ciphertext is gone, and re-initialising would hide that
         allow_init=False,
     )
+    # the executor's start watcher skips encrypted pods, so the validator restarts platform Jupyter after the remount
+    assert any("lium-jupyter-restart.sh" in c.args[0] for c in ssh_client.run.await_args_list)
 
 
 @pytest.mark.asyncio
@@ -5215,7 +5220,7 @@ async def _another_create_live(pod_id: str, live: bool):
     registered, release = asyncio.Event(), asyncio.Event()
 
     async def other_create():
-        with docker_service_module.inflight_creates.track(pod_id):
+        with docker_service_module.inflight_creates.track(pod_id, ("miner", "exec")):
             registered.set()
             await release.wait()
 
@@ -5273,7 +5278,7 @@ async def test_rental_create_removes_only_its_own_leftover_container_on_a_name_c
     registry = docker_service_module.inflight_creates
     async with _another_create_live("test", live_creates == 2):
         # production registers one create twice: the job runner, then the miner handler
-        with registry.track("test"), registry.track("test"):
+        with registry.track("test", ("miner", "exec")), registry.track("test", ("miner", "exec")):
             run = docker_service._run_rental_docker_create_with_port_retry(
                 docker_client=FakeRentalClient(),
                 ssh_client=Mock(),
@@ -5314,7 +5319,7 @@ async def test_rental_create_keeps_a_same_name_pod_that_changed_after_its_status
                     registered, release = asyncio.Event(), asyncio.Event()
 
                     async def other_create():
-                        with registry.track("test"):
+                        with registry.track("test", ("miner", "exec")):
                             registered.set()
                             await release.wait()
 
@@ -5334,7 +5339,7 @@ async def test_rental_create_keeps_a_same_name_pod_that_changed_after_its_status
                     raise Exception("409 Conflict: cannot remove a running container")
 
         monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
-        with registry.track("test"):
+        with registry.track("test", ("miner", "exec")):
             with pytest.raises(docker_service_module._SameNameContainerKept):
                 await docker_service._run_rental_docker_create_with_port_retry(
                     docker_client=FakeRentalClient(),
@@ -5363,7 +5368,7 @@ async def test_failed_create_without_container_id_removes_by_name_only_when_no_o
     monkeypatch.setattr(docker_service_module, "retry_ssh_command", ssh_commands)
     registry = docker_service_module.inflight_creates
     async with _another_create_live("test", live_creates == 2):
-        with registry.track("test"), registry.track("test"):
+        with registry.track("test", ("miner", "exec")), registry.track("test", ("miner", "exec")):
             await docker_service.cleanup_failed_container_creation(
                 ssh_client=Mock(), default_extra={}, container_name="pod_test", pod_id="test",
             )
@@ -5421,7 +5426,7 @@ async def test_redelivered_create_leaves_a_running_same_name_pod_untouched(
         root_dir="/root/app",
         ssh_host_key=FAKE_SSH_HOST_KEY,
     )
-    with docker_service_module.inflight_creates.track(pod_id):
+    with docker_service_module.inflight_creates.track(pod_id, docker_service_module.executor_key(payload)):
         result = await docker_service.create_container(
             payload=payload, executor_info=executor_info, keypair=Mock(ss58_address="v"), private_key="encrypted",
         )
@@ -5443,7 +5448,7 @@ async def test_failed_create_removes_the_pods_volume_only_when_no_other_create_i
     monkeypatch.setattr(docker_service_module, "retry_ssh_command", ssh_commands)
     registry = docker_service_module.inflight_creates
     async with _another_create_live("test", live_creates == 2):
-        with registry.track("test"):
+        with registry.track("test", ("miner", "exec")):
             await docker_service.cleanup_failed_container_creation(
                 ssh_client=Mock(), default_extra={}, container_name="pod_test", volume_name="volume_test",
                 remove_volume=True, container_id="cid", pod_id="test",
@@ -10852,7 +10857,8 @@ async def test_the_flatten_lease_is_released_however_the_create_ends(
 async def test_no_flatten_no_lease_release(docker_service):
     ssh = _node_ssh()
     assert await _create_with_flatten(docker_service, _SysboxFailingRentalClient(set()), AsyncMock(), ssh=ssh) == "cid"
-    ssh.run.assert_not_awaited()
+    # only the host memory guard ran on the node
+    assert [c for c in ssh.run.await_args_list if "MemoryMin" not in c.args[0]] == []
 
 
 @pytest.mark.asyncio
@@ -10941,6 +10947,74 @@ def test_a_trailing_slash_on_the_template_path_selects_the_same_mount(template_v
     volumes = CustomOptions.sanitize(CustomOptions(volumes=[template_volume])).volumes
 
     assert _pod_volume_path(volumes, existing_volume=existing_volume) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "volume",
+    [
+        "/mnt",
+        "/mnt/data/",
+        "/lium-cipher",
+        "/lium-cipher/x",
+        "volume_pod:/mnt/data",
+        "/data:/lium-cipher",
+        "volume::/mnt",
+        "volume::/lium-cipher",
+        "//mnt",
+        "//lium-cipher",
+        "/./mnt",
+        "/workspace/../mnt",
+        "///lium-cipher/x/",
+        "volume:://mnt",
+    ],
+)
+async def test_create_refuses_a_reserved_volume_path_instead_of_moving_the_volume_to_root(
+    docker_service, monkeypatch, volume
+):
+    # DAH-6579: the path was dropped and the encrypted volume made at /root while the pod showed encryption on
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    payload = ContainerCreateRequest(
+        miner_hotkey="miner",
+        executor_id=str(uuid4()),
+        pod_id=str(uuid4()),
+        workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        docker_image="daturaai/dlph:test",
+        user_public_keys=["ssh-ed25519 test-key"],
+        gpu_uuids=["GPU-test"],
+        cpu_count=1,
+        memory_gb=1,
+        volume_limit_gb=2,
+        storage_limit_gb=1,
+        available_ports=[PayloadPortMapping(internal_port=20020, external_port=20020)],
+        pod_mapping=[],
+        active_container_names=[],
+        active_volume_names=[],
+        custom_options=CustomOptions(volumes=[volume]),
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload, executor_info=executor_info, keypair=Mock(ss58_address="validator-hotkey"), private_key="k"
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "reserved_volume_path"
+    assert "Use another folder, such as /workspace" in str(result.msg)
+
+
+@pytest.mark.parametrize("volume", ["/workspace", "/data/mnt", "/mntx", "volume_pod:/workspace", "/mnt/x:/data"])
+def test_a_path_outside_mnt_and_lium_cipher_is_not_reserved(volume):
+    assert CustomOptions.reserved_volume_paths([volume]) == []
 
 
 @pytest.mark.asyncio
