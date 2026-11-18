@@ -12,8 +12,9 @@ What lives here:
   `POST /executors` accepts `SimpleValidatorRequest` and returns `ExecutorListResponse`.
   SSH-key submission, SSH-key removal and pod-log requests authenticate with signed HTTP
   headers built from `AuthenticationPayload`; their successful responses are
-  `AcceptSSHKeyRequest`, `SSHKeyRemoved` and `PodLogsResponse`, and a refused request
-  answers `FailedRequest`.
+  `AcceptSSHKeyRequest`, `SSHKeyRemoved` and `PodLogsResponse`. The handlers return
+  `FailedRequest` for operation errors they catch; authentication and miner-name refusals
+  return an HTTP 400/401/403 error with a `detail` field.
 - `datura/errors/protocol.py` — the protocol-level exceptions.
 
 Adding a message type means adding a model in the right `*_requests.py` and a
