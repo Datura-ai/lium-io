@@ -223,3 +223,29 @@ def test_no_validator_code_reads_the_executor_reported_paths():
         if isinstance(node, ast.Attribute) and node.attr in ("python_path", "root_dir")
     ]
     assert reads == []
+
+
+def test_scripts_are_written_where_the_disk_reserve_holds():
+    # a renter filling the host disk must not stop the validator writing its scripts
+    reserve = (EXECUTOR_SOURCES.parent / "setup_disk_reserve.sh").read_text()
+    assert f'workdir=$MNT/app-work" {executor_payload.SERVICE_DIR_PARENT}\n' in reserve
+
+
+async def test_uploads_go_where_the_disk_reserve_holds_and_sweeps_them():
+    import re
+    from contextlib import asynccontextmanager
+
+    from services.task.checks.upload_files import upload_validation_files_to_fresh_remote_dir
+
+    sent = []
+
+    @asynccontextmanager
+    async def sftp_client():
+        async def put(local, remote, recurse):
+            sent.append(remote)
+
+        yield SimpleNamespace(put=put)
+
+    ctx = SimpleNamespace(state=SimpleNamespace(upload_local_dir="/local"), ssh=SimpleNamespace(start_sftp_client=sftp_client))
+    remote = await upload_validation_files_to_fresh_remote_dir(ctx)
+    assert sent == [remote] and re.fullmatch(r"/root/app/[0-9a-f]{32}", remote)  # the reserve janitor's pattern

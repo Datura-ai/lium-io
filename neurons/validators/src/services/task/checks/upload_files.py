@@ -23,8 +23,9 @@ async def upload_validation_files_to_fresh_remote_dir(ctx: Context, *, attempts:
     if not local_dir:
         raise UploadFailed(f"missing upload config: local_dir={local_dir}")
 
-    # a validator-chosen place, never one the executor reported
-    remote_dir = f"{executor_payload.service_dir_glob('upload')}{uuid.uuid4().hex}"
+    # a validator-chosen place, never one the executor reported; the executor's disk reserve backs it and sweeps
+    # old <32 hex> upload directories there (setup_disk_reserve.sh)
+    remote_dir = f"{executor_payload.SERVICE_DIR_PARENT}/{uuid.uuid4().hex}"
     last_exc: Exception | None = None
 
     for attempt in range(1, attempts + 1):

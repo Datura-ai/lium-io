@@ -14,7 +14,9 @@ import shlex
 from pathlib import Path
 
 EXECUTOR_PYTHON = "/root/app/.venv/bin/python"
-SERVICE_DIR_PARENT = "/root"
+# the image's own directory (a fixed path, not a reported one): the executor's disk reserve backs it
+# (setup_disk_reserve.sh), so the scripts are written there even when a renter has filled the host disk
+SERVICE_DIR_PARENT = "/root/app"
 _IMAGE_PAYLOADS = Path(__file__).resolve().parents[1] / "executor_payloads"
 PAYLOAD_DIR = _IMAGE_PAYLOADS if _IMAGE_PAYLOADS.is_dir() else Path(__file__).resolve().parents[3] / "executor" / "src"
 
