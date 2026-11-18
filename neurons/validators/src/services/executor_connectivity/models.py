@@ -65,7 +65,8 @@ class DindProbeResult:
     log_text: str | None = None
     # DAH-2856: the cause when the container started but sshd never answered, read from the
     # container's own logs before removal. DAH-3634: also when `docker run` itself was refused by
-    # the NVIDIA container hook (docker's stderr). None when the probe passed or the cause is unknown.
+    # the NVIDIA container hook (docker's stderr). DAH-6637: on a passed probe, HOST_SYSBOX_FS_BROKEN when
+    # sysbox-fs answered a read with a broken-FUSE error. Otherwise None.
     error: DindLogCause | None = None
     # the in-container Sysbox test timed out: sysbox_runtime is False, but nothing was measured
     sysbox_timed_out: bool = False

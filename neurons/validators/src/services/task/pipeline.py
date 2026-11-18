@@ -218,7 +218,8 @@ class ContextState:
     # hook, from docker's stderr). None when the probe passed or the cause is unknown.
     # SysboxRequiredCheck puts it into the SYSBOX_REQUIRED_MISSING event instead of "install sysbox",
     # and emits the NVIDIA_* reason code in place of SYSBOX_REQUIRED_MISSING for an NVIDIA_* cause,
-    # DIND_PROBE_UNREACHABLE for DIND_SSHD_NOT_READY (DAH-5844).
+    # DIND_PROBE_UNREACHABLE for DIND_SSHD_NOT_READY (DAH-5844). DAH-6637: HOST_SYSBOX_FS_BROKEN on a passed
+    # probe; SysboxRequiredCheck turns it into an availability entry.
     dind_probe_error: DindLogCause | None = None
     # the outside prober could not reach the ports: our filler's ports are behind the same firewall
     externally_unreachable: bool = False

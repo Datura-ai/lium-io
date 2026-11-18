@@ -100,6 +100,13 @@ UID_MAP_USER_NAMESPACE = "user_namespace"
 UID_MAP_IDENTITY = "identity"
 UID_MAP_UNREADABLE = "unreadable"
 
+# DAH-6637: a file sysbox-fs serves inside a sysbox container (the read the rented-pod check makes too). A broken
+# sysbox-fs answers it with one of these errors; a timeout or any other error decides nothing.
+SYSBOX_FS_PATH = "/proc/sys/kernel/hostname"
+SYSBOX_FS_BROKEN_ERRORS = ("not connected", "Input/output error")
+SYSBOX_FS_READ_TIMEOUT_SECONDS = 10
+HOST_SYSBOX_FS_BROKEN = "HOST_SYSBOX_FS_BROKEN"
+
 DOCKER_RUN_CAUSES: tuple[tuple[str, DindLogCause], ...] = (
     (
         "nvml error: driver/library version mismatch",
@@ -212,6 +219,7 @@ class DindVerifier:
         created = False
         sshd_answered = False
         sysbox_timed_out = False
+        sysbox_fs_error: DindLogCause | None = None
 
         try:
             logger.info(_m("DinD start", extra=get_extra_info(log_ctx)))
@@ -257,6 +265,8 @@ class DindVerifier:
                     measured = await self._sysbox_works(ssh, log_ctx)
                     sysbox_timed_out = measured is None
                     sysbox = measured is True
+                    if sysbox:
+                        sysbox_fs_error = await self._read_sysbox_fs(ssh, log_ctx)
 
             logger.info(_m("DinD check ok", extra=get_extra_info({**log_ctx, "sysbox_result": sysbox})))
 
@@ -266,6 +276,7 @@ class DindVerifier:
                 sysbox_runtime=sysbox,
                 port=port,
                 sysbox_timed_out=sysbox_timed_out,
+                error=sysbox_fs_error,
             )
 
         except Exception as e:
@@ -356,6 +367,23 @@ class DindVerifier:
         if fields[:3] == ["0", "0", "4294967295"]:
             return UID_MAP_IDENTITY
         return UID_MAP_USER_NAMESPACE
+
+    @staticmethod
+    async def _read_sysbox_fs(ssh: SSHClientConnection, log_ctx: dict[str, Any]) -> DindLogCause | None:
+        """HOST_SYSBOX_FS_BROKEN when a sysbox-fs file inside the probe container answers with a broken-FUSE
+        error; None for a clean read, a timeout or any other error (no answer decides nothing)."""
+        try:
+            result = await asyncio.wait_for(ssh.run(f"cat {SYSBOX_FS_PATH}"), timeout=SYSBOX_FS_READ_TIMEOUT_SECONDS)
+        except (asyncio.TimeoutError, asyncssh.Error, OSError):
+            return None
+        stderr = result.stderr.strip() if isinstance(result.stderr, str) else ""
+        if result.exit_status == 0 or not any(error in stderr for error in SYSBOX_FS_BROKEN_ERRORS):
+            return None
+        logger.warning(_m(HOST_SYSBOX_FS_BROKEN, extra=get_extra_info({**log_ctx, "error": stderr})))
+        return DindLogCause(
+            HOST_SYSBOX_FS_BROKEN,
+            f"reading {SYSBOX_FS_PATH} in a new sysbox container failed: {stderr[:DOCKER_RUN_ERROR_LINE_MAX_CHARS]}",
+        )
 
     @staticmethod
     def _user_namespace_allows_sysbox(uid_map: str, log_ctx: dict[str, Any]) -> bool:

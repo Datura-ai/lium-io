@@ -127,3 +127,81 @@ class _HelloWorldHangs(_InnerSSH):
 async def test_a_timed_out_sysbox_test_measured_nothing():
     """30 Oct, pod c0877f60: a busy host is not a host without Sysbox."""
     assert await DindVerifier(Mock())._sysbox_works(_HelloWorldHangs(SYSBOX_MAP), {}) is None
+
+
+class _ProcSysSSH:
+    """DAH-6637: the sysbox-fs read inside the probe container."""
+
+    def __init__(self, stderr: str = "", exit_status: int = 0, hangs: bool = False):
+        self.stderr, self.exit_status, self.hangs = stderr, exit_status, hangs
+
+    async def run(self, command):
+        assert command == f"cat {dind_probe.SYSBOX_FS_PATH}"
+        if self.hangs:
+            raise TimeoutError
+        return SimpleNamespace(stdout="" if self.exit_status else "probe\n", stderr=self.stderr, exit_status=self.exit_status)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "cat: /proc/sys/kernel/hostname: Transport endpoint is not connected",
+        "cat: /proc/sys/kernel/hostname: Input/output error",
+    ],
+)
+async def test_a_broken_sysbox_fs_is_named(stderr):
+    cause = await DindVerifier._read_sysbox_fs(_ProcSysSSH(stderr, exit_status=1), {})
+
+    assert cause.code == dind_probe.HOST_SYSBOX_FS_BROKEN
+    assert stderr in cause.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "inner",
+    [
+        _ProcSysSSH(),
+        _ProcSysSSH("cat: /proc/sys/kernel/hostname: Permission denied", exit_status=1),
+        _ProcSysSSH(hangs=True),
+    ],
+)
+async def test_a_clean_or_unanswered_sysbox_fs_read_decides_nothing(inner):
+    assert await DindVerifier._read_sysbox_fs(inner, {}) is None
+
+
+class _BrokenFsSSH(_InnerSSH):
+    async def run(self, command):
+        if command == f"cat {dind_probe.SYSBOX_FS_PATH}":
+            return SimpleNamespace(stdout="", stderr="Transport endpoint is not connected", exit_status=1)
+        return await super().run(command)
+
+
+@pytest.mark.asyncio
+async def test_a_passed_probe_carries_the_broken_sysbox_fs(mocker):
+    """Sysbox still counts as present; the cause rides on DindProbeResult.error."""
+    from contextlib import asynccontextmanager
+
+    from services.executor_connectivity.models import PortPair
+
+    @asynccontextmanager
+    async def answered():
+        yield _BrokenFsSSH(SYSBOX_MAP)
+
+    async def connect(*args, **kwargs):
+        return answered()
+
+    ssh_service = Mock(generate_keypair=Mock(return_value=("private", "public")))
+    mocker.patch.object(dind_probe.asyncssh, "import_private_key")
+    verifier = DindVerifier(ssh_service)
+    mocker.patch.object(verifier, "_connect_retrying_until_sshd_answers", side_effect=connect)
+
+    async def run(cmd):
+        return SimpleNamespace(exit_status=0, stdout="", stderr="")
+
+    result = await verifier.verify(
+        PortPair(9000, 9000), ssh_client=Mock(run=run), host="192.0.2.1", container_name_prefix="c", sysbox=True
+    )
+
+    assert (result.success, result.sysbox_runtime) == (True, True)
+    assert result.error.code == dind_probe.HOST_SYSBOX_FS_BROKEN

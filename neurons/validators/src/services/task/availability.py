@@ -75,6 +75,8 @@ class AvailabilityErrorCode(StrEnum):
     NODE_ACCOUNT_MISMATCH = "NODE_ACCOUNT_MISMATCH"
     # DAH-6539: the account read failed or stalled; a reach failure, so silenced with our own outage like one.
     NODE_ACCOUNT_UNVERIFIED = "NODE_ACCOUNT_UNVERIFIED"
+    # DAH-6637: the host's sysbox-fs answered a read in a new sysbox container with a broken-FUSE error.
+    HOST_SYSBOX_FS_BROKEN = "HOST_SYSBOX_FS_BROKEN"
 
 
 # Faults the node itself proved: never a sign of our own outage, and never silenced with one.
@@ -88,6 +90,7 @@ NODE_GPU_FAULT_CODES = frozenset(
         AvailabilityErrorCode.GPU_MODEL_NOT_MEASURED,
         # read off the machine itself (its host key or account files)
         AvailabilityErrorCode.NODE_ACCOUNT_MISMATCH,
+        AvailabilityErrorCode.HOST_SYSBOX_FS_BROKEN,
         # only raised for REASONS_THAT_HIDE_AT_ONCE, all read off the node's own report or probe
         AvailabilityErrorCode.VERIFICATION_FAILED,
     }

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from services.executor_connectivity.dind_probe import DIND_SSHD_NOT_READY
+from services.executor_connectivity.dind_probe import DIND_SSHD_NOT_READY, HOST_SYSBOX_FS_BROKEN
 from services.executor_connectivity.models import DIND_INNER_DOCKERD_CODES
 
+from ..availability import ReachSource, ReachTarget
 from ..messages import MessageTemplate, render_message
 from ..messages import SysboxRequiredMessages as Msg
 from ..models import ValidationEvent
@@ -39,6 +40,19 @@ class SysboxRequiredCheck:
             # forces sysbox_runtime=False whenever the DinD probe fails at all, not only on a
             # genuinely missing runtime, so a transient miss must not flip the executor instantly.
             return CheckResult(passed=False, event=self._render_missing_sysbox_event(ctx, is_rented))
+
+        cause = ctx.state.dind_probe_error
+        if cause is not None and cause.code == HOST_SYSBOX_FS_BROKEN:
+            # DAH-6637: hidden from new rentals only, rented or not; never fatal, score and verification kept.
+            # The next probe that reads clean sends no entry, which lists the node again.
+            what = {
+                "reach_source": str(ReachSource.VALIDATOR),
+                "reach_target": str(ReachTarget.NODE),
+                "is_rented": is_rented,
+                "dind_probe_error": cause.text,
+            }
+            event = render_message(Msg.HOST_SYSBOX_FS_BROKEN, ctx=ctx, check_id=self.check_id, what=what)
+            return CheckResult(passed=False, event=event, fatal=False)
 
         event = render_message(
             Msg.SYSBOX_OK,

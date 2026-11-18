@@ -10,6 +10,7 @@ from neurons.validators.src.services.executor_connectivity.dind_probe import (
     diagnose_docker_run_error,
     ssh_ready_timeout,
 )
+from neurons.validators.src.services.task.availability import AvailabilityErrorCode, availability_errors
 from neurons.validators.src.services.task.checks.sysbox_required import (
     _NVIDIA_HOOK_TEMPLATE_BY_REASON_CODE,
     SysboxRequiredCheck,
@@ -314,3 +315,35 @@ async def test_no_sysbox_under_another_miners_rental_on_a_different_endpoint_fai
 
     assert result.passed is False
     assert result.event.reason_code == Msg.SYSBOX_MISSING.reason
+
+
+_SYSBOX_FS_BROKEN = DindLogCause(
+    "HOST_SYSBOX_FS_BROKEN", "reading /proc/sys/kernel/hostname in a new sysbox container failed: not connected"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rented", [True, False])
+async def test_a_broken_sysbox_fs_hides_the_node_without_failing_the_run(context_factory, rented):
+    """DAH-6637: an availability entry, rented (split) or not; never fatal, verification kept."""
+    state = build_state(
+        sysbox_runtime=True, dind_probe_error=_SYSBOX_FS_BROKEN, rented_data=_rented_data() if rented else None
+    )
+
+    result = await SysboxRequiredCheck().run(context_factory(state=state))
+
+    assert (result.passed, result.fatal) == (False, False)
+    assert "clear_verified_job_info" not in result.updates
+    [entry] = availability_errors([result.event])
+    assert entry.reason_code == AvailabilityErrorCode.HOST_SYSBOX_FS_BROKEN
+    assert (entry.reach_source, entry.reach_target) == ("validator", "node")
+    assert entry.what_we_saw["is_rented"] is rented
+
+
+@pytest.mark.asyncio
+async def test_a_clean_sysbox_fs_read_sends_no_entry(context_factory):
+    """The next clean cycle's empty list lists the node again."""
+    result = await SysboxRequiredCheck().run(context_factory(state=build_state(sysbox_runtime=True)))
+
+    assert result.passed is True
+    assert availability_errors([result.event]) == []

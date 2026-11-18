@@ -924,6 +924,20 @@ class ExecutorImageMessages:
 
 
 class SysboxRequiredMessages:
+    # DAH-6637: an availability error: the backend hides the node from new rentals; a rental already on it keeps running
+    HOST_SYSBOX_FS_BROKEN = MessageTemplate(
+        event="The host's sysbox-fs is not answering",
+        reason="HOST_SYSBOX_FS_BROKEN",
+        severity="error",
+        category=AVAILABILITY_CATEGORY,
+        impact="Node hidden and takes no new rentals until a check reads sysbox-fs clean; a running rental is "
+        "kept and the score is not changed",
+        remediation=(
+            "A new sysbox container could not read its /proc/sys: the host's sysbox-fs (the FUSE service behind "
+            "a sysbox container's /proc) is not answering. Restart sysbox on the host (`systemctl restart "
+            "sysbox`); tell the renters first, because their pods must be restarted after it."
+        ),
+    )
     SYSBOX_MISSING = MessageTemplate(
         event="Sysbox required for unrented executor",
         reason="SYSBOX_REQUIRED_MISSING",
