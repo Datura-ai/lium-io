@@ -258,6 +258,48 @@ async def test_a_held_xid_stays_without_proof_of_a_reset(context_factory, before
     assert later.report["card_faults"] == [XID_FAULT]
 
 
+def _held_before_reset_marks(services, xid: int) -> str:
+    """A card state stored by a validator that kept no reset marks: one held Xid on card 3."""
+    fault = f"gpu 3 ({UUIDS[3]}): new NVRM Xid on a probed GPU: NVRM: Xid (PCI:0000:03:00): {xid}, pid=1"
+    key = next(k for k in services.redis.store if k.startswith("gpu_card_health:"))
+    services.redis.store[key] = json.dumps({"xid_after": 5, "boot_id": "boot-a", "held": [fault]})
+    return fault
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("xid", [48, 79, 95])
+async def test_a_hold_stored_before_reset_marks_heals_on_a_zeroed_read_for_a_reset_only_xid(context_factory, xid):
+    services = _services()
+    boot = {"boot_id": "boot-a", "xid": {"available": True, "last_ts": 5}}
+    await _read(context_factory, services, _ok(**boot))
+    _held_before_reset_marks(services, xid)
+
+    read, _ = await _read(context_factory, services, _ok(gpu={"recovery_action": 0}, **boot))
+
+    assert read.report["card_faults"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("xid", "gpu"),
+    [
+        (74, {"recovery_action": 0}),  # NVLink: a healthy-looking read says nothing about it
+        (119, {"recovery_action": 0}),
+        (48, {"recovery_action": None}),  # an unreadable counter is not a cleared one
+        (48, {"ecc_uncorrected": 1, "recovery_action": 0}),
+    ],
+)
+async def test_a_hold_stored_before_reset_marks_stays_without_proof(context_factory, xid, gpu):
+    services = _services()
+    boot = {"boot_id": "boot-a", "xid": {"available": True, "last_ts": 5}}
+    await _read(context_factory, services, _ok(**boot))
+    fault = _held_before_reset_marks(services, xid)
+
+    read, _ = await _read(context_factory, services, _ok(gpu=gpu, **boot))
+
+    assert read.report["card_faults"] == [fault]
+
+
 @pytest.mark.asyncio
 async def test_a_card_missing_from_one_read_keeps_its_reset_marks(context_factory):
     services = _services()

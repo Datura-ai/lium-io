@@ -44,8 +44,9 @@ class CardHealthState:
     xid_after: float | None = None
     boot_id: str | None = None
     held: list[str] = field(default_factory=list)
-    # per card UUID, the NVML counters only a GPU reset (or a driver reload) clears that the last read saw set
-    reset_marks: dict[str, list[str]] = field(default_factory=dict)
+    # per card UUID, the NVML counters only a GPU reset (or a driver reload) clears that the last read saw set;
+    # None: stored before these marks existed, so no read has a baseline yet
+    reset_marks: dict[str, list[str]] | None = None
 
 
 def _card_health_key(ctx: Context) -> str:
@@ -78,9 +79,11 @@ async def _load_card_health(ctx: Context) -> CardHealthState | None:
         held=strings("held"),
         reset_marks={
             uuid: [c for c in counters if c in RESET_CLEARED_COUNTERS]
-            for uuid, counters in (marks.items() if isinstance(marks, dict) else [])
+            for uuid, counters in marks.items()
             if isinstance(uuid, str) and isinstance(counters, list)
-        },
+        }
+        if isinstance(marks, dict)
+        else None,
     )
 
 
@@ -92,10 +95,30 @@ def _reset_marks(gpu: dict[str, Any]) -> list[str]:
     return [c for c in RESET_CLEARED_COUNTERS if type(gpu.get(c)) is int and gpu[c] != 0]
 
 
-def _card_was_reset(uuid: str, gpus: dict[str, dict[str, Any]], before: CardHealthState) -> bool:
-    """Every reset-only counter the last read saw set on the card now reads 0: the card was reset since."""
-    marked = before.reset_marks.get(uuid)
-    return bool(marked) and uuid in gpus and all(gpus[uuid].get(c) == 0 for c in marked)
+# Xids that leave a reset-only counter set (48 DBE, 95 uncontained ECC) or the card unlisted (79, off the bus) until
+# the card is reset; any other hardware Xid can leave both counters at 0, so a zeroed read proves nothing for it
+RESET_PROVEN_XIDS = {48, 79, 95}
+_HELD_XID = re.compile(r"Xid \([^)]*\): (\d+)")
+
+
+def _card_was_reset(
+    fault: str, uuid: str, gpus: dict[str, dict[str, Any]], every_card_named: bool, before: CardHealthState
+) -> bool:
+    """Every reset-only counter the last read saw set on the card now reads 0: the card was reset since. A hold
+    stored before the marks existed has no such read: there, a read naming every card with both counters at 0
+    proves it only for an Xid in RESET_PROVEN_XIDS."""
+    if uuid not in gpus:
+        return False
+    if before.reset_marks is not None:
+        marked = before.reset_marks.get(uuid)
+        return bool(marked) and all(gpus[uuid].get(c) == 0 for c in marked)
+    xid = _HELD_XID.search(fault)
+    return (
+        every_card_named
+        and xid is not None
+        and int(xid.group(1)) in RESET_PROVEN_XIDS
+        and all(type(gpus[uuid].get(c)) is int and gpus[uuid][c] == 0 for c in RESET_CLEARED_COUNTERS)
+    )
 
 
 def _card_uuid(fault: str) -> str | None:
@@ -117,7 +140,7 @@ def _held_fault_proven_healed(
     uuid = _card_uuid(fault)
     if uuid is None:
         return False
-    if rebooted or _card_was_reset(uuid, gpus, before):
+    if rebooted or _card_was_reset(fault, uuid, gpus, every_card_named, before):
         return True
     # a card that drops out after the scrape is still listed there, so no missing-card fault fires yet
     # shortcut: a reset of a card whose read never showed a reset-only counter set still waits for a reboot
@@ -173,7 +196,7 @@ async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardH
         return
     key = _card_health_key(ctx)
     # a card this read did not name keeps its marks: its next read still proves a reset
-    reset_marks = {u: m for u, m in before.reset_marks.items() if u not in gpus and not rebooted}
+    reset_marks = {u: m for u, m in (before.reset_marks or {}).items() if u not in gpus and not rebooted}
     reset_marks.update({u: m for u, gpu in gpus.items() if (m := _reset_marks(gpu))})
     state = CardHealthState(
         xid_after=xid_after, boot_id=boot_id or before.boot_id, held=report["card_faults"], reset_marks=reset_marks
