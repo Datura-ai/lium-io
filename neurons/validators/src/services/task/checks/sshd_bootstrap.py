@@ -19,7 +19,7 @@ from services.redis_service import (
     sshd_bootstrap_failed_key,
 )
 
-from ...const import DEFAULT_JOB_OWNER_LIUM, FILLER_CONTAINER_PREFIX
+from ...const import DEFAULT_JOB_OWNER_LIUM, ENGY_TEE_FILLER_STRATEGY, FILLER_CONTAINER_PREFIX
 from ..messages import SshdBootstrapMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -146,6 +146,8 @@ class SshdBootstrapCheck:
         ):
             return False
         for name in rented_data.get_filler_containers(ctx.executor.uuid):
+            if rented_data.filler_strategy_by_container.get(name) == ENGY_TEE_FILLER_STRATEGY:
+                continue  # Engy SN53 counts any access to a provisioned server as cheating: never exec into it
             task_seconds_left = (
                 settings.JOB_TIME_OUT
                 - _TASK_TIMEOUT_MARGIN_SECONDS
