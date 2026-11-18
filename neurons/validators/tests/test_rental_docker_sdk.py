@@ -1816,6 +1816,88 @@ def test_authorized_keys_append_runs_under_busybox_ash(tmp_path):
     assert target.read_text() == "k1\n"
 
 
+@pytest.mark.skipif(shutil.which("flock") is None, reason="flock not installed")
+@pytest.mark.parametrize("remove", [False, True])
+def test_authorized_keys_edit_waits_for_the_other_edit_and_never_writes_past_it(tmp_path, monkeypatch, remove):
+    # DAH-6441: a remove's read-filter-write must not interleave with an add, or it writes back a file missing the add
+    monkeypatch.setattr(rental_docker_sdk, "AUTHORIZED_KEYS_LOCK_WAIT_SECONDS", 1)
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("k1\n")
+    lock = str(target.parent / ".lium-cp.lock")
+    build = build_remove_authorized_keys_exec_spec if remove else build_authorized_keys_exec_spec
+    spec = build(container_name="pod_key", public_keys=["k1"], target_path=str(target))
+    holder = subprocess.Popen(["flock", "-o", lock, "sleep", "30"])
+    try:
+        while subprocess.run(["flock", "-n", lock, "true"]).returncode == 0:
+            pass
+        completed = _run_key_append(spec)
+    finally:
+        holder.kill()
+        holder.wait()
+
+    assert completed.returncode == (1 if remove else 75)
+    assert target.read_text() == "k1\n"
+
+
+def test_authorized_keys_remove_drops_only_the_listed_keys(tmp_path):
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("k1\nk2\nk3\n")
+
+    completed = _run_key_append(
+        build_remove_authorized_keys_exec_spec(container_name="pod_key", public_keys=["k1", "k3"], target_path=str(target))
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == "k2\n"
+
+
+def _path_without_flock(tmp_path) -> str:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for tool in ("sh", "mkdir", "cat", "chmod", "touch", "mktemp", "rm", "grep"):
+        (bin_dir / tool).symlink_to(shutil.which(tool))
+    return str(bin_dir)
+
+
+@pytest.mark.parametrize("remove", [False, True])
+def test_authorized_keys_edit_without_flock_runs_unlocked_as_before(tmp_path, remove):
+    # no lock that a killed edit could leave behind and so block every later edit on the pod
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("k1\nk2\n")
+    build = build_remove_authorized_keys_exec_spec if remove else build_authorized_keys_exec_spec
+    spec = build(container_name="pod_key", public_keys=["k1"], target_path=str(target))
+
+    completed = _run_key_append(spec, env={"PATH": _path_without_flock(tmp_path)})
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == ("k2\n" if remove else "k1\nk2\nk1\n")
+    assert sorted(p.name for p in target.parent.iterdir()) == ["authorized_keys"]
+
+
+@pytest.mark.skipif(shutil.which("flock") is None, reason="flock not installed")
+@pytest.mark.parametrize("remove", [False, True])
+def test_authorized_keys_edit_takes_the_lock_with_a_flock_that_has_no_wait_option(tmp_path, remove):
+    # Alpine images have BusyBox flock, which takes -n but no -w
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("k1\nk2\n")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    busybox_like = bin_dir / "flock"
+    busybox_like.write_text(f'#!/bin/sh\ncase " $* " in *" -w "*) exit 1;; esac\nexec {shutil.which("flock")} "$@"\n')
+    busybox_like.chmod(0o755)
+    build = build_remove_authorized_keys_exec_spec if remove else build_authorized_keys_exec_spec
+    spec = build(container_name="pod_key", public_keys=["k1"], target_path=str(target))
+
+    completed = _run_key_append(spec, env={"PATH": f"{bin_dir}:/usr/bin:/bin"})
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == ("k2\n" if remove else "k1\nk2\nk1\n")
+
+
 # --- DAH-6302: a CPU share of 0 never means no CPU limit ---
 
 

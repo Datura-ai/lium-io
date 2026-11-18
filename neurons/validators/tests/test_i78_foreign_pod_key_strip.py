@@ -1,14 +1,16 @@
 import os
+import shutil
 import subprocess
 import tempfile
 from types import SimpleNamespace
 
 import pytest
-
 from services.task.checks.rented_machine import (
     FOREIGN_POD_KEY_BODIES,
     _check_pod_running_and_read_authorized_keys,
 )
+
+from services import rental_docker_sdk
 
 FOREIGN = f"ssh-ed25519 {FOREIGN_POD_KEY_BODIES[0]}"
 RENTER = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIrenterkey renter@laptop"
@@ -64,7 +66,7 @@ async def test_strip_script_keeps_only_other_lines(lines):
             fh.write("\n".join(lines) + "\n")
         os.chmod(path, 0o600)
         run = subprocess.run(
-            ["sh", "-c", f"sh -c {script}".replace("/root/.ssh/authorized_keys", path)], capture_output=True, text=True
+            ["sh", "-c", f"sh -c {script}".replace("/root/.ssh", root)], capture_output=True, text=True
         )
         assert run.returncode == 0, run.stderr
         assert open(path).read().split() == " ".join(l for l in lines if FOREIGN_POD_KEY_BODIES[0] not in l).split()
@@ -79,5 +81,29 @@ async def test_strip_script_leaves_the_file_alone_when_grep_errors():
     script = next(c for c in ssh.commands if "grep -vF" in c).split(" sh -c ", 1)[1]
     with tempfile.TemporaryDirectory() as root:
         path = os.path.join(root, "authorized_keys")
-        run = subprocess.run(["sh", "-c", f"sh -c {script}".replace("/root/.ssh/authorized_keys", path)], capture_output=True, text=True)
+        run = subprocess.run(["sh", "-c", f"sh -c {script}".replace("/root/.ssh", root)], capture_output=True, text=True)
         assert run.returncode != 0 and not os.path.exists(path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("flock") is None, reason="flock not installed")
+async def test_strip_script_waits_for_the_key_lock_and_leaves_the_file_alone_when_it_stays_held(monkeypatch):
+    # DAH-6441: a strip between a remove's filter and its write-back would put the removed key back
+    monkeypatch.setattr(rental_docker_sdk, "AUTHORIZED_KEYS_LOCK_WAIT_SECONDS", 1)
+    ssh = FakeSSH([RENTER, FOREIGN])
+    await _check_pod_running_and_read_authorized_keys(ssh, "pod_x")
+    script = next(c for c in ssh.commands if "grep -vF" in c).split(" sh -c ", 1)[1]
+    with tempfile.TemporaryDirectory() as root:
+        path = os.path.join(root, "authorized_keys")
+        with open(path, "w") as fh:
+            fh.write(f"{RENTER}\n{FOREIGN}\n")
+        holder = subprocess.Popen(["flock", "-o", os.path.join(root, ".lium-cp.lock"), "sleep", "30"])
+        try:
+            while subprocess.run(["flock", "-n", os.path.join(root, ".lium-cp.lock"), "true"]).returncode == 0:
+                pass
+            run = subprocess.run(["sh", "-c", f"sh -c {script}".replace("/root/.ssh", root)], capture_output=True, text=True)
+        finally:
+            holder.kill()
+            holder.wait()
+        assert run.returncode == 1
+        assert open(path).read() == f"{RENTER}\n{FOREIGN}\n"

@@ -14,7 +14,7 @@ neither number is `not_measured`: one miss after a measured pass is tolerated, a
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 from services.gpu_spec_table import normalize_gpu_model
@@ -130,6 +130,8 @@ EXPECTED_CC_ONLY: dict[str, str] = {
 
 BELOW_MODEL = "below_model"
 NOT_MEASURED = "not_measured"
+# a filler sample pinned to the card got no right answer from it (a card CUDA cannot see, or a wrong answer)
+WORK_PROOF_FAILED = "work_proof_failed"
 
 
 @dataclass(frozen=True)
@@ -215,6 +217,12 @@ def not_measured(machine_spec: Any, card_index: int) -> GpuModelMismatch:
         measured_device_name=None,
         kind=NOT_MEASURED,
     )
+
+
+def work_proof_failed(machine_spec: Any, card_index: int) -> GpuModelMismatch:
+    """A card whose pinned work-proof gave no right answer: stored like a mismatch, so the node fails on every
+    cycle until a run on that card passes, not only on the cycle that sampled it (lio#2305 review)."""
+    return replace(not_measured(machine_spec, card_index), kind=WORK_PROOF_FAILED)
 
 
 def gpu_model_mismatches(
