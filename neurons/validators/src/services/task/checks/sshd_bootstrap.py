@@ -18,6 +18,7 @@ from services.redis_service import (
     SSHD_BOOTSTRAP_FAILED_TTL_SECONDS,
     SSHD_VERIFY_FAILED_MARKER,
     sshd_bootstrap_failed_key,
+    sshd_bootstrap_failed_stamp,
 )
 
 from ...const import DEFAULT_JOB_OWNER_LIUM, FILLER_CONTAINER_PREFIX
@@ -156,11 +157,13 @@ class SshdBootstrapCheck:
                     )
             return False
         # the dry-run pipeline must not start sshd in a filler
-        if not self.remove_fillers or not await self._running_filler_fails(ctx):
+        failing_filler = await self._running_filler_fails(ctx) if self.remove_fillers else None
+        if not failing_filler:
             return False
         if not settings.DRY_RUN:
             try:
-                await ctx.services.redis.set(key, "1", ex=SSHD_BOOTSTRAP_FAILED_TTL_SECONDS)
+                stamp = await self._running_filler_stamp(ctx, failing_filler)
+                await ctx.services.redis.set(key, stamp, ex=SSHD_BOOTSTRAP_FAILED_TTL_SECONDS)
             except Exception:
                 logger.warning(
                     _m("sshd bootstrap stamp could not be written", extra=get_extra_info(ctx.default_extra)),
@@ -187,14 +190,26 @@ class SshdBootstrapCheck:
             return False  # no verdict: the stamp stands
         return result.exit_status == 0
 
-    async def _running_filler_fails(self, ctx: Context) -> bool:
-        """Re-run the sshd bootstrap in each listed Lium filler; True if one ends with sshd not serving."""
+    async def _running_filler_stamp(self, ctx: Context, name: str) -> str:
+        """The failed filler's image and runtime as the stamp the next cycle re-probes in a fresh container."""
+        with contextlib.suppress(Exception):
+            result = await ctx.ssh.run(
+                f"/usr/bin/docker inspect -f '{{{{.Config.Image}}}} {{{{.HostConfig.Runtime}}}}' {shlex.quote(name)}",
+                timeout=30,
+            )
+            image, runtime = (result.stdout or "").split()
+            if result.exit_status == 0:
+                return sshd_bootstrap_failed_stamp(image, runtime == "sysbox-runc")
+        return "1"  # no image to re-probe: the stamp holds until its TTL, as before
+
+    async def _running_filler_fails(self, ctx: Context) -> str | None:
+        """Re-run the sshd bootstrap in each listed Lium filler; the first one whose sshd does not serve."""
         rented_data = ctx.state.rented_data
         if (
             not rented_data
             or rented_data.get_default_job_owner(ctx.executor.uuid) != DEFAULT_JOB_OWNER_LIUM
         ):
-            return False
+            return None
         for name in rented_data.get_filler_containers(ctx.executor.uuid):
             task_seconds_left = (
                 settings.JOB_TIME_OUT
@@ -202,7 +217,7 @@ class SshdBootstrapCheck:
                 - (time.monotonic() - ctx.started_at_monotonic)
             )
             if task_seconds_left < _MIN_PROBE_SECONDS:
-                return False
+                return None
             try:
                 result = await ctx.ssh.run(
                     running_filler_sshd_bootstrap_command(name),
@@ -211,8 +226,8 @@ class SshdBootstrapCheck:
             except Exception:
                 continue  # our own probe failing is no evidence against the node
             if SSHD_VERIFY_FAILED_MARKER in f"{result.stdout}{result.stderr}":
-                return True
-        return False
+                return name
+        return None
 
 
 async def remove_lium_fillers(ctx: Context, fillers: list[str]) -> list[str]:
