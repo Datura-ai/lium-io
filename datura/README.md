@@ -8,14 +8,12 @@ picked up by all three on their next `pdm install`.
 
 What lives here:
 
-- `datura/requests/` — the WebSocket message types the validator and the miner
-  exchange, as pydantic models: `validator_requests.py` (what the validator
+- `datura/requests/` — the message types the validator and the miner
+  exchange over the miner's REST API, as pydantic models: `validator_requests.py` (what the validator
   sends: authentication, SSH-key submit/remove, pod-log requests) and
   `miner_requests.py` (what the miner answers: accept/decline job, executor SSH
   info, generic error). `base.py` holds `BaseRequest`, which parses an incoming
   JSON frame into the right subclass by its `message_type`.
-- `datura/consumers/base.py` — `BaseConsumer`, the FastAPI WebSocket
-  receive/send loop both sides build their consumers on.
 - `datura/errors/protocol.py` — the protocol-level exceptions.
 
 Adding a message type means adding a model in the right `*_requests.py` and a

@@ -18,7 +18,6 @@ from datura.requests.miner_requests import (
 )
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 
-from consumers.validator_consumer import ValidatorConsumer
 from dependencies.auth import (
     authenticated_miner_hotkey,
     require_request_names_authenticated_miner,
@@ -31,12 +30,6 @@ from services.ssh_service import MinerSSHService
 logger = logging.getLogger(__name__)
 
 validator_router = APIRouter()
-
-
-@validator_router.websocket("/websocket/{validator_key}")
-async def validator_interface(consumer: Annotated[ValidatorConsumer, Depends(ValidatorConsumer)]):
-    if await consumer.connect():
-        await consumer.handle()
 
 
 @validator_router.post("/executors", response_model=ExecutorListResponse)
@@ -99,7 +92,6 @@ async def submit_ssh_pubkey(
 ) -> AcceptSSHKeyRequest | FailedRequest:
     """Submit SSH public key to miner (REST API version).
     
-    This endpoint mirrors the WebSocket SSHPubKeySubmitRequest handling.
     Requires authentication via headers: X-Validator-Hotkey, X-Miner-Hotkey, X-Timestamp, X-Signature.
     
     Args:
@@ -171,7 +163,6 @@ async def remove_ssh_pubkey(
 ) -> SSHKeyRemoved | FailedRequest:
     """Remove SSH public key from miner (REST API version).
     
-    This endpoint mirrors the WebSocket SSHPubKeyRemoveRequest handling.
     Requires authentication via headers: X-Validator-Hotkey, X-Miner-Hotkey, X-Timestamp, X-Signature.
     
     Args:
@@ -209,7 +200,6 @@ async def get_pod_logs(
 ) -> PodLogsResponse | FailedRequest:
     """Get pod logs from miner (REST API version).
     
-    This endpoint mirrors the WebSocket GetPodLogsRequest handling.
     Requires authentication via headers: X-Validator-Hotkey, X-Miner-Hotkey, X-Timestamp, X-Signature.
     
     Args:

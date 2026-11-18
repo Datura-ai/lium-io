@@ -5,7 +5,6 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI
 
-from consumers.validator_consumer import WS_MAX_MESSAGE_BYTES
 from core.config import settings
 from core.miner import Miner
 from routes.validator_interface import validator_router
@@ -40,4 +39,4 @@ app.include_router(validator_router)
 reload = True if settings.ENV == "dev" else False
 
 if __name__ == "__main__":
-    uvicorn.run("miner:app", host="0.0.0.0", port=settings.INTERNAL_PORT, reload=reload, ws_max_size=WS_MAX_MESSAGE_BYTES)
+    uvicorn.run("miner:app", host="0.0.0.0", port=settings.INTERNAL_PORT, reload=reload)
