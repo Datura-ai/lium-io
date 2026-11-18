@@ -2,7 +2,6 @@ from ctypes import *
 import sys
 import os
 import glob
-import difflib
 import http.client
 import json
 import re
@@ -864,9 +863,9 @@ def get_needrestart_guard(host_root="/proc/1/root"):
         if start + off >= len(flat):
             return unknowable(f"{main_path} line {main[-1][0]} ends inside the conf.d loader")
         bad = start + off
-        # before the anchor, a line is the edited loader line only if it still resembles it; else the loader
-        # line is missing there, and the anchor is where the loader visibly starts
-        if off < j and (bad < 0 or difflib.SequenceMatcher(None, flat[bad], loader[off]).ratio() < 0.6):
+        # anchored on the glob, the line before it is the (edited) opener only if it opens a block, however much
+        # its condition changed; a setting there means the opener is missing, and the glob is where the loader starts
+        if off < j and (bad < 0 or not flat[bad].endswith("{")):
             bad = i
         return unknowable(f"{main_path} line {main[bad][0]} differs from the stock conf.d loader")
     if at + len(loader) != len(main):
