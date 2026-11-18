@@ -324,6 +324,9 @@ class PipelineFactory:
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
+                # DAH-6566: right after the scrape, before any fatal check: writes the needrestart guard on hosts set up
+                # before 16 Nov, idle and rented alike, so apt never restarts sysbox-fs under running pods
+                NeedrestartGuardCheck(),
                 # Non-fatal, right after the scrape. A rented node that lost a GPU fails the fatal
                 # GPU checks below (DETAILS_MISMATCH, GPU_MISSING), which halt the cycle before
                 # TenantEnforcementCheck; this reports it to the backend on that same cycle.
@@ -357,8 +360,6 @@ class PipelineFactory:
                 # short-circuit so a rented host that has just lost its disk is reported too. The
                 # score is not changed until the reading is proven on live executors.
                 DiskHealthCheck(),
-                # hosts set up before 16 Nov lack the needrestart guard: pure data, non-fatal, rented hosts too
-                NeedrestartGuardCheck(),
                 # one NVML read, no CUDA: a card with uncorrected ECC or a pending row remap fails
                 # the node like a GPU ban (not fatal under a live pod), so it sits before the rented
                 # short-circuit
@@ -531,6 +532,9 @@ class PipelineFactory:
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
+                # DAH-6566: right after the scrape, before any fatal check: writes the needrestart guard on hosts set up
+                # before 16 Nov, idle and rented alike, so apt never restarts sysbox-fs under running pods
+                NeedrestartGuardCheck(),
                 RentedGpuDropCheck(),
                 GpuLossHoldCheck(),
                 GpuThermalThrottleCheck(),
@@ -544,8 +548,6 @@ class PipelineFactory:
                 GpuVramPrecheck(),
                 SpecFloorCheck(),
                 DiskHealthCheck(),
-                # hosts set up before 16 Nov lack the needrestart guard: pure data, non-fatal, rented hosts too
-                NeedrestartGuardCheck(),
                 GpuMemoryHealthCheck(),
                 CpuTruthCheck(),
                 GpuPowerLimitCheck(),
@@ -634,6 +636,8 @@ class PipelineFactory:
                 # StartGPUMonitorCheck(),  # SKIP: Starts processes on executor
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
+                # DAH-6566: same place as in build_checks(); under DRY_RUN it reports and writes nothing
+                NeedrestartGuardCheck(write=False),
                 # RentedGpuDropCheck: same place as in build_checks(); under DRY_RUN it logs and posts nothing.
                 RentedGpuDropCheck(),
                 # DAH-4457: same place as in build_checks(); under DRY_RUN it reads the hold and writes none.
@@ -652,8 +656,6 @@ class PipelineFactory:
                 SpecFloorCheck(),
                 # DAH-2928: pure-data report on specs.disk_health, same place as in build_checks.
                 DiskHealthCheck(),
-                # hosts set up before 16 Nov lack the needrestart guard: pure data, non-fatal, rented hosts too
-                NeedrestartGuardCheck(),
                 # one NVML read, no CUDA: safe in dry run, and a broken card is not rented out
                 GpuMemoryHealthCheck(),
                 # DAH-2671 item 2a: read-only SSH corroboration, safe in dry run (mutates nothing).

@@ -1000,6 +1000,13 @@ class NeedrestartGuardMessages:
             "(one per line). Writing the file restarts nothing."
         ),
     )
+    WRITTEN = MessageTemplate(
+        event="Host needrestart guard added",
+        reason="NEEDRESTART_GUARD_WRITTEN",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
     UNKNOWN = MessageTemplate(
         event="Host needrestart guard not reported",
         reason="NEEDRESTART_GUARD_UNKNOWN",

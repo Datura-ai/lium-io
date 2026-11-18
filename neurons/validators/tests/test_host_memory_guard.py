@@ -13,12 +13,8 @@ import pytest
 from services.host_memory_guard import (
     EXECUTOR_MEMORY_MIN_MIB,
     MIB,
-    NEEDRESTART_GUARD_FILE,
-    NEEDRESTART_GUARD_TEXT,
     UNIT_MEMORY_MIN_MIB,
     _host_memory_min_script,
-    _needrestart_guard_inner,
-    _needrestart_guard_script,
     apply_host_memory_guard,
     host_memory_guard_script,
     parse_guard_output,
@@ -157,32 +153,3 @@ async def test_unapplied_settings_log_a_warning_with_the_node_and_reason(caplog)
     assert len(warning) == 1
     extra = warning[0].msg.extra
     assert extra["executor_uuid"] == "node-1" and extra["failed"] == ["memory_min no_systemd"]
-
-
-def _run_needrestart_guard(tmp_path):
-    out = subprocess.run(["sh", "-c", _needrestart_guard_inner(str(tmp_path))], capture_output=True, text=True, check=True)
-    return out.stdout.strip()
-
-
-def test_needrestart_guard_is_written_where_needrestart_runs_and_left_alone_once_there(tmp_path):
-    (tmp_path / "usr/sbin").mkdir(parents=True)
-    (tmp_path / "usr/sbin/needrestart").write_text("")
-
-    first, second = _run_needrestart_guard(tmp_path), _run_needrestart_guard(tmp_path)
-
-    assert first == "needrestart_guard_set host"
-    assert second == ""
-    assert (tmp_path / NEEDRESTART_GUARD_FILE.lstrip("/")).read_text() == NEEDRESTART_GUARD_TEXT + "\n"
-    assert parse_guard_output(first)["set"] == ["needrestart_guard host"]
-
-
-def test_needrestart_guard_is_not_written_without_needrestart(tmp_path):
-    assert _run_needrestart_guard(tmp_path) == "needrestart_guard_skipped no_needrestart"
-    assert not (tmp_path / "etc").exists()
-
-
-def test_needrestart_guard_matches_the_setup_script_and_reads_present():
-    setup = open(os.path.join(os.path.dirname(__file__), "../../executor/nvidia_docker_sysbox_setup.sh")).read()
-    assert "<<'NRCONF'\n" + NEEDRESTART_GUARD_TEXT + "\nNRCONF" in setup
-    assert _needrestart_guard_script() in host_memory_guard_script()
-

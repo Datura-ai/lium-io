@@ -4,10 +4,18 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
-from neurons.validators.src.services.task.checks.needrestart_guard import NeedrestartGuardCheck
+from neurons.validators.src.services.task.checks.needrestart_guard import (
+    NEEDRESTART_GUARD_TEXT,
+    NeedrestartGuardCheck,
+    needrestart_guard_inner,
+    needrestart_guard_script,
+)
 from neurons.validators.src.services.task.messages import NeedrestartGuardMessages as Msg
 from neurons.validators.tests.helpers import build_scrape_namespace
 
@@ -222,20 +230,59 @@ def test_no_host_view_raises_so_the_scrape_reports_unknown():
         _read(Path("/"))
 
 
+def _ssh(stdout: str):
+    return SimpleNamespace(run=AsyncMock(return_value=SimpleNamespace(exit_status=0, stdout=stdout, stderr="")))
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("guard", ["missing", "partial"])
 @pytest.mark.parametrize("rented", [False, True])
-async def test_an_unguarded_host_warns_and_keeps_its_score(context_factory, guard, rented):
+async def test_an_unguarded_host_gets_the_guard_written_and_keeps_its_score(context_factory, guard, rented):
     specs = {"needrestart_guard": guard, "needrestart_guard_unguarded": ["sysbox"]}
     state = build_state(specs=specs, rented_data=_rented_data() if rented else None)
+    ssh = _ssh("needrestart_guard_set host\n")
 
-    result = await NeedrestartGuardCheck().run(context_factory(state=state))
+    result = await NeedrestartGuardCheck().run(context_factory(state=state, ssh=ssh))
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.WRITTEN.reason
+    assert not result.updates
+    assert ssh.run.await_args.args[0] == needrestart_guard_script()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stdout", ["needrestart_guard_failed host write_denied\n", "needrestart_guard_skipped no_nsenter\n"])
+async def test_a_host_the_write_does_not_reach_warns_and_keeps_its_score(context_factory, stdout):
+    state = build_state(specs={"needrestart_guard": "missing"})
+
+    result = await NeedrestartGuardCheck().run(context_factory(state=state, ssh=_ssh(stdout)))
 
     assert result.passed is True
     assert result.event.reason_code == Msg.MISSING.reason
     assert result.event.severity == "warning"
-    assert not result.updates
     assert GUARD in Msg.MISSING.remediation
+
+
+@pytest.mark.asyncio
+async def test_an_ssh_error_in_the_write_never_fails_the_check(context_factory):
+    ssh = SimpleNamespace(run=AsyncMock(side_effect=OSError("connection lost")))
+
+    result = await NeedrestartGuardCheck().run(context_factory(state=build_state(specs={"needrestart_guard": "missing"}), ssh=ssh))
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.MISSING.reason
+
+
+@pytest.mark.asyncio
+async def test_dry_run_writes_nothing(context_factory):
+    ssh = _ssh("")
+
+    result = await NeedrestartGuardCheck(write=False).run(
+        context_factory(state=build_state(specs={"needrestart_guard": "missing"}), ssh=ssh)
+    )
+
+    assert result.event.reason_code == Msg.MISSING.reason
+    ssh.run.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -244,14 +291,26 @@ async def test_an_unguarded_host_warns_and_keeps_its_score(context_factory, guar
     [
         ({"needrestart_guard": "present"}, Msg.OK.reason),
         ({"needrestart_guard": "no_needrestart"}, Msg.OK.reason),
-        ({}, Msg.UNKNOWN.reason),  # old scrape or no host view: unknown, never a warning
+        ({}, Msg.UNKNOWN.reason),  # old scrape or no host view, and the write did not run: unknown, never a warning
     ],
 )
 async def test_guarded_or_unknown_hosts_pass_quietly(context_factory, specs, reason):
-    result = await NeedrestartGuardCheck().run(context_factory(state=build_state(specs=specs)))
+    ssh = _ssh("needrestart_guard_skipped no_needrestart\n")
+
+    result = await NeedrestartGuardCheck().run(context_factory(state=build_state(specs=specs), ssh=ssh))
 
     assert result.passed is True
     assert result.event.reason_code == reason
+    assert ssh.run.await_count == (0 if specs else 1)
+
+
+@pytest.mark.parametrize("pipeline", ["build_checks", "build_fast_path_checks", "build_dry_run_checks"])
+def test_the_guard_runs_right_after_the_scrape_before_any_fatal_check(pipeline):
+    from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
+
+    names = [type(c).__name__ for c in getattr(PipelineFactory, pipeline)()]
+
+    assert names[names.index("MachineSpecScrapeCheck") + 1] == "NeedrestartGuardCheck"
 
 
 @pytest.mark.parametrize(
@@ -361,13 +420,27 @@ def test_an_overlapping_entry_outside_override_rc_is_not_a_restart_rule(tmp_path
 
 
 def test_a_host_without_the_guard_reads_present_once_the_validator_writes_it(tmp_path):
-    import subprocess
-
-    from services.host_memory_guard import _needrestart_guard_inner
-
     host = _host(tmp_path, None)
     assert _read(host)[0] == "missing"
 
-    subprocess.run(["sh", "-c", _needrestart_guard_inner(str(host))], check=True)
+    subprocess.run(["sh", "-c", needrestart_guard_inner(str(host))], check=True)
 
     assert _read(host) == ("present", [])
+
+
+def test_the_written_guard_is_exactly_the_setup_scripts(tmp_path):
+    assert NEEDRESTART_GUARD_TEXT == _setup_script_guard()
+    host = _host(tmp_path, None)
+
+    first = subprocess.run(["sh", "-c", needrestart_guard_inner(str(host))], capture_output=True, text=True, check=True)
+    second = subprocess.run(["sh", "-c", needrestart_guard_inner(str(host))], capture_output=True, text=True, check=True)
+
+    assert (first.stdout, second.stdout) == ("needrestart_guard_set host\n", "")
+    assert (host / GUARD.lstrip("/")).read_text() == _setup_script_guard() + "\n"
+
+
+def test_no_guard_is_written_without_needrestart(tmp_path):
+    out = subprocess.run(["sh", "-c", needrestart_guard_inner(str(tmp_path))], capture_output=True, text=True, check=True)
+
+    assert out.stdout == "needrestart_guard_skipped no_needrestart\n"
+    assert not (tmp_path / "etc").exists()
