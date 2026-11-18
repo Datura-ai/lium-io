@@ -1,3 +1,4 @@
+import time
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -126,6 +127,10 @@ class JobResult(BaseModel):
     # Such a copy under the keeper's own executor UUID: one backend row, so it is not published
     # and the row hears only the copy that kept the score.
     duplicate_shares_kept_row: bool = Field(default=False, exclude=True)
+    # DAH-6596: when what this result says was observed (time.monotonic()): its construction, or for a row from the
+    # miner's answer the answer itself. Such a row observed before an express pass of the same node under the same
+    # cycle id is older news than that pass and is not published.
+    observed_at: float = Field(default_factory=time.monotonic, exclude=True)
     # DAH-4658: the node's last scored result, standing in for a scrape the renter's GPU reset hid the cards
     # from; scored like the cycle it came from, never published
     carried_for_renter_gpu_reset: bool = Field(default=False, exclude=True)
@@ -162,6 +167,11 @@ class JobResult(BaseModel):
     # the share of its own spot rate a spot node is paid: below 1 when its GPU model's spot nodes would
     # together be paid more than the model's fillers earn per hour (filler_revenue_usd_per_hour)
     spot_pool_multiplier: float | None = None
+    # DAH-5944: idle spot GPUs have their own cap per (GPU model, bucket) at the secure numbers. Kept apart
+    # from max_cap / total_unrented_by_gpu_type / unrented_cap_multiplier, which mean a secure tier.
+    spot_cap: int | None = None
+    spot_gpus_in_bucket: int | None = None
+    spot_cap_multiplier: float | None = None
     # Spot pay and secure-floor top-ups are paid on top of the burn-capped rental share:
     # unbucketed_share is the emission share that pays them, unbucketed_rental_cost their USD/hour,
     # floor_top_up_rate the per-GPU USD/hour the floor added to this node (after its multipliers),

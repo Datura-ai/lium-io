@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import dataclasses
 import json
 import os
 import time
@@ -19,7 +21,7 @@ from services.default_docker_image_digest_service import (
     fetch_executor_image_digest,
 )
 from services.docker_service import DockerService
-from services.executor_image_policy import build_expected_image_snapshot
+from services.executor_image_policy import build_expected_image_snapshot, normalize_sha256_digest
 from services.executor_rollout import (
     ROLLOUT_GRACE,
     ExecutorRolloutTracker,
@@ -30,6 +32,8 @@ from services.executor_rollout import (
     remember_rented_scored_results,
     withhold_renter_gpu_reset_verdicts,
     withhold_rollout_verdicts,
+    session_kept_hotkeys,
+    withhold_session_lost_verdicts,
 )
 from services.executor_connectivity.container_runner import ContainerRunner
 from services.executor_connectivity.dind_probe import DindProbe, DindVerifier
@@ -65,6 +69,9 @@ from services.ssh_service import SSHService
 logger = get_logger(__name__)
 
 SYNC_CYCLE = 12
+# DAH-6011: on a rollout's SIGTERM the running cycle may finish for this long; the pod's
+# terminationGracePeriodSeconds must be longer, or the kubelet's SIGKILL still cuts the cycle.
+STOP_CYCLE_WAIT_SECONDS = 25 * 60
 WEIGHT_MAX_COUNTER = 6
 MINER_SCORES_KEY = "miner_scores"
 # accepted submissions whose inclusion the backend has not acknowledged yet, {tempo_index: block}, each retried
@@ -457,6 +464,13 @@ class Validator:
                 # early return and before the first job of this cycle runs against the new digest,
                 # so an aborted iteration does not count as a cycle of the window.
                 rollout_window = await self.observe_executor_rollout(executor_digest, job_block)
+                if rollout_window.previous_reads_current(job_block):
+                    # DAH-6560: no OUTDATED mark for the release Watchtower is still rolling out (8 cycles;
+                    # the verdict-withholding window above stays at its own 2-cycle cap)
+                    executor_image_snapshot = dataclasses.replace(
+                        executor_image_snapshot,
+                        rollout_previous_digest=normalize_sha256_digest(rollout_window.previous_digest),
+                    )
 
                 logger.info(
                     _m(
@@ -693,7 +707,7 @@ class Validator:
                         miner_hotkey
                         for miner_hotkey, results in all_job_results.items()
                         if any(result.is_successful or result.duplicate_kept_by for result in results)
-                    } | {withheld.miner_hotkey for withheld in withheld_results}
+                    } | session_kept_hotkeys(withheld_results)
 
                     incentive = IncentiveFactory.create(
                         config=self.incentive,
@@ -802,22 +816,16 @@ class Validator:
                         )
                         # DAH-5635: a node published early gets back what the last cycle published for it
                         if self.miner_service.outage_tally is not None:
-                            self.miner_service.outage_tally.restore_published_early(
-                                cycle_results, self.miner_service.cycle_published_availability
-                            )
+                            published = self.miner_service.cycle_published_availability
+                            for miner_hotkey, results in incentive.job_results.items():
+                                mine = {uuid: e for (hotkey, uuid), e in published.items() if hotkey == miner_hotkey}
+                                self.miner_service.outage_tally.restore_published_early(results, mine)
 
                     # each node's pod SSH observations ride on its result; a probed rented
                     # node the cycle has no result for gets one carrying only them. A withheld
                     # executor has a result this cycle, held back, so it gets none.
                     pod_ssh = await pod_ssh_probe
-                    reported = attach_pod_ssh(incentive.job_results, pod_ssh) | {
-                        str(withheld.result.executor_info.uuid).lower() for withheld in withheld_results
-                    }
-                    result_missing = (
-                        pod_ssh_only_results(rented_executors, pod_ssh, reported, job_batch_id)
-                        if settings.RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED
-                        else {}
-                    )
+                    with_result = attach_pod_ssh(incentive.job_results, pod_ssh)
 
                     # Publish machine specs
                     published_executor_ids: list[str] = []
@@ -835,9 +843,26 @@ class Validator:
                                 if result.executor_info.uuid != FAILED_MINER_EXECUTOR_UUID
                             )
 
+                    # built after the spec publish awaits: an express pass landing meanwhile must count too
+                    reported = (
+                        with_result
+                        | {str(withheld.result.executor_info.uuid).lower() for withheld in withheld_results}
+                        # the express lane's result under this cycle's id stands: no observations-only one over it
+                        | {
+                            uuid
+                            for uuid, batch in self.miner_service.express_published.items()
+                            if batch == job_batch_id
+                        }
+                    )
+                    result_missing = (
+                        pod_ssh_only_results(rented_executors, pod_ssh, reported, job_batch_id)
+                        if settings.RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED
+                        else {}
+                    )
                     # Not the whole miner's batch, not scored: no scored_at, and not "validated" for
                     # the express lane below.
                     await self.publish_result_missing(result_missing, miners, miner_coldkeys, job_batch_id)
+                    await self.publish_session_lost_findings(withheld_results, miner_coldkeys, pod_ssh)
 
                     # DAH-3405: a withheld executor was handled by this cycle too — the express
                     # lane must not treat it as never validated and run a first pass on it.
@@ -1573,7 +1598,38 @@ class Validator:
         standing, withheld_results = withhold_rollout_verdicts(all_job_results, window, job_block)
         await self.record_withheld_verdicts(window, withheld_results, job_batch_id, job_block)
         standing, held_for_gpu_reset = withhold_renter_gpu_reset_verdicts(standing)
-        return standing, withheld_results + held_for_gpu_reset
+        standing, session_lost = withhold_session_lost_verdicts(standing)
+        return standing, withheld_results + held_for_gpu_reset + session_lost
+
+    async def publish_session_lost_findings(
+        self,
+        withheld_results: list[WithheldVerdict],
+        miner_coldkeys: dict[str, str | None],
+        pod_ssh: dict[str, list] | None = None,
+    ) -> None:
+        """DAH-5718: a run whose session died in the port check has no score, but what its finished checks found (a
+        GPU safety failure) still hides the node, and its rented pods' SSH observations still go out (review
+        4470167895: billing reads a silent pod from them). Unscored (scored_at None) and not the miner's whole batch,
+        like an early publish; with no finding availability_errors stays None, so the stored reasons are left alone.
+        A finding goes out alone: the backend merges a session-lost report by reason code, and a validator-side copy
+        of the earlier list goes stale (an express recheck clears a hold; review 4510532986). A run with neither
+        publishes nothing."""
+        pod_ssh = pod_ssh or {}
+        for withheld in withheld_results:
+            result = withheld.result
+            executor_uuid = str(result.executor_info.uuid).lower()
+            miner_coldkey = miner_coldkeys.get(withheld.miner_hotkey)
+            if not result.session_lost_in_port_check or not miner_coldkey:
+                continue
+            result.pod_ssh = pod_ssh.get(executor_uuid, result.pod_ssh)
+            if not result.availability_errors:
+                result.availability_errors = None  # no finding: None leaves the stored reasons alone
+            # review 4482976707: a reaped container's state (StaleContainerCleanupCheck) goes out too
+            if not result.availability_errors and not result.pod_ssh and not result.pod_states:
+                continue
+            await self.miner_service.publish_machine_specs(
+                [result], withheld.miner_hotkey, miner_coldkey, is_whole_miner_batch=False
+            )
 
     async def record_withheld_verdicts(
         self,
@@ -1620,7 +1676,6 @@ class Validator:
         )
         try:
             await self.initiate_services()
-            self.should_exit = False
 
             if not settings.DRY_RUN:
                 # DAH-2958: ticks beside the cycle on this loop; coordination through
@@ -1637,8 +1692,10 @@ class Validator:
 
             while not self.should_exit:
                 await self.sync()
-                self.should_exit = settings.DRY_RUN
-                if not settings.DRY_RUN:
+                # DAH-6011: only set, never cleared here, so a shutdown that lands mid-cycle ends the loop
+                if settings.DRY_RUN:
+                    self.should_exit = True
+                else:
                     await asyncio.sleep(SYNC_CYCLE)
 
         except KeyboardInterrupt:
@@ -1656,6 +1713,25 @@ class Validator:
                     extra=get_extra_info({**self.default_extra, "error": str(e)}),
                 ),
             )
+
+    async def finish_running_cycle(self, task: asyncio.Task, wait_seconds: float = STOP_CYCLE_WAIT_SECONDS) -> bool:
+        """DAH-6011: no new cycle starts, and the running one (if any) finishes, within `wait_seconds`.
+        Past it the cycle is cancelled. True when it finished."""
+        self.should_exit = True
+        try:
+            await asyncio.wait_for(asyncio.shield(task), wait_seconds)
+            return True
+        except TimeoutError:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            logger.warning(
+                _m(
+                    "[stop] Running cycle did not finish in time; cancelled",
+                    extra=get_extra_info({**self.default_extra, "wait_seconds": wait_seconds}),
+                ),
+            )
+            return False
 
     async def stop(self):
         logger.info(

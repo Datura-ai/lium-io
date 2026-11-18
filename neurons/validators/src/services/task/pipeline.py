@@ -27,8 +27,8 @@ from services.inspector_validation_service import InspectorValidationService
 from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import PodContainerState
-from .availability import REASONS_THAT_HIDE_AT_ONCE
-from .messages import RentalVerificationMessages, TenantEnforcementMessages, render_message
+from .availability import REASONS_THAT_HIDE_AT_ONCE, AvailabilityErrorCode
+from .messages import NodeAccountMessages, RentalVerificationMessages, TenantEnforcementMessages, render_message
 from .models import ValidationEvent
 from .runner import SSHCommandResult, SSHCommandRunner
 
@@ -76,6 +76,42 @@ class PodRecoverer(Protocol):
         container_error: str | None,
         default_extra: dict[str, Any],
     ) -> bool: ...
+
+    async def recover_parked_pod_container(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_info: ExecutorSSHInfo,
+        miner_hotkey: str,
+        private_key: str,
+        container_name: str,
+        pod_id: str,
+        local_volume_path: str | None,
+        default_extra: dict[str, Any],
+        stopped_by_recovery: bool = False,
+    ) -> bool: ...
+
+    async def encrypted_volume_mount_missing(
+        self, ssh_client: asyncssh.SSHClientConnection, container_name: str, plaintext_path: str | None
+    ) -> bool: ...
+
+    async def restore_volume_mount_of_running_container(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_info: ExecutorSSHInfo,
+        private_key: str | None,
+        container_name: str,
+        pod_id: str,
+        local_volume_path: str | None,
+        default_extra: dict[str, Any],
+    ) -> bool: ...
+
+    async def unmounted_stop_outcome(self, pod_id: str) -> str | None: ...
+
+    async def forget_recovery_stop(self, pod_id: str) -> None: ...
+
+    async def recovery_stop_pending(self, pod_id: str) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -141,6 +177,9 @@ class ContextState:
     upload_remote_dir: Optional[str] = None
     remote_dir: Optional[str] = None
     specs: dict[str, Any] = field(default_factory=dict)
+    # The normalized scrape document before later checks write into it; None when this cycle used
+    # the liumd document instead of the Python scrape.
+    scrape_specs: dict[str, Any] | None = None
     gpu_model: Optional[str] = None
     gpu_count: Optional[int] = None
     gpu_details: list[dict] = field(default_factory=list)
@@ -175,6 +214,11 @@ class ContextState:
     # DAH-5244: this cycle's verified ports and sysbox were republished from the last completed check's memory,
     # not measured; a consumer that keeps "last good ports" must not store them as fresh.
     port_check_deferred: bool = False
+    # VerifyXCheck skipped its run for a standing rental-probe failure; RentalProbeCheck then never passes the cycle
+    verifyx_skipped_for_standing_probe_failure: bool = False
+    # CapabilityCheck skipped the enforced all-cards work proof for a standing rental-probe failure; RentalProbeCheck
+    # then never passes the cycle either
+    allcards_skipped_for_standing_probe_failure: bool = False
     # DAH-5981: the error of this cycle's port probe when the SSH connection dropped mid-probe; None otherwise.
     # PortCountCheck then reports the lost connection, not a port shortfall it never measured.
     port_probe_connection_lost: str | None = None
@@ -214,6 +258,12 @@ class ContextState:
     # not attempted or fell back entirely; the capability and VerifyX checks consume a judged
     # step when present and run over SSH otherwise.
     local_verify: LocalVerifyOutcome | None = None
+    # The liumd shadow's docker and ports read, started right after machine_scrape so both see the
+    # same containers; awaited by the shadow at the end of the run. None = no shadow for this node.
+    liumd_shadow_facts_task: Any = None
+    # True once machine_scrape has tried to start that read, so a later shadow never falls back
+    # to a different Docker moment.
+    liumd_shadow_facts_attempted: bool = False
     # DAH-5462: VerifyX's cold first sample, re-measured by VerifyXColdRetryCheck just before scoring
     verifyx_cold_retry: Any = None
 
@@ -267,6 +317,8 @@ class Context(BaseModel):
     # Set by GpuFingerprintCheck when the node lists a full set of other GPUs (full_set_changed): ResultHandler
     # makes this cycle's set the anchor.
     gpu_reanchor: bool = False
+    # Set by SpecChangeCheck: the reset records this cycle's model:count, so the next cycle audits the node as it is now
+    gpu_respec: bool = False
     collateral_deposited: bool = False
     contract_version: str | None = None
     is_rental_succeed: bool = False
@@ -285,6 +337,8 @@ class Context(BaseModel):
     # False only once CpuTruthCheck sees a mismatch under enforcement; the score gate lives in
     # calculate_scores because the check is non-fatal and ScoreCheck runs after it.
     cpu_truth_passed: bool = True
+    # False only once SpecFloorCheck fails a node under a live rental (fatal otherwise); gated in calculate_scores.
+    spec_floor_passed: bool = True
     # False only once ProviderSideLoadCheck sees provider-side CPU/disk above the floors under
     # enforcement; the score gate lives in calculate_scores for the same reason as above.
     provider_side_load_passed: bool = True
@@ -322,6 +376,12 @@ class Context(BaseModel):
     # False once GpuKernelCountCheck finds a kernel list shorter than the reported count; the
     # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
     gpu_kernel_count_passed: bool = True
+    # False once a card is below its reported GPU model (DAH-6241); non-fatal on a live rental, so the score
+    # gate lives in calculate_scores.
+    gpu_model_passed: bool = True
+    # False once NodeAccountCheck finds the node on another account's machine (DAH-6539); non-fatal on a live
+    # rental, so the score gate lives in calculate_scores.
+    node_account_passed: bool = True
     # G1 — NVIDIA CC GPU attestation outcome: True/False when verified, None when
     # not performed (non-CVM node, no evidence supplied, or NRAS undeterminable).
     gpu_attestation_passed: bool | None = None
@@ -347,6 +407,7 @@ class EventSink(Protocol):
 PROVIDER_STATE_REASON_CODES: frozenset[str] = frozenset(
     {
         "EXECUTOR_IMAGE_OUTDATED",
+        "EXECUTOR_IMAGE_UNOFFICIAL",
         "PROVIDER_BANNED",
         "PROVIDER_SIDE_LOAD_ABOVE_LIMIT",
     }
@@ -591,25 +652,39 @@ def _not_terminal(ran: _RanCheck) -> _RanCheck:
     return replace(ran, result=ran.result.model_copy(update={"fatal": False, "halt": False}))
 
 
+_NOT_THE_ACCOUNTS_MACHINE = frozenset(
+    {NodeAccountMessages.MISMATCH.reason, NodeAccountMessages.BINDING_UNVERIFIED.reason}
+)
+
+
 def _a_finding(ran: _RanCheck) -> bool:
     # a fault the check finished reading stays the run's verdict: hiding the node and publishing it key on the last event;
     # its extra events count too (the GPU recheck's failure carries GPU_LOST there)
+    # NODE_ACCOUNT_UNVERIFIED is a read that did not finish, not a fault read off the node: a dropped session is
+    # reconnected and the read run again (DAH-6539, Sergej lio#2288 at 72215ea)
     return any(
-        event.is_availability_error or event.reason_code in REASONS_THAT_HIDE_AT_ONCE
+        (event.is_availability_error or event.reason_code in REASONS_THAT_HIDE_AT_ONCE)
+        and event.reason_code != AvailabilityErrorCode.NODE_ACCOUNT_UNVERIFIED
         for event in [ran.result.event, *ran.result.extra_events]
     )
 
 
-def _session_lost(ran: list[_RanCheck], ctx: Context) -> _RanCheck:
-    failed = next(r for r in ran if not r.result.passed)
+def _session_lost(ran: list[_RanCheck], ctx: Context, step: "Check | ParallelStage | None" = None) -> _RanCheck:
+    # the failed check names the event; after a failed reconnect the run may have no failure (or nothing ran)
+    failed = next((r for r in ran if not r.result.passed), ran[-1] if ran else None)
+    if failed is None:
+        chk = step.checks[-1] if isinstance(step, ParallelStage) else step
+        before, at = ctx.state, time.perf_counter()
+    else:
+        chk, before, at = failed.check, failed.before_state, failed.finished
     event = render_message(
         TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE,
         ctx=ctx,
-        check_id=failed.check.check_id,
+        check_id=chk.check_id,
         what={"executor_uuid": ctx.executor.uuid, "transport_error": "SSH session closed under the check"},
     )
     result = CheckResult(passed=False, event=event, fatal=True)
-    return _RanCheck(failed.check, result, failed.before_state, failed.finished, failed.finished, in_steps=False)
+    return _RanCheck(chk, result, before, at, at, in_steps=False)
 
 
 def _replays_after_session_drop(step: "Check | ParallelStage") -> bool:
@@ -626,7 +701,10 @@ class Pipeline:
         reconnect: Callable[[], Awaitable[asyncssh.SSHClientConnection]] | None = None,
     ):
         """`reconnect` opens a fresh session to the same node; without it a dropped session ends the run as before."""
-        self.checks = checks
+        # DAH-6442: a check with `on_completion` runs once the run has ended, however it ended (passed, a fatal
+        # failure or a halt), so a fatal check before it can never leave its host-side cleanup undone
+        self.checks = [chk for chk in checks if not getattr(chk, "on_completion", False)]
+        self.on_completion = [chk for chk in checks if getattr(chk, "on_completion", False)]
         self.sink = sink
         self.reconnect = reconnect
         # one reconnect per run: a session that drops again stands as the transport failure it is
@@ -727,6 +805,9 @@ class Pipeline:
                         extra={**ctx.default_extra, "error": repr(exc)[:300]},
                     )
                 )
+                # the node refused the new session: the run ends here on the transport failure, whether the step
+                # passed or raised, never carrying on over the dead session or ending with no verdict
+                return [*(_not_terminal(r) for r in ran), _session_lost(ran, ctx, step)], ctx
             else:
                 logger.warning(
                     _m(
@@ -769,6 +850,22 @@ class Pipeline:
         return current_ctx.model_copy(update=updates)
 
     async def run(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
+        passed, events, end_ctx = await self._run_checks(ctx)
+        # another account's machine answered, or the machine could not be confirmed as the account's (a read that
+        # still failed after the reconnect, which a relay can cause): no completion step touches it (DAH-6539)
+        if any(event.reason_code in _NOT_THE_ACCOUNTS_MACHINE for event in events):
+            return passed, events, end_ctx
+        for chk in self.on_completion:
+            try:
+                res = await chk.run(end_ctx)
+            except Exception as exc:  # noqa: BLE001 — a completion step never changes the run's verdict
+                logger.warning(_m("Completion check failed", extra={**end_ctx.default_extra, "error": repr(exc)[:300]}))
+                continue
+            # reported, but not one of the run's events: the verdict and its publication read the last of those
+            await self.sink.emit(res.event)
+        return passed, events, end_ctx
+
+    async def _run_checks(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
         events: list[ValidationEvent] = []
         current_ctx = ctx
         pipeline_start_time = time.perf_counter()

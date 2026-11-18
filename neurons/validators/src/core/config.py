@@ -140,6 +140,8 @@ class Settings(BaseSettings):
     BACKEND_COMMAND_CLAIM_TTL_SECONDS: int = Field(default=60, gt=0)
     BACKEND_COMMAND_HEARTBEAT_SECONDS: float = Field(default=20, gt=0)
     BACKEND_COMMAND_ANSWER_TTL_SECONDS: int = Field(default=900, gt=0)
+    # DAH-5592: how long a host-fault create failure is sent again on each new backend socket (redis_service)
+    HOST_FAULT_FAILURE_RESEND_SECONDS: int = Field(default=2 * 3600, gt=0)
     COMPUTE_APP_URI: str = Field(env="COMPUTE_APP_URI", default="wss://lium.io/api")
     COMPUTE_REST_API_URL: str | None = Field(
         env="COMPUTE_REST_API_URL", default="https://lium.io/api"
@@ -169,18 +171,11 @@ class Settings(BaseSettings):
     # ticket-0494: how long a DinD probe's sysbox pass is remembered for a rented executor whose later
     # probes cannot reach the host (PortConnectivityCheck). Refreshed by every passing probe.
     SYSBOX_VERIFIED_TTL_SECONDS: int = Field(env="SYSBOX_VERIFIED_TTL_SECONDS", default=24 * 3600, gt=0)
-    DISCORD_INCENTIVE_CUTOFF: datetime = datetime(2026, 6, 15, 12, 0, 0)
 
-    # DAH-2265: cached-template requirement. Before the cutoff the CachedTemplateVerificationCheck
-    # is purely advisory (publishes recommended_image_cached / recommended_image_digest_match to
-    # executor.specs, never changes score). On/after the cutoff that check turns critical: an
-    # unrented executor that has not pre-pulled the recommended default image, or holds stale
-    # content under the same tag, fails verification early (score 0, reason surfaced to the
-    # provider). Fails open: an unmeasured signal (None) is never penalised.
-    # The cutoff has elapsed and CachedTemplateVerificationCheck is fatal again, so the gate is
-    # live: unrented executors are enforced, rented ones are exempt (the check runs after the
-    # tenant short-circuit).
-    CACHED_TEMPLATE_CUTOFF: datetime = datetime(2026, 7, 14, 12, 0, 0)
+    # DAH-2265: cached-template requirement. An unrented executor that has not pre-pulled the
+    # recommended default image, or holds stale content under the same tag, fails
+    # CachedTemplateVerificationCheck (score 0, reason surfaced to the provider); rented ones are
+    # exempt. Fails open: an unmeasured signal (None) is never penalised.
     # A node this validator has just found without its recommended image is held as pending, not
     # failed, until the executor's first pre-pull sweep completes or GRACE_SECONDS after that first
     # sighting, whichever comes first. The express lane verifies a new node seconds after it is
@@ -191,11 +186,9 @@ class Settings(BaseSettings):
 
     # Minimum NVIDIA driver requirement. Compared as a dotted version tuple against the
     # executor's reported gpu.driver (e.g. "580.95.05"). 580.65.06 is the r580 floor that
-    # ships CUDA 13.0. Before MIN_DRIVER_CUTOFF providers get a grace period (no penalty);
-    # on/after the cutoff, non-compliant unrented executors are fully gated (multiplier 0).
+    # ships CUDA 13.0. Non-compliant unrented executors are fully gated (multiplier 0).
     # Currently-rented executors are always exempt.
     MIN_NVIDIA_DRIVER_VERSION: str = Field(env="MIN_NVIDIA_DRIVER_VERSION", default="580.65.06")
-    MIN_DRIVER_CUTOFF: datetime = datetime(2026, 6, 30, 12, 0, 0)
 
     TIME_DELTA_FOR_EMISSION: float = 0.01
 
@@ -323,6 +316,13 @@ class Settings(BaseSettings):
     # measurements are still taken and published; only the amount of RAM/disk written shrinks.
     FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB: int = Field(env="FIRST_PASS_VERIFYX_MEMORY_MAX_TEST_GB", default=16)
     FIRST_PASS_VERIFYX_STORAGE_TEST_GB: int = Field(env="FIRST_PASS_VERIFYX_STORAGE_TEST_GB", default=1)
+    # The first pass's shortest VerifyX network wait (package try, each speed-test direction). The
+    # library sizes each wait from its transfer at the acceptance floor plus a margin, between this and
+    # VERIFYX NETWORK_TIMEOUT_SECONDS, and gives a failed package one sized try plus a 10 s retry: a slow
+    # mirror cost a new node 4 min at two 120 s tries, while a healthy node at the floor still has time
+    # for a 500 MiB package. Cycle challenges send no floor and keep the full wait. A library without
+    # sizing ignores the keys and waits the full time.
+    FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS: int = Field(env="FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS", default=45)
     # liumd phase 1 (DAH-2834): for an executor whose `/version` advertises `local_verify/1`, run the
     # capability matmul and VerifyX with ONE signed `POST /verify` instead of the SSH commands, and
     # judge the answer with the same unseal/verify code. The POST travels through a direct-tcpip
@@ -342,16 +342,36 @@ class Settings(BaseSettings):
     # `[liumd_shadow] comparison` line per node (per-step verdicts, agreement, durations). Nothing
     # it finds is scored or stored: the result is built before it starts. Off: nothing new runs.
     VALIDATOR_LIUMD_SHADOW: bool = Field(env="VALIDATOR_LIUMD_SHADOW", default=False)
+    # Use the full machine-scrape document returned by the same early `liumd run` instead of
+    # running the Python machine scrape. Off: Python remains authoritative and the early run is
+    # only compared in the shadow.
+    VALIDATOR_LIUMD_SPECS: bool = Field(env="VALIDATOR_LIUMD_SPECS", default=False)
+    # Prod repair path: fetch the liumd manifest from lium-io main and replace a missing/stale
+    # /usr/local/bin/liumd only after the manifest sha256 matches.
+    LIUMD_BINARY_REFRESH_ENABLED: bool = Field(env="LIUMD_BINARY_REFRESH_ENABLED", default=False)
+    LIUMD_BINARY_MANIFEST_URL: str = Field(
+        env="LIUMD_BINARY_MANIFEST_URL",
+        default="https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/liumd/manifest.json",
+    )
+    LIUMD_BINARY_PATH: str = Field(env="LIUMD_BINARY_PATH", default="/usr/local/bin/liumd")
     # The shadow's whole-call budget (seconds), clipped to what the executor task has left; the
     # intent's `deadline_s` is this − 30. Sized for a scored cycle, where VerifyX (p90 about 150 s)
     # and the matmul (at most 120 s) run one after the other.
     LIUMD_SHADOW_TIMEOUT_SECONDS: int = Field(env="LIUMD_SHADOW_TIMEOUT_SECONDS", default=330)
-    # The only executors the shadow runs on: reserved, non-rentable dev executors, as
-    # comma-separated `miner_hotkey/executor_uuid/address/ssh_port` entries. A pod or filler started
-    # after the cycle's snapshot is not seen, so on a rentable node the shadow could run its
-    # GPU/RAM/disk/network probe next to a workload. Executor UUIDs are miner-chosen, so an entry
-    # matches only that miner's executor at that SSH endpoint. Empty = none.
+    # The executors the shadow runs on: comma-separated
+    # `miner_hotkey/executor_uuid/address/ssh_port` entries, or `all` for every executor. A
+    # listed entry is meant to be a reserved, non-rentable dev executor; `all` can include
+    # rentable nodes, so it refuses to start with GPU steps enabled until the rental-overlap
+    # guard lands. A pod or filler started after the cycle's snapshot is not seen, so on a
+    # rentable node the shadow could run its GPU/RAM/disk/network probe next to a workload.
+    # Executor UUIDs are miner-chosen, so an entry matches only that miner's executor at that SSH
+    # endpoint. Empty = none.
     LIUMD_SHADOW_RESERVED_EXECUTORS: str = Field(env="LIUMD_SHADOW_RESERVED_EXECUTORS", default="")
+    # The shadow can run only the fact steps while the Python path still owns VerifyX and matmul.
+    # Flip this on when liumd's GPU checks are the thing being compared again.
+    LIUMD_SHADOW_GPU_STEPS_ENABLED: bool = Field(
+        env="LIUMD_SHADOW_GPU_STEPS_ENABLED", default=False
+    )
     # DAH-3338: send every container state a cycle saw on a node to the backend as PodStatesReport
     # chunks (256 states each) after the cycle's spec, so a node with 256 rented pods still reports
     # its reaped orphans the same cycle. The spec keeps a bounded copy either way. Turn on once the
@@ -379,16 +399,20 @@ class Settings(BaseSettings):
     # present and shorter than the reported GPU count fails the validation
     # (GPU_KERNEL_COUNT_MISMATCH). A missing kernel list never fails.
     GPU_KERNEL_COUNT_CHECK_ENABLED: bool = Field(env="GPU_KERNEL_COUNT_CHECK_ENABLED", default=True)
+    # When the container's kernel GPU list is unavailable, the check reads the host's list (PID 1's root) instead.
+    # Off: a host list shorter than the reported count is recorded on the event (would_fail) and the node passes.
+    # On: it fails like a short container list (GPU_KERNEL_COUNT_MISMATCH).
+    GPU_KERNEL_COUNT_HOST_FALLBACK_ENFORCEMENT_ENABLED: bool = Field(
+        env="GPU_KERNEL_COUNT_HOST_FALLBACK_ENFORCEMENT_ENABLED", default=False
+    )
     # The scrape mounts a size-limited vloopback volume the way a rental does and reports the verdict in
     # its SCRAPE_OK event. Kill switch: off, the scrape skips the test (baked in by FileEncryptService).
     VLOOPBACK_SCRAPE_CHECK_ENABLED: bool = Field(env="VLOOPBACK_SCRAPE_CHECK_ENABLED", default=True)
     # Item 3 — run the GPU work-proof on every claimed card concurrently (own challenge per card,
     # sized from the registry SKU) and time the aggregate on the validator, so a count lie either
     # fails device selection or serialises past a wide wall-clock threshold.
-    # Defaults to False: "shadow" here only means the verdict is
-    # not scored — the GPU work itself is real, so an 8-card host would run 8 near-full-VRAM matmuls
-    # on top of the legacy single-card one every cycle. Flip it on once elapsed/VRAM/host-RSS numbers
-    # from a real 8-GPU box show what that costs an honest miner.
+    # Off by default until enforcement is on in prod: a validator on the public image pulls each release at once,
+    # so a true default would enforce there before the shadow step. It never runs beside a renter. Details: DAH-6576.
     MATMUL_ALLCARDS_CHECK_ENABLED: bool = Field(env="MATMUL_ALLCARDS_CHECK_ENABLED", default=False)
     MATMUL_ALLCARDS_ENFORCEMENT_ENABLED: bool = Field(env="MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", default=False)
     # Item 2b — send the advertised CPU-core count in the rental-verification health check so the
@@ -468,11 +492,11 @@ class Settings(BaseSettings):
     # re-registers the node to list a different set. Off again = the mark stays in the record but is ignored.
     # Flip after reading a week of the warn-mode rows.
     GPU_ANCHOR_HARD_ENABLED: bool = Field(env="GPU_ANCHOR_HARD_ENABLED", default=False)
-    # DAH-5508: an RTX 4090 reporting ~48 GB is scored as its own model "NVIDIA GeForce RTX 4090 48GB" (own VRAM
-    # window, rate, anchor and idle tier) instead of failing the 24 GB window. Off: such a card is rejected as before.
-    # Ships off. Turned on only by the Lium product owner, once the native verifier accepts a 48 GB 4090, the provider
-    # preflight classifies it too, and the all-card probe is sized from the classified model.
-    RTX_4090_48GB_MODEL_ENABLED: bool = Field(env="RTX_4090_48GB_MODEL_ENABLED", default=False)
+    # SpecFloorCheck (DAH-6343): off, a node with specs below the floors is logged with its findings only. Turned on
+    # by a separate PR once real cases show no false positives.
+    SPEC_FLOOR_ENFORCEMENT_ENABLED: bool = Field(env="SPEC_FLOOR_ENFORCEMENT_ENABLED", default=False)
+    # DockerCpuCheck: when disabled, a node whose Docker daemon sees fewer CPUs than the machine is logged only.
+    DOCKER_CPU_MISMATCH_ENFORCEMENT_ENABLED: bool = Field(env="DOCKER_CPU_MISMATCH_ENFORCEMENT_ENABLED", default=False)
     PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED: bool = Field(
         env="PROVIDER_SIDE_LOAD_ENFORCEMENT_ENABLED", default=False
     )
@@ -485,16 +509,11 @@ class Settings(BaseSettings):
     PROVIDER_SIDE_LOAD_STACK_EXCUSE_CAP_ENABLED: bool = Field(
         env="PROVIDER_SIDE_LOAD_STACK_EXCUSE_CAP_ENABLED", default=False
     )
-    FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED: bool = Field(
-        env="FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED", default=False
-    )
     # DAH-3035 — a ~6 s kernel-fault probe after the matmul: indexed/scattered access, atomics, a pointer
     # chase and a pinned-memory copy round-trip over a ~2 GB working set, plus NVML before/after: a rise in
     # uncorrected ECC or remapped rows, a pending or failed remap, or a required recovery action is a fault.
     # A card that faults under indexed access (Blender "Illegal address in CUDA queue", 6 Sep) passes the
-    # sequential matmul. It always runs and logs the verdict (DAH-4257 shadow, flag removed);
-    # ENFORCEMENT lets a fault zero the score and stays off until the owner decides.
-    GPU_FAULT_PROBE_ENFORCEMENT_ENABLED: bool = Field(env="GPU_FAULT_PROBE_ENFORCEMENT_ENABLED", default=False)
+    # sequential matmul. It always runs; a fault always zeroes the score.
     # DAH-3110 — a card NVML reports broken (uncorrected ECC since the driver loaded, a pending or failed
     # row remap, a required recovery action) fails the node like a GPU ban until the host resets or
     # replaces it. On: a broken card faults renters' jobs. Off is the kill switch back to flag-only.
@@ -509,7 +528,7 @@ class Settings(BaseSettings):
     PINNED_MEMORY_PROBE_CHECK_ENABLED: bool = Field(env="PINNED_MEMORY_PROBE_CHECK_ENABLED", default=True)
     # A fault probe with no verdict passes. Five such cycles in a row on one node are logged
     # (GPU_FAULT_PROBE_UNKNOWN_STREAK); with this on they are judged like a fault, which fails the
-    # node only while GPU_FAULT_PROBE_ENFORCEMENT_ENABLED is on too. Off by default.
+    # node. Off by default.
     GPU_FAULT_PROBE_UNKNOWN_STREAK_ENFORCEMENT_ENABLED: bool = Field(
         env="GPU_FAULT_PROBE_UNKNOWN_STREAK_ENFORCEMENT_ENABLED", default=False
     )
@@ -633,6 +652,10 @@ class Settings(BaseSettings):
     # validation and every OUTDATED executor earns 0. Off until nodes auto-update again
     # (DAH-3419): with Watchtower stalled, 99 executors earned 0 for it in one hour on 11 Sep.
     EXECUTOR_IMAGE_CHECK_ENFORCE: bool = Field(env="EXECUTOR_IMAGE_CHECK_ENFORCE", default=False)
+    # DAH-5936: an executor digest absent from EXECUTOR_IMAGE_REF's repository is logged as an unofficial build
+    # every cycle (EXECUTOR_BUILD lines). Off (default): no consequence, the node is judged as OUTDATED is.
+    # On: UNOFFICIAL fails an idle node, and a rented one keeps its rental at score 0, out of both incentive pools.
+    EXECUTOR_IMAGE_UNOFFICIAL_ENFORCE: bool = Field(env="EXECUTOR_IMAGE_UNOFFICIAL_ENFORCE", default=False)
     # DAH-3405: for this many validation cycles, counting the one in which the registry digest of
     # EXECUTOR_IMAGE_REF was seen to change, an executor that fails the way a watchtower restart
     # makes it fail (SSH gone, scrape failed, ports missing, image not yet the new one) gets no
@@ -737,13 +760,6 @@ class Settings(BaseSettings):
     # Issued nonce validity window; a quote echoing an older nonce is stale.
     ATTESTATION_NONCE_TTL_SECONDS: int = Field(env="ATTESTATION_NONCE_TTL_SECONDS", default=600)
 
-    # G1 — NVIDIA GPU confidential-compute attestation (validator-side verification).
-    # Off = observe-only: nvidia_payload, when present, is verified and logged but
-    # never affects the outcome. On = a CVM executor (verified TDX quote) must supply
-    # GPU evidence bound to the issued nonce; any failure raises AttestationError.
-    ENABLE_GPU_ATTESTATION_ENFORCEMENT: bool = Field(
-        env="ENABLE_GPU_ATTESTATION_ENFORCEMENT", default=False
-    )
     # DAH-4551 - GpuAttestationIdentityCheck: each Hopper/Blackwell GPU's NVIDIA-signed identity, pinned to its
     # UUID both ways. Shadow by default: a mismatch or forged evidence is logged as a warning event and the node
     # passes. On = it fails the node (not fatal with a live rental). Unavailable evidence alone never fails it.
@@ -785,9 +801,18 @@ class Settings(BaseSettings):
     def get_allowed_advisory_ids(self) -> set[str]:
         return {s.strip() for s in self.TDX_ALLOWED_ADVISORY_IDS.split(",") if s.strip()}
 
-    def get_liumd_shadow_reserved_executors(self) -> set[tuple[str, str, str, int]]:
+    def get_liumd_shadow_reserved_executors(self) -> set[tuple[str, str, str, int]] | None:
         """`LIUMD_SHADOW_RESERVED_EXECUTORS` as (miner_hotkey, executor_uuid, address, ssh_port).
-        A malformed entry raises ValueError rather than being dropped."""
+
+        `all` means every executor. A malformed entry raises ValueError rather than being dropped.
+        """
+        if self.LIUMD_SHADOW_RESERVED_EXECUTORS.strip().lower() == "all":
+            if self.LIUMD_SHADOW_GPU_STEPS_ENABLED:
+                raise ValueError(
+                    "LIUMD_SHADOW_RESERVED_EXECUTORS=all cannot enable GPU steps until the "
+                    "rental-overlap guard exists; list the executors instead"
+                )
+            return None
         reserved = set()
         for entry in self.LIUMD_SHADOW_RESERVED_EXECUTORS.split(","):
             if not entry.strip():
@@ -827,8 +852,10 @@ class Settings(BaseSettings):
     # no incentive ledger row); the next cycle scores and overwrites it as today.
     EXPRESS_LANE_TICK_SECONDS: int = Field(env="EXPRESS_LANE_TICK_SECONDS", default=30)
     # Hard bound on the extra load a registration flood can add: at most this many express
-    # verifications in flight at once (so also per tick), and per miner.
-    EXPRESS_LANE_MAX_IN_FLIGHT: int = Field(env="EXPRESS_LANE_MAX_IN_FLIGHT", default=4)
+    # verifications in flight at once (so also per tick), and per self-hosted miner (a hotkey
+    # routed through the central miner is bounded by the global cap only). A wave runs every
+    # executor at once, so 8 is small beside it; at 4 a few nodes added together queued minutes.
+    EXPRESS_LANE_MAX_IN_FLIGHT: int = Field(env="EXPRESS_LANE_MAX_IN_FLIGHT", default=8)
     EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER: int = Field(
         env="EXPRESS_LANE_MAX_IN_FLIGHT_PER_MINER", default=2
     )

@@ -99,7 +99,9 @@ COMMANDS = {
         "docker", "run", "--rm",
         "--runtime=sysbox-runc",
         "--gpus", "all",
-        "daturaai/compute-subnet-executor:latest", "nvidia-smi"
+        # the P2P matrix as a rental sees it under this runtime; `|| true` keeps the GPU verdict on `nvidia-smi`
+        "daturaai/compute-subnet-executor:latest",
+        "sh", "-c", "nvidia-smi && echo LIUM_RENTAL_P2P && (nvidia-smi topo -p2p r || true)",
     ],
     "CHECK_STORAGE_LIMIT_ABILITY": [
         "docker", "run", "--rm",
@@ -729,6 +731,155 @@ def get_executor_pid_mode():
     return pid_mode
 
 
+NEEDRESTART_GUARD_FILE = "/etc/needrestart/conf.d/lium-container-runtime.conf"
+# the services nvidia_docker_sysbox_setup.sh keeps needrestart from restarting under running pods (DAH-6384)
+NEEDRESTART_GUARD_SERVICES = ("sysbox", "docker", "containerd", "nvidia-fabricmanager", "nvidia-persistenced")
+# the units needrestart matches each guard against: qr(^sysbox) covers the sysbox package's three units
+NEEDRESTART_GUARD_UNITS = {
+    "sysbox": ("sysbox.service", "sysbox-mgr.service", "sysbox-fs.service"),
+    "docker": ("docker.service",),
+    "containerd": ("containerd.service",),
+    "nvidia-fabricmanager": ("nvidia-fabricmanager.service",),
+    "nvidia-persistenced": ("nvidia-persistenced.service",),
+}
+
+
+def needrestart_data_line(line, literal, plain_setting):
+    # What Perl stores on a data-only line, or None if the line may run code: ("set",), ("open", key) for
+    # $nrconf{key} = { or [, ("close",), or ("entry", pattern, value, is_qr) for one hash/list entry, where the key is a
+    # literal or a qr<delim>...<delim> that neither interpolates (@x, $x, ${...}) nor runs code ((?{...}))
+    if re.fullmatch(plain_setting, line):
+        return ("set",)
+    opener = re.fullmatch(r"[ \t]*\$nrconf\{(\w+)\}\s*=\s*[\[{]\s*([}\]]\s*;\s*)?(#.*)?", line)
+    if opener:
+        return ("set",) if opener.group(2) else ("open", opener.group(1))
+    if re.fullmatch(r"[ \t]*[}\]]\s*;\s*(#.*)?", line):
+        return ("close",)
+    rest = r"\s*(?:=>\s*" + literal + r"\s*)?,?\s*(#.*)?"
+    entry = re.fullmatch(r"[ \t]*" + literal + rest, line)
+    if entry:
+        return ("entry", entry.group(1).strip("'\""), entry.group(3), False)
+    start = re.match(r"[ \t]*qr([^\w\s])", line)
+    if not start:
+        return None
+    opening = start.group(1)
+    closing = {"(": ")", "{": "}", "[": "]", "<": ">"}.get(opening, opening)
+    depth, i = 1, start.end()
+    while i < len(line):  # Perl nests bracketing delimiters and skips backslash escapes
+        if line[i] == "\\":
+            i += 2
+            continue
+        if line[i] == closing:
+            depth -= 1
+            if depth == 0:
+                body = line[start.end() : i]
+                after = re.fullmatch(rest, line[i + 1 :])
+                if re.search(r"[@$]#?[\w{:$]|\(\?\??\{", body) or not after:  # @. and a closing $ do not interpolate
+                    return None
+                return ("entry", body, after.group(1), True)
+        elif line[i] == opening and opening != closing:
+            depth += 1
+        i += 1
+    return None
+
+
+def get_needrestart_guard(host_root="/proc/1/root"):
+    # "present", "partial", "missing" or "no_needrestart", plus the services the host file leaves unguarded.
+    # Hosts set up before the setup script wrote the file (16 Nov) have needrestart and no guard. The setup script
+    # writes the guard file on hosts without needrestart too, so only the binary or the stock config counts.
+    if os.path.samefile(host_root + "/", "/"):  # as docker_utils' [ /proc/1/root/ -ef / ]
+        raise RuntimeError("no host view: the executor is not in the host PID namespace")
+    if not (os.path.exists(host_root + "/usr/sbin/needrestart") or os.path.isfile(host_root + "/etc/needrestart/needrestart.conf")):
+        return "no_needrestart", []
+    try:
+        with open(host_root + NEEDRESTART_GUARD_FILE) as guard_file:
+            text = guard_file.read()
+    except FileNotFoundError:
+        return "missing", list(NEEDRESTART_GUARD_SERVICES)
+    zero = ("0", "'0'", '"0"')  # anything else (1, '1', "'0'", an expression) may be true in Perl
+    last_values = {}
+    other_rules = []  # (pattern, value) of every rule that is not one of the five exact keys
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        # only the exact line the setup script writes is understood; any other live Perl (another
+        # delimiter, two statements on a line, a map reset) may undo a guard, so it guards nothing
+        match = re.fullmatch(r"[ \t]*\$nrconf\{override_rc\}->\{qr\(\^([\w.-]+)\)\}\s*=\s*([^;#]+?)\s*;\s*(#.*)?", line)
+        if not match:
+            return "partial", list(NEEDRESTART_GUARD_SERVICES)
+        last_values[match.group(1)] = match.group(2)  # Perl keeps the last assignment
+        if match.group(1) not in NEEDRESTART_GUARD_SERVICES:
+            other_rules.append(("^" + match.group(1), match.group(2)))
+    # needrestart evals needrestart.conf, whose stock loader block then evals conf.d/*.conf in name order. Config
+    # is Perl, and code anywhere (a tie on %nrconf, a sub, %nrconf = ()) can undo the guard in ways no text scan
+    # rules out, so every file must be data only: literal settings, {/[ structures of qr// and literal entries,
+    # and the loader. A later file may only set other keys to literals; anything else leaves it unknowable.
+    unknowable = ("partial", list(NEEDRESTART_GUARD_SERVICES))
+    literal = r"""(-?\d+(\.\d+)?|'[^'\\]*'|"[^"\\$@]*")"""
+    plain_setting = r"[ \t]*\$nrconf\{(\w+)\}\s*=\s*" + literal + r"\s*;\s*(#.*)?"
+    loader = [
+        "if(-d q(/etc/needrestart/conf.d)) {",
+        "foreach my $fn (sort </etc/needrestart/conf.d/*.conf>) {",
+        'print STDERR "$LOGPREF eval $fn\\n" if($nrconf{verbosity} > 1);',  # needrestart 3.4 (Ubuntu 20.04): verbose
+        "eval do { local(@ARGV, $/) = $fn; <>};",
+        'die "Error parsing $fn: $@" if($@);',
+        "}",
+        "}",
+    ]
+    conf_dir = host_root + "/etc/needrestart/conf.d"
+    guard_name = os.path.basename(NEEDRESTART_GUARD_FILE)
+    try:
+        with open(host_root + "/etc/needrestart/needrestart.conf") as conf_file:
+            main = [ln for ln in conf_file.read().splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    except FileNotFoundError:
+        return unknowable  # no main config, so nothing loads conf.d and the guard file is never read
+    # the stock files differ only in 3.4's log condition and its one computed setting, matched exactly
+    old_log = 'print STDERR "$LOGPREF eval $fn\\n" if($nrconf{verbose});'
+    stock_code = ["$nrconf{skip_mapfiles} = (-d '/proc/sys/kernel/grsecurity' ? -1 : 0);"]
+    flat = [" ".join(ln.split()).replace(old_log, loader[2]) for ln in main]
+    at = next((i for i in range(len(flat)) if flat[i : i + len(loader)] == loader), None)
+    if at is None or at + len(loader) != len(main):
+        return unknowable  # conf.d is not loaded the stock way, or main config code runs after the guard file
+    earlier = [[ln for ln, f in zip(main[:at], flat) if f not in stock_code]]
+    names = sorted(n for n in os.listdir(conf_dir) if n.endswith(".conf") and n != guard_name)
+    for name in names:
+        with open(conf_dir + "/" + name) as conf_file:
+            lines = [ln for ln in conf_file.read().splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+        if name < guard_name:
+            earlier.append(lines)
+        elif not all((m := re.fullmatch(plain_setting, ln)) and m.group(1) != "override_rc" for ln in lines):
+            return unknowable
+    for lines in earlier:
+        block = None
+        for ln in lines:
+            data = needrestart_data_line(ln, literal, plain_setting)
+            if data is None:
+                return unknowable
+            if data[0] == "open":
+                block = data[1]
+            elif data[0] == "close":
+                block = None
+            elif data[0] == "entry" and block == "override_rc":
+                # the parser that accepted the line also gives its rule, so no delimiter is read one way and kept another.
+                # The guard file overwrites only the same Perl key: qr(^<service>) with any delimiter stringifies alike,
+                # while the string '^<service>' is another key that stays next to it.
+                if not (data[3] and data[1] in ["^" + s for s in NEEDRESTART_GUARD_SERVICES]):
+                    other_rules.append((data[1], data[2]))
+    unguarded = []
+    for service in NEEDRESTART_GUARD_SERVICES:
+        overlapping = False
+        for pattern, value in other_rules:
+            if value in zero:
+                continue
+            try:
+                overlapping = overlapping or any(re.search(pattern, unit) for unit in NEEDRESTART_GUARD_UNITS[service])
+            except re.error:
+                overlapping = True  # a pattern Python cannot read may still match in Perl
+        if overlapping or last_values.get(service) not in zero:
+            unguarded.append(service)
+    return ("partial" if unguarded else "present"), unguarded
+
+
 def get_vloopback_volume_bytes(docker_root_dir, filler_only=False, sizes=None):
     # disk held by loopback-backed volumes, which /system/df misses entirely: it only accounts for
     # the `local` driver. The plugin keeps one backing file per volume, named after the volume.
@@ -952,7 +1103,7 @@ def release_filler_cache(hard_disk):
     hard_disk["hard_disk_utilization"] = used_kb / hard_disk["hard_disk_total"] * 100
 
 
-def get_container_cpu_percents(docker_path: str) -> tuple[float, dict[str, float]]:
+def get_container_cpu_percents(docker_path: str) -> tuple[float, dict[str, float], dict[str, tuple[int, int]]]:
     # per-container CPU in core-percent ("897.45%" = ~9 cores). `stats --no-stream` does its own
     # two-sample delta, one call for all containers. Keyed by the 12-char id stats prints.
     # The host CPU is sampled over the SAME window (reset counter -> stats -> read), because the
@@ -961,16 +1112,45 @@ def get_container_cpu_percents(docker_path: str) -> tuple[float, dict[str, float
     # `timeout 30` bounds a wedged docker daemon: the signal degrades instead of hanging the
     # whole (fatal) machine scrape.
     psutil.cpu_percent(interval=None)
-    result = run_cmd(f'timeout 30 {docker_path} stats --no-stream --format "{{{{.ID}}}}|{{{{.CPUPerc}}}}"')
+    result = run_cmd(f'timeout 30 {docker_path} stats --no-stream --format "{{{{.ID}}}}|{{{{.CPUPerc}}}}|{{{{.NetIO}}}}"')
     host_cpu_percent = psutil.cpu_percent(interval=None)
     # An unparsable row means a container whose CPU the window cannot account for — let the
     # ValueError escape so the caller voids the whole CPU signal for this cycle (fail-safe)
     # instead of silently booking that container's load to the provider.
     cpu_percent_by_short_id = {}
     for line in result.strip().splitlines():
-        short_id, _, raw_percent = line.partition('|')
+        short_id, _, rest = line.partition('|')
+        raw_percent = rest.partition('|')[0]
         cpu_percent_by_short_id[short_id.strip()] = float(raw_percent.strip().rstrip('%'))
-    return host_cpu_percent, cpu_percent_by_short_id
+    return host_cpu_percent, cpu_percent_by_short_id, parse_container_net_io(result)
+
+
+_DOCKER_SIZE_UNITS = {"B": 1, "kB": 10**3, "KB": 10**3, "MB": 10**6, "GB": 10**9, "TB": 10**12, "PB": 10**15}
+
+
+# Top level, not nested in its caller: obfuscator.py renames a nested function's body and leaves its
+# signature, which broke every row (lium-io#2146 review).
+def docker_size_bytes(size_text: str) -> int:
+    size_text = size_text.strip()
+    number = size_text.rstrip("kKMGTPB")
+    return int(float(number) * _DOCKER_SIZE_UNITS[size_text[len(number):]])
+
+
+def parse_container_net_io(stats_output: str) -> dict[str, tuple[int, int]]:
+    # `docker stats` NetIO: "<received> / <sent>" since the container started, in decimal units
+    # ("1.23GB / 456MB", 3 significant digits). Keyed by the 12-char id. A row that does not parse
+    # is left out: the traffic shown to the provider is informational, it must not void the CPU signal.
+    net_io_by_short_id = {}
+    for line in stats_output.strip().splitlines():
+        fields = line.split('|')
+        if len(fields) < 3:
+            continue
+        received, _, sent = fields[2].partition('/')
+        try:
+            net_io_by_short_id[fields[0].strip()] = (docker_size_bytes(received), docker_size_bytes(sent))
+        except (KeyError, ValueError):
+            continue
+    return net_io_by_short_id
 
 
 def get_docker_info(content: bytes):
@@ -994,9 +1174,9 @@ def get_docker_info(content: bytes):
         # appears in ps without a stats row, which voids the CPU attribution for the cycle
         # (fail-safe) instead of silently counting that container's CPU as provider-side.
         try:
-            host_cpu_percent, cpu_percents = get_container_cpu_percents(docker_path)
+            host_cpu_percent, cpu_percents, net_io = get_container_cpu_percents(docker_path)
         except Exception:
-            host_cpu_percent, cpu_percents = None, {}
+            host_cpu_percent, cpu_percents, net_io = None, {}, {}
 
         result = run_cmd(f'{docker_path} ps --no-trunc --format "{{{{.ID}}}}"')
         container_ids = result.strip().split('\n')
@@ -1011,6 +1191,9 @@ def get_docker_info(content: bytes):
             data["docker_host_cpu_percent"] = host_cpu_percent
 
         containers = []
+        # the executor is the container this scrape runs in, never another one on its image (the monitor,
+        # or a burner); with no such match none is reported, which excuses nothing
+        own_pid = str(os.getpid())
 
         for container_id in container_ids:
             # Get the image ID of the container
@@ -1034,12 +1217,21 @@ def get_docker_info(content: bytes):
             if repo_digests:
                 digest = repo_digests[0].split('@')[1]
                 if repo_digests[0].split('@')[0] == 'daturaai/compute-subnet-executor':
-                    data["docker_container_id"] = container_id
+                    # `docker top` lists the container's processes by cgroup, in host pids under the required
+                    # `pid: host`; a hostname can name any container, and a daemonized sshd leaves the init's tree
+                    try:
+                        in_container = own_pid in run_cmd(f'{docker_path} top {container_id} -eo pid').split()[1:]
+                    except RuntimeError:
+                        in_container = False
+                    if in_container:
+                        data["docker_container_id"] = container_id
 
             container_entry = {'each_container_id': container_id, 'each_digest': digest or '', "each_name": container_name}
             cpu_percent = cpu_percents.get(container_id[:12])
             if cpu_percent is not None:
                 container_entry['each_cpu_percent'] = cpu_percent
+            if container_id[:12] in net_io:
+                container_entry['each_net_rx_bytes'], container_entry['each_net_tx_bytes'] = net_io[container_id[:12]]
             containers.append(container_entry)
 
         data["docker_containers"] = containers
@@ -1146,7 +1338,18 @@ def run_capability_check(command):
         run_storage_probe(["docker", "rm", "-f", name], VLOOPBACK_CLEANUP_TIMEOUT_SECONDS)
 
 
-def check_sysbox_gpu_compatibility() -> tuple[bool, str]:
+RENTAL_P2P_MARKER = "LIUM_RENTAL_P2P"
+
+
+def rental_p2p_output(stdout):
+    """The `topo -p2p r` table printed inside the sysbox check container, or None when it printed none."""
+    if RENTAL_P2P_MARKER not in stdout:
+        return None
+    table = stdout.split(RENTAL_P2P_MARKER, 1)[1]
+    return table if table.strip() else None
+
+
+def check_sysbox_gpu_compatibility() -> tuple[bool, str, str | None]:
     """
     Checks if the system supports running Docker containers with the sysbox-runc runtime
     and NVIDIA GPU access (--gpus all).
@@ -1160,18 +1363,18 @@ def check_sysbox_gpu_compatibility() -> tuple[bool, str]:
         result = run_capability_check(test_command)
 
         if result.returncode == 0:
-            return True, "Sysbox runtime supports GPU access."
+            return True, "Sysbox runtime supports GPU access.", rental_p2p_output(result.stdout)
         else:
-            return False, "Sysbox runtime does not support GPU access."
+            return False, "Sysbox runtime does not support GPU access.", None
 
     except subprocess.TimeoutExpired:
-        return False, "Test command timed out."
+        return False, "Test command timed out.", None
 
     except FileNotFoundError:
-        return False, "Docker is not installed or not found in PATH."
+        return False, "Docker is not installed or not found in PATH.", None
 
     except Exception as e:
-        return False, f"An unexpected error occurred: {e}"
+        return False, f"An unexpected error occurred: {e}", None
 
 
 # ticket-0331 (22 Sep 2026): the `--storage-opt` probe passed on a host where every rental volume failed to
@@ -1344,6 +1547,26 @@ SYSBOX_RUNC_CANDIDATES = ("sysbox-runc", "/usr/bin/sysbox-runc", "/usr/local/bin
 SYSBOX_VERSION_PATTERN = re.compile(r"^\s*version:\s*([0-9A-Za-z.+~_-]{1,32})", re.MULTILINE)
 
 
+# A VM whose CPUID hides the brand string (a TDX guest, some clouds) makes lscpu print "Model name: 06/cf",
+# the raw family/model in hex. Intel family 6 ids from arch/x86/include/asm/intel-family.h; the raw id stays
+# in the name, so the validator's TDX host check still reads it.
+INTEL_FAMILY6_SERVER_CPUS = {
+    "8f": "Intel Xeon 4th Gen Scalable (Sapphire Rapids)",
+    "cf": "Intel Xeon 5th Gen Scalable (Emerald Rapids)",
+    "ad": "Intel Xeon 6 (Granite Rapids)",
+    "ae": "Intel Xeon 6 (Granite Rapids-D)",
+    "af": "Intel Xeon 6 (Sierra Forest)",
+}
+
+
+def cpu_model_name(lscpu_model: str) -> str:
+    raw = re.fullmatch(r"\s*0*([0-9a-fA-F]+)/([0-9a-fA-F]+)\s*", lscpu_model or "")
+    if not raw or int(raw.group(1), 16) != 6:
+        return lscpu_model
+    name = INTEL_FAMILY6_SERVER_CPUS.get(raw.group(2).lower())
+    return f"{name}, CPUID {lscpu_model.strip()}" if name else lscpu_model
+
+
 def get_sysbox_version() -> str | None:
     """The host's `sysbox-runc --version` (e.g. "0.6.4"), telemetry only. None when Sysbox is absent
     or the command fails or cannot run. The absolute paths are tried through PID 1's root, since the
@@ -1502,13 +1725,36 @@ def get_host_boot_id() -> str:
 # The node is listed at the geo of the address the validator connects to; behind a reverse proxy
 # that is the proxy's. The backend geolocates the host's own egress address instead (Cloudflare's
 # trace echoes the caller's IP). "" when the fetch fails: the backend then keeps the connect address.
-# The trace runs in the host's network namespace (the executor has pid: host and is privileged),
-# where renter pods' traffic leaves the host: the executor container's own route may differ.
-# Never falls back to the container's route. The name is resolved in the container first, since its
-# resolv.conf may point at docker's embedded DNS, which the host namespace cannot reach.
+# The trace runs where renter pods' traffic leaves: in a short-lived container on the network a
+# running pod is on (else the one pods are created on), from the executor's own image so nothing is
+# pulled. Never inside a pod itself. When that fails it runs in the host's network namespace (the
+# executor has pid: host and is privileged); never in the executor container's own route.
+# The name is resolved in the container first, since its resolv.conf may point at docker's
+# embedded DNS, which the host namespace cannot reach.
 EGRESS_TRACE_HOST = "www.cloudflare.com"
 EGRESS_TRACE_PATH = "/cdn-cgi/trace"
 EGRESS_TRACE_TIMEOUT_SECONDS = 5
+# container start on top of the trace itself
+EGRESS_PROBE_START_SECONDS = 20
+EGRESS_PROBE_NAME_PREFIX = "lium_egress_probe_"
+# the network pods are created on (services/rental_docker_sdk.py RENTAL_NETWORK_NAME)
+EGRESS_RENTAL_NETWORK = "lium-rentals"
+
+
+def get_egress_probe_network():
+    # a running pod's network, else the one pods are created on; raises on a pod sharing another
+    # container's namespace or none, so the trace falls back to the host
+    for container in docker_api_get("/containers/json"):
+        if any(name.startswith("/pod_") for name in container.get("Names") or []):
+            info = docker_api_get(f"/containers/{container['Id']}/json")
+            mode = info["HostConfig"]["NetworkMode"]
+            if mode in ("default", "bridge"):
+                # a legacy pod moved onto another network at start keeps mode "default"
+                return next(iter((info.get("NetworkSettings") or {}).get("Networks") or {}), "bridge")
+            if not mode or mode == "none" or mode.startswith("container:"):
+                raise ValueError(f"pod network mode {mode!r}")
+            return mode
+    return EGRESS_RENTAL_NETWORK
 
 
 def get_egress_ip() -> str:
@@ -1518,21 +1764,43 @@ def get_egress_ip() -> str:
         )[0][4][0]
         env = {**os.environ}
         env.pop("LD_LIBRARY_PATH", None)
-        body = subprocess.run(
-            [
-                "nsenter", "-t", "1", "-n",
-                "curl", "-q", "--noproxy", "*", "-fsS", "--max-time", str(EGRESS_TRACE_TIMEOUT_SECONDS),
-                "--resolve", f"{EGRESS_TRACE_HOST}:443:{trace_addr}",
-                f"https://{EGRESS_TRACE_HOST}{EGRESS_TRACE_PATH}",
-            ],
-            capture_output=True, text=True, check=True, env=env,
-            timeout=EGRESS_TRACE_TIMEOUT_SECONDS + 5,
-        ).stdout[:4096]
     except Exception:
         return ""
-    for line in body.splitlines():
-        if line.startswith("ip="):
-            return line[3:].strip()[:64]
+    curl = [
+        "curl", "-q", "--noproxy", "*", "-fsS", "--max-time", str(EGRESS_TRACE_TIMEOUT_SECONDS),
+        "--resolve", f"{EGRESS_TRACE_HOST}:443:{trace_addr}",
+        f"https://{EGRESS_TRACE_HOST}{EGRESS_TRACE_PATH}",
+    ]
+    commands = []
+    probe_name = f"{EGRESS_PROBE_NAME_PREFIX}{os.getpid()}_{os.urandom(3).hex()}"
+    try:
+        network = get_egress_probe_network()
+        image = docker_api_get(f"/containers/{socket.gethostname()}/json")["Image"]
+        commands.append(
+            ["docker", "run", "--rm", "--name", probe_name, "--network", network, "--entrypoint", "curl", image]
+            + curl[1:]
+        )
+    except Exception:
+        pass
+    commands.append(["nsenter", "-t", "1", "-n"] + curl)
+    for command in commands:
+        is_probe = command[0] == "docker"
+        try:
+            body = subprocess.run(
+                command, capture_output=True, text=True, check=True, env=env,
+                timeout=EGRESS_TRACE_TIMEOUT_SECONDS + (EGRESS_PROBE_START_SECONDS if is_probe else 5),
+            ).stdout[:4096]
+        except Exception:
+            if is_probe:
+                # --rm misses a container whose run was cut off by the timeout
+                try:
+                    subprocess.run(["docker", "rm", "-f", probe_name], capture_output=True, env=env, timeout=30)
+                except Exception:
+                    pass
+            continue
+        for line in body.splitlines():
+            if line.startswith("ip="):
+                return line[3:].strip()[:64]
     return ""
 
 
@@ -1812,7 +2080,7 @@ def summarize_gpu_interconnect(topo_output, p2p_output, nvlink_output):
     }
 
 
-def get_gpu_interconnect():
+def get_gpu_interconnect(rental_p2p=None):
     """Run the three nvidia-smi topology tables and summarize them; never fails the scrape.
 
     `topo -m` is required - without it there is nothing to report and the reason travels in
@@ -1825,11 +2093,13 @@ def get_gpu_interconnect():
     except Exception as exc:
         return GpuInterconnectObservation(None, f"{NVIDIA_SMI_TOPO_MATRIX_CMD}: {exc!r}"[:400])
 
-    p2p_output = None
-    try:
-        p2p_output = run_cmd(NVIDIA_SMI_TOPO_P2P_READ_CMD)
-    except Exception as exc:
-        errors.append(f"{NVIDIA_SMI_TOPO_P2P_READ_CMD}: {exc!r}"[:200])
+    # a sysbox rental can read NS on pairs this scrape container reads OK: list what the rental sees
+    p2p_output = rental_p2p
+    if p2p_output is None:
+        try:
+            p2p_output = run_cmd(NVIDIA_SMI_TOPO_P2P_READ_CMD)
+        except Exception as exc:
+            errors.append(f"{NVIDIA_SMI_TOPO_P2P_READ_CMD}: {exc!r}"[:200])
 
     nvlink_output = None
     try:
@@ -2351,7 +2621,7 @@ def get_machine_specs():
     sysbox_check, storage_limit_check = run_checks_concurrently(
         [check_sysbox_gpu_compatibility, check_storage_limit_ability]
     )
-    is_supported, log_text = sysbox_check
+    is_supported, log_text, rental_p2p = sysbox_check
     data["data_sysbox_runtime"] = is_supported
     if not is_supported:
         data["data_sysbox_runtime_scrape_error"] = log_text
@@ -2381,14 +2651,14 @@ def get_machine_specs():
     if infiniband.scrape_error:
         data["data_infiniband_scrape_error"] = infiniband.scrape_error
 
-    interconnect = get_gpu_interconnect()
+    interconnect = get_gpu_interconnect(rental_p2p)
     data["data_interconnect"] = interconnect.payload
     if interconnect.scrape_error:
         data["data_interconnect_scrape_error"] = interconnect.scrape_error
 
     try:
         lscpu_output = run_cmd("lscpu")
-        data["data_cpu"]["cpu_model"] = re.search(r"Model name:\s*(.*)$", lscpu_output, re.M).group(1)
+        data["data_cpu"]["cpu_model"] = cpu_model_name(re.search(r"Model name:\s*(.*)$", lscpu_output, re.M).group(1))
         data["data_cpu"]["cpu_count"] = int(re.search(r"CPU\(s\):\s*(.*)", lscpu_output).group(1))
         data["data_cpu"]["cpu_utilization"] = psutil.cpu_percent(interval=1)
     except Exception as exc:
@@ -2459,6 +2729,12 @@ def get_machine_specs():
         data["data_executor_pid_mode"] = get_executor_pid_mode()
     except Exception as exc:
         data["data_executor_pid_mode_scrape_error"] = repr(exc)
+
+    # DAH: hosts set up before 16 Nov lack the needrestart guard; missing key = unknown, never fails
+    try:
+        data["data_needrestart_guard"], data["data_needrestart_guard_unguarded"] = get_needrestart_guard()
+    except Exception as exc:
+        data["data_needrestart_guard_scrape_error"] = repr(exc)
 
     data["data_os"] = ""
     try:

@@ -134,6 +134,7 @@ class DummyConnectivityService:
         port_ranges: tuple[PortRangeResult, ...] = (),
         sysbox_measured: bool | None = None,
         host_runtime_fault: bool = False,
+        dind_skipped: bool = False,
     ):
         """
         Args:
@@ -145,6 +146,7 @@ class DummyConnectivityService:
             dind_ok: Override whether the DinD probe reached its container (default: success)
         """
         self.dind_error = dind_error
+        self.dind_skipped = dind_skipped
         self.host_runtime_fault = host_runtime_fault
         self.sysbox_measured = sysbox_measured
         self.port_ranges = port_ranges
@@ -211,6 +213,7 @@ class DummyConnectivityService:
             port_ranges=self.port_ranges,
             sysbox_measured=self.sysbox_measured,
             host_runtime_fault=self.host_runtime_fault,
+            dind_skipped=self.dind_skipped,
         )
 
 
@@ -1086,9 +1089,26 @@ async def test_the_fourth_pressured_cycle_runs_the_check_and_ends_the_streak(con
 
 
 @pytest.mark.asyncio
-async def test_a_replayed_memory_never_lists_or_pays_free_gpus_across_the_deferral_cadence(context_factory, monkeypatch):
+async def test_an_idle_node_defers_once_in_a_row(context_factory, monkeypatch):
+    """DAH-5851 review: an idle node's deferred cycle is withheld, so a second one in a row runs the check
+    before the backend's 45-minute sweep could drop the unpublished row."""
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+    redis_service = DummyRedis()
+    deferred = []
+    for _ in range(4):
+        ctx, connectivity = _gate_ctx(context_factory, redis_service=redis_service, state=_filler_state(), reading=STALLED)
+        if not redis_service.verified_ports:
+            _remember(redis_service, ctx)
+        result = await PortConnectivityCheck().run(ctx)
+        deferred.append(connectivity.called_with is None)
+        assert result.passed
+    assert deferred == [True, False, True, False]
+
+
+@pytest.mark.asyncio
+async def test_a_replayed_memory_keeps_the_listing_but_never_pays_free_gpus_across_the_deferral_cadence(context_factory, monkeypatch):
     """Review on #1964: three deferrals then one briefly healthy forced check, repeated. Only the forced
-    check's own measurement reaches the published ports and the free GPUs' idle pay; the rental stays."""
+    check's own measurement reaches the free GPUs' idle pay; the rental stays, and so does the listing (DAH-5851)."""
     from incentive.rental_price import RentalPriceIncentive
 
     from neurons.validators.src.services.task.checks.port_count import PortCountCheck
@@ -1096,7 +1116,7 @@ async def test_a_replayed_memory_never_lists_or_pays_free_gpus_across_the_deferr
 
     monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
     redis_service = DummyRedis()
-    unpaid, deferred = [], []
+    unpaid, deferred, listed = [], [], []
     for _ in range(8):
         ctx, connectivity = _gate_ctx(context_factory, redis_service=redis_service, state=_rented_state(), reading=STALLED)
         if not redis_service.verified_ports:
@@ -1104,6 +1124,7 @@ async def test_a_replayed_memory_never_lists_or_pays_free_gpus_across_the_deferr
         connected = await PortConnectivityCheck().run(ctx)
         counted = await PortCountCheck().run(ctx.model_copy(update=connected.updates))
         assert counted.passed  # the renter's pod keeps the node rented
+        listed.append(counted.updates["state"].specs["available_port_count"])
         deferred.append(connectivity.called_with is None)
         incentive = _build_incentive(
             _make_job(spec=counted.updates["state"].specs, gpu_count=8, rented_gpu_count=1, is_rented=True)
@@ -1114,6 +1135,35 @@ async def test_a_replayed_memory_never_lists_or_pays_free_gpus_across_the_deferr
 
     assert deferred == [True, True, True, False] * 2
     assert unpaid == [7, 7, 7, 0] * 2  # 7 free one-GPU splits: paid only on the measured cycle
+    # DAH-5851: the free GPUs stay listed on the last completed check's ports (24 remembered, then the forced 100)
+    assert listed == [24, 24, 24, 100, 100, 100, 100, 100]
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_cycle_withholds_an_idle_nodes_verdict_and_never_carries_it(context_factory, monkeypatch):
+    """DAH-5851: an idle node (our filler on it) on a deferral is neither hidden for 0 ports nor scored from the
+    republished ones: the run is withheld at the cycle's end, and the renter-GPU-reset carry never picks it up."""
+    from services.executor_rollout import withhold_renter_gpu_reset_verdicts
+    from neurons.validators.src.services.task.checks.port_count import PortCountCheck
+    from neurons.validators.src.services.task.messages import PortCountMessages
+    from tests.test_executor_rollout_grace import _failed
+
+    monkeypatch.setattr(settings, "DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED", True)
+    redis_service = DummyRedis()
+    ctx, connectivity = _gate_ctx(context_factory, redis_service=redis_service, state=_filler_state(), reading=STALLED)
+    _remember(redis_service, ctx, pairs=[(port, port) for port in range(40020, 40044)])
+    connected = await PortConnectivityCheck().run(ctx)
+    counted = await PortCountCheck().run(ctx.model_copy(update=connected.updates))
+
+    assert connectivity.called_with is None
+    reason = PortCountMessages.VERDICT_WITHHELD_PORT_CHECK_DEFERRED.reason
+    assert not counted.passed and counted.event.reason_code == reason
+    assert "listing_hidden" not in counted.event.model_dump_json()
+    standing, withheld = withhold_renter_gpu_reset_verdicts(
+        {"miner": [_failed("deferred-node", reason), _failed("other-node", "INSUFFICIENT_PORTS")]}
+    )
+    assert [w.result.executor_info.uuid for w in withheld] == ["deferred-node"]
+    assert [r.executor_info.uuid for r in standing["miner"]] == ["other-node"]
 
 
 @pytest.mark.asyncio
@@ -1821,6 +1871,19 @@ class CountingBackendService(DummyBackendService):
 
 
 @pytest.mark.asyncio
+async def test_a_failed_port_check_on_a_live_session_stays_a_ports_verdict(context_factory):
+    ctx = _port_ctx(
+        context_factory, DummyRedis(), success=False, connectivity=DummyConnectivityService(success=False, status="error")
+    )
+    ctx = ctx.model_copy(update={"ssh": _Session(closed=False)})
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.VERIFY_FAILED.reason
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "declared,expected_pass,expected_reason",
     [(2, True, Msg.SKIPPED_ALL_PORTS_RENTED.reason), (3, False, Msg.VERIFY_FAILED.reason)],
@@ -1989,3 +2052,53 @@ async def test_host_runtime_fault_is_the_dind_probes_own_reading(context_factory
     result = await PortConnectivityCheck().run(ctx)
 
     assert result.updates["state"].host_runtime_fault is fault
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("known_sysbox", [True, False])
+async def test_a_skipped_dind_probe_keeps_sysbox_and_its_memory(context_factory, known_sysbox):
+    """DAH-6376: no free port for the DinD probe, so nothing was measured: the node keeps its known Sysbox value,
+    the verified-Sysbox memory is not forgotten, and the ports that answered still pass the check."""
+    redis_service = DummyRedis()
+    redis_service.sysbox_verified[("miner-hotkey", "executor-123")] = 86400
+    services = build_services(
+        redis=redis_service,
+        backend=DummyBackendService(),
+        connectivity=DummyConnectivityService(
+            success=True, sysbox_runtime=True, verified_port_count=10, dind_ok=False, dind_skipped=True
+        ),
+    )
+    ctx = context_factory(
+        services=services,
+        config=build_context_config(job_batch_id="batch-123"),
+        state=build_state(sysbox_runtime=known_sysbox),
+    )
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.updates["state"].sysbox_runtime is known_sysbox
+    assert result.updates["default_extra"]["dind_skipped"] is True
+    assert ("miner-hotkey", "executor-123") in redis_service.sysbox_verified
+
+
+@pytest.mark.asyncio
+async def test_a_skipped_dind_probe_after_a_timed_out_scrape_test_is_no_sysbox_miss(context_factory):
+    """DAH-6376 review: an unrented node whose scrape Sysbox test timed out asked the probe for Sysbox; the probe
+    was skipped, so nothing was measured and the cycle must not end on SYSBOX_REQUIRED_MISSING."""
+    services = build_services(
+        redis=DummyRedis(),
+        backend=DummyBackendService(),
+        connectivity=DummyConnectivityService(
+            success=True, sysbox_runtime=True, verified_port_count=100, dind_ok=False, dind_skipped=True
+        ),
+    )
+    ctx = context_factory(
+        services=services,
+        config=build_context_config(job_batch_id="batch-123"),
+        state=build_state(sysbox_runtime=False, specs=dict(TIMED_OUT_SPECS)),
+    )
+
+    result = await PortConnectivityCheck().run(ctx)
+
+    assert result.updates["state"].sysbox_runtime is True

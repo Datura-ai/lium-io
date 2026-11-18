@@ -77,7 +77,7 @@ async def test_only_an_unrented_validator_reading_that_failed_is_published_early
         service.publish_machine_specs.assert_awaited_once()
         args, kwargs = service.publish_machine_specs.await_args
         assert args == ([candidate], "miner-hotkey", "miner-coldkey")
-        assert kwargs == {"is_whole_miner_batch": False}
+        assert kwargs == {"is_whole_miner_batch": False, "published_early": True}
         assert candidate.scored_at is None
         assert service.outage_tally.published_early == {candidate.executor_info.uuid}
     else:
@@ -144,16 +144,63 @@ def test_the_cycle_end_silencer_gives_nodes_published_early_their_state_from_bef
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("whole_batch", "recorded"), [(True, True), (False, False)])
-async def test_only_the_cycle_publish_records_what_it_sent(monkeypatch, whole_batch, recorded):
+@pytest.mark.parametrize(
+    ("whole_batch", "express", "publish_fails", "recorded"),
+    [(True, False, False, True), (False, False, False, False), (False, True, False, True), (True, False, True, False)],
+)
+async def test_only_the_cycle_publish_records_what_it_sent(monkeypatch, whole_batch, express, publish_fails, recorded):
+    # review 4510532986: an express publish records its list too, and a failed publish records nothing
     service = MinerService.__new__(MinerService)
     service.cycle_published_availability = {}
     service.redis_service = AsyncMock()
+    if publish_fails:
+        service.redis_service.publish.side_effect = ConnectionError("redis down")
     service._pod_states_capped_for_spec = lambda result, extra: None
     monkeypatch.setattr("services.miner_service.settings.DRY_RUN", False)
     node, unchecked = _result([SSH]), _result(None)
 
-    await service.publish_machine_specs([node, unchecked], "hk", "ck", is_whole_miner_batch=whole_batch)
+    await service.publish_machine_specs(
+        [node, unchecked], "hk", "ck", is_whole_miner_batch=whole_batch, remember_availability=express
+    )
 
-    expected = {str(node.executor_info.uuid).lower(): [SSH]} if recorded else {}
+    expected = {("hk", str(node.executor_info.uuid).lower()): [SSH]} if recorded else {}
     assert service.cycle_published_availability == expected
+
+
+def _publisher(monkeypatch, receivers: int, remembered: list[dict]) -> tuple[MinerService, JobResult]:
+    service = MinerService.__new__(MinerService)
+    service.redis_service = AsyncMock()
+    service.redis_service.publish.return_value = receivers
+    service._pod_states_capped_for_spec = lambda result, extra: None
+    monkeypatch.setattr("services.miner_service.settings.DRY_RUN", False)
+    node = _result([GPU_LOST])
+    service.cycle_published_availability = {("hk", str(node.executor_info.uuid).lower()): remembered}
+    return service, node
+
+
+@pytest.mark.asyncio
+async def test_a_list_no_connector_received_forgets_the_remembered_one(monkeypatch):
+    # review 4523252153: PUBLISH succeeds with no subscriber, so the backend may still hold the GPU_LOST it cleared
+    service, node = _publisher(monkeypatch, receivers=0, remembered=[GPU_LOST])
+    node.availability_errors = []
+
+    await service.publish_machine_specs([node], "hk", "ck", is_whole_miner_batch=False, remember_availability=True)
+
+    assert service.cycle_published_availability == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("published_early", "kept"), [(False, False), (True, True)])
+async def test_a_partial_finding_forgets_the_remembered_list_unless_it_is_the_early_publish(
+    monkeypatch, published_early, kept
+):
+    # review 4523252162: a session-lost GPU_LOST merges into the backend's list, so a remembered [] is stale and
+    # would relist the node on the outage restore; the early unreachable publish is the one the restore undoes
+    service, node = _publisher(monkeypatch, receivers=1, remembered=[])
+
+    await service.publish_machine_specs(
+        [node], "hk", "ck", is_whole_miner_batch=False, published_early=published_early
+    )
+
+    assert bool(service.cycle_published_availability) is kept
+

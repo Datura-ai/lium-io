@@ -343,6 +343,11 @@ class FakeSSHConnection:
 SSH_BANNER = b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n"
 
 
+async def teardowns_after_verdict() -> None:
+    """Wait for the passed probes' teardowns, which run after the verdict."""
+    await asyncio.gather(*module._TEARDOWNS_AFTER_VERDICT)
+
+
 class FakeReader:
     """docker-proxy's accept-then-close (b"": EOF before any line) or sshd's identification line."""
 
@@ -645,6 +650,32 @@ async def test_a_standing_failure_ends_with_a_passed_probe():
 
 
 @pytest.mark.asyncio
+async def test_a_probe_that_clears_a_standing_failure_in_a_cycle_without_verifyx_does_not_pass_the_cycle():
+    """VerifyX skipped this cycle for the standing failure: the cycle must not relist the node unjudged."""
+    redis = FakeRedis(failed_step=STEP_GPU_COUNT)
+    ctx, docker, _ = make_probe_context(redis=redis)
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, verifyx_skipped_for_standing_probe_failure=True)})
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False and result.event.reason_code == Msg.CYCLE_WITHOUT_VERIFYX.reason
+    assert "clear_verified_job_info" not in result.updates
+    assert redis.standing_failure() is None and redis.stamped()
+
+
+@pytest.mark.asyncio
+async def test_a_probe_that_clears_a_standing_failure_in_a_cycle_without_the_all_cards_run_does_not_pass_the_cycle():
+    """lio-deployment#129 review: the all-cards work proof was deferred for the standing failure; the cycle must not
+    relist the node before every card proved itself."""
+    redis = FakeRedis(failed_step=STEP_GPU_COUNT)
+    ctx, docker, _ = make_probe_context(redis=redis)
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, allcards_skipped_for_standing_probe_failure=True)})
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False and result.event.reason_code == Msg.CYCLE_WITHOUT_ALLCARDS.reason
+    assert redis.standing_failure() is None and redis.stamped()
+
+
+@pytest.mark.asyncio
 async def test_a_standing_failure_holds_through_cycles_without_a_verdict_until_a_probe_passes():
     """The failure is carried by every cycle that reaches no verdict and never lapses on its own: a broken
     node relisted without a clean probe fails a renter's pod first."""
@@ -701,6 +732,7 @@ async def test_the_probe_holds_the_create_lock_from_the_idleness_re_read_until_i
     ctx, docker, _ = make_probe_context(docker=RecordingDocker(), redis=redis)
     with probe_settings(), renter_path():
         result = await RentalProbeCheck().run(ctx)
+        await teardowns_after_verdict()
     assert result.event.reason_code == Msg.PROBE_OK.reason
     assert events == ["acquired", "idleness re-read", "create", "released", "delete"]
 
@@ -783,6 +815,9 @@ async def test_success_records_every_step_tears_down_and_stamps_the_interval():
     ctx, docker, redis = make_probe_context()
     with probe_settings(), renter_path() as seen:
         result = await RentalProbeCheck().run(ctx)
+        # the pass is recorded first; the teardown runs after the verdict
+        assert redis.stamped() and not docker.delete_calls and not redis.removed_pending
+        await teardowns_after_verdict()
 
     assert result.passed and result.event.reason_code == Msg.PROBE_OK.reason
     what = result.event.what_we_saw
@@ -791,7 +826,6 @@ async def test_success_records_every_step_tears_down_and_stamps_the_interval():
         STEP_SSHD_LISTEN,
         STEP_SSH_LOGIN,
         STEP_GPU_COUNT,
-        STEP_TEARDOWN,
     ]
     assert all(step["ok"] for step in what["probe_steps"])
     assert what["ssh_port"] == 30002
@@ -966,6 +1000,20 @@ async def test_a_create_that_cannot_open_its_ssh_session_is_inconclusive():
 
 
 @pytest.mark.asyncio
+async def test_a_node_without_an_ssh_host_key_fails_the_probe():
+    ctx, docker, redis = make_probe_context(
+        docker=FakeDocker(create_result=create_failed("docker_sdk_ssh_host_key"))
+    )
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False
+    assert result.event.reason_code == Msg.PROBE_FAILED.reason
+    assert result.updates["score"] == 0.0
+    assert "SSH host key" in result.event.remediation
+    assert "port range" not in result.event.remediation
+
+
+@pytest.mark.asyncio
 async def test_create_failure_before_the_host_is_not_the_nodes_fault():
     """Regression: a validator-side failure (its Redis lock, its key, the attestation verifier) zeroes an
     honest node's score; or the settle runs `docker rm` on a node the create never reached and reports a
@@ -1041,6 +1089,7 @@ async def test_a_slow_starting_sshd_behind_docker_proxy_passes():
     ctx, docker, redis = make_probe_context()
     with probe_settings(deadline=5), renter_path(sshd_up_after=3) as seen:
         result = await RentalProbeCheck().run(ctx)
+        await teardowns_after_verdict()
 
     assert result.passed is True and result.event.reason_code == Msg.PROBE_OK.reason
     steps = {step["step"]: step for step in result.event.what_we_saw["probe_steps"]}
@@ -1245,7 +1294,9 @@ async def test_a_cancel_during_the_teardown_finishes_it_and_still_ends_the_run_c
             return self.delete_result
 
     ctx, docker, redis = make_probe_context(docker=SlowDeleteDocker())
-    with probe_settings(), renter_path():
+    # a failed probe (one card of two): its teardown runs inside the check, a passed one's after the verdict
+    one_gpu = "GPU 0: NVIDIA GeForce RTX 5090 (UUID: GPU-aaaa)\n"
+    with probe_settings(), renter_path(smi_stdout=one_gpu):
         task = asyncio.ensure_future(RentalProbeCheck().run(ctx))
         # let the probe reach the teardown, then cancel while delete_container is running
         while not docker.delete_calls:
@@ -1386,9 +1437,10 @@ async def test_a_create_that_hangs_is_cut_off_and_its_container_removed_by_name(
 
 
 @pytest.mark.asyncio
-async def test_teardown_failure_after_a_clean_run_neither_penalises_nor_stamps():
+async def test_teardown_failure_after_a_clean_run_neither_penalises_nor_keeps_the_stamp(caplog):
     """Regression: the container is left on the node binding the verified ports (PortCount then fails the
-    next cycle) and the probe stamps success, so nothing looks at the node again for six hours."""
+    next cycle) and the probe keeps a success stamp, so nothing looks at the node again for six hours.
+    The teardown runs after the passed verdict; one that does not finish clears the stamp."""
     failed_delete = FailedContainerRequest(
         miner_hotkey=MINER,
         executor_id=EXECUTOR.uuid,
@@ -1400,11 +1452,10 @@ async def test_teardown_failure_after_a_clean_run_neither_penalises_nor_stamps()
     ctx, docker, redis = make_probe_context(docker=FakeDocker(delete_result=failed_delete))
     with probe_settings(), renter_path():
         result = await RentalProbeCheck().run(ctx)
-    assert result.passed is True and result.event.reason_code == Msg.INCONCLUSIVE.reason
-    assert result.event.what_we_saw["reason"] == "teardown did not finish"
-    teardown = next(
-        step for step in result.event.what_we_saw["probe_steps"] if step["step"] == STEP_TEARDOWN
-    )
+        await teardowns_after_verdict()
+    assert result.passed is True and result.event.reason_code == Msg.PROBE_OK.reason
+    (warning,) = [r for r in caplog.records if "did not finish; the node is probed again" in r.getMessage()]
+    teardown = warning.msg.extra["teardown"]
     assert teardown["ok"] is False and "delete_container" in teardown["detail"]
     # the leftover is removed by name over the validation shell, so no port stays bound until the sweep
     assert "docker rm by name over the validation shell left nothing" in teardown["detail"]
@@ -1539,7 +1590,8 @@ def test_the_probe_runs_last_before_scoring_and_never_in_dry_run():
     ]
     assert "RentalProbeCheck" not in dry and "IdleDiskWriteCheck" not in dry
     fast = [type(check).__name__ for check in pipeline_factory.PipelineFactory.build_fast_path_checks()]
-    assert fast[-5:-2] == ["RentalProbeCheck", "IdleDiskWriteCheck", "VerifyXColdRetryCheck"]
+    # the rental egress guard sits between ScoreCheck and FinalizeCheck (DAH-6442)
+    assert fast[-6:-3] == ["RentalProbeCheck", "IdleDiskWriteCheck", "VerifyXColdRetryCheck"]
 
 
 @pytest.mark.asyncio
@@ -1811,3 +1863,44 @@ async def test_another_miners_rental_neither_skips_the_probe_nor_excuses_its_fai
         result = await RentalProbeCheck().run(ctx)
     assert result.passed is False
     assert len(docker.create_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_key_removal_waits_for_this_miners_teardowns_only():
+    # DAH-5699: a teardown still running when the cycle removes the validator's key fails with Permission denied
+    done: list[str] = []
+
+    async def teardown(name: str, seconds: float):
+        await asyncio.sleep(seconds)
+        done.append(name)
+
+    for hotkey, seconds in (("miner-a", 0.05), ("miner-b", 5)):
+        task = asyncio.create_task(teardown(hotkey, seconds), name=f"{module._TEARDOWN_TASK_PREFIX}{hotkey}")
+        module._TEARDOWNS_AFTER_VERDICT.add(task)
+        task.add_done_callback(module._TEARDOWNS_AFTER_VERDICT.discard)
+
+    started = asyncio.get_running_loop().time()
+    await module.wait_for_teardowns_after_verdict("miner-a", max_seconds=60)
+
+    assert done == ["miner-a"]
+    assert asyncio.get_running_loop().time() - started < 1
+    for task in list(module._TEARDOWNS_AFTER_VERDICT):
+        task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_the_teardown_wait_never_outlasts_the_job():
+    async def stuck():
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(stuck(), name=f"{module._TEARDOWN_TASK_PREFIX}miner-a")
+    module._TEARDOWNS_AFTER_VERDICT.add(task)
+    task.add_done_callback(module._TEARDOWNS_AFTER_VERDICT.discard)
+
+    started = asyncio.get_running_loop().time()
+    await module.wait_for_teardowns_after_verdict("miner-a", max_seconds=0.05)
+    await module.wait_for_teardowns_after_verdict("miner-a", max_seconds=-5)  # no time left: no wait
+
+    assert asyncio.get_running_loop().time() - started < 1
+    assert not task.done()
+    task.cancel()

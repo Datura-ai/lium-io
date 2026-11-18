@@ -578,7 +578,8 @@ def test_the_cold_retry_runs_after_every_other_check_right_before_scoring(fast_p
     names = [type(c).__name__ for c in checks]
     assert names.index("VerifyXCheck") < names.index("VerifyXColdRetryCheck") == names.index("ScoreCheck") - 1
     # review 5771536147: the retry check judges the disk of the sample it keeps, so nothing but scoring follows it
-    assert names[names.index("VerifyXColdRetryCheck") + 1 :] == ["ScoreCheck", "FinalizeCheck"]
+    # (the idle egress guard, DAH-6442, runs after scoring and judges nothing)
+    assert names[names.index("VerifyXColdRetryCheck") + 1 :] == ["ScoreCheck", "RentalEgressGuardCheck", "FinalizeCheck"]
     assert not any(isinstance(c, ParallelStage) for c in checks[names.index("VerifyXColdRetryCheck") :])
 
 
@@ -726,6 +727,7 @@ class _PendingRedis(FakeRedis):
     get_pending_pods = RedisService.get_pending_pods
     add_pending_pod = RedisService.add_pending_pod
     remove_pending_pod = RedisService.remove_pending_pod
+    _remove_unacked_container_created_unless = RedisService._remove_unacked_container_created_unless
     renting_in_progress = RedisService.renting_in_progress
 
 
@@ -736,10 +738,21 @@ async def test_a_failed_create_stamp_write_leaves_no_pending_pod_marker():
     redis.fail_next_set_of.add(create_started_at_key("miner", EXECUTOR))
 
     with pytest.raises(RedisTimeoutError):
-        await redis.add_pending_pod("miner", EXECUTOR, "pod-1", kind="gpu_reset")
+        await redis.add_pending_pod("miner", EXECUTOR, "pod-1")
 
     assert redis.hashes.get(PENDING_PODS_PREFIX, {}) == {}
     assert await redis.get_pending_pods("miner", EXECUTOR) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["gpu_reset", "gpu_clocks"])
+async def test_a_gpu_operation_marker_leaves_no_create_stamp(kind):
+    # PR review, 5 Nov: a GPU reset or clock operation is no rental create
+    redis = _PendingRedis()
+    await redis.add_pending_pod("miner", EXECUTOR, "pod-1", kind=kind)
+
+    assert [p["kind"] for p in await redis.get_pending_pods("miner", EXECUTOR)] == [kind]
+    assert await redis.get(create_started_at_key("miner", EXECUTOR)) is None
 
 
 class _CreateDuringRetry(_TimedProbeSequence):

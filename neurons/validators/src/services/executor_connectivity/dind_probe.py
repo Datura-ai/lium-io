@@ -77,12 +77,26 @@ DIND_SSHD_NOT_READY_MESSAGE = (
 DIND_SSHD_NOT_READY = DindLogCause("DIND_SSHD_NOT_READY", DIND_SSHD_NOT_READY_MESSAGE)
 
 
+def describe_ssh_error(error: Exception, port: PortPair) -> str:
+    """The provider-facing ssh fact; a connect timeout has no text of its own."""
+    if isinstance(error, TimeoutError):
+        # a provider report: a router flood/DoS filter dropped this connect right after the port test
+        return (
+            f"ssh to port {port.external}: connect timed out; check the forwarding of that port, and that "
+            "no router or firewall flood protection blocks our checks"
+        )
+    return f"ssh to port {port.external}: {(str(error) or type(error).__name__)[:120]}"
+
+
 # DAH-3634: `docker run` itself refused by the NVIDIA container hook. Every hook line counts
 # except `mount error`: that is sysbox's shiftfs fallback (nvidia_docker_sysbox_setup.sh --check)
 # and keeps SYSBOX_REQUIRED_MISSING. `NVIDIA_RUNTIME_MISMATCH` is the executor updater's name
 # for the same host condition (watchtower/src/watchtower.py RUNTIME_PROBE_NVIDIA_MISMATCH).
 _HOOK_LINE_START = "nvidia-container-cli:"
 _SYSBOX_HOOK_ERROR = "nvidia-container-cli: mount error:"
+# The toolkit's CDI mode refuses `--gpus`; that line has no `nvidia-container-cli:` prefix.
+_CDI_HOOK_ERROR = "invoking the NVIDIA Container Runtime Hook directly"
+_HOOK_LINE_MARKERS = (_HOOK_LINE_START, _CDI_HOOK_ERROR)
 
 # /proc/self/uid_map inside the sysbox probe container (G21), logged as `uid_map` on "Sysbox check ok"
 UID_MAP_USER_NAMESPACE = "user_namespace"
@@ -90,6 +104,13 @@ UID_MAP_IDENTITY = "identity"
 UID_MAP_UNREADABLE = "unreadable"
 
 DOCKER_RUN_CAUSES: tuple[tuple[str, DindLogCause], ...] = (
+    (
+        _CDI_HOOK_ERROR,
+        DindLogCause(
+            "NVIDIA_TOOLKIT_CDI_MODE",
+            "the NVIDIA container toolkit is in CDI mode, which refuses GPU containers started with --gpus",
+        ),
+    ),
     (
         "nvml error: driver/library version mismatch",
         DindLogCause(
@@ -117,9 +138,9 @@ def diagnose_docker_run_error(stderr: str | None) -> DindLogCause | None:
     provider sees the hook's error in the event and not only the validator's reading of it.
     """
     hook_lines = [
-        line[line.find(_HOOK_LINE_START) :].strip()
+        line[min(line.find(m) for m in _HOOK_LINE_MARKERS if m in line) :].strip()
         for line in (stderr or "").splitlines()
-        if _HOOK_LINE_START in line and _SYSBOX_HOOK_ERROR not in line
+        if any(m in line for m in _HOOK_LINE_MARKERS) and _SYSBOX_HOOK_ERROR not in line
     ]
     for pattern, cause in DOCKER_RUN_CAUSES:
         line = next((ln for ln in hook_lines if pattern in ln), None)
@@ -277,7 +298,7 @@ class DindVerifier:
                 )
             error: DindLogCause | None = None
             if created and not sshd_answered and sysbox:
-                error = await self._diagnose_unanswered_container(ssh_client, name, e, log_ctx)
+                error = await self._diagnose_unanswered_container(ssh_client, name, e, port, log_ctx)
             return DindProbeResult(
                 success=False,
                 log_text=f"dind: check failed port={port.internal}",
@@ -364,6 +385,7 @@ class DindVerifier:
         ssh_client: SSHClientConnection,
         name: str,
         ssh_error: Exception,
+        port: PortPair,
         log_ctx: dict[str, Any],
     ) -> DindLogCause:
         """Read the container's logs while it still exists and name the cause (DAH-2856).
@@ -383,7 +405,7 @@ class DindVerifier:
         cause = diagnose_dind_log(stdout)
         if cause.code == DIND_SSHD_NOT_READY.code:
             # the log said nothing, so the ssh error is the only fact left for the provider
-            cause = DindLogCause(cause.code, f"{cause.message} (ssh: {str(ssh_error)[:120]})")
+            cause = DindLogCause(cause.code, f"{cause.message} ({describe_ssh_error(ssh_error, port)})")
         logger.warning(
             _m(
                 "DinD container started but sshd never answered",

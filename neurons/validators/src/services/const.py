@@ -40,9 +40,11 @@ GPU_MODEL_RATES = {
     "NVIDIA GeForce RTX 4060": 0.0,
     "NVIDIA GeForce RTX 4090": 0.05,
     "NVIDIA GeForce RTX 4090 D": 0.02,
-    # DAH-5508: no rental history yet, so no share, as the RTX 5090 D and the Quadro RTX 8000 it was paid as before.
-    # Only reachable with RTX_4090_48GB_MODEL_ENABLED on (see gpu_spec_table.classify_gpu_model).
+    # DAH-5508: memory-modded cards (gpu_spec_table.MODDED_VRAM_MODELS): no rental history yet, so no share, as the
+    # RTX 5090 D and the Quadro RTX 8000 the 48 GB card was paid as before.
     "NVIDIA GeForce RTX 4090 48GB": 0.0,
+    "NVIDIA GeForce RTX 4080 32GB": 0.0,
+    "NVIDIA GeForce RTX 4080 SUPER 32GB": 0.0,
     # "NVIDIA RTX 4000 Ada Generation": 0.005,
     "NVIDIA RTX PRO 2000 Blackwell": 0.0,
     "NVIDIA RTX PRO 4000 Blackwell": 0.0,
@@ -128,8 +130,6 @@ DOWNLOAD_SPEED_WEIGHT = 0.05
 
 MAX_GPU_COUNT = 14
 
-UNRENTED_MULTIPLIER = 1
-
 GPU_UTILIZATION_LIMIT = 5  # percent
 GPU_MEMORY_UTILIZATION_LIMIT = 5  # percent
 
@@ -153,6 +153,8 @@ GPU_WEDGE_SWEEP_SETTLE_SECONDS = 5  # let GPU state settle after a container is 
 MIN_PORT_COUNT = 3
 # DAH-3698: a pod needs only its SSH port (plus one for Jupyter); generate_portMappings creates it from that many.
 MIN_POD_PORT_COUNT = 1
+# DAH-6376: a new pod's ports stay out of port checks this long, until the backend's rental list shows them
+POD_PORTS_PENDING_TTL_SECONDS = 900
 # DAH-4961: the disk floor the renter listing used to apply itself; an idle node past it now fails
 # validation instead of being hidden. The free-space floor is settings.MIN_FREE_DISK_GB (per environment).
 MAX_DISK_UTILIZATION_PERCENT = 90
@@ -166,7 +168,6 @@ PORT_RANGE_BUCKET_WIDTH = 5000
 BATCH_PORT_TIMEOUT = 40
 BATCH_PORT_CONCURRENCY = 200
 BATCH_HEALTH_CHECK_TIMEOUT = 10  # seconds to wait for batch verifier to become healthy
-VERIFY_JOB_REQUIRED_COUNT = 6 * 24 * 1
 
 # Emission split between the rented "mining" pool and the unrented + burn pool is
 # sourced from shared config at runtime via core.config.get_total_burn_emission()
@@ -176,9 +177,8 @@ VERIFY_JOB_REQUIRED_COUNT = 6 * 24 * 1
 # Rental Price Incentive Constants
 TEMPO = 360  # blocks per epoch (from subtensor)
 SECONDS_PER_BLOCK = 12  # seconds per block
-FIXED_RATIO = 0.41  # fixed constant for rental emission calculation
+FIXED_RATIO = 0.50  # miners' share of subnet emission; converts USD pay to emission share
 
-IS_NOT_DEPOSITED_SCORE_MULTIPLIER = 0.5
 DOCKER_DIND_IMAGE = "daturaai/dind:0.0.3"
 
 LIB_NVIDIA_ML_DIGESTS = {
@@ -324,6 +324,22 @@ FILLER_CONTAINER_PREFIX = "filler_"
 # Still a pod_* name, so both sweepers protect it while the pod is rented (they add this suffix to
 # every protected pod name) and reap it once the pod is gone.
 EDIT_PARKED_SUFFIX = "__prev"
+# The name a recovery parks a pod under when it stopped the pod but could not write its STOPPED_BY_RECOVERY mark:
+# the name itself says the validator stopped it. Protected and reaped like EDIT_PARKED_SUFFIX.
+RECOVERY_STOPPED_SUFFIX = "__stopped"
+PARKED_SUFFIXES = (EDIT_PARKED_SUFFIX, RECOVERY_STOPPED_SUFFIX)
+# A parked container with renter files in its own layer under the encrypted volume's plaintext path (written
+# while dockerd ran it without the gocryptfs mount; a later remount only hides them) is kept under this prefix
+# after a successful edit, instead of removed: no sweep removes a name outside pod_/filler_.
+KEPT_UNMOUNTED_PREFIX = "kept_unmounted_"
+
+
+def unparked_name(name: str) -> str:
+    """The pod's own name of a parked container (either suffix); any other name as it is."""
+    for suffix in PARKED_SUFFIXES:
+        if name.endswith(suffix):
+            return name.removesuffix(suffix)
+    return name
 # DAH-2475: prefix of the persistent DPHN model/runtime cache volumes. The backend builds the full
 # name with the model + runtime version baked in; the validator only needs the prefix, to recognise
 # which volumes belong to the cache when sweeping or reclaiming them.
@@ -405,7 +421,7 @@ LIUM_WORKLOAD_LOOKUPS_PER_CYCLE = 10
 # A pod or filler container created before the label: reaped only when the backend's record of
 # that pod or filler run confirms it ended.
 LEGACY_LIUM_CONTAINER_NAME = re.compile(
-    r"^(?:pod|filler)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:__prev)?$"
+    r"^(?:pod|filler)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:__prev|__stopped)?$"
 )
 # The backend's own probe, created over SSH and so never labelled: health_check_{uuid4().hex}, or
 # the int(time.time()) suffix it used before (lium-platform orchestrator/executor_health_check.py).
@@ -420,6 +436,10 @@ PROBE_CONTAINER_NAME = "lium_roce_probe"
 # volumes. Named — and named with a Lium prefix — so the provider-side load gate excuses the seconds
 # of CPU it holds instead of counting our own housekeeping against the miner.
 CACHE_SWEEP_CONTAINER_NAME = "lium_cache_sweep"
+
+# DAH-6004: the scrape's short-lived egress check container (miner_jobs/machine_scrape.py
+# EGRESS_PROBE_NAME_PREFIX), suffixed per run.
+EGRESS_PROBE_CONTAINER_PREFIX = "lium_egress_probe_"
 
 # Short-lived containers LIUM starts on an executor that carry no backend-issued id to confirm
 # them by: validator DinD/port probes, backend health probes, the RoCE link probe. The
@@ -439,6 +459,7 @@ LIUM_INFRA_CONTAINER_PREFIXES = (
     "s3fs-backup",
     PROBE_CONTAINER_NAME,
     CACHE_SWEEP_CONTAINER_NAME,
+    EGRESS_PROBE_CONTAINER_PREFIX,
 )
 
 # For simplicity, store whitelist in code. Can be updated to use DB if needed. 
@@ -484,6 +505,9 @@ TDX_WHITELIST = {
             # DAH-5243 — runner sha256:f8421a1d… (executor-v1.156, 2026-10-26)
             # includes /miner-identity for portal registration. Measured files unchanged.
             "0cc30085543511090db2952809f104dd30ec7d8630abb9fc4cde8590068ec104": 7,
+            # DAH-6549 — the same runner digest with pre_launch_script.sh keeping the guest's own rsync (the
+            # sysbox installer's static rsync crashed in __libc_early_init). Version 8.
+            "24ddd0868ee11bb38981420c157f00013651491002333c7f90d0ffc30d56377e": 8,
             # Version 3 (ab4d1433…, July runner sha256:f85b948b…) is gone and its number burned:
             # that runner bakes the STAGING validator hotkey via config_override.py and answers every
             # prod validator with 401. Removed, not demoted: TDX_MINIMUM_COMPOSE_VERSION defaults to 0.

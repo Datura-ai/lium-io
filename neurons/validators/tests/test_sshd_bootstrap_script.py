@@ -183,7 +183,7 @@ class BootstrapHarness:
     def watchdog_spawned(self) -> bool:
         return (self.state / "nohup_calls").exists()
 
-    def run(self, *args: str, verify_secs: int = 2) -> subprocess.CompletedProcess:
+    def run(self, *args: str, verify_secs: int = 2, **extra_env: str) -> subprocess.CompletedProcess:
         env = {
             **os.environ,
             "PATH": f"{self.shims}:{os.environ['PATH']}",
@@ -198,6 +198,7 @@ class BootstrapHarness:
             "LIUM_NVIDIA_LIB_DIRS": str(self.nvidia_lib_dir),
             "LIUM_VULKAN_ICD_DIR": str(self.vulkan_icd_dir),
             "LIUM_APT_ETC": str(self.apt_etc),
+            **extra_env,
         }
         return subprocess.run(
             ["sh", str(SCRIPT), *args],
@@ -419,6 +420,8 @@ def test_vulkan_icd_only_registers_the_driver_and_leaves_sshd_alone(harness):
     assert result.returncode == 0, result.stdout + result.stderr
     assert (harness.vulkan_icd_dir / "nvidia_egl_icd.json").exists()
     assert harness.sshd_start_attempts() == []
+    # DAH-6042: the image starts sshd once; the watchdog brings it back (spawned in the background)
+    assert "Started sshd watchdog" in result.stdout
 
 
 # DAH-6029: records the narrowed sources apt-get was pointed at (the temp dir is gone afterwards)
@@ -513,6 +516,77 @@ def test_failed_main_only_install_falls_back_to_all_sources(harness):
     assert "retrying with all of the image's apt sources" in result.stdout
 
 
+def test_waits_out_the_images_apt_lock_on_the_main_only_install(harness):
+    harness.stage_sshd_payload(SSHD_STARTS)
+    (harness.apt_etc / "sources.list").write_text("deb http://deb.debian.org/debian trixie main\n")
+    # the image's own apt-get holds the lists lock for the first two updates
+    lock_twice = (
+        'case "$*" in update*) n=$(cat "$SHIM_STATE/locked" 2>/dev/null || echo 0); '
+        'if [ "$n" -lt 2 ]; then echo $((n + 1)) > "$SHIM_STATE/locked"; '
+        'echo "E: Could not get lock /var/lib/apt/lists/lock. It is held by process 98 (apt-get)" >&2; exit 100; fi ;; esac\ncase'
+    )
+    harness._write_executable(harness.shims / "apt-get", APT_GET_SHIM.replace("case", lock_twice, 1))
+
+    result = harness.run("--grace", "0")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = harness.apt_calls()
+    assert len(calls) == 4 and all("SourceList" in c for c in calls), calls  # 3 updates, 1 install: main only
+    assert "retrying with all of the image's apt sources" not in result.stdout
+
+
+def test_a_non_lock_apt_failure_is_not_retried(harness):
+    harness.stage_sshd_payload(SSHD_STARTS)
+    (harness.apt_etc / "sources.list").write_text("deb http://deb.debian.org/debian trixie main\n")
+    fail = 'case "$*" in update*SourceList*) echo "E: Some index files failed to download" >&2; exit 100 ;; esac\ncase'
+    harness._write_executable(harness.shims / "apt-get", APT_GET_SHIM.replace("case", fail, 1))
+
+    result = harness.run("--grace", "0")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert [c for c in harness.apt_calls() if "SourceList" in c] and len(harness.apt_calls()) == 3
+
+
+@pytest.mark.parametrize(
+    "failed, falls_back",
+    [
+        ([("E", "noble-backports")], False),
+        ([("E", "noble-updates")], False),  # Ubuntu mirror mid-sync: noble + noble-security still carry openssh's fixes
+        ([("E", "noble-updates"), ("W", "noble-backports")], False),
+        ([("E", "noble-security")], True),  # the security pocket is the one that must arrive
+        ([("E", "noble-updates"), ("W", "noble-security")], True),  # an unreachable security InRelease counts too
+        ([("E", "noble")], True),
+        # a fatal repository error suppresses the later fetch summaries (the unreachable -security one)
+        ([("E", "trixie-updates"), ("RAW", "E: The repository http://deb.debian.org/debian trixie-updates InRelease is not signed.")], True),
+    ],
+)
+def test_a_failed_list_fetch_installs_from_the_lists_that_arrived(harness, failed, falls_back):
+    harness.stage_sshd_payload(SSHD_STARTS)
+    (harness.apt_etc / "sources.list").write_text("deb http://archive.ubuntu.com/ubuntu noble main\n")
+    errs = "".join(
+        f"E: Failed to fetch http://archive.ubuntu.com/ubuntu/dists/{s}/main/binary-amd64/Packages.gz"
+        "  File has unexpected size (1 != 2). Mirror sync in progress?\n"
+        if level == "E"
+        else f"{s}\n"
+        if level == "RAW"
+        else f"W: Failed to fetch http://archive.ubuntu.com/ubuntu/dists/{s}/InRelease  Temporary failure resolving x\n"
+        for level, s in failed
+    )
+    fail = f"case \"$*\" in update*SourceList*) printf '%s' '{errs}' >&2; exit 100 ;; esac\ncase"
+    harness._write_executable(harness.shims / "apt-get", APT_GET_SHIM.replace("case", fail, 1))
+
+    result = harness.run("--grace", "0")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = harness.apt_calls()
+    if falls_back:
+        assert [c.split()[0] for c in calls] == ["update", "update", "install"] and "SourceList" not in calls[2], calls
+        assert "retrying with all of the image's apt sources" in result.stdout
+    else:
+        assert len(calls) == 2 and "install" in calls[1] and "SourceList" in calls[1], calls
+        assert "retrying with all of the image's apt sources" not in result.stdout
+
+
 # DAH-6029: one fixture across the deb822 / one-line grammar, checked against apt's own parser.
 GRAMMAR_LIST = """# deb http://commented.example/debian stable main
 deb http://http.kali.org/kali kali-rolling main contrib non-free
@@ -598,3 +672,62 @@ def test_main_only_sources_match_apts_own_parse(tmp_path, awk):
     assert parts.count("Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg") == 1
     assert parts.count("signed-by: /usr/share/keyrings/ubuntu-archive-keyring.gpg") == 1
     assert "signed-by=/etc/apt/keyrings/x.gpg" in (narrowed / "sources.list").read_text()
+
+
+# DAH-6042: the pod heals its own SSH. A started sshd brings the :22 listener back.
+SSHD_STARTS_LISTENING = """#!/bin/sh
+touch "$SHIM_STATE/sshd_running"
+cp "$SHIM_STATE/listening" "$LIUM_PROC_TCP_FILES"
+printf 'started\\n' >> "$SHIM_STATE/sshd_started"
+exit 0
+"""
+
+
+def _watchdog_harness(harness, *, running: bool, listening: bool):
+    harness.install_sshd_bin(SSHD_STARTS_LISTENING)
+    (harness.state / "listening").write_text(PROC_TCP_WITH_LISTENER)
+    if running:
+        harness.mark_sshd_running()
+    harness.proc_tcp.write_text(PROC_TCP_WITH_LISTENER if listening else PROC_TCP_WITHOUT_LISTENER)
+
+
+def test_watchdog_leaves_a_serving_sshd_alone(harness):
+    _watchdog_harness(harness, running=True, listening=True)
+
+    result = harness.run("--watchdog-loop", LIUM_WATCHDOG_PASSES="2")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert harness.sshd_start_attempts() == []
+
+
+def test_watchdog_restarts_sshd_when_nothing_listens_on_22_though_an_sshd_process_is_left(harness):
+    # a session process left behind, or a killed sshd that a non-reaping PID 1 (sleep infinity) keeps as a
+    # zombie, is named sshd too; the listener is what the renter needs
+    _watchdog_harness(harness, running=True, listening=False)
+
+    result = harness.run("--watchdog-loop", LIUM_WATCHDOG_PASSES="2")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert harness.sshd_start_attempts() == ["started"]
+    assert "Watchdog restarted sshd" in result.stdout
+
+
+def test_watchdog_restarts_a_dead_sshd(harness):
+    _watchdog_harness(harness, running=False, listening=False)
+
+    result = harness.run("--watchdog-loop", LIUM_WATCHDOG_PASSES="1")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert harness.sshd_start_attempts() == ["started"]
+
+
+def test_a_failed_step_never_ends_the_watchdog(harness):
+    _watchdog_harness(harness, running=False, listening=False)
+    harness.install_sshd_bin(SSHD_NEVER_SERVES)
+    harness._write_executable(harness.shims / "ssh-keygen", "#!/bin/sh\nexit 1\n")
+
+    result = harness.run("--watchdog-loop", LIUM_WATCHDOG_PASSES="3")
+
+    # under the script's `set -e` the failed keygen used to end the loop on its first pass
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert harness.sshd_start_attempts() == ["failed"] * 3

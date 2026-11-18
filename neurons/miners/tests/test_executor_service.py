@@ -344,6 +344,29 @@ async def test_register_pubkey_answers_by_the_deadline_with_the_uploads_that_fin
 
 
 @pytest.mark.asyncio
+async def test_register_pubkey_warns_with_the_ids_of_executors_cut_off_at_the_deadline(
+    executor_service, test_executor, monkeypatch
+):
+    """A cut-off upload logs nothing itself; the provider needs the executor ids to find the slow node."""
+    dead = Executor(uuid=uuid4(), validator="//TestValidator", address="192.0.2.2", port=8001)
+
+    async def upload(executor, *_args, **_kwargs):
+        if executor is dead:
+            await asyncio.sleep(10)
+        return None
+
+    monkeypatch.setattr(es, "UPLOAD_SSH_KEY_BUDGET_SECONDS", 0.2)
+    es.settings.RENTAL_REQUEST_HOOK = None
+    executor_service.get_executors_for_validator = AsyncMock(return_value=[test_executor, dead])
+    executor_service.send_pubkey_to_executor = upload
+
+    with patch.object(es.logger, "warning") as warning:
+        await executor_service.register_pubkey("v", "m", _SSH_KEY.encode(), "0xaa")
+
+    assert warning.call_args.args[0].extra["cut_off_executor_ids"] == [str(dead.uuid)]
+
+
+@pytest.mark.asyncio
 async def test_register_pubkey_counts_the_deadline_from_the_validators_signed_timestamp(
     executor_service, test_executor, monkeypatch
 ):
@@ -481,7 +504,8 @@ async def test_central_miner_lists_each_node_with_its_registered_host_key_from_o
     keyed_node, unkeyed_node = str(uuid4()), str(uuid4())
     portal_items = [
         {"id": keyed_node.upper(), "validator_hotkey": "v", "executor_ip_address": "node.example.com",
-         "executor_ip_port": "8001", "ssh_host_key": "ssh-ed25519 AAAAregistered"},
+         "executor_ip_port": "8001", "ssh_host_key": "ssh-ed25519 AAAAregistered",
+         "node_hotkeys": ["5Account", "5Pool"], "account_claim": "claim-1"},
         {"id": unkeyed_node, "validator_hotkey": "v", "executor_ip_address": "203.0.113.5", "executor_ip_port": "8001"},
     ]
     es.settings.CENTRAL_MODE = True
@@ -503,6 +527,10 @@ async def test_central_miner_lists_each_node_with_its_registered_host_key_from_o
     by_id = {info.uuid: info for info in registration.accepted}
     assert by_id[keyed_node.lower()].expected_ssh_host_key == "ssh-ed25519 AAAAregistered"
     assert by_id[unkeyed_node].expected_ssh_host_key is None
+    # DAH-6539: the account binding from the same read; none for a node the portal lists without it
+    assert by_id[keyed_node.lower()].expected_node_hotkeys == ["5Account", "5Pool"]
+    assert by_id[keyed_node.lower()].expected_account_claim == "claim-1"
+    assert by_id[unkeyed_node].expected_node_hotkeys is None
 
 
 @pytest.mark.asyncio

@@ -28,7 +28,6 @@ if TYPE_CHECKING:
 from incentive.utils import get_hourly_rate
 from incentive.default import DefaultIncentive, get_min_driver_multiplier
 from incentive.price_provider import PriceProvider
-from services.gpu_spec_table import RTX_4090_48GB
 from services.const import (
     DEFAULT_JOB_OWNER_MINER,
     FIXED_RATIO,
@@ -70,7 +69,8 @@ NVIDIACTL_ROOT_UID = 0
 # The share of a GPU configuration's average filler revenue per GPU-hour that a node is paid:
 # spot-node pay and the secure floor.
 # Two constants on purpose: the owner sets each on its own, so changing one must not move the other.
-FILLER_REVENUE_PAY_FACTOR = 1.0
+# Spot is paid 0.9x what Default Jobs earn (DAH-6328), per node and for a GPU model's spot nodes together.
+FILLER_REVENUE_PAY_FACTOR = 0.9
 SECURE_FILLER_REVENUE_FLOOR_FACTOR = 1.0
 # The share of an idle secure node's rate that an idle spot node of the same configuration earns at most
 # (Fish, 6 Nov 2026, DAH-5930): spot idle pay stays below secure idle pay, to keep secure supply worth offering.
@@ -277,15 +277,20 @@ class RentalPriceIncentive(DefaultIncentive):
         # DAH-2528: split-capable idle executors pinned to their gpu_count bucket,
         # revisited once per-bucket fill is known. Items: (base_model, result).
         self._split_fallback_candidates: list[tuple[str, JobResult]] = []
-        # Spot-node pay and secure-floor top-ups, in USD/hour. No cap (owner rule): they are paid on
-        # top of the burn-capped rental share, from `unbucketed_share`, and sit in no bucket, so they
-        # neither face nor cause cap dilution and never scale another idle payee.
+        # Spot-node pay and secure-floor top-ups, in USD/hour. No cap on the share (owner rule): they
+        # are paid on top of the burn-capped rental share, from `unbucketed_share`, and sit in no
+        # secure bucket, so they never dilute a secure node. Spot nodes face their own per-bucket
+        # cap at the secure numbers (DAH-5944, spot_count_by_bucket).
         self._unbucketed_rental_cost = 0.0
         self.unbucketed_share = 0.0
         self.unbucketed_share_raw = 0.0
         self.unbucketed_paid_fraction = 1.0
         # Idle spot nodes priced this cycle, scaled to their GPU model's filler earnings once all are known.
         self._spot_pay_candidates: list[tuple[str, JobResult]] = []
+        # DAH-5944: idle spot GPUs per (base_model, bucket), a pool of their own under the secure caps.
+        self.spot_count_by_bucket: dict[tuple[str, int], int] = {}
+        # every Spot node counted there, diluted by _dilute_spot_pay_over_cap whichever pay list it is on
+        self._spot_cap_members: list[tuple[str, JobResult]] = []
         # Idle secure nodes the secure floor may lift once the cap multipliers are known.
         self._secure_floor_candidates: list[tuple[str, JobResult]] = []
         self.total_rental_cost = 0.0
@@ -449,8 +454,7 @@ class RentalPriceIncentive(DefaultIncentive):
         # unreachable by construction; a verified TDX quote is that machine's capability path.
         # The quote alone, not JobResult.tdx_attestation_passed: that flag also drops on a failed
         # GPU-CC verdict, which is observe-only today, so a CVM submitting failing GPU evidence
-        # would earn less than one submitting none. Bad GPU evidence is the GPU-attestation
-        # enforcement flag's job; once it is on, evidence is mandatory and no digest reaches here.
+        # would earn less than one submitting none. GPU attestation is observe-only (DAH-4904).
         attested_cvm: bool = result.attestation_digest is not None
         if (
             ncu_profiling_access == NCU_PROFILING_UNRESTRICTED
@@ -612,6 +616,10 @@ class RentalPriceIncentive(DefaultIncentive):
         if isinstance(verified, list):
             # a port two mappings both publish can still serve only one renter
             available = min(available, len(set(verified)))
+        # DAH-5851: a deferred port check lists the last completed check's ports but pays only from this cycle's
+        deferred: Any = result.spec.get("deferred_idle_pay_port_count")
+        if isinstance(deferred, int) and not isinstance(deferred, bool):
+            available = min(available, deferred)
         free_gpu_count: int = result.gpu_count + result.port_unpaid_gpu_count
         free_split_count: int = free_gpu_count // result.gpu_splitting_min_count
         # the rent path refuses any pod below MIN_PORT_COUNT free ports, so below it no split is rentable
@@ -995,6 +1003,7 @@ class RentalPriceIncentive(DefaultIncentive):
         for key, weighted_sum in self._weighted_rate_sum_by_bucket.items():
             cap_mult = self.cap_multiplier_by_bucket.get(key, 0.0)
             self.total_rental_cost += cap_mult * weighted_sum
+        self._dilute_spot_pay_over_cap()
         self._unbucketed_rental_cost += self._spot_pay_within_filler_earnings()
         self._unbucketed_rental_cost += self._secure_floor_top_up()
 
@@ -1234,7 +1243,7 @@ class RentalPriceIncentive(DefaultIncentive):
 
     @staticmethod
     def _qualify_spot_node(job_result: JobResult, excluded_from_both_pools: bool) -> JobResult:
-        """An idle spot node is never in the mining pool and never in a bucket. It is paid from
+        """An idle spot node is never in the mining pool and never in a secure bucket. It is paid from
         unbucketed_share, on top of the burn-capped rental share, priced in _price_spot_node, only
         while it runs a Lium filler and its GPU configuration has a filler revenue average. The
         idle-pool gates do not apply: the node is paid for the filler work it does, not for being
@@ -1275,13 +1284,18 @@ class RentalPriceIncentive(DefaultIncentive):
         SPOT_IDLE_SECURE_RATE_SHARE x the secure rate for this node).
 
         The secure rate is what an idle secure node with this node's GPUs, split setting, sysbox
-        runtime and driver is listed at, before bucket-cap dilution: spot nodes have no cap. It is
-        0 where a secure node of this configuration earns no idle pay, so the min() pays 0 there.
+        runtime and driver is listed at, before secure bucket-cap dilution. It is 0 where a secure
+        node of this configuration earns no idle pay, so the min() pays 0 there. Spot GPUs are
+        then capped per (GPU model, bucket) at the secure caps, in a pool of their own
+        (_dilute_spot_pay_over_cap, DAH-5944).
         """
         base_model: str = self.get_base_model_for_gpu(result.gpu_model)
         cap_spec: dict[int, int] = self.config.max_unrented_gpus.get(base_model, {})
+        # shortcut: no DAH-2528 split-tier reassignment for spot, extend it if spot split nodes crowd a bucket.
         bucket: int = self._resolve_bucket(result, cap_spec)
         result.count_bucket = bucket
+        # own fields, not max_cap & co: those mark a Secure tier member for every reader (portal tier breakdown)
+        result.spot_cap = cap_spec.get(bucket, 0)
         result.sysbox_multiplier = 1.0 if result.sysbox_runtime else 1 - settings.PORTION_FOR_SYSBOX_UNRENTED
         result.driver_multiplier = get_min_driver_multiplier(result.nvidia_driver_version)
         if base_model not in self.config.rental_incentive_gpu_types:
@@ -1299,12 +1313,27 @@ class RentalPriceIncentive(DefaultIncentive):
             FILLER_REVENUE_PAY_FACTOR * result.filler_revenue_per_gpu_hour,
             self._spot_secure_rate(result),
         )
+        # only paid GPUs take cap slots: a zero driver/sysbox multiplier or filler average pays 0 and dilutes nobody
+        if result.effective_rate > 0 and result.spot_cap > 0:
+            key: tuple[str, int] = (base_model, bucket)
+            self.spot_count_by_bucket[key] = self.spot_count_by_bucket.get(key, 0) + result.gpu_count
+            self._spot_cap_members.append((base_model, result))
         self._spot_pay_candidates.append((base_model, result))
 
+    def _dilute_spot_pay_over_cap(self) -> None:
+        """DAH-5944 (Fish): idle spot GPUs of a GPU model and bucket are capped at the secure cap, in a
+        pool of their own (spot never counts against secure caps, nor secure against spot). Above the
+        cap every spot rate there is scaled by min(count, cap) / count, before the DAH-5128 pool."""
+        for base_model, result in self._spot_cap_members:
+            count: int = self.spot_count_by_bucket[(base_model, result.count_bucket)]
+            result.spot_gpus_in_bucket = count
+            result.spot_cap_multiplier = min(count, result.spot_cap) / count
+            result.effective_rate *= result.spot_cap_multiplier
+
     def _spot_pay_within_filler_earnings(self) -> float:
-        """DAH-5128 (Fish): a GPU model's idle spot nodes share what the model's fillers earn per hour;
-        they are not each paid an expected rate. When their spot rates add up to more, every one is
-        scaled by the same multiplier, so a new spot node dilutes the others and the total stays put.
+        """DAH-5128 (Fish): a GPU model's idle spot nodes share FILLER_REVENUE_PAY_FACTOR x what the model's
+        fillers earn per hour; they are not each paid an expected rate. When their spot rates add up to more,
+        every one is scaled by the same multiplier, so a new spot node dilutes the others and the total stays put.
         Returns the USD/hour they are paid in all."""
         rate_sum_by_model: dict[str, float] = {}
         pool_by_model: dict[str, float] = {}
@@ -1319,7 +1348,9 @@ class RentalPriceIncentive(DefaultIncentive):
                         "base_model": base_model,
                         "filler_revenue_usd_per_hour": pool_by_model[base_model],
                         "spot_rate_sum_usd_per_hour": rate_sum,
-                        "spot_pool_multiplier": min(1.0, pool_by_model[base_model] / rate_sum) if rate_sum > 0 else 1.0,
+                        "spot_pool_multiplier": min(1.0, FILLER_REVENUE_PAY_FACTOR * pool_by_model[base_model] / rate_sum)
+                        if rate_sum > 0
+                        else 1.0,
                         "spot_gpu_count": sum(r.gpu_count for m, r in self._spot_pay_candidates if m == base_model),
                     },
                 )
@@ -1327,7 +1358,9 @@ class RentalPriceIncentive(DefaultIncentive):
         total: float = 0.0
         for base_model, result in self._spot_pay_candidates:
             rate_sum: float = rate_sum_by_model[base_model]
-            multiplier: float = min(1.0, pool_by_model[base_model] / rate_sum) if rate_sum > 0 else 1.0
+            multiplier: float = (
+                min(1.0, FILLER_REVENUE_PAY_FACTOR * pool_by_model[base_model] / rate_sum) if rate_sum > 0 else 1.0
+            )
             result.spot_pool_multiplier = multiplier
             result.effective_rate *= multiplier
             total += result.gpu_count * result.effective_rate
@@ -1659,11 +1692,6 @@ class RentalPriceIncentive(DefaultIncentive):
         gpu_count = params.gpu_count
         is_rented = params.is_rented
 
-        if gpu_model == RTX_4090_48GB and not settings.RTX_4090_48GB_MODEL_ENABLED:
-            # DAH-5508: off, the card is rejected, so no estimate at all (0.0 would read as an available $0)
-            return RentalPriceEstimate(
-                gpu_model=gpu_model, base_model=gpu_model, gpu_count=gpu_count, is_rented=is_rented, usd_per_epoch=None
-            )
         base_model = BASE_GPU_MAP.get(gpu_model)
         cap_spec = self.config.max_unrented_gpus.get(base_model, {}) if base_model else {}
         eligible_for_unrented_estimate = (
@@ -1893,9 +1921,6 @@ async def precompute_all_estimates(
     on-demand request to the validator.
     """
     gpu_models = list(BASE_GPU_MAP.keys())
-    if not settings.RTX_4090_48GB_MODEL_ENABLED:
-        # DAH-5508: the validator rejects this card while off, so publish no estimate for it.
-        gpu_models.remove(RTX_4090_48GB)
     estimates: dict[str, dict] = {}
     for gpu_model in gpu_models:
         estimates[gpu_model] = {

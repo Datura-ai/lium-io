@@ -65,6 +65,18 @@ class AvailabilityErrorCode(StrEnum):
     VERIFICATION_FAILED = "VERIFICATION_FAILED"
     # DAH-5351: a busy card's clock collapsed by a thermal slowdown, or still unproven since (GpuThermalThrottleCheck).
     GPU_THERMAL_COLLAPSE = "GPU_THERMAL_COLLAPSE"
+    # A reported card the create step cannot attach, so every rent on it fails (GpuKernelCountCheck).
+    GPU_KERNEL_UNATTACHABLE = "GPU_KERNEL_UNATTACHABLE"
+    # DAH-6241: a card measured below the GPU model the node reports (CapabilityCheck, GpuModelVerdictCheck).
+    GPU_MODEL_MISMATCH = "GPU_MODEL_MISMATCH"
+    # DAH-6241: a card of a judged model whose GPU check gave no numbers after its one tolerated miss.
+    GPU_MODEL_NOT_MEASURED = "GPU_MODEL_NOT_MEASURED"
+    # lio#2305: a claimed card whose own work-proof gave no right answer, until a run on it passes.
+    GPU_WORK_PROOF_FAILED = "GPU_WORK_PROOF_FAILED"
+    # DAH-6539: the node at this address is not the account's (NodeAccountCheck); hidden, a running rental runs on.
+    NODE_ACCOUNT_MISMATCH = "NODE_ACCOUNT_MISMATCH"
+    # DAH-6539: the account read failed or stalled; a reach failure, so silenced with our own outage like one.
+    NODE_ACCOUNT_UNVERIFIED = "NODE_ACCOUNT_UNVERIFIED"
 
 
 # Faults the node itself proved: never a sign of our own outage, and never silenced with one.
@@ -73,6 +85,12 @@ NODE_GPU_FAULT_CODES = frozenset(
         AvailabilityErrorCode.GPU_LOST,
         AvailabilityErrorCode.GPU_MEMORY_HEALTH_FAILED,
         AvailabilityErrorCode.GPU_THERMAL_COLLAPSE,
+        AvailabilityErrorCode.GPU_KERNEL_UNATTACHABLE,
+        AvailabilityErrorCode.GPU_MODEL_MISMATCH,
+        AvailabilityErrorCode.GPU_MODEL_NOT_MEASURED,
+        AvailabilityErrorCode.GPU_WORK_PROOF_FAILED,
+        # read off the machine itself (its host key or account files)
+        AvailabilityErrorCode.NODE_ACCOUNT_MISMATCH,
         # only raised for REASONS_THAT_HIDE_AT_ONCE, all read off the node's own report or probe
         AvailabilityErrorCode.VERIFICATION_FAILED,
     }
@@ -190,11 +208,13 @@ def build_ssh_unreachable_event(
         if host_key_mismatch
         else (
             "Check that sshd on the node accepts the validator on its management port, "
-            "and that no firewall or rate limit rejects the connection. If your host NATs or "
-            "proxies inbound SSH, set EXECUTOR_SSH_SOURCE_PIN=false and EXECUTOR_SSH_SOURCE_LIMITS=false "
-            "in the executor .env and recreate the executor container (in ~/compute-subnet/neurons/executor: "
-            "docker compose up -d --force-recreate; a plain docker compose up -d or docker restart keeps "
-            "the old .env values)."
+            "and that no firewall or rate limit rejects the connection. While the source pin is on, the "
+            "validator's keys log in only from the validator's addresses, so a relay, tunnel or Docker "
+            "userland-proxy in front of sshd makes every login fail; with the pin off it does not. If your "
+            "host NATs, relays or proxies inbound SSH, set EXECUTOR_SSH_SOURCE_PIN=false and "
+            "EXECUTOR_SSH_SOURCE_LIMITS=false in the executor .env and recreate the executor container "
+            "(in ~/compute-subnet/neurons/executor: docker compose up -d --force-recreate; a plain "
+            "docker compose up -d or docker restart keeps the old .env values)."
         ),
         what_we_saw={
             "executor_uuid": executor_uuid,

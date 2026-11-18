@@ -6,6 +6,8 @@ VerifyX writes less RAM/disk, and a cold bandwidth sample is published but not e
 never sets `first_pass`, so a scored verification is byte-for-byte today's.
 """
 
+import platform
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,12 +16,12 @@ import pytest
 import services.matrix_validation_service as mvs
 from core.config import settings
 from neurons.validators.src.services.task.checks.capability import CapabilityCheck
-from neurons.validators.src.services.task.checks.verifyx import VerifyXCheck
+from neurons.validators.src.services.task.checks.verifyx import VerifyXCheck, _first_pass_challenge_config
 from neurons.validators.src.services.task.messages import CapabilityMessages as CapMsg
 from neurons.validators.src.services.task.messages import VerifyXMessages as VxMsg
 from neurons.validators.src.services.task import pipeline_factory as pipeline_factory_module
 from neurons.validators.src.services.task.pipeline_factory import PipelineFactory
-from neurons.validators.src.services.verifyx_validation_service import VerifyXValidationService
+from neurons.validators.src.services.verifyx_validation_service import VerifyXValidationService, VerifyXValidator
 from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsResponse
 
 from tests.test_verifyx_cold_sample_retry import _run as _verifyx_then_cold_retry
@@ -233,12 +235,19 @@ async def test_first_pass_verifyx_uses_the_smaller_challenge_config(context_fact
     result = await VerifyXCheck().run(_ctx(context_factory, service, first_pass=True, rented_data=_never_measured()))
 
     assert service.kwargs == {
-        "challenge_config_overrides": {"memory_max_test_gb": 16, "storage_throughput_test_gb": 1}
+        "challenge_config_overrides": {
+            "memory_max_test_gb": 16,
+            "storage_throughput_test_gb": 1,
+            "network_floor_mbps": 50.0,
+            "network_min_timeout_seconds": 45,
+        }
     }
     assert result.passed is True
     assert result.event.what_we_saw["first_pass_challenge_config"] == {
         "memory_max_test_gb": 16,
         "storage_throughput_test_gb": 1,
+        "network_floor_mbps": 50.0,
+        "network_min_timeout_seconds": 45,
     }
     # A warm sample seeds the EMA exactly as today.
     assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(500.0)
@@ -299,7 +308,14 @@ async def test_first_pass_cold_sample_retry_measures_with_the_same_smaller_confi
 
     result = await _verifyx_then_cold_retry(_ctx(context_factory, service, first_pass=True, rented_data=_never_measured()))
 
-    first_pass_overrides = {"challenge_config_overrides": {"memory_max_test_gb": 16, "storage_throughput_test_gb": 1}}
+    first_pass_overrides = {
+        "challenge_config_overrides": {
+            "memory_max_test_gb": 16,
+            "storage_throughput_test_gb": 1,
+            "network_floor_mbps": 50.0,
+            "network_min_timeout_seconds": 45,
+        }
+    }
     assert service.kwargs_per_call == [first_pass_overrides, first_pass_overrides]
     assert result.passed is True
     assert result.event.what_we_saw["cold_sample_retry"]["used"] == "retry"
@@ -384,7 +400,38 @@ async def test_verifyx_service_applies_overrides_to_the_challenge_config_only():
     assert default_config["memory_max_test_gb"] == settings.verifyx.MEMORY_MAX_TEST_GB
     assert default_config["storage_throughput_test_gb"] == settings.verifyx.STORAGE_THROUGHPUT_TEST_GB
     assert first_pass_config == {**default_config, "memory_max_test_gb": 16, "storage_throughput_test_gb": 1}
-    # Untouched: the RAM minimum the executor must still allocate, the disk minimum, the download.
+    # Untouched: the RAM minimum the executor must still allocate, the disk minimum.
     assert first_pass_config["memory_min_test_gb"] == default_config["memory_min_test_gb"]
     assert first_pass_config["storage_min_available_gb"] == default_config["storage_min_available_gb"]
-    assert first_pass_config["network_timeout_seconds"] == default_config["network_timeout_seconds"]
+    assert default_config["network_timeout_seconds"] == settings.verifyx.NETWORK_TIMEOUT_SECONDS
+    assert "network_floor_mbps" not in default_config  # the cycle's waits are not sized
+
+
+def test_first_pass_network_waits_are_sized_from_the_acceptance_floor():
+    """A slow package mirror on a new node: the library sizes each wait from its transfer at the
+    acceptance floor (a 500 MiB package at 50 Mbps gets ~101 s, a small one on a fast floor 45 s; the
+    library's tests cover the sizing). The first pass sends the floor and the 45 s minimum; it no
+    longer caps the timeout itself, so a library without sizing keeps the full wait."""
+    config = _first_pass_challenge_config()
+    assert config["network_floor_mbps"] == settings.verifyx.NETWORK_MIN_PACKAGE_DOWNLOAD_SPEED_MBPS == 50.0
+    assert config["network_floor_mbps"] <= settings.verifyx.NETWORK_MIN_DOWNLOAD_SPEED_MBPS
+    assert config["network_min_timeout_seconds"] == settings.FIRST_PASS_VERIFYX_NETWORK_TIMEOUT_SECONDS == 45
+    assert "network_timeout_seconds" not in config
+
+
+@pytest.mark.skipif(platform.machine() != "x86_64", reason="the vendored libverifyx.so is the x86_64 build")
+def test_vendored_library_sizes_the_waits_from_the_first_pass_config():
+    """The vendored libverifyx.so (lium-platform#2518) acts on the first-pass keys: the sized waits
+    ride in the challenge, so it grows; a library without sizing ignores the keys (same length)."""
+    lib = str(Path(__file__).resolve().parents[1] / "libverifyx.so")
+    base = {
+        "memory_allocation_percentage": 80, "memory_min_test_gb": 1, "memory_max_test_gb": 16,
+        "storage_min_available_gb": 10, "storage_throughput_test_gb": 1, "network_timeout_seconds": 120,
+        "enable_xet_challenge": True,
+    }
+    machine_info = {"uuids": "GPU-x", "gpu_count": 1, "gpu_model": "H100"}
+
+    def cipher(config):
+        return VerifyXValidator(lib, 7).generate_challenge({"seed": 7, "machine_info": machine_info, "config": config})
+
+    assert len(cipher({**base, **_first_pass_challenge_config()})) > len(cipher(base))

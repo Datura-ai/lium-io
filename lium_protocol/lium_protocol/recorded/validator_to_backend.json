@@ -383,6 +383,7 @@
         "miner_hotkey": "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
         "executor_id": "6f1d2c3b-4a5e-4f60-9b7c-8d9e0f1a2b3c",
         "pod_id": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+        "command_id": "5c0e9a52-3b7d-4e1f-9a26-7d4b8c1e0f35",
         "workload_kind": "CUSTOMER_RENTAL",
         "container_name": "container_0b1c2d3e",
         "volume_name": "volume_0b1c2d3e",

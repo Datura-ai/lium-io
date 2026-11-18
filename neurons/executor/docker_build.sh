@@ -143,11 +143,13 @@ if [[ -n "${PLATFORMS:-}" ]]; then
     --platform "${PLATFORMS}" \
     --provenance=false \
     --build-context datura=../../datura \
+    --build-context liumd="${SCRIPT_DIR}/liumd" \
     --output "type=oci,dest=${OCI_ARCHIVE:-/tmp/executor.oci.tar}" \
     "${SCRIPT_DIR}"
 else
   docker build \
     --build-context datura=../../datura \
+    --build-context liumd="${SCRIPT_DIR}/liumd" \
     --tag "${IMAGE_NAME}" \
     "${SCRIPT_DIR}"
 fi

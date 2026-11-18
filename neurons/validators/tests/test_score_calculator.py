@@ -133,6 +133,14 @@ def test_rented_pod_resources_flag_zeroes_a_rented_score():
     assert "below its deployed CPUs" in warning
 
 
+def test_spec_floor_flag_zeroes_a_rented_score():
+    """SpecFloorCheck is non-fatal under a live rental: only this flag zeroes it."""
+    ctx = _ctx(500.0).model_copy(update={"spec_floor_passed": False})
+    actual_score, _, warning = calculate_scores(ctx, rented=True)
+    assert actual_score == 0.0
+    assert "below the hardware floor" in warning
+
+
 def test_rented_throughput_flag_zeroes_a_rented_score():
     ctx = _ctx(500.0).model_copy(update={"rented_throughput_passed": False})
     actual_score, _, warning = calculate_scores(ctx, rented=True)
@@ -207,3 +215,21 @@ def test_hardware_identity_flag_zeroes_a_rented_score():
     actual_score, _, warning = calculate_scores(ctx, rented=True)
     assert actual_score == 0.0
     assert "Host hardware identity" in warning
+
+
+@pytest.mark.parametrize("passed", [True, False])
+def test_gpu_model_flag_zeroes_a_rented_score(passed):
+    """DAH-6241: a stored GPU model mismatch is non-fatal on a live rental; only this flag zeroes the score."""
+    ctx = _ctx(500.0).model_copy(update={"gpu_model_passed": passed})
+    actual_score, _, warning = calculate_scores(ctx, rented=True)
+    assert actual_score == (1.0 if passed else 0.0)
+    assert ("A GPU is not the model the node reports" in warning) is not passed
+
+
+@pytest.mark.parametrize("passed", [True, False])
+def test_node_account_flag_zeroes_a_rented_score(passed):
+    """DAH-6539: a node on another account's machine is non-fatal on a live rental; only this flag zeroes its score."""
+    ctx = _ctx(500.0).model_copy(update={"node_account_passed": passed})
+    actual_score, _, warning = calculate_scores(ctx, rented=True)
+    assert actual_score == (1.0 if passed else 0.0)
+    assert ("not on the machine its account registered" in warning) is not passed

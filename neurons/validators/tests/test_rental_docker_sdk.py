@@ -1,8 +1,10 @@
 import base64
 import json
 import os
+import shutil
 import socket
 import struct
+import subprocess
 import threading
 from unittest.mock import Mock
 
@@ -1360,6 +1362,34 @@ def test_require_rental_docker_ssh_host_key_strips_present_key():
     assert require_rental_docker_ssh_host_key(executor_info) == "ssh-ed25519 AAAATESTKEY"
 
 
+@pytest.mark.parametrize(
+    ("reported", "registered", "accepted"),
+    [
+        ("ssh-ed25519 AAAATESTKEY", "ssh-ed25519 AAAAOTHERKEY", False),
+        ("ssh-ed25519 AAAATESTKEY", "ssh-ed25519 AAAAOTHERKEY\nssh-ed25519 AAAATESTKEY node", True),
+        ("ssh-ed25519 AAAATESTKEY\nssh-ed25519 AAAAOTHERKEY", "ssh-ed25519 AAAATESTKEY", False),
+    ],
+)
+def test_require_rental_docker_ssh_host_key_checks_a_hostnames_registered_key(reported, registered, accepted):
+    executor_info = ExecutorSSHInfo(
+        uuid="executor-id",
+        address="node.example",
+        port=8000,
+        ssh_username="root",
+        ssh_port=2222,
+        python_path="/usr/bin/python",
+        root_dir="/root",
+        ssh_host_key=reported,
+        expected_ssh_host_key=registered,
+    )
+
+    if accepted:
+        assert require_rental_docker_ssh_host_key(executor_info) == reported
+    else:
+        with pytest.raises(RentalDockerConnectionError, match="not the host key registered"):
+            require_rental_docker_ssh_host_key(executor_info)
+
+
 def test_rental_ssh_adapter_uses_explicit_key_and_known_hosts(monkeypatch, tmp_path):
     import paramiko
 
@@ -1692,3 +1722,95 @@ def test_rental_ssh_adapter_hands_paramiko_a_socket_to_the_pinned_address(tmp_pa
     finally:
         connected["sock"].close()
         listener.close()
+
+
+def _run_key_append(spec, env=None) -> subprocess.CompletedProcess:
+    return subprocess.run(list(spec.argv), input=spec.stdin, capture_output=True, text=True, env=env)
+
+
+def test_authorized_keys_append_adds_the_keys_within_the_deadline(tmp_path):
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("existing\n")
+
+    completed = _run_key_append(
+        build_authorized_keys_exec_spec(container_name="pod_key", public_keys=["k1", "k2"], target_path=str(target))
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == "existing\nk1\nk2\n"
+
+
+def test_authorized_keys_append_past_its_deadline_appends_nothing(tmp_path):
+    # DAH-6441: a stalled add must never append after the backend confirmed a removal
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("existing\n")
+
+    completed = _run_key_append(
+        build_authorized_keys_exec_spec(
+            container_name="pod_key", public_keys=["k1"], target_path=str(target), append_deadline_seconds=-1
+        )
+    )
+
+    assert completed.returncode == 75
+    assert target.read_text() == "existing\n"
+
+
+def test_authorized_keys_append_that_cannot_read_its_keys_appends_nothing(tmp_path):
+    blocker = tmp_path / "ssh"
+    blocker.write_text("a file where the directory should be")
+
+    completed = _run_key_append(
+        build_authorized_keys_exec_spec(
+            container_name="pod_key", public_keys=["k1"], target_path=str(blocker / "authorized_keys")
+        )
+    )
+
+    assert completed.returncode == 1
+    assert blocker.read_text() == "a file where the directory should be"
+
+
+def test_authorized_keys_append_needs_no_date_or_mktemp_in_the_image(tmp_path):
+    # minimal rental images: only the tools the add always used (sh, cat, mkdir, chmod) are on PATH
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    for tool in ("sh", "cat", "mkdir", "chmod"):
+        (tools / tool).symlink_to(shutil.which(tool))
+    target = tmp_path / "ssh" / "authorized_keys"
+    spec = build_authorized_keys_exec_spec(container_name="pod_key", public_keys=["k1", "k2"], target_path=str(target))
+
+    completed = subprocess.run(
+        [str(tools / "sh"), *spec.argv[1:]], input=spec.stdin, capture_output=True, text=True, env={"PATH": str(tools)}
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == "k1\nk2\n"
+    assert "date" not in spec.argv[2] and "mktemp" not in spec.argv[2]
+
+
+def test_authorized_keys_append_reads_the_clock_whole_as_sysboxfs_needs(tmp_path):
+    # DAH-6441: in a Sysbox pod /proc/uptime fails the shell's byte-wise `read` (rc 1, empty) but a whole read works;
+    # a `read` that always fails stands in for it, so the clock must come from cat alone
+    target = tmp_path / "ssh" / "authorized_keys"
+    spec = build_authorized_keys_exec_spec(container_name="pod_key", public_keys=["k1"], target_path=str(target))
+
+    completed = subprocess.run(
+        ["sh", "-c", "read() { return 1; }; " + spec.argv[2]], input=spec.stdin, capture_output=True, text=True
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == "k1\n"
+
+
+@pytest.mark.skipif(shutil.which("busybox") is None, reason="busybox not installed")
+def test_authorized_keys_append_runs_under_busybox_ash(tmp_path):
+    target = tmp_path / "ssh" / "authorized_keys"
+    spec = build_authorized_keys_exec_spec(container_name="pod_key", public_keys=["k1"], target_path=str(target))
+
+    completed = subprocess.run(
+        [shutil.which("busybox"), "sh", "-c", spec.argv[2]], input=spec.stdin, capture_output=True, text=True
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == "k1\n"
