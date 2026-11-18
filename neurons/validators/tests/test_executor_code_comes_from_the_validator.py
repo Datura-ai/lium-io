@@ -201,3 +201,9 @@ def test_every_payload_is_found():
     # in the repository the executor sources; in the image the copies the Dockerfile takes from them
     for name in executor_payload.GPU_MONITOR + executor_payload.INSPECTOR + executor_payload.VERIFYX:
         assert (executor_payload.PAYLOAD_DIR / name).read_bytes() == (EXECUTOR_SOURCES / name).read_bytes(), name
+
+
+def test_scripts_are_written_where_the_disk_reserve_holds():
+    # a renter filling the host disk must not stop the validator writing its scripts
+    reserve = (EXECUTOR_SOURCES.parent / "setup_disk_reserve.sh").read_text()
+    assert f'workdir=$MNT/app-work" {executor_payload.SERVICE_DIR_PARENT}\n' in reserve
