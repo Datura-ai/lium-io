@@ -45,7 +45,22 @@ def _read(host_root: Path):
         },
         {"os": os, "re": re},
     )
-    return ns["get_needrestart_guard"](str(host_root))
+    return ns["get_needrestart_guard"](str(host_root))[:2]
+
+
+def _reason(host_root: Path):
+    ns = build_scrape_namespace(
+        SRC / "miner_jobs" / "machine_scrape.py",
+        {
+            "get_needrestart_guard",
+            "needrestart_data_line",
+            "NEEDRESTART_GUARD_FILE",
+            "NEEDRESTART_GUARD_SERVICES",
+            "NEEDRESTART_GUARD_UNITS",
+        },
+        {"os": os, "re": re},
+    )
+    return ns["get_needrestart_guard"](str(host_root))[2]
 
 
 def _host(tmp_path: Path, guard_text: str | None, needrestart: bool = True) -> Path:
@@ -335,6 +350,9 @@ def test_code_in_config_loaded_before_the_guard_makes_it_partial(tmp_path, code,
         (host / "etc/needrestart/conf.d/00-local.conf").write_text(code + "\n")
 
     assert _read(host) == ("partial", ALL)
+    # DAH-6566 follow-up: the event names the file and the line the scrape could not prove
+    path = "needrestart.conf" if where == "main" else "conf.d/00-local.conf"
+    assert f"/etc/needrestart/{path}, loaded before the guard" in _reason(host)
 
 
 @pytest.mark.parametrize(
@@ -359,6 +377,7 @@ def test_a_main_config_that_does_not_load_the_guard_last_makes_it_partial(tmp_pa
         (host / "usr/sbin/needrestart").write_text("")
 
     assert _read(host) == ("partial", ALL)
+    assert "needrestart.conf" in _reason(host)
 
 
 @pytest.mark.parametrize(
@@ -444,3 +463,23 @@ def test_no_guard_is_written_without_needrestart(tmp_path):
 
     assert out.stdout == "needrestart_guard_skipped no_needrestart\n"
     assert not (tmp_path / "etc").exists()
+
+
+def test_a_readable_config_gives_no_reason_and_a_guard_line_it_cannot_read_is_named(tmp_path):
+    assert _reason(_host(tmp_path, _setup_script_guard())) is None
+
+    host = _host(tmp_path / "odd", _setup_script_guard() + "\n$nrconf{override_rc}{qr(^x)} = 0;\n")
+
+    assert _read(host) == ("partial", ALL)
+    assert _reason(host).endswith("is not a guard line: $nrconf{override_rc}{qr(^x)} = 0;")
+
+
+@pytest.mark.asyncio
+async def test_the_partial_reason_reaches_the_event(context_factory):
+    specs = {"needrestart_guard": "partial", "needrestart_guard_unguarded": ALL, "needrestart_guard_reason": "why"}
+    ssh = AsyncMock()
+    ssh.run.return_value = SimpleNamespace(exit_status=0, stdout="needrestart_guard_unchanged\n", stderr="")
+
+    result = await NeedrestartGuardCheck().run(context_factory(state=build_state(specs=specs), ssh=ssh))
+
+    assert result.event.what_we_saw["reason"] == "why"

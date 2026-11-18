@@ -784,29 +784,33 @@ def needrestart_data_line(line, literal, plain_setting):
 
 
 def get_needrestart_guard(host_root="/proc/1/root"):
-    # "present", "partial", "missing" or "no_needrestart", plus the services the host file leaves unguarded.
+    # "present", "partial", "missing" or "no_needrestart", the services the host file leaves unguarded, and why a
+    # "partial" could not prove the guard effective (None when it could read everything).
     # Hosts set up before the setup script wrote the file (16 Nov) have needrestart and no guard. The setup script
     # writes the guard file on hosts without needrestart too, so only the binary or the stock config counts.
+    def unknowable(why):  # a config the scrape cannot prove leaves every service unguarded; `why` names file and line
+        return "partial", list(NEEDRESTART_GUARD_SERVICES), why
+
     if os.path.samefile(host_root + "/", "/"):  # as docker_utils' [ /proc/1/root/ -ef / ]
         raise RuntimeError("no host view: the executor is not in the host PID namespace")
     if not (os.path.exists(host_root + "/usr/sbin/needrestart") or os.path.isfile(host_root + "/etc/needrestart/needrestart.conf")):
-        return "no_needrestart", []
+        return "no_needrestart", [], None
     try:
         with open(host_root + NEEDRESTART_GUARD_FILE) as guard_file:
             text = guard_file.read()
     except FileNotFoundError:
-        return "missing", list(NEEDRESTART_GUARD_SERVICES)
+        return "missing", list(NEEDRESTART_GUARD_SERVICES), None
     zero = ("0", "'0'", '"0"')  # anything else (1, '1', "'0'", an expression) may be true in Perl
     last_values = {}
     other_rules = []  # (pattern, value) of every rule that is not one of the five exact keys
-    for line in text.splitlines():
+    for number, line in enumerate(text.splitlines(), 1):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         # only the exact line the setup script writes is understood; any other live Perl (another
         # delimiter, two statements on a line, a map reset) may undo a guard, so it guards nothing
         match = re.fullmatch(r"[ \t]*\$nrconf\{override_rc\}->\{qr\(\^([\w.-]+)\)\}\s*=\s*([^;#]+?)\s*;\s*(#.*)?", line)
         if not match:
-            return "partial", list(NEEDRESTART_GUARD_SERVICES)
+            return unknowable(f"{NEEDRESTART_GUARD_FILE} line {number} is not a guard line: {line.strip()[:160]}")
         last_values[match.group(1)] = match.group(2)  # Perl keeps the last assignment
         if match.group(1) not in NEEDRESTART_GUARD_SERVICES:
             other_rules.append(("^" + match.group(1), match.group(2)))
@@ -814,7 +818,6 @@ def get_needrestart_guard(host_root="/proc/1/root"):
     # is Perl, and code anywhere (a tie on %nrconf, a sub, %nrconf = ()) can undo the guard in ways no text scan
     # rules out, so every file must be data only: literal settings, {/[ structures of qr// and literal entries,
     # and the loader. A later file may only set other keys to literals; anything else leaves it unknowable.
-    unknowable = ("partial", list(NEEDRESTART_GUARD_SERVICES))
     literal = r"""(-?\d+(\.\d+)?|'[^'\\]*'|"[^"\\$@]*")"""
     plain_setting = r"[ \t]*\$nrconf\{(\w+)\}\s*=\s*" + literal + r"\s*;\s*(#.*)?"
     loader = [
@@ -831,30 +834,34 @@ def get_needrestart_guard(host_root="/proc/1/root"):
     try:
         with open(host_root + "/etc/needrestart/needrestart.conf") as conf_file:
             main = [ln for ln in conf_file.read().splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
-    except FileNotFoundError:
-        return unknowable  # no main config, so nothing loads conf.d and the guard file is never read
+    except FileNotFoundError:  # no main config, so nothing loads conf.d and the guard file is never read
+        return unknowable("no /etc/needrestart/needrestart.conf, so conf.d is never loaded")
     # the stock files differ only in 3.4's log condition and its one computed setting, matched exactly
     old_log = 'print STDERR "$LOGPREF eval $fn\\n" if($nrconf{verbose});'
     stock_code = ["$nrconf{skip_mapfiles} = (-d '/proc/sys/kernel/grsecurity' ? -1 : 0);"]
     flat = [" ".join(ln.split()).replace(old_log, loader[2]) for ln in main]
     at = next((i for i in range(len(flat)) if flat[i : i + len(loader)] == loader), None)
-    if at is None or at + len(loader) != len(main):
-        return unknowable  # conf.d is not loaded the stock way, or main config code runs after the guard file
-    earlier = [[ln for ln, f in zip(main[:at], flat) if f not in stock_code]]
+    if at is None:
+        return unknowable("/etc/needrestart/needrestart.conf does not load conf.d with the stock loader")
+    if at + len(loader) != len(main):
+        return unknowable(f"/etc/needrestart/needrestart.conf runs code after the conf.d loader: {main[at + len(loader)].strip()[:160]}")
+    earlier = [("/etc/needrestart/needrestart.conf", [ln for ln, f in zip(main[:at], flat) if f not in stock_code])]
     names = sorted(n for n in os.listdir(conf_dir) if n.endswith(".conf") and n != guard_name)
     for name in names:
         with open(conf_dir + "/" + name) as conf_file:
             lines = [ln for ln in conf_file.read().splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
         if name < guard_name:
-            earlier.append(lines)
-        elif not all((m := re.fullmatch(plain_setting, ln)) and m.group(1) != "override_rc" for ln in lines):
-            return unknowable
-    for lines in earlier:
+            earlier.append(("/etc/needrestart/conf.d/" + name, lines))
+            continue
+        for ln in lines:
+            if not ((m := re.fullmatch(plain_setting, ln)) and m.group(1) != "override_rc"):
+                return unknowable(f"/etc/needrestart/conf.d/{name}, loaded after the guard, is not a literal setting: {ln.strip()[:160]}")
+    for path, lines in earlier:
         block = None
         for ln in lines:
             data = needrestart_data_line(ln, literal, plain_setting)
             if data is None:
-                return unknowable
+                return unknowable(f"{path}, loaded before the guard, has a line that is not plain data: {ln.strip()[:160]}")
             if data[0] == "open":
                 block = data[1]
             elif data[0] == "close":
@@ -877,7 +884,7 @@ def get_needrestart_guard(host_root="/proc/1/root"):
                 overlapping = True  # a pattern Python cannot read may still match in Perl
         if overlapping or last_values.get(service) not in zero:
             unguarded.append(service)
-    return ("partial" if unguarded else "present"), unguarded
+    return ("partial" if unguarded else "present"), unguarded, None
 
 
 def get_vloopback_volume_bytes(docker_root_dir, filler_only=False, sizes=None):
@@ -2732,7 +2739,11 @@ def get_machine_specs():
 
     # DAH: hosts set up before 16 Nov lack the needrestart guard; missing key = unknown, never fails
     try:
-        data["data_needrestart_guard"], data["data_needrestart_guard_unguarded"] = get_needrestart_guard()
+        (
+            data["data_needrestart_guard"],
+            data["data_needrestart_guard_unguarded"],
+            data["data_needrestart_guard_reason"],
+        ) = get_needrestart_guard()
     except Exception as exc:
         data["data_needrestart_guard_scrape_error"] = repr(exc)
 
