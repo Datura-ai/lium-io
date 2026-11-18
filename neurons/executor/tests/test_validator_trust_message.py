@@ -3,6 +3,7 @@
 Real signatures with ephemeral keypairs; a temp dir stands in for the reserve_data volume.
 """
 
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -211,3 +212,25 @@ def test_the_image_copy_needs_the_release_owner(tmp_path, owner, new_validator):
     image = tmp_path / "image.json"
     image.write_text(_dump(_signed(owner, new_validator, 1)))  # not signed by the release owner
     assert _trust(tmp_path, owner, image).held is None
+
+
+def test_owner_a_b_a_prefers_the_current_owners_message(tmp_path, monkeypatch, owner, old_validator, new_validator):
+    # review finding: image copy signed by A (revision 8), kept message signed by B, the owner file still says B
+    owner_b = Keypair.create_from_uri("//LiumTrustNewOwner")
+    monkeypatch.setattr(trust_service, "RELEASE_SUBNET_OWNER_HOTKEY", owner.ss58_address)
+    image = tmp_path / "image.json"
+    image.write_text(_dump(_signed(owner, new_validator, 8)))
+    (tmp_path / MESSAGE_FILE).write_text(
+        json.dumps({**_signed(owner_b, old_validator, 3)._asdict(), "owner": owner_b.ss58_address})
+    )
+    trust = _trust(tmp_path, owner_b, image)
+    assert trust.held.validator == old_validator.ss58_address  # B is still the owner the node knows
+    # the chain names A again: the image message A signed is held at once, with no backend
+    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout: owner.ss58_address)
+    monkeypatch.setattr(trust_service.requests, "get", lambda *a, **k: (_ for _ in ()).throw(requests.ConnectionError()))
+    trust.refresh_owner()
+    assert (trust.held.validator, trust.held.revision) == (new_validator.ss58_address, 8)
+    # a restart with the owner file now saying A keeps it, and A's lower revisions stay refused
+    restarted = _trust(tmp_path, owner, image)
+    assert (restarted.held.validator, restarted.held.revision) == (new_validator.ss58_address, 8)
+    assert not restarted.offer(_signed(owner, old_validator, 5))

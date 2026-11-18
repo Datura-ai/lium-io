@@ -98,12 +98,12 @@ class ValidatorTrust:
         self.held_owner: str | None = None
         # state the volume refused (full, read-only): written again on every refresh until it lands
         self._unsaved: dict[str, dict] = {}
+        # the image copy and the kept message with the owner that signed each, re-ordered on an owner change
+        self._candidates: dict[str, tuple[SignedTrustMessage, str]] = {}
 
     def load(self) -> None:
-        """At start: the owner kept on disk, then the higher revision of the image copy and the kept message.
-
-        Each is checked against the owner that signed it: the image copy against the owner at release, the kept
-        message against the owner recorded with it when it was accepted."""
+        """At start: the owner kept on disk, then the image copy and the kept message, each checked against the
+        owner that signed it (the image copy: the owner at release; the kept message: the owner recorded with it)."""
         if not self.enabled:
             return
         try:
@@ -116,11 +116,31 @@ class ValidatorTrust:
             logger.warning("Validator trust: kept owner unreadable, using the release one: %s", exc)
         image = _read_signed(self.image_message)
         if image is not None:
-            self._take(image, RELEASE_SUBNET_OWNER_HOTKEY)
+            self._candidates["image"] = (image, RELEASE_SUBNET_OWNER_HOTKEY)
         kept = _read_signed(self.state_dir / MESSAGE_FILE)
         if kept is not None:
-            self._take(kept, _read_signer(self.state_dir / MESSAGE_FILE) or self.owner)
+            self._candidates["kept"] = (kept, _read_signer(self.state_dir / MESSAGE_FILE) or self.owner)
+        self._select()
         logger.info("Validator trust at start: %s", self.report())
+
+    def _select(self) -> None:
+        """Hold the best known message for the current owner: one the current owner signed (highest revision), else
+        the kept one, else the image copy. Run at start and after every owner change, so the image copy and the kept
+        message are ordered the same way whatever owner signed each."""
+        best = None
+        for name, (signed, signer) in self._candidates.items():
+            try:
+                trusted = verify_trust_message(signed, signer)
+            except Exception as exc:
+                logger.warning("Validator trust: %s message refused: %s", name, exc)
+                continue
+            current = signer == self.owner
+            rank = (current, trusted.revision if current else 0, name == "kept")
+            if best is None or rank > best[0]:
+                best = (rank, trusted, signer)
+        if best is not None and (best[1], best[2]) != (self.held, self.held_owner):
+            self.held, self.held_owner = best[1], best[2]
+            logger.warning("Validator trust: now trusting %s (revision %d)", self.held.validator, self.held.revision)
 
     def offer(self, signed: SignedTrustMessage) -> bool:
         """Take a served message: signed by the current owner, and a higher revision than the held one unless the
@@ -129,6 +149,7 @@ class ValidatorTrust:
             return False
         if not self._take(signed, self.owner):
             return False
+        self._candidates["kept"] = (signed, self.owner)
         self._save(MESSAGE_FILE, {**signed._asdict(), "owner": self.owner})
         return True
 
@@ -207,6 +228,7 @@ class ValidatorTrust:
             logger.warning("Validator trust: subnet owner changed from %s to %s", self.owner, owner)
             self.owner = owner
             self._save(OWNER_FILE, {"owner": owner})
+            self._select()
 
 
 validator_trust = ValidatorTrust(enabled=importlib.util.find_spec("core.config_override") is None)
