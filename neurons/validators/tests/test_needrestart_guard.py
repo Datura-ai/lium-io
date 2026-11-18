@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import os
 import re
 import subprocess
@@ -43,7 +44,7 @@ def _read(host_root: Path):
             "NEEDRESTART_GUARD_SERVICES",
             "NEEDRESTART_GUARD_UNITS",
         },
-        {"os": os, "re": re},
+        {"os": os, "re": re, "difflib": difflib},
     )
     return ns["get_needrestart_guard"](str(host_root))[:2]
 
@@ -58,7 +59,7 @@ def _reason(host_root: Path):
             "NEEDRESTART_GUARD_SERVICES",
             "NEEDRESTART_GUARD_UNITS",
         },
-        {"os": os, "re": re},
+        {"os": os, "re": re, "difflib": difflib},
     )
     return ns["get_needrestart_guard"](str(host_root))[2]
 
@@ -568,6 +569,19 @@ def test_a_changed_loader_line_is_named_and_a_missing_loader_names_the_file(tmp_
     opener = next(n for n, ln in enumerate(STOCK_MAIN.splitlines(), 1) if "q(/etc/needrestart/conf.d))" in ln)
     main.write_text(STOCK_MAIN.replace("q(/etc/needrestart/conf.d))", "'/etc/needrestart/conf.d')"))
     assert _reason(host) == f"/etc/needrestart/needrestart.conf line {opener} differs from the stock conf.d loader"
+
+    # the optional log line deleted: the line now in its place (the eval) is named, after the intact opener and glob
+    lines = STOCK_MAIN.splitlines()
+    log_line = next(n for n, ln in enumerate(lines, 1) if "print STDERR" in ln and "eval $fn" in ln)
+    main.write_text("\n".join(ln for n, ln in enumerate(lines, 1) if n != log_line) + "\n")
+    assert _reason(host) == f"/etc/needrestart/needrestart.conf line {log_line} differs from the stock conf.d loader"
+
+    # the directory check and its brace deleted: the glob, where the loader starts, is named, not a setting above it
+    last_brace = max(n for n, ln in enumerate(lines, 1) if ln.strip() == "}")
+    main.write_text("\n".join(ln for n, ln in enumerate(lines, 1) if n not in (opener, last_brace)) + "\n")
+    # the glob moved up into the deleted opener's line number
+    assert _reason(host) == f"/etc/needrestart/needrestart.conf line {opener} differs from the stock conf.d loader"
+    assert "conf.d/*.conf>" in (host / "etc/needrestart/needrestart.conf").read_text().splitlines()[opener - 1]
 
     main.write_text("$nrconf{restart} = 'a';\nif (1) {\n}\n}\n")  # stray braces are not a loader
     assert _reason(host) == "/etc/needrestart/needrestart.conf has no stock conf.d loader"

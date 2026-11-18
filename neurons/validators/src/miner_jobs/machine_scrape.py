@@ -2,6 +2,7 @@ from ctypes import *
 import sys
 import os
 import glob
+import difflib
 import http.client
 import json
 import re
@@ -851,19 +852,22 @@ def get_needrestart_guard(host_root="/proc/1/root"):
     flat = [" ".join(ln.split()).replace(old_log, loader[2]) for _, ln in main]
     at = next((i for i in range(len(flat)) if flat[i : i + len(loader)] == loader), None)
     if at is None:
-        # a recognisable loader that was changed: align it on any of its distinctive (non-brace) lines, take the
-        # alignment that matches most loader lines, and name its first changed line, not only the file
-        def matched(start):
-            return sum(0 <= start + j < len(flat) and flat[start + j] == loader[j] for j in range(len(loader)))
-
-        starts = {i - j for i in range(len(flat)) for j in range(len(loader) - 2) if flat[i] == loader[j]}
-        if not starts:
+        # a recognisable loader that was changed: anchor on the first of its distinctive (non-brace) lines in the
+        # file and name the first line that differs from there on, not only the file
+        anchor = next(((i, j) for i in range(len(flat)) for j in range(len(loader) - 2) if flat[i] == loader[j]), None)
+        if anchor is None:
             return unknowable(f"{main_path} has no stock conf.d loader")
-        start = max(sorted(starts), key=matched)
-        off = next(j for j in range(len(loader)) if not 0 <= start + j < len(flat) or flat[start + j] != loader[j])
+        i, j = anchor
+        start = i - j
+        off = next(k for k in range(len(loader)) if not 0 <= start + k < len(flat) or flat[start + k] != loader[k])
         if start + off >= len(flat):
             return unknowable(f"{main_path} line {main[-1][0]} ends inside the conf.d loader")
-        return unknowable(f"{main_path} line {main[max(start + off, 0)][0]} differs from the stock conf.d loader")
+        bad = start + off
+        # before the anchor, a line is the edited loader line only if it still resembles it; else the loader
+        # line is missing there, and the anchor is where the loader visibly starts
+        if off < j and (bad < 0 or difflib.SequenceMatcher(None, flat[bad], loader[off]).ratio() < 0.6):
+            bad = i
+        return unknowable(f"{main_path} line {main[bad][0]} differs from the stock conf.d loader")
     if at + len(loader) != len(main):
         return unknowable(f"{main_path} line {main[at + len(loader)][0]} runs code after the conf.d loader")
     earlier = [(main_path, [line for line, f in zip(main[:at], flat) if f not in stock_code])]
