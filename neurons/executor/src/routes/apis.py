@@ -21,6 +21,7 @@ from fastapi import APIRouter, Depends, Query, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 from services.miner_service import MinerService
+from services.ssh_service import check_authorized_key
 from services.pod_log_service import PodLogService
 from services.hardware_service import get_docker_client, get_system_metrics, get_container_metrics
 from services.update_status_service import ExpectedDigestCache, collect_update_status
@@ -239,6 +240,11 @@ def _validate_ssh_key_consistency(payload: UploadSShKeyPayload) -> None:
     if len(pk_normalized.encode()) > MAX_PUBLIC_KEY_BYTES:
         logger.warning("Rejecting a public_key of %d bytes", len(pk_normalized.encode()))
         raise HTTPException(status_code=400, detail=f"Public key longer than {MAX_PUBLIC_KEY_BYTES} bytes")
+    try:
+        check_authorized_key(pk_normalized)
+    except ValueError as exc:
+        logger.warning("Rejecting a public_key that is not a plain public key line: %s", exc)
+        raise HTTPException(status_code=400, detail="Public key is not a plain public key line")
 
 
 def _validate_validator_signature(payload: UploadSShKeyPayload, require_nonce: bool = False) -> None:

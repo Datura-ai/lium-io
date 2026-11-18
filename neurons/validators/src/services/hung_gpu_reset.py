@@ -43,6 +43,7 @@ from services.gpu_reset import (
     build_reset_command,
     parse_host_gpus,
     plan_host_holders,
+    resets_whole_fabric,
 )
 from services.gpu_wedge import (
     COMPUTE_APPS_QUERY_COMMAND,
@@ -172,7 +173,12 @@ async def _reset(
         warning = _NOT_RESET_WARNING.get(refused.code, ContainerWarningCode.HungGpuNotResetUnsupported)
         return HungGpuResult(hung, warning, refused.detail)
 
-    command = build_reset_command(plan.targets, container_uuids=pod_gpu_uuids, pod_gpu_uuids=pod_gpu_uuids)
+    command = build_reset_command(
+        plan.targets,
+        container_uuids=pod_gpu_uuids,
+        pod_gpu_uuids=pod_gpu_uuids,
+        whole_fabric=resets_whole_fabric(plan.owns_host, plan.host_services),
+    )
     if not plan.owns_host:
         reset = await _run(runner, command, timeout=_RESET_TIMEOUT_SECONDS)
     else:

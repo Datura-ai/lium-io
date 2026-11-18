@@ -2701,3 +2701,60 @@ async def test_a_pod_stopped_for_the_renters_balance_is_not_a_node_fault(
 
     assert result.passed is expected_pass
     assert result.event.reason_code == expected_reason
+
+
+class _GuardStub:
+    check_id = "executor.network.rental_egress_guard"
+
+    def __init__(self):
+        self.calls = 0
+
+    async def run(self, ctx):
+        from neurons.validators.src.services.task.messages import RentalEgressGuardMessages, render_message
+        from neurons.validators.src.services.task.pipeline import CheckResult
+
+        self.calls += 1
+        return CheckResult(
+            passed=True,
+            event=render_message(RentalEgressGuardMessages.APPLIED, ctx=ctx, check_id=self.check_id, what={}),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "containers,pod_running,rental_active,guarded",
+    [
+        # active rental: the halt branch, the only place the guard runs on a rented node
+        ([{"name": "tenant-123", "pod_id": "pod-1"}], True, True, True),
+        # every listed pod stale: the node goes on to scored steps, so no guard here
+        ([{"name": "tenant-123", "pod_id": "pod-1"}], False, False, False),
+        # no rental: the idle guard after ScoreCheck covers it
+        ([], True, True, False),
+    ],
+)
+async def test_egress_guard_runs_only_in_the_rented_halt(context_factory, containers, pod_running, rental_active, guarded):
+    guard = _GuardStub()
+    ctx = context_factory(
+        services=build_services(
+            score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
+            container_cleanup=MockContainerCleanup(),
+            backend=DummyBackendClient(active=rental_active),
+        ),
+        config=build_context_config(),
+        state=build_state(
+            gpu_processes=[],
+            gpu_details=[],
+            gpu_model="NVIDIA RTX 4090",
+            rented_data=build_rented_data("executor-123", {"containers": containers}),
+        ),
+        ssh=DummySSHClient(pod_running=pod_running),
+        collateral_deposited=True,
+        is_rental_succeed=True,
+        contract_version="v1.0.0",
+    )
+
+    result = await TenantEnforcementCheck(egress_guard=guard).run(ctx)
+
+    assert result.halt is guarded
+    assert guard.calls == int(guarded)
+    assert [e.reason_code for e in result.extra_events] == (["RENTAL_EGRESS_GUARD_APPLIED"] if guarded else [])
