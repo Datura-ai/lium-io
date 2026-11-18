@@ -124,18 +124,19 @@ class ValidatorTrust:
         logger.info("Validator trust at start: %s", self.report())
 
     def _select(self) -> None:
-        """Hold the best known message for the current owner: one the current owner signed (highest revision), else
-        the kept one, else the image copy. Run at start and after every owner change, so the image copy and the kept
-        message are ordered the same way whatever owner signed each."""
+        """Hold the best known message: one the current owner signed (highest revision). Without one, a held message
+        stays held; at start the highest revision is taken. Run at start and after every owner change."""
         best = None
         for name, (signed, signer) in self._candidates.items():
+            current = signer == self.owner
+            if not current and self.held is not None:
+                continue  # an owner change alone never swaps the held validator for another former-owner message
             try:
                 trusted = verify_trust_message(signed, signer)
             except Exception as exc:
                 logger.warning("Validator trust: %s message refused: %s", name, exc)
                 continue
-            current = signer == self.owner
-            rank = (current, trusted.revision if current else 0, name == "kept")
+            rank = (current, trusted.revision, name == "kept")
             if best is None or rank > best[0]:
                 best = (rank, trusted, signer)
         if best is not None and (best[1], best[2]) != (self.held, self.held_owner):

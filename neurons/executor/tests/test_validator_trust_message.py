@@ -234,3 +234,25 @@ def test_owner_a_b_a_prefers_the_current_owners_message(tmp_path, monkeypatch, o
     restarted = _trust(tmp_path, owner, image)
     assert (restarted.held.validator, restarted.held.revision) == (new_validator.ss58_address, 8)
     assert not restarted.offer(_signed(owner, old_validator, 5))
+
+
+def test_an_owner_change_never_restores_an_older_message_of_the_former_owner(
+    tmp_path, monkeypatch, owner, old_validator, new_validator
+):
+    # review finding: owner A, image revision 8 (replacement), kept revision 3 (revoked); the chain then names B
+    owner_b = Keypair.create_from_uri("//LiumTrustNewOwner")
+    monkeypatch.setattr(trust_service, "RELEASE_SUBNET_OWNER_HOTKEY", owner.ss58_address)
+    image = tmp_path / "image.json"
+    image.write_text(_dump(_signed(owner, new_validator, 8)))
+    (tmp_path / MESSAGE_FILE).write_text(
+        json.dumps({**_signed(owner, old_validator, 3)._asdict(), "owner": owner.ss58_address})
+    )
+    trust = _trust(tmp_path, owner, image)
+    assert (trust.held.validator, trust.held.revision) == (new_validator.ss58_address, 8)
+    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout: owner_b.ss58_address)
+    trust.refresh_owner()
+    assert (trust.held.validator, trust.held.revision) == (new_validator.ss58_address, 8)
+    restarted = ValidatorTrust(state_dir=tmp_path, image_message=image)
+    restarted.load()
+    assert restarted.owner == owner_b.ss58_address
+    assert (restarted.held.validator, restarted.held.revision) == (new_validator.ss58_address, 8)
