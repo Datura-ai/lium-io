@@ -1135,8 +1135,6 @@ def get_container_cpu_percents(docker_path: str) -> tuple[float, dict[str, float
 _DOCKER_SIZE_UNITS = {"B": 1, "kB": 10**3, "KB": 10**3, "MB": 10**6, "GB": 10**9, "TB": 10**12, "PB": 10**15}
 
 
-# Top level, not nested in its caller: obfuscator.py renames a nested function's body and leaves its
-# signature, which broke every row (lium-io#2146 review).
 def docker_size_bytes(size_text: str) -> int:
     size_text = size_text.strip()
     number = size_text.rstrip("kKMGTPB")
