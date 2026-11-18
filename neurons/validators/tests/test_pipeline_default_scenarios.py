@@ -346,7 +346,6 @@ async def test_successful_unrented_pipeline_flow(context_factory):
     config = build_context_config(
         validator_keypair=keypair,
         compute_rest_app_url="http://validator:8000",
-        gpu_monitor_script_relative="src/gpus_utility.py",
         machine_scrape_filename="scrape.sh",
         machine_scrape_timeout=300,
         obfuscation_keys={},
@@ -528,7 +527,6 @@ async def test_successful_rented_pipeline_flow(context_factory):
     config = build_context_config(
         validator_keypair=keypair,
         compute_rest_app_url="http://validator:8000",
-        gpu_monitor_script_relative="src/gpus_utility.py",
         machine_scrape_filename="scrape.sh",
         machine_scrape_timeout=300,
         obfuscation_keys={},

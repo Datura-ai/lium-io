@@ -4,6 +4,8 @@ from typing import Any, Dict
 import shlex
 import uuid
 
+from services import executor_payload as payload
+
 from ..messages import StartGpuMonitorMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
@@ -17,6 +19,9 @@ class StartGPUMonitorCheck:
     reaches the backend through the machine-spec scrape instead. The metrics-push arguments below
     are still sent so that executors running an older image (the miner picks the image version)
     keep starting — the script accepts and ignores them, and they go once the fleet has rolled.
+
+    The script and the interpreter come from the validator (services.executor_payload), never from the
+    executor's reported root_dir/python_path.
     """
 
     check_id = "prep.start_gpu_monitor"
@@ -28,7 +33,6 @@ class StartGPUMonitorCheck:
 
         validator_keypair = ctx.config.validator_keypair
         compute_rest_app_url = ctx.config.compute_rest_app_url
-        script_relative_path = ctx.config.gpu_monitor_script_relative
 
         if not compute_rest_app_url:
             event = render_message(
@@ -39,9 +43,11 @@ class StartGPUMonitorCheck:
             )
             return CheckResult(passed=False, event=event)
 
-        script_path = f"{executor.root_dir.rstrip('/')}/{script_relative_path.lstrip('/')}"
-
-        check_cmd = f"ps aux | grep {shlex.quote('python.*' + script_path)} | grep -v grep"
+        script_path = f"{payload.service_dir_glob('monitor')}*/{payload.GPU_MONITOR[0]}"
+        # a monitor already started by the validator; the one an executor image of before this change started from
+        # its own /root/app/src counts too, so no second copy starts beside it. Detection only: nothing is executed.
+        pattern = f"python.*({payload.service_dir_glob('monitor')}[^/]*|/root/app/src)/{payload.GPU_MONITOR[0]}"
+        check_cmd = f"ps auxww | grep -E {shlex.quote(pattern)} | grep -v grep"
         check_res = await runner.run(check_cmd, timeout=10, retryable=False)
         processes = [line for line in check_res.stdout.splitlines() if "grep" not in line]
 
@@ -50,7 +56,7 @@ class StartGPUMonitorCheck:
                 Msg.ALREADY_RUNNING,
                 ctx=ctx,
                 check_id=self.check_id,
-                what={"script_path": script_path, "python_path": executor.python_path},
+                what={"script_path": script_path, "python_path": payload.EXECUTOR_PYTHON},
             )
             return CheckResult(passed=True, event=event)
 
@@ -66,8 +72,11 @@ class StartGPUMonitorCheck:
         }
 
         args_string = " ".join([f"--{k} {shlex.quote(str(v))}" for k, v in command_args.items()])
+        # no monitor runs (checked above): the directories of earlier ones go before a fresh one is written
         start_cmd = (
-            f"nohup {shlex.quote(executor.python_path)} {shlex.quote(script_path)} {args_string} > /dev/null 2>&1 &"
+            f"rm -rf {shlex.quote(payload.service_dir_glob('monitor'))}*; "
+            f"{payload.install('monitor', payload.GPU_MONITOR)}; "
+            f"nohup {payload.run(payload.GPU_MONITOR)} {args_string} > /dev/null 2>&1 &"
         )
         start_res = await runner.run(start_cmd, timeout=50, retryable=False)
 
@@ -76,7 +85,7 @@ class StartGPUMonitorCheck:
                 Msg.STARTED,
                 ctx=ctx,
                 check_id=self.check_id,
-                what={"script_path": script_path, "python_path": executor.python_path, "command_id": start_res.command_id},
+                what={"script_path": script_path, "python_path": payload.EXECUTOR_PYTHON, "command_id": start_res.command_id},
             )
             return CheckResult(passed=True, event=event)
 

@@ -60,7 +60,6 @@ async def test_gpu_monitor_start_keeps_executor_reported_values_as_single_argume
         config=SimpleNamespace(
             validator_keypair=SimpleNamespace(sign=lambda data: b"\x01", ss58_address="5validator"),
             compute_rest_app_url="http://backend",
-            gpu_monitor_script_relative="src/gpus_utility.py",
         ),
     )
 

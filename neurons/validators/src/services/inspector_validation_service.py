@@ -24,6 +24,7 @@ from core.checksums import (
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 from core.config import settings
+from services import executor_payload
 from core.utils import _m, get_extra_info
 
 if TYPE_CHECKING:
@@ -602,8 +603,11 @@ class InspectorValidationService:
         )
 
     def _interactive_command(self, executor: ExecutorSSHInfo) -> str:
-        script = f"{executor.root_dir.rstrip('/')}/src/inspector_executor.py"
-        return f"{shlex.quote(executor.python_path)} {shlex.quote(script)} --interactive"
+        # the script and interpreter are the validator's (services.executor_payload), not the executor's reported paths
+        return (
+            f"{executor_payload.install('inspector', executor_payload.INSPECTOR)}; "
+            f'{executor_payload.run(executor_payload.INSPECTOR)} --interactive; rc=$?; rm -rf "$d"; exit $rc'
+        )
 
     async def _send_message(self, process, payload: dict[str, Any]) -> str:
         cmd = str(payload.get("cmd", ""))
