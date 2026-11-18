@@ -91,7 +91,9 @@ def test_refuses_another_signer_and_a_revision_not_higher(tmp_path, owner, old_v
     assert trust.held.validator == old_validator.ss58_address
 
 
-def test_start_takes_the_higher_revision_of_image_and_volume(tmp_path, owner, old_validator, new_validator):
+def test_start_takes_the_higher_revision_of_image_and_volume(tmp_path, monkeypatch, owner, old_validator, new_validator):
+    # the image copy is checked against the owner at release
+    monkeypatch.setattr(trust_service, "RELEASE_SUBNET_OWNER_HOTKEY", owner.ss58_address)
     image = tmp_path / "image.json"
     image.write_text(_dump(_signed(owner, old_validator, 4)))
     (tmp_path / MESSAGE_FILE).write_text(_dump(_signed(owner, new_validator, 3)))
@@ -142,3 +144,70 @@ def _dump(signed: SignedTrustMessage) -> str:
     import json
 
     return json.dumps(signed._asdict())
+
+
+def test_an_owner_change_keeps_the_held_validator_across_a_restart(tmp_path, monkeypatch, owner, new_validator):
+    # review finding: owner A signed the held message, the chain then names owner C, the node restarts
+    new_owner = Keypair.create_from_uri("//LiumTrustNewOwner")
+    trust = _trust(tmp_path, owner)
+    assert trust.offer(_signed(owner, new_validator, 7))
+    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout: new_owner.ss58_address)
+    trust.refresh_owner()
+    restarted = ValidatorTrust(state_dir=tmp_path, image_message=tmp_path / "absent.json")
+    restarted.load()
+    assert restarted.owner == new_owner.ss58_address
+    assert restarted.report()["validator"] == new_validator.ss58_address
+    assert restarted.held.revision == 7
+
+
+def test_a_new_owner_starts_its_own_revisions(tmp_path, monkeypatch, owner, old_validator, new_validator):
+    new_owner = Keypair.create_from_uri("//LiumTrustNewOwner")
+    trust = _trust(tmp_path, owner)
+    assert trust.offer(_signed(owner, new_validator, 50))
+    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout: new_owner.ss58_address)
+    trust.refresh_owner()
+    assert not trust.offer(_signed(owner, old_validator, 51))  # the old owner no longer signs
+    assert trust.offer(_signed(new_owner, old_validator, 1))
+    assert not trust.offer(_signed(new_owner, new_validator, 1))  # and the floor holds within the new owner
+
+
+def test_a_failed_write_is_written_once_the_volume_takes_it(tmp_path, monkeypatch, owner, new_validator):
+    # review finding: a full volume at acceptance must not leave the revision unsaved for good
+    trust = _trust(tmp_path, owner)
+    real_write = trust_service._write_json
+
+    def full(path, data):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(trust_service, "_write_json", full)
+    assert trust.offer(_signed(owner, new_validator, 7))
+    assert not (tmp_path / MESSAGE_FILE).exists()
+    monkeypatch.setattr(trust_service, "_write_json", real_write)
+    monkeypatch.setattr(trust_service.requests, "get", lambda *a, **k: MagicMock(status_code=404))
+    trust.refresh_message()
+    restarted = _trust(tmp_path, owner)
+    assert restarted.held == trust.held
+
+
+def test_one_public_node_cannot_name_an_owner(tmp_path, monkeypatch, owner):
+    trust = _trust(tmp_path, owner)
+    liar = Keypair.create_from_uri("//LiumTrustLiar").ss58_address
+    answers = iter([liar, owner.ss58_address])
+    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout: next(answers))
+    trust.refresh_owner()
+    assert trust.owner == owner.ss58_address
+
+    def one_down(url, timeout):
+        if url == trust_service.PUBLIC_CHAIN_NODES[0]:
+            raise requests.ConnectionError("down")
+        return liar
+
+    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", one_down)
+    trust.refresh_owner()
+    assert trust.owner == owner.ss58_address
+
+
+def test_the_image_copy_needs_the_release_owner(tmp_path, owner, new_validator):
+    image = tmp_path / "image.json"
+    image.write_text(_dump(_signed(owner, new_validator, 1)))  # not signed by the release owner
+    assert _trust(tmp_path, owner, image).held is None
