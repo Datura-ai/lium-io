@@ -20,7 +20,7 @@ from routes.apis import apis_router
 from services.local_verify_service import accepted_miner_hotkeys
 from services.miner_service import MinerService
 
-_SSH_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey123456789abcdef user@host"
+_SSH_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFdStYghocJM65d3WyCC6wtbXYeqq4wUyfjS3e6wskzJ user@host"
 _NONCE = "ab" * 32
 _LOG_KEY = "ssh_key_miner_binding"
 
