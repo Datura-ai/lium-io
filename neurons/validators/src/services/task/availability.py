@@ -401,6 +401,21 @@ class RunningOutageTally:
 REASONS_THAT_HIDE_AT_ONCE = frozenset({"GPU_DETAILS_MISMATCH", "GPU_UUID_CHANGED", "NVLINK_FAULT"})
 
 
+# runs that stop before the checks that re-read the stored restrictions: [] would clear what those checks keep
+# (DAH-6546: a pod left unread after a GPU-set move stops the run, and its rerun looks again)
+REASONS_THAT_KEEP_STORED = frozenset({"GPU_LOST_POD_UNREAD"})
+
+
+def run_availability_errors(ok: bool, events: list[ValidationEvent]) -> list[dict] | None:
+    """The availability errors a run sends: its own, plus the failed check's entry. A run ended by a reason in
+    REASONS_THAT_KEEP_STORED sends None when it found none, so the backend keeps what it stored."""
+    failed = failed_check_event(ok, events)
+    errors = [e.model_dump(mode="json") for e in availability_errors([*events, failed] if failed else events)]
+    if not ok and events and events[-1].reason_code in REASONS_THAT_KEEP_STORED:
+        return errors or None
+    return errors
+
+
 def failed_check_event(ok: bool, events: list[ValidationEvent]) -> ValidationEvent | None:
     """The availability entry for a run ended by a reason in REASONS_THAT_HIDE_AT_ONCE, else None.
 
