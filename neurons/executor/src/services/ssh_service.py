@@ -106,8 +106,7 @@ def verify_signed_ssh_sources(answer: SshSourcesAnswer) -> str:
 
 class SignedSshSources:
     """The signed source list. A background task refreshes it (run_ssh_sources_refresh) so an upload never waits
-    on the backend; a failed refresh keeps the last good list; after a 404, or on a node that never got one, it is empty
-    and the build's own list is pinned."""
+    on the backend; a failed refresh keeps the last good list; a 404 and a node that never got one do not pin."""
 
     def __init__(self):
         self._sources = ""
@@ -123,7 +122,7 @@ class SignedSshSources:
         try:
             response = requests.get(url, timeout=SSH_SOURCES_TIMEOUT_SECONDS)
             if response.status_code == HTTPStatus.NOT_FOUND:
-                # the backend has no list (endpoint reverted): back to the build's own list, as a node that never got one
+                # the backend has no list (endpoint reverted): unpin, as a node that never got one
                 self._sources = ""
                 return
             response.raise_for_status()
@@ -142,13 +141,12 @@ def _pin_applies() -> bool:
 def _validator_source_pin_option() -> bytes:
     """The `from="..." ` option every uploaded key gets (I-78), or b"" when there is no pin.
 
-    A build without a source list (non-prod, e2e) never pins. A prod build pins to the signed list, and to its own
-    list while it has no signed one (never fetched, or a 404), so where the pin applies no key is written unpinned.
+    A build without a source list (non-prod, e2e) never pins; a prod build pins to the signed list.
     """
     if not _pin_applies():
         return b""
-    sources = _signed_ssh_sources.get() or VALIDATOR_SSH_SOURCES
-    return b'from="' + sources.encode() + b'" '
+    sources = _signed_ssh_sources.get()
+    return b'from="' + sources.encode() + b'" ' if sources else b""
 
 
 def _key_without_marker_and_source_pin(line: bytes) -> bytes:
