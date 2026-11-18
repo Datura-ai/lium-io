@@ -177,6 +177,21 @@ async def test_one_shot_payload_runs_with_its_environment_and_is_removed(node):
     assert not list((node.tmp / "service").iterdir())
 
 
+async def test_one_shot_payload_is_removed_when_its_write_fails(node):
+    command = executor_payload.run_once("matrix", executor_payload.MATRIX, "--x 1").replace("base64 -d", "false")
+    done = subprocess.run(["sh", "-c", command], cwd=node.tmp, capture_output=True, text=True, timeout=20)
+    assert done.returncode == 1
+    assert not list((node.tmp / "service").iterdir())
+
+
+def test_the_kill_pattern_matches_the_run_and_not_the_shell_that_cleans_up():
+    pattern = executor_payload.process_pattern("matrix", executor_payload.MATRIX)
+    shell = executor_payload.run_once("matrix", executor_payload.MATRIX, "--x 1")
+    worker = f"{executor_payload.EXECUTOR_PYTHON} -E -s /root/app/.lium-validator-matrix.Ab3dE9xZ/decrypt_challenge.py --x 1"
+    found = subprocess.run(["grep", "-Ec", pattern], input=f"{worker}\n{shell}\n", capture_output=True, text=True)
+    assert found.stdout.strip() == "1"
+
+
 def test_no_validator_code_reads_the_executor_reported_paths():
     # python_path and root_dir come from the executor's answer: any new read of them must be reviewed, not added here
     src = Path(__file__).resolve().parents[1] / "src"
