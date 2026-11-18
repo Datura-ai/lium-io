@@ -346,3 +346,18 @@ async def test_a_stamp_saved_under_the_uuid_alone_is_ignored(context_factory):
 
     assert result.passed is True
     assert KEY not in redis.store
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("strategy", "probed"), [("ENGY_TEE", False), ("DPHN", True)])
+async def test_the_probe_never_execs_into_an_engy_filler_and_still_probes_dolphin(context_factory, strategy, probed):
+    # Engy SN53 counts any access to a provisioned server as cheating
+    redis = FakeRedis()
+    ctx, ssh, _ = _probe_ctx(context_factory, redis, stdout=FAILED_RUN)
+    ctx.state.rented_data.filler_strategy_by_container = {FILLER: strategy}
+
+    result = await SshdBootstrapCheck().run(ctx)
+
+    assert result.passed is (not probed)
+    assert bool(ssh.run.await_args_list) is probed
+    assert (KEY in redis.store) is probed
