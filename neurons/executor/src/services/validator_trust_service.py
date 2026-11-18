@@ -3,13 +3,17 @@
 The message is `lium-validator:<validator hotkey>:<revision>` (datura.validator_trust). It comes from
 `<COMPUTE_REST_API_URL>/watchtower/validator-message` every few minutes, and from the image
 (`src/validator_trust_message.json`) when one was released with it. A message is taken when the subnet
-owner's hotkey signed it and its revision is higher than the one held (revisions count per owner: after an
-owner change on chain, the new owner's first message is taken); on any error the last good one stays. The accepted message is kept on the reserve_data volume, which outlives a container recreate,
-so a restarted node keeps trusting it with the backend and the chain both unreachable.
+owner's hotkey signed it and its revision is higher than that owner's highest one known (revisions count per
+owner: after an owner change on chain, the new owner's first message is taken); on any error the last good one
+stays. The node keeps, for every owner, the highest message it has verified from that owner, so an owner that
+returns never falls back to an older revision of its own.
 
-The owner hotkey starts as the address known at release and is re-read from public chain nodes once
-an hour at a random offset; a change is taken only when all public nodes report it. It is kept on the same
-volume, and each kept message records the owner that signed it.
+The owner hotkey starts as the address known at release and is re-read from public chain nodes at start, then
+about once an hour with random jitter; a change is taken only when all public nodes report it. Until one read has
+succeeded since start, no message is taken from the backend, so a restarted node never takes a former owner's
+message. The owner, the held message's owner and the messages are kept together in one file on the reserve_data
+volume (written atomically), which outlives a container recreate, so a restarted node keeps trusting the same
+validator with the backend and the chain both unreachable.
 
 While no message is held, the executor trusts the hotkeys baked into the image (core.config), as
 before. A non-prod build (core/config_override.py) names its own validator and never reads a message.
@@ -44,30 +48,11 @@ from core.config import settings
 logger = logging.getLogger(__name__)
 
 STATE_DIR = Path("/var/lium-reserve")
-MESSAGE_FILE = "validator_trust.json"
-OWNER_FILE = "subnet_owner.json"
+STATE_FILE = "validator_trust.json"
 IMAGE_MESSAGE_PATH = Path(__file__).resolve().parents[1] / "validator_trust_message.json"
 MESSAGE_REFRESH_SECONDS = 300
 OWNER_REFRESH_SECONDS = 3600
 FETCH_TIMEOUT_SECONDS = 5.0
-
-
-def _read_signed(path: Path) -> SignedTrustMessage | None:
-    try:
-        data = json.loads(path.read_text())
-        return SignedTrustMessage(message=str(data["message"]), signature=str(data["signature"]))
-    except FileNotFoundError:
-        return None
-    except Exception as exc:
-        logger.warning("Validator trust: ignoring unreadable %s: %s: %s", path, type(exc).__name__, exc)
-        return None
-
-
-def _read_signer(path: Path) -> str | None:
-    try:
-        return str(json.loads(path.read_text())["owner"])
-    except Exception:
-        return None  # a file from before the owner was recorded: checked against the current owner
 
 
 def _write_json(path: Path, data: dict) -> None:
@@ -92,95 +77,100 @@ class ValidatorTrust:
         self.image_message = image_message
         self.enabled = enabled
         self.owner = RELEASE_SUBNET_OWNER_HOTKEY
+        # set by the first chain read that names one owner; the backend's messages wait for it
+        self.owner_confirmed = False
         self.held: TrustedValidator | None = None
-        # the owner whose signature the held message carries: kept with it, so a later owner change on chain
-        # does not void it, and the revision floor applies per owner
+        # the owner whose signature the held message carries: an owner change keeps it until the new owner signs
         self.held_owner: str | None = None
-        # state the volume refused (full, read-only): written again on every refresh until it lands
-        self._unsaved: dict[str, dict] = {}
-        # the image copy and the kept message with the owner that signed each, re-ordered on an owner change
-        self._candidates: dict[str, tuple[SignedTrustMessage, str]] = {}
+        # every owner's highest verified message: the revision floor per owner, kept across owner changes
+        self.messages: dict[str, tuple[TrustedValidator, SignedTrustMessage]] = {}
+        # the volume refused the state (full, read-only): written again on every refresh until it lands
+        self._unsaved = False
 
     def load(self) -> None:
-        """At start: the owner kept on disk, then the image copy and the kept message, each checked against the
-        owner that signed it (the image copy: the owner at release; the kept message: the owner recorded with it)."""
+        """At start: the kept state (owner, held owner, messages) and the image copy, signed by the owner at release."""
         if not self.enabled:
             return
+        held_owner = None
         try:
-            owner = json.loads((self.state_dir / OWNER_FILE).read_text())["owner"]
-            Keypair(ss58_address=owner)
-            self.owner = owner
+            state = json.loads((self.state_dir / STATE_FILE).read_text())
+            Keypair(ss58_address=state["owner"])
+            self.owner, held_owner = state["owner"], state.get("held")
+            kept = [(SignedTrustMessage(**signed), signer) for signer, signed in state.get("messages", {}).items()]
+        except FileNotFoundError:
+            kept = []
+        except Exception as exc:
+            logger.warning("Validator trust: kept state unreadable, using the release owner: %s: %s", type(exc).__name__, exc)
+            kept = []
+        try:
+            image = json.loads(self.image_message.read_text())
+            kept.append((SignedTrustMessage(message=str(image["message"]), signature=str(image["signature"])), RELEASE_SUBNET_OWNER_HOTKEY))
         except FileNotFoundError:
             pass
         except Exception as exc:
-            logger.warning("Validator trust: kept owner unreadable, using the release one: %s", exc)
-        image = _read_signed(self.image_message)
-        if image is not None:
-            self._candidates["image"] = (image, RELEASE_SUBNET_OWNER_HOTKEY)
-        kept = _read_signed(self.state_dir / MESSAGE_FILE)
-        if kept is not None:
-            self._candidates["kept"] = (kept, _read_signer(self.state_dir / MESSAGE_FILE) or self.owner)
+            logger.warning("Validator trust: image message unreadable: %s: %s", type(exc).__name__, exc)
+        for signed, signer in kept:
+            try:
+                self._remember(verify_trust_message(signed, signer), signed, signer)
+            except Exception as exc:
+                logger.warning("Validator trust: kept message refused: %s", exc)
+        self.held_owner = held_owner
         self._select()
         logger.info("Validator trust at start: %s", self.report())
 
+    def _remember(self, trusted: TrustedValidator, signed: SignedTrustMessage, signer: str) -> bool:
+        """Keep `signed` as `signer`'s message when its revision is above the highest one known from that signer."""
+        known = self.messages.get(signer)
+        if known is not None and trusted.revision <= known[0].revision:
+            return False
+        self.messages[signer] = (trusted, signed)
+        return True
+
     def _select(self) -> None:
-        """Hold the current owner's highest revision among the image copy and the kept message; without one, the kept
-        message (what this node last held), else the image copy. Revisions are only compared within one signer. The
-        held message is always the kept one, so a restart starts from it. Run at start and after every owner change."""
-        verified = {}
-        for name, (signed, signer) in self._candidates.items():
-            try:
-                verified[name] = (verify_trust_message(signed, signer), signer, signed)
-            except Exception as exc:
-                logger.warning("Validator trust: %s message refused: %s", name, exc)
-        current = [entry for entry in verified.values() if entry[1] == self.owner]
-        best = max(current, key=lambda entry: entry[0].revision) if current else verified.get("kept") or verified.get("image")
-        if best is None:
+        """Hold the current owner's message; without one, the held owner's (what this node last trusted), else the
+        image copy's. Run at start and after every owner change."""
+        for signer in (self.owner, self.held_owner, RELEASE_SUBNET_OWNER_HOTKEY):
+            if signer in self.messages:
+                break
+        else:
             return
-        trusted, signer, signed = best
+        self._hold(signer)
+
+    def _hold(self, signer: str) -> None:
+        trusted = self.messages[signer][0]
         if (trusted, signer) != (self.held, self.held_owner):
             self.held, self.held_owner = trusted, signer
             logger.warning("Validator trust: now trusting %s (revision %d)", trusted.validator, trusted.revision)
-        if self._candidates.get("kept") != (signed, signer):
-            self._candidates["kept"] = (signed, signer)
-            self._save(MESSAGE_FILE, {**signed._asdict(), "owner": signer})
+        self._save()
 
     def offer(self, signed: SignedTrustMessage) -> bool:
-        """Take a served message: signed by the current owner, and a higher revision than the held one unless the
-        held one carries another owner's signature (a new owner starts its own revisions)."""
+        """Take a served message: signed by the current owner, and a higher revision than that owner's highest."""
         if not self.enabled:
             return False
-        if not self._take(signed, self.owner):
-            return False
-        self._candidates["kept"] = (signed, self.owner)
-        self._save(MESSAGE_FILE, {**signed._asdict(), "owner": self.owner})
-        return True
-
-    def _take(self, signed: SignedTrustMessage, signer: str) -> bool:
         try:
-            trusted = verify_trust_message(signed, signer)
+            trusted = verify_trust_message(signed, self.owner)
         except Exception as exc:
             logger.warning("Validator trust: message refused: %s", exc)
             return False
-        if self.held is not None and self.held_owner == signer and trusted.revision <= self.held.revision:
+        if not self._remember(trusted, signed, self.owner):
             return False
-        self.held, self.held_owner = trusted, signer
-        logger.warning("Validator trust: now trusting %s (revision %d)", trusted.validator, trusted.revision)
+        self._hold(self.owner)
         return True
 
-    def _save(self, name: str, data: dict) -> None:
-        self._unsaved[name] = data
-        self._save_unsaved()
-
-    def _save_unsaved(self) -> None:
-        for name, data in list(self._unsaved.items()):
-            try:
-                _write_json(self.state_dir / name, data)
-            except OSError as exc:
-                # trusted for this run; written again on the next refresh, so a recreate does not lose it
-                logger.warning("Validator trust: %s not kept on disk yet: %s", name, exc)
-                continue
-            del self._unsaved[name]
+    def _save(self) -> None:
+        """One atomic file for the owner, the held owner and the messages: a restart never reads them apart."""
+        state = {
+            "owner": self.owner,
+            "held": self.held_owner,
+            "messages": {signer: signed._asdict() for signer, (_, signed) in self.messages.items()},
+        }
+        try:
+            _write_json(self.state_dir / STATE_FILE, state)
+            self._unsaved = False
+        except OSError as exc:
+            # trusted for this run; written again on the next refresh, so a recreate does not lose it
+            self._unsaved = True
+            logger.warning("Validator trust: state not kept on disk yet: %s", exc)
 
     def hotkeys(self, baked: dict[str, str]) -> dict[str, str]:
         """Key id -> ss58 the executor accepts signatures from: the signed validator alone, else `baked`."""
@@ -197,8 +187,9 @@ class ValidatorTrust:
         """Blocking: run it off the event loop. A 404 or any failure keeps the message held."""
         if not self.enabled:
             return
-        self._save_unsaved()
-        if not settings.COMPUTE_REST_API_URL:
+        if self._unsaved:
+            self._save()
+        if not self.owner_confirmed or not settings.COMPUTE_REST_API_URL:
             return
         url = settings.COMPUTE_REST_API_URL.rstrip("/") + "/watchtower/validator-message"
         try:
@@ -227,24 +218,27 @@ class ValidatorTrust:
             logger.warning("Validator trust: public chain nodes disagree on the subnet owner: %s", sorted(answers))
             return
         (owner,) = answers
+        self.owner_confirmed = True
         if owner != self.owner:
             logger.warning("Validator trust: subnet owner changed from %s to %s", self.owner, owner)
             self.owner = owner
-            self._save(OWNER_FILE, {"owner": owner})
             self._select()
+            self._save()
 
 
 validator_trust = ValidatorTrust(enabled=importlib.util.find_spec("core.config_override") is None)
 
 
 async def run_validator_trust_refresh() -> None:
-    """Background loop: the message every MESSAGE_REFRESH_SECONDS, the owner hourly at a random offset."""
+    """Background loop: the message every MESSAGE_REFRESH_SECONDS; the owner first (every round until one read
+    succeeds), then about hourly with random jitter."""
     if not validator_trust.enabled:
         return
-    owner_due = asyncio.get_running_loop().time() + random.uniform(0, OWNER_REFRESH_SECONDS)
+    owner_due = asyncio.get_running_loop().time()
     while True:
         if asyncio.get_running_loop().time() >= owner_due:
             await asyncio.to_thread(validator_trust.refresh_owner)
-            owner_due += OWNER_REFRESH_SECONDS
+            if validator_trust.owner_confirmed:
+                owner_due = asyncio.get_running_loop().time() + random.uniform(0.5, 1.5) * OWNER_REFRESH_SECONDS
         await asyncio.to_thread(validator_trust.refresh_message)
         await asyncio.sleep(MESSAGE_REFRESH_SECONDS)

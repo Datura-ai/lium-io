@@ -13,7 +13,7 @@ from bittensor_wallet import Keypair
 import dependencies.auth as auth
 import services.validator_trust_service as trust_service
 from datura.validator_trust import SignedTrustMessage, trust_line, verify_trust_message
-from services.validator_trust_service import MESSAGE_FILE, OWNER_FILE, ValidatorTrust
+from services.validator_trust_service import STATE_FILE, ValidatorTrust
 
 
 @pytest.fixture(scope="module")
@@ -36,10 +36,29 @@ def _signed(owner: Keypair, validator: Keypair, revision: int) -> SignedTrustMes
     return SignedTrustMessage(message=line, signature="0x" + owner.sign(line).hex())
 
 
-def _trust(tmp_path, owner: Keypair, image_message=None) -> ValidatorTrust:
-    (tmp_path / OWNER_FILE).write_text(f'{{"owner": "{owner.ss58_address}"}}')
+def _state(tmp_path) -> dict:
+    path = tmp_path / STATE_FILE
+    return json.loads(path.read_text()) if path.exists() else {"messages": {}}
+
+
+def _keep(tmp_path, signer: Keypair, signed: SignedTrustMessage, held: bool = True) -> None:
+    """A message on the volume, as a node that took it from `signer` keeps it."""
+    state = _state(tmp_path)
+    state["messages"][signer.ss58_address] = signed._asdict()
+    state.setdefault("owner", signer.ss58_address)
+    if held:
+        state["held"] = signer.ss58_address
+    (tmp_path / STATE_FILE).write_text(json.dumps(state))
+
+
+def _trust(tmp_path, owner: Keypair, image_message=None, confirmed: bool = True) -> ValidatorTrust:
+    """Start a node whose kept owner is `owner`; `confirmed`: its first chain read has named that owner."""
+    state = _state(tmp_path)
+    state["owner"] = owner.ss58_address
+    (tmp_path / STATE_FILE).write_text(json.dumps(state))
     trust = ValidatorTrust(state_dir=tmp_path, image_message=image_message or tmp_path / "absent.json")
     trust.load()
+    trust.owner_confirmed = confirmed
     return trust
 
 
@@ -97,9 +116,10 @@ def test_start_takes_the_higher_revision_of_image_and_volume(tmp_path, monkeypat
     monkeypatch.setattr(trust_service, "RELEASE_SUBNET_OWNER_HOTKEY", owner.ss58_address)
     image = tmp_path / "image.json"
     image.write_text(_dump(_signed(owner, old_validator, 4)))
-    (tmp_path / MESSAGE_FILE).write_text(_dump(_signed(owner, new_validator, 3)))
+    _keep(tmp_path, owner, _signed(owner, new_validator, 3))
     assert _trust(tmp_path, owner, image).held.validator == old_validator.ss58_address
-    (tmp_path / MESSAGE_FILE).write_text(_dump(_signed(owner, new_validator, 5)))
+    (tmp_path / STATE_FILE).unlink()
+    _keep(tmp_path, owner, _signed(owner, new_validator, 5))
     assert _trust(tmp_path, owner, image).held.validator == new_validator.ss58_address
 
 
@@ -182,7 +202,7 @@ def test_a_failed_write_is_written_once_the_volume_takes_it(tmp_path, monkeypatc
 
     monkeypatch.setattr(trust_service, "_write_json", full)
     assert trust.offer(_signed(owner, new_validator, 7))
-    assert not (tmp_path / MESSAGE_FILE).exists()
+    assert _state(tmp_path)["messages"] == {}
     monkeypatch.setattr(trust_service, "_write_json", real_write)
     monkeypatch.setattr(trust_service.requests, "get", lambda *a, **k: MagicMock(status_code=404))
     trust.refresh_message()
@@ -220,9 +240,7 @@ def test_owner_a_b_a_prefers_the_current_owners_message(tmp_path, monkeypatch, o
     monkeypatch.setattr(trust_service, "RELEASE_SUBNET_OWNER_HOTKEY", owner.ss58_address)
     image = tmp_path / "image.json"
     image.write_text(_dump(_signed(owner, new_validator, 8)))
-    (tmp_path / MESSAGE_FILE).write_text(
-        json.dumps({**_signed(owner_b, old_validator, 3)._asdict(), "owner": owner_b.ss58_address})
-    )
+    _keep(tmp_path, owner_b, _signed(owner_b, old_validator, 3))
     trust = _trust(tmp_path, owner_b, image)
     assert trust.held.validator == old_validator.ss58_address  # B is still the owner the node knows
     # the chain names A again: the image message A signed is held at once, with no backend
@@ -244,9 +262,7 @@ def test_an_owner_change_never_restores_an_older_message_of_the_former_owner(
     monkeypatch.setattr(trust_service, "RELEASE_SUBNET_OWNER_HOTKEY", owner.ss58_address)
     image = tmp_path / "image.json"
     image.write_text(_dump(_signed(owner, new_validator, 8)))
-    (tmp_path / MESSAGE_FILE).write_text(
-        json.dumps({**_signed(owner, old_validator, 3)._asdict(), "owner": owner.ss58_address})
-    )
+    _keep(tmp_path, owner, _signed(owner, old_validator, 3), held=False)
     trust = _trust(tmp_path, owner, image)
     assert (trust.held.validator, trust.held.revision) == (new_validator.ss58_address, 8)
     monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout: owner_b.ss58_address)
@@ -279,3 +295,73 @@ def test_a_restart_never_compares_revisions_of_different_owners(
     restarted.load()
     assert restarted.owner == owner_c.ss58_address
     assert (restarted.held.validator, restarted.held.revision) == (new_validator.ss58_address, 1)
+
+
+def test_a_returning_owner_keeps_its_highest_revision(tmp_path, monkeypatch, owner, old_validator, new_validator):
+    # review finding: A's image copy is revision 4, the node takes A revision 8, B signs, then the chain names A again
+    owner_b = Keypair.create_from_uri("//LiumTrustNewOwner")
+    monkeypatch.setattr(trust_service, "RELEASE_SUBNET_OWNER_HOTKEY", owner.ss58_address)
+    image = tmp_path / "image.json"
+    image.write_text(_dump(_signed(owner, old_validator, 4)))
+    trust = _trust(tmp_path, owner, image)
+    assert trust.offer(_signed(owner, new_validator, 8))
+    for chain_owner in (owner_b, owner):
+        monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout, o=chain_owner: o.ss58_address)
+        trust.refresh_owner()
+        if chain_owner is owner_b:
+            assert trust.offer(_signed(owner_b, old_validator, 1))
+    assert (trust.held.validator, trust.held.revision) == (new_validator.ss58_address, 8)
+    restarted = ValidatorTrust(state_dir=tmp_path, image_message=image)
+    restarted.load()
+    assert (restarted.held.validator, restarted.held.revision) == (new_validator.ss58_address, 8)
+    assert not restarted.offer(_signed(owner, old_validator, 5))
+
+
+def test_a_restarted_node_reads_the_owner_before_taking_a_served_message(
+    tmp_path, monkeypatch, owner, old_validator, new_validator
+):
+    # review finding: kept owner A, the chain already names B, the backend still serves a higher A revision
+    owner_b = Keypair.create_from_uri("//LiumTrustNewOwner")
+    _keep(tmp_path, owner, _signed(owner, new_validator, 2))
+    trust = _trust(tmp_path, owner, confirmed=False)
+    answer = MagicMock(status_code=200)
+    answer.json.return_value = _signed(owner, old_validator, 9)._asdict()
+    monkeypatch.setattr(trust_service.requests, "get", lambda *a, **k: answer)
+    monkeypatch.setattr(trust_service.settings, "COMPUTE_REST_API_URL", "http://backend")
+    trust.refresh_message()  # no chain read yet: nothing is taken
+    assert (trust.held.validator, trust.held.revision) == (new_validator.ss58_address, 2)
+
+    def down(url, timeout):
+        raise requests.ConnectionError("down")
+
+    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", down)
+    trust.refresh_owner()  # the chain unreachable: the last held message stays, still nothing taken
+    trust.refresh_message()
+    assert (trust.held.validator, trust.held.revision) == (new_validator.ss58_address, 2)
+    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout: owner_b.ss58_address)
+    trust.refresh_owner()
+    trust.refresh_message()  # A no longer signs
+    assert (trust.held.validator, trust.held.revision) == (new_validator.ss58_address, 2)
+    answer.json.return_value = _signed(owner_b, old_validator, 1)._asdict()
+    trust.refresh_message()
+    assert (trust.held.validator, trust.held_owner) == (old_validator.ss58_address, owner_b.ss58_address)
+
+
+def test_the_owner_and_the_held_message_are_kept_together(tmp_path, monkeypatch, owner, old_validator, new_validator):
+    # review finding: the owner write failed, the message write landed, a restart read owner A with B's message
+    owner_b = Keypair.create_from_uri("//LiumTrustNewOwner")
+    trust = _trust(tmp_path, owner)
+    assert trust.offer(_signed(owner, new_validator, 3))
+    real_write = trust_service._write_json
+    monkeypatch.setattr(trust_service, "_write_json", lambda path, data: (_ for _ in ()).throw(OSError(28, "full")))
+    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout: owner_b.ss58_address)
+    trust.refresh_owner()
+    assert _state(tmp_path)["owner"] == owner.ss58_address  # nothing of the change landed
+    monkeypatch.setattr(trust_service, "_write_json", real_write)
+    assert trust.offer(_signed(owner_b, old_validator, 1))
+    state = _state(tmp_path)
+    assert (state["owner"], state["held"]) == (owner_b.ss58_address, owner_b.ss58_address)
+    restarted = ValidatorTrust(state_dir=tmp_path, image_message=tmp_path / "absent.json")
+    restarted.load()
+    assert (restarted.owner, restarted.held.validator) == (owner_b.ss58_address, old_validator.ss58_address)
+    assert not restarted.offer(_signed(owner, new_validator, 99))  # the former owner signs nothing any more
