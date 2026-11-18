@@ -143,9 +143,6 @@ IN_CONTAINER_SSH_BOOTSTRAP_PATH = "/tmp/lium-ssh-bootstrap.sh"
 VERIFIED_JOB_COUNT_KEY = "verified_job_counts"
 # The anchor: the GPU UUID set of the executor's first successful verification, kept by every later write.
 GPU_ANCHOR_KEY = "uuids"
-# DAH-3457: field of a verified-job record, kept by every later write. No check sets or reads it any more (a changed
-# GPU set is re-anchored, not broken); old records still carry it.
-GPU_ANCHOR_BROKEN_KEY = "anchor_broken"
 
 EXECUTORS_UPTIME_PREFIX = "executors_uptime"
 NORMALIZED_SCORE_CHANNEL = "normalized_score_channel"
@@ -1385,9 +1382,8 @@ class RedisService:
             "spec": prev_spec if prev_spec else spec,
             GPU_ANCHOR_KEY: prev_uuids if prev_uuids else uuids,
         }
-        # DAH-3457: the anchor and its broken mark outlive every write to the record; only a new executor id starts clean.
-        if prev_info.get(GPU_ANCHOR_BROKEN_KEY):
-            data[GPU_ANCHOR_BROKEN_KEY] = True
+        # DAH-3457: the anchor outlives every write to the record; only a new executor id starts clean.
+        # DAH-6645: the retired "anchor_broken" mark of older records is dropped here, not carried.
 
         await self.hset(VERIFIED_JOB_COUNT_KEY, _verified_job_field(miner_hotkey, executor_id), json.dumps(data))
 
@@ -1398,7 +1394,6 @@ class RedisService:
         prev_info: dict = {},
         reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT,
         evidence: dict | None = None,
-        anchor_broken: bool = False,
         reanchor_uuids: str = '',
         respec: str = '',
     ):
@@ -1413,8 +1408,6 @@ class RedisService:
             "spec": spec,
             GPU_ANCHOR_KEY: uuids,
         }
-        if anchor_broken or prev_info.get(GPU_ANCHOR_BROKEN_KEY):
-            data[GPU_ANCHOR_BROKEN_KEY] = True
         await self.hset(VERIFIED_JOB_COUNT_KEY, _verified_job_field(miner_hotkey, executor_id), json.dumps(data))
 
         # DAH-3386: the check that cleared the job and what it saw ride along; the backend puts them on the
