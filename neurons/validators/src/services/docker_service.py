@@ -5238,7 +5238,8 @@ class DockerService:
         timeout: int = 10,
         remove_every_filler: bool = False,
         default_extra: dict | None = None,
-        executor_id: str = "",
+        *,
+        executor_id: str,
     ):
         """Check if the container is running.
 
@@ -9924,6 +9925,7 @@ class DockerService:
                 removed_filler,
                 log_extra=default_extra,
                 executor_id=payload.executor_id,
+                concurrency=concurrency,
             )
         # DAH-2356 safety net: restore any leftover pre-cap records BEFORE a container
         # without its own cap starts, so a customer (or an uncapped filler) never

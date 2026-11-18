@@ -1199,6 +1199,7 @@ async def test_check_container_running_quotes_hostile_container_name_filter(
     assert await docker_service.check_container_running(
         ssh_client,
         HOSTILE_CONTAINER_NAME,
+        executor_id="executor-1",
     )
 
     assert len(ssh_client.commands) == 1

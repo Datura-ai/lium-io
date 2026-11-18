@@ -1012,6 +1012,25 @@ async def restore_tracked_gpu_power_limits(
     ``require_complete`` raises on unreadable records or any restore not confirmed and cleared, and
     on a GPU without a record that the host does not show at 80 % of its default limit or more.
     """
+    restored, _ = await _restore_tracked_gpu_power_limits(
+        ssh, redis, gpu_uuids, log_extra,
+        host_probe=host_probe, concurrency=concurrency, require_complete=require_complete,
+    )
+    return restored
+
+
+async def _restore_tracked_gpu_power_limits(
+    ssh: asyncssh.SSHClientConnection,
+    redis: RedisService,
+    gpu_uuids: list[str],
+    log_extra: dict[str, object] | None,
+    *,
+    host_probe: PrerunHostProbe | None,
+    concurrency: int,
+    require_complete: bool,
+) -> tuple[int, GpuPowerRestoreReadResult]:
+    """``restore_tracked_gpu_power_limits`` that also returns its record read, so a caller can tell a
+    record it could not read from one that is gone."""
     read_result = await read_gpu_power_restore_records(
         redis, gpu_uuids, log_extra, require_complete=require_complete
     )
@@ -1019,7 +1038,7 @@ async def restore_tracked_gpu_power_limits(
     # restore before its `docker run`; strict callers confirm that on the GPU itself.
     check_missing = require_complete and bool(read_result.missing)
     if not read_result.records and not check_missing:
-        return 0
+        return 0, read_result
     try:
         # before-values for the change log (and the strict check of record-less GPUs)
         state_by_uuid = await _query_power_state(ssh, host_probe=host_probe)
@@ -1038,14 +1057,14 @@ async def restore_tracked_gpu_power_limits(
             ):
                 raise GpuPowerRestoreStateError(f"GPU power restore record is missing and {gpu_uuid} is below its floor")
     if not read_result.records:
-        return 0
+        return 0, read_result
     restored = await _restore_records(
         ssh, redis, read_result.records, state_by_uuid, log_extra, concurrency,
         require_complete=require_complete,
     )
     if require_complete and restored != len(read_result.records):
         raise RuntimeError("GPU power restoration incomplete")
-    return restored
+    return restored, read_result
 
 
 async def restore_all_host_gpu_power_limits(
@@ -1251,7 +1270,7 @@ async def _raise_to_default(
 
 
 # A live limit within this many watts of the cap Lium applied is still Lium's cap (nvidia-smi rounds).
-LIUM_CAP_MATCH_WATTS = 1
+LIUM_CAP_TOLERANCE_WATTS = 1
 
 
 async def _raise_gpus_left_at_lium_cap(
@@ -1259,6 +1278,8 @@ async def _raise_gpus_left_at_lium_cap(
     executor_id: str,
     cap_watts_by_uuid: dict[str, int],
     log_extra: dict[str, object] | None,
+    *,
+    concurrency: int = POWER_LIMIT_SET_CONCURRENCY,
 ) -> int:
     """Lift to its default every GPU that still sits at the cap this filler pod applied.
 
@@ -1282,7 +1303,7 @@ async def _raise_gpus_left_at_lium_cap(
         state = state_by_uuid.get(gpu_uuid)
         if state is None or state.default_watts is None or state.current_watts >= state.default_watts:
             continue
-        if abs(state.current_watts - cap_watts) > LIUM_CAP_MATCH_WATTS:
+        if abs(state.current_watts - cap_watts) > LIUM_CAP_TOLERANCE_WATTS:
             continue
         targets.append(
             _GpuToRaiseToDefault(gpu_uuid=gpu_uuid, current_watts=state.current_watts, default_watts=state.default_watts)
@@ -1294,7 +1315,7 @@ async def _raise_gpus_left_at_lium_cap(
             {"gpu_uuids": [target.gpu_uuid for target in targets]},
             log_extra,
         )
-    return await _raise_to_default(ssh, executor_id, targets, log_extra)
+    return await _raise_to_default(ssh, executor_id, targets, log_extra, concurrency=concurrency)
 
 
 def _parse_pod_index(raw_index: str | bytes) -> dict[str, int | None]:
@@ -1317,12 +1338,13 @@ async def restore_filler_pod_gpu_power_limits(
     *,
     executor_id: str,
     require_complete: bool = False,
+    concurrency: int = POWER_LIMIT_SET_CONCURRENCY,
 ) -> int:
     """Restore exactly the GPUs this filler pod capped (its pod index), then drop the index.
 
     Touching only the pod's own records means a replacement filler's fresh caps on the same host are
     never swept, and a filler we never capped costs one Redis read — no SSH. Best-effort: a record
-    whose restore failed is kept for the safety nets; the index is deleted only after the restore, so a
+    whose restore failed is kept for the safety nets; the index is deleted only after the restore and the raise, so a
     parallel restore of the same pod still sees it (the per-GPU records, not the index, are the source of
     truth). A GPU still at the cap the index recorded after the restore is raised to its default
     (``_raise_gpus_left_at_lium_cap``); a GPU of an index written before caps were stored is never raised.
@@ -1351,16 +1373,23 @@ async def restore_filler_pod_gpu_power_limits(
         if require_complete:
             raise GpuPowerRestoreStateError("GPU power restore index is corrupt") from exc
         _log(logging.ERROR, f"gpu power restore: dropped corrupt pod index {raw_index!r} for {pod_id}", {}, log_extra)
+        await _delete_pod_index(redis, pod_id, log_extra, require_complete=False)
         return 0
     capped_uuids: list[str] = list(cap_watts_by_uuid)
     # Raised only at a cap the index recorded: a GPU the cap did not lower, or one of an index written before
     # caps were stored (cap None), may hold the host's own limit, which another path's restore can have set.
     raise_candidates: dict[str, int] = {uuid: cap for uuid, cap in cap_watts_by_uuid.items() if cap is not None}
-    restored = await restore_tracked_gpu_power_limits(
-        ssh, redis, capped_uuids, log_extra, require_complete=require_complete
+    restored, read_result = await _restore_tracked_gpu_power_limits(
+        ssh, redis, capped_uuids, log_extra,
+        host_probe=None, concurrency=concurrency, require_complete=require_complete,
     )
+    if read_result.read_failed:
+        # a record we could not read may hold the host's own limit: never lift that GPU over it
+        _log(logging.ERROR, f"gpu power raise: skipped for {pod_id}, a restore record could not be read", {}, log_extra)
+    else:
+        await _raise_gpus_left_at_lium_cap(ssh, executor_id, raise_candidates, log_extra, concurrency=concurrency)
+    # after the raise: a parallel strict restore must not pass while a GPU still sits at the cap
     await _delete_pod_index(redis, pod_id, log_extra, require_complete=require_complete)
-    await _raise_gpus_left_at_lium_cap(ssh, executor_id, raise_candidates, log_extra)
     return restored
 
 
@@ -1486,13 +1515,13 @@ async def apply_filler_gpu_power_limits(
             await _undo_partial_apply(ssh, redis, target_uuids, pod_id, log_extra)
             return GpuPowerCapResult.FAILED
         watts_to_restore_by_uuid[target.gpu_uuid] = watts_to_restore
-    # A GPU whose restore writes back a limit within LIUM_CAP_MATCH_WATTS of the cap cannot be told from
+    # A GPU whose restore writes back a limit within LIUM_CAP_TOLERANCE_WATTS of the cap cannot be told from
     # Lium's cap afterwards, so no cap is kept for it and it is never raised. The comparison is with what
     # the restore writes back (a leftover record's watts, else the current limit), not with what the GPU
     # reads now, which after a failed restore can be an old cap. Every other GPU keeps its cap, including
     # one the cap raised (a host under the floor): left at the cap with its record lost, it goes to default.
     index_by_uuid: dict[str, int | None] = {
-        gpu_uuid: None if abs(cap - watts_to_restore_by_uuid[gpu_uuid]) <= LIUM_CAP_MATCH_WATTS else cap
+        gpu_uuid: None if abs(cap - watts_to_restore_by_uuid[gpu_uuid]) <= LIUM_CAP_TOLERANCE_WATTS else cap
         for gpu_uuid, cap in cap_watts_by_uuid.items()
     }
     try:

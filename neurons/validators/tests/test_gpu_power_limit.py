@@ -678,6 +678,55 @@ async def test_pod_restore_leaves_a_gpu_another_path_already_restored() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pod_restore_raises_nothing_when_a_record_cannot_be_read() -> None:
+    # The unread record may hold the host's own limit under the default: the GPU is not lifted over it.
+    redis = FakeRedis({_pod_index_key(POD_ID): json.dumps({"GPU-a": 368})})
+    real_get = redis.get
+
+    async def get(key: str) -> str | None:
+        if key == _restore_key("GPU-a"):
+            raise ConnectionError("redis down")
+        return await real_get(key)
+
+    redis.get = get
+    ssh = fake_ssh()
+
+    assert await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, executor_id=EXECUTOR_ID) == 0
+
+    ssh.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pod_restore_deletes_a_corrupt_index() -> None:
+    redis = FakeRedis({_pod_index_key(POD_ID): '"not an index"'})
+
+    assert await restore_filler_pod_gpu_power_limits(fake_ssh(), redis, POD_ID, executor_id=EXECUTOR_ID) == 0
+
+    assert _pod_index_key(POD_ID) not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_pod_restore_keeps_the_index_until_the_raise_is_done() -> None:
+    # A parallel strict restore must still see the index while a GPU sits at the cap.
+    redis = FakeRedis({_pod_index_key(POD_ID): json.dumps({"GPU-a": 368})})
+    index_seen_at_raise: list[bool] = []
+
+    async def run(command: str, **_kwargs: object) -> FakeRun:
+        if " -pl " in command:
+            index_seen_at_raise.append(_pod_index_key(POD_ID) in redis.store)
+        return responses.pop(0)
+
+    responses = [FakeRun(stdout="GPU-a, 368, 400, 100, 400\n"), *_set_ok(400)]
+    ssh = AsyncMock()
+    ssh.run.side_effect = run
+
+    await restore_filler_pod_gpu_power_limits(ssh, redis, POD_ID, executor_id=EXECUTOR_ID)
+
+    assert index_seen_at_raise == [True]
+    assert _pod_index_key(POD_ID) not in redis.store
+
+
+@pytest.mark.asyncio
 async def test_pod_restore_raises_a_gpu_whose_restore_failed_while_still_at_the_cap() -> None:
     # The record stays for the safety nets, but the renter must not start at the cap in the meantime.
     ssh = AsyncMock()

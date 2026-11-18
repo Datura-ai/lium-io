@@ -36,7 +36,7 @@ async def test_separate_connectors_cannot_start_filler_beside_customer(customer_
     async def finish_customer():
         host["pod_customer"] = _CUSTOMER_CONTAINER_ID
         assert await customer.check_container_running(
-            Mock(run=AsyncMock(side_effect=ssh_run)), "pod_customer", remove_every_filler=True
+            Mock(run=AsyncMock(side_effect=ssh_run)), "pod_customer", remove_every_filler=True, executor_id="executor-1"
         )
 
     def customer_on_other_connector():
