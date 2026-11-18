@@ -266,8 +266,10 @@ class DindVerifier:
                     measured = await self._sysbox_works(ssh, log_ctx)
                     sysbox_timed_out = measured is None
                     sysbox = measured is True
-                    if sysbox:
-                        sysbox_fs_clean, sysbox_fs_error = await self._read_sysbox_fs(ssh, log_ctx)
+                    # a broken sysbox-fs can fail hello-world too, so the read runs whatever it returned; a
+                    # clean read only counts when hello-world proved sysbox ran this container
+                    read_clean, sysbox_fs_error = await self._read_sysbox_fs(ssh, log_ctx)
+                    sysbox_fs_clean = read_clean and sysbox
 
             logger.info(_m("DinD check ok", extra=get_extra_info({**log_ctx, "sysbox_result": sysbox})))
 

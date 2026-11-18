@@ -183,16 +183,14 @@ class _BrokenFsSSH(_InnerSSH):
         return await super().run(command)
 
 
-@pytest.mark.asyncio
-async def test_a_passed_probe_carries_the_broken_sysbox_fs(mocker):
-    """Sysbox still counts as present; the cause rides on DindProbeResult.error."""
+async def _probe(mocker, inner):
     from contextlib import asynccontextmanager
 
     from services.executor_connectivity.models import PortPair
 
     @asynccontextmanager
     async def answered():
-        yield _BrokenFsSSH(SYSBOX_MAP)
+        yield inner
 
     async def connect(*args, **kwargs):
         return answered()
@@ -205,10 +203,48 @@ async def test_a_passed_probe_carries_the_broken_sysbox_fs(mocker):
     async def run(cmd):
         return SimpleNamespace(exit_status=0, stdout="", stderr="")
 
-    result = await verifier.verify(
+    return await verifier.verify(
         PortPair(9000, 9000), ssh_client=Mock(run=run), host="192.0.2.1", container_name_prefix="c", sysbox=True
     )
 
+
+@pytest.mark.asyncio
+async def test_a_passed_probe_carries_the_broken_sysbox_fs(mocker):
+    """Sysbox still counts as present; the cause rides on DindProbeResult.error."""
+    result = await _probe(mocker, _BrokenFsSSH(SYSBOX_MAP))
+
     assert (result.success, result.sysbox_runtime) == (True, True)
     assert result.error.code == dind_probe.HOST_SYSBOX_FS_BROKEN
+    assert result.sysbox_fs_read_clean is False
+
+
+class _HelloWorldFails(_InnerSSH):
+    def __init__(self, fs_stderr: str, fs_exit: int):
+        super().__init__(SYSBOX_MAP)
+        self.fs_stderr, self.fs_exit = fs_stderr, fs_exit
+
+    async def run(self, command):
+        if command == f"cat {dind_probe.SYSBOX_FS_PATH}":
+            return SimpleNamespace(stdout="", stderr=self.fs_stderr, exit_status=self.fs_exit)
+        if command == "docker run --rm hello-world":
+            return SimpleNamespace(stdout="", stderr="docker: Error response from daemon", exit_status=125)
+        return await super().run(command)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_hello_world_still_reads_sysbox_fs_and_names_a_broken_one(mocker):
+    """A broken sysbox-fs can fail hello-world itself: the read still runs, so a partly rented node is hidden."""
+    result = await _probe(mocker, _HelloWorldFails("Transport endpoint is not connected", 1))
+
+    assert result.sysbox_runtime is False
+    assert result.error.code == dind_probe.HOST_SYSBOX_FS_BROKEN
+    assert result.sysbox_fs_read_clean is False
+
+
+@pytest.mark.asyncio
+async def test_a_clean_read_after_a_failed_hello_world_does_not_count_as_clean(mocker):
+    """Without hello-world proving sysbox ran the container, a clean read cannot lift a hold."""
+    result = await _probe(mocker, _HelloWorldFails("", 0))
+
+    assert result.error is None
     assert result.sysbox_fs_read_clean is False
