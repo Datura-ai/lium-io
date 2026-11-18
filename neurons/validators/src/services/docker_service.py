@@ -3609,7 +3609,7 @@ class DockerService:
                 f"{executor_payload.install('inspector-collector', executor_payload.INSPECTOR)}; "
                 f"nohup {run} >/dev/null 2>&1 &"
             )
-        return f'{executor_payload.install("inspector", executor_payload.INSPECTOR)}; {run}; rc=$?; rm -rf "$d"; exit $rc'
+        return executor_payload.run_once("inspector", executor_payload.INSPECTOR, flag)
 
     async def _run_inspector_collector_lifecycle(
         self,
@@ -3621,7 +3621,7 @@ class DockerService:
         command = self._build_inspector_collector_command(executor_info, action)
         log_extra = {
             **default_extra,
-            "command": command,
+            "command": executor_payload.label(executor_payload.INSPECTOR, action),
             "executor_uuid": executor_info.uuid,
             "inspector_action": action,
         }

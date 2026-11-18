@@ -2453,7 +2453,7 @@ async def test_inspector_lifecycle_command_quotes_executor_paths(docker_service)
         "nohup /root/app/.venv/bin/python -E -s \"$d\"/inspector_executor.py --start-collector >/dev/null 2>&1 &"
     )
     assert stop_command.endswith(
-        '/root/app/.venv/bin/python -E -s "$d"/inspector_executor.py --stop-collector; rc=$?; rm -rf "$d"; exit $rc'
+        '/root/app/.venv/bin/python -E -s "$d"/inspector_executor.py --stop-collector'
     )
 
 
