@@ -583,5 +583,12 @@ def test_a_changed_loader_line_is_named_and_a_missing_loader_names_the_file(tmp_
     assert _reason(host) == f"/etc/needrestart/needrestart.conf line {opener} differs from the stock conf.d loader"
     assert "conf.d/*.conf>" in (host / "etc/needrestart/needrestart.conf").read_text().splitlines()[opener - 1]
 
+    # a site loader's eval line above a stock loader whose glob changed: the glob is named, not the site loader
+    site = "my $fn = '/etc/needrestart/site.conf';\nif(-f $fn) {\neval do { local(@ARGV, $/) = $fn; <>};\n}\n"
+    main.write_text(site + STOCK_MAIN.replace("conf.d/*.conf>", "other/*.conf>"))
+    assert _reason(host) == (
+        f"/etc/needrestart/needrestart.conf line {glob_line + 4} differs from the stock conf.d loader"
+    )
+
     main.write_text("$nrconf{restart} = 'a';\nif (1) {\n}\n}\n")  # stray braces are not a loader
     assert _reason(host) == "/etc/needrestart/needrestart.conf has no stock conf.d loader"

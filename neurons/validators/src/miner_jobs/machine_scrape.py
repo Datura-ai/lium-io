@@ -852,9 +852,10 @@ def get_needrestart_guard(host_root="/proc/1/root"):
     flat = [" ".join(ln.split()).replace(old_log, loader[2]) for _, ln in main]
     at = next((i for i in range(len(flat)) if flat[i : i + len(loader)] == loader), None)
     if at is None:
-        # a recognisable loader that was changed: anchor on the first of its distinctive (non-brace) lines in the
-        # file and name the first line that differs from there on, not only the file
-        anchor = next(((i, j) for i in range(len(flat)) for j in range(len(loader) - 2) if flat[i] == loader[j]), None)
+        # a recognisable loader that was changed: anchor on its opener or its conf.d glob, the only loader lines
+        # no other Perl block shares (eval/die are generic idioms a site loader also uses), and name the first
+        # line that differs from there on, not only the file
+        anchor = next(((i, j) for i in range(len(flat)) for j in (0, 1) if flat[i] == loader[j]), None)
         if anchor is None:
             return unknowable(f"{main_path} has no stock conf.d loader")
         i, j = anchor
