@@ -2963,7 +2963,7 @@ _HALF_STARTED_STOP_ATTEMPTS = 3
 _HALF_STARTED_STOP_RETRY_SEC = 2
 # a pod that refused stop and kill is retried in the background this soon, before the next cycle's check (F-31)
 _HALF_STARTED_STOP_LATER_DELAYS_SEC = (10, 20, 30)
-# pod_id -> that background retry, cancelled by the pod's next start
+# executor:pod:container -> that background retry, cancelled by a start that mounted that same container
 _HALF_STARTED_STOP_LATER: dict[str, asyncio.Task] = {}
 
 
@@ -2971,9 +2971,17 @@ def _half_started_stop_slot(executor_info: ExecutorSSHInfo, pod_id: str) -> str:
     return f"{executor_info.uuid}:{pod_id}"
 
 
+def _half_started_stop_field(pod_id: str, container_id: str) -> str:
+    """One record (and one background retry) per container: a start of another container of the pod neither ends nor
+    replaces it."""
+    return f"{pod_id}:{container_id}"
+
+
 def half_started_stop_retry(executor_uuid: str, pod_id: str) -> asyncio.Task | None:
-    """The pod's background stop retry, still running: it reconnects with the key of the request that started it."""
-    return _HALF_STARTED_STOP_LATER.get(f"{executor_uuid}:{pod_id}")
+    """The pod's newest background stop retry, still running: it reconnects with the key of the request that started
+    it."""
+    prefix = f"{executor_uuid}:{pod_id}:"
+    return next((task for slot, task in reversed(_HALF_STARTED_STOP_LATER.items()) if slot.startswith(prefix)), None)
 
 
 # bounds the host-side mount read of a half-started pod before its stop is decided
@@ -3013,7 +3021,7 @@ def _pod_start_fence_lock(pod_id: str) -> str:
 def _pod_start_fence_hold_command(pod_id: str) -> str:
     """Held for a whole start/remount (the process lives until the SSH session closes, a dead validator's included):
     prints "held" once the shared lock is taken, "none" on a host without flock or the lock dir, where the fence
-    stops nothing (exit 3) either."""
+    stops nothing (exit 3) either and so no start is let in."""
     return (
         f"l={_pod_start_fence_lock(pod_id)}; "
         'if command -v flock >/dev/null 2>&1 && touch "$l" 2>/dev/null; then '
@@ -12938,11 +12946,11 @@ class DockerService:
                         )
                     )
                 raise
-            # only a start that mounted the pod ends an earlier failed start's pending stop; a failed one leaves it
-            task = _HALF_STARTED_STOP_LATER.pop(slot, None)
-            if task:
+            # a start that mounted this container ends only this container's pending stop; another container's (a
+            # replacement, an edit's park) stays until its own run is proven stopped, gone or mounted
+            if task := _HALF_STARTED_STOP_LATER.pop(f"{slot}:{container_id}", None):
                 task.cancel()
-            await self._forget_half_started_stop(executor_info, pod_id, default_extra)
+            await self._forget_half_started_stop(executor_info, pod_id, container_id, default_extra)
 
     async def _stop_after_failed_start(
         self,
@@ -13038,8 +13046,8 @@ class DockerService:
                 ):
                     return
 
-        slot = _half_started_stop_slot(executor_info, pod_id)
-        # a newer failure's record replaces an older one's
+        slot = f"{_half_started_stop_slot(executor_info, pod_id)}:{recorded[1].partition('@')[0]}"
+        # a newer failure of the same container replaces its older record's retry
         if earlier := _HALF_STARTED_STOP_LATER.pop(slot, None):
             earlier.cancel()
         task = asyncio.create_task(retry())
@@ -13062,7 +13070,7 @@ class DockerService:
             await asyncio.wait_for(
                 self.redis_service.hset(
                     f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}",
-                    pod_id,
+                    _half_started_stop_field(pod_id, identity.partition("@")[0]),
                     json.dumps(
                         {
                             "container_name": container_name,
@@ -13083,12 +13091,14 @@ class DockerService:
             )
 
     async def _forget_half_started_stop(
-        self, executor_info: ExecutorSSHInfo, pod_id: str, default_extra: dict[str, Any]
+        self, executor_info: ExecutorSSHInfo, pod_id: str, container_id: str, default_extra: dict[str, Any]
     ) -> bool:
         slot = _half_started_stop_slot(executor_info, pod_id)
         try:
             await asyncio.wait_for(
-                self.redis_service.hdel(f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}", pod_id),
+                self.redis_service.hdel(
+                    f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}", _half_started_stop_field(pod_id, container_id)
+                ),
                 timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
             )
             return True
@@ -13109,7 +13119,10 @@ class DockerService:
         pod_id: str,
         default_extra: dict[str, Any],
         recorded: tuple[str, str, str, str] | None = None,
+        container_id: str = "",
     ) -> bool | None:
+        """The pending stop of one container of the pod: ``recorded``, or the record read under the lock for
+        ``container_id``."""
         # under the pod's shared lock from record read to stop: a start (here or in the other process) cannot slip in
         # between the check and the stop
         async def locked() -> bool | None:
@@ -13129,6 +13142,7 @@ class DockerService:
                     pod_id=pod_id,
                     default_extra=default_extra,
                     recorded=recorded,
+                    container_id=container_id,
                 )
 
         # a cancel (the check's deadline) leaves the lock with the retry until its stop is done: the SDK stop runs on
@@ -13164,7 +13178,7 @@ class DockerService:
         """Held by every start and remount of the pod: the Redis pod lock (orders the two processes' work), and the
         pod's host start lock, held shared over its own SSH session (_pod_start_fence_hold_command). A start goes
         ahead when Redis is unreachable, but never without the host lock: that is what makes a concurrent pending
-        stop's fence fail (_fenced_stop_command), whatever the Redis lock's state."""
+        stop's fence fail (_fenced_stop_command), whatever the Redis lock's state; a host without it refuses the start."""
         async with self.redis_service.pod_start_stop_lock(_half_started_stop_slot(executor_info, pod_id)):
             if not private_key:  # nothing can be started without the key
                 yield
@@ -13182,7 +13196,8 @@ class DockerService:
             async with asyncio.timeout(_FENCED_STOP_TIMEOUT_SEC + 10 + _OWN_SSH_CONNECTION_MARGIN_SEC):
                 process = await own_ssh.create_process(_pod_start_fence_hold_command(pod_id))
                 taken = (await process.stdout.readline()).strip()
-            if taken not in ("held", "none"):
+            # "none" (no flock or lock dir) holds nothing a pending stop's fence would see: no start goes ahead without it
+            if taken != "held":
                 raise RentalDockerOperationError("the pod's host start lock could not be taken")
             yield
 
@@ -13226,6 +13241,7 @@ class DockerService:
         pod_id: str,
         default_extra: dict[str, Any],
         recorded: tuple[str, str, str, str] | None,
+        container_id: str = "",
     ) -> bool | None:
         """Stop a pod whose failed start left it possibly running without its mount (F-31/F-37/F-15).
         The recorded container (by its id, whatever its name) is stopped while its encrypted volume is unmounted, across
@@ -13238,7 +13254,10 @@ class DockerService:
         if recorded is None:
             try:
                 raw = await asyncio.wait_for(
-                    self.redis_service.hget(f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}", pod_id),
+                    self.redis_service.hget(
+                        f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}",
+                        _half_started_stop_field(pod_id, container_id),
+                    ),
                     timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
                 )
                 if raw is None:
@@ -13258,12 +13277,12 @@ class DockerService:
                 return False
         container_name, identity, recorded_at, plaintext_path = recorded
         extra["container_name"] = container_name
+        recorded_id = identity.partition("@")[0]
         try:
             if not private_key:
                 raise RentalDockerOperationError("no executor key to reach Docker")
             # every record carries the id the start read before starting; one without it cannot be followed through a
             # rename (an edit's park) or proven gone, so it is never dropped and never acted on
-            recorded_id = identity.partition("@")[0]
             if not recorded_id:
                 raise RentalDockerOperationError("the record names no container id")
             async with self.rental_docker_client_factory.connect(
@@ -13300,7 +13319,7 @@ class DockerService:
         except Exception as exc:  # noqa: BLE001
             logger.error(_m("POD_HALF_STARTED_STOP_STILL_PENDING", extra=get_extra_info({**extra, "error": str(exc)})))
             return False
-        await self._forget_half_started_stop(executor_info, pod_id, extra)
+        await self._forget_half_started_stop(executor_info, pod_id, recorded_id, extra)
         return True
 
     async def retry_pending_half_started_stops(
@@ -13311,15 +13330,17 @@ class DockerService:
         index = f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}"
         pending = await asyncio.wait_for(self.redis_service.hgetall(index), timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC)
         # all at once, each under its own pod lock: one slow stop cannot use up the check's budget for the others
+        fields = [member.decode() if isinstance(member, bytes) else str(member) for member in pending or {}]
         await asyncio.gather(
             *(
                 self.retry_half_started_stop(
                     executor_info=executor_info,
                     private_key=private_key,
-                    pod_id=member.decode() if isinstance(member, bytes) else str(member),
+                    pod_id=pod_id,
+                    container_id=container_id,
                     default_extra=default_extra,
                 )
-                for member in pending or {}
+                for pod_id, _, container_id in (field.partition(":") for field in fields)
             )
         )
 
@@ -13986,11 +14007,20 @@ class DockerService:
         plaintext path is known."""
         _UNMOUNTED_STOP_OUTCOMES.pop(pod_id, None)  # only this call's stop is reported
         # under the pod's shared lock, like a start: a pending stop's retry that read the pod unmounted must not stop it
-        # once this remount restored it
+        # once this remount restored it. The two locks of _pod_start_exclusion, the Redis one entered before the try so
+        # it is still held by the cleanup's stop below when the host lock cannot be taken
         async with AsyncExitStack() as exclusion:
+            redis_held = await exclusion.enter_async_context(
+                self.redis_service.pod_start_stop_lock(_half_started_stop_slot(executor_info, pod_id))
+            )
+            host_held = False
             try:
                 # inside the try: a pod whose host start lock cannot be taken is not left up unmounted either
-                await exclusion.enter_async_context(self._pod_start_exclusion(executor_info, private_key, pod_id))
+                if private_key:
+                    await exclusion.enter_async_context(
+                        self._hold_pod_start_host_lock(executor_info, private_key, pod_id)
+                    )
+                    host_held = True
                 # never at a guessed path, and only with the secret the volume was made with
                 if not private_key or not _can_remount_encrypted_volume(local_volume_path):
                     raise RuntimeError("no usable plaintext path, master secret or SSH key to remount with")
@@ -14007,8 +14037,15 @@ class DockerService:
                         default_extra=default_extra,
                     )
             except (asyncio.CancelledError, Exception) as exc:
+                # with neither lock held, a start may have remounted the pod meanwhile: no stop by name, only of the
+                # run still unmounted with no start holding its host lock
                 container_stopped = await _cleanup_to_completion(
-                    self._mark_and_stop_unmounted_pod(ssh_client, container_name, pod_id)
+                    self._mark_and_stop_unmounted_pod(
+                        ssh_client,
+                        container_name,
+                        pod_id,
+                        fence_path=None if redis_held or host_held else (local_volume_path or ""),
+                    )
                 )
                 logger.error(
                     _m(
@@ -14035,7 +14072,11 @@ class DockerService:
         return True
 
     async def _mark_and_stop_unmounted_pod(
-        self, ssh_client: asyncssh.SSHClientConnection, container_name: str, pod_id: str
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+        pod_id: str,
+        fence_path: str | None = None,
     ) -> bool:
         # marked before the stop (at most the mark's 5 s bound), since no later cycle restarts an
         # unmarked pod stopped under its own name, and a stop whose reply is lost may still have
@@ -14063,7 +14104,11 @@ class DockerService:
                 container_name = parked
             else:
                 await _drop_unmarked_recovery_stop(pod_id)
-        outcome = await self._stop_outcome(ssh_client, container_name)
+        outcome = (
+            await self._stop_outcome(ssh_client, container_name)
+            if fence_path is None
+            else await self._fenced_stop_outcome(ssh_client, container_name, pod_id, fence_path)
+        )
         _UNMOUNTED_STOP_OUTCOMES[pod_id] = outcome
         if outcome == "failed":
             # docker said it did not stop: the pod still runs, and neither the mark nor the park record may restart
@@ -14230,6 +14275,29 @@ class DockerService:
         # the POD_NOT_RUNNING verdict keeps matching what the customer sees. A no-op when the start
         # itself was what failed.
         return await self._stop_outcome(ssh_client, container_name) == "stopped"
+
+    async def _fenced_stop_outcome(
+        self, ssh_client: asyncssh.SSHClientConnection, container_name: str, pod_id: str, plaintext_path: str
+    ) -> str:
+        """"stopped" only for the run read here, still without its encrypted mount and with no start holding the pod's
+        host lock (_fenced_stop_command); "unknown" otherwise, nothing stopped."""
+        try:
+            read = await ssh_client.run(
+                f"/usr/bin/docker inspect -f '{{{{.Id}}}} {{{{.State.StartedAt}}}}' {shlex.quote(container_name)}",
+                timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+            )
+            container_id, _, started_at = (read.stdout or "").strip().partition(" ")
+            if getattr(read, "exit_status", 1) != 0 or not re.fullmatch(r"[0-9a-f]{64}", container_id):
+                return "unknown"
+            fenced = await ssh_client.run(
+                _fenced_stop_command(pod_id, container_id, started_at, plaintext_path, 1),
+                timeout=_FENCED_STOP_TIMEOUT_SEC,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - unproven is not stopped
+            return "unknown"
+        return "stopped" if getattr(fenced, "exit_status", None) == 0 else "unknown"
 
     async def _stop_outcome(self, ssh_client: asyncssh.SSHClientConnection, container_name: str) -> str:
         """"stopped", "failed" (the container verifiably still runs) or "unknown" (the stop may have applied)."""

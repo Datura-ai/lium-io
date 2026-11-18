@@ -474,7 +474,7 @@ def _start_leaving_a_stop_retry(mocker, miner_service, retry_done: asyncio.Event
 
     async def start_failing(*args, **kwargs):
         retry = asyncio.create_task(retry_done.wait())
-        docker_service_module._HALF_STARTED_STOP_LATER[f"{executor_id}:{pod_id}"] = retry
+        docker_service_module._HALF_STARTED_STOP_LATER[f"{executor_id}:{pod_id}:cid"] = retry
         return Mock()
 
     mocker.patch("services.miner_service.DockerService.start_container", AsyncMock(side_effect=start_failing))

@@ -3529,14 +3529,14 @@ async def test_a_half_started_pod_that_refuses_stop_and_kill_fails_the_start_as_
 
     # one field in the node's index holds the record: no write can leave a record the node check cannot find
     key, field, value = docker_service.redis_service.hset.await_args.args
-    assert (key, field) == ("half_started_stop_index:exec-1", "pod-id")
+    assert (key, field) == ("half_started_stop_index:exec-1", "pod-id:cid")
     docker_service.redis_service.set.assert_not_awaited()
     docker_service.redis_service.sadd.assert_not_awaited()
     record = json.loads(value)
     # the mount path the retry checks the run against (the pod's own mount table, read on the host)
     assert (record["container_name"], record["identity"], record["plaintext_path"]) == ("pod_test", _RUN, "/workspace")
     assert datetime.fromisoformat(record["recorded_at"]).tzinfo is not None
-    docker_service_module._HALF_STARTED_STOP_LATER.pop("exec-1:pod-id").cancel()
+    docker_service_module._HALF_STARTED_STOP_LATER.pop("exec-1:pod-id:cid").cancel()
 
 
 @pytest.mark.asyncio
@@ -3553,7 +3553,7 @@ async def test_a_half_started_pod_that_refused_stop_and_kill_is_stopped_by_the_p
     client.kill_error = RuntimeError("kill refused")
     with pytest.raises(RentalDockerOperationError):
         await _start_existing(docker_service)
-    retry = docker_service_module._HALF_STARTED_STOP_LATER["exec-1:pod-id"]
+    retry = docker_service_module._HALF_STARTED_STOP_LATER["exec-1:pod-id:cid"]
     docker_service.redis_service.hdel.reset_mock()
 
     client.kill_error = None
@@ -3562,8 +3562,8 @@ async def test_a_half_started_pod_that_refused_stop_and_kill_is_stopped_by_the_p
     await retry
 
     assert client.running is False
-    docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id")
-    assert "exec-1:pod-id" not in docker_service_module._HALF_STARTED_STOP_LATER
+    docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id:cid")
+    assert "exec-1:pod-id:cid" not in docker_service_module._HALF_STARTED_STOP_LATER
 
 
 @pytest.mark.asyncio
@@ -3580,7 +3580,7 @@ async def test_retry_half_started_stop_stops_the_recorded_container_and_clears_i
 
     assert stopped is True
     assert client.stopped_containers == ["cid"]
-    docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id")
+    docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id:cid")
 
 
 @pytest.mark.asyncio
@@ -3616,7 +3616,7 @@ async def test_retry_half_started_stop_leaves_a_pod_started_again_since_running_
 
     assert stopped is True
     assert client.stopped_containers == [] and client.killed_containers == []
-    docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id")
+    docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id:cid")
 
 
 @pytest.mark.asyncio
@@ -3679,7 +3679,7 @@ async def test_retry_half_started_stop_that_read_unmounted_stops_nothing_when_it
     assert stopped is expect_dropped
     assert client.stopped_containers == [] and client.killed_containers == [] and client.running is True
     if expect_dropped:
-        docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id")
+        docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id:cid")
     else:
         docker_service.redis_service.hdel.assert_not_awaited()
 
@@ -3703,17 +3703,17 @@ async def test_a_start_ends_only_its_own_executors_pending_stop_retry(
 ):
     _let_starts_succeed(docker_service, monkeypatch)
     pending = asyncio.create_task(asyncio.sleep(3600))
-    docker_service_module._HALF_STARTED_STOP_LATER["exec-1:pod-id"] = pending
+    docker_service_module._HALF_STARTED_STOP_LATER["exec-1:pod-id:cid"] = pending
 
     await _start_existing(docker_service, executor_uuid="exec-2")
     await asyncio.sleep(0)
     assert not pending.cancelled()
-    assert call("half_started_stop_index:exec-1", "pod-id") not in docker_service.redis_service.hdel.await_args_list
+    assert call("half_started_stop_index:exec-1", "pod-id:cid") not in docker_service.redis_service.hdel.await_args_list
 
     await _start_existing(docker_service, executor_uuid="exec-1")
     await asyncio.sleep(0)
     assert pending.cancelled()
-    docker_service.redis_service.hdel.assert_any_await("half_started_stop_index:exec-1", "pod-id")
+    docker_service.redis_service.hdel.assert_any_await("half_started_stop_index:exec-1", "pod-id:cid")
 
 
 @pytest.mark.asyncio
@@ -3724,7 +3724,7 @@ async def test_a_failed_start_keeps_an_earlier_failed_starts_pending_stop_and_it
     _let_starts_succeed(docker_service, monkeypatch)
     monkeypatch.setattr("services.docker_service.asyncssh.connect", Mock(side_effect=OSError("ssh refused")))
     pending = asyncio.create_task(asyncio.sleep(3600))
-    docker_service_module._HALF_STARTED_STOP_LATER["exec-1:pod-id"] = pending
+    docker_service_module._HALF_STARTED_STOP_LATER["exec-1:pod-id:cid"] = pending
     docker_service.rental_docker_client_factory.client.running = False
 
     with pytest.raises(OSError):
@@ -3734,6 +3734,125 @@ async def test_a_failed_start_keeps_an_earlier_failed_starts_pending_stop_and_it
     assert not pending.cancelled()
     docker_service.redis_service.hdel.assert_not_awaited()
     pending.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_pending_stop_belongs_to_its_own_container_not_to_a_replacements_start(
+    docker_service, monkeypatch, fresh_half_started_stop_state
+):
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    monkeypatch.setattr("services.docker_service.asyncssh.connect", Mock(side_effect=OSError("ssh refused")))
+    monkeypatch.setattr("services.docker_service._HALF_STARTED_STOP_RETRY_SEC", 0)
+    client = docker_service.rental_docker_client_factory.client
+    client.running = False
+    client.stop_error = RuntimeError("stop refused")
+    client.kill_error = RuntimeError("kill refused")
+    with pytest.raises(RentalDockerOperationError):
+        await _start_existing(docker_service)
+    first_field = docker_service.redis_service.hset.await_args.args[1]
+    first_retry = docker_service_module._HALF_STARTED_STOP_LATER[f"exec-1:{first_field}"]
+
+    # the pod's container is replaced (new id, same name); its own failed start records it separately
+    client.identity = "cid2@2026-11-16T15:00:00.123456789Z"
+    client.running = False
+    with pytest.raises(RentalDockerOperationError):
+        await _start_existing(docker_service)
+    second_field = docker_service.redis_service.hset.await_args.args[1]
+    assert (first_field, second_field) == ("pod-id:cid", "pod-id:cid2")
+    assert not first_retry.cancelled()
+
+    # the replacement then starts and mounts: only its own record and retry end
+    _let_starts_succeed(docker_service, monkeypatch)
+    client.stop_error = client.kill_error = None
+    await _start_existing(docker_service)
+    await asyncio.sleep(0)
+    assert not first_retry.cancelled()
+    assert list(docker_service_module._HALF_STARTED_STOP_LATER) == ["exec-1:pod-id:cid"]
+    assert [c.args[1] for c in docker_service.redis_service.hdel.await_args_list] == ["pod-id:cid2"]
+    first_retry.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_start_is_refused_before_docker_when_the_host_start_lock_is_unavailable(
+    docker_service, monkeypatch, fresh_half_started_stop_state
+):
+    # "none": no flock or lock dir on the host, so a pending stop's fence could not see this start
+    process = Mock(stdout=Mock(readline=AsyncMock(return_value="none\n")))
+
+    @contextlib.asynccontextmanager
+    async def own_ssh(*args):
+        yield Mock(create_process=AsyncMock(return_value=process))
+
+    monkeypatch.setattr(docker_service_module, "_connect_own_ssh", own_ssh)
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    docker_service._prepare_known_hosts_policy = AsyncMock(return_value=object())
+    docker_service._hold_pod_start_host_lock = DockerService._hold_pod_start_host_lock.__get__(docker_service)
+    client = docker_service.rental_docker_client_factory.client
+    client.running = False
+
+    with pytest.raises(RentalDockerOperationError, match="host start lock"):
+        await _start_existing(docker_service)
+
+    assert client.started_containers == []
+
+
+@contextlib.asynccontextmanager
+async def _host_lock_not_taken(*args):
+    raise RentalDockerOperationError("the pod's host start lock could not be taken")
+    yield
+
+
+def _restore_mount(docker_service, ssh_client):
+    return docker_service.restore_volume_mount_of_running_container(
+        ssh_client=ssh_client,
+        executor_info=Mock(uuid="exec-1"),
+        private_key="private-key",
+        container_name="pod_test",
+        pod_id="pod-id",
+        local_volume_path="/workspace",
+        default_extra={},
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_remount_whose_host_lock_fails_stops_the_pod_still_holding_the_pod_lock(docker_service):
+    locks: dict[str, asyncio.Lock] = {}
+    docker_service.redis_service.pod_start_stop_lock = shared_pod_start_stop_lock(locks)
+    docker_service._hold_pod_start_host_lock = _host_lock_not_taken
+    docker_service._mark_stopped_by_recovery = AsyncMock()
+    held_at_stop = []
+
+    async def run(command, **kwargs):
+        if command.startswith("/usr/bin/docker stop"):
+            held_at_stop.append(locks["exec-1:pod-id"].locked())
+        return Mock(exit_status=0, stdout="")
+
+    assert await _restore_mount(docker_service, Mock(run=run)) is False
+    assert held_at_stop == [True]
+
+
+@pytest.mark.asyncio
+async def test_a_remount_holding_neither_lock_stops_only_through_the_host_fence(docker_service):
+    # Redis unreachable and the host lock not taken: a start may have remounted the pod, so no stop by name
+    @contextlib.asynccontextmanager
+    async def redis_down(slot):
+        yield False
+
+    docker_service.redis_service.pod_start_stop_lock = redis_down
+    docker_service._hold_pod_start_host_lock = _host_lock_not_taken
+    docker_service._mark_stopped_by_recovery = AsyncMock()
+    commands = []
+
+    async def run(command, **kwargs):
+        commands.append(command)
+        if command.startswith("/usr/bin/docker inspect -f"):
+            return Mock(exit_status=0, stdout="a" * 64 + " 2026-11-16T14:00:00.123456789Z\n")
+        return Mock(exit_status=4, stdout="")  # the fence: a start holds the pod's host lock
+
+    assert await _restore_mount(docker_service, Mock(run=run)) is False
+    assert not any(c.startswith("/usr/bin/docker stop") for c in commands)
+    assert any("flock -n -x" in c and "a" * 64 in c for c in commands)
+    assert await docker_service.unmounted_stop_outcome("pod-id") == "unknown"
 
 
 @pytest.mark.asyncio
@@ -3784,7 +3903,7 @@ async def test_a_pending_stop_retry_racing_a_start_does_not_stop_the_new_run(
 async def test_pending_half_started_stops_of_the_node_are_all_retried_and_none_is_dropped_without_its_stop(
     docker_service,
 ):
-    docker_service.redis_service.hgetall = AsyncMock(return_value={b"pod-a": b"{}", b"pod-b": b"{}"})
+    docker_service.redis_service.hgetall = AsyncMock(return_value={b"pod-a:cid-a": b"{}", b"pod-b:cid-b": b"{}"})
     outcomes = {"pod-a": False, "pod-b": None}  # a still refuses its stop; b has no record left
     docker_service.retry_half_started_stop = AsyncMock(side_effect=lambda **kw: outcomes[kw["pod_id"]])
 
@@ -3792,7 +3911,9 @@ async def test_pending_half_started_stops_of_the_node_are_all_retried_and_none_i
         executor_info=Mock(uuid="exec-1"), private_key="private-key", default_extra={}
     )
 
-    assert sorted(c.kwargs["pod_id"] for c in docker_service.retry_half_started_stop.await_args_list) == ["pod-a", "pod-b"]
+    assert sorted(
+        (c.kwargs["pod_id"], c.kwargs["container_id"]) for c in docker_service.retry_half_started_stop.await_args_list
+    ) == [("pod-a", "cid-a"), ("pod-b", "cid-b")]
     docker_service.redis_service.hgetall.assert_awaited_once_with("half_started_stop_index:exec-1")
     docker_service.redis_service.hdel.assert_not_awaited()
 
@@ -3800,7 +3921,7 @@ async def test_pending_half_started_stops_of_the_node_are_all_retried_and_none_i
 @pytest.mark.asyncio
 async def test_a_slow_pending_stop_does_not_hold_back_the_nodes_other_pending_stops(docker_service):
     # gateway review: one deadline over a sorted loop let pod-a's stop starve pod-b every cycle
-    docker_service.redis_service.hgetall = AsyncMock(return_value={b"pod-a": b"{}", b"pod-b": b"{}"})
+    docker_service.redis_service.hgetall = AsyncMock(return_value={b"pod-a:cid-a": b"{}", b"pod-b:cid-b": b"{}"})
     reached = []
 
     async def retry(**kw):
@@ -3834,8 +3955,8 @@ async def test_an_unreadable_pending_stop_record_is_kept_pending_not_read_as_abs
 
 @pytest.mark.asyncio
 async def test_a_confirmed_half_started_stop_leaves_the_nodes_index(docker_service, monkeypatch):
-    assert await docker_service._forget_half_started_stop(Mock(uuid="exec-1"), "pod-id", {})
-    docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id")
+    assert await docker_service._forget_half_started_stop(Mock(uuid="exec-1"), "pod-id", "cid", {})
+    docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id:cid")
 
 
 @pytest.mark.parametrize(
@@ -4019,7 +4140,7 @@ async def test_a_pending_stop_follows_the_recorded_container_by_its_id(docker_se
     )
 
     assert client.stopped_containers == stops
-    docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id")
+    docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id:cid")
 
 
 def _bring_up_by(holder: str, service, client):
@@ -4250,7 +4371,7 @@ async def test_a_pending_stop_drops_a_container_re_created_under_its_name_withou
 
     run.assert_not_awaited()
     assert client.stopped_containers == []
-    docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id")
+    docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id:cid")
 
 
 @pytest.mark.parametrize(
