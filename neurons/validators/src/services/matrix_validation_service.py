@@ -13,6 +13,7 @@ import asyncssh
 
 from core.config import settings
 from core.utils import _m, get_extra_info
+from services import executor_payload
 from services.gpu_spec_table import name_reported_by_driver, matmul_probe_vram_mb
 
 logger = logging.getLogger(__name__)
@@ -331,7 +332,7 @@ class ValidationService:
         if not sized_vram_mb:
             return _not_probed(f"no work-proof size for GPU model {gpu_model!r}")
 
-        script_path = f"{executor_info.root_dir}/src/decrypt_challenge.py"
+        script_path = executor_payload.process_pattern("matrix", executor_payload.MATRIX)
 
         # DAH-6241: one challenge per card, pinned to that card's UUID and keyed to it alone (the
         # executor's .so sees only that card), so each answer is sealed and its metrics are the card's
@@ -517,8 +518,8 @@ class ValidationService:
         # aggregate wall-clock. The command sent to the executor is unchanged except the
         # CUDA_VISIBLE_DEVICES env prefix, and never reveals which card/signal disagreed (anti-treadmill).
         pin = shlex.quote(card_uuid) if card_uuid else str(index)
-        command = (
-            f"CUDA_VISIBLE_DEVICES={pin} {shlex.quote(executor_info.python_path)} {shlex.quote(script_path)} {challenge.params}"
+        command = executor_payload.run_once(
+            "matrix", executor_payload.MATRIX, str(challenge.params), env=f"CUDA_VISIBLE_DEVICES={pin} "
         )
         try:
             result = await ssh_client.run(command, timeout=MATRIX_VERIFY_TIMEOUT_SECONDS)
@@ -850,7 +851,7 @@ class ValidationService:
         # by concurrent validations across the `await` below. Freed in `finally`.
         challenge = None
         try:
-            script_path = f"{executor_info.root_dir}/src/decrypt_challenge.py"
+            script_path = executor_payload.process_pattern("matrix", executor_payload.MATRIX)
             challenge = self.prepare_matmul_challenge(
                 machine_spec, default_extra, vram_budget_mb, gpu_uuid=gpu_uuid
             )
@@ -870,10 +871,9 @@ class ValidationService:
                     validator_error=True,
                 )
 
-            command = f"{shlex.quote(executor_info.python_path)} {shlex.quote(script_path)} {verifier_params}"
-            if gpu_uuid is not None:
-                # gpu_uuid comes from host-reported specs, so it is quoted
-                command = f"CUDA_VISIBLE_DEVICES={shlex.quote(gpu_uuid)} {command}"
+            # gpu_uuid comes from host-reported specs, so it is quoted
+            env = f"CUDA_VISIBLE_DEVICES={shlex.quote(gpu_uuid)} " if gpu_uuid is not None else ""
+            command = executor_payload.run_once("matrix", executor_payload.MATRIX, f"{verifier_params}", env=env)
 
             logger.info(_m("Matrix Multiplication Python Script Command", extra=get_extra_info(log_extra)))
 

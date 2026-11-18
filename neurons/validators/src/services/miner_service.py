@@ -64,6 +64,7 @@ from payload_models.payloads import (
     now_ms,
 )
 
+from services import executor_payload
 from core.config import settings
 from core.utils import _m, _StructuredMessage, get_extra_info
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
@@ -1768,7 +1769,7 @@ class MinerService:
             if payload.backup_engine == "restic":
                 operation_id = UUID(payload.backup_log_id)
                 if payload.exclude_patterns and not await supports_workspace_field(
-                    ssh_client, executor_info.python_path, "exclude_patterns"
+                    ssh_client, executor_payload.EXECUTOR_PYTHON, "exclude_patterns"
                 ):
                     error = RuntimeError(
                         "executor image cannot skip caches and keys (no workspace.exclude_patterns); "
@@ -1785,7 +1786,7 @@ class MinerService:
                 try:
                     await start_storage_operation(
                         ssh_client,
-                        executor_info.python_path,
+                        executor_payload.EXECUTOR_PYTHON,
                         operation_id,
                         self._restic_backup_operation_spec(payload),
                         retain_terminal_artifacts=False,
@@ -1814,7 +1815,7 @@ class MinerService:
                 await sftp.put(local_helper_path, remote_helper_path)
 
             argv = [
-                executor_info.python_path,
+                executor_payload.EXECUTOR_PYTHON,
                 "/root/app/backup_storage.py",
                 "--api-url", settings.COMPUTE_REST_API_URL_EXTERNAL,
                 "--source-volume", payload.source_volume,
@@ -1850,7 +1851,7 @@ class MinerService:
                 try:
                     await start_storage_operation(
                         ssh_client,
-                        executor_info.python_path,
+                        executor_payload.EXECUTOR_PYTHON,
                         operation_id,
                         self._restic_restore_operation_spec(payload),
                         retain_terminal_artifacts=False,
@@ -1879,7 +1880,7 @@ class MinerService:
                 await sftp.put(local_helper_path, remote_helper_path)
 
             argv = [
-                executor_info.python_path,
+                executor_payload.EXECUTOR_PYTHON,
                 "/root/app/restore_storage.py",
                 "--api-url", settings.COMPUTE_REST_API_URL_EXTERNAL,
                 "--target-volume", payload.target_volume,

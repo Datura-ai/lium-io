@@ -20,6 +20,7 @@ from neurons.validators.src.services.task.checks.gpu_fault_probe import (
 from neurons.validators.src.services.task.messages import GpuFaultProbeMessages as Msg
 from neurons.validators.src.services.task.runner import SSHCommandResult
 
+from services.executor_payload import EXECUTOR_PYTHON
 from tests.helpers import build_context_config, build_services, build_state, default_executor
 
 PROBE_SOURCE = probe_source()
@@ -141,7 +142,7 @@ async def test_probe_source_goes_over_stdin_to_the_executor_interpreter(context_
     assert result.passed is True
     assert result.event.reason_code == Msg.PROBE_OK.reason
     (call,) = runner.calls
-    assert call["cmd"] == f"{default_executor().python_path} -I - --seconds {PROBE_SECONDS}"
+    assert call["cmd"] == f"{EXECUTOR_PYTHON} -I - --seconds {PROBE_SECONDS}"
     assert call["stdin_text"] == PROBE_SOURCE
     assert call["timeout"] == PROBE_TIMEOUT_SECONDS
     assert call["retryable"] is False

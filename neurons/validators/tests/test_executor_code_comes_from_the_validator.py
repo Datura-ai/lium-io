@@ -5,6 +5,7 @@ interpreter wrapper that write marker files; the validator's own payloads write 
 run in a local shell, with the service directory and the trusted interpreter moved into the test's temp dir.
 """
 
+import ast
 import asyncio
 import os
 import signal
@@ -56,6 +57,7 @@ def node(tmp_path, monkeypatch):
     (payloads / "services" / "pull_lock.py").write_text("")
     (payloads / "inspector_executor.py").write_text(_marker_script(tmp_path / "VALIDATOR_INSPECTOR"))
     (payloads / "verifyx_executor.py").write_text(_marker_script(tmp_path / "VALIDATOR_VERIFYX"))
+    (payloads / "decrypt_challenge.py").write_text(_marker_script(tmp_path / "VALIDATOR_MATRIX"))
     (tmp_path / "service").mkdir()
     monkeypatch.setattr(executor_payload, "PAYLOAD_DIR", payloads)
     monkeypatch.setattr(executor_payload, "SERVICE_DIR_PARENT", str(tmp_path / "service"))
@@ -98,7 +100,7 @@ def _ctx(node, runner, **config):
     keypair = SimpleNamespace(sign=lambda data: b"\x01", ss58_address="5Validator")
     return make_context(
         executor=node.executor, runner=runner, miner_hotkey="5Account",
-        config=build_context_config(validator_keypair=keypair, executor_root=node.executor.root_dir, **config),
+        config=build_context_config(validator_keypair=keypair, **config),
         state=build_state(),
     )
 
@@ -199,5 +201,25 @@ async def test_honest_gpu_monitor_still_starts(node):
 
 def test_every_payload_is_found():
     # in the repository the executor sources; in the image the copies the Dockerfile takes from them
-    for name in executor_payload.GPU_MONITOR + executor_payload.INSPECTOR + executor_payload.VERIFYX:
+    for name in executor_payload.GPU_MONITOR + executor_payload.INSPECTOR + executor_payload.VERIFYX + executor_payload.MATRIX:
         assert (executor_payload.PAYLOAD_DIR / name).read_bytes() == (EXECUTOR_SOURCES / name).read_bytes(), name
+
+
+async def test_one_shot_payload_runs_with_its_environment_and_is_removed(node):
+    command = executor_payload.run_once("matrix", executor_payload.MATRIX, "--x 1", env="CUDA_VISIBLE_DEVICES=0 ")
+    done = subprocess.run(["sh", "-c", command], cwd=node.tmp, capture_output=True, text=True, timeout=20)
+    assert done.returncode == 0, done.stderr
+    assert (node.tmp / "VALIDATOR_MATRIX").read_text() == "--x 1\n"
+    assert not list((node.tmp / "service").iterdir())
+
+
+def test_no_validator_code_reads_the_executor_reported_paths():
+    # python_path and root_dir come from the executor's answer: any new read of them must be reviewed, not added here
+    src = Path(__file__).resolve().parents[1] / "src"
+    reads = [
+        f"{path.relative_to(src)}:{node.lineno}"
+        for path in sorted(src.rglob("*.py"))
+        for node in ast.walk(ast.parse(path.read_text(), str(path)))
+        if isinstance(node, ast.Attribute) and node.attr in ("python_path", "root_dir")
+    ]
+    assert reads == []

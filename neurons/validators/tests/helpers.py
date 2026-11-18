@@ -286,7 +286,6 @@ def default_executor() -> ExecutorSSHInfo:
 
 def build_context_config(**overrides) -> ContextConfig:
     base = dict(
-        executor_root="/root/app",
         compute_rest_app_url="http://validator",
         machine_scrape_filename="scrape.sh",
         machine_scrape_timeout=300,

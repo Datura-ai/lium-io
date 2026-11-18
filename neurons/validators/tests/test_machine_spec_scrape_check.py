@@ -18,6 +18,7 @@ from neurons.validators.src.services.task.messages import (
 )
 from neurons.validators.src.services.task.runner import NO_EXIT_STATUS, SSHCommandResult
 
+from services.executor_payload import EXECUTOR_PYTHON
 from tests.helpers import (
     FERNET_TOKEN,
     DummySSHClient,
@@ -301,7 +302,7 @@ async def test_machine_spec_scrape_pipes_source_to_the_executor_interpreter(cont
 
     # Assert
     assert result.passed is True
-    assert runner.called_with.command == "/usr/bin/python -I -"
+    assert runner.called_with.command == f"{EXECUTOR_PYTHON} -I -"
     assert runner.called_with.stdin_text == source
 
 
@@ -366,7 +367,7 @@ async def test_machine_spec_scrape_uploads_the_binary_when_the_source_will_not_r
     assert result.passed is True
     assert result.event.reason_code == Msg.SCRAPE_OK.reason
     assert [call.command for call in runner.calls] == [
-        "/usr/bin/python -I -",
+        f"{EXECUTOR_PYTHON} -I -",
         f"chmod +x {ssh_client.sftp_client.put_called_with.remote_path}/scrape.sh"
         f" && {ssh_client.sftp_client.put_called_with.remote_path}/scrape.sh",
     ]

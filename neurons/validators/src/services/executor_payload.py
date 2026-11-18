@@ -22,6 +22,7 @@ PAYLOAD_DIR = _IMAGE_PAYLOADS if _IMAGE_PAYLOADS.is_dir() else Path(__file__).re
 GPU_MONITOR = ("gpus_utility.py", "services/pull_lock.py")
 INSPECTOR = ("inspector_executor.py",)
 VERIFYX = ("verifyx_executor.py",)
+MATRIX = ("decrypt_challenge.py",)
 
 
 def service_dir_glob(purpose: str, parent: str | None = None) -> str:
@@ -43,3 +44,13 @@ def install(purpose: str, files: tuple[str, ...], parent: str | None = None) -> 
 def run(files: tuple[str, ...]) -> str:
     """The trusted interpreter on the entry script in `$d`; -E -s: no PYTHON* variables, no user site."""
     return f'{shlex.quote(EXECUTOR_PYTHON)} -E -s "$d"/{shlex.quote(files[0])}'
+
+
+def run_once(purpose: str, files: tuple[str, ...], args: str, env: str = "") -> str:
+    """Install, run with `args` (and `env` assignments before the interpreter), remove; the run's exit status."""
+    return f'{install(purpose, files)}; {env}{run(files)} {args}; rc=$?; rm -rf "$d"; exit $rc'
+
+
+def process_pattern(purpose: str, files: tuple[str, ...]) -> str:
+    """An extended regex matching the command line of any running entry script of `purpose` (for pkill -f)."""
+    return (service_dir_glob(purpose) + "*/" + files[0]).replace(".", r"\.").replace("*", "[^/]*")

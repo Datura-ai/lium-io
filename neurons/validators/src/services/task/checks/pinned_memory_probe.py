@@ -6,6 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from services import executor_payload
 from core.config import settings
 
 from ..messages import PinnedMemoryProbeMessages as Msg
@@ -71,7 +72,7 @@ class PinnedMemoryProbeCheck:
             )
             return CheckResult(passed=True, event=event)
 
-        command = f"{shlex.quote(ctx.executor.python_path)} -I -"
+        command = f"{shlex.quote(executor_payload.EXECUTOR_PYTHON)} -I -"
         run = await ctx.runner.run(
             command, timeout=PROBE_TIMEOUT_SECONDS, retryable=False, stdin_text=PROBE_SOURCE
         )

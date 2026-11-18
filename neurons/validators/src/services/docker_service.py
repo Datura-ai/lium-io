@@ -11160,7 +11160,7 @@ class DockerService:
                     # would put the backup's plaintext on a disk the renter asked to encrypt, and
                     # the old encrypted mode would hand the executor the passphrase.
                     current_step = "bootstrap_restore_probe"
-                    if not await supports_bootstrap_restore(ssh_client, executor_info.python_path):
+                    if not await supports_bootstrap_restore(ssh_client, executor_payload.EXECUTOR_PYTHON):
                         raise RuntimeError(
                             "executor image cannot restore into an encrypted volume at create time "
                             "(no workspace.bootstrap); the provider must update the executor image"
@@ -12434,7 +12434,7 @@ class DockerService:
         try:
             files = await start_storage_operation(
                 ssh_client,
-                executor_info.python_path,
+                executor_payload.EXECUTOR_PYTHON,
                 operation_id,
                 spec,
                 retain_terminal_artifacts=True,
@@ -12460,7 +12460,7 @@ class DockerService:
             await sftp.put(str(local_jobs / "restore_storage.py"), remote_script)
             await sftp.put(str(local_jobs / "workspace_mount.py"), remote_helper)
         command = [
-            executor_info.python_path,
+            executor_payload.EXECUTOR_PYTHON,
             remote_script,
             "--api-url",
             settings.COMPUTE_REST_API_URL_EXTERNAL,

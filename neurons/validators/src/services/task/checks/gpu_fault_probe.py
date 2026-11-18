@@ -7,6 +7,7 @@ import shlex
 from pathlib import Path
 from typing import Any
 
+from services import executor_payload
 from core.config import settings
 from core.utils import _m, get_extra_info
 
@@ -97,7 +98,7 @@ class GpuFaultProbeCheck:
             )
             return CheckResult(passed=True, event=event)
 
-        command = f"{shlex.quote(ctx.executor.python_path)} -I - --seconds {PROBE_SECONDS}"
+        command = f"{shlex.quote(executor_payload.EXECUTOR_PYTHON)} -I - --seconds {PROBE_SECONDS}"
         if self.is_post_rental_recheck:
             # the recheck after a rental: a card that hangs its kernels every cycle must not list again
             command += " --hang-in-kernels-is-fault"
