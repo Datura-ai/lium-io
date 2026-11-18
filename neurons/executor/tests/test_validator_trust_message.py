@@ -365,3 +365,38 @@ def test_the_owner_and_the_held_message_are_kept_together(tmp_path, monkeypatch,
     restarted.load()
     assert (restarted.owner, restarted.held.validator) == (owner_b.ss58_address, old_validator.ss58_address)
     assert not restarted.offer(_signed(owner, new_validator, 99))  # the former owner signs nothing any more
+
+
+@pytest.mark.parametrize("second_read", ["down", "disagree"])
+def test_a_failed_owner_read_after_a_good_one_takes_no_served_message(
+    tmp_path, monkeypatch, owner, old_validator, new_validator, second_read
+):
+    other = Keypair.create_from_uri("//LiumTrustNewOwner")
+    _keep(tmp_path, owner, _signed(owner, new_validator, 2))
+    trust = _trust(tmp_path, owner, confirmed=False)
+    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout: owner.ss58_address)
+    trust.refresh_owner()
+    assert trust.owner_confirmed
+    if second_read == "down":
+
+        def read(url, timeout):
+            raise requests.ConnectionError("down")
+    else:
+        answers = iter([owner.ss58_address, other.ss58_address] * 4)
+
+        def read(url, timeout):
+            return next(answers)
+
+    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", read)
+    trust.refresh_owner()
+    assert not trust.owner_confirmed
+    answer = MagicMock(status_code=200)
+    answer.json.return_value = _signed(owner, old_validator, 9)._asdict()
+    monkeypatch.setattr(trust_service.requests, "get", lambda *a, **k: answer)
+    monkeypatch.setattr(trust_service.settings, "COMPUTE_REST_API_URL", "http://backend")
+    trust.refresh_message()
+    assert (trust.held.validator, trust.held.revision) == (new_validator.ss58_address, 2)
+    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", lambda url, timeout: owner.ss58_address)
+    trust.refresh_owner()  # the next round reads the owner again
+    trust.refresh_message()
+    assert (trust.held.validator, trust.held.revision) == (old_validator.ss58_address, 9)

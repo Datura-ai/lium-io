@@ -204,9 +204,11 @@ class ValidatorTrust:
 
     def refresh_owner(self) -> None:
         """Blocking: a new owner is taken only when every public chain node answers with it (at least two), so one
-        node cannot name an owner by itself; any failure or disagreement keeps the last one."""
+        node cannot name an owner by itself; any failure or disagreement keeps the last one and takes no served
+        message until a later read agrees."""
         if not self.enabled:
             return
+        self.owner_confirmed = False
         answers = set()
         for url in PUBLIC_CHAIN_NODES:
             try:
@@ -230,8 +232,8 @@ validator_trust = ValidatorTrust(enabled=importlib.util.find_spec("core.config_o
 
 
 async def run_validator_trust_refresh() -> None:
-    """Background loop: the message every MESSAGE_REFRESH_SECONDS; the owner first (every round until one read
-    succeeds), then about hourly with random jitter."""
+    """Background loop: the message every MESSAGE_REFRESH_SECONDS; the owner every round until a read succeeds,
+    then about hourly with random jitter."""
     if not validator_trust.enabled:
         return
     owner_due = asyncio.get_running_loop().time()
