@@ -38,6 +38,7 @@ from .checks import (
     ContainerDownloadSpeedCheck,
     CpuTruthCheck,
     CustomBuildOrphanSweepCheck,
+    RentalEgressGuardCheck,
     DiskHealthCheck,
     DiskSpaceCheck,
     SplitDiskCheck,
@@ -122,6 +123,11 @@ JOB_LENGTH = 300
 # call would lose the "last swept at" timestamps. The check itself is stateless
 # wrt input data and only reads ctx, so a shared instance is safe.
 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON = CustomBuildOrphanSweepCheck()
+# Same reason: per-executor cadence state, shared by the two positions. Never before a scored step:
+# a rented node is guarded inside TenantEnforcementCheck's rented halt, an idle node after ScoreCheck.
+_RENTAL_EGRESS_GUARD_LAST_RUN: dict[tuple, float] = {}
+_RENTAL_EGRESS_GUARD_RENTED = RentalEgressGuardCheck(rented_only=True, last_run=_RENTAL_EGRESS_GUARD_LAST_RUN)
+_RENTAL_EGRESS_GUARD_IDLE = RentalEgressGuardCheck(last_run=_RENTAL_EGRESS_GUARD_LAST_RUN)
 
 # DAH-2805: same reason — the download-temporary sweep inside this check carries its own per-executor
 # cadence, and a fresh instance every cycle would sweep every cycle.
@@ -428,7 +434,7 @@ class PipelineFactory:
                 RentedThroughputCheck(),
                 # DAH-6241: a rented node never reaches the matmul; its stored GPU model verdict judges it
                 GpuModelVerdictCheck(),
-                TenantEnforcementCheck(),
+                TenantEnforcementCheck(egress_guard=_RENTAL_EGRESS_GUARD_RENTED),
                 # DAH-4663: idle nodes only; resets a leftover clock lock or unlists the node
                 GpuClockLockCheck(),
                 GpuUsageCheck(),
@@ -468,6 +474,7 @@ class PipelineFactory:
                 # DAH-5462: VerifyX's second sample of a cold never-measured node, in whatever time the checks above left
                 VerifyXColdRetryCheck(),
                 ScoreCheck(),
+                _RENTAL_EGRESS_GUARD_IDLE,
                 FinalizeCheck(),
             ],
         )
@@ -568,7 +575,7 @@ class PipelineFactory:
                 RentedThroughputCheck(),
                 # DAH-6241: a rented node never reaches the matmul; its stored GPU model verdict judges it
                 GpuModelVerdictCheck(),
-                TenantEnforcementCheck(),
+                TenantEnforcementCheck(egress_guard=_RENTAL_EGRESS_GUARD_RENTED),
                 # DAH-4663: idle nodes only; resets a leftover clock lock or unlists the node
                 GpuClockLockCheck(),
                 GpuUsageCheck(),
@@ -603,6 +610,7 @@ class PipelineFactory:
                 # DAH-5462: VerifyX's second sample of a cold never-measured node, in whatever time the checks above left
                 VerifyXColdRetryCheck(),
                 ScoreCheck(),
+                _RENTAL_EGRESS_GUARD_IDLE,
                 FinalizeCheck(),
             ],
         )

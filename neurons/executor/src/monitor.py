@@ -70,6 +70,12 @@ def log_event(log: PodLog) -> None:
         pass
 
 
+# container id -> time of its last "oom" event. Docker resets State.OOMKilled when a restart policy brings the pod
+# back, so the die right after an oom event is the only record that the pod was OOM-killed (DAH-6379).
+_last_oom: dict[str, float] = {}
+OOM_DIE_WINDOW_S = 30
+
+
 def handle_event(event):
     """Process a Docker event."""
     action = event.get("Action")
@@ -88,10 +94,13 @@ def handle_event(event):
     )
 
     if action in {"start", "stop", "restart", "kill", "destroy", "oom"}:
+        if action == "oom":
+            _last_oom[container_id] = time.monotonic()
         log_event(pod_log)
     elif action == "die":
         exit_code = int(attrs.get("exitCode", 0))
-        reason = classify_stop(exit_code)
+        oom_at = _last_oom.pop(container_id, None)
+        reason = "oom_killed" if oom_at and time.monotonic() - oom_at < OOM_DIE_WINDOW_S else classify_stop(exit_code)
         pod_log.exit_code = exit_code
         pod_log.reason = reason
         log_event(pod_log)
