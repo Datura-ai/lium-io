@@ -935,7 +935,7 @@ async def test_the_undo_repairs_a_stale_vloopback_mountpoint_left_by_park_and_st
         svc._restore_mount_and_sshd_after_start.assert_awaited_once()
     assert docker_client.start.await_count == starts
     if "file exists" in start_error:
-        svc._repair_stale_mountpoint_of_container_volume.assert_awaited_once_with(ssh, "pod_abc", {})
+        svc._repair_stale_mountpoint_of_container_volume.assert_awaited_once_with(ssh, "cid", {})
     else:
         svc._repair_stale_mountpoint_of_container_volume.assert_not_awaited()
 
@@ -1278,7 +1278,7 @@ async def test_a_failed_edit_brings_a_kept_container_back_unmounted(
     if start_error:
         sshd.assert_not_awaited()
     else:
-        assert sshd.await_args.kwargs["container_name"] == kept
+        assert sshd.await_args.kwargs["container_name"] == "cid"
     if renamed_back:
         assert ssh.commands[-2:] == [f"/usr/bin/docker inspect -f '{{{{.State.Status}}}}' {kept}", f"/usr/bin/docker rename {kept} {name}"]
         return

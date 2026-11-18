@@ -3119,7 +3119,7 @@ async def test_start_container_restarts_ssh_after_docker_start(docker_service, m
     assert docker_service.rental_docker_client_factory.client.start_networks == ["lium-rentals"]
     docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once_with(
         docker_client=docker_service.rental_docker_client_factory.client,
-        container_name="pod_test",
+        container_name="cid",  # the run it started, by id
         log_tag="start_container_pod-id",
         log_extra={
             "miner_hotkey": "miner-hotkey",
@@ -3229,7 +3229,7 @@ async def test_start_existing_container_repairs_a_stale_vloopback_mountpoint_and
             await start()
         docker_service._restore_mount_and_sshd_after_start.assert_not_awaited()
     assert client.start.await_count == starts
-    docker_service._repair_stale_mountpoint_of_container_volume.assert_awaited_once_with(ssh_client, "pod_test", {})
+    docker_service._repair_stale_mountpoint_of_container_volume.assert_awaited_once_with(ssh_client, "cid", {})
 
 
 @pytest.mark.asyncio
@@ -3275,7 +3275,7 @@ async def test_start_container_remounts_when_container_state_is_encrypted(docker
 
     docker_service.setup_encrypted_local_volume.assert_awaited_once_with(
         ssh_client=ssh_client,
-        container_name="pod_test",
+        container_name="cid",
         plaintext_path="/workspace",
         volume_name="volume_test",
         log_tag="start_container_pod-id",
@@ -4020,6 +4020,69 @@ async def test_a_pending_stop_follows_the_recorded_container_by_its_id(docker_se
 
     assert client.stopped_containers == stops
     docker_service.redis_service.hdel.assert_awaited_once_with("half_started_stop_index:exec-1", "pod-id")
+
+
+def _bring_up_by(holder: str, service, client):
+    if holder == "start":
+        return _start_existing(service)
+    return service._bring_up_existing_container(
+        executor_info=Mock(uuid="exec-1"),
+        private_key="private-key",
+        docker_client=client,
+        ssh_client=AsyncMock(),
+        container_name="pod_test",
+        local_volume_path="/workspace",
+        pod_id="pod-id",
+        default_extra={},
+    )
+
+
+def _name_taken_by_a_running_replacement(client):
+    """`pod_test` was a stopped run, then a running replacement took the name before the id read."""
+    client.identities = {"pod_test": "new@2026-11-18T11:00:00Z", "new": "new@2026-11-18T11:00:00Z"}
+
+    async def state_of(*, container_name):
+        running = container_name == "new"
+        return ContainerStateSnapshot(
+            status="running" if running else "exited", running=running, restarting=False, exit_code=0,
+            restart_count=0, error=None, oom_killed=False,
+        )
+
+    client.inspect_container_state = state_of
+
+
+@pytest.mark.parametrize("holder", ["start", "edit_rollback"])
+@pytest.mark.asyncio
+async def test_a_failed_bring_up_judges_the_container_it_started_not_the_one_the_name_had(
+    docker_service, monkeypatch, fresh_half_started_stop_state, holder
+):
+    # the state is read by the id the start runs: a replacement already running is not this start's to stop
+    _let_starts_succeed(docker_service, monkeypatch)
+    docker_service._restore_mount_and_sshd_after_start = AsyncMock(side_effect=RuntimeError("remount failed"))
+    client = docker_service.rental_docker_client_factory.client
+    _name_taken_by_a_running_replacement(client)
+
+    with pytest.raises(RuntimeError, match="remount failed"):
+        await _bring_up_by(holder, docker_service, client)
+
+    assert client.started_containers == ["new"]
+    assert client.stopped_containers == []
+
+
+@pytest.mark.parametrize("holder", ["start", "edit_rollback"])
+@pytest.mark.asyncio
+async def test_a_bring_up_remounts_the_container_it_started_by_id(
+    docker_service, monkeypatch, fresh_half_started_stop_state, holder
+):
+    # by name, the remount would read whatever holds the name now and could pass without mounting this run
+    _let_starts_succeed(docker_service, monkeypatch)
+    client = docker_service.rental_docker_client_factory.client
+    client.running = False
+
+    await _bring_up_by(holder, docker_service, client)
+
+    assert client.started_containers == ["cid"]
+    assert docker_service._restore_mount_and_sshd_after_start.await_args.kwargs["container_name"] == "cid"
 
 
 def _process_sharing(docker_service, redis_service):

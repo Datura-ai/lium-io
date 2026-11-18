@@ -1200,7 +1200,8 @@ async def test_lifecycle_operations_pass_container_names_as_sdk_data(
         _all_host_commands(retried_commands, ssh_client),
         ["CONTAINER_MARKER"],
     )
-    assert docker_client.started_containers == [HOSTILE_CONTAINER_NAME]
+    # the start runs the id read for that name (as SDK data too), not the name itself
+    assert docker_client.started_containers == ["cid"]
     # two stops: the explicit stop_container call + the graceful stop inside
     # delete_container (DAH-2364)
     assert docker_client.stopped_containers == [HOSTILE_CONTAINER_NAME, HOSTILE_CONTAINER_NAME]

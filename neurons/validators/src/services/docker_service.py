@@ -12854,10 +12854,11 @@ class DockerService:
             executor_info=executor_info,
             private_key=private_key,
         ) as docker_client:
-            # an unreadable state fails the request before any start: cleanup could otherwise stop a running pod
-            before = await docker_client.inspect_container_state(container_name=container_name)
-            # the id a failed start's pending stop follows (a start keeps it; an edit's park renames the container)
+            # the id a failed start's pending stop follows (a start keeps it; an edit's park renames the container). Read
+            # first, and everything after goes by it: a container that takes the name meanwhile is not this start's
             container_id = await _container_id_to_start(docker_client, container_name)
+            # an unreadable state fails the request before any start: cleanup could otherwise stop a running pod
+            before = await docker_client.inspect_container_state(container_name=container_id)
             stopped_before = not before.running and not before.restarting
             # Docker accepts a start of a running container as a no-op: a failure after it is not this start's to undo
             running_before = not stopped_before
@@ -12906,14 +12907,14 @@ class DockerService:
                         # (5 Nov): the same repair as the edit undo, rmdir only an empty, unmounted
                         # mountpoint, then start once more
                         if not await self._repair_stale_mountpoint_of_container_volume(
-                            ssh_client, container_name, default_extra
+                            ssh_client, container_id, default_extra
                         ):
                             raise stale_mount_error
                         await _start()
                     await self._restore_mount_and_sshd_after_start(
                         docker_client=docker_client,
                         ssh_client=ssh_client,
-                        container_name=container_name,
+                        container_name=container_id,
                         local_volume_path=local_volume_path,
                         pod_id=pod_id,
                         default_extra=default_extra,
@@ -13358,9 +13359,10 @@ class DockerService:
         # unmounted and then stop it after this undo restarted and remounted it
         async with self._pod_start_exclusion(executor_info, private_key, pod_id):
             # unreadable state or id fails the undo before any start, like start_existing_container: a start the
-            # cleanup below could not follow by id would leave the pod up without its remount
-            before = await docker_client.inspect_container_state(container_name=container_name)
+            # cleanup below could not follow by id would leave the pod up without its remount. The id is read first and
+            # everything after goes by it, so a container that takes the name meanwhile is neither judged nor remounted
             container_id = await _container_id_to_start(docker_client, container_name)
+            before = await docker_client.inspect_container_state(container_name=container_id)
             stopped_before = not before.running and not before.restarting
             try:
                 try:
@@ -13373,14 +13375,14 @@ class DockerService:
                     if not _is_stale_vloopback_mountpoint_error(str(exc)):
                         raise
                     if not await self._repair_stale_mountpoint_of_container_volume(
-                        ssh_client, container_name, default_extra
+                        ssh_client, container_id, default_extra
                     ):
                         raise
                     await _start()
                 await self._restore_mount_and_sshd_after_start(
                     docker_client=docker_client,
                     ssh_client=ssh_client,
-                    container_name=container_name,
+                    container_name=container_id,
                     local_volume_path=local_volume_path,
                     pod_id=pod_id,
                     default_extra=default_extra,
