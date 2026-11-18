@@ -1812,6 +1812,8 @@ _PARK_COMMAND_TIMEOUT_SECONDS = 60
 _EDIT_PARKED_RECORD_TIMEOUT_SECONDS = 2
 # the undo's bring-up (start, gocryptfs remount, sshd bootstrap) is several SDK and SSH steps, not one command
 _RESTORE_BRING_UP_TIMEOUT_SECONDS = 300
+# copying the renter files of a parked layer onto the pod's kept copy: a renter may have written gigabytes unmounted
+_KEPT_COPY_TIMEOUT_SECONDS = 900
 
 
 class KeptContainersNotRemoved(RuntimeError):
@@ -1870,31 +1872,12 @@ def _layer_data_check(
     when no upper dir was readable) is never released by a startup window."""
     name = shlex.quote(container_name)
     under = shlex.quote(f"{plaintext_path.rstrip('/')}/")
-    upper_under = shlex.quote(plaintext_path.rstrip("/"))
     awk = (
         '$0 == "diff-failed" {f=1} ($1 == "A" || $1 == "C") && index(substr($0, 3), p) == 1 {k=1} '
         f'END {{if (!f && !k) print "{_DROP_MARK}"}}'
     )
-    root_mount_upper = (
-        "awk '$5 == \"/\" {for (i = 7; i < NF; i++) if ($i == \"-\") {n = split($(i + 3), o, \",\"); "
-        "for (j = 1; j <= n; j++) if (o[j] ~ /^upperdir=/) print substr(o[j], 10); exit}}' \"/proc/$p/mountinfo\""
-    )
-    given = f"u={shlex.quote(upper_dir)}; d=$(v \"$u\")" if upper_dir else "false"
     shortcut = (
-        'v() { [ -n "$1" ] || return 1; [ -d "/proc/1/root$1" ] && { echo "/proc/1/root$1"; return 0; }; '
-        '[ -d "$1" ] && echo "$1"; }; '
-        f"c=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}} {{{{.GraphDriver.Data.UpperDir}}}}' {name} 2>/dev/null) "
-        f"&& p=\"${{c%% *}}\" && u=\"${{c#* }}\" "
-        f"&& {{ d=$(v \"$u\") || {{ u=$({root_mount_upper} 2>/dev/null) && d=$(v \"$u\"); }} || {{ {given}; }}; }} "
-        f"&& echo \"upper $u\" && x=\"$d\"{upper_under} && [ -d \"$x\" ] "
-        # one window per recorded start, cut short by a later start of Docker's own: its files are the renter's
-        f"&& {{ i=$(/usr/bin/docker inspect -f '{{{{.Id}}}} {{{{.State.StartedAt}}}}' {name} 2>/dev/null); "
-        "g=$(date -d \"${i#* }\" +%s%N 2>/dev/null) || g=0; w=; "
-        "n() { printf '@%d.%09d' $(($1 / 1000000000)) $(($1 % 1000000000)); }; "
-        "while read -r s e; do [ -n \"$e\" ] || continue; case \"$s$e\" in *[!0-9]*) continue;; esac; "
-        "[ \"$g\" -gt \"$s\" ] && [ \"$g\" -lt \"$e\" ] && e=$g; "
-        "w=\"$w ! ( -newerct $(n $s) ! -newerct $(n $e) )\"; "
-        f"done 2>/dev/null < {_VALIDATOR_STARTS_DIR}/\"${{i%% *}}\"; true; }} "
+        f"{_layer_upper_scope(name, plaintext_path, upper_dir)} && [ -d \"$x\" ] "
         "&& f=$(find \"$x\" -mindepth 1 \\( -type f -o -type l \\) $w -print -quit 2>/dev/null) && [ -z \"$f\" ] && { echo " + _DROP_MARK + "; exit 0; }; "
     )
     return (
@@ -1902,6 +1885,34 @@ def _layer_data_check(
         f"printf '%s\\n' \"$m\" | grep -qxF {_LIUM_CIPHER_MOUNT} || {{ echo {_DROP_MARK}; exit 0; }}; "
         f"{shortcut if startup_shortcut else ''}"
         f"{{ /usr/bin/docker diff {name} || echo diff-failed; }} | awk -v p={under} {shlex.quote(awk)}"
+    )
+
+
+def _layer_upper_scope(name: str, plaintext_path: str, upper_dir: str | None) -> str:
+    """Shell that sets ``x`` to the container layer's own copy of the plaintext path (its overlay upper dir, see
+    ``_layer_data_check``) and ``w`` to the find tests that leave out every recorded validator start window; it
+    fails when no upper dir is readable. ``name`` is shell-quoted."""
+    upper_under = shlex.quote(plaintext_path.rstrip("/"))
+    root_mount_upper = (
+        "awk '$5 == \"/\" {for (i = 7; i < NF; i++) if ($i == \"-\") {n = split($(i + 3), o, \",\"); "
+        "for (j = 1; j <= n; j++) if (o[j] ~ /^upperdir=/) print substr(o[j], 10); exit}}' \"/proc/$p/mountinfo\""
+    )
+    given = f"u={shlex.quote(upper_dir)}; d=$(v \"$u\")" if upper_dir else "false"
+    return (
+        'v() { [ -n "$1" ] || return 1; [ -d "/proc/1/root$1" ] && { echo "/proc/1/root$1"; return 0; }; '
+        '[ -d "$1" ] && echo "$1"; }; '
+        f"c=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}} {{{{.GraphDriver.Data.UpperDir}}}}' {name} 2>/dev/null) "
+        f"&& p=\"${{c%% *}}\" && u=\"${{c#* }}\" "
+        f"&& {{ d=$(v \"$u\") || {{ u=$({root_mount_upper} 2>/dev/null) && d=$(v \"$u\"); }} || {{ {given}; }}; }} "
+        f"&& echo \"upper $u\" && x=\"$d\"{upper_under} "
+        # one window per recorded start, cut short by a later start of Docker's own: its files are the renter's
+        f"&& {{ i=$(/usr/bin/docker inspect -f '{{{{.Id}}}} {{{{.State.StartedAt}}}}' {name} 2>/dev/null); "
+        "g=$(date -d \"${i#* }\" +%s%N 2>/dev/null) || g=0; w=; "
+        "n() { printf '@%d.%09d' $(($1 / 1000000000)) $(($1 % 1000000000)); }; "
+        "while read -r s e; do [ -n \"$e\" ] || continue; case \"$s$e\" in *[!0-9]*) continue;; esac; "
+        "[ \"$g\" -gt \"$s\" ] && [ \"$g\" -lt \"$e\" ] && e=$g; "
+        "w=\"$w ! ( -newerct $(n $s) ! -newerct $(n $e) )\"; "
+        f"done 2>/dev/null < {_VALIDATOR_STARTS_DIR}/\"${{i%% *}}\"; true; }}"
     )
 
 
@@ -2003,6 +2014,8 @@ class _EditSwap:
         self.plaintext_path: str | None = None
         # the parked container's layer holds renter files under the plaintext path: kept, never removed, after a successful edit
         self.keep_parked = False
+        # DAH-6226: those files were copied onto the pod's one earlier kept copy, so the parked one goes like a clean one
+        self.copied_to_kept = False
         # the overlay upper dir the last layer read used
         self._upper_dir: str | None = None
         # the plaintext path was mounted when parked (None: unknown); a failed edit restores that, kept or not
@@ -2104,12 +2117,6 @@ class _EditSwap:
         )
         # the containerd store names the upper dir only in a running container's mounts: the stopped read reuses it
         upper_dir = self._upper_dir
-        if self.keep_parked and kept:
-            # one kept container per pod: repeated edits must not pile kept layers onto the host's disk
-            raise Exception(
-                f"[park_current_container] a container kept from an earlier edit ({kept[0]}) is still on the host "
-                "and this one holds renter files under the volume path too; the pod was left as it was"
-            )
         # every candidate is parked under the protected kept name, before the stop: no later rename can fail and leave
         # renter files written during the shutdown to a sweep; a clean one is removed by ID after the edit
         parked = recover_kept or f"{kept_prefix}{int(time.time())}"
@@ -2152,15 +2159,35 @@ class _EditSwap:
             container_id, upper_dir, already_kept=bool(recover_kept)
         ):
             # a write between the running read and the stop (or by its shutdown) shows only on the stopped layer:
-            # decided here, before the replacement exists, so the one-kept limit holds; a failed edit brings it back unmounted
+            # decided here, before the replacement exists; a failed edit brings it back unmounted
             self.keep_parked = True
-            if kept:
-                raise Exception(
-                    f"[park_current_container] a container kept from an earlier edit ({kept[0]}) is still on the host "
-                    "and this one wrote renter files under the volume path while it stopped; the pod was restored"
-                )
+        if self.keep_parked and kept:
+            # one rolling kept copy per pod: an earlier one takes these files too, so the count never grows
+            await self._copy_into_kept(parked, ids_by_name.get(kept[-1]) or kept[-1], upper_dir)
         logger.info(_m("Parked current container for edit", extra=get_extra_info({**self.default_extra, "parked": parked})))
         return parked
+
+    async def _copy_into_kept(self, parked: str, kept: str, upper_dir: str | None) -> None:
+        """Copy the files the parked layer itself added or changed under the plaintext path, outside the validator start
+        windows (the ones its layer check counts), onto the earlier kept copy, newer over older. Read from the upper dir:
+        the stopped container's merged path would carry image files over older renter files. No readable upper dir or
+        any other failure fails the edit; the pod comes back."""
+        if not self.plaintext_path:
+            raise Exception("[park_current_container] the pod's volume path is unknown; the pod was restored")
+        path = self.plaintext_path.rstrip("/")
+        copy = (
+            f"set -o pipefail; {_layer_upper_scope(shlex.quote(parked), path, upper_dir)} "
+            "|| { echo 'the parked layer could not be read' >&2; exit 1; }; [ -d \"$x\" ] || exit 0; "
+            "cd \"$x\" && find . -mindepth 1 \\( -type f -o -type l \\) $w -print0 | tar --null -T - -cf - "
+            f"| /usr/bin/docker cp - {shlex.quote(f'{kept}:{path}')}"
+        )
+        copied = await _run_with_host_timeout(self.ssh_client, f"bash -c {shlex.quote(copy)}", _KEPT_COPY_TIMEOUT_SECONDS)
+        if copied.exit_status != 0:
+            raise Exception(
+                f"[park_current_container] the renter files could not be copied onto the pod's kept copy ({kept}): "
+                f"{(copied.stderr or '').strip() or f'exit {copied.exit_status}'}; the pod was restored"
+            )
+        self.copied_to_kept = True
 
     async def _plaintext_mounted(self, container: str) -> bool | None:
         """Whether the container has a mount at the plaintext path (a stopped one has none); None when that cannot be read."""
@@ -2284,7 +2311,7 @@ class _EditSwap:
             if exc is None or self.replacement_is_up or isinstance(exc, _CreateCancelledByDelete):
                 # Replacement is up (or the pod was deleted meanwhile): the old container is now the
                 # stale one. Best effort — a wedged remove is left to the next edit's clean-leftover removal.
-                if self.keep_parked:
+                if self.keep_parked and not self.copied_to_kept:
                     # the renter's files written while the volume was unmounted live only in this container's layer
                     logger.error(
                         _m("PARKED_CONTAINER_KEPT_VOLUME_UNMOUNTED", extra=get_extra_info({**self.default_extra, "kept_as": self.parked_name}))
