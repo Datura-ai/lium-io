@@ -46,7 +46,7 @@ class Runner:
 
     async def run(self, command, timeout, retryable):
         self.calls.append(command)
-        if command.endswith(" version"):
+        if command.endswith('"$b" version'):
             if self.version_error:
                 return SimpleNamespace(
                     success=False, stdout="", stderr="", exit_status=None, error_type="timeout"
@@ -68,7 +68,7 @@ class Runner:
             return SimpleNamespace(
                 success=True, stdout=self.arch + "\n", stderr="", exit_status=0
             )
-        if command.startswith("curl "):
+        if "curl -fsSL" in command:
             if self.download_rc:
                 return SimpleNamespace(
                     success=True,
@@ -78,11 +78,11 @@ class Runner:
                 )
             return SimpleNamespace(
                 success=True,
-                stdout=f"RC:0\n{self.download_sha}  /tmp/liumd.binary.fetch\n",
+                stdout=f"RC:0\n{self.download_sha}  liumd.fetch\n",
                 stderr="",
                 exit_status=0,
             )
-        if command.startswith("install -m 0755"):
+        if "install -m 0755" in command:
             if not self.install_ok:
                 return SimpleNamespace(
                     success=False,
@@ -146,7 +146,7 @@ async def test_an_up_to_date_binary_is_not_downloaded(monkeypatch):
     assert len(fetches) == 1
     assert fetches[0][1] <= liumd_binary_refresh.MANIFEST_TIMEOUT_SECONDS
     assert len(runner.calls) == 1
-    assert runner.calls[0].endswith(" version")
+    assert runner.calls[0].endswith('"$b" version')
     assert not any("curl " in c for c in runner.calls)
     assert "uname -m" not in runner.calls
 
@@ -163,10 +163,10 @@ async def test_a_stale_binary_is_downloaded_only_after_the_hash_matches(monkeypa
     assert result.changed is True
     assert result.build_sha == NEW_BUILD
     assert runner.installed is True
-    [download] = [c for c in runner.calls if c.startswith("curl ")]
+    [download] = [c for c in runner.calls if "curl -fsSL" in c]
     max_time = int(download.split("--max-time ")[1].split()[0])
     assert 0 < max_time <= 60
-    assert any(c.startswith("install -m 0755") for c in runner.calls)
+    assert any("install -m 0755" in c for c in runner.calls)
 
 
 @pytest.mark.asyncio
@@ -193,8 +193,8 @@ async def test_a_manifest_fetch_failure_keeps_a_usable_local_binary(monkeypatch)
     assert result.ok is True
     assert result.changed is False
     assert "manifest timeout" in result.detail
-    assert runner.calls[0].endswith(" version")
-    assert not any(c.startswith("curl ") or c.startswith("install ") for c in runner.calls)
+    assert runner.calls[0].endswith('"$b" version')
+    assert not any("curl -fsSL" in c or "install -m" in c for c in runner.calls)
 
 
 @pytest.mark.asyncio
@@ -207,7 +207,7 @@ async def test_a_manifest_fetch_failure_without_a_local_binary_fails(monkeypatch
 
     assert result.ok is False
     assert result.detail == "manifest timeout"
-    assert runner.calls[0].endswith(" version")
+    assert runner.calls[0].endswith('"$b" version')
 
 
 @pytest.mark.asyncio
@@ -238,7 +238,7 @@ async def test_no_room_for_the_download_does_not_start_it(monkeypatch):
     assert result.ok is False
     assert result.skipped is True
     assert "no task budget" in result.detail
-    assert not any(c.startswith("curl ") for c in runner.calls)
+    assert not any("curl -fsSL" in c for c in runner.calls)
 
 
 @pytest.mark.asyncio
@@ -265,7 +265,7 @@ async def test_a_local_version_that_cannot_be_read_does_not_download(monkeypatch
 
     assert result.ok is False
     assert "could not be read" in result.detail
-    assert not any(c.startswith("curl ") for c in runner.calls)
+    assert not any("curl -fsSL" in c for c in runner.calls)
 
 
 @pytest.mark.asyncio
@@ -278,7 +278,7 @@ async def test_an_unsupported_arch_does_not_download(monkeypatch):
 
     assert result.ok is False
     assert "architecture" in result.detail
-    assert not any(c.startswith("curl ") for c in runner.calls)
+    assert not any("curl -fsSL" in c for c in runner.calls)
 
 
 @pytest.mark.asyncio
@@ -295,7 +295,7 @@ async def test_a_manifest_file_outside_the_two_names_is_rejected(monkeypatch):
 
     assert result.ok is False
     assert "no binary for this arch" in result.detail
-    assert not any(c.startswith("curl ") for c in runner.calls)
+    assert not any("curl -fsSL" in c for c in runner.calls)
 
 
 @pytest.mark.asyncio
