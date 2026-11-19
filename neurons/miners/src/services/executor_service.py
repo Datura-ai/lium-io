@@ -355,6 +355,7 @@ class ExecutorService:
                         "claims": [str(c) for c in item.get("account_claims") or []] or None,
                         # {} (no notice yet: report first) differs from a missing map (an older portal: enforce)
                         "enforce_after": item.get("check_enforce_after"),
+                        "claims_by_hotkey": item.get("claims_by_hotkey"),
                     }
                 result.append(
                     Executor(
@@ -606,6 +607,7 @@ class ExecutorService:
                 info.expected_account_claim = account.get("claim")
                 info.expected_account_claims = account.get("claims")
                 info.check_enforce_after = account.get("enforce_after")
+                info.expected_claims_by_hotkey = account.get("claims_by_hotkey")
         # a cut-off upload logs nothing itself, so name its executors here or the validator's miss looks unexplained
         cut_off_ids = [str(executor.uuid) for executor, task in zip(executors, tasks) if task in pending]
         (logger.warning if cut_off_ids else logger.info)(

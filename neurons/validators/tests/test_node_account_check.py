@@ -402,6 +402,30 @@ async def test_a_node_its_owner_set_up_under_another_of_their_accounts_passes(fi
     assert (result.passed, result.event.reason_code) == (True, "NODE_ACCOUNT_OK")
 
 
+@pytest.mark.parametrize(
+    "claim, passed, reason",
+    [
+        ("claim-of-their-custodied-account", True, "NODE_ACCOUNT_OK"),
+        ("claim-of-a-stranger", False, "NODE_ACCOUNT_MISMATCH"),
+        ("", True, "NODE_ACCOUNT_SKIPPED"),
+    ],
+)
+async def test_a_pool_setup_on_an_own_key_listing_needs_an_owner_claim(claim, passed, reason):
+    """Review (#5): the claim follows the machine's setup hotkey, not the key the listing is grouped under. On an
+    own-key listing, a machine set up for the shared pool hotkey passes only with a claim of the owner's accounts:
+    a linked custodied account's setup passes, any other pool node is refused."""
+    executor = ExecutorSSHInfo(
+        uuid="node-1", address="203.0.113.7", port=8001, ssh_username="root", ssh_port=22,
+        python_path="/usr/bin/python3", root_dir="/root", expected_node_hotkeys=["5OwnKey"],
+        expected_claims_by_hotkey={POOL: ["claim-of-their-custodied-account"]}, check_enforce_after={},
+    )
+    ctx = make_context(executor=executor, runner=_HostFiles(f"hotkey={POOL}\nclaim={claim}\n"), miner_hotkey="5OwnKey")
+
+    result = await NodeAccountCheck().run(ctx)
+
+    assert (result.passed, result.event.reason_code) == (passed, reason)
+
+
 async def test_another_owners_setup_is_refused_at_once_without_a_notice():
     """The security case does not wait for the notice: no check_enforce_after, refused all the same."""
     ctx = _relay_ctx(
@@ -439,8 +463,8 @@ class _Ends:
     check_id = "executor.validate.ends"
     fatal = False
 
-    def __init__(self, halt: bool):
-        self.halt = halt
+    def __init__(self, halt: bool, fails: bool = False):
+        self.halt, self.fails = halt, fails
 
     async def run(self, ctx):
         from datetime import UTC, datetime
@@ -452,12 +476,13 @@ class _Ends:
             event="end", reason_code="ALREADY_RENTED" if self.halt else "OK", severity="info", impact="x",
             check_id=self.check_id, when=datetime.now(UTC),
         )
-        return CheckResult(passed=True, event=event, halt=self.halt)
+        return CheckResult(passed=not self.fails, event=event, halt=self.halt, fatal=self.fails or None)
 
 
-@pytest.mark.parametrize("halt", [True, False])
-async def test_the_last_event_of_any_run_lists_the_findings_that_only_reported(halt):
-    """Review: a rented node's run halts before Finalize; the finding still reaches the portal on its last event."""
+@pytest.mark.parametrize("halt, fails", [(True, False), (False, False), (False, True)])
+async def test_the_last_event_of_any_run_lists_the_findings_that_only_reported(halt, fails):
+    """Review: a rented node's run halts before Finalize, and a later fatal check ends a run early; the finding still
+    reaches the portal on the run's last event."""
     from services.task.pipeline import Pipeline
 
     class _Sink:
@@ -465,12 +490,12 @@ async def test_the_last_event_of_any_run_lists_the_findings_that_only_reported(h
             pass
 
     ctx = _relay_ctx(_HostFiles("", success=False), enforce={})
-    _, events, _ = await Pipeline([NodeAccountCheck(), _Ends(halt), _Ends(False)], _Sink()).run(ctx)
+    _, events, _ = await Pipeline([NodeAccountCheck(), _Ends(halt, fails), _Ends(False)], _Sink()).run(ctx)
 
     assert events[-1].what_we_saw["reported_only"] == ["NODE_ACCOUNT_UNVERIFIED"]
     assert "reported_only" not in events[0].what_we_saw
     ctx = _relay_ctx(_HostFiles(f"hotkey={POOL}\nclaim={CLAIM}\n"), enforce={})
-    _, events, _ = await Pipeline([NodeAccountCheck(), _Ends(halt)], _Sink()).run(ctx)
+    _, events, _ = await Pipeline([NodeAccountCheck(), _Ends(halt, fails)], _Sink()).run(ctx)
     assert "reported_only" not in events[-1].what_we_saw
 
 

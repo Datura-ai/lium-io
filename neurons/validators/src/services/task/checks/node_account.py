@@ -135,7 +135,21 @@ class NodeAccountCheck:
                 )
             )
             return None, False
-        if hotkey not in executor.expected_node_hotkeys:
+        by_hotkey = executor.expected_claims_by_hotkey or {}
+        if hotkey in by_hotkey:
+            # a shared (pool) hotkey of the owner's accounts, whatever the listing is grouped under: every pool node
+            # accepts it, so only the claim proves the machine is this owner's
+            if claim and claim not in by_hotkey[hotkey]:
+                what["binding_mismatch"] = "claim"
+                what["node_claim"] = claim
+            elif not claim:
+                logger.info(
+                    _m("NODE_ACCOUNT_BINDING_UNVERIFIED", extra=get_extra_info({**what, "unread": "claim"}))
+                )
+                return None, False
+            else:
+                return None, True
+        elif hotkey not in executor.expected_node_hotkeys:
             what["binding_mismatch"] = "hotkey"
         elif claims and hotkey == ctx.miner_hotkey and claim and claim not in claims:
             # a node set up for the listing (pool) hotkey proves its owner only by the claim; one set up for one of

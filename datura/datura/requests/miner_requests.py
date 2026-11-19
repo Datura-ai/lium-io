@@ -73,6 +73,10 @@ class ExecutorSSHInfo(pydantic.BaseModel):
     # once it sent the provider the per-node notice for that finding. A code absent from the map only reports; no map at
     # all (an older miner or portal) keeps every check enforced as before.
     check_enforce_after: dict[str, str] | None = None
+    # shared (pool) hotkey -> the claims a machine set up for it must report to serve this listing: the pool hotkeys of
+    # the listing account's owner, whatever hotkey the node is listed under. A machine set up for one of them passes
+    # only with one of these claims (an empty claim proves nothing either way, as for the listing hotkey).
+    expected_claims_by_hotkey: dict[str, list[str]] | None = None
 
 
 class AcceptSSHKeyRequest(BaseMinerRequest):
