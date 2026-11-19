@@ -1222,11 +1222,15 @@ _RENTAL_PROBE_CONTAINER_START_STEP = "container_start"
 _CREATE_STEPS_BEFORE_THE_HOST = frozenset({"ssh_connect", "docker_sdk_ssh_host_key"})
 
 
+class RentalEgressGuardRefused(RuntimeError):
+    """The host's link-local egress drop could not be applied to a pod's bridge, so the pod was not started."""
+
+
 def is_host_fault_create_failure(current_step: str | None, error: BaseException | None = None) -> bool:
     """A failure on the node itself, or the node's Docker connection over SSH dropping on a step past the connect
     (after the SDK call's own retry, where it has one): a node whose link keeps dropping fails every create,
     renter's or filler's, while its checks pass. The probe this stamps decides: one clean create clears it."""
-    if current_step in _HOST_FAULT_CREATE_STEPS:
+    if current_step in _HOST_FAULT_CREATE_STEPS or isinstance(error, RentalEgressGuardRefused):
         return True
     return (
         error is not None
@@ -3821,22 +3825,23 @@ class DockerService:
         default_extra: dict,
     ) -> None:
         """The pod's own bridge exists and is in the host's link-local egress drop before the pod starts (DAH-6737),
-        under the same host lock as the periodic guard; fail-open like that guard, which retries every interval."""
+        under the same host lock as the periodic guard. Fail closed: a bridge the drop could not be confirmed on is
+        never started on, and the refusal is a host fault (the node holds until a rental probe passes)."""
         from services.task.checks.rental_egress_guard import apply_rental_egress_guard
 
         try:
-            # the create or start ensures it again and fails there, not here, if it cannot be made
             await docker_client.ensure_network(network)
             _, error = await asyncio.wait_for(apply_rental_egress_guard(ssh_client), timeout=120)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 — every failure refuses the start
             error = str(exc) or type(exc).__name__
         if error:
             logger.warning(
                 _m(
-                    "Rental egress guard not applied before start",
+                    "Rental egress guard not applied: pod not started",
                     extra={**default_extra, "network": network, "error": error[:300]},
                 )
             )
+            raise RentalEgressGuardRefused(f"rental network guard not applied on this node: {error[:300]}")
 
     async def _run_rental_docker_create_attempts(
         self,

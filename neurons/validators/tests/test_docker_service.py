@@ -11002,16 +11002,20 @@ async def test_generate_portMappings_keeps_held_ports_when_no_other_port_is_free
     assert {mapping[2] for mapping in result} == {20000}
 
 
+@pytest.mark.real_egress_guard
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["create", "start"])
-async def test_the_pod_bridge_is_guarded_before_the_pod_starts(docker_service, monkeypatch, path):
+@pytest.mark.parametrize("outcome", ["applied", "error", "raises"])
+async def test_a_pod_never_starts_on_a_bridge_without_the_egress_drop(docker_service, monkeypatch, path, outcome):
     # DAH-6737: the bridge exists and the host-locked egress guard ran before the first start, on create and on the
-    # start that moves a stopped pod onto its own bridge
+    # start that moves a stopped pod onto its own bridge; when the guard did not apply, nothing starts (fail closed)
     events: list = []
 
     async def guard(ssh):
         events.append(("guard",))
-        return {}, None
+        if outcome == "raises":
+            raise RuntimeError("inventory unknown")
+        return {}, (None if outcome == "applied" else "DOCKER-USER chain not found")
 
     monkeypatch.setattr("services.task.checks.rental_egress_guard.apply_rental_egress_guard", guard)
 
@@ -11030,15 +11034,19 @@ async def test_the_pod_bridge_is_guarded_before_the_pod_starts(docker_service, m
             raise RuntimeError("unread")
 
     net = rental_network_for("pod_a")
+    docker_service._restore_mount_and_sshd_after_start = AsyncMock()
     if path == "create":
         spec = ContainerRunSpec(name="pod_a", image="img", network=net)
-        await docker_service._run_rental_docker_create_attempts(
-            docker_client=Client(), ssh_client=Mock(), run_spec=spec, container_name="pod_a", default_extra={}, flatten_lease=None
+        bring_up = docker_service._run_rental_docker_create_attempts(
+            docker_client=Client(),
+            ssh_client=Mock(),
+            run_spec=spec,
+            container_name="pod_a",
+            default_extra={},
+            flatten_lease=None,
         )
-        assert events == [("ensure_network", net), ("guard",), ("run_container", net)]
     else:
-        docker_service._restore_mount_and_sshd_after_start = AsyncMock()
-        await docker_service._bring_up_existing_container(
+        bring_up = docker_service._bring_up_existing_container(
             docker_client=Client(),
             ssh_client=Mock(),
             container_name="pod_a",
@@ -11046,4 +11054,12 @@ async def test_the_pod_bridge_is_guarded_before_the_pod_starts(docker_service, m
             pod_id="p",
             default_extra={},
         )
-        assert events == [("ensure_network", net), ("guard",), ("start", net)]
+    if outcome == "applied":
+        await bring_up
+        assert events == [("ensure_network", net), ("guard",), (("run_container" if path == "create" else "start"), net)]
+    else:
+        with pytest.raises(docker_service_module.RentalEgressGuardRefused) as refused:
+            await bring_up
+        assert events == [("ensure_network", net), ("guard",)]
+        # a host fault: the node holds until a rental probe passes on it
+        assert docker_service_module.is_host_fault_create_failure("docker_run", refused.value)
