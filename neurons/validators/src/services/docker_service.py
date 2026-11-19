@@ -10884,6 +10884,13 @@ class DockerService:
                         **(custom_options.environment or {}),
                         "JUPYTER_PASSWORD": image_jupyter_token,
                     }
+                # DAH-6522: the image's start.sh opens Jupyter, and its login tip points, at the pod volume, the one
+                # folder a reboot keeps; only the validator knows where the template put it. Every rental gets it:
+                # a renter's startup command may run start.sh itself.
+                custom_options.environment = {
+                    **(custom_options.environment or {}),
+                    "LIUM_VOLUME_PATH": local_volume_path,
+                }
 
                 container_name = self.get_container_name(payload)
                 created_local_volume = False

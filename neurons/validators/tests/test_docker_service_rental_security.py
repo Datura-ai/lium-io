@@ -1001,6 +1001,7 @@ async def test_create_container_emits_secret_safe_sdk_operation_logs(
     assert sorted(run_extra["environment_keys"]) == [
         "APP_MODE",
         "HOSTILE_ENV",
+        "LIUM_VOLUME_PATH",
         "MULTILINE_ENV",
         "NVIDIA_DRIVER_CAPABILITIES",
     ]
