@@ -15,6 +15,7 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from daos.executor import ExecutorDao
 from models.executor import Executor
+from services.node_address import executor_session
 from services.ssh_service import MinerSSHService
 
 from protocol.miner_portal_request import (
@@ -163,8 +164,8 @@ class ExecutorService:
         try:
             timeout = aiohttp.ClientTimeout(total=10)
             url = f"http://{executor.address}:{executor.port}/version"
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as response:
+            async with executor_session(timeout=timeout) as session:
+                async with session.get(url, allow_redirects=False) as response:
                     if response.status != 200:
                         return False, f"Executor health check failed with status {response.status}"
             return True, "Connectivity test passed - proceeding to save executor"
@@ -421,7 +422,7 @@ class ExecutorService:
                 extra=get_extra_info(base_log_extra),
             ),
         )
-        async with aiohttp.ClientSession() as session:
+        async with executor_session() as session:
             for attempt in range(1, UPLOAD_SSH_KEY_ATTEMPTS + 1):
                 # the first attempt keeps main's full timeout, so a slow portal lookup never fails an upload main
                 # accepted; only the retries are clipped to the deadline
@@ -431,7 +432,7 @@ class ExecutorService:
                     total = max(UPLOAD_SSH_KEY_MIN_ATTEMPT_SECONDS, min(total, deadline - time.monotonic()))
                 timeout = aiohttp.ClientTimeout(total=total)
                 try:
-                    async with session.post(url, json=payload, timeout=timeout) as response:
+                    async with session.post(url, json=payload, timeout=timeout, allow_redirects=False) as response:
                         body = await _read_capped(response)
                         if response.status != 200:
                             text = body.decode(errors="replace")
@@ -509,9 +510,9 @@ class ExecutorService:
                 extra=get_extra_info(base_log_extra),
             ),
         )
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with executor_session(timeout=timeout) as session:
             try:
-                async with session.post(url, json=payload) as response:
+                async with session.post(url, json=payload, allow_redirects=False) as response:
                     if response.status != 200:
                         logger.error(
                             _m(
@@ -664,8 +665,8 @@ class ExecutorService:
             "data_to_sign": container_name,
             "signature": f"0x{keypair.sign(container_name).hex()}"
         }
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, json=payload) as response:
+        async with executor_session(timeout=timeout) as session:
+            async with session.post(url, json=payload, allow_redirects=False) as response:
                 if response.status != 200:
                     raise Exception('[get_pod_logs] Error: API request failed')
 

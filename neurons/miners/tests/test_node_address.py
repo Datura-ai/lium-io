@@ -1,0 +1,144 @@
+"""The miner's requests to a node never reach its own network (services/node_address.py)."""
+
+import socket
+
+import pytest
+from aiohttp import web
+
+from services import node_address
+from services.node_address import NonPublicNodeAddress, executor_session, is_public_address
+
+
+def _answers(*hosts, port=0):
+    return [
+        {"hostname": "node.example.com", "host": host, "port": port, "family": socket.AF_INET, "proto": 0, "flags": 0}
+        for host in hosts
+    ]
+
+
+@pytest.fixture
+async def local_node():
+    """An HTTP server on 127.0.0.1 that records the requests it gets; the stand-in for a node."""
+    seen = []
+
+    async def handle(request):
+        seen.append(request.path)
+        return web.json_response({"ok": True})
+
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    yield port, seen
+    await runner.cleanup()
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["127.0.0.1", "10.0.0.5", "192.168.1.2", "172.16.0.1", "169.254.169.254", "100.64.0.1", "0.0.0.0", "224.0.0.1",
+     "::1", "fe80::1%eth0", "fc00::1", "::ffff:127.0.0.1", "::ffff:169.254.169.254"],
+)
+def test_internal_addresses_are_not_public(address):
+    assert not is_public_address(address)
+
+
+def test_public_addresses_are_public():
+    assert is_public_address("8.8.8.8") and is_public_address("2001:4860:4860::8888")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answers", [["127.0.0.1"], ["10.0.0.5"], ["169.254.169.254"], ["::1"], ["8.8.8.8", "127.0.0.1"]])
+async def test_a_name_resolving_inside_is_refused_without_a_connection(monkeypatch, local_node, answers):
+    port, seen = local_node
+
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        return _answers(*answers)
+
+    monkeypatch.setattr(node_address.DefaultResolver, "resolve", resolve)
+    async with executor_session() as session:
+        with pytest.raises(NonPublicNodeAddress):
+            await session.post(f"http://node.example.com:{port}/upload_ssh_key", json={}, allow_redirects=False)
+    assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_the_connection_goes_to_the_first_lookups_answer_not_a_second_one(monkeypatch, local_node):
+    """A rebinding name answers a public address, then a private one. The miner dials what the checked lookup
+    returned and never looks the name up again for that request. (127.0.0.1 stands in for the public answer here,
+    so the request can land on the local server; 10.0.0.5 is the rebound answer.)"""
+    port, seen = local_node
+    lookups = []
+
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        lookups.append(host)
+        return _answers("127.0.0.1" if len(lookups) == 1 else "10.0.0.5", port=port)
+
+    monkeypatch.setattr(node_address.DefaultResolver, "resolve", resolve)
+    monkeypatch.setattr(node_address, "is_public_address", lambda address: address == "127.0.0.1")
+    async with executor_session() as session:
+        async with session.post(f"http://node.example.com:{port}/upload_ssh_key", json={}, allow_redirects=False) as response:
+            assert response.status == 200
+    assert seen == ["/upload_ssh_key"] and lookups == ["node.example.com"]
+
+
+@pytest.mark.asyncio
+async def test_a_redirect_from_the_node_is_not_followed(monkeypatch):
+    """A node answering 307 to http://127.0.0.1/... would otherwise send the miner's POST inside."""
+    inside = []
+
+    async def target(request):
+        inside.append(request.path)
+        return web.json_response({})
+
+    async def redirect(request):
+        raise web.HTTPTemporaryRedirect(f"http://127.0.0.1:{target_port}/admin")
+
+    runners = []
+    ports = []
+    for handler in (target, redirect):
+        app = web.Application()
+        app.router.add_route("*", "/{tail:.*}", handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        runners.append(runner)
+        ports.append(site._server.sockets[0].getsockname()[1])
+    target_port, node_port = ports
+    try:
+        async with executor_session() as session:
+            # an IP literal is dialled as given (the node registry only takes public ones)
+            async with session.post(f"http://127.0.0.1:{node_port}/upload_ssh_key", json={}, allow_redirects=False) as response:
+                assert response.status == 307
+        assert inside == []
+    finally:
+        for runner in runners:
+            await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_public_name_is_dialled(monkeypatch):
+    """A name whose every answer is public reaches the connector unchanged."""
+
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        return _answers("8.8.8.8", "1.1.1.1")
+
+    monkeypatch.setattr(node_address.DefaultResolver, "resolve", resolve)
+    resolver = node_address.PublicOnlyResolver()
+    assert [answer["host"] for answer in await resolver.resolve("node.example.com", 8080)] == ["8.8.8.8", "1.1.1.1"]
+    await resolver.close()
+
+
+@pytest.mark.asyncio
+async def test_every_request_to_a_node_uses_the_checked_session(monkeypatch):
+    """Each executor_service call to a node builds its session through executor_session()."""
+    import inspect
+
+    from services import executor_service
+
+    source = inspect.getsource(executor_service)
+    assert "aiohttp.ClientSession(" not in source
+    assert source.count("allow_redirects=False") == source.count("session.post(") + source.count("session.get(")
