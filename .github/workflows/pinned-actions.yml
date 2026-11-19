@@ -66,7 +66,7 @@ jobs:
                       if str(ref).startswith("./"):
                           # a local action is checked through its manifest, so it must be a tracked one: a manifest written
                           # at run time is never scanned (the runner resolves ./ from the repository root)
-                          d = str(ref)[2:].split("@")[0]
+                          d = str(ref)[2:]  # the literal path the runner opens: nothing after it is a ref
                           # a job-level ./x.yml is a reusable workflow (scanned with the workflows); a step's ./dir is an action
                           want = [d] if d.endswith((".yml", ".yaml")) else [posixpath.join(d, n) for n in ("action.yml", "action.yaml")]
                           if not {posixpath.normpath(w) for w in want} & tracked:
@@ -93,7 +93,7 @@ jobs:
               "jobs:\n  yes:\n    steps:\n      - uses: acme/act@v1\n  on:\n    steps:\n      - uses: acme/act@" + sha + "\n": 1,
               "jobs:\n  a:\n    steps:\n      - uses: acme/act@v1\n  a:\n    steps:\n      - uses: acme/act@" + sha + "\n": 1,
               "jobs:\n  yes:\n    steps:\n      - uses: acme/act@" + sha + "\n  on:\n    steps:\n      - uses: acme/act@" + sha + "\n": 0,
-              "jobs:\n  a:\n    steps:\n      - uses: ./gen/act\n      - uses: ./.github/actions/ok/\n  b:\n    uses: ./.github/workflows/ok.yml\n  c:\n    uses: ./.github/workflows/gen.yml\n": 2,
+              "jobs:\n  a:\n    steps:\n      - uses: ./gen/act\n      - uses: ./.github/actions/ok/\n      - uses: ./.github/actions/ok@main\n  b:\n    uses: ./.github/workflows/ok.yml\n  c:\n    uses: ./.github/workflows/gen.yml\n": 3,
           }
           with tempfile.TemporaryDirectory() as d:
               for i, (text, want) in enumerate(cases.items()):
