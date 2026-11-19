@@ -1063,7 +1063,9 @@ class SubtensorClient:
         while retries < max_retries:
             try:
                 node = self.get_node()
-                block_hash = node.get_block_hash(block)
+                # asked of the chain on every attempt: get_block_hash caches a height's answer in the client
+                # (lru_cache), a null one included, so a peer that answered no hash once would answer it until restart
+                block_hash = node.rpc_request("chain_getBlockHash", [block])["result"]
                 if not block_hash:
                     # a peer that has not seen the block answers no hash, and a storage read without one reads the
                     # peer's best block instead: that is no answer for this block
