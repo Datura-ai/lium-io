@@ -501,13 +501,15 @@ async def test_central_miner_lists_each_node_with_its_registered_host_key_from_o
 
     from clients.miner_portal_api import MinerPortalAPI
 
-    keyed_node, unkeyed_node = str(uuid4()), str(uuid4())
+    keyed_node, unkeyed_node, noticeless_node = str(uuid4()), str(uuid4()), str(uuid4())
     portal_items = [
         {"id": keyed_node.upper(), "validator_hotkey": "v", "executor_ip_address": "node.example.com",
          "executor_ip_port": "8001", "ssh_host_key": "ssh-ed25519 AAAAregistered",
          "node_hotkeys": ["5Account", "5Pool"], "account_claim": "claim-1", "account_claims": ["claim-1", "claim-0"],
          "check_enforce_after": {"NODE_ACCOUNT_UNVERIFIED": "2026-11-19T06:00:00Z"}},
         {"id": unkeyed_node, "validator_hotkey": "v", "executor_ip_address": "203.0.113.5", "executor_ip_port": "8001"},
+        {"id": noticeless_node, "validator_hotkey": "v", "executor_ip_address": "203.0.113.6", "executor_ip_port": "8001",
+         "node_hotkeys": ["5Account"], "check_enforce_after": {}},
     ]
     es.settings.CENTRAL_MODE = True
     es.settings.RENTAL_REQUEST_HOOK = None
@@ -535,6 +537,8 @@ async def test_central_miner_lists_each_node_with_its_registered_host_key_from_o
     assert by_id[keyed_node.lower()].check_enforce_after == {"NODE_ACCOUNT_UNVERIFIED": "2026-11-19T06:00:00Z"}
     assert by_id[unkeyed_node].expected_node_hotkeys is None
     assert (by_id[unkeyed_node].expected_account_claims, by_id[unkeyed_node].check_enforce_after) == (None, None)
+    # review: an empty map (no notice yet: report first) stays empty, never None (an older portal: enforce)
+    assert by_id[noticeless_node].check_enforce_after == {}
 
 
 @pytest.mark.asyncio

@@ -36,9 +36,6 @@ class FinalizeCheck:
             "unrented_multiplier": 1,  # kept on the wire; the constant it echoed is gone
             "sysbox_runtime": ctx.state.sysbox_runtime,
         }
-        if ctx.reported_only:
-            # failures that are not enforced yet: the portal sends the per-node notice from this field (DAH-6539)
-            what["reported_only"] = list(ctx.reported_only)
         # Only a run exempted from PortCountCheck by a pod that then proved stale gets here below the floor.
         port_count_below_floor = port_count_below_listing_floor(ctx.state)
         if port_count_below_floor is not None:

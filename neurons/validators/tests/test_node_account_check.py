@@ -433,13 +433,45 @@ async def test_a_failed_read_only_reports_until_the_provider_was_notified(enforc
     assert availability_errors([result.event]) == []
 
 
-async def test_finalize_reports_the_findings_that_only_reported():
-    from services.task.checks.finalize import FinalizeCheck
+class _Ends:
+    """The check that ends a run: Finalize, or a rented node's tenant check, which halts before Finalize."""
 
-    ctx = make_context(reported_only=("NODE_ACCOUNT_UNVERIFIED",))
-    result = await FinalizeCheck().run(ctx)
-    assert result.event.what_we_saw["reported_only"] == ["NODE_ACCOUNT_UNVERIFIED"]
-    assert "reported_only" not in (await FinalizeCheck().run(make_context())).event.what_we_saw
+    check_id = "executor.validate.ends"
+    fatal = False
+
+    def __init__(self, halt: bool):
+        self.halt = halt
+
+    async def run(self, ctx):
+        from datetime import UTC, datetime
+
+        from services.task.models import ValidationEvent
+        from services.task.pipeline import CheckResult
+
+        event = ValidationEvent(
+            event="end", reason_code="ALREADY_RENTED" if self.halt else "OK", severity="info", impact="x",
+            check_id=self.check_id, when=datetime.now(UTC),
+        )
+        return CheckResult(passed=True, event=event, halt=self.halt)
+
+
+@pytest.mark.parametrize("halt", [True, False])
+async def test_the_last_event_of_any_run_lists_the_findings_that_only_reported(halt):
+    """Review: a rented node's run halts before Finalize; the finding still reaches the portal on its last event."""
+    from services.task.pipeline import Pipeline
+
+    class _Sink:
+        async def emit(self, event):
+            pass
+
+    ctx = _relay_ctx(_HostFiles("", success=False), enforce={})
+    _, events, _ = await Pipeline([NodeAccountCheck(), _Ends(halt), _Ends(False)], _Sink()).run(ctx)
+
+    assert events[-1].what_we_saw["reported_only"] == ["NODE_ACCOUNT_UNVERIFIED"]
+    assert "reported_only" not in events[0].what_we_saw
+    ctx = _relay_ctx(_HostFiles(f"hotkey={POOL}\nclaim={CLAIM}\n"), enforce={})
+    _, events, _ = await Pipeline([NodeAccountCheck(), _Ends(halt)], _Sink()).run(ctx)
+    assert "reported_only" not in events[-1].what_we_saw
 
 
 async def test_a_portal_that_sends_no_notice_map_keeps_the_failed_read_enforced(monkeypatch):

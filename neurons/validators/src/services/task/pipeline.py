@@ -902,6 +902,11 @@ class Pipeline:
                             failed_check_id=(res.event.check_id or chk.check_id) if failed else None,
                         )
                     )
+                    # findings that are not enforced yet, on the run's last event whichever check ends it (a rented
+                    # node's run halts before Finalize): the portal sends the per-node notice from it (DAH-6539)
+                    reported = res.updates.get("reported_only", current_ctx.reported_only)
+                    if reported:
+                        res.event.what_we_saw["reported_only"] = list(reported)
 
                 for extra_event in res.extra_events:
                     await self.sink.emit(extra_event)

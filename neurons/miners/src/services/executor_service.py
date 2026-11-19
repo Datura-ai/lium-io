@@ -353,7 +353,8 @@ class ExecutorService:
                         "hotkeys": [str(h) for h in item["node_hotkeys"]],
                         "claim": item.get("account_claim") or None,
                         "claims": [str(c) for c in item.get("account_claims") or []] or None,
-                        "enforce_after": item.get("check_enforce_after") or None,
+                        # {} (no notice yet: report first) differs from a missing map (an older portal: enforce)
+                        "enforce_after": item.get("check_enforce_after"),
                     }
                 result.append(
                     Executor(
