@@ -1,11 +1,12 @@
 name: Pinned actions
 
+# no path filter: a local action can live anywhere in the repo, and a required check must report on every PR
 on:
   pull_request:
-    paths: [".github/workflows/**", ".github/actions/**"]
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main]
-    paths: [".github/workflows/**", ".github/actions/**"]
 
 permissions:
   contents: read
@@ -15,23 +16,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      # every workflow and local action pins third-party actions to a commit, never to a movable tag;
+      # every workflow and local action pins third-party actions to a commit and images to a digest, never to a movable tag;
       # the files are parsed as YAML so quoting and spacing cannot hide a reference
       - name: All actions are pinned to commit SHAs
         run: |
           python3 -m venv /tmp/venv
           /tmp/venv/bin/pip install -q pyyaml==6.0.3
           /tmp/venv/bin/python - <<'PY'
-          import pathlib, re, sys, yaml
-          files = sorted(pathlib.Path(".github/workflows").glob("*.y*ml")) + sorted(pathlib.Path(".github/actions").glob("**/action.y*ml"))
+          import pathlib, re, subprocess, sys, yaml
+          # every tracked action manifest, wherever it lives: `uses: ./any/dir` runs that dir's action.yml
+          actions = subprocess.run(["git", "ls-files", "-z", ":(glob)**/action.yml", ":(glob)**/action.yaml"], capture_output=True, text=True, check=True).stdout.split("\0")
+          files = sorted(pathlib.Path(".github/workflows").glob("*.y*ml")) + sorted(pathlib.Path(a) for a in actions if a)
+          digest = r"docker://[^@\s]+@sha256:[0-9a-f]{64}"
+          pinned = re.compile(rf"(?!docker://)[^@\s]+@[0-9a-f]{{40}}|{digest}")
           bad = []
           for path in files:
               doc = yaml.safe_load(path.read_text()) or {}
               jobs = list((doc.get("jobs") or {}).values())
-              steps = [step for job in jobs for step in job.get("steps") or []] + list((doc.get("runs") or {}).get("steps") or [])
+              runs = doc.get("runs") or {}
+              steps = [step for job in jobs for step in job.get("steps") or []] + list(runs.get("steps") or [])
               for ref in [job.get("uses") for job in jobs] + [step.get("uses") for step in steps]:
-                  if ref is not None and not str(ref).startswith("./") and not re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", str(ref)):
+                  if ref is not None and not str(ref).startswith("./") and not pinned.fullmatch(str(ref)):
                       bad.append(f"{path}: {ref}")
+              # a Docker action's image: a registry image needs a digest; a local Dockerfile path is reviewed in-repo
+              image = runs.get("image")
+              if image is not None and str(image).startswith("docker://") and not re.fullmatch(digest, str(image)):
+                  bad.append(f"{path}: runs.image {image}")
           print("\n".join(bad) or f"all pinned ({len(files)} files)")
           sys.exit(1 if bad else 0)
           PY
