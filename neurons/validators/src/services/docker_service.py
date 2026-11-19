@@ -4564,7 +4564,10 @@ class DockerService:
             restart_policy=restart_policy,
             runtime="sysbox-runc" if payload.is_sysbox else None,
             cap_add=self._capabilities_for(devices),
-            sysctls={"net.ipv4.conf.all.src_valid_mark": "1"},
+            # A sysbox pod owns its network namespace, so its root (wg-quick) sets this itself; preset by sysbox-runc
+            # it is written through sysbox-fs on every start, and a Docker restart where that path is not up yet
+            # fails the pod (OCI create "src_valid_mark: no such file"). runc pods cannot write /proc/sys, so keep it.
+            sysctls={} if payload.is_sysbox else {"net.ipv4.conf.all.src_valid_mark": "1"},
             ulimits=self._memlock_ulimit_for(devices, memory_gb),
             devices=devices,
             device_requests=gpu_devices.device_requests,
