@@ -49,8 +49,11 @@ def test_upload_is_pinned_and_removal_and_expiry_still_find_it(authorized_keys):
     assert authorized_keys.read_text() == RENTER_KEY
 
     SSHService().add_pubkey_to_host(KEY)
+    # the unmarked RENTER_KEY goes at once; the pinned upload is read as marked and kept until its TTL
+    assert purge_expired_uploaded_keys(900, now=time.time()) == 1
+    assert authorized_keys.read_text().startswith(f'from="{config.VALIDATOR_SSH_SOURCES}" {KEY} ')
     assert purge_expired_uploaded_keys(900, now=time.time() + 905) == 1
-    assert authorized_keys.read_text() == RENTER_KEY
+    assert authorized_keys.read_text() == ""
 
 
 def test_a_key_pinned_by_an_older_list_is_still_removed(authorized_keys):
