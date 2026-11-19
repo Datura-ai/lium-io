@@ -99,8 +99,15 @@ async def _load_card_health(ctx: Context) -> CardHealthState | None:
 RESET_CLEARED_COUNTERS = ("ecc_uncorrected", "recovery_action")
 
 
-def _reset_marks(gpu: dict[str, Any]) -> list[str]:
-    return [c for c in RESET_CLEARED_COUNTERS if type(gpu.get(c)) is int and gpu[c] != 0]
+def _reset_marks(gpu: dict[str, Any], kept: list[str], conclusive: bool) -> list[str]:
+    """The reset-only counters this read saw set. A counter it could not read, or any counter in a read that could
+    not see the kernel log (no reset is proven there), keeps the mark the last read left (`kept`): an inconclusive
+    read never erases the baseline a later reset is proven against."""
+    return [
+        c
+        for c in RESET_CLEARED_COUNTERS
+        if (type(gpu.get(c)) is int and gpu[c] != 0) or ((gpu.get(c) is None or not conclusive) and c in kept)
+    ]
 
 
 # Xids that leave a reset-only counter set (48 DBE, 95 uncontained ECC) or the card unlisted (79, off the bus) until
@@ -135,9 +142,15 @@ def _card_uuid(fault: str) -> str | None:
 
 
 def _held_fault_proof(
-    fault: str, gpus: dict[str, dict[str, Any]], every_card_named: bool, rebooted: bool, before: CardHealthState
+    fault: str,
+    gpus: dict[str, dict[str, Any]],
+    every_card_named: bool,
+    rebooted: bool,
+    before: CardHealthState,
+    log_seen: bool,
 ) -> str | None:
-    """What proves a held card fault over: "reboot" (a new host boot) or "reset" (`_card_was_reset`), else None.
+    """What proves a held card fault over: "reboot" (a new host boot) or "reset" (`_card_was_reset`, only in a
+    read that also sees the kernel log, so a card logging Xids this read cannot see is not lifted), else None.
     A card missing from the read, or with its counters unread, is no proof: a card that drops out for a cycle
     comes back as faulty as it left (0d0c64ef, 18 Nov)."""
     uuid = _card_uuid(fault)
@@ -145,7 +158,7 @@ def _held_fault_proof(
         return None
     if rebooted:
         return "reboot"
-    if _card_was_reset(fault, uuid, gpus, every_card_named, before):
+    if log_seen and _card_was_reset(fault, uuid, gpus, every_card_named, before):
         return "reset"
     return None
 
@@ -184,7 +197,8 @@ async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardH
     else:
         # an old boot's time would skip this boot's early lines: start the new boot from its first line
         xid_after = 0.0 if rebooted else before.xid_after
-    proofs = {f: _held_fault_proof(f, gpus, every_card_named, rebooted, before) for f in before.held}
+    log_seen = bool(xid.get("available"))
+    proofs = {f: _held_fault_proof(f, gpus, every_card_named, rebooted, before, log_seen) for f in before.held}
     held = [f for f, proof in proofs.items() if proof is None]
     # one fault per card, this read's first: a card repeating an Xid must not grow the stored state
     fault_by_card: dict[str, str] = {}
@@ -215,7 +229,8 @@ async def _judge_card_faults(ctx: Context, report: dict[str, Any], before: CardH
     key = _card_health_key(ctx)
     # a card this read did not name keeps its marks: its next read still proves a reset
     reset_marks = {u: m for u, m in (before.reset_marks or {}).items() if u not in gpus and not rebooted}
-    reset_marks.update({u: m for u, gpu in gpus.items() if (m := _reset_marks(gpu))})
+    kept = {} if rebooted else before.reset_marks or {}
+    reset_marks.update({u: m for u, gpu in gpus.items() if (m := _reset_marks(gpu, kept.get(u, []), log_seen))})
     state = CardHealthState(
         xid_after=xid_after, boot_id=boot_id or before.boot_id, held=report["card_faults"], reset_marks=reset_marks
     )

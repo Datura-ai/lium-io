@@ -304,6 +304,44 @@ async def test_a_held_xid_stays_without_proof_of_a_reset(context_factory, before
     assert later.report["card_faults"] == [XID_FAULT]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "inconclusive",
+    [
+        pytest.param({"gpu": {"ecc_uncorrected": None, "recovery_action": None}}, id="counters-unread"),
+        pytest.param({"gpu": {"ecc_uncorrected": 1, "recovery_action": None}}, id="one-counter-unread"),
+    ],
+)
+async def test_an_inconclusive_read_keeps_the_reset_baseline_of_a_held_card(context_factory, inconclusive):
+    """A read that cannot read the card's reset-only counters neither lifts the hold nor forgets what the card
+    last read: a reset after it is still proven by the next conclusive read."""
+    services = _services()
+    boot = {"boot_id": "boot-a", "xid": {"available": True, "last_ts": 5}}
+    needs_reset = {"ecc_uncorrected": 1, "recovery_action": 1}
+    await _read(context_factory, services, _ok(gpu=needs_reset, xid_faults=[XID_FAULT], **boot))
+    unread, _ = await _read(context_factory, services, _ok(**inconclusive, **boot))
+    reset, _ = await _read(context_factory, services, _ok(gpu={"recovery_action": 0}, **boot))
+
+    assert unread.report["card_faults"] == [XID_FAULT]
+    assert reset.report["card_faults"] == []
+
+
+@pytest.mark.asyncio
+async def test_zeroed_counters_lift_nothing_while_the_kernel_log_is_unreadable(context_factory):
+    """Zeroed counters prove a reset only in a read that also sees the kernel log: a card logging Xids the read
+    cannot see stays held until a read that can see them."""
+    services = _services()
+    boot = {"boot_id": "boot-a"}
+    needs_reset = {"ecc_uncorrected": 1, "recovery_action": 1}
+    log = {"available": True, "last_ts": 5}
+    await _read(context_factory, services, _ok(gpu=needs_reset, xid_faults=[XID_FAULT], xid=log, **boot))
+    blind, _ = await _read(context_factory, services, _ok(gpu={"recovery_action": 0}, xid={"available": False}, **boot))
+    seen, _ = await _read(context_factory, services, _ok(gpu={"recovery_action": 0}, xid=log, **boot))
+
+    assert blind.report["card_faults"] == [XID_FAULT]
+    assert seen.report["card_faults"] == []
+
+
 def _held_before_reset_marks(services, xid: int) -> str:
     """A card state stored by a validator that kept no reset marks: one held Xid on card 3."""
     fault = f"gpu 3 ({UUIDS[3]}): new NVRM Xid on a probed GPU: NVRM: Xid (PCI:0000:03:00): {xid}, pid=1"
