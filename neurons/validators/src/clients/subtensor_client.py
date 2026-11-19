@@ -1064,6 +1064,10 @@ class SubtensorClient:
             try:
                 node = self.get_node()
                 block_hash = node.get_block_hash(block)
+                if not block_hash:
+                    # a peer that has not seen the block answers no hash, and a storage read without one reads the
+                    # peer's best block instead: that is no answer for this block
+                    raise LookupError(f"no hash for block {block}")
                 return datetime.fromtimestamp(
                     node.query("Timestamp", "Now", block_hash=block_hash).value / 1000, tz=UTC
                 ).strftime("%Y-%m-%d %H:%M:%S")

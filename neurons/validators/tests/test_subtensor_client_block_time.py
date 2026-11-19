@@ -33,3 +33,12 @@ async def test_a_chain_that_does_not_answer_gives_no_time():
     node = MagicMock()
     node.get_block_hash.side_effect = ConnectionError("down")
     assert await SubtensorClient.get_time_from_block(_client(node), 9542550) is None
+
+
+@pytest.mark.asyncio
+async def test_a_peer_with_no_hash_for_the_block_gives_no_time_never_its_best_blocks():
+    node = MagicMock()
+    node.get_block_hash.return_value = None
+    node.query.return_value.value = 1795164758000
+    assert await SubtensorClient.get_time_from_block(_client(node), 9542550) is None
+    node.query.assert_not_called()
