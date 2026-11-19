@@ -127,6 +127,8 @@ jobs:
       with:
         # the image reads only these INPUT_* values (no action.yml defaults), so the upstream defaults are written out
         user: __token__
+        # the entrypoint reads INPUT_PASSWORD under set -u; empty selects Trusted Publishing
+        password: ''
         repository-url: https://upload.pypi.org/legacy/
         packages-dir: dist/
         verify-metadata: true
