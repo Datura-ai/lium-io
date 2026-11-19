@@ -250,10 +250,14 @@ class ValidatorTrust:
         (owner,) = answers
         self.owner_confirmed = True
         if owner != self.owner:
-            logger.warning("Validator trust: subnet owner changed from %s to %s", self.owner, owner)
-            self.owner = owner
-            self._select()
-            await asyncio.to_thread(self._save)
+            # the change selects and writes the state file: all of it off the event loop
+            await asyncio.to_thread(self._take_owner, owner)
+
+    def _take_owner(self, owner: str) -> None:
+        logger.warning("Validator trust: subnet owner changed from %s to %s", self.owner, owner)
+        self.owner = owner
+        self._select()
+        self._save()
 
 
 validator_trust = ValidatorTrust(enabled=importlib.util.find_spec("core.config_override") is None)

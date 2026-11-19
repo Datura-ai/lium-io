@@ -559,6 +559,7 @@ def test_refreshes_write_the_volume_off_the_event_loop(tmp_path, monkeypatch, ow
 
     new_owner = Keypair.create_from_uri("//LiumTrustNewOwner")
     trust = _trust(tmp_path, owner)
+    assert trust.offer(_signed(owner, new_validator, 3))  # a held message: the owner change re-selects and writes it
     real_write = trust_service._write_json
     writers = []
 
@@ -574,5 +575,5 @@ def test_refreshes_write_the_volume_off_the_event_loop(tmp_path, monkeypatch, ow
     _backend(monkeypatch, lambda url: answer)
     asyncio.run(trust.refresh_owner())  # owner change written
     asyncio.run(trust.refresh_message())  # new message written
-    assert trust.held.validator == new_validator.ss58_address
-    assert len(writers) >= 2 and not any(writers)
+    assert (trust.held_owner, trust.held.revision) == (new_owner.ss58_address, 1)
+    assert len(writers) >= 3 and not any(writers)
