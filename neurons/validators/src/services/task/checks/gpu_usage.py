@@ -7,7 +7,6 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from uuid import UUID
 
-from core.config import settings
 from protocol.vc_protocol.compute_requests import (
     BROKEN_POD_STATUS,
     LIVE_FILLER_RUN_STATUSES,
@@ -577,8 +576,7 @@ async def _foreign_processes_in_fillers(
     ctx: Context, gpu_processes: list[dict], filler_container_names: set[str]
 ) -> list[str]:
     """The GPU processes inside these fillers whose command is not one their workload runs, as
-    "<container> (pid <pid>): <command>". Judged as foreign GPU work only when
-    FILLER_PROCESS_ALLOWLIST_ENFORCED is on, logged either way. Not judged: a process with no scraped
+    "<container> (pid <pid>): <command>", each judged as foreign GPU work. Not judged: a process with no scraped
     command (the scrape could not read it, or a scraper that does not report it), a filler with no
     readable repository record, or a workload with no allowlist."""
     workloads: dict[str, FillerWorkload] = {}
@@ -607,16 +605,14 @@ async def _foreign_processes_in_fillers(
             foreign.append((workload.strategy, f"{container} (pid {process.get('pid')}): {cmdline}"))
     if not foreign:
         return []
-    enforced = settings.FILLER_PROCESS_ALLOWLIST_ENFORCED
     logger.warning(
-        "FILLER_FOREIGN_PROCESS executor=%s miner=%s processes=%s strategies=%s enforced=%s",
+        "FILLER_FOREIGN_PROCESS executor=%s miner=%s processes=%s strategies=%s",
         ctx.executor.uuid,
         ctx.miner_hotkey,
         [described for _, described in foreign],
         sorted({strategy for strategy, _ in foreign}),
-        enforced,
     )
-    return [described for _, described in foreign] if enforced else []
+    return [described for _, described in foreign]
 
 
 def _foreign_process_remediation(foreign_in_fillers: list[str]) -> dict[str, str]:

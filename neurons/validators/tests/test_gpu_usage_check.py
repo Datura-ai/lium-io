@@ -1924,28 +1924,19 @@ async def _filler_process_ctx(context_factory, cmdline, repository="daturaai/pea
     return context_factory(services=services, config=build_context_config(), state=state), filler
 
 
-@pytest.mark.parametrize("enforced", [False, True])
 @pytest.mark.asyncio
-async def test_unlisted_process_in_a_filler_on_its_own_image(context_factory, monkeypatch, caplog, enforced):
+async def test_unlisted_process_in_a_filler_on_its_own_image(context_factory, caplog):
     # a GPU process in a PEARL filler on its own image whose command is not the workload's
-    monkeypatch.setattr(gpu_usage.settings, "FILLER_PROCESS_ALLOWLIST_ENFORCED", enforced)
     ctx, filler = await _filler_process_ctx(context_factory, "/opt/other/gpu-app --run")
 
     with caplog.at_level("WARNING"):
         result = await GpuUsageCheck().run(ctx)
 
     assert "FILLER_FOREIGN_PROCESS executor=executor-123" in caplog.text
-    assert f"enforced={enforced}" in caplog.text
-    if enforced:
-        assert result.passed is False
-        assert result.event.reason_code == Msg.USAGE_HIGH.reason
-        assert result.event.what_we_saw["filler_foreign_processes"] == [
-            f"{filler} (pid 4242): /opt/other/gpu-app --run"
-        ]
-        assert f"{filler} (pid 4242): /opt/other/gpu-app" in result.event.remediation
-    else:
-        assert result.passed is True
-        assert result.event.reason_code == Msg.USAGE_OK.reason
+    assert result.passed is False
+    assert result.event.reason_code == Msg.USAGE_HIGH.reason
+    assert result.event.what_we_saw["filler_foreign_processes"] == [f"{filler} (pid 4242): /opt/other/gpu-app --run"]
+    assert f"{filler} (pid 4242): /opt/other/gpu-app" in result.event.remediation
 
 
 @pytest.mark.parametrize(
@@ -1961,10 +1952,9 @@ async def test_unlisted_process_in_a_filler_on_its_own_image(context_factory, mo
     ],
 )
 @pytest.mark.asyncio
-async def test_a_fillers_own_workload_passes_with_the_allowlist_enforced(
+async def test_a_fillers_own_workload_passes(
     context_factory, monkeypatch, caplog, repository, cmdline
 ):
-    monkeypatch.setattr(gpu_usage.settings, "FILLER_PROCESS_ALLOWLIST_ENFORCED", True)
     ctx, _ = await _filler_process_ctx(context_factory, cmdline, repository)
 
     with caplog.at_level("WARNING"):
@@ -1985,7 +1975,6 @@ async def test_a_fillers_own_workload_passes_with_the_allowlist_enforced(
 )
 @pytest.mark.asyncio
 async def test_no_command_or_unknown_workload_is_not_judged(context_factory, monkeypatch, caplog, repository, cmdline):
-    monkeypatch.setattr(gpu_usage.settings, "FILLER_PROCESS_ALLOWLIST_ENFORCED", True)
     ctx, _ = await _filler_process_ctx(context_factory, cmdline, repository)
 
     with caplog.at_level("WARNING"):
@@ -2216,7 +2205,6 @@ async def test_a_recovery_parked_name_is_ours_by_its_redis_mark_when_no_record_i
 @pytest.mark.asyncio
 async def test_a_repository_record_read_as_bytes_still_names_the_workload(context_factory, monkeypatch):
     # the prod Redis client returns bytes, not str
-    monkeypatch.setattr(gpu_usage.settings, "FILLER_PROCESS_ALLOWLIST_ENFORCED", True)
     ctx, filler = await _filler_process_ctx(context_factory, "/opt/other/gpu-app --run", b"daturaai/pearl-miner")
 
     result = await GpuUsageCheck().run(ctx)
