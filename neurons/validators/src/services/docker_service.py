@@ -4472,6 +4472,7 @@ class DockerService:
         quote_socket: bool = False,
         image_command_fallback: tuple[str, ...] = (),
         docker_data_volume_driver: str | None = None,
+        restart_policy: str | None = "unless-stopped",
     ) -> ContainerRunSpec:
         # A sysbox pod's inner dockerd writes /var/lib/docker; without a mount there it lands in an
         # uncapped host volume (the image's VOLUME, or sysbox's own) that can fill the host disk. It
@@ -4557,7 +4558,7 @@ class DockerService:
                 if docker_data_volume_gb
                 else ()
             ),
-            restart_policy="unless-stopped",
+            restart_policy=restart_policy,
             runtime="sysbox-runc" if payload.is_sysbox else None,
             cap_add=self._capabilities_for(devices),
             sysctls={"net.ipv4.conf.all.src_valid_mark": "1"},
@@ -11635,6 +11636,9 @@ class DockerService:
                     quote_socket=quote_socket,
                     image_command_fallback=image_command_fallback,
                     docker_data_volume_driver=local_volume_driver,
+                    # the validator's own probe pod lives for one check: a host stop that cuts its teardown short
+                    # must not bring it back at boot beside the filler on the same GPUs
+                    restart_policy=None if synthetic_probe else "unless-stopped",
                 )
 
                 logger.info(
