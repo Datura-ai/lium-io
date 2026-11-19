@@ -11252,7 +11252,7 @@ async def test_recover_pod_whose_boot_start_missed_a_gpu_device_node(
     )
 
     async def run(command, *_args, **_kwargs):
-        if command == "test -e /dev/nvidia4":
+        if command == "test -e /proc/1/root/dev/nvidia4":
             return _make_ssh_command_result(exit_status=0 if device_exists else 1)
         return _make_ssh_command_result(stdout="")
 

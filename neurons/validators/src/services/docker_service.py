@@ -13632,10 +13632,12 @@ class DockerService:
     ) -> bool:
         log_extra = {**default_extra, "container_name": container_name}
         try:
-            # started only once the cause is gone: the device node the boot-time start missed exists now
+            # started only once the cause is gone: the device node the boot-time start missed exists now on the host
+            # (the executor runs with the host pid namespace, so /proc/1/root is the host's root; on the host itself, /)
             if missing_device:
                 present = await ssh_client.run(
-                    f"test -e {shlex.quote(missing_device)}", timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC
+                    f"test -e {shlex.quote('/proc/1/root' + missing_device)}",
+                    timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
                 )
                 if getattr(present, "exit_status", 1) != 0:
                     logger.warning(

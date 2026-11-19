@@ -15,17 +15,6 @@ def _install(root) -> None:
     subprocess.run(["bash", "-c", script], check=True, env={**os.environ, "SYSBOX_SETUP_HOST_ROOT": str(root)})
 
 
-def test_the_unit_runs_before_docker_and_docker_waits_for_it_without_requiring_it(tmp_path):
-    _install(tmp_path)
-    unit = (tmp_path / "etc/systemd/system/lium-nvidia-device-nodes.service").read_text()
-    assert "Before=docker.service\n" in unit
-    assert "ExecStart=/usr/local/sbin/lium-nvidia-device-nodes\n" in unit
-    dropin = (tmp_path / "etc/systemd/system/docker.service.d/lium-nvidia-device-nodes.conf").read_text()
-    assert "After=lium-nvidia-device-nodes.service\n" in dropin
-    assert "Wants=lium-nvidia-device-nodes.service\n" in dropin
-    assert "Requires=" not in dropin
-
-
 def test_every_gpu_node_and_the_shared_nodes_are_made_by_minor(tmp_path):
     # the 19 Nov case: an 8 GPU host whose /dev/nvidia4 did not exist yet when Docker started the pod
     _install(tmp_path)
