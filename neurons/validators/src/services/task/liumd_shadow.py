@@ -568,7 +568,7 @@ LIVE_GPU_DETAIL_FIELDS = frozenset(
         "memory_speed",
         "power_limit",
         "pcie",
-        "speed_pcie",
+        "pcie_speed",
         "clocks_event_reasons",
     }
 )

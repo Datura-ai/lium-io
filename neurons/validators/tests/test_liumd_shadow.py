@@ -359,7 +359,7 @@ PYTHON_GPU_DETAILS = [
         "memory_speed": 5,
         "power_limit": 600,
         "pcie": 16,
-        "speed_pcie": 8000,
+        "pcie_speed": 8000,
         "clocks_event_reasons": 0,
     }
 ]
@@ -376,7 +376,7 @@ LIUMD_GPU_DETAILS = [
         "memory_speed": 95,
         "power_limit": 420,
         "pcie": 8,
-        "speed_pcie": 2500,
+        "pcie_speed": 2500,
         "clocks_event_reasons": 1,
     }
 ]
