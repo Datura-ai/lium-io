@@ -17,6 +17,12 @@ from services.task.checks.node_account import NodeAccountCheck
 from tests.helpers import make_context
 
 IP_A, IP_B = "127.0.0.1", "127.0.0.2"
+# an idle node's refusal clears its verified job, marked so the backend applies the reset only while it stays unrented
+REFUSED_IDLE = {
+    "node_account_passed": False,
+    "clear_verified_job_info": True,
+    "clear_verified_job_evidence": {"unrented_only": True},
+}
 HOST_KEYS_SCRIPT = Path(__file__).resolve().parents[2] / "executor" / "ssh_host_keys.sh"
 
 pytestmark = pytest.mark.asyncio
@@ -78,7 +84,7 @@ async def test_hostname_re_pointed_to_another_machine_is_refused(two_machines):
     result = await NodeAccountCheck().run(_ctx("node.example.com", await dial(IP_B), registered_key))
     assert not result.passed
     assert result.event.reason_code == "NODE_ACCOUNT_MISMATCH"
-    assert result.updates == {"node_account_passed": False, "clear_verified_job_info": True}
+    assert result.updates == REFUSED_IDLE
 
 
 async def test_ip_addressed_node_is_unchanged(two_machines):
@@ -185,7 +191,7 @@ async def test_ip_node_is_refused_on_a_machine_set_up_for_another_account(files,
     assert result.event.reason_code == reason
     assert result.passed is (reason != "NODE_ACCOUNT_MISMATCH")
     if not result.passed:
-        assert result.updates == {"node_account_passed": False, "clear_verified_job_info": True}
+        assert result.updates == REFUSED_IDLE
         assert "hostname" not in result.event.remediation
     assert runner.commands == [
         "printf 'hotkey=%s\\nclaim=%s\\n' \"$(cat /etc/liumd/miner_hotkey 2>/dev/null)\" "
@@ -226,7 +232,7 @@ async def test_a_rented_node_on_another_accounts_machine_keeps_its_rental(rented
     if rented:
         assert (result.updates, result.fatal) == ({"node_account_passed": False}, False)
     else:
-        assert (result.updates, result.fatal) == ({"node_account_passed": False, "clear_verified_job_info": True}, True)
+        assert (result.updates, result.fatal) == (REFUSED_IDLE, True)
     # an availability entry: the backend hides the node, so a partly rented one takes no rental on its free GPUs
     from services.task.availability import NODE_GPU_FAULT_CODES, availability_errors
 
@@ -375,3 +381,5 @@ async def test_a_dropped_session_during_the_account_read_is_reconnected_through_
     assert len(calls) == (1 if drops else 0)
     assert end.node_account_passed is account_passed
     assert end.clear_verified_job_info is (not account_passed and not rented)
+    if end.clear_verified_job_info:
+        assert end.clear_verified_job_evidence["unrented_only"] is True
