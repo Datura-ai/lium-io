@@ -13,6 +13,12 @@ on:
 permissions:
   contents: read
 
+# a newer push to the same PR cancels the older run, so superseded runs stop reading the API; main and the merge queue
+# keep every run
+concurrency:
+  group: pinned-actions-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -26,12 +32,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          python3 - <<'PY'
-          import os, pathlib, posixpath, re, subprocess, sys, urllib.error, urllib.parse, urllib.request
-          # PyYAML 6.0.3 vendored in this repository (pure Python, MIT): no package index, so a fresh runner always gets to the scan
-          sys.path.insert(0, ".github/vendor/pyyaml-6.0.3")
-          import yaml
-          assert yaml.__version__ == "6.0.3" and yaml.__file__.startswith(os.path.abspath(".github/vendor/pyyaml-6.0.3")), yaml.__file__
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install -q pyyaml==6.0.3
+          /tmp/venv/bin/python - <<'PY'
+          import os, pathlib, posixpath, re, subprocess, sys, urllib.error, urllib.parse, urllib.request, yaml
 
           class Loader(yaml.SafeLoader):
               """GitHub's YAML: only true/false are booleans (PyYAML's 1.1 rules make yes/on/no/off booleans too,
@@ -56,8 +60,9 @@ jobs:
           norm = lambda ref: re.sub(r"^docker://", "docker://", str(ref), flags=re.I)
           is_digest = lambda img: re.fullmatch(digest, "docker://" + re.sub(r"^docker://", "", str(img), flags=re.I)) is not None
           # a pinned action's own calls are followed this many levels down, and at most this many remote files are read in all:
-          # past either bound the check fails, it never passes what it did not read
-          MAX_DEPTH, MAX_FETCHES = 5, 300
+          # past either bound the check fails, it never passes what it did not read. The read budget is sized to the real
+          # graph (14 reads in lium-io, 9 in lium at the time of writing) so one run cannot spend much of the shared token quota
+          MAX_DEPTH, MAX_FETCHES = 5, 50
 
           class TooMany(Exception):
               pass
