@@ -255,10 +255,10 @@ jobs:
   # summary.md, junit per suite, compose logs, the suites' JSON dumps) — uploaded on every run, and summarised in
   # one sticky PR comment when the run is on a PR. Reproduce: make -C e2e e2e-full.
   e2e:
-    # e2e-gate is the one required check. An unapproved PR reports this job skipped under another name, so the
-    # check is missing and a merge cannot pass on the skip (DAH-5832). With the queue active, an approved PR
-    # reports e2e-gate as deferred and the merge-group run executes the gate for the queued tree.
-    name: ${{ needs.route.outputs.approved == 'true' && 'e2e-gate' || 'e2e-gate (runs once a review approves)' }}
+    # e2e-gate is the one required check. A PR reports it deferred when the queue is active, or runs the
+    # gate on approval; the merge-group run executes the gate for the queued tree. The name is always
+    # e2e-gate so the required check is present even before approval.
+    name: e2e-gate
     # e2e-gate is the one required check, so it also fails when route, ruff-check or a package test job failed:
     # a red unit test cannot merge on a green e2e
     needs: [route, validators, executor, miners, ruff-check, protocol]
