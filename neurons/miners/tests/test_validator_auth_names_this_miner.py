@@ -132,6 +132,36 @@ async def test_rest_headers_with_a_huge_timestamp_are_refused_401_not_500(rest, 
     assert refused.value.status_code == 401
 
 
+@pytest.mark.parametrize(
+    "offset_ms, expected",
+    [
+        pytest.param(-10_001, 401, id="past-10s-plus-1ms"),
+        pytest.param(-10_000, 200, id="past-10s"),
+        pytest.param(10_000, 200, id="future-10s"),
+        pytest.param(10_001, 401, id="future-10s-plus-1ms"),
+    ],
+)
+async def test_millisecond_headers_use_an_exact_window(
+    rest, validator_keypair, miner_keypair, monkeypatch, offset_ms, expected
+):
+    """A millisecond X-Timestamp is compared in milliseconds; the signature covers its whole-second floor."""
+    now = 1_763_500_000
+    monkeypatch.setattr(auth_module.time, "time", lambda: now + 0.5)
+    validator_service, _ = rest()
+    timestamp_ms = now * 1000 + offset_ms
+    headers = _headers(validator_keypair, miner_keypair.ss58_address, timestamp=timestamp_ms // 1000)
+    headers["x_timestamp"] = timestamp_ms
+
+    if expected == 200:
+        assert await auth_module.verify_validator_auth_from_headers(
+            **headers, validator_service=validator_service
+        ) == validator_keypair.ss58_address
+    else:
+        with pytest.raises(HTTPException) as refused:
+            await auth_module.verify_validator_auth_from_headers(**headers, validator_service=validator_service)
+        assert refused.value.status_code == expected
+
+
 def _dependency_names(dependant) -> set[str]:
     names = {dependant.call.__name__} if dependant.call is not None else set()
     for sub in dependant.dependencies:
