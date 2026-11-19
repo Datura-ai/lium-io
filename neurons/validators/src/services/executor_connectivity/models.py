@@ -130,8 +130,8 @@ class PortVerificationResult:
     # DAH-6376: the DinD probe did not run because no candidate port was known free (all held, or the host's port
     # inventory could not be read); measures nothing, so it counts neither for nor against the node
     dind_skipped: bool = False
-    # DAH-6637: DindProbeResult.sysbox_fs_read_clean of this cycle's DinD probe
-    sysbox_fs_read_clean: bool = False
+    # DAH-6637: DindProbeResult.sysbox_fs_read_clean of this cycle's DinD probe; None when no probe ran
+    sysbox_fs_read_clean: bool | None = None
 
 
 @dataclass(frozen=True)

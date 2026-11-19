@@ -393,6 +393,8 @@ async def test_orchestrator_skips_dind_when_no_candidate_port_is_known_free(
     assert result.dind_skipped is True
     assert result.dind_port is None
     assert result.dind_ok is False
+    # no probe ran: nothing was read, so the read is neither clean nor unclean
+    assert result.sysbox_fs_read_clean is None
     # neutral: the batch ports that answered count, the skipped probe adds neither a pass nor a failure
     assert result.status == "ok"
     assert len(result.successful_ports) == 2

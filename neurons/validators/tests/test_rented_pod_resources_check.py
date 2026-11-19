@@ -279,3 +279,6 @@ def test_a_later_checks_verdict_keeps_the_earlier_checks_codes(context_factory):
 def test_the_newest_sysbox_fs_is_timed_against_the_pod():
     # an old sysbox-fs left running beside a restarted one would read as older than the pod and hide the restart
     assert "pgrep -xn sysbox-fs" in _INIT_READ_SCRIPT
+    # the script runs in the executor container, which has no sysbox-fs binary: the host's is seen through PID 1
+    assert "[ -x /proc/1/root/usr/bin/sysbox-fs ]" in _INIT_READ_SCRIPT
+    assert "command -v sysbox-fs" not in _INIT_READ_SCRIPT

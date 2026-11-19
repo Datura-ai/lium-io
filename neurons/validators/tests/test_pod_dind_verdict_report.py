@@ -74,7 +74,7 @@ async def test_the_cycle_result_carries_the_verdicts_and_the_sysbox_fs_read(cont
 async def test_a_cycle_that_judged_no_pod_reports_no_verdicts(context_factory):
     result = await _job_result(context_factory(state=build_state()))
     assert result.rented_pod_faults is None
-    assert result.sysbox_fs_read_clean is False
+    assert result.sysbox_fs_read_clean is None
 
 
 @pytest.mark.asyncio

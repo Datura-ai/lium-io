@@ -42,7 +42,8 @@ _DEFAULT_CPU_PERIOD_US = 100_000
 # a renter can stack and kill their own FUSE mount on /proc/sys, but cannot restart the host's sysbox-fs.
 _INIT_READ_SCRIPT = (
     "se=$(ps -o etimes= -p \"$(pgrep -xn sysbox-fs)\" 2>/dev/null | tr -d ' '); "
-    "sb=$(command -v sysbox-fs >/dev/null 2>&1 && echo 1); "
+    # the script runs in the executor container: the host's binary is seen through PID 1's root
+    "sb=$([ -x /proc/1/root/usr/bin/sysbox-fs ] && echo 1); "
     "for p in {pids}; do "
     "o=$(cat /proc/$p/oom_score_adj 2>/dev/null); cs=; cm=; "
     "g=$(awk -F: '$1==\"0\"{{print $3}}' /proc/$p/cgroup 2>/dev/null); "
