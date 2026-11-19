@@ -65,6 +65,13 @@ class ExecutorSSHInfo(pydantic.BaseModel):
     # registration. The validator requires the machine it reached to be set up for them. None from an older miner.
     expected_node_hotkeys: list[str] | None = None
     expected_account_claim: str | None = None
+    # DAH-6539 follow-up (19 Nov 2026): every claim a node of this account's owner may carry, the listing account's and
+    # those of the owner's other accounts (same own-key coldkey or same confirmed e-mail). A node an owner set up under
+    # one of their own older accounts is theirs, not a relay. None from an older miner: `expected_account_claim` only.
+    expected_account_claims: list[str] | None = None
+    # check_id -> ISO-8601 time from which a check that so far only reports may refuse this node: the portal sets it
+    # once it sent the provider the per-node notice for that finding. Absent: the check reports and does not refuse.
+    check_enforce_after: dict[str, str] | None = None
 
 
 class AcceptSSHKeyRequest(BaseMinerRequest):

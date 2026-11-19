@@ -160,10 +160,14 @@ class _HostFiles:
         )
 
 
-def _relay_ctx(runner, hotkeys=("5Account", POOL), claim=CLAIM, address="203.0.113.7"):
+NOTIFIED = {"executor.validate.node_account": "2026-11-18T07:00:00Z"}  # the portal sent the per-node notice
+
+
+def _relay_ctx(runner, hotkeys=("5Account", POOL), claim=CLAIM, address="203.0.113.7", claims=None, enforce=None):
     executor = ExecutorSSHInfo(
         uuid="node-1", address=address, port=8001, ssh_username="root", ssh_port=22, python_path="/usr/bin/python3",
         root_dir="/root", expected_node_hotkeys=list(hotkeys) if hotkeys else None, expected_account_claim=claim,
+        expected_account_claims=claims, check_enforce_after=enforce,
     )
     return make_context(executor=executor, runner=runner, miner_hotkey=POOL)  # the validator reaches it via the pool hotkey
 
@@ -173,8 +177,8 @@ def _relay_ctx(runner, hotkeys=("5Account", POOL), claim=CLAIM, address="203.0.1
     [
         ("hotkey=5Victim\nclaim=\n", "NODE_ACCOUNT_MISMATCH"),  # another provider's own-key machine
         (f"hotkey={POOL}\nclaim=claim-of-another-account\n", "NODE_ACCOUNT_MISMATCH"),  # another account's pool node
-        (f"hotkey={POOL}\nclaim={CLAIM}\n", "NODE_ACCOUNT_SKIPPED"),  # its own pool node
-        ("hotkey=5Account\nclaim=\n", "NODE_ACCOUNT_SKIPPED"),  # its own own-key node
+        (f"hotkey={POOL}\nclaim={CLAIM}\n", "NODE_ACCOUNT_OK"),  # its own pool node: a pass, logged as one
+        ("hotkey=5Account\nclaim=\n", "NODE_ACCOUNT_OK"),  # its own own-key node
         (f"hotkey={POOL}\nclaim=\n", "NODE_ACCOUNT_SKIPPED"),  # a pool node from before the claim file: no evidence
         ("hotkey=\nclaim=\n", "NODE_ACCOUNT_SKIPPED"),  # an executor without the host files: no evidence
     ],
@@ -241,7 +245,7 @@ async def test_a_failed_or_stalled_read_hides_the_node_until_a_cycle_reads_it(re
     from services.task.availability import NODE_GPU_FAULT_CODES, availability_errors
 
     monkeypatch.setattr("services.task.checks.node_account.has_live_rental", lambda ctx: rented)
-    result = await NodeAccountCheck().run(_relay_ctx(_HostFiles("", success=False)))
+    result = await NodeAccountCheck().run(_relay_ctx(_HostFiles("", success=False), enforce=NOTIFIED))
     assert not result.passed and result.fatal is (not rented)
     assert result.event.event == "Node account ownership could not be verified at this address"
     [entry] = availability_errors([result.event])
@@ -291,7 +295,8 @@ async def test_every_way_the_read_can_fail_is_refused(outcome, read_error, monke
     monkeypatch.setattr(module, "READ_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr(runner_module.asyncio, "sleep", _no_wait(runner_module.asyncio.sleep))
     monkeypatch.setattr(module, "has_live_rental", lambda ctx: False)
-    result = await NodeAccountCheck().run(_relay_ctx(runner_module.SSHCommandRunner(_Ssh(outcome))))
+    runner = runner_module.SSHCommandRunner(_Ssh(outcome))
+    result = await NodeAccountCheck().run(_relay_ctx(runner, enforce=NOTIFIED))
     assert not result.passed and result.fatal
     assert result.event.reason_code == "NODE_ACCOUNT_UNVERIFIED"
     assert result.event.what_we_saw["read_error"] == read_error
@@ -323,7 +328,7 @@ class _DropsTheSession(_HostFiles):
     "case, drops, reconnects, files, reasons, account_passed",
     [
         # the session dropped and the reconnect worked: the read runs again on the new session and stands
-        ("reconnected, own machine", True, True, f"hotkey={POOL}\nclaim={CLAIM}\n", ["NODE_ACCOUNT_SKIPPED"], True),
+        ("reconnected, own machine", True, True, f"hotkey={POOL}\nclaim={CLAIM}\n", ["NODE_ACCOUNT_OK"], True),
         ("reconnected, mismatch", True, True, "hotkey=5Victim\nclaim=\n", ["NODE_ACCOUNT_MISMATCH"], False),
         # the reconnect failed: the run ends on the dead session, as for any other check
         (
@@ -368,10 +373,77 @@ async def test_a_dropped_session_during_the_account_read_is_reconnected_through_
         return _session()
 
     first = _session()
-    ctx = _relay_ctx(_DropsTheSession(first) if drops else _HostFiles(files)).model_copy(update={"ssh": first})
+    runner = _DropsTheSession(first) if drops else _HostFiles(files)
+    ctx = _relay_ctx(runner, enforce=NOTIFIED).model_copy(update={"ssh": first})
     _, events, end = await Pipeline([NodeAccountCheck()], _Sink(), reconnect=reconnect).run(ctx)
 
     assert [e.reason_code for e in events] == reasons, case
     assert len(calls) == (1 if drops else 0)
     assert end.node_account_passed is account_passed
     assert end.clear_verified_job_info is (not account_passed and not rented)
+
+
+# DAH-6539 follow-up (Mikhail's incident review, 19 Nov 2026)
+
+
+@pytest.mark.parametrize(
+    "files",
+    [f"hotkey={POOL}\nclaim=claim-of-their-older-account\n", "hotkey=5TheirOtherHotkey\nclaim=\n"],
+)
+async def test_a_node_its_owner_set_up_under_another_of_their_accounts_passes(files):
+    """itssb 17 Nov: a node installed under the owner's older account. The portal sends every claim and hotkey of the
+    owner's accounts, so it passes with no re-setup and is not hidden."""
+    ctx = _relay_ctx(
+        _HostFiles(files),
+        hotkeys=("5Account", POOL, "5TheirOtherHotkey"),
+        claims=[CLAIM, "claim-of-their-older-account"],
+    )
+    result = await NodeAccountCheck().run(ctx)
+    assert (result.passed, result.event.reason_code) == (True, "NODE_ACCOUNT_OK")
+
+
+async def test_another_owners_setup_is_refused_at_once_without_a_notice():
+    """The security case does not wait for the notice: no check_enforce_after, refused all the same."""
+    ctx = _relay_ctx(
+        _HostFiles(f"hotkey={POOL}\nclaim=claim-of-a-stranger\n"),
+        claims=[CLAIM, "claim-of-their-older-account"],
+    )
+    result = await NodeAccountCheck().run(ctx)
+    assert not result.passed and result.event.reason_code == "NODE_ACCOUNT_MISMATCH"
+    assert result.event.what_we_saw["node_claim"] == "claim-of-a-stranger"
+
+
+@pytest.mark.parametrize(
+    "enforce", [{}, {"executor.validate.node_account": "2999-01-01T00:00:00Z"}, {"x": "y"}]
+)
+async def test_a_failed_read_only_reports_until_the_provider_was_notified(enforce):
+    """Not proof of another owner: before the portal's notice (or before its time) the run passes, the finding is no
+    availability entry, and it is kept for the final event, from which the portal sends the notice."""
+    from services.task.availability import availability_errors
+
+    result = await NodeAccountCheck().run(
+        _relay_ctx(_HostFiles("", success=False), enforce=enforce)
+    )
+    assert result.passed
+    assert (result.event.reason_code, result.event.severity) == (
+        "NODE_ACCOUNT_UNVERIFIED",
+        "warning",
+    )
+    assert result.updates == {"reported_only": ("NODE_ACCOUNT_UNVERIFIED",)}
+    assert availability_errors([result.event]) == []
+
+
+async def test_finalize_reports_the_findings_that_only_reported():
+    from services.task.checks.finalize import FinalizeCheck
+
+    ctx = make_context(reported_only=("NODE_ACCOUNT_UNVERIFIED",))
+    result = await FinalizeCheck().run(ctx)
+    assert result.event.what_we_saw["reported_only"] == ["NODE_ACCOUNT_UNVERIFIED"]
+    assert "reported_only" not in (await FinalizeCheck().run(make_context())).event.what_we_saw
+
+
+async def test_a_portal_that_sends_no_notice_map_keeps_the_failed_read_enforced(monkeypatch):
+    """Validator first, portal later: no map at all means an older portal, so the stalled read is refused as before."""
+    monkeypatch.setattr("services.task.checks.node_account.has_live_rental", lambda ctx: False)
+    result = await NodeAccountCheck().run(_relay_ctx(_HostFiles("", success=False), enforce=None))
+    assert not result.passed and result.event.reason_code == "NODE_ACCOUNT_UNVERIFIED"

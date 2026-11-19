@@ -352,6 +352,8 @@ class ExecutorService:
                     node_accounts[str(uuid)] = {
                         "hotkeys": [str(h) for h in item["node_hotkeys"]],
                         "claim": item.get("account_claim") or None,
+                        "claims": [str(c) for c in item.get("account_claims") or []] or None,
+                        "enforce_after": item.get("check_enforce_after") or None,
                     }
                 result.append(
                     Executor(
@@ -601,6 +603,8 @@ class ExecutorService:
                 account = node_accounts.get(str(info.uuid)) or {}
                 info.expected_node_hotkeys = account.get("hotkeys")
                 info.expected_account_claim = account.get("claim")
+                info.expected_account_claims = account.get("claims")
+                info.check_enforce_after = account.get("enforce_after")
         # a cut-off upload logs nothing itself, so name its executors here or the validator's miss looks unexplained
         cut_off_ids = [str(executor.uuid) for executor, task in zip(executors, tasks) if task in pending]
         (logger.warning if cut_off_ids else logger.info)(

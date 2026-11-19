@@ -379,6 +379,9 @@ class Context(BaseModel):
     # False once NodeAccountCheck finds the node on another account's machine (DAH-6539); non-fatal on a live
     # rental, so the score gate lives in calculate_scores.
     node_account_passed: bool = True
+    # Reason codes of checks that found a failure they do not enforce yet (report-only until the portal sent the
+    # provider its per-node notice, see checks/enforcement.py). Finalize reports them so the portal can send it.
+    reported_only: tuple[str, ...] = ()
     # G1 — NVIDIA CC GPU attestation outcome: True/False when verified, None when
     # not performed (non-CVM node, no evidence supplied, or NRAS undeterminable).
     gpu_attestation_passed: bool | None = None

@@ -16,7 +16,12 @@ fixed command. It refuses only on direct evidence of another account: a machine 
 of the account's, or a pool node reporting another account's claim. The portal requires both at registration
 (DAH-4375), so an honest node matches. Missing files and an empty claim prove nothing either way (executors write the claim
 file from this release on): the node passes and the read is logged (NODE_ACCOUNT_BINDING_UNVERIFIED). A read that
-fails, times out or closes without an exit status (a relay can stall it) is refused as NODE_ACCOUNT_UNVERIFIED.
+fails, times out or closes without an exit status (a relay can stall it) is refused as NODE_ACCOUNT_UNVERIFIED once the
+portal sent the provider the per-node notice, and only reported before that (checks/enforcement.py).
+
+Follow-up of 19 Nov (Mikhail's incident review): the portal now sends the hotkeys and claims of every account of the
+listing account's owner, so a node its owner set up under another of their own accounts passes without a re-setup.
+A machine set up for another owner is still refused at once. A pass on an IP node logs NODE_ACCOUNT_OK, not SKIPPED.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ from ..messages import NodeAccountMessages as Msg, render_message
 from ..availability import ReachSource, ReachTarget
 from ..pipeline import CheckResult, Context
 from .banned_provider import has_live_rental
+from .enforcement import enforced, reported_only
 
 logger = get_logger(__name__)
 
@@ -62,51 +68,91 @@ class NodeAccountCheck:
         # compared first: it needs no read, so a stalled account read cannot hide this direct evidence
         if expected and presented_host_key(ctx) not in expected:
             return _refused(ctx, self.check_id, Msg.MISMATCH, what)
+        bound = False
         if executor.expected_node_hotkeys and ctx.runner is not None:
-            refused = await self._other_account(ctx, what)
+            refused, bound = await self._other_account(ctx, what)
             if refused is not None:
                 return refused
-        if not expected:
-            if not is_ip_literal(executor.address) and executor.uuid not in _logged_without_expected:
-                _logged_without_expected.add(executor.uuid)
-                logger.info(
-                    _m(
-                        "Hostname node listed without its registered host key; account check skipped",
-                        extra=get_extra_info({**what, "miner_hotkey": ctx.miner_hotkey}),
-                    )
+        if expected or bound:
+            # a pass is logged as one: an IP node whose machine is set up for its account matched, it was not skipped
+            return CheckResult(
+                passed=True,
+                event=render_message(Msg.MATCH, ctx=ctx, check_id=self.check_id, what=what),
+            )
+        if not is_ip_literal(executor.address) and executor.uuid not in _logged_without_expected:
+            _logged_without_expected.add(executor.uuid)
+            logger.info(
+                _m(
+                    "Hostname node listed without its registered host key; account check skipped",
+                    extra=get_extra_info({**what, "miner_hotkey": ctx.miner_hotkey}),
                 )
-            return CheckResult(passed=True, event=render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what=what))
+            )
+        return CheckResult(
+            passed=True,
+            event=render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what=what),
+        )
 
-        return CheckResult(passed=True, event=render_message(Msg.MATCH, ctx=ctx, check_id=self.check_id, what=what))
+    async def _other_account(self, ctx: Context, what: dict) -> tuple[CheckResult | None, bool]:
+        """(refusal or report, None when the machine may serve this listing; True when its files proved it does).
 
-    async def _other_account(self, ctx: Context, what: dict) -> CheckResult | None:
-        """MISMATCH when the machine reached is set up for another account than the one listing it, else None."""
+        Accepted: a machine set up for one of the hotkeys and claims the portal sends for this node, which cover every
+        account of the listing account's owner (same own-key coldkey or confirmed e-mail). A node the owner set up
+        under another of their own accounts is theirs and passes with no re-setup; only another owner's setup is
+        refused, at once (the relay case). A read that fails proves nothing either way: it only reports until the
+        provider was notified (checks/enforcement.py)."""
         executor = ctx.executor
-        result = await ctx.runner.run(READ_NODE_ACCOUNT_COMMAND, timeout=READ_TIMEOUT_SECONDS, retryable=True)
-        found = dict(line.split("=", 1) for line in (result.stdout or "").splitlines() if "=" in line)
+        result = await ctx.runner.run(
+            READ_NODE_ACCOUNT_COMMAND, timeout=READ_TIMEOUT_SECONDS, retryable=True
+        )
+        found = dict(
+            line.split("=", 1) for line in (result.stdout or "").splitlines() if "=" in line
+        )
         hotkey, claim = found.get("hotkey", "").strip(), found.get("claim", "").strip()
-        what = {**what, "node_hotkey": hotkey, "expected_node_hotkeys": executor.expected_node_hotkeys}
-        expected_claim = executor.expected_account_claim
+        what = {
+            **what,
+            "node_hotkey": hotkey,
+            "expected_node_hotkeys": executor.expected_node_hotkeys,
+        }
+        claims = set(executor.expected_account_claims or ()) | (
+            {executor.expected_account_claim} - {None, ""}
+        )
         if not result.success:
-            # failed, timed out or closed without an exit status: a relay could stall it on purpose, so ownership is
-            # not proven and the node is hidden until a cycle reads it
+            # failed, timed out or closed without an exit status: ownership is not proven
             what["read_error"] = result.error_type or f"exit {result.exit_code}"
-            return _refused(ctx, self.check_id, Msg.BINDING_UNVERIFIED, what)
+            if enforced(ctx, self.check_id):
+                return _refused(ctx, self.check_id, Msg.BINDING_UNVERIFIED, what), False
+            what = {**what, "enforced": False}
+            return reported_only(
+                ctx,
+                render_message(Msg.UNVERIFIED_REPORTED, ctx=ctx, check_id=self.check_id, what=what),
+            ), False
         if not hotkey:
             # the read worked and found no host files: an older executor, no evidence either way
-            logger.info(_m("NODE_ACCOUNT_BINDING_UNVERIFIED", extra=get_extra_info({**what, "unread": "hotkey"})))
-            return None
+            logger.info(
+                _m(
+                    "NODE_ACCOUNT_BINDING_UNVERIFIED",
+                    extra=get_extra_info({**what, "unread": "hotkey"}),
+                )
+            )
+            return None, False
         if hotkey not in executor.expected_node_hotkeys:
             what["binding_mismatch"] = "hotkey"
-        elif expected_claim and hotkey == ctx.miner_hotkey and claim and claim != expected_claim:
-            # a node set up for the listing (pool) hotkey proves its account only by the claim; one set up for the
-            # account's own hotkey needs none
+        elif claims and hotkey == ctx.miner_hotkey and claim and claim not in claims:
+            # a node set up for the listing (pool) hotkey proves its owner only by the claim; one set up for one of
+            # the owner's own hotkeys needs none. The claim is the HMAC the node publishes at /miner-identity.
             what["binding_mismatch"] = "claim"
+            what["node_claim"] = claim
         else:
-            if expected_claim and hotkey == ctx.miner_hotkey and not claim:
-                logger.info(_m("NODE_ACCOUNT_BINDING_UNVERIFIED", extra=get_extra_info({**what, "unread": "claim"})))
-            return None
-        return _refused(ctx, self.check_id, Msg.BINDING_MISMATCH, what)
+            if claims and hotkey == ctx.miner_hotkey and not claim:
+                logger.info(
+                    _m(
+                        "NODE_ACCOUNT_BINDING_UNVERIFIED",
+                        extra=get_extra_info({**what, "unread": "claim"}),
+                    )
+                )
+                return None, False
+            return None, True
+        return _refused(ctx, self.check_id, Msg.BINDING_MISMATCH, what), False
 
 
 def _refused(ctx: Context, check_id: str, template, what: dict) -> CheckResult:

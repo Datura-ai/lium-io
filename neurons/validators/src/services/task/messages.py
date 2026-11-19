@@ -1207,6 +1207,16 @@ class NodeAccountMessages:
         remediation="The validator could not read this node's account files over SSH. Make sure the executor is up "
         "and reachable at this address; the node is listed again after the next successful check.",
     )
+    # DAH-6539 follow-up: the same finding before the portal sent the provider its notice; the run passes
+    UNVERIFIED_REPORTED = MessageTemplate(
+        event="Node account ownership could not be verified at this address (reported, not enforced yet)",
+        reason="NODE_ACCOUNT_UNVERIFIED",
+        severity="warning",
+        category="policy",
+        impact="Proceed; the provider is notified first, and only after that notice does this finding hide the node",
+        remediation="The validator could not read this node's account files over SSH. Make sure the executor is up "
+        "and reachable at this address.",
+    )
 
 
 class StaleContainerCleanupMessages:
