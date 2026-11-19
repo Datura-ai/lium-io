@@ -7,8 +7,8 @@ Both files are the unsigned build artifacts built from the liumd merged source `
 
 | binary | sha256 |
 | --- | --- |
-| `liumd-amd64` | `6721baf2623c41a639459fbbfeeff7f53fca49ae71de5ff8dbe2b2cccddc8710` |
-| `liumd-arm64` | `ba99d6078f95f771e173cdc5cdf2a0efd396972f7bd2dd61ad407c9c07ee496a` |
+| `liumd-amd64` | `23ce96f5486a7a19e9dff0a4acbe8f6558cce7d681e1ed3d12ecc1375bde7b56` |
+| `liumd-arm64` | `d6e4755f749116a8347b3ab1a0869e0db2fc7b047c9151e2809f085d86de347d` |
 
 `provenance-amd64.json`/`provenance-arm64.json` are the same run's metadata, kept beside the
 binaries for traceability. `manifest.json` is the validator refresh manifest: it names the
