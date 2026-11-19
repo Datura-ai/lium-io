@@ -430,12 +430,10 @@ class Validator:
             ):
                 job_block = (current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB
                 # The cycle id is a function of the job block alone (DAH-6539): every attempt at one block reports under
-                # one id whether or not the chain answered this time (a timed-out run, a restart, an "Unknown" then a
-                # success), so a block is never settled twice, and the backend can always order the report against a
-                # node's registration. The chain's time of the block (or "Unknown") is read only where a real time is
-                # needed: the settlement's cycle start.
+                # one id whether or not the chain answers (a timed-out run, a restart), so a block is never settled
+                # twice, and the backend can always order the report against a node's registration. The backend reads
+                # the cycle's start from this id everywhere (ledger rows, settlement, pod and rental timing).
                 job_batch_id = estimated_block_time(job_block)
-                job_block_time = await self.subtensor_client.get_time_from_block(job_block)
 
                 # DAH-2380: fetch default cache-template digests from Docker Hub at the
                 # start of each job cycle, so verification compares executors against the
@@ -806,7 +804,6 @@ class Validator:
                             job_batch_id,
                             job_block,
                             scored_at,
-                            job_block_time=job_block_time,
                         )
 
                     # DAH-2748: a cycle where most nodes failed at the connect is our own
@@ -988,7 +985,6 @@ class Validator:
         job_batch_id: str,
         job_block: int,
         scored_at: datetime,
-        job_block_time: str = "Unknown",
     ) -> None:
         """DAH-4001: hand the cycle's vector and per-node rows to the backend for delayed settlement. Never fails
         the cycle.
@@ -1006,11 +1002,11 @@ class Validator:
                 )
             )
             return
-        # the chain's time of the job block, never the id's estimate: an estimate can fall inside a penalty window that
-        # ended just before the real start; with no chain time, the scoring time as before (DAH-6539)
+        # the id's own time: the backend keys the cycle's ledger rows, settlement and attribution on it, so any other
+        # start (the chain's reading of the block) would match none of them
         try:
-            cycle_started_at = datetime.strptime(job_block_time, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-        except (TypeError, ValueError):
+            cycle_started_at = datetime.strptime(job_batch_id, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+        except ValueError:
             cycle_started_at = scored_at
         payload = {
             "cycle_id": job_batch_id,

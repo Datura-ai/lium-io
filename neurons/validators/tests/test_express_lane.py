@@ -572,11 +572,18 @@ async def test_every_miner_is_asked_under_the_cycles_block_time_id(
         c.kwargs["payload"].miner_hotkey: c.kwargs["payload"].job_batch_id
         for c in validator.miner_service.request_job_to_miner.await_args_list
     }
-    [job_block] = {c.args[0] for c in validator.subtensor_client.get_time_from_block.await_args_list}
+    job_block = _job_block(validator)
     cycle_id = estimated_block_time(job_block)
     assert asked == {"miner-a": cycle_id, "miner-b": cycle_id}
     assert validator.cycle_inputs.job_batch_id == cycle_id
     validator.miner_service.start_awaiting_wave_lists.assert_called_once_with(cycle_id, ["miner-a", "miner-b"])
+
+
+def _job_block(validator) -> int:
+    from core.config import settings
+
+    current = validator.subtensor_client.get_current_block.return_value
+    return (current // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB
 
 
 @pytest.mark.asyncio
@@ -601,9 +608,10 @@ async def test_a_cycle_that_cannot_read_its_block_time_asks_under_its_blocks_est
         await validator.sync()
 
     [asked] = {c.kwargs["payload"].job_batch_id for c in validator.miner_service.request_job_to_miner.await_args_list}
-    [job_block] = {c.args[0] for c in validator.subtensor_client.get_time_from_block.await_args_list}
+    job_block = _job_block(validator)
     assert asked == estimated_block_time(job_block)
     assert validator.cycle_inputs.job_batch_id == asked
+    validator.subtensor_client.get_time_from_block.assert_not_awaited()  # the cycle no longer needs the chain's time
 
 
 @pytest.mark.asyncio
