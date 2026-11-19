@@ -14,12 +14,24 @@ from datetime import UTC, datetime
 from ..pipeline import CheckResult, Context
 
 
+def fresh(until: str | None) -> bool:
+    """Whether the portal read the miner sent this node from still vouches for it (`snapshot_valid_until`): False once
+    the time passed or when it does not parse (a time without a zone included)."""
+    try:
+        return datetime.now(UTC) < datetime.fromisoformat(str(until))
+    except (TypeError, ValueError):
+        return False
+
+
 def enforced(ctx: Context, reason_code: str) -> bool:
     """True once the portal says this node's provider was notified of `reason_code` and its time has come. A miner or
     portal that sends no map at all predates this rule: its nodes are enforced as before, so shipping the validator
-    first never lets a stalled read pass."""
+    first never lets a stalled read pass. A map from a read that no longer vouches for the node (a snapshot the miner
+    kept serving through a portal outage) may be an earlier registration's of the same uuid: the finding only reports."""
     if ctx.executor.check_enforce_after is None:
         return True
+    if not fresh(ctx.executor.snapshot_valid_until):
+        return False
     after = ctx.executor.check_enforce_after.get(reason_code)
     if not after:
         return False

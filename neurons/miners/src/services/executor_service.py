@@ -58,19 +58,22 @@ def _describe_error(error: BaseException) -> str:
     return f"{type(error).__name__}: {text}" if text else type(error).__name__
 
 
-def _current_binding(item: dict) -> dict:
-    """What the node's machine may be set up for now (DAH-6539). The portal's owner-wide binding (the hotkeys and claims
-    of every account of the listing's owner) counts until its `owner_binding_until`; this miner serves its last
-    snapshot while the portal is unreachable, so after that time a link removed meanwhile must stop passing, and the
-    listing account's own binding (`listing_binding`) applies. A portal that sends neither field: the row as it is."""
-    until, listing = item.get("owner_binding_until"), item.get("listing_binding")
-    if until is None or not isinstance(listing, dict):
-        return item
+def _fresh(until) -> bool:
+    """Whether the portal read a snapshot row came from still vouches for it (`snapshot_valid_until`, DAH-6539). False
+    once that time passed or when it does not parse: this miner serves its last snapshot while the portal is
+    unreachable, and a link removed, or a node deleted and registered again, meanwhile must not keep its old grant."""
     try:
-        expired = datetime.now(UTC) >= datetime.fromisoformat(str(until))
+        return datetime.now(UTC) < datetime.fromisoformat(str(until))
     except (TypeError, ValueError):
-        expired = True  # an unreadable end grants nothing beyond the listing
-    return listing if expired else item
+        return False  # an unreadable end vouches for nothing (a time without a zone included)
+
+
+def _current_binding(item: dict) -> dict:
+    """What the node's machine may be set up for now (DAH-6539): the owner-wide binding (`owner_binding`: the hotkeys
+    and claims of every account of the listing's owner) while the row is fresh, else the row's own fields, which hold
+    the listing account's binding (an older portal: the row as it is)."""
+    owner = item.get("owner_binding")
+    return owner if isinstance(owner, dict) and _fresh(item.get("snapshot_valid_until")) else item
 
 
 def _expected_fields(binding: dict) -> dict:
@@ -376,15 +379,16 @@ class ExecutorService:
                     host_keys[str(uuid)] = item["ssh_host_key"]
                 binding = _current_binding(item)
                 if node_accounts is not None and binding.get("node_hotkeys"):
-                    listing = item.get("listing_binding")
+                    until, enforce_after = item.get("snapshot_valid_until"), item.get("check_enforce_after")
                     node_accounts[str(uuid)] = {
                         **_expected_fields(binding),
-                        # {} (no notice yet: report first) differs from a missing map (an older portal: enforce)
-                        "check_enforce_after": item.get("check_enforce_after"),
-                        # the validator re-applies the grant's end when it checks the node: this snapshot can be
-                        # served, and the upload finish, after it
-                        "owner_binding_until": item.get("owner_binding_until") if isinstance(listing, dict) else None,
-                        "listing_binding": _expected_fields(listing) if isinstance(listing, dict) else None,
+                        # {} (no notice yet: report first) differs from a missing map (an older portal: enforce). A
+                        # stale row's times may belong to an earlier registration of this uuid: report first
+                        "check_enforce_after": enforce_after if enforce_after is None or _fresh(until) else {},
+                        # the validator re-applies the end when it checks the node: this snapshot can be served, and
+                        # the upload finish, after it
+                        "snapshot_valid_until": until,
+                        "listing_binding": _expected_fields(item) if binding is not item else None,
                     }
                 result.append(
                     Executor(

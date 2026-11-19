@@ -26,8 +26,6 @@ A machine set up for another owner is still refused at once. A pass on an IP nod
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 from core.utils import _m, get_extra_info, get_logger
@@ -37,7 +35,7 @@ from ..messages import NodeAccountMessages as Msg, render_message
 from ..availability import ReachSource, ReachTarget
 from ..pipeline import CheckResult, Context
 from .banned_provider import has_live_rental
-from .enforcement import enforced, reported_only
+from .enforcement import enforced, fresh, reported_only
 
 logger = get_logger(__name__)
 
@@ -66,16 +64,11 @@ def presented_host_key(ctx: Context) -> str:
 
 
 def current_binding(executor: ExecutorSSHInfo) -> ExecutorSSHInfo:
-    """The node as it may be bound now (DAH-6539): the owner-wide binding the miner sent counts until its
-    `owner_binding_until`, read here at check time because the miner can serve a cached snapshot and finish the upload
-    after the grant ended; from then on, or when the time does not parse, the listing account's own binding."""
-    if executor.owner_binding_until is None or not isinstance(executor.listing_binding, dict):
-        return executor
-    try:
-        expired = datetime.now(UTC) >= datetime.fromisoformat(executor.owner_binding_until)
-    except (TypeError, ValueError):
-        expired = True  # an unreadable end grants nothing beyond the listing
-    if not expired:
+    """The node as it may be bound now (DAH-6539): the owner-wide binding the miner sent counts while the portal read
+    it came from vouches for it (`snapshot_valid_until`), read here at check time because the miner can serve a cached
+    snapshot and finish the upload after it; from then on, or when the time does not parse, the listing account's own
+    binding."""
+    if not isinstance(executor.listing_binding, dict) or fresh(executor.snapshot_valid_until):
         return executor
     listing = {field: executor.listing_binding.get(field) for field in LISTING_BINDING_FIELDS}
     return executor.model_copy(update=listing)

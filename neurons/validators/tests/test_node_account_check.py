@@ -169,6 +169,8 @@ def _relay_ctx(runner, hotkeys=("5Account", POOL), claim=CLAIM, address="203.0.1
         uuid="node-1", address=address, port=8001, ssh_username="root", ssh_port=22, python_path="/usr/bin/python3",
         root_dir="/root", expected_node_hotkeys=list(hotkeys) if hotkeys else None, expected_account_claim=claim,
         expected_account_claims=claims, check_enforce_after=enforce,
+        # a map comes with the time its portal read vouches until (a fresh snapshot here)
+        snapshot_valid_until=None if enforce is None else (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
     )
     return make_context(executor=executor, runner=runner, miner_hotkey=POOL)  # the validator reaches it via the pool hotkey
 
@@ -453,14 +455,14 @@ async def test_an_empty_claim_on_a_hotkey_the_listing_already_accepts_keeps_the_
 )
 async def test_an_owner_wide_grant_counts_only_until_its_end_when_the_node_is_checked(until, passed):
     """Off-GitHub review on df0df43 (Critical 1): the miner can serve a cached snapshot read just before the grant's
-    `owner_binding_until` and finish the upload after it. The end now travels with the node and is applied here, at
+    `snapshot_valid_until` and finish the upload after it. The end now travels with the node and is applied here, at
     check time, so a partner unlinked meanwhile stops passing and the listing account's own binding applies."""
     if isinstance(until, timedelta):
         until = (datetime.now(UTC) + until).isoformat()
     executor = ExecutorSSHInfo(
         uuid="node-1", address="203.0.113.7", port=8001, ssh_username="root", ssh_port=22,
         python_path="/usr/bin/python3", root_dir="/root", expected_node_hotkeys=["5Account", "5Partner"],
-        check_enforce_after={}, owner_binding_until=until,
+        check_enforce_after={}, snapshot_valid_until=until,
         listing_binding=None if until is None else {"expected_node_hotkeys": ["5Account"]},
     )
     ctx = make_context(executor=executor, runner=_HostFiles("hotkey=5Partner\nclaim=\n"), miner_hotkey="5Account")
@@ -479,13 +481,13 @@ async def test_a_read_that_outlasts_the_owner_grant_is_judged_by_the_binding_aft
 
     class _SlowRead(_HostFiles):
         async def run(self, cmd, **kwargs):
-            executor.owner_binding_until = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()  # ended meanwhile
+            executor.snapshot_valid_until = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()  # ended meanwhile
             return await super().run(cmd, **kwargs)
 
     executor = ExecutorSSHInfo(
         uuid="node-1", address="203.0.113.7", port=8001, ssh_username="root", ssh_port=22,
         python_path="/usr/bin/python3", root_dir="/root", expected_node_hotkeys=["5Account", "5Partner"],
-        check_enforce_after={}, owner_binding_until=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+        check_enforce_after={}, snapshot_valid_until=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
         listing_binding={"expected_node_hotkeys": ["5Account"]},
     )
     ctx = make_context(executor=executor, runner=_SlowRead("hotkey=5Partner\nclaim=\n"), miner_hotkey="5Account")
@@ -493,6 +495,21 @@ async def test_a_read_that_outlasts_the_owner_grant_is_judged_by_the_binding_aft
     result = await NodeAccountCheck().run(ctx)
 
     assert (result.passed, result.event.reason_code) == (False, "NODE_ACCOUNT_MISMATCH")
+
+
+@pytest.mark.parametrize("valid_until", [timedelta(seconds=-1), "not a time", None])
+async def test_a_notice_time_from_a_read_that_no_longer_vouches_for_the_node_only_reports(valid_until):
+    """lp#3232 review 4634721602: the miner serves its last snapshot through a portal outage, and the node may have been
+    deleted and registered again meanwhile (its notice deleted with it). A notice time from a read past its
+    `snapshot_valid_until` may be the earlier registration's: the finding only reports."""
+    if isinstance(valid_until, timedelta):
+        valid_until = (datetime.now(UTC) + valid_until).isoformat()
+    ctx = _relay_ctx(_HostFiles("", success=False), enforce=NOTIFIED)
+    ctx.executor.snapshot_valid_until = valid_until
+
+    result = await NodeAccountCheck().run(ctx)
+
+    assert result.passed and result.updates["reported_only"] == ("NODE_ACCOUNT_UNVERIFIED",)
 
 
 async def test_another_owners_setup_is_refused_at_once_without_a_notice():
