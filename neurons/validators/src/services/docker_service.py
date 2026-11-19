@@ -11099,6 +11099,36 @@ class DockerService:
                     "LIUM_VOLUME_PATH": local_volume_path,
                 }
 
+                # DAH-3257: one SSH command reads every host listing the steps down to `docker run`
+                # need (containers, volumes, mounted volumes, GPU minor map, device nodes, power
+                # state, the image's encryption label). Each consumer takes the probe in place of
+                # its own listing command; every removal and write below still runs as before.
+                # None (the probe failed) leaves every consumer on its own commands. It runs before an edit
+                # parks the current container: a probe that stops the create (its channel may still hold the
+                # host's only session) then leaves that container running, with nothing to undo.
+                host_probe: PrerunHostProbe | None = None
+                current_step = "prerun_host_probe"
+                if early_host_probe is not None and image_present:
+                    host_probe, early_host_probe_step = await early_host_probe
+                    profilers.append(early_host_probe_step)
+                else:
+                    host_probe = await self.probe_prerun_host(
+                        ssh_client,
+                        docker_image=payload.docker_image,
+                        # A PEARL filler caps its GPUs with live nvidia-smi queries of its own
+                        # (apply_filler_gpu_power_limits) and never reads the probe's power state.
+                        with_power=probe_with_power,
+                        miner_hotkey=payload.miner_hotkey,
+                        log_extra=default_extra,
+                        with_label=probe_with_label,
+                    )
+                # The probe is a snapshot. Once a step below removes a container or a volume, the
+                # container/volume listings are stale (a removed volume would still read as present,
+                # a removed container as still mounting its volume), so the later sweeps go back to
+                # their own commands. The GPU, power and image-label sections are unaffected by a
+                # docker removal and stay in use.
+                docker_listing_probe: PrerunHostProbe | None = host_probe
+
                 container_name = self.get_container_name(payload)
                 created_local_volume = False
                 protected_volume_names = set(payload.active_volume_names or [])
@@ -11145,34 +11175,8 @@ class DockerService:
                         raise
                     if parked_name:
                         protected_container_names.append(parked_name)
-
-                # DAH-3257: one SSH command reads every host listing the steps down to `docker run`
-                # need (containers, volumes, mounted volumes, GPU minor map, device nodes, power
-                # state, the image's encryption label). Each consumer takes the probe in place of
-                # its own listing command; every removal and write below still runs as before.
-                # None (the probe failed) leaves every consumer on its own commands.
-                host_probe: PrerunHostProbe | None = None
-                current_step = "prerun_host_probe"
-                if early_host_probe is not None and image_present:
-                    host_probe, early_host_probe_step = await early_host_probe
-                    profilers.append(early_host_probe_step)
-                else:
-                    host_probe = await self.probe_prerun_host(
-                        ssh_client,
-                        docker_image=payload.docker_image,
-                        # A PEARL filler caps its GPUs with live nvidia-smi queries of its own
-                        # (apply_filler_gpu_power_limits) and never reads the probe's power state.
-                        with_power=probe_with_power,
-                        miner_hotkey=payload.miner_hotkey,
-                        log_extra=default_extra,
-                        with_label=probe_with_label,
-                    )
-                # The probe is a snapshot. Once a step below removes a container or a volume, the
-                # container/volume listings are stale (a removed volume would still read as present,
-                # a removed container as still mounting its volume), so the later sweeps go back to
-                # their own commands. The GPU, power and image-label sections are unaffected by a
-                # docker removal and stay in use.
-                docker_listing_probe: PrerunHostProbe | None = host_probe
+                    # the park, and the earlier edit's removals waited for above, changed the container listing
+                    docker_listing_probe = None
 
                 current_step = "container_cleanup"
                 # DAH-1524: the GC below (force-removing stale pod_/filler_
