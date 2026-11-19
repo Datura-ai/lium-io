@@ -113,7 +113,7 @@ async def test_unresolvable_name_is_refused(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "address", ["fec0::1", "64:ff9b::7f00:1", "100::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1", "ff0e::1"]
+    "address", ["fec0::1", "64:ff9b::7f00:1", "100::1", "::ffff:127.0.0.1", "::ffff:169.254.169.254", "ff0e::1"]
 )
 def test_addresses_python_calls_global_but_are_not_public(address):
     """lium-io#2369 review: Python 3.11-3.12 call some of these global (site-local, NAT64 of 127.0.0.1)."""
