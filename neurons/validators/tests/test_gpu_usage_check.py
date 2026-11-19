@@ -2211,3 +2211,15 @@ async def test_a_recovery_parked_name_is_ours_by_its_redis_mark_when_no_record_i
 
     assert result.passed is passed
     assert services.backend.get_pod_rental_active.await_count == (1 if passed else 0)
+
+
+@pytest.mark.asyncio
+async def test_a_repository_record_read_as_bytes_still_names_the_workload(context_factory, monkeypatch):
+    # the prod Redis client returns bytes, not str
+    monkeypatch.setattr(gpu_usage.settings, "FILLER_PROCESS_ALLOWLIST_ENFORCED", True)
+    ctx, filler = await _filler_process_ctx(context_factory, "/opt/other/gpu-app --run", b"daturaai/pearl-miner")
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["filler_foreign_processes"] == [f"{filler} (pid 4242): /opt/other/gpu-app --run"]

@@ -592,7 +592,9 @@ async def _foreign_processes_in_fillers(
         except Exception as exc:  # noqa: BLE001
             logger.warning("Filler image repository record unreadable, not judging %s: %s", name, exc)
             continue
-        if workload := FILLER_PROCESS_ALLOWLISTS.get(str(repository or "")):
+        if isinstance(repository, bytes):  # the prod Redis client returns bytes
+            repository = repository.decode()
+        if workload := FILLER_PROCESS_ALLOWLISTS.get(repository or ""):
             workloads[name] = workload
     foreign: list[tuple[str, str]] = []
     for process in gpu_processes:
