@@ -1733,6 +1733,18 @@ def test_rental_ssh_adapter_hands_paramiko_a_socket_to_the_pinned_address(tmp_pa
         listener.close()
 
 
+@pytest.mark.asyncio
+async def test_container_identity_is_id_and_start_time_and_none_once_the_container_is_gone():
+    api_client = Mock()
+    api_client.inspect_container = Mock(return_value={"Id": "cid", "State": {"StartedAt": "t1"}})
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.container_identity(container_name="pod_x") == "cid@t1"
+
+    api_client.inspect_container = Mock(side_effect=NotFound("gone"))
+    assert await client.container_identity(container_name="pod_x") is None
+
+
 def _run_key_append(spec, env=None) -> subprocess.CompletedProcess:
     return subprocess.run(list(spec.argv), input=spec.stdin, capture_output=True, text=True, env=env)
 
