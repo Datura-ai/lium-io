@@ -572,7 +572,7 @@ class GpuResetErrorCode(enum.Enum):
     ClockLockNotSupported = "ClockLockNotSupported"
     # 2.16.0: the host GPU listing failed, timed out or came back empty: the GPUs are gone from the host driver
     GpusLostOnHost = "GpusLostOnHost"
-    # 2.17.0: every GPU was reset and the pod's container did not start again
+    # 2.18.0: every GPU was reset and the pod's container did not start again
     ContainerNotRestarted = "ContainerNotRestarted"
 
 
@@ -596,8 +596,8 @@ class PodGpuResetResult(PodContainerResponse):
     container_restarted: bool = False
     gpus: list[GpuResetOutcome] = []
     detail: str | None = None
-    # 2.17.0: the reset sent `docker stop` to the pod's container. False: a refusal before the stop, the container
-    # was never touched and runs as before (container_restarted is then false too). None: a validator before 2.17.0
+    # 2.18.0: the reset sent `docker stop` to the pod's container. False: a refusal before the stop, the container
+    # was never touched and runs as before (container_restarted is then false too). None: a validator before 2.18.0
     pod_stopped: bool | None = None
 
 

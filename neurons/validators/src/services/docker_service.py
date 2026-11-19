@@ -14877,7 +14877,7 @@ class DockerService:
             # GpusLostOnHost is not on the wire yet: the backend drops the whole frame on an unknown error_code and the
             # renter's reset hangs until timeout; a separate task adds the wire code and removes this swap after
             # lium-platform accepts GpusLostOnHost
-            # ContainerNotRestarted likewise (lium_protocol 2.17.0): until the backend accepts it, the case goes with no
+            # ContainerNotRestarted likewise (lium_protocol 2.18.0): until the backend accepts it, the case goes with no
             # code, which lium-platform reads as container_not_restarted (DAH-6741)
             error_code=(
                 GpuResetErrorCode.ResetNotSupported
