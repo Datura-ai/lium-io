@@ -131,9 +131,8 @@ async def test_applies_the_drop_in_the_hosts_namespaces_without_any_image(contex
     assert result.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
     [helper] = _helper_calls(ssh)
     root = f"HOST_NS={shlex.quote(rental_egress_guard.HOST_NS)} " + helper_command(link_local_drop_script("br-0123456789ab", []), "0")
-    assert helper.startswith('if ! { [ "$(id -u)" = 0 ] && mkdir -p ') and helper.endswith(
-        f"; fi; {root.replace(' exec timeout ', ' timeout ', 1)}; RC=$?; [ $RC -eq 3 ] || exit $RC; "
-        f"exec {rental_egress_guard.NON_ROOT_HELPER} /bin/sh -c {shlex.quote(root)}"
+    assert helper.startswith('if ! { [ "$(id -u)" = 0 ] && { [ "$(readlink /proc/1/ns/mnt)" ') and helper.endswith(
+        f"; fi; {root}"
     )
     assert "then exec /usr/bin/docker run --rm --privileged --pid=host " in helper
     # no container on a root executor: a registry refusing an anonymous pull (Docker Hub's rate limit) never matters
@@ -1104,3 +1103,52 @@ def test_an_old_releases_docker0_jump_is_detached(tmp_path, monkeypatch, script)
     assert "LIUM-RENTAL-EGRESS-A" not in (state / "DOCKER-USER").read_text()
     assert (state / "LIUM-RENTAL-EGRESS-A").read_text() == "-i docker0 -j DROP\n"
     assert "old jump" not in done.stdout
+
+
+def test_a_failed_generation_write_changes_no_rule_and_fails(tmp_path, monkeypatch):
+    """F-8: a pre-start whose generation cannot be recorded (a full /run) must not apply rules an older inventory could
+    later replace: it changes nothing and fails, so the pod is not started on an unrecorded rule set."""
+    _bin, state, env = _host(tmp_path, monkeypatch)
+    (tmp_path / "lock").mkdir()
+    (tmp_path / "lock" / "generation.tmp").mkdir()  # the atomic write cannot happen
+    before = (state / "DOCKER-USER").read_text()
+
+    done = subprocess.run(
+        ["sh", "-c", locked_script(link_local_drop_script("br-bbbbbbbbbbbb", []), "0")], env=env, capture_output=True, text=True
+    )
+
+    assert done.returncode == 4 and "rule generation not recorded" in done.stderr
+    assert (state / "DOCKER-USER").read_text() == before
+    # an older periodic run still reads generation 0 and may apply: nothing of the refused run's existed to erase
+    assert not (tmp_path / "lock" / "generation").exists()
+
+
+def test_a_root_executor_with_its_own_pid1_reads_and_writes_the_generation_through_the_helper(tmp_path, monkeypatch):
+    """F-16: a root executor in a container without the host's PIDs passes every tool and directory check, and with the
+    host network even reaches DOCKER-USER. Its PID 1 shares its mount namespace, so every call (the generation read and
+    the apply) takes the helper and the host's one generation; a second guard applies, never stale."""
+    bin_dir, state, env = _host(tmp_path, monkeypatch)
+    (bin_dir / "id").write_text('#!/bin/sh\n[ "$1" = -u ] && echo 0 || echo root\n')
+    (bin_dir / "readlink").write_text("#!/bin/sh\necho 'mnt:[4026531841]'\n")  # PID 1 in the executor's own namespace
+    (bin_dir / "nsenter").write_text(_HOST_NSENTER_STUB)
+    (bin_dir / "docker").write_text(
+        '#!/bin/sh\necho run >> "$STATE/docker_run"\n'
+        'while [ "$1" != "docker.io/library/alpine:3.19" ]; do shift; done; shift\nexec "$@"\n'
+    )
+    for f in bin_dir.iterdir():
+        f.chmod(0o755)
+    mark = tmp_path / "dockerenv"
+    mark.touch()
+    monkeypatch.setattr(rental_egress_guard, "CONTAINER_MARK", str(mark))
+
+    def run(script, generation=None):
+        command = rental_egress_guard._helper(script, generation).replace("/usr/bin/docker", str(bin_dir / "docker"))
+        return subprocess.run(["sh", "-c", command], env=env, capture_output=True, text=True)
+
+    read = f"cat {shlex.quote(rental_egress_guard.HOST_GENERATION)} 2>/dev/null; :"
+    for expected in ("0", "1"):
+        generation = run(read).stdout.strip() or "0"
+        assert generation == expected
+        done = run(link_local_drop_script("br-0123456789ab", []), generation)
+        assert done.returncode == 0, done.stderr
+    assert (state / "docker_run").read_text().split() == ["run"] * 4

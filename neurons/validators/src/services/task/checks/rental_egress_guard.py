@@ -262,13 +262,16 @@ def locked_script(script: str, generation: str | None = None) -> str:
     )
     if generation is None:
         return locked + script
-    gen = shlex.quote(HOST_GENERATION)
+    gen, tmp = shlex.quote(HOST_GENERATION), shlex.quote(f"{HOST_GENERATION}.tmp")
     return locked + (
         f"G=$(cat {gen} 2>/dev/null); "
         f'[ "${{G:-0}}" = {shlex.quote(generation)} ] || '
         f"{{ echo 'host rules changed since this inventory' >&2; exit {STALE_INVENTORY_EXIT}; }}; "
-        # 3 changed nothing (no iptables reached): the helper retries on the same inventory
-        f"( {script} ); RC=$?; [ $RC -eq 3 ] || echo $((${{G:-0}} + 1)) > {gen}; exit $RC"
+        # bumped before any rule changes, atomically: a run that cannot record it (a full /run) changes nothing and
+        # fails, so an older inventory can never pass the check above after newer rules went in
+        f"echo $((${{G:-0}} + 1)) > {tmp} && mv -f {tmp} {gen} || "
+        f"{{ echo 'rule generation not recorded' >&2; exit 4; }}; "
+        f"( {script} )"
     )
 
 
@@ -283,19 +286,25 @@ def _helper(script: str, generation: str | None = None) -> str:
     # binary dockerd itself needs there
     inner = f"HOST_NS={shlex.quote(HOST_NS)} {helper_command(script, generation)}"
     in_helper = f"exec {NON_ROOT_HELPER} /bin/sh -c {shlex.quote(inner)}"
-    # the lock directory in the host's /run through PID 1: a PID 1 that is the executor's own (no ``pid: host``) and
-    # read-only fails it; one that is writable is caught by its iptables answer (3: none reached) and goes to the helper
+    # the lock directory in the host's /run through PID 1
     lock_dir = shlex.quote(HOST_LOCK.rsplit("/", 1)[0])
     tools = " && ".join(f"command -v {tool} >/dev/null" for tool in ("nsenter", "flock", "timeout"))
-    direct = f'[ "$(id -u)" = 0 ] && mkdir -p {lock_dir} 2>/dev/null && {tools}'
-    run_direct = inner.replace(" exec timeout ", " timeout ", 1)
-    return f"if ! {{ {direct}; }}; then {in_helper}; fi; {run_direct}; RC=$?; [ $RC -eq 3 ] || exit $RC; {in_helper}"
+    # PID 1 must be the host's: in another mount namespace than the executor (``pid: host``), or no container at all. A
+    # private PID 1 would give this route its own lock and rule generation, never the host's (DAH-6737)
+    host_pid1 = f'{{ [ "$(readlink /proc/1/ns/mnt)" != "$(readlink /proc/self/ns/mnt)" ] || [ ! -e {CONTAINER_MARK} ]; }}'
+    # and the host's DOCKER-USER must answer from here: the route is chosen once, before any read or change, so the
+    # rule generation is always read and bumped where the rules are written (DAH-6737)
+    reach = f"{{ HOST_NS={shlex.quote(HOST_NS)}; {_BACKEND_PROBE}; [ -n \"$IPT\" ]; }}"
+    direct = f'[ "$(id -u)" = 0 ] && {host_pid1} && mkdir -p {lock_dir} 2>/dev/null && {tools} && {reach}'
+    return f"if ! {{ {direct}; }}; then {in_helper}; fi; {inner}"
 
 
 # An executor that cannot run the script on the host itself (another user than root, a PID 1 that is not the host's,
 # or an image without nsenter, flock or timeout) still reaches dockerd, which runs as root: the same script runs in the
 # alpine helper the validator already uses on every node, privileged with the host's PIDs, so it reaches the same host
 # lock and the host's own iptables through PID 1 (DAH-6737). busybox there has sh, flock, timeout and nsenter.
+# Docker's mark in every container's root: an executor without it runs on the host itself, so its PID 1 is the host's
+CONTAINER_MARK = "/.dockerenv"
 NON_ROOT_HELPER = f"/usr/bin/docker run --rm --privileged --pid=host --network host {ALPINE_HELPER_IMAGE}"
 
 
