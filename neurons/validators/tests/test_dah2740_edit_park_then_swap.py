@@ -989,8 +989,9 @@ async def test_the_undo_repairs_a_stale_vloopback_mountpoint_left_by_park_and_st
 
 
 @pytest.mark.asyncio
-async def test_the_undo_puts_a_pod_whose_ssh_bootstrap_failed_back_down_and_fails(svc):
-    # DAH-6737 review: a pod brought back without its SSH is no restored pod, neither left up nor counted as running
+async def test_the_undo_leaves_a_pod_whose_ssh_bootstrap_failed_running(svc):
+    # review on lium-io#2352: a failed bootstrap copy does not prove the original unreachable (its workload or its own
+    # sshd may serve), so the undo logs it and leaves the pod up; billing follows Docker's state, not this step
     docker_client = Mock()
     docker_client.start = AsyncMock()
     docker_client.inspect_container_state = AsyncMock(return_value=Mock(running=False, restarting=False))
@@ -998,18 +999,18 @@ async def test_the_undo_puts_a_pod_whose_ssh_bootstrap_failed_back_down_and_fail
     svc._stop_after_failed_start = AsyncMock()
     svc._restore_mount_and_sshd_after_start = AsyncMock(return_value=False)
 
-    with pytest.raises(RuntimeError, match="SSH bootstrap"):
-        await svc._bring_up_existing_container(
-            executor_info=Mock(uuid="exec-1"),
-            private_key="private-key",
-            docker_client=docker_client,
-            ssh_client=Mock(),
-            container_name="pod_abc",
-            local_volume_path="/root",
-            pod_id="abc",
-            default_extra={},
-        )
-    svc._stop_after_failed_start.assert_awaited_once()
+    await svc._bring_up_existing_container(
+        executor_info=Mock(uuid="exec-1"),
+        private_key="private-key",
+        docker_client=docker_client,
+        ssh_client=Mock(),
+        container_name="pod_abc",
+        local_volume_path="/root",
+        pod_id="abc",
+        default_extra={},
+    )
+    docker_client.start.assert_awaited_once()
+    svc._stop_after_failed_start.assert_not_awaited()
 
 
 @pytest.mark.asyncio

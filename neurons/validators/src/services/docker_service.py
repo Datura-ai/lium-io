@@ -13561,9 +13561,9 @@ class DockerService:
                     ):
                         raise
                     await _start()
-                # a pod the renter cannot reach is no restored pod: put back down below, so it is neither left
-                # up unreachable nor billed (DAH-6737)
-                if not await self._restore_mount_and_sshd_after_start(
+                # a failed SSH bootstrap is logged, not undone: the original may still serve its workload or its own
+                # sshd, and billing follows what Docker reports for the pod (_observed_pod_state), not this step
+                await self._restore_mount_and_sshd_after_start(
                     docker_client=docker_client,
                     ssh_client=ssh_client,
                     container_name=container_id,
@@ -13572,8 +13572,7 @@ class DockerService:
                     default_extra=default_extra,
                     remount=remount,
                     record_start=stopped_before,
-                ):
-                    raise RuntimeError("started, but its SSH bootstrap did not complete")
+                )
             except (asyncio.CancelledError, Exception):
                 # a start that lands after the cancel would leave the pod up without its remount: drained and put
                 # back down before the lock is released, like start_existing_container
@@ -13604,13 +13603,13 @@ class DockerService:
         default_extra: dict[str, Any],
         remount: bool = True,
         record_start: bool = False,
-    ) -> bool:
+    ) -> None:
         """What a bare ``docker start`` drops: the gocryptfs plaintext mount (remounted with
         ``allow_init=False`` — an existing volume is never re-initialised) and the sshd. Shared by
         ``start_existing_container`` and the undo of a failed edit. ``remount=False`` (a kept container that
         ran unmounted, its files in its own layer) skips the remount, which would hide them. ``record_start``: the
         caller saw the container stopped before its own start, so this start is the validator's (a no-op start of a
-        running container, or a remount alone, records nothing). True when the SSH bootstrap completed."""
+        running container, or a remount alone, records nothing)."""
         encrypted_volume_name = remount and await self._encrypted_local_volume_name(
             docker_client,
             container_name,
@@ -13666,7 +13665,6 @@ class DockerService:
                 ),
             ),
         )
-        return ssh_bootstrap_ok
 
     async def recover_pod_after_stale_vloopback_mount(
         self,
