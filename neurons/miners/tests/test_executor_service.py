@@ -150,6 +150,20 @@ async def test_send_pubkey_to_executor_relays_the_miner_bound_signature(executor
         assert "miner_hotkey" not in sent and "validator_miner_signature" not in sent
 
 
+@pytest.mark.asyncio
+async def test_send_pubkey_to_executor_relays_the_owner_hotkey_signatures(executor_service, test_executor):
+    """DAH-6740: the validator's per-owner-hotkey signatures reach the executor verbatim; absent when not sent."""
+    mock_session = _make_mock_session()
+    with patch("services.executor_service.aiohttp.ClientSession", return_value=mock_session):
+        await executor_service.send_pubkey_to_executor(
+            test_executor, _SSH_KEY, "0xaa", owner_hotkey_signatures={"5Old": "0xcc"}
+        )
+        assert mock_session.post.call_args.kwargs["json"]["owner_hotkey_signatures"] == {"5Old": "0xcc"}
+
+        await executor_service.send_pubkey_to_executor(test_executor, _SSH_KEY, "0xaa")
+        assert "owner_hotkey_signatures" not in mock_session.post.call_args.kwargs["json"]
+
+
 @pytest.mark.parametrize(
     "status, body_error, expected_posts, accepted",
     [

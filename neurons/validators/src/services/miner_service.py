@@ -294,6 +294,18 @@ def _ssh_key_not_accepted_text(executors: list[ExecutorSSHInfo], default_extra: 
 
 JOB_LENGTH = 30
 
+# DAH-6740: per listing hotkey, the other hotkeys of its owner's accounts the miner reported in the last cycle
+# (ExecutorSSHInfo.expected_node_hotkeys). Module-level: the cycle's and the rental path's MinerService share it.
+# shortcut: empty after a validator restart until each miner's first cycle; read the portal snapshot if that matters.
+_owner_hotkeys: dict[str, frozenset[str]] = {}
+# bounds the signing a miner's list can ask of the validator per upload; an owner has a few accounts, not dozens
+MAX_OWNER_HOTKEYS = 16
+
+
+def remember_owner_hotkeys(miner_hotkey: str, executors) -> None:
+    hotkeys = {h for executor in executors for h in (executor.expected_node_hotkeys or ())} - {miner_hotkey}
+    _owner_hotkeys[miner_hotkey] = frozenset(hotkeys) if len(hotkeys) <= MAX_OWNER_HOTKEYS else frozenset()
+
 # HTTP timeout constants for REST API calls
 REST_SSH_SUBMIT_TIMEOUT = 30  # Timeout for SSH key submission requests
 REST_EXECUTOR_LIST_TIMEOUT = 5  # the miner's POST /executors is a DB read
@@ -686,6 +698,15 @@ class MinerService:
         """
         pubkey = self._normalize_public_key(public_key)
         return f"0x{keypair.sign(ssh_pubkey_signing_blob(pubkey, nonce, miner_hotkey)).hex()}"
+
+    def _owner_hotkey_signatures(
+        self, keypair: bittensor.Keypair, public_key: bytes | str, nonce: str | None, miner_hotkey: str
+    ) -> dict[str, str] | None:
+        """DAH-6740: the miner-bound signature for each other hotkey of the listing owner, None when there is none."""
+        hotkeys = _owner_hotkeys.get(miner_hotkey)
+        if not hotkeys:
+            return None
+        return {h: self._sign_validator_pubkey(keypair, public_key, nonce=nonce, miner_hotkey=h) for h in sorted(hotkeys)}
 
     @for_payload_miner
     async def request_job_to_miner(
@@ -2271,6 +2292,9 @@ class MinerService:
                 validator_miner_signature=self._sign_validator_pubkey(
                     my_key, public_key, nonce=nonce_hex, miner_hotkey=payload.miner_hotkey
                 ),
+                owner_hotkey_signatures=self._owner_hotkey_signatures(
+                    my_key, public_key, nonce_hex, payload.miner_hotkey
+                ),
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=executor_id,
                 nonce=nonce_hex,
@@ -2306,6 +2330,8 @@ class MinerService:
             
             if isinstance(msg, AcceptSSHKeyRequest):
                 ssh_key_accepted = True
+                # only the cycle's answer lists every node of the listing; a rental's lists one
+                remember_owner_hotkeys(payload.miner_hotkey, msg.executors)
                 logger.info(
                     _m(
                         "Received AcceptSSHKeyRequest for miner via REST API. Running tasks for executors",
@@ -2542,6 +2568,9 @@ class MinerService:
                 validator_signature=self._sign_validator_pubkey(my_key, public_key, nonce=upload_nonce),
                 validator_miner_signature=self._sign_validator_pubkey(
                     my_key, public_key, nonce=upload_nonce, miner_hotkey=payload.miner_hotkey
+                ),
+                owner_hotkey_signatures=self._owner_hotkey_signatures(
+                    my_key, public_key, upload_nonce, payload.miner_hotkey
                 ),
                 executor_id=payload.executor_id,
                 is_rental_request=isinstance(payload, ContainerCreateRequest),
@@ -2953,6 +2982,9 @@ class MinerService:
                 validator_signature=self._sign_validator_pubkey(my_key, payload.public_key, nonce=upload_nonce),
                 validator_miner_signature=self._sign_validator_pubkey(
                     my_key, payload.public_key, nonce=upload_nonce, miner_hotkey=payload.miner_hotkey
+                ),
+                owner_hotkey_signatures=self._owner_hotkey_signatures(
+                    my_key, payload.public_key, upload_nonce, payload.miner_hotkey
                 ),
                 executor_id=payload.executor_id,
                 is_rental_request=False,

@@ -144,3 +144,33 @@ async def test_the_nonce_create_task_gets_equals_the_nonce_sent(rest_miner_servi
     [task_call] = rest_miner_service.task_service.create_task.await_args_list
     expected = task_call.kwargs["attestation_nonce"].value_hex
     assert submitted["nonce"] == (expected if axon_version >= MIN_DATED_NONCE_MINER_AXON_VERSION else None)
+
+
+# --- DAH-6740: the key is also signed for each other hotkey of the listing owner ----------------------------------
+
+
+def test_owner_hotkeys_from_the_last_cycle_are_each_signed(miner_service, validator_keypair, monkeypatch):
+    from datura.requests.validator_requests import ssh_pubkey_signing_blob
+
+    from services import miner_service as module
+
+    monkeypatch.setattr(module, "_owner_hotkeys", {})
+    nonce = "ab" * 32
+    assert miner_service._owner_hotkey_signatures(validator_keypair, _SSH_KEY, nonce, "listing") is None
+
+    nodes = [SimpleNamespace(expected_node_hotkeys=["listing", "5Old"]), SimpleNamespace(expected_node_hotkeys=None)]
+    module.remember_owner_hotkeys("listing", nodes)
+    signatures = miner_service._owner_hotkey_signatures(validator_keypair, _SSH_KEY, nonce, "listing")
+
+    assert list(signatures) == ["5Old"]
+    assert validator_keypair.verify(ssh_pubkey_signing_blob(_SSH_KEY, nonce, "5Old"), signatures["5Old"])
+
+
+def test_an_oversized_owner_list_signs_nothing(miner_service, validator_keypair, monkeypatch):
+    from services import miner_service as module
+
+    monkeypatch.setattr(module, "_owner_hotkeys", {})
+    many = [f"5Key{i}" for i in range(module.MAX_OWNER_HOTKEYS + 1)]
+    module.remember_owner_hotkeys("listing", [SimpleNamespace(expected_node_hotkeys=many)])
+
+    assert miner_service._owner_hotkey_signatures(validator_keypair, _SSH_KEY, None, "listing") is None

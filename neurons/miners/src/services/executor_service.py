@@ -377,6 +377,7 @@ class ExecutorService:
         nonce: str | None = None,
         miner_hotkey: str | None = None,
         validator_miner_signature: str | None = None,
+        owner_hotkey_signatures: dict[str, str] | None = None,
         deadline: float | None = None,
     ) -> ExecutorSSHInfo | None:
         """TODO: Send API request to executor with pubkey
@@ -408,6 +409,9 @@ class ExecutorService:
             # relayed verbatim: the executor checks the validator signed this key for its own miner
             payload["miner_hotkey"] = miner_hotkey
             payload["validator_miner_signature"] = validator_miner_signature
+        if owner_hotkey_signatures:
+            # DAH-6740: relayed verbatim; the executor takes the one for its own hotkey, if the validator signed it
+            payload["owner_hotkey_signatures"] = owner_hotkey_signatures
         
         base_log_extra = {
             "executor_id": str(executor.uuid),
@@ -544,6 +548,7 @@ class ExecutorService:
         executor_id: Optional[str] = None,
         nonce: str | None = None,
         validator_miner_signature: str | None = None,
+        owner_hotkey_signatures: dict[str, str] | None = None,
         is_rental_request: bool = False,
         requested_at: float | None = None,
     ) -> PubkeyRegistration:
@@ -579,7 +584,7 @@ class ExecutorService:
                 self.send_pubkey_to_executor(
                     executor, pubkey.decode("utf-8"), validator_signature, nonce=nonce,
                     miner_hotkey=miner_hotkey, validator_miner_signature=validator_miner_signature,
-                    deadline=deadline,
+                    owner_hotkey_signatures=owner_hotkey_signatures, deadline=deadline,
                 ),
                 name=f"{executor}.send_pubkey_to_executor",
             )

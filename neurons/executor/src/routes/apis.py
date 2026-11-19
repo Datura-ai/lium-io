@@ -284,6 +284,23 @@ def _accepted_miner_hotkeys() -> set[str]:
     )
 
 
+def _owner_set_signed(payload: UploadSShKeyPayload, own_hotkey: str) -> bool:
+    """DAH-6740: the validator also signed this key for this node's own hotkey as one of the listing owner's.
+
+    Only the own hotkey counts here: the pool hotkey is accepted by every pool node, so signing it for an own-key
+    listing would bind the key to nothing. The validator signs only hotkeys the listing's miner reported for its own
+    nodes, and an upload needs this node's own or the central miner's auth (MinerMiddleware).
+    """
+    signature = (payload.owner_hotkey_signatures or {}).get(own_hotkey)
+    if not own_hotkey or not signature:
+        return False
+    try:
+        blob = ssh_pubkey_signing_blob(payload.public_key, payload.nonce, own_hotkey)
+        return match_validator_hotkey(blob, signature) is not None
+    except Exception:
+        return False
+
+
 def _check_miner_binding(payload: UploadSShKeyPayload) -> None:
     """Check the validator issued this key for this executor's own miner hotkey or the pool's.
 
@@ -305,6 +322,8 @@ def _check_miner_binding(payload: UploadSShKeyPayload) -> None:
             miner_binding = "mismatch"
         else:
             return
+    if _owner_set_signed(payload, own_hotkey):
+        return
     enforced = settings.REQUIRE_MINER_BOUND_SSH_KEY
     logger.warning(
         _m(
