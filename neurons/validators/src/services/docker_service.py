@@ -582,6 +582,12 @@ _DOCKER_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 # below it the renter is short-changed, so the create fails and the backend's rent retry moves the pod to another node
 RENTAL_VOLUME_MIN_SHARE_OF_ORDER = 0.95
 RENTAL_DISK_SHORT_STEP = "rental_disk_short"
+# The fail-closed host reads, named apart from the old `host_pid_max`/`host_ram_kib`/`host_gpu_count` steps: those also
+# failed when an early probe held a one-session sshd, so the backend counts only these as the node's own miss
+# (review on lium-platform#3256).
+HOST_READ_PID_MAX_STEP = "host_read_pid_max"
+HOST_READ_RAM_KIB_STEP = "host_read_ram_kib"
+HOST_READ_GPU_COUNT_STEP = "host_read_gpu_count"
 # DAH-5260: `docker volume rm` of the 1561 GB kimi-k3 cache unlinks ~1.5 TB; ext4 frees ~180 GB/s of
 # extents (22 GB in 0.12 s measured), so ~10 s. The bound only stops a wedged dockerd holding the create.
 CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS = 600
@@ -10686,7 +10692,7 @@ class DockerService:
                 assert host_limits_read is not None  # started as soon as the SSH session was up
                 host_pid_max, host_ram_kib, read_host_gpu_count = await host_limits_read
                 if settings.RENTAL_PIDS_LIMIT_PER_CPU > 0:
-                    current_step = "host_pid_max"
+                    current_step = HOST_READ_PID_MAX_STEP
                     if host_pid_max is None:
                         raise RuntimeError(
                             "host kernel.pid_max could not be read; refusing to start a rental without a safe pids limit"
@@ -10704,7 +10710,7 @@ class DockerService:
                 # rental sent without a memory limit", not "legacy" — a miss refuses: under host
                 # contention, the exact condition that delays this SSH probe, an unlimited rental lets
                 # the renter exhaust host RAM and OOM the executor/sshd.
-                current_step = "host_ram_kib"
+                current_step = HOST_READ_RAM_KIB_STEP
                 rental_gpu_share = 1.0
                 if not payload.memory_gb and host_ram_kib is None:
                     raise RuntimeError(
@@ -10716,7 +10722,7 @@ class DockerService:
                 # rentals keep share 1.0. A miss refuses a limitless rental; a sent limit keeps the
                 # host-wide clamp.
                 if host_ram_kib is not None and payload.gpu_uuids:
-                    current_step = "host_gpu_count"
+                    current_step = HOST_READ_GPU_COUNT_STEP
                     host_gpu_count = read_host_gpu_count
                     if host_gpu_count and len(payload.gpu_uuids) <= host_gpu_count:
                         rental_gpu_share = len(payload.gpu_uuids) / host_gpu_count

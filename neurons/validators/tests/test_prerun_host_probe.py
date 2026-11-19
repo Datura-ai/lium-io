@@ -1109,3 +1109,16 @@ async def test_a_one_session_host_answers_the_host_reads_beside_the_early_probes
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
     assert svc._read_host_gpu_count.await_count == (1 if gpu_uuids else 0)
+
+
+@pytest.mark.asyncio
+async def test_a_host_read_miss_fails_at_its_own_step(svc_fixture, monkeypatch):
+    """Review on lium-platform#3256: the backend counts a host read miss as the node's only under the step name this
+    validator uses once the reads no longer share the session with the early probes."""
+    svc = svc_fixture
+    _wire_early_probes(svc, monkeypatch, image_present=True)
+    monkeypatch.setattr(svc, "_read_host_pid_max", AsyncMock(return_value=None))
+
+    result = await _run_create_container(svc, _deploy_payload())
+
+    assert result.failure_step == ds_module.HOST_READ_PID_MAX_STEP == "host_read_pid_max"
