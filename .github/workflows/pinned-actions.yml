@@ -1,6 +1,6 @@
 name: Pinned actions
 
-# no path filter: a local action can live anywhere in the repo, and a required check must report on every PR
+# no path filter: an action manifest can live anywhere in the repo, and a required check must report on every PR
 on:
   pull_request:
     # edited: a retarget to main (a stacked PR) with no new push still gets this required check on the new merge ref
@@ -78,15 +78,6 @@ jobs:
                   runs = doc.get("runs") or {}
                   steps = [step for job in jobs for step in job.get("steps") or []] + list(runs.get("steps") or [])
                   refs = [("job", job.get("uses")) for job in jobs] + [("step", step.get("uses")) for step in steps if isinstance(step, dict)]
-                  # a ./ action after a checkout of another ref or repository comes from code this scan never read
-                  for seq in [job.get("steps") or [] for job in jobs] + [runs.get("steps") or []]:
-                      moved = False
-                      for step in (s for s in seq if isinstance(s, dict)):
-                          uses = str(step.get("uses") or "")
-                          if moved and uses.startswith("./"):
-                              bad.append(f"{where}: {uses} runs after a checkout with ref or repository, which this check did not scan")
-                          if re.match(r"actions/checkout@", uses, re.I) and {"ref", "repository"} & set(step.get("with") or {}):
-                              moved = True
                   for level, ref in refs:
                       if ref is None:
                           continue
@@ -99,16 +90,10 @@ jobs:
                                   bad.append(f"{where}: {ref} is not a workflow at that commit")
                               else:
                                   queue.append((repo, p, at, depth))
-                          elif repo is not None:
-                              # inside a pinned action or workflow, ./ is the caller's workspace, not that commit
-                              bad.append(f"{where}: {ref}: a workspace action cannot be inspected")
                           else:
-                              # this commit's checkout, scanned here as it is tracked (the runner prefers action.yml)
-                              m = next((m for m in (f"{p}/action.yml", f"{p}/action.yaml") if fetch(None, m, None) is not None), None)
-                              if m:
-                                  queue.append((None, m, None, depth))
-                              else:
-                                  bad.append(f"{where}: {ref} has no tracked action manifest")
+                              # the runner resolves a step's ./ in the job's workspace at run time, which any earlier step
+                              # can change, so no commit is inspected here: call the action as owner/repo/path@sha instead
+                              bad.append(f"{where}: {ref}: a step-level ./ action is not accepted, use owner/repo/path@sha")
                           continue
                       if norm(ref).startswith("docker://"):
                           if not re.fullmatch(digest, norm(ref)):
@@ -168,13 +153,11 @@ jobs:
               "jobs:\n  yes:\n    steps:\n      - uses: acme/act@v1\n  on:\n    steps:\n      - uses: acme/act@" + sha + "\n": 1,
               "jobs:\n  a:\n    steps:\n      - uses: acme/act@v1\n  a:\n    steps:\n      - uses: acme/act@" + sha + "\n": 1,
               "jobs:\n  yes:\n    steps:\n      - uses: acme/act@" + sha + "\n  on:\n    steps:\n      - uses: acme/act@" + sha + "\n": 0,
-              # this commit's ./ actions and workflows must be tracked here, and are scanned as tracked
-              "jobs:\n  a:\n    steps:\n      - uses: ./gen/act\n      - uses: ./.github/actions/ok/\n      - uses: ./.github/actions/ok@main\n      - uses: ./.github/actions/yaml\n  b:\n    uses: ./.github/workflows/ok.yml\n  c:\n    uses: ./.github/workflows/gen.yml\n": 3,
+              # a step-level ./ action always fails (here and in a pinned composite); a same-commit reusable workflow must be tracked
+              "jobs:\n  a:\n    steps:\n      - uses: ./.github/actions/ok\n      - uses: ./.github/actions/ok/\n  b:\n    uses: ./.github/workflows/ok.yml\n  c:\n    uses: ./.github/workflows/gen.yml\n": 3,
+              comp + "    - uses: actions/checkout@" + sha + "\n      with:\n        ref: main\n    - uses: ./tools/release\n": 1,
+              "jobs:\n  b:\n    uses: ./.github/workflows/ok.yml\n": 0,
               step("acme/act@" + sha): 0,
-              # a ./ action after checking out another ref or repository fails; before it, or with a plain checkout, it passes
-              "jobs:\n  a:\n    steps:\n      - uses: actions/checkout@" + sha + "\n        with:\n          ref: main\n      - uses: ./.github/actions/ok\n": 1,
-              "jobs:\n  a:\n    steps:\n      - uses: actions/checkout@" + sha + "\n        with:\n          repository: acme/other\n      - uses: ./.github/actions/ok\n": 1,
-              "jobs:\n  a:\n    steps:\n      - uses: ./.github/actions/ok\n      - uses: actions/checkout@" + sha + "\n        with:\n          ref: main\n  b:\n    steps:\n      - uses: actions/checkout@" + sha + "\n        with:\n          fetch-depth: 0\n      - uses: ./.github/actions/ok\n": 0,
               step("acme/act@" + s2): 1,  # its own step uses a tag, whoever owns the action
               step("vendor/comp/sub@" + sha): 1,  # two levels down
               step("vendor/comp/ws@" + sha): 1,  # a workspace action inside a pinned one

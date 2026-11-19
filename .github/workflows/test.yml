@@ -57,8 +57,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - id: pkgs
-        # the checkout above is this run's commit, where pinned-actions scans this manifest
-        uses: ./.github/actions/changed-packages
+        # pinned to a commit, not ./ (pinned-actions rejects step-level ./); re-pin to main once this action merges there
+        uses: Datura-ai/lium-io/.github/actions/changed-packages@1d722f2b22ca131e8439982b29ea1f1f1b8a1add
 
   ruff-check:
     # DAH-2972: gate the rule families that are at zero after the dead-code sweep (DAH-2971) so
