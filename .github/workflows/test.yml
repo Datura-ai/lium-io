@@ -257,12 +257,12 @@ jobs:
   e2e:
     # e2e-gate is the one required check, so the job never skips: a skipped job does not evaluate its
     # name expression and reports under the raw expression text, and a static-name skip would report the
-    # required check as passing (DAH-6742). A review that cannot route (a comment, a request for changes,
-    # an outside approval) is not a gating run and reports under another name, so it cannot overwrite the
-    # gate. A PR reports the gate deferred when the queue is active, or runs it on approval; the
-    # merge-group run executes the gate for the queued tree, and is green only when the gate ran (or no
-    # package changed), never when route failed.
-    name: ${{ needs.route.result == 'skipped' && 'e2e-gate (not a gating review)' || 'e2e-gate' }}
+    # required check as passing (DAH-6742). A review that is not a gating run (a comment, a request for
+    # changes, an outside approval, or an approval that route does not count) reports under another name,
+    # so it cannot overwrite the gate. A PR reports the gate deferred when the queue is active, or runs
+    # it on approval; the merge-group run executes the gate for the queued tree, and is green only when
+    # the gate ran (or no package changed), never when route failed.
+    name: ${{ (needs.route.result == 'skipped' || (github.event_name == 'pull_request_review' && needs.route.result == 'success' && needs.route.outputs.approved != 'true')) && 'e2e-gate (not a gating review)' || 'e2e-gate' }}
     # e2e-gate is the one required check, so it also fails when route, ruff-check or a package test job failed:
     # a red unit test cannot merge on a green e2e
     needs: [route, validators, executor, miners, ruff-check, protocol]
