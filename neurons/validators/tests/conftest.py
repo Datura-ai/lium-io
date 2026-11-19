@@ -144,7 +144,7 @@ def first_owner_hotkeys_read_already_done():
     from clients import validator_portal_api
 
     with patch.object(validator_portal_api, "_owner_hotkeys_read_once", True), patch.object(
-        validator_portal_api, "_first_owner_read", None
+        validator_portal_api, "_owner_read", None
     ):
         yield
 

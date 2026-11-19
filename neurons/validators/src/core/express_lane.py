@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 import bittensor
-from clients.validator_portal_api import PortalExecutor, ValidatorPortalAPI
+from clients.validator_portal_api import PortalExecutor, ValidatorPortalAPI, start_owner_hotkeys_read
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.executor_image_policy import ExpectedImageSnapshot
@@ -211,7 +211,7 @@ class ExpressLane:
         self._self_hosted_misses: Counter[str] = Counter()  # miner hotkey -> misses in a row
         self._next_self_hosted_listing = 0.0  # monotonic
         self._listing: asyncio.Task | None = None
-        self._owner_refresh: asyncio.Task | None = None  # DAH-6740
+        self._owner_refresh: asyncio.Future | None = None  # DAH-6740
         # DAH-5716: runs started per queued recheck request.
         # shortcut: in memory, so a restart restarts the budget; the request's TTL still bounds it.
         self._recheck_runs: Counter[str] = Counter()
@@ -259,7 +259,7 @@ class ExpressLane:
         # DAH-6740: every upload this validator signs reads the owner map, so it refreshes even when no wave runs; in the
         # background, so a slow portal never holds discovery
         if self._owner_refresh is None or self._owner_refresh.done():
-            self._owner_refresh = asyncio.create_task(self.portal_api.refresh_owner_hotkeys())
+            self._owner_refresh = start_owner_hotkeys_read()  # the same read the upload gate waits on
         inputs = self.cycle_inputs()
         if inputs is None:
             return 0

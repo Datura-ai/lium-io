@@ -20,7 +20,7 @@ from uuid import uuid4
 import bittensor
 import pytest
 import services.file_encrypt_service as file_encrypt_service
-from clients.validator_portal_api import PortalExecutor, portal_miner_auth_blob
+from clients.validator_portal_api import PortalExecutor, ValidatorPortalAPI, portal_miner_auth_blob
 from core.express_lane import (
     EXPRESS_FAILED_EVENT,
     EXPRESS_PUBLISHED_EVENT,
@@ -258,9 +258,9 @@ class _Harness:
             "miner_coldkey": payload.miner_coldkey,
             "results": [_job_result(executor_id, job_batch_id=payload.job_batch_id)],
         }
-        self.portal_api = Mock(
-            get_all_executors=AsyncMock(return_value=snapshot), refresh_owner_hotkeys=AsyncMock(return_value=True)
-        )
+        self.portal_api = Mock(get_all_executors=AsyncMock(return_value=snapshot))
+        # the tick starts the module's one shared owner read (start_owner_hotkeys_read), which calls this
+        monkeypatch.setattr(ValidatorPortalAPI, "refresh_owner_hotkeys", AsyncMock(return_value=True))
         self.inputs: CycleInputs | None = _cycle_inputs()
         self.lane = ExpressLane(
             miner_service=self.miner_service,
@@ -291,13 +291,15 @@ async def test_a_stalled_owner_hotkeys_read_never_holds_discovery(monkeypatch, w
     not start a second read."""
     harness = _Harness(monkeypatch, {"miner-a": []}, [_Neuron("miner-a")])
     stalled = asyncio.Event()
-    harness.portal_api.refresh_owner_hotkeys = AsyncMock(side_effect=stalled.wait)
+    read = AsyncMock(side_effect=stalled.wait)
+    monkeypatch.setattr(ValidatorPortalAPI, "refresh_owner_hotkeys", read)
 
     await asyncio.wait_for(harness.lane.tick(), timeout=5)
     await asyncio.wait_for(harness.lane.tick(), timeout=5)
 
     assert harness.portal_api.get_all_executors.await_count == 2
-    assert harness.portal_api.refresh_owner_hotkeys.call_count == 1
+    await asyncio.sleep(0)  # the shared read is a task: let it start
+    assert read.call_count == 1
     stalled.set()
     await harness.lane._owner_refresh
 

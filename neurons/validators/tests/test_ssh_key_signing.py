@@ -254,13 +254,74 @@ async def test_after_a_restart_a_signed_upload_waits_for_the_first_owner_read(re
         raise OSError("portal down")
 
     monkeypatch.setattr(portal_owners, "_owner_hotkeys_read_once", False)
-    monkeypatch.setattr(portal_owners, "_first_owner_read", None)
+    monkeypatch.setattr(portal_owners, "_owner_read", None)
     monkeypatch.setattr(ValidatorPortalAPI, "refresh_owner_hotkeys", staticmethod(real_read))
     monkeypatch.setattr(portal_owners.settings, "MINER_PORTAL_REST_API_URL", "https://portal.test/")
     monkeypatch.setattr(portal_owners.aiohttp, "ClientSession", _portal_down)
     await asyncio.wait_for(portal_owners.first_owner_hotkeys_read(), 1)
     await asyncio.wait_for(portal_owners.first_owner_hotkeys_read(), 1)
     assert reads == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_an_upload_waits_for_the_pending_express_lane_read_even_when_another_read_fails(
+    rest_miner_service, portal_owners, monkeypatch
+):
+    """DAH-6740 review: the express lane's read and the upload gate are one shared read. While it is pending, a
+    separate read that fails does not open the gate; the upload waits and signs the pending read's answer."""
+    import asyncio
+
+    from datura.requests.miner_requests import AcceptSSHKeyRequest
+
+    from clients.validator_portal_api import ValidatorPortalAPI
+    from fixtures.rest_miner_fixtures import executor_info
+
+    monkeypatch.setattr(portal_owners, "_owner_hotkeys_read_once", False)
+    _subtensor(monkeypatch, axon_versions={"miner-a": MIN_DATED_NONCE_MINER_AXON_VERSION})
+    release, reads = asyncio.Event(), []
+
+    async def _read():
+        reads.append(1)
+        if len(reads) > 1:
+            return False  # any other attempt: portal error
+        await release.wait()
+        portal_owners.remember_owner_hotkeys({"miner-a": ["5OwnerX"]})
+        return True
+
+    monkeypatch.setattr(ValidatorPortalAPI, "refresh_owner_hotkeys", staticmethod(_read))
+    submitted = []
+
+    async def _make_rest_request(method, url, json_data, headers, timeout, log_extra, operation_name):
+        if url.endswith("ssh-pubkey-submit"):
+            submitted.append(json_data)
+            return 200, AcceptSSHKeyRequest(executors=[executor_info("exec-1")]).model_dump(mode="json")
+        return 200, {"message_type": "SSHKeyRemoved"}
+
+    rest_miner_service._make_rest_request = _make_rest_request
+
+    express_read = portal_owners.start_owner_hotkeys_read()  # what the express lane tick starts
+    await asyncio.sleep(0)
+    upload = asyncio.ensure_future(
+        rest_miner_service.request_job_to_miner(
+            payload=MinerJobRequestPayload(
+                job_batch_id="b", miner_hotkey="miner-a", miner_coldkey="c", miner_address="192.0.2.10", miner_port=8091
+            ),
+            encrypted_files=MinerJobEnryptedFiles(
+                encrypt_key="k", all_keys={}, tmp_directory="/tmp", machine_scrape_file_name="s",
+                machine_scrape_source="",
+            ),
+            rented_data=RentedExecutorsResponse(executors={}),
+            default_docker_image_digests={},
+        )
+    )
+    assert not await ValidatorPortalAPI.refresh_owner_hotkeys()  # a separate read fails meanwhile
+    await asyncio.sleep(0.05)
+    assert portal_owners.start_owner_hotkeys_read() is express_read  # every caller shares the pending read
+    assert submitted == [] and reads == [1, 1]
+    release.set()
+    await upload
+    assert [list(body["owner_hotkey_signatures"]) for body in submitted] == [["5OwnerX"]]
+    assert reads == [1, 1]  # the upload started no read of its own
 
 
 @pytest.mark.asyncio

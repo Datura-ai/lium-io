@@ -38,13 +38,14 @@ class PortalExecutor(BaseModel):
 # DAH-6740: per own-key listing hotkey, the own hotkeys of its owner's other accounts, from this validator's own read of
 # the portal's /miners/owner-hotkeys (never from what a miner reports: a miner could then have keys signed for hotkeys
 # it names). That answer is computed afresh on every call, so each one replaces this copy whole (a removed link stops
-# counting). Filled by ValidatorPortalAPI.refresh_owner_hotkeys, which the express lane starts every tick.
+# counting). Filled by start_owner_hotkeys_read, which the express lane calls every tick.
 _owner_hotkeys: dict[str, frozenset[str]] = {}
 # monotonic time of the last answer applied; None before the first
 _owner_hotkeys_read_at: float | None = None
 # True once one owner read has finished, even a failed one (404, no portal URL, timeout); see first_owner_hotkeys_read
 _owner_hotkeys_read_once = False
-_first_owner_read: asyncio.Future | None = None
+# the one owner read in flight, shared by every caller (express lane refresh and the upload gate); see start_owner_hotkeys_read
+_owner_read: asyncio.Future | None = None
 # An answer is authorization the portal gave at that time: past this age (portal down, or answering garbage) it counts
 # for nothing, so a link removed during an outage stops being honoured within this bound. Ten ticks of the slow lane.
 OWNER_HOTKEYS_MAX_AGE_SECONDS = 300
@@ -271,10 +272,8 @@ class ValidatorPortalAPI:
     async def refresh_owner_hotkeys() -> bool:
         """DAH-6740: replace the owner map with the portal's /miners/owner-hotkeys; False on any failure (a 404 from a
         portal without the route included): the last answer then ages out (portal_owner_hotkeys)."""
-        global _owner_hotkeys_read_once
         api_base = settings.MINER_PORTAL_REST_API_URL.rstrip("/") if settings.MINER_PORTAL_REST_API_URL else ""
         if not api_base:
-            _owner_hotkeys_read_once = True
             return False
         url = f"{api_base}/miners/owner-hotkeys"
         try:
@@ -299,17 +298,28 @@ class ValidatorPortalAPI:
                 _m("Owner hotkeys not refreshed from portal", extra=get_extra_info({"url": url, "error": str(exc)}))
             )
             return False
-        finally:
-            _owner_hotkeys_read_once = True
+
+
+async def _shared_owner_read() -> bool:
+    global _owner_hotkeys_read_once
+    try:
+        return await ValidatorPortalAPI.refresh_owner_hotkeys()
+    finally:
+        _owner_hotkeys_read_once = True
+
+
+def start_owner_hotkeys_read() -> asyncio.Future:
+    """DAH-6740: the owner read in flight, started if none is. Every caller gets the same one, so at most one read runs
+    and the first-read gate opens only when that read finishes, never on a separate caller's own attempt."""
+    global _owner_read
+    if _owner_read is None or _owner_read.done():
+        _owner_read = asyncio.ensure_future(_shared_owner_read())
+    return _owner_read
 
 
 async def first_owner_hotkeys_read() -> None:
     """DAH-6740: every upload that signs owner hotkeys awaits this, whichever lane sends it, so after a restart nothing
-    is signed (or checked) against the still-empty map. Returns once one read has finished, even a failed one; starts
-    that read if none is running. Bounded by the read's own 30 s timeout."""
-    global _first_owner_read
-    if _owner_hotkeys_read_once:
-        return
-    if _first_owner_read is None or _first_owner_read.done():
-        _first_owner_read = asyncio.ensure_future(ValidatorPortalAPI.refresh_owner_hotkeys())
-    await asyncio.shield(_first_owner_read)
+    is signed (or checked) against the still-empty map. Returns once the shared read (start_owner_hotkeys_read) has
+    finished, even a failed one. Bounded by the read's own 30 s timeout."""
+    if not _owner_hotkeys_read_once:
+        await asyncio.shield(start_owner_hotkeys_read())
