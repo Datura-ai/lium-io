@@ -609,6 +609,46 @@ async def test_a_cycle_the_chain_gives_no_block_time_does_not_run_and_the_block_
 
 
 @pytest.mark.asyncio
+async def test_a_job_block_whose_attempt_failed_at_the_boundary_runs_next_and_the_next_block_keeps_its_turn(
+    validator_with_mocks, create_neuron_info
+):
+    """Review on 679caa6: the last tick that chose job block B failed to read B's time; the next tick's height falls in
+    B + interval and chose that block instead, so B never got its wave or settlement. The failed block is kept and runs
+    next, and the block after it is still due on its own schedule."""
+    from core.config import settings
+
+    n = settings.BLOCKS_FOR_JOB
+    validator = validator_with_mocks
+    validator.subtensor_client.get_miners = AsyncMock(return_value=[create_neuron_info(1, "miner-a")])
+
+    async def no_results(payload, **_):
+        return {"miner_hotkey": payload.miner_hotkey, "miner_coldkey": "c", "results": []}
+
+    validator.miner_service.request_job_to_miner = AsyncMock(side_effect=no_results)
+    block = 100 * n
+    validator.last_job_run_blocks = block - 2
+    times = {block: "2026-11-19 18:52:38", block + n: "2026-11-19 19:07:38"}
+    read = []
+    for height, answer in ((block + n - 2, None), (block + n, "chain"), (block + 2 * n - 1, "chain")):
+        validator.subtensor_client.get_current_block = Mock(return_value=height)
+
+        async def chain_time(b, answer=answer):
+            read.append(b)
+            return None if answer is None else times[b]
+
+        validator.subtensor_client.get_time_from_block = AsyncMock(side_effect=chain_time)
+        with (
+            patch("core.validator.fetch_default_image_digests", new=AsyncMock(return_value={})),
+            patch("core.validator.fetch_executor_image_digest", new=AsyncMock(return_value=None)),
+        ):
+            await validator.sync()
+
+    asked = [c.kwargs["payload"].job_batch_id for c in validator.miner_service.request_job_to_miner.await_args_list]
+    assert read == [block, block, block + n]
+    assert asked == [times[block], times[block + n]]
+
+
+@pytest.mark.asyncio
 async def test_every_attempt_at_one_job_block_asks_under_its_chain_time_only(validator_with_mocks, create_neuron_info):
     """Review on df0df43: an attempt with no block time and a rerun of the same block reported two cycle ids, and
     settlement counted the block twice. An attempt with no answer now runs nothing, and a block's chain time never

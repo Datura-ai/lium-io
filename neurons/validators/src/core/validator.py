@@ -151,6 +151,9 @@ class Validator:
 
         self.should_exit = False
         self.last_job_run_blocks = 0
+        # The job block a due cycle chose and has not started yet (an early return below left it): the next tick runs
+        # that block, not the one its own height falls in, so a block whose attempt failed is never skipped.
+        self.pending_job_block: int | None = None
         self.default_extra = {}
         # DAH-2958: the current cycle's job files / digests / image snapshot, reused by the
         # express lane so its verifications are the cycle's pipeline. None before the first cycle.
@@ -428,7 +431,10 @@ class Validator:
                 cycle_asked_for_now
                 or current_block - self.last_job_run_blocks >= settings.BLOCKS_FOR_JOB
             ):
-                job_block = (current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB
+                job_block = self.pending_job_block
+                if job_block is None:
+                    job_block = (current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB
+                self.pending_job_block = job_block
                 # The cycle id is the job block's own chain time (DAH-6539). The backend reads the cycle's start from it
                 # everywhere (ledger rows, settlement, penalty hours, pod and rental timing), so it must be the real time,
                 # and a block's chain time never changes, so every attempt at one block reports under one id. With no
@@ -499,7 +505,10 @@ class Validator:
                     ),
                 )
 
-                self.last_job_run_blocks = current_block
+                # a block run late (after a failed attempt) counts as run at the last height that chose it, so the
+                # next job block is still due on its own schedule
+                self.last_job_run_blocks = min(current_block, job_block + settings.BLOCKS_FOR_JOB - 1)
+                self.pending_job_block = None
                 if cycle_asked_for_now:
                     # Cleared here and not at the read: every return above this line means no
                     # cycle started, and the operator's request must survive to the next tick.
