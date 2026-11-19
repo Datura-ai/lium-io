@@ -164,33 +164,113 @@ def _identity_answer(session, hotkey: str | None, status: int = 200):
     session.get = MagicMock(side_effect=get)
 
 
+def _post_answers(session, *answers):
+    """POST /upload_ssh_key answers these responses in turn; session.sent keeps a copy of each body as sent."""
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(side_effect=list(answers))
+    ctx.__aexit__ = AsyncMock(return_value=None)
+    session.sent = []
+
+    def post(url, json=None, timeout=None):
+        session.sent.append(dict(json))
+        return ctx
+
+    session.post = MagicMock(side_effect=post)
+
+
+@pytest.fixture(autouse=True)
+def _no_known_identities():
+    es._executor_own_hotkeys.clear()
+    yield
+    es._executor_own_hotkeys.clear()
+
+
 @pytest.mark.asyncio
 async def test_a_big_owner_map_reaches_the_executor_as_its_one_entry(executor_service, test_executor):
-    """DAH-6740: 2,000 owner hotkeys (~370 KiB of signatures, past the executor's 256 KiB body limit) relay as one entry."""
+    """DAH-6740: 2,000 owner hotkeys (~370 KiB of signatures, past the executor's 256 KiB body limit) relay as one entry,
+    and the upload never waits on the identity read."""
     signatures = {f"5Owner{i:05d}" + "x" * 41: "0x" + "ab" * 64 for i in range(2000)}
     assert len(json.dumps(signatures)) > 256 * 1024
     own = sorted(signatures)[1234]
     mock_session = _make_mock_session()
     with patch("services.executor_service.aiohttp.ClientSession", return_value=mock_session):
         _identity_answer(mock_session, own)
+        # identity not known yet: the upload goes at once without an owner entry, the read runs beside it
+        await executor_service.send_pubkey_to_executor(test_executor, _SSH_KEY, "0xaa", owner_hotkey_signatures=signatures)
+        assert "owner_hotkey_signatures" not in mock_session.post.call_args.kwargs["json"]
+        await asyncio.gather(*es._identity_reads)
+
+        # learned: later uploads carry just that entry with no further read
+        mock_session.get.reset_mock()
         await executor_service.send_pubkey_to_executor(test_executor, _SSH_KEY, "0xaa", owner_hotkey_signatures=signatures)
         sent = mock_session.post.call_args.kwargs["json"]
         assert sent["owner_hotkey_signatures"] == {own: signatures[own]}
         assert len(json.dumps(sent)) < 256 * 1024
-
-        # set up for a hotkey outside the owner set, or no identity answer: no owner entry, the upload still goes
-        for hotkey, status in (("5Elsewhere", 200), (None, 200), ("5Any", 404)):
-            _identity_answer(mock_session, hotkey, status)
-            await executor_service.send_pubkey_to_executor(
-                test_executor, _SSH_KEY, "0xaa", owner_hotkey_signatures=signatures
-            )
-            assert "owner_hotkey_signatures" not in mock_session.post.call_args.kwargs["json"]
+        assert not mock_session.get.called
 
         # no owner map: no identity read at all
-        mock_session.get.reset_mock()
+        es._executor_own_hotkeys.clear()
         await executor_service.send_pubkey_to_executor(test_executor, _SSH_KEY, "0xaa")
         assert not mock_session.get.called
         assert "owner_hotkey_signatures" not in mock_session.post.call_args.kwargs["json"]
+
+
+@pytest.mark.asyncio
+async def test_a_slow_identity_read_never_holds_a_listing_bound_upload(executor_service, test_executor):
+    """The upload answers while /miner-identity is still hanging; the read finishes on its own afterwards."""
+    release = asyncio.Event()
+    session = _make_mock_session()
+
+    def hanging_get(url, params=None, timeout=None):
+        async def wait():
+            await release.wait()
+            raise asyncio.TimeoutError()
+
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(side_effect=wait)
+        ctx.__aexit__ = AsyncMock(return_value=None)
+        return ctx
+
+    session.get = MagicMock(side_effect=hanging_get)
+    _post_answers(session, _response(200, _SSH_ANSWER))
+    with patch("services.executor_service.aiohttp.ClientSession", return_value=session):
+        info = await asyncio.wait_for(
+            executor_service.send_pubkey_to_executor(
+                test_executor, _SSH_KEY, "0xaa", owner_hotkey_signatures={"5Owner": "0xcc"}
+            ),
+            timeout=1,
+        )
+        assert info is not None and session.post.call_count == 1
+        release.set()
+        await asyncio.gather(*es._identity_reads)
+    assert str(test_executor.uuid) not in es._executor_own_hotkeys
+
+
+@pytest.mark.asyncio
+async def test_a_binding_refusal_retries_with_the_executors_one_entry(executor_service, test_executor):
+    """A 403 makes the miner read the executor's hotkey and retry once with that entry; a hotkey outside the owner
+    set (or a second 403) ends the upload."""
+    signatures = {"5OwnerA": "0xaa01", "5OwnerB": "0xbb02"}
+    refused = lambda: _response(403, b'{"detail":"SSH key was not issued for this miner"}')  # noqa: E731
+    session = _make_mock_session()
+    with patch("services.executor_service.aiohttp.ClientSession", return_value=session), \
+            patch("services.executor_service._learn_own_hotkey_later"):
+        _identity_answer(session, "5OwnerB")
+        _post_answers(session, refused(), _response(200, _SSH_ANSWER))
+        info = await executor_service.send_pubkey_to_executor(test_executor, _SSH_KEY, "0xaa", owner_hotkey_signatures=signatures)
+        assert info is not None and session.post.call_count == 2
+        first, second = session.sent
+        assert "owner_hotkey_signatures" not in first
+        assert second["owner_hotkey_signatures"] == {"5OwnerB": "0xbb02"}
+
+        # the learned entry refused again, then a hotkey outside the owner set: no second retry either way
+        for hotkey in ("5OwnerB", "5Elsewhere"):
+            _identity_answer(session, hotkey)
+            _post_answers(session, refused(), refused())
+            assert await executor_service.send_pubkey_to_executor(
+                test_executor, _SSH_KEY, "0xaa", owner_hotkey_signatures=signatures
+            ) is None
+            assert session.post.call_count == 1 and session.get.call_count == 1
 
 
 @pytest.mark.parametrize(

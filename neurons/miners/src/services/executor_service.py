@@ -158,6 +158,25 @@ async def _executor_own_hotkey(session: aiohttp.ClientSession, executor: Executo
     return answer["miner_hotkey"]
 
 
+# executor uuid -> the hotkey its /miner-identity last named; read off the upload path so it never spends an upload's deadline
+_executor_own_hotkeys: dict[str, str] = {}
+_identity_reads: set[asyncio.Task] = set()
+
+
+async def _learn_own_hotkey(executor: Executor) -> str | None:
+    async with aiohttp.ClientSession() as session:
+        own = await _executor_own_hotkey(session, executor, time.monotonic() + MINER_IDENTITY_TIMEOUT_SECONDS)
+    if own:
+        _executor_own_hotkeys[str(executor.uuid)] = own
+    return own
+
+
+def _learn_own_hotkey_later(executor: Executor) -> None:
+    task = asyncio.create_task(_learn_own_hotkey(executor))
+    _identity_reads.add(task)
+    task.add_done_callback(_identity_reads.discard)
+
+
 class PubkeyRegistration(pydantic.BaseModel):
     """DAH-3338: the outcome of register_pubkey, known executors apart from accepting ones.
 
@@ -447,11 +466,15 @@ class ExecutorService:
             ),
         )
         async with aiohttp.ClientSession() as session:
+            # DAH-6740: relay only the entry the executor checks (an owner's whole map can pass its 256 KiB body limit),
+            # known from an earlier identity read; the upload itself never waits on that read
+            looked_up = False
             if owner_hotkey_signatures:
-                own = await _executor_own_hotkey(session, executor, deadline)
+                own = _executor_own_hotkeys.get(str(executor.uuid))
                 if own in owner_hotkey_signatures:
-                    # DAH-6740: only the entry the executor checks; an owner's whole map can pass its 256 KiB body limit
                     payload["owner_hotkey_signatures"] = {own: owner_hotkey_signatures[own]}
+                elif own is None:
+                    _learn_own_hotkey_later(executor)
             for attempt in range(1, UPLOAD_SSH_KEY_ATTEMPTS + 1):
                 # the first attempt keeps main's full timeout, so a slow portal lookup never fails an upload main
                 # accepted; only the retries are clipped to the deadline
@@ -463,6 +486,17 @@ class ExecutorService:
                 try:
                     async with session.post(url, json=payload, timeout=timeout) as response:
                         body = await _read_capped(response)
+                        if response.status == 403 and owner_hotkey_signatures and not looked_up:
+                            # refused for its binding: read which hotkey it is set up for now, retry with that entry
+                            looked_up = True
+                            own = await _executor_own_hotkey(session, executor, deadline)
+                            if own:
+                                _executor_own_hotkeys[str(executor.uuid)] = own
+                            entry = {own: owner_hotkey_signatures[own]} if own in owner_hotkey_signatures else None
+                            if entry and entry != payload.get("owner_hotkey_signatures") \
+                                    and deadline - time.monotonic() >= UPLOAD_SSH_KEY_MIN_ATTEMPT_SECONDS:
+                                payload["owner_hotkey_signatures"] = entry
+                                continue
                         if response.status != 200:
                             text = body.decode(errors="replace")
                             logger.error(
