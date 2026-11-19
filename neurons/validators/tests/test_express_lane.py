@@ -590,6 +590,20 @@ async def test_a_cycle_that_cannot_read_its_block_time_asks_under_the_clock_not_
     started = datetime.strptime(asked, JOB_BATCH_ID_FORMAT).replace(tzinfo=UTC)
     assert before <= started <= datetime.now(UTC)
     assert validator.cycle_inputs.job_batch_id == asked
+    # the id goes through the per-block record, so a rerun of the block reuses it
+    validator.redis_service.cycle_id_for_block.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_rerun_of_the_same_job_block_reports_under_its_first_cycle_id():
+    """Review on f205fc4: the clock fallback gave each attempt at one job block its own id, so a validator restarted
+    inside the block window settled the block twice (the backend dedupes by cycle id). The first attempt's id is kept
+    for the block, whether it came from the chain or the clock; the next block gets its own."""
+    redis = _redis_service()
+    first = await redis.cycle_id_for_block(7200, "2026-11-19 18:00:00")  # clock fallback of the first attempt
+    assert await redis.cycle_id_for_block(7200, "2026-11-19 18:03:10") == first  # restart, read fails again
+    assert await redis.cycle_id_for_block(7200, CYCLE_BATCH_ID) == first  # restart, read now succeeds
+    assert await redis.cycle_id_for_block(7560, "2026-11-19 19:12:00") == "2026-11-19 19:12:00"
 
 
 @pytest.mark.asyncio

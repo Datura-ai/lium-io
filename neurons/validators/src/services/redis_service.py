@@ -202,6 +202,9 @@ RECHECK_POP_ATTEMPTS = 5
 # When the express lane first saw a never-validated executor (epoch s), kept across validator restarts:
 # an in-memory stamp restarted with every rollout and logged discovery waits of up to 25 min (5 Nov).
 EXPRESS_LANE_FIRST_SEEN_PREFIX = "express_lane:first_seen"
+# job_block -> the cycle id its first attempt used; outlives a validator restart inside the block window
+CYCLE_ID_BY_JOB_BLOCK_PREFIX = "cycle_id_by_job_block"
+CYCLE_ID_BY_JOB_BLOCK_TTL_SECONDS = 24 * 3600
 EXPRESS_LANE_FIRST_SEEN_TTL_SECONDS = 2 * 3600
 
 # Distributed lock settings
@@ -823,6 +826,18 @@ class RedisService:
             await self.redis.set(key, repr(now), ex=ttl_seconds, nx=True)
             value = await self.redis.get(key)
         return float(value) if value is not None else now
+
+    async def cycle_id_for_block(self, job_block: int, candidate: str) -> str:
+        """The cycle id of `job_block`: the first attempt's `candidate`, kept for every later attempt at the same
+        block (a validator restarted inside the block window reruns it). The backend dedupes settlement reports by
+        cycle id, so one block must never report under two ids."""
+        key = f"{CYCLE_ID_BY_JOB_BLOCK_PREFIX}:{job_block}"
+        async with self.lock:
+            await self.redis.set(key, candidate, ex=CYCLE_ID_BY_JOB_BLOCK_TTL_SECONDS, nx=True)
+            value = await self.redis.get(key)
+        if value is None:
+            return candidate
+        return value.decode() if isinstance(value, bytes) else value
 
     async def set(self, key: str, value: str, ex: int | None = None):
         """Set a key-value pair in Redis; `ex` is the key's lifetime in seconds (none = no expiry)."""

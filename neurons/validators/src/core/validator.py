@@ -430,8 +430,11 @@ class Validator:
             ):
                 job_block = (current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB
                 # a failed block-time read gives "Unknown": the cycle then goes by the clock at its start, so every report
-                # it sends carries a time the backend can order against a node's registration (DAH-6539)
-                job_batch_id = _cycle_batch_id_or_clock(await self.subtensor_client.get_time_from_block(job_block))
+                # it sends carries a time the backend can order against a node's registration (DAH-6539). The block keeps
+                # the id of its first attempt, so a rerun of the same block (restart) reports under the same cycle id.
+                job_batch_id = await self.redis_service.cycle_id_for_block(
+                    job_block, _cycle_batch_id_or_clock(await self.subtensor_client.get_time_from_block(job_block))
+                )
 
                 # DAH-2380: fetch default cache-template digests from Docker Hub at the
                 # start of each job cycle, so verification compares executors against the
