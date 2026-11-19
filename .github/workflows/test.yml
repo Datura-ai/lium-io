@@ -110,14 +110,23 @@ jobs:
       - name: Install dependencies
         run: pdm install
 
-      - name: Run tests
+      - name: Run tests (parallel)
         env:
           BITTENSOR_WALLET_NAME: test_wallet
           BITTENSOR_WALLET_HOTKEY_NAME: test_hotkey
           SQLALCHEMY_DATABASE_URI: sqlite:///test.db
           ASYNC_SQLALCHEMY_DATABASE_URI: sqlite+aiosqlite:///test.db
           TDX_VERIFIER_URL: http://localhost:8000/verify
-        run: pdm run pytest tests/ -v --tb=short --strict-markers
+        run: pdm run pytest tests/ -v --tb=short --strict-markers -n 2 --dist loadfile --ignore=tests/test_loopback_plugin_setup.py --ignore=tests/test_sshd_bootstrap_script.py
+
+      - name: Run timing-sensitive tests (serial)
+        env:
+          BITTENSOR_WALLET_NAME: test_wallet
+          BITTENSOR_WALLET_HOTKEY_NAME: test_hotkey
+          SQLALCHEMY_DATABASE_URI: sqlite:///test.db
+          ASYNC_SQLALCHEMY_DATABASE_URI: sqlite+aiosqlite:///test.db
+          TDX_VERIFIER_URL: http://localhost:8000/verify
+        run: pdm run pytest tests/test_loopback_plugin_setup.py tests/test_sshd_bootstrap_script.py -v --tb=short --strict-markers
 
   executor:
     name: Executor Tests
