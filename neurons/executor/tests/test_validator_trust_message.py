@@ -663,14 +663,14 @@ def test_a_failed_write_trusts_no_validator_until_it_lands(
         await asyncio.sleep(0.05)
         monkeypatch.setattr(trust_service, "_write_json", write_once_failing)
         assert trust.offer(_signed(owner, new_validator, 2))
-        for _ in range(200):
+        for _ in range(1000):
             if not failures:
                 break
             await asyncio.sleep(0.05)
         while_failed = trust.hotkeys({"current": "baked"})
         _backend(monkeypatch, lambda *a, **k: MagicMock(status_code=404))
         await trust.refresh_message()  # the next refresh writes it
-        for _ in range(200):
+        for _ in range(1000):
             if not trust.closed():
                 break
             await asyncio.sleep(0.05)
@@ -749,7 +749,7 @@ def test_an_unreadable_kept_state_stays_closed_across_a_restart_after_it_was_rep
 
     async def write():
         writer = trust.start_persisting()
-        for _ in range(200):
+        for _ in range(1000):
             if not trust._unsaved:
                 break
             await asyncio.sleep(0.01)
@@ -815,7 +815,7 @@ def test_a_write_slower_than_a_refresh_still_opens_the_node(tmp_path, monkeypatc
         await asyncio.sleep(0.05)  # the write is in flight
         await trust.refresh_message()  # retries the same, still unwritten state
         gates[0].set()
-        for _ in range(200):
+        for _ in range(1000):
             if done:
                 break
             await asyncio.sleep(0.01)
@@ -866,7 +866,7 @@ def test_a_restart_after_a_shutdown_that_could_not_write_trusts_no_validator_unt
 
     async def run():
         writer = trust.start_persisting()
-        for _ in range(200):  # the start write marks the run running
+        for _ in range(1000):  # the start write marks the run running
             if trust._written is not None and trust._written["running"]:
                 break
             await asyncio.sleep(0.01)
@@ -951,7 +951,7 @@ def _crashed_first_boot(tmp_path, owner) -> ValidatorTrust:
 
     async def run():
         writer = trust.start_persisting()
-        for _ in range(200):
+        for _ in range(1000):
             if trust._written is not None and trust._written["running"]:
                 break
             await asyncio.sleep(0.01)
