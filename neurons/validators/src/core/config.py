@@ -453,9 +453,6 @@ class Settings(BaseSettings):
     # verified job is cleared, so the backend marks the executor inactive and billing stops. A transport
     # error or timeout decides nothing. Off by default: the pod keeps the plain POD_NOT_RUNNING verdict.
     REBOOT_FAILED_HOST_CHECK_ENABLED: bool = Field(env="REBOOT_FAILED_HOST_CHECK_ENABLED", default=False)
-    # A GPU process inside a Lium filler whose command is not on the filler workload's allowlist is
-    # foreign GPU work. Off: logged only (FILLER_FOREIGN_PROCESS ... enforced=False), the verdict is unchanged.
-    FILLER_PROCESS_ALLOWLIST_ENFORCED: bool = Field(env="FILLER_PROCESS_ALLOWLIST_ENFORCED", default=False)
     # DAH-4564 — read a rented pod's cpuset, CPU quota and init oom_score_adj and flag a host that
     # pinned or throttled the renter below 95% of its advertised cores, and zero its score. A raised
     # oom_score_adj is recorded only, never scored.

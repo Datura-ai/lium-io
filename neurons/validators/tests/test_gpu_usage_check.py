@@ -1900,7 +1900,7 @@ async def test_swapped_filler_is_judged_beside_a_rental_pod(context_factory, mon
     assert result.event.what_we_saw["filler_containers_off_their_image"] == ["filler_swapped"]
 
 
-async def _filler_process_ctx(context_factory, cmdline, repository="daturaai/pearl-miner"):
+async def _filler_process_ctx(context_factory, cmdline, repository="daturaai/pearl-miner", running=None):
     from neurons.validators.src.services.redis_service import (
         FILLER_IMAGE_DIGESTS_PREFIX,
         FILLER_IMAGE_REPOSITORY_PREFIX,
@@ -1919,33 +1919,24 @@ async def _filler_process_ctx(context_factory, cmdline, repository="daturaai/pea
             executors={},
             all_filler_containers_by_executor={"executor-123": [filler]},
         ),
-        specs={"docker": {"containers": [{"name": filler, "digest": "sha256:filler"}]}},
+        specs={"docker": {"containers": [{"name": filler, "digest": "sha256:filler", "repository": running}]}},
     )
     return context_factory(services=services, config=build_context_config(), state=state), filler
 
 
-@pytest.mark.parametrize("enforced", [False, True])
 @pytest.mark.asyncio
-async def test_unlisted_process_in_a_filler_on_its_own_image(context_factory, monkeypatch, caplog, enforced):
+async def test_unlisted_process_in_a_filler_on_its_own_image(context_factory, caplog):
     # a GPU process in a PEARL filler on its own image whose command is not the workload's
-    monkeypatch.setattr(gpu_usage.settings, "FILLER_PROCESS_ALLOWLIST_ENFORCED", enforced)
     ctx, filler = await _filler_process_ctx(context_factory, "/opt/other/gpu-app --run")
 
     with caplog.at_level("WARNING"):
         result = await GpuUsageCheck().run(ctx)
 
     assert "FILLER_FOREIGN_PROCESS executor=executor-123" in caplog.text
-    assert f"enforced={enforced}" in caplog.text
-    if enforced:
-        assert result.passed is False
-        assert result.event.reason_code == Msg.USAGE_HIGH.reason
-        assert result.event.what_we_saw["filler_foreign_processes"] == [
-            f"{filler} (pid 4242): /opt/other/gpu-app --run"
-        ]
-        assert f"{filler} (pid 4242): /opt/other/gpu-app" in result.event.remediation
-    else:
-        assert result.passed is True
-        assert result.event.reason_code == Msg.USAGE_OK.reason
+    assert result.passed is False
+    assert result.event.reason_code == Msg.USAGE_HIGH.reason
+    assert result.event.what_we_saw["filler_foreign_processes"] == [f"{filler} (pid 4242): /opt/other/gpu-app --run"]
+    assert f"{filler} (pid 4242): /opt/other/gpu-app" in result.event.remediation
 
 
 @pytest.mark.parametrize(
@@ -1958,13 +1949,23 @@ async def test_unlisted_process_in_a_filler_on_its_own_image(context_factory, mo
         ("daturaai/dolphin", "VLLM::EngineCore"),
         ("daturaai/dolphin", "python3 -m sonar.entrypoints serve"),
         ("daturaai/dolphin", "sonar serve model"),
+        # the engine's GPU P2P probe at start runs in children multiprocessing spawned
+        (
+            "daturaai/dolphin",
+            "/root/.venv/bin/python3 -c from multiprocessing.spawn import spawn_main; "
+            "spawn_main(tracker_fd=5, pipe_handle=7) --multiprocessing-fork",
+        ),
+        (
+            "daturaai/dolphin",
+            "python3 -s -E -X faulthandler -c from multiprocessing.spawn import spawn_main; "
+            "spawn_main(tracker_fd=5, pipe_handle=7) --multiprocessing-fork",
+        ),
     ],
 )
 @pytest.mark.asyncio
-async def test_a_fillers_own_workload_passes_with_the_allowlist_enforced(
+async def test_a_fillers_own_workload_passes(
     context_factory, monkeypatch, caplog, repository, cmdline
 ):
-    monkeypatch.setattr(gpu_usage.settings, "FILLER_PROCESS_ALLOWLIST_ENFORCED", True)
     ctx, _ = await _filler_process_ctx(context_factory, cmdline, repository)
 
     with caplog.at_level("WARNING"):
@@ -1979,13 +1980,12 @@ async def test_a_fillers_own_workload_passes_with_the_allowlist_enforced(
     [
         ("daturaai/pearl-miner", ""),  # the scrape could not read it, or liumd does not report it
         ("daturaai/pearl-miner", None),
-        (None, "/opt/other/gpu-app"),  # a filler started before the repository was recorded
+        (None, "/opt/other/gpu-app"),  # no record and no running image reported
         ("ghcr.io/hanlinai/engy-golden-serve", "/opt/other/gpu-app"),  # a workload with no allowlist
     ],
 )
 @pytest.mark.asyncio
 async def test_no_command_or_unknown_workload_is_not_judged(context_factory, monkeypatch, caplog, repository, cmdline):
-    monkeypatch.setattr(gpu_usage.settings, "FILLER_PROCESS_ALLOWLIST_ENFORCED", True)
     ctx, _ = await _filler_process_ctx(context_factory, cmdline, repository)
 
     with caplog.at_level("WARNING"):
@@ -2216,10 +2216,60 @@ async def test_a_recovery_parked_name_is_ours_by_its_redis_mark_when_no_record_i
 @pytest.mark.asyncio
 async def test_a_repository_record_read_as_bytes_still_names_the_workload(context_factory, monkeypatch):
     # the prod Redis client returns bytes, not str
-    monkeypatch.setattr(gpu_usage.settings, "FILLER_PROCESS_ALLOWLIST_ENFORCED", True)
     ctx, filler = await _filler_process_ctx(context_factory, "/opt/other/gpu-app --run", b"daturaai/pearl-miner")
 
     result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is False
     assert result.event.what_we_saw["filler_foreign_processes"] == [f"{filler} (pid 4242): /opt/other/gpu-app --run"]
+
+
+@pytest.mark.parametrize(
+    "cmdline, passed",
+    [("/opt/other/gpu-app --run", False), ("/var/lib/pearl/bin/peakminer --coin pearl", True)],
+)
+@pytest.mark.asyncio
+async def test_a_filler_with_no_record_is_judged_by_its_running_image(context_factory, cmdline, passed):
+    # a filler started before the creation-time record existed: its running image names the workload
+    ctx, _ = await _filler_process_ctx(context_factory, cmdline, repository=None, running="daturaai/pearl-miner")
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is passed
+
+
+@pytest.mark.asyncio
+async def test_a_running_image_other_than_the_recorded_one_is_judged_by_the_record(context_factory, caplog):
+    ctx, filler = await _filler_process_ctx(
+        context_factory, "sonar serve model", repository="daturaai/pearl-miner", running="docker.io/daturaai/dolphin"
+    )
+
+    with caplog.at_level("WARNING"):
+        result = await GpuUsageCheck().run(ctx)
+
+    assert "FILLER_IMAGE_REPOSITORY_MISMATCH" in caplog.text
+    assert result.passed is False
+    assert result.event.what_we_saw["filler_foreign_processes"] == [f"{filler} (pid 4242): sonar serve model"]
+
+
+@pytest.mark.parametrize(
+    "repository, cmdline",
+    [
+        # PEARL's miner is no Python program: a multiprocessing child in its filler is not its workload
+        (
+            "daturaai/pearl-miner",
+            "python3 -c from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=5, pipe_handle=7) "
+            "--multiprocessing-fork",
+        ),
+        # inline code that is not a multiprocessing child names no workload
+        ("daturaai/dolphin", "python3 -c import miner; miner.run()"),
+        ("daturaai/dolphin", "python3 -X dev -c from multiprocessing_tools import run"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_inline_python_that_is_not_the_workloads_own_child_is_foreign(context_factory, repository, cmdline):
+    ctx, _ = await _filler_process_ctx(context_factory, cmdline, repository)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
