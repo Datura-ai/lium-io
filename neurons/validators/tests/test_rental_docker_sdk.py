@@ -106,7 +106,8 @@ class FakeApiClient:
         self.container_states = None
         self.inspect_container_error = None
         self.events = []
-        self.pruned_images = False
+        self.repo_tags = []
+        self.removed_images = []
         self.created_volumes = []
         self.removed_volumes = []
         self.networks = {}  # name -> what inspect_network returns
@@ -148,7 +149,7 @@ class FakeApiClient:
             raise self.inspect_image_error
         if image in self.missing_images:
             raise ImageNotFound("missing image")
-        return {"Id": "image-id", "RepoDigests": self.repo_digests}
+        return {"Id": "image-id", "RepoDigests": self.repo_digests, "RepoTags": self.repo_tags}
 
     def inspect_distribution(self, image, auth_config=None):
         self.distribution_calls.append({"image": image, "auth_config": auth_config})
@@ -192,8 +193,8 @@ class FakeApiClient:
             return self.container_states[0]
         return {"State": {"Running": True, "Restarting": False}}
 
-    def prune_images(self):
-        self.pruned_images = True
+    def remove_image(self, image):
+        self.removed_images.append(image)
         return {"ImagesDeleted": []}
 
     def create_volume(self, **kwargs):
@@ -1228,7 +1229,7 @@ def test_stdin_exec_spec_builders_keep_values_out_of_argv():
 
 
 @pytest.mark.asyncio
-async def test_delete_helpers_call_sdk_volume_and_prune_apis():
+async def test_delete_helpers_call_sdk_volume_apis():
     api_client = FakeApiClient()
     client = RentalDockerSdkClient(api_client)
 
@@ -1239,7 +1240,6 @@ async def test_delete_helpers_call_sdk_volume_and_prune_apis():
         timeout=133,
         labels=FILLER_VOLUME_LABELS,
     )
-    await client.prune_images()
     await client.remove_volume(volume_name="volume_test", force=True)
 
     assert api_client.created_volumes == [
@@ -1252,8 +1252,17 @@ async def test_delete_helpers_call_sdk_volume_and_prune_apis():
         }
     ]
     assert api_client.timeout == 60
-    assert api_client.pruned_images is True
     assert api_client.removed_volumes == [("volume_test", {"force": True})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("repo_tags", "expect_removed"), [([], True), (["daturaai/pytorch:latest"], False)])
+async def test_an_image_is_removed_by_id_only_once_no_tag_names_it(repo_tags, expect_removed):
+    api_client = FakeApiClient()
+    api_client.repo_tags = repo_tags
+
+    assert await RentalDockerSdkClient(api_client).remove_image_if_untagged(image_id="sha256:pod") is expect_removed
+    assert api_client.removed_images == (["sha256:pod"] if expect_removed else [])
 
 
 @pytest.mark.asyncio

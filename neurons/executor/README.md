@@ -196,6 +196,8 @@ Installation of sysbox (as root; `sudo ./nvidia_docker_sysbox_setup.sh --check` 
 sudo ./nvidia_docker_sysbox_setup.sh
 ```
 
+The installer also gives `sysbox-fs` and `sysbox-mgr` 90 s to start and restarts them on failure (`/etc/systemd/system/<service>.service.d/lium-restart.conf`), so a slow boot no longer leaves Sysbox down. On a node set up before this, run the installer again; adding these files restarts no service. If Sysbox is down after a reboot, run `sudo systemctl restart sysbox`.
+
 Verify sysbox is working correctly with gpu
 ```shell
 docker run --rm --runtime=sysbox-runc --gpus all daturaai/compute-subnet-executor:latest nvidia-smi
