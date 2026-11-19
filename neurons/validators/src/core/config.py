@@ -1,6 +1,5 @@
 import logging
 import pathlib
-from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
@@ -158,10 +157,6 @@ class Settings(BaseSettings):
     PORTION_FOR_UPTIME: float = 1
     UPTIME_REQUIRED_MINUTES: int = 60 * 24 * 14 # 14 days
 
-    PORTION_FOR_SYSBOX: float = 0.2
-    PORTION_FOR_SYSBOX_UNRENTED: float = 1
-    PORTION_FOR_SYSBOX_RENTED: float = 1
-    SYSBOX_RENTED_CUTOFF: datetime = datetime(2026, 4, 3, 12, 0, 0)
     # DAH-3597: first-miss grace for a DinD probe that never reached its container; the rule is
     # in PortConnectivityCheck, the TTL bounds the window between two misses.
     DIND_PROBE_FIRST_MISS_GRACE: bool = Field(env="DIND_PROBE_FIRST_MISS_GRACE", default=False)
@@ -268,7 +263,9 @@ class Settings(BaseSettings):
     LOOPBACK_PLUGIN_V2_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V2_ENABLED", default=True)
     # DAH-5101: new size-limited volumes go on vloopback:v3 (direct I/O loop, no host page cache of
     # the volume image); off = vloopback:v2 as before. Volumes already created keep their plugin.
-    LOOPBACK_PLUGIN_V3_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V3_ENABLED", default=False)
+    # On by default: on v2 a hard host stop loses the gigabytes of volume writes the host still held
+    # in its page cache, which tore encrypted-volume blocks (I/O errors in the pod after the reboot).
+    LOOPBACK_PLUGIN_V3_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V3_ENABLED", default=True)
     # DAH-5101: unlink the pod's volume files before the stop so a delete does not wait for the disk
     # to absorb unwritten data. Off = delete exactly as before; turned on per environment.
     POD_VOLUME_WIPE_BEFORE_STOP_ENABLED: bool = Field(env="POD_VOLUME_WIPE_BEFORE_STOP_ENABLED", default=False)
@@ -338,6 +335,18 @@ class Settings(BaseSettings):
     # `[liumd_shadow] comparison` line per node (per-step verdicts, agreement, durations). Nothing
     # it finds is scored or stored: the result is built before it starts. Off: nothing new runs.
     VALIDATOR_LIUMD_SHADOW: bool = Field(env="VALIDATOR_LIUMD_SHADOW", default=False)
+    # Use the full machine-scrape document returned by the same early `liumd run` instead of
+    # running the Python machine scrape. Off: Python remains authoritative and the early run is
+    # only compared in the shadow.
+    VALIDATOR_LIUMD_SPECS: bool = Field(env="VALIDATOR_LIUMD_SPECS", default=False)
+    # Prod repair path: fetch the liumd manifest from lium-io main and replace a missing/stale
+    # /usr/local/bin/liumd only after the manifest sha256 matches.
+    LIUMD_BINARY_REFRESH_ENABLED: bool = Field(env="LIUMD_BINARY_REFRESH_ENABLED", default=False)
+    LIUMD_BINARY_MANIFEST_URL: str = Field(
+        env="LIUMD_BINARY_MANIFEST_URL",
+        default="https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/liumd/manifest.json",
+    )
+    LIUMD_BINARY_PATH: str = Field(env="LIUMD_BINARY_PATH", default="/usr/local/bin/liumd")
     # The shadow's whole-call budget (seconds), clipped to what the executor task has left; the
     # intent's `deadline_s` is this − 30. Sized for a scored cycle, where VerifyX (p90 about 150 s)
     # and the matmul (at most 120 s) run one after the other.
@@ -383,10 +392,8 @@ class Settings(BaseSettings):
     # Item 3 — run the GPU work-proof on every claimed card concurrently (own challenge per card,
     # sized from the registry SKU) and time the aggregate on the validator, so a count lie either
     # fails device selection or serialises past a wide wall-clock threshold.
-    # Defaults to False: "shadow" here only means the verdict is
-    # not scored — the GPU work itself is real, so an 8-card host would run 8 near-full-VRAM matmuls
-    # on top of the legacy single-card one every cycle. Flip it on once elapsed/VRAM/host-RSS numbers
-    # from a real 8-GPU box show what that costs an honest miner.
+    # Off by default until enforcement is on in prod: a validator on the public image pulls each release at once,
+    # so a true default would enforce there before the shadow step. It never runs beside a renter. Details: DAH-6576.
     MATMUL_ALLCARDS_CHECK_ENABLED: bool = Field(env="MATMUL_ALLCARDS_CHECK_ENABLED", default=False)
     MATMUL_ALLCARDS_ENFORCEMENT_ENABLED: bool = Field(env="MATMUL_ALLCARDS_ENFORCEMENT_ENABLED", default=False)
     # Item 2b — send the advertised CPU-core count in the rental-verification health check so the
@@ -413,13 +420,6 @@ class Settings(BaseSettings):
         env="RENTED_POD_WATCH_NO_BANNER_RETRY_TIMEOUT_SECONDS", default=20.0, gt=0
     )
     RENTED_POD_WATCH_NO_BANNER_MISSES: int = Field(env="RENTED_POD_WATCH_NO_BANNER_MISSES", default=10, ge=1)
-    # A probed rented node the cycle has no result for (the miner timed out, failed, or left it out)
-    # is reported as EXECUTOR_RESULT_MISSING with only its observations. Off until the backend that
-    # stores such a report as evidence only (lium-platform) is deployed:
-    # an older backend would score it as a failed validation.
-    RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED: bool = Field(
-        env="RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED", default=False
-    )
     # DAH-4564 — read a rented pod's cpuset, CPU quota and init oom_score_adj and flag a host that
     # pinned or throttled the renter below 95% of its advertised cores, and zero its score. A raised
     # oom_score_adj is recorded only, never scored.
@@ -610,15 +610,6 @@ class Settings(BaseSettings):
     # Root log level. DEBUG brings back the per-cycle check outcomes that repeat the previous cycle
     # and the per-executor job-result dump after scoring; asyncssh and sqlalchemy keep their own levels.
     LOG_LEVEL: str = Field(env="LOG_LEVEL", default="INFO", description="Root log level (DEBUG, INFO, WARNING, ...)")
-
-    # DAH-2786 — GPU power cap revert gate. When True, an unrented executor whose host put the
-    # GPU power limit back while a Lium idle job was running, often enough inside the window,
-    # loses the unrented rental incentive while staying active. Ships in shadow mode: unlike
-    # DAH-2715 this gate reads provider behaviour rather than a capability, so the prod numbers
-    # are read first. Set to True to enforce.
-    ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT: bool = Field(
-        env="ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT", default=False
-    )
 
     # DAH-4299: whether an idle provider-chosen spot node is paid is decided as for a secure node
     # (its GPU model is in the unrented program and every idle-pool gate passes), not by whether a

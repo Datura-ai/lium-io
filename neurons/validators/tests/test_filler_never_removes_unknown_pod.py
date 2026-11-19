@@ -75,7 +75,7 @@ async def _run(svc, payload):
     executor_info.ssh_host_key = "ssh-ed25519 AAAATESTKEY"
     # production registers every create before create_container (handle_container); the cleanup
     # removes the failed container by name only while this create is the pod's only one
-    with ds_module.inflight_creates.track(payload.pod_id):
+    with ds_module.inflight_creates.track(payload.pod_id, ds_module.executor_key(payload)):
         return await svc.create_container(payload, executor_info, Mock(ss58_address="validator-hotkey"), "private-key")
 
 

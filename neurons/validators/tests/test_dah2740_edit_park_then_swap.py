@@ -27,6 +27,7 @@ from services.docker_service import (
     DockerService,
     _layer_data_check,
     create_steps_after_reply,
+    executor_key,
     inflight_creates,
 )
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS
@@ -122,7 +123,7 @@ async def _run(svc, payload):
         private_key="encrypted",
     )
     # a successful edit removes the parked container after its reply, with the create's session close
-    await create_steps_after_reply.wait_until_done(payload.pod_id, timeout=10)
+    await create_steps_after_reply.wait_until_done(payload.pod_id, executor_key(payload), timeout=10)
     return result
 
 
@@ -214,6 +215,9 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         " --format=csv,noheader,nounits",
         # DAH-4663: the clock-lock safety net resets the pod's GPUs, inside the failed-create cleanup, before docker run
         "nvidia-smi -i GPU-test -rgc >/dev/null 2>&1; echo GPU-test $?",
+        # then, in its own call: application and memory clocks back to default
+        "nvidia-smi -i GPU-test -rac >/dev/null 2>&1; echo GPU-test -rac $?; "
+        "nvidia-smi -i GPU-test -rmc >/dev/null 2>&1; echo GPU-test -rmc $?",
         host_key,
         "nohup /usr/bin/python /root/app/src/inspector_executor.py --start-collector >/dev/null 2>&1 &",
         f"/usr/bin/docker rm -fv id-{name}",
@@ -241,7 +245,7 @@ async def test_a_cancelled_step_after_the_reply_keeps_the_edit(svc, monkeypatch)
         private_key="encrypted",
     )
     await asyncio.sleep(0)
-    steps_finished = await create_steps_after_reply.wait_until_done(payload.pod_id, timeout=0.01)
+    steps_finished = await create_steps_after_reply.wait_until_done(payload.pod_id, executor_key(payload), timeout=0.01)
 
     assert isinstance(result, ContainerCreated)
     assert steps_finished is False
@@ -275,7 +279,7 @@ async def test_a_second_edit_parks_only_after_the_first_edits_steps_after_reply(
     await asyncio.sleep(0.1)
     inspector_may_start.set()
     second_edit_result = await asyncio.wait_for(second_edit, 10)
-    await create_steps_after_reply.wait_until_done(payload.pod_id, timeout=10)
+    await create_steps_after_reply.wait_until_done(payload.pod_id, executor_key(payload), timeout=10)
 
     assert isinstance(first_edit, ContainerCreated)
     assert isinstance(second_edit_result, ContainerCreated)
@@ -305,16 +309,16 @@ async def test_a_second_edit_cancelled_by_a_delete_while_it_waits_never_parks(sv
     )
 
     async def tracked_edit():
-        with inflight_creates.track(payload.pod_id):
+        with inflight_creates.track(payload.pod_id, executor_key(payload)):
             return await svc.create_container(**create)
 
     await svc.create_container(**create)
     second_edit = asyncio.create_task(tracked_edit())
     await asyncio.sleep(0.1)
-    inflight_creates.cancel(payload.pod_id)
+    inflight_creates.cancel(payload.pod_id, executor_key(payload))
     inspector_may_start.set()
     second_edit_result = await asyncio.wait_for(second_edit, 10)
-    await create_steps_after_reply.wait_until_done(payload.pod_id, timeout=10)
+    await create_steps_after_reply.wait_until_done(payload.pod_id, executor_key(payload), timeout=10)
 
     assert isinstance(second_edit_result, FailedContainerRequest)
     assert ssh.commands.count(f"/usr/bin/docker rename {name} {parked}") == 1
@@ -1119,11 +1123,12 @@ async def test_the_stopped_layer_read_reuses_the_upper_dir_the_running_read_foun
 
 
 @pytest.mark.asyncio
-async def test_a_write_during_the_stop_with_a_kept_container_on_the_host_fails_the_edit_before_the_replacement(svc, monkeypatch):
-    # the one-kept limit holds for a write seen only on the stopped layer: the edit fails and the pod comes back
+async def test_a_write_during_the_stop_with_a_kept_container_on_the_host_is_copied_onto_it(svc, monkeypatch):
+    # DAH-6226: a write seen only on the stopped layer goes onto the pod's one kept copy; the pod reboots
     payload = _edit_payload()
     ssh = _ssh_recording()
-    ssh.kept = [f"kept_unmounted_{payload.pod_id}_1700000000"]
+    old = f"kept_unmounted_{payload.pod_id}_1700000000"
+    ssh.kept = [old]
     answer = ssh.run.side_effect
     name = _pod_name(payload)
 
@@ -1141,10 +1146,9 @@ async def test_a_write_during_the_stop_with_a_kept_container_on_the_host_fails_t
 
     result = await _run(svc, payload)
 
-    assert isinstance(result, FailedContainerRequest)
-    assert result.failure_step == "park_current_container"
-    svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
-    assert _docker(ssh.commands, "rm -fv id-") == []
+    assert isinstance(result, ContainerCreated)
+    assert len(_docker(ssh.commands, "cp")) == 1 and f"id-{old}:" in _docker(ssh.commands, "cp")[0]
+    assert _docker(ssh.commands, "rm -fv id-") == [f"/usr/bin/docker rm -fv id-{name}"]
 
 
 @pytest.mark.asyncio
@@ -1387,19 +1391,69 @@ async def test_a_failed_edit_restores_the_mount_the_pod_had(svc, monkeypatch, mo
 
 
 @pytest.mark.asyncio
-async def test_a_second_unmounted_edit_is_refused_while_a_kept_container_is_on_the_host(svc, monkeypatch):
+async def test_a_second_unmounted_edit_copies_its_files_onto_the_kept_copy_and_reboots_the_pod(svc, monkeypatch):
+    # DAH-6226: a one-kept refusal left pod 1625a2bb REBOOT_FAILED while it ran and billed. One rolling copy instead:
+    # the new layer's renter files go onto the earlier kept copy, the parked one is removed, the count stays one
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    old = f"kept_unmounted_{payload.pod_id}_1700000000"
+    ssh.kept = [old]
+    _report_unmounted(ssh)
+    _patch_happy(svc, monkeypatch, ssh)
+    name = _pod_name(payload)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated)
+    [copy] = _docker(ssh.commands, "cp")
+    # newest over older: the parked layer's files are extracted onto the earlier kept copy, not the other way
+    assert f"| /usr/bin/docker cp - id-{old}:/root" in copy
+    assert "pipefail" in copy
+    assert _docker(ssh.commands, "rm -fv id-") == [f"/usr/bin/docker rm -fv id-{name}"]  # the copied parked one only
+
+
+@pytest.mark.asyncio
+async def test_the_kept_copy_takes_only_the_parked_layers_own_files_never_its_image_files(svc, monkeypatch):
+    # an archive of the stopped container's merged path carries image files, which would overwrite older renter
+    # files of the same name on the kept copy: only the layer's own files, outside the start windows, are copied
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    old = f"kept_unmounted_{payload.pod_id}_1700000000"
+    ssh.kept = [old]
+    _report_unmounted(ssh)
+    _patch_happy(svc, monkeypatch, ssh)
+
+    await _run(svc, payload)
+
+    [copy] = _docker(ssh.commands, "cp")
+    assert f"{_kept(payload)}:" not in copy  # never `docker cp <parked>:<path>`, the merged rootfs
+    assert "GraphDriver.Data.UpperDir" in copy and "find . -mindepth 1" in copy and "$w -print0" in copy
+    assert "tar --null -T - -cf - | /usr/bin/docker cp - " in copy
+
+
+@pytest.mark.asyncio
+async def test_a_failed_copy_onto_the_kept_copy_fails_the_edit_and_keeps_both(svc, monkeypatch):
     payload = _edit_payload()
     ssh = _ssh_recording()
     ssh.kept = [f"kept_unmounted_{payload.pod_id}_1700000000"]
     _report_unmounted(ssh)
+    answer = ssh.run.side_effect
+
+    def _side(cmd, *args, **kwargs):
+        if "/usr/bin/docker cp" in cmd:
+            ssh.commands.append(cmd)
+            return _ssh_result(exit_status=1, stderr="no space left on device")
+        return answer(cmd, *args, **kwargs)
+
+    ssh.run.side_effect = _side
     _patch_happy(svc, monkeypatch, ssh)
 
     result = await _run(svc, payload)
 
     assert isinstance(result, FailedContainerRequest)
-    assert _docker(ssh.commands, "rename") == [] and _docker(ssh.commands, "stop") == []
-    assert _docker(ssh.commands, "rm -fv id-") == []
+    assert result.failure_step == "park_current_container"
     svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+    assert _docker(ssh.commands, "rm -fv id-") == []
 
 
 @pytest.mark.asyncio

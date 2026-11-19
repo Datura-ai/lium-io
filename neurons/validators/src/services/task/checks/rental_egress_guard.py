@@ -1,8 +1,8 @@
 """Running rental containers get the link-local egress drop that custom builds already have.
 
-Builds drop egress to blocked ranges through host DOCKER-USER rules set by a
-``--network=host --cap-add=NET_ADMIN`` helper container (``docker_service._egress_filter_script``).
-This check applies the same kind of rule for rentals: traffic entering from the ``lium-rentals``
+Builds drop egress to blocked ranges through host DOCKER-USER rules (``docker_service._egress_filter_script``).
+This check applies the same kind of rule for rentals, from a shell in the host's mount and network namespaces
+(``nsenter -t 1 -m -n -r``; the executor runs privileged with ``pid: host``), so it needs no image and no registry: traffic entering from the ``lium-rentals``
 bridge, and from a running legacy rental still on another network (the default bridge; a running
 pod is never moved), to link-local 169.254/16 is dropped, except DNS (port 53), because a rental
 container's embedded resolver forwards from the container's network namespace and some hosts use
@@ -10,7 +10,7 @@ a link-local resolver.
 
 - Never before a scored step: on a rented node TenantEnforcementCheck runs it in its rented halt
   branch, so only the halt waits for it; on an idle node it runs after ScoreCheck. A first
-  helper-image pull can take up to ``HELPER_TIMEOUT_SECONDS``, so it is skipped (and retried next
+  helper run is bounded by ``HELPER_TIMEOUT_SECONDS``, so it is skipped (and retried next
   cycle) when less than that is left before the executor task is cancelled.
 - Periodic, not on the create path: host iptables are gone after a reboot while rental
   containers come back (``restart=unless-stopped``), and a rental create gains no extra step.
@@ -18,7 +18,7 @@ a link-local resolver.
   host shows now and swapped in, so a recreated rental network or an ended legacy pod leaves no
   rule behind. The rental bridge is matched by interface, not subnet: a subnet Docker later
   gives an unrelated network is never caught.
-- Fail-open: a host without a DOCKER-USER chain or without the helper image logs a warning and
+- Fail-open: a host without a DOCKER-USER chain or without iptables logs a warning and
   validation proceeds; a hardening rule must not take a provider's node out of rotation.
 - DOCKER-USER sees forwarded traffic only: Docker's embedded DNS, published ports,
   container-to-container traffic on the subnet and the validator's inbound SSH are unaffected.
@@ -36,7 +36,6 @@ import time
 from services.const import LEGACY_LIUM_CONTAINER_NAME
 from services.rental_docker_sdk import RENTAL_NETWORK_NAME
 
-from core.config import settings
 from core.utils import _m, get_extra_info
 
 from ..messages import RentalEgressGuardMessages as Msg
@@ -61,14 +60,12 @@ CHAINS = ("LIUM-RENTAL-EGRESS-A", "LIUM-RENTAL-EGRESS-B")
 BRIDGE_NAME_OPTION = "com.docker.network.bridge.name"
 _IFNAME = re.compile(r"[A-Za-z0-9_.-]{1,15}")
 # One host-wide lock around every apply and cleanup: two miners can report the same host, and two interleaved
-# chain swaps could otherwise flush the chain the other just made active. The helper takes it itself: it runs on the
-# host's daemon, so the bind of HOST_LOCK_DIR is one host directory shared by every executor's helper. Only that
-# directory is mounted, never all of /run/lock: the DinD image's shell must not reach other services' locks.
-HOST_LOCK_DIR = "/run/lock/lium-rental-egress"  # `-v` creates it on the host when missing
-LOCK_MOUNT = "/lium-rental-egress-lock"
-HOST_LOCK = f"{LOCK_MOUNT}/apply.lock"
+# chain swaps could otherwise flush the chain the other just made active. The helper runs in the host's mount
+# namespace, so this is one host file shared by every executor's helper.
+HOST_LOCK_DIR = "/run/lock/lium-rental-egress"
+HOST_LOCK = f"{HOST_LOCK_DIR}/apply.lock"
 LOCK_WAIT_SECONDS = 30
-# The helper's own bound, inside the executor-side one: killing the docker client does not stop the container.
+# The helper's own bound, inside the executor-side one: the host-side shell is bounded on its own side too.
 HELPER_RUN_SECONDS = HELPER_TIMEOUT_SECONDS - 10
 _ABSENT_NETWORK = re.compile(r"no such network|network \S+ not found", re.IGNORECASE)
 _ABSENT_CONTAINER = re.compile(r"no such (object|container)", re.IGNORECASE)
@@ -165,6 +162,7 @@ def link_local_drop_script(bridge: str | None, legacy_bridges: list[str]) -> str
     lines = [
         "IPT=iptables-nft",
         "$IPT -L DOCKER-USER -n >/dev/null 2>&1 || IPT=iptables-legacy",
+        "$IPT -L DOCKER-USER -n >/dev/null 2>&1 || IPT=iptables",  # a host iptables without the -nft/-legacy names
         '$IPT -L DOCKER-USER -n >/dev/null 2>&1 || { echo "DOCKER-USER chain not found" >&2; exit 3; }',
         f"$IPT -N {a} 2>/dev/null; $IPT -N {b} 2>/dev/null",
         'RULES=$($IPT -S DOCKER-USER) || { echo "DOCKER-USER not readable" >&2; exit 4; }',
@@ -193,6 +191,7 @@ def link_local_cleanup_script() -> str:
     lines = [
         "IPT=iptables-nft",
         "$IPT -L DOCKER-USER -n >/dev/null 2>&1 || IPT=iptables-legacy",
+        "$IPT -L DOCKER-USER -n >/dev/null 2>&1 || IPT=iptables",  # a host iptables without the -nft/-legacy names
         "$IPT -L DOCKER-USER -n >/dev/null 2>&1 || exit 0",
     ]
     for chain in CHAINS:
@@ -211,7 +210,7 @@ def locked_script(script: str) -> str:
     """``script`` under the host lock. The lock is on fd 9 of the shell running the iptables calls, which inherit it,
     so it is released only when the last of them exits: no timeout can free it while a mutation still runs."""
     return (
-        f"exec 9>>{HOST_LOCK} || exit 5; "
+        f"mkdir -p {shlex.quote(HOST_LOCK.rsplit('/', 1)[0])} && exec 9>>{HOST_LOCK} || exit 5; "
         f"timeout {LOCK_WAIT_SECONDS} flock 9 || {{ echo 'host lock not taken' >&2; exit 5; }}; {script}"
     )
 
@@ -222,13 +221,12 @@ def helper_command(script: str) -> str:
 
 
 def _helper(script: str) -> str:
-    # --init: the shell is not the container's PID 1, which ignores a SIGKILL from inside its namespace; once it dies
-    # the init exits and the kernel kills whatever is left, so the lock goes with the helper
+    # The host's own iptables in its network namespace: no helper container, so no image pull that a registry
+    # (Docker Hub's anonymous rate limit) can refuse. -r: the lock file, /bin/sh and iptables resolve in the host's
+    # root, so every executor on one host takes the same lock instead of one in its own container root
     return (
         f"timeout -k 5 {HELPER_TIMEOUT_SECONDS} "
-        f"/usr/bin/docker run --rm --init --network=host --cap-add=NET_ADMIN -v {HOST_LOCK_DIR}:{LOCK_MOUNT} "
-        f"--entrypoint /bin/sh {shlex.quote(settings.CUSTOM_DOCKERFILE_DIND_IMAGE)} "
-        f"-c {shlex.quote(helper_command(script))}"
+        f"nsenter -t 1 -m -n -r -- /bin/sh -c {shlex.quote(helper_command(script))}"
     )
 
 
@@ -367,8 +365,7 @@ class RentalEgressGuardCheck:
                 )
                 legacy = legacy_bridge_inventory(nets)
         if bridge is None and not legacy:
-            # rules from a rental that has since ended must not outlive it (Docker reuses its address); the image
-            # is pulled if it was pruned, since its absence says nothing about rules left in DOCKER-USER
+            # rules from a rental that has since ended must not outlive it (Docker reuses its address)
             result = await ctx.ssh.run(_helper(link_local_cleanup_script()), check=False)
             return None, _error(result)
         result = await ctx.ssh.run(_helper(link_local_drop_script(bridge, legacy)), check=False)

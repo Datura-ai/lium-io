@@ -12,7 +12,6 @@ from incentive.rental_price import (
     MissingFull8xCapability,
     PortLimitedRemainder,
     PowerCapIncapable,
-    PowerCapReverted,
     RentalPriceIncentive,
 )
 from services.task_service import JobResult
@@ -39,7 +38,6 @@ def test_reason_enum_pins_the_stable_code_contract():
         "insufficient_disk_for_vram",
         "flagship_without_ncu_or_split",
         "cannot_apply_gpu_power_cap",
-        "reverts_gpu_power_cap",
         "outdated_executor_image",
         "port_limited_remainder",
         "provider_email_not_confirmed",
@@ -173,16 +171,6 @@ def _job(**overrides) -> JobResult:
             "CAP_SYS_ADMIN",
         ),
         (
-            lambda job: MinerLogLine.no_payout_because_reverts_gpu_power_cap(
-                job,
-                PowerCapReverted(
-                    revert_count=3, window_hours=24, capped_to_watts=280, found_watts=400
-                ),
-            ),
-            "reverts_gpu_power_cap",
-            "nvidia-smi -pl",
-        ),
-        (
             lambda job: MinerLogLine.no_payout_because_port_limited_remainder(
                 job, PortLimitedRemainder(
                     available_port_count=2, required_port_count=4, free_split_count=4, paid_split_count=0, unpaid_gpu_count=4
@@ -314,7 +302,7 @@ def test_to_log_line_renders_message_and_reason_code():
     "line, message_fragment, expected_keys",
     [
         (
-            MinerLogLine.mining_score_calculated(_job(mining_score=1.0), False),
+            MinerLogLine.mining_score_calculated(_job(mining_score=1.0)),
             "Mining score is calculated",
             ["mining_score", "gpu_portion", "driver_multiplier"],
         ),
@@ -343,7 +331,7 @@ def test_report_builder_message_and_keys(line, message_fragment, expected_keys):
 
 def test_report_line_renders_string_and_builds_internal_log():
     job = _job(mining_score=1.0)
-    line = MinerLogLine.mining_score_calculated(job, is_rented_after_cutoff=False)
+    line = MinerLogLine.mining_score_calculated(job)
 
     assert "Mining score is calculated" in line.to_log_line()
 
@@ -380,7 +368,7 @@ def test_record_incentive_log_keeps_zero_reason_as_text_and_data() -> None:
 def test_record_incentive_log_ignores_calculation_reports_for_the_data_path() -> None:
     # A calc report has reason=None: it belongs in the log text but is NOT a zero-incentive reason.
     job = _job(mining_score=1.0)
-    job.record_incentive_log(MinerLogLine.mining_score_calculated(job, is_rented_after_cutoff=False))
+    job.record_incentive_log(MinerLogLine.mining_score_calculated(job))
 
     assert job.incentive_logs                      # still logged as text
     assert job.zero_incentive_reasons == []        # but not surfaced as a structured reason

@@ -45,13 +45,19 @@ class ExecutorImageReport:
 class ExpectedImageSnapshot:
     executor: ExpectedImage | None
     executor_ref: str
+    # DAH-6560: the release just replaced, set only while the rollout window covers the cycle; a node
+    # still on it has not been reached by Watchtower yet, so it reads CURRENT instead of OUTDATED
+    rollout_previous_digest: str | None = None
+    # releases replaced before that one whose own grace still runs (two pushes close together)
+    rollout_earlier_digests: tuple[str, ...] = ()
 
     def report(self, observed_digest: str | None) -> ExecutorImageReport:
         if self.executor is None:
             raise ValueError("Cannot report without an expected executor digest")
         status = (
             ImageVerdict.CURRENT
-            if observed_digest == self.executor.digest
+            if observed_digest is not None
+            and observed_digest in (self.executor.digest, self.rollout_previous_digest, *self.rollout_earlier_digests)
             else ImageVerdict.OUTDATED
         )
         return ExecutorImageReport(

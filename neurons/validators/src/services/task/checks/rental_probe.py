@@ -265,6 +265,15 @@ class RentalProbeCheck:
                 ),
                 updates={"score": 0.0, "job_score": 0.0},
             )
+        if result.passed and ctx.state.allcards_skipped_for_standing_probe_failure:
+            # the all-cards work proof did not judge the node this cycle: it relists after the next cycle runs it
+            return CheckResult(
+                passed=False,
+                event=render_message(
+                    Msg.CYCLE_WITHOUT_ALLCARDS, ctx=ctx, check_id=self.check_id, what=result.event.what_we_saw
+                ),
+                updates={"score": 0.0, "job_score": 0.0},
+            )
         return result
 
     async def _probe_and_judge(self, ctx: Context) -> CheckResult:

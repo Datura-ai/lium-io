@@ -138,6 +138,7 @@ STUBS = {
     ),
     # records "<seconds> <command>" in .stub-docker/timeouts, then runs the command
     "timeout": '#!/bin/bash\necho "$*" >> "$SYSBOX_SETUP_HOST_ROOT/.stub-docker/timeouts"\nshift\nexec "$@"\n',
+    "systemctl": '#!/bin/bash\necho "$*" >> "$SYSBOX_SETUP_HOST_ROOT/.stub-docker/systemctl"\n',
     # `ip route` gives the default route; `ip route get X` routes X via it unless STUB_IP_LOCAL names X (a local subnet)
     "ip": textwrap.dedent(
         """\
@@ -457,6 +458,33 @@ def test_install_reloads_the_profile_even_when_an_earlier_run_already_wrote_the_
     assert rc == 0
     assert (tmp_path / "root/.stub-docker/apparmor").read_text() == "-r /etc/apparmor.d/fusermount3\n"
     assert (tmp_path / "root/etc/apparmor.d/local/fusermount3").read_text().count(APPARMOR_RULE) == 1
+
+
+def test_install_gives_sysbox_services_time_to_start_and_a_restart(tmp_path):
+    # sysbox-ce 0.7.1: 10 s (fs) / 45 s (mgr) start timeouts and no Restart=, so a slow boot left sysbox down
+    rc, _, _ = run_check(tmp_path, "install_sysbox_restart_dropins")
+    assert rc == 0
+    for svc in ("sysbox-fs", "sysbox-mgr"):
+        dropin = tmp_path / f"root/etc/systemd/system/{svc}.service.d/lium-restart.conf"
+        assert dropin.read_text() == "[Service]\nTimeoutStartSec=90\nRestart=on-failure\nRestartSec=5\n"
+    assert (tmp_path / "root/.stub-docker/systemctl").read_text() == "daemon-reload\n"
+
+
+SYSBOX_DROPINS = {
+    f"etc/systemd/system/{svc}.service.d/lium-restart.conf": "[Service]\nRestart=on-failure\n"
+    for svc in ("sysbox-fs", "sysbox-mgr")
+}
+
+
+def test_check_sysbox_tells_a_node_without_the_restart_dropins_to_rerun_the_installer(tmp_path):
+    rc, out, fixes = run_check(tmp_path, "check_sysbox")
+    assert (rc, fixes) == (1, 1)
+    assert "restart-on-failure drop-in" in out
+
+
+def test_check_sysbox_passes_with_the_restart_dropins(tmp_path):
+    rc, _, fixes = run_check(tmp_path, "check_sysbox", files=SYSBOX_DROPINS)
+    assert (rc, fixes) == (0, 0)
 
 
 def test_install_with_apparmor_off_skips_the_reload(tmp_path):
