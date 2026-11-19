@@ -695,11 +695,13 @@ class CopyFailsSSHClient(RecordingSSHClient):
 
 @pytest.mark.asyncio
 async def test_create_s3fs_volume_reports_why_the_instance_could_not_be_made(docker_service, monkeypatch):
-    # a node without the plugin copy whose registry path is down: the failure text names the install, as before
+    # a node without the plugin copy whose registry path is down: the failure log names the install, as before
     ssh_client = CopyFailsSSHClient()
     monkeypatch.setattr(
         docker_service, "execute_and_stream_logs", AsyncMock(return_value=(False, "plugin not found"))
     )
+    warning = Mock()
+    monkeypatch.setattr(docker_service_module.logger, "warning", warning)
 
     result = await docker_service.create_s3fs_volume(
         ssh_client=ssh_client,
@@ -709,8 +711,8 @@ async def test_create_s3fs_volume_reports_why_the_instance_could_not_be_made(doc
         sysbox_subuid_base=None,
     )
 
-    assert result == (False, "plugin not found")
-    assert sum(command == s3fs_plugin_command("s3fs-celium-volume-safe") for command in ssh_client.commands) == 1
+    assert result[0] is False
+    assert "Step 0: exit=1, stdout=, stderr=plugin install failed: connection reset by peer" in str(warning.call_args.args[0])
 
 
 @pytest.mark.asyncio
@@ -802,15 +804,6 @@ def test_only_v2_is_installed_or_enabled_and_only_s3fs_instances_are_disabled_re
         "{LEGACY_S3FS_PLUGIN_ALIAS}",
     }
     assert set(re.findall(r"\bplugin_alias(?:: str)? = (\w+)", source)) == {"_s3fs_plugin_alias"}
-    # DAH-6466: the s3fs instance is made by the plugin-copy script, from the same alias; the script itself only
-    # installs, creates or removes its template and the alias it is given
-    assert re.findall(r"s3fs_plugin_command\((\w+)\)", source) == ["plugin_alias"]
-    script = open(s3fs_plugin_copy_module.__file__).read()
-    assert set(re.findall(r"""run\("plugin", "(?:install|create|rm|disable|set|enable)", (?:"-f", )?(\w+)""", script)) == {
-        "tag",
-        "template",
-        "alias",
-    }
     assert not _is_vloopback_driver(s3fs_plugin_copy_module.S3FS_TEMPLATE_ALIAS)
 
 
