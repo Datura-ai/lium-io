@@ -471,6 +471,12 @@ class Validator:
                         executor_image_snapshot,
                         rollout_previous_digest=normalize_sha256_digest(rollout_window.previous_digest),
                     )
+                earlier = rollout_window.earlier_reading_current(job_block)
+                if earlier:
+                    executor_image_snapshot = dataclasses.replace(
+                        executor_image_snapshot,
+                        rollout_earlier_digests=tuple(filter(None, map(normalize_sha256_digest, earlier))),
+                    )
 
                 logger.info(
                     _m(
