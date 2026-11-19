@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from uuid import UUID
 
+from core.config import settings
 from protocol.vc_protocol.compute_requests import (
     BROKEN_POD_STATUS,
     LIVE_FILLER_RUN_STATUSES,
@@ -32,6 +33,7 @@ from services.redis_service import (
     EDIT_PARKED_CONTAINER_PREFIX,
     FILLER_IMAGE_DIGESTS_PREFIX,
     FILLER_IMAGE_DIGESTS_TTL_SECONDS,
+    FILLER_IMAGE_REPOSITORY_PREFIX,
     STOPPED_BY_RECOVERY_PREFIX,
     STOPPED_BY_RECOVERY_STOPPED,
 )
@@ -51,6 +53,18 @@ from ..pipeline import CheckResult, Context
 from .rental_owner import rental_of_this_node
 
 logger = logging.getLogger(__name__)
+
+# The filler workloads whose GPU processes are known, by the image repository the validator started
+# the filler from: (workload, the executable names its GPU processes run as). A name matches the start
+# of the executable's basename, or of the script or module an interpreter runs, or the part before "::"
+# of a renamed process title (vLLM's engine child shows as "VLLM::EngineCore"). A repository not
+# listed here is not judged.
+FILLER_PROCESS_ALLOWLISTS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "daturaai/pearl-miner": ("PEARL", ("peakminer",)),
+    # the worker downloads its inference engine at run time; the engine has been vLLM and sonar
+    "daturaai/dolphin": ("DPHN", ("dolphinpod", "sonar", "vllm")),
+}
+_INTERPRETER = re.compile(r"python[0-9.]*")
 
 
 @dataclass(frozen=True)
@@ -241,6 +255,9 @@ class GpuUsageCheck:
         # judged at any load, also beside a rental pod: a swapped filler can hold VRAM while staying
         # under the utilization limits
         off_image = await _fillers_off_their_image(ctx, process_names & filler_containers)
+        foreign_in_fillers = await _foreign_processes_in_fillers(
+            ctx, gpu_processes, (process_names & filler_containers) - set(off_image)
+        )
         violation = _find_violation(gpu_details, gpu_processes)
         if violation and "gpu_index" in violation:
             # the card's index on the node, not in the list left after a reset dropped some
@@ -250,6 +267,8 @@ class GpuUsageCheck:
             )
         if violation is None and off_image:
             violation = {"filler_containers_off_their_image": off_image}
+        if foreign_in_fillers:
+            violation = {**(violation or {}), "filler_foreign_processes": foreign_in_fillers}
 
         if violation is None:
             foreign_result = await self._judge_foreign_occupancy(ctx, gpu_details, gpu_processes)
@@ -264,7 +283,7 @@ class GpuUsageCheck:
             )
             return CheckResult(passed=True, event=event)
 
-        if fillers_only and not off_image:
+        if fillers_only and not off_image and not foreign_in_fillers:
             event = render_message(
                 Msg.USAGE_OK,
                 ctx=ctx,
@@ -293,7 +312,11 @@ class GpuUsageCheck:
             ctx=ctx,
             check_id=self.check_id,
             what=violation,
-            **_measured_usage_remediation(violation, filler_containers),
+            **(
+                _foreign_process_remediation(foreign_in_fillers)
+                if foreign_in_fillers
+                else _measured_usage_remediation(violation, filler_containers)
+            ),
         )
         return CheckResult(passed=False, event=event)
 
@@ -529,6 +552,65 @@ async def _fillers_off_their_image(ctx: Context, names: set[str]) -> list[str]:
             off_image,
         )
     return off_image
+
+
+def _runs_as(cmdline: str) -> str:
+    """The name a process runs as: its executable's basename, the script or module an interpreter runs,
+    or the part of a renamed process title before "::"."""
+    argv = cmdline.split()
+    name = argv[0].rsplit("/", 1)[-1] if argv else ""
+    if _INTERPRETER.fullmatch(name):
+        args = [arg for arg in argv[1:] if arg != "-u"]
+        if args[:1] == ["-m"]:
+            args = args[1:]
+        name = args[0].rsplit("/", 1)[-1] if args else name
+    return name.split("::", 1)[0].lower()
+
+
+async def _foreign_processes_in_fillers(ctx: Context, gpu_processes: list[dict], names: set[str]) -> list[str]:
+    """The GPU processes inside these fillers whose command is not one their workload runs, as
+    "<container> (pid <pid>): <command>". Judged as foreign GPU work only when
+    FILLER_PROCESS_ALLOWLIST_ENFORCED is on, logged either way. Not judged: a process with no scraped
+    command (the scrape could not read it, or a scraper that does not report it), a filler with no
+    readable repository record, or a workload with no allowlist."""
+    workloads: dict[str, tuple[str, tuple[str, ...]]] = {}
+    for name in sorted(names):
+        try:
+            key = f"{FILLER_IMAGE_REPOSITORY_PREFIX}{name}"
+            repository = await ctx.services.redis.get(key)
+            if repository:
+                # a filler can outlive the TTL: keep its record while it is still being checked
+                await ctx.services.redis.expire(key, FILLER_IMAGE_DIGESTS_TTL_SECONDS)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Filler image repository record unreadable, not judging %s: %s", name, exc)
+            continue
+        if workload := FILLER_PROCESS_ALLOWLISTS.get(str(repository or "")):
+            workloads[name] = workload
+    foreign: list[tuple[str, str]] = []
+    for process in gpu_processes:
+        container = process.get("container_name")
+        cmdline = str(process.get("cmdline") or "").strip()
+        if container not in workloads or not cmdline:
+            continue
+        strategy, allowed = workloads[container]
+        if not _runs_as(cmdline).startswith(allowed):
+            foreign.append((strategy, f"{container} (pid {process.get('pid')}): {cmdline}"))
+    if not foreign:
+        return []
+    enforced = settings.FILLER_PROCESS_ALLOWLIST_ENFORCED
+    logger.warning(
+        "FILLER_FOREIGN_PROCESS executor=%s miner=%s processes=%s strategies=%s enforced=%s",
+        ctx.executor.uuid,
+        ctx.miner_hotkey,
+        [described for _, described in foreign],
+        sorted({strategy for strategy, _ in foreign}),
+        enforced,
+    )
+    return [described for _, described in foreign] if enforced else []
+
+
+def _foreign_process_remediation(foreign_in_fillers: list[str]) -> dict:
+    return {"remediation": Msg.FOREIGN_PROCESS_IN_FILLER_REMEDIATION.format(processes="; ".join(foreign_in_fillers))}
 
 
 def carries_a_rental_prefix(container_name: str) -> bool:

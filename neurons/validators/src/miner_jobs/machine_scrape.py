@@ -1307,10 +1307,17 @@ def get_gpu_processes(pids: set, containers: list[dict]):
                     container_name = container['each_name']
                     break
 
+            # what runs, for the filler allowlist check; a failed read is empty and leaves the process unjudged
+            try:
+                cmdline = run_cmd(f"tr '\\0' ' ' < /proc/{pid}/cmdline").strip()[:512]
+            except:
+                cmdline = ""
+
             processes.append({
                 "processes_pid": pid,
                 "processes_info": info,
-                "processes_container_name": container_name
+                "processes_container_name": container_name,
+                "processes_cmdline": cmdline
             })
         except:
             pass
