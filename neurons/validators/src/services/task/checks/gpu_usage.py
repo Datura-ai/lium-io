@@ -27,6 +27,7 @@ from services.const import (
     RENTAL_CLOSE_CLOCK_SKEW_MINUTES,
     RENTAL_TEARDOWN_GRACE_MINUTES,
 )
+from services.container_cleanup import image_repository
 from services.gpu_reset import renter_gpu_resets
 from services.redis_service import (
     EDIT_PARKED_CONTAINER_PREFIX,
@@ -576,23 +577,39 @@ async def _foreign_processes_in_fillers(
     ctx: Context, gpu_processes: list[dict], filler_container_names: set[str]
 ) -> list[str]:
     """The GPU processes inside these fillers whose command is not one their workload runs, as
-    "<container> (pid <pid>): <command>", each judged as foreign GPU work. Not judged: a process with no scraped
-    command (the scrape could not read it, or a scraper that does not report it), a filler with no
-    readable repository record, or a workload with no allowlist."""
+    "<container> (pid <pid>): <command>", each judged as foreign GPU work. A filler's workload is read from the
+    image its running container reports this cycle, so a filler started before the creation-time record existed
+    is judged too; that record is the cross-check."""
+    running = {
+        str(entry.get("name") or ""): image_repository(str(entry.get("repository") or ""))
+        for entry in ((ctx.state.specs or {}).get("docker") or {}).get("containers") or []
+        if isinstance(entry, dict)
+    }
     workloads: dict[str, FillerWorkload] = {}
     for name in sorted(filler_container_names):
+        recorded = None
         try:
             key = f"{FILLER_IMAGE_REPOSITORY_PREFIX}{name}"
-            repository = await ctx.services.redis.get(key)
-            if repository:
+            recorded = await ctx.services.redis.get(key)
+            if recorded:
                 # a filler can outlive the TTL: keep its record while it is still being checked
                 await ctx.services.redis.expire(key, FILLER_IMAGE_DIGESTS_TTL_SECONDS)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Filler image repository record unreadable, not judging %s: %s", name, exc)
-            continue
-        if isinstance(repository, bytes):  # the prod Redis client returns bytes
-            repository = repository.decode()
-        if workload := FILLER_PROCESS_ALLOWLISTS.get(repository or ""):
+            logger.warning("Filler image repository record unreadable for %s, using its running image: %s", name, exc)
+        if isinstance(recorded, bytes):  # the prod Redis client returns bytes
+            recorded = recorded.decode()
+        live = running.get(name) or None
+        if recorded and live and recorded != live:
+            # the container runs another image than the validator started: judge it by what was started
+            logger.warning(
+                "FILLER_IMAGE_REPOSITORY_MISMATCH executor=%s miner=%s container=%s started=%s running=%s",
+                ctx.executor.uuid,
+                ctx.miner_hotkey,
+                name,
+                recorded,
+                live,
+            )
+        if workload := FILLER_PROCESS_ALLOWLISTS.get(recorded or live or ""):
             workloads[name] = workload
     foreign: list[tuple[str, str]] = []
     for process in gpu_processes:

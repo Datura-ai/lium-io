@@ -1900,7 +1900,7 @@ async def test_swapped_filler_is_judged_beside_a_rental_pod(context_factory, mon
     assert result.event.what_we_saw["filler_containers_off_their_image"] == ["filler_swapped"]
 
 
-async def _filler_process_ctx(context_factory, cmdline, repository="daturaai/pearl-miner"):
+async def _filler_process_ctx(context_factory, cmdline, repository="daturaai/pearl-miner", running=None):
     from neurons.validators.src.services.redis_service import (
         FILLER_IMAGE_DIGESTS_PREFIX,
         FILLER_IMAGE_REPOSITORY_PREFIX,
@@ -1919,7 +1919,7 @@ async def _filler_process_ctx(context_factory, cmdline, repository="daturaai/pea
             executors={},
             all_filler_containers_by_executor={"executor-123": [filler]},
         ),
-        specs={"docker": {"containers": [{"name": filler, "digest": "sha256:filler"}]}},
+        specs={"docker": {"containers": [{"name": filler, "digest": "sha256:filler", "repository": running}]}},
     )
     return context_factory(services=services, config=build_context_config(), state=state), filler
 
@@ -1969,7 +1969,7 @@ async def test_a_fillers_own_workload_passes(
     [
         ("daturaai/pearl-miner", ""),  # the scrape could not read it, or liumd does not report it
         ("daturaai/pearl-miner", None),
-        (None, "/opt/other/gpu-app"),  # a filler started before the repository was recorded
+        (None, "/opt/other/gpu-app"),  # no record and no running image reported
         ("ghcr.io/hanlinai/engy-golden-serve", "/opt/other/gpu-app"),  # a workload with no allowlist
     ],
 )
@@ -2211,3 +2211,31 @@ async def test_a_repository_record_read_as_bytes_still_names_the_workload(contex
 
     assert result.passed is False
     assert result.event.what_we_saw["filler_foreign_processes"] == [f"{filler} (pid 4242): /opt/other/gpu-app --run"]
+
+
+@pytest.mark.parametrize(
+    "cmdline, passed",
+    [("/opt/other/gpu-app --run", False), ("/var/lib/pearl/bin/peakminer --coin pearl", True)],
+)
+@pytest.mark.asyncio
+async def test_a_filler_with_no_record_is_judged_by_its_running_image(context_factory, cmdline, passed):
+    # a filler started before the creation-time record existed: its running image names the workload
+    ctx, _ = await _filler_process_ctx(context_factory, cmdline, repository=None, running="daturaai/pearl-miner")
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is passed
+
+
+@pytest.mark.asyncio
+async def test_a_running_image_other_than_the_recorded_one_is_judged_by_the_record(context_factory, caplog):
+    ctx, filler = await _filler_process_ctx(
+        context_factory, "sonar serve model", repository="daturaai/pearl-miner", running="docker.io/daturaai/dolphin"
+    )
+
+    with caplog.at_level("WARNING"):
+        result = await GpuUsageCheck().run(ctx)
+
+    assert "FILLER_IMAGE_REPOSITORY_MISMATCH" in caplog.text
+    assert result.passed is False
+    assert result.event.what_we_saw["filler_foreign_processes"] == [f"{filler} (pid 4242): sonar serve model"]
