@@ -299,10 +299,12 @@ jobs:
         if: needs.route.result == 'skipped'
         working-directory: ${{ github.workspace }}
         run: echo "this review cannot gate the tree; the last e2e-gate result stands"
+      # With the queue off the PR check is the real gate: a green here would let an approved head merge
+      # before the approval run reports, so fail closed instead.
       - name: not approved yet
         if: needs.route.result == 'success' && github.event_name != 'merge_group' && needs.route.outputs.approved != 'true'
         working-directory: ${{ github.workspace }}
-        run: echo "the approval rule blocks the merge; e2e-gate reports after a review approves"
+        run: echo "the approval rule blocks the merge; e2e-gate reports after a review approves" && [ "${{ vars.MERGE_QUEUE_ENABLED }}" = "true" ]
       - name: deferred to the merge queue
         if: github.event_name != 'merge_group' && needs.route.outputs.approved == 'true' && vars.MERGE_QUEUE_ENABLED == 'true'
         working-directory: ${{ github.workspace }}
