@@ -329,7 +329,7 @@ class ExecutorSpecRequest(ValidatorMessage):
     host_runtime_fault: bool | None = None
     # 2.17.0: the rented pods this cycle's pod checks judged, by pod id, each with the host-side fault codes found on
     # it (`RENTED_POD_PROC_FUSE_DISCONNECTED`); [] = judged and clean. A pod not listed was not judged. None = no check
-    # judged a pod, or a publisher that predates the field. Report only: changes no score, billing or payout.
+    # judged a pod, or a publisher that predates the field.
     rented_pod_faults: dict[str, list[str]] | None = pydantic.Field(default=None, max_length=POD_STATES_MAX_ITEMS)
     # 2.17.0: this cycle's fresh DinD test container read a sysbox-fs file clean. None from a publisher that predates
     # the field.

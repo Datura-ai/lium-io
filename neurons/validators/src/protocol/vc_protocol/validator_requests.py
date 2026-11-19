@@ -239,8 +239,7 @@ class ExecutorSpecRequest(BaseValidatorRequest):
     # the backend reads it with a silent rented pod as a down host.
     host_runtime_fault: bool | None = None
     # lium_protocol 2.17.0: the rented pods this cycle's pod checks judged, each with its host-side fault codes
-    # ([] = clean), and whether this cycle's fresh DinD container read sysbox-fs clean. Reports only: the backend
-    # shows the renter a notice from them and changes no billing, payout or score.
+    # ([] = clean), and whether this cycle's fresh DinD container read sysbox-fs clean.
     rented_pod_faults: dict[str, list[str]] | None = None
     sysbox_fs_read_clean: bool | None = None
     # When an express recheck outside the cycle started (lium_protocol 2.11.0); None for a cycle's own report.

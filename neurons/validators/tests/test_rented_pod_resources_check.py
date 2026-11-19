@@ -243,7 +243,7 @@ async def test_dead_proc_fuse_mount_is_reported_never_failed(context_factory):
     err = "cat: /proc/4242/root/proc/sys/kernel/hostname: Transport endpoint is not connected"
     result = await _run(_ctx(context_factory, _ssh(_container(), proc_err=err)))
     assert result.passed is True
-    # not scored; reported per pod so the platform can tell the renter (report only, no billing effect)
+    # reported per pod so the platform can tell the renter
     assert result.updates["state"].rented_pod_faults == {"1": [Msg.PROC_FUSE_DISCONNECTED.reason]}
     assert result.event.reason_code == Msg.PROC_FUSE_DISCONNECTED.reason
     assert _findings(result) == ["proc_fuse_disconnected"]
