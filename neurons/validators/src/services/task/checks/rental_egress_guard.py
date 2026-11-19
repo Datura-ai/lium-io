@@ -58,7 +58,11 @@ LINK_LOCAL_CIDR = str(ipaddress.ip_network("169.254.169.254/16", strict=False))
 
 
 # Two chains used in turn: the new set is built in the idle one and swapped in, so there is no unguarded gap.
-CHAINS = ("LIUM-RENTAL-EGRESS-A", "LIUM-RENTAL-EGRESS-B")
+# Written only by the host's own iptables (DAH-6737): the earlier LIUM-RENTAL-EGRESS-A/B were also written by the
+# helper image's newer iptables-nft, by validators on releases before lium-io#2308, and a host's older iptables-nft
+# refuses to read or flush a chain a newer one wrote ("is incompatible, use 'nft' tool"). Those chains and their jumps
+# are left to the releases that made them; they only drop link-local egress too.
+CHAINS = ("LIUM-EGRESS-HOST-A", "LIUM-EGRESS-HOST-B")
 BRIDGE_NAME_OPTION = "com.docker.network.bridge.name"
 _IFNAME = re.compile(r"[A-Za-z0-9_.-]{1,15}")
 # One host-wide lock around every apply and cleanup: two miners can report the same host, and two interleaved
@@ -237,7 +241,15 @@ def _helper(script: str) -> str:
     # No helper container, so no image pull that a registry (Docker Hub's anonymous rate limit) can refuse. The shell,
     # flock and timeout are the executor image's; only iptables resolves in the host root, the one binary dockerd
     # itself needs there
-    return f"HOST_NS={shlex.quote(HOST_NS)} {helper_command(script)}"
+    return f"{ROOT_REQUIRED}; HOST_NS={shlex.quote(HOST_NS)} {helper_command(script)}"
+
+
+# The host lock, nsenter and iptables all need root: an executor running as another user (not the shipped privileged
+# container) is refused with that cause instead of the first failing path (DAH-6737).
+ROOT_REQUIRED = (
+    '[ "$(id -u)" = 0 ] || { echo "the executor runs as user $(id -un), not root: the rental network guard needs '
+    'the executor\'s standard privileged setup" >&2; exit 6; }'
+)
 
 
 class RentalEgressGuardCheck:

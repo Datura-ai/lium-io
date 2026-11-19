@@ -124,7 +124,7 @@ async def test_applies_the_drop_in_the_hosts_namespaces_without_any_image(contex
     assert result.passed is True
     assert result.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
     [helper] = _helper_calls(ssh)
-    assert helper.startswith(f"HOST_NS={shlex.quote(rental_egress_guard.HOST_NS)} exec timeout ")
+    assert helper.startswith(f"{rental_egress_guard.ROOT_REQUIRED}; HOST_NS={shlex.quote(rental_egress_guard.HOST_NS)} exec timeout ")
     # no container: a registry refusing an anonymous pull (Docker Hub's rate limit) can never leave a node unguarded
     assert not any("docker run" in call or "docker pull" in call for call in ssh.calls)
     assert helper.endswith(helper_command(link_local_drop_script("br-0123456789ab", [])))
@@ -800,7 +800,13 @@ def test_the_helper_runs_only_iptables_in_the_host_root(tmp_path, monkeypatch, s
     bin_dir, state = tmp_path / "bin", tmp_path / "state"
     bin_dir.mkdir()
     state.mkdir()
-    for name, body in (("iptables-nft", _IPTABLES_STUB), ("iptables-legacy", _IPTABLES_STUB), ("nsenter", _HOST_NSENTER_STUB)):
+    root_id = '#!/bin/sh\n[ "$1" = -u ] && echo 0 || echo root\n'  # the executor container runs as root
+    for name, body in (
+        ("iptables-nft", _IPTABLES_STUB),
+        ("iptables-legacy", _IPTABLES_STUB),
+        ("nsenter", _HOST_NSENTER_STUB),
+        ("id", root_id),
+    ):
         (bin_dir / name).write_text(body)
         (bin_dir / name).chmod(0o755)
     (state / "DOCKER-USER").write_text("RETURN\n")
@@ -835,3 +841,50 @@ async def test_an_unreadable_pod_bridge_list_leaves_the_rules_as_they_are():
     with pytest.raises(rental_egress_guard.InventoryUnknown):
         await rental_egress_guard.apply_rental_egress_guard(ssh)
     assert not _helper_calls(ssh)
+
+
+def test_an_executor_not_running_as_root_is_refused_with_that_cause(tmp_path):
+    # DAH-6737: the host lock, nsenter and iptables need root; a non-root executor gets its cause, not a path error
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "id").write_text('#!/bin/sh\n[ "$1" = -u ] && echo 1000 || echo provider\n')
+    (bin_dir / "id").chmod(0o755)
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+
+    done = subprocess.run(
+        ["sh", "-c", rental_egress_guard._helper("touch should-not-run")], env=env, capture_output=True, text=True,
+        cwd=tmp_path,
+    )
+
+    assert done.returncode == 6 and "runs as user provider, not root" in done.stderr
+    assert not (tmp_path / "should-not-run").exists()
+
+
+@pytest.mark.parametrize("script", ["apply", "cleanup"])
+def test_chains_another_iptables_build_wrote_never_fail_the_guard(tmp_path, script):
+    # DAH-6737: an older release's chains, written by a newer iptables-nft, are unreadable for the host's own; the
+    # guard never reads, flushes or removes them, so it applies (or cleans up) its own chains regardless
+    bin_dir, state = tmp_path / "bin", tmp_path / "state"
+    bin_dir.mkdir()
+    state.mkdir()
+    old = ("LIUM-RENTAL-EGRESS-A", "LIUM-RENTAL-EGRESS-B")
+    stub = _IPTABLES_STUB.replace(
+        'chain=$2\n',
+        'chain=$2\ncase "$chain $4" in *LIUM-RENTAL-EGRESS-*) '
+        'echo "iptables v1.8.7 (nf_tables): chain is incompatible, use \'nft\' tool." >&2; exit 1;; esac\n',
+    )
+    for name in ("iptables-nft", "iptables-legacy"):
+        (bin_dir / name).write_text(stub)
+        (bin_dir / name).chmod(0o755)
+    (state / "DOCKER-USER").write_text("".join(f"{c}\n" for c in old))
+    for chain in old:
+        (state / chain).write_text("-j DROP\n")
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "STATE": str(state)}
+    body = link_local_drop_script("br-bbbbbbbbbbbb", []) if script == "apply" else link_local_cleanup_script()
+
+    done = subprocess.run(["sh", "-c", body], env=env, capture_output=True, text=True)
+
+    assert done.returncode == 0, done.stderr
+    assert not set(old) & set(CHAINS)
+    if script == "apply":
+        assert _jumps_and_rules(state)[0][0] in CHAINS
