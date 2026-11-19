@@ -31,11 +31,12 @@ async def test_root_login_passes():
     assert result.passed and result.event.reason_code == "LOGIN_USER_ROOT"
 
 
-async def test_non_root_login_is_refused_and_ends_the_run():
+async def test_non_root_login_is_refused_and_ends_the_run_without_a_reset():
     result = await LoginUserCheck().run(make_context(runner=_Runner("1000\n")))
     assert not result.passed and result.fatal
     assert result.event.reason_code == "LOGIN_USER_NOT_ROOT"
-    assert result.updates.get("clear_verified_job_info") is True
+    # the run ends without a verified-state reset: there is none to clear
+    assert not (result.updates or {}).get("clear_verified_job_info")
 
 
 async def test_unreadable_uid_is_not_a_verdict():

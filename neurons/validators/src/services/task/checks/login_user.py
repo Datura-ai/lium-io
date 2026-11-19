@@ -13,7 +13,6 @@ from core.utils import _m, get_extra_info, get_logger
 
 from ..messages import LoginUserMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
-from .banned_provider import has_live_rental
 
 logger = get_logger(__name__)
 
@@ -38,8 +37,7 @@ class LoginUserCheck:
             return CheckResult(passed=True, event=event)
         if uid == "0":
             return CheckResult(passed=True, event=render_message(Msg.ROOT, ctx=ctx, check_id=self.check_id, what=what))
+        # a plain failure: the run ends here and nothing is reset; a non-root login never passed validation (every later
+        # step needs root), so there is no verified state to clear
         event = render_message(Msg.NOT_ROOT, ctx=ctx, check_id=self.check_id, what=what)
-        if has_live_rental(ctx):
-            # clearing the verified job resets the node inactive, which would end the renter's pod
-            return CheckResult(passed=False, event=event, fatal=False)
-        return CheckResult(passed=False, event=event, updates={"clear_verified_job_info": True}, fatal=True)
+        return CheckResult(passed=False, event=event, fatal=True)
