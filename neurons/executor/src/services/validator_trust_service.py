@@ -61,11 +61,16 @@ FETCH_LIMIT_BYTES = 64 * 1024
 async def fetch_json(url: str, body: dict | None = None) -> dict | None:
     """The JSON a GET (or, with `body`, a POST) returns; None on a 404. Ends within FETCH_TIMEOUT_SECONDS and reads at
     most FETCH_LIMIT_BYTES; raises on anything else."""
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=FETCH_TIMEOUT_SECONDS)) as session:
-        async with session.request("GET" if body is None else "POST", url, json=body) as response:
+    # no decompression: the cap counts the bytes as they arrive, so a small compressed reply cannot expand past it
+    timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT_SECONDS)
+    async with aiohttp.ClientSession(timeout=timeout, auto_decompress=False) as session:
+        headers = {"Accept-Encoding": "identity"}
+        async with session.request("GET" if body is None else "POST", url, json=body, headers=headers) as response:
             if response.status == HTTPStatus.NOT_FOUND:
                 return None
             response.raise_for_status()
+            if response.headers.get("Content-Encoding", "identity").lower() != "identity":
+                raise ValueError(f"encoded reply: {response.headers['Content-Encoding']}")
             data = bytearray()
             async for chunk in response.content.iter_any():
                 data += chunk
@@ -208,11 +213,11 @@ class ValidatorTrust:
         }
 
     async def refresh_message(self) -> None:
-        """A 404 or any failure keeps the message held."""
+        """A 404 or any failure keeps the message held. Volume writes run off the event loop."""
         if not self.enabled:
             return
         if self._unsaved:
-            self._save()
+            await asyncio.to_thread(self._save)
         if not self.owner_confirmed or not settings.COMPUTE_REST_API_URL:
             return
         url = settings.COMPUTE_REST_API_URL.rstrip("/") + "/watchtower/validator-message"
@@ -220,7 +225,8 @@ class ValidatorTrust:
             data = await fetch_json(url)
             if data is None:
                 return
-            self.offer(SignedTrustMessage(message=str(data["message"]), signature=str(data["signature"])))
+            signed = SignedTrustMessage(message=str(data["message"]), signature=str(data["signature"]))
+            await asyncio.to_thread(self.offer, signed)
         except Exception as exc:
             logger.warning("Validator trust: message not refreshed from %s: %s: %s", url, type(exc).__name__, exc)
 
@@ -247,7 +253,7 @@ class ValidatorTrust:
             logger.warning("Validator trust: subnet owner changed from %s to %s", self.owner, owner)
             self.owner = owner
             self._select()
-            self._save()
+            await asyncio.to_thread(self._save)
 
 
 validator_trust = ValidatorTrust(enabled=importlib.util.find_spec("core.config_override") is None)

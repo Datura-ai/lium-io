@@ -528,3 +528,51 @@ def test_a_slow_backend_does_not_stop_later_refreshes(tmp_path, monkeypatch, own
     asyncio.run(run())
     assert len(message_reads) >= 3
     assert len(owner_reads) >= 3 * len(trust_service.PUBLIC_CHAIN_NODES)
+
+
+def test_a_compressed_reply_is_refused_unexpanded(monkeypatch):
+    import gzip
+
+    from aiohttp import web
+
+    seen = []
+
+    async def bomb(request):
+        seen.append(request.headers.get("Accept-Encoding"))
+        body = gzip.compress(b" " * (8 * trust_service.FETCH_LIMIT_BYTES))
+        return web.Response(body=body, headers={"Content-Encoding": "gzip", "Content-Type": "application/json"})
+
+    async def run():
+        runner, url = await _serve(bomb)
+        try:
+            with pytest.raises(ValueError, match="encoded"):
+                await trust_service.fetch_json(url)
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    assert seen == ["identity"]
+
+
+def test_refreshes_write_the_volume_off_the_event_loop(tmp_path, monkeypatch, owner, new_validator):
+    import threading
+
+    new_owner = Keypair.create_from_uri("//LiumTrustNewOwner")
+    trust = _trust(tmp_path, owner)
+    real_write = trust_service._write_json
+    writers = []
+
+    def write(path, data):
+        writers.append(threading.current_thread() is threading.main_thread())
+        real_write(path, data)
+
+    monkeypatch.setattr(trust_service, "_write_json", write)
+    monkeypatch.setattr(trust_service.settings, "COMPUTE_REST_API_URL", "http://backend")
+    _chain(monkeypatch, lambda url: new_owner.ss58_address)
+    answer = MagicMock(status_code=200)
+    answer.json.return_value = _signed(new_owner, new_validator, 1)._asdict()
+    _backend(monkeypatch, lambda url: answer)
+    asyncio.run(trust.refresh_owner())  # owner change written
+    asyncio.run(trust.refresh_message())  # new message written
+    assert trust.held.validator == new_validator.ss58_address
+    assert len(writers) >= 2 and not any(writers)
