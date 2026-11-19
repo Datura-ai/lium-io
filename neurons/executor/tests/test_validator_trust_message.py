@@ -718,3 +718,96 @@ def test_a_hung_volume_at_shutdown_ends_the_wait(tmp_path, monkeypatch, owner, n
         return asyncio.get_running_loop().time() - started
 
     assert asyncio.run(run()) < 1
+
+
+def test_an_unreadable_kept_state_stays_closed_across_a_restart_after_it_was_replaced(
+    tmp_path, monkeypatch, owner, old_validator, new_validator
+):
+    # review: the writer replaced the unreadable file with the image message; a restart before any served message
+    # confirmed one must not trust the (revoked) validator that message names
+    monkeypatch.setattr(trust_service, "RELEASE_SUBNET_OWNER_HOTKEY", owner.ss58_address)
+    image = tmp_path / "image.json"
+    image.write_text(_dump(_signed(owner, old_validator, 1)))
+    (tmp_path / STATE_FILE).write_text("{not json")
+    trust = ValidatorTrust(state_dir=tmp_path, image_message=image)
+    trust.load()
+
+    async def write():
+        writer = trust.start_persisting()
+        for _ in range(200):
+            if not trust._unsaved:
+                break
+            await asyncio.sleep(0.01)
+        await trust.stop_persisting(writer)
+
+    asyncio.run(write())
+    assert _state(tmp_path)["held"] == owner.ss58_address  # the file is readable again
+
+    def down(*args, **kwargs):
+        raise ConnectionError("down")
+
+    _backend(monkeypatch, down)
+    _chain(monkeypatch, down)
+    restarted = ValidatorTrust(state_dir=tmp_path, image_message=image)
+    restarted.load()
+    asyncio.run(restarted.refresh_owner())
+    asyncio.run(restarted.refresh_message())
+    assert restarted.closed()
+    assert restarted.hotkeys({"current": old_validator.ss58_address}) == {}
+
+    # a served message confirms a validator; that is written, and the next restart trusts it
+    monkeypatch.setattr(trust_service.settings, "COMPUTE_REST_API_URL", "http://backend")
+    _chain(monkeypatch, lambda url: owner.ss58_address)
+    answer = MagicMock(status_code=200)
+    answer.json.return_value = _signed(owner, new_validator, 2)._asdict()
+    _backend(monkeypatch, lambda *a, **k: answer)
+    asyncio.run(restarted.refresh_owner())
+    asyncio.run(restarted.refresh_message())
+    again = ValidatorTrust(state_dir=tmp_path, image_message=image)
+    again.load()
+    assert not again.closed()
+    assert again.hotkeys({}) == {"signed": new_validator.ss58_address}
+
+
+def test_a_kept_message_failing_its_signature_is_an_unreadable_state(tmp_path, owner, old_validator, new_validator):
+    # review: readable JSON whose held message no longer verifies must not fall back to the baked validator
+    line = trust_line(new_validator.ss58_address, 5)
+    _keep(tmp_path, owner, SignedTrustMessage(message=line, signature="0x" + old_validator.sign(line).hex()))
+    trust = _trust(tmp_path, owner)
+    assert trust.held is None
+    assert trust.closed()
+    assert trust.hotkeys({"current": old_validator.ss58_address}) == {}
+
+
+def test_a_write_slower_than_a_refresh_still_opens_the_node(tmp_path, monkeypatch, owner, new_validator):
+    # review: a refresh retrying the unchanged state during a slow write must not mark that write stale
+    import threading
+
+    trust = _trust(tmp_path, owner)
+    real_write, gates, done = trust_service._write_json, [threading.Event(), threading.Event()], []
+
+    def slow_write(path, data):
+        gates[min(len(done), 1)].wait(5)
+        real_write(path, data)
+        done.append(data)
+
+    monkeypatch.setattr(trust_service, "_write_json", slow_write)
+
+    async def run():
+        writer = trust.start_persisting()
+        assert trust.offer(_signed(owner, new_validator, 1))
+        await asyncio.sleep(0.05)  # the write is in flight
+        await trust.refresh_message()  # retries the same, still unwritten state
+        gates[0].set()
+        for _ in range(200):
+            if done:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        closed = trust.closed()
+        gates[1].set()
+        await trust.stop_persisting(writer)
+        return closed
+
+    assert not asyncio.run(run())
+    assert trust.hotkeys({}) == {"signed": new_validator.ss58_address}
