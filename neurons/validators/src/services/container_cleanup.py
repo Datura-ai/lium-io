@@ -3,6 +3,7 @@ import json
 import logging
 import random
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import shlex
 from typing import Awaitable, Callable, Optional
@@ -74,9 +75,31 @@ DOWNLOAD_TEMPORARY_SWEEP_TIMEOUT_SECONDS = 60
 # Created for good, and dockerd then refuses `volume rm` on the cache it mounts ("volume is in use").
 REMOVE_CACHE_SWEEP_CONTAINER = f"/usr/bin/docker rm -f {CACHE_SWEEP_CONTAINER_NAME} >/dev/null 2>&1"
 
+# Every image repository a filler is started from: its workload, the executable names its GPU
+# processes run as (None until they are established), and whether the reclaims below remove it idle.
+@dataclass(frozen=True)
+class FillerWorkload:
+    strategy: str
+    process_names: tuple[str, ...] | None
+    removed_when_idle: bool = True
+
+
+FILLER_WORKLOADS: dict[str, FillerWorkload] = {
+    # the workload installs its serving engine at run time: the image fixes no process name
+    "ghcr.io/hanlinai/engy-golden-serve": FillerWorkload("ENGY_TEE", None),
+    # the worker downloads its inference engine at run time; the engine has been vLLM and sonar
+    "daturaai/dolphin": FillerWorkload("DPHN", ("dolphinpod", "sonar", "vllm")),
+    # the first Dolphin image: it ran the worker in a nested container, not the processes above
+    "daturaai/dlph": FillerWorkload("DPHN", None),
+    # small and has no cache volume, so a reclaim gains nothing from removing it
+    "daturaai/pearl-miner": FillerWorkload("PEARL", ("peakminer",), removed_when_idle=False),
+}
+
 # The images of the fillers whose caches the reclaims below give back (Engy's alone is ~32 GB). No
 # `-f`: dockerd refuses an image any container still uses, running or stopped, so a live filler keeps it.
-FILLER_IMAGE_REPOSITORIES = ("ghcr.io/hanlinai/engy-golden-serve", "daturaai/dolphin", "daturaai/dlph")
+FILLER_IMAGE_REPOSITORIES = tuple(
+    repository for repository, workload in FILLER_WORKLOADS.items() if workload.removed_when_idle
+)
 
 
 def image_repository(image: str) -> str:

@@ -6,7 +6,11 @@ import pytest
 
 from payload_models.payloads import CacheVolume, ContainerCreateRequest, WorkloadKind
 from services.const import DPHN_CACHE_FREE_MARGIN_GB, DPHN_CACHE_LISTING_FLOOR_GB
-from services.container_cleanup import idle_filler_images_removal_command
+from services.container_cleanup import (
+    FILLER_IMAGE_REPOSITORIES,
+    FILLER_WORKLOADS,
+    idle_filler_images_removal_command,
+)
 from services.docker_service import (
     DockerService,
     RentalDiskFit,
@@ -897,6 +901,23 @@ def test_the_idle_filler_removal_keeps_the_rented_image_under_any_docker_hub_pre
 
     assert "reference=daturaai/dolphin " not in command
     assert "reference=daturaai/dlph " in command
+
+
+# Filler images with no established GPU process names: the first Dolphin image ran its worker in a
+# nested container, and the Engy image's serving engine is installed by the workload at run time.
+_FILLER_IMAGES_WITHOUT_PROCESS_NAMES = {"daturaai/dlph", "ghcr.io/hanlinai/engy-golden-serve"}
+
+
+def test_every_filler_image_has_its_gpu_process_names_apart_from_the_known_gaps():
+    from services.task.checks.gpu_usage import FILLER_PROCESS_ALLOWLISTS
+
+    assert set(FILLER_IMAGE_REPOSITORIES) <= set(FILLER_WORKLOADS)
+    assert set(FILLER_PROCESS_ALLOWLISTS) == set(FILLER_WORKLOADS) - _FILLER_IMAGES_WITHOUT_PROCESS_NAMES
+    assert all(workload.process_names for workload in FILLER_PROCESS_ALLOWLISTS.values())
+
+
+def test_the_idle_filler_image_removal_takes_every_filler_image_but_the_miner():
+    assert FILLER_IMAGE_REPOSITORIES == ("ghcr.io/hanlinai/engy-golden-serve", "daturaai/dolphin", "daturaai/dlph")
 
 
 class CacheDuHostSshClient(RemovingHostSshClient):
