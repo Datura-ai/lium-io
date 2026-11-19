@@ -2019,6 +2019,7 @@ class _EditSwap:
         # set once the reply went to the backend: from then on the edit stands, whatever ends the
         # steps after the reply (a delete's wait timing out cancels them)
         self.replacement_is_up = False
+        self.restored_running = False
         # The replacement's own Docker ID, once `docker run` returned it. The undo removes by this ID:
         # a concurrent retry may hold the pod name by then, and removing by name would delete it.
         self.replacement_id: str | None = None
@@ -2410,6 +2411,8 @@ class _EditSwap:
             if started.exit_status != 0:
                 error = f"docker start: {(started.stderr or '').strip()}"
         extra = get_extra_info({**self.default_extra, "parked": self.parked_name, "restored": error is None})
+        # the renter's pod runs again: a failed edit is then no host outage for billing (DAH-6737)
+        self.restored_running = start and error is None
         if error is None:
             logger.warning(_m("Edit failed; the pod's previous container was restored", extra=extra))
         else:
@@ -10356,6 +10359,7 @@ class DockerService:
         container_created = False
         container_id: str | None = None
         container_vanished = False
+        edit_swap: _EditSwap | None = None
         login_error: str | None = None
         volume_encryption_status = VolumeEncryptionStatus.DISABLED
 
@@ -12506,9 +12510,11 @@ class DockerService:
                     if container_vanished
                     else FailedContainerErrorCodes.RentingInProgress
                     if isinstance(e, _FillerRefusedForCustomerCreate)
-                    # refused before `docker run`: nothing of this pod started on the node (DAH-6737)
+                    # refused before `docker run` and no earlier container of the pod brought back: nothing of
+                    # it runs on the node (DAH-6737); a restored one runs and stays billed
                     else FailedContainerErrorCodes.ExecutorUnreachable
                     if isinstance(last_exc, RentalEgressGuardRefused)
+                    and not (edit_swap is not None and edit_swap.restored_running)
                     else FailedContainerErrorCodes.UnknownError
                 ),
                 failure_step=current_step,

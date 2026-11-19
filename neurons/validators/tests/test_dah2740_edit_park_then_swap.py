@@ -364,6 +364,39 @@ async def test_a_failed_edit_restores_the_previous_container(svc, monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("present", "error", "restore_fails", "code"),
+    [
+        (False, "guard", False, "ExecutorUnreachable"),  # nothing of the pod on the node: no host-fault charge
+        (True, "guard", False, "UnknownError"),  # the original pod was brought back running: still billed
+        (True, "guard", True, "ExecutorUnreachable"),  # the undo failed too: nothing of the pod runs
+        (True, "ordinary", False, "UnknownError"),
+    ],
+    ids=["absent_guard", "restored_guard", "restore_failed_guard", "restored_ordinary"],
+)
+@pytest.mark.asyncio
+async def test_a_reboot_the_guard_refused_is_a_host_fault_only_while_no_container_of_the_pod_runs(
+    svc, monkeypatch, present, error, restore_fails, code
+):
+    # DAH-6737 review: a restored original runs on the node, so the reply must not carry the no-billing code
+    from payload_models.payloads import FailedContainerErrorCodes
+    from services.docker_service import RentalEgressGuardRefused
+
+    payload = _edit_payload()
+    ssh = _ssh_recording(container_present=present)
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr(
+        svc, "_bring_up_existing_container", AsyncMock(side_effect=RuntimeError("sshd") if restore_fails else None)
+    )
+    exc = RentalEgressGuardRefused("not applied") if error == "guard" else RuntimeError("gocryptfs: EPERM")
+    monkeypatch.setattr(svc, "_run_rental_docker_create_with_port_retry", AsyncMock(side_effect=exc))
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == getattr(FailedContainerErrorCodes, code)
+
+
+@pytest.mark.parametrize(
     ("visible", "starts"),
     [(["GPU-new"], False), (["GPU-old-2", "GPU-new"], True), ([], True)],
     ids=["card_set_swapped", "one_card_missing", "procfs_unreadable"],
