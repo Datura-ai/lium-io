@@ -297,6 +297,8 @@ class ResultHandler:
             # and cuts the PodStatesReport chunks.
             pod_states=list(context.state.pod_states) or None,
             host_runtime_fault=context.state.host_runtime_fault,
+            rented_pod_faults=context.state.rented_pod_faults,
+            sysbox_fs_read_clean=context.state.sysbox_fs_read_clean,
         )
 
     @staticmethod

@@ -6,11 +6,15 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import asyncssh
 import pytest
-from neurons.validators.src.services.task.checks.rented_pod_resources import RentedPodResourcesCheck
+from neurons.validators.src.services.task.checks.rented_pod_resources import (
+    _INIT_READ_SCRIPT,
+    RentedPodResourcesCheck,
+    pod_verdict_updates,
+)
 from neurons.validators.src.services.task.messages import RentedPodResourcesMessages as Msg
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 from services.const import RENTAL_CPU_COUNT_LABEL
@@ -33,7 +37,9 @@ def _container(cpuset="", nano=8_000_000_000, oom=500, label="8", quota=0, perio
     }
 
 
-def _ssh(container=None, init_oom=500, raise_exc=None, cgroup_cpuset="", cpu_max="", proc_err=""):
+def _ssh(
+    container=None, init_oom=500, raise_exc=None, cgroup_cpuset="", cpu_max="", proc_err="", runtime_fault="1"
+):
     async def run(cmd, *args, **kwargs):
         if raise_exc is not None:
             raise raise_exc
@@ -42,7 +48,7 @@ def _ssh(container=None, init_oom=500, raise_exc=None, cgroup_cpuset="", cpu_max
             return SimpleNamespace(exit_status=0 if container else 1, stdout=out, stderr="")
         return SimpleNamespace(
             exit_status=0,
-            stdout=f"4242|{init_oom}|{cgroup_cpuset}|{cpu_max}|{proc_err}\n",
+            stdout=f"4242|{init_oom}|{cgroup_cpuset}|{cpu_max}|{runtime_fault}|{proc_err}\n",
             stderr="",
         )
 
@@ -90,7 +96,8 @@ async def test_pinned_cpuset_fails_and_zeroes_the_score(context_factory):
     assert result.event.reason_code == Msg.RESOURCES_REDUCED.reason
     assert _findings(result) == ["cpuset_pinned"]
     assert result.passed is False
-    assert result.updates == {"rented_pod_resources_passed": False}
+    assert result.updates == {"rented_pod_resources_passed": False, "state": ANY}
+    assert result.updates["state"].rented_pod_faults == {"1": []}
 
 
 @pytest.mark.asyncio
@@ -118,7 +125,7 @@ async def test_reduced_nano_cpus_fails(context_factory):
 async def test_raised_oom_score_is_recorded_never_failed(context_factory):
     result = await _run(_ctx(context_factory, _ssh(_container(), init_oom=1000)))
     assert result.passed is True
-    assert result.updates == {}
+    assert result.updates["state"].rented_pod_faults == {"1": []}
     assert _findings(result) == ["oom_priority_raised"]
     assert result.event.what_we_saw["pods"][0]["oom_score_adj_init"] == 1000
 
@@ -236,9 +243,19 @@ async def test_dead_proc_fuse_mount_is_reported_never_failed(context_factory):
     err = "cat: /proc/4242/root/proc/sys/kernel/hostname: Transport endpoint is not connected"
     result = await _run(_ctx(context_factory, _ssh(_container(), proc_err=err)))
     assert result.passed is True
-    assert result.updates == {}
+    # not scored; reported per pod so the platform can tell the renter (report only, no billing effect)
+    assert result.updates["state"].rented_pod_faults == {"1": [Msg.PROC_FUSE_DISCONNECTED.reason]}
     assert result.event.reason_code == Msg.PROC_FUSE_DISCONNECTED.reason
     assert _findings(result) == ["proc_fuse_disconnected"]
+
+
+@pytest.mark.asyncio
+async def test_dead_proc_under_a_sysbox_fs_older_than_the_pod_is_not_a_host_fault(context_factory):
+    # the renter's own FUSE mount stacked on /proc/sys and killed: sysbox-fs never restarted under the pod
+    err = "Transport endpoint is not connected"
+    result = await _run(_ctx(context_factory, _ssh(_container(), proc_err=err, runtime_fault="0")))
+    assert result.event.reason_code == Msg.RESOURCES_OK.reason
+    assert result.updates["state"].rented_pod_faults == {"1": []}
 
 
 @pytest.mark.asyncio
@@ -247,3 +264,18 @@ async def test_scored_finding_wins_over_dead_proc_fuse_mount(context_factory):
     result = await _run(_ctx(context_factory, _ssh(_container(cpuset="2-7"), proc_err=err)))
     assert result.passed is False
     assert result.event.reason_code == Msg.RESOURCES_REDUCED.reason
+
+
+def test_a_later_checks_verdict_keeps_the_earlier_checks_codes(context_factory):
+    ctx = _ctx(context_factory, ssh=None)
+    first = pod_verdict_updates(ctx, {"pod_1": [Msg.PROC_FUSE_DISCONNECTED.reason]})["state"]
+    ctx = context_factory(state=first, ssh=None)
+    # another check finds the pod clean, and a container not on the rented list is not judged
+    second = pod_verdict_updates(ctx, {"pod_1": [], "pod_x": ["CODE"]})["state"]
+    assert second.rented_pod_faults == {"1": [Msg.PROC_FUSE_DISCONNECTED.reason]}
+    assert pod_verdict_updates(context_factory(state=build_state(), ssh=None), {"pod_1": []}) == {}
+
+
+def test_the_newest_sysbox_fs_is_timed_against_the_pod():
+    # an old sysbox-fs left running beside a restarted one would read as older than the pod and hide the restart
+    assert "pgrep -xn sysbox-fs" in _INIT_READ_SCRIPT
