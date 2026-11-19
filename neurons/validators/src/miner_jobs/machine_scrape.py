@@ -950,7 +950,12 @@ def get_host_memory(list_workloads=list_workload_container_ids, host_root=HOST_M
         # MemTotal - MemFree holds the whole huge page pool: a host-only pool stays host use, and a pod's share is in its
         # memory.current only under hugetlb accounting; without it a running workload's share is unknown
         pool = mem.get("Hugetlb", mem.get("HugePages_Total", 0) * mem.get("Hugepagesize", 0))
-        if pool and hugetlb_unaccounted and facts["hm_outside_workloads_kb"] is not None:
+        # a pool whose every page is free (Hugetlb is the default pool alone, all of it free) holds no workload's share,
+        # so whatever the accounting it stays host use
+        all_free = all(k in mem for k in ("Hugetlb", "HugePages_Free", "Hugepagesize")) and (
+            mem["Hugetlb"] == mem["HugePages_Free"] * mem["Hugepagesize"]
+        )
+        if pool and not all_free and hugetlb_unaccounted and facts["hm_outside_workloads_kb"] is not None:
             for key in outside_keys[:2]:
                 facts[key] = None
                 errors[key] = "a huge page pool is reserved and a workload's hugetlb charge is not accounted"

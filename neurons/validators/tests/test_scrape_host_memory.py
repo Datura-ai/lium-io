@@ -291,6 +291,41 @@ def test_the_huge_page_pool_counts_where_its_owner_is_known(
         assert facts["hm_mapped_outside_workloads_kb"] == 0
 
 
+@pytest.mark.parametrize(
+    "free_gib, hugetlb_gib, expected_gib",
+    [
+        # review on lium-platform#3255 at fe9b5e7: an ordinary pod using 8 GiB, no hugetlb line, beside a pool whose
+        # eight 2 GiB pages are all free (64 total, 38 free): no workload holds a huge page, so 26 - 8 = 18 GiB
+        (38, 16, 18),
+        # a second, non-default pool (Hugetlb above the free default pages) may be a workload's: unknown
+        (36, 18, None),
+    ],
+    ids=["all_pages_free", "non_default_pool"],
+)
+def test_a_pool_with_every_page_free_holds_no_workload_share(
+    tmp_path: Path, free_gib: int, hugetlb_gib: int, expected_gib: int | None
+) -> None:
+    gib = 1024 * 1024
+    paths = _host(tmp_path)
+    Path(paths["meminfo_path"]).write_text(
+        f"MemTotal: {64 * gib} kB\nMemFree: {free_gib * gib} kB\nMemAvailable: 0 kB\nBuffers: 0 kB\nCached: 0 kB\n"
+        f"SwapTotal: 0 kB\nSwapFree: 0 kB\nShmem: 0 kB\nMapped: 0 kB\nHugePages_Total: 8\nHugePages_Free: 8\n"
+        f"Hugepagesize: {2 * gib} kB\nHugetlb: {hugetlb_gib * gib} kB\n"
+    )
+    filler = Path(paths["host_root"]) / f"sys/fs/cgroup/docker/{FILLER}"
+    pod = Path(paths["host_root"]) / f"sys/fs/cgroup/system.slice/docker-{POD}.scope"
+    (filler / "memory.current").write_text("0\n")
+    (filler / "memory.stat").write_text("anon 0\nhugetlb 0\n")
+    (pod / "memory.current").write_text(f"{8 * gib * 1024}\n")
+    (pod / "memory.stat").write_text("anon 0\n")
+    (pod / "hugetlb.2MB.current").unlink()
+
+    facts = NS["get_host_memory"](list_workloads=workloads, read_kmsg=lambda: [], **paths)
+    expected_kb = None if expected_gib is None else expected_gib * gib
+    assert facts["hm_outside_workloads_kb"] == expected_kb
+    assert facts["hm_outside_workloads_no_cache_kb"] == expected_kb
+
+
 def test_a_docker_reply_trickled_in_parts_still_ends_at_the_deadline(tmp_path: Path) -> None:
     # review on lium-io#2361: each part of the body arrived inside the per-read timeout, so the reply overran the budget
     import socket
