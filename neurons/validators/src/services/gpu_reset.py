@@ -452,7 +452,10 @@ async def _precheck(
     outside = await _processes_outside(runner, targets, container_id, ignore_cgroup=await _own_cgroup(runner))
     if outside:
         raise GpuResetRefused(
-            GpuResetErrorCode.GpuInUseOutsidePod, f"processes outside the pod use the GPUs: {outside}"
+            GpuResetErrorCode.GpuInUseOutsidePod,
+            # an unreadable cgroup counts here too, so the process may be the renter's own
+            "processes the node could not place in the pod (not in the pod's container, or their cgroup could not "
+            f"be read) use the GPUs: {outside}; if they are yours, stop them and retry",
         )
     host_services: list[str] = list(fabric_services)
     holder_containers: list[str] = []
@@ -819,8 +822,11 @@ async def reset_pod_gpus(
             report.detail = "; ".join(
                 [
                     *notes,
-                    f"a process outside the pod holds the GPU open on the host: {', '.join(held)}. "
-                    "The GPUs were not reset and the pod was not stopped; only the provider can stop that process",
+                    # an unreadable cgroup counts as outside, so the holder may be the renter's own process
+                    "a process the node could not place in the pod (not in the pod's container, or its cgroup could "
+                    f"not be read) holds the GPU open on the host: {', '.join(held)}. The GPUs were not reset and the "
+                    "pod was not stopped; if that process is yours, stop it and retry, otherwise only the provider "
+                    "can stop it",
                 ]
             )
             return report

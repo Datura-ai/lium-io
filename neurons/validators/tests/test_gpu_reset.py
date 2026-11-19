@@ -1367,6 +1367,31 @@ async def test_a_part_node_reset_held_open_by_a_host_process_is_refused_before_t
 
 
 @pytest.mark.asyncio
+async def test_a_holder_whose_cgroup_cannot_be_read_is_not_called_outside_the_pod():
+    # DAH-6741 review: an unreadable cgroup is not proof the holder is outside the pod; it may be the renter's own
+    host = FakeHost(device_holders=[XORG])
+
+    report, start = await _reset(host)
+
+    assert report.error_code == GpuResetErrorCode.GpuInUseOutsidePod and "Xorg (pid 1500)" in report.detail
+    assert "could not place in the pod" in report.detail
+    assert "if that process is yours, stop it and retry" in report.detail
+    assert "process outside the pod" not in report.detail and not report.stop_sent
+    _no_change(host, start)
+
+
+@pytest.mark.asyncio
+async def test_a_compute_app_whose_cgroup_cannot_be_read_is_not_called_outside_the_pod():
+    host = FakeHost(apps=[(998, U[0])])
+
+    report, start = await _reset(host)
+
+    assert report.error_code == GpuResetErrorCode.GpuInUseOutsidePod
+    assert "could not place in the pod" in report.detail and "stop them and retry" in report.detail
+    _no_change(host, start)
+
+
+@pytest.mark.asyncio
 async def test_a_holder_seen_in_one_read_only_does_not_refuse_the_reset():
     # Arrange: a passing nvidia-smi of the host
     host = FakeHost(transient_holders=[(1600, "nvidia-smi")], cgroups={1600: "0::/system.slice/cron.service"})
