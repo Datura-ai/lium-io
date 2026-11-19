@@ -2323,14 +2323,14 @@ class _EditSwap:
 
     async def _observed_pod_state(self) -> str:
         """What Docker reports for the pod after a failed edit, by its own name and its parked name: "running" when
-        a container of the pod runs (or restarts), "down" when Docker answered and none does, "unknown" when it
+        a container of the pod runs, restarts or is paused (a fenced stop's freeze it may undo), "down" when Docker answered and none does, "unknown" when it
         could not be read. Read, not inferred from the undo's steps: a stop that could not be confirmed leaves it
         maybe running, and an entrypoint can exit after Docker acknowledged the start (DAH-6737)."""
         names = [n for n in (self.container_name, self.parked_name) if n]
         filters = " ".join(f"--filter name=^{shlex.quote(n)}$" for n in names)
         try:
             listed = await self._run(
-                f"/usr/bin/docker ps --format '{{{{.Names}}}}' --filter status=running --filter status=restarting {filters}"
+                f"/usr/bin/docker ps --format '{{{{.Names}}}}' --filter status=running --filter status=restarting --filter status=paused {filters}"
             )
         except Exception:  # noqa: BLE001 — unread is unknown, never down
             return "unknown"

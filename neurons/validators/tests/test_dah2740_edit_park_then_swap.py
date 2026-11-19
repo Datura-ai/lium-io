@@ -101,7 +101,9 @@ def _ssh_recording(*, container_present: bool = True, stop_exit: int = 0, rename
         if "docker ps --format" in cmd and "--filter status=running" in cmd:  # what runs of the pod after a failed edit
             if after_undo == "unreadable":
                 return _ssh_result(exit_status=1, stderr="Cannot connect to the Docker daemon")
-            return _ssh_result(stdout="pod\n" if after_undo == "running" else "")
+            # Docker ORs filters on one key; a paused container is listed only under status=paused
+            listed = after_undo == "running" or (after_undo == "paused" and "--filter status=paused" in cmd)
+            return _ssh_result(stdout="pod\n" if listed else "")
         if "/usr/bin/docker diff" in cmd:  # the park's layer read: no renter files under the volume path
             return _ssh_result(stdout="drop\n")
         if "/proc/$p/mountinfo" in cmd:  # the park's mount read: the plaintext path is not mounted
@@ -376,6 +378,8 @@ async def test_a_failed_edit_restores_the_previous_container(svc, monkeypatch):
         (True, "guard", True, "running", "UnknownError"),  # the undo failed but the pod may still run: still billed
         (True, "guard", False, "down", "ExecutorUnreachable"),  # brought back, then it exited: not billed
         (True, "guard", True, "unreadable", "UnknownError"),  # an unread state is never taken as down
+        # a recovery check's fenced stop froze it and may unpause it: it can resume without a start, still billed
+        (True, "guard", True, "paused", "UnknownError"),
         (True, "ordinary", False, "running", "UnknownError"),
     ],
     ids=[
@@ -385,6 +389,7 @@ async def test_a_failed_edit_restores_the_previous_container(svc, monkeypatch):
         "restore_failed_still_running",
         "restored_then_exited",
         "state_unreadable",
+        "paused_during_fenced_stop",
         "restored_ordinary",
     ],
 )
