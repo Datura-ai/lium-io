@@ -1226,3 +1226,80 @@ async def test_early_probes_start_only_after_host_reads_succeed_while_docker_con
     assert result.failure_step == ds_module.HOST_READ_PID_MAX_STEP
     svc.probe_prerun_host.assert_not_awaited()
     svc.probe_volume_host.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_filler_cancelled_before_docker_connects_cleans_up_with_no_early_probe_on_the_one_session(
+    svc_fixture, monkeypatch
+):
+    """Review on lium-io#2364: the host reads end while Docker still connects; a delete flagged before the first delete
+    check makes that check clean up. On a one-session sshd no early probe may hold the session through that cleanup."""
+    svc = svc_fixture
+    _wire_early_probes(svc, monkeypatch, image_present=True)
+    session_holders: list[str] = []
+
+    async def probe_holding_the_session(*args, **kwargs):
+        session_holders.append("probe")
+        await asyncio.sleep(0.2)
+        session_holders.remove("probe")
+        return _probe()
+
+    svc.probe_prerun_host = AsyncMock(side_effect=probe_holding_the_session)
+    held_at_cleanup: list[list[str]] = []
+
+    async def cleanup(*args, **kwargs):
+        held_at_cleanup.append(list(session_holders))
+        return False
+
+    monkeypatch.setattr(svc, "cleanup_failed_container_creation", AsyncMock(side_effect=cleanup))
+    monkeypatch.setattr(ds_module, "restore_filler_pod_gpu_power_limits", AsyncMock())
+    monkeypatch.setattr(ds_module.inflight_creates, "is_cancelled", lambda pod_id: True)
+    factory = svc.rental_docker_client_factory
+    docker_ready = factory.__aenter__
+
+    async def slow_docker_connect():
+        await asyncio.sleep(0.05)  # the reads are done, Docker still connects
+        return await docker_ready()
+
+    monkeypatch.setattr(type(factory), "__aenter__", lambda self: slow_docker_connect())
+
+    await asyncio.wait_for(
+        _run_create_container(svc, _deploy_payload(workload_kind=WorkloadKind.FILLER, active_volume_names=["volume_x"])),
+        timeout=5,
+    )
+
+    assert held_at_cleanup and held_at_cleanup[0] == []
+    svc.probe_prerun_host.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_filler_cleanup_waits_for_a_started_probe_and_stops_on_a_taken_session(svc_fixture, monkeypatch):
+    """Review on lium-io#2364: a cancelled filler's cleanup runs only once a started early probe has ended; a probe
+    whose channel may still hold the one session stops the cleanup and the power restore."""
+    svc = svc_fixture
+    payload = _deploy_payload(workload_kind=WorkloadKind.FILLER)
+    monkeypatch.setattr(ds_module.inflight_creates, "is_cancelled", lambda pod_id: True)
+    restore = AsyncMock()
+    monkeypatch.setattr(ds_module, "restore_filler_pod_gpu_power_limits", restore)
+    order: list[str] = []
+    monkeypatch.setattr(
+        svc, "cleanup_failed_container_creation", AsyncMock(side_effect=lambda **kw: order.append("cleanup"))
+    )
+
+    async def probe_ended():
+        order.append("probe ended")
+
+    with pytest.raises(ds_module._CreateCancelledByDelete):
+        await svc._abort_if_cancelled_by_delete(Mock(), payload, {}, probe_ended)
+    assert order == ["probe ended", "cleanup"]
+
+    order.clear()
+    restore.reset_mock()
+
+    async def session_taken():
+        raise ds_module.SshSessionMayStillBeTakenError("close not confirmed")
+
+    with pytest.raises(ds_module.SshSessionMayStillBeTakenError):
+        await svc._abort_if_cancelled_by_delete(Mock(), payload, {}, session_taken)
+    assert order == []
+    restore.assert_not_awaited()

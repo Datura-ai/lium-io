@@ -7230,9 +7230,10 @@ class DockerService:
         try:
             # Bounded like the nvidia-smi query it carries (a hung driver must not stall the rent);
             # asyncio.TimeoutError lands in the except below → None → the per-command path.
-            result = await ssh_client.run(command, check=False, timeout=_PRERUN_HOST_PROBE_TIMEOUT_SECONDS)
+            result = await _run_closing_channel_on_timeout(ssh_client, command, _PRERUN_HOST_PROBE_TIMEOUT_SECONDS)
             probe = parse_prerun_host_probe(result.stdout or "", with_power=with_power, with_label=with_label)
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, SshSessionMayStillBeTakenError):
+            # a channel that may still hold the host's only session stops the create
             raise
         except Exception as exc:
             logger.warning(
@@ -9942,10 +9943,14 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         payload: ContainerCreateRequest,
         default_extra: dict,
+        settle_early_probes: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """Tear this create down when its own delete has already reported the pod gone (DAH-2728)."""
         if not inflight_creates.is_cancelled(payload.pod_id):
             return
+        if settle_early_probes is not None:
+            # the cleanup's commands need the session a started early probe may hold (MaxSessions=1)
+            await settle_early_probes()
 
         container_name = self.get_container_name(payload)
         logger.warning(
@@ -9979,6 +9984,7 @@ class DockerService:
         default_extra: dict,
         step: Awaitable[Any],
         on_cancel: Callable[[], Awaitable[Any]] | None = None,
+        settle_early_probes: Callable[[], Awaitable[None]] | None = None,
     ) -> Any:
         """Run a long create step (image pull, custom build, its export), but stop it as soon as this
         pod's delete cancels the create.
@@ -10005,7 +10011,7 @@ class DockerService:
                 with contextlib.suppress(Exception):
                     await on_cancel()
             await asyncio.wait({step_task})
-            await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+            await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra, settle_early_probes)
         return await step_task
 
     def _explain_container_killed_during_bootstrap(
@@ -10564,6 +10570,8 @@ class DockerService:
                     )
 
             host_limits_read: asyncio.Task[tuple[int | None, int | None, int | None]] | None = None
+            # set once the first delete check passed: a create cancelled before it cleans up with no probe started
+            first_delete_check_passed = asyncio.Event()
 
             def pid_max_refused(host_pid_max: int | None) -> bool:
                 return settings.RENTAL_PIDS_LIMIT_PER_CPU > 0 and (
@@ -10599,7 +10607,18 @@ class DockerService:
                 if host_limits_read.cancelled() or host_limits_read.exception() is not None:
                     # the create fails at the reads' own step; the probes only run after reads that succeeded
                     raise asyncio.CancelledError
+                await first_delete_check_passed.wait()
                 return await probe()
+
+            async def settle_early_probes() -> None:
+                # wait, never cancel: a started probe frees its channel, or reports the session taken, only as it ends
+                started = [task for task in (early_host_probe, early_volume_probe) if task is not None]
+                if started:
+                    await asyncio.wait(started)
+                for task in started:
+                    if not task.cancelled() and isinstance(task.exception(), SshSessionMayStillBeTakenError):
+                        # no cleanup command and no power restore on a session the probe may still hold
+                        raise task.exception()
 
             def start_early_probes(connected_ssh_client: asyncssh.SSHClientConnection) -> None:
                 nonlocal early_host_probe, early_volume_probe, host_limits_read
@@ -10708,6 +10727,7 @@ class DockerService:
                 # DAH-2728: cheapest place to notice the delete — the image pull/build below is
                 # where a cancelled create spends its minutes, and nothing is on the host yet.
                 await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+                first_delete_check_passed.set()
 
                 # Read the host's real limits and decide fail-closed BEFORE any host side-effect —
                 # the edit-swap park, the stale-container/filler cleanup (an irreversible rm), the
@@ -10985,6 +11005,7 @@ class DockerService:
                                     image=payload.docker_image,
                                 ),
                                 on_cancel=lambda: docker_client.aclose(),
+                                settle_early_probes=settle_early_probes,
                             )
                         except _CreateCancelledByDelete:
                             raise
@@ -11110,7 +11131,7 @@ class DockerService:
                             )
                         )
                     # a delete that landed during the wait must find the pod as it was, not parked
-                    await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+                    await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra, settle_early_probes)
                     try:
                         parked_name = await edit_swap.park()
                     except _UnkillableParkedContainer:
@@ -11757,7 +11778,7 @@ class DockerService:
                     await self._reset_leftover_clock_locks_before_create(ssh_client, payload, default_extra)
                     current_step = "docker_run"
                     # DAH-2728: last look before the host ports get bound.
-                    await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+                    await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra, settle_early_probes)
                     await self.stream_log("Creating docker container", "success", log_tag)
                     # No await between this check and the hand-off to the Docker thread, which checks
                     # again right before the create: a customer create may register while the run
@@ -11794,7 +11815,7 @@ class DockerService:
                             else None
                         ),
                         before_flatten_retry=lambda: self._abort_if_cancelled_by_delete(
-                            ssh_client, payload, default_extra
+                            ssh_client, payload, default_extra, settle_early_probes
                         ),
                         flatten_beside_other_create=lambda: customer_creates.others_running(payload),
                     )
@@ -12200,7 +12221,7 @@ class DockerService:
 
                     # DAH-2728: last call before the pod is cached as rented — a delete that landed
                     # during the run or the bootstrap above is holding ports it could not see.
-                    await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+                    await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra, settle_early_probes)
 
                     current_step = "finalize"
                     await self._cache_rented_pod_best_effort(
@@ -12257,7 +12278,7 @@ class DockerService:
                         # Our own delete (cancel-on-delete) is the first suspect and raises
                         # _CreateCancelledByDelete here; otherwise the failure names the kill
                         # it was, not the exec it broke.
-                        await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+                        await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra, settle_early_probes)
                         gone_cause = container_gone_cause(post_run_exc.state)
                         if gone_cause == "exited":
                             # The image's own command ended: not a kill, the step keeps its name.
