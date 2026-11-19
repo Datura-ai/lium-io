@@ -11181,6 +11181,8 @@ class DockerService:
                     # the park, and the earlier edit's removals waited for above, changed the container listing
                     docker_listing_probe = None
 
+                # the cleanup is irreversible: a delete that landed during the probes or the park stops the create here
+                await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra, settle_early_probes)
                 current_step = "container_cleanup"
                 # DAH-1524: the GC below (force-removing stale pod_/filler_
                 # containers + their volumes that aren't in active_*) stays on the

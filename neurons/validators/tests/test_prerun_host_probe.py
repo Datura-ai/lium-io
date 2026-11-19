@@ -1407,3 +1407,28 @@ async def test_a_pull_waits_for_the_discarded_early_probe_and_stops_if_it_may_st
     assert type(result).__name__ == "FailedContainerRequest", getattr(result, "msg", "")
     assert svc.probe_prerun_host.await_count == 1
     svc.clean_existing_containers.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_delete_during_a_pulls_fallback_probe_stops_the_create_before_the_cleanup(svc_fixture, monkeypatch):
+    # every irreversible step re-checks the delete right before it: a pull's cleanup too, not only the filler removal
+    svc = svc_fixture
+    _wire_early_probes(svc, monkeypatch, image_present=False)
+    deleted = False
+    probes = 0
+
+    async def fallback_probe_while_the_delete_arrives(*args, **kwargs):
+        nonlocal deleted, probes
+        probes += 1
+        if probes == 2:
+            deleted = True
+        return _probe_with_containers("filler_x")
+
+    svc.probe_prerun_host = AsyncMock(side_effect=fallback_probe_while_the_delete_arrives)
+    svc.clean_existing_containers = AsyncMock(return_value=[])
+    monkeypatch.setattr(ds_module.inflight_creates, "is_cancelled", lambda pod_id: deleted)
+
+    await asyncio.wait_for(_run_create_container(svc, _deploy_payload()), timeout=5)
+
+    assert deleted
+    svc.clean_existing_containers.assert_not_awaited()
