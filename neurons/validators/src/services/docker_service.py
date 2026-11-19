@@ -221,6 +221,7 @@ from services.rental_docker_sdk import (
     RentalDockerContainerRestartingError,
     RentalDockerOperationError,
     RentalPodBridgeGone,
+    RentalPodNetworkMoveFailed,
     RentalDockerSdkClient,
     RentalDockerSdkClientFactory,
     VolumeMount,
@@ -1238,6 +1239,12 @@ class RentalEgressGuardRefused(RuntimeError):
     pod_running = False
 
 
+# the start refusals of our own steps before `docker start` (DAH-6737): the pod's bridge gone, or Docker refusing to
+# move the stopped pod onto it; either leaves a stopped pod down
+_OUR_START_REFUSALS = (RentalPodBridgeGone, RentalPodNetworkMoveFailed)
+_UNDO_REFUSALS = (RentalEgressGuardRefused, *_OUR_START_REFUSALS)
+
+
 def failed_create_error_code(
     last_exc: BaseException | None,
     *,
@@ -1251,11 +1258,11 @@ def failed_create_error_code(
 
     Down after the host's egress guard refused the replacement: ExecutorUnreachable (the host cannot run the guard).
     Down after our own step left it so (the undo's guard refused, or the pod's bridge removed by another create after
-    its guard): PodDownNotHostFault, not billed and not the host's, whatever the replacement failed on, a vanished
-    replacement included (F-26)."""
+    its guard, or Docker refusing to move the stopped pod onto its bridge): PodDownNotHostFault, not billed and not the
+    host's, whatever the replacement failed on, a vanished replacement included (F-26)."""
     if pod_left_down and isinstance(last_exc, RentalEgressGuardRefused):
         return FailedContainerErrorCodes.ExecutorUnreachable
-    if pod_left_down and (undo_guard_refused or isinstance(last_exc, RentalPodBridgeGone)):
+    if pod_left_down and (undo_guard_refused or isinstance(last_exc, _OUR_START_REFUSALS)):
         return FailedContainerErrorCodes.PodDownNotHostFault
     if container_vanished:
         return FailedContainerErrorCodes.ContainerVanished
@@ -2049,7 +2056,8 @@ class _EditSwap:
         # what Docker reports for the pod after a failed edit's undo (DAH-6737): "running", "down" or "unknown". Only
         # "down" lets the failure reply carry the no-billing host-fault code; set by __aexit__
         self.pod_state_after_undo = "unknown"
-        # the undo's own guard refused to start the parked original: the pod may be down whatever the edit failed on
+        # the undo's own guard, or its move onto the pod's bridge, refused to start the parked original: the pod may be
+        # down whatever the edit failed on
         self.undo_guard_refused = False
         # The replacement's own Docker ID, once `docker run` returned it. The undo removes by this ID:
         # a concurrent retry may hold the pod name by then, and removing by name would delete it.
@@ -2349,7 +2357,7 @@ class _EditSwap:
             # read only where it decides the reply's code: a guard refusal (the replacement's or the undo's) or the pod's
             # bridge gone before its start are the failures of ours that can leave the pod down
             ours_may_leave_it_down = (
-                isinstance(_last_attempt_exception(exc), (RentalEgressGuardRefused, RentalPodBridgeGone))
+                isinstance(_last_attempt_exception(exc), (RentalEgressGuardRefused, *_OUR_START_REFUSALS))
                 or self.undo_guard_refused
             )
             if ours_may_leave_it_down and not self.replacement_is_up:
@@ -2439,7 +2447,7 @@ class _EditSwap:
                     raise RuntimeError(f"docker rename: {(renamed.stderr or '').strip()}")
             except Exception as exc:  # noqa: BLE001 — the undo is best effort; the error is what we log
                 error = f"{type(exc).__name__}: {exc}"
-                self.undo_guard_refused = isinstance(exc, RentalEgressGuardRefused)
+                self.undo_guard_refused = isinstance(_last_attempt_exception(exc), _UNDO_REFUSALS)
                 # left running under its kept name, nothing would ever stop it or free the pod's GPUs: stopped,
                 # the next edit recovers it as the crashed-edit kept copy
                 stopped = await self._run(f"/usr/bin/docker stop -t 10 {q_parked}")
@@ -2463,7 +2471,7 @@ class _EditSwap:
                     await self.bring_up(self.container_name, True)
             except Exception as exc:  # noqa: BLE001 — the undo is best effort; the error is what we log
                 error = f"{type(exc).__name__}: {exc}"
-                self.undo_guard_refused = isinstance(exc, RentalEgressGuardRefused)
+                self.undo_guard_refused = isinstance(_last_attempt_exception(exc), _UNDO_REFUSALS)
         else:
             started = await self._run(f"/usr/bin/docker start {q_name}")
             if started.exit_status != 0:
@@ -12995,7 +13003,7 @@ class DockerService:
                     # the bridge guarded for this start is gone: refused on a stopped pod, which the cleanup keeps
                     # down; ours, not the host's, and not billed (DAH-6737)
                     else FailedContainerErrorCodes.PodDownNotHostFault
-                    if isinstance(_last_attempt_exception(exc), RentalPodBridgeGone)
+                    if isinstance(_last_attempt_exception(exc), _OUR_START_REFUSALS)
                     else FailedContainerErrorCodes.UnknownError
                 ),
             )

@@ -137,6 +137,11 @@ class RentalPodBridgeGone(RentalDockerOperationError):
     refused, never made on a bridge the drop was not confirmed on (DAH-6737)."""
 
 
+class RentalPodNetworkMoveFailed(RentalDockerOperationError):
+    """Docker refused moving a stopped pod off its old network onto its own: the pod is left stopped, by our step, not
+    the host's (DAH-6737)."""
+
+
 class ContainerNameTakenOnRetry(RentalDockerOperationError):
     """A transport retry of `run_container` found the spec's name already held by a container on another image."""
 
@@ -1340,9 +1345,20 @@ class RentalDockerSdkClient:
                 return False
         elif network in networks:
             return False
-        for name in sorted(networks):
-            self._api_client.disconnect_container_from_network(container_name, name)
-        self._api_client.connect_container_to_network(container_name, network_id if own else network)
+        target_ref = network_id if own else network
+        try:
+            for name in sorted(networks):
+                try:
+                    self._api_client.disconnect_container_from_network(container_name, name)
+                except Exception:
+                    # an old network removed while the pod was stopped holds nothing to leave
+                    if self._inspect_network_or_none(name) is not None:
+                        raise
+            self._api_client.connect_container_to_network(container_name, target_ref)
+        except Exception as exc:
+            raise RentalPodNetworkMoveFailed(
+                _wrap_error_message(f"Docker SDK move of {container_name} onto network {network} failed", exc)
+            ) from exc
         return True
 
     def _remove_unused_pod_networks_sync(self) -> None:

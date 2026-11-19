@@ -8,6 +8,7 @@ from services.rental_docker_sdk import (
     RENTAL_NETWORK_NAME,
     RentalDockerSdkClient,
     RentalPodBridgeGone,
+    RentalPodNetworkMoveFailed,
 )
 
 
@@ -113,6 +114,46 @@ async def test_start_without_a_network_only_starts():
 
     assert api.events == [("start", "pod_a")]
 
+
+
+
+class OldNetworkApi(FakeApi):
+    """Its disconnect fails as Docker can for a network removed while the pod was stopped, or for any other reason."""
+
+    def __init__(self, *, disconnect_error, **kwargs):
+        super().__init__(**kwargs)
+        self.disconnect_error = disconnect_error
+
+    def disconnect_container_from_network(self, container, network):
+        super().disconnect_container_from_network(container, network)
+        raise self.disconnect_error
+
+
+@pytest.mark.asyncio
+async def test_leaving_an_old_network_already_removed_is_a_no_op_and_the_pod_still_moves():
+    # DAH-6737: the old shared network was removed while the pod was stopped; nothing to leave
+    api = OldNetworkApi(networks=("lium-old",), disconnect_error=NotFound("network lium-old not found"))
+    client = RentalDockerSdkClient(api)
+
+    await client.start(container_name="pod_a", network=RENTAL_NETWORK_NAME)
+
+    assert api.events[-3:] == [
+        ("inspect_network", "lium-old"),
+        ("connect", "pod_a", RENTAL_NETWORK_NAME),
+        ("start", "pod_a"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_refused_move_off_a_network_that_still_exists_is_ours_and_never_starts_the_pod():
+    api = OldNetworkApi(disconnect_error=RuntimeError("500 Server Error: endpoint busy"))
+    api.networks["bridge"] = {"Id": "id-bridge"}
+    client = RentalDockerSdkClient(api)
+
+    with pytest.raises(RentalPodNetworkMoveFailed):
+        await client.start(container_name="pod_a", network=RENTAL_NETWORK_NAME)
+
+    assert not [e for e in api.events if e[0] in ("connect", "start")]
 
 
 # DAH-6737: each rental has a bridge of its own; no two tenants share a link

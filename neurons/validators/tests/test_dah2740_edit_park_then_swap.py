@@ -394,6 +394,9 @@ async def test_a_failed_edit_restores_the_previous_container(svc, monkeypatch):
         (True, "bridge", False, "down", "PodDownNotHostFault"),
         (True, "bridge", False, "running", "UnknownError"),  # the original came back: still billed
         (True, "bridge", False, "unreadable", "UnknownError"),
+        # the undo's move of the stopped original onto its bridge refused by Docker: ours, as Docker reports it
+        (True, "ordinary", "move", "down", "PodDownNotHostFault"),
+        (True, "ordinary", "move", "running", "UnknownError"),
     ],
     ids=[
         "absent_guard",
@@ -412,6 +415,8 @@ async def test_a_failed_edit_restores_the_previous_container(svc, monkeypatch):
         "bridge_gone_down",
         "bridge_gone_restored",
         "bridge_gone_unreadable",
+        "undo_move_refused_down",
+        "undo_move_refused_running",
     ],
 )
 @pytest.mark.asyncio
@@ -425,7 +430,12 @@ async def test_a_reboot_the_guard_refused_is_a_host_fault_only_while_no_containe
     payload = _edit_payload()
     ssh = _ssh_recording(container_present=present, after_undo=after_undo)
     _patch_happy(svc, monkeypatch, ssh)
-    restore_error = RentalEgressGuardRefused("undo not applied") if restore_fails == "guard" else RuntimeError("sshd")
+    from services.rental_docker_sdk import RentalPodNetworkMoveFailed
+
+    restore_error = {
+        "guard": RentalEgressGuardRefused("undo not applied"),
+        "move": RentalPodNetworkMoveFailed("Docker SDK move of pod_x onto network lium-rentals-pod_x failed"),
+    }.get(restore_fails, RuntimeError("sshd"))
     monkeypatch.setattr(
         svc, "_bring_up_existing_container", AsyncMock(side_effect=restore_error if restore_fails else None)
     )
