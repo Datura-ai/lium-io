@@ -7122,6 +7122,38 @@ async def test_wait_for_port_check_filter_includes_health_check(docker_service):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("filler", [True, False])
+async def test_wait_for_port_check_filler_leaves_backend_health_check_running(docker_service, filler):
+    """DAH-6756: a filler create force-removed the backend's running health_check_* probe, which
+    then failed ('sshd binary not found', SSH auth) and failed the node. A filler removes no probe;
+    a customer rental still does (DAH-2272)."""
+    commands: list[str] = []
+
+    class FakeSSHClient:
+        async def run(self, cmd):
+            commands.append(cmd)
+            return MagicMock(stdout="health_check_abc\n", stderr="", exit_status=0)
+
+    removed, message = await docker_service.wait_for_port_check_containers(
+        executor_info=MagicMock(),
+        miner_hotkey="5TestMiner",
+        keypair=MagicMock(),
+        private_key="encrypted-private-key",
+        ssh_client=FakeSSHClient(),
+        probed_container_names=("health_check_abc",),
+        filler=filler,
+    )
+
+    removes = [c for c in commands if "docker rm" in c]
+    if filler:
+        assert (removed, message) == (False, "Filler create leaves probe containers running")
+        assert commands == []
+    else:
+        assert removed is True
+        assert len(removes) == 1 and "name=^health_check_" in removes[0]
+
+
+@pytest.mark.asyncio
 async def test_wait_for_port_check_does_not_block_other_miner(docker_service):
     """A container_<other_hotkey>_* container on a shared host does NOT block us.
 

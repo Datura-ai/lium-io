@@ -5555,8 +5555,14 @@ class DockerService:
         *,
         ssh_client: asyncssh.SSHClientConnection | None = None,
         probed_container_names: tuple[str, ...] | None = None,
+        filler: bool = False,
     ) -> PortCheckRemoval:
         """Force-remove lingering port-check / probe containers before a rental.
+
+        DAH-6756: a filler (our own Default Job) removes none. Only a customer rental outranks a
+        verification probe; a filler that removed the backend's running health_check_* failed that
+        check ('sshd binary not found', SSH auth) and the node with it. A port the probe holds makes
+        the filler's `docker run` take the port-allocated retry or fail, as a background start may.
 
         Matches two prefix patterns:
         - 'container_{miner_hotkey}_*' — validator DinD/port-check probes (hotkey-scoped,
@@ -5605,6 +5611,8 @@ class DockerService:
             - (False, "Port check containers listed but none removed")
             - (False, "Unable to check for port check containers, proceeding")
         """
+        if filler:
+            return PortCheckRemoval(False, "Filler create leaves probe containers running")
         listing_command = port_check_containers_command(miner_hotkey)
 
         async def _run_checks(client: asyncssh.SSHClientConnection) -> PortCheckRemoval:
@@ -11670,6 +11678,7 @@ class DockerService:
                     private_key=private_key,
                     ssh_client=ssh_client,
                     probed_container_names=probed_port_check_names,
+                    filler=payload.workload_kind == WorkloadKind.FILLER,
                 )
                 logger.info(
                     _m(
@@ -11718,6 +11727,7 @@ class DockerService:
                                 keypair=keypair,
                                 private_key=private_key,
                                 ssh_client=ssh_client,
+                                filler=payload.workload_kind == WorkloadKind.FILLER,
                             )
                         ),
                         # fillers keep no RepoDigests on a flattened copy, so their image check would be skipped
