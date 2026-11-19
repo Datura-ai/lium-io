@@ -69,8 +69,9 @@ class ExecutorSSHInfo(pydantic.BaseModel):
     # those of the owner's other accounts (same own-key coldkey or same confirmed e-mail). A node an owner set up under
     # one of their own older accounts is theirs, not a relay. None from an older miner: `expected_account_claim` only.
     expected_account_claims: list[str] | None = None
-    # check_id -> ISO-8601 time from which a check that so far only reports may refuse this node: the portal sets it
-    # once it sent the provider the per-node notice for that finding. Absent: the check reports and does not refuse.
+    # reason code -> ISO-8601 time from which a finding that so far only reports may refuse this node: the portal sets it
+    # once it sent the provider the per-node notice for that finding. A code absent from the map only reports; no map at
+    # all (an older miner or portal) keeps every check enforced as before.
     check_enforce_after: dict[str, str] | None = None
 
 

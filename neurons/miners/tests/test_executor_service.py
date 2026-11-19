@@ -506,7 +506,7 @@ async def test_central_miner_lists_each_node_with_its_registered_host_key_from_o
         {"id": keyed_node.upper(), "validator_hotkey": "v", "executor_ip_address": "node.example.com",
          "executor_ip_port": "8001", "ssh_host_key": "ssh-ed25519 AAAAregistered",
          "node_hotkeys": ["5Account", "5Pool"], "account_claim": "claim-1", "account_claims": ["claim-1", "claim-0"],
-         "check_enforce_after": {"executor.validate.node_account": "2026-11-19T06:00:00Z"}},
+         "check_enforce_after": {"NODE_ACCOUNT_UNVERIFIED": "2026-11-19T06:00:00Z"}},
         {"id": unkeyed_node, "validator_hotkey": "v", "executor_ip_address": "203.0.113.5", "executor_ip_port": "8001"},
     ]
     es.settings.CENTRAL_MODE = True
@@ -532,7 +532,7 @@ async def test_central_miner_lists_each_node_with_its_registered_host_key_from_o
     assert by_id[keyed_node.lower()].expected_node_hotkeys == ["5Account", "5Pool"]
     assert by_id[keyed_node.lower()].expected_account_claim == "claim-1"
     assert by_id[keyed_node.lower()].expected_account_claims == ["claim-1", "claim-0"]  # the owner's accounts
-    assert by_id[keyed_node.lower()].check_enforce_after == {"executor.validate.node_account": "2026-11-19T06:00:00Z"}
+    assert by_id[keyed_node.lower()].check_enforce_after == {"NODE_ACCOUNT_UNVERIFIED": "2026-11-19T06:00:00Z"}
     assert by_id[unkeyed_node].expected_node_hotkeys is None
     assert (by_id[unkeyed_node].expected_account_claims, by_id[unkeyed_node].check_enforce_after) == (None, None)
 

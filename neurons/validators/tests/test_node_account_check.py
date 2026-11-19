@@ -160,7 +160,7 @@ class _HostFiles:
         )
 
 
-NOTIFIED = {"executor.validate.node_account": "2026-11-18T07:00:00Z"}  # the portal sent the per-node notice
+NOTIFIED = {"NODE_ACCOUNT_UNVERIFIED": "2026-11-18T07:00:00Z"}  # the portal sent the per-node notice
 
 
 def _relay_ctx(runner, hotkeys=("5Account", POOL), claim=CLAIM, address="203.0.113.7", claims=None, enforce=None):
@@ -414,7 +414,7 @@ async def test_another_owners_setup_is_refused_at_once_without_a_notice():
 
 
 @pytest.mark.parametrize(
-    "enforce", [{}, {"executor.validate.node_account": "2999-01-01T00:00:00Z"}, {"x": "y"}]
+    "enforce", [{}, {"NODE_ACCOUNT_UNVERIFIED": "2999-01-01T00:00:00Z"}, {"x": "y"}]
 )
 async def test_a_failed_read_only_reports_until_the_provider_was_notified(enforce):
     """Not proof of another owner: before the portal's notice (or before its time) the run passes, the finding is no

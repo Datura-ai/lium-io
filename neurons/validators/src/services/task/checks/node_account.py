@@ -119,7 +119,7 @@ class NodeAccountCheck:
         if not result.success:
             # failed, timed out or closed without an exit status: ownership is not proven
             what["read_error"] = result.error_type or f"exit {result.exit_code}"
-            if enforced(ctx, self.check_id):
+            if enforced(ctx, Msg.BINDING_UNVERIFIED.reason):
                 return _refused(ctx, self.check_id, Msg.BINDING_UNVERIFIED, what), False
             what = {**what, "enforced": False}
             return reported_only(
