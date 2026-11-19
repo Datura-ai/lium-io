@@ -35,9 +35,9 @@ async def test_only_the_rental_probe_pod_has_no_restart_policy(svc, monkeypatch,
     ssh_client = _ssh_client(inspect_exit=0)
     _patch_happy(svc, monkeypatch, ssh_client)
     specs = []
-    build = svc._build_rental_container_run_spec
+    original_build_run_spec = svc._build_rental_container_run_spec
     monkeypatch.setattr(
-        svc, "_build_rental_container_run_spec", lambda **kw: specs.append(build(**kw)) or specs[-1]
+        svc, "_build_rental_container_run_spec", lambda **kw: specs.append(original_build_run_spec(**kw)) or specs[-1]
     )
     payload = _payload(workload_kind=kind)
 
