@@ -196,6 +196,74 @@ def test_a_large_owner_set_is_signed_whole(miner_service, validator_keypair, por
 
 
 @pytest.mark.asyncio
+async def test_after_a_restart_a_signed_upload_waits_for_the_first_owner_read(rest_miner_service, portal_owners, monkeypatch):
+    """The normal cycle (not only the express lane) signs nothing until the first owner read has finished, and starts
+    that read itself: a node set up under one account and listed under another gets its owner signed."""
+    import asyncio
+
+    from datura.requests.miner_requests import AcceptSSHKeyRequest
+
+    from clients.validator_portal_api import ValidatorPortalAPI
+    from fixtures.rest_miner_fixtures import executor_info
+
+    monkeypatch.setattr(portal_owners, "_owner_hotkeys_read_once", False)
+    _subtensor(monkeypatch, axon_versions={"miner-a": MIN_DATED_NONCE_MINER_AXON_VERSION})
+    release, reads = asyncio.Event(), []
+
+    async def _slow_read():
+        reads.append(1)
+        await release.wait()
+        portal_owners.remember_owner_hotkeys({"miner-a": ["5OwnerX"]})
+        return True
+
+    real_read = ValidatorPortalAPI.refresh_owner_hotkeys
+    monkeypatch.setattr(ValidatorPortalAPI, "refresh_owner_hotkeys", staticmethod(_slow_read))
+    submitted = []
+
+    async def _make_rest_request(method, url, json_data, headers, timeout, log_extra, operation_name):
+        if url.endswith("ssh-pubkey-submit"):
+            submitted.append(json_data)
+            return 200, AcceptSSHKeyRequest(executors=[executor_info("exec-1")]).model_dump(mode="json")
+        return 200, {"message_type": "SSHKeyRemoved"}
+
+    rest_miner_service._make_rest_request = _make_rest_request
+
+    def _cycle():
+        return rest_miner_service.request_job_to_miner(
+            payload=MinerJobRequestPayload(
+                job_batch_id="b", miner_hotkey="miner-a", miner_coldkey="c", miner_address="192.0.2.10", miner_port=8091
+            ),
+            encrypted_files=MinerJobEnryptedFiles(
+                encrypt_key="k", all_keys={}, tmp_directory="/tmp", machine_scrape_file_name="s",
+                machine_scrape_source="",
+            ),
+            rented_data=RentedExecutorsResponse(executors={}),
+            default_docker_image_digests={},
+        )
+
+    cycles = [asyncio.ensure_future(_cycle()) for _ in range(2)]
+    await asyncio.sleep(0.05)
+    assert submitted == [] and reads == [1]  # both wait on one read, which the cycle started itself
+    release.set()
+    await asyncio.gather(*cycles)
+    assert [list(body["owner_hotkey_signatures"]) for body in submitted] == [["5OwnerX"], ["5OwnerX"]]
+
+    # a failed first read (portal down) releases the wait too, and later uploads never read again before signing
+    def _portal_down(*args, **kwargs):
+        reads.append(1)
+        raise OSError("portal down")
+
+    monkeypatch.setattr(portal_owners, "_owner_hotkeys_read_once", False)
+    monkeypatch.setattr(portal_owners, "_first_owner_read", None)
+    monkeypatch.setattr(ValidatorPortalAPI, "refresh_owner_hotkeys", staticmethod(real_read))
+    monkeypatch.setattr(portal_owners.settings, "MINER_PORTAL_REST_API_URL", "https://portal.test/")
+    monkeypatch.setattr(portal_owners.aiohttp, "ClientSession", _portal_down)
+    await asyncio.wait_for(portal_owners.first_owner_hotkeys_read(), 1)
+    await asyncio.wait_for(portal_owners.first_owner_hotkeys_read(), 1)
+    assert reads == [1, 1]
+
+
+@pytest.mark.asyncio
 async def test_refresh_reads_the_portal_and_a_failed_read_keeps_the_last_answer(portal_owners, monkeypatch):
     from clients.validator_portal_api import ValidatorPortalAPI
 

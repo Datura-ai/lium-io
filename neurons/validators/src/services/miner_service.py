@@ -13,7 +13,7 @@ from asyncssh import SSHKey
 import asyncssh
 import bittensor
 from clients.subtensor_client import SubtensorClient
-from clients.validator_portal_api import portal_owner_hotkeys
+from clients.validator_portal_api import first_owner_hotkeys_read, portal_owner_hotkeys
 from datura.requests.miner_requests import (
     AcceptSSHKeyRequest,
     ExecutorSSHInfo,
@@ -2275,6 +2275,7 @@ class MinerService:
             attestation_nonce = await self.attestation_service.maybe_issue_nonce(nonce_hex)
 
             # Prepare request
+            await first_owner_hotkeys_read()  # DAH-6740: never sign against the empty map of a restart
             ssh_request = SSHPubKeySubmitRequest(
                 public_key=public_key,
                 validator_signature=self._sign_validator_pubkey(my_key, public_key, nonce=nonce_hex),
@@ -2550,6 +2551,7 @@ class MinerService:
             private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
 
             upload_nonce = self._upload_nonce_for_miner(payload.miner_hotkey)
+            await first_owner_hotkeys_read()  # DAH-6740: never sign against the empty map of a restart
             ssh_request = SSHPubKeySubmitRequest(
                 public_key=public_key,
                 validator_signature=self._sign_validator_pubkey(my_key, public_key, nonce=upload_nonce),
@@ -2964,6 +2966,7 @@ class MinerService:
             headers["Content-Type"] = "application/json"
             
             upload_nonce = self._upload_nonce_for_miner(payload.miner_hotkey)
+            await first_owner_hotkeys_read()  # DAH-6740: never sign against the empty map of a restart
             ssh_request = SSHPubKeySubmitRequest(
                 public_key=payload.public_key,
                 validator_signature=self._sign_validator_pubkey(my_key, payload.public_key, nonce=upload_nonce),

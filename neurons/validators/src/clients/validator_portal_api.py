@@ -42,6 +42,9 @@ class PortalExecutor(BaseModel):
 _owner_hotkeys: dict[str, frozenset[str]] = {}
 # monotonic time of the last answer applied; None before the first
 _owner_hotkeys_read_at: float | None = None
+# True once one owner read has finished, even a failed one (404, no portal URL, timeout); see first_owner_hotkeys_read
+_owner_hotkeys_read_once = False
+_first_owner_read: asyncio.Future | None = None
 # An answer is authorization the portal gave at that time: past this age (portal down, or answering garbage) it counts
 # for nothing, so a link removed during an outage stops being honoured within this bound. Ten ticks of the slow lane.
 OWNER_HOTKEYS_MAX_AGE_SECONDS = 300
@@ -268,8 +271,10 @@ class ValidatorPortalAPI:
     async def refresh_owner_hotkeys() -> bool:
         """DAH-6740: replace the owner map with the portal's /miners/owner-hotkeys; False on any failure (a 404 from a
         portal without the route included): the last answer then ages out (portal_owner_hotkeys)."""
+        global _owner_hotkeys_read_once
         api_base = settings.MINER_PORTAL_REST_API_URL.rstrip("/") if settings.MINER_PORTAL_REST_API_URL else ""
         if not api_base:
+            _owner_hotkeys_read_once = True
             return False
         url = f"{api_base}/miners/owner-hotkeys"
         try:
@@ -294,3 +299,17 @@ class ValidatorPortalAPI:
                 _m("Owner hotkeys not refreshed from portal", extra=get_extra_info({"url": url, "error": str(exc)}))
             )
             return False
+        finally:
+            _owner_hotkeys_read_once = True
+
+
+async def first_owner_hotkeys_read() -> None:
+    """DAH-6740: every upload that signs owner hotkeys awaits this, whichever lane sends it, so after a restart nothing
+    is signed (or checked) against the still-empty map. Returns once one read has finished, even a failed one; starts
+    that read if none is running. Bounded by the read's own 30 s timeout."""
+    global _first_owner_read
+    if _owner_hotkeys_read_once:
+        return
+    if _first_owner_read is None or _first_owner_read.done():
+        _first_owner_read = asyncio.ensure_future(ValidatorPortalAPI.refresh_owner_hotkeys())
+    await asyncio.shield(_first_owner_read)
