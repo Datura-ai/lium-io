@@ -17,12 +17,7 @@ on:
 permissions:
   contents: read
 
-# a newer push to the same PR cancels the older run, so superseded runs stop reading the API; every main and merge-queue
-# run has its own group (run_id): a shared ref group would let a third push replace the pending second one, unscanned.
-# workflow_ref keeps the ruleset's run (main's copy) and this repository's own run of a PR from cancelling each other
-concurrency:
-  group: pinned-actions-${{ github.workflow_ref }}-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+# no concurrency group: a ruleset-required run that GitHub cancels before it reports leaves the required check pending
 
 jobs:
   check:
