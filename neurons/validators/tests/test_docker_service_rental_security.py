@@ -24,6 +24,7 @@ from payload_models.payloads import (
     WorkloadKind,
 )
 import services.docker_service as docker_service_module
+from helpers import no_host_start_lock, shared_pod_start_stop_lock
 from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService, _is_vloopback_driver, _s3fs_plugin_alias
 from services.rental_docker_sdk import (
     ContainerExecResult,
@@ -115,6 +116,9 @@ class RecordingRentalDockerClient:
         self.exec_specs.append(spec)
         return ContainerExecResult(exit_status=0)
 
+    async def container_identity(self, *, container_name: str) -> str | None:
+        return "cid@2026-11-16T14:00:00Z"
+
     async def inspect_container_state(self, *, container_name: str) -> ContainerStateSnapshot:
         return ContainerStateSnapshot(
             status="running", running=True, restarting=False, exit_code=0, restart_count=0, error=None,
@@ -205,6 +209,7 @@ def docker_service():
     lock.__aenter__ = AsyncMock(return_value=lock)
     lock.__aexit__ = AsyncMock(return_value=None)
     redis_service.acquire_executor_lock = Mock(return_value=lock)
+    redis_service.pod_start_stop_lock = shared_pod_start_stop_lock({})
     service = DockerService(
         ssh_service=ssh_service,
         redis_service=redis_service,
@@ -213,6 +218,7 @@ def docker_service():
     )
     # the pre-run kernel.pid_max read is mandatory and the SSH doubles here do not model /proc
     service._read_host_pid_max = AsyncMock(return_value=4_194_304)
+    service._hold_pod_start_host_lock = no_host_start_lock
     return service
 
 
@@ -1199,7 +1205,8 @@ async def test_lifecycle_operations_pass_container_names_as_sdk_data(
         _all_host_commands(retried_commands, ssh_client),
         ["CONTAINER_MARKER"],
     )
-    assert docker_client.started_containers == [HOSTILE_CONTAINER_NAME]
+    # the start runs the id read for that name (as SDK data too), not the name itself
+    assert docker_client.started_containers == ["cid"]
     # two stops: the explicit stop_container call + the graceful stop inside
     # delete_container (DAH-2364)
     assert docker_client.stopped_containers == [HOSTILE_CONTAINER_NAME, HOSTILE_CONTAINER_NAME]

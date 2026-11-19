@@ -144,6 +144,9 @@ class _FakeRentalDockerClient:
             oom_killed=False,
         )
 
+    async def container_identity(self, *, container_name: str) -> str | None:
+        return "cid@2026-11-16T14:03:00Z"
+
 
 class _FakeRentalDockerFactory:
     def __init__(self, client):
