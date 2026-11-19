@@ -1307,10 +1307,19 @@ def get_gpu_processes(pids: set, containers: list[dict]):
                     container_name = container['each_name']
                     break
 
+            # what runs, read only inside our own filler containers: a renter's command line can hold secrets
+            cmdline = ""
+            if container_name and container_name.startswith("filler_"):
+                try:
+                    cmdline = run_cmd(f"tr '\\0' ' ' < /proc/{pid}/cmdline").strip()[:512]
+                except:
+                    pass
+
             processes.append({
                 "processes_pid": pid,
                 "processes_info": info,
-                "processes_container_name": container_name
+                "processes_container_name": container_name,
+                "processes_cmdline": cmdline
             })
         except:
             pass

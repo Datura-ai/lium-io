@@ -378,6 +378,11 @@ class ContainerRunSpec:
     # on the host; may raise ContainerCreateRefused, and the created container is then left unstarted
     before_start: Callable[[list[str]], None] | None = field(default=None, repr=False, compare=False)
 
+    def __post_init__(self) -> None:
+        # DAH-6302: Docker reads nano_cpus 0 as no limit, so a share that rounded down to 0 gets one core
+        if self.cpu_count is not None:
+            self.cpu_count = max(self.cpu_count, 1)
+
 
 @dataclass(slots=True)
 class ContainerExecSpec:
@@ -710,6 +715,9 @@ class RentalDockerSdkClient:
             timeout=stop_grace_seconds,
         )
 
+    async def kill(self, *, container_name: str) -> None:
+        await self._call_api(container_name, operation_label="kill", api_method=self._api_client.kill)
+
     async def remove_container(
         self,
         *,
@@ -740,6 +748,20 @@ class RentalDockerSdkClient:
             raise RentalDockerOperationError(
                 _wrap_error_message("Docker SDK inspect container failed", exc)
             ) from exc
+
+    async def container_identity(self, *, container_name: str) -> str | None:
+        """"<Id>@<StartedAt>": a re-create changes the id, a re-start the start time. None once the container is gone."""
+        try:
+            info = await _in_docker_thread(self._api_client.inspect_container, container_name)
+        except Exception as exc:
+            if _is_docker_not_found_error(exc):
+                return None
+            raise RentalDockerOperationError(_wrap_error_message("Docker SDK inspect container failed", exc)) from exc
+        container_id = info.get("Id") if isinstance(info, dict) else None
+        started_at = (info.get("State") or {}).get("StartedAt") if isinstance(info, dict) else None
+        if not container_id or not started_at:
+            raise RentalDockerOperationError("Docker inspect did not include the container's Id and StartedAt")
+        return f"{container_id}@{started_at}"
 
     async def container_log_tail(self, *, container_name: str, lines: int) -> str:
         """The container's last `lines` of stdout+stderr, decoded with replacement characters."""
@@ -945,11 +967,16 @@ class RentalDockerSdkClient:
             force=force,
         )
 
-    async def prune_images(self) -> None:
-        await self._call_api(
-            operation_label="prune images",
-            api_method=self._api_client.prune_images,
-        )
+    async def remove_image_if_untagged(self, *, image_id: str) -> bool:
+        """Remove the image by ID when no tag names it any more; dockerd refuses while a container uses it."""
+        try:
+            image = await _in_docker_thread(self._api_client.inspect_image, image_id)
+        except Exception as exc:
+            raise RentalDockerOperationError(_wrap_error_message("Docker SDK inspect image failed", exc)) from exc
+        if image.get("RepoTags"):
+            return False
+        await self._call_api(image_id, operation_label="remove image", api_method=self._api_client.remove_image)
+        return True
 
     async def aclose(self) -> None:
         close = getattr(self._api_client, "close", None)
