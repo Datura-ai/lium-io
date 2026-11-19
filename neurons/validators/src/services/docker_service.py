@@ -588,6 +588,8 @@ RENTAL_DISK_SHORT_STEP = "rental_disk_short"
 HOST_READ_PID_MAX_STEP = "host_read_pid_max"
 HOST_READ_RAM_KIB_STEP = "host_read_ram_kib"
 HOST_READ_GPU_COUNT_STEP = "host_read_gpu_count"
+# each fail-closed host read, on the validator side: its open, then its command
+_HOST_READ_TIMEOUT_SECONDS = 15
 # DAH-5260: `docker volume rm` of the 1561 GB kimi-k3 cache unlinks ~1.5 TB; ext4 frees ~180 GB/s of
 # extents (22 GB in 0.12 s measured), so ~10 s. The bound only stops a wedged dockerd holding the create.
 CACHE_VOLUME_REMOVE_TIMEOUT_SECONDS = 600
@@ -4686,14 +4688,14 @@ class DockerService:
 
         Lets `_rental_pids_limit` keep the rental container's pids cap below the host's global PID
         ceiling so a tenant fork bomb cannot starve sshd/dockerd on a low-pid_max host. Bounded:
-        the caller refuses the rental on a miss. The read is a bare `cat` of a /proc file bounded by asyncssh's own
-        `timeout`; it deliberately does not shell out to `timeout`, whose absence would otherwise
-        turn into a miss and fail the read.
+        the caller refuses the rental on a miss. The read is a bare `cat` of a /proc file bounded on the validator
+        side; it deliberately does not shell out to `timeout`, whose absence would otherwise turn into a miss and
+        fail the read. A timed-out read closes its channel before it returns, so the host's only SSH session
+        (MaxSessions=1) is free for the next command; when that close is not confirmed it raises
+        SshSessionMayStillBeTakenError and the create stops before any host side effect (review on lium-io#2364).
         """
         try:
-            res = await ssh_client.run(
-                "cat /proc/sys/kernel/pid_max", check=False, timeout=15
-            )
+            res = await _run_closing_channel_on_timeout(ssh_client, "cat /proc/sys/kernel/pid_max", _HOST_READ_TIMEOUT_SECONDS)
         except (asyncssh.Error, asyncio.TimeoutError, OSError) as e:
             why = f"read failed: {type(e).__name__}"
         else:
@@ -4714,7 +4716,7 @@ class DockerService:
     async def _read_host_ram_kib(self, ssh_client) -> int | None:
         """The executor host's MemTotal in KiB, or None when unreadable. Same bounded read as pid_max."""
         try:
-            res = await ssh_client.run("cat /proc/meminfo", check=False, timeout=15)
+            res = await _run_closing_channel_on_timeout(ssh_client, "cat /proc/meminfo", _HOST_READ_TIMEOUT_SECONDS)
         except (asyncssh.Error, asyncio.TimeoutError, OSError):
             return None
         if getattr(res, "exit_status", 1) != 0:
@@ -4736,8 +4738,8 @@ class DockerService:
         share of host RAM; the caller refuses the rental on a miss so the fallback is never larger than
         the renter's share of the host."""
         try:
-            res = await ssh_client.run(
-                "ls -1d /dev/nvidia[0-9]* 2>/dev/null | wc -l", check=False, timeout=15
+            res = await _run_closing_channel_on_timeout(
+                ssh_client, "ls -1d /dev/nvidia[0-9]* 2>/dev/null | wc -l", _HOST_READ_TIMEOUT_SECONDS
             )
         except (asyncssh.Error, asyncio.TimeoutError, OSError):
             return None
@@ -10569,17 +10571,22 @@ class DockerService:
                     or host_pid_max - settings.RENTAL_PIDS_LIMIT_HOST_MARGIN < _MIN_RENTAL_PIDS_LIMIT
                 )
 
+            host_read_step = HOST_READ_PID_MAX_STEP  # the read in progress, named if its channel stays taken
+
             async def read_host_limits(
                 connected_ssh_client: asyncssh.SSHClientConnection,
             ) -> tuple[int | None, int | None, int | None]:
+                nonlocal host_read_step
                 # one after another on the session; the GPU count only sizes a split rental's share of the RAM read
                 pid_max = await self._read_host_pid_max(connected_ssh_client)
                 if pid_max_refused(pid_max):
                     # the create refuses at the PID guard anyway: open no further channel a stalled host may never grant
                     return pid_max, None, None
+                host_read_step = HOST_READ_RAM_KIB_STEP
                 ram_kib = await self._read_host_ram_kib(connected_ssh_client)
                 gpu_count = None
                 if ram_kib is not None and payload.gpu_uuids:
+                    host_read_step = HOST_READ_GPU_COUNT_STEP
                     gpu_count = await self._read_host_gpu_count(connected_ssh_client)
                 return pid_max, ram_kib, gpu_count
 
@@ -10683,11 +10690,16 @@ class DockerService:
                 profilers.append(ProfilerStep.since(ProfilerStepName.SSH_CONNECTION_ESTABLISHED, prev_timestamp))
                 prev_timestamp = now_ms()
 
-                # The bounded host reads end before anything else uses this session: on an sshd with
-                # MaxSessions=1 a cancelled filler's cleanup below would otherwise get no channel, leave the
-                # filler running and then lift its power cap (review on lium-io#2364).
+                # The bounded host reads end, each with its channel closed, before anything else uses this
+                # session: on an sshd with MaxSessions=1 a cancelled filler's cleanup below would otherwise get no
+                # channel, leave the filler running and then lift its power cap (review on lium-io#2364). A read
+                # whose channel close is not confirmed stops the create here, before any host side effect.
                 assert host_limits_read is not None  # started as soon as the SSH session was up
-                host_pid_max, host_ram_kib, read_host_gpu_count = await host_limits_read
+                try:
+                    host_pid_max, host_ram_kib, read_host_gpu_count = await host_limits_read
+                except SshSessionMayStillBeTakenError:
+                    current_step = host_read_step
+                    raise
 
                 # DAH-2728: cheapest place to notice the delete — the image pull/build below is
                 # where a cancelled create spends its minutes, and nothing is on the host yet.

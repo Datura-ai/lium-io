@@ -1170,3 +1170,32 @@ async def test_a_filler_create_cancelled_at_ssh_connect_cleans_up_only_after_the
     )
 
     assert seen_at_abort[:1] == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("read", "step"),
+    [("_read_host_pid_max", "host_read_pid_max"), ("_read_host_ram_kib", "host_read_ram_kib")],
+)
+async def test_a_host_read_whose_channel_may_still_hold_the_session_stops_the_create_before_any_cleanup(
+    svc_fixture, monkeypatch, read, step
+):
+    """Review on lium-io#2364: a timed-out read whose channel close is not confirmed may still hold a one-session
+    sshd. The create stops at that read's step before the delete check, the filler cleanup or the power restore can
+    put a command on the session."""
+    svc = svc_fixture
+    _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers("filler_x"))
+    monkeypatch.setattr(svc, "_read_host_pid_max", AsyncMock(return_value=4194304))
+    monkeypatch.setattr(
+        svc, read, AsyncMock(side_effect=ds_module.SshSessionMayStillBeTakenError("close not confirmed"))
+    )
+    monkeypatch.setattr(svc, "_abort_if_cancelled_by_delete", AsyncMock())
+
+    result = await asyncio.wait_for(
+        _run_create_container(svc, _deploy_payload(workload_kind=WorkloadKind.FILLER, active_volume_names=["volume_x"])),
+        timeout=5,
+    )
+
+    assert result.failure_step == step
+    svc._abort_if_cancelled_by_delete.assert_not_awaited()
+
