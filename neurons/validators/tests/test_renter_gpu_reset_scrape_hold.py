@@ -538,6 +538,18 @@ async def _run_reset(service, backend=None, **connect):
 
 
 @pytest.mark.asyncio
+async def test_a_container_that_did_not_start_goes_with_no_code_until_the_backend_knows_it():
+    # DAH-6741: a backend before lium_protocol 2.17.0 drops a frame with an unknown error_code
+    connection = MagicMock(__aenter__=AsyncMock(), __aexit__=AsyncMock(return_value=False))
+    report = GpuResetReport(ok=False, error_code=GpuResetErrorCode.ContainerNotRestarted, detail="did not start")
+
+    with patch("services.docker_service.reset_pod_gpus", AsyncMock(return_value=report)):
+        result = await _run_reset(_redis_service(), return_value=connection)
+
+    assert (result.ok, result.error_code, result.container_restarted) == (False, None, False)
+
+
+@pytest.mark.asyncio
 async def test_the_reset_leaves_a_recent_mark_when_its_pending_mark_goes():
     service = _redis_service()
     connection = MagicMock(__aenter__=AsyncMock(), __aexit__=AsyncMock(return_value=False))

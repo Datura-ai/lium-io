@@ -572,6 +572,8 @@ class GpuResetErrorCode(enum.Enum):
     ClockLockNotSupported = "ClockLockNotSupported"
     # 2.16.0: the host GPU listing failed, timed out or came back empty: the GPUs are gone from the host driver
     GpusLostOnHost = "GpusLostOnHost"
+    # 2.17.0: every GPU was reset and the pod's container did not start again
+    ContainerNotRestarted = "ContainerNotRestarted"
 
 
 class GpuResetOutcome(pydantic.BaseModel):

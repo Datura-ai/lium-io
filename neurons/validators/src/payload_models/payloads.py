@@ -900,6 +900,7 @@ class GpuResetErrorCode(enum.Enum):
     ExecutorUnreachable = "ExecutorUnreachable"
     ClockLockNotSupported = "ClockLockNotSupported"
     GpusLostOnHost = "GpusLostOnHost"
+    ContainerNotRestarted = "ContainerNotRestarted"
 
 
 class GpuResetOutcome(BaseModel):
