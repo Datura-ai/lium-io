@@ -177,7 +177,7 @@ class RentedExecutorsResponse(BaseModel):
     # these ports never show up in executors[].pods and port verification used to probe them and
     # collide. Empty for a backend that predates the field — the collision simply stays.
     filler_ports_by_executor: dict[str, list[int]] = {}
-    # filler container name -> its FillerRunStrategy (lium_protocol 2.17.0). The periodic sshd probe never execs into
+    # filler container name -> its FillerRunStrategy (lium_protocol 2.19.0). The periodic sshd probe never execs into
     # an ENGY_TEE container: SN53 counts any access to a provisioned server as cheating. Empty from an older backend.
     filler_strategy_by_container: dict[str, str] = {}
     banned_guids: list[str] = []

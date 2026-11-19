@@ -89,7 +89,7 @@ class RentedExecutorsResponse(pydantic.BaseModel):
     filler_containers_by_executor: dict[str, str] = {}
     # executor_id → every active filler container name (DAH-2465)
     all_filler_containers_by_executor: dict[str, list[str]] = {}
-    # 2.17.0: filler container name -> its FillerRunStrategy ("ENGY_TEE", "DPHN", ...); the validator never execs into
+    # 2.19.0: filler container name -> its FillerRunStrategy ("ENGY_TEE", "DPHN", ...); the validator never execs into
     # an ENGY_TEE container (SN53 counts any access to a provisioned server as cheating). Empty from an older backend.
     filler_strategy_by_container: dict[str, str] = {}
     # executor_id → external ports its active fillers hold (DAH-2527)
