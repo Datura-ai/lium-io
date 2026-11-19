@@ -12,6 +12,9 @@ from ..pipeline import CheckResult, Context
 
 # the monitor an executor image of before DAH-6681 ran from its own source tree: never trusted, stopped on sight
 LEGACY_MONITOR = "/root/app/src/gpus_utility.py"
+# the executor runs with pid: host, so a bare pkill/pgrep also sees other containers' and the host's processes;
+# only those in this shell's mount namespace (the executor's own) are stopped or counted
+SAME_MOUNT_NS = '--ns "$$" --nslist mnt'
 
 
 class StartGPUMonitorCheck:
@@ -51,12 +54,11 @@ class StartGPUMonitorCheck:
         # a monitor running the executor's own copy is stopped, so only the validator's runs ("[p]" keeps the
         # pattern from matching the shell that runs this command)
         legacy = "[p]ython.*" + LEGACY_MONITOR.replace(".", "\\.")
-        await runner.run(f"pkill -f -- {shlex.quote(legacy)}; true", timeout=10, retryable=False)
+        await runner.run(f"pkill {SAME_MOUNT_NS} -f -- {shlex.quote(legacy)}; true", timeout=10, retryable=False)
         # a monitor already started by the validator. Detection only: nothing is executed.
-        pattern = f"python.*{payload.service_dir_glob('monitor')}[^/]*/{payload.GPU_MONITOR[0]}"
-        check_cmd = f"ps auxww | grep -E {shlex.quote(pattern)} | grep -v grep"
-        check_res = await runner.run(check_cmd, timeout=10, retryable=False)
-        processes = [line for line in check_res.stdout.splitlines() if "grep" not in line]
+        pattern = f"[p]ython.*{payload.service_dir_glob('monitor')}[^/]*/{payload.GPU_MONITOR[0]}"
+        check_res = await runner.run(f"pgrep {SAME_MOUNT_NS} -af -- {shlex.quote(pattern)}", timeout=10, retryable=False)
+        processes = check_res.stdout.splitlines()
 
         if processes:
             event = render_message(

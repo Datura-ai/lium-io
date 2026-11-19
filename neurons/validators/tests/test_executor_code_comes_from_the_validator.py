@@ -184,6 +184,16 @@ async def test_a_running_legacy_monitor_is_replaced_not_accepted(node, monkeypat
             running.kill()
 
 
+async def test_the_monitor_check_stops_and_counts_only_processes_in_the_executors_mount_namespace(node):
+    # the executor runs with pid: host: a same-named process of another container or the host is neither killed
+    # nor taken for the validator's monitor (a second mount namespace needs root, so the commands are checked)
+    runner = LocalRunner(node.tmp)
+    assert (await StartGPUMonitorCheck().run(_ctx(node, runner))).passed
+    process_commands = [c for c in runner.commands if any(w in c.split() for w in ("pkill", "pgrep", "ps"))]
+    assert len(process_commands) == 2
+    assert all('--ns "$$" --nslist mnt' in c for c in process_commands), process_commands
+
+
 def test_every_payload_is_found():
     # in the repository the executor sources; in the image the copies the Dockerfile takes from them
     for name in executor_payload.GPU_MONITOR + executor_payload.INSPECTOR + executor_payload.VERIFYX + executor_payload.MATRIX:
