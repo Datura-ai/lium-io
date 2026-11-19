@@ -10791,6 +10791,8 @@ class DockerService:
                     # the create before it, not after the filler is gone (review on lium-io#2364)
                     current_step = "prerun_host_probe"
                     await settle_early_probes()
+                    # the wait above can outlast the first check: a delete that arrived meanwhile keeps the filler
+                    await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
                     filler_removal_at_ssh_connect = asyncio.create_task(
                         self.remove_fillers_at_ssh_connect(
                             ssh_client,

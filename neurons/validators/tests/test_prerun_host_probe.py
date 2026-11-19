@@ -1326,3 +1326,29 @@ async def test_a_probe_that_may_still_hold_the_session_stops_the_create_before_t
 
     assert result.failure_step == "prerun_host_probe"
     svc.remove_fillers_at_ssh_connect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_delete_while_the_early_probes_settle_keeps_the_filler(svc_fixture, monkeypatch):
+    """Review on lium-io#2364: the probe wait before the filler removal can outlast the first delete check. A delete
+    that arrives during it ends the customer create before the irreversible removal starts."""
+    svc = svc_fixture
+    _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers("filler_x"))
+    deleted = False
+
+    async def probe_while_the_delete_arrives(*args, **kwargs):
+        nonlocal deleted
+        await asyncio.sleep(0.05)
+        deleted = True
+        return _probe_with_containers("filler_x")
+
+    svc.probe_prerun_host = AsyncMock(side_effect=probe_while_the_delete_arrives)
+    svc.remove_fillers_at_ssh_connect = AsyncMock(return_value=None)
+    monkeypatch.setattr(ds_module.inflight_creates, "is_cancelled", lambda pod_id: deleted)
+
+    await asyncio.wait_for(
+        _run_create_container(svc, _deploy_payload(active_volume_names=["volume_keep"])), timeout=5
+    )
+
+    assert deleted
+    svc.remove_fillers_at_ssh_connect.assert_not_awaited()
