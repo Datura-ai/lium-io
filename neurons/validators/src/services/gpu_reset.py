@@ -16,7 +16,8 @@ driver refuses `-r` "In use" while any of them holds a GPU. All of it runs in on
 outlives the SSH session (a reset that hangs past its timeout is left
 to that unit, which starts the fabric when the reset ends; the latch cure and the container start wait until the
 unit is proven gone);
-any other pod is refused (the provider resets).
+any other pod is refused (the provider resets). A pod that owns only some host GPUs is refused before its stop while
+a process outside it holds one of them open (DAH-6741): nothing on the host is stopped for it, so the driver would refuse.
 
 Safety invariants, each pinned by a test:
 - the reset set is a subset of BOTH the container's own DeviceRequests GPUs (from the docker
@@ -87,6 +88,23 @@ GPU_HOLDERS_SCRIPT = (
     "for p in $(fuser /dev/nvidia* 2>/dev/null | tr -cs 0-9 ' '); do cat /proc/$p/comm; done "
     "2>/dev/null | sort -u | tr '\\n' ' '"
 )
+
+
+def device_holders_command(bus_ids: list[str]) -> str:
+    """The "<pid> <name>" of every process holding one of these GPUs' device files open (host PID view).
+
+    The driver refuses `nvidia-smi -r` while any process has the GPU open: a graphics (Xorg) or monitoring one
+    too, which the compute-app listing never shows. The minor comes from the driver's own per-bus file."""
+    # nvidia-smi spells the domain with 8 digits, /proc/driver/nvidia/gpus/ with 4
+    buses = " ".join(shlex.quote(bus[-12:]) for bus in bus_ids)
+    return (
+        f"for b in {buses}; do "
+        "m=$(sed -n 's/^Device Minor:[[:space:]]*//p' /proc/driver/nvidia/gpus/$b/information 2>/dev/null); "
+        '[ -n "$m" ] && find /proc/[0-9]*/fd -lname "/dev/nvidia$m" 2>/dev/null; done '
+        "| cut -d/ -f3 | sort -un | while read p; do printf '%s %s\\n' \"$p\" \"$(cat /proc/$p/comm 2>/dev/null)\"; done"
+    )
+
+
 # the host services (system.slice) of the processes still holding a GPU device, but the reset unit itself
 GPU_HOLDER_UNITS_SCRIPT = (
     "for p in $(fuser /dev/nvidia* 2>/dev/null | tr -cs 0-9 ' '); do "
@@ -307,6 +325,11 @@ def _tail(text: str | None) -> str:
     return (text or "").strip()[-_DETAIL_TAIL_CHARS:]
 
 
+def _head(text: str | None) -> str:
+    """The start of a refusal: nvidia-smi names the GPU and the cause first, then a long generic advice."""
+    return " ".join((text or "").split())[:_DETAIL_TAIL_CHARS]
+
+
 async def _run(runner: SSHCommandRunner, cmd: str, timeout: int = _QUERY_TIMEOUT_SECONDS):
     return await runner.run(cmd, timeout=timeout, retryable=False)
 
@@ -340,6 +363,8 @@ class _Plan:
     # the pod owns every host GPU (container and backend alike): the reset runs in the host unit, which also
     # stops host GPU holders the validator does not list
     owns_host: bool = False
+    # host PCI bus id of each host GPU
+    bus_by_uuid: dict[str, str] = field(default_factory=dict)
 
 
 async def _precheck(
@@ -427,6 +452,7 @@ async def _precheck(
         host_services=host_services,
         holder_containers=holder_containers,
         owns_host=owns_host,
+        bus_by_uuid={gpu.uuid: gpu.bus_id for gpu in host_gpus},
     )
 
 
@@ -666,6 +692,36 @@ async def _processes_outside(
     ]
 
 
+async def _holders_outside(runner: SSHCommandRunner, plan: _Plan, settle_seconds: float) -> list[str]:
+    """"<name> (pid <pid>)" of the processes outside the pod (and the validator's session) holding a target GPU
+    open, in both of two reads settle_seconds apart: a passing nvidia-smi holds it for a moment only."""
+    buses = [plan.bus_by_uuid[uuid] for uuid in plan.targets if plan.bus_by_uuid.get(uuid)]
+    if not buses:
+        return []
+    own_cgroup = await _own_cgroup(runner)
+    held: dict[int, str] | None = None
+    for attempt in range(2):
+        if attempt:
+            await asyncio.sleep(settle_seconds)
+        listed = await _run(runner, device_holders_command(buses))
+        seen: dict[int, str] = {}
+        for line in (listed.stdout or "").splitlines():
+            pid, _, name = line.strip().partition(" ")
+            if pid.isdigit():
+                seen[int(pid)] = name.strip() or "unknown"
+        cgroups = await _cgroups(runner, list(seen))
+        outside = {
+            pid: name
+            for pid, name in seen.items()
+            if plan.container_id not in cgroups.get(pid, "")
+            and (own_cgroup is None or cgroups.get(pid, "").strip() != own_cgroup)
+        }
+        held = outside if held is None else {pid: name for pid, name in outside.items() if pid in held}
+        if not held:
+            return []
+    return [f"{name} (pid {pid})" for pid, name in sorted(held.items())]
+
+
 async def reset_pod_gpus(
     runner: SSHCommandRunner,
     *,
@@ -723,6 +779,20 @@ async def reset_pod_gpus(
 
     if plan.widened:
         notes.append("NVLink peers inside the pod were reset together")
+    if not plan.owns_host:
+        # nothing on the host is stopped for a pod that owns only some GPUs, and the driver refuses the reset while
+        # any process outside the pod holds a target GPU open: refuse before the pod is stopped
+        held = await _holders_outside(runner, plan, settle_seconds)
+        if held:
+            report.error_code = GpuResetErrorCode.GpuInUseOutsidePod
+            report.detail = "; ".join(
+                [
+                    *notes,
+                    f"a process outside the pod holds the GPU open on the host: {', '.join(held)}. "
+                    "The GPUs were not reset and the pod was not stopped; only the provider can stop that process",
+                ]
+            )
+            return report
     stop_failed = False
     try:
         stopped = await _run(
@@ -804,7 +874,7 @@ async def reset_pod_gpus(
             # ~45% of the Blackwell fleet refuses `nvidia-smi -r` (gpu_wedge.py); the context cycle at
             # least clears the DAH-2427 latch, on the pod's GPUs only
             report.error_code = GpuResetErrorCode.ResetNotSupported
-            notes.append(f"nvidia-smi -r refused, the GPUs were not reset: {_tail(reset.stdout or reset.stderr)}")
+            notes.append(f"nvidia-smi -r refused, the GPUs were not reset: {_head(reset.stdout or reset.stderr)}")
             for cure in await cure_wedged_gpus(runner, plan.targets):
                 report.gpus.append(
                     GpuResetOutcome(

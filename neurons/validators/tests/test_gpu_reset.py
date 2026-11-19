@@ -68,8 +68,15 @@ class FakeHost:
         docker_start_ok=True,
         container_state="true false",
         gpus_result=None,
+        device_holders=(),
+        transient_holders=(),
+        reset_output="refused",
     ):
         self.commands: list[str] = []
+        # (pid, name) holding a target GPU's device file: every read, or the first read only
+        self.device_holders, self.transient_holders = list(device_holders), list(transient_holders)
+        self.holder_reads = 0
+        self.reset_output = reset_output
         self.gpus_result = gpus_result
         self.stopped = False
         request = {"Driver": "", "Count": count or 0, "DeviceIDs": list(device_ids) or None, "Capabilities": [["gpu"]]}
@@ -128,6 +135,10 @@ class FakeHost:
             return make_command_result(True, self.topo)
         if cmd.endswith("< /proc/self/cgroup"):
             return make_command_result(True, f"{self.own_cgroup} ")
+        if cmd.startswith("for b in "):
+            self.holder_reads += 1
+            holders = self.device_holders + (self.transient_holders if self.holder_reads == 1 else [])
+            return make_command_result(True, "".join(f"{pid} {name}\n" for pid, name in holders))
         if cmd.startswith("for p in "):
             pids = [int(p) for p in cmd.split(";")[0].split()[3:]]
             out = "\n".join(f"{pid} {self.cgroups[pid]} " for pid in pids if pid in self.cgroups)
@@ -196,7 +207,7 @@ class FakeHost:
             self.active_during_reset = dict(self.active)
             if self.reset_raises:
                 raise RuntimeError("ssh dropped")
-            return make_command_result(self.reset_exit == 0, "refused", exit_code=self.reset_exit)
+            return make_command_result(self.reset_exit == 0, self.reset_output, exit_code=self.reset_exit)
         if cmd.startswith("CUDA_VISIBLE_DEVICES="):
             self.active_during_cure = self.active_during_cure or dict(self.active)
             return make_command_result(True, "ctx open/close OK")
@@ -1316,3 +1327,85 @@ async def test_a_stopped_encrypted_pod_without_its_plaintext_path_is_refused_bef
     assert not report.ok and report.error_code == GpuResetErrorCode.ResetNotSupported
     assert not report.container_restarted
     _no_change(host, start)
+
+
+# DAH-6741: the driver refuses `nvidia-smi -r` while any process holds the GPU open, not only a compute app
+XORG = (1500, "Xorg")
+NVIDIA_SMI_REFUSAL = (
+    "GPU 00000000:0A:00.0 is currently in use by another process.\n\n1 device is currently being used by one or more "
+    "other processes (e.g., Fabric Manager, CUDA application, graphics application such as an X server, or a "
+    "monitoring application such as another instance of nvidia-smi). Please first kill all processes using these "
+    "devices and all compute applications running in the system."
+)
+
+
+@pytest.mark.asyncio
+async def test_a_part_node_reset_held_open_by_a_host_process_is_refused_before_the_pod_stops():
+    # Arrange
+    host = FakeHost(device_holders=[XORG], cgroups={1500: "0::/system.slice/display-manager.service"})
+
+    # Act
+    report, start = await _reset(host)
+
+    # Assert
+    assert not report.ok and report.error_code == GpuResetErrorCode.GpuInUseOutsidePod
+    assert "Xorg (pid 1500)" in report.detail and "the pod was not stopped" in report.detail
+    _no_change(host, start)
+
+
+@pytest.mark.asyncio
+async def test_a_holder_seen_in_one_read_only_does_not_refuse_the_reset():
+    # Arrange: a passing nvidia-smi of the host
+    host = FakeHost(transient_holders=[(1600, "nvidia-smi")], cgroups={1600: "0::/system.slice/cron.service"})
+
+    # Act
+    report, _ = await _reset(host)
+
+    # Assert
+    assert report.ok and host.holder_reads == 2
+
+
+@pytest.mark.asyncio
+async def test_the_pods_own_processes_holding_its_gpus_do_not_refuse_the_reset():
+    # Arrange
+    host = FakeHost(device_holders=[(4243, "python")], cgroups={4243: f"0::/../docker-{CID}.scope"})
+
+    # Act
+    report, _ = await _reset(host)
+
+    # Assert
+    assert report.ok
+
+
+@pytest.mark.asyncio
+async def test_a_pod_that_owns_every_host_gpu_leaves_the_holders_to_the_host_unit():
+    # Arrange: the unit stops the host holders itself
+    host = FakeHost(device_ids=U, device_holders=[XORG], cgroups={1500: "0::/system.slice/display-manager.service"})
+
+    # Act
+    report, _ = await _reset(host, backend=U)
+
+    # Assert
+    assert report.ok and host.holder_reads == 0
+
+
+@pytest.mark.asyncio
+async def test_a_refused_reset_reports_the_start_of_the_nvidia_smi_text():
+    # Arrange
+    host = FakeHost(reset_exit=255, reset_output=NVIDIA_SMI_REFUSAL)
+
+    # Act
+    report, _ = await _reset(host)
+
+    # Assert
+    assert not report.ok
+    assert "the GPUs were not reset: GPU 00000000:0A:00.0 is currently in use by another process." in report.detail
+
+
+def test_the_device_holder_command_reads_the_drivers_bus_dirs_and_is_valid_sh():
+    # Act
+    command = gpu_reset.device_holders_command(["00000000:1b:00.0", "00000000:0a:00.0"])
+
+    # Assert
+    assert "for b in 0000:1b:00.0 0000:0a:00.0;" in command
+    assert subprocess.run(["sh", "-n", "-c", command]).returncode == 0
