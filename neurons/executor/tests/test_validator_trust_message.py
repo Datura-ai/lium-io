@@ -626,6 +626,30 @@ def test_a_shutdown_right_after_a_new_revision_writes_it_first(tmp_path, owner, 
     assert _state(tmp_path)["messages"][owner.ss58_address]["message"] == trust_line(new_validator.ss58_address, 2)
 
 
+def test_a_failed_write_at_shutdown_is_written_again(tmp_path, monkeypatch, owner, old_validator, new_validator):
+    trust = _trust(tmp_path, owner)
+    assert trust.offer(_signed(owner, old_validator, 1))
+    monkeypatch.setattr(trust_service, "FLUSH_RETRY_PAUSE_SECONDS", 0.01)
+    real_write, failures = trust_service._write_json, [OSError("transient")]
+
+    def write_once_failing(path, data):
+        if failures:
+            raise failures.pop()
+        real_write(path, data)
+
+    async def run():
+        writer = trust.start_persisting()
+        await asyncio.sleep(0.05)
+        monkeypatch.setattr(trust_service, "_write_json", write_once_failing)
+        assert trust.offer(_signed(owner, new_validator, 2))
+        await trust.stop_persisting(writer)
+        return writer.done()
+
+    assert asyncio.run(run())
+    assert failures == []
+    assert _state(tmp_path)["messages"][owner.ss58_address]["message"] == trust_line(new_validator.ss58_address, 2)
+
+
 def test_a_hung_volume_at_shutdown_ends_the_wait(tmp_path, monkeypatch, owner, new_validator):
     import threading
 

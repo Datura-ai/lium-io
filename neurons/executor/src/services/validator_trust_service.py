@@ -58,6 +58,7 @@ FETCH_TIMEOUT_SECONDS = 5.0
 FETCH_LIMIT_BYTES = 64 * 1024
 # the shutdown waits this long for the last state write; well inside the pod's termination grace
 FLUSH_SECONDS = 5.0
+FLUSH_RETRY_PAUSE_SECONDS = 0.2
 
 
 async def fetch_json(url: str, body: dict | None = None) -> dict | None:
@@ -244,7 +245,12 @@ class ValidatorTrust:
                         self._unsaved = True
                         logger.warning("Validator trust: state not kept on disk yet: %s", exc)
                 if stopping:
-                    return
+                    if not self._unsaved:
+                        return
+                    # the last write failed: no refresh comes after a shutdown, so write again until it lands or
+                    # stop_persisting's FLUSH_SECONDS deadline ends the writer
+                    await asyncio.sleep(FLUSH_RETRY_PAUSE_SECONDS)
+                    self._wake.set()
         finally:
             self._wake = None
 
