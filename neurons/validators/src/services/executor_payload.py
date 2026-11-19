@@ -10,6 +10,8 @@ image installs, at the path the image fixes; the validator names it, the executo
 from __future__ import annotations
 
 import base64
+import hashlib
+import secrets
 import shlex
 from pathlib import Path
 
@@ -26,15 +28,33 @@ INSPECTOR = ("inspector_executor.py",)
 VERIFYX = ("verifyx_executor.py",)
 MATRIX = ("decrypt_challenge.py",)
 
+# the executor runs with pid: host, so a bare pkill/pgrep also sees other containers' and the host's processes;
+# this selector keeps them to the shell's mount namespace, the executor's own
+SAME_MOUNT_NS = '--ns "$$" --nslist mnt'
+
 
 def service_dir_glob(purpose: str, parent: str | None = None) -> str:
     return f"{(parent or SERVICE_DIR_PARENT).rstrip('/')}/.lium-validator-{purpose}."
 
 
-def install(purpose: str, files: tuple[str, ...], parent: str | None = None, cleanup: bool = False) -> str:
+def new_run_tag() -> str:
+    """A tag naming one validation's runs: their directories carry it, so a kill reaches only that validation's."""
+    return secrets.token_hex(8)
+
+
+def digests(files: tuple[str, ...]) -> str:
+    """`sha256sum -c` input for the payload `files` as the validator ships them."""
+    return "".join(f"{hashlib.sha256((PAYLOAD_DIR / name).read_bytes()).hexdigest()}  {name}\n" for name in files)
+
+
+def install(
+    purpose: str, files: tuple[str, ...], parent: str | None = None, cleanup: bool = False, tag: str = ""
+) -> str:
     """Shell that makes a fresh 0700 directory under `parent`, sets `$d` to it and writes `files` into it; exits 1 on
-    any failure. `cleanup`: the directory goes when the shell ends (also on HUP/INT/TERM), set before the first write."""
-    steps = [f"d=$(mktemp -d {shlex.quote(service_dir_glob(purpose, parent) + 'XXXXXXXX')})"]
+    any failure. `cleanup`: the directory goes when the shell ends (also on HUP/INT/TERM), set before the first write.
+    `tag` (from new_run_tag) goes into the directory name, for process_pattern."""
+    template = service_dir_glob(purpose, parent) + (f"{tag}." if tag else "") + "XXXXXXXX"
+    steps = [f"d=$(mktemp -d {shlex.quote(template)})"]
     if cleanup:
         steps += ["trap 'rm -rf \"$d\"' EXIT", "trap 'exit 1' HUP INT TERM"]
     for name in files:
@@ -50,10 +70,10 @@ def run(files: tuple[str, ...]) -> str:
     return f'{shlex.quote(EXECUTOR_PYTHON)} -E -s "$d"/{shlex.quote(files[0])}'
 
 
-def run_once(purpose: str, files: tuple[str, ...], args: str, env: str = "") -> str:
+def run_once(purpose: str, files: tuple[str, ...], args: str, env: str = "", tag: str = "") -> str:
     """Install, run with `args` (`env` assignments before the interpreter); the directory goes when the shell ends,
     also on a hangup or kill signal of the session. The exit status is the run's."""
-    return f"{install(purpose, files, cleanup=True)}; {env}{run(files)} {args}"
+    return f"{install(purpose, files, cleanup=True, tag=tag)}; {env}{run(files)} {args}"
 
 
 def label(files: tuple[str, ...], args: str) -> str:
@@ -61,7 +81,8 @@ def label(files: tuple[str, ...], args: str) -> str:
     return f"{EXECUTOR_PYTHON} <validator>/{files[0]} {args}"
 
 
-def process_pattern(purpose: str, files: tuple[str, ...]) -> str:
-    """An extended regex matching the command line of a running entry script of `purpose` (for pkill -f), and not the
-    shell that installed it (its mktemp template and `"$d"/` never form the path), so that shell's cleanup still runs."""
-    return (service_dir_glob(purpose) + "@/" + files[0]).replace(".", r"\.").replace("@", "[[:alnum:]]{8}")
+def process_pattern(purpose: str, files: tuple[str, ...], tag: str) -> str:
+    """An extended regex matching the command line of a running entry script of `purpose` started with `tag` (for
+    pkill -f), and not the shell that installed it (its mktemp template and `"$d"/` never form the path), so that
+    shell's cleanup still runs. Other validations' runs carry other tags and are not matched."""
+    return (service_dir_glob(purpose) + f"{tag}.@/" + files[0]).replace(".", r"\.").replace("@", "[[:alnum:]]{8}")

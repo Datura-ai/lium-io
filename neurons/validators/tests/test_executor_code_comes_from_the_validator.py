@@ -194,6 +194,30 @@ async def test_the_monitor_check_stops_and_counts_only_processes_in_the_executor
     assert all('--ns "$$" --nslist mnt' in c for c in process_commands), process_commands
 
 
+@pytest.mark.parametrize("change", ["an earlier build", "a record naming another process"])
+async def test_a_monitor_is_reused_only_when_it_is_the_current_one_the_validator_started(node, change):
+    runner = LocalRunner(node.tmp)
+    assert (await StartGPUMonitorCheck().run(_ctx(node, runner))).event.reason_code == "MONITOR_STARTED"
+    assert await _until(node.tmp / "VALIDATOR_MONITOR")
+    (monitor_dir,) = (node.tmp / "service").iterdir()
+    first = int((monitor_dir / ".run").read_text().split()[0])
+    if change == "an earlier build":
+        (executor_payload.PAYLOAD_DIR / "gpus_utility.py").write_text(_marker_script(node.tmp / "NEW_BUILD", sleep=True))
+    else:
+        pid, _ = (monitor_dir / ".run").read_text().split()
+        (monitor_dir / ".run").write_text(f"{pid} 1\n")
+    replaced = await StartGPUMonitorCheck().run(_ctx(node, runner))
+    assert replaced.passed and replaced.event.reason_code == "MONITOR_STARTED"
+    for _ in range(100):
+        if not Path(f"/proc/{first}").exists() or "Z" in Path(f"/proc/{first}/stat").read_text().split(") ")[1][:1]:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("the earlier monitor still runs")
+    (current,) = (node.tmp / "service").iterdir()
+    assert current != monitor_dir
+
+
 def test_every_payload_is_found():
     # in the repository the executor sources; in the image the copies the Dockerfile takes from them
     for name in executor_payload.GPU_MONITOR + executor_payload.INSPECTOR + executor_payload.VERIFYX + executor_payload.MATRIX:
@@ -215,12 +239,32 @@ async def test_one_shot_payload_is_removed_when_its_write_fails(node):
     assert not list((node.tmp / "service").iterdir())
 
 
-def test_the_kill_pattern_matches_the_run_and_not_the_shell_that_cleans_up():
-    pattern = executor_payload.process_pattern("matrix", executor_payload.MATRIX)
-    shell = executor_payload.run_once("matrix", executor_payload.MATRIX, "--x 1")
-    worker = f"{executor_payload.EXECUTOR_PYTHON} -E -s /root/app/.lium-validator-matrix.Ab3dE9xZ/decrypt_challenge.py --x 1"
-    found = subprocess.run(["grep", "-Ec", pattern], input=f"{worker}\n{shell}\n", capture_output=True, text=True)
+def test_the_kill_pattern_matches_its_own_run_only():
+    # not the shell that cleans up, and not another validation's run on the same host
+    tag, other = executor_payload.new_run_tag(), executor_payload.new_run_tag()
+    pattern = executor_payload.process_pattern("matrix", executor_payload.MATRIX, tag)
+    shell = executor_payload.run_once("matrix", executor_payload.MATRIX, "--x 1", tag=tag)
+    worker = f"{executor_payload.EXECUTOR_PYTHON} -E -s /root/app/.lium-validator-matrix.%s.Ab3dE9xZ/decrypt_challenge.py"
+    lines = f"{worker % tag} --x 1\n{shell}\n{worker % other} --x 1\n"
+    found = subprocess.run(["grep", "-Ec", pattern], input=lines, capture_output=True, text=True)
     assert found.stdout.strip() == "1"
+
+
+async def test_a_run_is_written_under_its_tag_and_the_kill_takes_only_that_tag(node):
+    from services.matrix_validation_service import ValidationService
+
+    tag = executor_payload.new_run_tag()
+    command = executor_payload.run_once("matrix", executor_payload.MATRIX, "--x 1", tag=tag)
+    assert f".lium-validator-matrix.{tag}.XXXXXXXX" in command
+    ssh = SimpleNamespace(commands=[])
+
+    async def run(cmd, timeout=None):
+        ssh.commands.append(cmd)
+
+    ssh.run = run
+    await ValidationService._kill_remote_matmul(None, ssh, tag, {})
+    assert ssh.commands[0].startswith(f'pkill -9 -f {executor_payload.SAME_MOUNT_NS} -- ')
+    assert tag in ssh.commands[0]
 
 
 def test_no_validator_code_reads_the_executor_reported_paths():

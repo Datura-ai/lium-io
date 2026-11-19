@@ -12,9 +12,9 @@ from ..pipeline import CheckResult, Context
 
 # the monitor an executor image of before DAH-6681 ran from its own source tree: never trusted, stopped on sight
 LEGACY_MONITOR = "/root/app/src/gpus_utility.py"
-# the executor runs with pid: host, so a bare pkill/pgrep also sees other containers' and the host's processes;
-# only those in this shell's mount namespace (the executor's own) are stopped or counted
-SAME_MOUNT_NS = '--ns "$$" --nslist mnt'
+SAME_MOUNT_NS = payload.SAME_MOUNT_NS
+# the start time (clock ticks after boot) of process $pid: with the PID it names one process, never a later reuse of it
+_START_TIME = "$(sed 's/.*) //' /proc/$pid/stat 2>/dev/null | cut -d' ' -f20)"
 
 
 class StartGPUMonitorCheck:
@@ -55,10 +55,19 @@ class StartGPUMonitorCheck:
         # pattern from matching the shell that runs this command)
         legacy = "[p]ython.*" + LEGACY_MONITOR.replace(".", "\\.")
         await runner.run(f"pkill {SAME_MOUNT_NS} -f -- {shlex.quote(legacy)}; true", timeout=10, retryable=False)
-        # a monitor already started by the validator. Detection only: nothing is executed.
-        pattern = f"[p]ython.*{payload.service_dir_glob('monitor')}[^/]*/{payload.GPU_MONITOR[0]}"
-        check_res = await runner.run(f"pgrep {SAME_MOUNT_NS} -af -- {shlex.quote(pattern)}", timeout=10, retryable=False)
-        processes = check_res.stdout.splitlines()
+        # a monitor is reused only when it is the process this validator started (the PID and start time it recorded
+        # in the monitor's root-only directory), in the executor's mount namespace, and that directory holds the
+        # current payload: a monitor of an earlier build or any other process is replaced. Nothing is executed here.
+        dirs = shlex.quote(payload.service_dir_glob("monitor")) + "*"
+        sums = shlex.quote(payload.digests(payload.GPU_MONITOR))
+        check_cmd = (
+            f'for d in {dirs}; do read pid start < "$d/.run" 2>/dev/null || continue; '
+            f'case "$pid" in ""|*[!0-9]*) continue;; esac; [ "{_START_TIME}" = "$start" ] || continue; '
+            '[ "$(readlink /proc/$pid/ns/mnt)" = "$(readlink /proc/$$/ns/mnt)" ] || continue; '
+            f'printf %s {sums} | (cd "$d" && sha256sum -c --status -) && echo "$pid"; done'
+        )
+        check_res = await runner.run(check_cmd, timeout=10, retryable=False)
+        processes = check_res.stdout.split()
 
         if processes:
             event = render_message(
@@ -81,11 +90,15 @@ class StartGPUMonitorCheck:
         }
 
         args_string = " ".join([f"--{k} {shlex.quote(str(v))}" for k, v in command_args.items()])
-        # no monitor runs (checked above): the directories of earlier ones go before a fresh one is written
+        # no current monitor runs (checked above): any other one of ours is stopped and the directories of earlier ones
+        # go before a fresh one is written; the new one's PID and start time are recorded for the check above
+        ours = "[p]ython.*" + (payload.service_dir_glob("monitor") + "[^/]*/" + payload.GPU_MONITOR[0]).replace(".", "\\.")
         start_cmd = (
-            f"rm -rf {shlex.quote(payload.service_dir_glob('monitor'))}*; "
+            f"pkill {SAME_MOUNT_NS} -f -- {shlex.quote(ours)}; "
+            f"rm -rf {dirs}; "
             f"{payload.install('monitor', payload.GPU_MONITOR)}; "
-            f"nohup {payload.run(payload.GPU_MONITOR)} {args_string} > /dev/null 2>&1 &"
+            f"nohup {payload.run(payload.GPU_MONITOR)} {args_string} > /dev/null 2>&1 & "
+            f'pid=$!; printf "%s %s\\n" "$pid" "{_START_TIME}" > "$d/.run"'
         )
         start_res = await runner.run(start_cmd, timeout=50, retryable=False)
 
