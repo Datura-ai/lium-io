@@ -137,13 +137,14 @@ class ValidatorTrust:
         except Exception as exc:
             logger.warning("Validator trust: kept state ignored: %s: %s", type(exc).__name__, exc)
             self.held = self.held_signed = self.held_signer = None
+        # the kept state is on the volume already; an image message taken over it is not, so the next refresh writes it
+        self._unsaved = False
         try:
             self._hold(_signed(json.loads(self.image_message.read_text())), RELEASE_SUBNET_OWNER_HOTKEY)
         except FileNotFoundError:
             pass
         except Exception as exc:
             logger.warning("Validator trust: image message refused: %s: %s", type(exc).__name__, exc)
-        self._unsaved = False
         logger.info("Validator trust at start: %s", self.report())
 
     def _hold(self, signed: SignedTrustMessage, signer: str) -> bool:

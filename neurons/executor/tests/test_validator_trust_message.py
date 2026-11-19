@@ -149,6 +149,17 @@ def test_start_takes_the_higher_revision_of_image_and_volume(tmp_path, monkeypat
     assert _trust(tmp_path, image).held.validator == new_validator.ss58_address
 
 
+def test_an_image_message_taken_at_start_is_kept_for_a_later_start_without_it(
+    tmp_path, owner, old_validator, new_validator
+):
+    kept = _trust(tmp_path)
+    assert kept.offer(_signed(owner, old_validator, 3))
+    asyncio.run(kept.save())
+    started = _trust(tmp_path, _image(tmp_path, _signed(owner, new_validator, 4)))
+    asyncio.run(started.save())  # the next refresh
+    assert _trust(tmp_path).held.validator == new_validator.ss58_address
+
+
 def test_the_image_copy_needs_the_release_owner(tmp_path, new_owner, new_validator):
     assert _trust(tmp_path, _image(tmp_path, _signed(new_owner, new_validator, 1))).held is None
 
