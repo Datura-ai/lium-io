@@ -87,7 +87,8 @@ def _helper_calls(ssh) -> list[str]:
 
 
 def test_script_rebuilds_the_rules_in_a_fresh_chain_and_swaps_it_in():
-    script = link_local_drop_script("br-0123456789ab", ["docker0"])
+    full = link_local_drop_script("br-0123456789ab", ["docker0"])
+    script = full[: full.index("if [ -d ")]  # the rules; the boot copy after them is the same text again
     for match in ("-i br-0123456789ab", "-i docker0"):
         for proto in ("tcp", "udp"):
             assert f"$IPT -A $NEW {match} -d {LINK_LOCAL_CIDR} -p {proto} ! --dport 53 -j DROP" in script
@@ -538,14 +539,14 @@ esac
 case "$op" in
   -L) [ -f "$STATE/$chain" ] || { echo "iptables: No chain/target/match by that name." >&2; exit 1; } ;;
   -S) echo "-N DOCKER-USER"; grep -v RETURN "$STATE/DOCKER-USER" | sed 's/^/-A DOCKER-USER -j /' ;;
-  -C) grep -qx "$4" "$STATE/DOCKER-USER" ;;
-  -D) grep -qx "$4" "$STATE/DOCKER-USER" || exit 1
-      awk -v c="$4" '$0 == c && !d { d = 1; next } 1' "$STATE/DOCKER-USER" > "$STATE/t"; mv "$STATE/t" "$STATE/DOCKER-USER" ;;
+  -C) grep -qx "$4" "$STATE/$chain" ;;
+  -D) grep -qx "$4" "$STATE/$chain" || exit 1
+      awk -v c="$4" '$0 == c && !d { d = 1; next } 1' "$STATE/$chain" > "$STATE/t"; mv "$STATE/t" "$STATE/$chain" ;;
   -N) [ -f "$STATE/$chain" ] && exit 1; : > "$STATE/$chain" ;;
   -F) grep -qx "$chain" "$STATE/DOCKER-USER" && [ -s "$STATE/$chain" ] && touch "$STATE/FLUSHED_ACTIVE"
       [ -f "$STATE/$chain" ] && : > "$STATE/$chain" ;;
   -A) shift 2; echo "$*" >> "$STATE/$chain" ;;
-  -I) { echo "$4"; cat "$STATE/DOCKER-USER"; } > "$STATE/t"; mv "$STATE/t" "$STATE/DOCKER-USER" ;;
+  -I) { echo "$4"; cat "$STATE/$chain"; } > "$STATE/t"; mv "$STATE/t" "$STATE/$chain" ;;
   -X) [ -s "$STATE/$chain" ] && exit 1; rm "$STATE/$chain" ;;
   *) exit 2 ;;
 esac
@@ -1152,3 +1153,77 @@ def test_a_root_executor_with_its_own_pid1_reads_and_writes_the_generation_throu
         done = run(link_local_drop_script("br-0123456789ab", []), generation)
         assert done.returncode == 0, done.stderr
     assert (state / "docker_run").read_text().split() == ["run"] * 4
+
+
+def _modelled_host(tmp_path, *, docker_user: bool, systemd: bool = True):
+    """A modelled host: the iptables stub, a host root for the boot copy and a systemctl that records daemon-reloads."""
+    bin_dir, state, root = tmp_path / "bin", tmp_path / "state", tmp_path / "root"
+    for d in (bin_dir, state, root):
+        d.mkdir()
+    for name in ("iptables-nft", "iptables-legacy"):  # absent on the modelled host: plain iptables only
+        (bin_dir / name).write_text("#!/bin/sh\nexit 127\n")
+        (bin_dir / name).chmod(0o755)
+    (bin_dir / "iptables").write_text(_IPTABLES_STUB)
+    (bin_dir / "iptables").chmod(0o755)
+    (bin_dir / "systemctl").write_text(
+        '#!/bin/sh\ncase "$1" in show) echo loaded ;; daemon-reload) echo x >> "$STATE/reloads" ;; esac\n'
+    )
+    (bin_dir / "systemctl").chmod(0o755)
+    (state / "FORWARD").write_text("")
+    if docker_user:
+        (state / "DOCKER-USER").write_text("RETURN\n")
+    if systemd:
+        (root / "run" / "systemd" / "system").mkdir(parents=True)
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "STATE": str(state)}
+    return state, root, env
+
+
+def test_a_host_without_docker_user_gets_the_chain_and_a_forward_jump_not_a_skip(tmp_path):
+    state, root, env = _modelled_host(tmp_path, docker_user=False)
+
+    done = subprocess.run(
+        ["sh", "-c", link_local_drop_script("br-0123456789ab", [], str(root))], env=env, capture_output=True, text=True
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert (state / "FORWARD").read_text().split() == ["DOCKER-USER"]
+    [(_, rules)] = _jumps_and_rules(state)
+    assert rules == [f"-i br-0123456789ab -d {LINK_LOCAL_CIDR} -p {p} ! --dport 53 -j DROP" for p in ("tcp", "udp")]
+
+
+def test_the_rules_are_back_before_dockerd_starts_a_container_after_a_reboot(tmp_path):
+    state, root, env = _modelled_host(tmp_path, docker_user=True)
+    script = link_local_drop_script("br-0123456789ab", ["docker0"], str(root))
+
+    for _ in range(2):
+        done = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True)
+        assert done.returncode == 0, done.stderr
+    dropin = (root / rental_egress_guard.BOOT_DROPIN.lstrip("/")).read_text()
+    assert f"ExecStartPre=/bin/sh {rental_egress_guard.BOOT_SCRIPT}" in dropin.splitlines()
+    assert (state / "reloads").read_text().split() == ["x"]  # reloaded once, not on every apply
+
+    # the reboot: no chain survives, dockerd has not run yet; the drop-in's script alone restores the rules
+    for chain in [p for p in state.iterdir() if p.name not in ("FORWARD", "reloads")]:
+        chain.unlink()
+    (state / "FORWARD").write_text("")
+    boot = root / rental_egress_guard.BOOT_SCRIPT.lstrip("/")
+    restored = subprocess.run(["sh", str(boot)], env=env, capture_output=True, text=True)
+
+    assert restored.returncode == 0, restored.stderr
+    assert (state / "FORWARD").read_text().split() == ["DOCKER-USER"]
+    [(_, rules)] = _jumps_and_rules(state)
+    assert rules == [
+        f"-i {i} -d {LINK_LOCAL_CIDR} -p {p} ! --dport 53 -j DROP" for i in ("br-0123456789ab", "docker0") for p in ("tcp", "udp")
+    ]
+
+
+def test_a_host_without_a_systemd_docker_service_is_reported_not_failed(tmp_path):
+    state, root, env = _modelled_host(tmp_path, docker_user=True, systemd=False)
+
+    done = subprocess.run(
+        ["sh", "-c", link_local_drop_script("br-0123456789ab", [], str(root))], env=env, capture_output=True, text=True
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert "boot restore not installed" in done.stdout
+    assert not (root / "etc").exists()

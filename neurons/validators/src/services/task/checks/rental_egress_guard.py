@@ -15,14 +15,18 @@ a link-local resolver.
   branch, so only the halt waits for it; on an idle node it runs after ScoreCheck. A first
   helper run is bounded by ``HELPER_TIMEOUT_SECONDS``, so it is skipped (and retried next
   cycle) when less than that is left before the executor task is cancelled.
-- Periodic, not on the create path: host iptables are gone after a reboot while rental
-  containers come back (``restart=unless-stopped``), and a rental create gains no extra step.
+- Periodic, and right before a pod starts on the create and start paths (DAH-6737). Host iptables are gone after a
+  reboot while dockerd brings rental containers back (``restart=unless-stopped``) before any validator runs, so every
+  apply also writes the rule set it just put in force to the host and a ``docker.service`` drop-in that runs it as
+  ``ExecStartPre``: the rules are back before dockerd starts a container. A host whose dockerd is not the systemd
+  ``docker.service`` gets no drop-in and the apply says so on stdout.
 - Reconciled, not accumulated: the rules live in our own chain, rebuilt each run from what the
   host shows now and swapped in, so a recreated rental network or an ended legacy pod leaves no
   rule behind. The rental bridge is matched by interface, not subnet: a subnet Docker later
   gives an unrelated network is never caught.
-- Fail-open: a host without a DOCKER-USER chain or without iptables logs a warning and
-  validation proceeds; a hardening rule must not take a provider's node out of rotation.
+- No DOCKER-USER chain (a dockerd that does not manage iptables, or the boot run before dockerd made it): the
+  chain is created with the host's ``iptables`` and jumped to from FORWARD, never skipped. Only a host without any
+  iptables fails the run; the periodic run then logs a warning, and the pre-start run refuses the start.
 - DOCKER-USER sees forwarded traffic only: Docker's embedded DNS, published ports,
   container-to-container traffic on the subnet and the validator's inbound SSH are unaffected.
 """
@@ -86,6 +90,10 @@ LOCK_WAIT_SECONDS = 30
 HELPER_RUN_SECONDS = HELPER_TIMEOUT_SECONDS - 10
 # Prefix of every iptables call: the host's binary in the host's mount and network namespaces.
 HOST_NS = "nsenter -t 1 -m -n -r --"
+# The host's root as the executor sees it (``pid: host``), for the boot copy of the rules and the docker.service drop-in
+HOST_ROOT = "/proc/1/root"
+BOOT_SCRIPT = "/etc/lium/rental-egress-boot.sh"
+BOOT_DROPIN = "/etc/systemd/system/docker.service.d/lium-rental-egress.conf"
 _ABSENT_NETWORK = re.compile(r"no such network|network \S+ not found", re.IGNORECASE)
 _ABSENT_CONTAINER = re.compile(r"no such (object|container)", re.IGNORECASE)
 
@@ -186,7 +194,21 @@ _DETACH_OLD_JUMPS = (
 )
 
 
-def link_local_drop_script(bridge: str | None, legacy_bridges: list[str]) -> str:
+# No DOCKER-USER in any backend while an iptables answers: create it with the host's own ``iptables`` (the one dockerd
+# uses) and jump to it from FORWARD, so the rules always have a chain that forwarded traffic passes. A failed probe stays
+# an error (4); only a host without any iptables is 3.
+_ENSURE_DOCKER_USER = (
+    '[ -n "$IPT" ] || { [ -n "$ERRS" ] && { printf %s "$ERRS" >&2; exit 4; }; '
+    'for B in iptables iptables-nft iptables-legacy; do $HOST_NS $B -L FORWARD -n >/dev/null 2>&1 && '
+    '{ IPT="$HOST_NS $B"; break; }; done; '
+    '[ -n "$IPT" ] || { echo "no iptables" >&2; exit 3; }; '
+    "$IPT -N DOCKER-USER 2>/dev/null; "
+    '$IPT -L DOCKER-USER -n >/dev/null || { echo "DOCKER-USER not created" >&2; exit 4; }; '
+    "$IPT -C FORWARD -j DOCKER-USER 2>/dev/null || $IPT -I FORWARD -j DOCKER-USER || exit 4; }"
+)
+
+
+def link_local_drop_script(bridge: str | None, legacy_bridges: list[str], host_root: str = HOST_ROOT) -> str:
     """Host DOCKER-USER rules: drop rental egress to link-local, except DNS, reconciled to exactly this set.
 
     Matched by the bridge the traffic comes in on, never by source address: a renter with NET_ADMIN can add
@@ -201,8 +223,7 @@ def link_local_drop_script(bridge: str | None, legacy_bridges: list[str]) -> str
     a, b = CHAINS
     lines = [
         _BACKEND_PROBE,
-        '[ -n "$IPT" ] || { [ -n "$ERRS" ] && { printf %s "$ERRS" >&2; exit 4; }; '
-        'echo "no DOCKER-USER chain" >&2; exit 3; }',
+        _ENSURE_DOCKER_USER,
         f"$IPT -N {a} 2>/dev/null; $IPT -N {b} 2>/dev/null",
         'RULES=$($IPT -S DOCKER-USER) || { echo "DOCKER-USER not readable" >&2; exit 4; }',
         f"ACTIVE=$(printf '%s\\n' \"$RULES\" | awk '$1 == \"-A\" && $3 == \"-j\" && ($4 == \"{a}\" || $4 == \"{b}\") "
@@ -222,9 +243,30 @@ def link_local_drop_script(bridge: str | None, legacy_bridges: list[str]) -> str
         "while $IPT -D DOCKER-USER -j $OLD 2>/dev/null; do :; done",
         "$IPT -F $OLD || exit 4",
         _DETACH_OLD_JUMPS,
-        "exit 0",
     ]
-    return "; ".join(lines)
+    # the same rules, run by systemd on the host before dockerd starts any container after a reboot
+    boot = "; ".join(["HOST_NS=", *lines, "exit 0"])
+    return "; ".join([*lines, _boot_restore(boot, host_root), "exit 0"])
+
+
+def _boot_restore(boot: str, host_root: str) -> str:
+    """Install ``boot`` as ``ExecStartPre`` of the host's ``docker.service``; daemon-reload only when the drop-in is new."""
+    script, dropin = shlex.quote(host_root + BOOT_SCRIPT), shlex.quote(host_root + BOOT_DROPIN)
+    dirs = " ".join(shlex.quote(host_root + path.rsplit("/", 1)[0]) for path in (BOOT_SCRIPT, BOOT_DROPIN))
+    # printf makes the newlines, so the command stays on one line
+    unit = shlex.quote(f"[Service]\\nExecStartPre=/bin/sh {BOOT_SCRIPT}\\n")
+    return (
+        f"if [ -d {shlex.quote(host_root + '/run/systemd/system')} ] && "
+        '[ "$($HOST_NS systemctl show -p LoadState --value docker.service 2>/dev/null)" = loaded ]; then '
+        f"mkdir -p {dirs} || exit 4; "
+        f"printf '%s\\n' {shlex.quote(boot)} > {script}.tmp && mv -f {script}.tmp {script} || "
+        "{ echo 'boot rules not written' >&2; exit 4; }; "
+        f"printf {unit} > {dropin}.tmp || exit 4; "
+        f"if cmp {dropin}.tmp {dropin} >/dev/null 2>&1; then rm -f {dropin}.tmp; "
+        f"else mv -f {dropin}.tmp {dropin} && $HOST_NS systemctl daemon-reload || "
+        "{ echo 'docker.service drop-in not loaded' >&2; exit 4; }; fi; "
+        "else echo 'boot restore not installed: no systemd docker.service'; fi"
+    )
 
 
 def link_local_cleanup_script() -> str:
@@ -294,7 +336,8 @@ def _helper(script: str, generation: str | None = None) -> str:
     host_pid1 = f'{{ [ "$(readlink /proc/1/ns/mnt)" != "$(readlink /proc/self/ns/mnt)" ] || [ ! -e {CONTAINER_MARK} ]; }}'
     # and the host's DOCKER-USER must answer from here: the route is chosen once, before any read or change, so the
     # rule generation is always read and bumped where the rules are written (DAH-6737)
-    reach = f"{{ HOST_NS={shlex.quote(HOST_NS)}; {_BACKEND_PROBE}; [ -n \"$IPT\" ]; }}"
+    # (or a host iptables without the chain yet, which the script creates)
+    reach = f"{{ HOST_NS={shlex.quote(HOST_NS)}; {_BACKEND_PROBE}; [ -n \"$IPT\" ] || [ -z \"$ERRS\" -a -n \"$FOUND\" ]; }}"
     direct = f'[ "$(id -u)" = 0 ] && {host_pid1} && mkdir -p {lock_dir} 2>/dev/null && {tools} && {reach}'
     return f"if ! {{ {direct}; }}; then {in_helper}; fi; {inner}"
 
@@ -431,6 +474,10 @@ async def apply_rental_egress_guard(ssh) -> tuple[dict | None, str | None]:
             break
     else:
         raise InventoryUnknown("the host's rules kept changing during the inventory")
+    if boot := [line for line in (result.stdout or "").splitlines() if line.startswith("boot restore")]:
+        logger.warning(_m("Rental egress guard: rules not restored before dockerd after a reboot", extra={"why": boot}))
+        if guarded is not None:
+            guarded["boot_restore"] = boot
     if left := [line for line in (result.stdout or "").splitlines() if line.startswith("old jump")]:
         logger.warning(_m("Rental egress guard: an old release's jump was not detached", extra={"jumps": left}))
         if guarded is not None:
