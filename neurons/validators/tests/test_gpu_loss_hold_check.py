@@ -684,13 +684,52 @@ async def test_a_pod_on_the_old_cards_keeps_the_node_back_and_drops_the_dropout_
 
 
 @pytest.mark.asyncio
-async def test_a_pod_that_cannot_be_read_after_a_set_change_is_not_taken_as_served(context_factory):
-    ctx = _ctx(context_factory, FakeRedis(), listed=OTHER_CARDS, pods=(4,))
+async def test_a_pod_that_cannot_be_read_after_a_set_change_gives_no_verdict_not_gpu_lost(context_factory):
+    """DAH-6546: right after the backend moved a pod to the new cards its container could not be read, and the
+    check reported GPU_LOST with no missing GPU. Unread is no verdict: the run stops (nothing re-anchors past a pod
+    that may still be on the old cards), is checked again soon, and never reads as a lost GPU."""
+    redis = FakeRedis()
+    ctx = _ctx(context_factory, redis, listed=OTHER_CARDS, pods=(4,))
     ctx.ssh.gpus = None  # the SSH read fails
+
+    with patch.object(gpu_loss_hold.settings, "DRY_RUN", False):
+        unread = await GpuLossHoldCheck().run(ctx)
+
+    assert not unread.passed and _fatal(unread) and not _hidden(unread)
+    assert unread.event.reason_code == Msg.POD_UNREAD.reason == "GPU_LOST_POD_UNREAD"
+    seen = unread.event.what_we_saw
+    assert seen["pods_unread"] == ["container_pod1"] and seen["missing_uuids"] == [] and seen["inspect_error"] == "ssh lost"
+    assert redis.recheck_requests == [default_executor().uuid]
+
+
+@pytest.mark.asyncio
+async def test_a_container_docker_no_longer_has_is_no_verdict_and_keeps_dockers_answer(context_factory):
+    ctx = _ctx(context_factory, FakeRedis(), listed=OTHER_CARDS, pods=(4,))
+
+    async def run(cmd, timeout=None):
+        return SimpleNamespace(stdout="", exit_status=1, stderr="Error: No such object: container_pod1\n")
+
+    ctx.ssh.run = run
 
     unread = await GpuLossHoldCheck().run(ctx)
 
-    assert not unread.passed and _hidden(unread) and unread.event.what_we_saw["pods_unread"] == ["container_pod1"]
+    assert unread.event.reason_code == Msg.POD_UNREAD.reason and not _hidden(unread)
+    assert unread.event.what_we_saw["inspect_exit_status"] == 1
+    assert "No such object" in unread.event.what_we_saw["inspect_stderr"]
+
+
+@pytest.mark.asyncio
+async def test_a_pod_on_the_old_cards_is_gpu_lost_even_when_another_pods_container_is_unread(context_factory):
+    ctx = _ctx(context_factory, FakeRedis(), listed=OTHER_CARDS, pods=(4,), pod_gpus=UUIDS)
+    ctx.ssh.names = ["container_pod1"]  # a second pod's container is not in docker's answer
+    second = _pod(2, 0)
+    ctx.state.rented_data.executors[ctx.executor.uuid].pods.append(second)
+
+    result = await GpuLossHoldCheck().run(ctx)
+
+    assert result.event.event == Msg.POD_GPUS_GONE.event and _hidden(result)
+    assert result.event.what_we_saw["missing_uuids"] == sorted(UUIDS)
+    assert result.event.what_we_saw["pods_unread"] == ["container_pod2"]
 
 
 @pytest.mark.asyncio

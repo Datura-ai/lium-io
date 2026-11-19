@@ -25,7 +25,7 @@ failed row remap: GpuMemoryHealthCheck's NVML read, done here first on a rented 
 node too: the backend knows which cards each pod holds, and a fault naming no card is refused there.
 DAH-5869: a card NVML still lists but that logged a new hardware Xid (the same memory read) is
 `gpu_hw_fault`, its UUID named the same way, and stays so until a read proves it healed
-(gpu_memory_health._held_fault_proven_healed). The pod is never touched.
+(gpu_memory_health._held_fault_proof). The pod is never touched.
 
 The counts are executor-wide, and a fault is posted for every RUNNING pod on the executor; each post
 carries that pod's own `gpu_count` next to the executor totals so the backend can tell which renters of

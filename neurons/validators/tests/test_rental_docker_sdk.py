@@ -106,7 +106,8 @@ class FakeApiClient:
         self.container_states = None
         self.inspect_container_error = None
         self.events = []
-        self.pruned_images = False
+        self.repo_tags = []
+        self.removed_images = []
         self.created_volumes = []
         self.removed_volumes = []
         self.networks = {}  # name -> what inspect_network returns
@@ -148,7 +149,7 @@ class FakeApiClient:
             raise self.inspect_image_error
         if image in self.missing_images:
             raise ImageNotFound("missing image")
-        return {"Id": "image-id", "RepoDigests": self.repo_digests}
+        return {"Id": "image-id", "RepoDigests": self.repo_digests, "RepoTags": self.repo_tags}
 
     def inspect_distribution(self, image, auth_config=None):
         self.distribution_calls.append({"image": image, "auth_config": auth_config})
@@ -192,8 +193,8 @@ class FakeApiClient:
             return self.container_states[0]
         return {"State": {"Running": True, "Restarting": False}}
 
-    def prune_images(self):
-        self.pruned_images = True
+    def remove_image(self, image):
+        self.removed_images.append(image)
         return {"ImagesDeleted": []}
 
     def create_volume(self, **kwargs):
@@ -1228,7 +1229,7 @@ def test_stdin_exec_spec_builders_keep_values_out_of_argv():
 
 
 @pytest.mark.asyncio
-async def test_delete_helpers_call_sdk_volume_and_prune_apis():
+async def test_delete_helpers_call_sdk_volume_apis():
     api_client = FakeApiClient()
     client = RentalDockerSdkClient(api_client)
 
@@ -1239,7 +1240,6 @@ async def test_delete_helpers_call_sdk_volume_and_prune_apis():
         timeout=133,
         labels=FILLER_VOLUME_LABELS,
     )
-    await client.prune_images()
     await client.remove_volume(volume_name="volume_test", force=True)
 
     assert api_client.created_volumes == [
@@ -1252,8 +1252,17 @@ async def test_delete_helpers_call_sdk_volume_and_prune_apis():
         }
     ]
     assert api_client.timeout == 60
-    assert api_client.pruned_images is True
     assert api_client.removed_volumes == [("volume_test", {"force": True})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("repo_tags", "expect_removed"), [([], True), (["daturaai/pytorch:latest"], False)])
+async def test_an_image_is_removed_by_id_only_once_no_tag_names_it(repo_tags, expect_removed):
+    api_client = FakeApiClient()
+    api_client.repo_tags = repo_tags
+
+    assert await RentalDockerSdkClient(api_client).remove_image_if_untagged(image_id="sha256:pod") is expect_removed
+    assert api_client.removed_images == (["sha256:pod"] if expect_removed else [])
 
 
 @pytest.mark.asyncio
@@ -1814,3 +1823,85 @@ def test_authorized_keys_append_runs_under_busybox_ash(tmp_path):
 
     assert completed.returncode == 0, completed.stderr
     assert target.read_text() == "k1\n"
+
+
+@pytest.mark.skipif(shutil.which("flock") is None, reason="flock not installed")
+@pytest.mark.parametrize("remove", [False, True])
+def test_authorized_keys_edit_waits_for_the_other_edit_and_never_writes_past_it(tmp_path, monkeypatch, remove):
+    # DAH-6441: a remove's read-filter-write must not interleave with an add, or it writes back a file missing the add
+    monkeypatch.setattr(rental_docker_sdk, "AUTHORIZED_KEYS_LOCK_WAIT_SECONDS", 1)
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("k1\n")
+    lock = str(target.parent / ".lium-cp.lock")
+    build = build_remove_authorized_keys_exec_spec if remove else build_authorized_keys_exec_spec
+    spec = build(container_name="pod_key", public_keys=["k1"], target_path=str(target))
+    holder = subprocess.Popen(["flock", "-o", lock, "sleep", "30"])
+    try:
+        while subprocess.run(["flock", "-n", lock, "true"]).returncode == 0:
+            pass
+        completed = _run_key_append(spec)
+    finally:
+        holder.kill()
+        holder.wait()
+
+    assert completed.returncode == (1 if remove else 75)
+    assert target.read_text() == "k1\n"
+
+
+def test_authorized_keys_remove_drops_only_the_listed_keys(tmp_path):
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("k1\nk2\nk3\n")
+
+    completed = _run_key_append(
+        build_remove_authorized_keys_exec_spec(container_name="pod_key", public_keys=["k1", "k3"], target_path=str(target))
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == "k2\n"
+
+
+def _path_without_flock(tmp_path) -> str:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for tool in ("sh", "mkdir", "cat", "chmod", "touch", "mktemp", "rm", "grep"):
+        (bin_dir / tool).symlink_to(shutil.which(tool))
+    return str(bin_dir)
+
+
+@pytest.mark.parametrize("remove", [False, True])
+def test_authorized_keys_edit_without_flock_runs_unlocked_as_before(tmp_path, remove):
+    # no lock that a killed edit could leave behind and so block every later edit on the pod
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("k1\nk2\n")
+    build = build_remove_authorized_keys_exec_spec if remove else build_authorized_keys_exec_spec
+    spec = build(container_name="pod_key", public_keys=["k1"], target_path=str(target))
+
+    completed = _run_key_append(spec, env={"PATH": _path_without_flock(tmp_path)})
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == ("k2\n" if remove else "k1\nk2\nk1\n")
+    assert sorted(p.name for p in target.parent.iterdir()) == ["authorized_keys"]
+
+
+@pytest.mark.skipif(shutil.which("flock") is None, reason="flock not installed")
+@pytest.mark.parametrize("remove", [False, True])
+def test_authorized_keys_edit_takes_the_lock_with_a_flock_that_has_no_wait_option(tmp_path, remove):
+    # Alpine images have BusyBox flock, which takes -n but no -w
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("k1\nk2\n")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    busybox_like = bin_dir / "flock"
+    busybox_like.write_text(f'#!/bin/sh\ncase " $* " in *" -w "*) exit 1;; esac\nexec {shutil.which("flock")} "$@"\n')
+    busybox_like.chmod(0o755)
+    build = build_remove_authorized_keys_exec_spec if remove else build_authorized_keys_exec_spec
+    spec = build(container_name="pod_key", public_keys=["k1"], target_path=str(target))
+
+    completed = _run_key_append(spec, env={"PATH": f"{bin_dir}:/usr/bin:/bin"})
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == ("k2\n" if remove else "k1\nk2\nk1\n")
