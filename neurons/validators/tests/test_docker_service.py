@@ -3496,6 +3496,21 @@ async def test_a_cancel_waits_for_the_docker_start_still_in_flight_before_stoppi
 
 
 @pytest.mark.asyncio
+async def test_a_refused_egress_guard_starts_nothing_and_stops_nothing(docker_service, monkeypatch, pod_bridge_guarded_on_fake_hosts):
+    # DAH-6737: the guard runs before the start and outside its cleanup: a refusal leaves the pod exactly as it was
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    client = docker_service.rental_docker_client_factory.client
+    client.running = False
+    pod_bridge_guarded_on_fake_hosts.side_effect = docker_service_module.RentalEgressGuardRefused("not applied")
+
+    with pytest.raises(docker_service_module.RentalEgressGuardRefused):
+        await _start_existing(docker_service)
+
+    assert pod_bridge_guarded_on_fake_hosts.await_args.kwargs["network"] == rental_network_for("pod_test")
+    assert client.started_containers == [] and client.stopped_containers == []
+
+
+@pytest.mark.asyncio
 async def test_a_start_cancelled_inside_the_docker_call_stops_the_container(docker_service, monkeypatch):
     monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
     client = docker_service.rental_docker_client_factory.client

@@ -3931,18 +3931,25 @@ class DockerService:
         self,
         *,
         docker_client: RentalDockerSdkClient,
-        ssh_client: asyncssh.SSHClientConnection,
+        ssh_client: asyncssh.SSHClientConnection | None,
         network: str,
         default_extra: dict,
+        connect: Callable[[], Any] | None = None,
     ) -> None:
         """The pod's own bridge exists and is in the host's link-local egress drop before the pod starts (DAH-6737),
         under the same host lock as the periodic guard. Fail closed: a bridge the drop could not be confirmed on is
-        never started on, and the refusal is a host fault (the node holds until a rental probe passes)."""
+        never started on, and the refusal is a host fault (the node holds until a rental probe passes). Without
+        ``ssh_client`` it opens its own session with ``connect``."""
         from services.task.checks.rental_egress_guard import apply_rental_egress_guard
 
         try:
             await docker_client.ensure_network(network)
-            _, error = await asyncio.wait_for(apply_rental_egress_guard(ssh_client), timeout=120)
+            if ssh_client is None:
+                # a start that opens its SSH session only after the start (start_existing_container): its own
+                async with connect() as own_ssh:
+                    _, error = await asyncio.wait_for(apply_rental_egress_guard(own_ssh), timeout=120)
+            else:
+                _, error = await asyncio.wait_for(apply_rental_egress_guard(ssh_client), timeout=120)
         except Exception as exc:  # noqa: BLE001 — every failure refuses the start
             error = str(exc) or type(exc).__name__
         if error:
@@ -12946,8 +12953,8 @@ class DockerService:
             # Docker accepts a start of a running container as a no-op: a failure after it is not this start's to undo
             running_before = not stopped_before
             starts: list[asyncio.Future] = []
-            # the start goes through the docker SDK (no shell fallback for a failed start); the SSH session,
-            # opened first, guards the pod's bridge before it, then serves the remount or the
+            # the start goes through the docker SDK; the SSH session is opened only once it
+            # succeeded, for the remount (no shell fallback for a failed start), or for the
             # stale-mountpoint repair below
             async def _start() -> None:
                 # shielded: the SDK call runs in a thread a cancel cannot stop, so cleanup waits for it (below)
@@ -12968,35 +12975,51 @@ class DockerService:
                 )
                 await asyncio.shield(starts[-1])
 
-            async with asyncssh.connect(
-                host=executor_info.address,
-                port=executor_info.ssh_port,
-                **await public_host_sock(executor_info.address, executor_info.ssh_port),
-                username=executor_info.ssh_username,
-                client_keys=[pkey],
-                known_hosts=known_hosts_policy,
-            ) as ssh_client:
-                # before any start, outside the cleanup: a refused guard leaves the pod as it was, nothing to undo
-                await self._guard_pod_network_before_start(
-                    docker_client=docker_client,
-                    ssh_client=ssh_client,
-                    network=rental_network_for(container_name),
-                    default_extra=default_extra,
-                )
+            @contextlib.asynccontextmanager
+            async def _guard_ssh():
+                async with asyncssh.connect(
+                    host=executor_info.address,
+                    port=executor_info.ssh_port,
+                    **await public_host_sock(executor_info.address, executor_info.ssh_port),
+                    username=executor_info.ssh_username,
+                    client_keys=[pkey],
+                    known_hosts=known_hosts_policy,
+                ) as guard_ssh:
+                    yield guard_ssh
+
+            # before any start, outside the cleanup: a refused guard leaves the pod as it was (DAH-6737)
+            await self._guard_pod_network_before_start(
+                docker_client=docker_client,
+                ssh_client=None,
+                network=rental_network_for(container_name),
+                default_extra=default_extra,
+                connect=_guard_ssh,
+            )
+            stale_mount_error: Exception | None = None
+            try:
+                # inside the cleanup: the SDK call runs in a thread, so a cancel can land after Docker started the pod
                 try:
-                    # inside the cleanup: the SDK call runs in a thread, so a cancel can land after Docker started the pod
-                    try:
-                        await _start()
-                    except Exception as exc:
+                    await _start()
+                except Exception as exc:
+                    if not _is_stale_vloopback_mountpoint_error(str(exc)):
+                        raise
+                    stale_mount_error = exc
+                async with asyncssh.connect(
+                    host=executor_info.address,
+                    port=executor_info.ssh_port,
+                    **await public_host_sock(executor_info.address, executor_info.ssh_port),
+                    username=executor_info.ssh_username,
+                    client_keys=[pkey],
+                    known_hosts=known_hosts_policy,
+                ) as ssh_client:
+                    if stale_mount_error is not None:
                         # a GPU reset's restart of a stopped pod hit "file exists" and left the pod down
                         # (5 Nov): the same repair as the edit undo, rmdir only an empty, unmounted
                         # mountpoint, then start once more
-                        if not _is_stale_vloopback_mountpoint_error(
-                            str(exc)
-                        ) or not await self._repair_stale_mountpoint_of_container_volume(
+                        if not await self._repair_stale_mountpoint_of_container_volume(
                             ssh_client, container_id, default_extra
                         ):
-                            raise
+                            raise stale_mount_error
                         await _start()
                     await self._restore_mount_and_sshd_after_start(
                         docker_client=docker_client,
@@ -13007,24 +13030,24 @@ class DockerService:
                         default_extra=default_extra,
                         record_start=stopped_before,
                     )
-                except (asyncio.CancelledError, Exception):
-                    # a pod left up without its plaintext mount writes the renter's data unencrypted into the
-                    # container layer: put it back down, even when the start is cancelled
-                    if not running_before:
-                        await _cleanup_to_completion(
-                            self._stop_after_failed_start(
-                                docker_client=docker_client,
-                                executor_info=executor_info,
-                                private_key=private_key,
-                                container_id=container_id,
-                                container_name=container_name,
-                                local_volume_path=local_volume_path,
-                                pod_id=pod_id,
-                                starts=starts,
-                                default_extra=default_extra,
-                            )
+            except (asyncio.CancelledError, Exception):
+                # a pod left up without its plaintext mount writes the renter's data unencrypted into the
+                # container layer: put it back down, even when the start is cancelled
+                if not running_before:
+                    await _cleanup_to_completion(
+                        self._stop_after_failed_start(
+                            docker_client=docker_client,
+                            executor_info=executor_info,
+                            private_key=private_key,
+                            container_id=container_id,
+                            container_name=container_name,
+                            local_volume_path=local_volume_path,
+                            pod_id=pod_id,
+                            starts=starts,
+                            default_extra=default_extra,
                         )
-                    raise
+                    )
+                raise
             # a start that mounted this container ends only this container's pending stop; another container's (a
             # replacement, an edit's park) stays until its own run is proven stopped, gone or mounted
             if task := _HALF_STARTED_STOP_LATER.pop(f"{slot}:{container_id}", None):
