@@ -9,6 +9,8 @@ import time
 import types
 from pathlib import Path
 
+import pytest
+
 from neurons.validators.tests.helpers import build_scrape_namespace, dict_literal_keys
 
 SRC = Path(__file__).resolve().parents[1] / "src"
@@ -29,8 +31,7 @@ HELPERS = {
 }
 NS = build_scrape_namespace(SRC / "miner_jobs" / "machine_scrape.py", HELPERS, {"os": os, "time": time, "docker_api_get": None})
 
-# 32768 kB of it is the reserved huge page pool (16 x 2048 kB), outside MemFree and outside ordinary use
-MEMINFO = """MemTotal:       132768 kB
+MEMINFO = """MemTotal:       100000 kB
 MemFree:         20000 kB
 MemAvailable:    50000 kB
 Buffers:          1000 kB
@@ -63,6 +64,7 @@ def _host(tmp_path: Path, *, pod_cgroup: bool = True) -> dict:
         (d / "memory.current").write_text(f"{current * 1024}\n")
         (d / "memory.stat").write_text(
             f"anon {(current - file_) * 1024}\nfile {file_ * 1024}\nshmem {shmem * 1024}\nfile_mapped {mapped * 1024}\n"
+            "hugetlb 0\n"  # hugetlb accounting on: the pool the fixture reserves is the host's
         )
     return {
         "host_root": str(root),
@@ -117,7 +119,7 @@ def test_both_listings_share_one_short_time_budget(monkeypatch, tmp_path: Path) 
     assert all(t <= NS["HOST_MEMORY_INVENTORY_SECONDS"] for t in timeouts)
     assert facts["hm_workload_containers"] is None
     assert "time budget" in facts["hm_errors"]["hm_outside_workloads_kb"]
-    assert facts["hm_mem_total_kb"] == 132768
+    assert facts["hm_mem_total_kb"] == 100000
 
 
 def test_host_memory_outside_the_workloads(tmp_path: Path) -> None:
@@ -185,12 +187,14 @@ def test_a_failed_docker_listing_is_no_count_not_zero_workloads(tmp_path: Path) 
     assert facts["hm_workload_containers"] is None
     assert facts["hm_outside_workloads_no_cache_kb"] is None
     assert facts["hm_errors"]["hm_outside_workloads_no_cache_kb"].startswith("docker inventory failed: OSError")
-    assert facts["hm_mem_total_kb"] == 132768
+    assert facts["hm_mem_total_kb"] == 100000
 
 
 def test_a_cgroup_v1_pod_counts_its_child_cgroups_shmem(tmp_path: Path) -> None:
     # review on lium-io#2361: v1 usage includes child cgroups; its plain shmem is local, total_shmem hierarchical
     paths = _host(tmp_path)
+    # no huge page pool: a v1 memory cgroup never accounts huge pages (see test_the_huge_page_pool_counts_where_its_owner_is_known)
+    Path(paths["meminfo_path"]).write_text(MEMINFO.replace("HugePages_Total:     16", "HugePages_Total:      0"))
     pod = Path(paths["host_root"]) / f"sys/fs/cgroup/system.slice/docker-{POD}.scope"
     for f in pod.iterdir():
         f.unlink()
@@ -235,31 +239,42 @@ def test_a_workload_that_grew_between_the_reads_is_no_negative_figure(tmp_path: 
         assert "negative residual" in facts["hm_errors"][key]
 
 
-def test_a_pods_huge_pages_are_not_host_memory(tmp_path: Path) -> None:
-    # review on lium-io#2361: 26 GiB used, a pod with 8 GiB of RAM plus 16 GiB of huge pages and no hugetlb accounting
-    # was reported as 18 GiB outside the workloads instead of 2 GiB
+@pytest.mark.parametrize(
+    "workload_set, pod_current_gib, pod_stat, expected_gib",
+    [
+        # review on lium-io#2361: 64 GiB total, 46 GiB free, a 16 GiB huge page pool; used = MemTotal - MemFree = 18 GiB
+        ("none", 0, None, 18),  # a host-only pool is host use
+        ("pod", 0, "anon 0\nhugetlb 0\n", 18),  # an ordinary pod beside a host-only pool
+        ("pod", 16, f"anon 0\nhugetlb {16 * 1024 * 1024 * 1024}\n", 2),  # the pod owns the pool, accounting on
+        ("pod", 0, "anon 0\n", None),  # the pod may own the pool, accounting unavailable: unknown
+    ],
+)
+def test_the_huge_page_pool_counts_where_its_owner_is_known(
+    tmp_path: Path, workload_set: str, pod_current_gib: int, pod_stat: str | None, expected_gib: int | None
+) -> None:
     gib = 1024 * 1024
     paths = _host(tmp_path)
     Path(paths["meminfo_path"]).write_text(
-        f"MemTotal: {64 * gib} kB\nMemFree: {38 * gib} kB\nMemAvailable: {38 * gib} kB\nBuffers: 0 kB\nCached: 0 kB\n"
+        f"MemTotal: {64 * gib} kB\nMemFree: {46 * gib} kB\nMemAvailable: {46 * gib} kB\nBuffers: 0 kB\nCached: 0 kB\n"
         f"SwapTotal: 0 kB\nSwapFree: 0 kB\nShmem: 0 kB\nMapped: 0 kB\nHugePages_Total: 8\nHugePages_Free: 0\n"
         f"Hugepagesize: {2 * gib} kB\nHugetlb: {16 * gib} kB\n"
     )
     filler = Path(paths["host_root"]) / f"sys/fs/cgroup/docker/{FILLER}"
     pod = Path(paths["host_root"]) / f"sys/fs/cgroup/system.slice/docker-{POD}.scope"
     (filler / "memory.current").write_text("0\n")
-    (filler / "memory.stat").write_text("anon 0\n")
-    (pod / "memory.current").write_text(f"{8 * gib * 1024}\n")
-    (pod / "memory.stat").write_text(f"anon {8 * gib * 1024}\n")
+    (filler / "memory.stat").write_text("anon 0\nhugetlb 0\n")
+    if pod_stat is not None:
+        (pod / "memory.current").write_text(f"{pod_current_gib * gib * 1024}\n")
+        (pod / "memory.stat").write_text(pod_stat)
+    listing = (lambda deadline=None: []) if workload_set == "none" else workloads
 
-    facts = NS["get_host_memory"](list_workloads=workloads, read_kmsg=lambda: [], **paths)
-    assert facts["hm_outside_workloads_kb"] == 2 * gib
-
-    # with hugetlb accounting on, memory.current holds the pod's huge pages too, and they are still not counted twice
-    (pod / "memory.current").write_text(f"{24 * gib * 1024}\n")
-    (pod / "memory.stat").write_text(f"anon {8 * gib * 1024}\nhugetlb {16 * gib * 1024}\n")
-    facts = NS["get_host_memory"](list_workloads=workloads, read_kmsg=lambda: [], **paths)
-    assert facts["hm_outside_workloads_kb"] == 2 * gib
+    facts = NS["get_host_memory"](list_workloads=listing, read_kmsg=lambda: [], **paths)
+    expected_kb = None if expected_gib is None else expected_gib * gib
+    assert facts["hm_outside_workloads_kb"] == expected_kb
+    assert facts["hm_outside_workloads_no_cache_kb"] == expected_kb
+    if expected_kb is None:
+        assert "hugetlb" in facts["hm_errors"]["hm_outside_workloads_kb"]
+        assert facts["hm_mapped_outside_workloads_kb"] == 0
 
 
 def test_a_docker_reply_trickled_in_parts_still_ends_at_the_deadline(tmp_path: Path) -> None:

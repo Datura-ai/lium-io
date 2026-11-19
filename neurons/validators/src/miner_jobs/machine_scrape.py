@@ -893,6 +893,7 @@ def get_host_memory(list_workloads=list_workload_container_ids, host_root=HOST_M
 
     # the workload containers' cgroups: memory.current counts their anon, page cache and shmem
     current = file_ = shmem = file_mapped = 0
+    hugetlb_unaccounted = False
     unread = []
     for container_id, _started_at in workloads or []:
         try:
@@ -900,9 +901,9 @@ def get_host_memory(list_workloads=list_workload_container_ids, host_root=HOST_M
         except Exception as exc:
             unread.append(f"{container_id[:12]}: {exc!r}")
             continue
-        # with hugetlb accounting on (cgroup v2 memory_hugetlb_accounting) memory.current holds the pod's huge pages,
-        # which the host's figure below leaves out with the whole pool
-        current += usage - stat.get("hugetlb", 0)
+        current += usage
+        # memory.stat has a hugetlb line only with hugetlb accounting on (cgroup v2 memory_hugetlb_accounting)
+        hugetlb_unaccounted = hugetlb_unaccounted or "hugetlb" not in stat
         # v1's usage counts child cgroups, as its total_* stats do (its plain ones are local); v2's are hierarchical
         file_ += stat.get("total_cache", stat.get("file", 0))
         shmem += stat.get("total_shmem", stat.get("shmem", 0))
@@ -924,10 +925,7 @@ def get_host_memory(list_workloads=list_workload_container_ids, host_root=HOST_M
             facts[key] = None
             errors[key] = inventory_error if workloads is None else "; ".join(unread) or "a /proc/meminfo field is missing"
     else:
-        # the reserved huge page pool is not ordinary RAM (the hm_hugepages_* fields report it): MemFree leaves the whole
-        # pool out, used or not, while a pod's memory.current counts its huge pages only under hugetlb accounting
-        hugetlb = mem.get("Hugetlb", mem.get("HugePages_Total", 0) * mem.get("Hugepagesize", 0))
-        used = mem["MemTotal"] - mem["MemFree"] - hugetlb
+        used = mem["MemTotal"] - mem["MemFree"]
         # all page cache counted as used, then without it (shmem and tmpfs, /dev/shm included, stay counted: not reclaimable)
         facts["hm_outside_workloads_kb"] = used - current
         facts["hm_outside_workloads_no_cache_kb"] = (used - mem["Buffers"] - mem["Cached"] + mem["Shmem"]) - (current - file_ + shmem)
@@ -938,6 +936,13 @@ def get_host_memory(list_workloads=list_workload_container_ids, host_root=HOST_M
             for key in outside_keys:
                 facts[key] = None
                 errors[key] = "a workload grew between the host and container reads (negative residual)"
+        # MemTotal - MemFree holds the whole huge page pool: a host-only pool stays host use, and a pod's share is in its
+        # memory.current only under hugetlb accounting; without it a running workload's share is unknown
+        pool = mem.get("Hugetlb", mem.get("HugePages_Total", 0) * mem.get("Hugepagesize", 0))
+        if pool and hugetlb_unaccounted and facts["hm_outside_workloads_kb"] is not None:
+            for key in outside_keys[:2]:
+                facts[key] = None
+                errors[key] = "a huge page pool is reserved and a workload's hugetlb charge is not accounted"
 
     try:
         with open(vmstat_path) as vmstat:
