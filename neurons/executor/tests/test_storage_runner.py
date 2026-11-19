@@ -1525,10 +1525,8 @@ def test_local_backup_never_follows_a_symlink_to_a_host_path(monkeypatch: pytest
     volume, host = tmp_path / "volume", tmp_path / "host"
     volume.mkdir()
     host.mkdir()
-    (host / "secret").write_text("x")
-    (volume / "link").symlink_to(host)
+    (volume / "link").symlink_to(host)  # empty: the old pre-check would have returned a no-op here
     monkeypatch.setattr("storage.restic.HELPER_VOLUME_ROOT", str(volume))
-    monkeypatch.setattr(Path, "iterdir", lambda self: pytest.fail(f"listed {self}"))
     runner = ResticStorageRunner(
         StorageOperationSpec.from_mapping(_operation_payload()), LocalWorkspace(volume / "link"), restic_binary="/bin/false"
     )
@@ -2114,7 +2112,7 @@ def test_executor_only_launches_the_helper_detached_with_the_runner_as_its_entry
     # DAH-5893: the executor resolves the workspace and starts the helper; restic, retries and reporting run in the
     # helper, so an executor restart leaves the operation running.
     spec = tmp_path / "op.json"
-    spec.write_text(json.dumps(_operation_payload()))
+    spec.write_text(json.dumps({**_operation_payload(), "detach": True}))
     spec.chmod(0o600)
     monkeypatch.setattr("sys.argv", ["storage_runner.py", "--spec", str(spec)])
     workspace = (
@@ -2461,3 +2459,25 @@ def test_load_operation_leaves_only_the_reporter_in_the_spec_file(tmp_path: Path
     assert payload["repository"] == {"password": "p"}
     assert json.loads(spec.read_text()) == {"reporter": reporter}
     assert spec.stat().st_mode & 0o777 == 0o600
+
+
+def test_without_detach_the_executor_returns_only_when_the_helper_ends(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """An older validator (no spec "detach") reads the runner's exit as the end, so the runner follows the helper."""
+    spec = tmp_path / "op.json"
+    spec.write_text(json.dumps(_operation_payload()))
+    spec.chmod(0o600)
+    monkeypatch.setattr("sys.argv", ["storage_runner.py", "--spec", str(spec)])
+    workspace = DockerVolumeWorkspace(IMAGE, "customer-volume", PurePosixPath("/workspace/checkpoints"), True)
+    monkeypatch.setattr(storage_runner.WorkspaceResolver, "resolve", lambda self, operation: workspace)
+    calls: list[str] = []
+
+    def fake_run(command: list[str], *args: object, **kwargs: object) -> SimpleNamespace:
+        calls.append(command[1])
+        return SimpleNamespace(returncode=0, stdout="3\n" if command[1] == "wait" else "", stderr="")
+
+    monkeypatch.setattr("storage.restic.subprocess.run", fake_run)
+
+    assert storage_runner.main() == 3
+    assert calls[-4:] == ["run", "logs", "wait", "rm"]

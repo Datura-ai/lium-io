@@ -873,6 +873,27 @@ class ResticStorageRunner:
             detail = _redact((started.stderr or "").strip(), self._secret_values())
             raise ResticOperationError(f"storage helper did not start: {_bounded_message(detail, 500)}")
 
+    def follow_wrapper_helper(self) -> int:
+        """For a validator that did not ask for --detach: stream the helper's events and return its exit code.
+
+        Older validators read the runner's exit as the operation's end, so the runner must not return before the helper.
+        """
+        name = self._helper_container_name()
+        previous = signal.signal(
+            signal.SIGTERM,
+            lambda *_: subprocess.run([self._docker_binary, "kill", "--signal", "TERM", name], capture_output=True),
+        )
+        try:
+            subprocess.run([self._docker_binary, "logs", "--follow", name], stderr=subprocess.STDOUT)
+            waited = subprocess.run([self._docker_binary, "wait", name], capture_output=True, text=True)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+        subprocess.run([self._docker_binary, "rm", "--force", name], capture_output=True)
+        try:
+            return int(waited.stdout.strip())
+        except ValueError:
+            raise ResticOperationError("could not read the storage helper's exit code") from None
+
     def _docker_helper_base(self) -> list[str]:
         # the helper gets the whole spec (repository credentials and reporter token) in one variable,
         # and keeps its (redacted) event log so the validator can read why it failed

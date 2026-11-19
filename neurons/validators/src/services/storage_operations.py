@@ -317,7 +317,7 @@ async def start_storage_operation(
         async with ssh_client.start_sftp_client() as sftp:
             async with sftp.open(str(files.spec), "w") as remote_spec:
                 await remote_spec.write(
-                    json.dumps(dict(spec), separators=(",", ":"), sort_keys=True)
+                    json.dumps({**spec, "detach": True}, separators=(",", ":"), sort_keys=True)
                 )
             await sftp.chmod(str(files.spec), 0o600)
 

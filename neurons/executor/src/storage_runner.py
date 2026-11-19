@@ -71,10 +71,10 @@ def main() -> int:
             event_writer.stage("PREPARING")
         # the executor only resolves the workspace and starts the helper; an executor restart leaves the run alone
         workspace = WorkspaceResolver().resolve(operation)
-        ResticStorageRunner(operation, workspace, event_writer=event_writer).launch_wrapper_helper(
-            sys.executable, str(Path(__file__).resolve()), json.dumps(payload)
-        )
-        return 0
+        runner = ResticStorageRunner(operation, workspace, event_writer=event_writer)
+        runner.launch_wrapper_helper(sys.executable, str(Path(__file__).resolve()), json.dumps(payload))
+        # detaching is opt-in (spec "detach", ignored by older executors): an older validator reads this exit as the end
+        return 0 if payload.get("detach") is True else runner.follow_wrapper_helper()
     except StorageOperationCancelled as error:
         if event_writer:
             event_writer.diagnostic(str(error))
