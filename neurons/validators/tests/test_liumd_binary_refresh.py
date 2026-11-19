@@ -320,9 +320,9 @@ async def test_the_answer_build_refreshes_without_a_version_command(monkeypatch)
     assert result.ok is True
     assert result.changed is True
     assert not any(c.endswith(" version") for c in runner.calls)
-    install = [c for c in runner.calls if c.startswith("install -m 0755")]
+    install = [c for c in runner.calls if "install -m 0755" in c]
     assert len(install) == 1
-    assert "sha256sum /usr/local/bin/liumd" in install[0]
+    assert 'sha256sum "$t"' in install[0]
 
 
 @pytest.mark.asyncio
@@ -355,7 +355,7 @@ async def test_a_failed_answer_download_keeps_the_usable_answer(monkeypatch):
     assert result.skipped is True
     assert result.build_sha == "old-build"
     assert "404" in result.detail
-    assert not any(c.startswith("install -m 0755") for c in runner.calls)
+    assert not any("install -m 0755" in c for c in runner.calls)
 
 
 @pytest.mark.asyncio
@@ -420,3 +420,68 @@ async def test_a_failed_answer_repair_without_a_build_is_not_skipped(monkeypatch
     assert result.ok is False
     assert result.skipped is False
     assert not any(c.endswith(" version") for c in runner.calls)
+
+
+class ShRunner:
+    """Runs each refresh command through real `sh` as a non-root user with a fake HOME."""
+
+    def __init__(self, env):
+        self.env = env
+
+    async def run(self, command, timeout, retryable):
+        import subprocess
+
+        out = subprocess.run(
+            ["sh", "-c", command], env=self.env, capture_output=True, text=True, timeout=timeout
+        )
+        return SimpleNamespace(
+            success=out.returncode == 0,
+            stdout=out.stdout,
+            stderr=out.stderr,
+            exit_status=out.returncode,
+            error_type=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_non_root_refresh_runs_the_copy_it_installed(tmp_path, monkeypatch):
+    import hashlib
+    import os
+
+    system = tmp_path / "sys" / "liumd"
+    home = tmp_path / "home"
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    fake_liumd = f"#!/bin/sh\necho '{json.dumps({'build_sha': NEW_BUILD})}'\n"
+    stubs = {
+        "id": "#!/bin/sh\necho 1000\n",
+        # Writes the fake liumd to the -o path, like a download would.
+        "curl": (
+            "#!/bin/sh\nwhile [ $# -gt 0 ]; do [ \"$1\" = -o ] && o=$2; shift; done\n"
+            f"cat > \"$o\" <<'X'\n{fake_liumd}X\n"
+        ),
+    }
+    for name, body in stubs.items():
+        (stub / name).write_text(body)
+        (stub / name).chmod(0o755)
+    sha = hashlib.sha256(fake_liumd.encode()).hexdigest()
+    manifest = {
+        "build_sha": NEW_BUILD,
+        "binaries": {
+            "x86_64": {"file": "liumd-amd64", "sha256": sha},
+            "aarch64": {"file": "liumd-arm64", "sha256": sha},
+        },
+    }
+    fetch, _ = _manifest_fetcher(manifest=manifest)
+    monkeypatch.setattr(liumd_binary_refresh, "_fetch_manifest", fetch)
+    monkeypatch.setattr(liumd_binary_refresh.settings, "LIUMD_BINARY_PATH", str(system))
+    runner = ShRunner({"HOME": str(home), "PATH": f"{stub}:{os.environ['PATH']}"})
+
+    result = await ensure_liumd_binary(_ctx(runner), budget_seconds=60)
+
+    assert result.ok is True, result.detail
+    assert result.changed is True and result.build_sha == NEW_BUILD
+    user_copy = home / ".local" / "bin" / "liumd"
+    assert user_copy.read_text() == fake_liumd
+    assert sorted(p.name for p in user_copy.parent.iterdir()) == ["liumd"]
+    assert not system.exists()
