@@ -378,6 +378,11 @@ class ContainerRunSpec:
     # on the host; may raise ContainerCreateRefused, and the created container is then left unstarted
     before_start: Callable[[list[str]], None] | None = field(default=None, repr=False, compare=False)
 
+    def __post_init__(self) -> None:
+        # DAH-6302: Docker reads nano_cpus 0 as no limit, so a share that rounded down to 0 gets one core
+        if self.cpu_count is not None:
+            self.cpu_count = max(self.cpu_count, 1)
+
 
 @dataclass(slots=True)
 class ContainerExecSpec:
@@ -945,11 +950,16 @@ class RentalDockerSdkClient:
             force=force,
         )
 
-    async def prune_images(self) -> None:
-        await self._call_api(
-            operation_label="prune images",
-            api_method=self._api_client.prune_images,
-        )
+    async def remove_image_if_untagged(self, *, image_id: str) -> bool:
+        """Remove the image by ID when no tag names it any more; dockerd refuses while a container uses it."""
+        try:
+            image = await _in_docker_thread(self._api_client.inspect_image, image_id)
+        except Exception as exc:
+            raise RentalDockerOperationError(_wrap_error_message("Docker SDK inspect image failed", exc)) from exc
+        if image.get("RepoTags"):
+            return False
+        await self._call_api(image_id, operation_label="remove image", api_method=self._api_client.remove_image)
+        return True
 
     async def aclose(self) -> None:
         close = getattr(self._api_client, "close", None)

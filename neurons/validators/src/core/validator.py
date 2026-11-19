@@ -471,6 +471,12 @@ class Validator:
                         executor_image_snapshot,
                         rollout_previous_digest=normalize_sha256_digest(rollout_window.previous_digest),
                     )
+                earlier = rollout_window.earlier_reading_current(job_block)
+                if earlier:
+                    executor_image_snapshot = dataclasses.replace(
+                        executor_image_snapshot,
+                        rollout_earlier_digests=tuple(filter(None, map(normalize_sha256_digest, earlier))),
+                    )
 
                 logger.info(
                     _m(
@@ -853,11 +859,7 @@ class Validator:
                             if batch == job_batch_id
                         }
                     )
-                    result_missing = (
-                        pod_ssh_only_results(rented_executors, pod_ssh, reported, job_batch_id)
-                        if settings.RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED
-                        else {}
-                    )
+                    result_missing = pod_ssh_only_results(rented_executors, pod_ssh, reported, job_batch_id)
                     # Not the whole miner's batch, not scored: no scored_at, and not "validated" for
                     # the express lane below.
                     await self.publish_result_missing(result_missing, miners, miner_coldkeys, job_batch_id)

@@ -14260,6 +14260,11 @@ class DockerService:
                                 self.redis_service, cleared_cap_claims, log_extra=default_extra
                             )
 
+                # DAH-6314: the image this pod ran, removed after the pod if a re-pull left it untagged
+                image_id = ""
+                with _best_effort_delete_step(log, "read_pod_image_id"):
+                    image_id = await docker_client.container_image_id(container=payload.container_name)
+
                 if self._wipes_volume_before_stop(payload):
                     await self._wipe_volume(connect_ssh, payload, log, stage="before the stop")
                     stopped = not await self._terminate_and_wait(connect_ssh, payload, log)
@@ -14350,12 +14355,15 @@ class DockerService:
                         payload.miner_hotkey, payload.executor_id,
                     )
 
-                with _best_effort_delete_step(log, "prune_images"):
-                    await run_logged_rental_docker_sdk_operation(
-                        operation="prune_images",
-                        log_extra=default_extra,
-                        call=docker_client.prune_images,
-                    )
+                # DAH-6314: never a host-wide prune here: it collects the layers a renter's pull on this host is
+                # still writing ("lease does not exist"). Only this pod's own image goes, by ID, once untagged.
+                if image_id:
+                    with _best_effort_delete_step(log, "remove_untagged_pod_image"):
+                        await run_logged_rental_docker_sdk_operation(
+                            operation="remove_untagged_image",
+                            log_extra=default_extra,
+                            call=partial(docker_client.remove_image_if_untagged, image_id=image_id),
+                        )
 
                 # DAH-3467: after a removal confirmed by inspect, a volume dockerd still holds is
                 # retried before the step gives it up; every volume failure stays best-effort. A

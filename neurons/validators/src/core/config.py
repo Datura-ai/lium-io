@@ -1,6 +1,5 @@
 import logging
 import pathlib
-from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
@@ -158,10 +157,6 @@ class Settings(BaseSettings):
     PORTION_FOR_UPTIME: float = 1
     UPTIME_REQUIRED_MINUTES: int = 60 * 24 * 14 # 14 days
 
-    PORTION_FOR_SYSBOX: float = 0.2
-    PORTION_FOR_SYSBOX_UNRENTED: float = 1
-    PORTION_FOR_SYSBOX_RENTED: float = 1
-    SYSBOX_RENTED_CUTOFF: datetime = datetime(2026, 4, 3, 12, 0, 0)
     # DAH-3597: first-miss grace for a DinD probe that never reached its container; the rule is
     # in PortConnectivityCheck, the TTL bounds the window between two misses.
     DIND_PROBE_FIRST_MISS_GRACE: bool = Field(env="DIND_PROBE_FIRST_MISS_GRACE", default=False)
@@ -272,7 +267,9 @@ class Settings(BaseSettings):
     LOOPBACK_PLUGIN_V2_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V2_ENABLED", default=True)
     # DAH-5101: new size-limited volumes go on vloopback:v3 (direct I/O loop, no host page cache of
     # the volume image); off = vloopback:v2 as before. Volumes already created keep their plugin.
-    LOOPBACK_PLUGIN_V3_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V3_ENABLED", default=False)
+    # On by default: on v2 a hard host stop loses the gigabytes of volume writes the host still held
+    # in its page cache, which tore encrypted-volume blocks (I/O errors in the pod after the reboot).
+    LOOPBACK_PLUGIN_V3_ENABLED: bool = Field(env="LOOPBACK_PLUGIN_V3_ENABLED", default=True)
     # DAH-5101: unlink the pod's volume files before the stop so a delete does not wait for the disk
     # to absorb unwritten data. Off = delete exactly as before; turned on per environment.
     POD_VOLUME_WIPE_BEFORE_STOP_ENABLED: bool = Field(env="POD_VOLUME_WIPE_BEFORE_STOP_ENABLED", default=False)
@@ -439,13 +436,6 @@ class Settings(BaseSettings):
         env="RENTED_POD_WATCH_NO_BANNER_RETRY_TIMEOUT_SECONDS", default=20.0, gt=0
     )
     RENTED_POD_WATCH_NO_BANNER_MISSES: int = Field(env="RENTED_POD_WATCH_NO_BANNER_MISSES", default=10, ge=1)
-    # A probed rented node the cycle has no result for (the miner timed out, failed, or left it out)
-    # is reported as EXECUTOR_RESULT_MISSING with only its observations. Off until the backend that
-    # stores such a report as evidence only (lium-platform) is deployed:
-    # an older backend would score it as a failed validation.
-    RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED: bool = Field(
-        env="RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED", default=False
-    )
     # A rented node whose scrape, run in the already-running executor, finds the GPU runtime
     # dead on the host (NVML: driver not loaded, GPU lost, GPU requires reset, GPU not found; or zero
     # cards) is reset the way POD_NOT_RUNNING and GPU_MISSING are: verified job cleared, so the backend
@@ -681,15 +671,6 @@ class Settings(BaseSettings):
     # Root log level. DEBUG brings back the per-cycle check outcomes that repeat the previous cycle
     # and the per-executor job-result dump after scoring; asyncssh and sqlalchemy keep their own levels.
     LOG_LEVEL: str = Field(env="LOG_LEVEL", default="INFO", description="Root log level (DEBUG, INFO, WARNING, ...)")
-
-    # DAH-2786 — GPU power cap revert gate. When True, an unrented executor whose host put the
-    # GPU power limit back while a Lium idle job was running, often enough inside the window,
-    # loses the unrented rental incentive while staying active. Ships in shadow mode: unlike
-    # DAH-2715 this gate reads provider behaviour rather than a capability, so the prod numbers
-    # are read first. Set to True to enforce.
-    ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT: bool = Field(
-        env="ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT", default=False
-    )
 
     # DAH-4299: whether an idle provider-chosen spot node is paid is decided as for a secure node
     # (its GPU model is in the unrented program and every idle-pool gate passes), not by whether a

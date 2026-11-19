@@ -95,38 +95,33 @@ async def verify_validator_auth_from_headers(
     """
     validator_hotkey = x_validator_hotkey
     
-    # Normalize timestamp to seconds
-    # If timestamp is larger than 1e12, treat it as milliseconds and convert
-    if x_timestamp > 1e12:
-        timestamp_seconds = x_timestamp / 1000
-    else:
-        timestamp_seconds = x_timestamp
-    
+    # Normalize to integer milliseconds (values above 1e12 are milliseconds already); integer math only,
+    # so a huge header value cannot overflow a float, and the window is exact in both directions.
+    timestamp_ms = x_timestamp if x_timestamp > 1e12 else x_timestamp * 1000
+    timestamp_seconds = timestamp_ms // 1000
+
     # Validate timestamp is a reasonable Unix timestamp (after 2000-01-01)
     if timestamp_seconds < 946684800:  # 2000-01-01 00:00:00 UTC
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"X-Timestamp must be a Unix timestamp in seconds. Received invalid value: {x_timestamp}"
         )
-    
-    now = int(time.time())
-    
-    # Check timestamp is within allowed symmetric window
-    # Allow timestamps within AUTH_MESSAGE_MAX_AGE seconds in either direction
-    # to handle small clock differences between validator and miner servers
-    time_diff = abs(now - timestamp_seconds)
-    if time_diff > AUTH_MESSAGE_MAX_AGE:
-        if timestamp_seconds < now - AUTH_MESSAGE_MAX_AGE:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=f"Authentication message too old. Timestamp is outside the allowed {AUTH_MESSAGE_MAX_AGE}-second window and must be regenerated."
-            )
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=f"Authentication message timestamp is too far in the future. Timestamp must be within {AUTH_MESSAGE_MAX_AGE} seconds of current time."
-            )
-    
+
+    now_ms = int(time.time()) * 1000
+    max_age_ms = AUTH_MESSAGE_MAX_AGE * 1000
+
+    # Symmetric window: AUTH_MESSAGE_MAX_AGE seconds either way, for small clock differences between servers
+    if timestamp_ms < now_ms - max_age_ms:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Authentication message too old. Timestamp is outside the allowed {AUTH_MESSAGE_MAX_AGE}-second window and must be regenerated."
+        )
+    if timestamp_ms > now_ms + max_age_ms:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Authentication message timestamp is too far in the future. Timestamp must be within {AUTH_MESSAGE_MAX_AGE} seconds of current time."
+        )
+
     # Check validator registration
     if not validator_service.is_valid_validator(validator_hotkey):
         logger.warning("Validator %s is not registered", validator_hotkey)
