@@ -740,14 +740,17 @@ async def _restore_fabric_services(
     """Starts every stopped host service and holder container that is not up after the reset; the problem left,
     else None. A container counts as up only when it still runs (not exited, not restarting) after settle_seconds."""
     problems: list[str] = []
+    listed: list[str] = []
     try:
         # the ones a unit stopped beyond these: found late by this reset's unit, or left by a reset whose restore
-        # did not run. Stopped after the given ones, so started again after them
+        # did not run. Stopped after the given ones, so started again after them. No nsenter (127): no unit can
+        # have run on this host, as in _reset_unit_pending
         stopped = await _run(runner, STOPPED_UNITS_READ_COMMAND)
-        if stopped.exit_code != 0:
+        if stopped.exit_code not in (0, 127):
             problems.append(f"could not read which host services the reset unit stopped: {_tail(stopped.stderr)}")
-        else:
-            units = [*dict.fromkeys(u for u in (stopped.stdout or "").split() if u not in units), *units]
+        elif stopped.exit_code == 0:
+            listed = (stopped.stdout or "").split()
+            units = [*dict.fromkeys(u for u in listed if u not in units), *units]
     except Exception as exc:
         problems.append(f"could not read which host services the reset unit stopped: {exc}")
     for cid in reversed(containers):
@@ -776,7 +779,7 @@ async def _restore_fabric_services(
             problems.append(f"{unit} state unknown after the reset: {exc}")
     if problems:
         logger.error("host GPU services down after a GPU reset: %s", "; ".join(problems))
-    else:
+    elif listed:
         try:
             # every one is up again; a list left behind only makes a later restore check them once more
             await _run(runner, STOPPED_UNITS_CLEAR_COMMAND)
@@ -887,6 +890,15 @@ async def reset_pod_gpus(
             ok=False,
             error_code=GpuResetErrorCode.OperationInProgress,
             detail="the GPU reset is still running on the host",
+        )
+    # host services an earlier reset unit stopped and whose restore never ran (a dropped session): started again
+    # before anything here can return early, and nothing is stopped while one of them stays down
+    left_down = await _restore_fabric_services(runner, [])
+    if left_down:
+        return GpuResetReport(
+            ok=False,
+            error_code=GpuResetErrorCode.ResetNotSupported,
+            detail=f"a host GPU service an earlier reset stopped is down, nothing was stopped: {left_down}",
         )
     try:
         plan = await precheck()

@@ -159,6 +159,11 @@ async def _reset(
         # as in reset_pod_gpus: an earlier reset that outlived its SSH timeout still holds the GPUs and the fabric
         detail = "the GPU reset is still running on the host"
         return HungGpuResult(hung, ContainerWarningCode.HungGpuNotResetUnsupported, detail)
+    # as in reset_pod_gpus: services an earlier unit left stopped are started before any early return
+    left_down = await _restore_fabric_services(runner, [])
+    if left_down:
+        detail = f"a host GPU service an earlier reset stopped is down, nothing was stopped: {left_down}"
+        return HungGpuResult(hung, ContainerWarningCode.HungGpuNotResetUnsupported, detail)
     if set(hung) <= latched:
         # latch only: the seconds-long context cycle first, not a reset (a healthy GPU stopped a moment
         # ago can still read busy); -r below only when the cycle does not clear it

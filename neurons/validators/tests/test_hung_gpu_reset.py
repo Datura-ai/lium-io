@@ -409,6 +409,27 @@ async def test_a_whole_host_pod_whose_late_stopped_service_does_not_come_back_is
 
 
 @pytest.mark.asyncio
+async def test_a_service_left_stopped_is_restored_before_a_latch_cure_returns():
+    # DAH-6741 review: the latch cure returns before any host reset, so the restore must come first
+    late = "late-monitor.service"
+    host = HungHost(query=_query({U[0]: f"{U[0]}, 100, 0"}))
+    host.active[late], host.stopped_file = False, [late]
+    result = await _reset(host)
+    assert result.warning is None and _resets(host) == []
+    assert host.active[late] and host.stopped_file == []
+
+
+@pytest.mark.asyncio
+async def test_a_service_left_stopped_that_stays_down_refuses_the_hung_reset():
+    late = "late-monitor.service"
+    host = HungHost(query=_query({U[0]: None}), start_fails=(late,))
+    host.active[late], host.stopped_file = False, [late]
+    result = await _reset(host)
+    assert result.warning == W.HungGpuNotResetUnsupported and f"{late} is not active" in result.detail
+    assert _resets(host) == [] and host.stopped_file == [late]
+
+
+@pytest.mark.asyncio
 async def test_a_refused_reset_on_a_whole_host_pod_cured_by_the_cycle_is_not_a_reset():
     host = _whole_host(reset_exit=1)
     result = await reset_hung_pod_gpus(host, list(U), settle_seconds=0)

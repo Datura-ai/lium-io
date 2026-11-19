@@ -1128,6 +1128,31 @@ async def test_a_service_left_stopped_by_a_reset_whose_restore_did_not_run_is_re
         assert f"{late} is not active again after the reset" in report.detail
 
 
+@pytest.mark.parametrize("starts", [True, False])
+@pytest.mark.asyncio
+async def test_a_service_left_stopped_is_restored_before_a_precheck_refusal_returns(starts):
+    # DAH-6741 review: the earlier unit is gone and the host GPU listing fails (GpusLostOnHost), an early return
+    late = "late-monitor.service"
+    host = FakeHost(gpus_result=make_command_result(False, exit_code=255), start_fails=() if starts else (late,))
+    host.active[late], host.stopped_file = False, [late]
+    report, start = await _reset(host)
+    assert host.active[late] == starts and ("start", late) in host.fm_log
+    assert host.stopped_file == ([] if starts else [late])
+    if starts:
+        assert report.error_code == GpuResetErrorCode.GpusLostOnHost
+    else:
+        # nothing is stopped while it stays down; the list stays for the next restore
+        assert report.error_code == GpuResetErrorCode.ResetNotSupported and f"{late} is not active" in report.detail
+    _no_change(host, start)
+
+
+@pytest.mark.asyncio
+async def test_an_empty_list_of_stopped_services_is_not_cleared():
+    host = FakeHost()
+    report, _ = await _reset(host)
+    assert report.ok and gpu_reset.STOPPED_UNITS_CLEAR_COMMAND not in host.commands
+
+
 @pytest.mark.asyncio
 async def test_a_service_the_unit_stopped_on_its_own_is_checked_after_the_others():
     late = "late-monitor.service"
