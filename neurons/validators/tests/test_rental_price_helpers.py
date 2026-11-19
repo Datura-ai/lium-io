@@ -27,7 +27,7 @@ def expected_executor_score(
     score = BASE_JOB_SCORE * portion * gpu_count / total_gpu_count
 
     if not sysbox_runtime:
-        score *= 1 - settings.PORTION_FOR_SYSBOX
+        score = 0.0  # sysbox is required
 
     if not collateral_deposited:
         uptime_ratio = min(1.0, uptime_minutes / settings.UPTIME_REQUIRED_MINUTES)

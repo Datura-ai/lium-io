@@ -1,6 +1,5 @@
 import logging
 import pathlib
-from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
@@ -158,10 +157,6 @@ class Settings(BaseSettings):
     PORTION_FOR_UPTIME: float = 1
     UPTIME_REQUIRED_MINUTES: int = 60 * 24 * 14 # 14 days
 
-    PORTION_FOR_SYSBOX: float = 0.2
-    PORTION_FOR_SYSBOX_UNRENTED: float = 1
-    PORTION_FOR_SYSBOX_RENTED: float = 1
-    SYSBOX_RENTED_CUTOFF: datetime = datetime(2026, 4, 3, 12, 0, 0)
     # DAH-3597: first-miss grace for a DinD probe that never reached its container; the rule is
     # in PortConnectivityCheck, the TTL bounds the window between two misses.
     DIND_PROBE_FIRST_MISS_GRACE: bool = Field(env="DIND_PROBE_FIRST_MISS_GRACE", default=False)
@@ -441,13 +436,6 @@ class Settings(BaseSettings):
         env="RENTED_POD_WATCH_NO_BANNER_RETRY_TIMEOUT_SECONDS", default=20.0, gt=0
     )
     RENTED_POD_WATCH_NO_BANNER_MISSES: int = Field(env="RENTED_POD_WATCH_NO_BANNER_MISSES", default=10, ge=1)
-    # A probed rented node the cycle has no result for (the miner timed out, failed, or left it out)
-    # is reported as EXECUTOR_RESULT_MISSING with only its observations. Off until the backend that
-    # stores such a report as evidence only (lium-platform) is deployed:
-    # an older backend would score it as a failed validation.
-    RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED: bool = Field(
-        env="RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED", default=False
-    )
     # A rented node whose scrape, run in the already-running executor, finds the GPU runtime
     # dead on the host (NVML: driver not loaded, GPU lost, GPU requires reset, GPU not found; or zero
     # cards) is reset the way POD_NOT_RUNNING and GPU_MISSING are: verified job cleared, so the backend
@@ -465,6 +453,9 @@ class Settings(BaseSettings):
     # verified job is cleared, so the backend marks the executor inactive and billing stops. A transport
     # error or timeout decides nothing. Off by default: the pod keeps the plain POD_NOT_RUNNING verdict.
     REBOOT_FAILED_HOST_CHECK_ENABLED: bool = Field(env="REBOOT_FAILED_HOST_CHECK_ENABLED", default=False)
+    # A GPU process inside a Lium filler whose command is not on the filler workload's allowlist is
+    # foreign GPU work. Off: logged only (FILLER_FOREIGN_PROCESS ... enforced=False), the verdict is unchanged.
+    FILLER_PROCESS_ALLOWLIST_ENFORCED: bool = Field(env="FILLER_PROCESS_ALLOWLIST_ENFORCED", default=False)
     # DAH-4564 — read a rented pod's cpuset, CPU quota and init oom_score_adj and flag a host that
     # pinned or throttled the renter below 95% of its advertised cores, and zero its score. A raised
     # oom_score_adj is recorded only, never scored.
@@ -683,15 +674,6 @@ class Settings(BaseSettings):
     # Root log level. DEBUG brings back the per-cycle check outcomes that repeat the previous cycle
     # and the per-executor job-result dump after scoring; asyncssh and sqlalchemy keep their own levels.
     LOG_LEVEL: str = Field(env="LOG_LEVEL", default="INFO", description="Root log level (DEBUG, INFO, WARNING, ...)")
-
-    # DAH-2786 — GPU power cap revert gate. When True, an unrented executor whose host put the
-    # GPU power limit back while a Lium idle job was running, often enough inside the window,
-    # loses the unrented rental incentive while staying active. Ships in shadow mode: unlike
-    # DAH-2715 this gate reads provider behaviour rather than a capability, so the prod numbers
-    # are read first. Set to True to enforce.
-    ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT: bool = Field(
-        env="ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT", default=False
-    )
 
     # DAH-4299: whether an idle provider-chosen spot node is paid is decided as for a secure node
     # (its GPU model is in the unrented program and every idle-pool gate passes), not by whether a

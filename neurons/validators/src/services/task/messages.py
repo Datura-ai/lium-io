@@ -1539,6 +1539,10 @@ class GpuUsageMessages:
         "outside Lium's containers and re-run your node: {processes}. Leave Lium's own filler "
         "running: {fillers}."
     )
+    FOREIGN_PROCESS_IN_FILLER_REMEDIATION = (
+        "A GPU process that is not the workload of Lium's filler runs inside the filler container: "
+        "{processes}. Stop it, run nothing else inside Lium's containers, and re-run your node."
+    )
     USAGE_HIGH_BESIDE_A_RENTAL_REMEDIATION = (
         "Stop the GPU processes outside Lium's containers and re-run your node: {outside_processes}. "
         "Do not stop the pod container of the rental on this node ({pod_containers}): Lium stops or "

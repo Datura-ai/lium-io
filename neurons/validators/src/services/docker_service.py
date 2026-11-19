@@ -110,6 +110,7 @@ from services.container_cleanup import (
     REMOVE_CACHE_SWEEP_CONTAINER,
     evict_cache_volumes_oldest_first,
     idle_filler_images_size_command,
+    image_repository,
 )
 from services.cvm_quote_broker import ensure_quote_broker, quote_socket_pod_mount
 from services.node_host import node_owner, public_host_sock
@@ -176,6 +177,7 @@ from services.redis_service import (
     EDIT_PARKED_CONTAINER_TTL_SECONDS,
     FILLER_IMAGE_DIGESTS_PREFIX,
     FILLER_IMAGE_DIGESTS_TTL_SECONDS,
+    FILLER_IMAGE_REPOSITORY_PREFIX,
     IN_CONTAINER_SSH_BOOTSTRAP_PATH,
     RECENT_FILLER_PREFIX,
     RECENT_FILLER_TTL_SECONDS,
@@ -6351,9 +6353,25 @@ class DockerService:
         container: str,
         container_name: str,
         default_extra: dict,
+        docker_image: str = "",
     ) -> None:
         """Remember the image digests a filler was started from, so the GPU usage check can tell it
-        from another container later run under the same name. Never fails the create."""
+        from another container later run under the same name, and the image repository it was asked
+        to run, which names the filler's workload for the GPU process allowlist. Never fails the create."""
+        if docker_image:
+            try:
+                await self.redis_service.set(
+                    f"{FILLER_IMAGE_REPOSITORY_PREFIX}{container_name}",
+                    image_repository(docker_image),
+                    ex=FILLER_IMAGE_DIGESTS_TTL_SECONDS,
+                )
+            except Exception as exc:
+                logger.warning(
+                    _m(
+                        "Could not record the filler's image repository; its processes are not judged",
+                        extra=get_extra_info({**default_extra, "error": str(exc)}),
+                    )
+                )
         try:
             # the container's own image, not the tag: the tag can move during the bootstrap
             image_id = await docker_client.container_image_id(container=container)
@@ -10866,6 +10884,13 @@ class DockerService:
                         **(custom_options.environment or {}),
                         "JUPYTER_PASSWORD": image_jupyter_token,
                     }
+                # DAH-6522: the image's start.sh opens Jupyter, and its login tip points, at the pod volume, the one
+                # folder a reboot keeps; only the validator knows where the template put it. Every rental gets it:
+                # a renter's startup command may run start.sh itself.
+                custom_options.environment = {
+                    **(custom_options.environment or {}),
+                    "LIUM_VOLUME_PATH": local_volume_path,
+                }
 
                 container_name = self.get_container_name(payload)
                 created_local_volume = False
@@ -11999,7 +12024,11 @@ class DockerService:
                     )
                     if payload.workload_kind == WorkloadKind.FILLER:
                         await self._record_filler_image_best_effort(
-                            docker_client, container_id or container_name, container_name, default_extra
+                            docker_client,
+                            container_id or container_name,
+                            container_name,
+                            default_extra,
+                            payload.docker_image,
                         )
                         await self._remember_new_filler_best_effort(executor_info.uuid, container_name, container_id)
                     # no duration: the collector starts after the reply, its time is logged there
@@ -14254,6 +14283,11 @@ class DockerService:
                                 self.redis_service, cleared_cap_claims, log_extra=default_extra
                             )
 
+                # DAH-6314: the image this pod ran, removed after the pod if a re-pull left it untagged
+                image_id = ""
+                with _best_effort_delete_step(log, "read_pod_image_id"):
+                    image_id = await docker_client.container_image_id(container=payload.container_name)
+
                 if self._wipes_volume_before_stop(payload):
                     await self._wipe_volume(connect_ssh, payload, log, stage="before the stop")
                     stopped = not await self._terminate_and_wait(connect_ssh, payload, log)
@@ -14344,12 +14378,15 @@ class DockerService:
                         payload.miner_hotkey, payload.executor_id,
                     )
 
-                with _best_effort_delete_step(log, "prune_images"):
-                    await run_logged_rental_docker_sdk_operation(
-                        operation="prune_images",
-                        log_extra=default_extra,
-                        call=docker_client.prune_images,
-                    )
+                # DAH-6314: never a host-wide prune here: it collects the layers a renter's pull on this host is
+                # still writing ("lease does not exist"). Only this pod's own image goes, by ID, once untagged.
+                if image_id:
+                    with _best_effort_delete_step(log, "remove_untagged_pod_image"):
+                        await run_logged_rental_docker_sdk_operation(
+                            operation="remove_untagged_image",
+                            log_extra=default_extra,
+                            call=partial(docker_client.remove_image_if_untagged, image_id=image_id),
+                        )
 
                 # DAH-3467: after a removal confirmed by inspect, a volume dockerd still holds is
                 # retried before the step gives it up; every volume failure stays best-effort. A

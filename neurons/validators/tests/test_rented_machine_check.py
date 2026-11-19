@@ -689,14 +689,17 @@ async def test_collect_pod_diagnostics_handles_removed_container():
     ssh = DiagnosticsSSHClient(
         inspect_stdout="",
         inspect_stderr="Error: No such object: pod_abc",
-        logs_stdout="",
+        # what `docker logs ... 2>&1` prints for a removed container: never the pod's output
+        logs_stdout="Error response from daemon: No such container: pod_abc\n",
     )
 
     diagnostics = await _collect_pod_diagnostics(ssh, "pod_abc")
 
     assert diagnostics["container_status"] is None
+    assert diagnostics["container_missing"] is True
     assert "Error: No such object: pod_abc" in diagnostics["diagnostics_capture_error"]
     assert diagnostics["container_logs_tail"] is None
+    assert not any("docker logs" in cmd for cmd in ssh.commands_called)
 
 
 @pytest.mark.asyncio

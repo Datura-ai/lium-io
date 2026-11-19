@@ -115,7 +115,7 @@ class _FakeRentalDockerClient:
         self.container_call_order = []
         self.created_volumes = []
         self.removed_volumes = []
-        self.pruned_images = 0
+        self.removed_pod_images = 0
         self.login_error = None
         self.pull_error = None
         self.run_error = None
@@ -126,7 +126,7 @@ class _FakeRentalDockerClient:
         # per-call answers for remove_volume, consumed in order (None = success); once empty,
         # remove_volume_error applies
         self.remove_volume_errors: list[Exception | None] = []
-        self.prune_images_error = None
+        self.remove_image_error = None
         # DAH-3467: answers for container_status, consumed in order; the last one repeats.
         # None = 404 (gone), a str = State.Status, an Exception = the inspect raised it.
         self.container_statuses: list[str | Exception | None] = []
@@ -246,10 +246,14 @@ class _FakeRentalDockerClient:
     ) -> str | None:
         return None
 
-    async def prune_images(self) -> None:
-        self.pruned_images += 1
-        if self.prune_images_error is not None:
-            raise self.prune_images_error
+    async def container_image_id(self, *, container: str) -> str:
+        return "sha256:pod-image"
+
+    async def remove_image_if_untagged(self, *, image_id: str) -> bool:
+        self.removed_pod_images += 1
+        if self.remove_image_error is not None:
+            raise self.remove_image_error
+        return True
 
 
 class _FakeRentalDockerFactory:
@@ -1127,7 +1131,7 @@ async def test_delete_filler_container_treats_missing_container_as_deleted(
             "remove_volumes": True,
         }
     ]
-    assert docker_service.rental_docker_client_factory.client.pruned_images == 1
+    assert docker_service.rental_docker_client_factory.client.removed_pod_images == 1
     assert docker_service.rental_docker_client_factory.client.removed_volumes == [
         {"volume_name": payload.local_volume, "force": False}
     ]
@@ -1188,7 +1192,7 @@ async def test_delete_customer_rental_treats_missing_container_as_deleted(
 
     assert isinstance(result, ContainerDeleted)
     assert result.pod_id == payload.pod_id
-    assert docker_service.rental_docker_client_factory.client.pruned_images == 1
+    assert docker_service.rental_docker_client_factory.client.removed_pod_images == 1
     assert docker_service.rental_docker_client_factory.client.removed_volumes == [
         {"volume_name": payload.local_volume, "force": False}
     ]
@@ -1557,7 +1561,7 @@ async def test_delete_container_removal_in_progress_returns_soft_failure(
     assert result.error_type == FailedContainerErrorTypes.ContainerDeletionFailed
     assert result.error_code == FailedContainerErrorCodes.DeletionInProgress
     assert result.msg == remove_error
-    assert docker_service.rental_docker_client_factory.client.pruned_images == 0
+    assert docker_service.rental_docker_client_factory.client.removed_pod_images == 0
     assert docker_service.rental_docker_client_factory.client.removed_volumes == []
     docker_service.redis_service.remove_rented_machine.assert_not_awaited()
 
@@ -1676,7 +1680,7 @@ async def test_delete_container_missing_volume_still_deleted(
 
 
 @pytest.mark.asyncio
-async def test_delete_container_prune_images_failure_still_deleted(
+async def test_delete_container_image_removal_failure_still_deleted(
     docker_service,
     monkeypatch,
 ):
@@ -1691,8 +1695,8 @@ async def test_delete_container_prune_images_failure_still_deleted(
 
     docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
     docker_service.redis_service.remove_rented_machine = AsyncMock()
-    docker_service.rental_docker_client_factory.client.prune_images_error = Exception(
-        "Docker SDK prune images failed: 500 Server Error"
+    docker_service.rental_docker_client_factory.client.remove_image_error = Exception(
+        "Docker SDK remove image failed: 500 Server Error"
     )
 
     payload = ContainerDeleteRequest(
@@ -1714,8 +1718,8 @@ async def test_delete_container_prune_images_failure_still_deleted(
     )
 
     assert isinstance(result, ContainerDeleted)
-    # prune ran (and raised); the local volume is still removed afterwards
-    assert docker_service.rental_docker_client_factory.client.pruned_images == 1
+    # the image removal ran (and raised); the local volume is still removed afterwards
+    assert docker_service.rental_docker_client_factory.client.removed_pod_images == 1
     assert docker_service.rental_docker_client_factory.client.removed_volumes == [
         {"volume_name": payload.local_volume, "force": False}
     ]
@@ -1823,8 +1827,8 @@ async def test_delete_container_remove_read_timeout_then_gone_is_deleted(
     assert isinstance(result, ContainerDeleted)
     assert result.pod_id == payload.pod_id
     assert client.inspected_containers == [payload.container_name]
-    # the teardown after the removal still runs: prune, the local volume, the redis rental record
-    assert client.pruned_images == 1
+    # the teardown after the removal still runs: image removal, the local volume, the redis rental record
+    assert client.removed_pod_images == 1
     assert client.removed_volumes == [{"volume_name": payload.local_volume, "force": False}]
     docker_service.redis_service.remove_rented_machine.assert_awaited_once_with(
         executor_info, payload.container_name
@@ -1872,7 +1876,7 @@ async def test_delete_container_remove_read_timeout_still_removing_reports_in_pr
     assert "Read timed out" in result.msg and "still 'removing'" in result.msg
     assert len(client.inspected_containers) >= 2  # kept asking until the confirm window ran out
     # nothing after the removal ran: the container is not known to be gone
-    assert client.pruned_images == 0
+    assert client.removed_pod_images == 0
     assert client.removed_volumes == []
     docker_service.redis_service.remove_rented_machine.assert_not_awaited()
 
@@ -2084,7 +2088,7 @@ async def test_delete_container_remove_read_timeout_then_gone_with_volume_still_
     assert isinstance(result, ContainerDeleted)
     assert result.pod_id == payload.pod_id
     assert client.removed_volumes == [{"volume_name": payload.local_volume, "force": False}] * 2
-    assert client.pruned_images == 1
+    assert client.removed_pod_images == 1
     assert not docker_service_module.pending_deletions.is_pending(payload.pod_id)
     docker_service.redis_service.remove_rented_machine.assert_awaited_once_with(
         executor_info, payload.container_name
