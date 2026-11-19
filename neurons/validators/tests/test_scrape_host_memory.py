@@ -485,30 +485,26 @@ def test_host_memory_keys_are_wired_through_both_obfuscation_tables() -> None:
 @pytest.mark.parametrize(
     "pod_stat_extra, host_swapcached_kb, expected_no_cache_kb",
     [
-        # review on lium-io#2361 at 34bf9ed: a pod's 2 GiB of swap cache sits in its file counter, not in the host's
-        # Cached, so it is taken back out of the workload's cache term (it read 2 GiB too high)
+        # review on lium-io#2361 at ceb64cb: the kernel counts swap cache in the node's file pages only (the cgroup's
+        # in swapcached), so neither the pod's file nor the host's Cached holds it: nothing is taken out
         (f"swapcached {2 * 1024 * 1024 * 1024}\n", 2 * 1024 * 1024, 14000),
-        # the host holds swap cache and the pod's share is not readable: unknown, not overstated
-        ("", 2 * 1024 * 1024, None),
+        # the host holds swap cache and the pod has no swapcached line: the figure still stands
+        ("", 2 * 1024 * 1024, 14000),
         # no swap cache anywhere: the figure stands without the counter
         ("", 0, 14000),
     ],
 )
-def test_a_pods_swap_cache_is_not_counted_as_host_ram(
-    tmp_path: Path, pod_stat_extra: str, host_swapcached_kb: int, expected_no_cache_kb: int | None
+def test_a_pods_swap_cache_counts_as_used_on_both_sides(
+    tmp_path: Path, pod_stat_extra: str, host_swapcached_kb: int, expected_no_cache_kb: int
 ) -> None:
     paths = _host(tmp_path)
     Path(paths["meminfo_path"]).write_text(MEMINFO.replace("SwapCached:          0 kB", f"SwapCached: {host_swapcached_kb} kB"))
     for cgroup, file_kb in ((f"sys/fs/cgroup/docker/{FILLER}", 4000), (f"sys/fs/cgroup/system.slice/docker-{POD}.scope", 10000)):
         stat = Path(paths["host_root"]) / cgroup / "memory.stat"
         extra = pod_stat_extra if POD in cgroup else ("swapcached 0\n" if pod_stat_extra else "")
-        if POD in cgroup and pod_stat_extra:
-            file_kb += 2 * 1024 * 1024  # the swap cache is inside the cgroup's file counter
         lines = [l for l in stat.read_text().splitlines() if not l.startswith("file ")]
         stat.write_text("\n".join(lines + [f"file {file_kb * 1024}"]) + "\n" + extra)
 
     facts = NS["get_host_memory"](list_workloads=workloads, read_kmsg=lambda: [], **paths)
     assert facts["hm_outside_workloads_no_cache_kb"] == expected_no_cache_kb
-    if expected_no_cache_kb is None:
-        assert "swap" in facts["hm_errors"]["hm_outside_workloads_no_cache_kb"]
-        assert facts["hm_outside_workloads_kb"] is not None
+    assert "hm_outside_workloads_no_cache_kb" not in facts["hm_errors"]

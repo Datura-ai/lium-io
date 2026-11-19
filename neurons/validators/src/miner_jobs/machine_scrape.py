@@ -901,7 +901,7 @@ def get_host_memory(list_workloads=list_workload_container_ids, host_root=HOST_M
 
     # the workload containers' cgroups: memory.current counts their anon, page cache and shmem
     current = file_ = shmem = file_mapped = 0
-    hugetlb_unaccounted = swapcache_unknown = False
+    hugetlb_unaccounted = False
     unread = []
     for container_id, _started_at in workloads or []:
         try:
@@ -913,11 +913,10 @@ def get_host_memory(list_workloads=list_workload_container_ids, host_root=HOST_M
         # memory.stat has a hugetlb line only with hugetlb accounting on (cgroup v2 memory_hugetlb_accounting), and pages
         # faulted before that remount are in hugetlb.*.current but not in it: trusted only when the two agree
         hugetlb_unaccounted = hugetlb_unaccounted or stat.get("hugetlb") is None or stat["hugetlb"] != hugetlb_pages
-        # the cgroup's file counter holds its swap cache, which the host's Cached leaves out
-        swapcached = stat.get("total_swapcached", stat.get("swapcached"))
-        swapcache_unknown = swapcache_unknown or (swapcached is None and mem.get("SwapCached", 0) > 0)
         # v1's usage counts child cgroups, as its total_* stats do (its plain ones are local); v2's are hierarchical
-        file_ += stat.get("total_cache", stat.get("file", 0)) - (swapcached or 0)
+        # swap cache is in neither the cgroup's file nor the host's Cached (the kernel counts it in the node's file
+        # pages only, the cgroup's in swapcached): both sides leave it in use, nothing to take out
+        file_ += stat.get("total_cache", stat.get("file", 0))
         shmem += stat.get("total_shmem", stat.get("shmem", 0))
         file_mapped += stat.get("total_mapped_file", stat.get("file_mapped", 0))
     if workloads is not None:
@@ -960,9 +959,6 @@ def get_host_memory(list_workloads=list_workload_container_ids, host_root=HOST_M
             for key in outside_keys[:2]:
                 facts[key] = None
                 errors[key] = "a huge page pool is reserved and a workload's hugetlb charge is not accounted"
-        if swapcache_unknown and facts["hm_outside_workloads_no_cache_kb"] is not None:
-            facts["hm_outside_workloads_no_cache_kb"] = None
-            errors["hm_outside_workloads_no_cache_kb"] = "the host holds swap cache and a workload's swapcached is not readable"
 
     try:
         with open(vmstat_path) as vmstat:
