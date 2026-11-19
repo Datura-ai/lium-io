@@ -1754,15 +1754,17 @@ async def test_a_clean_kept_leftover_next_to_the_pod_is_removed_before_parking(s
     result = await _run(svc, payload)
 
     assert isinstance(result, ContainerCreated)
-    removed = ssh.commands.index(f"/usr/bin/docker rm -fv id-{old}")
+    removed = ssh.commands.index(f"nohup /usr/bin/docker rm -fv id-{old} >/dev/null 2>&1 &")
     assert removed < ssh.commands.index(f"/usr/bin/docker rename {_pod_name(payload)} {_kept(payload)}")
     # an already-kept copy is released by docker diff alone, never by the startup-age bound
     assert _layer_data_check(f"id-{old}", "/root", startup_shortcut=False) in ssh.commands
 
 
 @pytest.mark.asyncio
-async def test_a_clean_kept_leftover_docker_will_not_remove_fails_the_edit_before_parking(svc, monkeypatch):
-    # counting it as gone would park another copy under a new name each edit, and they would pile up
+@pytest.mark.parametrize("synchronous_rm_exit", [124, 1], ids=["host-timeout", "refused"])
+async def test_a_clean_kept_leftover_slow_to_remove_never_fails_the_edit(svc, monkeypatch, synchronous_rm_exit):
+    # prod 19 Nov: removing an earlier edit's DinD copy outlasted the command timeout (exit 124) and failed every
+    # reboot; the removal is detached, so the edit parks under a new kept name and goes on
     payload = _edit_payload()
     ssh = _ssh_recording()
     old = f"kept_unmounted_{payload.pod_id}_1700000000"
@@ -1770,18 +1772,19 @@ async def test_a_clean_kept_leftover_docker_will_not_remove_fails_the_edit_befor
     _patch_happy(svc, monkeypatch, ssh)
     side = ssh.run.side_effect
 
-    def _rm_fails(cmd, *args, **kwargs):
+    def _rm_slow(cmd, *args, **kwargs):
         if cmd == f"/usr/bin/docker rm -fv id-{old}":
             ssh.commands.append(cmd)
-            return _ssh_result(exit_status=1, stderr="device or resource busy")
+            return _ssh_result(exit_status=synchronous_rm_exit)
         return side(cmd, *args, **kwargs)
 
-    ssh.run.side_effect = _rm_fails
+    ssh.run.side_effect = _rm_slow
 
     result = await _run(svc, payload)
 
-    assert not isinstance(result, ContainerCreated)
-    assert not any(c.startswith(f"/usr/bin/docker rename {_pod_name(payload)} ") for c in ssh.commands)
+    assert isinstance(result, ContainerCreated)
+    assert f"nohup /usr/bin/docker rm -fv id-{old} >/dev/null 2>&1 &" in ssh.commands
+    assert any(c.startswith(f"/usr/bin/docker rename {_pod_name(payload)} ") for c in ssh.commands)
 
 
 @pytest.mark.parametrize(
