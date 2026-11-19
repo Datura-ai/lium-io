@@ -91,18 +91,29 @@ GPU_HOLDERS_SCRIPT = (
 
 
 def device_holders_command(bus_ids: list[str]) -> str:
-    """The "<pid> <name>" of every process holding one of these GPUs' device files open (host PID view).
+    """A "gpu <bus>" line for each GPU whose holders were read, then "<pid> <name>" of every process holding one of
+    these GPUs' device files open (host PID view), but the scanning shell and its ancestors (the SSH session).
 
     The driver refuses `nvidia-smi -r` while any process has the GPU open: a graphics (Xorg) or monitoring one
-    too, which the compute-app listing never shows. The minor comes from the driver's own per-bus file."""
-    # nvidia-smi spells the domain with 8 digits, /proc/driver/nvidia/gpus/ with 4
-    buses = " ".join(shlex.quote(bus[-12:]) for bus in bus_ids)
+    too, which the compute-app listing never shows. The minor comes from the driver's own per-bus file; a GPU
+    without a "gpu" line was not read (no minor, no find), so its holders are unknown."""
+    buses = " ".join(shlex.quote(_proc_bus(bus)) for bus in bus_ids)
     return (
+        "command -v find >/dev/null || exit 3; "
+        's=" "; p=$$; while [ -n "$p" ] && [ "$p" -gt 1 ]; do '
+        's="$s$p "; p=$(sed -n \'s/^PPid:[[:space:]]*//p\' /proc/$p/status 2>/dev/null); done; '
         f"for b in {buses}; do "
         "m=$(sed -n 's/^Device Minor:[[:space:]]*//p' /proc/driver/nvidia/gpus/$b/information 2>/dev/null); "
-        '[ -n "$m" ] && find /proc/[0-9]*/fd -lname "/dev/nvidia$m" 2>/dev/null; done '
-        "| cut -d/ -f3 | sort -un | while read p; do printf '%s %s\\n' \"$p\" \"$(cat /proc/$p/comm 2>/dev/null)\"; done"
+        '[ -n "$m" ] || continue; echo "gpu $b"; find /proc/[0-9]*/fd -lname "/dev/nvidia$m" 2>/dev/null '
+        "| cut -d/ -f3; done | sort -u | while read k v; do "
+        'if [ "$k" = gpu ]; then echo "gpu $v"; else case "$s" in *" $k "*) ;; '
+        "*) printf '%s %s\\n' \"$k\" \"$(cat /proc/$k/comm 2>/dev/null)\";; esac; fi; done"
     )
+
+
+def _proc_bus(bus_id: str) -> str:
+    """nvidia-smi spells the PCI domain with 8 digits, /proc/driver/nvidia/gpus/ with 4."""
+    return bus_id[-12:]
 
 
 # the host services (system.slice) of the processes still holding a GPU device, but the reset unit itself
@@ -693,29 +704,37 @@ async def _processes_outside(
 
 
 async def _holders_outside(runner: SSHCommandRunner, plan: _Plan, settle_seconds: float) -> list[str]:
-    """"<name> (pid <pid>)" of the processes outside the pod (and the validator's session) holding a target GPU
-    open, in both of two reads settle_seconds apart: a passing nvidia-smi holds it for a moment only."""
-    buses = [plan.bus_by_uuid[uuid] for uuid in plan.targets if plan.bus_by_uuid.get(uuid)]
-    if not buses:
-        return []
-    own_cgroup = await _own_cgroup(runner)
+    """"<name> (pid <pid>)" of the processes outside the pod holding a target GPU open, in both of two reads
+    settle_seconds apart: a passing nvidia-smi holds it for a moment only. Raises when a target GPU's holders
+    could not be read: an unread GPU is not a free one."""
+    buses = {uuid: _proc_bus(plan.bus_by_uuid.get(uuid, "")) for uuid in plan.targets}
     held: dict[int, str] | None = None
     for attempt in range(2):
         if attempt:
             await asyncio.sleep(settle_seconds)
-        listed = await _run(runner, device_holders_command(buses))
+        listed = await _run(runner, device_holders_command([bus for bus in buses.values() if bus]))
+        if listed.exit_code < 0:
+            raise GpuResetRefused(
+                GpuResetErrorCode.ExecutorUnreachable, "the scan of who holds the GPUs on the host got no answer"
+            )
+        read: set[str] = set()
         seen: dict[int, str] = {}
-        for line in (listed.stdout or "").splitlines():
-            pid, _, name = line.strip().partition(" ")
-            if pid.isdigit():
-                seen[int(pid)] = name.strip() or "unknown"
+        for line in (listed.stdout or "").splitlines() if listed.exit_code == 0 else []:
+            key, _, value = line.strip().partition(" ")
+            if key == "gpu":
+                read.add(value.strip())
+            elif key.isdigit():
+                seen[int(key)] = value.strip() or "unknown"
+        unread = [plan.index_by_uuid[uuid] for uuid, bus in buses.items() if not bus or bus not in read]
+        if unread:
+            raise GpuResetRefused(
+                GpuResetErrorCode.ResetNotSupported,
+                f"could not read which host processes hold GPU {', '.join(map(str, sorted(unread)))}. "
+                "The GPUs were not reset and the pod was not stopped",
+            )
         cgroups = await _cgroups(runner, list(seen))
-        outside = {
-            pid: name
-            for pid, name in seen.items()
-            if plan.container_id not in cgroups.get(pid, "")
-            and (own_cgroup is None or cgroups.get(pid, "").strip() != own_cgroup)
-        }
+        # only the pod's own processes are excluded: an unreadable cgroup is not proven to be the pod's
+        outside = {pid: name for pid, name in seen.items() if plan.container_id not in cgroups.get(pid, "")}
         held = outside if held is None else {pid: name for pid, name in outside.items() if pid in held}
         if not held:
             return []
@@ -782,7 +801,12 @@ async def reset_pod_gpus(
     if not plan.owns_host:
         # nothing on the host is stopped for a pod that owns only some GPUs, and the driver refuses the reset while
         # any process outside the pod holds a target GPU open: refuse before the pod is stopped
-        held = await _holders_outside(runner, plan, settle_seconds)
+        try:
+            held = await _holders_outside(runner, plan, settle_seconds)
+        except GpuResetRefused as refused:
+            report.error_code = refused.code
+            report.detail = "; ".join([*notes, refused.detail])
+            return report
         if held:
             report.error_code = GpuResetErrorCode.GpuInUseOutsidePod
             report.detail = "; ".join(
@@ -910,7 +934,8 @@ async def reset_pod_gpus(
                     break
                 except Exception as exc:
                     if attempt:
-                        # the flag reports the last start: an earlier recovery start does not count (review 4447075986)
+                        # the flag reports the last start: an earlier recovery start does not count (review 4447075986).
+                        # Not ok with no error_code is how the backend tells this apart from a refused reset (DAH-6741)
                         report.ok, report.container_restarted = False, False
                         notes.append(f"the container did not start again: {exc}")
     if fabric_manager_problem:

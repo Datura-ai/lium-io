@@ -71,11 +71,13 @@ class FakeHost:
         device_holders=(),
         transient_holders=(),
         reset_output="refused",
+        holder_scan=None,
     ):
         self.commands: list[str] = []
         # (pid, name) holding a target GPU's device file: every read, or the first read only
         self.device_holders, self.transient_holders = list(device_holders), list(transient_holders)
         self.holder_reads = 0
+        self.holder_scan = holder_scan  # the scan's whole answer, when it is not the holders above
         self.reset_output = reset_output
         self.gpus_result = gpus_result
         self.stopped = False
@@ -135,10 +137,13 @@ class FakeHost:
             return make_command_result(True, self.topo)
         if cmd.endswith("< /proc/self/cgroup"):
             return make_command_result(True, f"{self.own_cgroup} ")
-        if cmd.startswith("for b in "):
+        if cmd.startswith("command -v find"):
             self.holder_reads += 1
+            if self.holder_scan is not None:
+                return self.holder_scan
             holders = self.device_holders + (self.transient_holders if self.holder_reads == 1 else [])
-            return make_command_result(True, "".join(f"{pid} {name}\n" for pid, name in holders))
+            read = "".join(f"gpu {bus}\n" for bus in re.search(r"for b in ([^;]*);", cmd).group(1).split())
+            return make_command_result(True, read + "".join(f"{pid} {name}\n" for pid, name in holders))
         if cmd.startswith("for p in "):
             pids = [int(p) for p in cmd.split(";")[0].split()[3:]]
             out = "\n".join(f"{pid} {self.cgroups[pid]} " for pid in pids if pid in self.cgroups)
@@ -1402,10 +1407,91 @@ async def test_a_refused_reset_reports_the_start_of_the_nvidia_smi_text():
     assert "the GPUs were not reset: GPU 00000000:0A:00.0 is currently in use by another process." in report.detail
 
 
-def test_the_device_holder_command_reads_the_drivers_bus_dirs_and_is_valid_sh():
-    # Act
+def _run_holder_scan(tmp_path, holders: dict[int, str], minors: dict[str, int]) -> list[str]:
+    """The holder command run by sh over a fake /proc: holders maps pid -> device it holds open."""
+    root = tmp_path / "proc"
+    for bus, minor in minors.items():
+        (root / "driver/nvidia/gpus" / bus).mkdir(parents=True)
+        (root / "driver/nvidia/gpus" / bus / "information").write_text(f"Model: x\nDevice Minor: \t {minor}\n")
+    for pid, device in holders.items():
+        (root / str(pid) / "fd").mkdir(parents=True)
+        (root / str(pid) / "fd" / "5").symlink_to(device)
+        (root / str(pid) / "comm").write_text(f"proc{pid}\n")
     command = gpu_reset.device_holders_command(["00000000:1b:00.0", "00000000:0a:00.0"])
+    command = command.replace("/proc/driver", f"{root}/driver").replace("/proc/[0-9]*", f"{root}/[0-9]*")
+    command = command.replace("/proc/$k/comm", f"{root}/$k/comm").replace("-f3", f"-f{len(root.parts) + 1}")
+    done = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    return done.stdout.splitlines()
+
+
+def test_the_holder_scan_names_each_read_gpu_and_the_processes_holding_it(tmp_path):
+    # Act: GPU 0a has no minor in the driver's file, so it is not read
+    lines = _run_holder_scan(tmp_path, {41: "/dev/nvidia3", 42: "/dev/nvidia3", 43: "/dev/nvidia1"}, {"0000:1b:00.0": 3})
 
     # Assert
-    assert "for b in 0000:1b:00.0 0000:0a:00.0;" in command
-    assert subprocess.run(["sh", "-n", "-c", command]).returncode == 0
+    assert sorted(lines) == ["41 proc41", "42 proc42", "gpu 0000:1b:00.0"]
+
+
+def test_the_holder_scan_never_names_its_own_session(tmp_path):
+    # Arrange: the scanning shell's parent holds the device (a stand-in for the validator's SSH session)
+    import os
+
+    lines = _run_holder_scan(tmp_path, {os.getpid(): "/dev/nvidia3", 44: "/dev/nvidia3"}, {"0000:1b:00.0": 3})
+
+    # Assert
+    assert sorted(lines) == ["44 proc44", "gpu 0000:1b:00.0"]
+
+
+@pytest.mark.asyncio
+async def test_a_gpu_whose_holders_could_not_be_read_is_refused_before_the_pod_stops():
+    # Arrange: the scan answered for GPU 1b (U[0]) only
+    host = FakeHost(holder_scan=make_command_result(True, f"gpu {BUS[0][-12:].lower()}\n"))
+
+    # Act
+    report, start = await _reset(host)
+
+    # Assert
+    assert not report.ok and report.error_code == GpuResetErrorCode.ResetNotSupported
+    assert "could not read which host processes hold GPU 0" in report.detail and "pod was not stopped" in report.detail
+    _no_change(host, start)
+
+
+@pytest.mark.asyncio
+async def test_a_holder_scan_that_times_out_is_refused_before_the_pod_stops():
+    # Arrange
+    host = FakeHost(holder_scan=make_command_result(False, exit_code=-1, error_type="timeout"))
+
+    # Act
+    report, start = await _reset(host)
+
+    # Assert
+    assert not report.ok and report.error_code == GpuResetErrorCode.ExecutorUnreachable
+    _no_change(host, start)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_holder_scan_is_refused_before_the_pod_stops():
+    # Arrange: no find on the host
+    host = FakeHost(holder_scan=make_command_result(False, exit_code=3))
+
+    # Act
+    report, start = await _reset(host)
+
+    # Assert
+    assert not report.ok and report.error_code == GpuResetErrorCode.ResetNotSupported
+    _no_change(host, start)
+
+
+@pytest.mark.asyncio
+async def test_an_executor_container_process_holding_the_gpu_refuses_the_reset():
+    # Arrange: the executor's own metrics process, in the cgroup the validator's SSH session also runs in
+    session = "0::/system.slice/docker-executor.scope"
+    host = FakeHost(own_cgroup=session, device_holders=[(1700, "python")], cgroups={1700: session})
+
+    # Act
+    report, start = await _reset(host)
+
+    # Assert
+    assert report.error_code == GpuResetErrorCode.GpuInUseOutsidePod and "python (pid 1700)" in report.detail
+    _no_change(host, start)
