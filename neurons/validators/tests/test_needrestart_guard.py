@@ -597,6 +597,11 @@ def test_a_changed_loader_line_is_named_and_a_missing_loader_names_the_file(tmp_
     main.write_text(site_loop + quoted.replace("conf.d/*.conf>", "other/*.conf>"))
     assert _reason(host) == f"/etc/needrestart/needrestart.conf line {opener + shift} differs from the stock conf.d loader"
 
+    # the opener edited and a block with an exact stock opener appended below: that block matches one loader line,
+    # the real loader's glob and the lines after it match more, so the edited opener is named, not the appended block
+    main.write_text(quoted + stock_opener + "\n$nrconf{verbosity} = 0;\n}\n")
+    assert _reason(host) == f"/etc/needrestart/needrestart.conf line {opener} differs from the stock conf.d loader"
+
     # the optional log line deleted: the line now in its place (the eval) is named, after the intact opener and glob
     lines = STOCK_MAIN.splitlines()
     log_line = next(n for n, ln in enumerate(lines, 1) if "print STDERR" in ln and "eval $fn" in ln)

@@ -854,16 +854,19 @@ def get_needrestart_guard(host_root="/proc/1/root"):
         # a recognisable loader that was changed: anchor on its opener, its conf.d glob or its $LOGPREF log line,
         # the only loader lines no other Perl block shares (eval/die are generic idioms a site loader also uses),
         # and name the first line that differs from there on, not only the file
-        # opener and glob first, over the whole file; the log line names no directory, so it anchors only when no
-        # opener or glob does and a line just above it still names conf.d (a copied site.d loop is not this loader)
+        # the anchor whose loader lines match most from its start wins (an exact opener in some other block matches
+        # only itself); ties go to the opener, then the glob. The log line names no directory, so it is a candidate
+        # only when a line just above it still names conf.d (a copied site.d loop is not this loader)
         conf_d_above = lambda i: any("/etc/needrestart/conf.d" in f for f in flat[max(i - 2, 0) : i])  # noqa: E731
-        anchor = next(
-            ((i, j) for j in (0, 1, 2) for i, f in enumerate(flat) if f == loader[j] and (j < 2 or conf_d_above(i))),
-            None,
+        matched = lambda i, j: sum(  # noqa: E731
+            0 <= i - j + k < len(flat) and flat[i - j + k] == loader[k] for k in range(len(loader))
         )
-        if anchor is None:
+        candidates = [
+            (i, j) for j in (0, 1, 2) for i, f in enumerate(flat) if f == loader[j] and (j < 2 or conf_d_above(i))
+        ]
+        if not candidates:
             return unknowable(f"{main_path} has no stock conf.d loader")
-        i, j = anchor
+        i, j = min(candidates, key=lambda c: (-matched(*c), c[1], c[0]))
         start = i - j
         off = next(k for k in range(len(loader)) if not 0 <= start + k < len(flat) or flat[start + k] != loader[k])
         if start + off >= len(flat):
