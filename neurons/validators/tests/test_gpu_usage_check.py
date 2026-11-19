@@ -1949,6 +1949,17 @@ async def test_unlisted_process_in_a_filler_on_its_own_image(context_factory, ca
         ("daturaai/dolphin", "VLLM::EngineCore"),
         ("daturaai/dolphin", "python3 -m sonar.entrypoints serve"),
         ("daturaai/dolphin", "sonar serve model"),
+        # the engine's GPU P2P probe at start runs in children multiprocessing spawned
+        (
+            "daturaai/dolphin",
+            "/root/.venv/bin/python3 -c from multiprocessing.spawn import spawn_main; "
+            "spawn_main(tracker_fd=5, pipe_handle=7) --multiprocessing-fork",
+        ),
+        (
+            "daturaai/dolphin",
+            "python3 -s -E -X faulthandler -c from multiprocessing.spawn import spawn_main; "
+            "spawn_main(tracker_fd=5, pipe_handle=7) --multiprocessing-fork",
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -2239,3 +2250,26 @@ async def test_a_running_image_other_than_the_recorded_one_is_judged_by_the_reco
     assert "FILLER_IMAGE_REPOSITORY_MISMATCH" in caplog.text
     assert result.passed is False
     assert result.event.what_we_saw["filler_foreign_processes"] == [f"{filler} (pid 4242): sonar serve model"]
+
+
+@pytest.mark.parametrize(
+    "repository, cmdline",
+    [
+        # PEARL's miner is no Python program: a multiprocessing child in its filler is not its workload
+        (
+            "daturaai/pearl-miner",
+            "python3 -c from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=5, pipe_handle=7) "
+            "--multiprocessing-fork",
+        ),
+        # inline code that is not a multiprocessing child names no workload
+        ("daturaai/dolphin", "python3 -c import miner; miner.run()"),
+        ("daturaai/dolphin", "python3 -X dev -c from multiprocessing_tools import run"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_inline_python_that_is_not_the_workloads_own_child_is_foreign(context_factory, repository, cmdline):
+    ctx, _ = await _filler_process_ctx(context_factory, cmdline, repository)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False

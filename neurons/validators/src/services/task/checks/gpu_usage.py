@@ -59,6 +59,11 @@ logger = logging.getLogger(__name__)
 # of the executable's basename, or of the script or module an interpreter runs, or the part before "::"
 # of a renamed process title (vLLM's engine child shows as "VLLM::EngineCore"). A repository not
 # listed here is not judged.
+# the name of a child Python's multiprocessing started with `spawn` or `forkserver`: its command line is
+# `python -c "from multiprocessing.spawn import spawn_main; ..." --multiprocessing-fork`, not the program it runs
+MULTIPROCESSING_CHILD = "multiprocessing-child"
+
+
 @dataclass(frozen=True)
 class FillerWorkload:
     strategy: str
@@ -67,10 +72,14 @@ class FillerWorkload:
 
 FILLER_PROCESS_ALLOWLISTS: dict[str, FillerWorkload] = {
     "daturaai/pearl-miner": FillerWorkload("PEARL", ("peakminer",)),
-    # the worker downloads its inference engine at run time; the engine has been vLLM and sonar
-    "daturaai/dolphin": FillerWorkload("DPHN", ("dolphinpod", "sonar", "vllm")),
+    # the worker downloads its inference engine at run time; the engine has been vLLM and sonar, and the engine
+    # starts GPU children through multiprocessing's spawn start method (sonar's P2P probe at engine start)
+    "daturaai/dolphin": FillerWorkload("DPHN", ("dolphinpod", "sonar", "vllm", MULTIPROCESSING_CHILD)),
 }
 _INTERPRETER = re.compile(r"python[0-9.]*")
+# interpreter options that take the next argument as their value (`-W ignore`, `-X faulthandler`)
+_INTERPRETER_OPTIONS_WITH_VALUE = {"-W", "-X", "--check-hash-based-pycs"}
+_MULTIPROCESSING_CHILD_MODULES = ("multiprocessing.spawn", "multiprocessing.forkserver")
 
 
 @dataclass(frozen=True)
@@ -562,11 +571,18 @@ async def _fillers_off_their_image(ctx: Context, names: set[str]) -> list[str]:
 
 def _process_executable_name(cmdline: str) -> str:
     """The name a process runs as: its executable's basename, the script or module an interpreter runs,
-    or the part of a renamed process title before "::"."""
+    MULTIPROCESSING_CHILD for a child multiprocessing started, or the part of a renamed process title before "::"."""
     argv = cmdline.split()
     name = argv[0].rsplit("/", 1)[-1] if argv else ""
     if _INTERPRETER.fullmatch(name):
-        args = [arg for arg in argv[1:] if arg != "-u"]
+        args = argv[1:]
+        # skip the interpreter's own options (multiprocessing passes the parent's, e.g. -s -E -X ...)
+        while args and args[0].startswith("-") and args[0] not in ("-m", "-c"):
+            args = args[2:] if args[0] in _INTERPRETER_OPTIONS_WITH_VALUE else args[1:]
+        if args[:1] == ["-c"]:
+            if args[2:3] and args[1] == "from" and args[2].startswith(_MULTIPROCESSING_CHILD_MODULES):
+                return MULTIPROCESSING_CHILD
+            return "-c"
         if args[:1] == ["-m"]:
             args = args[1:]
         name = args[0].rsplit("/", 1)[-1] if args else name
