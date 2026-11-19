@@ -851,6 +851,10 @@ class Pipeline:
 
     async def run(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
         passed, events, end_ctx = await self._run_checks(ctx)
+        # the published event is the last one after _ended's reorder (a rented GPU dropout moves the fingerprint
+        # failure last), so the findings that only reported go on it here (DAH-6539)
+        if events and end_ctx.reported_only:
+            events[-1].what_we_saw["reported_only"] = list(end_ctx.reported_only)
         # another account's machine answered, or the machine could not be confirmed as the account's (a read that
         # still failed after the reconnect, which a relay can cause): no completion step touches it (DAH-6539)
         if any(event.reason_code in _NOT_THE_ACCOUNTS_MACHINE for event in events):

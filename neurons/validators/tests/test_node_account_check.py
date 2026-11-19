@@ -407,7 +407,7 @@ async def test_a_node_its_owner_set_up_under_another_of_their_accounts_passes(fi
     [
         ("claim-of-their-custodied-account", True, "NODE_ACCOUNT_OK"),
         ("claim-of-a-stranger", False, "NODE_ACCOUNT_MISMATCH"),
-        ("", True, "NODE_ACCOUNT_SKIPPED"),
+        ("", False, "NODE_ACCOUNT_MISMATCH"),  # review: a pool node with its claim deleted proves nothing
     ],
 )
 async def test_a_pool_setup_on_an_own_key_listing_needs_an_owner_claim(claim, passed, reason):
@@ -424,6 +424,21 @@ async def test_a_pool_setup_on_an_own_key_listing_needs_an_owner_claim(claim, pa
     result = await NodeAccountCheck().run(ctx)
 
     assert (result.passed, result.event.reason_code) == (passed, reason)
+
+
+async def test_an_empty_claim_on_a_hotkey_the_listing_already_accepts_keeps_the_legacy_result():
+    """Review: the map only tightens a hotkey it alone accepts; an older executor without a claim on the listing's own
+    pool hotkey stays unverified, as before the map."""
+    executor = ExecutorSSHInfo(
+        uuid="node-1", address="203.0.113.7", port=8001, ssh_username="root", ssh_port=22,
+        python_path="/usr/bin/python3", root_dir="/root", expected_node_hotkeys=[POOL],
+        expected_account_claims=[CLAIM], expected_claims_by_hotkey={POOL: [CLAIM]}, check_enforce_after={},
+    )
+    ctx = make_context(executor=executor, runner=_HostFiles(f"hotkey={POOL}\nclaim=\n"), miner_hotkey=POOL)
+
+    result = await NodeAccountCheck().run(ctx)
+
+    assert (result.passed, result.event.reason_code) == (True, "NODE_ACCOUNT_SKIPPED")
 
 
 async def test_another_owners_setup_is_refused_at_once_without_a_notice():
@@ -497,6 +512,42 @@ async def test_the_last_event_of_any_run_lists_the_findings_that_only_reported(h
     ctx = _relay_ctx(_HostFiles(f"hotkey={POOL}\nclaim={CLAIM}\n"), enforce={})
     _, events, _ = await Pipeline([NodeAccountCheck(), _Ends(halt, fails)], _Sink()).run(ctx)
     assert "reported_only" not in events[-1].what_we_saw
+
+
+class _FingerprintDropout:
+    """A rented node whose GPU set changed: the fingerprint fails without ending the run (the rented-pod checks still
+    run for their reports), and _ended later moves this event last."""
+
+    check_id = "gpu.validate.fingerprint"
+    fatal = False
+
+    async def run(self, ctx):
+        from datetime import UTC, datetime
+
+        from services.task.models import ValidationEvent
+        from services.task.pipeline import CheckResult
+
+        event = ValidationEvent(
+            event="gpu", reason_code="GPU_MISSING", severity="error", impact="x", check_id=self.check_id,
+            when=datetime.now(UTC),
+        )
+        return CheckResult(passed=False, event=event, fatal=False, updates={"gpu_fingerprint_passed": False})
+
+
+async def test_a_rented_gpu_dropout_publishes_the_findings_that_only_reported():
+    """Review: the halt event got the report, then _ended moved the fingerprint failure last; the published (last)
+    event must carry it."""
+    from services.task.pipeline import Pipeline
+
+    class _Sink:
+        async def emit(self, event):
+            pass
+
+    ctx = _relay_ctx(_HostFiles("", success=False), enforce={})
+    passed, events, _ = await Pipeline([NodeAccountCheck(), _FingerprintDropout(), _Ends(True)], _Sink()).run(ctx)
+
+    assert not passed and events[-1].reason_code == "GPU_MISSING"
+    assert events[-1].what_we_saw["reported_only"] == ["NODE_ACCOUNT_UNVERIFIED"]
 
 
 async def test_a_portal_that_sends_no_notice_map_keeps_the_failed_read_enforced(monkeypatch):

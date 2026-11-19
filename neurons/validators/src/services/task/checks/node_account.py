@@ -136,19 +136,14 @@ class NodeAccountCheck:
             )
             return None, False
         by_hotkey = executor.expected_claims_by_hotkey or {}
-        if hotkey in by_hotkey:
-            # a shared (pool) hotkey of the owner's accounts, whatever the listing is grouped under: every pool node
-            # accepts it, so only the claim proves the machine is this owner's
-            if claim and claim not in by_hotkey[hotkey]:
-                what["binding_mismatch"] = "claim"
-                what["node_claim"] = claim
-            elif not claim:
-                logger.info(
-                    _m("NODE_ACCOUNT_BINDING_UNVERIFIED", extra=get_extra_info({**what, "unread": "claim"}))
-                )
-                return None, False
-            else:
+        # an empty claim on a hotkey the listing already accepts keeps the legacy path below (an older executor)
+        if hotkey in by_hotkey and (claim or hotkey not in executor.expected_node_hotkeys):
+            # a shared (pool) hotkey of the owner's accounts that only this map accepts: every pool node can write
+            # it, so only a matching claim proves the machine is this owner's; a missing claim proves nothing
+            if claim in by_hotkey[hotkey]:
                 return None, True
+            what["binding_mismatch"] = "claim"
+            what["node_claim"] = claim
         elif hotkey not in executor.expected_node_hotkeys:
             what["binding_mismatch"] = "hotkey"
         elif claims and hotkey == ctx.miner_hotkey and claim and claim not in claims:
