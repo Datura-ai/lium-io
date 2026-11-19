@@ -69,16 +69,22 @@ jobs:
                           # at run time is never scanned (the runner resolves ./ from the repository root)
                           d = str(ref)[2:]  # the literal path the runner opens: nothing after it is a ref
                           # a job's ./x.yml is a reusable workflow (scanned with the workflows); a step's ./dir is always an
-                          # action directory, so a step path naming a workflow file still needs a manifest inside it
-                          want = [d] if level == "job" else [posixpath.join(d, n) for n in ("action.yml", "action.yaml")]
+                          # action directory, so a step path naming a workflow file still needs a manifest inside it. Only
+                          # action.yml: the runner prefers it over action.yaml, so one generated beside a tracked action.yaml
+                          # would run unscanned
+                          want = [d] if level == "job" else [posixpath.join(d, "action.yml")]
                           if not {posixpath.normpath(w) for w in want} & tracked:
                               bad.append(f"{path}: {ref} is not a tracked workflow or action manifest")
                       elif not pinned.fullmatch(norm(ref)):
                           bad.append(f"{path}: {ref}")
-                  # a Docker action's image: a registry image needs a digest; a local Dockerfile path is reviewed in-repo
+                  # a Docker action's image: a registry image needs a digest; any other value must be a tracked Dockerfile
+                  # beside the manifest (the runner hands a bare value that is not a file to Docker as an image name)
                   image = runs.get("image")
-                  if image is not None and norm(image).startswith("docker://") and not re.fullmatch(digest, norm(image)):
-                      bad.append(f"{path}: runs.image {image}")
+                  if image is not None:
+                      local = posixpath.normpath(posixpath.join(posixpath.dirname(str(path)), str(image)))
+                      ok = re.fullmatch(digest, norm(image)) if norm(image).startswith("docker://") else local in tracked
+                      if not ok:
+                          bad.append(f"{path}: runs.image {image}")
                   # job containers and services start before the steps, with the job's token: digest only
                   for job in jobs:
                       container = job.get("container")
@@ -97,10 +103,19 @@ jobs:
               "jobs:\n  yes:\n    steps:\n      - uses: acme/act@" + sha + "\n  on:\n    steps:\n      - uses: acme/act@" + sha + "\n": 0,
               "jobs:\n  a:\n    steps:\n      - uses: ./gen/act\n      - uses: ./.github/actions/ok/\n      - uses: ./.github/actions/ok@main\n      - uses: ./.github/workflows/ok.yml\n  b:\n    uses: ./.github/workflows/ok.yml\n  c:\n    uses: ./.github/workflows/gen.yml\n": 4,
           }
+          img = "runs:\n  using: docker\n  image: "
+          cases.update({
+              "jobs:\n  a:\n    steps:\n      - uses: ./.github/actions/yaml\n": 1,  # only action.yaml tracked
+              img + "alpine:3\n": 1,
+              img + "docker://alpine:3\n": 1,
+              img + "docker://alpine@sha256:" + "0" * 64 + "\n": 0,
+              img + "Dockerfile\n": 0,
+              img + "Missing.Dockerfile\n": 1,
+          })
           with tempfile.TemporaryDirectory() as d:
               for i, (text, want) in enumerate(cases.items()):
                   f = pathlib.Path(d, f"case{i}.yml"); f.write_text(text)
-                  known = {".github/actions/ok/action.yml", ".github/workflows/ok.yml"}
+                  known = {".github/actions/ok/action.yml", ".github/workflows/ok.yml", ".github/actions/yaml/action.yaml", f"{d}/Dockerfile"}
                   assert len(scan([f], known)) == want, (i, scan([f], known))
 
           # every tracked action manifest, wherever it lives: `uses: ./any/dir` runs that dir's action.yml
