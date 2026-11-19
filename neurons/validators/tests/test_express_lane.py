@@ -608,44 +608,79 @@ async def test_a_cycle_the_chain_gives_no_block_time_does_not_run_and_the_block_
     assert validator.last_job_run_blocks == before
 
 
-@pytest.mark.asyncio
-async def test_a_job_block_whose_attempt_failed_at_the_boundary_runs_next_and_the_next_block_keeps_its_turn(
-    validator_with_mocks, create_neuron_info
-):
-    """Review on 679caa6: the last tick that chose job block B failed to read B's time; the next tick's height falls in
-    B + interval and chose that block instead, so B never got its wave or settlement. The failed block is kept and runs
-    next, and the block after it is still due on its own schedule."""
-    from core.config import settings
-
-    n = settings.BLOCKS_FOR_JOB
-    validator = validator_with_mocks
-    validator.subtensor_client.get_miners = AsyncMock(return_value=[create_neuron_info(1, "miner-a")])
+async def _run_ticks(validator, heights, readable):
+    """Run sync() at each height; the chain answers a block's time only when readable(block). Returns the blocks read
+    and the cycle ids miners were asked under."""
 
     async def no_results(payload, **_):
         return {"miner_hotkey": payload.miner_hotkey, "miner_coldkey": "c", "results": []}
 
     validator.miner_service.request_job_to_miner = AsyncMock(side_effect=no_results)
-    block = 100 * n
-    validator.last_job_run_blocks = block - 2
-    times = {block: "2026-11-19 18:52:38", block + n: "2026-11-19 19:07:38"}
     read = []
-    for height, answer in ((block + n - 2, None), (block + n, "chain"), (block + 2 * n - 1, "chain")):
+
+    async def chain_time(b):
+        read.append(b)
+        return f"time-of-{b}" if readable(b, len(read)) else None
+
+    validator.subtensor_client.get_time_from_block = AsyncMock(side_effect=chain_time)
+    for height in heights:
         validator.subtensor_client.get_current_block = Mock(return_value=height)
-
-        async def chain_time(b, answer=answer):
-            read.append(b)
-            return None if answer is None else times[b]
-
-        validator.subtensor_client.get_time_from_block = AsyncMock(side_effect=chain_time)
         with (
             patch("core.validator.fetch_default_image_digests", new=AsyncMock(return_value={})),
             patch("core.validator.fetch_executor_image_digest", new=AsyncMock(return_value=None)),
         ):
             await validator.sync()
-
     asked = [c.kwargs["payload"].job_batch_id for c in validator.miner_service.request_job_to_miner.await_args_list]
+    return read, asked
+
+
+@pytest.mark.asyncio
+async def test_a_job_block_whose_attempt_failed_at_the_boundary_runs_next_and_the_next_block_keeps_its_turn(
+    validator_with_mocks, create_neuron_info
+):
+    """Reviews on 679caa6 and 1cab03c: the tick that chose job block B failed to read B's time and the next tick's
+    height fell in B + interval, so B never got its wave. B is kept and runs next, and counts as run at the height that
+    first chose it, so the next block starts at the same tick as on the healthy schedule (not one block later, where a
+    tick that skips that height loses it)."""
+    from core.config import settings
+
+    n = settings.BLOCKS_FOR_JOB
+    validator = validator_with_mocks
+    validator.subtensor_client.get_miners = AsyncMock(return_value=[create_neuron_info(1, "miner-a")])
+    block = 100 * n
+    validator.last_job_run_blocks = block - 2
+
+    read, asked = await _run_ticks(
+        validator, (block + n - 2, block + n, block + 2 * n - 2, block + 2 * n), lambda b, attempt: attempt != 1
+    )
+
     assert read == [block, block, block + n]
-    assert asked == [times[block], times[block + n]]
+    assert asked == [f"time-of-{block}", f"time-of-{block + n}"]
+
+
+@pytest.mark.asyncio
+async def test_a_job_block_the_chain_can_no_longer_read_does_not_hold_back_the_cycles_after_it(
+    validator_with_mocks, create_neuron_info
+):
+    """Review on 1cab03c: a peer that pruned an old block's state never answers its time, and keeping that block
+    pending stopped every later cycle. A failed block keeps its turn for one interval from the height that chose it;
+    then the next block is chosen as on the healthy schedule."""
+    from core.config import settings
+
+    n = settings.BLOCKS_FOR_JOB
+    validator = validator_with_mocks
+    validator.subtensor_client.get_miners = AsyncMock(return_value=[create_neuron_info(1, "miner-a")])
+    block = 100 * n
+    validator.last_job_run_blocks = block - 2
+
+    read, asked = await _run_ticks(
+        validator,
+        (block + n - 2, block + n, block + 2 * n - 2, block + 2 * n, block + 3 * n - 2),
+        lambda b, attempt: b != block,
+    )
+
+    assert read == [block, block, block + n, block + 2 * n]
+    assert asked == [f"time-of-{block + n}", f"time-of-{block + 2 * n}"]
 
 
 @pytest.mark.asyncio
