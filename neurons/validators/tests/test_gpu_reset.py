@@ -1375,7 +1375,7 @@ async def test_a_holder_whose_cgroup_cannot_be_read_is_not_called_outside_the_po
 
     assert report.error_code == GpuResetErrorCode.GpuInUseOutsidePod and "Xorg (pid 1500)" in report.detail
     assert "could not place in the pod" in report.detail
-    assert "if that process is yours, stop it and retry" in report.detail
+    assert "only if you can tell it is yours from inside the pod" in report.detail and "host PID" in report.detail
     assert "process outside the pod" not in report.detail and not report.stop_sent
     _no_change(host, start)
 
@@ -1387,7 +1387,8 @@ async def test_a_compute_app_whose_cgroup_cannot_be_read_is_not_called_outside_t
     report, start = await _reset(host)
 
     assert report.error_code == GpuResetErrorCode.GpuInUseOutsidePod
-    assert "could not place in the pod" in report.detail and "stop them and retry" in report.detail
+    assert "could not place in the pod" in report.detail
+    assert "stop them only if you can tell they are yours" in report.detail
     _no_change(host, start)
 
 
