@@ -554,26 +554,48 @@ def test_a_compressed_reply_is_refused_unexpanded(monkeypatch):
     assert seen == ["identity"]
 
 
-def test_refreshes_write_the_volume_off_the_event_loop(tmp_path, monkeypatch, owner, new_validator):
+def test_a_hung_volume_write_holds_up_neither_the_refreshes_nor_the_newest_state(
+    tmp_path, monkeypatch, owner, new_validator
+):
     import threading
 
     new_owner = Keypair.create_from_uri("//LiumTrustNewOwner")
     trust = _trust(tmp_path, owner)
-    assert trust.offer(_signed(owner, new_validator, 3))  # a held message: the owner change re-selects and writes it
-    real_write = trust_service._write_json
-    writers = []
-
-    def write(path, data):
-        writers.append(threading.current_thread() is threading.main_thread())
-        real_write(path, data)
-
-    monkeypatch.setattr(trust_service, "_write_json", write)
+    assert trust.offer(_signed(owner, new_validator, 3))
+    monkeypatch.setattr(trust_service, "validator_trust", trust)
+    monkeypatch.setattr(trust_service, "MESSAGE_REFRESH_SECONDS", 0.01)
+    monkeypatch.setattr(trust_service, "OWNER_REFRESH_SECONDS", 0)
     monkeypatch.setattr(trust_service.settings, "COMPUTE_REST_API_URL", "http://backend")
-    _chain(monkeypatch, lambda url: new_owner.ss58_address)
+    owner_reads = []
+    _chain(monkeypatch, lambda url: owner_reads.append(url) or new_owner.ss58_address)
     answer = MagicMock(status_code=200)
     answer.json.return_value = _signed(new_owner, new_validator, 1)._asdict()
     _backend(monkeypatch, lambda url: answer)
-    asyncio.run(trust.refresh_owner())  # owner change written
-    asyncio.run(trust.refresh_message())  # new message written
-    assert (trust.held_owner, trust.held.revision) == (new_owner.ss58_address, 1)
-    assert len(writers) >= 3 and not any(writers)
+    real_write, release, written = trust_service._write_json, threading.Event(), []
+
+    def hung_write(path, data):
+        assert threading.current_thread() is not threading.main_thread()
+        release.wait(10)  # the volume stalls until the test lets it go
+        real_write(path, data)
+        written.append(data["held"])
+
+    monkeypatch.setattr(trust_service, "_write_json", hung_write)
+
+    async def run():
+        loop = asyncio.create_task(trust_service.run_validator_trust_refresh())
+        await asyncio.sleep(0.3)
+        reads_while_hung, held_while_hung = len(owner_reads), trust.held_owner
+        release.set()
+        await asyncio.sleep(0.3)
+        loop.cancel()
+        return reads_while_hung, held_while_hung
+
+    reads_while_hung, held_while_hung = asyncio.run(run())
+
+    # the owner changed and the new owner's message was taken while the first write still hung, and the chain
+    # kept being read
+    assert held_while_hung == new_owner.ss58_address
+    assert reads_while_hung >= 4 * len(trust_service.PUBLIC_CHAIN_NODES)
+    # the stalled write of the older state landed first; the newest state was written after it, never before
+    assert written[-1] == new_owner.ss58_address
+    assert _state(tmp_path)["held"] == new_owner.ss58_address

@@ -115,6 +115,8 @@ class ValidatorTrust:
         self.messages: dict[str, tuple[TrustedValidator, SignedTrustMessage]] = {}
         # the volume refused the state (full, read-only): written again on every refresh until it lands
         self._unsaved = False
+        # set by start_persisting: changes are written by its task, off the event loop, never by the caller
+        self._wake: asyncio.Event | None = None
 
     def load(self) -> None:
         """At start: the kept state (owner, held owner, messages) and the image copy, signed by the owner at release."""
@@ -186,20 +188,51 @@ class ValidatorTrust:
         self._hold(self.owner)
         return True
 
-    def _save(self) -> None:
-        """One atomic file for the owner, the held owner and the messages: a restart never reads them apart."""
-        state = {
+    def _state(self) -> dict:
+        """One document for the owner, the held owner and the messages: a restart never reads them apart."""
+        return {
             "owner": self.owner,
             "held": self.held_owner,
             "messages": {signer: signed._asdict() for signer, (_, signed) in self.messages.items()},
         }
+
+    def _save(self) -> None:
+        """Keep the state on the volume: through the writer once start_persisting ran (the caller never waits on the
+        volume), else written now (at start)."""
+        self._unsaved = True
+        if self._wake is not None:
+            self._wake.set()
+            return
         try:
-            _write_json(self.state_dir / STATE_FILE, state)
+            _write_json(self.state_dir / STATE_FILE, self._state())
             self._unsaved = False
         except OSError as exc:
             # trusted for this run; written again on the next refresh, so a recreate does not lose it
-            self._unsaved = True
             logger.warning("Validator trust: state not kept on disk yet: %s", exc)
+
+    def start_persisting(self) -> asyncio.Task:
+        """From now on the state file has one writer, a task beside the refreshes. Each write takes the newest state
+        and runs in a worker thread, one at a time: a change made during a write is written after it, so an older
+        state never replaces a newer one, and a slow or hung volume holds up only the file, never the refreshes. A
+        failed write is retried at the next refresh."""
+        self._wake = asyncio.Event()
+        if self._unsaved:
+            self._wake.set()
+        return asyncio.create_task(self._persist())
+
+    async def _persist(self) -> None:
+        try:
+            while True:
+                await self._wake.wait()
+                self._wake.clear()
+                state, self._unsaved = self._state(), False
+                try:
+                    await asyncio.to_thread(_write_json, self.state_dir / STATE_FILE, state)
+                except OSError as exc:
+                    self._unsaved = True
+                    logger.warning("Validator trust: state not kept on disk yet: %s", exc)
+        finally:
+            self._wake = None
 
     def hotkeys(self, baked: dict[str, str]) -> dict[str, str]:
         """Key id -> ss58 the executor accepts signatures from: the signed validator alone, else `baked`."""
@@ -213,11 +246,11 @@ class ValidatorTrust:
         }
 
     async def refresh_message(self) -> None:
-        """A 404 or any failure keeps the message held. Volume writes run off the event loop."""
+        """A 404 or any failure keeps the message held."""
         if not self.enabled:
             return
         if self._unsaved:
-            await asyncio.to_thread(self._save)
+            self._save()
         if not self.owner_confirmed or not settings.COMPUTE_REST_API_URL:
             return
         url = settings.COMPUTE_REST_API_URL.rstrip("/") + "/watchtower/validator-message"
@@ -226,7 +259,7 @@ class ValidatorTrust:
             if data is None:
                 return
             signed = SignedTrustMessage(message=str(data["message"]), signature=str(data["signature"]))
-            await asyncio.to_thread(self.offer, signed)
+            self.offer(signed)
         except Exception as exc:
             logger.warning("Validator trust: message not refreshed from %s: %s: %s", url, type(exc).__name__, exc)
 
@@ -250,14 +283,10 @@ class ValidatorTrust:
         (owner,) = answers
         self.owner_confirmed = True
         if owner != self.owner:
-            # the change selects and writes the state file: all of it off the event loop
-            await asyncio.to_thread(self._take_owner, owner)
-
-    def _take_owner(self, owner: str) -> None:
-        logger.warning("Validator trust: subnet owner changed from %s to %s", self.owner, owner)
-        self.owner = owner
-        self._select()
-        self._save()
+            logger.warning("Validator trust: subnet owner changed from %s to %s", self.owner, owner)
+            self.owner = owner
+            self._select()
+            self._save()
 
 
 validator_trust = ValidatorTrust(enabled=importlib.util.find_spec("core.config_override") is None)
@@ -268,11 +297,16 @@ async def run_validator_trust_refresh() -> None:
     then about hourly with random jitter."""
     if not validator_trust.enabled:
         return
+    # the state file is written beside the loop, so a slow volume never holds up a refresh
+    writer = validator_trust.start_persisting()
     owner_due = asyncio.get_running_loop().time()
-    while True:
-        if asyncio.get_running_loop().time() >= owner_due:
-            await validator_trust.refresh_owner()
-            if validator_trust.owner_confirmed:
-                owner_due = asyncio.get_running_loop().time() + random.uniform(0.5, 1.5) * OWNER_REFRESH_SECONDS
-        await validator_trust.refresh_message()
-        await asyncio.sleep(MESSAGE_REFRESH_SECONDS)
+    try:
+        while True:
+            if asyncio.get_running_loop().time() >= owner_due:
+                await validator_trust.refresh_owner()
+                if validator_trust.owner_confirmed:
+                    owner_due = asyncio.get_running_loop().time() + random.uniform(0.5, 1.5) * OWNER_REFRESH_SECONDS
+            await validator_trust.refresh_message()
+            await asyncio.sleep(MESSAGE_REFRESH_SECONDS)
+    finally:
+        writer.cancel()
