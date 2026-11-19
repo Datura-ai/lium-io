@@ -70,6 +70,8 @@ VERIFYX_LAST_EMA_TTL_SECONDS = 30 * 24 * 3600
 # filler container name -> JSON list of the image digests (bare sha256) the validator started it from
 FILLER_IMAGE_DIGESTS_PREFIX = "filler_image_digests:"
 FILLER_IMAGE_DIGESTS_TTL_SECONDS = 30 * 24 * 3600
+# filler container name -> the image repository the validator was asked to start it from (same TTL)
+FILLER_IMAGE_REPOSITORY_PREFIX = "filler_image_repository:"
 # A pod edit parks the pod's container under another name; the exact name this validator parked is
 # recorded per executor (key + parked name) so the GPU checks never take a self-named parked
 # container as ours. The edit's end shortens it to one GPU check's span; the TTL only backstops a

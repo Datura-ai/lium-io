@@ -110,6 +110,7 @@ from services.container_cleanup import (
     REMOVE_CACHE_SWEEP_CONTAINER,
     evict_cache_volumes_oldest_first,
     idle_filler_images_size_command,
+    image_repository,
 )
 from services.cvm_quote_broker import ensure_quote_broker, quote_socket_pod_mount
 from services.node_host import node_owner, public_host_sock
@@ -176,6 +177,7 @@ from services.redis_service import (
     EDIT_PARKED_CONTAINER_TTL_SECONDS,
     FILLER_IMAGE_DIGESTS_PREFIX,
     FILLER_IMAGE_DIGESTS_TTL_SECONDS,
+    FILLER_IMAGE_REPOSITORY_PREFIX,
     IN_CONTAINER_SSH_BOOTSTRAP_PATH,
     RECENT_FILLER_PREFIX,
     RECENT_FILLER_TTL_SECONDS,
@@ -6351,9 +6353,25 @@ class DockerService:
         container: str,
         container_name: str,
         default_extra: dict,
+        docker_image: str = "",
     ) -> None:
         """Remember the image digests a filler was started from, so the GPU usage check can tell it
-        from another container later run under the same name. Never fails the create."""
+        from another container later run under the same name, and the image repository it was asked
+        to run, which names the filler's workload for the GPU process allowlist. Never fails the create."""
+        if docker_image:
+            try:
+                await self.redis_service.set(
+                    f"{FILLER_IMAGE_REPOSITORY_PREFIX}{container_name}",
+                    image_repository(docker_image),
+                    ex=FILLER_IMAGE_DIGESTS_TTL_SECONDS,
+                )
+            except Exception as exc:
+                logger.warning(
+                    _m(
+                        "Could not record the filler's image repository; its processes are not judged",
+                        extra=get_extra_info({**default_extra, "error": str(exc)}),
+                    )
+                )
         try:
             # the container's own image, not the tag: the tag can move during the bootstrap
             image_id = await docker_client.container_image_id(container=container)
@@ -11999,7 +12017,11 @@ class DockerService:
                     )
                     if payload.workload_kind == WorkloadKind.FILLER:
                         await self._record_filler_image_best_effort(
-                            docker_client, container_id or container_name, container_name, default_extra
+                            docker_client,
+                            container_id or container_name,
+                            container_name,
+                            default_extra,
+                            payload.docker_image,
                         )
                         await self._remember_new_filler_best_effort(executor_info.uuid, container_name, container_id)
                     # no duration: the collector starts after the reply, its time is logged there
