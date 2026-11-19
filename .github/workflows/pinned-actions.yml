@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # system python3 is 3.12, the only CPython the hash-pinned PyYAML wheel below fits
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # every workflow and action this run can execute pins third-party code to a commit and images to a digest, never to a
