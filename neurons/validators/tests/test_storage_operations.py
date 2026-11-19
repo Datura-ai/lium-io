@@ -9,7 +9,7 @@ from uuid import UUID
 
 import pytest
 
-from services import storage_operations
+from services import executor_payload, storage_operations
 
 OPERATION_ID = UUID("11111111-1111-4111-8111-111111111111")
 
@@ -50,17 +50,6 @@ async def test_cancel_fallback_removes_the_helper_container(
     assert docker_log.read_text().splitlines() == [f"stop --time 5 {helper}", f"rm -f -- {helper}"]
     if runner_pid:
         assert subprocess.run(["kill", "-0", str(runner_pid)], capture_output=True).returncode != 0
-
-
-@pytest.mark.parametrize("field", ["bootstrap", "exclude_patterns"])
-def test_workspace_field_probe_finds_the_field_in_this_repo_s_executor_models(field: str) -> None:
-    # The probe imports the executor's own storage.models; run it against this checkout's copy
-    # so a renamed field or a wrong sys.path root fails here, not on every encrypted create.
-    executor_src = Path(__file__).resolve().parents[2] / "executor" / "src"
-    probe = storage_operations._WORKSPACE_FIELD_PROBE.replace("/root/app/src", str(executor_src))
-
-    assert subprocess.run([sys.executable, "-c", probe, field], check=False).returncode == 0
-    assert subprocess.run([sys.executable, "-c", probe, "no_such_field"], check=False).returncode == 3
 
 
 @pytest.mark.asyncio
@@ -132,15 +121,19 @@ def test_detached_wrapper_keeps_the_log_only_when_the_runner_fails(
 
     monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", storage_operations.PurePosixPath(str(tmp_path)))
     monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
-    runner = tmp_path / "runner"
-    runner.write_text(f"#!/bin/sh\necho working\nexit {exit_code}\n")
-    runner.chmod(0o755)
-    monkeypatch.setattr(storage_operations, "REMOTE_RUNNER_PATH", str(runner))
-    launched: list[str] = []
+    # the validator's runner, staged from its payloads: a stand-in that logs and exits
+    payloads = tmp_path / "payloads"
+    payloads.mkdir()
+    (payloads / "storage_runner.py").write_text(f"print('working', flush=True)\nraise SystemExit({exit_code})\n")
+    monkeypatch.setattr(executor_payload, "PAYLOAD_DIR", payloads)
+    monkeypatch.setattr(executor_payload, "STORAGE", ("storage_runner.py",))
+    monkeypatch.setattr(executor_payload, "SERVICE_DIR_PARENT", str(tmp_path / "service"))
+    (tmp_path / "service").mkdir()
+    launched: list[tuple[str, str]] = []
 
-    async def run(command: str, check: bool = False) -> SimpleNamespace:
-        if command.startswith("nohup"):
-            launched.append(command)
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        if "nohup" in command:
+            launched.append((command, input))
             return SimpleNamespace(exit_status=0, stdout="", stderr="")
         done = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
         return SimpleNamespace(exit_status=done.returncode, stdout=done.stdout, stderr=done.stderr)
@@ -171,10 +164,14 @@ def test_detached_wrapper_keeps_the_log_only_when_the_runner_fails(
     ssh_client = SimpleNamespace(run=run, start_sftp_client=lambda: Sftp())
     files = aio.run(
         storage_operations.start_storage_operation(
-            ssh_client, "sh", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+            ssh_client, sys.executable, OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
         )
     )
-    subprocess.run(["sh", "-c", launched[0].removeprefix("nohup ").rsplit(" &", 1)[0]], check=True)
+    command, staged = launched[0]
+    assert "storage_runner.py" in command and storage_operations.REMOTE_RUNNER_PATH not in command
+    # the launch in the foreground: the wrapper's own end (its cleanup) is then over when this returns
+    subprocess.run(["sh", "-c", command.replace("nohup ", "").rsplit(" &", 1)[0]], input=staged, text=True, check=True)
+    assert not list((tmp_path / "service").iterdir())  # the staged runner goes when it has exited
     log = Path(str(files.log))
     assert not Path(str(files.status)).exists()
     if exit_code:

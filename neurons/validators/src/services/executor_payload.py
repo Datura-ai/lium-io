@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import secrets
 import shlex
+import tarfile
 from pathlib import Path
 
 EXECUTOR_PYTHON = "/root/app/.venv/bin/python"
@@ -27,6 +29,8 @@ GPU_MONITOR = ("gpus_utility.py", "services/pull_lock.py")
 INSPECTOR = ("inspector_executor.py",)
 VERIFYX = ("verifyx_executor.py",)
 MATRIX = ("decrypt_challenge.py",)
+# the storage runner and the package it imports, too large for one command line: sent as an archive on stdin (unpack)
+STORAGE = ("storage_runner.py",) + tuple(sorted(f"storage/{p.name}" for p in (PAYLOAD_DIR / "storage").glob("*.py")))
 
 # the executor runs with pid: host, so a bare pkill/pgrep also sees other containers' and the host's processes;
 # this selector keeps them to the shell's mount namespace, the executor's own
@@ -62,6 +66,27 @@ def install(
             steps.append(f'mkdir -p "$d"/{shlex.quote(str(Path(name).parent))}')
         data = base64.b64encode((PAYLOAD_DIR / name).read_bytes()).decode()
         steps.append(f'printf %s {data} | base64 -d > "$d"/{shlex.quote(name)}')
+    return "{ " + " && ".join(steps) + "; } || exit 1"
+
+
+def archive(files: tuple[str, ...]) -> bytes:
+    """`files` as the stdin of an `unpack` command: a gzipped tar, base64-encoded."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        for name in files:
+            data = (PAYLOAD_DIR / name).read_bytes()
+            entry = tarfile.TarInfo(name)
+            entry.size, entry.mode = len(data), 0o600
+            tar.addfile(entry, io.BytesIO(data))
+    return base64.b64encode(buffer.getvalue())
+
+
+def unpack(purpose: str, cleanup: bool = False) -> str:
+    """As `install`, but the files come from stdin, an `archive` of them."""
+    steps = [f"d=$(mktemp -d {shlex.quote(service_dir_glob(purpose) + 'XXXXXXXX')})"]
+    if cleanup:
+        steps += ["trap 'rm -rf \"$d\"' EXIT", "trap 'exit 1' HUP INT TERM"]
+    steps.append('base64 -d | tar -xzf - -C "$d"')
     return "{ " + " && ".join(steps) + "; } || exit 1"
 
 

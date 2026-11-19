@@ -11,6 +11,7 @@ import os
 import signal
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -189,9 +190,10 @@ async def test_the_monitor_check_stops_and_counts_only_processes_in_the_executor
     # nor taken for the validator's monitor (a second mount namespace needs root, so the commands are checked)
     runner = LocalRunner(node.tmp)
     assert (await StartGPUMonitorCheck().run(_ctx(node, runner))).passed
-    process_commands = [c for c in runner.commands if any(w in c.split() for w in ("pkill", "pgrep", "ps"))]
-    assert len(process_commands) == 2
-    assert all('--ns "$$" --nslist mnt' in c for c in process_commands), process_commands
+    stops = [part for c in runner.commands for part in c.split("pkill ")[1:]]
+    assert len(stops) == 2  # the legacy monitor and an earlier one of ours
+    assert all(part.startswith(executor_payload.SAME_MOUNT_NS) for part in stops), stops
+    assert not any(w in c.split() for c in runner.commands for w in ("pgrep", "ps"))
 
 
 @pytest.mark.parametrize("change", ["an earlier build", "a record naming another process"])
@@ -199,7 +201,7 @@ async def test_a_monitor_is_reused_only_when_it_is_the_current_one_the_validator
     runner = LocalRunner(node.tmp)
     assert (await StartGPUMonitorCheck().run(_ctx(node, runner))).event.reason_code == "MONITOR_STARTED"
     assert await _until(node.tmp / "VALIDATOR_MONITOR")
-    (monitor_dir,) = (node.tmp / "service").iterdir()
+    (monitor_dir,) = [p for p in (node.tmp / "service").iterdir() if p.is_dir()]
     first = int((monitor_dir / ".run").read_text().split()[0])
     if change == "an earlier build":
         (executor_payload.PAYLOAD_DIR / "gpus_utility.py").write_text(_marker_script(node.tmp / "NEW_BUILD", sleep=True))
@@ -214,8 +216,48 @@ async def test_a_monitor_is_reused_only_when_it_is_the_current_one_the_validator
         await asyncio.sleep(0.05)
     else:
         raise AssertionError("the earlier monitor still runs")
-    (current,) = (node.tmp / "service").iterdir()
+    (current,) = [p for p in (node.tmp / "service").iterdir() if p.is_dir()]
     assert current != monitor_dir
+
+
+async def test_two_overlapping_checks_start_one_monitor(node):
+    class Recorder(LocalRunner):
+        async def run(self, cmd, **_):
+            self.commands.append(cmd)
+            return SSHCommandResult(
+                command=cmd, command_id="c", exit_code=1, stdout="", stderr="", duration_ms=1,
+                started_at=datetime.now(UTC), finished_at=datetime.now(UTC), success=False,
+            )
+
+    recorder = Recorder(node.tmp)
+    await StartGPUMonitorCheck().run(_ctx(node, recorder))
+    (command,) = recorder.commands
+    both = [subprocess.Popen(["sh", "-c", command], cwd=node.tmp, stdout=subprocess.PIPE, text=True) for _ in "ab"]
+    outcomes = sorted(p.communicate(timeout=60)[0].split()[0] for p in both)
+    assert outcomes == ["RUNNING", "STARTED"]
+    assert await _until(node.tmp / "VALIDATOR_MONITOR")
+    assert len([p for p in (node.tmp / "service").iterdir() if p.is_dir()]) == 1
+
+
+async def test_a_monitor_that_does_not_stay_up_is_not_reported_started(node):
+    (executor_payload.PAYLOAD_DIR / "gpus_utility.py").write_text("import sys; sys.exit(1)\n")
+    result = await StartGPUMonitorCheck().run(_ctx(node, LocalRunner(node.tmp)))
+    assert not result.passed and result.event.reason_code == "MONITOR_START_FAILED"
+
+
+async def test_a_failed_or_timed_out_check_is_not_taken_for_no_monitor(node):
+    class TimedOut(LocalRunner):
+        # the look for a running monitor times out; a command that only starts one would succeed
+        async def run(self, cmd, **kwargs):
+            if "nohup" in cmd and "sha256sum" not in cmd:
+                return await super().run(cmd, **kwargs)
+            return SSHCommandResult(
+                command=cmd, command_id="c", exit_code=-1, stdout="", stderr="timeout", duration_ms=1,
+                started_at=datetime.now(UTC), finished_at=datetime.now(UTC), success=False,
+            )
+
+    result = await StartGPUMonitorCheck().run(_ctx(node, TimedOut(node.tmp)))
+    assert not result.passed and result.event.reason_code == "MONITOR_START_FAILED"
 
 
 def test_every_payload_is_found():

@@ -14,12 +14,16 @@ from uuid import UUID, uuid4
 import aiohttp
 import asyncssh
 
+from services import executor_payload
+
 if TYPE_CHECKING:
     from services.redis_service import RedisService
 
 logger = logging.getLogger(__name__)
 
 REMOTE_OPERATION_DIRECTORY = PurePosixPath("/root/app/storage-operations")
+# the executor image's own runner: its presence marks an image that supports storage operations. It is never run; the
+# validator runs its own copy (executor_payload.STORAGE)
 REMOTE_RUNNER_PATH = "/root/app/src/storage_runner.py"
 REMOTE_SECRETS_DIRECTORY = PurePosixPath("/root/app/storage-secrets")
 
@@ -198,24 +202,14 @@ async def supports_storage_operation(
     return result.exit_status == 0
 
 
-# Asks the executor's own storage models whether `workspace.bootstrap` exists (DAH-3274). An
-# executor image from before it drops the unknown key and refuses the non-empty target the
-# pod's entrypoint has already written to, so the create must stop before `docker run`.
-# Exit 0 = the field exists, exit 3 = the models import but have no such field (an old image);
-# any other status is the probe itself failing (no python at that path = 127, an import error =
-# 1, …) and is reported as such, not read as an old image (review, taiberium).
-# DAH-2002: the same probe for `workspace.exclude_patterns`; an old image would back up what the excludes skip.
-# An image with no `storage` package at all predates every field, so it is an old image too (exit 3);
-# any other import error re-raises, so its traceback reaches the probe's stderr.
+# Asks the storage models the operation will run with, the validator's copy staged on the executor and loaded by the
+# executor's interpreter, whether `workspace.bootstrap` exists (DAH-3274) or `workspace.exclude_patterns` (DAH-2002).
+# Exit 0 = the field exists, exit 3 = the models import but have no such field; any other status is the probe itself
+# failing (no python at that path = 127, an import error = 1, …) and is reported as such (review, taiberium).
 _WORKSPACE_FIELD_PROBE = (
     "import sys\n"
-    "sys.path.insert(0, '/root/app/src')\n"
-    "try:\n"
-    "    from storage.models import WorkspaceSpec\n"
-    "except ModuleNotFoundError as e:\n"
-    "    if e.name not in ('storage', 'storage.models'):\n"
-    "        raise\n"
-    "    sys.exit(3)\n"
+    "sys.path.insert(0, sys.argv[2])\n"
+    "from storage.models import WorkspaceSpec\n"
     "sys.exit(0 if sys.argv[1] in WorkspaceSpec.__dataclass_fields__ else 3)"
 )
 _BOOTSTRAP_PROBE_FIELD_MISSING = 3
@@ -233,13 +227,15 @@ async def supports_workspace_field(
     python_path: str,
     field: str,
 ) -> bool:
-    """True when the executor's models know `workspace.<field>`, False when they do not.
+    """True when the storage models the operation runs with know `workspace.<field>`, False when they do not.
 
     Raises RuntimeError, with the exit status and the tail of stderr, when the probe could not
-    answer — the caller must not take that for an old executor image.
+    answer — the caller must not take that for a missing field.
     """
     result = await ssh_client.run(
-        f"{shlex.quote(python_path)} -c {shlex.quote(_WORKSPACE_FIELD_PROBE)} {shlex.quote(field)}",
+        f"{executor_payload.unpack('storage', cleanup=True)}; "
+        f"{shlex.quote(python_path)} -E -s -c {shlex.quote(_WORKSPACE_FIELD_PROBE)} {shlex.quote(field)} \"$d\"",
+        input=executor_payload.archive(executor_payload.STORAGE).decode(),
         check=False,
     )
     if result.exit_status == 0:
@@ -302,16 +298,11 @@ async def start_storage_operation(
                 )
             await sftp.chmod(str(files.spec), 0o600)
 
-        runner = " ".join(
-            shlex.quote(item)
-            for item in [
-                python_path,
-                REMOTE_RUNNER_PATH,
-                "--spec",
-                str(files.spec),
-                "--cancel-file",
-                str(files.cancel),
-            ]
+        # the validator's runner and storage package, staged in a root-only directory ($D) that goes when the runner
+        # has exited
+        runner = (
+            f'{shlex.quote(python_path)} -E -s "$D"/{executor_payload.STORAGE[0]} '
+            f"--spec {shlex.quote(str(files.spec))} --cancel-file {shlex.quote(str(files.cancel))}"
         )
         terminal_cleanup = (
             ""
@@ -328,16 +319,19 @@ async def start_storage_operation(
             f"{runner} & child=$!; "
             f"printf '%s\\n' \"$child\" > {shlex.quote(str(files.pid))}; "
             "trap 'kill -TERM \"$child\" 2>/dev/null || true' TERM INT; "
-            'wait "$child"; result=$?; '
+            'wait "$child"; result=$?; rm -rf "$D"; '
             f"printf '%s\\n' \"$result\" > {shlex.quote(str(files.status))}; "
             f"rm -f {shlex.quote(str(files.spec))} {shlex.quote(str(files.pid))} "
             f"{shlex.quote(str(files.cancel))}{terminal_cleanup}"
         )
         launch_command = (
-            f"nohup /bin/sh -c {shlex.quote(wrapper)} "
+            f"{executor_payload.unpack('storage')}; "
+            f'D="$d" nohup /bin/sh -c {shlex.quote(wrapper)} '
             f"> {shlex.quote(str(files.log))} 2>&1 < /dev/null &"
         )
-        await ssh_client.run(launch_command, check=True)
+        await ssh_client.run(
+            launch_command, input=executor_payload.archive(executor_payload.STORAGE).decode(), check=True
+        )
         return files
     except Exception as error:
         await report_launch_failure(operation_id, spec, error)

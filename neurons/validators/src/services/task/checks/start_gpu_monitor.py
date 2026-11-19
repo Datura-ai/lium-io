@@ -51,35 +51,6 @@ class StartGPUMonitorCheck:
             return CheckResult(passed=False, event=event)
 
         script_path = f"{payload.service_dir_glob('monitor')}*/{payload.GPU_MONITOR[0]}"
-        # a monitor running the executor's own copy is stopped, so only the validator's runs ("[p]" keeps the
-        # pattern from matching the shell that runs this command)
-        legacy = "[p]ython.*" + LEGACY_MONITOR.replace(".", "\\.")
-        await runner.run(f"pkill {SAME_MOUNT_NS} -f -- {shlex.quote(legacy)}; true", timeout=10, retryable=False)
-        # a monitor is reused only when it is the process this validator started (the PID and start time it recorded
-        # in the monitor's root-only directory), in the executor's mount namespace, and that directory holds the
-        # current payload: a monitor of an earlier build or any other process is replaced. Nothing is executed here.
-        dirs = shlex.quote(payload.service_dir_glob("monitor")) + "*"
-        sums = shlex.quote(payload.digests(payload.GPU_MONITOR))
-        check_cmd = (
-            f'for d in {dirs}; do read pid start < "$d/.run" 2>/dev/null || continue; '
-            f'case "$pid" in ""|*[!0-9]*) continue;; esac; [ "{_START_TIME}" = "$start" ] || continue; '
-            '[ "$(readlink /proc/$pid/ns/mnt)" = "$(readlink /proc/$$/ns/mnt)" ] || continue; '
-            f'printf %s {sums} | (cd "$d" && sha256sum -c --status -) && echo "$pid"; done'
-        )
-        check_res = await runner.run(check_cmd, timeout=10, retryable=False)
-        processes = check_res.stdout.split()
-
-        if processes:
-            event = render_message(
-                Msg.ALREADY_RUNNING,
-                ctx=ctx,
-                check_id=self.check_id,
-                what={"script_path": script_path, "python_path": payload.EXECUTOR_PYTHON},
-            )
-            return CheckResult(passed=True, event=event)
-
-        # await runner.run("pip install aiohttp click pynvml psutil", timeout=30, retryable=True)
-
         program_id = str(uuid.uuid4())
         command_args: Dict[str, Any] = {
             "program_id": program_id,
@@ -88,21 +59,51 @@ class StartGPUMonitorCheck:
             "validator_hotkey": validator_keypair.ss58_address,
             "compute_rest_app_url": compute_rest_app_url,
         }
-
         args_string = " ".join([f"--{k} {shlex.quote(str(v))}" for k, v in command_args.items()])
-        # no current monitor runs (checked above): any other one of ours is stopped and the directories of earlier ones
-        # go before a fresh one is written; the new one's PID and start time are recorded for the check above
-        ours = "[p]ython.*" + (payload.service_dir_glob("monitor") + "[^/]*/" + payload.GPU_MONITOR[0]).replace(".", "\\.")
-        start_cmd = (
-            f"pkill {SAME_MOUNT_NS} -f -- {shlex.quote(ours)}; "
-            f"rm -rf {dirs}; "
-            f"{payload.install('monitor', payload.GPU_MONITOR)}; "
-            f"nohup {payload.run(payload.GPU_MONITOR)} {args_string} > /dev/null 2>&1 & "
-            f'pid=$!; printf "%s %s\\n" "$pid" "{_START_TIME}" > "$d/.run"'
-        )
-        start_res = await runner.run(start_cmd, timeout=50, retryable=False)
 
-        if start_res.success:
+        # one command under an executor-local lock, so two overlapping checks never both start a monitor or remove
+        # each other's. pkill exits 1 when nothing matched; any other failure fails the command ("[p]" keeps the
+        # pattern from matching the shell that runs it).
+        def stop(pattern: str) -> str:
+            return f'pkill {SAME_MOUNT_NS} -f -- {shlex.quote(pattern)}; [ "$?" -le 1 ] || exit 1'
+
+        # held while a check looks for the monitor and starts one (outside the monitor directories' glob)
+        lock = f"{payload.SERVICE_DIR_PARENT}/.lium-validator-monitor-lock"
+        legacy = "[p]ython.*" + LEGACY_MONITOR.replace(".", "\\.")
+        dirs = shlex.quote(payload.service_dir_glob("monitor")) + "*"
+        sums = shlex.quote(payload.digests(payload.GPU_MONITOR))
+        ours = "[p]ython.*" + (payload.service_dir_glob("monitor") + "[^/]*/" + payload.GPU_MONITOR[0]).replace(".", "\\.")
+        command = (
+            f"exec 9> {shlex.quote(lock)} && flock -w 30 9 || exit 1; "
+            # a monitor running the executor's own copy is always stopped, so only the validator's runs
+            f"{stop(legacy)}; "
+            # reused only when it is the process this validator started (the PID and start time it recorded in the
+            # monitor's root-only directory), in the executor's mount namespace, and that directory holds the current
+            # payload; a monitor of an earlier build or any other process is replaced
+            f'for d in {dirs}; do read pid start < "$d/.run" 2>/dev/null || continue; '
+            f'case "$pid" in ""|*[!0-9]*) continue;; esac; [ "{_START_TIME}" = "$start" ] || continue; '
+            '[ "$(readlink /proc/$pid/ns/mnt)" = "$(readlink /proc/$$/ns/mnt)" ] || continue; '
+            f'printf %s {sums} | (cd "$d" && sha256sum -c --status -) && {{ echo "RUNNING $pid"; exit 0; }}; done; '
+            f"{stop(ours)}; rm -rf {dirs}; "
+            f"{payload.install('monitor', payload.GPU_MONITOR)}; "
+            f"nohup {payload.run(payload.GPU_MONITOR)} {args_string} > /dev/null 2>&1 9>&- & "
+            f'pid=$!; printf "%s %s\\n" "$pid" "{_START_TIME}" > "$d/.run" || exit 1; '
+            # the child must still be up once its interpreter has loaded the script
+            'sleep 1; kill -0 "$pid" 2>/dev/null || exit 1; echo "STARTED $pid"'
+        )
+        start_res = await runner.run(command, timeout=60, retryable=False)
+        outcome = start_res.stdout.split()[:1] if start_res.success else []
+
+        if outcome == ["RUNNING"]:
+            event = render_message(
+                Msg.ALREADY_RUNNING,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"script_path": script_path, "python_path": payload.EXECUTOR_PYTHON},
+            )
+            return CheckResult(passed=True, event=event)
+
+        if outcome == ["STARTED"]:
             event = render_message(
                 Msg.STARTED,
                 ctx=ctx,
