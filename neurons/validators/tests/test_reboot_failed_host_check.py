@@ -7,10 +7,11 @@ active and billed. With the flag on, the host is asked to start the executor's o
 """
 
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from neurons.validators.src.services.task.checks import rented_machine
 from neurons.validators.src.services.task.checks.rented_machine import TenantEnforcementCheck
 from neurons.validators.src.services.task.messages import TenantEnforcementMessages as Msg
 from neurons.validators.src.services.task.runner import SSHCommandResult
@@ -108,8 +109,9 @@ def _context(
     )
 
 
-async def _run(ctx):
-    return await TenantEnforcementCheck().run(ctx)
+async def _run(ctx, *, enabled: bool = True):
+    with patch.object(rented_machine.settings, "REBOOT_FAILED_HOST_CHECK_ENABLED", enabled):
+        return await TenantEnforcementCheck().run(ctx)
 
 
 @pytest.mark.asyncio
@@ -170,6 +172,16 @@ async def test_an_image_id_that_is_not_a_digest_skips_the_check(context_factory)
 
 
 @pytest.mark.asyncio
+async def test_the_flag_off_runs_no_host_check(context_factory):
+    runner = FakeRunner(gpu_run=_result(125, stderr=NVIDIA_HOOK_ERROR))
+
+    result = await _run(_context(context_factory, runner), enabled=False)
+
+    assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
+    assert runner.commands == []
+
+
+@pytest.mark.asyncio
 async def test_a_running_pod_status_runs_no_host_check(context_factory):
     runner = FakeRunner(gpu_run=_result(125, stderr=NVIDIA_HOOK_ERROR))
 
@@ -187,6 +199,10 @@ async def test_a_rental_another_miner_owns_runs_no_host_check(context_factory):
 
     assert result.event.reason_code == Msg.POD_NOT_RUNNING.reason
     assert runner.commands == []
+
+
+def test_the_flag_ships_off():
+    assert type(rented_machine.settings).model_fields["REBOOT_FAILED_HOST_CHECK_ENABLED"].default is False
 
 
 @pytest.mark.asyncio

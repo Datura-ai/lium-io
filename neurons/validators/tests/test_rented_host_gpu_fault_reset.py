@@ -12,12 +12,13 @@ through the real ResultHandler into a RedisService on fakeredis, so the assertio
 import asyncio
 import json
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fakeredis import FakeServer
 from fakeredis.aioredis import FakeRedis
 
+from neurons.validators.src.services.task.checks import machine_spec_scrape
 from neurons.validators.src.services.task.checks.gpu_fingerprint import GpuFingerprintCheck
 from neurons.validators.src.services.task.checks.machine_spec_scrape import MachineSpecScrapeCheck
 from neurons.validators.src.services.task.checks.rented_machine import TenantEnforcementCheck
@@ -102,6 +103,7 @@ async def _cycle(
     *,
     scrape: SSHCommandResult,
     rented: bool = True,
+    enabled=True,
     miner_hotkey: str = RENTAL_OWNER,
 ):
     """One validation cycle as the service runs it: the record from Redis, the checks through the Pipeline, the
@@ -129,9 +131,10 @@ async def _cycle(
         is_rental_succeed=True,
         contract_version="v1.0.0",
     )
-    ok, events, ctx = await Pipeline(
-        [MachineSpecScrapeCheck(), GpuFingerprintCheck(), TenantEnforcementCheck()], _Sink()
-    ).run(ctx)
+    with patch.object(machine_spec_scrape.settings, "RENTED_HOST_GPU_FAULT_RESET_ENABLED", enabled):
+        ok, events, ctx = await Pipeline(
+            [MachineSpecScrapeCheck(), GpuFingerprintCheck(), TenantEnforcementCheck()], _Sink()
+        ).run(ctx)
     await ResultHandler(redis_service=service, dry_run=False)._persist_verification_data(
         miner_hotkey="hk", executor_id=EXECUTOR, verified_job_info=verified, context=ctx, success=ok
     )

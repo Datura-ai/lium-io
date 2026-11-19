@@ -420,6 +420,23 @@ class Settings(BaseSettings):
         env="RENTED_POD_WATCH_NO_BANNER_RETRY_TIMEOUT_SECONDS", default=20.0, gt=0
     )
     RENTED_POD_WATCH_NO_BANNER_MISSES: int = Field(env="RENTED_POD_WATCH_NO_BANNER_MISSES", default=10, ge=1)
+    # A rented node whose scrape, run in the already-running executor, finds the GPU runtime
+    # dead on the host (NVML: driver not loaded, GPU lost, GPU requires reset, GPU not found; or zero
+    # cards) is reset the way POD_NOT_RUNNING and GPU_MISSING are: verified job cleared, so the backend
+    # marks the executor inactive and stops billing the renter. Only the validator's scrape on the host
+    # decides; nothing read from the renter's container does. A later clean scrape validates the node as
+    # usual. Off (the default): the scrape failure halts the cycle without a reset, as before. On once
+    # the matching backend change has rolled out, which handles this reset like GPU_MISSING (penalty
+    # proposed, relisted only after a full GPU re-verification). Turning it off stops
+    # future resets only: an executor already reset stays inactive until its next clean scrape, and
+    # cycles already skipped are not billed or paid afterwards.
+    RENTED_HOST_GPU_FAULT_RESET_ENABLED: bool = Field(env="RENTED_HOST_GPU_FAULT_RESET_ENABLED", default=False)
+    # A rented pod whose reboot failed (backend status REBOOT_FAILED) and whose container is not running:
+    # the validator asks the host to start a throwaway GPU container (the executor's own image,
+    # `nvidia-smi -L`). If the Docker daemon or the NVIDIA runtime refuses, the host is at fault and the
+    # verified job is cleared, so the backend marks the executor inactive and billing stops. A transport
+    # error or timeout decides nothing. Off by default: the pod keeps the plain POD_NOT_RUNNING verdict.
+    REBOOT_FAILED_HOST_CHECK_ENABLED: bool = Field(env="REBOOT_FAILED_HOST_CHECK_ENABLED", default=False)
     # DAH-4564 — read a rented pod's cpuset, CPU quota and init oom_score_adj and flag a host that
     # pinned or throttled the renter below 95% of its advertised cores, and zero its score. A raised
     # oom_score_adj is recorded only, never scored.

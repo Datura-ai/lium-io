@@ -28,6 +28,7 @@ from ...const import (
     PARKED_SUFFIXES,
     POD_CONTAINER_NAME_GRACE_MINUTES,
 )
+from core.config import settings
 from services.gpu_reset import renter_gpu_reset_in_progress
 from services.rental_docker_sdk import _authorized_keys_lock
 from services.redis_service import (
@@ -831,13 +832,13 @@ async def _host_gpu_container_failure(
 
     The container runs the executor's own image, already on the host, with `nvidia-smi -L`: nothing the
     renter wrote is in it, so a refusal is the Docker daemon's or the NVIDIA runtime's. None when the
-    pod is not REBOOT_FAILED, the rental is another miner's, the image is unknown,
+    check is off, the pod is not REBOOT_FAILED, the rental is another miner's, the image is unknown,
     the host started the container, or the transport gave no exit status. Only on a node with this
     one pod: the verdict resets the whole node, and on a split box it would stop billing a healthy
     neighbour pod too. A negative exit code (asyncssh's -1 when a signal killed the `docker` client)
     says nothing about the host.
     """
-    if pod_status != REBOOT_FAILED_POD_STATUS:
+    if not settings.REBOOT_FAILED_HOST_CHECK_ENABLED or pod_status != REBOOT_FAILED_POD_STATUS:
         return None
     rented_data = ctx.state.rented_data
     rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None

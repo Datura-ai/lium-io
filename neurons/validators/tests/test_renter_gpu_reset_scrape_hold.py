@@ -63,6 +63,7 @@ from test_rented_host_gpu_fault_reset import (
 )
 
 from helpers import FakeRedis, build_context_config, build_services, build_state
+from neurons.validators.src.services.task.checks import machine_spec_scrape
 from neurons.validators.src.services.task.checks.gpu_fingerprint import GpuFingerprintCheck
 from neurons.validators.src.services.task.checks.gpu_loss_hold import GpuLossHoldCheck
 from neurons.validators.src.services.task.checks.machine_spec_scrape import MachineSpecScrapeCheck
@@ -109,9 +110,10 @@ async def _cycle(context_factory, service, *, scrape, pod_gpu_count: int | None 
         is_rental_succeed=True,
         contract_version="v1.0.0",
     )
-    ok, events, ctx = await Pipeline(
-        [MachineSpecScrapeCheck(), GpuLossHoldCheck(), GpuFingerprintCheck(), TenantEnforcementCheck()], _Sink()
-    ).run(ctx)
+    with patch.object(machine_spec_scrape.settings, "RENTED_HOST_GPU_FAULT_RESET_ENABLED", True):
+        ok, events, ctx = await Pipeline(
+            [MachineSpecScrapeCheck(), GpuLossHoldCheck(), GpuFingerprintCheck(), TenantEnforcementCheck()], _Sink()
+        ).run(ctx)
     await ResultHandler(redis_service=service, dry_run=False)._persist_verification_data(
         miner_hotkey=RENTAL_OWNER, executor_id=EXECUTOR, verified_job_info=ctx.verified, context=ctx, success=ok
     )
