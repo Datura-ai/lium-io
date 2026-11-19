@@ -119,14 +119,14 @@ _HELD_XID = re.compile(r"Xid \([^)]*\): (\d+)")
 def _card_was_reset(
     fault: str, uuid: str, gpus: dict[str, dict[str, Any]], every_card_named: bool, before: CardHealthState
 ) -> bool:
-    """Every reset-only counter the last read saw set on the card now reads 0: the card was reset since. A hold
-    stored before the marks existed has no such read: there, a read naming every card with both counters at 0
-    proves it only for an Xid in RESET_PROVEN_XIDS."""
+    """Every reset-only counter the last read saw set on the card now reads 0: the card was reset since. A held card
+    with no marks (a hold stored before the marks existed, or an Xid logged after the last read whose counters the
+    reset zeroed before any read saw them) has no such read: there, a read naming every card with both counters
+    at 0 proves it only for an Xid in RESET_PROVEN_XIDS."""
     if uuid not in gpus:
         return False
-    if before.reset_marks is not None:
-        marked = before.reset_marks.get(uuid)
-        return bool(marked) and all(gpus[uuid].get(c) == 0 for c in marked)
+    if marked := (before.reset_marks or {}).get(uuid):
+        return all(gpus[uuid].get(c) == 0 for c in marked)
     xid = _HELD_XID.search(fault)
     return (
         every_card_named

@@ -385,6 +385,37 @@ async def test_a_hold_stored_before_reset_marks_stays_without_proof(context_fact
 
 
 @pytest.mark.asyncio
+async def test_a_reset_only_xid_logged_just_before_a_reset_heals_on_the_next_zeroed_read(context_factory):
+    """An Xid 48 logged after one read and reset away before the next is judged on a read whose counters are
+    already 0, so the card holds it with no marks: the zeroed-read rule for a reset-only Xid still lifts it."""
+    services = _services()
+    boot = {"boot_id": "boot-a", "xid": {"available": True, "last_ts": 5}}
+    dbe = f"gpu 3 ({UUIDS[3]}): new NVRM Xid on a probed GPU: [  210.0] NVRM: Xid (PCI:0000:03:00): 48, pid=1, DBE"
+    await _read(context_factory, services, _ok(gpu={"ecc_uncorrected": 1, "recovery_action": 0}, **boot))
+    await _read(context_factory, services, _ok(gpu={"ecc_uncorrected": 2, "recovery_action": 0}, **boot))
+    held, _ = await _read(context_factory, services, _ok(gpu={"recovery_action": 0}, xid_faults=[dbe], **boot))
+    clean, _ = await _read(context_factory, services, _ok(gpu={"recovery_action": 0}, **boot))
+
+    assert held.report["card_faults"] == [dbe]
+    assert clean.report["card_faults"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_hold_stored_before_reset_marks_still_heals_after_a_read_without_the_kernel_log(context_factory):
+    services = _services()
+    boot = {"boot_id": "boot-a", "xid": {"available": True, "last_ts": 5}}
+    await _read(context_factory, services, _ok(**boot))
+    fault = _held_before_reset_marks(services, 48)
+
+    no_log = _ok(gpu={"recovery_action": 0}, boot_id="boot-a", xid={"available": False})
+    blind, _ = await _read(context_factory, services, no_log)
+    seen, _ = await _read(context_factory, services, _ok(gpu={"recovery_action": 0}, **boot))
+
+    assert blind.report["card_faults"] == [fault]
+    assert seen.report["card_faults"] == []
+
+
+@pytest.mark.asyncio
 async def test_a_card_missing_from_one_read_keeps_its_reset_marks(context_factory):
     services = _services()
     boot = {"boot_id": "boot-a", "xid": {"available": True, "last_ts": 5}}
