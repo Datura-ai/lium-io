@@ -40,7 +40,9 @@ async def local_node():
     "address",
     # private, CGNAT and reserved IPv4 ranges are the stdlib's is_global; IPv4 literals here are the scan-allowed ones
     ["127.0.0.1", "169.254.169.254", "0.0.0.0", "192.0.2.1", "::1", "fe80::1%eth0", "fc00::1", "ff02::1", "ff0e::1",
-     "::ffff:127.0.0.1", "::ffff:169.254.169.254"],
+     "::ffff:127.0.0.1", "::ffff:169.254.169.254",
+     # Python 3.11-3.12 call these global: IPv6 site-local, and reserved ranges incl. NAT64 of 127.0.0.1
+     "fec0::1", "fec0::1%eth0", "64:ff9b::7f00:1", "100::1"],
 )
 def test_internal_addresses_are_not_public(address):
     assert not is_public_address(address)
@@ -143,3 +145,28 @@ async def test_every_request_to_a_node_uses_the_checked_session(monkeypatch):
     source = inspect.getsource(executor_service)
     assert "aiohttp.ClientSession(" not in source
     assert source.count("allow_redirects=False") == source.count("session.post(") + source.count("session.get(")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host", ["127.0.0.1", "169.254.169.254", "[::1]", "[fec0::1]", "[64:ff9b::7f00:1]", "[::ffff:127.0.0.1]"])
+async def test_a_central_miner_never_dials_a_stored_non_public_ip_literal(monkeypatch, local_node, host):
+    """sergej-bot 18:57Z: aiohttp dials an IP literal without the resolver, and the central miner's addresses come
+    from the portal snapshot. Every request's host is checked before it is sent; nothing reaches the node."""
+    port, seen = local_node
+    monkeypatch.setattr(node_address.settings, "CENTRAL_MODE", True)
+    async with executor_session() as session:
+        for method in (session.get, session.post):
+            with pytest.raises(NonPublicNodeAddress):
+                await method(f"http://{host}:{port}/upload_ssh_key", allow_redirects=False)
+    assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_a_self_hosted_miner_still_dials_its_operators_private_executor(monkeypatch, local_node):
+    """A self-hosted miner's executors are its own operator's; one on a private network keeps working."""
+    port, seen = local_node
+    monkeypatch.setattr(node_address.settings, "CENTRAL_MODE", False)
+    async with executor_session() as session:
+        async with session.get(f"http://127.0.0.1:{port}/health", allow_redirects=False) as response:
+            assert response.status == 200
+    assert seen == ["/health"]

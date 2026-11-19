@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import ipaddress
 import socket
 import sys
 import threading
@@ -109,6 +110,19 @@ async def test_unresolvable_name_is_refused(monkeypatch):
     # Act / Assert
     with pytest.raises(NodeHostError, match="does not resolve"):
         await public_host_sock("gone.example.net")
+
+
+@pytest.mark.parametrize(
+    "address", ["fec0::1", "64:ff9b::7f00:1", "100::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1", "ff0e::1"]
+)
+def test_addresses_python_calls_global_but_are_not_public(address):
+    """lium-io#2369 review: Python 3.11-3.12 call some of these global (site-local, NAT64 of 127.0.0.1)."""
+    assert not node_host.is_public_ip(ipaddress.ip_address(address))
+
+
+def test_public_addresses_stay_public():
+    assert node_host.is_public_ip(ipaddress.ip_address("8.8.8.8"))
+    assert node_host.is_public_ip(ipaddress.ip_address("2001:4860:4860::8888"))
 
 
 def test_is_ip_literal():

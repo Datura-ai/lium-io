@@ -192,6 +192,14 @@ class _QuotaSlotExecutor:
         return future
 
 
+def is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Global by the stdlib, and none of what Python before 3.13 also calls global: an IPv4-mapped IPv6 address
+    (judged as its IPv4 address), multicast, IPv6 site-local (fec0::/10) or a reserved range (64:ff9b::/96 carries an
+    IPv4 address through NAT64). Same rule as the miner's services/node_address.py."""
+    ip = getattr(ip, "ipv4_mapped", None) or ip
+    return ip.is_global and not ip.is_multicast and not ip.is_reserved and not getattr(ip, "is_site_local", False)
+
+
 async def resolve_public_host(host: str, port: int = 22, executor=None) -> list:
     """The getaddrinfo results to dial for ``host``: [] for an IP literal (dial it as is), else every
     address the name resolves to, all of them global; NodeHostError otherwise.
@@ -214,7 +222,7 @@ async def resolve_public_host(host: str, port: int = 22, executor=None) -> list:
     addresses = {ipaddress.ip_address(info[4][0]) for info in infos}
     if not addresses:
         raise _refused(host, port, "resolves to no address")
-    blocked = sorted(str(a) for a in addresses if not a.is_global)
+    blocked = sorted(str(a) for a in addresses if not is_public_ip(a))
     if blocked:
         raise _refused(host, port, f"resolves to a non-public address: {', '.join(blocked)}", blocked)
     checked = _CheckedAddresses(infos)
