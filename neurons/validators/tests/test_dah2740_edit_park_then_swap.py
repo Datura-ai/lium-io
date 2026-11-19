@@ -523,7 +523,10 @@ def _hung_reset(outcome, calls: list | None = None):
 @pytest.mark.parametrize(
     ("outcome", "warnings"),
     [
-        (HungGpuResult(["GPU-test"], ContainerWarningCode.HungGpuReset), [ContainerWarningCode.HungGpuReset]),
+        (
+            HungGpuResult(["GPU-test"], ContainerWarningCode.HungGpuReset, reset_stamp=(300.0, "boot-a")),
+            [ContainerWarningCode.HungGpuReset],
+        ),
         (RuntimeError("ssh dropped"), []),  # best-effort: the reboot goes on
     ],
 )
@@ -548,7 +551,7 @@ async def test_a_reboot_resets_a_hung_gpu_while_the_old_container_is_parked(svc,
         )
         # DAH-6646: and its next clean memory read lifts a held Xid fault on it
         svc.redis_service.hset.assert_awaited_once_with(
-            card_reset_key(payload.miner_hotkey, payload.executor_id), "GPU-test", "1"
+            card_reset_key(payload.miner_hotkey, payload.executor_id), "GPU-test", '{"ts": 300.0, "boot": "boot-a"}'
         )
     else:
         svc.redis_service.mark_gpu_reset_recent.assert_not_awaited()

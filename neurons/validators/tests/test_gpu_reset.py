@@ -99,6 +99,8 @@ class FakeHost:
         self.hung_units: list[str] = []
         self.active_during_cure: dict[str, bool] | None = None
         self.fm_log: list[tuple[str, str]] = []
+        # the kernel time dmesg prints for the stamp line; None: /dev/kmsg or dmesg refused
+        self.kmsg_stamp: float | None = 300.0
 
     async def run(self, cmd: str, *, timeout: int = 60, retryable: bool = True, **_):
         self.commands.append(cmd)
@@ -200,6 +202,12 @@ class FakeHost:
         if cmd.startswith("CUDA_VISIBLE_DEVICES="):
             self.active_during_cure = self.active_during_cure or dict(self.active)
             return make_command_result(True, "ctx open/close OK")
+        if " > /dev/kmsg && dmesg | grep -F " in cmd:
+            # DAH-6646: the kernel-log line the stamp writes, as dmesg prints it, then the boot id
+            if self.kmsg_stamp is None:
+                return make_command_result(False, stderr="Operation not permitted", exit_code=1)
+            nonce = cmd.split("grep -F ")[1].split()[0]
+            return make_command_result(True, f"[{self.kmsg_stamp:>12.6f}] lium validator: GPU reset stamp {nonce}\nboot-a\n")
         raise AssertionError(f"unexpected command {cmd}")
 
 
@@ -250,6 +258,28 @@ async def test_resets_the_pods_gpus_and_starts_the_container_again():
         f"nvidia-smi -r -i {U[1]},{U[0]}"
     )
     start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fabric", [False, True], ids=["per-gpu", "whole-fabric-unit"])
+async def test_the_reset_carries_the_kernel_time_and_boot_read_just_before_nvidia_smi_r(fabric):
+    # DAH-6646 (review): an Xid logged during the reset is later than the stamp, so the reset never lifts it
+    kwargs = {"device_ids": (), "count": -1, "nvswitch": True, "fabric_manager": True} if fabric else {}
+    host = FakeHost(**kwargs)
+    report, _ = await _reset(host, **({"backend": U} if fabric else {}))
+    stamp = next(i for i, cmd in enumerate(host.commands) if "/dev/kmsg" in cmd)
+    reset = next(i for i, cmd in enumerate(host.commands) if "nvidia-smi -r" in cmd)
+    assert report.ok and report.reset_stamp == (300.0, "boot-a")
+    assert stamp < reset
+
+
+@pytest.mark.asyncio
+async def test_a_stamp_the_host_refuses_leaves_the_reset_unstamped():
+    host = FakeHost()
+    host.kmsg_stamp = None
+    report, _ = await _reset(host)
+    # the reset still runs; it just records nothing that could lift a held Xid
+    assert report.ok and report.reset_stamp is None
 
 
 @pytest.mark.asyncio

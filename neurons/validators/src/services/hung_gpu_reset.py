@@ -38,6 +38,7 @@ from services.gpu_reset import (
     _run,
     _service_active,
     _tail,
+    kernel_reset_stamp,
     _widen_targets_to_nvlink_peers,
     build_fabric_reset_command,
     build_reset_command,
@@ -80,6 +81,8 @@ class HungGpuResult:
     # None: nothing to tell the renter (no pod GPU hung, or the latch clear alone fixed it)
     warning: ContainerWarningCode | None = None
     detail: str | None = None
+    # as GpuResetReport.reset_stamp: set only when the GPUs were reset
+    reset_stamp: tuple[float, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -179,6 +182,7 @@ async def _reset(
         pod_gpu_uuids=pod_gpu_uuids,
         whole_fabric=resets_whole_fabric(plan.owns_host, plan.host_services),
     )
+    stamp = await kernel_reset_stamp(runner)
     if not plan.owns_host:
         reset = await _run(runner, command, timeout=_RESET_TIMEOUT_SECONDS)
     else:
@@ -207,7 +211,7 @@ async def _reset(
                 _tail(reset.stderr) or "a host GPU holder did not stop or start",
             )
     if reset.exit_code == 0:
-        return HungGpuResult(hung, ContainerWarningCode.HungGpuReset, f"reset {plan.targets}")
+        return HungGpuResult(hung, ContainerWarningCode.HungGpuReset, f"reset {plan.targets}", stamp)
     # as in reset_pod_gpus: the context cycle at least clears the latch, but it is no reset
     cures = await cure_wedged_gpus(runner, plan.targets)
     detail = f"nvidia-smi -r refused, the GPUs were not reset: {_tail(reset.stdout or reset.stderr)}"

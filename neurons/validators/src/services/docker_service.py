@@ -14567,7 +14567,11 @@ class DockerService:
                         RECENT_RENTER_GPU_RESET_SECONDS,
                     )
                     await record_card_resets(
-                        self.redis_service, payload.miner_hotkey, payload.executor_id, reset_result_holder[0].hung_uuids
+                        self.redis_service,
+                        payload.miner_hotkey,
+                        payload.executor_id,
+                        reset_result_holder[0].hung_uuids,
+                        reset_result_holder[0].reset_stamp,
                     )
                 except Exception as exc:
                     logger.warning(
@@ -14786,6 +14790,7 @@ class DockerService:
                             payload.miner_hotkey,
                             payload.executor_id,
                             [gpu.uuid for gpu in report.gpus if gpu.result == "reset"],
+                            report.reset_stamp,
                         )
             except Exception as exc:
                 logger.warning(

@@ -36,6 +36,7 @@ import json
 import logging
 import re
 import shlex
+import uuid as uuid_lib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -173,6 +174,8 @@ class GpuResetReport:
     detail: str | None = None
     # docker stop ran: the pod's GPUs may drop out until the driver brings them back
     pod_stopped: bool = False
+    # (kernel time, boot id) read just before `nvidia-smi -r` ran (kernel_reset_stamp); None: unread, nothing recorded
+    reset_stamp: tuple[float, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -753,6 +756,7 @@ async def reset_pod_gpus(
             pod_gpu_uuids=pod_gpu_uuids,
             whole_fabric=resets_whole_fabric(plan.owns_host, plan.host_services),
         )
+        report.reset_stamp = await kernel_reset_stamp(runner)
         if not plan.owns_host:
             reset = await _run(runner, command, timeout=_RESET_TIMEOUT_SECONDS)
         else:
@@ -865,24 +869,59 @@ async def _wait_exited(runner: SSHCommandRunner, container_name: str) -> None:
 # a scrape this soon after a renter's reset can still miss the cards the driver is bringing back
 RECENT_RENTER_GPU_RESET_SECONDS = 5 * 60
 
-# DAH-6646: the cards a validator `nvidia-smi -r` reset, per node, until the next memory read judges them: one that
-# reads clean there lifts its held Xid fault (checks/gpu_memory_health.py). The expiry only cleans up a gone node:
-# an unconsumed record lifts nothing.
+# DAH-6646: the cards a validator `nvidia-smi -r` reset, per node, each with the host's kernel time and boot id read
+# just before the reset: a clean read of the card lifts its Xid faults logged before that time
+# (checks/gpu_memory_health.py), never a later one. A newer reset overwrites the card's entry; the expiry only
+# cleans up a gone node, since an entry from another boot is ignored.
 CARD_RESET_KEY_PREFIX = "gpu_card_reset"
 CARD_RESET_TTL_SECONDS = 86400
+_KERNEL_TS = re.compile(r"\[\s*(\d+(?:\.\d+)?)\]")
+
+
+def kernel_ts(text: str) -> float | None:
+    """The first dmesg kernel time (`[  123.456789]`) in a line or a held fault naming it, or None."""
+    match = _KERNEL_TS.search(text)
+    return float(match.group(1)) if match else None
+
+
+def kernel_stamp_command(nonce: str) -> str:
+    # a line written to the kernel log gets its time from the clock dmesg prints for an Xid (printk's local_clock);
+    # /proc/uptime is CLOCK_BOOTTIME, NTP-slewed, and drifts from it by minutes on a long uptime
+    return (
+        f"echo 'lium validator: GPU reset stamp {nonce}' > /dev/kmsg && dmesg | grep -F {nonce} "
+        "&& cat /proc/sys/kernel/random/boot_id"
+    )
+
+
+async def kernel_reset_stamp(runner: SSHCommandRunner) -> tuple[float, str] | None:
+    """(kernel time, boot id) on the host, read just before `nvidia-smi -r` runs: an Xid logged during the reset is
+    later than it, so the reset never lifts it. None when either is unreadable: then no reset is recorded."""
+    nonce = uuid_lib.uuid4().hex
+    try:
+        result = await _run(runner, kernel_stamp_command(nonce))
+    except Exception:
+        return None
+    lines = (result.stdout or "").strip().splitlines() if result.exit_code == 0 else []
+    ts = next((kernel_ts(line) for line in lines if nonce in line), None)
+    boot = lines[-1].strip() if lines and nonce not in lines[-1] else ""
+    return (ts, boot) if ts is not None and boot else None
 
 
 def card_reset_key(miner_hotkey: str, executor_id: str) -> str:
     return f"{CARD_RESET_KEY_PREFIX}:{miner_hotkey}:{executor_id}"
 
 
-async def record_card_resets(redis, miner_hotkey: str, executor_id: str, gpu_uuids: list[str]) -> None:
-    """Record cards an `nvidia-smi -r` of this validator reset (exit 0); never a latch clear or a refused reset."""
-    if not gpu_uuids:
+async def record_card_resets(
+    redis, miner_hotkey: str, executor_id: str, gpu_uuids: list[str], stamp: tuple[float, str] | None
+) -> None:
+    """Record cards an `nvidia-smi -r` of this validator reset (exit 0), with its kernel time and boot id; never a
+    latch clear or a refused reset, and nothing without a stamp (no time, no proof)."""
+    if not gpu_uuids or stamp is None:
         return
     key = card_reset_key(miner_hotkey, executor_id)
+    value = json.dumps({"ts": stamp[0], "boot": stamp[1]})
     for uuid in gpu_uuids:
-        await redis.hset(key, uuid, "1")
+        await redis.hset(key, uuid, value)
     await redis.expire(key, CARD_RESET_TTL_SECONDS)
 
 # the checks a renter's own reset can trip (the pod is stopped, its GPUs drop out for a moment); a reset of

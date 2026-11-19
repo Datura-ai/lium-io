@@ -80,6 +80,8 @@ async def test_a_hung_pod_gpu_is_reset_alone(line):
     result = await _reset(host)
     assert _resets(host) == [f"nvidia-smi -r -i {U[0]}"]
     assert result.warning == W.HungGpuReset and result.hung_uuids == [U[0]]
+    # DAH-6646: stamped just before `nvidia-smi -r`
+    assert result.reset_stamp == (300.0, "boot-a")
 
 
 @pytest.mark.parametrize("cure_ok", [True, False])

@@ -564,12 +564,16 @@ async def test_only_the_cards_the_reset_actually_reset_are_recorded_for_the_memo
             GpuResetOutcome(index=0, uuid="GPU-1", result="reset"),
             GpuResetOutcome(index=1, uuid="GPU-2", result="latch_cleared"),
         ],
+        reset_stamp=(300.0, "boot-a"),
     )
 
     with patch("services.docker_service.reset_pod_gpus", AsyncMock(return_value=report)):
         await _run_reset(service, return_value=connection)
 
-    assert set(await service.hgetall(card_reset_key(RENTAL_OWNER, EXECUTOR))) == {b"GPU-1"}
+    recorded = await service.hgetall(card_reset_key(RENTAL_OWNER, EXECUTOR))
+    assert set(recorded) == {b"GPU-1"}
+    # with the kernel time and boot id read just before the reset: it lifts only Xids logged before it
+    assert json.loads(recorded[b"GPU-1"]) == {"ts": 300.0, "boot": "boot-a"}
 
 
 @pytest.mark.asyncio
