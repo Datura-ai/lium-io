@@ -264,6 +264,38 @@ async def test_after_a_restart_a_signed_upload_waits_for_the_first_owner_read(re
 
 
 @pytest.mark.asyncio
+async def test_a_debug_key_upload_makes_its_auth_headers_after_the_first_owner_read(rest_miner_service, monkeypatch):
+    """The miner accepts auth headers for 10 s only; a slow first owner read must not age them into a 401."""
+    from payload_models.payloads import AddDebugSshKeyRequest
+    from services import miner_service as miner_service_module
+
+    order = []
+
+    async def _read():
+        order.append("owner read")
+
+    real_headers = rest_miner_service._generate_auth_headers
+
+    def _headers(*args, **kwargs):
+        order.append("auth headers")
+        return real_headers(*args, **kwargs)
+
+    async def _make_rest_request(**kwargs):
+        return 500, None
+
+    monkeypatch.setattr(miner_service_module, "first_owner_hotkeys_read", _read)
+    monkeypatch.setattr(rest_miner_service, "_generate_auth_headers", _headers)
+    rest_miner_service._make_rest_request = _make_rest_request
+    await rest_miner_service._add_debug_ssh_key(
+        AddDebugSshKeyRequest(
+            miner_hotkey="miner-a", miner_address="192.0.2.10", miner_port=8091, executor_id="exec-1",
+            public_key=_SSH_KEY,
+        )
+    )
+    assert order == ["owner read", "auth headers"]
+
+
+@pytest.mark.asyncio
 async def test_an_upload_waits_for_the_pending_express_lane_read_even_when_another_read_fails(
     rest_miner_service, portal_owners, monkeypatch
 ):

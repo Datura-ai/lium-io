@@ -3000,12 +3000,13 @@ class MinerService:
         }
 
         try:
+            # DAH-6740: never sign against the empty map of a restart; wait before the 10 s auth headers are made
+            await first_owner_hotkeys_read()
             base_url = f"http://{payload.miner_address}:{payload.miner_port}"
             headers = self._generate_auth_headers(my_key, payload.miner_hotkey)
             headers["Content-Type"] = "application/json"
-            
+
             upload_nonce = self._upload_nonce_for_miner(payload.miner_hotkey)
-            await first_owner_hotkeys_read()  # DAH-6740: never sign against the empty map of a restart
             ssh_request = SSHPubKeySubmitRequest(
                 public_key=payload.public_key,
                 validator_signature=self._sign_validator_pubkey(my_key, payload.public_key, nonce=upload_nonce),
