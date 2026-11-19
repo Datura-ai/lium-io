@@ -553,6 +553,7 @@ NOT_COMPARABLE_SPEC_PATHS = frozenset(
         "hard_disk.utilization",
         "hard_disk.engy_cache_used_gb",
         "hard_disk.containers",
+        "hard_disk.volumes",
     }
 )
 LIVE_GPU_DETAIL_FIELDS = frozenset(
@@ -571,7 +572,11 @@ LIVE_DOCKER_CONTAINER_FIELDS = frozenset({"cpu_percent", "net_rx_bytes", "net_tx
 def _is_not_comparable(path: str) -> bool:
     if path in NOT_COMPARABLE_SPEC_PATHS:
         return True
-    if path == "hard_disk.by_container" or path.startswith("hard_disk.by_container."):
+    if path in {"hard_disk.by_container", "hard_disk.by_volume"}:
+        return True
+    if path.startswith(("hard_disk.by_container.", "hard_disk.by_volume.")):
+        return True
+    if path == "gpu_processes" or path.startswith("gpu_processes["):
         return True
     parent, _, leaf = path.rpartition(".")
     if not parent.endswith("]"):

@@ -384,7 +384,10 @@ PYTHON_SCRAPE = {
         "engy_cache_used_gb": 8,
         "containers": 210288,
         "by_container": {"c1": 100},
+        "by_volume": {"v1": 100},
+        "volumes": 200,
     },
+    "gpu_processes": [{"pid": 100, "info": "live", "container_name": "c1"}],
     "docker": {
         "version": "29.10.0",
         "host_cpu_percent": 9,
@@ -405,7 +408,10 @@ LIUMD_SCRAPE = {
         "engy_cache_used_gb": 98,
         "containers": 210300,
         "by_container": {"c1": 112},
+        "by_volume": {"v1": 112},
+        "volumes": 212,
     },
+    "gpu_processes": [{"pid": 101, "info": "live", "container_name": "c1"}],
     "docker": {
         "version": "29.9.3",
         "host_cpu_percent": 99,
