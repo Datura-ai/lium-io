@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import secrets
 import time
 from typing import Annotated, Optional, Union
 from uuid import UUID
@@ -107,6 +108,7 @@ UPLOAD_SSH_KEY_ATTEMPTS = 3
 UPLOAD_SSH_KEY_ATTEMPT_TIMEOUT_SECONDS = 10.0
 UPLOAD_SSH_KEY_BUDGET_SECONDS = VALIDATOR_SSH_SUBMIT_TIMEOUT_SECONDS - UPLOAD_SSH_KEY_RESPONSE_MARGIN_SECONDS
 UPLOAD_SSH_KEY_RETRY_DELAY_SECONDS = 1.0
+MINER_IDENTITY_TIMEOUT_SECONDS = 3.0
 # a retry with less time than this left cannot get the executor's answer (it collects attestation)
 UPLOAD_SSH_KEY_MIN_ATTEMPT_SECONDS = 3.0
 # the validator's clock starts when it signs the request; a request queued longer than this is read as clock skew
@@ -132,6 +134,28 @@ async def _read_capped(response: aiohttp.ClientResponse, limit: int = MAX_EXECUT
         if len(body) > limit:
             raise ExecutorAnswerTooLarge(f"answer over {limit} bytes")
     return bytes(body)
+
+
+async def _executor_own_hotkey(session: aiohttp.ClientSession, executor: Executor, deadline: float) -> str | None:
+    """The miner hotkey the executor says it is set up for (its public /miner-identity), None when it does not answer.
+
+    Not trusted for anything but picking which owner signature to relay: the executor checks that signature against its
+    own setting. Every executor that reads owner_hotkey_signatures also serves /miner-identity (DAH-5729 came first).
+    """
+    nonce = secrets.token_hex(16)
+    timeout = aiohttp.ClientTimeout(total=max(0.5, min(MINER_IDENTITY_TIMEOUT_SECONDS, deadline - time.monotonic())))
+    try:
+        async with session.get(
+            f"http://{executor.address}:{executor.port}/miner-identity", params={"nonce": nonce}, timeout=timeout
+        ) as response:
+            if response.status != 200:
+                return None
+            answer = json.loads(await _read_capped(response))
+    except (*_UPLOAD_RETRY_ERRORS, ExecutorAnswerTooLarge, ValueError):
+        return None
+    if not isinstance(answer, dict) or answer.get("nonce") != nonce or not isinstance(answer.get("miner_hotkey"), str):
+        return None
+    return answer["miner_hotkey"]
 
 
 class PubkeyRegistration(pydantic.BaseModel):
@@ -409,10 +433,7 @@ class ExecutorService:
             # relayed verbatim: the executor checks the validator signed this key for its own miner
             payload["miner_hotkey"] = miner_hotkey
             payload["validator_miner_signature"] = validator_miner_signature
-        if owner_hotkey_signatures:
-            # DAH-6740: relayed verbatim; the executor takes the one for its own hotkey, if the validator signed it
-            payload["owner_hotkey_signatures"] = owner_hotkey_signatures
-        
+
         base_log_extra = {
             "executor_id": str(executor.uuid),
             "executor_address": executor.address,
@@ -426,6 +447,11 @@ class ExecutorService:
             ),
         )
         async with aiohttp.ClientSession() as session:
+            if owner_hotkey_signatures:
+                own = await _executor_own_hotkey(session, executor, deadline)
+                if own in owner_hotkey_signatures:
+                    # DAH-6740: only the entry the executor checks; an owner's whole map can pass its 256 KiB body limit
+                    payload["owner_hotkey_signatures"] = {own: owner_hotkey_signatures[own]}
             for attempt in range(1, UPLOAD_SSH_KEY_ATTEMPTS + 1):
                 # the first attempt keeps main's full timeout, so a slow portal lookup never fails an upload main
                 # accepted; only the retries are clipped to the deadline

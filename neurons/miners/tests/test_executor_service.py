@@ -150,17 +150,46 @@ async def test_send_pubkey_to_executor_relays_the_miner_bound_signature(executor
         assert "miner_hotkey" not in sent and "validator_miner_signature" not in sent
 
 
+def _identity_answer(session, hotkey: str | None, status: int = 200):
+    """Make the mock session's GET /miner-identity answer `hotkey`, echoing the request's nonce."""
+
+    def get(url, params=None, timeout=None):
+        assert url.endswith("/miner-identity")
+        answer = {"miner_hotkey": hotkey, "nonce": params["nonce"]} if hotkey else {}
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=_response(status, json.dumps(answer).encode()))
+        ctx.__aexit__ = AsyncMock(return_value=None)
+        return ctx
+
+    session.get = MagicMock(side_effect=get)
+
+
 @pytest.mark.asyncio
-async def test_send_pubkey_to_executor_relays_the_owner_hotkey_signatures(executor_service, test_executor):
-    """DAH-6740: the validator's per-owner-hotkey signatures reach the executor verbatim; absent when not sent."""
+async def test_a_big_owner_map_reaches_the_executor_as_its_one_entry(executor_service, test_executor):
+    """DAH-6740: 2,000 owner hotkeys (~370 KiB of signatures, past the executor's 256 KiB body limit) relay as one entry."""
+    signatures = {f"5Owner{i:05d}" + "x" * 41: "0x" + "ab" * 64 for i in range(2000)}
+    assert len(json.dumps(signatures)) > 256 * 1024
+    own = sorted(signatures)[1234]
     mock_session = _make_mock_session()
     with patch("services.executor_service.aiohttp.ClientSession", return_value=mock_session):
-        await executor_service.send_pubkey_to_executor(
-            test_executor, _SSH_KEY, "0xaa", owner_hotkey_signatures={"5Old": "0xcc"}
-        )
-        assert mock_session.post.call_args.kwargs["json"]["owner_hotkey_signatures"] == {"5Old": "0xcc"}
+        _identity_answer(mock_session, own)
+        await executor_service.send_pubkey_to_executor(test_executor, _SSH_KEY, "0xaa", owner_hotkey_signatures=signatures)
+        sent = mock_session.post.call_args.kwargs["json"]
+        assert sent["owner_hotkey_signatures"] == {own: signatures[own]}
+        assert len(json.dumps(sent)) < 256 * 1024
 
+        # set up for a hotkey outside the owner set, or no identity answer: no owner entry, the upload still goes
+        for hotkey, status in (("5Elsewhere", 200), (None, 200), ("5Any", 404)):
+            _identity_answer(mock_session, hotkey, status)
+            await executor_service.send_pubkey_to_executor(
+                test_executor, _SSH_KEY, "0xaa", owner_hotkey_signatures=signatures
+            )
+            assert "owner_hotkey_signatures" not in mock_session.post.call_args.kwargs["json"]
+
+        # no owner map: no identity read at all
+        mock_session.get.reset_mock()
         await executor_service.send_pubkey_to_executor(test_executor, _SSH_KEY, "0xaa")
+        assert not mock_session.get.called
         assert "owner_hotkey_signatures" not in mock_session.post.call_args.kwargs["json"]
 
 
