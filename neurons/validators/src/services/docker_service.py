@@ -1882,9 +1882,12 @@ def _layer_data_check(
         '$0 == "diff-failed" {f=1} ($1 == "A" || $1 == "C") && index(substr($0, 3), p) == 1 {k=1} '
         f'END {{if (!f && !k) print "{_DROP_MARK}"}}'
     )
+    # A readable upper dir decides either way: docker diff walks the whole layer (minutes on a DinD pod) and holds the
+    # container meanwhile, so the next docker inspect of the park timed out too and every reboot of the pod failed
     shortcut = (
-        f"{_layer_upper_scope(name, plaintext_path, upper_dir)} && [ -d \"$x\" ] "
-        "&& f=$(find \"$x\" -mindepth 1 \\( -type f -o -type l \\) $w -print -quit 2>/dev/null) && [ -z \"$f\" ] && { echo " + _DROP_MARK + "; exit 0; }; "
+        f"{_layer_upper_scope(name, plaintext_path, upper_dir)} && {{ [ -d \"$x\" ] || {{ echo {_DROP_MARK}; exit 0; }}; "
+        "f=$(find \"$x\" -mindepth 1 \\( -type f -o -type l \\) $w -print -quit 2>/dev/null) "
+        "&& { [ -n \"$f\" ] || echo " + _DROP_MARK + "; exit 0; }; }; "
     )
     return (
         f"m=$(/usr/bin/docker inspect -f '{{{{range .Mounts}}}}{{{{println .Destination}}}}{{{{end}}}}' {name}) || exit 1; "

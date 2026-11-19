@@ -1581,7 +1581,7 @@ def test_the_layer_read_skips_only_files_written_in_a_recorded_validator_start(
         f'case "$3" in *UpperDir*) echo "{inspect}"; exit;; *StartedAt*) echo "cid {docker_started}"; exit;; *.Id*) echo cid; exit;; esac\n'
         '[ "$1" = inspect ] && { echo /lium-cipher; exit; }\n'
         # docker diff lists the same file: only the upper-dir read can tell it is startup noise
-        '[ "$1" = diff ] && { printf "C /root\\nA /root/.jupyter\\nA /root/.jupyter/lab.json\\n"; exit; }\n'
+        f'[ "$1" = diff ] && {{ touch {tmp_path}/diffed; printf "C /root\\nA /root/.jupyter\\nA /root/.jupyter/lab.json\\n"; exit; }}\n'
         "exit 2\n"
     )
     docker.chmod(0o755)
@@ -1597,6 +1597,31 @@ def test_the_layer_read_skips_only_files_written_in_a_recorded_validator_start(
     out = subprocess.run(["sh", "-c", command], capture_output=True, text=True).stdout.strip().splitlines()
     assert (out[-1:] != ["drop"]) is kept
     assert (f"upper {host_upper}" in out) is (store not in ("none", "kept"))
+    # a readable upper dir decides alone: docker diff walks the whole layer and holds the container (a DinD pod's
+    # reboot timed out on it every time, 19 Nov)
+    assert (tmp_path / "diffed").exists() is (store in ("none", "kept"))
+
+
+def test_a_readable_upper_dir_without_the_volume_path_drops_without_docker_diff(tmp_path, monkeypatch):
+    import subprocess
+
+    host_upper = "/var/lib/docker/x/diff"
+    proc = tmp_path / "proc"
+    (proc / "1" / "root" / host_upper.lstrip("/") / "etc").mkdir(parents=True)  # the layer changed nothing under /root
+    docker = tmp_path / "docker"
+    docker.write_text(
+        "#!/bin/sh\n"
+        f'case "$3" in *UpperDir*) echo "4242 {host_upper}"; exit;; *StartedAt*) echo "cid 0001-01-01T00:00:00Z"; exit;; esac\n'
+        '[ "$1" = inspect ] && { echo /lium-cipher; exit; }\n'
+        f'[ "$1" = diff ] && {{ touch {tmp_path}/diffed; exit; }}\n'
+        "exit 2\n"
+    )
+    docker.chmod(0o755)
+    monkeypatch.setattr("services.docker_service._VALIDATOR_STARTS_DIR", str(tmp_path / "starts"))
+    command = _layer_data_check("pod_x", "/root").replace("/usr/bin/docker", str(docker)).replace("/proc/", f"{proc}/")
+    out = subprocess.run(["sh", "-c", command], capture_output=True, text=True).stdout.strip().splitlines()
+    assert out[-1:] == ["drop"]
+    assert not (tmp_path / "diffed").exists()
 
 
 @pytest.mark.asyncio
