@@ -400,6 +400,15 @@ async def test_a_whole_host_pod_whose_exporter_does_not_come_back_is_not_a_reset
 
 
 @pytest.mark.asyncio
+async def test_a_whole_host_pod_whose_late_stopped_service_does_not_come_back_is_not_a_reset():
+    # DAH-6741 review: a service the host unit stopped on its own (it opened a GPU after the scan) is restored too
+    host = _whole_host(late_units=("late-monitor.service",), start_fails=("late-monitor.service",))
+    result = await reset_hung_pod_gpus(host, list(U), settle_seconds=0)
+    assert result.warning == W.HungGpuNotResetUnsupported
+    assert "late-monitor.service is not active again" in result.detail
+
+
+@pytest.mark.asyncio
 async def test_a_refused_reset_on_a_whole_host_pod_cured_by_the_cycle_is_not_a_reset():
     host = _whole_host(reset_exit=1)
     result = await reset_hung_pod_gpus(host, list(U), settle_seconds=0)
