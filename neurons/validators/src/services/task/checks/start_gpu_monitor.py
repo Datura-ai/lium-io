@@ -10,6 +10,10 @@ from ..messages import StartGpuMonitorMessages as Msg, render_message
 from ..pipeline import CheckResult, Context
 
 
+# the monitor an executor image of before DAH-6681 ran from its own source tree: never trusted, stopped on sight
+LEGACY_MONITOR = "/root/app/src/gpus_utility.py"
+
+
 class StartGPUMonitorCheck:
     """Ensure `gpus_utility.py` is running on the executor, where it keeps the Docker template
     images synced and pruned.
@@ -44,9 +48,12 @@ class StartGPUMonitorCheck:
             return CheckResult(passed=False, event=event)
 
         script_path = f"{payload.service_dir_glob('monitor')}*/{payload.GPU_MONITOR[0]}"
-        # a monitor already started by the validator; the one an executor image of before this change started from
-        # its own /root/app/src counts too, so no second copy starts beside it. Detection only: nothing is executed.
-        pattern = f"python.*({payload.service_dir_glob('monitor')}[^/]*|/root/app/src)/{payload.GPU_MONITOR[0]}"
+        # a monitor running the executor's own copy is stopped, so only the validator's runs ("[p]" keeps the
+        # pattern from matching the shell that runs this command)
+        legacy = "[p]ython.*" + LEGACY_MONITOR.replace(".", "\\.")
+        await runner.run(f"pkill -f -- {shlex.quote(legacy)}; true", timeout=10, retryable=False)
+        # a monitor already started by the validator. Detection only: nothing is executed.
+        pattern = f"python.*{payload.service_dir_glob('monitor')}[^/]*/{payload.GPU_MONITOR[0]}"
         check_cmd = f"ps auxww | grep -E {shlex.quote(pattern)} | grep -v grep"
         check_res = await runner.run(check_cmd, timeout=10, retryable=False)
         processes = [line for line in check_res.stdout.splitlines() if "grep" not in line]

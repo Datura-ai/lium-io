@@ -163,6 +163,27 @@ async def test_honest_gpu_monitor_still_starts(node):
     assert len((node.tmp / "VALIDATOR_MONITOR").read_text().splitlines()) == 1
 
 
+async def test_a_running_legacy_monitor_is_replaced_not_accepted(node, monkeypatch):
+    # an executor image of before this change ran the monitor from its own source tree: that copy is stopped and the
+    # validator's own starts
+    from services.task.checks import start_gpu_monitor
+
+    legacy = node.tmp / "root" / "app" / "src" / "gpus_utility.py"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(_marker_script(node.tmp / "LEGACY_MONITOR", sleep=True))
+    monkeypatch.setattr(start_gpu_monitor, "LEGACY_MONITOR", str(legacy))
+    running = subprocess.Popen([sys.executable, str(legacy)])
+    try:
+        assert await _until(node.tmp / "LEGACY_MONITOR")
+        result = await StartGPUMonitorCheck().run(_ctx(node, LocalRunner(node.tmp)))
+        assert result.passed and result.event.reason_code == "MONITOR_STARTED"
+        assert running.wait(timeout=10) is not None
+        assert await _until(node.tmp / "VALIDATOR_MONITOR")
+    finally:
+        if running.poll() is None:
+            running.kill()
+
+
 def test_every_payload_is_found():
     # in the repository the executor sources; in the image the copies the Dockerfile takes from them
     for name in executor_payload.GPU_MONITOR + executor_payload.INSPECTOR + executor_payload.VERIFYX + executor_payload.MATRIX:
