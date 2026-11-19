@@ -114,7 +114,7 @@ async def test_start_without_a_network_only_starts():
 
 
 
-# DAH-6736: each rental has a bridge of its own; no two tenants share a link
+# DAH-6737: each rental has a bridge of its own; no two tenants share a link
 OWN = "lium-rentals-pod_a"
 
 

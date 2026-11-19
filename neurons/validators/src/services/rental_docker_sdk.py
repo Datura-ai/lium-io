@@ -84,7 +84,7 @@ _DOCKER_EXECUTOR = ThreadPoolExecutor(
     max_workers=_DOCKER_EXECUTOR_MAX_WORKERS, thread_name_prefix="docker-sdk"
 )
 # DAH-3199: rentals run on user-defined bridges with inter-container traffic off, never on docker0.
-# DAH-6736: each rental container gets a bridge of its own (rental_network_for), so no two tenants share
+# DAH-6737: each rental container gets a bridge of its own (rental_network_for), so no two tenants share
 # a link: the host is the only other station on it. `lium-rentals` stays as the host's template (its
 # MTU, set by the provider, is copied into every rental's own bridge) and as the network the
 # validator's own probes measure on. Published ports still arrive through the host and NAT egress is
@@ -102,7 +102,7 @@ POD_NETWORK_REAP_MIN_AGE_SECONDS = 10 * 60
 
 
 def rental_network_for(container_name: str) -> str:
-    """The bridge of this rental container alone (DAH-6736); a renamed-aside edit original keeps sharing it."""
+    """The bridge of this rental container alone (DAH-6737); a renamed-aside edit original keeps sharing it."""
     return f"{RENTAL_NETWORK_NAME}-{container_name}"
 
 
@@ -1205,7 +1205,7 @@ class RentalDockerSdkClient:
         network of that name whose options do not turn ICC off is refused rather than used: running
         the pod on it would silently restore the docker0 behaviour this network exists to end.
 
-        A rental's own bridge (DAH-6736) is created from the `lium-rentals` template, which is ensured
+        A rental's own bridge (DAH-6737) is created from the `lium-rentals` template, which is ensured
         first, and before it is created the bridges of rentals that are gone are removed, so ended
         rentals never use up the daemon's address pools.
         """
@@ -1246,7 +1246,7 @@ class RentalDockerSdkClient:
 
         A container keeps the network it was created with across `docker start`, so a pod created
         before rentals ran on `network` would stay on a shared bridge (docker0, or the one
-        `lium-rentals` every rental used before DAH-6736) for its whole life. Published ports are host
+        `lium-rentals` every rental used before DAH-6737) for its whole life. Published ports are host
         config and survive the move. A running container is left alone (a move would cut its live
         connections), and so is one on host, none or another container's namespace: only the shared
         bridges are the old setups this replaces.
@@ -1266,7 +1266,7 @@ class RentalDockerSdkClient:
         return True
 
     def _remove_unused_pod_networks_sync(self) -> None:
-        """Remove rental bridges no container references any more (ended rentals, DAH-6736).
+        """Remove rental bridges no container references any more (ended rentals, DAH-6737).
 
         A stopped container still references its network, so a stopped pod keeps its bridge; a bridge
         younger than POD_NETWORK_REAP_MIN_AGE_SECONDS is kept, as a racing create may not have made its

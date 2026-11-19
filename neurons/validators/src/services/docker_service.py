@@ -12749,7 +12749,7 @@ class DockerService:
                 await run_logged_rental_docker_sdk_operation(
                     operation="start_container",
                     log_extra=default_extra,
-                    # a pod created before it had a bridge of its own (DAH-6736) would keep a shared one across
+                    # a pod created before it had a bridge of its own (DAH-6737) would keep a shared one across
                     # every `docker start`; start moves it onto its own
                     call=lambda: docker_client.start(
                         container_name=container_name, network=rental_network_for(container_name)

@@ -1753,7 +1753,7 @@ def get_egress_probe_network():
                 mode = next(iter((info.get("NetworkSettings") or {}).get("Networks") or {}), "bridge")
             elif not mode or mode == "none" or mode.startswith("container:"):
                 raise ValueError(f"pod network mode {mode!r}")
-            # a pod's own bridge is that tenant's alone (DAH-6736); the template has the same egress path
+            # a pod's own bridge is that tenant's alone (DAH-6737); the template has the same egress path
             return EGRESS_RENTAL_NETWORK if mode.startswith(f"{EGRESS_RENTAL_NETWORK}-") else mode
     return EGRESS_RENTAL_NETWORK
 

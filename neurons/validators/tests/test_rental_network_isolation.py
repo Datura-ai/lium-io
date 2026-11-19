@@ -1,4 +1,4 @@
-"""DAH-3199 / DAH-6736: every rental container runs on an ICC-off bridge of its own, not on docker0.
+"""DAH-3199 / DAH-6737: every rental container runs on an ICC-off bridge of its own, not on docker0.
 
 The daemon's default bridge lets every container on it reach every other one, and a pod holds
 NET_ADMIN, so two rentals on a split host could otherwise open connections to each other's
