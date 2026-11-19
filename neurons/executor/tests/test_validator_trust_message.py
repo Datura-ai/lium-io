@@ -860,6 +860,9 @@ def test_a_restart_after_a_shutdown_that_could_not_write_trusts_no_validator_unt
         real_write(path, data)
 
     monkeypatch.setattr(trust_service, "_write_json", write)
+    # every write of the shutdown is refused too: the writer tries again until the deadline
+    monkeypatch.setattr(trust_service, "FLUSH_SECONDS", 0.2)
+    monkeypatch.setattr(trust_service, "FLUSH_RETRY_PAUSE_SECONDS", 0.01)
 
     async def run():
         writer = trust.start_persisting()
@@ -914,3 +917,93 @@ def test_a_clean_shutdown_restart_keeps_trusting_without_backend_or_chain(tmp_pa
     restarted.load()
     asyncio.run(restarted.refresh_owner())
     assert restarted.hotkeys({}) == {"signed": new_validator.ss58_address}
+
+
+def test_a_failed_write_at_shutdown_is_written_again(tmp_path, monkeypatch, owner, old_validator, new_validator):
+    trust = _trust(tmp_path, owner)
+    assert trust.offer(_signed(owner, old_validator, 1))
+    monkeypatch.setattr(trust_service, "FLUSH_RETRY_PAUSE_SECONDS", 0.01)
+    real_write, failures = trust_service._write_json, [OSError("transient")]
+
+    def write_once_failing(path, data):
+        if failures:
+            raise failures.pop()
+        real_write(path, data)
+
+    async def run():
+        writer = trust.start_persisting()
+        await asyncio.sleep(0.05)
+        monkeypatch.setattr(trust_service, "_write_json", write_once_failing)
+        assert trust.offer(_signed(owner, new_validator, 2))
+        await trust.stop_persisting(writer)
+        return writer.done()
+
+    assert asyncio.run(run())
+    assert failures == []
+    state = _state(tmp_path)
+    assert state["messages"][owner.ss58_address]["message"] == trust_line(new_validator.ss58_address, 2)
+    assert state["running"] is False
+
+
+def _crashed_first_boot(tmp_path, owner) -> ValidatorTrust:
+    """A node that never took a message: its run wrote the running mark, then the process died (no shutdown)."""
+    trust = _trust(tmp_path, owner)
+
+    async def run():
+        writer = trust.start_persisting()
+        for _ in range(200):
+            if trust._written is not None and trust._written["running"]:
+                break
+            await asyncio.sleep(0.01)
+        writer.cancel()
+
+    asyncio.run(run())
+    assert _state(tmp_path)["running"] is True
+    restarted = ValidatorTrust(state_dir=tmp_path, image_message=tmp_path / "absent.json")
+    restarted.load()
+    assert restarted.closed()
+    return restarted
+
+
+def test_a_crash_restart_of_a_node_holding_no_message_trusts_baked_once_the_backend_publishes_none(
+    tmp_path, monkeypatch, owner, old_validator
+):
+    # review: the backend answers 404 while no message is configured, so a served message can never confirm
+    restarted = _crashed_first_boot(tmp_path, owner)
+    monkeypatch.setattr(trust_service.settings, "COMPUTE_REST_API_URL", "http://backend")
+    _chain(monkeypatch, lambda url: owner.ss58_address)
+    _backend(monkeypatch, lambda *a, **k: MagicMock(status_code=404))
+    asyncio.run(restarted.refresh_owner())
+    asyncio.run(restarted.refresh_message())
+    baked = {"current": old_validator.ss58_address}
+    assert restarted.hotkeys(baked) == baked
+    assert _accepts(monkeypatch, restarted, old_validator, baked) == "current"
+
+
+def test_a_404_before_the_chain_names_the_owner_does_not_confirm(tmp_path, monkeypatch, owner, old_validator):
+    restarted = _crashed_first_boot(tmp_path, owner)
+    monkeypatch.setattr(trust_service.settings, "COMPUTE_REST_API_URL", "http://backend")
+
+    def down(*args, **kwargs):
+        raise ConnectionError("down")
+
+    _chain(monkeypatch, down)
+    _backend(monkeypatch, lambda *a, **k: MagicMock(status_code=404))
+    asyncio.run(restarted.refresh_owner())
+    asyncio.run(restarted.refresh_message())
+    assert restarted.hotkeys({"current": old_validator.ss58_address}) == {}
+
+
+def test_a_404_does_not_confirm_a_node_that_holds_a_message(tmp_path, monkeypatch, owner, old_validator):
+    # the node took a message before the crash: a newer one may have replaced it, and a 404 confirms neither
+    _keep(tmp_path, owner, _signed(owner, old_validator, 1))
+    state = _state(tmp_path) | {"owner": owner.ss58_address, "running": True}
+    (tmp_path / STATE_FILE).write_text(json.dumps(state))
+    restarted = ValidatorTrust(state_dir=tmp_path, image_message=tmp_path / "absent.json")
+    restarted.load()
+    monkeypatch.setattr(trust_service.settings, "COMPUTE_REST_API_URL", "http://backend")
+    _chain(monkeypatch, lambda url: owner.ss58_address)
+    _backend(monkeypatch, lambda *a, **k: MagicMock(status_code=404))
+    asyncio.run(restarted.refresh_owner())
+    asyncio.run(restarted.refresh_message())
+    assert restarted.hotkeys({}) == {}

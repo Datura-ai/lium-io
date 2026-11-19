@@ -20,7 +20,8 @@ validator: it never falls back to one that may have been replaced. That unconfir
 state, so a restart before the confirmation stays closed too. The state a run writes is marked running, and the
 shutdown writes the newest state marked ended: a start that finds the running mark (the last run ended without
 writing its newest state: a failed or cut-short shutdown write, a crash) cannot tell whether a newer message was
-taken, and stays closed the same way until a served message confirms a validator. A kept state with any field
+taken, and stays closed the same way until a served message confirms a validator, or, for a node holding no
+message, until the backend answers that it publishes none (a 404 after a chain read named the owner). A kept state with any field
 missing or malformed is unreadable. Only a volume that refused every write of a run, the running mark included,
 cannot be read for it: a restart then reads the last state the volume holds.
 
@@ -67,6 +68,7 @@ FETCH_TIMEOUT_SECONDS = 5.0
 FETCH_LIMIT_BYTES = 64 * 1024
 # the shutdown waits this long for the last state write; well inside the pod's termination grace
 FLUSH_SECONDS = 5.0
+FLUSH_RETRY_PAUSE_SECONDS = 0.2
 
 
 async def fetch_json(url: str, body: dict | None = None) -> dict | None:
@@ -312,7 +314,12 @@ class ValidatorTrust:
                         # was saved meanwhile; a change made during the write waits for its own
                         self._unsaved = self._state() != state
                 if stopping:
-                    return
+                    if self._state() == self._written:
+                        return
+                    # no refresh comes after a shutdown: a failed last write is written again until it lands or
+                    # stop_persisting's FLUSH_SECONDS deadline ends the writer
+                    await asyncio.sleep(FLUSH_RETRY_PAUSE_SECONDS)
+                    self._wake.set()
         finally:
             self._wake = None
 
@@ -348,7 +355,8 @@ class ValidatorTrust:
         }
 
     async def refresh_message(self) -> None:
-        """A 404 or any failure keeps the message held."""
+        """A 404 or any failure keeps the message held. A 404 also confirms a node that holds no message: the backend
+        publishes none, so no message can have replaced the baked validators."""
         if not self.enabled:
             return
         if self._unsaved:
@@ -362,6 +370,9 @@ class ValidatorTrust:
         try:
             data = await fetch_json(url)
             if data is None:
+                if self._unconfirmed and self.held is None:
+                    self._unconfirmed = False
+                    self._save()
                 return
             signed = SignedTrustMessage(message=str(data["message"]), signature=str(data["signature"]))
             self.offer(signed)
