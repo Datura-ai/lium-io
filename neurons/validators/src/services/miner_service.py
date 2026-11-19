@@ -89,6 +89,7 @@ from services.task.availability import (
     build_rented_executor_not_listed_event,
     RunningOutageTally,
 )
+from services.task.messages import TenantEnforcementMessages
 from incentive.config import BASE_GPU_MAP
 from services.task_service import TaskService, JobResult
 from services.storage_operations import (
@@ -103,6 +104,11 @@ from services.storage_operations import upload_secrets_file
 from services.upload_nonce import upload_nonce_for_miner
 
 logger = logging.getLogger(__name__)
+
+# rows the wave builds from the miner's answer alone, without checking the node (DAH-6596)
+MINER_ANSWER_REASON_CODES = frozenset(
+    {AvailabilityErrorCode.EXECUTOR_UNREACHABLE_BY_MINER, AvailabilityErrorCode.RENTED_EXECUTOR_NOT_LISTED}
+)
 
 
 def _miner_job_script_path(script_name: str) -> str:
@@ -317,9 +323,13 @@ POD_GPUS_GONE_RERUN_MIN_SECONDS = 240
 
 
 def _pod_left_on_old_gpus(result) -> bool:
-    """The result failed because a rented pod still runs on GPUs the node no longer has."""
+    """The result failed because a rented pod still runs on GPUs the node no longer has, or its container could not
+    be read right after the node's GPUs changed (DAH-6546: the backend is often recreating it then)."""
     if not isinstance(result, JobResult) or result.is_successful:
         return False
+    event = result.validation_event
+    if event is not None and event.reason_code == "GPU_LOST_POD_UNREAD":
+        return True
     return any(
         error.get("reason_code") == "GPU_LOST"
         and "pod_gpus_gone" in ((error.get("what_we_saw") or {}).get("faults") or [])
@@ -405,6 +415,8 @@ class MinerService:
         self.express_published: dict[str, str] = {}
         # the same uuid -> the miner hotkey that pass was for: two miners can report one uuid (review 4565706519)
         self.express_published_miner: dict[str, str] = {}
+        # the same uuid -> time.monotonic() of that pass: a miner-answer row of the wave built before it is stale
+        self.express_passed_at: dict[str, float] = {}
         # DAH-5635: the running cycle's outage share for publish_unreachable_early; None = publish nothing early
         self.outage_tally: RunningOutageTally | None = None
         # DAH-5635: (miner hotkey, executor uuid) -> the availability errors this process's last cycle publish sent for
@@ -521,7 +533,7 @@ class MinerService:
         its old GPUs, once the backend has had time to recreate the pod on the new cards, and
         (a wave only: an express run publishes its own result next) publish a pass at once
         (spec-only, as publish_gpu_set_changes; the cycle's publish carries the same result).
-        Kept to the miner's job budget; a rerun with no result keeps the first."""
+        Kept to the miner's job budget; a rerun with no result (an error or a timeout) keeps the first."""
         stranded = [i for i, result in enumerate(raw_results) if _pod_left_on_old_gpus(result)]
         if not stranded:
             return
@@ -542,8 +554,15 @@ class MinerService:
             *(run(executors[i], timeout) for i in stranded), return_exceptions=True
         )
         for i, rerun in zip(stranded, reruns):
-            # a failed rerun keeps the first result: its pod_gpus_gone event moves the pod off the cycle report
-            if isinstance(rerun, JobResult) and rerun.is_successful:
+            # DAH-6546: a rerun that ran its checks is the latest verdict, failed or not; a pod still on the old GPUs
+            # fails it with its own pod_gpus_gone event, and its rented-GPU drop report moves the pod as the first run's
+            # did. An errored run (create_task's log_status "error") has no verdict, nor has one whose SSH session died
+            # (its later checks never ran, review 4602277079): the first stands.
+            if (
+                isinstance(rerun, JobResult)
+                and rerun.log_status != "error"
+                and rerun.failure_reason_code != TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason
+            ):
                 raw_results[i] = rerun
         passed = [r for r in reruns if isinstance(r, JobResult) and r.is_successful]
         logger.info(
@@ -1106,9 +1125,14 @@ class MinerService:
             self.express_published.get(uuid) == job_batch_id and self.express_published_miner.get(uuid) == miner_hotkey
         )
 
-    def _express_passed_after_unreachable(self, result: JobResult, miner_hotkey: str) -> bool:
-        return result.failure_reason_code == AvailabilityErrorCode.EXECUTOR_UNREACHABLE_BY_MINER and (
-            self._express_passed(result.executor_info.uuid, result.job_batch_id, miner_hotkey)
+    def _express_passed_after_miner_answer(self, result: JobResult, miner_hotkey: str) -> bool:
+        """A row from the miner's answer (it could not reach the node, or left the rented node out) that the miner gave
+        before an express pass of that node under the same cycle id and miner: the pass is newer and stands (DAH-6596)."""
+        uuid = str(result.executor_info.uuid).lower()
+        return (
+            result.failure_reason_code in MINER_ANSWER_REASON_CODES
+            and self._express_passed(uuid, result.job_batch_id, miner_hotkey)
+            and self.express_passed_at.get(uuid, float("-inf")) > result.observed_at
         )
 
     def _build_unreachable_known_results(
@@ -1364,7 +1388,7 @@ class MinerService:
             "miner_hotkey": miner_hotkey,
         }
         # checked again here: an express pass can land after the wave built the row (review 4582945951)
-        results = [result for result in results if not self._express_passed_after_unreachable(result, miner_hotkey)]
+        results = [result for result in results if not self._express_passed_after_miner_answer(result, miner_hotkey)]
         if not results:
             return
 
@@ -2248,6 +2272,8 @@ class MinerService:
                 )
 
             msg = _parse_miner_response(response_data)
+            # DAH-6596: what the miner's answer says is as old as the answer, not as the rows built from it after the run
+            answered_at = time.monotonic()
             
             # Track whether SSH key was successfully accepted
             ssh_key_accepted = False
@@ -2328,14 +2354,12 @@ class MinerService:
                 )
                 # DAH-3558: a rented node the miner left out of msg.executors gets a failed
                 # result, so the wave records the outage instead of nothing.
-                results.extend(
-                    self._build_not_listed_rented_results(
-                        payload, rented_data, msg.executors, executor_id
-                    )
-                )
-                results.extend(
-                    self._build_unreachable_known_results(payload, rented_data, msg, executor_id)
-                )
+                answer_rows = self._build_not_listed_rented_results(
+                    payload, rented_data, msg.executors, executor_id
+                ) + self._build_unreachable_known_results(payload, rented_data, msg, executor_id)
+                for row in answer_rows:
+                    row.observed_at = answered_at
+                results.extend(answer_rows)
 
                 # DAH-2667: while the miner's key is still installed and its idle hosts are free,
                 # measure every RoCE pair. Best effort — an unmeasured pair is simply not sold as a

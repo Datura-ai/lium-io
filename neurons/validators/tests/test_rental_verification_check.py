@@ -261,7 +261,7 @@ async def test_rental_verification_success():
         "rental_in_progress": False,  # no customer rental in this state
         "gpu_uuids": [],  # this state carries no scraped gpu details
         "cpu_count": None,  # this state carries no scraped cpu count
-        "loopback_plugin": "vloopback:v2",  # the plugin alias new rental volumes are created on
+        "loopback_plugin": "vloopback:v3",  # the plugin alias new rental volumes are created on (v3 by default)
         "upload_nonce": None,  # a miner the metagraph does not show relaying the nonce gets none
     }
 

@@ -84,7 +84,7 @@ async def test_a_card_flagged_under_a_live_rental_records_the_marker(context_fac
 
     assert result.passed is False and result.fatal is False
     redis = ctx.services.redis
-    assert redis.ttl[KEY] == module.MARKER_TTL_SECONDS
+    assert redis.ttl.get(KEY) is None
     marker = json.loads(redis.store[KEY])
     assert marker["source"] == "gpu.validate.memory_health" and marker["at"]
     assert (marker["verdict"], marker["flags"]) == ("flagged", FLAGS)
@@ -134,7 +134,21 @@ async def test_on_a_fault_fails_the_node_and_keeps_the_marker(context_factory):
     assert "gpu 1: wrong result" in result.event.what_we_saw["error"]
     assert validation.calls == 1 and len(runner.calls) == 1
     assert KEY in ctx.services.redis.store
-    assert ctx.services.redis.ttl[KEY] == module.MARKER_TTL_SECONDS
+    assert ctx.services.redis.ttl.get(KEY) is None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_recheck_drops_the_ttl_an_older_validator_set(context_factory):
+    # DAH-6355: the marker ends only on a pass, so a 3-day TTL left from before must not relist the node unchecked
+    runner = FakeRunner(probe_stdout("fault", faults=["gpu 1: wrong result in gather"]))
+    ctx = _idle_ctx(context_factory, runner, FakeValidation(_all_cards("", "")))
+    ctx.services.redis.ttl[KEY] = 3 * 24 * 3600
+
+    result = await PostRentalGpuRecheckCheck().run(ctx)
+
+    assert result.passed is False
+    assert KEY in ctx.services.redis.store
+    assert ctx.services.redis.ttl.get(KEY) is None
 
 
 @pytest.mark.asyncio
@@ -174,7 +188,7 @@ async def test_on_a_probe_without_a_verdict_keeps_the_marker_and_skips_the_strea
 
     assert result.passed and result.event.reason_code == Msg.INCONCLUSIVE.reason
     assert KEY in ctx.services.redis.store
-    assert ctx.services.redis.ttl[KEY] == module.MARKER_TTL_SECONDS
+    assert ctx.services.redis.ttl.get(KEY) is None
     # the pipeline's own probe already counted this cycle
     assert probe_module._unknown_streak == {}
 
@@ -201,6 +215,11 @@ async def test_no_all_cards_matmul_is_inconclusive_on_a_multi_card_node(
         _all_cards("ssh_error: channel closed", ""),
         _all_cards("ssh_error: channel closed", "timeout"),
         _all_cards("", "", over_wall_clock=True),
+        # review (17 Nov): a multi-card claim the probe could not run (no card details or size, our own cipher
+        # failed) ran no card, so it says nothing about them: inconclusive as before, whatever the flags
+        SimpleNamespace(
+            passed=False, failure_reason="not probed: no card details", over_wall_clock=False, per_card=[]
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -210,7 +229,20 @@ async def test_an_all_cards_matmul_lost_to_ssh_or_time_is_inconclusive(context_f
     result = await PostRentalGpuRecheckCheck().run(ctx)
 
     assert result.passed and result.event.reason_code == Msg.INCONCLUSIVE.reason
-    assert ctx.services.redis.ttl[KEY] == module.MARKER_TTL_SECONDS
+    assert ctx.services.redis.ttl.get(KEY) is None
+
+
+@pytest.mark.asyncio
+async def test_a_card_that_times_out_again_on_the_retry_fails_the_recheck(context_factory):
+    # lio#2305: the probe retries a run with a timeout once; a card that times out again is a verdict here, whatever
+    # the MATMUL_ALLCARDS flags say (the recheck always runs the probe)
+    all_cards = _all_cards("", "timeout_after_retry")
+    ctx = _idle_ctx(context_factory, FakeRunner(probe_stdout("ok")), FakeValidation(all_cards))
+
+    result = await PostRentalGpuRecheckCheck().run(ctx)
+
+    assert result.passed is False and result.event.reason_code == Msg.FAILED.reason
+    assert KEY in ctx.services.redis.store
 
 
 @pytest.mark.asyncio
@@ -236,7 +268,7 @@ async def test_a_filler_cycle_renews_the_marker(context_factory):
 
     assert result.passed and result.event.reason_code == Msg.FILLER_SKIPPED.reason
     assert runner.calls == [] and validation.calls == 0
-    assert ctx.services.redis.ttl[KEY] == module.MARKER_TTL_SECONDS
+    assert ctx.services.redis.ttl.get(KEY) is None
     assert json.loads(ctx.services.redis.store[KEY])["filler_skips"] == 1
 
 
