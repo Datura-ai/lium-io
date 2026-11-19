@@ -10,6 +10,7 @@ from typing import Optional
 
 from preflight.base import PreflightCheck, CheckResult, CheckStatus
 from preflight.utils import suppress_library_output, get_gpu_info
+from services.verifyx_network_probe import is_cloudflare_probe_failure
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +167,7 @@ class VerifyXCheck(PreflightCheck):
             network_timeout_seconds = verifyx_config.get('network_timeout_seconds')
 
             # 1) Detect GPU
-            gpu_info = get_gpu_info(include_memory=True)
+            gpu_info = get_gpu_info(include_memory=True, raise_errors=True)
             if not gpu_info:
                 raise NoGpuError("No GPUs detected for verifyx test")
 
@@ -263,7 +264,14 @@ class VerifyXCheck(PreflightCheck):
         errors = []
 
         net = response_data.get("network_execution", {})
-        if not net.get("success", False):
+        # a Cloudflare-side fault is not the host's: the validator then judges the package download
+        # (verifyx_validation_service), so the preflight must not refuse a node the validator passes
+        cloudflare_fault = (
+            is_cloudflare_probe_failure(net) and (net.get("download") or {}).get("status") == "success"
+        )
+        if cloudflare_fault:
+            logger.debug("Cloudflare probe failed (%s); the package download passed", net.get("error"))
+        elif not net.get("success", False):
             errors.append(f"Network: {net.get('error', 'Network test failed')}")
 
         mem = response_data.get("memory_execution", {})

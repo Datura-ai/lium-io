@@ -84,6 +84,11 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append("Advertised CPU cores exceed the host's physical cores")
 
+    if not ctx.spec_floor_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("Reported specs below the hardware floor")
+
     # Provider-side load gate (DAH-2734): the host burns CPU or disk outside Lium's containers
     # while it sells that capacity — the CPU/disk twin of the foreign-GPU gate. Same mechanics
     # as the CPU-truth gate above: the check is non-fatal, so only this line zeroes the score,
@@ -162,6 +167,13 @@ def calculate_scores(
         actual_score = 0.0
         job_score = 0.0
         warning_messages.append("A GPU is not the model the node reports")
+
+    # Node account gate (DAH-6539): a rented node on another account's machine scores 0; its renter's pod runs on and
+    # is billed as usual.
+    if not ctx.node_account_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("The node is not on the machine its account registered")
 
     # EMA verifyx download speed check — threshold enforced upstream in VerifyXCheck
     ema_verifyx_download = ((ctx.state.specs or {}).get("network") or {}).get(

@@ -729,7 +729,7 @@ def test_a_capability_check_is_named_and_removed_even_when_it_times_out() -> Non
     # the exact name the stale cleanup removes by, and nothing looser
     from services.container_cleanup import never_started_check_containers
 
-    assert never_started_check_containers(f"a1 {name}") == ["a1"]
+    assert never_started_check_containers(f"{'a1' * 32} {name}") == ["a1" * 32]
     assert removed == [["docker", "rm", "-f", name]]
 
 

@@ -34,7 +34,7 @@ from tests.test_rental_price_incentive_flow import _make_pcc_job
 UNKNOWN = "NVIDIA RTX Future 9000"
 # lium-platform keeps a byte-identical apps/lium/backend/apps/server/src/core/gpu_reference_table.py
 # and pins the same hash
-GPU_REFERENCE_TABLE_SHA256 = "dc5b7fd493229374bbfcc10a313c9fb1d5c4a393cdd90e0e8d3933ac2344e462"
+GPU_REFERENCE_TABLE_SHA256 = "1082a78e5d85cbed2646436decdafd7d132b801c28e801f027cc4e71c3b5fe0c"
 PRICES = {model: price for model, (price, _) in GPU_REFERENCE_TABLE.items()}
 CANDIDATES = list(GPU_REFERENCE_TABLE)
 
@@ -231,3 +231,10 @@ def test_an_unknown_card_has_no_hard_price_limit(context_factory):
     )
 
     assert calculate_scores(context_factory(executor=executor, state=state), rented=True)[0] == 1.0
+
+
+def test_a_bare_nvidia_h100_is_scored_as_the_h100_pcie_not_by_vram():
+    # 80 GB HBM2e H100 (10de:2336) the driver names bare "NVIDIA H100" fell to the 80 GB VRAM reference (15 Nov)
+    from services.gpu_spec_table import reference_gpu_model
+
+    assert reference_gpu_model("NVIDIA H100", 81559) == "NVIDIA H100 PCIe"

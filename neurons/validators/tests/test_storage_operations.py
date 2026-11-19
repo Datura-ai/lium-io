@@ -1,3 +1,5 @@
+import inspect
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -62,13 +64,11 @@ def test_workspace_field_probe_finds_the_field_in_this_repo_s_executor_models(fi
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("helper_running", "runner_alive"), [(True, True), (False, True), (True, False), (False, False)]
-)
-async def test_start_never_removes_a_running_helper(
-    monkeypatch: pytest.MonkeyPatch, helper_running: bool, runner_alive: bool
+@pytest.mark.parametrize("runner_alive", [True, False])
+async def test_a_repeated_dispatch_never_starts_a_second_runner(
+    monkeypatch: pytest.MonkeyPatch, runner_alive: bool
 ) -> None:
-    # A repeated dispatch sees no runner PID yet (STARTING) while the first run's helper works.
+    # The first runner has read (and deleted) its spec but has no PID or helper yet: the state is STARTING.
     monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
     monkeypatch.setattr(storage_operations.asyncio, "sleep", AsyncMock())
     commands: list[str] = []
@@ -79,14 +79,12 @@ async def test_start_never_removes_a_running_helper(
         status = 1 if command.startswith("test -e") else 0
         if "echo STARTING" in command:
             stdout = "STARTING\n"
-        elif "docker ps -q" in command:
-            # a dead runner's helper is an orphan: only a live runner's helper is kept
-            status = 0 if helper_running and runner_alive else 1
+        elif command.startswith("pgrep -f"):
+            status = 0 if runner_alive else 1
         return SimpleNamespace(exit_status=status, stdout=stdout, stderr="")
 
     ssh_client = SimpleNamespace(run=run, start_sftp_client=None)
-    kept = helper_running and runner_alive
-    if kept:
+    if runner_alive:
         files = await storage_operations.start_storage_operation(
             ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
         )
@@ -97,7 +95,89 @@ async def test_start_never_removes_a_running_helper(
             await storage_operations.start_storage_operation(
                 ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
             )
-    helper = f"lium-storage-{str(OPERATION_ID)[:12]}"
-    probe = next(c for c in commands if "docker ps -q" in c)
-    assert f"name=^{helper}$" in probe and "pgrep -f" in probe
-    assert any("docker rm -f" in c for c in commands) is not kept
+    probe = next(c for c in commands if c.startswith("pgrep -f"))
+    assert f"[-]-spec {storage_operations.StorageOperationFiles.for_operation(OPERATION_ID).spec}" in probe
+    assert any("docker rm -f" in c for c in commands) is not runner_alive
+    assert any("nohup" in c for c in commands) is False  # never launched a second wrapper
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_reports_with_the_reporter_the_runner_left_in_its_spec(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    report = AsyncMock(return_value=True)
+    monkeypatch.setattr(storage_operations, "_report_cancelled", report)
+    reporter = {"api_url": "https://api.example", "auth_token": "t", "resource": "restore"}
+    # what the runner leaves once it has read the spec; no copy of the token is kept anywhere else
+    spec = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID).spec
+    spec.write_text(json.dumps({"reporter": reporter}))
+
+    async def run_locally(command: str, check: bool = False) -> SimpleNamespace:
+        result = subprocess.run(["sh", "-c", command.replace("/usr/bin/docker", "true")], capture_output=True, text=True)
+        return SimpleNamespace(exit_status=result.returncode, stdout=result.stdout, stderr=result.stderr)
+
+    await storage_operations.cancel_storage_operation(SimpleNamespace(run=run_locally), OPERATION_ID)
+
+    report.assert_awaited_once_with(OPERATION_ID, {"reporter": reporter})
+    assert "redis" not in inspect.signature(storage_operations.start_storage_operation).parameters
+
+
+@pytest.mark.parametrize("exit_code", [0, 3])
+def test_detached_wrapper_keeps_the_log_only_when_the_runner_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int
+) -> None:
+    # runs the real launch wrapper with a fake runner; a failed run must leave its log behind
+    import asyncio as aio
+
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", storage_operations.PurePosixPath(str(tmp_path)))
+    monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
+    runner = tmp_path / "runner"
+    runner.write_text(f"#!/bin/sh\necho working\nexit {exit_code}\n")
+    runner.chmod(0o755)
+    monkeypatch.setattr(storage_operations, "REMOTE_RUNNER_PATH", str(runner))
+    launched: list[str] = []
+
+    async def run(command: str, check: bool = False) -> SimpleNamespace:
+        if command.startswith("nohup"):
+            launched.append(command)
+            return SimpleNamespace(exit_status=0, stdout="", stderr="")
+        done = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
+        return SimpleNamespace(exit_status=done.returncode, stdout=done.stdout, stderr=done.stderr)
+
+    class Sftp:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def open(self, path, mode):
+            class Handle:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *exc):
+                    return False
+
+                async def write(self, data):
+                    open(path, "w").write(data)
+
+            return Handle()
+
+        async def chmod(self, path, mode):
+            return None
+
+    ssh_client = SimpleNamespace(run=run, start_sftp_client=lambda: Sftp())
+    files = aio.run(
+        storage_operations.start_storage_operation(
+            ssh_client, "sh", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+        )
+    )
+    subprocess.run(["sh", "-c", launched[0].removeprefix("nohup ").rsplit(" &", 1)[0]], check=True)
+    log = Path(str(files.log))
+    assert not Path(str(files.status)).exists()
+    if exit_code:
+        assert log.read_text().splitlines() == ["working", "runner exited 3"]
+    else:
+        assert not log.exists()

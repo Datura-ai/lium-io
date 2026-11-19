@@ -33,10 +33,12 @@ cp .env.example .env
 # Edit .env with your settings:
 # - MINER_HOTKEY_SS58_ADDRESS
 # - SSH_PORT
-# - RENTING_PORT_RANGE
+# - RENTING_PORT_RANGE (comma list, e.g. "19001,19002,19003"; no dash ranges)
 # - CVM_VCPUS, CVM_MEMORY, CVM_DISK
 # - CVM_GPUS (e.g., "all" or "19:00.0,3b:00.0")
 ```
+
+**Disk size.** `CVM_DISK` must be at least 1.5x the total VRAM of the GPUs you pass through, or the validator pays no idle incentive for the node. It compares the filesystem size the CVM reports, so leave about 10% headroom: 8x H100 needs about 1100G, 8x H200 about 1900G, 8x B200 about 2400G. The CVM disk is `run/vms/<name>/hda.img` inside this checkout, so clone the repository on the disk that has the space (for example under `/data`) before `new`.
 
 ### 4. Create CVM Instance
 
@@ -49,6 +51,8 @@ cp .env.example .env
 ```bash
 ./lium-cvm.sh run my-executor
 ```
+
+`run` keeps QEMU in the foreground: closing the terminal or pressing Ctrl+C stops the CVM. Start it inside `tmux` (or a systemd unit) so it outlives your SSH session. The CVM does not start by itself after a host reboot; run it again.
 
 `lium-cvm.sh` subcommands: `check`, `download`, `new <name> [--env local|staging|prod] [--enable-logs] [--enable-sysinfo]`
 (`--env` picks `app/docker-compose.local.yml`, `app/docker-compose.staging.yml` or `app/docker-compose.yml`; default `prod`),
@@ -105,7 +109,7 @@ RENTING_PORT_RANGE="19001,19002,19003"
 MINER_HOTKEY_SS58_ADDRESS=your_hotkey_here   # your provider hotkey (SS58)
 VALIDATOR_HOTKEY_SS58_ADDRESS=...            # measured into the CVM attestation (RTMR) by app/init_script.sh; the executor's trusted validator is fixed per image: docker_build.sh writes src/core/config_override.py from VALIDATOR_HOTKEY_SS58 at build time (src/core/config.py holds the default)
 ENABLE_TDX_ATTESTATION=true
-ENABLE_GPU_ATTESTATION=false                 # optional; GPU_ATTESTATION_ARCH=HOPPER | BLACKWELL when on
+GPU_ATTESTATION_ARCH=HOPPER                  # HOPPER | BLACKWELL
 # LOCAL_VERIFY_MAX_DEADLINE_SECONDS=600      # optional; tunes the validator's one-call POST /verify over its SSH tunnel (also LOCAL_VERIFY_INTENT_WINDOW_SECONDS)
 
 # Measured executor-runner release (release notes, section "CVM attestation") — required
@@ -114,7 +118,7 @@ EXECUTOR_RUNNER_IMAGE_DIGEST=sha256:...
 # Resources
 CVM_VCPUS=16
 CVM_MEMORY=64G
-CVM_DISK=200G
+CVM_DISK=1100G  # at least 1.5x total GPU VRAM (see above)
 CVM_GPUS=all  # or "19:00.0,3b:00.0"
 ```
 

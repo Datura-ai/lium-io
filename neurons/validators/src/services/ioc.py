@@ -51,6 +51,7 @@ async def initiate_services():
                 FallbackVerifier(port_tester, runner),
             ),
             DindProbe(DindVerifier(ioc["SSHService"])),
+            port_claims=ioc["RedisService"],
         ),
     )
     ioc["DockerService"] = DockerService(
