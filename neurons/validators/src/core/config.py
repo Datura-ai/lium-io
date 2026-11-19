@@ -976,7 +976,7 @@ class Settings(BaseSettings):
         ),
     )
     RENTAL_HOST_RAM_RESERVE_GB: int = Field(
-        env="RENTAL_HOST_RAM_RESERVE_GB", default=16, ge=0,
+        env="RENTAL_HOST_RAM_RESERVE_GB", default=8, ge=0,
         description=(
             "RAM kept back for the host's own use outside the rental's cgroup (sshd, dockerd, the "
             "executor, NVIDIA driver memory): the container's limit is at most (host MemTotal minus "
