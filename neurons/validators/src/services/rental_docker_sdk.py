@@ -1526,6 +1526,20 @@ def build_gpu_docker_config(
 
 # The backend's add fence (lium-platform DAH-6441) expires after an hour; this bound is what makes that expiry safe.
 AUTHORIZED_KEYS_APPEND_DEADLINE_SECONDS = 60
+AUTHORIZED_KEYS_LOCK_WAIT_SECONDS = 30
+# the lium CLI's transfer-key lock (TRANSFER_KEY_LOCK, ~/.ssh/.lium-cp.lock): its cp grant and revoke wait for these edits
+AUTHORIZED_KEYS_LOCK_FILE = ".lium-cp.lock"
+
+
+def _authorized_keys_lock(quoted_dir: str, busy_exit: int) -> str:
+    """Serializes the add and the remove, so a remove's read-filter-write never drops a key an add appended in between
+    and a delayed remove never writes back over a later one. BusyBox's flock has no -w, so poll -n. An image without
+    flock edits unlocked, as before: a lock that survives a killed holder would block every later edit."""
+    return (
+        f"if command -v flock >/dev/null 2>&1; then exec 9>>{quoted_dir}/{AUTHORIZED_KEYS_LOCK_FILE} || exit {busy_exit}; "
+        f"waited=0; until flock -n 9; do if [ $waited -ge {AUTHORIZED_KEYS_LOCK_WAIT_SECONDS} ]; then exit "
+        f"{busy_exit}; fi; waited=$((waited + 1)); sleep 1; done; fi; "
+    )
 
 
 def build_authorized_keys_exec_spec(
@@ -1549,7 +1563,8 @@ def build_authorized_keys_exec_spec(
     script = (
         "start=$(cat /proc/uptime) || exit 1; "
         f"mkdir -p {quoted_dir} && chmod 700 {quoted_dir} && keys=$(cat) || exit 1; "
-        "now=$(cat /proc/uptime) || exit 1; "
+        + _authorized_keys_lock(quoted_dir, 75)
+        + "now=$(cat /proc/uptime) || exit 1; "
         f'if [ $(( ${{now%%.*}} - ${{start%%.*}} )) -gt {append_deadline_seconds} ]; then '
         'echo "authorized_keys append deadline passed" >&2; exit 75; fi; '
         f'printf "%s\\n" "$keys" >> {shlex.quote(target_path)}'
@@ -1577,8 +1592,9 @@ def build_remove_authorized_keys_exec_spec(
     # into host-side Docker shell text or into this argv.
     script = (
         "set -e; "
-        f"mkdir -p {quoted_dir} && "
-        f"touch {quoted_path} && "
+        f"mkdir -p {quoted_dir}; "
+        + _authorized_keys_lock(quoted_dir, 1)
+        + f"touch {quoted_path} && "
         "keys=$(mktemp) && filtered=$(mktemp) && "
         "trap 'rm -f \"$keys\" \"$filtered\"' EXIT && "
         "cat > \"$keys\" && "

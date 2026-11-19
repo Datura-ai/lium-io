@@ -1139,11 +1139,12 @@ async def test_the_stopped_layer_read_reuses_the_upper_dir_the_running_read_foun
 
 
 @pytest.mark.asyncio
-async def test_a_write_during_the_stop_with_a_kept_container_on_the_host_fails_the_edit_before_the_replacement(svc, monkeypatch):
-    # the one-kept limit holds for a write seen only on the stopped layer: the edit fails and the pod comes back
+async def test_a_write_during_the_stop_with_a_kept_container_on_the_host_is_copied_onto_it(svc, monkeypatch):
+    # DAH-6226: a write seen only on the stopped layer goes onto the pod's one kept copy; the pod reboots
     payload = _edit_payload()
     ssh = _ssh_recording()
-    ssh.kept = [f"kept_unmounted_{payload.pod_id}_1700000000"]
+    old = f"kept_unmounted_{payload.pod_id}_1700000000"
+    ssh.kept = [old]
     answer = ssh.run.side_effect
     name = _pod_name(payload)
 
@@ -1161,10 +1162,9 @@ async def test_a_write_during_the_stop_with_a_kept_container_on_the_host_fails_t
 
     result = await _run(svc, payload)
 
-    assert isinstance(result, FailedContainerRequest)
-    assert result.failure_step == "park_current_container"
-    svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
-    assert _docker(ssh.commands, "rm -fv id-") == []
+    assert isinstance(result, ContainerCreated)
+    assert len(_docker(ssh.commands, "cp")) == 1 and f"id-{old}:" in _docker(ssh.commands, "cp")[0]
+    assert _docker(ssh.commands, "rm -fv id-") == [f"/usr/bin/docker rm -fv id-{name}"]
 
 
 @pytest.mark.asyncio
@@ -1407,19 +1407,69 @@ async def test_a_failed_edit_restores_the_mount_the_pod_had(svc, monkeypatch, mo
 
 
 @pytest.mark.asyncio
-async def test_a_second_unmounted_edit_is_refused_while_a_kept_container_is_on_the_host(svc, monkeypatch):
+async def test_a_second_unmounted_edit_copies_its_files_onto_the_kept_copy_and_reboots_the_pod(svc, monkeypatch):
+    # DAH-6226: a one-kept refusal left pod 1625a2bb REBOOT_FAILED while it ran and billed. One rolling copy instead:
+    # the new layer's renter files go onto the earlier kept copy, the parked one is removed, the count stays one
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    old = f"kept_unmounted_{payload.pod_id}_1700000000"
+    ssh.kept = [old]
+    _report_unmounted(ssh)
+    _patch_happy(svc, monkeypatch, ssh)
+    name = _pod_name(payload)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated)
+    [copy] = _docker(ssh.commands, "cp")
+    # newest over older: the parked layer's files are extracted onto the earlier kept copy, not the other way
+    assert f"| /usr/bin/docker cp - id-{old}:/root" in copy
+    assert "pipefail" in copy
+    assert _docker(ssh.commands, "rm -fv id-") == [f"/usr/bin/docker rm -fv id-{name}"]  # the copied parked one only
+
+
+@pytest.mark.asyncio
+async def test_the_kept_copy_takes_only_the_parked_layers_own_files_never_its_image_files(svc, monkeypatch):
+    # an archive of the stopped container's merged path carries image files, which would overwrite older renter
+    # files of the same name on the kept copy: only the layer's own files, outside the start windows, are copied
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    old = f"kept_unmounted_{payload.pod_id}_1700000000"
+    ssh.kept = [old]
+    _report_unmounted(ssh)
+    _patch_happy(svc, monkeypatch, ssh)
+
+    await _run(svc, payload)
+
+    [copy] = _docker(ssh.commands, "cp")
+    assert f"{_kept(payload)}:" not in copy  # never `docker cp <parked>:<path>`, the merged rootfs
+    assert "GraphDriver.Data.UpperDir" in copy and "find . -mindepth 1" in copy and "$w -print0" in copy
+    assert "tar --null -T - -cf - | /usr/bin/docker cp - " in copy
+
+
+@pytest.mark.asyncio
+async def test_a_failed_copy_onto_the_kept_copy_fails_the_edit_and_keeps_both(svc, monkeypatch):
     payload = _edit_payload()
     ssh = _ssh_recording()
     ssh.kept = [f"kept_unmounted_{payload.pod_id}_1700000000"]
     _report_unmounted(ssh)
+    answer = ssh.run.side_effect
+
+    def _side(cmd, *args, **kwargs):
+        if "/usr/bin/docker cp" in cmd:
+            ssh.commands.append(cmd)
+            return _ssh_result(exit_status=1, stderr="no space left on device")
+        return answer(cmd, *args, **kwargs)
+
+    ssh.run.side_effect = _side
     _patch_happy(svc, monkeypatch, ssh)
 
     result = await _run(svc, payload)
 
     assert isinstance(result, FailedContainerRequest)
-    assert _docker(ssh.commands, "rename") == [] and _docker(ssh.commands, "stop") == []
-    assert _docker(ssh.commands, "rm -fv id-") == []
+    assert result.failure_step == "park_current_container"
     svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+    assert _docker(ssh.commands, "rm -fv id-") == []
 
 
 @pytest.mark.asyncio
