@@ -6358,13 +6358,21 @@ class DockerService:
         """Remember the image digests a filler was started from, so the GPU usage check can tell it
         from another container later run under the same name, and the image repository it was asked
         to run, which names the filler's workload for the GPU process allowlist. Never fails the create."""
-        try:
-            if docker_image:
+        if docker_image:
+            try:
                 await self.redis_service.set(
                     f"{FILLER_IMAGE_REPOSITORY_PREFIX}{container_name}",
                     image_repository(docker_image),
                     ex=FILLER_IMAGE_DIGESTS_TTL_SECONDS,
                 )
+            except Exception as exc:
+                logger.warning(
+                    _m(
+                        "Could not record the filler's image repository; its processes are not judged",
+                        extra=get_extra_info({**default_extra, "error": str(exc)}),
+                    )
+                )
+        try:
             # the container's own image, not the tag: the tag can move during the bootstrap
             image_id = await docker_client.container_image_id(container=container)
             repo_digests = (

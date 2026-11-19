@@ -55,14 +55,20 @@ from .rental_owner import rental_of_this_node
 logger = logging.getLogger(__name__)
 
 # The filler workloads whose GPU processes are known, by the image repository the validator started
-# the filler from: (workload, the executable names its GPU processes run as). A name matches the start
+# the filler from: its workload and the executable names its GPU processes run as. A name matches the start
 # of the executable's basename, or of the script or module an interpreter runs, or the part before "::"
 # of a renamed process title (vLLM's engine child shows as "VLLM::EngineCore"). A repository not
 # listed here is not judged.
-FILLER_PROCESS_ALLOWLISTS: dict[str, tuple[str, tuple[str, ...]]] = {
-    "daturaai/pearl-miner": ("PEARL", ("peakminer",)),
+@dataclass(frozen=True)
+class FillerWorkload:
+    strategy: str
+    process_names: tuple[str, ...]
+
+
+FILLER_PROCESS_ALLOWLISTS: dict[str, FillerWorkload] = {
+    "daturaai/pearl-miner": FillerWorkload("PEARL", ("peakminer",)),
     # the worker downloads its inference engine at run time; the engine has been vLLM and sonar
-    "daturaai/dolphin": ("DPHN", ("dolphinpod", "sonar", "vllm")),
+    "daturaai/dolphin": FillerWorkload("DPHN", ("dolphinpod", "sonar", "vllm")),
 }
 _INTERPRETER = re.compile(r"python[0-9.]*")
 
@@ -554,7 +560,7 @@ async def _fillers_off_their_image(ctx: Context, names: set[str]) -> list[str]:
     return off_image
 
 
-def _runs_as(cmdline: str) -> str:
+def _process_executable_name(cmdline: str) -> str:
     """The name a process runs as: its executable's basename, the script or module an interpreter runs,
     or the part of a renamed process title before "::"."""
     argv = cmdline.split()
@@ -567,14 +573,16 @@ def _runs_as(cmdline: str) -> str:
     return name.split("::", 1)[0].lower()
 
 
-async def _foreign_processes_in_fillers(ctx: Context, gpu_processes: list[dict], names: set[str]) -> list[str]:
+async def _foreign_processes_in_fillers(
+    ctx: Context, gpu_processes: list[dict], filler_container_names: set[str]
+) -> list[str]:
     """The GPU processes inside these fillers whose command is not one their workload runs, as
     "<container> (pid <pid>): <command>". Judged as foreign GPU work only when
     FILLER_PROCESS_ALLOWLIST_ENFORCED is on, logged either way. Not judged: a process with no scraped
     command (the scrape could not read it, or a scraper that does not report it), a filler with no
     readable repository record, or a workload with no allowlist."""
-    workloads: dict[str, tuple[str, tuple[str, ...]]] = {}
-    for name in sorted(names):
+    workloads: dict[str, FillerWorkload] = {}
+    for name in sorted(filler_container_names):
         try:
             key = f"{FILLER_IMAGE_REPOSITORY_PREFIX}{name}"
             repository = await ctx.services.redis.get(key)
@@ -592,9 +600,9 @@ async def _foreign_processes_in_fillers(ctx: Context, gpu_processes: list[dict],
         cmdline = str(process.get("cmdline") or "").strip()
         if container not in workloads or not cmdline:
             continue
-        strategy, allowed = workloads[container]
-        if not _runs_as(cmdline).startswith(allowed):
-            foreign.append((strategy, f"{container} (pid {process.get('pid')}): {cmdline}"))
+        workload = workloads[container]
+        if not _process_executable_name(cmdline).startswith(workload.process_names):
+            foreign.append((workload.strategy, f"{container} (pid {process.get('pid')}): {cmdline}"))
     if not foreign:
         return []
     enforced = settings.FILLER_PROCESS_ALLOWLIST_ENFORCED
@@ -609,7 +617,7 @@ async def _foreign_processes_in_fillers(ctx: Context, gpu_processes: list[dict],
     return [described for _, described in foreign] if enforced else []
 
 
-def _foreign_process_remediation(foreign_in_fillers: list[str]) -> dict:
+def _foreign_process_remediation(foreign_in_fillers: list[str]) -> dict[str, str]:
     return {"remediation": Msg.FOREIGN_PROCESS_IN_FILLER_REMEDIATION.format(processes="; ".join(foreign_in_fillers))}
 
 
