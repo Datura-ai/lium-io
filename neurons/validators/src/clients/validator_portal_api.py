@@ -45,23 +45,18 @@ _owner_hotkeys_read_at: float | None = None
 # An answer is authorization the portal gave at that time: past this age (portal down, or answering garbage) it counts
 # for nothing, so a link removed during an outage stops being honoured within this bound. Ten ticks of the slow lane.
 OWNER_HOTKEYS_MAX_AGE_SECONDS = 300
-# bounds the signatures one upload carries; an owner has a few accounts, not dozens
-MAX_OWNER_HOTKEYS = 16
 
 
 def remember_owner_hotkeys(answer: object) -> bool:
     """Replace the owner map with the portal's answer ({listing hotkey: [hotkeys]}); False, keeping the map, when the
-    answer is not that shape. An entry over MAX_OWNER_HOTKEYS gets no signatures at all."""
+    answer is not that shape. The whole set is kept: the portal is the trusted source, and dropping part of it would leave
+    some of the owner's own setups unsigned."""
     if not isinstance(answer, dict) or not all(
         isinstance(listing, str) and isinstance(hotkeys, list) and all(isinstance(h, str) for h in hotkeys)
         for listing, hotkeys in answer.items()
     ):
         return False
-    owners = {
-        listing: frozenset(hotkeys) - {listing}
-        for listing, hotkeys in answer.items()
-        if len(set(hotkeys)) <= MAX_OWNER_HOTKEYS
-    }
+    owners = {listing: frozenset(hotkeys) - {listing} for listing, hotkeys in answer.items()}
     global _owner_hotkeys_read_at
     _owner_hotkeys.clear()
     _owner_hotkeys.update({listing: hotkeys for listing, hotkeys in owners.items() if hotkeys})

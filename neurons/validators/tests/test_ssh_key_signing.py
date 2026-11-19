@@ -188,10 +188,11 @@ def test_each_answer_replaces_the_map_whole_and_a_bad_one_keeps_it(miner_service
     assert miner_service._owner_hotkey_signatures(validator_keypair, _SSH_KEY, None, "listing") is None
 
 
-def test_an_oversized_owner_set_signs_nothing(miner_service, validator_keypair, portal_owners):
-    portal_owners.remember_owner_hotkeys({"listing": [f"5Key{i}" for i in range(17)]})
+def test_a_large_owner_set_is_signed_whole(miner_service, validator_keypair, portal_owners):
+    many = [f"5Key{i}" for i in range(17)]  # e.g. 18 accounts on one coldkey: every one of them gets its signature
+    portal_owners.remember_owner_hotkeys({"listing": many})
 
-    assert miner_service._owner_hotkey_signatures(validator_keypair, _SSH_KEY, None, "listing") is None
+    assert set(miner_service._owner_hotkey_signatures(validator_keypair, _SSH_KEY, None, "listing")) == set(many)
 
 
 @pytest.mark.asyncio
