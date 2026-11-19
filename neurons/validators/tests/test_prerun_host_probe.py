@@ -1122,3 +1122,20 @@ async def test_a_host_read_miss_fails_at_its_own_step(svc_fixture, monkeypatch):
     result = await _run_create_container(svc, _deploy_payload())
 
     assert result.failure_step == ds_module.HOST_READ_PID_MAX_STEP == "host_read_pid_max"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pid_max", [None, 1000])
+async def test_a_refused_pid_max_opens_no_further_host_read(svc_fixture, monkeypatch, pid_max):
+    """Review on lium-io#2364: a host whose pid_max is unreadable or too low fails at the PID guard without the RAM read
+    opening another channel, which a stalled host may never grant (asyncssh's timeout does not bound the open)."""
+    svc = svc_fixture
+    _wire_early_probes(svc, monkeypatch, image_present=True)
+    monkeypatch.setattr(svc, "_read_host_pid_max", AsyncMock(return_value=pid_max))
+    never_answers = asyncio.Event()
+    monkeypatch.setattr(svc, "_read_host_ram_kib", AsyncMock(side_effect=lambda *a, **k: never_answers.wait()))
+
+    result = await asyncio.wait_for(_run_create_container(svc, _deploy_payload()), 5)
+
+    assert result.failure_step == ds_module.HOST_READ_PID_MAX_STEP
+    svc._read_host_ram_kib.assert_not_awaited()

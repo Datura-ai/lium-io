@@ -10563,11 +10563,20 @@ class DockerService:
 
             host_limits_read: asyncio.Task[tuple[int | None, int | None, int | None]] | None = None
 
+            def pid_max_refused(host_pid_max: int | None) -> bool:
+                return settings.RENTAL_PIDS_LIMIT_PER_CPU > 0 and (
+                    host_pid_max is None
+                    or host_pid_max - settings.RENTAL_PIDS_LIMIT_HOST_MARGIN < _MIN_RENTAL_PIDS_LIMIT
+                )
+
             async def read_host_limits(
                 connected_ssh_client: asyncssh.SSHClientConnection,
             ) -> tuple[int | None, int | None, int | None]:
                 # one after another on the session; the GPU count only sizes a split rental's share of the RAM read
                 pid_max = await self._read_host_pid_max(connected_ssh_client)
+                if pid_max_refused(pid_max):
+                    # the create refuses at the PID guard anyway: open no further channel a stalled host may never grant
+                    return pid_max, None, None
                 ram_kib = await self._read_host_ram_kib(connected_ssh_client)
                 gpu_count = None
                 if ram_kib is not None and payload.gpu_uuids:
