@@ -62,10 +62,16 @@ class StartGPUMonitorCheck:
         args_string = " ".join([f"--{k} {shlex.quote(str(v))}" for k, v in command_args.items()])
 
         # one command under an executor-local lock, so two overlapping checks never both start a monitor or remove
-        # each other's. pkill exits 1 when nothing matched; any other failure fails the command ("[p]" keeps the
-        # pattern from matching the shell that runs it).
+        # each other's. A stop returns only once no matching process is left: TERM, KILL after 5 s, and the command
+        # fails after 10 s or on any pkill/pgrep error, so nothing is replaced while an old monitor lives ("[p]" keeps
+        # the pattern from matching the shell that runs it).
         def stop(pattern: str) -> str:
-            return f'pkill {SAME_MOUNT_NS} -f -- {shlex.quote(pattern)}; [ "$?" -le 1 ] || exit 1'
+            match = f"{SAME_MOUNT_NS} -f -- {shlex.quote(pattern)}"
+            return (
+                f'pkill {match}; [ "$?" -le 1 ] || exit 1; i=0; '
+                f'while :; do pgrep {match} > /dev/null; r=$?; [ "$r" = 1 ] && break; [ "$r" = 0 ] || exit 1; '
+                f'i=$((i + 1)); [ "$i" -ge 100 ] && exit 1; [ "$i" = 50 ] && pkill -KILL {match}; sleep 0.1; done'
+            )
 
         # held while a check looks for the monitor and starts one (outside the monitor directories' glob)
         lock = f"{payload.SERVICE_DIR_PARENT}/.lium-validator-monitor-lock"

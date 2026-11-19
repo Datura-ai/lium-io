@@ -8,6 +8,7 @@ run in a local shell, with the service directory and the trusted interpreter mov
 import ast
 import asyncio
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -190,10 +191,31 @@ async def test_the_monitor_check_stops_and_counts_only_processes_in_the_executor
     # nor taken for the validator's monitor (a second mount namespace needs root, so the commands are checked)
     runner = LocalRunner(node.tmp)
     assert (await StartGPUMonitorCheck().run(_ctx(node, runner))).passed
-    stops = [part for c in runner.commands for part in c.split("pkill ")[1:]]
-    assert len(stops) == 2  # the legacy monitor and an earlier one of ours
-    assert all(part.startswith(executor_payload.SAME_MOUNT_NS) for part in stops), stops
-    assert not any(w in c.split() for c in runner.commands for w in ("pgrep", "ps"))
+    calls = re.findall(r"\b(?:pkill|pgrep|ps)\b(?: -KILL)? ([^;]*)", " ".join(runner.commands))
+    assert len(calls) == 6  # the legacy monitor and an earlier one of ours: TERM, wait, KILL each
+    assert all(call.startswith(executor_payload.SAME_MOUNT_NS) for call in calls), calls
+
+
+async def test_a_monitor_that_ignores_term_is_gone_before_its_replacement_starts(node, monkeypatch):
+    from services.task.checks import start_gpu_monitor
+
+    legacy = node.tmp / "root" / "app" / "src" / "gpus_utility.py"
+    legacy.parent.mkdir(parents=True)
+    # stuck like a monitor in a driver call: TERM does not end it
+    legacy.write_text(
+        "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        + _marker_script(node.tmp / "LEGACY_MONITOR", sleep=True)
+    )
+    monkeypatch.setattr(start_gpu_monitor, "LEGACY_MONITOR", str(legacy))
+    running = subprocess.Popen([sys.executable, str(legacy)])
+    try:
+        assert await _until(node.tmp / "LEGACY_MONITOR")
+        result = await StartGPUMonitorCheck().run(_ctx(node, LocalRunner(node.tmp)))
+        assert result.passed and result.event.reason_code == "MONITOR_STARTED"
+        assert running.poll() is not None  # already gone when the replacement was reported
+    finally:
+        if running.poll() is None:
+            running.kill()
 
 
 @pytest.mark.parametrize("change", ["an earlier build", "a record naming another process"])
