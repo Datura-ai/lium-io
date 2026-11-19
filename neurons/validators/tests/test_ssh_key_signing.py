@@ -146,31 +146,82 @@ async def test_the_nonce_create_task_gets_equals_the_nonce_sent(rest_miner_servi
     assert submitted["nonce"] == (expected if axon_version >= MIN_DATED_NONCE_MINER_AXON_VERSION else None)
 
 
-# --- DAH-6740: the key is also signed for each other hotkey of the listing owner ----------------------------------
+# --- DAH-6740: the key is also signed for each other hotkey of the listing owner, as the portal lists them -------
 
 
-def test_owner_hotkeys_from_the_last_cycle_are_each_signed(miner_service, validator_keypair, monkeypatch):
+def _portal(node_id, hotkeys):
+    from clients.validator_portal_api import PortalExecutor
+
+    return PortalExecutor(id=node_id, validator_hotkey="v", node_hotkeys=hotkeys)
+
+
+@pytest.fixture
+def portal_owners(monkeypatch):
+    from clients import validator_portal_api
+
+    monkeypatch.setattr(validator_portal_api, "_owner_hotkeys", {})
+    return validator_portal_api
+
+
+def test_the_portals_owner_hotkeys_are_each_signed(miner_service, validator_keypair, portal_owners):
     from datura.requests.validator_requests import ssh_pubkey_signing_blob
 
-    from services import miner_service as module
-
-    monkeypatch.setattr(module, "_owner_hotkeys", {})
     nonce = "ab" * 32
     assert miner_service._owner_hotkey_signatures(validator_keypair, _SSH_KEY, nonce, "listing") is None
 
-    nodes = [SimpleNamespace(expected_node_hotkeys=["listing", "5Old"]), SimpleNamespace(expected_node_hotkeys=None)]
-    module.remember_owner_hotkeys("listing", nodes)
+    portal_owners.remember_owner_hotkeys({"listing": [_portal("n1", ["listing", "5Old"]), _portal("n2", ["5Old", "listing"])]})
     signatures = miner_service._owner_hotkey_signatures(validator_keypair, _SSH_KEY, nonce, "listing")
 
     assert list(signatures) == ["5Old"]
     assert validator_keypair.verify(ssh_pubkey_signing_blob(_SSH_KEY, nonce, "5Old"), signatures["5Old"])
 
 
-def test_an_oversized_owner_list_signs_nothing(miner_service, validator_keypair, monkeypatch):
-    from services import miner_service as module
-
-    monkeypatch.setattr(module, "_owner_hotkeys", {})
-    many = [f"5Key{i}" for i in range(module.MAX_OWNER_HOTKEYS + 1)]
-    module.remember_owner_hotkeys("listing", [SimpleNamespace(expected_node_hotkeys=many)])
+@pytest.mark.parametrize(
+    "nodes",
+    [
+        # nodes of two owners under one listing (the pool): no owner's hotkeys are lent to the other's nodes
+        [_portal("n1", ["listing", "5OwnerA"]), _portal("n2", ["listing", "5OwnerB"])],
+        [_portal("n1", ["listing", "5Old"]), _portal("n2", None)],
+        [_portal("n1", ["listing"] + [f"5Key{i}" for i in range(17)])],
+    ],
+)
+def test_a_listing_without_one_bounded_owner_set_signs_nothing(miner_service, validator_keypair, portal_owners, nodes):
+    portal_owners.remember_owner_hotkeys({"listing": nodes})
 
     assert miner_service._owner_hotkey_signatures(validator_keypair, _SSH_KEY, None, "listing") is None
+
+
+@pytest.mark.asyncio
+async def test_a_hotkey_only_the_miner_reports_gets_no_signature(rest_miner_service, portal_owners, monkeypatch):
+    """The owner set comes from the validator's own portal read: a miner naming another hotkey for its nodes gets
+    nothing signed for it, in this cycle or the next."""
+    from datura.requests.miner_requests import AcceptSSHKeyRequest
+
+    from fixtures.rest_miner_fixtures import executor_info
+
+    _subtensor(monkeypatch, axon_versions={"miner-a": MIN_DATED_NONCE_MINER_AXON_VERSION})
+    portal_owners.remember_owner_hotkeys({"miner-a": [_portal("exec-1", ["miner-a", "5PortalOld"])]})
+    reported = executor_info("exec-1").model_copy(update={"expected_node_hotkeys": ["miner-a", "5Victim"]})
+    submitted = []
+
+    async def _make_rest_request(method, url, json_data, headers, timeout, log_extra, operation_name):
+        if url.endswith("ssh-pubkey-submit"):
+            submitted.append(json_data)
+            return 200, AcceptSSHKeyRequest(executors=[reported]).model_dump(mode="json")
+        return 200, {"message_type": "SSHKeyRemoved"}
+
+    rest_miner_service._make_rest_request = _make_rest_request
+    for _ in range(2):
+        await rest_miner_service.request_job_to_miner(
+            payload=MinerJobRequestPayload(
+                job_batch_id="b", miner_hotkey="miner-a", miner_coldkey="c", miner_address="192.0.2.10", miner_port=8091
+            ),
+            encrypted_files=MinerJobEnryptedFiles(
+                encrypt_key="k", all_keys={}, tmp_directory="/tmp", machine_scrape_file_name="s",
+                machine_scrape_source="",
+            ),
+            rented_data=RentedExecutorsResponse(executors={}),
+            default_docker_image_digests={},
+        )
+
+    assert [list(body["owner_hotkey_signatures"]) for body in submitted] == [["5PortalOld"], ["5PortalOld"]]

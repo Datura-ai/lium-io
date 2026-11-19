@@ -26,6 +26,8 @@ class PortalExecutor(BaseModel):
     # The portal stamps rows with a naive datetime.utcnow(); registration → AVAILABLE is measured
     # from here, so it is read as UTC.
     created_at: datetime | None = None
+    # DAH-6740: the hotkeys of the listing owner's accounts this node may be set up under (portal-computed)
+    node_hotkeys: list[str] | None = None
 
     @field_validator("created_at")
     @classmethod
@@ -33,6 +35,33 @@ class PortalExecutor(BaseModel):
         if value is not None and value.tzinfo is None:
             return value.replace(tzinfo=UTC)
         return value
+
+
+# DAH-6740: per listing hotkey, the other hotkeys of its owner's accounts, from this validator's own read of the portal
+# snapshot (never from what a miner reports: a miner could then have keys signed for hotkeys it names). Refreshed by
+# every successful get_all_executors; the express lane fetches it every tick.
+_owner_hotkeys: dict[str, frozenset[str]] = {}
+# bounds the signatures one upload carries; an owner has a few accounts, not dozens
+MAX_OWNER_HOTKEYS = 16
+
+
+def remember_owner_hotkeys(snapshot: Mapping[str, list[PortalExecutor]]) -> None:
+    """A listing gets an owner set only when every one of its nodes carries the same one. A key is signed per listing,
+    not per node, so a listing holding nodes of several owners (the pool) must not lend one owner's hotkeys to all."""
+    owners = {}
+    for listing, executors in snapshot.items():
+        sets = {frozenset(executor.node_hotkeys or ()) for executor in executors}
+        if len(sets) != 1:
+            continue
+        hotkeys = sets.pop() - {listing}
+        if hotkeys and len(hotkeys) <= MAX_OWNER_HOTKEYS:
+            owners[listing] = hotkeys
+    _owner_hotkeys.clear()
+    _owner_hotkeys.update(owners)
+
+
+def portal_owner_hotkeys(listing_hotkey: str) -> frozenset[str]:
+    return _owner_hotkeys.get(listing_hotkey, frozenset())
 
 
 def portal_miner_auth_blob(hotkey: str, timestamp: int) -> str:
@@ -214,10 +243,12 @@ class ValidatorPortalAPI:
                     data = await response.json()
             if not isinstance(data, dict):
                 raise ValueError(f"unexpected portal bulk response shape: {type(data).__name__}")
-            return {
+            snapshot = {
                 miner_hotkey: [PortalExecutor.model_validate(item) for item in executors]
                 for miner_hotkey, executors in data.items()
             }
+            remember_owner_hotkeys(snapshot)
+            return snapshot
         except Exception as exc:
             logger.error(
                 _m(
