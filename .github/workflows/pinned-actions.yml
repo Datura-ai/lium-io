@@ -29,6 +29,8 @@ jobs:
           files = sorted(pathlib.Path(".github/workflows").glob("*.y*ml")) + sorted(pathlib.Path(a) for a in actions if a)
           digest = r"docker://[^@\s]+@sha256:[0-9a-f]{64}"
           pinned = re.compile(rf"(?!docker://)[^@\s]+@[0-9a-f]{{40}}|{digest}")
+          # the runner reads the scheme case-insensitively, so DOCKER:// must not slip past the checks
+          norm = lambda ref: re.sub(r"^docker://", "docker://", str(ref), flags=re.I)
           bad = []
           for path in files:
               doc = yaml.safe_load(path.read_text()) or {}
@@ -36,12 +38,20 @@ jobs:
               runs = doc.get("runs") or {}
               steps = [step for job in jobs for step in job.get("steps") or []] + list(runs.get("steps") or [])
               for ref in [job.get("uses") for job in jobs] + [step.get("uses") for step in steps]:
-                  if ref is not None and not str(ref).startswith("./") and not pinned.fullmatch(str(ref)):
+                  if ref is not None and not str(ref).startswith("./") and not pinned.fullmatch(norm(ref)):
                       bad.append(f"{path}: {ref}")
               # a Docker action's image: a registry image needs a digest; a local Dockerfile path is reviewed in-repo
               image = runs.get("image")
-              if image is not None and str(image).startswith("docker://") and not re.fullmatch(digest, str(image)):
+              if image is not None and norm(image).startswith("docker://") and not re.fullmatch(digest, norm(image)):
                   bad.append(f"{path}: runs.image {image}")
+              # job containers and services start before the steps, with the job's token: digest only
+              for job in jobs:
+                  container = job.get("container")
+                  images = [container.get("image") if isinstance(container, dict) else container]
+                  images += [(svc or {}).get("image") for svc in (job.get("services") or {}).values()]
+                  for img in images:
+                      if img and not re.fullmatch(digest, "docker://" + re.sub(r"^docker://", "", str(img), flags=re.I)):
+                          bad.append(f"{path}: container/service image {img}")
           print("\n".join(bad) or f"all pinned ({len(files)} files)")
           sys.exit(1 if bad else 0)
           PY

@@ -121,8 +121,16 @@ jobs:
         path: dist/
 
     - name: Publish package distributions to PyPI
-      uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+      # the published image by digest, not the upstream action: its generated runs.image uses a movable
+      # GHCR tag in every revision, so a repointed tag would run new code with PyPI OIDC rights
+      uses: docker://ghcr.io/pypa/gh-action-pypi-publish@sha256:411241df99067c98b6d08fd8e26d14e86740a22460599c2af571e6dc26e27ffc # v1.14.3 image (GHCR tag 7245906fb61f)
       with:
+        # the image reads only these INPUT_* values (no action.yml defaults), so the upstream defaults are written out
+        user: __token__
+        repository-url: https://upload.pypi.org/legacy/
+        packages-dir: dist/
+        verify-metadata: true
+        skip-existing: false
         attestations: true
         verbose: true
         print-hash: true
