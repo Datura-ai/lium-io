@@ -762,9 +762,10 @@ def last_oom_from_kmsg(records, boot_epoch):
     last = None
     for record in records:
         header, _, message = record.partition(";")
-        if "Memory cgroup out of memory" in message:
+        # only the kernel's victim records count: its warnings ("Out of memory and no killable processes...") are no kill
+        if message.startswith("Memory cgroup out of memory: Killed process "):
             kind = "memcg"
-        elif "Out of memory" in message:
+        elif message.startswith(("Out of memory: Killed process ", "Out of memory (oom_kill_allocating_task): Killed process ")):
             kind = "global"
         else:
             continue
@@ -806,50 +807,71 @@ def container_memory_kb(container_id, host_root=HOST_MEMORY_ROOT):
     raise FileNotFoundError(f"no memory cgroup for container {container_id[:12]}")
 
 
-def get_host_memory(containers, host_root=HOST_MEMORY_ROOT, meminfo_path="/proc/meminfo", vmstat_path="/proc/vmstat",
-                    stat_path="/proc/stat", read_kmsg=read_kmsg_records):
+def list_workload_container_ids():
+    # the running pod and filler containers' full ids, listed now: an older listing misses a pod started since
+    return sorted(
+        container["Id"]
+        for container in docker_api_get("/containers/json")
+        if any(name.lstrip("/").startswith(WORKLOAD_CONTAINER_PREFIXES) for name in container.get("Names") or [])
+    )
+
+
+def get_host_memory(list_workloads=list_workload_container_ids, host_root=HOST_MEMORY_ROOT, meminfo_path="/proc/meminfo",
+                    vmstat_path="/proc/vmstat", stat_path="/proc/stat", read_kmsg=read_kmsg_records):
     errors = {}
     facts = {"hm_errors": errors}
+    # the workloads are listed right before and after the memory reads; a change between them nulls the subtraction
+    try:
+        workloads = list_workloads()
+    except Exception as exc:
+        workloads = None
+        inventory_error = f"docker inventory failed: {exc!r}"
     with open(meminfo_path) as meminfo:
         mem = parse_meminfo_kb(meminfo.read())
 
-    def kb(name):
-        return mem.get(name)
-
-    facts["hm_mem_total_kb"] = kb("MemTotal")
-    facts["hm_mem_available_kb"] = kb("MemAvailable")
-    facts["hm_swap_total_kb"] = kb("SwapTotal")
-    facts["hm_swap_used_kb"] = kb("SwapTotal") - kb("SwapFree") if "SwapFree" in mem and "SwapTotal" in mem else None
-    facts["hm_shmem_kb"] = kb("Shmem")
-    facts["hm_page_cache_kb"] = kb("Cached")
-    facts["hm_hugepages_total"] = kb("HugePages_Total")
-    facts["hm_hugepages_free"] = kb("HugePages_Free")
-    facts["hm_hugepage_size_kb"] = kb("Hugepagesize")
-    facts["hm_mapped_kb"] = kb("Mapped")
+    facts["hm_mem_total_kb"] = mem.get("MemTotal")
+    facts["hm_mem_available_kb"] = mem.get("MemAvailable")
+    facts["hm_swap_total_kb"] = mem.get("SwapTotal")
+    facts["hm_swap_used_kb"] = mem["SwapTotal"] - mem["SwapFree"] if "SwapFree" in mem and "SwapTotal" in mem else None
+    facts["hm_shmem_kb"] = mem.get("Shmem")
+    facts["hm_page_cache_kb"] = mem.get("Cached")
+    facts["hm_hugepages_total"] = mem.get("HugePages_Total")
+    facts["hm_hugepages_free"] = mem.get("HugePages_Free")
+    facts["hm_hugepage_size_kb"] = mem.get("Hugepagesize")
+    facts["hm_mapped_kb"] = mem.get("Mapped")
     for name, key in (("SwapTotal", "hm_swap_total_kb"), ("HugePages_Total", "hm_hugepages_total"), ("Mapped", "hm_mapped_kb")):
         if name not in mem:
             errors[key] = f"{name} not in /proc/meminfo"
 
     # the workload containers' cgroups: memory.current counts their anon, page cache and shmem
-    workloads = [c for c in containers if c.get("each_name", "").startswith(WORKLOAD_CONTAINER_PREFIXES)]
     current = file_ = shmem = file_mapped = 0
     unread = []
-    for container in workloads:
+    for container_id in workloads or []:
         try:
-            usage, stat = container_memory_kb(container["each_container_id"], host_root)
+            usage, stat = container_memory_kb(container_id, host_root)
         except Exception as exc:
-            unread.append(f"{container['each_container_id'][:12]}: {exc!r}")
+            unread.append(f"{container_id[:12]}: {exc!r}")
             continue
         current += usage
         file_ += stat.get("file", stat.get("total_cache", 0))
         shmem += stat.get("shmem", stat.get("total_shmem", 0))
         file_mapped += stat.get("file_mapped", stat.get("total_mapped_file", 0))
-    facts["hm_workload_containers"] = len(workloads)
+    if workloads is not None:
+        try:
+            if list_workloads() != workloads:
+                inventory_error = "the workload containers changed during the memory reads"
+                workloads = None
+        except Exception as exc:
+            inventory_error = f"docker inventory failed: {exc!r}"
+            workloads = None
+    facts["hm_workload_containers"] = None if workloads is None else len(workloads)
+    if workloads is None:
+        errors["hm_workload_containers"] = inventory_error
     outside_keys = ("hm_outside_workloads_kb", "hm_outside_workloads_no_cache_kb", "hm_mapped_outside_workloads_kb")
-    if unread or not all(n in mem for n in ("MemTotal", "MemFree", "Buffers", "Cached", "Shmem", "Mapped")):
+    if workloads is None or unread or not all(n in mem for n in ("MemTotal", "MemFree", "Buffers", "Cached", "Shmem", "Mapped")):
         for key in outside_keys:
             facts[key] = None
-            errors[key] = "; ".join(unread) or "a /proc/meminfo field is missing"
+            errors[key] = inventory_error if workloads is None else "; ".join(unread) or "a /proc/meminfo field is missing"
     else:
         used = mem["MemTotal"] - mem["MemFree"]
         # all page cache counted as used, then without it (shmem and tmpfs, /dev/shm included, stay counted: not reclaimable)
@@ -2862,7 +2884,7 @@ def get_machine_specs():
 
     # DAH-6379: unreadable fields are None with a reason inside; a whole-block failure is reported, never raised
     try:
-        data["data_host_memory"] = get_host_memory(data["data_docker"]["docker_containers"])
+        data["data_host_memory"] = get_host_memory()
     except Exception as exc:
         data["data_host_memory_scrape_error"] = repr(exc)
 
