@@ -694,22 +694,41 @@ FILLER_VOLUME_LABEL_KEY = "io.lium.workload"
 FILLER_VOLUME_LABEL_VALUE = "filler"
 
 
+class DeadlineSocket(socket.socket):
+    # a socket whose every read waits only until the wall-clock `deadline` (time.monotonic()): a reply trickled in
+    # many parts, each inside a per-read timeout, still ends at the deadline
+    deadline = None
+
+    def recv_into(self, *args):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("the docker read ran out of its time budget")
+        self.settimeout(remaining)
+        return super().recv_into(*args)
+
+
 class UnixSocketHTTPConnection(http.client.HTTPConnection):
-    def __init__(self, socket_path, timeout):
+    def __init__(self, socket_path, timeout, deadline=None):
         super().__init__("localhost", timeout=timeout)
         self.socket_path = socket_path
+        self.deadline = deadline
 
     def connect(self):
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        if self.deadline is None:
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        else:
+            self.sock = DeadlineSocket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.deadline = self.deadline
         self.sock.settimeout(self.timeout)
         self.sock.connect(self.socket_path)
 
 
-def docker_api_get(path, timeout=DOCKER_API_TIMEOUT_SECONDS):
+def docker_api_get(path, timeout=DOCKER_API_TIMEOUT_SECONDS, deadline=None):
     # read one docker daemon endpoint over its unix socket; the scrape runs inside the privileged
     # executor container, where the host socket is bind-mounted. The CLI reports these sizes as
-    # human strings ("45.08GB"); the API returns exact integers.
-    conn = UnixSocketHTTPConnection(DOCKER_SOCKET_PATH, timeout)
+    # human strings ("45.08GB"); the API returns exact integers. With a `deadline` the whole reply, every part of
+    # its body included, must arrive by then.
+    conn = UnixSocketHTTPConnection(DOCKER_SOCKET_PATH, timeout, deadline)
     try:
         conn.request("GET", path)
         response = conn.getresponse()
@@ -826,7 +845,7 @@ def list_workload_container_ids(deadline):
         if remaining <= 0:
             raise TimeoutError("the docker listing ran out of its time budget")
         path = paths.pop(0)
-        reply = docker_api_get(path, remaining)
+        reply = docker_api_get(path, remaining, deadline)
         if path == "/containers/json":
             paths = [
                 f"/containers/{container['Id']}/json"
@@ -881,7 +900,9 @@ def get_host_memory(list_workloads=list_workload_container_ids, host_root=HOST_M
         except Exception as exc:
             unread.append(f"{container_id[:12]}: {exc!r}")
             continue
-        current += usage
+        # with hugetlb accounting on (cgroup v2 memory_hugetlb_accounting) memory.current holds the pod's huge pages,
+        # which the host's figure below leaves out with the whole pool
+        current += usage - stat.get("hugetlb", 0)
         # v1's usage counts child cgroups, as its total_* stats do (its plain ones are local); v2's are hierarchical
         file_ += stat.get("total_cache", stat.get("file", 0))
         shmem += stat.get("total_shmem", stat.get("shmem", 0))
@@ -903,7 +924,10 @@ def get_host_memory(list_workloads=list_workload_container_ids, host_root=HOST_M
             facts[key] = None
             errors[key] = inventory_error if workloads is None else "; ".join(unread) or "a /proc/meminfo field is missing"
     else:
-        used = mem["MemTotal"] - mem["MemFree"]
+        # the reserved huge page pool is not ordinary RAM (the hm_hugepages_* fields report it): MemFree leaves the whole
+        # pool out, used or not, while a pod's memory.current counts its huge pages only under hugetlb accounting
+        hugetlb = mem.get("Hugetlb", mem.get("HugePages_Total", 0) * mem.get("Hugepagesize", 0))
+        used = mem["MemTotal"] - mem["MemFree"] - hugetlb
         # all page cache counted as used, then without it (shmem and tmpfs, /dev/shm included, stay counted: not reclaimable)
         facts["hm_outside_workloads_kb"] = used - current
         facts["hm_outside_workloads_no_cache_kb"] = (used - mem["Buffers"] - mem["Cached"] + mem["Shmem"]) - (current - file_ + shmem)

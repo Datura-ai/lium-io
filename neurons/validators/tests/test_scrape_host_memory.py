@@ -29,7 +29,8 @@ HELPERS = {
 }
 NS = build_scrape_namespace(SRC / "miner_jobs" / "machine_scrape.py", HELPERS, {"os": os, "time": time, "docker_api_get": None})
 
-MEMINFO = """MemTotal:       100000 kB
+# 32768 kB of it is the reserved huge page pool (16 x 2048 kB), outside MemFree and outside ordinary use
+MEMINFO = """MemTotal:       132768 kB
 MemFree:         20000 kB
 MemAvailable:    50000 kB
 Buffers:          1000 kB
@@ -85,7 +86,7 @@ def workloads(deadline=None):
     return sorted([(POD, STARTED), (FILLER, STARTED)])
 
 
-def _docker(path, timeout=None):
+def _docker(path, timeout=None, deadline=None):
     if path == "/containers/json":
         return DOCKER_CONTAINERS
     return {"Id": path.split("/")[2], "State": {"StartedAt": STARTED}}
@@ -103,7 +104,7 @@ def test_both_listings_share_one_short_time_budget(monkeypatch, tmp_path: Path) 
     clock = [1000.0]
     timeouts = []
 
-    def slow_docker(path, timeout=None):
+    def slow_docker(path, timeout=None, deadline=None):
         timeouts.append(timeout)
         clock[0] += 2  # every docker read takes 2 s
         return _docker(path)
@@ -116,7 +117,7 @@ def test_both_listings_share_one_short_time_budget(monkeypatch, tmp_path: Path) 
     assert all(t <= NS["HOST_MEMORY_INVENTORY_SECONDS"] for t in timeouts)
     assert facts["hm_workload_containers"] is None
     assert "time budget" in facts["hm_errors"]["hm_outside_workloads_kb"]
-    assert facts["hm_mem_total_kb"] == 100000
+    assert facts["hm_mem_total_kb"] == 132768
 
 
 def test_host_memory_outside_the_workloads(tmp_path: Path) -> None:
@@ -184,7 +185,7 @@ def test_a_failed_docker_listing_is_no_count_not_zero_workloads(tmp_path: Path) 
     assert facts["hm_workload_containers"] is None
     assert facts["hm_outside_workloads_no_cache_kb"] is None
     assert facts["hm_errors"]["hm_outside_workloads_no_cache_kb"].startswith("docker inventory failed: OSError")
-    assert facts["hm_mem_total_kb"] == 100000
+    assert facts["hm_mem_total_kb"] == 132768
 
 
 def test_a_cgroup_v1_pod_counts_its_child_cgroups_shmem(tmp_path: Path) -> None:
@@ -224,7 +225,7 @@ def test_a_pod_restarted_during_the_reads_nulls_the_subtraction(tmp_path: Path) 
 def test_a_workload_that_grew_between_the_reads_is_no_negative_figure(tmp_path: Path) -> None:
     # review on lium-io#2361: 5,000,000 kB host use, then 15,000,000 kB workload use, published -10,000,000 kB
     paths = _host(tmp_path)
-    Path(paths["meminfo_path"]).write_text(MEMINFO.replace("100000 kB", "5020000 kB"))
+    Path(paths["meminfo_path"]).write_text(MEMINFO.replace("132768 kB", "5052768 kB"))
     pod = Path(paths["host_root"]) / f"sys/fs/cgroup/system.slice/docker-{POD}.scope"
     (pod / "memory.current").write_text(f"{15000000 * 1024}\n")
     facts = NS["get_host_memory"](list_workloads=workloads, read_kmsg=lambda: [], **paths)
@@ -232,6 +233,72 @@ def test_a_workload_that_grew_between_the_reads_is_no_negative_figure(tmp_path: 
     for key in ("hm_outside_workloads_kb", "hm_outside_workloads_no_cache_kb", "hm_mapped_outside_workloads_kb"):
         assert facts[key] is None
         assert "negative residual" in facts["hm_errors"][key]
+
+
+def test_a_pods_huge_pages_are_not_host_memory(tmp_path: Path) -> None:
+    # review on lium-io#2361: 26 GiB used, a pod with 8 GiB of RAM plus 16 GiB of huge pages and no hugetlb accounting
+    # was reported as 18 GiB outside the workloads instead of 2 GiB
+    gib = 1024 * 1024
+    paths = _host(tmp_path)
+    Path(paths["meminfo_path"]).write_text(
+        f"MemTotal: {64 * gib} kB\nMemFree: {38 * gib} kB\nMemAvailable: {38 * gib} kB\nBuffers: 0 kB\nCached: 0 kB\n"
+        f"SwapTotal: 0 kB\nSwapFree: 0 kB\nShmem: 0 kB\nMapped: 0 kB\nHugePages_Total: 8\nHugePages_Free: 0\n"
+        f"Hugepagesize: {2 * gib} kB\nHugetlb: {16 * gib} kB\n"
+    )
+    filler = Path(paths["host_root"]) / f"sys/fs/cgroup/docker/{FILLER}"
+    pod = Path(paths["host_root"]) / f"sys/fs/cgroup/system.slice/docker-{POD}.scope"
+    (filler / "memory.current").write_text("0\n")
+    (filler / "memory.stat").write_text("anon 0\n")
+    (pod / "memory.current").write_text(f"{8 * gib * 1024}\n")
+    (pod / "memory.stat").write_text(f"anon {8 * gib * 1024}\n")
+
+    facts = NS["get_host_memory"](list_workloads=workloads, read_kmsg=lambda: [], **paths)
+    assert facts["hm_outside_workloads_kb"] == 2 * gib
+
+    # with hugetlb accounting on, memory.current holds the pod's huge pages too, and they are still not counted twice
+    (pod / "memory.current").write_text(f"{24 * gib * 1024}\n")
+    (pod / "memory.stat").write_text(f"anon {8 * gib * 1024}\nhugetlb {16 * gib * 1024}\n")
+    facts = NS["get_host_memory"](list_workloads=workloads, read_kmsg=lambda: [], **paths)
+    assert facts["hm_outside_workloads_kb"] == 2 * gib
+
+
+def test_a_docker_reply_trickled_in_parts_still_ends_at_the_deadline(tmp_path: Path) -> None:
+    # review on lium-io#2361: each part of the body arrived inside the per-read timeout, so the reply overran the budget
+    import socket
+    import threading
+
+    ns = build_scrape_namespace(
+        SRC / "miner_jobs" / "machine_scrape.py",
+        {"DeadlineSocket", "UnixSocketHTTPConnection", "docker_api_get"},
+        {"socket": socket, "time": time, "json": __import__("json"), "http": __import__("http.client"),
+         "DOCKER_API_TIMEOUT_SECONDS": 20, "DOCKER_SOCKET_PATH": str(tmp_path / "docker.sock")},
+    )
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(tmp_path / "docker.sock"))
+    server.listen(1)
+
+    def trickle():
+        conn, _ = server.accept()
+        conn.recv(4096)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+        try:
+            for _ in range(10):
+                time.sleep(0.1)  # each part well inside the 1 s per-read timeout
+                conn.sendall(b"1\r\n \r\n")
+        except OSError:
+            pass
+        conn.close()
+
+    threading.Thread(target=trickle, daemon=True).start()
+    start = time.monotonic()
+    try:
+        ns["docker_api_get"]("/containers/json", 1, start + 0.25)
+        raise AssertionError("the trickled reply was accepted past its deadline")
+    except TimeoutError:
+        pass
+    finally:
+        server.close()
+    assert time.monotonic() - start < 0.6
 
 
 class _Kmsg:
