@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import time
+from datetime import UTC, datetime
 from typing import Annotated, Optional, Union
 from uuid import UUID
 
@@ -55,6 +56,21 @@ def _describe_error(error: BaseException) -> str:
     """`str(e)`, or the class name when the exception carries no text (aiohttp timeouts)."""
     text = str(error)
     return f"{type(error).__name__}: {text}" if text else type(error).__name__
+
+
+def _current_binding(item: dict) -> dict:
+    """What the node's machine may be set up for now (DAH-6539). The portal's owner-wide binding (the hotkeys and claims
+    of every account of the listing's owner) counts until its `owner_binding_until`; this miner serves its last
+    snapshot while the portal is unreachable, so after that time a link removed meanwhile must stop passing, and the
+    listing account's own binding (`listing_binding`) applies. A portal that sends neither field: the row as it is."""
+    until, listing = item.get("owner_binding_until"), item.get("listing_binding")
+    if until is None or not isinstance(listing, dict):
+        return item
+    try:
+        expired = datetime.now(UTC) >= datetime.fromisoformat(str(until))
+    except (TypeError, ValueError):
+        expired = True  # an unreadable end grants nothing beyond the listing
+    return listing if expired else item
 
 
 class _UnreachableExecutorLog:
@@ -348,14 +364,15 @@ class ExecutorService:
                 uuid = UUID(item.get("id"))
                 if host_keys is not None and item.get("ssh_host_key"):
                     host_keys[str(uuid)] = item["ssh_host_key"]
-                if node_accounts is not None and item.get("node_hotkeys"):
+                binding = _current_binding(item)
+                if node_accounts is not None and binding.get("node_hotkeys"):
                     node_accounts[str(uuid)] = {
-                        "hotkeys": [str(h) for h in item["node_hotkeys"]],
-                        "claim": item.get("account_claim") or None,
-                        "claims": [str(c) for c in item.get("account_claims") or []] or None,
+                        "hotkeys": [str(h) for h in binding["node_hotkeys"]],
+                        "claim": binding.get("account_claim") or None,
+                        "claims": [str(c) for c in binding.get("account_claims") or []] or None,
                         # {} (no notice yet: report first) differs from a missing map (an older portal: enforce)
                         "enforce_after": item.get("check_enforce_after"),
-                        "claims_by_hotkey": item.get("claims_by_hotkey"),
+                        "claims_by_hotkey": binding.get("claims_by_hotkey"),
                     }
                 result.append(
                     Executor(

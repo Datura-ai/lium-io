@@ -555,3 +555,25 @@ async def test_standalone_miner_sends_no_expected_host_key(executor_service, tes
     ))
     registration = await executor_service.register_pubkey("v", "m", _SSH_KEY.encode(), "0xaa")
     assert registration.accepted[0].expected_ssh_host_key is None
+
+
+def test_a_partners_grant_ends_at_its_time_and_the_listing_keeps_its_own_binding():
+    """DAH-6539 (lp#3232 review 4633432502): this miner serves its last snapshot while the portal is unreachable. Past
+    `owner_binding_until` a row's owner-wide binding no longer counts, so a partner unlinked meanwhile stops passing,
+    and the listing account's own binding applies. A row without the fields (an older portal) is used as it is."""
+    from datetime import UTC, datetime, timedelta
+
+    listing = {"node_hotkeys": ["5Account"], "account_claim": "claim-1", "account_claims": ["claim-1"], "claims_by_hotkey": None}
+    row = {
+        "node_hotkeys": ["5Account", "5Partner"], "account_claim": "claim-1", "account_claims": ["claim-1", "claim-p"],
+        "claims_by_hotkey": None, "listing_binding": listing,
+    }
+    now = datetime.now(UTC)
+
+    assert es._current_binding({**row, "owner_binding_until": (now + timedelta(minutes=5)).isoformat()})["node_hotkeys"] == [
+        "5Account", "5Partner"
+    ]
+    assert es._current_binding({**row, "owner_binding_until": (now - timedelta(seconds=1)).isoformat()}) == listing
+    assert es._current_binding({**row, "owner_binding_until": "not a time"}) == listing
+    assert es._current_binding({**row, "owner_binding_until": "2026-11-19T12:00:00"}) == listing  # no zone: unreadable
+    assert es._current_binding(row) is row  # an older portal sends no end
