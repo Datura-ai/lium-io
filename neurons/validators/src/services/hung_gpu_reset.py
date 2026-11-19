@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING
 
 from payload_models.payloads import ContainerWarningCode, GpuResetErrorCode
 from services.gpu_reset import (
-    _FABRIC_START_FAILED_EXIT,
     _FABRIC_STOP_FAILED_EXIT,
     _RESET_TIMEOUT_SECONDS,
     FABRIC_SERVICES,
@@ -200,11 +199,11 @@ async def _reset(
                 )
         if fabric_manager_problem:
             return HungGpuResult(hung, ContainerWarningCode.HungGpuNotResetUnsupported, fabric_manager_problem)
-        if reset.exit_code in (_FABRIC_STOP_FAILED_EXIT, _FABRIC_START_FAILED_EXIT):
+        if reset.exit_code == _FABRIC_STOP_FAILED_EXIT:
             return HungGpuResult(
                 hung,
                 ContainerWarningCode.HungGpuNotResetUnsupported,
-                _tail(reset.stderr) or "a host GPU holder did not stop or start",
+                _tail(reset.stderr) or "a host GPU holder did not stop",
             )
     if reset.exit_code == 0:
         return HungGpuResult(hung, ContainerWarningCode.HungGpuReset, f"reset {plan.targets}")

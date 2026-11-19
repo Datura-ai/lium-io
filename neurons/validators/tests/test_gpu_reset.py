@@ -72,12 +72,17 @@ class FakeHost:
         transient_holders=(),
         reset_output="refused",
         holder_scan=None,
+        host_holder_units="",
+        start_fails=(),
     ):
         self.commands: list[str] = []
         # (pid, name) holding a target GPU's device file: every read, or the first read only
         self.device_holders, self.transient_holders = list(device_holders), list(transient_holders)
         self.holder_reads = 0
         self.holder_scan = holder_scan  # the scan's whole answer, when it is not the holders above
+        # the host services the pre-stop scan finds holding a GPU (its stdout), or its whole answer
+        self.host_holder_units = host_holder_units
+        self.start_fails = set(start_fails)  # host services that do not start again
         self.reset_output = reset_output
         self.gpus_result = gpus_result
         self.stopped = False
@@ -168,7 +173,7 @@ class FakeHost:
                 self.hung_units = units
                 return make_command_result(False, stderr="timed out", exit_code=-1)
             for unit in reversed(units):
-                self.active[unit] = unit != "nvidia-fabricmanager" or self.fm_start_ok
+                self.active[unit] = (unit != "nvidia-fabricmanager" or self.fm_start_ok) and unit not in self.start_fails
                 self.fm_log.append(("start", unit))
             for cid in reversed(containers):
                 self.active[cid] = True
@@ -176,6 +181,9 @@ class FakeHost:
             if self.reset_raises:
                 raise RuntimeError("ssh dropped")
             return make_command_result(self.reset_exit == 0, "refused", exit_code=self.reset_exit)
+        if cmd == gpu_reset.HOST_GPU_HOLDER_UNITS_COMMAND:
+            found = self.host_holder_units
+            return make_command_result(True, found) if isinstance(found, str) else found
         if cmd == gpu_reset.HOST_SYSTEMD_PROBE:
             return make_command_result(True, "" if self.systemd else "no-systemd\n")
         if cmd == gpu_reset.FABRIC_RESET_UNIT_PROCS:
@@ -205,7 +213,7 @@ class FakeHost:
             if verb == "is-active":
                 up = self.active.get(unit, False)
                 return make_command_result(up, "active" if up else "inactive", exit_code=0 if up else 3)
-            ok = verb == "stop" or unit != "nvidia-fabricmanager" or self.fm_start_ok
+            ok = verb == "stop" or ((unit != "nvidia-fabricmanager" or self.fm_start_ok) and unit not in self.start_fails)
             self.active[unit] = verb == "start" and ok
             return make_command_result(ok, exit_code=0 if ok else 1)
         if cmd.startswith("nvidia-smi -r"):
@@ -603,20 +611,19 @@ def _fake_fd(proc, pid: int, device: str) -> None:
 def _run_fabric_script(
     tmp_path, *, stop_fails="", start_fails="", reset_exit=0, units=(FM, NVLSM), containers=(), procs=None, needs=""
 ):
-    """Runs the host unit's script under /bin/sh with logging stand-ins for systemctl, docker, stat and
-    nvidia-smi; procs is the host's /proc: {pid: (comm, cgroup[, device])}, device "<major>:<minor>" held open
-    (default 195:0, a GPU; "denied": unreadable). stop_fails and
+    """Runs the host unit's script under /bin/sh with logging stand-ins for systemctl, docker and nvidia-smi, and a
+    stat that never returns (a descriptor on a stalled filesystem); procs is the host's /proc: {pid: (comm, cgroup)},
+    all of them holding /dev/nvidia0 open. stop_fails and
     start_fails name the one unit whose systemctl stop or start exits 1; a start of any unit fails while the unit
     needs has not been started yet."""
     log = tmp_path / "log"
     proc = tmp_path / "proc"
     proc.mkdir()
-    (proc / "devices").write_text(PROC_DEVICES)
-    for pid, (comm, cgroup, *device) in (procs or {}).items():
-        (proc / str(pid)).mkdir(parents=True)
+    for pid, (comm, cgroup) in (procs or {}).items():
+        (proc / str(pid) / "fd").mkdir(parents=True)
+        (proc / str(pid) / "fd" / "5").symlink_to("/dev/nvidia0")
         (proc / str(pid) / "comm").write_text(f"{comm}\n")
         (proc / str(pid) / "cgroup").write_text(f"{cgroup}\n")
-        _fake_fd(proc, pid, device[0] if device else "195:0")
     for name, body in (
         (
             "systemctl",
@@ -626,7 +633,7 @@ def _run_fabric_script(
             "exit 0",
         ),
         ("docker", f'echo "docker $*" >> {log}; [ "$1" = stop ] && [ "$4" = "$STOP_FAILS" ] && exit 1; exit 0'),
-        ("stat", FAKE_STAT.removeprefix("#!/bin/sh\n")),
+        ("stat", "sleep 600"),
         ("nvidia-smi", f'echo "reset $*" >> {log}; echo "In use by another client"; exit {reset_exit}'),
     ):
         (tmp_path / name).write_text(f"#!/bin/sh\n{body}\n")
@@ -637,7 +644,7 @@ def _run_fabric_script(
     # what systemd does to the command line before the shell runs: unknown ${...} becomes "", $$ becomes $
     script = re.sub(r"\$\{[^}]*\}", "", script).replace("$$", "$")
     env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}", "STOP_FAILS": stop_fails, "START_FAILS": start_fails, "NEEDS": needs}
-    done = subprocess.run(["/bin/sh", "-c", script], env=env, capture_output=True, text=True)
+    done = subprocess.run(["/bin/sh", "-c", script], env=env, capture_output=True, text=True, timeout=60)
     return done, log.read_text().splitlines()
 
 
@@ -649,56 +656,69 @@ def test_the_host_unit_starts_the_fabric_again_after_a_failed_reset(tmp_path):
 
 def test_the_host_unit_stops_every_gpu_holder_and_starts_them_again_in_reverse(tmp_path):
     # B300: DCGM and nvidia-persistenced hold every GPU, a dcgm-exporter container too, and one more host
-    # service the validator did not know of
+    # service the validator found holding a GPU before the stop (first in the list)
     procs = {
         4242: ("nv-hostengine", "0::/system.slice/some-gpu-agent.service"),
         4243: ("python3", "0::/system.slice/docker-abc.scope"),
     }
-    units = ("nvidia-dcgm", FM, "nvidia-persistenced")
+    units = ("some-gpu-agent.service", "nvidia-dcgm", FM, "nvidia-persistenced")
     done, log = _run_fabric_script(tmp_path, reset_exit=3, units=units, containers=("e1",), procs=procs)
     assert done.returncode == 3
     assert log == [
         "docker stop -t 10 e1",
+        "stop some-gpu-agent.service",
         "stop nvidia-dcgm",
         f"stop {FM}",
         "stop nvidia-persistenced",
-        "stop some-gpu-agent.service",
         f"reset -r -i {U[0]}",
         "start nvidia-persistenced",
         f"start {FM}",
         "start nvidia-dcgm",
         "start some-gpu-agent.service",
-        "is-active some-gpu-agent.service",
         "docker start e1",
     ]
     # a refused reset names the processes still holding a GPU
     assert "GPU holders left: nv-hostengine python3" in done.stdout
 
 
-def test_the_host_unit_finds_gpu_holders_by_device_number_not_by_path(tmp_path):
+def test_the_host_unit_reads_no_files_filesystem_so_a_stalled_one_cannot_hold_it_down(tmp_path):
+    # DAH-6741 review: the harness's stat never returns; the unit still resets and starts everything again
+    done, log = _run_fabric_script(tmp_path, reset_exit=3, procs={4242: ("agent", f"0::/system.slice/{AGENT}")})
+    assert done.returncode == 3 and log[-2:] == [f"start {NVLSM}", f"start {FM}"]
+    assert "GPU holders left: agent" in done.stdout
+
+
+def _run_holder_units_scan(tmp_path, procs: dict[int, tuple[str, str]]) -> subprocess.CompletedProcess:
+    """GPU_HOLDER_UNITS_SCRIPT over a fake /proc: procs maps pid -> (cgroup, "<major>:<minor>" held open)."""
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    (proc / "devices").write_text(PROC_DEVICES)
+    for pid, (cgroup, device) in procs.items():
+        _fake_fd(proc, pid, device)
+        (proc / str(pid) / "cgroup").write_text(f"{cgroup}\n")
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin/stat").write_text(FAKE_STAT)
+    (tmp_path / "bin/stat").chmod(0o755)
+    script = gpu_reset.GPU_HOLDER_UNITS_SCRIPT.replace("/proc/", f"{proc}/")
+    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}"}
+    return subprocess.run(["/bin/sh", "-c", script], env=env, capture_output=True, text=True, timeout=60)
+
+
+def test_the_host_holder_scan_finds_services_by_device_number_not_by_path(tmp_path):
     # DAH-6741 review: any node with an NVIDIA driver's numbers opens the device, whatever it is called; another
-    # driver's device (226, drm) is not a GPU holder
-    procs = {
-        4242: ("agent", f"0::/system.slice/{AGENT}", "195:7"),
-        4243: ("uvm-user", "0::/system.slice/uvm-user.service", "510:0"),
-        4244: ("compositor", "0::/system.slice/compositor.service", "226:0"),
-    }
-    done, log = _run_fabric_script(tmp_path, reset_exit=3, units=(), procs=procs)
+    # driver's device (226, drm) is not a GPU holder, and the reset unit itself never counts
+    done = _run_holder_units_scan(tmp_path, {
+        4242: (f"0::/system.slice/{AGENT}", "195:7"),
+        4243: ("0::/system.slice/uvm-user.service", "510:0"),
+        4244: ("0::/system.slice/compositor.service", "226:0"),
+        4245: (f"0::/system.slice/{gpu_reset.FABRIC_RESET_UNIT}.service", "195:0"),
+    })
+    assert done.returncode == 0 and done.stdout.split() == [AGENT, "uvm-user.service"]
+
+
+def test_the_host_holder_scan_exits_3_when_an_open_file_cannot_be_read(tmp_path):
+    done = _run_holder_units_scan(tmp_path, {4242: (f"0::/system.slice/{AGENT}", "195:0"), 4250: ("0::/", "denied")})
     assert done.returncode == 3
-    assert log[:3] == [f"stop {AGENT}", "stop uvm-user.service", f"reset -r -i {U[0]}"]
-    assert sorted(log[3:]) == sorted(
-        [f"start {AGENT}", f"is-active {AGENT}", "start uvm-user.service", "is-active uvm-user.service"]
-    )
-    assert "compositor" not in done.stdout and "GPU holders left: agent uvm-user" in done.stdout
-
-
-def test_the_host_unit_does_not_reset_when_it_cannot_read_every_open_file(tmp_path):
-    # DAH-6741 review: an unreadable open file may be a GPU holder that would stay up: stop before the reset
-    procs = {4242: ("agent", f"0::/system.slice/{AGENT}"), 4250: ("hidden", "0::/", "denied")}
-    done, log = _run_fabric_script(tmp_path, units=(FM, NVLSM), procs=procs)
-    assert done.returncode == gpu_reset._FABRIC_STOP_FAILED_EXIT
-    assert "could not read which host processes hold the GPUs" in done.stderr
-    assert log == [f"stop {FM}", f"stop {NVLSM}", f"start {NVLSM}", f"start {FM}"]
 
 
 def test_the_host_unit_skips_the_reset_when_a_stop_fails_and_still_starts_the_fabric(tmp_path):
@@ -854,35 +874,14 @@ def test_hanging_docker_calls_hit_their_deadline_and_still_hand_off(tmp_path, mo
     assert (tmp_path / "log").read_text().splitlines()[-1] == "docker start e1"
 
 
-def test_the_host_unit_starts_the_listed_prerequisites_before_a_discovered_holder(tmp_path):
+def test_the_host_unit_starts_the_listed_prerequisites_before_a_found_holder(tmp_path):
     # a monitor that fails to start without Fabric Manager comes back, since Fabric Manager starts first
-    procs = {4242: ("agent", f"0::/system.slice/{AGENT}")}
-    done, log = _run_fabric_script(tmp_path, units=(FM, PERSISTENCED), procs=procs, needs=FM)
+    done, log = _run_fabric_script(tmp_path, units=(AGENT, FM, PERSISTENCED), needs=FM)
     assert done.returncode == 0 and "could not start" not in done.stderr
-    assert log[-3:] == [f"start {FM}", f"start {AGENT}", f"is-active {AGENT}"]
+    assert log[-2:] == [f"start {FM}", f"start {AGENT}"]
 
 
 AGENT = "some-gpu-agent.service"
-
-
-@pytest.mark.parametrize(
-    "stop_fails,start_fails,exit_code,log",
-    [
-        ("", "", 0, [f"stop {AGENT}", f"reset -r -i {U[0]}", f"start {AGENT}", f"is-active {AGENT}"]),
-        # a stop that fails may still have stopped it: it is started again, and the reset is skipped
-        (AGENT, "", gpu_reset._FABRIC_STOP_FAILED_EXIT, [f"stop {AGENT}", f"start {AGENT}", f"is-active {AGENT}"]),
-        ("", AGENT, gpu_reset._FABRIC_START_FAILED_EXIT, [f"stop {AGENT}", f"reset -r -i {U[0]}", f"start {AGENT}"]),
-    ],
-)
-def test_the_host_unit_starts_a_discovered_holder_again_and_fails_when_it_stays_down(
-    tmp_path, stop_fails, start_fails, exit_code, log
-):
-    procs = {4242: ("agent", f"0::/system.slice/{AGENT}")}
-    done, got = _run_fabric_script(
-        tmp_path, units=(), procs=procs, stop_fails=stop_fails, start_fails=start_fails
-    )
-    assert done.returncode == exit_code and got == log
-    assert (f"could not start {AGENT}" in done.stderr) == bool(start_fails)
 
 
 DCGM, PERSISTENCED = "nvidia-dcgm", "nvidia-persistenced"
@@ -1020,12 +1019,41 @@ async def test_a_pod_sharing_the_host_never_stops_the_host_gpu_holders():
 
 
 @pytest.mark.asyncio
-async def test_a_holder_the_host_unit_could_not_start_again_fails_the_reset():
-    host = _b300(reset_exit=gpu_reset._FABRIC_START_FAILED_EXIT)
+async def test_a_found_holder_that_does_not_start_again_fails_the_reset():
+    host = _b300(host_holder_units=f"{AGENT}\n", start_fails=(AGENT,))
     report, start = await _reset(host, backend=U)
     assert not report.ok and report.error_code == GpuResetErrorCode.ResetNotSupported
-    assert not report.gpus and not any(cmd.startswith("CUDA_VISIBLE_DEVICES=") for cmd in host.commands)
+    assert f"{AGENT} is not active again after the reset" in report.detail
+    assert not any(cmd.startswith("CUDA_VISIBLE_DEVICES=") for cmd in host.commands)
     start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_host_service_found_holding_a_gpu_stops_first_and_starts_last():
+    # DAH-6741 review: found before anything stops; a listed one the scan also finds is not stopped twice
+    host = _b300(host_holder_units=f"{AGENT}\n{DCGM}.service\n")
+    report, _ = await _reset(host, backend=U)
+    assert report.ok
+    stopped = [unit for verb, unit in host.fm_log if verb == "stop"]
+    started = [unit for verb, unit in host.fm_log if verb == "start"]
+    assert stopped == [AGENT, DCGM, FM, PERSISTENCED] and started[:4] == [PERSISTENCED, FM, DCGM, AGENT]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "answer,code",
+    [
+        (make_command_result(False, exit_code=3), GpuResetErrorCode.ResetNotSupported),
+        # a scan blocked on a stalled filesystem: the SSH timeout, with nothing stopped yet
+        (make_command_result(False, exit_code=-1, error_type="timeout"), GpuResetErrorCode.ExecutorUnreachable),
+    ],
+)
+async def test_a_host_holder_scan_that_is_not_whole_refuses_before_anything_stops(answer, code):
+    host = _b300(host_holder_units=answer)
+    report, start = await _reset(host, backend=U)
+    assert not report.ok and report.error_code == code and "nothing was stopped" in report.detail
+    assert report.stopped_during_reset is False
+    _no_change(host, start)
 
 
 @pytest.mark.asyncio
