@@ -114,6 +114,7 @@ ORIGINAL_KEYS = {
     "processes_pid": "pid",
     "processes_info": "info",
     "processes_container_name": "container_name",
+    "processes_cmdline": "cmdline",
     'hard_disk_total': "total",
     'hard_disk_used': "used",
     'hard_disk_free': "free",
@@ -354,6 +355,7 @@ class FileEncryptService:
             "processes_info": "",
             "gpu_scrape_error": "",
             "processes_container_name": "",
+            "processes_cmdline": "",
             'nvidia_cfg_scrape_error': "",
             'data_md5_checksums': "",
             'md5_checksums_nvidia_smi': "",
@@ -476,6 +478,8 @@ class FileEncryptService:
         """DAH-5899: this cycle's keys and obfuscated source, with the frozen scrape left unbuilt. A normal cycle
         delivers the source over stdin and never needs the binary; `binary_build` freezes it on the first failed
         stdin scrape. Earlier cycles' directories go only once that build is done (empty ones go now)."""
+        # first: a failed obfuscator run leaves the earlier cycles' directories as they are
+        scrape = self._obfuscated_scrape()
         root = JOB_FILES_ROOT
         root.mkdir(exist_ok=True)
         kept = {Path(path).resolve() for path in keep_directories()}
@@ -486,7 +490,6 @@ class FileEncryptService:
             except FileNotFoundError:  # a build's cleanup removed it first
                 continue
         directory = Path(tempfile.mkdtemp(prefix=f"cycle-{time.time_ns():020d}-", dir=root))
-        scrape = self._obfuscated_scrape()
         file_name = f"tmp{secrets.token_hex(4)}"
         return MinerJobEnryptedFiles(
             encrypt_key=scrape.encryption_key,
@@ -505,7 +508,9 @@ class FileEncryptService:
             Path(__file__).parent / ".." / "miner_jobs/obfuscated_machine_scrape.py"
         )
         command = [sys.executable, obfuscator_machine_scrape_file_path, machine_scrape_file_path]
-        subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)  # noqa
+        # a failed run must not leave the previous build's output to be read below
+        Path(obfuscated_machine_scrape_file_path).unlink(missing_ok=True)
+        subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)  # noqa
         with open(obfuscated_machine_scrape_file_path) as file:
             obfuscated_content = file.read()
         all_keys, encryption_key = self.generate_key_mappings()
@@ -530,8 +535,9 @@ class FileEncryptService:
 
         Returns: MinerJobEnryptedFiles
         """
-        tmp_directory = self.fresh_job_files_directory(keep_directories)
         scrape = self._obfuscated_scrape()
+        # after the run: a failed one leaves the previous cycle's directory in place
+        tmp_directory = self.fresh_job_files_directory(keep_directories)
 
         # build binary with nuitka
         with tempfile.NamedTemporaryFile(delete=True) as machine_scrape_file:

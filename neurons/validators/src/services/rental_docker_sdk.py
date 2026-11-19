@@ -378,6 +378,11 @@ class ContainerRunSpec:
     # on the host; may raise ContainerCreateRefused, and the created container is then left unstarted
     before_start: Callable[[list[str]], None] | None = field(default=None, repr=False, compare=False)
 
+    def __post_init__(self) -> None:
+        # DAH-6302: Docker reads nano_cpus 0 as no limit, so a share that rounded down to 0 gets one core
+        if self.cpu_count is not None:
+            self.cpu_count = max(self.cpu_count, 1)
+
 
 @dataclass(slots=True)
 class ContainerExecSpec:
@@ -710,6 +715,9 @@ class RentalDockerSdkClient:
             timeout=stop_grace_seconds,
         )
 
+    async def kill(self, *, container_name: str) -> None:
+        await self._call_api(container_name, operation_label="kill", api_method=self._api_client.kill)
+
     async def remove_container(
         self,
         *,
@@ -740,6 +748,20 @@ class RentalDockerSdkClient:
             raise RentalDockerOperationError(
                 _wrap_error_message("Docker SDK inspect container failed", exc)
             ) from exc
+
+    async def container_identity(self, *, container_name: str) -> str | None:
+        """"<Id>@<StartedAt>": a re-create changes the id, a re-start the start time. None once the container is gone."""
+        try:
+            info = await _in_docker_thread(self._api_client.inspect_container, container_name)
+        except Exception as exc:
+            if _is_docker_not_found_error(exc):
+                return None
+            raise RentalDockerOperationError(_wrap_error_message("Docker SDK inspect container failed", exc)) from exc
+        container_id = info.get("Id") if isinstance(info, dict) else None
+        started_at = (info.get("State") or {}).get("StartedAt") if isinstance(info, dict) else None
+        if not container_id or not started_at:
+            raise RentalDockerOperationError("Docker inspect did not include the container's Id and StartedAt")
+        return f"{container_id}@{started_at}"
 
     async def container_log_tail(self, *, container_name: str, lines: int) -> str:
         """The container's last `lines` of stdout+stderr, decoded with replacement characters."""
@@ -945,11 +967,16 @@ class RentalDockerSdkClient:
             force=force,
         )
 
-    async def prune_images(self) -> None:
-        await self._call_api(
-            operation_label="prune images",
-            api_method=self._api_client.prune_images,
-        )
+    async def remove_image_if_untagged(self, *, image_id: str) -> bool:
+        """Remove the image by ID when no tag names it any more; dockerd refuses while a container uses it."""
+        try:
+            image = await _in_docker_thread(self._api_client.inspect_image, image_id)
+        except Exception as exc:
+            raise RentalDockerOperationError(_wrap_error_message("Docker SDK inspect image failed", exc)) from exc
+        if image.get("RepoTags"):
+            return False
+        await self._call_api(image_id, operation_label="remove image", api_method=self._api_client.remove_image)
+        return True
 
     async def aclose(self) -> None:
         close = getattr(self._api_client, "close", None)
@@ -1526,6 +1553,20 @@ def build_gpu_docker_config(
 
 # The backend's add fence (lium-platform DAH-6441) expires after an hour; this bound is what makes that expiry safe.
 AUTHORIZED_KEYS_APPEND_DEADLINE_SECONDS = 60
+AUTHORIZED_KEYS_LOCK_WAIT_SECONDS = 30
+# the lium CLI's transfer-key lock (TRANSFER_KEY_LOCK, ~/.ssh/.lium-cp.lock): its cp grant and revoke wait for these edits
+AUTHORIZED_KEYS_LOCK_FILE = ".lium-cp.lock"
+
+
+def _authorized_keys_lock(quoted_dir: str, busy_exit: int) -> str:
+    """Serializes the add and the remove, so a remove's read-filter-write never drops a key an add appended in between
+    and a delayed remove never writes back over a later one. BusyBox's flock has no -w, so poll -n. An image without
+    flock edits unlocked, as before: a lock that survives a killed holder would block every later edit."""
+    return (
+        f"if command -v flock >/dev/null 2>&1; then exec 9>>{quoted_dir}/{AUTHORIZED_KEYS_LOCK_FILE} || exit {busy_exit}; "
+        f"waited=0; until flock -n 9; do if [ $waited -ge {AUTHORIZED_KEYS_LOCK_WAIT_SECONDS} ]; then exit "
+        f"{busy_exit}; fi; waited=$((waited + 1)); sleep 1; done; fi; "
+    )
 
 
 def build_authorized_keys_exec_spec(
@@ -1549,7 +1590,8 @@ def build_authorized_keys_exec_spec(
     script = (
         "start=$(cat /proc/uptime) || exit 1; "
         f"mkdir -p {quoted_dir} && chmod 700 {quoted_dir} && keys=$(cat) || exit 1; "
-        "now=$(cat /proc/uptime) || exit 1; "
+        + _authorized_keys_lock(quoted_dir, 75)
+        + "now=$(cat /proc/uptime) || exit 1; "
         f'if [ $(( ${{now%%.*}} - ${{start%%.*}} )) -gt {append_deadline_seconds} ]; then '
         'echo "authorized_keys append deadline passed" >&2; exit 75; fi; '
         f'printf "%s\\n" "$keys" >> {shlex.quote(target_path)}'
@@ -1577,8 +1619,9 @@ def build_remove_authorized_keys_exec_spec(
     # into host-side Docker shell text or into this argv.
     script = (
         "set -e; "
-        f"mkdir -p {quoted_dir} && "
-        f"touch {quoted_path} && "
+        f"mkdir -p {quoted_dir}; "
+        + _authorized_keys_lock(quoted_dir, 1)
+        + f"touch {quoted_path} && "
         "keys=$(mktemp) && filtered=$(mktemp) && "
         "trap 'rm -f \"$keys\" \"$filtered\"' EXIT && "
         "cat > \"$keys\" && "

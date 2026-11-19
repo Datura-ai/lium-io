@@ -1,37 +1,27 @@
 """
-A validator sign-in is accepted only when its signed payload names this miner, and every message after it
-names the same miner (WebSocket consumer and REST routes).
+A validator's signed REST headers are accepted only when they name this miner, within the time window, and
+every request names the same miner.
 
-Ephemeral keypairs sign the real payload shape (AuthenticationPayload.blob_for_signing); the consumer's socket
-and the services are the only things replaced. The REST dependency and the route functions are called directly
+Ephemeral keypairs sign the real payload shape (AuthenticationPayload.blob_for_signing); the services are the
+only things replaced. The REST dependency and the route functions are called directly
 (the miners lock has no httpx, so no TestClient); lium-io#1312's e2e stack exercises the same routes over HTTP.
 """
 
 import time
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
-from uuid import UUID
 
 import bittensor
 import pytest
-from datura.requests.miner_requests import UnAuthorizedRequest
 from datura.requests.validator_requests import (
-    AuthenticateRequest,
     AuthenticationPayload,
-    GetPodLogsRequest,
 )
 from fastapi import HTTPException
 
-import consumers.validator_consumer as consumer_module
 import dependencies.auth as auth_module
 import routes.validator_interface as routes
-from consumers.validator_consumer import ValidatorConsumer
 from services.executor_service import ExecutorService
-from services.ssh_service import MinerSSHService
 from services.validator_service import ValidatorService
 
-_CONTAINER = "pod_0b2a6d1e-9e2e-4e2e-8e2e-000000000e2e"
-_EXECUTOR_ID = "0b2a6d1e-9e2e-4e2e-8e2e-000000000e2e"
 
 
 @pytest.fixture(scope="module")
@@ -60,112 +50,15 @@ def _settings(miner_keypair, central_mode: bool) -> MagicMock:
     return settings
 
 
-def _auth_request(validator_keypair, miner_hotkey: str, *, signer=None):
-    payload = AuthenticationPayload(
-        validator_hotkey=validator_keypair.ss58_address,
-        miner_hotkey=miner_hotkey,
-        timestamp=int(time.time()),
-    )
-    signer = signer or validator_keypair
-    return AuthenticateRequest(
-        payload=payload, signature=f"0x{signer.sign(payload.blob_for_signing()).hex()}"
-    )
-
-
-# ---------------------------------------------------------------- WebSocket consumer ----------------------------------
-
-
-@pytest.fixture()
-def consumer(validator_keypair, miner_keypair, monkeypatch):
-    def make(central_mode: bool = False) -> ValidatorConsumer:
-        monkeypatch.setattr(consumer_module, "settings", _settings(miner_keypair, central_mode))
-        validator_service = MagicMock(spec=ValidatorService)
-        validator_service.is_valid_validator.return_value = True
-        executor_service = MagicMock(spec=ExecutorService)
-        # one executor, so an accepted sign-in is answered with AcceptJobRequest and the session stays open
-        executor_service.get_executors_for_validator = AsyncMock(
-            return_value=[
-                SimpleNamespace(uuid=UUID(_EXECUTOR_ID), address="203.0.113.10", port=8001)
-            ]
-        )
-        executor_service.get_pod_logs = AsyncMock(return_value=[])
-        executor_service.register_pubkey = AsyncMock(return_value=[])
-        executor_service.deregister_pubkey = AsyncMock(return_value=None)
-        c = ValidatorConsumer(
-            websocket=MagicMock(),
-            validator_key=validator_keypair.ss58_address,
-            ssh_service=MagicMock(spec=MinerSSHService),
-            validator_service=validator_service,
-            executor_service=executor_service,
-        )
-        c.send_message = AsyncMock()
-        c.disconnect = AsyncMock()
-        return c
-
-    return make
-
-
-def test_a_sign_in_naming_another_miner_is_refused(
-    consumer, validator_keypair, other_miner_keypair
-):
-    """The validator signed this payload for another miner; a standard miner is not that miner."""
-    c = consumer()
-    ok, reason = c.verify_auth_msg(
-        _auth_request(validator_keypair, other_miner_keypair.ss58_address)
-    )
-    assert ok is False
-    assert reason.startswith("wrong miner hotkey"), reason
-
-
-def test_a_bad_signature_is_a_refusal_not_none(consumer, validator_keypair, miner_keypair):
-    stranger = bittensor.Keypair.create_from_uri("//LiumTestStrangerNames")
-    c = consumer()
-    assert c.verify_auth_msg(
-        _auth_request(validator_keypair, miner_keypair.ss58_address, signer=stranger)
-    ) == (
-        False,
-        "invalid signature",
-    )
-
-
-@pytest.mark.asyncio
-async def test_after_sign_in_a_request_naming_another_miner_is_refused(
-    consumer, validator_keypair, miner_keypair, other_miner_keypair
-):
-    c = consumer(central_mode=True)
-    await c.handle_message(_auth_request(validator_keypair, miner_keypair.ss58_address))
-    assert (
-        c.validator_authenticated is True
-        and c.authenticated_miner_hotkey == miner_keypair.ss58_address
-    )
-    c.send_message.reset_mock()
-
-    await c.handle_message(
-        GetPodLogsRequest(
-            executor_id=_EXECUTOR_ID,
-            container_name=_CONTAINER,
-            miner_hotkey=other_miner_keypair.ss58_address,
-        )
-    )
-
-    c.executor_service.get_pod_logs.assert_not_awaited()
-    sent = c.send_message.await_args.args[0]
-    assert (
-        isinstance(sent, UnAuthorizedRequest) and other_miner_keypair.ss58_address in sent.details
-    )
-    c.disconnect.assert_awaited_once()
-    assert c.validator_authenticated is False, "a refused message ends the session"
-
-
 # ---------------------------------------------------------------- REST dependency and routes -------------------------
 
 
-def _headers(validator_keypair, miner_hotkey: str, *, signer=None) -> dict:
+def _headers(validator_keypair, miner_hotkey: str, *, signer=None, timestamp: int | None = None) -> dict:
     """The four headers MinerService._generate_auth_headers sends, as the dependency receives them."""
     payload = AuthenticationPayload(
         validator_hotkey=validator_keypair.ss58_address,
         miner_hotkey=miner_hotkey,
-        timestamp=int(time.time()),
+        timestamp=int(time.time()) if timestamp is None else timestamp,
     )
     signer = signer or validator_keypair
     return {
@@ -207,6 +100,66 @@ async def test_rest_headers_naming_another_miner_are_refused_403(
 
     assert refused.value.status_code == 403
     assert refused.value.detail == "Authentication names another miner"
+
+
+@pytest.mark.parametrize("offset", [-60, 60])
+async def test_rest_headers_outside_the_time_window_are_refused_401(
+    rest, validator_keypair, miner_keypair, offset
+):
+    """Signed headers are bounded in both directions: too old, and too far in the future."""
+    validator_service, _ = rest()
+
+    with pytest.raises(HTTPException) as refused:
+        await auth_module.verify_validator_auth_from_headers(
+            **_headers(
+                validator_keypair, miner_keypair.ss58_address, timestamp=int(time.time()) + offset
+            ),
+            validator_service=validator_service,
+        )
+
+    assert refused.value.status_code == 401
+
+
+async def test_rest_headers_with_a_huge_timestamp_are_refused_401_not_500(rest, validator_keypair, miner_keypair):
+    """A 401-digit integer X-Timestamp is a far-future timestamp, not an OverflowError."""
+    validator_service, _ = rest()
+    headers = _headers(validator_keypair, miner_keypair.ss58_address)
+    headers["x_timestamp"] = 10**400
+
+    with pytest.raises(HTTPException) as refused:
+        await auth_module.verify_validator_auth_from_headers(**headers, validator_service=validator_service)
+
+    assert refused.value.status_code == 401
+
+
+@pytest.mark.parametrize(
+    "offset_ms, expected",
+    [
+        pytest.param(-10_001, 401, id="past-10s-plus-1ms"),
+        pytest.param(-10_000, 200, id="past-10s"),
+        pytest.param(10_000, 200, id="future-10s"),
+        pytest.param(10_001, 401, id="future-10s-plus-1ms"),
+    ],
+)
+async def test_millisecond_headers_use_an_exact_window(
+    rest, validator_keypair, miner_keypair, monkeypatch, offset_ms, expected
+):
+    """A millisecond X-Timestamp is compared in milliseconds; the signature covers its whole-second floor."""
+    now = 1_763_500_000
+    monkeypatch.setattr(auth_module.time, "time", lambda: now + 0.5)
+    validator_service, _ = rest()
+    timestamp_ms = now * 1000 + offset_ms
+    headers = _headers(validator_keypair, miner_keypair.ss58_address, timestamp=timestamp_ms // 1000)
+    headers["x_timestamp"] = timestamp_ms
+
+    if expected == 200:
+        assert await auth_module.verify_validator_auth_from_headers(
+            **headers, validator_service=validator_service
+        ) == validator_keypair.ss58_address
+    else:
+        with pytest.raises(HTTPException) as refused:
+            await auth_module.verify_validator_auth_from_headers(**headers, validator_service=validator_service)
+        assert refused.value.status_code == expected
 
 
 def _dependency_names(dependant) -> set[str]:
