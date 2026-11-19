@@ -77,12 +77,16 @@ jobs:
                               bad.append(f"{path}: {ref} is not a tracked workflow or action manifest")
                       elif not pinned.fullmatch(norm(ref)):
                           bad.append(f"{path}: {ref}")
-                  # a Docker action's image: a registry image needs a digest; any other value must be a tracked Dockerfile
-                  # beside the manifest (the runner hands a bare value that is not a file to Docker as an image name)
+                  # a Docker action's image: the runner builds it only when the value ends in Dockerfile/dockerfile (then it
+                  # must be a tracked file beside the manifest); every other value is a registry image and needs a digest,
+                  # with or without docker://, whatever file of that name the repo holds
                   image = runs.get("image")
                   if image is not None:
-                      local = posixpath.normpath(posixpath.join(posixpath.dirname(str(path)), str(image)))
-                      ok = re.fullmatch(digest, norm(image)) if norm(image).startswith("docker://") else local in tracked
+                      v = norm(image)
+                      if str(image).endswith(("Dockerfile", "dockerfile")) and not v.startswith("docker://"):
+                          ok = posixpath.normpath(posixpath.join(posixpath.dirname(str(path)), str(image))) in tracked
+                      else:
+                          ok = re.fullmatch(digest, v if v.startswith("docker://") else "docker://" + v)
                       if not ok:
                           bad.append(f"{path}: runs.image {image}")
                   # job containers and services start before the steps, with the job's token: digest only
@@ -111,11 +115,13 @@ jobs:
               img + "docker://alpine@sha256:" + "0" * 64 + "\n": 0,
               img + "Dockerfile\n": 0,
               img + "Missing.Dockerfile\n": 1,
+              img + "alpine\n": 1,  # a tracked file named alpine sits beside it: still a registry image
+              img + "alpine@sha256:" + "0" * 64 + "\n": 0,
           })
           with tempfile.TemporaryDirectory() as d:
               for i, (text, want) in enumerate(cases.items()):
                   f = pathlib.Path(d, f"case{i}.yml"); f.write_text(text)
-                  known = {".github/actions/ok/action.yml", ".github/workflows/ok.yml", ".github/actions/yaml/action.yaml", f"{d}/Dockerfile"}
+                  known = {".github/actions/ok/action.yml", ".github/workflows/ok.yml", ".github/actions/yaml/action.yaml", f"{d}/Dockerfile", f"{d}/alpine"}
                   assert len(scan([f], known)) == want, (i, scan([f], known))
 
           # every tracked action manifest, wherever it lives: `uses: ./any/dir` runs that dir's action.yml
