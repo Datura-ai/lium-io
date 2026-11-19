@@ -92,23 +92,29 @@ GPU_HOLDERS_SCRIPT = (
 
 def device_holders_command(bus_ids: list[str]) -> str:
     """A "gpu <bus>" line for each GPU whose holders were read, then "<pid> <name>" of every process holding one of
-    these GPUs' device files open (host PID view), but the scanning shell and its ancestors (the SSH session).
+    these GPUs' devices open (host PID view), but the scanning shell and its ancestors (the SSH session).
 
     The driver refuses `nvidia-smi -r` while any process has the GPU open: a graphics (Xorg) or monitoring one
-    too, which the compute-app listing never shows. The minor comes from the driver's own per-bus file; a GPU
-    without a "gpu" line was not read whole (no minor, or find failed), so its holders are unknown. The one find
-    error that leaves the reading whole is a process that exited mid-scan (No such file or directory)."""
+    too, which the compute-app listing never shows. An open device is matched by its device number (the NVIDIA
+    major 195 and the minor from the driver's own per-bus file), not by its path, since any device node with those
+    numbers opens the GPU. A GPU without a "gpu" line was not read whole (no minor, or an open file whose device
+    could not be read), so its holders are unknown. The one error that leaves the reading whole is a process or
+    file that went away mid-scan (No such file or directory)."""
     buses = " ".join(shlex.quote(_proc_bus(bus)) for bus in bus_ids)
     return (
-        "command -v find >/dev/null && command -v grep >/dev/null || exit 3; "
+        "for c in find stat awk grep; do command -v $c >/dev/null || exit 3; done; "
         "d=$(mktemp -d) || exit 3; trap 'rm -rf \"$d\"' EXIT; "
         's=" "; p=$$; while [ -n "$p" ] && [ "$p" -gt 1 ]; do '
         's="$s$p "; p=$(sed -n \'s/^PPid:[[:space:]]*//p\' /proc/$p/status 2>/dev/null); done; '
+        # the device number (hex major, minor) of what every open file of every process is
+        'LC_ALL=C find /proc/[0-9]*/fd -type l -exec stat -L -c "%t %T %n" {} + >"$d/o" 2>"$d/e"; r=$?; '
+        'w=0; if [ "$r" = 0 ] || { [ -s "$d/e" ] && ! grep -qv "No such file or directory" "$d/e"; }; then w=1; fi; '
         f"for b in {buses}; do "
         "m=$(sed -n 's/^Device Minor:[[:space:]]*//p' /proc/driver/nvidia/gpus/$b/information 2>/dev/null); "
-        '[ -n "$m" ] || continue; LC_ALL=C find /proc/[0-9]*/fd -lname "/dev/nvidia$m" >"$d/o" 2>"$d/e"; r=$?; '
-        'cut -d/ -f3 "$d/o"; if [ "$r" = 0 ] || { [ -s "$d/e" ] && '
-        '! grep -qv "No such file or directory" "$d/e"; }; then echo "gpu $b"; fi; '
+        'case "$m" in ""|*[!0-9]*) continue;; esac; '
+        "awk -v m=\"$(printf %x \"$m\")\" "
+        "'$1 == \"c3\" && $2 == m { sub(\"/fd/.*\", \"\", $3); sub(\".*/\", \"\", $3); print $3 }' \"$d/o\"; "
+        'if [ "$w" = 1 ]; then echo "gpu $b"; fi; '
         "done | sort -u | while read k v; do "
         'if [ "$k" = gpu ]; then echo "gpu $v"; else case "$s" in *" $k "*) ;; '
         "*) printf '%s %s\\n' \"$k\" \"$(cat /proc/$k/comm 2>/dev/null)\";; esac; fi; done"

@@ -137,7 +137,7 @@ class FakeHost:
             return make_command_result(True, self.topo)
         if cmd.endswith("< /proc/self/cgroup"):
             return make_command_result(True, f"{self.own_cgroup} ")
-        if cmd.startswith("command -v find"):
+        if cmd.startswith("for c in find stat"):
             self.holder_reads += 1
             if self.holder_scan is not None:
                 return self.holder_scan
@@ -1441,26 +1441,44 @@ async def test_a_refused_reset_reports_the_start_of_the_nvidia_smi_text():
     assert "the GPUs were not reset: GPU 00000000:0A:00.0 is currently in use by another process." in report.detail
 
 
+# a fake stat: each fake fd links to ".../dev-<major>-<minor>" (tests cannot make device nodes); a link to
+# "denied" fails the way an fd the scan may not read does
+FAKE_STAT = """#!/bin/sh
+for f; do
+  case "$f" in -L|-c|"%t %T %n") continue;; esac
+  t=$(readlink "$f")
+  case "$t" in
+    denied) echo "stat: cannot statx '$f': Permission denied" >&2; ok=1;;
+    *dev-*) t=${t##*dev-}; printf '%x %x %s\\n' "${t%-*}" "${t#*-}" "$f";;
+  esac
+done
+exit ${ok:-0}
+"""
+
+
 def _run_holder_scan(tmp_path, holders: dict[int, str], minors: dict[str, int], find: str | None = None) -> list[str]:
-    """The holder command run by sh over a fake /proc: holders maps pid -> device it holds open. find, when given,
-    is the body of a fake find put first on PATH ($ROOT is the fake /proc)."""
+    """The holder command run by sh over a fake /proc: holders maps pid -> "<major>:<minor>" of the device it holds
+    open ("denied": an fd the scan cannot read). find, when given, is the body of a fake find put first on PATH
+    ($ROOT is the fake /proc)."""
     root = tmp_path / "proc"
     env = {**os.environ, "ROOT": str(root)}
-    if find is not None:
-        (tmp_path / "bin").mkdir()
-        (tmp_path / "bin/find").write_text(f"#!/bin/sh\n{find}\n")
-        (tmp_path / "bin/find").chmod(0o755)
-        env["PATH"] = f"{tmp_path / 'bin'}:{env['PATH']}"
+    (tmp_path / "bin").mkdir()
+    fakes = {"stat": FAKE_STAT, **({"find": f"#!/bin/sh\n{find}\n"} if find is not None else {})}
+    for name, body in fakes.items():
+        (tmp_path / "bin" / name).write_text(body)
+        (tmp_path / "bin" / name).chmod(0o755)
+    env["PATH"] = f"{tmp_path / 'bin'}:{env['PATH']}"
     for bus, minor in minors.items():
         (root / "driver/nvidia/gpus" / bus).mkdir(parents=True)
         (root / "driver/nvidia/gpus" / bus / "information").write_text(f"Model: x\nDevice Minor: \t {minor}\n")
     for pid, device in holders.items():
         (root / str(pid) / "fd").mkdir(parents=True)
-        (root / str(pid) / "fd" / "5").symlink_to(device)
+        target = "denied" if device == "denied" else "/dev/x/dev-" + device.replace(":", "-")
+        (root / str(pid) / "fd" / "5").symlink_to(target)
         (root / str(pid) / "comm").write_text(f"proc{pid}\n")
     command = gpu_reset.device_holders_command(["00000000:1b:00.0", "00000000:0a:00.0"])
     command = command.replace("/proc/driver", f"{root}/driver").replace("/proc/[0-9]*", f"{root}/[0-9]*")
-    command = command.replace("/proc/$k/comm", f"{root}/$k/comm").replace("-f3", f"-f{len(root.parts) + 1}")
+    command = command.replace("/proc/$k/comm", f"{root}/$k/comm")
     done = subprocess.run(["sh", "-c", command], capture_output=True, text=True, env=env)
     assert done.returncode == 0, done.stderr
     return done.stdout.splitlines()
@@ -1468,10 +1486,10 @@ def _run_holder_scan(tmp_path, holders: dict[int, str], minors: dict[str, int], 
 
 def test_a_find_error_other_than_an_exited_process_leaves_the_gpu_unread(tmp_path):
     # Arrange: find lists Xorg, then fails on a /proc entry it could not read
-    find = """printf '%s\\n' "$ROOT/1500/fd/5"; echo "find: '/proc/9/fd': Permission denied" >&2; exit 1"""
+    find = """printf 'c3 3 %s\\n' "$ROOT/1500/fd/5"; echo "find: '/proc/9/fd': Permission denied" >&2; exit 1"""
 
     # Act
-    lines = _run_holder_scan(tmp_path, {1500: "/dev/nvidia3"}, {"0000:1b:00.0": 3}, find=find)
+    lines = _run_holder_scan(tmp_path, {1500: "195:3"}, {"0000:1b:00.0": 3}, find=find)
 
     # Assert: the holder is named, and the GPU has no "gpu" line, so the reset is refused as unread
     assert lines == ["1500 proc1500"]
@@ -1487,26 +1505,41 @@ def test_a_find_killed_without_a_message_leaves_the_gpu_unread(tmp_path):
 
 def test_a_process_that_exits_mid_scan_keeps_the_gpu_read(tmp_path):
     # Arrange
-    find = """printf '%s\\n' "$ROOT/1500/fd/5"; echo "find: '/proc/9/fd': No such file or directory" >&2; exit 1"""
+    find = """printf 'c3 3 %s\\n' "$ROOT/1500/fd/5"; echo "find: '/proc/9/fd': No such file or directory" >&2; exit 1"""
 
     # Act
-    lines = _run_holder_scan(tmp_path, {1500: "/dev/nvidia3"}, {"0000:1b:00.0": 3}, find=find)
+    lines = _run_holder_scan(tmp_path, {1500: "195:3"}, {"0000:1b:00.0": 3}, find=find)
 
     # Assert
     assert sorted(lines) == ["1500 proc1500", "gpu 0000:1b:00.0"]
 
 
 def test_the_holder_scan_names_each_read_gpu_and_the_processes_holding_it(tmp_path):
-    # Act: GPU 0a has no minor in the driver's file, so it is not read
-    lines = _run_holder_scan(tmp_path, {41: "/dev/nvidia3", 42: "/dev/nvidia3", 43: "/dev/nvidia1"}, {"0000:1b:00.0": 3})
+    # Act: GPU 0a has no minor in the driver's file, so it is not read; 44 holds another device with minor 3
+    holders = {41: "195:3", 42: "195:3", 43: "195:1", 44: "226:3"}
+    lines = _run_holder_scan(tmp_path, holders, {"0000:1b:00.0": 3})
 
     # Assert
     assert sorted(lines) == ["41 proc41", "42 proc42", "gpu 0000:1b:00.0"]
 
 
+def test_the_holder_scan_matches_the_gpus_device_number_whatever_the_node_is_called(tmp_path):
+    # DAH-6741 review: any device node with the GPU's numbers opens it, so the path name proves nothing
+    lines = _run_holder_scan(tmp_path, {1500: "195:10"}, {"0000:1b:00.0": 10})
+
+    assert sorted(lines) == ["1500 proc1500", "gpu 0000:1b:00.0"]
+
+
+def test_an_open_file_whose_device_cannot_be_read_leaves_the_gpu_unread(tmp_path):
+    # DAH-6741 review: an fd the scan cannot stat may be the GPU, so the reading is not whole
+    lines = _run_holder_scan(tmp_path, {1500: "denied", 41: "195:3"}, {"0000:1b:00.0": 3})
+
+    assert lines == ["41 proc41"]
+
+
 def test_the_holder_scan_never_names_its_own_session(tmp_path):
     # Arrange: the scanning shell's parent holds the device (a stand-in for the validator's SSH session)
-    lines = _run_holder_scan(tmp_path, {os.getpid(): "/dev/nvidia3", 44: "/dev/nvidia3"}, {"0000:1b:00.0": 3})
+    lines = _run_holder_scan(tmp_path, {os.getpid(): "195:3", 44: "195:3"}, {"0000:1b:00.0": 3})
 
     # Assert
     assert sorted(lines) == ["44 proc44", "gpu 0000:1b:00.0"]
