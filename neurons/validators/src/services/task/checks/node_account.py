@@ -95,9 +95,8 @@ class NodeAccountCheck:
         if expected and presented_host_key(ctx) not in expected:
             return _refused(ctx, self.check_id, Msg.MISMATCH, what)
         bound = False
-        binding = current_binding(executor)
-        if binding.expected_node_hotkeys and ctx.runner is not None:
-            refused, bound = await self._other_account(ctx, binding, what)
+        if executor.expected_node_hotkeys and ctx.runner is not None:
+            refused, bound = await self._other_account(ctx, what)
             if refused is not None:
                 return refused
         if expected or bound:
@@ -119,9 +118,7 @@ class NodeAccountCheck:
             event=render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what=what),
         )
 
-    async def _other_account(
-        self, ctx: Context, executor: ExecutorSSHInfo, what: dict
-    ) -> tuple[CheckResult | None, bool]:
+    async def _other_account(self, ctx: Context, what: dict) -> tuple[CheckResult | None, bool]:
         """(refusal or report, None when the machine may serve this listing; True when its files proved it does).
 
         Accepted: a machine set up for one of the hotkeys and claims the portal sends for this node, which cover every
@@ -132,6 +129,11 @@ class NodeAccountCheck:
         result = await ctx.runner.run(
             READ_NODE_ACCOUNT_COMMAND, timeout=READ_TIMEOUT_SECONDS, retryable=True
         )
+        # the binding as of the verdict, after the read: a read that outlasts the owner-wide grant's end is judged
+        # against the listing account's own binding
+        executor = current_binding(ctx.executor)
+        if not executor.expected_node_hotkeys:
+            return None, False  # a listing binding naming no hotkey: nothing to compare, as for a node sent without one
         found = dict(
             line.split("=", 1) for line in (result.stdout or "").splitlines() if "=" in line
         )

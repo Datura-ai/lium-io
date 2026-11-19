@@ -472,6 +472,29 @@ async def test_an_owner_wide_grant_counts_only_until_its_end_when_the_node_is_ch
     )
 
 
+async def test_a_read_that_outlasts_the_owner_grant_is_judged_by_the_binding_after_it():
+    """Review on 4f44d24: the binding was chosen before the awaited read, so a read that ran past the grant's end
+    still passed the partner's setup. It is chosen after the read now."""
+    from datetime import timedelta
+
+    class _SlowRead(_HostFiles):
+        async def run(self, cmd, **kwargs):
+            executor.owner_binding_until = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()  # ended meanwhile
+            return await super().run(cmd, **kwargs)
+
+    executor = ExecutorSSHInfo(
+        uuid="node-1", address="203.0.113.7", port=8001, ssh_username="root", ssh_port=22,
+        python_path="/usr/bin/python3", root_dir="/root", expected_node_hotkeys=["5Account", "5Partner"],
+        check_enforce_after={}, owner_binding_until=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+        listing_binding={"expected_node_hotkeys": ["5Account"]},
+    )
+    ctx = make_context(executor=executor, runner=_SlowRead("hotkey=5Partner\nclaim=\n"), miner_hotkey="5Account")
+
+    result = await NodeAccountCheck().run(ctx)
+
+    assert (result.passed, result.event.reason_code) == (False, "NODE_ACCOUNT_MISMATCH")
+
+
 async def test_another_owners_setup_is_refused_at_once_without_a_notice():
     """The security case does not wait for the notice: no check_enforce_after, refused all the same."""
     ctx = _relay_ctx(

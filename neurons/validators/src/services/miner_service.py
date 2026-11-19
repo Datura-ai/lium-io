@@ -4,6 +4,7 @@ import logging
 import os
 import shlex
 import time
+from datetime import UTC, datetime
 from collections.abc import Awaitable, Container, Iterator
 from typing import Annotated
 from uuid import UUID
@@ -2339,8 +2340,11 @@ class MinerService:
                 )
                 # DAH-3019: one start report for the whole miner, as its executors are launched.
                 self.task_service.report_verification_started(payload, executors)
-                def run(executor_info, timeout: float = settings.JOB_TIME_OUT - 120):
-                    return asyncio.wait_for(
+                async def run(executor_info, timeout: float = settings.JOB_TIME_OUT - 120):
+                    # the run's own start goes with its result: the cycle id is the job block's estimated time, and
+                    # the backend ties a finding to a node registered before the later of the two (observed_from)
+                    check_started_at = datetime.now(UTC)
+                    result = await asyncio.wait_for(
                         self.task_service.create_task(
                             miner_info=payload,
                             executor_info=executor_info,
@@ -2356,6 +2360,9 @@ class MinerService:
                         ),
                         timeout=timeout,
                     )
+                    if isinstance(result, JobResult) and result.check_started_at is None:
+                        result.check_started_at = check_started_at
+                    return result
 
                 try:
                     tasks = [asyncio.create_task(run(executor_info)) for executor_info in executors]

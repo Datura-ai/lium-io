@@ -173,6 +173,21 @@ async def test_the_cycle_asks_for_every_executor(rest_miner_service):
 
 
 @pytest.mark.asyncio
+async def test_every_wave_result_carries_when_its_own_run_started(rest_miner_service):
+    """Review on 4f44d24: the cycle id is the job block's estimated time, so a node registered after that estimate
+    but before its run had no look time the backend could tie a finding to. Each wave result now carries its run's
+    start (the backend uses the later of the two), set before any early publish reads it."""
+    node = str(uuid4())
+    rest_miner_service.miner_returns(node)
+    before = datetime.now(UTC)
+
+    job = await _request(rest_miner_service)
+
+    [result] = job["results"]
+    assert before <= result.check_started_at <= datetime.now(UTC)
+
+
+@pytest.mark.asyncio
 async def test_the_wave_leaves_a_node_the_express_lane_has_queued_to_it(rest_miner_service):
     """DAH-5601: queued, not yet running (per-miner cap, retry wait), the node still goes express:
     in the wave it waited its turn and ran the full check, 7-15 min from add to listed."""
