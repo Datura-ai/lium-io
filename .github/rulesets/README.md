@@ -77,3 +77,19 @@ Add a person by appending `{ "actor_id": <id>, "actor_type": "User", "bypass_mod
 
 Check: `gh api "repos/$R/rulesets?targets=tag" --jq '.[]|.name+" "+.enforcement'` → `release-tags active`.
 A push of `executor-v*` by anyone outside the bypass list is refused by GitHub before any workflow runs.
+
+## `pinned-actions-required-workflow`: the pinned-actions check always comes from main (organization owner, once)
+
+`pinned-actions.yml` judges whether a PR or a merge-queue group may land, so the copy that runs must be the one on
+`main`, not the one the candidate carries. A repository workflow cannot guarantee that on `pull_request` or
+`merge_group` (both run the candidate's copy), so an organization ruleset requires it instead:
+`pinned-actions-required-workflow.json` ("Require workflows to pass before merging" on the default branch of `lium-io`
+and `lium`, workflow `.github/workflows/pinned-actions.yml` from `Datura-ai/lium-io` at `refs/heads/main`). GitHub then
+runs main's copy on every PR and every queued group, whatever the candidate changes in its own workflow files. The rule
+exists at organization level only, so an organization owner applies it:
+
+```bash
+gh api "orgs/Datura-ai/rulesets" --method POST --input .github/rulesets/pinned-actions-required-workflow.json
+```
+
+Check: `gh api "orgs/Datura-ai/rulesets" --jq '.[]|.name+" "+.enforcement'` → `pinned-actions-required-workflow active`.
