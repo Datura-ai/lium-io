@@ -73,6 +73,16 @@ def _current_binding(item: dict) -> dict:
     return listing if expired else item
 
 
+def _expected_fields(binding: dict) -> dict:
+    """A portal binding as the ExecutorSSHInfo fields the validator checks the node against."""
+    return {
+        "expected_node_hotkeys": [str(h) for h in binding.get("node_hotkeys") or []] or None,
+        "expected_account_claim": binding.get("account_claim") or None,
+        "expected_account_claims": [str(c) for c in binding.get("account_claims") or []] or None,
+        "expected_claims_by_hotkey": binding.get("claims_by_hotkey"),
+    }
+
+
 class _UnreachableExecutorLog:
     """Folds repeated request failures per executor into one WARNING per window."""
 
@@ -366,13 +376,15 @@ class ExecutorService:
                     host_keys[str(uuid)] = item["ssh_host_key"]
                 binding = _current_binding(item)
                 if node_accounts is not None and binding.get("node_hotkeys"):
+                    listing = item.get("listing_binding")
                     node_accounts[str(uuid)] = {
-                        "hotkeys": [str(h) for h in binding["node_hotkeys"]],
-                        "claim": binding.get("account_claim") or None,
-                        "claims": [str(c) for c in binding.get("account_claims") or []] or None,
+                        **_expected_fields(binding),
                         # {} (no notice yet: report first) differs from a missing map (an older portal: enforce)
-                        "enforce_after": item.get("check_enforce_after"),
-                        "claims_by_hotkey": binding.get("claims_by_hotkey"),
+                        "check_enforce_after": item.get("check_enforce_after"),
+                        # the validator re-applies the grant's end when it checks the node: this snapshot can be
+                        # served, and the upload finish, after it
+                        "owner_binding_until": item.get("owner_binding_until") if isinstance(listing, dict) else None,
+                        "listing_binding": _expected_fields(listing) if isinstance(listing, dict) else None,
                     }
                 result.append(
                     Executor(
@@ -619,12 +631,8 @@ class ExecutorService:
             # no portal read here: the uploads can outlast the snapshot cache, and the reply must meet its deadline
             if isinstance(info, ExecutorSSHInfo):
                 info.expected_ssh_host_key = host_keys.get(str(info.uuid))
-                account = node_accounts.get(str(info.uuid)) or {}
-                info.expected_node_hotkeys = account.get("hotkeys")
-                info.expected_account_claim = account.get("claim")
-                info.expected_account_claims = account.get("claims")
-                info.check_enforce_after = account.get("enforce_after")
-                info.expected_claims_by_hotkey = account.get("claims_by_hotkey")
+                for field, value in (node_accounts.get(str(info.uuid)) or {}).items():
+                    setattr(info, field, value)
         # a cut-off upload logs nothing itself, so name its executors here or the validator's miss looks unexplained
         cut_off_ids = [str(executor.uuid) for executor, task in zip(executors, tasks) if task in pending]
         (logger.warning if cut_off_ids else logger.info)(

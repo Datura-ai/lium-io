@@ -6,6 +6,7 @@ its executor container after the container was recreated. The validator's SSH se
 """
 
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import asyncssh
@@ -439,6 +440,36 @@ async def test_an_empty_claim_on_a_hotkey_the_listing_already_accepts_keeps_the_
     result = await NodeAccountCheck().run(ctx)
 
     assert (result.passed, result.event.reason_code) == (True, "NODE_ACCOUNT_SKIPPED")
+
+
+@pytest.mark.parametrize(
+    "until, passed",
+    [
+        (timedelta(minutes=5), True),  # the grant still runs: the partner's setup is the owner's
+        (timedelta(seconds=-1), False),  # ended before the check, though the miner read the row before its end
+        ("not a time", False),  # an unreadable end grants nothing beyond the listing
+        (None, True),  # an older miner sends no end: the binding as sent
+    ],
+)
+async def test_an_owner_wide_grant_counts_only_until_its_end_when_the_node_is_checked(until, passed):
+    """Off-GitHub review on df0df43 (Critical 1): the miner can serve a cached snapshot read just before the grant's
+    `owner_binding_until` and finish the upload after it. The end now travels with the node and is applied here, at
+    check time, so a partner unlinked meanwhile stops passing and the listing account's own binding applies."""
+    if isinstance(until, timedelta):
+        until = (datetime.now(UTC) + until).isoformat()
+    executor = ExecutorSSHInfo(
+        uuid="node-1", address="203.0.113.7", port=8001, ssh_username="root", ssh_port=22,
+        python_path="/usr/bin/python3", root_dir="/root", expected_node_hotkeys=["5Account", "5Partner"],
+        check_enforce_after={}, owner_binding_until=until,
+        listing_binding=None if until is None else {"expected_node_hotkeys": ["5Account"]},
+    )
+    ctx = make_context(executor=executor, runner=_HostFiles("hotkey=5Partner\nclaim=\n"), miner_hotkey="5Account")
+
+    result = await NodeAccountCheck().run(ctx)
+
+    assert (result.passed, result.event.reason_code) == (
+        (True, "NODE_ACCOUNT_OK") if passed else (False, "NODE_ACCOUNT_MISMATCH")
+    )
 
 
 async def test_another_owners_setup_is_refused_at_once_without_a_notice():

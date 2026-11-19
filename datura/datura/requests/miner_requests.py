@@ -77,6 +77,13 @@ class ExecutorSSHInfo(pydantic.BaseModel):
     # the listing account's owner, whatever hotkey the node is listed under. A machine set up for one of them passes
     # only with one of these claims (an empty claim proves nothing either way, as for the listing hotkey).
     expected_claims_by_hotkey: dict[str, list[str]] | None = None
+    # DAH-6539: the owner-wide binding above (every account of the listing's owner) counts only until this ISO-8601
+    # time; from then on, or when it does not parse, the validator checks the node against `listing_binding`: the
+    # listing account's own binding, keyed by the four expected_* field names above. A miner can serve a cached
+    # snapshot and an upload can finish after the grant ended, so the expiry is applied when the node is checked.
+    # None from an older miner or portal: the fields above as they are.
+    owner_binding_until: str | None = None
+    listing_binding: dict | None = None
 
 
 class AcceptSSHKeyRequest(BaseMinerRequest):

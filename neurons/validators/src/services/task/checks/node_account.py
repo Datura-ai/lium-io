@@ -26,6 +26,10 @@ A machine set up for another owner is still refused at once. A pass on an IP nod
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
+from datura.requests.miner_requests import ExecutorSSHInfo
+
 from core.utils import _m, get_extra_info, get_logger
 from services.node_host import host_key_body, is_ip_literal, registered_host_keys
 
@@ -43,6 +47,12 @@ READ_NODE_ACCOUNT_COMMAND = (
     "\"$(cat /etc/liumd/account_claim 2>/dev/null)\""
 )
 READ_TIMEOUT_SECONDS = 15
+LISTING_BINDING_FIELDS = (
+    "expected_node_hotkeys",
+    "expected_account_claim",
+    "expected_account_claims",
+    "expected_claims_by_hotkey",
+)
 
 _logged_without_expected: set[str] = set()
 
@@ -53,6 +63,22 @@ def presented_host_key(ctx: Context) -> str:
     except Exception:
         return ""
     return host_key_body(key.export_public_key("openssh").decode()) if key is not None else ""
+
+
+def current_binding(executor: ExecutorSSHInfo) -> ExecutorSSHInfo:
+    """The node as it may be bound now (DAH-6539): the owner-wide binding the miner sent counts until its
+    `owner_binding_until`, read here at check time because the miner can serve a cached snapshot and finish the upload
+    after the grant ended; from then on, or when the time does not parse, the listing account's own binding."""
+    if executor.owner_binding_until is None or not isinstance(executor.listing_binding, dict):
+        return executor
+    try:
+        expired = datetime.now(UTC) >= datetime.fromisoformat(executor.owner_binding_until)
+    except (TypeError, ValueError):
+        expired = True  # an unreadable end grants nothing beyond the listing
+    if not expired:
+        return executor
+    listing = {field: executor.listing_binding.get(field) for field in LISTING_BINDING_FIELDS}
+    return executor.model_copy(update=listing)
 
 
 class NodeAccountCheck:
@@ -69,8 +95,9 @@ class NodeAccountCheck:
         if expected and presented_host_key(ctx) not in expected:
             return _refused(ctx, self.check_id, Msg.MISMATCH, what)
         bound = False
-        if executor.expected_node_hotkeys and ctx.runner is not None:
-            refused, bound = await self._other_account(ctx, what)
+        binding = current_binding(executor)
+        if binding.expected_node_hotkeys and ctx.runner is not None:
+            refused, bound = await self._other_account(ctx, binding, what)
             if refused is not None:
                 return refused
         if expected or bound:
@@ -92,7 +119,9 @@ class NodeAccountCheck:
             event=render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what=what),
         )
 
-    async def _other_account(self, ctx: Context, what: dict) -> tuple[CheckResult | None, bool]:
+    async def _other_account(
+        self, ctx: Context, executor: ExecutorSSHInfo, what: dict
+    ) -> tuple[CheckResult | None, bool]:
         """(refusal or report, None when the machine may serve this listing; True when its files proved it does).
 
         Accepted: a machine set up for one of the hotkeys and claims the portal sends for this node, which cover every
@@ -100,7 +129,6 @@ class NodeAccountCheck:
         under another of their own accounts is theirs and passes with no re-setup; only another owner's setup is
         refused, at once (the relay case). A read that fails proves nothing either way: it only reports until the
         provider was notified (checks/enforcement.py)."""
-        executor = ctx.executor
         result = await ctx.runner.run(
             READ_NODE_ACCOUNT_COMMAND, timeout=READ_TIMEOUT_SECONDS, retryable=True
         )

@@ -116,6 +116,8 @@ async def _run_sync_with_jobs(validator, miners, job_results_by_hotkey, *, job_b
             "core.validator.fetch_executor_image_digest",
             new=AsyncMock(return_value=None),
         ),
+        # the cycle id comes from the job block alone (DAH-6539); pin it to the id the scenario uses
+        patch("core.validator.estimated_block_time", return_value=job_batch_id),
     ):
         await validator.sync()
 

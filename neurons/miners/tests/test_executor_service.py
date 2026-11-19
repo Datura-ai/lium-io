@@ -506,7 +506,9 @@ async def test_central_miner_lists_each_node_with_its_registered_host_key_from_o
         {"id": keyed_node.upper(), "validator_hotkey": "v", "executor_ip_address": "node.example.com",
          "executor_ip_port": "8001", "ssh_host_key": "ssh-ed25519 AAAAregistered",
          "node_hotkeys": ["5Account", "5Pool"], "account_claim": "claim-1", "account_claims": ["claim-1", "claim-0"],
-         "check_enforce_after": {"NODE_ACCOUNT_UNVERIFIED": "2026-11-19T06:00:00Z"}},
+         "check_enforce_after": {"NODE_ACCOUNT_UNVERIFIED": "2026-11-19T06:00:00Z"},
+         "owner_binding_until": "2999-01-01T00:00:00+00:00",
+         "listing_binding": {"node_hotkeys": ["5Account"], "account_claim": "claim-1", "account_claims": ["claim-1"]}},
         {"id": unkeyed_node, "validator_hotkey": "v", "executor_ip_address": "203.0.113.5", "executor_ip_port": "8001"},
         {"id": noticeless_node, "validator_hotkey": "v", "executor_ip_address": "203.0.113.6", "executor_ip_port": "8001",
          "node_hotkeys": ["5Account"], "check_enforce_after": {}, "claims_by_hotkey": {"5Pool": ["claim-2"]}},
@@ -541,6 +543,14 @@ async def test_central_miner_lists_each_node_with_its_registered_host_key_from_o
     assert by_id[noticeless_node].check_enforce_after == {}
     assert by_id[noticeless_node].expected_claims_by_hotkey == {"5Pool": ["claim-2"]}
     assert by_id[keyed_node.lower()].expected_claims_by_hotkey is None
+    # review on df0df43: the grant's end and the listing's own binding go with the node, so the validator applies the
+    # end when it checks the node (this snapshot can be served, and the upload finish, after it)
+    assert by_id[keyed_node.lower()].owner_binding_until == "2999-01-01T00:00:00+00:00"
+    assert by_id[keyed_node.lower()].listing_binding == {
+        "expected_node_hotkeys": ["5Account"], "expected_account_claim": "claim-1",
+        "expected_account_claims": ["claim-1"], "expected_claims_by_hotkey": None,
+    }
+    assert (by_id[noticeless_node].owner_binding_until, by_id[noticeless_node].listing_binding) == (None, None)
 
 
 @pytest.mark.asyncio
