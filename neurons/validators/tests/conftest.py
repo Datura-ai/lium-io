@@ -103,21 +103,34 @@ def update_snapshot(request: pytest.FixtureRequest) -> bool:
 
 @pytest.fixture(autouse=True)
 def _loopback_fakes_stand_in_for_public_nodes(request, monkeypatch):
-    """Tests run their fake nodes on 127.0.0.1 / ::1, which the validator refuses as a node address in production
-    (services/node_host.py `_check_literal`). Here loopback stands in for a public node; every other non-public
-    address is still refused. test_node_host.py tests the real rule."""
+    """Tests run their fake nodes on loopback or on the documentation ranges (TEST-NET-1/2/3), which the validator
+    refuses as a node address in production (services/node_host.py `_check_literal`). Here those stand in for a
+    public node; every other non-public address is still refused. test_node_host.py tests the real rule."""
     if request.module.__name__.endswith("test_node_host"):
         return
+    import ipaddress
+
     from services import node_host
 
     real = node_host._check_literal
+    stand_ins = [
+        ipaddress.ip_network(n)
+        for n in ("127.0.0.0/8", "::1/128", "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")
+    ]
 
-    def allow_loopback(host: str, port: int) -> None:
-        if host.strip("[]") in {"127.0.0.1", "::1", "localhost"}:
+    def allow_stand_ins(host: str, port: int) -> None:
+        h = host.strip("[]")
+        if h == "localhost":
+            return
+        try:
+            addr = ipaddress.ip_address(h.split("%", 1)[0])
+        except ValueError:
+            addr = None
+        if addr is not None and any(addr in n for n in stand_ins):
             return
         real(host, port)
 
-    monkeypatch.setattr(node_host, "_check_literal", allow_loopback)
+    monkeypatch.setattr(node_host, "_check_literal", allow_stand_ins)
 
 
 @pytest.fixture(autouse=True)
