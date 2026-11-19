@@ -851,10 +851,10 @@ def get_needrestart_guard(host_root="/proc/1/root"):
     flat = [" ".join(ln.split()).replace(old_log, loader[2]) for _, ln in main]
     at = next((i for i in range(len(flat)) if flat[i : i + len(loader)] == loader), None)
     if at is None:
-        # a recognisable loader that was changed: anchor on its opener or its conf.d glob, the only loader lines
-        # no other Perl block shares (eval/die are generic idioms a site loader also uses), and name the first
-        # line that differs from there on, not only the file
-        anchor = next(((i, j) for i in range(len(flat)) for j in (0, 1) if flat[i] == loader[j]), None)
+        # a recognisable loader that was changed: anchor on its opener, its conf.d glob or its $LOGPREF log line,
+        # the only loader lines no other Perl block shares (eval/die are generic idioms a site loader also uses),
+        # and name the first line that differs from there on, not only the file
+        anchor = next(((i, j) for i in range(len(flat)) for j in (0, 1, 2) if flat[i] == loader[j]), None)
         if anchor is None:
             return unknowable(f"{main_path} has no stock conf.d loader")
         i, j = anchor
@@ -863,10 +863,11 @@ def get_needrestart_guard(host_root="/proc/1/root"):
         if start + off >= len(flat):
             return unknowable(f"{main_path} line {main[-1][0]} ends inside the conf.d loader")
         bad = start + off
-        # anchored on the glob, the line before it is the (edited) opener only if it opens a block, however much
-        # its condition changed; a setting there means the opener is missing, and the glob is where the loader starts
-        if off < j and (bad < 0 or not flat[bad].endswith("{")):
-            bad = i
+        # anchored below the opener, the line in the opener's place is the (edited) opener only if it opens a block
+        # (a trailing comment allowed), however much its condition changed; a setting there means the opener is
+        # missing, and the line after it (the glob's place) is where the loader starts
+        if off == 0 and j and (start < 0 or not re.search(r"\{\s*(#.*)?$", flat[start])):
+            bad = max(start + 1, 0)
         return unknowable(f"{main_path} line {main[bad][0]} differs from the stock conf.d loader")
     if at + len(loader) != len(main):
         return unknowable(f"{main_path} line {main[at + len(loader)][0]} runs code after the conf.d loader")

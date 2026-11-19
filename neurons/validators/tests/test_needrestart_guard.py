@@ -575,6 +575,18 @@ def test_a_changed_loader_line_is_named_and_a_missing_loader_names_the_file(tmp_
     main.write_text(STOCK_MAIN.replace(stock_opener, "if (!$ENV{NR_SKIP_CONFD}) {"))
     assert _reason(host) == f"/etc/needrestart/needrestart.conf line {opener} differs from the stock conf.d loader"
 
+    # the edited opener with a trailing comment still opens the block, so it is named, not the unchanged glob
+    main.write_text(STOCK_MAIN.replace(stock_opener, "if (-d '/etc/needrestart/conf.d') { # local"))
+    assert _reason(host) == f"/etc/needrestart/needrestart.conf line {opener} differs from the stock conf.d loader"
+
+    # the opener's quoting and the glob both changed: the stock log line below still anchors the loader
+    main.write_text(
+        STOCK_MAIN.replace("q(/etc/needrestart/conf.d))", "'/etc/needrestart/conf.d')").replace(
+            "conf.d/*.conf>", "other/*.conf>"
+        )
+    )
+    assert _reason(host) == f"/etc/needrestart/needrestart.conf line {opener} differs from the stock conf.d loader"
+
     # the optional log line deleted: the line now in its place (the eval) is named, after the intact opener and glob
     lines = STOCK_MAIN.splitlines()
     log_line = next(n for n, ln in enumerate(lines, 1) if "print STDERR" in ln and "eval $fn" in ln)
