@@ -20,8 +20,10 @@ validator: it never falls back to one that may have been replaced. That unconfir
 state, so a restart before the confirmation stays closed too. The state a run writes is marked running, and the
 shutdown writes the newest state marked ended: a start that finds the running mark (the last run ended without
 writing its newest state: a failed or cut-short shutdown write, a crash) cannot tell whether a newer message was
-taken, and stays closed the same way until a served message confirms a validator, or, for a node holding no
-message, until the backend answers that it publishes none (a 404 after a chain read named the owner). A kept state with any field
+taken, and stays closed the same way until a served message confirms a validator. Only a message the owner signed
+confirms: a 404 or a failure never does, so the backend must keep serving a signed message (one naming the current
+validator before any replacement) for a closed node to reopen. The operator's recovery for a node that cannot reach it
+is to remove the kept state file, which returns the node to the image's message or baked validators. A kept state with any field
 missing or malformed is unreadable. Only a volume that refused every write of a run, the running mark included,
 cannot be read for it: a restart then reads the last state the volume holds.
 
@@ -355,8 +357,7 @@ class ValidatorTrust:
         }
 
     async def refresh_message(self) -> None:
-        """A 404 or any failure keeps the message held. A 404 also confirms a node that holds no message: the backend
-        publishes none, so no message can have replaced the baked validators."""
+        """A 404 or any failure keeps the message held, and confirms nothing."""
         if not self.enabled:
             return
         if self._unsaved:
@@ -370,9 +371,7 @@ class ValidatorTrust:
         try:
             data = await fetch_json(url)
             if data is None:
-                if self._unconfirmed and self.held is None:
-                    self._unconfirmed = False
-                    self._save()
+                # a 404 is no statement from the owner: it never confirms a closed node
                 return
             signed = SignedTrustMessage(message=str(data["message"]), signature=str(data["signature"]))
             self.offer(signed)

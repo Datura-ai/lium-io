@@ -965,10 +965,11 @@ def _crashed_first_boot(tmp_path, owner) -> ValidatorTrust:
     return restarted
 
 
-def test_a_crash_restart_of_a_node_holding_no_message_trusts_baked_once_the_backend_publishes_none(
+def test_a_crash_restart_of_a_node_holding_no_message_stays_closed_on_a_404_until_a_signed_message(
     tmp_path, monkeypatch, owner, old_validator
 ):
-    # review: the backend answers 404 while no message is configured, so a served message can never confirm
+    # review at 1833127: a 404 is no statement from the owner; the crash may have lost a replacement of the baked
+    # validator. A served signed message naming the validator (the current one, before any replacement) reopens it
     restarted = _crashed_first_boot(tmp_path, owner)
     monkeypatch.setattr(trust_service.settings, "COMPUTE_REST_API_URL", "http://backend")
     _chain(monkeypatch, lambda url: owner.ss58_address)
@@ -976,8 +977,34 @@ def test_a_crash_restart_of_a_node_holding_no_message_trusts_baked_once_the_back
     asyncio.run(restarted.refresh_owner())
     asyncio.run(restarted.refresh_message())
     baked = {"current": old_validator.ss58_address}
-    assert restarted.hotkeys(baked) == baked
-    assert _accepts(monkeypatch, restarted, old_validator, baked) == "current"
+    assert restarted.hotkeys(baked) == {}
+
+    answer = MagicMock(status_code=200)
+    answer.json.return_value = _signed(owner, old_validator, 1)._asdict()
+    _backend(monkeypatch, lambda *a, **k: answer)
+    asyncio.run(restarted.refresh_message())
+    assert restarted.hotkeys(baked) == {"signed": old_validator.ss58_address}
+
+
+def test_an_unreadable_kept_state_stays_closed_on_a_404(tmp_path, monkeypatch, owner, old_validator):
+    (tmp_path / STATE_FILE).write_text("{not json")
+    restarted = ValidatorTrust(state_dir=tmp_path, image_message=tmp_path / "absent.json")
+    restarted.load()
+    monkeypatch.setattr(trust_service.settings, "COMPUTE_REST_API_URL", "http://backend")
+    _chain(monkeypatch, lambda url: owner.ss58_address)
+    _backend(monkeypatch, lambda *a, **k: MagicMock(status_code=404))
+    asyncio.run(restarted.refresh_owner())
+    asyncio.run(restarted.refresh_message())
+    assert restarted.hotkeys({"current": old_validator.ss58_address}) == {}
+
+
+def test_removing_the_kept_state_is_the_operator_recovery(tmp_path, owner, old_validator):
+    _crashed_first_boot(tmp_path, owner)
+    (tmp_path / STATE_FILE).unlink()
+    recovered = ValidatorTrust(state_dir=tmp_path, image_message=tmp_path / "absent.json")
+    recovered.load()
+    baked = {"current": old_validator.ss58_address}
+    assert recovered.hotkeys(baked) == baked
 
 
 def test_a_404_before_the_chain_names_the_owner_does_not_confirm(tmp_path, monkeypatch, owner, old_validator):
