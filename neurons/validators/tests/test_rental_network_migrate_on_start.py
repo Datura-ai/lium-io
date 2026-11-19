@@ -348,3 +348,25 @@ async def test_the_cleanup_ages_each_bridge_by_its_own_offset(monkeypatch):
     await RentalDockerSdkClient(api).ensure_network(OWN)
 
     assert api.removed == ["old"]
+
+
+def test_the_reaper_keeps_a_bridge_a_create_here_guarded_and_has_not_run_on_yet():
+    # review on lium-platform#3246: a create whose run (retries, an image flatten) outlasts the reap age leaves its
+    # guarded bridge unreferenced; another create's reaper must not remove it, so a gone bridge is only ever the host's
+    from unittest.mock import Mock
+
+    from services.rental_docker_sdk import bridge_in_use
+
+    held, idle = f"{RENTAL_NETWORK_NAME}-pod_held", f"{RENTAL_NETWORK_NAME}-pod_ended"
+    api = Mock()
+    api.containers.return_value = []
+    api.networks.return_value = [{"Name": n, "Id": n, "Created": "2020-01-01T00:00:00Z"} for n in (held, idle)]
+    client = RentalDockerSdkClient(api)
+
+    with bridge_in_use(held):
+        client._remove_unused_pod_networks_sync()
+    assert [c.args[0] for c in api.remove_network.call_args_list] == [idle]
+
+    api.remove_network.reset_mock()
+    client._remove_unused_pod_networks_sync()  # the create ended: an unused bridge is reaped as before
+    assert {c.args[0] for c in api.remove_network.call_args_list} == {held, idle}

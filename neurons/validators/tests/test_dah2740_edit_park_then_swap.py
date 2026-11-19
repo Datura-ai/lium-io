@@ -389,13 +389,14 @@ async def test_a_failed_edit_restores_the_previous_container(svc, monkeypatch):
         (True, "drop", "guard", "down", "PodDownNotHostFault"),
         (True, "drop", False, "running", "UnknownError"),  # restored: the node's link failure still holds it
         (True, "ordinary", "guard", "running", "UnknownError"),
-        # the pod's bridge was removed by another create after its guard: the start is refused (ours, not the host's)
-        (False, "bridge", False, "down", "PodDownNotHostFault"),  # a balance-stopped pod's reboot: nothing runs
-        (True, "bridge", False, "down", "PodDownNotHostFault"),
+        # review on lium-platform#3246: the pod's guarded bridge removed on the host (our reaper keeps it) is the host's
+        # fault, never the neutral code a provider could trigger by deleting it
+        (False, "bridge", False, "down", "ExecutorUnreachable"),  # a balance-stopped pod's reboot: nothing runs
+        (True, "bridge", False, "down", "ExecutorUnreachable"),
         (True, "bridge", False, "running", "UnknownError"),  # the original came back: still billed
         (True, "bridge", False, "unreadable", "UnknownError"),
-        # the undo's move of the stopped original onto its bridge refused by Docker: ours, as Docker reports it
-        (True, "ordinary", "move", "down", "PodDownNotHostFault"),
+        # the undo's move of the stopped original onto its bridge refused by the host's Docker: the host's
+        (True, "ordinary", "move", "down", "ExecutorUnreachable"),
         (True, "ordinary", "move", "running", "UnknownError"),
     ],
     ids=[
@@ -458,7 +459,7 @@ async def test_a_reboot_the_guard_refused_is_a_host_fault_only_while_no_containe
     # the node is held only for its own fault, never with the neutral code (no hold, no provider penalty)
     if code == "PodDownNotHostFault":
         assert held == []
-    elif error in ("guard", "drop"):
+    elif error in ("guard", "drop") or code == "ExecutorUnreachable":
         assert held
 
 

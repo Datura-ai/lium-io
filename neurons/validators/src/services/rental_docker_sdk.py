@@ -8,9 +8,10 @@ import socket as socket_module
 import tempfile
 import threading
 import time
+from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import partial
@@ -107,6 +108,25 @@ def rental_network_for(container_name: str) -> str:
     return f"{RENTAL_NETWORK_NAME}-{container_name}"
 
 
+# DAH-6737 (review on lium-platform#3246): the bridges creates of this process guarded and have no container on yet
+# (the run, its retries and an image flatten can outlast POD_NETWORK_REAP_MIN_AGE_SECONDS). The reaper keeps them, so
+# a guarded bridge that is gone was removed on the host, never by another create here (one process owns the executor)
+_BRIDGES_IN_USE: Counter[str] = Counter()
+
+
+@contextmanager
+def bridge_in_use(name: str | None) -> Iterator[None]:
+    if name:
+        _BRIDGES_IN_USE[name] += 1
+    try:
+        yield
+    finally:
+        if name:
+            _BRIDGES_IN_USE[name] -= 1
+            if _BRIDGES_IN_USE[name] <= 0:
+                del _BRIDGES_IN_USE[name]
+
+
 def is_rental_network(name: str) -> bool:
     return name == RENTAL_NETWORK_NAME or name.startswith(f"{RENTAL_NETWORK_NAME}-")
 # a filler create sweeps only unmounted volumes with this label: a customer's volume never has it
@@ -133,13 +153,13 @@ class RentalDockerOperationError(RuntimeError):
 
 
 class RentalPodBridgeGone(RentalDockerOperationError):
-    """The pod's own bridge was removed (another create's cleanup) after its egress drop was applied: the start is
-    refused, never made on a bridge the drop was not confirmed on (DAH-6737)."""
+    """The pod's own bridge was removed on the host after its egress drop was applied (our reaper keeps it, see
+    bridge_in_use): the start is refused, never made on a bridge the drop was not confirmed on (DAH-6737)."""
 
 
 class RentalPodNetworkMoveFailed(RentalDockerOperationError):
-    """Docker refused moving a stopped pod off its old network onto its own: the pod is left stopped, by our step, not
-    the host's (DAH-6737)."""
+    """Docker refused moving a stopped pod off its old network onto its own: the pod is left stopped; the host's
+    Docker refused it (DAH-6737)."""
 
 
 class ContainerNameTakenOnRetry(RentalDockerOperationError):
@@ -770,7 +790,7 @@ class RentalDockerSdkClient:
             )
         except RentalDockerOperationError:
             if network and network != RENTAL_NETWORK_NAME:
-                # the bridge removed between the move and the start: the same refusal, not a host fault
+                # the bridge removed between the move and the start: the same refusal, the host's
                 await _in_docker_thread(self._guarded_pod_network_sync, network, network_id)
             raise
 
@@ -1219,7 +1239,7 @@ class RentalDockerSdkClient:
                 )
             except Exception as exc:
                 if spec.network and spec.network != RENTAL_NETWORK_NAME:
-                    # the bridge removed between the check above and the create: the same refusal, not a host fault
+                    # the bridge removed between the check above and the create: the same refusal, the host's
                     self._guarded_pod_network_sync(spec.network, spec.network_id)
                 # The first attempt's create timed out on the client but still runs in dockerd: it holds
                 # the name (409) while inspect answers 404 until it registers the container. Adopt it then.
@@ -1411,7 +1431,7 @@ class RentalDockerSdkClient:
             return
         for network in networks:
             name = network.get("Name") or ""
-            if name in used or not is_rental_network(name) or name == RENTAL_NETWORK_NAME:
+            if name in used or name in _BRIDGES_IN_USE or not is_rental_network(name) or name == RENTAL_NETWORK_NAME:
                 continue
             if _age_seconds(network.get("Created")) < POD_NETWORK_REAP_MIN_AGE_SECONDS:
                 continue

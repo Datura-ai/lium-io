@@ -3204,8 +3204,9 @@ async def test_start_container_sdk_failure_returns_failed_request_without_shell_
         (docker_service_module.RentalEgressGuardRefused("not applied"), FailedContainerErrorCodes.ExecutorUnreachable),
         ("running", FailedContainerErrorCodes.UnknownError),
         (Exception("SDK start failed"), FailedContainerErrorCodes.UnknownError),
-        # finding 5 (DAH-6737 review): the guarded bridge vanished before the start; the stopped pod stays down, ours
-        (RentalPodBridgeGone("Docker network lium-rentals-pod_test is gone"), FailedContainerErrorCodes.PodDownNotHostFault),
+        # the guarded bridge vanished on the host before the start; the stopped pod stays down, the host's (review on
+        # lium-platform#3246: a provider deleting it never gets the neutral code)
+        (RentalPodBridgeGone("Docker network lium-rentals-pod_test is gone"), FailedContainerErrorCodes.ExecutorUnreachable),
     ],
     ids=["guard-refused-pod-down", "guard-refused-pod-running", "docker-failure", "bridge-gone-pod-down"],
 )
@@ -12552,7 +12553,7 @@ async def test_a_pod_never_starts_on_a_bridge_without_the_egress_drop(docker_ser
         with pytest.raises(RentalPodBridgeGone):
             await bring_up
         assert events == [("ensure_network", net), ("guard",), started]
-        assert not docker_service_module.is_host_fault_create_failure("docker_run", RentalPodBridgeGone("x"))
+        assert docker_service_module.is_host_fault_create_failure("docker_run", RentalPodBridgeGone("x"))
     else:
         with pytest.raises(docker_service_module.RentalEgressGuardRefused) as refused:
             await bring_up
