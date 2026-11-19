@@ -51,6 +51,7 @@ from services.rental_docker_sdk import (
     ContainerStateSnapshot,
     RentalDockerOperationError,
     RentalPodBridgeGone,
+    RentalDockerTransportNotReopened,
     _wrap_error_message,
     build_gpu_docker_config,
     rental_network_for,
@@ -5399,10 +5400,61 @@ async def test_create_container_uses_keepalives_and_sdk_pull(
     ]
 
 
+def _pull_wrapped_not_reopened() -> Exception:
+    refused = RentalDockerTransportNotReopened(
+        "Docker SDK pull failed on a dropped SSH transport and the transport could not be re-opened"
+    )
+    try:
+        raise RentalDockerOperationError("Docker SDK pull failed") from refused
+    except RentalDockerOperationError as wrapped:
+        return wrapped
+
+
+def test_a_failure_diagnosed_above_an_unreopened_transport_keeps_its_own_step():
+    """The key injection lost its transport, then an inspect found the container OOM-killed or its image exited:
+    that diagnosis is the cause, not the node's SSH endpoint."""
+    from services.docker_service import ContainerKilledDuringBootstrap, ImageExitedDuringKeyInjection
+    from services.rental_docker_sdk import is_transport_not_reopened
+
+    def raised_from_refusal(diagnosis: Exception) -> Exception:
+        try:
+            raise diagnosis from _pull_wrapped_not_reopened()
+        except Exception as exc:
+            return exc
+
+    killed = ContainerKilledDuringBootstrap(
+        container_name="pod_x", bootstrap_step="inject_keys", state=None, detail="OOM-killed"
+    )
+    exited = ImageExitedDuringKeyInjection("image exited")
+
+    assert not is_transport_not_reopened(raised_from_refusal(killed))
+    assert not is_transport_not_reopened(raised_from_refusal(exited))
+    assert is_transport_not_reopened(_pull_wrapped_not_reopened())
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pull_error", "expected_step"),
+    [
+        (Exception("[Errno 104] Connection reset by peer"), "docker_pull"),
+        # the node refused a new SSH connection after the pull's dropped: still the step that was running, which
+        # every backend rule keyed on the step reads; the error text names the dropped transport
+        (
+            RentalDockerTransportNotReopened(
+                "Docker SDK pull failed on a dropped SSH transport and the transport could not be re-opened: "
+                "IncompleteRead; re-open: Connection refused"
+            ),
+            "docker_pull",
+        ),
+        # as the real pull() raises it: wrapped, with the refusal as its __cause__
+        (_pull_wrapped_not_reopened(), "docker_pull"),
+    ],
+)
 async def test_create_container_reports_docker_pull_failure_step(
     docker_service,
     monkeypatch,
+    pull_error,
+    expected_step,
 ):
     ssh_client = AsyncMock()
 
@@ -5424,9 +5476,7 @@ async def test_create_container_reports_docker_pull_failure_step(
     docker_service.ssh_service.decrypt_payload = Mock(return_value="private-key")
     docker_service.redis_service.add_pending_pod = AsyncMock()
     docker_service.redis_service.remove_pending_pod = AsyncMock()
-    docker_service.rental_docker_client_factory.client.pull_error = Exception(
-        "[Errno 104] Connection reset by peer"
-    )
+    docker_service.rental_docker_client_factory.client.pull_error = pull_error
     monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
     monkeypatch.setattr(
         docker_service,
@@ -5471,7 +5521,7 @@ async def test_create_container_reports_docker_pull_failure_step(
         private_key="encrypted",
     )
 
-    assert result.failure_step == "docker_pull"
+    assert result.failure_step == expected_step
     docker_service.redis_service.remove_pending_pod.assert_awaited_once_with(
         payload.miner_hotkey,
         payload.executor_id,
@@ -5540,6 +5590,80 @@ async def test_create_container_reports_docker_login_failure_step_when_pull_also
     assert "pull without login then failed: blocked" in result.detail
     # the wire msg the backend shows the renter: the reason only, no registry or executor text
     assert result.msg == "Docker login refused by the image registry: check the template's registry credentials"
+
+
+@pytest.mark.asyncio
+async def test_create_container_reports_a_refused_ssh_reopen_after_a_failed_login_as_the_dropped_transport(
+    docker_service,
+    monkeypatch,
+):
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    docker_client = docker_service.rental_docker_client_factory.client
+    docker_client.login_error = Exception(
+        "Docker SDK login for registry.digitalocean.com failed: 401 Client Error: Unauthorized"
+    )
+    docker_client.pull_error = _pull_wrapped_not_reopened()
+    payload = _private_registry_create_payload()
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "docker_pull"
+    assert "registry" not in result.msg
+
+
+@pytest.mark.asyncio
+async def test_a_create_whose_transport_drops_at_docker_run_keeps_docker_run_as_its_step(
+    docker_service,
+    monkeypatch,
+):
+    # the real step: `ssh_connect` would tell the rental probe the create never reached the host (no by-name removal),
+    # and a new step name would drop out of every backend rule keyed on the step (host failure, renter hint)
+    from services.task.checks.rental_probe import _CREATE_STEPS_BEFORE_THE_HOST
+
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    docker_service.rental_docker_client_factory.client.run_error = RentalDockerTransportNotReopened(
+        "Docker SDK run container failed on a dropped SSH transport and the transport could not be re-opened"
+    )
+    payload = _private_registry_create_payload()
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "docker_run"
+    assert result.failure_step not in _CREATE_STEPS_BEFORE_THE_HOST
+    assert "dropped_during_step" not in result.detail
+    assert "could not be re-opened" in result.detail
 
 
 @pytest.mark.parametrize(
@@ -12494,6 +12618,26 @@ async def test_a_slow_guard_never_uses_up_the_port_retry_budget(docker_service, 
     )
 
     assert container_id == "cid" and len(runs) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("inspect_error", "expected"),
+    [
+        (RentalDockerTransportNotReopened("transport could not be re-opened"), RentalDockerTransportNotReopened),
+        (Exception("read timed out"), RuntimeError),
+    ],
+)
+async def test_final_state_inspect_keeps_a_refused_ssh_reopen_as_the_diagnosis(monkeypatch, inspect_error, expected):
+    from services import docker_service as module
+
+    monkeypatch.setattr(module, "FINAL_STATE_INSPECT_RETRY_DELAY_S", 0)
+    client = Mock(inspect_container_state=AsyncMock(side_effect=inspect_error))
+
+    with pytest.raises(expected) as raised:
+        await module._raise_unless_running_before_created(client, container_name="pod_x", container_id="abc")
+
+    assert module.is_transport_not_reopened(raised.value) is (expected is RentalDockerTransportNotReopened)
 
 
 _FAKE_DOCKER = """#!/bin/sh
