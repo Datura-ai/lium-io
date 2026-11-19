@@ -765,6 +765,10 @@ def last_oom_from_kmsg(records, boot_epoch):
     last = None
     for record in records:
         header, _, message = record.partition(";")
+        fields = header.split(",")
+        # facility 0 (kernel) only: a user process can write a look-alike text to /dev/kmsg
+        if not fields[0].isdigit() or int(fields[0]) >> 3 != 0:
+            continue
         # only the kernel's victim records count: its warnings ("Out of memory and no killable processes...") are no kill
         if message.startswith("Memory cgroup out of memory: Killed process "):
             kind = "memcg"
@@ -772,7 +776,6 @@ def last_oom_from_kmsg(records, boot_epoch):
             kind = "global"
         else:
             continue
-        fields = header.split(",")
         if len(fields) >= 3 and fields[2].isdigit():
             last = (kind, round(boot_epoch + int(fields[2]) / 1e6, 3))
     return last

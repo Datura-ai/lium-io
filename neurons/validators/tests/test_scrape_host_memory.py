@@ -290,6 +290,15 @@ def test_a_kernel_oom_warning_is_not_a_kill() -> None:
     )
 
 
+def test_a_user_written_oom_lookalike_is_not_a_kill() -> None:
+    # LOG_USER (facility 1): pri 14 = 1 << 3 | info, written by a process into /dev/kmsg
+    records = [
+        "3,10,7000000,-;Memory cgroup out of memory: Killed process 200 (python)",
+        "14,11,9000000,-;Out of memory: Killed process 1 (fake)",
+    ]
+    assert NS["last_oom_from_kmsg"](records, 1700000000) == ("memcg", 1700000007.0)
+
+
 def test_the_obfuscated_scrape_reads_host_memory(tmp_path: Path) -> None:
     # review on lium-io#2361: run get_host_memory as it ships, out of obfuscator.py's output (a nested helper's
     # parameter kept its name while its body was renamed, so the scrape only reported an error)
