@@ -62,8 +62,8 @@ LINK_LOCAL_CIDR = str(ipaddress.ip_network("169.254.169.254/16", strict=False))
 # Two chains used in turn: the new set is built in the idle one and swapped in, so there is no unguarded gap.
 # Written only by the host's own iptables (DAH-6737): the earlier LIUM-RENTAL-EGRESS-A/B were also written by the
 # helper image's newer iptables-nft, by validators on releases before lium-io#2308, and a host's older iptables-nft
-# refuses to read or flush a chain a newer one wrote ("is incompatible, use 'nft' tool"). Those chains and their jumps
-# are left to the releases that made them; they only drop link-local egress too.
+# refuses to read or flush a chain a newer one wrote ("is incompatible, use 'nft' tool"). Those chains are never read;
+# only their DOCKER-USER jumps are detached (OLD_CHAINS).
 CHAINS = ("LIUM-EGRESS-HOST-A", "LIUM-EGRESS-HOST-B")
 BRIDGE_NAME_OPTION = "com.docker.network.bridge.name"
 _IFNAME = re.compile(r"[A-Za-z0-9_.-]{1,15}")
@@ -72,6 +72,15 @@ _IFNAME = re.compile(r"[A-Za-z0-9_.-]{1,15}")
 # one host file shared by every executor's helper.
 HOST_LOCK_DIR = "/proc/1/root/run/lock/lium-rental-egress"
 HOST_LOCK = f"{HOST_LOCK_DIR}/apply.lock"
+# Bumped under the lock by every apply and cleanup. A run reads it before its Docker inventory and applies only if it is
+# unchanged, so a run whose inventory predates another run's rules (a pod's bridge added by its pre-start guard) never
+# replaces them with its older view; it reads the host again instead.
+HOST_GENERATION = f"{HOST_LOCK_DIR}/generation"
+STALE_INVENTORY_EXIT = 6
+INVENTORY_ATTEMPTS = 3
+# Chains of releases before DAH-6737 (lium-io#2259/#2308/#2341): their jumps are detached once ours are in force, so a
+# host never keeps an old docker0 drop after the last rental it guarded is gone
+OLD_CHAINS = ("LIUM-RENTAL-EGRESS-A", "LIUM-RENTAL-EGRESS-B")
 LOCK_WAIT_SECONDS = 30
 # The helper's own bound, inside the validator-side one.
 HELPER_RUN_SECONDS = HELPER_TIMEOUT_SECONDS - 10
@@ -161,9 +170,19 @@ def legacy_network_ids(inspect_stdout: str) -> list[str]:
 # failed probe is kept in ERRS, so a later backend's absence is never taken for the whole host's.
 # $HOST_NS is empty when the script runs where iptables is local (tests).
 _BACKEND_PROBE = (
-    "IPT=; ERRS=; for B in iptables-nft iptables-legacy iptables; do "
+    "IPT=; ERRS=; FOUND=; for B in iptables-nft iptables-legacy iptables; do "
     'ERR=$($HOST_NS $B -L DOCKER-USER -n 2>&1 >/dev/null) && { IPT="$HOST_NS $B"; break; }; '
-    '[ $? -eq 127 ] || case "$ERR" in *"No chain"*|*"does not exist"*) ;; *) ERRS="$ERRS$B: $ERR; ";; esac; done'
+    '[ $? -eq 127 ] || { FOUND=1; case "$ERR" in *"No chain"*|*"does not exist"*) ;; *) ERRS="$ERRS$B: $ERR; ";; esac; }; '
+    "done"
+)
+
+# Detach the old releases' jumps (never read or flush their chains: another iptables build may have written them). One
+# that stays is reported on stdout, apart from whether our own rules applied.
+_DETACH_OLD_JUMPS = (
+    f"for C in {' '.join(OLD_CHAINS)}; do while $IPT -D DOCKER-USER -j $C 2>/dev/null; do :; done; "
+    'ERR=$($IPT -C DOCKER-USER -j $C 2>&1); RC=$?; '
+    'if [ $RC -eq 1 ]; then case "$ERR" in *ncompatible*) ;; *) continue;; esac; fi; '
+    'echo "old jump to $C not detached: ${ERR:-still present}"; done'
 )
 
 
@@ -201,7 +220,9 @@ def link_local_drop_script(bridge: str | None, legacy_bridges: list[str]) -> str
     lines += [
         "$IPT -I DOCKER-USER -j $NEW || exit 4",
         "while $IPT -D DOCKER-USER -j $OLD 2>/dev/null; do :; done",
-        "$IPT -F $OLD",
+        "$IPT -F $OLD || exit 4",
+        _DETACH_OLD_JUMPS,
+        "exit 0",
     ]
     return "; ".join(lines)
 
@@ -210,8 +231,10 @@ def link_local_cleanup_script() -> str:
     """Remove our chains and their DOCKER-USER jumps: run when a host has nothing left to guard."""
     lines = [
         _BACKEND_PROBE,
-        # nothing to clean only when every backend proved absent; a probe that failed otherwise may hide our jumps
-        '[ -n "$IPT" ] || { [ -z "$ERRS" ] && exit 0; printf %s "$ERRS" >&2; exit 4; }',
+        # nothing to clean only when an iptables said so on every backend; a probe that failed otherwise may hide our
+        # jumps, and no iptables at all (a PID 1 that is not the host's) proves nothing: 3, so the helper reads the host
+        '[ -n "$IPT" ] || { [ -n "$ERRS" ] && { printf %s "$ERRS" >&2; exit 4; }; [ -n "$FOUND" ] && exit 0; '
+        'echo "no iptables" >&2; exit 3; }',
     ]
     for chain in CHAINS:
         # a chain iptables says does not exist is done; one that exists must lose its jumps, rules and itself
@@ -222,32 +245,51 @@ def link_local_cleanup_script() -> str:
             f"$IPT -F {chain} || exit 4; $IPT -X {chain} || exit 4; "
             f'else case "$ERR" in *"No chain"*|*"does not exist"*) ;; *) echo "$ERR" >&2; exit 4;; esac; fi'
         )
-    return "; ".join(lines) + "; exit 0"
+    return "; ".join(lines) + f"; {_DETACH_OLD_JUMPS}; exit 0"
 
 
-def locked_script(script: str) -> str:
+def locked_script(script: str, generation: str | None = None) -> str:
     """``script`` under the host lock. The lock is on fd 9 of the shell running the iptables calls, which inherit it,
-    so it is released only when the last of them exits: no timeout can free it while a mutation still runs."""
-    return (
-        f"mkdir -p {shlex.quote(HOST_LOCK.rsplit('/', 1)[0])} && exec 9>>{HOST_LOCK} || exit 5; "
-        f"flock -w {LOCK_WAIT_SECONDS} 9 || {{ echo 'host lock not taken' >&2; exit 5; }}; {script}"
+    so it is released only when the last of them exits: no timeout can free it while a mutation still runs.
+
+    With ``generation`` (what ``HOST_GENERATION`` held before the caller's inventory) the script runs only if no other
+    run has changed the rules since (else ``STALE_INVENTORY_EXIT``), and the generation is bumped after it. The wait is
+    ``timeout`` around a plain ``flock``: busybox's flock (the alpine helper) has no ``-w``."""
+    lock_dir = shlex.quote(HOST_LOCK.rsplit("/", 1)[0])
+    locked = (
+        f"mkdir -p {lock_dir} && exec 9>>{HOST_LOCK} || exit 5; "
+        f"timeout -s KILL {LOCK_WAIT_SECONDS} flock 9 || {{ echo 'host lock not taken' >&2; exit 5; }}; "
+    )
+    if generation is None:
+        return locked + script
+    gen = shlex.quote(HOST_GENERATION)
+    return locked + (
+        f"G=$(cat {gen} 2>/dev/null); "
+        f'[ "${{G:-0}}" = {shlex.quote(generation)} ] || '
+        f"{{ echo 'host rules changed since this inventory' >&2; exit {STALE_INVENTORY_EXIT}; }}; "
+        # 3 changed nothing (no iptables reached): the helper retries on the same inventory
+        f"( {script} ); RC=$?; [ $RC -eq 3 ] || echo $((${{G:-0}} + 1)) > {gen}; exit $RC"
     )
 
 
-def helper_command(script: str) -> str:
+def helper_command(script: str, generation: str | None = None) -> str:
     """What the executor runs: ``script`` under the lock, killed at ``HELPER_RUN_SECONDS``."""
-    return f"exec timeout -s KILL {HELPER_RUN_SECONDS} /bin/sh -c {shlex.quote(locked_script(script))}"
+    return f"exec timeout -s KILL {HELPER_RUN_SECONDS} /bin/sh -c {shlex.quote(locked_script(script, generation))}"
 
 
-def _helper(script: str) -> str:
+def _helper(script: str, generation: str | None = None) -> str:
     # No helper container on the shipped executor, so no image pull that a registry (Docker Hub's anonymous rate limit)
     # can refuse. The shell, flock and timeout are the executor image's; only iptables resolves in the host root, the one
     # binary dockerd itself needs there
-    inner = f"HOST_NS={shlex.quote(HOST_NS)} {helper_command(script)}"
-    # the lock directory in the host's /run through PID 1: a PID 1 that is the executor's own (no ``pid: host``) fails it
+    inner = f"HOST_NS={shlex.quote(HOST_NS)} {helper_command(script, generation)}"
+    in_helper = f"exec {NON_ROOT_HELPER} /bin/sh -c {shlex.quote(inner)}"
+    # the lock directory in the host's /run through PID 1: a PID 1 that is the executor's own (no ``pid: host``) and
+    # read-only fails it; one that is writable is caught by its iptables answer (3: none reached) and goes to the helper
     lock_dir = shlex.quote(HOST_LOCK.rsplit("/", 1)[0])
-    direct = f'[ "$(id -u)" = 0 ] && mkdir -p {lock_dir} 2>/dev/null && command -v nsenter flock timeout >/dev/null'
-    return f"if ! {{ {direct}; }}; then exec {NON_ROOT_HELPER} /bin/sh -c {shlex.quote(inner)}; fi; {inner}"
+    tools = " && ".join(f"command -v {tool} >/dev/null" for tool in ("nsenter", "flock", "timeout"))
+    direct = f'[ "$(id -u)" = 0 ] && mkdir -p {lock_dir} 2>/dev/null && {tools}'
+    run_direct = inner.replace(" exec timeout ", " timeout ", 1)
+    return f"if ! {{ {direct}; }}; then {in_helper}; fi; {run_direct}; RC=$?; [ $RC -eq 3 ] || exit $RC; {in_helper}"
 
 
 # An executor that cannot run the script on the host itself (another user than root, a PID 1 that is not the host's,
@@ -370,8 +412,32 @@ async def apply_rental_egress_guard(ssh) -> tuple[dict | None, str | None]:
     """(what was guarded, error); None when there is neither a rental network nor a legacy rental.
 
     Also run on the create and start paths right before a pod starts (DAH-6737), so a pod's own bridge is guarded
-    before its first packet, not at the next periodic run.
+    before its first packet, not at the next periodic run. The rules are applied only if no other run changed them
+    since this inventory began; otherwise the host is read again (``INVENTORY_ATTEMPTS`` times, then unknown).
     """
+    for _ in range(INVENTORY_ATTEMPTS):
+        generation = await _host_generation(ssh)
+        guarded, result = await _inventory_and_apply(ssh, generation)
+        if result.exit_status != STALE_INVENTORY_EXIT:
+            break
+    else:
+        raise InventoryUnknown("the host's rules kept changing during the inventory")
+    if left := [line for line in (result.stdout or "").splitlines() if line.startswith("old jump")]:
+        logger.warning(_m("Rental egress guard: an old release's jump was not detached", extra={"jumps": left}))
+        if guarded is not None:
+            guarded["old_jumps_left"] = left
+    return guarded, _error(result)
+
+
+async def _host_generation(ssh) -> str:
+    result = await ssh.run(_helper(f"cat {shlex.quote(HOST_GENERATION)} 2>/dev/null; :"), check=False)
+    generation = (result.stdout or "").strip() or "0"
+    if result.exit_status != 0 or not generation.isdigit():
+        raise InventoryUnknown(_error(result) or f"unreadable rule generation: {generation[:50]}")
+    return generation
+
+
+async def _inventory_and_apply(ssh, generation: str):
     inspect = await ssh.run(
         f"/usr/bin/docker network inspect {RENTAL_NETWORK_NAME} "
         f"-f '{{{{.Id}}}} {{{{index .Options \"{BRIDGE_NAME_OPTION}\"}}}}'",
@@ -409,10 +475,9 @@ async def apply_rental_egress_guard(ssh) -> tuple[dict | None, str | None]:
         legacy = legacy_bridge_inventory(nets)
     if bridge is None and not legacy:
         # rules from a rental that has since ended must not outlive it (Docker reuses its address)
-        result = await ssh.run(_helper(link_local_cleanup_script()), check=False)
-        return None, _error(result)
-    result = await ssh.run(_helper(link_local_drop_script(bridge, legacy)), check=False)
-    return {"bridge": bridge, "legacy_bridges": legacy}, _error(result)
+        return None, await ssh.run(_helper(link_local_cleanup_script(), generation), check=False)
+    result = await ssh.run(_helper(link_local_drop_script(bridge, legacy), generation), check=False)
+    return {"bridge": bridge, "legacy_bridges": legacy}, result
 
 
 def _error(result) -> str | None:

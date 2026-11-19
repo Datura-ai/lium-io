@@ -60,6 +60,8 @@ def _ssh(
 
     async def run(cmd, *args, **kwargs):
         calls.append(cmd)
+        if _is_generation_read(cmd):
+            return SimpleNamespace(exit_status=0, stdout="0\n", stderr="")
         if "network ls" in cmd:
             return SimpleNamespace(exit_status=labelled_rc, stdout=labelled, stderr="daemon error" if labelled_rc else "")
         if "docker ps" in cmd:
@@ -75,8 +77,13 @@ def _ssh(
     return SimpleNamespace(run=run, calls=calls)
 
 
+def _is_generation_read(cmd: str) -> bool:
+    return rental_egress_guard.HOST_GENERATION in cmd and "G=$(cat" not in cmd
+
+
 def _helper_calls(ssh) -> list[str]:
-    return [c for c in ssh.calls if "nsenter -t 1 " in c]
+    """The apply or cleanup helper runs, without the generation reads before each inventory."""
+    return [c for c in ssh.calls if "nsenter -t 1 " in c and not _is_generation_read(c)]
 
 
 def test_script_rebuilds_the_rules_in_a_fresh_chain_and_swaps_it_in():
@@ -123,11 +130,14 @@ async def test_applies_the_drop_in_the_hosts_namespaces_without_any_image(contex
     assert result.passed is True
     assert result.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
     [helper] = _helper_calls(ssh)
-    root = f"HOST_NS={shlex.quote(rental_egress_guard.HOST_NS)} " + helper_command(link_local_drop_script("br-0123456789ab", []))
-    assert helper.startswith('if ! { [ "$(id -u)" = 0 ] && mkdir -p ') and helper.endswith(f"; fi; {root}")
+    root = f"HOST_NS={shlex.quote(rental_egress_guard.HOST_NS)} " + helper_command(link_local_drop_script("br-0123456789ab", []), "0")
+    assert helper.startswith('if ! { [ "$(id -u)" = 0 ] && mkdir -p ') and helper.endswith(
+        f"; fi; {root.replace(' exec timeout ', ' timeout ', 1)}; RC=$?; [ $RC -eq 3 ] || exit $RC; "
+        f"exec {rental_egress_guard.NON_ROOT_HELPER} /bin/sh -c {shlex.quote(root)}"
+    )
     assert "then exec /usr/bin/docker run --rm --privileged --pid=host " in helper
     # no container on a root executor: a registry refusing an anonymous pull (Docker Hub's rate limit) never matters
-    assert not any("docker run" in call or "docker pull" in call for call in ssh.calls if call != helper)
+    assert not any("docker run" in call or "docker pull" in call for call in ssh.calls if call != helper and not _is_generation_read(call))
 
 
 @pytest.mark.asyncio
@@ -160,7 +170,7 @@ async def test_nothing_left_to_guard_removes_our_rules_pulling_a_pruned_image(co
 
     assert result.passed is True
     [helper] = _helper_calls(ssh)
-    assert helper_command(link_local_cleanup_script()) in helper
+    assert helper_command(link_local_cleanup_script(), "0").removeprefix("exec ") in helper
     script = link_local_cleanup_script()
     for chain in CHAINS:
         assert f"$IPT -D DOCKER-USER -j {chain}" in script and f"$IPT -F {chain}" in script
@@ -346,7 +356,7 @@ async def test_the_guard_runs_once_per_cycle_however_the_pipeline_ends(context_f
     assert [event.check_id for event in events] == ran
     assert sink.emit.await_args_list[-1].args[0].check_id == RentalEgressGuardCheck.check_id
     [helper] = _helper_calls(ssh)
-    assert helper.endswith(helper_command(link_local_drop_script("br-0123456789ab", [])))
+    assert helper_command(link_local_drop_script("br-0123456789ab", []), "0").removeprefix("exec ") in helper
     assert len(last_run) == 1
 
 
@@ -401,7 +411,7 @@ async def test_a_running_legacy_rental_off_the_rental_network_is_guarded(context
     assert inspect.endswith(f"{POD_A} filler_00000000-0000-4000-8000-00000000000c {POD_B}__prev")
     assert ".State.Running" in inspect
     [helper] = _helper_calls(ssh)
-    assert helper_command(link_local_drop_script(None, ["docker0"])) in helper
+    assert helper_command(link_local_drop_script(None, ["docker0"]), "0").removeprefix("exec ") in helper
     assert result.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
 
 
@@ -428,8 +438,8 @@ async def test_apply_and_cleanup_take_the_same_host_lock(context_factory):
     await RentalEgressGuardCheck().run(context_factory(ssh=cleaned))
 
     [apply_cmd], [cleanup_cmd] = _helper_calls(applied), _helper_calls(cleaned)
-    assert apply_cmd.endswith(helper_command(link_local_drop_script("br-0123456789ab", [])))
-    assert cleanup_cmd.endswith(helper_command(link_local_cleanup_script()))
+    assert helper_command(link_local_drop_script("br-0123456789ab", []), "0").removeprefix("exec ") in apply_cmd
+    assert helper_command(link_local_cleanup_script(), "0").removeprefix("exec ") in cleanup_cmd
     # the host file the previous release locked too, reached through PID 1's root
     assert rental_egress_guard.HOST_LOCK == "/proc/1/root/run/lock/lium-rental-egress/apply.lock"
     assert rental_egress_guard.HELPER_RUN_SECONDS < rental_egress_guard.HELPER_TIMEOUT_SECONDS
@@ -464,7 +474,7 @@ async def test_two_registrations_of_one_host_reconcile_the_same_host_wide_set(
     for ctx, rented_only in order:
         await RentalEgressGuardCheck(rented_only=rented_only).run(ctx)
 
-    expected = helper_command(link_local_drop_script("br-0123456789ab" if network_present else None, ["docker0"]))
+    expected = helper_command(link_local_drop_script("br-0123456789ab" if network_present else None, ["docker0"]), "0").removeprefix("exec ")
     assert [expected in helper for helper in _helper_calls(ssh)] == [True, True]
 
 
@@ -511,7 +521,7 @@ async def test_an_unknown_inventory_keeps_the_rules_and_is_retried(context_facto
         assert result.event.reason_code == "RENTAL_EGRESS_GUARD_SKIPPED"
     elif outcome == "cleaned":
         [helper] = helpers
-        assert helper_command(link_local_cleanup_script()) in helper
+        assert helper_command(link_local_cleanup_script(), "0").removeprefix("exec ") in helper
     else:
         [helper] = helpers
         assert "-j DROP" in helper and result.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
@@ -959,3 +969,138 @@ def test_chains_another_iptables_build_wrote_never_fail_the_guard(tmp_path, scri
     assert not set(old) & set(CHAINS)
     if script == "apply":
         assert _jumps_and_rules(state)[0][0] in CHAINS
+    # a jump this iptables cannot remove is reported apart from our own rules (F-12)
+    assert "old jump to LIUM-RENTAL-EGRESS-A not detached" in done.stdout
+
+
+def _host(tmp_path, monkeypatch):
+    """A host with the iptables stub as its iptables, the lock and the rule generation in tmp."""
+    bin_dir, state = tmp_path / "bin", tmp_path / "state"
+    bin_dir.mkdir()
+    state.mkdir()
+    for name in ("iptables-nft", "iptables-legacy"):
+        (bin_dir / name).write_text(_IPTABLES_STUB)
+        (bin_dir / name).chmod(0o755)
+    (state / "DOCKER-USER").write_text("RETURN\n")
+    lock_dir = tmp_path / "lock"
+    monkeypatch.setattr(rental_egress_guard, "HOST_LOCK", str(lock_dir / "apply.lock"))
+    monkeypatch.setattr(rental_egress_guard, "HOST_GENERATION", str(lock_dir / "generation"))
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "STATE": str(state)}
+    return bin_dir, state, env
+
+
+def test_a_periodic_run_whose_inventory_predates_a_pods_guard_never_removes_its_bridge(tmp_path, monkeypatch):
+    """F-14: a periodic run reads the host before pod B's bridge exists; B's pre-start guard then applies B; the
+    periodic run's older set must not replace B's rules, so it is refused as stale and reads the host again."""
+    _bin, state, env = _host(tmp_path, monkeypatch)
+    periodic_generation = "0"  # read before its inventory, as apply_rental_egress_guard does
+    b_rules = [f"-i br-bbbbbbbbbbbb -d {LINK_LOCAL_CIDR} -p {p} ! --dport 53 -j DROP" for p in ("tcp", "udp")]
+
+    pre_start = locked_script(link_local_drop_script("br-aaaaaaaaaaaa", ["br-bbbbbbbbbbbb"]), "0")
+    assert subprocess.run(["sh", "-c", pre_start], env=env, capture_output=True).returncode == 0
+    stale = locked_script(link_local_drop_script("br-aaaaaaaaaaaa", []), periodic_generation)
+    late = subprocess.run(["sh", "-c", stale], env=env, capture_output=True, text=True)
+
+    assert late.returncode == rental_egress_guard.STALE_INVENTORY_EXIT, late.stderr
+    [(_, rules)] = _jumps_and_rules(state)
+    assert set(b_rules) <= set(rules)  # still covered after the late periodic run
+
+
+@pytest.mark.asyncio
+async def test_a_stale_inventory_is_read_again_then_given_up_as_unknown(monkeypatch):
+    ssh = _ssh(helper_rc=rental_egress_guard.STALE_INVENTORY_EXIT)
+    with pytest.raises(rental_egress_guard.InventoryUnknown):
+        await rental_egress_guard.apply_rental_egress_guard(ssh)
+    assert len(_helper_calls(ssh)) == rental_egress_guard.INVENTORY_ATTEMPTS
+    assert sum(_is_generation_read(c) for c in ssh.calls) == rental_egress_guard.INVENTORY_ATTEMPTS
+
+
+def test_the_lock_wait_works_with_busybox_flock_which_has_no_w(tmp_path, monkeypatch):
+    # the alpine helper's busybox flock rejects -w: the wait is timeout around a plain flock
+    _bin_dir, state, env = _host(tmp_path, monkeypatch)
+    real = subprocess.run(["sh", "-c", "command -v flock"], capture_output=True, text=True).stdout.strip()
+    (_bin_dir / "flock").write_text(
+        f'#!/bin/sh\ncase "$1" in -w) echo "flock: unrecognized option: w" >&2; exit 1;; esac\nexec {real} "$@"\n'
+    )
+    (_bin_dir / "flock").chmod(0o755)
+
+    done = subprocess.run(
+        ["sh", "-c", locked_script(link_local_drop_script("br-0123456789ab", []), "0")], env=env, capture_output=True, text=True
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert _jumps_and_rules(state)[0][0] in CHAINS
+
+
+@pytest.mark.parametrize("absent", ["nsenter", "flock", "timeout"])
+def test_one_missing_tool_alone_sends_the_executor_to_the_helper(tmp_path, monkeypatch, absent):
+    # `command -v a b c` succeeds when only some exist: each tool is checked on its own
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "id").write_text('#!/bin/sh\n[ "$1" = -u ] && echo 0 || echo root\n')
+    (bin_dir / "docker").write_text('#!/bin/sh\necho helper > "$STATE"\n')
+    for name in ("nsenter", "flock", "timeout"):
+        if name != absent:
+            (bin_dir / name).write_text("#!/bin/sh\n")
+    for f in bin_dir.iterdir():
+        f.chmod(0o755)
+    (tmp_path / "host" / "run").mkdir(parents=True)
+    monkeypatch.setattr(rental_egress_guard, "HOST_LOCK", str(tmp_path / "host" / "run" / "lock" / "apply.lock"))
+    command = rental_egress_guard._helper("touch ran").replace("/usr/bin/docker", str(bin_dir / "docker"))
+    env = {**os.environ, "PATH": str(bin_dir), "STATE": str(tmp_path / "state")}
+
+    done = subprocess.run(["/bin/bash", "-c", command], env=env, capture_output=True, text=True, cwd=tmp_path)
+
+    assert done.returncode == 0, done.stderr
+    assert (tmp_path / "state").read_text().strip() == "helper" and not (tmp_path / "ran").exists()
+
+
+@pytest.mark.parametrize("script", ["apply", "cleanup"])
+def test_a_root_executor_whose_pid1_reaches_no_iptables_falls_back_to_the_helper(tmp_path, monkeypatch, script):
+    # a writable private PID 1 root passes the directory check, but no iptables answers there (3): the helper decides
+    bin_dir, state = tmp_path / "bin", tmp_path / "state"
+    bin_dir.mkdir()
+    state.mkdir()
+    (bin_dir / "id").write_text('#!/bin/sh\n[ "$1" = -u ] && echo 0 || echo root\n')
+    (bin_dir / "nsenter").write_text(_HOST_NSENTER_STUB.replace(
+            'iptables*) exec "$@" ;;', 'iptables*) [ -n "$IN_HELPER" ] && exec "$@"; exit 127 ;;'  # not the host's root
+        ))
+    (bin_dir / "docker").write_text(
+        '#!/bin/sh\necho run >> "$STATE/docker_run"\n'
+        'while [ "$1" != "docker.io/library/alpine:3.19" ]; do shift; done; shift\nIN_HELPER=1 exec "$@"\n'
+    )
+    for name in ("iptables-nft", "iptables-legacy"):
+        (bin_dir / name).write_text(_IPTABLES_STUB)
+    for f in bin_dir.iterdir():
+        f.chmod(0o755)
+    (state / "DOCKER-USER").write_text("RETURN\n")
+    monkeypatch.setattr(rental_egress_guard, "HOST_LOCK", str(tmp_path / "lock" / "apply.lock"))
+    monkeypatch.setattr(rental_egress_guard, "HOST_GENERATION", str(tmp_path / "lock" / "generation"))
+    body = link_local_drop_script("br-0123456789ab", []) if script == "apply" else link_local_cleanup_script()
+    command = rental_egress_guard._helper(body, "0").replace("/usr/bin/docker", str(bin_dir / "docker"))
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "STATE": str(state)}
+
+    done = subprocess.run(["sh", "-c", command], env=env, capture_output=True, text=True)
+
+    assert done.returncode == 0, done.stderr
+    assert (state / "docker_run").read_text().split() == ["run"]
+    if script == "apply":
+        [(_, rules)] = _jumps_and_rules(state)
+        assert rules == [f"-i br-0123456789ab -d {LINK_LOCAL_CIDR} -p {p} ! --dport 53 -j DROP" for p in ("tcp", "udp")]
+
+
+@pytest.mark.parametrize("script", ["apply", "cleanup"])
+def test_an_old_releases_docker0_jump_is_detached(tmp_path, monkeypatch, script):
+    """F-12: a host upgraded from a release with LIUM-RENTAL-EGRESS-A/B keeps no old jump, so an old docker0 drop does
+    not outlive the last rental it guarded. Its chains are never read or flushed."""
+    _bin, state, env = _host(tmp_path, monkeypatch)
+    (state / "DOCKER-USER").write_text("LIUM-RENTAL-EGRESS-A\nRETURN\n")
+    (state / "LIUM-RENTAL-EGRESS-A").write_text("-i docker0 -j DROP\n")
+    body = link_local_drop_script("br-0123456789ab", []) if script == "apply" else link_local_cleanup_script()
+
+    done = subprocess.run(["sh", "-c", body], env=env, capture_output=True, text=True)
+
+    assert done.returncode == 0, done.stderr
+    assert "LIUM-RENTAL-EGRESS-A" not in (state / "DOCKER-USER").read_text()
+    assert (state / "LIUM-RENTAL-EGRESS-A").read_text() == "-i docker0 -j DROP\n"
+    assert "old jump" not in done.stdout

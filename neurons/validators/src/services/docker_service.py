@@ -1229,7 +1229,12 @@ _CREATE_STEPS_BEFORE_THE_HOST = frozenset({"ssh_connect", "docker_sdk_ssh_host_k
 
 
 class RentalEgressGuardRefused(RuntimeError):
-    """The host's link-local egress drop could not be applied to a pod's bridge, so the pod was not started."""
+    """The host's link-local egress drop could not be applied to a pod's bridge, so the pod was not started.
+
+    A host fault: its reply carries ExecutorUnreachable (the backend's no-billing code for a failed reboot) whenever no
+    original of the pod is running; ``pod_running`` is set by a start of an already running container."""
+
+    pod_running = False
 
 
 def is_host_fault_create_failure(current_step: str | None, error: BaseException | None = None) -> bool:
@@ -3935,10 +3940,12 @@ class DockerService:
         network: str,
         default_extra: dict,
         connect: Callable[[], Any] | None = None,
+        executor_uuid: str | None = None,
     ) -> None:
         """The pod's own bridge exists and is in the host's link-local egress drop before the pod starts (DAH-6737),
         under the same host lock as the periodic guard. Fail closed: a bridge the drop could not be confirmed on is
-        never started on, and the refusal is a host fault (the node holds until a rental probe passes). Without
+        never started on, and the refusal is a host fault (the node holds until a rental probe passes; a restart path,
+        which has no create failure handler, passes ``executor_uuid`` and the hold is stamped here). Without
         ``ssh_client`` it opens its own session with ``connect``."""
         from services.task.checks.rental_egress_guard import apply_rental_egress_guard
 
@@ -3959,7 +3966,10 @@ class DockerService:
                     extra={**default_extra, "network": network, "error": error[:300]},
                 )
             )
-            raise RentalEgressGuardRefused(f"rental network guard not applied on this node: {error[:300]}")
+            refused = RentalEgressGuardRefused(f"rental network guard not applied on this node: {error[:300]}")
+            if executor_uuid:
+                await self.hold_node_until_probe_passes(executor_uuid, "rental_egress_guard", default_extra, refused)
+            raise refused
 
     async def _run_rental_docker_create_attempts(
         self,
@@ -4009,7 +4019,6 @@ class DockerService:
         `remove_port_checks_listed_live` runs once, on the first bind refusal, before either retry;
         when it removed a port check, the run is retried at once on the same mapping.
         """
-        deadline = time.monotonic() + _PORT_ALLOCATED_RETRY_BUDGET_SEC
         attempt = 0
         vloopback_mount_repair_attempted = False
         image_flattened = False
@@ -4022,6 +4031,8 @@ class DockerService:
                 network=run_spec.network,
                 default_extra=default_extra,
             )
+        # after the guard: its own time never uses up the port retries' budget
+        deadline = time.monotonic() + _PORT_ALLOCATED_RETRY_BUDGET_SEC
         while True:
             try:
                 container_id = await run_logged_rental_docker_sdk_operation(
@@ -12495,6 +12506,9 @@ class DockerService:
                     if container_vanished
                     else FailedContainerErrorCodes.RentingInProgress
                     if isinstance(e, _FillerRefusedForCustomerCreate)
+                    # refused before `docker run`: nothing of this pod started on the node (DAH-6737)
+                    else FailedContainerErrorCodes.ExecutorUnreachable
+                    if isinstance(last_exc, RentalEgressGuardRefused)
                     else FailedContainerErrorCodes.UnknownError
                 ),
                 failure_step=current_step,
@@ -12907,7 +12921,11 @@ class DockerService:
                 workload_kind=payload.workload_kind,
                 msg=str(log_text),
                 error_type=FailedContainerErrorTypes.ContainerStartFailed,
-                error_code=FailedContainerErrorCodes.UnknownError,
+                error_code=(
+                    FailedContainerErrorCodes.ExecutorUnreachable
+                    if isinstance(exc, RentalEgressGuardRefused) and not exc.pod_running
+                    else FailedContainerErrorCodes.UnknownError
+                ),
             )
         return ContainerStarted(
             miner_hotkey=payload.miner_hotkey,
@@ -12988,13 +13006,18 @@ class DockerService:
                     yield guard_ssh
 
             # before any start, outside the cleanup: a refused guard leaves the pod as it was (DAH-6737)
-            await self._guard_pod_network_before_start(
-                docker_client=docker_client,
-                ssh_client=None,
-                network=rental_network_for(container_name),
-                default_extra=default_extra,
-                connect=_guard_ssh,
-            )
+            try:
+                await self._guard_pod_network_before_start(
+                    docker_client=docker_client,
+                    ssh_client=None,
+                    network=rental_network_for(container_name),
+                    default_extra=default_extra,
+                    connect=_guard_ssh,
+                    executor_uuid=executor_info.uuid,
+                )
+            except RentalEgressGuardRefused as refused:
+                refused.pod_running = running_before
+                raise
             stale_mount_error: Exception | None = None
             try:
                 # inside the cleanup: the SDK call runs in a thread, so a cancel can land after Docker started the pod
@@ -13495,6 +13518,7 @@ class DockerService:
                 ssh_client=ssh_client,
                 network=rental_network_for(container_name),
                 default_extra=default_extra,
+                executor_uuid=executor_info.uuid,
             )
             try:
                 try:

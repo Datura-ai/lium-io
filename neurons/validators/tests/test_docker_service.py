@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, MagicMock, call, patch
+from unittest.mock import ANY, AsyncMock, Mock, MagicMock, call, patch
 from uuid import uuid4, UUID
 
 import asyncssh
@@ -83,7 +83,7 @@ import redis.asyncio as aioredis
 import redis.exceptions
 
 from helpers import no_host_start_lock, shared_pod_start_stop_lock
-from services.redis_service import RedisService
+from services.redis_service import RENTAL_PROBE_FAILED_PREFIX, RedisService
 
 
 FAKE_SSH_HOST_KEY = "ssh-ed25519 AAAATESTKEY"
@@ -3196,6 +3196,53 @@ async def test_start_container_sdk_failure_returns_failed_request_without_shell_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "code"),
+    [
+        (docker_service_module.RentalEgressGuardRefused("not applied"), FailedContainerErrorCodes.ExecutorUnreachable),
+        ("running", FailedContainerErrorCodes.UnknownError),
+        (Exception("SDK start failed"), FailedContainerErrorCodes.UnknownError),
+    ],
+    ids=["guard-refused-pod-down", "guard-refused-pod-running", "docker-failure"],
+)
+async def test_a_guard_refused_restart_of_a_pod_that_is_down_replies_the_host_fault_code(
+    docker_service, monkeypatch, error, code
+):
+    # F-9: a reboot the guard refused started nothing; the backend bills no host fault (ExecutorUnreachable)
+    if error == "running":
+        error = docker_service_module.RentalEgressGuardRefused("not applied")
+        error.pod_running = True  # Docker took the start of a running pod as a no-op: it still runs
+    docker_service.ssh_service.decrypt_payload.return_value = "private-key"
+    docker_service._prepare_known_hosts_policy = AsyncMock(return_value=None)
+    docker_service.start_existing_container = AsyncMock(side_effect=error)
+    payload = ContainerStartRequest(
+        miner_hotkey="miner-hotkey",
+        miner_address="127.0.0.1",
+        miner_port=8000,
+        executor_id=str(uuid4()),
+        pod_id="pod-id",
+        container_name="pod_test",
+        local_volume_path="/root",
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=str(uuid4()),
+        address="127.0.0.1",
+        port=8001,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.start_container(
+        payload, executor_info, Mock(ss58_address="validator-hotkey"), "encrypted-private-key"
+    )
+
+    assert isinstance(result, FailedContainerRequest) and result.error_code == code
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("repaired, starts", [("volume_x", 2), (None, 1)])
 async def test_start_existing_container_repairs_a_stale_vloopback_mountpoint_and_starts_again(
     docker_service, monkeypatch, repaired, starts
@@ -3503,9 +3550,10 @@ async def test_a_refused_egress_guard_starts_nothing_and_stops_nothing(docker_se
     client.running = False
     pod_bridge_guarded_on_fake_hosts.side_effect = docker_service_module.RentalEgressGuardRefused("not applied")
 
-    with pytest.raises(docker_service_module.RentalEgressGuardRefused):
+    with pytest.raises(docker_service_module.RentalEgressGuardRefused) as refused:
         await _start_existing(docker_service)
 
+    assert refused.value.pod_running is False  # the pod is down: its reply carries the host-fault code (F-9)
     assert pod_bridge_guarded_on_fake_hosts.await_args.kwargs["network"] == rental_network_for("pod_test")
     assert client.started_containers == [] and client.stopped_containers == []
 
@@ -11357,6 +11405,27 @@ async def _create_failing_at_add_public_keys(
     return result
 
 
+@pytest.mark.asyncio
+async def test_a_create_the_egress_guard_refused_replies_the_host_fault_code(
+    docker_service, monkeypatch, pod_bridge_guarded_on_fake_hosts
+):
+    # F-9: refused before `docker run`, nothing of the pod started: a reboot's recreate is not billed (ExecutorUnreachable)
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    pod_bridge_guarded_on_fake_hosts.side_effect = docker_service_module.RentalEgressGuardRefused("not applied")
+    monkeypatch.setattr(docker_service, "cleanup_failed_container_creation", AsyncMock(return_value=False))
+    payload = _filler_create_payload()
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=_filler_executor_info(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == FailedContainerErrorCodes.ExecutorUnreachable
+
+
 def _failure_error_field(result: FailedContainerRequest) -> str:
     """The `error` the backend reads from `detail` (headline >>> json extra)."""
     return json.loads(result.detail.split(" >>> ", 1)[1])["error"]
@@ -12350,6 +12419,42 @@ async def test_a_pod_never_starts_on_a_bridge_without_the_egress_drop(docker_ser
         assert events == [("ensure_network", net), ("guard",)]
         # a host fault: the node holds until a rental probe passes on it
         assert docker_service_module.is_host_fault_create_failure("docker_run", refused.value)
+        # the restart path has no create failure handler: the hold is stamped where the guard refused (F-11)
+        if path == "start":
+            docker_service.redis_service.set.assert_any_await(f"{RENTAL_PROBE_FAILED_PREFIX}:exec-1", ANY)
+
+
+@pytest.mark.real_egress_guard
+@pytest.mark.asyncio
+async def test_a_slow_guard_never_uses_up_the_port_retry_budget(docker_service, monkeypatch):
+    # the port retries' budget starts after the guard: a guard as slow as the budget still leaves its retry
+    monkeypatch.setattr(docker_service_module, "_PORT_ALLOCATED_RETRY_BUDGET_SEC", 0.2)
+    monkeypatch.setattr(docker_service_module, "_PORT_ALLOCATED_RETRY_SLEEP_SEC", 0)
+    real_sleep = asyncio.sleep
+
+    async def slow_guard(**kwargs):
+        await real_sleep(0.3)
+
+    monkeypatch.setattr(docker_service, "_guard_pod_network_before_start", slow_guard)
+    runs: list = []
+
+    class Client:
+        async def run_container(self, spec):
+            runs.append(spec.network)
+            if len(runs) == 1:
+                raise Exception(_PORT_ALLOCATED_ERR)
+            return "cid"
+
+    container_id = await docker_service._run_rental_docker_create_attempts(
+        docker_client=Client(),
+        ssh_client=Mock(),
+        run_spec=ContainerRunSpec(name="pod_a", image="img", network=rental_network_for("pod_a")),
+        container_name="pod_a",
+        default_extra={},
+        flatten_lease=None,
+    )
+
+    assert container_id == "cid" and len(runs) == 2
 
 
 _FAKE_DOCKER = """#!/bin/sh
