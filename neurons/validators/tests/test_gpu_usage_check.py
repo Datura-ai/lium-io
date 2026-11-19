@@ -2223,3 +2223,13 @@ async def test_a_repository_record_read_as_bytes_still_names_the_workload(contex
 
     assert result.passed is False
     assert result.event.what_we_saw["filler_foreign_processes"] == [f"{filler} (pid 4242): /opt/other/gpu-app --run"]
+
+
+@pytest.mark.asyncio
+async def test_any_gpu_process_in_a_filler_on_the_retired_dolphin_image_is_foreign(context_factory, monkeypatch):
+    monkeypatch.setattr(gpu_usage.settings, "FILLER_PROCESS_ALLOWLIST_ENFORCED", True)
+    ctx, _ = await _filler_process_ctx(context_factory, "/opt/dolphinpod/dolphinpod-worker start", "daturaai/dlph")
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False

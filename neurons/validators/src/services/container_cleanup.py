@@ -89,8 +89,8 @@ FILLER_WORKLOADS: dict[str, FillerWorkload] = {
     "ghcr.io/hanlinai/engy-golden-serve": FillerWorkload("ENGY_TEE", None),
     # the worker downloads its inference engine at run time; the engine has been vLLM and sonar
     "daturaai/dolphin": FillerWorkload("DPHN", ("dolphinpod", "sonar", "vllm")),
-    # the first Dolphin image: it ran the worker in a nested container, not the processes above
-    "daturaai/dlph": FillerWorkload("DPHN", None),
+    # the first Dolphin image, no longer started: no GPU process of a Lium workload runs in it
+    "daturaai/dlph": FillerWorkload("DPHN", ()),
     # small and has no cache volume, so a reclaim gains nothing from removing it
     "daturaai/pearl-miner": FillerWorkload("PEARL", ("peakminer",), removed_when_idle=False),
 }
