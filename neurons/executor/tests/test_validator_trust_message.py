@@ -115,6 +115,7 @@ def test_acceptance_new_validator_survives_recreate_without_backend_or_chain(
         "validator": new_validator.ss58_address,
         "revision": 1,
         "subnet_owner": owner.ss58_address,
+        "closed": False,
     }
     assert _accepts(monkeypatch, recreated, new_validator, baked) == "signed"
     assert _accepts(monkeypatch, recreated, old_validator, baked) is None
@@ -222,6 +223,7 @@ def test_a_failed_write_is_written_once_the_volume_takes_it(tmp_path, monkeypatc
     monkeypatch.setattr(trust_service, "_write_json", full)
     assert trust.offer(_signed(owner, new_validator, 7))
     assert _state(tmp_path)["messages"] == {}
+    assert trust.hotkeys({"current": "baked"}) == {}  # not on the volume: no validator trusted
     monkeypatch.setattr(trust_service, "_write_json", real_write)
     _backend(monkeypatch, lambda *a, **k: MagicMock(status_code=404))
     asyncio.run(trust.refresh_message())
@@ -608,7 +610,8 @@ def test_a_stalled_volume_does_not_hold_up_the_start(tmp_path, monkeypatch, owne
 
     trust = _trust(tmp_path, owner)
 
-    assert (trust.held.validator, trust._unsaved) == (new_validator.ss58_address, True)
+    # the volume already holds what the start chose: nothing to write, and the validator is trusted
+    assert (trust.held.validator, trust._unsaved) == (new_validator.ss58_address, False)
 
 
 def test_a_shutdown_right_after_a_new_revision_writes_it_first(tmp_path, owner, old_validator, new_validator):
@@ -626,10 +629,13 @@ def test_a_shutdown_right_after_a_new_revision_writes_it_first(tmp_path, owner, 
     assert _state(tmp_path)["messages"][owner.ss58_address]["message"] == trust_line(new_validator.ss58_address, 2)
 
 
-def test_a_failed_write_at_shutdown_is_written_again(tmp_path, monkeypatch, owner, old_validator, new_validator):
+def test_a_failed_write_trusts_no_validator_until_it_lands(
+    tmp_path, monkeypatch, owner, old_validator, new_validator
+):
+    # review: a replaced validator must never stay trusted because the newer revision did not reach the volume
     trust = _trust(tmp_path, owner)
     assert trust.offer(_signed(owner, old_validator, 1))
-    monkeypatch.setattr(trust_service, "FLUSH_RETRY_PAUSE_SECONDS", 0.01)
+    monkeypatch.setattr(trust_service, "validator_trust", trust)
     real_write, failures = trust_service._write_json, [OSError("transient")]
 
     def write_once_failing(path, data):
@@ -642,12 +648,57 @@ def test_a_failed_write_at_shutdown_is_written_again(tmp_path, monkeypatch, owne
         await asyncio.sleep(0.05)
         monkeypatch.setattr(trust_service, "_write_json", write_once_failing)
         assert trust.offer(_signed(owner, new_validator, 2))
+        for _ in range(200):
+            if not failures:
+                break
+            await asyncio.sleep(0.05)
+        while_failed = trust.hotkeys({"current": "baked"})
+        _backend(monkeypatch, lambda *a, **k: MagicMock(status_code=404))
+        await trust.refresh_message()  # the next refresh writes it
+        for _ in range(200):
+            if not trust.closed():
+                break
+            await asyncio.sleep(0.05)
+        after = trust.hotkeys({"current": "baked"})
         await trust.stop_persisting(writer)
-        return writer.done()
+        return while_failed, after
 
-    assert asyncio.run(run())
-    assert failures == []
+    while_failed, after = asyncio.run(run())
+    assert while_failed == {}
+    assert after == {"signed": new_validator.ss58_address}
     assert _state(tmp_path)["messages"][owner.ss58_address]["message"] == trust_line(new_validator.ss58_address, 2)
+
+
+def test_an_unreadable_kept_state_trusts_no_validator_until_a_served_message_confirms_one(
+    tmp_path, monkeypatch, owner, old_validator, new_validator
+):
+    baked = {"current": old_validator.ss58_address}
+    (tmp_path / STATE_FILE).write_text("{not json")
+    trust = ValidatorTrust(state_dir=tmp_path, image_message=tmp_path / "absent.json")
+    trust.load()
+
+    def down(*args, **kwargs):
+        raise ConnectionError("down")
+
+    # restarted with backend and chain unreachable: neither the baked nor any earlier validator is trusted
+    _backend(monkeypatch, down)
+    _chain(monkeypatch, down)
+    asyncio.run(trust.refresh_owner())
+    asyncio.run(trust.refresh_message())
+    assert trust.closed()
+    assert _accepts(monkeypatch, trust, old_validator, baked) is None
+
+    # the chain names the owner and the backend serves its message: trusted again
+    monkeypatch.setattr(trust_service.settings, "COMPUTE_REST_API_URL", "http://backend")
+    _chain(monkeypatch, lambda url: owner.ss58_address)
+    answer = MagicMock(status_code=200)
+    answer.json.return_value = _signed(owner, new_validator, 1)._asdict()
+    _backend(monkeypatch, lambda *a, **k: answer)
+    asyncio.run(trust.refresh_owner())
+    asyncio.run(trust.refresh_message())
+    assert not trust.closed()
+    assert _accepts(monkeypatch, trust, new_validator, baked) == "signed"
+    assert _accepts(monkeypatch, trust, old_validator, baked) is None
 
 
 def test_a_hung_volume_at_shutdown_ends_the_wait(tmp_path, monkeypatch, owner, new_validator):
