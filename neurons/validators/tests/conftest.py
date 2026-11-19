@@ -113,10 +113,7 @@ def _loopback_fakes_stand_in_for_public_nodes(request, monkeypatch):
     from services import node_host
 
     real = node_host._check_literal
-    stand_ins = [
-        ipaddress.ip_network(n)
-        for n in ("127.0.0.0/8", "::1/128", "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")
-    ]
+    documentation = [ipaddress.ip_network(n) for n in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")]
 
     def allow_stand_ins(host: str, port: int) -> None:
         h = host.strip("[]")
@@ -126,7 +123,7 @@ def _loopback_fakes_stand_in_for_public_nodes(request, monkeypatch):
             addr = ipaddress.ip_address(h.split("%", 1)[0])
         except ValueError:
             addr = None
-        if addr is not None and any(addr in n for n in stand_ins):
+        if addr is not None and (addr.is_loopback or any(addr in n for n in documentation)):
             return
         real(host, port)
 
