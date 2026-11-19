@@ -36,7 +36,6 @@ import json
 import logging
 import re
 import shlex
-import uuid as uuid_lib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -884,26 +883,24 @@ def kernel_ts(text: str) -> float | None:
     return float(match.group(1)) if match else None
 
 
-def kernel_stamp_command(nonce: str) -> str:
-    # a line written to the kernel log gets its time from the clock dmesg prints for an Xid (printk's local_clock);
+def kernel_stamp_command() -> str:
+    # read-only: the newest kernel-log line's time is on the clock dmesg prints for an Xid (printk's local_clock);
     # /proc/uptime is CLOCK_BOOTTIME, NTP-slewed, and drifts from it by minutes on a long uptime
-    return (
-        f"echo 'lium validator: GPU reset stamp {nonce}' > /dev/kmsg && dmesg | grep -F {nonce} "
-        "&& cat /proc/sys/kernel/random/boot_id"
-    )
+    return "dmesg | tail -n 1 && cat /proc/sys/kernel/random/boot_id"
 
 
 async def kernel_reset_stamp(runner: SSHCommandRunner) -> tuple[float, str] | None:
-    """(kernel time, boot id) on the host, read just before `nvidia-smi -r` runs: an Xid logged during the reset is
-    later than it, so the reset never lifts it. None when either is unreadable: then no reset is recorded."""
-    nonce = uuid_lib.uuid4().hex
+    """(kernel time of the newest kernel-log line, boot id) on the host, read just before `nvidia-smi -r` runs: every
+    line at or before that time was logged before the reset, and anything later (an Xid during or after the reset)
+    is never lifted by it. Nothing is written to the host. None when either is unreadable: then no reset is
+    recorded."""
     try:
-        result = await _run(runner, kernel_stamp_command(nonce))
+        result = await _run(runner, kernel_stamp_command())
     except Exception:
         return None
     lines = (result.stdout or "").strip().splitlines() if result.exit_code == 0 else []
-    ts = next((kernel_ts(line) for line in lines if nonce in line), None)
-    boot = lines[-1].strip() if lines and nonce not in lines[-1] else ""
+    ts = kernel_ts(lines[0]) if len(lines) == 2 else None
+    boot = lines[-1].strip() if len(lines) == 2 else ""
     return (ts, boot) if ts is not None and boot else None
 
 

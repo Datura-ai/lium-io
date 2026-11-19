@@ -103,7 +103,9 @@ def test_nvml_only_reports_the_xid_read_and_the_card_lists():
 XID_FAULT = f"gpu 3 ({UUIDS[3]}): new NVRM Xid on a probed GPU: {HW}"
 # the kernel time of the validator reset in the tests below: XID_FAULT (200.5) is before it, these two after it
 RESET_TS = 300.0
-POST_RESET_FAULT = f"gpu 3 ({UUIDS[3]}): new NVRM Xid on a probed GPU: [  300.0] NVRM: Xid (PCI:0000:03:00): 119, pid=1, Timeout"
+POST_RESET_FAULT = f"gpu 3 ({UUIDS[3]}): new NVRM Xid on a probed GPU: [  300.000001] NVRM: Xid (PCI:0000:03:00): 119, pid=1, Timeout"
+# the newest kernel line when the stamp was read: logged before the reset
+AT_STAMP_FAULT = f"gpu 3 ({UUIDS[3]}): new NVRM Xid on a probed GPU: [  300.0] NVRM: Xid (PCI:0000:03:00): 119, pid=1, Timeout"
 LATER_FAULT = f"gpu 3 ({UUIDS[3]}): new NVRM Xid on a probed GPU: [  400.25] NVRM: Xid (PCI:0000:03:00): 119, pid=1, Timeout"
 
 
@@ -303,8 +305,8 @@ async def test_a_validator_reset_and_a_clean_read_of_the_card_lift_its_held_xid(
 @pytest.mark.parametrize(
     ("after_reset", "held_after"),
     [
-        # an Xid at the reset's kernel time or later is never the reset's to lift: it stays held
-        pytest.param({"xid_faults": [POST_RESET_FAULT]}, POST_RESET_FAULT, id="an-xid-at-the-reset-time"),
+        # an Xid logged after the stamp (the newest kernel line before the reset) is never the reset's to lift
+        pytest.param({"xid_faults": [POST_RESET_FAULT]}, POST_RESET_FAULT, id="the-first-xid-after-the-stamp"),
         pytest.param({"xid_faults": [LATER_FAULT]}, LATER_FAULT, id="an-xid-after-the-reset"),
         pytest.param({"status": "flagged", "flags": [f"gpu 3 ({UUIDS[3]}): 2 uncorrected ECC error(s)"]}, None, id="nvml-flags-it"),
         pytest.param({"warnings": [f"gpu 3 ({UUIDS[3]}): NVML recovery action GPU_RESET required"]}, None, id="nvml-warns-on-it"),
@@ -373,14 +375,21 @@ async def test_a_reset_judged_before_a_fault_does_not_lift_that_later_fault(cont
 
 
 @pytest.mark.asyncio
-async def test_an_xid_logged_before_the_reset_and_first_read_after_it_is_not_held(context_factory):
+@pytest.mark.parametrize(
+    "pre_reset",
+    [
+        pytest.param(XID_FAULT, id="logged-before-the-stamp"),
+        pytest.param(AT_STAMP_FAULT, id="the-newest-kernel-line-at-the-stamp"),
+    ],
+)
+async def test_an_xid_logged_before_the_reset_and_first_read_after_it_is_not_held(context_factory, pre_reset):
     """Review case 1: an Xid outside 48/79/95 logged after one read and before the validator reset is new on the
     next read. The reset cleared it, so that read does not hold it, and it stays cleared after."""
     services = _services()
     boot = {"boot_id": "boot-a", "xid": {"available": True, "last_ts": 5}}
     await _read(context_factory, services, _ok(**boot))
     await _reset(context_factory, services, UUIDS[3])
-    first, _ = await _read(context_factory, services, _ok(xid_faults=[XID_FAULT], **boot))
+    first, _ = await _read(context_factory, services, _ok(xid_faults=[pre_reset], **boot))
     quiet, _ = await _read(context_factory, services, _ok(**boot))
 
     assert first.report["card_faults"] == []

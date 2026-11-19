@@ -172,9 +172,10 @@ def _held_fault_proof(
 
 def _reset_covers(fault: str, uuid: str | None, reset_clean: dict[str, float]) -> bool:
     """The fault's Xid was logged before a validator reset of its card that a clean read followed: the reset cleared
-    it. An Xid at or after the reset's kernel time, or with no kernel time, is never covered."""
+    it. The stamp is the newest kernel-log line just before the reset, so a line at or before it predates the reset;
+    an Xid after it, or with no kernel time, is never covered."""
     ts = kernel_ts(fault)
-    return uuid in reset_clean and ts is not None and ts < reset_clean[uuid]
+    return uuid in reset_clean and ts is not None and ts <= reset_clean[uuid]
 
 
 async def _load_card_resets(ctx: Context) -> dict[str, tuple[float, str]]:
