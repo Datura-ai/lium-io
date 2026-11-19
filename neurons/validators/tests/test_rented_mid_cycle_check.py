@@ -99,6 +99,22 @@ async def test_no_rent_since_cycle_start_goes_on(marked, at_start, redis):
     assert not result.updates
 
 
+@pytest.mark.asyncio
+async def test_a_starved_redis_pool_does_not_hold_the_check(monkeypatch):
+    """The GET is bounded: a read stuck waiting for a pool connection counts as no rent."""
+    ctx = make_ctx()
+
+    async def stuck(_key):
+        await asyncio.sleep(3600)
+
+    ctx.services.redis.get = stuck
+    real_wait_for = asyncio.wait_for
+    monkeypatch.setattr(asyncio, "wait_for", lambda aw, timeout: real_wait_for(aw, 0.01))
+    result = await RentedMidCycleCheck().run(ctx)
+
+    assert result.passed and result.event.reason_code == Msg.NOT_RENTED.reason
+
+
 def test_the_mark_outlives_one_validation_run_and_no_more():
     # a run that began before the rent is over within JOB_TIME_OUT; the mark must not reach far into the next cycle
     assert settings.JOB_TIME_OUT < RENT_REQUESTED_TTL_SECONDS <= settings.JOB_TIME_OUT + 120

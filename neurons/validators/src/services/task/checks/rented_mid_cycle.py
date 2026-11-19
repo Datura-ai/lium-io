@@ -1,3 +1,5 @@
+import asyncio
+
 import redis.exceptions
 
 from services.redis_service import rent_requested_key
@@ -11,11 +13,12 @@ async def rent_requested_since_cycle_start(ctx: Context) -> str | None:
     """The pod of a renter's create the connector marked on this node, unless the cycle-start rented list has it.
 
     `rented_data` is read once, at cycle start; a pod it already listed was judged by `TenantEnforcementCheck`.
-    No mark (none sent, the create failed, or the mark expired) or no Redis: no rent to stop for.
+    No mark (none sent, the create failed, or the mark expired) or no Redis: no rent to stop for. The read is bounded,
+    so a starved Redis pool cannot hold a finished step.
     """
     try:
-        pod = await ctx.services.redis.get(rent_requested_key(ctx.miner_hotkey, ctx.executor.uuid))
-    except redis.exceptions.RedisError:
+        pod = await asyncio.wait_for(ctx.services.redis.get(rent_requested_key(ctx.miner_hotkey, ctx.executor.uuid)), 5)
+    except (redis.exceptions.RedisError, TimeoutError):
         return None
     if pod is None:
         return None
