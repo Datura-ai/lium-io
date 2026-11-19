@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   check:
-    runs-on: ubuntu-24.04  # system python3 is 3.12, the only CPython the hash-pinned PyYAML wheel below fits
+    runs-on: ubuntu-24.04  # its /usr/bin/python3 ships the distro PyYAML the check imports below
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # every workflow and action this run can execute pins third-party code to a commit and images to a digest, never to a
@@ -32,12 +32,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          python3 -m venv /tmp/venv
-          # the reviewed CPython 3.12 x86_64 wheel only (the same hash as neurons/validators/uv.lock): no sdist build, so no
-          # unpinned build tools run first; another runner Python finds no wheel and fails red, never unscanned
-          echo 'pyyaml==6.0.3 --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc' > /tmp/pyyaml.txt
-          /tmp/venv/bin/pip install -q --only-binary=:all: --require-hashes -r /tmp/pyyaml.txt
-          /tmp/venv/bin/python - <<'PY'
+          # the runner image's own distro PyYAML (Ubuntu's python3-yaml): no package index and no copied parser in this
+          # repo, so an index outage cannot stop the scan; a runner without it fails red on the import, never unscanned
+          /usr/bin/python3 - <<'PY'
           import os, pathlib, posixpath, re, subprocess, sys, urllib.error, urllib.parse, urllib.request, yaml
 
           class Loader(yaml.SafeLoader):
