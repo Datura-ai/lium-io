@@ -382,3 +382,17 @@ async def test_a_redis_outage_holds_nothing_but_still_reports_a_broken_read(cont
     unread = await _cycle(context_factory, redis)
 
     assert (broken.passed, unread.passed) == (False, True)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_hold_renewal_keeps_the_node_hidden_and_ends_no_run(context_factory):
+    """Review on #2327: a Redis error on the renewal neither raises out of the check nor lists the node."""
+    redis = FakeRedis()
+    await _cycle(context_factory, redis, dind_probe_error=_SYSBOX_FS_BROKEN)
+    redis.fail_next_set_of = set(redis.store)
+
+    unread = await _cycle(context_factory, redis)
+
+    assert (unread.passed, unread.fatal) == (False, False)
+    [entry] = availability_errors([unread.event])
+    assert entry.reason_code == AvailabilityErrorCode.HOST_SYSBOX_FS_BROKEN

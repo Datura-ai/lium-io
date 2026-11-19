@@ -102,7 +102,13 @@ class SysboxRequiredCheck:
         if held is None:
             return None
         if not settings.DRY_RUN:
-            await redis.set(key, held, ex=SYSBOX_FS_HOLD_TTL_SECONDS)
+            try:
+                await redis.set(key, held, ex=SYSBOX_FS_HOLD_TTL_SECONDS)
+            except GPU_DROP_REDIS_ERRORS:
+                # the mark keeps its earlier expiry, so the hold stands this cycle; the next one renews it
+                logger.warning(
+                    _m("SYSBOX_FS_HOLD_REDIS_UNAVAILABLE", extra=get_extra_info(ctx.default_extra)), exc_info=True
+                )
         text = held.decode() if isinstance(held, bytes) else str(held)
         return f"held since an earlier cycle, no clean read yet: {text}"
 
