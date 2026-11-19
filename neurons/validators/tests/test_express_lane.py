@@ -286,6 +286,23 @@ class _Harness:
 
 
 @pytest.mark.asyncio
+async def test_a_stalled_owner_hotkeys_read_never_holds_discovery(monkeypatch, wallet):
+    """DAH-6740 review: the owner-set read runs beside the tick; while it hangs, ticks still read the snapshot and do
+    not start a second read."""
+    harness = _Harness(monkeypatch, {"miner-a": []}, [_Neuron("miner-a")])
+    stalled = asyncio.Event()
+    harness.portal_api.refresh_owner_hotkeys = AsyncMock(side_effect=stalled.wait)
+
+    await asyncio.wait_for(harness.lane.tick(), timeout=5)
+    await asyncio.wait_for(harness.lane.tick(), timeout=5)
+
+    assert harness.portal_api.get_all_executors.await_count == 2
+    assert harness.portal_api.refresh_owner_hotkeys.call_count == 1
+    stalled.set()
+    await harness.lane._owner_refresh
+
+
+@pytest.mark.asyncio
 async def test_nothing_runs_before_the_first_cycle_has_started(monkeypatch, wallet):
     new_node = str(uuid4())
     harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])

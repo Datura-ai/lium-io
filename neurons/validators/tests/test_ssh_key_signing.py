@@ -156,6 +156,7 @@ def portal_owners(monkeypatch):
     from clients import validator_portal_api
 
     monkeypatch.setattr(validator_portal_api, "_owner_hotkeys", {})
+    monkeypatch.setattr(validator_portal_api, "_owner_hotkeys_read_at", None)
     return validator_portal_api
 
 
@@ -197,7 +198,8 @@ def test_an_oversized_owner_set_signs_nothing(miner_service, validator_keypair, 
 async def test_refresh_reads_the_portal_and_a_failed_read_keeps_the_last_answer(portal_owners, monkeypatch):
     from clients.validator_portal_api import ValidatorPortalAPI
 
-    answers = [(200, {"listing": ["5Old"]}), (503, None)]
+    # a portal without the route yet (404): nothing to sign, as before this change
+    answers = [(404, None), (200, {"listing": ["5Old"]}), (503, None)]
 
     class _Response:
         def __init__(self, status, body):
@@ -232,9 +234,27 @@ async def test_refresh_reads_the_portal_and_a_failed_read_keeps_the_last_answer(
     monkeypatch.setattr(type(portal_owners.settings), "get_bittensor_wallet",
                         lambda self: SimpleNamespace(get_hotkey=lambda: keypair))
 
+    assert not await ValidatorPortalAPI.refresh_owner_hotkeys()
+    assert portal_owners.portal_owner_hotkeys("listing") == frozenset()
     assert await ValidatorPortalAPI.refresh_owner_hotkeys()
     assert not await ValidatorPortalAPI.refresh_owner_hotkeys()
     assert portal_owners.portal_owner_hotkeys("listing") == {"5Old"}
+
+
+def test_a_link_removed_while_the_portal_is_unreachable_stops_counting_within_the_max_age(
+    miner_service, validator_keypair, portal_owners, monkeypatch
+):
+    """Review: X authorized for Y, then the link is removed while every read fails. The last answer counts only up to
+    OWNER_HOTKEYS_MAX_AGE_SECONDS; after that nothing is signed for X and the account check sees X as a stranger."""
+    now = [1000.0]
+    monkeypatch.setattr(portal_owners.time, "monotonic", lambda: now[0])
+    portal_owners.remember_owner_hotkeys({"listing": ["5Old"]})
+
+    now[0] += portal_owners.OWNER_HOTKEYS_MAX_AGE_SECONDS
+    assert portal_owners.portal_owner_hotkeys("listing") == {"5Old"}
+    now[0] += 1
+    assert portal_owners.portal_owner_hotkeys("listing") == frozenset()
+    assert miner_service._owner_hotkey_signatures(validator_keypair, _SSH_KEY, None, "listing") is None
 
 
 @pytest.mark.asyncio

@@ -37,10 +37,14 @@ class PortalExecutor(BaseModel):
 
 # DAH-6740: per own-key listing hotkey, the own hotkeys of its owner's other accounts, from this validator's own read of
 # the portal's /miners/owner-hotkeys (never from what a miner reports: a miner could then have keys signed for hotkeys
-# it names). That answer is complete on every call, so each one replaces this copy whole (a removed link stops counting);
-# a failed read keeps the last answer. Filled by ValidatorPortalAPI.refresh_owner_hotkeys, which the express lane calls
-# every tick.
+# it names). That answer is computed afresh on every call, so each one replaces this copy whole (a removed link stops
+# counting). Filled by ValidatorPortalAPI.refresh_owner_hotkeys, which the express lane starts every tick.
 _owner_hotkeys: dict[str, frozenset[str]] = {}
+# monotonic time of the last answer applied; None before the first
+_owner_hotkeys_read_at: float | None = None
+# An answer is authorization the portal gave at that time: past this age (portal down, or answering garbage) it counts
+# for nothing, so a link removed during an outage stops being honoured within this bound. Ten ticks of the slow lane.
+OWNER_HOTKEYS_MAX_AGE_SECONDS = 300
 # bounds the signatures one upload carries; an owner has a few accounts, not dozens
 MAX_OWNER_HOTKEYS = 16
 
@@ -58,12 +62,18 @@ def remember_owner_hotkeys(answer: object) -> bool:
         for listing, hotkeys in answer.items()
         if len(set(hotkeys)) <= MAX_OWNER_HOTKEYS
     }
+    global _owner_hotkeys_read_at
     _owner_hotkeys.clear()
     _owner_hotkeys.update({listing: hotkeys for listing, hotkeys in owners.items() if hotkeys})
+    _owner_hotkeys_read_at = time.monotonic()
     return True
 
 
 def portal_owner_hotkeys(listing_hotkey: str) -> frozenset[str]:
+    """The listing owner's other hotkeys per the portal's last answer; none once that answer is older than
+    OWNER_HOTKEYS_MAX_AGE_SECONDS, so signing and the account check fall back to the listing alone."""
+    if _owner_hotkeys_read_at is None or time.monotonic() - _owner_hotkeys_read_at > OWNER_HOTKEYS_MAX_AGE_SECONDS:
+        return frozenset()
     return _owner_hotkeys.get(listing_hotkey, frozenset())
 
 
@@ -261,7 +271,8 @@ class ValidatorPortalAPI:
 
     @staticmethod
     async def refresh_owner_hotkeys() -> bool:
-        """DAH-6740: replace the owner map with the portal's /miners/owner-hotkeys; False (map kept) on any failure."""
+        """DAH-6740: replace the owner map with the portal's /miners/owner-hotkeys; False on any failure (a 404 from a
+        portal without the route included): the last answer then ages out (portal_owner_hotkeys)."""
         api_base = settings.MINER_PORTAL_REST_API_URL.rstrip("/") if settings.MINER_PORTAL_REST_API_URL else ""
         if not api_base:
             return False
@@ -274,6 +285,7 @@ class ValidatorPortalAPI:
                 "timestamp": str(timestamp),
                 "signature": f"0x{keypair.sign(portal_miner_auth_blob(keypair.ss58_address, timestamp)).hex()}",
             }
+            # runs beside the tick (ExpressLane), so a slow portal delays only this read
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
                 async with session.get(url, headers=headers) as response:
                     if response.status != 200:

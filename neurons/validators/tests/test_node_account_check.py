@@ -384,6 +384,7 @@ async def test_a_node_set_up_under_another_account_of_the_listing_owner_passes_b
     from clients import validator_portal_api
 
     monkeypatch.setattr(validator_portal_api, "_owner_hotkeys", {})
+    monkeypatch.setattr(validator_portal_api, "_owner_hotkeys_read_at", None)
     validator_portal_api.remember_owner_hotkeys({"5ListingY": ["5OwnerX"]})
     executor = ExecutorSSHInfo(
         uuid="node-1", address="203.0.113.7", port=8001, ssh_username="root", ssh_port=22,
@@ -396,3 +397,10 @@ async def test_a_node_set_up_under_another_account_of_the_listing_owner_passes_b
     assert (await NodeAccountCheck().run(ctx("hotkey=5OwnerX\nclaim=\n"))).passed
     refused = await NodeAccountCheck().run(ctx("hotkey=5Victim\nclaim=\n"))
     assert refused.event.reason_code == "NODE_ACCOUNT_MISMATCH"
+    # the portal answer aged out (outage): X is a stranger again
+    monkeypatch.setattr(
+        validator_portal_api, "_owner_hotkeys_read_at",
+        validator_portal_api.time.monotonic() - validator_portal_api.OWNER_HOTKEYS_MAX_AGE_SECONDS - 1,
+    )
+    stale = await NodeAccountCheck().run(ctx("hotkey=5OwnerX\nclaim=\n"))
+    assert stale.event.reason_code == "NODE_ACCOUNT_MISMATCH"

@@ -211,6 +211,7 @@ class ExpressLane:
         self._self_hosted_misses: Counter[str] = Counter()  # miner hotkey -> misses in a row
         self._next_self_hosted_listing = 0.0  # monotonic
         self._listing: asyncio.Task | None = None
+        self._owner_refresh: asyncio.Task | None = None  # DAH-6740
         # DAH-5716: runs started per queued recheck request.
         # shortcut: in memory, so a restart restarts the budget; the request's TTL still bounds it.
         self._recheck_runs: Counter[str] = Counter()
@@ -255,8 +256,10 @@ class ExpressLane:
 
     async def tick(self) -> int:
         """One pass: discover, select under the caps, launch. Returns how many were launched."""
-        # DAH-6740: every upload this validator signs reads the owner map, so it refreshes even when no wave runs
-        await self.portal_api.refresh_owner_hotkeys()
+        # DAH-6740: every upload this validator signs reads the owner map, so it refreshes even when no wave runs; in the
+        # background, so a slow portal never holds discovery
+        if self._owner_refresh is None or self._owner_refresh.done():
+            self._owner_refresh = asyncio.create_task(self.portal_api.refresh_owner_hotkeys())
         inputs = self.cycle_inputs()
         if inputs is None:
             return 0

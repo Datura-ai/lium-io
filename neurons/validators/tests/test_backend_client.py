@@ -622,6 +622,7 @@ async def test_check_executor_health_sends_the_portals_owner_hotkeys_for_the_lis
     from clients import validator_portal_api
 
     monkeypatch.setattr(validator_portal_api, "_owner_hotkeys", {})
+    monkeypatch.setattr(validator_portal_api, "_owner_hotkeys_read_at", None)
     validator_portal_api.remember_owner_hotkeys({"hotkey": ["5OwnerB", "5OwnerA"]})
     with patch.object(client, "_signed_request", new=AsyncMock(return_value=None)) as signed:
         await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001)
