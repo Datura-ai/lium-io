@@ -24,7 +24,7 @@ from clients.validator_portal_api import PortalExecutor, portal_miner_auth_blob
 from core.express_lane import (
     EXPRESS_FAILED_EVENT,
     EXPRESS_PUBLISHED_EVENT,
-    JOB_BATCH_ID_FORMAT,
+    estimated_block_time,
     MAX_ATTEMPTS,
     SESSION_LOST_MAX_RUNS,
     CycleInputs,
@@ -565,12 +565,12 @@ async def test_every_miner_is_asked_under_the_cycles_block_time_id(
 
 
 @pytest.mark.asyncio
-async def test_a_cycle_that_cannot_read_its_block_time_asks_under_the_clock_not_unknown(
+async def test_a_cycle_that_cannot_read_its_block_time_asks_under_its_blocks_estimated_time(
     validator_with_mocks, create_neuron_info
 ):
-    """lium-platform#3253 review 4632765324: a failed block-time read used to send job_batch_id "Unknown", which
-    the backend cannot order against a node's registration, so the cycle's findings were dropped. The cycle now
-    goes by the clock at its start, which precedes every check it runs."""
+    """lium-platform#3253 review 4632765324: a failed block-time read used to send job_batch_id "Unknown", which the
+    backend cannot order against a node's registration, so the cycle's findings were dropped. The cycle now goes by its
+    job block's estimated time: the same for every attempt at that block, and no later than the block's real time."""
     validator = validator_with_mocks
     validator.subtensor_client.get_miners = AsyncMock(return_value=[create_neuron_info(1, "miner-a")])
     validator.subtensor_client.get_time_from_block = AsyncMock(return_value="Unknown")
@@ -579,7 +579,6 @@ async def test_a_cycle_that_cannot_read_its_block_time_asks_under_the_clock_not_
         return {"miner_hotkey": payload.miner_hotkey, "miner_coldkey": "c", "results": []}
 
     validator.miner_service.request_job_to_miner = AsyncMock(side_effect=no_results)
-    before = datetime.now(UTC).replace(microsecond=0)
     with (
         patch("core.validator.fetch_default_image_digests", new=AsyncMock(return_value={})),
         patch("core.validator.fetch_executor_image_digest", new=AsyncMock(return_value=None)),
@@ -587,23 +586,20 @@ async def test_a_cycle_that_cannot_read_its_block_time_asks_under_the_clock_not_
         await validator.sync()
 
     [asked] = {c.kwargs["payload"].job_batch_id for c in validator.miner_service.request_job_to_miner.await_args_list}
-    started = datetime.strptime(asked, JOB_BATCH_ID_FORMAT).replace(tzinfo=UTC)
-    assert before <= started <= datetime.now(UTC)
+    [job_block] = {c.args[0] for c in validator.subtensor_client.get_time_from_block.await_args_list}
+    assert asked == estimated_block_time(job_block)
     assert validator.cycle_inputs.job_batch_id == asked
-    # the id goes through the per-block record, so a rerun of the block reuses it
-    validator.redis_service.cycle_id_for_block.assert_awaited_once()
 
 
-@pytest.mark.asyncio
-async def test_a_rerun_of_the_same_job_block_reports_under_its_first_cycle_id():
-    """Review on f205fc4: the clock fallback gave each attempt at one job block its own id, so a validator restarted
-    inside the block window settled the block twice (the backend dedupes by cycle id). The first attempt's id is kept
-    for the block, whether it came from the chain or the clock; the next block gets its own."""
-    redis = _redis_service()
-    first = await redis.cycle_id_for_block(7200, "2026-11-19 18:00:00")  # clock fallback of the first attempt
-    assert await redis.cycle_id_for_block(7200, "2026-11-19 18:03:10") == first  # restart, read fails again
-    assert await redis.cycle_id_for_block(7200, CYCLE_BATCH_ID) == first  # restart, read now succeeds
-    assert await redis.cycle_id_for_block(7560, "2026-11-19 19:12:00") == "2026-11-19 19:12:00"
+def test_a_blocks_estimated_time_depends_on_the_block_alone_and_never_runs_ahead_of_the_chain():
+    """Reviews on f205fc4 and 75a9fe1: an id taken from the clock (or from a record that can be lost) gave a rerun of one
+    job block a second cycle id, and settlement counted the block twice. The estimate is a function of the block, so a
+    restart, a wiped store or an upgrade all give the same id. Real chain times from validator_cycle bound it."""
+    assert estimated_block_time(9542475) == estimated_block_time(9542475) == "2026-11-19 18:37:36"
+    assert estimated_block_time(9542550) == "2026-11-19 18:52:36"  # the next job block, 75 blocks on
+    # 305,100 blocks before the anchor the estimate is 20 min ahead of that block's real chain time (09:17:36): blocks
+    # averaged a little over 12 s, so for blocks after the anchor (every job block from now on) it falls behind instead
+    assert estimated_block_time(9237375) == "2026-10-08 09:37:36"
 
 
 @pytest.mark.asyncio

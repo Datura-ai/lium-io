@@ -14,7 +14,6 @@ from services.task_service import JobResult
 @pytest.fixture
 def incentive_redis_service():
     service = AsyncMock()
-    service.cycle_id_for_block = AsyncMock(side_effect=lambda _block, candidate: candidate)
 
     gpu_portions = {
         "H100": 0.3,

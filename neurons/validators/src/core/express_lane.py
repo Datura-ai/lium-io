@@ -90,6 +90,18 @@ RECHECK_MARGIN_SECONDS = 60
 RECHECK_MAX_RUNS = 2
 
 
+# A block and its chain time (validator_cycle, 19 Nov 2026). Blocks have averaged 12.004 s since 8 Oct, never faster than
+# SECONDS_PER_BLOCK on average, so an estimate from here is at or slightly before the block's real time.
+ANCHOR_BLOCK = 9542475
+ANCHOR_TIME = datetime(2026, 11, 19, 18, 37, 36, tzinfo=UTC)
+
+
+def estimated_block_time(block: int) -> str:
+    """`block`'s time when the chain could not be read, as a job_batch_id: derived from the block alone, so every
+    attempt at one block gets the same id, and never later than the block's real time."""
+    return (ANCHOR_TIME + timedelta(seconds=(block - ANCHOR_BLOCK) * SECONDS_PER_BLOCK)).strftime(JOB_BATCH_ID_FORMAT)
+
+
 def _cycle_batch_id_or_clock(cycle_batch_id: str) -> str:
     """The cycle's id, or the clock when the cycle could not read its block time
     (SubtensorClient.get_time_from_block gives "Unknown"): the backend's write of a spec whose id
