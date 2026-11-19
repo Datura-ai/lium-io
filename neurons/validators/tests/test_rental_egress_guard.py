@@ -124,7 +124,8 @@ async def test_applies_the_drop_in_the_hosts_namespaces_without_any_image(contex
     assert result.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
     [helper] = _helper_calls(ssh)
     root = f"HOST_NS={shlex.quote(rental_egress_guard.HOST_NS)} " + helper_command(link_local_drop_script("br-0123456789ab", []))
-    assert helper.startswith('if [ "$(id -u)" != 0 ]; then exec /usr/bin/docker run ') and helper.endswith(f"; fi; {root}")
+    assert helper.startswith('if ! { [ "$(id -u)" = 0 ] && mkdir -p ') and helper.endswith(f"; fi; {root}")
+    assert "then exec /usr/bin/docker run --rm --privileged --pid=host " in helper
     # no container on a root executor: a registry refusing an anonymous pull (Docker Hub's rate limit) never matters
     assert not any("docker run" in call or "docker pull" in call for call in ssh.calls if call != helper)
 
@@ -883,12 +884,44 @@ def test_an_executor_not_running_as_root_gets_the_guard_through_the_privileged_h
         assert rules == [f"-i br-0123456789ab -d {LINK_LOCAL_CIDR} -p {p} ! --dport 53 -j DROP" for p in ("tcp", "udp")]
 
 
-def test_a_root_executor_runs_no_container(tmp_path, monkeypatch):
+@pytest.mark.parametrize("missing", ["host-pid1", "timeout"])
+def test_a_root_executor_that_cannot_reach_the_host_itself_uses_the_helper(tmp_path, monkeypatch, missing):
+    # prod 19 Nov: "/proc/1/root/run: Read-only file system" (PID 1 is the executor's own) and "timeout: not found"
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     (bin_dir / "id").write_text('#!/bin/sh\n[ "$1" = -u ] && echo 0 || echo root\n')
-    (bin_dir / "id").chmod(0o755)
-    monkeypatch.setattr(rental_egress_guard, "HOST_LOCK", str(tmp_path / "lock" / "apply.lock"))
+    (bin_dir / "docker").write_text('#!/bin/sh\necho helper > "$STATE"\n')
+    for name in ("id", "docker"):
+        (bin_dir / name).chmod(0o755)
+    host_run = tmp_path / "host" / "run"
+    host_run.mkdir(parents=True)
+    if missing == "host-pid1":
+        if os.geteuid() == 0:
+            pytest.skip("root writes a read-only directory")
+        host_run.chmod(0o555)
+    monkeypatch.setattr(rental_egress_guard, "HOST_LOCK", str(host_run / "lock" / "apply.lock"))
+    command = rental_egress_guard._helper("touch ran").replace("/usr/bin/docker", str(bin_dir / "docker"))
+    path = f"{bin_dir}:{os.environ['PATH']}" if missing == "host-pid1" else str(bin_dir)
+    if missing == "host-pid1":
+        (bin_dir / "nsenter").write_text("#!/bin/sh\n")
+        (bin_dir / "nsenter").chmod(0o755)
+    env = {**os.environ, "PATH": path, "STATE": str(tmp_path / "state")}
+
+    done = subprocess.run(["/bin/sh", "-c", command], env=env, capture_output=True, text=True, cwd=tmp_path)
+    host_run.chmod(0o755)
+
+    assert done.returncode == 0, done.stderr
+    assert (tmp_path / "state").read_text().strip() == "helper" and not (tmp_path / "ran").exists()
+
+
+def test_a_root_executor_runs_no_container(tmp_path, monkeypatch):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in ("id", "nsenter"):
+        (bin_dir / name).write_text('#!/bin/sh\n[ "$1" = -u ] && echo 0 || echo root\n')
+        (bin_dir / name).chmod(0o755)
+    monkeypatch.setattr(rental_egress_guard, "HOST_LOCK", str(tmp_path / "host" / "run" / "lock" / "apply.lock"))
+    (tmp_path / "host" / "run").mkdir(parents=True)
     command = rental_egress_guard._helper("touch ran").replace("/usr/bin/docker", "false")
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
 
