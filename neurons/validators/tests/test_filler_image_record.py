@@ -45,3 +45,16 @@ async def test_records_nothing_and_never_raises_without_a_digest(repo_digests, e
     )
 
     assert await redis.get(f"{FILLER_IMAGE_DIGESTS_PREFIX}filler_x") is None
+
+
+@pytest.mark.asyncio
+async def test_records_the_image_repository_the_filler_was_started_from():
+    from services.redis_service import FILLER_IMAGE_REPOSITORY_PREFIX
+
+    redis = FakeRedis()
+
+    await DockerService._record_filler_image_best_effort(
+        SimpleNamespace(redis_service=redis), _docker(()), "img", "filler_x", {}, "docker.io/daturaai/pearl-miner:0.5.0"
+    )
+
+    assert await redis.get(f"{FILLER_IMAGE_REPOSITORY_PREFIX}filler_x") == "daturaai/pearl-miner"
