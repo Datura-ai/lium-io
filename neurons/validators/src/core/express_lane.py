@@ -36,6 +36,7 @@ from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.miner_service import EXPRESS_LANE, MinerService
 from services.redis_service import EXPRESS_REDIS_SLOT
+from services.task.messages import TenantEnforcementMessages
 from services.task_service import JobResult
 
 from core.config import settings
@@ -67,6 +68,7 @@ FIRST_PASS_FAILED = "first pass failed"
 FIRST_PASS_FAILED_RETRY_SECONDS = 60
 FIRST_PASS_MAX_RUNS = 3
 SESSION_LOST_IN_PORT_CHECK = "the validator's SSH session closed during the port check"
+RENTED_SINCE_CYCLE_START = TenantEnforcementMessages.RENTED_SINCE_CYCLE_START.reason
 # A lost session is the validator's, not the node's, so it spends none of MAX_ATTEMPTS (which the
 # miner's snapshot misses may already have used). Its own bound keeps a node whose session always
 # drops from staying queued, and hidden from the wave, for good: ~20 min at RETRY_SECONDS.
@@ -681,6 +683,10 @@ class ExpressLane:
                     with suppress(Exception):
                         await self._end_recheck(pending)
             self._defer(pending, SESSION_LOST_IN_PORT_CHECK)
+            return
+        if result.failure_reason_code == RENTED_SINCE_CYCLE_START:
+            # a renter's create stopped the run: no verdict, as the wave holds it; retried as a deferral
+            self._defer(pending, RENTED_SINCE_CYCLE_START)
             return
         passed = result.score > 0 or result.job_score > 0
         should_run_first_pass_again = (

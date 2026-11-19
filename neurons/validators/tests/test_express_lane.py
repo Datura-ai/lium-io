@@ -730,6 +730,29 @@ async def test_a_session_lost_in_the_port_check_is_retried_not_a_failed_first_pa
 
 
 @pytest.mark.asyncio
+async def test_a_run_stopped_by_a_renters_create_is_deferred_not_published_as_failed(monkeypatch, wallet, caplog):
+    """A renter's create since cycle start stops the run with no verdict: nothing is published, it is not a
+    failed first pass, and it is retried as a deferral, as the wave holds it."""
+    new_node = str(uuid4())
+    harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
+
+    def stopped(payload, executor_id):
+        result = _job_result(executor_id, score=0.0)
+        result.failure_reason_code = "RENTED_SINCE_CYCLE_START"
+        return {"miner_hotkey": "miner-a", "miner_coldkey": "c", "results": [result]}
+
+    harness.job_for = stopped
+    with caplog.at_level(logging.INFO):
+        assert await harness.tick_and_settle() == 1
+
+    harness.miner_service.publish_machine_specs.assert_not_awaited()
+    assert not [r for r in caplog.records if r.getMessage() == EXPRESS_FAILED_EVENT]
+    pending = harness.lane._pending[new_node]
+    assert pending.failed_runs == 0 and pending.not_before > 0
+    assert await harness.redis_service.get_validated_executors() == set()
+
+
+@pytest.mark.asyncio
 async def test_a_session_lost_after_snapshot_misses_used_max_attempts_keeps_the_node_queued(
     monkeypatch, wallet
 ):
