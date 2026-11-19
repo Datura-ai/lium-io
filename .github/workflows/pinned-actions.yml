@@ -19,16 +19,15 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # every workflow and action this run can execute pins third-party code to a commit and images to a digest, never to a
-      # movable tag: the tracked files at this commit, then every pinned action or reusable workflow they call, fetched at
-      # its pinned commit, whoever owns it. The files are parsed as YAML so quoting and spacing cannot hide a reference
+      # movable tag. Third-party pins are checked where they are called; this repository's own actions and reusable
+      # workflows are called at the running commit ($/ or a job-level ./) and scanned here, as every tracked manifest is.
+      # The files are parsed as YAML so quoting and spacing cannot hide a reference. No network: nothing outside this commit is read
       - name: All actions are pinned to commit SHAs
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
           python3 -m venv /tmp/venv
           /tmp/venv/bin/pip install -q pyyaml==6.0.3
           /tmp/venv/bin/python - <<'PY'
-          import json, os, pathlib, posixpath, re, subprocess, sys, urllib.error, urllib.parse, urllib.request, yaml
+          import os, pathlib, posixpath, re, subprocess, sys, yaml
 
           class Loader(yaml.SafeLoader):
               """GitHub's YAML: only true/false are booleans (PyYAML's 1.1 rules make yes/on/no/off booleans too,
@@ -52,20 +51,19 @@ jobs:
           # the runner reads the scheme case-insensitively, so DOCKER:// must not slip past the checks
           norm = lambda ref: re.sub(r"^docker://", "docker://", str(ref), flags=re.I)
           is_digest = lambda img: re.fullmatch(digest, "docker://" + re.sub(r"^docker://", "", str(img), flags=re.I)) is not None
-          MAX_DEPTH = 5
 
-          def scan(files, fetch):
-              """files: workflows and action manifests tracked at this commit. fetch(repo, path, sha) returns a file's text, or
-              None when it cannot be read; repo None is this commit's tree. A pinned action or reusable workflow is fetched at its
-              commit and scanned by the same rules, so a tag anywhere in what a run executes fails the check."""
-              bad, queue, seen = [], [(None, str(f), None, 0) for f in files], set()
-              while queue:
-                  repo, path, at, depth = queue.pop(0)
-                  if (repo, path, at) in seen:
-                      continue
-                  seen.add((repo, path, at))
-                  where = f"{repo}/{path}@{at}" if repo else path
-                  text = fetch(repo, path, at)
+          def is_dockerfile(image):
+              """The runner's classifier: not docker://, and a basename that starts with Dockerfile. or ends with Dockerfile,
+              any case. Such a value is built, whatever else it looks like, so it is decided before the digest rule."""
+              base = posixpath.basename(str(image)).lower()
+              return not norm(image).startswith("docker://") and (base.startswith("dockerfile.") or base.endswith("dockerfile"))
+
+          def scan(files, read, own):
+              """files: workflows and action manifests tracked at this commit; read(path) returns a tracked file's text or
+              None; own is this repository (owner/name)."""
+              bad = []
+              for where in files:
+                  text = read(where)
                   try:
                       doc = yaml.load(text, Loader=Loader) if text is not None else None
                   except Exception as e:
@@ -82,18 +80,18 @@ jobs:
                       if ref is None:
                           continue
                       ref = str(ref)
-                      if ref.startswith("./"):
+                      if ref.startswith(("./", "$/")):
                           p = posixpath.normpath(ref[2:])
                           if level == "job":
-                              # a reusable workflow runs from the caller's repository at the caller's commit
-                              if fetch(repo, p, at) is None:
-                                  bad.append(f"{where}: {ref} is not a workflow at that commit")
-                              else:
-                                  queue.append((repo, p, at, depth))
-                          else:
+                              # a reusable workflow runs from this repository at the running commit: it must be tracked here
+                              if read(p) is None:
+                                  bad.append(f"{where}: {ref} is not a tracked workflow at this commit")
+                          elif ref.startswith("./"):
                               # the runner resolves a step's ./ in the job's workspace at run time, which any earlier step
-                              # can change, so no commit is inspected here: call the action as owner/repo/path@sha instead
-                              bad.append(f"{where}: {ref}: a step-level ./ action is not accepted, use owner/repo/path@sha")
+                              # can change; $/ resolves at the running commit instead
+                              bad.append(f"{where}: {ref}: a step-level ./ action is not accepted, use $/{p}")
+                          elif all(read(posixpath.join(p, n)) is None for n in ("action.yml", "action.yaml")):
+                              bad.append(f"{where}: {ref} has no tracked action manifest at this commit")
                           continue
                       if norm(ref).startswith("docker://"):
                           if not re.fullmatch(digest, norm(ref)):
@@ -102,21 +100,13 @@ jobs:
                       m = remote.fullmatch(ref)
                       if not m:
                           bad.append(f"{where}: {ref}")
-                          continue
-                      if depth >= MAX_DEPTH:
-                          bad.append(f"{where}: {ref}: nested more than {MAX_DEPTH} levels deep")
-                          continue
-                      r, sub, sha = m[1], posixpath.normpath(m[2] or "."), m[3]
-                      names = [sub] if level == "job" else [posixpath.normpath(f"{sub}/{n}") for n in ("action.yml", "action.yaml")]
-                      man = next((n for n in names if fetch(r, n, sha) is not None), None)
-                      if man:
-                          queue.append((r, man, sha, depth + 1))
-                      else:
-                          bad.append(f"{where}: {ref} has no readable workflow or action manifest at that commit")
+                      elif m[1].lower() == own.lower():
+                          # a commit of this repository may never reach main (a squash merge), and is not scanned here
+                          bad.append(f"{where}: {ref}: call this repository's own code as $/{posixpath.normpath(m[2] or '.')}")
                   # a Docker action runs a registry image by digest; a Dockerfile build pulls what its file says, which this
                   # check does not read, so it is not accepted
                   image = runs.get("image")
-                  if image is not None and not is_digest(image):
+                  if image is not None and (is_dockerfile(image) or not is_digest(image)):
                       bad.append(f"{where}: runs.image {image}: a registry image by sha256 digest only")
                   # job containers and services start before the steps, with the job's token: digest only
                   for job in jobs:
@@ -126,82 +116,54 @@ jobs:
                       bad += [f"{where}: container/service image {img}" for img in images if img and not is_digest(img)]
               return bad
 
-          # regression self-test on an in-memory tree (repo, path, commit) -> text, before the real scan
-          sha, s2, s3, dig = "a" * 40, "b" * 40, "c" * 40, "@sha256:" + "0" * 64
+          # regression self-test on an in-memory tree path -> text, before the real scan
+          sha, dig = "a" * 40, "@sha256:" + "0" * 64
           comp = "runs:\n  using: composite\n  steps:\n"
           img = "runs:\n  using: docker\n  image: "
           base = {
-              (None, ".github/actions/ok/action.yml", None): comp + "    - uses: acme/act@" + sha + "\n",
-              (None, ".github/actions/yaml/action.yaml", None): "runs: {}\n",
-              (None, ".github/workflows/ok.yml", None): "on: push\n",
-              ("acme/act", "action.yml", sha): "runs:\n  using: node20\n  main: index.js\n",
-              ("actions/checkout", "action.yml", sha): "runs:\n  using: node20\n  main: index.js\n",
-              ("acme/act", "action.yml", s2): comp + "    - uses: acme/leaf@v1\n",
-              ("vendor/comp", "sub/action.yml", sha): comp + "    - uses: acme/act@" + s2 + "\n",
-              ("vendor/comp", "ws/action.yml", sha): comp + "    - uses: ./x\n",
-              ("acme/wf", ".github/workflows/outer.yml", sha): "jobs:\n  a:\n    uses: ./.github/workflows/inner.yml\n",
-              ("acme/wf", ".github/workflows/inner.yml", sha): "jobs:\n  a:\n    steps:\n      - uses: acme/act@v1\n",
-              ("acme/loop", "action.yml", s3): comp + "    - uses: acme/loop@" + s3 + "\n",
-              ("acme/img", "action.yml", sha): img + "Dockerfile\n",
-              ("acme/img", "action.yml", s2): img + "docker://alpine" + dig + "\n",
+              ".github/actions/ok/action.yml": comp + "    - uses: acme/act@" + sha + "\n",
+              ".github/actions/yaml/action.yaml": "runs: {}\n",
+              ".github/workflows/ok.yml": "on: push\n",
           }
-          for i in range(MAX_DEPTH + 1):
-              base[(f"acme/deep{i}", "action.yml", sha)] = comp + f"    - uses: acme/deep{i + 1}@{sha}\n"
-          base[(f"acme/deep{MAX_DEPTH + 1}", "action.yml", sha)] = "runs:\n  using: node20\n  main: x.js\n"
           step = lambda ref: "jobs:\n  a:\n    steps:\n      - uses: " + ref + "\n"
           cases = {
               "jobs:\n  yes:\n    steps:\n      - uses: acme/act@v1\n  on:\n    steps:\n      - uses: acme/act@" + sha + "\n": 1,
               "jobs:\n  a:\n    steps:\n      - uses: acme/act@v1\n  a:\n    steps:\n      - uses: acme/act@" + sha + "\n": 1,
               "jobs:\n  yes:\n    steps:\n      - uses: acme/act@" + sha + "\n  on:\n    steps:\n      - uses: acme/act@" + sha + "\n": 0,
-              # a step-level ./ action always fails (here and in a pinned composite); a same-commit reusable workflow must be tracked
+              # a step-level ./ action always fails; a same-commit reusable workflow must be tracked
               "jobs:\n  a:\n    steps:\n      - uses: ./.github/actions/ok\n      - uses: ./.github/actions/ok/\n  b:\n    uses: ./.github/workflows/ok.yml\n  c:\n    uses: ./.github/workflows/gen.yml\n": 3,
               comp + "    - uses: actions/checkout@" + sha + "\n      with:\n        ref: main\n    - uses: ./tools/release\n": 1,
-              "jobs:\n  b:\n    uses: ./.github/workflows/ok.yml\n": 0,
-              step("acme/act@" + sha): 0,
-              step("acme/act@" + s2): 1,  # its own step uses a tag, whoever owns the action
-              step("vendor/comp/sub@" + sha): 1,  # two levels down
-              step("vendor/comp/ws@" + sha): 1,  # a workspace action inside a pinned one
-              step("acme/none@" + sha): 1,
-              step("acme/loop@" + s3): 0,  # a cycle ends
-              step("acme/deep0@" + sha): 1,  # deeper than the bound
-              "jobs:\n  a:\n    uses: acme/wf/.github/workflows/outer.yml@" + sha + "\n": 1,  # its ./ child, at that commit
-              step("acme/img@" + sha): 1,
-              step("acme/img@" + s2): 0,
+              "jobs:\n  b:\n    uses: ./.github/workflows/ok.yml\n  c:\n    uses: $/.github/workflows/ok.yml\n": 0,
+              step("$/.github/actions/ok"): 0,
+              step("$/.github/actions/yaml/"): 0,
+              step("$/.github/actions/none"): 1,
+              step("$/../outside"): 1,
+              step("acme/self/.github/actions/ok@" + sha): 1,  # own code by commit: $/ instead
+              step("acme/act@" + sha): 0,  # third-party: the pin is checked here, its contents are not fetched
+              step("acme/act@v1"): 1,
               step("docker://alpine:3"): 1,
               step("DOCKER://alpine" + dig): 0,
               img + "alpine\n": 1,
               img + "alpine" + dig + "\n": 0,
+              img + "docker://ghcr.io/acme/img" + dig + "\n": 0,
+              img + "ghcr.io/acme/img" + dig + "\n": 0,
               img + "Dockerfile\n": 1,
+              img + "docker/build.DOCKERFILE\n": 1,
+              img + "Dockerfile.x" + dig + "\n": 1,  # built by the runner, digest-shaped or not
+              img + "sub/dockerfile.runner" + dig + "\n": 1,
               "jobs:\n  a:\n    container: alpine:3\n    services:\n      db:\n        image: postgres" + dig + "\n": 1,
           }
           for i, (text, want) in enumerate(cases.items()):
-              tree = {**base, (None, f"w/case{i}.yml", None): text}
-              got = scan([f"w/case{i}.yml"], lambda r, p, at: tree.get((r, p, at)))
+              tree = {**base, f"w/case{i}.yml": text}
+              got = scan([f"w/case{i}.yml"], tree.get, "acme/self")
               assert len(got) == want, (i, got)
 
           tracked = set(subprocess.run(["git", "ls-files", "-z"], capture_output=True, text=True, check=True).stdout.split("\0"))
-          cache = {}
-          def fetch(repo, path, at):
-              if repo is None:
-                  return pathlib.Path(path).read_text() if path in tracked else None
-              if (repo, path, at) not in cache:
-                  url = f"https://api.github.com/repos/{repo}/contents/{urllib.parse.quote(path)}?ref={at}"
-                  req = urllib.request.Request(url, headers={"Accept": "application/vnd.github.raw", "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}"})
-                  try:
-                      with urllib.request.urlopen(req, timeout=30) as resp:
-                          cache[(repo, path, at)] = resp.read().decode()
-                  except urllib.error.HTTPError as e:
-                      if e.code != 404:  # only a missing file may fall back (action.yml -> action.yaml); anything else fails the check
-                          sys.exit(f"cannot read {repo}/{path}@{at}: HTTP {e.code}")
-                      cache[(repo, path, at)] = None  # not found: the scan reports it, never skips it
-                  except (urllib.error.URLError, UnicodeDecodeError) as e:
-                      sys.exit(f"cannot read {repo}/{path}@{at}: {e}")
-              return cache[(repo, path, at)]
-
+          read = lambda path: pathlib.Path(path).read_text() if path in tracked else None
           # every tracked action manifest, wherever it lives, and every workflow
           actions = sorted(p for p in tracked if posixpath.basename(p) in ("action.yml", "action.yaml"))
           files = sorted(str(p) for p in pathlib.Path(".github/workflows").glob("*.y*ml")) + actions
-          bad = scan(files, fetch)
-          print("\n".join(bad) or f"all pinned ({len(files)} files, {len(cache)} pinned actions and workflows read)")
+          bad = scan(files, read, os.environ["GITHUB_REPOSITORY"])
+          print("\n".join(bad) or f"all pinned ({len(files)} files)")
           sys.exit(1 if bad else 0)
           PY
