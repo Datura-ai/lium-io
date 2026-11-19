@@ -596,8 +596,9 @@ class PodGpuResetResult(PodContainerResponse):
     container_restarted: bool = False
     gpus: list[GpuResetOutcome] = []
     detail: str | None = None
-    # 2.18.0: the reset sent `docker stop` to the pod's container. False: a refusal before the stop, the container
-    # was never touched and runs as before (container_restarted is then false too). None: a validator before 2.18.0
+    # 2.18.0: the pod's container was down during this reset (its `docker stop` was sent, or it was found stopped by
+    # an earlier reset). False: it was seen running and never touched, so it runs as before (container_restarted is
+    # then false too). None: not known (refused before its state was read, a lost session, a validator before 2.18.0)
     pod_stopped: bool | None = None
 
 

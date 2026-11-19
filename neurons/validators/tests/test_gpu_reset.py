@@ -321,6 +321,9 @@ async def test_a_whole_host_rental_resolves_gpus_all_on_the_host():
 async def test_every_precheck_refusal_changes_nothing(host, kwargs, code):
     report, start = await _reset(host, **kwargs)
     assert not report.ok and report.error_code == code and report.gpus == [] and not report.pod_stopped
+    # seen running (False), or refused before its state was read (None: TEE, encrypted, no container), never True
+    unread = "in_tee" in kwargs or "encrypted_volume_mount" in kwargs or code == GpuResetErrorCode.ContainerNotFound
+    assert report.stopped_during_reset is (None if unread else False)
     _no_change(host, start)
 
 
@@ -490,6 +493,7 @@ async def test_a_retry_while_an_earlier_reset_unit_still_runs_changes_nothing():
     report, start = await _reset(host, backend=U)
     assert not report.ok and report.error_code == GpuResetErrorCode.OperationInProgress
     assert "still running on the host" in report.detail and not report.container_restarted
+    assert report.stopped_during_reset is None  # DAH-6741 review: the earlier reset may have left it stopped
     assert host.commands == [gpu_reset.FABRIC_RESET_UNIT_PROCS]
     _no_change(host, start)
 
@@ -572,20 +576,47 @@ async def test_an_unreadable_reset_unit_cgroup_skips_the_fallback_and_the_contai
     start.assert_not_awaited()
 
 
+# a fake stat: each fake fd links to ".../dev-<major>-<minor>" (tests cannot make device nodes); a link to
+# "denied" fails the way an fd the scan may not read does. Prints "<major> <minor> <path>" for "%t %T %n" and
+# "<major> <path>" for "%t %n", in hex like stat
+FAKE_STAT = """#!/bin/sh
+for f; do
+  case "$f" in -L|-c) continue;; %*) fmt=$f; continue;; esac
+  t=$(readlink "$f")
+  case "$t" in
+    denied) echo "stat: cannot statx '$f': Permission denied" >&2; ok=1;;
+    *dev-*) t=$(echo "$t" | sed 's/.*dev-//'); maj=$(printf '%x' "$(echo "$t" | cut -d- -f1)")
+      if [ "$fmt" = "%t %n" ]; then echo "$maj $f"; else printf '%s %x %s\\n' "$maj" "$(echo "$t" | cut -d- -f2)" "$f"; fi;;
+  esac
+done
+exit ${ok:-0}
+"""
+PROC_DEVICES = "Character devices:\n  1 mem\n195 nvidia-frontend\n226 drm\n510 nvidia-uvm\n\nBlock devices:\n  8 sd\n"
+
+
+def _fake_fd(proc, pid: int, device: str) -> None:
+    """pid holds "<major>:<minor>" open ("denied": an fd the scan cannot read)."""
+    (proc / str(pid) / "fd").mkdir(parents=True, exist_ok=True)
+    (proc / str(pid) / "fd" / "5").symlink_to("denied" if device == "denied" else "/dev/x/dev-" + device.replace(":", "-"))
+
+
 def _run_fabric_script(
     tmp_path, *, stop_fails="", start_fails="", reset_exit=0, units=(FM, NVLSM), containers=(), procs=None, needs=""
 ):
-    """Runs the host unit's script under /bin/sh with logging stand-ins for systemctl, docker, fuser and
-    nvidia-smi; procs is the host's /proc: {pid: (comm, cgroup)}, all of them holding a GPU device. stop_fails and
+    """Runs the host unit's script under /bin/sh with logging stand-ins for systemctl, docker, stat and
+    nvidia-smi; procs is the host's /proc: {pid: (comm, cgroup[, device])}, device "<major>:<minor>" held open
+    (default 195:0, a GPU; "denied": unreadable). stop_fails and
     start_fails name the one unit whose systemctl stop or start exits 1; a start of any unit fails while the unit
     needs has not been started yet."""
     log = tmp_path / "log"
     proc = tmp_path / "proc"
-    for pid, (comm, cgroup) in (procs or {}).items():
+    proc.mkdir()
+    (proc / "devices").write_text(PROC_DEVICES)
+    for pid, (comm, cgroup, *device) in (procs or {}).items():
         (proc / str(pid)).mkdir(parents=True)
         (proc / str(pid) / "comm").write_text(f"{comm}\n")
         (proc / str(pid) / "cgroup").write_text(f"{cgroup}\n")
-    fuser_out = " ".join(f"{pid}m" if i else str(pid) for i, pid in enumerate(procs or {}))
+        _fake_fd(proc, pid, device[0] if device else "195:0")
     for name, body in (
         (
             "systemctl",
@@ -595,7 +626,7 @@ def _run_fabric_script(
             "exit 0",
         ),
         ("docker", f'echo "docker $*" >> {log}; [ "$1" = stop ] && [ "$4" = "$STOP_FAILS" ] && exit 1; exit 0'),
-        ("fuser", f'echo "$*" | grep -q "/dev/nvidia" && echo " {fuser_out}"; exit 0'),
+        ("stat", FAKE_STAT.removeprefix("#!/bin/sh\n")),
         ("nvidia-smi", f'echo "reset $*" >> {log}; echo "In use by another client"; exit {reset_exit}'),
     ):
         (tmp_path / name).write_text(f"#!/bin/sh\n{body}\n")
@@ -642,6 +673,32 @@ def test_the_host_unit_stops_every_gpu_holder_and_starts_them_again_in_reverse(t
     ]
     # a refused reset names the processes still holding a GPU
     assert "GPU holders left: nv-hostengine python3" in done.stdout
+
+
+def test_the_host_unit_finds_gpu_holders_by_device_number_not_by_path(tmp_path):
+    # DAH-6741 review: any node with an NVIDIA driver's numbers opens the device, whatever it is called; another
+    # driver's device (226, drm) is not a GPU holder
+    procs = {
+        4242: ("agent", f"0::/system.slice/{AGENT}", "195:7"),
+        4243: ("uvm-user", "0::/system.slice/uvm-user.service", "510:0"),
+        4244: ("compositor", "0::/system.slice/compositor.service", "226:0"),
+    }
+    done, log = _run_fabric_script(tmp_path, reset_exit=3, units=(), procs=procs)
+    assert done.returncode == 3
+    assert log[:3] == [f"stop {AGENT}", "stop uvm-user.service", f"reset -r -i {U[0]}"]
+    assert sorted(log[3:]) == sorted(
+        [f"start {AGENT}", f"is-active {AGENT}", "start uvm-user.service", "is-active uvm-user.service"]
+    )
+    assert "compositor" not in done.stdout and "GPU holders left: agent uvm-user" in done.stdout
+
+
+def test_the_host_unit_does_not_reset_when_it_cannot_read_every_open_file(tmp_path):
+    # DAH-6741 review: an unreadable open file may be a GPU holder that would stay up: stop before the reset
+    procs = {4242: ("agent", f"0::/system.slice/{AGENT}"), 4250: ("hidden", "0::/", "denied")}
+    done, log = _run_fabric_script(tmp_path, units=(FM, NVLSM), procs=procs)
+    assert done.returncode == gpu_reset._FABRIC_STOP_FAILED_EXIT
+    assert "could not read which host processes hold the GPUs" in done.stderr
+    assert log == [f"stop {FM}", f"stop {NVLSM}", f"start {NVLSM}", f"start {FM}"]
 
 
 def test_the_host_unit_skips_the_reset_when_a_stop_fails_and_still_starts_the_fabric(tmp_path):
@@ -1248,7 +1305,7 @@ async def test_a_root_own_cgroup_ignores_nothing():
 async def test_a_failed_docker_stop_does_not_report_the_pod_stopped():
     host = FakeHost(stop_exit=1)
     report, _ = await _reset(host)
-    assert not report.ok and not report.pod_stopped and report.stop_sent
+    assert not report.ok and not report.pod_stopped and report.stopped_during_reset
     assert not any(cmd.startswith("nvidia-smi -r") for cmd in host.commands)
 
 
@@ -1301,6 +1358,7 @@ async def test_a_stopped_container_that_does_not_start_changes_nothing_else():
     host = FakeHost(main_pid=0)
     report, start = await _reset(host, start=AsyncMock(side_effect=RuntimeError("no start")))
     assert not report.ok and not report.container_restarted and "did not start" in report.detail
+    assert report.stopped_during_reset is True  # DAH-6741 review: it is down, so the answer must not say it runs
     assert not any(cmd.startswith(("/usr/bin/docker stop", "nvidia-smi -r")) for cmd in host.commands)
     start.assert_awaited_once()
 
@@ -1310,6 +1368,7 @@ async def test_a_stopped_container_started_but_refused_by_the_precheck_reports_t
     host = FakeHost(main_pid=0)
     report, start = await _reset(host)  # the start does not make the fake run: the precheck refuses again
     assert not report.ok and report.container_restarted and report.error_code == GpuResetErrorCode.ResetNotSupported
+    assert report.stopped_during_reset is True  # it was found stopped
     assert not any(cmd.startswith("/usr/bin/docker stop") for cmd in host.commands)
     start.assert_awaited_once()
 
@@ -1337,7 +1396,7 @@ async def test_a_stopped_encrypted_pod_without_its_plaintext_path_is_refused_bef
     host = FakeHost(main_pid=0, mounts=[{"Destination": "/lium-cipher"}])
     report, start = await _reset(host, encrypted_volume_mount="/lium-cipher")
     assert not report.ok and report.error_code == GpuResetErrorCode.ResetNotSupported
-    assert not report.container_restarted
+    assert not report.container_restarted and report.stopped_during_reset is None  # refused before its state was read
     _no_change(host, start)
 
 
@@ -1362,7 +1421,7 @@ async def test_a_part_node_reset_held_open_by_a_host_process_is_refused_before_t
     # Assert
     assert not report.ok and report.error_code == GpuResetErrorCode.GpuInUseOutsidePod
     assert "Xorg (pid 1500)" in report.detail and "the pod was not stopped" in report.detail
-    assert not report.stop_sent and not report.container_restarted
+    assert not report.stopped_during_reset and not report.container_restarted
     _no_change(host, start)
 
 
@@ -1376,7 +1435,7 @@ async def test_a_holder_whose_cgroup_cannot_be_read_is_not_called_outside_the_po
     assert report.error_code == GpuResetErrorCode.GpuInUseOutsidePod and "Xorg (pid 1500)" in report.detail
     assert "could not place in the pod" in report.detail
     assert "only if you can tell it is yours from inside the pod" in report.detail and "host PID" in report.detail
-    assert "process outside the pod" not in report.detail and not report.stop_sent
+    assert "process outside the pod" not in report.detail and not report.stopped_during_reset
     _no_change(host, start)
 
 
@@ -1441,21 +1500,6 @@ async def test_a_refused_reset_reports_the_start_of_the_nvidia_smi_text():
     assert "the GPUs were not reset: GPU 00000000:0A:00.0 is currently in use by another process." in report.detail
 
 
-# a fake stat: each fake fd links to ".../dev-<major>-<minor>" (tests cannot make device nodes); a link to
-# "denied" fails the way an fd the scan may not read does
-FAKE_STAT = """#!/bin/sh
-for f; do
-  case "$f" in -L|-c|"%t %T %n") continue;; esac
-  t=$(readlink "$f")
-  case "$t" in
-    denied) echo "stat: cannot statx '$f': Permission denied" >&2; ok=1;;
-    *dev-*) t=${t##*dev-}; printf '%x %x %s\\n' "${t%-*}" "${t#*-}" "$f";;
-  esac
-done
-exit ${ok:-0}
-"""
-
-
 def _run_holder_scan(tmp_path, holders: dict[int, str], minors: dict[str, int], find: str | None = None) -> list[str]:
     """The holder command run by sh over a fake /proc: holders maps pid -> "<major>:<minor>" of the device it holds
     open ("denied": an fd the scan cannot read). find, when given, is the body of a fake find put first on PATH
@@ -1472,9 +1516,7 @@ def _run_holder_scan(tmp_path, holders: dict[int, str], minors: dict[str, int], 
         (root / "driver/nvidia/gpus" / bus).mkdir(parents=True)
         (root / "driver/nvidia/gpus" / bus / "information").write_text(f"Model: x\nDevice Minor: \t {minor}\n")
     for pid, device in holders.items():
-        (root / str(pid) / "fd").mkdir(parents=True)
-        target = "denied" if device == "denied" else "/dev/x/dev-" + device.replace(":", "-")
-        (root / str(pid) / "fd" / "5").symlink_to(target)
+        _fake_fd(root, pid, device)
         (root / str(pid) / "comm").write_text(f"proc{pid}\n")
     command = gpu_reset.device_holders_command(["00000000:1b:00.0", "00000000:0a:00.0"])
     command = command.replace("/proc/driver", f"{root}/driver").replace("/proc/[0-9]*", f"{root}/[0-9]*")

@@ -538,15 +538,19 @@ async def _run_reset(service, backend=None, **connect):
 
 
 @pytest.mark.asyncio
-async def test_a_container_that_did_not_start_goes_with_no_code_until_the_backend_knows_it():
-    # DAH-6741: a backend before lium_protocol 2.18.0 drops a frame with an unknown error_code
+async def test_a_container_that_did_not_start_goes_with_its_own_code():
+    # DAH-6741 review: no code would read as reset_not_supported; the backend that knows 2.18.0 is deployed first
     connection = MagicMock(__aenter__=AsyncMock(), __aexit__=AsyncMock(return_value=False))
     report = GpuResetReport(ok=False, error_code=GpuResetErrorCode.ContainerNotRestarted, detail="did not start")
 
     with patch("services.docker_service.reset_pod_gpus", AsyncMock(return_value=report)):
         result = await _run_reset(_redis_service(), return_value=connection)
 
-    assert (result.ok, result.error_code, result.container_restarted) == (False, None, False)
+    assert (result.ok, result.error_code, result.container_restarted) == (
+        False,
+        GpuResetErrorCode.ContainerNotRestarted,
+        False,
+    )
 
 
 @pytest.mark.asyncio
@@ -554,7 +558,7 @@ async def test_a_container_that_did_not_start_goes_with_no_code_until_the_backen
 async def test_the_answer_says_whether_the_reset_stopped_the_pod(stopped):
     # DAH-6741: a refusal before the stop has container_restarted false on a pod that still runs
     connection = MagicMock(__aenter__=AsyncMock(), __aexit__=AsyncMock(return_value=False))
-    report = GpuResetReport(ok=False, error_code=GpuResetErrorCode.GpuInUseOutsidePod, stop_sent=stopped)
+    report = GpuResetReport(ok=False, error_code=GpuResetErrorCode.GpuInUseOutsidePod, stopped_during_reset=stopped)
 
     with patch("services.docker_service.reset_pod_gpus", AsyncMock(return_value=report)):
         result = await _run_reset(_redis_service(), return_value=connection)

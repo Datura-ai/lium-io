@@ -82,11 +82,23 @@ DOCKER_PS_COMMAND = (
     f"{DOCKER} inspect --format '{{{{.Id}}}} {{{{.HostConfig.AutoRemove}}}} {{{{.Config.Image}}}}' "
     f"$({DOCKER} ps -q --no-trunc)"
 )
-# the process names still holding a GPU device (host PID view): what blocked a refused `nvidia-smi -r`.
-# No ${...} in a unit script: systemd expands it in the command line before /bin/sh runs (to "" if unknown)
+# the host PIDs holding any NVIDIA device open, matched by device number (every major the nvidia drivers registered
+# in /proc/devices), not by path, since any node with those numbers opens the device; exits 3 when the scan is not
+# whole (an open file whose device could not be read). No ${...} in a unit script: systemd expands it in the command
+# line before /bin/sh runs (to "" if unknown)
+# (a subshell: put a space after a "$(" that wraps it, or the shell reads "$((" as arithmetic)
+GPU_HOLDER_PIDS_SCRIPT = (
+    "( m=$(awk '$2 ~ /^nvidia/ { printf \" %x \", $1 }' /proc/devices) && [ -n \"$m\" ] || exit 3; "
+    "d=$(mktemp -d) || exit 3; trap 'rm -rf \"$d\"' EXIT; "
+    "LC_ALL=C find /proc/[0-9]*/fd -type l -exec stat -L -c '%t %n' {} + >\"$d/o\" 2>\"$d/e\"; r=$?; "
+    "awk -v m=\"$m\" 'index(m, \" \" $1 \" \") { sub(\"/fd/.*\", \"\", $2); sub(\".*/\", \"\", $2); print $2 }' "
+    "\"$d/o\" | sort -u; "
+    "[ \"$r\" = 0 ] || { [ -s \"$d/e\" ] && ! grep -qv 'No such file or directory' \"$d/e\"; } || exit 3 )"
+)
+# the process names still holding a GPU device (host PID view): what blocked a refused `nvidia-smi -r`
 GPU_HOLDERS_SCRIPT = (
-    "for p in $(fuser /dev/nvidia* 2>/dev/null | tr -cs 0-9 ' '); do cat /proc/$p/comm; done "
-    "2>/dev/null | sort -u | tr '\\n' ' '"
+    f"{{ hp=$( {GPU_HOLDER_PIDS_SCRIPT}) || echo '(holder scan incomplete)'; "
+    "for p in $hp; do cat /proc/$p/comm; done 2>/dev/null | sort -u | tr '\\n' ' '; }"
 )
 
 
@@ -127,8 +139,9 @@ def _proc_bus(bus_id: str) -> str:
 
 
 # the host services (system.slice) of the processes still holding a GPU device, but the reset unit itself
+# (exits 3 when the holder scan is not whole)
 GPU_HOLDER_UNITS_SCRIPT = (
-    "for p in $(fuser /dev/nvidia* 2>/dev/null | tr -cs 0-9 ' '); do "
+    f"hp=$( {GPU_HOLDER_PIDS_SCRIPT}) || exit 3; for p in $hp; do "
     "sed -n 's#.*:/system.slice/\\([^/]*\\.service\\)$#\\1#p' /proc/$p/cgroup; done 2>/dev/null "
     "| grep -vx 'lium-gpu-reset-fabric.service' | sort -u"
 )
@@ -196,6 +209,8 @@ class GpuResetRefused(Exception):
         super().__init__(detail)
         self.code = code
         self.detail = detail
+        # True once the precheck saw the pod's container running: a refusal from then on left it running as before
+        self.container_running: bool | None = None
 
 
 class ContainerNotRunning(GpuResetRefused):
@@ -212,9 +227,10 @@ class GpuResetReport:
     detail: str | None = None
     # docker stop ran: the pod's GPUs may drop out until the driver brings them back
     pod_stopped: bool = False
-    # docker stop was sent, even one that then failed. False: a refusal before the stop, the container was never
-    # touched (the wire's pod_stopped, DAH-6741). None: not known (the reset timed out or its session dropped)
-    stop_sent: bool | None = False
+    # the wire's pod_stopped (DAH-6741). True: the container was down during this reset, by its docker stop (even
+    # one that then failed) or found stopped by an earlier one. False: it was seen running and never touched.
+    # None: not known (refused before its state was read, an earlier reset unit still running, a dropped session)
+    stopped_during_reset: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -426,7 +442,22 @@ async def _precheck(
 
     if container_pid <= 0:
         raise ContainerNotRunning()
+    try:
+        return await _plan_running_pod(runner, container_id, container_pid, device_requests, pod_gpu_uuids, gpu_indices)
+    except GpuResetRefused as refused:
+        refused.container_running = True
+        raise
 
+
+async def _plan_running_pod(
+    runner: SSHCommandRunner,
+    container_id: str,
+    container_pid: int,
+    device_requests: list[dict] | None,
+    pod_gpu_uuids: list[str],
+    gpu_indices: list[int] | None,
+) -> _Plan:
+    """The precheck of a running container: everything that can still refuse, before anything changes."""
     # no host PID view = no way to tell whose a GPU process is: the container's own main process must
     # show up in our /proc with the container's cgroup
     own = await _cgroups(runner, [container_pid])
@@ -579,7 +610,10 @@ def build_fabric_reset_command(units: list[str], reset_command: str, containers:
         stop = " ".join(shlex.quote(u) for u in units)
         script += f'[ $rc -ne 0 ] || for u in {stop}; do systemctl stop "$u" {fail}; done; '
     script += (
-        f"[ $rc -ne 0 ] || for u in $({GPU_HOLDER_UNITS_SCRIPT}); do "
+        # a holder the scan could not read would stay up and refuse the reset: stop here, before the reset
+        f"[ $rc -ne 0 ] || hu=$({GPU_HOLDER_UNITS_SCRIPT}) || "
+        f'{{ echo "could not read which host processes hold the GPUs" >&2; rc={_FABRIC_STOP_FAILED_EXIT}; }}; '
+        "[ $rc -ne 0 ] || for u in $hu; do "
         f'echo "stopping GPU holder $u"; up="$u $up"; systemctl stop "$u" {fail}; done; '
         f"[ $rc -ne 0 ] || {{ {reset_command}; rc=$?; "
         f'[ $rc -eq 0 ] || echo "GPU holders left: $({GPU_HOLDERS_SCRIPT})"; }}; '
@@ -801,8 +835,14 @@ async def reset_pod_gpus(
         try:
             await start_container()
         except Exception as exc:
-            return GpuResetReport(ok=False, error_code=refused.code, detail=f"{refused.detail}; it did not start: {exc}")
+            return GpuResetReport(
+                ok=False,
+                error_code=refused.code,
+                detail=f"{refused.detail}; it did not start: {exc}",
+                stopped_during_reset=True,
+            )
         report.container_restarted = True
+        report.stopped_during_reset = True
         notes.append("the container was not running: started it again")
         try:
             plan = await precheck()
@@ -811,7 +851,14 @@ async def reset_pod_gpus(
             report.detail = "; ".join([*notes, again.detail])
             return report
     except GpuResetRefused as refused:
-        return GpuResetReport(ok=False, error_code=refused.code, detail=refused.detail)
+        return GpuResetReport(
+            ok=False,
+            error_code=refused.code,
+            detail=refused.detail,
+            stopped_during_reset=False if refused.container_running else None,
+        )
+    if report.stopped_during_reset is None:
+        report.stopped_during_reset = False  # the precheck saw it running
 
     if plan.widened:
         notes.append("NVLink peers inside the pod were reset together")
@@ -838,7 +885,7 @@ async def reset_pod_gpus(
             )
             return report
     stop_failed = False
-    report.stop_sent = True
+    report.stopped_during_reset = True
     try:
         stopped = await _run(
             runner, f"{DOCKER} stop -t {STOP_GRACE_SECONDS} {shlex.quote(container_name)}", timeout=60

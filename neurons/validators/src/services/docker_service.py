@@ -14863,7 +14863,7 @@ class DockerService:
             after=mark_recent,
             # a reset that timed out or lost its session may have stopped the pod: not known
             failed=lambda detail: GpuResetReport(
-                ok=False, error_code=GpuResetErrorCode.ExecutorUnreachable, detail=detail, stop_sent=None
+                ok=False, error_code=GpuResetErrorCode.ExecutorUnreachable, detail=detail, stopped_during_reset=None
             ),
             gpu_uuids=payload.gpu_uuids,
         )
@@ -14877,19 +14877,17 @@ class DockerService:
             # GpusLostOnHost is not on the wire yet: the backend drops the whole frame on an unknown error_code and the
             # renter's reset hangs until timeout; a separate task adds the wire code and removes this swap after
             # lium-platform accepts GpusLostOnHost
-            # ContainerNotRestarted likewise (lium_protocol 2.18.0): until the backend accepts it, the case goes with no
-            # code, which lium-platform reads as container_not_restarted (DAH-6741)
+            # ContainerNotRestarted (lium_protocol 2.18.0) goes as is: this validator is released only after the
+            # backend that accepts 2.18.0 is deployed (DAH-6741)
             error_code=(
                 GpuResetErrorCode.ResetNotSupported
                 if report.error_code == GpuResetErrorCode.GpusLostOnHost
-                else None
-                if report.error_code == GpuResetErrorCode.ContainerNotRestarted
                 else report.error_code
             ),
             container_restarted=report.container_restarted,
             gpus=report.gpus,
             detail=report.detail,
-            pod_stopped=report.stop_sent,
+            pod_stopped=report.stopped_during_reset,
         )
 
     async def lock_pod_gpu_clocks(
