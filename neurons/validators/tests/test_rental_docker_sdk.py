@@ -1733,6 +1733,18 @@ def test_rental_ssh_adapter_hands_paramiko_a_socket_to_the_pinned_address(tmp_pa
         listener.close()
 
 
+@pytest.mark.asyncio
+async def test_container_identity_is_id_and_start_time_and_none_once_the_container_is_gone():
+    api_client = Mock()
+    api_client.inspect_container = Mock(return_value={"Id": "cid", "State": {"StartedAt": "t1"}})
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.container_identity(container_name="pod_x") == "cid@t1"
+
+    api_client.inspect_container = Mock(side_effect=NotFound("gone"))
+    assert await client.container_identity(container_name="pod_x") is None
+
+
 def _run_key_append(spec, env=None) -> subprocess.CompletedProcess:
     return subprocess.run(list(spec.argv), input=spec.stdin, capture_output=True, text=True, env=env)
 
@@ -1905,3 +1917,13 @@ def test_authorized_keys_edit_takes_the_lock_with_a_flock_that_has_no_wait_optio
 
     assert completed.returncode == 0, completed.stderr
     assert target.read_text() == ("k2\n" if remove else "k1\nk2\nk1\n")
+
+
+# --- DAH-6302: a CPU share of 0 never means no CPU limit ---
+
+
+@pytest.mark.parametrize(("cpu_count", "nano_cpus"), [(0, 1_000_000_000), (3, 3_000_000_000), (None, None)])
+def test_a_cpu_share_that_rounded_down_to_0_gets_one_core_not_no_limit(cpu_count, nano_cpus):
+    spec = ContainerRunSpec(image="registry.example/app:tag", name="pod_test", cpu_count=cpu_count)
+
+    assert rental_docker_sdk._build_host_config_kwargs(spec).get("nano_cpus") == nano_cpus

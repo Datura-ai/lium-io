@@ -1,8 +1,10 @@
 """Running rental containers get the link-local egress drop that custom builds already have.
 
 Builds drop egress to blocked ranges through host DOCKER-USER rules (``docker_service._egress_filter_script``).
-This check applies the same kind of rule for rentals, from a shell in the host's mount and network namespaces
-(``nsenter -t 1 -m -n -r``; the executor runs privileged with ``pid: host``), so it needs no image and no registry: traffic entering from the ``lium-rentals``
+This check applies the same kind of rule for rentals with the host's own iptables in the host's namespaces
+(``nsenter -t 1 -m -n -r``; the executor runs privileged with ``pid: host``), so it needs no image and no registry.
+The shell, lock and time bound are the executor's: only iptables runs in the host root, which may have no ``/bin/sh``
+or ``timeout``. Traffic entering from the ``lium-rentals``
 bridge, and from a running legacy rental still on another network (the default bridge; a running
 pod is never moved), to link-local 169.254/16 is dropped, except DNS (port 53), because a rental
 container's embedded resolver forwards from the container's network namespace and some hosts use
@@ -60,13 +62,15 @@ CHAINS = ("LIUM-RENTAL-EGRESS-A", "LIUM-RENTAL-EGRESS-B")
 BRIDGE_NAME_OPTION = "com.docker.network.bridge.name"
 _IFNAME = re.compile(r"[A-Za-z0-9_.-]{1,15}")
 # One host-wide lock around every apply and cleanup: two miners can report the same host, and two interleaved
-# chain swaps could otherwise flush the chain the other just made active. The helper runs in the host's mount
-# namespace, so this is one host file shared by every executor's helper.
-HOST_LOCK_DIR = "/run/lock/lium-rental-egress"
+# chain swaps could otherwise flush the chain the other just made active. Reached through PID 1's root, so this is
+# one host file shared by every executor's helper.
+HOST_LOCK_DIR = "/proc/1/root/run/lock/lium-rental-egress"
 HOST_LOCK = f"{HOST_LOCK_DIR}/apply.lock"
 LOCK_WAIT_SECONDS = 30
-# The helper's own bound, inside the executor-side one: the host-side shell is bounded on its own side too.
+# The helper's own bound, inside the validator-side one.
 HELPER_RUN_SECONDS = HELPER_TIMEOUT_SECONDS - 10
+# Prefix of every iptables call: the host's binary in the host's mount and network namespaces.
+HOST_NS = "nsenter -t 1 -m -n -r --"
 _ABSENT_NETWORK = re.compile(r"no such network|network \S+ not found", re.IGNORECASE)
 _ABSENT_CONTAINER = re.compile(r"no such (object|container)", re.IGNORECASE)
 
@@ -146,6 +150,17 @@ def legacy_network_ids(inspect_stdout: str) -> list[str]:
     return ids
 
 
+# The host's iptables whose DOCKER-USER reads, tried in order (plain `iptables` for a host without -nft/-legacy).
+# A backend is absent only when its binary is missing (127) or iptables says the chain does not exist; any other
+# failed probe is kept in ERRS, so a later backend's absence is never taken for the whole host's.
+# $HOST_NS is empty when the script runs where iptables is local (tests).
+_BACKEND_PROBE = (
+    "IPT=; ERRS=; for B in iptables-nft iptables-legacy iptables; do "
+    'ERR=$($HOST_NS $B -L DOCKER-USER -n 2>&1 >/dev/null) && { IPT="$HOST_NS $B"; break; }; '
+    '[ $? -eq 127 ] || case "$ERR" in *"No chain"*|*"does not exist"*) ;; *) ERRS="$ERRS$B: $ERR; ";; esac; done'
+)
+
+
 def link_local_drop_script(bridge: str | None, legacy_bridges: list[str]) -> str:
     """Host DOCKER-USER rules: drop rental egress to link-local, except DNS, reconciled to exactly this set.
 
@@ -160,10 +175,9 @@ def link_local_drop_script(bridge: str | None, legacy_bridges: list[str]) -> str
     """
     a, b = CHAINS
     lines = [
-        "IPT=iptables-nft",
-        "$IPT -L DOCKER-USER -n >/dev/null 2>&1 || IPT=iptables-legacy",
-        "$IPT -L DOCKER-USER -n >/dev/null 2>&1 || IPT=iptables",  # a host iptables without the -nft/-legacy names
-        '$IPT -L DOCKER-USER -n >/dev/null 2>&1 || { echo "DOCKER-USER chain not found" >&2; exit 3; }',
+        _BACKEND_PROBE,
+        '[ -n "$IPT" ] || { [ -n "$ERRS" ] && { printf %s "$ERRS" >&2; exit 4; }; '
+        'echo "no DOCKER-USER chain" >&2; exit 3; }',
         f"$IPT -N {a} 2>/dev/null; $IPT -N {b} 2>/dev/null",
         'RULES=$($IPT -S DOCKER-USER) || { echo "DOCKER-USER not readable" >&2; exit 4; }',
         f"ACTIVE=$(printf '%s\\n' \"$RULES\" | awk '$1 == \"-A\" && $3 == \"-j\" && ($4 == \"{a}\" || $4 == \"{b}\") "
@@ -189,10 +203,9 @@ def link_local_drop_script(bridge: str | None, legacy_bridges: list[str]) -> str
 def link_local_cleanup_script() -> str:
     """Remove our chains and their DOCKER-USER jumps: run when a host has nothing left to guard."""
     lines = [
-        "IPT=iptables-nft",
-        "$IPT -L DOCKER-USER -n >/dev/null 2>&1 || IPT=iptables-legacy",
-        "$IPT -L DOCKER-USER -n >/dev/null 2>&1 || IPT=iptables",  # a host iptables without the -nft/-legacy names
-        "$IPT -L DOCKER-USER -n >/dev/null 2>&1 || exit 0",
+        _BACKEND_PROBE,
+        # nothing to clean only when every backend proved absent; a probe that failed otherwise may hide our jumps
+        '[ -n "$IPT" ] || { [ -z "$ERRS" ] && exit 0; printf %s "$ERRS" >&2; exit 4; }',
     ]
     for chain in CHAINS:
         # a chain iptables says does not exist is done; one that exists must lose its jumps, rules and itself
@@ -211,23 +224,20 @@ def locked_script(script: str) -> str:
     so it is released only when the last of them exits: no timeout can free it while a mutation still runs."""
     return (
         f"mkdir -p {shlex.quote(HOST_LOCK.rsplit('/', 1)[0])} && exec 9>>{HOST_LOCK} || exit 5; "
-        f"timeout {LOCK_WAIT_SECONDS} flock 9 || {{ echo 'host lock not taken' >&2; exit 5; }}; {script}"
+        f"flock -w {LOCK_WAIT_SECONDS} 9 || {{ echo 'host lock not taken' >&2; exit 5; }}; {script}"
     )
 
 
 def helper_command(script: str) -> str:
-    """What the helper container runs: ``script`` under the lock, killed at ``HELPER_RUN_SECONDS``."""
+    """What the executor runs: ``script`` under the lock, killed at ``HELPER_RUN_SECONDS``."""
     return f"exec timeout -s KILL {HELPER_RUN_SECONDS} /bin/sh -c {shlex.quote(locked_script(script))}"
 
 
 def _helper(script: str) -> str:
-    # The host's own iptables in its network namespace: no helper container, so no image pull that a registry
-    # (Docker Hub's anonymous rate limit) can refuse. -r: the lock file, /bin/sh and iptables resolve in the host's
-    # root, so every executor on one host takes the same lock instead of one in its own container root
-    return (
-        f"timeout -k 5 {HELPER_TIMEOUT_SECONDS} "
-        f"nsenter -t 1 -m -n -r -- /bin/sh -c {shlex.quote(helper_command(script))}"
-    )
+    # No helper container, so no image pull that a registry (Docker Hub's anonymous rate limit) can refuse. The shell,
+    # flock and timeout are the executor image's; only iptables resolves in the host root, the one binary dockerd
+    # itself needs there
+    return f"HOST_NS={shlex.quote(HOST_NS)} {helper_command(script)}"
 
 
 class RentalEgressGuardCheck:
