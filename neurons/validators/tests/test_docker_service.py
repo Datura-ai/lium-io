@@ -50,6 +50,7 @@ from services.rental_docker_sdk import (
     ContainerRunSpec,
     ContainerStateSnapshot,
     RentalDockerOperationError,
+    RentalPodBridgeGone,
     _wrap_error_message,
     build_gpu_docker_config,
     rental_network_for,
@@ -237,7 +238,7 @@ class _FakeRentalDockerClient:
             restart_count=0, error=None, oom_killed=False,
         )
 
-    async def start(self, *, container_name: str, network: str | None = None) -> None:
+    async def start(self, *, container_name: str, network: str | None = None, network_id: str | None = None) -> None:
         self.started_containers.append(container_name)
         self.start_networks.append(network)
         if self.start_error is not None:
@@ -3202,8 +3203,10 @@ async def test_start_container_sdk_failure_returns_failed_request_without_shell_
         (docker_service_module.RentalEgressGuardRefused("not applied"), FailedContainerErrorCodes.ExecutorUnreachable),
         ("running", FailedContainerErrorCodes.UnknownError),
         (Exception("SDK start failed"), FailedContainerErrorCodes.UnknownError),
+        # finding 5 (DAH-6737 review): the guarded bridge vanished before the start; the stopped pod stays down, ours
+        (RentalPodBridgeGone("Docker network lium-rentals-pod_test is gone"), FailedContainerErrorCodes.PodDownNotHostFault),
     ],
-    ids=["guard-refused-pod-down", "guard-refused-pod-running", "docker-failure"],
+    ids=["guard-refused-pod-down", "guard-refused-pod-running", "docker-failure", "bridge-gone-pod-down"],
 )
 async def test_a_guard_refused_restart_of_a_pod_that_is_down_replies_the_host_fault_code(
     docker_service, monkeypatch, error, code
@@ -3522,14 +3525,14 @@ async def test_a_cancel_waits_for_the_docker_start_still_in_flight_before_stoppi
         client.started_containers.append("pod_test")
         client.running = True
 
-    async def start(*, container_name, network=None):
+    async def start(*, container_name, network=None, network_id=None):
         # the SDK call runs in a thread a cancel cannot stop: model it as work that outlives the await
         in_flight.set()
         await asyncio.shield(asyncio.ensure_future(_thread_start()))
 
     client.start = start
     task = asyncio.ensure_future(_start_existing(docker_service))
-    await in_flight.wait()
+    await asyncio.wait_for(in_flight.wait(), 5)  # a fake signature mismatch fails here, not hangs
     task.cancel()
     await asyncio.sleep(0)
     release.set()
@@ -12355,7 +12358,7 @@ async def test_generate_portMappings_keeps_held_ports_when_no_other_port_is_free
 @pytest.mark.real_egress_guard
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["create", "start"])
-@pytest.mark.parametrize("outcome", ["applied", "error", "raises"])
+@pytest.mark.parametrize("outcome", ["applied", "error", "raises", "bridge_gone_after_the_guard"])
 async def test_a_pod_never_starts_on_a_bridge_without_the_egress_drop(docker_service, monkeypatch, path, outcome):
     # DAH-6737: the bridge exists and the host-locked egress guard ran before the first start, on create and on the
     # start that moves a stopped pod onto its own bridge; when the guard did not apply, nothing starts (fail closed)
@@ -12365,20 +12368,26 @@ async def test_a_pod_never_starts_on_a_bridge_without_the_egress_drop(docker_ser
         events.append(("guard",))
         if outcome == "raises":
             raise RuntimeError("inventory unknown")
-        return {}, (None if outcome == "applied" else "DOCKER-USER chain not found")
+        return {}, ("DOCKER-USER chain not found" if outcome == "error" else None)
 
     monkeypatch.setattr("services.task.checks.rental_egress_guard.apply_rental_egress_guard", guard)
 
     class Client:
         async def ensure_network(self, name):
             events.append(("ensure_network", name))
+            return "guarded-id"
 
+        # the SDK's own check (test_rental_docker_sdk): the bridge bound by the guarded ID is gone
         async def run_container(self, spec):
-            events.append(("run_container", spec.network))
+            events.append(("run_container", spec.network, spec.network_id))
+            if outcome == "bridge_gone_after_the_guard":
+                raise RentalPodBridgeGone("Docker network gone since its egress drop was applied")
             return "cid"
 
-        async def start(self, *, container_name, network=None):
-            events.append(("start", network))
+        async def start(self, *, container_name, network=None, network_id=None):
+            events.append(("start", network, network_id))
+            if outcome == "bridge_gone_after_the_guard":
+                raise RentalPodBridgeGone("Docker network gone since its egress drop was applied")
 
         async def container_identity(self, *, container_name):
             return "cid@2026-11-19T00:00:00Z"
@@ -12410,18 +12419,48 @@ async def test_a_pod_never_starts_on_a_bridge_without_the_egress_drop(docker_ser
             pod_id="p",
             default_extra={},
         )
+    started = (("run_container" if path == "create" else "start"), net, "guarded-id")
     if outcome == "applied":
         await bring_up
-        assert events == [("ensure_network", net), ("guard",), (("run_container" if path == "create" else "start"), net)]
+        # F-28: the pod is created on, or moved to, the ID the guard applied the drop to
+        assert events == [("ensure_network", net), ("guard",), started]
+    elif outcome == "bridge_gone_after_the_guard":
+        with pytest.raises(RentalPodBridgeGone):
+            await bring_up
+        assert events == [("ensure_network", net), ("guard",), started]
+        assert not docker_service_module.is_host_fault_create_failure("docker_run", RentalPodBridgeGone("x"))
     else:
         with pytest.raises(docker_service_module.RentalEgressGuardRefused) as refused:
             await bring_up
         assert events == [("ensure_network", net), ("guard",)]
-        # a host fault: the node holds until a rental probe passes on it
+        # a host fault for a create: its failure handler holds the node until a rental probe passes on it
         assert docker_service_module.is_host_fault_create_failure("docker_run", refused.value)
-        # the restart path has no create failure handler: the hold is stamped where the guard refused (F-11)
-        if path == "start":
-            docker_service.redis_service.set.assert_any_await(f"{RENTAL_PROBE_FAILED_PREFIX}:exec-1", ANY)
+    if path == "start":
+        # finding 3: the edit's undo stamps no hold; its failure handler decides with the reply's code
+        assert not [
+            c for c in docker_service.redis_service.set.await_args_list if RENTAL_PROBE_FAILED_PREFIX in str(c.args[:1])
+        ]
+
+
+@pytest.mark.real_egress_guard
+@pytest.mark.asyncio
+async def test_a_reboot_the_guard_refused_holds_the_node_where_it_refused(docker_service, monkeypatch):
+    # F-11: start_existing_container has no create failure handler, so it passes executor_uuid and the guard stamps
+    async def guard(ssh):
+        return {}, "DOCKER-USER chain not found"
+
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.apply_rental_egress_guard", guard)
+    client = Mock(ensure_network=AsyncMock(return_value="guarded-id"))
+
+    with pytest.raises(docker_service_module.RentalEgressGuardRefused):
+        await docker_service._guard_pod_network_before_start(
+            docker_client=client,
+            ssh_client=Mock(),
+            network=rental_network_for("pod_a"),
+            default_extra={},
+            executor_uuid="exec-1",
+        )
+    docker_service.redis_service.set.assert_any_await(f"{RENTAL_PROBE_FAILED_PREFIX}:exec-1", ANY)
 
 
 @pytest.mark.real_egress_guard

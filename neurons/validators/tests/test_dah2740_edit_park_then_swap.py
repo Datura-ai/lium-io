@@ -384,6 +384,10 @@ async def test_a_failed_edit_restores_the_previous_container(svc, monkeypatch):
         # an edit that failed on anything, whose undo's own guard was refused: down is down, not billed, and our
         # undo's refusal is not the host's fault
         (True, "ordinary", "guard", "down", "PodDownNotHostFault"),
+        # finding 3: a replacement that failed on the node's link, then the undo's guard refused: neutral, and the
+        # neutral reply goes with no hold (the failure handler decides it, after the code)
+        (True, "drop", "guard", "down", "PodDownNotHostFault"),
+        (True, "drop", False, "running", "UnknownError"),  # restored: the node's link failure still holds it
         (True, "ordinary", "guard", "running", "UnknownError"),
         # the pod's bridge was removed by another create after its guard: the start is refused (ours, not the host's)
         (False, "bridge", False, "down", "PodDownNotHostFault"),  # a balance-stopped pod's reboot: nothing runs
@@ -401,6 +405,8 @@ async def test_a_failed_edit_restores_the_previous_container(svc, monkeypatch):
         "paused_during_fenced_stop",
         "restored_ordinary",
         "ordinary_undo_guard_refused_down",
+        "host_fault_undo_guard_refused_down",
+        "host_fault_restored",
         "ordinary_undo_guard_refused_running",
         "bridge_gone_absent",
         "bridge_gone_down",
@@ -423,11 +429,12 @@ async def test_a_reboot_the_guard_refused_is_a_host_fault_only_while_no_containe
     monkeypatch.setattr(
         svc, "_bring_up_existing_container", AsyncMock(side_effect=restore_error if restore_fails else None)
     )
-    from services.rental_docker_sdk import RentalPodBridgeGone
+    from services.rental_docker_sdk import RentalDockerTransportDropped, RentalPodBridgeGone
 
     exc = {
         "guard": RentalEgressGuardRefused("not applied"),
         "bridge": RentalPodBridgeGone("Docker network lium-rentals-pod_x is gone since its egress drop was applied"),
+        "drop": RentalDockerTransportDropped("ssh channel closed"),
     }.get(error, RuntimeError("gocryptfs: EPERM"))
     monkeypatch.setattr(svc, "_run_rental_docker_create_with_port_retry", AsyncMock(side_effect=exc))
 
@@ -435,6 +442,14 @@ async def test_a_reboot_the_guard_refused_is_a_host_fault_only_while_no_containe
 
     assert isinstance(result, FailedContainerRequest)
     assert result.error_code == getattr(FailedContainerErrorCodes, code)
+    from services.redis_service import RENTAL_PROBE_FAILED_PREFIX
+
+    held = [c for c in svc.redis_service.set.await_args_list if str(c.args[0]).startswith(RENTAL_PROBE_FAILED_PREFIX)]
+    # the node is held only for its own fault, never with the neutral code (no hold, no provider penalty)
+    if code == "PodDownNotHostFault":
+        assert held == []
+    elif error in ("guard", "drop"):
+        assert held
 
 
 @pytest.mark.parametrize(("undo", "after_undo", "code"), [

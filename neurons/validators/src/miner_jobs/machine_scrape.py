@@ -1764,6 +1764,10 @@ def get_egress_probe_network():
         if any(name.startswith("/pod_") for name in container.get("Names") or []):
             info = docker_api_get(f"/containers/{container['Id']}/json")
             mode = info["HostConfig"]["NetworkMode"]
+            networks = (info.get("NetworkSettings") or {}).get("Networks") or {}
+            # a pod is bound to its own bridge by ID (DAH-6737): never probe on a tenant's bridge, the template instead
+            if any(name.startswith(f"{EGRESS_RENTAL_NETWORK}-") for name in networks):
+                return EGRESS_RENTAL_NETWORK
             if mode in ("default", "bridge"):
                 # a legacy pod moved onto another network at start keeps mode "default"
                 mode = next(iter((info.get("NetworkSettings") or {}).get("Networks") or {}), "bridge")

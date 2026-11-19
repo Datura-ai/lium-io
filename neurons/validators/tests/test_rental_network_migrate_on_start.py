@@ -7,6 +7,7 @@ from services.rental_docker_sdk import (
     RENTAL_NETWORK_ICC_OPTION,
     RENTAL_NETWORK_NAME,
     RentalDockerSdkClient,
+    RentalPodBridgeGone,
 )
 
 
@@ -34,7 +35,7 @@ class FakeApi:
 
     def create_network(self, name, **kwargs):
         self.events.append(("create_network", name))
-        self.networks[name] = {"Driver": kwargs["driver"], "Options": kwargs["options"]}
+        self.networks[name] = {"Id": f"id-{name}", "Driver": kwargs["driver"], "Options": kwargs["options"]}
 
     def disconnect_container_from_network(self, container, network):
         self.events.append(("disconnect", container, network))
@@ -161,24 +162,61 @@ OLD = "2026-01-01T00:00:00.123456789Z"
 @pytest.mark.asyncio
 async def test_start_moves_a_stopped_pod_off_the_shared_rentals_bridge_onto_its_own():
     api = PerPodApi(networks=(RENTAL_NETWORK_NAME,), mode=RENTAL_NETWORK_NAME)
+    client = RentalDockerSdkClient(api)
 
-    await RentalDockerSdkClient(api).start(container_name="pod_a", network=OWN)
+    guarded = await client.ensure_network(OWN)  # the guard's step, before its egress drop
+    await client.start(container_name="pod_a", network=OWN, network_id=guarded)
 
-    assert ("create_network", OWN) in api.events
+    assert guarded == f"id-{OWN}" and api.events.count(("create_network", OWN)) == 1
+    # bound to the ID the drop was applied to, never the name
     assert api.events[-3:] == [
         ("disconnect", "pod_a", RENTAL_NETWORK_NAME),
-        ("connect", "pod_a", OWN),
+        ("connect", "pod_a", guarded),
         ("start", "pod_a"),
     ]
     assert api.networks[OWN]["Labels"]["io.lium.network"] == "pod"
     assert api.networks[OWN]["Options"][RENTAL_NETWORK_ICC_OPTION] == "false"
 
 
+@pytest.mark.parametrize("bridge", ["gone", "made_again"])
+@pytest.mark.parametrize("mode", [RENTAL_NETWORK_NAME, "default"])
+@pytest.mark.asyncio
+async def test_start_never_makes_or_uses_a_pod_bridge_other_than_the_guarded_one(bridge, mode):
+    # DAH-6737 review (F-28, finding 6): the bridge is removed after its egress drop, and maybe made again under the
+    # same name with no drop on it; the start is refused, nothing is created, moved or started
+    api = PerPodApi(networks=(RENTAL_NETWORK_NAME,), mode=mode)
+    client = RentalDockerSdkClient(api)
+    guarded = await client.ensure_network(OWN)
+    del api.networks[OWN]
+    if bridge == "made_again":
+        api.networks[OWN] = {"Id": "id-other", "Driver": "bridge", "Options": {RENTAL_NETWORK_ICC_OPTION: "false"}}
+    api.events.clear()
+
+    with pytest.raises(RentalPodBridgeGone):
+        await client.start(container_name="pod_a", network=OWN, network_id=guarded)
+
+    assert not [e for e in api.events if e[0] in ("create_network", "disconnect", "connect", "start")]
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_pod_bound_to_a_bridge_since_removed_is_refused_not_started():
+    # created on its own bridge by ID; that bridge was removed while it was stopped and the guard made a new one
+    api = PerPodApi(networks=(OWN,), mode="id-old")
+    client = RentalDockerSdkClient(api)
+    guarded = await client.ensure_network(OWN)
+    api.events.clear()
+
+    with pytest.raises(RentalPodBridgeGone):
+        await client.start(container_name="pod_a", network=OWN, network_id=guarded)
+
+    assert ("start", "pod_a") not in api.events
+
+
 @pytest.mark.asyncio
 async def test_a_pod_bridge_takes_the_mtu_the_provider_set_on_the_template():
     api = PerPodApi(template_options={RENTAL_NETWORK_ICC_OPTION: "false", "com.docker.network.driver.mtu": "1400"})
 
-    await RentalDockerSdkClient(api).start(container_name="pod_a", network=OWN)
+    await RentalDockerSdkClient(api).ensure_network(OWN)
 
     assert api.networks[OWN]["Options"]["com.docker.network.driver.mtu"] == "1400"
 
@@ -197,7 +235,7 @@ async def test_creating_a_pod_bridge_removes_only_old_unreferenced_pod_bridges()
         ],
     )
 
-    await RentalDockerSdkClient(api).start(container_name="pod_a", network=OWN)
+    await RentalDockerSdkClient(api).ensure_network(OWN)
 
     assert api.removed == ["gone"]
 
@@ -210,7 +248,8 @@ async def test_a_failed_cleanup_never_blocks_the_pod():
         raise RuntimeError("daemon busy")
 
     api.containers = broken
-    await RentalDockerSdkClient(api).start(container_name="pod_a", network=OWN)
+    client = RentalDockerSdkClient(api)
+    await client.start(container_name="pod_a", network=OWN, network_id=await client.ensure_network(OWN))
 
     assert api.events[-1] == ("start", "pod_a")
 
@@ -265,6 +304,6 @@ async def test_the_cleanup_ages_each_bridge_by_its_own_offset(monkeypatch):
         ],
     )
 
-    await RentalDockerSdkClient(api).start(container_name="pod_a", network=OWN)
+    await RentalDockerSdkClient(api).ensure_network(OWN)
 
     assert api.removed == ["old"]

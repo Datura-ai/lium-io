@@ -785,24 +785,45 @@ async def test_run_container_creates_the_container_with_the_spec_labels_and_the_
     }
 
 
-@pytest.mark.parametrize("present", [True, False], ids=["bridge_kept", "bridge_gone_since_the_guard"])
+@pytest.mark.parametrize(
+    "bridge", ["kept", "gone_since_the_guard", "made_again_since_the_guard", "removed_at_the_create", "removed_at_the_start"]
+)
 @pytest.mark.asyncio
-async def test_run_container_never_creates_a_pods_own_bridge(present):
+async def test_run_container_never_creates_a_pods_own_bridge(bridge):
     # DAH-6737: a pod's bridge is made only by ensure_network, before the egress drop; one removed between the drop
-    # and the start (another create's cleanup) fails the attempt instead of starting on a bridge the drop never saw
+    # and the start (another create's cleanup) fails the attempt instead of starting on a bridge the drop never saw.
+    # F-28: the container is bound to the guarded bridge's ID, so a same-name bridge made since is never used, and
+    # one removed inside the create or start call is the same refusal, not a generic Docker error
     api_client = FakeApiClient()
     pod_net = "lium-rentals-pod_test"
-    if present:
-        api_client.networks[pod_net] = _bridge_network({RENTAL_NETWORK_ICC_OPTION: "false"})
-    client = RentalDockerSdkClient(api_client)
+    api_client.networks[pod_net] = {**_bridge_network({RENTAL_NETWORK_ICC_OPTION: "false"}), "Id": "guarded-id"}
+    if bridge == "gone_since_the_guard":
+        del api_client.networks[pod_net]
+    elif bridge == "made_again_since_the_guard":
+        api_client.networks[pod_net] = {**api_client.networks[pod_net], "Id": "other-id"}
+    elif bridge in ("removed_at_the_create", "removed_at_the_start"):
+        call = "create_container" if bridge == "removed_at_the_create" else "start"
+        real = getattr(api_client, call)
 
-    if present:
-        await client.run_container(_rental_spec(network=pod_net))
-        assert api_client.host_config_kwargs["network_mode"] == pod_net
+        def removed(*args, **kwargs):
+            api_client.networks.pop(pod_net)
+            if call == "start":
+                real(*args, **kwargs)
+            raise APIError("network guarded-id not found")
+
+        setattr(api_client, call, removed)
+    client = RentalDockerSdkClient(api_client)
+    spec = _rental_spec(network=pod_net)
+    spec.network_id = "guarded-id"
+
+    if bridge == "kept":
+        await client.run_container(spec)
+        assert api_client.host_config_kwargs["network_mode"] == "guarded-id"
     else:
         with pytest.raises(RentalPodBridgeGone, match="gone since its egress drop"):
-            await client.run_container(_rental_spec(network=pod_net))
-        assert api_client.created_container is None and api_client.started == []
+            await client.run_container(spec)
+        if bridge in ("gone_since_the_guard", "made_again_since_the_guard"):
+            assert api_client.created_container is None and api_client.started == []
     assert api_client.created_networks == []
 
 

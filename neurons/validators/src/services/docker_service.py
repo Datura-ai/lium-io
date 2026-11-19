@@ -4000,16 +4000,19 @@ class DockerService:
         default_extra: dict,
         connect: Callable[[], Any] | None = None,
         executor_uuid: str | None = None,
-    ) -> None:
+    ) -> str | None:
         """The pod's own bridge exists and is in the host's link-local egress drop before the pod starts (DAH-6737),
         under the same host lock as the periodic guard. Fail closed: a bridge the drop could not be confirmed on is
         never started on, and the refusal is a host fault (the node holds until a rental probe passes; a restart path,
-        which has no create failure handler, passes ``executor_uuid`` and the hold is stamped here). Without
-        ``ssh_client`` it opens its own session with ``connect``."""
+        which has no create failure handler, passes ``executor_uuid`` and the hold is stamped here; a create or an
+        edit's undo leaves the hold to its failure handler). Without ``ssh_client`` it opens its own session with
+        ``connect``. Returns the guarded bridge's ID: the pod is created on or moved to that ID only, never a same-name
+        bridge made after the drop."""
         from services.task.checks.rental_egress_guard import apply_rental_egress_guard
 
+        network_id = None
         try:
-            await docker_client.ensure_network(network)
+            network_id = await docker_client.ensure_network(network)
             if ssh_client is None:
                 # a start that opens its SSH session only after the start (start_existing_container): its own
                 async with connect() as own_ssh:
@@ -4029,6 +4032,7 @@ class DockerService:
             if executor_uuid:
                 await self.hold_node_until_probe_passes(executor_uuid, "rental_egress_guard", default_extra, refused)
             raise refused
+        return network_id
 
     async def _run_rental_docker_create_attempts(
         self,
@@ -4084,7 +4088,7 @@ class DockerService:
         remaps = 0
         own_leftover_removed = False
         if run_spec.network:
-            await self._guard_pod_network_before_start(
+            run_spec.network_id = await self._guard_pod_network_before_start(
                 docker_client=docker_client,
                 ssh_client=ssh_client,
                 network=run_spec.network,
@@ -12530,9 +12534,18 @@ class DockerService:
             await self.redis_service.remove_pending_pod(
                 payload.miner_hotkey, payload.executor_id, payload.pod_id, command_id=payload.command_id
             )
-            await self.hold_node_until_probe_passes(
-                payload.executor_id, current_step, default_extra, error=_last_attempt_exception(e)
+            error_code = failed_create_error_code(
+                last_exc,
+                container_vanished=container_vanished,
+                filler_refused=isinstance(e, _FillerRefusedForCustomerCreate),
+                undo_guard_refused=edit_swap is not None and edit_swap.undo_guard_refused,
+                pod_left_down=edit_swap is None or edit_swap.pod_state_after_undo == "down",
             )
+            # a pod our own step left down is not the host's fault: no hold (DAH-6737)
+            if error_code != FailedContainerErrorCodes.PodDownNotHostFault:
+                await self.hold_node_until_probe_passes(
+                    payload.executor_id, current_step, default_extra, error=_last_attempt_exception(e)
+                )
 
             # Port release now handled by backend.
             # DAH-2475: msg carries the renter-safe headline; detail carries the FULL text (headline +
@@ -12565,13 +12578,7 @@ class DockerService:
                 ),
                 detail=failure_detail,
                 error_type=FailedContainerErrorTypes.ContainerCreationFailed,
-                error_code=failed_create_error_code(
-                    last_exc,
-                    container_vanished=container_vanished,
-                    filler_refused=isinstance(e, _FillerRefusedForCustomerCreate),
-                    undo_guard_refused=edit_swap is not None and edit_swap.undo_guard_refused,
-                    pod_left_down=edit_swap is None or edit_swap.pod_state_after_undo == "down",
-                ),
+                error_code=error_code,
                 failure_step=current_step,
                 volume_encryption_status=(
                     VolumeEncryptionStatus.FAILED
@@ -12985,6 +12992,10 @@ class DockerService:
                 error_code=(
                     FailedContainerErrorCodes.ExecutorUnreachable
                     if isinstance(exc, RentalEgressGuardRefused) and not exc.pod_running
+                    # the bridge guarded for this start is gone: refused on a stopped pod, which the cleanup keeps
+                    # down; ours, not the host's, and not billed (DAH-6737)
+                    else FailedContainerErrorCodes.PodDownNotHostFault
+                    if isinstance(_last_attempt_exception(exc), RentalPodBridgeGone)
                     else FailedContainerErrorCodes.UnknownError
                 ),
             )
@@ -13046,7 +13057,9 @@ class DockerService:
                             # across every `docker start`; start moves it onto its own
                             # by id: a container that took the name since the read is not this start's to run
                             call=lambda: docker_client.start(
-                                container_name=container_id, network=rental_network_for(container_name)
+                                container_name=container_id,
+                                network=rental_network_for(container_name),
+                                network_id=network_id,
                             ),
                             container_name=container_name,
                         )
@@ -13068,7 +13081,7 @@ class DockerService:
 
             # before any start, outside the cleanup: a refused guard leaves the pod as it was (DAH-6737)
             try:
-                await self._guard_pod_network_before_start(
+                network_id = await self._guard_pod_network_before_start(
                     docker_client=docker_client,
                     ssh_client=None,
                     network=rental_network_for(container_name),
@@ -13556,7 +13569,9 @@ class DockerService:
                         log_extra=default_extra,
                         # by id: a container that took the name since the read is not this undo's to run
                         call=lambda: docker_client.start(
-                            container_name=container_id, network=rental_network_for(container_name)
+                            container_name=container_id,
+                            network=rental_network_for(container_name),
+                            network_id=network_id,
                         ),
                         container_name=container_name,
                     )
@@ -13573,13 +13588,13 @@ class DockerService:
             container_id = await _container_id_to_start(docker_client, container_name)
             before = await docker_client.inspect_container_state(container_name=container_id)
             stopped_before = not before.running and not before.restarting
-            # before any start, outside the cleanup: a refused guard leaves the pod as it was (DAH-6737)
-            await self._guard_pod_network_before_start(
+            # before any start, outside the cleanup: a refused guard leaves the pod as it was (DAH-6737). No hold here:
+            # the edit's failure handler decides it with the reply's code (a pod our undo left down is not the host's)
+            network_id = await self._guard_pod_network_before_start(
                 docker_client=docker_client,
                 ssh_client=ssh_client,
                 network=rental_network_for(container_name),
                 default_extra=default_extra,
-                executor_uuid=executor_info.uuid,
             )
             try:
                 try:
