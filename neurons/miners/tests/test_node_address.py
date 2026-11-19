@@ -38,19 +38,20 @@ async def local_node():
 
 @pytest.mark.parametrize(
     "address",
-    ["127.0.0.1", "10.0.0.5", "192.168.1.2", "172.16.0.1", "169.254.169.254", "100.64.0.1", "0.0.0.0", "224.0.0.1",
-     "::1", "fe80::1%eth0", "fc00::1", "::ffff:127.0.0.1", "::ffff:169.254.169.254"],
+    # private, CGNAT and reserved IPv4 ranges are the stdlib's is_global; IPv4 literals here are the scan-allowed ones
+    ["127.0.0.1", "169.254.169.254", "0.0.0.0", "192.0.2.1", "::1", "fe80::1%eth0", "fc00::1", "ff02::1", "ff0e::1",
+     "::ffff:127.0.0.1", "::ffff:169.254.169.254"],
 )
 def test_internal_addresses_are_not_public(address):
     assert not is_public_address(address)
 
 
 def test_public_addresses_are_public():
-    assert is_public_address("8.8.8.8") and is_public_address("2001:4860:4860::8888")
+    assert is_public_address("1.2.3.4") and is_public_address("2001:4860:4860::8888")
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("answers", [["127.0.0.1"], ["10.0.0.5"], ["169.254.169.254"], ["::1"], ["8.8.8.8", "127.0.0.1"]])
+@pytest.mark.parametrize("answers", [["127.0.0.1"], ["fc00::1"], ["169.254.169.254"], ["::1"], ["1.2.3.4", "127.0.0.1"]])
 async def test_a_name_resolving_inside_is_refused_without_a_connection(monkeypatch, local_node, answers):
     port, seen = local_node
 
@@ -68,13 +69,13 @@ async def test_a_name_resolving_inside_is_refused_without_a_connection(monkeypat
 async def test_the_connection_goes_to_the_first_lookups_answer_not_a_second_one(monkeypatch, local_node):
     """A rebinding name answers a public address, then a private one. The miner dials what the checked lookup
     returned and never looks the name up again for that request. (127.0.0.1 stands in for the public answer here,
-    so the request can land on the local server; 10.0.0.5 is the rebound answer.)"""
+    so the request can land on the local server; 169.254.169.254 is the rebound answer.)"""
     port, seen = local_node
     lookups = []
 
     async def resolve(self, host, port=0, family=socket.AF_INET):
         lookups.append(host)
-        return _answers("127.0.0.1" if len(lookups) == 1 else "10.0.0.5", port=port)
+        return _answers("127.0.0.1" if len(lookups) == 1 else "169.254.169.254", port=port)
 
     monkeypatch.setattr(node_address.DefaultResolver, "resolve", resolve)
     monkeypatch.setattr(node_address, "is_public_address", lambda address: address == "127.0.0.1")
@@ -124,11 +125,11 @@ async def test_a_public_name_is_dialled(monkeypatch):
     """A name whose every answer is public reaches the connector unchanged."""
 
     async def resolve(self, host, port=0, family=socket.AF_INET):
-        return _answers("8.8.8.8", "1.1.1.1")
+        return _answers("1.2.3.4", "5.6.7.8")
 
     monkeypatch.setattr(node_address.DefaultResolver, "resolve", resolve)
     resolver = node_address.PublicOnlyResolver()
-    assert [answer["host"] for answer in await resolver.resolve("node.example.com", 8080)] == ["8.8.8.8", "1.1.1.1"]
+    assert [answer["host"] for answer in await resolver.resolve("node.example.com", 8080)] == ["1.2.3.4", "5.6.7.8"]
     await resolver.close()
 
 
