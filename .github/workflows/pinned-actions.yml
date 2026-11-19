@@ -23,35 +23,74 @@ jobs:
           python3 -m venv /tmp/venv
           /tmp/venv/bin/pip install -q pyyaml==6.0.3
           /tmp/venv/bin/python - <<'PY'
-          import pathlib, re, subprocess, sys, yaml
-          # every tracked action manifest, wherever it lives: `uses: ./any/dir` runs that dir's action.yml
-          actions = subprocess.run(["git", "ls-files", "-z", ":(glob)**/action.yml", ":(glob)**/action.yaml"], capture_output=True, text=True, check=True).stdout.split("\0")
-          files = sorted(pathlib.Path(".github/workflows").glob("*.y*ml")) + sorted(pathlib.Path(a) for a in actions if a)
+          import pathlib, re, subprocess, sys, tempfile, yaml
+
+          class Loader(yaml.SafeLoader):
+              """GitHub's YAML: only true/false are booleans (PyYAML's 1.1 rules make yes/on/no/off booleans too,
+              so the job IDs yes and on both became True and one job replaced the other), and a repeated key is
+              an error, not a silent replacement."""
+              def construct_mapping(self, node, deep=False):
+                  keys = [self.construct_object(k, deep=deep) for k, _ in node.value]
+                  dup = {repr(k) for k in keys if keys.count(k) > 1}
+                  if dup:
+                      raise yaml.constructor.ConstructorError(None, None, f"duplicate key(s) {', '.join(sorted(dup))}", node.start_mark)
+                  return super().construct_mapping(node, deep=deep)
+          Loader.yaml_implicit_resolvers = {
+              ch: [(tag, rx) for tag, rx in rs if tag != "tag:yaml.org,2002:bool"]
+              for ch, rs in yaml.SafeLoader.yaml_implicit_resolvers.items()
+          }
+          for ch in "tTfF":
+              Loader.yaml_implicit_resolvers.setdefault(ch, []).insert(0, ("tag:yaml.org,2002:bool", re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")))
+
           digest = r"docker://[^@\s]+@sha256:[0-9a-f]{64}"
           pinned = re.compile(rf"(?!docker://)[^@\s]+@[0-9a-f]{{40}}|{digest}")
           # the runner reads the scheme case-insensitively, so DOCKER:// must not slip past the checks
           norm = lambda ref: re.sub(r"^docker://", "docker://", str(ref), flags=re.I)
-          bad = []
-          for path in files:
-              doc = yaml.safe_load(path.read_text()) or {}
-              jobs = list((doc.get("jobs") or {}).values())
-              runs = doc.get("runs") or {}
-              steps = [step for job in jobs for step in job.get("steps") or []] + list(runs.get("steps") or [])
-              for ref in [job.get("uses") for job in jobs] + [step.get("uses") for step in steps]:
-                  if ref is not None and not str(ref).startswith("./") and not pinned.fullmatch(norm(ref)):
-                      bad.append(f"{path}: {ref}")
-              # a Docker action's image: a registry image needs a digest; a local Dockerfile path is reviewed in-repo
-              image = runs.get("image")
-              if image is not None and norm(image).startswith("docker://") and not re.fullmatch(digest, norm(image)):
-                  bad.append(f"{path}: runs.image {image}")
-              # job containers and services start before the steps, with the job's token: digest only
-              for job in jobs:
-                  container = job.get("container")
-                  images = [container.get("image") if isinstance(container, dict) else container]
-                  images += [(svc or {}).get("image") for svc in (job.get("services") or {}).values()]
-                  for img in images:
-                      if img and not re.fullmatch(digest, "docker://" + re.sub(r"^docker://", "", str(img), flags=re.I)):
-                          bad.append(f"{path}: container/service image {img}")
+
+          def scan(files):
+              bad = []
+              for path in files:
+                  try:
+                      doc = yaml.load(path.read_text(), Loader=Loader) or {}
+                  except yaml.YAMLError as e:
+                      bad.append(f"{path}: not checkable: {e}".replace("\n", " "))
+                      continue
+                  jobs = list((doc.get("jobs") or {}).values())
+                  runs = doc.get("runs") or {}
+                  steps = [step for job in jobs for step in job.get("steps") or []] + list(runs.get("steps") or [])
+                  for ref in [job.get("uses") for job in jobs] + [step.get("uses") for step in steps]:
+                      if ref is not None and not str(ref).startswith("./") and not pinned.fullmatch(norm(ref)):
+                          bad.append(f"{path}: {ref}")
+                  # a Docker action's image: a registry image needs a digest; a local Dockerfile path is reviewed in-repo
+                  image = runs.get("image")
+                  if image is not None and norm(image).startswith("docker://") and not re.fullmatch(digest, norm(image)):
+                      bad.append(f"{path}: runs.image {image}")
+                  # job containers and services start before the steps, with the job's token: digest only
+                  for job in jobs:
+                      container = job.get("container")
+                      images = [container.get("image") if isinstance(container, dict) else container]
+                      images += [(svc or {}).get("image") for svc in (job.get("services") or {}).values()]
+                      for img in images:
+                          if img and not re.fullmatch(digest, "docker://" + re.sub(r"^docker://", "", str(img), flags=re.I)):
+                              bad.append(f"{path}: container/service image {img}")
+              return bad
+
+          # regression self-test: job IDs yes/on stay two jobs, and a repeated job ID is refused, before the real scan
+          sha = "a" * 40
+          cases = {
+              "jobs:\n  yes:\n    steps:\n      - uses: acme/act@v1\n  on:\n    steps:\n      - uses: acme/act@" + sha + "\n": 1,
+              "jobs:\n  a:\n    steps:\n      - uses: acme/act@v1\n  a:\n    steps:\n      - uses: acme/act@" + sha + "\n": 1,
+              "jobs:\n  yes:\n    steps:\n      - uses: acme/act@" + sha + "\n  on:\n    steps:\n      - uses: acme/act@" + sha + "\n": 0,
+          }
+          with tempfile.TemporaryDirectory() as d:
+              for i, (text, want) in enumerate(cases.items()):
+                  f = pathlib.Path(d, f"case{i}.yml"); f.write_text(text)
+                  assert len(scan([f])) == want, (i, scan([f]))
+
+          # every tracked action manifest, wherever it lives: `uses: ./any/dir` runs that dir's action.yml
+          actions = subprocess.run(["git", "ls-files", "-z", ":(glob)**/action.yml", ":(glob)**/action.yaml"], capture_output=True, text=True, check=True).stdout.split("\0")
+          files = sorted(pathlib.Path(".github/workflows").glob("*.y*ml")) + sorted(pathlib.Path(a) for a in actions if a)
+          bad = scan(files)
           print("\n".join(bad) or f"all pinned ({len(files)} files)")
           sys.exit(1 if bad else 0)
           PY
