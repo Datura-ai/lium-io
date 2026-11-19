@@ -599,3 +599,47 @@ def test_a_hung_volume_write_holds_up_neither_the_refreshes_nor_the_newest_state
     # the stalled write of the older state landed first; the newest state was written after it, never before
     assert written[-1] == new_owner.ss58_address
     assert _state(tmp_path)["held"] == new_owner.ss58_address
+
+
+def test_a_stalled_volume_does_not_hold_up_the_start(tmp_path, monkeypatch, owner, new_validator):
+    # load picks the trusted key in memory and leaves the write to the writer the refresh loop starts
+    _keep(tmp_path, owner, _signed(owner, new_validator, 3))
+    monkeypatch.setattr(trust_service, "_write_json", lambda path, data: pytest.fail("written during the start"))
+
+    trust = _trust(tmp_path, owner)
+
+    assert (trust.held.validator, trust._unsaved) == (new_validator.ss58_address, True)
+
+
+def test_a_shutdown_right_after_a_new_revision_writes_it_first(tmp_path, owner, old_validator, new_validator):
+    trust = _trust(tmp_path, owner)
+    assert trust.offer(_signed(owner, old_validator, 1))
+
+    async def run():
+        writer = trust.start_persisting()
+        await asyncio.sleep(0.05)
+        assert trust.offer(_signed(owner, new_validator, 2))  # accepted; the writer has not had a turn yet
+        await trust.stop_persisting(writer)
+        return writer.done()
+
+    assert asyncio.run(run())
+    assert _state(tmp_path)["messages"][owner.ss58_address]["message"] == trust_line(new_validator.ss58_address, 2)
+
+
+def test_a_hung_volume_at_shutdown_ends_the_wait(tmp_path, monkeypatch, owner, new_validator):
+    import threading
+
+    trust = _trust(tmp_path, owner)
+    monkeypatch.setattr(trust_service, "FLUSH_SECONDS", 0.2)
+    release = threading.Event()
+    monkeypatch.setattr(trust_service, "_write_json", lambda path, data: release.wait(5))
+
+    async def run():
+        writer = trust.start_persisting()
+        trust.offer(_signed(owner, new_validator, 1))
+        started = asyncio.get_running_loop().time()
+        await trust.stop_persisting(writer)
+        release.set()
+        return asyncio.get_running_loop().time() - started
+
+    assert asyncio.run(run()) < 1

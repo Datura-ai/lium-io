@@ -56,6 +56,8 @@ OWNER_REFRESH_SECONDS = 3600
 # each request as a whole (connect, headers and body), so a server that answers slowly cannot hold the loop
 FETCH_TIMEOUT_SECONDS = 5.0
 FETCH_LIMIT_BYTES = 64 * 1024
+# the shutdown waits this long for the last state write; well inside the pod's termination grace
+FLUSH_SECONDS = 5.0
 
 
 async def fetch_json(url: str, body: dict | None = None) -> dict | None:
@@ -117,6 +119,8 @@ class ValidatorTrust:
         self._unsaved = False
         # set by start_persisting: changes are written by its task, off the event loop, never by the caller
         self._wake: asyncio.Event | None = None
+        # set at shutdown: the writer writes the newest state once more, then ends
+        self._stopping = False
 
     def load(self) -> None:
         """At start: the kept state (owner, held owner, messages) and the image copy, signed by the owner at release."""
@@ -146,7 +150,9 @@ class ValidatorTrust:
             except Exception as exc:
                 logger.warning("Validator trust: kept message refused: %s", exc)
         self.held_owner = held_owner
-        self._select()
+        # chosen in memory before the first request; written by the writer once the refresh loop starts it, so a
+        # stalled volume never holds up the start
+        self._select(save=False)
         logger.info("Validator trust at start: %s", self.report())
 
     def _remember(self, trusted: TrustedValidator, signed: SignedTrustMessage, signer: str) -> bool:
@@ -157,7 +163,7 @@ class ValidatorTrust:
         self.messages[signer] = (trusted, signed)
         return True
 
-    def _select(self) -> None:
+    def _select(self, save: bool = True) -> None:
         """Hold the current owner's message; without one, the held owner's (what this node last trusted), else the
         image copy's. Run at start and after every owner change."""
         for signer in (self.owner, self.held_owner, RELEASE_SUBNET_OWNER_HOTKEY):
@@ -165,14 +171,17 @@ class ValidatorTrust:
                 break
         else:
             return
-        self._hold(signer)
+        self._hold(signer, save)
 
-    def _hold(self, signer: str) -> None:
+    def _hold(self, signer: str, save: bool = True) -> None:
         trusted = self.messages[signer][0]
         if (trusted, signer) != (self.held, self.held_owner):
             self.held, self.held_owner = trusted, signer
             logger.warning("Validator trust: now trusting %s (revision %d)", trusted.validator, trusted.revision)
-        self._save()
+        if save:
+            self._save()
+        else:
+            self._unsaved = True
 
     def offer(self, signed: SignedTrustMessage) -> bool:
         """Take a served message: signed by the current owner, and a higher revision than that owner's highest."""
@@ -215,7 +224,7 @@ class ValidatorTrust:
         and runs in a worker thread, one at a time: a change made during a write is written after it, so an older
         state never replaces a newer one, and a slow or hung volume holds up only the file, never the refreshes. A
         failed write is retried at the next refresh."""
-        self._wake = asyncio.Event()
+        self._wake, self._stopping = asyncio.Event(), False
         if self._unsaved:
             self._wake.set()
         return asyncio.create_task(self._persist())
@@ -225,14 +234,30 @@ class ValidatorTrust:
             while True:
                 await self._wake.wait()
                 self._wake.clear()
-                state, self._unsaved = self._state(), False
-                try:
-                    await asyncio.to_thread(_write_json, self.state_dir / STATE_FILE, state)
-                except OSError as exc:
-                    self._unsaved = True
-                    logger.warning("Validator trust: state not kept on disk yet: %s", exc)
+                # read before the write: a stop asked during it gets one more turn, which writes the newer state
+                stopping = self._stopping
+                if self._unsaved:
+                    state, self._unsaved = self._state(), False
+                    try:
+                        await asyncio.to_thread(_write_json, self.state_dir / STATE_FILE, state)
+                    except OSError as exc:
+                        self._unsaved = True
+                        logger.warning("Validator trust: state not kept on disk yet: %s", exc)
+                if stopping:
+                    return
         finally:
             self._wake = None
+
+    async def stop_persisting(self, writer: asyncio.Task) -> None:
+        """At shutdown: the newest state reaches the volume before the writer ends (a key switched in memory is
+        never lost to a restart), within FLUSH_SECONDS so a hung volume cannot hold up the shutdown."""
+        if self._wake is not None:
+            self._stopping = True
+            self._wake.set()
+        try:
+            await asyncio.wait_for(writer, FLUSH_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning("Validator trust: state not written within %ss of shutdown", FLUSH_SECONDS)
 
     def hotkeys(self, baked: dict[str, str]) -> dict[str, str]:
         """Key id -> ss58 the executor accepts signatures from: the signed validator alone, else `baked`."""
@@ -309,4 +334,4 @@ async def run_validator_trust_refresh() -> None:
             await validator_trust.refresh_message()
             await asyncio.sleep(MESSAGE_REFRESH_SECONDS)
     finally:
-        writer.cancel()
+        await validator_trust.stop_persisting(writer)
