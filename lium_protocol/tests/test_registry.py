@@ -45,3 +45,14 @@ def test_a_refused_message_never_carries_the_input_into_the_error() -> None:
     assert all("input" not in e and "url" not in e for e in errors)
 
 
+def test_an_idle_only_reset_keeps_its_mark_through_a_round_trip() -> None:
+    # 2.17.0: a consumer that parses through VALIDATOR_MESSAGES tells an idle-only reset from an unconditional one
+    from lium_protocol.validator_to_backend import VALIDATOR_MESSAGES, ResetVerifiedJobRequest
+
+    sent = ResetVerifiedJobRequest(validator_hotkey="v", miner_hotkey="m", executor_uuid="e", unrented_only=True)
+    parsed = VALIDATOR_MESSAGES.parse(sent.model_dump_json())
+    assert isinstance(parsed, ResetVerifiedJobRequest) and parsed.unrented_only is True
+    older = VALIDATOR_MESSAGES.parse(
+        '{"message_type":"ResetVerifiedJobRequest","validator_hotkey":"v","miner_hotkey":"m","executor_uuid":"e"}'
+    )
+    assert older.unrented_only is False
