@@ -280,6 +280,7 @@ jobs:
         run: echo "::error::a package test job or ruff failed (see tests-ok)" && exit 1
       - name: deferred to the merge queue
         if: github.event_name != 'merge_group' && vars.MERGE_QUEUE_ENABLED == 'true'
+        working-directory: ${{ github.workspace }}
         run: echo "e2e gate runs in the merge queue for this tree"
       - uses: actions/checkout@v4
         if: (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
