@@ -255,6 +255,8 @@ class ExpressLane:
 
     async def tick(self) -> int:
         """One pass: discover, select under the caps, launch. Returns how many were launched."""
+        # DAH-6740: every upload this validator signs reads the owner map, so it refreshes even when no wave runs
+        await self.portal_api.refresh_owner_hotkeys()
         inputs = self.cycle_inputs()
         if inputs is None:
             return 0

@@ -614,3 +614,19 @@ async def test_backend_calls_sign_the_whole_request(reset_session, method, path,
     message = BackendClient.signed_request_message(method, path, body, headers["timestamp"])
     assert headers["hotkey"] == keypair.ss58_address
     assert keypair.verify(message, bytes.fromhex(headers["signature"].removeprefix("0x")))
+
+
+@pytest.mark.asyncio
+async def test_check_executor_health_sends_the_portals_owner_hotkeys_for_the_listing(client, monkeypatch):
+    # DAH-6740: the backend signs its health-check key for these, as the validator's own uploads do
+    from clients import validator_portal_api
+
+    monkeypatch.setattr(validator_portal_api, "_owner_hotkeys", {})
+    validator_portal_api.remember_owner_hotkeys({"hotkey": ["5OwnerB", "5OwnerA"]})
+    with patch.object(client, "_signed_request", new=AsyncMock(return_value=None)) as signed:
+        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001)
+        await client.check_executor_health("1.2.3.4", 8001, "another", 9001)
+
+    owned, other = (call.kwargs["json_data"] for call in signed.await_args_list)
+    assert owned["owner_hotkeys"] == ["5OwnerA", "5OwnerB"]
+    assert "owner_hotkeys" not in other

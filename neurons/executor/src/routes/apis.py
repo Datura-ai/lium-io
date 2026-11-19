@@ -288,8 +288,9 @@ def _owner_set_signed(payload: UploadSShKeyPayload, own_hotkey: str) -> bool:
     """DAH-6740: the validator also signed this key for this node's own hotkey as one of the listing owner's.
 
     Only the own hotkey counts here: the pool hotkey is accepted by every pool node, so signing it for an own-key
-    listing would bind the key to nothing. The validator signs only hotkeys the listing's miner reported for its own
-    nodes, and an upload needs this node's own or the central miner's auth (MinerMiddleware).
+    listing would bind the key to nothing. The validator (and the backend's health check, on the validator's word) signs
+    only the hotkeys the portal itself names for the listing's owner, never what a miner reports, and an upload needs
+    this node's own or the central miner's auth (MinerMiddleware).
     """
     signature = (payload.owner_hotkey_signatures or {}).get(own_hotkey)
     if not own_hotkey or not signature:

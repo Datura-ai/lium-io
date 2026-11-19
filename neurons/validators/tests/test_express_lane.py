@@ -258,7 +258,9 @@ class _Harness:
             "miner_coldkey": payload.miner_coldkey,
             "results": [_job_result(executor_id, job_batch_id=payload.job_batch_id)],
         }
-        self.portal_api = Mock(get_all_executors=AsyncMock(return_value=snapshot))
+        self.portal_api = Mock(
+            get_all_executors=AsyncMock(return_value=snapshot), refresh_owner_hotkeys=AsyncMock(return_value=True)
+        )
         self.inputs: CycleInputs | None = _cycle_inputs()
         self.lane = ExpressLane(
             miner_service=self.miner_service,

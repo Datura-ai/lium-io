@@ -147,12 +147,8 @@ async def test_the_nonce_create_task_gets_equals_the_nonce_sent(rest_miner_servi
 
 
 # --- DAH-6740: the key is also signed for each other hotkey of the listing owner, as the portal lists them -------
-
-
-def _portal(node_id, hotkeys):
-    from clients.validator_portal_api import PortalExecutor
-
-    return PortalExecutor(id=node_id, validator_hotkey="v", node_hotkeys=hotkeys)
+# The portal's GET /miners/owner-hotkeys answers {own-key listing hotkey: [the own hotkeys of the owner's other
+# accounts]}, complete on every call (no age cutoff), only for listings that have some.
 
 
 @pytest.fixture
@@ -169,26 +165,76 @@ def test_the_portals_owner_hotkeys_are_each_signed(miner_service, validator_keyp
     nonce = "ab" * 32
     assert miner_service._owner_hotkey_signatures(validator_keypair, _SSH_KEY, nonce, "listing") is None
 
-    portal_owners.remember_owner_hotkeys({"listing": [_portal("n1", ["listing", "5Old"]), _portal("n2", ["5Old", "listing"])]})
+    assert portal_owners.remember_owner_hotkeys({"listing": ["5Old"], "other": ["5Else"]})
     signatures = miner_service._owner_hotkey_signatures(validator_keypair, _SSH_KEY, nonce, "listing")
 
     assert list(signatures) == ["5Old"]
     assert validator_keypair.verify(ssh_pubkey_signing_blob(_SSH_KEY, nonce, "5Old"), signatures["5Old"])
 
 
-@pytest.mark.parametrize(
-    "nodes",
-    [
-        # nodes of two owners under one listing (the pool): no owner's hotkeys are lent to the other's nodes
-        [_portal("n1", ["listing", "5OwnerA"]), _portal("n2", ["listing", "5OwnerB"])],
-        [_portal("n1", ["listing", "5Old"]), _portal("n2", None)],
-        [_portal("n1", ["listing"] + [f"5Key{i}" for i in range(17)])],
-    ],
-)
-def test_a_listing_without_one_bounded_owner_set_signs_nothing(miner_service, validator_keypair, portal_owners, nodes):
-    portal_owners.remember_owner_hotkeys({"listing": nodes})
+def test_each_answer_replaces_the_map_whole_and_a_bad_one_keeps_it(miner_service, validator_keypair, portal_owners):
+    """Complete answers: an older node keeps its owner across consecutive reads, and a removed link stops counting at
+    the next read. A malformed answer is ignored, not applied."""
+    portal_owners.remember_owner_hotkeys({"listing": ["5Old"]})
+    portal_owners.remember_owner_hotkeys({"listing": ["5Old"]})
+    assert portal_owners.portal_owner_hotkeys("listing") == {"5Old"}
+
+    assert not portal_owners.remember_owner_hotkeys({"listing": "5Old"})
+    assert not portal_owners.remember_owner_hotkeys(["listing"])
+    assert portal_owners.portal_owner_hotkeys("listing") == {"5Old"}
+
+    portal_owners.remember_owner_hotkeys({})
+    assert miner_service._owner_hotkey_signatures(validator_keypair, _SSH_KEY, None, "listing") is None
+
+
+def test_an_oversized_owner_set_signs_nothing(miner_service, validator_keypair, portal_owners):
+    portal_owners.remember_owner_hotkeys({"listing": [f"5Key{i}" for i in range(17)]})
 
     assert miner_service._owner_hotkey_signatures(validator_keypair, _SSH_KEY, None, "listing") is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_reads_the_portal_and_a_failed_read_keeps_the_last_answer(portal_owners, monkeypatch):
+    from clients.validator_portal_api import ValidatorPortalAPI
+
+    answers = [(200, {"listing": ["5Old"]}), (503, None)]
+
+    class _Response:
+        def __init__(self, status, body):
+            self.status, self._body = status, body
+
+        async def json(self):
+            return self._body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Session:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get(self, url, headers):
+            assert url == "https://portal.test/miners/owner-hotkeys" and headers["signature"].startswith("0x")
+            return _Response(*answers.pop(0))
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(portal_owners.settings, "MINER_PORTAL_REST_API_URL", "https://portal.test/")
+    monkeypatch.setattr(portal_owners.aiohttp, "ClientSession", _Session)
+    keypair = bittensor.Keypair.create_from_uri("//Validator")
+    monkeypatch.setattr(type(portal_owners.settings), "get_bittensor_wallet",
+                        lambda self: SimpleNamespace(get_hotkey=lambda: keypair))
+
+    assert await ValidatorPortalAPI.refresh_owner_hotkeys()
+    assert not await ValidatorPortalAPI.refresh_owner_hotkeys()
+    assert portal_owners.portal_owner_hotkeys("listing") == {"5Old"}
 
 
 @pytest.mark.asyncio
@@ -200,7 +246,7 @@ async def test_a_hotkey_only_the_miner_reports_gets_no_signature(rest_miner_serv
     from fixtures.rest_miner_fixtures import executor_info
 
     _subtensor(monkeypatch, axon_versions={"miner-a": MIN_DATED_NONCE_MINER_AXON_VERSION})
-    portal_owners.remember_owner_hotkeys({"miner-a": [_portal("exec-1", ["miner-a", "5PortalOld"])]})
+    portal_owners.remember_owner_hotkeys({"miner-a": ["5PortalOld"]})
     reported = executor_info("exec-1").model_copy(update={"expected_node_hotkeys": ["miner-a", "5Victim"]})
     submitted = []
 

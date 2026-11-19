@@ -26,8 +26,6 @@ class PortalExecutor(BaseModel):
     # The portal stamps rows with a naive datetime.utcnow(); registration → AVAILABLE is measured
     # from here, so it is read as UTC.
     created_at: datetime | None = None
-    # DAH-6740: the hotkeys of the listing owner's accounts this node may be set up under (portal-computed)
-    node_hotkeys: list[str] | None = None
 
     @field_validator("created_at")
     @classmethod
@@ -37,27 +35,32 @@ class PortalExecutor(BaseModel):
         return value
 
 
-# DAH-6740: per listing hotkey, the other hotkeys of its owner's accounts, from this validator's own read of the portal
-# snapshot (never from what a miner reports: a miner could then have keys signed for hotkeys it names). Refreshed by
-# every successful get_all_executors; the express lane fetches it every tick.
+# DAH-6740: per own-key listing hotkey, the own hotkeys of its owner's other accounts, from this validator's own read of
+# the portal's /miners/owner-hotkeys (never from what a miner reports: a miner could then have keys signed for hotkeys
+# it names). That answer is complete on every call, so each one replaces this copy whole (a removed link stops counting);
+# a failed read keeps the last answer. Filled by ValidatorPortalAPI.refresh_owner_hotkeys, which the express lane calls
+# every tick.
 _owner_hotkeys: dict[str, frozenset[str]] = {}
 # bounds the signatures one upload carries; an owner has a few accounts, not dozens
 MAX_OWNER_HOTKEYS = 16
 
 
-def remember_owner_hotkeys(snapshot: Mapping[str, list[PortalExecutor]]) -> None:
-    """A listing gets an owner set only when every one of its nodes carries the same one. A key is signed per listing,
-    not per node, so a listing holding nodes of several owners (the pool) must not lend one owner's hotkeys to all."""
-    owners = {}
-    for listing, executors in snapshot.items():
-        sets = {frozenset(executor.node_hotkeys or ()) for executor in executors}
-        if len(sets) != 1:
-            continue
-        hotkeys = sets.pop() - {listing}
-        if hotkeys and len(hotkeys) <= MAX_OWNER_HOTKEYS:
-            owners[listing] = hotkeys
+def remember_owner_hotkeys(answer: object) -> bool:
+    """Replace the owner map with the portal's answer ({listing hotkey: [hotkeys]}); False, keeping the map, when the
+    answer is not that shape. An entry over MAX_OWNER_HOTKEYS gets no signatures at all."""
+    if not isinstance(answer, dict) or not all(
+        isinstance(listing, str) and isinstance(hotkeys, list) and all(isinstance(h, str) for h in hotkeys)
+        for listing, hotkeys in answer.items()
+    ):
+        return False
+    owners = {
+        listing: frozenset(hotkeys) - {listing}
+        for listing, hotkeys in answer.items()
+        if len(set(hotkeys)) <= MAX_OWNER_HOTKEYS
+    }
     _owner_hotkeys.clear()
-    _owner_hotkeys.update(owners)
+    _owner_hotkeys.update({listing: hotkeys for listing, hotkeys in owners.items() if hotkeys})
+    return True
 
 
 def portal_owner_hotkeys(listing_hotkey: str) -> frozenset[str]:
@@ -243,12 +246,10 @@ class ValidatorPortalAPI:
                     data = await response.json()
             if not isinstance(data, dict):
                 raise ValueError(f"unexpected portal bulk response shape: {type(data).__name__}")
-            snapshot = {
+            return {
                 miner_hotkey: [PortalExecutor.model_validate(item) for item in executors]
                 for miner_hotkey, executors in data.items()
             }
-            remember_owner_hotkeys(snapshot)
-            return snapshot
         except Exception as exc:
             logger.error(
                 _m(
@@ -257,3 +258,32 @@ class ValidatorPortalAPI:
                 )
             )
             return None
+
+    @staticmethod
+    async def refresh_owner_hotkeys() -> bool:
+        """DAH-6740: replace the owner map with the portal's /miners/owner-hotkeys; False (map kept) on any failure."""
+        api_base = settings.MINER_PORTAL_REST_API_URL.rstrip("/") if settings.MINER_PORTAL_REST_API_URL else ""
+        if not api_base:
+            return False
+        url = f"{api_base}/miners/owner-hotkeys"
+        try:
+            keypair: bittensor.Keypair = settings.get_bittensor_wallet().get_hotkey()
+            timestamp = int(time.time())
+            headers = {
+                "hotkey": keypair.ss58_address,
+                "timestamp": str(timestamp),
+                "signature": f"0x{keypair.sign(portal_miner_auth_blob(keypair.ss58_address, timestamp)).hex()}",
+            }
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+                async with session.get(url, headers=headers) as response:
+                    if response.status != 200:
+                        raise ValueError(f"status {response.status}")
+                    answer = await response.json()
+            if not remember_owner_hotkeys(answer):
+                raise ValueError("unexpected owner-hotkeys response shape")
+            return True
+        except Exception as exc:
+            logger.warning(
+                _m("Owner hotkeys not refreshed from portal", extra=get_extra_info({"url": url, "error": str(exc)}))
+            )
+            return False
