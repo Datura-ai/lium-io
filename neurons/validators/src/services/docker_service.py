@@ -2019,7 +2019,9 @@ class _EditSwap:
         # set once the reply went to the backend: from then on the edit stands, whatever ends the
         # steps after the reply (a delete's wait timing out cancels them)
         self.replacement_is_up = False
-        self.restored_running = False
+        # what Docker reports for the pod after a failed edit's undo (DAH-6737): "running", "down" or "unknown". Only
+        # "down" lets the failure reply carry the no-billing host-fault code; set by __aexit__
+        self.pod_state_after_undo = "unknown"
         # The replacement's own Docker ID, once `docker run` returned it. The undo removes by this ID:
         # a concurrent retry may hold the pod name by then, and removing by name would delete it.
         self.replacement_id: str | None = None
@@ -2315,6 +2317,26 @@ class _EditSwap:
         finally:
             # after the parked container is gone or renamed back, never before
             await self._record_parked(False)
+            # read only where it decides the reply's code: a guard refusal is the one failure that can be a host fault
+            if isinstance(_last_attempt_exception(exc), RentalEgressGuardRefused) and not self.replacement_is_up:
+                self.pod_state_after_undo = await self._observed_pod_state()
+
+    async def _observed_pod_state(self) -> str:
+        """What Docker reports for the pod after a failed edit, by its own name and its parked name: "running" when
+        a container of the pod runs (or restarts), "down" when Docker answered and none does, "unknown" when it
+        could not be read. Read, not inferred from the undo's steps: a stop that could not be confirmed leaves it
+        maybe running, and an entrypoint can exit after Docker acknowledged the start (DAH-6737)."""
+        names = [n for n in (self.container_name, self.parked_name) if n]
+        filters = " ".join(f"--filter name=^{shlex.quote(n)}$" for n in names)
+        try:
+            listed = await self._run(
+                f"/usr/bin/docker ps --format '{{{{.Names}}}}' --filter status=running --filter status=restarting {filters}"
+            )
+        except Exception:  # noqa: BLE001 — unread is unknown, never down
+            return "unknown"
+        if listed.exit_status != 0:
+            return "unknown"
+        return "running" if (listed.stdout or "").strip() else "down"
 
     async def _finish(self, exc) -> bool:
         # Nothing here may change the create's own outcome: the cleanup and the undo are best effort,
@@ -2411,8 +2433,6 @@ class _EditSwap:
             if started.exit_status != 0:
                 error = f"docker start: {(started.stderr or '').strip()}"
         extra = get_extra_info({**self.default_extra, "parked": self.parked_name, "restored": error is None})
-        # the renter's pod runs again: a failed edit is then no host outage for billing (DAH-6737)
-        self.restored_running = start and error is None
         if error is None:
             logger.warning(_m("Edit failed; the pod's previous container was restored", extra=extra))
         else:
@@ -12510,11 +12530,11 @@ class DockerService:
                     if container_vanished
                     else FailedContainerErrorCodes.RentingInProgress
                     if isinstance(e, _FillerRefusedForCustomerCreate)
-                    # refused before `docker run` and no earlier container of the pod brought back: nothing of
-                    # it runs on the node (DAH-6737); a restored one runs and stays billed
+                    # refused before `docker run`, and Docker reports no container of the pod running: nothing of
+                    # it runs on the node (DAH-6737); one that runs, or a state that could not be read, stays billed
                     else FailedContainerErrorCodes.ExecutorUnreachable
                     if isinstance(last_exc, RentalEgressGuardRefused)
-                    and not (edit_swap is not None and edit_swap.restored_running)
+                    and (edit_swap is None or edit_swap.pod_state_after_undo == "down")
                     else FailedContainerErrorCodes.UnknownError
                 ),
                 failure_step=current_step,
@@ -13541,7 +13561,9 @@ class DockerService:
                     ):
                         raise
                     await _start()
-                await self._restore_mount_and_sshd_after_start(
+                # a pod the renter cannot reach is no restored pod: put back down below, so it is neither left
+                # up unreachable nor billed (DAH-6737)
+                if not await self._restore_mount_and_sshd_after_start(
                     docker_client=docker_client,
                     ssh_client=ssh_client,
                     container_name=container_id,
@@ -13550,7 +13572,8 @@ class DockerService:
                     default_extra=default_extra,
                     remount=remount,
                     record_start=stopped_before,
-                )
+                ):
+                    raise RuntimeError("started, but its SSH bootstrap did not complete")
             except (asyncio.CancelledError, Exception):
                 # a start that lands after the cancel would leave the pod up without its remount: drained and put
                 # back down before the lock is released, like start_existing_container
@@ -13581,13 +13604,13 @@ class DockerService:
         default_extra: dict[str, Any],
         remount: bool = True,
         record_start: bool = False,
-    ) -> None:
+    ) -> bool:
         """What a bare ``docker start`` drops: the gocryptfs plaintext mount (remounted with
         ``allow_init=False`` — an existing volume is never re-initialised) and the sshd. Shared by
         ``start_existing_container`` and the undo of a failed edit. ``remount=False`` (a kept container that
         ran unmounted, its files in its own layer) skips the remount, which would hide them. ``record_start``: the
         caller saw the container stopped before its own start, so this start is the validator's (a no-op start of a
-        running container, or a remount alone, records nothing)."""
+        running container, or a remount alone, records nothing). True when the SSH bootstrap completed."""
         encrypted_volume_name = remount and await self._encrypted_local_volume_name(
             docker_client,
             container_name,
@@ -13643,6 +13666,7 @@ class DockerService:
                 ),
             ),
         )
+        return ssh_bootstrap_ok
 
     async def recover_pod_after_stale_vloopback_mount(
         self,

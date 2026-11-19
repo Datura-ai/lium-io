@@ -4164,6 +4164,7 @@ async def test_a_pending_stop_retry_waits_for_an_edit_undo_bringing_the_pod_back
     async def remount_after_start(**kwargs):
         in_undo.set()
         await release.wait()
+        return True  # its SSH bootstrap completed
 
     docker_service._restore_mount_and_sshd_after_start = remount_after_start
     undo = asyncio.create_task(
@@ -4337,6 +4338,7 @@ async def test_a_pending_stop_retry_in_one_process_waits_for_the_other_process_b
     async def remount(**kwargs):
         in_bring_up.set()
         await release.wait()
+        return True  # its SSH bootstrap completed
 
     connector._restore_mount_and_sshd_after_start = remount
     bring_up = asyncio.create_task(_hold_pod(connector, holder, client))

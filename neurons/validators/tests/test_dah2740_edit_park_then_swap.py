@@ -79,7 +79,7 @@ def _kept(payload) -> str:
     return f"kept_unmounted_{payload.pod_id}_{_PARKED_AT}"
 
 
-def _ssh_recording(*, container_present: bool = True, stop_exit: int = 0, rename_back_exit: int = 0, listed_with_ids: bool = True, kill_stops: bool = False):
+def _ssh_recording(*, container_present: bool = True, stop_exit: int = 0, rename_back_exit: int = 0, listed_with_ids: bool = True, kill_stops: bool = False, after_undo: str = "running"):
     """An ssh mock that answers docker like a host with (or without) the pod's container, recording every command."""
     client = AsyncMock()
     client.image_exists_result = True
@@ -98,6 +98,10 @@ def _ssh_recording(*, container_present: bool = True, stop_exit: int = 0, rename
             names = [n for n in names if not n.startswith("kept_unmounted_")]
             present = kept + [n for n in names if (n.endswith(EDIT_PARKED_SUFFIX) and client.parked_present) or (not n.endswith(EDIT_PARKED_SUFFIX) and container_present)]
             return _ssh_result(stdout="".join(f"{n} id-{n}\n" if listed_with_ids else f"{n}\n" for n in present))
+        if "docker ps --format" in cmd and "--filter status=running" in cmd:  # what runs of the pod after a failed edit
+            if after_undo == "unreadable":
+                return _ssh_result(exit_status=1, stderr="Cannot connect to the Docker daemon")
+            return _ssh_result(stdout="pod\n" if after_undo == "running" else "")
         if "/usr/bin/docker diff" in cmd:  # the park's layer read: no renter files under the volume path
             return _ssh_result(stdout="drop\n")
         if "/proc/$p/mountinfo" in cmd:  # the park's mount read: the plaintext path is not mounted
@@ -364,25 +368,36 @@ async def test_a_failed_edit_restores_the_previous_container(svc, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("present", "error", "restore_fails", "code"),
+    ("present", "error", "restore_fails", "after_undo", "code"),
     [
-        (False, "guard", False, "ExecutorUnreachable"),  # nothing of the pod on the node: no host-fault charge
-        (True, "guard", False, "UnknownError"),  # the original pod was brought back running: still billed
-        (True, "guard", True, "ExecutorUnreachable"),  # the undo failed too: nothing of the pod runs
-        (True, "ordinary", False, "UnknownError"),
+        (False, "guard", False, "down", "ExecutorUnreachable"),  # nothing of the pod on the node: no host-fault charge
+        (True, "guard", False, "running", "UnknownError"),  # the original pod was brought back running: still billed
+        (True, "guard", True, "down", "ExecutorUnreachable"),  # the undo failed too and Docker reports it down
+        (True, "guard", True, "running", "UnknownError"),  # the undo failed but the pod may still run: still billed
+        (True, "guard", False, "down", "ExecutorUnreachable"),  # brought back, then it exited: not billed
+        (True, "guard", True, "unreadable", "UnknownError"),  # an unread state is never taken as down
+        (True, "ordinary", False, "running", "UnknownError"),
     ],
-    ids=["absent_guard", "restored_guard", "restore_failed_guard", "restored_ordinary"],
+    ids=[
+        "absent_guard",
+        "restored_guard",
+        "restore_failed_guard",
+        "restore_failed_still_running",
+        "restored_then_exited",
+        "state_unreadable",
+        "restored_ordinary",
+    ],
 )
 @pytest.mark.asyncio
 async def test_a_reboot_the_guard_refused_is_a_host_fault_only_while_no_container_of_the_pod_runs(
-    svc, monkeypatch, present, error, restore_fails, code
+    svc, monkeypatch, present, error, restore_fails, after_undo, code
 ):
-    # DAH-6737 review: a restored original runs on the node, so the reply must not carry the no-billing code
+    # DAH-6737 review: the code follows what Docker reports for the pod after the undo, never the undo's own steps
     from payload_models.payloads import FailedContainerErrorCodes
     from services.docker_service import RentalEgressGuardRefused
 
     payload = _edit_payload()
-    ssh = _ssh_recording(container_present=present)
+    ssh = _ssh_recording(container_present=present, after_undo=after_undo)
     _patch_happy(svc, monkeypatch, ssh)
     monkeypatch.setattr(
         svc, "_bring_up_existing_container", AsyncMock(side_effect=RuntimeError("sshd") if restore_fails else None)
@@ -971,6 +986,30 @@ async def test_the_undo_repairs_a_stale_vloopback_mountpoint_left_by_park_and_st
         svc._repair_stale_mountpoint_of_container_volume.assert_awaited_once_with(ssh, "cid", {})
     else:
         svc._repair_stale_mountpoint_of_container_volume.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_undo_puts_a_pod_whose_ssh_bootstrap_failed_back_down_and_fails(svc):
+    # DAH-6737 review: a pod brought back without its SSH is no restored pod, neither left up nor counted as running
+    docker_client = Mock()
+    docker_client.start = AsyncMock()
+    docker_client.inspect_container_state = AsyncMock(return_value=Mock(running=False, restarting=False))
+    docker_client.container_identity = AsyncMock(return_value="cid@2026-11-16T14:03:00Z")
+    svc._stop_after_failed_start = AsyncMock()
+    svc._restore_mount_and_sshd_after_start = AsyncMock(return_value=False)
+
+    with pytest.raises(RuntimeError, match="SSH bootstrap"):
+        await svc._bring_up_existing_container(
+            executor_info=Mock(uuid="exec-1"),
+            private_key="private-key",
+            docker_client=docker_client,
+            ssh_client=Mock(),
+            container_name="pod_abc",
+            local_volume_path="/root",
+            pod_id="abc",
+            default_extra={},
+        )
+    svc._stop_after_failed_start.assert_awaited_once()
 
 
 @pytest.mark.asyncio
