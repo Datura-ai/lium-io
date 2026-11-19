@@ -957,16 +957,20 @@ class Settings(BaseSettings):
         ),
     )
     RENTAL_HOST_RAM_RESERVE_GB: int = Field(
-        env="RENTAL_HOST_RAM_RESERVE_GB", default=4, ge=0,
+        env="RENTAL_HOST_RAM_RESERVE_GB", default=8, ge=0,
         description=(
-            "RAM kept back for the host (sshd, dockerd, the executor) when a rental arrives with no "
-            "memory limit: the container gets host MemTotal minus max(this, "
-            "RENTAL_HOST_RAM_RESERVE_PERCENT), so a renter cannot exhaust the host's memory."
+            "RAM kept back for the host's own use outside the rental's cgroup (sshd, dockerd, the "
+            "executor, NVIDIA driver memory): the container's limit is at most (host MemTotal minus "
+            "max(this, RENTAL_HOST_RAM_RESERVE_PERCENT)) times its GPU share, so a renter at its limit "
+            "cannot starve the host. The backend lists pod RAM with the same figures."
         ),
     )
     RENTAL_HOST_RAM_RESERVE_PERCENT: float = Field(
-        env="RENTAL_HOST_RAM_RESERVE_PERCENT", default=3.0, ge=0, lt=100,
-        description="Percent of host RAM kept back, see RENTAL_HOST_RAM_RESERVE_GB (3 %, as the backend: DAH-5206).",
+        env="RENTAL_HOST_RAM_RESERVE_PERCENT", default=10.0, ge=0, lt=100,
+        description=(
+            "Percent of host RAM kept back, see RENTAL_HOST_RAM_RESERVE_GB (10 %, as the backend: an idle "
+            "376 GiB host used 14 GiB outside the rental's cgroup, more than the former 3 %)."
+        ),
     )
     CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS: int = Field(
         env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60, gt=0,
