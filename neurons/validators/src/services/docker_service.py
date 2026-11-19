@@ -10781,28 +10781,6 @@ class DockerService:
                             "refusing to start a split rental sent without a memory limit"
                         )
 
-                # DAH-3980 overlaps the filler's irreversible rm with the image inspect/pull. It must not
-                # precede the fail-closed reads above: a probe that then refused (a transient /proc read, or
-                # MaxSessions=1 denying its channel while the removal held the session) would reject the rental
-                # after the filler was already gone, stranding the host. So the removal starts only now, once the
-                # host reads have succeeded, and still runs beside the image inspect/pull below.
-                if removes_fillers_at_ssh_connect:
-                    # the rm is irreversible: an early probe whose channel may still hold the one session must stop
-                    # the create before it, not after the filler is gone (review on lium-io#2364)
-                    current_step = "prerun_host_probe"
-                    await settle_early_probes()
-                    # the wait above can outlast the first check: a delete that arrived meanwhile keeps the filler
-                    await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
-                    filler_removal_at_ssh_connect = asyncio.create_task(
-                        self.remove_fillers_at_ssh_connect(
-                            ssh_client,
-                            default_extra,
-                            self.get_container_name(payload),
-                            payload.active_volume_names,
-                        )
-                    )
-                    connections.push_async_callback(settle_filler_removal_at_ssh_connect)
-
                 # No logout counterpart below: the SDK login is a POST /auth to the executor's
                 # Docker daemon and the credential stays in this validator's client, so nothing is
                 # written to the executor's ~/.docker/config.json for a `docker logout` to clear.
@@ -10886,6 +10864,27 @@ class DockerService:
                             )
                     profilers.append(ProfilerStep.since(ProfilerStepName.DOCKER_IMAGE_INSPECT, prev_timestamp))
                     prev_timestamp = now_ms()
+
+                # DAH-3980 overlaps the filler's irreversible rm with the rest of the create. The rm starts only once
+                # every probe that can still fail the create has passed: the fail-closed host reads above, and the
+                # prerun probe. With the image present the early probe is that probe (settled below); a pull re-runs
+                # the probe afterwards, so a create that pulls leaves the fillers to the cleanup step after it.
+                # Otherwise a refused probe would reject the rental with the filler already gone (review on
+                # lium-io#2364).
+                if removes_fillers_at_ssh_connect and image_present:
+                    current_step = "prerun_host_probe"
+                    await settle_early_probes()
+                    # the wait above can outlast the first check: a delete that arrived meanwhile keeps the filler
+                    await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
+                    filler_removal_at_ssh_connect = asyncio.create_task(
+                        self.remove_fillers_at_ssh_connect(
+                            ssh_client,
+                            default_extra,
+                            self.get_container_name(payload),
+                            payload.active_volume_names,
+                        )
+                    )
+                    connections.push_async_callback(settle_filler_removal_at_ssh_connect)
 
                 skip_login = not has_credentials or image_present
                 if skip_login:

@@ -503,11 +503,12 @@ def _wire_customer_create_over_the_host(
     containers_on_host: tuple[str, ...] | None = None,
     container_ids: dict[str, str] | None = None,
     listings_that_answer: int | None = None,
+    image_present: bool = True,
 ) -> AsyncMock:
     """Both early probes on; the cleanup, the sweeps and the port-check wait are the real
     ones over a stub SSH client, so every listing they run is a command on it. The host lists the
     probe's containers until the first rm, then ``ps_after_rm``."""
-    ssh_client = _deploy_ssh_client()
+    ssh_client = _deploy_ssh_client(inspect_exit=0 if image_present else 1)
     answer_as_the_deploy_host = ssh_client.run.side_effect
     names_on_host = list(probe.container_names or () if containers_on_host is None else containers_on_host)
     listings = 0
@@ -701,14 +702,14 @@ _RECREATED_ID = "b" * 64
         (_REMOVED_AT_SSH_CONNECT_ID, [_REMOVED_AT_SSH_CONNECT_ID], 0, 0, []),
         # a listing without IDs: the removal at SSH connect still targets the ID it listed, not the name
         (None, [_REMOVED_AT_SSH_CONNECT_ID], 0, 0, []),
-        # the kill is issued once the early host probe ended (review on lium-io#2364: a probe that may still hold the
-        # session stops the create before the rm), and is confirmed before the image inspect beside it finishes
-        (None, [_REMOVED_AT_SSH_CONNECT_ID], 0, 0.05, ["image inspected"]),
+        # the kill is issued only after the image inspect shows the early host probe is the one the create keeps
+        # (review on lium-io#2364: no probe that can still fail the create comes after the rm)
+        (None, [_REMOVED_AT_SSH_CONNECT_ID], 0, 0.05, ["docker run"]),
         # safety order: a PEARL filler is gone before its cap is lifted (beside the volume create, and again
         # right before docker run), and the Dolphin cache is reclaimed only once the filler that mounts it is gone
         (None, [_REMOVED_AT_SSH_CONNECT_ID], 0.05, 0, ["cache reclaim", "docker run", "power restore", "power restore"]),
     ],
-    ids=["same_instance", "cleanup_listing_without_ids", "before_the_image_inspect_finishes",
+    ids=["same_instance", "cleanup_listing_without_ids", "after_the_image_inspect",
          "before_power_restore_cache_reclaim_and_docker_run"],
 )
 async def test_the_filler_removed_at_ssh_connect_goes_first_and_only_once(
@@ -1324,6 +1325,33 @@ async def test_a_probe_that_may_still_hold_the_session_stops_the_create_before_t
         _run_create_container(svc, _deploy_payload(active_volume_names=["volume_keep"])), timeout=5
     )
 
+    assert result.failure_step == "prerun_host_probe"
+    svc.remove_fillers_at_ssh_connect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_pull_keeps_the_filler_until_the_probe_after_it_passes(svc_fixture, monkeypatch):
+    """Review on lium-io#2364: a create that pulls the image re-runs the prerun probe after the pull. The filler stays
+    until that probe has passed, so a probe whose channel close is not confirmed fails the create with the filler kept."""
+    svc = svc_fixture
+    _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers("filler_x"), image_present=False)
+    probes = 0
+
+    async def second_probe_close_not_confirmed(*args, **kwargs):
+        nonlocal probes
+        probes += 1
+        if probes == 1:
+            return _probe_with_containers("filler_x")
+        raise ds_module.SshSessionMayStillBeTakenError("close not confirmed")
+
+    svc.probe_prerun_host = AsyncMock(side_effect=second_probe_close_not_confirmed)
+    svc.remove_fillers_at_ssh_connect = AsyncMock(return_value=None)
+
+    result = await asyncio.wait_for(
+        _run_create_container(svc, _deploy_payload(active_volume_names=["volume_keep"])), timeout=5
+    )
+
+    assert probes == 2
     assert result.failure_step == "prerun_host_probe"
     svc.remove_fillers_at_ssh_connect.assert_not_awaited()
 
