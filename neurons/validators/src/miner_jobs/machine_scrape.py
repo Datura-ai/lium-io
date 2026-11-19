@@ -9,6 +9,7 @@ import shutil
 import socket
 import subprocess
 import threading
+import time
 import psutil
 from functools import wraps
 import hashlib
@@ -704,11 +705,11 @@ class UnixSocketHTTPConnection(http.client.HTTPConnection):
         self.sock.connect(self.socket_path)
 
 
-def docker_api_get(path):
+def docker_api_get(path, timeout=DOCKER_API_TIMEOUT_SECONDS):
     # read one docker daemon endpoint over its unix socket; the scrape runs inside the privileged
     # executor container, where the host socket is bind-mounted. The CLI reports these sizes as
     # human strings ("45.08GB"); the API returns exact integers.
-    conn = UnixSocketHTTPConnection(DOCKER_SOCKET_PATH, DOCKER_API_TIMEOUT_SECONDS)
+    conn = UnixSocketHTTPConnection(DOCKER_SOCKET_PATH, timeout)
     try:
         conn.request("GET", path)
         response = conn.getresponse()
@@ -733,7 +734,9 @@ CONTAINER_MEMORY_CGROUPS = (
     ("/sys/fs/cgroup/memory/docker/{id}", "memory.usage_in_bytes"),
 )
 KMSG_PATH = "/dev/kmsg"
-KMSG_MAX_RECORDS = 200000
+KMSG_MAX_READS = 200000
+# both workload listings together, out of the scrape's own 300 s budget: past it the listing is unknown, never a timeout
+HOST_MEMORY_INVENTORY_SECONDS = 5
 
 
 def parse_meminfo_kb(text):
@@ -776,25 +779,26 @@ def last_oom_from_kmsg(records, boot_epoch):
 
 
 def read_kmsg_records(path=KMSG_PATH):
-    # every record still in the kernel ring buffer, without blocking at its end
+    # every record still in the kernel ring buffer, without blocking at its end; raises unless the scan reached the
+    # end whole, so a partial scan is never read as "the newest kill" (records are oldest first)
     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     records = []
     try:
-        while len(records) < KMSG_MAX_RECORDS:
+        for _ in range(KMSG_MAX_READS):
             try:
                 chunk = os.read(fd, 8192)
             except BlockingIOError:
-                break
+                return records
             except OSError as exc:
-                if exc.errno == 32:  # EPIPE: the record was overwritten while reading; the next read goes on
-                    continue
+                if exc.errno == 32:  # EPIPE: a record was overwritten before it was read
+                    raise RuntimeError("a kernel log record was overwritten during the read") from exc
                 raise
             if not chunk:
-                break
+                return records
             records.append(chunk.decode("utf-8", "replace"))
+        raise RuntimeError(f"the kernel log did not end within {KMSG_MAX_READS} reads")
     finally:
         os.close(fd)
-    return records
 
 
 def container_memory_kb(container_id, host_root=HOST_MEMORY_ROOT):
@@ -807,22 +811,44 @@ def container_memory_kb(container_id, host_root=HOST_MEMORY_ROOT):
     raise FileNotFoundError(f"no memory cgroup for container {container_id[:12]}")
 
 
-def list_workload_container_ids():
-    # the running pod and filler containers' full ids, listed now: an older listing misses a pod started since
-    return sorted(
-        container["Id"]
-        for container in docker_api_get("/containers/json")
-        if any(name.lstrip("/").startswith(WORKLOAD_CONTAINER_PREFIXES) for name in container.get("Names") or [])
-    )
+def list_workload_container_ids(deadline):
+    # the running pod and filler containers as sorted (full id, State.StartedAt), listed now: an older listing misses a
+    # pod started since, and the start time tells a restart of the same container apart (rental_docker_sdk
+    # container_identity). Every docker read shares the wall-clock `deadline` (time.monotonic()); no nested helper,
+    # which the obfuscator does not rename consistently.
+    workloads = []
+    paths = ["/containers/json"]
+    while paths:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("the docker listing ran out of its time budget")
+        path = paths.pop(0)
+        reply = docker_api_get(path, remaining)
+        if path == "/containers/json":
+            paths = [
+                f"/containers/{container['Id']}/json"
+                for container in reply
+                if any(name.lstrip("/").startswith(WORKLOAD_CONTAINER_PREFIXES) for name in container.get("Names") or [])
+            ]
+        else:
+            started_at = (reply.get("State") or {}).get("StartedAt")
+            if not started_at:
+                raise ValueError(f"docker inspect has no State.StartedAt for {path}")
+            workloads.append((reply["Id"], started_at))
+    if time.monotonic() > deadline:
+        raise TimeoutError("the docker listing ran out of its time budget")
+    return sorted(workloads)
 
 
 def get_host_memory(list_workloads=list_workload_container_ids, host_root=HOST_MEMORY_ROOT, meminfo_path="/proc/meminfo",
                     vmstat_path="/proc/vmstat", stat_path="/proc/stat", read_kmsg=read_kmsg_records):
     errors = {}
     facts = {"hm_errors": errors}
-    # the workloads are listed right before and after the memory reads; a change between them nulls the subtraction
+    # the workloads are listed right before and after the memory reads; a change between them (a container started,
+    # stopped or restarted) nulls the subtraction. Both listings share one short time budget.
+    deadline = time.monotonic() + HOST_MEMORY_INVENTORY_SECONDS
     try:
-        workloads = list_workloads()
+        workloads = list_workloads(deadline)
     except Exception as exc:
         workloads = None
         inventory_error = f"docker inventory failed: {exc!r}"
@@ -846,19 +872,20 @@ def get_host_memory(list_workloads=list_workload_container_ids, host_root=HOST_M
     # the workload containers' cgroups: memory.current counts their anon, page cache and shmem
     current = file_ = shmem = file_mapped = 0
     unread = []
-    for container_id in workloads or []:
+    for container_id, _started_at in workloads or []:
         try:
             usage, stat = container_memory_kb(container_id, host_root)
         except Exception as exc:
             unread.append(f"{container_id[:12]}: {exc!r}")
             continue
         current += usage
-        file_ += stat.get("file", stat.get("total_cache", 0))
-        shmem += stat.get("shmem", stat.get("total_shmem", 0))
-        file_mapped += stat.get("file_mapped", stat.get("total_mapped_file", 0))
+        # v1's usage counts child cgroups, as its total_* stats do (its plain ones are local); v2's are hierarchical
+        file_ += stat.get("total_cache", stat.get("file", 0))
+        shmem += stat.get("total_shmem", stat.get("shmem", 0))
+        file_mapped += stat.get("total_mapped_file", stat.get("file_mapped", 0))
     if workloads is not None:
         try:
-            if list_workloads() != workloads:
+            if list_workloads(deadline) != workloads:
                 inventory_error = "the workload containers changed during the memory reads"
                 workloads = None
         except Exception as exc:
@@ -879,6 +906,11 @@ def get_host_memory(list_workloads=list_workload_container_ids, host_root=HOST_M
         facts["hm_outside_workloads_no_cache_kb"] = (used - mem["Buffers"] - mem["Cached"] + mem["Shmem"]) - (current - file_ + shmem)
         # mapped pages no workload cgroup owns: an upper bound for NVIDIA driver and other host mappings
         facts["hm_mapped_outside_workloads_kb"] = mem["Mapped"] - file_mapped
+        # host and cgroup figures are read moments apart: a workload that grew in between leaves a residual below zero
+        if any(facts[key] < 0 for key in outside_keys):
+            for key in outside_keys:
+                facts[key] = None
+                errors[key] = "a workload grew between the host and container reads (negative residual)"
 
     try:
         with open(vmstat_path) as vmstat:

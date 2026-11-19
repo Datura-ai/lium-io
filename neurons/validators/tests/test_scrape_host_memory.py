@@ -3,7 +3,10 @@ mappings outside the containers and the last OOM. machine_scrape.py is a script 
 helpers are extracted by ast (as in test_scrape_interconnect.py)."""
 
 import ast
+import errno
 import os
+import time
+import types
 from pathlib import Path
 
 from neurons.validators.tests.helpers import build_scrape_namespace, dict_literal_keys
@@ -14,7 +17,8 @@ HELPERS = {
     "WORKLOAD_CONTAINER_PREFIXES",
     "CONTAINER_MEMORY_CGROUPS",
     "KMSG_PATH",
-    "KMSG_MAX_RECORDS",
+    "KMSG_MAX_READS",
+    "HOST_MEMORY_INVENTORY_SECONDS",
     "parse_meminfo_kb",
     "parse_memory_stat_kb",
     "last_oom_from_kmsg",
@@ -23,7 +27,7 @@ HELPERS = {
     "list_workload_container_ids",
     "get_host_memory",
 }
-NS = build_scrape_namespace(SRC / "miner_jobs" / "machine_scrape.py", HELPERS, {"os": os, "docker_api_get": None})
+NS = build_scrape_namespace(SRC / "miner_jobs" / "machine_scrape.py", HELPERS, {"os": os, "time": time, "docker_api_get": None})
 
 MEMINFO = """MemTotal:       100000 kB
 MemFree:         20000 kB
@@ -74,15 +78,45 @@ DOCKER_CONTAINERS = [
 ]
 
 
-def workloads():
-    return sorted([POD, FILLER])
+STARTED = "2026-11-19T10:00:00.000000000Z"
+
+
+def workloads(deadline=None):
+    return sorted([(POD, STARTED), (FILLER, STARTED)])
+
+
+def _docker(path, timeout=None):
+    if path == "/containers/json":
+        return DOCKER_CONTAINERS
+    return {"Id": path.split("/")[2], "State": {"StartedAt": STARTED}}
 
 
 def test_the_workloads_are_the_running_pod_and_filler_containers(monkeypatch) -> None:
-    monkeypatch.setitem(NS, "docker_api_get", lambda path: DOCKER_CONTAINERS if path == "/containers/json" else [])
+    monkeypatch.setitem(NS, "docker_api_get", _docker)
 
     # the executor's own container is the host's
-    assert NS["list_workload_container_ids"]() == [POD, FILLER]
+    assert NS["list_workload_container_ids"](time.monotonic() + 5) == [(POD, STARTED), (FILLER, STARTED)]
+
+
+def test_both_listings_share_one_short_time_budget(monkeypatch, tmp_path: Path) -> None:
+    # review on lium-io#2361: each docker read waited up to 20 s, so two listings could outlast the 300 s scrape
+    clock = [1000.0]
+    timeouts = []
+
+    def slow_docker(path, timeout=None):
+        timeouts.append(timeout)
+        clock[0] += 2  # every docker read takes 2 s
+        return _docker(path)
+
+    monkeypatch.setitem(NS, "time", types.SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setitem(NS, "docker_api_get", slow_docker)
+    facts = NS["get_host_memory"](read_kmsg=lambda: [], **_host(tmp_path))
+
+    assert clock[0] - 1000.0 <= NS["HOST_MEMORY_INVENTORY_SECONDS"] + 2
+    assert all(t <= NS["HOST_MEMORY_INVENTORY_SECONDS"] for t in timeouts)
+    assert facts["hm_workload_containers"] is None
+    assert "time budget" in facts["hm_errors"]["hm_outside_workloads_kb"]
+    assert facts["hm_mem_total_kb"] == 100000
 
 
 def test_host_memory_outside_the_workloads(tmp_path: Path) -> None:
@@ -130,8 +164,8 @@ def test_an_unreadable_kernel_log_is_a_reason_not_a_failure(tmp_path: Path) -> N
 
 def test_a_pod_started_during_the_reads_nulls_the_subtraction(tmp_path: Path) -> None:
     # review on lium-io#2361: a listing that changed between before and after the reads leaves a container uncounted
-    listings = iter([[FILLER], sorted([POD, FILLER])])
-    facts = NS["get_host_memory"](lambda: next(listings), read_kmsg=lambda: [], **_host(tmp_path))
+    listings = iter([[(FILLER, STARTED)], workloads()])
+    facts = NS["get_host_memory"](lambda deadline: next(listings), read_kmsg=lambda: [], **_host(tmp_path))
 
     assert facts["hm_workload_containers"] is None
     for key in ("hm_outside_workloads_kb", "hm_outside_workloads_no_cache_kb", "hm_mapped_outside_workloads_kb"):
@@ -142,7 +176,7 @@ def test_a_pod_started_during_the_reads_nulls_the_subtraction(tmp_path: Path) ->
 
 
 def test_a_failed_docker_listing_is_no_count_not_zero_workloads(tmp_path: Path) -> None:
-    def refused():
+    def refused(deadline):
         raise OSError("docker.sock")
 
     facts = NS["get_host_memory"](refused, read_kmsg=lambda: [], **_host(tmp_path))
@@ -151,6 +185,96 @@ def test_a_failed_docker_listing_is_no_count_not_zero_workloads(tmp_path: Path) 
     assert facts["hm_outside_workloads_no_cache_kb"] is None
     assert facts["hm_errors"]["hm_outside_workloads_no_cache_kb"].startswith("docker inventory failed: OSError")
     assert facts["hm_mem_total_kb"] == 100000
+
+
+def test_a_cgroup_v1_pod_counts_its_child_cgroups_shmem(tmp_path: Path) -> None:
+    # review on lium-io#2361: v1 usage includes child cgroups; its plain shmem is local, total_shmem hierarchical
+    paths = _host(tmp_path)
+    pod = Path(paths["host_root"]) / f"sys/fs/cgroup/system.slice/docker-{POD}.scope"
+    for f in pod.iterdir():
+        f.unlink()
+    pod.rmdir()
+    v1 = Path(paths["host_root"]) / f"sys/fs/cgroup/memory/docker/{POD}"
+    v1.mkdir(parents=True)
+    (v1 / "memory.usage_in_bytes").write_text(f"{40000 * 1024}\n")
+    (v1 / "memory.stat").write_text(
+        "\n".join(
+            f"{k} {v * 1024}"
+            for k, v in (("cache", 0), ("shmem", 0), ("mapped_file", 0), ("total_cache", 10000), ("total_shmem", 2000), ("total_mapped_file", 3000))
+        )
+        + "\n"
+    )
+    facts = NS["get_host_memory"](list_workloads=workloads, read_kmsg=lambda: [], **paths)
+
+    # the same figures as the v2 pod in test_host_memory_outside_the_workloads
+    assert facts["hm_outside_workloads_no_cache_kb"] == 14000
+    assert facts["hm_mapped_outside_workloads_kb"] == 9000 - 3500
+
+
+def test_a_pod_restarted_during_the_reads_nulls_the_subtraction(tmp_path: Path) -> None:
+    # review on lium-io#2361: a restart keeps the id, so only the start time shows the cgroup is a new run
+    restarted = sorted([(POD, "2026-11-19T10:05:00.000000000Z"), (FILLER, STARTED)])
+    listings = iter([workloads(), restarted])
+    facts = NS["get_host_memory"](lambda deadline: next(listings), read_kmsg=lambda: [], **_host(tmp_path))
+
+    assert facts["hm_outside_workloads_no_cache_kb"] is None
+    assert facts["hm_errors"]["hm_workload_containers"] == "the workload containers changed during the memory reads"
+
+
+def test_a_workload_that_grew_between_the_reads_is_no_negative_figure(tmp_path: Path) -> None:
+    # review on lium-io#2361: 5,000,000 kB host use, then 15,000,000 kB workload use, published -10,000,000 kB
+    paths = _host(tmp_path)
+    Path(paths["meminfo_path"]).write_text(MEMINFO.replace("100000 kB", "5020000 kB"))
+    pod = Path(paths["host_root"]) / f"sys/fs/cgroup/system.slice/docker-{POD}.scope"
+    (pod / "memory.current").write_text(f"{15000000 * 1024}\n")
+    facts = NS["get_host_memory"](list_workloads=workloads, read_kmsg=lambda: [], **paths)
+
+    for key in ("hm_outside_workloads_kb", "hm_outside_workloads_no_cache_kb", "hm_mapped_outside_workloads_kb"):
+        assert facts[key] is None
+        assert "negative residual" in facts["hm_errors"][key]
+
+
+class _Kmsg:
+    O_RDONLY = O_NONBLOCK = 0
+
+    def __init__(self, reads):
+        self.reads = iter(reads)
+
+    def open(self, path, flags):
+        return 3
+
+    def close(self, fd):
+        pass
+
+    def read(self, fd, size):
+        item = next(self.reads)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def test_an_overwritten_kernel_log_record_is_a_reason_not_a_stale_kill(monkeypatch) -> None:
+    # review on lium-io#2361: an EPIPE skipped records, so an older kill could read as the newest
+    epipe = OSError(errno.EPIPE, "overwritten")
+    monkeypatch.setitem(NS, "os", _Kmsg([b"3,1,1,-;Memory cgroup out of memory: Killed process 1 (a)", epipe, b""]))
+    try:
+        NS["read_kmsg_records"]()
+    except RuntimeError as exc:
+        assert "overwritten" in str(exc)
+    else:
+        raise AssertionError("an overwritten record must not pass as a whole scan")
+
+
+def test_a_kernel_log_past_the_read_budget_is_a_reason(monkeypatch) -> None:
+    # review on lium-io#2361: reaching the cap returned the partial, oldest-first scan as success; EPIPE bypassed it
+    monkeypatch.setitem(NS, "KMSG_MAX_READS", 3)
+    monkeypatch.setitem(NS, "os", _Kmsg([b"6,1,1,-;a", b"6,2,2,-;b", b"6,3,3,-;c", b"6,4,4,-;d", b""]))
+    try:
+        NS["read_kmsg_records"]()
+    except RuntimeError as exc:
+        assert "3 reads" in str(exc)
+    else:
+        raise AssertionError("a scan cut at the budget must not pass as a whole scan")
 
 
 def test_a_kernel_oom_warning_is_not_a_kill() -> None:
