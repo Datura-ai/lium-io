@@ -475,7 +475,9 @@ class ExecutorService:
                     payload["owner_hotkey_signatures"] = {own: owner_hotkey_signatures[own]}
                 elif own is None:
                     _learn_own_hotkey_later(executor)
-            for attempt in range(1, UPLOAD_SSH_KEY_ATTEMPTS + 1):
+            attempt, attempts = 0, UPLOAD_SSH_KEY_ATTEMPTS
+            while attempt < attempts:
+                attempt += 1
                 # the first attempt keeps main's full timeout, so a slow portal lookup never fails an upload main
                 # accepted; only the retries are clipped to the deadline
                 total = UPLOAD_SSH_KEY_ATTEMPT_TIMEOUT_SECONDS
@@ -490,12 +492,19 @@ class ExecutorService:
                             # refused for its binding: read which hotkey it is set up for now, retry with that entry
                             looked_up = True
                             own = await _executor_own_hotkey(session, executor, deadline)
+                            # a transient identity failure is read again while a read plus the retry still fit
+                            while own is None and deadline - time.monotonic() - UPLOAD_SSH_KEY_RETRY_DELAY_SECONDS \
+                                    >= MINER_IDENTITY_TIMEOUT_SECONDS + UPLOAD_SSH_KEY_MIN_ATTEMPT_SECONDS:
+                                await asyncio.sleep(UPLOAD_SSH_KEY_RETRY_DELAY_SECONDS)
+                                own = await _executor_own_hotkey(session, executor, deadline)
                             if own:
                                 _executor_own_hotkeys[str(executor.uuid)] = own
                             entry = {own: owner_hotkey_signatures[own]} if own in owner_hotkey_signatures else None
                             if entry and entry != payload.get("owner_hotkey_signatures") \
                                     and deadline - time.monotonic() >= UPLOAD_SSH_KEY_MIN_ATTEMPT_SECONDS:
                                 payload["owner_hotkey_signatures"] = entry
+                                # the signed retry is its own step: a refusal on the last attempt still sends it
+                                attempts = max(attempts, attempt + 1)
                                 continue
                         if response.status != 200:
                             text = body.decode(errors="replace")
@@ -523,7 +532,7 @@ class ExecutorService:
                         return ExecutorSSHInfo.parse_obj(response_obj)
                 except _UPLOAD_RETRY_ERRORS as e:
                     time_left = deadline - time.monotonic() - UPLOAD_SSH_KEY_RETRY_DELAY_SECONDS
-                    if attempt < UPLOAD_SSH_KEY_ATTEMPTS and time_left >= UPLOAD_SSH_KEY_MIN_ATTEMPT_SECONDS:
+                    if attempt < attempts and time_left >= UPLOAD_SSH_KEY_MIN_ATTEMPT_SECONDS:
                         await asyncio.sleep(UPLOAD_SSH_KEY_RETRY_DELAY_SECONDS)
                         # a delay that overran (busy event loop) must not start a retry past the deadline
                         if deadline - time.monotonic() >= UPLOAD_SSH_KEY_MIN_ATTEMPT_SECONDS:

@@ -273,6 +273,61 @@ async def test_a_binding_refusal_retries_with_the_executors_one_entry(executor_s
             assert session.post.call_count == 1 and session.get.call_count == 1
 
 
+@pytest.mark.asyncio
+async def test_a_refusal_on_the_last_attempt_still_sends_the_signed_retry(executor_service, test_executor):
+    """Two dropped uploads, then a binding refusal on the third: the one-entry retry is its own step and is sent."""
+    signatures = {"5OwnerA": "0xaa01", "5OwnerB": "0xbb02"}
+    refused = _response(403, b'{"detail":"SSH key was not issued for this miner"}')
+    session = _make_mock_session()
+    with patch("services.executor_service.aiohttp.ClientSession", return_value=session), \
+            patch("services.executor_service._learn_own_hotkey_later"), \
+            patch("services.executor_service.asyncio.sleep", AsyncMock()):
+        _identity_answer(session, "5OwnerB")
+        _post_answers(session, asyncio.TimeoutError(), asyncio.TimeoutError(), refused, _response(200, _SSH_ANSWER))
+        info = await executor_service.send_pubkey_to_executor(
+            test_executor, _SSH_KEY, "0xaa", owner_hotkey_signatures=signatures, deadline=time.monotonic() + 60
+        )
+    assert info is not None and session.post.call_count == es.UPLOAD_SSH_KEY_ATTEMPTS + 1
+    assert session.sent[-1]["owner_hotkey_signatures"] == {"5OwnerB": "0xbb02"}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_identity_read_after_a_refusal_is_read_again_within_the_deadline(executor_service, test_executor):
+    """A 503 from /miner-identity after a refusal is read again while time remains; with no time left it gives up."""
+    signatures = {"5OwnerA": "0xaa01", "5OwnerB": "0xbb02"}
+    refused = lambda: _response(403, b'{"detail":"SSH key was not issued for this miner"}')  # noqa: E731
+    session = _make_mock_session()
+    answers = iter([None, "5OwnerB"])
+
+    def flaky_get(url, params=None, timeout=None):
+        hotkey = next(answers)
+        body = json.dumps({"miner_hotkey": hotkey, "nonce": params["nonce"]} if hotkey else {}).encode()
+        ctx = MagicMock()
+        ctx.__aenter__ = AsyncMock(return_value=_response(200 if hotkey else 503, body))
+        ctx.__aexit__ = AsyncMock(return_value=None)
+        return ctx
+
+    with patch("services.executor_service.aiohttp.ClientSession", return_value=session), \
+            patch("services.executor_service._learn_own_hotkey_later"), \
+            patch("services.executor_service.asyncio.sleep", AsyncMock()):
+        session.get = MagicMock(side_effect=flaky_get)
+        _post_answers(session, refused(), _response(200, _SSH_ANSWER))
+        info = await executor_service.send_pubkey_to_executor(
+            test_executor, _SSH_KEY, "0xaa", owner_hotkey_signatures=signatures, deadline=time.monotonic() + 60
+        )
+        assert info is not None and session.get.call_count == 2
+        assert session.sent[-1]["owner_hotkey_signatures"] == {"5OwnerB": "0xbb02"}
+
+        # too little time for another read plus the retry: one read, then the upload ends
+        es._executor_own_hotkeys.clear()
+        _identity_answer(session, None, status=503)
+        _post_answers(session, refused())
+        assert await executor_service.send_pubkey_to_executor(
+            test_executor, _SSH_KEY, "0xaa", owner_hotkey_signatures=signatures, deadline=time.monotonic() + 5
+        ) is None
+        assert session.get.call_count == 1 and session.post.call_count == 1
+
+
 @pytest.mark.parametrize(
     "status, body_error, expected_posts, accepted",
     [
