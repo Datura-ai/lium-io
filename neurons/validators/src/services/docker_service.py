@@ -1275,6 +1275,17 @@ def failed_create_error_code(
     return FailedContainerErrorCodes.UnknownError
 
 
+def wire_failed_create_error_code(code: FailedContainerErrorCodes) -> FailedContainerErrorCodes:
+    """The code sent to the backend for `code`. The backend in production vendors protocol 2.16.0, which cannot parse
+    PodDownNotHostFault (2.20.0): it rejects the whole failure frame and keeps billing the pod. Until lium-platform
+    accepts 2.20.0, the pod-down case goes out as ExecutorUnreachable, the old protocol's code that stops the renter's
+    billing (it also counts as a host fault there); the same swap as GpusLostOnHost -> ResetNotSupported. A separate
+    task removes this swap once that backend is deployed."""
+    if code == FailedContainerErrorCodes.PodDownNotHostFault:
+        return FailedContainerErrorCodes.ExecutorUnreachable
+    return code
+
+
 def is_host_fault_create_failure(current_step: str | None, error: BaseException | None = None) -> bool:
     """A failure on the node itself, or the node's Docker connection over SSH dropping on a step past the connect
     (after the SDK call's own retry, where it has one): a node whose link keeps dropping fails every create,
@@ -12608,7 +12619,7 @@ class DockerService:
                 ),
                 detail=failure_detail,
                 error_type=FailedContainerErrorTypes.ContainerCreationFailed,
-                error_code=error_code,
+                error_code=wire_failed_create_error_code(error_code),
                 failure_step=current_step,
                 volume_encryption_status=(
                     VolumeEncryptionStatus.FAILED
