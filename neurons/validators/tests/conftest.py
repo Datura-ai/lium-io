@@ -102,6 +102,25 @@ def update_snapshot(request: pytest.FixtureRequest) -> bool:
 
 
 @pytest.fixture(autouse=True)
+def _loopback_fakes_stand_in_for_public_nodes(request, monkeypatch):
+    """Tests run their fake nodes on 127.0.0.1 / ::1, which the validator refuses as a node address in production
+    (services/node_host.py `_check_literal`). Here loopback stands in for a public node; every other non-public
+    address is still refused. test_node_host.py tests the real rule."""
+    if request.module.__name__.endswith("test_node_host"):
+        return
+    from services import node_host
+
+    real = node_host._check_literal
+
+    def allow_loopback(host: str, port: int) -> None:
+        if host.strip("[]") in {"127.0.0.1", "::1", "localhost"}:
+            return
+        real(host, port)
+
+    monkeypatch.setattr(node_host, "_check_literal", allow_loopback)
+
+
+@pytest.fixture(autouse=True)
 def no_docker_hub_digest_on_rent_path():
     """create_container asks Docker Hub for a present image's digest; no answer keeps tests offline."""
     with patch("services.docker_service.fetch_docker_hub_digest", AsyncMock(return_value=None)) as lookup:

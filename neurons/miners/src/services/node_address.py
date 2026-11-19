@@ -24,6 +24,9 @@ from aiohttp.resolver import DefaultResolver
 from core.config import settings
 
 
+NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")  # RFC 6052 well-known prefix: the IPv4 address in the last 32 bits
+
+
 class NonPublicNodeAddress(aiohttp.ClientConnectionError):
     """The node's address name resolves to an address that is not public; nothing was dialled."""
 
@@ -32,8 +35,10 @@ def is_public_address(address: str) -> bool:
     ip = ipaddress.ip_address(address.split("%", 1)[0])  # a scoped IPv6 link-local carries %iface
     # judged as the IPv4 address it carries: Python before 3.13 calls ::ffff:127.0.0.1 global
     ip = getattr(ip, "ipv4_mapped", None) or ip
-    # Python counts global-scope multicast, IPv6 site-local (fec0::/10) and reserved ranges (64:ff9b::/96 carries
-    # an IPv4 address through NAT64) as global
+    # a DNS64 answer (what an IPv6-only host gets for a public A record) is judged as the IPv4 address it carries
+    if ip.version == 6 and ip in NAT64_PREFIX:
+        ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    # Python counts global-scope multicast, IPv6 site-local (fec0::/10) and other reserved ranges as global
     return (
         ip.is_global and not ip.is_multicast and not ip.is_reserved and not getattr(ip, "is_site_local", False)
     )

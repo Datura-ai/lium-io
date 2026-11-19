@@ -42,7 +42,7 @@ async def local_node():
     ["127.0.0.1", "169.254.169.254", "0.0.0.0", "192.0.2.1", "::1", "fe80::1%eth0", "fc00::1", "ff02::1", "ff0e::1",
      "::ffff:127.0.0.1", "::ffff:169.254.169.254",
      # Python 3.11-3.12 call these global: IPv6 site-local, and reserved ranges incl. NAT64 of 127.0.0.1
-     "fec0::1", "fec0::1%eth0", "64:ff9b::7f00:1", "100::1"],
+     "fec0::1", "fec0::1%eth0", "64:ff9b::7f00:1", "64:ff9b::a9fe:a9fe", "100::1"],
 )
 def test_internal_addresses_are_not_public(address):
     assert not is_public_address(address)
@@ -50,6 +50,8 @@ def test_internal_addresses_are_not_public(address):
 
 def test_public_addresses_are_public():
     assert is_public_address("1.2.3.4") and is_public_address("2001:4860:4860::8888")
+    # lium-io#2369 review 5981962325: an IPv6-only host's DNS64 answer for a public A record stays reachable
+    assert is_public_address("64:ff9b::808:808")
 
 
 @pytest.mark.asyncio
