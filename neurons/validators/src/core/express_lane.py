@@ -212,6 +212,8 @@ class ExpressLane:
         self._next_self_hosted_listing = 0.0  # monotonic
         self._listing: asyncio.Task | None = None
         self._owner_refresh: asyncio.Task | None = None  # DAH-6740
+        # True once one owner-hotkeys read has finished, even a failed one (404, no portal URL, timeout)
+        self._owner_read_finished = False
         # DAH-5716: runs started per queued recheck request.
         # shortcut: in memory, so a restart restarts the budget; the request's TTL still bounds it.
         self._recheck_runs: Counter[str] = Counter()
@@ -260,6 +262,7 @@ class ExpressLane:
         # background, so a slow portal never holds discovery
         if self._owner_refresh is None or self._owner_refresh.done():
             self._owner_refresh = asyncio.create_task(self.portal_api.refresh_owner_hotkeys())
+            self._owner_refresh.add_done_callback(self._mark_owner_read_finished)
         inputs = self.cycle_inputs()
         if inputs is None:
             return 0
@@ -293,7 +296,14 @@ class ExpressLane:
             )
         if not chosen:
             return 0
+        if not self._owner_read_finished:
+            # after a restart the owner map is empty until the first read ends: a run launched now would sign no owner
+            # hotkeys and find another-account setup a mismatch; the chosen nodes are picked again next tick
+            return 0
         return await self._launch(chosen)
+
+    def _mark_owner_read_finished(self, _task: asyncio.Task) -> None:
+        self._owner_read_finished = True
 
     async def _restore_first_seen(self) -> None:
         """Newly queued executors take their first sighting from Redis (written now when there is none),

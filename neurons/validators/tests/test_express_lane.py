@@ -275,6 +275,8 @@ class _Harness:
             cycle_inputs=lambda: self.inputs,
             portal_api=self.portal_api,
         )
+        # a validator past its first owner-hotkeys read; the gate before it has its own test
+        self.lane._owner_read_finished = True
 
     async def tick_and_settle(self) -> int:
         launched = await self.lane.tick()
@@ -300,6 +302,31 @@ async def test_a_stalled_owner_hotkeys_read_never_holds_discovery(monkeypatch, w
     assert harness.portal_api.refresh_owner_hotkeys.call_count == 1
     stalled.set()
     await harness.lane._owner_refresh
+
+
+@pytest.mark.asyncio
+async def test_no_run_launches_until_the_first_owner_hotkeys_read_has_finished(monkeypatch, wallet):
+    """DAH-6740 review: after a restart the owner map is empty; a run launched before the first read ends would find a
+    node set up under the owner's other account a mismatch. Discovery goes on; launching waits for that read to finish,
+    and a failed read (404, no portal URL) releases it like a good one."""
+    new_node = str(uuid4())
+    harness = _Harness(
+        monkeypatch, {"miner-a": [_portal_executor(new_node, registered_seconds_ago=40)]}, [_Neuron("miner-a")]
+    )
+    stalled = asyncio.Event()
+
+    async def read_that_fails_once_released():
+        await stalled.wait()
+        return False
+
+    harness.portal_api.refresh_owner_hotkeys = AsyncMock(side_effect=read_that_fails_once_released)
+    harness.lane._owner_read_finished = False  # just restarted
+
+    assert await harness.tick_and_settle() == 0
+    assert harness.portal_api.get_all_executors.await_count == 1
+    stalled.set()
+    await harness.lane._owner_refresh
+    assert await harness.tick_and_settle() == 1
 
 
 @pytest.mark.asyncio
