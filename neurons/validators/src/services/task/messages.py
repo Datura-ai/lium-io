@@ -1430,6 +1430,13 @@ class InspectorMessages:
 
 
 class TenantEnforcementMessages:
+    HALF_STARTED_STOPS_RETRIED = MessageTemplate(
+        event="Pending stops of half-started pods retried",
+        reason="HALF_STARTED_STOPS_RETRIED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
     NOT_RENTED = MessageTemplate(
         event="Executor not rented",
         reason="EXECUTOR_NOT_RENTED",
@@ -3208,7 +3215,8 @@ SSHD_BOOTSTRAP_REMEDIATION = (
     "\"/run/sshd must be owned by root and not group or world-writable\"). Fix the runtime/image setup so "
     "a fresh container gets a root-owned /run/sshd with mode 755, then check that `docker run --rm ubuntu sh -c "
     "'apt-get update -qq && apt-get install -y -qq openssh-server && mkdir -p /run/sshd && /usr/sbin/sshd -t'` "
-    "succeeds. The node is validated again once a new container on it starts sshd."
+    "succeeds. Each validation cycle starts sshd in a fresh container on the node again; the node is validated again the "
+    "cycle sshd starts there."
 )
 
 

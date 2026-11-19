@@ -1733,6 +1733,18 @@ def test_rental_ssh_adapter_hands_paramiko_a_socket_to_the_pinned_address(tmp_pa
         listener.close()
 
 
+@pytest.mark.asyncio
+async def test_container_identity_is_id_and_start_time_and_none_once_the_container_is_gone():
+    api_client = Mock()
+    api_client.inspect_container = Mock(return_value={"Id": "cid", "State": {"StartedAt": "t1"}})
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.container_identity(container_name="pod_x") == "cid@t1"
+
+    api_client.inspect_container = Mock(side_effect=NotFound("gone"))
+    assert await client.container_identity(container_name="pod_x") is None
+
+
 def _run_key_append(spec, env=None) -> subprocess.CompletedProcess:
     return subprocess.run(list(spec.argv), input=spec.stdin, capture_output=True, text=True, env=env)
 
@@ -1823,6 +1835,52 @@ def test_authorized_keys_append_runs_under_busybox_ash(tmp_path):
 
     assert completed.returncode == 0, completed.stderr
     assert target.read_text() == "k1\n"
+
+
+def test_rental_ssh_adapter_failed_reconnect_reads_as_a_transport_not_reopened(monkeypatch, tmp_path):
+    """A call's retry finds the SSH session dead and cannot connect again: through the retry's own wrappers this
+    is the node not answering (ssh_connect), not the call's step."""
+    import paramiko
+    from urllib3._collections import RecentlyUsedContainer
+
+    key_path = tmp_path / "id_executor"
+    known_hosts_path = tmp_path / "known_hosts"
+    key_path.write_text("PRIVATE KEY")
+    known_hosts_path.write_text("[192.0.2.10]:2222 ssh-ed25519 AAAATESTKEY\n")
+
+    class FakeSSHClient:
+        def load_host_keys(self, path):
+            pass
+
+        def set_missing_host_key_policy(self, policy):
+            pass
+
+        def connect(self, **params):
+            raise TimeoutError("timed out")
+
+        def get_transport(self):
+            return None
+
+    monkeypatch.setattr(paramiko, "SSHClient", FakeSSHClient)
+    adapter_class = _build_rental_ssh_http_adapter_class(key_path=key_path, known_hosts_path=known_hosts_path)
+    adapter = adapter_class.__new__(adapter_class)
+    adapter._create_paramiko_client("ssh://root@192.0.2.10:2222")
+    adapter.pools = RecentlyUsedContainer(1)
+    adapter.ssh_host = "192.0.2.10"
+    adapter._connect_deferred = False
+
+    with pytest.raises(rental_docker_sdk.RentalDockerReconnectFailed) as raised:
+        adapter.get_connection("http+docker://ssh/v1.43/images/create")
+
+    # as the retry raises it: the pull's wrapper, then the retry's transport error over it
+    try:
+        try:
+            raise rental_docker_sdk.RentalDockerOperationError("Docker SDK pull failed") from raised.value
+        except rental_docker_sdk.RentalDockerOperationError as wrapped:
+            raise rental_docker_sdk.RentalDockerTransportError("pull failed once more after re-opening") from wrapped
+    except rental_docker_sdk.RentalDockerTransportError as retried:
+        assert rental_docker_sdk.is_rental_docker_transport_error(raised.value)
+        assert rental_docker_sdk.is_transport_not_reopened(retried)
 
 
 @pytest.mark.skipif(shutil.which("flock") is None, reason="flock not installed")

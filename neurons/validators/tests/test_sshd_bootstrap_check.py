@@ -8,7 +8,11 @@ from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutor
 
 from core.config import settings
 from services.docker_service import DockerService
-from services.redis_service import SSHD_BOOTSTRAP_FAILED_TTL_SECONDS, sshd_bootstrap_failed_key
+from services.redis_service import (
+    SSHD_BOOTSTRAP_FAILED_TTL_SECONDS,
+    sshd_bootstrap_failed_key,
+    sshd_bootstrap_failed_stamp,
+)
 from services.task.checks.sshd_bootstrap import SshdBootstrapCheck
 from services.task.messages import SshdBootstrapMessages as Msg
 from tests.helpers import FakeRedis, build_services, build_state
@@ -190,14 +194,15 @@ async def test_other_failures_and_renter_creates_stamp_nothing():
     assert KEY not in redis.store
 
 
-def _probe_ctx(context_factory, redis, stdout="", error=None, rented=False):
+def _probe_ctx(context_factory, redis, stdout="", error=None, rented=False, inspected=""):
     ssh = AsyncMock()
     if error:
         ssh.run.side_effect = error
     else:
-        # the probe answers first, then the running check, then the filler removal
+        # the probe answers first, then the failed filler's inspect, then the running check, then the filler removal
         ssh.run.side_effect = [
             SimpleNamespace(exit_status=1 if stdout else 0, stdout=stdout, stderr=""),
+            SimpleNamespace(exit_status=0 if inspected else 1, stdout=inspected, stderr=""),
             SimpleNamespace(exit_status=0, stdout="abc123\n", stderr=""),  # docker ps: still running
             SimpleNamespace(exit_status=0, stdout="", stderr=""),
         ]
@@ -220,9 +225,30 @@ async def test_a_running_filler_without_sshd_past_the_grace_fails_stamps_and_is_
     probe = ssh.run.await_args_list[0].args[0]
     assert f"inspect -f '{{{{.State.Running}}}} {{{{.State.StartedAt}}}}' {FILLER}" in probe
     assert f"| base64 -d | /usr/bin/docker exec -u 0 -i {FILLER} sh -c" in probe
-    assert ssh.run.await_args_list[1].args[0].startswith("/usr/bin/docker ps -q -f ")
-    assert ssh.run.await_args_list[2].args[0] == f"/usr/bin/docker rm -fv {FILLER}"
+    assert ssh.run.await_args_list[2].args[0].startswith("/usr/bin/docker ps -q -f ")
+    assert ssh.run.await_args_list[3].args[0] == f"/usr/bin/docker rm -fv {FILLER}"
     backend.get_filler_run_active.assert_awaited_once_with("run-1", container_missing=True)
+
+
+@pytest.mark.asyncio
+async def test_a_running_filler_failure_stamps_its_image_and_runtime_and_a_later_reprobe_clears_it(
+    context_factory,
+):
+    # an uninspectable filler keeps the plain stamp above (held until the TTL); an inspected one is re-probed
+    redis = FakeRedis()
+    ctx, ssh, _ = _probe_ctx(context_factory, redis, stdout=FAILED_RUN, inspected="daturaai/dolphin:1 sysbox-runc\n")
+    assert (await SshdBootstrapCheck().run(ctx)).passed is False
+    assert ssh.run.await_args_list[1].args[0] == (
+        f"/usr/bin/docker inspect -f '{{{{.Config.Image}}}} {{{{.HostConfig.Runtime}}}}' {FILLER}"
+    )
+    assert redis.store[KEY] == sshd_bootstrap_failed_stamp("daturaai/dolphin:1", True)
+
+    ssh = AsyncMock()
+    ssh.run.return_value = SimpleNamespace(exit_status=0, stdout="", stderr="")
+    result = await SshdBootstrapCheck().run(_ctx(context_factory, redis, filler_owner="lium", ssh=ssh))
+    assert result.passed is True
+    assert KEY not in redis.store
+    assert "--runtime=sysbox-runc --entrypoint sh daturaai/dolphin:1 -c" in ssh.run.await_args.args[0]
 
 
 @pytest.mark.asyncio
@@ -346,3 +372,88 @@ async def test_a_stamp_saved_under_the_uuid_alone_is_ignored(context_factory):
 
     assert result.passed is True
     assert KEY not in redis.store
+
+
+IMAGE = "daturaai/dolphin:1"
+STAMP = sshd_bootstrap_failed_stamp(IMAGE, True)
+
+
+def _reprobe_ctx(context_factory, redis, exit_status):
+    ssh = AsyncMock()
+    # the re-probe answers first; a failed node then has its filler removed (docker ps, docker rm)
+    ssh.run.side_effect = [
+        SimpleNamespace(exit_status=exit_status, stdout="" if exit_status == 0 else FAILED_RUN, stderr=""),
+        SimpleNamespace(exit_status=0, stdout="", stderr=""),
+        SimpleNamespace(exit_status=0, stdout="", stderr=""),
+    ]
+    backend = build_services().backend
+    return _ctx(context_factory, redis, filler_owner="lium", ssh=ssh, backend=backend), ssh
+
+
+@pytest.mark.asyncio
+async def test_a_stamped_node_whose_fresh_container_serves_sshd_is_lifted_the_same_cycle(context_factory):
+    redis = FakeRedis()
+    redis.store[KEY] = STAMP
+    ctx, ssh = _reprobe_ctx(context_factory, redis, exit_status=0)
+
+    result = await SshdBootstrapCheck().run(ctx)
+
+    assert result.passed is True
+    assert KEY not in redis.store
+    probe = ssh.run.await_args_list[0].args[0]
+    assert "/usr/bin/docker run --rm -i --pull never -u 0 --runtime=sysbox-runc --entrypoint sh daturaai/dolphin:1 -c" in probe
+    assert len(ssh.run.await_args_list) == 1  # no filler removed
+
+
+@pytest.mark.asyncio
+async def test_a_stamped_node_whose_fresh_container_still_fails_stays_held(context_factory):
+    redis = FakeRedis()
+    redis.store[KEY] = STAMP
+    ctx, ssh = _reprobe_ctx(context_factory, redis, exit_status=1)
+
+    result = await SshdBootstrapCheck().run(ctx)
+
+    assert result.passed is False
+    assert redis.store[KEY] == STAMP
+    assert ssh.run.await_args_list[2].args[0] == f"/usr/bin/docker rm -fv {FILLER}"
+
+
+@pytest.mark.asyncio
+async def test_a_dry_run_or_a_legacy_stamp_starts_no_container(context_factory):
+    for stamp, remove_fillers in [(STAMP, False), ("1", True)]:
+        redis = FakeRedis()
+        redis.store[KEY] = stamp
+        ctx, ssh = _reprobe_ctx(context_factory, redis, exit_status=0)
+        result = await SshdBootstrapCheck(remove_fillers=remove_fillers).run(ctx)
+        assert result.passed is False
+        assert redis.store[KEY] == stamp
+        assert not any("docker run" in call.args[0] for call in ssh.run.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_create_stamps_its_image_and_runtime():
+    redis = FakeRedis()
+    ok = SimpleNamespace(exit_status=0, stdout="", stderr="")
+    failed = SimpleNamespace(exit_status=1, stdout=FAILED_RUN, stderr="")
+    with patch(
+        "services.docker_service.exec_logged_rental_docker_sdk_operation", AsyncMock(side_effect=[ok, failed])
+    ):
+        await _service(redis).install_open_ssh_server_and_start_ssh_service_with_rental_docker(
+            Mock(), container_name="filler_x", log_tag="t", log_extra={}, sshd_verdict_key=KEY, sshd_failed_stamp=STAMP
+        )
+    assert redis.store[KEY] == STAMP
+
+
+def test_the_fresh_container_runs_the_bootstrap_it_is_fed(tmp_path):
+    import os
+    import subprocess
+
+    from services.task.checks.sshd_bootstrap import _BOOTSTRAP_SCRIPT, fresh_container_sshd_bootstrap_command
+
+    docker, fed = tmp_path / "docker", tmp_path / "fed.sh"
+    docker.write_text(f'#!/bin/sh\necho "$@" > {tmp_path}/args; cat > {fed}\n')
+    docker.chmod(0o755)
+    probe = fresh_container_sshd_bootstrap_command("img:1", False).replace("/usr/bin/docker", str(docker))
+    assert subprocess.run(["sh", "-c", probe], timeout=10, env=os.environ).returncode == 0
+    assert fed.read_bytes() == _BOOTSTRAP_SCRIPT.read_bytes()
+    assert "sysbox" not in (tmp_path / "args").read_text()

@@ -75,6 +75,10 @@ DOWNLOAD_TEMPORARY_SWEEP_TIMEOUT_SECONDS = 60
 # Created for good, and dockerd then refuses `volume rm` on the cache it mounts ("volume is in use").
 REMOVE_CACHE_SWEEP_CONTAINER = f"/usr/bin/docker rm -f {CACHE_SWEEP_CONTAINER_NAME} >/dev/null 2>&1"
 
+# the name of a child Python's multiprocessing started with `spawn` or `forkserver`: its command line is
+# `python -c "from multiprocessing.spawn import spawn_main; ..." --multiprocessing-fork`, not the program it runs
+MULTIPROCESSING_CHILD = "multiprocessing-child"
+
 # Every image repository a filler is started from: its workload, the executable names its GPU
 # processes run as (None until they are established), and whether the reclaims below remove it idle.
 @dataclass(frozen=True)
@@ -87,8 +91,9 @@ class FillerWorkload:
 FILLER_WORKLOADS: dict[str, FillerWorkload] = {
     # the workload installs its serving engine at run time: the image fixes no process name
     "ghcr.io/hanlinai/engy-golden-serve": FillerWorkload("ENGY_TEE", None),
-    # the worker downloads its inference engine at run time; the engine has been vLLM and sonar
-    "daturaai/dolphin": FillerWorkload("DPHN", ("dolphinpod", "sonar", "vllm")),
+    # the worker downloads its inference engine at run time; the engine has been vLLM and sonar, and the engine
+    # starts GPU children through multiprocessing's spawn start method (sonar's P2P probe at engine start)
+    "daturaai/dolphin": FillerWorkload("DPHN", ("dolphinpod", "sonar", "vllm", MULTIPROCESSING_CHILD)),
     # the first Dolphin image, no longer started: no GPU process of a Lium workload runs in it
     "daturaai/dlph": FillerWorkload("DPHN", ()),
     # small and has no cache volume, so a reclaim gains nothing from removing it
