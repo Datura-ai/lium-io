@@ -13,10 +13,10 @@ on:
 permissions:
   contents: read
 
-# a newer push to the same PR cancels the older run, so superseded runs stop reading the API; main and the merge queue
-# keep every run
+# a newer push to the same PR cancels the older run, so superseded runs stop reading the API; every main and merge-queue
+# run has its own group (run_id): a shared ref group would let a third push replace the pending second one, unscanned
 concurrency:
-  group: pinned-actions-${{ github.event.pull_request.number || github.ref }}
+  group: pinned-actions-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -33,7 +33,10 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           python3 -m venv /tmp/venv
-          /tmp/venv/bin/pip install -q pyyaml==6.0.3
+          # the reviewed CPython 3.12 x86_64 wheel only (the same hash as neurons/validators/uv.lock): no sdist build, so no
+          # unpinned build tools run first; another runner Python finds no wheel and fails red, never unscanned
+          echo 'pyyaml==6.0.3 --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc' > /tmp/pyyaml.txt
+          /tmp/venv/bin/pip install -q --only-binary=:all: --require-hashes -r /tmp/pyyaml.txt
           /tmp/venv/bin/python - <<'PY'
           import os, pathlib, posixpath, re, subprocess, sys, urllib.error, urllib.parse, urllib.request, yaml
 
@@ -163,7 +166,8 @@ jobs:
                       for job in jobs:
                           container = job.get("container")
                           images = [container.get("image") if isinstance(container, dict) else container]
-                          images += [(svc or {}).get("image") for svc in (job.get("services") or {}).values() if isinstance(svc, (dict, type(None)))]
+                          # a service is a mapping with image: or the image itself as a scalar; the runner accepts both
+                          images += [svc.get("image") if isinstance(svc, dict) else svc for svc in (job.get("services") or {}).values()]
                           bad += [f"{where}: container/service image {img}" for img in images if img and not is_digest(img)]
               except TooMany:
                   bad.append(f"more than {MAX_FETCHES} pinned actions and workflows to read: not checked, so not accepted")
@@ -242,6 +246,9 @@ jobs:
               # job containers and services keep bare digests: the runner pulls those from a registry as written
               "jobs:\n  a:\n    container: alpine:3\n    services:\n      db:\n        image: postgres" + dig + "\n": 1,
               "jobs:\n  a:\n    container: alpine" + dig + "\n": 0,
+              # a scalar service image is checked like the mapping form
+              "jobs:\n  a:\n    services:\n      db: postgres:16\n": 1,
+              "jobs:\n  a:\n    services:\n      db: postgres" + dig + "\n": 0,
           }
           for i, (text, want) in enumerate(cases.items()):
               tree = {**base, (None, f"w/case{i}.yml", None): text}
