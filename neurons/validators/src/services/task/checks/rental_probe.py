@@ -497,6 +497,9 @@ class RentalProbeCheck:
                     "failed_step": failure.step,
                     "create_step": failure.create_step,
                     "ssh_port": ssh_port,
+                    # a rented node is left alone (class docstring): a rental placed after the reads above keeps
+                    # its node, the backend applies this reset only while no customer pod runs there
+                    "unrented_only": True,
                 },
             },
         )

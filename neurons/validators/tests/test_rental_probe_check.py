@@ -1610,6 +1610,7 @@ async def test_pipeline_carries_the_failed_step_to_the_reset_evidence():
     assert last_ctx.clear_verified_job_info is True
     assert last_ctx.clear_verified_job_evidence["reason_code"] == "RENTAL_PROBE_FAILED"
     assert last_ctx.clear_verified_job_evidence["failed_step"] == STEP_SSHD_LISTEN
+    assert last_ctx.clear_verified_job_evidence["unrented_only"] is True
     assert last_ctx.score == 0.0 and last_ctx.job_score == 0.0
     # the pipeline writes its own per-check `steps` summary onto the last event; the probe's records must
     # survive it under their own key, since this event is what the portal shows the provider
