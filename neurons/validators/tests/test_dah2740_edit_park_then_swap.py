@@ -381,6 +381,9 @@ async def test_a_failed_edit_restores_the_previous_container(svc, monkeypatch):
         # a recovery check's fenced stop froze it and may unpause it: it can resume without a start, still billed
         (True, "guard", True, "paused", "UnknownError"),
         (True, "ordinary", False, "running", "UnknownError"),
+        # an edit that failed on anything, whose undo's own guard was refused: down is down, not billed
+        (True, "ordinary", "guard", "down", "ExecutorUnreachable"),
+        (True, "ordinary", "guard", "running", "UnknownError"),
     ],
     ids=[
         "absent_guard",
@@ -391,6 +394,8 @@ async def test_a_failed_edit_restores_the_previous_container(svc, monkeypatch):
         "state_unreadable",
         "paused_during_fenced_stop",
         "restored_ordinary",
+        "ordinary_undo_guard_refused_down",
+        "ordinary_undo_guard_refused_running",
     ],
 )
 @pytest.mark.asyncio
@@ -404,8 +409,9 @@ async def test_a_reboot_the_guard_refused_is_a_host_fault_only_while_no_containe
     payload = _edit_payload()
     ssh = _ssh_recording(container_present=present, after_undo=after_undo)
     _patch_happy(svc, monkeypatch, ssh)
+    restore_error = RentalEgressGuardRefused("undo not applied") if restore_fails == "guard" else RuntimeError("sshd")
     monkeypatch.setattr(
-        svc, "_bring_up_existing_container", AsyncMock(side_effect=RuntimeError("sshd") if restore_fails else None)
+        svc, "_bring_up_existing_container", AsyncMock(side_effect=restore_error if restore_fails else None)
     )
     exc = RentalEgressGuardRefused("not applied") if error == "guard" else RuntimeError("gocryptfs: EPERM")
     monkeypatch.setattr(svc, "_run_rental_docker_create_with_port_retry", AsyncMock(side_effect=exc))

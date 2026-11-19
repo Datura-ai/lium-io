@@ -784,6 +784,27 @@ async def test_run_container_creates_the_container_with_the_spec_labels_and_the_
     }
 
 
+@pytest.mark.parametrize("present", [True, False], ids=["bridge_kept", "bridge_gone_since_the_guard"])
+@pytest.mark.asyncio
+async def test_run_container_never_creates_a_pods_own_bridge(present):
+    # DAH-6737: a pod's bridge is made only by ensure_network, before the egress drop; one removed between the drop
+    # and the start (another create's cleanup) fails the attempt instead of starting on a bridge the drop never saw
+    api_client = FakeApiClient()
+    pod_net = "lium-rentals-pod_test"
+    if present:
+        api_client.networks[pod_net] = _bridge_network({RENTAL_NETWORK_ICC_OPTION: "false"})
+    client = RentalDockerSdkClient(api_client)
+
+    if present:
+        await client.run_container(_rental_spec(network=pod_net))
+        assert api_client.host_config_kwargs["network_mode"] == pod_net
+    else:
+        with pytest.raises(RentalDockerOperationError, match="gone since its egress drop"):
+            await client.run_container(_rental_spec(network=pod_net))
+        assert api_client.created_container is None and api_client.started == []
+    assert api_client.created_networks == []
+
+
 @pytest.mark.asyncio
 async def test_run_container_without_a_network_stays_on_the_default_bridge():
     api_client = FakeApiClient()

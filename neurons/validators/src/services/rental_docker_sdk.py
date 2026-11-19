@@ -1134,8 +1134,15 @@ class RentalDockerSdkClient:
         return None
 
     def _run_container_sync(self, spec: ContainerRunSpec, *, adopt_existing: bool = False) -> str | None:
-        if spec.network:
+        if spec.network == RENTAL_NETWORK_NAME:
             self._ensure_rental_network_sync(spec.network)
+        elif spec.network:
+            # a pod's own bridge is created only before its egress drop is applied (ensure_network): one gone since
+            # fails this attempt, never comes back here as a bridge the drop was not confirmed on (DAH-6737)
+            network = self._inspect_network_or_none(spec.network)
+            if network is None:
+                raise RentalDockerOperationError(f"Docker network {spec.network} is gone since its egress drop was applied")
+            _require_icc_off(spec.network, network)
         created = None
         adopted_id = self._adopt_container_by_name_sync(spec) if adopt_existing else None
         if adopted_id is None:

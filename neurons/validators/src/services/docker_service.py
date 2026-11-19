@@ -2022,6 +2022,8 @@ class _EditSwap:
         # what Docker reports for the pod after a failed edit's undo (DAH-6737): "running", "down" or "unknown". Only
         # "down" lets the failure reply carry the no-billing host-fault code; set by __aexit__
         self.pod_state_after_undo = "unknown"
+        # the undo's own guard refused to start the parked original: the pod may be down whatever the edit failed on
+        self.undo_guard_refused = False
         # The replacement's own Docker ID, once `docker run` returned it. The undo removes by this ID:
         # a concurrent retry may hold the pod name by then, and removing by name would delete it.
         self.replacement_id: str | None = None
@@ -2317,8 +2319,10 @@ class _EditSwap:
         finally:
             # after the parked container is gone or renamed back, never before
             await self._record_parked(False)
-            # read only where it decides the reply's code: a guard refusal is the one failure that can be a host fault
-            if isinstance(_last_attempt_exception(exc), RentalEgressGuardRefused) and not self.replacement_is_up:
+            # read only where it decides the reply's code: a guard refusal (the replacement's or the undo's) is the one
+            # failure that can leave the pod down
+            guard_refused = isinstance(_last_attempt_exception(exc), RentalEgressGuardRefused) or self.undo_guard_refused
+            if guard_refused and not self.replacement_is_up:
                 self.pod_state_after_undo = await self._observed_pod_state()
 
     async def _observed_pod_state(self) -> str:
@@ -2405,6 +2409,7 @@ class _EditSwap:
                     raise RuntimeError(f"docker rename: {(renamed.stderr or '').strip()}")
             except Exception as exc:  # noqa: BLE001 — the undo is best effort; the error is what we log
                 error = f"{type(exc).__name__}: {exc}"
+                self.undo_guard_refused = isinstance(exc, RentalEgressGuardRefused)
                 # left running under its kept name, nothing would ever stop it or free the pod's GPUs: stopped,
                 # the next edit recovers it as the crashed-edit kept copy
                 stopped = await self._run(f"/usr/bin/docker stop -t 10 {q_parked}")
@@ -2428,6 +2433,7 @@ class _EditSwap:
                     await self.bring_up(self.container_name, True)
             except Exception as exc:  # noqa: BLE001 — the undo is best effort; the error is what we log
                 error = f"{type(exc).__name__}: {exc}"
+                self.undo_guard_refused = isinstance(exc, RentalEgressGuardRefused)
         else:
             started = await self._run(f"/usr/bin/docker start {q_name}")
             if started.exit_status != 0:
@@ -12537,7 +12543,10 @@ class DockerService:
                     # refused before `docker run`, and Docker reports no container of the pod running: nothing of
                     # it runs on the node (DAH-6737); one that runs, or a state that could not be read, stays billed
                     else FailedContainerErrorCodes.ExecutorUnreachable
-                    if isinstance(last_exc, RentalEgressGuardRefused)
+                    if (
+                        isinstance(last_exc, RentalEgressGuardRefused)
+                        or (edit_swap is not None and edit_swap.undo_guard_refused)
+                    )
                     and (edit_swap is None or edit_swap.pod_state_after_undo == "down")
                     else FailedContainerErrorCodes.UnknownError
                 ),
