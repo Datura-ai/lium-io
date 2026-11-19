@@ -57,7 +57,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - id: pkgs
-        uses: ./.github/actions/changed-packages
+        # bound to a commit, not ./: a workspace action is whatever the job's checkout holds (pinned-actions)
+        uses: Datura-ai/lium-io/.github/actions/changed-packages@d878534351f184bbd921a0442ed8e08057948df9
 
   ruff-check:
     # DAH-2972: gate the rule families that are at zero after the dead-code sweep (DAH-2971) so

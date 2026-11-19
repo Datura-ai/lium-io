@@ -18,6 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0  # an own-repo action bound to a commit is read at that commit
       # every workflow and local action pins third-party actions to a commit and images to a digest, never to a movable tag;
       # the files are parsed as YAML so quoting and spacing cannot hide a reference
       - name: All actions are pinned to commit SHAs
@@ -25,7 +27,7 @@ jobs:
           python3 -m venv /tmp/venv
           /tmp/venv/bin/pip install -q pyyaml==6.0.3
           /tmp/venv/bin/python - <<'PY'
-          import pathlib, posixpath, re, subprocess, sys, tempfile, yaml
+          import os, pathlib, posixpath, re, subprocess, sys, yaml
 
           class Loader(yaml.SafeLoader):
               """GitHub's YAML: only true/false are booleans (PyYAML's 1.1 rules make yes/on/no/off booleans too,
@@ -46,16 +48,56 @@ jobs:
 
           digest = r"docker://[^@\s]+@sha256:[0-9a-f]{64}"
           pinned = re.compile(rf"(?!docker://)[^@\s]+@[0-9a-f]{{40}}|{digest}")
+          image_pin = re.compile(r"[^@\s$]+@sha256:[0-9a-f]{64}")
           # the runner reads the scheme case-insensitively, so DOCKER:// must not slip past the checks
           norm = lambda ref: re.sub(r"^docker://", "docker://", str(ref), flags=re.I)
 
-          def scan(files, tracked):
-              bad = []
-              for path in files:
+          def builds(image):
+              """The runner's IsDockerfile: not docker://, and a basename that starts with Dockerfile. or ends with Dockerfile, any case."""
+              base = str(image).rsplit("/", 1)[-1].lower()
+              return not norm(image).startswith("docker://") and (base.startswith("dockerfile.") or base.endswith("dockerfile"))
+
+          def unpinned_bases(text):
+              """Every image a Dockerfile build pulls (the syntax frontend, FROM, COPY/ADD --from, RUN --mount from=) that is not
+              a digest, scratch or an earlier stage. A value the check cannot read as one of those (an ARG, ${...}) is unpinned."""
+              text = re.sub(r"\\\r?\n", " ", text)
+              pulls, stages = [], set()
+              syntax = re.match(r"\s*#\s*syntax\s*=\s*(\S+)", text, re.I)
+              if syntax:
+                  pulls.append(syntax[1])
+              for line in text.splitlines():
+                  words = line.split()
+                  if not words or words[0].startswith("#"):
+                      continue
+                  kw, args = words[0].upper(), words[1:]
+                  plain = [a for a in args if not a.startswith("--")]
+                  if kw == "FROM":
+                      src = plain[0] if plain else ""
+                      if src.lower() not in stages and src.lower() != "scratch":
+                          pulls.append(src)
+                      if len(plain) >= 3 and plain[1].upper() == "AS":
+                          stages.add(plain[2].lower())
+                  elif kw in ("COPY", "ADD", "RUN"):
+                      for a in args:
+                          for src in re.findall(r"(?:^--from=|[,=]from=)([^,\s]+)", a, re.I) if a.startswith("--") else []:
+                              if src.lower() not in stages and not src.isdigit():
+                                  pulls.append(src)
+              return [p for p in pulls if not image_pin.fullmatch(p)]
+
+          def scan(files, read, exists, repo):
+              """files: workflow and manifest paths in the working tree. read(path, sha) and exists(path, sha) see the tracked tree
+              (sha None) or a commit; an own-repo action pinned to a commit is scanned as it is at that commit."""
+              bad, queue, seen = [], [(str(f), None) for f in files], set()
+              while queue:
+                  path, at = queue.pop(0)
+                  if (path, at) in seen:
+                      continue
+                  seen.add((path, at))
+                  where = f"{path}@{at}" if at else path
                   try:
-                      doc = yaml.load(path.read_text(), Loader=Loader) or {}
-                  except yaml.YAMLError as e:
-                      bad.append(f"{path}: not checkable: {e}".replace("\n", " "))
+                      doc = yaml.load(read(path, at), Loader=Loader) or {}
+                  except Exception as e:
+                      bad.append(f"{where}: not checkable: {e}".replace("\n", " "))
                       continue
                   jobs = list((doc.get("jobs") or {}).values())
                   runs = doc.get("runs") or {}
@@ -64,31 +106,42 @@ jobs:
                   for level, ref in refs:
                       if ref is None:
                           continue
-                      if str(ref).startswith("./"):
-                          # a local action is checked through its manifest, so it must be a tracked one: a manifest written
-                          # at run time is never scanned (the runner resolves ./ from the repository root)
-                          d = str(ref)[2:]  # the literal path the runner opens: nothing after it is a ref
-                          # a job's ./x.yml is a reusable workflow (scanned with the workflows); a step's ./dir is always an
-                          # action directory, so a step path naming a workflow file still needs a manifest inside it. Only
-                          # action.yml: the runner prefers it over action.yaml, so one generated beside a tracked action.yaml
-                          # would run unscanned
-                          want = [d] if level == "job" else [posixpath.join(d, "action.yml")]
-                          if not {posixpath.normpath(w) for w in want} & tracked:
-                              bad.append(f"{path}: {ref} is not a tracked workflow or action manifest")
-                      elif not pinned.fullmatch(norm(ref)):
-                          bad.append(f"{path}: {ref}")
-                  # a Docker action's image: the runner builds it only when the value ends in Dockerfile/dockerfile (then it
-                  # must be a tracked file beside the manifest); every other value is a registry image and needs a digest,
-                  # with or without docker://, whatever file of that name the repo holds
+                      ref = str(ref)
+                      if ref.startswith("./"):
+                          # a job's ./x.yml is a reusable workflow, read from the run's commit and scanned with the workflows. A
+                          # step's ./dir is read from the job's workspace at run time, which any checkout of another ref replaces:
+                          # bind it to a commit as <owner>/<repo>/<dir>@<sha> instead
+                          if level == "step":
+                              bad.append(f"{where}: {ref}: a workspace action; use {repo}/{ref[2:].rstrip('/')}@<commit sha>")
+                          elif not exists(posixpath.normpath(ref[2:]), at):
+                              bad.append(f"{where}: {ref} is not a tracked workflow")
+                          continue
+                      if not pinned.fullmatch(norm(ref)):
+                          bad.append(f"{where}: {ref}")
+                          continue
+                      own = re.fullmatch(rf"{re.escape(repo)}/(.+)@([0-9a-f]{{40}})", ref, re.I)
+                      if own:
+                          # the runner prefers action.yml; at a fixed commit nothing can be generated beside it
+                          d, sha = posixpath.normpath(own[1]), own[2]
+                          manifest = d if level == "job" else next((m for m in (f"{d}/action.yml", f"{d}/action.yaml") if exists(m, sha)), None)
+                          if manifest and exists(manifest, sha):
+                              queue.append((manifest, sha))
+                          else:
+                              bad.append(f"{where}: {ref} has no workflow or action manifest at that commit")
+                  # a Docker action's image: built from a Dockerfile beside the manifest (then every image that build pulls needs a
+                  # digest), else a registry image that needs one itself
                   image = runs.get("image")
                   if image is not None:
-                      v = norm(image)
-                      if str(image).endswith(("Dockerfile", "dockerfile")) and not v.startswith("docker://"):
-                          ok = posixpath.normpath(posixpath.join(posixpath.dirname(str(path)), str(image))) in tracked
+                      if builds(image):
+                          df = posixpath.normpath(posixpath.join(posixpath.dirname(path), str(image)))
+                          if not exists(df, at):
+                              bad.append(f"{where}: runs.image {image} is not a tracked file")
+                          else:
+                              bad += [f"{where}: {df} pulls {src} without a digest" for src in unpinned_bases(read(df, at))]
                       else:
-                          ok = re.fullmatch(digest, v if v.startswith("docker://") else "docker://" + v)
-                      if not ok:
-                          bad.append(f"{path}: runs.image {image}")
+                          v = norm(image)
+                          if not re.fullmatch(digest, v if v.startswith("docker://") else "docker://" + v):
+                              bad.append(f"{where}: runs.image {image}")
                   # job containers and services start before the steps, with the job's token: digest only
                   for job in jobs:
                       container = job.get("container")
@@ -96,39 +149,72 @@ jobs:
                       images += [(svc or {}).get("image") for svc in (job.get("services") or {}).values()]
                       for img in images:
                           if img and not re.fullmatch(digest, "docker://" + re.sub(r"^docker://", "", str(img), flags=re.I)):
-                              bad.append(f"{path}: container/service image {img}")
+                              bad.append(f"{where}: container/service image {img}")
               return bad
 
-          # regression self-test: job IDs yes/on stay two jobs, and a repeated job ID is refused, before the real scan
-          sha = "a" * 40
+          # regression self-test on an in-memory tree (path, commit) -> text, before the real scan
+          sha, other, dig = "a" * 40, "b" * 40, "@sha256:" + "0" * 64
+          img = "runs:\n  using: docker\n  image: "
+          base = {
+              (".github/actions/ok/action.yml", None): "runs:\n  using: composite\n  steps: []\n",
+              (".github/workflows/ok.yml", None): "on: push\n",
+              (".github/actions/yaml/action.yaml", None): "runs: {}\n",
+              ("w/Dockerfile", None): f"FROM alpine{dig} AS b\nFROM b\nCOPY --from=b /x /y\n",
+              ("w/Dockerfile.runner", None): f"# syntax=docker/dockerfile{dig}\nFROM scratch\n",
+              ("w/DOCKERFILE", None): f"FROM alpine{dig}\n",
+              ("w/alpine", None): "",
+              ("w/tag/Dockerfile", None): "FROM alpine:3\n",
+              ("w/syntax/Dockerfile", None): "# syntax=docker/dockerfile:1\nFROM scratch\n",
+              ("w/arg/Dockerfile", None): f"ARG V=3\nFROM alpine:${{V}}\n",
+              ("w/copy/Dockerfile", None): f"FROM alpine{dig}\nCOPY --from=busybox:1 /bin/sh /sh\nRUN --mount=type=bind,from=node:20,target=/n true\n",
+              ("w/cont/Dockerfile", None): f"FROM \\\n  alpine:3\n",
+              (".github/actions/ok/action.yml", sha): "runs:\n  using: composite\n  steps:\n    - uses: acme/act@" + sha + "\n",
+              (".github/actions/ok/action.yml", other): "runs:\n  using: composite\n  steps:\n    - uses: acme/act@v1\n",
+          }
           cases = {
               "jobs:\n  yes:\n    steps:\n      - uses: acme/act@v1\n  on:\n    steps:\n      - uses: acme/act@" + sha + "\n": 1,
               "jobs:\n  a:\n    steps:\n      - uses: acme/act@v1\n  a:\n    steps:\n      - uses: acme/act@" + sha + "\n": 1,
               "jobs:\n  yes:\n    steps:\n      - uses: acme/act@" + sha + "\n  on:\n    steps:\n      - uses: acme/act@" + sha + "\n": 0,
-              "jobs:\n  a:\n    steps:\n      - uses: ./gen/act\n      - uses: ./.github/actions/ok/\n      - uses: ./.github/actions/ok@main\n      - uses: ./.github/workflows/ok.yml\n  b:\n    uses: ./.github/workflows/ok.yml\n  c:\n    uses: ./.github/workflows/gen.yml\n": 4,
-          }
-          img = "runs:\n  using: docker\n  image: "
-          cases.update({
-              "jobs:\n  a:\n    steps:\n      - uses: ./.github/actions/yaml\n": 1,  # only action.yaml tracked
+              # every step ./ action fails, whether or not it is tracked; a job's ./ workflow must be tracked
+              "jobs:\n  a:\n    steps:\n      - uses: ./gen/act\n      - uses: ./.github/actions/ok/\n      - uses: ./.github/actions/ok@main\n      - uses: ./.github/actions/yaml\n  b:\n    uses: ./.github/workflows/ok.yml\n  c:\n    uses: ./.github/workflows/gen.yml\n": 5,
+              # an own-repo action bound to a commit is scanned as it is at that commit, in any case of the repo name
+              "jobs:\n  a:\n    steps:\n      - uses: Acme/Repo/.github/actions/ok@" + sha + "\n": 0,
+              "jobs:\n  a:\n    steps:\n      - uses: acme/repo/.github/actions/ok@" + other + "\n": 1,
+              "jobs:\n  a:\n    steps:\n      - uses: acme/repo/.github/actions/none@" + sha + "\n": 1,
               img + "alpine:3\n": 1,
               img + "docker://alpine:3\n": 1,
-              img + "docker://alpine@sha256:" + "0" * 64 + "\n": 0,
-              img + "Dockerfile\n": 0,
-              img + "Missing.Dockerfile\n": 1,
+              img + "docker://alpine" + dig + "\n": 0,
               img + "alpine\n": 1,  # a tracked file named alpine sits beside it: still a registry image
-              img + "alpine@sha256:" + "0" * 64 + "\n": 0,
-          })
-          with tempfile.TemporaryDirectory() as d:
-              for i, (text, want) in enumerate(cases.items()):
-                  f = pathlib.Path(d, f"case{i}.yml"); f.write_text(text)
-                  known = {".github/actions/ok/action.yml", ".github/workflows/ok.yml", ".github/actions/yaml/action.yaml", f"{d}/Dockerfile", f"{d}/alpine"}
-                  assert len(scan([f], known)) == want, (i, scan([f], known))
+              img + "alpine" + dig + "\n": 0,
+              img + "Dockerfile\n": 0,
+              img + "Dockerfile.runner\n": 0,  # Dockerfile. prefix, a pinned syntax frontend
+              img + "DOCKERFILE\n": 0,  # any case
+              img + "Missing.Dockerfile\n": 1,
+              img + "tag/Dockerfile\n": 1,
+              img + "syntax/Dockerfile\n": 1,
+              img + "arg/Dockerfile\n": 1,
+              img + "copy/Dockerfile\n": 2,
+              img + "cont/Dockerfile\n": 1,
+          }
+          for i, (text, want) in enumerate(cases.items()):
+              tree = {**base, (f"w/case{i}.yml", None): text}
+              read = lambda p, at: tree[(p, at)]
+              exists = lambda p, at: (p, at) in tree
+              got = scan([f"w/case{i}.yml"], read, exists, "acme/repo")
+              assert len(got) == want, (i, got)
 
-          # every tracked action manifest, wherever it lives: `uses: ./any/dir` runs that dir's action.yml
-          actions = [a for a in subprocess.run(["git", "ls-files", "-z", ":(glob)**/action.yml", ":(glob)**/action.yaml"], capture_output=True, text=True, check=True).stdout.split("\0") if a]
-          files = sorted(pathlib.Path(".github/workflows").glob("*.y*ml")) + sorted(pathlib.Path(a) for a in actions)
-          tracked = set(subprocess.run(["git", "ls-files", "-z"], capture_output=True, text=True, check=True).stdout.split("\0"))
-          bad = scan(files, tracked)
+          def git(*args):
+              return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout
+          tracked = set(git("ls-files", "-z").split("\0"))
+          def read(path, at):
+              return pathlib.Path(path).read_text() if at is None else git("show", f"{at}:{path}")
+          def exists(path, at):
+              return path in tracked if at is None else subprocess.run(["git", "cat-file", "-e", f"{at}:{path}"], capture_output=True).returncode == 0
+
+          # every tracked action manifest, wherever it lives, and every workflow
+          actions = [a for a in git("ls-files", "-z", ":(glob)**/action.yml", ":(glob)**/action.yaml").split("\0") if a]
+          files = sorted(str(p) for p in pathlib.Path(".github/workflows").glob("*.y*ml")) + sorted(actions)
+          bad = scan(files, read, exists, os.environ["GITHUB_REPOSITORY"])
           print("\n".join(bad) or f"all pinned ({len(files)} files)")
           sys.exit(1 if bad else 0)
           PY
