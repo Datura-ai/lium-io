@@ -228,6 +228,7 @@ from services.rental_docker_sdk import (
     keep_alive_command_for,
     is_docker_container_not_running_error,
     is_docker_not_found_error,
+    is_transport_not_reopened,
     is_rental_docker_transport_drop,
     build_environment_exec_spec,
     build_remove_authorized_keys_exec_spec,
@@ -1525,6 +1526,8 @@ async def _raise_unless_running_before_created(
                     state=None,
                 ) from inspect_exc
             if attempt == FINAL_STATE_INSPECT_ATTEMPTS:
+                if is_transport_not_reopened(inspect_exc):
+                    raise  # the node stopped answering: that is the diagnosis, not an unread State
                 raise RuntimeError(
                     f"could not read the container State before caching the pod "
                     f"({FINAL_STATE_INSPECT_ATTEMPTS} attempts): {inspect_exc}"
@@ -10933,7 +10936,8 @@ class DockerService:
                         except _CreateCancelledByDelete:
                             raise
                         except Exception as exc:
-                            if login_error is None:
+                            # a node that stopped answering is not the login's fault: report the dead transport
+                            if login_error is None or is_transport_not_reopened(exc):
                                 raise
                             # docker-py pulls anonymously after a failed login, so the
                             # pull failure is most likely the login's fault — attribute it,

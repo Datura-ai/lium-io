@@ -22,6 +22,7 @@ from services.rental_docker_sdk import (
     RentalDockerOperationError,
     RentalDockerSdkClient,
     RentalDockerSdkClientFactory,
+    RentalDockerTransportNotReopened,
 )
 
 # The three error texts of the cluster, as the validator logged them.
@@ -375,3 +376,59 @@ async def test_pull_whose_reply_ends_prematurely_is_retried_once_after_reopen():
 
     assert pulls == ["daturaai/pytorch:x", "daturaai/pytorch:x"]
     assert adapter.reopen_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_a_host_gone_silent_fails_the_inspect_as_a_dropped_transport_not_a_bare_timeout(
+    tmp_path, monkeypatch
+):
+    # a host stopped answering mid-create: the session under the Docker SDK died and every
+    # re-connect timed out at TCP. The create failure read "inspect container failed: timed out",
+    # so the backend kept the renter on that host.
+    import services.rental_docker_sdk as sdk
+
+    adapter_class = sdk._build_rental_ssh_http_adapter_class(
+        key_path=tmp_path / "key", known_hosts_path=tmp_path / "known_hosts"
+    )
+    adapter = adapter_class.__new__(adapter_class)
+    adapter.pools = SimpleNamespace(lock=threading.Lock(), get=lambda host: None)
+    adapter.ssh_host = "node"
+    dead = Mock(is_active=Mock(return_value=False))
+    adapter.ssh_client = Mock(get_transport=Mock(return_value=dead))
+    monkeypatch.setattr(adapter_class, "_connect", Mock(side_effect=TimeoutError("timed out")))
+
+    class _SilentHostApiClient(_FakeApiClient):
+        def inspect_container(self, name):
+            adapter.get_connection("http+docker://ssh/v1/containers/json")
+
+    api_client = _SilentHostApiClient(adapter=_FakeAdapter(reopen_error=TimeoutError("timed out")))
+
+    with pytest.raises(RentalDockerOperationError) as raised:
+        await _client(api_client).inspect_container_state(container_name="pod_test")
+
+    assert "Docker SDK inspect container failed on a dropped SSH transport" in str(raised.value)
+    # and it holds the node: the re-open's own timeout must not hide the drop from the strict classifier
+    from services.docker_service import is_host_fault_create_failure
+
+    assert is_host_fault_create_failure("container_health_check", raised.value)
+
+
+@pytest.mark.asyncio
+async def test_a_read_timeout_then_a_reset_while_reopening_still_holds_the_node():
+    # the first error is a read timeout (a transport error, not a strict drop); the re-open then hits a reset
+    import requests
+
+    from services.docker_service import is_host_fault_create_failure
+
+    class _TimeoutApiClient(_FakeApiClient):
+        def inspect_container(self, name):
+            raise requests.exceptions.ReadTimeout("read timed out")
+
+    api_client = _TimeoutApiClient(adapter=_FakeAdapter(reopen_error=ConnectionResetError("reset by peer")))
+
+    with pytest.raises(RentalDockerOperationError) as raised:
+        await _client(api_client).inspect_container_state(container_name="pod_test")
+
+    assert is_host_fault_create_failure("container_health_check", raised.value)
+    # the create reports it at ssh_connect: the node refused the new connection
+    assert isinstance(raised.value, RentalDockerTransportNotReopened)
