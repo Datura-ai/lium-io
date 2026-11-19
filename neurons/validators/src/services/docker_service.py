@@ -10787,6 +10787,10 @@ class DockerService:
                 # after the filler was already gone, stranding the host. So the removal starts only now, once the
                 # host reads have succeeded, and still runs beside the image inspect/pull below.
                 if removes_fillers_at_ssh_connect:
+                    # the rm is irreversible: an early probe whose channel may still hold the one session must stop
+                    # the create before it, not after the filler is gone (review on lium-io#2364)
+                    current_step = "prerun_host_probe"
+                    await settle_early_probes()
                     filler_removal_at_ssh_connect = asyncio.create_task(
                         self.remove_fillers_at_ssh_connect(
                             ssh_client,

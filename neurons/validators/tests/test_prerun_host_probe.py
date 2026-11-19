@@ -701,13 +701,14 @@ _RECREATED_ID = "b" * 64
         (_REMOVED_AT_SSH_CONNECT_ID, [_REMOVED_AT_SSH_CONNECT_ID], 0, 0, []),
         # a listing without IDs: the removal at SSH connect still targets the ID it listed, not the name
         (None, [_REMOVED_AT_SSH_CONNECT_ID], 0, 0, []),
-        # the kill is issued at SSH connect: confirmed before the image inspect and the probes finish
-        (None, [_REMOVED_AT_SSH_CONNECT_ID], 0, 0.05, ["host probed", "image inspected"]),
+        # the kill is issued once the early host probe ended (review on lium-io#2364: a probe that may still hold the
+        # session stops the create before the rm), and is confirmed before the image inspect beside it finishes
+        (None, [_REMOVED_AT_SSH_CONNECT_ID], 0, 0.05, ["image inspected"]),
         # safety order: a PEARL filler is gone before its cap is lifted (beside the volume create, and again
         # right before docker run), and the Dolphin cache is reclaimed only once the filler that mounts it is gone
         (None, [_REMOVED_AT_SSH_CONNECT_ID], 0.05, 0, ["cache reclaim", "docker run", "power restore", "power restore"]),
     ],
-    ids=["same_instance", "cleanup_listing_without_ids", "before_the_image_inspect_and_the_probes_finish",
+    ids=["same_instance", "cleanup_listing_without_ids", "before_the_image_inspect_finishes",
          "before_power_restore_cache_reclaim_and_docker_run"],
 )
 async def test_the_filler_removed_at_ssh_connect_goes_first_and_only_once(
@@ -1303,3 +1304,25 @@ async def test_a_cancelled_filler_cleanup_waits_for_a_started_probe_and_stops_on
         await svc._abort_if_cancelled_by_delete(Mock(), payload, {}, session_taken)
     assert order == []
     restore.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_probe_that_may_still_hold_the_session_stops_the_create_before_the_filler_removal(svc_fixture, monkeypatch):
+    """Review on lium-io#2364: the filler removal at SSH connect is irreversible. An early probe whose channel close is
+    not confirmed stops the customer create before that removal, so the node keeps its filler."""
+    svc = svc_fixture
+    _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers("filler_x"))
+
+    async def probe_close_not_confirmed(*args, **kwargs):
+        await asyncio.sleep(0.05)  # still running when the removal would start
+        raise ds_module.SshSessionMayStillBeTakenError("close not confirmed")
+
+    svc.probe_prerun_host = AsyncMock(side_effect=probe_close_not_confirmed)
+    svc.remove_fillers_at_ssh_connect = AsyncMock(return_value=None)
+
+    result = await asyncio.wait_for(
+        _run_create_container(svc, _deploy_payload(active_volume_names=["volume_keep"])), timeout=5
+    )
+
+    assert result.failure_step == "prerun_host_probe"
+    svc.remove_fillers_at_ssh_connect.assert_not_awaited()
