@@ -11112,6 +11112,9 @@ class DockerService:
                     host_probe, early_host_probe_step = await early_host_probe
                     profilers.append(early_host_probe_step)
                 else:
+                    # a pull discards the early probe; on a one-session host it may still hold the channel, so it
+                    # ends (or stops the create on an unconfirmed close) before this probe opens another
+                    await settle_early_probes()
                     host_probe = await self.probe_prerun_host(
                         ssh_client,
                         docker_image=payload.docker_image,

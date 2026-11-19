@@ -1380,3 +1380,30 @@ async def test_a_delete_while_the_early_probes_settle_keeps_the_filler(svc_fixtu
 
     assert deleted
     svc.remove_fillers_at_ssh_connect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_pull_waits_for_the_discarded_early_probe_and_stops_if_it_may_still_hold_the_session(
+    svc_fixture, monkeypatch
+):
+    # MaxSessions=1: with the image to pull, the early probe is discarded; the fallback probe must not open a
+    # channel beside it, and an early probe whose close is unconfirmed stops the create before any cleanup
+    svc = svc_fixture
+    _wire_early_probes(svc, monkeypatch, image_present=False)
+    running: list[int] = []
+
+    async def early_probe_then_unconfirmed_close(*args, **kwargs):
+        assert not running, "the fallback probe started while the early probe still held the session"
+        running.append(1)
+        await asyncio.sleep(0.2)
+        running.pop()
+        raise SshSessionMayStillBeTakenError("close not confirmed")
+
+    svc.probe_prerun_host = AsyncMock(side_effect=early_probe_then_unconfirmed_close)
+    svc.clean_existing_containers = AsyncMock()
+
+    result = await _run_create_container(svc, _deploy_payload())
+
+    assert type(result).__name__ == "FailedContainerRequest", getattr(result, "msg", "")
+    assert svc.probe_prerun_host.await_count == 1
+    svc.clean_existing_containers.assert_not_awaited()
