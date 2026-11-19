@@ -18,7 +18,9 @@ What lives here:
   and a validation-error list in `detail`. The other refusals carry a string `detail`: HTTP 400 for
   a timestamp before 2000-01-01 after normalization (values above 1e12 are read as milliseconds),
   HTTP 401 for a timestamp outside the allowed window after normalization or an invalid or malformed signature, and
-  HTTP 403 for an unregistered validator hotkey or an `X-Miner-Hotkey` naming another miner.
+  HTTP 403 for an unregistered validator hotkey. Outside `CENTRAL_MODE` an `X-Miner-Hotkey` other than
+  this miner's own hotkey also gets 403. In `CENTRAL_MODE` the miner serves many portal hotkeys, so any
+  `X-Miner-Hotkey` is accepted, and a request body that names a different miner than the header gets 403.
 - `datura/errors/protocol.py` — the protocol-level exceptions.
 
 Adding a message type means adding a model in the right `*_requests.py` and a
