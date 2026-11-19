@@ -684,8 +684,37 @@ def test_the_host_unit_stops_every_gpu_holder_and_starts_them_again_in_reverse(t
 def test_the_host_unit_reads_no_files_filesystem_so_a_stalled_one_cannot_hold_it_down(tmp_path):
     # DAH-6741 review: the harness's stat never returns; the unit still resets and starts everything again
     done, log = _run_fabric_script(tmp_path, reset_exit=3, procs={4242: ("agent", f"0::/system.slice/{AGENT}")})
-    assert done.returncode == 3 and log[-2:] == [f"start {NVLSM}", f"start {FM}"]
+    assert done.returncode == 3 and log[-3:] == [f"start {NVLSM}", f"start {FM}", f"start {AGENT}"]
     assert "GPU holders left: agent" in done.stdout
+
+
+def test_the_host_unit_stops_a_service_that_opened_a_gpu_after_the_scan_and_starts_it_last(tmp_path):
+    # DAH-6741 review: a monitor started after the validator's scan; the given services and the unit are not stopped
+    # twice, and a process outside system.slice services (a container) is not a unit to stop
+    procs = {
+        4242: ("monitor", "0::/system.slice/late-monitor.service"),
+        4243: ("dcgm", "0::/system.slice/nvidia-dcgm.service"),
+        4244: ("sh", f"0::/system.slice/{gpu_reset.FABRIC_RESET_UNIT}.service"),
+        4245: ("python3", "0::/system.slice/docker-abc.scope"),
+    }
+    done, log = _run_fabric_script(tmp_path, units=("nvidia-dcgm", FM), procs=procs)
+    assert done.returncode == 0
+    assert log == [
+        "stop nvidia-dcgm",
+        f"stop {FM}",
+        "stop late-monitor.service",
+        f"reset -r -i {U[0]}",
+        f"start {FM}",
+        "start nvidia-dcgm",
+        "start late-monitor.service",
+    ]
+
+
+def test_the_host_unit_skips_the_reset_when_a_late_service_does_not_stop_and_starts_everything_again(tmp_path):
+    procs = {4242: ("monitor", "0::/system.slice/late-monitor.service")}
+    done, log = _run_fabric_script(tmp_path, stop_fails="late-monitor.service", units=(FM,), procs=procs)
+    assert done.returncode == gpu_reset._FABRIC_STOP_FAILED_EXIT
+    assert log == [f"stop {FM}", "stop late-monitor.service", f"start {FM}", "start late-monitor.service"]
 
 
 def _run_holder_units_scan(tmp_path, procs: dict[int, tuple[str, str]]) -> subprocess.CompletedProcess:

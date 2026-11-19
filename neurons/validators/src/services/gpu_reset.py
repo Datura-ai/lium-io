@@ -99,9 +99,13 @@ GPU_HOLDER_PIDS_SCRIPT = (
 # readlink on /proc, which never touches the file's filesystem, so it cannot block the unit before its restore; text
 # for the report only, nothing is decided on it. No ${...} in a unit script: systemd expands it in the command line
 # before /bin/sh runs (to "" if unknown)
-GPU_HOLDERS_SCRIPT = (
-    "for p in $(find /proc/[0-9]*/fd -lname '/dev/nvidia*' 2>/dev/null | sed 's#/fd/.*##; s#.*/##' | sort -u); "
-    "do cat /proc/$p/comm; done 2>/dev/null | sort -u | tr '\\n' ' '"
+_GPU_PATH_HOLDER_PIDS = "find /proc/[0-9]*/fd -lname '/dev/nvidia*' 2>/dev/null | sed 's#/fd/.*##; s#.*/##' | sort -u"
+GPU_HOLDERS_SCRIPT = f"for p in $({_GPU_PATH_HOLDER_PIDS}); do cat /proc/$p/comm; done 2>/dev/null | sort -u | tr '\\n' ' '"
+# the host services holding a /dev/nvidia* node open, by the same readlink only: the unit's second look, after its
+# stops, for a service that opened a GPU after the validator's scan (which matched by device number before the stop)
+GPU_PATH_HOLDER_UNITS_SCRIPT = (
+    f"for p in $({_GPU_PATH_HOLDER_PIDS}); do "
+    "sed -n 's#.*:/system.slice/\\([^/]*\\.service\\)$#\\1#p' /proc/$p/cgroup; done 2>/dev/null | sort -u"
 )
 
 
@@ -613,12 +617,13 @@ async def _widen_targets_to_nvlink_peers(
 def build_fabric_reset_command(units: list[str], reset_command: str, containers: list[str] = ()) -> str:
     """Stop the GPU holders (containers, then the given services: the ones plan_host_holders found holding a GPU
     first), reset, start them all again (the given services last stopped first, then the containers) as one host
-    systemd unit. A refused reset prints the processes still holding a GPU. Nothing in it reads a file's
-    filesystem, so a stalled one cannot keep it from its starts.
+    systemd unit. After its stops it looks once more, by readlink, for a host service that opened a GPU device after
+    the validator's scan, stops it too and starts it again after the others. A refused reset prints the processes
+    still holding a GPU. Nothing in it reads a file's filesystem, so a stalled one cannot keep it from its starts.
 
     The unit outlives the SSH session, and SIGPIPE is ignored so a closed pipe cannot kill it before the start."""
     fail = f'|| {{ echo "could not stop $u" >&2; rc={_FABRIC_STOP_FAILED_EXIT}; break; }}'
-    script = "trap '' PIPE; rc=0; dying=''; "
+    script = "trap '' PIPE; rc=0; dying=''; late=''; "
     if containers:
         ids = " ".join(shlex.quote(c) for c in containers)
         script += (
@@ -629,6 +634,13 @@ def build_fabric_reset_command(units: list[str], reset_command: str, containers:
     if units:
         stop = " ".join(shlex.quote(u) for u in units)
         script += f'[ $rc -ne 0 ] || for u in {stop}; do systemctl stop "$u" {fail}; done; '
+    # a host service that opened a GPU after the validator's scan: stopped too (and started again after the others),
+    # or the driver refuses the reset with the pod already stopped. Readlink only, so it cannot block the unit
+    planned = " ".join(u if u.endswith(".service") else f"{u}.service" for u in (*units, FABRIC_RESET_UNIT))
+    script += (
+        f"[ $rc -ne 0 ] || {{ for u in $({GPU_PATH_HOLDER_UNITS_SCRIPT}); do "
+        f'case " {planned} " in *" $u "*) ;; *) late="$late $u"; systemctl stop "$u" {fail};; esac; done; }}; '
+    )
     script += (
         f"[ $rc -ne 0 ] || {{ {reset_command}; rc=$?; "
         f'[ $rc -eq 0 ] || echo "GPU holders left: $({GPU_HOLDERS_SCRIPT})"; }}; '
@@ -638,6 +650,7 @@ def build_fabric_reset_command(units: list[str], reset_command: str, containers:
         # start that fails here is checked and retried by the validator's restore of every one of them
         start = " ".join(shlex.quote(u) for u in reversed(units))
         script += f'for u in {start}; do systemctl start "$u"; done; '
+    script += 'for u in $late; do systemctl start "$u"; done; '
     if containers:
         # a failed stop may leave the container dying, and `docker start` is a no-op on a running one: wait for
         # the exit (a removed container ends the wait), then kill one still there and wait once more. Bounded, so
