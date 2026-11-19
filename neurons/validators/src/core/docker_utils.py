@@ -23,7 +23,7 @@ class DockerCommand:
         heredoc = "__NC_EOF__"
         network_flag = f"--network={network_mode}" if network_mode == "host" else network_mode
         return (
-            f"/usr/bin/docker run -d --rm --name {name} "
+            f"/usr/bin/docker run -d --rm --name {shlex.quote(name)} "
             f"{network_flag} docker.io/library/alpine:3.19 sh -c "
             f"'cat << \"{heredoc}\" > /tmp/nc.sh\n{script}\n{heredoc}\n"
             # `; exit $?`: as the last command sh would exec timeout, which execs the script as the
@@ -36,21 +36,22 @@ class DockerCommand:
     def run_dind(name: str, port: int, public_key: str, sysbox: bool) -> str:
         """Build docker run command for DinD container."""
         runtime = "--runtime=sysbox-runc " if sysbox else ""
-        ssh_cmd = (
-            "sh -c 'mkdir -p ~/.ssh && echo "
-            f"\"{public_key}\" >> ~/.ssh/authorized_keys "
-            "&& ssh-keygen -A && service ssh start && tail -f /dev/null'"
+        # the inner script is one shell word, quoted once: the key never sits inside hand-made quotes
+        inner = (
+            f"mkdir -p ~/.ssh && echo {shlex.quote(public_key)} >> ~/.ssh/authorized_keys "
+            "&& ssh-keygen -A && service ssh start && tail -f /dev/null"
         )
         return (
-            f"/usr/bin/docker run -d {runtime} --name {name} --label {LIUM_POD_ID_LABEL}={name} "
+            f"/usr/bin/docker run -d {runtime} --name {shlex.quote(name)} "
+            f"--label {shlex.quote(f'{LIUM_POD_ID_LABEL}={name}')} "
             "--gpus all "
-            f"-p {port}:22 {DOCKER_DIND_IMAGE} {ssh_cmd}"
+            f"-p {int(port)}:22 {DOCKER_DIND_IMAGE} sh -c {shlex.quote(inner)}"
         )
 
     @staticmethod
     def remove_with_volumes(name: str) -> str:
         """Build docker rm command that also removes anonymous volumes."""
-        return f"/usr/bin/docker rm -fv {name}"
+        return f"/usr/bin/docker rm -fv {shlex.quote(name)}"
 
     @staticmethod
     def dind_diagnostics(name: str, lines: int = 40) -> str:
@@ -164,23 +165,32 @@ class DockerCommand:
     @staticmethod
     def ps_filter(*name_patterns: str, output_format: str = "{{.Names}}") -> str:
         """Build docker ps command with one or more filters."""
-        filters = ' '.join(f'--filter "name={pattern}"' for pattern in name_patterns)
+        filters = " ".join(f"--filter {shlex.quote(f'name={pattern}')}" for pattern in name_patterns)
         return f"/usr/bin/docker ps -a {filters} --format {shlex.quote(output_format)}"
+
+    @staticmethod
+    def host_port_bindings() -> str:
+        """Build a command printing each container's name and published host ports, stopped containers included."""
+        # no pipe: a failed `docker ps` must exit non-zero, not read as a host without containers
+        return (
+            'ids=$(/usr/bin/docker ps -aq) && { [ -z "$ids" ] || /usr/bin/docker inspect --format '
+            "'{{.Name}} {{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostPort}} {{end}}{{end}}' $ids; }"
+        )
 
     @staticmethod
     def inspect_status(container_id: str) -> str:
         """Build docker inspect command for status."""
-        return f"/usr/bin/docker ps -a --filter id={container_id} --format '{{{{.Status}}}}|||{{{{.State}}}}' 2>&1"
+        return f"/usr/bin/docker ps -a --filter {shlex.quote(f'id={container_id}')} --format '{{{{.Status}}}}|||{{{{.State}}}}' 2>&1"
 
     @staticmethod
     def logs(container_id: str) -> str:
         """Build docker logs command."""
-        return f"/usr/bin/docker logs {container_id} 2>&1 | head -20"
+        return f"/usr/bin/docker logs {shlex.quote(container_id)} 2>&1 | head -20"
 
     @staticmethod
     def inspect_exit_code(container_id: str) -> str:
         """Build docker inspect for exit code."""
-        return f"/usr/bin/docker inspect {container_id} --format '{{{{.State.ExitCode}}}}' 2>&1"
+        return f"/usr/bin/docker inspect {shlex.quote(container_id)} --format '{{{{.State.ExitCode}}}}' 2>&1"
 
     @staticmethod
     def volume_remove(*volume_names: str) -> str:
@@ -375,16 +385,18 @@ async def collect_container_death_diagnostics(
     except Exception as exc:
         capture_errors.append(f"inspect: {exc}")
 
-    try:
-        logs_result = await ssh_client.run(
-            f"/usr/bin/docker logs --tail {_CONTAINER_DEATH_LOG_TAIL_LINES} {quoted_name} 2>&1 || true"
-        )
-        tail = (logs_result.stdout or "")[-_CONTAINER_DEATH_LOG_MAX_CHARS:]
-        diagnostics.logs_tail = tail or None
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        capture_errors.append(f"logs: {exc}")
+    # a removed container's log went with it: `2>&1` would store docker's "No such container" as its output
+    if not diagnostics.container_missing:
+        try:
+            logs_result = await ssh_client.run(
+                f"/usr/bin/docker logs --tail {_CONTAINER_DEATH_LOG_TAIL_LINES} {quoted_name} 2>&1 || true"
+            )
+            tail = (logs_result.stdout or "")[-_CONTAINER_DEATH_LOG_MAX_CHARS:]
+            diagnostics.logs_tail = tail or None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            capture_errors.append(f"logs: {exc}")
 
     host_context = await _collect_host_context(ssh_client)
     diagnostics.host_context = host_context or None

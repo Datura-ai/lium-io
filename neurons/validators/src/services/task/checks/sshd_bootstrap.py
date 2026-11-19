@@ -178,7 +178,7 @@ async def remove_lium_fillers(ctx: Context, fillers: list[str]) -> list[str]:
             with contextlib.suppress(Exception):
                 ps = await ctx.ssh.run(DockerCommand.ps_running(name), timeout=60)
                 was_running = ps.exit_status == 0 and bool((ps.stdout or "").strip())
-            result = await ctx.ssh.run(DockerCommand.remove_with_volumes(shlex.quote(name)), timeout=60)
+            result = await ctx.ssh.run(DockerCommand.remove_with_volumes(name), timeout=60)
             if result.exit_status != 0:
                 continue
             removed.append(name)

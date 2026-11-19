@@ -70,6 +70,8 @@ VERIFYX_LAST_EMA_TTL_SECONDS = 30 * 24 * 3600
 # filler container name -> JSON list of the image digests (bare sha256) the validator started it from
 FILLER_IMAGE_DIGESTS_PREFIX = "filler_image_digests:"
 FILLER_IMAGE_DIGESTS_TTL_SECONDS = 30 * 24 * 3600
+# filler container name -> the image repository the validator was asked to start it from (same TTL)
+FILLER_IMAGE_REPOSITORY_PREFIX = "filler_image_repository:"
 # A pod edit parks the pod's container under another name; the exact name this validator parked is
 # recorded per executor (key + parked name) so the GPU checks never take a self-named parked
 # container as ours. The edit's end shortens it to one GPU check's span; the TTL only backstops a
@@ -143,9 +145,6 @@ IN_CONTAINER_SSH_BOOTSTRAP_PATH = "/tmp/lium-ssh-bootstrap.sh"
 VERIFIED_JOB_COUNT_KEY = "verified_job_counts"
 # The anchor: the GPU UUID set of the executor's first successful verification, kept by every later write.
 GPU_ANCHOR_KEY = "uuids"
-# DAH-3457: field of a verified-job record, kept by every later write. No check sets or reads it any more (a changed
-# GPU set is re-anchored, not broken); old records still carry it.
-GPU_ANCHOR_BROKEN_KEY = "anchor_broken"
 
 EXECUTORS_UPTIME_PREFIX = "executors_uptime"
 NORMALIZED_SCORE_CHANNEL = "normalized_score_channel"
@@ -172,6 +171,9 @@ SYSBOX_VERIFIED_PREFIX = "sysbox_verified"
 # DAH-5244: one key per executor with the port pairs its last completed port check verified, under which
 # address/range/mappings, so a cycle deferred for disk pressure can republish them.
 VERIFIED_PORTS_PREFIX = "verified_ports"
+# DAH-6376: external ports a port check is probing on an executor, and ports a pod was just given there
+PROBE_HELD_PORTS_PREFIX = "probe_held_ports"
+POD_PORTS_PENDING_PREFIX = "pod_ports_pending"
 # DAH-5244: one key per executor counting port checks deferred in a row (":shadow" for the simulated count).
 DISK_PRESSURE_DEFERRALS_PREFIX = "disk_pressure_deferrals"
 # One key per executor: when this validator first found it without its recommended default image
@@ -723,6 +725,36 @@ class RedisService:
 
     async def is_sysbox_verified(self, miner_hotkey: str, executor_id: str) -> bool:
         return await self.get(self._sysbox_verified_key(miner_hotkey, executor_id)) is not None
+
+    async def hold_probe_ports(self, executor_id: str, external_ports: set[int], ttl_seconds: int) -> None:
+        """A port check binds these external ports on the executor until it releases them (or the TTL ends)."""
+        key = f"{PROBE_HELD_PORTS_PREFIX}:{executor_id}"
+        await self.redis.delete(key)
+        if external_ports:
+            await self.redis.sadd(key, *external_ports)
+            await self.redis.expire(key, ttl_seconds)
+
+    async def release_probe_ports(self, executor_id: str) -> None:
+        await self.redis.delete(f"{PROBE_HELD_PORTS_PREFIX}:{executor_id}")
+
+    async def probe_held_ports(self, executor_id: str) -> set[int]:
+        return {int(port) for port in await self.redis.smembers(f"{PROBE_HELD_PORTS_PREFIX}:{executor_id}")}
+
+    async def record_pending_pod_ports(self, executor_id: str, external_ports: list[int], ttl_seconds: int) -> None:
+        """A pod was just given these external ports; the backend's rental list may not show them yet.
+        Each port expires on its own (sorted-set score = expiry time), so a later pod never extends an earlier one's."""
+        if not external_ports:
+            return
+        key = f"{POD_PORTS_PENDING_PREFIX}:{executor_id}"
+        expires_at = time.time() + ttl_seconds
+        await self.redis.zadd(key, {str(port): expires_at for port in external_ports})
+        await self.redis.expire(key, ttl_seconds)
+
+    async def pending_pod_ports(self, executor_id: str) -> set[int]:
+        key = f"{POD_PORTS_PENDING_PREFIX}:{executor_id}"
+        now = time.time()
+        await self.redis.zremrangebyscore(key, "-inf", now)
+        return {int(port) for port in await self.redis.zrangebyscore(key, now, "+inf")}
 
     @staticmethod
     def _verified_ports_key(miner_hotkey: str, executor_id: str) -> str:
@@ -1352,9 +1384,8 @@ class RedisService:
             "spec": prev_spec if prev_spec else spec,
             GPU_ANCHOR_KEY: prev_uuids if prev_uuids else uuids,
         }
-        # DAH-3457: the anchor and its broken mark outlive every write to the record; only a new executor id starts clean.
-        if prev_info.get(GPU_ANCHOR_BROKEN_KEY):
-            data[GPU_ANCHOR_BROKEN_KEY] = True
+        # DAH-3457: the anchor outlives every write to the record; only a new executor id starts clean.
+        # DAH-6645: the retired "anchor_broken" mark of older records is dropped here, not carried.
 
         await self.hset(VERIFIED_JOB_COUNT_KEY, _verified_job_field(miner_hotkey, executor_id), json.dumps(data))
 
@@ -1365,7 +1396,6 @@ class RedisService:
         prev_info: dict = {},
         reason: ResetVerifiedJobReason = ResetVerifiedJobReason.DEFAULT,
         evidence: dict | None = None,
-        anchor_broken: bool = False,
         reanchor_uuids: str = '',
         respec: str = '',
     ):
@@ -1380,8 +1410,6 @@ class RedisService:
             "spec": spec,
             GPU_ANCHOR_KEY: uuids,
         }
-        if anchor_broken or prev_info.get(GPU_ANCHOR_BROKEN_KEY):
-            data[GPU_ANCHOR_BROKEN_KEY] = True
         await self.hset(VERIFIED_JOB_COUNT_KEY, _verified_job_field(miner_hotkey, executor_id), json.dumps(data))
 
         # DAH-3386: the check that cleared the job and what it saw ride along; the backend puts them on the

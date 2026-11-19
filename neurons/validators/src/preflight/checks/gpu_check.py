@@ -36,7 +36,15 @@ class GPUCheck(PreflightCheck):
 
             # Get GPU information
             logger.debug("Getting GPU information...")
-            gpu_info = get_gpu_info(include_utilization=True)
+            try:
+                gpu_info = get_gpu_info(include_utilization=True, raise_errors=True)
+            except Exception as e:
+                # an NVML failure is not "no GPUs": the provider needs the driver's own words to fix it
+                return CheckResult(
+                    name=self.name,
+                    status=CheckStatus.FAILED,
+                    message=f"NVIDIA driver query (NVML) failed: {type(e).__name__}: {e}",
+                )
 
             if not gpu_info:
                 return CheckResult(

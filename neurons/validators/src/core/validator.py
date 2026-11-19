@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import dataclasses
 import json
 import os
 import time
@@ -20,7 +21,7 @@ from services.default_docker_image_digest_service import (
     fetch_executor_image_digest,
 )
 from services.docker_service import DockerService
-from services.executor_image_policy import build_expected_image_snapshot
+from services.executor_image_policy import build_expected_image_snapshot, normalize_sha256_digest
 from services.executor_rollout import (
     ROLLOUT_GRACE,
     ExecutorRolloutTracker,
@@ -463,6 +464,19 @@ class Validator:
                 # early return and before the first job of this cycle runs against the new digest,
                 # so an aborted iteration does not count as a cycle of the window.
                 rollout_window = await self.observe_executor_rollout(executor_digest, job_block)
+                if rollout_window.previous_reads_current(job_block):
+                    # DAH-6560: no OUTDATED mark for the release Watchtower is still rolling out (8 cycles;
+                    # the verdict-withholding window above stays at its own 2-cycle cap)
+                    executor_image_snapshot = dataclasses.replace(
+                        executor_image_snapshot,
+                        rollout_previous_digest=normalize_sha256_digest(rollout_window.previous_digest),
+                    )
+                earlier = rollout_window.earlier_reading_current(job_block)
+                if earlier:
+                    executor_image_snapshot = dataclasses.replace(
+                        executor_image_snapshot,
+                        rollout_earlier_digests=tuple(filter(None, map(normalize_sha256_digest, earlier))),
+                    )
 
                 logger.info(
                     _m(
@@ -845,11 +859,7 @@ class Validator:
                             if batch == job_batch_id
                         }
                     )
-                    result_missing = (
-                        pod_ssh_only_results(rented_executors, pod_ssh, reported, job_batch_id)
-                        if settings.RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED
-                        else {}
-                    )
+                    result_missing = pod_ssh_only_results(rented_executors, pod_ssh, reported, job_batch_id)
                     # Not the whole miner's batch, not scored: no scored_at, and not "validated" for
                     # the express lane below.
                     await self.publish_result_missing(result_missing, miners, miner_coldkeys, job_batch_id)

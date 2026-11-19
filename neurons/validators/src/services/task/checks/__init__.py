@@ -7,6 +7,7 @@ from .cpu_truth import CpuTruthCheck
 from .disk_health import DiskHealthCheck
 from .disk_space import DiskSpaceCheck, SplitDiskCheck
 from .custom_build_orphan_sweep import CustomBuildOrphanSweepCheck
+from .rental_egress_guard import RentalEgressGuardCheck
 from .duplicate_executor import DuplicateExecutorCheck
 from .executor_image import ExecutorImageCheck
 from .finalize import FinalizeCheck
@@ -57,6 +58,7 @@ from .sshd_auth_log import SshdAuthLogCheck
 from .stale_container_cleanup import StaleContainerCleanupCheck
 from .start_gpu_monitor import StartGPUMonitorCheck
 from .docker_cpu import DockerCpuCheck
+from .needrestart_guard import NeedrestartGuardCheck
 from .pid_host_required import PidHostRequiredCheck
 from .sysbox_required import SysboxRequiredCheck
 from .tdx_host import TdxHostCheck
@@ -74,6 +76,7 @@ __all__ = [
     "DiskSpaceCheck",
     "SplitDiskCheck",
     "CustomBuildOrphanSweepCheck",
+    "RentalEgressGuardCheck",
     "DuplicateExecutorCheck",
     "ExecutorImageCheck",
     "FinalizeCheck",
@@ -122,6 +125,7 @@ __all__ = [
     "StaleContainerCleanupCheck",
     "StartGPUMonitorCheck",
     "DockerCpuCheck",
+    "NeedrestartGuardCheck",
     "PidHostRequiredCheck",
     "SysboxRequiredCheck",
     "SpecChangeCheck",
