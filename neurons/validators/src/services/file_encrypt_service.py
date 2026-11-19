@@ -108,6 +108,7 @@ ORIGINAL_KEYS = {
     "processes_pid": "pid",
     "processes_info": "info",
     "processes_container_name": "container_name",
+    "processes_cmdline": "cmdline",
     'hard_disk_total': "total",
     'hard_disk_used': "used",
     'hard_disk_free': "free",
@@ -355,6 +356,7 @@ class FileEncryptService:
             "processes_info": "",
             "gpu_scrape_error": "",
             "processes_container_name": "",
+            "processes_cmdline": "",
             'nvidia_cfg_scrape_error': "",
             'data_md5_checksums': "",
             'md5_checksums_nvidia_smi': "",
@@ -487,8 +489,6 @@ class FileEncryptService:
 
         Returns: MinerJobEnryptedFiles
         """
-        tmp_directory = self.fresh_job_files_directory(keep_directories)
-
         # file pathes
         machine_scrape_file_path = str(
             Path(__file__).parent / ".." / "miner_jobs/machine_scrape.py"
@@ -502,7 +502,11 @@ class FileEncryptService:
 
         # run obfuscator.py to generate obfuscated_machine_scrape.py
         command = [sys.executable, obfuscator_machine_scrape_file_path, machine_scrape_file_path]
-        subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)  # noqa
+        # a failed run must not leave the previous build's output to be read below
+        Path(obfuscated_machine_scrape_file_path).unlink(missing_ok=True)
+        subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)  # noqa
+        # after the run: a failed one leaves the previous cycle's directory in place
+        tmp_directory = self.fresh_job_files_directory(keep_directories)
 
         with open(obfuscated_machine_scrape_file_path) as file:
             obfuscated_content = file.read()
