@@ -121,3 +121,63 @@ async def test_a_cancel_reports_with_the_reporter_the_runner_left_in_its_spec(
 
     report.assert_awaited_once_with(OPERATION_ID, {"reporter": reporter})
     assert "redis" not in inspect.signature(storage_operations.start_storage_operation).parameters
+
+
+@pytest.mark.parametrize("exit_code", [0, 3])
+def test_detached_wrapper_keeps_the_log_only_when_the_runner_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int
+) -> None:
+    # runs the real launch wrapper with a fake runner; a failed run must leave its log behind
+    import asyncio as aio
+
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", storage_operations.PurePosixPath(str(tmp_path)))
+    monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
+    runner = tmp_path / "runner"
+    runner.write_text(f"#!/bin/sh\necho working\nexit {exit_code}\n")
+    runner.chmod(0o755)
+    monkeypatch.setattr(storage_operations, "REMOTE_RUNNER_PATH", str(runner))
+    launched: list[str] = []
+
+    async def run(command: str, check: bool = False) -> SimpleNamespace:
+        if command.startswith("nohup"):
+            launched.append(command)
+            return SimpleNamespace(exit_status=0, stdout="", stderr="")
+        done = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
+        return SimpleNamespace(exit_status=done.returncode, stdout=done.stdout, stderr=done.stderr)
+
+    class Sftp:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def open(self, path, mode):
+            class Handle:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *exc):
+                    return False
+
+                async def write(self, data):
+                    open(path, "w").write(data)
+
+            return Handle()
+
+        async def chmod(self, path, mode):
+            return None
+
+    ssh_client = SimpleNamespace(run=run, start_sftp_client=lambda: Sftp())
+    files = aio.run(
+        storage_operations.start_storage_operation(
+            ssh_client, "sh", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+        )
+    )
+    subprocess.run(["sh", "-c", launched[0].removeprefix("nohup ").rsplit(" &", 1)[0]], check=True)
+    log = Path(str(files.log))
+    assert not Path(str(files.status)).exists()
+    if exit_code:
+        assert log.read_text().splitlines() == ["working", "runner exited 3"]
+    else:
+        assert not log.exists()

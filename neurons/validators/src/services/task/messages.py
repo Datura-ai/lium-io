@@ -546,6 +546,18 @@ class GpuLossHoldMessages:
         "missing_uuids). The pod cannot use the new cards until it is recreated; the node is verified on its new "
         "cards on the first check after that, or after the rental ends.",
     )
+    # DAH-6546: no verdict on the pod's GPUs, so not GPU_LOST; the run stops (nothing re-anchors) and is checked again
+    POD_UNREAD = MessageTemplate(
+        event="A rented pod's container could not be read after the node's GPUs changed; checked again shortly",
+        reason="GPU_LOST_POD_UNREAD",
+        severity="warning",
+        category="env",
+        impact="This check scores 0 and the node is checked again within minutes; a pod being recreated on the new "
+        "GPUs reads clean then",
+        remediation="Usually the pod is being recreated on the new GPUs and nothing is needed. If it repeats, run "
+        "`docker inspect <container>` on the host for the pods in pods_unread (see inspect_exit_status and "
+        "inspect_stderr).",
+    )
     CLEAN_AGAIN = MessageTemplate(
         event="Every GPU is listed again; each card is load-tested before the node is listed",
         reason="GPU_LOST_CLEAN_AGAIN",
@@ -1418,6 +1430,13 @@ class InspectorMessages:
 
 
 class TenantEnforcementMessages:
+    HALF_STARTED_STOPS_RETRIED = MessageTemplate(
+        event="Pending stops of half-started pods retried",
+        reason="HALF_STARTED_STOPS_RETRIED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
     NOT_RENTED = MessageTemplate(
         event="Executor not rented",
         reason="EXECUTOR_NOT_RENTED",
@@ -1534,6 +1553,10 @@ class GpuUsageMessages:
         "{vram_utilization}, with Lium's filler running on the node. Stop the GPU processes "
         "outside Lium's containers and re-run your node: {processes}. Leave Lium's own filler "
         "running: {fillers}."
+    )
+    FOREIGN_PROCESS_IN_FILLER_REMEDIATION = (
+        "A GPU process that is not the workload of Lium's filler runs inside the filler container: "
+        "{processes}. Stop it, run nothing else inside Lium's containers, and re-run your node."
     )
     USAGE_HIGH_BESIDE_A_RENTAL_REMEDIATION = (
         "Stop the GPU processes outside Lium's containers and re-run your node: {outside_processes}. "
@@ -3200,7 +3223,8 @@ SSHD_BOOTSTRAP_REMEDIATION = (
     "\"/run/sshd must be owned by root and not group or world-writable\"). Fix the runtime/image setup so "
     "a fresh container gets a root-owned /run/sshd with mode 755, then check that `docker run --rm ubuntu sh -c "
     "'apt-get update -qq && apt-get install -y -qq openssh-server && mkdir -p /run/sshd && /usr/sbin/sshd -t'` "
-    "succeeds. The node is validated again once a new container on it starts sshd."
+    "succeeds. Each validation cycle starts sshd in a fresh container on the node again; the node is validated again the "
+    "cycle sshd starts there."
 )
 
 

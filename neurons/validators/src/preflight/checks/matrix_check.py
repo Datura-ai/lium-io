@@ -137,7 +137,7 @@ class MatrixValidationCheck(PreflightCheck):
         """Run the matrix multiplication validation in one clear, linear flow."""
         try:
             # 1) Detect GPU
-            gpu_info = get_gpu_info(include_memory=True)
+            gpu_info = get_gpu_info(include_memory=True, raise_errors=True)
             if not gpu_info:
                 raise NoGpuError("No GPUs detected for matrix multiplication test")
 

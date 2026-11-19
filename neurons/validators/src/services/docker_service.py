@@ -19,6 +19,7 @@ from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 from typing import Annotated, Any, NamedTuple, TypeVar
@@ -48,6 +49,7 @@ from payload_models.payloads import (
     ContainerCreated,
     ContainerCreateRequest,
     ContainerDeleted,
+    ContainerStarted,
     ContainerStopped,
     ContainerDeleteRequest,
     ContainerStartRequest,
@@ -110,6 +112,7 @@ from services.container_cleanup import (
     REMOVE_CACHE_SWEEP_CONTAINER,
     evict_cache_volumes_oldest_first,
     idle_filler_images_size_command,
+    image_repository,
 )
 from services.cvm_quote_broker import ensure_quote_broker, quote_socket_pod_mount
 from services.node_host import node_owner, public_host_sock
@@ -171,11 +174,13 @@ from services.cluster_fabric import WIREGUARD_LISTEN_PORT, cluster_pod_networkin
 from services.redis_service import (
     GPU_CLOCKS_PENDING_KIND,
     GPU_RESET_PENDING_KIND,
+    HALF_STARTED_STOP_INDEX_PREFIX,
     EDIT_PARKED_CONTAINER_AFTER_EDIT_SECONDS,
     EDIT_PARKED_CONTAINER_PREFIX,
     EDIT_PARKED_CONTAINER_TTL_SECONDS,
     FILLER_IMAGE_DIGESTS_PREFIX,
     FILLER_IMAGE_DIGESTS_TTL_SECONDS,
+    FILLER_IMAGE_REPOSITORY_PREFIX,
     IN_CONTAINER_SSH_BOOTSTRAP_PATH,
     RECENT_FILLER_PREFIX,
     RECENT_FILLER_TTL_SECONDS,
@@ -189,6 +194,7 @@ from services.redis_service import (
     STREAMING_LOG_CHANNEL,
     RedisService,
     sshd_bootstrap_failed_key,
+    sshd_bootstrap_failed_stamp,
 )
 from services.rental_docker_observability import (
     exec_logged_rental_docker_sdk_operation,
@@ -222,6 +228,7 @@ from services.rental_docker_sdk import (
     keep_alive_command_for,
     is_docker_container_not_running_error,
     is_docker_not_found_error,
+    is_transport_not_reopened,
     is_rental_docker_transport_drop,
     build_environment_exec_spec,
     build_remove_authorized_keys_exec_spec,
@@ -1519,6 +1526,8 @@ async def _raise_unless_running_before_created(
                     state=None,
                 ) from inspect_exc
             if attempt == FINAL_STATE_INSPECT_ATTEMPTS:
+                if is_transport_not_reopened(inspect_exc):
+                    raise  # the node stopped answering: that is the diagnosis, not an unread State
                 raise RuntimeError(
                     f"could not read the container State before caching the pod "
                     f"({FINAL_STATE_INSPECT_ATTEMPTS} attempts): {inspect_exc}"
@@ -1916,14 +1925,13 @@ def _layer_upper_scope(name: str, plaintext_path: str, upper_dir: str | None) ->
     )
 
 
-async def _stopped_before_start(docker_client: RentalDockerSdkClient, container_name: str) -> bool:
-    """True only when Docker says the container is stopped: the start that follows is then the validator's. Docker
-    accepts a start of a running container as success, so an unreadable state counts as running."""
-    try:
-        state = await docker_client.inspect_container_state(container_name=container_name)
-    except Exception:  # noqa: BLE001 — unknown: no start window, so the layer read keeps the copy
-        return False
-    return state.running is False and state.restarting is False
+async def _container_id_to_start(docker_client: RentalDockerSdkClient, container_name: str) -> str:
+    """The id a start of ``container_name`` runs and a failed start's cleanup stops. Raises when the container is gone:
+    starting by name could then run another container that took the name, which the cleanup could not follow."""
+    identity = await docker_client.container_identity(container_name=container_name)
+    if not identity:
+        raise RentalDockerOperationError(f"container {container_name} no longer exists")
+    return identity.partition("@")[0]
 
 
 async def _record_validator_start(ssh_client: asyncssh.SSHClientConnection, container_name: str) -> None:
@@ -2954,6 +2962,112 @@ def _is_stale_vloopback_mountpoint_error(error_text: str) -> bool:
     # Takes raw text so it serves both sources: a create-time exception, and the State.Error of a
     # container the host already tried to auto-restart.
     return all(phrase in error_text for phrase in _VLOOPBACK_MOUNT_ERROR_PHRASES)
+
+
+# a half-started pod's stop, retried until Docker reports it stopped
+_HALF_STARTED_STOP_ATTEMPTS = 3
+_HALF_STARTED_STOP_RETRY_SEC = 2
+# a pod that refused stop and kill is retried in the background this soon, before the next cycle's check (F-31)
+_HALF_STARTED_STOP_LATER_DELAYS_SEC = (10, 20, 30)
+# executor:pod:container -> that background retry, cancelled by a start that mounted that same container
+_HALF_STARTED_STOP_LATER: dict[str, asyncio.Task] = {}
+
+
+def _half_started_stop_slot(executor_info: ExecutorSSHInfo, pod_id: str) -> str:
+    return f"{executor_info.uuid}:{pod_id}"
+
+
+def _half_started_stop_field(pod_id: str, container_id: str) -> str:
+    """One record (and one background retry) per container: a start of another container of the pod neither ends nor
+    replaces it."""
+    return f"{pod_id}:{container_id}"
+
+
+def half_started_stop_retry(executor_uuid: str, pod_id: str) -> asyncio.Task | None:
+    """The pod's newest background stop retry, still running: it reconnects with the key of the request that started
+    it."""
+    prefix = f"{executor_uuid}:{pod_id}:"
+    return next((task for slot, task in reversed(_HALF_STARTED_STOP_LATER.items()) if slot.startswith(prefix)), None)
+
+
+# bounds the host-side mount read of a half-started pod before its stop is decided
+_ENCRYPTED_MOUNT_PROBE_TIMEOUT_SEC = 30
+# the fenced stop: pause, re-read, kill and up to 10 s for Docker to report it stopped
+_FENCED_STOP_TIMEOUT_SEC = 60
+
+# retries whose caller was cancelled, kept referenced until their stop is done
+_HALF_STARTED_STOPS_IN_FLIGHT: set[asyncio.Task] = set()
+
+
+def _encrypted_mount_probe(container_id: str, plaintext_path: str) -> str:
+    """Host-side read of the container's mount table (kernel-written, nothing run inside the renter's container): exit 0
+    when it holds its own /lium-cipher gocryptfs mount at the recorded path, 2 when it has no encrypted volume (no
+    /lium-cipher in its mount table, e.g. a plain local volume at that path), 1 for an encrypted volume without that
+    mount, anything else unknown. With no recorded path a gocryptfs mount is unknown (3): its destination cannot be
+    checked."""
+    check = (
+        f"awk -v target={shlex.quote(plaintext_path)} -v source={_LIUM_CIPHER_MOUNT} "
+        "'$1 == source && $3 == \"fuse.gocryptfs\" {g=1; if ($2 == target) t=1} $2 == source {c=1} "
+        "END {exit t ? 0 : (target == \"\" && g ? 3 : (c ? 1 : 2))}' /dev/stdin"
+    )
+    return (
+        f"p=$(/usr/bin/docker inspect -f '{{{{.State.Pid}}}}' {shlex.quote(container_id)}) || exit 3; "
+        '[ "$p" -gt 0 ] 2>/dev/null || exit 1; '
+        'm=$(cat "/proc/$p/mounts") || exit 3; '
+        f"printf '%s\\n' \"$m\" | {check}"
+    )
+
+
+def _pod_start_fence_lock(pod_id: str) -> str:
+    """The host-side lock file every start/remount of the pod holds shared and its pending stop's fence takes
+    exclusively: exclusion on the host itself, so it holds whether or not either side reached Redis."""
+    return shlex.quote(f"/run/lock/lium-pod-start.{pod_id}")
+
+
+def _pod_start_fence_hold_command(pod_id: str) -> str:
+    """Held for a whole start/remount (the process lives until the SSH session closes, a dead validator's included):
+    prints "held" once the shared lock is taken, "none" on a host without flock or the lock dir, where the fence
+    stops nothing (exit 3) either and so no start is let in."""
+    return (
+        f"l={_pod_start_fence_lock(pod_id)}; "
+        'if command -v flock >/dev/null 2>&1 && touch "$l" 2>/dev/null; then '
+        f'exec 9>>"$l"; flock -s -w {_FENCED_STOP_TIMEOUT_SEC + 10} 9 || exit 1; echo held; '
+        "else echo none; fi; exec cat >/dev/null"
+    )
+
+
+def _fenced_stop_command(
+    pod_id: str, container_id: str, started_at: str, plaintext_path: str, expected_mount: int
+) -> str:
+    """One host-side command that stops a pending half-started run only if it is still the run the retry read. It
+    first takes the pod's host start lock exclusively without waiting (_pod_start_fence_hold_command): every start
+    and remount holds it shared from before its `docker start` until its remount or its own stop is done, whether or
+    not it got the Redis pod lock, so a start in progress fails the fence. The container is then paused (a frozen
+    container takes no `docker start` or `docker exec`), its StartedAt and mount table re-read, and it is killed only
+    when both still match; otherwise it is unpaused.
+    Exit 0: stopped (or not running); 4: a start is in progress or landed since the read; 10: now holds its encrypted
+    mount; anything else: not proven, nothing stopped."""
+    running = '"{{.State.Running}}"'
+    return (
+        f"l={_pod_start_fence_lock(pod_id)}; "
+        'command -v flock >/dev/null 2>&1 && touch "$l" 2>/dev/null || exit 3; '
+        'exec 9>>"$l"; flock -n -x 9 || exit 4; '
+        f"d=/usr/bin/docker; id={shlex.quote(container_id)}; "
+        # a pause fails on a stopped container: not running is nothing to stop, unreadable is unknown
+        f'$d pause "$id" >/dev/null 2>&1 || {{ r=$($d inspect -f {running} "$id") || exit 3; '
+        '[ "$r" = false ] && exit 0; exit 3; }; '
+        # the host timeout's TERM must unpause too, not leave the pod frozen
+        "trap '$d unpause \"$id\" >/dev/null 2>&1' EXIT; trap 'exit 3' HUP INT TERM; "
+        's=$($d inspect -f "{{.State.StartedAt}}" "$id") || exit 3; '
+        f'[ "$s" = {shlex.quote(started_at)} ] || exit 4; '
+        f"( {_encrypted_mount_probe(container_id, plaintext_path)} ); c=$?; "
+        '[ "$c" = 0 ] && exit 10; '
+        f'[ "$c" = {expected_mount} ] || exit 3; '
+        '$d kill "$id" >/dev/null || exit 3; '
+        # the SIGKILL lands on thaw: the trap unpauses unless Docker already reports it stopped
+        f'for i in 1 2 3 4 5 6 7 8 9 10; do [ "$($d inspect -f {running} "$id")" = false ] && {{ trap - EXIT; exit 0; }}; '
+        "sleep 1; done; exit 3"
+    )
 
 
 async def _cleanup_to_completion(cleanup: Awaitable[Any]) -> Any:
@@ -4361,6 +4475,7 @@ class DockerService:
         quote_socket: bool = False,
         image_command_fallback: tuple[str, ...] = (),
         docker_data_volume_driver: str | None = None,
+        restart_policy: str | None = "unless-stopped",
     ) -> ContainerRunSpec:
         # A sysbox pod's inner dockerd writes /var/lib/docker; without a mount there it lands in an
         # uncapped host volume (the image's VOLUME, or sysbox's own) that can fill the host disk. It
@@ -4446,7 +4561,7 @@ class DockerService:
                 if docker_data_volume_gb
                 else ()
             ),
-            restart_policy="unless-stopped",
+            restart_policy=restart_policy,
             runtime="sysbox-runc" if payload.is_sysbox else None,
             cap_add=self._capabilities_for(devices),
             sysctls={"net.ipv4.conf.all.src_valid_mark": "1"},
@@ -6351,9 +6466,25 @@ class DockerService:
         container: str,
         container_name: str,
         default_extra: dict,
+        docker_image: str = "",
     ) -> None:
         """Remember the image digests a filler was started from, so the GPU usage check can tell it
-        from another container later run under the same name. Never fails the create."""
+        from another container later run under the same name, and the image repository it was asked
+        to run, which names the filler's workload for the GPU process allowlist. Never fails the create."""
+        if docker_image:
+            try:
+                await self.redis_service.set(
+                    f"{FILLER_IMAGE_REPOSITORY_PREFIX}{container_name}",
+                    image_repository(docker_image),
+                    ex=FILLER_IMAGE_DIGESTS_TTL_SECONDS,
+                )
+            except Exception as exc:
+                logger.warning(
+                    _m(
+                        "Could not record the filler's image repository; its processes are not judged",
+                        extra=get_extra_info({**default_extra, "error": str(exc)}),
+                    )
+                )
         try:
             # the container's own image, not the tag: the tag can move during the bootstrap
             image_id = await docker_client.container_image_id(container=container)
@@ -7555,9 +7686,11 @@ class DockerService:
         log_extra: dict,
         raise_if_container_gone: bool = False,
         sshd_verdict_key: str | None = None,
+        sshd_failed_stamp: str = "1",
     ) -> bool:
         # sshd_verdict_key: a filler create (Lium's own image) records the executor's sshd
         # verdict for SshdBootstrapCheck; a renter's image can break sshd itself, so it records nothing.
+        # sshd_failed_stamp: the value a failed verdict saves (sshd_bootstrap_failed_stamp), what the check re-probes.
         # raise_if_container_gone: the create path wants the ContainerGoneBeforeExec (with the
         # State it carries) rather than a False it never read; the start path keeps its
         # "did not complete cleanly" warning for every failure of the first exec.
@@ -7686,7 +7819,9 @@ class DockerService:
             )
             # only sshd installed but not serving is the node's fault; a failed apt-get exits before that line
             if SSHD_VERIFY_FAILED_MARKER in f"{run_result.stdout}{run_result.stderr}":
-                await self._record_sshd_verdict(sshd_verdict_key, failed=True, log_extra=log_extra)
+                await self._record_sshd_verdict(
+                    sshd_verdict_key, failed=True, stamp=sshd_failed_stamp, log_extra=log_extra
+                )
             return False
 
         await self._record_sshd_verdict(sshd_verdict_key, failed=False, log_extra=log_extra)
@@ -7752,12 +7887,14 @@ class DockerService:
                 ),
             )
 
-    async def _record_sshd_verdict(self, key: str | None, *, failed: bool, log_extra: dict) -> None:
+    async def _record_sshd_verdict(
+        self, key: str | None, *, failed: bool, log_extra: dict, stamp: str = "1"
+    ) -> None:
         if not key:
             return
         try:
             if failed:
-                await self.redis_service.set(key, "1", ex=SSHD_BOOTSTRAP_FAILED_TTL_SECONDS)
+                await self.redis_service.set(key, stamp, ex=SSHD_BOOTSTRAP_FAILED_TTL_SECONDS)
             else:
                 await self.redis_service.delete(key)
         except Exception:  # noqa: BLE001 — the create's own result still goes out
@@ -10790,7 +10927,8 @@ class DockerService:
                         except _CreateCancelledByDelete:
                             raise
                         except Exception as exc:
-                            if login_error is None:
+                            # a node that stopped answering is not the login's fault: report the dead transport
+                            if login_error is None or is_transport_not_reopened(exc):
                                 raise
                             # docker-py pulls anonymously after a failed login, so the
                             # pull failure is most likely the login's fault — attribute it,
@@ -10866,6 +11004,13 @@ class DockerService:
                         **(custom_options.environment or {}),
                         "JUPYTER_PASSWORD": image_jupyter_token,
                     }
+                # DAH-6522: the image's start.sh opens Jupyter, and its login tip points, at the pod volume, the one
+                # folder a reboot keeps; only the validator knows where the template put it. Every rental gets it:
+                # a renter's startup command may run start.sh itself.
+                custom_options.environment = {
+                    **(custom_options.environment or {}),
+                    "LIUM_VOLUME_PATH": local_volume_path,
+                }
 
                 container_name = self.get_container_name(payload)
                 created_local_volume = False
@@ -10880,6 +11025,8 @@ class DockerService:
                     # the parked container back the way start_container does (remount, sshd), at the
                     # pod's volume path.
                     edit_swap.bring_up = lambda name, remount: self._bring_up_existing_container(
+                        executor_info=executor_info,
+                        private_key=private_key,
                         docker_client=docker_client,
                         ssh_client=ssh_client,
                         container_name=name,
@@ -11493,6 +11640,9 @@ class DockerService:
                     quote_socket=quote_socket,
                     image_command_fallback=image_command_fallback,
                     docker_data_volume_driver=local_volume_driver,
+                    # the validator's own probe pod lives for one check: a host stop that cuts its teardown short
+                    # must not bring it back at boot beside the filler on the same GPUs
+                    restart_policy=None if synthetic_probe else "unless-stopped",
                 )
 
                 logger.info(
@@ -11873,6 +12023,7 @@ class DockerService:
                             if payload.workload_kind == WorkloadKind.FILLER
                             else None
                         ),
+                        sshd_failed_stamp=sshd_bootstrap_failed_stamp(payload.docker_image, bool(payload.is_sysbox)),
                     ):
                         soft_failed_step = current_step
                     if soft_failed_step is None:
@@ -11999,7 +12150,11 @@ class DockerService:
                     )
                     if payload.workload_kind == WorkloadKind.FILLER:
                         await self._record_filler_image_best_effort(
-                            docker_client, container_id or container_name, container_name, default_extra
+                            docker_client,
+                            container_id or container_name,
+                            container_name,
+                            default_extra,
+                            payload.docker_image,
                         )
                         await self._remember_new_filler_best_effort(executor_info.uuid, container_name, container_id)
                     # no duration: the collector starts after the reply, its time is logged there
@@ -12717,6 +12872,13 @@ class DockerService:
                 error_type=FailedContainerErrorTypes.ContainerStartFailed,
                 error_code=FailedContainerErrorCodes.UnknownError,
             )
+        return ContainerStarted(
+            miner_hotkey=payload.miner_hotkey,
+            executor_id=payload.executor_id,
+            pod_id=payload.pod_id,
+            workload_kind=payload.workload_kind,
+            container_name=payload.container_name,
+        )
 
     async def start_existing_container(
         self,
@@ -12737,63 +12899,501 @@ class DockerService:
         # safe for a pod without an encrypted volume: mounting gocryptfs at a guessed path would
         # leave the customer's real path an ordinary container dir, writing plaintext to the host.
         pkey = asyncssh.import_private_key(private_key)
-        async with self.rental_docker_client_factory.connect(
+        # keyed by executor too: a pod id moves between nodes, and a start on one must not touch another's stop
+        slot = _half_started_stop_slot(executor_info, pod_id)
+        # held through the start, so a pending stop's retry (here or in the other process) can neither act mid-start nor
+        # on a run checked before it
+        async with self._pod_start_exclusion(executor_info, private_key, pod_id), self.rental_docker_client_factory.connect(
             executor_info=executor_info,
             private_key=private_key,
         ) as docker_client:
-            stopped_before = await _stopped_before_start(docker_client, container_name)
+            # the id a failed start's pending stop follows (a start keeps it; an edit's park renames the container). Read
+            # first, and everything after goes by it: a container that takes the name meanwhile is not this start's
+            container_id = await _container_id_to_start(docker_client, container_name)
+            # an unreadable state fails the request before any start: cleanup could otherwise stop a running pod
+            before = await docker_client.inspect_container_state(container_name=container_id)
+            stopped_before = not before.running and not before.restarting
+            # Docker accepts a start of a running container as a no-op: a failure after it is not this start's to undo
+            running_before = not stopped_before
+            starts: list[asyncio.Future] = []
             # the start goes through the docker SDK; the SSH session is opened only once it
             # succeeded, for the remount (no shell fallback for a failed start), or for the
             # stale-mountpoint repair below
             async def _start() -> None:
-                await run_logged_rental_docker_sdk_operation(
-                    operation="start_container",
-                    log_extra=default_extra,
-                    # a pod created before rentals ran on RENTAL_NETWORK_NAME would keep docker0 across
-                    # every `docker start`; start moves it onto the rental network
-                    call=lambda: docker_client.start(
-                        container_name=container_name, network=RENTAL_NETWORK_NAME
-                    ),
-                    container_name=container_name,
+                # shielded: the SDK call runs in a thread a cancel cannot stop, so cleanup waits for it (below)
+                starts.append(
+                    asyncio.ensure_future(
+                        run_logged_rental_docker_sdk_operation(
+                            operation="start_container",
+                            log_extra=default_extra,
+                            # a pod created before rentals ran on RENTAL_NETWORK_NAME would keep docker0 across
+                            # every `docker start`; start moves it onto the rental network
+                            # by id: a container that took the name since the read is not this start's to run
+                            call=lambda: docker_client.start(
+                                container_name=container_id, network=RENTAL_NETWORK_NAME
+                            ),
+                            container_name=container_name,
+                        )
+                    )
                 )
+                await asyncio.shield(starts[-1])
 
             stale_mount_error: Exception | None = None
             try:
-                await _start()
-            except Exception as exc:
-                if not _is_stale_vloopback_mountpoint_error(str(exc)):
-                    raise
-                stale_mount_error = exc
-            async with asyncssh.connect(
-                host=executor_info.address,
-                port=executor_info.ssh_port,
-                **await public_host_sock(executor_info.address, executor_info.ssh_port),
-                username=executor_info.ssh_username,
-                client_keys=[pkey],
-                known_hosts=known_hosts_policy,
-            ) as ssh_client:
-                if stale_mount_error is not None:
-                    # a GPU reset's restart of a stopped pod hit "file exists" and left the pod down
-                    # (5 Nov): the same repair as the edit undo, rmdir only an empty, unmounted
-                    # mountpoint, then start once more
-                    if not await self._repair_stale_mountpoint_of_container_volume(
-                        ssh_client, container_name, default_extra
-                    ):
-                        raise stale_mount_error
+                # inside the cleanup: the SDK call runs in a thread, so a cancel can land after Docker started the pod
+                try:
                     await _start()
-                await self._restore_mount_and_sshd_after_start(
-                    docker_client=docker_client,
-                    ssh_client=ssh_client,
-                    container_name=container_name,
-                    local_volume_path=local_volume_path,
+                except Exception as exc:
+                    if not _is_stale_vloopback_mountpoint_error(str(exc)):
+                        raise
+                    stale_mount_error = exc
+                async with asyncssh.connect(
+                    host=executor_info.address,
+                    port=executor_info.ssh_port,
+                    **await public_host_sock(executor_info.address, executor_info.ssh_port),
+                    username=executor_info.ssh_username,
+                    client_keys=[pkey],
+                    known_hosts=known_hosts_policy,
+                ) as ssh_client:
+                    if stale_mount_error is not None:
+                        # a GPU reset's restart of a stopped pod hit "file exists" and left the pod down
+                        # (5 Nov): the same repair as the edit undo, rmdir only an empty, unmounted
+                        # mountpoint, then start once more
+                        if not await self._repair_stale_mountpoint_of_container_volume(
+                            ssh_client, container_id, default_extra
+                        ):
+                            raise stale_mount_error
+                        await _start()
+                    await self._restore_mount_and_sshd_after_start(
+                        docker_client=docker_client,
+                        ssh_client=ssh_client,
+                        container_name=container_id,
+                        local_volume_path=local_volume_path,
+                        pod_id=pod_id,
+                        default_extra=default_extra,
+                        record_start=stopped_before,
+                    )
+            except (asyncio.CancelledError, Exception):
+                # a pod left up without its plaintext mount writes the renter's data unencrypted into the
+                # container layer: put it back down, even when the start is cancelled
+                if not running_before:
+                    await _cleanup_to_completion(
+                        self._stop_after_failed_start(
+                            docker_client=docker_client,
+                            executor_info=executor_info,
+                            private_key=private_key,
+                            container_id=container_id,
+                            container_name=container_name,
+                            local_volume_path=local_volume_path,
+                            pod_id=pod_id,
+                            starts=starts,
+                            default_extra=default_extra,
+                        )
+                    )
+                raise
+            # a start that mounted this container ends only this container's pending stop; another container's (a
+            # replacement, an edit's park) stays until its own run is proven stopped, gone or mounted
+            if task := _HALF_STARTED_STOP_LATER.pop(f"{slot}:{container_id}", None):
+                task.cancel()
+            await self._forget_half_started_stop(executor_info, pod_id, container_id, default_extra)
+
+    async def _stop_after_failed_start(
+        self,
+        *,
+        docker_client: RentalDockerSdkClient,
+        executor_info: ExecutorSSHInfo,
+        private_key: str,
+        container_id: str,
+        container_name: str,
+        local_volume_path: str | None,
+        pod_id: str,
+        starts: list[asyncio.Future],
+        default_extra: dict[str, Any],
+    ) -> None:
+        """Put a failed (or cancelled) start's container back down, under the caller's pod lock: the SDK starts run in
+        threads a cancel cannot stop, so they are drained first; a stop Docker refused is recorded and retried, by the
+        container id read before the start (``container_id``; empty: no container existed, so this start ran none)."""
+        await asyncio.gather(*starts, return_exceptions=True)
+        if not container_id:
+            return
+        # read before the stops: its StartedAt lets a later retry tell this run from a pod started again since
+        identity = f"{container_id}@"
+        with contextlib.suppress(Exception):
+            identity = await docker_client.container_identity(container_name=container_id) or identity
+        try:
+            await self._stop_half_started_container(docker_client, container_id, default_extra)
+        except RentalDockerOperationError:
+            recorded = (
+                container_name,
+                identity,
+                datetime.now(timezone.utc).isoformat(),
+                local_volume_path or "",
+            )
+            self._stop_half_started_container_later(executor_info, private_key, recorded, pod_id, default_extra)
+            await self._mark_half_started_stop_pending(executor_info, pod_id, recorded, default_extra)
+            raise
+
+    async def _stop_half_started_container(
+        self, docker_client: RentalDockerSdkClient, container_name: str, default_extra: dict[str, Any]
+    ) -> None:
+        """Stop until Docker's own state says stopped: a stop call that failed or was dropped proves nothing.
+        Raises when stop and kill both fail, so the caller reports a pod that may still run unmounted."""
+        error = "still running after stop"
+        for attempt in range(_HALF_STARTED_STOP_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(_HALF_STARTED_STOP_RETRY_SEC)
+            try:
+                await docker_client.stop(container_name=container_name)
+            except Exception as exc:  # noqa: BLE001 — the inspect below decides
+                error = str(exc)
+            try:
+                state = await docker_client.inspect_container_state(container_name=container_name)
+            except Exception as exc:  # noqa: BLE001
+                error = str(exc)
+                continue
+            if not state.running and not state.restarting:
+                return
+        # a host that refused every stop gets a SIGKILL with no grace before we give up
+        try:
+            await docker_client.kill(container_name=container_name)
+            state = await docker_client.inspect_container_state(container_name=container_name)
+            if not state.running and not state.restarting:
+                return
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc)
+        logger.error(
+            _m(
+                "POD_HALF_STARTED_STOP_FAILED",
+                extra=get_extra_info({**default_extra, "container_name": container_name, "error": error}),
+            )
+        )
+        raise RentalDockerOperationError(
+            f"pod {container_name} may still be running without its mount: stop and kill failed ({error})"
+        )
+
+    def _stop_half_started_container_later(
+        self,
+        executor_info: ExecutorSSHInfo,
+        private_key: str,
+        recorded: tuple[str, str, str, str],
+        pod_id: str,
+        default_extra: dict[str, Any],
+    ) -> None:
+        async def retry() -> None:
+            for delay in _HALF_STARTED_STOP_LATER_DELAYS_SEC:
+                await asyncio.sleep(delay)
+                if await self.retry_half_started_stop(
+                    executor_info=executor_info,
+                    private_key=private_key,
                     pod_id=pod_id,
                     default_extra=default_extra,
-                    record_start=stopped_before,
+                    recorded=recorded,
+                ):
+                    return
+
+        slot = f"{_half_started_stop_slot(executor_info, pod_id)}:{recorded[1].partition('@')[0]}"
+        # a newer failure of the same container replaces its older record's retry
+        if earlier := _HALF_STARTED_STOP_LATER.pop(slot, None):
+            earlier.cancel()
+        task = asyncio.create_task(retry())
+        _HALF_STARTED_STOP_LATER[slot] = task
+        task.add_done_callback(
+            lambda done: _HALF_STARTED_STOP_LATER.get(slot) is done and _HALF_STARTED_STOP_LATER.pop(slot)
+        )
+
+    async def _mark_half_started_stop_pending(
+        self,
+        executor_info: ExecutorSSHInfo,
+        pod_id: str,
+        recorded: tuple[str, str, str, str],
+        default_extra: dict[str, Any],
+    ) -> None:
+        container_name, identity, recorded_at, plaintext_path = recorded
+        slot = _half_started_stop_slot(executor_info, pod_id)
+        try:
+            # one write: a lost reply leaves the field either set and indexed or absent, never a record the check misses
+            await asyncio.wait_for(
+                self.redis_service.hset(
+                    f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}",
+                    _half_started_stop_field(pod_id, identity.partition("@")[0]),
+                    json.dumps(
+                        {
+                            "container_name": container_name,
+                            "identity": identity,
+                            "recorded_at": recorded_at,
+                            "plaintext_path": plaintext_path,
+                        }
+                    ),
+                ),
+                timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
+            )
+        except Exception as exc:  # noqa: BLE001 — the background retry still runs; only a restart loses it
+            logger.error(
+                _m(
+                    "POD_HALF_STARTED_STOP_MARK_FAILED",
+                    extra=get_extra_info({**default_extra, "slot": slot, "error": str(exc)}),
                 )
+            )
+
+    async def _forget_half_started_stop(
+        self, executor_info: ExecutorSSHInfo, pod_id: str, container_id: str, default_extra: dict[str, Any]
+    ) -> bool:
+        slot = _half_started_stop_slot(executor_info, pod_id)
+        try:
+            await asyncio.wait_for(
+                self.redis_service.hdel(
+                    f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}", _half_started_stop_field(pod_id, container_id)
+                ),
+                timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                _m(
+                    "POD_HALF_STARTED_STOP_CLEAR_FAILED",
+                    extra=get_extra_info({**default_extra, "slot": slot, "error": str(exc)}),
+                )
+            )
+            return False
+
+    async def retry_half_started_stop(
+        self,
+        *,
+        executor_info: ExecutorSSHInfo,
+        private_key: str | None,
+        pod_id: str,
+        default_extra: dict[str, Any],
+        recorded: tuple[str, str, str, str] | None = None,
+        container_id: str = "",
+    ) -> bool | None:
+        """The pending stop of one container of the pod: ``recorded``, or the record read under the lock for
+        ``container_id``."""
+        # under the pod's shared lock from record read to stop: a start (here or in the other process) cannot slip in
+        # between the check and the stop
+        async def locked() -> bool | None:
+            async with self.redis_service.pod_start_stop_lock(_half_started_stop_slot(executor_info, pod_id)) as held:
+                if not held:
+                    # unlocked, a start elsewhere could remount the pod between the read and the stop: stays pending
+                    logger.error(
+                        _m(
+                            "POD_HALF_STARTED_STOP_STILL_PENDING",
+                            extra=get_extra_info({**default_extra, "pod_id": pod_id, "error": "pod lock unavailable"}),
+                        )
+                    )
+                    return False
+                return await self._retry_half_started_stop_locked(
+                    executor_info=executor_info,
+                    private_key=private_key,
+                    pod_id=pod_id,
+                    default_extra=default_extra,
+                    recorded=recorded,
+                    container_id=container_id,
+                )
+
+        # a cancel (the check's deadline) leaves the lock with the retry until its stop is done: the SDK stop runs on
+        # in its thread, and a start let in meanwhile would have its new run stopped by it
+        task = asyncio.ensure_future(locked())
+        _HALF_STARTED_STOPS_IN_FLIGHT.add(task)
+        task.add_done_callback(_HALF_STARTED_STOPS_IN_FLIGHT.discard)
+        return await asyncio.shield(task)
+
+    async def _holds_its_encrypted_mount(
+        self, executor_info: ExecutorSSHInfo, private_key: str, container_id: str, plaintext_path: str
+    ) -> int | None:
+        """_encrypted_mount_probe's 0 (mounted), 1 (not mounted) or 2 (no encrypted volume), read on the host over the
+        executor's pinned SSH; None when it could not be read."""
+        try:
+            policy = await self._prepare_known_hosts_policy(executor_info, None, {"container_id": container_id})
+            if policy is None:
+                # an unpinned endpoint could report the mount present while the real pod runs without it
+                return None
+            result = await _run_on_own_ssh_connection(
+                partial(_connect_own_ssh, executor_info, asyncssh.import_private_key(private_key), policy),
+                _encrypted_mount_probe(container_id, plaintext_path),
+                _ENCRYPTED_MOUNT_PROBE_TIMEOUT_SEC,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - unread is unknown, never unmounted
+            return None
+        return result.exit_status if result.exit_status in (0, 1, 2) else None
+
+    @contextlib.asynccontextmanager
+    async def _pod_start_exclusion(self, executor_info: ExecutorSSHInfo, private_key: str | None, pod_id: str):
+        """Held by every start and remount of the pod: the Redis pod lock (orders the two processes' work), and the
+        pod's host start lock, held shared over its own SSH session (_pod_start_fence_hold_command). A start goes
+        ahead when Redis is unreachable, but never without the host lock: that is what makes a concurrent pending
+        stop's fence fail (_fenced_stop_command), whatever the Redis lock's state; a host without it refuses the start."""
+        async with self.redis_service.pod_start_stop_lock(_half_started_stop_slot(executor_info, pod_id)):
+            if not private_key:  # nothing can be started without the key
+                yield
+                return
+            async with self._hold_pod_start_host_lock(executor_info, private_key, pod_id):
+                yield
+
+    @contextlib.asynccontextmanager
+    async def _hold_pod_start_host_lock(self, executor_info: ExecutorSSHInfo, private_key: str, pod_id: str):
+        policy = await self._prepare_known_hosts_policy(executor_info, None, {"pod_id": pod_id})
+        if policy is None:
+            raise RentalDockerOperationError("no pinned host key to hold the pod's start lock over")
+        async with _connect_own_ssh(executor_info, asyncssh.import_private_key(private_key), policy) as own_ssh:
+            # bounded only while waiting: a pending stop's fence holds the lock for at most its host timeout
+            async with asyncio.timeout(_FENCED_STOP_TIMEOUT_SEC + 10 + _OWN_SSH_CONNECTION_MARGIN_SEC):
+                process = await own_ssh.create_process(_pod_start_fence_hold_command(pod_id))
+                taken = (await process.stdout.readline()).strip()
+            # "none" (no flock or lock dir) holds nothing a pending stop's fence would see: no start goes ahead without it
+            if taken != "held":
+                raise RentalDockerOperationError("the pod's host start lock could not be taken")
+            yield
+
+    async def _stop_if_still_the_run_read(
+        self,
+        executor_info: ExecutorSSHInfo,
+        private_key: str,
+        pod_id: str,
+        container_id: str,
+        started_at: str,
+        plaintext_path: str,
+        mount: int,
+    ) -> bool:
+        """Stop the run the retry read, fenced on the host (_fenced_stop_command): True once stopped, False when it now
+        holds its encrypted mount. Raises (record stays pending, nothing stopped) when it cannot be proven the same
+        unmounted run, e.g. a start the Redis pod lock did not keep out (Redis down, a lapsed lease) is in progress or
+        landed since the read."""
+        policy = await self._prepare_known_hosts_policy(executor_info, None, {"container_id": container_id})
+        if policy is None:
+            raise RentalDockerOperationError("no pinned host key to stop over")
+        result = await _run_on_own_ssh_connection(
+            partial(_connect_own_ssh, executor_info, asyncssh.import_private_key(private_key), policy),
+            _fenced_stop_command(pod_id, container_id, started_at, plaintext_path, mount),
+            _FENCED_STOP_TIMEOUT_SEC,
+        )
+        if result.exit_status == 0:
+            return True
+        if result.exit_status == 10:
+            return False
+        raise RentalDockerOperationError(
+            "a start is in progress or landed since the read"
+            if result.exit_status == 4
+            else "not proven the same unmounted run"
+        )
+
+    async def _retry_half_started_stop_locked(
+        self,
+        *,
+        executor_info: ExecutorSSHInfo,
+        private_key: str | None,
+        pod_id: str,
+        default_extra: dict[str, Any],
+        recorded: tuple[str, str, str, str] | None,
+        container_id: str = "",
+    ) -> bool | None:
+        """Stop a pod whose failed start left it possibly running without its mount (F-31/F-37/F-15).
+        The recorded container (by its id, whatever its name) is stopped while its encrypted volume is unmounted, across
+        restarts (same id); a removed one is dropped, a mounted one kept, an unread mount stays pending. A pod with no
+        encrypted volume is stopped only in the very run recorded. The stop itself is fenced on the host: it happens
+        only if the container is still the run read here (_fenced_stop_command), else the record stays pending.
+        None when none is pending; True once it is stopped or no longer that run (record dropped); False (logged)
+        while it still may run."""
+        extra = {**default_extra, "pod_id": pod_id}
+        if recorded is None:
+            try:
+                raw = await asyncio.wait_for(
+                    self.redis_service.hget(
+                        f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}",
+                        _half_started_stop_field(pod_id, container_id),
+                    ),
+                    timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC,
+                )
+                if raw is None:
+                    return None
+                record = json.loads(raw)
+                recorded = (
+                    record["container_name"],
+                    record["identity"],
+                    record["recorded_at"],
+                    record.get("plaintext_path", ""),
+                )
+            except Exception as exc:  # noqa: BLE001
+                # an unread record is not an absent one: still pending, retried next check
+                logger.error(
+                    _m("POD_HALF_STARTED_STOP_MARK_UNREADABLE", extra=get_extra_info({**extra, "error": str(exc)}))
+                )
+                return False
+        container_name, identity, recorded_at, plaintext_path = recorded
+        extra["container_name"] = container_name
+        recorded_id = identity.partition("@")[0]
+        try:
+            if not private_key:
+                raise RentalDockerOperationError("no executor key to reach Docker")
+            # every record carries the id the start read before starting; one without it cannot be followed through a
+            # rename (an edit's park) or proven gone, so it is never dropped and never acted on
+            if not recorded_id:
+                raise RentalDockerOperationError("the record names no container id")
+            async with self.rental_docker_client_factory.connect(
+                executor_info=executor_info, private_key=private_key
+            ) as docker_client:
+                # by id, never by name: an edit's park renames the run, and a replacement may take the name
+                current = await docker_client.container_identity(container_name=recorded_id)
+                # a restart by Docker (unless-stopped) keeps the id and changes StartedAt: the mount decides
+                mount = (
+                    None
+                    if current is None
+                    else await self._holds_its_encrypted_mount(executor_info, private_key, recorded_id, plaintext_path)
+                )
+                # no encrypted volume, nothing it could write unencrypted: only the very run recorded is stopped
+                if current is None or (mount == 2 and current != identity):
+                    logger.info(
+                        _m(
+                            "POD_HALF_STARTED_STOP_DROPPED_NOT_SAME_RUN",
+                            extra=get_extra_info({**extra, "container_gone": current is None}),
+                        )
+                    )
+                elif mount == 0:
+                    # a later start remounted this container (a start of a running pod keeps its id): nothing to stop
+                    logger.info(_m("POD_HALF_STARTED_STOP_DROPPED_MOUNTED", extra=get_extra_info(extra)))
+                elif mount is None:
+                    # unknown is not unmounted: stopping here could stop a restored pod; the record stays for next check
+                    raise RentalDockerOperationError("the pod's encrypted mount could not be read")
+                elif await self._stop_if_still_the_run_read(
+                    executor_info, private_key, pod_id, recorded_id, current.rpartition("@")[2], plaintext_path, mount
+                ):
+                    logger.info(_m("POD_HALF_STARTED_STOP_CONFIRMED", extra=get_extra_info(extra)))
+                else:
+                    logger.info(_m("POD_HALF_STARTED_STOP_DROPPED_MOUNTED", extra=get_extra_info(extra)))
+        except Exception as exc:  # noqa: BLE001
+            logger.error(_m("POD_HALF_STARTED_STOP_STILL_PENDING", extra=get_extra_info({**extra, "error": str(exc)})))
+            return False
+        await self._forget_half_started_stop(executor_info, pod_id, recorded_id, extra)
+        return True
+
+    async def retry_pending_half_started_stops(
+        self, *, executor_info: ExecutorSSHInfo, private_key: str | None, default_extra: dict[str, Any]
+    ) -> None:
+        """Retry every pending stop on this executor, whatever the node's current rental: a pod deleted or reassigned
+        since its failed start is no longer listed, but its old run may still write without its mount."""
+        index = f"{HALF_STARTED_STOP_INDEX_PREFIX}{executor_info.uuid}"
+        pending = await asyncio.wait_for(self.redis_service.hgetall(index), timeout=_STOPPED_BY_RECOVERY_MARK_TIMEOUT_SEC)
+        # all at once, each under its own pod lock: one slow stop cannot use up the check's budget for the others
+        fields = [member.decode() if isinstance(member, bytes) else str(member) for member in pending or {}]
+        await asyncio.gather(
+            *(
+                self.retry_half_started_stop(
+                    executor_info=executor_info,
+                    private_key=private_key,
+                    pod_id=pod_id,
+                    container_id=container_id,
+                    default_extra=default_extra,
+                )
+                for pod_id, _, container_id in (field.partition(":") for field in fields)
+            )
+        )
 
     async def _bring_up_existing_container(
         self,
         *,
+        executor_info: ExecutorSSHInfo,
+        private_key: str,
         docker_client: RentalDockerSdkClient,
         ssh_client: asyncssh.SSHClientConnection,
         container_name: str,
@@ -12804,40 +13404,75 @@ class DockerService:
     ) -> None:
         """`docker start` plus :meth:`_restore_mount_and_sshd_after_start`, on clients the caller already
         holds — the undo of a failed edit (``_EditSwap.restore``), whose SSH session is open anyway."""
+        starts: list[asyncio.Future] = []
 
         async def _start() -> None:
-            await run_logged_rental_docker_sdk_operation(
-                operation="start_container",
-                log_extra=default_extra,
-                call=lambda: docker_client.start(
-                    container_name=container_name, network=RENTAL_NETWORK_NAME
-                ),
-                container_name=container_name,
+            # shielded: the SDK call runs in a thread a cancel (the undo's deadline) cannot stop; the cleanup drains it
+            starts.append(
+                asyncio.ensure_future(
+                    run_logged_rental_docker_sdk_operation(
+                        operation="start_container",
+                        log_extra=default_extra,
+                        # by id: a container that took the name since the read is not this undo's to run
+                        call=lambda: docker_client.start(container_name=container_id, network=RENTAL_NETWORK_NAME),
+                        container_name=container_name,
+                    )
+                )
             )
+            await asyncio.shield(starts[-1])
 
-        stopped_before = await _stopped_before_start(docker_client, container_name)
-        try:
-            await _start()
-        except Exception as exc:
-            # park's `docker stop` can leave the vloopback mountpoint dir behind, so the parked
-            # container's own start fails on "file exists" and the customer's pod stays down
-            # (pod 6577912c, 22 Oct). Same repair as the create retry: rmdir only an empty,
-            # unmounted mountpoint, then start once more.
-            if not _is_stale_vloopback_mountpoint_error(str(exc)) or not await self._repair_stale_mountpoint_of_container_volume(
-                ssh_client, container_name, default_extra
-            ):
+        # under the pod's lock like start_existing_container: a pending stop's retry cannot probe the container
+        # unmounted and then stop it after this undo restarted and remounted it
+        async with self._pod_start_exclusion(executor_info, private_key, pod_id):
+            # unreadable state or id fails the undo before any start, like start_existing_container: a start the
+            # cleanup below could not follow by id would leave the pod up without its remount. The id is read first and
+            # everything after goes by it, so a container that takes the name meanwhile is neither judged nor remounted
+            container_id = await _container_id_to_start(docker_client, container_name)
+            before = await docker_client.inspect_container_state(container_name=container_id)
+            stopped_before = not before.running and not before.restarting
+            try:
+                try:
+                    await _start()
+                except Exception as exc:
+                    # park's `docker stop` can leave the vloopback mountpoint dir behind, so the parked
+                    # container's own start fails on "file exists" and the customer's pod stays down
+                    # (pod 6577912c, 22 Oct). Same repair as the create retry: rmdir only an empty,
+                    # unmounted mountpoint, then start once more.
+                    if not _is_stale_vloopback_mountpoint_error(str(exc)):
+                        raise
+                    if not await self._repair_stale_mountpoint_of_container_volume(
+                        ssh_client, container_id, default_extra
+                    ):
+                        raise
+                    await _start()
+                await self._restore_mount_and_sshd_after_start(
+                    docker_client=docker_client,
+                    ssh_client=ssh_client,
+                    container_name=container_id,
+                    local_volume_path=local_volume_path,
+                    pod_id=pod_id,
+                    default_extra=default_extra,
+                    remount=remount,
+                    record_start=stopped_before,
+                )
+            except (asyncio.CancelledError, Exception):
+                # a start that lands after the cancel would leave the pod up without its remount: drained and put
+                # back down before the lock is released, like start_existing_container
+                if stopped_before:
+                    await _cleanup_to_completion(
+                        self._stop_after_failed_start(
+                            docker_client=docker_client,
+                            executor_info=executor_info,
+                            private_key=private_key,
+                            container_id=container_id,
+                            container_name=container_name,
+                            local_volume_path=local_volume_path,
+                            pod_id=pod_id,
+                            starts=starts,
+                            default_extra=default_extra,
+                        )
+                    )
                 raise
-            await _start()
-        await self._restore_mount_and_sshd_after_start(
-            docker_client=docker_client,
-            ssh_client=ssh_client,
-            container_name=container_name,
-            local_volume_path=local_volume_path,
-            pod_id=pod_id,
-            default_extra=default_extra,
-            remount=remount,
-            record_start=stopped_before,
-        )
 
     async def _restore_mount_and_sshd_after_start(
         self,
@@ -13416,40 +14051,61 @@ class DockerService:
         next cycle's ``recover_parked_pod_container`` starts the pod with its mount once the
         plaintext path is known."""
         _UNMOUNTED_STOP_OUTCOMES.pop(pod_id, None)  # only this call's stop is reported
-        try:
-            # never at a guessed path, and only with the secret the volume was made with
-            if not private_key or not _can_remount_encrypted_volume(local_volume_path):
-                raise RuntimeError("no usable plaintext path, master secret or SSH key to remount with")
-            async with self.rental_docker_client_factory.connect(
-                executor_info=executor_info,
-                private_key=private_key,
-            ) as docker_client:
-                await self._restore_mount_and_sshd_after_start(
-                    docker_client=docker_client,
-                    ssh_client=ssh_client,
-                    container_name=container_name,
-                    local_volume_path=local_volume_path,
-                    pod_id=pod_id,
-                    default_extra=default_extra,
-                )
-        except (asyncio.CancelledError, Exception) as exc:
-            container_stopped = await _cleanup_to_completion(
-                self._mark_and_stop_unmounted_pod(ssh_client, container_name, pod_id)
+        # under the pod's shared lock, like a start: a pending stop's retry that read the pod unmounted must not stop it
+        # once this remount restored it. The two locks of _pod_start_exclusion, the Redis one entered before the try so
+        # it is still held by the cleanup's stop below when the host lock cannot be taken
+        async with AsyncExitStack() as exclusion:
+            redis_held = await exclusion.enter_async_context(
+                self.redis_service.pod_start_stop_lock(_half_started_stop_slot(executor_info, pod_id))
             )
-            logger.error(
-                _m(
-                    "POD_VOLUME_MOUNT_RESTORE_FAILED",
-                    extra=get_extra_info({
-                        **default_extra,
-                        "container_name": container_name,
-                        "error": repr(exc),
-                        "container_stopped": container_stopped,
-                    }),
+            host_held = False
+            try:
+                # inside the try: a pod whose host start lock cannot be taken is not left up unmounted either
+                if private_key:
+                    await exclusion.enter_async_context(
+                        self._hold_pod_start_host_lock(executor_info, private_key, pod_id)
+                    )
+                    host_held = True
+                # never at a guessed path, and only with the secret the volume was made with
+                if not private_key or not _can_remount_encrypted_volume(local_volume_path):
+                    raise RuntimeError("no usable plaintext path, master secret or SSH key to remount with")
+                async with self.rental_docker_client_factory.connect(
+                    executor_info=executor_info,
+                    private_key=private_key,
+                ) as docker_client:
+                    await self._restore_mount_and_sshd_after_start(
+                        docker_client=docker_client,
+                        ssh_client=ssh_client,
+                        container_name=container_name,
+                        local_volume_path=local_volume_path,
+                        pod_id=pod_id,
+                        default_extra=default_extra,
+                    )
+            except (asyncio.CancelledError, Exception) as exc:
+                # with neither lock held, a start may have remounted the pod meanwhile: no stop by name, only of the
+                # run still unmounted with no start holding its host lock
+                container_stopped = await _cleanup_to_completion(
+                    self._mark_and_stop_unmounted_pod(
+                        ssh_client,
+                        container_name,
+                        pod_id,
+                        fence_path=None if redis_held or host_held else (local_volume_path or ""),
+                    )
                 )
-            )
-            if isinstance(exc, asyncio.CancelledError):
-                raise
-            return False
+                logger.error(
+                    _m(
+                        "POD_VOLUME_MOUNT_RESTORE_FAILED",
+                        extra=get_extra_info({
+                            **default_extra,
+                            "container_name": container_name,
+                            "error": repr(exc),
+                            "container_stopped": container_stopped,
+                        }),
+                    )
+                )
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                return False
         # a mark left by an earlier stop that did not take would later restart a pod the provider stopped
         await self._clear_stopped_by_recovery(pod_id)
         logger.warning(
@@ -13461,7 +14117,11 @@ class DockerService:
         return True
 
     async def _mark_and_stop_unmounted_pod(
-        self, ssh_client: asyncssh.SSHClientConnection, container_name: str, pod_id: str
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        container_name: str,
+        pod_id: str,
+        fence_path: str | None = None,
     ) -> bool:
         # marked before the stop (at most the mark's 5 s bound), since no later cycle restarts an
         # unmarked pod stopped under its own name, and a stop whose reply is lost may still have
@@ -13489,7 +14149,11 @@ class DockerService:
                 container_name = parked
             else:
                 await _drop_unmarked_recovery_stop(pod_id)
-        outcome = await self._stop_outcome(ssh_client, container_name)
+        outcome = (
+            await self._stop_outcome(ssh_client, container_name)
+            if fence_path is None
+            else await self._fenced_stop_outcome(ssh_client, container_name, pod_id, fence_path)
+        )
         _UNMOUNTED_STOP_OUTCOMES[pod_id] = outcome
         if outcome == "failed":
             # docker said it did not stop: the pod still runs, and neither the mark nor the park record may restart
@@ -13656,6 +14320,29 @@ class DockerService:
         # the POD_NOT_RUNNING verdict keeps matching what the customer sees. A no-op when the start
         # itself was what failed.
         return await self._stop_outcome(ssh_client, container_name) == "stopped"
+
+    async def _fenced_stop_outcome(
+        self, ssh_client: asyncssh.SSHClientConnection, container_name: str, pod_id: str, plaintext_path: str
+    ) -> str:
+        """"stopped" only for the run read here, still without its encrypted mount and with no start holding the pod's
+        host lock (_fenced_stop_command); "unknown" otherwise, nothing stopped."""
+        try:
+            read = await ssh_client.run(
+                f"/usr/bin/docker inspect -f '{{{{.Id}}}} {{{{.State.StartedAt}}}}' {shlex.quote(container_name)}",
+                timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
+            )
+            container_id, _, started_at = (read.stdout or "").strip().partition(" ")
+            if getattr(read, "exit_status", 1) != 0 or not re.fullmatch(r"[0-9a-f]{64}", container_id):
+                return "unknown"
+            fenced = await ssh_client.run(
+                _fenced_stop_command(pod_id, container_id, started_at, plaintext_path, 1),
+                timeout=_FENCED_STOP_TIMEOUT_SEC,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - unproven is not stopped
+            return "unknown"
+        return "stopped" if getattr(fenced, "exit_status", None) == 0 else "unknown"
 
     async def _stop_outcome(self, ssh_client: asyncssh.SSHClientConnection, container_name: str) -> str:
         """"stopped", "failed" (the container verifiably still runs) or "unknown" (the stop may have applied)."""
@@ -14254,6 +14941,11 @@ class DockerService:
                                 self.redis_service, cleared_cap_claims, log_extra=default_extra
                             )
 
+                # DAH-6314: the image this pod ran, removed after the pod if a re-pull left it untagged
+                image_id = ""
+                with _best_effort_delete_step(log, "read_pod_image_id"):
+                    image_id = await docker_client.container_image_id(container=payload.container_name)
+
                 if self._wipes_volume_before_stop(payload):
                     await self._wipe_volume(connect_ssh, payload, log, stage="before the stop")
                     stopped = not await self._terminate_and_wait(connect_ssh, payload, log)
@@ -14344,12 +15036,15 @@ class DockerService:
                         payload.miner_hotkey, payload.executor_id,
                     )
 
-                with _best_effort_delete_step(log, "prune_images"):
-                    await run_logged_rental_docker_sdk_operation(
-                        operation="prune_images",
-                        log_extra=default_extra,
-                        call=docker_client.prune_images,
-                    )
+                # DAH-6314: never a host-wide prune here: it collects the layers a renter's pull on this host is
+                # still writing ("lease does not exist"). Only this pod's own image goes, by ID, once untagged.
+                if image_id:
+                    with _best_effort_delete_step(log, "remove_untagged_pod_image"):
+                        await run_logged_rental_docker_sdk_operation(
+                            operation="remove_untagged_image",
+                            log_extra=default_extra,
+                            call=partial(docker_client.remove_image_if_untagged, image_id=image_id),
+                        )
 
                 # DAH-3467: after a removal confirmed by inspect, a volume dockerd still holds is
                 # retried before the step gives it up; every volume failure stays best-effort. A
