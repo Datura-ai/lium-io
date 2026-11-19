@@ -204,3 +204,34 @@ async def test_the_check_leaves_a_rented_node_alone(context_factory):
         result = await check_module.S3fsPluginCopyCheck().run(context_factory(runner=runner))
 
     assert result.passed and runner.commands == []
+
+
+def test_the_check_is_a_completion_step_so_it_never_runs_before_the_verdict():
+    from services.task.pipeline import Pipeline
+    from services.task.pipeline_factory import PipelineFactory
+
+    pipeline = Pipeline(PipelineFactory.build_checks(), sink=None)
+    assert [type(c) for c in pipeline.on_completion].count(check_module.S3fsPluginCopyCheck) == 1
+    assert not any(isinstance(c, check_module.S3fsPluginCopyCheck) for c in pipeline.checks)
+
+
+@pytest.mark.asyncio
+async def test_the_check_skips_when_the_task_has_less_than_its_bound_left(context_factory):
+    import time
+
+    from core.config import settings
+    from services.task.checks.task_time import TASK_TIMEOUT_MARGIN_SECONDS
+
+    runner = _Runner(0)
+    needed = check_module.S3FS_PLUGIN_COMMAND_TIMEOUT_SECONDS + check_module.BUDGET_MARGIN_SECONDS
+    elapsed = settings.JOB_TIME_OUT - TASK_TIMEOUT_MARGIN_SECONDS - needed + 5
+    ctx = context_factory(runner=runner, started_at_monotonic=time.monotonic() - elapsed)
+    check = check_module.S3fsPluginCopyCheck()
+
+    with patch.object(check_module, "rental_of_this_node", lambda ctx: None):
+        result = await check.run(ctx)
+        assert result.passed and "not enough task time left" in str(result.event) and runner.commands == []
+        # not a run: a later run with time left stages at once
+        assert (await check.run(context_factory(runner=runner))).passed
+
+    assert runner.commands == [s3fs_plugin_command()]

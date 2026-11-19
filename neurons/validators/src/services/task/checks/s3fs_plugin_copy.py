@@ -1,6 +1,7 @@
 """DAH-6466: stage the node's local s3fs plugin copy outside any rental, so a Volume rental reads only local files.
 
-Non-fatal and never scored. A node the check has not reached yet (or a rented one) is not held off Volume
+Non-fatal and never scored. A completion step: it runs only once the run's verdict is settled, and only when the
+task has time left for its whole bound, so it can never take the time a scored check needs. A node the check has not reached yet (or a rented one) is not held off Volume
 rentals: its first Volume rental stages the copy itself, the one registry contact for that node.
 """
 
@@ -15,7 +16,9 @@ from services.s3fs_plugin_copy import S3FS_PLUGIN_COMMAND_TIMEOUT_SECONDS, s3fs_
 from ..messages import S3fsPluginCopyMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from .rental_egress_guard import BUDGET_MARGIN_SECONDS
 from .rental_owner import rental_of_this_node
+from .task_time import task_seconds_left
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +31,7 @@ RETRY_FAILED_SECONDS = 60 * 60
 class S3fsPluginCopyCheck:
     check_id = "executor.prep.s3fs_plugin_copy"
     fatal = False
+    on_completion = True
 
     def __init__(self) -> None:
         # (miner hotkey, executor uuid) -> (monotonic time of the last run, whether it staged)
@@ -43,6 +47,9 @@ class S3fsPluginCopyCheck:
         if rented is not None and rented.pods:
             # no plugin install beside a renter's pod; the copy is staged once the node is idle
             return self._result(ctx, Msg.SKIPPED, {"why": "rented"})
+        if task_seconds_left(ctx) < S3FS_PLUGIN_COMMAND_TIMEOUT_SECONDS + BUDGET_MARGIN_SECONDS:
+            # not a run: the next cycle with time for the whole bound tries again
+            return self._result(ctx, Msg.SKIPPED, {"why": "not enough task time left"})
 
         result = await ctx.runner.run(
             s3fs_plugin_command(), timeout=S3FS_PLUGIN_COMMAND_TIMEOUT_SECONDS, retryable=False

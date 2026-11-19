@@ -415,9 +415,6 @@ class PipelineFactory:
                 # instance so cadence state persists across `build_checks()`
                 # calls.
                 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON,
-                # DAH-6466: the node's local s3fs plugin copy, so a Volume rental makes no registry round trip.
-                # Non-fatal, throttled per executor, leaves rented nodes alone.
-                _S3FS_PLUGIN_COPY_SINGLETON,
                 PortConnectivityCheck(),
                 PortCountCheck(),
                 # Before the rented short-circuit; it leaves a rented node alone itself (no pull beside a
@@ -482,6 +479,9 @@ class PipelineFactory:
                 VerifyXColdRetryCheck(),
                 ScoreCheck(),
                 _RENTAL_EGRESS_GUARD_IDLE,
+                # DAH-6466: the node's local s3fs plugin copy, so a Volume rental makes no registry round trip.
+                # A completion step (after the verdict, only with time for its whole bound): never scored time.
+                _S3FS_PLUGIN_COPY_SINGLETON,
                 FinalizeCheck(),
             ],
         )
@@ -619,6 +619,7 @@ class PipelineFactory:
                 VerifyXColdRetryCheck(),
                 ScoreCheck(),
                 _RENTAL_EGRESS_GUARD_IDLE,
+                _S3FS_PLUGIN_COPY_SINGLETON,
                 FinalizeCheck(),
             ],
         )
