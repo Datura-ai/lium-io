@@ -453,9 +453,6 @@ class Settings(BaseSettings):
     # verified job is cleared, so the backend marks the executor inactive and billing stops. A transport
     # error or timeout decides nothing. Off by default: the pod keeps the plain POD_NOT_RUNNING verdict.
     REBOOT_FAILED_HOST_CHECK_ENABLED: bool = Field(env="REBOOT_FAILED_HOST_CHECK_ENABLED", default=False)
-    # A GPU process inside a Lium filler whose command is not on the filler workload's allowlist is
-    # foreign GPU work. Off: logged only (FILLER_FOREIGN_PROCESS ... enforced=False), the verdict is unchanged.
-    FILLER_PROCESS_ALLOWLIST_ENFORCED: bool = Field(env="FILLER_PROCESS_ALLOWLIST_ENFORCED", default=False)
     # DAH-4564 — read a rented pod's cpuset, CPU quota and init oom_score_adj and flag a host that
     # pinned or throttled the renter below 95% of its advertised cores, and zero its score. A raised
     # oom_score_adj is recorded only, never scored.
@@ -960,16 +957,20 @@ class Settings(BaseSettings):
         ),
     )
     RENTAL_HOST_RAM_RESERVE_GB: int = Field(
-        env="RENTAL_HOST_RAM_RESERVE_GB", default=4, ge=0,
+        env="RENTAL_HOST_RAM_RESERVE_GB", default=8, ge=0,
         description=(
-            "RAM kept back for the host (sshd, dockerd, the executor) when a rental arrives with no "
-            "memory limit: the container gets host MemTotal minus max(this, "
-            "RENTAL_HOST_RAM_RESERVE_PERCENT), so a renter cannot exhaust the host's memory."
+            "RAM kept back for the host's own use outside the rental's cgroup (sshd, dockerd, the "
+            "executor, NVIDIA driver memory): the container's limit is at most (host MemTotal minus "
+            "max(this, RENTAL_HOST_RAM_RESERVE_PERCENT)) times its GPU share, so a renter at its limit "
+            "cannot starve the host. The backend lists pod RAM with the same figures."
         ),
     )
     RENTAL_HOST_RAM_RESERVE_PERCENT: float = Field(
-        env="RENTAL_HOST_RAM_RESERVE_PERCENT", default=3.0, ge=0, lt=100,
-        description="Percent of host RAM kept back, see RENTAL_HOST_RAM_RESERVE_GB (3 %, as the backend: DAH-5206).",
+        env="RENTAL_HOST_RAM_RESERVE_PERCENT", default=10.0, ge=0, lt=100,
+        description=(
+            "Percent of host RAM kept back, see RENTAL_HOST_RAM_RESERVE_GB (10 %, as the backend: an idle "
+            "376 GiB host used 14 GiB outside the rental's cgroup, more than the former 3 %)."
+        ),
     )
     CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS: int = Field(
         env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60, gt=0,

@@ -264,3 +264,22 @@ def test_no_image_container_listing_the_scrape_s_pid_reports_no_executor():
     scrape["run_cmd"] = _three_on_the_executor_image({BURNER: [900], EXECUTOR: [812], MONITOR: [950]})
 
     assert scrape["get_docker_info"](b"#!/bin/sh\n")["docker_container_id"] == ""
+
+
+def test_a_container_reports_the_image_repository_it_runs():
+    scrape = _scrape(_docker_outputs(f"{RENTER[:12]}|5.00%\n", [RENTER]))
+
+    data = scrape["get_docker_info"](b"#!/bin/sh\n")
+
+    assert data["docker_containers"][0]["each_repository"] == "daturaai/pod"
+    original_keys, mapped_keys = _obfuscation_tables()
+    assert "each_repository" in original_keys and "each_repository" in mapped_keys
+
+
+def test_a_container_whose_image_is_gone_reports_no_repository():
+    outputs = _docker_outputs(f"{RENTER[:12]}|5.00%\n", [RENTER])
+    outputs["json .RepoDigests"] = RuntimeError("run_cmd error: error: no such object: sha256:image")
+
+    data = _scrape(outputs)["get_docker_info"](b"#!/bin/sh\n")
+
+    assert data["docker_containers"][0]["each_repository"] == ""
