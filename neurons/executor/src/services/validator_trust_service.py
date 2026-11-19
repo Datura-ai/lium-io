@@ -17,9 +17,12 @@ and the chain both unreachable. Each change is written durably (temp file, fsync
 as soon as it is made. Until the newest state is on the volume, and after a start that could not read the kept state
 (or found a message in it whose signature fails) until a served message confirms one, the executor trusts no
 validator: it never falls back to one that may have been replaced. That unconfirmed mark is part of the written
-state, so a restart before the confirmation stays closed too. A change the volume never took (every write refused
-until the process ends) cannot be kept: the node trusted no validator while it was unwritten, and a restart reads the
-last state the volume holds.
+state, so a restart before the confirmation stays closed too. The state a run writes is marked running, and the
+shutdown writes the newest state marked ended: a start that finds the running mark (the last run ended without
+writing its newest state: a failed or cut-short shutdown write, a crash) cannot tell whether a newer message was
+taken, and stays closed the same way until a served message confirms a validator. A kept state with any field
+missing or malformed is unreadable. Only a volume that refused every write of a run, the running mark included,
+cannot be read for it: a restart then reads the last state the volume holds.
 
 While no message is held, the executor trusts the hotkeys baked into the image (core.config), as
 before. A non-prod build (core/config_override.py) names its own validator and never reads a message.
@@ -140,22 +143,40 @@ class ValidatorTrust:
         self._wake: asyncio.Event | None = None
         # set at shutdown: the writer writes the newest state once more, then ends
         self._stopping = False
+        # set at shutdown: the newest state is written marked ended, not running
+        self._ended = False
+        # the state the volume holds as far as this run knows: the writer writes whenever the state differs from it
+        self._written: dict | None = None
 
     def load(self) -> None:
         """At start: the kept state (owner, held owner, messages) and the image copy, signed by the owner at release.
-        A kept state that cannot be read, or holds a message whose signature fails, is dropped whole and the node
-        stays closed until a served message confirms a validator."""
+        A kept state that cannot be read, has a field missing or malformed, or holds a message whose signature fails,
+        is dropped whole, and the node stays closed until a served message confirms a validator; so does one the last
+        run left marked running."""
         if not self.enabled:
             return
         held_owner, state, kept = None, None, []
         try:
             state = json.loads((self.state_dir / STATE_FILE).read_text())
             Keypair(ss58_address=state["owner"])
-            for signer, signed in state.get("messages", {}).items():
+            messages, held_owner, running, unconfirmed = (
+                state["messages"], state["held"], state["running"], state["unconfirmed"]
+            )
+            if not (isinstance(messages, dict) and isinstance(running, bool) and isinstance(unconfirmed, bool)):
+                raise ValueError("a field of the kept state is malformed")
+            if held_owner is not None and held_owner not in messages:
+                raise ValueError("the held owner has no kept message")
+            for signer, signed in messages.items():
                 signed = SignedTrustMessage(**signed)
                 kept.append((verify_trust_message(signed, signer), signed, signer))
-            self.owner, held_owner = state["owner"], state.get("held")
-            self._unconfirmed = state.get("unconfirmed") is True
+            self.owner = state["owner"]
+            self._unconfirmed = unconfirmed
+            if running:
+                logger.warning(
+                    "Validator trust: the last run ended before its newest state was written, trusting no validator "
+                    "until a served message confirms one"
+                )
+                self._unconfirmed = True
         except FileNotFoundError:
             pass
         except Exception as exc:
@@ -163,7 +184,7 @@ class ValidatorTrust:
                 "Validator trust: kept state unreadable, trusting no validator until a served message confirms one: "
                 "%s: %s", type(exc).__name__, exc,
             )
-            kept, state, self._unconfirmed = [], None, True
+            kept, state, held_owner, self._unconfirmed = [], None, None, True
         try:
             image = json.loads(self.image_message.read_text())
             signed = SignedTrustMessage(message=str(image["message"]), signature=str(image["signature"]))
@@ -174,12 +195,16 @@ class ValidatorTrust:
             logger.warning("Validator trust: image message refused: %s: %s", type(exc).__name__, exc)
         for trusted, signed, signer in kept:
             self._remember(trusted, signed, signer)
+        self._written = state
         self.held_owner = held_owner
         # chosen in memory before the first request; a choice the volume does not hold yet is written by the writer
         # once the refresh loop starts it, so a stalled volume never holds up the start
         self._select(save=False)
         # the unconfirmed mark is written too, so a restart before the confirmation still finds it
-        self._unsaved = (self.held is not None or self._unconfirmed) and self._state() != state
+        # (the running mark alone does not close it: it is written once the writer starts)
+        self._unsaved = (self.held is not None or self._unconfirmed) and (
+            state is None or {**self._state(), "running": state["running"]} != state
+        )
         logger.info("Validator trust at start: %s", self.report())
 
     def _remember(self, trusted: TrustedValidator, signed: SignedTrustMessage, signer: str) -> bool:
@@ -232,14 +257,13 @@ class ValidatorTrust:
     def _state(self) -> dict:
         """One document for the owner, the held owner, the messages and the unconfirmed mark: a restart never reads
         them apart."""
-        state = {
+        return {
             "owner": self.owner,
             "held": self.held_owner,
             "messages": {signer: signed._asdict() for signer, (_, signed) in self.messages.items()},
+            "unconfirmed": self._unconfirmed,
+            "running": not self._ended,
         }
-        if self._unconfirmed:
-            state["unconfirmed"] = True
-        return state
 
     def _save(self) -> None:
         """Keep the state on the volume: through the writer once start_persisting ran (the caller never waits on the
@@ -249,8 +273,9 @@ class ValidatorTrust:
             self._wake.set()
             return
         try:
-            _write_json(self.state_dir / STATE_FILE, self._state())
-            self._unsaved = False
+            state = self._state()
+            _write_json(self.state_dir / STATE_FILE, state)
+            self._written, self._unsaved = state, False
         except OSError as exc:
             # no validator is trusted until it lands; written again on the next refresh
             logger.warning("Validator trust: state not on the volume, trusting no validator: %s", exc)
@@ -262,7 +287,9 @@ class ValidatorTrust:
         the newest state is written, no validator is trusted (hotkeys); a failed write is written again at the next
         refresh."""
         self._wake, self._stopping = asyncio.Event(), False
-        if self._unsaved:
+        # the first write marks this run running, so a restart after a shutdown that could not write its newest
+        # state knows it
+        if self._state() != self._written:
             self._wake.set()
         return asyncio.create_task(self._persist())
 
@@ -273,13 +300,14 @@ class ValidatorTrust:
                 self._wake.clear()
                 # read before the write: a stop asked during it gets one more turn, which writes the newer state
                 stopping = self._stopping
-                if self._unsaved:
-                    state = self._state()
+                state = self._state()
+                if state != self._written:
                     try:
                         await asyncio.to_thread(_write_json, self.state_dir / STATE_FILE, state)
                     except OSError as exc:
                         logger.warning("Validator trust: state not on the volume, trusting no validator: %s", exc)
                     else:
+                        self._written = state
                         # trusted only once on the volume: open when what was written is still the state, whatever
                         # was saved meanwhile; a change made during the write waits for its own
                         self._unsaved = self._state() != state
@@ -292,7 +320,7 @@ class ValidatorTrust:
         """At shutdown: one last turn of the writer, within FLUSH_SECONDS so a hung volume cannot hold up the shutdown.
         Nothing trusted depends on it: a validator is trusted only once its state is on the volume."""
         if self._wake is not None:
-            self._stopping = True
+            self._stopping = self._ended = True
             self._wake.set()
         try:
             await asyncio.wait_for(writer, FLUSH_SECONDS)
@@ -325,6 +353,9 @@ class ValidatorTrust:
             return
         if self._unsaved:
             self._save()
+        elif self._wake is not None and self._state() != self._written:
+            # only the running mark is unwritten: written again, trusting what the volume holds meanwhile
+            self._wake.set()
         if not self.owner_confirmed or not settings.COMPUTE_REST_API_URL:
             return
         url = settings.COMPUTE_REST_API_URL.rstrip("/") + "/watchtower/validator-message"

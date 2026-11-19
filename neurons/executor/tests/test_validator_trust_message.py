@@ -57,7 +57,11 @@ def _chain(monkeypatch, read) -> None:
 
 def _state(tmp_path) -> dict:
     path = tmp_path / STATE_FILE
-    return json.loads(path.read_text()) if path.exists() else {"messages": {}}
+    return json.loads(path.read_text()) if path.exists() else _EMPTY_STATE | {"messages": {}}
+
+
+# a kept state as a node writes it: every field present
+_EMPTY_STATE = {"held": None, "messages": {}, "unconfirmed": False, "running": False}
 
 
 def _keep(tmp_path, signer: Keypair, signed: SignedTrustMessage, held: bool = True) -> None:
@@ -71,14 +75,25 @@ def _keep(tmp_path, signer: Keypair, signed: SignedTrustMessage, held: bool = Tr
 
 
 def _trust(tmp_path, owner: Keypair, image_message=None, confirmed: bool = True) -> ValidatorTrust:
-    """Start a node whose kept owner is `owner`; `confirmed`: its first chain read has named that owner."""
+    """Start a node whose kept owner is `owner`, after a run that ended cleanly (its shutdown wrote the newest state
+    marked ended); `confirmed`: its first chain read has named that owner."""
     state = _state(tmp_path)
     state["owner"] = owner.ss58_address
+    state["running"] = False
     (tmp_path / STATE_FILE).write_text(json.dumps(state))
     trust = ValidatorTrust(state_dir=tmp_path, image_message=image_message or tmp_path / "absent.json")
     trust.load()
     trust.owner_confirmed = confirmed
     return trust
+
+
+def _end_run(trust: ValidatorTrust) -> None:
+    """The run's shutdown: the writer writes the newest state marked ended."""
+
+    async def end():
+        await trust.stop_persisting(trust.start_persisting())
+
+    asyncio.run(end())
 
 
 def _accepts(monkeypatch, trust: ValidatorTrust, validator: Keypair, baked: dict[str, str]) -> str | None:
@@ -763,6 +778,7 @@ def test_an_unreadable_kept_state_stays_closed_across_a_restart_after_it_was_rep
     _backend(monkeypatch, lambda *a, **k: answer)
     asyncio.run(restarted.refresh_owner())
     asyncio.run(restarted.refresh_message())
+    _end_run(restarted)
     again = ValidatorTrust(state_dir=tmp_path, image_message=image)
     again.load()
     assert not again.closed()
@@ -811,3 +827,90 @@ def test_a_write_slower_than_a_refresh_still_opens_the_node(tmp_path, monkeypatc
 
     assert not asyncio.run(run())
     assert trust.hotkeys({}) == {"signed": new_validator.ss58_address}
+
+
+@pytest.mark.parametrize("field", ["messages", "held", "unconfirmed", "running"])
+def test_a_kept_state_missing_a_field_is_unreadable(tmp_path, owner, old_validator, new_validator, field):
+    # review: a readable state without its messages map must not fall back to the baked validator
+    _keep(tmp_path, owner, _signed(owner, new_validator, 3))
+    trust = _trust(tmp_path, owner)
+    assert trust.hotkeys({"current": old_validator.ss58_address}) == {"signed": new_validator.ss58_address}
+    state = _state(tmp_path)
+    del state[field]
+    (tmp_path / STATE_FILE).write_text(json.dumps(state))
+    restarted = ValidatorTrust(state_dir=tmp_path, image_message=tmp_path / "absent.json")
+    restarted.load()
+    assert restarted.closed()
+    assert restarted.hotkeys({"current": old_validator.ss58_address}) == {}
+
+
+def test_a_restart_after_a_shutdown_that_could_not_write_trusts_no_validator_until_confirmed(
+    tmp_path, monkeypatch, owner, old_validator, new_validator
+):
+    # review: a newer message taken, its writes and the shutdown write all refused: the restart must not trust the
+    # older validator the volume still holds
+    _keep(tmp_path, owner, _signed(owner, old_validator, 1))
+    trust = _trust(tmp_path, owner)
+    real_write = trust_service._write_json
+    refused = False
+
+    def write(path, data):
+        if refused:
+            raise OSError("volume refused the write")
+        real_write(path, data)
+
+    monkeypatch.setattr(trust_service, "_write_json", write)
+
+    async def run():
+        writer = trust.start_persisting()
+        for _ in range(200):  # the start write marks the run running
+            if trust._written is not None and trust._written["running"]:
+                break
+            await asyncio.sleep(0.01)
+        nonlocal refused
+        refused = True
+        assert trust.offer(_signed(owner, new_validator, 2))
+        await trust.stop_persisting(writer)
+
+    asyncio.run(run())
+    assert _state(tmp_path)["messages"][owner.ss58_address]["message"] == trust_line(old_validator.ss58_address, 1)
+
+    def down(*args, **kwargs):
+        raise ConnectionError("down")
+
+    _backend(monkeypatch, down)
+    _chain(monkeypatch, down)
+    restarted = ValidatorTrust(state_dir=tmp_path, image_message=tmp_path / "absent.json")
+    restarted.load()
+    asyncio.run(restarted.refresh_owner())
+    asyncio.run(restarted.refresh_message())
+    assert restarted.closed()
+    assert restarted.hotkeys({"current": old_validator.ss58_address}) == {}
+
+    # once the backend serves the owner's newest message again, it is trusted
+    refused = False
+    monkeypatch.setattr(trust_service.settings, "COMPUTE_REST_API_URL", "http://backend")
+    _chain(monkeypatch, lambda url: owner.ss58_address)
+    answer = MagicMock(status_code=200)
+    answer.json.return_value = _signed(owner, new_validator, 2)._asdict()
+    _backend(monkeypatch, lambda *a, **k: answer)
+    asyncio.run(restarted.refresh_owner())
+    asyncio.run(restarted.refresh_message())
+    assert restarted.hotkeys({}) == {"signed": new_validator.ss58_address}
+
+
+def test_a_clean_shutdown_restart_keeps_trusting_without_backend_or_chain(tmp_path, monkeypatch, owner, new_validator):
+    trust = _trust(tmp_path, owner)
+    assert trust.offer(_signed(owner, new_validator, 1))
+    _end_run(trust)
+    assert _state(tmp_path)["running"] is False
+
+    def down(*args, **kwargs):
+        raise ConnectionError("down")
+
+    _backend(monkeypatch, down)
+    _chain(monkeypatch, down)
+    restarted = ValidatorTrust(state_dir=tmp_path, image_message=tmp_path / "absent.json")
+    restarted.load()
+    asyncio.run(restarted.refresh_owner())
+    assert restarted.hotkeys({}) == {"signed": new_validator.ss58_address}
