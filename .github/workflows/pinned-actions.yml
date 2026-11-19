@@ -38,7 +38,7 @@ jobs:
         run: |
           # the runner image's own distro PyYAML (Ubuntu's python3-yaml): no package index and no copied parser in this
           # repo, so an index outage cannot stop the scan; a runner without it fails red on the import, never unscanned
-          /usr/bin/python3 - <<'PY'
+          /usr/bin/python3 -I - <<'PY'
           import os, pathlib, posixpath, re, subprocess, sys, urllib.error, urllib.parse, urllib.request, yaml
 
           class Loader(yaml.SafeLoader):
