@@ -824,12 +824,19 @@ def read_kmsg_records(path=KMSG_PATH):
 
 
 def container_memory_kb(container_id, host_root=HOST_MEMORY_ROOT):
-    # (memory.current kB, memory.stat {name: kB}) of one container's cgroup on the host; raises when none is readable
+    # (memory.current kB, memory.stat {name: kB}, the huge pages its hugetlb.*.current files hold in kB or None when it
+    # has none) of one container's cgroup on the host; raises when none is readable
     for directory, usage_file in CONTAINER_MEMORY_CGROUPS:
         base = host_root + directory.format(id=container_id)
         if os.path.isdir(base):
             with open(f"{base}/{usage_file}") as usage, open(f"{base}/memory.stat") as stat:
-                return int(usage.read().strip()) // 1024, parse_memory_stat_kb(stat.read())
+                current, stats = int(usage.read().strip()) // 1024, parse_memory_stat_kb(stat.read())
+            hugetlb_files = [n for n in os.listdir(base) if n.startswith("hugetlb.") and n.endswith(".current")]
+            hugetlb = None
+            for name in hugetlb_files:
+                with open(f"{base}/{name}") as pages:
+                    hugetlb = (hugetlb or 0) + int(pages.read().strip()) // 1024
+            return current, stats, hugetlb
     raise FileNotFoundError(f"no memory cgroup for container {container_id[:12]}")
 
 
@@ -893,19 +900,23 @@ def get_host_memory(list_workloads=list_workload_container_ids, host_root=HOST_M
 
     # the workload containers' cgroups: memory.current counts their anon, page cache and shmem
     current = file_ = shmem = file_mapped = 0
-    hugetlb_unaccounted = False
+    hugetlb_unaccounted = swapcache_unknown = False
     unread = []
     for container_id, _started_at in workloads or []:
         try:
-            usage, stat = container_memory_kb(container_id, host_root)
+            usage, stat, hugetlb_pages = container_memory_kb(container_id, host_root)
         except Exception as exc:
             unread.append(f"{container_id[:12]}: {exc!r}")
             continue
         current += usage
-        # memory.stat has a hugetlb line only with hugetlb accounting on (cgroup v2 memory_hugetlb_accounting)
-        hugetlb_unaccounted = hugetlb_unaccounted or "hugetlb" not in stat
+        # memory.stat has a hugetlb line only with hugetlb accounting on (cgroup v2 memory_hugetlb_accounting), and pages
+        # faulted before that remount are in hugetlb.*.current but not in it: trusted only when the two agree
+        hugetlb_unaccounted = hugetlb_unaccounted or stat.get("hugetlb") is None or stat["hugetlb"] != hugetlb_pages
+        # the cgroup's file counter holds its swap cache, which the host's Cached leaves out
+        swapcached = stat.get("total_swapcached", stat.get("swapcached"))
+        swapcache_unknown = swapcache_unknown or (swapcached is None and mem.get("SwapCached", 0) > 0)
         # v1's usage counts child cgroups, as its total_* stats do (its plain ones are local); v2's are hierarchical
-        file_ += stat.get("total_cache", stat.get("file", 0))
+        file_ += stat.get("total_cache", stat.get("file", 0)) - (swapcached or 0)
         shmem += stat.get("total_shmem", stat.get("shmem", 0))
         file_mapped += stat.get("total_mapped_file", stat.get("file_mapped", 0))
     if workloads is not None:
@@ -943,6 +954,9 @@ def get_host_memory(list_workloads=list_workload_container_ids, host_root=HOST_M
             for key in outside_keys[:2]:
                 facts[key] = None
                 errors[key] = "a huge page pool is reserved and a workload's hugetlb charge is not accounted"
+        if swapcache_unknown and facts["hm_outside_workloads_no_cache_kb"] is not None:
+            facts["hm_outside_workloads_no_cache_kb"] = None
+            errors["hm_outside_workloads_no_cache_kb"] = "the host holds swap cache and a workload's swapcached is not readable"
 
     try:
         with open(vmstat_path) as vmstat:

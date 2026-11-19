@@ -66,6 +66,7 @@ def _host(tmp_path: Path, *, pod_cgroup: bool = True) -> dict:
             f"anon {(current - file_) * 1024}\nfile {file_ * 1024}\nshmem {shmem * 1024}\nfile_mapped {mapped * 1024}\n"
             "hugetlb 0\n"  # hugetlb accounting on: the pool the fixture reserves is the host's
         )
+        (d / "hugetlb.2MB.current").write_text("0\n")
     return {
         "host_root": str(root),
         "meminfo_path": str(tmp_path / "meminfo"),
@@ -240,17 +241,25 @@ def test_a_workload_that_grew_between_the_reads_is_no_negative_figure(tmp_path: 
 
 
 @pytest.mark.parametrize(
-    "workload_set, pod_current_gib, pod_stat, expected_gib",
+    "workload_set, pod_current_gib, pod_stat, expected_gib, pod_hugetlb_gib",
     [
         # review on lium-io#2361: 64 GiB total, 46 GiB free, a 16 GiB huge page pool; used = MemTotal - MemFree = 18 GiB
-        ("none", 0, None, 18),  # a host-only pool is host use
-        ("pod", 0, "anon 0\nhugetlb 0\n", 18),  # an ordinary pod beside a host-only pool
-        ("pod", 16, f"anon 0\nhugetlb {16 * 1024 * 1024 * 1024}\n", 2),  # the pod owns the pool, accounting on
-        ("pod", 0, "anon 0\n", None),  # the pod may own the pool, accounting unavailable: unknown
+        ("none", 0, None, 18, None),  # a host-only pool is host use
+        ("pod", 0, "anon 0\nhugetlb 0\n", 18, 0),  # an ordinary pod beside a host-only pool
+        ("pod", 16, f"anon 0\nhugetlb {16 * 1024 * 1024 * 1024}\n", 2, 16),  # the pod owns the pool, accounting on
+        ("pod", 0, "anon 0\n", None, None),  # the pod may own the pool, accounting unavailable: unknown
+        # review on lium-io#2361 at 34bf9ed: pages faulted before the remount turned accounting on are in
+        # hugetlb.*.current but not in memory.stat, so the charge cannot be trusted: unknown
+        ("pod", 0, "anon 0\nhugetlb 0\n", None, 16),
     ],
 )
 def test_the_huge_page_pool_counts_where_its_owner_is_known(
-    tmp_path: Path, workload_set: str, pod_current_gib: int, pod_stat: str | None, expected_gib: int | None
+    tmp_path: Path,
+    workload_set: str,
+    pod_current_gib: int,
+    pod_stat: str | None,
+    expected_gib: int | None,
+    pod_hugetlb_gib: int | None,
 ) -> None:
     gib = 1024 * 1024
     paths = _host(tmp_path)
@@ -266,6 +275,11 @@ def test_the_huge_page_pool_counts_where_its_owner_is_known(
     if pod_stat is not None:
         (pod / "memory.current").write_text(f"{pod_current_gib * gib * 1024}\n")
         (pod / "memory.stat").write_text(pod_stat)
+        hugetlb_file = pod / "hugetlb.2MB.current"
+        if pod_hugetlb_gib is None:
+            hugetlb_file.unlink()
+        else:
+            hugetlb_file.write_text(f"{pod_hugetlb_gib * gib * 1024}\n")
     listing = (lambda deadline=None: []) if workload_set == "none" else workloads
 
     facts = NS["get_host_memory"](list_workloads=listing, read_kmsg=lambda: [], **paths)
@@ -426,3 +440,35 @@ def test_host_memory_keys_are_wired_through_both_obfuscation_tables() -> None:
     for key in used:
         assert f'"{key}"' in scrape
         assert key in all_keys
+
+
+@pytest.mark.parametrize(
+    "pod_stat_extra, host_swapcached_kb, expected_no_cache_kb",
+    [
+        # review on lium-io#2361 at 34bf9ed: a pod's 2 GiB of swap cache sits in its file counter, not in the host's
+        # Cached, so it is taken back out of the workload's cache term (it read 2 GiB too high)
+        (f"swapcached {2 * 1024 * 1024 * 1024}\n", 2 * 1024 * 1024, 14000),
+        # the host holds swap cache and the pod's share is not readable: unknown, not overstated
+        ("", 2 * 1024 * 1024, None),
+        # no swap cache anywhere: the figure stands without the counter
+        ("", 0, 14000),
+    ],
+)
+def test_a_pods_swap_cache_is_not_counted_as_host_ram(
+    tmp_path: Path, pod_stat_extra: str, host_swapcached_kb: int, expected_no_cache_kb: int | None
+) -> None:
+    paths = _host(tmp_path)
+    Path(paths["meminfo_path"]).write_text(MEMINFO.replace("SwapCached:          0 kB", f"SwapCached: {host_swapcached_kb} kB"))
+    for cgroup, file_kb in ((f"sys/fs/cgroup/docker/{FILLER}", 4000), (f"sys/fs/cgroup/system.slice/docker-{POD}.scope", 10000)):
+        stat = Path(paths["host_root"]) / cgroup / "memory.stat"
+        extra = pod_stat_extra if POD in cgroup else ("swapcached 0\n" if pod_stat_extra else "")
+        if POD in cgroup and pod_stat_extra:
+            file_kb += 2 * 1024 * 1024  # the swap cache is inside the cgroup's file counter
+        lines = [l for l in stat.read_text().splitlines() if not l.startswith("file ")]
+        stat.write_text("\n".join(lines + [f"file {file_kb * 1024}"]) + "\n" + extra)
+
+    facts = NS["get_host_memory"](list_workloads=workloads, read_kmsg=lambda: [], **paths)
+    assert facts["hm_outside_workloads_no_cache_kb"] == expected_no_cache_kb
+    if expected_no_cache_kb is None:
+        assert "swap" in facts["hm_errors"]["hm_outside_workloads_no_cache_kb"]
+        assert facts["hm_outside_workloads_kb"] is not None
