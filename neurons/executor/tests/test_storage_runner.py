@@ -1511,10 +1511,29 @@ def test_a_restore_through_a_symlink_fails_with_a_clear_message(monkeypatch: pyt
 def test_local_backup_of_a_file_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     path = tmp_path / "backup"
     path.write_text("x")
-    runner = ResticStorageRunner(StorageOperationSpec.from_mapping(_operation_payload()), LocalWorkspace(path))
-    monkeypatch.setattr("storage.restic.subprocess.Popen", lambda *a, **k: pytest.fail("restic ran"))
+    monkeypatch.setattr("storage.restic.HELPER_VOLUME_ROOT", str(tmp_path))
+    runner = ResticStorageRunner(
+        StorageOperationSpec.from_mapping(_operation_payload()), LocalWorkspace(path), restic_binary="/bin/false"
+    )
 
     with pytest.raises(ResticOperationError, match="not a directory"):
+        runner._backup()
+
+
+def test_local_backup_never_follows_a_symlink_to_a_host_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The missing/empty check is the walker's: a renter symlink to a host dir is refused, never listed or backed up."""
+    volume, host = tmp_path / "volume", tmp_path / "host"
+    volume.mkdir()
+    host.mkdir()
+    (host / "secret").write_text("x")
+    (volume / "link").symlink_to(host)
+    monkeypatch.setattr("storage.restic.HELPER_VOLUME_ROOT", str(volume))
+    monkeypatch.setattr(Path, "iterdir", lambda self: pytest.fail(f"listed {self}"))
+    runner = ResticStorageRunner(
+        StorageOperationSpec.from_mapping(_operation_payload()), LocalWorkspace(volume / "link"), restic_binary="/bin/false"
+    )
+
+    with pytest.raises(ResticOperationError, match="symlink, which is not followed"):
         runner._backup()
 
 
@@ -1598,10 +1617,16 @@ def test_local_backup_of_a_missing_or_empty_directory_skips_restic(
     path = tmp_path / "backup"
     if make_dir:
         path.mkdir()
-    runner = ResticStorageRunner(StorageOperationSpec.from_mapping(_operation_payload()), LocalWorkspace(path))
-    monkeypatch.setattr("storage.restic.subprocess.Popen", lambda *a, **k: pytest.fail("restic ran"))
+    monkeypatch.setattr("storage.restic.HELPER_VOLUME_ROOT", str(tmp_path))
+    marker = tmp_path / "ran"
+    runner = ResticStorageRunner(
+        StorageOperationSpec.from_mapping(_operation_payload()), LocalWorkspace(path), restic_binary="/usr/bin/touch"
+    )
+    monkeypatch.setattr(runner, "_restic_command", lambda arguments: ["/usr/bin/touch", str(marker)])
 
     result = runner._backup()
+
+    assert not marker.exists()
 
     assert (result.status, result.result_quality, result.snapshot_id) == ("COMPLETED", OperationResultQuality.EMPTY, None)
 

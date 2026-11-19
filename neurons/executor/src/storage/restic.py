@@ -22,7 +22,7 @@ from storage.models import (
     StorageOperationSpec,
 )
 from storage.reporting import StorageEventReporter
-from storage.safe_path import SYMLINK_EXIT, safe_enter_command
+from storage.safe_path import NOT_A_DIRECTORY_EXIT, SYMLINK_EXIT, safe_enter_command
 from storage.workspace import (
     DockerUserNamespaceWorkspace,
     DockerVolumeWorkspace,
@@ -461,12 +461,7 @@ class ResticStorageRunner:
         ]
         # DAH-2002/DAH-4693: a missing, empty or fully excluded path is a no-op, not a failed run
         nothing = ResticResult("COMPLETED", OperationResultQuality.EMPTY, None, 0)
-        if isinstance(self._workspace, LocalWorkspace):
-            path = self._workspace.path
-            if path.exists() and not path.is_dir():
-                raise ResticOperationError("the backup path is not a directory")
-            if not path.exists() or not any(path.iterdir()):
-                return nothing
+        # the missing/empty check is the walker's (exit 66), which never follows a renter symlink
         renewals = reruns = 0
         while True:
             self._last_error_text = ""
@@ -502,6 +497,8 @@ class ResticStorageRunner:
             raise ResticOperationError(self._killed_helper_message("backup"))
         if exit_code == SYMLINK_EXIT and not snapshot_id:
             raise ResticOperationError("the backup path leads through a symlink, which is not followed")
+        if exit_code == NOT_A_DIRECTORY_EXIT and not snapshot_id:
+            raise ResticOperationError("the backup path is not a directory")
         raise ResticOperationError(
             f"restic backup failed with exit {exit_code}"
             + (" without a snapshot ID" if not snapshot_id else "")
