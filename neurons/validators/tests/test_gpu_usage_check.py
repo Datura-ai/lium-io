@@ -1926,10 +1926,10 @@ async def _filler_process_ctx(context_factory, cmdline, repository="daturaai/pea
 
 @pytest.mark.parametrize("enforced", [False, True])
 @pytest.mark.asyncio
-async def test_foreign_process_exec_into_a_filler_on_its_own_image(context_factory, monkeypatch, caplog, enforced):
-    # a provider `docker exec`s his own miner into Lium's PEARL filler: the image still matches
+async def test_unlisted_process_in_a_filler_on_its_own_image(context_factory, monkeypatch, caplog, enforced):
+    # a GPU process in a PEARL filler on its own image whose command is not the workload's
     monkeypatch.setattr(gpu_usage.settings, "FILLER_PROCESS_ALLOWLIST_ENFORCED", enforced)
-    ctx, filler = await _filler_process_ctx(context_factory, "/usr/bin/xmrig -o pool.example:3333")
+    ctx, filler = await _filler_process_ctx(context_factory, "/opt/other/gpu-app --run")
 
     with caplog.at_level("WARNING"):
         result = await GpuUsageCheck().run(ctx)
@@ -1940,9 +1940,9 @@ async def test_foreign_process_exec_into_a_filler_on_its_own_image(context_facto
         assert result.passed is False
         assert result.event.reason_code == Msg.USAGE_HIGH.reason
         assert result.event.what_we_saw["filler_foreign_processes"] == [
-            f"{filler} (pid 4242): /usr/bin/xmrig -o pool.example:3333"
+            f"{filler} (pid 4242): /opt/other/gpu-app --run"
         ]
-        assert f"{filler} (pid 4242): /usr/bin/xmrig" in result.event.remediation
+        assert f"{filler} (pid 4242): /opt/other/gpu-app" in result.event.remediation
     else:
         assert result.passed is True
         assert result.event.reason_code == Msg.USAGE_OK.reason
@@ -1979,8 +1979,8 @@ async def test_a_fillers_own_workload_passes_with_the_allowlist_enforced(
     [
         ("daturaai/pearl-miner", ""),  # the scrape could not read it, or liumd does not report it
         ("daturaai/pearl-miner", None),
-        (None, "/usr/bin/xmrig"),  # a filler started before the repository was recorded
-        ("ghcr.io/hanlinai/engy-golden-serve", "/usr/bin/xmrig"),  # a workload with no allowlist
+        (None, "/opt/other/gpu-app"),  # a filler started before the repository was recorded
+        ("ghcr.io/hanlinai/engy-golden-serve", "/opt/other/gpu-app"),  # a workload with no allowlist
     ],
 )
 @pytest.mark.asyncio
