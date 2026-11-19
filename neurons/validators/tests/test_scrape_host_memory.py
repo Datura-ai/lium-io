@@ -241,16 +241,18 @@ def test_a_workload_that_grew_between_the_reads_is_no_negative_figure(tmp_path: 
 
 
 @pytest.mark.parametrize(
-    "workload_set, pod_current_gib, pod_stat, expected_gib, pod_hugetlb_gib",
+    "workload_set, pod_current_gib, pod_stat, expected_gib, pod_hugetlb_gib, pod_rsvd_gib",
     [
         # review on lium-io#2361: 64 GiB total, 46 GiB free, a 16 GiB huge page pool; used = MemTotal - MemFree = 18 GiB
-        ("none", 0, None, 18, None),  # a host-only pool is host use
-        ("pod", 0, "anon 0\nhugetlb 0\n", 18, 0),  # an ordinary pod beside a host-only pool
-        ("pod", 16, f"anon 0\nhugetlb {16 * 1024 * 1024 * 1024}\n", 2, 16),  # the pod owns the pool, accounting on
-        ("pod", 0, "anon 0\n", None, None),  # the pod may own the pool, accounting unavailable: unknown
+        ("none", 0, None, 18, None, None),  # a host-only pool is host use
+        ("pod", 0, "anon 0\nhugetlb 0\n", 18, 0, None),  # an ordinary pod beside a host-only pool
+        ("pod", 16, f"anon 0\nhugetlb {16 * 1024 * 1024 * 1024}\n", 2, 16, None),  # the pod owns the pool, accounting on
+        # review at ceb64cb: hugetlb.<size>.rsvd.current counts reservations, not usage, and is never summed
+        ("pod", 16, f"anon 0\nhugetlb {16 * 1024 * 1024 * 1024}\n", 2, 16, 16),
+        ("pod", 0, "anon 0\n", None, None, None),  # the pod may own the pool, accounting unavailable: unknown
         # review on lium-io#2361 at 34bf9ed: pages faulted before the remount turned accounting on are in
         # hugetlb.*.current but not in memory.stat, so the charge cannot be trusted: unknown
-        ("pod", 0, "anon 0\nhugetlb 0\n", None, 16),
+        ("pod", 0, "anon 0\nhugetlb 0\n", None, 16, None),
     ],
 )
 def test_the_huge_page_pool_counts_where_its_owner_is_known(
@@ -260,6 +262,7 @@ def test_the_huge_page_pool_counts_where_its_owner_is_known(
     pod_stat: str | None,
     expected_gib: int | None,
     pod_hugetlb_gib: int | None,
+    pod_rsvd_gib: int | None,
 ) -> None:
     gib = 1024 * 1024
     paths = _host(tmp_path)
@@ -280,6 +283,8 @@ def test_the_huge_page_pool_counts_where_its_owner_is_known(
             hugetlb_file.unlink()
         else:
             hugetlb_file.write_text(f"{pod_hugetlb_gib * gib * 1024}\n")
+        if pod_rsvd_gib is not None:
+            (pod / "hugetlb.2MB.rsvd.current").write_text(f"{pod_rsvd_gib * gib * 1024}\n")
     listing = (lambda deadline=None: []) if workload_set == "none" else workloads
 
     facts = NS["get_host_memory"](list_workloads=listing, read_kmsg=lambda: [], **paths)

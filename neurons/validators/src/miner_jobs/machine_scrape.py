@@ -831,7 +831,8 @@ def container_memory_kb(container_id, host_root=HOST_MEMORY_ROOT):
         if os.path.isdir(base):
             with open(f"{base}/{usage_file}") as usage, open(f"{base}/memory.stat") as stat:
                 current, stats = int(usage.read().strip()) // 1024, parse_memory_stat_kb(stat.read())
-            hugetlb_files = [n for n in os.listdir(base) if n.startswith("hugetlb.") and n.endswith(".current")]
+            # usage only: hugetlb.<size>.current, never hugetlb.<size>.rsvd.current (reservations)
+            hugetlb_files = [n for n in os.listdir(base) if n.startswith("hugetlb.") and n.count(".") == 2 and n.endswith(".current")]
             hugetlb = None
             for name in hugetlb_files:
                 with open(f"{base}/{name}") as pages:
