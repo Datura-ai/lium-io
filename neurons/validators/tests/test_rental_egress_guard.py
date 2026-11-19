@@ -52,6 +52,8 @@ def _ssh(
     legacy_nets=f"{LEGACY_NET_ID} bridge docker0",
     legacy_nets_rc=0,
     legacy_nets_stderr="",
+    labelled="",
+    labelled_rc=0,
 ):
     calls: list[str] = []
     if network_stderr is None:
@@ -59,6 +61,8 @@ def _ssh(
 
     async def run(cmd, *args, **kwargs):
         calls.append(cmd)
+        if "network ls" in cmd:
+            return SimpleNamespace(exit_status=labelled_rc, stdout=labelled, stderr="daemon error" if labelled_rc else "")
         if "docker ps" in cmd:
             return SimpleNamespace(exit_status=ps_rc, stdout=names, stderr="Cannot connect to the Docker daemon" if ps_rc else "")
         if "network inspect" in cmd and ".Driver" in cmd:
@@ -811,3 +815,23 @@ def test_the_helper_runs_only_iptables_in_the_host_root(tmp_path, monkeypatch, s
     if script == "apply":
         [(_, rules)] = _jumps_and_rules(state)
         assert rules == [f"-i br-0123456789ab -d {LINK_LOCAL_CIDR} -p {p} ! --dport 53 -j DROP" for p in ("tcp", "udp")]
+
+
+@pytest.mark.asyncio
+async def test_a_pod_bridge_whose_pod_is_stopped_or_not_started_yet_is_guarded():
+    # no pod runs: the labelled bridge of a stopped or just-created pod is still in the rules (DAH-6737)
+    ssh = _ssh(labelled=f"{LEGACY_NET_ID}\n", legacy_nets=f"{LEGACY_NET_ID} bridge <no value>")
+
+    guarded, error = await rental_egress_guard.apply_rental_egress_guard(ssh)
+
+    assert error is None and guarded["legacy_bridges"] == [f"br-{LEGACY_NET_ID[:12]}"]
+    [helper] = _helper_calls(ssh)
+    assert f"-i br-{LEGACY_NET_ID[:12]} " in helper
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_pod_bridge_list_leaves_the_rules_as_they_are():
+    ssh = _ssh(labelled_rc=1)
+    with pytest.raises(rental_egress_guard.InventoryUnknown):
+        await rental_egress_guard.apply_rental_egress_guard(ssh)
+    assert not _helper_calls(ssh)

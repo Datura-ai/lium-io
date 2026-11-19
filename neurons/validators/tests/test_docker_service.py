@@ -49,6 +49,7 @@ from services.rental_docker_sdk import (
     RentalDockerOperationError,
     _wrap_error_message,
     build_gpu_docker_config,
+    rental_network_for,
 )
 from payload_models.payloads import (
     AddSshPublicKeyRequest,
@@ -3082,8 +3083,17 @@ async def test_start_container_sdk_failure_returns_failed_request_without_shell_
         "SDK start failed"
     )
     monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
-    connect_mock = Mock(side_effect=AssertionError("asyncssh fallback is not allowed"))
+    # the session opens only to guard the pod's bridge before the start (DAH-6737); never a shell start
+    shell: list[str] = []
+
+    async def _run(cmd, *args, **kwargs):
+        shell.append(cmd)
+        return Mock(exit_status=0, stdout="", stderr="")
+
+    ssh = Mock(run=_run)
+    connect_mock = Mock(return_value=contextlib.nullcontext(ssh))
     monkeypatch.setattr("services.docker_service.asyncssh.connect", connect_mock)
+    monkeypatch.setattr("services.docker_service.public_host_sock", AsyncMock(return_value={}))
 
     payload = ContainerStartRequest(
         miner_hotkey="miner-hotkey",
@@ -3113,7 +3123,7 @@ async def test_start_container_sdk_failure_returns_failed_request_without_shell_
     )
 
     assert isinstance(result, FailedContainerRequest)
-    assert connect_mock.call_count == 0
+    assert not [cmd for cmd in shell if "docker start" in cmd]
     assert docker_service.rental_docker_client_factory.client.started_containers == [
         "pod_test"
     ]
@@ -10990,3 +11000,50 @@ async def test_generate_portMappings_keeps_held_ports_when_no_other_port_is_free
     )
 
     assert {mapping[2] for mapping in result} == {20000}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["create", "start"])
+async def test_the_pod_bridge_is_guarded_before_the_pod_starts(docker_service, monkeypatch, path):
+    # DAH-6737: the bridge exists and the host-locked egress guard ran before the first start, on create and on the
+    # start that moves a stopped pod onto its own bridge
+    events: list = []
+
+    async def guard(ssh):
+        events.append(("guard",))
+        return {}, None
+
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.apply_rental_egress_guard", guard)
+
+    class Client:
+        async def ensure_network(self, name):
+            events.append(("ensure_network", name))
+
+        async def run_container(self, spec):
+            events.append(("run_container", spec.network))
+            return "cid"
+
+        async def start(self, *, container_name, network=None):
+            events.append(("start", network))
+
+        async def inspect_container_state(self, *, container_name):
+            raise RuntimeError("unread")
+
+    net = rental_network_for("pod_a")
+    if path == "create":
+        spec = ContainerRunSpec(name="pod_a", image="img", network=net)
+        await docker_service._run_rental_docker_create_attempts(
+            docker_client=Client(), ssh_client=Mock(), run_spec=spec, container_name="pod_a", default_extra={}, flatten_lease=None
+        )
+        assert events == [("ensure_network", net), ("guard",), ("run_container", net)]
+    else:
+        docker_service._restore_mount_and_sshd_after_start = AsyncMock()
+        await docker_service._bring_up_existing_container(
+            docker_client=Client(),
+            ssh_client=Mock(),
+            container_name="pod_a",
+            local_volume_path=None,
+            pod_id="p",
+            default_extra={},
+        )
+        assert events == [("ensure_network", net), ("guard",), ("start", net)]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import http.client
 import logging
+import re
 import socket as socket_module
 import tempfile
 import threading
@@ -708,6 +709,10 @@ class RentalDockerSdkClient:
             exit_code = None
         return f"exit_code={exit_code}"
 
+    async def ensure_network(self, name: str) -> None:
+        """The rental network `name` exists with ICC off (and the template with it), as before a create or start."""
+        await _in_docker_thread(self._ensure_rental_network_sync, name)
+
     async def start(self, *, container_name: str, network: str | None = None) -> None:
         # starting a running container answers 304, so a second start after a drop is safe
         if network:
@@ -1257,9 +1262,13 @@ class RentalDockerSdkClient:
             return False
         attached = set(((info.get("NetworkSettings") or {}).get("Networks") or {}).keys())
         mode = (info.get("HostConfig") or {}).get("NetworkMode") or "default"
-        if network in attached or mode not in ("default", "bridge", RENTAL_NETWORK_NAME):
+        if mode not in ("default", "bridge", RENTAL_NETWORK_NAME):
             return False
+        # a moved pod keeps NetworkMode lium-rentals, which `docker start` resolves: the template is recreated (with
+        # the pod's own bridge) when it was pruned while the pod was stopped, moved before or not
         self._ensure_rental_network_sync(network)
+        if network in attached:
+            return False
         for name in sorted(attached):
             self._api_client.disconnect_container_from_network(container_name, name)
         self._api_client.connect_container_to_network(container_name, network)
@@ -1970,10 +1979,11 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
 
 def _age_seconds(created: str | None) -> float:
     """Seconds since Docker's `Created` (RFC 3339, nanoseconds); 0 when unreadable, so the network is kept."""
-    try:
-        stamp = datetime.strptime((created or "")[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
-    except ValueError:
+    # fromisoformat takes at most microseconds: cut the nanoseconds, keep the Z or +hh:mm offset
+    match = re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?(Z|[+-]\d\d:\d\d)", created or "")
+    if match is None:
         return 0.0
+    stamp = datetime.fromisoformat(match[1] + (match[2] or "")[:7] + match[3].replace("Z", "+00:00"))
     return (datetime.now(timezone.utc) - stamp).total_seconds()
 
 

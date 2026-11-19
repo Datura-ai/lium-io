@@ -3812,6 +3812,32 @@ class DockerService:
             return False
         return status in ("created", "exited", "dead")
 
+    async def _guard_pod_network_before_start(
+        self,
+        *,
+        docker_client: RentalDockerSdkClient,
+        ssh_client: asyncssh.SSHClientConnection,
+        network: str,
+        default_extra: dict,
+    ) -> None:
+        """The pod's own bridge exists and is in the host's link-local egress drop before the pod starts (DAH-6737),
+        under the same host lock as the periodic guard; fail-open like that guard, which retries every interval."""
+        from services.task.checks.rental_egress_guard import apply_rental_egress_guard
+
+        try:
+            # the create or start ensures it again and fails there, not here, if it cannot be made
+            await docker_client.ensure_network(network)
+            _, error = await asyncio.wait_for(apply_rental_egress_guard(ssh_client), timeout=120)
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc) or type(exc).__name__
+        if error:
+            logger.warning(
+                _m(
+                    "Rental egress guard not applied before start",
+                    extra={**default_extra, "network": network, "error": error[:300]},
+                )
+            )
+
     async def _run_rental_docker_create_attempts(
         self,
         *,
@@ -3866,6 +3892,13 @@ class DockerService:
         image_flattened = False
         remaps = 0
         own_leftover_removed = False
+        if run_spec.network:
+            await self._guard_pod_network_before_start(
+                docker_client=docker_client,
+                ssh_client=ssh_client,
+                network=run_spec.network,
+                default_extra=default_extra,
+            )
         while True:
             try:
                 container_id = await run_logged_rental_docker_sdk_operation(
@@ -12742,8 +12775,8 @@ class DockerService:
             private_key=private_key,
         ) as docker_client:
             stopped_before = await _stopped_before_start(docker_client, container_name)
-            # the start goes through the docker SDK; the SSH session is opened only once it
-            # succeeded, for the remount (no shell fallback for a failed start), or for the
+            # the start goes through the docker SDK (no shell fallback for a failed start); the SSH session,
+            # opened first, guards the pod's bridge before it, then serves the remount or the
             # stale-mountpoint repair below
             async def _start() -> None:
                 await run_logged_rental_docker_sdk_operation(
@@ -12757,13 +12790,6 @@ class DockerService:
                     container_name=container_name,
                 )
 
-            stale_mount_error: Exception | None = None
-            try:
-                await _start()
-            except Exception as exc:
-                if not _is_stale_vloopback_mountpoint_error(str(exc)):
-                    raise
-                stale_mount_error = exc
             async with asyncssh.connect(
                 host=executor_info.address,
                 port=executor_info.ssh_port,
@@ -12772,14 +12798,24 @@ class DockerService:
                 client_keys=[pkey],
                 known_hosts=known_hosts_policy,
             ) as ssh_client:
-                if stale_mount_error is not None:
+                await self._guard_pod_network_before_start(
+                    docker_client=docker_client,
+                    ssh_client=ssh_client,
+                    network=rental_network_for(container_name),
+                    default_extra=default_extra,
+                )
+                try:
+                    await _start()
+                except Exception as exc:
                     # a GPU reset's restart of a stopped pod hit "file exists" and left the pod down
                     # (5 Nov): the same repair as the edit undo, rmdir only an empty, unmounted
                     # mountpoint, then start once more
-                    if not await self._repair_stale_mountpoint_of_container_volume(
+                    if not _is_stale_vloopback_mountpoint_error(
+                        str(exc)
+                    ) or not await self._repair_stale_mountpoint_of_container_volume(
                         ssh_client, container_name, default_extra
                     ):
-                        raise stale_mount_error
+                        raise
                     await _start()
                 await self._restore_mount_and_sshd_after_start(
                     docker_client=docker_client,
@@ -12816,6 +12852,12 @@ class DockerService:
             )
 
         stopped_before = await _stopped_before_start(docker_client, container_name)
+        await self._guard_pod_network_before_start(
+            docker_client=docker_client,
+            ssh_client=ssh_client,
+            network=rental_network_for(container_name),
+            default_extra=default_extra,
+        )
         try:
             await _start()
         except Exception as exc:

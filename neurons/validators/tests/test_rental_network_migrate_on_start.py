@@ -80,7 +80,7 @@ async def test_start_leaves_a_pod_already_on_the_rental_network_alone():
 
     await client.start(container_name="pod_a", network=RENTAL_NETWORK_NAME)
 
-    assert api.events == [("inspect_container", "pod_a"), ("start", "pod_a")]
+    assert api.events == [("inspect_container", "pod_a"), ("inspect_network", RENTAL_NETWORK_NAME), ("start", "pod_a")]
 
 
 @pytest.mark.asyncio
@@ -213,3 +213,58 @@ async def test_a_failed_cleanup_never_blocks_the_pod():
     await RentalDockerSdkClient(api).start(container_name="pod_a", network=OWN)
 
     assert api.events[-1] == ("start", "pod_a")
+
+
+@pytest.mark.asyncio
+async def test_a_moved_pod_whose_template_was_pruned_gets_it_back_before_its_start():
+    # moved earlier: on its own bridge, NetworkMode still the template, which a prune removed while it was stopped
+    api = PerPodApi(networks=(OWN,), mode=RENTAL_NETWORK_NAME, rental_network_exists=False)
+    api.networks[OWN] = {"Driver": "bridge", "Options": {RENTAL_NETWORK_ICC_OPTION: "false"}}
+
+    await RentalDockerSdkClient(api).start(container_name="pod_a", network=OWN)
+
+    assert api.events.index(("create_network", RENTAL_NETWORK_NAME)) < api.events.index(("start", "pod_a"))
+    assert not [e for e in api.events if e[0] in ("disconnect", "connect")]
+
+
+def test_bridge_age_reads_the_offset_docker_writes(monkeypatch):
+    from datetime import datetime, timezone
+
+    from services import rental_docker_sdk
+
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 11, 18, 12, 0, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(rental_docker_sdk, "datetime", Frozen)
+    # the same instant, 11:50 UTC, in UTC and at +02:00: both 600 s old, not 7800 s and -6600 s
+    assert rental_docker_sdk._age_seconds("2026-11-18T11:50:00.123456789Z") == pytest.approx(600, abs=1)
+    assert rental_docker_sdk._age_seconds("2026-11-18T13:50:00.123456789+02:00") == pytest.approx(600, abs=1)
+    assert rental_docker_sdk._age_seconds("garbage") == 0.0
+
+
+@pytest.mark.asyncio
+async def test_the_cleanup_ages_each_bridge_by_its_own_offset(monkeypatch):
+    from datetime import datetime, timezone
+
+    from services import rental_docker_sdk
+
+    class Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 11, 18, 12, 0, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(rental_docker_sdk, "datetime", Frozen)
+    api = PerPodApi(
+        pod_networks=[
+            # 11:45 UTC, 15 min old: removed (read as UTC it would look 2 h in the future and stay forever)
+            {"Id": "old", "Name": "lium-rentals-pod_old", "Created": "2026-11-18T13:45:00.5+02:00"},
+            # 11:55 UTC, 5 min old, a racing create's: kept (read as UTC it would look 5 h old and be removed)
+            {"Id": "fresh", "Name": "lium-rentals-pod_fresh", "Created": "2026-11-18T06:55:00.5-05:00"},
+        ],
+    )
+
+    await RentalDockerSdkClient(api).start(container_name="pod_a", network=OWN)
+
+    assert api.removed == ["old"]

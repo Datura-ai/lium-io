@@ -36,7 +36,7 @@ import shlex
 import time
 
 from services.const import LEGACY_LIUM_CONTAINER_NAME
-from services.rental_docker_sdk import RENTAL_NETWORK_NAME
+from services.rental_docker_sdk import POD_NETWORK_LABEL, RENTAL_NETWORK_NAME
 
 from core.utils import _m, get_extra_info
 
@@ -346,40 +346,56 @@ class RentalEgressGuardCheck:
         )
 
     async def _apply(self, ctx: Context) -> tuple[dict | None, str | None]:
-        """(what was guarded, error); None when there is neither a rental network nor a legacy rental."""
-        inspect = await ctx.ssh.run(
-            f"/usr/bin/docker network inspect {RENTAL_NETWORK_NAME} "
-            f"-f '{{{{.Id}}}} {{{{index .Options \"{BRIDGE_NAME_OPTION}\"}}}}'",
+        return await apply_rental_egress_guard(ctx.ssh)
+
+
+async def apply_rental_egress_guard(ssh) -> tuple[dict | None, str | None]:
+    """(what was guarded, error); None when there is neither a rental network nor a legacy rental.
+
+    Also run on the create and start paths right before a pod starts (DAH-6737), so a pod's own bridge is guarded
+    before its first packet, not at the next periodic run.
+    """
+    inspect = await ssh.run(
+        f"/usr/bin/docker network inspect {RENTAL_NETWORK_NAME} "
+        f"-f '{{{{.Id}}}} {{{{index .Options \"{BRIDGE_NAME_OPTION}\"}}}}'",
+        check=False,
+    )
+    bridge = network_inventory(inspect)
+    legacy: list[str] = []
+    # host-wide, never this registration's rental: every miner reporting this host must reconcile the same set,
+    # or an idle registration would drop the rules of another registration's legacy pod
+    names = rental_containers(await ssh.run("/usr/bin/docker ps --format '{{.Names}}'", check=False))
+    network_ids: list[str] = []
+    if names:
+        # running pods created before the rental network stay on their own network until they stop
+        pods = await ssh.run(
+            "/usr/bin/docker inspect -f '{{if .State.Running}}{{range $k, $v := .NetworkSettings.Networks}}"
+            f"{{{{if ne $k \"{RENTAL_NETWORK_NAME}\"}}}}{{{{$v.NetworkID}}}} {{{{end}}}}{{{{end}}}}{{{{end}}}}' "
+            f"{' '.join(shlex.quote(name) for name in names)}",
             check=False,
         )
-        bridge = network_inventory(inspect)
-        legacy: list[str] = []
-        # host-wide, never this registration's rental: every miner reporting this host must reconcile the same set,
-        # or an idle registration would drop the rules of another registration's legacy pod
-        names = rental_containers(await ctx.ssh.run("/usr/bin/docker ps --format '{{.Names}}'", check=False))
-        if names:
-            # running pods created before the rental network stay on their own network until they stop
-            pods = await ctx.ssh.run(
-                "/usr/bin/docker inspect -f '{{if .State.Running}}{{range $k, $v := .NetworkSettings.Networks}}"
-                f"{{{{if ne $k \"{RENTAL_NETWORK_NAME}\"}}}}{{{{$v.NetworkID}}}} {{{{end}}}}{{{{end}}}}{{{{end}}}}' "
-                f"{' '.join(shlex.quote(name) for name in names)}",
-                check=False,
-            )
-            network_ids = pod_inventory(pods)
-            if network_ids:
-                nets = await ctx.ssh.run(
-                    "/usr/bin/docker network inspect "
-                    f"-f '{{{{.Id}}}} {{{{.Driver}}}} {{{{index .Options \"{BRIDGE_NAME_OPTION}\"}}}}' "
-                    f"{' '.join(network_ids)}",
-                    check=False,
-                )
-                legacy = legacy_bridge_inventory(nets)
-        if bridge is None and not legacy:
-            # rules from a rental that has since ended must not outlive it (Docker reuses its address)
-            result = await ctx.ssh.run(_helper(link_local_cleanup_script()), check=False)
-            return None, _error(result)
-        result = await ctx.ssh.run(_helper(link_local_drop_script(bridge, legacy)), check=False)
-        return {"bridge": bridge, "legacy_bridges": legacy}, _error(result)
+        network_ids = pod_inventory(pods)
+    # every pod's own bridge, its pod stopped or not started yet, so a start never runs on an unguarded bridge
+    labelled = await ssh.run(
+        f"/usr/bin/docker network ls -q --no-trunc --filter label={POD_NETWORK_LABEL}=pod", check=False
+    )
+    if labelled.exit_status != 0:
+        raise InventoryUnknown(_error(labelled) or "pod network list failed")
+    network_ids += [nid for nid in legacy_network_ids(labelled.stdout) if nid not in network_ids]
+    if network_ids:
+        nets = await ssh.run(
+            "/usr/bin/docker network inspect "
+            f"-f '{{{{.Id}}}} {{{{.Driver}}}} {{{{index .Options \"{BRIDGE_NAME_OPTION}\"}}}}' "
+            f"{' '.join(network_ids)}",
+            check=False,
+        )
+        legacy = legacy_bridge_inventory(nets)
+    if bridge is None and not legacy:
+        # rules from a rental that has since ended must not outlive it (Docker reuses its address)
+        result = await ssh.run(_helper(link_local_cleanup_script()), check=False)
+        return None, _error(result)
+    result = await ssh.run(_helper(link_local_drop_script(bridge, legacy)), check=False)
+    return {"bridge": bridge, "legacy_bridges": legacy}, _error(result)
 
 
 def _error(result) -> str | None:
