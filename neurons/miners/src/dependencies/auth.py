@@ -98,7 +98,8 @@ async def verify_validator_auth_from_headers(
     # Normalize timestamp to seconds
     # If timestamp is larger than 1e12, treat it as milliseconds and convert
     if x_timestamp > 1e12:
-        timestamp_seconds = x_timestamp / 1000
+        # integer division: a float conversion of a huge header value raises OverflowError (HTTP 500)
+        timestamp_seconds = x_timestamp // 1000
     else:
         timestamp_seconds = x_timestamp
     

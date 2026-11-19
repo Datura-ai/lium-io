@@ -15,9 +15,10 @@ What lives here:
   `AcceptSSHKeyRequest`, `SSHKeyRemoved` and `PodLogsResponse`. The handlers return
   `FailedRequest` for operation errors they catch. A missing required auth header, or an
   `X-Timestamp` that is not an integer, is refused by FastAPI's header validation with HTTP 422
-  and a validation-error list in `detail`. Every other header problem, including an out-of-range
-  timestamp, a malformed signature or an unregistered validator hotkey, gets HTTP 400/401/403
-  with a string `detail`.
+  and a validation-error list in `detail`. The other refusals carry a string `detail`: HTTP 400 for
+  a timestamp before 2000-01-01 after normalization (values above 1e12 are read as milliseconds),
+  HTTP 401 for a timestamp outside the allowed window after normalization or an invalid or malformed signature, and
+  HTTP 403 for an unregistered validator hotkey or an `X-Miner-Hotkey` naming another miner.
 - `datura/errors/protocol.py` — the protocol-level exceptions.
 
 Adding a message type means adding a model in the right `*_requests.py` and a

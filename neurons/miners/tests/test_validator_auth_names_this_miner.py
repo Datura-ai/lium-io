@@ -120,6 +120,18 @@ async def test_rest_headers_outside_the_time_window_are_refused_401(
     assert refused.value.status_code == 401
 
 
+async def test_rest_headers_with_a_huge_timestamp_are_refused_401_not_500(rest, validator_keypair, miner_keypair):
+    """A 401-digit integer X-Timestamp is a far-future timestamp, not an OverflowError."""
+    validator_service, _ = rest()
+    headers = _headers(validator_keypair, miner_keypair.ss58_address)
+    headers["x_timestamp"] = 10**400
+
+    with pytest.raises(HTTPException) as refused:
+        await auth_module.verify_validator_auth_from_headers(**headers, validator_service=validator_service)
+
+    assert refused.value.status_code == 401
+
+
 def _dependency_names(dependant) -> set[str]:
     names = {dependant.call.__name__} if dependant.call is not None else set()
     for sub in dependant.dependencies:
