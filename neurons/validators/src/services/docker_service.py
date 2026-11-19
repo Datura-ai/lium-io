@@ -3226,6 +3226,18 @@ def _orphaned_task_id(error_text: str) -> str | None:
     return match.group(1) if match else None
 
 
+# DAH-6780: at boot dockerd's restart of a pod can run before the driver made one of its pinned GPU nodes; the
+# container then stays exited with this error, though the node exists moments later
+_MISSING_CUSTOM_DEVICE_ERROR_RE = re.compile(
+    r'error gathering device information while adding custom device "(/dev/[\w./-]+)": no such file or directory'
+)
+
+
+def _missing_custom_device(error_text: str) -> str | None:
+    match = _MISSING_CUSTOM_DEVICE_ERROR_RE.search(error_text)
+    return match.group(1) if match and ".." not in match.group(1) else None
+
+
 def _is_stale_container_cgroup_error(error_text: str) -> bool:
     # `docker start` after a host dockerd restart: runc cannot join the old run's leftover cgroup
     return "cgroup.procs" in error_text and "device or resource busy" in error_text
@@ -13570,10 +13582,15 @@ class DockerService:
         # that shim is cleared below, then the stale-mountpoint repair runs as usual.
         # DAH-5834: a start that failed on the old run's leftover cgroup records that error itself,
         # so it opens recovery too; the start below clears the cgroup and tries once more.
+        # DAH-6780: a boot-time start that found a pinned GPU node missing opens recovery once that node exists.
         orphaned_task_id = _orphaned_task_id(container_error or "")
         stale_cgroup = _is_stale_container_cgroup_error(container_error or "")
+        missing_device = _missing_custom_device(container_error or "")
         if not container_error or not (
-            orphaned_task_id or stale_cgroup or _is_stale_vloopback_mountpoint_error(container_error)
+            orphaned_task_id
+            or stale_cgroup
+            or missing_device
+            or _is_stale_vloopback_mountpoint_error(container_error)
         ):
             return False
         # one recovery per pod at a time: a second check cycle acting on the same stale verdict
@@ -13591,6 +13608,7 @@ class DockerService:
                 pod_id=pod_id,
                 orphaned_task_id=orphaned_task_id,
                 stale_cgroup=stale_cgroup,
+                missing_device=missing_device,
                 local_volume_path=local_volume_path,
                 default_extra=default_extra,
             )
@@ -13610,9 +13628,23 @@ class DockerService:
         local_volume_path: str | None,
         default_extra: dict[str, Any],
         stale_cgroup: bool = False,
+        missing_device: str | None = None,
     ) -> bool:
         log_extra = {**default_extra, "container_name": container_name}
         try:
+            # started only once the cause is gone: the device node the boot-time start missed exists now
+            if missing_device:
+                present = await ssh_client.run(
+                    f"test -e {shlex.quote(missing_device)}", timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC
+                )
+                if getattr(present, "exit_status", 1) != 0:
+                    logger.warning(
+                        _m(
+                            "POD_STALE_MOUNT_RECOVERY_DEVICE_STILL_MISSING",
+                            extra=get_extra_info({**log_extra, "device": missing_device}),
+                        )
+                    )
+                    return False
             encryption_state = await self._local_volume_encryption_state(
                 ssh_client, container_name
             )
@@ -13651,7 +13683,7 @@ class DockerService:
             )
             return False
         # an orphaned-shim or leftover-cgroup pod may have no stale mountpoint at all; its start is the test
-        if not repaired_volume and not orphaned_task_id and not stale_cgroup:
+        if not repaired_volume and not orphaned_task_id and not stale_cgroup and not missing_device:
             logger.warning(
                 _m(
                     "POD_STALE_MOUNT_RECOVERY_REPAIR_FAILED",
