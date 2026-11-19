@@ -10555,31 +10555,61 @@ class DockerService:
                         )
                     )
 
+            host_limits_read: asyncio.Task[tuple[int | None, int | None, int | None]] | None = None
+
+            async def read_host_limits(
+                connected_ssh_client: asyncssh.SSHClientConnection,
+            ) -> tuple[int | None, int | None, int | None]:
+                # one after another on the session; the GPU count only sizes a split rental's share of the RAM read
+                pid_max = await self._read_host_pid_max(connected_ssh_client)
+                ram_kib = await self._read_host_ram_kib(connected_ssh_client)
+                gpu_count = None
+                if ram_kib is not None and payload.gpu_uuids:
+                    gpu_count = await self._read_host_gpu_count(connected_ssh_client)
+                return pid_max, ram_kib, gpu_count
+
+            async def after_host_limits_read(
+                probe: Callable[[], Awaitable[AnswerWithOwnDuration]],
+            ) -> AnswerWithOwnDuration:
+                assert host_limits_read is not None
+                await asyncio.wait([host_limits_read])
+                return await probe()
+
             def start_early_probes(connected_ssh_client: asyncssh.SSHClientConnection) -> None:
-                nonlocal early_host_probe, early_volume_probe
+                nonlocal early_host_probe, early_volume_probe, host_limits_read
+                # The fail-closed host reads run first and the early probes only once they end: on an sshd with
+                # MaxSessions=1 a probe holding the session refused the read's channel, and the create failed as the
+                # node's own miss (review on lium-platform#3256). Started here, the reads still overlap the Docker
+                # connect, and the probes start a few short reads later.
+                host_limits_read = asyncio.create_task(read_host_limits(connected_ssh_client))
+                connections.callback(host_limits_read.cancel)
                 if not early_probes_allowed:
                     return
                 early_host_probe = asyncio.create_task(
-                    _with_own_duration(
-                        self.probe_prerun_host(
-                            connected_ssh_client,
-                            docker_image=payload.docker_image,
-                            with_power=probe_with_power,
-                            miner_hotkey=payload.miner_hotkey,
-                            log_extra=default_extra,
-                            with_label=probe_with_label,
-                        ),
-                        ProfilerStepName.PRERUN_HOST_PROBE_PARALLEL,
+                    after_host_limits_read(
+                        lambda: _with_own_duration(
+                            self.probe_prerun_host(
+                                connected_ssh_client,
+                                docker_image=payload.docker_image,
+                                with_power=probe_with_power,
+                                miner_hotkey=payload.miner_hotkey,
+                                log_extra=default_extra,
+                                with_label=probe_with_label,
+                            ),
+                            ProfilerStepName.PRERUN_HOST_PROBE_PARALLEL,
+                        )
                     )
                 )
                 connections.callback(early_host_probe.cancel)
                 if wants_volume_probe:
                     early_volume_probe = asyncio.create_task(
-                        _with_own_duration(
-                            self.probe_volume_host(
-                                connected_ssh_client, with_df=measures_host, log_extra=default_extra
-                            ),
-                            ProfilerStepName.VOLUME_HOST_PROBE_PARALLEL,
+                        after_host_limits_read(
+                            lambda: _with_own_duration(
+                                self.probe_volume_host(
+                                    connected_ssh_client, with_df=measures_host, log_extra=default_extra
+                                ),
+                                ProfilerStepName.VOLUME_HOST_PROBE_PARALLEL,
+                            )
                         )
                     )
                     connections.callback(early_volume_probe.cancel)
@@ -10653,7 +10683,8 @@ class DockerService:
                 # even the floored cgroup cap would not reserve RENTAL_PIDS_LIMIT_HOST_MARGIN for the
                 # host's own tasks. No fixed fallback is safe on a host whose real pid_max is lower, so
                 # a tenant fork bomb would starve sshd/dockerd and take the executor offline mid-rental.
-                host_pid_max = await self._read_host_pid_max(ssh_client)
+                assert host_limits_read is not None  # started as soon as the SSH session was up
+                host_pid_max, host_ram_kib, read_host_gpu_count = await host_limits_read
                 if settings.RENTAL_PIDS_LIMIT_PER_CPU > 0:
                     current_step = "host_pid_max"
                     if host_pid_max is None:
@@ -10674,7 +10705,6 @@ class DockerService:
                 # contention, the exact condition that delays this SSH probe, an unlimited rental lets
                 # the renter exhaust host RAM and OOM the executor/sshd.
                 current_step = "host_ram_kib"
-                host_ram_kib = await self._read_host_ram_kib(ssh_client)
                 rental_gpu_share = 1.0
                 if not payload.memory_gb and host_ram_kib is None:
                     raise RuntimeError(
@@ -10687,7 +10717,7 @@ class DockerService:
                 # host-wide clamp.
                 if host_ram_kib is not None and payload.gpu_uuids:
                     current_step = "host_gpu_count"
-                    host_gpu_count = await self._read_host_gpu_count(ssh_client)
+                    host_gpu_count = read_host_gpu_count
                     if host_gpu_count and len(payload.gpu_uuids) <= host_gpu_count:
                         rental_gpu_share = len(payload.gpu_uuids) / host_gpu_count
                     elif not payload.memory_gb:

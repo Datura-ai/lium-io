@@ -1063,3 +1063,49 @@ def test_probe_shared_section_lists_nvswitch_nodes_only_with_a_switch(tmp_path, 
 
     shared_nodes = [line.split("\t", 1)[1].removeprefix(str(tmp_path)) for line in stdout.splitlines() if line.startswith("SHARED\t")]
     assert shared_nodes == ["/dev/nvidiactl", *expected_nvswitch_nodes]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gpu_uuids", [None, ["GPU-1"]])
+async def test_a_one_session_host_answers_the_host_reads_beside_the_early_probes(svc_fixture, monkeypatch, gpu_uuids):
+    """Review on lium-platform#3256: on an sshd with MaxSessions=1 the early probe held the only session, the
+    kernel.pid_max read was refused its channel, and the create failed at `host_pid_max` as the node's own miss."""
+    svc = svc_fixture
+    _wire_early_probes(svc, monkeypatch, image_present=True)
+    sessions: list[str] = []
+
+    def one_session(name: str):
+        if sessions:
+            raise asyncssh.ChannelOpenError(asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED, f"{name} beside {sessions[0]}")
+        sessions.append(name)
+
+    async def probe_holding_the_session(*args, **kwargs):
+        one_session("probe")
+        await asyncio.sleep(0.05)
+        sessions.pop()
+        return _probe()
+
+    def reader(value: int):
+        async def read(*args, **kwargs):
+            try:
+                one_session("read")
+            except asyncssh.ChannelOpenError:
+                return None  # what the real reader makes of a refused channel: a miss
+            await asyncio.sleep(0.01)
+            sessions.pop()
+            return value
+
+        return read
+
+    svc.probe_prerun_host = AsyncMock(side_effect=probe_holding_the_session)
+    svc.probe_volume_host = AsyncMock(return_value=None)
+    monkeypatch.setattr(svc, "_read_host_pid_max", AsyncMock(side_effect=reader(4194304)))
+    monkeypatch.setattr(svc, "_read_host_ram_kib", AsyncMock(side_effect=reader(64 * 1024 * 1024)))
+    monkeypatch.setattr(svc, "_read_host_gpu_count", AsyncMock(side_effect=reader(8)))
+    payload = _deploy_payload()
+    payload.gpu_uuids = gpu_uuids
+
+    result = await _run_create_container(svc, payload)
+
+    assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
+    assert svc._read_host_gpu_count.await_count == (1 if gpu_uuids else 0)
