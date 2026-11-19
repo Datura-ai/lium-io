@@ -62,7 +62,7 @@ from services.task_service import JobResult, TaskService
 from services.verifyx_validation_service import NETWORK_GATE_TALLY, VerifyXValidationService
 
 from core.config import settings
-from core.express_lane import CycleInputs, ExpressLane
+from core.express_lane import CycleInputs, ExpressLane, _cycle_batch_id_or_clock
 from core.utils import _m, get_extra_info, get_logger
 from services.ssh_service import SSHService
 
@@ -429,7 +429,9 @@ class Validator:
                 or current_block - self.last_job_run_blocks >= settings.BLOCKS_FOR_JOB
             ):
                 job_block = (current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB
-                job_batch_id = await self.subtensor_client.get_time_from_block(job_block)
+                # a failed block-time read gives "Unknown": the cycle then goes by the clock at its start, so every report
+                # it sends carries a time the backend can order against a node's registration (DAH-6539)
+                job_batch_id = _cycle_batch_id_or_clock(await self.subtensor_client.get_time_from_block(job_block))
 
                 # DAH-2380: fetch default cache-template digests from Docker Hub at the
                 # start of each job cycle, so verification compares executors against the

@@ -24,6 +24,7 @@ from clients.validator_portal_api import PortalExecutor, portal_miner_auth_blob
 from core.express_lane import (
     EXPRESS_FAILED_EVENT,
     EXPRESS_PUBLISHED_EVENT,
+    JOB_BATCH_ID_FORMAT,
     MAX_ATTEMPTS,
     SESSION_LOST_MAX_RUNS,
     CycleInputs,
@@ -561,6 +562,34 @@ async def test_every_miner_is_asked_under_the_cycles_block_time_id(
     validator.miner_service.start_awaiting_wave_lists.assert_called_once_with(
         CYCLE_BATCH_ID, ["miner-a", "miner-b"]
     )
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_that_cannot_read_its_block_time_asks_under_the_clock_not_unknown(
+    validator_with_mocks, create_neuron_info
+):
+    """lium-platform#3253 review 4632765324: a failed block-time read used to send job_batch_id "Unknown", which
+    the backend cannot order against a node's registration, so the cycle's findings were dropped. The cycle now
+    goes by the clock at its start, which precedes every check it runs."""
+    validator = validator_with_mocks
+    validator.subtensor_client.get_miners = AsyncMock(return_value=[create_neuron_info(1, "miner-a")])
+    validator.subtensor_client.get_time_from_block = AsyncMock(return_value="Unknown")
+
+    async def no_results(payload, **_):
+        return {"miner_hotkey": payload.miner_hotkey, "miner_coldkey": "c", "results": []}
+
+    validator.miner_service.request_job_to_miner = AsyncMock(side_effect=no_results)
+    before = datetime.now(UTC).replace(microsecond=0)
+    with (
+        patch("core.validator.fetch_default_image_digests", new=AsyncMock(return_value={})),
+        patch("core.validator.fetch_executor_image_digest", new=AsyncMock(return_value=None)),
+    ):
+        await validator.sync()
+
+    [asked] = {c.kwargs["payload"].job_batch_id for c in validator.miner_service.request_job_to_miner.await_args_list}
+    started = datetime.strptime(asked, JOB_BATCH_ID_FORMAT).replace(tzinfo=UTC)
+    assert before <= started <= datetime.now(UTC)
+    assert validator.cycle_inputs.job_batch_id == asked
 
 
 @pytest.mark.asyncio
