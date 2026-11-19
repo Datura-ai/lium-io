@@ -62,7 +62,7 @@ from services.task_service import JobResult, TaskService
 from services.verifyx_validation_service import NETWORK_GATE_TALLY, VerifyXValidationService
 
 from core.config import settings
-from core.express_lane import CycleInputs, ExpressLane, estimated_block_time
+from core.express_lane import CycleInputs, ExpressLane
 from core.utils import _m, get_extra_info, get_logger
 from services.ssh_service import SSHService
 
@@ -429,11 +429,20 @@ class Validator:
                 or current_block - self.last_job_run_blocks >= settings.BLOCKS_FOR_JOB
             ):
                 job_block = (current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB
-                # The cycle id is a function of the job block alone (DAH-6539): every attempt at one block reports under
-                # one id whether or not the chain answers (a timed-out run, a restart), so a block is never settled
-                # twice, and the backend can always order the report against a node's registration. The backend reads
-                # the cycle's start from this id everywhere (ledger rows, settlement, pod and rental timing).
-                job_batch_id = estimated_block_time(job_block)
+                # The cycle id is the job block's own chain time (DAH-6539). The backend reads the cycle's start from it
+                # everywhere (ledger rows, settlement, penalty hours, pod and rental timing), so it must be the real time,
+                # and a block's chain time never changes, so every attempt at one block reports under one id. With no
+                # answer from the chain the attempt does not run: the block is retried on the next tick, never reported
+                # under a stand-in id.
+                job_batch_id = await self.subtensor_client.get_time_from_block(job_block)
+                if job_batch_id is None:
+                    logger.error(
+                        _m(
+                            "[sync] the chain gave no time for the job block, skipping this iteration",
+                            extra=get_extra_info({**self.default_extra, "job_block": job_block}),
+                        ),
+                    )
+                    return
 
                 # DAH-2380: fetch default cache-template digests from Docker Hub at the
                 # start of each job cycle, so verification compares executors against the
@@ -1002,8 +1011,8 @@ class Validator:
                 )
             )
             return
-        # the id's own time: the backend keys the cycle's ledger rows, settlement and attribution on it, so any other
-        # start (the chain's reading of the block) would match none of them
+        # the id's own time (the job block's chain time): the backend keys the cycle's ledger rows, settlement and
+        # attribution on it, and compares it with penalty hours
         try:
             cycle_started_at = datetime.strptime(job_batch_id, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
         except ValueError:

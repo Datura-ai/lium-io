@@ -2341,7 +2341,7 @@ class MinerService:
                 # DAH-3019: one start report for the whole miner, as its executors are launched.
                 self.task_service.report_verification_started(payload, executors)
                 async def run(executor_info, timeout: float = settings.JOB_TIME_OUT - 120):
-                    # the run's own start goes with its result: the cycle id is the job block's estimated time, and
+                    # the run's own start goes with its result: the cycle id is the job block's time, before the run, and
                     # the backend ties a finding to a node registered before the later of the two (observed_from)
                     check_started_at = datetime.now(UTC)
                     result = await asyncio.wait_for(

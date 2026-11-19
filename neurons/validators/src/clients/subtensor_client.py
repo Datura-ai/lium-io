@@ -4,7 +4,7 @@ import json
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Self, TypeVar
 
 import aiohttp
@@ -1055,7 +1055,9 @@ class SubtensorClient:
             )
             return False
 
-    async def get_time_from_block(self, block: int):
+    async def get_time_from_block(self, block: int) -> str | None:
+        """The block's own chain time as a cycle id (UTC, the format the backend parses); None when the chain did not
+        answer."""
         max_retries = 3
         retries = 0
         while retries < max_retries:
@@ -1063,7 +1065,7 @@ class SubtensorClient:
                 node = self.get_node()
                 block_hash = node.get_block_hash(block)
                 return datetime.fromtimestamp(
-                    node.query("Timestamp", "Now", block_hash=block_hash).value / 1000
+                    node.query("Timestamp", "Now", block_hash=block_hash).value / 1000, tz=UTC
                 ).strftime("%Y-%m-%d %H:%M:%S")
             except Exception as e:
                 logger.error(
@@ -1079,7 +1081,7 @@ class SubtensorClient:
                     ),
                 )
                 retries += 1
-        return "Unknown"
+        return None
 
     async def _warm_up_subtensor(self):
         count = 0

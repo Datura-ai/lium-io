@@ -24,7 +24,6 @@ from clients.validator_portal_api import PortalExecutor, portal_miner_auth_blob
 from core.express_lane import (
     EXPRESS_FAILED_EVENT,
     EXPRESS_PUBLISHED_EVENT,
-    estimated_block_time,
     MAX_ATTEMPTS,
     SESSION_LOST_MAX_RUNS,
     CycleInputs,
@@ -550,8 +549,8 @@ async def test_a_miners_executor_list_is_its_executors_route(wallet):
 async def test_every_miner_is_asked_under_the_cycles_block_time_id(
     validator_with_mocks, create_neuron_info
 ):
-    """Every miner is asked under the id the cycle derives from the job block. The last line
-    guards the wiring the lane reads: the inputs carry that same id."""
+    """Every miner is asked under the job block's chain time. The last line guards the wiring the lane reads: the
+    inputs carry that same id."""
     validator = validator_with_mocks
     validator.subtensor_client.get_miners = AsyncMock(
         return_value=[create_neuron_info(1, "miner-a"), create_neuron_info(2, "miner-b")]
@@ -572,8 +571,8 @@ async def test_every_miner_is_asked_under_the_cycles_block_time_id(
         c.kwargs["payload"].miner_hotkey: c.kwargs["payload"].job_batch_id
         for c in validator.miner_service.request_job_to_miner.await_args_list
     }
-    job_block = _job_block(validator)
-    cycle_id = estimated_block_time(job_block)
+    cycle_id = CYCLE_BATCH_ID
+    validator.subtensor_client.get_time_from_block.assert_awaited_once_with(_job_block(validator))
     assert asked == {"miner-a": cycle_id, "miner-b": cycle_id}
     assert validator.cycle_inputs.job_batch_id == cycle_id
     validator.miner_service.start_awaiting_wave_lists.assert_called_once_with(cycle_id, ["miner-a", "miner-b"])
@@ -587,40 +586,33 @@ def _job_block(validator) -> int:
 
 
 @pytest.mark.asyncio
-async def test_a_cycle_that_cannot_read_its_block_time_asks_under_its_blocks_estimated_time(
+async def test_a_cycle_the_chain_gives_no_block_time_does_not_run_and_the_block_is_retried(
     validator_with_mocks, create_neuron_info
 ):
-    """lium-platform#3253 review 4632765324: a failed block-time read used to send job_batch_id "Unknown", which the
-    backend cannot order against a node's registration, so the cycle's findings were dropped. The cycle now goes by its
-    job block's estimated time: the same for every attempt at that block, and no later than the block's real time."""
+    """lium-platform#3253 review 4632765324 and the review on 769d980: the backend reads the cycle's start from its id
+    (ledger rows, settlement, penalty hours), so no stand-in id ("Unknown", the clock, an estimate) may reach it. An
+    attempt the chain gives no block time for asks no miner and leaves the block to the next tick."""
     validator = validator_with_mocks
     validator.subtensor_client.get_miners = AsyncMock(return_value=[create_neuron_info(1, "miner-a")])
-    validator.subtensor_client.get_time_from_block = AsyncMock(return_value="Unknown")
-
-    async def no_results(payload, **_):
-        return {"miner_hotkey": payload.miner_hotkey, "miner_coldkey": "c", "results": []}
-
-    validator.miner_service.request_job_to_miner = AsyncMock(side_effect=no_results)
+    validator.subtensor_client.get_time_from_block = AsyncMock(return_value=None)
+    validator.miner_service.request_job_to_miner = AsyncMock()
+    before = validator.last_job_run_blocks
     with (
         patch("core.validator.fetch_default_image_digests", new=AsyncMock(return_value={})),
         patch("core.validator.fetch_executor_image_digest", new=AsyncMock(return_value=None)),
     ):
         await validator.sync()
 
-    [asked] = {c.kwargs["payload"].job_batch_id for c in validator.miner_service.request_job_to_miner.await_args_list}
-    job_block = _job_block(validator)
-    assert asked == estimated_block_time(job_block)
-    assert validator.cycle_inputs.job_batch_id == asked
-    validator.subtensor_client.get_time_from_block.assert_not_awaited()  # the cycle no longer needs the chain's time
+    validator.miner_service.request_job_to_miner.assert_not_awaited()
+    assert validator.cycle_inputs is None
+    assert validator.last_job_run_blocks == before
 
 
 @pytest.mark.asyncio
-async def test_a_rerun_of_one_job_block_asks_under_one_id_whether_or_not_the_chain_answered(
-    validator_with_mocks, create_neuron_info
-):
-    """Review on df0df43: an attempt whose block-time read failed ("Unknown", or a run that timed out after committing)
-    and a rerun of the same block whose read succeeded reported two cycle ids, and settlement counted the block twice.
-    Every attempt now takes its id from the job block alone."""
+async def test_every_attempt_at_one_job_block_asks_under_its_chain_time_only(validator_with_mocks, create_neuron_info):
+    """Review on df0df43: an attempt with no block time and a rerun of the same block reported two cycle ids, and
+    settlement counted the block twice. An attempt with no answer now runs nothing, and a block's chain time never
+    changes, so every attempt that runs asks under the one id."""
     validator = validator_with_mocks
     validator.subtensor_client.get_miners = AsyncMock(return_value=[create_neuron_info(1, "miner-a")])
 
@@ -628,8 +620,7 @@ async def test_a_rerun_of_one_job_block_asks_under_one_id_whether_or_not_the_cha
         return {"miner_hotkey": payload.miner_hotkey, "miner_coldkey": "c", "results": []}
 
     validator.miner_service.request_job_to_miner = AsyncMock(side_effect=no_results)
-    ids = []
-    for chain_answer in ("Unknown", "2026-11-19 19:00:00"):
+    for chain_answer in (None, "2026-11-19 18:52:38", "2026-11-19 18:52:38"):
         validator.subtensor_client.get_time_from_block = AsyncMock(return_value=chain_answer)
         validator.last_job_run_blocks = 0
         with (
@@ -637,20 +628,9 @@ async def test_a_rerun_of_one_job_block_asks_under_one_id_whether_or_not_the_cha
             patch("core.validator.fetch_executor_image_digest", new=AsyncMock(return_value=None)),
         ):
             await validator.sync()
-        ids.append(validator.cycle_inputs.job_batch_id)
 
-    assert ids[0] == ids[1]
-
-
-def test_a_blocks_estimated_time_depends_on_the_block_alone_and_never_runs_ahead_of_the_chain():
-    """Reviews on f205fc4 and 75a9fe1: an id taken from the clock (or from a record that can be lost) gave a rerun of one
-    job block a second cycle id, and settlement counted the block twice. The estimate is a function of the block, so a
-    restart, a wiped store or an upgrade all give the same id. Real chain times from validator_cycle bound it."""
-    assert estimated_block_time(9542475) == estimated_block_time(9542475) == "2026-11-19 18:37:36"
-    assert estimated_block_time(9542550) == "2026-11-19 18:52:36"  # the next job block, 75 blocks on
-    # 305,100 blocks before the anchor the estimate is 20 min ahead of that block's real chain time (09:17:36): blocks
-    # averaged a little over 12 s, so for blocks after the anchor (every job block from now on) it falls behind instead
-    assert estimated_block_time(9237375) == "2026-10-08 09:37:36"
+    asked = {c.kwargs["payload"].job_batch_id for c in validator.miner_service.request_job_to_miner.await_args_list}
+    assert asked == {"2026-11-19 18:52:38"}
 
 
 @pytest.mark.asyncio
