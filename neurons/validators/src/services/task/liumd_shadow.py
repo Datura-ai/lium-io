@@ -572,7 +572,6 @@ LIVE_GPU_DETAIL_FIELDS = frozenset(
         "clocks_event_reasons",
     }
 )
-LIVE_DOCKER_CONTAINER_FIELDS = frozenset({"cpu_percent", "net_rx_bytes", "net_tx_bytes"})
 
 
 def _is_not_comparable(path: str) -> bool:
@@ -587,9 +586,7 @@ def _is_not_comparable(path: str) -> bool:
     parent, _, leaf = path.rpartition(".")
     if not parent.endswith("]"):
         return False
-    if leaf in LIVE_GPU_DETAIL_FIELDS and parent.startswith("gpu.details["):
-        return True
-    return leaf in LIVE_DOCKER_CONTAINER_FIELDS and parent.startswith("docker.containers[")
+    return leaf in LIVE_GPU_DETAIL_FIELDS and parent.startswith("gpu.details[")
 
 
 def _spec_diffs(python: Any, liumd: Any, path: str = "") -> list[dict[str, Any]]:
