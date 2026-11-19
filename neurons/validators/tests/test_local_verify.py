@@ -24,6 +24,7 @@ import bittensor
 import pytest
 import services.matrix_validation_service as mvs
 import services.verifyx_validation_service as vvs
+from services import executor_payload
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from datura.requests.miner_requests import ExecutorSSHInfo
@@ -1095,6 +1096,43 @@ async def test_the_first_pass_matmul_runs_the_validators_script(
     assert capability.event.what_we_saw["transport"] == "ssh"
     ssh_matmul.assert_awaited_once()
     assert verifyx.event.what_we_saw["transport"] == "ssh"
+
+
+class _RecordingSSH(FakeSSH):
+    """FakeSSH that also answers `run`: records each command and answers with no output."""
+
+    def __init__(self):
+        super().__init__()
+        self.commands: list[str] = []
+
+    async def run(self, cmd, **_kwargs):
+        self.commands.append(cmd)
+        return SimpleNamespace(stdout="", stderr="", exit_status=1)
+
+
+@pytest.mark.asyncio
+async def test_the_first_pass_matmul_command_is_the_validators_own(
+    keypair, monkeypatch, short_local_verify_timeouts, verifyx_service
+):
+    """The real SSH launcher, not a mock: the command it sends names the validator's interpreter and script and none of
+    the paths the executor reported."""
+    monkeypatch.setattr(local_verify, "_matmul_ssh_reason", REAL_MATMUL_SSH_REASON)
+    verifyx_service.validate_verifyx_and_process_job = AsyncMock(
+        return_value=vvs.VerifyXResponse(data={"success": True, "network": {}})
+    )
+    ssh = _RecordingSSH()
+    async with FakeExecutor(keypair) as executor:
+        reported = executor.executor_info.model_copy(
+            update={"python_path": "/opt/reported/bin/python", "root_dir": "/opt/reported"}
+        )
+        ctx = context(keypair, reported, validation=matmul_service(monkeypatch), verifyx=verifyx_service, ssh=ssh)
+        await run_local_then_consumers(ctx, LocalVerifyCheck(client_factory=client_factory(keypair)))
+    matmul = [cmd for cmd in ssh.commands if "decrypt_challenge.py" in cmd]
+    assert len(matmul) == 1
+    assert reported.python_path not in matmul[0]
+    assert reported.root_dir not in matmul[0]
+    assert executor_payload.EXECUTOR_PYTHON in matmul[0]
+    assert '"$d"/decrypt_challenge.py' in matmul[0]
 
 
 @pytest.mark.asyncio
