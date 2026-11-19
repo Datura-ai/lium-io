@@ -97,7 +97,7 @@ def test_the_snapshot_reads_the_recovery_action_through_field_value_230(monkeypa
     from types import ModuleType, SimpleNamespace
 
     namespace = _probe_namespace(
-        "nvml_snapshot", "nvml_recovery_action", "NVML_FI_DEV_GET_GPU_RECOVERY_ACTION"
+        "nvml_snapshot", "nvml_recovery_action", "nvml_reading_unsupported", "NVML_FI_DEV_GET_GPU_RECOVERY_ACTION"
     )
     asked = []
 
@@ -107,11 +107,14 @@ def test_the_snapshot_reads_the_recovery_action_through_field_value_230(monkeypa
         return [SimpleNamespace(nvmlReturn=code, value=SimpleNamespace(uiVal=4))]
 
     class NVMLError(Exception):
-        pass
+        def __init__(self, value):
+            self.value = value
 
     fake = ModuleType("pynvml")
     fake.__dict__.update(
         NVML_SUCCESS=0,
+        NVML_ERROR_NOT_SUPPORTED=3,
+        NVML_ERROR_FUNCTION_NOT_FOUND=13,
         NVMLError=NVMLError,
         NVML_MEMORY_ERROR_TYPE_UNCORRECTED=1,
         NVML_VOLATILE_ECC=0,
@@ -130,6 +133,8 @@ def test_the_snapshot_reads_the_recovery_action_through_field_value_230(monkeypa
     gpus = namespace["nvml_snapshot"]()["gpus"]
 
     assert [gpu["recovery_action"] for gpu in gpus] == [4, None]
+    # a card without the field can never give it: unsupported, not an unread reading
+    assert [gpu.get("unsupported") for gpu in gpus] == [None, ["recovery_action"]]
     assert asked == [[230], [230]]
 
 

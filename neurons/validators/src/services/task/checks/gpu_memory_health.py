@@ -111,6 +111,17 @@ def _reset_marks(gpu: dict[str, Any], kept: list[str], conclusive: bool) -> list
     ]
 
 
+# the readings NVML's flags and warnings on a card come from (miner_jobs/gpu_fault_probe.py nvml_health)
+HEALTH_READINGS = ("ecc_uncorrected", "remapped_rows", "recovery_action")
+
+
+def _health_read(gpu: dict[str, Any]) -> bool:
+    """Every health reading of the card was read, or the card cannot give it (the probe's `unsupported`): a reading
+    that failed this time leaves the card's clean state unknown, so the read is inconclusive for it."""
+    unsupported = gpu.get("unsupported") if isinstance(gpu.get("unsupported"), list) else []
+    return all(gpu.get(c) is not None or c in unsupported for c in HEALTH_READINGS)
+
+
 # Xids that leave a reset-only counter set (48 DBE, 95 uncontained ECC) or the card unlisted (79, off the bus) until
 # the card is reset; any other hardware Xid can leave both counters at 0, so a zeroed read proves nothing for it
 RESET_PROVEN_XIDS = {48, 79, 95}
@@ -237,12 +248,17 @@ async def _judge_card_faults(
         # an old boot's time would skip this boot's early lines: start the new boot from its first line
         xid_after = 0.0 if rebooted else before.xid_after
     log_seen = bool(xid.get("available"))
-    # a reset card this read can judge: reset on this boot, listed and tied to its kernel-log lines, in a read that
-    # sees the log
+    # a reset card this read can judge: reset on this boot, listed with its health readings and tied to its
+    # kernel-log lines, in a read that sees the log
     resets_judged = {
         u: ts
         for u, (ts, boot) in (resets or {}).items()
-        if log_seen and boot_id is not None and boot == boot_id and u in gpus and isinstance(gpus[u].get("pci_bus_id"), str)
+        if log_seen
+        and boot_id is not None
+        and boot == boot_id
+        and u in gpus
+        and isinstance(gpus[u].get("pci_bus_id"), str)
+        and _health_read(gpus[u])
     }
     # clean: no NVML flag or warning and no new Xid at or after the reset naming the card
     named = {_card_uuid(s) for s in [*(report.get("flags") or []), *(report.get("warnings") or [])] if isinstance(s, str)}

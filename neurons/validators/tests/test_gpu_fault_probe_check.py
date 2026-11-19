@@ -899,3 +899,41 @@ def test_the_verdict_reaches_stdout_even_with_a_child_the_driver_still_holds(tmp
     assert run.returncode == 1
     assert run.stdout.strip() == 'GPU_FAULT_PROBE_JSON: {"status": "fault"}'
     assert __import__("time").perf_counter() - started < 15
+
+
+def test_a_reading_the_card_cannot_give_is_marked_unsupported_and_a_failed_read_is_not(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    class NVMLError(Exception):
+        def __init__(self, value):
+            self.value = value
+
+    def failing(value):
+        def read(*_):
+            raise NVMLError(value)
+
+        return read
+
+    fake = SimpleNamespace(
+        NVMLError=NVMLError,
+        NVML_ERROR_NOT_SUPPORTED=3,
+        NVML_ERROR_FUNCTION_NOT_FOUND=13,
+        NVML_MEMORY_ERROR_TYPE_UNCORRECTED=1,
+        NVML_VOLATILE_ECC=0,
+        nvmlInit=lambda: None,
+        nvmlShutdown=lambda: None,
+        nvmlDeviceGetCount=lambda: 1,
+        nvmlDeviceGetHandleByIndex=lambda i: i,
+        nvmlDeviceGetUUID=lambda h: "GPU-0",
+        nvmlDeviceGetPciInfo=lambda h: SimpleNamespace(busId="00000000:03:00.0"),
+        nvmlDeviceGetTotalEccErrors=failing(15),  # NVML_ERROR_GPU_IS_LOST: this read failed, the card has it
+        nvmlDeviceGetRemappedRows=failing(3),  # not supported on this card
+    )  # no nvmlDeviceGetFieldValues: a binding without the call
+    monkeypatch.setitem(sys.modules, "pynvml", fake)
+    ns = _probe_namespace("nvml_snapshot", "nvml_reading_unsupported", "nvml_recovery_action")
+
+    gpu = ns["nvml_snapshot"]()["gpus"][0]
+
+    assert gpu["ecc_uncorrected"] is None and gpu["remapped_rows"] is None and gpu["recovery_action"] is None
+    assert gpu["unsupported"] == ["remapped_rows", "recovery_action"]

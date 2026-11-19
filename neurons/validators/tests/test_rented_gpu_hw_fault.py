@@ -103,6 +103,8 @@ def test_nvml_only_reports_the_xid_read_and_the_card_lists():
 XID_FAULT = f"gpu 3 ({UUIDS[3]}): new NVRM Xid on a probed GPU: {HW}"
 # the kernel time of the validator reset in the tests below: XID_FAULT (200.5) is before it, these two after it
 RESET_TS = 300.0
+# every health reading of a card, read and clean
+READ_CLEAN = {"ecc_uncorrected": 0, "remapped_rows": [0, 0, 0, 0], "recovery_action": 0}
 POST_RESET_FAULT = f"gpu 3 ({UUIDS[3]}): new NVRM Xid on a probed GPU: [  300.000001] NVRM: Xid (PCI:0000:03:00): 119, pid=1, Timeout"
 # the newest kernel line when the stamp was read: logged before the reset
 AT_STAMP_FAULT = f"gpu 3 ({UUIDS[3]}): new NVRM Xid on a probed GPU: [  300.0] NVRM: Xid (PCI:0000:03:00): 119, pid=1, Timeout"
@@ -110,7 +112,7 @@ LATER_FAULT = f"gpu 3 ({UUIDS[3]}): new NVRM Xid on a probed GPU: [  400.25] NVR
 
 
 def _ok(gpu=None, **extra):
-    card = {"index": 3, "uuid": UUIDS[3], "pci_bus_id": "00000000:03:00.0", "ecc_uncorrected": 0}
+    card = {"index": 3, "uuid": UUIDS[3], "pci_bus_id": "00000000:03:00.0", **READ_CLEAN}
     nvml = {"available": True, "gpus": [{**card, **(gpu or {})}]}
     return _report("ok", flags=[], nvml=nvml, **extra)
 
@@ -319,7 +321,7 @@ async def test_a_reset_lifts_nothing_unless_the_next_read_of_the_card_is_clean(c
     await _reset(context_factory, services, UUIDS[3])
     extra = {**boot, **after_reset}
     status, gpu = extra.pop("status", "ok"), extra.pop("gpu", None)
-    card = {"index": 3, "uuid": UUIDS[3], "pci_bus_id": "00000000:03:00.0", "ecc_uncorrected": 0, **(gpu or {})}
+    card = {"index": 3, "uuid": UUIDS[3], "pci_bus_id": "00000000:03:00.0", **READ_CLEAN, **(gpu or {})}
     extra.setdefault("flags", [])
     after, _ = await _read(context_factory, services, _report(status, nvml={"available": True, "gpus": [card]}, **extra))
     quiet, _ = await _read(context_factory, services, _ok(**boot))
@@ -342,6 +344,9 @@ async def test_a_reset_lifts_nothing_unless_the_next_read_of_the_card_is_clean(c
         pytest.param({"xid": {"available": False, "error": "denied"}}, id="kernel-log-not-readable"),
         pytest.param({"gpu": {"pci_bus_id": None}}, id="card-not-tied-to-its-log-lines"),
         pytest.param({"status": "error", "nvml": {"available": False}}, id="nvml-not-readable"),
+        # the card gives this reading, but this read of it failed: its clean state is unknown
+        pytest.param({"gpu": {"recovery_action": None}}, id="a-health-reading-unavailable-this-read"),
+        pytest.param({"gpu": {"remapped_rows": None}}, id="remapped-rows-unavailable-this-read"),
     ],
 )
 async def test_an_inconclusive_read_after_a_reset_keeps_it_for_the_next_clean_read(context_factory, inconclusive):
@@ -351,7 +356,7 @@ async def test_an_inconclusive_read_after_a_reset_keeps_it_for_the_next_clean_re
     await _reset(context_factory, services, UUIDS[3])
     extra = {**boot, "flags": [], **inconclusive}
     status, gpu = extra.pop("status", "ok"), extra.pop("gpu", None)
-    card = {"index": 3, "uuid": UUIDS[3], "pci_bus_id": "00000000:03:00.0", "ecc_uncorrected": 0, **(gpu or {})}
+    card = {"index": 3, "uuid": UUIDS[3], "pci_bus_id": "00000000:03:00.0", **READ_CLEAN, **(gpu or {})}
     extra.setdefault("nvml", {"available": True, "gpus": [card]})
     blind, _ = await _read(context_factory, services, _report(status, **extra))
     # that read proved nothing either way, so it left the reset for the next read that can see the card
@@ -751,3 +756,15 @@ async def test_an_xid_incident_stays_open_until_the_host_boots_again(context_fac
     assert _states(services) == ["fault"]
     await _drop(context_factory, services, _ok(boot_id="boot-b"))
     assert _states(services) == ["fault", "recovered"]
+
+
+@pytest.mark.asyncio
+async def test_a_card_that_cannot_give_a_health_reading_is_still_lifted_by_a_reset_and_a_clean_read(context_factory):
+    services = _services()
+    boot = {"boot_id": "boot-a", "xid": {"available": True, "last_ts": 5}}
+    unsupported = {"remapped_rows": None, "recovery_action": None, "unsupported": ["remapped_rows", "recovery_action"]}
+    await _read(context_factory, services, _ok(gpu=unsupported, xid_faults=[XID_FAULT], **boot))
+    await _reset(context_factory, services, UUIDS[3])
+    lifted, _ = await _read(context_factory, services, _ok(gpu=unsupported, **boot))
+
+    assert lifted.report["card_faults"] == []

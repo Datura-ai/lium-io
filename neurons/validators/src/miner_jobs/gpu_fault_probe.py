@@ -771,6 +771,17 @@ def nvml_recovery_action(handle):
     return field.value.uiVal
 
 
+def nvml_reading_unsupported(pynvml, exc: Exception) -> bool:
+    """The card, driver or binding can never give this reading, unlike a read that failed this time: a missing
+    binding call, or NVML's not-supported / function-not-found."""
+    if isinstance(exc, AttributeError):
+        return True
+    return isinstance(exc, pynvml.NVMLError) and getattr(exc, "value", None) in (
+        pynvml.NVML_ERROR_NOT_SUPPORTED,
+        pynvml.NVML_ERROR_FUNCTION_NOT_FOUND,
+    )
+
+
 def nvml_snapshot() -> dict:
     """Per-GPU counters that move when hardware faults: uncorrected ECC, remapped rows, recovery action."""
     try:
@@ -801,8 +812,10 @@ def nvml_snapshot() -> dict:
                 try:
                     value = read(handle)
                     gpu[key] = value.decode() if isinstance(value, bytes) else value
-                except Exception:  # noqa: BLE001 - NotSupported on consumer cards, missing on old bindings
+                except Exception as exc:  # noqa: BLE001 - NotSupported on consumer cards, missing on old bindings
                     gpu[key] = None
+                    if nvml_reading_unsupported(pynvml, exc):
+                        gpu.setdefault("unsupported", []).append(key)
             gpus.append(gpu)
     finally:
         pynvml.nvmlShutdown()
