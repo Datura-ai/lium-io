@@ -190,8 +190,12 @@ jobs:
                   try:
                       with urllib.request.urlopen(req, timeout=30) as resp:
                           cache[(repo, path, at)] = resp.read().decode()
-                  except (urllib.error.URLError, UnicodeDecodeError):
-                      cache[(repo, path, at)] = None  # not found or not readable: the scan reports it, never skips it
+                  except urllib.error.HTTPError as e:
+                      if e.code != 404:  # only a missing file may fall back (action.yml -> action.yaml); anything else fails the check
+                          sys.exit(f"cannot read {repo}/{path}@{at}: HTTP {e.code}")
+                      cache[(repo, path, at)] = None  # not found: the scan reports it, never skips it
+                  except (urllib.error.URLError, UnicodeDecodeError) as e:
+                      sys.exit(f"cannot read {repo}/{path}@{at}: {e}")
               return cache[(repo, path, at)]
 
           # every tracked action manifest, wherever it lives, and every workflow
