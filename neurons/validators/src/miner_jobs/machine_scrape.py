@@ -720,6 +720,166 @@ def docker_api_get(path):
         conn.close()
 
 
+# DAH-6379 host memory facts: what the host uses outside the workload containers, swap, hugepages, the mappings
+# outside the containers (where NVIDIA driver memory shows) and the last OOM since boot. Every field the host does not
+# let us read is None with its reason in hm_errors; nothing here fails the scrape.
+HOST_MEMORY_ROOT = "/proc/1/root"  # the host's filesystem: the executor shares the host PID namespace
+WORKLOAD_CONTAINER_PREFIXES = ("pod_", "filler_")
+# one container's memory cgroup on the host: cgroup v2 under systemd or cgroupfs, then v1 (memory controller)
+CONTAINER_MEMORY_CGROUPS = (
+    ("/sys/fs/cgroup/system.slice/docker-{id}.scope", "memory.current"),
+    ("/sys/fs/cgroup/docker/{id}", "memory.current"),
+    ("/sys/fs/cgroup/memory/system.slice/docker-{id}.scope", "memory.usage_in_bytes"),
+    ("/sys/fs/cgroup/memory/docker/{id}", "memory.usage_in_bytes"),
+)
+KMSG_PATH = "/dev/kmsg"
+KMSG_MAX_RECORDS = 200000
+
+
+def parse_meminfo_kb(text):
+    # /proc/meminfo as {name: kB}; HugePages_* are page counts, not kB, and are returned as is
+    values = {}
+    for line in text.splitlines():
+        name, _, rest = line.partition(":")
+        parts = rest.split()
+        if parts and parts[0].isdigit():
+            values[name.strip()] = int(parts[0])
+    return values
+
+
+def parse_memory_stat_kb(text):
+    # a cgroup's memory.stat (bytes) as {name: kB}
+    values = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].isdigit():
+            values[parts[0]] = int(parts[1]) // 1024
+    return values
+
+
+def last_oom_from_kmsg(records, boot_epoch):
+    # ("global" | "memcg", epoch seconds) of the newest OOM kill in /dev/kmsg records ("pri,seq,usec,flags;msg"), or None
+    last = None
+    for record in records:
+        header, _, message = record.partition(";")
+        if "Memory cgroup out of memory" in message:
+            kind = "memcg"
+        elif "Out of memory" in message:
+            kind = "global"
+        else:
+            continue
+        fields = header.split(",")
+        if len(fields) >= 3 and fields[2].isdigit():
+            last = (kind, round(boot_epoch + int(fields[2]) / 1e6, 3))
+    return last
+
+
+def read_kmsg_records(path=KMSG_PATH):
+    # every record still in the kernel ring buffer, without blocking at its end
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    records = []
+    try:
+        while len(records) < KMSG_MAX_RECORDS:
+            try:
+                chunk = os.read(fd, 8192)
+            except BlockingIOError:
+                break
+            except OSError as exc:
+                if exc.errno == 32:  # EPIPE: the record was overwritten while reading; the next read goes on
+                    continue
+                raise
+            if not chunk:
+                break
+            records.append(chunk.decode("utf-8", "replace"))
+    finally:
+        os.close(fd)
+    return records
+
+
+def container_memory_kb(container_id, host_root=HOST_MEMORY_ROOT):
+    # (memory.current kB, memory.stat {name: kB}) of one container's cgroup on the host; raises when none is readable
+    for directory, usage_file in CONTAINER_MEMORY_CGROUPS:
+        base = host_root + directory.format(id=container_id)
+        if os.path.isdir(base):
+            with open(f"{base}/{usage_file}") as usage, open(f"{base}/memory.stat") as stat:
+                return int(usage.read().strip()) // 1024, parse_memory_stat_kb(stat.read())
+    raise FileNotFoundError(f"no memory cgroup for container {container_id[:12]}")
+
+
+def get_host_memory(containers, host_root=HOST_MEMORY_ROOT, meminfo_path="/proc/meminfo", vmstat_path="/proc/vmstat",
+                    stat_path="/proc/stat", read_kmsg=read_kmsg_records):
+    errors = {}
+    facts = {"hm_errors": errors}
+    with open(meminfo_path) as meminfo:
+        mem = parse_meminfo_kb(meminfo.read())
+
+    def kb(name):
+        return mem.get(name)
+
+    facts["hm_mem_total_kb"] = kb("MemTotal")
+    facts["hm_mem_available_kb"] = kb("MemAvailable")
+    facts["hm_swap_total_kb"] = kb("SwapTotal")
+    facts["hm_swap_used_kb"] = kb("SwapTotal") - kb("SwapFree") if "SwapFree" in mem and "SwapTotal" in mem else None
+    facts["hm_shmem_kb"] = kb("Shmem")
+    facts["hm_page_cache_kb"] = kb("Cached")
+    facts["hm_hugepages_total"] = kb("HugePages_Total")
+    facts["hm_hugepages_free"] = kb("HugePages_Free")
+    facts["hm_hugepage_size_kb"] = kb("Hugepagesize")
+    facts["hm_mapped_kb"] = kb("Mapped")
+    for name, key in (("SwapTotal", "hm_swap_total_kb"), ("HugePages_Total", "hm_hugepages_total"), ("Mapped", "hm_mapped_kb")):
+        if name not in mem:
+            errors[key] = f"{name} not in /proc/meminfo"
+
+    # the workload containers' cgroups: memory.current counts their anon, page cache and shmem
+    workloads = [c for c in containers if c.get("each_name", "").startswith(WORKLOAD_CONTAINER_PREFIXES)]
+    current = file_ = shmem = file_mapped = 0
+    unread = []
+    for container in workloads:
+        try:
+            usage, stat = container_memory_kb(container["each_container_id"], host_root)
+        except Exception as exc:
+            unread.append(f"{container['each_container_id'][:12]}: {exc!r}")
+            continue
+        current += usage
+        file_ += stat.get("file", stat.get("total_cache", 0))
+        shmem += stat.get("shmem", stat.get("total_shmem", 0))
+        file_mapped += stat.get("file_mapped", stat.get("total_mapped_file", 0))
+    facts["hm_workload_containers"] = len(workloads)
+    outside_keys = ("hm_outside_workloads_kb", "hm_outside_workloads_no_cache_kb", "hm_mapped_outside_workloads_kb")
+    if unread or not all(n in mem for n in ("MemTotal", "MemFree", "Buffers", "Cached", "Shmem", "Mapped")):
+        for key in outside_keys:
+            facts[key] = None
+            errors[key] = "; ".join(unread) or "a /proc/meminfo field is missing"
+    else:
+        used = mem["MemTotal"] - mem["MemFree"]
+        # all page cache counted as used, then without it (shmem and tmpfs, /dev/shm included, stay counted: not reclaimable)
+        facts["hm_outside_workloads_kb"] = used - current
+        facts["hm_outside_workloads_no_cache_kb"] = (used - mem["Buffers"] - mem["Cached"] + mem["Shmem"]) - (current - file_ + shmem)
+        # mapped pages no workload cgroup owns: an upper bound for NVIDIA driver and other host mappings
+        facts["hm_mapped_outside_workloads_kb"] = mem["Mapped"] - file_mapped
+
+    try:
+        with open(vmstat_path) as vmstat:
+            counters = dict(line.split()[:2] for line in vmstat if len(line.split()) >= 2)
+        facts["hm_oom_kills_since_boot"] = int(counters["oom_kill"])
+    except Exception as exc:
+        facts["hm_oom_kills_since_boot"] = None
+        errors["hm_oom_kills_since_boot"] = repr(exc)
+
+    facts["hm_last_oom_kind"] = facts["hm_last_oom_at"] = None
+    try:
+        with open(stat_path) as stat:
+            boot_epoch = next(int(line.split()[1]) for line in stat if line.startswith("btime "))
+        last = last_oom_from_kmsg(read_kmsg(), boot_epoch)
+        if last:
+            facts["hm_last_oom_kind"], facts["hm_last_oom_at"] = last
+        elif facts["hm_oom_kills_since_boot"]:
+            errors["hm_last_oom_at"] = "OOM kills since boot, none left in the kernel log"
+    except Exception as exc:
+        errors["hm_last_oom_at"] = repr(exc)
+    return facts
+
+
 def get_executor_pid_mode():
     # PidMode of the executor's own container (hostname = container id): "host", or "" when private.
     # A missing or non-string value raises, so the scrape reports unknown instead of a failing mode.
@@ -2699,6 +2859,12 @@ def get_machine_specs():
     except Exception as exc:
         # print(f"Error reading /proc/meminfo; Exc: {exc}", file=sys.stderr)
         data["ram_scrape_error"] = repr(exc)
+
+    # DAH-6379: unreadable fields are None with a reason inside; a whole-block failure is reported, never raised
+    try:
+        data["data_host_memory"] = get_host_memory(data["data_docker"]["docker_containers"])
+    except Exception as exc:
+        data["data_host_memory_scrape_error"] = repr(exc)
 
     data["data_hard_disk"] = {}
     try:
