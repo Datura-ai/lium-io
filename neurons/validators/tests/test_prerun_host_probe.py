@@ -1139,3 +1139,34 @@ async def test_a_refused_pid_max_opens_no_further_host_read(svc_fixture, monkeyp
 
     assert result.failure_step == ds_module.HOST_READ_PID_MAX_STEP
     svc._read_host_ram_kib.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_filler_create_cancelled_at_ssh_connect_cleans_up_only_after_the_host_reads(svc_fixture, monkeypatch):
+    """Review on lium-io#2364: on an sshd with MaxSessions=1 a cancelled filler's cleanup that runs while the host
+    reads still hold the session gets no channel, leaves the filler running and then lifts its power cap. The
+    delete check, and so that cleanup, waits for the bounded reads to end."""
+    svc = svc_fixture
+    _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers("filler_x"))
+    reads_done = []
+
+    async def slow_pid_max(_ssh):
+        await asyncio.sleep(0.05)
+        reads_done.append(True)
+        return 4194304
+
+    monkeypatch.setattr(svc, "_read_host_pid_max", slow_pid_max)
+    seen_at_abort: list[bool] = []
+
+    async def deleted(*args, **kwargs):
+        seen_at_abort.append(bool(reads_done))
+        raise RuntimeError("deleted")
+
+    monkeypatch.setattr(svc, "_abort_if_cancelled_by_delete", AsyncMock(side_effect=deleted))
+
+    await asyncio.wait_for(
+        _run_create_container(svc, _deploy_payload(workload_kind=WorkloadKind.FILLER, active_volume_names=["volume_x"])),
+        timeout=2,
+    )
+
+    assert seen_at_abort[:1] == [True]

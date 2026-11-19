@@ -10683,6 +10683,12 @@ class DockerService:
                 profilers.append(ProfilerStep.since(ProfilerStepName.SSH_CONNECTION_ESTABLISHED, prev_timestamp))
                 prev_timestamp = now_ms()
 
+                # The bounded host reads end before anything else uses this session: on an sshd with
+                # MaxSessions=1 a cancelled filler's cleanup below would otherwise get no channel, leave the
+                # filler running and then lift its power cap (review on lium-io#2364).
+                assert host_limits_read is not None  # started as soon as the SSH session was up
+                host_pid_max, host_ram_kib, read_host_gpu_count = await host_limits_read
+
                 # DAH-2728: cheapest place to notice the delete — the image pull/build below is
                 # where a cancelled create spends its minutes, and nothing is on the host yet.
                 await self._abort_if_cancelled_by_delete(ssh_client, payload, default_extra)
@@ -10698,8 +10704,6 @@ class DockerService:
                 # even the floored cgroup cap would not reserve RENTAL_PIDS_LIMIT_HOST_MARGIN for the
                 # host's own tasks. No fixed fallback is safe on a host whose real pid_max is lower, so
                 # a tenant fork bomb would starve sshd/dockerd and take the executor offline mid-rental.
-                assert host_limits_read is not None  # started as soon as the SSH session was up
-                host_pid_max, host_ram_kib, read_host_gpu_count = await host_limits_read
                 if settings.RENTAL_PIDS_LIMIT_PER_CPU > 0:
                     current_step = HOST_READ_PID_MAX_STEP
                     if host_pid_max is None:
