@@ -78,6 +78,15 @@ jobs:
                   runs = doc.get("runs") or {}
                   steps = [step for job in jobs for step in job.get("steps") or []] + list(runs.get("steps") or [])
                   refs = [("job", job.get("uses")) for job in jobs] + [("step", step.get("uses")) for step in steps if isinstance(step, dict)]
+                  # a ./ action after a checkout of another ref or repository comes from code this scan never read
+                  for seq in [job.get("steps") or [] for job in jobs] + [runs.get("steps") or []]:
+                      moved = False
+                      for step in (s for s in seq if isinstance(s, dict)):
+                          uses = str(step.get("uses") or "")
+                          if moved and uses.startswith("./"):
+                              bad.append(f"{where}: {uses} runs after a checkout with ref or repository, which this check did not scan")
+                          if re.match(r"actions/checkout@", uses, re.I) and {"ref", "repository"} & set(step.get("with") or {}):
+                              moved = True
                   for level, ref in refs:
                       if ref is None:
                           continue
@@ -141,6 +150,7 @@ jobs:
               (None, ".github/actions/yaml/action.yaml", None): "runs: {}\n",
               (None, ".github/workflows/ok.yml", None): "on: push\n",
               ("acme/act", "action.yml", sha): "runs:\n  using: node20\n  main: index.js\n",
+              ("actions/checkout", "action.yml", sha): "runs:\n  using: node20\n  main: index.js\n",
               ("acme/act", "action.yml", s2): comp + "    - uses: acme/leaf@v1\n",
               ("vendor/comp", "sub/action.yml", sha): comp + "    - uses: acme/act@" + s2 + "\n",
               ("vendor/comp", "ws/action.yml", sha): comp + "    - uses: ./x\n",
@@ -161,6 +171,10 @@ jobs:
               # this commit's ./ actions and workflows must be tracked here, and are scanned as tracked
               "jobs:\n  a:\n    steps:\n      - uses: ./gen/act\n      - uses: ./.github/actions/ok/\n      - uses: ./.github/actions/ok@main\n      - uses: ./.github/actions/yaml\n  b:\n    uses: ./.github/workflows/ok.yml\n  c:\n    uses: ./.github/workflows/gen.yml\n": 3,
               step("acme/act@" + sha): 0,
+              # a ./ action after checking out another ref or repository fails; before it, or with a plain checkout, it passes
+              "jobs:\n  a:\n    steps:\n      - uses: actions/checkout@" + sha + "\n        with:\n          ref: main\n      - uses: ./.github/actions/ok\n": 1,
+              "jobs:\n  a:\n    steps:\n      - uses: actions/checkout@" + sha + "\n        with:\n          repository: acme/other\n      - uses: ./.github/actions/ok\n": 1,
+              "jobs:\n  a:\n    steps:\n      - uses: ./.github/actions/ok\n      - uses: actions/checkout@" + sha + "\n        with:\n          ref: main\n  b:\n    steps:\n      - uses: actions/checkout@" + sha + "\n        with:\n          fetch-depth: 0\n      - uses: ./.github/actions/ok\n": 0,
               step("acme/act@" + s2): 1,  # its own step uses a tag, whoever owns the action
               step("vendor/comp/sub@" + sha): 1,  # two levels down
               step("vendor/comp/ws@" + sha): 1,  # a workspace action inside a pinned one
