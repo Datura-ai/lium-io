@@ -1,8 +1,10 @@
 name: Pinned actions
 
 # no path filter: an action manifest can live anywhere in the repo, and a required check must report on every PR
+# pull_request_target: a PR's run uses this file as it is on the base branch, so a PR cannot change the check that judges
+# it; the PR's merge tree is checked out below as data only (nothing from it runs, and the token is read-only)
 on:
-  pull_request:
+  pull_request_target:
     # edited: a retarget to main (a stacked PR) with no new push still gets this required check on the new merge ref
     types: [opened, synchronize, reopened, edited]
   merge_group:
@@ -17,13 +19,17 @@ permissions:
 # run has its own group (run_id): a shared ref group would let a third push replace the pending second one, unscanned
 concurrency:
   group: pinned-actions-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
 
 jobs:
   check:
     runs-on: ubuntu-24.04  # its /usr/bin/python3 ships the distro PyYAML the check imports below
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # a PR run scans the PR's merge tree; main and the merge queue scan the commit they run on
+          ref: ${{ github.event_name == 'pull_request_target' && format('refs/pull/{0}/merge', github.event.pull_request.number) || '' }}
+          persist-credentials: false
       # every workflow and action this run can execute pins third-party code to a commit and images to a digest, never to a
       # movable tag: the tracked files at this commit, then every pinned action or reusable workflow they call, fetched at
       # its pinned commit. This repository's own actions and reusable workflows are called at the running commit ($/ or a
@@ -253,10 +259,20 @@ jobs:
               assert len(got) == want, (i, got)
 
           tracked = set(subprocess.run(["git", "ls-files", "-z"], capture_output=True, text=True, check=True).stdout.split("\0"))
+          root = pathlib.Path.cwd().resolve()
+
+          def local(path):
+              """A tracked file's text, read as data: a symlink (to a file outside the tree or inside it) fails the check, so a
+              PR's tree can never make this step read anything but its own regular files."""
+              p = root / path
+              if any(q.is_symlink() for q in [p, *p.parents] if q != root and root in q.parents) or not p.resolve().is_relative_to(root):
+                  sys.exit(f"{path}: a symlink in the tree; workflows and action manifests must be regular files")
+              return p.read_text()
+
           reads = []
           def fetch(repo, path, at):
               if repo is None:
-                  return pathlib.Path(path).read_text() if path in tracked else None
+                  return local(path) if path in tracked else None
               reads.append(path)
               url = f"https://api.github.com/repos/{repo}/contents/{urllib.parse.quote(path)}?ref={at}"
               req = urllib.request.Request(url, headers={"Accept": "application/vnd.github.raw", "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}"})
