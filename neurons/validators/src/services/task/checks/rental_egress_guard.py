@@ -5,8 +5,8 @@ This check applies the same kind of rule for rentals with the host's own iptable
 (``nsenter -t 1 -m -n -r``; the executor runs privileged with ``pid: host``), so it needs no image and no registry.
 The shell, lock and time bound are the executor's: only iptables runs in the host root, which may have no ``/bin/sh``
 or ``timeout``. Traffic entering from the ``lium-rentals``
-bridge, and from a running legacy rental still on another network (the default bridge; a running
-pod is never moved), to link-local 169.254/16 is dropped, except DNS (port 53), because a rental
+bridge, and from every running rental on another network (its own bridge since DAH-6736, or the
+default bridge of a legacy pod that was never moved), to link-local 169.254/16 is dropped, except DNS (port 53), because a rental
 container's embedded resolver forwards from the container's network namespace and some hosts use
 a link-local resolver.
 

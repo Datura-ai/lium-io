@@ -210,7 +210,7 @@ from services.rental_docker_sdk import (
     DeviceMount,
     DriverVolumeMount,
     PortBinding,
-    RENTAL_NETWORK_NAME,
+    rental_network_for,
     RentalDockerConnectionError,
     RentalDockerContainerRestartingError,
     RentalDockerOperationError,
@@ -4465,7 +4465,7 @@ class DockerService:
             pids_limit=self._rental_pids_limit(cpu_count, host_pid_max),
             shm_size=custom_options.shm_size,
             entrypoint=custom_options.entrypoint,
-            network=RENTAL_NETWORK_NAME,
+            network=rental_network_for(container_name),
             labels={LIUM_POD_ID_LABEL: payload.pod_id},
             before_create=lambda: _refuse_filler_during_customer_create(payload),
             # a customer pod created since the cleanup's listing is seen here, before the filler starts
@@ -12749,10 +12749,10 @@ class DockerService:
                 await run_logged_rental_docker_sdk_operation(
                     operation="start_container",
                     log_extra=default_extra,
-                    # a pod created before rentals ran on RENTAL_NETWORK_NAME would keep docker0 across
-                    # every `docker start`; start moves it onto the rental network
+                    # a pod created before it had a bridge of its own (DAH-6736) would keep a shared one across
+                    # every `docker start`; start moves it onto its own
                     call=lambda: docker_client.start(
-                        container_name=container_name, network=RENTAL_NETWORK_NAME
+                        container_name=container_name, network=rental_network_for(container_name)
                     ),
                     container_name=container_name,
                 )
@@ -12810,7 +12810,7 @@ class DockerService:
                 operation="start_container",
                 log_extra=default_extra,
                 call=lambda: docker_client.start(
-                    container_name=container_name, network=RENTAL_NETWORK_NAME
+                    container_name=container_name, network=rental_network_for(container_name)
                 ),
                 container_name=container_name,
             )

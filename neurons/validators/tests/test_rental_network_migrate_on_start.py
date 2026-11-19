@@ -112,3 +112,104 @@ async def test_start_without_a_network_only_starts():
 
     assert api.events == [("start", "pod_a")]
 
+
+
+# DAH-6736: each rental has a bridge of its own; no two tenants share a link
+OWN = "lium-rentals-pod_a"
+
+
+class _Networks(dict):
+    """FakeApi's name -> network map that also answers docker's `networks(filters=...)` list call."""
+
+    def __init__(self, known, listing):
+        super().__init__(known)
+        self.listing = listing
+
+    def __call__(self, filters=None):
+        assert filters == {"label": "io.lium.network=pod"}
+        return self.listing
+
+
+class PerPodApi(FakeApi):
+    def __init__(self, *, template_options=None, containers=(), pod_networks=(), **kwargs):
+        super().__init__(**kwargs)
+        if template_options is not None:
+            self.networks[RENTAL_NETWORK_NAME]["Options"] = template_options
+        self.listed = list(containers)
+        self.networks = _Networks(self.networks, list(pod_networks))
+        self.removed = []
+
+    def create_network(self, name, **kwargs):
+        super().create_network(name, **kwargs)
+        self.networks[name]["Labels"] = kwargs["labels"]
+
+    def containers(self, all=False):
+        assert all is True  # a stopped pod still owns its bridge
+        return self.listed
+
+    def remove_network(self, net_id):
+        self.removed.append(net_id)
+
+
+def _listed(*networks):
+    return {"NetworkSettings": {"Networks": {name: {} for name in networks}}}
+
+
+OLD = "2026-01-01T00:00:00.123456789Z"
+
+
+@pytest.mark.asyncio
+async def test_start_moves_a_stopped_pod_off_the_shared_rentals_bridge_onto_its_own():
+    api = PerPodApi(networks=(RENTAL_NETWORK_NAME,), mode=RENTAL_NETWORK_NAME)
+
+    await RentalDockerSdkClient(api).start(container_name="pod_a", network=OWN)
+
+    assert ("create_network", OWN) in api.events
+    assert api.events[-3:] == [
+        ("disconnect", "pod_a", RENTAL_NETWORK_NAME),
+        ("connect", "pod_a", OWN),
+        ("start", "pod_a"),
+    ]
+    assert api.networks[OWN]["Labels"]["io.lium.network"] == "pod"
+    assert api.networks[OWN]["Options"][RENTAL_NETWORK_ICC_OPTION] == "false"
+
+
+@pytest.mark.asyncio
+async def test_a_pod_bridge_takes_the_mtu_the_provider_set_on_the_template():
+    api = PerPodApi(template_options={RENTAL_NETWORK_ICC_OPTION: "false", "com.docker.network.driver.mtu": "1400"})
+
+    await RentalDockerSdkClient(api).start(container_name="pod_a", network=OWN)
+
+    assert api.networks[OWN]["Options"]["com.docker.network.driver.mtu"] == "1400"
+
+
+@pytest.mark.asyncio
+async def test_creating_a_pod_bridge_removes_only_old_unreferenced_pod_bridges():
+    api = PerPodApi(
+        containers=[_listed("lium-rentals-pod_stopped")],
+        pod_networks=[
+            {"Id": "gone", "Name": "lium-rentals-pod_gone", "Created": OLD},
+            {"Id": "stopped", "Name": "lium-rentals-pod_stopped", "Created": OLD},
+            # a racing create has made its bridge but not yet its container
+            {"Id": "fresh", "Name": "lium-rentals-pod_fresh", "Created": "2999-01-01T00:00:00Z"},
+            {"Id": "tmpl", "Name": RENTAL_NETWORK_NAME, "Created": OLD},
+            {"Id": "foreign", "Name": "someone-else", "Created": OLD},
+        ],
+    )
+
+    await RentalDockerSdkClient(api).start(container_name="pod_a", network=OWN)
+
+    assert api.removed == ["gone"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_cleanup_never_blocks_the_pod():
+    api = PerPodApi()
+
+    def broken(all=False):
+        raise RuntimeError("daemon busy")
+
+    api.containers = broken
+    await RentalDockerSdkClient(api).start(container_name="pod_a", network=OWN)
+
+    assert api.events[-1] == ("start", "pod_a")

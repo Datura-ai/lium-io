@@ -3055,7 +3055,7 @@ async def test_start_container_restarts_ssh_after_docker_start(docker_service, m
     assert docker_service.rental_docker_client_factory.client.started_containers == [
         "pod_test"
     ]
-    assert docker_service.rental_docker_client_factory.client.start_networks == ["lium-rentals"]
+    assert docker_service.rental_docker_client_factory.client.start_networks == ["lium-rentals-pod_test"]  # its own bridge (DAH-6736)
     docker_service.install_open_ssh_server_and_start_ssh_service_with_rental_docker.assert_awaited_once_with(
         docker_client=docker_service.rental_docker_client_factory.client,
         container_name="pod_test",
