@@ -11,6 +11,7 @@ HOW A NODE PICKS A POOL:
                                                           mining score is zeroed, e.g. Sysbox
                                                           not confirmed; reason below)
   idle AND model in program AND price ok AND disk >= 1.5x VRAM
+       AND RAM >= half of VRAM (when that gate is enforced)
        AND (not full-8x OR NCU/split/attested-CVM offered) AND power cap appliable
                                AND capacity?            -> unrented pool (earns)
   otherwise                                            -> 0 incentive (reason below)
@@ -28,6 +29,7 @@ WHAT THIS CATALOG HOLDS — every `MinerLogLine` the miner-facing log block
      GPU model not in the unrented program (earns only when rented),
      price above the market soft limit (lower the price to earn),
      total disk below 1.5x total GPU VRAM (add disk to earn),
+     system RAM below half of total GPU VRAM, when enforced (add RAM to earn),
      8x H200/B200/B300 with no NCU profiling, GPU splitting or passed TDX
        attestation (offer any of the three to earn),
      container that cannot apply a GPU power cap (give it CAP_SYS_ADMIN to earn),
