@@ -102,7 +102,8 @@ RECENT_FILLER_TTL_SECONDS = 45 * 60
 # closes the run only after ~30 min of missing reports; until then the container's absence is not a host kill.
 FILLER_REMOVED_BY_VALIDATOR_PREFIX = "filler_removed_by_validator:"
 FILLER_REMOVED_BY_VALIDATOR_TTL_SECONDS = 2 * 3600
-# set by a filler create whose sshd never came up in the container, cleared by one where it did
+# set by a filler create whose sshd never came up in the container, cleared by one where it did or by
+# SshdBootstrapCheck's re-probe in a fresh container of the same image
 SSHD_BOOTSTRAP_FAILED_PREFIX = "sshd_bootstrap_failed"
 # prod, 24 h: failed filler creates on a broken node came 5 min to 2.7 h apart, so 6 h outlives the
 # longest gap about twice over; a stale stamp ends by itself
@@ -125,6 +126,11 @@ def verifyx_stale_runs_key(miner_hotkey: str, executor_uuid: str) -> str:
 def sshd_bootstrap_failed_key(miner_hotkey: str, executor_uuid: str) -> str:
     # the UUID is the miner's word: keyed with the hotkey, a node copying it cannot set or clear the owner's stamp
     return f"{SSHD_BOOTSTRAP_FAILED_PREFIX}:{miner_hotkey}:{executor_uuid}"
+
+
+def sshd_bootstrap_failed_stamp(image: str, sysbox: bool) -> str:
+    """The stamp's value: the failed filler create's image and runtime, which SshdBootstrapCheck re-probes each cycle."""
+    return json.dumps({"image": image, "sysbox": sysbox})
 
 
 async def get_or_adopt_legacy(redis, key: str, legacy_key: str):

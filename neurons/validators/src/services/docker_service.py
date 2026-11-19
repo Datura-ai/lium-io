@@ -194,6 +194,7 @@ from services.redis_service import (
     STREAMING_LOG_CHANNEL,
     RedisService,
     sshd_bootstrap_failed_key,
+    sshd_bootstrap_failed_stamp,
 )
 from services.rental_docker_observability import (
     exec_logged_rental_docker_sdk_operation,
@@ -7681,9 +7682,11 @@ class DockerService:
         log_extra: dict,
         raise_if_container_gone: bool = False,
         sshd_verdict_key: str | None = None,
+        sshd_failed_stamp: str = "1",
     ) -> bool:
         # sshd_verdict_key: a filler create (Lium's own image) records the executor's sshd
         # verdict for SshdBootstrapCheck; a renter's image can break sshd itself, so it records nothing.
+        # sshd_failed_stamp: the value a failed verdict saves (sshd_bootstrap_failed_stamp), what the check re-probes.
         # raise_if_container_gone: the create path wants the ContainerGoneBeforeExec (with the
         # State it carries) rather than a False it never read; the start path keeps its
         # "did not complete cleanly" warning for every failure of the first exec.
@@ -7812,7 +7815,9 @@ class DockerService:
             )
             # only sshd installed but not serving is the node's fault; a failed apt-get exits before that line
             if SSHD_VERIFY_FAILED_MARKER in f"{run_result.stdout}{run_result.stderr}":
-                await self._record_sshd_verdict(sshd_verdict_key, failed=True, log_extra=log_extra)
+                await self._record_sshd_verdict(
+                    sshd_verdict_key, failed=True, stamp=sshd_failed_stamp, log_extra=log_extra
+                )
             return False
 
         await self._record_sshd_verdict(sshd_verdict_key, failed=False, log_extra=log_extra)
@@ -7878,12 +7883,14 @@ class DockerService:
                 ),
             )
 
-    async def _record_sshd_verdict(self, key: str | None, *, failed: bool, log_extra: dict) -> None:
+    async def _record_sshd_verdict(
+        self, key: str | None, *, failed: bool, log_extra: dict, stamp: str = "1"
+    ) -> None:
         if not key:
             return
         try:
             if failed:
-                await self.redis_service.set(key, "1", ex=SSHD_BOOTSTRAP_FAILED_TTL_SECONDS)
+                await self.redis_service.set(key, stamp, ex=SSHD_BOOTSTRAP_FAILED_TTL_SECONDS)
             else:
                 await self.redis_service.delete(key)
         except Exception:  # noqa: BLE001 — the create's own result still goes out
@@ -12008,6 +12015,7 @@ class DockerService:
                             if payload.workload_kind == WorkloadKind.FILLER
                             else None
                         ),
+                        sshd_failed_stamp=sshd_bootstrap_failed_stamp(payload.docker_image, bool(payload.is_sysbox)),
                     ):
                         soft_failed_step = current_step
                     if soft_failed_step is None:
