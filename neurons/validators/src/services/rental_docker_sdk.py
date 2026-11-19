@@ -114,6 +114,16 @@ def rental_network_for(container_name: str) -> str:
 _BRIDGES_IN_USE: Counter[str] = Counter()
 
 
+# A pod bridge's ensure (inspect or create, the ID its guard records) and our reaper's check-and-remove of that bridge
+# never interleave: a reservation made while the reaper is past its check finds the bridge gone and makes it again
+# before the guard, never guards a bridge the reaper then removes. Striped, one lock held at a time (no deadlock).
+_POD_NETWORK_LOCKS = tuple(threading.Lock() for _ in range(64))
+
+
+def _pod_network_lock(name: str) -> threading.Lock:
+    return _POD_NETWORK_LOCKS[hash(name) % len(_POD_NETWORK_LOCKS)]
+
+
 @contextmanager
 def bridge_in_use(name: str | None) -> Iterator[None]:
     if name:
@@ -1319,13 +1329,19 @@ class RentalDockerSdkClient:
         if name != RENTAL_NETWORK_NAME:
             self._ensure_rental_network_sync(RENTAL_NETWORK_NAME)
             labels = dict(POD_NETWORK_LABELS)
+            if self._inspect_network_or_none(name) is None:
+                self._remove_unused_pod_networks_sync()
+            with _pod_network_lock(name):
+                return self._ensure_network_locked_sync(name, options, labels)
+        return self._ensure_network_locked_sync(name, options, labels)
+
+    def _ensure_network_locked_sync(self, name: str, options: dict, labels: dict) -> str:
         network = self._inspect_network_or_none(name)
         if network is None:
             if name != RENTAL_NETWORK_NAME:
                 template = self._inspect_network_or_none(RENTAL_NETWORK_NAME) or {}
                 if mtu := (template.get("Options") or {}).get(RENTAL_NETWORK_MTU_OPTION):
                     options[RENTAL_NETWORK_MTU_OPTION] = mtu
-                self._remove_unused_pod_networks_sync()
             try:
                 self._api_client.create_network(
                     name,
@@ -1396,7 +1412,7 @@ class RentalDockerSdkClient:
                 return False
         elif network in networks:
             return False
-        target_ref = network_id if own else network
+        target_ref = network
         try:
             for name in sorted(networks):
                 try:
@@ -1405,7 +1421,17 @@ class RentalDockerSdkClient:
                     # an old network removed while the pod was stopped holds nothing to leave
                     if self._inspect_network_or_none(name) is not None:
                         raise
-            self._api_client.connect_container_to_network(container_name, target_ref)
+            if own:
+                # docker-py sends EndpointConfig {}: dockerd then keeps the attachment by network name and resolves the
+                # name again at start, a same-name bridge made since included. NetworkID pins it to the guarded one (F-36)
+                api = self._api_client
+                response = api._post_json(
+                    api._url("/networks/{0}/connect", network_id),
+                    data={"Container": container_name, "EndpointConfig": {"NetworkID": network_id}},
+                )
+                api._raise_for_status(response)
+            else:
+                self._api_client.connect_container_to_network(container_name, target_ref)
         except Exception as exc:
             raise RentalPodNetworkMoveFailed(
                 _wrap_error_message(f"Docker SDK move of {container_name} onto network {network} failed", exc)
@@ -1431,16 +1457,20 @@ class RentalDockerSdkClient:
             return
         for network in networks:
             name = network.get("Name") or ""
-            if name in used or name in _BRIDGES_IN_USE or not is_rental_network(name) or name == RENTAL_NETWORK_NAME:
+            if name in used or not is_rental_network(name) or name == RENTAL_NETWORK_NAME:
                 continue
             if _age_seconds(network.get("Created")) < POD_NETWORK_REAP_MIN_AGE_SECONDS:
                 continue
-            try:
-                self._api_client.remove_network(network.get("Id") or name)
-            except Exception as exc:
-                logger.warning(
-                    _m("Rental network not removed", extra={"network": name, "error": str(exc)[:300]})
-                )
+            with _pod_network_lock(name):
+                # checked under the bridge's lock: a create reserving it now ensures it only after this removal (F-38)
+                if name in _BRIDGES_IN_USE:
+                    continue
+                try:
+                    self._api_client.remove_network(network.get("Id") or name)
+                except Exception as exc:
+                    logger.warning(
+                        _m("Rental network not removed", extra={"network": name, "error": str(exc)[:300]})
+                    )
 
     def _inspect_network_or_none(self, name: str) -> dict | None:
         try:

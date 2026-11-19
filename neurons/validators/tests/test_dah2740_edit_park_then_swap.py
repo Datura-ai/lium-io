@@ -1431,6 +1431,10 @@ async def test_a_failed_edit_brings_a_kept_container_back_unmounted(
     kept = _docker(ssh.commands, "rename")[0].split()[3]
     # the real bring-up of the kept container, by the id read before it: start, sshd, never the remount
     assert docker_client.start.await_args.kwargs["container_name"] == "cid"
+    # F-39: started by its kept name, but on the pod's own bridge, never one named after the kept name
+    from services.rental_docker_sdk import rental_network_for
+
+    assert docker_client.start.await_args.kwargs["network"] == rental_network_for(name)
     svc._encrypted_local_volume_name.assert_not_awaited()
     svc.setup_encrypted_local_volume.assert_not_awaited()
     sshd = svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker

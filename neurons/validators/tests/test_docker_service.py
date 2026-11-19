@@ -3300,6 +3300,55 @@ async def test_start_existing_container_repairs_a_stale_vloopback_mountpoint_and
 
 
 @pytest.mark.asyncio
+async def test_a_stopped_pod_start_keeps_its_bridge_from_our_reaper_from_the_guard_through_the_start(
+    docker_service, monkeypatch
+):
+    # DAH-6737 review (F-38): between the guard (which records the bridge ID) and the start (after which the container
+    # references the bridge), a stopped pod's bridge is unreferenced; our reaper must not remove it then
+    from services.rental_docker_sdk import _BRIDGES_IN_USE, rental_network_for
+
+    held = []
+
+    async def guard(**kwargs):
+        held.append(("guard", kwargs["network"] in _BRIDGES_IN_USE))
+        return "guarded-id"
+
+    async def start(**kwargs):
+        held.append(("start", kwargs["network"] in _BRIDGES_IN_USE))
+
+    monkeypatch.setattr("services.docker_service.asyncssh.import_private_key", Mock(return_value="pkey"))
+    monkeypatch.setattr(
+        "services.docker_service.asyncssh.connect", Mock(return_value=DummySSHConnectionManager(AsyncMock()))
+    )
+    monkeypatch.setattr(docker_service, "_guard_pod_network_before_start", guard)
+    docker_service.rental_docker_client_factory.client.start = AsyncMock(side_effect=start)
+    docker_service._restore_mount_and_sshd_after_start = AsyncMock()
+    executor_info = ExecutorSSHInfo(
+        uuid=str(uuid4()),
+        address="127.0.0.1",
+        port=8001,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python3",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    await docker_service.start_existing_container(
+        executor_info=executor_info,
+        private_key="private-key",
+        known_hosts_policy=None,
+        container_name="pod_test",
+        local_volume_path="/root",
+        pod_id="pod-id",
+        default_extra={},
+    )
+
+    assert held == [("guard", True), ("start", True)]
+    assert rental_network_for("pod_test") not in _BRIDGES_IN_USE
+
+
+@pytest.mark.asyncio
 async def test_start_container_remounts_when_container_state_is_encrypted(docker_service, monkeypatch):
     ssh_client = AsyncMock()
     ssh_client.run = AsyncMock(return_value=_make_ssh_command_result(stdout=""))

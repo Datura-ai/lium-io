@@ -1,5 +1,7 @@
 """A stopped pod still on the default bridge is moved onto the rental network when it is started again."""
 
+import json
+
 import pytest
 from docker.errors import NotFound
 
@@ -15,6 +17,7 @@ from services.rental_docker_sdk import (
 class FakeApi:
     def __init__(self, *, running=False, networks=("bridge",), mode="default", rental_network_exists=True):
         self.events = []
+        self.connect_requests = []
         self.container = {
             "State": {"Running": running, "Restarting": False},
             "HostConfig": {"NetworkMode": mode},
@@ -43,6 +46,17 @@ class FakeApi:
 
     def connect_container_to_network(self, container, network):
         self.events.append(("connect", container, network))
+
+    # docker-py's low-level request path, as a pod's own bridge is connected by ID with EndpointConfig.NetworkID
+    def _url(self, path, *args):
+        return path.format(*args)
+
+    def _post_json(self, url, data=None):
+        self.connect_requests.append(json.loads(json.dumps(data)))  # what goes on the wire
+        self.events.append(("connect", data["Container"], url.split("/")[2]))
+
+    def _raise_for_status(self, response):
+        return None
 
     def start(self, container):
         self.events.append(("start", container))
@@ -215,6 +229,8 @@ async def test_start_moves_a_stopped_pod_off_the_shared_rentals_bridge_onto_its_
         ("connect", "pod_a", guarded),
         ("start", "pod_a"),
     ]
+    # F-36: the ID in the body too, else dockerd keeps the attachment by name and resolves it again at start
+    assert api.connect_requests[-1] == {"Container": "pod_a", "EndpointConfig": {"NetworkID": guarded}}
     assert api.networks[OWN]["Labels"]["io.lium.network"] == "pod"
     assert api.networks[OWN]["Options"][RENTAL_NETWORK_ICC_OPTION] == "false"
 
@@ -370,3 +386,39 @@ def test_the_reaper_keeps_a_bridge_a_create_here_guarded_and_has_not_run_on_yet(
     api.remove_network.reset_mock()
     client._remove_unused_pod_networks_sync()  # the create ended: an unused bridge is reaped as before
     assert {c.args[0] for c in api.remove_network.call_args_list} == {held, idle}
+
+
+def test_a_bridge_reserved_while_the_reaper_removes_it_is_made_again_before_its_guard():
+    # DAH-6737 review (F-38): the reaper checked the old bridge unreserved and is removing it when a create reserves it
+    # and ensures it for its guard; the guard must get a bridge that exists after the removal, never the removed one
+    import threading
+
+    from services.rental_docker_sdk import bridge_in_use
+
+    stale = {"Id": "old-id", "Name": OWN, "Created": OLD, "Driver": "bridge", "Options": {RENTAL_NETWORK_ICC_OPTION: "false"}}
+    api = PerPodApi(pod_networks=[stale])
+    api.networks[OWN] = stale
+    removing, release = threading.Event(), threading.Event()
+
+    def remove_network(net_id):
+        removing.set()
+        release.wait(5)
+        api.removed.append(net_id)
+        del api.networks[OWN]
+
+    api.remove_network = remove_network
+    client = RentalDockerSdkClient(api)
+    reaper = threading.Thread(target=client._remove_unused_pod_networks_sync)
+    reaper.start()
+    assert removing.wait(5)
+    guarded: list[str] = []
+    with bridge_in_use(OWN):
+        ensure = threading.Thread(target=lambda: guarded.append(client._ensure_rental_network_sync(OWN)))
+        ensure.start()
+        ensure.join(0.3)  # the ensure waits on the reaper's removal of that bridge
+        release.set()
+        reaper.join(5)
+        ensure.join(5)
+
+    assert api.removed == ["old-id"]
+    assert guarded == [f"id-{OWN}"] and api.networks[OWN]["Id"] == guarded[0]
