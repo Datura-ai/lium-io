@@ -998,39 +998,6 @@ def test_an_unreadable_kept_state_stays_closed_on_a_404(tmp_path, monkeypatch, o
     assert restarted.hotkeys({"current": old_validator.ss58_address}) == {}
 
 
-def test_the_operator_recovery_keeps_a_replacement_the_node_had_written(
-    tmp_path, monkeypatch, owner, old_validator, new_validator
-):
-    # review at 8e22fbd: revision 2 named a replacement and is on the volume; the node then crashed. The recovery must
-    # never bring back the baked (replaced) validator
-    _keep(tmp_path, owner, _signed(owner, new_validator, 2))
-    state = _state(tmp_path) | {"owner": owner.ss58_address, "running": True}
-    (tmp_path / STATE_FILE).write_text(json.dumps(state))
-    closed = ValidatorTrust(state_dir=tmp_path, image_message=tmp_path / "absent.json")
-    closed.load()
-    assert closed.hotkeys({"current": old_validator.ss58_address}) == {}
-
-    trust_service.confirm_kept(tmp_path)
-    recovered = ValidatorTrust(state_dir=tmp_path, image_message=tmp_path / "absent.json")
-    recovered.load()
-    assert recovered.hotkeys({"current": old_validator.ss58_address}) == {"signed": new_validator.ss58_address}
-
-
-def test_the_operator_recovery_reopens_a_never_messaged_node_on_the_baked_validators(tmp_path, owner, old_validator):
-    _crashed_first_boot(tmp_path, owner)
-    trust_service.confirm_kept(tmp_path)
-    recovered = ValidatorTrust(state_dir=tmp_path, image_message=tmp_path / "absent.json")
-    recovered.load()
-    baked = {"current": old_validator.ss58_address}
-    assert recovered.hotkeys(baked) == baked
-
-
-@pytest.mark.parametrize("kept", [None, "{not json", json.dumps({"owner": "x", "messages": {}})])
-def test_the_operator_recovery_refuses_a_missing_or_unreadable_state(tmp_path, kept):
-    if kept is not None:
-        (tmp_path / STATE_FILE).write_text(kept)
-    with pytest.raises((OSError, ValueError)):
-        trust_service.confirm_kept(tmp_path)
 
 def test_a_404_before_the_chain_names_the_owner_does_not_confirm(tmp_path, monkeypatch, owner, old_validator):
     restarted = _crashed_first_boot(tmp_path, owner)

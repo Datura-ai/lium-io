@@ -22,10 +22,8 @@ shutdown writes the newest state marked ended: a start that finds the running ma
 writing its newest state: a failed or cut-short shutdown write, a crash) cannot tell whether a newer message was
 taken, and stays closed the same way until a served message confirms a validator. Only a message the owner signed
 confirms: a 404 or a failure never does, so the backend must keep serving a signed message (one naming the current
-validator before any replacement) for a closed node to reopen. The operator's recovery for a node that cannot reach it
-is `confirm_kept` (run with the executor stopped): it lifts the marks and keeps every kept message, so the node trusts
-the newest validator it holds (revision 2 stays revision 2), never one an older state named; removing the kept file is
-not a recovery, since it forgets every replacement. A kept state with any field
+validator before any replacement) for a closed node to reopen. Nothing else reopens it: no operator step can tell
+whether a newer message was lost, and removing the kept file forgets every replacement. A kept state with any field
 missing or malformed is unreadable. Only a volume that refused every write of a run, the running mark included,
 cannot be read for it: a restart then reads the last state the volume holds.
 
@@ -406,21 +404,6 @@ class ValidatorTrust:
             self._save()
 
 
-def confirm_kept(state_dir: Path = STATE_DIR) -> dict:
-    """The operator's recovery for a closed node that cannot reach a served message: the kept state, read whole as
-    load() reads it, written back with the running and unconfirmed marks lifted. Every kept message stays, so the node
-    trusts the newest validator it holds. Refuses a missing or unreadable state, which holds nothing to confirm."""
-    path = state_dir / STATE_FILE
-    state = json.loads(path.read_text())
-    probe = ValidatorTrust(state_dir=state_dir, image_message=state_dir / ".no-image-message")
-    probe.load()
-    if probe._written is None:  # load() dropped it: missing a field, malformed, or a message failing its signature
-        raise ValueError("the kept state is unreadable: nothing to confirm")
-    state = {**state, "running": False, "unconfirmed": False}
-    _write_json(path, state)
-    return state
-
-
 validator_trust = ValidatorTrust(enabled=importlib.util.find_spec("core.config_override") is None)
 
 
@@ -443,10 +426,3 @@ async def run_validator_trust_refresh() -> None:
     finally:
         await validator_trust.stop_persisting(writer)
 
-
-if __name__ == "__main__":
-    import sys
-
-    if sys.argv[1:] != ["confirm-kept"]:
-        sys.exit("usage: python -m services.validator_trust_service confirm-kept  (executor stopped)")
-    print(json.dumps(confirm_kept()["held"]))
