@@ -7,9 +7,10 @@ on:
   # datura/ or .github/ changed (lium_protocol/ also selects validators). tests-ok reports on every PR either way. No `branches:` filter
   # either: a PR stacked on another PR's branch (the loop's and the team's dependent PRs) used
   # to get no run at all until its base merged and GitHub retargeted it to main.
-  # CI minutes: a PR runs only route and ruff-check. The package jobs and the real e2e gate run in the
-  # merge queue, on the tree that lands; push to main runs route and tests-ok only. A PR reports e2e-gate
-  # as deferred, so the required check is present without running the suites twice.
+  # CI minutes: once the merge queue is active, a PR runs only route and ruff-check. Until then a PR keeps
+  # running the suites after approval. Set the repository variable MERGE_QUEUE_ENABLED=true after the queue
+  # rule is enabled; push to main runs route and tests-ok either way. With the queue active, a PR reports
+  # e2e-gate as deferred, so the required check is present without running the suites twice.
   pull_request:
   push:
     branches: [main]
@@ -83,7 +84,7 @@ jobs:
   validators:
     name: Validators Tests
     needs: route
-    if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.outputs.validators == 'true' && needs.route.outputs.approved == 'true' }}
+    if: ${{ !cancelled() && needs.route.outputs.validators == 'true' && needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || (vars.MERGE_QUEUE_ENABLED != 'true' && github.event_name != 'push')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -121,7 +122,7 @@ jobs:
   executor:
     name: Executor Tests
     needs: route
-    if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.outputs.executor == 'true' && needs.route.outputs.approved == 'true' }}
+    if: ${{ !cancelled() && needs.route.outputs.executor == 'true' && needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || (vars.MERGE_QUEUE_ENABLED != 'true' && github.event_name != 'push')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -155,7 +156,7 @@ jobs:
     # validators, so a broken client ships to every provider on the next tag
     name: Miners Tests
     needs: route
-    if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.outputs.miners == 'true' && needs.route.outputs.approved == 'true' }}
+    if: ${{ !cancelled() && needs.route.outputs.miners == 'true' && needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || (vars.MERGE_QUEUE_ENABLED != 'true' && github.event_name != 'push')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -191,7 +192,7 @@ jobs:
     # Routed like the neurons; a lium_protocol/ change also selects `validators` (the compat test).
     name: Protocol package (tests + schema snapshot)
     needs: route
-    if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.outputs.protocol == 'true' && needs.route.outputs.approved == 'true' }}
+    if: ${{ !cancelled() && needs.route.outputs.protocol == 'true' && needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || (vars.MERGE_QUEUE_ENABLED != 'true' && github.event_name != 'push')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -262,17 +263,17 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: echo "::error::a package test job or ruff failed (see tests-ok)" && exit 1
       - name: deferred to the merge queue
-        if: github.event_name != 'merge_group'
+        if: github.event_name != 'merge_group' && vars.MERGE_QUEUE_ENABLED == 'true'
         run: echo "e2e gate runs in the merge queue for this tree"
       - uses: actions/checkout@v4
-        if: github.event_name == 'merge_group' && env.RUN == 'true'
+        if: (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
       # the gha layer cache (E2E_CACHE, e2e/Makefile) needs a builder that exports cache and the Actions cache URL + token
       - uses: docker/setup-buildx-action@v3
-        if: github.event_name == 'merge_group' && env.RUN == 'true'
+        if: (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
       - uses: crazy-max/ghaction-github-runtime@v3
-        if: github.event_name == 'merge_group' && env.RUN == 'true'
+        if: (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
       - name: build, up, every suite, logs, down — each step under a hard timeout (gate.sh)
-        if: github.event_name == 'merge_group' && env.RUN == 'true'
+        if: (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
         id: gate
         timeout-minutes: 55
         env:
@@ -280,7 +281,7 @@ jobs:
         run: ./gate.sh
       - uses: actions/upload-artifact@v4
         id: artifacts
-        if: always() && github.event_name == 'merge_group' && env.RUN == 'true'
+        if: always() && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
         with:
           name: e2e-gate-${{ github.event.pull_request.number || github.run_id }}-${{ github.run_attempt }}
           path: e2e/artifacts
