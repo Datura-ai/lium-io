@@ -1199,3 +1199,30 @@ async def test_a_host_read_whose_channel_may_still_hold_the_session_stops_the_cr
     assert result.failure_step == step
     svc._abort_if_cancelled_by_delete.assert_not_awaited()
 
+
+@pytest.mark.asyncio
+async def test_early_probes_start_only_after_host_reads_succeed_while_docker_connects(
+    svc_fixture, monkeypatch
+):
+    """Review on lium-io#2364: the early probes start only after the host reads succeeded, also when a read fails while
+    the Docker connection is still opening."""
+    svc = svc_fixture
+    _wire_early_probes(svc, monkeypatch, image_present=True)
+    monkeypatch.setattr(
+        svc, "_read_host_pid_max", AsyncMock(side_effect=ds_module.SshSessionMayStillBeTakenError("close not confirmed"))
+    )
+    factory = svc.rental_docker_client_factory
+    docker_ready = factory.__aenter__
+
+    async def slow_docker_connect():
+        await asyncio.sleep(0.05)  # the reads fail while Docker still connects
+        return await docker_ready()
+
+    # `async with` looks __aenter__ up on the type
+    monkeypatch.setattr(type(factory), "__aenter__", lambda self: slow_docker_connect())
+
+    result = await asyncio.wait_for(_run_create_container(svc, _deploy_payload(volume_limit_gb=10)), 5)
+
+    assert result.failure_step == ds_module.HOST_READ_PID_MAX_STEP
+    svc.probe_prerun_host.assert_not_awaited()
+    svc.probe_volume_host.assert_not_awaited()

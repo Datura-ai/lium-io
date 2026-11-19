@@ -10594,7 +10594,11 @@ class DockerService:
                 probe: Callable[[], Awaitable[AnswerWithOwnDuration]],
             ) -> AnswerWithOwnDuration:
                 assert host_limits_read is not None
+                # waiting does not cancel the shared reads when this probe is cancelled
                 await asyncio.wait([host_limits_read])
+                if host_limits_read.cancelled() or host_limits_read.exception() is not None:
+                    # the create fails at the reads' own step; the probes only run after reads that succeeded
+                    raise asyncio.CancelledError
                 return await probe()
 
             def start_early_probes(connected_ssh_client: asyncssh.SSHClientConnection) -> None:
