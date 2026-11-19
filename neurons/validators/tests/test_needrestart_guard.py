@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import os
 import re
 import subprocess
@@ -43,7 +44,7 @@ def _read(host_root: Path):
             "NEEDRESTART_GUARD_SERVICES",
             "NEEDRESTART_GUARD_UNITS",
         },
-        {"os": os, "re": re},
+        {"difflib": difflib, "os": os, "re": re},
     )
     return ns["get_needrestart_guard"](str(host_root))[:2]
 
@@ -58,7 +59,7 @@ def _reason(host_root: Path):
             "NEEDRESTART_GUARD_SERVICES",
             "NEEDRESTART_GUARD_UNITS",
         },
-        {"os": os, "re": re},
+        {"difflib": difflib, "os": os, "re": re},
     )
     return ns["get_needrestart_guard"](str(host_root))[2]
 
@@ -601,6 +602,15 @@ def test_a_changed_loader_line_is_named_and_a_missing_loader_names_the_file(tmp_
     # the real loader's glob and the lines after it match more, so the edited opener is named, not the appended block
     main.write_text(quoted + stock_opener + "\n$nrconf{verbosity} = 0;\n}\n")
     assert _reason(host) == f"/etc/needrestart/needrestart.conf line {opener} differs from the stock conf.d loader"
+
+    lines = STOCK_MAIN.splitlines()
+    # a line inserted inside the loader, after the glob or after the opener: the inserted line is named, not the
+    # unchanged loader line above it
+    glob_text = lines[glob_line - 1]
+    main.write_text(STOCK_MAIN.replace(glob_text, glob_text + "\nnext unless -r $fn;"))
+    assert _reason(host) == f"/etc/needrestart/needrestart.conf line {glob_line + 1} differs from the stock conf.d loader"
+    main.write_text(STOCK_MAIN.replace(stock_opener, stock_opener + "\n$nrconf{verbosity} = 0;"))
+    assert _reason(host) == f"/etc/needrestart/needrestart.conf line {opener + 1} differs from the stock conf.d loader"
 
     # the optional log line deleted: the line now in its place (the eval) is named, after the intact opener and glob
     lines = STOCK_MAIN.splitlines()

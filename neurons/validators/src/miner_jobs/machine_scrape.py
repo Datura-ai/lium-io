@@ -1,6 +1,7 @@
 from ctypes import *
 import sys
 import os
+import difflib
 import glob
 import http.client
 import json
@@ -854,29 +855,42 @@ def get_needrestart_guard(host_root="/proc/1/root"):
         # a recognisable loader that was changed: anchor on its opener, its conf.d glob or its $LOGPREF log line,
         # the only loader lines no other Perl block shares (eval/die are generic idioms a site loader also uses),
         # and name the first line that differs from there on, not only the file
-        # the anchor whose loader lines match most from its start wins (an exact opener in some other block matches
-        # only itself); ties go to the opener, then the glob. The log line names no directory, so it is a candidate
-        # only when a line just above it still names conf.d (a copied site.d loop is not this loader)
+        # every opener, glob or (below a conf.d line) log line is a candidate start; each is aligned line by line
+        # against the stock loader, inserted and deleted lines allowed, and the one with the most aligned lines wins
+        # (an exact opener in some other block aligns little); ties go to the opener, then the glob. The log line
+        # names no directory, so it is a candidate only when a line just above it still names conf.d
         conf_d_above = lambda i: any("/etc/needrestart/conf.d" in f for f in flat[max(i - 2, 0) : i])  # noqa: E731
-        matched = lambda i, j: sum(  # noqa: E731
-            0 <= i - j + k < len(flat) and flat[i - j + k] == loader[k] for k in range(len(loader))
-        )
         candidates = [
             (i, j) for j in (0, 1, 2) for i, f in enumerate(flat) if f == loader[j] and (j < 2 or conf_d_above(i))
         ]
         if not candidates:
             return unknowable(f"{main_path} has no stock conf.d loader")
-        i, j = min(candidates, key=lambda c: (-matched(*c), c[1], c[0]))
-        start = i - j
-        off = next(k for k in range(len(loader)) if not 0 <= start + k < len(flat) or flat[start + k] != loader[k])
-        if start + off >= len(flat):
-            return unknowable(f"{main_path} line {main[-1][0]} ends inside the conf.d loader")
-        bad = start + off
-        # anchored below the opener, the line in the opener's place is the (edited) opener only if it opens a block
-        # (a trailing comment allowed), however much its condition changed; a setting there means the opener is
-        # missing, and the line after it (the glob's place) is where the loader starts
-        if off == 0 and j and (start < 0 or not re.search(r"\{\s*(#.*)?$", flat[start])):
-            bad = max(start + 1, 0)
+
+        def aligned(i, j):  # window from the candidate's start, two spare lines for inserted ones; its matched runs
+            start = max(i - j, 0)
+            blocks = difflib.SequenceMatcher(None, loader, flat[start : i - j + len(loader) + 2], autojunk=False)
+            return start, blocks.get_matching_blocks()[:-1]
+
+        i, j = min(candidates, key=lambda c: (-sum(m.size for m in aligned(*c)[1]), c[1], c[0]))
+        start, runs = aligned(i, j)
+        first = runs[0]
+        if first.a:
+            # the first aligned line is below the opener: the line in the opener's place is the (edited) opener only
+            # if it opens a block (a trailing comment allowed), however much its condition changed; a setting there
+            # means the opener is missing, and the line after it is where the loader starts
+            top = start + first.b - first.a
+            if top >= 0 and re.search(r"\{\s*(#.*)?$", flat[top]):
+                bad = top
+            else:
+                bad = start + first.b if first.a == 1 else max(top + 1, 0)
+        else:
+            # the first line after an unbroken aligned run: an inserted line, or the line now in a deleted one's place
+            bad = next(
+                (start + m.b + m.size for m, n in zip(runs, runs[1:]) if (n.a, n.b) != (m.a + m.size, m.b + m.size)),
+                start + runs[-1].b + runs[-1].size,
+            )
+            if bad >= len(flat):
+                return unknowable(f"{main_path} line {main[-1][0]} ends inside the conf.d loader")
         return unknowable(f"{main_path} line {main[bad][0]} differs from the stock conf.d loader")
     if at + len(loader) != len(main):
         return unknowable(f"{main_path} line {main[at + len(loader)][0]} runs code after the conf.d loader")
