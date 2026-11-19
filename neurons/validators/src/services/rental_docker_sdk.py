@@ -132,6 +132,11 @@ class RentalDockerOperationError(RuntimeError):
     """Raised when Docker SDK reports a rental Docker operation failure."""
 
 
+class RentalPodBridgeGone(RentalDockerOperationError):
+    """The pod's own bridge was removed (another create's cleanup) after its egress drop was applied: the start is
+    refused, never made on a bridge the drop was not confirmed on (DAH-6737)."""
+
+
 class ContainerNameTakenOnRetry(RentalDockerOperationError):
     """A transport retry of `run_container` found the spec's name already held by a container on another image."""
 
@@ -1141,7 +1146,7 @@ class RentalDockerSdkClient:
             # fails this attempt, never comes back here as a bridge the drop was not confirmed on (DAH-6737)
             network = self._inspect_network_or_none(spec.network)
             if network is None:
-                raise RentalDockerOperationError(f"Docker network {spec.network} is gone since its egress drop was applied")
+                raise RentalPodBridgeGone(f"Docker network {spec.network} is gone since its egress drop was applied")
             _require_icc_off(spec.network, network)
         created = None
         adopted_id = self._adopt_container_by_name_sync(spec) if adopt_existing else None

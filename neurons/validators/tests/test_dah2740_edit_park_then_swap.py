@@ -381,9 +381,15 @@ async def test_a_failed_edit_restores_the_previous_container(svc, monkeypatch):
         # a recovery check's fenced stop froze it and may unpause it: it can resume without a start, still billed
         (True, "guard", True, "paused", "UnknownError"),
         (True, "ordinary", False, "running", "UnknownError"),
-        # an edit that failed on anything, whose undo's own guard was refused: down is down, not billed
-        (True, "ordinary", "guard", "down", "ExecutorUnreachable"),
+        # an edit that failed on anything, whose undo's own guard was refused: down is down, not billed, and our
+        # undo's refusal is not the host's fault
+        (True, "ordinary", "guard", "down", "PodDownNotHostFault"),
         (True, "ordinary", "guard", "running", "UnknownError"),
+        # the pod's bridge was removed by another create after its guard: the start is refused (ours, not the host's)
+        (False, "bridge", False, "down", "PodDownNotHostFault"),  # a balance-stopped pod's reboot: nothing runs
+        (True, "bridge", False, "down", "PodDownNotHostFault"),
+        (True, "bridge", False, "running", "UnknownError"),  # the original came back: still billed
+        (True, "bridge", False, "unreadable", "UnknownError"),
     ],
     ids=[
         "absent_guard",
@@ -396,6 +402,10 @@ async def test_a_failed_edit_restores_the_previous_container(svc, monkeypatch):
         "restored_ordinary",
         "ordinary_undo_guard_refused_down",
         "ordinary_undo_guard_refused_running",
+        "bridge_gone_absent",
+        "bridge_gone_down",
+        "bridge_gone_restored",
+        "bridge_gone_unreadable",
     ],
 )
 @pytest.mark.asyncio
@@ -413,8 +423,47 @@ async def test_a_reboot_the_guard_refused_is_a_host_fault_only_while_no_containe
     monkeypatch.setattr(
         svc, "_bring_up_existing_container", AsyncMock(side_effect=restore_error if restore_fails else None)
     )
-    exc = RentalEgressGuardRefused("not applied") if error == "guard" else RuntimeError("gocryptfs: EPERM")
+    from services.rental_docker_sdk import RentalPodBridgeGone
+
+    exc = {
+        "guard": RentalEgressGuardRefused("not applied"),
+        "bridge": RentalPodBridgeGone("Docker network lium-rentals-pod_x is gone since its egress drop was applied"),
+    }.get(error, RuntimeError("gocryptfs: EPERM"))
     monkeypatch.setattr(svc, "_run_rental_docker_create_with_port_retry", AsyncMock(side_effect=exc))
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == getattr(FailedContainerErrorCodes, code)
+
+
+@pytest.mark.parametrize(("undo", "after_undo", "code"), [
+    ("guard", "down", "PodDownNotHostFault"),
+    ("guard", "running", "ContainerVanished"),
+    ("ok", "down", "ContainerVanished"),
+], ids=["vanished_undo_guard_refused_down", "vanished_undo_guard_refused_running", "vanished_undo_ok"])
+@pytest.mark.asyncio
+async def test_a_vanished_replacement_never_masks_an_undo_guard_refusal_that_left_the_pod_down(
+    svc, monkeypatch, undo, after_undo, code
+):
+    # F-26 (DAH-6737 review): the replacement starts and is gone during bootstrap; the undo's guard is refused and
+    # Docker reports nothing of the pod running: not billed (PodDownNotHostFault), never ContainerVanished
+    from payload_models.payloads import FailedContainerErrorCodes
+    from services.docker_service import RentalEgressGuardRefused
+
+    payload = _edit_payload()
+    ssh = _ssh_recording(after_undo=after_undo)
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr(
+        svc,
+        "_bring_up_existing_container",
+        AsyncMock(side_effect=RentalEgressGuardRefused("undo not applied") if undo == "guard" else None),
+    )
+    monkeypatch.setattr(
+        svc, "install_open_ssh_server_and_start_ssh_service_with_rental_docker", AsyncMock(side_effect=RuntimeError("sshd"))
+    )
+    monkeypatch.setattr(svc, "_run_rental_docker_create_with_port_retry", AsyncMock(return_value="replacement-id"))
+    monkeypatch.setattr(svc, "cleanup_failed_container_creation", AsyncMock(return_value=True))  # it was gone
 
     result = await _run(svc, payload)
 

@@ -27,6 +27,7 @@ from services.rental_docker_sdk import (
     PortBinding,
     RentalDockerConnectionError,
     RentalDockerOperationError,
+    RentalPodBridgeGone,
     RentalDockerSdkClient,
     RentalDockerSdkClientFactory,
     VolumeMount,
@@ -799,7 +800,7 @@ async def test_run_container_never_creates_a_pods_own_bridge(present):
         await client.run_container(_rental_spec(network=pod_net))
         assert api_client.host_config_kwargs["network_mode"] == pod_net
     else:
-        with pytest.raises(RentalDockerOperationError, match="gone since its egress drop"):
+        with pytest.raises(RentalPodBridgeGone, match="gone since its egress drop"):
             await client.run_container(_rental_spec(network=pod_net))
         assert api_client.created_container is None and api_client.started == []
     assert api_client.created_networks == []

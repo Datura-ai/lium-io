@@ -822,6 +822,9 @@ class FailedContainerErrorCodes(enum.Enum):
     # DAH-2703: the container we created was gone from the host before creation finished — a
     # host-side reaper, not a container that failed on its own.
     ContainerVanished = "ContainerVanished"
+    # DAH-6737: our own step (the undo's egress guard, a pod bridge removed by another create) left no container
+    # of the pod running, as Docker reports it: not billed, and not the host's fault (no hold, no provider penalty)
+    PodDownNotHostFault = "PodDownNotHostFault"
 
 
 class FailedContainerErrorTypes(enum.Enum):

@@ -220,6 +220,7 @@ from services.rental_docker_sdk import (
     RentalDockerConnectionError,
     RentalDockerContainerRestartingError,
     RentalDockerOperationError,
+    RentalPodBridgeGone,
     RentalDockerSdkClient,
     RentalDockerSdkClientFactory,
     VolumeMount,
@@ -1235,6 +1236,32 @@ class RentalEgressGuardRefused(RuntimeError):
     original of the pod is running; ``pod_running`` is set by a start of an already running container."""
 
     pod_running = False
+
+
+def failed_create_error_code(
+    last_exc: BaseException | None,
+    *,
+    container_vanished: bool,
+    filler_refused: bool,
+    undo_guard_refused: bool,
+    pod_left_down: bool,
+) -> FailedContainerErrorCodes:
+    """The error code of a failed create, edit or reboot (DAH-6737). `pod_left_down`: Docker reported no container of
+    the pod running afterwards (nothing was there to restore counts as down); a running or unread pod stays billed.
+
+    Down after the host's egress guard refused the replacement: ExecutorUnreachable (the host cannot run the guard).
+    Down after our own step left it so (the undo's guard refused, or the pod's bridge removed by another create after
+    its guard): PodDownNotHostFault, not billed and not the host's, whatever the replacement failed on, a vanished
+    replacement included (F-26)."""
+    if pod_left_down and isinstance(last_exc, RentalEgressGuardRefused):
+        return FailedContainerErrorCodes.ExecutorUnreachable
+    if pod_left_down and (undo_guard_refused or isinstance(last_exc, RentalPodBridgeGone)):
+        return FailedContainerErrorCodes.PodDownNotHostFault
+    if container_vanished:
+        return FailedContainerErrorCodes.ContainerVanished
+    if filler_refused:
+        return FailedContainerErrorCodes.RentingInProgress
+    return FailedContainerErrorCodes.UnknownError
 
 
 def is_host_fault_create_failure(current_step: str | None, error: BaseException | None = None) -> bool:
@@ -2319,10 +2346,13 @@ class _EditSwap:
         finally:
             # after the parked container is gone or renamed back, never before
             await self._record_parked(False)
-            # read only where it decides the reply's code: a guard refusal (the replacement's or the undo's) is the one
-            # failure that can leave the pod down
-            guard_refused = isinstance(_last_attempt_exception(exc), RentalEgressGuardRefused) or self.undo_guard_refused
-            if guard_refused and not self.replacement_is_up:
+            # read only where it decides the reply's code: a guard refusal (the replacement's or the undo's) or the pod's
+            # bridge gone before its start are the failures of ours that can leave the pod down
+            ours_may_leave_it_down = (
+                isinstance(_last_attempt_exception(exc), (RentalEgressGuardRefused, RentalPodBridgeGone))
+                or self.undo_guard_refused
+            )
+            if ours_may_leave_it_down and not self.replacement_is_up:
                 self.pod_state_after_undo = await self._observed_pod_state()
 
     async def _observed_pod_state(self) -> str:
@@ -12535,20 +12565,12 @@ class DockerService:
                 ),
                 detail=failure_detail,
                 error_type=FailedContainerErrorTypes.ContainerCreationFailed,
-                error_code=(
-                    FailedContainerErrorCodes.ContainerVanished
-                    if container_vanished
-                    else FailedContainerErrorCodes.RentingInProgress
-                    if isinstance(e, _FillerRefusedForCustomerCreate)
-                    # refused before `docker run`, and Docker reports no container of the pod running: nothing of
-                    # it runs on the node (DAH-6737); one that runs, or a state that could not be read, stays billed
-                    else FailedContainerErrorCodes.ExecutorUnreachable
-                    if (
-                        isinstance(last_exc, RentalEgressGuardRefused)
-                        or (edit_swap is not None and edit_swap.undo_guard_refused)
-                    )
-                    and (edit_swap is None or edit_swap.pod_state_after_undo == "down")
-                    else FailedContainerErrorCodes.UnknownError
+                error_code=failed_create_error_code(
+                    last_exc,
+                    container_vanished=container_vanished,
+                    filler_refused=isinstance(e, _FillerRefusedForCustomerCreate),
+                    undo_guard_refused=edit_swap is not None and edit_swap.undo_guard_refused,
+                    pod_left_down=edit_swap is None or edit_swap.pod_state_after_undo == "down",
                 ),
                 failure_step=current_step,
                 volume_encryption_status=(
