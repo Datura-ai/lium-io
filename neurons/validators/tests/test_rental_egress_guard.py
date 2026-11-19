@@ -15,10 +15,10 @@ from services.task.checks.rental_egress_guard import (
     CHAINS,
     LINK_LOCAL_CIDR,
     RentalEgressGuardCheck,
+    helper_command,
     legacy_bridge_inventory,
     legacy_network_ids,
     link_local_cleanup_script,
-    helper_command,
     link_local_drop_script,
     locked_script,
     rental_bridge,
@@ -28,7 +28,6 @@ from services.task.pipeline_factory import (
     _RENTAL_EGRESS_GUARD_RENTED,
     PipelineFactory,
 )
-
 
 NET_ID = "0123456789abcdef" * 4
 LEGACY_NET_ID = "fedcba9876543210" * 4
@@ -124,10 +123,10 @@ async def test_applies_the_drop_in_the_hosts_namespaces_without_any_image(contex
     assert result.passed is True
     assert result.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
     [helper] = _helper_calls(ssh)
-    assert helper.startswith(f"{rental_egress_guard.ROOT_REQUIRED}; HOST_NS={shlex.quote(rental_egress_guard.HOST_NS)} exec timeout ")
-    # no container: a registry refusing an anonymous pull (Docker Hub's rate limit) can never leave a node unguarded
-    assert not any("docker run" in call or "docker pull" in call for call in ssh.calls)
-    assert helper.endswith(helper_command(link_local_drop_script("br-0123456789ab", [])))
+    root = f"HOST_NS={shlex.quote(rental_egress_guard.HOST_NS)} " + helper_command(link_local_drop_script("br-0123456789ab", []))
+    assert helper.startswith('if [ "$(id -u)" != 0 ]; then exec /usr/bin/docker run ') and helper.endswith(f"; fi; {root}")
+    # no container on a root executor: a registry refusing an anonymous pull (Docker Hub's rate limit) never matters
+    assert not any("docker run" in call or "docker pull" in call for call in ssh.calls if call != helper)
 
 
 @pytest.mark.asyncio
@@ -843,21 +842,60 @@ async def test_an_unreadable_pod_bridge_list_leaves_the_rules_as_they_are():
     assert not _helper_calls(ssh)
 
 
-def test_an_executor_not_running_as_root_is_refused_with_that_cause(tmp_path):
-    # DAH-6737: the host lock, nsenter and iptables need root; a non-root executor gets its cause, not a path error
+# dockerd as a non-root executor reaches it: records the run, then runs the command after the image as the container would
+_DOCKER_STUB = r"""#!/bin/sh
+printf '%s\n' "$*" >> "$STATE/docker_run"
+while [ "$1" != "docker.io/library/alpine:3.19" ]; do shift; done; shift
+exec "$@"
+"""
+
+
+@pytest.mark.parametrize("script", ["apply", "cleanup"])
+def test_an_executor_not_running_as_root_gets_the_guard_through_the_privileged_helper(tmp_path, monkeypatch, script):
+    # DAH-6737: the host lock, nsenter and iptables need root; a non-root executor reaches dockerd, so the same script
+    # runs in the validator's alpine helper, privileged with the host's PIDs, and still uses only the host's iptables
+    bin_dir, state = tmp_path / "bin", tmp_path / "state"
+    bin_dir.mkdir()
+    state.mkdir()
+    for name, body in (
+        ("iptables-nft", _IPTABLES_STUB),
+        ("iptables-legacy", _IPTABLES_STUB),
+        ("nsenter", _HOST_NSENTER_STUB),
+        ("id", '#!/bin/sh\n[ "$1" = -u ] && echo 1000 || echo provider\n'),
+        ("docker", _DOCKER_STUB),
+    ):
+        (bin_dir / name).write_text(body)
+        (bin_dir / name).chmod(0o755)
+    (state / "DOCKER-USER").write_text("RETURN\n")
+    body = link_local_drop_script("br-0123456789ab", []) if script == "apply" else link_local_cleanup_script()
+    monkeypatch.setattr(rental_egress_guard, "HOST_LOCK", str(tmp_path / "lock" / "apply.lock"))
+    command = rental_egress_guard._helper(body).replace("/usr/bin/docker", str(bin_dir / "docker"))
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "STATE": str(state)}
+
+    done = subprocess.run(["sh", "-c", command], env=env, capture_output=True, text=True)
+
+    assert done.returncode == 0, done.stderr
+    [run] = (state / "docker_run").read_text().splitlines()
+    assert run.startswith("run --rm --privileged --pid=host --network host docker.io/library/alpine:3.19 /bin/sh -c ")
+    assert set((state / "host_exec").read_text().split()) == {"iptables-nft"}
+    if script == "apply":
+        [(_, rules)] = _jumps_and_rules(state)
+        assert rules == [f"-i br-0123456789ab -d {LINK_LOCAL_CIDR} -p {p} ! --dport 53 -j DROP" for p in ("tcp", "udp")]
+
+
+def test_a_root_executor_runs_no_container(tmp_path, monkeypatch):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    (bin_dir / "id").write_text('#!/bin/sh\n[ "$1" = -u ] && echo 1000 || echo provider\n')
+    (bin_dir / "id").write_text('#!/bin/sh\n[ "$1" = -u ] && echo 0 || echo root\n')
     (bin_dir / "id").chmod(0o755)
+    monkeypatch.setattr(rental_egress_guard, "HOST_LOCK", str(tmp_path / "lock" / "apply.lock"))
+    command = rental_egress_guard._helper("touch ran").replace("/usr/bin/docker", "false")
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
 
-    done = subprocess.run(
-        ["sh", "-c", rental_egress_guard._helper("touch should-not-run")], env=env, capture_output=True, text=True,
-        cwd=tmp_path,
-    )
+    done = subprocess.run(["sh", "-c", command], env=env, capture_output=True, text=True, cwd=tmp_path)
 
-    assert done.returncode == 6 and "runs as user provider, not root" in done.stderr
-    assert not (tmp_path / "should-not-run").exists()
+    assert done.returncode == 0, done.stderr
+    assert (tmp_path / "ran").exists()
 
 
 @pytest.mark.parametrize("script", ["apply", "cleanup"])

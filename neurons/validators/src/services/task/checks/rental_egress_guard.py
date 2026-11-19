@@ -4,7 +4,8 @@ Builds drop egress to blocked ranges through host DOCKER-USER rules (``docker_se
 This check applies the same kind of rule for rentals with the host's own iptables in the host's namespaces
 (``nsenter -t 1 -m -n -r``; the executor runs privileged with ``pid: host``), so it needs no image and no registry.
 The shell, lock and time bound are the executor's: only iptables runs in the host root, which may have no ``/bin/sh``
-or ``timeout``. Traffic entering from the ``lium-rentals``
+or ``timeout``. An executor not running as root runs the same script in the validator's alpine helper container,
+privileged with the host's PIDs, through the dockerd it already uses. Traffic entering from the ``lium-rentals``
 bridge, and from every running rental on another network (its own bridge since DAH-6737, or the
 default bridge of a legacy pod that was never moved), to link-local 169.254/16 is dropped, except DNS (port 53), because a rental
 container's embedded resolver forwards from the container's network namespace and some hosts use
@@ -35,6 +36,7 @@ import re
 import shlex
 import time
 
+from core.docker_utils import ALPINE_HELPER_IMAGE
 from services.const import LEGACY_LIUM_CONTAINER_NAME
 from services.rental_docker_sdk import POD_NETWORK_LABEL, RENTAL_NETWORK_NAME
 
@@ -238,18 +240,18 @@ def helper_command(script: str) -> str:
 
 
 def _helper(script: str) -> str:
-    # No helper container, so no image pull that a registry (Docker Hub's anonymous rate limit) can refuse. The shell,
-    # flock and timeout are the executor image's; only iptables resolves in the host root, the one binary dockerd
-    # itself needs there
-    return f"{ROOT_REQUIRED}; HOST_NS={shlex.quote(HOST_NS)} {helper_command(script)}"
+    # No helper container on the shipped executor, so no image pull that a registry (Docker Hub's anonymous rate limit)
+    # can refuse. The shell, flock and timeout are the executor image's; only iptables resolves in the host root, the one
+    # binary dockerd itself needs there
+    inner = f"HOST_NS={shlex.quote(HOST_NS)} {helper_command(script)}"
+    return f'if [ "$(id -u)" != 0 ]; then exec {NON_ROOT_HELPER} /bin/sh -c {shlex.quote(inner)}; fi; {inner}'
 
 
-# The host lock, nsenter and iptables all need root: an executor running as another user (not the shipped privileged
-# container) is refused with that cause instead of the first failing path (DAH-6737).
-ROOT_REQUIRED = (
-    '[ "$(id -u)" = 0 ] || { echo "the executor runs as user $(id -un), not root: the rental network guard needs '
-    'the executor\'s standard privileged setup" >&2; exit 6; }'
-)
+# An executor running as another user (not the shipped privileged container) cannot take the host lock, nsenter or run
+# iptables itself, but it reaches dockerd, which runs as root: the same script runs in the alpine helper the validator
+# already uses on every node, privileged with the host's PIDs, so it reaches the same host lock and the host's own
+# iptables through PID 1 (DAH-6737). busybox there has sh, flock, timeout and nsenter.
+NON_ROOT_HELPER = f"/usr/bin/docker run --rm --privileged --pid=host --network host {ALPINE_HELPER_IMAGE}"
 
 
 class RentalEgressGuardCheck:
