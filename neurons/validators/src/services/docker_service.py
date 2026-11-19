@@ -14861,8 +14861,9 @@ class DockerService:
             kind=GPU_RESET_PENDING_KIND,
             operate=operate,
             after=mark_recent,
+            # a reset that timed out or lost its session may have stopped the pod: not known
             failed=lambda detail: GpuResetReport(
-                ok=False, error_code=GpuResetErrorCode.ExecutorUnreachable, detail=detail
+                ok=False, error_code=GpuResetErrorCode.ExecutorUnreachable, detail=detail, stop_sent=None
             ),
             gpu_uuids=payload.gpu_uuids,
         )
@@ -14888,6 +14889,7 @@ class DockerService:
             container_restarted=report.container_restarted,
             gpus=report.gpus,
             detail=report.detail,
+            pod_stopped=report.stop_sent,
         )
 
     async def lock_pod_gpu_clocks(

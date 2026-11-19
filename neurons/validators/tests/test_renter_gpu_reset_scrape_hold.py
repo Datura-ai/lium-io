@@ -550,6 +550,26 @@ async def test_a_container_that_did_not_start_goes_with_no_code_until_the_backen
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stopped", [True, False, None])
+async def test_the_answer_says_whether_the_reset_stopped_the_pod(stopped):
+    # DAH-6741: a refusal before the stop has container_restarted false on a pod that still runs
+    connection = MagicMock(__aenter__=AsyncMock(), __aexit__=AsyncMock(return_value=False))
+    report = GpuResetReport(ok=False, error_code=GpuResetErrorCode.GpuInUseOutsidePod, stop_sent=stopped)
+
+    with patch("services.docker_service.reset_pod_gpus", AsyncMock(return_value=report)):
+        result = await _run_reset(_redis_service(), return_value=connection)
+
+    assert (result.pod_stopped, result.container_restarted) == (stopped, False)
+
+
+@pytest.mark.asyncio
+async def test_a_reset_whose_session_failed_does_not_say_the_pod_was_not_stopped():
+    result = await _run_reset(_redis_service(), side_effect=OSError("dropped"))
+
+    assert result.error_code == GpuResetErrorCode.ExecutorUnreachable and result.pod_stopped is None
+
+
+@pytest.mark.asyncio
 async def test_the_reset_leaves_a_recent_mark_when_its_pending_mark_goes():
     service = _redis_service()
     connection = MagicMock(__aenter__=AsyncMock(), __aexit__=AsyncMock(return_value=False))

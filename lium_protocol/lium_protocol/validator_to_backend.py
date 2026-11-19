@@ -596,6 +596,9 @@ class PodGpuResetResult(PodContainerResponse):
     container_restarted: bool = False
     gpus: list[GpuResetOutcome] = []
     detail: str | None = None
+    # 2.17.0: the reset sent `docker stop` to the pod's container. False: a refusal before the stop, the container
+    # was never touched and runs as before (container_restarted is then false too). None: a validator before 2.17.0
+    pod_stopped: bool | None = None
 
 
 class GpuClockOutcome(pydantic.BaseModel):

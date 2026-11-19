@@ -96,16 +96,20 @@ def device_holders_command(bus_ids: list[str]) -> str:
 
     The driver refuses `nvidia-smi -r` while any process has the GPU open: a graphics (Xorg) or monitoring one
     too, which the compute-app listing never shows. The minor comes from the driver's own per-bus file; a GPU
-    without a "gpu" line was not read (no minor, no find), so its holders are unknown."""
+    without a "gpu" line was not read whole (no minor, or find failed), so its holders are unknown. The one find
+    error that leaves the reading whole is a process that exited mid-scan (No such file or directory)."""
     buses = " ".join(shlex.quote(_proc_bus(bus)) for bus in bus_ids)
     return (
-        "command -v find >/dev/null || exit 3; "
+        "command -v find >/dev/null && command -v grep >/dev/null || exit 3; "
+        "d=$(mktemp -d) || exit 3; trap 'rm -rf \"$d\"' EXIT; "
         's=" "; p=$$; while [ -n "$p" ] && [ "$p" -gt 1 ]; do '
         's="$s$p "; p=$(sed -n \'s/^PPid:[[:space:]]*//p\' /proc/$p/status 2>/dev/null); done; '
         f"for b in {buses}; do "
         "m=$(sed -n 's/^Device Minor:[[:space:]]*//p' /proc/driver/nvidia/gpus/$b/information 2>/dev/null); "
-        '[ -n "$m" ] || continue; echo "gpu $b"; find /proc/[0-9]*/fd -lname "/dev/nvidia$m" 2>/dev/null '
-        "| cut -d/ -f3; done | sort -u | while read k v; do "
+        '[ -n "$m" ] || continue; LC_ALL=C find /proc/[0-9]*/fd -lname "/dev/nvidia$m" >"$d/o" 2>"$d/e"; r=$?; '
+        'cut -d/ -f3 "$d/o"; if [ "$r" = 0 ] || { [ -s "$d/e" ] && '
+        '! grep -qv "No such file or directory" "$d/e"; }; then echo "gpu $b"; fi; '
+        "done | sort -u | while read k v; do "
         'if [ "$k" = gpu ]; then echo "gpu $v"; else case "$s" in *" $k "*) ;; '
         "*) printf '%s %s\\n' \"$k\" \"$(cat /proc/$k/comm 2>/dev/null)\";; esac; fi; done"
     )
@@ -202,6 +206,9 @@ class GpuResetReport:
     detail: str | None = None
     # docker stop ran: the pod's GPUs may drop out until the driver brings them back
     pod_stopped: bool = False
+    # docker stop was sent, even one that then failed. False: a refusal before the stop, the container was never
+    # touched (the wire's pod_stopped, DAH-6741). None: not known (the reset timed out or its session dropped)
+    stop_sent: bool | None = False
 
 
 @dataclass(frozen=True)
@@ -818,6 +825,7 @@ async def reset_pod_gpus(
             )
             return report
     stop_failed = False
+    report.stop_sent = True
     try:
         stopped = await _run(
             runner, f"{DOCKER} stop -t {STOP_GRACE_SECONDS} {shlex.quote(container_name)}", timeout=60

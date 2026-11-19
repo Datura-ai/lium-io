@@ -4600,6 +4600,18 @@
           "title": "Pod Id",
           "type": "string"
         },
+        "pod_stopped": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pod Stopped"
+        },
         "queue_depth": {
           "anyOf": [
             {
