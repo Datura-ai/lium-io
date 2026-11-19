@@ -281,6 +281,8 @@ jobs:
         run: echo "::error::a package test job or ruff failed (see tests-ok)" && exit 1
       - name: deferred to the merge queue
         if: github.event_name != 'merge_group' && vars.MERGE_QUEUE_ENABLED == 'true'
+        # no checkout on this path, so the job's e2e default directory does not exist
+        working-directory: ${{ github.workspace }}
         run: echo "e2e gate runs in the merge queue for this tree"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         if: (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
