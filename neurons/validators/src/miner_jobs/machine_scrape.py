@@ -1408,7 +1408,14 @@ def get_docker_info(content: bytes):
                     if in_container:
                         data["docker_container_id"] = container_id
 
-            container_entry = {'each_container_id': container_id, 'each_digest': digest or '', "each_name": container_name}
+            # the image repository the container runs, which names a Lium filler's workload
+            repository = repo_digests[0].split('@')[0] if repo_digests else ''
+            container_entry = {
+                'each_container_id': container_id,
+                'each_digest': digest or '',
+                "each_name": container_name,
+                'each_repository': repository,
+            }
             cpu_percent = cpu_percents.get(container_id[:12])
             if cpu_percent is not None:
                 container_entry['each_cpu_percent'] = cpu_percent
