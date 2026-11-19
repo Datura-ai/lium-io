@@ -16,12 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
 
 import pytest
-from payload_models.payloads import (
-    ContainerCreated,
-    ContainerWarningCode,
-    FailedContainerErrorCodes,
-    FailedContainerRequest,
-)
+from payload_models.payloads import ContainerCreated, ContainerWarningCode, FailedContainerRequest
 from test_deploy_optimizations import _executor_info, _patch_happy, _payload, _ssh_result
 
 from core.docker_utils import DockerCommand
@@ -34,7 +29,6 @@ from services.docker_service import (
     create_steps_after_reply,
     executor_key,
     inflight_creates,
-    wire_failed_create_error_code,
 )
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS
 from services.hung_gpu_reset import HUNG_GPU_QUERY_COMMAND, HungGpuResult
@@ -458,9 +452,7 @@ async def test_a_reboot_the_guard_refused_is_a_host_fault_only_while_no_containe
     result = await _run(svc, payload)
 
     assert isinstance(result, FailedContainerRequest)
-    # the decision is `code`; the wire carries what a protocol 2.16.0 backend parses (PodDownNotHostFault goes out as
-    # ExecutorUnreachable until lium-platform accepts 2.20.0)
-    assert result.error_code == wire_failed_create_error_code(getattr(FailedContainerErrorCodes, code))
+    assert result.error_code == getattr(FailedContainerErrorCodes, code)
     from services.redis_service import RENTAL_PROBE_FAILED_PREFIX
 
     held = [c for c in svc.redis_service.set.await_args_list if str(c.args[0]).startswith(RENTAL_PROBE_FAILED_PREFIX)]
@@ -502,9 +494,7 @@ async def test_a_vanished_replacement_never_masks_an_undo_guard_refusal_that_lef
     result = await _run(svc, payload)
 
     assert isinstance(result, FailedContainerRequest)
-    # the decision is `code`; the wire carries what a protocol 2.16.0 backend parses (PodDownNotHostFault goes out as
-    # ExecutorUnreachable until lium-platform accepts 2.20.0)
-    assert result.error_code == wire_failed_create_error_code(getattr(FailedContainerErrorCodes, code))
+    assert result.error_code == getattr(FailedContainerErrorCodes, code)
 
 
 @pytest.mark.parametrize(
@@ -1958,31 +1948,3 @@ def test_the_mount_read_runs_in_a_real_shell(pid, path, out):
     done = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
 
     assert (done.stdout.strip() if done.returncode == 0 else None) == out
-
-
-# lium-platform 445efa786 vendors protocol 2.16.0 (tag lium-protocol-v2.16.0): the FailedContainerErrorCodes it parses.
-# A code outside this set makes it reject the whole failure frame, and the pod stays billed.
-PROTOCOL_2_16_FAILED_CODES = {
-    "UnknownError", "NoSshKeys", "ContainerNotRunning", "DeletionInProgress", "NoPortMappings", "InvalidExecutorId",
-    "ExceptionError", "FailedMsgFromMiner", "RentingInProgress", "NoJupyterPortMapping", "AttestationError",
-    "ContainerVanished", "ExecutorUnreachable",
-}
-
-
-@pytest.mark.parametrize(
-    ("backend", "parses"),
-    [
-        ("2.16.0 (production backend)", PROTOCOL_2_16_FAILED_CODES),
-        ("2.20.0", {c.value for c in FailedContainerErrorCodes}),
-    ],
-)
-@pytest.mark.parametrize("code", list(FailedContainerErrorCodes))
-def test_every_failed_create_code_on_the_wire_is_one_the_backend_parses(backend, parses, code):
-    # review on lium-io#2352: PodDownNotHostFault is 2.20.0; until lium-platform accepts it the pod-down case goes out
-    # as ExecutorUnreachable, the 2.16.0 code that stops the renter's billing (and counts as a host fault there)
-    wire = wire_failed_create_error_code(code)
-    assert wire.value in parses
-    if code == FailedContainerErrorCodes.PodDownNotHostFault:
-        assert wire == FailedContainerErrorCodes.ExecutorUnreachable
-    else:
-        assert wire == code
