@@ -255,12 +255,13 @@ async def _judge_card_faults(
         f: _held_fault_proof(f, gpus, every_card_named, rebooted, before, log_seen, reset_clean) for f in before.held
     }
     held = [f for f, proof in proofs.items() if proof is None]
-    # one fault per card, this read's first: a card repeating an Xid must not grow the stored state
+    # one fault per card, the newest: the kernel log lists a read's Xids oldest first, after the held ones;
+    # a card repeating an Xid must not grow the stored state
     fault_by_card: dict[str, str] = {}
-    for fault in xid_faults + held:
+    for fault in held + xid_faults:
         uuid = _card_uuid(fault)
         if uuid is not None:
-            fault_by_card.setdefault(uuid, fault)
+            fault_by_card[uuid] = fault
     report["card_faults"] = list(fault_by_card.values())
     if before.held or xid_faults or pre_reset:
         what = {
