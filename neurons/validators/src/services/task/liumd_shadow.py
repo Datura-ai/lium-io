@@ -552,8 +552,10 @@ NOT_COMPARABLE_SPEC_PATHS = frozenset(
         "hard_disk.free",
         "hard_disk.utilization",
         "hard_disk.engy_cache_used_gb",
+        "hard_disk.images",
         "hard_disk.containers",
         "hard_disk.volumes",
+        "docker.containers",
     }
 )
 LIVE_GPU_DETAIL_FIELDS = frozenset(
@@ -564,6 +566,10 @@ LIVE_GPU_DETAIL_FIELDS = frozenset(
         "memory_used_mb",
         "graphics_speed",
         "memory_speed",
+        "power_limit",
+        "pcie",
+        "speed_pcie",
+        "clocks_event_reasons",
     }
 )
 LIVE_DOCKER_CONTAINER_FIELDS = frozenset({"cpu_percent", "net_rx_bytes", "net_tx_bytes"})
