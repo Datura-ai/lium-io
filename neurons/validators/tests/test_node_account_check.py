@@ -21,7 +21,7 @@ IP_A, IP_B = "127.0.0.1", "127.0.0.2"
 REFUSED_IDLE = {
     "node_account_passed": False,
     "clear_verified_job_info": True,
-    "clear_verified_job_evidence": {"unrented_only": True},
+    "clear_verified_job_unrented_only": True,
 }
 HOST_KEYS_SCRIPT = Path(__file__).resolve().parents[2] / "executor" / "ssh_host_keys.sh"
 
@@ -382,4 +382,4 @@ async def test_a_dropped_session_during_the_account_read_is_reconnected_through_
     assert end.node_account_passed is account_passed
     assert end.clear_verified_job_info is (not account_passed and not rented)
     if end.clear_verified_job_info:
-        assert end.clear_verified_job_evidence["unrented_only"] is True
+        assert end.clear_verified_job_unrented_only is True

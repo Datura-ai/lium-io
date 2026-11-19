@@ -306,7 +306,7 @@ class RentalVerificationCheck:
                         "clear_verified_job_info": True,
                         # the backend runs the failing container check only on a node it saw unrented: a rental
                         # placed since keeps its node, the reset applies only while no customer pod runs there
-                        "clear_verified_job_evidence": {"unrented_only": True},
+                        "clear_verified_job_unrented_only": True,
                     },
                 )
             elif (response.error or "").endswith("visible: []"):

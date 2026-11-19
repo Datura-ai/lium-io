@@ -327,6 +327,9 @@ class ResetVerifiedJobRequest(BaseValidatorRequest):
     reason_code: str | None = None
     check_id: str | None = None
     evidence: ResetVerifiedJobEvidence | None = None
+    # DAH-6784: the reset is for an idle node only; the backend applies it only while no customer pod runs there.
+    # Its own field so an evidence cut cannot drop it; an older backend ignores it.
+    unrented_only: bool = False
 
 
 class DuplicateExecutorsRequest(BaseValidatorRequest):

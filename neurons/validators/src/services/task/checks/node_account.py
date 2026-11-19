@@ -126,7 +126,7 @@ def _refused(ctx: Context, check_id: str, template, what: dict) -> CheckResult:
             "clear_verified_job_info": True,
             # has_live_rental reads a snapshot: a rental placed since must not be ended, so the backend applies this
             # reset only while no customer pod runs on the node, under its row lock
-            "clear_verified_job_evidence": {"unrented_only": True},
+            "clear_verified_job_unrented_only": True,
         },
         fatal=True,
     )

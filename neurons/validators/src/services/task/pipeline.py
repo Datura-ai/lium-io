@@ -315,6 +315,10 @@ class Context(BaseModel):
     # carries the evidence (lium-platform DAH-3385). The pipeline fills reason_code/check_id from the event when
     # the check did not set it itself.
     clear_verified_job_evidence: dict[str, Any] | None = None
+    # DAH-6784: the check that cleared the verified job meant it for an idle node only (it leaves rented nodes
+    # alone, judged from rental reads older than the reset). Sent as its own field, not in the evidence the backend
+    # may cut, and applied there only while no customer pod runs on the node. Set afresh by every clearing check.
+    clear_verified_job_unrented_only: bool = False
     # Set by GpuFingerprintCheck when the node lists a full set of other GPUs (full_set_changed): ResultHandler
     # makes this cycle's set the anchor.
     gpu_reanchor: bool = False
@@ -519,6 +523,8 @@ def updates_with_clear_verified_job_evidence(res: CheckResult, check_id: str) ->
     evidence.setdefault("reason_code", res.event.reason_code)
     evidence.setdefault("check_id", res.event.check_id or check_id)
     updates["clear_verified_job_evidence"] = evidence
+    # a later clearing check never inherits an earlier one's idle-only mark
+    updates["clear_verified_job_unrented_only"] = updates.get("clear_verified_job_unrented_only") is True
     return updates
 
 

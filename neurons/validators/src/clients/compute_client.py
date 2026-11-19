@@ -616,6 +616,7 @@ class ComputeClient:
                             reason_code=data.get("reason_code"),
                             check_id=data.get("check_id"),
                             evidence=data.get("evidence"),
+                            unrented_only=data.get("unrented_only") is True,
                         )
 
                         async with self.lock:

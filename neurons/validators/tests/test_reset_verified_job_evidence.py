@@ -49,3 +49,52 @@ async def test_the_reset_carries_the_address_and_cycle_this_check_ran_in(context
         "executor_port": ctx.executor.port,
         "job_batch_id": ctx.config.job_batch_id,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unrented_only", [True, False])
+async def test_an_idle_only_reset_travels_as_its_own_field_not_in_the_evidence(context_factory, unrented_only):
+    # DAH-6784: the backend may cut an oversized evidence to its keys; the idle-only mark must not ride in it
+    from services.redis_service import RedisService
+
+    redis = AsyncMock()
+    ctx = context_factory(state=build_state()).model_copy(
+        update={
+            "clear_verified_job_info": True,
+            "clear_verified_job_evidence": {"reason_code": "NODE_ACCOUNT_MISMATCH", "container_logs": "x" * 8192},
+            "clear_verified_job_unrented_only": unrented_only,
+        }
+    )
+    await ResultHandler(redis_service=redis, dry_run=False)._persist_verification_data(
+        "miner-hotkey", "executor-123", {"count": 7, "failed": 0, "spec": "s", "uuids": "GPU-a"}, ctx, success=False
+    )
+    kwargs = redis.clear_verified_job_info.await_args.kwargs
+    assert kwargs["unrented_only"] is unrented_only
+
+    service = object.__new__(RedisService)
+    service.hset, service.publish = AsyncMock(), AsyncMock()
+    await RedisService.clear_verified_job_info(service, "miner-hotkey", "executor-123", **{
+        k: kwargs[k] for k in ("prev_info", "reason", "evidence", "unrented_only")
+    })
+    published = service.publish.await_args.args[1]
+    assert published["unrented_only"] is unrented_only
+    assert "unrented_only" not in published["evidence"]
+
+
+def test_a_later_clearing_check_never_inherits_an_idle_only_mark():
+    # the pipeline copies each check's updates onto the context: a clearing check without the mark resets it to False
+    from datetime import UTC, datetime
+
+    from services.task.models import ValidationEvent
+    from services.task.pipeline import CheckResult, updates_with_clear_verified_job_evidence
+
+    event = ValidationEvent(
+        event="banned", reason_code="GPU_BANNED", severity="error", impact="", check_id="gpu.validate.banned",
+        when=datetime.now(UTC),
+    )
+    plain = CheckResult(passed=False, event=event, updates={"clear_verified_job_info": True})
+    marked = CheckResult(
+        passed=False, event=event, updates={"clear_verified_job_info": True, "clear_verified_job_unrented_only": True}
+    )
+    assert updates_with_clear_verified_job_evidence(plain, "x")["clear_verified_job_unrented_only"] is False
+    assert updates_with_clear_verified_job_evidence(marked, "x")["clear_verified_job_unrented_only"] is True

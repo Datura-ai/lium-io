@@ -321,7 +321,7 @@ async def test_rental_verification_nvml_mismatch_clears_verified_job_info():
     assert result.updates["clear_verified_job_info"] is True
     assert "clear_verified_job_reason" not in result.updates
     # judged on a node the backend saw unrented: idle-only, so a rental placed since keeps its node
-    assert result.updates["clear_verified_job_evidence"] == {"unrented_only": True}
+    assert result.updates["clear_verified_job_unrented_only"] is True
 
 
 @pytest.mark.asyncio
