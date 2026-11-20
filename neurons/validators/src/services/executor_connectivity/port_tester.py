@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import socket
 import statistics
 import time
 
@@ -7,6 +8,7 @@ import aiohttp
 
 from core.utils import _m, get_extra_info
 from services.executor_connectivity.models import PortPair
+from services.node_host import public_host_connector
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +18,29 @@ logger = logging.getLogger(__name__)
 PROBE_TIMEOUT = aiohttp.ClientTimeout(sock_connect=3, sock_read=3)
 # a node's answer is "<token>:<port>"; reading more than this lets a node grow the validator's memory
 PROBE_BODY_LIMIT = 256
+# What a probe socket holds before the probe reads it: the kernel takes at most this much of an answer off the wire (a
+# node can send no more until the probe reads), and the client parser pauses the socket once a few hundred bytes wait
+PROBE_RECEIVE_BUFFER = 4096
+# the answer's headers stay small too (aiohttp's defaults let one answer's headers reach about a megabyte)
+PROBE_ANSWER_LIMITS = {
+    "read_bufsize": PROBE_BODY_LIMIT + 1,
+    "max_line_size": 1024,
+    "max_field_size": 1024,
+    "max_headers": 32,
+}
+
+
+def _probe_socket(addr_info) -> socket.socket:
+    family, type_, proto, _, _ = addr_info
+    sock = socket.socket(family=family, type=type_, proto=proto)
+    # set before connect, so the receive window the node sees is this small from the first packet
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, PROBE_RECEIVE_BUFFER)
+    return sock
+
+
+def probe_connector(**kwargs) -> aiohttp.TCPConnector:
+    """The connector for port probes: the node-address rule of public_host_connector, on small receive buffers."""
+    return public_host_connector(socket_factory=_probe_socket, **kwargs)
 
 
 class PortTester:
@@ -28,8 +53,15 @@ class PortTester:
 
         try:
             # the node answers its own address only: a redirect would point the probe somewhere else. The answer is
-            # never decompressed, so the cap counts the bytes the node sent, not what a compressed body expands to
-            async with session.get(url, timeout=PROBE_TIMEOUT, allow_redirects=False, auto_decompress=False) as resp:
+            # asked for and read uncompressed, so the cap counts the bytes the node sent
+            async with session.get(
+                url,
+                timeout=PROBE_TIMEOUT,
+                allow_redirects=False,
+                auto_decompress=False,
+                headers={"Accept-Encoding": "identity"},
+                **PROBE_ANSWER_LIMITS,
+            ) as resp:
                 body = b""
                 while len(body) <= PROBE_BODY_LIMIT:
                     chunk = await resp.content.read(PROBE_BODY_LIMIT + 1 - len(body))
