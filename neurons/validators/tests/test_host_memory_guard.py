@@ -284,6 +284,41 @@ def test_host_without_systemd_sums_system_slice_itself(tmp_path):
     assert _read(tmp_path / "cg/system.slice/memory.min") == EX + sshd
 
 
+def test_executor_path_with_a_space_gets_memory_min_with_its_parent(tmp_path):
+    run = _run_memory_min(tmp_path, "/tenant/executor one")
+
+    first, second = parse_guard_output(run()), parse_guard_output(run())
+
+    root = tmp_path / "cg"
+    assert _read(root / "tenant/executor one/memory.min") == EX
+    assert _read(root / "tenant/memory.min") == EX
+    assert first["failed"] == [] and second["set"] == []
+
+
+@pytest.mark.parametrize("existing", [2048 * MIB, 4096 * MIB, "max"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_host_without_systemd_counts_a_larger_existing_service_reservation_in_its_parents(tmp_path, existing, nested):
+    """A sibling service's existing memory.min adds to the parent's; on a service holding the executor it is the
+    whole subtree's, so it only raises that cgroup. Either way a repeat run changes nothing."""
+    executor = "/host/containerd/executor" if nested else "/host/executor"
+    run = _run_memory_min(tmp_path, executor, systemd=False, procs=(("containerd", "/host/containerd"),))
+    (tmp_path / "cg/host/containerd/memory.min").write_text(f"{existing}\n")
+
+    first, second = run(), run()
+
+    root, own = tmp_path / "cg", UNIT_MEMORY_MIN_MIB["containerd.service"] * MIB
+    assert _read(root / executor.lstrip("/") / "memory.min") == EX
+    if existing == "max":
+        assert (root / "host/memory.min").read_text().strip() == "max"
+    elif nested:
+        assert _read(root / "host/containerd/memory.min") == max(existing, own + EX)
+        assert _read(root / "host/memory.min") == max(existing, own + EX)
+    else:
+        assert _read(root / "host/containerd/memory.min") == existing
+        assert _read(root / "host/memory.min") == existing + EX
+    assert parse_guard_output(second)["set"] == [], first
+
+
 @pytest.mark.asyncio
 async def test_unapplied_settings_log_a_warning_with_the_node_and_reason(caplog):
     async def run(*args, **kwargs):

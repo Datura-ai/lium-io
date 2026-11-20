@@ -52,14 +52,20 @@ def _host_memory_min_script() -> str:
         'set_cg_min() { f="/sys/fs/cgroup$1/memory.min"; c=$(cat "$f" 2>/dev/null); '
         '{ [ "$c" = max ] || [ "$c" -ge "$2" ]; } 2>/dev/null && return; '
         '{ echo "$2" > "$f"; } 2>/dev/null && echo "memory_min_set $1" || echo "memory_min_failed $1 write_denied"; }; '
-        # cgroups written directly (not systemd units): a child's protection never exceeds its parent's, so every
-        # ancestor gets the sum of what is protected below it, parents first; flush's argument names a path
-        # left to systemd (/system.slice when systemd sets it)
-        'acc=; add() { acc="$acc $1=$2"; }; '
-        "flush() { for kv in $acc; do echo \"${kv%=*} ${kv#*=}\"; done | awk -v k=\"$1\" '{n=split($1,a,\"/\"); p=\"\"; "
-        "for(i=2;i<=n;i++){p=p \"/\" a[i]; if(p!=k){s[p]+=($2==\"max\")?0:$2; if($2==\"max\") m[p]=1}}} "
-        "END{for(p in s) print p, (p in m)?\"max\":s[p]}' "
-        '| sort | while read -r p v; do set_cg_min "$p" "$v"; done; }; '
+        # cgroups written directly (not systemd units): one "value path" record per line, so a path may hold spaces.
+        # A child's protection never exceeds its parent's, so bottom-up each cgroup gets the larger of its existing
+        # memory.min and its own request plus its children's totals ("max" absorbs), parents written first; flush's
+        # argument names a path left to systemd (/system.slice when systemd sets it)
+        'acc=; add() { acc="$acc$2 $1\n"; }; '
+        "flush() { printf '%s' \"$acc\" | awk -v k=\"$1\" '"
+        'function sum(a,b){return (a=="max"||b=="max")?"max":a+b} '
+        'function big(a,b){return (a=="max"||b=="max")?"max":(a+0>b+0?a:b)} '
+        '{v=$1; q=substr($0,length(v)+2); own[q]=sum(own[q],v); n=split(q,a,"/"); p=""; '
+        "for(i=2;i<=n;i++){p=p \"/\" a[i]; if(p!=k){d[p]=i; if(i>m) m=i}}} "
+        'END{for(i=m;i>=2;i--) for(p in d) if(d[p]==i){c=""; f="/sys/fs/cgroup" p "/memory.min"; '
+        "if((getline c < f)<=0) c=0; close(f); t[p]=big(c,sum(own[p],t[p])); "
+        'u=p; sub(/\\/[^\\/]*$/,"",u); if(u in d) t[u]=sum(t[u],t[p]); print t[p], p}}\' '
+        '| LC_ALL=C sort -k2 | while read -r v p; do set_cg_min "$p" "$v"; done; }; '
         # this shell sits in the executor's cgroup; with the host cgroup namespace its path is absolute
         "ex=$(sed -n 's#^0::##p' /proc/self/cgroup); "
         'case "$ex" in /|"") ex=; echo "memory_min_failed executor root_cgroup";; '
