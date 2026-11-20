@@ -173,6 +173,9 @@ STOPPED_UNITS_FILE = f"/run/{FABRIC_RESET_UNIT}.stopped"
 STOPPED_UNITS_READ_COMMAND = (
     f"nsenter -t 1 -m -- /bin/sh -c {shlex.quote(f'[ ! -e {STOPPED_UNITS_FILE} ] || cat {STOPPED_UNITS_FILE}')}"
 )
+# marks a service the unit found late (after the validator's scan) in STOPPED_UNITS_FILE: it may need a listed one
+# (Fabric Manager, nvidia-persistenced) up first, so it starts after them, never by its place in the stop order
+LATE_MARK = "+"
 STOPPED_UNITS_CLEAR_COMMAND = f"nsenter -t 1 -m -- rm -f {STOPPED_UNITS_FILE}"
 HOST_SYSTEMD_RUN = f"nsenter -t 1 -m -- systemd-run --quiet --wait --pipe --collect --unit={FABRIC_RESET_UNIT}"
 # starts an exporter that outlived its kill once it exits, after the reset unit has ended. systemd owns the
@@ -644,6 +647,8 @@ def build_fabric_reset_command(units: list[str], reset_command: str, containers:
     fail = f'|| {{ echo "could not stop $u" >&2; rc={_FABRIC_STOP_FAILED_EXIT}; break; }}'
     # listed before the stop, so the restore check knows it even if this unit never gets to its start
     stop_one = f'echo "$u" >>{STOPPED_UNITS_FILE} && systemctl stop "$u" {fail}'
+    # a late one is listed with LATE_MARK: the restore starts it after the others, as this unit does
+    stop_late = f'echo "{LATE_MARK}$u" >>{STOPPED_UNITS_FILE} && systemctl stop "$u" {fail}'
     script = "trap '' PIPE; rc=0; dying=''; late=''; "
     if containers:
         ids = " ".join(shlex.quote(c) for c in containers)
@@ -660,7 +665,7 @@ def build_fabric_reset_command(units: list[str], reset_command: str, containers:
     planned = " ".join(u if u.endswith(".service") else f"{u}.service" for u in units)
     script += (
         f"[ $rc -ne 0 ] || for u in $({LATE_GPU_HOLDER_UNITS_SCRIPT}); do "
-        f'case " {planned} " in *" $u "*) ;; *) late="$late $u"; {stop_one};; esac; done; '
+        f'case " {planned} " in *" $u "*) ;; *) late="$late $u"; {stop_late};; esac; done; '
     )
     script += (
         f"[ $rc -ne 0 ] || {{ {reset_command}; rc=$?; "
@@ -734,6 +739,11 @@ async def _reset_unit_pending(runner: SSHCommandRunner) -> bool:
     return True
 
 
+def _unit_name(unit: str) -> str:
+    """nvidia-fabricmanager and nvidia-fabricmanager.service are one unit"""
+    return unit if unit.endswith(".service") else f"{unit}.service"
+
+
 async def _restore_fabric_services(
     runner: SSHCommandRunner, units: list[str], containers: list[str] = (), settle_seconds: float = 0
 ) -> str | None:
@@ -741,16 +751,22 @@ async def _restore_fabric_services(
     else None. A container counts as up only when it still runs (not exited, not restarting) after settle_seconds."""
     problems: list[str] = []
     listed: list[str] = []
+    late: list[str] = []
     try:
         # the ones a unit stopped beyond these: found late by this reset's unit, or left by a reset whose restore
-        # did not run. Stopped after the given ones, so started again after them. No nsenter (127): no unit can
-        # have run on this host, as in _reset_unit_pending
+        # did not run. No nsenter (127): no unit can have run on this host, as in _reset_unit_pending. The listed
+        # ones start in the unit's order: the planned ones last stopped first, then the late ones (LATE_MARK), which
+        # may need a planned one (Fabric Manager) up and were stopped after it
         stopped = await _run(runner, STOPPED_UNITS_READ_COMMAND)
         if stopped.exit_code not in (0, 127):
             problems.append(f"could not read which host services the reset unit stopped: {_tail(stopped.stderr)}")
         elif stopped.exit_code == 0:
             listed = (stopped.stdout or "").split()
-            units = [*dict.fromkeys(u for u in listed if u not in units), *units]
+            planned = [u for u in listed if not u.startswith(LATE_MARK)]
+            units = [*dict.fromkeys(u for u in planned if u not in units), *units]
+            known = {_unit_name(u) for u in units}
+            late = [*dict.fromkeys(u[len(LATE_MARK):] for u in listed if u.startswith(LATE_MARK))]
+            late = [u for u in late if _unit_name(u) not in known]
     except Exception as exc:
         problems.append(f"could not read which host services the reset unit stopped: {exc}")
     for cid in reversed(containers):
@@ -768,7 +784,7 @@ async def _restore_fabric_services(
                 )
         except Exception as exc:
             problems.append(f"container {cid[:12]} state unknown after the reset: {exc}")
-    for unit in reversed(units):
+    for unit in [*reversed(units), *late]:
         try:
             if await _service_active(runner, unit):
                 continue

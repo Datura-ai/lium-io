@@ -74,6 +74,7 @@ class FakeHost:
         holder_scan=None,
         host_holder_units="",
         start_fails=(),
+        needs_fm=(),
         late_units=(),
     ):
         self.commands: list[str] = []
@@ -84,6 +85,7 @@ class FakeHost:
         # the host services the pre-stop scan finds holding a GPU (its stdout), or its whole answer
         self.host_holder_units = host_holder_units
         self.start_fails = set(start_fails)  # host services that do not start again
+        self.needs_fm = set(needs_fm)  # host services whose start fails while Fabric Manager is down
         # host services the unit finds holding a GPU after its stops (opened one after the scan): it stops them and
         # starts them after the others. stopped_file: the unit's list of every service it stopped (never truncated)
         self.late_units, self.stopped_file = list(late_units), []
@@ -170,7 +172,7 @@ class FakeHost:
             for unit in units + self.late_units:
                 self.active[unit] = False
                 self.fm_log.append(("stop", unit))
-            self.stopped_file += units + self.late_units
+            self.stopped_file += units + [gpu_reset.LATE_MARK + u for u in self.late_units]
             self.commands.append(re.search(r"\{ (nvidia-smi -r\b[^;]*);", script).group(1))
             self.active_during_reset = dict(self.active)
             if self.reset_hangs:
@@ -223,7 +225,11 @@ class FakeHost:
             if verb == "is-active":
                 up = self.active.get(unit, False)
                 return make_command_result(up, "active" if up else "inactive", exit_code=0 if up else 3)
-            ok = verb == "stop" or ((unit != "nvidia-fabricmanager" or self.fm_start_ok) and unit not in self.start_fails)
+            ok = verb == "stop" or (
+                (unit != "nvidia-fabricmanager" or self.fm_start_ok)
+                and unit not in self.start_fails
+                and not (unit in self.needs_fm and not self.active.get("nvidia-fabricmanager"))
+            )
             self.active[unit] = verb == "start" and ok
             return make_command_result(ok, exit_code=0 if ok else 1)
         if cmd.startswith("nvidia-smi -r"):
@@ -748,8 +754,8 @@ def test_the_host_unit_stops_a_service_that_opened_a_gpu_after_the_scan_and_star
         "start nvidia-dcgm",
         "start late-monitor.service",
     ]
-    # every stopped one listed for the validator's restore check, before its stop
-    assert (tmp_path / "stopped").read_text().split() == ["nvidia-dcgm", FM, "late-monitor.service"]
+    # every stopped one listed for the validator's restore check, before its stop; the late one marked
+    assert (tmp_path / "stopped").read_text().split() == ["nvidia-dcgm", FM, "+late-monitor.service"]
 
 
 def test_the_host_unit_skips_the_reset_when_a_late_service_does_not_stop_and_starts_everything_again(tmp_path):
@@ -1144,6 +1150,20 @@ async def test_a_service_left_stopped_is_restored_before_a_precheck_refusal_retu
         # nothing is stopped while it stays down; the list stays for the next restore
         assert report.error_code == GpuResetErrorCode.ResetNotSupported and f"{late} is not active" in report.detail
     _no_change(host, start)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("listed", [[FM, "+late-monitor.service"], ["+late-monitor.service", FM]])
+async def test_a_listed_late_service_starts_after_its_prerequisite_whatever_the_list_order(listed):
+    # DAH-6741 review: an earlier whole-host reset timed out with Fabric Manager and a late monitor that needs it
+    # both down; the precheck's restore starts Fabric Manager first, so the monitor comes back and the reset runs
+    late = "late-monitor.service"
+    host = _b300(needs_fm=(late,))
+    host.active[FM], host.active[late], host.stopped_file = False, False, list(listed)
+    report, _ = await _reset(host, backend=U)
+    starts = [unit for verb, unit in host.fm_log if verb == "start" and unit in (FM, late)]
+    assert starts[:2] == [FM, late]
+    assert report.ok and host.active[late] and host.active[FM] and host.stopped_file == []
 
 
 @pytest.mark.asyncio
