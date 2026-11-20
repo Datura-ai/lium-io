@@ -51,6 +51,7 @@ from payload_models.payloads import (
     ContainerDeleted,
     ContainerStarted,
     ContainerStopped,
+    ContainerDeleteOnNodeLeftRequest,
     ContainerDeleteRequest,
     ContainerStartRequest,
     ContainerStopRequest,
@@ -119,6 +120,7 @@ from services.node_host import node_owner, public_host_sock
 from services.default_docker_image_digest_service import fetch_docker_hub_digest
 from services.gpu_power_limit import (
     NVIDIA_SMI_TIMEOUT_SECONDS,
+    _read_host_boot_id,
     POWER_LIMIT_SET_CONCURRENCY,
     GpuPowerCapResult,
     GpuPowerRestoreStateError,
@@ -14536,7 +14538,12 @@ class DockerService:
             workload_kind=payload.workload_kind,
         )
 
-    def _failed_delete(self, payload: ContainerDeleteRequest, msg: str) -> FailedContainerRequest:
+    def _failed_delete(
+        self,
+        payload: ContainerDeleteRequest,
+        msg: str,
+        error_code: FailedContainerErrorCodes = FailedContainerErrorCodes.UnknownError,
+    ) -> FailedContainerRequest:
         return FailedContainerRequest(
             miner_hotkey=payload.miner_hotkey,
             executor_id=payload.executor_id,
@@ -14544,7 +14551,7 @@ class DockerService:
             workload_kind=payload.workload_kind,
             msg=msg,
             error_type=FailedContainerErrorTypes.ContainerDeletionFailed,
-            error_code=FailedContainerErrorCodes.UnknownError,
+            error_code=error_code,
         )
 
     @dataclass(frozen=True)
@@ -15078,6 +15085,18 @@ class DockerService:
                     private_key=private_key,
                 ) as docker_client,
             ):
+                if isinstance(payload, ContainerDeleteOnNodeLeftRequest):
+                    # the registration may point at the replacement's host by now: delete only on the host the
+                    # node left booted as; an unreadable boot id is no proof either
+                    boot_id = await _read_host_boot_id(ssh_client)
+                    if boot_id != payload.expected_boot_id:
+                        log.warning("Delete for the node a moved pod left reached another host; nothing deleted",
+                                    boot_id_read=boot_id is not None)
+                        return self._failed_delete(
+                            payload,
+                            msg="The host reached is not the node the pod left",
+                            error_code=FailedContainerErrorCodes.NotTheNodeLeft,
+                        )
                 cleared_cap_claims: dict[str, int] = {}
                 if payload.workload_kind == WorkloadKind.FILLER:
                     # DAH-2786: our job ends here, so a limit reset from now on is no revert.

@@ -95,6 +95,8 @@ class FailedContainerErrorCodes(enum.Enum):
     ContainerVanished = "ContainerVanished"
     # DAH-3338: the miner knows the executor but could not reach it; distinct from InvalidExecutorId
     ExecutorUnreachable = "ExecutorUnreachable"
+    # 2.18.0: a ContainerDeleteOnNodeLeftRequest reached a host with another boot id; nothing was deleted
+    NotTheNodeLeft = "NotTheNodeLeft"
 
 
 class FailedContainerErrorTypes(enum.Enum):
