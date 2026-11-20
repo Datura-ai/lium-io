@@ -51,7 +51,15 @@ class DockerUserNamespaceWorkspace:
         return self.helper_root / self.path.relative_to("/")
 
 
-ResolvedWorkspace = LocalWorkspace | DockerVolumeWorkspace | DockerUserNamespaceWorkspace
+@dataclass(frozen=True)
+class NamespaceWorkspace:
+    """Inside the helper: an encrypted workspace, reached by running commands under nsenter -t pid -U."""
+
+    pid: int
+    path: PurePosixPath
+
+
+ResolvedWorkspace = LocalWorkspace | DockerVolumeWorkspace | DockerUserNamespaceWorkspace | NamespaceWorkspace
 
 
 @dataclass(frozen=True)
