@@ -265,6 +265,8 @@ async def _run_check_while_filler_runs(
     records: list[GpuPowerRestoreRecord],
     live_watts_by_uuid: list[tuple[str, float]],
     ssh: AsyncMock | None = None,
+    read_after: float | None = None,
+    cycle_age: float = 0.0,
 ) -> None:
     monkeypatch.setattr(
         check_module,
@@ -272,9 +274,10 @@ async def _run_check_while_filler_runs(
         AsyncMock(return_value=GpuPowerRestoreReadResult(records=records, read_failed=False)),
     )
     ctx = context_factory(
-        state=_running_filler_state(*live_watts_by_uuid),
+        state=dataclasses.replace(_running_filler_state(*live_watts_by_uuid), gpu_details_read_after=read_after),
         services=build_services(redis=redis),
         ssh=ssh or host_with_running_fillers(),
+        started_at_monotonic=time.monotonic() - cycle_age,
     )
     result = await GpuPowerLimitCheck().run(ctx)
 
@@ -305,6 +308,47 @@ async def test_a_cap_that_holds_records_nothing(context_factory, monkeypatch) ->
 
     await _run_check_while_filler_runs(
         context_factory, monkeypatch, redis, [_record()], [("GPU-a", 280.0)]
+    )
+
+    assert _revert_key(CHECK_EXECUTOR_UUID) not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_cap_applied_after_the_cycles_scrape_is_not_a_revert(context_factory, monkeypatch) -> None:
+    # DAH-6571: the filler capped the GPU after this cycle had read it at the card default; that older
+    # reading is not the host raising the cap back
+    redis = FakeRedis()
+    record = _record().model_copy(update={"capped_at": time.time() + 30})
+
+    await _run_check_while_filler_runs(context_factory, monkeypatch, redis, [record], [("GPU-a", 400.0)])
+
+    assert _revert_key(CHECK_EXECUTOR_UUID) not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_cap_applied_mid_cycle_before_the_scrape_began_is_judged(context_factory, monkeypatch) -> None:
+    # DAH-6571 review: the filler capped the GPU after the cycle started but before its scrape began, and the host
+    # rolled the cap back before the scrape: that reading postdates our cap, so it is a revert
+    redis = FakeRedis()
+    scrape_began = time.time()
+    record = _record().model_copy(update={"capped_at": scrape_began - 5})
+
+    await _run_check_while_filler_runs(
+        context_factory, monkeypatch, redis, [record], [("GPU-a", 400.0)], read_after=scrape_began, cycle_age=60
+    )
+
+    assert _revert_key(CHECK_EXECUTOR_UUID) in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_cap_applied_after_the_scrape_began_is_not_judged_on_it(context_factory, monkeypatch) -> None:
+    # DAH-6571: the scrape may have read the GPU before this cap landed
+    redis = FakeRedis()
+    scrape_began = time.time() - 5
+    record = _record().model_copy(update={"capped_at": scrape_began + 1})
+
+    await _run_check_while_filler_runs(
+        context_factory, monkeypatch, redis, [record], [("GPU-a", 400.0)], read_after=scrape_began, cycle_age=60
     )
 
     assert _revert_key(CHECK_EXECUTOR_UUID) not in redis.store
@@ -632,6 +676,21 @@ async def test_the_stamp_moves_a_frozen_record_onto_the_capping_executor() -> No
     stored = GpuPowerRestoreRecord.model_validate_json(redis.store[_restore_key("GPU-a")])
     assert stored.executor_id == EXECUTOR_ID
     assert stored.pod_id == POD_ID
+
+
+@pytest.mark.asyncio
+async def test_a_reused_record_takes_the_time_of_the_new_cap() -> None:
+    # DAH-6571: an old capped_at would let a scrape taken before this cap read its pre-cap limit as a revert
+    ssh = fake_ssh(FakeRun(stdout="GPU-a, 400, 400, 100, 400\n"), FakeRun(stdout="boot-1\n"), *_set_ok(280))
+    old = _restore_record(watts=400, capped_to_watts=None).model_copy(update={"capped_at": time.time() - 3600})
+    redis = FakeRedis({_restore_key("GPU-a"): old.model_dump_json()})
+    before = time.time()
+
+    await apply_filler_gpu_power_limits(
+        ssh, [GpuPowerLimit(gpu_uuid="GPU-a", watts=280)], redis, POD_ID, EXECUTOR_ID
+    )
+
+    assert GpuPowerRestoreRecord.model_validate_json(redis.store[_restore_key("GPU-a")]).capped_at >= before
 
 
 @pytest.mark.asyncio

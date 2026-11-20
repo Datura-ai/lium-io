@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import shlex
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, fields, replace
 from typing import Any, Literal
@@ -19,7 +20,7 @@ from core.utils import _m, get_extra_info
 from ..messages import MachineSpecMessages as Msg
 from ..messages import MessageTemplate, render_message
 from ..models import ValidationEvent
-from ..pipeline import CheckResult, Context
+from ..pipeline import CheckResult, Context, ContextState
 from ..runner import SSHCommandResult
 from .gpu_loss_hold import GpuLossHoldCheck
 from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
@@ -445,14 +446,20 @@ class MachineSpecScrapeCheck:
                         extra=get_extra_info({**ctx.default_extra, "detail": refresh.detail[:300]}),
                     )
                 )
+        # every read below (the Python scrape, its retry, the liumd facts task) starts after this
+        read_after = time.time()
         if liumd_specs:
-            return await self._scrape_with_liumd(ctx)
-
-        timeout = ctx.config.machine_scrape_timeout or self.DEFAULT_TIMEOUT
-
-        if ctx.config.machine_scrape_source:
-            return await self._scrape_from_source(ctx, timeout, start_shadow=True)
-        return await self._scrape_uploaded_binary(ctx, timeout, start_shadow=True)
+            result = await self._scrape_with_liumd(ctx)
+        elif ctx.config.machine_scrape_source:
+            timeout = ctx.config.machine_scrape_timeout or self.DEFAULT_TIMEOUT
+            result = await self._scrape_from_source(ctx, timeout, start_shadow=True)
+        else:
+            timeout = ctx.config.machine_scrape_timeout or self.DEFAULT_TIMEOUT
+            result = await self._scrape_uploaded_binary(ctx, timeout, start_shadow=True)
+        state = result.updates.get("state")
+        if isinstance(state, ContextState):
+            result.updates["state"] = replace(state, gpu_details_read_after=read_after)
+        return result
 
     async def _scrape_with_liumd(self, ctx: Context) -> CheckResult:
         """Use the full machine-scrape document from the same early `liumd run`."""
