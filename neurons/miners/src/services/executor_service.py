@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import time
+from datetime import UTC, datetime
 from typing import Annotated, Optional, Union
 from uuid import UUID
 
@@ -56,6 +57,49 @@ def _describe_error(error: BaseException) -> str:
     """`str(e)`, or the class name when the exception carries no text (aiohttp timeouts)."""
     text = str(error)
     return f"{type(error).__name__}: {text}" if text else type(error).__name__
+
+
+def _fresh(until) -> bool:
+    """Whether the portal read a snapshot row came from still vouches for it (`snapshot_valid_until`, DAH-6539). False
+    once that time passed or when it does not parse: this miner serves its last snapshot while the portal is
+    unreachable, and a link removed, or a node deleted and registered again, meanwhile must not keep its old grant."""
+    try:
+        return datetime.now(UTC) < datetime.fromisoformat(str(until))
+    except (TypeError, ValueError):
+        return False  # an unreadable end vouches for nothing (a time without a zone included)
+
+
+def _current_binding(item: dict) -> dict:
+    """What the node's machine may be set up for now (DAH-6539): the owner-wide binding (`owner_binding`: the hotkeys
+    and claims of every account of the listing's owner) while the row is fresh, else the row's own fields, which hold
+    the listing account's binding (an older portal: the row as it is)."""
+    owner = item.get("owner_binding")
+    return owner if isinstance(owner, dict) and _fresh(item.get("snapshot_valid_until")) else item
+
+
+# the ExecutorSSHInfo fields only the portal sets (register_pubkey fills them from the trusted row)
+PORTAL_OWNED_FIELDS = frozenset(
+    {
+        "expected_ssh_host_key",
+        "expected_node_hotkeys",
+        "expected_account_claim",
+        "expected_account_claims",
+        "expected_claims_by_hotkey",
+        "check_enforce_after",
+        "snapshot_valid_until",
+        "owner_binding",
+    }
+)
+
+
+def _expected_fields(binding: dict) -> dict:
+    """A portal binding as the ExecutorSSHInfo fields the validator checks the node against."""
+    return {
+        "expected_node_hotkeys": [str(h) for h in binding.get("node_hotkeys") or []] or None,
+        "expected_account_claim": binding.get("account_claim") or None,
+        "expected_account_claims": [str(c) for c in binding.get("account_claims") or []] or None,
+        "expected_claims_by_hotkey": binding.get("claims_by_hotkey"),
+    }
 
 
 class _UnreachableExecutorLog:
@@ -349,10 +393,21 @@ class ExecutorService:
                 uuid = UUID(item.get("id"))
                 if host_keys is not None and item.get("ssh_host_key"):
                     host_keys[str(uuid)] = item["ssh_host_key"]
-                if node_accounts is not None and item.get("node_hotkeys"):
+                binding = _current_binding(item)
+                if node_accounts is not None and binding.get("node_hotkeys"):
+                    until, enforce_after = item.get("snapshot_valid_until"), item.get("check_enforce_after")
                     node_accounts[str(uuid)] = {
-                        "hotkeys": [str(h) for h in item["node_hotkeys"]],
-                        "claim": item.get("account_claim") or None,
+                        # the expected_* fields are always the listing account's own: a validator that predates
+                        # `owner_binding` reads only these and would never let an owner-wide grant end
+                        **_expected_fields(item),
+                        # {} (no notice yet: report first) differs from a missing map (an older portal: enforce). A
+                        # stale row's times may belong to an earlier registration of this uuid: report first
+                        "check_enforce_after": enforce_after if enforce_after is None or _fresh(until) else {},
+                        # the validator re-applies the end when it checks the node: this snapshot can be served, and
+                        # the upload finish, after it
+                        "snapshot_valid_until": until,
+                        # the owner-wide binding, only from a fresh row; the validator counts it until the time above
+                        "owner_binding": _expected_fields(binding) if binding is not item else None,
                     }
                 result.append(
                     Executor(
@@ -454,7 +509,10 @@ class ExecutorService:
                             ),
                         )
                         response_obj = {
-                            **response_obj,
+                            # what the node may be checked against comes from the portal row only (register_pubkey),
+                            # never from the executor's own answer: a standalone miner or a row without a binding
+                            # would otherwise pass an executor-chosen binding on to the validator
+                            **{k: v for k, v in response_obj.items() if k not in PORTAL_OWNED_FIELDS},
                             **executor.model_dump(mode="json"),
                         }
                         return ExecutorSSHInfo.parse_obj(response_obj)
@@ -599,9 +657,8 @@ class ExecutorService:
             # no portal read here: the uploads can outlast the snapshot cache, and the reply must meet its deadline
             if isinstance(info, ExecutorSSHInfo):
                 info.expected_ssh_host_key = host_keys.get(str(info.uuid))
-                account = node_accounts.get(str(info.uuid)) or {}
-                info.expected_node_hotkeys = account.get("hotkeys")
-                info.expected_account_claim = account.get("claim")
+                for field, value in (node_accounts.get(str(info.uuid)) or {}).items():
+                    setattr(info, field, value)
         # a cut-off upload logs nothing itself, so name its executors here or the validator's miss looks unexplained
         cut_off_ids = [str(executor.uuid) for executor, task in zip(executors, tasks) if task in pending]
         (logger.warning if cut_off_ids else logger.info)(

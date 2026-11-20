@@ -501,12 +501,19 @@ async def test_central_miner_lists_each_node_with_its_registered_host_key_from_o
 
     from clients.miner_portal_api import MinerPortalAPI
 
-    keyed_node, unkeyed_node = str(uuid4()), str(uuid4())
+    keyed_node, unkeyed_node, noticeless_node = str(uuid4()), str(uuid4()), str(uuid4())
+    valid_until = "2999-01-01T00:00:00+00:00"
     portal_items = [
         {"id": keyed_node.upper(), "validator_hotkey": "v", "executor_ip_address": "node.example.com",
          "executor_ip_port": "8001", "ssh_host_key": "ssh-ed25519 AAAAregistered",
-         "node_hotkeys": ["5Account", "5Pool"], "account_claim": "claim-1"},
+         "node_hotkeys": ["5Account"], "account_claim": "claim-1", "account_claims": ["claim-1"],
+         "owner_binding": {"node_hotkeys": ["5Account", "5Pool"], "account_claim": "claim-1",
+                           "account_claims": ["claim-1", "claim-0"]},
+         "check_enforce_after": {"NODE_ACCOUNT_UNVERIFIED": "2026-11-19T06:00:00Z"}, "snapshot_valid_until": valid_until},
         {"id": unkeyed_node, "validator_hotkey": "v", "executor_ip_address": "203.0.113.5", "executor_ip_port": "8001"},
+        {"id": noticeless_node, "validator_hotkey": "v", "executor_ip_address": "203.0.113.6", "executor_ip_port": "8001",
+         "node_hotkeys": ["5Account"], "check_enforce_after": {}, "claims_by_hotkey": {"5Pool": ["claim-2"]},
+         "snapshot_valid_until": valid_until},
     ]
     es.settings.CENTRAL_MODE = True
     es.settings.RENTAL_REQUEST_HOOK = None
@@ -528,9 +535,25 @@ async def test_central_miner_lists_each_node_with_its_registered_host_key_from_o
     assert by_id[keyed_node.lower()].expected_ssh_host_key == "ssh-ed25519 AAAAregistered"
     assert by_id[unkeyed_node].expected_ssh_host_key is None
     # DAH-6539: the account binding from the same read; none for a node the portal lists without it
-    assert by_id[keyed_node.lower()].expected_node_hotkeys == ["5Account", "5Pool"]
+    # the expected_* fields are the listing account's own, all a validator that predates owner_binding reads
+    assert by_id[keyed_node.lower()].expected_node_hotkeys == ["5Account"]
     assert by_id[keyed_node.lower()].expected_account_claim == "claim-1"
+    assert by_id[keyed_node.lower()].expected_account_claims == ["claim-1"]
+    assert by_id[keyed_node.lower()].check_enforce_after == {"NODE_ACCOUNT_UNVERIFIED": "2026-11-19T06:00:00Z"}
     assert by_id[unkeyed_node].expected_node_hotkeys is None
+    assert (by_id[unkeyed_node].expected_account_claims, by_id[unkeyed_node].check_enforce_after) == (None, None)
+    # review: an empty map (no notice yet: report first) stays empty, never None (an older portal: enforce)
+    assert by_id[noticeless_node].check_enforce_after == {}
+    assert by_id[noticeless_node].expected_claims_by_hotkey == {"5Pool": ["claim-2"]}
+    assert by_id[keyed_node.lower()].expected_claims_by_hotkey is None
+    # the owner-wide binding and its end go with the node in their own field, so the validator applies the end when
+    # it checks the node (this snapshot can be served, and the upload finish, after it)
+    assert by_id[keyed_node.lower()].snapshot_valid_until == valid_until
+    assert by_id[keyed_node.lower()].owner_binding == {
+        "expected_node_hotkeys": ["5Account", "5Pool"], "expected_account_claim": "claim-1",
+        "expected_account_claims": ["claim-1", "claim-0"], "expected_claims_by_hotkey": None,
+    }
+    assert (by_id[noticeless_node].snapshot_valid_until, by_id[noticeless_node].owner_binding) == (valid_until, None)
 
 
 @pytest.mark.asyncio
@@ -572,3 +595,95 @@ async def test_standalone_miner_sends_no_expected_host_key(executor_service, tes
     ))
     registration = await executor_service.register_pubkey("v", "m", _SSH_KEY.encode(), "0xaa")
     assert registration.accepted[0].expected_ssh_host_key is None
+
+
+def test_a_partners_grant_ends_at_its_time_and_the_listing_keeps_its_own_binding():
+    """DAH-6539 (lp#3232 reviews 4633432502, 4634721592): this miner serves its last snapshot while the portal is
+    unreachable. The owner-wide binding is in `owner_binding` and counts only while `snapshot_valid_until` has not
+    passed, so a partner unlinked meanwhile stops passing; the row's own fields hold the listing account's binding,
+    which is all a miner that predates `owner_binding` reads. A row without the fields (an older portal) is as it is."""
+    from datetime import UTC, datetime, timedelta
+
+    owner = {"node_hotkeys": ["5Account", "5Partner"], "account_claim": "claim-1", "account_claims": ["claim-1", "claim-p"]}
+    row = {"node_hotkeys": ["5Account"], "account_claim": "claim-1", "account_claims": ["claim-1"], "owner_binding": owner}
+    now = datetime.now(UTC)
+
+    assert es._current_binding({**row, "snapshot_valid_until": (now + timedelta(minutes=5)).isoformat()}) == owner
+    for stale in [(now - timedelta(seconds=1)).isoformat(), "not a time", "2026-11-19T12:00:00", None]:
+        assert es._current_binding({**row, "snapshot_valid_until": stale})["node_hotkeys"] == ["5Account"]
+    older = {"node_hotkeys": ["5Account"], "account_claim": "claim-1"}
+    assert es._current_binding(older) is older
+
+
+@pytest.mark.asyncio
+async def test_a_stale_snapshot_row_sends_report_first_and_no_owner_binding(executor_service):
+    """lp#3232 review 4634721602: through a portal outage this miner keeps serving its last snapshot, and the node may
+    have been deleted and registered again meanwhile (its notice deleted with it). A row past `snapshot_valid_until`
+    sends no notice time (report first) and only the listing account's binding."""
+    from datura.requests.miner_requests import ExecutorSSHInfo
+
+    from clients.miner_portal_api import MinerPortalAPI
+
+    node = str(uuid4())
+    item = {
+        "id": node, "validator_hotkey": "v", "executor_ip_address": "203.0.113.8", "executor_ip_port": "8001",
+        "node_hotkeys": ["5Account"], "owner_binding": {"node_hotkeys": ["5Account", "5Partner"]},
+        "check_enforce_after": {"NODE_ACCOUNT_UNVERIFIED": "2026-11-19T06:00:00Z"},
+        "snapshot_valid_until": "2026-11-19T06:05:00+00:00",
+    }
+    es.settings.CENTRAL_MODE = True
+    es.settings.RENTAL_REQUEST_HOOK = None
+
+    async def answered(executor, *_args, **_kwargs):
+        return ExecutorSSHInfo(
+            uuid=str(executor.uuid), address=executor.address, port=executor.port, ssh_username="root",
+            ssh_port=22, python_path="/p", root_dir="/r",
+        )
+
+    executor_service.send_pubkey_to_executor = answered
+    with patch.object(MinerPortalAPI, "fetch_executors", AsyncMock(return_value=[item])):
+        registration = await executor_service.register_pubkey("v", "m", _SSH_KEY.encode(), "0xaa")
+
+    [info] = registration.accepted
+    assert (info.expected_node_hotkeys, info.check_enforce_after, info.owner_binding) == (["5Account"], {}, None)
+    assert info.snapshot_valid_until == "2026-11-19T06:05:00+00:00"  # the validator applies it again
+
+
+@pytest.mark.parametrize("central", [False, True])
+@pytest.mark.asyncio
+async def test_binding_fields_in_the_executors_answer_never_reach_the_validator(
+    executor_service, test_executor, central
+):
+    """The executor's JSON is parsed as ExecutorSSHInfo; account-policy fields in it must not survive when the portal
+    row sets none (a standalone miner, or a row without a binding). Only the portal row fills them."""
+    import json as _json
+
+    from clients.miner_portal_api import MinerPortalAPI
+
+    planted = {
+        "expected_ssh_host_key": "ssh-ed25519 AAAAplanted", "expected_node_hotkeys": ["5Planted"],
+        "expected_account_claim": "planted", "expected_account_claims": ["planted"],
+        "expected_claims_by_hotkey": {"5Pool": ["planted"]}, "check_enforce_after": {"NODE_ACCOUNT_UNVERIFIED": "x"},
+        "snapshot_valid_until": "2999-01-01T00:00:00+00:00", "owner_binding": {"expected_node_hotkeys": ["5Planted"]},
+    }
+    answer = {"ssh_username": "root", "ssh_port": 22, "python_path": "/p", "root_dir": "/r", **planted}
+
+    post_ctx = MagicMock()
+    post_ctx.__aenter__ = AsyncMock(return_value=_response(200, _json.dumps(answer).encode()))
+    post_ctx.__aexit__ = AsyncMock(return_value=None)
+    session = _make_mock_session()
+    session.post = MagicMock(return_value=post_ctx)
+
+    es.settings.CENTRAL_MODE = central
+    es.settings.RENTAL_REQUEST_HOOK = None
+    executor_service.executor_dao.get_executors_for_validator.return_value = [test_executor]
+    row = {"id": str(test_executor.uuid), "validator_hotkey": "v", "executor_ip_address": test_executor.address,
+           "executor_ip_port": str(test_executor.port)}
+    with (
+        patch("services.executor_service.aiohttp.ClientSession", return_value=session),
+        patch.object(MinerPortalAPI, "fetch_executors", AsyncMock(return_value=[row])),
+    ):
+        registration = await executor_service.register_pubkey("v", "m", _SSH_KEY.encode(), "0xaa")
+
+    [info] = registration.accepted
+    assert {field: getattr(info, field) for field in planted} == dict.fromkeys(planted)
