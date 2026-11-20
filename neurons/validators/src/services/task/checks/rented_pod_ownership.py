@@ -249,17 +249,24 @@ class RentedPodOwnershipCheck:
         self, ctx: Context, pods: list[dict]
     ) -> tuple[dict[str, list[str]], dict[str, str]]:
         """Each runtime process that started after a pod's container: {process: [containers]}, and when each of
-        those started ({process: UTC time}, from the host's clock). Observe-only, for the support sweep; an unread
-        age flags nothing."""
+        those started ({process: UTC time, or "unknown"}). Both come from the kernel's start time of each process
+        (/proc/<pid>/stat field 22, ticks since boot, plus the boot epoch), not from ages and a clock sampled
+        apart, so a slow read cannot move a date. Observe-only, for the support sweep; an unread start flags
+        nothing."""
+        start = "$(sed 's/.*) //' /proc/$p/stat 2>/dev/null | cut -d' ' -f20)"  # after "pid (comm) ": field 22
         try:
             res = await asyncio.wait_for(
                 ctx.ssh.run(
                     # comm is cut to 15 characters (nv-fabricmanage)
-                    "ps -eo pid=,ppid=,comm=,etimes= | grep -E ' ("
+                    "ps -eo pid=,ppid=,comm= | grep -E ' ("
                     + "|".join(n[:15] for n in RUNTIME_PROCESSES)
-                    + ") +[0-9]+$'; echo --; ps -o pid=,etimes= -p "
-                    + ",".join(str(int(p["pid"])) for p in pods)
-                    + "; echo --; date +%s",
+                    + ")$' | while read -r p pp c; do echo \"$p $pp $c "
+                    + start
+                    + '"; done; echo --; for p in '
+                    + " ".join(str(int(p["pid"])) for p in pods)
+                    + '; do echo "$p '
+                    + start
+                    + "\"; done; echo --; awk '/^btime /{print $2}' /proc/stat; getconf CLK_TCK",
                     check=False,
                 ),
                 timeout=READ_TIMEOUT_SECONDS,
@@ -267,37 +274,41 @@ class RentedPodOwnershipCheck:
         except (asyncssh.Error, OSError, TimeoutError):
             return {}, {}
         services, _, rest = (res.stdout or "").partition("--")
-        pod_lines, _, host_now = rest.partition("--")
-        host_now_s = _num(host_now.strip())
+        pod_lines, _, clock = rest.partition("--")
+        boot_s, ticks_per_s = ([_num(x) for x in clock.split()] + [None, None])[:2]
         procs = []
         for line in services.splitlines():
             fields = line.split()
             if len(fields) != 4:
                 continue
-            pid, ppid, comm, age = fields
+            pid, ppid, comm, ticks = fields
             name = next((n for n in RUNTIME_PROCESSES if n[:15] == comm), None)
-            if name and None not in (_num(pid), _num(ppid), _num(age)):
-                procs.append((name, _num(pid), _num(ppid), _num(age)))
+            if name and None not in (_num(pid), _num(ppid), _num(ticks)):
+                procs.append((name, _num(pid), _num(ppid), _num(ticks)))
         pids = {(name, pid) for name, pid, _, _ in procs}
-        youngest: dict[str, int] = {}
-        for name, _, ppid, age_s in procs:
+        latest: dict[str, int] = {}
+        for name, _, ppid, ticks in procs:
             # sysbox-fs and sysbox-mgr re-exec themselves for short-lived helpers (e.g. while serving
             # a pod's /proc): a child of the same daemon is not a restart of it
             if (name, ppid) not in pids:
-                youngest[name] = min(age_s, youngest.get(name, age_s))
-        pod_age = {}
+                latest[name] = max(ticks, latest.get(name, ticks))
+        pod_start = {}
         for line in pod_lines.splitlines():
-            pid, _, age = line.strip().partition(" ")
-            pod_age[_num(pid)] = _num(age.strip())
+            pid, _, ticks = line.strip().partition(" ")
+            pod_start[_num(pid)] = _num(ticks.strip())
         restarted, started_at = {}, {}
-        for name, age_s in sorted(youngest.items()):
-            under = sorted(p["container"] for p in pods if (pod_age.get(p["pid"]) or 0) > age_s)
+        for name, ticks in sorted(latest.items()):
+            under = sorted(
+                p["container"] for p in pods if pod_start.get(p["pid"]) is not None and pod_start[p["pid"]] < ticks
+            )
             if under:
                 restarted[name] = under
-                if host_now_s:
-                    started_at[name] = datetime.fromtimestamp(host_now_s - age_s, timezone.utc).strftime(
-                        "%Y-%m-%dT%H:%M:%SZ"
-                    )
+                # stated, not left out: a reader must not take a missing time for "today"
+                started_at[name] = (
+                    datetime.fromtimestamp(boot_s + ticks // ticks_per_s, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    if boot_s and ticks_per_s
+                    else "unknown"
+                )
         return restarted, started_at
 
     def _event(self, ctx: Context, template, what: dict) -> CheckResult:

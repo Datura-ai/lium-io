@@ -3128,7 +3128,8 @@ class RentedPodOwnershipMessages:
         category="runtime",
         impact="Proceed; pods running across a sysbox or NVIDIA fabric manager restart can lose /proc paths or NVLink",
         remediation="A runtime service listed in runtime_restarted_under_pods started after the listed pods, at the "
-        "time in runtime_started_at (which can be days before this report). "
+        "time in runtime_started_at (which can be days before this report; \"unknown\" when the host's boot time "
+        "could not be read). "
         "Contact support before changing anything on the host; restarting the pod alone does not repair it.",
     )
     UNREAD = MessageTemplate(
