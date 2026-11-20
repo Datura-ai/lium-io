@@ -1167,11 +1167,13 @@ class LoginUserMessages:
         impact="Proceed",
     )
     UNREAD = MessageTemplate(
-        event="Login user could not be read",
+        event="Login user could not be read; checked again next cycle",
         reason="LOGIN_USER_UNREAD",
-        severity="info",
-        category="policy",
-        impact="Proceed",
+        severity="warning",
+        category="env",
+        impact="This run stops before anything is installed; nothing is reset and the node is checked again next cycle",
+        remediation="Usually a slow or interrupted SSH session and nothing is needed. If it repeats, check that `id -u` "
+        "answers promptly over the validator's SSH login.",
     )
     NOT_ROOT = MessageTemplate(
         event="Executor SSH user must be root",

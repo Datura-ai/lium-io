@@ -23,6 +23,10 @@ EXECUTOR_PYTHON = "/root/app/.venv/bin/python"
 SERVICE_DIR_PARENT = "/root/app"
 _IMAGE_PAYLOADS = Path(__file__).resolve().parents[1] / "executor_payloads"
 PAYLOAD_DIR = _IMAGE_PAYLOADS if _IMAGE_PAYLOADS.is_dir() else Path(__file__).resolve().parents[3] / "executor" / "src"
+# the validator's own miner jobs (src/miner_jobs), run by run_job; entry script first, then the module it imports
+MINER_JOBS = Path(__file__).resolve().parents[1] / "miner_jobs"
+BACKUP_JOB = ("backup_storage.py", "workspace_mount.py")
+RESTORE_JOB = ("restore_storage.py", "workspace_mount.py")
 
 # entry script first; the rest are modules it imports from its own directory
 GPU_MONITOR = ("gpus_utility.py", "services/pull_lock.py")
@@ -35,6 +39,10 @@ STORAGE = ("storage_runner.py",) + tuple(sorted(f"storage/{p.name}" for p in (PA
 # the executor runs with pid: host, so a bare pkill/pgrep also sees other containers' and the host's processes;
 # this selector keeps them to the shell's mount namespace, the executor's own
 SAME_MOUNT_NS = '--ns "$$" --nslist mnt'
+
+
+# a failed staging leaves nothing behind: its partial directory goes before the shell exits
+_FAIL = '{ [ -z "${d:-}" ] || rm -rf "$d"; exit 1; }'
 
 
 def service_dir_glob(purpose: str, parent: str | None = None) -> str:
@@ -52,7 +60,12 @@ def digests(files: tuple[str, ...]) -> str:
 
 
 def install(
-    purpose: str, files: tuple[str, ...], parent: str | None = None, cleanup: bool = False, tag: str = ""
+    purpose: str,
+    files: tuple[str, ...],
+    parent: str | None = None,
+    cleanup: bool = False,
+    tag: str = "",
+    source: Path | None = None,
 ) -> str:
     """Shell that makes a fresh 0700 directory under `parent`, sets `$d` to it and writes `files` into it; exits 1 on
     any failure. `cleanup`: the directory goes when the shell ends (also on HUP/INT/TERM), set before the first write.
@@ -64,9 +77,9 @@ def install(
     for name in files:
         if "/" in name:
             steps.append(f'mkdir -p "$d"/{shlex.quote(str(Path(name).parent))}')
-        data = base64.b64encode((PAYLOAD_DIR / name).read_bytes()).decode()
+        data = base64.b64encode(((source or PAYLOAD_DIR) / name).read_bytes()).decode()
         steps.append(f'printf %s {data} | base64 -d > "$d"/{shlex.quote(name)}')
-    return "{ " + " && ".join(steps) + "; } || exit 1"
+    return "{ " + " && ".join(steps) + "; } || " + _FAIL
 
 
 def archive(files: tuple[str, ...]) -> bytes:
@@ -87,7 +100,12 @@ def unpack(purpose: str, cleanup: bool = False) -> str:
     if cleanup:
         steps += ["trap 'rm -rf \"$d\"' EXIT", "trap 'exit 1' HUP INT TERM"]
     steps.append('base64 -d | tar -xzf - -C "$d"')
-    return "{ " + " && ".join(steps) + "; } || exit 1"
+    return "{ " + " && ".join(steps) + "; } || " + _FAIL
+
+
+def verify(files: tuple[str, ...]) -> str:
+    """Shell that checks the files in `$d` are exactly the validator's `files` (sha256), else removes `$d` and exits 1."""
+    return f"{{ printf %s {shlex.quote(digests(files))} | (cd \"$d\" && sha256sum -c --quiet --strict -) >/dev/null; }} || {_FAIL}"
 
 
 def run(files: tuple[str, ...]) -> str:
@@ -101,6 +119,21 @@ def run_once(purpose: str, files: tuple[str, ...], args: str, env: str = "", tag
     return f"{install(purpose, files, cleanup=True, tag=tag)}; {env}{run(files)} {args}"
 
 
+def run_job(purpose: str, files: tuple[str, ...], args: list[str], log: str | None = None) -> str:
+    """A validator miner job (`files` from MINER_JOBS): staged in a fresh 0700 directory and run there by the trusted
+    interpreter with -E -s, so its imports resolve to the staged files only, never to code on the node or in its
+    environment. The directory goes when the run ends. `log`: run detached (nohup) with its output there; the detached
+    worker then owns the cleanup, also when it is killed."""
+    command = f'{shlex.quote(EXECUTOR_PYTHON)} -E -s "$D"/{shlex.quote(files[0])} {shlex.join(args)}'
+    if log is None:
+        return f'{install(purpose, files, cleanup=True, source=MINER_JOBS)}; D="$d"; {command}'
+    worker = "trap 'rm -rf \"$D\"' EXIT; trap 'exit 1' HUP INT TERM; " + command
+    return (
+        f"{install(purpose, files, source=MINER_JOBS)}; "
+        f'D="$d" nohup /bin/sh -c {shlex.quote(worker)} > {shlex.quote(log)} 2>&1 < /dev/null &'
+    )
+
+
 def label(files: tuple[str, ...], args: str) -> str:
     """What a log or event names instead of the command, which carries the script itself."""
     return f"{EXECUTOR_PYTHON} <validator>/{files[0]} {args}"
@@ -111,3 +144,23 @@ def process_pattern(purpose: str, files: tuple[str, ...], tag: str) -> str:
     pkill -f), and not the shell that installed it (its mktemp template and `"$d"/` never form the path), so that
     shell's cleanup still runs. Other validations' runs carry other tags and are not matched."""
     return (service_dir_glob(purpose) + f"{tag}.@/" + files[0]).replace(".", r"\.").replace("@", "[[:alnum:]]{8}")
+
+
+def launcher_pattern(purpose: str, tag: str) -> str:
+    """An extended regex matching the command line of the shell that installs and starts a `purpose` run tagged `tag`
+    (its mktemp template carries the tag), and nothing else."""
+    return (service_dir_glob(purpose) + f"{tag}.XXXXXXXX").replace(".", r"\.")
+
+
+def kill_runs(purpose: str, files: tuple[str, ...], tag: str) -> str:
+    """Shell that ends every run of `purpose` tagged `tag`: SIGKILL to the whole process group of each tagged launcher,
+    so a script it is still installing or has not started yet never starts, then to any tagged entry script left, then
+    removes the tagged directories. Runs with other tags, and the shell running this, are not touched."""
+    me = "$(ps -o pgid= -p $$ | tr -d ' ')"
+    return (
+        f"for p in $(pgrep -f {SAME_MOUNT_NS} -- {shlex.quote(launcher_pattern(purpose, tag))}); do "
+        "g=$(ps -o pgid= -p \"$p\" | tr -d ' '); "
+        f'[ -n "$g" ] && [ "$g" != "{me}" ] && kill -9 -- "-$g" 2>/dev/null; done; '
+        f"pkill -9 -f {SAME_MOUNT_NS} -- {shlex.quote(process_pattern(purpose, files, tag))}; "
+        f'rm -rf -- "{service_dir_glob(purpose)}"{tag}.*; true'
+    )

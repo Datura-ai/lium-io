@@ -29,15 +29,18 @@ class LoginUserCheck:
         result = await ctx.runner.run(READ_UID_COMMAND, timeout=READ_TIMEOUT_SECONDS, retryable=True)
         uid = (result.stdout or "").strip()
         what = {"login_uid": uid, "ssh_username": ctx.executor.ssh_username}
-        if not result.success:
-            # an unreadable uid proves nothing; the SSH failure surfaces in the next check that runs a command
-            what["error"] = result.error_type or f"exit {result.exit_code}"
+        if not result.success or not uid.isdigit():
+            # no confirmed uid (a timeout, an error, empty or malformed output): nothing is installed without one, so the
+            # run stops here; it is no verdict either, so nothing is reset or hidden (REASONS_THAT_KEEP_STORED) and the
+            # next cycle reads it again
+            what["error"] = (result.error_type or f"exit {result.exit_code}") if not result.success else "not a uid"
             logger.info(_m("LOGIN_USER_UNREAD", extra=get_extra_info(what)))
             event = render_message(Msg.UNREAD, ctx=ctx, check_id=self.check_id, what=what)
-            return CheckResult(passed=True, event=event)
+            return CheckResult(passed=False, event=event, fatal=True)
         if uid == "0":
             return CheckResult(passed=True, event=render_message(Msg.ROOT, ctx=ctx, check_id=self.check_id, what=what))
-        # a plain failure: the run ends here and nothing is reset; a non-root login never passed validation (every later
-        # step needs root), so there is no verified state to clear
+        # the run ends here and nothing is reset; a non-root login never passed validation (every later step needs root),
+        # so there is no verified state to clear. It hides the node at once (REASONS_THAT_HIDE_AT_ONCE): a listed node
+        # that switched its login must not take a new rental while it fails
         event = render_message(Msg.NOT_ROOT, ctx=ctx, check_id=self.check_id, what=what)
         return CheckResult(passed=False, event=event, fatal=True)

@@ -327,7 +327,8 @@ async def test_a_run_is_written_under_its_tag_and_the_kill_takes_only_that_tag(n
 
     ssh.run = run
     await ValidationService._kill_remote_matmul(None, ssh, tag, {})
-    assert ssh.commands[0].startswith(f'pkill -9 -f {executor_payload.SAME_MOUNT_NS} -- ')
+    # the launcher's process group and the entry script of this tag (test_matrix_cancel_before_start runs it)
+    assert ssh.commands[0] == executor_payload.kill_runs("matrix", executor_payload.MATRIX, tag)
     assert tag in ssh.commands[0]
 
 

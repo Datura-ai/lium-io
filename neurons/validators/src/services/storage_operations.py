@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import shlex
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -291,51 +292,70 @@ async def start_storage_operation(
             await _remove_operation_artifacts(ssh_client, files)
         await _remove_stale_helper_container(ssh_client, operation_id)
 
-        async with ssh_client.start_sftp_client() as sftp:
-            async with sftp.open(str(files.spec), "w") as remote_spec:
-                await remote_spec.write(
-                    json.dumps(dict(spec), separators=(",", ":"), sort_keys=True)
-                )
-            await sftp.chmod(str(files.spec), 0o600)
+        # stage and verify the runner first: the spec carries the repository credentials, so it is written only once the
+        # runner that consumes and removes it is in place; a failed unpack or check leaves no spec and no partial directory
+        staged = await ssh_client.run(
+            f"{executor_payload.unpack('storage')}; {executor_payload.verify(executor_payload.STORAGE)}; "
+            'printf "%s" "$d"',
+            input=executor_payload.archive(executor_payload.STORAGE).decode(),
+            check=True,
+        )
+        stage_dir = _staged_directory(staged.stdout)
+        try:
+            async with ssh_client.start_sftp_client() as sftp:
+                async with sftp.open(str(files.spec), "w") as remote_spec:
+                    await remote_spec.write(
+                        json.dumps(dict(spec), separators=(",", ":"), sort_keys=True)
+                    )
+                await sftp.chmod(str(files.spec), 0o600)
 
-        # the validator's runner and storage package, staged in a root-only directory ($D) that goes when the runner
-        # has exited
-        runner = (
-            f'{shlex.quote(python_path)} -E -s "$D"/{executor_payload.STORAGE[0]} '
-            f"--spec {shlex.quote(str(files.spec))} --cancel-file {shlex.quote(str(files.cancel))}"
-        )
-        terminal_cleanup = (
-            ""
-            if retain_terminal_artifacts
-            # a failed run keeps its log: a runner that dies before reporting leaves no other trace
-            else f"; rm -f {shlex.quote(str(files.status))}; "
-            f'if [ "$result" = 0 ]; then rm -f {shlex.quote(str(files.log))}; '
-            f"else echo \"runner exited $result\" >> {shlex.quote(str(files.log))}; fi"
-        )
-        # Bootstrap callers consume the terminal files; detached online jobs
-        # remove them themselves after the runner has finished reporting.
-        wrapper = (
-            f"rm -f {shlex.quote(str(files.status))} {shlex.quote(str(files.cancel))}; "
-            f"{runner} & child=$!; "
-            f"printf '%s\\n' \"$child\" > {shlex.quote(str(files.pid))}; "
-            "trap 'kill -TERM \"$child\" 2>/dev/null || true' TERM INT; "
-            'wait "$child"; result=$?; rm -rf "$D"; '
-            f"printf '%s\\n' \"$result\" > {shlex.quote(str(files.status))}; "
-            f"rm -f {shlex.quote(str(files.spec))} {shlex.quote(str(files.pid))} "
-            f"{shlex.quote(str(files.cancel))}{terminal_cleanup}"
-        )
-        launch_command = (
-            f"{executor_payload.unpack('storage')}; "
-            f'D="$d" nohup /bin/sh -c {shlex.quote(wrapper)} '
-            f"> {shlex.quote(str(files.log))} 2>&1 < /dev/null &"
-        )
-        await ssh_client.run(
-            launch_command, input=executor_payload.archive(executor_payload.STORAGE).decode(), check=True
-        )
+            # the validator's runner and storage package, staged in a root-only directory ($D) that goes when the runner
+            # has exited
+            runner = (
+                f'{shlex.quote(python_path)} -E -s "$D"/{executor_payload.STORAGE[0]} '
+                f"--spec {shlex.quote(str(files.spec))} --cancel-file {shlex.quote(str(files.cancel))}"
+            )
+            terminal_cleanup = (
+                ""
+                if retain_terminal_artifacts
+                # a failed run keeps its log: a runner that dies before reporting leaves no other trace
+                else f"; rm -f {shlex.quote(str(files.status))}; "
+                f'if [ "$result" = 0 ]; then rm -f {shlex.quote(str(files.log))}; '
+                f"else echo \"runner exited $result\" >> {shlex.quote(str(files.log))}; fi"
+            )
+            # Bootstrap callers consume the terminal files; detached online jobs
+            # remove them themselves after the runner has finished reporting.
+            wrapper = (
+                f"rm -f {shlex.quote(str(files.status))} {shlex.quote(str(files.cancel))}; "
+                f"{runner} & child=$!; "
+                f"printf '%s\\n' \"$child\" > {shlex.quote(str(files.pid))}; "
+                "trap 'kill -TERM \"$child\" 2>/dev/null || true' TERM INT; "
+                'wait "$child"; result=$?; rm -rf "$D"; '
+                f"printf '%s\\n' \"$result\" > {shlex.quote(str(files.status))}; "
+                f"rm -f {shlex.quote(str(files.spec))} {shlex.quote(str(files.pid))} "
+                f"{shlex.quote(str(files.cancel))}{terminal_cleanup}"
+            )
+            launch_command = (
+                f"D={shlex.quote(stage_dir)} nohup /bin/sh -c {shlex.quote(wrapper)} "
+                f"> {shlex.quote(str(files.log))} 2>&1 < /dev/null &"
+            )
+            await ssh_client.run(launch_command, check=True)
+        except Exception:
+            # no runner took the spec: remove it and the staged runner here
+            await ssh_client.run(f"rm -rf {shlex.quote(stage_dir)} {shlex.quote(str(files.spec))}", check=False)
+            raise
         return files
     except Exception as error:
         await report_launch_failure(operation_id, spec, error)
         raise
+
+
+def _staged_directory(stdout: object) -> str:
+    """The directory the staging command made: only a fresh one of the storage template, never another path."""
+    path = stdout.strip() if isinstance(stdout, str) else ""
+    if not re.fullmatch(re.escape(executor_payload.service_dir_glob("storage")) + r"[A-Za-z0-9]{8}", path):
+        raise StorageOperationLaunchError("staging the storage runner returned no directory")
+    return path
 
 
 async def wait_for_storage_operation(

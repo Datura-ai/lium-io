@@ -12453,15 +12453,8 @@ class DockerService:
         local_volume: str,
         local_volume_path: str,
     ) -> None:
-        local_jobs = Path(__file__).resolve().parent.parent / "miner_jobs"
-        remote_script = "/root/app/restore_storage.py"
-        remote_helper = "/root/app/workspace_mount.py"
-        async with ssh_client.start_sftp_client() as sftp:
-            await sftp.put(str(local_jobs / "restore_storage.py"), remote_script)
-            await sftp.put(str(local_jobs / "workspace_mount.py"), remote_helper)
-        command = [
-            executor_payload.EXECUTOR_PYTHON,
-            remote_script,
+        # the validator's restore job and its helper, staged and run in a fresh private directory (run_job)
+        args = [
             "--api-url",
             settings.COMPUTE_REST_API_URL_EXTERNAL,
             "--target-volume",
@@ -12479,7 +12472,7 @@ class DockerService:
             "--target-volume-path",
             local_volume_path,
         ]
-        await ssh_client.run(shlex.join(command), check=True)
+        await ssh_client.run(executor_payload.run_job("restore", executor_payload.RESTORE_JOB, args), check=True)
 
     async def _report_pull_progress(self, docker_client, image: str, log_tag: str, every: float = 15) -> None:
         """DAH-6025: a big pull showed one 'Pulling' line for minutes, and renters cancelled pods that were

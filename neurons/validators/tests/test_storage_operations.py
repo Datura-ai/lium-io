@@ -135,7 +135,9 @@ def test_detached_wrapper_keeps_the_log_only_when_the_runner_fails(
         if "nohup" in command:
             launched.append((command, input))
             return SimpleNamespace(exit_status=0, stdout="", stderr="")
-        done = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
+        done = subprocess.run(["sh", "-c", command], input=input, capture_output=True, text=True)
+        if check and done.returncode:
+            raise RuntimeError(f"exit {done.returncode}")
         return SimpleNamespace(exit_status=done.returncode, stdout=done.stdout, stderr=done.stderr)
 
     class Sftp:
@@ -167,10 +169,10 @@ def test_detached_wrapper_keeps_the_log_only_when_the_runner_fails(
             ssh_client, sys.executable, OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
         )
     )
-    command, staged = launched[0]
+    command, _ = launched[0]
     assert "storage_runner.py" in command and storage_operations.REMOTE_RUNNER_PATH not in command
     # the launch in the foreground: the wrapper's own end (its cleanup) is then over when this returns
-    subprocess.run(["sh", "-c", command.replace("nohup ", "").rsplit(" &", 1)[0]], input=staged, text=True, check=True)
+    subprocess.run(["sh", "-c", command.replace("nohup ", "").rsplit(" &", 1)[0]], text=True, check=True)
     assert not list((tmp_path / "service").iterdir())  # the staged runner goes when it has exited
     log = Path(str(files.log))
     assert not Path(str(files.status)).exists()
@@ -178,3 +180,56 @@ def test_detached_wrapper_keeps_the_log_only_when_the_runner_fails(
         assert log.read_text().splitlines() == ["working", "runner exited 3"]
     else:
         assert not log.exists()
+
+
+@pytest.mark.parametrize("bad_archive", ["not a tar", "changed runner"])
+def test_a_failed_unpack_leaves_no_spec_and_no_staging_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_archive: str
+) -> None:
+    # the spec carries the repository credentials: it must not exist on the node unless a runner is there to take it
+    import asyncio as aio
+    import base64
+    import io
+    import tarfile
+
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", storage_operations.PurePosixPath(str(tmp_path)))
+    monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
+    reported = AsyncMock()
+    monkeypatch.setattr(storage_operations, "report_launch_failure", reported)
+    payloads = tmp_path / "payloads"
+    payloads.mkdir()
+    (payloads / "storage_runner.py").write_text("raise SystemExit(0)\n")
+    monkeypatch.setattr(executor_payload, "PAYLOAD_DIR", payloads)
+    monkeypatch.setattr(executor_payload, "STORAGE", ("storage_runner.py",))
+    monkeypatch.setattr(executor_payload, "SERVICE_DIR_PARENT", str(tmp_path / "service"))
+    (tmp_path / "service").mkdir()
+    if bad_archive == "not a tar":
+        monkeypatch.setattr(executor_payload, "archive", lambda files: base64.b64encode(b"not a tar"))
+    else:
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+            data = b"print('not the validator runner')\n"
+            entry = tarfile.TarInfo("storage_runner.py")
+            entry.size = len(data)
+            tar.addfile(entry, io.BytesIO(data))
+        monkeypatch.setattr(executor_payload, "archive", lambda files: base64.b64encode(buffer.getvalue()))
+    sftp_used: list[str] = []
+
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        done = subprocess.run(["sh", "-c", command], input=input, capture_output=True, text=True)
+        if check and done.returncode:
+            raise RuntimeError(f"exit {done.returncode}")
+        return SimpleNamespace(exit_status=done.returncode, stdout=done.stdout, stderr=done.stderr)
+
+    ssh_client = SimpleNamespace(run=run, start_sftp_client=lambda: sftp_used.append("opened"))
+    spec = {"engine": "restic", "repository": {"s3_access_key_id": "AKIA-TEST", "password": "restic-test"}}
+    with pytest.raises(RuntimeError):
+        aio.run(
+            storage_operations.start_storage_operation(
+                ssh_client, sys.executable, OPERATION_ID, spec, retain_terminal_artifacts=False
+            )
+        )
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    assert not Path(str(files.spec)).exists() and sftp_used == []
+    assert not list((tmp_path / "service").iterdir())  # the partial staging directory is gone
+    reported.assert_awaited_once()

@@ -324,7 +324,7 @@ def _ssh_scripted(answers_by_card: dict[int, list[str]]):
     calls = {"runs": {card: 0 for card in answers_by_card}, "kills": []}
 
     async def run(cmd, *args, **kwargs):
-        if cmd.startswith("pkill"):
+        if "pkill -9" in cmd:   # the tagged kill (executor_payload.kill_runs)
             calls["kills"].append(cmd)
             return SimpleNamespace(exit_status=0, stdout="", stderr="")
         if "CUDA_VISIBLE_DEVICES=" in cmd and _card_index(cmd) in answers_by_card:
@@ -453,7 +453,7 @@ async def test_a_cancelled_all_cards_run_kills_the_remote_matmuls_and_stays_canc
     started, kills = asyncio.Event(), []
 
     async def run(cmd, *args, **kwargs):
-        if cmd.startswith("pkill"):
+        if "pkill -9" in cmd:   # the tagged kill (executor_payload.kill_runs)
             kills.append(cmd)
             return SimpleNamespace(exit_status=0, stdout="", stderr="")
         started.set()

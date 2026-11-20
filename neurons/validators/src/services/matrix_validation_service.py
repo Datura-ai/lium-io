@@ -298,14 +298,12 @@ class ValidationService:
 
     async def _kill_remote_matmul(self, ssh_client, run_tag: str, log_extra: dict) -> None:
         # best-effort kill of the leaked matmul process so it stops holding GPU memory; only this validation's
-        # (its run tag) in the executor's mount namespace, never another validation's on the same host
-        pattern = executor_payload.process_pattern("matrix", executor_payload.MATRIX, run_tag)
+        # (its run tag) in the executor's mount namespace, never another validation's on the same host. The launcher's
+        # process group goes too, so a run cancelled while its script is still being written never starts a matmul.
         try:
             # SIGKILL: a SIGTERM can be ignored/slow on a wedged process; -9 is strictly
             # more reliable outside pure D-state (where no signal lands anyway)
-            await ssh_client.run(
-                f"pkill -9 -f {executor_payload.SAME_MOUNT_NS} -- {shlex.quote(pattern)}", timeout=10
-            )
+            await ssh_client.run(executor_payload.kill_runs("matrix", executor_payload.MATRIX, run_tag), timeout=10)
         except Exception as e:
             logger.warning(
                 _m(

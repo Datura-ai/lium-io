@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import os
 import shlex
 import time
 from collections.abc import Awaitable, Container, Iterator
@@ -114,14 +113,6 @@ MIN_DATED_NONCE_MINER_AXON_VERSION = 10_005_000
 MINER_ANSWER_REASON_CODES = frozenset(
     {AvailabilityErrorCode.EXECUTOR_UNREACHABLE_BY_MINER, AvailabilityErrorCode.RENTED_EXECUTOR_NOT_LISTED}
 )
-
-
-def _miner_job_script_path(script_name: str) -> str:
-    return os.path.join(os.path.dirname(__file__), "..", "miner_jobs", script_name)
-
-
-def _nohup_command(argv: list[str], log_path: str) -> str:
-    return f"{shlex.join(argv)} > {shlex.quote(log_path)} 2>&1 &"
 
 
 async def _storage_known_hosts(docker_service: DockerService, executor_info: ExecutorSSHInfo, payload):
@@ -1810,25 +1801,10 @@ class MinerService:
                     raise
                 return
 
-            remote_script_path = "/root/app/backup_storage.py"
-            remote_helper_path = "/root/app/workspace_mount.py"
-            local_script_path = _miner_job_script_path("backup_storage.py")
-            local_helper_path = _miner_job_script_path("workspace_mount.py")
-
-            logger.info(
-                _m(
-                    "Uploading backup_storage.py script to the remote server", 
-                    extra=get_extra_info({ "remote_script_path": remote_script_path, "local_script_path": local_script_path })
-                ),
-            )
-
-            async with ssh_client.start_sftp_client() as sftp:
-                await sftp.put(local_script_path, remote_script_path)
-                await sftp.put(local_helper_path, remote_helper_path)
-
+            # the validator's backup job and its helper, staged and run in a fresh private directory (run_job), never
+            # beside node-local code it could import
+            logger.info(_m("Starting the backup job on the executor", extra=get_extra_info({"backup_log_id": payload.backup_log_id})))
             argv = [
-                executor_payload.EXECUTOR_PYTHON,
-                "/root/app/backup_storage.py",
                 "--api-url", settings.COMPUTE_REST_API_URL_EXTERNAL,
                 "--source-volume", payload.source_volume,
                 "--backup-path", payload.backup_path,
@@ -1839,7 +1815,7 @@ class MinerService:
                 "--backup-target-path", payload.backup_target_path,
             ]
             await ssh_client.run(
-                _nohup_command(["nohup", *argv], "/root/app/backup_storage.log"),
+                executor_payload.run_job("backup", executor_payload.BACKUP_JOB, argv, log="/root/app/backup_storage.log"),
                 timeout=50,
                 check=True,
             )
@@ -1875,25 +1851,9 @@ class MinerService:
                     raise
                 return
 
-            remote_script_path = "/root/app/restore_storage.py"
-            remote_helper_path = "/root/app/workspace_mount.py"
-            local_script_path = _miner_job_script_path("restore_storage.py")
-            local_helper_path = _miner_job_script_path("workspace_mount.py")
-
-            logger.info(
-                _m(
-                    "Uploading restore_storage.py script to the remote server for restore operation", 
-                    extra=get_extra_info({ "remote_script_path": remote_script_path, "local_script_path": local_script_path })
-                ),
-            )
-
-            async with ssh_client.start_sftp_client() as sftp:
-                await sftp.put(local_script_path, remote_script_path)
-                await sftp.put(local_helper_path, remote_helper_path)
-
+            # the validator's restore job and its helper, staged and run in a fresh private directory (run_job)
+            logger.info(_m("Starting the restore job on the executor", extra=get_extra_info({"restore_log_id": payload.restore_log_id})))
             argv = [
-                executor_payload.EXECUTOR_PYTHON,
-                "/root/app/restore_storage.py",
                 "--api-url", settings.COMPUTE_REST_API_URL_EXTERNAL,
                 "--target-volume", payload.target_volume,
                 "--restore-path", payload.restore_path,
@@ -1904,7 +1864,7 @@ class MinerService:
                 "--target-volume-path", payload.target_volume_path,
             ]
             await ssh_client.run(
-                _nohup_command(["nohup", *argv], "/root/app/restore_storage.log"),
+                executor_payload.run_job("restore", executor_payload.RESTORE_JOB, argv, log="/root/app/restore_storage.log"),
                 timeout=50,
                 check=True,
             )
