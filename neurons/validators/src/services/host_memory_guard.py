@@ -59,26 +59,32 @@ def _host_memory_min_script() -> str:
         # argument names a path left to systemd (/system.slice when systemd sets it); its direct children's total is
         # the record "<total> =", which flush skips.
         # A parent's protection is shared among all its children, so each written parent also counts its other
-        # children ("s path" records from sib), each with the protection it already holds: its memory.min, never more
-        # than the parent grants today (a sibling may be a rental; its own claim must not raise the host's reserve)
+        # children ("s path" records from sib) with the protection they already hold: their memory.min summed, never
+        # more in total than the parent granted before this guard first raised it (a sibling may be a rental; its own
+        # claim must not raise the host's reserve). That baseline is kept per boot in $B ("value path" lines), so the
+        # guard's own earlier increment is never counted as a sibling's grant on a later run
         'acc=; add() { acc="$acc$2 $1\n"; }; '
         "sib() { printf '%s' \"$acc\" | while IFS= read -r r; do p=${r#* }; "
         'while u=${p%/*}; [ -n "$u" ] && [ "$u" != "$1" ]; do for c in "/sys/fs/cgroup$u"/*/; do '
         '[ -f "${c}memory.min" ] || continue; c=${c%/}; printf \'s %s\\n\' "${c#/sys/fs/cgroup}"; done; p=$u; done; done; }; '
-        "tree() { { printf '%s' \"$acc\"; sib \"$1\"; } | awk -v k=\"$1\" '"
+        "tree() { { printf '%s' \"$acc\"; sib \"$1\"; } | awk -v k=\"$1\" -v B=\"$B\" '"
         'function sum(a,b){return (a=="max"||b=="max")?"max":a+b} '
         'function big(a,b){return (a=="max"||b=="max")?"max":(a+0>b+0?a:b)} '
         'function small(a,b){return a=="max"?b:(b=="max"?a:(a+0<b+0?a:b))} '
         'function rd(p, c,f){c=""; f="/sys/fs/cgroup" p "/memory.min"; if((getline c < f)<=0) c=0; close(f); return c} '
+        'function base(p){if(!(p in bs)){bs[p]=rd(p); nb[p]=1} return bs[p]} '
+        'BEGIN{while((getline l < B)>0){v=l; sub(/ .*/,"",v); bs[substr(l,length(v)+2)]=v} close(B)} '
         '{v=$1; q=substr($0,length(v)+2); if(v!="s") own[q]=sum(own[q],v); n=split(q,a,"/"); p=""; '
         "for(i=2;i<=n;i++){p=p \"/\" a[i]; if(p!=k){d[p]=i; if(i>m) m=i; if(v!=\"s\") w[p]=1}}} "
         'END{for(i=m;i>=2;i--) for(p in d) if(d[p]==i){u=p; sub(/\\/[^\\/]*$/,"",u); '
-        "t[p]=(p in w)?big(rd(p),sum(own[p],t[p])):small(rd(p),rd(u)); "
-        'if(u in d) t[u]=sum(t[u],t[p]); else if(u==k) s=sum(s,t[p]); if(p in w) print t[p], p} '
-        'print (s==""?0:s), "="}\'; }; '
+        'if(!(p in w)){ss[u]=sum(ss[u],rd(p)); continue} '
+        "t[p]=big(rd(p),sum(own[p],sum(t[p],(p in ss)?small(ss[p],base(p)):0))); "
+        'if(u in d) t[u]=sum(t[u],t[p]); else if(u==k) s=sum(s,t[p]); print t[p], p} '
+        'for(p in nb) print bs[p], p >> B; print (s==""?0:s), "="}\'; }; '
         'flush() { tree "$1" | LC_ALL=C sort -k2 | while read -r v p; do [ "$p" = = ] || set_cg_min "$p" "$v"; done; }; '
         # this shell sits in the executor's cgroup; with the host cgroup namespace its path is absolute
         "ex=$(sed -n 's#^0::##p' /proc/self/cgroup); "
+        "B=/run/lium-host-memory-guard.$(cat /proc/sys/kernel/random/boot_id 2>/dev/null); "
         'case "$ex" in /|"") ex=; echo "memory_min_failed executor root_cgroup";; '
         '/..*) ex=; echo "memory_min_failed executor outside_host_cgroup_namespace";; esac; '
         "if [ -d /run/systemd/system ]; then "
@@ -110,13 +116,17 @@ def _host_memory_min_script() -> str:
         'ts=$(tree /system.slice | sed -n "s/ =\$//p"); '
         'if [ "$ts" = max ] || [ "$hs" = max ]; then inf=1; else sl=$((sl - ${hs:-0} + ${ts:-0})); fi; '
         # the slice's other children (services this guard does not set, rentals' scopes) keep the protection they
-        # already hold: their memory.min, never more than the slice grants today, as for a written parent's children
-        'st=$(systemctl show -p MemoryMin --value system.slice); [ "$st" = infinity ] && st=max; '
+        # already hold: their memory.min summed, never more in total than the slice granted before this guard first
+        # raised it (the per-boot baseline in $B), as for a written parent's children
+        "bs=$(awk '$2==\"/system.slice\"{print $1}' \"$B\" 2>/dev/null); "
+        'if [ -z "$bs" ]; then bs=$(systemctl show -p MemoryMin --value system.slice); [ "$bs" = infinity ] && bs=max; '
+        'bs=${bs:-0}; echo "$bs /system.slice" >> "$B"; fi; ss=0; '
         'for c in /sys/fs/cgroup/system.slice/*/; do [ -f "${c}memory.min" ] || continue; n=${c%/}; n=${n##*/}; '
         f'case " {unit_names} " in *" $n "*) continue;; esac; case "$ex/" in "/system.slice/$n/"*) continue;; esac; '
-        'v=$(cat "${c}memory.min" 2>/dev/null); [ "$v" = max ] && v=$st; '
-        '[ "$st" != max ] && [ "$v" -gt "$st" ] 2>/dev/null && v=$st; '
-        'if [ "$v" = max ]; then inf=1; elif [ "$v" -gt 0 ] 2>/dev/null; then sl=$((sl + v)); fi; done; '
+        'v=$(cat "${c}memory.min" 2>/dev/null); '
+        'if [ "$v" = max ]; then ss=max; elif [ "$ss" != max ] && [ "$v" -gt 0 ] 2>/dev/null; then ss=$((ss + v)); fi; done; '
+        '[ "$ss" = max ] && ss=$bs; [ "$bs" != max ] && [ "$ss" -gt "$bs" ] 2>/dev/null && ss=$bs; '
+        'if [ "$ss" = max ]; then inf=1; else sl=$((sl + ss)); fi; '
         'flush /system.slice; [ -n "$inf" ] && sl=infinity; set_min system.slice "$sl"; '
         "else "
         # no systemd (another init, a container as PID 1): the services' own cgroups, found from /proc. A host service

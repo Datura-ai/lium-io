@@ -92,6 +92,7 @@ def _run_memory_min(
     inner = (
         inner.replace("/sys/fs/cgroup", str(root))
         .replace("/run/systemd/system", str(run_systemd))
+        .replace("/run/lium-host-memory-guard", str(tmp_path / "guard-base"))
         .replace("/proc/", f"{proc}/")
     )
     env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}"}
@@ -390,6 +391,7 @@ def test_parent_counts_the_protection_its_other_children_already_hold(tmp_path, 
     (root / "tenant/memory.min").write_text(f"{granted}\n")
 
     run()
+    run()  # a later run counts the same grant, not the guard's own earlier increment
 
     assert _read(root / "tenant/memory.min") == parent
     assert _read(root / "tenant/executor/memory.min") == EX
@@ -409,5 +411,37 @@ def test_system_slice_counts_the_protection_its_other_children_already_hold(tmp_
     (state / "system.slice").write_text(f"{granted}\n")
 
     run()
+    first = _read(state / "system.slice")
+    run()  # a later run counts the same grant, not the guard's own earlier increment
 
-    assert _read(state / "system.slice") == max(granted, UNITS_MIB * MIB + EX + counted)
+    assert first == max(granted, UNITS_MIB * MIB + EX + counted)
+    assert _read(state / "system.slice") == first
+
+
+def test_other_children_count_together_up_to_what_the_parent_granted(tmp_path):
+    """Two rentals claiming max under a parent granting 2 GiB add 2 GiB in total, not 2 GiB each."""
+    run = _run_memory_min(tmp_path, "/tenant/executor", systemd=False)
+    root = tmp_path / "cg"
+    for name in ("a", "b"):
+        (root / "tenant" / name).mkdir(parents=True)
+        (root / "tenant" / name / "memory.min").write_text("max\n")
+    (root / "tenant/memory.min").write_text(f"{2048 * MIB}\n")
+
+    run()
+    run()
+
+    assert _read(root / "tenant/memory.min") == 2048 * MIB + EX
+
+
+def test_system_slice_other_children_count_together_up_to_what_the_slice_granted(tmp_path):
+    run = _run_memory_min(tmp_path, "/system.slice/docker-abc.scope")
+    root, state = tmp_path / "cg", tmp_path / "sd"
+    for name in ("a.scope", "b.scope"):
+        (root / "system.slice" / name).mkdir(parents=True)
+        (root / "system.slice" / name / "memory.min").write_text("max\n")
+    (state / "system.slice").write_text(f"{2048 * MIB}\n")
+
+    run()
+    run()
+
+    assert _read(state / "system.slice") == UNITS_MIB * MIB + EX + 2048 * MIB
