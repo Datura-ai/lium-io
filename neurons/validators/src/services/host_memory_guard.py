@@ -69,23 +69,30 @@ def _host_memory_min_script() -> str:
         '{ [ "$v" = infinity ] || [ "$v" -ge "$2" ]; } 2>/dev/null && return; '
         'systemctl set-property --runtime "$1" MemoryMin="$2" >/dev/null 2>&1 && echo "memory_min_set $1" '
         '|| echo "memory_min_failed $1 set_property_failed"; }; '
-        # a unit holding the executor keeps its own share on top of the executor's when its cgroup is summed
-        f"for kv in {units}; do u=${{kv%=*}}; case \"$ex\" in \"/system.slice/$u/\"*) add \"/system.slice/$u\" \"${{kv#*=}}\";; esac; "
-        'systemctl is-active -q "$u" && set_min "$u" "${kv#*=}"; done; '
+        # a unit's effective share is its larger existing MemoryMin when it has one; the slice sum and a unit holding the
+        # executor (summed with the executor below) count that share. shortcut: an "infinity" unit counts as its
+        # default (a finite sum cannot hold it), raise system.slice by hand on such a host if it matters
         f"sl={units_mib * MIB}; "
+        f"for kv in {units}; do u=${{kv%=*}}; d=${{kv#*=}}; e=$d; "
+        'if systemctl is-active -q "$u"; then v=$(systemctl show -p MemoryMin --value "$u"); '
+        '[ "$v" -gt "$d" ] 2>/dev/null && { e=$v; sl=$((sl + v - d)); }; set_min "$u" "$d"; fi; '
+        'case "$ex" in "/system.slice/$u/"*) add "/system.slice/$u" "$e";; esac; done; '
         'case "$ex" in '
         f'/system.slice/docker-*.scope) set_min "${{ex#/system.slice/}}" {ex_min}; sl=$((sl + {ex_min}));; '
         f'/system.slice/*) add "$ex" {ex_min}; sl=$((sl + {ex_min}));; '
         f'?*) add "$ex" {ex_min};; esac; '
         'flush /system.slice; set_min system.slice "$sl"; '
         "else "
-        # no systemd (another init, a container as PID 1): the services' own cgroups, found from /proc. The host
-        # PID namespace shows rental and executor processes too, so only processes in PID 1's mount namespace count
-        "hm=$(readlink /proc/1/ns/mnt); "
+        # no systemd (another init, a container as PID 1): the services' own cgroups, found from /proc. A host service
+        # shares PID 1's PID namespace (its mount namespace may be its own); a rental's processes have their own PID
+        # namespace, and the executor's (host PID namespace) sit in its cgroup, so both are left out
+        "hp=$(readlink /proc/1/ns/pid); "
         f"seen=; for d in /proc/[0-9]*; do n=$(cat \"$d/comm\" 2>/dev/null); v=; for kv in {procs}; do "
         '[ "${kv%=*}" = "$n" ] && v=${kv#*=}; done; [ -n "$v" ] || continue; '
-        '[ "$(readlink "$d/ns/mnt")" = "$hm" ] || continue; case " $seen " in *" $n "*) continue;; esac; '
-        'seen="$seen $n"; p=$(sed -n \'s#^0::##p\' "$d/cgroup" 2>/dev/null); '
+        'pn=$(readlink "$d/ns/pid"); case " $seen " in *" $n "*) continue;; esac; '
+        '[ -n "$pn" ] && [ -n "$hp" ] || { echo "memory_min_failed $n pid_namespace_unreadable"; continue; }; '
+        '[ "$pn" = "$hp" ] || continue; p=$(sed -n \'s#^0::##p\' "$d/cgroup" 2>/dev/null); '
+        '[ -n "$ex" ] && case "$p/" in "$ex/"*) continue;; esac; seen="$seen $n"; '
         # memory.min does not exist on the root cgroup: a service there cannot be protected without moving it
         'case "$p" in /|"") echo "memory_min_failed $n root_cgroup";; /..*) ;; *) add "$p" "$v";; esac; done; '
         f'[ -n "$ex" ] && add "$ex" {ex_min}; flush; '
