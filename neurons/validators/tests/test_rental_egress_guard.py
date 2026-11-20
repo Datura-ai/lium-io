@@ -1249,6 +1249,9 @@ def test_a_boot_copy_holds_the_docker_start_until_the_rules_are_back(tmp_path):
     [line] = [x for x in unit.splitlines() if x.startswith("ExecStart=")]
     assert not line.startswith("ExecStart=-")
     assert "TimeoutStartSec=infinity" in unit.splitlines()  # no start timeout cuts the wait short
+    # a host firewall's start flushes the ruleset: the boot copy writes the rules after it, not in parallel
+    assert f"After={rental_egress_guard.BOOT_AFTER}" in unit.splitlines()
+    assert "firewalld.service" in rental_egress_guard.BOOT_AFTER.split()
     # sergej-bot review at 957d8e3: Docker's own start settings, the provider's included, are left as they are
     dropin = (root / rental_egress_guard.BOOT_DROPIN.lstrip("/")).read_text()
     assert dropin.splitlines()[0] == "[Unit]" and "[Service]" not in dropin and "Timeout" not in dropin

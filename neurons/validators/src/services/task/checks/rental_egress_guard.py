@@ -264,6 +264,7 @@ def link_local_drop_script(bridge: str | None, legacy_bridges: list[str], host_r
 
 
 NO_BOOT_UNIT = "boot restore not installed: no systemd docker.service"
+BOOT_AFTER = "firewalld.service nftables.service iptables.service netfilter-persistent.service"
 
 
 def _boot_restore(boot: str, host_root: str) -> str:
@@ -276,9 +277,10 @@ def _boot_restore(boot: str, host_root: str) -> str:
     # dockerd restarts rental containers itself (unless-stopped), past the validator's pre-start guard: Requires= with
     # After= keeps dockerd from starting until the boot copy has put the rules back, and a boot copy that fails stops
     # it. The wait has no deadline on this unit only, so Docker's own start timeout and the provider's settings stay.
-    # No RemainAfterExit: the copy runs again on every Docker start, as before
+    # No RemainAfterExit: the copy runs again on every Docker start, as before. After= the host firewall services
+    # Docker itself orders after: their start flushes the ruleset, so the copy must write the rules after they load
     unit = shlex.quote(
-        "[Unit]\\nDescription=Lium rental egress rules\\n"
+        f"[Unit]\\nDescription=Lium rental egress rules\\nAfter={BOOT_AFTER}\\n"
         f"[Service]\\nType=oneshot\\nTimeoutStartSec=infinity\\nExecStart=/bin/sh {BOOT_SCRIPT}\\n"
     )
     hook = shlex.quote(f"[Unit]\\nRequires={name}\\nAfter={name}\\n")
