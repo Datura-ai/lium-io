@@ -148,9 +148,10 @@ def test_systemd_unit_with_more_protection_is_not_lowered(tmp_path):
 
     out = run()
 
-    assert _read(tmp_path / "sd/system.slice") == UNITS_MIB * MIB * 4
     assert (tmp_path / "sd/docker.service").read_text().strip() == "infinity"
-    assert "memory_min_set system.slice" not in out
+    # the slice holding an unlimited unit is made unlimited too, so it never caps the unit's protection
+    assert (tmp_path / "sd/system.slice").read_text().strip() == "infinity"
+    assert "memory_min_set docker.service" not in out
 
 
 def test_protected_total_stays_under_the_pod_reserve():
@@ -177,17 +178,29 @@ def test_executor_on_another_cgroup_path_gets_memory_min_written_with_its_parent
     assert out["failed"] == []
 
 
-@pytest.mark.parametrize("existing_mib", [0, 2048])
+@pytest.mark.parametrize("existing_mib", [0, 2048, "infinity"])
 def test_executor_under_system_slice_counts_in_the_slice_set_by_systemd(tmp_path, existing_mib):
     active = ("docker.service", "ssh.service", "containerd.service")
     run = _run_memory_min(tmp_path, "/system.slice/containerd.service/x", active=active)
+    root, state = tmp_path / "cg", tmp_path / "sd"
+    if existing_mib == "infinity":
+        # systemd writes an infinite MemoryMin to the unit cgroup as max
+        (state / "containerd.service").write_text("infinity\n")
+        (root / "system.slice/containerd.service/memory.min").write_text("max\n")
+
+        run()
+
+        assert _read(root / "system.slice/containerd.service/x/memory.min") == EX
+        assert (root / "system.slice/containerd.service/memory.min").read_text().strip() == "max"
+        assert (state / "containerd.service").read_text().strip() == "infinity"
+        assert (state / "system.slice").read_text().strip() == "infinity"
+        return
     if existing_mib:
-        (tmp_path / "sd/containerd.service").write_text(f"{existing_mib * MIB}\n")
+        (state / "containerd.service").write_text(f"{existing_mib * MIB}\n")
     share = max(existing_mib, UNIT_MEMORY_MIN_MIB["containerd.service"]) * MIB
 
     run()
 
-    root, state = tmp_path / "cg", tmp_path / "sd"
     assert _read(root / "system.slice/containerd.service/x/memory.min") == EX
     assert _read(root / "system.slice/containerd.service/memory.min") == EX + share
     assert _read(state / "containerd.service") == share

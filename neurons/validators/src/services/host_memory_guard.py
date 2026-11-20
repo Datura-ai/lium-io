@@ -57,7 +57,8 @@ def _host_memory_min_script() -> str:
         # left to systemd (/system.slice when systemd sets it)
         'acc=; add() { acc="$acc $1=$2"; }; '
         "flush() { for kv in $acc; do echo \"${kv%=*} ${kv#*=}\"; done | awk -v k=\"$1\" '{n=split($1,a,\"/\"); p=\"\"; "
-        "for(i=2;i<=n;i++){p=p \"/\" a[i]; if(p!=k) s[p]+=$2}} END{for(p in s) print p, s[p]}' "
+        "for(i=2;i<=n;i++){p=p \"/\" a[i]; if(p!=k){s[p]+=($2==\"max\")?0:$2; if($2==\"max\") m[p]=1}}} "
+        "END{for(p in s) print p, (p in m)?\"max\":s[p]}' "
         '| sort | while read -r p v; do set_cg_min "$p" "$v"; done; }; '
         # this shell sits in the executor's cgroup; with the host cgroup namespace its path is absolute
         "ex=$(sed -n 's#^0::##p' /proc/self/cgroup); "
@@ -70,18 +71,19 @@ def _host_memory_min_script() -> str:
         'systemctl set-property --runtime "$1" MemoryMin="$2" >/dev/null 2>&1 && echo "memory_min_set $1" '
         '|| echo "memory_min_failed $1 set_property_failed"; }; '
         # a unit's effective share is its larger existing MemoryMin when it has one; the slice sum and a unit holding the
-        # executor (summed with the executor below) count that share. shortcut: an "infinity" unit counts as its
-        # default (a finite sum cannot hold it), raise system.slice by hand on such a host if it matters
-        f"sl={units_mib * MIB}; "
+        # executor (summed with the executor below) count that share. An "infinity" unit makes both unlimited too
+        # (max for a directly written cgroup, infinity for system.slice): a finite parent would cap its protection
+        f"sl={units_mib * MIB}; inf=; "
         f"for kv in {units}; do u=${{kv%=*}}; d=${{kv#*=}}; e=$d; "
         'if systemctl is-active -q "$u"; then v=$(systemctl show -p MemoryMin --value "$u"); '
-        '[ "$v" -gt "$d" ] 2>/dev/null && { e=$v; sl=$((sl + v - d)); }; set_min "$u" "$d"; fi; '
+        'if [ "$v" = infinity ]; then e=max; inf=1; elif [ "$v" -gt "$d" ] 2>/dev/null; then e=$v; sl=$((sl + v - d)); fi; '
+        'set_min "$u" "$d"; fi; '
         'case "$ex" in "/system.slice/$u/"*) add "/system.slice/$u" "$e";; esac; done; '
         'case "$ex" in '
         f'/system.slice/docker-*.scope) set_min "${{ex#/system.slice/}}" {ex_min}; sl=$((sl + {ex_min}));; '
         f'/system.slice/*) add "$ex" {ex_min}; sl=$((sl + {ex_min}));; '
         f'?*) add "$ex" {ex_min};; esac; '
-        'flush /system.slice; set_min system.slice "$sl"; '
+        'flush /system.slice; [ -n "$inf" ] && sl=infinity; set_min system.slice "$sl"; '
         "else "
         # no systemd (another init, a container as PID 1): the services' own cgroups, found from /proc. A host service
         # shares PID 1's PID namespace (its mount namespace may be its own); a rental's processes have their own PID
