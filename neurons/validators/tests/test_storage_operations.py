@@ -52,6 +52,41 @@ async def test_cancel_fallback_removes_the_helper_container(
         assert subprocess.run(["kill", "-0", str(runner_pid)], capture_output=True).returncode != 0
 
 
+@pytest.mark.asyncio
+async def test_a_cancel_that_cannot_write_its_marker_still_stops_the_runner_then_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    reported = AsyncMock(return_value=True)
+    monkeypatch.setattr(storage_operations, "_report_cancelled", reported)
+    docker_log = tmp_path / "docker.log"
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text(f'#!/bin/sh\necho "$*" >> {docker_log}\n')
+    fake_docker.chmod(0o755)
+    spawned = subprocess.run(["sh", "-c", "sleep 60 >/dev/null 2>&1 & echo $!"], capture_output=True, text=True)
+    runner_pid = int(spawned.stdout)
+    (tmp_path / f"{OPERATION_ID}.pid").write_text(str(runner_pid))
+
+    async def run_locally(command: str, check: bool = False) -> SimpleNamespace:
+        # a full or read-only filesystem: the marker write fails
+        command = (
+            command.replace("/usr/bin/docker", str(fake_docker))
+            .replace("sleep 0.25", "sleep 0.01")
+            .replace("touch ", "false ")
+        )
+        result = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
+        return SimpleNamespace(exit_status=result.returncode, stdout=result.stdout, stderr=result.stderr)
+
+    try:
+        with pytest.raises(storage_operations.StorageOperationLaunchError):
+            await storage_operations.cancel_storage_operation(SimpleNamespace(run=run_locally), OPERATION_ID)
+    finally:
+        subprocess.run(["kill", "-KILL", str(runner_pid)], capture_output=True)
+    helper = f"lium-storage-{str(OPERATION_ID)[:12]}"
+    assert docker_log.read_text().splitlines() == [f"stop --time 5 {helper}", f"rm -f -- {helper}"]
+    reported.assert_not_awaited()
+
+
 @pytest.mark.parametrize("field", ["bootstrap", "exclude_patterns"])
 def test_workspace_field_probe_finds_the_field_in_this_repo_s_executor_models(field: str) -> None:
     # The probe imports the executor's own storage.models; run it against this checkout's copy

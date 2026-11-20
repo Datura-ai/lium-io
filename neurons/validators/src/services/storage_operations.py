@@ -427,9 +427,11 @@ async def cancel_storage_operation(
     pid_path = shlex.quote(str(files.pid))
     # Let the runner terminate its Restic process and helper first. Direct
     # process termination is only a bounded fallback for an unresponsive runner.
-    # the marker is what stops a later launch, so a cancel that cannot write it fails
+    # the marker is what stops a later launch, so a cancel that cannot write it fails, but only
+    # after it has still stopped the runner and helper
     command = (
-        f"install -d -m 0700 {shlex.quote(str(REMOTE_OPERATION_DIRECTORY))} && touch {cancel_path} || exit 4; "
+        "marked=0; "
+        f"install -d -m 0700 {shlex.quote(str(REMOTE_OPERATION_DIRECTORY))} && touch {cancel_path} || marked=4; "
         f"if test -s {pid_path}; then "
         f"pid=$(cat {pid_path}); "
         "case \"$pid\" in (*[!0-9]*|'') exit 2;; esac; "
@@ -448,7 +450,8 @@ async def cancel_storage_operation(
         "else "
         f"/usr/bin/docker stop --time 5 {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
         f"/usr/bin/docker rm -f -- {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
-        "fi"
+        "fi; "
+        'exit "$marked"'
     )
     result = await ssh_client.run(command, check=False)
     if result.exit_status == 2:
