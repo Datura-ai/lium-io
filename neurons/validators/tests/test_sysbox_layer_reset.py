@@ -211,3 +211,14 @@ async def test_an_image_built_without_the_setup_script_installs_nothing(context_
 
     assert (result.passed, result.event.reason_code) == (True, Msg.UNKNOWN.reason)
     ssh.run.assert_not_awaited()
+
+
+def test_every_scrape_key_is_registered_in_both_obfuscation_tables():
+    # a key only in ORIGINAL_KEYS ships unobfuscated in the scrape binary; one only in generate_key_mappings is
+    # stripped by the backend model. Checking the whole tables keeps the next new key from missing either.
+    from neurons.validators.tests.test_scrape_disk_breakdown import _obfuscation_tables
+
+    original_keys, mapped_keys = _obfuscation_tables()
+
+    assert {"data_sysbox_layer_reset_version", "data_sysbox_layer_reset_scrape_error"} <= mapped_keys
+    assert sorted(original_keys - mapped_keys) == []

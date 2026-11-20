@@ -419,6 +419,8 @@ class FileEncryptService:
             'data_needrestart_guard_scrape_error': "",
             'data_needrestart_guard_unguarded': "",
             'data_needrestart_guard': "",
+            'data_sysbox_layer_reset_version': "",
+            'data_sysbox_layer_reset_scrape_error': "",
             'data_nvidiactl_owner_uid': "",
             'data_power_cap_probe_error': "",
             # DAH-2922 - longer keys before the key they extend (prefix rule above)
