@@ -327,6 +327,8 @@ class RentalProbeCheck:
             return CheckResult(
                 passed=True,
                 event=render_message(Msg.PROBE_OK, ctx=ctx, check_id=self.check_id, what=what),
+                # DAH-6784: the probe ran this cycle and its rental succeeded: the full check
+                updates={"idle_check_passed": True},
             )
 
         # A renter may have taken the node while the probe ran: their create sweeps our container
@@ -498,6 +500,9 @@ class RentalProbeCheck:
                     "create_step": failure.create_step,
                     "ssh_port": ssh_port,
                 },
+                # a rented node is left alone (class docstring): a rental placed after the reads above keeps
+                # its node, the backend applies this reset only while no customer pod runs there
+                "clear_verified_job_unrented_only": True,
             },
         )
 

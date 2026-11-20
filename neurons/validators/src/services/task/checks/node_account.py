@@ -62,10 +62,17 @@ class NodeAccountCheck:
         # compared first: it needs no read, so a stalled account read cannot hide this direct evidence
         if expected and presented_host_key(ctx) not in expected:
             return _refused(ctx, self.check_id, Msg.MISMATCH, what)
-        if executor.expected_node_hotkeys and ctx.runner is not None:
-            refused = await self._other_account(ctx, what)
-            if refused is not None:
-                return refused
+        binding_proven: bool | None = None  # None: the node names no account to bind it to
+        if executor.expected_node_hotkeys:
+            binding_proven = False
+            if ctx.runner is not None:
+                refused = await self._other_account(ctx, what)
+                if isinstance(refused, CheckResult):
+                    return refused
+                binding_proven = refused
+        # DAH-6784: the check ran in full when it proved all this node can be checked by (its recorded host key, the
+        # account binding it names), and at least one of them; only then may it lift a hold it left on a rented node
+        full = {"idle_check_passed": True} if binding_proven is not False and (expected or binding_proven) else {}
         if not expected:
             if not is_ip_literal(executor.address) and executor.uuid not in _logged_without_expected:
                 _logged_without_expected.add(executor.uuid)
@@ -75,12 +82,17 @@ class NodeAccountCheck:
                         extra=get_extra_info({**what, "miner_hotkey": ctx.miner_hotkey}),
                     )
                 )
-            return CheckResult(passed=True, event=render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what=what))
+            return CheckResult(
+                passed=True, event=render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id, what=what), updates=full
+            )
 
-        return CheckResult(passed=True, event=render_message(Msg.MATCH, ctx=ctx, check_id=self.check_id, what=what))
+        return CheckResult(
+            passed=True, event=render_message(Msg.MATCH, ctx=ctx, check_id=self.check_id, what=what), updates=full
+        )
 
-    async def _other_account(self, ctx: Context, what: dict) -> CheckResult | None:
-        """MISMATCH when the machine reached is set up for another account than the one listing it, else None."""
+    async def _other_account(self, ctx: Context, what: dict) -> CheckResult | bool:
+        """MISMATCH when the machine reached is set up for another account than the one listing it; else whether the
+        binding was read and proven (False: an older executor without host files, or an unread claim)."""
         executor = ctx.executor
         result = await ctx.runner.run(READ_NODE_ACCOUNT_COMMAND, timeout=READ_TIMEOUT_SECONDS, retryable=True)
         found = dict(line.split("=", 1) for line in (result.stdout or "").splitlines() if "=" in line)
@@ -95,7 +107,7 @@ class NodeAccountCheck:
         if not hotkey:
             # the read worked and found no host files: an older executor, no evidence either way
             logger.info(_m("NODE_ACCOUNT_BINDING_UNVERIFIED", extra=get_extra_info({**what, "unread": "hotkey"})))
-            return None
+            return False
         if hotkey not in executor.expected_node_hotkeys:
             what["binding_mismatch"] = "hotkey"
         elif expected_claim and hotkey == ctx.miner_hotkey and claim and claim != expected_claim:
@@ -105,7 +117,8 @@ class NodeAccountCheck:
         else:
             if expected_claim and hotkey == ctx.miner_hotkey and not claim:
                 logger.info(_m("NODE_ACCOUNT_BINDING_UNVERIFIED", extra=get_extra_info({**what, "unread": "claim"})))
-            return None
+                return False
+            return True
         return _refused(ctx, self.check_id, Msg.BINDING_MISMATCH, what)
 
 
@@ -121,6 +134,12 @@ def _refused(ctx: Context, check_id: str, template, what: dict) -> CheckResult:
     return CheckResult(
         passed=False,
         event=event,
-        updates={"node_account_passed": False, "clear_verified_job_info": True},
+        updates={
+            "node_account_passed": False,
+            "clear_verified_job_info": True,
+            # has_live_rental reads a snapshot: a rental placed since must not be ended, so the backend applies this
+            # reset only while no customer pod runs on the node, under its row lock
+            "clear_verified_job_unrented_only": True,
+        },
         fatal=True,
     )

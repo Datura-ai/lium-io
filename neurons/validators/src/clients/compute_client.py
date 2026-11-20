@@ -531,6 +531,7 @@ class ComputeClient:
                             pod_states=data.get("pod_states"),
                             pod_ssh=data.get("pod_ssh"),
                             host_runtime_fault=data.get("host_runtime_fault"),
+                            idle_checks_passed=data.get("idle_checks_passed"),
                             check_started_at=data.get("check_started_at"),
                             ssh_host_key=data.get("ssh_host_key"),
                         )
@@ -616,6 +617,7 @@ class ComputeClient:
                             reason_code=data.get("reason_code"),
                             check_id=data.get("check_id"),
                             evidence=data.get("evidence"),
+                            unrented_only=data.get("unrented_only") is True,
                         )
 
                         async with self.lock:

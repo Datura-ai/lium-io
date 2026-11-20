@@ -1450,6 +1450,7 @@ class RedisService:
         evidence: dict | None = None,
         reanchor_uuids: str = '',
         respec: str = '',
+        unrented_only: bool = False,
     ):
         # a changed model:count is reset once, then verified from scratch as it is now
         spec = respec or prev_info.get('spec', '')
@@ -1478,6 +1479,8 @@ class RedisService:
                 "reason_code": reason_code,
                 "check_id": check_id,
                 "evidence": evidence or None,
+                # DAH-6784: idle-only reset; an older backend ignores the key
+                "unrented_only": unrented_only is True,
             },
         )
 

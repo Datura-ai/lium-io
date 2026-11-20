@@ -841,7 +841,7 @@ async def test_success_records_every_step_tears_down_and_stamps_the_interval():
     assert redis.expiries[f"rental_probe_ok:{EXECUTOR.uuid}"] == module._REDIS_STAMP_TTL_SECONDS
     probe_pod_id = docker.create_calls[0][0].pod_id
     assert redis.removed_pending == [(MINER, EXECUTOR.uuid, probe_pod_id)]
-    assert result.updates == {}
+    assert result.updates == {"idle_check_passed": True}  # DAH-6784: the full check ran and passed
 
 
 @pytest.mark.asyncio
@@ -1610,6 +1610,8 @@ async def test_pipeline_carries_the_failed_step_to_the_reset_evidence():
     assert last_ctx.clear_verified_job_info is True
     assert last_ctx.clear_verified_job_evidence["reason_code"] == "RENTAL_PROBE_FAILED"
     assert last_ctx.clear_verified_job_evidence["failed_step"] == STEP_SSHD_LISTEN
+    assert last_ctx.clear_verified_job_unrented_only is True
+    assert "unrented_only" not in last_ctx.clear_verified_job_evidence
     assert last_ctx.score == 0.0 and last_ctx.job_score == 0.0
     # the pipeline writes its own per-check `steps` summary onto the last event; the probe's records must
     # survive it under their own key, since this event is what the portal shows the provider
