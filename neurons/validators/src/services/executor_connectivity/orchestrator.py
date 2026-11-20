@@ -161,7 +161,6 @@ class ConnectivityOrchestrator:
             dind_port = None
         probe_log = {
             **log_ctx,
-            "probe_container": f"container_{miner_hotkey}_{dind_port.external}" if dind_port else None,
             "internal_port": dind_port.internal if dind_port else None,
             "external_port": dind_port.external if dind_port else None,
             "held_ports": sorted(held & {p.internal for p in ports}) if held is not None else None,

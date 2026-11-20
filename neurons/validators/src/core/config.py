@@ -242,10 +242,6 @@ class Settings(BaseSettings):
     # just-started collector) are counted per node and logged as INSPECTOR_BLIND_STREAK from this
     # many on.
     INSPECTOR_BLIND_STREAK_LIMIT: int = Field(env="INSPECTOR_BLIND_STREAK_LIMIT", default=5)
-    # On: the Inspector check fails from that cycle until the sensor reports again. Off by default.
-    INSPECTOR_BLIND_STREAK_ENFORCEMENT_ENABLED: bool = Field(
-        env="INSPECTOR_BLIND_STREAK_ENFORCEMENT_ENABLED", default=False
-    )
     # On a libinspector.so hash mismatch a RENTED executor, during the rental, curls
     # INSPECTOR_LIBRARY_FETCH_URL once into a temp file beside /usr/lib/libinspector.so, and the
     # file replaces the library (one rename) only if its sha256 is the validator's own. This is a
@@ -971,6 +967,21 @@ class Settings(BaseSettings):
             "Percent of host RAM kept back, see RENTAL_HOST_RAM_RESERVE_GB (10 %, as the backend: an idle "
             "376 GiB host used 14 GiB outside the rental's cgroup, more than the former 3 %)."
         ),
+    )
+    RENTAL_HOST_CPU_RESERVE: int = Field(
+        env="RENTAL_HOST_CPU_RESERVE", default=1, ge=0,
+        description=(
+            "CPUs kept back for the host (sshd, dockerd, the executor): a rental's --cpus is at most "
+            "the host's CPU count minus this, so a whole-host rental cannot take every core."
+        ),
+    )
+    RENTAL_LOG_MAX_SIZE: str = Field(
+        env="RENTAL_LOG_MAX_SIZE", default="100m",
+        description="json-file max-size of a rental container's log, so its stdout cannot fill the host disk.",
+    )
+    RENTAL_LOG_MAX_FILE: int = Field(
+        env="RENTAL_LOG_MAX_FILE", default=3, gt=0,
+        description="json-file max-file of a rental container's log (see RENTAL_LOG_MAX_SIZE).",
     )
     CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS: int = Field(
         env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60, gt=0,

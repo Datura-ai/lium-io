@@ -15,6 +15,7 @@ import logging
 
 import asyncssh
 
+from core.config import settings
 from core.utils import _m, get_extra_info
 from services.rental_docker_sdk import (
     ContainerExecSpec,
@@ -81,7 +82,8 @@ _ENTRYPOINT = (
 def quote_broker_revision() -> str:
     # anything that changes what the broker does changes the revision, so a running broker
     # from an older validator release gets replaced instead of trusted
-    digest = hashlib.sha256(f"{QUOTE_BROKER_IMAGE}\n{_ENTRYPOINT}\n{_NGINX_CONF}".encode()).hexdigest()
+    log = f"{settings.RENTAL_LOG_MAX_SIZE}/{settings.RENTAL_LOG_MAX_FILE}"
+    digest = hashlib.sha256(f"{QUOTE_BROKER_IMAGE}\n{_ENTRYPOINT}\n{_NGINX_CONF}\n{log}".encode()).hexdigest()
     return digest[:16]
 
 
@@ -100,6 +102,8 @@ def quote_broker_run_spec() -> ContainerRunSpec:
             VolumeMount(source=QUOTE_BROKER_SOCKET_DIR, target=QUOTE_BROKER_SOCKET_DIR),
         ),
         restart_policy="unless-stopped",
+        # same rotation as a rental: an unbounded json-file log could fill the host disk
+        log_opts={"max-size": settings.RENTAL_LOG_MAX_SIZE, "max-file": str(settings.RENTAL_LOG_MAX_FILE)},
     )
 
 
