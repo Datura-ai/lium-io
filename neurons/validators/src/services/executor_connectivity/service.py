@@ -88,7 +88,6 @@ class ExecutorConnectivityService:
                 sysbox_measured=verification.sysbox_measured,
                 host_runtime_fault=verification.host_runtime_fault,
                 dind_skipped=verification.dind_skipped,
-                sysbox_fs_read_clean=verification.sysbox_fs_read_clean,
             )
 
             return result

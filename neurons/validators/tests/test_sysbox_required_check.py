@@ -10,7 +10,6 @@ from neurons.validators.src.services.executor_connectivity.dind_probe import (
     diagnose_docker_run_error,
     ssh_ready_timeout,
 )
-from neurons.validators.src.services.task.availability import AvailabilityErrorCode, availability_errors
 from neurons.validators.src.services.task.checks.sysbox_required import (
     _NVIDIA_HOOK_TEMPLATE_BY_REASON_CODE,
     SysboxRequiredCheck,
@@ -23,7 +22,7 @@ from protocol.vc_protocol.compute_requests import (
 )
 
 from services.executor_connectivity.models import DindLogCause
-from tests.helpers import FakeRedis, build_services, build_state
+from tests.helpers import build_state
 
 
 def _rented_data(miner_hotkey: str = "test-miner", port: str = "22") -> RentedExecutorsResponse:
@@ -315,84 +314,3 @@ async def test_no_sysbox_under_another_miners_rental_on_a_different_endpoint_fai
 
     assert result.passed is False
     assert result.event.reason_code == Msg.SYSBOX_MISSING.reason
-
-
-_SYSBOX_FS_BROKEN = DindLogCause(
-    "HOST_SYSBOX_FS_BROKEN", "reading /proc/sys/kernel/hostname in a new sysbox container failed: not connected"
-)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("rented", [True, False])
-async def test_a_broken_sysbox_fs_hides_the_node_without_failing_the_run(context_factory, rented):
-    """DAH-6637: an availability entry, rented (split) or not; never fatal, verification kept."""
-    state = build_state(
-        sysbox_runtime=True, dind_probe_error=_SYSBOX_FS_BROKEN, rented_data=_rented_data() if rented else None
-    )
-
-    result = await SysboxRequiredCheck().run(context_factory(state=state))
-
-    assert (result.passed, result.fatal) == (False, False)
-    assert "clear_verified_job_info" not in result.updates
-    [entry] = availability_errors([result.event])
-    assert entry.reason_code == AvailabilityErrorCode.HOST_SYSBOX_FS_BROKEN
-    assert (entry.reach_source, entry.reach_target) == ("validator", "node")
-    assert entry.what_we_saw["is_rented"] is rented
-
-
-@pytest.mark.asyncio
-async def test_a_clean_sysbox_fs_read_sends_no_entry(context_factory):
-    """No hold and a clean read: no entry."""
-    state = build_state(sysbox_runtime=True, sysbox_fs_read_clean=True)
-
-    result = await SysboxRequiredCheck().run(context_factory(state=state))
-
-    assert result.passed is True
-    assert availability_errors([result.event]) == []
-
-
-async def _cycle(context_factory, redis, **state):
-    ctx = context_factory(state=build_state(sysbox_runtime=True, **state), services=build_services(redis=redis))
-    return await SysboxRequiredCheck().run(ctx)
-
-
-@pytest.mark.asyncio
-async def test_a_cycle_without_a_read_keeps_the_hold_until_a_clean_read(context_factory):
-    """Review on #2327: a skipped, deferred or timed-out probe must not list the node again; only a clean read does."""
-    redis = FakeRedis()
-
-    broken = await _cycle(context_factory, redis, dind_probe_error=_SYSBOX_FS_BROKEN)
-    unread = await _cycle(context_factory, redis)
-    clean = await _cycle(context_factory, redis, sysbox_fs_read_clean=True)
-    after = await _cycle(context_factory, redis)
-
-    assert (broken.passed, unread.passed, unread.fatal) == (False, False, False)
-    [entry] = availability_errors([unread.event])
-    assert entry.reason_code == AvailabilityErrorCode.HOST_SYSBOX_FS_BROKEN
-    assert "no clean read yet" in entry.what_we_saw["dind_probe_error"]
-    assert (clean.passed, after.passed) == (True, True)
-    assert redis.store == {}
-
-
-@pytest.mark.asyncio
-async def test_a_redis_outage_holds_nothing_but_still_reports_a_broken_read(context_factory):
-    redis = FakeRedis(failing=True)
-
-    broken = await _cycle(context_factory, redis, dind_probe_error=_SYSBOX_FS_BROKEN)
-    unread = await _cycle(context_factory, redis)
-
-    assert (broken.passed, unread.passed) == (False, True)
-
-
-@pytest.mark.asyncio
-async def test_a_failed_hold_renewal_keeps_the_node_hidden_and_ends_no_run(context_factory):
-    """Review on #2327: a Redis error on the renewal neither raises out of the check nor lists the node."""
-    redis = FakeRedis()
-    await _cycle(context_factory, redis, dind_probe_error=_SYSBOX_FS_BROKEN)
-    redis.fail_next_set_of = set(redis.store)
-
-    unread = await _cycle(context_factory, redis)
-
-    assert (unread.passed, unread.fatal) == (False, False)
-    [entry] = availability_errors([unread.event])
-    assert entry.reason_code == AvailabilityErrorCode.HOST_SYSBOX_FS_BROKEN

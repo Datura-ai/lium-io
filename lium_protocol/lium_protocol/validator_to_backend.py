@@ -331,8 +331,9 @@ class ExecutorSpecRequest(ValidatorMessage):
     # it (`RENTED_POD_PROC_FUSE_DISCONNECTED`); [] = judged and clean. A pod not listed was not judged. None = no check
     # judged a pod, or a publisher that predates the field.
     rented_pod_faults: dict[str, list[str]] | None = pydantic.Field(default=None, max_length=POD_STATES_MAX_ITEMS)
-    # 2.17.0: this cycle's fresh DinD test container read a sysbox-fs file clean. None from a publisher that predates
-    # the field.
+    # 2.17.0: this cycle's fresh DinD test container started under sysbox and passed, so the host's sysbox-fs works
+    # (sysbox-ce starts no new container while it is broken). None when no probe ran and from a publisher that
+    # predates the field.
     sysbox_fs_read_clean: bool | None = None
     # When an express recheck outside the cycle started; its `job_batch_id` is still the cycle's. None for a cycle's
     # own report and from a publisher that predates the field.

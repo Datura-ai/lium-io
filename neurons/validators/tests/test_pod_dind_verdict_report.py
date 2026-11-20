@@ -1,5 +1,5 @@
 """DAH-6710: the validator reports, per rented pod, a dead /proc FUSE (RENTED_POD_PROC_FUSE_DISCONNECTED) and whether
-this cycle's fresh DinD container read sysbox-fs clean."""
+this cycle's fresh DinD container started under sysbox and passed (sysbox-fs works)."""
 
 from __future__ import annotations
 

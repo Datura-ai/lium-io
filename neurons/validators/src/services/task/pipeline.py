@@ -218,11 +218,11 @@ class ContextState:
     # hook, from docker's stderr). None when the probe passed or the cause is unknown.
     # SysboxRequiredCheck puts it into the SYSBOX_REQUIRED_MISSING event instead of "install sysbox",
     # and emits the NVIDIA_* reason code in place of SYSBOX_REQUIRED_MISSING for an NVIDIA_* cause,
-    # DIND_PROBE_UNREACHABLE for DIND_SSHD_NOT_READY (DAH-5844). DAH-6637: HOST_SYSBOX_FS_BROKEN on a passed
-    # probe; SysboxRequiredCheck turns it into an availability entry.
+    # DIND_PROBE_UNREACHABLE for DIND_SSHD_NOT_READY (DAH-5844).
     dind_probe_error: DindLogCause | None = None
-    # DAH-6637: this cycle's DinD probe read a sysbox-fs file clean; lifts SysboxRequiredCheck's sysbox-fs hold.
-    # None when no probe ran this cycle (skipped, or no pipeline), so the report does not read it as unclean
+    # this cycle's DinD probe started a fresh container under sysbox and it passed: sysbox-ce 0.7.1 starts no new
+    # container while sysbox-fs is broken, so the host's sysbox-fs works now. None when no probe ran (skipped, the
+    # connection dropped, or no pipeline), so the report does not read it as broken
     sysbox_fs_read_clean: bool | None = None
     # the outside prober could not reach the ports: our filler's ports are behind the same firewall
     externally_unreachable: bool = False

@@ -552,6 +552,28 @@ async def test_port_connectivity_carries_the_dind_probe_cause_into_state(context
     assert "dind_error" not in result.updates["default_extra"]
 
 
+@pytest.mark.parametrize(
+    "dind_ok,measured,skipped,expected",
+    [
+        (True, True, False, True),  # a fresh container started under sysbox and passed: sysbox-fs works
+        (True, None, False, False),  # passed without testing sysbox: no sysbox-fs evidence
+        (False, True, False, False),
+        (False, None, True, None),  # no probe ran: neither clean nor broken
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_passed_sysbox_probe_reports_sysbox_fs_clean(context_factory, dind_ok, measured, skipped, expected):
+    connectivity = DummyConnectivityService(
+        success=True, verified_port_count=100, dind_ok=dind_ok, sysbox_measured=measured, dind_skipped=skipped
+    )
+    services = build_services(redis=DummyRedis(renting_in_progress=False), backend=DummyBackendService(), connectivity=connectivity)
+    ctx = context_factory(
+        services=services, config=build_context_config(job_batch_id="batch-123"), state=build_state(), rented=False
+    )
+    result = await PortConnectivityCheck().run(ctx)
+    assert result.updates["state"].sysbox_fs_read_clean is expected
+
+
 @pytest.mark.parametrize("success", [True, False])
 @pytest.mark.asyncio
 async def test_port_connectivity_event_carries_the_range_tallies(context_factory, success):

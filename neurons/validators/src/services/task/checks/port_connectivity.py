@@ -280,9 +280,11 @@ class PortConnectivityCheck:
             declared_port_count=declared_port_count,
             verified_port_pairs=[(p.internal, p.external) for p in result.successful_ports],
             dind_probe_error=result.dind_error,
-            sysbox_fs_read_clean=result.sysbox_fs_read_clean,
             externally_unreachable=result.status == "externally_unreachable",
             host_runtime_fault=result.host_runtime_fault,
+            sysbox_fs_read_clean=(
+                None if result.dind_skipped or result.connection_lost else result.dind_ok and result.sysbox_measured is True
+            ),
             external_probe_blocked=result.external_probe == "blocked",
             port_probe_connection_lost=(result.error or "connection lost") if result.connection_lost else None,
         )
