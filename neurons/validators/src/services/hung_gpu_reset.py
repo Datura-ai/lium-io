@@ -145,7 +145,9 @@ async def _restore_left_stopped(runner: SSHCommandRunner) -> None:
     query) must not leave them down until a GPU hangs again. A healthy host pays one read of the unit's list."""
     try:
         listed = await _run(runner, STOPPED_UNITS_READ_COMMAND)
-        if listed.exit_code == 0 and (listed.stdout or "").strip() and not await _reset_unit_pending(runner):
+        if listed.exit_code not in (0, 127):  # 127: no nsenter, so no unit can have run on this host
+            logger.error("could not read which host services a GPU reset left stopped: %s", _tail(listed.stderr))
+        elif (listed.stdout or "").strip() and not await _reset_unit_pending(runner):
             await _restore_fabric_services(runner, [])  # logs what stays down; _reset refuses on it
     except Exception as exc:
         logger.error("could not restore the host services an earlier GPU reset stopped: %s", exc)

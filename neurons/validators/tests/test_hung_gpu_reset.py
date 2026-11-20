@@ -432,6 +432,22 @@ async def test_a_service_left_stopped_is_restored_when_no_gpu_is_hung_or_the_que
 
 
 @pytest.mark.asyncio
+async def test_an_unreadable_list_of_stopped_services_is_logged_and_the_check_goes_on(caplog):
+    # DAH-6741 review: a failed read (an SSH timeout) is not "nothing stopped"; it is said, and the check still runs
+    class UnreadableList(HungHost):
+        async def run(self, cmd, **kwargs):
+            if cmd == gpu_reset.STOPPED_UNITS_READ_COMMAND:
+                self.commands.append(cmd)
+                return make_command_result(False, "", "timed out", exit_code=124)
+            return await super().run(cmd, **kwargs)
+
+    host = UnreadableList(query=_query())
+    result = await _reset(host)
+    assert result.warning is None and HUNG_GPU_QUERY_COMMAND in host.commands
+    assert "could not read which host services a GPU reset left stopped" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_the_shadow_check_restores_nothing():
     late = "late-monitor.service"
     host = HungHost(query=_query())

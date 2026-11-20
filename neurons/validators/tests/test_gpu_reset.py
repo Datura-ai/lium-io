@@ -606,15 +606,19 @@ async def test_an_unreadable_reset_unit_cgroup_skips_the_fallback_and_the_contai
 FAKE_STAT = """#!/bin/sh
 for f; do
   case "$f" in -L|-c) continue;; %*) fmt=$f; continue;; esac
-  t=$(readlink "$f")
+  t=$(readlink -m "$f")
   case "$t" in
-    denied) echo "stat: cannot statx '$f': Permission denied" >&2; ok=1;;
+    */denied) echo "stat: cannot statx '$f': Permission denied" >&2; ok=1;;
     *dev-*) t=$(echo "$t" | sed 's/.*dev-//'); maj=$(printf '%x' "$(echo "$t" | cut -d- -f1)")
       if [ "$fmt" = "%t %n" ]; then echo "$maj $f"; else printf '%s %x %s\\n' "$maj" "$(echo "$t" | cut -d- -f2)" "$f"; fi;;
   esac
 done
 exit ${ok:-0}
 """
+STALLING_STAT = (
+    '#!/bin/sh\nfor a; do case "$(readlink "$a" 2>/dev/null)" in /mnt/*) case " $* " in *" -L "*) exec sleep 20;; esac;; '
+    'esac; done\n' + FAKE_STAT.removeprefix("#!/bin/sh\n")
+)
 PROC_DEVICES = "Character devices:\n  1 mem\n195 nvidia-frontend\n226 drm\n510 nvidia-uvm\n\nBlock devices:\n  8 sd\n"
 
 
@@ -626,7 +630,8 @@ def _fake_fd(proc, pid: int, device: str) -> None:
 
 def _unit_script(cmd: str, tmp_path) -> str:
     """The host unit's shell script, with its stopped-services file under tmp_path (stopped), not the host's /run."""
-    return shlex.split(cmd)[-1].replace(gpu_reset.STOPPED_UNITS_FILE, str(tmp_path / "stopped"))
+    script = shlex.split(cmd)[-1].replace(gpu_reset.STOPPED_UNITS_FILE, str(tmp_path / "stopped"))
+    return script.replace(gpu_reset.LATE_SCAN_FILE, str(tmp_path / "late"))
 
 
 def _run_fabric_script(
@@ -661,7 +666,8 @@ def _run_fabric_script(
             "exit 0",
         ),
         ("docker", f'echo "docker $*" >> {log}; [ "$1" = stop ] && [ "$4" = "$STOP_FAILS" ] && exit 1; exit 0'),
-        ("stat", 'case " $* " in *" -L "*) exec sleep 600;; esac\n' + FAKE_STAT.removeprefix("#!/bin/sh\n")),
+        # an open file on a stalled filesystem (/mnt): its stat -L never returns
+        ("stat", STALLING_STAT),
         ("nvidia-smi", f'echo "reset $*" >> {log}; echo "In use by another client"; exit {reset_exit}'),
     ):
         (tmp_path / name).write_text(f"#!/bin/sh\n{body}\n")
@@ -669,8 +675,6 @@ def _run_fabric_script(
     cmd = build_fabric_reset_command(list(units), f"nvidia-smi -r -i {U[0]}", list(containers))
     assert cmd.startswith("nsenter -t 1 -m -- systemd-run ")
     script = _unit_script(cmd, tmp_path).replace("/proc/", f"{proc}/")
-    # the host's /dev: its nodes are symlinks here (no mknod without root)
-    script = script.replace("find /dev -xdev -type c", f"find {dev} -xdev -type l")
     script = script.replace("-lname '/dev/nvidia*'", f"-lname '{dev}/nvidia*'")
     # what systemd does to the command line before the shell runs: unknown ${...} becomes "", $$ becomes $
     script = re.sub(r"\$\{[^}]*\}", "", script).replace("$$", "$")
@@ -712,16 +716,26 @@ def test_the_host_unit_stops_every_gpu_holder_and_starts_them_again_in_reverse(t
     assert "GPU holders left: nv-hostengine python3" in done.stdout
 
 
-def test_the_host_unit_never_follows_an_open_file_so_a_stalled_filesystem_cannot_hold_it_down(tmp_path):
-    # DAH-6741 review: the harness's stat never returns for an open file (-L); a reader of a hung mount is there too
+def test_a_late_look_stalled_on_an_open_file_skips_the_reset_and_still_starts_everything(tmp_path, monkeypatch):
+    # DAH-6741 review: the second look follows open files (device numbers) in the background; a reader of a hung
+    # mount keeps it from ending, so the holders are unknown: no reset, and the unit still reaches its starts
+    monkeypatch.setattr(gpu_reset, "LATE_SCAN_SECONDS", 2)
     procs = {4242: ("agent", f"0::/system.slice/{AGENT}"), 4250: ("reader", "0::/system.slice/r.service", "/mnt/f")}
-    done, log = _run_fabric_script(tmp_path, reset_exit=3, procs=procs)
-    assert done.returncode == 3
-    assert log == [
-        f"stop {FM}", f"stop {NVLSM}", f"stop {AGENT}", f"reset -r -i {U[0]}", f"start {NVLSM}", f"start {FM}",
-        f"start {AGENT}",
-    ]
-    assert "GPU holders left: agent" in done.stdout
+    done, log = _run_fabric_script(tmp_path, procs=procs)
+    assert done.returncode == gpu_reset._FABRIC_STOP_FAILED_EXIT
+    assert "could not read which host services hold a GPU after the stops" in done.stderr
+    assert log == [f"stop {FM}", f"stop {NVLSM}", f"start {NVLSM}", f"start {FM}"]
+
+
+def test_the_late_look_finds_a_gpu_opened_through_a_bind_mounted_node(tmp_path):
+    # DAH-6741 review: a service holding the GPU through a node outside the host's /dev (a bind mount such as /gpu0)
+    # is found by the device number, stopped, and started again after the others
+    (tmp_path / "ctr").mkdir()
+    (tmp_path / "ctr" / "gpu0").symlink_to("x/dev-195-0")
+    procs = {4242: ("monitor", "0::/system.slice/late-monitor.service", str(tmp_path / "ctr" / "gpu0"))}
+    done, log = _run_fabric_script(tmp_path, units=(FM,), procs=procs)
+    assert done.returncode == 0
+    assert log == [f"stop {FM}", "stop late-monitor.service", f"reset -r -i {U[0]}", f"start {FM}", "start late-monitor.service"]
 
 
 def test_the_host_units_list_of_stopped_services_is_never_truncated(tmp_path):
@@ -772,7 +786,8 @@ def _run_holder_units_scan(tmp_path, procs: dict[int, tuple[str, str]]) -> subpr
     (proc / "devices").write_text(PROC_DEVICES)
     for pid, (cgroup, device) in procs.items():
         _fake_fd(proc, pid, device)
-        (proc / str(pid) / "cgroup").write_text(f"{cgroup}\n")
+        if cgroup is not None:  # None: a live process whose cgroup cannot be read
+            (proc / str(pid) / "cgroup").write_text(f"{cgroup}\n")
     (tmp_path / "bin").mkdir()
     (tmp_path / "bin/stat").write_text(FAKE_STAT)
     (tmp_path / "bin/stat").chmod(0o755)
@@ -791,6 +806,21 @@ def test_the_host_holder_scan_finds_services_by_device_number_not_by_path(tmp_pa
         4245: (f"0::/system.slice/{gpu_reset.FABRIC_RESET_UNIT}.service", "195:0"),
     })
     assert done.returncode == 0 and done.stdout.split() == [AGENT, "uvm-user.service"]
+
+
+def test_the_host_holder_scan_finds_the_service_enclosing_a_nested_cgroup(tmp_path):
+    # DAH-6741 review: a service under a sub-slice, and a worker in a service's child cgroup, are that service
+    done = _run_holder_units_scan(tmp_path, {
+        4242: ("0::/system.slice/gpu.slice/monitor.service", "195:0"),
+        4243: ("0::/system.slice/agent.service/worker", "195:0"),
+        4244: ("0::/system.slice/docker-abc.scope", "195:0"),
+    })
+    assert done.returncode == 0 and done.stdout.split() == ["agent.service", "monitor.service"]
+
+
+def test_the_host_holder_scan_exits_3_when_a_live_holders_cgroup_cannot_be_read(tmp_path):
+    done = _run_holder_units_scan(tmp_path, {4242: (f"0::/system.slice/{AGENT}", "195:0"), 4243: (None, "195:0")})
+    assert done.returncode == 3
 
 
 def test_the_host_holder_scan_exits_3_when_an_open_file_cannot_be_read(tmp_path):
