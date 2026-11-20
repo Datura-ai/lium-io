@@ -26,6 +26,8 @@ A machine set up for another owner is still refused at once. A pass on an IP nod
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 from core.utils import _m, get_extra_info, get_logger
@@ -122,6 +124,7 @@ class NodeAccountCheck:
         under another of their own accounts is theirs and passes with no re-setup; only another owner's setup is
         refused, at once (the relay case). A read that fails proves nothing either way: it only reports until the
         provider was notified (checks/enforcement.py)."""
+        started = datetime.now(UTC)  # the deadline is judged at the read's start, not when its failure is handled
         result = await ctx.runner.run(
             READ_NODE_ACCOUNT_COMMAND, timeout=READ_TIMEOUT_SECONDS, retryable=True
         )
@@ -145,7 +148,7 @@ class NodeAccountCheck:
         if not result.success:
             # failed, timed out or closed without an exit status: ownership is not proven
             what["read_error"] = result.error_type or f"exit {result.exit_code}"
-            if enforced(ctx, Msg.BINDING_UNVERIFIED.reason):
+            if enforced(ctx, Msg.BINDING_UNVERIFIED.reason, started):
                 return _refused(ctx, self.check_id, Msg.BINDING_UNVERIFIED, what), False
             what = {**what, "enforced": False}
             return reported_only(

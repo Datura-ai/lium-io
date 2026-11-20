@@ -540,6 +540,34 @@ async def test_a_failed_read_only_reports_until_the_provider_was_notified(enforc
     assert availability_errors([result.event]) == []
 
 
+class _SlowFailedRead(_HostFiles):
+    """A read that fails after `seconds`."""
+
+    def __init__(self, seconds: float):
+        super().__init__("", success=False)
+        self.seconds = seconds
+
+    async def run(self, cmd, **kwargs):
+        import asyncio
+
+        await asyncio.sleep(self.seconds)
+        return await super().run(cmd, **kwargs)
+
+
+async def test_a_failed_read_that_straddles_the_deadline_only_reports_and_the_next_read_enforces():
+    """lp#3232 review 4639138682: a read started before the deadline whose failure is handled after it only reports;
+    a read started at or after the deadline enforces."""
+    deadline = datetime.now(UTC) + timedelta(seconds=0.3)
+    notified = {"NODE_ACCOUNT_UNVERIFIED": deadline.isoformat()}
+
+    straddling = await NodeAccountCheck().run(_relay_ctx(_SlowFailedRead(0.6), enforce=notified))
+    assert datetime.now(UTC) > deadline
+    assert straddling.passed and straddling.updates == {"reported_only": ("NODE_ACCOUNT_UNVERIFIED",)}
+
+    after = await NodeAccountCheck().run(_relay_ctx(_HostFiles("", success=False), enforce=notified))
+    assert not after.passed and after.event.reason_code == "NODE_ACCOUNT_UNVERIFIED"
+
+
 class _Ends:
     """The check that ends a run: Finalize, or a rented node's tenant check, which halts before Finalize."""
 

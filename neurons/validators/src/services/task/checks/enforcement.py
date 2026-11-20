@@ -23,11 +23,13 @@ def fresh(until: str | None) -> bool:
         return False
 
 
-def enforced(ctx: Context, reason_code: str) -> bool:
-    """True once the portal says this node's provider was notified of `reason_code` and its time has come. A miner or
-    portal that sends no map at all predates this rule: its nodes are enforced as before, so shipping the validator
-    first never lets a stalled read pass. A map from a read that no longer vouches for the node (a snapshot the miner
-    kept serving through a portal outage) may be an earlier registration's of the same uuid: the finding only reports."""
+def enforced(ctx: Context, reason_code: str, started: datetime) -> bool:
+    """True once the portal says this node's provider was notified of `reason_code` and its time had come when the
+    check `started` (a read that began before the deadline and failed after it only reports; the next check enforces).
+    A miner or portal that sends no map at all predates this rule: its nodes are enforced as before, so shipping the
+    validator first never lets a stalled read pass. A map from a read that no longer vouches for the node (a snapshot
+    the miner kept serving through a portal outage) may be an earlier registration's of the same uuid: the finding only
+    reports."""
     if ctx.executor.check_enforce_after is None:
         return True
     if not fresh(ctx.executor.snapshot_valid_until):
@@ -39,7 +41,7 @@ def enforced(ctx: Context, reason_code: str) -> bool:
         at = datetime.fromisoformat(after.replace("Z", "+00:00"))
     except ValueError:
         return False
-    return datetime.now(UTC) >= (at if at.tzinfo else at.replace(tzinfo=UTC))
+    return started >= (at if at.tzinfo else at.replace(tzinfo=UTC))
 
 
 def reported_only(ctx: Context, event) -> CheckResult:
