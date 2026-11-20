@@ -116,12 +116,14 @@ services:
     env_file: miner/e2e.env
     environment:
       BITTENSOR_HOTKEY_MNEMONIC: ${E2E_MINER_MNEMONIC}
-      DEFAULT_VALIDATOR_HOTKEY: ${E2E_VALIDATOR_HOTKEY}
       EXTERNAL_IP_ADDRESS: ${E2E_MINER_IP}
       INTERNAL_PORT: ${E2E_MINER_PORT}
       EXTERNAL_PORT: ${E2E_MINER_PORT}
     volumes:
       - ./miner/healthcheck.py:/healthcheck.py:ro
+      # the validator the miner trusts — production takes it from the message the subnet owner signed; a non-prod
+      # build names its own through core/config_override.py, as the executor does
+      - ./miner/trust_anchor.py:/root/app/src/core/config_override.py:ro
     networks:
       e2e:
         ipv4_address: ${E2E_MINER_IP}

@@ -1,17 +1,15 @@
-"""The validator hotkey rotation on the miner: both Lium validator hotkeys sign in, only the current one is
-active (new executors are listed under it), the swap-day flip is the config pair swap that keeps both
-accepted, the drop is a blank VALIDATOR_NEXT_HOTKEY, and the executor rows move with one CLI command.
-
-Settings are built with a clean environment per test so a developer's .env cannot change the answer.
+"""The validator hotkeys a miner trusts with no signed message taken (the baked fallback), and the CLI that re-keys
+executor rows by hand. The signed message itself: test_validator_trust_message.py.
 """
 
 import pytest
 from sqlmodel import Session, SQLModel, create_engine, select
 
-import core.config as core_config
+import services.validator_service as validator_service
 from daos.executor import ExecutorDao
 from models.executor import Executor
 from services.validator_service import ValidatorService, migrate_validator_hotkey_rows
+from services.validator_trust_service import ValidatorTrust
 
 CURRENT = "5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p"
 NEXT = "5F1aH9124FPvDNMWKgPCCJ8WeBBV3B3vpijDCyxZVyZgrEV9"
@@ -19,96 +17,35 @@ STRANGER = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 
 
 @pytest.fixture()
-def settings(monkeypatch):
-    for name in ("DEFAULT_VALIDATOR_HOTKEY", "VALIDATOR_NEXT_HOTKEY", "DEBUG_SKIP_VALIDATOR_REGISTRATION_CHECK"):
-        monkeypatch.delenv(name, raising=False)
-    built = core_config.Settings(_env_file=None)
-    monkeypatch.setattr("services.validator_service.settings", built)
-    return built
+def no_message(monkeypatch, tmp_path):
+    """A miner that never took a signed message."""
+    monkeypatch.setattr(validator_service.settings.debug, "SKIP_VALIDATOR_REGISTRATION_CHECK", False)
+    monkeypatch.setattr(validator_service, "validator_trust", ValidatorTrust(image_message=tmp_path / "absent.json"))
 
 
 def _service() -> ValidatorService:
     return ValidatorService(validator_dao=None)
 
 
-def test_the_defaults_are_the_two_lium_hotkeys_with_current_active(settings):
-    # regression: the new address lands in DEFAULT_VALIDATOR_HOTKEY (new executors are listed under a
-    # validator that does not serve yet; the live validator's sign-in is refused) instead of NEXT
-    assert settings.DEFAULT_VALIDATOR_HOTKEY == CURRENT
-    assert settings.VALIDATOR_NEXT_HOTKEY == NEXT
-    assert settings.accepted_validator_hotkeys == frozenset({CURRENT, NEXT})
-
-
-def test_the_current_hotkey_signs_in(settings):
+def test_with_no_message_both_baked_lium_hotkeys_sign_in(no_message):
     assert _service().is_valid_validator(CURRENT) is True
-
-
-def test_the_next_hotkey_signs_in_before_the_swap(settings):
-    # regression: is_valid_validator stays an equality check on DEFAULT_VALIDATOR_HOTKEY, so the
-    # chain swap is refused by every miner until each one is reconfigured
     assert _service().is_valid_validator(NEXT) is True
 
 
-def test_a_third_hotkey_is_refused_with_two_accepted(settings):
+def test_a_third_hotkey_is_refused(no_message):
     # regression: the check becomes "anything non-empty" or a substring match once it is a set
     assert _service().is_valid_validator(STRANGER) is False
     assert _service().is_valid_validator("") is False
 
 
-def _built(monkeypatch, default: str, nxt: str) -> core_config.Settings:
-    monkeypatch.setenv("DEFAULT_VALIDATOR_HOTKEY", default)
-    monkeypatch.setenv("VALIDATOR_NEXT_HOTKEY", nxt)
-    monkeypatch.delenv("DEBUG_SKIP_VALIDATOR_REGISTRATION_CHECK", raising=False)
-    return core_config.Settings(_env_file=None)
-
-
-def test_after_the_pair_swap_flip_both_hotkeys_stay_accepted_and_the_new_one_is_active(monkeypatch):
-    # the swap-day flip: DEFAULT_VALIDATOR_HOTKEY=<new>, VALIDATOR_NEXT_HOTKEY=<old> — the validator now
-    # signs with the new hotkey and new executors are listed under it, while the old one still signs in
-    # (its last cycle, the rollback path). Regression: the flip drops the old hotkey the same hour.
-    built = _built(monkeypatch, default=NEXT, nxt=CURRENT)
-
-    assert built.DEFAULT_VALIDATOR_HOTKEY == NEXT
-    assert built.accepted_validator_hotkeys == frozenset({CURRENT, NEXT})
-
-
-def test_flipping_default_alone_drops_the_old_hotkey_at_once(monkeypatch):
-    # the hazard the pair swap avoids: DEFAULT_VALIDATOR_HOTKEY=<new> with VALIDATOR_NEXT_HOTKEY still <new>
-    # leaves one accepted hotkey, so a validator still signing with the old one is refused immediately
-    built = _built(monkeypatch, default=NEXT, nxt=NEXT)
-
-    assert built.accepted_validator_hotkeys == frozenset({NEXT})
-
-
-def test_the_old_hotkey_is_dropped_by_blanking_next_after_the_flip(monkeypatch):
-    # the follow-up release once the old hotkey has left the chain — VALIDATOR_NEXT_HOTKEY="" — the new
-    # hotkey stays active, the old one no longer signs in
-    built = _built(monkeypatch, default=NEXT, nxt="")
-
-    assert built.DEFAULT_VALIDATOR_HOTKEY == NEXT
-    assert built.accepted_validator_hotkeys == frozenset({NEXT})
-
-
-def test_a_blank_next_hotkey_adds_no_signer(monkeypatch):
-    # rolling back (VALIDATOR_NEXT_HOTKEY="") leaves the miner exactly as before this release
-    monkeypatch.setenv("VALIDATOR_NEXT_HOTKEY", " ")
-    monkeypatch.delenv("DEFAULT_VALIDATOR_HOTKEY", raising=False)
-    built = core_config.Settings(_env_file=None)
-
-    assert built.accepted_validator_hotkeys == frozenset({CURRENT})
-
-
-def test_a_miner_serving_another_validator_does_not_accept_the_lium_next_hotkey(monkeypatch):
-    # regression: a staging or e2e miner that sets only DEFAULT_VALIDATOR_HOTKEY also accepts the prod
-    # validator's new hotkey (the executor and watchtower staging builds trust their own validator only)
-    monkeypatch.delenv("VALIDATOR_NEXT_HOTKEY", raising=False)
+def test_an_env_entry_cannot_name_the_validator(no_message, monkeypatch):
+    # regression: a local .env repoints the miner at another validator
     monkeypatch.setenv("DEFAULT_VALIDATOR_HOTKEY", STRANGER)
-    built = core_config.Settings(_env_file=None)
+    monkeypatch.setenv("VALIDATOR_NEXT_HOTKEY", STRANGER)
+    assert _service().is_valid_validator(STRANGER) is False
 
-    assert built.accepted_validator_hotkeys == frozenset({STRANGER})
 
-
-# --- cli.py migrate-validator-hotkey: the executor rows move with the flip ------------------------------------
+# --- cli.py migrate-validator-hotkey: re-keys the executor rows by hand ------------------------------------------
 
 
 @pytest.fixture()

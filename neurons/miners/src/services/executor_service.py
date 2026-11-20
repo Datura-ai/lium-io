@@ -17,6 +17,7 @@ from daos.executor import ExecutorDao
 from models.executor import Executor
 from services.node_address import executor_session
 from services.ssh_service import MinerSSHService
+from services.validator_trust_service import validator_trust
 
 from protocol.miner_portal_request import (
     ExecutorAdded,
@@ -323,9 +324,11 @@ class ExecutorService:
         at registration, by executor id, from the same portal read as the list (DAH-5729). `node_accounts` likewise
         gets the hotkeys and account claim the portal checked the node against (`node_hotkeys`, `account_claim`,
         DAH-6539)."""
+        # the trusted validator also gets the rows keyed to a validator this miner trusted before
+        served_keys = validator_trust.served_keys(validator_hotkey)
         # Standard mode: use local DB, in Standard mode
         if not settings.CENTRAL_MODE:
-            return self.executor_dao.get_executors_for_validator(validator_hotkey, executor_id)
+            return self.executor_dao.get_executors_for_validator(served_keys, executor_id)
 
         # Central mode: fetch from portal
         from clients.miner_portal_api import MinerPortalAPI
@@ -343,7 +346,7 @@ class ExecutorService:
         result: list[Executor] = []
         for item in data:
             try:
-                if item.get("validator_hotkey") != validator_hotkey:
+                if item.get("validator_hotkey") not in served_keys:
                     continue
 
                 uuid = UUID(item.get("id"))

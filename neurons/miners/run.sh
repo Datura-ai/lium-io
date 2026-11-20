@@ -46,8 +46,6 @@ if [ "$MODE" = "miner" ]; then
         [ "$tries" -ge 30 ] && { echo "alembic upgrade head failed 30 times, starting anyway"; break; }
         sleep 10
     done
-    # migrate validator hotkey
-    pdm run src/cli.py migrate-validator-hotkey
     # run fastapi app
     pdm run src/miner.py
 elif [ "$MODE" = "connector" ]; then
