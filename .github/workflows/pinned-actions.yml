@@ -7,9 +7,10 @@ name: Pinned actions
 # The candidate's tree is checked out as data only (nothing from it runs, and the token is read-only)
 on:
   pull_request:
-    # edited: a retarget to main (a stacked PR) with no new push still gets this repository run on the new merge ref. The
-    # ruleset-required run ignores these types; the same ruleset requires the branch to be up to date with main, so a
-    # retargeted PR cannot merge until a push to it re-runs this check (.github/rulesets/README.md)
+    # edited: a retarget to main (a stacked PR) with no new push still gets this repository run. The ruleset-required run
+    # ignores these types and needs no retarget run: it scans the PR's head commit, which no retarget changes, and the
+    # ruleset requires the branch to be up to date with main, so the tree that merges is the tree it scanned
+    # (.github/rulesets/README.md)
     types: [opened, synchronize, reopened, edited]
   merge_group:
     types: [checks_requested]
@@ -23,13 +24,15 @@ permissions:
 
 jobs:
   check:
-    name: pinned-actions  # the status context the ruleset requires (strict): keep it unique across workflows
+    name: pinned-actions  # carries the ruleset's up-to-date (strict) rule only; trust comes from the required run itself
     runs-on: ubuntu-24.04  # its /usr/bin/python3 ships the distro PyYAML the check imports below
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        # the event's own commit: a PR's merge tree (a fork's too: checkout refuses a fork's ref only under pull_request_target),
-        # the queued group's commit, or main
+        # the commit that will land: a PR's HEAD commit, not its merge ref (a merge ref depends on the base, and a retarget
+        # changes the base without a new run; with main required to be an ancestor of the head, the merged tree IS the head's
+        # tree), the queued group's commit, or main. A fork's head commit is fetched from this repository's pull refs
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       # every workflow and action this run can execute pins third-party code to a commit and images to a digest, never to a
       # movable tag: the tracked files at this commit, then every pinned action or reusable workflow they call, fetched at

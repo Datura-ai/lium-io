@@ -95,9 +95,11 @@ gh api "orgs/Datura-ai/rulesets" --method POST --input .github/rulesets/pinned-a
 Check: `gh api "orgs/Datura-ai/rulesets" --jq '.[]|.name+" "+.enforcement'` → `pinned-actions-required-workflow active`.
 
 **A retargeted PR cannot merge unscanned.** A workflow required by a ruleset runs on its own trigger list and ignores the
-`types` in the file, so the `edited` event of a retarget (a stacked PR whose base PR merged) does not start the required
-run, and its last result belongs to the old merge tree. The same ruleset therefore also requires the `pinned-actions`
-status check from GitHub Actions with "Require branches to be up to date before merging" (strict). A PR whose head does
-not contain the tip of `main` cannot merge, and bringing it up to date is a push to its head, which starts the required
-run on the new merge tree. In `lium-io` the merge queue goes further: every queued group is checked on its own merge
-commit. The job's name `pinned-actions` is that status context, so no other workflow may use it.
+`types` in the file, so a retarget (a stacked PR whose base PR merged) starts no required run. The required run therefore
+scans the PR's head commit, not its merge ref: a retarget changes the base but not the head, so the result still describes
+the commit under review. The same ruleset also sets "Require branches to be up to date before merging" (strict), which
+GitHub checks on the branch itself: a PR can merge only when `main` is an ancestor of its head, and then the merged tree is
+exactly the head's tree. Bringing a branch up to date is a push, which starts the required run on the new head. The
+`pinned-actions` status context only carries the strict rule. A PR's own copy of the workflow can report that context
+too, but that grants nothing: the merge still needs the required run of `main`'s copy on the current head. In `lium-io`
+the merge queue goes further: every queued group is checked on its own merge commit.
