@@ -2273,3 +2273,12 @@ async def test_inline_python_that_is_not_the_workloads_own_child_is_foreign(cont
     result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is False
+
+
+@pytest.mark.asyncio
+async def test_any_gpu_process_in_a_filler_on_the_retired_dolphin_image_is_foreign(context_factory):
+    ctx, _ = await _filler_process_ctx(context_factory, "/opt/dolphinpod/dolphinpod-worker start", "daturaai/dlph")
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
