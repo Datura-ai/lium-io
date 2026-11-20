@@ -9,6 +9,7 @@ from clients.compute_client import ComputeClient, OutgoingMessages
 from core.config import settings
 from payload_models.payloads import (
     AddSshPublicKeyRequest,
+    ExecutorRentFinishedRequest,
     ContainerCreateRequest,
     ContainerCreated,
     FailedContainerErrorCodes,
@@ -41,6 +42,10 @@ class FakeRedis:
 
     async def delete(self, key):
         self.values.pop(key, None)
+
+    async def expire(self, key, ttl):
+        if await self.get(key) is not None:
+            self.values[key] = (self.values[key][0], self.now + ttl)
 
     async def eval(self, script, numkeys, key, claim, value, ttl):
         self.updates += 1
@@ -148,8 +153,9 @@ async def test_create_duplicates_during_and_after_long_job(client, caplog, heart
     await client.miner_driver(request())
     assert client.miner_service.handle_container.await_count == 1
     assert client.message_queue == [response, response]
-    assert redis.values[BACKEND_COMMAND_PREFIX + "command"][1] == redis.now + 900
-    redis.now += 901
+    # a create's answer outlives the backend's same-id resends (until its receipt, at most the create bound)
+    assert redis.values[BACKEND_COMMAND_PREFIX + "command"][1] == redis.now + settings.BACKEND_CREATE_ANSWER_MAX_SECONDS
+    redis.now += settings.BACKEND_CREATE_ANSWER_MAX_SECONDS + 1
     await client.miner_driver(request())
     assert client.miner_service.handle_container.await_count == 2
 
@@ -471,3 +477,42 @@ async def test_a_reboot_failure_the_backend_lost_in_a_restart_is_sent_again_on_t
     code = FailedContainerErrorCodes.ExecutorUnreachable.value
     assert failures(first) == [("reboot-a", code)]
     assert failures(again) == [("reboot-a", code)]
+
+
+@pytest.mark.asyncio
+async def test_a_create_resent_after_an_outage_outlasting_the_answer_ttl_replays_and_never_runs_again(client, monkeypatch):
+    """The backend resends a create it got no answer for under the same command id while the pod is pending (every
+    30 min). A resend refused in a Redis outage, then sent again after the ordinary answer TTL, still finds the first
+    answer: it is replayed and the create does not run a second time."""
+    service = client.miner_service.redis_service
+    await client.miner_driver(request())   # the first copy runs; its answer is lost on the way back
+    [first] = list(client.message_queue)
+    client.message_queue.clear()
+    claim = service.claim_backend_command
+    monkeypatch.setattr(service, "claim_backend_command", AsyncMock(side_effect=ConnectionError))
+    await client.miner_driver(request())   # resent during the outage: nothing runs, nothing is answered
+    assert list(client.message_queue) == []
+    monkeypatch.setattr(service, "claim_backend_command", claim)
+    service.redis.now += settings.BACKEND_COMMAND_ANSWER_TTL_SECONDS + 30 * 60   # the backend's next resend
+
+    await client.miner_driver(request())
+
+    assert client.miner_service.handle_container.await_count == 1
+    assert list(client.message_queue) == [first]
+
+
+@pytest.mark.asyncio
+async def test_the_receipt_ends_a_create_answer_like_any_other(client, monkeypatch):
+    """Once the backend's receipt for the create arrives it never resends that command id: the answer then expires
+    with the ordinary TTL instead of the create bound."""
+    service = client.miner_service.redis_service
+    monkeypatch.setattr(service, "remove_pending_pod", AsyncMock())   # the receipt's pending-mark side, tested elsewhere
+    await client.miner_driver(request())
+    key = BACKEND_COMMAND_PREFIX + "command"
+    assert service.redis.values[key][1] == service.redis.now + settings.BACKEND_CREATE_ANSWER_MAX_SECONDS
+
+    await client.miner_driver(ExecutorRentFinishedRequest(
+        miner_hotkey="miner", executor_id="executor", pod_id="pod", create_command_id="command", command_id="receipt"
+    ))
+
+    assert service.redis.values[key][1] == service.redis.now + settings.BACKEND_COMMAND_ANSWER_TTL_SECONDS

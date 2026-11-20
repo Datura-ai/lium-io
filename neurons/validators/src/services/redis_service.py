@@ -1224,6 +1224,19 @@ class RedisService:
                 # Redis may retry SET NX after storing our claim but losing the reply.
                 return None if existing == BackendCommand.model_validate_json(claim) else existing
 
+    async def settle_backend_command(self, command_id: str, ttl: int) -> None:
+        """A finished command's answer now expires in `ttl` (a running claim is left alone)."""
+        key = f"{BACKEND_COMMAND_PREFIX}{command_id}"
+        stored = await self.redis.get(key)
+        if stored is None:
+            return
+        try:
+            running = BackendCommand.model_validate_json(stored).state != "finished"
+        except ValueError:
+            running = False   # an unreadable answer goes like a readable one
+        if not running:
+            await self.redis.expire(key, ttl)
+
     async def update_backend_command(
         self, command_id: str, claim: str, value: str, ttl: int
     ) -> None:

@@ -1111,7 +1111,12 @@ class ComputeClient:
             )
             try:
                 await redis_service.update_backend_command(
-                    command_id, claim, value, settings.BACKEND_COMMAND_ANSWER_TTL_SECONDS
+                    command_id,
+                    claim,
+                    value,
+                    settings.BACKEND_CREATE_ANSWER_MAX_SECONDS
+                    if isinstance(job_request, ContainerCreateRequest)
+                    else settings.BACKEND_COMMAND_ANSWER_TTL_SECONDS,
                 )
             except Exception:
                 logger.exception("Failed to finish backend command: %s", command_id)
@@ -1706,6 +1711,11 @@ class ComputeClient:
             await self.miner_service.redis_service.remove_pending_pod(
                 job_request.miner_hotkey, job_request.executor_id, job_request.pod_id, command_id=job_request.create_command_id
             )
+            if job_request.create_command_id:
+                # the backend no longer resends this create: its answer is kept only as long as any other command's
+                await self.miner_service.redis_service.settle_backend_command(
+                    job_request.create_command_id, settings.BACKEND_COMMAND_ANSWER_TTL_SECONDS
+                )
         elif isinstance(job_request, GetPodLogsRequestFromServer):
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port
