@@ -153,8 +153,9 @@ async def test_send_pubkey_to_executor_relays_the_miner_bound_signature(executor
 def _identity_answer(session, hotkey: str | None, status: int = 200):
     """Make the mock session's GET /miner-identity answer `hotkey`, echoing the request's nonce."""
 
-    def get(url, params=None, timeout=None):
+    def get(url, params=None, timeout=None, allow_redirects=True):
         assert url.endswith("/miner-identity")
+        assert allow_redirects is False  # a node's redirect is never followed
         answer = {"miner_hotkey": hotkey, "nonce": params["nonce"]} if hotkey else {}
         ctx = MagicMock()
         ctx.__aenter__ = AsyncMock(return_value=_response(status, json.dumps(answer).encode()))
@@ -171,7 +172,8 @@ def _post_answers(session, *answers):
     ctx.__aexit__ = AsyncMock(return_value=None)
     session.sent = []
 
-    def post(url, json=None, timeout=None):
+    def post(url, json=None, timeout=None, allow_redirects=True):
+        assert allow_redirects is False  # a node's redirect is never followed
         session.sent.append(dict(json))
         return ctx
 
@@ -221,7 +223,7 @@ async def test_a_slow_identity_read_never_holds_a_listing_bound_upload(executor_
     release = asyncio.Event()
     session = _make_mock_session()
 
-    def hanging_get(url, params=None, timeout=None):
+    def hanging_get(url, params=None, timeout=None, allow_redirects=True):
         async def wait():
             await release.wait()
             raise asyncio.TimeoutError()
@@ -299,7 +301,7 @@ async def test_a_failed_identity_read_after_a_refusal_is_read_again_within_the_d
     session = _make_mock_session()
     answers = iter([None, "5OwnerB"])
 
-    def flaky_get(url, params=None, timeout=None):
+    def flaky_get(url, params=None, timeout=None, allow_redirects=True):
         hotkey = next(answers)
         body = json.dumps({"miner_hotkey": hotkey, "nonce": params["nonce"]} if hotkey else {}).encode()
         ctx = MagicMock()

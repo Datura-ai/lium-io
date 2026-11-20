@@ -228,6 +228,7 @@ from services.rental_docker_sdk import (
     keep_alive_command_for,
     is_docker_container_not_running_error,
     is_docker_not_found_error,
+    is_transport_not_reopened,
     is_rental_docker_transport_drop,
     build_environment_exec_spec,
     build_remove_authorized_keys_exec_spec,
@@ -1525,6 +1526,8 @@ async def _raise_unless_running_before_created(
                     state=None,
                 ) from inspect_exc
             if attempt == FINAL_STATE_INSPECT_ATTEMPTS:
+                if is_transport_not_reopened(inspect_exc):
+                    raise  # the node stopped answering: that is the diagnosis, not an unread State
                 raise RuntimeError(
                     f"could not read the container State before caching the pod "
                     f"({FINAL_STATE_INSPECT_ATTEMPTS} attempts): {inspect_exc}"
@@ -4561,7 +4564,10 @@ class DockerService:
             restart_policy=restart_policy,
             runtime="sysbox-runc" if payload.is_sysbox else None,
             cap_add=self._capabilities_for(devices),
-            sysctls={"net.ipv4.conf.all.src_valid_mark": "1"},
+            # A sysbox pod owns its network namespace, so its root (wg-quick) sets this itself; preset by sysbox-runc
+            # it is written through sysbox-fs on every start, and a Docker restart where that path is not up yet
+            # fails the pod (OCI create "src_valid_mark: no such file"). runc pods cannot write /proc/sys, so keep it.
+            sysctls={} if payload.is_sysbox else {"net.ipv4.conf.all.src_valid_mark": "1"},
             ulimits=self._memlock_ulimit_for(devices, memory_gb),
             devices=devices,
             device_requests=gpu_devices.device_requests,
@@ -10924,7 +10930,8 @@ class DockerService:
                         except _CreateCancelledByDelete:
                             raise
                         except Exception as exc:
-                            if login_error is None:
+                            # a node that stopped answering is not the login's fault: report the dead transport
+                            if login_error is None or is_transport_not_reopened(exc):
                                 raise
                             # docker-py pulls anonymously after a failed login, so the
                             # pull failure is most likely the login's fault — attribute it,

@@ -12,11 +12,6 @@ import aiohttp
 from asyncssh import SSHKey
 import asyncssh
 import bittensor
-from clients.subtensor_client import (  # noqa: F401 (the constant is read from here by tests)
-    MIN_DATED_NONCE_MINER_AXON_VERSION,
-    SubtensorClient,
-    upload_nonce_for_miner,
-)
 from clients.validator_portal_api import first_owner_hotkeys_read, portal_owner_hotkeys
 from datura.requests.miner_requests import (
     AcceptSSHKeyRequest,
@@ -110,6 +105,7 @@ from services.storage_operations import (
     supports_workspace_field,
 )
 from services.storage_operations import upload_secrets_file
+from services.upload_nonce import upload_nonce_for_miner
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +122,7 @@ async def _remove_ssh_key_after_stop_retry(stop_retry: asyncio.Task, remove_ssh_
         await _cleanup_to_completion(remove_ssh_key)
         raise
     return await remove_ssh_key
+
 
 # rows the wave builds from the miner's answer alone, without checking the node (DAH-6596)
 MINER_ANSWER_REASON_CODES = frozenset(
@@ -666,9 +663,6 @@ class MinerService:
     @staticmethod
     def _normalize_public_key(public_key: bytes | str) -> str:
         return public_key.decode("utf-8") if isinstance(public_key, bytes) else public_key
-
-    def _upload_nonce_for_miner(self, miner_hotkey: str) -> str | None:
-        return upload_nonce_for_miner(miner_hotkey)
 
     def _sign_validator_pubkey(
         self,
@@ -2280,7 +2274,7 @@ class MinerService:
             # G3 — every wave carries a challenge that executors must echo in TDX
             # report_data[32:64] / GPU evidence. The nonce is covered by
             # validator_signature so it cannot be stripped or swapped.
-            nonce_hex = self._upload_nonce_for_miner(payload.miner_hotkey)
+            nonce_hex = upload_nonce_for_miner(payload.miner_hotkey)
             attestation_nonce = await self.attestation_service.maybe_issue_nonce(nonce_hex)
 
             # Prepare request
@@ -2559,7 +2553,7 @@ class MinerService:
             # Generate SSH key and send it to miner
             private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
 
-            upload_nonce = self._upload_nonce_for_miner(payload.miner_hotkey)
+            upload_nonce = upload_nonce_for_miner(payload.miner_hotkey)
             await first_owner_hotkeys_read()  # DAH-6740: never sign against the empty map of a restart
             ssh_request = SSHPubKeySubmitRequest(
                 public_key=public_key,
@@ -2987,7 +2981,7 @@ class MinerService:
             headers = self._generate_auth_headers(my_key, payload.miner_hotkey)
             headers["Content-Type"] = "application/json"
 
-            upload_nonce = self._upload_nonce_for_miner(payload.miner_hotkey)
+            upload_nonce = upload_nonce_for_miner(payload.miner_hotkey)
             ssh_request = SSHPubKeySubmitRequest(
                 public_key=payload.public_key,
                 validator_signature=self._sign_validator_pubkey(my_key, payload.public_key, nonce=upload_nonce),

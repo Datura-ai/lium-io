@@ -2,11 +2,13 @@ import asyncio
 import json
 import time
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import asyncssh
 import pytest
 from core.config import settings
+from datura.requests.validator_requests import upload_nonce_issued_at
 from neurons.validators.src.core.docker_utils import ContainerDeathDiagnostics
 from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     CPU_QUOTA_EXCEEDS_HOST_REASON,
@@ -55,6 +57,7 @@ class DummyBackendClient:
         gpu_uuids: list[str] | None = None,
         cpu_count: int | None = None,
         loopback_plugin: str | None = None,
+        upload_nonce: str | None = None,
         timeout: int = 300,
     ):
         self.timeout = timeout
@@ -68,6 +71,7 @@ class DummyBackendClient:
             "gpu_uuids": gpu_uuids,
             "cpu_count": cpu_count,
             "loopback_plugin": loopback_plugin,
+            "upload_nonce": upload_nonce,
         }
         return self.response
 
@@ -94,6 +98,27 @@ async def test_rental_verification_selects_loopback_alias_from_the_switches(
     # Assert: the backend probes the plugin selected for new rental volumes by this validator.
     assert result.passed is True
     assert backend.called_with["loopback_plugin"] == alias
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("axon_version, dated", [(10_005_000, True), (9_010_001, False)])
+async def test_the_backend_upload_is_dated_for_a_miner_that_relays_the_nonce(
+    context_factory, monkeypatch, axon_version, dated
+):
+    # DAH-6606: the backend's health-check upload carried no nonce, so the executor could not require one
+    from clients.subtensor_client import SubtensorClient
+
+    backend = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
+    services = build_services(backend=backend, container_cleanup=ContainerCleanup())
+    ctx = context_factory(services=services, state=build_state(specs={"verified_ports": [8080]}))
+    miner = SimpleNamespace(hotkey=ctx.miner_hotkey, axon_info=SimpleNamespace(version=axon_version))
+    fake = SimpleNamespace(miners=[miner], hotkeys_routed_via_central_miner=frozenset())
+    monkeypatch.setattr(SubtensorClient, "get_instance", classmethod(lambda cls: fake))
+
+    await RentalVerificationCheck().run(ctx)
+
+    issued_at = upload_nonce_issued_at(backend.called_with["upload_nonce"])
+    assert (issued_at is not None and abs(issued_at - time.time()) < 5) if dated else issued_at is None
 
 
 @pytest.mark.asyncio
@@ -237,6 +262,7 @@ async def test_rental_verification_success():
         "gpu_uuids": [],  # this state carries no scraped gpu details
         "cpu_count": None,  # this state carries no scraped cpu count
         "loopback_plugin": "vloopback:v3",  # the plugin alias new rental volumes are created on (v3 by default)
+        "upload_nonce": None,  # a miner the metagraph does not show relaying the nonce gets none
     }
 
 

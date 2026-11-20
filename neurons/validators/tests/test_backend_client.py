@@ -204,21 +204,28 @@ async def test_check_executor_health_sends_loopback_plugin_only_when_given(clien
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("nonce", [None, "4c545331" + "00" * 28])
-async def test_check_executor_health_sends_the_dated_nonce_the_backend_needs_to_sign_owner_hotkeys(client, nonce):
-    """The health check sent owner_hotkeys but no upload_nonce, and the backend signs owner hotkeys only with a dated
-    nonce, so a linked node would fail the check once executors require a bound key. The nonce follows the
-    validator's own rule (upload_nonce_for_miner): none for a miner not proven to relay it."""
+async def test_check_executor_health_sends_owner_hotkeys_with_the_dated_nonce_it_was_given(client, nonce):
+    """The backend signs owner hotkeys only with a dated nonce, so the health check sends the owner hotkeys next to the
+    nonce the caller passes (upload_nonce_for_miner: none for a miner not proven to relay it)."""
     with (
         patch.object(backend_client_module, "portal_owner_hotkeys", return_value={"5OtherAccount"}),
-        patch.object(backend_client_module, "upload_nonce_for_miner", return_value=nonce) as nonce_for,
         patch.object(client, "_signed_request", AsyncMock(return_value=None)) as post,
     ):
-        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001)
+        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001, upload_nonce=nonce)
 
     sent = post.await_args.kwargs["json_data"]
-    nonce_for.assert_called_once_with("hotkey")
     assert sent["owner_hotkeys"] == ["5OtherAccount"]
     assert sent.get("upload_nonce") == nonce
+
+
+@pytest.mark.asyncio
+async def test_check_executor_health_sends_the_upload_nonce_only_when_given(client):
+    with patch.object(client, "_signed_request", AsyncMock(return_value=None)) as post:
+        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001)
+        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001, upload_nonce="ab" * 32)
+
+    assert "upload_nonce" not in post.await_args_list[0].kwargs["json_data"]
+    assert post.await_args_list[1].kwargs["json_data"]["upload_nonce"] == "ab" * 32
 
 
 @pytest.mark.asyncio
@@ -406,6 +413,28 @@ async def test_get_all_rented_executors_parses_filler_mapping(reset_session, cli
     assert result.filler_containers_by_executor == {
         "executor-123": "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cycle_snapshot_block", "path"),
+    [
+        (7200, "/internal/executors/rented?snapshot_cycle=7200"),
+        (None, "/internal/executors/rented"),
+    ],
+)
+async def test_cycle_snapshot_read_adds_the_query_flag(
+    reset_session, client, cycle_snapshot_block, path
+):
+    # DAH-6400: the backend counts only the cycle's read toward a resumed node's idle-pay hold
+    mock_session = create_mock_session(create_mock_response(200, {"executors": {}}))
+
+    with patch.object(BackendClient, "get_session", return_value=mock_session):
+        await client.get_all_rented_executors(cycle_snapshot_block=cycle_snapshot_block)
+
+    call = mock_session.request.call_args
+    url = str(call.args[1] if len(call.args) > 1 else call.kwargs.get("url"))
+    assert url.endswith(path)
 
 
 def create_mock_session_with_attempts(side_effects):

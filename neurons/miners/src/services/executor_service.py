@@ -16,6 +16,7 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from daos.executor import ExecutorDao
 from models.executor import Executor
+from services.node_address import executor_session
 from services.ssh_service import MinerSSHService
 
 from protocol.miner_portal_request import (
@@ -146,7 +147,8 @@ async def _executor_own_hotkey(session: aiohttp.ClientSession, executor: Executo
     timeout = aiohttp.ClientTimeout(total=max(0.5, min(MINER_IDENTITY_TIMEOUT_SECONDS, deadline - time.monotonic())))
     try:
         async with session.get(
-            f"http://{executor.address}:{executor.port}/miner-identity", params={"nonce": nonce}, timeout=timeout
+            f"http://{executor.address}:{executor.port}/miner-identity", params={"nonce": nonce}, timeout=timeout,
+            allow_redirects=False,
         ) as response:
             if response.status != 200:
                 return None
@@ -164,7 +166,7 @@ _identity_reads: set[asyncio.Task] = set()
 
 
 async def _learn_own_hotkey(executor: Executor) -> str | None:
-    async with aiohttp.ClientSession() as session:
+    async with executor_session() as session:
         own = await _executor_own_hotkey(session, executor, time.monotonic() + MINER_IDENTITY_TIMEOUT_SECONDS)
     if own:
         _executor_own_hotkeys[str(executor.uuid)] = own
@@ -206,8 +208,8 @@ class ExecutorService:
         try:
             timeout = aiohttp.ClientTimeout(total=10)
             url = f"http://{executor.address}:{executor.port}/version"
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as response:
+            async with executor_session(timeout=timeout) as session:
+                async with session.get(url, allow_redirects=False) as response:
                     if response.status != 200:
                         return False, f"Executor health check failed with status {response.status}"
             return True, "Connectivity test passed - proceeding to save executor"
@@ -465,7 +467,7 @@ class ExecutorService:
                 extra=get_extra_info(base_log_extra),
             ),
         )
-        async with aiohttp.ClientSession() as session:
+        async with executor_session() as session:
             # DAH-6740: relay only the entry the executor checks (an owner's whole map can pass its 256 KiB body limit),
             # known from an earlier identity read; the upload itself never waits on that read
             looked_up = False
@@ -486,7 +488,7 @@ class ExecutorService:
                     total = max(UPLOAD_SSH_KEY_MIN_ATTEMPT_SECONDS, min(total, deadline - time.monotonic()))
                 timeout = aiohttp.ClientTimeout(total=total)
                 try:
-                    async with session.post(url, json=payload, timeout=timeout) as response:
+                    async with session.post(url, json=payload, timeout=timeout, allow_redirects=False) as response:
                         body = await _read_capped(response)
                         if response.status == 403 and owner_hotkey_signatures and not looked_up:
                             # refused for its binding: read which hotkey it is set up for now, retry with that entry
@@ -582,9 +584,9 @@ class ExecutorService:
                 extra=get_extra_info(base_log_extra),
             ),
         )
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with executor_session(timeout=timeout) as session:
             try:
-                async with session.post(url, json=payload) as response:
+                async with session.post(url, json=payload, allow_redirects=False) as response:
                     if response.status != 200:
                         logger.error(
                             _m(
@@ -738,8 +740,8 @@ class ExecutorService:
             "data_to_sign": container_name,
             "signature": f"0x{keypair.sign(container_name).hex()}"
         }
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, json=payload) as response:
+        async with executor_session(timeout=timeout) as session:
+            async with session.post(url, json=payload, allow_redirects=False) as response:
                 if response.status != 200:
                     raise Exception('[get_pod_logs] Error: API request failed')
 
