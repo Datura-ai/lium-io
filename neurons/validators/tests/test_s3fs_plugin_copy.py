@@ -17,20 +17,23 @@ import subprocess
 import sys
 import tarfile
 import threading
+import urllib.parse
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
-from services.s3fs_plugin_copy import S3FS_PLUGIN_REPOSITORY, s3fs_plugin_command
+from services.s3fs_plugin_copy import S3FS_PLUGIN_REPOSITORY, S3FS_PLUGIN_TAG, s3fs_plugin_command
 from services.task.checks import s3fs_plugin_copy as check_module
 from services.task.runner import SSHCommandResult
 
 DOCKER_ROOT = "/dockerroot"
+UNREACHABLE = "http://127.0.0.1:9"
+PINNED_DIFF_ID = "sha256:" + "d" * 64
 CONFIG = b'{"Entrypoint":["/usr/bin/tini"],"Interface":{"Socket":"s3fs.sock"}}'
 
-FAKE_DOCKER = r'''
+FAKE_DOCKER = r"""
 import json, os, sys
 state_path, root = os.environ["FAKE_STATE"], os.environ["FAKE_ROOT"]
 state = json.load(open(state_path)) if os.path.exists(state_path) else {"plugins": {}, "calls": []}
@@ -40,11 +43,25 @@ def done(code=0, out="", err=""):
     json.dump(state, open(state_path, "w"))
     sys.stdout.write(out); sys.stderr.write(err); sys.exit(code)
 if args[:1] == ["info"]:
-    done(out=root + "\n")
+    done(out=json.dumps({
+        "DockerRootDir": root,
+        "HTTPProxy": os.environ.get("FAKE_PROXY", ""),
+        "RegistryConfig": {"Mirrors": json.loads(os.environ.get("FAKE_MIRRORS", "[]"))},
+    }))
 if args[:2] == ["plugin", "inspect"]:
     if args[-1] not in state["plugins"]:
         done(1, err="Error: No such plugin: " + args[-1])
+    if "{{json .Config.Rootfs.DiffIds}}" in args:
+        done(out=json.dumps(state["plugins"][args[-1]]["diff_ids"]) + "\n")
     done(out="[{}]")
+if args[:2] == ["plugin", "install"]:
+    if os.environ.get("FAKE_INSTALL_ERROR"):
+        done(1, err=os.environ["FAKE_INSTALL_ERROR"])
+    state["plugins"][args[args.index("--alias") + 1]] = {"installed": args[2], "diff_ids": [os.environ["FAKE_DIFF_ID"]]}
+    done()
+if args[:2] == ["plugin", "rm"]:
+    state["plugins"].pop(args[-1], None)
+    done()
 if args[:2] == ["plugin", "create"]:
     name, directory = args[2], args[3]
     rootfs = directory + "/rootfs"
@@ -55,7 +72,7 @@ if args[:2] == ["plugin", "create"]:
     }
     done()
 done(2, err="unexpected " + " ".join(args))
-'''
+"""
 
 
 def _digest(data: bytes) -> str:
@@ -76,30 +93,45 @@ class _Registry:
 
     def __init__(self):
         layer = _layer()
-        self.manifest = json.dumps({
-            "schemaVersion": 2,
-            "config": {"mediaType": "application/vnd.docker.plugin.v1+json", "digest": _digest(CONFIG)},
-            "layers": [{"mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip", "digest": _digest(layer)}],
-        }).encode()
+        self.manifest = json.dumps(
+            {
+                "schemaVersion": 2,
+                "config": {"mediaType": "application/vnd.docker.plugin.v1+json", "digest": _digest(CONFIG)},
+                "layers": [
+                    {"mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip", "digest": _digest(layer)}
+                ],
+            }
+        ).encode()
         self.pinned = _digest(self.manifest)
         self.blobs = {_digest(CONFIG): CONFIG, _digest(layer): layer}
-        self.requests: list[str] = []
+        self.requests: list[tuple[str, str]] = []
+        self.served: list[str] = []
         registry = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
-                registry.requests.append(self.path)
+                # a proxied request carries the absolute URL; serve it as the registry it names
+                split = urllib.parse.urlsplit(self.path)
+                path = split.path + ("?" + split.query if split.query else "")
+                registry.requests.append((split.hostname, path))
                 prefix = f"/v2/{S3FS_PLUGIN_REPOSITORY}/"
-                if self.path.startswith("/token"):
+                if path.startswith("/token?") and "service=registry.test" in path:
                     body = b'{"token": "t"}'
                 elif self.headers.get("Authorization") != "Bearer t":
-                    return self.send_error(401)
-                elif self.path == prefix + "manifests/" + registry.pinned:
+                    self.send_response(401)
+                    self.send_header(
+                        "WWW-Authenticate",
+                        f'Bearer realm="{registry.url}/token",service="registry.test",scope="repository:x:pull"',
+                    )
+                    self.end_headers()
+                    return
+                elif path == prefix + "manifests/" + registry.pinned:
                     body = registry.manifest
-                elif self.path.startswith(prefix + "blobs/") and self.path.split("/")[-1] in registry.blobs:
-                    body = registry.blobs[self.path.split("/")[-1]]
+                elif path.startswith(prefix + "blobs/") and path.split("/")[-1] in registry.blobs:
+                    body = registry.blobs[path.split("/")[-1]]
                 else:
                     return self.send_error(404)
+                registry.served.append(path)
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(body)
@@ -112,7 +144,7 @@ class _Registry:
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def downloads(self) -> int:
-        return sum("/manifests/" in path for path in self.requests)
+        return sum("/manifests/" in path for path in self.served)
 
 
 @pytest.fixture
@@ -129,18 +161,19 @@ def node(tmp_path, registry):
     docker.chmod(0o755)
     host_root = tmp_path / "host"
     (host_root / DOCKER_ROOT.lstrip("/")).mkdir(parents=True)
-    env = {**os.environ, "FAKE_STATE": str(tmp_path / "state.json"), "FAKE_ROOT": DOCKER_ROOT}
+    env = {k: v for k, v in os.environ.items() if "proxy" not in k.lower()}
+    env |= {"FAKE_STATE": str(tmp_path / "state.json"), "FAKE_ROOT": DOCKER_ROOT, "FAKE_DIFF_ID": PINNED_DIFF_ID}
 
-    def run(alias="", registry_url=None):
+    def run(alias="", registry_url=None, **fake):
         command = s3fs_plugin_command(
             alias,
             host_root=str(host_root),
             docker=str(docker),
             registry=registry_url or registry.url,
-            token_url=(registry_url or registry.url) + "/token?service=registry.docker.io",
             manifest=registry.pinned,
+            diff_id=PINNED_DIFF_ID,
         )
-        result = subprocess.run(shlex.split(command), capture_output=True, text=True, env=env)
+        result = subprocess.run(shlex.split(command), capture_output=True, text=True, env=env | fake)
         state = json.loads((tmp_path / "state.json").read_text())
         return result, state
 
@@ -180,8 +213,8 @@ def test_validation_stages_the_copy_and_the_rental_then_needs_no_registry(node, 
     assert "s3fs-celium-volume-one" in state["plugins"]
 
 
-def test_a_registry_failure_on_a_node_without_the_copy_fails_with_the_reason(node):
-    result, state = node("s3fs-celium-volume-one", registry_url="http://127.0.0.1:9")
+def test_staging_that_cannot_download_fails_with_the_reason(node):
+    result, state = node(registry_url=UNREACHABLE)
 
     assert result.returncode == 1
     assert "plugin download failed" in result.stderr and "refused" in result.stderr.lower()
@@ -198,7 +231,7 @@ def test_a_download_other_than_the_pinned_build_is_refused(node, registry, tampe
         layer = next(digest for digest, body in registry.blobs.items() if body != CONFIG)
         registry.blobs[layer] += b"x"
 
-    result, state = node("s3fs-celium-volume-one")
+    result, state = node()
 
     assert result.returncode == 1
     assert "does not match the pinned digest" in result.stderr
@@ -217,8 +250,15 @@ def test_an_instance_that_exists_is_left_alone(node):
 def _result(exit_code: int, stderr: str = "") -> SSHCommandResult:
     now = datetime.now(UTC)
     return SSHCommandResult(
-        command="", command_id="c", exit_code=exit_code, stdout="", stderr=stderr, duration_ms=1,
-        started_at=now, finished_at=now, success=exit_code == 0,
+        command="",
+        command_id="c",
+        exit_code=exit_code,
+        stdout="",
+        stderr=stderr,
+        duration_ms=1,
+        started_at=now,
+        finished_at=now,
+        success=exit_code == 0,
     )
 
 
@@ -232,8 +272,13 @@ class _Runner:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("exit_code", "reason", "wait"), [(0, "S3FS_PLUGIN_COPY_STAGED", check_module.RECHECK_STAGED_SECONDS),
-                                                          (1, "S3FS_PLUGIN_COPY_NOT_STAGED", check_module.RETRY_FAILED_SECONDS)])
+@pytest.mark.parametrize(
+    ("exit_code", "reason", "wait"),
+    [
+        (0, "S3FS_PLUGIN_COPY_STAGED", check_module.RECHECK_STAGED_SECONDS),
+        (1, "S3FS_PLUGIN_COPY_NOT_STAGED", check_module.RETRY_FAILED_SECONDS),
+    ],
+)
 async def test_the_check_stages_an_idle_node_then_waits_and_never_fails_it(context_factory, exit_code, reason, wait):
     runner = _Runner(exit_code)
     ctx = context_factory(runner=runner)
@@ -307,3 +352,49 @@ async def test_the_check_skips_when_an_express_recheck_deadline_leaves_less_than
         result = await check_module.S3fsPluginCopyCheck().run(ctx)
 
     assert result.passed and "not enough task time left" in str(result.event) and runner.commands == []
+
+
+def test_the_nodes_configured_mirror_is_tried_first(node, registry):
+    result, state = node(
+        "s3fs-celium-volume-one", registry_url=UNREACHABLE, FAKE_MIRRORS=json.dumps([registry.url + "/"])
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert registry.downloads() == 1 and "s3fs-celium-volume-one" in state["plugins"]
+    assert not any(call[:2] == ["plugin", "install"] for call in state["calls"])
+
+
+def test_the_download_goes_through_dockerds_proxy(node, registry):
+    # the registry name does not resolve: only the proxy dockerd is configured with can reach it
+    result, state = node("s3fs-celium-volume-one", registry_url="http://registry.invalid", FAKE_PROXY=registry.url)
+
+    assert result.returncode == 0, result.stderr
+    assert ("registry.invalid", f"/v2/{S3FS_PLUGIN_REPOSITORY}/manifests/{registry.pinned}") in registry.requests
+    assert "s3fs-celium-volume-one" in state["plugins"]
+
+
+def test_a_rental_that_cannot_download_has_dockerd_install_the_pinned_build(node):
+    result, state = node("s3fs-celium-volume-one", registry_url=UNREACHABLE)
+
+    assert result.returncode == 0, result.stderr
+    assert "installed through dockerd" in result.stdout
+    assert state["plugins"]["s3fs-celium-volume-one"]["installed"] == S3FS_PLUGIN_TAG
+    assert not (node.copy / "ready").exists()  # the next staging run still builds the copy
+
+
+def test_a_build_dockerd_installs_that_is_not_the_pinned_one_is_removed(node):
+    result, state = node("s3fs-celium-volume-one", registry_url=UNREACHABLE, FAKE_DIFF_ID="sha256:" + "e" * 64)
+
+    assert result.returncode == 1
+    assert "does not match the pinned digest" in result.stderr
+    assert state["plugins"] == {}
+
+
+def test_a_rental_fails_with_both_reasons_when_dockerd_cannot_install_either(node):
+    result, state = node(
+        "s3fs-celium-volume-one", registry_url=UNREACHABLE, FAKE_INSTALL_ERROR="connection reset by peer"
+    )
+
+    assert result.returncode == 1
+    assert "plugin download failed" in result.stderr and "connection reset by peer" in result.stderr
+    assert state["plugins"] == {}
