@@ -12,6 +12,13 @@ from tests.helpers import build_context_config, build_services, build_state
         ("", "model:2", True, Msg.SPEC_UNCHANGED.reason, False),
         ("model:2", "model:2", True, Msg.SPEC_UNCHANGED.reason, False),
         ("model:2", "model:4", False, Msg.SPEC_CHANGED.reason, True),
+        # DAH-6546: one card under two datacenter names, as the backend's GPU-set move treats it
+        ("NVIDIA B300 SXM6 AC:8", "NVIDIA B300 SXM6 PC:8", True, Msg.SPEC_UNCHANGED.reason, False),
+        ("NVIDIA B300 SXM6 PC:8", "NVIDIA B300 SXM6 AC:8", True, Msg.SPEC_UNCHANGED.reason, False),
+        # every other model change, or a count change across the pair, still resets
+        ("NVIDIA B300 SXM6 AC:8", "NVIDIA B300 SXM6 PC:4", False, Msg.SPEC_CHANGED.reason, True),
+        ("NVIDIA B300 SXM6 AC:8", "NVIDIA B200:8", False, Msg.SPEC_CHANGED.reason, True),
+        ("NVIDIA B300 SXM6 PC:8", "NVIDIA GB300:8", False, Msg.SPEC_CHANGED.reason, True),
     ],
 )
 @pytest.mark.asyncio
@@ -32,6 +39,7 @@ async def test_spec_change_check(
 
     if expect_clear:
         assert result.updates.get("clear_verified_job_info") is True
+        assert result.updates.get("gpu_respec") is True
     else:
         assert "clear_verified_job_info" not in result.updates
 

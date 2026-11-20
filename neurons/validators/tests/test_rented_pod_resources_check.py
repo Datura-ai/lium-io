@@ -33,7 +33,7 @@ def _container(cpuset="", nano=8_000_000_000, oom=500, label="8", quota=0, perio
     }
 
 
-def _ssh(container=None, init_oom=500, raise_exc=None, cgroup_cpuset="", cpu_max=""):
+def _ssh(container=None, init_oom=500, raise_exc=None, cgroup_cpuset="", cpu_max="", proc_err=""):
     async def run(cmd, *args, **kwargs):
         if raise_exc is not None:
             raise raise_exc
@@ -41,7 +41,9 @@ def _ssh(container=None, init_oom=500, raise_exc=None, cgroup_cpuset="", cpu_max
             out = json.dumps(container) if container else ""
             return SimpleNamespace(exit_status=0 if container else 1, stdout=out, stderr="")
         return SimpleNamespace(
-            exit_status=0, stdout=f"4242|{init_oom}|{cgroup_cpuset}|{cpu_max}\n", stderr=""
+            exit_status=0,
+            stdout=f"4242|{init_oom}|{cgroup_cpuset}|{cpu_max}|{proc_err}\n",
+            stderr="",
         )
 
     return SimpleNamespace(run=run)
@@ -65,6 +67,7 @@ def _ctx(context_factory, ssh):
 async def _run(ctx):
     with patch(SETTINGS) as s:
         s.RENTED_POD_RESOURCES_CHECK_ENABLED = True
+        s.DRY_RUN = False
         return await RentedPodResourcesCheck().run(ctx)
 
 
@@ -197,3 +200,50 @@ async def test_cgroup_written_directly_is_seen(context_factory, cgroup_cpuset, c
     result = await _run(_ctx(context_factory, ssh))
     assert _findings(result) == findings
     assert result.passed is (not findings)
+
+
+@pytest.mark.asyncio
+async def test_memory_guard_coverage_is_counted_in_the_result(context_factory):
+    ssh = _ssh(_container())
+    inner_run = ssh.run
+
+    async def run(cmd, *args, **kwargs):
+        if "MemoryMin" in cmd:
+            return SimpleNamespace(exit_status=0, stdout="memory_min_skipped no_systemd\n", stderr="")
+        return await inner_run(cmd, *args, **kwargs)
+
+    result = await _run(_ctx(context_factory, SimpleNamespace(run=run)))
+
+    assert result.event.what_we_saw["memory_guard"] == {"set": 0, "failed": ["memory_min no_systemd"]}
+
+
+@pytest.mark.asyncio
+async def test_dry_run_validator_writes_no_memory_guard_on_the_host(context_factory):
+    ctx = _ctx(context_factory, _ssh(_container()))
+    with patch(SETTINGS) as s, patch(
+        "neurons.validators.src.services.task.checks.rented_pod_resources.apply_host_memory_guard"
+    ) as guard:
+        s.RENTED_POD_RESOURCES_CHECK_ENABLED = True
+        s.DRY_RUN = True
+        result = await RentedPodResourcesCheck().run(ctx)
+
+    guard.assert_not_called()
+    assert result.event.what_we_saw["memory_guard"] == {"set": 0, "failed": []}
+
+
+@pytest.mark.asyncio
+async def test_dead_proc_fuse_mount_is_reported_never_failed(context_factory):
+    err = "cat: /proc/4242/root/proc/sys/kernel/hostname: Transport endpoint is not connected"
+    result = await _run(_ctx(context_factory, _ssh(_container(), proc_err=err)))
+    assert result.passed is True
+    assert result.updates == {}
+    assert result.event.reason_code == Msg.PROC_FUSE_DISCONNECTED.reason
+    assert _findings(result) == ["proc_fuse_disconnected"]
+
+
+@pytest.mark.asyncio
+async def test_scored_finding_wins_over_dead_proc_fuse_mount(context_factory):
+    err = "Transport endpoint is not connected"
+    result = await _run(_ctx(context_factory, _ssh(_container(cpuset="2-7"), proc_err=err)))
+    assert result.passed is False
+    assert result.event.reason_code == Msg.RESOURCES_REDUCED.reason

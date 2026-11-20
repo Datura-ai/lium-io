@@ -31,7 +31,6 @@ class GPUAttestationService:
     """
 
     def __init__(self) -> None:
-        self.enabled: bool = bool(settings.ENABLE_GPU_ATTESTATION)
         self.arch: str = settings.GPU_ATTESTATION_ARCH
 
     @staticmethod
@@ -104,12 +103,9 @@ class GPUAttestationService:
         Payload shape matches the private-ml-sdk reference exactly:
         {"nonce": <hex>, "evidence_list": [...], "arch": <arch>}.
         """
-        if not self.enabled:
-            return None
-
         if not self._in_cvm():
             logger.info(
-                "GPU attestation enabled but no dstack guest detected at %s — "
+                "No dstack guest detected at %s — "
                 "host-mode topology, skipping GPU evidence collection",
                 settings.DSTACK_SOCKET_PATH,
             )

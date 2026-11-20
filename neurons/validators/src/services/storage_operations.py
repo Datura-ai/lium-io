@@ -284,8 +284,9 @@ async def start_storage_operation(
                     break
         if existing_state == "RUNNING" or existing_state.startswith("STATUS:"):
             return files
-        if await _helper_owned_by_live_runner(ssh_client, operation_id, files):
-            # an earlier dispatch's helper is still working; removing it would kill that run.
+        if await _runner_alive(ssh_client, files):
+            # an earlier dispatch's runner is still working, even before it wrote its PID or started
+            # its helper; a second runner would interrupt it.
             # A helper whose runner died is an orphan: it is removed below and the run relaunched.
             return files
         if existing_state in {"EXITED", "INVALID"} or await _remote_file_exists(
@@ -315,7 +316,10 @@ async def start_storage_operation(
         terminal_cleanup = (
             ""
             if retain_terminal_artifacts
-            else f"; rm -f {shlex.quote(str(files.status))} {shlex.quote(str(files.log))}"
+            # a failed run keeps its log: a runner that dies before reporting leaves no other trace
+            else f"; rm -f {shlex.quote(str(files.status))}; "
+            f'if [ "$result" = 0 ]; then rm -f {shlex.quote(str(files.log))}; '
+            f"else echo \"runner exited $result\" >> {shlex.quote(str(files.log))}; fi"
         )
         # Bootstrap callers consume the terminal files; detached online jobs
         # remove them themselves after the runner has finished reporting.
@@ -409,6 +413,7 @@ async def cancel_storage_operation(
     operation_id: UUID,
 ) -> None:
     files = StorageOperationFiles.for_operation(operation_id)
+    # once the runner has read it, the spec holds only the reporter (DAH-6463)
     spec = await _read_operation_spec(ssh_client, files.spec)
     helper_name = storage_helper_name(operation_id)
     cancel_path = shlex.quote(str(files.cancel))
@@ -472,17 +477,14 @@ async def _remote_file_exists(
     return result.exit_status == 0
 
 
-async def _helper_owned_by_live_runner(
+async def _runner_alive(
     ssh_client: asyncssh.SSHClientConnection,
-    operation_id: UUID,
     files: StorageOperationFiles,
 ) -> bool:
-    helper_name = storage_helper_name(operation_id)
     # "[-]-spec" keeps pgrep from matching this command's own shell
     runner_pattern = f"[-]-spec {files.spec}"
     result = await ssh_client.run(
-        f"/usr/bin/docker ps -q --filter {shlex.quote(f'name=^{helper_name}$')} --filter status=running"
-        f" | grep -q . && pgrep -f -- {shlex.quote(runner_pattern)} >/dev/null",
+        f"pgrep -f -- {shlex.quote(runner_pattern)} >/dev/null",
         check=False,
     )
     return result.exit_status == 0

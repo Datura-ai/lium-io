@@ -79,7 +79,7 @@ REMOVE_CACHE_SWEEP_CONTAINER = f"/usr/bin/docker rm -f {CACHE_SWEEP_CONTAINER_NA
 FILLER_IMAGE_REPOSITORIES = ("ghcr.io/hanlinai/engy-golden-serve", "daturaai/dolphin", "daturaai/dlph")
 
 
-def _image_repository(image: str) -> str:
+def image_repository(image: str) -> str:
     reference = image.split("@", 1)[0]
     name, _, tag = reference.rpartition(":")
     repository = name if name and "/" not in tag else reference
@@ -89,7 +89,7 @@ def _image_repository(image: str) -> str:
 def idle_filler_images_removal_command(keep_image: str | None = None) -> str:
     """The idle filler images' removal; `keep_image` is the image a create is about to run, whose repository
     is left alone: a renter may rent the Engy image itself, and it has no container until docker run."""
-    keep = _image_repository(keep_image) if keep_image else None
+    keep = image_repository(keep_image) if keep_image else None
     repositories = [repository for repository in FILLER_IMAGE_REPOSITORIES if repository != keep]
     if not repositories:  # `docker image ls` without a filter would list every image
         return "true"
@@ -97,6 +97,19 @@ def idle_filler_images_removal_command(keep_image: str | None = None) -> str:
         "/usr/bin/docker image ls "
         + " ".join(f"--filter reference={repository}" for repository in repositories)
         + " --format '{{.Repository}}:{{.Tag}}' | xargs -r /usr/bin/docker image rm >/dev/null 2>&1 || true"
+    )
+
+
+def idle_filler_images_size_command(keep_image: str | None = None) -> str:
+    """Prints the byte size of each image `idle_filler_images_removal_command` would remove, one per line."""
+    keep = image_repository(keep_image) if keep_image else None
+    repositories = [repository for repository in FILLER_IMAGE_REPOSITORIES if repository != keep]
+    if not repositories:
+        return "true"
+    return (
+        "/usr/bin/docker image ls "
+        + " ".join(f"--filter reference={repository}" for repository in repositories)
+        + " -q | sort -u | xargs -r /usr/bin/docker image inspect --format '{{.Size}}'"
     )
 
 
@@ -229,6 +242,7 @@ def _bound_pod_id_label(container_name: str, label: str) -> str:
 # diagnostic of theirs, is never removed. Only never-started (Created) ones go: a running one is a check
 # in progress.
 CAPABILITY_CHECK_NAME = re.compile(r"^lium_capability_check_[0-9]+_[0-9a-f]{6}$")
+FULL_CONTAINER_ID = re.compile(r"[0-9a-f]{64}")
 LIST_CREATED_CONTAINERS = "/usr/bin/docker ps -a --no-trunc --filter status=created --format '{{.ID}} {{.Names}}'"
 
 
@@ -236,7 +250,8 @@ def never_started_check_containers(listing: str) -> list[str]:
     return [
         fields[0]
         for fields in (line.split() for line in listing.splitlines())
-        if len(fields) == 2 and CAPABILITY_CHECK_NAME.match(fields[1])
+        # the id is node output that goes into `docker rm`: only a full container id is accepted
+        if len(fields) == 2 and CAPABILITY_CHECK_NAME.match(fields[1]) and FULL_CONTAINER_ID.fullmatch(fields[0])
     ]
 
 

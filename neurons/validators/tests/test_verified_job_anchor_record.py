@@ -15,7 +15,7 @@ from neurons.validators.src.services.task.checks.gpu_fingerprint import GpuFinge
 from neurons.validators.src.services.task.checks.spec_change import SpecChangeCheck
 from neurons.validators.src.services.task.pipeline import Pipeline
 from neurons.validators.src.services.task.result_handler import ResultHandler
-from services.redis_service import GPU_ANCHOR_BROKEN_KEY, VERIFIED_JOB_COUNT_KEY, RedisService
+from services.redis_service import VERIFIED_JOB_COUNT_KEY, RedisService
 
 from tests.helpers import build_state
 
@@ -39,12 +39,14 @@ async def _record(service: RedisService) -> dict:
     return json.loads(await service.redis.hget(VERIFIED_JOB_COUNT_KEY, f"hk:{EXECUTOR}"))
 
 
-async def _cycle(service, handler, context_factory, *, uuids: str, hard: bool, later_check_fails: bool = False):
+async def _cycle(
+    service, handler, context_factory, *, uuids: str, hard: bool, later_check_fails: bool = False, model: str = "A100"
+):
     """One validation cycle as the service runs it: record from Redis, the two GPU-set checks through the real
     Pipeline, the outcome persisted by the ResultHandler."""
     verified = await service.get_verified_job_info("hk", EXECUTOR)
     ctx = context_factory(
-        state=build_state(gpu_uuids=uuids, gpu_model_count=f"A100:{len(uuids.split(','))}"), verified=verified
+        state=build_state(gpu_uuids=uuids, gpu_model_count=f"{model}:{len(uuids.split(','))}"), verified=verified
     )
     with patch(SETTINGS) as s:
         s.GPU_ANCHOR_HARD_ENABLED = hard
@@ -77,7 +79,7 @@ async def test_a_full_set_of_other_cards_is_re_anchored_and_verified_the_same_cy
     await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", hard=hard)
 
     ok, _, record = await _cycle(service, handler, context_factory, uuids=swapped, hard=hard)
-    assert ok is passes and record["uuids"] == anchored_after and GPU_ANCHOR_BROKEN_KEY not in record
+    assert ok is passes and record["uuids"] == anchored_after and "anchor_broken" not in record
     # no verification reset for a full set change
     assert service.publish.await_count == (0 if passes else 1)
     if passes:
@@ -100,3 +102,23 @@ async def test_a_re_anchor_is_kept_when_a_later_check_fails_the_cycle(context_fa
 
     _, ctx, record = await _cycle(service, handler, context_factory, uuids="gpu-002", hard=False, later_check_fails=True)
     assert not ctx.gpu_reanchor and record["uuids"] == "gpu-002" and record["failed"] == 2
+
+
+@pytest.mark.asyncio
+async def test_a_node_on_another_gpu_model_is_reset_once_then_verified_as_it_is_now(context_factory):
+    """Regression: the reset kept the old model:count, so a node moved onto another model failed every cycle."""
+    service = _redis_service()
+    service.publish = AsyncMock()
+    handler = ResultHandler(redis_service=service, dry_run=False)
+    await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", hard=False, model="B300 PC")
+
+    ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-003,gpu-004", hard=False, model="B300 AC")
+    assert ok is False and record["spec"] == "B300 AC:2" and record["count"] == 0
+    assert service.publish.await_count == 1
+
+    ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-003,gpu-004", hard=False, model="B300 AC")
+    assert ok is True and record["spec"] == "B300 AC:2" and record["count"] == 1
+
+    # a change back is reset again: every model change still costs a fresh audit
+    ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-003,gpu-004", hard=False, model="B300 PC")
+    assert ok is False and record["spec"] == "B300 PC:2" and record["count"] == 0

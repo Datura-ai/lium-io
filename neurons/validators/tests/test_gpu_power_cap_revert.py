@@ -1,32 +1,29 @@
-"""DAH-2786 — a host that puts its own GPU power limit back loses the unrented incentive.
+"""DAH-2786 — a host that puts its own GPU power limit back while Lium's job runs.
 
 Case 3 of the three power-cap problems: the cap applies, the validator reads it back, and
 then something on the provider's host raises the limit again. The PEARL filler is killed by
-the backend grace check, so the node runs no Lium job — and today it still collects the full
-unrented incentive.
+the backend grace check; the validator only records and logs the revert, and reverts no longer
+gate pay (its 2-in-24h pay gate is gone).
 
 The revert is observed WHILE the Lium job runs, in the validation check that already skips the
 power-limit penalty for a live filler. That is the only moment it can be told apart from a host
 that leaves our cap alone and merely resets the limit after the job ends, which harms nothing.
-This suite covers the three halves: the rule, the recording, and the incentive gate.
+This suite covers the rule and the recording, and that no validator pay gate reads them.
 """
 
 import asyncio
+import dataclasses
 import json
-import logging
 import time
 from unittest.mock import AsyncMock
 
 import pytest
 from datura.requests.miner_requests import ExecutorSSHInfo
 from helpers import build_services, build_state
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
-
-from core.config import settings
 from incentive.config import IncentiveConfig
-from incentive.rental_price import MIN_POWER_CAP_REVERTS_TO_PENALIZE, NCU_PROFILING_UNRESTRICTED, RentalPriceIncentive
-from incentive.miner_incentive_log import ZeroIncentiveReason
+from incentive.rental_price import NCU_PROFILING_UNRESTRICTED, RentalPriceIncentive
 from payload_models.payloads import GpuPowerLimit
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.const import DEFAULT_JOB_OWNER_LIUM
 from services.gpu_power_limit import (
     CAP_REVERT_WINDOW_SECONDS,
@@ -35,13 +32,12 @@ from services.gpu_power_limit import (
     GpuPowerCapRevertHistory,
     GpuPowerRestoreReadResult,
     GpuPowerRestoreRecord,
+    _pod_index_key,
     _restore_key,
     _revert_key,
-    _pod_index_key,
     apply_filler_gpu_power_limits,
     clear_filler_pod_applied_caps,
     detect_cap_revert,
-    read_gpu_power_cap_reverts,
     restore_filler_pod_applied_caps,
 )
 from services.task.checks import gpu_power_limit as check_module
@@ -618,36 +614,13 @@ async def test_history_is_bounded(context_factory, monkeypatch) -> None:
 # ---------------------------- the applied-cap stamp ----------------------------
 
 
-# ---------------------------- read_gpu_power_cap_reverts ----------------------------
-
-
-@pytest.mark.asyncio
-async def test_read_returns_only_reverts_inside_the_window() -> None:
-    now = time.time()
-    history = GpuPowerCapRevertHistory(
-        reverts=[
-            GpuPowerCapRevert(observed_at=now - CAP_REVERT_WINDOW_SECONDS - 1, pod_id="pod-old", gpu_uuid="GPU-a", capped_to_watts=280, found_watts=400),
-            GpuPowerCapRevert(observed_at=now - 10, pod_id="pod-new", gpu_uuid="GPU-b", capped_to_watts=280, found_watts=400),
-        ],
-    )
-    redis = FakeRedis({_revert_key(EXECUTOR_ID): history.model_dump_json()})
-
-    reverts = await read_gpu_power_cap_reverts(redis, EXECUTOR_ID)
-
-    assert [revert.gpu_uuid for revert in reverts] == ["GPU-b"]
-
-
-@pytest.mark.asyncio
-async def test_read_is_empty_without_a_record() -> None:
-    assert await read_gpu_power_cap_reverts(FakeRedis(), EXECUTOR_ID) == []
-
-
 @pytest.mark.asyncio
 async def test_the_stamp_moves_a_frozen_record_onto_the_capping_executor() -> None:
     # A GPU whose record was frozen under an earlier executor must not file its next breach
     # against that executor - the provider running it now is the one being judged.
     state_csv = "GPU-a, 400, 400, 100, 400\n"
-    ssh = fake_ssh(FakeRun(stdout=state_csv), *_set_ok(280))
+    # the state query, the host's boot id (DAH-6555), then the set
+    ssh = fake_ssh(FakeRun(stdout=state_csv), FakeRun(stdout="boot-1\n"), *_set_ok(280))
     redis = FakeRedis({
         _restore_key("GPU-a"): _stored_restore_record(executor_id="executor-earlier", pod_id="pod-earlier")
     })
@@ -662,19 +635,30 @@ async def test_the_stamp_moves_a_frozen_record_onto_the_capping_executor() -> No
 
 
 @pytest.mark.asyncio
-async def test_read_fails_open_when_redis_is_down() -> None:
-    # Redis resilience: our own outage must never zero an innocent provider's incentive.
-    assert await read_gpu_power_cap_reverts(BrokenRedis(), EXECUTOR_ID) == []
+async def test_the_cap_records_the_hosts_boot_id() -> None:
+    # DAH-6555: a later scan with another boot id tells a reboot from the host raising our cap
+    ssh = fake_ssh(FakeRun(stdout="GPU-a, 400, 400, 100, 400\n"), FakeRun(stdout="boot-1\n"), *_set_ok(280))
+    redis = FakeRedis()
+
+    await apply_filler_gpu_power_limits(ssh, [GpuPowerLimit(gpu_uuid="GPU-a", watts=280)], redis, POD_ID, EXECUTOR_ID)
+
+    assert GpuPowerRestoreRecord.model_validate_json(redis.store[_restore_key("GPU-a")]).boot_id == "boot-1"
 
 
 @pytest.mark.asyncio
-async def test_read_fails_open_on_a_corrupt_record() -> None:
-    redis = FakeRedis({_revert_key(EXECUTOR_ID): json.dumps({"nonsense": True})})
+async def test_the_cap_stamps_this_boot_on_a_frozen_record() -> None:
+    # DAH-6555 review: a record frozen in an older boot must take this boot's id, or a raise in this boot would read
+    # as a reboot and get a free re-cap instead of a revert
+    ssh = fake_ssh(FakeRun(stdout="GPU-a, 400, 400, 100, 400\n"), FakeRun(stdout="boot-1\n"), *_set_ok(280))
+    frozen = GpuPowerRestoreRecord.model_validate_json(_stored_restore_record()).model_copy(update={"boot_id": "boot-0"})
+    redis = FakeRedis({_restore_key("GPU-a"): frozen.model_dump_json()})
 
-    assert await read_gpu_power_cap_reverts(redis, EXECUTOR_ID) == []
+    await apply_filler_gpu_power_limits(ssh, [GpuPowerLimit(gpu_uuid="GPU-a", watts=280)], redis, POD_ID, EXECUTOR_ID)
+
+    assert GpuPowerRestoreRecord.model_validate_json(redis.store[_restore_key("GPU-a")]).boot_id == "boot-1"
 
 
-# ---------------------------- the incentive gate ----------------------------
+# ---------------------------- no incentive gate ----------------------------
 
 
 def _build_incentive(redis: FakeRedis) -> RentalPriceIncentive:
@@ -723,44 +707,9 @@ def _make_job(is_rented: bool = False) -> JobResult:
 
 
 @pytest.mark.asyncio
-async def test_one_revert_does_not_reach_the_threshold() -> None:
-    # A driver reset can raise a limit on its own, so a single observation is not a breach.
-    incentive = _build_incentive(_redis_with_reverts(1))
-
-    assert await incentive._power_cap_reverted(_make_job()) is None
-
-
-@pytest.mark.asyncio
-async def test_repeated_reverts_are_flagged() -> None:
-    incentive = _build_incentive(_redis_with_reverts(MIN_POWER_CAP_REVERTS_TO_PENALIZE))
-
-    reverted = await incentive._power_cap_reverted(_make_job())
-
-    assert reverted is not None
-    assert reverted.revert_count == MIN_POWER_CAP_REVERTS_TO_PENALIZE
-    assert reverted.capped_to_watts == 280
-    assert reverted.found_watts == 400
-
-
-def test_the_rule_is_the_one_the_provider_docs_publish() -> None:
-    # lium-platform apps/docs providers/nodes/gpu-power-cap.md "Do not put the limit back":
-    # "After 2 such jobs in 24 hours ... the idle payout stops". Change the docs with these.
-    assert MIN_POWER_CAP_REVERTS_TO_PENALIZE == 2
-    assert CAP_REVERT_WINDOW_SECONDS == 24 * 60 * 60
-    assert ZeroIncentiveReason.REVERTS_GPU_POWER_CAP == "reverts_gpu_power_cap"
-
-
-@pytest.mark.asyncio
-async def test_gate_fails_open_when_redis_is_down() -> None:
-    incentive = _build_incentive(BrokenRedis())
-
-    assert await incentive._power_cap_reverted(_make_job()) is None
-
-
-@pytest.mark.asyncio
-async def test_shadow_mode_keeps_rental_eligibility(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT", False)
-    incentive = _build_incentive(_redis_with_reverts(MIN_POWER_CAP_REVERTS_TO_PENALIZE))
+async def test_recorded_reverts_do_not_withhold_idle_pay() -> None:
+    # the validator gate misfired on split nodes at a filler swap, so recorded reverts no longer gate pay
+    incentive = _build_incentive(_redis_with_reverts(5))
 
     result = await incentive.calculate_executor_score(_make_job())
 
@@ -768,52 +717,133 @@ async def test_shadow_mode_keeps_rental_eligibility(monkeypatch) -> None:
     assert "reverts_gpu_power_cap" not in "\n".join(result.incentive_logs)
 
 
-@pytest.mark.asyncio
-async def test_shadow_mode_emits_the_measurement_log(monkeypatch, caplog) -> None:
-    # The shadow numbers are the whole deliverable of the first deploy.
-    monkeypatch.setattr(settings, "ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT", False)
-    incentive = _build_incentive(_redis_with_reverts(MIN_POWER_CAP_REVERTS_TO_PENALIZE))
+# ---------------------------- DAH-6555: a host reboot under our live cap ----------------------------
 
-    with caplog.at_level(logging.INFO):
-        await incentive.calculate_executor_score(_make_job())
+BOOT_AT_CAP = "boot-at-cap"
 
-    breach = next(
-        record.msg for record in caplog.records
-        if hasattr(record.msg, "extra") and record.msg.extra.get("reason") == "reverts_gpu_power_cap"
+
+def host_after_reboot(failing_gpu: str | None = None, readback_watts: int = 280) -> AsyncMock:
+    """SSH to a host whose filler runs and that answers nvidia-smi -pm/-pl/readback; a -pl on `failing_gpu` fails."""
+    commands: list[str] = []
+
+    async def run(command: str, **_kwargs) -> FakeRun:
+        commands.append(command)
+        if command.startswith("/usr/bin/docker inspect"):
+            return FakeRun(stdout=f"/filler_{POD_ID} true\n")
+        if " -pl " in command:
+            failed = failing_gpu is not None and failing_gpu in command
+            return FakeRun(exit_status=1 if failed else 0, stderr="not permitted" if failed else "")
+        if "--query-gpu=power.limit,persistence_mode" in command:
+            return FakeRun(stdout=f"{readback_watts}.00, Enabled\n")
+        return FakeRun()
+
+    ssh = AsyncMock()
+    ssh.run.side_effect = run
+    ssh.commands = commands
+    return ssh
+
+
+async def _check_under_live_cap(
+    context_factory,
+    monkeypatch,
+    ssh: AsyncMock,
+    *,
+    boot_id_now: str | None,
+    record_boot_id: str | None = BOOT_AT_CAP,
+    gpu_uuids: tuple[str, ...] = ("GPU-a",),
+):
+    records = [
+        _record(gpu_uuid=uuid).model_copy(update={"capped_at": time.time() - 3600, "boot_id": record_boot_id})
+        for uuid in gpu_uuids
+    ]
+    redis = FakeRedis({_restore_key(record.gpu_uuid): record.model_dump_json() for record in records})
+    monkeypatch.setattr(
+        check_module,
+        "read_gpu_power_restore_records",
+        AsyncMock(return_value=GpuPowerRestoreReadResult(records=records, read_failed=False)),
     )
-    assert "shadow only - flag off" in breach.message
-    assert breach.extra["power_cap_revert_count"] == MIN_POWER_CAP_REVERTS_TO_PENALIZE
-    assert breach.extra["enforced"] is False
-    assert breach.extra["pool"] == "rental_kept_shadow"
+    details = [
+        {"name": "NVIDIA L40S", "uuid": uuid, "power_limit": 400.0, "power_default_limit": 400.0,
+         "power_max_limit": 450.0}
+        for uuid in gpu_uuids
+    ]
+    state = _running_filler_state(*[(uuid, 400.0) for uuid in gpu_uuids])
+    specs = {"gpu": {"count": len(gpu_uuids), "details": details}} | ({"boot_id": boot_id_now} if boot_id_now else {})
+    state = dataclasses.replace(state, specs=specs)
+    ctx = context_factory(state=state, services=build_services(redis=redis), ssh=ssh)
+
+    result = await GpuPowerLimitCheck().run(ctx)
+
+    assert result.passed is True
+    return result, redis
 
 
 @pytest.mark.asyncio
-async def test_enforced_drops_rental_eligibility(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT", True)
-    incentive = _build_incentive(_redis_with_reverts(MIN_POWER_CAP_REVERTS_TO_PENALIZE))
+async def test_a_cap_raised_by_a_host_reboot_is_set_again_and_no_revert(context_factory, monkeypatch) -> None:
+    # 136 of 171 PEARL power-cap stops in 14 days (to 17 Nov) followed a host reboot: the reboot reset the limit and
+    # docker started the filler again by its restart policy, uncapped. That is no host revert: we cap it again.
+    ssh = host_after_reboot()
 
-    result = await incentive.calculate_executor_score(_make_job())
+    result, redis = await _check_under_live_cap(context_factory, monkeypatch, ssh, boot_id_now="boot-after")
 
-    assert result.eligible_for_rental_share is False
-    assert result.mining_score == 0
-    assert "reverts_gpu_power_cap" in "\n".join(result.incentive_logs)
+    assert any(" -pl 280" in command for command in ssh.commands)
+    assert _revert_key(CHECK_EXECUTOR_UUID) not in redis.store
+    published = result.updates["state"].specs["gpu"]["details"][0]
+    assert published["power_limit"] == 280
+    assert published["power_host_limit"] == 400
+    refreshed = GpuPowerRestoreRecord.model_validate_json(redis.store[_restore_key("GPU-a")])
+    assert refreshed.boot_id == "boot-after"  # a later raise in this boot is judged as a revert again
+    assert refreshed.capped_at > time.time() - 60
+    assert refreshed.capped_to_watts == 280
+    assert refreshed.watts == 400
+
+
+@pytest.mark.parametrize(
+    ("boot_id_now", "record_boot_id"),
+    [
+        pytest.param(BOOT_AT_CAP, BOOT_AT_CAP, id="same boot: the host raised it"),
+        pytest.param(None, BOOT_AT_CAP, id="the scan has no boot id"),
+        pytest.param("boot-after", None, id="a record from before the boot id"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_raised_cap_with_no_reboot_seen_is_still_a_revert(
+    context_factory, monkeypatch, boot_id_now, record_boot_id
+) -> None:
+    # we cap before docker run, so the container always starts after the cap: only a new boot id proves a reboot
+    ssh = host_after_reboot()
+
+    result, redis = await _check_under_live_cap(
+        context_factory, monkeypatch, ssh, boot_id_now=boot_id_now, record_boot_id=record_boot_id
+    )
+
+    assert not any(" -pl " in command for command in ssh.commands)
+    assert len(_stored_history(redis).reverts) == 1
+    assert result.updates["state"].specs["gpu"]["details"][0]["power_limit"] == 400.0
 
 
 @pytest.mark.asyncio
-async def test_rented_executor_is_never_gated(monkeypatch) -> None:
-    # The gate only withholds the UNRENTED incentive; a rented node earns from the mining pool.
-    monkeypatch.setattr(settings, "ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT", True)
-    incentive = _build_incentive(_redis_with_reverts(MIN_POWER_CAP_REVERTS_TO_PENALIZE))
+async def test_a_cap_that_cannot_be_set_again_after_a_reboot_is_still_a_revert(context_factory, monkeypatch) -> None:
+    ssh = host_after_reboot(failing_gpu="GPU-a")
 
-    assert await incentive._power_cap_reverted(_make_job(is_rented=True)) is not None  # gate is state-only
-    result = await incentive.calculate_executor_score(_make_job(is_rented=True))
+    result, redis = await _check_under_live_cap(context_factory, monkeypatch, ssh, boot_id_now="boot-after")
 
-    assert "reverts_gpu_power_cap" not in "\n".join(result.incentive_logs)
+    assert any(" -pl 280" in command for command in ssh.commands)
+    assert len(_stored_history(redis).reverts) == 1
+    assert result.updates["state"].specs["gpu"]["details"][0]["power_limit"] == 400.0
 
 
 @pytest.mark.asyncio
-async def test_enforcement_ships_off() -> None:
-    # Rollout contract: this gate infers provider intent, so it starts in shadow.
-    default = type(settings).model_fields["ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT"].default
+async def test_a_pod_whose_second_gpu_refuses_the_cap_again_stays_a_revert(context_factory, monkeypatch) -> None:
+    # Review: one GPU takes the cap again and the next one fails; the pod keeps the revert path for both
+    ssh = host_after_reboot(failing_gpu="GPU-b")
 
-    assert default is False
+    result, redis = await _check_under_live_cap(
+        context_factory, monkeypatch, ssh, boot_id_now="boot-after", gpu_uuids=("GPU-a", "GPU-b")
+    )
+
+    assert any("GPU-a" in command and " -pl 280" in command for command in ssh.commands)
+    assert any("GPU-b" in command and " -pl 280" in command for command in ssh.commands)
+    assert len(_stored_history(redis).reverts) == 1  # one entry per job
+    published = result.updates["state"].specs["gpu"]["details"]
+    assert [detail["power_limit"] for detail in published] == [400.0, 400.0]

@@ -504,7 +504,8 @@ async def test_central_miner_lists_each_node_with_its_registered_host_key_from_o
     keyed_node, unkeyed_node = str(uuid4()), str(uuid4())
     portal_items = [
         {"id": keyed_node.upper(), "validator_hotkey": "v", "executor_ip_address": "node.example.com",
-         "executor_ip_port": "8001", "ssh_host_key": "ssh-ed25519 AAAAregistered"},
+         "executor_ip_port": "8001", "ssh_host_key": "ssh-ed25519 AAAAregistered",
+         "node_hotkeys": ["5Account", "5Pool"], "account_claim": "claim-1"},
         {"id": unkeyed_node, "validator_hotkey": "v", "executor_ip_address": "203.0.113.5", "executor_ip_port": "8001"},
     ]
     es.settings.CENTRAL_MODE = True
@@ -526,6 +527,37 @@ async def test_central_miner_lists_each_node_with_its_registered_host_key_from_o
     by_id = {info.uuid: info for info in registration.accepted}
     assert by_id[keyed_node.lower()].expected_ssh_host_key == "ssh-ed25519 AAAAregistered"
     assert by_id[unkeyed_node].expected_ssh_host_key is None
+    # DAH-6539: the account binding from the same read; none for a node the portal lists without it
+    assert by_id[keyed_node.lower()].expected_node_hotkeys == ["5Account", "5Pool"]
+    assert by_id[keyed_node.lower()].expected_account_claim == "claim-1"
+    assert by_id[unkeyed_node].expected_node_hotkeys is None
+
+
+@pytest.mark.asyncio
+async def test_central_miner_gives_a_validator_nothing_of_a_miner_whose_nodes_are_assigned_elsewhere(executor_service):
+    """Central mode accepts any signed X-Miner-Hotkey; what the request reaches is the portal's list of that miner's
+    nodes assigned to the SIGNING validator. A validator naming a miner whose nodes it was not assigned acts on none."""
+    from clients.miner_portal_api import MinerPortalAPI
+
+    others_nodes = [
+        {"id": str(uuid4()), "validator_hotkey": "assigned-validator", "executor_ip_address": "node.example.com",
+         "executor_ip_port": "8001"},
+    ]
+    es.settings.CENTRAL_MODE = True
+    es.settings.RENTAL_REQUEST_HOOK = None
+    executor_service.send_pubkey_to_executor = AsyncMock()
+    executor_service.remove_pubkey_from_executor = AsyncMock()
+
+    with patch.object(MinerPortalAPI, "fetch_executors", AsyncMock(return_value=others_nodes)):
+        assert await executor_service.get_executors_for_validator("signing-validator", "other-miner") == []
+        registration = await executor_service.register_pubkey("signing-validator", "other-miner", _SSH_KEY.encode(), "0xaa")
+        await executor_service.deregister_pubkey("signing-validator", "other-miner", _SSH_KEY.encode(), "0xaa")
+        with pytest.raises(Exception, match="not found executor"):
+            await executor_service.get_pod_logs("signing-validator", "other-miner", others_nodes[0]["id"], "c")
+
+    assert registration.accepted == []
+    executor_service.send_pubkey_to_executor.assert_not_awaited()
+    executor_service.remove_pubkey_from_executor.assert_not_awaited()
 
 
 @pytest.mark.asyncio

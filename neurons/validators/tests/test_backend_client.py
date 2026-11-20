@@ -202,6 +202,16 @@ async def test_check_executor_health_sends_loopback_plugin_only_when_given(clien
 
 
 @pytest.mark.asyncio
+async def test_check_executor_health_sends_the_upload_nonce_only_when_given(client):
+    with patch.object(client, "_signed_request", AsyncMock(return_value=None)) as post:
+        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001)
+        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001, upload_nonce="ab" * 32)
+
+    assert "upload_nonce" not in post.await_args_list[0].kwargs["json_data"]
+    assert post.await_args_list[1].kwargs["json_data"]["upload_nonce"] == "ab" * 32
+
+
+@pytest.mark.asyncio
 async def test_check_executor_health_bounds_the_whole_call_including_retries(reset_session, client):
     # the first attempt drops late, the retry would start a fresh full-length wait
     async def drop_late():
@@ -386,6 +396,28 @@ async def test_get_all_rented_executors_parses_filler_mapping(reset_session, cli
     assert result.filler_containers_by_executor == {
         "executor-123": "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cycle_snapshot_block", "path"),
+    [
+        (7200, "/internal/executors/rented?snapshot_cycle=7200"),
+        (None, "/internal/executors/rented"),
+    ],
+)
+async def test_cycle_snapshot_read_adds_the_query_flag(
+    reset_session, client, cycle_snapshot_block, path
+):
+    # DAH-6400: the backend counts only the cycle's read toward a resumed node's idle-pay hold
+    mock_session = create_mock_session(create_mock_response(200, {"executors": {}}))
+
+    with patch.object(BackendClient, "get_session", return_value=mock_session):
+        await client.get_all_rented_executors(cycle_snapshot_block=cycle_snapshot_block)
+
+    call = mock_session.request.call_args
+    url = str(call.args[1] if len(call.args) > 1 else call.kwargs.get("url"))
+    assert url.endswith(path)
 
 
 def create_mock_session_with_attempts(side_effects):

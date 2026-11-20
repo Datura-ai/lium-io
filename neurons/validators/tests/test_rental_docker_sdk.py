@@ -1,8 +1,10 @@
 import base64
 import json
 import os
+import shutil
 import socket
 import struct
+import subprocess
 import threading
 from unittest.mock import Mock
 
@@ -104,7 +106,8 @@ class FakeApiClient:
         self.container_states = None
         self.inspect_container_error = None
         self.events = []
-        self.pruned_images = False
+        self.repo_tags = []
+        self.removed_images = []
         self.created_volumes = []
         self.removed_volumes = []
         self.networks = {}  # name -> what inspect_network returns
@@ -146,7 +149,7 @@ class FakeApiClient:
             raise self.inspect_image_error
         if image in self.missing_images:
             raise ImageNotFound("missing image")
-        return {"Id": "image-id", "RepoDigests": self.repo_digests}
+        return {"Id": "image-id", "RepoDigests": self.repo_digests, "RepoTags": self.repo_tags}
 
     def inspect_distribution(self, image, auth_config=None):
         self.distribution_calls.append({"image": image, "auth_config": auth_config})
@@ -190,8 +193,8 @@ class FakeApiClient:
             return self.container_states[0]
         return {"State": {"Running": True, "Restarting": False}}
 
-    def prune_images(self):
-        self.pruned_images = True
+    def remove_image(self, image):
+        self.removed_images.append(image)
         return {"ImagesDeleted": []}
 
     def create_volume(self, **kwargs):
@@ -1226,7 +1229,7 @@ def test_stdin_exec_spec_builders_keep_values_out_of_argv():
 
 
 @pytest.mark.asyncio
-async def test_delete_helpers_call_sdk_volume_and_prune_apis():
+async def test_delete_helpers_call_sdk_volume_apis():
     api_client = FakeApiClient()
     client = RentalDockerSdkClient(api_client)
 
@@ -1237,7 +1240,6 @@ async def test_delete_helpers_call_sdk_volume_and_prune_apis():
         timeout=133,
         labels=FILLER_VOLUME_LABELS,
     )
-    await client.prune_images()
     await client.remove_volume(volume_name="volume_test", force=True)
 
     assert api_client.created_volumes == [
@@ -1250,8 +1252,17 @@ async def test_delete_helpers_call_sdk_volume_and_prune_apis():
         }
     ]
     assert api_client.timeout == 60
-    assert api_client.pruned_images is True
     assert api_client.removed_volumes == [("volume_test", {"force": True})]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("repo_tags", "expect_removed"), [([], True), (["daturaai/pytorch:latest"], False)])
+async def test_an_image_is_removed_by_id_only_once_no_tag_names_it(repo_tags, expect_removed):
+    api_client = FakeApiClient()
+    api_client.repo_tags = repo_tags
+
+    assert await RentalDockerSdkClient(api_client).remove_image_if_untagged(image_id="sha256:pod") is expect_removed
+    assert api_client.removed_images == (["sha256:pod"] if expect_removed else [])
 
 
 @pytest.mark.asyncio
@@ -1720,3 +1731,245 @@ def test_rental_ssh_adapter_hands_paramiko_a_socket_to_the_pinned_address(tmp_pa
     finally:
         connected["sock"].close()
         listener.close()
+
+
+@pytest.mark.asyncio
+async def test_container_identity_is_id_and_start_time_and_none_once_the_container_is_gone():
+    api_client = Mock()
+    api_client.inspect_container = Mock(return_value={"Id": "cid", "State": {"StartedAt": "t1"}})
+    client = RentalDockerSdkClient(api_client)
+
+    assert await client.container_identity(container_name="pod_x") == "cid@t1"
+
+    api_client.inspect_container = Mock(side_effect=NotFound("gone"))
+    assert await client.container_identity(container_name="pod_x") is None
+
+
+def _run_key_append(spec, env=None) -> subprocess.CompletedProcess:
+    return subprocess.run(list(spec.argv), input=spec.stdin, capture_output=True, text=True, env=env)
+
+
+def test_authorized_keys_append_adds_the_keys_within_the_deadline(tmp_path):
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("existing\n")
+
+    completed = _run_key_append(
+        build_authorized_keys_exec_spec(container_name="pod_key", public_keys=["k1", "k2"], target_path=str(target))
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == "existing\nk1\nk2\n"
+
+
+def test_authorized_keys_append_past_its_deadline_appends_nothing(tmp_path):
+    # DAH-6441: a stalled add must never append after the backend confirmed a removal
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("existing\n")
+
+    completed = _run_key_append(
+        build_authorized_keys_exec_spec(
+            container_name="pod_key", public_keys=["k1"], target_path=str(target), append_deadline_seconds=-1
+        )
+    )
+
+    assert completed.returncode == 75
+    assert target.read_text() == "existing\n"
+
+
+def test_authorized_keys_append_that_cannot_read_its_keys_appends_nothing(tmp_path):
+    blocker = tmp_path / "ssh"
+    blocker.write_text("a file where the directory should be")
+
+    completed = _run_key_append(
+        build_authorized_keys_exec_spec(
+            container_name="pod_key", public_keys=["k1"], target_path=str(blocker / "authorized_keys")
+        )
+    )
+
+    assert completed.returncode == 1
+    assert blocker.read_text() == "a file where the directory should be"
+
+
+def test_authorized_keys_append_needs_no_date_or_mktemp_in_the_image(tmp_path):
+    # minimal rental images: only the tools the add always used (sh, cat, mkdir, chmod) are on PATH
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    for tool in ("sh", "cat", "mkdir", "chmod"):
+        (tools / tool).symlink_to(shutil.which(tool))
+    target = tmp_path / "ssh" / "authorized_keys"
+    spec = build_authorized_keys_exec_spec(container_name="pod_key", public_keys=["k1", "k2"], target_path=str(target))
+
+    completed = subprocess.run(
+        [str(tools / "sh"), *spec.argv[1:]], input=spec.stdin, capture_output=True, text=True, env={"PATH": str(tools)}
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == "k1\nk2\n"
+    assert "date" not in spec.argv[2] and "mktemp" not in spec.argv[2]
+
+
+def test_authorized_keys_append_reads_the_clock_whole_as_sysboxfs_needs(tmp_path):
+    # DAH-6441: in a Sysbox pod /proc/uptime fails the shell's byte-wise `read` (rc 1, empty) but a whole read works;
+    # a `read` that always fails stands in for it, so the clock must come from cat alone
+    target = tmp_path / "ssh" / "authorized_keys"
+    spec = build_authorized_keys_exec_spec(container_name="pod_key", public_keys=["k1"], target_path=str(target))
+
+    completed = subprocess.run(
+        ["sh", "-c", "read() { return 1; }; " + spec.argv[2]], input=spec.stdin, capture_output=True, text=True
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == "k1\n"
+
+
+@pytest.mark.skipif(shutil.which("busybox") is None, reason="busybox not installed")
+def test_authorized_keys_append_runs_under_busybox_ash(tmp_path):
+    target = tmp_path / "ssh" / "authorized_keys"
+    spec = build_authorized_keys_exec_spec(container_name="pod_key", public_keys=["k1"], target_path=str(target))
+
+    completed = subprocess.run(
+        [shutil.which("busybox"), "sh", "-c", spec.argv[2]], input=spec.stdin, capture_output=True, text=True
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == "k1\n"
+
+
+def test_rental_ssh_adapter_failed_reconnect_reads_as_a_transport_not_reopened(monkeypatch, tmp_path):
+    """A call's retry finds the SSH session dead and cannot connect again: through the retry's own wrappers this
+    is the node not answering (ssh_connect), not the call's step."""
+    import paramiko
+    from urllib3._collections import RecentlyUsedContainer
+
+    key_path = tmp_path / "id_executor"
+    known_hosts_path = tmp_path / "known_hosts"
+    key_path.write_text("PRIVATE KEY")
+    known_hosts_path.write_text("[192.0.2.10]:2222 ssh-ed25519 AAAATESTKEY\n")
+
+    class FakeSSHClient:
+        def load_host_keys(self, path):
+            pass
+
+        def set_missing_host_key_policy(self, policy):
+            pass
+
+        def connect(self, **params):
+            raise TimeoutError("timed out")
+
+        def get_transport(self):
+            return None
+
+    monkeypatch.setattr(paramiko, "SSHClient", FakeSSHClient)
+    adapter_class = _build_rental_ssh_http_adapter_class(key_path=key_path, known_hosts_path=known_hosts_path)
+    adapter = adapter_class.__new__(adapter_class)
+    adapter._create_paramiko_client("ssh://root@192.0.2.10:2222")
+    adapter.pools = RecentlyUsedContainer(1)
+    adapter.ssh_host = "192.0.2.10"
+    adapter._connect_deferred = False
+
+    with pytest.raises(rental_docker_sdk.RentalDockerReconnectFailed) as raised:
+        adapter.get_connection("http+docker://ssh/v1.43/images/create")
+
+    # as the retry raises it: the pull's wrapper, then the retry's transport error over it
+    try:
+        try:
+            raise rental_docker_sdk.RentalDockerOperationError("Docker SDK pull failed") from raised.value
+        except rental_docker_sdk.RentalDockerOperationError as wrapped:
+            raise rental_docker_sdk.RentalDockerTransportError("pull failed once more after re-opening") from wrapped
+    except rental_docker_sdk.RentalDockerTransportError as retried:
+        assert rental_docker_sdk.is_rental_docker_transport_error(raised.value)
+        assert rental_docker_sdk.is_transport_not_reopened(retried)
+
+
+@pytest.mark.skipif(shutil.which("flock") is None, reason="flock not installed")
+@pytest.mark.parametrize("remove", [False, True])
+def test_authorized_keys_edit_waits_for_the_other_edit_and_never_writes_past_it(tmp_path, monkeypatch, remove):
+    # DAH-6441: a remove's read-filter-write must not interleave with an add, or it writes back a file missing the add
+    monkeypatch.setattr(rental_docker_sdk, "AUTHORIZED_KEYS_LOCK_WAIT_SECONDS", 1)
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("k1\n")
+    lock = str(target.parent / ".lium-cp.lock")
+    build = build_remove_authorized_keys_exec_spec if remove else build_authorized_keys_exec_spec
+    spec = build(container_name="pod_key", public_keys=["k1"], target_path=str(target))
+    holder = subprocess.Popen(["flock", "-o", lock, "sleep", "30"])
+    try:
+        while subprocess.run(["flock", "-n", lock, "true"]).returncode == 0:
+            pass
+        completed = _run_key_append(spec)
+    finally:
+        holder.kill()
+        holder.wait()
+
+    assert completed.returncode == (1 if remove else 75)
+    assert target.read_text() == "k1\n"
+
+
+def test_authorized_keys_remove_drops_only_the_listed_keys(tmp_path):
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("k1\nk2\nk3\n")
+
+    completed = _run_key_append(
+        build_remove_authorized_keys_exec_spec(container_name="pod_key", public_keys=["k1", "k3"], target_path=str(target))
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == "k2\n"
+
+
+def _path_without_flock(tmp_path) -> str:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for tool in ("sh", "mkdir", "cat", "chmod", "touch", "mktemp", "rm", "grep"):
+        (bin_dir / tool).symlink_to(shutil.which(tool))
+    return str(bin_dir)
+
+
+@pytest.mark.parametrize("remove", [False, True])
+def test_authorized_keys_edit_without_flock_runs_unlocked_as_before(tmp_path, remove):
+    # no lock that a killed edit could leave behind and so block every later edit on the pod
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("k1\nk2\n")
+    build = build_remove_authorized_keys_exec_spec if remove else build_authorized_keys_exec_spec
+    spec = build(container_name="pod_key", public_keys=["k1"], target_path=str(target))
+
+    completed = _run_key_append(spec, env={"PATH": _path_without_flock(tmp_path)})
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == ("k2\n" if remove else "k1\nk2\nk1\n")
+    assert sorted(p.name for p in target.parent.iterdir()) == ["authorized_keys"]
+
+
+@pytest.mark.skipif(shutil.which("flock") is None, reason="flock not installed")
+@pytest.mark.parametrize("remove", [False, True])
+def test_authorized_keys_edit_takes_the_lock_with_a_flock_that_has_no_wait_option(tmp_path, remove):
+    # Alpine images have BusyBox flock, which takes -n but no -w
+    target = tmp_path / "ssh" / "authorized_keys"
+    target.parent.mkdir()
+    target.write_text("k1\nk2\n")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    busybox_like = bin_dir / "flock"
+    busybox_like.write_text(f'#!/bin/sh\ncase " $* " in *" -w "*) exit 1;; esac\nexec {shutil.which("flock")} "$@"\n')
+    busybox_like.chmod(0o755)
+    build = build_remove_authorized_keys_exec_spec if remove else build_authorized_keys_exec_spec
+    spec = build(container_name="pod_key", public_keys=["k1"], target_path=str(target))
+
+    completed = _run_key_append(spec, env={"PATH": f"{bin_dir}:/usr/bin:/bin"})
+
+    assert completed.returncode == 0, completed.stderr
+    assert target.read_text() == ("k2\n" if remove else "k1\nk2\nk1\n")
+
+
+# --- DAH-6302: a CPU share of 0 never means no CPU limit ---
+
+
+@pytest.mark.parametrize(("cpu_count", "nano_cpus"), [(0, 1_000_000_000), (3, 3_000_000_000), (None, None)])
+def test_a_cpu_share_that_rounded_down_to_0_gets_one_core_not_no_limit(cpu_count, nano_cpus):
+    spec = ContainerRunSpec(image="registry.example/app:tag", name="pod_test", cpu_count=cpu_count)
+
+    assert rental_docker_sdk._build_host_config_kwargs(spec).get("nano_cpus") == nano_cpus
