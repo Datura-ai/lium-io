@@ -208,7 +208,7 @@ async def test_restart_clears_only_running_claims_and_retry_answers(client):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "operation", ["claim_backend_command", "update_backend_command", "invalid_reply", "retried_set"]
+    "operation", ["update_backend_command", "retried_set"]
 )
 async def test_redis_failure_fails_open(client, monkeypatch, operation):
     service = client.miner_service.redis_service
@@ -231,6 +231,32 @@ async def test_redis_failure_fails_open(client, monkeypatch, operation):
     await client.miner_driver(request())
     assert client.miner_service.handle_container.await_count == 1
     assert len(client.message_queue) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["claim_backend_command", "invalid_reply"])
+async def test_a_create_without_a_dedupe_record_is_refused_not_run(client, monkeypatch, operation):
+    """A create whose first copy ran must never run again because Redis failed on the resend: with no readable
+    command record the create is refused, nothing runs, and the backend gets a failure it may send again."""
+    service = client.miner_service.redis_service
+    await client.miner_driver(request())  # the first copy runs and records its answer
+    client.message_queue.clear()
+    if operation == "invalid_reply":
+        await service.redis.set(
+            BACKEND_COMMAND_PREFIX + "command", json.dumps({"state": "finished", "responses": ["{}"]}), ex=900
+        )
+    else:
+        monkeypatch.setattr(service, operation, AsyncMock(side_effect=ConnectionError))
+
+    await client.miner_driver(request())
+
+    assert client.miner_service.handle_container.await_count == 1
+    [refusal] = client.message_queue
+    assert isinstance(refusal, FailedContainerRequest)
+    assert refusal.command_id == "command"
+    assert refusal.error_type == FailedContainerErrorTypes.ContainerCreationFailed
+    assert refusal.error_code == FailedContainerErrorCodes.UnknownError
+    assert refusal.failure_step == "validator_restarted"
 
 
 @pytest.mark.asyncio

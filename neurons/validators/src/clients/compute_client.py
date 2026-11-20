@@ -1082,6 +1082,8 @@ class ComputeClient:
                 "Backend command dedup failed open",
                 extra=get_extra_info({**self.logging_extra, "command_id": command_id}),
             ))
+            if isinstance(job_request, ContainerCreateRequest):
+                return await self._refuse_unrecorded_create(job_request)
             return await self._run_miner_job(job_request)
         if existing is not None:
             return await self._handle_backend_command_duplicate(job_request, existing)
@@ -1124,7 +1126,10 @@ class ComputeClient:
                     "Backend command reply replay failed open",
                     extra=get_extra_info({**self.logging_extra, "command_id": command_id}),
                 ))
-                await self._run_miner_job(job_request)
+                if isinstance(job_request, ContainerCreateRequest):
+                    await self._refuse_unrecorded_create(job_request)
+                else:
+                    await self._run_miner_job(job_request)
                 return
             async with self.lock:
                 for reply in replies:
@@ -1138,6 +1143,26 @@ class ComputeClient:
                         "command_id": command_id,
                         "request_type": job_request.message_type.value,
                     }),
+                )
+            )
+
+    async def _refuse_unrecorded_create(self, job_request: ContainerCreateRequest) -> None:
+        """A create runs only under a dedupe record: without one, a resend of the same command could build a second
+        container over the first one's pod. Nothing ran, so the backend may send it again."""
+        async with self.lock:
+            self.message_queue.append(
+                FailedContainerRequest(
+                    miner_hotkey=job_request.miner_hotkey,
+                    executor_id=job_request.executor_id,
+                    pod_id=job_request.pod_id,
+                    workload_kind=job_request.workload_kind,
+                    command_id=job_request.command_id,
+                    error_type=FailedContainerErrorTypes.ContainerCreationFailed,
+                    error_code=FailedContainerErrorCodes.UnknownError,
+                    msg="The validator could not start the create. Please try again.",
+                    detail="the create's command record could not be read or written, so the create did not run",
+                    # the step the backend already reads as "nothing ran on the host, send it again", no host blame
+                    failure_step=CREATE_CUT_OFF_BY_RESTART_STEP,
                 )
             )
 
