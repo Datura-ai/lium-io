@@ -621,6 +621,22 @@ async def test_a_reset_only_xid_logged_just_before_a_reset_heals_on_the_next_zer
 
 
 @pytest.mark.asyncio
+async def test_two_xids_on_one_card_in_one_read_are_each_lifted_only_by_their_own_proof(context_factory):
+    """Review (QA on lio#2331): an Xid 119 then an Xid 48 on one card in one read are both held. The next zeroed
+    read proves the reset-only 48 healed, but proves nothing for the 119, which stays held."""
+    services = _services()
+    boot = {"boot_id": "boot-a", "xid": {"available": True, "last_ts": 5}}
+    timeout = f"gpu 3 ({UUIDS[3]}): new NVRM Xid on a probed GPU: [  310.0] NVRM: Xid (PCI:0000:03:00): 119, pid=1, Timeout"
+    dbe = f"gpu 3 ({UUIDS[3]}): new NVRM Xid on a probed GPU: [  311.0] NVRM: Xid (PCI:0000:03:00): 48, pid=1, DBE"
+    await _read(context_factory, services, _ok(gpu={"recovery_action": 0}, **boot))
+    both, _ = await _read(context_factory, services, _ok(gpu={"recovery_action": 0}, xid_faults=[timeout, dbe], **boot))
+    clean, _ = await _read(context_factory, services, _ok(gpu={"recovery_action": 0}, **boot))
+
+    assert both.report["card_faults"] == [timeout, dbe]
+    assert clean.report["card_faults"] == [timeout]
+
+
+@pytest.mark.asyncio
 async def test_a_hold_stored_before_reset_marks_still_heals_after_a_read_without_the_kernel_log(context_factory):
     services = _services()
     boot = {"boot_id": "boot-a", "xid": {"available": True, "last_ts": 5}}

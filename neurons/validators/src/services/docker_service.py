@@ -14578,7 +14578,7 @@ class DockerService:
                         self.redis_service,
                         payload.miner_hotkey,
                         payload.executor_id,
-                        reset_result_holder[0].hung_uuids,
+                        reset_result_holder[0].reset_uuids,
                         reset_result_holder[0].reset_stamp,
                     )
                 except Exception as exc:

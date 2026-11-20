@@ -83,6 +83,8 @@ class HungGpuResult:
     detail: str | None = None
     # as GpuResetReport.reset_stamp: set only when the GPUs were reset
     reset_stamp: tuple[float, str] | None = None
+    # every card `nvidia-smi -r` reset (the hung ones plus their NVLink peers): set only when the GPUs were reset
+    reset_uuids: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -211,7 +213,7 @@ async def _reset(
                 _tail(reset.stderr) or "a host GPU holder did not stop or start",
             )
     if reset.exit_code == 0:
-        return HungGpuResult(hung, ContainerWarningCode.HungGpuReset, f"reset {plan.targets}", stamp)
+        return HungGpuResult(hung, ContainerWarningCode.HungGpuReset, f"reset {plan.targets}", stamp, list(plan.targets))
     # as in reset_pod_gpus: the context cycle at least clears the latch, but it is no reset
     cures = await cure_wedged_gpus(runner, plan.targets)
     detail = f"nvidia-smi -r refused, the GPUs were not reset: {_tail(reset.stdout or reset.stderr)}"

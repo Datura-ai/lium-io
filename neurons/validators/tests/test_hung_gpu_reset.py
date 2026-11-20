@@ -82,6 +82,7 @@ async def test_a_hung_pod_gpu_is_reset_alone(line):
     assert result.warning == W.HungGpuReset and result.hung_uuids == [U[0]]
     # DAH-6646: stamped just before `nvidia-smi -r`
     assert result.reset_stamp == (300.0, "boot-a")
+    assert result.reset_uuids == [U[0]]
 
 
 @pytest.mark.parametrize("cure_ok", [True, False])
@@ -115,8 +116,10 @@ async def test_a_query_that_times_out_resets_every_pod_gpu():
 @pytest.mark.asyncio
 async def test_nvlink_peers_inside_the_pod_are_reset_together():
     host = HungHost(query=_query({U[0]: None}), topo=TOPO_PAIR01)
-    await _reset(host)
+    result = await _reset(host)
     assert _resets(host) == [f"nvidia-smi -r -i {U[0]},{U[1]}"]
+    # review (QA on lio#2331): the peer the reset took is a reset card too, so its held Xid can be lifted
+    assert result.hung_uuids == [U[0]] and result.reset_uuids == [U[0], U[1]]
 
 
 @pytest.mark.parametrize(
@@ -366,6 +369,27 @@ async def test_the_result_is_handed_to_the_hold_before_it_is_let_go(reset_exit):
     result = await reset_hung_pod_gpus(host, POD, resetting=hold)
     assert seen_on_exit == [[result]]
     assert result.warning == (W.HungGpuReset if reset_exit == 0 else W.HungGpuNotResetUnsupported)
+
+
+@pytest.mark.asyncio
+async def test_the_reboot_reset_records_every_card_it_reset_not_only_the_hung_one(monkeypatch):
+    """Review (QA on lio#2331): the hung card's NVLink peer is reset with it, so both get the reset record that
+    lets a clean read lift a held Xid."""
+    from unittest.mock import AsyncMock, Mock
+
+    import services.docker_service as ds
+    from payload_models.payloads import ContainerCreateRequest
+    from services.hung_gpu_reset import HungGpuResult
+
+    record = AsyncMock()
+    monkeypatch.setattr(ds, "record_card_resets", record)
+    service = ds.DockerService(ssh_service=Mock(), redis_service=AsyncMock(), attestation_service=Mock())
+    payload = ContainerCreateRequest.model_construct(pod_id="pod1", gpu_uuids=U[:2], miner_hotkey="hk", executor_id="ex")
+
+    async with service._hold_gpu_reset_pending_mark(payload, {}) as holder:
+        holder.append(HungGpuResult([U[0]], W.HungGpuReset, "reset", (300.0, "boot-a"), [U[0], U[1]]))
+
+    assert record.await_args.args[1:] == ("hk", "ex", [U[0], U[1]], (300.0, "boot-a"))
 
 
 DCGM, PERSISTENCED, NVLSM = "nvidia-dcgm", "nvidia-persistenced", "nvidia-nvlsm"
