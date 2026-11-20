@@ -920,7 +920,7 @@ def test_every_filler_image_has_its_gpu_process_names_apart_from_the_known_gaps(
     )
 
 
-def test_the_idle_filler_image_removal_takes_every_filler_image_but_the_miner():
+def test_the_idle_filler_image_removal_takes_every_filler_image_but_pearl_miner():
     assert FILLER_IMAGE_REPOSITORIES == ("ghcr.io/hanlinai/engy-golden-serve", "daturaai/dolphin", "daturaai/dlph")
 
 

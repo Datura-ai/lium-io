@@ -3,12 +3,12 @@
 The executor image installs the vendored `liumd-amd64` or `liumd-arm64` binary at
 `/usr/local/bin/liumd`.
 
-Both files are the unsigned CI artifacts built from the liumd source head `f92fb6473f61`:
+Both files are the unsigned build artifacts built from the liumd merged source `6ea408d468b9`:
 
 | binary | sha256 |
 | --- | --- |
-| `liumd-amd64` | `03fd59d996a435eb42bc0be59b3dbe77a107ff9416f40056267fc775f8ed57e5` |
-| `liumd-arm64` | `b0a13e8b20f1eb99c07103fdf6b2594cbbe66f8e4f3a710eb748caa95a479657` |
+| `liumd-amd64` | `23ce96f5486a7a19e9dff0a4acbe8f6558cce7d681e1ed3d12ecc1375bde7b56` |
+| `liumd-arm64` | `d6e4755f749116a8347b3ab1a0869e0db2fc7b047c9151e2809f085d86de347d` |
 
 `provenance-amd64.json`/`provenance-arm64.json` are the same run's metadata, kept beside the
 binaries for traceability. `manifest.json` is the validator refresh manifest: it names the
