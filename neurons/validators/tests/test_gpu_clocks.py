@@ -6,7 +6,11 @@ is read from inside the pod; the range is clamped to the supported clocks; the p
 next create reset the lock; the thermal-throttle check spares a locked GPU only its low clock.
 """
 
+import asyncio
 import json
+import os
+import re
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -21,6 +25,7 @@ from services.gpu_clocks import (
     reset_pod_clock_locks,
 )
 
+from services import gpu_clocks
 from tests.helpers import FakeRedis, build_state
 from tests.test_machine_spec_scrape_check import make_command_result
 
@@ -61,8 +66,8 @@ class FakeHost:
         if " -rac " in cmd:  # after the -rgc batch, in its own call: one "<uuid> <flag> <exit>" line per reset
             if self.app_mem_exit is None:
                 return make_command_result(False, "", exit_code=-1)
-            parts = [p.split() for p in cmd.split("; ") if p.startswith("nvidia-smi -i ")]
-            return make_command_result(True, "\n".join(f"{p[2]} {p[3]} {self.app_mem_exit}" for p in parts))
+            resets = re.findall(r"nvidia-smi -i (\S+) (-rac|-rmc) ", cmd)
+            return make_command_result(True, "\n".join(f"{u} {flag} {self.app_mem_exit}" for u, flag in resets))
         if " -rgc " in cmd:  # the batched resets: one "<uuid> <exit>" line per GPU
             uuids = _reset_uuids(cmd)
             return make_command_result(True, "\n".join(f"{u} {self.rgc_exit}" for u in uuids))
@@ -72,10 +77,10 @@ class FakeHost:
 def _assert_invariants(host: FakeHost, allowed) -> None:
     for cmd in host.commands:
         assert "docker exec" not in cmd and " -pl" not in cmd, "never inside the pod, never the power limit"
-        for part in cmd.split("; "):
-            if not part.startswith("echo ") and any(flag in part for flag in (" -lgc", " -rgc", " -rac", " -rmc")):
-                assert part.startswith("nvidia-smi -i GPU-"), "never a clock change without -i"
-                assert part.split()[2] in set(allowed)
+        flags = re.findall(r"\S+ (?:-lgc|-rgc|-rac|-rmc)\b", cmd.replace("echo ", "echo_"))
+        changes = re.findall(r"nvidia-smi -i (GPU-\S+) (?:-lgc|-rgc|-rac|-rmc)\b", cmd)
+        assert len(changes) == len([f for f in flags if not f.startswith("echo_")]), "never a clock change without -i"
+        assert set(changes) <= set(allowed)
 
 
 def _reset_uuids(cmd: str) -> list[str]:
@@ -273,13 +278,32 @@ async def test_a_create_resets_application_and_memory_clocks_after_the_graphics_
     _assert_invariants(host, [U[0], U[1]])
     rgc, app_mem = host.commands
     assert _reset_uuids(rgc) == [U[0], U[1]] and " -rac" not in rgc
-    assert app_mem.split("; ") == [
-        part
+    assert app_mem == " ".join(
+        "( " + "; ".join(f"nvidia-smi -i {u} {flag} >/dev/null 2>&1; echo {u} {flag} $?" for flag in ("-rac", "-rmc"))
+        + " ) &"
         for u in (U[0], U[1])
-        for flag in ("-rac", "-rmc")
-        for part in (f"nvidia-smi -i {u} {flag} >/dev/null 2>&1", f"echo {u} {flag} $?")
-    ]
+    ) + " wait"
     assert host.timeouts[1] == APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_application_and_memory_clock_resets_of_an_8_gpu_node_run_in_parallel_inside_the_budget(tmp_path):
+    """Prod 18-19 Nov: on 8-GPU H200/B300 nodes the 16 nvidia-smi runs one after another outlasted the 30 s budget,
+    so no GPU's clocks were reset. Run for real with a 1 s nvidia-smi: 8 GPUs answer in about one call's time."""
+    fake = tmp_path / "nvidia-smi"
+    fake.write_text("#!/bin/sh\nsleep 1\n")
+    fake.chmod(0o755)
+    uuids = [f"GPU-{i:08d}-0000-0000-0000-000000000000" for i in range(8)]
+    cmd = " ".join(gpu_clocks._reset_app_and_memory_clocks(u) for u in uuids) + " wait"
+    t0 = time.monotonic()
+    proc = await asyncio.create_subprocess_shell(
+        cmd, stdout=asyncio.subprocess.PIPE, env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"}
+    )
+    out, _ = await proc.communicate()
+    elapsed = time.monotonic() - t0
+    lines = sorted(out.decode().split("\n")[:-1])
+    assert lines == sorted(f"{u} {flag} 0" for u in uuids for flag in ("-rac", "-rmc"))
+    assert elapsed < 6, f"{elapsed:.1f} s: the resets ran one after another (16 s)"
 
 
 @pytest.mark.asyncio
@@ -296,7 +320,8 @@ async def test_a_stalled_or_failed_application_or_memory_reset_keeps_the_rgc_res
         assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == []
     assert not any(k.startswith("gpu_clock_lock:") for k in redis.store)
     expected = "unknown" if app_mem_exit is None else "1"
-    assert caplog.text.count("gpu_clock_action=rac_rmc_failed") == 4 and f"exit={expected}" in caplog.text
+    lost = 1 if app_mem_exit is None else 0  # an empty answer also logs why, once
+    assert caplog.text.count("gpu_clock_action=rac_rmc_failed") == 4 + lost and f"exit={expected}" in caplog.text
 
     caplog.clear()
     host.app_mem_exit = 3

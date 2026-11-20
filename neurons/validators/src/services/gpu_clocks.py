@@ -115,22 +115,29 @@ def build_clock_command(
 
 
 def _reset_app_and_memory_clocks(uuid: str) -> str:
+    """One GPU's -rac then -rmc, run in the background so every GPU resets at once (see the caller)."""
     q = shlex.quote(uuid)
-    return "; ".join(f"nvidia-smi -i {q} {flag} >/dev/null 2>&1; echo {q} {flag} $?" for flag in ("-rac", "-rmc"))
+    return "( " + "; ".join(f"nvidia-smi -i {q} {flag} >/dev/null 2>&1; echo {q} {flag} $?" for flag in ("-rac", "-rmc")) + " ) &"
 
 
 async def _reset_app_and_memory_clocks_of(runner: SSHCommandRunner, uuids: list[str]) -> None:
     """Application clocks (-ac, or any process once the host ran -acp UNRESTRICTED) and locked memory clocks (-lmc)
     back to default, so a create never hands a renter clocks the host or the last pod lowered. Best effort, after the
-    -rgc batch and in its own call: it never changes a GPU's -rgc verdict or its lock record. Exits other than 0 and 3
-    (not supported), a timeout and a lost answer are logged."""
+    -rgc batch and in its own call: it never changes a GPU's -rgc verdict or its lock record. The GPUs reset in
+    parallel: one after another, the 16 nvidia-smi runs of an 8-GPU H200/B300 node outlast the budget and no clock is
+    reset (prod, 18-19 Nov). Exits other than 0 and 3 (not supported), a timeout and a lost answer are logged."""
     try:
         result = await _run(
             runner,
-            "; ".join(_reset_app_and_memory_clocks(u) for u in uuids),
+            " ".join(_reset_app_and_memory_clocks(u) for u in uuids) + " wait",
             timeout=APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS,
         )
         stdout = result.stdout or ""
+        if not stdout.strip():
+            logger.warning(
+                "gpu_clock_action=rac_rmc_failed error=%s gpus=%d duration_ms=%s",
+                getattr(result, "error_type", None) or "no answer", len(uuids), getattr(result, "duration_ms", None),
+            )
     except Exception as exc:
         stdout = ""
         logger.warning("gpu_clock_action=rac_rmc_failed error=%s", exc)
