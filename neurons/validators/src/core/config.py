@@ -242,10 +242,6 @@ class Settings(BaseSettings):
     # just-started collector) are counted per node and logged as INSPECTOR_BLIND_STREAK from this
     # many on.
     INSPECTOR_BLIND_STREAK_LIMIT: int = Field(env="INSPECTOR_BLIND_STREAK_LIMIT", default=5)
-    # On: the Inspector check fails from that cycle until the sensor reports again. Off by default.
-    INSPECTOR_BLIND_STREAK_ENFORCEMENT_ENABLED: bool = Field(
-        env="INSPECTOR_BLIND_STREAK_ENFORCEMENT_ENABLED", default=False
-    )
     # On a libinspector.so hash mismatch a RENTED executor, during the rental, curls
     # INSPECTOR_LIBRARY_FETCH_URL once into a temp file beside /usr/lib/libinspector.so, and the
     # file replaces the library (one rename) only if its sha256 is the validator's own. This is a

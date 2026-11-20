@@ -12,6 +12,7 @@ from payloads.backend import (
     SignaturePayload,
 )
 from services.local_verify_service import accepted_miner_hotkeys
+from services.validator_trust_service import validator_trust
 
 from core.config import VALIDATOR_HOTKEYS_SS58, settings
 
@@ -19,13 +20,14 @@ logger = get_logger(__name__)
 
 
 def match_validator_hotkey(message: str | bytes, signature: str) -> str | None:
-    """The id (`current` / `next`) of the configured validator hotkey that signed `message`, or None.
+    """The id of the trusted validator hotkey that signed `message`, or None.
 
-    Every validator-signature check in the executor goes through here, so the hotkey rotation
-    (DAH-3394) is one list: VALIDATOR_HOTKEYS_SS58, tried in order. Malformed signatures raise
-    as they did before; the caller decides the status code.
+    Every validator-signature check in the executor goes through here. The trusted hotkey is the one
+    a subnet-owner-signed message names (`signed`, DAH-6590, services/validator_trust_service.py);
+    until a message is held, the hotkeys baked into the image (`current` / `next`, DAH-3394).
+    Malformed signatures raise as they did before; the caller decides the status code.
     """
-    for key_id, ss58 in VALIDATOR_HOTKEYS_SS58.items():
+    for key_id, ss58 in validator_trust.hotkeys(VALIDATOR_HOTKEYS_SS58).items():
         if Keypair(ss58_address=ss58).verify(message, signature):
             # the id only: which key is in use is operational information, the key itself is not
             logger.debug("validator signature verified with the %s hotkey", key_id)

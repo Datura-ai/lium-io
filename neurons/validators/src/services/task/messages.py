@@ -606,13 +606,6 @@ class PostRentalGpuRecheckMessages:
         category="env",
         impact="Proceed",
     )
-    FILLER_SKIPPED = MessageTemplate(
-        event="Post-rental GPU recheck waits: active filler",
-        reason="POST_RENTAL_GPU_RECHECK_SKIPPED_ACTIVE_FILLER",
-        severity="info",
-        category="policy",
-        impact="Proceed; the recheck runs on a cycle without a filler, or after a few filler cycles anyway.",
-    )
     INCONCLUSIVE = MessageTemplate(
         event="Post-rental GPU recheck gave no verdict",
         reason="POST_RENTAL_GPU_RECHECK_INCONCLUSIVE",
