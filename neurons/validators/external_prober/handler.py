@@ -38,11 +38,15 @@ def _fetch(host: str, port: int, timeout: float) -> str | None:
 
 
 def _get(url: str, timeout: float) -> str | None:
+    # one handler for opening and reading: an error status is an answer too, and a node that stalls or drops mid-body
+    # is no answer for that target, never a failure of the whole invocation
     try:
-        with _opener.open(url, timeout=timeout) as resp:
+        try:
+            resp = _opener.open(url, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            resp = e
+        with resp:
             return _capped(resp)
-    except urllib.error.HTTPError as e:
-        return _capped(e)
     except Exception:
         return None
 

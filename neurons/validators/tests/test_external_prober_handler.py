@@ -61,6 +61,32 @@ def test_redirects_are_not_followed():
         server.shutdown()
 
 
+@pytest.mark.parametrize("status", [200, 302])
+def test_a_node_that_stalls_mid_answer_is_no_answer(status):
+    """A node that sends part of its body and then stalls gives no answer for itself, whatever its status."""
+    release = threading.Event()
+
+    class Stall(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(status)
+            self.send_header("Content-Length", "1000")
+            self.end_headers()
+            self.wfile.write(b"x" * 256)
+            self.wfile.flush()
+            release.wait(5)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Stall)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        assert handler._fetch("127.0.0.1", server.server_port, 0.5) is None
+    finally:
+        release.set()
+        server.shutdown()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("size, passes", [(256, True), (257, False)])
 async def test_both_probe_paths_judge_an_answer_of_the_same_size_alike(size, passes):
