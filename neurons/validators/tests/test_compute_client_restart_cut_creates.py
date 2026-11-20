@@ -1568,7 +1568,8 @@ async def test_a_restart_releases_every_cut_off_create_claim_but_one_whose_succe
     the resend must run, a rented pod's too (a reboot's create); a saved success the reconnect replays keeps its claim.
     A record that cannot be read is skipped and left as it is, so it never stops the start."""
     redis_service = _redis_service()
-    for command_id, pod_id in (("cmd-1", "pod-1"), ("cmd-rented", "pod-rented"), ("cmd-saved", "pod-saved")):
+    claims = (("cmd-1", "pod-1"), ("cmd-rented", "pod-rented"), ("cmd-saved", "pod-saved"), ("cmd-newer", "pod-older"))
+    for command_id, pod_id in claims:
         claim = BackendCommand(state="running", owner=command_id, create=True, pod_id=pod_id, executor_id="exec-1")
         assert await redis_service.claim_backend_command(command_id, claim.model_dump_json(), persist=True) is None
     await redis_service.claim_backend_command("cmd-other", BackendCommand(state="running").model_dump_json())
@@ -1576,16 +1577,18 @@ async def test_a_restart_releases_every_cut_off_create_claim_but_one_whose_succe
     if in_flight_record:
         await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER, "c1")
     redis_service.rented_pod_ids = AsyncMock(return_value=frozenset({"pod-rented"}))
-    redis_service.unacked_container_created = AsyncMock(return_value={"pod-saved": "{}"})
+    redis_service.unacked_container_created = AsyncMock(
+        return_value={"pod-saved": '{"command_id": "cmd-saved"}', "pod-older": '{"command_id": "cmd-older"}'}
+    )
     client = _client(redis_service)
-    client._replayable_success = AsyncMock(side_effect=lambda pod_id, saved: pod_id == "pod-saved")
+    client._replayable_success = AsyncMock(return_value=True)
 
     await redis_service.clear_running_backend_commands()
     assert await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-other") is None
     assert await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-1") is not None
     await client.fail_creates_cut_off_by_restart()
 
-    for released in ("cmd-1", "cmd-rented"):   # their resends run
+    for released in ("cmd-1", "cmd-rented", "cmd-newer"):   # their resends run (an older command's success is not theirs)
         assert await redis_service.redis.get(BACKEND_COMMAND_PREFIX + released) is None
     assert await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-saved") is not None
     assert await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-unreadable") == "{not json"

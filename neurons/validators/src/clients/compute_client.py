@@ -106,6 +106,7 @@ from services.redis_service import (
     RESET_VERIFIED_JOB_CHANNEL,
     STREAMING_LOG_CHANNEL,
     NORMALIZED_SCORE_CHANNEL,
+    _saved_command_id,
     renter_create_id,
 )
 from clients.handlers.backup_handler import BackupHandler
@@ -1509,8 +1510,14 @@ class ComputeClient:
             # No create runs yet, so each running claim is a cut-off run's. The backend resends a create under the same
             # ID only while it holds no answer for it (the pod pending), so no renter has its container yet: the resend
             # is the re-run DAH-5437 makes of a cut-off create, replacing what it left under the pod's names. Only a
-            # saved success keeps its claim: the reconnect replays it, and its receipt settles the claim.
-            if claim.pod_id in unacked and await self._replayable_success(claim.pod_id, unacked[claim.pod_id]):
+            # saved success of this very command keeps its claim: the reconnect replays it, and its receipt settles the
+            # claim (an older command's saved success for the pod says nothing about this one).
+            saved = unacked.get(claim.pod_id)
+            if (
+                saved is not None
+                and _saved_command_id(saved) == command_id
+                and await self._replayable_success(claim.pod_id, saved)
+            ):
                 continue
             await redis_service.release_backend_command(command_id)
         resumed: list[str] = []
