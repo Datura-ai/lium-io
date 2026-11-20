@@ -841,7 +841,7 @@ async def test_success_records_every_step_tears_down_and_stamps_the_interval():
     assert redis.expiries[f"rental_probe_ok:{EXECUTOR.uuid}"] == module._REDIS_STAMP_TTL_SECONDS
     probe_pod_id = docker.create_calls[0][0].pod_id
     assert redis.removed_pending == [(MINER, EXECUTOR.uuid, probe_pod_id)]
-    assert result.updates == {}
+    assert result.updates == {"idle_check_passed": True}  # DAH-6784: the full check ran and passed
 
 
 @pytest.mark.asyncio

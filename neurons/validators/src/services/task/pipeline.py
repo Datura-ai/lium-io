@@ -319,6 +319,10 @@ class Context(BaseModel):
     # alone, judged from rental reads older than the reset). Sent as its own field, not in the evidence the backend
     # may cut, and applied there only while no customer pod runs on the node. Set afresh by every clearing check.
     clear_verified_job_unrented_only: bool = False
+    # DAH-6784: the check_ids of the idle-only checks (those that set clear_verified_job_unrented_only on a failure)
+    # that ran in full this cycle and passed. A check says so with updates["idle_check_passed"]=True on its real pass
+    # path only; the backend lifts a hold such a check left on a rented node only when that check is listed here.
+    idle_checks_passed: tuple[str, ...] = ()
     # Set by GpuFingerprintCheck when the node lists a full set of other GPUs (full_set_changed): ResultHandler
     # makes this cycle's set the anchor.
     gpu_reanchor: bool = False
@@ -508,7 +512,9 @@ def _vloopback_outcome(event: ValidationEvent) -> str:
     return f"{vloopback.get('verdict')}:{vloopback.get('reason_code')}"
 
 
-def updates_with_clear_verified_job_evidence(res: CheckResult, check_id: str) -> dict[str, Any]:
+def updates_with_clear_verified_job_evidence(
+    res: CheckResult, check_id: str, idle_checks_passed: tuple[str, ...] = ()
+) -> dict[str, Any]:
     """The check's updates, with ``clear_verified_job_evidence`` filled when the check clears the verified job.
 
     DAH-3386: every check that sets ``clear_verified_job_info`` names itself to the backend — its event's
@@ -517,6 +523,9 @@ def updates_with_clear_verified_job_evidence(res: CheckResult, check_id: str) ->
     rented-machine check adds the container's death diagnostics) keeps it; only the two names are filled in.
     """
     updates = dict(res.updates)
+    # DAH-6784: never a Context field of its own; a passing check's mark becomes its id in the run's list
+    if updates.pop("idle_check_passed", False) is True and res.passed:
+        updates["idle_checks_passed"] = (*idle_checks_passed, res.event.check_id or check_id)
     if not updates.get("clear_verified_job_info"):
         return updates
     evidence = dict(updates.get("clear_verified_job_evidence") or {})
@@ -736,7 +745,9 @@ class Pipeline:
             if _stops_run(chk, res):
                 return
             if res.updates:
-                current = current.model_copy(update=updates_with_clear_verified_job_evidence(res, chk.check_id))
+                current = current.model_copy(
+                    update=updates_with_clear_verified_job_evidence(res, chk.check_id, current.idle_checks_passed)
+                )
 
     async def _run_stage(self, stage: ParallelStage, ctx: Context) -> list[_RanCheck]:
         """Run the lanes at once; the first lane to stop (fatal, halt or exception) cancels the rest."""
@@ -851,7 +862,7 @@ class Pipeline:
         res = ran.result
         if not res.updates:
             return current_ctx
-        updates = updates_with_clear_verified_job_evidence(res, ran.check.check_id)
+        updates = updates_with_clear_verified_job_evidence(res, ran.check.check_id, current_ctx.idle_checks_passed)
         if parallel and "state" in updates:
             updates["state"] = merge_state(current_ctx.state, ran.before_state, updates["state"])
         return current_ctx.model_copy(update=updates)

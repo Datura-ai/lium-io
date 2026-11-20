@@ -297,6 +297,7 @@ class ResultHandler:
             # and cuts the PodStatesReport chunks.
             pod_states=list(context.state.pod_states) or None,
             host_runtime_fault=context.state.host_runtime_fault,
+            idle_checks_passed=list(dict.fromkeys(context.idle_checks_passed)),
         )
 
     @staticmethod

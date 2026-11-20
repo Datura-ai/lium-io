@@ -383,3 +383,28 @@ async def test_a_dropped_session_during_the_account_read_is_reconnected_through_
     assert end.clear_verified_job_info is (not account_passed and not rented)
     if end.clear_verified_job_info:
         assert end.clear_verified_job_unrented_only is True
+
+
+# DAH-6784: the check lists itself as run in full only when it proved all this node can be checked by
+
+
+@pytest.mark.parametrize(
+    "files, hotkeys, listed",
+    [
+        (f"hotkey={POOL}\nclaim={CLAIM}\n", ("5Account", POOL), True),  # binding read and proven
+        ("hotkey=5Account\nclaim=\n", ("5Account", POOL), True),  # an own-key node needs no claim
+        ("hotkey=\nclaim=\n", ("5Account", POOL), False),  # no host files: nothing proven
+        (f"hotkey={POOL}\nclaim=\n", ("5Account", POOL), False),  # the claim unread
+        ("hotkey=5Account\n", None, False),  # an IP node naming no account: nothing to prove
+    ],
+)
+async def test_only_a_proven_binding_is_the_full_check(files, hotkeys, listed):
+    result = await NodeAccountCheck().run(_relay_ctx(_HostFiles(files), hotkeys=hotkeys))
+    assert result.passed
+    assert (result.updates.get("idle_check_passed") is True) is listed
+
+
+async def test_a_matched_host_key_is_the_full_check(recorded_machine):
+    keys, recorded = recorded_machine
+    result = await _check_against(keys["ed25519"], recorded)
+    assert result.event.reason_code == "NODE_ACCOUNT_OK" and result.updates == {"idle_check_passed": True}

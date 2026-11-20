@@ -327,6 +327,10 @@ class ExecutorSpecRequest(ValidatorMessage):
     # This cycle's DinD test container started on the host and its sshd never answered (a failing container
     # runtime). None from a publisher that predates the field.
     host_runtime_fault: bool | None = None
+    # The check_ids of the checks that can reset a node idle-only (`ResetVerifiedJobRequest.unrented_only`) that this
+    # cycle ran in full on the node and passed; a skipped run, or a pass reached without that check's own probe, is not
+    # listed. [] when none did; None from a validator that does not send it.
+    idle_checks_passed: list[str] | None = None
     # When an express recheck outside the cycle started; its `job_batch_id` is still the cycle's. None for a cycle's
     # own report and from a publisher that predates the field.
     check_started_at: datetime | None = None

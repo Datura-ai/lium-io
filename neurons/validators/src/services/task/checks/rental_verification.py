@@ -274,7 +274,11 @@ class RentalVerificationCheck:
                 return CheckResult(
                     passed=True,
                     event=event,
-                    updates={},
+                    # DAH-6784: only a container check the backend really ran is the full check; a success it
+                    # answered with a reason (skipped as rented or for a filler, a raced create) ran none
+                    updates={"idle_check_passed": True}
+                    if not has_customer_rental and response.reason_code is None
+                    else {},
                 )
             elif response.reason_code == CPU_QUOTA_EXCEEDS_HOST_REASON:
                 return self._cpu_quota_verdict(ctx, response)

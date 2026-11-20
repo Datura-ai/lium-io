@@ -98,3 +98,42 @@ def test_a_later_clearing_check_never_inherits_an_idle_only_mark():
     )
     assert updates_with_clear_verified_job_evidence(plain, "x")["clear_verified_job_unrented_only"] is False
     assert updates_with_clear_verified_job_evidence(marked, "x")["clear_verified_job_unrented_only"] is True
+
+
+def test_a_passing_idle_only_check_appends_its_id_and_a_failed_one_does_not():
+    # DAH-6784: the backend lifts a hold an idle-only check left only when that check's id is listed
+    from datetime import UTC, datetime
+
+    from services.task.models import ValidationEvent
+    from services.task.pipeline import CheckResult, updates_with_clear_verified_job_evidence
+
+    def result(passed):
+        event = ValidationEvent(
+            event="probe", reason_code="PROBE", severity="info", impact="", check_id="executor.validate.rental_probe",
+            when=datetime.now(UTC),
+        )
+        return CheckResult(passed=passed, event=event, updates={"idle_check_passed": True})
+
+    assert updates_with_clear_verified_job_evidence(result(True), "x", ("executor.validate.node_account",)) == {
+        "idle_checks_passed": ("executor.validate.node_account", "executor.validate.rental_probe")
+    }
+    assert updates_with_clear_verified_job_evidence(result(False), "x", ("a",)) == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("success", [True, False])
+async def test_the_result_carries_the_idle_only_checks_that_passed_once_each(context_factory, success):
+    from types import SimpleNamespace
+
+    ctx = context_factory(state=build_state(specs={"gpu": {"count": 1}})).model_copy(
+        update={"idle_checks_passed": ("executor.validate.rental_probe", "executor.validate.rental_probe")}
+    )
+    result = await ResultHandler(redis_service=AsyncMock(), dry_run=True).handle_result(
+        context=ctx,
+        miner_info=SimpleNamespace(miner_hotkey="miner-hotkey", job_batch_id="batch-1"),
+        executor_info=ctx.executor,
+        verified_job_info={},
+        log_text="x",
+        success=success,
+    )
+    assert result.idle_checks_passed == ["executor.validate.rental_probe"]

@@ -1509,6 +1509,7 @@ class MinerService:
                             else None
                         ),
                         "host_runtime_fault": result.host_runtime_fault,
+                        "idle_checks_passed": result.idle_checks_passed,
                         "check_started_at": (
                             result.check_started_at.isoformat() if result.check_started_at else None
                         ),

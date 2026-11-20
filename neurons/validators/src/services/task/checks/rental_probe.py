@@ -327,6 +327,8 @@ class RentalProbeCheck:
             return CheckResult(
                 passed=True,
                 event=render_message(Msg.PROBE_OK, ctx=ctx, check_id=self.check_id, what=what),
+                # DAH-6784: the probe ran this cycle and its rental succeeded: the full check
+                updates={"idle_check_passed": True},
             )
 
         # A renter may have taken the node while the probe ran: their create sweeps our container

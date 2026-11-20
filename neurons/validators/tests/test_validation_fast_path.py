@@ -367,3 +367,25 @@ def test_express_lane_waits_shorten_only_with_the_flag_on(monkeypatch):
     assert max_attempts_for("verification failed") == 3
     monkeypatch.setattr(settings, "VALIDATION_FAST_PATH_ENABLED", False)
     assert max_attempts_for(MINER_DID_NOT_RETURN_EXECUTOR) == 3
+
+
+class _IdleCheck(_StateCheck):
+    """A check that marks its pass as the full idle-only check (DAH-6784), the way rental_probe does."""
+
+    async def run(self, ctx) -> CheckResult:
+        result = await super().run(ctx)
+        return result.model_copy(update={"updates": {**result.updates, "idle_check_passed": True}})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parallel", [False, True], ids=["serial", "parallel"])
+async def test_the_run_lists_each_idle_only_check_that_passed_in_full(context_factory, parallel):
+    host = [_IdleCheck("node_account"), _StateCheck("ports")]
+    gpu = [_IdleCheck("rental_probe"), _IdleCheck("failed_probe", passed=False, fatal=False)]
+    checks = [ParallelStage([host, gpu])] if parallel else [*host, *gpu]
+
+    _, _, last = await _run([*checks, _StateCheck("score")], context_factory=context_factory)
+
+    # a failed check never lists itself, whatever it marked; the mark is never a Context field of its own
+    assert sorted(last.idle_checks_passed) == ["node_account", "rental_probe"]
+    assert not hasattr(last, "idle_check_passed")
