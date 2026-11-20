@@ -87,7 +87,7 @@ def test_every_modded_model_has_its_own_economics_and_checks(model):
     base, size_mb = MODDED_VRAM_MODELS[model]
     family = BASE_GPU_MAP[model]
     assert GPU_MODEL_RATES[model] == 0.0  # no rental history yet
-    assert RENTAL_PRICES_PER_HOUR[model] > RENTAL_PRICES_PER_HOUR[base]
+    assert RENTAL_PRICES_PER_HOUR[model] >= RENTAL_PRICES_PER_HOUR[base]
     assert family != BASE_GPU_MAP[base]
     assert MAX_UNRENTED_GPUS_BY_TYPE[family] == {1: 10, 8: 64}  # the default tier
     assert expected_cc_and_sm(model) == expected_cc_and_sm(base)
@@ -109,6 +109,11 @@ def test_the_standard_cards_keep_their_numbers():
     assert GPU_MODEL_RATES[RTX_4090] == 0.05
     assert RENTAL_PRICES_PER_HOUR[RTX_4090_48GB] == 0.42
     assert RENTAL_PRICES_PER_HOUR[RTX_4080_32GB] == RENTAL_PRICES_PER_HOUR[RTX_4080_SUPER_32GB] == 0.26
+    assert (
+        RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4090 D 48GB"],
+        RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 3080 20GB"],
+        RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 2080 Ti 22GB"],
+    ) == (0.16, 0.09, 0.08)
     assert MAX_UNRENTED_GPUS_BY_TYPE["RTX 4090"] == {1: 10, 8: 64}
     assert name_reported_by_driver(RTX_4090) == RTX_4090
 

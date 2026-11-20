@@ -52,14 +52,14 @@ RENTAL_PRICES_PER_HOUR["NVIDIA GB300"] = RENTAL_PRICES_PER_HOUR["NVIDIA B300 SXM
 RENTAL_PRICES_PER_HOUR["NVIDIA GB200"] = RENTAL_PRICES_PER_HOUR["NVIDIA B200"]  # mirrors B200; revisit when GB200 market data exists
 # DAH-5508: memory-modded cards (gpu_spec_table.MODDED_VRAM_MODELS), each its own model and idle tier. Anchor = the
 # backend's MACHINE_PRICES: the base card x the same-chip Quadro RTX 8000/6000 double-memory ratio (0.21/0.13):
-# RTX 4080 / 4080 SUPER 0.16 -> 0.26, RTX 4090 D 0.11 -> 0.18, RTX 3080 0.09 -> 0.15, RTX 2080 Ti 0.08 -> 0.13.
-# The RTX 4090 48GB is a set number, not this ratio: 0.42 (1.4x the RTX 4090).
+# RTX 4080 / 4080 SUPER 0.16 -> 0.26. Set numbers, not this ratio: RTX 4090 48GB 0.42 (1.4x the RTX 4090),
+# RTX 4090 D 48GB 0.16, RTX 3080 20GB 0.09 and RTX 2080 Ti 22GB 0.08 (the base cards' prices).
 RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4090 48GB"] = 0.42
 RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4080 32GB"] = 0.26
 RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4080 SUPER 32GB"] = 0.26
-RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4090 D 48GB"] = 0.18
-RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 3080 20GB"] = 0.15
-RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 2080 Ti 22GB"] = 0.13
+RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4090 D 48GB"] = 0.16
+RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 3080 20GB"] = 0.09
+RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 2080 Ti 22GB"] = 0.08
 
 # Unrented incentive for more GPU types (DAH-4042). Anchors are the backend's MACHINE_PRICES, the listing
 # price renters see; the rows are in lium-core's defaults too, so this override drops on the next lium-core release.

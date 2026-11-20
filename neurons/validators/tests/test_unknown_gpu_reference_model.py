@@ -35,7 +35,7 @@ from tests.test_rental_price_incentive_flow import _make_pcc_job
 UNKNOWN = "NVIDIA RTX Future 9000"
 # lium-platform keeps a byte-identical apps/lium/backend/apps/server/src/core/gpu_reference_table.py
 # and pins the same hash
-GPU_REFERENCE_TABLE_SHA256 = "5cf72997587855b88e122d8e8b3d5575395ae99714e56cc706eca681534aa355"
+GPU_REFERENCE_TABLE_SHA256 = "ff8ef3b70f35b8966e6f9b338f531c23d76aa1ca7bfb751eed985ddb136b46e4"
 PRICES = {model: price for model, (price, _) in GPU_REFERENCE_TABLE.items()}
 CANDIDATES = [m for m in GPU_REFERENCE_TABLE if m not in gpu_reference_table.NEVER_A_REFERENCE]
 
