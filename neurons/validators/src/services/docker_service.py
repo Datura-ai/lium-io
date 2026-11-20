@@ -4039,9 +4039,9 @@ class DockerService:
             if ssh_client is None:
                 # a start that opens its SSH session only after the start (start_existing_container): its own
                 async with connect() as own_ssh:
-                    _, error = await asyncio.wait_for(apply_rental_egress_guard(own_ssh), timeout=120)
+                    _, error = await asyncio.wait_for(apply_rental_egress_guard(own_ssh, attempts=None), timeout=120)
             else:
-                _, error = await asyncio.wait_for(apply_rental_egress_guard(ssh_client), timeout=120)
+                _, error = await asyncio.wait_for(apply_rental_egress_guard(ssh_client, attempts=None), timeout=120)
         except Exception as exc:  # noqa: BLE001 — every failure refuses the start
             error = str(exc) or type(exc).__name__
         if error:

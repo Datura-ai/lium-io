@@ -258,17 +258,19 @@ def _boot_restore(boot: str, host_root: str) -> str:
     script, dropin = shlex.quote(host_root + BOOT_SCRIPT), shlex.quote(host_root + BOOT_DROPIN)
     dirs = " ".join(shlex.quote(host_root + path.rsplit("/", 1)[0]) for path in (BOOT_SCRIPT, BOOT_DROPIN))
     # printf makes the newlines, so the command stays on one line
-    unit = shlex.quote(f"[Service]\\nExecStartPre=/bin/sh {BOOT_SCRIPT}\\n")
+    # "-": a failing boot copy never stops dockerd; the pre-start guard still refuses an unguarded pod
+    unit = shlex.quote(f"[Service]\\nExecStartPre=-/bin/sh {BOOT_SCRIPT}\\n")
     return (
         f"if [ -d {shlex.quote(host_root + '/run/systemd/system')} ] && "
         '[ "$($HOST_NS systemctl show -p LoadState --value docker.service 2>/dev/null)" = loaded ]; then '
-        f"mkdir -p {dirs} || exit 4; "
-        f"printf '%s\\n' {shlex.quote(boot)} > {script}.tmp && mv -f {script}.tmp {script} || "
-        "{ echo 'boot rules not written' >&2; exit 4; }; "
-        f"printf {unit} > {dropin}.tmp || exit 4; "
-        f"if cmp {dropin}.tmp {dropin} >/dev/null 2>&1; then rm -f {dropin}.tmp; "
-        f"else mv -f {dropin}.tmp {dropin} && $HOST_NS systemctl daemon-reload || "
-        "{ echo 'docker.service drop-in not loaded' >&2; exit 4; }; fi; "
+        # reported, never failed: the runtime rules are already in force (e.g. a read-only /etc/systemd/system)
+        f"if ! mkdir -p {dirs}; then echo 'boot restore not installed: directories not created'; "
+        f"elif ! {{ printf '%s\\n' {shlex.quote(boot)} > {script}.tmp && mv -f {script}.tmp {script}; }}; then "
+        "echo 'boot restore not installed: boot rules not written'; "
+        f"elif ! printf {unit} > {dropin}.tmp; then echo 'boot restore not installed: drop-in not written'; "
+        f"elif cmp {dropin}.tmp {dropin} >/dev/null 2>&1; then rm -f {dropin}.tmp; "
+        f"elif ! {{ mv -f {dropin}.tmp {dropin} && $HOST_NS systemctl daemon-reload; }}; then "
+        "echo 'boot restore not installed: docker.service drop-in not loaded'; fi; "
         "else echo 'boot restore not installed: no systemd docker.service'; fi"
     )
 
@@ -477,20 +479,23 @@ class RentalEgressGuardCheck:
         return await apply_rental_egress_guard(ctx.ssh)
 
 
-async def apply_rental_egress_guard(ssh) -> tuple[dict | None, str | None]:
+async def apply_rental_egress_guard(ssh, attempts: int | None = INVENTORY_ATTEMPTS) -> tuple[dict | None, str | None]:
     """(what was guarded, error); None when there is neither a rental network nor a legacy rental.
 
     Also run on the create and start paths right before a pod starts (DAH-6737), so a pod's own bridge is guarded
     before its first packet, not at the next periodic run. The rules are applied only if no other run changed them
-    since this inventory began; otherwise the host is read again (``INVENTORY_ATTEMPTS`` times, then unknown).
+    since this inventory began; otherwise the host is read again (``attempts`` times, then unknown). The pre-start
+    path passes ``attempts=None``: concurrent guards on one host always settle, and its caller's timeout is the bound.
     """
-    for _ in range(INVENTORY_ATTEMPTS):
+    tries = 0
+    while True:
         generation = await _host_generation(ssh)
         guarded, result = await _inventory_and_apply(ssh, generation)
         if result.exit_status != STALE_INVENTORY_EXIT:
             break
-    else:
-        raise InventoryUnknown("the host's rules kept changing during the inventory")
+        tries += 1
+        if attempts is not None and tries >= attempts:
+            raise InventoryUnknown("the host's rules kept changing during the inventory")
     if boot := [line for line in (result.stdout or "").splitlines() if line.startswith("boot restore")]:
         logger.warning(_m("Rental egress guard: rules not restored before dockerd after a reboot", extra={"why": boot}))
         if guarded is not None:

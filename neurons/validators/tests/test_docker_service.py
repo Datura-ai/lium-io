@@ -12538,7 +12538,7 @@ async def test_a_pod_never_starts_on_a_bridge_without_the_egress_drop(docker_ser
     # start that moves a stopped pod onto its own bridge; when the guard did not apply, nothing starts (fail closed)
     events: list = []
 
-    async def guard(ssh):
+    async def guard(ssh, attempts=None):
         events.append(("guard",))
         if outcome == "raises":
             raise RuntimeError("inventory unknown")
@@ -12620,7 +12620,7 @@ async def test_a_pod_never_starts_on_a_bridge_without_the_egress_drop(docker_ser
 @pytest.mark.asyncio
 async def test_a_reboot_the_guard_refused_holds_the_node_where_it_refused(docker_service, monkeypatch):
     # F-11: start_existing_container has no create failure handler, so it passes executor_uuid and the guard stamps
-    async def guard(ssh):
+    async def guard(ssh, attempts=None):
         return {}, "DOCKER-USER chain not found"
 
     monkeypatch.setattr("services.task.checks.rental_egress_guard.apply_rental_egress_guard", guard)

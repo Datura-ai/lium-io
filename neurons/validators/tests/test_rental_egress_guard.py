@@ -72,7 +72,9 @@ def _ssh(
             return SimpleNamespace(exit_status=inspect_rc, stdout=network, stderr=network_stderr)
         if "docker inspect" in cmd:
             return SimpleNamespace(exit_status=pods_rc, stdout=legacy, stderr=pods_stderr)
-        return SimpleNamespace(exit_status=helper_rc, stdout="", stderr="DOCKER-USER chain not found" if helper_rc else "")
+        # a list is one exit per helper run; its last value repeats
+        rc = (helper_rc.pop(0) if len(helper_rc) > 1 else helper_rc[0]) if isinstance(helper_rc, list) else helper_rc
+        return SimpleNamespace(exit_status=rc, stdout="", stderr="DOCKER-USER chain not found" if rc else "")
 
     return SimpleNamespace(run=run, calls=calls)
 
@@ -1015,6 +1017,16 @@ async def test_a_stale_inventory_is_read_again_then_given_up_as_unknown(monkeypa
     assert sum(_is_generation_read(c) for c in ssh.calls) == rental_egress_guard.INVENTORY_ATTEMPTS
 
 
+@pytest.mark.asyncio
+async def test_the_pre_start_guard_reads_again_until_concurrent_guards_settle():
+    # four creates on one host: the last one loses three lock rounds and must still apply, not be refused
+    stale = rental_egress_guard.STALE_INVENTORY_EXIT
+    ssh = _ssh(helper_rc=[stale, stale, stale, stale, 0])
+    _, error = await rental_egress_guard.apply_rental_egress_guard(ssh, attempts=None)
+    assert error is None
+    assert len(_helper_calls(ssh)) == 5
+
+
 def test_the_lock_wait_works_with_busybox_flock_which_has_no_w(tmp_path, monkeypatch):
     # the alpine helper's busybox flock rejects -w: the wait is timeout around a plain flock
     _bin_dir, state, env = _host(tmp_path, monkeypatch)
@@ -1201,7 +1213,8 @@ def test_the_rules_are_back_before_dockerd_starts_a_container_after_a_reboot(tmp
         done = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True)
         assert done.returncode == 0, done.stderr
     dropin = (root / rental_egress_guard.BOOT_DROPIN.lstrip("/")).read_text()
-    assert f"ExecStartPre=/bin/sh {rental_egress_guard.BOOT_SCRIPT}" in dropin.splitlines()
+    # "-": a failing boot copy never stops dockerd
+    assert f"ExecStartPre=-/bin/sh {rental_egress_guard.BOOT_SCRIPT}" in dropin.splitlines()
     assert (state / "reloads").read_text().split() == ["x"]  # reloaded once, not on every apply
 
     # the reboot: no chain survives, dockerd has not run yet; the drop-in's script alone restores the rules
@@ -1239,8 +1252,12 @@ def test_a_docker_start_after_the_last_rental_ended_restores_no_rules(tmp_path):
     assert (root / rental_egress_guard.BOOT_DROPIN.lstrip("/")).exists()
 
 
-def test_a_host_without_a_systemd_docker_service_is_reported_not_failed(tmp_path):
-    state, root, env = _modelled_host(tmp_path, docker_user=True, systemd=False)
+@pytest.mark.parametrize("host", ["no systemd", "read-only /etc/systemd/system"])
+def test_a_host_without_a_systemd_docker_service_is_reported_not_failed(tmp_path, host):
+    state, root, env = _modelled_host(tmp_path, docker_user=True, systemd=host != "no systemd")
+    if host != "no systemd":  # e.g. NixOS: the unit directory is in the read-only store
+        (root / "etc" / "systemd").mkdir(parents=True)
+        (root / "etc" / "systemd" / "system").write_text("")  # a file, so mkdir -p fails even as root
 
     done = subprocess.run(
         ["sh", "-c", link_local_drop_script("br-0123456789ab", [], str(root))], env=env, capture_output=True, text=True
@@ -1248,4 +1265,7 @@ def test_a_host_without_a_systemd_docker_service_is_reported_not_failed(tmp_path
 
     assert done.returncode == 0, done.stderr
     assert "boot restore not installed" in done.stdout
-    assert not (root / "etc").exists()
+    [(_, rules)] = _jumps_and_rules(state)
+    assert rules  # the runtime rules stay in force
+    if host == "no systemd":
+        assert not (root / "etc").exists()
