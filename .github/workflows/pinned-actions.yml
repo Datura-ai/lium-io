@@ -8,8 +8,8 @@ name: Pinned actions
 on:
   pull_request:
     # edited: a retarget to main (a stacked PR) with no new push still gets this repository run. The ruleset-required run
-    # ignores these types and needs no retarget run: it scans the PR's head commit, which no retarget changes, and the
-    # ruleset requires the branch to be up to date with main, so the tree that merges is the tree it scanned
+    # ignores these types, so a retarget starts no required run: a PR whose head has no required result yet (one opened
+    # against another branch) waits, unmergeable, until a push or a close and reopen starts it. It never merges unscanned
     # (.github/rulesets/README.md)
     types: [opened, synchronize, reopened, edited]
   merge_group:

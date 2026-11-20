@@ -94,10 +94,15 @@ gh api "orgs/Datura-ai/rulesets" --method POST --input .github/rulesets/pinned-a
 
 Check: `gh api "orgs/Datura-ai/rulesets" --jq '.[]|.name+" "+.enforcement'` → `pinned-actions-required-workflow active`.
 
-**A retargeted PR cannot merge unscanned.** A workflow required by a ruleset runs on its own trigger list and ignores the
-`types` in the file, so a retarget (a stacked PR whose base PR merged) starts no required run. The required run therefore
-scans the PR's head commit, not its merge ref: a retarget changes the base but not the head, so the result still describes
-the commit under review. The same ruleset also sets "Require branches to be up to date before merging" (strict), which
+**A retargeted PR cannot merge unscanned, but it waits for a push.** A workflow required by a ruleset runs on its own
+trigger list and ignores the `types` in the file, so a retarget (a stacked PR whose base PR merged) starts no required run.
+A PR opened against another branch never got a required run (the ruleset covers the default branch only), so after the
+retarget the required workflow shows as expected and the PR cannot merge. Strict mode forces a branch update only when
+`main` is not yet an ancestor of the head; when the head already contains `main`, nothing forces one. In both cases start
+the required run yourself: push a commit (or use "Update branch"), or close and reopen the PR, which runs it on the same
+head. After a retarget, a required result exists only if a run already happened on that head while the PR targeted `main`.
+The required run scans the PR's head commit, not its merge ref: a retarget changes the base but not the head, so an existing
+result still describes the commit under review. The same ruleset also sets "Require branches to be up to date before merging" (strict), which
 GitHub checks on the branch itself: a PR can merge only when `main` is an ancestor of its head, and then the merged tree is
 exactly the head's tree. Bringing a branch up to date is a push, which starts the required run on the new head. The
 `pinned-actions` status context only carries the strict rule. A PR's own copy of the workflow can report that context
