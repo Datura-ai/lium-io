@@ -6,8 +6,9 @@ to stay reachable and manageable (sshd, dockerd, containerd, sysbox, the executo
 system.slice, so their pages are not reclaimed when a pod drives the host out of memory. `--runtime`: gone at
 reboot, set again here.
 
-Best-effort: never fails the caller. Every setting it cannot apply (no cgroup v2, systemd or host view, a
-denied write) is printed as a reason, logged as a WARNING with the node id and returned, so coverage is visible.
+Without systemd (another init, or a container as PID 1) the same services are found by process name and their
+cgroups written directly. Best-effort: never fails the caller. Every setting it cannot apply (no cgroup v2 or host
+view, a service or the executor in the root cgroup, a denied write) is printed as a reason, logged as a WARNING with the node id and returned, so coverage is visible.
 """
 
 from __future__ import annotations
@@ -32,33 +33,56 @@ UNIT_MEMORY_MIN_MIB = {
     "sysbox-fs.service": 256,
 }
 EXECUTOR_MEMORY_MIN_MIB = 1536
+SERVICE_PROCESS = {"docker.service": "dockerd"}
 
 def _host_memory_min_script() -> str:
     units = " ".join(f"{unit}={mib * MIB}" for unit, mib in UNIT_MEMORY_MIN_MIB.items())
     # sshd is ssh.service on Debian/Ubuntu and sshd.service elsewhere: count it once
     units_mib = sum(UNIT_MEMORY_MIN_MIB.values()) - UNIT_MEMORY_MIN_MIB["ssh.service"]
     ex_min = EXECUTOR_MEMORY_MIN_MIB * MIB
+    # without systemd the same services are found by process name (sshd for both ssh units)
+    procs = " ".join(
+        f"{SERVICE_PROCESS.get(unit, unit.removesuffix('.service'))}={mib * MIB}"
+        for unit, mib in UNIT_MEMORY_MIN_MIB.items()
+        if unit != "ssh.service"
+    )
     inner = (
-        "[ -d /run/systemd/system ] || { echo memory_min_skipped no_systemd; exit 0; }; "
         "[ -f /sys/fs/cgroup/cgroup.controllers ] || { echo memory_min_skipped no_cgroup_v2; exit 0; }; "
-        # never lower a unit that already has more protection (infinity included), as set_cg_min below
-        "set_min() { v=$(systemctl show -p MemoryMin --value \"$1\"); "
-        "{ [ \"$v\" = infinity ] || [ \"$v\" -ge \"$2\" ]; } 2>/dev/null && return; "
+        # never lower a cgroup that already has more protection, as set_min below
+        'set_cg_min() { f="/sys/fs/cgroup$1/memory.min"; [ "$(cat "$f" 2>/dev/null)" -ge "$2" ] 2>/dev/null && return; '
+        '{ echo "$2" > "$f"; } 2>/dev/null && echo "memory_min_set $1" || echo "memory_min_failed $1 write_denied"; }; '
+        # cgroups written directly (not systemd units): a child's protection never exceeds its parent's, so every
+        # ancestor gets the sum of what is protected below it, parents first; /system.slice stays systemd's
+        'acc=; add() { acc="$acc $1=$2"; }; '
+        "flush() { for kv in $acc; do echo \"${kv%=*} ${kv#*=}\"; done | awk '{n=split($1,a,\"/\"); p=\"\"; "
+        "for(i=2;i<=n;i++){p=p \"/\" a[i]; if(p!=\"/system.slice\") s[p]+=$2}} END{for(p in s) print p, s[p]}' "
+        '| sort | while read -r p v; do set_cg_min "$p" "$v"; done; }; '
+        # this shell sits in the executor's cgroup; with the host cgroup namespace its path is absolute
+        "ex=$(sed -n 's#^0::##p' /proc/self/cgroup); "
+        'case "$ex" in /|"") ex=; echo "memory_min_failed executor root_cgroup";; '
+        '/..*) ex=; echo "memory_min_failed executor outside_host_cgroup_namespace";; esac; '
+        "if [ -d /run/systemd/system ]; then "
+        # never lower a unit that already has more protection (infinity included)
+        'set_min() { v=$(systemctl show -p MemoryMin --value "$1"); '
+        '{ [ "$v" = infinity ] || [ "$v" -ge "$2" ]; } 2>/dev/null && return; '
         'systemctl set-property --runtime "$1" MemoryMin="$2" >/dev/null 2>&1 && echo "memory_min_set $1" '
         '|| echo "memory_min_failed $1 set_property_failed"; }; '
         f"for kv in {units}; do u=${{kv%=*}}; systemctl is-active -q \"$u\" && set_min \"$u\" \"${{kv#*=}}\"; done; "
-        # cgroupfs driver (the documented daemon.json): not a unit, so memory.min is written directly; a
-        # child's protection never exceeds its parent's, so /docker gets at least the same
-        'set_cg_min() { f="/sys/fs/cgroup$1/memory.min"; [ "$(cat "$f" 2>/dev/null)" -ge "$2" ] 2>/dev/null && return; '
-        '{ echo "$2" > "$f"; } 2>/dev/null && echo "memory_min_set $1" || echo "memory_min_failed $1 write_denied"; }; '
-        # this shell sits in the executor's cgroup; with the host cgroup namespace its path is absolute
-        f"ex=$(sed -n 's#^0::##p' /proc/self/cgroup); sl={units_mib * MIB}; "
+        f"sl={units_mib * MIB}; "
         'case "$ex" in '
         f'/system.slice/docker-*.scope) set_min "${{ex#/system.slice/}}" {ex_min}; sl=$((sl + {ex_min}));; '
-        f'/docker/*) set_cg_min /docker {ex_min}; set_cg_min "$ex" {ex_min};; '
-        '*) echo "memory_min_failed executor no_host_cgroup_path";; esac; '
-        # a child's protection never exceeds its parent's
-        'set_min system.slice "$sl"; true'
+        f'/system.slice/*) add "$ex" {ex_min}; sl=$((sl + {ex_min}));; '
+        f'?*) add "$ex" {ex_min};; esac; '
+        'flush; set_min system.slice "$sl"; '
+        "else "
+        # no systemd (another init, a container as PID 1): the services' own cgroups, found from /proc
+        f"seen=; for d in /proc/[0-9]*; do n=$(cat \"$d/comm\" 2>/dev/null); v=; for kv in {procs}; do "
+        '[ "${kv%=*}" = "$n" ] && v=${kv#*=}; done; [ -n "$v" ] || continue; case " $seen " in *" $n "*) continue;; esac; '
+        'seen="$seen $n"; p=$(sed -n \'s#^0::##p\' "$d/cgroup" 2>/dev/null); '
+        # memory.min does not exist on the root cgroup: a service there cannot be protected without moving it
+        'case "$p" in /|"") echo "memory_min_failed $n root_cgroup";; /..*) ;; *) add "$p" "$v";; esac; done; '
+        f'[ -n "$ex" ] && add "$ex" {ex_min}; flush; '
+        "fi; true"
     )
     return (
         "if ! command -v nsenter >/dev/null 2>&1; then echo memory_min_skipped no_nsenter; "
