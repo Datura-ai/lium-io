@@ -187,8 +187,11 @@ def test_detached_wrapper_keeps_the_log_only_when_the_runner_fails(
 async def test_a_launch_that_reaches_the_node_after_its_cancel_never_runs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # the cancel lands before the runner exists (no PID); the dispatch sent earlier arrives after it
-    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", storage_operations.PurePosixPath(str(tmp_path)))
+    # the cancel lands before the runner exists (no PID), on a node that never ran an operation
+    # (no operations directory yet); the dispatch sent earlier arrives after it
+    monkeypatch.setattr(
+        storage_operations, "REMOTE_OPERATION_DIRECTORY", storage_operations.PurePosixPath(str(tmp_path / "ops"))
+    )
     monkeypatch.setattr(storage_operations, "_report_cancelled", AsyncMock(return_value=True))
     monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
     launch_failure = AsyncMock()

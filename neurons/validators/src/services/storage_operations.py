@@ -427,8 +427,9 @@ async def cancel_storage_operation(
     pid_path = shlex.quote(str(files.pid))
     # Let the runner terminate its Restic process and helper first. Direct
     # process termination is only a bounded fallback for an unresponsive runner.
+    # the marker is what stops a later launch, so a cancel that cannot write it fails
     command = (
-        f"touch {cancel_path}; "
+        f"install -d -m 0700 {shlex.quote(str(REMOTE_OPERATION_DIRECTORY))} && touch {cancel_path} || exit 4; "
         f"if test -s {pid_path}; then "
         f"pid=$(cat {pid_path}); "
         "case \"$pid\" in (*[!0-9]*|'') exit 2;; esac; "
