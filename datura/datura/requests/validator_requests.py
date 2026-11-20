@@ -196,6 +196,9 @@ class SSHPubKeySubmitRequest(BaseValidatorRequest):
     # the miner so the executor can check the key was issued for its own miner hotkey. Optional
     # while validators, miners and executors roll out.
     validator_miner_signature: str | None = None
+    # DAH-6740: the same signature for each other hotkey of the listing owner's accounts, hotkey -> signature, so the
+    # executor of a node the owner set up under another of their own keys accepts the key. Optional like the above.
+    owner_hotkey_signatures: dict[str, str] | None = None
 
 
 class SSHPubKeyRemoveRequest(BaseValidatorRequest):
