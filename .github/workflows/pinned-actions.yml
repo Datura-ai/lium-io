@@ -8,7 +8,8 @@ name: Pinned actions
 on:
   pull_request:
     # edited: a retarget to main (a stacked PR) with no new push still gets this repository run on the new merge ref. The
-    # ruleset-required run ignores these types, so after a retarget update the branch or push (.github/rulesets/README.md)
+    # ruleset-required run ignores these types; the same ruleset requires the branch to be up to date with main, so a
+    # retargeted PR cannot merge until a push to it re-runs this check (.github/rulesets/README.md)
     types: [opened, synchronize, reopened, edited]
   merge_group:
     types: [checks_requested]
@@ -22,6 +23,7 @@ permissions:
 
 jobs:
   check:
+    name: pinned-actions  # the status context the ruleset requires (strict): keep it unique across workflows
     runs-on: ubuntu-24.04  # its /usr/bin/python3 ships the distro PyYAML the check imports below
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
