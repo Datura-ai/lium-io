@@ -166,6 +166,10 @@ class StorageOperationLaunchError(RuntimeError):
     pass
 
 
+class StorageOperationCancelledBeforeLaunch(StorageOperationLaunchError):
+    pass
+
+
 @dataclass(frozen=True)
 class StorageOperationFiles:
     spec: PurePosixPath
@@ -273,6 +277,9 @@ async def start_storage_operation(
             f"install -d -m 0700 {shlex.quote(str(REMOTE_OPERATION_DIRECTORY))}",
             check=True,
         )
+        # the cancel marker outlives the cancel: a dispatch that reaches the node after it never runs
+        if await _remote_file_exists(ssh_client, files.cancel):
+            raise StorageOperationCancelledBeforeLaunch("storage operation was cancelled before launch")
         existing_state = await _operation_state(ssh_client, files)
         if existing_state == "STARTING" and await _remote_file_exists(ssh_client, files.spec):
             # A repeated backend dispatch can arrive while the first wrapper is between
@@ -324,14 +331,13 @@ async def start_storage_operation(
         # Bootstrap callers consume the terminal files; detached online jobs
         # remove them themselves after the runner has finished reporting.
         wrapper = (
-            f"rm -f {shlex.quote(str(files.status))} {shlex.quote(str(files.cancel))}; "
+            f"rm -f {shlex.quote(str(files.status))}; "
             f"{runner} & child=$!; "
             f"printf '%s\\n' \"$child\" > {shlex.quote(str(files.pid))}; "
             "trap 'kill -TERM \"$child\" 2>/dev/null || true' TERM INT; "
             'wait "$child"; result=$?; '
             f"printf '%s\\n' \"$result\" > {shlex.quote(str(files.status))}; "
-            f"rm -f {shlex.quote(str(files.spec))} {shlex.quote(str(files.pid))} "
-            f"{shlex.quote(str(files.cancel))}{terminal_cleanup}"
+            f"rm -f {shlex.quote(str(files.spec))} {shlex.quote(str(files.pid))}{terminal_cleanup}"
         )
         launch_command = (
             f"nohup /bin/sh -c {shlex.quote(wrapper)} "
@@ -340,7 +346,8 @@ async def start_storage_operation(
         await ssh_client.run(launch_command, check=True)
         return files
     except Exception as error:
-        await report_launch_failure(operation_id, spec, error)
+        if not isinstance(error, StorageOperationCancelledBeforeLaunch):  # the cancel already reported it
+            await report_launch_failure(operation_id, spec, error)
         raise
 
 
@@ -521,7 +528,9 @@ async def _remove_operation_artifacts(
         "rm -f "
         + " ".join(
             shlex.quote(str(path))
-            for path in (files.status, files.log, files.pid, files.spec, files.cancel)
+            # the cancel marker stays: the operation id is never reused, and a late launch must see it
+            # shortcut: one empty marker per cancelled operation stays on the node; sweep old ones if they pile up
+            for path in (files.status, files.log, files.pid, files.spec)
         ),
         check=False,
     )

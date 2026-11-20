@@ -181,3 +181,33 @@ def test_detached_wrapper_keeps_the_log_only_when_the_runner_fails(
         assert log.read_text().splitlines() == ["working", "runner exited 3"]
     else:
         assert not log.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_launch_that_reaches_the_node_after_its_cancel_never_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # the cancel lands before the runner exists (no PID); the dispatch sent earlier arrives after it
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", storage_operations.PurePosixPath(str(tmp_path)))
+    monkeypatch.setattr(storage_operations, "_report_cancelled", AsyncMock(return_value=True))
+    monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
+    launch_failure = AsyncMock()
+    monkeypatch.setattr(storage_operations, "report_launch_failure", launch_failure)
+    launched: list[str] = []
+
+    async def run(command: str, check: bool = False) -> SimpleNamespace:
+        if command.startswith("nohup"):
+            launched.append(command)
+            return SimpleNamespace(exit_status=0, stdout="", stderr="")
+        done = subprocess.run(["sh", "-c", command.replace("/usr/bin/docker", "true")], capture_output=True, text=True)
+        return SimpleNamespace(exit_status=done.returncode, stdout=done.stdout, stderr=done.stderr)
+
+    ssh_client = SimpleNamespace(run=run, start_sftp_client=None)
+    await storage_operations.cancel_storage_operation(ssh_client, OPERATION_ID)
+
+    with pytest.raises(storage_operations.StorageOperationCancelledBeforeLaunch):
+        await storage_operations.start_storage_operation(
+            ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+        )
+    assert launched == []
+    launch_failure.assert_not_awaited()
