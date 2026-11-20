@@ -1138,14 +1138,17 @@ class ComputeClient:
                 json.loads(raw).get("message_type") == ContainerResponseType.ContainerCreated.value for raw in responses
             )
             ttl = 0 if kept else settings.BACKEND_COMMAND_ANSWER_TTL_SECONDS
-            # until the outcome is written a re-send is only ignored, never answered; the write compares the claim,
-            # so once the claim is gone (released or expired) it is a no-op and the loop ends
+            # A create's outcome is retried until written: until then a resend is only ignored, never answered, and
+            # its in-flight record stays (retired below). The write compares the claim, so once the claim is gone it is
+            # a no-op and the loop ends. Any other command tries once: its claim expires and a resend runs it again.
             while True:
                 try:
                     await redis_service.update_backend_command(command_id, claim, value, ttl)
                     break
                 except Exception:
-                    logger.exception("Failed to finish backend command, retrying: %s", command_id)
+                    logger.exception("Failed to finish backend command: %s", command_id)
+                    if not create:
+                        break
                     await asyncio.sleep(BACKEND_CREATE_TRACKING_RETRY_SECONDS)
             for pod_id, create_id in retirements:
                 await self._retire_backend_create_record(pod_id, create_id)
@@ -1501,13 +1504,13 @@ class ComputeClient:
         creates = await redis_service.inflight_backend_creates()
         claims = await redis_service.running_create_claims()
         unacked = await redis_service.unacked_container_created() if creates or claims else {}
-        rented_pod_ids = await redis_service.rented_pod_ids() if creates or claims else frozenset()
+        rented_pod_ids = await redis_service.rented_pod_ids() if creates else frozenset()
         for command_id, claim in claims.items():
-            # no create runs yet, so each running claim is a cut-off run's. A container in use (rented, or a saved
-            # success the reconnect replays) keeps it; otherwise the backend's same-ID resend must run, not be ignored
-            if claim.pod_id in rented_pod_ids or (
-                claim.pod_id in unacked and await self._replayable_success(claim.pod_id, unacked[claim.pod_id])
-            ):
+            # No create runs yet, so each running claim is a cut-off run's. The backend resends a create under the same
+            # ID only while it holds no answer for it (the pod pending), so no renter has its container yet: the resend
+            # is the re-run DAH-5437 makes of a cut-off create, replacing what it left under the pod's names. Only a
+            # saved success keeps its claim: the reconnect replays it, and its receipt settles the claim.
+            if claim.pod_id in unacked and await self._replayable_success(claim.pod_id, unacked[claim.pod_id]):
                 continue
             await redis_service.release_backend_command(command_id)
         resumed: list[str] = []

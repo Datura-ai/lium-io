@@ -597,3 +597,18 @@ async def test_a_failed_create_is_answered_like_any_command_and_leaves_no_kept_r
         service.redis.now + settings.BACKEND_COMMAND_ANSWER_TTL_SECONDS
     )
     assert await service.redis.smembers("backend_creates_of_pod:pod|executor") == set()
+
+
+@pytest.mark.asyncio
+async def test_a_command_other_than_a_create_tries_its_finish_write_once(client, monkeypatch):
+    """Only a create's outcome is retried until written; any other command's claim expires and its resend runs, so a
+    lost finish write never holds its driver."""
+    service = client.miner_service.redis_service
+    monkeypatch.setattr(service, "update_backend_command", AsyncMock(side_effect=ConnectionError))
+    monkeypatch.setattr(client, "_run_miner_job", AsyncMock())
+    add = AddSshPublicKeyRequest(
+        command_id="add:1", miner_hotkey="miner", executor_id="executor", pod_id="pod",
+        container_name="container", user_public_keys=["k"],
+    )
+    await asyncio.wait_for(client.miner_driver(add), 1)
+    assert service.update_backend_command.await_count == 1

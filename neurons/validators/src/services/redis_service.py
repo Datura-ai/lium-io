@@ -441,6 +441,11 @@ def _parse_pending_pods(data) -> list[dict]:
     return data
 
 
+def _text(value: str | bytes) -> str:
+    # the client does not decode responses: keys and set members come back as bytes
+    return value.decode() if isinstance(value, bytes) else value
+
+
 class RedisService:
     def __init__(self):
         self.redis = aioredis.Redis(
@@ -1243,7 +1248,7 @@ class RedisService:
         """A delete of the pod on that node cancels its creates: the backend never resends one of them."""
         index = f"{BACKEND_CREATES_OF_POD_PREFIX}{pod_id}|{executor_id}"
         for command_id in await self.redis.smembers(index):
-            await self.redis.expire(f"{BACKEND_COMMAND_PREFIX}{command_id}", ttl)
+            await self.redis.expire(f"{BACKEND_COMMAND_PREFIX}{_text(command_id)}", ttl)
         await self.redis.delete(index)
 
     async def index_backend_create(self, pod_id: str, executor_id: str, command_id: str) -> None:
@@ -1254,15 +1259,24 @@ class RedisService:
 
     async def running_create_claims(self) -> dict[str, BackendCommand]:
         """command ID -> running create claim (on start, every one is a cut-off run's)"""
-        claims: dict[str, BackendCommand] = {}
+        return {
+            command_id: command
+            async for command_id, command in self._backend_commands()
+            if command.create and command.state == "running"
+        }
+
+    async def _backend_commands(self):
+        """(command ID, record) of each readable record. An unreadable one is skipped and logged, so it never stops the
+        start; its own command stays fail-closed (miner_driver runs no create whose record it cannot read)."""
         async for key in self.redis.scan_iter(match=f"{BACKEND_COMMAND_PREFIX}*", count=100):
+            command_id = _text(key).removeprefix(BACKEND_COMMAND_PREFIX)
             value = await self.redis.get(key)
             if value is None:
                 continue
-            command = BackendCommand.model_validate_json(value)
-            if command.create and command.state == "running":
-                claims[key.removeprefix(BACKEND_COMMAND_PREFIX)] = command
-        return claims
+            try:
+                yield command_id, BackendCommand.model_validate_json(value)
+            except ValueError:
+                logger.error("Unreadable backend command record skipped: %s", command_id)
 
     async def update_backend_command(
         self, command_id: str, claim: str, value: str, ttl: int
@@ -1290,13 +1304,9 @@ class RedisService:
 
     async def clear_running_backend_commands(self) -> None:
         """A create's claim stays: the restart sweep decides it (fail_creates_cut_off_by_restart)."""
-        async for key in self.redis.scan_iter(match=f"{BACKEND_COMMAND_PREFIX}*", count=100):
-            value = await self.redis.get(key)
-            if value is None:
-                continue
-            command = BackendCommand.model_validate_json(value)
+        async for command_id, command in self._backend_commands():
             if command.state == "running" and not command.create:
-                await self.redis.delete(key)
+                await self.redis.delete(f"{BACKEND_COMMAND_PREFIX}{command_id}")
 
     async def release_backend_command(self, command_id: str) -> None:
         """Drops a running claim (a finished answer stays) so the backend's re-send of that command runs."""
