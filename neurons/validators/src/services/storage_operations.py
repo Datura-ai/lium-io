@@ -120,6 +120,13 @@ class WaveRead:
 _wave_read: WaveRead | None = None
 
 
+def start_a_new_wave() -> None:
+    """A cycle run starts: its checks read the records again even when its id repeats the
+    previous run's (an operator-forced cycle in the same BLOCKS_FOR_JOB window)."""
+    global _wave_read
+    _wave_read = None
+
+
 def _wave_raw_records(redis: RedisService, wave_id: str) -> Awaitable[dict[str, list[str]]]:
     global _wave_read
     failed = (

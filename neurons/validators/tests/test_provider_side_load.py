@@ -1264,6 +1264,24 @@ async def test_a_fresh_read_sees_a_helper_started_after_the_waves_read():
 
 
 @pytest.mark.asyncio
+async def test_a_cycle_run_that_repeats_the_previous_id_reads_the_records_again():
+    # an operator-forced cycle in the same BLOCKS_FOR_JOB window gets the previous cycle's id
+    sets: dict[str, set[str]] = {}
+    redis = _sets_redis(sets)
+
+    async def running(op):
+        return True
+
+    assert await settle_excused_storage_helper_keys(redis, "executor-1", running, wave_id="wave-1") == set()
+    await note_started_storage_helper(redis, "executor-1", OPERATION)
+    storage_operations.start_a_new_wave()
+
+    assert await settle_excused_storage_helper_keys(redis, "executor-1", running, wave_id="wave-1") == {
+        storage_helper_key(OPERATION)
+    }
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("label", ["Unknown", "pod-watch", None])
 async def test_cycles_under_a_label_that_names_no_cycle_never_share_records(label):
     # a cycle whose block time could not be read is labelled "Unknown" like the one before it:
