@@ -386,6 +386,33 @@ def _binary_command(remote_dir: str, script_filename: str) -> str:
     return f"chmod +x {script_path} && {script_path}"
 
 
+async def scrape_gpu_details(ctx: Context, timeout: int) -> list[dict[str, Any]]:
+    """A fresh scrape's gpu_details, normalised as MachineSpecScrapeCheck stores them; [] when no payload decrypted.
+
+    DAH-6469: GpuThermalThrottleCheck reads the cards under its own load with it. It writes nothing to ctx.state, so
+    the checks after it keep the cycle's own scrape."""
+    if ctx.config.machine_scrape_source:
+        command, stdin_text = f"{shlex.quote(ctx.executor.python_path)} -I -", ctx.config.machine_scrape_source
+    elif ctx.state.remote_dir and ctx.config.machine_scrape_filename:
+        command, stdin_text = _binary_command(ctx.state.remote_dir, ctx.config.machine_scrape_filename), None
+    else:
+        return []
+    scrape_run = await ctx.runner.run(command, timeout=timeout, retryable=False, stdin_text=stdin_text)
+    if not scrape_run.success:
+        return []
+    try:
+        specs = _deobfuscate(json.loads(_decrypt_payload(ctx, scrape_run.stdout)), ctx.config.obfuscation_keys)
+    except Exception:  # noqa: BLE001 - no token this validator can read: no reading
+        return []
+    gpu_info = specs.get("gpu") if isinstance(specs, dict) else None
+    details = gpu_info.get("details") if isinstance(gpu_info, dict) else None
+    if not isinstance(details, list):
+        return []
+    return list_sxm_on_pcie_adapter_as_pcie(
+        specs, _normalize_gpu_details([detail for detail in details if isinstance(detail, dict)])
+    )
+
+
 class MachineSpecScrapeCheck:
     """Run the obfuscated scrape script and unpack the executor's hardware profile.
 

@@ -14,6 +14,8 @@ context creation, an allocation the card or the container's limits refuse, a wor
 setup) is an error, not a fault: the validator does not penalise what it could not measure.
 
 Prints one line `GPU_FAULT_PROBE_JSON: {...}`. Exit 0 ok, 1 fault, 2 could not run.
+`--heat-seconds` (GpuThermalThrottleCheck, DAH-6469) adds dense FMA work per card after the fault rounds
+(HEAT_PTX), compute-bound so it heats the card; the validator reads the cards with its own scrape meanwhile.
 `--nvml-only` (GpuMemoryHealthCheck) reads NVML once and runs no CUDA: status ok, flagged (see
 `flags`) or error, exit 0. It also lists, per card, the new hardware Xids since `--xid-after` (`xid_faults`),
 which do not set the status.
@@ -348,6 +350,82 @@ L_end:
 }
 """
 
+# DAH-6469: dense compute for the thermal load (--heat-seconds). Eight independent FMA chains per thread, two
+# FMAs each per loop pass, no memory traffic until the one store: compute-bound, so the card draws its full power
+# and heats the way a broken cooler cannot hide, unlike the memory-bound fault rounds above. Its own module, loaded
+# only for a heat run: a JIT problem here never touches the fault probe.
+HEAT_PTX = r"""
+.version 6.0
+.target sm_50
+.address_size 64
+
+.visible .entry k_heat(.param .u64 p_out, .param .u32 p_n, .param .u32 p_iters)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<8>;
+    .reg .f32 %f<16>;
+    .reg .b64 %rd<5>;
+    ld.param.u64 %rd1, [p_out];
+    ld.param.u32 %r1, [p_n];
+    ld.param.u32 %r6, [p_iters];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra L_end;
+    cvt.rn.f32.u32 %f1, %r5;
+    mul.f32 %f1, %f1, 0f2F800000;
+    add.f32 %f2, %f1, 0f3F800000;
+    add.f32 %f3, %f1, 0f40000000;
+    add.f32 %f4, %f1, 0f40400000;
+    add.f32 %f5, %f1, 0f40800000;
+    add.f32 %f6, %f1, 0f40A00000;
+    add.f32 %f7, %f1, 0f40C00000;
+    add.f32 %f8, %f1, 0f40E00000;
+    add.f32 %f9, %f1, 0f41000000;
+    mov.f32 %f10, 0f3F7FFFEF;
+    mov.f32 %f11, 0f3A83126F;
+    mov.u32 %r7, 0;
+L_loop:
+    fma.rn.f32 %f2, %f2, %f10, %f11;
+    fma.rn.f32 %f3, %f3, %f10, %f11;
+    fma.rn.f32 %f4, %f4, %f10, %f11;
+    fma.rn.f32 %f5, %f5, %f10, %f11;
+    fma.rn.f32 %f6, %f6, %f10, %f11;
+    fma.rn.f32 %f7, %f7, %f10, %f11;
+    fma.rn.f32 %f8, %f8, %f10, %f11;
+    fma.rn.f32 %f9, %f9, %f10, %f11;
+    fma.rn.f32 %f2, %f2, %f10, %f11;
+    fma.rn.f32 %f3, %f3, %f10, %f11;
+    fma.rn.f32 %f4, %f4, %f10, %f11;
+    fma.rn.f32 %f5, %f5, %f10, %f11;
+    fma.rn.f32 %f6, %f6, %f10, %f11;
+    fma.rn.f32 %f7, %f7, %f10, %f11;
+    fma.rn.f32 %f8, %f8, %f10, %f11;
+    fma.rn.f32 %f9, %f9, %f10, %f11;
+    add.u32 %r7, %r7, 1;
+    setp.lt.u32 %p2, %r7, %r6;
+    @%p2 bra L_loop;
+    add.f32 %f12, %f2, %f3;
+    add.f32 %f13, %f4, %f5;
+    add.f32 %f14, %f6, %f7;
+    add.f32 %f15, %f8, %f9;
+    add.f32 %f12, %f12, %f13;
+    add.f32 %f14, %f14, %f15;
+    add.f32 %f12, %f12, %f14;
+    mul.wide.u32 %rd2, %r5, 4;
+    cvta.to.global.u64 %rd3, %rd1;
+    add.s64 %rd4, %rd3, %rd2;
+    st.global.f32 [%rd4], %f12;
+L_end:
+    ret;
+}
+"""
+# FMA loop passes per thread per launch: a launch stays well under a second on the slowest card we list, so the
+# heat loop can stop near its deadline
+HEAT_ITERS = 256
+
 KERNELS = (
     "k_perm",
     "k_iota",
@@ -408,6 +486,28 @@ class Cuda:
 
 class DevPtr(int):
     """A CUdeviceptr; distinguishes 64-bit pointer arguments from 32-bit scalars in _launch."""
+
+
+def _load_kernels(cuda: Cuda, ptx: str, kernels: tuple[str, ...]) -> dict:
+    module = ctypes.c_void_p()
+    error_log = ctypes.create_string_buffer(8192)
+    options = (ctypes.c_int * 2)(
+        5, 6
+    )  # CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES
+    option_values = (ctypes.c_void_p * 2)(ctypes.addressof(error_log), 8192)
+    code = cuda.lib.cuModuleLoadDataEx(ctypes.byref(module), ptx.encode(), 2, options, option_values)
+    if code != 0:
+        raise ProbeError(
+            f"PTX JIT failed: {cuda.error_name(code)}: {error_log.value.decode(errors='replace')}"
+        )
+    funcs = {}
+    for kernel in kernels:
+        func = ctypes.c_void_p()
+        cuda.call(
+            "cuModuleGetFunction", ctypes.byref(func), module, kernel.encode(), raise_as_fault=False
+        )
+        funcs[kernel] = func
+    return funcs
 
 
 def _launch(cuda: Cuda, func, stream, n: int, *args) -> None:
@@ -551,24 +651,7 @@ def _setup_device(index: int, vram_mb: int) -> ProbeSetup:
     report["working_set_mb"] = BUFFERS * 4 * n // MB
 
     t_jit = time.perf_counter()
-    module = ctypes.c_void_p()
-    error_log = ctypes.create_string_buffer(8192)
-    options = (ctypes.c_int * 2)(
-        5, 6
-    )  # CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES
-    option_values = (ctypes.c_void_p * 2)(ctypes.addressof(error_log), 8192)
-    code = lib.cuModuleLoadDataEx(ctypes.byref(module), PTX.encode(), 2, options, option_values)
-    if code != 0:
-        raise ProbeError(
-            f"PTX JIT failed: {cuda.error_name(code)}: {error_log.value.decode(errors='replace')}"
-        )
-    funcs = {}
-    for kernel in KERNELS:
-        func = ctypes.c_void_p()
-        cuda.call(
-            "cuModuleGetFunction", ctypes.byref(func), module, kernel.encode(), raise_as_fault=False
-        )
-        funcs[kernel] = func
+    funcs = _load_kernels(cuda, PTX, KERNELS)
     report["jit_ms"] = int((time.perf_counter() - t_jit) * 1000)
 
     stream = ctypes.c_void_p()
@@ -613,7 +696,9 @@ def _setup_device(index: int, vram_mb: int) -> ProbeSetup:
     )
 
 
-def probe_device(index: int, seconds: float, vram_mb: int, on_phase=None) -> dict:
+def probe_device(
+    index: int, seconds: float, vram_mb: int, on_phase=None, heat_seconds: float = 0.0
+) -> dict:
     setup = _setup_device(index, vram_mb)
     report, cuda, context = setup.report, setup.cuda, setup.context
     n, mask, funcs, stream = setup.n, setup.mask, setup.funcs, setup.stream
@@ -680,6 +765,8 @@ def probe_device(index: int, seconds: float, vram_mb: int, on_phase=None) -> dic
         rounds += 1
     report["rounds"] = rounds
     report["work_s"] = round(time.perf_counter() - t_work, 2)
+    if heat_seconds > 0:
+        report.update(heat(cuda, stream, n, d_out, heat_seconds))
 
     for ptr in device_buffers + [d_ctr]:
         cuda.call("cuMemFree_v2", ptr)
@@ -688,6 +775,21 @@ def probe_device(index: int, seconds: float, vram_mb: int, on_phase=None) -> dic
     cuda.call("cuCtxSynchronize")
     cuda.call("cuCtxDestroy_v2", context)
     return report
+
+
+def heat(cuda: Cuda, stream, n: int, d_out, seconds: float) -> dict:
+    """DAH-6469: dense FMA work on the card for `seconds`, the thermal load (see HEAT_PTX)."""
+    try:
+        k_heat = _load_kernels(cuda, HEAT_PTX, ("k_heat",))["k_heat"]
+    except ProbeError as exc:
+        return {"heat_error": str(exc)}
+    launches = 0
+    t_heat = time.perf_counter()
+    while time.perf_counter() - t_heat < seconds:
+        _launch(cuda, k_heat, stream, n, d_out, n, HEAT_ITERS)
+        cuda.call("cuStreamSynchronize", stream)
+        launches += 1
+    return {"heat_launches": launches, "heat_s": round(time.perf_counter() - t_heat, 2)}
 
 
 def _quiet_child() -> None:
@@ -699,7 +801,7 @@ def _quiet_child() -> None:
     os.close(devnull)
 
 
-def _worker(index: int, seconds: float, vram_mb: int, conn) -> None:
+def _worker(index: int, seconds: float, vram_mb: int, conn, heat_seconds: float = 0.0) -> None:
     _quiet_child()
     started = time.perf_counter()
 
@@ -708,7 +810,7 @@ def _worker(index: int, seconds: float, vram_mb: int, conn) -> None:
         conn.send({"phase": phase})
 
     try:
-        report = probe_device(index, seconds, vram_mb, on_phase)
+        report = probe_device(index, seconds, vram_mb, on_phase, heat_seconds)
         report["status"] = "ok"
     except CudaFault as exc:
         report = {"index": index, "status": "fault", "error": str(exc)}
@@ -1171,6 +1273,12 @@ def main(argv: list[str]) -> int:
         help="with --xid-after: the boot id that kernel time belongs to; on another boot every line is new",
     )
     parser.add_argument(
+        "--heat-seconds",
+        type=float,
+        default=0.0,
+        help="after the fault rounds, dense compute per GPU for this long (the thermal load)",
+    )
+    parser.add_argument(
         "--hang-in-kernels-is-fault",
         action="store_true",
         help="a worker still in its kernels at the deadline is a fault, not an error (post-rental recheck)",
@@ -1202,7 +1310,9 @@ def main(argv: list[str]) -> int:
     workers = []
     for index in indices:
         parent_conn, child_conn = mp.Pipe(duplex=False)
-        process = mp.Process(target=_worker, args=(index, args.seconds, args.vram_mb, child_conn))
+        process = mp.Process(
+            target=_worker, args=(index, args.seconds, args.vram_mb, child_conn, args.heat_seconds)
+        )
         process.start()
         child_conn.close()
         workers.append((index, process, parent_conn))
@@ -1210,7 +1320,7 @@ def main(argv: list[str]) -> int:
     # one wall-clock budget for the concurrent workers, with grace that grows with their number: eight
     # interpreters forking, JIT-compiling and allocating at once on a loaded host take longer than one
     grace = WORKER_GRACE_SECONDS + WORKER_GRACE_PER_GPU_SECONDS * (len(workers) - 1)
-    budget = args.seconds + grace
+    budget = args.seconds + args.heat_seconds + grace
     result["devices"] = drain_workers(
         workers, time.perf_counter() + budget, budget, args.hang_in_kernels_is_fault
     )
