@@ -1398,3 +1398,29 @@ def test_create_request_str_leaves_out_renter_supplied_values():
         assert marker not in logged
     assert payload.custom_options.environment["HOSTILE_ENV"] == HOSTILE_ENV_VALUE
     assert "HOSTILE_ENV" in payload.model_dump_json()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_sysbox, sysctls", [(True, {}), (False, {"net.ipv4.conf.all.src_valid_mark": "1"})])
+async def test_create_container_presets_src_valid_mark_only_for_runc_pods(
+    docker_service,
+    executor_info,
+    keypair,
+    monkeypatch,
+    is_sysbox,
+    sysctls,
+):
+    # a sysbox-runc restart that wrote this preset failed the pod when sysbox-fs did not expose the path yet
+    ssh_client = RecordingSSHClient(stdout="sysbox:231072:65536" if is_sysbox else "")
+    _patch_create_harness(monkeypatch, docker_service, ssh_client)
+    payload = _base_create_payload(is_sysbox=is_sysbox)
+
+    await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=keypair,
+        private_key="encrypted-private-key",
+    )
+
+    run_spec = docker_service.rental_docker_client_factory.client.run_specs[0]
+    assert run_spec.sysctls == sysctls
