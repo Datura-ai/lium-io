@@ -19,6 +19,7 @@ from services.storage_operations import (
 from .cpu_truth import advertised_cpu_count
 from .custom_build_orphan_sweep import BUILD_DIND_PREFIX
 from .rental_owner import rental_of_this_node
+from .provider_maintenance import JOB_BATCH_ID_FORMAT
 from .gpu_usage import (
     carries_a_rental_prefix,
     lium_workload_containers,
@@ -285,12 +286,23 @@ async def lium_containers(ctx: Context) -> set[str] | None:
     return containers
 
 
+def cycle_wave_id(job_batch_id: str | None) -> str | None:
+    """The wave to share a records read with: the cycle's own id, or None when the id names no
+    single cycle ("Unknown" when the block time could not be read, "pod-watch"), so runs that
+    repeat that label never reuse an earlier run's records."""
+    try:
+        datetime.strptime(job_batch_id or "", JOB_BATCH_ID_FORMAT)
+    except ValueError:
+        return None
+    return job_batch_id
+
+
 async def excused_storage_helper_keys(ctx: Context, fresh: bool = True) -> set[str]:
     return await settle_excused_storage_helper_keys(
         ctx.services.redis,
         ctx.executor.uuid,
         lambda op: storage_operation_open(ctx, op),
-        wave_id=None if fresh else ctx.config.job_batch_id,
+        wave_id=None if fresh else cycle_wave_id(ctx.config.job_batch_id),
     )
 
 

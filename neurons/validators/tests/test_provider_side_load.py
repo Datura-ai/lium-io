@@ -34,7 +34,7 @@ from neurons.validators.src.services.storage_operations import (
     storage_helper_key,
     storage_helper_name,
 )
-from tests.helpers import build_state
+from tests.helpers import build_context_config, build_state
 
 GB_KB = 1024 * 1024
 
@@ -1007,7 +1007,12 @@ async def test_a_backup_that_starts_before_the_second_look_is_lium_load(context_
     # wave's read is excused in the same cycle
     store: set[str] = set()
     ctx = _with_recorded_helpers(
-        context_factory(state=_rented_state(SN13_SPECS), runner=_helper_runner(BACKUP_HELPER)),
+        context_factory(
+            state=_rented_state(SN13_SPECS),
+            runner=_helper_runner(BACKUP_HELPER),
+            # a real cycle id: the cycle's checks share one records read
+            config=build_context_config(job_batch_id="2026-11-20 20:00:00"),
+        ),
         records=store,
     )
 
@@ -1256,6 +1261,44 @@ async def test_a_fresh_read_sees_a_helper_started_after_the_waves_read():
     assert await settle_excused_storage_helper_keys(
         redis, "executor-1", running, wave_id="wave-2"
     ) == {storage_helper_key(OPERATION)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("label", ["Unknown", "pod-watch", None])
+async def test_cycles_under_a_label_that_names_no_cycle_never_share_records(label):
+    # a cycle whose block time could not be read is labelled "Unknown" like the one before it:
+    # the second must read the records again, not reuse the first cycle's
+    from neurons.validators.src.services.task.checks import provider_side_load as psl
+
+    sets: dict[str, set[str]] = {}
+    ctx = MagicMock()
+    ctx.services.redis = _sets_redis(sets)
+    ctx.executor.uuid = "executor-1"
+    ctx.config.job_batch_id = label
+
+    with patch.object(psl, "storage_operation_open", AsyncMock(return_value=True)):
+        assert await psl.excused_storage_helper_keys(ctx, fresh=False) == set()
+        await note_started_storage_helper(ctx.services.redis, "executor-1", OPERATION)
+        assert await psl.excused_storage_helper_keys(ctx, fresh=False) == {
+            storage_helper_key(OPERATION)
+        }
+
+
+@pytest.mark.asyncio
+async def test_checks_of_one_cycle_share_its_records_read():
+    from neurons.validators.src.services.task.checks import provider_side_load as psl
+
+    sets: dict[str, set[str]] = {}
+    ctx = MagicMock()
+    ctx.services.redis = _sets_redis(sets)
+    ctx.executor.uuid = "executor-1"
+    ctx.config.job_batch_id = "2026-11-20 20:00:00"
+
+    with patch.object(psl, "storage_operation_open", AsyncMock(return_value=True)):
+        await psl.excused_storage_helper_keys(ctx, fresh=False)
+        await psl.excused_storage_helper_keys(ctx, fresh=False)
+
+    assert ctx.services.redis.smembers_many.await_count == 1
 
 
 @pytest.mark.asyncio
