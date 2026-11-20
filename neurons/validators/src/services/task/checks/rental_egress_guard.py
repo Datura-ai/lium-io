@@ -18,7 +18,8 @@ a link-local resolver.
 - Periodic, and right before a pod starts on the create and start paths (DAH-6737). Host iptables are gone after a
   reboot while dockerd brings rental containers back (``restart=unless-stopped``) before any validator runs, so every
   apply also writes the rule set it just put in force to the host and a ``docker.service`` drop-in that runs it as
-  ``ExecStartPre``: the rules are back before dockerd starts a container. A host whose dockerd is not the systemd
+  ``ExecStartPre``: the rules are back before dockerd starts a container, and dockerd does not start while they cannot
+  be put back. A host whose dockerd is not the systemd
   ``docker.service`` gets no drop-in and the apply says so on stdout.
 - Reconciled, not accumulated: the rules live in our own chain, rebuilt each run from what the
   host shows now and swapped in, so a recreated rental network or an ended legacy pod leaves no
@@ -266,8 +267,9 @@ def _boot_restore(boot: str, host_root: str) -> str:
     script, dropin = shlex.quote(host_root + BOOT_SCRIPT), shlex.quote(host_root + BOOT_DROPIN)
     dirs = " ".join(shlex.quote(host_root + path.rsplit("/", 1)[0]) for path in (BOOT_SCRIPT, BOOT_DROPIN))
     # printf makes the newlines, so the command stays on one line
-    # "-": a failing boot copy never stops dockerd; the pre-start guard still refuses an unguarded pod
-    unit = shlex.quote(f"[Service]\\nExecStartPre=-/bin/sh {BOOT_SCRIPT}\\n")
+    # no "-": dockerd restarts rental containers itself (unless-stopped), past the validator's pre-start guard, so a
+    # boot copy that cannot put the rules back keeps dockerd from starting; systemd's own restarts retry it
+    unit = shlex.quote(f"[Service]\\nExecStartPre=/bin/sh {BOOT_SCRIPT}\\n")
     return (
         f"if [ -d {shlex.quote(host_root + '/run/systemd/system')} ] && "
         '[ "$($HOST_NS systemctl show -p LoadState --value docker.service 2>/dev/null)" = loaded ]; then '

@@ -1213,8 +1213,8 @@ def test_the_rules_are_back_before_dockerd_starts_a_container_after_a_reboot(tmp
         done = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True)
         assert done.returncode == 0, done.stderr
     dropin = (root / rental_egress_guard.BOOT_DROPIN.lstrip("/")).read_text()
-    # "-": a failing boot copy never stops dockerd
-    assert f"ExecStartPre=-/bin/sh {rental_egress_guard.BOOT_SCRIPT}" in dropin.splitlines()
+    # no "-": a boot copy that fails stops dockerd, so no rental container restarts without its rules
+    assert f"ExecStartPre=/bin/sh {rental_egress_guard.BOOT_SCRIPT}" in dropin.splitlines()
     assert (state / "reloads").read_text().split() == ["x"]  # reloaded once, not on every apply
 
     # the reboot: no chain survives, dockerd has not run yet; the drop-in's script alone restores the rules
@@ -1230,6 +1230,26 @@ def test_the_rules_are_back_before_dockerd_starts_a_container_after_a_reboot(tmp
     assert rules == [
         f"-i {i} -d {LINK_LOCAL_CIDR} -p {p} ! --dport 53 -j DROP" for i in ("br-0123456789ab", "docker0") for p in ("tcp", "udp")
     ]
+
+
+def test_a_boot_copy_that_cannot_restore_the_rules_fails_the_docker_start(tmp_path):
+    """The boot copy's failure is not ignored by systemd: dockerd, which restarts rental containers on its own, does
+    not start until the rules are back."""
+    state, root, env = _modelled_host(tmp_path, docker_user=True)
+    applied = subprocess.run(
+        ["sh", "-c", link_local_drop_script("br-0123456789ab", [], str(root))], env=env, capture_output=True, text=True
+    )
+    assert applied.returncode == 0, applied.stderr
+    dropin = (root / rental_egress_guard.BOOT_DROPIN.lstrip("/")).read_text()
+    [line] = [x for x in dropin.splitlines() if x.startswith("ExecStartPre=")]
+    assert not line.startswith("ExecStartPre=-")
+
+    # the reboot, with the firewall write failing
+    bin_dir = tmp_path / "bin"
+    (bin_dir / "iptables").write_text('#!/bin/sh\necho "write failed" >&2\nexit 4\n')
+    boot = root / rental_egress_guard.BOOT_SCRIPT.lstrip("/")
+    restored = subprocess.run(["sh", str(boot)], env=env, capture_output=True, text=True)
+    assert restored.returncode != 0
 
 
 def test_a_docker_start_after_the_last_rental_ended_restores_no_rules(tmp_path):
