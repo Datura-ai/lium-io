@@ -97,12 +97,16 @@ class DefaultIncentive(BaseIncentive):
     @staticmethod
     def _record_outdated_image_reason(result: JobResult) -> bool:
         """True when the executor image excludes this result from both pools: always for an UNOFFICIAL
-        image, and for an OUTDATED one only on a free node (DAH-6845). A rented OUTDATED node keeps its share; its
+        image, and for an OUTDATED one only on a free node (DAH-6845). A rented OUTDATED node keeps its share, the free
+        GPUs of a partly rented split node included; its
         report still travels on the result and its specs.
         """
         report = result.executor_image_report or {}
         status = report.get("status")
-        if status != "UNOFFICIAL" and not (status == "OUTDATED" and not result.is_rented):
+        # the free GPUs of a partly rented split node are scored as an unrented copy, but the node is rented:
+        # it passed the image check, stays listed, and keeps the idle pay for those GPUs too
+        free_node = not result.is_rented and not result.is_split_remainder
+        if status != "UNOFFICIAL" and not (status == "OUTDATED" and free_node):
             return False
         if not any(
             reason.reason == ZeroIncentiveReason.OUTDATED_EXECUTOR_IMAGE.value
