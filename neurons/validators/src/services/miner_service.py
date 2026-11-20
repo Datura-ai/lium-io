@@ -1484,6 +1484,7 @@ class MinerService:
                             else None
                         ),
                         "host_runtime_fault": result.host_runtime_fault,
+                        "rented_pod_faults": result.rented_pod_faults,
                         "check_started_at": (
                             result.check_started_at.isoformat() if result.check_started_at else None
                         ),

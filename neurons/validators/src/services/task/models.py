@@ -104,6 +104,8 @@ class JobResult(BaseModel):
     pod_ssh: list[PodSshObservation] | None = None
     # DAH-5651: ContextState.host_runtime_fault, this cycle's DinD test container on the host never answered
     host_runtime_fault: bool = False
+    # ContextState.rented_pod_faults: {pod_id: [host-side fault codes]} for the rented pods this cycle judged
+    rented_pod_faults: dict[str, list[str]] | None = None
     # True only when this cycle opened the shell with known_hosts pinned to executor_info.ssh_host_key,
     # so the node proved it holds that key. Results for nodes the cycle never reached stay False.
     ssh_host_key_verified: bool = False
