@@ -28,6 +28,7 @@ from payload_models.payloads import (
 import services.docker_service as docker_service_module
 from helpers import no_host_start_lock, shared_pod_start_stop_lock
 from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService, _is_vloopback_driver, _s3fs_plugin_alias
+from services.s3fs_plugin_copy import s3fs_plugin_command
 from services.rental_docker_sdk import (
     ContainerExecResult,
     ContainerStateSnapshot,
@@ -681,7 +682,9 @@ async def test_create_s3fs_volume_uses_a_plugin_instance_of_its_own(
     )
 
     alias = "s3fs-celium-volume-safe"
-    assert any(f"--alias {alias} " in command for command in ssh_client.commands)
+    # DAH-6466: the instance is made from the node's local plugin copy, with no `plugin install` of its own
+    assert s3fs_plugin_command(alias) in ssh_client.commands
+    assert not any(command.startswith("/usr/bin/docker plugin install") for command in ssh_client.commands)
     assert any(f"plugin set {alias} AWSACCESSKEYID=" in command for command in ssh_client.commands)
     assert any(f"plugin enable {alias}" in command for command in ssh_client.commands)
     assert f"volume create -d {alias} " in stream_logs.await_args.kwargs["command"]
@@ -699,46 +702,23 @@ async def test_create_s3fs_volume_uses_a_plugin_instance_of_its_own(
     assert not any(command.startswith(forbidden) for command in ssh_client.commands)
 
 
-class InstallFailsSSHClient(RecordingSSHClient):
-    def __init__(self, install_failures: int, install_stderr: str):
-        super().__init__()
-        self.install_failures = install_failures
-        self.install_stderr = install_stderr
-
+class CopyFailsSSHClient(RecordingSSHClient):
     async def run(self, command, *args, **kwargs):
         self.commands.append(command)
-        if "plugin install" in command and self.install_failures:
-            self.install_failures -= 1
-            return SimpleNamespace(stdout="", stderr=self.install_stderr, exit_status=1)
+        if command == s3fs_plugin_command("s3fs-celium-volume-safe"):
+            return SimpleNamespace(stdout="", stderr="plugin install failed: connection reset by peer", exit_status=1)
         return SimpleNamespace(stdout="", stderr="", exit_status=0)
 
 
-def _s3fs_install_count(ssh_client) -> int:
-    return sum("plugin install" in command for command in ssh_client.commands)
-
-
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("install_failures", "install_stderr", "expected_installs"),
-    [
-        # a Docker Hub TLS timeout on the plugin pull (node 72d90b60, 15 Nov) is tried again
-        (1, 'failed to do request: Get "https://registry-1.docker.io/v2/": net/http: TLS handshake timeout', 2),
-        # the retries stop after two
-        (5, "net/http: TLS handshake timeout", 3),
-        # an instance already installed for this volume is not pulled again
-        (1, "Error response from daemon: plugin s3fs-celium-volume-safe:latest already exists", 1),
-    ],
-)
-async def test_create_s3fs_volume_retries_a_failed_plugin_install(
-    docker_service,
-    monkeypatch,
-    install_failures,
-    install_stderr,
-    expected_installs,
-):
-    ssh_client = InstallFailsSSHClient(install_failures, install_stderr)
-    monkeypatch.setattr(docker_service, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
-    monkeypatch.setattr(docker_service_module, "S3FS_PLUGIN_INSTALL_RETRY_WAIT_SECONDS", 0)
+async def test_create_s3fs_volume_reports_why_the_instance_could_not_be_made(docker_service, monkeypatch):
+    # a node without the plugin copy whose registry path is down: the failure log names the install, as before
+    ssh_client = CopyFailsSSHClient()
+    monkeypatch.setattr(
+        docker_service, "execute_and_stream_logs", AsyncMock(return_value=(False, "plugin not found"))
+    )
+    warning = Mock()
+    monkeypatch.setattr(docker_service_module.logger, "warning", warning)
 
     result = await docker_service.create_s3fs_volume(
         ssh_client=ssh_client,
@@ -748,10 +728,8 @@ async def test_create_s3fs_volume_retries_a_failed_plugin_install(
         sysbox_subuid_base=None,
     )
 
-    assert result == (True, "")
-    assert _s3fs_install_count(ssh_client) == expected_installs
-    # the instance is still configured and enabled after the retried install
-    assert any("plugin enable s3fs-celium-volume-safe" in command for command in ssh_client.commands)
+    assert result[0] is False
+    assert "Step 0: exit=1, stdout=, stderr=plugin install failed: connection reset by peer" in str(warning.call_args.args[0])
 
 
 @pytest.mark.asyncio
@@ -839,7 +817,6 @@ def test_only_v2_is_installed_or_enabled_and_only_s3fs_instances_are_disabled_re
     assert set(targets) == {"{plugin_alias}"}
     installed_or_enabled = re.findall(r"""docker plugin (?:install|enable) ([^\s"']+)""", source)
     assert set(installed_or_enabled) == {
-        "{S3FS_PLUGIN_IMAGE}",
         "{plugin_alias}",
         "{LEGACY_S3FS_PLUGIN_ALIAS}",
     }

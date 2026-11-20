@@ -38,6 +38,7 @@ from .checks import (
     ContainerDownloadSpeedCheck,
     CpuTruthCheck,
     CustomBuildOrphanSweepCheck,
+    S3fsPluginCopyCheck,
     RentalEgressGuardCheck,
     DiskHealthCheck,
     DiskSpaceCheck,
@@ -124,6 +125,8 @@ JOB_LENGTH = 300
 # call would lose the "last swept at" timestamps. The check itself is stateless
 # wrt input data and only reads ctx, so a shared instance is safe.
 _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON = CustomBuildOrphanSweepCheck()
+# DAH-6466: same reason, per-executor cadence of the s3fs plugin copy staging.
+_S3FS_PLUGIN_COPY_SINGLETON = S3fsPluginCopyCheck()
 # Same reason: per-executor cadence state, shared by the two positions. Never before a scored step:
 # a rented node is guarded inside TenantEnforcementCheck's rented halt, an idle node after ScoreCheck.
 _RENTAL_EGRESS_GUARD_LAST_RUN: dict[tuple, float] = {}
@@ -191,6 +194,7 @@ class PipelineFactory:
         first_pass: bool = False,
         encrypted_private_key: str | None = None,
         task_started_at: float | None = None,
+        deadline_monotonic: float | None = None,
     ) -> Context:
         """Build the base validation context with all configuration.
 
@@ -204,6 +208,7 @@ class PipelineFactory:
             encrypted_private_key: the same key as the backend sent it, for the rental probe's
                 create_container / delete_container calls (DAH-3436); None disables the probe
             task_started_at: time.monotonic() at the executor task's start, which its timeout counts from
+            deadline_monotonic: the caller's sooner deadline (an express recheck's), or None
             encrypted_files: Encrypted validation files
             tdx_attestation_passed: Whether TDX attestation passed
             gpu_attestation_passed: NVIDIA CC GPU attestation outcome (None = not performed)
@@ -241,6 +246,7 @@ class PipelineFactory:
         return Context(
             pipeline_id=pipeline_id,
             started_at_monotonic=task_started_at or time.monotonic(),
+            deadline_monotonic=deadline_monotonic,
             executor=executor_info,
             miner_hotkey=miner_info.miner_hotkey,
             miner_coldkey=miner_info.miner_coldkey,
@@ -479,6 +485,9 @@ class PipelineFactory:
                 VerifyXColdRetryCheck(),
                 ScoreCheck(),
                 _RENTAL_EGRESS_GUARD_IDLE,
+                # DAH-6466: the node's local s3fs plugin copy, so a Volume rental makes no registry round trip.
+                # A completion step (after the verdict, only with time for its whole bound): never scored time.
+                _S3FS_PLUGIN_COPY_SINGLETON,
                 FinalizeCheck(),
             ],
         )
@@ -618,6 +627,7 @@ class PipelineFactory:
                 VerifyXColdRetryCheck(),
                 ScoreCheck(),
                 _RENTAL_EGRESS_GUARD_IDLE,
+                _S3FS_PLUGIN_COPY_SINGLETON,
                 FinalizeCheck(),
             ],
         )

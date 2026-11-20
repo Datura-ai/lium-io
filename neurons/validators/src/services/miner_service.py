@@ -2342,6 +2342,14 @@ class MinerService:
                 )
                 # DAH-3019: one start report for the whole miner, as its executors are launched.
                 self.task_service.report_verification_started(payload, executors)
+                # an express recheck is cancelled at its deadline (job_timeout): every task step budgets against it,
+                # keeping the same tail the result needs as the stranded-pod rerun below (lium-io#2345 review)
+                task_deadline = (
+                    None
+                    if job_timeout is None
+                    else job_started_at + job_timeout - CYCLE_JOB_WAIT_SECONDS - PROBE_TAIL_MARGIN_SECONDS
+                )
+
                 def run(executor_info, timeout: float = settings.JOB_TIME_OUT - 120):
                     return asyncio.wait_for(
                         self.task_service.create_task(
@@ -2356,6 +2364,7 @@ class MinerService:
                             executor_image_snapshot=executor_image_snapshot,
                             attestation_nonce=attestation_nonce,
                             first_pass=first_pass,
+                            deadline_monotonic=task_deadline,
                         ),
                         timeout=timeout,
                     )

@@ -163,6 +163,7 @@ from services.image_flatten import (
     flatten_sized_mark_command,
     wait_for_node_flatten,
 )
+from services.s3fs_plugin_copy import s3fs_plugin_command
 from services.loopback_plugin_setup import (
     LOOPBACK_PLUGIN_BUILDS,
     current_loopback_plugin_alias,
@@ -364,9 +365,6 @@ DOCKER_VOLUME_PLUGINS = {
     "s3fs": "mochoa/s3fs-volume-plugin"
 }
 
-S3FS_PLUGIN_IMAGE = "mochoa/s3fs-volume-plugin"
-S3FS_PLUGIN_INSTALL_RETRIES = 2
-S3FS_PLUGIN_INSTALL_RETRY_WAIT_SECONDS = 5
 
 
 LEGACY_S3FS_PLUGIN_ALIAS = "s3fs"
@@ -8232,18 +8230,10 @@ class DockerService:
         volume_info: ExternalVolumeInfo,
         mount_options: str,
     ) -> list[asyncssh.SSHCompletedProcess]:
-        """Install and configure the plugin instance that serves this one volume."""
-        install_command: str = (
-            f"/usr/bin/docker plugin install {S3FS_PLUGIN_IMAGE} "
-            f"--alias {plugin_alias} --grant-all-permissions --disable"
-        )
-        # the install pulls the plugin from Docker Hub every time; one TLS timeout there failed the whole rental
-        install_result = await ssh_client.run(install_command)
-        for _ in range(S3FS_PLUGIN_INSTALL_RETRIES):
-            if install_result.exit_status == 0 or "already exists" in (install_result.stderr or ""):
-                break
-            await asyncio.sleep(S3FS_PLUGIN_INSTALL_RETRY_WAIT_SECONDS)
-            install_result = await ssh_client.run(install_command)
+        """Create the plugin instance that serves this one volume from the node's local plugin copy and configure it.
+
+        DAH-6466: no registry round trip here; only a node without the copy yet makes one, once."""
+        install_result = await ssh_client.run(s3fs_plugin_command(plugin_alias))
         commands: list[str] = [
             f"/usr/bin/docker plugin disable {plugin_alias} -f",
             # backend-sent keys and options: each assignment is one quoted word
