@@ -14,7 +14,7 @@ import pytest
 import pytest_asyncio
 from datura.requests.miner_requests import ExecutorSSHInfo
 
-from services.task.checks.node_account import NodeAccountCheck
+from services.task.checks.node_account import READ_NODE_ACCOUNT_COMMAND, NodeAccountCheck
 from tests.helpers import make_context
 
 IP_A, IP_B = "127.0.0.1", "127.0.0.2"
@@ -194,10 +194,7 @@ async def test_ip_node_is_refused_on_a_machine_set_up_for_another_account(files,
     if not result.passed:
         assert result.updates == {"node_account_passed": False, "clear_verified_job_info": True}
         assert "hostname" not in result.event.remediation
-    assert runner.commands == [
-        "printf 'hotkey=%s\\nclaim=%s\\n' \"$(cat /etc/liumd/miner_hotkey 2>/dev/null)\" "
-        "\"$(cat /etc/liumd/account_claim 2>/dev/null)\""
-    ]
+    assert runner.commands == [READ_NODE_ACCOUNT_COMMAND]  # its behaviour on real files: the test below
 
 
 @pytest.mark.parametrize(
@@ -626,3 +623,26 @@ async def test_a_portal_that_sends_no_notice_map_keeps_the_failed_read_enforced(
     monkeypatch.setattr("services.task.checks.node_account.has_live_rental", lambda ctx: False)
     result = await NodeAccountCheck().run(_relay_ctx(_HostFiles("", success=False), enforce=None))
     assert not result.passed and result.event.reason_code == "NODE_ACCOUNT_UNVERIFIED"
+
+
+@pytest.mark.parametrize(
+    ("setup", "ok", "output"),
+    [
+        ("missing", True, "hotkey=hk\nclaim=\n"),
+        ("empty", True, "hotkey=hk\nclaim=\n"),
+        ("unreadable", False, ""),
+    ],
+)
+def test_the_account_read_command_fails_only_on_an_unreadable_file(tmp_path, setup, ok, output):
+    """The real command under sh: a claim file that exists but cannot be read fails the read (NODE_ACCOUNT_UNVERIFIED
+    path) instead of reading as an empty claim; a missing or empty one still reads as no claim."""
+    (tmp_path / "miner_hotkey").write_text("hk\n")
+    claim = tmp_path / "account_claim"
+    if setup == "empty":
+        claim.write_text("")
+    elif setup == "unreadable":
+        claim.mkdir()  # cat fails on it even as root, as an I/O error would
+    command = READ_NODE_ACCOUNT_COMMAND.replace("/etc/liumd/", f"{tmp_path}/")
+    run = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
+    assert (run.returncode == 0) is ok
+    assert run.stdout == output
