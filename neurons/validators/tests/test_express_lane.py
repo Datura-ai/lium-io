@@ -1401,6 +1401,24 @@ async def test_a_recheck_whose_sessions_are_lost_keeps_its_runs_for_a_verdict(mo
     assert await harness.tick_and_settle() == 0
 
 
+def _keep_in(redis) -> dict:
+    """Back the validator's plain Redis reads and writes with a dict that outlives a restart."""
+    store: dict = {}
+    redis.get = AsyncMock(side_effect=lambda key: store.get(key))
+    redis.set = AsyncMock(side_effect=lambda key, value, *a, **k: store.__setitem__(key, value))
+    redis.delete = AsyncMock(side_effect=lambda key: store.pop(key, None))
+
+    async def write_atomically(writes):
+        for op in writes.ops:
+            if op.command == "set":
+                store[op.args[0]] = op.args[1]
+            else:
+                store.pop(op.args[0], None)
+
+    redis.write_atomically = AsyncMock(side_effect=write_atomically)
+    return store
+
+
 @pytest.mark.asyncio
 async def test_a_restart_between_retry_ticks_runs_the_pending_block(validator_with_mocks, create_neuron_info):
     """A tick that failed to read the due block's time leaves it pending; a restart before the next tick started from
@@ -1410,11 +1428,7 @@ async def test_a_restart_between_retry_ticks_runs_the_pending_block(validator_wi
     from core.validator import Validator
 
     n = settings.BLOCKS_FOR_JOB
-    store: dict = {}
-    redis = validator_with_mocks.redis_service
-    redis.get = AsyncMock(side_effect=lambda key: store.get(key))
-    redis.set = AsyncMock(side_effect=lambda key, value, *a, **k: store.__setitem__(key, value))
-    redis.delete = AsyncMock(side_effect=lambda key: store.pop(key, None))
+    store = _keep_in(validator_with_mocks.redis_service)
     validator = validator_with_mocks
     validator.subtensor_client.get_miners = AsyncMock(return_value=[create_neuron_info(1, "miner-a")])
     block = 14 * n  # 1050 with a 75-block interval
@@ -1442,6 +1456,126 @@ async def test_a_restart_between_retry_ticks_runs_the_pending_block(validator_wi
     assert (read, asked) == ([block + n], [f"time-of-{block + n}"])
 
 
+def _restarted(validator):
+    """A new process on the same Redis and chain: the accumulator is loaded as at startup, the throttle starts over."""
+    from core.validator import Validator
+
+    restarted = Validator()
+    for name in ("incentive", "redis_service", "subtensor_client", "file_encrypt_service", "miner_service",
+                 "express_lane", "backend_client"):
+        setattr(restarted, name, getattr(validator, name))
+    restarted.last_job_run_blocks = 0
+    return restarted
+
+
+@pytest.mark.asyncio
+async def test_a_pending_block_unread_at_startup_is_read_again_before_a_new_block_is_chosen(
+    validator_with_mocks, create_neuron_info
+):
+    """Review 4644806248: a Redis error on the startup read looked like no pending block, so the first tick chose the
+    block its height falls in and overwrote the one a previous run had kept."""
+    from core.config import settings
+
+    n = settings.BLOCKS_FOR_JOB
+    validator = validator_with_mocks
+    store = _keep_in(validator.redis_service)
+    validator.subtensor_client.get_miners = AsyncMock(return_value=[create_neuron_info(1, "miner-a")])
+    block = 14 * n  # 1050 with a 75-block interval
+    store["validator_pending_job_block"] = f"[{block}, {block + n - 1}]"
+    read_from_store = validator.redis_service.get.side_effect
+    failures = iter([TimeoutError("redis timeout")])
+
+    def flaky(key):
+        if key == "validator_pending_job_block" and (error := next(failures, None)):
+            raise error
+        return read_from_store(key)
+
+    validator.redis_service.get.side_effect = flaky
+    await validator.restore_pending_job()  # startup: the read times out
+    read, asked = await _run_ticks(validator, (block + n,), lambda b, attempt: True)  # 1125, Redis answers again
+    assert (read, asked) == ([block], [f"time-of-{block}"])
+
+
+@pytest.mark.asyncio
+async def test_a_failed_job_file_step_leaves_its_block_due_on_the_next_tick(validator_with_mocks, create_neuron_info):
+    """Review 4644806239: the throttle moved before the job files were prepared, so after an ordinary error there the
+    pending block waited a whole interval and expired unrun, unless the process restarted."""
+    from core.config import settings
+
+    n = settings.BLOCKS_FOR_JOB
+    validator = validator_with_mocks
+    _keep_in(validator.redis_service)
+    validator.subtensor_client.get_miners = AsyncMock(return_value=[create_neuron_info(1, "miner-a")])
+    block = 14 * n
+    encrypt = validator.file_encrypt_service.ecrypt_miner_job_files
+    validator.file_encrypt_service.ecrypt_miner_job_files = Mock(side_effect=OSError("disk full"))
+
+    read, asked = await _run_ticks(validator, (block + n - 1,), lambda b, attempt: True)  # 1124: job files fail
+    assert (read, asked) == ([block], [])
+    validator.file_encrypt_service.ecrypt_miner_job_files = encrypt
+    read, asked = await _run_ticks(validator, (block + n,), lambda b, attempt: True)  # 1125, same process
+    assert (read, asked) == ([block], [f"time-of-{block}"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart", ["before_checkpoint", "after_checkpoint"])
+async def test_a_restart_around_the_cycle_checkpoint_applies_the_cycle_once(
+    validator_with_mocks, create_neuron_info, restart, monkeypatch
+):
+    """Review 4644806228: the pending block was dropped when the wave ended, before the cycle was applied and its
+    report kept, so a restart in between lost the whole cycle. The block now stays pending until the accumulator with
+    the cycle in it and the drop are one write; a rerun of the same block applies it once."""
+    from core.config import settings
+
+    n = settings.BLOCKS_FOR_JOB
+    validator = validator_with_mocks
+    store = _keep_in(validator.redis_service)
+    validator.subtensor_client.get_miners = AsyncMock(return_value=[create_neuron_info(1, "miner-a")])
+    block = 14 * n
+    from core.validator import IncentiveFactory
+
+    build = IncentiveFactory.create
+
+    def scoring_miner_a(*args, **kwargs):  # each cycle gives miner-a 1.0, so a cycle applied twice shows
+        incentive = build(*args, **kwargs)
+        incentive.calculate_final_weights = AsyncMock(return_value={"miner-a": 1.0})
+        return incentive
+
+    monkeypatch.setattr(IncentiveFactory, "create", scoring_miner_a)
+    checkpoint = validator.redis_service.write_atomically
+    if restart == "before_checkpoint":
+        async def killed_at_the_checkpoint(writes):
+            if any(op.args[0] == "validator_pending_job_block" for op in writes.ops):
+                raise _Killed
+            await checkpoint(writes)
+
+        validator.redis_service.write_atomically = AsyncMock(side_effect=killed_at_the_checkpoint)
+        with pytest.raises(_Killed):
+            await _run_ticks(validator, (block + n - 1,), lambda b, attempt: True)  # 1124: wave run, then killed
+        assert store["validator_pending_job_block"] == f"[{block}, {block + n - 1}]"
+    else:
+        await _run_ticks(validator, (block + n - 1,), lambda b, attempt: True)
+        assert "validator_pending_job_block" not in store
+    applied_once = dict(validator.miner_scores)
+    assert applied_once == {"miner-a": 1.0} and validator.live_cycle_ids == [f"time-of-{block}"]
+
+    restarted = _restarted(validator)
+    restarted.redis_service.write_atomically = checkpoint
+    restarted.miner_scores = json.loads(store["miner_scores"])
+    restarted.live_cycle_ids = json.loads(store["settlement_live_cycle_ids"])
+    await restarted.restore_pending_job()
+    read, asked = await _run_ticks(restarted, (block + n,), lambda b, attempt: True)  # 1125, after the restart
+    if restart == "before_checkpoint":
+        assert asked == [f"time-of-{block}"]  # the same cycle runs again
+        assert restarted.miner_scores == applied_once  # and counts once
+        assert restarted.live_cycle_ids == [f"time-of-{block}"]
+    else:
+        assert asked == [f"time-of-{block + n}"]  # the next block, 1050 is done
+        assert restarted.miner_scores == {"miner-a": 2.0}
+        assert restarted.live_cycle_ids == [f"time-of-{block}", f"time-of-{block + n}"]
+    assert "validator_pending_job_block" not in store
+
+
 class _Killed(BaseException):
     """The process ending mid-tick: nothing after it runs, and no handler in sync() sees it."""
 
@@ -1464,11 +1598,7 @@ async def test_a_restart_after_the_blocks_time_was_read_but_before_its_wave_was_
     from core.validator import Validator
 
     n = settings.BLOCKS_FOR_JOB
-    store: dict = {}
-    redis = validator_with_mocks.redis_service
-    redis.get = AsyncMock(side_effect=lambda key: store.get(key))
-    redis.set = AsyncMock(side_effect=lambda key, value, *a, **k: store.__setitem__(key, value))
-    redis.delete = AsyncMock(side_effect=lambda key: store.pop(key, None))
+    store = _keep_in(validator_with_mocks.redis_service)
     validator = validator_with_mocks
     validator.subtensor_client.get_miners = AsyncMock(return_value=[create_neuron_info(1, "miner-a")])
     block = 14 * n  # 1050 with a 75-block interval

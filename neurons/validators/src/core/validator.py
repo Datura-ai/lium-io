@@ -51,6 +51,7 @@ from services.redis_service import (
     GPU_ESTIMATES_CHANNEL,
     PENDING_PODS_PREFIX,
     RedisService,
+    RedisWrites,
 )
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.pod_ssh_probe import attach_pod_ssh, pod_ssh_only_results, probe_rented_pods
@@ -155,8 +156,10 @@ class Validator:
         self.last_job_run_blocks = 0
         # The job block a due cycle chose and has not started yet (an early return below left it): the next tick runs
         # that block, not the one its own height falls in, so a block whose attempt failed is never skipped.
-        # a due cycle's job block and the height that first chose it, kept until that cycle starts or its turn passes
+        # a due cycle's job block and the height that first chose it, kept until its cycle is checkpointed
         self.pending_job: tuple[int, int] | None = None
+        # False until Redis answered for the kept pending block: a failed read is no proof that none was kept
+        self.pending_job_read = False
         self.default_extra = {}
         # DAH-2958: the current cycle's job files / digests / image snapshot, reused by the
         # express lane so its verifications are the cycle's pipeline. None before the first cycle.
@@ -338,11 +341,30 @@ class Validator:
                 )
             )
 
+    async def checkpoint_cycle(self) -> None:
+        """Keep the accumulator with this cycle in it and drop the pending block in one Redis write."""
+        self.pending_job = None
+        try:
+            await self.redis_service.write_atomically(
+                RedisWrites()
+                .set(MINER_SCORES_KEY, json.dumps(self.miner_scores))
+                .set(LIVE_CYCLE_IDS_KEY, json.dumps(self.live_cycle_ids))
+                .delete(PENDING_JOB_KEY)
+            )
+        except Exception as e:
+            logger.error(
+                _m(
+                    "[sync] failed to checkpoint the cycle",
+                    extra=get_extra_info({**self.default_extra, "error": str(e)}),
+                )
+            )
+
     async def restore_pending_job(self) -> None:
         """The due job block a previous run had not started (keep_pending_job). It is dropped by the same one-interval
         limit as before the restart, at the first tick."""
         try:
             raw = await self.redis_service.get(PENDING_JOB_KEY)
+            self.pending_job_read = True
             if raw:
                 job_block, chosen_at = json.loads(raw)
                 self.pending_job = (int(job_block), int(chosen_at))
@@ -467,7 +489,20 @@ class Validator:
             if (
                 cycle_asked_for_now
                 or current_block - self.last_job_run_blocks >= settings.BLOCKS_FOR_JOB
+                # a wave that failed after the throttle advanced is still owed (its one-interval limit applies below)
+                or self.pending_job is not None
             ):
+                if not self.pending_job_read:
+                    await self.restore_pending_job()
+                    if not self.pending_job_read:
+                        # choosing a block now could overwrite one a previous run kept; retried on the next tick
+                        logger.error(
+                            _m(
+                                "[sync] pending job block still unread; cycle not started",
+                                extra=get_extra_info(self.default_extra),
+                            )
+                        )
+                        return
                 # A failed attempt keeps its block for the following ticks, for one interval from the height that first
                 # chose it: by then the healthy schedule has moved to the next block, so a block the chain can no longer
                 # read (pruned state) never holds back the cycles after it.
@@ -647,10 +682,6 @@ class Validator:
                         done, pending = await asyncio.wait(jobs, timeout=settings.JOB_TIME_OUT - 50)
                     else:
                         done, pending = set(), set()
-                    # The block stops being pending only once its wave has run: a restart at any step before (after its
-                    # time was read, or before a request left) restores it and runs the wave again, within the same
-                    # one-interval limit and under the same cycle id, the block's own chain time.
-                    await self.keep_pending_job(None)
 
                     # Process completed jobs
                     for task in done:
@@ -855,20 +886,27 @@ class Validator:
                         for result in results:
                             result.scored_at = scored_at
 
-                    # PHASE 3: Accumulate scores with burning applied
-                    for miner_hotkey, score in cycle_scores.items():
-                        self.miner_scores[miner_hotkey] = self.miner_scores.get(miner_hotkey, 0) + score
-                    self.live_cycle_ids.append(job_batch_id)
+                    # PHASE 3: Accumulate scores with burning applied. A rerun of the same block (its wave ran but the
+                    # block was not yet checkpointed) carries the same cycle id and is applied once.
+                    if job_batch_id not in self.live_cycle_ids:
+                        for miner_hotkey, score in cycle_scores.items():
+                            self.miner_scores[miner_hotkey] = self.miner_scores.get(miner_hotkey, 0) + score
+                        self.live_cycle_ids.append(job_batch_id)
 
-                    if settings.SETTLEMENT_MODE != SETTLEMENT_OFF:
-                        await self.report_cycle_scores(
-                            cycle_scores,
-                            cycle_node_shares(incentive.job_results),
-                            self._settlement_burner(miners),
-                            job_batch_id,
-                            job_block,
-                            scored_at,
-                        )
+                    reported = settings.SETTLEMENT_MODE == SETTLEMENT_OFF or await self.report_cycle_scores(
+                        cycle_scores,
+                        cycle_node_shares(incentive.job_results),
+                        self._settlement_burner(miners),
+                        job_batch_id,
+                        job_block,
+                        scored_at,
+                    )
+                    # The block stops being pending only once its cycle is applied and its report kept or delivered: a
+                    # restart at any step before restores it and runs the cycle again, within the same one-interval
+                    # limit and under the same cycle id. The accumulator and the clear are one write, so a restart
+                    # sees either both or neither.
+                    if reported:
+                        await self.checkpoint_cycle()
 
                     # DAH-2748: a cycle where most nodes failed at the connect is our own
                     # outage, not theirs; reporting it would empty the market in one cycle.
@@ -1049,9 +1087,9 @@ class Validator:
         job_batch_id: str,
         job_block: int,
         scored_at: datetime,
-    ) -> None:
+    ) -> bool:
         """DAH-4001: hand the cycle's vector and per-node rows to the backend for delayed settlement. Never fails
-        the cycle.
+        the cycle. False when the report was neither kept nor delivered, so the cycle stays pending.
 
         A report the backend does not acknowledge is kept in Redis and replayed at every later cycle, so a
         backend outage delays a cycle's settlement instead of dropping its scores: under enforce nothing else
@@ -1065,7 +1103,7 @@ class Validator:
                     extra=get_extra_info({**self.default_extra, "cycle_id": job_batch_id}),
                 )
             )
-            return
+            return True
         # the id's own time (the job block's chain time): the backend keys the cycle's ledger rows, settlement and
         # attribution on it, and compares it with penalty hours
         try:
@@ -1085,7 +1123,8 @@ class Validator:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + SETTLEMENT_REPORTING_BUDGET_SECONDS
         # kept before any network wait: the budget below may cut a delivery off, and the replay then sends it
-        if not await self._keep_cycle_report(payload):
+        reported = await self._keep_cycle_report(payload)
+        if not reported:
             # Redis could not keep it, so this send is its only chance: before anything else that needs Redis
             try:
                 delivered = await asyncio.wait_for(
@@ -1093,10 +1132,11 @@ class Validator:
                 )
             except TimeoutError:
                 delivered = False
+            reported = delivered
             if not delivered:
                 logger.error(
                     _m(
-                        "[settlement] cycle report neither kept nor delivered; its scores are lost",
+                        "[settlement] cycle report neither kept nor delivered; the cycle stays pending",
                         extra=get_extra_info({**self.default_extra, "cycle_id": job_batch_id}),
                     )
                 )
@@ -1110,6 +1150,7 @@ class Validator:
                 )
             )
         await self._cap_kept_cycle_reports()
+        return reported
 
     async def _deliver_kept_settlement_reports(self) -> None:
         await self._retry_pending_inclusion()
