@@ -71,14 +71,24 @@ jobs:
           class TooMany(Exception):
               pass
 
-          def flat(steps):
+          class Unreadable(Exception):
+              """a file that exists but cannot be read as text: reported as not checkable, never skipped"""
+
+          def flat(steps, odd):
               """Each step and every step in a parallel group under it, at any depth: GitHub runs those children with the job's
-              permissions too."""
-              for step in steps if isinstance(steps, list) else []:
-                  if isinstance(step, dict):
-                      yield step
-                      group = step.get("parallel")
-                      yield from flat(group.get("steps") if isinstance(group, dict) else group)
+              permissions too. A steps value that is not a list of mappings goes to odd()."""
+              if steps is None:
+                  return
+              if not isinstance(steps, list):
+                  odd(f"steps {steps!r:.80}")
+                  return
+              for step in steps:
+                  if not isinstance(step, dict):
+                      odd(f"step {step!r:.80}")
+                      continue
+                  yield step
+                  group = step.get("parallel")
+                  yield from flat(group.get("steps") if isinstance(group, dict) else group, odd)
 
           def scan(files, fetch, own):
               """files: workflows and action manifests tracked at this commit. fetch(repo, path, sha) returns a file's text, or None
@@ -90,9 +100,14 @@ jobs:
                   if (repo, path, at) not in cache:
                       if repo is not None and sum(k[0] is not None for k in cache) >= MAX_FETCHES:
                           raise TooMany
-                      cache[(repo, path, at)] = fetch(repo, path, at)
+                      try:
+                          cache[(repo, path, at)] = fetch(repo, path, at)
+                      except Unreadable as e:
+                          cache[(repo, path, at)] = e  # it exists: a lookup finds it, and the scan reports it as not checkable
                   return cache[(repo, path, at)]
               bad, queue, seen = [], [(None, str(f), None, 0) for f in files], set()
+              # one rule for every input the scan cannot read or does not recognise: it fails as not checkable, never passes
+              odd = lambda what: bad.append(f"{where}: not checkable: {what}")
               try:
                   while queue:
                       repo, path, at, depth = queue.pop(0)
@@ -101,6 +116,9 @@ jobs:
                       seen.add((repo, path, at))
                       where = f"{repo}/{path}@{at}" if repo else path
                       text = get(repo, path, at)
+                      if isinstance(text, Unreadable):
+                          odd(text)
+                          continue
                       try:
                           doc = yaml.load(text, Loader=Loader) if text is not None else None
                       except Exception as e:
@@ -109,14 +127,27 @@ jobs:
                       if not isinstance(doc, dict):
                           bad.append(f"{where}: not a readable workflow or action manifest")
                           continue
-                      jobs = [j for j in (doc.get("jobs") or {}).values() if isinstance(j, dict)]
-                      runs = doc.get("runs") if isinstance(doc.get("runs"), dict) else {}
-                      steps = [step for job in jobs for step in flat(job.get("steps"))] + list(flat(runs.get("steps")))
+                      jobs, runs = doc.get("jobs"), doc.get("runs")
+                      if jobs is not None and not isinstance(jobs, dict):
+                          odd(f"jobs {jobs!r:.80}")
+                          jobs = None
+                      if runs is not None and not isinstance(runs, dict):
+                          odd(f"runs {runs!r:.80}")
+                          runs = None
+                      for name, job in (jobs or {}).items():
+                          if not isinstance(job, dict):
+                              odd(f"job {name} {job!r:.80}")
+                      jobs, runs = [j for j in (jobs or {}).values() if isinstance(j, dict)], runs or {}
+                      steps = [step for job in jobs for step in flat(job.get("steps"), odd)] + list(flat(runs.get("steps"), odd))
                       refs = [("job", job.get("uses")) for job in jobs] + [("step", step.get("uses")) for step in steps]
                       for level, ref in refs:
                           if ref is None:
                               continue
                           ref = str(ref)
+                          if "\\" in ref:
+                              # the runner and this scan would read a backslash differently, so the manifest checked may not be the one run
+                              odd(f"{ref}: a backslash in uses")
+                              continue
                           if ref.startswith(("./", "$/")):
                               # the file's own repository at the file's commit: this commit here, the pinned commit in a fetched file
                               p = posixpath.normpath(ref[2:])
@@ -130,7 +161,7 @@ jobs:
                                   # can change; $/ resolves at the running commit instead
                                   bad.append(f"{where}: {ref}: a step-level ./ action is not accepted, use $/{p}")
                               else:
-                                  man = next((n for n in (f"{p}/action.yml", f"{p}/action.yaml") if get(repo, n, at) is not None), None)
+                                  man = next((n for n in (posixpath.normpath(f"{p}/{n}") for n in ("action.yml", "action.yaml")) if get(repo, n, at) is not None), None)
                                   if man:
                                       queue.append((repo, man, at, depth))
                                   else:
@@ -165,11 +196,20 @@ jobs:
                           bad.append(f"{where}: runs.image {image}: docker://<image>@sha256:<digest> only")
                       # job containers and services start before the steps, with the job's token: digest only
                       for job in jobs:
-                          container = job.get("container")
+                          container, services = job.get("container"), job.get("services")
                           images = [container.get("image") if isinstance(container, dict) else container]
                           # a service is a mapping with image: or the image itself as a scalar; the runner accepts both
-                          images += [svc.get("image") if isinstance(svc, dict) else svc for svc in (job.get("services") or {}).values()]
-                          bad += [f"{where}: container/service image {img}" for img in images if img and not is_digest(img)]
+                          if isinstance(services, dict):
+                              images += [svc.get("image") if isinstance(svc, dict) else svc for svc in services.values()]
+                          elif services is not None:
+                              odd(f"services {services!r:.80}")
+                          for img in images:
+                              if img is None:
+                                  continue
+                              if not isinstance(img, str):
+                                  odd(f"container/service image {img!r:.80}")
+                              elif not is_digest(img):
+                                  bad.append(f"{where}: container/service image {img}")
               except TooMany:
                   bad.append(f"more than {MAX_FETCHES} pinned actions and workflows to read: not checked, so not accepted")
               return bad
@@ -183,6 +223,9 @@ jobs:
               (None, ".github/actions/ok/action.yml", None): comp + "    - uses: acme/act@" + sha + "\n",
               (None, ".github/actions/yaml/action.yaml", None): "runs: {}\n",
               (None, ".github/workflows/ok.yml", None): "on: push\n",
+              (None, "action.yml", None): comp + "    - uses: acme/act@" + sha + "\n",
+              (None, ".github/actions/bin/action.yml", None): Unreadable("not UTF-8"),
+              ("acme/bin", "action.yml", sha): Unreadable("not UTF-8"),
               ("acme/act", "action.yml", sha): node,
               ("actions/checkout", "action.yml", sha): node,
               ("acme/act", "action.yml", s2): comp + "    - uses: acme/leaf@v1\n",
@@ -250,10 +293,33 @@ jobs:
               # a scalar service image is checked like the mapping form
               "jobs:\n  a:\n    services:\n      db: postgres:16\n": 1,
               "jobs:\n  a:\n    services:\n      db: postgres" + dig + "\n": 0,
+              step("$/."): 0,  # the repository's root action
+              step("$/./"): 0,
+              # a value that is not an image string is not checkable, never skipped
+              "jobs:\n  a:\n    container: false\n": 1,
+              "jobs:\n  a:\n    container: 0\n": 1,
+              "jobs:\n  a:\n    container:\n      image: false\n": 1,
+              "jobs:\n  a:\n    services:\n      db: 0\n": 1,
+              "jobs:\n  a:\n    services:\n      db:\n        image: 0\n": 1,
+              "jobs:\n  a:\n    services: ${{ fromJSON(vars.S) }}\n": 1,
+              "jobs: x\n": 1,
+              "jobs:\n  a: x\n": 1,
+              "jobs:\n  a:\n    steps: x\n": 1,
+              "jobs:\n  a:\n    steps:\n      - x\n": 1,
+              step("$/.github/actions/bin"): 1,  # a manifest that is not text
+              step("acme/bin@" + sha): 1,
+              step("$/.\\sub"): 1,  # a backslash in a ref
+              step("$/x\\..\\sub"): 1,
+              step("$/sub\\"): 1,
           }
           for i, (text, want) in enumerate(cases.items()):
               tree = {**base, (None, f"w/case{i}.yml", None): text}
-              got = scan([f"w/case{i}.yml"], lambda r, p, at: tree.get((r, p, at)), "acme/self")
+              def tfetch(r, p, at):
+                  v = tree.get((r, p, at))
+                  if isinstance(v, Unreadable):
+                      raise v
+                  return v
+              got = scan([f"w/case{i}.yml"], tfetch, "acme/self")
               assert len(got) == want, (i, got)
 
           tracked = set(subprocess.run(["git", "ls-files", "-z"], capture_output=True, text=True, check=True).stdout.split("\0"))
@@ -265,7 +331,10 @@ jobs:
               p = root / path
               if any(q.is_symlink() for q in [p, *p.parents] if q != root and root in q.parents) or not p.resolve().is_relative_to(root):
                   sys.exit(f"{path}: a symlink in the tree; workflows and action manifests must be regular files")
-              return p.read_text()
+              try:
+                  return p.read_text()
+              except UnicodeDecodeError:
+                  raise Unreadable(f"{path} is not UTF-8 text") from None
 
           reads = []
           def fetch(repo, path, at):
@@ -281,7 +350,9 @@ jobs:
                   if e.code != 404:  # only a missing file may fall back (action.yml -> action.yaml); anything else fails the check
                       sys.exit(f"cannot read {repo}/{path}@{at}: HTTP {e.code}")
                   return None  # not found: the scan reports it, never skips it
-              except (urllib.error.URLError, UnicodeDecodeError, TimeoutError) as e:
+              except UnicodeDecodeError:
+                  raise Unreadable(f"{repo}/{path}@{at} is not UTF-8 text") from None
+              except (urllib.error.URLError, TimeoutError) as e:
                   sys.exit(f"cannot read {repo}/{path}@{at}: {e}")
 
           # every tracked action manifest, wherever it lives, and every workflow
