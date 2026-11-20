@@ -539,7 +539,7 @@ esac
 case "$op" in
   -L) [ -f "$STATE/$chain" ] || { echo "iptables: No chain/target/match by that name." >&2; exit 1; } ;;
   -S) echo "-N DOCKER-USER"; grep -v RETURN "$STATE/DOCKER-USER" | sed 's/^/-A DOCKER-USER -j /' ;;
-  -C) grep -qx "$4" "$STATE/$chain" ;;
+  -C) grep -qx "$4" "$STATE/$chain" 2>/dev/null || exit 1 ;;  # 1 is "no such rule", as iptables answers
   -D) grep -qx "$4" "$STATE/$chain" || exit 1
       awk -v c="$4" '$0 == c && !d { d = 1; next } 1' "$STATE/$chain" > "$STATE/t"; mv "$STATE/t" "$STATE/$chain" ;;
   -N) [ -f "$STATE/$chain" ] && exit 1; : > "$STATE/$chain" ;;
@@ -1178,14 +1178,16 @@ def _modelled_host(tmp_path, *, docker_user: bool, systemd: bool = True):
     return state, root, env
 
 
-def test_a_host_without_docker_user_gets_the_chain_and_a_forward_jump_not_a_skip(tmp_path):
-    state, root, env = _modelled_host(tmp_path, docker_user=False)
+@pytest.mark.parametrize("docker_user", [False, True])
+def test_docker_user_always_has_a_forward_jump_whoever_made_the_chain(tmp_path, docker_user):
+    """No chain: it is created and jumped to. A chain with no FORWARD jump (restored by a host firewall, or left by a
+    dockerd that does not manage iptables) gets the jump too, so the rules never sit where no traffic passes."""
+    state, root, env = _modelled_host(tmp_path, docker_user=docker_user)
+    script = link_local_drop_script("br-0123456789ab", [], str(root))
 
-    done = subprocess.run(
-        ["sh", "-c", link_local_drop_script("br-0123456789ab", [], str(root))], env=env, capture_output=True, text=True
-    )
-
-    assert done.returncode == 0, done.stderr
+    for _ in range(2):  # a second run keeps the one jump
+        done = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True)
+        assert done.returncode == 0, done.stderr
     assert (state / "FORWARD").read_text().split() == ["DOCKER-USER"]
     [(_, rules)] = _jumps_and_rules(state)
     assert rules == [f"-i br-0123456789ab -d {LINK_LOCAL_CIDR} -p {p} ! --dport 53 -j DROP" for p in ("tcp", "udp")]

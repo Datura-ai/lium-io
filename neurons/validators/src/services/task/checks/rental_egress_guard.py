@@ -195,16 +195,20 @@ _DETACH_OLD_JUMPS = (
 
 
 # No DOCKER-USER in any backend while an iptables answers: create it with the host's own ``iptables`` (the one dockerd
-# uses) and jump to it from FORWARD, so the rules always have a chain that forwarded traffic passes. A failed probe stays
-# an error (4); only a host without any iptables is 3.
+# uses). A failed probe stays an error (4); only a host without any iptables is 3. The FORWARD jump is then ensured on
+# every run, whoever made the chain: a chain restored by a host firewall, or kept by a dockerd that does not manage
+# iptables, can exist with nothing jumping to it, and its rules would see no forwarded traffic.
 _ENSURE_DOCKER_USER = (
     '[ -n "$IPT" ] || { [ -n "$ERRS" ] && { printf %s "$ERRS" >&2; exit 4; }; '
     'for B in iptables iptables-nft iptables-legacy; do $HOST_NS $B -L FORWARD -n >/dev/null 2>&1 && '
     '{ IPT="$HOST_NS $B"; break; }; done; '
     '[ -n "$IPT" ] || { echo "no iptables" >&2; exit 3; }; '
     "$IPT -N DOCKER-USER 2>/dev/null; "
-    '$IPT -L DOCKER-USER -n >/dev/null || { echo "DOCKER-USER not created" >&2; exit 4; }; '
-    "$IPT -C FORWARD -j DOCKER-USER 2>/dev/null || $IPT -I FORWARD -j DOCKER-USER || exit 4; }"
+    '$IPT -L DOCKER-USER -n >/dev/null || { echo "DOCKER-USER not created" >&2; exit 4; }; }; '
+    # 1 is "no such rule"; any other failed check is an error, never a reason to insert a second jump
+    '$IPT -C FORWARD -j DOCKER-USER 2>/dev/null; RC=$?; '
+    '[ $RC -eq 0 ] || { [ $RC -eq 1 ] && $IPT -I FORWARD -j DOCKER-USER; } || '
+    '{ echo "FORWARD jump to DOCKER-USER not ensured" >&2; exit 4; }'
 )
 
 
