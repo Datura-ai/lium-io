@@ -1,8 +1,10 @@
 #!/bin/bash
 set -eux -o pipefail
 
-# the prod backend must read every message this validator sends (protocol_release_gate.py)
-python3 ./protocol_release_gate.py
+# a prod release (TAG=latest) must speak no newer protocol than the prod backend reads; dev builds are not gated
+if [ "$TAG" = "latest" ]; then
+  python3 ./protocol_release_gate.py
+fi
 
 IMAGE_NAME="daturaai/compute-subnet-validator:$TAG"
 
