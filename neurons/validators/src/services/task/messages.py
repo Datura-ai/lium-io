@@ -909,7 +909,7 @@ class ExecutorImageMessages:
         reason="EXECUTOR_IMAGE_OUTDATED",
         severity="error",
         category="policy",
-        impact="Score set to 0 until the image is current",
+        impact="Free node: validation failed, off the rent list until the image is current",
     )
     UNOFFICIAL = MessageTemplate(
         event="Executor is not an official build",
@@ -917,14 +917,6 @@ class ExecutorImageMessages:
         severity="error",
         category="policy",
         impact="Score set to 0 until the node runs the official executor image",
-    )
-    # Same reason code as OUTDATED so log queries keep matching; severity says it is not scored.
-    OUTDATED_WARNING = MessageTemplate(
-        event="Executor image is outdated",
-        reason="EXECUTOR_IMAGE_OUTDATED",
-        severity="warning",
-        category="policy",
-        impact="Warning only until EXECUTOR_IMAGE_CHECK_ENFORCE is on: score and incentive unchanged",
     )
 
 

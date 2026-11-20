@@ -1,21 +1,10 @@
 from unittest.mock import AsyncMock
 
 import pytest
-from core.config import settings
 from datura.requests.miner_requests import ExecutorSSHInfo
 from incentive.config import IncentiveConfig
 from incentive.rental_price import RentalPriceIncentive
 from services.task.models import JobResult
-
-
-@pytest.fixture
-def enforce(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", True)
-
-
-@pytest.fixture
-def warn_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", False)
 
 
 def failed_idle_result() -> JobResult:
@@ -43,22 +32,29 @@ def failed_idle_result() -> JobResult:
     )
 
 
-@pytest.mark.asyncio
-async def test_rented_outdated_executor_keeps_job_result_but_gets_zero_mining_score(enforce):
+def _rented(status: str) -> JobResult:
     result = failed_idle_result().model_copy(
-        update={
-            "job_score": 1.0,
-            "is_rented": True,
-            "gpu_model": "NVIDIA H200",
-            "gpu_count": 8,
-        }
+        update={"job_score": 1.0, "is_rented": True, "gpu_model": "NVIDIA H200", "gpu_count": 8}
     )
-    incentive = RentalPriceIncentive(
-        IncentiveConfig(),
-        AsyncMock(),
-        {"miner": [result]},
-        {"NVIDIA H200": 8},
-    )
+    result.executor_image_report = {**result.executor_image_report, "status": status}
+    return result
+
+
+@pytest.mark.asyncio
+async def test_rented_outdated_executor_keeps_its_incentive():
+    # DAH-6845: an old image never costs a renter's node its share; it leaves the rent list once free
+    result = _rented("OUTDATED")
+    incentive = RentalPriceIncentive(IncentiveConfig(), AsyncMock(), {"miner": [result]}, {"NVIDIA H200": 8})
+
+    await incentive._pre_process_job_result("miner", result)
+
+    assert "outdated_executor_image" not in [r.reason for r in result.zero_incentive_reasons]
+
+
+@pytest.mark.asyncio
+async def test_rented_unofficial_executor_keeps_job_result_but_gets_zero_mining_score():
+    result = _rented("UNOFFICIAL")
+    incentive = RentalPriceIncentive(IncentiveConfig(), AsyncMock(), {"miner": [result]}, {"NVIDIA H200": 8})
 
     await incentive._pre_process_job_result("miner", result)
 

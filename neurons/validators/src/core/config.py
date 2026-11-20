@@ -632,12 +632,6 @@ class Settings(BaseSettings):
         env="EXECUTOR_IMAGE_REF",
         default="daturaai/compute-subnet-executor:latest",
     )
-    # DAH-2701 compares the executor container's image digest with EXECUTOR_IMAGE_REF's.
-    # False (default): an OUTDATED verdict is logged with both digests and the score, the
-    # incentive and the validation result are unchanged. True: an idle OUTDATED executor fails
-    # validation and every OUTDATED executor earns 0. Off until nodes auto-update again
-    # (DAH-3419): with Watchtower stalled, 99 executors earned 0 for it in one hour on 11 Sep.
-    EXECUTOR_IMAGE_CHECK_ENFORCE: bool = Field(env="EXECUTOR_IMAGE_CHECK_ENFORCE", default=False)
     # DAH-5936: an executor digest absent from EXECUTOR_IMAGE_REF's repository is logged as an unofficial build
     # every cycle (EXECUTOR_BUILD lines). Off (default): no consequence, the node is judged as OUTDATED is.
     # On: UNOFFICIAL fails an idle node, and a rented one keeps its rental at score 0, out of both incentive pools.

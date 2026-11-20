@@ -82,12 +82,10 @@ def build_expected_image_snapshot(digest: str | None) -> ExpectedImageSnapshot:
     return ExpectedImageSnapshot(executor=executor, executor_ref=ref)
 
 
-def outdated_image_remediation(expected_ref: str, *, enforced: bool) -> str:
+def outdated_image_remediation(expected_ref: str) -> str:
     consequence = (
-        "The node earns no incentive until the executor image matches the current release."
-        if enforced
-        else "Incentive is unchanged for now: the image check is a warning until "
-        "EXECUTOR_IMAGE_CHECK_ENFORCE is on."
+        "While the node is free it fails validation, earns nothing and is off the rent list until the executor "
+        "image matches the current release; a rented node keeps its rental and incentive."
     )
     return (
         f"This node is not running the current {expected_ref} image. "
