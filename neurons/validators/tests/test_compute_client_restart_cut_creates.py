@@ -49,7 +49,9 @@ class _FakeRedis(FakeRedis):
             claim, value = field, expected
             if await self.get(key) != claim:
                 return 0
-            return await (self.set(key, value, ex=ttl) if value else self.delete(key))
+            if not value:
+                return await self.delete(key)
+            return await (self.set(key, value, ex=ttl) if ttl else self.set(key, value, keepttl=True))
         # HDEL the field only while it still holds `expected`
         assert "HDEL" in script and numkeys == 1
         if await self.hget(key, field) != expected:

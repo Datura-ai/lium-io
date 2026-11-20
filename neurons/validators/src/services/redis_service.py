@@ -309,8 +309,12 @@ class _CommandLock:
 class BackendCommand(BaseModel):
     state: Literal["running", "finished"]
     owner: str = ""
-    # a create's claim outlives a connector restart: the restart sweep releases only the ones it asks to be resent
+    # a create's record never expires on its own: the backend may resend a create for as long as the pod is pending, so
+    # only its receipt or a delete of the pod on that node (settle_backend_command*) starts the answer's lifetime, and a
+    # connector restart releases only the claims of creates it asks to be resent
     create: bool = False
+    pod_id: str = ""
+    executor_id: str = ""
     responses: list[str] = []
 
 
@@ -1216,12 +1220,12 @@ class RedisService:
         await self.remove_unacked_container_created(pod_id, saved)
 
     async def claim_backend_command(
-        self, command_id: str, claim: str, ttl: int | None = None
+        self, command_id: str, claim: str, persist: bool = False
     ) -> BackendCommand | None:
         key = f"{BACKEND_COMMAND_PREFIX}{command_id}"
         while True:
             if await self.redis.set(
-                key, claim, nx=True, ex=ttl or settings.BACKEND_COMMAND_CLAIM_TTL_SECONDS
+                key, claim, nx=True, ex=None if persist else settings.BACKEND_COMMAND_CLAIM_TTL_SECONDS
             ):
                 return None
             existing = await self.redis.get(key)
@@ -1231,27 +1235,32 @@ class RedisService:
                 return None if existing == BackendCommand.model_validate_json(claim) else existing
 
     async def settle_backend_command(self, command_id: str, ttl: int) -> None:
-        """A finished command's answer now expires in `ttl` (a running claim is left alone)."""
-        key = f"{BACKEND_COMMAND_PREFIX}{command_id}"
-        stored = await self.redis.get(key)
-        if stored is None:
-            return
-        try:
-            running = BackendCommand.model_validate_json(stored).state != "finished"
-        except ValueError:
-            running = False   # an unreadable answer goes like a readable one
-        if not running:
-            await self.redis.expire(key, ttl)
+        """The command's record now expires in `ttl`: the backend has the outcome and will not resend it."""
+        await self.redis.expire(f"{BACKEND_COMMAND_PREFIX}{command_id}", ttl)
+
+    async def settle_backend_creates_of_pod(self, pod_id: str, executor_id: str, ttl: int) -> None:
+        """A delete of the pod on that node cancels its creates: the backend never resends one of them."""
+        async for key in self.redis.scan_iter(match=f"{BACKEND_COMMAND_PREFIX}*", count=100):
+            value = await self.redis.get(key)
+            if value is None:
+                continue
+            command = BackendCommand.model_validate_json(value)
+            if command.create and command.pod_id == pod_id and command.executor_id == executor_id:
+                await self.redis.expire(key, ttl)
 
     async def update_backend_command(
         self, command_id: str, claim: str, value: str, ttl: int
     ) -> None:
+        """ttl 0 keeps the key's lifetime (none for a create, unless its receipt or a delete already set one)."""
         # Compare ownership atomically: a stale job must not touch a retry's claim.
         await self.redis.eval(
             """
             if redis.call('GET', KEYS[1]) == ARGV[1] then
                 if ARGV[2] == '' then
                     return redis.call('DEL', KEYS[1])
+                end
+                if ARGV[3] == '0' then
+                    return redis.call('SET', KEYS[1], ARGV[2], 'KEEPTTL')
                 end
                 return redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
             end

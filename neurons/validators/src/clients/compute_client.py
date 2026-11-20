@@ -1075,13 +1075,18 @@ class ComputeClient:
         command_id = job_request.command_id
         redis_service = self.miner_service.redis_service
         create = isinstance(job_request, ContainerCreateRequest)
-        claim = BackendCommand(state="running", owner=uuid4().hex, create=create).model_dump_json()
+        record = BackendCommand(
+            state="running",
+            owner=uuid4().hex,
+            create=create,
+            pod_id=job_request.pod_id if create else "",
+            executor_id=job_request.executor_id if create else "",
+        )
+        claim = record.model_dump_json()
         try:
-            # a create's claim lasts as long as its answer may be needed: with Redis or the heartbeat unavailable, a
-            # 60-second claim would expire while the create's outcome is unknown and let a re-send run it again
-            existing = await redis_service.claim_backend_command(
-                command_id, claim, settings.BACKEND_CREATE_ANSWER_MAX_SECONDS if create else None
-            )
+            # a create's record lasts until the backend cannot resend it (its receipt or a delete of the pod): any
+            # lifetime of its own, a claim's or an answer's, would end while a same-ID resend can still arrive
+            existing = await redis_service.claim_backend_command(command_id, claim, persist=create)
         except Exception:
             logger.exception(_m(
                 "Backend command dedup failed open",
@@ -1111,11 +1116,11 @@ class ComputeClient:
                     await heartbeat
             # A failure without any answer releases the claim so a retry can run.
             value = (
-                BackendCommand(state="finished", responses=responses).model_dump_json()
+                record.model_copy(update={"state": "finished", "owner": "", "responses": responses}).model_dump_json()
                 if succeeded or responses
                 else ""
             )
-            ttl = settings.BACKEND_CREATE_ANSWER_MAX_SECONDS if create else settings.BACKEND_COMMAND_ANSWER_TTL_SECONDS
+            ttl = 0 if create else settings.BACKEND_COMMAND_ANSWER_TTL_SECONDS
             # until the outcome is written a re-send is only ignored, never answered; the write compares the claim,
             # so once the claim is gone (released or expired) it is a no-op and the loop ends
             while True:
@@ -1194,6 +1199,12 @@ class ComputeClient:
             if inflight_creates.is_running(job_request.pod_id, executor):
                 self.deleted_pod_ids.add((job_request.pod_id, executor))
             await self._retire_backend_create_records_of_pod(job_request.pod_id, executor)
+            try:
+                await self.miner_service.redis_service.settle_backend_creates_of_pod(
+                    job_request.pod_id, job_request.executor_id, settings.BACKEND_COMMAND_ANSWER_TTL_SECONDS
+                )
+            except Exception:  # its record then stays: a resend is still answered, never run again
+                logger.exception("Failed to settle the creates of a deleted pod: %s", job_request.pod_id)
         if not isinstance(job_request, ContainerCreateRequest):
             return await self._drive_miner_job(job_request)
         executor = executor_key(job_request)

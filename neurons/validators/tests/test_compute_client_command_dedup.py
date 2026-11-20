@@ -13,6 +13,7 @@ from payload_models.payloads import (
     ExecutorRentFinishedRequest,
     ContainerCreateRequest,
     ContainerCreated,
+    ContainerDeleteRequest,
     FailedContainerErrorCodes,
     FailedContainerErrorTypes,
     FailedContainerRequest,
@@ -38,7 +39,7 @@ class FakeRedis:
     async def set(self, key, value, *, nx=False, ex):
         if nx and await self.get(key) is not None:
             return False
-        self.values[key] = (value, self.now + ex)
+        self.values[key] = (value, float("inf") if ex is None else self.now + ex)
         return True
 
     async def delete(self, key):
@@ -54,7 +55,9 @@ class FakeRedis:
             self.fail_refresh = False
             raise ConnectionError("heartbeat unavailable")
         if await self.get(key) == claim:
-            if value:
+            if value and not ttl:   # KEEPTTL
+                self.values[key] = (value, self.values[key][1])
+            elif value:
                 await self.set(key, value, ex=ttl)
             else:
                 await self.delete(key)
@@ -150,11 +153,8 @@ async def test_create_duplicates_during_and_after_long_job(client, caplog):
     await client.miner_driver(request())
     assert client.miner_service.handle_container.await_count == 1
     assert client.message_queue == [response, response]
-    # a create's answer outlives the backend's same-id resends (until its receipt, at most the create bound)
-    assert redis.values[BACKEND_COMMAND_PREFIX + "command"][1] == redis.now + settings.BACKEND_CREATE_ANSWER_MAX_SECONDS
-    redis.now += settings.BACKEND_CREATE_ANSWER_MAX_SECONDS + 1
-    await client.miner_driver(request())
-    assert client.miner_service.handle_container.await_count == 2
+    # a create's answer outlives every same-ID resend: it only expires once its receipt or a delete says none can come
+    assert redis.values[BACKEND_COMMAND_PREFIX + "command"][1] == float("inf")
 
 
 @pytest.mark.asyncio
@@ -504,12 +504,12 @@ async def test_a_create_resent_after_an_outage_outlasting_the_answer_ttl_replays
 @pytest.mark.asyncio
 async def test_the_receipt_ends_a_create_answer_like_any_other(client, monkeypatch):
     """Once the backend's receipt for the create arrives it never resends that command id: the answer then expires
-    with the ordinary TTL instead of the create bound."""
+    with the ordinary TTL."""
     service = client.miner_service.redis_service
     monkeypatch.setattr(service, "remove_pending_pod", AsyncMock())   # the receipt's pending-mark side, tested elsewhere
     await client.miner_driver(request())
     key = BACKEND_COMMAND_PREFIX + "command"
-    assert service.redis.values[key][1] == service.redis.now + settings.BACKEND_CREATE_ANSWER_MAX_SECONDS
+    assert service.redis.values[key][1] == float("inf")
 
     await client.miner_driver(ExecutorRentFinishedRequest(
         miner_hotkey="miner", executor_id="executor", pod_id="pod", create_command_id="command", command_id="receipt"
@@ -545,3 +545,29 @@ async def test_a_create_whose_finish_write_is_lost_is_never_run_again_by_a_resen
     assert client.miner_service.handle_container.await_count == 1
     assert client.message_queue == [response, response]
 
+
+
+@pytest.mark.asyncio
+async def test_a_create_resent_long_after_any_bound_still_replays_until_a_receipt_or_delete(client, monkeypatch):
+    """A pod whose create got no answer can stay pending (and be resent) far past any fixed bound: the answer stays
+    until a delete of the pod on that node, then expires with the ordinary TTL, and a later run is a new create."""
+    service = client.miner_service.redis_service
+    await client.miner_driver(request())
+    [first] = list(client.message_queue)
+    service.redis.now += 10 * 365 * 24 * 3600
+    await client.miner_driver(request())
+    assert client.miner_service.handle_container.await_count == 1
+    assert list(client.message_queue) == [first, first]
+    monkeypatch.setattr(client, "_drive_miner_job", AsyncMock())   # the delete itself is tested elsewhere
+    monkeypatch.setattr(client, "_retire_backend_create_records_of_pod", AsyncMock())
+
+    other_node = ContainerDeleteRequest(
+        miner_hotkey="miner", executor_id="moved-from", pod_id="pod", command_id="d1", container_name="c", volume_name="v"
+    )
+    await client.miner_driver(other_node)   # a delete on another node is not this create's cancellation
+    assert service.redis.values[BACKEND_COMMAND_PREFIX + "command"][1] == float("inf")
+    await client.miner_driver(
+        ContainerDeleteRequest(miner_hotkey="miner", executor_id="executor", pod_id="pod", command_id="d2", container_name="c", volume_name="v")
+    )
+    key = BACKEND_COMMAND_PREFIX + "command"
+    assert service.redis.values[key][1] == service.redis.now + settings.BACKEND_COMMAND_ANSWER_TTL_SECONDS
