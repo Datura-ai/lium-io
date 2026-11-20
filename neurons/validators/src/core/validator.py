@@ -551,7 +551,6 @@ class Validator:
                 # a block run late (after a failed attempt) counts as run at the height that first chose it, so the next
                 # job block is due exactly when it would have been had the first attempt run
                 self.last_job_run_blocks = chosen_at
-                await self.keep_pending_job(None)
                 if cycle_asked_for_now:
                     # Cleared here and not at the read: every return above this line means no
                     # cycle started, and the operator's request must survive to the next tick.
@@ -638,6 +637,9 @@ class Validator:
                         "miner_port": miner.axon_info.port,
                         "job_batch_id": job_batch_id,
                     }
+                # the block stops being pending only once its wave is sent: a restart at any step above (after its time
+                # was read) restores it and runs its wave, within the same one-interval limit
+                await self.keep_pending_job(None)
 
                 try:
                     all_job_results = {}

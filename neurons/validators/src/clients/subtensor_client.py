@@ -1108,9 +1108,9 @@ class SubtensorClient:
                 timestamp = _storage_at(node, block_hash, "Timestamp", "Now")
                 timestamp_ms = int.from_bytes(timestamp, "little") if timestamp else 0
                 if timestamp_ms <= 0:
-                    # an unset or zero value is no answer, never a 1970 cycle id that would settle the block a second
-                    # time next to its real one
-                    raise LookupError(f"no timestamp for block {block}")
+                    # every finalized block has a timestamp, so an unset or zero one is a failed read of this endpoint:
+                    # the read moves to the next one, and it is never a 1970 cycle id
+                    raise ConnectionError(f"no timestamp for block {block}")
                 return datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC).strftime("%Y-%m-%d %H:%M:%S")
             except Exception as e:
                 logger.error(

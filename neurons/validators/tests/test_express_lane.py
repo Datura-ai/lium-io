@@ -1438,3 +1438,44 @@ async def test_a_restart_between_retry_ticks_runs_the_pending_block(validator_wi
     await late.restore_pending_job()
     read, asked = await _run_ticks(late, (block + 2 * n - 1,), lambda b, attempt: True)  # past its one interval
     assert (read, asked) == ([block + n], [f"time-of-{block + n}"])
+
+
+class _Killed(BaseException):
+    """The process ending mid-tick: nothing after it runs, and no handler in sync() sees it."""
+
+
+@pytest.mark.asyncio
+async def test_a_restart_after_the_blocks_time_was_read_but_before_its_wave_was_sent_runs_that_wave(
+    validator_with_mocks, create_neuron_info
+):
+    """Review on 34557fb: the pending block left Redis as soon as its time was read, before any miner was asked, so a
+    restart in between started from nothing and block 1050's wave never ran. It stays pending until its wave is sent."""
+    from core.config import settings
+    from core.validator import Validator
+
+    n = settings.BLOCKS_FOR_JOB
+    store: dict = {}
+    redis = validator_with_mocks.redis_service
+    redis.get = AsyncMock(side_effect=lambda key: store.get(key))
+    redis.set = AsyncMock(side_effect=lambda key, value, *a, **k: store.__setitem__(key, value))
+    redis.delete = AsyncMock(side_effect=lambda key: store.pop(key, None))
+    validator = validator_with_mocks
+    validator.subtensor_client.get_miners = AsyncMock(return_value=[create_neuron_info(1, "miner-a")])
+    block = 14 * n  # 1050 with a 75-block interval
+    encrypt = validator.file_encrypt_service.ecrypt_miner_job_files
+    validator.file_encrypt_service.ecrypt_miner_job_files = Mock(side_effect=_Killed)  # the wave's files: before it is sent
+
+    with pytest.raises(_Killed):
+        await _run_ticks(validator, (block + n - 1,), lambda b, attempt: True)  # 1124: 1050's time is read
+    assert store["validator_pending_job_block"] == f"[{block}, {block + n - 1}]"
+
+    restarted = Validator()
+    for name in ("incentive", "redis_service", "subtensor_client", "file_encrypt_service", "miner_service",
+                 "express_lane", "backend_client"):
+        setattr(restarted, name, getattr(validator, name))
+    restarted.file_encrypt_service.ecrypt_miner_job_files = encrypt
+    restarted.last_job_run_blocks = 0
+    await restarted.restore_pending_job()
+    read, asked = await _run_ticks(restarted, (block + n,), lambda b, attempt: True)  # 1125, after the restart
+    assert (read, asked) == ([block], [f"time-of-{block}"])
+    assert "validator_pending_job_block" not in store  # its wave was sent

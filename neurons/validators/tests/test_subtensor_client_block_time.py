@@ -201,3 +201,21 @@ async def test_an_endpoint_that_fails_a_storage_read_is_left_for_the_fallback(it
 
     assert await SubtensorClient.get_time_from_block(client, BLOCK) == "2026-11-19 18:52:38"
     client._switch_endpoint_after_read_failure.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unset", [None, "0x" + "00" * 8])
+async def test_an_endpoint_that_keeps_answering_no_timestamp_is_left_for_the_fallback(unset):
+    """Every finalized block has a timestamp; an endpoint that answers none (null or zero, without an error object)
+    is failing the read, so the read moves to the fallback instead of retrying it until no cycle runs."""
+    primary = _Chain(CHAIN, _hash(f"a{BLOCK + 2}"))
+    real = primary.storage
+    primary.storage = lambda key, at: {"result": unset} if key == TIMESTAMP_NOW else real(key, at)
+    fallback = _Chain(CHAIN, _hash(f"a{BLOCK + 2}"))
+    client = _client(primary)
+    client._switch_endpoint_after_read_failure.side_effect = lambda error: setattr(
+        client.get_node, "return_value", fallback
+    )
+
+    assert await SubtensorClient.get_time_from_block(client, BLOCK) == "2026-11-19 18:52:38"
+    client._switch_endpoint_after_read_failure.assert_called_once()
