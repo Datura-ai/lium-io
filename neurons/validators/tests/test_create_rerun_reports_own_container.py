@@ -25,6 +25,8 @@ class _Node:
     def __init__(self):
         self.files: dict[str, str] = {}
         self.container: tuple[bool, str] | None = None
+        # None: Docker answers. "docker": the listing exits non-zero. "ssh": the command cannot be run
+        self.unavailable: str | None = None
 
     def wrap(self, ssh_client):
         inner = ssh_client.run.side_effect
@@ -35,9 +37,15 @@ class _Node:
                 self.files[parts[-1]] = parts[parts.index("printf") + 2]
                 return _ssh_result(exit_status=0)
             if _CREATE_RECORD_STATE_MARK in cmd:
+                if self.unavailable == "ssh":
+                    raise OSError("connection lost")
                 path = next(p for p in self.files) if self.files else ""
-                state = f"{str(self.container[0]).lower()} {self.container[1]}" if self.container else ""
-                return _ssh_result(exit_status=0, stdout=f"{self.files.get(path, '')}\n{_CREATE_RECORD_STATE_MARK}\n{state}\n")
+                running = "running" if self.container and self.container[0] else "exited"
+                state = f"{running} {self.container[1]}" if self.container and not self.unavailable else ""
+                return _ssh_result(
+                    exit_status=1 if self.unavailable == "docker" else 0,
+                    stdout=f"{self.files.get(path, '')}\n{_CREATE_RECORD_STATE_MARK}\n{state}\n",
+                )
             return inner(cmd, *args, **kwargs)
 
         ssh_client.run = AsyncMock(side_effect=run)
@@ -107,4 +115,31 @@ async def test_a_rerun_never_removes_its_own_container_without_a_readable_reply(
 
     assert again is None
     assert len(specs) == 1   # no second container
+    cleanup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unavailable", ["ssh", "docker"])
+async def test_a_rerun_never_replaces_a_container_the_node_could_not_be_asked_about(svc, monkeypatch, unavailable):
+    """The node could not say whether this command's container is there (SSH failed, or Docker could not list it): the
+    rerun answers nothing and never reaches the replacement path, as for a container it found without a reply."""
+    node = _Node()
+    ssh_client = node.wrap(_ssh_client(inspect_exit=0))
+    _patch_happy(svc, monkeypatch, ssh_client)
+    specs = []
+    build = svc._build_rental_container_run_spec
+    monkeypatch.setattr(svc, "_build_rental_container_run_spec", lambda **kw: specs.append(build(**kw)) or specs[-1])
+    payload = _payload(command_id="cmd-1")
+    first = await _create(svc, payload, ssh_client)
+    assert isinstance(first, ContainerCreated)
+    node.files.clear()
+    node.container = (True, "cmd-1")
+    node.unavailable = unavailable
+    cleanup = AsyncMock()
+    monkeypatch.setattr(svc, "clean_existing_containers", cleanup)
+
+    again = await _create(svc, payload, ssh_client)
+
+    assert again is None
+    assert len(specs) == 1
     cleanup.assert_not_awaited()

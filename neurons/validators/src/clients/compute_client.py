@@ -151,6 +151,9 @@ command_responses: ContextVar[list[str] | None] = ContextVar("command_responses"
 deferred_create_retirements: ContextVar[list[tuple[str, str]] | None] = ContextVar(
     "deferred_create_retirements", default=None
 )
+# set by a create run under a command claim when the node holds this command's container but its outcome cannot be
+# read: miner_driver then keeps the record as an unknown outcome instead of a finished, empty answer
+create_outcome_unknown: ContextVar[list[bool] | None] = ContextVar("create_outcome_unknown", default=None)
 
 
 # lium-io#1952: retries of a create's dispatch record that failed in the receive loop, before the create gives up
@@ -1106,11 +1109,20 @@ class ComputeClient:
                 # resends a pending create under the same command ID, which the record settles once it can be read
                 return
             return await self._run_miner_job(job_request)
+        if existing is not None and existing.state == "finished" and existing.unknown:
+            # its outcome was never known: this resend re-checks the node under a claim that keeps the mark, so a
+            # restart meanwhile still sees an unknown outcome and a concurrent resend is ignored as a running one
+            record = record.model_copy(update={"unknown": True})
+            if not await redis_service.take_over_backend_command(command_id, existing.model_dump_json(), record.model_dump_json()):
+                return None
+            claim, existing = record.model_dump_json(), None
         if existing is not None:
             return await self._handle_backend_command_duplicate(job_request, existing)
 
         responses: list[str] = []
         token = command_responses.set(responses)
+        unknown_flags: list[bool] = []
+        unknown_token = create_outcome_unknown.set(unknown_flags if create else None)
         retirements: list[tuple[str, str]] = []
         retirements_token = deferred_create_retirements.set(retirements if create else None)
         heartbeat = None if create else asyncio.create_task(self._refresh_backend_command(command_id, claim))
@@ -1121,23 +1133,29 @@ class ComputeClient:
             return result
         finally:
             command_responses.reset(token)
+            create_outcome_unknown.reset(unknown_token)
             deferred_create_retirements.reset(retirements_token)
             if heartbeat is not None:
                 heartbeat.cancel()
                 with suppress(asyncio.CancelledError):
                     await heartbeat
-            # A failure without any answer releases the claim so a retry can run.
+            # A failure without any answer releases the claim so a retry can run; a create whose container may be on
+            # the node with no known outcome (found so now, or so before and not answered by this re-check) is kept as
+            # unknown instead, so the restart report never fails its pod (fail_creates_cut_off_by_restart)
+            unknown = bool(unknown_flags) or (record.unknown and not responses)
             value = (
-                record.model_copy(update={"state": "finished", "owner": "", "responses": responses}).model_dump_json()
-                if succeeded or responses
+                record.model_copy(
+                    update={"state": "finished", "owner": "", "responses": responses, "unknown": unknown}
+                ).model_dump_json()
+                if succeeded or responses or unknown
                 else ""
             )
             # only a create that made a container is kept until its receipt or a delete: a re-run would replace it.
             # A failed one is answered like any command: the backend gets no receipt for it, and a later re-run of a
             # create that made nothing is the retry the backend asked for
-            kept = create and any(
+            kept = create and (unknown or any(
                 json.loads(raw).get("message_type") == ContainerResponseType.ContainerCreated.value for raw in responses
-            )
+            ))
             ttl = 0 if kept else settings.BACKEND_COMMAND_ANSWER_TTL_SECONDS
             # A create's outcome is retried until written: until then a resend is only ignored, never answered, and
             # its in-flight record stays (retired below). The write compares the claim, so once the claim is gone it is
@@ -1317,7 +1335,9 @@ class ComputeClient:
         redis_service = self.miner_service.redis_service
         try:
             # a filler's flag is already cleared here: the backend sends it no rent-finished
-            if await redis_service.renting_in_progress(created.miner_hotkey, created.executor_id, created.pod_id):
+            if await redis_service.renting_in_progress(
+                created.miner_hotkey, created.executor_id, created.pod_id, max_age_seconds=None
+            ):
                 await redis_service.save_container_created_of_current_dispatch(
                     created.miner_hotkey, created.executor_id, created.pod_id, created.command_id, created.model_dump_json()
                 )
@@ -1325,12 +1345,17 @@ class ComputeClient:
             self._log_unacked_container_created_error(created.pod_id, exc)
 
     async def _replayable_success(self, pod_id: str, message_json: str) -> bool:
-        """a saved ContainerCreated the next reconnect will resend: readable and its pod still pending"""
+        """a saved ContainerCreated the next reconnect will resend: readable, and the backend still waits on it. Its
+        pending mark is cleared only by the receipt or a delete, whatever its age (the 30-min window is the scheduler's,
+        not the backend's), and its command record stays unsettled until the same two: either one is enough."""
         try:
             created = ContainerCreated.model_validate_json(message_json)
         except pydantic.ValidationError:
             return False
-        return await self.miner_service.redis_service.renting_in_progress(created.miner_hotkey, created.executor_id, pod_id)
+        redis_service = self.miner_service.redis_service
+        return await redis_service.renting_in_progress(
+            created.miner_hotkey, created.executor_id, pod_id, max_age_seconds=None
+        ) or bool(created.command_id and await redis_service.create_unsettled(created.command_id))
 
     async def _unacked_successes(self) -> dict[str, str]:
         """pod id -> each saved ContainerCreated the backend has not answered, plus any whose saved report was lost
@@ -1369,8 +1394,9 @@ class ComputeClient:
                 self._log_unacked_container_created_error(pod_id, exc)
                 continue
             try:
-                if not await redis_service.renting_in_progress(created.miner_hotkey, created.executor_id, pod_id):
-                    # the pending flag expired or was wiped: the backend no longer waits on this create
+                if not await self._replayable_success(pod_id, message_json):
+                    # its receipt or a delete came, or the flags were wiped and no unsettled record holds it: the
+                    # backend no longer waits on this create
                     await redis_service.remove_unacked_container_created(pod_id, message_json)
                     continue
             except Exception as exc:
@@ -1529,6 +1555,14 @@ class ComputeClient:
             # is the re-run DAH-5437 makes of a cut-off create, replacing what it left under the pod's names. Only a
             # saved success of this very command keeps its claim: the reconnect replays it, and its receipt settles the
             # claim (an older command's saved success for the pod says nothing about this one).
+            if claim.unknown:
+                # a re-check of an unknown outcome was cut off: the outcome is still unknown, and a resend re-checks
+                await redis_service.take_over_backend_command(
+                    command_id,
+                    claim.model_dump_json(),
+                    claim.model_copy(update={"state": "finished", "owner": "", "responses": []}).model_dump_json(),
+                )
+                continue
             saved = unacked.get(claim.pod_id)
             if (
                 saved is not None
@@ -1537,6 +1571,8 @@ class ComputeClient:
             ):
                 continue
             await redis_service.release_backend_command(command_id)
+        # pods whose container may be on the node with no known outcome: neither resumed nor failed, and the report waits
+        unknown_pod_ids = {command.pod_id for command in (await redis_service.unknown_create_outcomes()).values()}
         resumed: list[str] = []
         reports: list[tuple[FailedContainerRequest, InflightBackendCreate]] = []
         reported_create_ids: dict[str, list[str]] = {}
@@ -1545,6 +1581,11 @@ class ComputeClient:
                 resumed.append(pod_id)  # resumed by an earlier attempt of this sweep, its record already counted
                 continue
             create = max(pod_creates, key=lambda c: c.resumes)
+            if pod_id in unknown_pod_ids:
+                # a re-run could replace that container and a failure report frees its node: only its record stays
+                for stale in pod_creates:
+                    await self._retire_backend_create_record(pod_id, stale.create_id)
+                continue
             if pod_id in unacked and await self._replayable_success(pod_id, unacked[pod_id]):
                 # DAH-5380: it was created, only the report is unanswered; the reconnect replays it ahead of the
                 # ResumedCreatesReport, so its pending flag and saved success stay and only the stale inflight records
@@ -1613,14 +1654,17 @@ class ComputeClient:
                 )
             )
         # DAH-5437: only a sweep that read the records reports; an empty list is the point (Redis lost them)
-        if unreadable:
-            # an unreadable record may be a create that made its container: the report would fail its pending pod
-            # and the backend could place it again elsewhere. Without a report the backend changes nothing (as with a
-            # validator older than 2.5.0); the next start reports once the record reads or has been settled
+        if unreadable or unknown_pod_ids:
+            # an unreadable record, or a create whose outcome is unknown, may be a create that made its container: the
+            # report would fail its pending pod and the backend could place it again elsewhere. Without a report the
+            # backend changes nothing (as with a validator older than 2.5.0); the next start reports once the record
+            # reads, the outcome is known or a delete has settled it
             logger.error(
                 _m(
-                    "Restart report withheld: unreadable backend command records may cover a pending create",
-                    extra=get_extra_info({**self.logging_extra, "command_ids": unreadable}),
+                    "Restart report withheld: backend command records may cover a pending create with a container",
+                    extra=get_extra_info(
+                        {**self.logging_extra, "command_ids": unreadable, "unknown_pod_ids": sorted(unknown_pod_ids)}
+                    ),
                 )
             )
             self.resumed_creates_report = None
@@ -1683,8 +1727,11 @@ class ComputeClient:
                 ContainerCreated | FailedContainerRequest | None
             ) = await self.miner_service.handle_container(job_request)
             if response is None:
-                # this command's container is on the node without a readable reply (create_container): nothing is
-                # answered, so the backend neither retries the pod elsewhere nor reads it as created
+                # this command's container may be on the node without a readable reply (create_container): nothing is
+                # answered, so the backend neither retries the pod elsewhere nor reads it as created, and the command's
+                # record keeps the outcome unknown (miner_driver) so no restart report fails the pod either
+                if (unknown := create_outcome_unknown.get()) is not None:
+                    unknown.append(True)
                 return
             if isinstance(response, FailedContainerRequest):
                 # the backend fences a failure on the create it answers: a late failure of an earlier create (a

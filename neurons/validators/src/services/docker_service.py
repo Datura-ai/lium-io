@@ -3690,7 +3690,8 @@ def _create_record(reply: ContainerCreated) -> str:
 
 
 class _OwnCreateWithoutRecord(Exception):
-    """This command's container is on the node, but the reply its first run saved cannot be read."""
+    """This command's container is (or may be) on the node, but the reply its first run saved cannot be read, or the
+    node could not be asked whether the container is there."""
 
 
 async def _replay_own_finished_create(
@@ -3701,25 +3702,29 @@ async def _replay_own_finished_create(
     reply is reported. A container carrying this command's label without a readable reply (the run was cut off between
     `docker run` and the record write, or the write failed) raises _OwnCreateWithoutRecord: the create then answers
     nothing and leaves the container, because the cleanup would treat it as the pod's stale container and remove it
-    with its volume. No container of this command returns None and the create runs as usual."""
+    with its volume. So does a node that cannot be asked (SSH or Docker failing): only a listing Docker answered without
+    this command's container returns None, and the create runs as usual."""
     if not payload.command_id:
         return None
+    # `docker ps` exits 0 with no line when the name is absent and non-zero when Docker cannot answer, unlike
+    # `docker inspect`, whose failure looks the same for both
     command = (
         f"cat {shlex.quote(_create_record_path(payload.pod_id))} 2>/dev/null; echo; echo {_CREATE_RECORD_STATE_MARK}; "
-        f"/usr/bin/docker inspect -f '{{{{.State.Running}}}} {{{{index .Config.Labels \"{LIUM_CREATE_COMMAND_ID_LABEL}\"}}}}' "
-        f"{shlex.quote(container_name)} 2>/dev/null"
+        f"/usr/bin/docker ps -a --no-trunc --filter {shlex.quote(f'name=^/?{re.escape(container_name)}$')} "
+        f"--format '{{{{.State}}}} {{{{.Label \"{LIUM_CREATE_COMMAND_ID_LABEL}\"}}}}'"
     )
     try:
         result = await ssh_client.run(command, check=False, timeout=30)
-    except Exception as exc:  # unreachable: the create's own SSH steps fail the same way
-        logger.warning(_m("Could not read a finished create's record", extra=get_extra_info({**log_extra, "error": str(exc)})))
-        return None
+    except Exception as exc:
+        raise _OwnCreateWithoutRecord(f"the node could not be asked: {exc}") from exc
+    if result.exit_status != 0:
+        raise _OwnCreateWithoutRecord(f"docker could not list the container (exit {result.exit_status})")
     record_text, _, state = (result.stdout or "").partition(_CREATE_RECORD_STATE_MARK)
     fields = state.split()
     if len(fields) != 2 or fields[1] != payload.command_id:
         return None
     try:
-        if fields[0] != "true":
+        if fields[0] != "running":
             raise ValueError("the container is not running")
         record = json.loads(record_text.strip())
         if record.get("command_id") != payload.command_id:

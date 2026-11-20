@@ -13,6 +13,7 @@ from clients.compute_client import (
     INFLIGHT_CREATE_MAX_AGE_SECONDS,
     ComputeClient,
     OutgoingMessages,
+    create_outcome_unknown,
 )
 from payload_models.payloads import (
     ContainerCreated,
@@ -1138,8 +1139,8 @@ async def test_the_replays_expiry_never_deletes_a_success_a_new_dispatch_saved_a
     ).model_dump_json()
     flag_check = redis_service.renting_in_progress
 
-    async def flag_check_while_the_reboot_saves(*args) -> bool:
-        pending = await flag_check(*args)
+    async def flag_check_while_the_reboot_saves(*args, **kwargs) -> bool:
+        pending = await flag_check(*args, **kwargs)
         await redis_service.add_unacked_container_created("pod-1", reboot)
         return pending
 
@@ -1698,7 +1699,171 @@ async def test_a_create_left_unanswered_by_the_node_queues_nothing() -> None:
         command_id="cmd-1",
     )
 
-    await client._drive_miner_job(request)
+    flags: list[bool] = []
+    token = create_outcome_unknown.set(flags)
+    try:
+        await client._drive_miner_job(request)
+    finally:
+        create_outcome_unknown.reset(token)
 
     assert list(client.message_queue) == []
     assert await redis_service.unacked_container_created() == {}
+    assert flags == [True]   # miner_driver keeps the outcome unknown, not a finished empty answer
+
+
+@pytest.mark.parametrize("stored_reply", ["{broken", "{}", "[]"])
+@pytest.mark.asyncio
+async def test_a_create_record_with_an_unreadable_reply_withholds_the_report_and_stops_no_replay(stored_reply) -> None:
+    """A readable record whose stored reply is not a message cannot tell a success from a failure: it counts as an
+    unreadable record (no restart report), and the replays of other pods still go out."""
+    redis_service = _redis_service()
+    client = _client(redis_service)
+    client.lock = asyncio.Lock()
+    claim = BackendCommand(state="running", owner="o", create=True, pod_id="pod-x", executor_id="exec-1")
+    await redis_service.claim_backend_command("cmd-x", claim.model_dump_json(), persist=True)
+    broken = claim.model_copy(update={"state": "finished", "owner": "", "responses": [stored_reply]})
+    await redis_service.update_backend_command("cmd-x", claim.model_dump_json(), broken.model_dump_json(), 0)
+    await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-1", command_id="cmd-1")
+    created = _success("cmd-1")
+    await _finished_create_record(redis_service, "cmd-1", created)
+
+    await client.fail_creates_cut_off_by_restart()
+    ws = AsyncMock()
+    awaiting = await client.resend_unacked_container_created(ws)
+
+    assert client.resumed_creates_report is None
+    assert awaiting == {"pod-1": "cmd-1"}
+    assert await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-x") == broken.model_dump_json()
+
+
+@pytest.mark.parametrize("source", ["saved_report", "command_record"])
+@pytest.mark.asyncio
+async def test_a_success_still_pending_past_30_minutes_is_replayed(source) -> None:
+    """The pending mark goes only with the receipt or a delete; its age is the scheduler's window, not the backend's.
+    A success the backend still waits on is replayed however old its mark."""
+    redis_service = _redis_service()
+    client = _client(redis_service)
+    client.lock = asyncio.Lock()
+    with patch("services.redis_service.time.time", return_value=time.time() - 2 * 3600):
+        await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-1", command_id="cmd-1")
+    created = _success("cmd-1")
+    if source == "saved_report":
+        await redis_service.add_unacked_container_created("pod-1", created.model_dump_json())
+    else:
+        await _finished_create_record(redis_service, "cmd-1", created)
+    assert not await redis_service.renting_in_progress("miner-hk", "exec-1", "pod-1")   # the 30-min view
+
+    await client.fail_creates_cut_off_by_restart()
+    ws = AsyncMock()
+    awaiting = await client.resend_unacked_container_created(ws)
+
+    assert awaiting == {"pod-1": "cmd-1"}
+    assert [ContainerCreated.model_validate_json(c.args[0]) for c in ws.send.await_args_list] == [created]
+    assert client.resumed_creates_report.pod_ids == []
+
+
+def _driver_client(redis_service: RedisService, outcomes: list) -> ComputeClient:
+    """miner_driver over a node whose create answers each of `outcomes` in turn: None (container there, outcome
+    unknown), a ContainerCreated, or an exception"""
+    client = _client(redis_service)
+    client.lock = asyncio.Lock()
+    client.message_queue = OutgoingMessages()
+    client._accept_create_dispatch = AsyncMock(return_value=True)
+    client.get_miner_axon_info = AsyncMock()
+
+    async def drive(request):
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        if outcome is None:
+            create_outcome_unknown.get().append(True)
+            return
+        client.message_queue.append(outcome)   # the reply: recorded in the command's responses
+
+    client._drive_miner_job = drive
+    return client
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_create_outcome_is_kept_and_no_restart_report_fails_or_resumes_its_pod() -> None:
+    """The node holds this command's container without a readable reply: nothing is answered, and the record keeps
+    the outcome unknown with no expiry instead of a finished empty answer, so a restart neither resumes nor fails the
+    pod and withholds the report while it lasts. A delete of the pod settles it."""
+    redis_service = _redis_service()
+    client = _driver_client(redis_service, [None])
+    await client.miner_driver(_create_request())
+
+    stored = BackendCommand.model_validate_json(await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-1"))
+    assert (stored.state, stored.unknown, stored.responses) == ("finished", True, [])
+    assert await redis_service.redis.ttl(BACKEND_COMMAND_PREFIX + "cmd-1") == -1
+    assert list(client.message_queue) == []
+
+    # a restart: the in-flight record of a later cut-off run of the pod is neither resumed nor failed
+    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER, "c9")
+    restarted = _client(redis_service)
+    restarted.lock = asyncio.Lock()
+    await restarted.fail_creates_cut_off_by_restart()
+    assert restarted.resumed_creates_report is None
+    assert list(restarted.message_queue) == []
+    assert await redis_service.inflight_backend_creates() == {}
+
+    await redis_service.settle_backend_creates_of_pod("pod-1", "exec-1", 900)
+    settled = _client(redis_service)
+    settled.lock = asyncio.Lock()
+    await settled.fail_creates_cut_off_by_restart()
+    assert settled.resumed_creates_report.pod_ids == []
+
+
+@pytest.mark.parametrize("recheck", ["created", "still_unknown", "raised"])
+@pytest.mark.asyncio
+async def test_a_resend_of_an_unknown_outcome_re_checks_the_node(recheck) -> None:
+    """A resend takes the unknown record over and asks the node again: a success is answered and kept like any
+    other; a re-check that learns nothing (unknown again, or it fails) leaves the outcome unknown, never released."""
+    redis_service = _redis_service()
+    created = _success("cmd-1")
+    outcome = {"created": created, "still_unknown": None, "raised": RuntimeError("ssh")}[recheck]
+    client = _driver_client(redis_service, [None, outcome])
+    await client.miner_driver(_create_request())
+
+    if recheck == "raised":
+        with pytest.raises(RuntimeError):
+            await client.miner_driver(_create_request())
+    else:
+        await client.miner_driver(_create_request())
+
+    stored = BackendCommand.model_validate_json(await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-1"))
+    assert await redis_service.redis.ttl(BACKEND_COMMAND_PREFIX + "cmd-1") == -1
+    if recheck == "created":
+        assert (stored.state, stored.unknown, stored.responses) == ("finished", False, [created.model_dump_json()])
+        assert list(client.message_queue) == [created]
+    else:
+        assert (stored.state, stored.unknown) == ("finished", True)
+
+
+@pytest.mark.asyncio
+async def test_a_restart_during_the_re_check_of_an_unknown_outcome_keeps_it_unknown() -> None:
+    redis_service = _redis_service()
+    unknown = BackendCommand(state="running", owner="o", create=True, pod_id="pod-1", executor_id="exec-1", unknown=True)
+    await redis_service.claim_backend_command("cmd-1", unknown.model_dump_json(), persist=True)
+    client = _client(redis_service)
+    client.lock = asyncio.Lock()
+
+    await client.fail_creates_cut_off_by_restart()
+
+    stored = BackendCommand.model_validate_json(await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-1"))
+    assert (stored.state, stored.unknown) == ("finished", True)
+    assert client.resumed_creates_report is None
+
+
+@pytest.mark.asyncio
+async def test_a_resend_while_an_unknown_outcome_is_re_checked_is_ignored() -> None:
+    redis_service = _redis_service()
+    client = _driver_client(redis_service, [None])
+    await client.miner_driver(_create_request())
+    stored = await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-1")
+    rival = BackendCommand(state="running", owner="rival", create=True, pod_id="pod-1", executor_id="exec-1", unknown=True)
+    assert await redis_service.take_over_backend_command("cmd-1", stored, rival.model_dump_json())
+
+    await client.miner_driver(_create_request())   # no outcome left in `outcomes`: it must not run
+
+    assert await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-1") == rival.model_dump_json()

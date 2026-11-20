@@ -318,6 +318,9 @@ class BackendCommand(BaseModel):
     create: bool = False
     pod_id: str = ""
     executor_id: str = ""
+    # a create whose container is on the node without a readable reply: nothing was answered and the record is kept
+    # (finished) until a delete settles it; a resend re-checks the node under a fresh claim that keeps the mark
+    unknown: bool = False
     responses: list[str] = []
 
 
@@ -439,6 +442,14 @@ def _parse_pending_pods(data) -> list[dict]:
         logger.warning(f"Unexpected data type in get_pending_pods: {type(data)}")
         return []
     return data
+
+
+def _readable_replies(command: BackendCommand) -> bool:
+    """a create's stored replies are each a message: one that is not cannot tell a success from a failure"""
+    try:
+        return all(isinstance(m := json.loads(raw), dict) and isinstance(m.get("message_type"), str) for raw in command.responses)
+    except ValueError:
+        return False
 
 
 def _text(value: str | bytes) -> str:
@@ -1274,9 +1285,9 @@ class RedisService:
         async for command_id, command in self._backend_commands():
             if not (command.create and command.state == "finished"):
                 continue
-            created = [
+            created = [   # readable: _backend_commands yields no create with an unreadable reply
                 raw for raw in command.responses
-                if json.loads(raw).get("message_type") == ContainerResponseType.ContainerCreated.value
+                if json.loads(raw)["message_type"] == ContainerResponseType.ContainerCreated.value
             ]
             if not created or await self.redis.ttl(f"{BACKEND_COMMAND_PREFIX}{command_id}") != -1:
                 continue
@@ -1286,20 +1297,47 @@ class RedisService:
         return found
 
     async def _backend_commands(self, unreadable: list[str] | None = None):
-        """(command ID, record) of each readable record. An unreadable one is skipped, logged and added to
-        `unreadable`, so it never stops the start; its own command stays fail-closed (miner_driver runs no create whose
-        record it cannot read)."""
+        """(command ID, record) of each readable record. An unreadable one (a create's stored reply included) is skipped,
+        logged and added to `unreadable`, so it never stops the start or a replay; its own command stays fail-closed
+        (miner_driver runs no create whose record it cannot read)."""
         async for key in self.redis.scan_iter(match=f"{BACKEND_COMMAND_PREFIX}*", count=100):
             command_id = _text(key).removeprefix(BACKEND_COMMAND_PREFIX)
             value = await self.redis.get(key)
             if value is None:
                 continue
             try:
-                yield command_id, BackendCommand.model_validate_json(value)
+                command = BackendCommand.model_validate_json(value)
+                if command.create and not _readable_replies(command):
+                    raise ValueError("a stored reply is not a message")
             except ValueError:
                 logger.error("Unreadable backend command record skipped: %s", command_id)
                 if unreadable is not None:
                     unreadable.append(command_id)
+                continue
+            yield command_id, command
+
+    async def unknown_create_outcomes(self) -> dict[str, BackendCommand]:
+        """command ID -> each create whose container is on the node without a readable reply, not yet settled"""
+        return {
+            command_id: command
+            async for command_id, command in self._backend_commands()
+            if command.create and command.unknown
+            and await self.redis.ttl(f"{BACKEND_COMMAND_PREFIX}{command_id}") == -1
+        }
+
+    async def create_unsettled(self, command_id: str) -> bool:
+        """the create's record has no expiry: neither its receipt nor a delete of the pod has settled it"""
+        return await self.redis.ttl(f"{BACKEND_COMMAND_PREFIX}{command_id}") == -1
+
+    async def take_over_backend_command(self, command_id: str, stored: str, claim: str) -> bool:
+        """Replaces `stored` (a record read just before) by `claim`, keeping its lifetime; False when it changed meanwhile."""
+        return bool(await self.redis.eval(
+            "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('SET', KEYS[1], ARGV[2], 'KEEPTTL') end return nil",
+            1,
+            f"{BACKEND_COMMAND_PREFIX}{command_id}",
+            stored,
+            claim,
+        ))
 
     async def update_backend_command(
         self, command_id: str, claim: str, value: str, ttl: int
@@ -1483,8 +1521,10 @@ class RedisService:
             # a mark written before it named its GPUs: the bare pod id
             return RecentGpuReset(pod_id=raw)
 
-    async def renting_in_progress(self, miner_hotkey: str, executor_id: str, pod_id: str | None = None) -> bool:
-        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id)
+    async def renting_in_progress(
+        self, miner_hotkey: str, executor_id: str, pod_id: str | None = None, max_age_seconds: int | None = 30 * 60
+    ) -> bool:
+        pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id, max_age_seconds)
         
         if pod_id:
             pending_pods = [item for item in pending_pods if item.get('pod_id', '') == pod_id]
