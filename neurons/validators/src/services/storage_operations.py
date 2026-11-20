@@ -337,36 +337,34 @@ async def start_storage_operation(
         )
         # Bootstrap callers consume the terminal files; detached online jobs
         # remove them themselves after the runner has finished reporting.
+        lock_path = shlex.quote(str(files.lock))
+        pid_path = shlex.quote(str(files.pid))
+        # The wrapper takes the launch lock before it starts the runner, so it runs only after the
+        # launch has recorded its PID, and never once a cancel has marked the operation.
         wrapper = (
             f"rm -f {shlex.quote(str(files.status))}; "
+            f"exec 8>>{lock_path}; "
+            f"if flock -w 30 8 && ! test -e {shlex.quote(str(files.cancel))}; then exec 8>&-; "
             f"{runner} & child=$!; "
-            f"printf '%s\\n' \"$child\" > {shlex.quote(str(files.pid))}; "
             "trap 'kill -TERM \"$child\" 2>/dev/null || true' TERM INT; "
             'wait "$child"; result=$?; '
+            "else exec 8>&-; result=5; fi; "
             f"printf '%s\\n' \"$result\" > {shlex.quote(str(files.status))}; "
-            f"rm -f {shlex.quote(str(files.spec))} {shlex.quote(str(files.pid))}{terminal_cleanup}"
+            f"rm -f {shlex.quote(str(files.spec))} {pid_path}{terminal_cleanup}"
         )
-        pid_path = shlex.quote(str(files.pid))
-        # Under the launch lock (the cancel takes it too): refuse if a cancel has marked it,
-        # else start the runner and hold the lock until its PID is written, so a cancel that comes
-        # after always finds the runner to stop. The runner must not inherit the lock (9>&-).
+        # Under the launch lock (the cancel takes it too): refuse if a cancel has marked it, else
+        # start the wrapper as its own process group and record that group before releasing the
+        # lock, so a cancel that comes after always finds every process of the operation.
+        # The wrapper must not inherit the held lock (9>&-).
         launch_command = (
-            f"exec 9>>{shlex.quote(str(files.lock))}; flock -w 30 9 || exit 6; "
+            f"exec 9>>{lock_path}; flock -w 30 9 || exit 6; "
             f"if test -e {shlex.quote(str(files.cancel))}; then rm -f {shlex.quote(str(files.spec))}; exit 5; fi; "
-            f"nohup /bin/sh -c {shlex.quote(wrapper)} "
-            f"> {shlex.quote(str(files.log))} 2>&1 < /dev/null 9>&- & wrapper=$!; "
-            f"attempt=0; while ! test -s {pid_path} && kill -0 \"$wrapper\" 2>/dev/null "
-            "&& test \"$attempt\" -lt 100; do "
-            "sleep 0.05; attempt=$((attempt + 1)); done; "
-            # never release the lock with a runner whose PID a cancel cannot read: stop what started
-            # (the runner first, so it removes its helper) and fail the launch
-            f"if ! test -s {pid_path} && kill -0 \"$wrapper\" 2>/dev/null; then "
-            'kids=$(pgrep -P "$wrapper"); kill -TERM $kids "$wrapper" 2>/dev/null; wait "$wrapper"; '
-            'alive() { for p in $kids; do kill -0 "$p" 2>/dev/null && return 0; done; return 1; }; '
-            'attempt=0; while alive && test "$attempt" -lt 100; do sleep 0.1; attempt=$((attempt + 1)); done; '
-            'kill -KILL $kids 2>/dev/null; '
-            f"/usr/bin/docker rm -f -- {shlex.quote(storage_helper_name(operation_id))} >/dev/null 2>&1; "
-            f"rm -f {shlex.quote(str(files.spec))} {pid_path} {shlex.quote(str(files.status))}; exit 7; fi"
+            f"setsid nohup /bin/sh -c {shlex.quote(wrapper)} "
+            f"> {shlex.quote(str(files.log))} 2>&1 < /dev/null 9>&- & "
+            f"if ! printf '%s\\n' \"$!\" > {pid_path}; then "
+            # the wrapper is still waiting for this lock, so nothing of the operation has run yet
+            'kill -KILL -"$!" 2>/dev/null; '
+            f"rm -f {shlex.quote(str(files.spec))} {pid_path}; exit 7; fi"
         )
         launched = await ssh_client.run(launch_command, check=False)
         if launched.exit_status == 5:
@@ -458,7 +456,8 @@ async def cancel_storage_operation(
     # process termination is only a bounded fallback for an unresponsive runner.
     # the marker is what stops a later launch, so a cancel that cannot write it fails, but only
     # after it has still stopped the runner and helper
-    # under the launch lock, so a launch either sees this marker or has written its PID first
+    # under the launch lock, so a launch either sees this marker or has recorded its process group
+    # first; the PID is that group's leader, so every check and signal below covers the whole group
     lock_path = shlex.quote(str(files.lock))
     command = (
         "marked=0; "
@@ -469,18 +468,20 @@ async def cancel_storage_operation(
         f"pid=$(cat {pid_path} 2>/dev/null); exec 9>&-; "
         'if test -n "$pid"; then '
         "case \"$pid\" in (*[!0-9]*|'') exit 2;; esac; "
-        'attempt=0; while kill -0 "$pid" 2>/dev/null && test "$attempt" -lt 100; do '
+        # an operation launched before process groups recorded its runner's PID, which leads no group
+        'alive() { kill -0 -"$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null; }; '
+        'attempt=0; while alive && test "$attempt" -lt 100; do '
         "sleep 0.25; attempt=$((attempt + 1)); done; "
-        'if kill -0 "$pid" 2>/dev/null; then '
+        'if alive; then '
         f"/usr/bin/docker stop --time 5 {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
-        'kill -TERM "$pid" 2>/dev/null || true; sleep 2; '
-        'if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null || true; '
-        'attempt=0; while kill -0 "$pid" 2>/dev/null && test "$attempt" -lt 20; do '
+        'kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true; sleep 2; '
+        'if alive; then kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true; '
+        'attempt=0; while alive && test "$attempt" -lt 20; do '
         "sleep 0.1; attempt=$((attempt + 1)); done; fi; "
         # the stopped helper still holds the repository credentials; remove it, not just stop it
         f"/usr/bin/docker rm -f -- {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
         "fi; "
-        'kill -0 "$pid" 2>/dev/null && exit 3 || true; '
+        'alive && exit 3 || true; '
         "else "
         f"/usr/bin/docker stop --time 5 {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
         f"/usr/bin/docker rm -f -- {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "

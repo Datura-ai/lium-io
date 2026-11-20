@@ -1,5 +1,6 @@
 import inspect
 import json
+import os
 import subprocess
 import sys
 import time
@@ -333,12 +334,14 @@ async def test_a_cancel_between_the_launch_check_and_its_start_stops_the_launch(
 async def test_a_cancel_right_after_a_launch_finds_and_stops_its_runner(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # the launch holds the lock until its PID is written, so the cancel that follows always sees the runner
+    # the launch records the operation's process group before releasing the lock, so the cancel that
+    # follows always stops the runner, even one that ignores the marker
     monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", storage_operations.PurePosixPath(str(tmp_path / "ops")))
     monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
     monkeypatch.setattr(storage_operations, "_report_cancelled", AsyncMock(return_value=True))
+    runner_pid_file = tmp_path / "runner-pid"
     runner = tmp_path / "runner"
-    runner.write_text("#!/bin/sh\nexec sleep 60\n")  # ignores the marker like an unresponsive runner
+    runner.write_text(f"#!/bin/sh\necho $$ > {runner_pid_file}\nexec sleep 60\n")
     runner.chmod(0o755)
     monkeypatch.setattr(storage_operations, "REMOTE_RUNNER_PATH", str(runner))
     local = _local_ssh()
@@ -347,28 +350,32 @@ async def test_a_cancel_right_after_a_launch_finds_and_stops_its_runner(
     await storage_operations.start_storage_operation(
         local, "sh", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
     )
-    runner_pid = int(Path(str(files.pid)).read_text())
+    group = int(Path(str(files.pid)).read_text())
+    for _ in range(100):
+        if runner_pid_file.exists() and runner_pid_file.read_text().strip():
+            break
+        time.sleep(0.05)
+    runner_pid = int(runner_pid_file.read_text())
     try:
         await storage_operations.cancel_storage_operation(local, OPERATION_ID)
     finally:
-        subprocess.run(["kill", "-KILL", str(runner_pid)], capture_output=True)
+        subprocess.run(["sh", "-c", f"kill -KILL -{group}"], capture_output=True)
     assert subprocess.run(["kill", "-0", str(runner_pid)], capture_output=True).returncode != 0
     assert Path(str(files.cancel)).exists()
 
 
 @pytest.mark.asyncio
-async def test_a_launch_whose_pid_is_not_written_in_time_stops_its_runner_and_fails(
+async def test_a_cancel_before_a_slow_wrapper_starts_its_runner_leaves_nothing_running(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # the wrapper starts the runner but is delayed before writing its PID past the launch's wait:
-    # the launch must not release the lock with a runner a cancel cannot find
+    # the wrapper is delayed before it starts the runner; the cancel that comes right after the launch
+    # finds the recorded process group, and no runner ever does any work
     monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", storage_operations.PurePosixPath(str(tmp_path / "ops")))
     monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
-    launch_failure = AsyncMock()
-    monkeypatch.setattr(storage_operations, "report_launch_failure", launch_failure)
+    monkeypatch.setattr(storage_operations, "_report_cancelled", AsyncMock(return_value=True))
     worked = tmp_path / "worked"
     runner = tmp_path / "runner"
-    runner.write_text(f"#!/bin/sh\nsleep 1\ntouch {worked}\n")
+    runner.write_text(f"#!/bin/sh\ntouch {worked}\nexec sleep 60\n")
     runner.chmod(0o755)
     monkeypatch.setattr(storage_operations, "REMOTE_RUNNER_PATH", str(runner))
     local = _local_ssh()
@@ -376,18 +383,21 @@ async def test_a_launch_whose_pid_is_not_written_in_time_stops_its_runner_and_fa
 
     async def run(command: str, check: bool = False) -> SimpleNamespace:
         if "nohup" in command:
-            assert "child=$!; " in command and "-lt 100; do sleep 0.05" in command
-            command = command.replace("child=$!; ", "child=$!; sleep 2; ").replace(
-                "-lt 100; do sleep 0.05", "-lt 4; do sleep 0.05"
-            )
+            assert "exec 8>>" in command
+            command = command.replace("exec 8>>", "sleep 1; exec 8>>", 1)
         return await local.run(command, check)
 
-    with pytest.raises(storage_operations.StorageOperationLaunchError):
-        await storage_operations.start_storage_operation(
-            SimpleNamespace(run=run, start_sftp_client=local.start_sftp_client),
-            "sh", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False,
-        )
-    launch_failure.assert_awaited_once()
-    time.sleep(1.5)
+    await storage_operations.start_storage_operation(
+        SimpleNamespace(run=run, start_sftp_client=local.start_sftp_client),
+        "sh", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False,
+    )
+    group = int(Path(str(files.pid)).read_text())
+    try:
+        await storage_operations.cancel_storage_operation(local, OPERATION_ID)
+    finally:
+        subprocess.run(["sh", "-c", f"kill -KILL -{group}"], capture_output=True)
+    time.sleep(0.2)
     assert not worked.exists()
+    with pytest.raises(ProcessLookupError):
+        os.killpg(group, 0)
     assert not Path(str(files.spec)).exists() and not Path(str(files.pid)).exists()
