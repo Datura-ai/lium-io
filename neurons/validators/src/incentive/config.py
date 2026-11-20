@@ -53,7 +53,7 @@ RENTAL_PRICES_PER_HOUR["NVIDIA GB200"] = RENTAL_PRICES_PER_HOUR["NVIDIA B200"]  
 # DAH-5508: memory-modded cards (gpu_spec_table.MODDED_VRAM_MODELS), each its own model and idle tier. Anchor = the
 # backend's MACHINE_PRICES: the base card x the same-chip Quadro RTX 8000/6000 double-memory ratio (0.21/0.13):
 # RTX 4080 / 4080 SUPER 0.16 -> 0.26. Set numbers, not this ratio: RTX 4090 48GB 0.42 (1.4x the RTX 4090),
-# RTX 4090 D 48GB 0.16, RTX 3080 20GB 0.09 and RTX 2080 Ti 22GB 0.08 (the base cards' prices).
+# RTX 4090 D 48GB 0.16, RTX 3080 20GB 0.09 and RTX 2080 Ti 22GB 0.08 (the last two at their base cards' prices).
 RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4090 48GB"] = 0.42
 RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4080 32GB"] = 0.26
 RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4080 SUPER 32GB"] = 0.26
