@@ -169,7 +169,7 @@ Executors are machines running on GPUs that you can add to your central miner. T
     - `<gpu-price>`: GPU price per hour in USD for the executor.
 
     **Optional parameters:**
-    - `<validator-hotkey>`: The validator hotkey that you want to give access to this executor. If not provided, our validator_hotkey will be used as default.
+    - `<validator-hotkey>`: The validator hotkey that you want to give access to this executor. If not provided, the validator this miner trusts (see [Which validator the miner trusts](#which-validator-the-miner-trusts)) is used.
 
     **Tier:** a node added with this command starts on the **Spot** tier; the command has no tier option. A node you deleted in the Provider Portal and add again at the same IP and port within 7 days keeps its earlier tier. To move it to **Secure**, open the node's page in the Provider Portal and click **Change Tier**; a node can change tier once every 24 hours.
 
@@ -286,11 +286,15 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py current-cont
 
 `show-contract-versions` lists the collateral contract versions with their addresses; `current-contract-version` prints the one this miner uses.
 
-`migrate-validator-hotkey` is the data step of a validator hotkey rotation, run once per miner after the config pair swap (`DEFAULT_VALIDATOR_HOTKEY=<new>`, `VALIDATOR_NEXT_HOTKEY=<old>`): it re-keys this miner's executor rows from the previous validator hotkey to the active one. The defaults read those two settings; `--from-hotkey` / `--to-hotkey` name them explicitly and `--dry-run` prints the row count without changing anything. Lium announces the rotation date; the current swap (to `5F1aH9124FPvDNMWKgPCCJ8WeBBV3B3vpijDCyxZVyZgrEV9`) is pending.
+### Which validator the miner trusts
+
+The miner accepts sign-in from the validator named in a message the SN51 subnet owner signed (`lium-validator:<validator hotkey>:<revision>`, checked against the owner coldkey read from chain), the same message the executor follows. It ships with the image (`src/validator_trust_message.json`) and is refreshed every few minutes from `<COMPUTE_REST_API_URL>/watchtower/validator-message`; a higher revision replaces the held one, and on any error the miner keeps the last good message. Every message taken is stored in the miner database, so a restart keeps the same validator with the backend and the chain unreachable. No setting or `.env` entry changes it. The validator and revision in use are logged at start (`Validator trust at start`) and on every change (`Validator trust: now trusting`).
+
+After a validator change, executor rows keyed to a validator this miner trusted before are served to the new one; no row migration is needed. `migrate-validator-hotkey` re-keys rows by hand if you want to: `--from-hotkey` names the hotkey the rows are keyed to, `--to-hotkey` defaults to the trusted validator, and `--dry-run` prints the row count without changing anything.
 
 ```shell
-docker exec -it <container-id or name> pdm run /root/app/src/cli.py migrate-validator-hotkey --dry-run
-docker exec -it <container-id or name> pdm run /root/app/src/cli.py migrate-validator-hotkey
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py migrate-validator-hotkey --from-hotkey <old-hotkey> --dry-run
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py migrate-validator-hotkey --from-hotkey <old-hotkey>
 ```
 
 ### Finalizing a Reclaim Request

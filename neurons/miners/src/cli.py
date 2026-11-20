@@ -456,26 +456,29 @@ def finalize_reclaim_request(reclaim_request_id: int, private_key: str, contract
 @click.option(
     "--from-hotkey",
     "old_hotkey",
-    default=None,
-    help="The validator hotkey the rows are keyed to today. Default: VALIDATOR_NEXT_HOTKEY, which after the "
-    "swap-day pair swap (DEFAULT_VALIDATOR_HOTKEY=<new>, VALIDATOR_NEXT_HOTKEY=<old>) is the previous hotkey.",
+    required=True,
+    help="The validator hotkey the rows are keyed to today.",
 )
 @click.option(
     "--to-hotkey",
     "new_hotkey",
     default=None,
-    help="The validator hotkey the rows move to. Default: DEFAULT_VALIDATOR_HOTKEY (the active one).",
+    help="The validator hotkey the rows move to. Default: the validator named in the message the subnet owner "
+    "signed that this miner trusts.",
 )
 @click.option("--dry-run", is_flag=True, default=False, help="Count the rows that would move; change nothing.")
-def migrate_validator_hotkey(old_hotkey: str | None, new_hotkey: str | None, dry_run: bool):
-    """Re-key this miner's executor rows from one validator hotkey to another (the validator hotkey rotation:
-    run once per miner DB after the config pair swap; the central miner has no rows of its own)."""
+def migrate_validator_hotkey(old_hotkey: str, new_hotkey: str | None, dry_run: bool):
+    """Re-key this miner's executor rows from one validator hotkey to another. Not needed for a validator change:
+    the trusted validator is served the rows keyed to a validator this miner trusted before; the central miner has
+    no rows of its own."""
     from core.db import get_db
     from daos.executor import ExecutorDao
     from services.validator_service import migrate_validator_hotkey_rows
+    from services.validator_trust_service import validator_trust
 
-    old_hotkey = old_hotkey or settings.VALIDATOR_NEXT_HOTKEY
-    new_hotkey = new_hotkey or settings.DEFAULT_VALIDATOR_HOTKEY
+    if not new_hotkey:
+        validator_trust.load()
+        new_hotkey = validator_trust.validator()
     executor_dao = ExecutorDao(session=next(get_db()))
     try:
         result = migrate_validator_hotkey_rows(executor_dao, old_hotkey, new_hotkey, dry_run=dry_run)

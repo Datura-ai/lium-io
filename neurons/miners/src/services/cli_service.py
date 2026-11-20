@@ -11,6 +11,7 @@ from core.db import get_db
 from daos.executor import ExecutorDao
 from services.executor_service import ExecutorService
 from services.ssh_service import MinerSSHService
+from services.validator_trust_service import validator_trust
 from models.executor import Executor
 from core.collateral import (
     CollateralConfigError,
@@ -313,7 +314,8 @@ class CliService:
         :return: True if successful, False otherwise
         """
         if validator is None:
-            validator = settings.DEFAULT_VALIDATOR_HOTKEY
+            validator_trust.load()
+            validator = validator_trust.validator()
 
         result = await self.executor_service.create(
             Executor(

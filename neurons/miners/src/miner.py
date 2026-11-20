@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from core.config import settings
 from core.miner import Miner
 from routes.validator_interface import validator_router
+from services.validator_trust_service import run_validator_trust_refresh, validator_trust
 from core.utils import cap_recursion_limit, configure_logs_of_other_modules, wait_for_services_sync
 
 cap_recursion_limit()
@@ -17,6 +18,9 @@ wait_for_services_sync()
 
 @asynccontextmanager
 async def app_lifespan(app: FastAPI):
+    # before the first request: the sign-in check and the executor list read the trusted validator
+    await asyncio.to_thread(validator_trust.load)
+    trust_task = asyncio.create_task(run_validator_trust_refresh())
     miner = Miner()
     # Run the miner in the background
     task = asyncio.create_task(miner.start())
@@ -24,6 +28,7 @@ async def app_lifespan(app: FastAPI):
     try:
         yield
     finally:
+        trust_task.cancel()
         await miner.stop()  # Ensure proper cleanup
         await task  # Wait for the background task to complete
         logging.info("Miner exited successfully.")
