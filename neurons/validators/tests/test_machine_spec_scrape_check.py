@@ -1,4 +1,5 @@
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime, UTC
 from types import SimpleNamespace
@@ -152,10 +153,13 @@ async def test_machine_spec_scrape_preserves_raw_a10_name_for_native_challenge(
         encrypt_key="test-encrypt-key",
     )
 
+    before = time.time()
     result = await MachineSpecScrapeCheck().run(ctx)
 
     assert result.passed is True
     updated_state = result.updates["state"]
+    # DAH-6571: the power-cap check judges a cap only against readings taken after it
+    assert before <= updated_state.gpu_details_read_after <= time.time()
     assert updated_state.specs["gpu"]["details"][0]["name"] == "NVIDIA A10"
     assert updated_state.gpu_details[0]["name"] == "NVIDIA A10 Tensor Core GPU"
     assert updated_state.gpu_model == "NVIDIA A10 Tensor Core GPU"

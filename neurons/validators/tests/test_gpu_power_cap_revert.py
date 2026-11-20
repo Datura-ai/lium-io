@@ -274,6 +274,8 @@ async def _run_check_while_filler_runs(
     records: list[GpuPowerRestoreRecord],
     live_watts_by_uuid: list[tuple[str, float]],
     ssh: AsyncMock | None = None,
+    read_after: float | None = None,
+    cycle_age: float = 0.0,
 ) -> None:
     monkeypatch.setattr(
         check_module,
@@ -281,9 +283,10 @@ async def _run_check_while_filler_runs(
         AsyncMock(return_value=GpuPowerRestoreReadResult(records=records, read_failed=False)),
     )
     ctx = context_factory(
-        state=_running_filler_state(*live_watts_by_uuid),
+        state=dataclasses.replace(_running_filler_state(*live_watts_by_uuid), gpu_details_read_after=read_after),
         services=build_services(redis=redis),
         ssh=ssh or host_with_running_fillers(),
+        started_at_monotonic=time.monotonic() - cycle_age,
     )
     result = await GpuPowerLimitCheck().run(ctx)
 
@@ -327,6 +330,35 @@ async def test_a_cap_applied_after_the_cycles_scrape_is_not_a_revert(context_fac
     record = _record().model_copy(update={"capped_at": time.time() + 30})
 
     await _run_check_while_filler_runs(context_factory, monkeypatch, redis, [record], [("GPU-a", 400.0)])
+
+    assert _revert_key(CHECK_EXECUTOR_UUID) not in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_cap_applied_mid_cycle_before_the_scrape_began_is_judged(context_factory, monkeypatch) -> None:
+    # DAH-6571 review: the filler capped the GPU after the cycle started but before its scrape began, and the host
+    # rolled the cap back before the scrape: that reading postdates our cap, so it is a revert
+    redis = FakeRedis()
+    scrape_began = time.time()
+    record = _record().model_copy(update={"capped_at": scrape_began - 5})
+
+    await _run_check_while_filler_runs(
+        context_factory, monkeypatch, redis, [record], [("GPU-a", 400.0)], read_after=scrape_began, cycle_age=60
+    )
+
+    assert _revert_key(CHECK_EXECUTOR_UUID) in redis.store
+
+
+@pytest.mark.asyncio
+async def test_a_cap_applied_after_the_scrape_began_is_not_judged_on_it(context_factory, monkeypatch) -> None:
+    # DAH-6571: the scrape may have read the GPU before this cap landed
+    redis = FakeRedis()
+    scrape_began = time.time() - 5
+    record = _record().model_copy(update={"capped_at": scrape_began + 1})
+
+    await _run_check_while_filler_runs(
+        context_factory, monkeypatch, redis, [record], [("GPU-a", 400.0)], read_after=scrape_began, cycle_age=60
+    )
 
     assert _revert_key(CHECK_EXECUTOR_UUID) not in redis.store
 

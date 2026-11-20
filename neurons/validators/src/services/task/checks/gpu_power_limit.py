@@ -392,13 +392,15 @@ class GpuPowerLimitCheck:
         if not self.restore_stale_caps:
             return LiveCapReadout(records, {})
         observed_at = time.time()
-        # DAH-6571: the readings come from this cycle's scrape; a cap applied after the cycle started may be newer
-        # than them, and its pre-cap reading would look like a revert
-        cycle_started_at = observed_at - (time.monotonic() - ctx.started_at_monotonic)
+        # DAH-6571: the readings come from this cycle's scrape; a cap applied after that scrape began may be newer
+        # than them, and its pre-cap reading would look like a revert. A cap applied before it is judged.
+        read_after = ctx.state.gpu_details_read_after
+        if read_after is None:
+            read_after = observed_at - (time.monotonic() - ctx.started_at_monotonic)
         reverts: list[GpuPowerCapRevert] = []
         for record in records:
             measurement = live_watts_by_uuid.get(record.gpu_uuid)
-            if measurement is None or measurement.power_limit is None or record.capped_at > cycle_started_at:
+            if measurement is None or measurement.power_limit is None or record.capped_at > read_after:
                 continue
             revert = detect_cap_revert(
                 record, measurement.power_limit, measurement.power_default_limit, observed_at
