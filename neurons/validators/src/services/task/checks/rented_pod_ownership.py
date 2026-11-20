@@ -175,9 +175,11 @@ class RentedPodOwnershipCheck:
         unread = sorted(set(names) - {p["container"] for p in pods.values()})
         what = {"pods": list(pods.values())}
         if pods:
-            restarted = await self._runtime_restarted_under(ctx, list(pods.values()))
+            restarted, started_at = await self._runtime_restarted_under(ctx, list(pods.values()))
             if restarted:
                 what["runtime_restarted_under_pods"] = restarted
+                # when each flagged runtime started: a notice must date the restart, not the day the check first saw it
+                what["runtime_started_at"] = started_at
         shifted = [p for p in pods.values() if p["outside_namespace"]]
         if shifted:
             template = await self._shift_template(ctx, shifted)
@@ -243,9 +245,12 @@ class RentedPodOwnershipCheck:
             return Msg.SHIFTED_MIXED
         return Msg.SHIFTED
 
-    async def _runtime_restarted_under(self, ctx: Context, pods: list[dict]) -> dict[str, list[str]]:
-        """Each runtime process that started after a pod's container: {process: [containers]}. Observe-only,
-        for the support sweep; an unread age flags nothing."""
+    async def _runtime_restarted_under(
+        self, ctx: Context, pods: list[dict]
+    ) -> tuple[dict[str, list[str]], dict[str, str]]:
+        """Each runtime process that started after a pod's container: {process: [containers]}, and when each of
+        those started ({process: UTC time}, from the host's clock). Observe-only, for the support sweep; an unread
+        age flags nothing."""
         try:
             res = await asyncio.wait_for(
                 ctx.ssh.run(
@@ -253,14 +258,17 @@ class RentedPodOwnershipCheck:
                     "ps -eo pid=,ppid=,comm=,etimes= | grep -E ' ("
                     + "|".join(n[:15] for n in RUNTIME_PROCESSES)
                     + ") +[0-9]+$'; echo --; ps -o pid=,etimes= -p "
-                    + ",".join(str(int(p["pid"])) for p in pods),
+                    + ",".join(str(int(p["pid"])) for p in pods)
+                    + "; echo --; date +%s",
                     check=False,
                 ),
                 timeout=READ_TIMEOUT_SECONDS,
             )
         except (asyncssh.Error, OSError, TimeoutError):
-            return {}
-        services, _, pod_lines = (res.stdout or "").partition("--")
+            return {}, {}
+        services, _, rest = (res.stdout or "").partition("--")
+        pod_lines, _, host_now = rest.partition("--")
+        host_now_s = _num(host_now.strip())
         procs = []
         for line in services.splitlines():
             fields = line.split()
@@ -281,12 +289,16 @@ class RentedPodOwnershipCheck:
         for line in pod_lines.splitlines():
             pid, _, age = line.strip().partition(" ")
             pod_age[_num(pid)] = _num(age.strip())
-        restarted = {}
+        restarted, started_at = {}, {}
         for name, age_s in sorted(youngest.items()):
             under = sorted(p["container"] for p in pods if (pod_age.get(p["pid"]) or 0) > age_s)
             if under:
                 restarted[name] = under
-        return restarted
+                if host_now_s:
+                    started_at[name] = datetime.fromtimestamp(host_now_s - age_s, timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    )
+        return restarted, started_at
 
     def _event(self, ctx: Context, template, what: dict) -> CheckResult:
         what = {"executor_uuid": ctx.executor.uuid, **what}

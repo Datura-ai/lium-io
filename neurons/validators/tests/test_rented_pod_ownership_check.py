@@ -414,3 +414,20 @@ async def test_every_shifted_pod_gets_the_cause_its_creation_and_start_show(
     out = f"1400.25\n4242 {age_1}\n4343 {age_2}\n--\n{boot}\n/pod_1 {created_1}\n/pod_2 {created_2}\n"
     result = await RentedPodOwnershipCheck().run(_ctx(context_factory, _ssh_with_uptime(str(tmp_path), out)))
     assert result.event.remediation == template.remediation
+
+
+@pytest.mark.asyncio
+async def test_a_flagged_runtime_carries_when_it_started_on_the_host_clock(context_factory, tmp_path):
+    """the check first ran days after a restart: the report dates the restart itself (host clock minus the
+    daemon's age), so a notice cannot name the day of the report as the day of the restart"""
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me}      65536\n")
+    _proc(tmp_path, 4343, f"         0     {me}      65536\n")
+    # host clock 2026-11-17T18:00:00Z; sysbox-fs started 4 days before (13 Nov 18:00Z), pod_1 a week before
+    ages = "10 1 sysbox-mgr 2000000\n11 1 sysbox-fs 345600\n--\n4242 604800\n4343 50\n--\n1794938400\n"
+    result = await RentedPodOwnershipCheck().run(
+        _ctx(context_factory, _ssh_with_runtime_ages(str(tmp_path), ages))
+    )
+    assert result.event.reason_code == Msg.RUNTIME_RESTARTED.reason
+    assert result.event.what_we_saw["runtime_restarted_under_pods"] == {"sysbox-fs": ["pod_1"]}
+    assert result.event.what_we_saw["runtime_started_at"] == {"sysbox-fs": "2026-11-13T18:00:00Z"}
