@@ -307,6 +307,72 @@ async def test_the_port_probe_does_not_follow_a_redirect():
     assert target_hits == []
 
 
+async def _streaming_server(chunks: list[bytes]) -> tuple[web.AppRunner, int, list[int]]:
+    """A loopback node that writes ``chunks`` one by one; the list it returns counts the bytes it got out."""
+    written: list[int] = []
+
+    async def handler(request):
+        resp = web.StreamResponse()
+        await resp.prepare(request)
+        try:
+            for chunk in chunks:
+                await resp.write(chunk)
+                written.append(len(chunk))
+        except ConnectionError:
+            pass  # the probe stopped reading and closed the connection
+        return resp
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    return runner, site._server.sockets[0].getsockname()[1], written
+
+
+async def _probe(port: int, monkeypatch) -> tuple[bool, list[int]]:
+    from neurons.validators.src.services.executor_connectivity.models import PortPair
+    from neurons.validators.src.services.executor_connectivity.port_tester import PortTester
+
+    real_read = aiohttp.StreamReader.read
+    read: list[int] = []
+
+    async def counted(self, n=-1):
+        data = await real_read(self, n)
+        read.append(len(data))
+        return data
+
+    monkeypatch.setattr(aiohttp.StreamReader, "read", counted)
+    async with aiohttp.ClientSession() as session:
+        ok = await PortTester().test_one(session, "127.0.0.1", PortPair(internal=7, external=port), "token")
+    return ok, read
+
+
+@pytest.mark.asyncio
+async def test_the_port_probe_fails_a_large_answer_having_read_only_the_cap(monkeypatch):
+    from neurons.validators.src.services.executor_connectivity.port_tester import PROBE_BODY_LIMIT
+
+    runner, port, written = await _streaming_server([b"token:7" + b" " * 65536] * 64)
+    try:
+        ok, read = await _probe(port, monkeypatch)
+    finally:
+        await runner.cleanup()
+    assert not ok
+    assert sum(read) == PROBE_BODY_LIMIT + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pad, passes", [(256 - len("token:7"), True), (257 - len("token:7"), False)])
+async def test_the_port_probe_reads_an_answer_of_up_to_the_cap_across_chunks(monkeypatch, pad, passes):
+    runner, port, _ = await _streaming_server([b"tok", b"en:7", b" " * pad])
+    try:
+        ok, _ = await _probe(port, monkeypatch)
+    finally:
+        await runner.cleanup()
+    assert ok is passes
+
+
 def _logged(caplog, level):
     return [(r.getMessage(), r.msg.extra) for r in caplog.records if r.levelno == level]
 

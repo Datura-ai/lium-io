@@ -14,6 +14,8 @@ logger = logging.getLogger(__name__)
 # connector hands out a socket, so a probe queued behind a full pool burned its budget waiting
 # and was recorded as a dead port without ever putting a packet on the wire
 PROBE_TIMEOUT = aiohttp.ClientTimeout(sock_connect=3, sock_read=3)
+# a node's answer is "<token>:<port>"; reading more than this lets a node grow the validator's memory
+PROBE_BODY_LIMIT = 256
 
 
 class PortTester:
@@ -27,8 +29,15 @@ class PortTester:
         try:
             # the node answers its own address only: a redirect would point the probe somewhere else
             async with session.get(url, timeout=PROBE_TIMEOUT, allow_redirects=False) as resp:
-                text = await resp.text()
-                return text.strip() == expected
+                body = b""
+                while len(body) <= PROBE_BODY_LIMIT:
+                    chunk = await resp.content.read(PROBE_BODY_LIMIT + 1 - len(body))
+                    if not chunk:
+                        break
+                    body += chunk
+                if len(body) > PROBE_BODY_LIMIT:
+                    return False
+                return body.decode(errors="replace").strip() == expected
         except Exception:
             return False
 
