@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from payload_models.payloads import ContainerCreated
 from services.const import LIUM_CREATE_COMMAND_ID_LABEL
-from services.docker_service import DockerService, _CREATE_RECORD_STATE_MARK, _create_record_path
+from services.docker_service import DockerService, _CREATE_RECORD_STATE_MARK, _create_record_path, create_node_absent
 from test_deploy_optimizations import _executor_info, _patch_happy, _payload, _ssh_client, _ssh_result
 
 
@@ -143,3 +143,29 @@ async def test_a_rerun_never_replaces_a_container_the_node_could_not_be_asked_ab
     assert again is None
     assert len(specs) == 1
     cleanup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("node", ["empty", "other_command", "own_without_record", "ssh", "docker"])
+async def test_only_a_listing_without_this_commands_container_counts_as_absent(svc, monkeypatch, node):
+    """create_node_absent is what lets a re-check answer a failure (compute_client): only a Docker listing that answered
+    without this command's container sets it, never an SSH or Docker failure or this command's own container."""
+    n = _Node()
+    ssh_client = n.wrap(_ssh_client(inspect_exit=0))
+    _patch_happy(svc, monkeypatch, ssh_client)
+    payload = _payload(command_id="cmd-1")
+    if node == "other_command":
+        n.container = (True, "cmd-other")
+    elif node == "own_without_record":
+        n.container = (True, "cmd-1")
+    elif node in ("ssh", "docker"):
+        n.container = (True, "cmd-1")
+        n.unavailable = node
+    absent: list[bool] = []
+    token = create_node_absent.set(absent)
+    try:
+        await _create(svc, payload, ssh_client)
+    finally:
+        create_node_absent.reset(token)
+
+    assert absent == ([True] if node in ("empty", "other_command") else [])

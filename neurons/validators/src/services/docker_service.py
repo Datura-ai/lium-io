@@ -3689,6 +3689,12 @@ def _create_record(reply: ContainerCreated) -> str:
     return json.dumps({"command_id": reply.command_id, "reply": reply.model_dump(mode="json")})
 
 
+# set (to an empty list) by miner_driver for a create whose earlier run may have left its container: True is appended
+# once the node's own listing shows no container of this command. Until then a failure of this run is not answered,
+# since the backend would fail or replace the pod while that container may run (compute_client._drive_miner_job)
+create_node_absent: contextvars.ContextVar[list[bool] | None] = contextvars.ContextVar("create_node_absent", default=None)
+
+
 class _OwnCreateWithoutRecord(Exception):
     """This command's container is (or may be) on the node, but the reply its first run saved cannot be read, or the
     node could not be asked whether the container is there."""
@@ -3722,6 +3728,8 @@ async def _replay_own_finished_create(
     record_text, _, state = (result.stdout or "").partition(_CREATE_RECORD_STATE_MARK)
     fields = state.split()
     if len(fields) != 2 or fields[1] != payload.command_id:
+        if (absent := create_node_absent.get()) is not None:
+            absent.append(True)
         return None
     try:
         if fields[0] != "running":

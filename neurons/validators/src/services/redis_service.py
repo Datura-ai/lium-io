@@ -1271,6 +1271,14 @@ class RedisService:
     async def unindex_backend_create(self, pod_id: str, executor_id: str, command_id: str) -> None:
         await self.redis.srem(f"{BACKEND_CREATES_OF_POD_PREFIX}{pod_id}|{executor_id}", command_id)
 
+    async def pods_of_backend_creates(self, command_ids: list[str]) -> "set[str]":   # quoted: the class has a set method
+        """pod IDs of the creates among `command_ids`, read from the create index (written before each create record)"""
+        wanted, pods = set(command_ids), set()
+        async for key in self.redis.scan_iter(match=f"{BACKEND_CREATES_OF_POD_PREFIX}*", count=100):
+            if wanted & {_text(member) for member in await self.redis.smembers(key)}:
+                pods.add(_text(key).removeprefix(BACKEND_CREATES_OF_POD_PREFIX).split("|", 1)[0])
+        return pods
+
     async def running_create_claims(self, unreadable: list[str] | None = None) -> dict[str, BackendCommand]:
         """command ID -> running create claim (on start, every one is a cut-off run's). `unreadable` collects the ids
         of records that could not be read: any of them may be a create's."""
@@ -1525,12 +1533,20 @@ class RedisService:
             return RecentGpuReset(pod_id=raw)
 
     async def renting_in_progress(
-        self, miner_hotkey: str, executor_id: str, pod_id: str | None = None, max_age_seconds: int | None = 30 * 60
+        self,
+        miner_hotkey: str,
+        executor_id: str,
+        pod_id: str | None = None,
+        max_age_seconds: int | None = 30 * 60,
+        except_command_id: str = "",
     ) -> bool:
+        """`except_command_id`: that command's own marks do not count (a resend of a create finds its earlier run's)"""
         pending_pods: list[dict] = await self.get_pending_pods(miner_hotkey, executor_id, max_age_seconds)
-        
+
         if pod_id:
             pending_pods = [item for item in pending_pods if item.get('pod_id', '') == pod_id]
+        if except_command_id:
+            pending_pods = [item for item in pending_pods if item.get("command_id") != except_command_id]
         
         return len(pending_pods) > 0
 

@@ -88,7 +88,7 @@ from websockets.asyncio.client import ClientConnection
 from core.config import settings
 from core.utils import _m, get_extra_info
 from clients.subtensor_client import SubtensorClient
-from services.docker_service import create_steps_after_reply, executor_key, inflight_creates
+from services.docker_service import create_node_absent, create_steps_after_reply, executor_key, inflight_creates
 from services.gpu_reset import renter_gpu_reset_in_progress, renter_gpu_reset_recent, reset_caused
 from services.miner_service import MinerService
 from services.task.event_report_fit import MAX_FRAME_BYTES
@@ -1125,6 +1125,8 @@ class ComputeClient:
         unknown_token = create_outcome_unknown.set(unknown_flags if create else None)
         retirements: list[tuple[str, str]] = []
         retirements_token = deferred_create_retirements.set(retirements if create else None)
+        # an earlier run of this command may have left its container: no failure is answered until the node says not
+        absent_token = create_node_absent.set([] if create and record.unknown else None)
         heartbeat = None if create else asyncio.create_task(self._refresh_backend_command(command_id, claim))
         succeeded = False
         try:
@@ -1135,6 +1137,7 @@ class ComputeClient:
             command_responses.reset(token)
             create_outcome_unknown.reset(unknown_token)
             deferred_create_retirements.reset(retirements_token)
+            create_node_absent.reset(absent_token)
             if heartbeat is not None:
                 heartbeat.cancel()
                 with suppress(asyncio.CancelledError):
@@ -1555,14 +1558,6 @@ class ComputeClient:
             # is the re-run DAH-5437 makes of a cut-off create, replacing what it left under the pod's names. Only a
             # saved success of this very command keeps its claim: the reconnect replays it, and its receipt settles the
             # claim (an older command's saved success for the pod says nothing about this one).
-            if claim.unknown:
-                # a re-check of an unknown outcome was cut off: the outcome is still unknown, and a resend re-checks
-                await redis_service.take_over_backend_command(
-                    command_id,
-                    claim.model_dump_json(),
-                    claim.model_copy(update={"state": "finished", "owner": "", "responses": []}).model_dump_json(),
-                )
-                continue
             saved = unacked.get(claim.pod_id)
             if (
                 saved is not None
@@ -1570,9 +1565,21 @@ class ComputeClient:
                 and await self._replayable_success(claim.pod_id, saved)
             ):
                 continue
-            await redis_service.release_backend_command(command_id)
-        # pods whose container may be on the node with no known outcome: neither resumed nor failed, and the report waits
+            # the run may have started its container before it was cut off: the outcome is unknown, not released for
+            # a blind re-run. The pod is listed as resumed below, and the backend's resend under this ID checks the node
+            # first and answers a failure only once the node shows no container of this command
+            await redis_service.take_over_backend_command(
+                command_id,
+                claim.model_dump_json(),
+                claim.model_copy(
+                    update={"state": "finished", "owner": "", "responses": [], "unknown": True}
+                ).model_dump_json(),
+            )
+        # pods whose container may be on the node with no known outcome (an unreadable record's pod too, found by the
+        # create index written before any record): listed as resumed, so the backend resends each under its own ID and
+        # neither fails it nor replaces it; the resend checks the node before it answers anything
         unknown_pod_ids = {command.pod_id for command in (await redis_service.unknown_create_outcomes()).values()}
+        unknown_pod_ids |= await redis_service.pods_of_backend_creates(unreadable) if unreadable else set()
         resumed: list[str] = []
         reports: list[tuple[FailedContainerRequest, InflightBackendCreate]] = []
         reported_create_ids: dict[str, list[str]] = {}
@@ -1582,7 +1589,7 @@ class ComputeClient:
                 continue
             create = max(pod_creates, key=lambda c: c.resumes)
             if pod_id in unknown_pod_ids:
-                # a re-run could replace that container and a failure report frees its node: only its record stays
+                # resumed below with the others of unknown outcome; only its stale in-flight records go
                 for stale in pod_creates:
                     await self._retire_backend_create_record(pod_id, stale.create_id)
                 continue
@@ -1654,21 +1661,12 @@ class ComputeClient:
                 )
             )
         # DAH-5437: only a sweep that read the records reports; an empty list is the point (Redis lost them)
-        if unreadable or unknown_pod_ids:
-            # an unreadable record, or a create whose outcome is unknown, may be a create that made its container: the
-            # report would fail its pending pod and the backend could place it again elsewhere. Without a report the
-            # backend changes nothing (as with a validator older than 2.5.0); the next start reports once the record
-            # reads, the outcome is known or a delete has settled it
-            logger.error(
-                _m(
-                    "Restart report withheld: backend command records may cover a pending create with a container",
-                    extra=get_extra_info(
-                        {**self.logging_extra, "command_ids": unreadable, "unknown_pod_ids": sorted(unknown_pod_ids)}
-                    ),
-                )
-            )
-            self.resumed_creates_report = None
-            return
+        if unreadable:
+            logger.error(_m(
+                "Unreadable backend command records: their creates' pods are resumed, never failed",
+                extra=get_extra_info({**self.logging_extra, "command_ids": unreadable}),
+            ))
+        resumed += sorted(unknown_pod_ids.difference(resumed))
         self.resumed_creates_report = ResumedCreatesReport(pod_ids=resumed)
 
     async def _drive_miner_job(
@@ -1730,6 +1728,17 @@ class ComputeClient:
                 # this command's container may be on the node without a readable reply (create_container): nothing is
                 # answered, so the backend neither retries the pod elsewhere nor reads it as created, and the command's
                 # record keeps the outcome unknown (miner_driver) so no restart report fails the pod either
+                if (unknown := create_outcome_unknown.get()) is not None:
+                    unknown.append(True)
+                return
+            if isinstance(response, FailedContainerRequest) and (absent := create_node_absent.get()) is not None and not absent:
+                # an earlier run of this command may have left its container, and this run failed before the node
+                # showed it absent (the miner handshake, the pending check, attestation, SSH): answered, the backend
+                # would fail or replace the pod while that container runs. The record stays unknown; a resend re-checks
+                logger.warning(_m(
+                    "Create failure not answered: an earlier run's container may be on the node",
+                    extra=get_extra_info({**logging_extra, "pod_id": job_request.pod_id, "response": str(response)}),
+                ))
                 if (unknown := create_outcome_unknown.get()) is not None:
                     unknown.append(True)
                 return

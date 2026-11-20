@@ -2671,7 +2671,14 @@ class MinerService:
                         error_code=error_code,
                     )
 
-                renting_in_progress = await self.redis_service.renting_in_progress(payload.miner_hotkey, payload.executor_id, payload.pod_id)
+                # a create's own earlier run (cut off, or re-checked) left its mark under the same command ID: the
+                # dedupe claim lets only one run of a command at a time, so that mark is never a concurrent create's
+                renting_in_progress = await self.redis_service.renting_in_progress(
+                    payload.miner_hotkey,
+                    payload.executor_id,
+                    payload.pod_id,
+                    except_command_id=payload.command_id if isinstance(payload, ContainerCreateRequest) else "",
+                )
                 if renting_in_progress and not _bypasses_renting_in_progress(payload):
                     log_text = _m(
                         "Decline renting pod request. Renting is still in progress",
