@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Self, TypeVar
 import aiohttp
 import bittensor
 import numpy as np
+import xxhash
 from bittensor.utils.weight_utils import process_weights_for_netuid
 from datura.chain import (
     ChainConnection,
@@ -221,6 +222,19 @@ def _rpc_result(node, method: str, params: list):
     if not isinstance(reply, dict) or "result" not in reply:
         raise ConnectionError(f"{method} failed: {reply.get('error') if isinstance(reply, dict) else reply!r}")
     return reply["result"]
+
+
+def _twox(data: bytes, seeds: tuple[int, ...]) -> bytes:
+    return b"".join(xxhash.xxh64(data, seed=seed).intdigest().to_bytes(8, "little") for seed in seeds)
+
+
+def _storage_at(node, block_hash: str, pallet: str, item: str, map_key: bytes = b"") -> bytes | None:
+    """A storage value's raw bytes at `block_hash`, None when unset. Read by raw RPC: the SDK's query decodes an error
+    reply as the type's default (zero), which would hide a failing endpoint from the fallback; here it raises a
+    chain error like any other failed call."""
+    key = _twox(pallet.encode(), (0, 1)) + _twox(item.encode(), (0, 1)) + map_key
+    value = _rpc_result(node, "state_getStorage", ["0x" + key.hex(), block_hash])
+    return bytes.fromhex(value[2:]) if value else None
 
 class SubtensorClient:
     # Static class variables (shared across all instances)
@@ -1086,13 +1100,16 @@ class SubtensorClient:
                     raise LookupError(f"block {block} is not finalized yet")
                 block_hash = head
                 if int(header["number"], 16) > block:
-                    block_hash = str(node.query("System", "BlockHash", [block], block_hash=head).value or "")
-                    if not block_hash or int(block_hash, 16) == 0:  # the map's default: no such block in its range
+                    height = block.to_bytes(4, "little")  # System::BlockHash is a Twox64Concat map over u32
+                    found = _storage_at(node, head, "System", "BlockHash", _twox(height, (0,)) + height)
+                    if not found or not any(found):  # unset or zero: no such block in the map's range
                         raise LookupError(f"no hash for block {block} in the finalized head's state")
-                timestamp_ms = node.query("Timestamp", "Now", block_hash=block_hash).value
-                if not timestamp_ms or timestamp_ms <= 0:
-                    # the SDK decodes a null or failed storage reply as the type's default, zero: that is no answer,
-                    # never a 1970 cycle id that would settle the block a second time next to its real one
+                    block_hash = "0x" + found.hex()
+                timestamp = _storage_at(node, block_hash, "Timestamp", "Now")
+                timestamp_ms = int.from_bytes(timestamp, "little") if timestamp else 0
+                if timestamp_ms <= 0:
+                    # an unset or zero value is no answer, never a 1970 cycle id that would settle the block a second
+                    # time next to its real one
                     raise LookupError(f"no timestamp for block {block}")
                 return datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC).strftime("%Y-%m-%d %H:%M:%S")
             except Exception as e:
