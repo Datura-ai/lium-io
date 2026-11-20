@@ -967,7 +967,7 @@ def test_missing_rules_accepts_the_hosts_listing_and_nothing_weaker():
     assert rental_egress.missing_rules(_listed(CHAINS[0], "docker0"), bridges) == ["br-0123456789ab"]
     udp_only = _listed(CHAINS[0], "docker0").splitlines()[1]
     assert rental_egress.missing_rules(udp_only, ["docker0"]) == ["docker0"]
-    narrowed = full.replace("-i docker0 -p tcp", "-i docker0 -s 10.0.0.2/32 -p tcp")
+    narrowed = full.replace("-i docker0 -p tcp", "-i docker0 -s 192.0.2.2/32 -p tcp")
     assert rental_egress.missing_rules(narrowed, bridges) == ["docker0"]
     wider_dns = full.replace("! --dport 53", "! --dport 443", 1)
     assert rental_egress.missing_rules(wider_dns, bridges) == ["br-0123456789ab"]
