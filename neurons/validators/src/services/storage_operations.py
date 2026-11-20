@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 REMOTE_OPERATION_DIRECTORY = PurePosixPath("/root/app/storage-operations")
 REMOTE_RUNNER_PATH = "/root/app/src/storage_runner.py"
 REMOTE_SECRETS_DIRECTORY = PurePosixPath("/root/app/storage-secrets")
+# cancel markers and the per-operation launch/cancel lock live on the executor's reserve_data volume:
+# /root/app's overlay upper is wiped on every executor start, and a marker must outlive a restart
+REMOTE_CANCEL_DIRECTORY = PurePosixPath("/var/lium-reserve/storage-cancels")
 
 # DAH-6148: an operation runs restic in a `lium-storage-<operation id[:12]>` helper container on
 # the node, and reruns it under the same name when it renews credentials or retries an upload.
@@ -177,6 +180,7 @@ class StorageOperationFiles:
     pid: PurePosixPath
     status: PurePosixPath
     cancel: PurePosixPath
+    lock: PurePosixPath
 
     @classmethod
     def for_operation(cls, operation_id: UUID) -> StorageOperationFiles:
@@ -186,7 +190,9 @@ class StorageOperationFiles:
             log=REMOTE_OPERATION_DIRECTORY / f"{stem}.log",
             pid=REMOTE_OPERATION_DIRECTORY / f"{stem}.pid",
             status=REMOTE_OPERATION_DIRECTORY / f"{stem}.status",
-            cancel=REMOTE_OPERATION_DIRECTORY / f"{stem}.cancel",
+            cancel=REMOTE_CANCEL_DIRECTORY / f"{stem}.cancel",
+            # one lock for every operation: each holder keeps it only for a check and a write
+            lock=REMOTE_CANCEL_DIRECTORY / "launch.lock",
         )
 
 
@@ -274,7 +280,8 @@ async def start_storage_operation(
                 f"executor does not support the requested {engine or 'storage'} operation"
             )
         await ssh_client.run(
-            f"install -d -m 0700 {shlex.quote(str(REMOTE_OPERATION_DIRECTORY))}",
+            f"install -d -m 0700 {shlex.quote(str(REMOTE_OPERATION_DIRECTORY))} "
+            f"{shlex.quote(str(REMOTE_CANCEL_DIRECTORY))}",
             check=True,
         )
         # the cancel marker outlives the cancel: a dispatch that reaches the node after it never runs
@@ -339,11 +346,24 @@ async def start_storage_operation(
             f"printf '%s\\n' \"$result\" > {shlex.quote(str(files.status))}; "
             f"rm -f {shlex.quote(str(files.spec))} {shlex.quote(str(files.pid))}{terminal_cleanup}"
         )
+        pid_path = shlex.quote(str(files.pid))
+        # Under the launch lock (the cancel takes it too): refuse if a cancel has marked it,
+        # else start the runner and hold the lock until its PID is written, so a cancel that comes
+        # after always finds the runner to stop. The runner must not inherit the lock (9>&-).
         launch_command = (
+            f"exec 9>>{shlex.quote(str(files.lock))}; flock -w 30 9 || exit 6; "
+            f"if test -e {shlex.quote(str(files.cancel))}; then rm -f {shlex.quote(str(files.spec))}; exit 5; fi; "
             f"nohup /bin/sh -c {shlex.quote(wrapper)} "
-            f"> {shlex.quote(str(files.log))} 2>&1 < /dev/null &"
+            f"> {shlex.quote(str(files.log))} 2>&1 < /dev/null 9>&- & wrapper=$!; "
+            f"attempt=0; while ! test -s {pid_path} && kill -0 \"$wrapper\" 2>/dev/null "
+            "&& test \"$attempt\" -lt 100; do "
+            "sleep 0.05; attempt=$((attempt + 1)); done"
         )
-        await ssh_client.run(launch_command, check=True)
+        launched = await ssh_client.run(launch_command, check=False)
+        if launched.exit_status == 5:
+            raise StorageOperationCancelledBeforeLaunch("storage operation was cancelled before launch")
+        if launched.exit_status != 0:
+            raise StorageOperationLaunchError(f"storage operation launch failed (exit {launched.exit_status})")
         return files
     except Exception as error:
         if not isinstance(error, StorageOperationCancelledBeforeLaunch):  # the cancel already reported it
@@ -429,11 +449,16 @@ async def cancel_storage_operation(
     # process termination is only a bounded fallback for an unresponsive runner.
     # the marker is what stops a later launch, so a cancel that cannot write it fails, but only
     # after it has still stopped the runner and helper
+    # under the launch lock, so a launch either sees this marker or has written its PID first
+    lock_path = shlex.quote(str(files.lock))
     command = (
         "marked=0; "
-        f"install -d -m 0700 {shlex.quote(str(REMOTE_OPERATION_DIRECTORY))} && touch {cancel_path} || marked=4; "
-        f"if test -s {pid_path}; then "
-        f"pid=$(cat {pid_path}); "
+        f"{{ install -d -m 0700 {shlex.quote(str(REMOTE_CANCEL_DIRECTORY))} && exec 9>>{lock_path} "
+        f"&& flock -w 30 9 && touch {cancel_path}; }} || marked=4; "
+        # read under the lock: a launch that took it first has written its PID by now; release it before
+        # the bounded wait so other operations' launches never queue behind this one
+        f"pid=$(cat {pid_path} 2>/dev/null); exec 9>&-; "
+        'if test -n "$pid"; then '
         "case \"$pid\" in (*[!0-9]*|'') exit 2;; esac; "
         'attempt=0; while kill -0 "$pid" 2>/dev/null && test "$attempt" -lt 100; do '
         "sleep 0.25; attempt=$((attempt + 1)); done; "
@@ -533,7 +558,7 @@ async def _remove_operation_artifacts(
         + " ".join(
             shlex.quote(str(path))
             # the cancel marker stays: the operation id is never reused, and a late launch must see it
-            # shortcut: one empty marker per cancelled operation stays on the node; sweep old ones if they pile up
+            # shortcut: one empty marker per cancelled operation stays on the reserve volume; sweep old ones if they pile up
             for path in (files.status, files.log, files.pid, files.spec)
         ),
         check=False,

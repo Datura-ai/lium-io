@@ -47,6 +47,9 @@ def main() -> int:
                 lambda: Path(arguments.cancel_file).exists() if arguments.cancel_file else False
             ),
         )
+        # a cancel that marked the operation before this runner started: no workspace or restore work
+        if arguments.cancel_file and Path(arguments.cancel_file).exists():
+            raise StorageOperationCancelled("storage operation was cancelled before the runner started")
         if operation.action.value == "restore":
             event_writer.stage("PREPARING")
         workspace = WorkspaceResolver().resolve(operation)
