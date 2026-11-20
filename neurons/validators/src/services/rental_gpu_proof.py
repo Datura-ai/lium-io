@@ -1,7 +1,7 @@
 """Rental create proves every rented GPU with CUDA before the pod is reported created.
 
-A host can make nvidia-smi and /proc inside the renter's container list cards CUDA cannot use (5DExpmXh,
-20 Nov 2026: nvidia-smi listed 8, torch.cuda.device_count() was 1). Billing starts on ContainerCreated, so
+A host can make nvidia-smi and /proc inside the renter's container list cards CUDA cannot use (20 Nov 2026:
+nvidia-smi listed 8, torch.cuda.device_count() was 1). Billing starts on ContainerCreated, so
 the create itself asks CUDA, from inside the renter's container: every rented GPU UUID must be a CUDA
 device there that opens a context and runs a 1 MiB memset. A short count raises RentalGpuProofFailed,
 which the create's post-run handler turns into FailedContainerRequest (rent_failed, never billed).
@@ -79,10 +79,15 @@ def judge_gpu_proof(expected_uuids: list[str], stdout: str) -> str:
     usable = [u for u in expected_uuids if seen.get(u.lower(), -1) == 0 or seen.get(u.lower()) in _BUSY_RC]
     if len(usable) == len(expected_uuids):
         return ""
+    # the image's own python3 wrote this answer and the backend reads the error for GPU-fault text: only an int or
+    # the probe's own marker goes into it
+    init_rc = verdict.get("init_rc")
+    if not (isinstance(init_rc, int) or init_rc == "no_libcuda"):
+        init_rc = "?"
     # count only, never which card or which signal disagreed (anti-treadmill, as the all-cards proof)
     return (
         f"CUDA can use {len(usable)} of the {len(expected_uuids)} rented GPUs "
-        f"(cuInit={verdict.get('init_rc')}, CUDA devices={len(seen)})"
+        f"(cuInit={init_rc}, CUDA devices={len(seen)})"
     )
 
 

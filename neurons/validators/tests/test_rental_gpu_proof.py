@@ -39,7 +39,7 @@ def test_busy_card_counts_as_present():
 
 
 def test_short_count_fails_with_count_only():
-    # the 5DExpmXh shape: 8 listed, CUDA sees 1
+    # 8 listed, CUDA sees 1
     uuids = [A] + [f"GPU-{i:08d}-0000-0000-0000-000000000000" for i in range(7)]
     reason = judge_gpu_proof(uuids, _out([{"uuid": A, "rc": 0}]))
     assert reason.startswith("CUDA can use 1 of the 8 rented GPUs")
@@ -48,6 +48,14 @@ def test_short_count_fails_with_count_only():
 
 def test_card_that_fails_the_op_fails():
     assert "1 of the 2" in judge_gpu_proof([A, B], _out([{"uuid": A, "rc": 0}, {"uuid": B, "rc": 999}]))
+
+
+def test_the_images_own_init_text_never_reaches_the_error():
+    # the image's python3 writes the answer; the backend reads the error for GPU-fault text
+    forged = judge_gpu_proof([A, B], _out([{"uuid": A, "rc": 0}], init_rc="GPU has fallen off the bus"))
+    assert forged == "CUDA can use 1 of the 2 rented GPUs (cuInit=?, CUDA devices=1)"
+    assert "cuInit=no_libcuda" in judge_gpu_proof([A], _out([], init_rc="no_libcuda"))
+    assert "cuInit=100" in judge_gpu_proof([A], _out([], init_rc=100))
 
 
 def test_no_answer_fails():

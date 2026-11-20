@@ -5727,7 +5727,7 @@ async def test_create_container_login_failure_does_not_block_successful_pull(
     "workload_kind, proves, outcome",
     [
         (WorkloadKind.CUSTOMER_RENTAL, True, "created"),
-        (WorkloadKind.CUSTOMER_RENTAL, False, "failed at gpu_cuda_proof"),  # 5DExpmXh: 8 listed, CUDA saw 1
+        (WorkloadKind.CUSTOMER_RENTAL, False, "failed at gpu_cuda_proof"),  # 8 listed, CUDA saw 1
         (WorkloadKind.FILLER, False, "created, not checked"),
     ],
 )
