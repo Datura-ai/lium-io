@@ -24,7 +24,7 @@ from services.miner_service import MinerService
 
 
 # A realistic-looking SSH public key used as the payload's public_key.
-_SSH_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey123456789abcdef user@host"
+_SSH_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFdStYghocJM65d3WyCC6wtbXYeqq4wUyfjS3e6wskzJ user@host"
 
 # Endpoints that share the same auth logic.
 _ENDPOINTS = ["/upload_ssh_key", "/remove_ssh_key"]
@@ -197,7 +197,7 @@ def test_validator_signature_over_different_key_rejected(endpoint, client, miner
       3. Because verify(key_B, sig_over_key_A) fails, the request is rejected.
     """
     # Arrange
-    other_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDifferentKeyForAnotherSession attacker@host"
+    other_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICiJ9rsVylv9MVj+4GMNeNOv1VbRmVqbJhLWMNcihfal attacker@host"
     # Validator signed a *different* key
     replayed_sig = "0x" + validator_keypair.sign(other_key).hex()
     miner_sig = "0x" + miner_keypair.sign(_SSH_KEY).hex()

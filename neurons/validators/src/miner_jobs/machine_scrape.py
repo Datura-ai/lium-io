@@ -9,6 +9,7 @@ import shutil
 import socket
 import subprocess
 import threading
+import time
 import psutil
 from functools import wraps
 import hashlib
@@ -99,7 +100,9 @@ COMMANDS = {
         "docker", "run", "--rm",
         "--runtime=sysbox-runc",
         "--gpus", "all",
-        "daturaai/compute-subnet-executor:latest", "nvidia-smi"
+        # the P2P matrix as a rental sees it under this runtime; `|| true` keeps the GPU verdict on `nvidia-smi`
+        "daturaai/compute-subnet-executor:latest",
+        "sh", "-c", "nvidia-smi && echo LIUM_RENTAL_P2P && (nvidia-smi topo -p2p r || true)",
     ],
     "CHECK_STORAGE_LIMIT_ABILITY": [
         "docker", "run", "--rm",
@@ -691,22 +694,41 @@ FILLER_VOLUME_LABEL_KEY = "io.lium.workload"
 FILLER_VOLUME_LABEL_VALUE = "filler"
 
 
+class DeadlineSocket(socket.socket):
+    # a socket whose every read waits only until the wall-clock `deadline` (time.monotonic()): a reply trickled in
+    # many parts, each inside a per-read timeout, still ends at the deadline
+    deadline = None
+
+    def recv_into(self, *args):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("the docker read ran out of its time budget")
+        self.settimeout(remaining)
+        return super().recv_into(*args)
+
+
 class UnixSocketHTTPConnection(http.client.HTTPConnection):
-    def __init__(self, socket_path, timeout):
+    def __init__(self, socket_path, timeout, deadline=None):
         super().__init__("localhost", timeout=timeout)
         self.socket_path = socket_path
+        self.deadline = deadline
 
     def connect(self):
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        if self.deadline is None:
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        else:
+            self.sock = DeadlineSocket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.deadline = self.deadline
         self.sock.settimeout(self.timeout)
         self.sock.connect(self.socket_path)
 
 
-def docker_api_get(path):
+def docker_api_get(path, timeout=DOCKER_API_TIMEOUT_SECONDS, deadline=None):
     # read one docker daemon endpoint over its unix socket; the scrape runs inside the privileged
     # executor container, where the host socket is bind-mounted. The CLI reports these sizes as
-    # human strings ("45.08GB"); the API returns exact integers.
-    conn = UnixSocketHTTPConnection(DOCKER_SOCKET_PATH, DOCKER_API_TIMEOUT_SECONDS)
+    # human strings ("45.08GB"); the API returns exact integers. With a `deadline` the whole reply, every part of
+    # its body included, must arrive by then.
+    conn = UnixSocketHTTPConnection(DOCKER_SOCKET_PATH, timeout, deadline)
     try:
         conn.request("GET", path)
         response = conn.getresponse()
@@ -718,6 +740,248 @@ def docker_api_get(path):
         conn.close()
 
 
+# DAH-6379 host memory facts: what the host uses outside the workload containers, swap, hugepages, the mappings
+# outside the containers (where NVIDIA driver memory shows) and the last OOM since boot. Every field the host does not
+# let us read is None with its reason in hm_errors; nothing here fails the scrape.
+HOST_MEMORY_ROOT = "/proc/1/root"  # the host's filesystem: the executor shares the host PID namespace
+WORKLOAD_CONTAINER_PREFIXES = ("pod_", "filler_")
+# one container's memory cgroup on the host: cgroup v2 under systemd or cgroupfs, then v1 (memory controller)
+CONTAINER_MEMORY_CGROUPS = (
+    ("/sys/fs/cgroup/system.slice/docker-{id}.scope", "memory.current"),
+    ("/sys/fs/cgroup/docker/{id}", "memory.current"),
+    ("/sys/fs/cgroup/memory/system.slice/docker-{id}.scope", "memory.usage_in_bytes"),
+    ("/sys/fs/cgroup/memory/docker/{id}", "memory.usage_in_bytes"),
+)
+KMSG_PATH = "/dev/kmsg"
+KMSG_MAX_READS = 200000
+# both workload listings together, out of the scrape's own 300 s budget: past it the listing is unknown, never a timeout
+HOST_MEMORY_INVENTORY_SECONDS = 5
+
+
+def parse_meminfo_kb(text):
+    # /proc/meminfo as {name: kB}; HugePages_* are page counts, not kB, and are returned as is
+    values = {}
+    for line in text.splitlines():
+        name, _, rest = line.partition(":")
+        parts = rest.split()
+        if parts and parts[0].isdigit():
+            values[name.strip()] = int(parts[0])
+    return values
+
+
+def parse_memory_stat_kb(text):
+    # a cgroup's memory.stat (bytes) as {name: kB}
+    values = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].isdigit():
+            values[parts[0]] = int(parts[1]) // 1024
+    return values
+
+
+def last_oom_from_kmsg(records, boot_epoch):
+    # ("global" | "memcg", epoch seconds) of the newest OOM kill in /dev/kmsg records ("pri,seq,usec,flags;msg"), or None
+    last = None
+    for record in records:
+        header, _, message = record.partition(";")
+        fields = header.split(",")
+        # facility 0 (kernel) only: a user process can write a look-alike text to /dev/kmsg
+        if not fields[0].isdigit() or int(fields[0]) >> 3 != 0:
+            continue
+        # only the kernel's victim records count: its warnings ("Out of memory and no killable processes...") are no kill
+        if message.startswith("Memory cgroup out of memory: Killed process "):
+            kind = "memcg"
+        elif message.startswith(("Out of memory: Killed process ", "Out of memory (oom_kill_allocating_task): Killed process ")):
+            kind = "global"
+        else:
+            continue
+        if len(fields) >= 3 and fields[2].isdigit():
+            last = (kind, round(boot_epoch + int(fields[2]) / 1e6, 3))
+    return last
+
+
+def read_kmsg_records(path=KMSG_PATH):
+    # every record still in the kernel ring buffer, without blocking at its end; raises unless the scan reached the
+    # end whole, so a partial scan is never read as "the newest kill" (records are oldest first)
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    records = []
+    try:
+        for _ in range(KMSG_MAX_READS):
+            try:
+                chunk = os.read(fd, 8192)
+            except BlockingIOError:
+                return records
+            except OSError as exc:
+                if exc.errno == 32:  # EPIPE: a record was overwritten before it was read
+                    raise RuntimeError("a kernel log record was overwritten during the read") from exc
+                raise
+            if not chunk:
+                return records
+            records.append(chunk.decode("utf-8", "replace"))
+        raise RuntimeError(f"the kernel log did not end within {KMSG_MAX_READS} reads")
+    finally:
+        os.close(fd)
+
+
+def container_memory_kb(container_id, host_root=HOST_MEMORY_ROOT):
+    # (memory.current kB, memory.stat {name: kB}, the huge pages its hugetlb.*.current files hold in kB or None when it
+    # has none) of one container's cgroup on the host; raises when none is readable
+    for directory, usage_file in CONTAINER_MEMORY_CGROUPS:
+        base = host_root + directory.format(id=container_id)
+        if os.path.isdir(base):
+            with open(f"{base}/{usage_file}") as usage, open(f"{base}/memory.stat") as stat:
+                current, stats = int(usage.read().strip()) // 1024, parse_memory_stat_kb(stat.read())
+            # usage only: hugetlb.<size>.current, never hugetlb.<size>.rsvd.current (reservations)
+            hugetlb_files = [n for n in os.listdir(base) if n.startswith("hugetlb.") and n.count(".") == 2 and n.endswith(".current")]
+            hugetlb = None
+            for name in hugetlb_files:
+                with open(f"{base}/{name}") as pages:
+                    hugetlb = (hugetlb or 0) + int(pages.read().strip()) // 1024
+            return current, stats, hugetlb
+    raise FileNotFoundError(f"no memory cgroup for container {container_id[:12]}")
+
+
+def list_workload_container_ids(deadline):
+    # the running pod and filler containers as sorted (full id, State.StartedAt), listed now: an older listing misses a
+    # pod started since, and the start time tells a restart of the same container apart (rental_docker_sdk
+    # container_identity). Every docker read shares the wall-clock `deadline` (time.monotonic()); no nested helper,
+    # which the obfuscator does not rename consistently.
+    workloads = []
+    paths = ["/containers/json"]
+    while paths:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("the docker listing ran out of its time budget")
+        path = paths.pop(0)
+        reply = docker_api_get(path, remaining, deadline)
+        if path == "/containers/json":
+            paths = [
+                f"/containers/{container['Id']}/json"
+                for container in reply
+                if any(name.lstrip("/").startswith(WORKLOAD_CONTAINER_PREFIXES) for name in container.get("Names") or [])
+            ]
+        else:
+            started_at = (reply.get("State") or {}).get("StartedAt")
+            if not started_at:
+                raise ValueError(f"docker inspect has no State.StartedAt for {path}")
+            workloads.append((reply["Id"], started_at))
+    if time.monotonic() > deadline:
+        raise TimeoutError("the docker listing ran out of its time budget")
+    return sorted(workloads)
+
+
+def get_host_memory(list_workloads=list_workload_container_ids, host_root=HOST_MEMORY_ROOT, meminfo_path="/proc/meminfo",
+                    vmstat_path="/proc/vmstat", stat_path="/proc/stat", read_kmsg=read_kmsg_records):
+    errors = {}
+    facts = {"hm_errors": errors}
+    # the workloads are listed right before and after the memory reads; a change between them (a container started,
+    # stopped or restarted) nulls the subtraction. Both listings share one short time budget.
+    deadline = time.monotonic() + HOST_MEMORY_INVENTORY_SECONDS
+    try:
+        workloads = list_workloads(deadline)
+    except Exception as exc:
+        workloads = None
+        inventory_error = f"docker inventory failed: {exc!r}"
+    with open(meminfo_path) as meminfo:
+        mem = parse_meminfo_kb(meminfo.read())
+
+    facts["hm_mem_total_kb"] = mem.get("MemTotal")
+    facts["hm_mem_available_kb"] = mem.get("MemAvailable")
+    facts["hm_swap_total_kb"] = mem.get("SwapTotal")
+    facts["hm_swap_used_kb"] = mem["SwapTotal"] - mem["SwapFree"] if "SwapFree" in mem and "SwapTotal" in mem else None
+    facts["hm_shmem_kb"] = mem.get("Shmem")
+    facts["hm_page_cache_kb"] = mem.get("Cached")
+    facts["hm_hugepages_total"] = mem.get("HugePages_Total")
+    facts["hm_hugepages_free"] = mem.get("HugePages_Free")
+    facts["hm_hugepage_size_kb"] = mem.get("Hugepagesize")
+    facts["hm_mapped_kb"] = mem.get("Mapped")
+    for name, key in (("SwapTotal", "hm_swap_total_kb"), ("HugePages_Total", "hm_hugepages_total"), ("Mapped", "hm_mapped_kb")):
+        if name not in mem:
+            errors[key] = f"{name} not in /proc/meminfo"
+
+    # the workload containers' cgroups: memory.current counts their anon, page cache and shmem
+    current = file_ = shmem = file_mapped = 0
+    hugetlb_unaccounted = False
+    unread = []
+    for container_id, _started_at in workloads or []:
+        try:
+            usage, stat, hugetlb_pages = container_memory_kb(container_id, host_root)
+        except Exception as exc:
+            unread.append(f"{container_id[:12]}: {exc!r}")
+            continue
+        current += usage
+        # memory.stat has a hugetlb line only with hugetlb accounting on (cgroup v2 memory_hugetlb_accounting), and pages
+        # faulted before that remount are in hugetlb.*.current but not in it: trusted only when the two agree
+        hugetlb_unaccounted = hugetlb_unaccounted or stat.get("hugetlb") is None or stat["hugetlb"] != hugetlb_pages
+        # v1's usage counts child cgroups, as its total_* stats do (its plain ones are local); v2's are hierarchical
+        # swap cache is in neither the cgroup's file nor the host's Cached (the kernel counts it in the node's file
+        # pages only, the cgroup's in swapcached): both sides leave it in use, nothing to take out
+        file_ += stat.get("total_cache", stat.get("file", 0))
+        shmem += stat.get("total_shmem", stat.get("shmem", 0))
+        file_mapped += stat.get("total_mapped_file", stat.get("file_mapped", 0))
+    if workloads is not None:
+        try:
+            if list_workloads(deadline) != workloads:
+                inventory_error = "the workload containers changed during the memory reads"
+                workloads = None
+        except Exception as exc:
+            inventory_error = f"docker inventory failed: {exc!r}"
+            workloads = None
+    facts["hm_workload_containers"] = None if workloads is None else len(workloads)
+    if workloads is None:
+        errors["hm_workload_containers"] = inventory_error
+    outside_keys = ("hm_outside_workloads_kb", "hm_outside_workloads_no_cache_kb", "hm_mapped_outside_workloads_kb")
+    if workloads is None or unread or not all(n in mem for n in ("MemTotal", "MemFree", "Buffers", "Cached", "Shmem", "Mapped")):
+        for key in outside_keys:
+            facts[key] = None
+            errors[key] = inventory_error if workloads is None else "; ".join(unread) or "a /proc/meminfo field is missing"
+    else:
+        used = mem["MemTotal"] - mem["MemFree"]
+        # all page cache counted as used, then without it (shmem and tmpfs, /dev/shm included, stay counted: not reclaimable)
+        facts["hm_outside_workloads_kb"] = used - current
+        facts["hm_outside_workloads_no_cache_kb"] = (used - mem["Buffers"] - mem["Cached"] + mem["Shmem"]) - (current - file_ + shmem)
+        # mapped pages no workload cgroup owns: an upper bound for NVIDIA driver and other host mappings
+        facts["hm_mapped_outside_workloads_kb"] = mem["Mapped"] - file_mapped
+        # host and cgroup figures are read moments apart: a workload that grew in between leaves a residual below zero
+        if any(facts[key] < 0 for key in outside_keys):
+            for key in outside_keys:
+                facts[key] = None
+                errors[key] = "a workload grew between the host and container reads (negative residual)"
+        # MemTotal - MemFree holds the whole huge page pool: a host-only pool stays host use, and a pod's share is in its
+        # memory.current only under hugetlb accounting; without it a running workload's share is unknown
+        pool = mem.get("Hugetlb", mem.get("HugePages_Total", 0) * mem.get("Hugepagesize", 0))
+        # a pool whose every page is free (Hugetlb is the default pool alone, all of it free) holds no workload's share,
+        # so whatever the accounting it stays host use
+        all_free = all(k in mem for k in ("Hugetlb", "HugePages_Free", "Hugepagesize")) and (
+            mem["Hugetlb"] == mem["HugePages_Free"] * mem["Hugepagesize"]
+        )
+        if pool and not all_free and hugetlb_unaccounted and facts["hm_outside_workloads_kb"] is not None:
+            for key in outside_keys[:2]:
+                facts[key] = None
+                errors[key] = "a huge page pool is reserved and a workload's hugetlb charge is not accounted"
+
+    try:
+        with open(vmstat_path) as vmstat:
+            counters = dict(line.split()[:2] for line in vmstat if len(line.split()) >= 2)
+        facts["hm_oom_kills_since_boot"] = int(counters["oom_kill"])
+    except Exception as exc:
+        facts["hm_oom_kills_since_boot"] = None
+        errors["hm_oom_kills_since_boot"] = repr(exc)
+
+    facts["hm_last_oom_kind"] = facts["hm_last_oom_at"] = None
+    try:
+        with open(stat_path) as stat:
+            boot_epoch = next(int(line.split()[1]) for line in stat if line.startswith("btime "))
+        last = last_oom_from_kmsg(read_kmsg(), boot_epoch)
+        if last:
+            facts["hm_last_oom_kind"], facts["hm_last_oom_at"] = last
+        elif facts["hm_oom_kills_since_boot"]:
+            errors["hm_last_oom_at"] = "OOM kills since boot, none left in the kernel log"
+    except Exception as exc:
+        errors["hm_last_oom_at"] = repr(exc)
+    return facts
+
+
 def get_executor_pid_mode():
     # PidMode of the executor's own container (hostname = container id): "host", or "" when private.
     # A missing or non-string value raises, so the scrape reports unknown instead of a failing mode.
@@ -727,6 +991,155 @@ def get_executor_pid_mode():
     if not isinstance(pid_mode, str):
         raise ValueError(f"docker inspect has no HostConfig.PidMode: {pid_mode!r}")
     return pid_mode
+
+
+NEEDRESTART_GUARD_FILE = "/etc/needrestart/conf.d/lium-container-runtime.conf"
+# the services nvidia_docker_sysbox_setup.sh keeps needrestart from restarting under running pods (DAH-6384)
+NEEDRESTART_GUARD_SERVICES = ("sysbox", "docker", "containerd", "nvidia-fabricmanager", "nvidia-persistenced")
+# the units needrestart matches each guard against: qr(^sysbox) covers the sysbox package's three units
+NEEDRESTART_GUARD_UNITS = {
+    "sysbox": ("sysbox.service", "sysbox-mgr.service", "sysbox-fs.service"),
+    "docker": ("docker.service",),
+    "containerd": ("containerd.service",),
+    "nvidia-fabricmanager": ("nvidia-fabricmanager.service",),
+    "nvidia-persistenced": ("nvidia-persistenced.service",),
+}
+
+
+def needrestart_data_line(line, literal, plain_setting):
+    # What Perl stores on a data-only line, or None if the line may run code: ("set",), ("open", key) for
+    # $nrconf{key} = { or [, ("close",), or ("entry", pattern, value, is_qr) for one hash/list entry, where the key is a
+    # literal or a qr<delim>...<delim> that neither interpolates (@x, $x, ${...}) nor runs code ((?{...}))
+    if re.fullmatch(plain_setting, line):
+        return ("set",)
+    opener = re.fullmatch(r"[ \t]*\$nrconf\{(\w+)\}\s*=\s*[\[{]\s*([}\]]\s*;\s*)?(#.*)?", line)
+    if opener:
+        return ("set",) if opener.group(2) else ("open", opener.group(1))
+    if re.fullmatch(r"[ \t]*[}\]]\s*;\s*(#.*)?", line):
+        return ("close",)
+    rest = r"\s*(?:=>\s*" + literal + r"\s*)?,?\s*(#.*)?"
+    entry = re.fullmatch(r"[ \t]*" + literal + rest, line)
+    if entry:
+        return ("entry", entry.group(1).strip("'\""), entry.group(3), False)
+    start = re.match(r"[ \t]*qr([^\w\s])", line)
+    if not start:
+        return None
+    opening = start.group(1)
+    closing = {"(": ")", "{": "}", "[": "]", "<": ">"}.get(opening, opening)
+    depth, i = 1, start.end()
+    while i < len(line):  # Perl nests bracketing delimiters and skips backslash escapes
+        if line[i] == "\\":
+            i += 2
+            continue
+        if line[i] == closing:
+            depth -= 1
+            if depth == 0:
+                body = line[start.end() : i]
+                after = re.fullmatch(rest, line[i + 1 :])
+                if re.search(r"[@$]#?[\w{:$]|\(\?\??\{", body) or not after:  # @. and a closing $ do not interpolate
+                    return None
+                return ("entry", body, after.group(1), True)
+        elif line[i] == opening and opening != closing:
+            depth += 1
+        i += 1
+    return None
+
+
+def get_needrestart_guard(host_root="/proc/1/root"):
+    # "present", "partial", "missing" or "no_needrestart", plus the services the host file leaves unguarded.
+    # Hosts set up before the setup script wrote the file (16 Nov) have needrestart and no guard. The setup script
+    # writes the guard file on hosts without needrestart too, so only the binary or the stock config counts.
+    if os.path.samefile(host_root + "/", "/"):  # as docker_utils' [ /proc/1/root/ -ef / ]
+        raise RuntimeError("no host view: the executor is not in the host PID namespace")
+    if not (os.path.exists(host_root + "/usr/sbin/needrestart") or os.path.isfile(host_root + "/etc/needrestart/needrestart.conf")):
+        return "no_needrestart", []
+    try:
+        with open(host_root + NEEDRESTART_GUARD_FILE) as guard_file:
+            text = guard_file.read()
+    except FileNotFoundError:
+        return "missing", list(NEEDRESTART_GUARD_SERVICES)
+    zero = ("0", "'0'", '"0"')  # anything else (1, '1', "'0'", an expression) may be true in Perl
+    last_values = {}
+    other_rules = []  # (pattern, value) of every rule that is not one of the five exact keys
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        # only the exact line the setup script writes is understood; any other live Perl (another
+        # delimiter, two statements on a line, a map reset) may undo a guard, so it guards nothing
+        match = re.fullmatch(r"[ \t]*\$nrconf\{override_rc\}->\{qr\(\^([\w.-]+)\)\}\s*=\s*([^;#]+?)\s*;\s*(#.*)?", line)
+        if not match:
+            return "partial", list(NEEDRESTART_GUARD_SERVICES)
+        last_values[match.group(1)] = match.group(2)  # Perl keeps the last assignment
+        if match.group(1) not in NEEDRESTART_GUARD_SERVICES:
+            other_rules.append(("^" + match.group(1), match.group(2)))
+    # needrestart evals needrestart.conf, whose stock loader block then evals conf.d/*.conf in name order. Config
+    # is Perl, and code anywhere (a tie on %nrconf, a sub, %nrconf = ()) can undo the guard in ways no text scan
+    # rules out, so every file must be data only: literal settings, {/[ structures of qr// and literal entries,
+    # and the loader. A later file may only set other keys to literals; anything else leaves it unknowable.
+    unknowable = ("partial", list(NEEDRESTART_GUARD_SERVICES))
+    literal = r"""(-?\d+(\.\d+)?|'[^'\\]*'|"[^"\\$@]*")"""
+    plain_setting = r"[ \t]*\$nrconf\{(\w+)\}\s*=\s*" + literal + r"\s*;\s*(#.*)?"
+    loader = [
+        "if(-d q(/etc/needrestart/conf.d)) {",
+        "foreach my $fn (sort </etc/needrestart/conf.d/*.conf>) {",
+        'print STDERR "$LOGPREF eval $fn\\n" if($nrconf{verbosity} > 1);',  # needrestart 3.4 (Ubuntu 20.04): verbose
+        "eval do { local(@ARGV, $/) = $fn; <>};",
+        'die "Error parsing $fn: $@" if($@);',
+        "}",
+        "}",
+    ]
+    conf_dir = host_root + "/etc/needrestart/conf.d"
+    guard_name = os.path.basename(NEEDRESTART_GUARD_FILE)
+    try:
+        with open(host_root + "/etc/needrestart/needrestart.conf") as conf_file:
+            main = [ln for ln in conf_file.read().splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    except FileNotFoundError:
+        return unknowable  # no main config, so nothing loads conf.d and the guard file is never read
+    # the stock files differ only in 3.4's log condition and its one computed setting, matched exactly
+    old_log = 'print STDERR "$LOGPREF eval $fn\\n" if($nrconf{verbose});'
+    stock_code = ["$nrconf{skip_mapfiles} = (-d '/proc/sys/kernel/grsecurity' ? -1 : 0);"]
+    flat = [" ".join(ln.split()).replace(old_log, loader[2]) for ln in main]
+    at = next((i for i in range(len(flat)) if flat[i : i + len(loader)] == loader), None)
+    if at is None or at + len(loader) != len(main):
+        return unknowable  # conf.d is not loaded the stock way, or main config code runs after the guard file
+    earlier = [[ln for ln, f in zip(main[:at], flat) if f not in stock_code]]
+    names = sorted(n for n in os.listdir(conf_dir) if n.endswith(".conf") and n != guard_name)
+    for name in names:
+        with open(conf_dir + "/" + name) as conf_file:
+            lines = [ln for ln in conf_file.read().splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+        if name < guard_name:
+            earlier.append(lines)
+        elif not all((m := re.fullmatch(plain_setting, ln)) and m.group(1) != "override_rc" for ln in lines):
+            return unknowable
+    for lines in earlier:
+        block = None
+        for ln in lines:
+            data = needrestart_data_line(ln, literal, plain_setting)
+            if data is None:
+                return unknowable
+            if data[0] == "open":
+                block = data[1]
+            elif data[0] == "close":
+                block = None
+            elif data[0] == "entry" and block == "override_rc":
+                # the parser that accepted the line also gives its rule, so no delimiter is read one way and kept another.
+                # The guard file overwrites only the same Perl key: qr(^<service>) with any delimiter stringifies alike,
+                # while the string '^<service>' is another key that stays next to it.
+                if not (data[3] and data[1] in ["^" + s for s in NEEDRESTART_GUARD_SERVICES]):
+                    other_rules.append((data[1], data[2]))
+    unguarded = []
+    for service in NEEDRESTART_GUARD_SERVICES:
+        overlapping = False
+        for pattern, value in other_rules:
+            if value in zero:
+                continue
+            try:
+                overlapping = overlapping or any(re.search(pattern, unit) for unit in NEEDRESTART_GUARD_UNITS[service])
+            except re.error:
+                overlapping = True  # a pattern Python cannot read may still match in Perl
+        if overlapping or last_values.get(service) not in zero:
+            unguarded.append(service)
+    return ("partial" if unguarded else "present"), unguarded
 
 
 def get_vloopback_volume_bytes(docker_root_dir, filler_only=False, sizes=None):
@@ -1040,6 +1453,9 @@ def get_docker_info(content: bytes):
             data["docker_host_cpu_percent"] = host_cpu_percent
 
         containers = []
+        # the executor is the container this scrape runs in, never another one on its image (the monitor,
+        # or a burner); with no such match none is reported, which excuses nothing
+        own_pid = str(os.getpid())
 
         for container_id in container_ids:
             # Get the image ID of the container
@@ -1063,9 +1479,23 @@ def get_docker_info(content: bytes):
             if repo_digests:
                 digest = repo_digests[0].split('@')[1]
                 if repo_digests[0].split('@')[0] == 'daturaai/compute-subnet-executor':
-                    data["docker_container_id"] = container_id
+                    # `docker top` lists the container's processes by cgroup, in host pids under the required
+                    # `pid: host`; a hostname can name any container, and a daemonized sshd leaves the init's tree
+                    try:
+                        in_container = own_pid in run_cmd(f'{docker_path} top {container_id} -eo pid').split()[1:]
+                    except RuntimeError:
+                        in_container = False
+                    if in_container:
+                        data["docker_container_id"] = container_id
 
-            container_entry = {'each_container_id': container_id, 'each_digest': digest or '', "each_name": container_name}
+            # the image repository the container runs, which names a Lium filler's workload
+            repository = repo_digests[0].split('@')[0] if repo_digests else ''
+            container_entry = {
+                'each_container_id': container_id,
+                'each_digest': digest or '',
+                "each_name": container_name,
+                'each_repository': repository,
+            }
             cpu_percent = cpu_percents.get(container_id[:12])
             if cpu_percent is not None:
                 container_entry['each_cpu_percent'] = cpu_percent
@@ -1146,10 +1576,19 @@ def get_gpu_processes(pids: set, containers: list[dict]):
                     container_name = container['each_name']
                     break
 
+            # what runs, read only inside our own filler containers: a renter's command line can hold secrets
+            cmdline = ""
+            if container_name and container_name.startswith("filler_"):
+                try:
+                    cmdline = run_cmd(f"tr '\\0' ' ' < /proc/{pid}/cmdline").strip()[:512]
+                except:
+                    pass
+
             processes.append({
                 "processes_pid": pid,
                 "processes_info": info,
-                "processes_container_name": container_name
+                "processes_container_name": container_name,
+                "processes_cmdline": cmdline
             })
         except:
             pass
@@ -1177,7 +1616,18 @@ def run_capability_check(command):
         run_storage_probe(["docker", "rm", "-f", name], VLOOPBACK_CLEANUP_TIMEOUT_SECONDS)
 
 
-def check_sysbox_gpu_compatibility() -> tuple[bool, str]:
+RENTAL_P2P_MARKER = "LIUM_RENTAL_P2P"
+
+
+def rental_p2p_output(stdout):
+    """The `topo -p2p r` table printed inside the sysbox check container, or None when it printed none."""
+    if RENTAL_P2P_MARKER not in stdout:
+        return None
+    table = stdout.split(RENTAL_P2P_MARKER, 1)[1]
+    return table if table.strip() else None
+
+
+def check_sysbox_gpu_compatibility() -> tuple[bool, str, str | None]:
     """
     Checks if the system supports running Docker containers with the sysbox-runc runtime
     and NVIDIA GPU access (--gpus all).
@@ -1191,18 +1641,18 @@ def check_sysbox_gpu_compatibility() -> tuple[bool, str]:
         result = run_capability_check(test_command)
 
         if result.returncode == 0:
-            return True, "Sysbox runtime supports GPU access."
+            return True, "Sysbox runtime supports GPU access.", rental_p2p_output(result.stdout)
         else:
-            return False, "Sysbox runtime does not support GPU access."
+            return False, "Sysbox runtime does not support GPU access.", None
 
     except subprocess.TimeoutExpired:
-        return False, "Test command timed out."
+        return False, "Test command timed out.", None
 
     except FileNotFoundError:
-        return False, "Docker is not installed or not found in PATH."
+        return False, "Docker is not installed or not found in PATH.", None
 
     except Exception as e:
-        return False, f"An unexpected error occurred: {e}"
+        return False, f"An unexpected error occurred: {e}", None
 
 
 # ticket-0331 (22 Sep 2026): the `--storage-opt` probe passed on a host where every rental volume failed to
@@ -1373,6 +1823,26 @@ def vloopback_check_payload(storage_opt_supported, sysbox_supported):
 
 SYSBOX_RUNC_CANDIDATES = ("sysbox-runc", "/usr/bin/sysbox-runc", "/usr/local/bin/sysbox-runc")
 SYSBOX_VERSION_PATTERN = re.compile(r"^\s*version:\s*([0-9A-Za-z.+~_-]{1,32})", re.MULTILINE)
+
+
+# A VM whose CPUID hides the brand string (a TDX guest, some clouds) makes lscpu print "Model name: 06/cf",
+# the raw family/model in hex. Intel family 6 ids from arch/x86/include/asm/intel-family.h; the raw id stays
+# in the name, so the validator's TDX host check still reads it.
+INTEL_FAMILY6_SERVER_CPUS = {
+    "8f": "Intel Xeon 4th Gen Scalable (Sapphire Rapids)",
+    "cf": "Intel Xeon 5th Gen Scalable (Emerald Rapids)",
+    "ad": "Intel Xeon 6 (Granite Rapids)",
+    "ae": "Intel Xeon 6 (Granite Rapids-D)",
+    "af": "Intel Xeon 6 (Sierra Forest)",
+}
+
+
+def cpu_model_name(lscpu_model: str) -> str:
+    raw = re.fullmatch(r"\s*0*([0-9a-fA-F]+)/([0-9a-fA-F]+)\s*", lscpu_model or "")
+    if not raw or int(raw.group(1), 16) != 6:
+        return lscpu_model
+    name = INTEL_FAMILY6_SERVER_CPUS.get(raw.group(2).lower())
+    return f"{name}, CPUID {lscpu_model.strip()}" if name else lscpu_model
 
 
 def get_sysbox_version() -> str | None:
@@ -1888,7 +2358,7 @@ def summarize_gpu_interconnect(topo_output, p2p_output, nvlink_output):
     }
 
 
-def get_gpu_interconnect():
+def get_gpu_interconnect(rental_p2p=None):
     """Run the three nvidia-smi topology tables and summarize them; never fails the scrape.
 
     `topo -m` is required - without it there is nothing to report and the reason travels in
@@ -1901,11 +2371,13 @@ def get_gpu_interconnect():
     except Exception as exc:
         return GpuInterconnectObservation(None, f"{NVIDIA_SMI_TOPO_MATRIX_CMD}: {exc!r}"[:400])
 
-    p2p_output = None
-    try:
-        p2p_output = run_cmd(NVIDIA_SMI_TOPO_P2P_READ_CMD)
-    except Exception as exc:
-        errors.append(f"{NVIDIA_SMI_TOPO_P2P_READ_CMD}: {exc!r}"[:200])
+    # a sysbox rental can read NS on pairs this scrape container reads OK: list what the rental sees
+    p2p_output = rental_p2p
+    if p2p_output is None:
+        try:
+            p2p_output = run_cmd(NVIDIA_SMI_TOPO_P2P_READ_CMD)
+        except Exception as exc:
+            errors.append(f"{NVIDIA_SMI_TOPO_P2P_READ_CMD}: {exc!r}"[:200])
 
     nvlink_output = None
     try:
@@ -2427,7 +2899,7 @@ def get_machine_specs():
     sysbox_check, storage_limit_check = run_checks_concurrently(
         [check_sysbox_gpu_compatibility, check_storage_limit_ability]
     )
-    is_supported, log_text = sysbox_check
+    is_supported, log_text, rental_p2p = sysbox_check
     data["data_sysbox_runtime"] = is_supported
     if not is_supported:
         data["data_sysbox_runtime_scrape_error"] = log_text
@@ -2457,14 +2929,14 @@ def get_machine_specs():
     if infiniband.scrape_error:
         data["data_infiniband_scrape_error"] = infiniband.scrape_error
 
-    interconnect = get_gpu_interconnect()
+    interconnect = get_gpu_interconnect(rental_p2p)
     data["data_interconnect"] = interconnect.payload
     if interconnect.scrape_error:
         data["data_interconnect_scrape_error"] = interconnect.scrape_error
 
     try:
         lscpu_output = run_cmd("lscpu")
-        data["data_cpu"]["cpu_model"] = re.search(r"Model name:\s*(.*)$", lscpu_output, re.M).group(1)
+        data["data_cpu"]["cpu_model"] = cpu_model_name(re.search(r"Model name:\s*(.*)$", lscpu_output, re.M).group(1))
         data["data_cpu"]["cpu_count"] = int(re.search(r"CPU\(s\):\s*(.*)", lscpu_output).group(1))
         data["data_cpu"]["cpu_utilization"] = psutil.cpu_percent(interval=1)
     except Exception as exc:
@@ -2496,6 +2968,12 @@ def get_machine_specs():
     except Exception as exc:
         # print(f"Error reading /proc/meminfo; Exc: {exc}", file=sys.stderr)
         data["ram_scrape_error"] = repr(exc)
+
+    # DAH-6379: unreadable fields are None with a reason inside; a whole-block failure is reported, never raised
+    try:
+        data["data_host_memory"] = get_host_memory()
+    except Exception as exc:
+        data["data_host_memory_scrape_error"] = repr(exc)
 
     data["data_hard_disk"] = {}
     try:
@@ -2535,6 +3013,12 @@ def get_machine_specs():
         data["data_executor_pid_mode"] = get_executor_pid_mode()
     except Exception as exc:
         data["data_executor_pid_mode_scrape_error"] = repr(exc)
+
+    # DAH: hosts set up before 16 Nov lack the needrestart guard; missing key = unknown, never fails
+    try:
+        data["data_needrestart_guard"], data["data_needrestart_guard_unguarded"] = get_needrestart_guard()
+    except Exception as exc:
+        data["data_needrestart_guard_scrape_error"] = repr(exc)
 
     data["data_os"] = ""
     try:

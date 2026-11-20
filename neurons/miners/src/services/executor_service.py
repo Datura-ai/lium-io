@@ -15,6 +15,7 @@ from core.config import settings
 from core.utils import _m, get_extra_info
 from daos.executor import ExecutorDao
 from models.executor import Executor
+from services.node_address import executor_session
 from services.ssh_service import MinerSSHService
 
 from protocol.miner_portal_request import (
@@ -163,8 +164,8 @@ class ExecutorService:
         try:
             timeout = aiohttp.ClientTimeout(total=10)
             url = f"http://{executor.address}:{executor.port}/version"
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as response:
+            async with executor_session(timeout=timeout) as session:
+                async with session.get(url, allow_redirects=False) as response:
                     if response.status != 200:
                         return False, f"Executor health check failed with status {response.status}"
             return True, "Connectivity test passed - proceeding to save executor"
@@ -316,9 +317,12 @@ class ExecutorService:
     async def get_executors_for_validator(
         self, validator_hotkey: str, miner_hotkey: str, executor_id: Optional[str] = None,
         host_keys: dict[str, str] | None = None,
+        node_accounts: dict[str, dict] | None = None,
     ) -> list[Executor]:
         """`host_keys`, when given, is filled (central mode) with each node's SSH host key as the portal recorded it
-        at registration, by executor id, from the same portal read as the list (DAH-5729)."""
+        at registration, by executor id, from the same portal read as the list (DAH-5729). `node_accounts` likewise
+        gets the hotkeys and account claim the portal checked the node against (`node_hotkeys`, `account_claim`,
+        DAH-6539)."""
         # Standard mode: use local DB, in Standard mode
         if not settings.CENTRAL_MODE:
             return self.executor_dao.get_executors_for_validator(validator_hotkey, executor_id)
@@ -345,6 +349,11 @@ class ExecutorService:
                 uuid = UUID(item.get("id"))
                 if host_keys is not None and item.get("ssh_host_key"):
                     host_keys[str(uuid)] = item["ssh_host_key"]
+                if node_accounts is not None and item.get("node_hotkeys"):
+                    node_accounts[str(uuid)] = {
+                        "hotkeys": [str(h) for h in item["node_hotkeys"]],
+                        "claim": item.get("account_claim") or None,
+                    }
                 result.append(
                     Executor(
                         uuid=uuid,
@@ -413,7 +422,7 @@ class ExecutorService:
                 extra=get_extra_info(base_log_extra),
             ),
         )
-        async with aiohttp.ClientSession() as session:
+        async with executor_session() as session:
             for attempt in range(1, UPLOAD_SSH_KEY_ATTEMPTS + 1):
                 # the first attempt keeps main's full timeout, so a slow portal lookup never fails an upload main
                 # accepted; only the retries are clipped to the deadline
@@ -423,7 +432,7 @@ class ExecutorService:
                     total = max(UPLOAD_SSH_KEY_MIN_ATTEMPT_SECONDS, min(total, deadline - time.monotonic()))
                 timeout = aiohttp.ClientTimeout(total=total)
                 try:
-                    async with session.post(url, json=payload, timeout=timeout) as response:
+                    async with session.post(url, json=payload, timeout=timeout, allow_redirects=False) as response:
                         body = await _read_capped(response)
                         if response.status != 200:
                             text = body.decode(errors="replace")
@@ -501,9 +510,9 @@ class ExecutorService:
                 extra=get_extra_info(base_log_extra),
             ),
         )
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with executor_session(timeout=timeout) as session:
             try:
-                async with session.post(url, json=payload) as response:
+                async with session.post(url, json=payload, allow_redirects=False) as response:
                     if response.status != 200:
                         logger.error(
                             _m(
@@ -562,8 +571,9 @@ class ExecutorService:
             budget -= min(max(0.0, time.time() - requested_at), MAX_REQUEST_PICKUP_LAG_SECONDS)
         deadline = time.monotonic() + budget
         host_keys: dict[str, str] = {}
+        node_accounts: dict[str, dict] = {}
         executors = await self.get_executors_for_validator(
-            validator_hotkey, miner_hotkey, executor_id, host_keys=host_keys
+            validator_hotkey, miner_hotkey, executor_id, host_keys=host_keys, node_accounts=node_accounts
         )
         tasks = [
             asyncio.create_task(
@@ -589,6 +599,9 @@ class ExecutorService:
             # no portal read here: the uploads can outlast the snapshot cache, and the reply must meet its deadline
             if isinstance(info, ExecutorSSHInfo):
                 info.expected_ssh_host_key = host_keys.get(str(info.uuid))
+                account = node_accounts.get(str(info.uuid)) or {}
+                info.expected_node_hotkeys = account.get("hotkeys")
+                info.expected_account_claim = account.get("claim")
         # a cut-off upload logs nothing itself, so name its executors here or the validator's miss looks unexplained
         cut_off_ids = [str(executor.uuid) for executor, task in zip(executors, tasks) if task in pending]
         (logger.warning if cut_off_ids else logger.info)(
@@ -652,8 +665,8 @@ class ExecutorService:
             "data_to_sign": container_name,
             "signature": f"0x{keypair.sign(container_name).hex()}"
         }
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, json=payload) as response:
+        async with executor_session(timeout=timeout) as session:
+            async with session.post(url, json=payload, allow_redirects=False) as response:
                 if response.status != 200:
                     raise Exception('[get_pod_logs] Error: API request failed')
 

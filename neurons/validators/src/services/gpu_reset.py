@@ -21,7 +21,8 @@ any other pod is refused (the provider resets).
 Safety invariants, each pinned by a test:
 - the reset set is a subset of BOTH the container's own DeviceRequests GPUs (from the docker
   daemon) and the GPUs the backend holds for the pod;
-- `nvidia-smi -r` never runs without `-i`;
+- `nvidia-smi -r` never runs without `-i`, except on a pod that owns every host GPU of an NVSwitch fabric whose
+  Fabric Manager the unit stops (the whole baseboard resets, NVSwitches included);
 - a refused `-r` never reports ok: the latch cure alone reads `latch_cleared`, never `reset`;
 - every host GPU holder stopped for the reset is started again, also when the reset fails;
 - the container is always started again once it was stopped (or a stop of it failed), and a reset
@@ -146,6 +147,7 @@ KILL_WAIT_SECONDS = 30
 _QUERY_TIMEOUT_SECONDS = 30
 _RESET_TIMEOUT_SECONDS = 120
 _DETAIL_TAIL_CHARS = 300
+_LOG_OUTPUT_CHARS = 4000
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _GPU_LABEL = re.compile(r"GPU\d+")
 
@@ -278,13 +280,27 @@ def parse_compute_apps(csv: str) -> list[tuple[int, str]]:
     return apps
 
 
-def build_reset_command(uuids: list[str], *, container_uuids: list[str], pod_gpu_uuids: list[str]) -> str:
-    """The one place `nvidia-smi -r` is spelled: always with `-i`, only on the pod's own GPUs."""
+def build_reset_command(
+    uuids: list[str], *, container_uuids: list[str], pod_gpu_uuids: list[str], whole_fabric: bool = False
+) -> str:
+    """The one place `nvidia-smi -r` is spelled: with `-i`, only on the pod's own GPUs.
+
+    whole_fabric (the pod owns every host GPU and the host unit stops Fabric Manager): no `-i`, so the NVSwitches
+    reset with the GPUs, as NVIDIA's Fabric Manager guide resets an HGX H100-or-later baseboard."""
     if not uuids:
         raise ValueError("refusing nvidia-smi -r without -i: no GPU to reset")
     if not set(uuids) <= set(container_uuids) or not set(uuids) <= set(pod_gpu_uuids):
         raise ValueError("refusing to reset a GPU outside the pod")
+    if whole_fabric:
+        if not set(uuids) == set(container_uuids) == set(pod_gpu_uuids):
+            raise ValueError("refusing nvidia-smi -r without -i: the pod does not reset every GPU")
+        return "nvidia-smi -r"
     return f"nvidia-smi -r -i {shlex.quote(','.join(uuids))}"
+
+
+def resets_whole_fabric(owns_host: bool, host_services: list[str]) -> bool:
+    """Fabric Manager stopped around the reset loses the fabric state: every GPU and NVSwitch of it must reset."""
+    return owns_host and any(unit in FABRIC_SERVICES for unit in host_services)
 
 
 def _tail(text: str | None) -> str:
@@ -731,7 +747,12 @@ async def reset_pod_gpus(
                 GpuResetErrorCode.GpuInUseOutsidePod, f"processes left on the GPUs: {pids_still_on_targets}"
             )
 
-        command = build_reset_command(plan.targets, container_uuids=plan.container_uuids, pod_gpu_uuids=pod_gpu_uuids)
+        command = build_reset_command(
+            plan.targets,
+            container_uuids=plan.container_uuids,
+            pod_gpu_uuids=pod_gpu_uuids,
+            whole_fabric=resets_whole_fabric(plan.owns_host, plan.host_services),
+        )
         if not plan.owns_host:
             reset = await _run(runner, command, timeout=_RESET_TIMEOUT_SECONDS)
         else:
@@ -755,6 +776,19 @@ async def reset_pod_gpus(
                     )
                 if fabric_manager_problem:
                     notes.append(fabric_manager_problem)
+        if reset is not None and reset.exit_code != 0:
+            # the report keeps only a short tail; the whole host output is what explains a refusal, logged before a
+            # holder that did not come back ends the reset early
+            logger.warning(
+                "nvidia-smi -r refused for %s: exit %s, host services %s, holder containers %s, stdout %r, stderr %r",
+                container_name,
+                reset.exit_code,
+                plan.host_services,
+                plan.holder_containers,
+                (reset.stdout or "")[-_LOG_OUTPUT_CHARS:],
+                (reset.stderr or "")[-_LOG_OUTPUT_CHARS:],
+            )
+        if plan.owns_host:
             if fabric_manager_problem:
                 raise GpuResetRefused(
                     GpuResetErrorCode.ResetNotSupported, "no latch cure while a host GPU service is down"

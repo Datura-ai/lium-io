@@ -142,14 +142,6 @@ class BackendClient:
             await cls._session.close()
             cls._session = None
 
-    def _get_signature_headers(self) -> dict[str, str]:
-        timestamp = int(time.time())
-        return {
-            "hotkey": self.keypair.ss58_address,
-            "timestamp": str(timestamp),
-            "signature": f"0x{self.keypair.sign(str(timestamp)).hex()}",
-        }
-
     @staticmethod
     def signed_request_message(method: str, path_with_query: str, body: bytes, timestamp: str) -> str:
         """What the settlement routes verify (backend utils/auth.py validator_signed_message): the method, the path
@@ -257,7 +249,12 @@ class BackendClient:
         context = {"url": url, "method": method}
 
         try:
-            headers = self._get_signature_headers() if add_signature else {}
+            headers = {}
+            if add_signature:
+                # DAH-6169: every signed call signs method, path?query, body hash and timestamp; the bytes signed are sent
+                if raw_body is None and json_data is not None:
+                    raw_body = json.dumps(json_data, separators=(",", ":"), sort_keys=True).encode()
+                headers = self._get_signed_request_headers(method, "/" + path.lstrip("/"), raw_body or b"")
             if extra_headers:
                 headers.update(extra_headers)
 
@@ -343,16 +340,22 @@ class BackendClient:
         # without this, tenacity raises RetryError after the last None
         retry_error_callback=lambda retry_state: None,
     )
-    async def get_all_rented_executors(self) -> RentedExecutorsResponse | None:
+    async def get_all_rented_executors(
+        self, cycle_snapshot_block: int | None = None
+    ) -> RentedExecutorsResponse | None:
         """Fetch all rented executors with their ports from the backend.
 
         Retried three times, 30 s apart: this is the cycle's snapshot, and a cycle without it
         cannot start. None when all three fail. A check that asks mid-cycle uses
-        `get_rented_executors_now` instead.
+        `get_rented_executors_now` instead. `cycle_snapshot_block`, the cycle's job block, marks the
+        one read per cycle (DAH-6400): only that read counts as a resumed node's list read for its
+        idle-pay hold, and a retry of it (same block) still holds the node.
         """
-        return await self.get_rented_executors_now()
+        return await self.get_rented_executors_now(cycle_snapshot_block=cycle_snapshot_block)
 
-    async def get_rented_executors_now(self) -> RentedExecutorsResponse | None:
+    async def get_rented_executors_now(
+        self, cycle_snapshot_block: int | None = None
+    ) -> RentedExecutorsResponse | None:
         """One un-retried read of the rented executors and fillers as the backend sees them now.
 
         For a check that re-asks after the cycle snapshot (DAH-3480): a backend that does not
@@ -361,7 +364,9 @@ class BackendClient:
         """
         return await self._signed_request(
             "GET",
-            "/internal/executors/rented",
+            "/internal/executors/rented"
+            if cycle_snapshot_block is None
+            else f"/internal/executors/rented?snapshot_cycle={cycle_snapshot_block}",
             RentedExecutorsResponse,
             timeout=30,
         )
@@ -562,6 +567,7 @@ class BackendClient:
         gpu_uuids: list[str] | None = None,
         cpu_count: int | None = None,
         loopback_plugin: str | None = None,
+        upload_nonce: str | None = None,
         timeout: int = 300,
     ) -> ExecutorHealthCheckResponse | None:
         """Check executor health via backend API.
@@ -585,6 +591,9 @@ class BackendClient:
             loopback_plugin: The plugin alias this validator creates rental volumes on. The backend
                 probes that plugin; without it (or on an older backend, which ignores it) only the
                 legacy plugin is probed. None omits the field.
+            upload_nonce: The dated nonce (datura fresh_upload_nonce) the backend signs into its SSH-key upload
+                with the miner binding, as this validator's own uploads do (DAH-6606), so a captured upload
+                signature goes stale. None for a miner that does not relay the field (upload_nonce_for_miner).
             timeout: Seconds to wait; the backend needs time to SSH and verify the container.
 
         Returns:
@@ -615,6 +624,9 @@ class BackendClient:
 
         if executor_id:
             json_data["executor_id"] = executor_id
+
+        if upload_nonce is not None:
+            json_data["upload_nonce"] = upload_nonce
 
         try:
             # the whole call, retries included: a connection retry must not restart the wait
