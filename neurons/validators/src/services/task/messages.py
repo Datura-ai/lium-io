@@ -1225,6 +1225,18 @@ class NodeAccountMessages:
         remediation="The validator could not read this node's account files over SSH. Make sure the executor is up "
         "and reachable at this address.",
     )
+    # the same finding on a machine no write may reach (no host key the portal registered): the run still only
+    # reports, but the node takes no new rental, which would run without the host-side rules this run cannot apply
+    UNVERIFIED_REPORTED_NOT_RENTABLE = MessageTemplate(
+        event="Node account ownership could not be verified at this address (reported, not enforced yet)",
+        reason="NODE_ACCOUNT_UNVERIFIED",
+        severity="warning",
+        category=AVAILABILITY_CATEGORY,
+        impact="No effect on this run's score, but the node takes no new rentals until a check reads its account files "
+        "(a running rental is kept). A later failed check can hide the node once its notice deadline passes.",
+        remediation="The validator could not read this node's account files over SSH. Make sure the executor is up "
+        "and reachable at this address; new rentals resume after the next successful check.",
+    )
 
 
 class StaleContainerCleanupMessages:

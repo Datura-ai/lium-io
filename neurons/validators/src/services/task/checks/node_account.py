@@ -220,14 +220,18 @@ class NodeAccountCheck:
         if enforced(ctx, Msg.BINDING_UNVERIFIED.reason, started):
             return _refused(ctx, self.check_id, Msg.BINDING_UNVERIFIED, what)
         what = {**what, "enforced": False}
+        # the run is only reported, but nothing proved this machine the account's: no repair, cleanup or rule
+        # writes to it unless the host key it presented is one the portal registered for the node. Fail closed: a
+        # machine that gets no writes gets no new rental either, which would run without the rental egress rules
+        if registered_host_keys(ctx.executor):
+            return reported_only(
+                ctx, render_message(Msg.UNVERIFIED_REPORTED, ctx=ctx, check_id=self.check_id, what=what)
+            )
+        what = {**what, "reach_source": str(ReachSource.VALIDATOR), "reach_target": str(ReachTarget.NODE)}
         result = reported_only(
-            ctx,
-            render_message(Msg.UNVERIFIED_REPORTED, ctx=ctx, check_id=self.check_id, what=what),
+            ctx, render_message(Msg.UNVERIFIED_REPORTED_NOT_RENTABLE, ctx=ctx, check_id=self.check_id, what=what)
         )
-        # the run is only reported, but nothing proved this machine the account's: no repair or cleanup writes to it
-        # unless the host key it presented is one the portal registered for the node
-        if not registered_host_keys(ctx.executor):
-            result.updates["host_writes_deferred"] = True
+        result.updates["host_writes_deferred"] = True
         return result
 
 

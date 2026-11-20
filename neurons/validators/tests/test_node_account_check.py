@@ -526,20 +526,38 @@ async def test_another_owners_setup_is_refused_at_once_without_a_notice():
     "enforce", [{}, {"NODE_ACCOUNT_UNVERIFIED": "2999-01-01T00:00:00Z"}, {"x": "y"}]
 )
 async def test_a_failed_read_only_reports_until_the_provider_was_notified(enforce):
-    """Not proof of another owner: before the portal's notice (or before its time) the run passes, the finding is no
-    availability entry, and it is kept for the final event, from which the portal sends the notice."""
+    """Not proof of another owner: before the portal's notice (or before its time) the run passes and the finding is
+    kept for the final event, from which the portal sends the notice. An IP node has no registered host key, so no
+    write reaches it, the rental egress rules included: it takes no new rental meanwhile (an availability entry)."""
     from services.task.availability import availability_errors
 
     result = await NodeAccountCheck().run(
         _relay_ctx(_HostFiles("", success=False), enforce=enforce)
     )
-    assert result.passed
+    assert result.passed and not result.fatal
     assert (result.event.reason_code, result.event.severity) == (
         "NODE_ACCOUNT_UNVERIFIED",
         "warning",
     )
     assert result.updates == {"reported_only": ("NODE_ACCOUNT_UNVERIFIED",), "host_writes_deferred": True}
+    assert [e.reason_code for e in availability_errors([result.event])] == ["NODE_ACCOUNT_UNVERIFIED"]
+
+
+async def test_a_failed_read_on_the_registered_machine_only_reports_and_stays_rentable(monkeypatch):
+    """A hostname node that presented a host key the portal registered gets its writes and the egress rules, so a
+    failed read before the notice only reports: no availability entry, nothing deferred."""
+    from services.task.availability import availability_errors
+
+    monkeypatch.setattr("services.task.checks.node_account.presented_host_key", lambda ctx: "ssh-ed25519 AAAAregistered")
+    ctx = _relay_ctx(_HostFiles("", success=False), address="node.example.com", enforce={})
+    ctx.executor.expected_ssh_host_key = "ssh-ed25519 AAAAregistered"
+    result = await NodeAccountCheck().run(ctx)
+    assert result.passed and result.event.reason_code == "NODE_ACCOUNT_UNVERIFIED"
+    assert result.updates == {"reported_only": ("NODE_ACCOUNT_UNVERIFIED",)}
     assert availability_errors([result.event]) == []
+    assert result.event.impact == (
+        "This check has no effect on this run. A later failed check can hide the node once its notice deadline passes."
+    )
 
 
 class _SlowFailedRead(_HostFiles):
@@ -764,7 +782,8 @@ async def test_a_stalled_claim_read_never_hides_a_hotkey_that_settles_the_result
 async def test_an_unverified_read_before_the_notice_promises_no_notice_it_cannot_guarantee():
     result = await NodeAccountCheck().run(_relay_ctx(_HostFiles("", success=False), enforce={}))
     assert result.event.impact == (
-        "This check has no effect on this run. A later failed check can hide the node once its notice deadline passes."
+        "No effect on this run's score, but the node takes no new rentals until a check reads its account files (a "
+        "running rental is kept). A later failed check can hide the node once its notice deadline passes."
     )
 
 
