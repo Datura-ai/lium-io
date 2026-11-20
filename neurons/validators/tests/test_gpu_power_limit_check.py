@@ -527,6 +527,8 @@ async def test_an_unreadable_power_limit_under_a_lium_filler_passes(context_fact
         ("lium", 280, 280),  # Pearl over an 80 % tier host limit
         ("lium", None, None),  # no restore record: no field, the backend keeps today's verdict
         (None, 280, None),  # no filler: the live limit is the host's, no field
+        ("miner", 315, 315),  # DAH-5861: the provider's own 80 % job over a 90 % host limit
+        ("miner", None, None),
     ],
 )
 @pytest.mark.asyncio
@@ -534,7 +536,7 @@ async def test_the_host_limit_under_our_pearl_cap_reaches_the_specs(
     context_factory, read_records_mock, owner, recorded_watts, expected_host
 ) -> None:
     # lio#1924 r4477687011: the badge judges the limit the renter gets back, not Pearl's live cap
-    live = 245 if owner else 280
+    live = 245 if owner == "lium" else 280
     state = _state(current_limit=live, default_limit=350, default_job_owner=owner)
     state = ContextState(**{**state.__dict__, "specs": {"gpu": {"details": [dict(d) for d in state.gpu_details]}}})
     if recorded_watts is not None:

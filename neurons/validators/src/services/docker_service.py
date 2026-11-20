@@ -10171,7 +10171,9 @@ class DockerService:
         # GPUs of a pod that brings no power cap of its own (a customer, an uncapped filler)
         # DAH-2356 safety net: restore any leftover pre-cap records BEFORE a container
         # without its own cap starts, so a customer (or an uncapped filler) never
-        # inherits a reduced limit. Best-effort, never blocks the rental.
+        # inherits a reduced limit. The customer create's last call (record_rental_start) is strict:
+        # a provider's own cap is 80 % or more, so the floor raise below would leave a failed restore
+        # standing under the renter (DAH-5861). Earlier and filler calls stay best-effort.
         if payload.gpu_uuids:
             await restore_tracked_gpu_power_limits(
                 ssh_client,
@@ -10180,6 +10182,7 @@ class DockerService:
                 log_extra=default_extra,
                 host_probe=host_probe,
                 concurrency=concurrency,
+                require_restored=record_rental_start,
             )
         else:
             # empty gpu_uuids = whole-node container (--gpus all) → check every host GPU
@@ -10189,6 +10192,7 @@ class DockerService:
                 log_extra=default_extra,
                 host_probe=host_probe,
                 concurrency=concurrency,
+                require_restored=record_rental_start,
             )
         # State-free last-resort net: if a pre-cap record was lost, the record-based
         # restore above did nothing — lift anything still below the check's floor back

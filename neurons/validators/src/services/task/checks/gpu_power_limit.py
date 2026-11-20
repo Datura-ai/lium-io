@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from pydantic import BaseModel
-from services.const import DEFAULT_JOB_OWNER_LIUM, FILLER_CONTAINER_PREFIX
+from services.const import DEFAULT_JOB_OWNER_LIUM, DEFAULT_JOB_OWNER_MINER, FILLER_CONTAINER_PREFIX
 from services.gpu_power_limit import (
     MIN_POWER_LIMIT_RATIO,
     RENTAL_START_RATIO_TTL_SECONDS,
@@ -96,6 +96,12 @@ def _dump_measurements(measurements: list[GpuPowerMeasurement]) -> list[dict[str
 
 
 FILLER_INSPECT_TIMEOUT_SECONDS = 30
+
+
+async def _own_restore_records(ctx: Context, gpu_uuids: list[str]) -> list[GpuPowerRestoreRecord]:
+    """This executor's restore records for these GPUs (the host's own limits under our cap)."""
+    read_result = await read_gpu_power_restore_records(ctx.services.redis, gpu_uuids, log_extra=ctx.default_extra)
+    return [record for record in read_result.records if record.executor_id == ctx.executor.uuid]
 
 
 async def _filler_pods_running(ctx: Context, pod_ids: set[str]) -> set[str]:
@@ -274,7 +280,12 @@ class GpuPowerLimitCheck:
                 "measurements": _dump_measurements(measurements),
             },
         )
-        return CheckResult(passed=True, event=event)
+        updates: dict[str, Any] = {}
+        if default_job_owner == DEFAULT_JOB_OWNER_MINER:
+            # the provider's own capped job (DAH-5861): the badge judges the host's pre-cap limit, as under Pearl
+            records = await _own_restore_records(ctx, [m.uuid for m in measurements if m.uuid])
+            updates = _with_host_limits(ctx, records)
+        return CheckResult(passed=True, event=event, updates=updates)
 
     async def _remember_tier_ratios(self, ctx: Context, measurements: list[GpuPowerMeasurement]) -> bool:
         """Keep each GPU's passing reading in the 80 % tier (and clear it at stock) for a rental-start
@@ -384,10 +395,7 @@ class GpuPowerLimitCheck:
         }
         if not live_watts_by_uuid:
             return LiveCapReadout([], {})
-        read_result = await read_gpu_power_restore_records(
-            ctx.services.redis, list(live_watts_by_uuid), log_extra=ctx.default_extra
-        )
-        records = [record for record in read_result.records if record.executor_id == ctx.executor.uuid]
+        records = await _own_restore_records(ctx, list(live_watts_by_uuid))
         # same reason the stale-cap rescue is gated: the dry-run pipeline must not write shared state
         if not self.restore_stale_caps:
             return LiveCapReadout(records, {})
