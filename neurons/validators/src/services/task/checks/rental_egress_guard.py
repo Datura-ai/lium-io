@@ -298,10 +298,11 @@ def _boot_restore(boot: str, host_root: str) -> str:
         "echo 'boot restore not installed: boot rules not written'; "
         f"elif ! {{ printf {unit} > {own}.tmp && printf {hook} > {dropin}.tmp; }}; then "
         "echo 'boot restore not installed: drop-in not written'; "
-        # same bytes: still reloaded while systemd has not loaded them (an earlier run's reload failed)
+        # same bytes: still reloaded while systemd has not loaded them (an earlier run's reload failed); skipped only
+        # when both queries succeed and answer exactly "no", so a query that failed never passes for loaded
         f"elif cmp {own}.tmp {own} >/dev/null 2>&1 && cmp {dropin}.tmp {dropin} >/dev/null 2>&1 && "
-        f"rm -f {own}.tmp {dropin}.tmp && [ \"$({need} {name} 2>/dev/null)\" != yes ] && "
-        f'[ "$({need} docker.service 2>/dev/null)" != yes ]; then :; '
+        f"rm -f {own}.tmp {dropin}.tmp && R=$({need} {name} 2>/dev/null) && [ \"$R\" = no ] && "
+        f'R=$({need} docker.service 2>/dev/null) && [ "$R" = no ]; then :; '
         f"elif ! {{ {{ [ ! -e {own}.tmp ] || mv -f {own}.tmp {own}; }} && {{ [ ! -e {dropin}.tmp ] || "
         f"mv -f {dropin}.tmp {dropin}; }} && $HOST_NS systemctl daemon-reload; }}; then "
         "echo 'boot restore not installed: docker.service drop-in not loaded'; fi"
@@ -318,8 +319,18 @@ def _boot_clear(host_root: str) -> str:
     )
 
 
+# a reservation its holder stopped renewing (its validator process restarted) expires after this, so its bridge is
+# reaped once no container references it; a live holder renews it every BRIDGE_RESERVATION_RENEW_SECONDS
+BRIDGE_RESERVATION_TTL_MINUTES = 10
+BRIDGE_RESERVATION_RENEW_SECONDS = 60
+
+
 def _reservations_dir() -> str:
     return HOST_LOCK.rsplit("/", 1)[0] + "/bridges"
+
+
+def _reservation(network: str, token: str) -> str:
+    return f"{shlex.quote(_reservations_dir())}/{shlex.quote(f'{network}.{token}')}"
 
 
 def reserve_pod_bridge_script(network: str, token: str) -> str:
@@ -329,7 +340,9 @@ def reserve_pod_bridge_script(network: str, token: str) -> str:
     before it is ensured) and its container's reference to it, whichever process holds it."""
     d = shlex.quote(_reservations_dir())
     return (
-        f"mkdir -p {d} && : > {d}/{shlex.quote(f'{network}.{token}')} || {{ echo 'bridge not reserved' >&2; exit 4; }}; "
+        f"mkdir -p {d} && : > {_reservation(network, token)} || {{ echo 'bridge not reserved' >&2; exit 4; }}; "
+        f"find {d} -type f -mmin +{BRIDGE_RESERVATION_TTL_MINUTES} -exec rm -f {{}} + || "
+        "{ echo 'expired reservations not read' >&2; exit 4; }; "
         f"for ID in $($HOST_NS docker network ls -q --no-trunc --filter label={POD_NETWORK_LABEL}=pod); do "
         "N=$($HOST_NS docker network inspect -f '{{.Name}}' \"$ID\") || continue; "
         f'case "$N" in {RENTAL_NETWORK_NAME}-*) ;; *) continue ;; esac; '
@@ -342,7 +355,11 @@ def reserve_pod_bridge_script(network: str, token: str) -> str:
 
 
 def release_pod_bridge_script(network: str, token: str) -> str:
-    return f"rm -f {shlex.quote(_reservations_dir())}/{shlex.quote(f'{network}.{token}')}; exit 0"
+    return f"rm -f {_reservation(network, token)}"
+
+
+def renew_pod_bridge_script(network: str, token: str) -> str:
+    return f"touch {_reservation(network, token)}"
 
 
 async def reserve_pod_bridge(ssh, network: str, token: str) -> None:
@@ -357,6 +374,12 @@ async def release_pod_bridge(ssh, network: str, token: str) -> None:
     result = await ssh.run(_helper(release_pod_bridge_script(network, token)), check=False)
     if result.exit_status != 0:
         raise InventoryUnknown(_error(result) or "pod bridge not released")
+
+
+async def renew_pod_bridge(ssh, network: str, token: str) -> None:
+    result = await ssh.run(_helper(renew_pod_bridge_script(network, token)), check=False)
+    if result.exit_status != 0:
+        raise InventoryUnknown(_error(result) or "pod bridge reservation not renewed")
 
 
 def link_local_cleanup_script(host_root: str = HOST_ROOT) -> str:

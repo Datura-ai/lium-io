@@ -12667,6 +12667,53 @@ async def test_a_reboot_the_guard_refused_holds_the_node_where_it_refused(docker
 
 @pytest.mark.real_egress_guard
 @pytest.mark.asyncio
+async def test_a_bridge_reservation_that_stalls_is_the_guards_refusal(docker_service, monkeypatch):
+    # gateway review at 98b4318: one deadline covers the whole guard, the reservation included, so a stall there is
+    # a guard refusal the edit's undo records, not its own outer timeout
+    monkeypatch.setattr(docker_service_module, "PRE_START_GUARD_SECONDS", 0.05)
+
+    async def stalled_reserve(ssh, network, token):
+        await asyncio.sleep(5)
+
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.reserve_pod_bridge", stalled_reserve)
+    client = Mock(ensure_network=AsyncMock(return_value="guarded-id"))
+
+    with pytest.raises(docker_service_module.RentalEgressGuardRefused):
+        await docker_service._guard_pod_network_before_start(
+            docker_client=client,
+            ssh_client=Mock(),
+            network=rental_network_for("pod_a"),
+            default_extra={},
+            hold=docker_service_module._PodBridgeHold(rental_network_for("pod_a")),
+        )
+    client.ensure_network.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_held_bridge_reservation_is_renewed_until_its_release(monkeypatch):
+    # gateway review at 98b4318: a reservation expires unless its live holder renews it
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.BRIDGE_RESERVATION_RENEW_SECONDS", 0.01)
+    calls: list = []
+
+    async def renew(ssh, network, token):
+        calls.append("renew")
+
+    async def release(ssh, network, token):
+        calls.append("release")
+
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.renew_pod_bridge", renew)
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.release_pod_bridge", release)
+    async with docker_service_module._pod_bridge_held(rental_network_for("pod_a")) as hold:
+        hold.release_with = lambda: contextlib.nullcontext("ssh")
+        await asyncio.sleep(0.05)
+    renewed = len(calls) - 1
+    await asyncio.sleep(0.03)
+
+    assert renewed >= 2 and calls[-1] == "release" and len(calls) == renewed + 1  # none after the release
+
+
+@pytest.mark.real_egress_guard
+@pytest.mark.asyncio
 async def test_a_slow_guard_never_uses_up_the_port_retry_budget(docker_service, monkeypatch):
     # the port retries' budget starts after the guard: a guard as slow as the budget still leaves its retry
     monkeypatch.setattr(docker_service_module, "_PORT_ALLOCATED_RETRY_BUDGET_SEC", 0.2)

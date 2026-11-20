@@ -1255,6 +1255,10 @@ class RentalEgressGuardRefused(RuntimeError):
 _BRIDGE_LOST = (RentalPodBridgeGone, RentalPodNetworkMoveFailed)
 
 
+# the pod's pre-start egress guard, all of it (DAH-6737)
+PRE_START_GUARD_SECONDS = 180
+
+
 @dataclasses.dataclass
 class _PodBridgeHold:
     """A pod bridge's host-side reservation (DAH-6737): taken by its guard before the bridge is ensured, released when
@@ -1266,19 +1270,38 @@ class _PodBridgeHold:
     release_with: Callable[[], Any] | None = None
 
 
+async def _renew_pod_bridge_hold(hold: _PodBridgeHold) -> None:
+    """Keeps the hold's reservation from expiring while its create or start is live: one that stops (this process
+    restarted) lets the bridge be reaped once no container references it."""
+    from services.task.checks.rental_egress_guard import BRIDGE_RESERVATION_RENEW_SECONDS, renew_pod_bridge
+
+    while True:
+        await asyncio.sleep(BRIDGE_RESERVATION_RENEW_SECONDS)
+        if hold.release_with is None:
+            continue
+        try:
+            async with hold.release_with() as ssh:
+                await renew_pod_bridge(ssh, hold.network, hold.token)
+        except Exception as exc:  # noqa: BLE001 — the next renewal tries again before the reservation expires
+            logger.warning(_m("Pod bridge reservation not renewed", extra={"network": hold.network, "error": str(exc)}))
+
+
 @contextlib.asynccontextmanager
 async def _pod_bridge_held(network: str | None):
     from services.task.checks.rental_egress_guard import release_pod_bridge
 
     hold = _PodBridgeHold(network) if network else None
+    renewal = asyncio.create_task(_renew_pod_bridge_hold(hold)) if hold is not None else None
     try:
         yield hold
     finally:
+        if renewal is not None:
+            renewal.cancel()  # not awaited: a renewal mid-flight can at most leave a reservation that then expires
         if hold is not None and hold.release_with is not None:
             try:
                 async with hold.release_with() as ssh:
                     await release_pod_bridge(ssh, hold.network, hold.token)
-            except Exception as exc:  # noqa: BLE001 — a reservation left behind only keeps the bridge until a reboot
+            except Exception as exc:  # noqa: BLE001 — a reservation left behind expires, unrenewed
                 logger.warning(_m("Pod bridge reservation not released", extra={"network": network, "error": str(exc)}))
 
 
@@ -4086,19 +4109,21 @@ class DockerService:
                 await reserve_pod_bridge(ssh, network, hold.token)
             ensured = await docker_client.ensure_network(network)
             # the pod's bridge is required in the applied rules, whatever the host's labels say
-            _, failed = await asyncio.wait_for(
-                apply_rental_egress_guard(ssh, attempts=None, required_network_id=ensured), timeout=120
-            )
+            _, failed = await apply_rental_egress_guard(ssh, attempts=None, required_network_id=ensured)
             return ensured, failed
 
-        network_id = None
-        try:
+        async def _guard() -> tuple[str, str | None]:
             if ssh_client is None:
                 # a start that opens its SSH session only after the start (start_existing_container): its own
                 async with connect() as own_ssh:
-                    network_id, error = await _ensure_and_apply(own_ssh)
-            else:
-                network_id, error = await _ensure_and_apply(ssh_client)
+                    return await _ensure_and_apply(own_ssh)
+            return await _ensure_and_apply(ssh_client)
+
+        network_id = None
+        try:
+            # one deadline over the whole guard (session, reservation, bridge, rules): a stall anywhere is this
+            # guard's refusal, never the caller's own outer timeout
+            network_id, error = await asyncio.wait_for(_guard(), timeout=PRE_START_GUARD_SECONDS)
         except Exception as exc:  # noqa: BLE001 — every failure refuses the start
             error = str(exc) or type(exc).__name__
         if error:

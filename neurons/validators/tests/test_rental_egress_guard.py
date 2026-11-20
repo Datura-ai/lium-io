@@ -1179,7 +1179,8 @@ def _modelled_host(tmp_path, *, docker_user: bool, systemd: bool = True):
     (bin_dir / "iptables").write_text(_IPTABLES_STUB)
     (bin_dir / "iptables").chmod(0o755)
     (bin_dir / "systemctl").write_text(
-        '#!/bin/sh\ncase "$1" in show) echo loaded ;; daemon-reload) echo x >> "$STATE/reloads" ;; esac\n'
+        '#!/bin/sh\ncase "$1 $3" in "show NeedDaemonReload") echo no ;; show*) echo loaded ;; '
+        'daemon-reload*) echo x >> "$STATE/reloads" ;; esac\n'
     )
     (bin_dir / "systemctl").chmod(0o755)
     (state / "FORWARD").write_text("")
@@ -1447,3 +1448,67 @@ def test_a_bridge_another_process_reserved_is_never_reaped_until_its_holder_rele
     process(rental_egress_guard.reserve_pod_bridge_script(bridge["pod_b"], "tokB2"))
     assert (state / "removed").read_text().split() == ["ccc", "aaa"]  # released and never used: reaped then
     assert sorted(p.name for p in nets.iterdir()) == ["bbb", "ddd"]
+
+
+def test_a_reservation_its_holder_stopped_renewing_expires_and_its_unused_bridge_is_reaped(tmp_path, monkeypatch):
+    # gateway review at 98b4318: a validator restart between reserve and release leaves the token behind; it must not
+    # keep the bridge until a reboot. A renewed reservation keeps its bridge; an expired one is dropped, then reaped
+    import os
+    import time
+
+    bin_dir, state, env = _host(tmp_path, monkeypatch)
+    (bin_dir / "docker").write_text(_RESERVE_DOCKER_STUB)
+    (bin_dir / "docker").chmod(0o755)
+    nets = state / "nets"
+    nets.mkdir()
+    bridge = {name: f"{rental_egress_guard.RENTAL_NETWORK_NAME}-{name}" for name in ("pod_gone", "pod_live", "pod_new")}
+
+    def process(script):
+        done = subprocess.run(["sh", "-c", locked_script(script)], env=env, capture_output=True, text=True)
+        assert done.returncode == 0, done.stderr
+
+    process(rental_egress_guard.reserve_pod_bridge_script(bridge["pod_gone"], "tokG"))
+    (nets / "ggg").write_text(bridge["pod_gone"] + "\n")
+    process(rental_egress_guard.reserve_pod_bridge_script(bridge["pod_live"], "tokL"))
+    (nets / "lll").write_text(bridge["pod_live"] + "\n")
+    stale = time.time() - (rental_egress_guard.BRIDGE_RESERVATION_TTL_MINUTES + 1) * 60
+    reservations = sorted(p for p in (tmp_path).rglob("*.tok*"))
+    for path in reservations:
+        os.utime(path, (stale, stale))
+    process(rental_egress_guard.renew_pod_bridge_script(bridge["pod_live"], "tokL"))  # the live holder renews
+
+    process(rental_egress_guard.reserve_pod_bridge_script(bridge["pod_new"], "tokN"))
+
+    assert (state / "removed").read_text().split() == ["ggg"]
+    assert sorted(p.name for p in nets.iterdir()) == ["lll"]
+
+
+def test_a_release_that_cannot_remove_its_reservation_fails(tmp_path):
+    script = rental_egress_guard.release_pod_bridge_script("net", "tok")
+    assert subprocess.run(["sh", "-c", script.replace("rm -f", "false")]).returncode != 0
+
+
+@pytest.mark.parametrize("failing", ["unit", "docker"])
+def test_a_reload_query_that_fails_never_passes_for_loaded(tmp_path, failing):
+    # gateway review at 98b4318: same bytes on disk, an earlier reload failed, and a NeedDaemonReload query now fails
+    # with no output. That empty answer must not skip the reload: the run reloads, or reports the drop-in not loaded
+    state, root, env = _modelled_host(tmp_path, docker_user=True)
+    name = rental_egress_guard.BOOT_UNIT.rsplit("/", 1)[1]
+    query = name if failing == "unit" else "docker.service"
+    (tmp_path / "bin" / "systemctl").write_text(
+        "#!/bin/sh\n"
+        f'[ "$3" = NeedDaemonReload ] && [ "$5" = {query} ] && [ -e "$STATE/query_fails" ] && exit 1\n'
+        'case "$1 $3" in\n'
+        '  "show LoadState") echo loaded ;;\n'
+        '  "show NeedDaemonReload") echo no ;;\n'
+        '  "daemon-reload ") [ -e "$STATE/reload_fails" ] && exit 1; echo x >> "$STATE/reloads" ;;\n'
+        "esac\n"
+    )
+    script = link_local_drop_script("br-0123456789ab", [], str(root))
+    assert subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True).returncode == 0
+    (state / "query_fails").touch()
+    (state / "reload_fails").touch()
+
+    again = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True)
+
+    assert again.returncode == 0 and "docker.service drop-in not loaded" in again.stdout
