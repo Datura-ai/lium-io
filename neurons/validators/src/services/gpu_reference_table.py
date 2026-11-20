@@ -38,6 +38,7 @@ GPU_REFERENCE_TABLE: dict[str, tuple[float, tuple[int, ...]]] = {
     "NVIDIA GeForce RTX 2070 SUPER": (0.07, (8,)),
     "NVIDIA GeForce RTX 2080 SUPER": (0.74, (8,)),
     "NVIDIA GeForce RTX 2080 Ti": (0.08, (11,)),
+    "NVIDIA GeForce RTX 2080 Ti 22GB": (0.08, (22,)),
     "NVIDIA GeForce RTX 3050": (0.05, (6, 8)),
     "NVIDIA GeForce RTX 3060": (0.06, (8, 12)),
     "NVIDIA GeForce RTX 3060 Laptop GPU": (0.08, (6,)),
@@ -45,6 +46,7 @@ GPU_REFERENCE_TABLE: dict[str, tuple[float, tuple[int, ...]]] = {
     "NVIDIA GeForce RTX 3070": (0.07, (8,)),
     "NVIDIA GeForce RTX 3070 Ti": (0.09, (8,)),
     "NVIDIA GeForce RTX 3080": (0.09, (10, 12)),
+    "NVIDIA GeForce RTX 3080 20GB": (0.09, (20,)),
     "NVIDIA GeForce RTX 3080 Ti": (0.1, (12,)),
     "NVIDIA GeForce RTX 3090": (0.16, (24,)),
     "NVIDIA GeForce RTX 3090 Ti": (0.16, (24,)),
@@ -61,6 +63,7 @@ GPU_REFERENCE_TABLE: dict[str, tuple[float, tuple[int, ...]]] = {
     "NVIDIA GeForce RTX 4090": (0.3, (24,)),
     "NVIDIA GeForce RTX 4090 48GB": (0.42, (48,)),
     "NVIDIA GeForce RTX 4090 D": (0.11, (24,)),
+    "NVIDIA GeForce RTX 4090 D 48GB": (0.16, (48,)),
     "NVIDIA GeForce RTX 5060": (0.11, (8,)),
     "NVIDIA GeForce RTX 5060 Ti": (0.12, (8, 16)),
     "NVIDIA GeForce RTX 5070": (0.09, (12,)),
@@ -113,6 +116,19 @@ GPU_REFERENCE_TABLE: dict[str, tuple[float, tuple[int, ...]]] = {
 }
 
 
+# memory-modded cards (DAH-5508/DAH-6595) are priced for the mod, not the memory: never an unknown card's reference
+NEVER_A_REFERENCE = frozenset(
+    {
+        "NVIDIA GeForce RTX 2080 Ti 22GB",
+        "NVIDIA GeForce RTX 3080 20GB",
+        "NVIDIA GeForce RTX 4080 32GB",
+        "NVIDIA GeForce RTX 4080 SUPER 32GB",
+        "NVIDIA GeForce RTX 4090 48GB",
+        "NVIDIA GeForce RTX 4090 D 48GB",
+    }
+)
+
+
 def pick_reference(vram_mib: float | None) -> str | None:
     """The cheapest candidate with a nominal size within REFERENCE_VRAM_BAND of `vram_mib` (MiB, as
     nvidia-smi reports it), else the cheapest with the largest size below it; a price tie goes to
@@ -123,6 +139,7 @@ def pick_reference(vram_mib: float | None) -> str | None:
     sizes = [
         (size_gb * 1024, price, model)
         for model, (price, sizes_gb) in GPU_REFERENCE_TABLE.items()
+        if model not in NEVER_A_REFERENCE
         for size_gb in sizes_gb
     ]
     in_band = [(price, model) for size, price, model in sizes if low <= size / vram_mib <= high]
