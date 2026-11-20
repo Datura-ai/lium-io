@@ -66,7 +66,7 @@ def _chain(monkeypatch, read) -> None:
     async def owner(url):
         return read(url)
 
-    monkeypatch.setattr(trust_service, "read_subnet_owner_hotkey", owner)
+    monkeypatch.setattr(trust_service, "read_subnet_owner_coldkey", owner)
 
 
 def _trust(tmp_path, image_message=None) -> ValidatorTrust:
@@ -90,7 +90,7 @@ def _accepts(monkeypatch, trust: ValidatorTrust, validator: Keypair, baked: dict
 
 @pytest.fixture(autouse=True)
 def release_owner(monkeypatch, owner):
-    monkeypatch.setattr(trust_service, "RELEASE_SUBNET_OWNER_HOTKEY", owner.ss58_address)
+    monkeypatch.setattr(trust_service, "RELEASE_SUBNET_OWNER_COLDKEY", owner.ss58_address)
     monkeypatch.setattr(trust_service.settings, "COMPUTE_REST_API_URL", "http://backend")
 
 
@@ -339,7 +339,7 @@ def test_the_owner_read_posts_the_storage_request(monkeypatch, owner):
     async def run():
         runner, url = await _serve(node)
         try:
-            return await trust_service.read_subnet_owner_hotkey(url)
+            return await trust_service.read_subnet_owner_coldkey(url)
         finally:
             await runner.cleanup()
 
@@ -396,3 +396,10 @@ def test_a_compressed_reply_is_refused_unexpanded(monkeypatch):
 
     asyncio.run(run())
     assert seen == ["identity"]
+
+
+def test_the_image_copy_is_signed_by_the_release_time_owner_coldkey():
+    from datura.validator_trust import RELEASE_SUBNET_OWNER_COLDKEY, verify_trust_message
+
+    shipped = trust_service._signed(json.loads(trust_service.IMAGE_MESSAGE_PATH.read_text()))
+    assert verify_trust_message(shipped, RELEASE_SUBNET_OWNER_COLDKEY).revision == 1

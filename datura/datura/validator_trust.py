@@ -1,9 +1,9 @@
-"""Which validator a node trusts: the one named in a message signed by the SN51 subnet owner hotkey.
+"""Which validator a node trusts: the one named in a message signed by the SN51 subnet owner coldkey.
 
 The subnet owner signs one line, `lium-validator:<validator hotkey ss58>:<revision>`, built by
 `trust_line` so every component signs and checks the same text. A node accepts a message whose
-signature matches the owner hotkey and whose revision is higher than the one it holds; on any error
-it keeps the last good one. The owner hotkey is read from chain (`SubtensorModule.SubnetOwnerHotkey`)
+signature matches the owner coldkey and whose revision is higher than the one it holds; on any error
+it keeps the last good one. The owner coldkey is read from chain (`SubtensorModule.SubnetOwner`)
 on public nodes only, with one plain `state_getStorage` request (the caller sends it and bounds it), so a validator key change needs a new
 signed message and no release.
 """
@@ -16,14 +16,14 @@ from typing import NamedTuple
 NETUID = 51
 TRUST_LABEL = "lium-validator"
 # The owner known at release time: a fresh node starts from it and needs no chain read to begin.
-RELEASE_SUBNET_OWNER_HOTKEY = "5FTVrwEpjvpNeKwczFtYjs62GHKKLHLCdqCThtj2unZouKg1"
+RELEASE_SUBNET_OWNER_COLDKEY = "5FqACMtcegZxxopgu1g7TgyrnyD8skurr9QDPLPhxNQzsThe"  # gitleaks:allow public on chain: the SN51 owner ss58
 # Public chain nodes only: this code runs on provider machines.
 PUBLIC_CHAIN_NODES = (
     "https://entrypoint-finney.opentensor.ai",
     "https://lite.chain.opentensor.ai",
 )
-# twox128("SubtensorModule") + twox128("SubnetOwnerHotkey"); the map key (netuid, u16) is Identity-hashed.
-_SUBNET_OWNER_HOTKEY_PREFIX = "0x658faa385070e074c85bf6b568cf055568b7553499633fe05caf4d8a51aefe5c"
+# twox128("SubtensorModule") + twox128("SubnetOwner"); the map key (netuid, u16) is Identity-hashed.
+_SUBNET_OWNER_COLDKEY_PREFIX = "0x658faa385070e074c85bf6b568cf055536e3e82152c8758267395fe524fbbd16"  # gitleaks:allow public on chain: storage prefix
 _SS58 = "[1-9A-HJ-NP-Za-km-z]{46,48}"
 _TRUST_LINE = re.compile(rf"{TRUST_LABEL}:({_SS58}):([0-9]{{1,18}})")
 _SIGNATURE = re.compile(r"0x[0-9a-fA-F]{128}")
@@ -62,24 +62,24 @@ def verify_trust_message(signed: SignedTrustMessage, owner_ss58: str) -> Trusted
     if trust_line(validator, revision) != signed.message:
         raise ValueError("the line is not in its canonical form")
     if not Keypair(ss58_address=owner_ss58).verify(signed.message, signed.signature):
-        raise ValueError("not signed by the subnet owner hotkey")
+        raise ValueError("not signed by the subnet owner coldkey")
     return TrustedValidator(validator, revision)
 
 
 def subnet_owner_storage_key(netuid: int = NETUID) -> str:
-    return _SUBNET_OWNER_HOTKEY_PREFIX + netuid.to_bytes(2, "little").hex()
+    return _SUBNET_OWNER_COLDKEY_PREFIX + netuid.to_bytes(2, "little").hex()
 
 
 def subnet_owner_request(netuid: int = NETUID) -> dict:
-    """The JSON-RPC request a chain node answers with the SN `netuid` owner hotkey."""
+    """The JSON-RPC request a chain node answers with the SN `netuid` owner coldkey."""
     return {"jsonrpc": "2.0", "id": 1, "method": "state_getStorage", "params": [subnet_owner_storage_key(netuid)]}
 
 
 def subnet_owner_from_reply(reply: dict) -> str:
-    """The owner hotkey (ss58) in a chain node's reply to `subnet_owner_request`. Raises ValueError on anything else."""
+    """The owner coldkey (ss58) in a chain node's reply to `subnet_owner_request`. Raises ValueError on anything else."""
     from scalecodec.utils.ss58 import ss58_encode
 
     result = reply.get("result") if isinstance(reply, dict) else None
     if not isinstance(result, str) or not re.fullmatch(r"0x[0-9a-fA-F]{64}", result):
-        raise ValueError(f"unexpected SubnetOwnerHotkey value: {result!r}")
+        raise ValueError(f"unexpected SubnetOwner value: {result!r}")
     return ss58_encode(result, 42)

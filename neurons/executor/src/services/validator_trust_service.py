@@ -3,7 +3,7 @@
 The message is `lium-validator:<validator hotkey>:<revision>` (datura.validator_trust). It comes from
 `<COMPUTE_REST_API_URL>/watchtower/validator-message` every few minutes, and from the image
 (`src/validator_trust_message.json`) when one was released with it. A message is taken when the current subnet
-owner's hotkey signed it and its revision is higher than the held one's (one counter, whoever signed the held one);
+owner's coldkey signed it and its revision is higher than the held one's (one counter, whoever signed the held one);
 on any error the held message stays.
 
 The taken message, the key that signed it and the current owner are kept in one small file on the reserve_data
@@ -12,7 +12,7 @@ and the chain both unreachable. The file is written atomically, off the event lo
 taken; a failed write is logged and tried again at the next refresh. A missing, unreadable or badly signed file is
 ignored: the node uses the image copy, else the baked hotkeys, and keeps polling.
 
-The owner hotkey starts as the address known at release and is re-read from the public chain nodes at start, then
+The owner coldkey starts as the address known at release and is re-read from the public chain nodes at start, then
 about once an hour with random jitter. A new owner is taken only when every public node answers with it; a failed or
 disagreeing read keeps the known owner, whose messages are still taken (a chain outage never blocks a validator
 change). An owner change only changes the key that verifies new messages: the held validator stays until the new
@@ -38,7 +38,7 @@ import aiohttp
 from bittensor_wallet import Keypair
 from datura.validator_trust import (
     PUBLIC_CHAIN_NODES,
-    RELEASE_SUBNET_OWNER_HOTKEY,
+    RELEASE_SUBNET_OWNER_COLDKEY,
     SignedTrustMessage,
     TrustedValidator,
     subnet_owner_from_reply,
@@ -81,8 +81,8 @@ async def fetch_json(url: str, body: dict | None = None) -> dict | None:
             return json.loads(data)
 
 
-async def read_subnet_owner_hotkey(url: str) -> str:
-    """The subnet owner hotkey as one chain node reports it. Raises on any failure."""
+async def read_subnet_owner_coldkey(url: str) -> str:
+    """The subnet owner coldkey as one chain node reports it. Raises on any failure."""
     return subnet_owner_from_reply(await fetch_json(url, subnet_owner_request()))
 
 
@@ -113,7 +113,7 @@ class ValidatorTrust:
         self.state_dir = state_dir
         self.image_message = image_message
         self.enabled = enabled
-        self.owner = RELEASE_SUBNET_OWNER_HOTKEY
+        self.owner = RELEASE_SUBNET_OWNER_COLDKEY
         self.held: TrustedValidator | None = None
         self.held_signed: SignedTrustMessage | None = None
         # the key that signed the held message: an owner change keeps the message until the new owner signs a higher one
@@ -140,7 +140,7 @@ class ValidatorTrust:
         # the kept state is on the volume already; an image message taken over it is not, so the next refresh writes it
         self._unsaved = False
         try:
-            self._hold(_signed(json.loads(self.image_message.read_text())), RELEASE_SUBNET_OWNER_HOTKEY)
+            self._hold(_signed(json.loads(self.image_message.read_text())), RELEASE_SUBNET_OWNER_COLDKEY)
         except FileNotFoundError:
             pass
         except Exception as exc:
@@ -217,7 +217,7 @@ class ValidatorTrust:
         answers = set()
         for url in PUBLIC_CHAIN_NODES:
             try:
-                answers.add(await read_subnet_owner_hotkey(url))
+                answers.add(await read_subnet_owner_coldkey(url))
             except Exception as exc:
                 logger.warning("Validator trust: subnet owner not read from %s: %s: %s", url, type(exc).__name__, exc)
                 return False
