@@ -204,7 +204,8 @@ jobs:
                           elif services is not None:
                               odd(f"services {services!r:.80}")
                           for img in images:
-                              if img is None:
+                              # GitHub skips a service (and the runner a job container) whose image is empty: nothing starts
+                              if img is None or img == "":
                                   continue
                               if not isinstance(img, str):
                                   odd(f"container/service image {img!r:.80}")
@@ -295,6 +296,10 @@ jobs:
               "jobs:\n  a:\n    services:\n      db: postgres" + dig + "\n": 0,
               step("$/."): 0,  # the repository's root action
               step("$/./"): 0,
+              # an empty image starts nothing (GitHub skips the service, the runner skips the job container)
+              "jobs:\n  a:\n    services:\n      db:\n        image: ''\n": 0,
+              "jobs:\n  a:\n    container: ''\n": 0,
+              "jobs:\n  a:\n    container:\n      image: ''\n": 0,
               # a value that is not an image string is not checkable, never skipped
               "jobs:\n  a:\n    container: false\n": 1,
               "jobs:\n  a:\n    container: 0\n": 1,
