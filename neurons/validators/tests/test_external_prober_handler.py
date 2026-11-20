@@ -59,3 +59,41 @@ def test_redirects_are_not_followed():
         assert handler._fetch("127.0.0.1", server.server_port, 3) == "moved"
     finally:
         server.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size, passes", [(256, True), (257, False)])
+async def test_both_probe_paths_judge_an_answer_of_the_same_size_alike(size, passes):
+    """The outside prober and the validator's own probe accept and reject exactly the same answers."""
+    import aiohttp
+    from neurons.validators.src.services.executor_connectivity.models import PortPair
+    from neurons.validators.src.services.executor_connectivity.port_tester import (
+        PROBE_BODY_LIMIT,
+        PortTester,
+    )
+
+    assert handler.MAX_BODY == PROBE_BODY_LIMIT
+    answer = b"token:7".ljust(size)
+
+    class Node(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(answer)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Node)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        # the validator's verdict on the outside prober's answer, as in ExternalPortProbe.reached
+        outside = (handler._fetch("127.0.0.1", server.server_port, 3) or "").strip() == "token:7"
+        async with aiohttp.ClientSession() as session:
+            inside = await PortTester().test_one(
+                session, "127.0.0.1", PortPair(internal=7, external=server.server_port), "token"
+            )
+    finally:
+        server.shutdown()
+    assert outside is passes
+    assert inside is passes

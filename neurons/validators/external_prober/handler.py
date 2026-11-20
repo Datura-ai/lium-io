@@ -16,6 +16,9 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 MAX_TARGETS = 64
+# A node's answer is "<token>:<port>". Same cap as the validator's own probe (PortTester.PROBE_BODY_LIMIT): a longer
+# answer is no answer on both paths, so the two can never disagree on a port.
+MAX_BODY = 256
 # Fetched with every request: if the prober cannot reach this known-open URL, its own egress is down and an empty
 # answer would read as "every node blocks the outside", so it answers 503 (no verdict) instead.
 CANARY_URL = os.environ.get("CANARY_URL", "http://checkip.amazonaws.com/")
@@ -37,11 +40,16 @@ def _fetch(host: str, port: int, timeout: float) -> str | None:
 def _get(url: str, timeout: float) -> str | None:
     try:
         with _opener.open(url, timeout=timeout) as resp:
-            return resp.read(256).decode(errors="replace")
+            return _capped(resp)
     except urllib.error.HTTPError as e:
-        return e.read(256).decode(errors="replace")
+        return _capped(e)
     except Exception:
         return None
+
+
+def _capped(resp) -> str | None:
+    data = resp.read(MAX_BODY + 1)
+    return None if len(data) > MAX_BODY else data.decode(errors="replace")
 
 
 def _public(host: str) -> bool:
