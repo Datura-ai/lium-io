@@ -19,6 +19,8 @@ RUN pdm lock --check
 RUN pdm install --prod
 
 COPY . .
+# DAH-6804: SysboxLayerResetCheck runs this script's --install-layer-reset on Sysbox hosts (context: neurons/executor)
+COPY --from=executor_setup nvidia_docker_sysbox_setup.sh /app/executor_setup/
 
 RUN mv libdmcompverify.so /usr/lib/
 RUN mv libverifyx.so /usr/lib/

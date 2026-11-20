@@ -24,9 +24,14 @@ def _function(name: str) -> str:
     return match.group(0)
 
 
+def _layer_reset_version() -> int:
+    return int(re.search(r"^LAYER_RESET_VERSION=(\d+)$", open(SCRIPT).read(), re.M).group(1))
+
+
 def _install(root) -> None:
     script = (
         'host_path() { echo "${SYSBOX_SETUP_HOST_ROOT:-}$1"; }\nwarn() { echo "WARN $*"; }\n'
+        + f"LAYER_RESET_VERSION={_layer_reset_version()}\n"
         + _function("docker_containerd_address")
         + _function("systemd_quote")
         + _function("systemd_env")
@@ -99,6 +104,31 @@ def test_the_boot_unit_runs_after_sysbox_and_before_docker(tmp_path):
     assert "After=local-fs.target sysbox.service sysbox-mgr.service containerd.service" in unit
     assert "Before=docker.service\n" in unit
     assert "ExecStart=/usr/bin/python3 -I /usr/local/sbin/lium-sysbox-layer-reset" in unit
+
+
+def test_the_unit_carries_the_version_the_validator_compares(tmp_path):
+    # DAH-6804: lium-io machine_scrape reads this line; 1 is reserved for units written before the marker
+    _install(tmp_path)
+    unit = (tmp_path / "etc/systemd/system/lium-sysbox-layer-reset.service").read_text()
+    assert _layer_reset_version() >= 2
+    assert unit.splitlines()[0] == f"# lium-layer-reset-version={_layer_reset_version()}"
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="the not-root answer needs a non-root run")
+def test_install_layer_reset_mode_answers_one_line_and_installs_nothing_without_root(tmp_path):
+    result = subprocess.run(
+        ["bash", SCRIPT, "--install-layer-reset"], capture_output=True, text=True, timeout=60,
+        env={**os.environ, "SYSBOX_SETUP_HOST_ROOT": str(tmp_path)},
+    )
+    assert (result.returncode, result.stdout) == (0, "layer_reset_skipped not_root\n")
+    assert not any(tmp_path.iterdir())
+
+
+def test_install_layer_reset_mode_never_runs_the_reset_or_restarts_docker():
+    # the validator runs it under rented pods: install only (unit + drop-in), as the setup script's own install does
+    branch = re.search(r"^    --install-layer-reset\)\n(.*?)^        ;;$", open(SCRIPT).read(), re.S | re.M).group(1)
+    assert "shift_sysbox_layers_back_at_boot" in branch
+    assert not re.search(r"systemctl (re)?start|systemctl restart|/usr/local/sbin/lium-sysbox-layer-reset|--dry-run", branch)
 
 
 def test_a_shifted_sysbox_layer_is_found_and_a_runc_container_is_left_alone(tmp_path):

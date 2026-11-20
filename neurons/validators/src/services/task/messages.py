@@ -1040,6 +1040,51 @@ class NeedrestartGuardMessages:
     )
 
 
+class SysboxLayerResetMessages:
+    OUTDATED = MessageTemplate(
+        event="Host boot-time layer reset missing or old",
+        reason="SYSBOX_LAYER_RESET_OUTDATED",
+        severity="info",
+        category="env",
+        impact="Proceed; score not changed",
+        remediation=(
+            "After a power loss or hard reset, rented pods on this host come back with their files owned by the "
+            "host's root, so sudo and apt fail inside them. Run `sudo bash nvidia_docker_sysbox_setup.sh "
+            "--install-layer-reset` from lium-io neurons/executor on the host: it installs "
+            "lium-sysbox-layer-reset.service, runs nothing and restarts nothing."
+        ),
+    )
+    INSTALLED = MessageTemplate(
+        event="Host boot-time layer reset installed",
+        reason="SYSBOX_LAYER_RESET_INSTALLED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    INSTALL_FAILED = MessageTemplate(
+        event="Host boot-time layer reset could not be installed",
+        reason="SYSBOX_LAYER_RESET_INSTALL_FAILED",
+        severity="warning",
+        category="env",
+        impact="Proceed; score not changed",
+        remediation=OUTDATED.remediation,
+    )
+    UNKNOWN = MessageTemplate(
+        event="Host boot-time layer reset not reported",
+        reason="SYSBOX_LAYER_RESET_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    OK = MessageTemplate(
+        event="Host boot-time layer reset ok",
+        reason="SYSBOX_LAYER_RESET_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+
+
 class PidHostRequiredMessages:
     MISSING = MessageTemplate(
         event="Executor not in the host PID namespace",

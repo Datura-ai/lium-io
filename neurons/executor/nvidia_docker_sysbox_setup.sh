@@ -6,6 +6,7 @@ set -e
 #   curl -fsSL https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/nvidia_docker_sysbox_setup.sh | sudo bash
 #   or: cd lium-io/neurons/executor && sudo bash nvidia_docker_sysbox_setup.sh
 #   sudo bash nvidia_docker_sysbox_setup.sh --check   only the preflight, one PASS/FIX line per requirement; exit 1 on any FIX
+#   sudo bash nvidia_docker_sysbox_setup.sh --install-layer-reset   only (re)install the boot-time layer reset (validators run it)
 # After sysbox works, install mode also sets up the vloopback volume plugin (pinned by digest,
 # DATA_DIR=<Docker data-root>/loopback) and mounts a 1 GB test volume into a sysbox container; the run exits 1
 # with a doc link when that fails.
@@ -18,6 +19,10 @@ set -e
 # 0.7.1 (DAH-3833): 0.6.6 cannot start an image with 44+ layers under Docker 29's containerd image store,
 # and 0.7.0 brings the runc container-escape fixes (CVE-2025-52565, CVE-2025-52881)
 SYSBOX_VERSION="0.7.1"
+# DAH-6804: the boot-time layer reset's version, written into its unit; the validator reinstalls it (--install-layer-reset)
+# on Sysbox hosts whose unit is missing or older. Bump it whenever shift_sysbox_layers_back_at_boot's output changes.
+# 1 is reserved for units written before this marker.
+LAYER_RESET_VERSION=2
 # nestybox publishes amd64 and arm64 .debs; arm64 is for GB300 / Grace hosts (check_arch refuses the rest)
 case "$(uname -m)" in
     aarch64|arm64) SYSBOX_ARCH=arm64; SYSBOX_SHA="04ca894ae0b53f0fa54eaacc173ce40363c9a95ea5450f773716a84ef650a69b" ;;
@@ -578,6 +583,7 @@ main()
 PY
     chmod 755 "$bin" || return 1
     cat > "$unit" <<UNIT || return 1
+# lium-layer-reset-version=$LAYER_RESET_VERSION
 [Unit]
 Description=Lium: shift sysbox pods' layers back after an unclean stop
 After=local-fs.target sysbox.service sysbox-mgr.service containerd.service
@@ -1340,16 +1346,29 @@ CHECK_MODE_OPTION=""
 case "${1:-}" in
     "") ;;
     --check) CHECK_MODE_OPTION="--check" ;;
+    --install-layer-reset)
+        # DAH-6804: what the validator runs on Sysbox hosts whose layer reset is missing or old. Installs the unit and
+        # Docker's drop-in only: never runs the reset, never restarts Docker, so running pods are not touched. One
+        # result line for the validator. Without python3 the unit's ExecStart fails at boot and the drop-in's
+        # Requires= then keeps Docker down, so it installs nothing there.
+        if [ "$(id -u)" != 0 ]; then echo "layer_reset_skipped not_root"
+        elif [ ! -x /usr/bin/python3 ]; then echo "layer_reset_skipped no_python3"
+        elif ! command -v sysbox-runc >/dev/null 2>&1; then echo "layer_reset_skipped no_sysbox"
+        elif shift_sysbox_layers_back_at_boot >/dev/null 2>&1; then echo "layer_reset_installed $LAYER_RESET_VERSION"
+        else echo "layer_reset_failed install"; fi
+        exit 0
+        ;;
     -h|--help)
-        echo "Usage: sudo bash nvidia_docker_sysbox_setup.sh [--check]"
+        echo "Usage: sudo bash nvidia_docker_sysbox_setup.sh [--check | --install-layer-reset]"
         echo "  (no option)  preflight the host, then install sysbox + NVIDIA container toolkit, configure Docker, verify;"
         echo "               a FIX on root, architecture, kernel or Docker stops the install, any other FIX is printed and the install goes on;"
         echo "               then sets up the vloopback volume plugin and mounts a test volume into a sysbox container (exit 1 if it fails)"
         echo "  --check      preflight only: host requirements and what this script installs, PASS/FIX per line, exit 1 on any FIX"
+        echo "  --install-layer-reset  only (re)install the boot-time layer reset unit; runs no reset, restarts nothing"
         echo "Env: SYSBOX_SKIP_KERNEL_CHECK=1, EXECUTOR_PORT, SSH_PORT (see the header of this script)"
         exit 0
         ;;
-    *)  fail "Unknown option: $1 (use --check or --help)"; exit 2 ;;
+    *)  fail "Unknown option: $1 (use --check, --install-layer-reset or --help)"; exit 2 ;;
 esac
 
 # ── 1. Pre-flight ────────────────────────────────────────
