@@ -54,18 +54,20 @@ def _host_memory_min_script() -> str:
         '{ echo "$2" > "$f"; } 2>/dev/null && echo "memory_min_set $1" || echo "memory_min_failed $1 write_denied"; }; '
         # cgroups written directly (not systemd units): one "value path" record per line, so a path may hold spaces.
         # A child's protection never exceeds its parent's, so bottom-up each cgroup gets the larger of its existing
-        # memory.min and its own request plus its children's totals ("max" absorbs), parents written first; flush's
-        # argument names a path left to systemd (/system.slice when systemd sets it)
+        # memory.min and its own request plus its children's totals ("max" absorbs), parents written first. tree's
+        # argument names a path left to systemd (/system.slice when systemd sets it); its direct children's total is
+        # the record "<total> =", which flush skips
         'acc=; add() { acc="$acc$2 $1\n"; }; '
-        "flush() { printf '%s' \"$acc\" | awk -v k=\"$1\" '"
+        "tree() { printf '%s' \"$acc\" | awk -v k=\"$1\" '"
         'function sum(a,b){return (a=="max"||b=="max")?"max":a+b} '
         'function big(a,b){return (a=="max"||b=="max")?"max":(a+0>b+0?a:b)} '
         '{v=$1; q=substr($0,length(v)+2); own[q]=sum(own[q],v); n=split(q,a,"/"); p=""; '
         "for(i=2;i<=n;i++){p=p \"/\" a[i]; if(p!=k){d[p]=i; if(i>m) m=i}}} "
         'END{for(i=m;i>=2;i--) for(p in d) if(d[p]==i){c=""; f="/sys/fs/cgroup" p "/memory.min"; '
         "if((getline c < f)<=0) c=0; close(f); t[p]=big(c,sum(own[p],t[p])); "
-        'u=p; sub(/\\/[^\\/]*$/,"",u); if(u in d) t[u]=sum(t[u],t[p]); print t[p], p}}\' '
-        '| LC_ALL=C sort -k2 | while read -r v p; do set_cg_min "$p" "$v"; done; }; '
+        'u=p; sub(/\\/[^\\/]*$/,"",u); if(u in d) t[u]=sum(t[u],t[p]); else if(u==k) s=sum(s,t[p]); print t[p], p} '
+        'print (s==""?0:s), "="}\'; }; '
+        'flush() { tree "$1" | LC_ALL=C sort -k2 | while read -r v p; do [ "$p" = = ] || set_cg_min "$p" "$v"; done; }; '
         # this shell sits in the executor's cgroup; with the host cgroup namespace its path is absolute
         "ex=$(sed -n 's#^0::##p' /proc/self/cgroup); "
         'case "$ex" in /|"") ex=; echo "memory_min_failed executor root_cgroup";; '
@@ -79,16 +81,19 @@ def _host_memory_min_script() -> str:
         # a unit's effective share is its larger existing MemoryMin when it has one; the slice sum and a unit holding the
         # executor (summed with the executor below) count that share. An "infinity" unit makes both unlimited too
         # (max for a directly written cgroup, infinity for system.slice): a finite parent would cap its protection
-        f"sl={units_mib * MIB}; inf=; "
+        f"sl={units_mib * MIB}; inf=; hs=; "
         f"for kv in {units}; do u=${{kv%=*}}; d=${{kv#*=}}; e=$d; "
         'if systemctl is-active -q "$u"; then v=$(systemctl show -p MemoryMin --value "$u"); '
         'if [ "$v" = infinity ]; then e=max; inf=1; elif [ "$v" -gt "$d" ] 2>/dev/null; then e=$v; sl=$((sl + v - d)); fi; '
         'set_min "$u" "$d"; fi; '
-        'case "$ex" in "/system.slice/$u/"*) add "/system.slice/$u" "$e";; esac; done; '
+        'case "$ex" in "/system.slice/$u/"*) add "/system.slice/$u" "$e"; hs=$e;; esac; done; '
         'case "$ex" in '
         f'/system.slice/docker-*.scope) set_min "${{ex#/system.slice/}}" {ex_min}; sl=$((sl + {ex_min}));; '
-        f'/system.slice/*) add "$ex" {ex_min}; sl=$((sl + {ex_min}));; '
         f'?*) add "$ex" {ex_min};; esac; '
+        # the cgroups under system.slice written here count with their full totals (an existing larger memory.min
+        # included), in place of the share already counted for the unit holding the executor
+        'ts=$(tree /system.slice | sed -n "s/ =\$//p"); '
+        'if [ "$ts" = max ] || [ "$hs" = max ]; then inf=1; else sl=$((sl - ${hs:-0} + ${ts:-0})); fi; '
         'flush /system.slice; [ -n "$inf" ] && sl=infinity; set_min system.slice "$sl"; '
         "else "
         # no systemd (another init, a container as PID 1): the services' own cgroups, found from /proc. A host service

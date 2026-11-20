@@ -209,6 +209,17 @@ def test_executor_under_system_slice_counts_in_the_slice_set_by_systemd(tmp_path
     assert _read(state / "system.slice") == UNITS_MIB * MIB + extra + EX
 
 
+def test_executor_with_a_larger_existing_reservation_under_system_slice_counts_in_full(tmp_path):
+    executor = "/system.slice/custom.slice/executor"
+    run = _run_memory_min(tmp_path, executor)
+    (tmp_path / "cg" / executor.lstrip("/") / "memory.min").write_text(f"{4096 * MIB}\n")
+
+    run()
+
+    assert _read(tmp_path / "cg/system.slice/custom.slice/memory.min") == 4096 * MIB
+    assert _read(tmp_path / "sd/system.slice") == UNITS_MIB * MIB + 4096 * MIB
+
+
 @pytest.mark.parametrize(
     ("path", "reason"),
     [("/", "root_cgroup"), ("/../../docker/abc", "outside_host_cgroup_namespace")],
