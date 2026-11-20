@@ -341,8 +341,9 @@ def reserve_pod_bridge_script(network: str, token: str) -> str:
     d = shlex.quote(_reservations_dir())
     return (
         f"mkdir -p {d} && : > {_reservation(network, token)} || {{ echo 'bridge not reserved' >&2; exit 4; }}; "
+        # a failed cleanup never blocks the create: unread expired reservations only keep their bridges longer
         f"find {d} -type f -mmin +{BRIDGE_RESERVATION_TTL_MINUTES} -exec rm -f {{}} + || "
-        "{ echo 'expired reservations not read' >&2; exit 4; }; "
+        "echo 'bridge not removed: expired reservations not read'; "
         f"for ID in $($HOST_NS docker network ls -q --no-trunc --filter label={POD_NETWORK_LABEL}=pod); do "
         "N=$($HOST_NS docker network inspect -f '{{.Name}}' \"$ID\") || continue; "
         f'case "$N" in {RENTAL_NETWORK_NAME}-*) ;; *) continue ;; esac; '
