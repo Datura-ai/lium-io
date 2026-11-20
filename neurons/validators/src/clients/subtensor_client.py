@@ -1063,21 +1063,23 @@ class SubtensorClient:
         while retries < max_retries:
             try:
                 node = self.get_node()
-                # Only a finalized block, and its hash taken from the finalized chain itself: from the finalized head,
-                # parent by parent down to the height. A best-chain block can be reorganized away, and a separate
-                # lookup by height can reach another peer (the SDK reconnects per call) on a competing branch; either
-                # way one job block would report under two cycle ids. A block hash fixes its parent, so whichever peer
-                # answers each step, the walk stays on the chain the finalized head belongs to. Until finality reaches
-                # the height there is no answer and the block is retried.
-                block_hash = node.rpc_request("chain_getFinalizedHead", [])["result"]
-                header = node.rpc_request("chain_getHeader", [block_hash])["result"]
+                # Only a finalized block, and its hash taken from the finalized chain itself: the head's own state
+                # (System::BlockHash, read at the finalized head's hash) names the block at the height on that chain.
+                # A best-chain block can be reorganized away, and a lookup by height can reach another peer (the SDK
+                # reconnects per call) on a competing branch; either way one job block would report under two cycle
+                # ids. State read at a hash is the same on every peer, so this answers the finalized chain's block in
+                # a fixed three or four calls, however far the head is past the height (a walk down the parents took
+                # one blocking call per block on the shared loop). Until finality reaches the height there is no answer
+                # and the block is retried; the map holds the last BlockHashCount blocks, so an older one has none.
+                head = node.rpc_request("chain_getFinalizedHead", [])["result"]
+                header = node.rpc_request("chain_getHeader", [head])["result"]
                 if not header or int(header["number"], 16) < block:
                     raise LookupError(f"block {block} is not finalized yet")
-                while int(header["number"], 16) > block:
-                    block_hash = header["parentHash"]
-                    header = node.rpc_request("chain_getHeader", [block_hash])["result"]
-                    if not header:
-                        raise LookupError(f"no header for {block_hash}")
+                block_hash = head
+                if int(header["number"], 16) > block:
+                    block_hash = str(node.query("System", "BlockHash", [block], block_hash=head).value or "")
+                    if not block_hash or int(block_hash, 16) == 0:  # the map's default: no such block in its range
+                        raise LookupError(f"no hash for block {block} in the finalized head's state")
                 return datetime.fromtimestamp(
                     node.query("Timestamp", "Now", block_hash=block_hash).value / 1000, tz=UTC
                 ).strftime("%Y-%m-%d %H:%M:%S")
