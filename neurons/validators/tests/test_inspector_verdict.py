@@ -541,16 +541,11 @@ def test_no_scoring_or_enforcement_path_reads_inspector_findings():
 
     scoring = [src / "services/task/score_calculator.py", src / "services/task/checks/score.py", *sorted((src / "incentive").rglob("*.py"))]
     assert all(path.exists() for path in scoring)
-    # DAH-4271: the one inspector name scoring may read is the blind-streak flag, which says only
-    # whether the sensor saw the rental at all, never what it found
-    texts = {
-        path: path.read_text(encoding="utf-8")
-        .replace("inspector_blind_streak_passed", "")
-        .replace("inspector_host_write_passed", "")  # DAH-4548: host wrote into a rented pod
-        for path in scoring
-    }
+    # DAH-6216: inspector events are recorded only, so scoring reads no inspector name at all
     assert [
-        str(path.relative_to(src)) for path in scoring if "inspector" in texts[path].lower()
+        str(path.relative_to(src))
+        for path in scoring
+        if "inspector" in path.read_text(encoding="utf-8").lower()
     ] == []
     assert "inspector_passed" not in Context.model_fields
     assert not hasattr(settings, "INSPECTOR_ENFORCE_ENABLED")

@@ -552,7 +552,10 @@ NOT_COMPARABLE_SPEC_PATHS = frozenset(
         "hard_disk.free",
         "hard_disk.utilization",
         "hard_disk.engy_cache_used_gb",
+        "hard_disk.images",
         "hard_disk.containers",
+        "hard_disk.volumes",
+        "docker.containers",
     }
 )
 LIVE_GPU_DETAIL_FIELDS = frozenset(
@@ -563,22 +566,27 @@ LIVE_GPU_DETAIL_FIELDS = frozenset(
         "memory_used_mb",
         "graphics_speed",
         "memory_speed",
+        "power_limit",
+        "pcie",
+        "pcie_speed",
+        "clocks_event_reasons",
     }
 )
-LIVE_DOCKER_CONTAINER_FIELDS = frozenset({"cpu_percent", "net_rx_bytes", "net_tx_bytes"})
 
 
 def _is_not_comparable(path: str) -> bool:
     if path in NOT_COMPARABLE_SPEC_PATHS:
         return True
-    if path == "hard_disk.by_container" or path.startswith("hard_disk.by_container."):
+    if path in {"hard_disk.by_container", "hard_disk.by_volume"}:
+        return True
+    if path.startswith(("hard_disk.by_container.", "hard_disk.by_volume.")):
+        return True
+    if path == "gpu_processes" or path.startswith("gpu_processes["):
         return True
     parent, _, leaf = path.rpartition(".")
     if not parent.endswith("]"):
         return False
-    if leaf in LIVE_GPU_DETAIL_FIELDS and parent.startswith("gpu.details["):
-        return True
-    return leaf in LIVE_DOCKER_CONTAINER_FIELDS and parent.startswith("docker.containers[")
+    return leaf in LIVE_GPU_DETAIL_FIELDS and parent.startswith("gpu.details[")
 
 
 def _spec_diffs(python: Any, liumd: Any, path: str = "") -> list[dict[str, Any]]:
