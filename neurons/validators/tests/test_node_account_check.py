@@ -776,14 +776,16 @@ async def test_an_unverified_read_before_the_notice_promises_no_notice_it_cannot
     ],
 )
 async def test_an_unverified_node_is_scored_but_its_host_is_never_repaired_or_cleaned(files, success, written):
-    """The run goes on for scoring and the report, but the needrestart guard, container cleanup and build sweep write
-    to the host only once the account check proved the machine the listing account's."""
+    """The run goes on for scoring and the report, but the needrestart guard, container cleanup, build sweep, GPU monitor
+    start and egress rules write to the host only once the account check proved the machine the listing account's."""
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
     from services.task.checks.custom_build_orphan_sweep import CustomBuildOrphanSweepCheck
     from services.task.checks.needrestart_guard import NeedrestartGuardCheck
+    from services.task.checks.rental_egress_guard import RentalEgressGuardCheck
     from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+    from services.task.checks.start_gpu_monitor import StartGPUMonitorCheck
     from services.task.pipeline import Pipeline
 
     from tests.helpers import build_state
@@ -802,6 +804,11 @@ async def test_an_unverified_node_is_scored_but_its_host_is_never_repaired_or_cl
     assert ssh.run.await_count == (1 if written else 0)
     assert end.host_writes_deferred is not written
     if not written:
-        for check in (StaleContainerCleanupCheck(), CustomBuildOrphanSweepCheck()):
+        for check in (StaleContainerCleanupCheck(), CustomBuildOrphanSweepCheck(), StartGPUMonitorCheck()):
             result = await check.run(end)
             assert result.passed and result.event.reason_code.endswith("_DEFERRED")
+        # the egress rules are left as they are, and the first verified cycle changes them (no cadence stamp)
+        guard = RentalEgressGuardCheck()
+        result = await guard.run(end)
+        assert result.event.reason_code == "RENTAL_EGRESS_GUARD_SKIPPED" and not guard._last_run
+        assert ssh.run.await_count == 0

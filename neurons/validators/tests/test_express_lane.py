@@ -1545,14 +1545,15 @@ async def test_a_restart_around_the_cycle_checkpoint_applies_the_cycle_once(
     checkpoint = validator.redis_service.write_atomically
     if restart == "before_checkpoint":
         async def killed_at_the_checkpoint(writes):
-            if any(op.args[0] == "validator_pending_job_block" for op in writes.ops):
+            if any(op.command == "delete" and op.args[0] == "validator_pending_job_block" for op in writes.ops):
                 raise _Killed
             await checkpoint(writes)
 
         validator.redis_service.write_atomically = AsyncMock(side_effect=killed_at_the_checkpoint)
         with pytest.raises(_Killed):
             await _run_ticks(validator, (block + n - 1,), lambda b, attempt: True)  # 1124: wave run, then killed
-        assert store["validator_pending_job_block"] == f"[{block}, {block + n - 1}]"
+        # applied at 1124 and kept with the block, in the same write as the accumulator
+        assert store["validator_pending_job_block"] == f"[{block}, {block + n - 1}, {block + n - 1}]"
     else:
         await _run_ticks(validator, (block + n - 1,), lambda b, attempt: True)
         assert "validator_pending_job_block" not in store
@@ -1574,6 +1575,116 @@ async def test_a_restart_around_the_cycle_checkpoint_applies_the_cycle_once(
         assert restarted.miner_scores == {"miner-a": 2.0}
         assert restarted.live_cycle_ids == [f"time-of-{block}", f"time-of-{block + n}"]
     assert "validator_pending_job_block" not in store
+
+
+def _scoring_miner_a(monkeypatch):
+    """Each cycle gives miner-a 1.0, so a cycle applied twice shows."""
+    from core.validator import IncentiveFactory
+
+    build = IncentiveFactory.create
+
+    def create(*args, **kwargs):
+        incentive = build(*args, **kwargs)
+        incentive.calculate_final_weights = AsyncMock(return_value={"miner-a": 1.0})
+        return incentive
+
+    monkeypatch.setattr(IncentiveFactory, "create", create)
+
+
+@pytest.mark.asyncio
+async def test_a_restart_after_a_failed_checkpoint_applies_the_cycle_once(
+    validator_with_mocks, create_neuron_info, monkeypatch
+):
+    """Review 4645563087: the checkpoint failed, the end-of-tick save wrote miner_scores with the cycle in it, and the
+    process stopped before live_cycle_ids was written, so the restart ran the block again and added it twice. The
+    accumulator, its cycle ids and the pending block are now one write."""
+    from core.config import settings
+
+    n = settings.BLOCKS_FOR_JOB
+    validator = validator_with_mocks
+    store = _keep_in(validator.redis_service)
+    validator.subtensor_client.get_miners = AsyncMock(return_value=[create_neuron_info(1, "miner-a")])
+    _scoring_miner_a(monkeypatch)
+    block = 14 * n
+    keep = validator.redis_service.write_atomically.side_effect
+    plain_set = validator.redis_service.set.side_effect
+
+    async def checkpoint_fails(writes):
+        if any(op.command == "delete" and op.args[0] == "validator_pending_job_block" for op in writes.ops):
+            raise ConnectionError("redis down")
+        await keep(writes)
+
+    def killed_before_the_cycle_ids(key, value, *a, **k):
+        if key == "settlement_live_cycle_ids":
+            raise _Killed
+        plain_set(key, value)
+
+    validator.redis_service.write_atomically = AsyncMock(side_effect=checkpoint_fails)
+    validator.redis_service.set = AsyncMock(side_effect=killed_before_the_cycle_ids)
+    with contextlib.suppress(_Killed):
+        await _run_ticks(validator, (block + n - 1,), lambda b, attempt: True)  # 1124: 1050 runs, checkpoint fails
+
+    restarted = _restarted(validator)
+    restarted.redis_service.write_atomically = AsyncMock(side_effect=keep)
+    restarted.redis_service.set = AsyncMock(side_effect=plain_set)
+    restarted.miner_scores = json.loads(store.get("miner_scores", "{}"))
+    restarted.live_cycle_ids = json.loads(store.get("settlement_live_cycle_ids", "[]"))
+    await restarted.restore_pending_job()
+    await _run_ticks(restarted, (block + n,), lambda b, attempt: True)  # 1125
+    assert restarted.miner_scores == {"miner-a": 1.0}
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_retried_after_a_live_submission_is_not_added_again(
+    validator_with_mocks, create_neuron_info, monkeypatch
+):
+    """Review 4645563087: a cycle whose report was neither kept nor delivered stays pending, but its score was already
+    in miner_scores; a live submission sent it and cleared live_cycle_ids, so the retry added it to the next vector."""
+    from core import validator as validator_module
+    from core.config import settings
+
+    n = settings.BLOCKS_FOR_JOB
+    validator = validator_with_mocks
+    store = _keep_in(validator.redis_service)
+    validator.subtensor_client.get_miners = AsyncMock(return_value=[create_neuron_info(1, "miner-a")])
+    _scoring_miner_a(monkeypatch)
+    monkeypatch.setattr(settings, "SETTLEMENT_MODE", validator_module.SETTLEMENT_SHADOW)
+    validator.report_cycle_scores = AsyncMock(side_effect=[False, True])
+    block = 14 * n
+
+    await _run_ticks(validator, (block + n - 1,), lambda b, attempt: True)  # 1124: applied, report fails
+    assert validator.miner_scores == {"miner-a": 1.0} and "validator_pending_job_block" in store
+    validator.miner_scores, validator.live_cycle_ids = {}, []  # what the live submission does after sending it
+    await _run_ticks(validator, (block + n,), lambda b, attempt: True)  # 1125: the pending cycle retries
+    assert validator.report_cycle_scores.await_count == 2
+    assert validator.miner_scores == {}
+    assert "validator_pending_job_block" not in store
+
+
+@pytest.mark.asyncio
+async def test_a_report_that_fails_at_the_end_of_the_interval_is_retried_on_the_next_tick(
+    validator_with_mocks, create_neuron_info, monkeypatch
+):
+    """A failed report kept its block pending, but the one-interval limit counted from the height that first chose it,
+    so a wave that ended near that limit was dropped before its report was retried. An applied cycle counts its retry
+    interval from when it was applied."""
+    from core import validator as validator_module
+    from core.config import settings
+
+    n = settings.BLOCKS_FOR_JOB
+    validator = validator_with_mocks
+    _keep_in(validator.redis_service)
+    validator.subtensor_client.get_miners = AsyncMock(return_value=[create_neuron_info(1, "miner-a")])
+    _scoring_miner_a(monkeypatch)
+    monkeypatch.setattr(settings, "SETTLEMENT_MODE", validator_module.SETTLEMENT_SHADOW)
+    validator.report_cycle_scores = AsyncMock(side_effect=[False, True])
+    block = 14 * n
+    # 1124 chooses 1050 and cannot read its time; 1198 runs it and the report fails; 1199 is past 1124's interval
+    read, asked = await _run_ticks(
+        validator, (block + n - 1, block + 2 * n - 2, block + 2 * n - 1), lambda b, attempt: attempt != 1
+    )
+    assert asked == [f"time-of-{block}", f"time-of-{block}"]
+    assert [c.args[3] for c in validator.report_cycle_scores.await_args_list] == [f"time-of-{block}"] * 2
 
 
 class _Killed(BaseException):

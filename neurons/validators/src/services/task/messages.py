@@ -90,6 +90,13 @@ class StartGpuMonitorMessages:
         category="prep",
         impact="Proceed",
     )
+    DEFERRED = MessageTemplate(
+        event="GPU monitor not started: node account not verified",
+        reason="MONITOR_START_DEFERRED",
+        severity="info",
+        category="prep",
+        impact="Proceed; the monitor starts once a check verifies the node's account",
+    )
     STARTED = MessageTemplate(
         event="GPU monitor started",
         reason="MONITOR_STARTED",

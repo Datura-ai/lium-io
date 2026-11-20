@@ -160,6 +160,9 @@ class Validator:
         self.pending_job: tuple[int, int] | None = None
         # False until Redis answered for the kept pending block: a failed read is no proof that none was kept
         self.pending_job_read = False
+        # the height at which the pending block's cycle went into miner_scores; None while it is not in them. Kept
+        # with the block, so a retry (after a restart or a live submission that cleared live_cycle_ids) adds it once
+        self.pending_applied_at: int | None = None
         self.default_extra = {}
         # DAH-2958: the current cycle's job files / digests / image snapshot, reused by the
         # express lane so its verifications are the cycle's pipeline. None before the first cycle.
@@ -328,11 +331,12 @@ class Validator:
         """Set the due job block (and the height that first chose it) and keep it in Redis, so a restart before its
         cycle starts runs that block, not the one the new height falls in. A Redis error leaves it in memory only."""
         self.pending_job = pending
+        self.pending_applied_at = None
         try:
             if pending is None:
                 await self.redis_service.delete(PENDING_JOB_KEY)
             else:
-                await self.redis_service.set(PENDING_JOB_KEY, json.dumps(list(pending)))
+                await self.redis_service.set(PENDING_JOB_KEY, self._pending_record())
         except Exception as e:
             logger.error(
                 _m(
@@ -341,23 +345,41 @@ class Validator:
                 )
             )
 
-    async def checkpoint_cycle(self) -> None:
-        """Keep the accumulator with this cycle in it and drop the pending block in one Redis write."""
-        self.pending_job = None
+    def _pending_record(self) -> str:
+        record = [*self.pending_job]
+        if self.pending_applied_at is not None:
+            record.append(self.pending_applied_at)
+        return json.dumps(record)
+
+    async def persist_state(self) -> None:
+        """The accumulator, the cycles in it and the pending block (with whether its cycle is in the accumulator) in
+        one Redis write, so a restart sees all of them or none. The block is left alone until Redis has answered for
+        it: an unread block is no proof that none was kept."""
         try:
-            await self.redis_service.write_atomically(
+            writes = (
                 RedisWrites()
                 .set(MINER_SCORES_KEY, json.dumps(self.miner_scores))
                 .set(LIVE_CYCLE_IDS_KEY, json.dumps(self.live_cycle_ids))
-                .delete(PENDING_JOB_KEY)
             )
+            if self.pending_job_read:
+                if self.pending_job is None:
+                    writes.delete(PENDING_JOB_KEY)
+                else:
+                    writes.set(PENDING_JOB_KEY, self._pending_record())
+            await self.redis_service.write_atomically(writes)
         except Exception as e:
             logger.error(
                 _m(
-                    "[sync] failed to checkpoint the cycle",
+                    "[sync] failed to keep miner_scores and the pending block",
                     extra=get_extra_info({**self.default_extra, "error": str(e)}),
                 )
             )
+
+    async def checkpoint_cycle(self) -> None:
+        """Keep the accumulator with this cycle in it and drop the pending block in one Redis write."""
+        self.pending_job = None
+        self.pending_applied_at = None
+        await self.persist_state()
 
     async def restore_pending_job(self) -> None:
         """The due job block a previous run had not started (keep_pending_job). It is dropped by the same one-interval
@@ -366,8 +388,9 @@ class Validator:
             raw = await self.redis_service.get(PENDING_JOB_KEY)
             self.pending_job_read = True
             if raw:
-                job_block, chosen_at = json.loads(raw)
+                job_block, chosen_at, *applied_at = json.loads(raw)
                 self.pending_job = (int(job_block), int(chosen_at))
+                self.pending_applied_at = int(applied_at[0]) if applied_at else None
         except Exception as e:
             logger.error(
                 _m(
@@ -506,7 +529,11 @@ class Validator:
                 # A failed attempt keeps its block for the following ticks, for one interval from the height that first
                 # chose it: by then the healthy schedule has moved to the next block, so a block the chain can no longer
                 # read (pruned state) never holds back the cycles after it.
-                if self.pending_job is not None and current_block - self.pending_job[1] >= settings.BLOCKS_FOR_JOB:
+                # A cycle already applied but not yet reported counts its interval from when it was applied, so a
+                # wave that ends near the limit still gets its retry.
+                if self.pending_job is not None and current_block - (
+                    self.pending_applied_at if self.pending_applied_at is not None else self.pending_job[1]
+                ) >= settings.BLOCKS_FOR_JOB:
                     await self.keep_pending_job(None)
                 if self.pending_job is None:
                     await self.keep_pending_job(
@@ -888,10 +915,15 @@ class Validator:
 
                     # PHASE 3: Accumulate scores with burning applied. A rerun of the same block (its wave ran but the
                     # block was not yet checkpointed) carries the same cycle id and is applied once.
-                    if job_batch_id not in self.live_cycle_ids:
+                    # Whether it is applied is kept with the pending block itself, in the same write as the
+                    # accumulator: live_cycle_ids is cleared at each live submission, so it cannot tell on its own.
+                    if self.pending_applied_at is None and job_batch_id not in self.live_cycle_ids:
                         for miner_hotkey, score in cycle_scores.items():
                             self.miner_scores[miner_hotkey] = self.miner_scores.get(miner_hotkey, 0) + score
                         self.live_cycle_ids.append(job_batch_id)
+                        applied_at = self._current_block_or_none()
+                        self.pending_applied_at = applied_at if applied_at is not None else current_block
+                        await self.persist_state()
 
                     reported = settings.SETTLEMENT_MODE == SETTLEMENT_OFF or await self.report_cycle_scores(
                         cycle_scores,
@@ -1064,20 +1096,7 @@ class Validator:
             # Persist the current accumulator on every cycle so an unclean
             # restart (SIGKILL / OOM / liveness preempt) does not lose the
             # in-memory state — graceful stop() alone is not enough.
-            try:
-                await self.redis_service.set(
-                    MINER_SCORES_KEY, json.dumps(self.miner_scores)
-                )
-                await self.redis_service.set(LIVE_CYCLE_IDS_KEY, json.dumps(self.live_cycle_ids))
-            except Exception as e:
-                logger.warning(
-                    _m(
-                        "[sync] Failed to persist miner_scores",
-                        extra=get_extra_info(
-                            {**self.default_extra, "error": str(e)}
-                        ),
-                    ),
-                )
+            await self.persist_state()
 
     async def report_cycle_scores(
         self,
@@ -1859,13 +1878,4 @@ class Validator:
         if hasattr(self, 'subtensor_client'):
             await SubtensorClient.shutdown()
 
-        try:
-            await self.redis_service.set(MINER_SCORES_KEY, json.dumps(self.miner_scores))
-            await self.redis_service.set(LIVE_CYCLE_IDS_KEY, json.dumps(self.live_cycle_ids))
-        except Exception as e:
-            logger.info(
-                _m(
-                    "[stop] Failed to save miner_scores",
-                    extra=get_extra_info({**self.default_extra, "error": str(e)}),
-                ),
-            )
+        await self.persist_state()
