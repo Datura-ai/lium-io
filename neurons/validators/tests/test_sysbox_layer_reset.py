@@ -192,3 +192,22 @@ def test_it_runs_right_after_the_needrestart_guard_before_any_fatal_check(pipeli
     names = [type(c).__name__ for c in getattr(PipelineFactory, pipeline)()]
 
     assert names[names.index("NeedrestartGuardCheck") + 1] == "SysboxLayerResetCheck"
+
+
+@pytest.mark.asyncio
+async def test_an_image_built_without_the_setup_script_installs_nothing(context_factory, mode, monkeypatch, tmp_path):
+    # the Dockerfile's empty placeholder, when a build does not pass the executor_setup context
+    from neurons.validators.src.services.task.checks import sysbox_layer_reset
+
+    (tmp_path / "nvidia_docker_sysbox_setup.sh").write_text("")
+    monkeypatch.setattr(sysbox_layer_reset, "SETUP_SCRIPT_PATHS", (tmp_path / "nvidia_docker_sysbox_setup.sh",))
+    sysbox_layer_reset.setup_script.cache_clear()
+    mode("all")
+    ssh = _ssh("")
+    try:
+        result = await _run(context_factory, {"sysbox_layer_reset_version": 0}, ssh)
+    finally:
+        sysbox_layer_reset.setup_script.cache_clear()
+
+    assert (result.passed, result.event.reason_code) == (True, Msg.UNKNOWN.reason)
+    ssh.run.assert_not_awaited()
