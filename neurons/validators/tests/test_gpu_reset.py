@@ -1468,6 +1468,8 @@ async def test_a_reset_that_never_reached_the_executor_answers_with_a_reset_resu
     assert isinstance(busy, PodGpuResetResult) and busy.request_id == "r1" and not busy.ok
     assert busy.error_code == GpuResetErrorCode.OperationInProgress
     assert gone.error_code == GpuResetErrorCode.ExecutorUnreachable
+    # DAH-6741 review: the container was never read, so neither says it runs (an earlier reset may have stopped it)
+    assert busy.pod_stopped is None and gone.pod_stopped is None
 
 
 @pytest.mark.asyncio
