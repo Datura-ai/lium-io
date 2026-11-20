@@ -78,10 +78,21 @@ async def test_a_non_public_axon_is_refused_with_nothing_sent(monkeypatch, host)
         await _request(f"http://{host}:8080/executors")
 
 
+def _debug_local_miner(monkeypatch, host, port):
+    monkeypatch.setattr(settings.debug, "USE_LOCAL_MINER", True)
+    monkeypatch.setattr(settings.debug, "MINER_ADDRESS", host)
+    monkeypatch.setattr(settings.debug, "MINER_PORT", port)
+
+
+def _configured_origin(monkeypatch, host, port):
+    monkeypatch.setattr(settings, "CONFIGURED_MINER_ORIGINS", f"miner.example.net:9000, {host}:{port}")
+
+
 @pytest.mark.asyncio
-async def test_the_configured_local_miner_is_reached_at_its_private_address(monkeypatch):
-    """A debug validator's local miner (DEBUG_USE_LOCAL_MINER) is the operator's setting, so its private address is
-    dialled; any other private address, even on the same host, is still refused."""
+@pytest.mark.parametrize("configure", [_debug_local_miner, _configured_origin], ids=["debug-local-miner", "origin"])
+async def test_a_miner_the_operator_configured_is_reached_at_its_private_address(monkeypatch, configure):
+    """A miner the validator's operator set up (a stand's local miner, a dev copy's in-cluster central miner) is
+    dialled at its private address; any other private address, even on the same host, is still refused."""
 
     async def handler(request):
         return web.json_response({"ok": True})
@@ -93,15 +104,12 @@ async def test_the_configured_local_miner_is_reached_at_its_private_address(monk
     site = web.TCPSite(runner, "0.0.0.0", 0)
     await site.start()
     port = site._server.sockets[0].getsockname()[1]
-    monkeypatch.setattr(settings.debug, "USE_LOCAL_MINER", True)
-    monkeypatch.setattr(settings.debug, "MINER_ADDRESS", "0.0.0.0")
-    monkeypatch.setattr(settings.debug, "MINER_PORT", port)
     try:
+        with pytest.raises(NodeHostError):
+            await _request(f"http://0.0.0.0:{port}/executors")
+        configure(monkeypatch, "0.0.0.0", port)
         assert await _request(f"http://0.0.0.0:{port}/executors") == (200, {"ok": True})
         with pytest.raises(NodeHostError):
             await _request(f"http://0.0.0.0:{port + 1}/executors")
-        monkeypatch.setattr(settings.debug, "USE_LOCAL_MINER", False)
-        with pytest.raises(NodeHostError):
-            await _request(f"http://0.0.0.0:{port}/executors")
     finally:
         await runner.cleanup()

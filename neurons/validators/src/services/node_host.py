@@ -64,14 +64,20 @@ class _CheckedAddresses(list):
     host: str = ""
 
 
-def _refused(host: str, port: int, reason: str, addresses: list[str] | None = None) -> NodeHostError:
+class NonPublicAddressError(NodeHostError):
+    """The address, or one the name resolves to, is not public. Unlike a failed lookup, retrying does not change it."""
+
+
+def _refused(
+    host: str, port: int, reason: str, addresses: list[str] | None = None, error: type[NodeHostError] = NodeHostError
+) -> NodeHostError:
     logger.warning(
         _m(
             f"Refused hostname node {host}:{port}: {reason}",
             extra=get_extra_info({"host": host, "port": port, "addresses": addresses or [], "reason": reason}),
         )
     )
-    return NodeHostError(f"{host} {reason}")
+    return error(f"{host} {reason}")
 
 
 def _log_dialed(infos: list, sockaddr: tuple) -> None:
@@ -211,7 +217,7 @@ def _check_literal(host: str, port: int) -> None:
     and 127.0.0.1 or the metadata address would have the validator connect to its own host."""
     address = host.strip("[]").split("%", 1)[0]
     if not is_public_ip(ipaddress.ip_address(address)):
-        raise _refused(host, port, "is not a public address", [address])
+        raise _refused(host, port, "is not a public address", [address], NonPublicAddressError)
 
 
 async def resolve_public_host(host: str, port: int = 22, executor=None) -> list:
@@ -239,7 +245,8 @@ async def resolve_public_host(host: str, port: int = 22, executor=None) -> list:
         raise _refused(host, port, "resolves to no address")
     blocked = sorted(str(a) for a in addresses if not is_public_ip(a))
     if blocked:
-        raise _refused(host, port, f"resolves to a non-public address: {', '.join(blocked)}", blocked)
+        reason = f"resolves to a non-public address: {', '.join(blocked)}"
+        raise _refused(host, port, reason, blocked, NonPublicAddressError)
     checked = _CheckedAddresses(infos)
     checked.host = host
     return checked

@@ -142,6 +142,11 @@ class Settings(BaseSettings):
     # DAH-5592: how long a host-fault create failure is sent again on each new backend socket (redis_service)
     HOST_FAULT_FAILURE_RESEND_SECONDS: int = Field(default=2 * 3600, gt=0)
     COMPUTE_APP_URI: str = Field(env="COMPUTE_APP_URI", default="wss://lium.io/api")
+    CONFIGURED_MINER_ORIGINS: str = Field(
+        default="",
+        description="Comma-separated host:port of miners this validator's operator set up itself (a dev copy's "
+        "in-cluster central miner). Dialled as configured; every address a miner reports must be public.",
+    )
     COMPUTE_REST_API_URL: str | None = Field(
         env="COMPUTE_REST_API_URL", default="https://lium.io/api"
     )
@@ -1071,6 +1076,17 @@ class Settings(BaseSettings):
             chain_endpoint=self.BITTENSOR_CHAIN_ENDPOINT,
             network=self.BITTENSOR_NETWORK,
         )
+
+    def configured_miner_origins(self) -> set[tuple[str, int]]:
+        """(host, port) of the miners the operator configured: CONFIGURED_MINER_ORIGINS and the debug local miner."""
+        origins = {
+            (host.strip("[]"), int(port))
+            for host, _, port in (o.strip().rpartition(":") for o in self.CONFIGURED_MINER_ORIGINS.split(","))
+            if host
+        }
+        if self.debug.USE_LOCAL_MINER and self.debug.MINER_ADDRESS and self.debug.MINER_PORT:
+            origins.add((self.debug.MINER_ADDRESS, self.debug.MINER_PORT))
+        return origins
 
     def get_debug_miner(self) -> dict:
         if not self.debug.MINER_ADDRESS or not self.debug.MINER_PORT:

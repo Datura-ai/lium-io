@@ -80,6 +80,7 @@ from services.docker_service import (
 )
 from services.executor_image_policy import ExpectedImageSnapshot
 from services.node_host import (
+    NonPublicAddressError,
     for_payload_miner,
     is_ip_literal,
     public_host_connector,
@@ -2085,10 +2086,9 @@ class MinerService:
             # name; aiohttp dials a literal without a lookup, so it is checked here), and a redirect is never
             # followed to another address.
             target = yarl.URL(url)
-            # the local miner a debug validator is pointed at is the operator's own setting, not an address a miner
-            # reported, so it is dialled as configured (a stand's miner sits on a private compose address)
-            debug = settings.debug
-            configured = debug.USE_LOCAL_MINER and (target.host, target.port) == (debug.MINER_ADDRESS, debug.MINER_PORT)
+            # a miner the operator configured (a dev copy's in-cluster miner, a stand's local one) is not an address a
+            # miner reported, so it is dialled as set
+            configured = (target.host, target.port) in settings.configured_miner_origins()
             if not configured and target.host and is_ip_literal(target.host):
                 await resolve_node_host(target.host, target.port)
             connector = aiohttp.TCPConnector() if configured else public_host_connector()
@@ -2599,11 +2599,11 @@ class MinerService:
                     stale = status == 401 and "too old" in str(response_data)
                     if not stale or time.monotonic() >= deadline:
                         break
-                except (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError):
+                except (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError) as exc:
                     # refused, or a connect nobody answered: it never reached the miner, so its rental hook did not
                     # run and a resubmit must run it. A read timeout may have run it, and the hook is not idempotent:
-                    # that create fails.
-                    if time.monotonic() >= deadline:
+                    # that create fails. A non-public miner address stays non-public, so that one fails at once.
+                    if isinstance(getattr(exc, "os_error", None), NonPublicAddressError) or time.monotonic() >= deadline:
                         raise
                 await asyncio.sleep(MINER_RESTART_RETRY_S)
 
