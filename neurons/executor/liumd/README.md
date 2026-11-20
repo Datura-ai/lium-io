@@ -16,6 +16,8 @@ binaries for traceability. `manifest.json` is the validator refresh manifest: it
 manifest's exact bytes, made by the liumd release key (ed25519:04d614eaf59dbbb8) when a `liumd-v*`
 release is tagged. The validator's refresh pins that key, fetches the signature with the manifest and
 installs nothing unless it verifies; a missing or foreign signature keeps the node's current binary.
+The signed manifest also carries `release`, the release tag's X.Y.Z. The validator keeps the highest release it has
+accepted, for each node and overall, and refuses a lower one, so an older signed manifest cannot roll nodes back.
 The image digest is still the normal delivery trust boundary.
 
 Refresh both binaries, both provenance files, `manifest.json` and `manifest.json.sig` together from

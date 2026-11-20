@@ -6,12 +6,14 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from fakeredis.aioredis import FakeRedis
 from services.liumd_binary_refresh import ensure_liumd_binary
 
 from services import liumd_binary_refresh
 
 MANIFEST = {
     "build_sha": "new-build",
+    "release": "1.2.3",
     "binaries": {
         "x86_64": {"file": "liumd-amd64", "sha256": "a" * 64},
         "aarch64": {"file": "liumd-arm64", "sha256": "b" * 64},
@@ -75,10 +77,13 @@ class Runner:
         raise AssertionError(command)
 
 
-def _ctx(runner, batch="batch-1"):
+def _ctx(runner, batch="batch-1", redis=None, executor="exec-1"):
     return SimpleNamespace(
         runner=runner,
         config=SimpleNamespace(job_batch_id=batch),
+        miner_hotkey="miner-hk",
+        executor=SimpleNamespace(uuid=executor),
+        services=SimpleNamespace(redis=SimpleNamespace(redis=redis if redis is not None else FakeRedis())),
     )
 
 
@@ -353,8 +358,102 @@ async def test_a_manifest_without_a_valid_signature_installs_nothing(
     assert error in result.detail
     assert not runner.installed
     assert not any(c.startswith(("curl ", "install ")) for c in runner.calls)
-    # fail closed: a node keeps the binary it has; one without a binary gets none
-    assert (result.ok, result.build_sha) == ((True, "old-build") if local_present else (False, None))
+    # fail closed and reported as a refusal, not as an unavailable manifest: the node keeps the binary it has
+    assert (result.ok, result.refused, result.build_sha) == (False, True, "old-build" if local_present else None)
+    assert "using local" not in result.detail
+
+
+@pytest.mark.asyncio
+async def test_a_signature_fetch_that_fails_on_the_network_is_not_a_refusal(monkeypatch):
+    async def fetch_bytes(url, timeout, limit):
+        return (MANIFEST_BYTES, None) if url.endswith(".json") else (None, "ClientError: reset")
+
+    monkeypatch.setattr(liumd_binary_refresh, "_fetch_bytes", fetch_bytes)
+    result = await ensure_liumd_binary(_ctx(Runner()), budget_seconds=60)
+
+    assert (result.ok, result.refused, result.build_sha) == (True, False, "old-build")
+    assert "manifest unavailable, using local liumd" in result.detail
+
+
+def _signed(release):
+    data = (json.dumps({**MANIFEST, "release": release}, indent=2) + "\n").encode()
+    return {"manifest.json": data, "manifest.json.sig": _sig(RELEASE_KEY, data)}
+
+
+@pytest.mark.asyncio
+async def test_a_validly_signed_older_release_is_refused_after_a_newer_one_was_accepted(monkeypatch):
+    """The replay: main gets an older signed manifest and its binaries back. The signature verifies, but the node
+    accepted a higher release before, so nothing is installed and the refusal is reported as one."""
+    redis = FakeRedis()
+    _serve(monkeypatch, _signed("1.2.3"))
+    assert (await ensure_liumd_binary(_ctx(Runner(), redis=redis), budget_seconds=60)).changed
+
+    liumd_binary_refresh._MANIFEST_CACHE.clear()
+    _serve(monkeypatch, _signed("1.2.2"))
+    runner = Runner(local=NEW_BUILD)
+    result = await ensure_liumd_binary(_ctx(runner, redis=redis), budget_seconds=60)
+
+    assert (result.ok, result.refused, result.build_sha) == (False, True, NEW_BUILD)
+    assert "release 1.2.2 is below 1.2.3" in result.detail
+    assert not any(c.startswith(("curl ", "install ")) for c in runner.calls)
+
+
+@pytest.mark.asyncio
+async def test_an_older_release_is_refused_on_a_node_that_never_saw_the_newer_one(monkeypatch):
+    """The floor is the validator's too, not only the node's: a node new to it gets no older release either."""
+    redis = FakeRedis()
+    _serve(monkeypatch, _signed("2.0.0"))
+    assert (await ensure_liumd_binary(_ctx(Runner(), redis=redis, executor="a"), budget_seconds=60)).ok
+
+    liumd_binary_refresh._MANIFEST_CACHE.clear()
+    _serve(monkeypatch, _signed("1.9.9"))
+    result = await ensure_liumd_binary(_ctx(Runner(), redis=redis, executor="b"), budget_seconds=60)
+
+    assert (result.ok, result.refused) == (False, True)
+
+
+@pytest.mark.parametrize(("first", "then", "accepted"), [("1.2.3", "1.2.3", True), ("1.9.0", "1.10.0", True),
+                                                         ("1.10.0", "1.9.0", False)])
+@pytest.mark.asyncio
+async def test_the_release_compares_by_number_and_the_same_one_stays_accepted(monkeypatch, first, then, accepted):
+    redis = FakeRedis()
+    _serve(monkeypatch, _signed(first))
+    assert (await ensure_liumd_binary(_ctx(Runner(), redis=redis), budget_seconds=60)).ok
+    liumd_binary_refresh._MANIFEST_CACHE.clear()
+    _serve(monkeypatch, _signed(then))
+
+    result = await ensure_liumd_binary(_ctx(Runner(), redis=redis), budget_seconds=60)
+
+    assert (result.ok, result.refused) == (accepted, not accepted)
+
+
+@pytest.mark.parametrize("release", ["0.9.9", None, "1.2", "v1.2.3", "01.2.3", 123])
+@pytest.mark.asyncio
+async def test_a_release_below_the_code_minimum_or_not_x_y_z_is_refused(monkeypatch, release):
+    files = _signed(release)
+    if release is None:
+        data = (json.dumps({k: v for k, v in MANIFEST.items() if k != "release"}, indent=2) + "\n").encode()
+        files = {"manifest.json": data, "manifest.json.sig": _sig(RELEASE_KEY, data)}
+    _serve(monkeypatch, files)
+    runner = Runner()
+
+    result = await ensure_liumd_binary(_ctx(runner), budget_seconds=60)
+
+    assert (result.ok, result.refused, runner.installed) == (False, True, False)
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_floor_installs_nothing_and_keeps_the_local_binary(monkeypatch):
+    class Down:
+        async def mget(self, keys):
+            raise ConnectionError("redis down")
+
+    _serve(monkeypatch, _signed("1.2.3"))
+    runner = Runner()
+    result = await ensure_liumd_binary(_ctx(runner, redis=Down()), budget_seconds=60)
+
+    assert (result.ok, result.build_sha, runner.installed) == (True, "old-build", False)
+    assert "release floor unavailable" in result.detail
 
 
 @pytest.mark.asyncio

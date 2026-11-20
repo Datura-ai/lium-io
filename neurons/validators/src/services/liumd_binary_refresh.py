@@ -3,6 +3,11 @@
 The manifest names the build and each binary's sha256. It is trusted only when manifest.json.sig, an ed25519
 signature over the manifest's exact bytes, verifies against the release key pinned below. A missing, malformed or
 foreign signature refuses the refresh: nothing is installed and the local binary stays.
+
+The signed manifest also names its `release` (the liumd-v X.Y.Z tag). The validator keeps the highest release it
+accepted, for each node and overall, and refuses a lower one, so an older signed manifest (with its binaries) cannot be
+put back on main to roll nodes back. MIN_RELEASE in code is only an extra floor: the same main-merge rights could lower
+it. A refusal is reported as `refused`, not as an unavailable manifest.
 """
 
 from __future__ import annotations
@@ -17,6 +22,7 @@ from typing import Any
 from urllib.parse import urljoin
 
 import aiohttp
+import redis.exceptions
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
@@ -28,6 +34,13 @@ FILE_BY_ARCH = {"x86_64": "liumd-amd64", "aarch64": "liumd-arm64"}
 LIUMD_FILE_RX = re.compile(r"^liumd-(amd64|arm64)$")
 SHA256_RX = re.compile(r"^[0-9a-f]{64}$")
 TMP_BINARY = "/tmp/liumd.binary.fetch"
+
+# X.Y.Z, each part at most 6 digits with no leading zero (sign_manifest.py signs only this form)
+RELEASE_RX = re.compile(r"(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})")
+MIN_RELEASE = (1, 0, 0)
+# highest release accepted overall, and per node under ":<miner hotkey>:<executor uuid>"; stored zero-padded, so the
+# strings compare in release order
+RELEASE_FLOOR_KEY = "liumd_release_floor"
 
 MANIFEST_TIMEOUT_SECONDS = 10
 MAX_MANIFEST_BYTES = 64 * 1024
@@ -45,6 +58,10 @@ _MANIFEST_CACHE: dict[tuple[str, str], tuple[dict[str, Any] | None, str | None, 
 _MANIFEST_LOCK = asyncio.Lock()
 
 
+class _Refused(str):
+    """An error that refuses the manifest itself (signature, form or release), not a network miss."""
+
+
 @dataclass(frozen=True)
 class LiumdRefresh:
     ok: bool
@@ -52,6 +69,54 @@ class LiumdRefresh:
     detail: str = ""
     changed: bool = False
     skipped: bool = False
+    # the manifest was refused (bad or missing signature, older release): nothing installed, the local binary stays
+    refused: bool = False
+
+
+def _release(text: Any) -> tuple[int, int, int] | None:
+    m = RELEASE_RX.fullmatch(text) if isinstance(text, str) else None
+    return tuple(int(g) for g in m.groups()) if m else None  # type: ignore[return-value]
+
+
+def _padded(release: tuple[int, int, int]) -> str:
+    return ".".join(f"{part:06d}" for part in release)
+
+
+def _floor_keys(ctx: Any) -> list[str]:
+    return [RELEASE_FLOOR_KEY, f"{RELEASE_FLOOR_KEY}:{ctx.miner_hotkey}:{ctx.executor.uuid}"]
+
+
+async def _release_floor(ctx: Any) -> tuple[int, int, int]:
+    """The highest of MIN_RELEASE and the releases this validator accepted, overall and for this node."""
+    floor = MIN_RELEASE
+    for stored in await ctx.services.redis.redis.mget(_floor_keys(ctx)):
+        if stored is not None:
+            text = stored.decode() if isinstance(stored, bytes) else stored
+            floor = max(floor, tuple(int(part) for part in text.split(".")))
+    return floor
+
+
+async def _raise_floor(ctx: Any, release: tuple[int, int, int]) -> str:
+    """Records an accepted release; "" or why it could not be recorded (the next cycle records it again)."""
+    keys, value = _floor_keys(ctx), _padded(release)
+    try:
+        # WATCHed: a concurrent raise reruns the compare, so a lower release never overwrites a higher one
+        async with ctx.services.redis.redis.pipeline(transaction=True) as pipe:
+            while True:
+                try:
+                    await pipe.watch(*keys)
+                    current = [c.decode() if isinstance(c, bytes) else c for c in await pipe.mget(keys)]
+                    pipe.multi()
+                    for key, stored in zip(keys, current):
+                        if stored is None or value > stored:
+                            pipe.set(key, value)
+                    await pipe.execute()
+                    break
+                except redis.exceptions.WatchError:
+                    continue
+    except Exception as exc:  # noqa: BLE001 - the binary is fine; only the floor waits for the next cycle
+        return f"release floor not recorded: {type(exc).__name__}: {exc}"[:300]
+    return ""
 
 
 @dataclass(frozen=True)
@@ -126,14 +191,16 @@ async def _fetch_manifest(url: str, timeout: float) -> tuple[dict[str, Any] | No
         return None, f"manifest {error}"
     signature, error = await _fetch_bytes(url + ".sig", timeout, MAX_SIGNATURE_BYTES)
     if signature is None:
-        return None, f"manifest signature {error}"
+        # the manifest is there without its signature: refused; any other miss is the network's
+        message = f"manifest signature {error}"
+        return None, _Refused(message) if error == "fetch status 404" else message
     if error := _signature_error(body, signature):
-        return None, error
+        return None, _Refused(error)
     try:
         doc = json.loads(body)
     except ValueError as exc:
-        return None, f"manifest is not JSON: {exc}"
-    return (doc, None) if isinstance(doc, dict) else (None, "manifest is not an object")
+        return None, _Refused(f"manifest is not JSON: {exc}")
+    return (doc, None) if isinstance(doc, dict) else (None, _Refused("manifest is not an object"))
 
 
 async def _manifest(ctx: Any, timeout: float) -> tuple[dict[str, Any] | None, str | None]:
@@ -245,6 +312,8 @@ async def _ensure(ctx: Any, budget: float, started: float) -> LiumdRefresh:
             return LiumdRefresh(False, None, "local liumd version could not be read")
 
         manifest, error = await _manifest(ctx, min(MANIFEST_TIMEOUT_SECONDS, budget))
+        if isinstance(error, _Refused):
+            return LiumdRefresh(False, version.build_sha, f"manifest refused: {error}", refused=True)
         if manifest is None:
             if version.build_sha:
                 return LiumdRefresh(
@@ -256,9 +325,25 @@ async def _ensure(ctx: Any, budget: float, started: float) -> LiumdRefresh:
         expected_build = manifest.get("build_sha")
         if not isinstance(expected_build, str) or not expected_build:
             return LiumdRefresh(False, None, "manifest has no build_sha")
+        release = _release(manifest.get("release"))
+        if release is None:
+            return LiumdRefresh(False, version.build_sha, "manifest refused: no X.Y.Z release", refused=True)
+        try:
+            floor = await _release_floor(ctx)
+        except Exception as exc:  # noqa: BLE001 - unknown floor: install nothing, keep the local binary
+            detail = f"release floor unavailable: {type(exc).__name__}: {exc}"[:300]
+            return LiumdRefresh(bool(version.build_sha), version.build_sha, detail)
+        if release < floor:
+            return LiumdRefresh(
+                False,
+                version.build_sha,
+                f"manifest refused: release {'.'.join(map(str, release))} is below "
+                f"{'.'.join(map(str, floor))}, the highest accepted",
+                refused=True,
+            )
 
         if version.build_sha == expected_build:
-            return LiumdRefresh(True, expected_build)
+            return LiumdRefresh(True, expected_build, await _raise_floor(ctx, release))
 
         arch = _target_arch(version.target) or await _host_arch(ctx)
         if arch is None:
@@ -304,6 +389,6 @@ async def _ensure(ctx: Any, budget: float, started: float) -> LiumdRefresh:
             return LiumdRefresh(
                 False, installed_build.build_sha, "installed binary reports the wrong build_sha"
             )
-        return LiumdRefresh(True, installed_build.build_sha, changed=True)
+        return LiumdRefresh(True, installed_build.build_sha, await _raise_floor(ctx, release), changed=True)
     except Exception as exc:  # noqa: BLE001 - a repair failure is reported to the caller
         return LiumdRefresh(False, None, f"{type(exc).__name__}: {exc}"[:300])

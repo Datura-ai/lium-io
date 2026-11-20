@@ -277,3 +277,30 @@ async def test_a_failed_binary_refresh_does_not_fail_shadow_mode(monkeypatch):
     assert result.passed is True
     assert result.event.reason_code == Msg.SCRAPE_OK.reason
     assert len(runner.calls) == 1
+
+
+@pytest.mark.parametrize("local", ["old-build", None])
+@pytest.mark.asyncio
+async def test_a_refused_manifest_is_reported_as_a_refusal_and_keeps_the_local_binary(monkeypatch, caplog, local):
+    """A bad signature or an older release is not the node's fault: it logs its own error (not 'using the local
+    binary' like a network miss), and the scrape goes on with the node's binary; with none there is nothing to run."""
+    _liumd_on(monkeypatch)
+    _start_reading(monkeypatch, _answer(LIUMD_SPECS))
+
+    async def refused(ctx, *, budget_seconds=None):
+        return LiumdRefresh(False, local, "manifest refused: release 1.2.2 is below 1.2.3", refused=True)
+
+    monkeypatch.setattr(machine_spec_scrape, "ensure_liumd_binary", refused)
+    runner = DummySSHCommandRunner(result=make_command_result(success=False))
+
+    with caplog.at_level("ERROR"):
+        result = await MachineSpecScrapeCheck().run(_ctx(runner))
+
+    assert any("liumd manifest REFUSED" in r.getMessage() and r.levelname == "ERROR" for r in caplog.records)
+    assert not any("using the local binary" in r.getMessage() and "REFUSED" not in r.getMessage() for r in caplog.records)
+    if local:
+        assert result.passed is True
+        assert result.event.what_we_saw["delivery"] == "liumd"
+    else:
+        assert result.passed is False
+        assert result.event.what_we_saw["liumd_reason"] == "binary_refresh_failed"
