@@ -235,9 +235,9 @@ async def test_redis_failure_fails_open(client, monkeypatch, operation):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["claim_backend_command", "invalid_reply"])
-async def test_a_create_without_a_dedupe_record_is_refused_not_run(client, monkeypatch, operation):
-    """A create whose first copy ran must never run again because Redis failed on the resend: with no readable
-    command record the create is refused, nothing runs, and the backend gets a failure it may send again."""
+async def test_a_create_without_a_readable_dedupe_record_runs_nothing_and_answers_nothing(client, monkeypatch, operation):
+    """A create whose first copy ran must never run again because Redis failed on the resend, and the validator must
+    not claim it did not run: it runs nothing and answers nothing, so the backend's same-ID resend settles it later."""
     service = client.miner_service.redis_service
     await client.miner_driver(request())  # the first copy runs and records its answer
     client.message_queue.clear()
@@ -251,12 +251,7 @@ async def test_a_create_without_a_dedupe_record_is_refused_not_run(client, monke
     await client.miner_driver(request())
 
     assert client.miner_service.handle_container.await_count == 1
-    [refusal] = client.message_queue
-    assert isinstance(refusal, FailedContainerRequest)
-    assert refusal.command_id == "command"
-    assert refusal.error_type == FailedContainerErrorTypes.ContainerCreationFailed
-    assert refusal.error_code == FailedContainerErrorCodes.UnknownError
-    assert refusal.failure_step == "validator_restarted"
+    assert list(client.message_queue) == []
 
 
 @pytest.mark.asyncio
