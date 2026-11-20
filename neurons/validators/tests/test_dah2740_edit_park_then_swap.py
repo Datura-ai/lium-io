@@ -198,6 +198,11 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
     assert ssh.commands.index('/usr/bin/docker volume ls --format "{{.Name}}"') < hung_query
     assert hung_query < len(ssh.commands) - 1 - ssh.commands[::-1].index(_POWER_READ)  # before the last power read
     assert [cmd for cmd in ssh.commands if cmd != HUNG_GPU_QUERY_COMMAND] == [
+        # the pre-run host probe (DAH-3257); no image-label section, the volume is not encrypted; before the park, so
+        # a probe that stops the create leaves the current container as it was
+        prerun_host_probe_command(
+            docker_image=payload.docker_image, image_label=None, with_power=True, miner_hotkey=payload.miner_hotkey
+        ),
         f'/usr/bin/docker ps -a --no-trunc --format "{{{{.Names}}}} {{{{.ID}}}}" --filter name=^{name}$ --filter name=^{name}{EDIT_PARKED_SUFFIX}$ '
         f"--filter name=^kept_unmounted_{payload.pod_id}_",
         # the layer read: renter files under the volume path keep it after the edit
@@ -208,10 +213,6 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         f"/usr/bin/docker stop -t 10 {parked}",
         # the layer read again on the stopped container, before the replacement exists
         _layer_data_check(f"id-{name}", "/root"),
-        # the pre-run host probe (DAH-3257); no image-label section, the volume is not encrypted
-        prerun_host_probe_command(
-            docker_image=payload.docker_image, image_label=None, with_power=True, miner_hotkey=payload.miner_hotkey
-        ),
         '/usr/bin/docker volume ls --format "{{.Name}}"',
         # the live power floor read twice: beside the volume create, and again right before docker run
         "nvidia-smi --query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit"
@@ -1813,3 +1814,24 @@ def test_the_mount_read_runs_in_a_real_shell(pid, path, out):
     done = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
 
     assert (done.stdout.strip() if done.returncode == 0 else None) == out
+
+
+@pytest.mark.asyncio
+async def test_a_probe_that_may_still_hold_the_session_stops_the_edit_before_it_parks(svc, monkeypatch):
+    """The prerun probe runs before the park: a probe whose channel close is not confirmed (it may still hold the
+    host's only session) fails the edit with the renter's container untouched, so no undo needs that session."""
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr(
+        svc, "probe_prerun_host", AsyncMock(side_effect=docker_service.SshSessionMayStillBeTakenError("probe"))
+    )
+    monkeypatch.setattr(svc, "_bring_up_existing_container", AsyncMock())
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.failure_step == "prerun_host_probe"
+    assert _docker(ssh.commands, "rename") == []
+    assert _docker(ssh.commands, "stop") == []
+    svc._bring_up_existing_container.assert_not_awaited()
