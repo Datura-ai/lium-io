@@ -1,11 +1,12 @@
 #!/bin/bash
 set -eux -o pipefail
 
-# a prod release (TAG=latest) must speak no newer protocol than the prod backend reads; dev builds are not gated
-if [ "$TAG" = "latest" ]; then
-  python3 ./protocol_release_gate.py
+# the Dockerfile runs the protocol release check on every build; only non-latest (dev) tags opt out
+ALLOW_PROTOCOL_AHEAD=0
+if [ "$TAG" != "latest" ]; then
+  ALLOW_PROTOCOL_AHEAD=1
 fi
 
 IMAGE_NAME="daturaai/compute-subnet-validator:$TAG"
 
-docker build --build-context datura=../../datura -t $IMAGE_NAME .
+docker build --build-arg ALLOW_PROTOCOL_AHEAD=$ALLOW_PROTOCOL_AHEAD --build-context datura=../../datura -t $IMAGE_NAME .

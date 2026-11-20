@@ -20,6 +20,10 @@ RUN pdm install --prod
 
 COPY . .
 
+# every build is checked unless it opts out; only docker_build.sh opts out, for non-latest (dev) tags
+ARG ALLOW_PROTOCOL_AHEAD=0
+RUN [ "$ALLOW_PROTOCOL_AHEAD" = 1 ] || python3 protocol_release_gate.py
+
 RUN mv libdmcompverify.so /usr/lib/
 RUN mv libverifyx.so /usr/lib/
 RUN mv libinspector.so /usr/lib/
