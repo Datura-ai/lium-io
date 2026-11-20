@@ -20,6 +20,8 @@ from payload_models.payloads import (
     ContainerCreateRequest,
     ContainerDeleteRequest,
     ExecutorRentFinishedRequest,
+    FailedContainerErrorCodes,
+    FailedContainerErrorTypes,
     FailedContainerRequest,
     WorkloadKind,
 )
@@ -1711,7 +1713,14 @@ async def test_a_create_left_unanswered_by_the_node_queues_nothing() -> None:
     assert flags == [True]   # miner_driver keeps the outcome unknown, not a finished empty answer
 
 
-@pytest.mark.parametrize("stored_reply", ["{broken", "{}", "[]"])
+@pytest.mark.parametrize(
+    "stored_reply",
+    [
+        "{broken", "{}", "[]",
+        # a known type with its fields missing, a failure with its fields missing, a type that is not on the wire
+        '{"message_type": "ContainerCreated"}', '{"message_type": "FailedRequest"}', '{"message_type": "not-a-wire-type"}',
+    ],
+)
 @pytest.mark.asyncio
 async def test_a_create_record_with_an_unreadable_reply_withholds_the_report_and_stops_no_replay(stored_reply) -> None:
     """A readable record whose stored reply is not a message cannot tell a success from a failure: it counts as an
@@ -1867,3 +1876,22 @@ async def test_a_resend_while_an_unknown_outcome_is_re_checked_is_ignored() -> N
     await client.miner_driver(_create_request())   # no outcome left in `outcomes`: it must not run
 
     assert await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-1") == rival.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_a_create_record_whose_reply_is_a_whole_failure_stays_readable() -> None:
+    redis_service = _redis_service()
+    claim = BackendCommand(state="running", owner="o", create=True, pod_id="pod-x", executor_id="exec-1")
+    await redis_service.claim_backend_command("cmd-x", claim.model_dump_json(), persist=True)
+    reply = FailedContainerRequest(
+        miner_hotkey="miner-hk", executor_id="exec-1", pod_id="pod-x", workload_kind=WorkloadKind.FILLER,
+        error_type=FailedContainerErrorTypes.ContainerCreationFailed, error_code=FailedContainerErrorCodes.UnknownError,
+        msg="no",
+    ).model_dump_json()
+    finished = claim.model_copy(update={"state": "finished", "owner": "", "responses": [reply]})
+    await redis_service.update_backend_command("cmd-x", claim.model_dump_json(), finished.model_dump_json(), 0)
+    unreadable: list[str] = []
+
+    await redis_service.running_create_claims(unreadable)
+
+    assert unreadable == []

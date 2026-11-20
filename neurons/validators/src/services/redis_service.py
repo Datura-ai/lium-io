@@ -10,7 +10,7 @@ from typing import Callable, Literal, NamedTuple
 import redis.asyncio as aioredis
 import redis.exceptions
 from datura.requests.miner_requests import ExecutorSSHInfo
-from payload_models.payloads import ContainerResponseType, WorkloadKind
+from payload_models.payloads import BaseValidatorResponse, ContainerResponseType, WorkloadKind
 from protocol.vc_protocol.compute_requests import ExecutorUptimeResponse, RentedMachine
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 from pydantic import BaseModel, ValidationError
@@ -445,11 +445,14 @@ def _parse_pending_pods(data) -> list[dict]:
 
 
 def _readable_replies(command: BackendCommand) -> bool:
-    """a create's stored replies are each a message: one that is not cannot tell a success from a failure"""
+    """a create's stored replies each parse as the reply they were (the parser the duplicate replay uses): one that
+    does not cannot be replayed, nor tell a success from a failure"""
     try:
-        return all(isinstance(m := json.loads(raw), dict) and isinstance(m.get("message_type"), str) for raw in command.responses)
-    except ValueError:
+        for raw in command.responses:
+            BaseValidatorResponse.parse(raw)
+    except Exception:  # noqa: BLE001 - any parse failure makes the record unreadable
         return False
+    return True
 
 
 def _text(value: str | bytes) -> str:
