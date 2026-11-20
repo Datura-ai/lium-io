@@ -7,6 +7,7 @@ import os
 import shlex
 import subprocess
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -59,6 +60,8 @@ def _run_memory_min(
     systemd: bool = True,
     procs: tuple = (),
     active: tuple = ("docker.service", "ssh.service"),
+    without: tuple = (),
+    outer: bool = False,
 ):
     """Runs the memory.min script against a fake systemctl (`active` units active, MemoryMin from the state dir),
     a fake cgroup tree, a fake /proc placing this shell at executor_cgroup and holding `procs` ((comm, cgroup[, PID
@@ -88,15 +91,31 @@ def _run_memory_min(
         f'is-active) case " {" ".join(active)} " in *" $3 "*) ;; *) exit 1;; esac;; '
         f"set-property) {set_property};; esac\n",
     )
-    inner = shlex.split(_host_memory_min_script().split("sh -c ", 1)[1])[0]
-    inner = inner.split("exit 0; }; ", 1)[1]
+    if outer:
+        # the whole script as the executor runs it: nsenter just runs the host part here
+        _fake_bin(tmp_path, "nsenter", 'while [ "$1" != -- ]; do shift; done; shift; exec "$@"\n')
+        (proc / "1" / "root" / "run").mkdir(parents=True, exist_ok=True)
+        inner = _host_memory_min_script().replace("[ -f /sys/fs/cgroup/cgroup.controllers ] ||", "true ||")
+    else:
+        inner = shlex.split(_host_memory_min_script().split("sh -c ", 1)[1])[0]
+        inner = inner.split("exit 0; }; ", 1)[1]
     inner = (
         inner.replace("/sys/fs/cgroup", str(root))
         .replace("/run/systemd/system", str(run_systemd))
         .replace("/run/lium-host-memory-guard", str(tmp_path / "guard-base"))
         .replace("/proc/", f"{proc}/")
     )
-    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}"}
+    path = f"{tmp_path / 'bin'}:{os.environ['PATH']}"
+    if without:
+        # a host whose command set lacks `without`: every other command on PATH, linked into one directory
+        host = tmp_path / "host-bin"
+        host.mkdir(exist_ok=True)
+        for d in path.split(":"):
+            for f in Path(d).iterdir() if Path(d).is_dir() else ():
+                if f.name not in without and not (host / f.name).exists():
+                    (host / f.name).symlink_to(f.resolve())
+        path = str(host)
+    env = {**os.environ, "PATH": path}
     return lambda: subprocess.run(["sh", "-c", inner], capture_output=True, text=True, env=env, check=False).stdout
 
 
@@ -478,8 +497,8 @@ def test_system_slice_reads_one_baseline_record_when_two_were_written(tmp_path):
 
 def test_runs_wait_for_each_other(tmp_path):
     """A second run waits for the lock, so a baseline is recorded once, before the first raise."""
-    run = _run_memory_min(tmp_path, "/tenant/executor", systemd=False)
-    lock = tmp_path / "guard-base..lock"
+    run = _run_memory_min(tmp_path, "/tenant/executor", systemd=False, outer=True)
+    lock = tmp_path / "proc/1/root/run/lium-memory-guard.lock"
     holder = subprocess.Popen(["flock", str(lock), "sh", "-c", "sleep 1.5"])
     try:
         time.sleep(0.3)
@@ -490,3 +509,24 @@ def test_runs_wait_for_each_other(tmp_path):
         holder.wait()
     assert waited >= 1.0
     assert "memory_min_set /tenant/executor" in out
+
+
+@pytest.mark.parametrize("executor, parent", [("/tenant/executor", "/tenant"), ("/docker/abc", "/docker")])
+def test_a_host_without_flock_still_protects_the_executor_and_its_parent(tmp_path, executor, parent):
+    """The lock is the executor's (its image ships flock with nsenter); a host command set without flock is guarded."""
+    run = _run_memory_min(tmp_path, executor, systemd=False, without=("flock",))
+
+    out = parse_guard_output(run())
+
+    assert out["failed"] == []
+    assert _read(tmp_path / "cg" / executor.lstrip("/") / "memory.min") == EX
+    assert _read(tmp_path / "cg" / parent.lstrip("/") / "memory.min") == EX
+
+
+def test_the_lock_is_held_around_the_host_part(tmp_path):
+    run = _run_memory_min(tmp_path, "/tenant/executor", systemd=False, outer=True)
+
+    out = run()
+
+    assert "memory_min_set /tenant/executor" in out
+    assert (tmp_path / "proc/1/root/run/lium-memory-guard.lock").exists()

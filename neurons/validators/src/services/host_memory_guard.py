@@ -34,6 +34,8 @@ UNIT_MEMORY_MIN_MIB = {
 }
 EXECUTOR_MEMORY_MIN_MIB = 1536
 SERVICE_PROCESS = {"docker.service": "dockerd"}
+# the host's /run as the executor sees it (host PID namespace, as nsenter -t 1 needs); /run is cleared each boot
+LOCK = "/proc/1/root/run/lium-memory-guard.lock"
 
 def _host_memory_min_script() -> str:
     units = " ".join(f"{unit}={mib * MIB}" for unit, mib in UNIT_MEMORY_MIN_MIB.items())
@@ -88,10 +90,6 @@ def _host_memory_min_script() -> str:
         # this shell sits in the executor's cgroup; with the host cgroup namespace its path is absolute
         "ex=$(sed -n 's#^0::##p' /proc/self/cgroup); "
         "B=/run/lium-host-memory-guard.$(cat /proc/sys/kernel/random/boot_id 2>/dev/null); "
-        # a rental create and a resources check can run the guard at once: one run at a time, so a baseline is
-        # recorded once and always before this guard first raises that cgroup
-        'command -v flock >/dev/null 2>&1 || { echo memory_min_skipped no_flock; exit 0; }; '
-        'exec 9>>"$B.lock"; flock -w 25 9 || { echo memory_min_skipped lock_busy; exit 0; }; '
         'case "$ex" in /|"") ex=; echo "memory_min_failed executor root_cgroup";; '
         '/..*) ex=; echo "memory_min_failed executor outside_host_cgroup_namespace";; esac; '
         "if [ -d /run/systemd/system ]; then "
@@ -151,9 +149,16 @@ def _host_memory_min_script() -> str:
         f'[ -n "$ex" ] && add "$ex" {ex_min}; flush; '
         "fi; true"
     )
+    # a rental create and a resources check can run the guard at once: one run at a time, so a baseline is recorded
+    # once and always before this guard first raises that cgroup. The lock is taken here, in the executor (whose image
+    # ships flock with nsenter, both util-linux), on a file in the host's /run, so the host needs no flock of its own
     return (
         "if ! command -v nsenter >/dev/null 2>&1; then echo memory_min_skipped no_nsenter; "
-        "else nsenter -t 1 -m -C -- sh -c " + shlex.quote(inner) + " 2>/dev/null || echo memory_min_skipped nsenter_failed; fi"
+        "elif ! command -v flock >/dev/null 2>&1; then echo memory_min_skipped no_flock; "
+        f"elif ! (: >>{LOCK}) 2>/dev/null; then echo memory_min_skipped lock_unavailable; "
+        "else { if flock -w 25 9; then nsenter -t 1 -m -C -- sh -c " + shlex.quote(inner)
+        + " 9>&- 2>/dev/null || echo memory_min_skipped nsenter_failed; else echo memory_min_skipped lock_busy; fi; "
+        f"}} 9>>{LOCK}; fi"
     )
 
 
