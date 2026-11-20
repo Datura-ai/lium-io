@@ -82,6 +82,9 @@ class InitReading:
     cgroup_cpuset: str
     cgroup_quota_cpus: float | None
     proc_fuse_disconnected: bool = False
+    # the pod's /proc/sys read gave an answer: no error, or "not connected" (a host fault only if sysbox-fs restarted
+    # under the pod). Any other error, or no read, is no verdict on the pod
+    proc_sys_answered: bool = False
 
 
 @dataclass(frozen=True)
@@ -173,8 +176,9 @@ class RentedPodResourcesCheck:
         outcomes = [
             judge_pod(_with_init(pod, init_reads_by_pid.get(pod.pid)), host_cpus) for pod in pods
         ]
-        # only a pod whose /proc/sys was read is judged on it
-        read_names = {pod.name for pod in pods if pod.pid in init_reads_by_pid}
+        # a pod is judged only when its /proc/sys read gave an answer: a failed read says nothing, so it must not send
+        # [] and let the backend clear an earlier fault
+        read_names = {pod.name for pod in pods if (r := init_reads_by_pid.get(pod.pid)) and r.proc_sys_answered}
         verdicts = pod_verdict_updates(
             ctx,
             {
@@ -234,7 +238,8 @@ class RentedPodResourcesCheck:
             oom = int(parts[1]) if parts[1].lstrip("-").isdigit() else None
             fuse_dead = len(parts) == 6 and parts[4] == "1" and "not connected" in parts[5]
             reads[int(parts[0])] = InitReading(
-                oom, parts[2].strip(), _cpu_max_cpus(parts[3]), fuse_dead
+                oom, parts[2].strip(), _cpu_max_cpus(parts[3]), fuse_dead,
+                len(parts) == 6 and (not parts[5].strip() or "not connected" in parts[5]),
             )
         return reads
 

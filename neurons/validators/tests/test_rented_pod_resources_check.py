@@ -282,3 +282,31 @@ def test_the_newest_sysbox_fs_is_timed_against_the_pod():
     # the script runs in the executor container, which has no sysbox-fs binary: the host's is seen through PID 1
     assert "[ -x /proc/1/root/usr/bin/sysbox-fs ]" in _INIT_READ_SCRIPT
     assert "command -v sysbox-fs" not in _INIT_READ_SCRIPT
+
+
+
+def _ssh_without_init_line(container):
+    inspect = _ssh(container)
+
+    async def run(cmd, *args, **kwargs):
+        if cmd.startswith("/usr/bin/docker inspect"):
+            return await inspect.run(cmd)
+        return SimpleNamespace(exit_status=0, stdout="", stderr="")
+
+    return SimpleNamespace(run=run)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ssh",
+    [
+        _ssh(_container(), proc_err="cat: /proc/4242/root/proc/sys/kernel/hostname: Permission denied"),
+        _ssh_without_init_line(_container()),
+    ],
+)
+async def test_a_failed_proc_read_sends_no_verdict_so_an_earlier_fault_stands(context_factory, ssh):
+    # another error, or no line for the pod's init, says nothing about the pod: it must not be sent as [] (clean),
+    # which the platform reads as "the fault is gone"
+    result = await _run(_ctx(context_factory, ssh))
+    assert result.passed is True
+    assert "state" not in result.updates
