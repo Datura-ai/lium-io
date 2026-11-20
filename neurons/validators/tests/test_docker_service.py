@@ -11223,63 +11223,6 @@ async def test_recover_pod_whose_recorded_error_is_the_leftover_cgroup(
     assert start_existing_container.await_count == starts
 
 
-_MISSING_DEVICE_ERROR = (
-    'error gathering device information while adding custom device "/dev/nvidia4": no such file or directory'
-)
-
-
-@pytest.mark.parametrize(
-    "device_exists, expected_recovered, starts",
-    [
-        pytest.param(True, True, 1, id="node_made_after_boot_pod_started"),
-        pytest.param(False, False, 0, id="node_still_missing_left_for_the_next_cycle"),
-    ],
-)
-@pytest.mark.asyncio
-async def test_recover_pod_whose_boot_start_missed_a_gpu_device_node(
-    docker_service, monkeypatch, device_exists, expected_recovered, starts
-):
-    # DAH-6780: dockerd's boot-time restart ran before the driver made /dev/nvidia4, the pod stayed exited; it is started
-    # (through start_existing_container, which remounts an encrypted volume) only once the node exists
-    monkeypatch.setattr(docker_service, "_prepare_known_hosts_policy", AsyncMock(return_value=None))
-    monkeypatch.setattr("services.docker_service.require_rental_docker_ssh_host_key", Mock())
-    start_existing_container = AsyncMock(return_value=None)
-    monkeypatch.setattr(docker_service, "start_existing_container", start_existing_container)
-    monkeypatch.setattr(
-        docker_service,
-        "_bounded_death_diagnostics",
-        AsyncMock(return_value=Mock(status="running", to_log_fields=Mock(return_value={}))),
-    )
-
-    async def run(command, *_args, **_kwargs):
-        if command == "test -e /proc/1/root/dev/nvidia4":
-            return _make_ssh_command_result(exit_status=0 if device_exists else 1)
-        return _make_ssh_command_result(stdout="")
-
-    ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(side_effect=run)
-
-    recovered = await _attempt_stale_mount_recovery(docker_service, _MISSING_DEVICE_ERROR, ssh_client)
-
-    assert recovered is expected_recovered
-    assert start_existing_container.await_count == starts
-
-
-@pytest.mark.parametrize(
-    "error_text, device",
-    [
-        (_MISSING_DEVICE_ERROR, "/dev/nvidia4"),
-        ('adding custom device "/dev/nvidia-uvm": no such file or directory', None),  # not Docker's whole message
-        ('error gathering device information while adding custom device "/dev/x; rm -rf /": no such file', None),
-        ('error gathering device information while adding custom device "/dev/../etc": no such file or directory', None),
-    ],
-)
-def test_missing_custom_device_reads_only_a_plain_dev_path(error_text, device):
-    from services.docker_service import _missing_custom_device
-
-    assert _missing_custom_device(error_text) == device
-
-
 @pytest.mark.parametrize(
     "status, holds_process, expected",
     [

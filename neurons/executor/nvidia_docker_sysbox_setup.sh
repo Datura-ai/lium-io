@@ -640,6 +640,8 @@ Before=docker.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# a hung nvidia-modprobe is killed here, so Docker (which only Wants this unit) still starts
+TimeoutStartSec=60
 ExecStart=/usr/local/sbin/lium-nvidia-device-nodes
 
 [Install]
