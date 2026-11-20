@@ -529,6 +529,10 @@ async def test_a_collapse_names_the_cause_from_the_reason_bits(context_factory, 
     assert fix in result.event.remediation
     if "thermal" not in causes:
         assert "cooling" not in result.event.remediation.split("power supply")[0]
+    # several causes at once: each fix stands, none tells the provider to rule another out
+    assert "not the cooling" not in result.event.remediation
+    for cause in causes:
+        assert gpu_thermal_throttle.CAUSES[cause][1] in result.event.remediation
     # the portal shows the availability entry's message: it must name the same cause
     entry = next(e for e in availability_errors([result.event]) if e.reason_code == Msg.COLLAPSED.reason)
     assert entry.message == title

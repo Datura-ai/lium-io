@@ -86,7 +86,8 @@ MIN_UTILIZATION_PCT = 80
 MIN_CLOCK_RATIO = 0.5
 # A power limit at least this share of the card's default counts as the default (not lowered on purpose).
 POWER_CAP_DEFAULT_RATIO = 0.98
-# Each cause judge_gpu can name: its words in the event title, and what the provider should check.
+# Each cause judge_gpu can name: its words in the event title, and what the provider should check. A card can
+# report several causes at once, so no text rules out another cause's fix.
 CAUSES: dict[str, tuple[str, str]] = {
     "thermal": (
         "overheating",
@@ -97,7 +98,7 @@ CAUSES: dict[str, tuple[str, str]] = {
     "power_brake": (
         "a power brake",
         "The driver reports a hardware power brake: the power supply or the board asked the card to slow down. "
-        "Check the power supply, the GPU power cables and the PDU, not the cooling.",
+        "Check the power supply, the GPU power cables and the PDU.",
     ),
     "hw_slowdown": (
         "a hardware slowdown",
