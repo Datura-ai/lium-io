@@ -221,7 +221,7 @@ from services.rental_docker_sdk import (
     RentalDockerContainerRestartingError,
     RentalDockerOperationError,
     RentalPodBridgeGone,
-    bridge_in_use,
+    created_container_id,
     RentalPodNetworkMoveFailed,
     RentalDockerSdkClient,
     RentalDockerSdkClientFactory,
@@ -1242,9 +1242,36 @@ class RentalEgressGuardRefused(RuntimeError):
 
 
 # the pod's guarded bridge lost before `docker start` (DAH-6737): gone, or Docker refusing to move the stopped pod onto
-# it. Our own reaper keeps every bridge a create of this process holds (rental_docker_sdk.bridge_in_use), so only the
-# host removes it: a host fault, never PodDownNotHostFault (review on lium-platform#3246)
+# it. Our reaper, in every validator process, keeps every bridge a create or start holds (_pod_bridge_held), so only
+# the host removes it: a host fault, never PodDownNotHostFault (review on lium-platform#3246)
 _BRIDGE_LOST = (RentalPodBridgeGone, RentalPodNetworkMoveFailed)
+
+
+@dataclasses.dataclass
+class _PodBridgeHold:
+    """A pod bridge's host-side reservation (DAH-6737): taken by its guard before the bridge is ensured, released when
+    the create or start that holds it ends, after its container references the bridge."""
+
+    network: str
+    token: str = dataclasses.field(default_factory=lambda: secrets.token_hex(8))
+    # opens the SSH session the release runs on; set by the guard before it reserves
+    release_with: Callable[[], Any] | None = None
+
+
+@contextlib.asynccontextmanager
+async def _pod_bridge_held(network: str | None):
+    from services.task.checks.rental_egress_guard import release_pod_bridge
+
+    hold = _PodBridgeHold(network) if network else None
+    try:
+        yield hold
+    finally:
+        if hold is not None and hold.release_with is not None:
+            try:
+                async with hold.release_with() as ssh:
+                    await release_pod_bridge(ssh, hold.network, hold.token)
+            except Exception as exc:  # noqa: BLE001 — a reservation left behind only keeps the bridge until a reboot
+                logger.warning(_m("Pod bridge reservation not released", extra={"network": network, "error": str(exc)}))
 
 
 def failed_create_error_code(
@@ -3976,7 +4003,7 @@ class DockerService:
         flatten_lease: list[str] = []
         try:
             # the pod's bridge is guarded inside, then unreferenced until its container exists: kept from our reaper
-            with bridge_in_use(run_spec.network):
+            async with _pod_bridge_held(run_spec.network) as bridge_hold:
                 container_id = await self._run_rental_docker_create_attempts(
                     docker_client=docker_client,
                     ssh_client=ssh_client,
@@ -3993,6 +4020,7 @@ class DockerService:
                     flatten_beside_other_create=flatten_beside_other_create,
                     flatten_lease=flatten_lease,
                     pod_id=pod_id,
+                    bridge_hold=bridge_hold,
                 )
             await apply_host_memory_guard(ssh_client, default_extra)
             return container_id
@@ -4023,6 +4051,7 @@ class DockerService:
         default_extra: dict,
         connect: Callable[[], Any] | None = None,
         executor_uuid: str | None = None,
+        hold: _PodBridgeHold | None = None,
     ) -> str | None:
         """The pod's own bridge exists and is in the host's link-local egress drop before the pod starts (DAH-6737),
         under the same host lock as the periodic guard. Fail closed: a bridge the drop could not be confirmed on is
@@ -4030,18 +4059,29 @@ class DockerService:
         which has no create failure handler, passes ``executor_uuid`` and the hold is stamped here; a create or an
         edit's undo leaves the hold to its failure handler). Without ``ssh_client`` it opens its own session with
         ``connect``. Returns the guarded bridge's ID: the pod is created on or moved to that ID only, never a same-name
-        bridge made after the drop."""
-        from services.task.checks.rental_egress_guard import apply_rental_egress_guard
+        bridge made after the drop. With ``hold``, the bridge is reserved on the host before it is ensured, so no
+        validator process's reaper removes it until the hold's release."""
+        from services.task.checks.rental_egress_guard import apply_rental_egress_guard, reserve_pod_bridge
+
+        async def _ensure_and_apply(ssh) -> tuple[str, str | None]:
+            if hold is not None:
+                hold.release_with = connect if ssh_client is None else lambda: contextlib.nullcontext(ssh_client)
+                await reserve_pod_bridge(ssh, network, hold.token)
+            ensured = await docker_client.ensure_network(network)
+            # the pod's bridge is required in the applied rules, whatever the host's labels say
+            _, failed = await asyncio.wait_for(
+                apply_rental_egress_guard(ssh, attempts=None, required_network_id=ensured), timeout=120
+            )
+            return ensured, failed
 
         network_id = None
         try:
-            network_id = await docker_client.ensure_network(network)
             if ssh_client is None:
                 # a start that opens its SSH session only after the start (start_existing_container): its own
                 async with connect() as own_ssh:
-                    _, error = await asyncio.wait_for(apply_rental_egress_guard(own_ssh, attempts=None), timeout=120)
+                    network_id, error = await _ensure_and_apply(own_ssh)
             else:
-                _, error = await asyncio.wait_for(apply_rental_egress_guard(ssh_client, attempts=None), timeout=120)
+                network_id, error = await _ensure_and_apply(ssh_client)
         except Exception as exc:  # noqa: BLE001 — every failure refuses the start
             error = str(exc) or type(exc).__name__
         if error:
@@ -4075,6 +4115,7 @@ class DockerService:
         flatten_beside_other_create: Callable[[], bool] | None = None,
         flatten_lease: list[str],
         pod_id: str | None = None,
+        bridge_hold: _PodBridgeHold | None = None,
     ) -> str | None:
         """`docker run` through the SDK with the same-command retry on known Docker races.
 
@@ -4116,6 +4157,7 @@ class DockerService:
                 ssh_client=ssh_client,
                 network=run_spec.network,
                 default_extra=default_extra,
+                hold=bridge_hold,
             )
         # after the guard: its own time never uses up the port retries' budget
         deadline = time.monotonic() + _PORT_ALLOCATED_RETRY_BUDGET_SEC
@@ -4190,7 +4232,7 @@ class DockerService:
                         # name and the retry would fail on a 409 name conflict
                         await self._remove_failed_rental_container_for_retry(
                             docker_client=docker_client,
-                            container_name=container_name,
+                            container_name=created_container_id(exc) or container_name,
                             default_extra=default_extra,
                             warning_event="STALE_MOUNT_RETRY_RM_FAILED",
                         )
@@ -4215,7 +4257,7 @@ class DockerService:
                     if flat_image is not None:
                         await self._remove_failed_rental_container_for_retry(
                             docker_client=docker_client,
-                            container_name=container_name,
+                            container_name=created_container_id(exc) or container_name,
                             default_extra=default_extra,
                             warning_event="FLATTEN_RETRY_RM_FAILED",
                         )
@@ -4237,7 +4279,7 @@ class DockerService:
                         attempt += 1
                         await self._remove_failed_rental_container_for_retry(
                             docker_client=docker_client,
-                            container_name=container_name,
+                            container_name=created_container_id(exc) or container_name,
                             default_extra=default_extra,
                             warning_event="PORT_RETRY_STALE_RM_FAILED",
                         )
@@ -4273,7 +4315,7 @@ class DockerService:
                         attempt += 1
                         await self._remove_failed_rental_container_for_retry(
                             docker_client=docker_client,
-                            container_name=container_name,
+                            container_name=created_container_id(exc) or container_name,
                             default_extra=default_extra,
                             warning_event="PORT_COLLISION_STALE_RM_FAILED",
                         )
@@ -4297,7 +4339,7 @@ class DockerService:
                     await asyncio.sleep(_PORT_ALLOCATED_RETRY_SLEEP_SEC)
                     await self._remove_failed_rental_container_for_retry(
                         docker_client=docker_client,
-                        container_name=container_name,
+                        container_name=created_container_id(exc) or container_name,
                         default_extra=default_extra,
                         warning_event="PORT_RETRY_STALE_RM_FAILED",
                     )
@@ -11969,7 +12011,7 @@ class DockerService:
                         container_name=container_name,
                         volume_name=local_volume,
                         remove_volume=created_local_volume,
-                        container_id=container_id,
+                        container_id=container_id or created_container_id(docker_run_error),
                         pod_id=payload.pod_id,
                         keep_container=isinstance(docker_run_error, _SameNameContainerKept),
                     )
@@ -13060,8 +13102,8 @@ class DockerService:
         slot = _half_started_stop_slot(executor_info, pod_id)
         # held through the start, so a pending stop's retry (here or in the other process) can neither act mid-start nor
         # on a run checked before it
-        # DAH-6737: the pod bridge is kept from our reaper from its guard until the started container references it
-        with bridge_in_use(rental_network_for(container_name)):
+        # DAH-6737: the pod bridge is kept from every reaper from its guard until the started container references it
+        async with _pod_bridge_held(rental_network_for(container_name)) as bridge_hold:
             async with self._pod_start_exclusion(executor_info, private_key, pod_id), self.rental_docker_client_factory.connect(
                 executor_info=executor_info,
                 private_key=private_key,
@@ -13120,6 +13162,7 @@ class DockerService:
                         default_extra=default_extra,
                         connect=_guard_ssh,
                         executor_uuid=executor_info.uuid,
+                        hold=bridge_hold,
                     )
                 except RentalEgressGuardRefused as refused:
                     refused.pod_running = running_before
@@ -13159,7 +13202,7 @@ class DockerService:
                             default_extra=default_extra,
                             record_start=stopped_before,
                         )
-                except (asyncio.CancelledError, Exception):
+                except (asyncio.CancelledError, Exception) as exc:
                     # a pod left up without its plaintext mount writes the renter's data unencrypted into the
                     # container layer: put it back down, even when the start is cancelled
                     if not running_before:
@@ -13176,6 +13219,10 @@ class DockerService:
                                 default_extra=default_extra,
                             )
                         )
+                    if isinstance(exc, Exception) and isinstance(_last_attempt_exception(exc), _BRIDGE_LOST):
+                        # the bridge guarded for this start was lost on the host after the guard passed: the node's
+                        # last passing probe no longer holds, as when the guard itself is refused
+                        await self.hold_node_until_probe_passes(executor_info.uuid, "rental_egress_guard", default_extra, exc)
                     raise
                 # a start that mounted this container ends only this container's pending stop; another container's (a
                 # replacement, an edit's park) stays until its own run is proven stopped, gone or mounted
@@ -13616,7 +13663,8 @@ class DockerService:
 
         # under the pod's lock like start_existing_container: a pending stop's retry cannot probe the container
         # unmounted and then stop it after this undo restarted and remounted it
-        with bridge_in_use(network):  # kept from our reaper from its guard until the started container references it
+        # kept from every reaper from its guard until the started container references it
+        async with _pod_bridge_held(network) as bridge_hold:
             async with self._pod_start_exclusion(executor_info, private_key, pod_id):
                 # unreadable state or id fails the undo before any start, like start_existing_container: a start the
                 # cleanup below could not follow by id would leave the pod up without its remount. The id is read first and
@@ -13631,6 +13679,7 @@ class DockerService:
                     ssh_client=ssh_client,
                     network=network,
                     default_extra=default_extra,
+                    hold=bridge_hold,
                 )
                 try:
                     try:

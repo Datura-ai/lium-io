@@ -142,7 +142,11 @@ def pod_bridge_guarded_on_fake_hosts(request):
     """A pod starts only once its bridge has the host's egress drop (DAH-6737); fake hosts have no iptables.
     test_docker_service.py covers the guard itself (marker real_egress_guard)."""
     if request.node.get_closest_marker("real_egress_guard"):
-        yield None
+        # the host-side bridge reservation runs a host script; test_rental_egress_guard.py covers it
+        with patch("services.task.checks.rental_egress_guard.reserve_pod_bridge", AsyncMock()), patch(
+            "services.task.checks.rental_egress_guard.release_pod_bridge", AsyncMock()
+        ):
+            yield None
         return
     with patch(
         "services.docker_service.DockerService._guard_pod_network_before_start", AsyncMock(return_value=None)

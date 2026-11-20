@@ -8,6 +8,7 @@ from docker.errors import NotFound
 from services.rental_docker_sdk import (
     RENTAL_NETWORK_ICC_OPTION,
     RENTAL_NETWORK_NAME,
+    RentalDockerOperationError,
     RentalDockerSdkClient,
     RentalPodBridgeGone,
     RentalPodNetworkMoveFailed,
@@ -207,13 +208,6 @@ class PerPodApi(FakeApi):
         self.removed.append(net_id)
 
 
-def _listed(*networks):
-    return {"NetworkSettings": {"Networks": {name: {} for name in networks}}}
-
-
-OLD = "2026-01-01T00:00:00.123456789Z"
-
-
 @pytest.mark.asyncio
 async def test_start_moves_a_stopped_pod_off_the_shared_rentals_bridge_onto_its_own():
     api = PerPodApi(networks=(RENTAL_NETWORK_NAME,), mode=RENTAL_NETWORK_NAME)
@@ -270,45 +264,24 @@ async def test_a_stopped_pod_bound_to_a_bridge_since_removed_is_refused_not_star
 
 
 @pytest.mark.asyncio
+async def test_a_same_name_bridge_without_the_pod_label_is_refused_not_used():
+    # gateway review at 129a43b: the guard inventories pod bridges by their label, so an unlabelled one with the pod's
+    # name would be returned to a create its rules never covered
+    api = PerPodApi()
+    api.networks[OWN] = {"Id": "foreign", "Driver": "bridge", "Options": {RENTAL_NETWORK_ICC_OPTION: "false"}}
+
+    with pytest.raises(RentalDockerOperationError, match="without the io.lium.network=pod label"):
+        await RentalDockerSdkClient(api).ensure_network(OWN)
+    assert ("create_network", OWN) not in api.events
+
+
+@pytest.mark.asyncio
 async def test_a_pod_bridge_takes_the_mtu_the_provider_set_on_the_template():
     api = PerPodApi(template_options={RENTAL_NETWORK_ICC_OPTION: "false", "com.docker.network.driver.mtu": "1400"})
 
     await RentalDockerSdkClient(api).ensure_network(OWN)
 
     assert api.networks[OWN]["Options"]["com.docker.network.driver.mtu"] == "1400"
-
-
-@pytest.mark.asyncio
-async def test_creating_a_pod_bridge_removes_only_old_unreferenced_pod_bridges():
-    api = PerPodApi(
-        containers=[_listed("lium-rentals-pod_stopped")],
-        pod_networks=[
-            {"Id": "gone", "Name": "lium-rentals-pod_gone", "Created": OLD},
-            {"Id": "stopped", "Name": "lium-rentals-pod_stopped", "Created": OLD},
-            # a racing create has made its bridge but not yet its container
-            {"Id": "fresh", "Name": "lium-rentals-pod_fresh", "Created": "2999-01-01T00:00:00Z"},
-            {"Id": "tmpl", "Name": RENTAL_NETWORK_NAME, "Created": OLD},
-            {"Id": "foreign", "Name": "someone-else", "Created": OLD},
-        ],
-    )
-
-    await RentalDockerSdkClient(api).ensure_network(OWN)
-
-    assert api.removed == ["gone"]
-
-
-@pytest.mark.asyncio
-async def test_a_failed_cleanup_never_blocks_the_pod():
-    api = PerPodApi()
-
-    def broken(all=False):
-        raise RuntimeError("daemon busy")
-
-    api.containers = broken
-    client = RentalDockerSdkClient(api)
-    await client.start(container_name="pod_a", network=OWN, network_id=await client.ensure_network(OWN))
-
-    assert api.events[-1] == ("start", "pod_a")
 
 
 @pytest.mark.asyncio
@@ -323,102 +296,3 @@ async def test_a_moved_pod_whose_template_was_pruned_gets_it_back_before_its_sta
     assert not [e for e in api.events if e[0] in ("disconnect", "connect")]
 
 
-def test_bridge_age_reads_the_offset_docker_writes(monkeypatch):
-    from datetime import datetime, timezone
-
-    from services import rental_docker_sdk
-
-    class Frozen(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return datetime(2026, 11, 18, 12, 0, 0, tzinfo=timezone.utc)
-
-    monkeypatch.setattr(rental_docker_sdk, "datetime", Frozen)
-    # the same instant, 11:50 UTC, in UTC and at +02:00: both 600 s old, not 7800 s and -6600 s
-    assert rental_docker_sdk._age_seconds("2026-11-18T11:50:00.123456789Z") == pytest.approx(600, abs=1)
-    assert rental_docker_sdk._age_seconds("2026-11-18T13:50:00.123456789+02:00") == pytest.approx(600, abs=1)
-    assert rental_docker_sdk._age_seconds("garbage") == 0.0
-
-
-@pytest.mark.asyncio
-async def test_the_cleanup_ages_each_bridge_by_its_own_offset(monkeypatch):
-    from datetime import datetime, timezone
-
-    from services import rental_docker_sdk
-
-    class Frozen(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return datetime(2026, 11, 18, 12, 0, 0, tzinfo=timezone.utc)
-
-    monkeypatch.setattr(rental_docker_sdk, "datetime", Frozen)
-    api = PerPodApi(
-        pod_networks=[
-            # 11:45 UTC, 15 min old: removed (read as UTC it would look 2 h in the future and stay forever)
-            {"Id": "old", "Name": "lium-rentals-pod_old", "Created": "2026-11-18T13:45:00.5+02:00"},
-            # 11:55 UTC, 5 min old, a racing create's: kept (read as UTC it would look 5 h old and be removed)
-            {"Id": "fresh", "Name": "lium-rentals-pod_fresh", "Created": "2026-11-18T06:55:00.5-05:00"},
-        ],
-    )
-
-    await RentalDockerSdkClient(api).ensure_network(OWN)
-
-    assert api.removed == ["old"]
-
-
-def test_the_reaper_keeps_a_bridge_a_create_here_guarded_and_has_not_run_on_yet():
-    # review on lium-platform#3246: a create whose run (retries, an image flatten) outlasts the reap age leaves its
-    # guarded bridge unreferenced; another create's reaper must not remove it, so a gone bridge is only ever the host's
-    from unittest.mock import Mock
-
-    from services.rental_docker_sdk import bridge_in_use
-
-    held, idle = f"{RENTAL_NETWORK_NAME}-pod_held", f"{RENTAL_NETWORK_NAME}-pod_ended"
-    api = Mock()
-    api.containers.return_value = []
-    api.networks.return_value = [{"Name": n, "Id": n, "Created": "2020-01-01T00:00:00Z"} for n in (held, idle)]
-    client = RentalDockerSdkClient(api)
-
-    with bridge_in_use(held):
-        client._remove_unused_pod_networks_sync()
-    assert [c.args[0] for c in api.remove_network.call_args_list] == [idle]
-
-    api.remove_network.reset_mock()
-    client._remove_unused_pod_networks_sync()  # the create ended: an unused bridge is reaped as before
-    assert {c.args[0] for c in api.remove_network.call_args_list} == {held, idle}
-
-
-def test_a_bridge_reserved_while_the_reaper_removes_it_is_made_again_before_its_guard():
-    # DAH-6737 review (F-38): the reaper checked the old bridge unreserved and is removing it when a create reserves it
-    # and ensures it for its guard; the guard must get a bridge that exists after the removal, never the removed one
-    import threading
-
-    from services.rental_docker_sdk import bridge_in_use
-
-    stale = {"Id": "old-id", "Name": OWN, "Created": OLD, "Driver": "bridge", "Options": {RENTAL_NETWORK_ICC_OPTION: "false"}}
-    api = PerPodApi(pod_networks=[stale])
-    api.networks[OWN] = stale
-    removing, release = threading.Event(), threading.Event()
-
-    def remove_network(net_id):
-        removing.set()
-        release.wait(5)
-        api.removed.append(net_id)
-        del api.networks[OWN]
-
-    api.remove_network = remove_network
-    client = RentalDockerSdkClient(api)
-    reaper = threading.Thread(target=client._remove_unused_pod_networks_sync)
-    reaper.start()
-    assert removing.wait(5)
-    guarded: list[str] = []
-    with bridge_in_use(OWN):
-        ensure = threading.Thread(target=lambda: guarded.append(client._ensure_rental_network_sync(OWN)))
-        ensure.start()
-        ensure.join(0.3)  # the ensure waits on the reaper's removal of that bridge
-        release.set()
-        reaper.join(5)
-        ensure.join(5)
-
-    assert api.removed == ["old-id"]
-    assert guarded == [f"id-{OWN}"] and api.networks[OWN]["Id"] == guarded[0]

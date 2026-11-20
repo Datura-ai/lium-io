@@ -29,6 +29,8 @@ from services.rental_docker_sdk import (
     RentalDockerOperationError,
     RentalPodBridgeGone,
     RentalDockerSdkClient,
+    ContainerNameTakenOnRetry,
+    created_container_id,
     RentalDockerSdkClientFactory,
     VolumeMount,
     build_authorized_keys_exec_spec,
@@ -652,7 +654,7 @@ async def test_run_container_maps_spec_to_docker_sdk_api():
     assert api_client.host_config_kwargs["mem_limit"] == "8g"
     assert api_client.host_config_kwargs["storage_opt"] == {"size": "20g"}
     assert api_client.host_config_kwargs["pids_limit"] == 8192
-    assert api_client.started == ["pod_test"]
+    assert api_client.started == ["container-id"]  # by ID, never a same-name successor
 
 
 # --- DAH-3199: a rental joins the ICC-off bridge, never docker0 ---
@@ -2016,3 +2018,42 @@ def test_a_cpu_share_that_rounded_down_to_0_gets_one_core_not_no_limit(cpu_count
     spec = ContainerRunSpec(image="registry.example/app:tag", name="pod_test", cpu_count=cpu_count)
 
     assert rental_docker_sdk._build_host_config_kwargs(spec).get("nano_cpus") == nano_cpus
+
+
+def _guarded_pod_api() -> tuple[FakeApiClient, ContainerRunSpec]:
+    api = FakeApiClient()
+    net = f"{RENTAL_NETWORK_NAME}-pod_a"
+    api.networks[net] = {**_bridge_network({RENTAL_NETWORK_ICC_OPTION: "false"}), "Id": "guarded-id"}
+    return api, ContainerRunSpec(name="pod_a", image="img", network=net, network_id="guarded-id")
+
+
+def test_a_retried_create_never_adopts_a_same_name_container_on_another_bridge():
+    # gateway review at 129a43b: a restored container that took the pod's name sits on its own network; the transport
+    # retry must not adopt (and start) it as this create's container
+    api, spec = _guarded_pod_api()
+    api.container_states = [{"Id": "successor", "Config": {"Image": "img"}, "HostConfig": {"NetworkMode": "other-id"}}]
+
+    with pytest.raises(ContainerNameTakenOnRetry, match="not the guarded 'guarded-id'"):
+        RentalDockerSdkClient(api)._run_container_sync(spec, adopt_existing=True)
+    assert api.started == []
+
+    api.container_states = [{"Id": "ours", "Config": {"Image": "img"}, "HostConfig": {"NetworkMode": "guarded-id"}}]
+    assert RentalDockerSdkClient(api)._run_container_sync(spec, adopt_existing=True) == "ours"
+    assert api.started == ["ours"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_start_carries_the_created_id_so_its_cleanup_never_removes_a_same_name_successor():
+    api, spec = _guarded_pod_api()
+
+    def start(container_name):
+        api.started.append(container_name)
+        raise RuntimeError("start failed")
+
+    api.start = start
+
+    with pytest.raises(RentalDockerOperationError) as failed:
+        await RentalDockerSdkClient(api).run_container(spec)
+
+    assert api.started == ["container-id"]  # by ID, not by the name a successor may hold
+    assert created_container_id(failed.value) == "container-id"

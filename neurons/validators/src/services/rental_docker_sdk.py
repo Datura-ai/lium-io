@@ -3,17 +3,14 @@ from __future__ import annotations
 import asyncio
 import http.client
 import logging
-import re
 import socket as socket_module
 import tempfile
 import threading
 import time
-from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager, contextmanager, suppress
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 from typing import TypeVar
@@ -99,42 +96,11 @@ RENTAL_NETWORK_LABELS = {"io.lium.purpose": "rental-isolation"}
 # marks a rental's own bridge; only these are ever removed, and only once no container references them
 POD_NETWORK_LABEL = "io.lium.network"
 POD_NETWORK_LABELS = {**RENTAL_NETWORK_LABELS, POD_NETWORK_LABEL: "pod"}
-# a rental's bridge younger than this is never removed: its container may not be created yet
-POD_NETWORK_REAP_MIN_AGE_SECONDS = 10 * 60
 
 
 def rental_network_for(container_name: str) -> str:
     """The bridge of this rental container alone (DAH-6737); a renamed-aside edit original keeps sharing it."""
     return f"{RENTAL_NETWORK_NAME}-{container_name}"
-
-
-# DAH-6737 (review on lium-platform#3246): the bridges creates of this process guarded and have no container on yet
-# (the run, its retries and an image flatten can outlast POD_NETWORK_REAP_MIN_AGE_SECONDS). The reaper keeps them, so
-# a guarded bridge that is gone was removed on the host, never by another create here (one process owns the executor)
-_BRIDGES_IN_USE: Counter[str] = Counter()
-
-
-# A pod bridge's ensure (inspect or create, the ID its guard records) and our reaper's check-and-remove of that bridge
-# never interleave: a reservation made while the reaper is past its check finds the bridge gone and makes it again
-# before the guard, never guards a bridge the reaper then removes. Striped, one lock held at a time (no deadlock).
-_POD_NETWORK_LOCKS = tuple(threading.Lock() for _ in range(64))
-
-
-def _pod_network_lock(name: str) -> threading.Lock:
-    return _POD_NETWORK_LOCKS[hash(name) % len(_POD_NETWORK_LOCKS)]
-
-
-@contextmanager
-def bridge_in_use(name: str | None) -> Iterator[None]:
-    if name:
-        _BRIDGES_IN_USE[name] += 1
-    try:
-        yield
-    finally:
-        if name:
-            _BRIDGES_IN_USE[name] -= 1
-            if _BRIDGES_IN_USE[name] <= 0:
-                del _BRIDGES_IN_USE[name]
 
 
 def is_rental_network(name: str) -> bool:
@@ -162,9 +128,15 @@ class RentalDockerOperationError(RuntimeError):
     """Raised when Docker SDK reports a rental Docker operation failure."""
 
 
+def created_container_id(exc: BaseException) -> str | None:
+    """The ID of the container a failed run created, set on the failure by `_run_container_sync`."""
+    return next((e.container_id for e in _iter_exception_chain(exc) if getattr(e, "container_id", None)), None)
+
+
 class RentalPodBridgeGone(RentalDockerOperationError):
     """The pod's own bridge was removed on the host after its egress drop was applied (our reaper keeps it, see
-    bridge_in_use): the start is refused, never made on a bridge the drop was not confirmed on (DAH-6737)."""
+    rental_egress_guard.reserve_pod_bridge): the start is refused, never made on a bridge the drop was not confirmed on
+    (DAH-6737)."""
 
 
 class RentalPodNetworkMoveFailed(RentalDockerOperationError):
@@ -1258,23 +1230,28 @@ class RentalDockerSdkClient:
                 adopted_id = self._wait_for_inflight_create_sync(spec)
                 if adopted_id is None:
                     raise
-        if spec.before_start is not None:
-            spec.before_start(
-                [
-                    name.lstrip("/")
-                    for container in self._api_client.containers(all=True)
-                    for name in container.get("Names") or ()
-                ]
-            )
         container_id = created.get("Id") if isinstance(created, dict) else adopted_id
         container_id = container_id if isinstance(container_id, str) and container_id else None
-        # A create with a start check starts the container it checked, by ID, never a same-name successor.
-        # Others keep the name: a failed start leaves no ID for the cleanup, which then removes by name.
+        # Started by ID, never a same-name successor (a restored container that took the name since the create); a
+        # failure carries the ID (created_container_id), so its cleanup removes this container, never the successor.
         try:
-            self._api_client.start(container_id if spec.before_start is not None and container_id else spec.name)
-        except Exception:
-            if spec.network and spec.network != RENTAL_NETWORK_NAME:
-                self._guarded_pod_network_sync(spec.network, spec.network_id)
+            if spec.before_start is not None:
+                spec.before_start(
+                    [
+                        name.lstrip("/")
+                        for container in self._api_client.containers(all=True)
+                        for name in container.get("Names") or ()
+                    ]
+                )
+            try:
+                self._api_client.start(container_id or spec.name)
+            except Exception:
+                if spec.network and spec.network != RENTAL_NETWORK_NAME:
+                    self._guarded_pod_network_sync(spec.network, spec.network_id)
+                raise
+        except Exception as exc:
+            if container_id:
+                exc.container_id = container_id
             raise
         return container_id
 
@@ -1304,6 +1281,13 @@ class RentalDockerSdkClient:
             raise
         config = info.get("Config") if isinstance(info, dict) else None
         existing_image = config.get("Image") if isinstance(config, dict) else None
+        mode = (info.get("HostConfig") or {}).get("NetworkMode") if isinstance(info, dict) else None
+        if spec.network_id and mode != spec.network_id:
+            # created on another bridge than the one this create guarded (a restored container under the name)
+            raise ContainerNameTakenOnRetry(
+                "Docker SDK run container refused after a transport retry: a container named "
+                f"{spec.name} already exists on network {mode!r}, not the guarded {spec.network_id!r}"
+            )
         if existing_image == spec.image:
             existing_id = info.get("Id")
             return existing_id if isinstance(existing_id, str) else ""
@@ -1322,20 +1306,13 @@ class RentalDockerSdkClient:
         the pod on it would silently restore the docker0 behaviour this network exists to end.
 
         A rental's own bridge (DAH-6737) is created from the `lium-rentals` template, which is ensured
-        first, and before it is created the bridges of rentals that are gone are removed, so ended
-        rentals never use up the daemon's address pools.
+        first. The bridges of ended rentals are removed under the host lock before the pod's guard
+        (rental_egress_guard.reserve_pod_bridge), never here.
         """
         options, labels = dict(RENTAL_NETWORK_OPTIONS), dict(RENTAL_NETWORK_LABELS)
         if name != RENTAL_NETWORK_NAME:
             self._ensure_rental_network_sync(RENTAL_NETWORK_NAME)
             labels = dict(POD_NETWORK_LABELS)
-            if self._inspect_network_or_none(name) is None:
-                self._remove_unused_pod_networks_sync()
-            with _pod_network_lock(name):
-                return self._ensure_network_locked_sync(name, options, labels)
-        return self._ensure_network_locked_sync(name, options, labels)
-
-    def _ensure_network_locked_sync(self, name: str, options: dict, labels: dict) -> str:
         network = self._inspect_network_or_none(name)
         if network is None:
             if name != RENTAL_NETWORK_NAME:
@@ -1362,6 +1339,12 @@ class RentalDockerSdkClient:
                         f"Docker network {name} was created but cannot be inspected"
                     )
         _require_icc_off(name, network)
+        if labels.get(POD_NETWORK_LABEL) and (network.get("Labels") or {}).get(POD_NETWORK_LABEL) != "pod":
+            # not made by a guarded create: the guard's inventory of pod bridges would not keep its rules
+            raise RentalDockerOperationError(
+                f"Docker network {name} exists on the executor without the {POD_NETWORK_LABEL}=pod label; "
+                "refusing to run the rental on it. Remove the network once it is empty."
+            )
         return network.get("Id") or name
 
     def _guarded_pod_network_sync(self, name: str, network_id: str | None) -> dict:
@@ -1437,40 +1420,6 @@ class RentalDockerSdkClient:
                 _wrap_error_message(f"Docker SDK move of {container_name} onto network {network} failed", exc)
             ) from exc
         return True
-
-    def _remove_unused_pod_networks_sync(self) -> None:
-        """Remove rental bridges no container references any more (ended rentals, DAH-6737).
-
-        A stopped container still references its network, so a stopped pod keeps its bridge; a bridge
-        younger than POD_NETWORK_REAP_MIN_AGE_SECONDS is kept, as a racing create may not have made its
-        container yet. Best effort: a failure here never blocks the create.
-        """
-        try:
-            used = {
-                name
-                for container in self._api_client.containers(all=True)
-                for name in ((container.get("NetworkSettings") or {}).get("Networks") or {})
-            }
-            networks = self._api_client.networks(filters={"label": f"{POD_NETWORK_LABEL}=pod"})
-        except Exception as exc:
-            logger.warning(_m("Rental network cleanup skipped", extra={"error": str(exc)[:300]}))
-            return
-        for network in networks:
-            name = network.get("Name") or ""
-            if name in used or not is_rental_network(name) or name == RENTAL_NETWORK_NAME:
-                continue
-            if _age_seconds(network.get("Created")) < POD_NETWORK_REAP_MIN_AGE_SECONDS:
-                continue
-            with _pod_network_lock(name):
-                # checked under the bridge's lock: a create reserving it now ensures it only after this removal (F-38)
-                if name in _BRIDGES_IN_USE:
-                    continue
-                try:
-                    self._api_client.remove_network(network.get("Id") or name)
-                except Exception as exc:
-                    logger.warning(
-                        _m("Rental network not removed", extra={"network": name, "error": str(exc)[:300]})
-                    )
 
     def _inspect_network_or_none(self, name: str) -> dict | None:
         try:
@@ -2151,16 +2100,6 @@ def _build_host_config_kwargs(spec: ContainerRunSpec) -> dict:
         "network_mode": spec.network_id or spec.network,
     }
     return {key: value for key, value in kwargs.items() if value is not None}
-
-
-def _age_seconds(created: str | None) -> float:
-    """Seconds since Docker's `Created` (RFC 3339, nanoseconds); 0 when unreadable, so the network is kept."""
-    # fromisoformat takes at most microseconds: cut the nanoseconds, keep the Z or +hh:mm offset
-    match = re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?(Z|[+-]\d\d:\d\d)", created or "")
-    if match is None:
-        return 0.0
-    stamp = datetime.fromisoformat(match[1] + (match[2] or "")[:7] + match[3].replace("Z", "+00:00"))
-    return (datetime.now(timezone.utc) - stamp).total_seconds()
 
 
 def _require_icc_off(name: str, network: dict) -> None:

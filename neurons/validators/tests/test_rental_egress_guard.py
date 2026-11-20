@@ -1269,3 +1269,97 @@ def test_a_host_without_a_systemd_docker_service_is_reported_not_failed(tmp_path
     assert rules  # the runtime rules stay in force
     if host == "no systemd":
         assert not (root / "etc").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("on_host", [True, False])
+async def test_the_pre_start_guard_requires_the_pods_own_bridge_in_the_applied_rules(on_host):
+    # gateway review at 129a43b: a same-name bridge without the pod label is not in the labelled list, so an apply
+    # covering only the template must not pass the start; the pod's bridge is inventoried by its ID, or refused
+    nets = f"{LEGACY_NET_ID} bridge <no value>" if on_host else ""
+    ssh = _ssh(labelled="", legacy_nets=nets, legacy_nets_rc=0 if on_host else 1, legacy_nets_stderr=ABSENT_NETWORK)
+
+    guarded, error = await rental_egress_guard.apply_rental_egress_guard(
+        ssh, attempts=None, required_network_id=LEGACY_NET_ID
+    )
+
+    if on_host:
+        assert error is None and guarded["legacy_bridges"] == [f"br-{LEGACY_NET_ID[:12]}"]
+        [helper] = _helper_calls(ssh)
+        assert f"-i br-{LEGACY_NET_ID[:12]} " in helper
+    else:
+        assert error == f"the pod's bridge {LEGACY_NET_ID[:12]} is not in the applied rules"
+
+
+def test_a_failed_daemon_reload_is_retried_by_the_next_run_although_the_drop_in_is_unchanged(tmp_path):
+    # gateway review at 129a43b: the first run moved the drop-in in place but its reload failed; the next run sees the
+    # same bytes and must still reload while systemd says NeedDaemonReload=yes, or a Docker restart skips the rules
+    state, root, env = _modelled_host(tmp_path, docker_user=True)
+    dropin = root / rental_egress_guard.BOOT_DROPIN.lstrip("/")
+    (tmp_path / "bin" / "systemctl").write_text(
+        "#!/bin/sh\n"
+        'case "$1 $3" in\n'
+        '  "show LoadState") echo loaded ;;\n'
+        f'  "show NeedDaemonReload") cmp -s {dropin} "$STATE/loaded" && echo no || echo yes ;;\n'
+        '  "daemon-reload ") [ -e "$STATE/reload_fails" ] && exit 1; '
+        f'cp {dropin} "$STATE/loaded"; echo x >> "$STATE/reloads" ;;\n'
+        "esac\n"
+    )
+    (state / "reload_fails").touch()
+    script = link_local_drop_script("br-0123456789ab", [], str(root))
+
+    first = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True)
+    assert first.returncode == 0 and "docker.service drop-in not loaded" in first.stdout
+    (state / "reload_fails").unlink()
+    for _ in range(2):
+        again = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True)
+        assert again.returncode == 0 and "boot restore not installed" not in again.stdout
+
+    assert (state / "loaded").read_text() == dropin.read_text()
+    assert (state / "reloads").read_text().split() == ["x"]  # reloaded once loaded, not on every apply
+
+
+# the host's dockerd for the reservation tests: networks are files in $STATE/nets (name per ID), containers' networks
+# lines in $STATE/ps
+_RESERVE_DOCKER_STUB = r"""#!/bin/sh
+case "$1 $2" in
+  "network ls") ls "$STATE/nets" ;;
+  "network inspect") cat "$STATE/nets/$5" ;;
+  "network rm") rm "$STATE/nets/$3" && echo "$3" >> "$STATE/removed" ;;
+  "ps -aq")
+    shift 2
+    for f in "$@"; do case "$f" in network=*) grep -qxF "${f#network=}" "$STATE/ps" 2>/dev/null && echo cid ;; esac; done
+    exit 0 ;;
+esac
+"""
+
+
+def test_a_bridge_another_process_reserved_is_never_reaped_until_its_holder_releases_it(tmp_path, monkeypatch):
+    # gateway review at 129a43b: two executor registrations share one dockerd, each create in its own validator process.
+    # Process A reserved its bridge and has no container on it yet (a long pull); process B's reaper, under the same
+    # host lock, must keep it, so A's start neither fails on a lost bridge nor is blamed on the provider
+    bin_dir, state, env = _host(tmp_path, monkeypatch)
+    (bin_dir / "docker").write_text(_RESERVE_DOCKER_STUB)
+    (bin_dir / "docker").chmod(0o755)
+    nets = state / "nets"
+    nets.mkdir()
+    bridge = {name: f"{rental_egress_guard.RENTAL_NETWORK_NAME}-{name}" for name in ("pod_a", "pod_b", "pod_ended", "pod_stopped")}
+    (nets / "ccc").write_text(bridge["pod_ended"] + "\n")
+    (nets / "ddd").write_text(bridge["pod_stopped"] + "\n")
+    (state / "ps").write_text(bridge["pod_stopped"] + "\n")  # a stopped pod's container still names its bridge
+
+    def process(script):  # each in its own shell, as each validator process runs its own SSH command
+        done = subprocess.run(["sh", "-c", locked_script(script)], env=env, capture_output=True, text=True)
+        assert done.returncode == 0, done.stderr
+
+    # A reserves, then ensures its bridge (the reservation comes first); B does the same while A has no container yet
+    process(rental_egress_guard.reserve_pod_bridge_script(bridge["pod_a"], "tokA"))
+    (nets / "aaa").write_text(bridge["pod_a"] + "\n")
+    process(rental_egress_guard.reserve_pod_bridge_script(bridge["pod_b"], "tokB"))
+    (nets / "bbb").write_text(bridge["pod_b"] + "\n")
+
+    assert (state / "removed").read_text().split() == ["ccc"]  # only the ended rental's bridge
+    process(rental_egress_guard.release_pod_bridge_script(bridge["pod_a"], "tokA"))
+    process(rental_egress_guard.reserve_pod_bridge_script(bridge["pod_b"], "tokB2"))
+    assert (state / "removed").read_text().split() == ["ccc", "aaa"]  # released and never used: reaped then
+    assert sorted(p.name for p in nets.iterdir()) == ["bbb", "ddd"]

@@ -154,6 +154,13 @@ def legacy_bridge_inventory(result) -> list[str]:
 _NETWORK_ID = re.compile(r"[0-9a-f]{12,64}")
 
 
+def bridge_network_ids(result) -> set[str]:
+    """IDs of the bridge networks in the ``docker network inspect`` output ``legacy_bridge_inventory`` read."""
+    return {
+        parts[0] for parts in (line.split() for line in (result.stdout or "").splitlines()) if parts[1:2] == ["bridge"]
+    }
+
+
 def rental_bridge(inspect_stdout: str) -> str | None:
     """Host interface of the rental network from ``docker network inspect`` ("<id> <bridge-name option>")."""
     parts = (inspect_stdout or "").split()
@@ -254,7 +261,8 @@ def link_local_drop_script(bridge: str | None, legacy_bridges: list[str], host_r
 
 
 def _boot_restore(boot: str, host_root: str) -> str:
-    """Install ``boot`` as ``ExecStartPre`` of the host's ``docker.service``; daemon-reload only when the drop-in is new."""
+    """Install ``boot`` as ``ExecStartPre`` of the host's ``docker.service``; daemon-reload when the drop-in is new or
+    systemd has not loaded it yet."""
     script, dropin = shlex.quote(host_root + BOOT_SCRIPT), shlex.quote(host_root + BOOT_DROPIN)
     dirs = " ".join(shlex.quote(host_root + path.rsplit("/", 1)[0]) for path in (BOOT_SCRIPT, BOOT_DROPIN))
     # printf makes the newlines, so the command stays on one line
@@ -268,8 +276,10 @@ def _boot_restore(boot: str, host_root: str) -> str:
         f"elif ! {{ printf '%s\\n' {shlex.quote(boot)} > {script}.tmp && mv -f {script}.tmp {script}; }}; then "
         "echo 'boot restore not installed: boot rules not written'; "
         f"elif ! printf {unit} > {dropin}.tmp; then echo 'boot restore not installed: drop-in not written'; "
-        f"elif cmp {dropin}.tmp {dropin} >/dev/null 2>&1; then rm -f {dropin}.tmp; "
-        f"elif ! {{ mv -f {dropin}.tmp {dropin} && $HOST_NS systemctl daemon-reload; }}; then "
+        # same bytes: still reloaded while systemd has not loaded them (an earlier run's reload failed)
+        f"elif cmp {dropin}.tmp {dropin} >/dev/null 2>&1 && rm -f {dropin}.tmp && "
+        '[ "$($HOST_NS systemctl show -p NeedDaemonReload --value docker.service 2>/dev/null)" != yes ]; then :; '
+        f"elif ! {{ {{ [ ! -e {dropin}.tmp ] || mv -f {dropin}.tmp {dropin}; }} && $HOST_NS systemctl daemon-reload; }}; then "
         "echo 'boot restore not installed: docker.service drop-in not loaded'; fi; "
         "else echo 'boot restore not installed: no systemd docker.service'; fi"
     )
@@ -283,6 +293,47 @@ def _boot_clear(host_root: str) -> str:
         f"if [ -f {script} ]; then printf 'exit 0\\n' > {script}.tmp && mv -f {script}.tmp {script} || "
         "{ echo 'boot rules not cleared' >&2; exit 4; }; fi"
     )
+
+
+def _reservations_dir() -> str:
+    return HOST_LOCK.rsplit("/", 1)[0] + "/bridges"
+
+
+def reserve_pod_bridge_script(network: str, token: str) -> str:
+    """Under the host lock (DAH-6737): reserve the pod bridge ``network`` for this holder, then remove every other pod
+    bridge that no holder reserves and no container references, checked right before its removal. Every validator
+    process reserves through this one host lock, so a bridge is never removed between a holder's reservation (taken
+    before it is ensured) and its container's reference to it, whichever process holds it."""
+    d = shlex.quote(_reservations_dir())
+    return (
+        f"mkdir -p {d} && : > {d}/{shlex.quote(f'{network}.{token}')} || {{ echo 'bridge not reserved' >&2; exit 4; }}; "
+        f"for ID in $($HOST_NS docker network ls -q --no-trunc --filter label={POD_NETWORK_LABEL}=pod); do "
+        "N=$($HOST_NS docker network inspect -f '{{.Name}}' \"$ID\") || continue; "
+        f'case "$N" in {RENTAL_NETWORK_NAME}-*) ;; *) continue ;; esac; '
+        f'ls {d}/"$N".* >/dev/null 2>&1 && continue; '
+        # a created container holds its network by ID (our creates) or by name, started or not
+        'U=$($HOST_NS docker ps -aq --filter network="$ID" --filter network="$N") || continue; [ -z "$U" ] || continue; '
+        '$HOST_NS docker network rm "$ID" >/dev/null 2>&1 || echo "bridge not removed: $N"; '
+        "done; exit 0"
+    )
+
+
+def release_pod_bridge_script(network: str, token: str) -> str:
+    return f"rm -f {shlex.quote(_reservations_dir())}/{shlex.quote(f'{network}.{token}')}; exit 0"
+
+
+async def reserve_pod_bridge(ssh, network: str, token: str) -> None:
+    result = await ssh.run(_helper(reserve_pod_bridge_script(network, token)), check=False)
+    if result.exit_status != 0:
+        raise InventoryUnknown(_error(result) or "pod bridge not reserved")
+    if left := [line for line in (result.stdout or "").splitlines() if line.startswith("bridge not removed")]:
+        logger.warning(_m("Rental egress guard: an ended rental's bridge was not removed", extra={"bridges": left}))
+
+
+async def release_pod_bridge(ssh, network: str, token: str) -> None:
+    result = await ssh.run(_helper(release_pod_bridge_script(network, token)), check=False)
+    if result.exit_status != 0:
+        raise InventoryUnknown(_error(result) or "pod bridge not released")
 
 
 def link_local_cleanup_script(host_root: str = HOST_ROOT) -> str:
@@ -479,18 +530,22 @@ class RentalEgressGuardCheck:
         return await apply_rental_egress_guard(ctx.ssh)
 
 
-async def apply_rental_egress_guard(ssh, attempts: int | None = INVENTORY_ATTEMPTS) -> tuple[dict | None, str | None]:
+async def apply_rental_egress_guard(
+    ssh, attempts: int | None = INVENTORY_ATTEMPTS, required_network_id: str | None = None
+) -> tuple[dict | None, str | None]:
     """(what was guarded, error); None when there is neither a rental network nor a legacy rental.
 
     Also run on the create and start paths right before a pod starts (DAH-6737), so a pod's own bridge is guarded
     before its first packet, not at the next periodic run. The rules are applied only if no other run changed them
     since this inventory began; otherwise the host is read again (``attempts`` times, then unknown). The pre-start
     path passes ``attempts=None``: concurrent guards on one host always settle, and its caller's timeout is the bound.
+    It also passes the pod's bridge as ``required_network_id``: inventoried whatever its labels, and an error unless it
+    resolved to a bridge in the applied rules, so a pod never starts on a bridge the drop was not applied to.
     """
     tries = 0
     while True:
         generation = await _host_generation(ssh)
-        guarded, result = await _inventory_and_apply(ssh, generation)
+        guarded, result, required_missing = await _inventory_and_apply(ssh, generation, required_network_id)
         if result.exit_status != STALE_INVENTORY_EXIT:
             break
         tries += 1
@@ -504,7 +559,10 @@ async def apply_rental_egress_guard(ssh, attempts: int | None = INVENTORY_ATTEMP
         logger.warning(_m("Rental egress guard: an old release's jump was not detached", extra={"jumps": left}))
         if guarded is not None:
             guarded["old_jumps_left"] = left
-    return guarded, _error(result)
+    error = _error(result)
+    if error is None and required_missing:
+        error = f"the pod's bridge {required_network_id[:12]} is not in the applied rules"
+    return guarded, error
 
 
 async def _host_generation(ssh) -> str:
@@ -515,7 +573,7 @@ async def _host_generation(ssh) -> str:
     return generation
 
 
-async def _inventory_and_apply(ssh, generation: str):
+async def _inventory_and_apply(ssh, generation: str, required_network_id: str | None = None):
     inspect = await ssh.run(
         f"/usr/bin/docker network inspect {RENTAL_NETWORK_NAME} "
         f"-f '{{{{.Id}}}} {{{{index .Options \"{BRIDGE_NAME_OPTION}\"}}}}'",
@@ -543,6 +601,9 @@ async def _inventory_and_apply(ssh, generation: str):
     if labelled.exit_status != 0:
         raise InventoryUnknown(_error(labelled) or "pod network list failed")
     network_ids += [nid for nid in legacy_network_ids(labelled.stdout) if nid not in network_ids]
+    if required_network_id and required_network_id not in network_ids:
+        network_ids.append(required_network_id)
+    required_missing = bool(required_network_id)
     if network_ids:
         nets = await ssh.run(
             "/usr/bin/docker network inspect "
@@ -551,11 +612,12 @@ async def _inventory_and_apply(ssh, generation: str):
             check=False,
         )
         legacy = legacy_bridge_inventory(nets)
+        required_missing = bool(required_network_id) and required_network_id not in bridge_network_ids(nets)
     if bridge is None and not legacy:
         # rules from a rental that has since ended must not outlive it (Docker reuses its address)
-        return None, await ssh.run(_helper(link_local_cleanup_script(), generation), check=False)
+        return None, await ssh.run(_helper(link_local_cleanup_script(), generation), check=False), required_missing
     result = await ssh.run(_helper(link_local_drop_script(bridge, legacy), generation), check=False)
-    return {"bridge": bridge, "legacy_bridges": legacy}, result
+    return {"bridge": bridge, "legacy_bridges": legacy}, result, required_missing
 
 
 def _error(result) -> str | None:
