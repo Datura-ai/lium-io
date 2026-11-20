@@ -8,22 +8,14 @@ WATCHTOWER_VERSION: str = "1.2.3"
 WATCHTOWER_USER_AGENT: str = f"lium-watchtower/{WATCHTOWER_VERSION}"
 
 WATCHTOWER_ENDPOINT_URL: str = "https://lium.io/api/watchtower/digest"
-# The validator hotkey whose signature on the digest is trusted, and the one the Lium validator swaps
-# to (owner, 22 Sep 2026). Both are checked until the swap release drops the first; a build with a
-# config_override names its own pair (or only the first).
+# The validator hotkey whose signature on the digest is trusted while no message signed by the subnet owner has been
+# taken (validator_trust_service.py). A build with a config_override names its own validator and reads no message.
 WATCHTOWER_VALIDATOR_HOTKEY: str = "5F7X5UpKSr26KU3jKfpLmT8kuKtBNyHhEnfS8xtxPCqCb13p"
-WATCHTOWER_VALIDATOR_NEXT_HOTKEY: str = "5F1aH9124FPvDNMWKgPCCJ8WeBBV3B3vpijDCyxZVyZgrEV9"
 
 try:
     from config_override import WATCHTOWER_ENDPOINT_URL, WATCHTOWER_VALIDATOR_HOTKEY  # noqa: F401, F811
 except ImportError:
     pass
-else:
-    # an override that names only the first hotkey (a staging build) trusts one signer
-    try:
-        from config_override import WATCHTOWER_VALIDATOR_NEXT_HOTKEY  # noqa: F811
-    except ImportError:
-        WATCHTOWER_VALIDATOR_NEXT_HOTKEY = ""
 
 
 class Settings(BaseSettings):
