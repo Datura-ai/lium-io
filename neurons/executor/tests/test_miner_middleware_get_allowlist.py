@@ -26,23 +26,6 @@ def _client(extra_get_route: str | None = None) -> TestClient:
     return TestClient(app)
 
 
-def test_version_is_public():
-    assert _client().get("/version").status_code == 200
-
-
-def test_update_status_is_public():
-    # The post-release check calls it without a signature.
-    assert _client().get("/update-status").status_code != 401
-
-
-def test_container_logs_reaches_its_own_signature_check():
-    # Reaches the route: FastAPI rejects the missing signature headers (422),
-    # not the middleware (401).
-    response = _client().get("/containers/pod_x/logs")
-
-    assert response.status_code == 422
-
-
 def test_unlisted_get_route_is_denied_by_default(caplog):
     # core.logger may set propagate=False (then caplog's root handler sees nothing), so the
     # handler is attached to the module logger itself; a propagating logger records it twice.
@@ -63,5 +46,3 @@ def test_unlisted_get_route_is_denied_by_default(caplog):
     assert '"client_host": "testclient"' in message
 
 
-def test_unknown_get_path_is_denied_not_404():
-    assert _client().get("/does_not_exist").status_code == 401

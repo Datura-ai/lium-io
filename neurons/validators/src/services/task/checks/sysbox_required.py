@@ -1,18 +1,20 @@
 from __future__ import annotations
 
-from core.config import settings
+from services.executor_connectivity.dind_probe import DIND_SSHD_NOT_READY
 from services.executor_connectivity.models import DIND_INNER_DOCKERD_CODES
 
 from ..messages import MessageTemplate, render_message
 from ..messages import SysboxRequiredMessages as Msg
 from ..models import ValidationEvent
 from ..pipeline import CheckResult, Context
+from .rental_owner import rental_of_this_node
 
 # DAH-3634: probe causes that get their own reason code instead of SYSBOX_REQUIRED_MISSING, keyed
 # by `ContextState.dind_probe_error.code`, written by dind_probe.diagnose_docker_run_error.
 _NVIDIA_HOOK_TEMPLATE_BY_REASON_CODE: dict[str, MessageTemplate] = {
     Msg.NVIDIA_RUNTIME_MISMATCH.reason: Msg.NVIDIA_RUNTIME_MISMATCH,
     Msg.NVIDIA_CONTAINER_HOOK_FAILED.reason: Msg.NVIDIA_CONTAINER_HOOK_FAILED,
+    Msg.NVIDIA_TOOLKIT_CDI_MODE.reason: Msg.NVIDIA_TOOLKIT_CDI_MODE,
 }
 
 
@@ -29,13 +31,8 @@ class SysboxRequiredCheck:
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:
-        if not settings.REQUIRE_SYSBOX_FOR_UNRENTED:
-            event = render_message(Msg.DISABLED, ctx=ctx, check_id=self.check_id)
-            return CheckResult(passed=True, event=event)
-
         # Determine rental status the same way as port_count.py / rented_machine.py.
-        rented_data = ctx.state.rented_data
-        rented_executor = rented_data.executors.get(ctx.executor.uuid) if rented_data else None
+        rented_executor = rental_of_this_node(ctx)
         is_rented = rented_executor is not None and len(rented_executor.pods) > 0
 
         if not ctx.state.sysbox_runtime and not is_rented:
@@ -81,6 +78,10 @@ class SysboxRequiredCheck:
             # with no line names the symptom, not the cause, so the generic guidance stays.
             if cause.code in DIND_INNER_DOCKERD_CODES and cause.dockerd_line:
                 remediation += " Fix that on the host first; reinstalling sysbox does not change it."
+            elif cause.code == DIND_SSHD_NOT_READY.code:
+                # DAH-5844: the container never answered at all, so the notice must not say sysbox is missing
+                template = Msg.DIND_PROBE_UNREACHABLE
+                remediation += f" {template.remediation}"
         return render_message(
             template,
             ctx=ctx,

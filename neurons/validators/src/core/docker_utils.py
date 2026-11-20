@@ -1,11 +1,12 @@
 import asyncio
 import json
+import re
 import shlex
 from dataclasses import dataclass
 
 import asyncssh
 
-from services.const import DOCKER_DIND_IMAGE
+from services.const import DOCKER_DIND_IMAGE, LIUM_POD_ID_LABEL
 
 # Bounded so a crash-looping worker can't flood the log line; keep the tail,
 # not the head — a dying entrypoint prints its fatal error last.
@@ -22,30 +23,35 @@ class DockerCommand:
         heredoc = "__NC_EOF__"
         network_flag = f"--network={network_mode}" if network_mode == "host" else network_mode
         return (
-            f"/usr/bin/docker run -d --rm --name {name} "
+            f"/usr/bin/docker run -d --rm --name {shlex.quote(name)} "
             f"{network_flag} docker.io/library/alpine:3.19 sh -c "
             f"'cat << \"{heredoc}\" > /tmp/nc.sh\n{script}\n{heredoc}\n"
-            f"timeout {timeout} sh /tmp/nc.sh'"
+            # `; exit $?`: as the last command sh would exec timeout, which execs the script as the
+            # container's PID 1, and PID 1 ignores timeout's SIGTERM; any port nobody fetched then kept
+            # the listener (and its port) up for hours. Not last, the script runs as a child and dies.
+            f"timeout {timeout} sh /tmp/nc.sh; exit $?'"
         )
 
     @staticmethod
     def run_dind(name: str, port: int, public_key: str, sysbox: bool) -> str:
         """Build docker run command for DinD container."""
         runtime = "--runtime=sysbox-runc " if sysbox else ""
-        ssh_cmd = (
-            "sh -c 'mkdir -p ~/.ssh && echo "
-            f"\"{public_key}\" >> ~/.ssh/authorized_keys "
-            "&& ssh-keygen -A && service ssh start && tail -f /dev/null'"
+        # the inner script is one shell word, quoted once: the key never sits inside hand-made quotes
+        inner = (
+            f"mkdir -p ~/.ssh && echo {shlex.quote(public_key)} >> ~/.ssh/authorized_keys "
+            "&& ssh-keygen -A && service ssh start && tail -f /dev/null"
         )
         return (
-            f"/usr/bin/docker run -d {runtime} --name {name} --gpus all "
-            f"-p {port}:22 {DOCKER_DIND_IMAGE} {ssh_cmd}"
+            f"/usr/bin/docker run -d {runtime} --name {shlex.quote(name)} "
+            f"--label {shlex.quote(f'{LIUM_POD_ID_LABEL}={name}')} "
+            "--gpus all "
+            f"-p {int(port)}:22 {DOCKER_DIND_IMAGE} sh -c {shlex.quote(inner)}"
         )
 
     @staticmethod
     def remove_with_volumes(name: str) -> str:
         """Build docker rm command that also removes anonymous volumes."""
-        return f"/usr/bin/docker rm -fv {name}"
+        return f"/usr/bin/docker rm -fv {shlex.quote(name)}"
 
     @staticmethod
     def dind_diagnostics(name: str, lines: int = 40) -> str:
@@ -60,6 +66,23 @@ class DockerCommand:
         return (
             f"/usr/bin/docker logs --tail {lines} {quoted} 2>&1; "
             f"/usr/bin/docker exec {quoted} tail -n {lines} /var/log/dockerd.err.log 2>&1; true"
+        )
+
+    @staticmethod
+    def terminate_and_wait(name: str, grace_seconds: int) -> str:
+        """SIGTERM the container and wait up to grace_seconds for it to exit (DAH-5101).
+
+        The two halves of `docker stop` without its ending: the image's stop signal (STOPSIGNAL,
+        SIGTERM by default, as `docker stop` sends it) and the grace, but no SIGKILL and so no unmount
+        yet, which lets the delete wipe the volume once more before the forced removal kills the
+        container. Exit 0 = the container exited inside the grace; 124 = still running; any other
+        exit = unknown (a Docker API error, a container already gone), to be treated as running.
+        """
+        quoted = shlex.quote(name)
+        return (
+            f"s=$(/usr/bin/docker inspect --format '{{{{.Config.StopSignal}}}}' {quoted}) && "
+            f'/usr/bin/docker kill --signal "${{s:-SIGTERM}}" {quoted} >/dev/null && '
+            f"timeout {grace_seconds} /usr/bin/docker wait {quoted}"
         )
 
     @staticmethod
@@ -84,25 +107,90 @@ class DockerCommand:
         )
 
     @staticmethod
-    def ps_filter(*name_patterns: str) -> str:
+    def kill_orphaned_task_shim(container_id: str) -> str:
+        """SIGKILL the containerd shim still holding the task of a container dockerd reports exited.
+
+        After a dockerd/containerd restart the old shim can outlive dockerd's view of the container,
+        and every `docker start` then fails with "AlreadyExists: task <id>". Matches only the shim
+        started with `-id <container_id>` (the exact 64-hex id). Its pid and start time are captured
+        first, then the container state is re-read: only while it is still exited/created, and only
+        that same shim generation, is it killed with its children. A replacement shim started by
+        anyone in between has another pid/start time and is never touched. Exit 0 always.
+        """
+        if not re.fullmatch(r"[0-9a-f]{64}", container_id):
+            raise ValueError(f"not a full container id: {container_id!r}")
+        # argv0 must be the shim binary, so this shell (whose own cmdline holds the id) never matches
+        return (
+            "shim=; for d in /proc/[0-9]*; do "
+            "c=$(tr '\\0' ' ' 2>/dev/null < $d/cmdline); "
+            "case \"${c%% *}\" in *containerd-shim*) case \"$c\" in "
+            f"*' -id {container_id} '*) shim=${{d#/proc/}};; esac;; esac; done; "
+            "[ -n \"$shim\" ] || { echo 'no shim'; exit 0; }; "
+            # field 22 of /proc/<pid>/stat = start time: (pid, start time) names one process
+            "gen=$(cut -d' ' -f22 /proc/$shim/stat 2>/dev/null); "
+            f"st=$(/usr/bin/docker inspect --format '{{{{.State.Status}}}}' {container_id} 2>&1); "
+            "case \"$st\" in exited|created) ;; *) echo \"skipped state=$st\"; exit 0;; esac; "
+            "[ -n \"$gen\" ] && [ \"$(cut -d' ' -f22 /proc/$shim/stat 2>/dev/null)\" = \"$gen\" ] "
+            "|| { echo 'skipped shim replaced'; exit 0; }; "
+            "kids=$(awk -v p=$shim '/^PPid:/ && $2 == p {print FILENAME}' /proc/[0-9]*/status "
+            "2>/dev/null | cut -d/ -f3); kill -9 $kids $shim 2>/dev/null; "
+            "echo \"killed shim=$shim init=$kids\"; sleep 3; true"
+        )
+
+    @staticmethod
+    def remove_stale_container_cgroup(container_id: str) -> str:
+        """rmdir the cgroup a stopped container's last run left on the host (systemd or cgroupfs driver).
+
+        After a host dockerd restart the old cgroup can stay behind with child cgroups (the renter's
+        own nested docker or systemd made them), and every `docker start` then fails writing
+        cgroup.procs with "device or resource busy". Only empty cgroups are removed: the kernel
+        refuses rmdir of one that holds a process, so nothing running is touched. Re-reads the state
+        first and acts only while the container is still exited/created. Prints `removed`, `busy`,
+        `no cgroup`, `no host view` or `skipped state=...`; exit 0 always.
+        """
+        if not re.fullmatch(r"[0-9a-f]{64}", container_id):
+            raise ValueError(f"not a full container id: {container_id!r}")
+        return (
+            # the host's cgroup tree is reachable only when /proc/1 is the host's (host pid namespace)
+            "[ /proc/1/root/ -ef / ] && { echo 'no host view'; exit 0; }; "
+            f"st=$(/usr/bin/docker inspect --format '{{{{.State.Status}}}}' {container_id} 2>&1); "
+            "case \"$st\" in exited|created) ;; *) echo \"skipped state=$st\"; exit 0;; esac; "
+            f"found=; for d in /proc/1/root/sys/fs/cgroup/system.slice/docker-{container_id}.scope "
+            f"/proc/1/root/sys/fs/cgroup/docker/{container_id}; do [ -d \"$d\" ] || continue; found=1; "
+            "find \"$d\" -depth -type d -exec rmdir {} \\; 2>/dev/null; "
+            "[ -d \"$d\" ] && { echo busy; exit 0; }; done; "
+            "[ -n \"$found\" ] && echo removed || echo 'no cgroup'; true"
+        )
+
+    @staticmethod
+    def ps_filter(*name_patterns: str, output_format: str = "{{.Names}}") -> str:
         """Build docker ps command with one or more filters."""
-        filters = ' '.join(f'--filter "name={pattern}"' for pattern in name_patterns)
-        return f'/usr/bin/docker ps -a {filters} --format "{{{{.Names}}}}"'
+        filters = " ".join(f"--filter {shlex.quote(f'name={pattern}')}" for pattern in name_patterns)
+        return f"/usr/bin/docker ps -a {filters} --format {shlex.quote(output_format)}"
+
+    @staticmethod
+    def host_port_bindings() -> str:
+        """Build a command printing each container's name and published host ports, stopped containers included."""
+        # no pipe: a failed `docker ps` must exit non-zero, not read as a host without containers
+        return (
+            'ids=$(/usr/bin/docker ps -aq) && { [ -z "$ids" ] || /usr/bin/docker inspect --format '
+            "'{{.Name}} {{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostPort}} {{end}}{{end}}' $ids; }"
+        )
 
     @staticmethod
     def inspect_status(container_id: str) -> str:
         """Build docker inspect command for status."""
-        return f"/usr/bin/docker ps -a --filter id={container_id} --format '{{{{.Status}}}}|||{{{{.State}}}}' 2>&1"
+        return f"/usr/bin/docker ps -a --filter {shlex.quote(f'id={container_id}')} --format '{{{{.Status}}}}|||{{{{.State}}}}' 2>&1"
 
     @staticmethod
     def logs(container_id: str) -> str:
         """Build docker logs command."""
-        return f"/usr/bin/docker logs {container_id} 2>&1 | head -20"
+        return f"/usr/bin/docker logs {shlex.quote(container_id)} 2>&1 | head -20"
 
     @staticmethod
     def inspect_exit_code(container_id: str) -> str:
         """Build docker inspect for exit code."""
-        return f"/usr/bin/docker inspect {container_id} --format '{{{{.State.ExitCode}}}}' 2>&1"
+        return f"/usr/bin/docker inspect {shlex.quote(container_id)} --format '{{{{.State.ExitCode}}}}' 2>&1"
 
     @staticmethod
     def volume_remove(*volume_names: str) -> str:
@@ -135,8 +223,13 @@ class DockerCommand:
 
     @staticmethod
     def ps_running(container_name: str) -> str:
-        """Build docker ps command to check if container is running."""
-        return f"/usr/bin/docker ps -q -f name={container_name}"
+        """Build docker ps command to check if container is running.
+
+        Docker's name filter is an unanchored regex: `name=pod_1` also lists `pod_12`. A container
+        name is [a-zA-Z0-9_.-], so `.` is its only regex metacharacter.
+        """
+        pattern = container_name.replace(".", r"\.")
+        return f"/usr/bin/docker ps -q -f {shlex.quote(f'name=^/?{pattern}$')}"
 
     @staticmethod
     def exec_command(container_name: str, command: str) -> str:
@@ -252,6 +345,7 @@ def _reports_missing_container(message: str) -> bool:
 async def collect_container_death_diagnostics(
     ssh_client: asyncssh.SSHClientConnection,
     container_name: str,
+    diagnostics: ContainerDeathDiagnostics | None = None,
 ) -> ContainerDeathDiagnostics:
     """Read why a container died over an already-open SSH session.
 
@@ -259,9 +353,10 @@ async def collect_container_death_diagnostics(
     (cancellation excepted). At both call sites this runs right before the
     container is force-removed, and the executor host belongs to the miner —
     losing the rest of the evidence to an exception is worse than a partial
-    record.
+    record. A caller that bounds this with a timeout passes its own `diagnostics`
+    so the fields read before the timeout survive it.
     """
-    diagnostics = ContainerDeathDiagnostics()
+    diagnostics = diagnostics if diagnostics is not None else ContainerDeathDiagnostics()
     capture_errors: list[str] = []
     quoted_name = shlex.quote(container_name)
 
@@ -290,16 +385,18 @@ async def collect_container_death_diagnostics(
     except Exception as exc:
         capture_errors.append(f"inspect: {exc}")
 
-    try:
-        logs_result = await ssh_client.run(
-            f"/usr/bin/docker logs --tail {_CONTAINER_DEATH_LOG_TAIL_LINES} {quoted_name} 2>&1 || true"
-        )
-        tail = (logs_result.stdout or "")[-_CONTAINER_DEATH_LOG_MAX_CHARS:]
-        diagnostics.logs_tail = tail or None
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        capture_errors.append(f"logs: {exc}")
+    # a removed container's log went with it: `2>&1` would store docker's "No such container" as its output
+    if not diagnostics.container_missing:
+        try:
+            logs_result = await ssh_client.run(
+                f"/usr/bin/docker logs --tail {_CONTAINER_DEATH_LOG_TAIL_LINES} {quoted_name} 2>&1 || true"
+            )
+            tail = (logs_result.stdout or "")[-_CONTAINER_DEATH_LOG_MAX_CHARS:]
+            diagnostics.logs_tail = tail or None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            capture_errors.append(f"logs: {exc}")
 
     host_context = await _collect_host_context(ssh_client)
     diagnostics.host_context = host_context or None

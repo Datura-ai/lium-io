@@ -46,7 +46,7 @@ subject-claim rule, resources and a scope:
 
 | Label | Subject claim | Resources (Docker Hub repositories) | Scope |
 |---|---|---|---|
-| `lium-io-publish` | `repo:Datura-ai/lium-io:environment:dockerhub-push` | `daturaai/compute-subnet-executor`, `…-executor-runner`, `…-miner`, `…-miner-runner`, `…-validator`, `…-validator-runner`, `daturaai/lium-watchtower` | image push |
+| `lium-io-publish` | `repo:Datura-ai/lium-io:environment:dockerhub-push` | `daturaai/compute-subnet-executor`, `…-executor-runner`, `…-miner`, `…-miner-runner`, `…-validator`, `…-validator-runner`, `daturaai/lium-watchtower` (the `lium mine` preflight image is the `preflight` tag of `…-validator`) | image push |
 | `lium-io-dev` | `repo:Datura-ai/lium-io:environment:dockerhub-push-dev` | `daturaai/compute-subnet-executor-dev`, `daturaai/compute-subnet-executor-runner-dev` (only these two) | image push |
 
 `lium-io-dev` is the branch path: `executor_cd_dev` dispatched from any branch but `main` runs in

@@ -20,8 +20,13 @@ from protocol.vc_protocol.compute_requests import (
     NvmlReportAckResponse,
     PodHostRebootRecoveredResponse,
     PodRentalActiveResponse,
+    PodSshReachabilityResponse,
+    RentedExecutor,
+    StorageOperationActiveResponse,
     RentedExecutorsResponse,
     RentedGpuDropResponse,
+    RentedPod,
+    RentedPodTargets,
     VerificationStartedResponse,
 )
 from pydantic import BaseModel, ValidationError
@@ -69,6 +74,11 @@ class SettledWeights(BaseModel):
 class SettledWeightsResult(BaseModel):
     tempo_index: int
     inclusion_block: int | None = None
+
+
+class LiveWeightsReceipt(BaseModel):
+    inclusion_block: int
+    created: bool
 
 
 # the 4xx answers that mean the request itself is wrong; a 401/403 (a clock past the signature window) or a 429
@@ -132,14 +142,6 @@ class BackendClient:
             await cls._session.close()
             cls._session = None
 
-    def _get_signature_headers(self) -> dict[str, str]:
-        timestamp = int(time.time())
-        return {
-            "hotkey": self.keypair.ss58_address,
-            "timestamp": str(timestamp),
-            "signature": f"0x{self.keypair.sign(str(timestamp)).hex()}",
-        }
-
     @staticmethod
     def signed_request_message(method: str, path_with_query: str, body: bytes, timestamp: str) -> str:
         """What the settlement routes verify (backend utils/auth.py validator_signed_message): the method, the path
@@ -165,6 +167,8 @@ class BackendClient:
         response_model: type[T],
         *,
         json_data: dict[str, Any] | None = None,
+        timeout: int = 30,
+        non_200_log_level: int = logging.ERROR,
         raise_on_4xx: bool = False,
     ) -> T | None:
         """A settlement call: the body is serialized once, and the signature covers these exact bytes."""
@@ -177,6 +181,8 @@ class BackendClient:
             add_signature=False,
             extra_headers=self._get_signed_request_headers(method, path, body),
             raw_body=body if json_data is not None else None,
+            timeout=timeout,
+            non_200_log_level=non_200_log_level,
             raise_on_4xx=raise_on_4xx,
         )
 
@@ -208,6 +214,7 @@ class BackendClient:
         timeout: int = 30,
         extra_headers: dict[str, str] | None = None,
         non_200_log_level: int = logging.ERROR,
+        raise_on_4xx: bool = False,
     ) -> T | None:
         return await self._request(
             "POST",
@@ -218,6 +225,7 @@ class BackendClient:
             timeout=timeout,
             extra_headers=extra_headers,
             non_200_log_level=non_200_log_level,
+            raise_on_4xx=raise_on_4xx,
         )
 
     async def _request(
@@ -241,7 +249,12 @@ class BackendClient:
         context = {"url": url, "method": method}
 
         try:
-            headers = self._get_signature_headers() if add_signature else {}
+            headers = {}
+            if add_signature:
+                # DAH-6169: every signed call signs method, path?query, body hash and timestamp; the bytes signed are sent
+                if raw_body is None and json_data is not None:
+                    raw_body = json.dumps(json_data, separators=(",", ":"), sort_keys=True).encode()
+                headers = self._get_signed_request_headers(method, "/" + path.lstrip("/"), raw_body or b"")
             if extra_headers:
                 headers.update(extra_headers)
 
@@ -324,12 +337,15 @@ class BackendClient:
         stop=stop_after_attempt(3),
         wait=wait_fixed(30),
         retry=retry_if_result(lambda x: x is None),
+        # without this, tenacity raises RetryError after the last None
+        retry_error_callback=lambda retry_state: None,
     )
     async def get_all_rented_executors(self) -> RentedExecutorsResponse | None:
         """Fetch all rented executors with their ports from the backend.
 
         Retried three times, 30 s apart: this is the cycle's snapshot, and a cycle without it
-        cannot start. A check that asks mid-cycle uses `get_rented_executors_now` instead.
+        cannot start. None when all three fail. A check that asks mid-cycle uses
+        `get_rented_executors_now` instead.
         """
         return await self.get_rented_executors_now()
 
@@ -340,7 +356,8 @@ class BackendClient:
         answer within the 30 s timeout returns None, and the caller decides what that means;
         nothing waits 60 s for two more attempts inside a running pipeline.
         """
-        return await self.get(
+        return await self._signed_request(
+            "GET",
             "/internal/executors/rented",
             RentedExecutorsResponse,
             timeout=30,
@@ -367,7 +384,8 @@ class BackendClient:
 
     async def get_pod_rental_active(self, pod_id: str) -> PodRentalActiveResponse | None:
         """Fetch whether the backend still considers a pod rental active."""
-        return await self.get(
+        return await self._signed_request(
+            "GET",
             f"/internal/pods/{pod_id}/rental-active",
             PodRentalActiveResponse,
             timeout=10,
@@ -382,7 +400,8 @@ class BackendClient:
         the same downtime reported by a later cycle while keeping a genuine second reboot of the
         same pod a separate event. Older backends 404 and the caller treats that as nothing to do.
         """
-        return await self.post(
+        return await self._signed_request(
+            "POST",
             f"/internal/pods/{pod_id}/host-reboot-recovered",
             PodHostRebootRecoveredResponse,
             json_data={"container_finished_at": container_finished_at},
@@ -405,6 +424,8 @@ class BackendClient:
         pod_gpu_count: int | None,
         rented_gpu_count: int | None,
         nvml_gpu_count: int,
+        gpu_details: list[dict] | None = None,
+        observed_at: str | None = None,
     ) -> RentedGpuDropResponse | None:
         """Tell the backend a rented pod's node lost a GPU (``state="fault"``) or has all of them back
         (``state="recovered"``).
@@ -414,8 +435,11 @@ class BackendClient:
         next cycle. ``expected_gpu_count``, ``visible_gpu_count``, ``rented_gpu_count`` (every pod's
         ``gpu_count`` summed, None when one is unknown) and ``nvml_gpu_count`` are executor-wide;
         ``pod_gpu_count`` is this pod's own share, so a split node's renters can be told apart.
+        ``gpu_details``: the scrape's card list, sent when the anchored cards are gone.
+        ``observed_at``: when the check saw the fault or the clean result (a retried recovery keeps it).
         """
-        return await self.post(
+        return await self._signed_request(
+            "POST",
             f"/internal/pods/{quote(str(pod_id), safe='')}/gpu-drop",
             RentedGpuDropResponse,
             json_data={
@@ -431,9 +455,72 @@ class BackendClient:
                 "pod_gpu_count": pod_gpu_count,
                 "rented_gpu_count": rented_gpu_count,
                 "nvml_gpu_count": nvml_gpu_count,
+                **({"gpu_details": gpu_details} if gpu_details else {}),
+                **({"observed_at": observed_at} if observed_at else {}),
             },
             timeout=10,
             non_200_log_level=logging.WARNING,
+        )
+
+    async def get_rented_pod_targets(self) -> RentedExecutorsResponse | None:
+        """The watch's per-minute read: only pod_id, ip, miner_hotkey, port and status
+        (`?light=true`), shaped as the rented list the probe takes. A 4xx (a backend without the
+        parameter) falls back to the full list."""
+        try:
+            answer = await self._signed_request(
+                "GET", "/internal/executors/rented?light=true", RentedPodTargets, timeout=30, raise_on_4xx=True
+            )
+        except BackendRejected:
+            return await self.get_rented_executors_now()
+        if answer is None or isinstance(answer.root, RentedExecutorsResponse):
+            return answer and answer.root  # None, or the full list from a backend that ignores the parameter
+        return RentedExecutorsResponse(
+            executors={
+                row.pod_id: RentedExecutor(
+                    miner_hotkey=row.miner_hotkey,
+                    executor_ip_address=row.ip,
+                    executor_ip_port="",
+                    pods=[RentedPod(pod_id=row.pod_id, container_name="", ssh_port=row.port, status=row.status)],
+                )
+                for row in answer.root
+            }
+        )
+
+    async def report_pod_ssh_reachability(
+        self,
+        pod_id: str,
+        *,
+        state: str,
+        since: str,
+        result: str | None,
+        errno: int | None,
+        observed_at: str,
+        answered_before: bool | None = None,
+    ) -> PodSshReachabilityResponse | None:
+        """Tell the backend a rented pod's SSH stopped answering (``state="unreachable"``, ``since`` =
+        the first missed probe) or answers again (``state="reachable"``, ``since`` = when it came back).
+
+        Raises ``BackendRejected`` on 404 (an older backend without the route); None on any other
+        failure, which the caller reports again next tick.
+        """
+        return await self.post(
+            f"/internal/pods/{quote(str(pod_id), safe='')}/ssh-reachability",
+            PodSshReachabilityResponse,
+            json_data={
+                "state": state,
+                "since": since,
+                "result": result,
+                "errno": errno,
+                # DAH-5215 review: the backend stores these to order and judge observations
+                "probe_result": result,
+                "answered_before": answered_before,
+                "observed_at": observed_at,
+                "source": "watch",
+            },
+            timeout=10,
+            # once a minute per down pod: the watch logs the counts, not every failed post
+            non_200_log_level=logging.DEBUG,
+            raise_on_4xx=True,
         )
 
     async def get_filler_run_active(
@@ -449,7 +536,17 @@ class BackendClient:
         path = f"/internal/filler-runs/{filler_run_id}/active"
         if container_missing:
             path += "?container_missing=true"
-        return await self.get(path, FillerRunActiveResponse, timeout=10)
+        return await self._signed_request("GET", path, FillerRunActiveResponse, timeout=10)
+
+    async def get_storage_operation_active(
+        self, operation_id: str
+    ) -> StorageOperationActiveResponse | None:
+        """Whether the backend still has this storage operation open; None when it did not say."""
+        return await self.get(
+            f"/internal/storage-operations/{operation_id}/active",
+            StorageOperationActiveResponse,
+            timeout=10,
+        )
 
     async def check_executor_health(
         self,
@@ -461,6 +558,8 @@ class BackendClient:
         rental_in_progress: bool = False,
         gpu_uuids: list[str] | None = None,
         cpu_count: int | None = None,
+        loopback_plugin: str | None = None,
+        timeout: int = 300,
     ) -> ExecutorHealthCheckResponse | None:
         """Check executor health via backend API.
 
@@ -480,6 +579,10 @@ class BackendClient:
                 probe with `--cpus=<cpu_count>`, so a host claiming more cores than it physically has
                 is rejected by its own Docker daemon (CPU_QUOTA_EXCEEDS_HOST) rather than only in a
                 paying customer's rent (DAH-2671). None omits the flag.
+            loopback_plugin: The plugin alias this validator creates rental volumes on. The backend
+                probes that plugin; without it (or on an older backend, which ignores it) only the
+                legacy plugin is probed. None omits the field.
+            timeout: Seconds to wait; the backend needs time to SSH and verify the container.
 
         Returns:
             ExecutorHealthCheckResponse if successful, None otherwise
@@ -504,16 +607,29 @@ class BackendClient:
         if cpu_count is not None:
             json_data["cpu_count"] = cpu_count
 
+        if loopback_plugin is not None:
+            json_data["loopback_plugin"] = loopback_plugin
+
         if executor_id:
             json_data["executor_id"] = executor_id
 
-        return await self.post(
-            path,
-            ExecutorHealthCheckResponse,
-            json_data=json_data,
-            add_signature=True,  # Use standard signature headers
-            timeout=300,  # 5 minutes - backend needs time to SSH and verify container
-        )
+        try:
+            # the whole call, retries included: a connection retry must not restart the wait
+            return await asyncio.wait_for(
+                self._signed_request(
+                    "POST",
+                    path,
+                    ExecutorHealthCheckResponse,
+                    json_data=json_data,
+                    timeout=timeout,
+                ),
+                timeout,
+            )
+        except TimeoutError:
+            logger.error(
+                _m("Executor health check timeout", extra=get_extra_info({"path": path, "timeout": timeout}))
+            )
+            return None
 
     async def report_verification_started(
         self, *, job_batch_id: str, miner_hotkey: str, executor_uuids: list[str], started_at: datetime
@@ -548,7 +664,8 @@ class BackendClient:
         for start in range(0, len(uuids), VERIFICATION_STARTED_BATCH_MAX):
             chunk = uuids[start : start + VERIFICATION_STARTED_BATCH_MAX]
             try:
-                await self.post(
+                await self._signed_request(
+                    "POST",
                     path,
                     VerificationStartedResponse,
                     json_data={
@@ -557,7 +674,6 @@ class BackendClient:
                         "started_at": started_at.isoformat(),
                         "executor_uuids": chunk,
                     },
-                    add_signature=True,
                     timeout=10,
                     non_200_log_level=logging.WARNING,
                 )
@@ -582,11 +698,11 @@ class BackendClient:
         config. Never raises — a reporting failure must not disturb the pipeline.
         """
         try:
-            await self.post(
+            await self._signed_request(
+                "POST",
                 "/v1/nvml-driver/report-unknown",
                 NvmlReportAckResponse,
                 json_data={"driver_version": driver_version},
-                add_signature=True,
                 timeout=10,
             )
         except Exception as exc:
@@ -609,6 +725,17 @@ class BackendClient:
         """The vector to submit this tempo; None when the backend is unreachable."""
         path = f"/validator/{self.keypair.ss58_address}/settled-weights?tempo_index={tempo_index}&tempo_blocks={tempo_blocks}"
         return await self._signed_request("GET", path, SettledWeights)
+
+    async def report_live_weights(self, inclusion_block: int, cycle_ids: list[str]) -> LiveWeightsReceipt | None:
+        """Live weights this validator put on chain (settlement shadow or off) and the cycles summed into them, so the
+        backend credits the epochs they pay to those cycles, not to the last settled window."""
+        return await self._signed_request(
+            "POST",
+            f"/validator/{self.keypair.ss58_address}/live-weights",
+            LiveWeightsReceipt,
+            json_data={"inclusion_block": inclusion_block, "cycle_ids": cycle_ids},
+            raise_on_4xx=True,
+        )
 
     async def report_settled_weights_result(self, tempo_index: int, inclusion_block: int) -> SettledWeightsResult | None:
         path = f"/validator/{self.keypair.ss58_address}/settled-weights/{tempo_index}/result"

@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import dataclasses
 import json
 import os
 import time
@@ -6,9 +8,10 @@ from datetime import UTC, datetime
 
 from clients.backend_client import BackendClient, BackendRejected
 from clients.subtensor_client import ProviderPortalDataUnavailable, SubtensorClient
+from core.loop_sampler import start_loop_sampler
 from core.settlement import cycle_node_shares, share_moved, tempo_index
 from incentive.burn_service import verified_burner_hotkey
-from incentive.eligibility import is_missing_discord_after_cutoff
+from incentive.eligibility import earns_spot_rental_incentive, is_missing_discord_after_cutoff
 from incentive.factory import IncentiveFactory
 from incentive.rental_price import precompute_all_estimates
 from payload_models.payloads import MinerJobRequestPayload
@@ -18,13 +21,21 @@ from services.default_docker_image_digest_service import (
     fetch_executor_image_digest,
 )
 from services.docker_service import DockerService
-from services.executor_image_policy import build_expected_image_snapshot
+from services.executor_image_policy import build_expected_image_snapshot, normalize_sha256_digest
 from services.executor_rollout import (
     ROLLOUT_GRACE,
     ExecutorRolloutTracker,
     RolloutWindow,
     WithheldVerdict,
+    carry_renter_gpu_reset_results,
+    has_renter_gpu_reset_holds,
+    remember_rented_scored_results,
+    has_rental_change_candidates,
+    withhold_rental_change_verdicts,
+    withhold_renter_gpu_reset_verdicts,
     withhold_rollout_verdicts,
+    session_kept_hotkeys,
+    withhold_session_lost_verdicts,
 )
 from services.executor_connectivity.container_runner import ContainerRunner
 from services.executor_connectivity.dind_probe import DindProbe, DindVerifier
@@ -32,6 +43,7 @@ from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
 from services.executor_connectivity.port_probe import PortProbe
 from services.executor_connectivity.port_selector import PortSelector
 from services.executor_connectivity.port_tester import PortTester
+from services.executor_connectivity.external_probe import external_port_probe
 from services.executor_connectivity.port_verifiers import BatchVerifier, FallbackVerifier, SemiBatchVerifier
 from services.executor_connectivity_service import ExecutorConnectivityService
 from services.file_encrypt_service import FileEncryptService
@@ -44,8 +56,9 @@ from services.redis_service import (
 )
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.pod_ssh_probe import attach_pod_ssh, pod_ssh_only_results, probe_rented_pods
-from services.task.availability import silence_availability_errors_on_our_own_outage
-from services.task.checks.duplicate_executor import keep_one_miner_per_executor
+from services.rented_pod_watch import RentedPodWatch
+from services.task.availability import RunningOutageTally, silence_availability_errors_on_our_own_outage
+from services.task.checks.duplicate_executor import keep_one_executor_per_gpu, keep_one_miner_per_executor
 from services.task.checks.verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 from services.task_service import JobResult, TaskService
 from services.verifyx_validation_service import NETWORK_GATE_TALLY, VerifyXValidationService
@@ -58,6 +71,9 @@ from services.ssh_service import SSHService
 logger = get_logger(__name__)
 
 SYNC_CYCLE = 12
+# DAH-6011: on a rollout's SIGTERM the running cycle may finish for this long; the pod's
+# terminationGracePeriodSeconds must be longer, or the kubelet's SIGKILL still cuts the cycle.
+STOP_CYCLE_WAIT_SECONDS = 25 * 60
 WEIGHT_MAX_COUNTER = 6
 MINER_SCORES_KEY = "miner_scores"
 # accepted submissions whose inclusion the backend has not acknowledged yet, {tempo_index: block}, each retried
@@ -65,6 +81,10 @@ MINER_SCORES_KEY = "miner_scores"
 PENDING_INCLUSION_KEY = "settlement_pending_inclusion"
 # cycle reports the backend has not acknowledged yet, replayed every cycle until it does
 UNACKED_CYCLE_REPORTS_KEY = "settlement_unacked_cycle_reports"
+# DAH-4001: the cycles summed into miner_scores since the last live submission, and live submissions not yet
+# acknowledged by the backend
+LIVE_CYCLE_IDS_KEY = "settlement_live_cycle_ids"
+UNACKED_LIVE_WEIGHTS_KEY = "settlement_unacked_live_weights"
 UNACKED_CYCLE_REPORTS_MAX = 200
 # one cycle's settlement HTTP (kept reports, pending inclusions, this cycle's report) is cut off past this, retries
 # included, so a slow backend cannot hold up the cycle; what was not delivered stays in Redis for the next cycle
@@ -94,6 +114,7 @@ def settle_cycle_results(
             for executor_id, rented in (rented_executors.executors if rented_executors else {}).items()
         }
         keep_one_miner_per_executor(all_job_results, default_extra, rental_hotkeys)
+        keep_one_executor_per_gpu(all_job_results, default_extra)
     except Exception as exc:
         logger.error(
             _m("[sync] Duplicate-executor pass failed; results left as they are", extra=get_extra_info({**default_extra, "error": str(exc)})),
@@ -106,19 +127,25 @@ def settle_cycle_results(
                 job_result.gpu_model
                 and job_result.gpu_count
                 and (job_result.score > 0 or job_result.job_score > 0)
-                and not job_result.is_spot
+                and (not job_result.is_spot or earns_spot_rental_incentive(job_result))
                 and not is_missing_discord_after_cutoff(job_result)
                 and not (
                     job_result.is_new_rentals_paused and not job_result.is_rented
                 )
+                and not job_result.is_in_maintenance
             ):
                 total_gpu_model_count_map[job_result.gpu_model] = total_gpu_model_count_map.get(job_result.gpu_model, 0) + job_result.gpu_count
     return total_gpu_model_count_map
 
 
 def specs_to_publish(results: list[JobResult]) -> list[JobResult]:
-    """All but a zeroed duplicate under the keeper's own executor UUID: that backend row hears the keeper."""
-    return [result for result in results if not result.duplicate_shares_kept_row]
+    """All but a zeroed duplicate under the keeper's own executor UUID (that backend row hears the keeper) and a
+    result carried over a renter GPU reset (the backend keeps the row it has)."""
+    return [
+        result
+        for result in results
+        if not result.duplicate_shares_kept_row and not result.carried_for_renter_gpu_reset
+    ]
 
 
 class Validator:
@@ -134,6 +161,7 @@ class Validator:
         self.first_cycle_started_at: datetime | None = None
 
         self.miner_scores = {}
+        self.live_cycle_ids: list[str] = []
         # Hotkeys with at least one live executor in the last completed cycle. Rebuilt
         # every cycle, never persisted — set_weights floors them to u16=1.
         self.active_hotkeys: set[str] = set()
@@ -170,7 +198,7 @@ class Validator:
             orchestrator=ConnectivityOrchestrator(
                 PortSelector(),
                 PortProbe(
-                    BatchVerifier(port_tester, runner),
+                    BatchVerifier(port_tester, runner, external_port_probe()),
                     SemiBatchVerifier(port_tester, runner),
                     FallbackVerifier(port_tester, runner),
                 ),
@@ -182,6 +210,7 @@ class Validator:
             ssh_service=ssh_service,
             redis_service=self.redis_service,
             attestation_service=self.attestation_service,
+            backend_client=self.backend_client,
         )
         task_service = TaskService(
             ssh_service=ssh_service,
@@ -206,6 +235,8 @@ class Validator:
             subtensor_client=self.subtensor_client,
             cycle_inputs=self.express_lane_cycle_inputs,
         )
+        # DAH-5215: re-probes rented pods' SSH between cycles; observe only.
+        self.rented_pod_watch = RentedPodWatch(backend_client=self.backend_client)
 
         # the tempo index already submitted (or read, in shadow, or found empty): should_set_weights stays true for a
         # tick or two after a submission, and a second attempt for the same frozen window would be rejected as too fast
@@ -226,6 +257,7 @@ class Validator:
                 self.miner_scores = {}
             else:
                 self.miner_scores = json.loads(miner_scores_json)
+            self.live_cycle_ids = json.loads(await self.redis_service.get(LIVE_CYCLE_IDS_KEY) or "[]")
 
             # remove pod renting-in-progress status
             await self.redis_service.delete(PENDING_PODS_PREFIX)
@@ -251,12 +283,11 @@ class Validator:
         )
 
     def express_lane_cycle_inputs(self) -> CycleInputs | None:
-        """DAH-2958: the express lane runs only once a full cycle has completed since start.
-        That cycle marks validated every executor of every miner that answered it; an executor
-        registered before it began whose miner failed or was offline is not in that set, so the
-        lane also skips everything registered before `fleet_known_since` (the inputs carry it)."""
-        if self.completed_cycles_since_start < 1:
-            return None
+        """DAH-2958: the express lane runs once the first cycle since start has begun (None before).
+        The lane skips everything registered before `fleet_known_since` (that cycle's start, the inputs
+        carry it), so it only ever takes executors no cycle since start could have known; one the running
+        cycle does pick up is in `in_flight` under the cycle lane, which the lane skips. Waiting for that
+        first cycle to finish instead kept new nodes out of the lane 8-14 minutes after every restart."""
         return self.cycle_inputs
 
     async def an_operator_asked_for_a_cycle_now(self) -> bool:
@@ -330,17 +361,37 @@ class Validator:
                             )
                         )
                         self.miner_scores = {}
+                        self.live_cycle_ids = []
                     elif settings.SETTLEMENT_MODE == SETTLEMENT_ENFORCE:
                         # DAH-4001: the accumulator is scored but not submitted; the backend's settled window is
                         await self.submit_settled_window()
                         self.miner_scores = {}
+                        self.live_cycle_ids = []
+                        # a live report left unacknowledged when settlement switched to enforce still goes out
+                        await self.drain_live_weights()
                     else:
-                        live_scores = self.miner_scores
-                        await self.subtensor_client.set_weights(
+                        live_scores, live_cycle_ids = self.miner_scores, self.live_cycle_ids
+                        block_before = self._current_block_or_none()
+                        accepted = await self.subtensor_client.set_weights(
                             miner_scores=live_scores,
                             active_hotkeys=self.active_hotkeys,
+                            wait_for_inclusion=True,
                         )
                         self.miner_scores = {}
+                        self.live_cycle_ids = []
+                        if accepted:
+                            # the block read after it landed, or before it when that read fails, as for a window
+                            block = self._current_block_or_none()
+                            block = block if block is not None else block_before
+                            if block is not None:
+                                await self.report_live_weights(block, live_cycle_ids)
+                            else:
+                                logger.warning(
+                                    _m(
+                                        "[settlement] live weights landed but no block could be read; not reported",
+                                        extra=get_extra_info(self.default_extra),
+                                    )
+                                )
                         # after the live submission: a slow or failing backend must not delay or skip it
                         if settings.SETTLEMENT_MODE == SETTLEMENT_SHADOW:
                             await self.shadow_settled_window(live_scores)
@@ -411,10 +462,32 @@ class Validator:
                     )
                     return
 
+                # A fresh job-files directory for this cycle; the ones an express verification
+                # still reads are kept (DAH-2958). The express lane uses the new one from here on.
+                # Built before the cycle and the rollout window count: a failed build (obfuscator exit) retries next tick.
+                # keep the published inputs' directory too: an express tick reads it until the new inputs are published below
+                keep = self.express_lane.directories_in_use()
+                if self.cycle_inputs is not None:
+                    keep.add(self.cycle_inputs.encrypted_files.tmp_directory)
+                encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files(keep_directories=keep)
+
                 # DAH-3405: a push between two cycles opens the grace window here, after the last
                 # early return and before the first job of this cycle runs against the new digest,
                 # so an aborted iteration does not count as a cycle of the window.
                 rollout_window = await self.observe_executor_rollout(executor_digest, job_block)
+                if rollout_window.previous_reads_current(job_block):
+                    # DAH-6560: no OUTDATED mark for the release Watchtower is still rolling out (8 cycles;
+                    # the verdict-withholding window above stays at its own 2-cycle cap)
+                    executor_image_snapshot = dataclasses.replace(
+                        executor_image_snapshot,
+                        rollout_previous_digest=normalize_sha256_digest(rollout_window.previous_digest),
+                    )
+                earlier = rollout_window.earlier_reading_current(job_block)
+                if earlier:
+                    executor_image_snapshot = dataclasses.replace(
+                        executor_image_snapshot,
+                        rollout_earlier_digests=tuple(filter(None, map(normalize_sha256_digest, earlier))),
+                    )
 
                 logger.info(
                     _m(
@@ -434,26 +507,60 @@ class Validator:
                 if cycle_asked_for_now:
                     # Cleared here and not at the read: every return above this line means no
                     # cycle started, and the operator's request must survive to the next tick.
-                    await self.redis_service.clear_forced_validation_cycle_request()
+                    try:
+                        await self.redis_service.clear_forced_validation_cycle_request()
+                    except Exception as exc:
+                        # the cycle has started and its job files are built; a lost clear only means one more forced cycle
+                        logger.error(
+                            _m(
+                                "[sync] Failed to clear the forced validation cycle request",
+                                extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                            ),
+                        )
 
-                if self.first_cycle_started_at is None:
+                first_cycle = self.first_cycle_started_at is None
+                if first_cycle:
                     self.first_cycle_started_at = datetime.now(UTC)
-                # A fresh job-files directory for this cycle; the ones an express verification
-                # still reads are kept (DAH-2958). The express lane uses the new one from here on.
-                encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files(
-                    keep_directories=(
-                        self.express_lane.directories_in_use() if settings.EXPRESS_LANE_ENABLED else ()
-                    )
-                )
                 self.cycle_inputs = CycleInputs(
                     encrypted_files=encrypted_files,
                     default_image_digests=default_image_digests,
                     executor_image_snapshot=executor_image_snapshot,
                     job_batch_id=job_batch_id,
                     fleet_known_since=self.first_cycle_started_at,
+                    maintenance_ends={
+                        executor_id: window.expiring_at
+                        for executor_id, window in (
+                            rented_executors.maintenance_windows_by_executor if rented_executors else {}
+                        ).items()
+                    },
                 )
                 self.miner_service.start_awaiting_wave_lists(
                     job_batch_id, [miner.hotkey for miner in miners]
+                )
+                if first_cycle and not settings.DRY_RUN:
+                    # Queue the nodes a restart cut off before this wave asks their miners, or the
+                    # wave takes them (minutes slower). The lane launches once each list is in.
+                    try:
+                        await self.express_lane.tick()
+                    except Exception as exc:
+                        logger.error(
+                            _m(
+                                "[express] Restart queue pass failed",
+                                extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                            ),
+                        )
+                # DAH-5635: a fresh running share per cycle. None inside an executor rollout window,
+                # where the cycle withholds an unreachable verdict that an early publish would leak.
+                self.miner_service.outage_tally = (
+                    None
+                    if rollout_window.covers(job_block)
+                    else RunningOutageTally(
+                        job_batch_id,
+                        frozenset(
+                            str(executor_id).lower()
+                            for executor_id in (rented_executors.executors if rented_executors else {})
+                        ),
+                    )
                 )
                 # every listed rented pod's SSH (any status), probed once while the miners work
                 pod_ssh_probe = asyncio.create_task(self.probe_rented_pod_ssh(rented_executors, job_batch_id))
@@ -463,7 +570,7 @@ class Validator:
                 # request jobs
                 jobs = [
                     asyncio.create_task(
-                        self.miner_service.request_job_to_miner(
+                        self.request_wave_job(
                             payload=MinerJobRequestPayload(
                                 job_batch_id=job_batch_id,
                                 miner_hotkey=miner.hotkey,
@@ -575,6 +682,12 @@ class Validator:
                             )
                             task.cancel()
 
+                    # DAH-4658: before the duplicate pass and the GPU count, so a carried result counts in both
+                    # DAH-6564: one cycle-end read of the rented list, shared by the carry and the rental-change rule
+                    rented_at_end = await self.rented_at_cycle_end(all_job_results)
+                    await self.carry_scores_over_renter_gpu_resets(
+                        all_job_results, rented_executors, miner_coldkeys, rented_at_end
+                    )
                     total_gpu_model_count_map = settle_cycle_results(
                         all_job_results,
                         {**self.default_extra, "job_batch_id": job_batch_id},
@@ -605,8 +718,9 @@ class Validator:
                     )
 
                     all_job_results, withheld_results = await self.withhold_verdicts_for_rollout(
-                        all_job_results, job_block, job_batch_id, rollout_window
+                        all_job_results, job_block, job_batch_id, rollout_window, rented_executors, rented_at_end
                     )
+                    await remember_rented_scored_results(all_job_results, self.redis_service)
 
                     # DAH-2622: a miner whose machine passed validation must keep its UID even
                     # when it earned nothing this cycle. Overwrite, never accumulate. A miner with a
@@ -617,7 +731,7 @@ class Validator:
                         miner_hotkey
                         for miner_hotkey, results in all_job_results.items()
                         if any(result.is_successful or result.duplicate_kept_by for result in results)
-                    } | {withheld.miner_hotkey for withheld in withheld_results}
+                    } | session_kept_hotkeys(withheld_results)
 
                     incentive = IncentiveFactory.create(
                         config=self.incentive,
@@ -665,7 +779,6 @@ class Validator:
 
                     # PHASE 2: Calculate final weights with burning logic per cycle
                     miners = await self.subtensor_client.get_miners()
-                    last_mechanism_step_block = self.subtensor_client.get_last_mechansim_step_block()
 
                     # Current subnet epoch for the referral feed's staleness guard. This MUST use
                     # the SAME numbering as the backend feed's epoch_index — see
@@ -688,7 +801,6 @@ class Validator:
 
                     cycle_scores = await incentive.calculate_final_weights(
                         miners=miners,
-                        last_mechanism_step_block=last_mechanism_step_block,
                         current_epoch=current_epoch,
                     )
 
@@ -703,6 +815,7 @@ class Validator:
                     # PHASE 3: Accumulate scores with burning applied
                     for miner_hotkey, score in cycle_scores.items():
                         self.miner_scores[miner_hotkey] = self.miner_scores.get(miner_hotkey, 0) + score
+                    self.live_cycle_ids.append(job_batch_id)
 
                     if settings.SETTLEMENT_MODE != SETTLEMENT_OFF:
                         await self.report_cycle_scores(
@@ -725,19 +838,18 @@ class Validator:
                                 extra={"silenced_results": silenced_count},
                             )
                         )
+                        # DAH-5635: a node published early gets back what the last cycle published for it
+                        if self.miner_service.outage_tally is not None:
+                            published = self.miner_service.cycle_published_availability
+                            for miner_hotkey, results in incentive.job_results.items():
+                                mine = {uuid: e for (hotkey, uuid), e in published.items() if hotkey == miner_hotkey}
+                                self.miner_service.outage_tally.restore_published_early(results, mine)
 
                     # each node's pod SSH observations ride on its result; a probed rented
                     # node the cycle has no result for gets one carrying only them. A withheld
                     # executor has a result this cycle, held back, so it gets none.
                     pod_ssh = await pod_ssh_probe
-                    reported = attach_pod_ssh(incentive.job_results, pod_ssh) | {
-                        str(withheld.result.executor_info.uuid).lower() for withheld in withheld_results
-                    }
-                    result_missing = (
-                        pod_ssh_only_results(rented_executors, pod_ssh, reported, job_batch_id)
-                        if settings.RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED
-                        else {}
-                    )
+                    with_result = attach_pod_ssh(incentive.job_results, pod_ssh)
 
                     # Publish machine specs
                     published_executor_ids: list[str] = []
@@ -755,9 +867,22 @@ class Validator:
                                 if result.executor_info.uuid != FAILED_MINER_EXECUTOR_UUID
                             )
 
+                    # built after the spec publish awaits: an express pass landing meanwhile must count too
+                    reported = (
+                        with_result
+                        | {str(withheld.result.executor_info.uuid).lower() for withheld in withheld_results}
+                        # the express lane's result under this cycle's id stands: no observations-only one over it
+                        | {
+                            uuid
+                            for uuid, batch in self.miner_service.express_published.items()
+                            if batch == job_batch_id
+                        }
+                    )
+                    result_missing = pod_ssh_only_results(rented_executors, pod_ssh, reported, job_batch_id)
                     # Not the whole miner's batch, not scored: no scored_at, and not "validated" for
                     # the express lane below.
                     await self.publish_result_missing(result_missing, miners, miner_coldkeys, job_batch_id)
+                    await self.publish_session_lost_findings(withheld_results, miner_coldkeys, pod_ssh)
 
                     # DAH-3405: a withheld executor was handled by this cycle too — the express
                     # lane must not treat it as never validated and run a first pass on it.
@@ -765,21 +890,20 @@ class Validator:
                         withheld.result.executor_info.uuid for withheld in withheld_results
                     )
 
-                    if settings.EXPRESS_LANE_ENABLED:
-                        # DAH-2958: everything published by a cycle is "validated" for the
-                        # express lane; only what the portal lists beyond this set is new.
-                        # Never lets a Redis blip end the cycle: the next cycle seeds again, and
-                        # the wave's CYCLE_DONE claims keep the lane off those executors until then.
-                        try:
-                            await self.redis_service.mark_executors_validated(published_executor_ids)
-                            self.miner_service.forget_cycle_done()
-                        except Exception as exc:
-                            logger.error(
-                                _m(
-                                    "[sync] Failed to record validated executors for the express lane",
-                                    extra=get_extra_info({**self.default_extra, "error": str(exc)}),
-                                ),
-                            )
+                    # DAH-2958: everything published by a cycle is "validated" for the
+                    # express lane; only what the portal lists beyond this set is new.
+                    # Never lets a Redis blip end the cycle: the next cycle seeds again, and
+                    # the wave's CYCLE_DONE claims keep the lane off those executors until then.
+                    try:
+                        await self.redis_service.mark_executors_validated(published_executor_ids)
+                        self.miner_service.forget_cycle_done()
+                    except Exception as exc:
+                        logger.error(
+                            _m(
+                                "[sync] Failed to record validated executors for the express lane",
+                                extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                            ),
+                        )
 
                     # A cycle with no miners validated nobody, so it keeps the post-restart
                     # warm-up closed: set_weights and the express lane wait for a scored cycle.
@@ -859,6 +983,7 @@ class Validator:
                 await self.redis_service.set(
                     MINER_SCORES_KEY, json.dumps(self.miner_scores)
                 )
+                await self.redis_service.set(LIVE_CYCLE_IDS_KEY, json.dumps(self.live_cycle_ids))
             except Exception as e:
                 logger.warning(
                     _m(
@@ -1028,6 +1153,73 @@ class Validator:
                 await self.redis_service.lrem(UNACKED_CYCLE_REPORTS_KEY, raw)
             except Exception:
                 pass
+
+    async def report_live_weights(self, inclusion_block: int, cycle_ids: list[str]) -> None:
+        """DAH-4001: tell the backend where live weights landed and which cycles they summed, so it credits the epochs
+        they pay to those cycles instead of the last settled window. Kept in Redis before it is sent: a lost report
+        misattributes epochs. Never fails the tempo."""
+        report = {"inclusion_block": inclusion_block, "cycle_ids": cycle_ids}
+        try:
+            await self.redis_service.lpush(UNACKED_LIVE_WEIGHTS_KEY, json.dumps(report).encode())
+        except Exception as exc:
+            logger.error(
+                _m(
+                    "[settlement] could not keep the live weights report; sending it once without replay",
+                    extra=get_extra_info({**self.default_extra, "inclusion_block": inclusion_block, "error": str(exc)}),
+                )
+            )
+            await self._send_live_weights(report)
+            return
+        await self.drain_live_weights()
+        try:
+            # one report per tempo: past the cap during a long outage the oldest go, as for the cycle reports
+            await self.redis_service.ltrim(UNACKED_LIVE_WEIGHTS_KEY, UNACKED_CYCLE_REPORTS_MAX)
+        except Exception:
+            pass
+
+    async def drain_live_weights(self) -> None:
+        """Send the kept live weights reports, oldest first, until one is not taken: after every tempo's submission in
+        every mode, so the first failure costs one request per tempo and never delays a submission."""
+        try:
+            kept = list(reversed(await self.redis_service.lrange(UNACKED_LIVE_WEIGHTS_KEY)))
+        except Exception as exc:
+            logger.warning(
+                _m("[settlement] could not read kept live weights reports", extra=get_extra_info({**self.default_extra, "error": str(exc)}))
+            )
+            return
+        for raw in kept:
+            if not await self._send_live_weights(json.loads(raw)):
+                return
+            try:
+                await self.redis_service.lrem(UNACKED_LIVE_WEIGHTS_KEY, raw)
+            except Exception:
+                pass
+
+    async def _send_live_weights(self, report: dict) -> bool:
+        """Whether the report is done with: taken, or rejected as wrong (keeping it would block every later one)."""
+        try:
+            # bounded like the cycle reports: a hung backend costs one budget per tempo and the report stays kept
+            receipt = await asyncio.wait_for(
+                self.backend_client.report_live_weights(report["inclusion_block"], report["cycle_ids"]),
+                timeout=SETTLEMENT_REPORTING_BUDGET_SECONDS,
+            )
+            return receipt is not None
+        except BackendRejected as exc:
+            logger.error(
+                _m(
+                    "[settlement] live weights report rejected by the backend; dropped",
+                    extra=get_extra_info({**self.default_extra, "error": str(exc), **report}),
+                )
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                _m(
+                    "[settlement] live weights report failed; kept for the next tempo",
+                    extra=get_extra_info({**self.default_extra, "error": str(exc), "inclusion_block": report["inclusion_block"]}),
+                )
+            )
+            return False
 
     def _settlement_burner(self, miners) -> str | None:
         """The verified burner. A test network has none, so our own hotkey stands in; on mainnet a burner that fails
@@ -1273,6 +1465,14 @@ class Validator:
             )
         )
 
+    async def request_wave_job(self, **kwargs) -> dict | None:
+        """One miner's wave request; its new executors that passed are listed now, and its unrented nodes that
+        failed with an availability error are hidden now (DAH-5635), not at the cycle's end."""
+        job = await self.miner_service.request_job_to_miner(**kwargs)
+        await self.miner_service.publish_new_executors_at_pass(job)
+        await self.miner_service.publish_unreachable_early(job)
+        return job
+
     async def probe_rented_pod_ssh(self, rented_executors, job_batch_id: str) -> dict:
         """The cycle's pod SSH observations (services/pod_ssh_probe.py); {} when off or on any error."""
         if not settings.RENTED_POD_SSH_PROBE_ENABLED:
@@ -1383,12 +1583,46 @@ class Validator:
                 grace_cycles=0,
             )
 
+    async def carry_scores_over_renter_gpu_resets(
+        self,
+        all_job_results: dict[str, list[JobResult]],
+        rented_executors: RentedExecutorsResponse | None,
+        miner_coldkeys: dict[str, str | None],
+        rented_now: RentedExecutorsResponse | None,
+    ) -> None:
+        """DAH-4658: only a node the backend still lists as rented carries its score: at the cycle end (`rented_now`),
+        or in this cycle's snapshot when the backend did not answer."""
+        if not has_renter_gpu_reset_holds(all_job_results):
+            return
+        rented = rented_now or rented_executors
+        rented_executor_ids = {str(executor_id).lower() for executor_id in rented.executors} if rented else set()
+        await carry_renter_gpu_reset_results(
+            all_job_results, self.redis_service, rented_executor_ids, rented_executors, miner_coldkeys
+        )
+
+    async def rented_at_cycle_end(
+        self, all_job_results: dict[str, list[JobResult]]
+    ) -> RentedExecutorsResponse | None:
+        """The rented list now, read only when a renter GPU reset hold or a rental-change rule failure needs it.
+        None when not needed or when the backend gives no answer (an exception counts as none)."""
+        if not (has_renter_gpu_reset_holds(all_job_results) or has_rental_change_candidates(all_job_results)):
+            return None
+        try:
+            return await self.backend_client.get_rented_executors_now()
+        except Exception as exc:
+            logger.warning(
+                _m("[sync] Cycle-end rented list unreadable", extra=get_extra_info({**self.default_extra, "error": str(exc)}))
+            )
+            return None
+
     async def withhold_verdicts_for_rollout(
         self,
         all_job_results: dict[str, list[JobResult]],
         job_block: int,
         job_batch_id: str,
         window_at_cycle_start: RolloutWindow,
+        rented_at_start: RentedExecutorsResponse | None = None,
+        rented_at_end: RentedExecutorsResponse | None = None,
     ) -> tuple[dict[str, list[JobResult]], list[WithheldVerdict]]:
         """DAH-3405: at cycle end, take the results the rollout explains out of the cycle.
 
@@ -1401,7 +1635,45 @@ class Validator:
         )
         standing, withheld_results = withhold_rollout_verdicts(all_job_results, window, job_block)
         await self.record_withheld_verdicts(window, withheld_results, job_batch_id, job_block)
-        return standing, withheld_results
+        standing, held_for_gpu_reset = withhold_renter_gpu_reset_verdicts(standing)
+        standing, session_lost = withhold_session_lost_verdicts(standing)
+        rental_changed = []
+        if rented_at_start is not None:
+            tally = self.miner_service.outage_tally
+            standing, rental_changed = await withhold_rental_change_verdicts(
+                standing, rented_at_start, rented_at_end, self.redis_service, tally.published_early if tally else set()
+            )
+        return standing, withheld_results + held_for_gpu_reset + session_lost + rental_changed
+
+    async def publish_session_lost_findings(
+        self,
+        withheld_results: list[WithheldVerdict],
+        miner_coldkeys: dict[str, str | None],
+        pod_ssh: dict[str, list] | None = None,
+    ) -> None:
+        """DAH-5718: a run whose session died in the port check has no score, but what its finished checks found (a
+        GPU safety failure) still hides the node, and its rented pods' SSH observations still go out (review
+        4470167895: billing reads a silent pod from them). Unscored (scored_at None) and not the miner's whole batch,
+        like an early publish; with no finding availability_errors stays None, so the stored reasons are left alone.
+        A finding goes out alone: the backend merges a session-lost report by reason code, and a validator-side copy
+        of the earlier list goes stale (an express recheck clears a hold; review 4510532986). A run with neither
+        publishes nothing."""
+        pod_ssh = pod_ssh or {}
+        for withheld in withheld_results:
+            result = withheld.result
+            executor_uuid = str(result.executor_info.uuid).lower()
+            miner_coldkey = miner_coldkeys.get(withheld.miner_hotkey)
+            if not result.session_lost_in_port_check or not miner_coldkey:
+                continue
+            result.pod_ssh = pod_ssh.get(executor_uuid, result.pod_ssh)
+            if not result.availability_errors:
+                result.availability_errors = None  # no finding: None leaves the stored reasons alone
+            # review 4482976707: a reaped container's state (StaleContainerCleanupCheck) goes out too
+            if not result.availability_errors and not result.pod_ssh and not result.pod_states:
+                continue
+            await self.miner_service.publish_machine_specs(
+                [result], withheld.miner_hotkey, miner_coldkey, is_whole_miner_batch=False
+            )
 
     async def record_withheld_verdicts(
         self,
@@ -1448,19 +1720,26 @@ class Validator:
         )
         try:
             await self.initiate_services()
-            self.should_exit = False
 
-            if settings.EXPRESS_LANE_ENABLED and not settings.DRY_RUN:
+            if not settings.DRY_RUN:
                 # DAH-2958: ticks beside the cycle on this loop; coordination through
-                # MinerService.in_flight. Flag off: the task is never created.
+                # MinerService.in_flight.
                 self.express_lane_task = asyncio.create_task(
                     self.express_lane.run(lambda: self.should_exit)
                 )
+                if settings.RENTED_POD_WATCH_INTERVAL_SECONDS > 0:
+                    self.rented_pod_watch_task = asyncio.create_task(
+                        self.rented_pod_watch.run(lambda: self.should_exit)
+                    )
+                # which code saturates the loop the lane shares with the wave (core/loop_sampler.py)
+                self.loop_sampler_stop = start_loop_sampler()
 
             while not self.should_exit:
                 await self.sync()
-                self.should_exit = settings.DRY_RUN
-                if not settings.DRY_RUN:
+                # DAH-6011: only set, never cleared here, so a shutdown that lands mid-cycle ends the loop
+                if settings.DRY_RUN:
+                    self.should_exit = True
+                else:
                     await asyncio.sleep(SYNC_CYCLE)
 
         except KeyboardInterrupt:
@@ -1479,6 +1758,25 @@ class Validator:
                 ),
             )
 
+    async def finish_running_cycle(self, task: asyncio.Task, wait_seconds: float = STOP_CYCLE_WAIT_SECONDS) -> bool:
+        """DAH-6011: no new cycle starts, and the running one (if any) finishes, within `wait_seconds`.
+        Past it the cycle is cancelled. True when it finished."""
+        self.should_exit = True
+        try:
+            await asyncio.wait_for(asyncio.shield(task), wait_seconds)
+            return True
+        except TimeoutError:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            logger.warning(
+                _m(
+                    "[stop] Running cycle did not finish in time; cancelled",
+                    extra=get_extra_info({**self.default_extra, "wait_seconds": wait_seconds}),
+                ),
+            )
+            return False
+
     async def stop(self):
         logger.info(
             _m(
@@ -1488,6 +1786,8 @@ class Validator:
         )
 
         self.should_exit = True
+        if getattr(self, "loop_sampler_stop", None) is not None:
+            self.loop_sampler_stop.set()
 
         # Cleanup subtensor client
         if hasattr(self, 'subtensor_client'):
@@ -1495,6 +1795,7 @@ class Validator:
 
         try:
             await self.redis_service.set(MINER_SCORES_KEY, json.dumps(self.miner_scores))
+            await self.redis_service.set(LIVE_CYCLE_IDS_KEY, json.dumps(self.live_cycle_ids))
         except Exception as e:
             logger.info(
                 _m(

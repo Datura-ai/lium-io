@@ -19,7 +19,7 @@ ARTIFACTS := $(CURDIR)/artifacts
 WAIT_TIMEOUT ?= 300
 ifeq ($(E2E_GPU),)
   COMPOSE_FILES := -f docker-compose.e2e.yml
-  # the executor host's dockerd (rental containers land there); the pod image is built onto it in `seed`
+  # the executor host's dockerd (rental containers land there); `seed` loads the host-built pod image onto it
   EXECUTOR_DOCKER := docker -H tcp://127.0.0.1:23750
 else
   # GPU host: the executor runs on THIS machine's dockerd (docker-compose.gpu.yml) and is reached at the network gateway;
@@ -53,8 +53,11 @@ build:
 ifeq ($(E2E_CACHE),)
 	$(COMPOSE) build
 	$(COMPOSE) --profile tools build tester
+	docker build --progress=plain -t $(E2E_POD_IMAGE) pod
 else
 	docker buildx bake $(COMPOSE_FILES) --allow=fs.read=.. --load $(BAKE_CACHE)
+	docker buildx build --progress=plain --load --cache-from type=$(E2E_CACHE),scope=e2e-pod \
+	  --cache-to type=$(E2E_CACHE),scope=e2e-pod,mode=max,ignore-error=true -t $(E2E_POD_IMAGE) pod
 endif
 
 up:
@@ -62,12 +65,15 @@ up:
 	$(MAKE) seed
 
 # ready = every healthcheck green (compose --wait above) + the miner knows the executor + the rental image is on the
-# executor host's daemon. `seed` is idempotent (ON CONFLICT DO NOTHING; build is cached).
+# executor host's daemon. `seed` is idempotent (ON CONFLICT DO NOTHING; the load replaces the same tag). The pod image
+# is built on the host in `build` (cached in CI) and copied in: a build inside dind pulled ubuntu + apt every run.
 seed:
 	$(COMPOSE) exec -T miner-db psql -qU postgres -d miner -v ON_ERROR_STOP=1 \
 	  -v live_uuid=$(E2E_EXECUTOR_UUID) -v live_ip=$(E2E_EXECUTOR_IP) -v dead_uuid=$(E2E_DEAD_EXECUTOR_UUID) -v dead_ip=$(E2E_DEAD_EXECUTOR_IP) \
 	  -v port=$(E2E_EXECUTOR_PORT) -v validator=$(E2E_VALIDATOR_HOTKEY) < miner/seed.sql
-	$(EXECUTOR_DOCKER) build -q -t $(E2E_POD_IMAGE) pod >/dev/null
+ifeq ($(E2E_GPU),)
+	docker save $(E2E_POD_IMAGE) | $(EXECUTOR_DOCKER) load -q
+endif
 	@echo "seeded: 2 executor rows for $(E2E_VALIDATOR_HOTKEY); $(E2E_POD_IMAGE) on the executor host"
 
 test: test-protocol test-cycle test-rental

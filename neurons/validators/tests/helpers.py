@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -132,6 +134,9 @@ class FakeRedis:
         # it sits inside write_atomically
         self.fail_delete_of: set[str] = set()
         self.calls = 0
+        # request_executor_recheck_once: executor ids queued, and the ones still inside their window
+        self.recheck_requests: list[str] = []
+        self.recheck_claims: set[str] = set()
 
     def _touch(self):
         self.calls += 1
@@ -141,6 +146,10 @@ class FakeRedis:
     async def get(self, key: str):
         self._touch()
         return self.store.get(key)
+
+    async def mget(self, keys: list[str]):
+        self._touch()
+        return [self.store.get(key) for key in keys]
 
     def _set_hook(self, key: str):
         if key in self.fail_next_set_of:
@@ -152,11 +161,26 @@ class FakeRedis:
                 raise redis.exceptions.TimeoutError(f"Timeout writing {key}")
             self.fail_set_of_after[key] -= 1
 
+    async def request_executor_recheck_once(self, executor_id: str, ttl_seconds: int) -> bool:
+        self._touch()
+        if executor_id in self.recheck_claims:
+            return False
+        self.recheck_claims.add(executor_id)
+        self.recheck_requests.append(executor_id)
+        return True
+
     async def set(self, key: str, value: str, ex: int | None = None):
         self._touch()
         self._set_hook(key)
         self.store[key] = value
         self.ttl[key] = ex
+
+    async def pttl(self, key: str) -> int:
+        self._touch()
+        if key not in self.store:
+            return -2
+        ttl = self.ttl.get(key)
+        return -1 if ttl is None else ttl * 1000
 
     async def write_atomically(self, writes):
         """`RedisService.write_atomically`: all of `writes` or none. `fail_delete_of` names keys whose
@@ -217,10 +241,35 @@ class FakeRedis:
         for field in fields:
             self.hashes.get(key, {}).pop(field, None)
 
+    async def _update_pending_pods(self, miner_hotkey: str, executor_id: str, change, also=None):
+        """`RedisService._update_pending_pods`: read, change and write with no await between, so atomic here;
+        `also()` first, so a batch that fails applies none of it"""
+        import json
+
+        from neurons.validators.src.services.redis_service import PENDING_PODS_PREFIX, _parse_pending_pods
+
+        self._touch()
+        field = f"{miner_hotkey}:{executor_id}"
+        pending_pods = change(_parse_pending_pods(self.hashes.get(PENDING_PODS_PREFIX, {}).get(field)))
+        if also:
+            await self.write_atomically(also())
+        if pending_pods:
+            self.hashes.setdefault(PENDING_PODS_PREFIX, {})[field] = json.dumps(pending_pods)
+        else:
+            self.hashes.get(PENDING_PODS_PREFIX, {}).pop(field, None)
+
     async def expire(self, key: str, seconds: int):
         self._touch()
         if key in self.store or key in self.hashes:
             self.ttl[key] = seconds
+
+    async def persist(self, key: str):
+        self._touch()
+        self.ttl.pop(key, None)
+
+    @asynccontextmanager
+    async def rented_gpu_drop_lock(self, pod_id: str):
+        yield None if self.failing else True
 
 
 def default_executor() -> ExecutorSSHInfo:
@@ -249,8 +298,6 @@ def build_context_config(**overrides) -> ContextConfig:
         max_gpu_count=None,
         gpu_model_rates={},
         nvml_digest_map={},
-        verifyx_enabled=False,
-        inspector_enabled=False,
         port_private_key=None,
         port_public_key=None,
         job_batch_id="batch-1",
@@ -263,6 +310,8 @@ def build_services(**overrides) -> ContextServices:
     pod_recovery = AsyncMock()
     # A bare AsyncMock would report every pod as recovered; opt in per test instead.
     pod_recovery.recover_pod_after_stale_vloopback_mount.return_value = False
+    pod_recovery.recover_parked_pod_container.return_value = False
+    pod_recovery.encrypted_volume_mount_missing.return_value = False
     backend = AsyncMock()
     # A bare AsyncMock would confirm every Lium-named container as ours (DAH-2757); opt in per test.
     backend.get_filler_run_active.return_value = FillerRunActiveResponse(active=False)
@@ -398,3 +447,22 @@ def assert_rental_price_incentive_log_full_content(full_log_text: str) -> None:
         RENTAL_PRICE_INCENTIVE_LOG_MESSAGE in full_log_text
     ), f"Expected rental price incentive message not found in full_log_text"
     assert_log_contains_keys(full_log_text, RENTAL_PRICE_INCENTIVE_EXTRA_KEYS)
+
+
+def shared_pod_start_stop_lock(locks: dict[str, asyncio.Lock]):
+    """RedisService.pod_start_stop_lock for a Mock Redis service: one lock per slot across every DockerService given
+    this function, as the validator and the connector share Redis."""
+
+    @asynccontextmanager
+    async def pod_start_stop_lock(slot: str):
+        async with locks.setdefault(slot, asyncio.Lock()):
+            yield True
+
+    return pod_start_stop_lock
+
+
+@asynccontextmanager
+async def no_host_start_lock(*args):
+    """DockerService._hold_pod_start_host_lock for doubles that model no host shell: the host lock is tested on its
+    own with a real shell (test_docker_service: the fenced stop and its hold command)."""
+    yield

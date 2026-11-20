@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import logging
+from pathlib import Path
 from typing import Optional, Tuple
 
 from dstack_sdk import AsyncDstackClient
@@ -16,7 +17,9 @@ class TDXQuoteService:
     def __init__(self) -> None:
         from core.config import settings
 
-        self.enabled: bool = bool(settings.ENABLE_TDX_ATTESTATION)
+        # a quote exists only inside a dstack CVM (its guest socket); is_socket, not exists:
+        # on bare metal a Docker bind mount creates the missing path as a directory
+        self.enabled: bool = Path(settings.DSTACK_SOCKET_PATH).is_socket()
         self.timeout: int = settings.TDX_QUOTE_TIMEOUT
         self._cached_report_data: Optional[str] = None
         self._cached_quote: Optional[str] = None

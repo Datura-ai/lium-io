@@ -1,27 +1,20 @@
 """DAH-2265 — CachedTemplateVerificationCheck.
 
 Verifies the executor has the recommended default image pre-pulled, publishing the
-result to executor.specs (via pipeline state) and a structured event. Before
-``settings.CACHED_TEMPLATE_CUTOFF`` it is advisory (never fails / changes score); on/after
-the cutoff the two bad signals (not cached, stale digest) fail verification. It must fail
-open on every uncertainty regardless of the cutoff.
-
-An autouse fixture pins the cutoff to the future by default so the advisory-mode assertions
-are wall-clock-independent; cutoff-enforcement tests opt in with ``_set_cutoff(active=True)``.
+result to executor.specs (via pipeline state) and a structured event. The two bad signals
+(not cached, stale digest) fail verification. It must fail open on every uncertainty.
 """
 
 import asyncio
 import json
-import logging
 import time
-from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fakeredis import FakeServer
 from fakeredis.aioredis import FakeRedis
 
-from core.config import Settings, settings
+from core.config import settings
 from neurons.validators.src.services.task.checks.cached_template_verification import (
     CachedTemplateVerificationCheck,
     _remediation_from_prefetch_state,
@@ -89,20 +82,6 @@ def _config_with_digests(digest_map: dict[str, str]):
     return build_context_config(default_docker_image_digests=digest_map)
 
 
-@pytest.fixture(autouse=True)
-def _advisory_by_default(monkeypatch):
-    # Pin every test to BEFORE the cutoff (advisory mode) so assertions are independent of the
-    # wall clock. Cutoff-enforcement tests opt in with _set_cutoff(active=True).
-    monkeypatch.setattr(
-        settings, "CACHED_TEMPLATE_CUTOFF", datetime.utcnow() + timedelta(days=365)
-    )
-
-
-def _set_cutoff(monkeypatch, *, active: bool) -> None:
-    cutoff = datetime.utcnow() - timedelta(days=1) if active else datetime.utcnow() + timedelta(days=1)
-    monkeypatch.setattr(settings, "CACHED_TEMPLATE_CUTOFF", cutoff)
-
-
 def test_check_is_fatal():
     # The gate is live: a passed=False result on/after the cutoff halts the pipeline (score 0).
     assert CachedTemplateVerificationCheck.fatal is True
@@ -142,7 +121,7 @@ async def test_image_not_cached_publishes_false(context_factory):
 
     result = await CachedTemplateVerificationCheck().run(ctx)
 
-    assert result.passed is True
+    assert result.passed is False
     assert result.event.reason_code == Msg.NOT_CACHED.reason
     assert result.event.what_we_saw["cached"] is False
     assert result.updates["state"].recommended_image_cached is False
@@ -267,7 +246,7 @@ async def test_digest_mismatch_publishes_false(context_factory):
 
     result = await CachedTemplateVerificationCheck().run(ctx)
 
-    assert result.passed is True
+    assert result.passed is False
     assert result.event.reason_code == Msg.DIGEST_MISMATCH.reason
     assert result.updates["state"].recommended_image_cached is True
     assert result.updates["state"].recommended_image_digest_match is False
@@ -355,7 +334,6 @@ async def test_digest_fails_open_on_unparseable_stdout(context_factory):
 async def test_not_cached_fails_after_cutoff(context_factory, monkeypatch):
     # Image not pre-pulled + after cutoff → fatal fail. The reason rides the event (and thus
     # log_text → provider), the cached signal is still published to specs.
-    _set_cutoff(monkeypatch, active=True)
     ctx = context_factory(
         services=build_services(backend=_backend(images=[_IMAGE])),
         state=build_state(gpu_model=_GPU, specs=_SPECS),
@@ -373,7 +351,6 @@ async def test_not_cached_fails_after_cutoff(context_factory, monkeypatch):
 @pytest.mark.asyncio
 async def test_digest_mismatch_fails_after_cutoff(context_factory, monkeypatch):
     # Stale content under the same tag + after cutoff → fatal fail.
-    _set_cutoff(monkeypatch, active=True)
     ctx = context_factory(
         services=_services([_IMAGE]),
         config=_config_with_digests({_IMAGE_REF: _IMAGE_DIGEST}),
@@ -393,7 +370,6 @@ async def test_digest_mismatch_fails_after_cutoff(context_factory, monkeypatch):
 @pytest.mark.asyncio
 async def test_cached_passes_after_cutoff(context_factory, monkeypatch):
     # Pre-pulled, no backend digest to compare → CACHED, never a fatal fail.
-    _set_cutoff(monkeypatch, active=True)
     ctx = context_factory(
         services=build_services(backend=_backend(images=[_IMAGE])),
         state=build_state(gpu_model=_GPU, specs=_SPECS),
@@ -408,7 +384,6 @@ async def test_cached_passes_after_cutoff(context_factory, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_digest_match_passes_after_cutoff(context_factory, monkeypatch):
-    _set_cutoff(monkeypatch, active=True)
     ctx = context_factory(
         services=_services([_IMAGE]),
         config=_config_with_digests({_IMAGE_REF: _IMAGE_DIGEST}),
@@ -425,7 +400,6 @@ async def test_digest_match_passes_after_cutoff(context_factory, monkeypatch):
 @pytest.mark.asyncio
 async def test_uncertainty_fails_open_after_cutoff(context_factory, monkeypatch):
     # No recommended image from backend → SKIPPED, stays advisory even after the cutoff.
-    _set_cutoff(monkeypatch, active=True)
     ssh = _ssh()
     ctx = context_factory(
         services=build_services(backend=_backend(images=None)),
@@ -443,7 +417,6 @@ async def test_uncertainty_fails_open_after_cutoff(context_factory, monkeypatch)
 @pytest.mark.asyncio
 async def test_digest_skipped_passes_after_cutoff(context_factory, monkeypatch):
     # Cached but RepoDigest unreadable for this repo → DIGEST_SKIPPED, never a fatal fail.
-    _set_cutoff(monkeypatch, active=True)
     ctx = context_factory(
         services=_services([_IMAGE]),
         config=_config_with_digests({_IMAGE_REF: _IMAGE_DIGEST}),
@@ -481,7 +454,6 @@ _PREFETCH_STATE = json.dumps(
 
 def _failing_ctx(context_factory, monkeypatch, ssh):
     """Context that lands on DIGEST_MISMATCH after the cutoff — i.e. the node is zeroed."""
-    _set_cutoff(monkeypatch, active=True)
     return context_factory(
         services=_services([_IMAGE]),
         config=_config_with_digests({_IMAGE_REF: _IMAGE_DIGEST}),
@@ -537,7 +509,6 @@ async def test_prefetch_state_absence_is_itself_a_finding(
 @pytest.mark.asyncio
 async def test_healthy_node_issues_no_extra_ssh_call(context_factory, monkeypatch):
     # Roughly three quarters of checked nodes pass. None of them may pay for this.
-    _set_cutoff(monkeypatch, active=True)
     ssh = _ssh_seq(_result(stdout=_LOCAL_MATCH))
     ctx = context_factory(
         services=_services([_IMAGE]),
@@ -554,21 +525,25 @@ async def test_healthy_node_issues_no_extra_ssh_call(context_factory, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_not_cached_stays_advisory_before_cutoff(context_factory, monkeypatch):
-    # Same bad signal as the fatal test, but before the cutoff → advisory pass, info severity.
-    _set_cutoff(monkeypatch, active=False)
+async def test_a_failed_inspect_is_looked_at_again_before_the_node_is_zeroed(
+    context_factory, monkeypatch
+):
+    stderr = "Error response from daemon: context deadline exceeded"
+    miss = Mock(exit_status=1, stdout="", stderr=stderr)
+    ssh = _ssh_seq(miss, _result(stdout=_LOCAL_MATCH))
     ctx = context_factory(
-        services=build_services(backend=_backend(images=[_IMAGE])),
+        services=_services([_IMAGE]),
+        config=_config_with_digests({_IMAGE_REF: _IMAGE_DIGEST}),
         state=build_state(gpu_model=_GPU, specs=_SPECS),
-        ssh=_ssh(exit_status=1),
+        ssh=ssh,
     )
 
     result = await CachedTemplateVerificationCheck().run(ctx)
 
     assert result.passed is True
-    assert result.event.reason_code == Msg.NOT_CACHED.reason
-    assert result.event.severity != "error"
-    assert result.updates["state"].recommended_image_cached is False
+    assert result.event.reason_code == Msg.DIGEST_MATCH.reason
+    assert ssh.run.await_count == 2
+    assert result.event.what_we_saw["first_inspect_miss"] == {"exit_status": 1, "stderr": stderr}
 
 
 # --- fresh-node grace and the remediation quote ------------------------------------------
@@ -607,16 +582,12 @@ def _fake_redis_service():
     return service
 
 
-def _uncached_ctx(
-    context_factory, monkeypatch, redis, prefetch_doc, *, digests=None, grace_enabled=True
-):
-    _set_cutoff(monkeypatch, active=True)
-    monkeypatch.setattr(settings, "CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED", grace_enabled)
+def _uncached_ctx(context_factory, monkeypatch, redis, prefetch_doc, *, digests=None):
     return context_factory(
         services=build_services(backend=_backend(images=[_IMAGE]), redis=redis),
         config=_config_with_digests(digests or {}),
         state=build_state(gpu_model=_GPU, specs=_SPECS),
-        ssh=_ssh_seq(_result(exit_status=1), _result(stdout=prefetch_doc)),
+        ssh=_ssh_seq(_result(exit_status=1), _result(exit_status=1), _result(stdout=prefetch_doc)),
     )
 
 
@@ -718,54 +689,6 @@ async def test_grace_disabled_fails_a_fresh_node(context_factory, monkeypatch):
     assert "fresh_node_grace" not in result.event.what_we_saw
 
 
-def test_fresh_node_grace_flag_is_off_by_default():
-    assert Settings.model_fields["CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED"].default is False
-
-
-@pytest.mark.asyncio
-async def test_grace_flag_off_fails_a_fresh_node_as_before_and_logs_the_hold(
-    context_factory, monkeypatch, caplog
-):
-    ctx = _uncached_ctx(
-        context_factory, monkeypatch, _fake_redis_service(), _prefetch_doc(), grace_enabled=False
-    )
-
-    with caplog.at_level(logging.INFO):
-        result = await CachedTemplateVerificationCheck().run(ctx)
-
-    assert result.passed is False
-    assert result.event.reason_code == Msg.NOT_CACHED.reason
-    assert result.event.severity == "error"
-    assert set(result.event.what_we_saw) == {
-        "recommended_image",
-        "cached",
-        "digest_match",
-        "backend_digest",
-        "local_digest",
-        "gpu_model",
-        "driver_version",
-        "after_cutoff",
-        "prefetch_state",
-    }
-    assert any("would have been held as pending" in r.getMessage() for r in caplog.records)
-
-
-@pytest.mark.asyncio
-async def test_grace_flag_off_logs_nothing_for_a_node_past_its_grace(
-    context_factory, monkeypatch, caplog
-):
-    redis = _fake_redis_service()
-    ctx = _uncached_ctx(context_factory, monkeypatch, redis, _prefetch_doc(), grace_enabled=False)
-    first_seen = time.time() - settings.CACHED_TEMPLATE_FRESH_NODE_GRACE_SECONDS - 60
-    await redis.redis.set(f"cached_template_first_uncached:{ctx.executor.uuid}", repr(first_seen))
-
-    with caplog.at_level(logging.INFO):
-        result = await CachedTemplateVerificationCheck().run(ctx)
-
-    assert result.passed is False
-    assert not any("would have been held" in r.getMessage() for r in caplog.records)
-
-
 @pytest.mark.asyncio
 async def test_pending_without_a_prefetch_document_says_only_the_time_bound_applies(
     context_factory, monkeypatch
@@ -816,7 +739,6 @@ async def test_not_cached_with_no_named_cause_names_the_pinned_image_to_pull(
 
 
 def _mismatch_ctx(context_factory, monkeypatch, prefetch_read):
-    _set_cutoff(monkeypatch, active=True)
     return context_factory(
         services=build_services(backend=_backend(images=[_IMAGE]), redis=_fake_redis_service()),
         config=_config_with_digests({_IMAGE_REF: _IMAGE_DIGEST}),
@@ -862,8 +784,6 @@ def test_cached_template_messages_carry_no_placeholder():
 @pytest.mark.asyncio
 async def test_digest_mismatch_gets_no_fresh_node_grace(context_factory, monkeypatch):
     redis = _fake_redis_service()
-    _set_cutoff(monkeypatch, active=True)
-    monkeypatch.setattr(settings, "CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED", True)
     ctx = context_factory(
         services=build_services(backend=_backend(images=[_IMAGE]), redis=redis),
         config=_config_with_digests({_IMAGE_REF: _IMAGE_DIGEST}),

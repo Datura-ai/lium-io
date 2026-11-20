@@ -4,7 +4,7 @@ import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field, fields, replace
-from typing import Any, Callable, List, Optional, Protocol, Tuple, runtime_checkable
+from typing import Any, Awaitable, Callable, List, Optional, Protocol, Tuple, runtime_checkable
 
 import asyncssh
 from pydantic import BaseModel, Field
@@ -26,8 +26,12 @@ from services.inspector_validation_service import InspectorValidationService
 from services.container_cleanup import ContainerCleanup
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import PodContainerState
+from .availability import REASONS_THAT_HIDE_AT_ONCE, AvailabilityErrorCode
+from .messages import NodeAccountMessages, RentalVerificationMessages, TenantEnforcementMessages, render_message
 from .models import ValidationEvent
-from .runner import SSHCommandRunner
+from .runner import SSHCommandResult, SSHCommandRunner
+
+logger = logging.getLogger(__name__)
 
 @runtime_checkable
 class PodRecoverer(Protocol):
@@ -39,13 +43,16 @@ class PodRecoverer(Protocol):
     # DAH-3436: the rental probe rents the node through the same two entry points a renter's pod
     # takes (miner_service hands the backend's requests to these), so there is one start path and
     # one teardown path to keep correct. `private_key` is the Fernet-encrypted key as the backend
-    # sends it; both decrypt it themselves.
+    # sends it; both decrypt it themselves. `beside_fillers`: the probe's create on a node running
+    # a filler, which leaves the filler and its GPU power cap alone.
     async def create_container(
         self,
         payload: Any,
         executor_info: ExecutorSSHInfo,
         keypair: Any,
         private_key: str,
+        *,
+        beside_fillers: bool = False,
     ) -> Any: ...
 
     async def delete_container(
@@ -68,6 +75,46 @@ class PodRecoverer(Protocol):
         container_error: str | None,
         default_extra: dict[str, Any],
     ) -> bool: ...
+
+    async def recover_parked_pod_container(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_info: ExecutorSSHInfo,
+        miner_hotkey: str,
+        private_key: str,
+        container_name: str,
+        pod_id: str,
+        local_volume_path: str | None,
+        default_extra: dict[str, Any],
+        stopped_by_recovery: bool = False,
+    ) -> bool: ...
+
+    async def encrypted_volume_mount_missing(
+        self, ssh_client: asyncssh.SSHClientConnection, container_name: str, plaintext_path: str | None
+    ) -> bool: ...
+
+    async def restore_volume_mount_of_running_container(
+        self,
+        *,
+        ssh_client: asyncssh.SSHClientConnection,
+        executor_info: ExecutorSSHInfo,
+        private_key: str | None,
+        container_name: str,
+        pod_id: str,
+        local_volume_path: str | None,
+        default_extra: dict[str, Any],
+    ) -> bool: ...
+
+    async def unmounted_stop_outcome(self, pod_id: str) -> str | None: ...
+
+    async def retry_pending_half_started_stops(
+        self, *, executor_info: ExecutorSSHInfo, private_key: str | None, default_extra: dict[str, Any]
+    ) -> None: ...
+
+    async def forget_recovery_stop(self, pod_id: str) -> None: ...
+
+    async def recovery_stop_pending(self, pod_id: str) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -104,19 +151,25 @@ class ContextConfig:
     # Driver versions already confirmed as spoofs (DAH-2451). The nvml_digest check
     # rejects these without re-reporting them to the backend for verification.
     nvml_invalid_drivers: Optional[list[str]] = None
-    verifyx_enabled: bool = False
-    inspector_enabled: bool = False
     port_private_key: Optional[str] = None
     port_public_key: Optional[str] = None
     job_batch_id: Optional[str] = None
     # DAH-2794: obfuscated scrape source, piped to the executor's interpreter over stdin.
     # None => the legacy path, where the scrape is a binary uploaded by UploadFilesCheck.
     machine_scrape_source: Optional[str] = None
-    # DAH-3011: True only for a never-validated executor's first, unscored verification AND with
-    # FIRST_PASS_FAST_PATH_ENABLED on (resolved in PipelineFactory.build_context). The capability
+    # DAH-3011: True only for a never-validated executor's first, unscored verification
+    # (set in PipelineFactory.build_context). The capability
     # matmul and VerifyX right-size their probes and the bandwidth gate is deferred to the first
     # scored cycle; every other check is the same.
     first_pass: bool = False
+
+
+@dataclass(frozen=True)
+class MemoryHealthRead:
+    """One NVML-only memory read (gpu_memory_health.read_memory_health): the SSH run and its report."""
+
+    run: SSHCommandResult
+    report: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -125,6 +178,9 @@ class ContextState:
     upload_remote_dir: Optional[str] = None
     remote_dir: Optional[str] = None
     specs: dict[str, Any] = field(default_factory=dict)
+    # The normalized scrape document before later checks write into it; None when this cycle used
+    # the liumd document instead of the Python scrape.
+    scrape_specs: dict[str, Any] | None = None
     gpu_model: Optional[str] = None
     gpu_count: Optional[int] = None
     gpu_details: list[dict] = field(default_factory=list)
@@ -136,7 +192,7 @@ class ContextState:
     gpu_uuids: Optional[str] = None
     # DAH-2662: GPU UUIDs as the kernel reports them (/proc/driver/nvidia), read by BannedProviderCheck;
     # None = unreadable or not read; `kernel_gpu_uuids_read_attempted` tells the two apart so a failed read is
-    # attempted once per cycle. Bans match against these too once KERNEL_GPU_BAN_ENFORCEMENT_ENABLED.
+    # attempted once per cycle. Bans match against these too.
     kernel_gpu_uuids: list[str] | None = None
     kernel_gpu_uuids_read_attempted: bool = False
     # mounts that are not procfs at or under /proc/driver/nvidia/gpus ("<mount point> <fstype>");
@@ -156,17 +212,37 @@ class ContextState:
     # `specs["verified_ports"]` keeps only the external side for the backend; the rental probe
     # needs both to hand create_container the ports as the backend would.
     verified_port_pairs: list[tuple[int, int]] = field(default_factory=list)
+    # DAH-5244: this cycle's verified ports and sysbox were republished from the last completed check's memory,
+    # not measured; a consumer that keeps "last good ports" must not store them as fresh.
+    port_check_deferred: bool = False
+    # VerifyXCheck skipped its run for a standing rental-probe failure; RentalProbeCheck then never passes the cycle
+    verifyx_skipped_for_standing_probe_failure: bool = False
+    # CapabilityCheck skipped the enforced all-cards work proof for a standing rental-probe failure; RentalProbeCheck
+    # then never passes the cycle either
+    allcards_skipped_for_standing_probe_failure: bool = False
+    # DAH-5981: the error of this cycle's port probe when the SSH connection dropped mid-probe; None otherwise.
+    # PortCountCheck then reports the lost connection, not a port shortfall it never measured.
+    port_probe_connection_lost: str | None = None
     # DAH-2856: why the DinD probe's container never answered on sshd this cycle (a code and plain
     # words), read from the container's logs; DAH-3634: or why `docker run` refused it (the NVIDIA
     # hook, from docker's stderr). None when the probe passed or the cause is unknown.
     # SysboxRequiredCheck puts it into the SYSBOX_REQUIRED_MISSING event instead of "install sysbox",
-    # and emits the NVIDIA_* reason code in place of SYSBOX_REQUIRED_MISSING for an NVIDIA_* cause.
+    # and emits the NVIDIA_* reason code in place of SYSBOX_REQUIRED_MISSING for an NVIDIA_* cause,
+    # DIND_PROBE_UNREACHABLE for DIND_SSHD_NOT_READY (DAH-5844).
     dind_probe_error: DindLogCause | None = None
+    # the outside prober could not reach the ports: our filler's ports are behind the same firewall
+    externally_unreachable: bool = False
+    # DAH-5651: this cycle's DinD test container was started on the host and never answered, so the host's
+    # container runtime is failing; reaches the backend as ExecutorSpecRequest.host_runtime_fault
+    host_runtime_fault: bool = False
+    # this cycle's outside reading was "blocked" (already recorded): a re-probe in the same cycle never adds a miss
+    external_probe_blocked: bool = False
     # DAH-3338: per rented pod, the container state this cycle saw (TenantEnforcementCheck) and
     # the orphans the stale cleanup reaped (StaleContainerCleanupCheck). Reaches the backend as
     # ExecutorSpecRequest.pod_states.
     pod_states: list[PodContainerState] = field(default_factory=list)
     rented_data: RentedExecutorsResponse | None = None
+    memory_health: MemoryHealthRead | None = None
     gpu_metrics: dict | None = None
     inspector_event: dict | None = None
     # DAH-2265 Plan 2: advisory result of the cached-template verification check.
@@ -183,6 +259,14 @@ class ContextState:
     # not attempted or fell back entirely; the capability and VerifyX checks consume a judged
     # step when present and run over SSH otherwise.
     local_verify: LocalVerifyOutcome | None = None
+    # The liumd shadow's docker and ports read, started right after machine_scrape so both see the
+    # same containers; awaited by the shadow at the end of the run. None = no shadow for this node.
+    liumd_shadow_facts_task: Any = None
+    # True once machine_scrape has tried to start that read, so a later shadow never falls back
+    # to a different Docker moment.
+    liumd_shadow_facts_attempted: bool = False
+    # DAH-5462: VerifyX's cold first sample, re-measured by VerifyXColdRetryCheck just before scoring
+    verifyx_cold_retry: Any = None
 
 
 class CheckResult(BaseModel):
@@ -193,12 +277,14 @@ class CheckResult(BaseModel):
     # A check may decide per run whether its failure stops the pipeline (a ban is fatal only
     # when the node has no live rental). None = fall back to the check's class default.
     fatal: bool | None = None
+    # Events of checks this one ran inside itself, reported before its own (the scrape's GPU_LOST hold).
+    extra_events: list[ValidationEvent] = []
 
 
 class Context(BaseModel):
     model_config = {"frozen": True, "arbitrary_types_allowed": True}
     pipeline_id: str
-    # time.monotonic() when the pipeline's context was built; a best-effort step budgets against
+    # time.monotonic() at the executor task's start; a best-effort step budgets against
     # the executor task's timeout from here.
     started_at_monotonic: float = Field(default_factory=time.monotonic)
     executor: ExecutorSSHInfo
@@ -229,10 +315,11 @@ class Context(BaseModel):
     # carries the evidence (lium-platform DAH-3385). The pipeline fills reason_code/check_id from the event when
     # the check did not set it itself.
     clear_verified_job_evidence: dict[str, Any] | None = None
-    # DAH-3457: set by GpuFingerprintCheck under GPU_ANCHOR_HARD_ENABLED when the scrape shows a GPU outside the
-    # anchored set. ResultHandler writes it into the executor's verified-job record, where it is sticky: the
-    # node scores 0 on every later cycle under this executor id and is never re-anchored.
-    gpu_anchor_broken: bool = False
+    # Set by GpuFingerprintCheck when the node lists a full set of other GPUs (full_set_changed): ResultHandler
+    # makes this cycle's set the anchor.
+    gpu_reanchor: bool = False
+    # Set by SpecChangeCheck: the reset records this cycle's model:count, so the next cycle audits the node as it is now
+    gpu_respec: bool = False
     collateral_deposited: bool = False
     contract_version: str | None = None
     is_rental_succeed: bool = False
@@ -251,9 +338,45 @@ class Context(BaseModel):
     # False only once CpuTruthCheck sees a mismatch under enforcement; the score gate lives in
     # calculate_scores because the check is non-fatal and ScoreCheck runs after it.
     cpu_truth_passed: bool = True
+    # False only once SpecFloorCheck fails a node under a live rental (fatal otherwise); gated in calculate_scores.
+    spec_floor_passed: bool = True
     # False only once ProviderSideLoadCheck sees provider-side CPU/disk above the floors under
     # enforcement; the score gate lives in calculate_scores for the same reason as above.
     provider_side_load_passed: bool = True
+    # False only once RentedPodResourcesCheck sees a pinned cpuset or a cut CPU quota under
+    # enforcement; the score gate lives in calculate_scores for the same reason as above.
+    rented_pod_resources_passed: bool = True
+    # False only once RentedThroughputCheck reads two slow readings in a row on a rented node; non-fatal, so the
+    # score gate lives in calculate_scores.
+    rented_throughput_passed: bool = True
+    # True when that failure is RENTED_THROUGHPUT_NOT_RUN (no reading ran), not a slow reading.
+    rented_throughput_not_run: bool = False
+    # which side failed and its measured vs required value (slow_detail), for the score warning
+    rented_throughput_slow_detail: str = ""
+    # False only once GpuAttestationIdentityCheck finds a swap/mismatch under enforcement; the
+    # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
+    gpu_attestation_identity_passed: bool = True
+    # False only once the same check finds a multi-GPU CC B200/B300 below NVIDIA's minimum VBIOS under
+    # CC_VBIOS_MINIMUM_ENFORCEMENT_ENABLED; same non-fatal rental mechanics as above.
+    cc_vbios_passed: bool = True
+    # False only once GpuFingerprintCheck fails on a node with a live rental: non-fatal there so the
+    # rented-pod checks still run; the run still ends as that failure (_ended).
+    gpu_fingerprint_passed: bool = True
+    # False once HardwareIdentityCheck has a finding; non-fatal on a live rental, so the score
+    # gate lives in calculate_scores.
+    hardware_identity_passed: bool = True
+    # False only once BannedProviderCheck finds the kernel GPU view overlaid; the check is
+    # non-fatal on a live rental, so the score gate lives in calculate_scores.
+    kernel_gpu_view_passed: bool = True
+    # False once GpuKernelCountCheck finds a kernel list shorter than the reported count; the
+    # check is non-fatal on a live rental, so the score gate lives in calculate_scores.
+    gpu_kernel_count_passed: bool = True
+    # False once a card is below its reported GPU model (DAH-6241); non-fatal on a live rental, so the score
+    # gate lives in calculate_scores.
+    gpu_model_passed: bool = True
+    # False once NodeAccountCheck finds the node on another account's machine (DAH-6539); non-fatal on a live
+    # rental, so the score gate lives in calculate_scores.
+    node_account_passed: bool = True
     # G1 — NVIDIA CC GPU attestation outcome: True/False when verified, None when
     # not performed (non-CVM node, no evidence supplied, or NRAS undeterminable).
     gpu_attestation_passed: bool | None = None
@@ -279,6 +402,7 @@ class EventSink(Protocol):
 PROVIDER_STATE_REASON_CODES: frozenset[str] = frozenset(
     {
         "EXECUTOR_IMAGE_OUTDATED",
+        "EXECUTOR_IMAGE_UNOFFICIAL",
         "PROVIDER_BANNED",
         "PROVIDER_SIDE_LOAD_ABOVE_LIMIT",
     }
@@ -295,10 +419,10 @@ class StatusChangeTracker:
 
     def __init__(self, max_entries: int = 200_000):
         self.max_entries = max_entries
-        self._last: OrderedDict[tuple[str, str, str], tuple[str, str, str]] = OrderedDict()
+        self._last: OrderedDict[tuple[str, str, str], tuple[str, ...]] = OrderedDict()
 
     def changed(
-        self, miner_hotkey: str, executor_uuid: str, check_id: str, outcome: tuple[str, str, str]
+        self, miner_hotkey: str, executor_uuid: str, check_id: str, outcome: tuple[str, ...]
     ) -> bool:
         # the miner reports its executor UUIDs: keyed without the hotkey, one miner could replay another
         # provider's UUID and move that provider's lines between INFO and DEBUG
@@ -359,10 +483,19 @@ class LoggerSink:
             str(event.context.get("miner_hotkey") or ""),
             executor_uuid,
             event.check_id,
-            (event.event, event.reason_code, event.severity),
+            (event.event, event.reason_code, event.severity, _vloopback_outcome(event)),
         )
         # The run's last event carries the per-step summary; it stays at INFO as one line per run.
         return not changed and "steps_total_s" not in event.what_we_saw
+
+
+def _vloopback_outcome(event: ValidationEvent) -> str:
+    # SCRAPE_OK stays SCRAPE_OK when the vloopback mount test fails, so its verdict joins the outcome
+    storage_limit = event.what_we_saw.get("storage_limit")
+    vloopback = storage_limit.get("vloopback") if isinstance(storage_limit, dict) else None
+    if not isinstance(vloopback, dict):
+        return ""
+    return f"{vloopback.get('verdict')}:{vloopback.get('reason_code')}"
 
 
 def updates_with_clear_verified_job_evidence(res: CheckResult, check_id: str) -> dict[str, Any]:
@@ -450,6 +583,8 @@ class _RanCheck:
     before_state: ContextState
     started: float
     finished: float
+    # False for the run's end on a dead session, which reuses the check's id and took no time of its own
+    in_steps: bool = True
 
 
 def merge_state(current: ContextState, before: ContextState, after: ContextState) -> ContextState:
@@ -483,10 +618,92 @@ def _stops_run(chk: Check, res: CheckResult) -> bool:
     return (not res.passed and fatal) or res.halt
 
 
+def _ended(events: list[ValidationEvent], ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
+    """A run that got through. A GPU set change under a live rental ran on through the rented-pod checks for
+    their reports only: the run still ends as that failure (its event last, score 0, not rented), as it did
+    when the check halted it."""
+    if ctx.gpu_fingerprint_passed:
+        return True, events, ctx
+    failure = next(e for e in events if e.check_id == "gpu.validate.fingerprint")
+    events = [e for e in events if e is not failure] + [failure]
+    return False, events, ctx.model_copy(update={"rented": False, "score": 0.0, "job_score": 0.0, "success": False})
+
+
+async def _session_dropped(ssh: asyncssh.SSHClientConnection) -> bool:
+    # asyncssh marks a lost connection closed one loop tick after the drop
+    await asyncio.sleep(0)
+    return ssh.is_closed() is True
+
+
+_TRANSPORT_REASONS = frozenset(
+    {
+        TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason,
+        RentalVerificationMessages.FILLER_TRANSPORT_UNREACHABLE.reason,
+    }
+)
+
+
+def _not_terminal(ran: _RanCheck) -> _RanCheck:
+    return replace(ran, result=ran.result.model_copy(update={"fatal": False, "halt": False}))
+
+
+_NOT_THE_ACCOUNTS_MACHINE = frozenset(
+    {NodeAccountMessages.MISMATCH.reason, NodeAccountMessages.BINDING_UNVERIFIED.reason}
+)
+
+
+def _a_finding(ran: _RanCheck) -> bool:
+    # a fault the check finished reading stays the run's verdict: hiding the node and publishing it key on the last event;
+    # its extra events count too (the GPU recheck's failure carries GPU_LOST there)
+    # NODE_ACCOUNT_UNVERIFIED is a read that did not finish, not a fault read off the node: a dropped session is
+    # reconnected and the read run again (DAH-6539, Sergej lio#2288 at 72215ea)
+    return any(
+        (event.is_availability_error or event.reason_code in REASONS_THAT_HIDE_AT_ONCE)
+        and event.reason_code != AvailabilityErrorCode.NODE_ACCOUNT_UNVERIFIED
+        for event in [ran.result.event, *ran.result.extra_events]
+    )
+
+
+def _session_lost(ran: list[_RanCheck], ctx: Context, step: "Check | ParallelStage | None" = None) -> _RanCheck:
+    # the failed check names the event; after a failed reconnect the run may have no failure (or nothing ran)
+    failed = next((r for r in ran if not r.result.passed), ran[-1] if ran else None)
+    if failed is None:
+        chk = step.checks[-1] if isinstance(step, ParallelStage) else step
+        before, at = ctx.state, time.perf_counter()
+    else:
+        chk, before, at = failed.check, failed.before_state, failed.finished
+    event = render_message(
+        TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE,
+        ctx=ctx,
+        check_id=chk.check_id,
+        what={"executor_uuid": ctx.executor.uuid, "transport_error": "SSH session closed under the check"},
+    )
+    result = CheckResult(passed=False, event=event, fatal=True)
+    return _RanCheck(chk, result, before, at, at, in_steps=False)
+
+
+def _replays_after_session_drop(step: "Check | ParallelStage") -> bool:
+    # opt-in: only a check that writes nothing to Redis or the host before it returns is run again on a new session
+    checks = step.checks if isinstance(step, ParallelStage) else [step]
+    return all(getattr(chk, "replays_after_session_drop", False) for chk in checks)
+
+
 class Pipeline:
-    def __init__(self, checks: List[Check], sink: EventSink):
-        self.checks = checks
+    def __init__(
+        self,
+        checks: List[Check],
+        sink: EventSink,
+        reconnect: Callable[[], Awaitable[asyncssh.SSHClientConnection]] | None = None,
+    ):
+        """`reconnect` opens a fresh session to the same node; without it a dropped session ends the run as before."""
+        # DAH-6442: a check with `on_completion` runs once the run has ended, however it ended (passed, a fatal
+        # failure or a halt), so a fatal check before it can never leave its host-side cleanup undone
+        self.checks = [chk for chk in checks if not getattr(chk, "on_completion", False)]
+        self.on_completion = [chk for chk in checks if getattr(chk, "on_completion", False)]
         self.sink = sink
+        self.reconnect = reconnect
+        # one reconnect per run: a session that drops again stands as the transport failure it is
+        self.reconnected = False
 
     async def _run_check(self, chk: Check, ctx: Context) -> _RanCheck:
         started = time.perf_counter()
@@ -547,6 +764,77 @@ class Pipeline:
             return await self._run_stage(step, ctx)
         return [await self._run_check(step, ctx)]
 
+    async def _attempt(self, step: Check | ParallelStage, ctx: Context) -> tuple[list[_RanCheck], BaseException | None]:
+        try:
+            return await self._run_step(step, ctx), None
+        except (asyncssh.Error, OSError) as exc:
+            return [], exc
+
+    async def _run_step_surviving_a_dropped_session(
+        self, step: Check | ParallelStage, ctx: Context
+    ) -> tuple[list[_RanCheck], Context]:
+        """Run the step; if the open session died under it, reconnect once and run the step again on the new one.
+
+        Whatever the step returned or raised, the session decides: still open, the step stands as it ran. Closed,
+        it runs once more on a fresh session and that run stands. A failure on a session that is closed at the end
+        (the reconnect failed, the rerun dropped too, or the step is not replayable) ends the run as the transport
+        failure it is (EXECUTOR_TRANSPORT_UNREACHABLE, which the executor-image rollout window withholds while a
+        release recreates containers); the check's own events and updates stay, so a fault it finished reading
+        is still published. A connect that fails at the start of the run never gets here."""
+        ran, error = await self._attempt(step, ctx)
+        if (
+            self.reconnect is not None
+            and not self.reconnected
+            and _replays_after_session_drop(step)
+            # a fault the step already finished reading stands: a replay could read nothing and pass over it
+            and not any(_a_finding(r) for r in ran if not r.result.passed)
+            and await _session_dropped(ctx.ssh)
+        ):
+            self.reconnected = True
+            try:
+                fresh = await self.reconnect()
+            except (asyncssh.Error, OSError) as exc:
+                logger.warning(
+                    _m(
+                        "SSH session dropped mid-check; reconnect failed",
+                        extra={**ctx.default_extra, "error": repr(exc)[:300]},
+                    )
+                )
+                # the node refused the new session: the run ends here on the transport failure, whether the step
+                # passed or raised, never carrying on over the dead session or ending with no verdict
+                return [*(_not_terminal(r) for r in ran), _session_lost(ran, ctx, step)], ctx
+            else:
+                logger.warning(
+                    _m(
+                        "SSH session dropped mid-check; reconnected, running the check again",
+                        extra={**ctx.default_extra, "error": repr(error)[:300]},
+                    )
+                )
+                ctx = ctx.model_copy(update={"ssh": fresh, "runner": SSHCommandRunner(fresh, max_retries=1)})
+                ran, error = await self._attempt(step, ctx)
+        if (
+            error is None
+            and self.reconnect is not None
+            and any(not r.result.passed for r in ran)
+            # a check that already names the dead session keeps its own event and check_id
+            and not any(r.result.event.reason_code in _TRANSPORT_REASONS for r in ran)
+            and await _session_dropped(ctx.ssh)
+        ):
+            findings = [r for r in ran if not r.result.passed and _a_finding(r)]
+            if findings:
+                # a fault the check finished reading ends the run as itself: the hide, its publication and the
+                # rollout window all read the last event
+                fault = findings[-1]
+                fatal = replace(fault, result=fault.result.model_copy(update={"fatal": True}))
+                ran = [*(_not_terminal(r) for r in ran if r is not fault), fatal]
+            else:
+                # any other failure the check returned on a session that died is the transport's, not the node's:
+                # the run ends on the dead session, and what the check finished (its updates) stays in the result
+                ran = [*(_not_terminal(r) for r in ran), _session_lost(ran, ctx)]
+        if error is not None:
+            raise error
+        return ran, ctx
+
     def _apply(self, current_ctx: Context, ran: _RanCheck, parallel: bool) -> Context:
         res = ran.result
         if not res.updates:
@@ -557,6 +845,22 @@ class Pipeline:
         return current_ctx.model_copy(update=updates)
 
     async def run(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
+        passed, events, end_ctx = await self._run_checks(ctx)
+        # another account's machine answered, or the machine could not be confirmed as the account's (a read that
+        # still failed after the reconnect, which a relay can cause): no completion step touches it (DAH-6539)
+        if any(event.reason_code in _NOT_THE_ACCOUNTS_MACHINE for event in events):
+            return passed, events, end_ctx
+        for chk in self.on_completion:
+            try:
+                res = await chk.run(end_ctx)
+            except Exception as exc:  # noqa: BLE001 — a completion step never changes the run's verdict
+                logger.warning(_m("Completion check failed", extra={**end_ctx.default_extra, "error": repr(exc)[:300]}))
+                continue
+            # reported, but not one of the run's events: the verdict and its publication read the last of those
+            await self.sink.emit(res.event)
+        return passed, events, end_ctx
+
+    async def _run_checks(self, ctx: Context) -> Tuple[bool, list[ValidationEvent], Context]:
         events: list[ValidationEvent] = []
         current_ctx = ctx
         pipeline_start_time = time.perf_counter()
@@ -565,7 +869,7 @@ class Pipeline:
 
         for index, step in enumerate(self.checks):
             parallel = isinstance(step, ParallelStage)
-            ran_checks = await self._run_step(step, current_ctx)
+            ran_checks, current_ctx = await self._run_step_surviving_a_dropped_session(step, current_ctx)
             for ran in ran_checks:
                 ran.result.event.context["execution_time_ms"] = int((ran.finished - ran.started) * 1000)
                 ran.result.event.context["elapsed_time_ms"] = int((ran.finished - pipeline_start_time) * 1000)
@@ -576,19 +880,27 @@ class Pipeline:
                 chk, res = ran.check, ran.result
                 # Only emitted checks enter the summary: a sibling lane's checks completed before
                 # the cancel ran, but the run does not report them.
-                steps.append((chk.check_id, res.event.context["execution_time_ms"]))
+                if ran.in_steps:
+                    steps.append((chk.check_id, res.event.context["execution_time_ms"]))
                 elapsed_time_ms = stage_elapsed_ms if parallel else res.event.context["elapsed_time_ms"]
                 failed = not res.passed and (
                     res.fatal if res.fatal is not None else getattr(chk, "fatal", False)
                 )
                 last_of_run = index == last_index and position == len(ran_checks) - 1
                 if failed or res.halt or last_of_run:
+                    # the failed event's own check: a composite check (the cold retry's disk judgement) fails
+                    # with another check's event, and the provider timeline names the step from this
                     res.event.what_we_saw.update(
                         summarize_steps(
-                            steps, elapsed_time_ms, failed_check_id=chk.check_id if failed else None
+                            steps,
+                            elapsed_time_ms,
+                            failed_check_id=(res.event.check_id or chk.check_id) if failed else None,
                         )
                     )
 
+                for extra_event in res.extra_events:
+                    await self.sink.emit(extra_event)
+                    events.append(extra_event)
                 await self.sink.emit(res.event)
                 events.append(res.event)
 
@@ -598,6 +910,6 @@ class Pipeline:
                     return False, events, current_ctx
 
                 if res.halt:
-                    return True, events, current_ctx
+                    return _ended(events, current_ctx)
 
-        return True, events, current_ctx
+        return _ended(events, current_ctx)

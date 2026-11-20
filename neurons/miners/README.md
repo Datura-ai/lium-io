@@ -2,10 +2,10 @@
 
 **[Provider Documentation](https://docs.lium.io/providers)** — docs.lium.io calls a miner a *provider*, the
 central miner the *self-hosted provider* ([setup guide](https://docs.lium.io/providers/self-hosted-provider)),
-and an executor a *node*. Most providers do not run this service themselves: opting into the
-[Lium.io Central Provider Server](https://docs.lium.io/providers/provider-configuration) from the
-[Provider Portal](https://provider.lium.io) lets Lium run it for you, and nodes are then set up with
-`lium mine` ([Node Quickstart](https://docs.lium.io/providers/nodes/quickstart)).
+and an executor a *node*. Most providers do not run this service: the
+[Lium.io Central Provider Server](https://docs.lium.io/providers/provider-configuration) runs it for them and is
+ON by default in the [Provider Portal](https://provider.lium.io); nodes are set up with `lium mine`
+([Node Quickstart](https://docs.lium.io/providers/nodes/quickstart)).
 
 ## Overview
 
@@ -81,6 +81,16 @@ Fill in your information for:
 
 ```
 cd neurons/miners && docker compose up -d
+```
+
+#### Updates
+
+The miner updates itself. The stack runs `miner-runner` and `watchtower`. Every 60 seconds `watchtower` checks for a new runner image and recreates the runner, and the runner pulls the current miner image and recreates the miner. A stack started from an older compose file may still run `containrrr/watchtower`, which stops on Docker Engine 29 and later; the runner replaces it with the `nickfedor/watchtower` release that `docker-compose.yml` pins by digest when it starts.
+
+A miner run without this stack (from source or from your own compose file) does not update itself. If yours is behind, run this once in the checkout:
+
+```
+cd neurons/miners && git pull && docker compose pull && docker compose up -d
 ```
 
 ## Managing Ethereum Address
@@ -160,6 +170,8 @@ Executors are machines running on GPUs that you can add to your central miner. T
 
     **Optional parameters:**
     - `<validator-hotkey>`: The validator hotkey that you want to give access to this executor. If not provided, our validator_hotkey will be used as default.
+
+    **Tier:** a node added with this command starts on the **Spot** tier; the command has no tier option. A node you deleted in the Provider Portal and add again at the same IP and port within 7 days keeps its earlier tier. To move it to **Secure**, open the node's page in the Provider Portal and click **Change Tier**; a node can change tier once every 24 hours.
 
 ### List Executors
 
@@ -272,7 +284,14 @@ docker exec -it <container-id or name> pdm run /root/app/src/cli.py show-contrac
 docker exec -it <container-id or name> pdm run /root/app/src/cli.py current-contract-version
 ```
 
-`show-contract-versions` lists the collateral contract versions with their addresses; `current-contract-version` prints the one this miner uses. (`migrate-validator-hotkey` is a one-off data migration for a past validator hotkey change and is not part of normal operation.)
+`show-contract-versions` lists the collateral contract versions with their addresses; `current-contract-version` prints the one this miner uses.
+
+`migrate-validator-hotkey` is the data step of a validator hotkey rotation, run once per miner after the config pair swap (`DEFAULT_VALIDATOR_HOTKEY=<new>`, `VALIDATOR_NEXT_HOTKEY=<old>`): it re-keys this miner's executor rows from the previous validator hotkey to the active one. The defaults read those two settings; `--from-hotkey` / `--to-hotkey` name them explicitly and `--dry-run` prints the row count without changing anything. Lium announces the rotation date; the current swap (to `5F1aH9124FPvDNMWKgPCCJ8WeBBV3B3vpijDCyxZVyZgrEV9`) is pending.
+
+```shell
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py migrate-validator-hotkey --dry-run
+docker exec -it <container-id or name> pdm run /root/app/src/cli.py migrate-validator-hotkey
+```
 
 ### Finalizing a Reclaim Request
 

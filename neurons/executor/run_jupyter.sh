@@ -12,6 +12,7 @@ set -e
 # Default values
 JUPYTER_PORT=8888
 JUPYTER_PASSWORD=""
+JUPYTER_RESTART_SCRIPT=/tmp/lium-jupyter-restart.sh
 
 # Parse command line arguments
 parse_arguments() {
@@ -50,7 +51,7 @@ parse_arguments() {
 
 # Function to detect package manager
 detect_package_manager() {
-    echo "Detecting Linux distribution and package manager..."
+    echo "Detecting Linux distribution and package manager..." >&2
     if command -v apk >/dev/null 2>&1; then
         echo "apk"
     elif command -v apt >/dev/null 2>&1; then
@@ -89,7 +90,7 @@ install_system_packages() {
         "apk")
             echo "Installing packages with apk (Alpine)..."
             apk update
-            apk add --no-cache python3 python3-dev python3-pip py3-pip build-base linux-headers gcc g++ make bash
+            apk add --no-cache python3 python3-dev py3-pip build-base linux-headers gcc g++ make bash
             ;;
         "apt")
             echo "Installing packages with apt (Ubuntu/Debian)..."
@@ -159,8 +160,8 @@ install_python_packages() {
 
 # Install Python and Jupyter if needed
 install_python_jupyter() {
-    if ! command -v python3 >/dev/null 2>&1; then
-        echo "Python not found. Installing system packages and Python..."
+    if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import venv, ensurepip' >/dev/null 2>&1; then
+        echo "Python or venv support not found. Installing system packages and Python..."
         install_system_packages
     else
         echo "Python is already installed."
@@ -191,22 +192,28 @@ start_jupyter() {
     shell_cmd=$(detect_shell)
     echo "Using shell: $shell_cmd"
     
-    # Start Jupyter lab using virtual environment
-    nohup /opt/jupyter-env/bin/jupyter lab \
-        --allow-root \
-        --no-browser \
-        --port=$JUPYTER_PORT \
-        --ip=0.0.0.0 \
-        --FileContentsManager.delete_to_trash=False \
-        --ServerApp.terminado_settings="{\"shell_command\":[\"$shell_cmd\"]}" \
-        --IdentityProvider.token=$JUPYTER_PASSWORD \
-        --ServerApp.allow_origin=* \
-        --ServerApp.root_dir=/root \
-        --ServerApp.disable_check_xsrf=True \
-        --ServerApp.tornado_settings="{\"max_body_size\": 536870912}" \
-        --ServerApp.log_level=ERROR \
-        --LabApp.log_level=ERROR \
-        &> /jupyter.log &
+    # DAH-6379: the launch is kept as a root-only script; a pod restart keeps the container's files but not its
+    # processes, and the executor runs this script on the pod's start, so Jupyter is back with the same token and port
+    (umask 077; cat > "$JUPYTER_RESTART_SCRIPT" <<EOF
+#!/bin/sh
+nohup /opt/jupyter-env/bin/jupyter lab \\
+    --allow-root \\
+    --no-browser \\
+    --port=$JUPYTER_PORT \\
+    --ip=0.0.0.0 \\
+    --FileContentsManager.delete_to_trash=False \\
+    --ServerApp.terminado_settings='{"shell_command":["$shell_cmd"]}' \\
+    --IdentityProvider.token='$JUPYTER_PASSWORD' \\
+    --ServerApp.allow_origin='*' \\
+    --ServerApp.root_dir=/root \\
+    --ServerApp.disable_check_xsrf=True \\
+    --ServerApp.tornado_settings='{"max_body_size": 536870912}' \\
+    --ServerApp.log_level=ERROR \\
+    --LabApp.log_level=ERROR \\
+    > /jupyter.log 2>&1 &
+EOF
+    )
+    sh "$JUPYTER_RESTART_SCRIPT"
     
     # Wait a moment for Jupyter to start
     sleep 3

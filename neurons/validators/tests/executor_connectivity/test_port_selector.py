@@ -1,17 +1,14 @@
 import pytest
-from core.config import settings
 from datura.requests.miner_requests import ExecutorSSHInfo
 
-from services.const import BATCH_PORT_VERIFICATION_SIZE
 from services.executor_connectivity.dind_probe import DindProbe
 from services.executor_connectivity.models import (
     PortPair,
     PortRangeResult,
-    SecondPass,
 )
 from services.executor_connectivity.orchestrator import ConnectivityOrchestrator
 from services.executor_connectivity.port_probe import PortProbe
-from services.executor_connectivity.port_selector import PortSelector, spread_ports, tally_port_ranges
+from services.executor_connectivity.port_selector import PortSelector, tally_port_ranges
 from services.port_utils import get_all_ports
 
 
@@ -94,14 +91,6 @@ def _available(info, unavailable=frozenset()):
     ]
 
 
-def two_passes(info, unavailable=frozenset()):
-    """The declared ports and the two passes' picks, as the orchestrator selects them."""
-    selector, declared = PortSelector(), _available(info)
-    one = selector.select(info, BATCH_PORT_VERIFICATION_SIZE, set(unavailable), declared=declared)
-    two = selector.select_spread(declared, BATCH_PORT_VERIFICATION_SIZE, set(unavailable), pass_one_ports=one)
-    return declared, one, two
-
-
 _WIDE = [PortPair(8000 + i, 38017 + i) for i in range(12001)]
 _SMALL = [PortPair(p, p) for p in range(9000, 9101)]
 _ODD = [PortPair(9000, 40000), PortPair(9001, 40000), PortPair(9002, 40001), PortPair(9002, 40001)]
@@ -130,9 +119,7 @@ def test_tally_port_ranges(declared, probed, answered, expected):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("topup", [False, True])
-async def test_orchestrator_no_ports_still_reports_declared_ranges(mocker, monkeypatch, topup):
-    monkeypatch.setattr(settings, "PORT_PROBE_TOPUP_BELOW_FLOOR", topup)
+async def test_orchestrator_no_ports_still_reports_declared_ranges(mocker):
     info = _executor_info(port_range="9000-9001")
     port_probe = mocker.Mock(spec=PortProbe)
     dind_probe = mocker.Mock(spec=DindProbe)
@@ -147,39 +134,31 @@ async def test_orchestrator_no_ports_still_reports_declared_ranges(mocker, monke
 
     assert result.status == "no_ports"
     assert result.port_ranges == (PortRangeResult(first=9000, last=9001, declared=2, probed=0, answered=0),)
-    assert result.second_pass == (SecondPass.NO_PORTS_LEFT if topup else None)
 
 
-def test_pass_two_spread_excludes_pass_one_and_rented_ports_and_includes_the_highest():
-    info = _executor_info(port_range="40000-65535")
-    rented = {40001, 50000, 65535}
+def test_declared_ports_counts_one_pair_per_external_port():
+    from services.executor_connectivity.port_selector import declared_ports
 
-    _, one, two = two_passes(info, rented)
+    info = _executor_info(port_mappings=str([[9000, 40000]] * 8 + [[9001, 40000], [9002, 40001]]))
 
-    assert len(two) == BATCH_PORT_VERIFICATION_SIZE
-    assert not {p.external for p in two} & ({p.external for p in one} | rented)
-    assert two[0] == PortPair(40301, 40301)
-    assert two[-1] == PortPair(65534, 65534)
-    assert two == sorted(set(two), key=lambda p: p.internal)
+    assert declared_ports(info) == [PortPair(9000, 40000), PortPair(9002, 40001)]
 
 
-@pytest.mark.parametrize("n", [1, 2, 299, 300, 301, 302, 450, 600, 25236, 45236])
-def test_spread_is_bounded_distinct_sorted_even_and_keeps_the_highest(n):
-    ports = [PortPair(p, p) for p in range(20000, 20000 + n)]
+def test_declared_ports_counts_one_pair_per_internal_port():
+    from services.executor_connectivity.port_selector import declared_ports
 
-    picked = spread_ports(ports, BATCH_PORT_VERIFICATION_SIZE)
+    # 24 distinct external aliases onto three host ports: a rental can bind only three of them
+    info = _executor_info(port_mappings=str([[9000 + i % 3, 40000 + i] for i in range(24)]))
 
-    assert len(picked) == min(n, BATCH_PORT_VERIFICATION_SIZE)
-    assert picked == sorted(set(picked), key=lambda p: p.internal)
-    assert picked[-1] == ports[-1]
-    if n > BATCH_PORT_VERIFICATION_SIZE:
-        assert picked[0] == ports[0]
-        gaps = [b.internal - a.internal for a, b in zip(picked, picked[1:])]
-        assert max(gaps) - min(gaps) <= 1
+    assert declared_ports(info) == [PortPair(9000, 40000), PortPair(9001, 40001), PortPair(9002, 40002)]
 
 
-@pytest.mark.parametrize("size, expected", [(0, []), (1, [9009]), (2, [9000, 9009]), (3, [9000, 9004, 9009])])
-def test_spread_tiny_budgets(size, expected):
-    ports = [PortPair(p, p) for p in range(9000, 9010)]
+def test_declared_ports_keep_the_internal_port_a_rental_binds():
+    from services.executor_connectivity.port_selector import declared_ports
 
-    assert [p.internal for p in spread_ports(ports, size)] == expected
+    # 40001 rents onto 9000 (its first mapping), which 40000 already holds; 40003 rents onto 9004
+    mappings = [[9000, 40000], [9000, 40001], [9001, 40001], [9002, 40002], [9004, 40003], [9003, 40003]]
+    info = _executor_info(port_mappings=str(mappings))
+
+    expected = [PortPair(9000, 40000), PortPair(9002, 40002), PortPair(9004, 40003)]
+    assert declared_ports(info) == expected

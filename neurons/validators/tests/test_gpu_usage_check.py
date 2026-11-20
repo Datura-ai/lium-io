@@ -1,4 +1,3 @@
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -23,16 +22,8 @@ from neurons.validators.src.services.task.messages import TenantEnforcementMessa
 from neurons.validators.src.services.task.pipeline import Pipeline
 from neurons.validators.src.services.task.score_calculator import calculate_scores
 
+from neurons.validators.src.services.redis_service import EDIT_PARKED_CONTAINER_PREFIX, STOPPED_BY_RECOVERY_PREFIX
 from tests.helpers import build_context_config, build_services, build_state, default_executor
-
-
-@contextmanager
-def foreign_gate(*, enforce: bool = True, check_enabled: bool = True):
-    """DAH-2735: the ownership gate ships shadow-first, like every money-withholding gate."""
-    with patch("neurons.validators.src.services.task.checks.gpu_usage.settings") as s:
-        s.FOREIGN_GPU_WORKLOAD_CHECK_ENABLED = check_enabled
-        s.FOREIGN_GPU_WORKLOAD_ENFORCEMENT_ENABLED = enforce
-        yield s
 
 
 @pytest.mark.parametrize(
@@ -134,7 +125,31 @@ async def test_gpu_usage_orphaned_container(context_factory):
     assert result.event.what_we_saw.get("orphaned_container") == container_name
     assert result.event.what_we_saw.get("rental_status") == "Lium has no rental for it"
     assert result.event.what_we_saw.get("container_status") == "still running"
-    assert "Provider Portal must show no active rental" in result.event.remediation
+    # DAH-5117: no record of the rental ending, so the stale cleanup keeps it: no removal promise
+    remediation = result.event.remediation
+    assert "within about 30 minutes" not in remediation
+    assert "the node passes again" not in remediation
+    assert "Lium cannot confirm a rental of it on this node" in remediation
+    assert "contact Lium support" in remediation
+    assert "docker rm" not in remediation
+
+
+@pytest.mark.asyncio
+async def test_a_pod_named_container_lium_never_issued_is_left_to_the_provider(context_factory):
+    container_name = f"{POD_CONTAINER_PREFIX}mine"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 100, "memory_utilization": 61}],
+        gpu_processes=[{"pid": 1, "info": "0::/x/init.scope", "container_name": container_name}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state, rented=False)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
+    assert "Lium cannot confirm a rental of it on this node" in result.event.remediation
+    assert "never removes" not in result.event.remediation
+    assert "stop" not in result.event.remediation.lower()
 
 
 # --- A rental that ends while the run is inside it is teardown, not an orphan ---
@@ -145,6 +160,7 @@ async def test_gpu_usage_orphaned_container(context_factory):
 TEARDOWN_POD_ID = "5703f4c9-c2f4-4fae-a652-3dee4753030a"
 TEARDOWN_POD = f"{POD_CONTAINER_PREFIX}{TEARDOWN_POD_ID}"
 BUSY_GPU = [{"gpu_utilization": 100, "memory_utilization": 61}]
+IDLE_GPU_HOLDING_VRAM = [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 9000}]
 
 
 class _Scores:
@@ -230,12 +246,6 @@ class _ListSink:
         self.events.append(event)
 
 
-@pytest.fixture
-def teardown_deferral_on():
-    with patch.object(gpu_usage.settings, "RENTAL_TEARDOWN_DEFERRAL_ENABLED", True):
-        yield
-
-
 async def _run_the_renter_ending_mid_run(ctx):
     sink = _ListSink()
     rented_machine = "neurons.validators.src.services.task.checks.rented_machine"
@@ -251,175 +261,55 @@ async def _run_the_renter_ending_mid_run(ctx):
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures("teardown_deferral_on")
-async def test_the_renter_ending_the_rental_mid_run_is_teardown_not_an_orphan(context_factory):
+async def test_the_renter_ending_the_rental_mid_run_is_not_an_orphan(context_factory):
     ctx = _scored_ctx(context_factory, rented_data=_snapshot_with_pod(last_verifyx_download_speed=800.0))
 
     ok, events, final_ctx, sink = await _run_the_renter_ending_mid_run(ctx)
 
     assert [event.reason_code for event in events] == [
         TenantMsg.STALE_POD_NOT_RUNNING.reason,
-        Msg.TEARDOWN_IN_PROGRESS.reason,
+        Msg.USAGE_OK.reason,
     ]
-    teardown = events[-1]
-    assert teardown.severity == "info"
-    assert teardown.impact == "GPU usage re-checked next cycle; job score=1.0, actual score=1.0"
-    assert teardown.remediation == (
-        "No action needed. A rental on this node has just ended and Lium is stopping its container; "
-        "do not stop it yourself."
-    )
-    assert final_ctx.log_status == "info"
-    assert teardown.what_we_saw["pod_containers"][0].state is PodRentalState.ENDED_DURING_RUN
+    assert events[-1].what_we_saw["pod_containers"][0].state is PodRentalState.ENDED_DURING_RUN
     assert ok is True
     assert final_ctx.rented is False
-    assert final_ctx.score == 1.0
-    assert final_ctx.success is True
-    assert final_ctx.state.specs["network"]["ema_verifyx_download_speed"] == 800.0
-    assert sink.events[-1].reason_code == Msg.TEARDOWN_IN_PROGRESS.reason
 
 
 @pytest.mark.asyncio
-async def test_with_the_deferral_off_the_renter_ending_mid_run_scores_0_as_before(context_factory):
-    ctx = _scored_ctx(context_factory, rented_data=_snapshot_with_pod(last_verifyx_download_speed=800.0))
-
-    ok, events, final_ctx, sink = await _run_the_renter_ending_mid_run(ctx)
-
-    assert [event.reason_code for event in events] == [
-        TenantMsg.STALE_POD_NOT_RUNNING.reason,
-        Msg.ORPHANED_CONTAINER.reason,
-    ]
-    orphan = events[-1]
-    assert orphan.impact == "Validation skipped; score set to 0"
-    assert ok is False
-    assert final_ctx.success is False
-    assert final_ctx.score == 0
-    assert orphan.remediation == (
-        f"{TEARDOWN_POD} is a Lium pod container (pod {TEARDOWN_POD_ID}) of a rental on this node that is "
-        "ending or starting: its rental ended 1 minute ago. Lium stops or starts it itself, so do not stop or "
-        "remove it; the next cycle checks the node again."
-    )
-
-
-@pytest.mark.parametrize(
-    "pod_rental",
-    [_closed(minutes_ago=10), PodRentalActiveResponse(active=True, executor_id=default_executor().uuid)],
-    ids=["ended-10-min-ago", "started-mid-run"],
-)
-@pytest.mark.asyncio
-async def test_with_the_deferral_off_every_pod_container_is_the_orphan_zero(context_factory, pod_rental):
-    ctx = _unrented_ctx(context_factory, pod_rental=pod_rental, rented_data=_snapshot_with_pod())
-
-    result = await GpuUsageCheck().run(ctx)
-
-    assert result.passed is False
-    assert result.halt is False
-    assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
-    assert "docker" not in result.event.remediation
-    assert "do not stop or remove it" in result.event.remediation
-
-
-@pytest.mark.asyncio
-@pytest.mark.usefixtures("teardown_deferral_on")
-async def test_teardown_on_a_node_with_no_download_speed_on_record_still_scores_0(context_factory):
-    ctx = _scored_ctx(context_factory, rented_data=_snapshot_with_pod())
-
-    result = await GpuUsageCheck().run(ctx)
-
-    assert result.event.reason_code == Msg.TEARDOWN_IN_PROGRESS.reason
-    assert result.updates["score"] == 0.0
-    assert result.updates["success"] is False
-    assert result.event.impact == "GPU usage re-checked next cycle; job score=0.0, actual score=0.0"
-    assert "EMA verifyx download speed unavailable" in result.updates["score_warning"]
-    assert result.event.severity == "warning"
-    assert result.updates["log_status"] == "warning"
-    assert result.event.remediation == (
-        f"Address issues:{result.updates['score_warning']} {Msg.TEARDOWN_IN_PROGRESS.remediation}"
-    )
-    assert "No action needed" not in result.event.remediation
-
-
-@pytest.mark.asyncio
-@pytest.mark.usefixtures("teardown_deferral_on")
-async def test_a_rental_started_mid_run_that_scores_0_without_a_warning_still_says_to_address_it(context_factory):
-    ctx = _unrented_ctx(
-        context_factory,
-        pod_rental=PodRentalActiveResponse(active=True, executor_id=default_executor().uuid),
-        scores=_Scores(actual_score=0.0, job_score=0.0),
-    )
-
-    result = await GpuUsageCheck().run(ctx)
-
-    assert result.event.reason_code == Msg.RENTAL_STARTED_DURING_RUN.reason
-    assert result.event.severity == "warning"
-    assert result.event.remediation == f"Address issues. {Msg.RENTAL_STARTED_DURING_RUN.remediation}"
-
-
-@pytest.mark.parametrize(
-    "last_download_speed,score,warning",
-    [
-        (50.0, 0.0, " WARNING: Last VerifyX download speed 50.0 Mbps is under the 100.0 Mbps minimum"),
-        (100.0, 1.0, None),
-    ],
-    ids=["under-the-floor", "at-the-floor"],
-)
-@pytest.mark.asyncio
-@pytest.mark.usefixtures("teardown_deferral_on")
-async def test_a_deferral_holds_the_carried_download_speed_to_verifyxs_floor(
-    context_factory, last_download_speed, score, warning
-):
-    ctx = _scored_ctx(
-        context_factory, rented_data=_snapshot_with_pod(last_verifyx_download_speed=last_download_speed)
-    )
-
-    result = await GpuUsageCheck().run(ctx)
-
-    assert result.event.reason_code == Msg.TEARDOWN_IN_PROGRESS.reason
-    assert result.updates["score"] == score
-    assert result.updates["job_score"] == score
-    assert result.updates["success"] is (score > 0)
-    assert result.updates["score_warning"] == warning
-
-
-@pytest.mark.asyncio
-@pytest.mark.usefixtures("teardown_deferral_on")
-async def test_teardown_halts_the_run_so_nothing_after_it_loads_the_gpu(context_factory):
+async def test_teardown_passes_and_the_pipeline_goes_on(context_factory):
     ctx = _unrented_ctx(context_factory, pod_rental=_closed(minutes_ago=1), rented_data=_snapshot_with_pod())
 
     result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is True
-    assert result.halt is True
-    assert result.event.reason_code == Msg.TEARDOWN_IN_PROGRESS.reason
+    assert result.halt is False
+    assert result.event.reason_code == Msg.USAGE_OK.reason
     assert "docker" not in result.event.remediation
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures("teardown_deferral_on")
-async def test_a_pod_the_snapshot_listed_is_teardown_even_when_the_backend_is_unreachable(context_factory):
+async def test_a_pod_the_snapshot_listed_is_an_orphan_when_the_backend_cannot_confirm_it(context_factory):
     ctx = _unrented_ctx(context_factory, pod_rental=None, rented_data=_snapshot_with_pod())
 
     result = await GpuUsageCheck().run(ctx)
 
-    assert result.passed is True
-    assert result.event.reason_code == Msg.TEARDOWN_IN_PROGRESS.reason
-    rental = result.event.what_we_saw["pod_containers"][0]
-    assert rental.provider_facing_rental_status == "its rental ended during this run"
+    assert result.passed is False
+    assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
+    assert result.event.what_we_saw["rental_status"] == "Lium could not confirm a rental for it this cycle"
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_a_rental_that_ended_just_before_the_run_is_teardown(context_factory):
     ctx = _unrented_ctx(context_factory, pod_rental=_closed(minutes_ago=10))
 
     result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is True
-    assert result.event.reason_code == Msg.TEARDOWN_IN_PROGRESS.reason
+    assert result.event.reason_code == Msg.USAGE_OK.reason
     assert result.event.what_we_saw["pod_containers"][0].state is PodRentalState.ENDED_RECENTLY
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_a_container_whose_rental_ended_20_minutes_ago_is_an_orphan(context_factory):
     ctx = _unrented_ctx(context_factory, pod_rental=_closed(minutes_ago=20))
 
@@ -434,9 +324,43 @@ async def test_a_container_whose_rental_ended_20_minutes_ago_is_an_orphan(contex
         f"{TEARDOWN_POD} is named like a Lium pod container (pod {TEARDOWN_POD_ID}), and no live "
         "rental on this node uses it: its rental ended 20 minutes ago."
     )
-    assert "Provider Portal must show no active rental" in remediation
+    assert "removes a leftover pod container by itself" in remediation
+    assert "Do not remove pod containers yourself" in remediation
     assert "docker stop" not in remediation
-    assert f"Only then remove it: docker rm -f {TEARDOWN_POD}" in remediation
+    assert "docker rm" not in remediation
+
+
+@pytest.mark.asyncio
+async def test_an_ended_rental_with_no_owning_node_gets_no_removal_promise(context_factory):
+    # the stale cleanup keeps it: a record naming no node cannot prove the pod ran here
+    pod_rental = PodRentalActiveResponse(
+        active=False, executor_id=None, rental_closed_at=datetime.now(timezone.utc) - timedelta(minutes=20)
+    )
+    ctx = _unrented_ctx(context_factory, pod_rental=pod_rental)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
+    assert "removes a leftover pod container by itself" not in result.event.remediation
+    assert "Lium cannot confirm a rental of it on this node" in result.event.remediation
+
+
+@pytest.mark.parametrize("owner", ["this", "none", "other"])
+@pytest.mark.asyncio
+async def test_the_orphan_remediation_promises_removal_only_when_the_rental_is_placed_here(context_factory, owner):
+    # cleanup removes an unlabelled leftover only with this node's record; a label it may follow is not visible
+    # here, so without that record the text promises neither removal nor retention
+    executor_id = {"this": default_executor().uuid, "none": None, "other": "00000000-0000-4000-8000-000000000001"}[owner]
+    pod_rental = PodRentalActiveResponse(
+        active=False, executor_id=executor_id, rental_closed_at=datetime.now(timezone.utc) - timedelta(minutes=20)
+    )
+    ctx = _unrented_ctx(context_factory, pod_rental=pod_rental)
+
+    remediation = (await GpuUsageCheck().run(ctx)).event.remediation
+
+    assert ("removes a leftover pod container by itself" in remediation) is (owner == "this")
+    assert "keeps" not in remediation
+    assert "do not wait" not in remediation.lower()
 
 
 @pytest.mark.parametrize(
@@ -447,7 +371,6 @@ async def test_a_container_whose_rental_ended_20_minutes_ago_is_an_orphan(contex
     ],
 )
 @pytest.mark.asyncio
-@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_a_container_that_was_never_rented_is_an_orphan(context_factory, pod_rental, rental_status):
     ctx = _unrented_ctx(context_factory, pod_rental=pod_rental)
 
@@ -456,10 +379,11 @@ async def test_a_container_that_was_never_rented_is_an_orphan(context_factory, p
     assert result.passed is False
     assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
     assert result.event.what_we_saw["rental_status"] == rental_status
+    assert "within about 30 minutes" not in result.event.remediation
+    assert "Lium cannot confirm a rental of it on this node" in result.event.remediation
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_a_pod_name_without_a_pod_id_is_an_orphan_without_asking(context_factory):
     ctx = _unrented_ctx(
         context_factory, pod_rental=_closed(minutes_ago=1), gpu_processes=[_pod_process("pod_whatever")]
@@ -474,8 +398,7 @@ async def test_a_pod_name_without_a_pod_id_is_an_orphan_without_asking(context_f
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures("teardown_deferral_on")
-async def test_a_recent_rental_of_another_node_buys_no_deferral(context_factory):
+async def test_a_recent_rental_of_another_node_is_still_an_orphan(context_factory):
     ctx = _unrented_ctx(
         context_factory,
         pod_rental=PodRentalActiveResponse(
@@ -493,8 +416,7 @@ async def test_a_recent_rental_of_another_node_buys_no_deferral(context_factory)
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures("teardown_deferral_on")
-async def test_a_recent_close_with_no_owner_buys_no_deferral_outside_the_snapshot(context_factory):
+async def test_a_recent_close_with_no_owner_is_still_an_orphan_outside_the_snapshot(context_factory):
     # The backend deletes the pod row when it closes the rental, so it sends no executor_id.
     ctx = _unrented_ctx(
         context_factory,
@@ -511,7 +433,6 @@ async def test_a_recent_close_with_no_owner_buys_no_deferral_outside_the_snapsho
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_a_live_rental_of_another_node_is_an_orphan_the_provider_must_not_remove(context_factory):
     ctx = _unrented_ctx(
         context_factory, pod_rental=PodRentalActiveResponse(active=True, executor_id="another-executor")
@@ -527,7 +448,6 @@ async def test_a_live_rental_of_another_node_is_an_orphan_the_provider_must_not_
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_an_orphan_beside_a_tearing_down_pod_is_still_an_orphan(context_factory):
     orphan_pod_id = "f7c2e6b0-9d41-4c8a-8e3f-5a6b7c8d9e0f"
     assert orphan_pod_id > TEARDOWN_POD_ID, "the orphan must not be the first container in sorted order"
@@ -552,10 +472,10 @@ async def test_an_orphan_beside_a_tearing_down_pod_is_still_an_orphan(context_fa
 @pytest.mark.parametrize(
     "minutes_ago,reason,rental_status",
     [
-        (14 + 50 / 60, Msg.TEARDOWN_IN_PROGRESS.reason, "its rental ended 15 minutes ago"),
+        (14 + 50 / 60, Msg.USAGE_OK.reason, "its rental ended 15 minutes ago"),
         (15 + 10 / 60, Msg.ORPHANED_CONTAINER.reason, "its rental ended 15 minutes ago"),
-        (-2, Msg.TEARDOWN_IN_PROGRESS.reason, "its rental ended just now"),
-        (-(4 + 50 / 60), Msg.TEARDOWN_IN_PROGRESS.reason, "its rental ended just now"),
+        (-2, Msg.USAGE_OK.reason, "its rental ended just now"),
+        (-(4 + 50 / 60), Msg.USAGE_OK.reason, "its rental ended just now"),
         (
             -(5 + 10 / 60),
             Msg.ORPHANED_CONTAINER.reason,
@@ -565,7 +485,6 @@ async def test_an_orphan_beside_a_tearing_down_pod_is_still_an_orphan(context_fa
     ],
 )
 @pytest.mark.asyncio
-@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_the_grace_window_runs_from_5_minutes_before_the_close_to_15_after(
     context_factory, minutes_ago, reason, rental_status
 ):
@@ -582,7 +501,6 @@ async def test_the_grace_window_runs_from_5_minutes_before_the_close_to_15_after
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_a_rental_that_started_mid_run_is_not_an_orphan(context_factory):
     ctx = _unrented_ctx(
         context_factory, pod_rental=PodRentalActiveResponse(active=True, executor_id=default_executor().uuid)
@@ -591,68 +509,164 @@ async def test_a_rental_that_started_mid_run_is_not_an_orphan(context_factory):
     result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is True
-    assert result.halt is True
-    assert result.event.reason_code == Msg.RENTAL_STARTED_DURING_RUN.reason
+    assert result.halt is False
+    assert result.event.reason_code == Msg.USAGE_OK.reason
 
 
-@pytest.mark.parametrize("deferral_enabled", [True, False], ids=["flag-on", "flag-off"])
 @pytest.mark.parametrize(
-    "pod_rental",
-    [_closed(minutes_ago=1), PodRentalActiveResponse(active=True, executor_id=default_executor().uuid)],
+    "make_pod_rental",
+    [
+        lambda: _closed(minutes_ago=1),
+        lambda: PodRentalActiveResponse(active=True, executor_id=default_executor().uuid),
+    ],
     ids=["ending", "started-mid-run"],
 )
 @pytest.mark.asyncio
 async def test_a_foreign_process_beside_a_renters_pod_never_gets_advice_to_stop_the_pod(
-    context_factory, deferral_enabled, pod_rental
+    context_factory, make_pod_rental
 ):
     foreign = {"pid": 4242, "container_name": "nodexo-rental-1cd1ba2b"}
     ctx = _unrented_ctx(
         context_factory,
-        pod_rental=pod_rental,
+        pod_rental=make_pod_rental(),
         rented_data=_snapshot_with_pod(),
         gpu_processes=[_pod_process(), foreign],
     )
 
-    with patch.object(gpu_usage.settings, "RENTAL_TEARDOWN_DEFERRAL_ENABLED", deferral_enabled):
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is False
     assert result.halt is False
     remediation = result.event.remediation
     assert "Stop all GPU processes" not in remediation
     assert "docker" not in remediation
-    if deferral_enabled:
-        assert result.event.reason_code == Msg.USAGE_HIGH.reason
-        assert remediation == (
-            "Stop the GPU processes outside Lium's containers and re-run your node: "
-            "nodexo-rental-1cd1ba2b (pid 4242). Do not stop the pod container of the rental on this node "
-            f"({TEARDOWN_POD}): Lium stops or starts it itself."
-        )
-        assert result.event.what_we_saw["gpu_processes"] == [foreign]
-        assert result.event.what_we_saw["process_count"] == 1
-    else:
-        assert result.event.reason_code == Msg.ORPHANED_CONTAINER.reason
-        assert "do not stop or remove it" in remediation
+    assert result.event.reason_code == Msg.USAGE_HIGH.reason
+    assert remediation == (
+        "Stop the GPU processes outside Lium's containers and re-run your node: "
+        "nodexo-rental-1cd1ba2b (pid 4242). Do not stop the pod container of the rental on this node "
+        f"({TEARDOWN_POD}): Lium stops or starts it itself."
+    )
+    assert result.event.what_we_saw["gpu_processes"] == [foreign]
+    assert result.event.what_we_saw["process_count"] == 1
 
 
+@pytest.mark.parametrize(
+    ("make_pod_rental", "rented_data", "state"),
+    [
+        (lambda: PodRentalActiveResponse(active=True, executor_id=default_executor().uuid), None, PodRentalState.LIVE),
+        (lambda: _closed(minutes_ago=1), _snapshot_with_pod(), PodRentalState.ENDED_DURING_RUN),
+        (lambda: _closed(minutes_ago=10), None, PodRentalState.ENDED_RECENTLY),
+    ],
+    ids=["live", "ended-during-run", "ended-recently"],
+)
 @pytest.mark.asyncio
-@pytest.mark.usefixtures("teardown_deferral_on")
-async def test_an_edit_parked_pod_container_is_judged_by_its_pod(context_factory):
+async def test_a_leftover_process_beside_a_renters_pod_is_rebooted_only_once_no_rental_runs(
+    context_factory, make_pod_rental, rented_data, state
+):
+    leftover = {"pid": 644002, "info": f"0::/../docker-{'e' * 64}.scope/init.scope", "container_name": None}
     ctx = _unrented_ctx(
         context_factory,
-        pod_rental=_closed(minutes_ago=1),
-        gpu_processes=[_pod_process(f"{TEARDOWN_POD}__prev")],
+        pod_rental=make_pod_rental(),
+        rented_data=rented_data,
+        gpu_processes=[_pod_process(), leftover],
     )
 
     result = await GpuUsageCheck().run(ctx)
 
-    assert result.passed is True
-    assert result.event.reason_code == Msg.TEARDOWN_IN_PROGRESS.reason
-    ctx.services.backend.get_pod_rental_active.assert_awaited_once_with(TEARDOWN_POD_ID)
+    assert result.event.what_we_saw["pod_containers"][0].state is state
+    remediation = result.event.remediation
+    assert f"container {'e' * 12}, which is no longer running (once no rental is running, reboot" in remediation
+    assert "Do not stop the pod container of the rental on this node" in remediation
+
+
+@pytest.mark.parametrize("container_name", [TEARDOWN_POD, f"{TEARDOWN_POD}__prev"], ids=["pod", "edit-parked"])
+@pytest.mark.parametrize("gpu_details", [BUSY_GPU, IDLE_GPU_HOLDING_VRAM], ids=["busy", "idle"])
+@pytest.mark.parametrize(
+    "pod_rental, owned",
+    [
+        (PodRentalActiveResponse(active=True, executor_id=default_executor().uuid), True),
+        # a renter's delete in flight: DELETING, no close time yet
+        (
+            PodRentalActiveResponse(active=False, status="DELETING", executor_id=default_executor().uuid),
+            True,
+        ),
+        (_closed(minutes_ago=1), True),
+        (_closed(minutes_ago=30), False),  # past the teardown grace
+        (PodRentalActiveResponse(active=False), False),  # an id the backend does not know
+        (PodRentalActiveResponse(active=True, executor_id="another-executor"), False),
+        (
+            PodRentalActiveResponse(active=False, status="DELETING", executor_id="another-executor"),
+            False,
+        ),
+    ],
+    ids=["live", "deleting", "closed-in-grace", "closed-past-grace", "unknown", "another-node", "deleting-elsewhere"],
+)
+@pytest.mark.asyncio
+async def test_a_pod_container_on_an_unrented_node_is_judged_by_its_pod(
+    context_factory, container_name, gpu_details, pod_rental, owned
+):
+    services = build_services(score_calculator=_Scores())
+    services.backend.get_pod_rental_active.return_value = pod_rental
+    # the validator recorded this name when the edit parked it
+    services.redis.store[f"{EDIT_PARKED_CONTAINER_PREFIX}{default_executor().uuid}:{TEARDOWN_POD}__prev"] = "1"
+    state = build_state(
+        gpu_details=gpu_details,
+        gpu_processes=[_pod_process(container_name)],
+        rented_data=RentedExecutorsResponse(executors={}),
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state, rented=False)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is owned
+    services.backend.get_pod_rental_active.assert_awaited_once_with(TEARDOWN_POD_ID)
+
+
+KEPT_POD = f"kept_unmounted_{TEARDOWN_POD_ID}_1731312000"
+
+
+@pytest.mark.parametrize(
+    "container_name",
+    [f"{TEARDOWN_POD}__prev", f"{TEARDOWN_POD}__stopped", KEPT_POD],
+    ids=["edit-parked", "recovery-stopped", "edit-kept"],
+)
+@pytest.mark.parametrize("gpu_details", [BUSY_GPU, IDLE_GPU_HOLDING_VRAM], ids=["busy", "idle"])
+@pytest.mark.parametrize(
+    "record, passed, backend_asked",
+    [(False, False, False), (None, True, True), (True, True, True)],
+    ids=["unrecorded-is-provider-load", "record-unreadable-backend-decides", "recorded-backend-decides"],
+)
+@pytest.mark.asyncio
+async def test_a_parked_name_is_ours_only_when_this_validator_recorded_parking_it(
+    context_factory, monkeypatch, container_name, gpu_details, record, passed, backend_asked
+):
+    services = build_services(score_calculator=_Scores())
+    if container_name.endswith("__stopped"):
+        # a recovery's park is recorded by the recovery, not by an edit
+        monkeypatch.setattr(gpu_usage, "_recovery_parked", AsyncMock(return_value=record))
+    elif record is None:
+        services.redis.failing = True
+    elif record:
+        services.redis.store[f"{EDIT_PARKED_CONTAINER_PREFIX}{default_executor().uuid}:{container_name}"] = "1"
+    services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
+        active=True, executor_id=default_executor().uuid
+    )
+    state = build_state(
+        gpu_details=gpu_details,
+        gpu_processes=[_pod_process(container_name)],
+        rented_data=RentedExecutorsResponse(executors={}),
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state, rented=False)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is passed
+    assert services.backend.get_pod_rental_active.await_count == (1 if backend_asked else 0)
+    if backend_asked:
+        services.backend.get_pod_rental_active.assert_awaited_with(TEARDOWN_POD_ID)
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_teardown_event_payload_serializes_to_json(context_factory):
     ctx = _unrented_ctx(context_factory, pod_rental=_closed(minutes_ago=1), rented_data=_snapshot_with_pod())
 
@@ -664,7 +678,6 @@ async def test_teardown_event_payload_serializes_to_json(context_factory):
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures("teardown_deferral_on")
 async def test_the_nodes_filler_beside_a_tearing_down_pod_is_still_teardown(context_factory):
     filler_container = "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
     ctx = _unrented_ctx(
@@ -679,7 +692,7 @@ async def test_the_nodes_filler_beside_a_tearing_down_pod_is_still_teardown(cont
     result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is True
-    assert result.event.reason_code == Msg.TEARDOWN_IN_PROGRESS.reason
+    assert result.event.reason_code == Msg.USAGE_OK.reason
 
 
 @pytest.mark.asyncio
@@ -789,6 +802,120 @@ async def test_ghost_still_latched_after_cure_fails_the_check(context_factory):
     assert result.passed is False
     assert result.event.reason_code == Msg.GPU_WEDGED.reason
     assert result.event.what_we_saw["still_wedged"] == [WEDGED_UUID]
+
+
+async def _after_the_cleanup_removed(ctx, removed: list[str], confirmed: bool = True):
+    """Run the stale cleanup check, its service reporting `removed`, and apply its state update.
+
+    `confirmed`: the backend's record shows each removed workload ended on this node."""
+    from neurons.validators.src.services.task.checks.stale_container_cleanup import (
+        StaleContainerCleanupCheck,
+    )
+
+    cleanup = AsyncMock()
+
+    async def remove(**kwargs):  # as the real cleanup: a labelled removal asks for its lookup slot first
+        gone = [name for name in removed if kwargs["reserve_removal"](name)]
+        return len(gone), gone, []
+
+    cleanup.cleanup.side_effect = remove
+    cleanup.sweep_abandoned_download_temporaries.return_value = 0
+    cleanup.reclaim_dphn_cache_when_disk_is_tight.return_value = 0
+    redis = AsyncMock()
+    redis.sadd.return_value = 0
+    redis.hgetall.return_value = {}
+    cleanup_services = build_services(container_cleanup=cleanup, redis=redis)
+    if confirmed:
+        owner = str(ctx.executor.uuid)
+        cleanup_services.backend.get_filler_run_active.return_value = FillerRunActiveResponse(
+            active=False, status="STOPPED", executor_id=owner
+        )
+        cleanup_services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
+            active=False, rental_closed_at=datetime.now(timezone.utc), executor_id=owner
+        )
+    services = ctx.services
+    ctx = ctx.model_copy(update={"services": cleanup_services})
+    result = await StaleContainerCleanupCheck().run(ctx)
+    return ctx.model_copy(update={**result.updates, "services": services})
+
+
+@pytest.mark.asyncio
+async def test_a_wedged_gpu_still_fails_after_the_cleanup_removed_an_unrelated_container(
+    context_factory,
+):
+    """Review 4371171963: a removal this cycle must not skip the wedge cure."""
+    runner = _mock_runner(requery_gpu_csv=f"{WEDGED_UUID}, 100, 0\n")
+    state = build_state(gpu_details=[_wedged_detail()], gpu_processes=[])
+    ctx = context_factory(
+        services=build_services(), config=build_context_config(), state=state, runner=runner
+    )
+    ctx = await _after_the_cleanup_removed(ctx, ["health_check_1777040800"])
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.GPU_WEDGED.reason
+    assert any(cmd.startswith(CURE_PREFIX) for cmd in _commands(runner))
+
+
+@pytest.mark.asyncio
+async def test_a_reaped_containers_process_no_longer_counts_but_a_surviving_one_does(
+    context_factory,
+):
+    reaped = f"{FILLER_CONTAINER_PREFIX}5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    survivor = f"{POD_CONTAINER_PREFIX}mine"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 100, "memory_utilization": 61}],
+        gpu_processes=[
+            {"pid": 1, "info": "0::/x/init.scope", "container_name": reaped},
+            {"pid": 2, "info": "0::/x/init.scope", "container_name": survivor},
+        ],
+    )
+    ctx = context_factory(
+        services=build_services(), config=build_context_config(), state=state, rented=False
+    )
+    ctx = await _after_the_cleanup_removed(ctx, [reaped])
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.what_we_saw.get("orphaned_container") == survivor
+
+
+@pytest.mark.asyncio
+async def test_a_node_whose_only_gpu_load_was_a_reaped_container_passes(context_factory):
+    reaped = f"{POD_CONTAINER_PREFIX}5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 10, "memory_utilization": 10}],
+        gpu_processes=[{"pid": 1, "info": "0::/x/init.scope", "container_name": reaped}],
+    )
+    ctx = context_factory(
+        services=build_services(), config=build_context_config(), state=state, rented=False
+    )
+    ctx = await _after_the_cleanup_removed(ctx, [reaped])
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
+
+
+@pytest.mark.asyncio
+async def test_a_removal_the_backend_does_not_confirm_still_counts_its_gpu_load(context_factory):
+    """Review 5644590326: a container removed by its label alone does not exempt its GPU load."""
+    reaped = f"{POD_CONTAINER_PREFIX}5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 100, "memory_utilization": 61}],
+        gpu_processes=[{"pid": 1, "info": "0::/x/init.scope", "container_name": reaped}],
+    )
+    ctx = context_factory(
+        services=build_services(), config=build_context_config(), state=state, rented=False
+    )
+    ctx = await _after_the_cleanup_removed(ctx, [reaped], confirmed=False)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
 
 
 @pytest.mark.asyncio
@@ -957,8 +1084,7 @@ async def test_foreign_container_at_idle_utilization_fails(context_factory):
     )
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
@@ -976,8 +1102,7 @@ async def test_container_renamed_to_look_like_a_filler_still_fails(context_facto
     )
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
@@ -992,8 +1117,7 @@ async def test_bare_host_gpu_process_fails(context_factory):
     )
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
@@ -1014,12 +1138,61 @@ async def test_held_vram_with_no_visible_processes_fails(context_factory):
         services=build_services(), config=build_context_config(), state=state, runner=runner
     )
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.VRAM_HELD.reason
     assert result.event.what_we_saw["held_vram"][0].memory_used_mb == 22400
+
+
+@pytest.mark.asyncio
+async def test_graphics_only_vram_is_never_credited(context_factory):
+    # A compute shader can run in a graphics context, which NVML lists only as graphics: VRAM held
+    # there has no owner we can verify, so it is judged like any other ownerless VRAM.
+    state = _idle_state(
+        [
+            {
+                "uuid": HELD_UUID,
+                "gpu_utilization": 0,
+                "memory_utilization": 0,
+                "memory_used_mb": 2529,
+                "graphics_only_memory_mb": 600,
+            }
+        ],
+        [],
+    )
+    runner = _mock_runner(requery_gpu_csv=f"{HELD_UUID}, 0, 2529\n")
+    ctx = context_factory(
+        services=build_services(), config=build_context_config(), state=state, runner=runner
+    )
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.VRAM_HELD.reason
+
+
+@pytest.mark.asyncio
+async def test_a_compute_process_named_like_a_desktop_still_flags(context_factory):
+    # No name buys an exclusion: a compute process running as Xorg under the display manager is
+    # still listed, and still foreign.
+    state = _idle_state(
+        [
+            {
+                "uuid": HELD_UUID,
+                "gpu_utilization": 0,
+                "memory_utilization": 0,
+                "memory_used_mb": 22400,
+            }
+        ],
+        [{"pid": 1717, "info": "0::/../../system.slice/display-manager.service", "container_name": None, "name": "Xorg"}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
 
 
 @pytest.mark.asyncio
@@ -1035,8 +1208,7 @@ async def test_stale_vram_snapshot_is_not_judged(context_factory):
         services=build_services(), config=build_context_config(), state=state, runner=runner
     )
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.USAGE_OK.reason
@@ -1054,8 +1226,7 @@ async def test_vram_with_a_live_compute_app_is_not_judged(context_factory):
         services=build_services(), config=build_context_config(), state=state, runner=runner
     )
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.USAGE_OK.reason
@@ -1067,8 +1238,7 @@ async def test_driver_reserve_vram_with_no_processes_passes(context_factory):
     state = _idle_state([{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 728}], [])
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.USAGE_OK.reason
@@ -1083,8 +1253,7 @@ async def test_the_nodes_own_filler_holding_vram_passes(context_factory):
     )
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.USAGE_OK.reason
@@ -1100,8 +1269,7 @@ async def test_a_container_running_the_executor_image_is_still_foreign(context_f
     )
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
@@ -1117,39 +1285,7 @@ async def test_held_vram_passes_when_the_node_runs_a_filler(context_factory):
     )
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
-
-    assert result.passed is True
-    assert result.event.reason_code == Msg.USAGE_OK.reason
-
-
-@pytest.mark.asyncio
-async def test_foreign_process_only_warns_while_enforcement_is_off(context_factory):
-    state = _idle_state(
-        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 22400}],
-        [{"pid": 4242, "container_name": "nodexo-rental-1cd1ba2b"}],
-    )
-    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
-
-    with foreign_gate(enforce=False):
-        result = await GpuUsageCheck().run(ctx)
-
-    assert result.passed is True
-    assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
-    assert result.event.severity == "warning"
-
-
-@pytest.mark.asyncio
-async def test_disabled_check_leaves_the_legacy_verdict_untouched(context_factory):
-    state = _idle_state(
-        [{"gpu_utilization": 0, "memory_utilization": 0, "memory_used_mb": 22400}],
-        [{"pid": 4242, "container_name": "nodexo-rental-1cd1ba2b"}],
-    )
-    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
-
-    with foreign_gate(check_enabled=False):
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.USAGE_OK.reason
@@ -1166,8 +1302,7 @@ async def test_missing_backend_truth_never_judges(context_factory):
     )
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.USAGE_OK.reason
@@ -1181,8 +1316,7 @@ async def test_foreign_event_payload_serializes_to_json(context_factory):
     )
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     dumped = result.event.model_dump(mode="json")["what_we_saw"]
     assert dumped["foreign_processes"][0]["cgroup"] == "0::/../pm2-lichsl.service"
@@ -1199,8 +1333,7 @@ async def test_validator_own_gpu_work_in_the_executors_cgroup_passes(context_fac
     )
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.USAGE_OK.reason
@@ -1216,8 +1349,7 @@ async def test_host_process_escaping_the_cgroup_namespace_still_fails(context_fa
     )
     ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
@@ -1238,8 +1370,7 @@ async def test_failed_live_query_never_withholds(context_factory):
         services=build_services(), config=build_context_config(), state=state, runner=runner
     )
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.USAGE_OK.reason
@@ -1282,8 +1413,29 @@ async def test_a_lium_named_container_is_judged_by_the_backend(
     services.backend.get_pod_rental_active.return_value = pod_rental
     ctx = context_factory(services=services, config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is expected_pass
+
+
+@pytest.mark.parametrize("gpu_utilization", [0, 5])
+@pytest.mark.parametrize("closed_minutes,expected_pass", [(5, True), (30, False)])
+@pytest.mark.asyncio
+async def test_a_pod_in_its_teardown_grace_gets_one_verdict_at_any_load(
+    context_factory, gpu_utilization, closed_minutes, expected_pass
+):
+    # The renter ended a pod the cycle snapshot never saw, between the scrape and this check: within
+    # the teardown grace it passes whether its last reading sat above or below the utilization limit.
+    state = _idle_state(
+        [{"gpu_utilization": gpu_utilization, "memory_utilization": 0, "memory_used_mb": 9000}],
+        [{"pid": 111, "info": "0::/../docker-a.scope", "container_name": LATE_POD}],
+        fillers=[FILLER],
+    )
+    services = build_services()
+    services.backend.get_pod_rental_active.return_value = _closed(closed_minutes)
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is expected_pass
 
@@ -1304,8 +1456,7 @@ async def test_only_the_squatter_survives_the_backend_re_check(context_factory):
     )
     ctx = context_factory(services=services, config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     seen = result.event.what_we_saw
     assert [p.container_name for p in seen["foreign_processes"]] == ["nodexo-rental-1cd1ba2b"]
@@ -1327,8 +1478,7 @@ async def test_one_question_per_container_not_per_process(context_factory):
     services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(active=True)
     ctx = context_factory(services=services, config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is True
     assert services.backend.get_pod_rental_active.await_count == 1
@@ -1345,8 +1495,7 @@ async def test_a_lium_name_without_a_uuid_is_never_asked_about(context_factory):
     services = build_services()
     ctx = context_factory(services=services, config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is False
     assert [p.container_name for p in result.event.what_we_saw["lium_named_outside_snapshot"]] == [
@@ -1378,8 +1527,7 @@ async def test_a_non_canonical_spelling_of_a_live_run_id_is_still_foreign(
     )
     ctx = context_factory(services=services, config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is False
     services.backend.get_filler_run_active.assert_not_awaited()
@@ -1407,8 +1555,7 @@ async def test_a_live_run_of_another_executor_is_still_foreign(context_factory):
     )
     ctx = context_factory(services=services, config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
@@ -1428,8 +1575,7 @@ async def test_a_filler_the_backend_calls_active_without_a_status_is_ours(contex
     services.backend.get_filler_run_active.return_value = FillerRunActiveResponse(active=True)
     ctx = context_factory(services=services, config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.USAGE_OK.reason
@@ -1450,8 +1596,7 @@ async def test_a_run_the_backend_places_on_another_node_is_foreign(context_facto
     )
     ctx = context_factory(services=services, config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
@@ -1470,8 +1615,7 @@ async def test_a_run_the_backend_places_on_this_node_is_ours(context_factory):
     )
     ctx = context_factory(services=services, config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.USAGE_OK.reason
@@ -1490,8 +1634,7 @@ async def test_a_pod_the_backend_places_on_another_node_is_foreign(context_facto
     )
     ctx = context_factory(services=services, config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
@@ -1516,8 +1659,7 @@ async def test_a_broken_pods_container_is_still_ours(context_factory):
     )
     ctx = context_factory(services=services, config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.USAGE_OK.reason
@@ -1539,8 +1681,7 @@ async def test_a_broken_pod_of_another_node_is_still_foreign(context_factory):
     )
     ctx = context_factory(services=services, config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
@@ -1558,8 +1699,7 @@ async def test_a_deleted_pods_container_is_foreign(context_factory):
     services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(active=False)
     ctx = context_factory(services=services, config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
@@ -1583,8 +1723,7 @@ async def test_a_long_broken_pod_no_longer_shields_its_name(context_factory):
     )
     ctx = context_factory(services=services, config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is False
     assert result.event.reason_code == Msg.FOREIGN_PROCESS.reason
@@ -1603,8 +1742,7 @@ async def test_a_broken_pod_without_a_close_time_does_not_shield_its_name(contex
     )
     ctx = context_factory(services=services, config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is False
 
@@ -1627,8 +1765,511 @@ async def test_a_close_time_that_arrives_with_a_timezone_is_still_read(context_f
     )
     ctx = context_factory(services=services, config=build_context_config(), state=state)
 
-    with foreign_gate():
-        result = await GpuUsageCheck().run(ctx)
+    result = await GpuUsageCheck().run(ctx)
 
     assert result.passed is True
     assert result.event.reason_code == Msg.USAGE_OK.reason
+
+
+def test_lium_workload_containers_counts_the_pod_container_of_an_unnamed_pod():
+    # DAH-4315: the backend lists a new pod before it records the container name
+    rented_data = RentedExecutorsResponse(
+        executors={
+            "executor-123": RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="8080",
+                pods=[RentedPod(pod_id="53a68595", container_name="")],
+            )
+        },
+        banned_guids=[],
+    )
+    ctx = MagicMock()
+    ctx.executor = default_executor()
+    ctx.miner_hotkey = "miner-hotkey"
+    ctx.state.rented_data = rented_data
+
+    assert gpu_usage.lium_workload_containers(ctx) == {f"{POD_CONTAINER_PREFIX}53a68595"}
+
+
+@pytest.mark.parametrize("load", [(100, 61), (2, 3)], ids=["high_load", "low_load"])
+@pytest.mark.parametrize(
+    "scraped_digest, expected_pass",
+    [
+        ("sha256:filler", True),  # the image it was started from
+        ("sha256:other", False),  # another image: foreign GPU work
+        ("", False),  # a local build has no RepoDigests: an empty digest is a mismatch
+        (None, True),  # container missing from the scrape: not judged
+    ],
+)
+@pytest.mark.asyncio
+async def test_filler_gpu_work_counts_only_on_the_filler_image(
+    context_factory, scraped_digest, expected_pass, load
+):
+    from neurons.validators.src.services.redis_service import (
+        FILLER_IMAGE_DIGESTS_PREFIX,
+        FILLER_IMAGE_DIGESTS_TTL_SECONDS,
+    )
+
+    filler_container = "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    services = build_services()
+    await services.redis.set(f"{FILLER_IMAGE_DIGESTS_PREFIX}{filler_container}", '["sha256:filler"]')
+    state = build_state(
+        gpu_details=[{"gpu_utilization": load[0], "memory_utilization": load[1]}],
+        gpu_processes=[{"pid": 3217038, "container_name": filler_container}],
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            all_filler_containers_by_executor={"executor-123": [filler_container]},
+        ),
+        specs={
+            "docker": {
+                "containers": [] if scraped_digest is None else [{"name": filler_container, "digest": scraped_digest}]
+            }
+        },
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is expected_pass
+    assert result.event.reason_code == (Msg.USAGE_OK if expected_pass else Msg.USAGE_HIGH).reason
+    if not expected_pass and load == (2, 3):  # at high load the utilization violation is reported
+        assert result.event.what_we_saw["filler_containers_off_their_image"] == [filler_container]
+    # the record outlives a long filler: each check refreshes its TTL
+    assert services.redis.ttl[f"{FILLER_IMAGE_DIGESTS_PREFIX}{filler_container}"] == FILLER_IMAGE_DIGESTS_TTL_SECONDS
+
+
+async def _filler_image_ctx(context_factory, monkeypatch, record, extra_processes=()):
+    from neurons.validators.src.services.redis_service import FILLER_IMAGE_DIGESTS_PREFIX
+
+    swapped, intact = "filler_swapped", "filler_intact"
+    services = build_services()
+    await services.redis.set(f"{FILLER_IMAGE_DIGESTS_PREFIX}{swapped}", record)
+    await services.redis.set(f"{FILLER_IMAGE_DIGESTS_PREFIX}{intact}", '["sha256:filler"]')
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 2, "memory_utilization": 3}],
+        gpu_processes=[
+            {"pid": 1, "container_name": swapped},
+            {"pid": 2, "container_name": intact},
+            *extra_processes,
+        ],
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            all_filler_containers_by_executor={"executor-123": [swapped, intact]},
+        ),
+        specs={
+            "docker": {
+                "containers": [
+                    {"name": swapped, "digest": "sha256:other"},
+                    {"name": intact, "digest": "sha256:filler"},
+                ]
+            }
+        },
+    )
+    return context_factory(services=services, config=build_context_config(), state=state)
+
+
+@pytest.mark.asyncio
+async def test_off_image_event_names_only_the_mismatched_fillers(context_factory, monkeypatch):
+    ctx = await _filler_image_ctx(context_factory, monkeypatch, '["sha256:filler"]')
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["filler_containers_off_their_image"] == ["filler_swapped"]
+
+
+@pytest.mark.asyncio
+async def test_unreadable_filler_image_record_skips_that_filler(context_factory, monkeypatch):
+    ctx = await _filler_image_ctx(context_factory, monkeypatch, "not json")
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.event.reason_code == Msg.USAGE_OK.reason
+
+
+@pytest.mark.asyncio
+async def test_swapped_filler_is_judged_beside_a_rental_pod(context_factory, monkeypatch):
+    pod = {"pid": 3, "container_name": f"{POD_CONTAINER_PREFIX}53a68595"}
+    ctx = await _filler_image_ctx(context_factory, monkeypatch, '["sha256:filler"]', [pod])
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["filler_containers_off_their_image"] == ["filler_swapped"]
+
+
+async def _filler_process_ctx(context_factory, cmdline, repository="daturaai/pearl-miner", running=None):
+    from neurons.validators.src.services.redis_service import (
+        FILLER_IMAGE_DIGESTS_PREFIX,
+        FILLER_IMAGE_REPOSITORY_PREFIX,
+    )
+
+    filler = "filler_0d7b2a51-5f0e-4f43-9a3b-7a8f1c2e6d90"
+    services = build_services()
+    await services.redis.set(f"{FILLER_IMAGE_DIGESTS_PREFIX}{filler}", '["sha256:filler"]')
+    if repository:
+        await services.redis.set(f"{FILLER_IMAGE_REPOSITORY_PREFIX}{filler}", repository)
+    state = build_state(
+        # a filler at full load: the utilization violation alone is tolerated for fillers
+        gpu_details=[{"gpu_utilization": 100, "memory_utilization": 90}],
+        gpu_processes=[{"pid": 4242, "container_name": filler, "cmdline": cmdline}],
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            all_filler_containers_by_executor={"executor-123": [filler]},
+        ),
+        specs={"docker": {"containers": [{"name": filler, "digest": "sha256:filler", "repository": running}]}},
+    )
+    return context_factory(services=services, config=build_context_config(), state=state), filler
+
+
+@pytest.mark.asyncio
+async def test_unlisted_process_in_a_filler_on_its_own_image(context_factory, caplog):
+    # a GPU process in a PEARL filler on its own image whose command is not the workload's
+    ctx, filler = await _filler_process_ctx(context_factory, "/opt/other/gpu-app --run")
+
+    with caplog.at_level("WARNING"):
+        result = await GpuUsageCheck().run(ctx)
+
+    assert "FILLER_FOREIGN_PROCESS executor=executor-123" in caplog.text
+    assert result.passed is False
+    assert result.event.reason_code == Msg.USAGE_HIGH.reason
+    assert result.event.what_we_saw["filler_foreign_processes"] == [f"{filler} (pid 4242): /opt/other/gpu-app --run"]
+    assert f"{filler} (pid 4242): /opt/other/gpu-app" in result.event.remediation
+
+
+@pytest.mark.parametrize(
+    "repository, cmdline",
+    [
+        ("daturaai/pearl-miner", "peakminer --coin pearl --url prl.kryptex.network:7048 --user w.x"),
+        ("daturaai/pearl-miner", "/var/lib/pearl/bin/peakminer --coin pearl"),
+        ("daturaai/dolphin", "/opt/dolphinpod/dolphinpod-worker start"),
+        ("daturaai/dolphin", "/root/.venv/bin/python3 /root/.venv/bin/vllm serve model --uds /tmp/e.sock"),
+        ("daturaai/dolphin", "VLLM::EngineCore"),
+        ("daturaai/dolphin", "python3 -m sonar.entrypoints serve"),
+        ("daturaai/dolphin", "sonar serve model"),
+        # the engine's GPU P2P probe at start runs in children multiprocessing spawned
+        (
+            "daturaai/dolphin",
+            "/root/.venv/bin/python3 -c from multiprocessing.spawn import spawn_main; "
+            "spawn_main(tracker_fd=5, pipe_handle=7) --multiprocessing-fork",
+        ),
+        (
+            "daturaai/dolphin",
+            "python3 -s -E -X faulthandler -c from multiprocessing.spawn import spawn_main; "
+            "spawn_main(tracker_fd=5, pipe_handle=7) --multiprocessing-fork",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_fillers_own_workload_passes(
+    context_factory, monkeypatch, caplog, repository, cmdline
+):
+    ctx, _ = await _filler_process_ctx(context_factory, cmdline, repository)
+
+    with caplog.at_level("WARNING"):
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert "FILLER_FOREIGN_PROCESS" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "repository, cmdline",
+    [
+        ("daturaai/pearl-miner", ""),  # the scrape could not read it, or liumd does not report it
+        ("daturaai/pearl-miner", None),
+        (None, "/opt/other/gpu-app"),  # no record and no running image reported
+        ("ghcr.io/hanlinai/engy-golden-serve", "/opt/other/gpu-app"),  # a workload with no allowlist
+    ],
+)
+@pytest.mark.asyncio
+async def test_no_command_or_unknown_workload_is_not_judged(context_factory, monkeypatch, caplog, repository, cmdline):
+    ctx, _ = await _filler_process_ctx(context_factory, cmdline, repository)
+
+    with caplog.at_level("WARNING"):
+        result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is True
+    assert "FILLER_FOREIGN_PROCESS" not in caplog.text
+
+
+def test_lium_workload_containers_skips_another_miners_rental_on_a_different_endpoint():
+    # DAH-4263: another miner's rental on a different endpoint is not this node's rental.
+    rented_data = RentedExecutorsResponse(
+        executors={
+            "executor-123": RentedExecutor(
+                miner_hotkey="other-miner-hotkey",
+                executor_ip_address="127.0.0.1",
+                executor_ip_port="2222",
+                pods=[RentedPod(pod_id="53a68595", container_name="pod_53a68595")],
+            )
+        },
+        banned_guids=[],
+    )
+    ctx = MagicMock()
+    ctx.executor = default_executor()
+    ctx.miner_hotkey = "miner-hotkey"
+    ctx.default_extra = {}
+    ctx.state.rented_data = rented_data
+
+    assert gpu_usage.lium_workload_containers(ctx) == set()
+
+
+@pytest.mark.asyncio
+async def test_a_busy_gpu_names_its_measured_load_the_limit_and_the_processes(context_factory):
+    state = build_state(
+        gpu_details=[
+            {"gpu_utilization": 0, "memory_utilization": 0},
+            {"gpu_utilization": 37, "memory_utilization": 12},
+        ],
+        gpu_processes=[{"pid": 4242, "name": "python3"}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.USAGE_HIGH.reason
+    assert result.event.remediation.startswith(
+        "GPU 1: utilization 37% and memory utilization 12%; an idle node must stay below 5% "
+        "utilization and at most 5% memory utilization. GPU processes on the node: python3 "
+        "(pid 4242)."
+    )
+
+
+_LEFTOVER_ID = "ee61df8264ce3006fff5b96ac6005f46067c6fedb3cb053ac67b7f91030dc9a7"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "info",
+    [
+        f"0::/../docker-{_LEFTOVER_ID}.scope/init.scope",  # systemd cgroup driver
+        f"0::/../{_LEFTOVER_ID}/init.scope",  # cgroupfs driver
+        f"0::/docker/{_LEFTOVER_ID}",  # cgroupfs driver, host cgroup namespace
+    ],
+)
+async def test_a_busy_gpu_held_by_a_container_no_longer_running_says_a_reboot_clears_it(
+    context_factory, info
+):
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 100, "memory_utilization": 0}],
+        gpu_processes=[{"pid": 644002, "info": info, "container_name": None}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert (
+        "GPU processes on the node: a leftover process of container ee61df8264ce, which is no "
+        "longer running (once no rental is running, reboot the node to clear it) (pid 644002)." in result.event.remediation
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "info", [f"0::/../docker-{_LEFTOVER_ID}.scope/init.scope", f"0::/../{_LEFTOVER_ID}/init.scope"]
+)
+async def test_a_running_named_container_is_named_not_called_a_leftover(context_factory, info):
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 100, "memory_utilization": 0}],
+        gpu_processes=[{"pid": 4242, "info": info, "container_name": "someones-trainer"}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert "someones-trainer (pid 4242)" in result.event.remediation
+    assert "leftover process of container" not in result.event.remediation
+
+
+@pytest.mark.asyncio
+async def test_a_busy_gpu_beside_the_nodes_filler_never_names_the_filler_to_stop(context_factory):
+    filler_container = "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 34, "memory_utilization": 3}],
+        gpu_processes=[
+            {"pid": 3217038, "container_name": filler_container},
+            {"pid": 777, "name": "python3"},
+        ],
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            all_filler_containers_by_executor={"executor-123": [filler_container]},
+        ),
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.USAGE_HIGH.reason
+    stop = result.event.remediation.split("Leave Lium's own filler running:")[0]
+    assert "filler_5703" not in stop
+    assert "must stay below" not in result.event.remediation
+    assert "python3 (pid 777)" in result.event.remediation
+
+
+@pytest.mark.asyncio
+async def test_a_busy_gpu_after_a_reset_of_an_earlier_gpu_keeps_its_node_index(
+    context_factory, monkeypatch
+):
+    async def resets(*_args):
+        return [{"gpu_uuids": ["GPU-0"]}]
+
+    monkeypatch.setattr(gpu_usage, "renter_gpu_resets", resets)
+    state = build_state(
+        gpu_details=[
+            {"uuid": "GPU-0", "gpu_utilization": 0, "memory_utilization": 0},
+            {"uuid": "GPU-1", "gpu_utilization": 37, "memory_utilization": 12},
+        ],
+        gpu_processes=[{"pid": 4242, "name": "python3"}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.USAGE_HIGH.reason
+    assert result.event.remediation.startswith("GPU 1: utilization 37%")
+    assert result.event.what_we_saw["gpu_index"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_busy_gpu_lists_the_processes_of_every_card_as_the_nodes(context_factory):
+    state = build_state(
+        gpu_details=[
+            {"gpu_utilization": 37, "memory_utilization": 12},
+            {"gpu_utilization": 0, "memory_utilization": 0},
+        ],
+        gpu_processes=[{"pid": 4242, "name": "python3"}, {"pid": 5151, "name": "miner"}],
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert "On the GPU" not in result.event.remediation
+    expected = "GPU processes on the node: python3 (pid 4242), miner (pid 5151)."
+    assert expected in result.event.remediation
+
+
+@pytest.mark.parametrize(
+    "stray",
+    [{"pid": 777, "name": "python3"}, {"pid": 778, "container_name": "filler_my_training"}],
+    ids=["host-process", "unmapped-filler-name"],
+)
+@pytest.mark.asyncio
+async def test_only_the_backends_own_filler_is_left_out_of_the_processes_to_stop(
+    context_factory, stray
+):
+    filler_container = "filler_5703f4c9-c2f4-4fae-a652-3dee4753030a"
+    state = build_state(
+        gpu_details=[{"gpu_utilization": 34, "memory_utilization": 3}],
+        gpu_processes=[{"pid": 3217038, "container_name": filler_container}, stray],
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            all_filler_containers_by_executor={"executor-123": [filler_container]},
+        ),
+    )
+    ctx = context_factory(services=build_services(), config=build_context_config(), state=state)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    remediation = result.event.remediation
+    stop, keep = remediation.split("Leave Lium's own filler running:")
+    assert f"(pid {stray['pid']})" in stop
+    assert filler_container not in stop
+    assert keep.strip() == f"{filler_container} (pid 3217038)."
+    assert "filler_*" not in remediation
+
+
+@pytest.mark.parametrize(
+    "mark, passed",
+    [("stopped", True), (b"stopped", True), ("renaming", False), (b"renaming", False)],
+    ids=["park-done", "park-done-bytes", "rename-in-progress", "rename-in-progress-bytes"],
+)
+@pytest.mark.parametrize("gpu_details", [BUSY_GPU, IDLE_GPU_HOLDING_VRAM], ids=["busy", "idle"])
+@pytest.mark.asyncio
+async def test_a_recovery_parked_name_is_ours_by_its_redis_mark_when_no_record_is_left(
+    context_factory, monkeypatch, gpu_details, mark, passed
+):
+    # the park record was in a restarted process's memory only; the mark's background retry landed since.
+    # Only a completed park's mark counts: "renaming" is written before the rename, which may never apply,
+    # so a <name>__stopped container next to it is not known to be the one this validator parked
+    services = build_services(score_calculator=_Scores())
+    monkeypatch.setattr(gpu_usage, "_recovery_parked", AsyncMock(return_value=False))
+    services.redis.store[f"{STOPPED_BY_RECOVERY_PREFIX}{TEARDOWN_POD_ID}"] = mark
+    services.backend.get_pod_rental_active.return_value = PodRentalActiveResponse(
+        active=True, executor_id=default_executor().uuid
+    )
+    state = build_state(
+        gpu_details=gpu_details,
+        gpu_processes=[_pod_process(f"{TEARDOWN_POD}__stopped")],
+        rented_data=RentedExecutorsResponse(executors={}),
+    )
+    ctx = context_factory(services=services, config=build_context_config(), state=state, rented=False)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is passed
+    assert services.backend.get_pod_rental_active.await_count == (1 if passed else 0)
+
+
+@pytest.mark.asyncio
+async def test_a_repository_record_read_as_bytes_still_names_the_workload(context_factory, monkeypatch):
+    # the prod Redis client returns bytes, not str
+    ctx, filler = await _filler_process_ctx(context_factory, "/opt/other/gpu-app --run", b"daturaai/pearl-miner")
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.what_we_saw["filler_foreign_processes"] == [f"{filler} (pid 4242): /opt/other/gpu-app --run"]
+
+
+@pytest.mark.parametrize(
+    "cmdline, passed",
+    [("/opt/other/gpu-app --run", False), ("/var/lib/pearl/bin/peakminer --coin pearl", True)],
+)
+@pytest.mark.asyncio
+async def test_a_filler_with_no_record_is_judged_by_its_running_image(context_factory, cmdline, passed):
+    # a filler started before the creation-time record existed: its running image names the workload
+    ctx, _ = await _filler_process_ctx(context_factory, cmdline, repository=None, running="daturaai/pearl-miner")
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is passed
+
+
+@pytest.mark.asyncio
+async def test_a_running_image_other_than_the_recorded_one_is_judged_by_the_record(context_factory, caplog):
+    ctx, filler = await _filler_process_ctx(
+        context_factory, "sonar serve model", repository="daturaai/pearl-miner", running="docker.io/daturaai/dolphin"
+    )
+
+    with caplog.at_level("WARNING"):
+        result = await GpuUsageCheck().run(ctx)
+
+    assert "FILLER_IMAGE_REPOSITORY_MISMATCH" in caplog.text
+    assert result.passed is False
+    assert result.event.what_we_saw["filler_foreign_processes"] == [f"{filler} (pid 4242): sonar serve model"]
+
+
+@pytest.mark.parametrize(
+    "repository, cmdline",
+    [
+        # PEARL's miner is no Python program: a multiprocessing child in its filler is not its workload
+        (
+            "daturaai/pearl-miner",
+            "python3 -c from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=5, pipe_handle=7) "
+            "--multiprocessing-fork",
+        ),
+        # inline code that is not a multiprocessing child names no workload
+        ("daturaai/dolphin", "python3 -c import miner; miner.run()"),
+        ("daturaai/dolphin", "python3 -X dev -c from multiprocessing_tools import run"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_inline_python_that_is_not_the_workloads_own_child_is_foreign(context_factory, repository, cmdline):
+    ctx, _ = await _filler_process_ctx(context_factory, cmdline, repository)
+
+    result = await GpuUsageCheck().run(ctx)
+
+    assert result.passed is False

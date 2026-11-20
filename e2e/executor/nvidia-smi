@@ -1,0 +1,10 @@
+#!/bin/sh
+# Stand-in on the GPU-less CI host: a customer create records each GPU's power at rental start and is refused when the
+# host cannot report it, so the power-state query answers "no GPUs"; every other call fails as with no binary at all.
+# With E2E_GPU=1 the real nvidia-smi the NVIDIA runtime puts in /usr/bin answers instead.
+[ -x /usr/bin/nvidia-smi ] && exec /usr/bin/nvidia-smi "$@"
+case "$*" in
+  "--query-gpu=uuid,power.limit,power.default_limit,power.min_limit,power.max_limit --format=csv,noheader,nounits") exit 0 ;;
+esac
+echo "nvidia-smi: command not found" >&2
+exit 127

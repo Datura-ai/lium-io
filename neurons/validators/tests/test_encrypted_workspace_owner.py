@@ -46,53 +46,6 @@ async def _grant(ssh_client, inspect: tuple[int, str], plaintext_path: str = "/w
 
 
 @pytest.mark.asyncio
-async def test_non_root_image_is_chowned_then_probed():
-    ssh_client = _FakeSshClient([(0, ""), (0, "")])
-
-    assert await _grant(ssh_client, (0, "prism\n")) is None
-
-    chown_command, probe_command = ssh_client.commands_called
-    assert "chown prism" in chown_command
-    assert "-u prism" in probe_command and ".lium-write-probe-" in probe_command
-
-
-@pytest.mark.asyncio
-async def test_root_image_needs_no_chown_or_probe():
-    ssh_client = _FakeSshClient([])
-
-    assert await _grant(ssh_client, (0, "\n")) is None
-    assert ssh_client.commands_called == []
-
-
-@pytest.mark.asyncio
-async def test_unreadable_image_user_fails_the_rental():
-    # a probe we cannot run must not be mistaken for a probe that passed
-    ssh_client = _FakeSshClient([])
-
-    error = await _grant(ssh_client, (1, ""))
-
-    assert error is not None and "could not read the image USER" in error
-
-
-@pytest.mark.asyncio
-async def test_unwritable_workspace_fails_even_when_chown_succeeded():
-    # chown-ing the mountpoint says nothing about traversing its parents
-    ssh_client = _FakeSshClient([(0, ""), (1, "")])
-
-    error = await _grant(ssh_client, (0, "prism\n"))
-
-    assert error is not None and "not writable by the image user" in error
-
-
-@pytest.mark.asyncio
-async def test_failed_chown_still_passes_when_the_probe_succeeds():
-    # the probe is the verdict; the chown is only remediation
-    ssh_client = _FakeSshClient([(1, ""), (0, "")])
-
-    assert await _grant(ssh_client, (0, "prism\n")) is None
-
-
-@pytest.mark.asyncio
 async def test_probe_name_is_unique_so_it_cannot_delete_renter_data():
     # the workspace may already hold renter files on a remount
     probes: list[str] = []

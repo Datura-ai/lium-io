@@ -60,7 +60,7 @@ def _payload(miner_hotkey: str = "5Miner") -> MinerJobRequestPayload:
 
 @pytest.mark.asyncio
 async def test_report_verification_started_posts_one_batch_for_the_miner(client):
-    client.post = AsyncMock(return_value=SimpleNamespace(recorded=5))
+    client._signed_request = AsyncMock(return_value=SimpleNamespace(recorded=5))
     uuids = _uuids(5)
 
     await client.report_verification_started(
@@ -70,9 +70,9 @@ async def test_report_verification_started_posts_one_batch_for_the_miner(client)
         started_at=STARTED_AT,
     )
 
-    client.post.assert_awaited_once()
-    path = client.post.await_args.args[0]
-    kwargs = client.post.await_args.kwargs
+    client._signed_request.assert_awaited_once()
+    path = client._signed_request.await_args.args[1]
+    kwargs = client._signed_request.await_args.kwargs
     assert path == "/validator/5FakeValidatorHotkey/verification-started"
     assert kwargs["json_data"] == {
         "job_batch_id": "2026-09-08 02:53:00",
@@ -80,7 +80,6 @@ async def test_report_verification_started_posts_one_batch_for_the_miner(client)
         "started_at": "2026-09-08T03:01:30+00:00",
         "executor_uuids": uuids,
     }
-    assert kwargs["add_signature"] is True
     assert kwargs["timeout"] == 10
     # the route ships with lium-platform#120; a 404 from an older backend is not an outage
     assert kwargs["non_200_log_level"] == logging.WARNING
@@ -88,7 +87,7 @@ async def test_report_verification_started_posts_one_batch_for_the_miner(client)
 
 @pytest.mark.asyncio
 async def test_report_verification_started_never_raises(client):
-    client.post = AsyncMock(side_effect=RuntimeError("backend down"))
+    client._signed_request = AsyncMock(side_effect=RuntimeError("backend down"))
 
     # A failed report costs the provider a progress bar, never a verdict.
     await client.report_verification_started(
@@ -116,7 +115,7 @@ async def test_a_miner_controlled_uuid_that_is_not_a_uuid_is_dropped_and_the_res
     client, crafted
 ):
     """The backend parses the list as UUIDs and would 422 the whole batch on one bad value."""
-    client.post = AsyncMock(return_value=SimpleNamespace(recorded=2))
+    client._signed_request = AsyncMock(return_value=SimpleNamespace(recorded=2))
     good = _uuids(2)
 
     await client.report_verification_started(
@@ -126,13 +125,13 @@ async def test_a_miner_controlled_uuid_that_is_not_a_uuid_is_dropped_and_the_res
         started_at=STARTED_AT,
     )
 
-    client.post.assert_awaited_once()
-    assert client.post.await_args.kwargs["json_data"]["executor_uuids"] == good
+    client._signed_request.assert_awaited_once()
+    assert client._signed_request.await_args.kwargs["json_data"]["executor_uuids"] == good
 
 
 @pytest.mark.asyncio
 async def test_a_batch_with_no_valid_uuid_sends_nothing(client):
-    client.post = AsyncMock()
+    client._signed_request = AsyncMock()
 
     await client.report_verification_started(
         job_batch_id="2026-09-08 02:53:00",
@@ -141,12 +140,12 @@ async def test_a_batch_with_no_valid_uuid_sends_nothing(client):
         started_at=STARTED_AT,
     )
 
-    client.post.assert_not_awaited()
+    client._signed_request.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_a_miner_with_more_executors_than_the_batch_limit_gets_two_requests(client):
-    client.post = AsyncMock(return_value=SimpleNamespace(recorded=1))
+    client._signed_request = AsyncMock(return_value=SimpleNamespace(recorded=1))
     uuids = _uuids(VERIFICATION_STARTED_BATCH_MAX + 1)
 
     await client.report_verification_started(
@@ -156,7 +155,7 @@ async def test_a_miner_with_more_executors_than_the_batch_limit_gets_two_request
         started_at=STARTED_AT,
     )
 
-    sent = [call.kwargs["json_data"]["executor_uuids"] for call in client.post.await_args_list]
+    sent = [call.kwargs["json_data"]["executor_uuids"] for call in client._signed_request.await_args_list]
     assert [len(chunk) for chunk in sent] == [VERIFICATION_STARTED_BATCH_MAX, 1]
     assert [u for chunk in sent for u in chunk] == uuids
 
@@ -215,14 +214,14 @@ async def test_task_service_schedules_one_report_for_the_miner_without_awaiting_
 async def _requests_for_cycle(client: BackendClient, executors_per_miner: list[int]) -> list[dict]:
     """Drive the real TaskService + BackendClient path for one cycle of fake miners; return the
     JSON bodies that went to the backend."""
-    client.post = AsyncMock(return_value=SimpleNamespace(recorded=0))
+    client._signed_request = AsyncMock(return_value=SimpleNamespace(recorded=0))
     service = SimpleNamespace(backend_client=client, _start_reports=set())
     for i, count in enumerate(executors_per_miner):
         TaskService.report_verification_started(
             service, _payload(f"5Miner{i}"), [_executor(u) for u in _uuids(count)]
         )
     await asyncio.gather(*service._start_reports)
-    return [call.kwargs["json_data"] for call in client.post.await_args_list]
+    return [call.kwargs["json_data"] for call in client._signed_request.await_args_list]
 
 
 @pytest.mark.asyncio
@@ -252,20 +251,6 @@ async def test_the_8_sep_prod_cycle_is_104_requests_not_483(client):
 # --------------------------------------------------------------------------- MinerService
 
 
-class _FakeMinerClient:
-    def __init__(self, accepted: AcceptSSHKeyRequest):
-        future = asyncio.get_running_loop().create_future()
-        future.set_result(accepted)
-        self.job_state = SimpleNamespace(miner_accepted_ssh_key_or_failed_future=future)
-        self.send_model = AsyncMock()
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return None
-
-
 def _miner_service_recording(order: list[str]) -> MinerService:
     """A MinerService whose task_service records the order of the start report and each create_task."""
     service = MinerService.__new__(MinerService)
@@ -275,7 +260,9 @@ def _miner_service_recording(order: list[str]) -> MinerService:
     service.attestation_service = MagicMock()
     service.attestation_service.maybe_issue_nonce = AsyncMock(return_value=None)
     service.in_flight = {}
+    service.express_queued = frozenset()
     service.miners_awaiting_wave_list = {}
+    service.rented_missed_last_cycle = {}
 
     def report(miner_info, executors):
         order.append(f"report:{miner_info.miner_hotkey}:{','.join(e.uuid for e in executors)}")
@@ -306,29 +293,6 @@ def _accepted(*uuids: str) -> AcceptSSHKeyRequest:
 
 
 @pytest.mark.asyncio
-async def test_websocket_path_reports_the_miner_once_before_launching_its_executors(monkeypatch):
-    order: list[str] = []
-    service = _miner_service_recording(order)
-    uuids = ["exec-a", "exec-b", "exec-c"]
-    monkeypatch.setattr(settings, "USE_REST_API", False)
-    monkeypatch.setattr(settings, "JOB_TIME_OUT", 300)
-    monkeypatch.setattr(type(settings), "get_bittensor_wallet", lambda self: _wallet())
-
-    with (
-        patch(
-            "services.miner_service.MinerClient", return_value=_FakeMinerClient(_accepted(*uuids))
-        ),
-        patch("services.miner_service.measure_and_attach", AsyncMock()),
-    ):
-        await service.request_job_to_miner(
-            _payload(), MagicMock(), RentedExecutorsResponse(executors={}), {}
-        )
-
-    assert order[0] == "report:5Miner:exec-a,exec-b,exec-c"
-    assert sorted(order[1:]) == [f"create_task:{u}" for u in uuids]
-
-
-@pytest.mark.asyncio
 async def test_rest_path_reports_the_miner_once_before_launching_its_executors(monkeypatch):
     order: list[str] = []
     service = _miner_service_recording(order)
@@ -338,7 +302,6 @@ async def test_rest_path_reports_the_miner_once_before_launching_its_executors(m
         return_value=(200, _accepted(*uuids).model_dump(mode="json"))
     )
     service._remove_ssh_key_via_rest = AsyncMock()
-    monkeypatch.setattr(settings, "USE_REST_API", True)
     monkeypatch.setattr(settings, "JOB_TIME_OUT", 300)
     monkeypatch.setattr(type(settings), "get_bittensor_wallet", lambda self: _wallet())
 
@@ -359,18 +322,15 @@ async def test_the_report_carries_the_claimed_list_not_what_the_express_lane_hol
     order: list[str] = []
     service = _miner_service_recording(order)
     service.in_flight = {"exec-b": EXPRESS_LANE}
-    monkeypatch.setattr(settings, "EXPRESS_LANE_ENABLED", True)
-    monkeypatch.setattr(settings, "USE_REST_API", False)
+    service._generate_auth_headers = MagicMock(return_value={})
+    service._make_rest_request = AsyncMock(
+        return_value=(200, _accepted("exec-a", "exec-b", "exec-c").model_dump(mode="json"))
+    )
+    service._remove_ssh_key_via_rest = AsyncMock()
     monkeypatch.setattr(settings, "JOB_TIME_OUT", 300)
     monkeypatch.setattr(type(settings), "get_bittensor_wallet", lambda self: _wallet())
 
-    with (
-        patch(
-            "services.miner_service.MinerClient",
-            return_value=_FakeMinerClient(_accepted("exec-a", "exec-b", "exec-c")),
-        ),
-        patch("services.miner_service.measure_and_attach", AsyncMock()),
-    ):
+    with patch("services.miner_service.measure_and_attach", AsyncMock()):
         await service.request_job_to_miner(
             _payload(), MagicMock(), RentedExecutorsResponse(executors={}), {}
         )
@@ -387,18 +347,15 @@ async def test_an_express_lane_run_reports_its_one_executor(monkeypatch):
     answers with more."""
     order: list[str] = []
     service = _miner_service_recording(order)
-    monkeypatch.setattr(settings, "EXPRESS_LANE_ENABLED", True)
-    monkeypatch.setattr(settings, "USE_REST_API", False)
+    service._generate_auth_headers = MagicMock(return_value={})
+    service._make_rest_request = AsyncMock(
+        return_value=(200, _accepted("exec-a", "exec-b").model_dump(mode="json"))
+    )
+    service._remove_ssh_key_via_rest = AsyncMock()
     monkeypatch.setattr(settings, "JOB_TIME_OUT", 300)
     monkeypatch.setattr(type(settings), "get_bittensor_wallet", lambda self: _wallet())
 
-    with (
-        patch(
-            "services.miner_service.MinerClient",
-            return_value=_FakeMinerClient(_accepted("exec-a", "exec-b")),
-        ),
-        patch("services.miner_service.measure_and_attach", AsyncMock()),
-    ):
+    with patch("services.miner_service.measure_and_attach", AsyncMock()):
         await service.request_job_to_miner(
             _payload(), MagicMock(), RentedExecutorsResponse(executors={}), {}, executor_id="exec-b"
         )
@@ -490,3 +447,41 @@ async def test_create_task_no_longer_reports_per_executor(monkeypatch):
     assert ran == ["pipe-1"]  # the pipeline ran; only the report is gone
     service.report_verification_started.assert_not_called()
     service.backend_client.report_verification_started.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_validators_key_is_removed_only_after_the_passed_probe_teardown(monkeypatch):
+    # DAH-5699: a passed rental probe tears its container down after the verdict, over the
+    # validator's key; removed first, the teardown failed with Permission denied and left the
+    # test pod behind
+    from services.task.checks import rental_probe
+
+    order: list[str] = []
+    service = _miner_service_recording(order)
+    create_task = service.task_service.create_task
+
+    async def teardown():
+        await asyncio.sleep(0.05)
+        order.append("teardown")
+
+    async def create_task_and_pass_the_probe(**kwargs):
+        task = asyncio.create_task(teardown(), name=f"{rental_probe._TEARDOWN_TASK_PREFIX}5Miner")
+        rental_probe._TEARDOWNS_AFTER_VERDICT.add(task)
+        task.add_done_callback(rental_probe._TEARDOWNS_AFTER_VERDICT.discard)
+        return await create_task(**kwargs)
+
+    service.task_service.create_task = create_task_and_pass_the_probe
+    service._generate_auth_headers = MagicMock(return_value={})
+    service._make_rest_request = AsyncMock(
+        return_value=(200, _accepted("exec-a").model_dump(mode="json"))
+    )
+    service._remove_ssh_key_via_rest = AsyncMock(side_effect=lambda **_: order.append("remove_key"))
+    monkeypatch.setattr(settings, "JOB_TIME_OUT", 300)
+    monkeypatch.setattr(type(settings), "get_bittensor_wallet", lambda self: _wallet())
+
+    with patch("services.miner_service.measure_and_attach", AsyncMock()):
+        await service.request_job_to_miner(
+            _payload(), MagicMock(), RentedExecutorsResponse(executors={}), {}
+        )
+
+    assert order[-2:] == ["teardown", "remove_key"]

@@ -28,6 +28,14 @@ _MANIFEST_ACCEPT = (
     "application/vnd.docker.distribution.manifest.list.v2+json,"
     " application/vnd.docker.distribution.manifest.v2+json"
 )
+# Executor image only: a multi-arch executor tag pushed by buildx is an OCI index, which Docker Hub
+# does not serve to the Docker types alone. Template digests keep the Docker types the executor's
+# cache side resolves with, so the two sides of the cache check cannot diverge.
+_EXECUTOR_MANIFEST_ACCEPT = (
+    "application/vnd.oci.image.index.v1+json,"
+    " application/vnd.oci.image.manifest.v1+json, "
+    + _MANIFEST_ACCEPT
+)
 _REGISTRY_AUTH_URL = "https://auth.docker.io/token"
 _REGISTRY_API = "https://registry-1.docker.io/v2"
 # `[docker.io/][namespace/]name:tag` with Docker Hub's own charset: a namespace has no dot, so a
@@ -64,7 +72,9 @@ def _shared_config_image_refs() -> tuple[str, ...]:
     return tuple(refs)
 
 
-async def fetch_registry_digest(session: aiohttp.ClientSession, image_ref: str) -> str | None:
+async def fetch_registry_digest(
+    session: aiohttp.ClientSession, image_ref: str, accept: str = _MANIFEST_ACCEPT
+) -> str | None:
     """Return the registry manifest digest for ``repository:tag``, or None on any error."""
     repository, _, tag = image_ref.partition(":")
     if not repository or not tag:
@@ -86,7 +96,7 @@ async def fetch_registry_digest(session: aiohttp.ClientSession, image_ref: str) 
             f"{_REGISTRY_API}/{repository}/manifests/{tag}",
             headers={
                 "Authorization": f"Bearer {token}",
-                "Accept": _MANIFEST_ACCEPT,
+                "Accept": accept,
             },
         ) as manifest_response:
             manifest_response.raise_for_status()
@@ -160,4 +170,45 @@ async def fetch_executor_image_digest() -> str | None:
     ref = settings.EXECUTOR_IMAGE_REF
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        return await fetch_registry_digest(session, ref)
+        return await fetch_registry_digest(session, ref, accept=_EXECUTOR_MANIFEST_ACCEPT)
+
+
+# digest -> (published, monotonic time read). A build stays published; "not ours" is re-read after the TTL.
+_executor_build_cache: dict[str, tuple[bool, float]] = {}
+_NOT_PUBLISHED_TTL_SECONDS = 600
+
+
+async def executor_build_published(digest: str | None) -> bool | None:
+    """Whether `digest` is a build in EXECUTOR_IMAGE_REF's repository. False: no digest, or the registry
+    has no such manifest (404). None: the registry gave no answer this time (the caller fails open)."""
+    if not digest:
+        return False
+    cached = _executor_build_cache.get(digest)
+    now = asyncio.get_running_loop().time()
+    if cached is not None and (cached[0] or now - cached[1] < _NOT_PUBLISHED_TTL_SECONDS):
+        return cached[0]
+    repository = settings.EXECUTOR_IMAGE_REF.partition(":")[0]
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            async with session.get(
+                _REGISTRY_AUTH_URL,
+                params={"service": "registry.docker.io", "scope": f"repository:{repository}:pull"},
+            ) as token_response:
+                token_response.raise_for_status()
+                token = (await token_response.json()).get("token")
+            async with session.head(
+                f"{_REGISTRY_API}/{repository}/manifests/{digest}",
+                headers={"Authorization": f"Bearer {token}", "Accept": _EXECUTOR_MANIFEST_ACCEPT},
+            ) as response:
+                if response.status == 404:
+                    published = False
+                elif response.status == 200:
+                    published = True
+                else:
+                    logger.warning("Executor build lookup for %s got HTTP %s", digest, response.status)
+                    return None
+    except Exception as exc:
+        logger.warning("Executor build lookup for %s failed: %s", digest, exc)
+        return None
+    _executor_build_cache[digest] = (published, now)
+    return published

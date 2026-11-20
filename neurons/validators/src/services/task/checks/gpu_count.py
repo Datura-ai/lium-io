@@ -13,6 +13,7 @@ class GpuCountCheck:
     """
 
     check_id = "gpu.validate.count"
+    replays_after_session_drop = True
     fatal = True
 
     async def run(self, ctx: Context) -> CheckResult:

@@ -3,9 +3,10 @@ import logging
 
 from clients.miner_portal_client import MinerPortalClient
 
-from core.utils import configure_logs_of_other_modules, wait_for_services_sync
+from core.utils import cap_recursion_limit, configure_logs_of_other_modules, wait_for_services_sync
 from services.ioc import initiate_services
 
+cap_recursion_limit()
 configure_logs_of_other_modules()
 wait_for_services_sync()
 

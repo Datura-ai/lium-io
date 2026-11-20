@@ -9,7 +9,6 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 
 from core.config import settings
-from core.utils import _m, get_extra_info
 
 from ..messages import CachedTemplateMessages as Msg
 from ..messages import render_message
@@ -240,16 +239,13 @@ class CachedTemplateVerificationCheck:
     the per-cycle Docker Hub digest snapshot fetched at job-cycle start (``ctx.config``),
     not the backend response.
 
-    Two-phase by ``settings.CACHED_TEMPLATE_CUTOFF``:
-      * Before the cutoff — advisory only: emits a structured event and publishes
-        ``recommended_image_cached`` / ``recommended_image_digest_match`` into
-        ``executor.specs`` via pipeline state. Never changes score.
-      * On/after the cutoff — critical (``fatal``): the two bad signals (image not pre-pulled,
-        or stale content under an unchanged tag) return ``passed=False`` so the pipeline halts
-        early, the executor scores 0, and the failure reason reaches the provider via
-        ``log_text``. This check sits after ``TenantEnforcementCheck`` (the rented
-        short-circuit), so it only ever gates *unrented* executors — an active customer rental
-        is never failed by it.
+    Emits a structured event and publishes ``recommended_image_cached`` /
+    ``recommended_image_digest_match`` into ``executor.specs`` via pipeline state.
+    It is critical (``fatal``): the two bad signals (image not pre-pulled, or stale content
+    under an unchanged tag) return ``passed=False`` so the pipeline halts early, the executor
+    scores 0, and the failure reason reaches the provider via ``log_text``. This check sits
+    after ``TenantEnforcementCheck`` (the rented short-circuit), so it only ever gates
+    *unrented* executors — an active customer rental is never failed by it.
 
     Fails open on every uncertainty (unknown GPU/driver, backend unreachable, empty
     recommendation, SSH error) by recording a skip and leaving score untouched.
@@ -259,16 +255,14 @@ class CachedTemplateVerificationCheck:
     holds a stale image is readable in Grafana without SSHing anywhere. The failure's remediation
     quotes that document: the executor's own pull error and the step it points to.
 
-    With ``settings.CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED``, a node this validator has only just
-    found without the image is held as PENDING (passed, score untouched by this check) while its
-    executor's first pre-pull sweep is still running, for at most
-    ``settings.CACHED_TEMPLATE_FRESH_NODE_GRACE_SECONDS`` (see ``_fresh_node_grace``). With it off
-    the node fails as before and the would-be hold is only logged.
+    A node this validator has only just found without the image is held as PENDING (passed,
+    score untouched by this check) while its executor's first pre-pull sweep is still running,
+    for at most ``settings.CACHED_TEMPLATE_FRESH_NODE_GRACE_SECONDS`` (see ``_fresh_node_grace``).
     """
 
     check_id = "executor.validate.cached_template"
     # The DAH-2380 digest rollout is done, so the gate is live: a `passed=False` result
-    # (NOT_CACHED / DIGEST_MISMATCH on/after CACHED_TEMPLATE_CUTOFF) halts the pipeline and the
+    # (NOT_CACHED / DIGEST_MISMATCH) halts the pipeline and the
     # executor scores 0. Every uncertainty still fails open inside run() (passed=True).
     fatal = True
 
@@ -337,24 +331,12 @@ class CachedTemplateVerificationCheck:
         )
 
     async def _apply_fresh_node_grace(self, ctx: Context, prefetch_state: dict, what: dict) -> bool:
-        """True when the grace holds this NOT_CACHED node as pending.
-
-        Flag on, the grace is added to ``what``. Flag off, a would-be hold is only logged.
-        """
+        """True when the grace holds this NOT_CACHED node as pending; the grace is added to ``what``."""
         grace = await self._fresh_node_grace(ctx, prefetch_state)
         if grace is None:
             return False
-        if settings.CACHED_TEMPLATE_FRESH_NODE_GRACE_ENABLED:
-            what["fresh_node_grace"] = asdict(grace)
-            return grace.pending
-        if grace.pending:
-            logger.info(
-                _m(
-                    "Fresh-node grace is off: this node would have been held as pending",
-                    extra=get_extra_info({**ctx.default_extra, "fresh_node_grace": asdict(grace)}),
-                )
-            )
-        return False
+        what["fresh_node_grace"] = asdict(grace)
+        return grace.pending
 
     async def run(self, ctx: Context) -> CheckResult:
         gpu_model = ctx.state.gpu_model
@@ -403,11 +385,12 @@ class CachedTemplateVerificationCheck:
         # Bare manifest digest the validator fetched from Docker Hub for this image, if any.
         backend_digest = ctx.config.default_docker_image_digests.get(image_ref)
 
+        inspect_cmd = (
+            '/usr/bin/docker image inspect --format "{{json .RepoDigests}}" '
+            + shlex.quote(image_ref)
+        )
         try:
-            inspect = await ctx.ssh.run(
-                f'/usr/bin/docker image inspect --format "{{{{json .RepoDigests}}}}" {shlex.quote(image_ref)}',
-                check=False,
-            )
+            inspect = await ctx.ssh.run(inspect_cmd, check=False)
         except Exception as exc:
             event = render_message(
                 Msg.SKIPPED,
@@ -422,6 +405,17 @@ class CachedTemplateVerificationCheck:
             return CheckResult(passed=True, event=event)
 
         cached = inspect.exit_status == 0
+        first_inspect_miss = None
+        if not cached:
+            # One failed inspect is not proof the image is gone: a node seen with it before and
+            # after was zeroed on a single miss. Look again, and keep what the miss said.
+            stderr = str(getattr(inspect, "stderr", "") or "")[:_PREFETCH_ERROR_CHARS]
+            first_inspect_miss = {"exit_status": inspect.exit_status, "stderr": stderr}
+            try:
+                inspect = await ctx.ssh.run(inspect_cmd, check=False)
+            except Exception:
+                pass  # the first miss stands
+            cached = inspect.exit_status == 0
         # Local RepoDigest for THIS repo (strict fail-open: any parse/lookup miss → None).
         local_digest = _repo_digest(getattr(inspect, "stdout", None), docker_image) if cached else None
 
@@ -444,14 +438,12 @@ class CachedTemplateVerificationCheck:
             # Cached, but the backend published no digest to compare against.
             template = Msg.CACHED
 
-        # DAH-2265: on/after the cutoff this check turns critical. The two "bad" signals —
-        # image not pre-pulled (NOT_CACHED) or stale content under an unchanged tag
-        # (DIGEST_MISMATCH) — fail verification early, so the executor scores 0 and the reason
-        # reaches the provider via log_text (the pipeline surfaces the last event). Before the
-        # cutoff (and on every fail-open None path above) the check stays advisory: passed=True,
+        # DAH-2265: the two "bad" signals — image not pre-pulled (NOT_CACHED) or stale content
+        # under an unchanged tag (DIGEST_MISMATCH) — fail verification early, so the executor
+        # scores 0 and the reason reaches the provider via log_text (the pipeline surfaces the
+        # last event). On every fail-open None path above the check stays advisory: passed=True,
         # score untouched. The cached/digest signals are published to specs either way.
-        after_cutoff = datetime.utcnow() >= settings.CACHED_TEMPLATE_CUTOFF
-        should_fail = after_cutoff and template in (Msg.NOT_CACHED, Msg.DIGEST_MISMATCH)
+        should_fail = template in (Msg.NOT_CACHED, Msg.DIGEST_MISMATCH)
 
         what = {
             "recommended_image": image_ref,
@@ -461,8 +453,10 @@ class CachedTemplateVerificationCheck:
             "local_digest": local_digest,
             "gpu_model": gpu_model,
             "driver_version": driver_version,
-            "after_cutoff": after_cutoff,
+            "after_cutoff": True,  # kept on the wire; the date cutoff has passed and is gone
         }
+        if first_inspect_miss:
+            what["first_inspect_miss"] = first_inspect_miss
         # DAH-2470: when we are about to zero this node, also carry what the executor's
         # own prefetch loop was doing at the time, so a reader can tell a provider-side
         # cause (registry rate-limits, disk, network) from ours (loop gave up, never

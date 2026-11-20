@@ -4,8 +4,6 @@ This implementation extracts the original score calculation and weight distribut
 logic to maintain backward compatibility with the existing system.
 """
 
-from datetime import UTC, datetime
-
 import bittensor
 from clients.referral_feed_client import ReferralFeedClient
 from services.executor_rollout import RUN_ENDED_WITHOUT_FAILING
@@ -34,14 +32,12 @@ def _parse_driver_version(value: str) -> tuple[int, ...] | None:
 def get_min_driver_multiplier(
     driver_version: str,
     is_rented: bool = False,
-    reference_time: datetime | None = None,
 ) -> float:
-    """Minimum NVIDIA driver multiplier with a grace period.
+    """Minimum NVIDIA driver multiplier.
 
     An executor whose reported driver is at least ``settings.MIN_NVIDIA_DRIVER_VERSION``
     (compared as a dotted version tuple) is unaffected (multiplier 1.0). A non-compliant
-    unrented executor gets a grace period until ``settings.MIN_DRIVER_CUTOFF`` (multiplier
-    1.0) and is fully gated on/after it (multiplier 0.0).
+    unrented executor is fully gated (multiplier 0.0).
 
     Currently-rented executors are always exempt — an active customer must not be
     penalised because their miner has not yet upgraded the host driver.
@@ -49,20 +45,12 @@ def get_min_driver_multiplier(
     A missing or unparseable ``driver_version`` means the value was not reported (a real
     GPU always reports a driver string), so the gate fails open rather than penalising an
     unknown reading.
-
-    ``reference_time`` is normalised to naive-UTC so it can be compared with the naive
-    cutoff (same convention as ``SYSBOX_RENTED_CUTOFF``); tests may inject it.
     """
     if is_rented:
         return 1.0
     reported = _parse_driver_version(driver_version)
     required = _parse_driver_version(settings.MIN_NVIDIA_DRIVER_VERSION)
     if reported is None or required is None or reported >= required:
-        return 1.0
-    now = reference_time or datetime.now(UTC)
-    if now.tzinfo is not None:
-        now = now.astimezone(UTC).replace(tzinfo=None)
-    if now < settings.MIN_DRIVER_CUTOFF:
         return 1.0
     return 0.0
 
@@ -108,15 +96,13 @@ class DefaultIncentive(BaseIncentive):
 
     @staticmethod
     def _record_outdated_image_reason(result: JobResult) -> bool:
-        """True when an OUTDATED executor image excludes this result from both pools.
-
-        Only when EXECUTOR_IMAGE_CHECK_ENFORCE is on (DAH-2701). Off, the report still
-        travels on the result and its specs, but no reason is recorded and nothing is zeroed.
+        """True when the executor image excludes this result from both pools: always for an UNOFFICIAL
+        image, and for an OUTDATED one only when EXECUTOR_IMAGE_CHECK_ENFORCE is on (DAH-2701). Off, an
+        OUTDATED report still travels on the result and its specs, but nothing is recorded or zeroed.
         """
-        if not settings.EXECUTOR_IMAGE_CHECK_ENFORCE:
-            return False
         report = result.executor_image_report or {}
-        if report.get("status") != "OUTDATED":
+        status = report.get("status")
+        if status != "UNOFFICIAL" and not (settings.EXECUTOR_IMAGE_CHECK_ENFORCE and status == "OUTDATED"):
             return False
         if not any(
             reason.reason == ZeroIncentiveReason.OUTDATED_EXECUTOR_IMAGE.value
@@ -139,11 +125,11 @@ class DefaultIncentive(BaseIncentive):
         reason_code: str = MinerLogLine.validation_failure_code(result)
         if reason_code in RUN_ENDED_WITHOUT_FAILING:
             return
-        if reason_code == ExecutorImageMessages.OUTDATED.reason and any(
+        if reason_code in (ExecutorImageMessages.OUTDATED.reason, ExecutorImageMessages.UNOFFICIAL.reason) and any(
             reason.reason == ZeroIncentiveReason.OUTDATED_EXECUTOR_IMAGE.value
             for reason in result.zero_incentive_reasons
         ):
-            # the image check failed on the outdated image: outdated_executor_image already says so
+            # the image check failed on the image: outdated_executor_image already says so
             return
         result.record_incentive_log(MinerLogLine.no_payout_because_validation_failed(result))
 
@@ -188,6 +174,19 @@ class DefaultIncentive(BaseIncentive):
             job_result.mining_score = 0
             return job_result
 
+        # Fallback for the legacy/default algorithm; rental_price records this among its
+        # hard exclusions before it calls into DefaultIncentive.
+        if job_result.is_hotkey_excluded_from_scoring:
+            if not any(
+                reason.reason == ZeroIncentiveReason.HOTKEY_EXCLUDED_FROM_SCORING.value
+                for reason in job_result.zero_incentive_reasons
+            ):
+                job_result.record_incentive_log(
+                    MinerLogLine.no_payout_because_hotkey_excluded_from_scoring(job_result)
+                )
+            job_result.mining_score = 0
+            return job_result
+
         # Early exit check - if job score is 0, return immediately
         if not job_result.score:
             job_result.mining_score = 0
@@ -196,16 +195,16 @@ class DefaultIncentive(BaseIncentive):
         # Fallback for deployments using the legacy/default incentive algorithm
         # directly. The active rental_price algorithm handles this before it
         # calls into DefaultIncentive.
-        if job_result.is_new_rentals_paused and not job_result.is_rented:
+        if job_result.is_in_maintenance or (job_result.is_new_rentals_paused and not job_result.is_rented):
             logger.info(
                 _m(
-                    "Executor excluded from mining pool - paused for new rentals",
+                    "Executor excluded from mining pool - paused for new rentals or in maintenance",
                     extra=get_extra_info(
                         {
                             "executor_id": str(job_result.executor_info.uuid),
                             "gpu_model": job_result.gpu_model,
                             "gpu_count": job_result.gpu_count,
-                            "reason": "new_rentals_paused",
+                            "reason": "provider_maintenance" if job_result.is_in_maintenance else "new_rentals_paused",
                             "score": 0,
                             "pool": "none",
                         }
@@ -225,20 +224,10 @@ class DefaultIncentive(BaseIncentive):
         job_result.gpu_portion = await self.redis_service.get_portion_per_gpu_type(job_result.gpu_model)
         job_result.mining_score = job_result.score * job_result.gpu_portion * job_result.gpu_count / job_result.total_gpu_count
 
-        # Sysbox runtime multiplier
-        is_rented_after_cutoff = (
-            job_result.is_rented
-            and job_result.rental_created_at
-            and job_result.rental_created_at >= settings.SYSBOX_RENTED_CUTOFF
-        )
-        if job_result.sysbox_runtime:
-            job_result.sysbox_multiplier = 1
-        else:
-            portion = settings.PORTION_FOR_SYSBOX_RENTED if is_rented_after_cutoff else settings.PORTION_FOR_SYSBOX
+        # Sysbox is required: a rented node without it scores 0 (an idle one already fails SysboxRequiredCheck)
+        job_result.sysbox_multiplier = 1 if job_result.sysbox_runtime else 0
 
-            job_result.sysbox_multiplier = 1 - portion
-
-        # Minimum NVIDIA driver multiplier (phased gate); rented executors are exempt.
+        # Minimum NVIDIA driver multiplier; rented executors are exempt.
         job_result.driver_multiplier = get_min_driver_multiplier(
             job_result.nvidia_driver_version, is_rented=job_result.is_rented
         )
@@ -256,18 +245,28 @@ class DefaultIncentive(BaseIncentive):
             )
 
         # Apply multiplier
+        spot_rental_factor: float = self._spot_rental_factor(job_result)
         job_result.mining_score *= (
-            job_result.sysbox_multiplier * job_result.uptime_multiplier * job_result.driver_multiplier
+            job_result.sysbox_multiplier
+            * job_result.uptime_multiplier
+            * job_result.driver_multiplier
+            * spot_rental_factor
         )
-        line: MinerLogLine = MinerLogLine.mining_score_calculated(job_result, is_rented_after_cutoff)
+        line: MinerLogLine = MinerLogLine.mining_score_calculated(job_result, spot_rental_factor)
         job_result.record_incentive_log(line)
         logger.info(line.as_internal_log())
+        # a rented node zeroed for no Sysbox must say why (the idle path has its own reason)
+        if job_result.is_rented and job_result.sysbox_multiplier == 0:
+            job_result.record_incentive_log(MinerLogLine.no_payout_because_rented_sysbox_not_confirmed(job_result))
         return job_result
+
+    def _spot_rental_factor(self, job_result: JobResult) -> float:
+        """Share of the mining score a rented spot node keeps; 1.0 for every other node."""
+        return 1.0
 
     async def calculate_final_weights(
         self,
         miners: list[bittensor.NeuronInfo],
-        last_mechanism_step_block: int | None,
         current_epoch: int | None = None,
     ) -> dict[str, float]:
         """Calculate scores with burning logic for this cycle.
@@ -278,7 +277,6 @@ class DefaultIncentive(BaseIncentive):
 
         Args:
             miners: List of miner neuron information
-            last_mechanism_step_block: Last mechanism step block number
 
         Returns:
             dict[str, float]: Scores with burning applied for each miner
@@ -287,7 +285,6 @@ class DefaultIncentive(BaseIncentive):
         burn_scores = self.burn_service.calculate_burn_scores(
             miners=miners,
             burn_share=self.burn_share,  # burn-emission share sourced from shared config (DAH-2274)
-            last_mechanism_step_block=last_mechanism_step_block,
         )
         cycle_scores = dict(burn_scores)
         for miner in miners:
@@ -296,11 +293,46 @@ class DefaultIncentive(BaseIncentive):
                 continue
             cycle_scores[miner.hotkey] = self.miner_incentives.get(miner.hotkey, 0.0)
 
+        self._burn_excluded_hotkey_scores(cycle_scores, burn_scores)
+
         # DAH-2251: fund referral rewards from the residual burn pool, split across the
         # miners who referred paying customers by their EMA (see _apply_referral_pool).
         await self._apply_referral_pool(cycle_scores, burn_scores, miners, current_epoch)
 
         return cycle_scores
+
+    @staticmethod
+    def _burn_excluded_hotkey_scores(cycle_scores: dict[str, float], burn_scores: dict[str, float]) -> None:
+        """Zero every SCORING_EXCLUDED_HOTKEYS hotkey and give what it held to the burn hotkeys.
+
+        Its executors were already scored 0 in every pool, so this is normally a no-op; it is the
+        last guard for any path that still left a score on it. The amount moves to the burn
+        hotkeys in proportion to their burn scores, so the cycle total and every other miner's
+        share stay as they were. A burner is never touched. With no burn score the amount is
+        dropped, and set_weights' normalization spreads it over the rest.
+        """
+        excluded_hotkeys: set[str] = settings.get_scoring_excluded_hotkeys()
+        if not excluded_hotkeys:
+            return
+        freed: float = 0.0
+        for hotkey in excluded_hotkeys:
+            if hotkey in burn_scores or hotkey not in cycle_scores:
+                continue
+            freed += max(cycle_scores[hotkey], 0.0)
+            cycle_scores[hotkey] = 0.0
+        if freed <= 0:
+            return
+        logger.warning(
+            _m(
+                "Excluded hotkey still held a score at final weights; moved to burn",
+                extra=get_extra_info({"freed_score": freed}),
+            )
+        )
+        burn_total: float = sum(burn_scores.values())
+        if burn_total <= 0:
+            return
+        for burner, score in burn_scores.items():
+            cycle_scores[burner] += freed * score / burn_total
 
     async def _apply_referral_pool(
         self,
@@ -339,11 +371,17 @@ class DefaultIncentive(BaseIncentive):
             return
 
         # Eligible referrers: present in THIS cycle's miner list, positive EMA, and never a
-        # burn slot (a burner must not also collect referral emission). Note `miners` is
+        # burn slot (a burner must not also collect referral emission) nor a
+        # SCORING_EXCLUDED_HOTKEYS hotkey (it earns no emission at all). Note `miners` is
         # already filtered by SubtensorClient.fetch_miners to serving axons plus burners,
         # so a referrer whose axon is not serving is not eligible -- same bar as mining.
         cycle_hotkeys = {miner.hotkey for miner in miners}
-        eligible = {hk: e for hk, e in ema.items() if hk in cycle_hotkeys and hk not in burn_scores and e > 0}
+        excluded_hotkeys: set[str] = settings.get_scoring_excluded_hotkeys()
+        eligible = {
+            hk: e
+            for hk, e in ema.items()
+            if hk in cycle_hotkeys and hk not in burn_scores and hk not in excluded_hotkeys and e > 0
+        }
         total_ema = sum(eligible.values())
         if total_ema <= 0:
             # The feed named referrers but none cleared the bar. Silent here would hide a

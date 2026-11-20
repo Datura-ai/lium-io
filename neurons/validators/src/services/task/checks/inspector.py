@@ -1,35 +1,42 @@
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import replace
 from typing import Any
 
+from core.utils import _m, get_extra_info
 from services.const import SECONDS_PER_BLOCK
 from services.inspector_validation_service import InspectorValidationResponse
 
 from core.config import settings
 
-from ..inspector_verdict import InspectorVerdict, build_verdict
+from ..inspector_verdict import InspectorVerdict, build_verdict, host_write_findings
 from ..messages import InspectorMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from ..models import ValidationEvent
 from protocol.vc_protocol.compute_requests import RentedPod
 
+logger = logging.getLogger(__name__)
+
+# Outcomes in which the sensor saw nothing of the rental: an error, a failed canary, a stopped
+# collector, or one that only just started (the collector is restarted before every read, so a host
+# that kills it always reads as just started).
+BLIND_OUTCOMES = frozenset(
+    {"ERROR", "CANARY_FAILED", "COLLECTOR_NOT_RUNNING", "COLLECTOR_RECENTLY_STARTED"}
+)
+BLIND_STREAK_KEY_PREFIX = "inspector:blind_streak"
+BLIND_STREAK_TTL_SECONDS = 24 * 60 * 60
+
 
 class InspectorRentedCheck:
     check_id = "executor.validate.inspector_rented"
+    # a replay that is also blind would count this cycle in the blind streak twice
+    replays_after_session_drop = False
     fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:
-        if not ctx.config.inspector_enabled:
-            event = render_message(
-                Msg.DISABLED,
-                ctx=ctx,
-                check_id=self.check_id,
-            )
-            return CheckResult(passed=True, event=event)
-
         rented_executor = (
             ctx.state.rented_data.executors.get(ctx.executor.uuid)
             if ctx.state.rented_data
@@ -75,6 +82,7 @@ class InspectorRentedCheck:
             inspector_event = _build_inspector_event(
                 ctx, event, rented_pods, result, outcome="ERROR"
             )
+            await _record_blind_streak(ctx, "ERROR")
             return CheckResult(
                 passed=True,
                 event=event,
@@ -103,10 +111,14 @@ class InspectorRentedCheck:
             inspector_event = _build_inspector_event(
                 ctx, event, rented_pods, result, outcome="ERROR", report=report
             )
+            await _record_blind_streak(ctx, "ERROR")
             return CheckResult(
                 passed=True,
                 event=event,
-                updates={"default_extra": extra, "state": replace(ctx.state, inspector_event=inspector_event)},
+                updates={
+                    "default_extra": extra,
+                    "state": replace(ctx.state, inspector_event=inspector_event),
+                },
             )
         warnings = _collector_start_warnings(report)
         verdict = build_verdict(
@@ -116,6 +128,9 @@ class InspectorRentedCheck:
             sensor_attested=sensor_attested,
         )
         if verdict.provider_origin:
+            # a finding seen while the canary failed or the collector was down or just started
+            # does not show the sensor saw everything, so that cycle still counts as blind
+            await _record_blind_streak(ctx, _sensor_outcome(report, warnings))
             return self._record_provider_origin(
                 ctx,
                 verdict=verdict,
@@ -190,6 +205,7 @@ class InspectorRentedCheck:
         inspector_event = _build_inspector_event(
             ctx, event, rented_pods, result, outcome=outcome, report=report, verdict=verdict
         )
+        await _record_blind_streak(ctx, outcome)
         return CheckResult(
             passed=True,
             event=event,
@@ -212,7 +228,39 @@ class InspectorRentedCheck:
     ) -> CheckResult:
         """A provider-origin verdict becomes the MALICIOUS event and the inspector event that
         carries its evidence. It is a record only: the check passes, nothing reaches the score
-        and no renter or backend is asked to act."""
+        and no renter or backend is asked to act. A host write into or read of a rented pod is
+        logged only."""
+        interference = host_write_findings(
+            report, verdict.provider_findings, [p.pod_id for p in rented_pods]
+        )
+        if interference is None:
+            writes, reads = [], []
+            logger.info(
+                _m(
+                    "INSPECTOR_INTERFERENCE_UNSUPPORTED",
+                    extra=get_extra_info(
+                        {**ctx.default_extra, "provider_findings": len(verdict.provider_findings)}
+                    ),
+                )
+            )
+        else:
+            writes, reads = interference
+        if writes or reads:
+            logger.warning(
+                _m(
+                    "INSPECTOR_HOST_WRITE" if writes else "INSPECTOR_HOST_READ",
+                    extra=get_extra_info(
+                        {
+                            **ctx.default_extra,
+                            "host_writes": len(writes),
+                            "host_reads": len(reads),
+                            "commands": [
+                                str(f.get("command"))[:160] for f in (writes + reads)[:5]
+                            ],
+                        }
+                    ),
+                )
+            )
         if verdict.affected_pod_ids:
             impact = "Provider-origin access to a rented pod recorded; score unchanged"
         else:
@@ -244,6 +292,32 @@ class InspectorRentedCheck:
                 "default_extra": extra,
                 "state": replace(ctx.state, inspector_event=inspector_event),
             },
+        )
+
+
+async def _record_blind_streak(ctx: Context, outcome: str) -> None:
+    """Counts the rented cycles in a row whose inspector outcome saw nothing of the rental and logs
+    the streak from INSPECTOR_BLIND_STREAK_LIMIT on. A record only: it never fails the check or the
+    score. A collector that only just started counts as blind."""
+    key = f"{BLIND_STREAK_KEY_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
+    try:
+        if outcome not in BLIND_OUTCOMES:
+            await ctx.services.redis.delete(key)
+            return
+        streak = int(await ctx.services.redis.get(key) or 0) + 1
+        await ctx.services.redis.set(key, str(streak), ex=BLIND_STREAK_TTL_SECONDS)
+    except Exception:
+        logger.warning(
+            _m("INSPECTOR_BLIND_STREAK_UNAVAILABLE", extra=get_extra_info(ctx.default_extra)),
+            exc_info=True,
+        )
+        return
+    if streak >= settings.INSPECTOR_BLIND_STREAK_LIMIT:
+        logger.warning(
+            _m(
+                "INSPECTOR_BLIND_STREAK",
+                extra=get_extra_info({**ctx.default_extra, "streak": streak, "outcome": outcome}),
+            )
         )
 
 
@@ -294,6 +368,17 @@ def _sensor_attested(ctx: Context) -> bool:
     # Elsewhere the checksum was read through the provider's own shell and proves nothing — say
     # so in the verdict.
     return bool(ctx.tdx_attestation_passed) and settings.ENABLE_ATTESTATION_WHITELIST
+
+
+def _sensor_outcome(report: dict[str, Any], warnings: list[dict[str, Any]]) -> str:
+    """The blind-streak outcome of a cycle with a provider-origin finding."""
+    if _canary_failed(report):
+        return "CANARY_FAILED"
+    if _collector_not_running(report):
+        return "COLLECTOR_NOT_RUNNING"
+    if warnings:
+        return "COLLECTOR_RECENTLY_STARTED"
+    return "MALICIOUS"
 
 
 def _canary_failed(report: dict[str, Any]) -> bool:

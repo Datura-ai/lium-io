@@ -15,6 +15,8 @@ services:
       - /etc/nvidia-container-runtime/config.toml:/etc/nvidia-container-runtime/config.toml
       - reserve_data:/var/lium-reserve
       - pod_logs:/var/lib/executor-pod-logs
+      # DAH-5729: sshd host keys survive recreation (ssh_host_keys.sh)
+      - ssh_host_keys:/var/lib/executor-ssh-host-keys
     pid: host
     privileged: true
     # A renter's workload gets the whole host's cores and nearly all its RAM, with nothing reserved
@@ -75,3 +77,4 @@ services:
 volumes:
   reserve_data:
   pod_logs:
+  ssh_host_keys:

@@ -16,8 +16,7 @@ its own reason and says nothing about our network.
 
 Each node's observations ride on its ``JobResult`` (``attach_pod_ssh``). A rented node the cycle
 has no result for (the miner timed out, failed, or left it out of its answer) gets a minimal result
-carrying only its observations, reason ``EXECUTOR_RESULT_MISSING`` (``pod_ssh_only_results``),
-with ``RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED`` on.
+carrying only its observations, reason ``EXECUTOR_RESULT_MISSING`` (``pod_ssh_only_results``).
 """
 
 from __future__ import annotations
@@ -34,6 +33,7 @@ from services.task.availability import (
     SMALLEST_FLEET_THAT_CAN_SHOW_AN_OUTAGE,
 )
 from services.task.checks.rented_pod_ssh import ConnectOutcome, tcp_connect_fault
+from services.node_host import node_owner
 from services.task.models import JobResult, build_msg
 
 from core.utils import _m, get_extra_info
@@ -81,12 +81,16 @@ async def probe_rented_pods(
     if not targets:
         return {}
     limit = asyncio.Semaphore(concurrency)
+    owners = {str(uuid).lower(): executor.miner_hotkey for uuid, executor in rented.executors.items()}
 
-    async def probe(host: str, port: int) -> ConnectOutcome:
+    async def probe(executor_uuid: str, host: str, port: int) -> ConnectOutcome:
         async with limit:
-            return await tcp_connect_fault(host, port, timeout)
+            with node_owner(owners.get(executor_uuid)):  # a hostname node's DNS counts against its miner
+                return await tcp_connect_fault(host, port, timeout)
 
-    outcomes = await asyncio.gather(*(probe(host, port) for _, _, host, port, _ in targets))
+    outcomes = await asyncio.gather(
+        *(probe(executor_uuid, host, port) for executor_uuid, _, host, port, _ in targets)
+    )
     fleet_ok = fleet_is_ok(
         outcome.result
         for (*_, status), outcome in zip(targets, outcomes, strict=True)

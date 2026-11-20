@@ -51,7 +51,7 @@ def _rented_data(executor_uuid: str) -> RentedExecutorsResponse:
 
 def _inspector_context(context_factory, **overrides):
     return context_factory(
-        config=build_context_config(inspector_enabled=True),
+        config=build_context_config(),
         **overrides,
     )
 
@@ -65,22 +65,6 @@ def _healthy_report(**overrides: Any) -> dict:
     }
     report.update(overrides)
     return report
-
-
-@pytest.mark.asyncio
-async def test_inspector_check_skips_when_disabled(context_factory):
-    service = DummyInspectorService(InspectorValidationResponse(report={}))
-    ctx = context_factory(
-        config=build_context_config(inspector_enabled=False),
-        services=build_services(inspector=service),
-        state=build_state(rented_data=_rented_data("executor-123")),
-    )
-
-    result = await InspectorRentedCheck().run(ctx)
-
-    assert result.passed is True
-    assert result.event.reason_code == Msg.DISABLED.reason
-    assert service.called is False
 
 
 @pytest.mark.asyncio

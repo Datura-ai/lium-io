@@ -34,12 +34,12 @@ APP_DIR = DSTACKTEE_DIR / "app"
 # (neurons/validators/src/services/const.py, TDX_WHITELIST["COMPOSE_HASH"]) in the same PR —
 # neurons/validators/tests/test_tdx_compose_hash_whitelist.py fails otherwise.
 APPROVED_RUNNER_IMAGE_DIGEST = (
-    "sha256:8c07d3a91f8900bd3f0e19025fb7a2c32f82577385550187b28c7769060d18b7"
+    "sha256:f8421a1d93c62029326e86bbd5ad5192c480477c68e87811fe4084bd499c854c"
 )
-# The day that runner image was pushed to Docker Hub (const.py, DAH-2861). The approved digest does
+# The day that runner image was pushed to Docker Hub (const.py, DAH-5243). The approved digest does
 # not change per release, so the digest is older than the tag whose notes carry it; the notes say so,
 # or a provider reads it as this release's runner.
-APPROVED_RUNNER_IMAGE_PUSHED = "2026-08-19"
+APPROVED_RUNNER_IMAGE_PUSHED = "2026-10-26"
 
 COMPOSE_FILES = {
     "prod": "docker-compose.yml",

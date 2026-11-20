@@ -5,37 +5,65 @@ from .capability import CapabilityCheck
 from .collateral_status import CollateralStatusCheck
 from .cpu_truth import CpuTruthCheck
 from .disk_health import DiskHealthCheck
+from .disk_space import DiskSpaceCheck, SplitDiskCheck
 from .custom_build_orphan_sweep import CustomBuildOrphanSweepCheck
+from .rental_egress_guard import RentalEgressGuardCheck
 from .duplicate_executor import DuplicateExecutorCheck
 from .executor_image import ExecutorImageCheck
 from .finalize import FinalizeCheck
 from .gpu_count import GpuCountCheck
+from .gpu_attestation_identity import GpuAttestationIdentityCheck
 from .gpu_fault_probe import GpuFaultProbeCheck
+from .gpu_memory_health import GpuMemoryHealthCheck
 from .gpu_fingerprint import GpuFingerprintCheck
+from .gpu_kernel_count import GpuKernelCountCheck
+from .gpu_loss_hold import GpuLossHoldCheck
 from .gpu_model_valid import GpuModelValidCheck
+from .gpu_clock_lock import GpuClockLockCheck
 from .gpu_power_limit import GpuPowerLimitCheck
+from .gpu_thermal_throttle import GpuThermalThrottleCheck
 from .gpu_usage import GpuUsageCheck
 from .gpu_vram_precheck import GpuVramPrecheck
+from .spec_floor import SpecFloorCheck
+from .gpu_model_verdict import GpuModelVerdictCheck
+from .hardware_identity import HardwareIdentityCheck
 from .inspector import InspectorRentedCheck
 from .local_verify import LocalVerifyCheck
 from .machine_spec_scrape import MachineSpecScrapeCheck
+from .node_account import NodeAccountCheck
+from .nvlink_fault import NvlinkFaultCheck
 from .nvml_digest import NvmlDigestCheck
+from .pinned_memory_probe import PinnedMemoryProbeCheck
 from .port_connectivity import PortConnectivityCheck
+from .post_rental_gpu_recheck import PostRentalGpuRecheckCheck
 from .provider_side_load import ProviderSideLoadCheck
 from .registry_pull import RegistryPullCheck
+from .container_download_speed import ContainerDownloadSpeedCheck
+from .idle_disk_write import IdleDiskWriteCheck
 from .rental_probe import RentalProbeCheck
 from .port_count import PortCountCheck
 from .rental_verification import RentalVerificationCheck
+from .rented_pod_network import RentedPodNetworkCheck
+from .rented_pod_ownership import RentedPodOwnershipCheck
+from .rented_pod_resources import RentedPodResourcesCheck
+from .rented_throughput import RentedThroughputCheck
 from .rented_gpu_drop import RentedGpuDropCheck
-from .rented_machine import TenantEnforcementCheck
+from .provider_maintenance import ProviderMaintenanceCheck
+from .rented_machine import HalfStartedStopRetryCheck, TenantEnforcementCheck
 from .score import ScoreCheck
 from .spec_change import SpecChangeCheck
+from .storage_limit import StorageLimitCheck
+from .sshd_bootstrap import SshdBootstrapCheck
+from .sshd_auth_log import SshdAuthLogCheck
 from .stale_container_cleanup import StaleContainerCleanupCheck
 from .start_gpu_monitor import StartGPUMonitorCheck
+from .docker_cpu import DockerCpuCheck
+from .needrestart_guard import NeedrestartGuardCheck
+from .pid_host_required import PidHostRequiredCheck
 from .sysbox_required import SysboxRequiredCheck
 from .tdx_host import TdxHostCheck
 from .upload_files import UploadFilesCheck
-from .verifyx import VerifyXCheck
+from .verifyx import VerifyXCheck, VerifyXColdRetryCheck
 
 __all__ = [
     "BannedGpuCheck",
@@ -45,35 +73,66 @@ __all__ = [
     "CollateralStatusCheck",
     "CpuTruthCheck",
     "DiskHealthCheck",
+    "DiskSpaceCheck",
+    "SplitDiskCheck",
     "CustomBuildOrphanSweepCheck",
+    "RentalEgressGuardCheck",
     "DuplicateExecutorCheck",
     "ExecutorImageCheck",
     "FinalizeCheck",
     "GpuCountCheck",
+    "GpuAttestationIdentityCheck",
     "GpuFaultProbeCheck",
+    "GpuMemoryHealthCheck",
     "GpuFingerprintCheck",
+    "GpuKernelCountCheck",
+    "GpuLossHoldCheck",
     "GpuModelValidCheck",
+    "GpuClockLockCheck",
     "GpuPowerLimitCheck",
+    "GpuThermalThrottleCheck",
     "GpuUsageCheck",
     "GpuVramPrecheck",
+    "SpecFloorCheck",
+    "GpuModelVerdictCheck",
+    "HardwareIdentityCheck",
     "InspectorRentedCheck",
+    "RentedPodNetworkCheck",
+    "RentedPodOwnershipCheck",
+    "RentedPodResourcesCheck",
+    "RentedThroughputCheck",
+    "SshdAuthLogCheck",
     "LocalVerifyCheck",
     "MachineSpecScrapeCheck",
+    "NodeAccountCheck",
+    "NvlinkFaultCheck",
     "NvmlDigestCheck",
+    "PinnedMemoryProbeCheck",
     "PortConnectivityCheck",
     "PortCountCheck",
+    "PostRentalGpuRecheckCheck",
     "ProviderSideLoadCheck",
     "RegistryPullCheck",
+    "ContainerDownloadSpeedCheck",
+    "IdleDiskWriteCheck",
     "RentalProbeCheck",
     "RentalVerificationCheck",
     "RentedGpuDropCheck",
     "TdxHostCheck",
+    "ProviderMaintenanceCheck",
+    "HalfStartedStopRetryCheck",
     "TenantEnforcementCheck",
     "ScoreCheck",
     "StaleContainerCleanupCheck",
     "StartGPUMonitorCheck",
+    "DockerCpuCheck",
+    "NeedrestartGuardCheck",
+    "PidHostRequiredCheck",
     "SysboxRequiredCheck",
     "SpecChangeCheck",
+    "StorageLimitCheck",
+    "SshdBootstrapCheck",
     "UploadFilesCheck",
     "VerifyXCheck",
+    "VerifyXColdRetryCheck",
 ]

@@ -1,0 +1,681 @@
+"""The shadow comparison of `liumd run` with today's verify.
+
+`TaskService.create_task` calls `run_liumd_shadow` once per node, after the pipeline has run and
+the node's `JobResult` is built, on the SSH session the pipeline used. With
+`VALIDATOR_LIUMD_SHADOW` off nothing here runs. With it on the fact steps always run, and with
+`LIUMD_SHADOW_GPU_STEPS_ENABLED` on the GPU steps today's run executed (the capability matmul,
+VerifyX) are prepared again the way their checks prepare them, sent in one signed intent through
+`liumd run` (`LiumdExecClient`), judged with the same functions
+(`evaluate_matmul_output`, `evaluate_verifyx_capture`), and compared with today's verdicts read from
+the run's events. VerifyX's verdict is `verifyx_verdict`, the check's own pass/fail including the
+download-EMA floor, read against the stored EMA; the capture is judged with `record_tally=False`, so
+the shadow writes no EMA, state or network-gate tally. The outcome is one `[liumd_shadow] comparison`
+log line. Nothing is returned to the caller, stored, or scored.
+
+It runs only on the executors listed in `LIUMD_SHADOW_RESERVED_EXECUTORS` (each matched on miner
+hotkey, executor UUID, address and SSH port; empty by default, `all` for every executor), never on
+an express-lane first pass. A listed executor is meant to be reserved and non-rentable; `all` can
+include rentable nodes, so GPU steps are refused with `all` until the rental-overlap guard exists.
+VerifyX is not compared on an executor with no stored download EMA: today's check may take a second
+sample there, the shadow takes one (`liumd_reason="cold_sample_retry"`).
+
+Today's verdict per step comes from the pipeline's events: both checks are fatal, so a check that
+failed is the run's last event on a run that did not pass; one that reported a skip reason did not
+run its probe; one with no event was never reached. The shadow runs no GPU work where today's run
+ran none: a node with a filler or a pod (by today's events or the run's rented snapshot), a step
+whose check skipped, or a run that stopped before either check. It is bounded by the time the
+executor task has left, so it cannot push the node's result past the task's timeout.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from dataclasses import dataclass
+from typing import Any, Callable
+
+from datura.requests.validator_requests import MatmulStep, VerifyXStep
+from services.liumd_exec_client import LiumdExecClient, LiumdRefusal
+from services.local_verify_client import (
+    DETAIL_MAX_CHARS,
+    STEP_NAMES,
+    LocalVerifyAnswer,
+    LocalVerifyUnavailable,
+    build_intent,
+    executor_deadline_s,
+)
+from services.verifyx_validation_service import SSHCapture
+
+from core.config import settings
+from core.utils import _m, get_extra_info
+
+from .checks.capability import CapabilityCheck
+from .checks.local_verify import _step_reason
+from .checks.machine_spec_scrape import normalize_liumd_specs
+from .checks.provider_side_load import docker_containers
+from .checks.verifyx import (
+    MAX_KEPT_UPLOAD_PROBES,
+    MAX_PACKAGE_FALLBACK_PROBES,
+    VerifyXCheck,
+    _first_pass_challenge_config,
+    _kept_upload_probes,
+    _package_fallback_probes,
+    verifyx_verdict,
+)
+from .pipeline import Context
+
+logger = logging.getLogger(__name__)
+
+LIUMD_SHADOW_EVENT = "[liumd_shadow] comparison"
+# `MinerService` runs each executor task under `wait_for(..., JOB_TIME_OUT - 120)`; the express
+# lane allows the whole JOB_TIME_OUT, so the tighter one bounds both.
+TASK_TIMEOUT_MARGIN_SECONDS = 120
+# Left after the shadow for the rest of the task (removing the validator's key, returning).
+TAIL_MARGIN_SECONDS = 60
+# Below this, not even a first-pass run fits; the shadow is skipped rather than cut off.
+MIN_BUDGET_SECONDS = 60
+
+TODAY_CHECK_IDS = {"matmul": CapabilityCheck.check_id, "verifyx": VerifyXCheck.check_id}
+# Reason codes of a check that did not run its probe because a workload holds the cards.
+WORKLOAD_REASONS = frozenset(
+    {
+        "GPU_VERIFY_SKIPPED_ACTIVE_FILLER",
+        "GPU_VERIFY_SKIPPED_RENTED",
+        "VERIFYX_SKIPPED_ACTIVE_FILLER",
+    }
+)
+# Reason codes of a check that did not run its probe for any other reason.
+SKIP_REASONS = WORKLOAD_REASONS | {"VERIFYX_DISABLED", "VERIFYX_SKIPPED_STANDING_PROBE_FAILURE"}
+RAN = ("pass", "fail")
+
+
+@dataclass(frozen=True)
+class TodayStep:
+    """What today's run decided for one step: pass | fail | skipped | not_reached."""
+
+    verdict: str
+    reason_code: str | None = None
+    ms: int | None = None
+
+
+def today_verdicts(ok: bool, events: list) -> dict[str, TodayStep]:
+    stopped_at = events[-1].check_id if events and not ok else None
+    verdicts: dict[str, TodayStep] = {}
+    for step, check_id in TODAY_CHECK_IDS.items():
+        event = next((e for e in reversed(events) if e.check_id == check_id), None)
+        if event is None:
+            verdicts[step] = TodayStep("not_reached")
+            continue
+        reason = event.reason_code
+        ms = (event.context or {}).get("execution_time_ms")
+        if check_id == stopped_at:
+            verdict = "fail"
+        elif reason in SKIP_REASONS:
+            verdict = "skipped"
+        else:
+            verdict = "pass"
+        verdicts[step] = TodayStep(verdict, reason, ms if isinstance(ms, int) else None)
+    return verdicts
+
+
+def shadow_deadline(task_started_at: float) -> float:
+    """The monotonic time by which the shadow must be done, for a task started at
+    `task_started_at` (`time.monotonic()`)."""
+    return (
+        task_started_at + settings.JOB_TIME_OUT - TASK_TIMEOUT_MARGIN_SECONDS - TAIL_MARGIN_SECONDS
+    )
+
+
+def _workload_on_node(ctx: Context, today: dict[str, TodayStep]) -> bool:
+    if any(step.reason_code in WORKLOAD_REASONS for step in today.values()):
+        return True
+    rented = ctx.state.rented_data
+    if rented is None:
+        return False
+    if rented.get_filler_containers(ctx.executor.uuid):
+        return True
+    executor = rented.executors.get(ctx.executor.uuid)
+    return bool(executor and executor.pods)
+
+
+def _reserved(ctx: Context) -> bool:
+    executor = ctx.executor
+    key = (ctx.miner_hotkey, executor.uuid, executor.address, executor.ssh_port)
+    reserved = settings.get_liumd_shadow_reserved_executors()
+    return reserved is None or key in reserved
+
+
+def start_facts_after_scrape(
+    ctx: Context, client_factory: Callable[[Context, float], Any] | None = None
+) -> asyncio.Task | None:
+    """Start liumd's docker and ports read in the background right after machine_scrape, so both
+    read the same containers; the shadow awaits it at the end of the run. None when no shadow
+    will compare this node."""
+    specs_mode = settings.VALIDATOR_LIUMD_SPECS
+    if not (settings.VALIDATOR_LIUMD_SHADOW or specs_mode) or settings.DRY_RUN:
+        return None
+    if ctx.config.first_pass and not specs_mode:
+        return None
+    # called from the fatal scrape check: a shadow error (e.g. a malformed reserved list) must never fail it
+    try:
+        if ctx.config.validator_keypair is None:
+            return None
+        # A shadow only compares reserved idle nodes. The specs path replaces the Python scrape
+        # for every node, so it must not be excluded by the shadow's replay filters.
+        if not specs_mode and (not _reserved(ctx) or _workload_on_node(ctx, {})):
+            return None
+        return asyncio.create_task(_facts_only(ctx, client_factory or _default_client))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            _m(
+                "liumd shadow early facts read not started",
+                extra=get_extra_info({**ctx.default_extra, "error": f"{type(exc).__name__}: {exc}"[:DETAIL_MAX_CHARS]}),
+            )
+        )
+        return None
+
+
+async def _facts_only(ctx: Context, client_factory: Callable[[Context, float], Any]) -> Any:
+    """The liumd answer to a facts-only intent, or the LocalVerifyUnavailable it failed with."""
+    budget = float(settings.LIUMD_SHADOW_TIMEOUT_SECONDS)
+    intent = build_intent(
+        executor_uuid=ctx.executor.uuid,
+        miner_hotkey=ctx.miner_hotkey,
+        matmul=None,
+        verifyx=None,
+        parallel_gpu=False,
+        deadline_s=executor_deadline_s(int(budget)),
+    )
+    intent["steps"]["inspector"] = False
+    try:
+        return await client_factory(ctx, budget).run(ctx.ssh, intent)
+    except LocalVerifyUnavailable as exc:
+        return exc
+    except Exception as exc:  # noqa: BLE001 — the task is awaited later; never fail the cycle
+        return LocalVerifyUnavailable("internal_error", f"{type(exc).__name__}: {exc}"[:DETAIL_MAX_CHARS])
+
+
+def _default_client(ctx: Context, timeout_s: float) -> LiumdExecClient:
+    return LiumdExecClient(ctx.config.validator_keypair, timeout_s=timeout_s)
+
+
+async def run_liumd_shadow(
+    ctx: Context,
+    *,
+    ok: bool,
+    events: list,
+    deadline_monotonic: float,
+    client_factory: Callable[[Context, float], Any] | None = None,
+) -> dict[str, Any]:
+    """Compare, log, and return the logged record (for tests). Never raises."""
+    record: dict[str, Any]
+    try:
+        remaining = deadline_monotonic - time.monotonic()
+        record = await asyncio.wait_for(
+            _compare(ctx, ok, events, remaining, client_factory or _default_client),
+            max(remaining, 0.001),
+        )
+    except TimeoutError:
+        record = {"outcome": "unavailable", "reason": "timeout", "detail": "task budget spent"}
+    except Exception as exc:  # noqa: BLE001 — a shadow bug must never reach the node's cycle
+        record = {
+            "outcome": "error",
+            "reason": "internal_error",
+            "detail": f"{type(exc).__name__}: {exc}"[:DETAIL_MAX_CHARS],
+        }
+    try:
+        logger.info(
+            _m(
+                LIUMD_SHADOW_EVENT,
+                extra=get_extra_info({**ctx.default_extra, "transport": "liumd_shadow", **record}),
+            )
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return record
+
+
+def _skipped(reason: str, **fields: Any) -> dict[str, Any]:
+    return {"outcome": "skipped", "reason": reason, **fields}
+
+
+def _today_fields(today: TodayStep) -> dict[str, Any]:
+    return {"today": today.verdict, "today_reason_code": today.reason_code, "today_ms": today.ms}
+
+
+async def _compare(
+    ctx: Context,
+    ok: bool,
+    events: list,
+    remaining: float,
+    client_factory: Callable[[Context, float], Any],
+) -> dict[str, Any]:
+    today = today_verdicts(ok, events)
+    steps = {name: _today_fields(step) for name, step in today.items()}
+    if settings.MATMUL_ALLCARDS_CHECK_ENABLED:
+        steps["matmul"]["liumd_reason"] = "allcards_ssh"
+    # A pod or filler started after the cycle's snapshot is not seen below, so a listed executor
+    # is meant to be reserved and non-rentable. `all` can include rentable nodes, so GPU steps are
+    # refused with `all` until the rental-overlap guard exists.
+    # Executor UUIDs are miner-chosen: an entry matches only its miner's executor at its endpoint.
+    if not _reserved(ctx):
+        return _skipped("not_reserved", steps=steps)
+    if _workload_on_node(ctx, today):
+        return _skipped("workload", steps=steps)
+    # All-cards enforcement can reject a card before today's matmul; the shadow's one ordinary
+    # matmul is not comparable (checks/local_verify.py `allcards_ssh`).
+    allcards = settings.MATMUL_ALLCARDS_CHECK_ENABLED
+    ask_matmul = (
+        settings.LIUMD_SHADOW_GPU_STEPS_ENABLED
+        and today["matmul"].verdict in RAN
+        and not allcards
+    )
+    # On a never-measured executor today's check may re-measure a cold sample below the gate
+    # (DAH-2959) and pass on the second; the shadow's one sample is not comparable.
+    cold_retry = _cold_retry_possible(ctx)
+    # Past the package-fallback cap today's check scores the package reading as zero; the shadow
+    # still reads it, so the two are not comparable.
+    fallback_cap = (
+        _package_fallback_probes.get((ctx.miner_hotkey, ctx.executor.uuid), 0)
+        > MAX_PACKAGE_FALLBACK_PROBES
+    )
+    # Past the upload keep cap today's check feeds the 429's 0; the shadow's verdict keeps the EMA.
+    upload_cap = (
+        _kept_upload_probes.get((ctx.miner_hotkey, ctx.executor.uuid), 0) > MAX_KEPT_UPLOAD_PROBES
+    )
+    if cold_retry:
+        steps["verifyx"]["liumd_reason"] = "cold_sample_retry"
+    elif fallback_cap:
+        steps["verifyx"]["liumd_reason"] = "package_fallback_cap"
+    elif upload_cap:
+        steps["verifyx"]["liumd_reason"] = "upload_fallback_cap"
+    ask_verifyx = (
+        settings.LIUMD_SHADOW_GPU_STEPS_ENABLED
+        and today["verifyx"].verdict in RAN
+        and not cold_retry
+        and not fallback_cap
+        and not upload_cap
+    )
+    # The fact steps run even when today's run reached no GPU step: the docker, ports and
+    # inspector data is useful on a node that stopped earlier, and the client asks for no GPU work.
+    specs = ctx.state.specs
+    if not specs:
+        return _skipped("no_specs", steps=steps)
+    if ctx.config.validator_keypair is None:
+        return _skipped("no_keypair", steps=steps)
+    budget = min(float(settings.LIUMD_SHADOW_TIMEOUT_SECONDS), remaining)
+    if budget < MIN_BUDGET_SECONDS:
+        return _skipped("no_budget", steps=steps, budget_s=int(budget))
+
+    first_pass = ctx.config.first_pass
+    # The judging functions log with this extra; the transport field keeps the shadow's lines
+    # apart from today's.
+    extra = {**ctx.default_extra, "transport": "liumd_shadow"}
+    matmul_challenge = None
+    try:
+        if ask_matmul:
+            matmul_challenge = ctx.services.validation.prepare_matmul_challenge(
+                specs,
+                extra,
+                vram_budget_mb=settings.FIRST_PASS_MATMUL_VRAM_MB if first_pass else None,
+            )
+            if not matmul_challenge.params.cipher_text:
+                return _skipped("cipher_generation_failed", steps=steps)
+        verifyx_challenge = (
+            ctx.services.verifyx.prepare_verifyx_challenge(
+                specs,
+                extra,
+                challenge_config_overrides=_first_pass_challenge_config() if first_pass else None,
+            )
+            if ask_verifyx
+            else None
+        )
+        intent = build_intent(
+            executor_uuid=ctx.executor.uuid,
+            miner_hotkey=ctx.miner_hotkey,
+            matmul=(
+                MatmulStep(
+                    dim_n=matmul_challenge.params.dim_n,
+                    dim_k=matmul_challenge.params.dim_k,
+                    seed=matmul_challenge.params.seed,
+                    cipher_text=matmul_challenge.params.cipher_text,
+                )
+                if matmul_challenge is not None
+                else None
+            ),
+            verifyx=(
+                VerifyXStep(seed=verifyx_challenge.seed, cipher_text=verifyx_challenge.cipher_text)
+                if verifyx_challenge is not None
+                else None
+            ),
+            parallel_gpu=first_pass,
+            deadline_s=executor_deadline_s(int(budget)),
+        )
+        intent["steps"]["inspector"] = False
+        # The facts come from the read taken right after machine_scrape; liumd is called again
+        # here only for GPU steps. With GPU steps off there is no late fallback: a missing early
+        # read would compare a different Docker moment.
+        facts_only = matmul_challenge is None and verifyx_challenge is None
+        early = ctx.state.liumd_shadow_facts_task
+        if facts_only and ctx.state.liumd_shadow_facts_attempted and early is None:
+            return _skipped("no_facts_read", steps=steps)
+        facts_answer = await early if early is not None else None
+        try:
+            if facts_only and facts_answer is not None:
+                answer = facts_answer
+            else:
+                answer = await client_factory(ctx, budget).run(ctx.ssh, intent)
+            if isinstance(answer, LocalVerifyUnavailable):
+                raise answer
+        except LocalVerifyUnavailable as exc:
+            return {
+                "outcome": "unavailable",
+                "reason": exc.reason,
+                "detail": exc.detail[:DETAIL_MAX_CHARS],
+                "steps": steps,
+                "first_pass": first_pass,
+            }
+        if isinstance(answer, LiumdRefusal):
+            return {
+                "outcome": "refused",
+                "reason": answer.error,
+                "detail": answer.detail,
+                "exit_status": answer.exit_status,
+                "echoed": answer.echoed,
+                "round_trip_ms": answer.round_trip_ms,
+                "steps": steps,
+                "first_pass": first_pass,
+            }
+        if isinstance(facts_answer, LocalVerifyUnavailable):
+            return {
+                "outcome": "unavailable",
+                "reason": facts_answer.reason,
+                "detail": facts_answer.detail[:DETAIL_MAX_CHARS],
+                "steps": steps,
+                "first_pass": first_pass,
+            }
+        if isinstance(facts_answer, LiumdRefusal):
+            return {
+                "outcome": "refused",
+                "reason": facts_answer.error,
+                "detail": facts_answer.detail,
+                "exit_status": facts_answer.exit_status,
+                "echoed": facts_answer.echoed,
+                "round_trip_ms": facts_answer.round_trip_ms,
+                "steps": steps,
+                "first_pass": first_pass,
+            }
+        if not isinstance(facts_answer, LocalVerifyAnswer):
+            facts_answer = answer
+        return _judged(
+            ctx, answer, today, steps, matmul_challenge, verifyx_challenge, extra, facts_answer
+        )
+    finally:
+        if matmul_challenge is not None:
+            matmul_challenge.close()
+
+
+def _not_run_or_fail(step, answer: LocalVerifyAnswer) -> str:
+    # A step the agent skipped, or cut at the suite deadline, never ran to a verdict. `deadline_hit`
+    # is document-wide (any step reached the deadline); a cut step's time is reset to 0, while a
+    # step that timed out at its own cap keeps its time and is a failure.
+    cut = step.status == "timeout" and answer.deadline_hit and step.ms == 0
+    return "not_run" if step.status == "skipped" or cut else "fail"
+
+
+def _stored_ema(ctx: Context):
+    rented = ctx.state.rented_data
+    return rented.network_ema.get(ctx.executor.uuid) if rented is not None else None
+
+
+def _cold_retry_possible(ctx: Context) -> bool:
+    """Whether today's VerifyX could have taken a cold-sample retry on this executor: the
+    backend's answer present and no stored download EMA (`_is_cold_sample_below_gate`)."""
+    if ctx.state.rented_data is None:
+        return False
+    prev_ema = _stored_ema(ctx)
+    return prev_ema is None or prev_ema.ema_verifyx_download_speed is None
+
+
+def _liumd_fields(step, verdict: str, reason: str) -> dict[str, Any]:
+    return {
+        "liumd_status": step.status,
+        "liumd_verdict": verdict,
+        "liumd_reason": reason,
+        "liumd_ms": step.ms,
+    }
+
+
+def _judged(
+    ctx: Context,
+    answer: LocalVerifyAnswer,
+    today: dict[str, TodayStep],
+    steps: dict[str, dict[str, Any]],
+    matmul_challenge,
+    verifyx_challenge,
+    extra: dict,
+    facts_answer: LocalVerifyAnswer,
+) -> dict[str, Any]:
+    if matmul_challenge is not None:
+        step = answer.step("matmul")
+        if step.status != "ok" or step.stdout is None:
+            verdict, reason = (
+                _not_run_or_fail(step, answer),
+                _step_reason(step),
+            )
+        else:
+            result = ctx.services.validation.evaluate_matmul_output(
+                matmul_challenge, stdout=step.stdout, stderr=step.stderr_tail or ""
+            )
+            verdict, reason = ("pass", "ok") if result.success else ("fail", "local_failed")
+        steps["matmul"].update(_liumd_fields(step, verdict, reason))
+    if verifyx_challenge is not None:
+        step = answer.step("verifyx")
+        if step.status != "ok" or step.stdout is None:
+            verdict, reason = (
+                _not_run_or_fail(step, answer),
+                _step_reason(step),
+            )
+        elif step.data.get("lib_sha256") != verifyx_challenge.expected_lib_sha256:
+            verdict, reason = "fail", "lib_mismatch"
+        else:
+            response = ctx.services.verifyx.evaluate_verifyx_capture(
+                verifyx_challenge,
+                SSHCapture(
+                    stdout=step.stdout, stderr=step.stderr_tail, exit_status=step.exit_status
+                ),
+                extra,
+                record_tally=False,
+            )
+            if not (response.data and response.data.get("success")):
+                verdict, reason = "fail", "local_failed"
+            elif verifyx_verdict(response.data, _stored_ema(ctx), first_pass=ctx.config.first_pass):
+                verdict, reason = "pass", "ok"
+            else:
+                verdict, reason = "fail", "network_too_slow"
+        steps["verifyx"].update(_liumd_fields(step, verdict, reason))
+    for name in STEP_NAMES:
+        if name not in steps and name in answer.steps:
+            steps[name] = {
+                "liumd_status": answer.steps[name].status,
+                "liumd_ms": answer.steps[name].ms,
+            }
+
+    # Every step asked for needs a comparable verdict, else the outcome is incomplete.
+    requested = [
+        n for n, c in (("matmul", matmul_challenge), ("verifyx", verifyx_challenge)) if c is not None
+    ]
+    compared = []
+    for name in requested:
+        entry = steps[name]
+        if today[name].verdict in RAN and entry.get("liumd_verdict") in RAN:
+            entry["agree"] = entry["liumd_verdict"] == today[name].verdict
+            compared.append(entry["agree"])
+    complete = len(compared) == len(requested)
+    facts = _facts(ctx, facts_answer)
+    return {
+        "outcome": "compared",
+        "reason": "ok",
+        "agree": all(compared) if complete and compared else None,
+        "facts_agree": facts["agree"],
+        "facts": facts["checks"],
+        "specs_agree": facts["specs_agree"],
+        "specs_diff": facts["specs_diff"],
+        "round_trip_ms": answer.round_trip_ms,
+        "executor_elapsed_ms": answer.elapsed_ms,
+        "executor_version": answer.executor_version,
+        "deadline_hit": answer.deadline_hit,
+        "first_pass": ctx.config.first_pass,
+        "steps": steps,
+    }
+
+
+def _logged_fact(value: Any) -> Any:
+    """A fact value as logged: keep the value when its text fits, else cap the text."""
+    text = value if isinstance(value, str) else str(value)
+    return value if len(text) <= DETAIL_MAX_CHARS else text[:DETAIL_MAX_CHARS]
+
+
+# Fields the two paths read at different moments, or read as different facts. `docker.version`:
+# Python reports its bundled CLI's client version, liumd the daemon's; nothing reads it.
+NOT_COMPARABLE_SPEC_PATHS = frozenset(
+    {
+        "docker.version",
+        "docker.host_cpu_percent",
+        "cpu.utilization",
+        "ram.free",
+        "ram.used",
+        "ram.available",
+        "ram.utilization",
+        "hard_disk.used",
+        "hard_disk.free",
+        "hard_disk.utilization",
+        "hard_disk.engy_cache_used_gb",
+        "hard_disk.images",
+        "hard_disk.containers",
+        "hard_disk.volumes",
+        "docker.containers",
+    }
+)
+LIVE_GPU_DETAIL_FIELDS = frozenset(
+    {
+        "temperature",
+        "gpu_utilization",
+        "memory_utilization",
+        "memory_used_mb",
+        "graphics_speed",
+        "memory_speed",
+        "power_limit",
+        "pcie",
+        "pcie_speed",
+        "clocks_event_reasons",
+    }
+)
+
+
+def _is_not_comparable(path: str) -> bool:
+    if path in NOT_COMPARABLE_SPEC_PATHS:
+        return True
+    if path in {"hard_disk.by_container", "hard_disk.by_volume"}:
+        return True
+    if path.startswith(("hard_disk.by_container.", "hard_disk.by_volume.")):
+        return True
+    if path == "gpu_processes" or path.startswith("gpu_processes["):
+        return True
+    parent, _, leaf = path.rpartition(".")
+    if not parent.endswith("]"):
+        return False
+    return leaf in LIVE_GPU_DETAIL_FIELDS and parent.startswith("gpu.details[")
+
+
+def _spec_diffs(python: Any, liumd: Any, path: str = "") -> list[dict[str, Any]]:
+    """Every differing leaf in the two normalized specs documents, capped for logging."""
+    if path and _is_not_comparable(path):
+        return []
+    diffs: list[dict[str, Any]] = []
+    if type(python) is not type(liumd) and not (
+        isinstance(python, (int, float)) and isinstance(liumd, (int, float))
+    ):
+        return [{"path": path or "$", "python": repr(python)[:120], "liumd": repr(liumd)[:120]}]
+    if isinstance(python, dict):
+        for key in sorted(set(python) | set(liumd)):
+            child = f"{path}.{key}" if path else key
+            if _is_not_comparable(child):
+                continue
+            if key not in python or key not in liumd:
+                diffs.append(
+                    {
+                        "path": child,
+                        "python": repr(python.get(key))[:120],
+                        "liumd": repr(liumd.get(key))[:120],
+                    }
+                )
+            else:
+                diffs.extend(_spec_diffs(python[key], liumd[key], child))
+    elif isinstance(python, list):
+        if len(python) != len(liumd):
+            diffs.append({"path": path or "$", "python": len(python), "liumd": len(liumd)})
+        else:
+            for i, (a, b) in enumerate(zip(python, liumd)):
+                diffs.extend(_spec_diffs(a, b, f"{path}[{i}]"))
+    elif python != liumd:
+        diffs.append({"path": path or "$", "python": repr(python)[:120], "liumd": repr(liumd)[:120]})
+    return diffs[:DETAIL_MAX_CHARS]
+
+
+def _facts(ctx: Context, answer: LocalVerifyAnswer) -> dict[str, Any]:
+    """Compare the facts both paths collect. Missing or skipped data is not a mismatch."""
+    specs = ctx.state.scrape_specs if ctx.state.scrape_specs is not None else (ctx.state.specs or {})
+    checks: list[dict[str, Any]] = []
+
+    def check(field: str, liumd: Any, python: Any) -> None:
+        checks.append(
+            {
+                "field": field,
+                "liumd": _logged_fact(liumd),
+                "python": _logged_fact(python),
+                "agree": liumd == python,
+            }
+        )
+
+    docker = answer.step("docker")
+    data = docker.data if docker.status == "ok" and isinstance(docker.data, dict) else None
+    if (
+        data
+        and isinstance(data.get("containers"), list)
+        and isinstance(specs.get("docker"), dict)
+    ):
+        # liumd lists every container; today's scrape lists the running ones, and `specs` is the
+        # miner's raw machine JSON, so read it through the check that owns that shape.
+        liumd_names = sorted(
+            c["name"]
+            for c in data["containers"]
+            if isinstance(c, dict) and c.get("name") and c.get("status") == "running"
+        )
+        python_names = sorted(row.name for row in docker_containers(specs) if row.name)
+        check("docker.container_names", liumd_names, python_names)
+
+    ports = answer.step("ports")
+    data = ports.data if ports.status == "ok" and isinstance(ports.data, dict) else None
+    if data:
+        check("ports.port_range", data.get("port_range"), ctx.executor.port_range)
+        check("ports.port_mappings", data.get("port_mappings"), ctx.executor.port_mappings)
+
+    inspector = answer.step("inspector")
+    data = inspector.data if inspector.status == "ok" and isinstance(inspector.data, dict) else None
+    local_checksum = getattr(getattr(ctx.services, "inspector", None), "local_checksum", None)
+    if data and local_checksum:
+        check("inspector.lib_sha256", data.get("lib_sha256"), local_checksum)
+
+    raw_specs = answer.specs
+    liumd_specs = normalize_liumd_specs(raw_specs) if isinstance(raw_specs, dict) and raw_specs else {}
+    python_specs = ctx.state.scrape_specs
+    compared = python_specs is not None and bool(liumd_specs)
+    diffs = _spec_diffs(python_specs, liumd_specs) if compared else []
+    return {
+        "agree": all(c["agree"] for c in checks) if checks else None,
+        "checks": checks,
+        "specs_agree": (not diffs) if compared else None,
+        "specs_diff": diffs,
+    }

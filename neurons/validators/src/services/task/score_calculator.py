@@ -8,6 +8,7 @@ from typing import Tuple
 
 from core.config import settings, shared_client
 from services.executor_image_policy import ImageVerdict
+from services.gpu_spec_table import normalize_gpu_model, reference_gpu_model
 from services.task.pipeline import Context
 
 
@@ -37,37 +38,39 @@ def calculate_scores(
     # Outdated executor image (DAH-2701). Enforcement is off by default until nodes
     # auto-update again (DAH-3419); off, ExecutorImageCheck logs the verdict as a warning.
     image_report = getattr(ctx.state, "executor_image_report", None)
-    if (
-        settings.EXECUTOR_IMAGE_CHECK_ENFORCE
-        and image_report
-        and image_report.status is ImageVerdict.OUTDATED
+    if image_report and (
+        image_report.status is ImageVerdict.UNOFFICIAL
+        or (settings.EXECUTOR_IMAGE_CHECK_ENFORCE and image_report.status is ImageVerdict.OUTDATED)
     ):
         actual_score = 0.0
         job_score = 0.0
         warning_messages.append("Required executor image is outdated")
 
     # Machine price check
+    # DAH-5088: no cap for an unknown model priced like a reference (the backend's worker skips it too): the
+    # cheapest same-memory model is a payout floor, not a fair price; the soft limit still gates its idle pay
+    gpu_details = getattr(ctx.state, "gpu_details", None) or []
+    capacity_mb = gpu_details[0].get("capacity") if gpu_details else None
+    referenced = reference_gpu_model(gpu_model, capacity_mb) not in (None, normalize_gpu_model(gpu_model))
     base_price = shared_client.config.machine_prices.get(gpu_model, 0)
     max_price_rate = shared_client.config.machine_max_price_rate
-    if price_per_gpu and price_per_gpu > base_price * max_price_rate:
+    if price_per_gpu and not referenced and price_per_gpu > base_price * max_price_rate:
         actual_score = 0.0
         warning_messages.append(
             f"GPU price exceeds the limit. limit: {base_price * max_price_rate}, actual: {price_per_gpu}"
         )
 
     # Minimal-G5 CVM attestation gate: a CVM-flagged executor (it presented a TDX
-    # quote) whose attestation did not pass earns nothing while TCB enforcement is
+    # quote) whose TDX attestation did not pass earns nothing while TCB enforcement is
     # on. Non-CVM executors (no quote) are untouched — omitted-quote bypass by a
-    # known CVM is rejected upstream by the attestation ratchet.
-    if (
-        settings.ENABLE_TDX_ATTESTATION
-        and settings.ENABLE_TCB_ENFORCEMENT
-        and ctx.executor.tdx_quote
-        and not ctx.tdx_attestation_passed
-    ):
+    # known CVM is rejected upstream by the attestation ratchet. GPU attestation is
+    # observe-only: tdx_attestation_passed also drops on a verified-bad GPU verdict
+    # (only verified beside a TDX digest, so False implies one), and that alone must not zero the score.
+    tdx_passed = ctx.tdx_attestation_passed or ctx.gpu_attestation_passed is False
+    if settings.ENABLE_TCB_ENFORCEMENT and ctx.executor.tdx_quote and not tdx_passed:
         actual_score = 0.0
         job_score = 0.0
-        warning_messages.append("CVM attestation not passed (TDX/GPU attestation required)")
+        warning_messages.append("CVM attestation not passed (TDX attestation required)")
 
     # CPU-truth gate: the advertised CPU(s) count is contradicted by the kernel-present
     # population. CpuTruthCheck is non-fatal and runs before this, so passed=False alone would
@@ -77,6 +80,11 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append("Advertised CPU cores exceed the host's physical cores")
 
+    if not ctx.spec_floor_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("Reported specs below the hardware floor")
+
     # Provider-side load gate (DAH-2734): the host burns CPU or disk outside Lium's containers
     # while it sells that capacity — the CPU/disk twin of the foreign-GPU gate. Same mechanics
     # as the CPU-truth gate above: the check is non-fatal, so only this line zeroes the score,
@@ -85,6 +93,68 @@ def calculate_scores(
         actual_score = 0.0
         job_score = 0.0
         warning_messages.append("Provider-side workload consumes the machine's CPU or disk")
+
+    # Rented-pod resources gate (DAH-4564): same mechanics as the CPU-truth gate above.
+    if not ctx.rented_pod_resources_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("Host pinned or throttled a rented pod below its deployed CPUs")
+
+    # Rented throughput gate: same mechanics.
+    if not ctx.rented_throughput_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append(
+            "Rented throughput reading could not run in several cycles in a row"
+            if ctx.rented_throughput_not_run
+            # the portal matches the prefix; the detail after it names the side and its values
+            else "A rented pod gets far too little network or disk throughput"
+            + (f" ({ctx.rented_throughput_slow_detail})" if ctx.rented_throughput_slow_detail else "")
+        )
+
+    # GPU identity gate (DAH-4551): non-fatal on a live rental, so only this line zeroes the
+    # score there; shadow leaves the flag True.
+    if not ctx.gpu_attestation_identity_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("GPU identity changed or could not be verified against the card")
+
+    # CC VBIOS gate (DAH-5329): same mechanics; shadow leaves the flag True.
+    if not ctx.cc_vbios_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("GPU VBIOS is below NVIDIA's minimum for multi-GPU Confidential Computing")
+
+    # Host hardware identity gate (DAH-4547): non-fatal on a live rental, so only this line zeroes it.
+    if not ctx.hardware_identity_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("Host hardware identity does not match the hardware")
+
+    # Kernel GPU view gate: BannedProviderCheck is non-fatal on a live rental, so only this
+    # line zeroes the score there.
+    if not ctx.kernel_gpu_view_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("Kernel GPU list was overlaid and could not be trusted")
+    # Kernel GPU-count gate (DAH-4982): same mechanics as the CPU-truth gate above.
+    if not ctx.gpu_kernel_count_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("The kernel lists fewer GPUs than the node reports")
+
+    # GPU model gate (DAH-6241): same mechanics; the renter's pod keeps running, the provider is not paid.
+    if not ctx.gpu_model_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("A GPU is not the model the node reports")
+
+    # Node account gate (DAH-6539): a rented node on another account's machine scores 0; its renter's pod runs on and
+    # is billed as usual.
+    if not ctx.node_account_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("The node is not on the machine its account registered")
 
     # EMA verifyx download speed check — threshold enforced upstream in VerifyXCheck
     ema_verifyx_download = ((ctx.state.specs or {}).get("network") or {}).get(

@@ -1,0 +1,55 @@
+name: "CD: lium mine preflight image"
+
+# Builds neurons/validators/Dockerfile.preflight and pushes daturaai/compute-subnet-validator:preflight,
+# the image `lium mine` runs for its GPU check before a node is added. A tag of the validator
+# repository, because the lium-io-publish OIDC ruleset already covers it. It is published from main
+# when its inputs change, not with a validator tag: validator releases no longer push tags, and
+# a stale image rejects every GPU model added since it was built.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - neurons/validators/Dockerfile.preflight
+      - neurons/validators/src/preflight/**
+      - neurons/validators/src/services/**
+      - neurons/validators/*.so
+      - .github/workflows/lium_preflight_image.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lium-preflight-image
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: dockerhub-push
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build before the login: the base image is a public docker.io image, and once the OIDC
+      # token is the docker.io credential every pull uses it.
+      - name: Build the image
+        run: |
+          cd neurons/validators
+          docker build -f Dockerfile.preflight -t daturaai/compute-subnet-validator:preflight .
+
+      - name: Log in to Docker Hub (OIDC, no stored token)
+        uses: docker/login-action@v4   # >= 4.5.0 for Docker Hub OIDC
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: "1800"
+        with:
+          username: daturaai
+
+      - name: Push the image
+        run: docker push daturaai/compute-subnet-validator:preflight

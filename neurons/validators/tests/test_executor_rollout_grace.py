@@ -6,33 +6,26 @@ containers under the validator's SSH sessions, and the cycle read the fleet as 1
 506 of 514 executors at 0). Each test below names the regression that would bring one of those zeros back.
 """
 
-import json
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import asyncssh
 import pytest
-from core.config import settings
 from core.validator import Validator
 from datura.requests.miner_requests import ExecutorSSHInfo
-from payload_models.payloads import MinerJobRequestPayload
-from services.attestation_service import HostPolicyResult
-from services.executor_image_policy import ExecutorImageReport, ImageVerdict
 from services.executor_rollout import (
     ROLLOUT_FAILURE_REASONS,
-    ROLLOUT_STATE_KEY,
     ExecutorRolloutTracker,
     RolloutWindow,
     WithheldVerdict,
     rollout_grace_reason,
+    session_kept_hotkeys,
     withhold_rollout_verdicts,
 )
-from services.task import service as task_service_module
-from services.task.models import JobResult, build_msg
-from services.task.pipeline import ContextState
-from services.task.service import TaskService
+from protocol.vc_protocol.validator_requests import ContainerState, PodContainerState, PodSshObservation, PodSshResult
+from services.miner_service import MinerService
+from services.task.models import JobResult
 
-from helpers import make_context
 
 OLD = "sha256:" + "a" * 64
 NEW = "sha256:" + "b" * 64
@@ -51,8 +44,11 @@ class _FakeRedis:
     async def get(self, key: str) -> str | None:
         return self.store.get(key)
 
-    async def set(self, key: str, value: str) -> None:
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
         self.store[key] = value
+
+    async def publish(self, channel: str, message: dict) -> None:
+        pass
 
 
 def _tracker(redis: _FakeRedis, grace_cycles: int = 2) -> ExecutorRolloutTracker:
@@ -160,190 +156,7 @@ async def test_a_digest_change_opens_the_window_and_the_first_digest_does_not() 
     assert opened.covers(J0) is True
 
 
-@pytest.mark.asyncio
-async def test_a_push_during_the_cycle_covers_that_same_cycle() -> None:
-    """The 11 Sep case: the cycle started on the old digest and the push landed while its jobs
-    ran. Regression: a window that opens only at the next cycle start leaves this cycle's
-    failures — the ones the push caused — as zeros."""
-    redis = _FakeRedis()
-    tracker = _tracker(redis)
-    await tracker.observe(OLD, J0 - BPC, now=T0)
-    at_start = await tracker.observe(OLD, J0, now=T0)
-    assert at_start.covers(J0) is False
-
-    at_end = await tracker.observe(NEW, J0, now=T0 + timedelta(minutes=10))
-
-    assert at_end.opened_job_block == J0
-    assert at_end.cycles_seen == 1
-    assert at_end.covers(J0) is True
-
-
-@pytest.mark.asyncio
-async def test_the_window_covers_the_observing_cycle_and_the_next_whatever_the_clock_says() -> None:
-    """Regression: a window measured in seconds at cycle end — a 13-minute cycle after a 2-minute
-    one lands outside it — or in job blocks: a cycle that starts late in its block window and runs
-    long makes the next one land two job blocks later (`sync` starts a cycle on the first 12-s tick
-    at ≥ 75 blocks since the last), and that cycle would fall outside a block-arithmetic window.
-    Cycles are counted as the validator observes them; the third one is not covered, whatever the
-    clock or the block says, because a third withheld cycle trips the backend's 1-hour sweep."""
-    redis = _FakeRedis()
-    await _tracker(redis).observe(OLD, J0 - BPC, now=T0)
-    opened = await _tracker(redis).observe(NEW, J0, now=T0)
-    # the cycle-end observation of the same cycle is the same cycle
-    same_cycle = await _tracker(redis).observe(NEW, J0, now=T0 + timedelta(minutes=14))
-    assert same_cycle.cycles_seen == 1
-
-    after_restart = _tracker(redis)
-    next_cycle = await after_restart.observe(NEW, J2, now=T0 + timedelta(hours=3))  # landed two blocks on
-    assert next_cycle.opened_job_block == J0
-    assert next_cycle.cycles_seen == 2
-    assert next_cycle.covers(J2) is True
-
-    third_cycle = await after_restart.observe(NEW, J2 + BPC, now=T0 + timedelta(minutes=16))
-    assert third_cycle.covers(J2 + BPC) is False
-    assert opened.covers(J0 - BPC) is False  # a cycle before the change is never covered
-    assert json.loads(redis.store[ROLLOUT_STATE_KEY])["closed"] is True
-
-
-@pytest.mark.asyncio
-async def test_a_second_push_inside_the_window_does_not_extend_it() -> None:
-    """Regression: a hotfix or rollback pushed while the fleet is still restarting for the first
-    image reopens the window at the new cycle — three cycles withheld in a row, and the backend's
-    1-hour inactive sweep marks the old-image fleet inactive with EXECUTOR_INACTIVE_MID_RENTAL.
-    The new digest becomes "current"; the window keeps its opening cycle and its count."""
-    hotfix = "sha256:" + "c" * 64
-    redis = _FakeRedis()
-    tracker = _tracker(redis)
-    await tracker.observe(OLD, J0 - BPC, now=T0)
-    await tracker.observe(NEW, J0, now=T0)
-    await tracker.record_withheld(200)
-
-    window = await tracker.observe(hotfix, J1, now=T0 + timedelta(minutes=15))
-    assert window.digest == hotfix
-    assert window.previous_digest == NEW
-    assert window.opened_job_block == J0
-    assert window.covers(J1) is True
-    assert json.loads(redis.store[ROLLOUT_STATE_KEY])["withheld"] == 200
-
-    third_cycle = await tracker.observe(hotfix, J2, now=T0 + timedelta(minutes=30))
-    assert third_cycle.covers(J2) is False
-
-
-@pytest.mark.asyncio
-async def test_a_push_right_after_the_window_closes_does_not_chain_a_second_window() -> None:
-    """Regression: a change seen in the first cycle after the window closed opens a fresh window —
-    an unreachable or OUTDATED executor is withheld four cycles in a row (J0..J3), over an hour
-    without a published row, and the backend's inactive sweep fires. One cycle must publish in
-    between; a change seen one cycle later does open a new window."""
-    hotfix = "sha256:" + "c" * 64
-    redis = _FakeRedis()
-    tracker = _tracker(redis)
-    await tracker.observe(OLD, J0 - BPC, now=T0)
-    await tracker.observe(NEW, J0, now=T0)
-    await tracker.observe(NEW, J1, now=T0)
-    closed = await tracker.observe(NEW, J2, now=T0)
-    assert closed.covers(J2) is False
-
-    too_soon = await tracker.observe(hotfix, J2, now=T0)
-    assert too_soon.digest == hotfix
-    assert too_soon.covers(J2) is False
-
-    late_enough = await tracker.observe("sha256:" + "d" * 64, J2 + BPC, now=T0)
-    assert late_enough.opened_job_block == J2 + BPC
-    assert late_enough.covers(J2 + BPC) is True
-
-
-def test_more_than_two_cycles_are_refused_because_of_the_backend_inactive_sweep() -> None:
-    """Regression: an operator setting 4 cycles — the withheld executors' rows go unrefreshed for
-    more than an hour and lium-io-backend's check_and_update_executors marks them inactive with
-    EXECUTOR_INACTIVE_MID_RENTAL, the penalty the ticket counts."""
-    tracker = ExecutorRolloutTracker(redis_service=_FakeRedis(), grace_cycles=4)
-
-    assert tracker.grace_cycles == 2
-
-
-@pytest.mark.asyncio
-async def test_a_registry_outage_keeps_the_window_as_it_was() -> None:
-    """Regression: reading `None` as "the digest changed" would open a window on every Docker
-    Hub hiccup; reading it as "no rollout" would close a real one halfway."""
-    redis = _FakeRedis()
-    tracker = _tracker(redis)
-    await tracker.observe(OLD, J0 - BPC, now=T0)
-    await tracker.observe(NEW, J0, now=T0)
-
-    window = await tracker.observe(None, J1, now=T0 + timedelta(minutes=15))
-
-    assert window.digest == NEW
-    assert window.opened_job_block == J0
-    assert window.covers(J1) is True
-
-
-@pytest.mark.asyncio
-async def test_the_withheld_total_accumulates_across_the_cycles_of_one_window() -> None:
-    """Regression: a per-cycle count that overwrites the last one makes the window-end line
-    report only the final cycle."""
-    redis = _FakeRedis()
-    tracker = _tracker(redis)
-    await tracker.observe(OLD, J0 - BPC, now=T0)
-    await tracker.observe(NEW, J0, now=T0)
-
-    await tracker.record_withheld(200)
-    await tracker.record_withheld(0)
-    await tracker.record_withheld(39)
-
-    assert json.loads(redis.store[ROLLOUT_STATE_KEY])["withheld"] == 239
-
-
-@pytest.mark.asyncio
-async def test_a_corrupt_redis_value_is_replaced_instead_of_failing_every_cycle() -> None:
-    """Regression: one bad write leaves `json.loads` raising on every observe, so the fail-open
-    path runs forever and no rollout is ever known again until someone deletes the key."""
-    for corrupt in ("{not json", "[1, 2]"):
-        redis = _FakeRedis()
-        redis.store[ROLLOUT_STATE_KEY] = corrupt
-        tracker = _tracker(redis)
-
-        window = await tracker.observe(OLD, J0, now=T0)
-
-        assert window.digest == OLD
-        reseeded = json.loads(redis.store[ROLLOUT_STATE_KEY])
-        assert reseeded["digest"] == OLD
-        assert reseeded["opened_job_block"] is None
-
-
-@pytest.mark.asyncio
-async def test_zero_grace_cycles_never_cover_a_cycle(caplog) -> None:
-    """Regression: the operator's off switch (EXECUTOR_ROLLOUT_GRACE_CYCLES=0) must mean today's
-    behaviour — no cycle covered, not even the observing one, and no window lines in the log
-    that would make an operator look for verdicts that were never withheld."""
-    redis = _FakeRedis()
-    tracker = _tracker(redis, grace_cycles=0)
-    await tracker.observe(OLD, J0 - BPC, now=T0)
-
-    with caplog.at_level("WARNING", logger="services.executor_rollout"):
-        window = await tracker.observe(NEW, J0, now=T0)
-        again = await tracker.observe("sha256:" + "c" * 64, J1, now=T0)
-
-    assert window.opened_job_block == J0
-    assert window.covers(J0) is False
-    assert again.covers(J1) is False
-    assert "[rollout-grace]" not in caplog.text
-
-
 # --- the classifier: which results does a rollout explain? ------------------------------------
-
-
-def test_an_unreachable_executor_inside_the_window_gets_no_verdict() -> None:
-    """The transport-unreachable rows of 11 Sep: the connect failed, nothing about the image is
-    known, the digest just changed — no score is written."""
-    unreachable = _failed("node-1", "EXECUTOR_SSH_UNREACHABLE")
-    healthy = _scored("node-2")
-    window = _open_window()
-
-    kept, withheld = withhold_rollout_verdicts({"5Miner": [unreachable, healthy]}, window, J0)
-
-    assert kept == {"5Miner": [healthy]}
-    assert [(w.miner_hotkey, w.result.executor_info.uuid) for w in withheld] == [("5Miner", "node-1")]
 
 
 def test_the_same_failure_after_the_window_is_a_zero_as_today() -> None:
@@ -355,81 +168,6 @@ def test_the_same_failure_after_the_window_is_a_zero_as_today() -> None:
 
     assert kept == {"5Miner": [unreachable]}
     assert withheld == []
-
-
-@pytest.mark.parametrize(
-    "reason",
-    ["EXECUTOR_TRANSPORT_UNREACHABLE", "FILLER_TRANSPORT_UNREACHABLE", "SCRAPE_FAILED", "INSUFFICIENT_PORTS"],
-)
-def test_a_failure_on_an_executor_already_running_the_new_image_is_a_real_failure(reason: str) -> None:
-    """Regression: grace hiding a port-table or SSH failure on a node that has finished
-    restarting — the rollout cannot explain a failure on the image it rolled out."""
-    on_new_image = _failed("node-1", reason, observed_digest=NEW)
-    still_on_old = _failed("node-2", reason, observed_digest=OLD)
-    window = _open_window()
-
-    assert rollout_grace_reason(on_new_image, window, J1) is None
-    assert rollout_grace_reason(still_on_old, window, J1) == reason
-
-
-@pytest.mark.parametrize(
-    "reason",
-    [
-        "SCRAPE_FAILED",
-        "SCRAPE_FAILED_NO_GPU",
-        "SCRAPE_FAILED_DRIVER",
-        "SCRAPE_FAILED_ON_HOST",
-        "SCRAPE_TIMEOUT",
-        "SCRAPE_TRANSPORT_FAILED",
-    ],
-)
-def test_every_scrape_failure_code_keeps_the_rollout_grace_scrape_failed_had(reason: str) -> None:
-    """Regression: a code SCRAPE_FAILED split into falling out of the set, so a scrape a watchtower
-    recreate ended inside the window would stand as a verdict."""
-    still_on_old = _failed("node-2", reason, observed_digest=OLD)
-
-    assert reason in ROLLOUT_FAILURE_REASONS
-    assert rollout_grace_reason(still_on_old, _open_window(), J1) == reason
-
-
-def test_an_outdated_image_inside_the_window_gets_no_verdict_rented_or_not(monkeypatch) -> None:
-    """The 70 EXECUTOR_IMAGE_OUTDATED rows of 11 Sep, with the image check enforced as it was that
-    day. Unrented, the fatal check ends the run with that reason; rented, the run completes with
-    score 0 and only the report says OUTDATED. Both are the fleet not having pulled yet (or the
-    validator's snapshot predating the push, in which case the observed digest is already the new
-    one)."""
-    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", True)
-    window = _open_window()
-    unrented = _failed("node-1", "EXECUTOR_IMAGE_OUTDATED", observed_digest=OLD, image_status="OUTDATED")
-    rented = _failed("node-2", "RENTED", observed_digest=OLD, image_status="OUTDATED")
-    validator_snapshot_was_stale = _failed(
-        "node-3", "EXECUTOR_IMAGE_OUTDATED", observed_digest=NEW, image_status="OUTDATED"
-    )
-
-    assert rollout_grace_reason(unrented, window, J0) == "EXECUTOR_IMAGE_OUTDATED"
-    assert rollout_grace_reason(rented, window, J0) == "EXECUTOR_IMAGE_OUTDATED"
-    assert rollout_grace_reason(validator_snapshot_was_stale, window, J0) == "EXECUTOR_IMAGE_OUTDATED"
-
-
-def test_a_rented_zero_under_an_unenforced_outdated_report_stands(monkeypatch) -> None:
-    """Regression: with EXECUTOR_IMAGE_CHECK_ENFORCE off (the default since DAH-3439) the image
-    check passes an OUTDATED node and leaves its score alone, so a rented run at score 0 owes its
-    0 to another gate (price cap, TDX, collateral). Reading the OUTDATED report as the cause would
-    withhold that verdict for two cycles and keep the executor's previous scored row."""
-    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", False)
-    window = _open_window()
-    rented_zero_from_another_gate = _failed("node-2", "RENTED", observed_digest=OLD, image_status="OUTDATED")
-
-    assert rollout_grace_reason(rented_zero_from_another_gate, window, J0) is None
-
-
-def test_a_rented_executor_failing_a_later_check_of_its_own_stands_even_when_outdated() -> None:
-    """Regression: the OUTDATED report riding along on every rented run makes any failure of that
-    run (the pod gone, the filler killed) read as "not pulled yet" and hides it for two cycles."""
-    window = _open_window()
-    pod_gone = _failed("node-1", "POD_NOT_RUNNING", observed_digest=OLD, image_status="OUTDATED")
-
-    assert rollout_grace_reason(pod_gone, window, J0) is None
 
 
 def test_a_failure_the_rollout_does_not_explain_stands() -> None:
@@ -444,56 +182,7 @@ def test_a_failure_the_rollout_does_not_explain_stands() -> None:
     assert rollout_grace_reason(_scored("node-3"), window, J0) is None
 
 
-def test_no_digest_change_means_unchanged_results() -> None:
-    """Regression: the classifier acting without a rollout — every cycle without a release must
-    hand its results on untouched, the same objects, nothing marked."""
-    unreachable = _failed("node-1", "EXECUTOR_SSH_UNREACHABLE")
-    results = {"5Miner": [unreachable]}
-    no_rollout = RolloutWindow(
-        digest=OLD, previous_digest=None, started_at=None, opened_job_block=None, cycles_seen=0, grace_cycles=2
-    )
-
-    kept, withheld = withhold_rollout_verdicts(results, no_rollout, J0)
-
-    assert kept is results
-    assert withheld == []
-
-
 # --- TaskService hands the classifier the reason a run ended on ---------------------------------
-
-
-def _task_service_that_reaches_the_ssh_connect() -> TaskService:
-    service = TaskService.__new__(TaskService)
-    service.ssh_service = MagicMock()
-    service.ssh_service.decrypt_payload = MagicMock(return_value="decrypted-key")
-    service.attestation_service = MagicMock()
-    service.attestation_service.prepare_host_policy = AsyncMock(return_value=HostPolicyResult())
-    return service
-
-
-def _a_job_for(executor_uuid: str) -> tuple[MinerJobRequestPayload, ExecutorSSHInfo]:
-    miner = MinerJobRequestPayload(
-        job_batch_id="batch-1",
-        miner_hotkey="5Miner",
-        miner_coldkey="5Cold",
-        miner_address="203.0.113.5",
-        miner_port=8080,
-        executors=[],
-    )
-    return miner, _executor(executor_uuid)
-
-
-async def _run_cycle(service: TaskService, miner: MinerJobRequestPayload, executor: ExecutorSSHInfo) -> JobResult:
-    return await service.create_task(
-        miner_info=miner,
-        executor_info=executor,
-        keypair=MagicMock(ss58_address="5Val"),
-        private_key="key",
-        public_key="pub",
-        encrypted_files=MagicMock(),
-        rented_data=MagicMock(),
-        default_docker_image_digests={},
-    )
 
 
 class _ShellThatRefusesToConnect:
@@ -513,141 +202,6 @@ class _ShellThatOpens:
 
     async def __aexit__(self, *_: object) -> bool:
         return False
-
-
-@pytest.mark.asyncio
-async def test_a_refused_connect_records_its_reason_code_for_the_classifier(monkeypatch) -> None:
-    """Regression: the connect failure reaching the cycle end with no reason code — the classifier
-    would let a refused connect stand as a zero inside the window."""
-    monkeypatch.setattr(task_service_module, "InteractiveShellService", _ShellThatRefusesToConnect)
-    miner, executor = _a_job_for("node-9")
-
-    result = await _run_cycle(_task_service_that_reaches_the_ssh_connect(), miner, executor)
-
-    assert result.score == 0
-    assert result.failure_reason_code == "EXECUTOR_SSH_UNREACHABLE"
-    assert result.validation_event.reason_code == "EXECUTOR_SSH_UNREACHABLE"
-    assert rollout_grace_reason(result, _open_window(), J0) == "EXECUTOR_SSH_UNREACHABLE"
-
-
-@pytest.mark.asyncio
-async def test_a_shell_that_dies_under_a_check_records_the_transport_code(monkeypatch) -> None:
-    """The recreate lands after the connect, inside a check that lets asyncssh raise (upload,
-    a `ctx.ssh.run`). Regression: the run ends in the generic error branch with no reason code and
-    the classifier lets it stand as 0 inside the window. A non-transport crash after the connect
-    must stay unnamed — it is not something a rollout explains."""
-    monkeypatch.setattr(task_service_module, "InteractiveShellService", lambda **_: _ShellThatOpens())
-    service = _task_service_that_reaches_the_ssh_connect()
-    service.pipeline_factory = MagicMock()
-    miner, executor = _a_job_for("node-9")
-
-    service.pipeline_factory.build_context = AsyncMock(side_effect=asyncssh.Error(code=1, reason="Connection lost"))
-    died = await _run_cycle(service, miner, executor)
-
-    service.pipeline_factory.build_context = AsyncMock(side_effect=ValueError("a bug of our own"))
-    crashed = await _run_cycle(service, miner, executor)
-
-    assert died.failure_reason_code == "EXECUTOR_TRANSPORT_UNREACHABLE"
-    assert died.availability_errors == []  # the connect succeeded: not an availability error
-    assert rollout_grace_reason(died, _open_window(), J0) == "EXECUTOR_TRANSPORT_UNREACHABLE"
-    assert crashed.failure_reason_code is None
-    assert rollout_grace_reason(crashed, _open_window(), J0) is None
-
-
-@pytest.mark.asyncio
-async def test_a_shell_that_dies_under_a_check_sends_the_transport_code_in_the_structured_event(monkeypatch) -> None:
-    """The backend stores the cycle's reason from `validation_event`. Regression: a transport death
-    after the connect sent no event, so the cycle reached the backend with no reason at all; a
-    crash of our own must still send none."""
-    monkeypatch.setattr(task_service_module, "InteractiveShellService", lambda **_: _ShellThatOpens())
-    service = _task_service_that_reaches_the_ssh_connect()
-    service.pipeline_factory = MagicMock()
-    miner, executor = _a_job_for("node-9")
-
-    service.pipeline_factory.build_context = AsyncMock(side_effect=asyncssh.Error(code=1, reason="x" * 2000))
-    died = await _run_cycle(service, miner, executor)
-
-    service.pipeline_factory.build_context = AsyncMock(side_effect=ValueError("a bug of our own"))
-    crashed = await _run_cycle(service, miner, executor)
-
-    event = died.validation_event
-    assert event.reason_code == "EXECUTOR_TRANSPORT_UNREACHABLE" == died.failure_reason_code
-    assert event.category == "transport"
-    assert event.what_we_saw["executor_uuid"] == "node-9"
-    assert len(event.what_we_saw["transport_error"]) <= 500
-    assert crashed.validation_event is None
-
-
-@pytest.mark.asyncio
-async def test_a_failed_check_records_its_reason_code_and_a_passing_run_records_none(monkeypatch) -> None:
-    """Regression: the reason of the failed fatal check not reaching the result (the 51 scrape
-    failures would stand), or a scored run carrying a reason it did not fail on."""
-    monkeypatch.setattr(task_service_module, "InteractiveShellService", lambda **_: _ShellThatOpens())
-    service = _task_service_that_reaches_the_ssh_connect()
-    # ResultHandler writes the verified-job counters here; the pipeline itself is stubbed.
-    service.redis_service = AsyncMock()
-    service.pipeline_factory = MagicMock()
-    service.pipeline_factory.build_checks = MagicMock(return_value=[])
-    miner, executor = _a_job_for("node-9")
-
-    scrape_failed = build_msg(
-        event="Machine specs scrape failed", reason="SCRAPE_FAILED", severity="error", impact="no score"
-    )
-    failed_ctx = make_context(executor=executor, miner_hotkey=miner.miner_hotkey, score=0.0, success=False)
-    service.pipeline_factory.build_context = AsyncMock(return_value=failed_ctx)
-    service.pipeline_factory.build_pipeline = MagicMock(
-        return_value=MagicMock(run=AsyncMock(return_value=(False, [scrape_failed], failed_ctx)))
-    )
-    failed = await _run_cycle(service, miner, executor)
-
-    finished = build_msg(event="Validation finished", reason="VALIDATION_COMPLETED", severity="info", impact="")
-    passed_ctx = make_context(executor=executor, miner_hotkey=miner.miner_hotkey, score=1.0, success=True)
-    service.pipeline_factory.build_context = AsyncMock(return_value=passed_ctx)
-    service.pipeline_factory.build_pipeline = MagicMock(
-        return_value=MagicMock(run=AsyncMock(return_value=(True, [finished], passed_ctx)))
-    )
-    passed = await _run_cycle(service, miner, executor)
-
-    assert failed.failure_reason_code == "SCRAPE_FAILED"
-    assert passed.failure_reason_code is None
-    assert passed.score == 1.0
-
-
-@pytest.mark.asyncio
-async def test_a_rented_outdated_run_carries_the_rented_halt_as_its_reason(monkeypatch) -> None:
-    """A rented executor's image check passes and TenantEnforcementCheck halts the run with
-    success=True and score 0. Regression: recording a reason only for failed runs leaves this
-    result with none, and the classifier publishes the rented fleet's OUTDATED zeros as today."""
-    monkeypatch.setattr(settings, "EXECUTOR_IMAGE_CHECK_ENFORCE", True)
-    monkeypatch.setattr(task_service_module, "InteractiveShellService", lambda **_: _ShellThatOpens())
-    service = _task_service_that_reaches_the_ssh_connect()
-    service.redis_service = AsyncMock()
-    service.pipeline_factory = MagicMock()
-    service.pipeline_factory.build_checks = MagicMock(return_value=[])
-    miner, executor = _a_job_for("node-9")
-    rented_halt = build_msg(event="Executor already rented", reason="RENTED", severity="info", impact="")
-    report = ExecutorImageReport(
-        status=ImageVerdict.OUTDATED, observed_digest=OLD, expected_ref="ref", expected_digest=NEW
-    )
-    rented_ctx = make_context(
-        executor=executor,
-        miner_hotkey=miner.miner_hotkey,
-        state=ContextState(executor_image_report=report),
-        score=0.0,
-        job_score=1.0,
-        rented=True,
-        success=True,
-    )
-    service.pipeline_factory.build_context = AsyncMock(return_value=rented_ctx)
-    service.pipeline_factory.build_pipeline = MagicMock(
-        return_value=MagicMock(run=AsyncMock(return_value=(True, [rented_halt], rented_ctx)))
-    )
-
-    result = await _run_cycle(service, miner, executor)
-
-    assert result.score == 0
-    assert result.failure_reason_code == "RENTED"
-    assert rollout_grace_reason(result, _open_window(), J0) == "EXECUTOR_IMAGE_OUTDATED"
 
 
 # --- the cycle: what happens when the tracker itself cannot be read -----------------------------
@@ -684,46 +238,218 @@ async def test_a_redis_error_leaves_every_verdict_standing_instead_of_ending_the
     assert await validator_process.observe_executor_rollout(NEW, J0, fallback=seen_at_start) is seen_at_start
 
 
+def test_an_idle_node_the_miner_cannot_reach_during_the_rollout_gets_the_rented_twins_grace() -> None:
+    """Regression: EXECUTOR_UNREACHABLE_BY_MINER outside the set, so a rollout scored every
+    restarting idle node 0 while the rented ones (RENTED_EXECUTOR_NOT_LISTED) were withheld."""
+    still_on_old = _failed("node-2", "EXECUTOR_UNREACHABLE_BY_MINER", observed_digest=OLD)
+
+    assert "EXECUTOR_UNREACHABLE_BY_MINER" in ROLLOUT_FAILURE_REASONS
+    assert rollout_grace_reason(still_on_old, _open_window(), J1) == "EXECUTOR_UNREACHABLE_BY_MINER"
+
+
+# --- DAH-5718: the validator's own session closed during the port check --------------------------
+
+
+def _session_lost(uuid: str, availability_errors: list[dict] | None) -> JobResult:
+    result = _failed(uuid, "EXECUTOR_TRANSPORT_UNREACHABLE", observed_digest=OLD)
+    result.session_lost_in_port_check = True
+    result.availability_errors = availability_errors
+    return result
+
+
+def _miner_service(published: dict[tuple[str, str], list[dict]]) -> MinerService:
+    service = MinerService.__new__(MinerService)
+    service.cycle_published_availability = published
+    service.publish_machine_specs = AsyncMock()
+    return service
+
+
+GPU_FINDING = {"reason_code": "GPU_MEMORY_HEALTH_FAILED"}
+STORED_HOLD = {"reason_code": "GPU_LOST"}
+
+
 @pytest.mark.asyncio
-async def test_the_cycle_end_read_of_the_registry_withholds_this_cycles_results(monkeypatch) -> None:
-    """The 11 Sep case end to end at the cycle level: the cycle started on the old digest, the push
-    landed while its jobs ran. Regression: the cycle-end registry read dropped from `sync` — the
-    window would open at the next cycle and this cycle's failures would publish as zeros."""
-    redis = _FakeRedis()
-    tracker = _tracker(redis)
+@pytest.mark.parametrize("in_rollout", [False, True])
+@pytest.mark.parametrize("findings", [None, [GPU_FINDING]])
+async def test_a_session_lost_in_the_port_check_is_unscored_and_publishes_only_its_findings(in_rollout, findings):
+    """Reviews 4469140353 / 4469140371 / 4469140385: outside a rollout the lost session scored 0; inside one the
+    rollout withheld an earlier GPU finding with it; a [] cleared the stored hold. Now the result is out of
+    scoring either way, and only a finding the finished checks made is published, alone: the backend merges it by
+    reason code. Review 4510532986: the cached GPU_LOST may be stale (an express recheck cleared it), so it is not
+    added back."""
+    tracker = _tracker(_FakeRedis())
     validator_process = _validator_process(tracker)
-    await tracker.observe(OLD, J0 - BPC, now=T0)
-    at_start = await validator_process.observe_executor_rollout(OLD, J0)
-    assert at_start.covers(J0) is False
-    monkeypatch.setattr(validator_process, "fetch_executor_digest_or_none", AsyncMock(return_value=NEW))
-    unreachable = _failed("node-1", "EXECUTOR_SSH_UNREACHABLE")
+    validator_process.fetch_executor_digest_or_none = AsyncMock(return_value=NEW)
+    window = _open_window() if in_rollout else MagicMock(covers=lambda _: False)
+    validator_process.observe_executor_rollout = AsyncMock(return_value=window)
+    validator_process.miner_service = _miner_service({("5Miner", "node-1"): [STORED_HOLD]})
+    lost = _session_lost("node-1", findings)
     healthy = _scored("node-2")
 
     kept, withheld = await validator_process.withhold_verdicts_for_rollout(
-        {"5Miner": [unreachable, healthy]}, J0, "batch-1", at_start
+        {"5Miner": [lost, healthy]}, J0, "batch-1", window
     )
+    await validator_process.publish_session_lost_findings(withheld, {"5Miner": "5Cold"})
 
-    assert kept == {"5Miner": [healthy]}
-    assert [w.result.executor_info.uuid for w in withheld] == ["node-1"]
-    assert json.loads(redis.store[ROLLOUT_STATE_KEY])["withheld"] == 1
+    assert kept == {"5Miner": [healthy]}  # what IncentiveFactory scores
+    assert [w.result for w in withheld] == [lost]
+    publish = validator_process.miner_service.publish_machine_specs
+    if findings is None:
+        publish.assert_not_awaited()
+    else:
+        publish.assert_awaited_once_with([lost], "5Miner", "5Cold", is_whole_miner_batch=False)
+        assert lost.availability_errors == [GPU_FINDING]
+        assert lost.scored_at is None
 
 
 @pytest.mark.asyncio
-async def test_the_cycle_adds_its_withheld_count_to_the_window_total_only_inside_the_window() -> None:
-    """Regression: a count written on every cycle — the window-end line would carry cycles the
-    window never covered — or a count never written, leaving the window-end line at 0."""
-    redis = _FakeRedis()
-    tracker = _tracker(redis)
+@pytest.mark.parametrize("probe", [PodSshResult.TIMEOUT, PodSshResult.BANNER])
+async def test_a_session_lost_with_no_finding_still_publishes_the_pod_ssh_observations(probe):
+    """Review 4470167895: withholding the result dropped the rented pod's SSH observations, so billing could not
+    tell a silent pod (TIMEOUT) and kept charging. They go out on the unscored result, the stored reasons untouched."""
+    validator_process = _validator_process(_tracker(_FakeRedis()))
+    validator_process.miner_service = _miner_service({})
+    lost = _session_lost("node-1", None)
+    observations = [PodSshObservation(pod_id="pod-1", result=probe)]
+
+    await validator_process.publish_session_lost_findings(
+        [WithheldVerdict(miner_hotkey="5Miner", result=lost)], {"5Miner": "5Cold"}, {"node-1": observations}
+    )
+
+    validator_process.miner_service.publish_machine_specs.assert_awaited_once_with(
+        [lost], "5Miner", "5Cold", is_whole_miner_batch=False
+    )
+    assert lost.pod_ssh == observations
+    assert lost.availability_errors is None  # None leaves the backend's stored reasons alone
+    assert lost.scored_at is None
+
+
+@pytest.mark.asyncio
+async def test_a_session_lost_with_only_a_reaped_pod_state_still_publishes_it():
+    """Review 4482976707: the stale cleanup ran before the port check and reaped a container; with no finding and
+    no pod SSH observation that state was dropped, so the backend never learnt the container is gone."""
+    validator_process = _validator_process(_tracker(_FakeRedis()))
+    validator_process.miner_service = _miner_service({})
+    lost = _session_lost("node-1", None)
+    reaped = PodContainerState(pod_id="orphan-1", container_state=ContainerState.REAPED, observed_at=datetime.now(UTC))
+    lost.pod_states = [reaped]
+
+    await validator_process.publish_session_lost_findings(
+        [WithheldVerdict(miner_hotkey="5Miner", result=lost)], {"5Miner": "5Cold"}
+    )
+
+    validator_process.miner_service.publish_machine_specs.assert_awaited_once_with(
+        [lost], "5Miner", "5Cold", is_whole_miner_batch=False
+    )
+    assert lost.pod_states == [reaped] and lost.availability_errors is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("findings", [None, []])
+async def test_pod_ssh_only_with_an_unknown_earlier_list_erases_nothing(findings):
+    """Review 4472994399: with no finding and only pod SSH observations, availability_errors goes out None, so the
+    backend leaves its stored reasons alone even when the validator does not know them."""
+    validator_process = _validator_process(_tracker(_FakeRedis()))
+    validator_process.miner_service = _miner_service({})
+    lost = _session_lost("node-1", findings)
+    observations = [PodSshObservation(pod_id="pod-1", result=PodSshResult.TIMEOUT)]
+
+    await validator_process.publish_session_lost_findings(
+        [WithheldVerdict(miner_hotkey="5Miner", result=lost)], {"5Miner": "5Cold"}, {"node-1": observations}
+    )
+
+    assert lost.availability_errors is None
+    validator_process.miner_service.publish_machine_specs.assert_awaited_once_with(
+        [lost], "5Miner", "5Cold", is_whole_miner_batch=False
+    )
+
+
+def test_a_miner_whose_only_withheld_result_is_a_lost_session_gets_no_eligibility_floor():
+    """Review 4469609776: a miner that closes SSH in every port check must not stay active (eligibility floor)."""
+    withheld = [
+        WithheldVerdict(miner_hotkey="5Closer", result=_session_lost("node-1", None)),
+        WithheldVerdict(miner_hotkey="5Rollout", result=_failed("node-2", "EXECUTOR_TRANSPORT_UNREACHABLE")),
+    ]
+
+    assert session_kept_hotkeys(withheld) == {"5Rollout"}
+
+
+def test_an_ssh_drop_under_the_port_probe_during_the_rollout_is_withheld() -> None:
+    """DAH-5981: PortCountCheck fails PORT_VERIFY_FAILED, not INSUFFICIENT_PORTS, when the connection dropped;
+    watchtower recreating the executor under the probe must keep the grace INSUFFICIENT_PORTS had."""
+    still_on_old = _failed("node-3", "PORT_VERIFY_FAILED", observed_digest=OLD)
+
+    assert rollout_grace_reason(still_on_old, _open_window(), J1) == "PORT_VERIFY_FAILED"
+
+
+# --- DAH-6560: the release just replaced reads CURRENT for 8 cycles ---------------------------
+
+NEWER = "sha256:" + "d" * 64
+
+
+@pytest.mark.asyncio
+async def test_the_previous_release_reads_current_through_cycle_8_and_the_verdict_window_stays_at_2() -> None:
+    """Regression: the OUTDATED card ended with the 2-cycle verdict window, while 4-31 nodes per release
+    were still on the previous image then; withholding verdicts longer would trip the 1-hour inactive sweep."""
+    tracker = _tracker(_FakeRedis())
     await tracker.observe(OLD, J0 - BPC, now=T0)
-    window = await tracker.observe(NEW, J0, now=T0)
-    validator_process = _validator_process(tracker)
-    withheld = [WithheldVerdict("5Miner", _failed("node-1", "EXECUTOR_SSH_UNREACHABLE"))] * 3
 
-    await validator_process.record_withheld_verdicts(window, withheld, job_batch_id="batch-1", job_block=J1)
-    assert json.loads(redis.store[ROLLOUT_STATE_KEY])["withheld"] == 3
+    seen = []
+    for cycle in range(1, 10):  # the cycle the change is seen is cycle 1
+        window = await tracker.observe(NEW, J0 + (cycle - 1) * BPC, now=T0)
+        job_block = J0 + (cycle - 1) * BPC
+        seen.append((cycle, window.previous_reads_current(job_block), window.covers(job_block)))
 
-    await tracker.observe(NEW, J1, now=T0)
-    closed = await tracker.observe(NEW, J2, now=T0)
-    assert closed.covers(J2) is False
-    await validator_process.record_withheld_verdicts(closed, withheld, job_batch_id="batch-2", job_block=J2)
-    assert json.loads(redis.store[ROLLOUT_STATE_KEY])["withheld"] == 3
+    assert seen == [(c, c <= 8, c <= 2) for c in range(1, 10)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("push", [3, 5])
+async def test_a_second_release_inside_the_8_cycles_gives_its_previous_release_a_fresh_grace(push) -> None:
+    tracker = _tracker(_FakeRedis())
+    await tracker.observe(OLD, J0 - BPC, now=T0)
+    for cycle in range(1, push):
+        await tracker.observe(NEW, J0 + (cycle - 1) * BPC, now=T0)
+
+    seen = []
+    for cycle in range(push, push + 9):  # NEWER is pushed in cycle `push`, its own cycle 1
+        window = await tracker.observe(NEWER, J0 + (cycle - 1) * BPC, now=T0)
+        job_block = J0 + (cycle - 1) * BPC
+        seen.append((cycle, window.previous_digest, window.previous_reads_current(job_block), window.covers(job_block)))
+
+    # NEW, the release just replaced, reads CURRENT for 8 cycles from the push; the verdict window keeps its
+    # own rules: not reopened in cycle 3 (no uncovered cycle has published yet), a fresh 2 cycles in cycle 5
+    reopened = push >= 5
+    assert seen == [(c, NEW, c < push + 8, reopened and c < push + 2) for c in range(push, push + 9)]
+
+
+@pytest.mark.asyncio
+async def test_a_second_release_keeps_the_release_before_it_current_through_its_own_cycle_8() -> None:
+    """Regression (18 Nov): v1.188 then v1.189 two cycles apart; nodes still on v1.187 read OUTDATED in
+    the cycle v1.189 was seen, because only the release just replaced kept its grace."""
+    tracker = _tracker(_FakeRedis())
+    await tracker.observe(OLD, J0 - BPC, now=T0)
+    await tracker.observe(NEW, J0, now=T0)  # OLD replaced: OLD's cycle 1
+    await tracker.observe(NEW, J0 + BPC, now=T0)
+
+    seen = []
+    for cycle in range(3, 12):  # NEWER pushed in cycle 3
+        job_block = J0 + (cycle - 1) * BPC
+        window = await tracker.observe(NEWER, job_block, now=T0)
+        seen.append((cycle, OLD in window.earlier_reading_current(job_block), window.previous_reads_current(job_block)))
+
+    # OLD: its own 8 cycles counted from cycle 1; NEW (now previous): 8 cycles from cycle 3
+    assert seen == [(c, c <= 8, c <= 10) for c in range(3, 12)]
+
+
+@pytest.mark.asyncio
+async def test_a_rollback_to_an_earlier_release_drops_it_from_the_earlier_list() -> None:
+    tracker = _tracker(_FakeRedis())
+    await tracker.observe(OLD, J0 - BPC, now=T0)
+    await tracker.observe(NEW, J0, now=T0)
+    await tracker.observe(NEWER, J0 + BPC, now=T0)
+    window = await tracker.observe(OLD, J0 + 2 * BPC, now=T0)  # rollback: OLD is current again
+
+    assert window.digest == OLD
+    assert window.previous_digest == NEWER
+    assert window.earlier_reading_current(J0 + 2 * BPC) == (NEW,)

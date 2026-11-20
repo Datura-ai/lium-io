@@ -52,14 +52,20 @@ services:
       context: ../neurons/executor
       additional_contexts:
         datura: ../datura
+        liumd: ../neurons/executor/liumd
     image: lium-e2e/executor
     network_mode: service:dind
+    # Match a provider executor: it can inspect the daemon host's saved plugin manifest
+    # through /proc/1/root. Here that host is dind, not the outer CI runner.
+    pid: service:dind
+    privileged: true
     depends_on:
       dind:
         condition: service_healthy
     env_file: executor/e2e.env
     environment:
       MINER_HOTKEY_SS58_ADDRESS: ${E2E_MINER_HOTKEY}
+      LIUM_POOL_HOTKEY: ${E2E_POOL_HOTKEY}
       INTERNAL_PORT: ${E2E_EXECUTOR_PORT}
       SSH_PORT: ${E2E_EXECUTOR_SSH_PORT}
       SSH_PUBLIC_PORT: ${E2E_EXECUTOR_SSH_PORT}
@@ -72,6 +78,8 @@ services:
       # the validator hotkey the executor trusts — production bakes it into the image (core/config.py); the :dev
       # images override it the same way, through core/config_override.py
       - ./executor/trust_anchor.py:/root/app/src/core/config_override.py:ro
+      # GPU-less host: the rental-start power read sees no GPUs (executor/nvidia-smi)
+      - ./executor/nvidia-smi:/usr/local/bin/nvidia-smi:ro
       # the host's docker socket, as on a provider's machine (exists once dind is healthy — see depends_on)
       - ./.dind-sock/docker.sock:/var/run/docker.sock
     healthcheck:
@@ -164,7 +172,7 @@ services:
 
   # The validator image plus pytest. The suites import the validator's own services (MinerService, TaskService,
   # DockerService) and run them against the miner and the executor above — the same code path the validator
-  # process takes every cycle, minus the chain (the subtensor client is never constructed).
+  # process takes every cycle, minus the chain (the subtensor client is never connected).
   tester:
     build:
       context: ./tester
@@ -189,6 +197,7 @@ services:
       E2E_MINER_HOTKEY: ${E2E_MINER_HOTKEY}
       E2E_MINER_MNEMONIC: ${E2E_MINER_MNEMONIC}
       E2E_STRANGER_MNEMONIC: ${E2E_STRANGER_MNEMONIC}
+      E2E_POOL_HOTKEY: ${E2E_POOL_HOTKEY}
       E2E_EXECUTOR_IP: ${E2E_EXECUTOR_IP}
       E2E_EXECUTOR_PORT: ${E2E_EXECUTOR_PORT}
       E2E_EXECUTOR_SSH_PORT: ${E2E_EXECUTOR_SSH_PORT}

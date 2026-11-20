@@ -7,7 +7,6 @@ from constants import TOTAL_BURN_EMISSION
 BASE_JOB_SCORE = 1.0
 BURNER_COUNT = 2
 MINING_ALLOCATION = 1 - TOTAL_BURN_EMISSION
-SYSBOX_PENALTY_PORTION = 0.1
 UPTIME_PENALTY_PORTION = 0.2
 UPTIME_REQUIRED_MINUTES = 120
 
@@ -31,7 +30,7 @@ def expected_score(
 ) -> float:
     score = BASE_JOB_SCORE * portion * gpu_count / total_gpu_count
     if not sysbox_runtime:
-        score *= 1 - SYSBOX_PENALTY_PORTION
+        return 0.0  # sysbox is required: a node without it scores 0
     if not collateral_deposited:
         uptime_ratio = min(1.0, (uptime_minutes or 0) / UPTIME_REQUIRED_MINUTES)
         score *= 1 - UPTIME_PENALTY_PORTION + UPTIME_PENALTY_PORTION * uptime_ratio
@@ -403,7 +402,7 @@ async def test_scenario_mixed_sysbox_usage(
     create_job_result,
     create_neuron_info,
 ):
-    """Miners using sysbox should score higher than those not using it."""
+    """Sysbox is required: a miner without it scores 0, the one with it takes the mining pool."""
     validator = validator_with_mocks
     validator.miner_scores = {}
 
@@ -1465,7 +1464,7 @@ async def test_set_weights_floors_live_miner_on_a_retired_burner_uid(
     mock_subtensor_client,
     create_neuron_info,
 ):
-    # BURNERS holds the pre-DAH-2274 slots; with the new burn logic on they receive nothing
+    # BURNERS holds the pre-DAH-2274 slots; they receive no burn (only NEW_BURNERS do)
     # and are ordinary miner uids, so a live miner sitting there still deserves the floor.
     miners = [
         create_neuron_info(uid=100, hotkey="burner"),
@@ -1650,3 +1649,37 @@ async def test_sync_passes_active_hotkeys_to_set_weights(
 
     call = validator.subtensor_client.set_weights.call_args
     assert call.kwargs["active_hotkeys"] == {"live_miner"}
+
+
+@pytest.mark.asyncio
+async def test_an_express_pass_during_the_spec_publish_is_in_the_cycles_reported_set(
+    validator_with_mocks, mock_settings, create_job_result, create_neuron_info, monkeypatch
+):
+    """Review 4559156751: a lane pass that lands while the spec-publish loop awaits must still keep
+    the cycle's observations-only EXECUTOR_RESULT_MISSING off that node."""
+    validator = validator_with_mocks
+    validator.miner_scores = {}
+    job_batch_id = "2024-01-01 00:00:00"
+    express_node = "express-node-1"
+    validator.miner_service.express_published = {}
+
+    async def lane_pass_lands(*args, **kwargs):
+        validator.miner_service.express_published[express_node] = job_batch_id
+
+    validator.miner_service.publish_machine_specs = AsyncMock(side_effect=lane_pass_lands)
+    validator.publish_result_missing = AsyncMock()
+    seen_reported = []
+
+    def spy(rented, observations, reported, batch_id):
+        seen_reported.append(set(reported))
+        return {}
+
+    miners = [
+        create_neuron_info(uid=100, hotkey="burner1"),
+        create_neuron_info(uid=101, hotkey="burner2"),
+        create_neuron_info(uid=2, hotkey="miner1"),
+    ]
+    with patch("core.validator.pod_ssh_only_results", side_effect=spy):
+        await _run_sync_with_jobs(validator, miners, {"miner1": [create_job_result()]}, job_batch_id=job_batch_id)
+
+    assert seen_reported and express_node in seen_reported[-1]

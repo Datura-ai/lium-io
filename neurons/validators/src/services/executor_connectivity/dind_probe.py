@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import socket
+import time
 from typing import Any
 
 import asyncssh
@@ -16,6 +17,7 @@ from services.executor_connectivity.models import (
     PortPair,
 )
 from services.ssh_service import SSHService
+from services.node_host import public_host_sock
 
 logger = logging.getLogger(__name__)
 
@@ -28,9 +30,22 @@ logger = logging.getLogger(__name__)
 # The per-attempt timeout is deliberately not tightened to the poll interval: asyncssh counts TCP
 # connect, key exchange AND authentication against it, none of which carry over to the next
 # attempt, so a host slow enough to need 6s would fail every single try. An attempt is shortened
-# only when less than 12s of the deadline is left, which is time it could not have used anyway.
-DIND_SSH_READY_TIMEOUT_SECONDS = 30
-DIND_SSH_CONNECT_TIMEOUT_SECONDS = 12
+# only when less than 20s of the deadline is left, which is time it could not have used anyway.
+# DAH-5419: `docker run` over SSH has no timeout of its own; a stuck daemon held it until the task was dropped.
+# Long enough for a first pull of the DinD image. It is enforced on the node (`timeout -s KILL`): cancelling only
+# our SSH wait leaves the remote CLI running, and it could create the container after the removal in `finally`.
+DIND_RUN_TIMEOUT_SECONDS = 180
+# the shortest create a cycle short on time still gets; the caller's deadline keeps time for the checks after this one
+DIND_MIN_RUN_TIMEOUT_SECONDS = 30
+# our own wait on top of it, for an SSH channel that hangs after the remote command is gone
+DIND_RUN_SSH_GRACE_SECONDS = 30
+# DAH-5844: measured 5 Nov 15:31-18:17Z over 5000 connects, sshd answered at p50 10s, p90 16s, p99 30s (cut off by
+# the old 30s wait), a single attempt took up to 21s, and about one probe in ten never answered, its inner dockerd
+# up 25-45s before the give-up. So up to 60s with 20s attempts, never past the cycle deadline and never below
+# the old 30s.
+DIND_SSH_READY_TIMEOUT_SECONDS = 60
+DIND_MIN_SSH_READY_TIMEOUT_SECONDS = 30
+DIND_SSH_CONNECT_TIMEOUT_SECONDS = 20
 DIND_SSH_POLL_INTERVAL_SECONDS = 1.5
 # cap on the one `docker logs` + `docker exec tail` read of a failed container (DAH-2856)
 DIND_DIAGNOSTICS_TIMEOUT_SECONDS = 15
@@ -57,10 +72,20 @@ DIND_LOG_CAUSES: tuple[tuple[str, DindLogCause], ...] = (
 DIND_LOG_EXCERPT_MAX_CHARS = 1500
 DIND_LOG_LINE_MAX_CHARS = 400
 DIND_SSHD_NOT_READY_MESSAGE = (
-    f"sshd inside the DinD container did not answer within {DIND_SSH_READY_TIMEOUT_SECONDS}s and its "
-    "log shows no dockerd error"
+    "sshd inside the DinD container did not answer in time and its log shows no dockerd error"
 )
 DIND_SSHD_NOT_READY = DindLogCause("DIND_SSHD_NOT_READY", DIND_SSHD_NOT_READY_MESSAGE)
+
+
+def describe_ssh_error(error: Exception, port: PortPair) -> str:
+    """The provider-facing ssh fact; a connect timeout has no text of its own."""
+    if isinstance(error, TimeoutError):
+        # a provider report: a router flood/DoS filter dropped this connect right after the port test
+        return (
+            f"ssh to port {port.external}: connect timed out; check the forwarding of that port, and that "
+            "no router or firewall flood protection blocks our checks"
+        )
+    return f"ssh to port {port.external}: {(str(error) or type(error).__name__)[:120]}"
 
 
 # DAH-3634: `docker run` itself refused by the NVIDIA container hook. Every hook line counts
@@ -69,7 +94,23 @@ DIND_SSHD_NOT_READY = DindLogCause("DIND_SSHD_NOT_READY", DIND_SSHD_NOT_READY_ME
 # for the same host condition (watchtower/src/watchtower.py RUNTIME_PROBE_NVIDIA_MISMATCH).
 _HOOK_LINE_START = "nvidia-container-cli:"
 _SYSBOX_HOOK_ERROR = "nvidia-container-cli: mount error:"
+# The toolkit's CDI mode refuses `--gpus`; that line has no `nvidia-container-cli:` prefix.
+_CDI_HOOK_ERROR = "invoking the NVIDIA Container Runtime Hook directly"
+_HOOK_LINE_MARKERS = (_HOOK_LINE_START, _CDI_HOOK_ERROR)
+
+# /proc/self/uid_map inside the sysbox probe container (G21), logged as `uid_map` on "Sysbox check ok"
+UID_MAP_USER_NAMESPACE = "user_namespace"
+UID_MAP_IDENTITY = "identity"
+UID_MAP_UNREADABLE = "unreadable"
+
 DOCKER_RUN_CAUSES: tuple[tuple[str, DindLogCause], ...] = (
+    (
+        _CDI_HOOK_ERROR,
+        DindLogCause(
+            "NVIDIA_TOOLKIT_CDI_MODE",
+            "the NVIDIA container toolkit is in CDI mode, which refuses GPU containers started with --gpus",
+        ),
+    ),
     (
         "nvml error: driver/library version mismatch",
         DindLogCause(
@@ -97,9 +138,9 @@ def diagnose_docker_run_error(stderr: str | None) -> DindLogCause | None:
     provider sees the hook's error in the event and not only the validator's reading of it.
     """
     hook_lines = [
-        line[line.find(_HOOK_LINE_START) :].strip()
+        line[min(line.find(m) for m in _HOOK_LINE_MARKERS if m in line) :].strip()
         for line in (stderr or "").splitlines()
-        if _HOOK_LINE_START in line and _SYSBOX_HOOK_ERROR not in line
+        if any(m in line for m in _HOOK_LINE_MARKERS) and _SYSBOX_HOOK_ERROR not in line
     ]
     for pattern, cause in DOCKER_RUN_CAUSES:
         line = next((ln for ln in hook_lines if pattern in ln), None)
@@ -139,6 +180,15 @@ _NODE_SIDE_ERRORS: tuple[type[BaseException], ...] = (
 )
 
 
+def ssh_ready_timeout(deadline_monotonic: float | None) -> float:
+    """The SSH-ready wait: the full wait, cut to the cycle deadline but never below the old 30s, so a cycle
+    short on time ends no later than before (DAH-5844)."""
+    if deadline_monotonic is None:
+        return DIND_SSH_READY_TIMEOUT_SECONDS
+    left = deadline_monotonic - time.monotonic()
+    return max(DIND_MIN_SSH_READY_TIMEOUT_SECONDS, min(DIND_SSH_READY_TIMEOUT_SECONDS, left))
+
+
 # How long the removal of the probe container may take on the way out of a probe.
 REMOVE_TIMEOUT_SECONDS = 20
 
@@ -158,12 +208,20 @@ class DindVerifier:
         container_name_prefix: str,
         sysbox: bool,
         log_ctx: dict | None = None,
+        deadline_monotonic: float | None = None,
     ) -> DindProbeResult:
-        """Verify DinD on port."""
+        """Verify DinD on port. `deadline_monotonic`: the cycle time budget the create must end within."""
         name = f"{container_name_prefix}_{port.external}"
         log_ctx = {**(log_ctx or {}), "port": port.internal, "sysbox_requested": sysbox}
+        run_timeout = DIND_RUN_TIMEOUT_SECONDS
+        if deadline_monotonic is not None:
+            left = int(deadline_monotonic - time.monotonic())
+            run_timeout = max(DIND_MIN_RUN_TIMEOUT_SECONDS, min(run_timeout, left))
+            if run_timeout < DIND_RUN_TIMEOUT_SECONDS:
+                log_ctx["run_timeout"] = run_timeout
         created = False
         sshd_answered = False
+        sysbox_timed_out = False
 
         try:
             logger.info(_m("DinD start", extra=get_extra_info(log_ctx)))
@@ -172,7 +230,9 @@ class DindVerifier:
             cmd = DockerCommand.run_dind(name, port.internal, public_key.strip(), sysbox)
             logger.debug("run: %s...", cmd[:100])
 
-            result = await ssh_client.run(cmd)
+            cmd = f"timeout -s KILL {run_timeout} {cmd}"
+            async with asyncio.timeout(run_timeout + DIND_RUN_SSH_GRACE_SECONDS):
+                result = await ssh_client.run(cmd)
             if result.exit_status != 0:
                 error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
                 # carried whether or not the probe asked for sysbox-runc: the executor's own sysbox
@@ -200,11 +260,13 @@ class DindVerifier:
             # Test SSH
             pkey = asyncssh.import_private_key(private_key)
             async with await self._connect_retrying_until_sshd_answers(
-                host, port, pkey, log_ctx
+                host, port, pkey, log_ctx, ssh_ready_timeout(deadline_monotonic)
             ) as ssh:
                 sshd_answered = True
                 if sysbox:
-                    sysbox = await self._sysbox_works(ssh, log_ctx)
+                    measured = await self._sysbox_works(ssh, log_ctx)
+                    sysbox_timed_out = measured is None
+                    sysbox = measured is True
 
             logger.info(_m("DinD check ok", extra=get_extra_info({**log_ctx, "sysbox_result": sysbox})))
 
@@ -213,6 +275,7 @@ class DindVerifier:
                 log_text=f"dind: check ok port={port.internal}",
                 sysbox_runtime=sysbox,
                 port=port,
+                sysbox_timed_out=sysbox_timed_out,
             )
 
         except Exception as e:
@@ -235,13 +298,14 @@ class DindVerifier:
                 )
             error: DindLogCause | None = None
             if created and not sshd_answered and sysbox:
-                error = await self._diagnose_unanswered_container(ssh_client, name, e, log_ctx)
+                error = await self._diagnose_unanswered_container(ssh_client, name, e, port, log_ctx)
             return DindProbeResult(
                 success=False,
                 log_text=f"dind: check failed port={port.internal}",
                 sysbox_runtime=sysbox,
                 port=port,
                 error=error,
+                sshd_never_answered=created and not sshd_answered and isinstance(e, _NODE_SIDE_ERRORS),
             )
         finally:
             # One removal on every way out — ok, failed, raised, and cancelled (the validation
@@ -259,8 +323,12 @@ class DindVerifier:
                 _m("DinD container removal failed", extra=get_extra_info({**log_ctx, "error": str(e)}))
             )
 
-    async def _sysbox_works(self, ssh: SSHClientConnection, log_ctx: dict[str, Any]) -> bool:
-        """Run hello-world inside the DinD container; True when it exits 0 within 30s.
+    async def _sysbox_works(self, ssh: SSHClientConnection, log_ctx: dict[str, Any]) -> bool | None:
+        """Run hello-world inside the DinD container; True when it exits 0 within 30s, None when it timed out.
+
+        A timeout measured nothing: on a busy rented host (30 Oct, pod c0877f60) it is load, not a missing
+        Sysbox, and reading it as False forgot the node's verified Sysbox, so the renter's next launches ran
+        their Docker-in-Docker image without Sysbox and Docker could not start inside.
 
         daturaai/dind loads hello-world into the inner dockerd at start (DAH-1959), so no registry
         pull is needed; when that load failed, docker falls back to a Docker Hub pull.
@@ -268,13 +336,48 @@ class DindVerifier:
         try:
             result = await asyncio.wait_for(ssh.run("docker run --rm hello-world"), timeout=30)
         except asyncio.TimeoutError:
-            error_msg = "sysbox check timed out after 30s"
+            timed_out = {**log_ctx, "error": "sysbox check timed out after 30s"}
+            logger.warning(_m("Sysbox check failed", extra=get_extra_info(timed_out)))
+            return None
         else:
             if result.exit_status == 0:
-                logger.info(_m("Sysbox check ok", extra=get_extra_info(log_ctx)))
-                return True
+                uid_map = await self._read_uid_map(ssh)
+                logger.info(_m("Sysbox check ok", extra=get_extra_info({**log_ctx, "uid_map": uid_map})))
+                return self._user_namespace_allows_sysbox(uid_map, log_ctx)
             error_msg = result.stderr.strip() if result.stderr and isinstance(result.stderr, str) else "unknown error"
         logger.warning(_m("Sysbox check failed", extra=get_extra_info({**log_ctx, "error": error_msg})))
+        return False
+
+    @staticmethod
+    async def _read_uid_map(ssh: SSHClientConnection) -> str:
+        """`user_namespace`, `identity` or `unreadable` for /proc/self/uid_map inside the sysbox probe container.
+
+        Sysbox always runs a container in a user namespace; runc, privileged or not, keeps the host's identity
+        map (`0 0 4294967295`). The `docker` that started this container is the node's own binary, so
+        hello-world passing does not show sysbox ran it.
+        """
+        try:
+            result = await asyncio.wait_for(ssh.run("cat /proc/self/uid_map"), timeout=10)
+        except (asyncio.TimeoutError, asyncssh.Error, OSError):
+            return UID_MAP_UNREADABLE
+        fields = (result.stdout or "").split() if isinstance(result.stdout, str) else []
+        if result.exit_status != 0 or len(fields) < 3:
+            return UID_MAP_UNREADABLE
+        if fields[:3] == ["0", "0", "4294967295"]:
+            return UID_MAP_IDENTITY
+        return UID_MAP_USER_NAMESPACE
+
+    @staticmethod
+    def _user_namespace_allows_sysbox(uid_map: str, log_ctx: dict[str, Any]) -> bool:
+        """False only for the identity map (logged as SYSBOX_IDENTITY_UID_MAP). True for a user namespace
+        and for an unreadable map (logged as SYSBOX_UID_MAP_UNREADABLE: no answer decides nothing).
+        """
+        if uid_map == UID_MAP_USER_NAMESPACE:
+            return True
+        if uid_map == UID_MAP_UNREADABLE:
+            logger.warning(_m("SYSBOX_UID_MAP_UNREADABLE", extra=get_extra_info(log_ctx)))
+            return True
+        logger.warning(_m("SYSBOX_IDENTITY_UID_MAP", extra=get_extra_info(log_ctx)))
         return False
 
     async def _diagnose_unanswered_container(
@@ -282,6 +385,7 @@ class DindVerifier:
         ssh_client: SSHClientConnection,
         name: str,
         ssh_error: Exception,
+        port: PortPair,
         log_ctx: dict[str, Any],
     ) -> DindLogCause:
         """Read the container's logs while it still exists and name the cause (DAH-2856).
@@ -301,7 +405,7 @@ class DindVerifier:
         cause = diagnose_dind_log(stdout)
         if cause.code == DIND_SSHD_NOT_READY.code:
             # the log said nothing, so the ssh error is the only fact left for the provider
-            cause = DindLogCause(cause.code, f"{cause.message} (ssh: {str(ssh_error)[:120]})")
+            cause = DindLogCause(cause.code, f"{cause.message} ({describe_ssh_error(ssh_error, port)})")
         logger.warning(
             _m(
                 "DinD container started but sshd never answered",
@@ -323,12 +427,13 @@ class DindVerifier:
         port: PortPair,
         pkey: SSHKey,
         log_ctx: dict[str, Any],
+        ready_timeout: float = DIND_SSH_READY_TIMEOUT_SECONDS,
     ) -> SSHClientConnection:
         """Connect to the freshly started DinD container, retrying until sshd answers.
 
         The deadline caps the whole wait, not just the moment an attempt starts: a hanging
         attempt gets whatever is left of the budget rather than a fresh 12s on top of it, so a
-        blackholed port cannot stretch the probe past DIND_SSH_READY_TIMEOUT_SECONDS (DAH-2272
+        blackholed port cannot stretch the probe past `ready_timeout` (DAH-2272
         exists because one such hang stalled the pipeline). No attempt starts once the deadline
         has passed either — a poll that resumes late would otherwise get a negative budget and
         report a timeout in place of the real connection error. The last failure is raised as is,
@@ -337,7 +442,7 @@ class DindVerifier:
         """
         loop = asyncio.get_running_loop()
         started_at = loop.time()
-        deadline = started_at + DIND_SSH_READY_TIMEOUT_SECONDS
+        deadline = started_at + ready_timeout
         attempts = 0
         last_error: Exception | None = None
 
@@ -350,6 +455,7 @@ class DindVerifier:
                 connection = await asyncssh.connect(
                     host=host,
                     port=port.external,
+                    **await public_host_sock(host, port.external, attempt_timeout_seconds),
                     username="root",
                     client_keys=[pkey],
                     known_hosts=None,
@@ -409,6 +515,7 @@ class DindProbe:
         container_name_prefix: str,
         sysbox_runtime: bool,
         log_ctx: dict | None = None,
+        deadline_monotonic: float | None = None,
     ) -> DindProbeResult:
         return await self.verifier.verify(
             port,
@@ -417,4 +524,5 @@ class DindProbe:
             container_name_prefix=container_name_prefix,
             sysbox=sysbox_runtime,
             log_ctx=log_ctx,
+            deadline_monotonic=deadline_monotonic,
         )

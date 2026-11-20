@@ -10,6 +10,7 @@ class CollateralStatusCheck:
     """Report collateral_deposited with the meaning its readers expect; never gates the run or the score."""
 
     check_id = "gpu.validate.collateral"
+    replays_after_session_drop = True
     fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:

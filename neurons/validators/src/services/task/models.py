@@ -1,3 +1,4 @@
+import time
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -30,6 +31,10 @@ class MixedFormulaInputs(BaseModel):
     unrented: dict[str, Any]
 
 
+# DAH-5805: a run the validator's own Redis ended (no pooled connection, a timeout) says nothing about the node
+VALIDATOR_REDIS_UNAVAILABLE = "VALIDATOR_REDIS_UNAVAILABLE"
+
+
 class JobResult(BaseModel):
     spec: dict | None = None
     executor_info: ExecutorSSHInfo
@@ -43,6 +48,9 @@ class JobResult(BaseModel):
     # One timestamp shared by every executor finalized in this validator cycle.
     # It is assigned after final weights are calculated and is the accounting/day key.
     scored_at: datetime | None = None
+    # Set by the express lane: when its run outside the cycle started (the backend reads it, not job_batch_id,
+    # against a maintenance window's end).
+    check_started_at: datetime | None = None
     gpu_model: str | None = None
     gpu_count: int = 0
     sysbox_runtime: bool = False
@@ -58,18 +66,28 @@ class JobResult(BaseModel):
     # DAH-2467: the free remainder of a partially rented split node. It is always rated at the
     # minimum-split tier and rate, never as a bundle of its own size.
     is_split_remainder: bool = False
+    # DAH-3698: free GPUs of the remainder left out of the idle pool for want of a free port per split
+    port_unpaid_gpu_count: int = 0
     is_spot: bool = False
-    # in the backend's provider_spot_executor_ids: the provider chose Spot, rather than a demotion,
-    # force-spot hotkey, pin or no-incentive rental putting the node there. Gates spot-node pay.
-    is_provider_chosen_spot: bool = False
+    # in the backend's provider_spot_executor_ids, the spot pay list: set to Spot by its provider, or
+    # force-spot by a penalty demotion; not a banned hotkey, pin or no-incentive rental. Gates spot-node pay.
+    is_on_spot_pay_list: bool = False
     is_new_rentals_paused: bool = False
+    is_in_maintenance: bool = False  # inside a running provider maintenance window: no incentive, rented or not
     is_provider_banned: bool = False
+    # the miner hotkey is in settings.SCORING_EXCLUDED_HOTKEYS (or, while unrented, in
+    # IDLE_INCENTIVE_EXCLUDED_HOTKEYS): no incentive from any pool, set by BaseIncentive.calculate_mining_scores. Validation, listing and rentals are unchanged.
+    is_hotkey_excluded_from_scoring: bool = False
     provider_discord_connected: bool = True
+    is_provider_email_held: bool = False
     rental_created_at: datetime | None = None
     default_job_owner: str | None = None  # "miner" | "lium" | None; miner default job is excluded from unrented incentive
     has_lium_filler: bool = False  # the backend lists at least one active Lium filler container on the node
     # the node's GPU configuration's average filler USD per GPU-hour; None = no usable sample
     filler_revenue_per_gpu_hour: float | None = None
+    # DAH-5128: what Lium's fillers earn per hour in total on the node's GPU model; the most all its
+    # idle spot nodes are paid together. None = no usable sample
+    filler_revenue_usd_per_hour: float | None = None
 
     # tdx attestation relevant fields
     attestation_digest: str | None = None
@@ -84,6 +102,11 @@ class JobResult(BaseModel):
     # this node's rented pods as the cycle's SSH probe saw them (services/pod_ssh_probe.py);
     # None when the node has no rented pod with an ssh_port or the probe did not run.
     pod_ssh: list[PodSshObservation] | None = None
+    # DAH-5651: ContextState.host_runtime_fault, this cycle's DinD test container on the host never answered
+    host_runtime_fault: bool = False
+    # True only when this cycle opened the shell with known_hosts pinned to executor_info.ssh_host_key,
+    # so the node proved it holds that key. Results for nodes the cycle never reached stay False.
+    ssh_host_key_verified: bool = False
 
     inspector_outcome: str = "SKIPPED"
 
@@ -104,6 +127,16 @@ class JobResult(BaseModel):
     # Such a copy under the keeper's own executor UUID: one backend row, so it is not published
     # and the row hears only the copy that kept the score.
     duplicate_shares_kept_row: bool = Field(default=False, exclude=True)
+    # DAH-6596: when what this result says was observed (time.monotonic()): its construction, or for a row from the
+    # miner's answer the answer itself. Such a row observed before an express pass of the same node under the same
+    # cycle id is older news than that pass and is not published.
+    observed_at: float = Field(default_factory=time.monotonic, exclude=True)
+    # DAH-4658: the node's last scored result, standing in for a scrape the renter's GPU reset hid the cards
+    # from; scored like the cycle it came from, never published
+    carried_for_renter_gpu_reset: bool = Field(default=False, exclude=True)
+    # DAH-5718: the validator's own SSH session died in the port check; no verdict this cycle (withheld at cycle end),
+    # only the findings of the checks that finished are published
+    session_lost_in_port_check: bool = Field(default=False, exclude=True)
 
     # Incentive relevant fields
     mining_score: float | None = None                   # Score for mining pool for scoring logic
@@ -131,6 +164,14 @@ class JobResult(BaseModel):
     eligible_for_rental_share: bool = False
     # spot-node pay: set on a spot node that qualifies; its effective_rate is then the paid rate
     spot_pay_candidate: bool = False
+    # the share of its own spot rate a spot node is paid: below 1 when its GPU model's spot nodes would
+    # together be paid more than the model's fillers earn per hour (filler_revenue_usd_per_hour)
+    spot_pool_multiplier: float | None = None
+    # DAH-5944: idle spot GPUs have their own cap per (GPU model, bucket) at the secure numbers. Kept apart
+    # from max_cap / total_unrented_by_gpu_type / unrented_cap_multiplier, which mean a secure tier.
+    spot_cap: int | None = None
+    spot_gpus_in_bucket: int | None = None
+    spot_cap_multiplier: float | None = None
     # Spot pay and secure-floor top-ups are paid on top of the burn-capped rental share:
     # unbucketed_share is the emission share that pays them, unbucketed_rental_cost their USD/hour,
     # floor_top_up_rate the per-GPU USD/hour the floor added to this node (after its multipliers),

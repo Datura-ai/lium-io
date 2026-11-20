@@ -137,11 +137,108 @@ get_sshd_binary() {
     return 1
 }
 
+APT_ETC="${LIUM_APT_ETC:-/etc/apt}"
+APT_PACKAGES="openssh-server ncurses-term xauth python3 wget ca-certificates"
+
+# The image's apt sources narrowed to the distro's `main` component, which holds every package
+# installed here; flat third-party repos (the CUDA one) drop out. A full `apt-get update` reads
+# ~36 MB of indexes (universe, CUDA) and took 2-8 min on slow node links before the install
+# began (DAH-6029). Prints the temp dir, or fails when nothing is left to read.
+apt_main_only_dir() {
+    command -v mktemp >/dev/null 2>&1 || return 1
+    dir="$(mktemp -d)" || return 1
+    mkdir -p "$dir/parts"
+    for f in "$APT_ETC/sources.list" "$APT_ETC"/sources.list.d/*.list; do
+        [ -f "$f" ] || continue
+        sed -n -E 's/^[[:space:]]*(deb[[:space:]]+(\[[^]]*\][[:space:]]+)?[^[:space:]]+[[:space:]]+[^[:space:]]+)[[:space:]](.*[[:space:]])?main([[:space:]].*)?$/\1 main/p' "$f"
+    done > "$dir/sources.list"
+    for f in "$APT_ETC"/sources.list.d/*.sources; do
+        [ -f "$f" ] || continue
+        # deb822: keep binary stanzas that list main, narrowed to it ([ \t] since old mawk lacks classes)
+        awk 'BEGIN { RS = ""; ORS = "" }
+        {
+            n = split($0, lines, "\n"); out = ""; field = ""; comps = ""; types = ""
+            for (i = 1; i <= n; i++) {
+                l = lines[i]
+                # multi-line values: a continuation line starts with a blank and belongs to the field above, comments between them too
+                if (l ~ /^[ \t]/) {
+                    if (field == "components") { comps = comps " " l; continue }
+                    if (field == "types") { types = types " " l; continue }
+                } else if (l ~ /^[A-Za-z][A-Za-z0-9-]*:/) {
+                    field = tolower(substr(l, 1, index(l, ":") - 1))  # field names are case-insensitive
+                    if (field == "components") { comps = substr(l, 12); out = out "Components: main\n"; continue }
+                    if (field == "types") { types = substr(l, 7); out = out "Types: deb\n"; continue }
+                } else if (l !~ /^#/) {
+                    field = ""
+                }
+                out = out l "\n"
+            }
+            if (comps ~ /(^|[ \t])main([ \t]|$)/ && types ~ /(^|[ \t])deb([ \t]|$)/) print out "\n"
+        }' "$f" > "$dir/parts/$(basename "$f")"
+    done
+    if [ -s "$dir/sources.list" ] || [ -n "$(cat "$dir"/parts/* 2>/dev/null)" ]; then
+        printf '%s\n' "$dir"
+        return 0
+    fi
+    rm -rf "$dir"
+    return 1
+}
+
+# The image's own start-up can be running apt-get when this script starts (DAH-6029: lock held
+# by the container's early apt-get). Wait that out instead of failing into the slow all-sources
+# fallback; any other apt failure returns at once.
+APT_LOCK_WAIT_TRIES="$(int_or "${LIUM_APT_LOCK_WAIT_TRIES:-}" 36 120)"
+apt_get() {
+    tries=0
+    while :; do
+        if apt-get "$@" 2>"$RUN_DIR/lium-apt.err"; then
+            cat "$RUN_DIR/lium-apt.err" >&2
+            return 0
+        fi
+        cat "$RUN_DIR/lium-apt.err" >&2
+        if ! grep -q 'Could not get lock' "$RUN_DIR/lium-apt.err" || [ "$tries" -ge "$APT_LOCK_WAIT_TRIES" ]; then
+            return 1
+        fi
+        tries=$((tries + 1))
+        sleep 5
+    done
+}
+
+# A failed index fetch (Ubuntu's "Mirror sync in progress?", a dead backports mirror) leaves the
+# other lists usable: install from them when only -updates or -backports failed. The base suite
+# and -security (the pocket that carries openssh's security fixes) must have arrived. Both E:
+# (bad index) and W: (unreachable InRelease) failures count. Reads the last apt_get's stderr.
+apt_lists_usable() {
+    # any other fatal line (an unsigned or 403'd repository) makes apt stop summarising later fetches
+    if grep '^E: ' "$RUN_DIR/lium-apt.err" | grep -qv -e '^E: Failed to fetch ' -e '^E: Some index files failed to download'; then
+        return 1
+    fi
+    failed="$(sed -n 's|^[EW]: Failed to fetch .*/dists/\([^/ ]*\)/.*|\1|p' "$RUN_DIR/lium-apt.err" | sort -u)"
+    [ -n "$failed" ] || return 1
+    for suite in $failed; do
+        case "$suite" in
+            *-backports | *-updates) ;;
+            *) return 1 ;;
+        esac
+    done
+    log "Some package lists failed to download; installing from the rest"
+}
+
 install_sshd() {
     if command -v apt-get >/dev/null 2>&1; then
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update
-        apt-get install -y openssh-server
+        # shellcheck disable=SC2086 # APT_PACKAGES is a word list
+        if main_dir="$(apt_main_only_dir)"; then
+            apt_main="-o Dir::Etc::SourceList=$main_dir/sources.list -o Dir::Etc::SourceParts=$main_dir/parts"
+            if { apt_get update $apt_main || apt_lists_usable; } && apt_get install -y --no-install-recommends $APT_PACKAGES $apt_main; then
+                rm -rf "$main_dir"
+                return 0
+            fi
+            rm -rf "$main_dir"
+            log "Install from the main package lists failed; retrying with all of the image's apt sources"
+        fi
+        apt_get update
+        apt_get install -y --no-install-recommends $APT_PACKAGES
         return 0
     fi
 
@@ -327,14 +424,26 @@ verify_sshd() {
     return 1
 }
 
+# The pod heals its own SSH (DAH-6042): every pass checks the bootstrap's invariant, an sshd
+# listening on :22, not only an sshd process (a leftover session process is named sshd too).
+# `set -e` is off here: one failed step (a log write on a full disk, a keygen error) must not
+# end the only thing that brings sshd back.
 watchdog_loop() {
+    set +e
+    passes=0
     while true; do
-        if ! is_sshd_running; then
+        # first check one interval in: the bootstrap has just verified sshd, or the image is still starting it
+        sleep "$SLEEP_SECONDS"
+        if ! is_sshd_running || ! is_sshd_listening; then
             acquire_lock
             if ensure_sshd_installed; then
                 prepare_sshd_runtime
-                if ! start_sshd_if_needed; then
+                if is_sshd_listening && is_sshd_running; then
+                    :
+                elif ! "$(get_sshd_binary)"; then
                     log "Failed to restart sshd from watchdog"
+                else
+                    log "Watchdog restarted sshd"
                 fi
             else
                 log "Watchdog could not install sshd"
@@ -342,7 +451,9 @@ watchdog_loop() {
             release_lock
         fi
 
-        sleep "$SLEEP_SECONDS"
+        passes=$((passes + 1))
+        # tests only: stop after N passes
+        [ "$passes" = "${LIUM_WATCHDOG_PASSES:-}" ] && return 0
     done
 }
 
@@ -375,11 +486,15 @@ if [ "${1:-}" = "--watchdog-loop" ]; then
 fi
 
 GRACE_SECS=""
+VULKAN_ICD_ONLY=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --grace)
             shift
             GRACE_SECS="${1:-}"
+            ;;
+        --vulkan-icd-only)
+            VULKAN_ICD_ONLY=1
             ;;
         *)
             log "Ignoring unknown argument: $1"
@@ -388,6 +503,31 @@ while [ "$#" -gt 0 ]; do
     shift || break
 done
 GRACE_SECS="$(int_or "${GRACE_SECS:-}" "" 300)"
+
+# Headless Vulkan: the NVIDIA toolkit injects the driver libraries but, on many hosts, no ICD
+# file, or only the GLX one, which needs an X server. Register the EGL library, which works
+# without one. Best effort: it never fails the bootstrap.
+ensure_vulkan_egl_icd() {
+    icd_dir="${LIUM_VULKAN_ICD_DIR:-/etc/vulkan/icd.d}"
+    for lib_dir in ${LIUM_NVIDIA_LIB_DIRS:-/usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib/aarch64-linux-gnu}; do
+        [ -e "$lib_dir/libEGL_nvidia.so.0" ] || continue
+        if grep -qs libEGL_nvidia "$icd_dir"/*.json /usr/share/vulkan/icd.d/*.json; then
+            return 0
+        fi
+        mkdir -p "$icd_dir" &&
+            printf '%s\n' '{"file_format_version":"1.0.1","ICD":{"library_path":"libEGL_nvidia.so.0","api_version":"1.3"}}' \
+                > "$icd_dir/nvidia_egl_icd.json" &&
+            log "Registered the NVIDIA EGL Vulkan driver"
+        return 0
+    done
+}
+ensure_vulkan_egl_icd || true
+# an image that starts its own sshd (docker_service: image_manages_services) gets the ICD step and
+# the watchdog: its start-up script starts sshd once and nothing brings it back (DAH-6042)
+if [ -n "${VULKAN_ICD_ONLY:-}" ]; then
+    spawn_watchdog
+    exit 0
+fi
 
 # 1. Somebody already brought sshd up (image entrypoint won outright, or this
 #    is a re-run) — adopt it, never touch host keys.

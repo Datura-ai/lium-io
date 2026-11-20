@@ -341,3 +341,25 @@ def build_verdict(
         unmatched_containers_count=len(names),
         unnamed_findings=unnamed,
     )
+
+
+def host_write_findings(
+    report: dict[str, Any], provider_findings: list[dict[str, Any]], rented_pod_ids: list[str]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+    """The sensor's rental-interference verdict on the rented pods (DAH-4548), split into
+    (writes, reads). The classification lives in the sensor (`rental_interference` and
+    `direction` on each finding); the validator only filters to this rental's pods. None when the
+    report has no `interference_rules_version`: a sensor without the verdict, so nothing is read."""
+    version = report.get("interference_rules_version")
+    if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+        return None
+    rented = set(rented_pod_ids)
+    writes, reads = [], []
+    for finding in provider_findings:
+        if finding.get("rental_interference") is not True:
+            continue
+        name = _named_resource(finding)
+        if not name or pod_id_of(name) not in rented:
+            continue
+        (writes if finding.get("direction") == "write" else reads).append(finding)
+    return writes, reads

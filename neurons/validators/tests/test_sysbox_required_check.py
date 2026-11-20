@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import time
+
 import pytest
 from neurons.validators.src.services.executor_connectivity.dind_probe import (
+    DIND_SSH_READY_TIMEOUT_SECONDS,
+    DIND_SSHD_NOT_READY_MESSAGE,
     DOCKER_RUN_CAUSES,
     diagnose_docker_run_error,
+    ssh_ready_timeout,
 )
 from neurons.validators.src.services.task.checks.sysbox_required import (
     _NVIDIA_HOOK_TEMPLATE_BY_REASON_CODE,
@@ -16,18 +21,17 @@ from protocol.vc_protocol.compute_requests import (
     RentedPod,
 )
 
-from core.config import settings
 from services.executor_connectivity.models import DindLogCause
 from tests.helpers import build_state
 
 
-def _rented_data() -> RentedExecutorsResponse:
+def _rented_data(miner_hotkey: str = "test-miner", port: str = "22") -> RentedExecutorsResponse:
     return RentedExecutorsResponse(
         executors={
             "executor-123": RentedExecutor(
-                miner_hotkey="test-miner",
+                miner_hotkey=miner_hotkey,
                 executor_ip_address="127.0.0.1",
-                executor_ip_port="22",
+                executor_ip_port=port,
                 pods=[RentedPod(pod_id="pod-1", container_name="container_test", rented_ports=[8080, 8081])],
             )
         },
@@ -66,18 +70,6 @@ async def test_sysbox_present_passes(context_factory):
 
     assert result.passed is True
     assert result.event.reason_code == Msg.SYSBOX_OK.reason
-
-
-@pytest.mark.asyncio
-async def test_disabled_flag_skips_enforcement(context_factory, monkeypatch):
-    """With the kill-switch off, no-sysbox unrented executors are not rejected."""
-    monkeypatch.setattr(settings, "REQUIRE_SYSBOX_FOR_UNRENTED", False)
-    ctx = context_factory(state=build_state(sysbox_runtime=False))
-
-    result = await SysboxRequiredCheck().run(ctx)
-
-    assert result.passed is True
-    assert result.event.reason_code == Msg.DISABLED.reason
 
 
 @pytest.mark.asyncio
@@ -136,18 +128,28 @@ async def test_inner_dockerd_down_without_dockerd_line_keeps_the_generic_guidanc
 
 @pytest.mark.asyncio
 async def test_no_sysbox_with_unknown_dind_cause_does_not_claim_sysbox_is_irrelevant(context_factory):
-    """DIND_SSHD_NOT_READY means the log showed nothing: the verdict quotes it and says no more."""
-    cause = DindLogCause(
-        "DIND_SSHD_NOT_READY",
-        "sshd inside the DinD container did not answer within 30s and its log shows no dockerd error",
-    )
+    """DIND_SSHD_NOT_READY means the log showed nothing: the verdict quotes it and does not blame sysbox.
+    DAH-5844: it gets its own reason code, so the notice no longer says sysbox is missing; still a failed check."""
+    cause = DindLogCause("DIND_SSHD_NOT_READY", DIND_SSHD_NOT_READY_MESSAGE)
     ctx = context_factory(state=build_state(sysbox_runtime=False, dind_probe_error=cause))
 
     result = await SysboxRequiredCheck().run(ctx)
 
     assert result.passed is False
+    assert result.event.reason_code == Msg.DIND_PROBE_UNREACHABLE.reason == "DIND_PROBE_UNREACHABLE"
     assert cause.text in result.event.remediation
+    assert Msg.DIND_PROBE_UNREACHABLE.remediation in result.event.remediation
     assert "reinstalling sysbox" not in result.event.remediation
+    assert "Install the sysbox runtime" not in result.event.remediation
+
+
+def test_ssh_ready_wait_is_cut_to_the_cycle_deadline_but_never_below_the_old_wait():
+    """DAH-5844: up to 60s, never past the cycle deadline, and never shorter than the 30s it replaced."""
+    now = time.monotonic()
+    assert ssh_ready_timeout(None) == DIND_SSH_READY_TIMEOUT_SECONDS == 60
+    assert ssh_ready_timeout(now + 600) == 60
+    assert 44 < ssh_ready_timeout(now + 45) <= 45
+    assert ssh_ready_timeout(now + 5) == ssh_ready_timeout(now - 5) == 30
 
 
 @pytest.mark.asyncio
@@ -229,6 +231,26 @@ async def test_other_nvml_failure_gets_the_generic_hook_code(context_factory):
 
 
 @pytest.mark.asyncio
+async def test_cdi_mode_toolkit_gets_its_own_code_and_the_config_fix(context_factory):
+    stderr = (
+        "docker: Error response from daemon: failed to create task for container: failed to create shim task: "
+        "OCI runtime create failed: container_linux.go:439: starting container process caused: process_linux.go:608: "
+        "container init caused: Running hook #0:: error running hook: exit status 1, stdout: , stderr: Using requested "
+        "mode 'cdi'\ninvoking the NVIDIA Container Runtime Hook directly (e.g. specifying the docker --gpus flag) is "
+        "not supported. Please use the NVIDIA Container Runtime (e.g. specify the --runtime=nvidia flag) instead: unknown"
+    )
+    ctx = context_factory(state=build_state(sysbox_runtime=False, dind_probe_error=_cause(stderr)))
+
+    result = await SysboxRequiredCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == "NVIDIA_TOOLKIT_CDI_MODE"
+    assert "docker said: invoking the NVIDIA Container Runtime Hook directly" in result.event.remediation
+    assert 'mode = "auto"' in result.event.remediation
+    assert "Install the sysbox runtime" not in result.event.remediation
+
+
+@pytest.mark.asyncio
 async def test_load_library_hook_error_gets_the_hook_code_not_sysbox_missing(context_factory):
     stderr = (
         "docker: Error response from daemon: OCI runtime create failed: error running prestart hook #0: exit status 1, "
@@ -300,3 +322,15 @@ async def test_dind_cause_from_the_container_log_keeps_sysbox_required_missing(c
 
     assert result.event.reason_code == Msg.SYSBOX_MISSING.reason
     assert cause.text in result.event.remediation
+
+
+@pytest.mark.asyncio
+async def test_no_sysbox_under_another_miners_rental_on_a_different_endpoint_fails(context_factory):
+    # DAH-4263: another miner's rental on a different endpoint is not this node's rental.
+    rented_data = _rented_data(miner_hotkey="other-miner-hotkey", port="2222")
+    ctx = context_factory(state=build_state(sysbox_runtime=False, rented_data=rented_data))
+
+    result = await SysboxRequiredCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == Msg.SYSBOX_MISSING.reason

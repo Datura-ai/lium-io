@@ -9,7 +9,7 @@ nodes (`build_gpu_docker_config_for_executor`), the nvidia-smi power state
 the lingering port-check / health-check containers (`wait_for_port_check_containers`). On the far half of
 the fleet a round trip is 0.2–0.6 s, so the listings cost more than the work they inform.
 
-With ``RENTAL_PRERUN_HOST_PROBE_ENABLED`` the same listings come back from ONE command, each
+Instead the same listings come back from ONE command, each
 section tagged (``PS\\t<name>``, ``VOL\\t<name>\\t<driver>``, …) and closed by its exit status
 (``PS_RC\\t0``). The consumers read the section instead of running their own listing command and
 keep every removal / write / retry exactly as it is. A section whose command failed (non-zero
@@ -50,7 +50,6 @@ _ALWAYS_TAGS = (
     GPUDEV_TAG,
     SHARED_TAG,
     SHAREDW_TAG,
-    LABEL_TAG,
     PORT_CHECK_TAG,
 )
 # The per-command path never looks at these commands' exit status (a `for p in …; [ -e "$p" ] && …`
@@ -80,9 +79,13 @@ def parse_container_listing(lines) -> tuple[tuple[str, ...], dict[str, str]]:
             ids[parts[0]] = parts[1]
     return tuple(names), ids
 DOCKER_VOLUME_LS_NAME_DRIVER_CMD = '/usr/bin/docker volume ls --format "{{.Name}} {{.Driver}}"'
+# A container `docker ps -a` lists but `docker inspect` cannot find ("no such object", a daemon
+# ghost that outlives restarts) is skipped: it failed this listing on every create, so the stale
+# volume sweep never ran and full-node rents failed short of disk. Any other inspect error still fails.
 DOCKER_MOUNTED_VOLUME_NAMES_CMD = (
-    "/usr/bin/docker ps -a -q | xargs -r /usr/bin/docker inspect --format "
+    "{ /usr/bin/docker ps -a -q | xargs -r /usr/bin/docker inspect --format "
     '\'{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{"\\n"}}{{end}}{{end}}\''
+    " 2>&1 >&3 | { ! grep -vi '^error: no such object: ' >&2; }; } 3>&1"
 )
 # Printed (untagged) when the awk that prefixes a section's lines fails: an untagged line makes
 # the parser raise, so a prefixing failure is a whole-probe fallback, never an empty listing.
@@ -90,11 +93,14 @@ PREFIX_FAILED_MARKER = "PRERUN_PROBE_PREFIX_FAILED"
 
 
 def port_check_container_filters(miner_hotkey: str) -> str:
-    """`docker ps` filters for validator probes (`container_{hotkey}_*`) and backend `health_check_*`."""
-    # docker ps OR-s multiple --filter name= flags
+    """`docker ps` filters for validator probes (`container_{hotkey}_*`, the port verifier's
+    `port_test_*`) and backend `health_check_*`."""
+    # docker ps OR-s multiple --filter name= flags. port_test_ runs --network=host, so neither
+    # `ss` in the executor nor `docker ps` Ports shows the host ports it holds (DAH-5797)
     return (
         f"--filter {shlex.quote(f'name=^container_{miner_hotkey}_')} "
-        f"--filter {shlex.quote('name=^health_check_')}"
+        f"--filter {shlex.quote('name=^health_check_')} "
+        f"--filter {shlex.quote('name=^port_test_')}"
     )
 
 
@@ -187,12 +193,14 @@ def _section(tag: str, command: str) -> str:
 
 
 def prerun_host_probe_command(
-    *, docker_image: str, image_label: str, with_power: bool, miner_hotkey: str
+    *, docker_image: str, image_label: str | None, with_power: bool, miner_hotkey: str
 ) -> str:
     """One `sh` command line printing every section; see the module docstring for the format.
 
     ``with_power`` adds the nvidia-smi power-state query (the customer-rental path reads it; a
     PEARL filler applies its own cap with live queries and never reads this section).
+    ``image_label`` None leaves out the image-label section, and with it the image name: only an
+    encrypted-volume create reads the label, so no other create puts the image in a host command.
     """
     parts = [
         # awk, not sed: `\t` in a sed replacement is GNU-only; awk's "\t" is POSIX (and
@@ -214,7 +222,8 @@ def prerun_host_probe_command(
     ]
     if with_power:
         parts.append(_section(POWER_TAG, POWER_STATE_CMD))
-    parts.append(_section(LABEL_TAG, image_label_command(docker_image, image_label)))
+    if image_label is not None:
+        parts.append(_section(LABEL_TAG, image_label_command(docker_image, image_label)))
     parts.append(_section(PORT_CHECK_TAG, port_check_containers_command(miner_hotkey)))
     return "; ".join(parts)
 
@@ -227,7 +236,7 @@ def _cap(text: str) -> str:
     return text if len(text) <= PROBE_OUTPUT_LOG_CAP else text[:PROBE_OUTPUT_LOG_CAP] + " …"
 
 
-def parse_prerun_host_probe(stdout: str, *, with_power: bool) -> PrerunHostProbe:
+def parse_prerun_host_probe(stdout: str, *, with_power: bool, with_label: bool = True) -> PrerunHostProbe:
     """Split the probe output into sections; raise on anything that is not the expected shape.
 
     Every expected tag must close with its ``_RC`` line — a section cut short (the ssh channel
@@ -249,7 +258,11 @@ def parse_prerun_host_probe(stdout: str, *, with_power: bool) -> PrerunHostProbe
         else:
             lines.setdefault(tag, []).append(value)
 
-    expected = (*_ALWAYS_TAGS, POWER_TAG) if with_power else _ALWAYS_TAGS
+    expected = (
+        *_ALWAYS_TAGS,
+        *((POWER_TAG,) if with_power else ()),
+        *((LABEL_TAG,) if with_label else ()),
+    )
     for tag in expected:
         if tag not in rcs:
             raise PrerunHostProbeParseError(
@@ -282,7 +295,7 @@ def parse_prerun_host_probe(stdout: str, *, with_power: bool) -> PrerunHostProbe
         volumes = tuple(parsed)
 
     label_value: str | None = None
-    if ok(LABEL_TAG):
+    if with_label and ok(LABEL_TAG):
         # The per-command path compares the whole stripped stdout; a label value with newlines
         # arrives as several LABEL lines and is joined back before the strip.
         label_value = "\n".join(lines.get(LABEL_TAG, ())).strip()

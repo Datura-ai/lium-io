@@ -1,17 +1,15 @@
 """Burn emission distribution service.
 
-This service handles the distribution of burn emission across burner nodes,
-supporting both the old burner selection algorithm and the new equal distribution logic.
+This service handles the distribution of burn emission across burner nodes:
+the burn share is split across NEW_BURNERS by slot count.
 """
 
-import random
 from collections import Counter
 
 import bittensor
 
 from core.config import get_total_burn_emission, settings
 from core.utils import _m, get_logger
-from services.const import BURNER_EMISSION
 
 logger = get_logger(__name__)
 
@@ -45,7 +43,7 @@ def verified_burner_hotkey(miners: list[bittensor.NeuronInfo]) -> str | None:
     Withheld idle shares go to it, so it passes the same check as the burn share.
     None when the uid is not in `miners` or another coldkey holds it: the caller must not pick a substitute.
     """
-    burner_uid = (settings.NEW_BURNERS if settings.ENABLE_NEW_BURN_LOGIC else settings.BURNERS)[0]
+    burner_uid = settings.NEW_BURNERS[0]
     burner = next((miner for miner in miners if miner.uid == burner_uid), None)
     if burner is None or not _burner_coldkey_matches(burner):
         return None
@@ -55,41 +53,29 @@ def verified_burner_hotkey(miners: list[bittensor.NeuronInfo]) -> str | None:
 class BurnService:
     """Service for calculating burn emission distribution across burner nodes.
 
-    Supports two burn logic modes:
-    - Old logic: One main burner gets slightly more, others share equally
-    - New logic: All burners share burn emission equally
+    All burners in NEW_BURNERS share the burn emission by slot count.
     """
 
     def calculate_burn_scores(
         self,
         miners: list[bittensor.NeuronInfo],
         burn_share: float,
-        last_mechanism_step_block: int | None,
     ) -> dict[str, float]:
         """Calculate burn scores for all miners.
 
-        Distributes the given burn_share across designated burner nodes based on
-        the configured burn logic mode (old or new).
+        Distributes the given burn_share across the NEW_BURNERS slots.
 
         Args:
             miners: List of all miner neuron information
             burn_share: Dynamic burn emission share to distribute (e.g., 0.87 for default,
                        or total burn emission - rental_share for rental price incentive)
-            last_mechanism_step_block: Block number for randomization (old logic only)
 
         Returns:
             dict[str, float]: Mapping of miner hotkeys to burn scores
                 - Burner nodes: Receive portion of burn_share
                 - Non-burners: Not included in result (0 score)
         """
-        burn_scores = {}
-
-        if settings.ENABLE_NEW_BURN_LOGIC:
-            # New burn logic: Equal distribution
-            burn_scores = self._calculate_new_burn_logic(miners, burn_share)
-        else:
-            # Old burn logic: Main burner + others
-            burn_scores = self._calculate_old_burn_logic(miners, burn_share, last_mechanism_step_block)
+        burn_scores = self._calculate_new_burn_logic(miners, burn_share)
 
         # Log summary
         num_burners = len(burn_scores)
@@ -99,7 +85,7 @@ class BurnService:
             _m(
                 "Burn emission distributed across burner nodes",
                 extra={
-                    "burn_logic": "new" if settings.ENABLE_NEW_BURN_LOGIC else "old",
+                    "burn_logic": "new",
                     "num_burners": num_burners,
                     "burn_share": burn_share,
                     "total_burn_emission": get_total_burn_emission(),
@@ -177,104 +163,6 @@ class BurnService:
 
         return burn_scores
 
-    def _calculate_old_burn_logic(
-        self,
-        miners: list[bittensor.NeuronInfo],
-        burn_share: float,
-        last_mechanism_step_block: int | None,
-    ) -> dict[str, float]:
-        """Calculate burn scores using old logic (main burner + others).
-
-        One randomly selected main burner gets slightly more emission,
-        other burners share the remainder equally.
-
-        Args:
-            miners: List of all miner neuron information
-            burn_share: Dynamic burn emission share to distribute
-            last_mechanism_step_block: Block number for random seed
-
-        Returns:
-            dict[str, float]: Burner hotkeys to burn scores
-        """
-        burn_scores = {}
-        burners = settings.BURNERS
-
-        # Select main burner using block-based randomization
-        main_burner = random.Random(last_mechanism_step_block or 0).choice(burners)
-        other_burners = [uid for uid in burners if uid != main_burner]
-
-        # Calculate scores proportional to burn_share
-        # Scale the original BURNER_EMISSION by the ratio of burn_share to the total burn
-        # emission. This maintains the same distribution pattern but with dynamic burn_share.
-        total_burn_emission = get_total_burn_emission()
-        burn_ratio = burn_share / total_burn_emission if total_burn_emission > 0 else 1
-        scaled_burner_emission = BURNER_EMISSION * burn_ratio
-
-        # Main burner gets: burn_share - (num_other_burners * scaled_burner_emission)
-        # Other burners get: scaled_burner_emission each
-        main_burner_score = burn_share - (len(burners) - 1) * scaled_burner_emission
-        other_burner_score = scaled_burner_emission
-
-        for miner in miners:
-            if miner.uid == main_burner:
-                if not _burner_coldkey_matches(miner):
-                    continue
-                burn_scores[miner.hotkey] = main_burner_score
-
-                logger.debug(
-                    _m(
-                        "Miner assigned as main burner (old logic)",
-                        extra={
-                            "miner_uid": miner.uid,
-                            "miner_hotkey": miner.hotkey,
-                            "burn_share": burn_share,
-                            "num_burners": len(burners),
-                            "score": main_burner_score,
-                            "pool": "burn_main",
-                            "logic": "old_main_burner",
-                            "block_seed": last_mechanism_step_block,
-                            "burn_ratio": burn_ratio,
-                        },
-                    )
-                )
-            elif miner.uid in other_burners:
-                if not _burner_coldkey_matches(miner):
-                    continue
-                burn_scores[miner.hotkey] = other_burner_score
-
-                logger.debug(
-                    _m(
-                        "Miner assigned as other burner (old logic)",
-                        extra={
-                            "miner_uid": miner.uid,
-                            "miner_hotkey": miner.hotkey,
-                            "burn_share": burn_share,
-                            "num_burners": len(burners),
-                            "score": other_burner_score,
-                            "pool": "burn_other",
-                            "logic": "old_other_burner",
-                        },
-                    )
-                )
-
-        logger.info(
-            _m(
-                "Old burn logic applied - main burner selection",
-                extra={
-                    "total_burners": len(burners),
-                    "burner_uids": list(burners),
-                    "main_burner_uid": main_burner,
-                    "main_burner_score": main_burner_score,
-                    "other_burner_score": other_burner_score,
-                    "burn_share": burn_share,
-                    "block_seed": last_mechanism_step_block,
-                    "burn_ratio": burn_ratio,
-                },
-            )
-        )
-
-        return burn_scores
-
     def is_burner(self, miner_uid: int) -> bool:
         """Check if a miner UID is a burner node.
 
@@ -284,10 +172,7 @@ class BurnService:
         Returns:
             bool: True if miner is a burner node
         """
-        if settings.ENABLE_NEW_BURN_LOGIC:
-            return miner_uid in settings.NEW_BURNERS
-        else:
-            return miner_uid in settings.BURNERS
+        return miner_uid in settings.NEW_BURNERS
 
     def get_burn_share(self) -> float:
         """Get the total burn emission share.

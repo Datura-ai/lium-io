@@ -12,8 +12,9 @@ from typing import Optional
 
 from .gpu_spec_table import (
     KNOWN_UNRANGED,
+    classify_gpu_model,
     get_expected_vram_windows,
-    normalize_gpu_model,
+    reference_gpu_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,8 @@ def precheck_gpu_spec(gpu_model: Optional[str], gpu_capacity_mb: int) -> None:
         None on pass (including models in KNOWN_UNRANGED).
     """
     raw = gpu_model or ""
-    normalized = normalize_gpu_model(raw)
+    # a memory-modded card reports its base card's name; the provider preflight passes that raw name (DAH-5508)
+    normalized = classify_gpu_model(raw, gpu_capacity_mb)
 
     if not raw or not isinstance(gpu_capacity_mb, int) or gpu_capacity_mb <= 0:
         raise MissingGpuFieldError(
@@ -61,6 +63,11 @@ def precheck_gpu_spec(gpu_model: Optional[str], gpu_capacity_mb: int) -> None:
 
     windows = get_expected_vram_windows(normalized)
     if windows is None:
+        reference = reference_gpu_model(normalized, gpu_capacity_mb)
+        if reference:
+            # DAH-5088: an unknown name has no window; its reported VRAM is its size
+            logger.debug("precheck: %r unknown, scored as %r; passthrough", normalized, reference)
+            return
         raise UnsupportedGpuModelError(
             f"no VRAM windows for normalized model {normalized!r} (raw={raw!r})"
         )

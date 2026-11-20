@@ -1,0 +1,340 @@
+"""DAH-4547 - HardwareIdentityCheck: DMI overlay, an NVML GPU the kernel does not list, DMI drift."""
+from __future__ import annotations
+
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from neurons.validators.src.services.nvidia_devices import KernelGpuView
+from neurons.validators.src.services.task.checks import hardware_identity
+from neurons.validators.src.services.task.checks.hardware_identity import (
+    BOOT_ID_PATH,
+    DMI_ID_PATH,
+    HW_ID_BOOT_FS_SEPARATOR,
+    HW_ID_BOOT_SEPARATOR,
+    HW_ID_BOOT_VALUE_SEPARATOR,
+    HW_ID_FS_SEPARATOR,
+    HW_ID_KEY_PREFIX,
+    HW_ID_VALUES_SEPARATOR,
+    HardwareIdentityCheck,
+    dmi_overlay_findings,
+    gpu_sources_disagree,
+    trusted_boot_id,
+)
+from neurons.validators.src.services.task.messages import HardwareIdentityMessages as Msg, render_message
+from neurons.validators.src.services.task.pipeline import CheckResult, Pipeline
+from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
+
+from tests.helpers import build_services, build_state, default_executor
+
+SYSFS_ROW = f"{DMI_ID_PATH}/product_uuid sysfs\n{DMI_ID_PATH}/product_uuid|regular file\n"
+SYS_MOUNT = "25 20 0:22 / /sys ro,nosuid - sysfs sysfs ro\n"
+PROC_MOUNT = "30 20 0:5 / /proc rw,nosuid - proc proc rw\n"
+# Docker's read-only bind of the same procfs subtree
+PROC_SYS_RO = "31 30 0:5 /sys /proc/sys ro,nosuid - proc proc rw\n"
+PROC_FILE = "proc\nregular empty file\n"
+B1, B2, B3 = (f"{n}1234567-89ab-cdef-0123-456789abcdef" for n in "123")
+
+
+def test_clean_sysfs_has_no_overlay():
+    assert dmi_overlay_findings(SYS_MOUNT, SYSFS_ROW) == []
+
+
+def test_bind_mounted_file_over_dmi_is_an_overlay():
+    mount = f"40 25 259:2 /tmp/.uuid {DMI_ID_PATH}/product_uuid ro - ext4 /dev/nvme0n1p2 rw\n"
+    assert dmi_overlay_findings(SYS_MOUNT + mount, SYSFS_ROW) == [f"{DMI_ID_PATH}/product_uuid ext4"]
+
+
+def test_file_on_tmpfs_or_symlink_is_an_overlay():
+    rows = f"{DMI_ID_PATH}/product_uuid tmpfs\n{DMI_ID_PATH}/board_serial|symbolic link\n"
+    assert dmi_overlay_findings("", rows) == [
+        f"{DMI_ID_PATH}/product_uuid tmpfs",
+        f"{DMI_ID_PATH}/board_serial symbolic link",
+    ]
+
+
+def test_gpu_sources_disagree():
+    assert gpu_sources_disagree(["GPU-a"], ["GPU-b"]) is True
+    assert gpu_sources_disagree(["GPU-a", "GPU-b"], ["GPU-a"]) is True
+    assert gpu_sources_disagree(["GPU-a"], ["GPU-a"]) is False
+    assert gpu_sources_disagree(["GPU-a"], None) is False  # unreadable kernel list decides nothing
+
+
+def test_kernel_gpu_the_node_does_not_report_is_not_a_disagreement():
+    assert gpu_sources_disagree(["GPU-a"], ["GPU-a", "GPU-b"]) is False
+
+
+def _ctx(
+    context_factory, *, stdout, kernel=("GPU-a",), reported="GPU-a", redis=None, rented_data=None, executor=None
+):
+    async def run(cmd, *args, **kwargs):
+        return SimpleNamespace(exit_status=0, stdout=stdout, stderr="")
+
+    state = build_state(
+        gpu_uuids=reported,
+        kernel_gpu_uuids=list(kernel) if kernel is not None else None,
+        kernel_gpu_uuids_read_attempted=True,
+        rented_data=rented_data,
+    )
+    services = build_services(redis=redis) if redis is not None else build_services()
+    return context_factory(
+        state=state, ssh=SimpleNamespace(run=run), services=services, executor=executor or default_executor()
+    )
+
+
+def _boot(boot, boot_mounts=PROC_MOUNT, boot_file=PROC_FILE):
+    return f"\n{boot_mounts}{HW_ID_BOOT_FS_SEPARATOR}\n{boot_file}{HW_ID_BOOT_VALUE_SEPARATOR}\n{boot}\n"
+
+
+def _stdout(mounts=SYS_MOUNT, rows=SYSFS_ROW, values="uuid-1|serial-1|", boot=None, **boot_layout):
+    out = f"{mounts}{HW_ID_FS_SEPARATOR}\n{rows}{HW_ID_VALUES_SEPARATOR}\n{values}"
+    return out if boot is None else f"{out}\n{HW_ID_BOOT_SEPARATOR}{_boot(boot, **boot_layout)}"
+
+
+async def _run(ctx):
+    return await HardwareIdentityCheck().run(ctx)
+
+
+@pytest.mark.asyncio
+async def test_clean_host_passes_and_logs_fingerprint(context_factory):
+    result = await _run(_ctx(context_factory, stdout=_stdout()))
+    assert result.passed is True
+    assert result.event.reason_code == Msg.OK.reason
+    assert result.event.what_we_saw["gpu_fingerprint"]
+
+
+@pytest.mark.asyncio
+async def test_dmi_overlay_fails(context_factory):
+    stdout = _stdout(rows=f"{DMI_ID_PATH}/product_uuid tmpfs\n")
+    result = await _run(_ctx(context_factory, stdout=stdout))
+    assert result.passed is False
+    assert result.event.reason_code == Msg.SPOOFED.reason
+    assert result.event.what_we_saw["findings"] == ["dmi_overlaid"]
+
+
+@pytest.mark.asyncio
+async def test_nvml_gpu_missing_from_kernel_fails(context_factory):
+    result = await _run(_ctx(context_factory, stdout=_stdout(), kernel=("GPU-b",)))
+    assert result.passed is False
+    assert result.event.what_we_saw["findings"] == ["gpu_sources_disagree"]
+
+
+def _container_with_one_of_two_cards(context_factory, monkeypatch, *, host_uuids):
+    async def read_host_view(ssh, *, host_view=False):
+        assert host_view is True
+        return KernelGpuView(uuids=host_uuids, foreign_mounts=[])
+
+    monkeypatch.setattr(hardware_identity, "read_kernel_gpu_view", read_host_view)
+    return _ctx(context_factory, stdout=_stdout(), kernel=("GPU-a",), reported="GPU-a,GPU-b")
+
+
+@pytest.mark.asyncio
+async def test_container_given_some_of_the_host_cards_passes_on_the_host_list(context_factory, monkeypatch):
+    ctx = _container_with_one_of_two_cards(context_factory, monkeypatch, host_uuids=["GPU-a", "GPU-b"])
+    result = await _run(ctx)
+    assert result.passed is True
+    assert result.event.what_we_saw["host_kernel_gpu_uuids"] == ["GPU-a", "GPU-b"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host_uuids", [["GPU-a"], None])
+async def test_nvml_gpu_missing_from_the_host_list_too_fails(context_factory, monkeypatch, host_uuids):
+    ctx = _container_with_one_of_two_cards(context_factory, monkeypatch, host_uuids=host_uuids)
+    result = await _run(ctx)
+    assert result.passed is False
+    assert result.event.what_we_saw["findings"] == ["gpu_sources_disagree"]
+
+
+@pytest.mark.asyncio
+async def test_dmi_change_under_same_gpus_is_flagged(context_factory):
+    ctx = _ctx(context_factory, stdout=_stdout(values="uuid-1|serial-1|"))
+    redis = ctx.services.redis
+    assert (await _run(ctx)).passed is True
+
+    result = await _run(_ctx(context_factory, stdout=_stdout(values="uuid-2|serial-1|"), redis=redis))
+    assert result.passed is False
+    assert result.event.what_we_saw["findings"] == ["dmi_changed_under_same_gpus"]
+
+
+async def _seen(context_factory, redis, dmi, boot, **boot_layout):
+    """One check of the node with this DMI identity and boot id; True when it passed."""
+    ctx = _ctx(context_factory, stdout=_stdout(values=dmi, boot=boot, **boot_layout), redis=redis)
+    return (await _run(ctx)).passed
+
+
+@pytest.fixture
+def redis():
+    return build_services().redis
+
+
+A, B = "uuid-1|serial-1|", "uuid-2|serial-1|"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("boot_after", "passes"), [(B1, False), (B2, True)])
+async def test_a_dmi_change_with_a_fresh_trusted_boot_id_is_a_restart(context_factory, redis, boot_after, passes):
+    assert await _seen(context_factory, redis, A, B1)
+    assert await _seen(context_factory, redis, B, boot_after) is passes
+
+
+@pytest.mark.asyncio
+async def test_a_return_to_an_earlier_identity_and_boot_id_is_flagged(context_factory, redis):
+    assert await _seen(context_factory, redis, A, B1)
+    assert await _seen(context_factory, redis, B, B2)
+    assert await _seen(context_factory, redis, A, B1) is False
+
+
+@pytest.mark.asyncio
+async def test_every_fresh_boot_id_is_a_restart(context_factory, redis):
+    for n in range(10):
+        assert await _seen(context_factory, redis, (A, B)[n % 2], f"{n:08x}-89ab-cdef-0123-456789abcdef")
+
+
+@pytest.mark.asyncio
+async def test_a_boot_id_seen_without_a_dmi_change_is_remembered(context_factory, redis):
+    assert await _seen(context_factory, redis, A, B1)
+    assert await _seen(context_factory, redis, A, B2)
+    assert await _seen(context_factory, redis, B, B1) is False
+
+
+@pytest.mark.asyncio
+async def test_an_existing_records_boot_id_seeds_the_history(context_factory, redis):
+    key = f"{HW_ID_KEY_PREFIX}:{default_executor().uuid}"
+    await redis.set(key, json.dumps({"gpus": ["GPU-a"], "dmi": A, "boot": B1}))
+    assert await _seen(context_factory, redis, B, B1) is False
+    assert json.loads(await redis.get(key))["boots"] == [B1]
+
+
+@pytest.mark.asyncio
+async def test_a_record_without_boot_history_keeps_flagging_a_dmi_change(context_factory, redis):
+    key = f"{HW_ID_KEY_PREFIX}:{default_executor().uuid}"
+    await redis.set(key, json.dumps({"gpus": ["GPU-a"], "dmi": A}))
+    assert await _seen(context_factory, redis, B, B2) is False
+    assert json.loads(await redis.get(key))["boots"] == [B2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boot", ["", "not-a-boot-id", B2.upper()])
+async def test_a_missing_or_invalid_boot_id_excuses_nothing(context_factory, redis, boot):
+    assert await _seen(context_factory, redis, A, B1)
+    assert await _seen(context_factory, redis, B, boot) is False
+
+
+@pytest.mark.parametrize(
+    ("boot_mounts", "boot_file"),
+    [
+        # a file bound over the boot id
+        (PROC_MOUNT + f"40 30 259:2 /tmp/boot {BOOT_ID_PATH} ro - ext4 /dev/nvme0n1p2 rw\n", "ext4\nregular file\n"),
+        # a procfs file that changes on every read, bound over the boot id
+        (PROC_MOUNT + f"40 30 0:5 /sys/kernel/random/uuid {BOOT_ID_PATH} ro - proc proc rw\n", PROC_FILE),
+        # a parent replaced by another filesystem
+        (PROC_MOUNT + "40 30 0:60 / /proc/sys/kernel tmpfs rw - tmpfs tmpfs rw\n", "tmpfs\nregular file\n"),
+        # a parent replaced by another procfs subtree
+        (PROC_MOUNT + "40 30 0:5 /sys/vm /proc/sys/kernel ro - proc proc rw\n", PROC_FILE),
+        # no mount listing
+        ("", PROC_FILE),
+    ],
+)
+def test_a_boot_id_not_served_by_procfs_is_not_trusted(boot_mounts, boot_file):
+    assert trusted_boot_id(_boot(B1, boot_mounts, boot_file)) == ""
+
+
+@pytest.mark.parametrize("boot_mounts", [PROC_MOUNT, PROC_MOUNT + PROC_SYS_RO])
+def test_a_normal_procfs_layout_is_trusted(boot_mounts):
+    assert trusted_boot_id(_boot(B1, boot_mounts)) == B1
+
+
+@pytest.mark.asyncio
+async def test_an_overlaid_boot_id_excuses_nothing_and_is_not_remembered(context_factory, redis):
+    overlay = PROC_MOUNT + "40 30 0:60 / /proc/sys/kernel tmpfs rw - tmpfs tmpfs rw\n"
+    assert await _seen(context_factory, redis, A, B1)
+    assert await _seen(context_factory, redis, A, B2, boot_mounts=overlay)  # unchanged DMI: no new failure
+    assert await _seen(context_factory, redis, B, B2, boot_mounts=overlay) is False
+    assert await _seen(context_factory, redis, B, B2)  # B2 was never remembered, so the trusted read is fresh
+
+
+@pytest.mark.asyncio
+async def test_unreadable_host_passes(context_factory):
+    async def run(cmd, *args, **kwargs):
+        raise OSError("ssh closed")
+
+    ctx = context_factory(
+        state=build_state(gpu_uuids="GPU-a", kernel_gpu_uuids_read_attempted=True), ssh=SimpleNamespace(run=run)
+    )
+    result = await _run(ctx)
+    assert result.passed is True
+
+
+class _Next:
+    check_id = "test.next"
+    fatal = True
+
+    def __init__(self):
+        self.ran = False
+
+    async def run(self, ctx):
+        self.ran = True
+        return CheckResult(passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id))
+
+
+def _rented(executor):
+    return RentedExecutorsResponse(
+        executors={
+            executor.uuid: RentedExecutor(
+                miner_hotkey="miner-hotkey",
+                executor_ip_address=executor.address,
+                executor_ip_port=str(executor.port),
+                pods=[RentedPod(pod_id="pod-1", container_name="pod_p1")],
+            )
+        },
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rented", [True, False])
+async def test_finding_is_fatal_only_without_a_live_rental(context_factory, rented):
+    executor = default_executor()
+    ctx = _ctx(
+        context_factory,
+        stdout=_stdout(rows=f"{DMI_ID_PATH}/product_uuid tmpfs\n"),
+        rented_data=_rented(executor) if rented else None,
+        executor=executor,
+    )
+    result = await _run(ctx)
+    assert result.passed is False
+    assert result.fatal is (not rented)
+    assert result.updates == {"hardware_identity_passed": False}
+
+    nxt = _Next()
+    await Pipeline(checks=[HardwareIdentityCheck(), nxt], sink=AsyncMock()).run(ctx)
+    assert nxt.ran is rented  # with a live pod the pipeline goes on to TenantEnforcementCheck
+
+
+@pytest.mark.asyncio
+async def test_a_dmi_change_stays_a_finding_when_the_session_drops_while_the_new_identity_is_stored(context_factory):
+    """Review 4491939660 on #2080: the check stores the new identity before it returns, so a replay on a fresh
+    session would compare against it and pass."""
+    first = _ctx(context_factory, stdout=_stdout(values="uuid-1|serial-1|"))
+    redis = first.services.redis
+    assert (await _run(first)).passed is True
+
+    ctx = _ctx(context_factory, stdout=_stdout(values="uuid-2|serial-1|"), redis=redis)  # same GPU UUIDs
+    closed = []
+    ctx.ssh.is_closed = lambda: bool(closed)
+    set_ = redis.set
+
+    async def set_then_drop(*args, **kwargs):
+        await set_(*args, **kwargs)
+        closed.append(1)
+
+    redis.set = set_then_drop
+    reconnect = AsyncMock()
+
+    _, events, after = await Pipeline(checks=[HardwareIdentityCheck()], sink=AsyncMock(), reconnect=reconnect).run(
+        ctx
+    )
+
+    assert not reconnect.called
+    assert Msg.SPOOFED.reason in [e.reason_code for e in events]
+    assert after.hardware_identity_passed is False

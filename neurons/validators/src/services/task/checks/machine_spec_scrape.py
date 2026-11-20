@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -8,26 +9,34 @@ from collections.abc import Iterator
 from dataclasses import dataclass, fields, replace
 from typing import Any, Literal
 
-from core.config import settings
+from services.file_encrypt_service import ORIGINAL_KEYS
+from services.gpu_spec_table import classify_gpu_model, list_sxm_on_pcie_adapter_as_pcie
+from services.liumd_binary_refresh import DEFAULT_REFRESH_BUDGET_SECONDS, ensure_liumd_binary
 
-from ..messages import MachineSpecMessages as Msg, MessageTemplate, render_message
+from core.config import settings
+from core.utils import _m, get_extra_info
+
+from ..messages import MachineSpecMessages as Msg
+from ..messages import MessageTemplate, render_message
+from ..models import ValidationEvent
 from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
-from core.utils import _m, get_extra_info
-from services.file_encrypt_service import ORIGINAL_KEYS
-from services.gpu_spec_table import normalize_gpu_model
-from .rented_gpu_drop import RentedGpuDropCheck
+from .gpu_loss_hold import GpuLossHoldCheck
+from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
+from .task_time import task_seconds_left
 from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
 
 logger = logging.getLogger(__name__)
 
-# DAH-2794: how long a failed stdin attempt may have taken and still be worth retrying with the
-# binary. Above a full scrape (~15 s on a real box, so a payload that will not decrypt is only
-# knowable around then), below the point where the retry stops fitting: 60 s here + 300 s upload
-# + 300 s scrape = 660 s against the 780 s per-executor timeout. The upload gets one attempt for
-# exactly that reason.
-STDIN_FAILURE_RETRY_WINDOW_MS = 60_000
+# How long a failed stdin attempt may have taken and still be worth retrying with the binary.
+# Above a full scrape (~15 s on a real box, plus up to ~90 s for the vloopback mount test and its
+# cleanup, so a payload that will not decrypt is only knowable around then), below the point where
+# the retry stops fitting: 120 s here + 300 s upload + 300 s scrape = 720 s against the 780 s
+# per-executor timeout. The upload gets one attempt for exactly that reason.
+STDIN_FAILURE_RETRY_WINDOW_MS = 120_000
 FALLBACK_UPLOAD_ATTEMPTS = 1
+# The scrape's own worst case from above; the liumd refresh must not eat the time this needs.
+SCRAPE_BUDGET_SECONDS = 720
 
 # The scrape says only two things on stdout: a Fernet token when it worked, and a JSON object
 # with an "error" key when it ran but had nothing to report. Every Fernet token is base64url of
@@ -73,11 +82,23 @@ def _deobfuscate(spec: dict[str, Any], obfuscation_keys: dict[str, str] | None) 
     return _update_keys(first_pass, ORIGINAL_KEYS)
 
 
+def _normalize_liumd_document(raw: dict[str, Any]) -> dict[str, Any]:
+    return _update_keys(_deobfuscate(raw, None), ORIGINAL_KEYS)
+
+
+def normalize_liumd_specs(raw: dict[str, Any]) -> dict[str, Any]:
+    """The liumd machine-scrape document in the validator's normalized specs shape."""
+    specs = _normalize_liumd_document(raw)
+    # the vloopback mount test is reported in the scrape event only; the stored specs do not carry it
+    specs.pop("vloopback_check", None)
+    return specs
+
+
 def _normalize_gpu_details(gpu_details: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         {
             **detail,
-            "name": normalize_gpu_model(detail.get("name")),
+            "name": classify_gpu_model(detail.get("name"), detail.get("capacity")),
         }
         if detail.get("name")
         else detail
@@ -183,6 +204,17 @@ def _classify_scrape_failure(
     return ScrapeFailure(Msg.SCRAPE_FAILED_NO_GPU, scrape_error="no_gpu_details")
 
 
+def _liumd_no_gpu_failure(specs: dict[str, Any]) -> ScrapeFailure:
+    gpu_scrape_error = specs.get("gpu_scrape_error")
+    if gpu_scrape_error:
+        return ScrapeFailure(
+            Msg.SCRAPE_FAILED_DRIVER,
+            scrape_error="no_gpu_details",
+            gpu_scrape_error=str(gpu_scrape_error)[:200],
+        )
+    return ScrapeFailure(Msg.SCRAPE_FAILED_NO_GPU, scrape_error="no_gpu_details")
+
+
 # The scrape's own NVML reading on the host says the node cannot serve a GPU: NVML answered with zero cards
 # (SCRAPE_FAILED_NO_GPU), or raised one of these nvml.h return codes (SCRAPE_FAILED_DRIVER): driver not
 # loaded, GPU lost, GPU requires reset, GPU not found. Anything else stays a plain halt: the library copied
@@ -252,7 +284,7 @@ def _no_gpu_report_specs(stdout: str, obfuscation_keys: dict[str, str] | None) -
     return specs if isinstance(specs.get("gpu"), dict) else {**specs, "gpu": {}}
 
 
-async def _report_rented_gpu_loss(ctx: Context, specs: dict[str, Any]) -> None:
+async def _report_rented_gpu_loss(ctx: Context, specs: dict[str, Any]) -> list[ValidationEvent]:
     # A scrape that lists no GPU (card 0 lost, the only card lost, the driver down) fails here, and
     # this check is fatal, so RentedGpuDropCheck never runs on that cycle: hand it the empty scrape.
     gpu = specs["gpu"]
@@ -264,12 +296,19 @@ async def _report_rented_gpu_loss(ctx: Context, specs: dict[str, Any]) -> None:
         gpu_details=[],
     )
     try:
-        await RentedGpuDropCheck().run(ctx.model_copy(update={"state": state}))
+        lost_ctx = ctx.model_copy(update={"state": state})
+        await RentedGpuDropCheck().run(lost_ctx)
+        # DAH-4457: the hold starts here too, so the next clean scrape does not list the node again at once.
+        # This failed scrape ends the run before GpuLossHoldCheck, so its GPU_LOST entry rides on the scrape's
+        # result: without it a node whose driver died stayed listed for as long as the scrape kept failing.
+        hold_result = await GpuLossHoldCheck().run(lost_ctx)
+        return [hold_result.event] if hold_result.event.is_availability_error else []
     except Exception:
         logger.warning(
             _m("RENTED_GPU_DROP_ON_SCRAPE_FAILURE_ERROR", extra=get_extra_info(ctx.default_extra)),
             exc_info=True,
         )
+        return []
 
 
 @dataclass(frozen=True)
@@ -316,8 +355,34 @@ def _interconnect_summary(specs: dict[str, Any]) -> dict[str, Any] | None:
     return summary
 
 
+VLOOPBACK_TEXT_FIELDS = ("verdict", "reason_code", "detail", "runtime")
+# the host sends these fields; a modified scrape can send any type or length, so the validator keeps
+# only strings, cut to the scrape's own detail cap
+VLOOPBACK_TEXT_CAP = 300
+
+
+def _host_text(value: Any) -> str | None:
+    return value[:VLOOPBACK_TEXT_CAP] if isinstance(value, str) else None
+
+
+def _vloopback_fields(vloopback: dict[str, Any]) -> dict[str, Any]:
+    return {field: _host_text(vloopback.get(field)) for field in VLOOPBACK_TEXT_FIELDS}
+
+
+def _storage_limit_summary(specs: dict[str, Any], vloopback: Any) -> dict[str, Any]:
+    # the storage-limit verdict and the vloopback mount test's own verdict, in the validator's own log
+    supported = bool(specs.get("storage_limit_supported", False))
+    summary: dict[str, Any] = {"supported": supported}
+    scrape_error = specs.get("storage_limit_scrape_error")
+    if not supported and scrape_error:
+        summary["detail"] = str(scrape_error)[:VLOOPBACK_TEXT_CAP]
+    if isinstance(vloopback, dict):
+        summary["vloopback"] = _vloopback_fields(vloopback)
+    return summary
+
+
 def _binary_command(remote_dir: str, script_filename: str) -> str:
-    script_path = f"{remote_dir.rstrip('/')}/{script_filename.lstrip('/')}"
+    script_path = shlex.quote(f"{remote_dir.rstrip('/')}/{script_filename.lstrip('/')}")
     return f"chmod +x {script_path} && {script_path}"
 
 
@@ -330,18 +395,227 @@ class MachineSpecScrapeCheck:
     """
 
     check_id = "gpu.scrape.machine_spec"
+    # a replay would advance this cycle's counters a second time
+    replays_after_session_drop = False
     fatal = True
 
     DEFAULT_TIMEOUT = 300
 
     async def run(self, ctx: Context) -> CheckResult:
+        liumd_specs = settings.VALIDATOR_LIUMD_SPECS and not settings.DRY_RUN
+        if settings.VALIDATOR_LIUMD_SHADOW or liumd_specs:
+            refresh = await ensure_liumd_binary(
+                ctx,
+                budget_seconds=min(
+                    DEFAULT_REFRESH_BUDGET_SECONDS, task_seconds_left(ctx) - SCRAPE_BUDGET_SECONDS
+                ),
+            )
+            if refresh is not None and refresh.skipped:
+                logger.warning(
+                    _m(
+                        "liumd binary refresh skipped; using the local binary",
+                        extra=get_extra_info({**ctx.default_extra, "detail": refresh.detail[:300]}),
+                    )
+                )
+            elif refresh is not None and not refresh.ok:
+                if liumd_specs:
+                    return self._fail_liumd(
+                        ctx,
+                        None,
+                        f"liumd binary refresh failed: {refresh.detail}",
+                        reason="binary_refresh_failed",
+                    )
+                logger.warning(
+                    _m(
+                        "liumd binary refresh failed; shadow continues",
+                        extra=get_extra_info({**ctx.default_extra, "detail": refresh.detail[:300]}),
+                    )
+                )
+            elif refresh is not None and refresh.changed:
+                logger.info(
+                    _m(
+                        "liumd binary refreshed",
+                        extra=get_extra_info({**ctx.default_extra, "build_sha": refresh.build_sha}),
+                    )
+                )
+            elif refresh is not None and refresh.detail:
+                logger.warning(
+                    _m(
+                        "liumd binary refresh degraded; using the local binary",
+                        extra=get_extra_info({**ctx.default_extra, "detail": refresh.detail[:300]}),
+                    )
+                )
+        if liumd_specs:
+            return await self._scrape_with_liumd(ctx)
+
         timeout = ctx.config.machine_scrape_timeout or self.DEFAULT_TIMEOUT
 
         if ctx.config.machine_scrape_source:
-            return await self._scrape_from_source(ctx, timeout)
-        return await self._scrape_uploaded_binary(ctx, timeout)
+            return await self._scrape_from_source(ctx, timeout, start_shadow=True)
+        return await self._scrape_uploaded_binary(ctx, timeout, start_shadow=True)
 
-    async def _scrape_from_source(self, ctx: Context, timeout: int) -> CheckResult:
+    async def _scrape_with_liumd(self, ctx: Context) -> CheckResult:
+        """Use the full machine-scrape document from the same early `liumd run`."""
+        from services.local_verify_client import LocalVerifyAnswer
+
+        from ..liumd_shadow import start_facts_after_scrape
+
+        task = start_facts_after_scrape(ctx)
+        if task is None:
+            return self._fail_liumd(ctx, None, "no early liumd read")
+        answer = await task
+        if not isinstance(answer, LocalVerifyAnswer):
+            return self._fail_liumd(ctx, answer)
+        if not answer.specs:
+            return self._fail_liumd(ctx, answer, "empty liumd specs")
+
+        specs = _normalize_liumd_document(answer.specs)
+        gpu_info = specs.get("gpu")
+        raw_gpu_details = gpu_info.get("details", []) if isinstance(gpu_info, dict) else None
+        if not isinstance(gpu_info, dict) or not isinstance(raw_gpu_details, list) or not all(
+            isinstance(detail, dict) for detail in raw_gpu_details
+        ):
+            return self._fail_liumd(ctx, answer, "malformed liumd specs")
+        if not raw_gpu_details:
+            return await self._fail_without_gpus(ctx, answer, specs)
+        return self._result_from_specs(ctx, specs, delivery="liumd", task=task, snapshot=False)
+
+    async def _fail_without_gpus(
+        self, ctx: Context, answer: Any, specs: dict[str, Any]
+    ) -> CheckResult:
+        failure = _liumd_no_gpu_failure(specs)
+        what: dict[str, Any] = {"delivery": "liumd", "round_trip_ms": answer.round_trip_ms}
+        # DAH-4658: every card is missing; held only when each one is a GPU the renter resets
+        if failure.scrape_error == "no_gpu_details" and await missing_gpus_under_reset(ctx, []):
+            event = render_message(
+                Msg.SCRAPE_GPU_RESET_IN_PROGRESS,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={**what, "held_reason_code": failure.template.reason, **failure.cause_event_fields()},
+            )
+            return CheckResult(passed=False, event=event)
+        gpu_lost_events = await _report_rented_gpu_loss(ctx, specs)
+        reset = _host_gpu_fault_reset(ctx, failure, self.check_id)
+        event = render_message(
+            failure.template,
+            ctx=ctx,
+            check_id=self.check_id,
+            impact=HOST_GPU_RUNTIME_FAULT_IMPACT if reset else None,
+            what={
+                **what,
+                **failure.cause_event_fields(),
+                **({"host_gpu_fault_reset": True} if reset else {}),
+            },
+        )
+        return CheckResult(passed=False, event=event, updates=reset, extra_events=gpu_lost_events)
+
+    def _result_from_specs(
+        self,
+        ctx: Context,
+        specs: dict[str, Any],
+        *,
+        delivery: Literal["stdin", "upload", "liumd"],
+        task: Any = None,
+        what: dict[str, Any] | None = None,
+        snapshot: bool = True,
+    ) -> CheckResult:
+        specs.pop("port_verify_first_miss", None)
+        specs.pop("split_disk", None)
+        vloopback = specs.pop("vloopback_check", None)
+        gpu_info = specs.get("gpu", {}) or {}
+        gpu_count = gpu_info.get("count", 0) or 0
+        raw_gpu_details = gpu_info.get("details", []) or []
+        for detail in raw_gpu_details:
+            if isinstance(detail, dict):
+                detail.pop("power_host_limit", None)
+        gpu_details = list_sxm_on_pcie_adapter_as_pcie(specs, _normalize_gpu_details(raw_gpu_details))
+        gpu_model = gpu_details[0].get("name") if gpu_count > 0 and gpu_details else None
+        gpu_model_count = f"{gpu_model}:{gpu_count}" if gpu_model is not None else None
+        gpu_uuids = ",".join(detail.get("uuid", "") for detail in gpu_details if detail.get("uuid"))
+        sysbox_runtime = specs.get("sysbox_runtime", False)
+        hardware_supports = specs.get("storage_limit_supported", False)
+        gpu_splitting_config = ctx.state.rented_data.gpu_splitting_config if ctx.state.rented_data else {}
+        gpu_splitting_min_count = gpu_splitting_config.get(ctx.executor.uuid)
+        supports_gpu_splitting = hardware_supports and gpu_splitting_min_count is not None
+        # only the Python scrape has a second read to compare against
+        scrape_specs = copy.deepcopy(specs) if snapshot else None
+        extra_info = {
+            "sysbox_runtime": sysbox_runtime,
+            "supports_gpu_splitting": supports_gpu_splitting,
+            "gpu_splitting_min_count": gpu_splitting_min_count,
+        }
+        event = render_message(
+            Msg.SCRAPE_OK,
+            ctx=ctx,
+            check_id=self.check_id,
+            what={
+                **(what or {"delivery": delivery}),
+                "gpu_count": gpu_count,
+                "gpu_model": gpu_model,
+                "network": specs.get("network"),
+                "interconnect": _interconnect_summary(specs),
+                "storage_limit": _storage_limit_summary(specs, vloopback),
+            },
+            extra=extra_info,
+        )
+        updated_state = replace(
+            ctx.state,
+            specs=specs,
+            scrape_specs=scrape_specs,
+            gpu_model=gpu_model,
+            gpu_count=gpu_count,
+            gpu_details=gpu_details,
+            gpu_processes=specs.get("gpu_processes", []) or [],
+            sysbox_runtime=sysbox_runtime,
+            supports_gpu_splitting=supports_gpu_splitting,
+            gpu_splitting_min_count=gpu_splitting_min_count,
+            gpu_model_count=gpu_model_count,
+            gpu_uuids=gpu_uuids,
+            liumd_shadow_facts_task=task,
+            liumd_shadow_facts_attempted=True,
+        )
+        return CheckResult(
+            passed=True,
+            event=event,
+            updates={"state": updated_state, "default_extra": {**ctx.default_extra, **extra_info}},
+        )
+
+    @staticmethod
+    def _fail_liumd(
+        ctx: Context,
+        answer: Any,
+        detail: str | None = None,
+        *,
+        reason: str | None = None,
+    ) -> CheckResult:
+        from services.local_verify_client import LocalVerifyUnavailable
+
+        if reason is None:
+            if isinstance(answer, LocalVerifyUnavailable):
+                reason = answer.reason or "unavailable"
+                detail = detail or answer.detail
+            elif answer is None:
+                reason = "no_early_read"
+            else:
+                reason = "malformed"
+        detail = (detail or reason)[:300]
+        template = Msg.SCRAPE_TIMEOUT if reason == "timeout" else Msg.SCRAPE_FAILED_ON_HOST
+        event = render_message(
+            template,
+            ctx=ctx,
+            check_id=MachineSpecScrapeCheck.check_id,
+            what={
+                "delivery": "liumd",
+                "liumd_reason": reason,
+                "scrape_error": reason,
+                "detail": detail,
+            },
+        )
+        return CheckResult(passed=False, event=event)
+
+    async def _scrape_from_source(
+        self, ctx: Context, timeout: int, *, start_shadow: bool = True
+    ) -> CheckResult:
         # pipe the obfuscated source into the executor's own interpreter; binary on failure
         #
         # `-I` implies -E -s -P, which drops PYTHONPATH, the user site-dir and the cwd entry
@@ -355,7 +629,9 @@ class MachineSpecScrapeCheck:
             retryable=False,
             stdin_text=ctx.config.machine_scrape_source,
         )
-        result = await self._check_result_from_scrape_run(ctx, scrape_run, delivery="stdin")
+        result = await self._check_result_from_scrape_run(
+            ctx, scrape_run, delivery="stdin", start_shadow=start_shadow
+        )
         if result.passed:
             return result
 
@@ -375,11 +651,16 @@ class MachineSpecScrapeCheck:
             return result
 
         return await self._retry_scrape_with_uploaded_binary(
-            ctx, timeout, fallback_from=StdinAttempt.from_failed_result(result)
+            ctx, timeout, fallback_from=StdinAttempt.from_failed_result(result), start_shadow=start_shadow
         )
 
     async def _retry_scrape_with_uploaded_binary(
-        self, ctx: Context, timeout: int, *, fallback_from: StdinAttempt
+        self,
+        ctx: Context,
+        timeout: int,
+        *,
+        fallback_from: StdinAttempt,
+        start_shadow: bool = True,
     ) -> CheckResult:
         # upload the frozen scrape and run it, after the stdin delivery failed to start
         try:
@@ -403,10 +684,12 @@ class MachineSpecScrapeCheck:
             retryable=False,
         )
         return await self._check_result_from_scrape_run(
-            ctx, scrape_run, delivery="upload", fallback_from=fallback_from
+            ctx, scrape_run, delivery="upload", fallback_from=fallback_from, start_shadow=start_shadow
         )
 
-    async def _scrape_uploaded_binary(self, ctx: Context, timeout: int) -> CheckResult:
+    async def _scrape_uploaded_binary(
+        self, ctx: Context, timeout: int, *, start_shadow: bool = True
+    ) -> CheckResult:
         # run the frozen scrape that UploadFilesCheck put on the executor
         remote_dir = ctx.state.remote_dir
         if not remote_dir:
@@ -430,7 +713,9 @@ class MachineSpecScrapeCheck:
         scrape_run = await ctx.runner.run(
             _binary_command(remote_dir, script_filename), timeout=timeout, retryable=False
         )
-        return await self._check_result_from_scrape_run(ctx, scrape_run, delivery="upload")
+        return await self._check_result_from_scrape_run(
+            ctx, scrape_run, delivery="upload", start_shadow=start_shadow
+        )
 
     async def _check_result_from_scrape_run(
         self,
@@ -439,6 +724,7 @@ class MachineSpecScrapeCheck:
         *,
         delivery: Literal["stdin", "upload"],
         fallback_from: StdinAttempt | None = None,
+        start_shadow: bool = True,
     ) -> CheckResult:
         what: dict[str, Any] = {"delivery": delivery}
         if fallback_from:
@@ -446,8 +732,18 @@ class MachineSpecScrapeCheck:
 
         if not scrape_run.success or not scrape_run.stdout.strip():
             failure = _classify_scrape_failure(scrape_run, ctx.config.obfuscation_keys)
+            # DAH-4658: every card is missing; held only when each one is a GPU the renter resets
+            if failure.scrape_error == "no_gpu_details" and await missing_gpus_under_reset(ctx, []):
+                event = render_message(
+                    Msg.SCRAPE_GPU_RESET_IN_PROGRESS,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={**what, "held_reason_code": failure.template.reason, **failure.cause_event_fields()},
+                )
+                return CheckResult(passed=False, event=event)
+            gpu_lost_events: list[ValidationEvent] = []
             if failure.scrape_error == "no_gpu_details":
-                await _report_rented_gpu_loss(
+                gpu_lost_events = await _report_rented_gpu_loss(
                     ctx, _no_gpu_report_specs(scrape_run.stdout, ctx.config.obfuscation_keys)
                 )
             reset = _host_gpu_fault_reset(ctx, failure, self.check_id)
@@ -466,67 +762,22 @@ class MachineSpecScrapeCheck:
                     **({"host_gpu_fault_reset": True} if reset else {}),
                 },
             )
-            return CheckResult(passed=False, event=event, updates=reset)
+            return CheckResult(passed=False, event=event, updates=reset, extra_events=gpu_lost_events)
 
         try:
             decrypted = _decrypt_payload(ctx, scrape_run.stdout)
             raw = json.loads(decrypted)
             obfuscation_keys = ctx.config.obfuscation_keys
             specs = _deobfuscate(raw, obfuscation_keys)
+            from ..liumd_shadow import start_facts_after_scrape  # liumd_shadow imports checks
 
-            gpu_info = specs.get("gpu", {}) or {}
-            gpu_count = gpu_info.get("count", 0) or 0
-            raw_gpu_details = gpu_info.get("details", []) or []
-            # The native capability challenge derives its key from the raw NVML name in
-            # specs. Policy and scoring use the canonicalized state fields below.
-            gpu_details = _normalize_gpu_details(raw_gpu_details)
-            gpu_model = None
-            if gpu_count > 0 and gpu_details:
-                gpu_model = gpu_details[0].get("name")
-
-            gpu_model_count = f"{gpu_model}:{gpu_count}" if gpu_model is not None else None
-            gpu_uuids = ",".join(detail.get("uuid", "") for detail in gpu_details if detail.get("uuid"))
-            sysbox_runtime = specs.get("sysbox_runtime", False)
-            hardware_supports = specs.get("storage_limit_supported", False)
-            gpu_splitting_config = ctx.state.rented_data.gpu_splitting_config if ctx.state.rented_data else {}
-            gpu_splitting_min_count = gpu_splitting_config.get(ctx.executor.uuid)
-            supports_gpu_splitting = hardware_supports and gpu_splitting_min_count is not None
-
-            extra_info = {
-                "sysbox_runtime": sysbox_runtime,
-                "supports_gpu_splitting": supports_gpu_splitting,
-                "gpu_splitting_min_count": gpu_splitting_min_count,
-            }
-
-            event = render_message(
-                Msg.SCRAPE_OK,
-                ctx=ctx,
-                check_id=self.check_id,
-                what={
-                    **what,
-                    "gpu_count": gpu_count,
-                    "gpu_model": gpu_model,
-                    "network": specs.get("network"),
-                    # DAH-2922: the NVLink/P2P verdict per cycle, without the 8x8 matrix
-                    "interconnect": _interconnect_summary(specs),
-                },
-                extra=extra_info,
+            return self._result_from_specs(
+                ctx,
+                specs,
+                delivery=delivery,
+                task=start_facts_after_scrape(ctx) if start_shadow else None,
+                what=what,
             )
-            updated_state = replace(
-                ctx.state,
-                specs=specs,
-                gpu_model=gpu_model,
-                gpu_count=gpu_count,
-                gpu_details=gpu_details,
-                gpu_processes=specs.get("gpu_processes", []) or [],
-                sysbox_runtime=sysbox_runtime,
-                supports_gpu_splitting=supports_gpu_splitting,
-                gpu_splitting_min_count=gpu_splitting_min_count,
-                gpu_model_count=gpu_model_count,
-                gpu_uuids=gpu_uuids,
-            )
-            updates: dict[str, object] = {"state": updated_state, "default_extra": {**ctx.default_extra, **extra_info}}
-            return CheckResult(passed=True, event=event, updates=updates)
 
         except Exception as exc:
             event = render_message(

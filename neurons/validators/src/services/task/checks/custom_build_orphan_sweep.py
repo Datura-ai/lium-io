@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shlex
 import time
 
 from core.utils import _m, get_extra_info
@@ -91,7 +92,10 @@ class CustomBuildOrphanSweepCheck:
 
     @staticmethod
     def _active_pod_ids(ctx: Context) -> set[str]:
-        """Pod ids the validator currently believes are rented on *this* executor."""
+        """Pod ids the validator currently believes are rented on *this* executor.
+
+        Pods still being created are added from the pending-pods set in ``run``.
+        """
         if ctx.state.rented_data is None:
             return set()
         executor = ctx.state.rented_data.executors.get(ctx.executor.uuid)
@@ -175,7 +179,8 @@ class CustomBuildOrphanSweepCheck:
         # Defensive — only act on names matching our prefix.
         if not name.startswith(BUILD_DIND_PREFIX):
             return False
-        cmd = f'/usr/bin/docker rm -fv {name} 2>/dev/null || true'
+        # name, image ref and path are node output: quoted, so a planted name cannot run as shell
+        cmd = f'/usr/bin/docker rm -fv {shlex.quote(name)} 2>/dev/null || true'
         try:
             await ssh.run(cmd, check=False)
             return True
@@ -186,7 +191,7 @@ class CustomBuildOrphanSweepCheck:
             return False
 
     async def _remove_image(self, ssh, image_ref: str) -> bool:
-        cmd = f'/usr/bin/docker image rm {image_ref} 2>/dev/null || true'
+        cmd = f'/usr/bin/docker image rm {shlex.quote(image_ref)} 2>/dev/null || true'
         try:
             await ssh.run(cmd, check=False)
             return True
@@ -198,9 +203,9 @@ class CustomBuildOrphanSweepCheck:
 
     async def _remove_scratch(self, ssh, path: str) -> bool:
         # Defensive — only act on paths matching our prefix.
-        if not path.startswith(BUILD_SCRATCH_PREFIX):
+        if not path.startswith(BUILD_SCRATCH_PREFIX) or "/" in path[len(BUILD_SCRATCH_PREFIX):]:
             return False
-        cmd = f'/usr/bin/rm -rf {path}'
+        cmd = f'/usr/bin/rm -rf -- {shlex.quote(path)}'
         try:
             await ssh.run(cmd, check=False)
             return True
@@ -224,6 +229,23 @@ class CustomBuildOrphanSweepCheck:
             return CheckResult(passed=True, event=event)
 
         active_pod_ids = self._active_pod_ids(ctx)
+        # A pod still being created is not in rented_data yet; its in-flight build
+        # (DinD, scratch dir, image) is listed in the shared pending-pods set. Every
+        # entry counts, not only the last 30 min: setup + build + export can run
+        # past that, and a create cut off by a restart has its entry cleared then.
+        try:
+            pending = await ctx.services.redis.get_pending_pods(
+                ctx.miner_hotkey, executor_uuid, max_age_seconds=None
+            )
+        except Exception as exc:  # noqa: BLE001 — cannot tell what is in flight: sweep nothing
+            event = render_message(
+                Msg.SKIPPED,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"reason": "pending pods unreadable", "error": str(exc)},
+            )
+            return CheckResult(passed=True, event=event)
+        active_pod_ids |= {item["pod_id"] for item in pending if item.get("pod_id")}
         try:
             orphan_images, orphan_scratch, orphan_dind = await asyncio.gather(
                 self._list_orphan_images(ctx.ssh, active_pod_ids),

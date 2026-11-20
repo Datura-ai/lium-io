@@ -38,7 +38,15 @@ else
 fi
 
 log_step "Pushing image: ${IMAGE_NAME}"
-PUSH_OUTPUT=$(docker push "$IMAGE_NAME" 2>&1 | tee /dev/stderr)
+if [[ -n "${PLATFORMS:-}" ]]; then
+  # The multi-arch OCI archive docker_build.sh wrote; skopeo reads the docker login and records the
+  # index digest, which both amd64 and arm64 hosts pull by.
+  skopeo copy --all --preserve-digests --digestfile /tmp/executor.digest \
+    "oci-archive:${OCI_ARCHIVE:-/tmp/executor.oci.tar}" "docker://docker.io/${IMAGE_NAME}"
+  PUSH_OUTPUT="digest: $(cat /tmp/executor.digest)"
+else
+  PUSH_OUTPUT=$(docker push "$IMAGE_NAME" 2>&1 | tee /dev/stderr)
+fi
 
 # ── Extract sha256 digest ──────────────────────────────────────────────────────
 log_step "Extracting image digest"

@@ -16,27 +16,20 @@ from datura.requests.miner_requests import (
     SSHKeyRemoved,
     PodLogsResponse,
 )
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 
-from consumers.validator_consumer import ValidatorConsumer
 from dependencies.auth import (
     authenticated_miner_hotkey,
     require_request_names_authenticated_miner,
     verify_simple_validator_signature,
     verify_validator_auth_from_headers,
 )
-from services.executor_service import ExecutorService
+from services.executor_service import RENTAL_REQUEST_HOOK_TIMEOUT_SECONDS, ExecutorService
 from services.ssh_service import MinerSSHService
 
 logger = logging.getLogger(__name__)
 
 validator_router = APIRouter()
-
-
-@validator_router.websocket("/websocket/{validator_key}")
-async def validator_interface(consumer: Annotated[ValidatorConsumer, Depends(ValidatorConsumer)]):
-    await consumer.connect()
-    await consumer.handle()
 
 
 @validator_router.post("/executors", response_model=ExecutorListResponse)
@@ -95,10 +88,10 @@ async def submit_ssh_pubkey(
     authenticated_miner: Annotated[str, Depends(authenticated_miner_hotkey)],
     executor_service: Annotated[ExecutorService, Depends(ExecutorService)],
     ssh_service: Annotated[MinerSSHService, Depends(MinerSSHService)],
+    x_timestamp: Annotated[int, Header(alias="X-Timestamp")],
 ) -> AcceptSSHKeyRequest | FailedRequest:
     """Submit SSH public key to miner (REST API version).
     
-    This endpoint mirrors the WebSocket SSHPubKeySubmitRequest handling.
     Requires authentication via headers: X-Validator-Hotkey, X-Miner-Hotkey, X-Timestamp, X-Signature.
     
     Args:
@@ -121,6 +114,10 @@ async def submit_ssh_pubkey(
             request.validator_signature,
             request.executor_id,
             nonce=request.nonce,
+            validator_miner_signature=request.validator_miner_signature,
+            is_rental_request=request.is_rental_request,
+            # verify_validator_auth_from_headers accepted it; > 1e12 is milliseconds there too
+            requested_at=x_timestamp / 1000 if x_timestamp > 1e12 else x_timestamp,
         )
         executors = registration.accepted
 
@@ -137,7 +134,7 @@ async def submit_ssh_pubkey(
                                 "executor_port": executors[0].port,
                                 "uuid": str(executors[0].uuid),
                             },
-                            timeout=aiohttp.ClientTimeout(total=5)
+                            timeout=aiohttp.ClientTimeout(total=RENTAL_REQUEST_HOOK_TIMEOUT_SECONDS)
                         ) as resp:
                             if resp.status != 200:
                                 logger.error(f"RENTAL_REQUEST_HOOK returned status {resp.status}: {await resp.text()}")
@@ -166,7 +163,6 @@ async def remove_ssh_pubkey(
 ) -> SSHKeyRemoved | FailedRequest:
     """Remove SSH public key from miner (REST API version).
     
-    This endpoint mirrors the WebSocket SSHPubKeyRemoveRequest handling.
     Requires authentication via headers: X-Validator-Hotkey, X-Miner-Hotkey, X-Timestamp, X-Signature.
     
     Args:
@@ -204,7 +200,6 @@ async def get_pod_logs(
 ) -> PodLogsResponse | FailedRequest:
     """Get pod logs from miner (REST API version).
     
-    This endpoint mirrors the WebSocket GetPodLogsRequest handling.
     Requires authentication via headers: X-Validator-Hotkey, X-Miner-Hotkey, X-Timestamp, X-Signature.
     
     Args:

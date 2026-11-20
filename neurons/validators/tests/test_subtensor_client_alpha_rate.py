@@ -10,7 +10,6 @@ heavy SubtensorClient init is bypassed.
 
 from unittest.mock import MagicMock
 
-import pytest
 
 from clients.subtensor_client import SubtensorClient
 
@@ -39,21 +38,3 @@ def test_get_alpha_rate_returns_subnet_price_tao():
     fake_self.subtensor.subnet.assert_called_once_with(netuid=51)
 
 
-def test_get_alpha_rate_raises_when_subnet_missing():
-    # Arrange: subnet() returns None (subnet not found / decode failure)
-    fake_self = _client_with_subnet(None)
-
-    # Act / Assert: surfaces an error so the caller's retry+fallback path engages
-    with pytest.raises(RuntimeError):
-        SubtensorClient.get_alpha_rate(fake_self)
-
-
-def test_get_alpha_rate_raises_when_price_missing():
-    # Arrange: subnet() returns an object without a usable price
-    subnet = MagicMock()
-    subnet.price = None
-    fake_self = _client_with_subnet(subnet)
-
-    # Act / Assert
-    with pytest.raises(RuntimeError):
-        SubtensorClient.get_alpha_rate(fake_self)

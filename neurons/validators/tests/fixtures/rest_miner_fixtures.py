@@ -36,9 +36,7 @@ def wallet(mocker):
 @pytest.fixture
 def rest_miner_service(mocker, wallet, monkeypatch, miner_task_result):
     """The miner accepts the key and returns the executors the test hands it."""
-    from core.config import settings
 
-    monkeypatch.setattr(settings, "USE_REST_API", True)
     ssh_service = mocker.Mock()
     ssh_service.generate_ssh_key.return_value = (b"---PRIV---", b"ssh-ed25519 pub")
     ssh_service.decrypt_payload.return_value = "---DECRYPTED-PRIV---"

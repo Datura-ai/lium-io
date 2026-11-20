@@ -50,12 +50,14 @@ distribution = true
 [tool.pytest.ini_options]
 pythonpath = ["src", "tests"]
 testpaths = ["tests"]
+markers = ["real_pod_ssh_check: run the real pod SSH answer check"]
 
 [dependency-groups]
 dev = [
     "pytest>=8.4.2",
     "pytest-asyncio>=0.25.0",
     "pytest-mock>=3.15.0",
+    "pytest-xdist>=3.6",
     "aiosqlite>=0.21.0",
     "fakeredis>=2.34.1",
 ]

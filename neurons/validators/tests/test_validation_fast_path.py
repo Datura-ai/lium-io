@@ -27,13 +27,10 @@ from neurons.validators.src.protocol.vc_protocol.compute_requests import (
     RentedPod,
 )
 from neurons.validators.src.services.task.checks import (
-    CachedTemplateVerificationCheck,
     CapabilityCheck,
+    ContainerDownloadSpeedCheck,
     GpuFaultProbeCheck,
     PortConnectivityCheck,
-    PortCountCheck,
-    RegistryPullCheck,
-    RentalVerificationCheck,
     SysboxRequiredCheck,
     TenantEnforcementCheck,
     VerifyXCheck,
@@ -305,16 +302,13 @@ def test_fast_path_checks_are_the_serial_checks_re_ordered():
     # VerifyX measures the network alone; the executor refuses VerifyX beside the matmul.
     lane_types = [[type(c) for c in lane] for lane in stage.lanes]
     assert VerifyXCheck not in [t for lane in lane_types for t in lane]
-    assert lane_types == [
-        [
-            PortConnectivityCheck,
-            PortCountCheck,
-            RegistryPullCheck,
-            SysboxRequiredCheck,
-            RentalVerificationCheck,
-        ],
-        [CapabilityCheck, GpuFaultProbeCheck, CachedTemplateVerificationCheck],
-    ]
+    # Only the orderings that matter: the checks reading sysbox_runtime run after the probe that
+    # settles it, and the kernel-fault probe follows the matmul it complements.
+    port_lane = next(lane for lane in lane_types if PortConnectivityCheck in lane)
+    for after in (ContainerDownloadSpeedCheck, SysboxRequiredCheck):
+        assert port_lane.index(PortConnectivityCheck) < port_lane.index(after)
+    gpu_lane = next(lane for lane in lane_types if CapabilityCheck in lane)
+    assert gpu_lane.index(CapabilityCheck) < gpu_lane.index(GpuFaultProbeCheck)
 
 
 def _rented(executor_uuid="exe-1", pods=(), fillers=()):

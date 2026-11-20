@@ -7,7 +7,13 @@ from datetime import datetime, UTC
 from typing import NamedTuple, Optional
 from docker.models.containers import Container
 
-from config import settings, WATCHTOWER_ENDPOINT_URL, WATCHTOWER_VALIDATOR_HOTKEY
+from config import (
+    settings,
+    WATCHTOWER_ENDPOINT_URL,
+    WATCHTOWER_USER_AGENT,
+    WATCHTOWER_VALIDATOR_HOTKEY,
+    WATCHTOWER_VALIDATOR_NEXT_HOTKEY,
+)
 from logger import get_logger, _m
 from models import WatchtowerDigestResponse
 
@@ -18,6 +24,10 @@ EXECUTOR_RUNNER_CONTAINER_NAME = "executor-runner"
 # is `<project>-executor-runner-1` there (`executor-executor-runner-1` under the default project),
 # so the standard stack is found by this label when the CVM name above does not exist.
 EXECUTOR_RUNNER_SERVICE_LABEL = "com.docker.compose.service=executor-runner"
+COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
+# This watchtower's own container ID is in its mount sources (/var/lib/docker/containers/<id>/hostname).
+MOUNTINFO_PATH = "/proc/self/mountinfo"
+_OWN_CONTAINER_ID = re.compile(r"/containers/([0-9a-f]{64})/")
 # Docker Hub's registry host. `registry-mirrors` in the daemon apply to `docker.io` names only,
 # so a reference that names this host goes straight to Docker Hub.
 CANONICAL_REGISTRY_HOST = "registry-1.docker.io"
@@ -108,9 +118,34 @@ def pull_image_by_digest(client: docker.DockerClient, image_name: str, remote_di
     return reference
 
 
+def own_compose_project(client: docker.DockerClient) -> Optional[str]:
+    """
+    The compose project of this watchtower's own container, or None when it runs in no container or
+    its container has no project (the CVM stack, `docker run`). A host can carry a second executor
+    project (an old checkout, a stopped test stack); the runner lookup by label is scoped to this one.
+
+    Raises:
+        RunnerLookupError: its own container is known but could not be inspected. Read as "no
+            project", that would widen the lookup to every stack on the host for this cycle.
+    """
+    try:
+        with open(MOUNTINFO_PATH) as f:
+            match = _OWN_CONTAINER_ID.search(f.read())
+    except OSError:
+        return None
+    if not match:
+        return None
+    try:
+        own = client.containers.get(match.group(1))
+    except Exception as e:
+        raise RunnerLookupError(f"inspecting this watchtower's own container failed: {e}") from e
+    return own.labels.get(COMPOSE_PROJECT_LABEL) or None
+
+
 def find_runner_container(client: docker.DockerClient) -> Optional[Container]:
     """
-    Find the executor-runner container: by the CVM name first, then by the compose service label.
+    Find the executor-runner container. Inside a compose project: by the service label within that
+    project only. Outside one (the CVM stack, `docker run`): by the CVM name first, then by the label.
 
     A container named `<runner>-previous-<id>` is a leftover of an interrupted
     `recreate_container` (the daemon or this process died between the rename and the
@@ -128,13 +163,18 @@ def find_runner_container(client: docker.DockerClient) -> Optional[Container]:
             more than one leftover and no live runner, or the listing failed. The caller
             must not pull or create anything in that state.
     """
-    container = find_container_by_name(client, EXECUTOR_RUNNER_CONTAINER_NAME)
-    if container is not None:
-        return container
+    # Inside a compose project only that project's labelled containers count: a container named
+    # `executor-runner` or `executor-runner-previous-*` on the same host can belong to another stack.
+    project = own_compose_project(client)
+    if not project:
+        container = find_container_by_name(client, EXECUTOR_RUNNER_CONTAINER_NAME)
+        if container is not None:
+            return container
     try:
-        matches = client.containers.list(all=True, filters={"label": EXECUTOR_RUNNER_SERVICE_LABEL})
+        label = [EXECUTOR_RUNNER_SERVICE_LABEL, f"{COMPOSE_PROJECT_LABEL}={project}"] if project else EXECUTOR_RUNNER_SERVICE_LABEL
+        matches = client.containers.list(all=True, filters={"label": label})
         # the CVM runner carries no compose label: its leftover is found by name
-        cvm_leftovers = client.containers.list(
+        cvm_leftovers = [] if project else client.containers.list(
             all=True, filters={"name": f"^/?{EXECUTOR_RUNNER_CONTAINER_NAME}{PREVIOUS_RUNNER_SUFFIX}"}
         )
     except Exception as e:
@@ -237,17 +277,33 @@ def container_image_digest(client: docker.DockerClient, container: Container) ->
         return None
 
 
+def trusted_validator_hotkeys() -> tuple[str, ...]:
+    """The validator hotkeys a digest signature is checked against, the active one first, no blanks or repeats.
+
+    Two during the hotkey rotation (config.py): the digest is signed by whichever wallet the platform
+    holds, and an executor must keep updating across the swap.
+    """
+    hotkeys: list[str] = []
+    for hotkey in (WATCHTOWER_VALIDATOR_HOTKEY, WATCHTOWER_VALIDATOR_NEXT_HOTKEY):
+        hotkey = (hotkey or "").strip()
+        if hotkey and hotkey not in hotkeys:
+            hotkeys.append(hotkey)
+    return tuple(hotkeys)
+
+
 def verify_watchtower_signature(payload: WatchtowerDigestResponse) -> None:
     """
-    Verify the signature of the watchtower digest response.
+    Verify the signature of the watchtower digest response against every trusted validator hotkey.
 
     Raises:
         Exception: If signature verification fails
     """
     try:
-        keypair = bittensor.Keypair(ss58_address=WATCHTOWER_VALIDATOR_HOTKEY)
         signing_data = f"{payload.digest}:{payload.timestamp}"
-        is_valid = keypair.verify(signing_data, payload.signature)
+        is_valid = any(
+            bittensor.Keypair(ss58_address=hotkey).verify(signing_data, payload.signature)
+            for hotkey in trusted_validator_hotkeys()
+        )
 
         # Verify that the timestamp is not too far in the future or past (e.g., within 5 minutes)
         now = int(datetime.now(UTC).timestamp())
@@ -259,7 +315,7 @@ def verify_watchtower_signature(payload: WatchtowerDigestResponse) -> None:
 
         if not is_valid:
             raise Exception(
-                f"Invalid signature from validator {WATCHTOWER_VALIDATOR_HOTKEY}"
+                f"Invalid signature: not signed by a trusted validator hotkey ({', '.join(trusted_validator_hotkeys())})"
             )
 
     except Exception as e:
@@ -278,7 +334,8 @@ def fetch_verified_digest() -> Optional[str]:
     try:
         response = requests.get(
             WATCHTOWER_ENDPOINT_URL,
-            timeout=30
+            headers={"User-Agent": WATCHTOWER_USER_AGENT},
+            timeout=30,
         )
         response.raise_for_status()
 
@@ -345,8 +402,11 @@ def container_create_kwargs(client: docker.DockerClient, old: Container, image_r
     Name, command, entrypoint, environment, labels, working directory, user, the whole
     HostConfig (binds, restart policy, ports, privileges) and the network endpoints are
     copied from the old container, so a runner created by compose keeps its compose
-    labels, its `.env` bind and its restart policy. A Cmd or Entrypoint that the old
-    container inherited from its image is not copied: the new image decides it.
+    labels, its `.env` bind and its restart policy. A Cmd, Entrypoint, working directory,
+    user or Env entry that the old container inherited from its image is not copied: the
+    new image decides it. A runner that never ran (`docker compose create`) has an image
+    nobody verified; when that image cannot be inspected nothing is copied blindly and
+    the rebuild is refused.
     """
     attrs = old.attrs
     config = attrs.get("Config") or {}
@@ -354,7 +414,10 @@ def container_create_kwargs(client: docker.DockerClient, old: Container, image_r
     try:
         old_image_config = client.images.get(attrs["Image"]).attrs.get("Config") or {}
     except Exception as e:
+        if old.status == "created":
+            raise RuntimeError(f"Image of the never-started runner is not inspectable: {e}") from e
         logger.warning(_m("Old image not inspectable, copying Cmd/Entrypoint as they are", {"error": str(e)}))
+    image_env = set(old_image_config.get("Env") or [])
 
     networks = (attrs.get("NetworkSettings") or {}).get("Networks") or {}
     endpoints = {}
@@ -368,12 +431,11 @@ def container_create_kwargs(client: docker.DockerClient, old: Container, image_r
         "name": attrs.get("Name", "").lstrip("/") or None,
         "command": _inherited_or_none(config.get("Cmd"), old_image_config.get("Cmd")),
         "entrypoint": _inherited_or_none(config.get("Entrypoint"), old_image_config.get("Entrypoint")),
-        # Env is copied whole: compose-set variables must survive, and the image-provided
-        # part (PATH and the like) is the same in every runner build.
-        "environment": config.get("Env"),
+        # Compose-set variables survive; entries the old image set are left to the new image.
+        "environment": [e for e in config.get("Env") or [] if e not in image_env] or None,
         "labels": config.get("Labels"),
-        "working_dir": config.get("WorkingDir") or None,
-        "user": config.get("User") or None,
+        "working_dir": _inherited_or_none(config.get("WorkingDir") or None, old_image_config.get("WorkingDir") or None),
+        "user": _inherited_or_none(config.get("User") or None, old_image_config.get("User") or None),
         "host_config": attrs.get("HostConfig") or {},
         "networking_config": client.api.create_networking_config(endpoints) if endpoints else None,
     }
@@ -393,6 +455,8 @@ def recreate_container(client: docker.DockerClient, old: Container, image_refere
     name = kwargs["name"]
     previous_name = previous_runner_name(name, old.short_id)
     logger.info(_m("Renaming existing container aside", {"name": name, "id": old.short_id, "to": previous_name}))
+    # A runner that never ran (`docker compose create`) holds an image nobody verified: never start it.
+    never_started = old.status == "created"
     old.rename(previous_name)
     try:
         logger.info(_m("Creating new container with updated image", {"name": name, "image": image_reference}))
@@ -408,7 +472,8 @@ def recreate_container(client: docker.DockerClient, old: Container, image_refere
         logger.error(_m("Switch to the new container failed, restoring the old one", {"name": name, "image": image_reference}))
         client.api.remove_container(created["Id"], force=True)
         old.rename(name)
-        old.start()
+        if not never_started:
+            old.start()
         raise
     logger.info(_m("Removing old container", {"name": previous_name}))
     old.remove(force=True)
@@ -610,7 +675,9 @@ def check_and_update() -> None:
         # GPU container right now. The check repeats every cycle, so the update resumes on its
         # own once the host is fixed (reboot or driver reload). A first boot (no runner) has
         # nothing to break and skips the probe.
-        if container is not None:
+        # A runner that never ran has an unverified image: running even `true` from it is not safe,
+        # and nothing runs on it that an update could break.
+        if container is not None and container.status != "created":
             image_id = container.attrs.get("Image")
             probe = (
                 probe_nvidia_runtime(client, image_id)
@@ -650,7 +717,7 @@ def main():
         "image": settings.WATCHTOWER_IMAGE,
         "interval": settings.WATCHTOWER_INTERVAL,
         "endpoint": WATCHTOWER_ENDPOINT_URL,
-        "validator_hotkey": WATCHTOWER_VALIDATOR_HOTKEY
+        "validator_hotkeys": list(trusted_validator_hotkeys()),
     }))
 
     while True:

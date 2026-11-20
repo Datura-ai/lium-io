@@ -47,7 +47,6 @@ class _StubReferralFeed:
 def burn_env(monkeypatch):
     """Pins burn logic to a single, known burner hotkey (`BURN_HOTKEY`)."""
     monkeypatch.setattr(settings, "NEW_BURNERS", [BURN_UID])
-    monkeypatch.setattr(settings, "ENABLE_NEW_BURN_LOGIC", True)
     monkeypatch.setattr(settings, "BURNER_COLDKEYS", {})
 
 
@@ -78,10 +77,10 @@ async def test_miners_never_diluted_empty_vs_nonempty_feed(incentive, miners, mo
     incentive.miner_incentives = {"miner_a": 0.08, "miner_b": 0.05}
 
     incentive.referral_feed = _StubReferralFeed({})
-    baseline = await incentive.calculate_final_weights(miners, last_mechanism_step_block=None)
+    baseline = await incentive.calculate_final_weights(miners)
 
     incentive.referral_feed = _StubReferralFeed({"referrer_1": 3.0, "referrer_2": 1.0})
-    with_referrals = await incentive.calculate_final_weights(miners, last_mechanism_step_block=None)
+    with_referrals = await incentive.calculate_final_weights(miners)
 
     assert with_referrals["miner_a"] == pytest.approx(baseline["miner_a"])
     assert with_referrals["miner_b"] == pytest.approx(baseline["miner_b"])
@@ -99,7 +98,7 @@ async def test_total_score_conserved(incentive, miners, monkeypatch):
     incentive.referral_feed = _StubReferralFeed({"referrer_1": 2.0, "referrer_2": 1.0})
 
     total_before = TOTAL_BURN_EMISSION + 0.08 + 0.05
-    scores = await incentive.calculate_final_weights(miners, last_mechanism_step_block=None)
+    scores = await incentive.calculate_final_weights(miners)
 
     assert sum(scores.values()) == pytest.approx(total_before)
 
@@ -117,7 +116,7 @@ async def test_pool_equals_min_share_total_and_gains_losses_match(incentive, min
     expected_pool = min(0.1 * total_before, burn_total_before)
     assert expected_pool < burn_total_before  # sanity: this case is NOT capped
 
-    scores = await incentive.calculate_final_weights(miners, last_mechanism_step_block=None)
+    scores = await incentive.calculate_final_weights(miners)
 
     burn_loss = burn_total_before - scores[BURN_HOTKEY]
     referrer_gain = scores["referrer_1"] + scores["referrer_2"]
@@ -139,7 +138,7 @@ async def test_pool_capped_at_burn_total_miners_still_untouched(incentive, miner
     total_before = TOTAL_BURN_EMISSION + 0.08 + 0.05
     assert 0.99 * total_before > TOTAL_BURN_EMISSION  # sanity: this case IS capped
 
-    scores = await incentive.calculate_final_weights(miners, last_mechanism_step_block=None)
+    scores = await incentive.calculate_final_weights(miners)
 
     assert scores[BURN_HOTKEY] == pytest.approx(0.0, abs=1e-9)
     assert scores["referrer_1"] == pytest.approx(TOTAL_BURN_EMISSION)
@@ -154,7 +153,7 @@ async def test_fail_closed_empty_feed(incentive, miners, monkeypatch):
     incentive.miner_incentives = {"miner_a": 0.08, "miner_b": 0.05}
     incentive.referral_feed = _StubReferralFeed({})
 
-    scores = await incentive.calculate_final_weights(miners, last_mechanism_step_block=None)
+    scores = await incentive.calculate_final_weights(miners)
 
     assert scores["miner_a"] == pytest.approx(0.08)
     assert scores["miner_b"] == pytest.approx(0.05)
@@ -174,7 +173,7 @@ async def test_fail_closed_non_positive_or_nan_share(incentive, miners, monkeypa
     incentive.miner_incentives = {"miner_a": 0.08, "miner_b": 0.05}
     incentive.referral_feed = _StubReferralFeed({"referrer_1": 3.0, "referrer_2": 1.0})
 
-    scores = await incentive.calculate_final_weights(miners, last_mechanism_step_block=None)
+    scores = await incentive.calculate_final_weights(miners)
 
     assert scores["miner_a"] == pytest.approx(0.08)
     assert scores["miner_b"] == pytest.approx(0.05)

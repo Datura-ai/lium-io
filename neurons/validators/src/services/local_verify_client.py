@@ -45,6 +45,7 @@ from datura.requests.validator_requests import (
 # when it is built — a name only the type checker sees leaves every cycle unbuildable
 # (test_rented_machine_check.test_context_annotations_resolve_at_runtime).
 from services.matrix_validation_service import ValidationResult
+from services.node_host import public_host_connector
 from services.verifyx_validation_service import VerifyXResponse
 
 # One definition for both sides (datura, #1339): the executor's payloads/verify.py and
@@ -214,6 +215,7 @@ class LocalVerifyAnswer:
     deadline_hit: bool
     steps: dict[str, StepEvidence]
     round_trip_ms: int
+    specs: dict[str, Any] = field(default_factory=dict)
 
     def step(self, name: str) -> StepEvidence:
         return self.steps.get(name) or StepEvidence(status="skipped")
@@ -240,6 +242,7 @@ def parse_answer(raw: Any, *, intent: dict[str, Any], round_trip_ms: int) -> Loc
         deadline_hit=bool(raw.get("deadline_hit")),
         steps={name: StepEvidence.from_wire(steps[name]) for name in STEP_NAMES if name in steps},
         round_trip_ms=round_trip_ms,
+        specs=raw.get("specs") if isinstance(raw.get("specs"), dict) else {},
     )
 
 
@@ -260,6 +263,11 @@ def _wire_port(value: Any) -> int | None:
     return value if 1 <= value <= 65535 else None
 
 
+def _node_session(**kwargs) -> aiohttp.ClientSession:
+    # the executor's address may be a hostname: it is dialled only at an address checked to be public
+    return aiohttp.ClientSession(connector=public_host_connector(), **kwargs)
+
+
 class LocalVerifyClient:
     """`GET /version` over the executor's API port (`executor_info.port`, where the miner and the
     backend already talk to it), then `POST /verify` through a direct-tcpip channel of the
@@ -269,7 +277,7 @@ class LocalVerifyClient:
         self.keypair = keypair
         self.timeout_s = timeout_s
         self.connect_timeout_s = connect_timeout_s
-        self._session_factory = session_factory or aiohttp.ClientSession
+        self._session_factory = session_factory or _node_session
 
     @staticmethod
     def base_url(executor_info) -> str:

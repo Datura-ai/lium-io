@@ -4,8 +4,8 @@
 [metadata]
 groups = ["default"]
 strategy = ["inherit_metadata"]
-lock_version = "4.5.0"
-content_hash = "sha256:ceae65629797267df92a6bd53145c0fad21e5b7878fecf8571a95c399826b3f1"
+lock_version = "4.5.1"
+content_hash = "sha256:3fd6a005db343728019e14302ea78d3ff0106428075fb30bbde201e871bf8a3d"
 
 [[metadata.targets]]
 requires_python = "==3.11.11"
@@ -186,115 +186,18 @@ files = [
 ]
 
 [[package]]
-name = "bittensor"
-version = "9.0.0"
-requires_python = ">=3.9"
-summary = "bittensor"
-groups = ["default"]
-dependencies = [
-    "aiohttp~=3.9",
-    "async-substrate-interface>=1.0.0",
-    "asyncstdlib~=3.13.0",
-    "bittensor-cli>=9.0.0",
-    "bittensor-commit-reveal>=0.2.0",
-    "bittensor-wallet>=3.0.3",
-    "colorama~=0.4.6",
-    "fastapi~=0.110.1",
-    "msgpack-numpy-opentensor~=0.5.0",
-    "munch~=2.5.0",
-    "nest-asyncio",
-    "netaddr",
-    "numpy~=2.0.1",
-    "packaging",
-    "pycryptodome<4.0.0,>=3.18.0",
-    "pydantic<3,>=2.3",
-    "python-Levenshtein",
-    "python-statemachine~=2.1",
-    "pyyaml",
-    "requests",
-    "retry",
-    "rich",
-    "scalecodec==1.2.11",
-    "setuptools~=70.0.0",
-    "uvicorn",
-    "websockets>=14.1",
-    "wheel",
-]
-files = [
-    {file = "bittensor-9.0.0-py3-none-any.whl", hash = "sha256:1f5e97d2333b46c535b03e780b7e3d58204e2ed116db6244227433449f6616cc"},
-    {file = "bittensor-9.0.0.tar.gz", hash = "sha256:64321a5f3acc07dbde41ecb81d753f05d0a8fcd19a22f35cb56e5af8e15e81aa"},
-]
-
-[[package]]
-name = "bittensor-cli"
-version = "9.0.0"
-requires_python = ">=3.9"
-summary = "Bittensor CLI"
-groups = ["default"]
-dependencies = [
-    "GitPython>=3.0.0",
-    "Jinja2",
-    "PyYAML~=6.0.1",
-    "aiohttp~=3.10.2",
-    "async-property==0.2.2",
-    "async-substrate-interface>=1.0.0",
-    "backoff~=2.2.1",
-    "bittensor-wallet>=3.0.3",
-    "fuzzywuzzy~=0.18.0",
-    "netaddr~=1.3.0",
-    "numpy>=2.0.1",
-    "plotille",
-    "plotly",
-    "pycryptodome",
-    "pytest",
-    "python-Levenshtein",
-    "pywry",
-    "rich~=13.7",
-    "scalecodec==1.2.11",
-    "typer~=0.12",
-    "websockets>=14.1",
-    "wheel",
-]
-files = [
-    {file = "bittensor-cli-9.0.0.tar.gz", hash = "sha256:f775c24b6acf574c4b64d009d8728f2657c2894fecb15385478fd8ac4501f0fd"},
-    {file = "bittensor_cli-9.0.0-py3-none-any.whl", hash = "sha256:211334018e878dd4145d1b7998630edd2e3a486ac4e992493b535306e3d0c178"},
-]
-
-[[package]]
-name = "bittensor-commit-reveal"
-version = "0.2.0"
-requires_python = ">=3.9"
-summary = ""
-groups = ["default"]
-files = [
-    {file = "bittensor_commit_reveal-0.2.0-cp311-cp311-macosx_10_12_x86_64.whl", hash = "sha256:fa0dfc1a891c07c9c042f5d2623805ca2a5b6a4ed113a52da40503c224440cc1"},
-    {file = "bittensor_commit_reveal-0.2.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:2d691fbcaef5001470e3196d9e5be0d66f0f3ff76c6465efba5fde30bf665da6"},
-    {file = "bittensor_commit_reveal-0.2.0-cp311-cp311-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:df3071b83ea4e95ee018aad8dc370fa24884be802e55c5ed706db541a201473f"},
-    {file = "bittensor_commit_reveal-0.2.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:f2e2bdb3ceb96df0ef722af3eb97e32504b45ce72e6defb1c4281a7147314600"},
-    {file = "bittensor_commit_reveal-0.2.0.tar.gz", hash = "sha256:d67bc49cb93b94136ae10af25a98ec29fe9a88b4ebefadd4f8504eebf63643c0"},
-]
-
-[[package]]
 name = "bittensor-wallet"
-version = "3.0.3"
+version = "3.1.0"
 requires_python = ">=3.9"
 summary = ""
 groups = ["default"]
-dependencies = [
-    "cryptography~=43.0.1",
-    "eth-utils<2.3.0",
-    "munch~=2.5.0",
-    "password-strength",
-    "py-bip39-bindings==0.1.11",
-    "rich",
-    "termcolor",
-]
 files = [
-    {file = "bittensor_wallet-3.0.3-cp311-cp311-macosx_10_12_x86_64.whl", hash = "sha256:3060507bd941edf2677661e2ea6680cfd950211b4855db926071541afb36e46c"},
-    {file = "bittensor_wallet-3.0.3-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:a0ac0e96c139fb191241ae4a751763357fcbf5d333c5d5496429bd3396cfc180"},
-    {file = "bittensor_wallet-3.0.3-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:158600cb19a05a91eeab79e39e5d87eb1cde247ba19de2a3eb5738ae6ac73222"},
-    {file = "bittensor_wallet-3.0.3-cp311-cp311-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:1600afcabf42f2463bc84f1a8ff07230e8aa6e301dff22ab2fd1df60bdb95daf"},
-    {file = "bittensor_wallet-3.0.3.tar.gz", hash = "sha256:60e534e1f1c256e4dac788acac4724ec92c445c24058954b7e12a3aca6828e1b"},
+    {file = "bittensor_wallet-3.1.0-cp311-cp311-macosx_10_12_x86_64.whl", hash = "sha256:5bcf71ece972738cb8c1489ecdcc41e79f80359585fc380db80da2f15e5d4d22"},
+    {file = "bittensor_wallet-3.1.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:f568a2f5735e0d14885947d4b32dea1c1473037a42e0ab0ceeb2ece4a5866832"},
+    {file = "bittensor_wallet-3.1.0-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:b2fca662df88a6e33aa054bea587a1161c93c70f96e5ae7e5545c865d0fcf5ba"},
+    {file = "bittensor_wallet-3.1.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:cd43596a37a1630a34c44288f853c048825e0a56ba48129fc3b05ff40b631524"},
+    {file = "bittensor_wallet-3.1.0-cp311-cp311-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:7a1ee9d89f2e65365879a6ca82bab9d13c354585a0523dfda6496115dd67a335"},
+    {file = "bittensor_wallet-3.1.0.tar.gz", hash = "sha256:d18eff3ab8ae64aa8c5641466026f0dc839cc690b55c9de36a9aa3dabf4c86f1"},
 ]
 
 [[package]]
@@ -1263,22 +1166,6 @@ files = [
     {file = "pywin32-310-cp311-cp311-win32.whl", hash = "sha256:1e765f9564e83011a63321bb9d27ec456a0ed90d3732c4b2e312b855365ed8bd"},
     {file = "pywin32-310-cp311-cp311-win_amd64.whl", hash = "sha256:126298077a9d7c95c53823934f000599f66ec9296b09167810eb24875f32689c"},
     {file = "pywin32-310-cp311-cp311-win_arm64.whl", hash = "sha256:19ec5fc9b1d51c4350be7bb00760ffce46e6c95eaf2f0b2f1150657b1a43c582"},
-]
-
-[[package]]
-name = "pywry"
-version = "0.6.2"
-requires_python = ">=3.8"
-summary = ""
-groups = ["default"]
-dependencies = [
-    "setproctitle",
-]
-files = [
-    {file = "pywry-0.6.2-py3-none-macosx_10_9_x86_64.macosx_11_0_arm64.macosx_10_9_universal2.whl", hash = "sha256:45d6bb827bf76b2532a9d70b539209d70f37dfb13e9862549b7bff8500ad2495"},
-    {file = "pywry-0.6.2-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:1d9ffd826a3a08c132843340e6d896efb7b972b301d045e3239a7dc08d9cac2f"},
-    {file = "pywry-0.6.2-py3-none-win_amd64.whl", hash = "sha256:4f0e5b502555ee8b8e799baeaebe63243a84b7ce51df01a1c439dbc4e8227b9e"},
-    {file = "pywry-0.6.2.tar.gz", hash = "sha256:9bd88c36ab0860728d9e64360010f8abcede43645656030e4a63e69e81a98c95"},
 ]
 
 [[package]]
