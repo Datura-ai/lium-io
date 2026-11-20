@@ -77,3 +77,34 @@ async def test_a_create_rerun_after_a_restart_reports_its_own_running_container(
     else:   # not this command's container: the create runs as usual
         assert len(specs) == 2
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gap", ["cut_off_before_record", "record_write_failed", "unreadable_record", "stopped"])
+async def test_a_rerun_never_removes_its_own_container_without_a_readable_reply(svc, monkeypatch, gap):
+    """The first run's container is on the node with this command's label, but its reply cannot be replayed: the
+    connector died between `docker run` and the record write, the write failed, the file is unreadable, or the
+    container is stopped. The rerun answers nothing and never reaches the stale-container cleanup."""
+    node = _Node()
+    ssh_client = node.wrap(_ssh_client(inspect_exit=0))
+    _patch_happy(svc, monkeypatch, ssh_client)
+    specs = []
+    build = svc._build_rental_container_run_spec
+    monkeypatch.setattr(svc, "_build_rental_container_run_spec", lambda **kw: specs.append(build(**kw)) or specs[-1])
+    payload = _payload(command_id="cmd-1")
+    first = await _create(svc, payload, ssh_client)
+    assert isinstance(first, ContainerCreated)
+    path = _create_record_path(payload.pod_id)
+    if gap in ("cut_off_before_record", "record_write_failed"):
+        node.files.clear()
+    elif gap == "unreadable_record":
+        node.files[path] = "{trunc"
+    node.container = (gap != "stopped", "cmd-1")
+    cleanup = AsyncMock()
+    monkeypatch.setattr(svc, "clean_existing_containers", cleanup)
+
+    again = await _create(svc, payload, ssh_client)
+
+    assert again is None
+    assert len(specs) == 1   # no second container
+    cleanup.assert_not_awaited()

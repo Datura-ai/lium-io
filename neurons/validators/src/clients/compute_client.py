@@ -1332,13 +1332,29 @@ class ComputeClient:
             return False
         return await self.miner_service.redis_service.renting_in_progress(created.miner_hotkey, created.executor_id, pod_id)
 
+    async def _unacked_successes(self) -> dict[str, str]:
+        """pod id -> each saved ContainerCreated the backend has not answered, plus any whose saved report was lost
+        (the best-effort save after the reply failed) but whose finished command record still holds it unsettled. The
+        record is the durable copy: without it such a success would be missing from the restart's replays and its
+        pending create failed by the ResumedCreatesReport while its container runs."""
+        redis_service = self.miner_service.redis_service
+        unacked = await redis_service.unacked_container_created()
+        for pod_id, raw in (await redis_service.unsettled_create_successes()).items():
+            saved = unacked.get(pod_id)
+            if saved is None or (
+                _saved_command_id(saved) != _saved_command_id(raw)
+                and await redis_service.current_create_dispatch(pod_id) == _saved_command_id(raw)
+            ):
+                unacked[pod_id] = raw
+        return unacked
+
     async def resend_unacked_container_created(self, ws=None) -> dict[str, str]:
         """ws given: each one is sent on it now, not queued, ahead of the ResumedCreatesReport; a Redis error then
         raises, so the report waits for the next socket instead of failing a create whose replay could not be read.
         Returns pod id -> command_id of each one sent or queued."""
         redis_service = self.miner_service.redis_service
         try:
-            unacked = await redis_service.unacked_container_created()
+            unacked = await self._unacked_successes()
         except Exception as exc:
             self._log_unacked_container_created_error(None, exc)
             if ws is not None:
@@ -1503,8 +1519,9 @@ class ComputeClient:
         Reports are queued only once the whole sweep succeeded, so a retried sweep never sends one twice."""
         redis_service = self.miner_service.redis_service
         creates = await redis_service.inflight_backend_creates()
-        claims = await redis_service.running_create_claims()
-        unacked = await redis_service.unacked_container_created() if creates or claims else {}
+        unreadable: list[str] = []
+        claims = await redis_service.running_create_claims(unreadable)
+        unacked = await self._unacked_successes() if creates or claims else {}
         rented_pod_ids = await redis_service.rented_pod_ids() if creates else frozenset()
         for command_id, claim in claims.items():
             # No create runs yet, so each running claim is a cut-off run's. The backend resends a create under the same
@@ -1596,6 +1613,18 @@ class ComputeClient:
                 )
             )
         # DAH-5437: only a sweep that read the records reports; an empty list is the point (Redis lost them)
+        if unreadable:
+            # an unreadable record may be a create that made its container: the report would fail its pending pod
+            # and the backend could place it again elsewhere. Without a report the backend changes nothing (as with a
+            # validator older than 2.5.0); the next start reports once the record reads or has been settled
+            logger.error(
+                _m(
+                    "Restart report withheld: unreadable backend command records may cover a pending create",
+                    extra=get_extra_info({**self.logging_extra, "command_ids": unreadable}),
+                )
+            )
+            self.resumed_creates_report = None
+            return
         self.resumed_creates_report = ResumedCreatesReport(pod_ids=resumed)
 
     async def _drive_miner_job(
@@ -1651,8 +1680,12 @@ class ComputeClient:
             job_request.miner_address = miner_axon_info.ip
             job_request.miner_port = miner_axon_info.port
             response: (
-                ContainerCreated | FailedContainerRequest
+                ContainerCreated | FailedContainerRequest | None
             ) = await self.miner_service.handle_container(job_request)
+            if response is None:
+                # this command's container is on the node without a readable reply (create_container): nothing is
+                # answered, so the backend neither retries the pod elsewhere nor reads it as created
+                return
             if isinstance(response, FailedContainerRequest):
                 # the backend fences a failure on the create it answers: a late failure of an earlier create (a
                 # reboot the backend already gave up on) must not fail or exempt the one that replaced it

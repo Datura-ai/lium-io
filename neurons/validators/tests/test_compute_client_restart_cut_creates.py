@@ -1561,19 +1561,24 @@ async def test_a_cut_off_create_lock_release_that_redis_fails_is_logged_not_rais
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("unreadable", [True, False])
 @pytest.mark.parametrize("in_flight_record", [True, False])
-async def test_a_restart_releases_every_cut_off_create_claim_but_one_whose_success_it_replays(in_flight_record) -> None:
+async def test_a_restart_releases_every_cut_off_create_claim_but_one_whose_success_it_replays(
+    in_flight_record, unreadable
+) -> None:
     """On start no create runs, so every running create claim is a cut-off run's, with or without an in-flight record
     (a crash between the claim and the record leaves none). The backend resends one only while it holds no answer, so
     the resend must run, a rented pod's too (a reboot's create); a saved success the reconnect replays keeps its claim.
-    A record that cannot be read is skipped and left as it is, so it never stops the start."""
+    A record that cannot be read is skipped and left as it is, so it never stops the start; it may be a create that
+    made its container, so the report that would fail every unlisted pending create is withheld."""
     redis_service = _redis_service()
     claims = (("cmd-1", "pod-1"), ("cmd-rented", "pod-rented"), ("cmd-saved", "pod-saved"), ("cmd-newer", "pod-older"))
     for command_id, pod_id in claims:
         claim = BackendCommand(state="running", owner=command_id, create=True, pod_id=pod_id, executor_id="exec-1")
         assert await redis_service.claim_backend_command(command_id, claim.model_dump_json(), persist=True) is None
     await redis_service.claim_backend_command("cmd-other", BackendCommand(state="running").model_dump_json())
-    await redis_service.redis.set(BACKEND_COMMAND_PREFIX + "cmd-unreadable", "{not json")
+    if unreadable:
+        await redis_service.redis.set(BACKEND_COMMAND_PREFIX + "cmd-unreadable", "{not json")
     if in_flight_record:
         await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER, "c1")
     redis_service.rented_pod_ids = AsyncMock(return_value=frozenset({"pod-rented"}))
@@ -1591,10 +1596,11 @@ async def test_a_restart_releases_every_cut_off_create_claim_but_one_whose_succe
     for released in ("cmd-1", "cmd-rented", "cmd-newer"):   # their resends run (an older command's success is not theirs)
         assert await redis_service.redis.get(BACKEND_COMMAND_PREFIX + released) is None
     assert await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-saved") is not None
-    assert await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-unreadable") == "{not json"
-    assert (client.resumed_creates_report.pod_ids if in_flight_record else None) == (
-        ["pod-1"] if in_flight_record else None
-    )
+    if unreadable:
+        assert await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-unreadable") == "{not json"
+        assert client.resumed_creates_report is None
+    else:
+        assert client.resumed_creates_report.pod_ids == (["pod-1"] if in_flight_record else [])
 
 
 @pytest.mark.asyncio
@@ -1632,3 +1638,67 @@ async def test_a_create_under_a_command_claim_keeps_its_in_flight_record_until_i
 
     assert len(seen) == 1 and list(seen[0]) == ["pod-1"]
     assert await redis_service.inflight_backend_creates() == {}
+
+
+async def _finished_create_record(redis_service: RedisService, command_id: str, created: ContainerCreated) -> None:
+    claim = BackendCommand(state="running", owner="o", create=True, pod_id=created.pod_id, executor_id="exec-1")
+    await redis_service.claim_backend_command(command_id, claim.model_dump_json(), persist=True)
+    finished = claim.model_copy(update={"state": "finished", "owner": "", "responses": [created.model_dump_json()]})
+    await redis_service.update_backend_command(command_id, claim.model_dump_json(), finished.model_dump_json(), 0)
+
+
+@pytest.mark.parametrize("case", ["lost_save", "settled", "older_dispatch"])
+@pytest.mark.asyncio
+async def test_a_finished_success_whose_saved_report_was_lost_is_replayed_before_the_report(case) -> None:
+    """The success was sent, the socket closed, and the best-effort save of its report failed; the connector then
+    restarted after retiring the in-flight record. Its command record still holds it, unsettled: it is replayed ahead
+    of the restart report and the report waits for its receipt, so the backend never fails the pod while its
+    container runs. A settled record (receipt or delete) or another dispatch's success is not replayed."""
+    redis_service = _redis_service()
+    client = _client(redis_service)
+    client.lock = asyncio.Lock()
+    await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-1", command_id="cmd-1")
+    created = ContainerCreated(
+        miner_hotkey="miner-hk", executor_id="exec-1", pod_id="pod-1",
+        container_name="c-1", volume_name="v-1", port_maps=[(22, 40022)], command_id="cmd-1",
+    )
+    await _finished_create_record(redis_service, "cmd-1", created)
+    if case == "settled":
+        await redis_service.settle_backend_command("cmd-1", 900)
+    if case == "older_dispatch":
+        await redis_service.accept_create_dispatch("pod-1", "cmd-1", 1)
+        await redis_service.accept_create_dispatch("pod-1", "cmd-2", 2)
+    assert await redis_service.unacked_container_created() == {}
+
+    await client.fail_creates_cut_off_by_restart()
+    ws = AsyncMock()
+    awaiting = await client.resend_unacked_container_created(ws)
+
+    assert client.resumed_creates_report.pod_ids == []
+    if case == "lost_save":
+        assert awaiting == {"pod-1": "cmd-1"}
+        assert [ContainerCreated.model_validate_json(c.args[0]) for c in ws.send.await_args_list] == [created]
+    else:
+        assert awaiting == {}
+        ws.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_create_left_unanswered_by_the_node_queues_nothing() -> None:
+    """create_container returns None when this command's container is on the node without a readable reply."""
+    redis_service = _redis_service()
+    client = _client(redis_service)
+    client.message_queue = OutgoingMessages()
+    client.lock = asyncio.Lock()
+    client.keypair = MagicMock()
+    client.get_miner_axon_info = AsyncMock(return_value=MagicMock(ip="1.2.3.4", port=8000))
+    client.miner_service.handle_container = AsyncMock(return_value=None)
+    request = ContainerCreateRequest.model_construct(
+        pod_id="pod-1", miner_hotkey="miner-hk", executor_id="exec-1", workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        command_id="cmd-1",
+    )
+
+    await client._drive_miner_job(request)
+
+    assert list(client.message_queue) == []
+    assert await redis_service.unacked_container_created() == {}

@@ -10,7 +10,7 @@ from typing import Callable, Literal, NamedTuple
 import redis.asyncio as aioredis
 import redis.exceptions
 from datura.requests.miner_requests import ExecutorSSHInfo
-from payload_models.payloads import WorkloadKind
+from payload_models.payloads import ContainerResponseType, WorkloadKind
 from protocol.vc_protocol.compute_requests import ExecutorUptimeResponse, RentedMachine
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason
 from pydantic import BaseModel, ValidationError
@@ -1257,17 +1257,38 @@ class RedisService:
     async def unindex_backend_create(self, pod_id: str, executor_id: str, command_id: str) -> None:
         await self.redis.srem(f"{BACKEND_CREATES_OF_POD_PREFIX}{pod_id}|{executor_id}", command_id)
 
-    async def running_create_claims(self) -> dict[str, BackendCommand]:
-        """command ID -> running create claim (on start, every one is a cut-off run's)"""
+    async def running_create_claims(self, unreadable: list[str] | None = None) -> dict[str, BackendCommand]:
+        """command ID -> running create claim (on start, every one is a cut-off run's). `unreadable` collects the ids
+        of records that could not be read: any of them may be a create's."""
         return {
             command_id: command
-            async for command_id, command in self._backend_commands()
+            async for command_id, command in self._backend_commands(unreadable)
             if command.create and command.state == "running"
         }
 
-    async def _backend_commands(self):
-        """(command ID, record) of each readable record. An unreadable one is skipped and logged, so it never stops the
-        start; its own command stays fail-closed (miner_driver runs no create whose record it cannot read)."""
+    async def unsettled_create_successes(self) -> dict[str, str]:
+        """pod id -> the ContainerCreated JSON of a finished create whose record has no expiry yet (no receipt and no
+        delete of the pod settled it): the durable copy of a success whose saved report may have been lost. Only the
+        pod's current dispatch counts (any one when no order was recorded), as for the saved report (lium-io#1952)."""
+        found: dict[str, str] = {}
+        async for command_id, command in self._backend_commands():
+            if not (command.create and command.state == "finished"):
+                continue
+            created = [
+                raw for raw in command.responses
+                if json.loads(raw).get("message_type") == ContainerResponseType.ContainerCreated.value
+            ]
+            if not created or await self.redis.ttl(f"{BACKEND_COMMAND_PREFIX}{command_id}") != -1:
+                continue
+            if (current := await self.current_create_dispatch(command.pod_id)) and current != command_id:
+                continue
+            found[command.pod_id] = created[-1]
+        return found
+
+    async def _backend_commands(self, unreadable: list[str] | None = None):
+        """(command ID, record) of each readable record. An unreadable one is skipped, logged and added to
+        `unreadable`, so it never stops the start; its own command stays fail-closed (miner_driver runs no create whose
+        record it cannot read)."""
         async for key in self.redis.scan_iter(match=f"{BACKEND_COMMAND_PREFIX}*", count=100):
             command_id = _text(key).removeprefix(BACKEND_COMMAND_PREFIX)
             value = await self.redis.get(key)
@@ -1277,6 +1298,8 @@ class RedisService:
                 yield command_id, BackendCommand.model_validate_json(value)
             except ValueError:
                 logger.error("Unreadable backend command record skipped: %s", command_id)
+                if unreadable is not None:
+                    unreadable.append(command_id)
 
     async def update_backend_command(
         self, command_id: str, claim: str, value: str, ttl: int

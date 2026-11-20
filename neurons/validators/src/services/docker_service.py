@@ -3689,13 +3689,19 @@ def _create_record(reply: ContainerCreated) -> str:
     return json.dumps({"command_id": reply.command_id, "reply": reply.model_dump(mode="json")})
 
 
+class _OwnCreateWithoutRecord(Exception):
+    """This command's container is on the node, but the reply its first run saved cannot be read."""
+
+
 async def _replay_own_finished_create(
     ssh_client: asyncssh.SSHClientConnection, payload: ContainerCreateRequest, container_name: str, log_extra: dict
 ) -> ContainerCreated | None:
     """A create re-sent under the same command ID (its first answer lost to a connector restart) finds the container
-    its first run finished and reports that run's reply, so it never starts a second one. Only a run that finished
-    (its record written) and whose container still runs carrying this command's label counts; anything else returns
-    None and the create runs as usual, where a started container of the pod is never replaced."""
+    its first run started and never starts a second one. With the run's saved reply and the container running, that
+    reply is reported. A container carrying this command's label without a readable reply (the run was cut off between
+    `docker run` and the record write, or the write failed) raises _OwnCreateWithoutRecord: the create then answers
+    nothing and leaves the container, because the cleanup would treat it as the pod's stale container and remove it
+    with its volume. No container of this command returns None and the create runs as usual."""
     if not payload.command_id:
         return None
     command = (
@@ -3705,16 +3711,22 @@ async def _replay_own_finished_create(
     )
     try:
         result = await ssh_client.run(command, check=False, timeout=30)
-        record_text, _, state = (result.stdout or "").partition(_CREATE_RECORD_STATE_MARK)
-        if state.split() != ["true", payload.command_id]:
-            return None
-        record = json.loads(record_text.strip())
-        if record.get("command_id") != payload.command_id:
-            return None
-        reply = ContainerCreated.model_validate(record["reply"])
-    except Exception as exc:  # unreadable or unreachable: the create runs as usual
+    except Exception as exc:  # unreachable: the create's own SSH steps fail the same way
         logger.warning(_m("Could not read a finished create's record", extra=get_extra_info({**log_extra, "error": str(exc)})))
         return None
+    record_text, _, state = (result.stdout or "").partition(_CREATE_RECORD_STATE_MARK)
+    fields = state.split()
+    if len(fields) != 2 or fields[1] != payload.command_id:
+        return None
+    try:
+        if fields[0] != "true":
+            raise ValueError("the container is not running")
+        record = json.loads(record_text.strip())
+        if record.get("command_id") != payload.command_id:
+            raise ValueError("no saved reply of this command")
+        reply = ContainerCreated.model_validate(record["reply"])
+    except Exception as exc:
+        raise _OwnCreateWithoutRecord(str(exc)) from exc
     logger.info(_m("Create re-sent after its first run finished: reporting that run", extra=get_extra_info(log_extra)))
     return reply
 
@@ -3722,7 +3734,8 @@ async def _replay_own_finished_create(
 async def _write_create_record(
     ssh_client: asyncssh.SSHClientConnection, reply: ContainerCreated, log_extra: dict
 ) -> None:
-    """Best effort: without the record a re-sent create meets the started container and fails, never replaces it."""
+    """Best effort: without the record a re-sent create finds its own container by the label and answers nothing,
+    never replaces it."""
     if not reply.command_id:
         return
     path = _create_record_path(reply.pod_id)
@@ -10695,11 +10708,22 @@ class DockerService:
                     log_extra=default_extra,
                 )
                 # before any step changes the host: a re-sent create whose first run finished reports that run
-                if (
-                    replayed := await _replay_own_finished_create(
+                try:
+                    replayed = await _replay_own_finished_create(
                         ssh_client, payload, self.get_container_name(payload), default_extra
                     )
-                ) is not None:
+                except _OwnCreateWithoutRecord as exc:
+                    logger.error(
+                        _m(
+                            "Create re-sent while its first run's container is on the node without a readable reply: "
+                            "leaving the container and answering nothing",
+                            extra=get_extra_info({**default_extra, "error": str(exc)}),
+                        )
+                    )
+                    await settle_filler_removal_at_ssh_connect()
+                    await self.finish_stream_logs()
+                    return None
+                if replayed is not None:
                     await settle_filler_removal_at_ssh_connect()
                     await self.finish_stream_logs()
                     return replayed
