@@ -14,6 +14,8 @@ from core.docker_utils import ALPINE_HELPER_IMAGE, DockerCommand, df_available_b
 from core.utils import _m
 from services.const import (
     DPHN_CACHE_LISTING_FLOOR_GB,
+    DPHN_CACHE_VOLUME_PREFIX,
+    ENGY_CACHE_VOLUME_PREFIX,
     CACHE_SWEEP_CONTAINER_NAME,
     PARKED_SUFFIXES,
     unparked_name,
@@ -728,7 +730,10 @@ class ContainerCleanup:
         """
         extra = {"executor_uuid": executor_uuid}
         try:
-            cache_volumes: list[str] = await self._get_cache_volumes(ssh_client, FILLER_CACHE_VOLUME_PREFIXES)
+            # a provider's own job cache keeps its files: a long run may write one for hours
+            cache_volumes: list[str] = await self._get_cache_volumes(
+                ssh_client, (DPHN_CACHE_VOLUME_PREFIX, ENGY_CACHE_VOLUME_PREFIX)
+            )
             if not cache_volumes:
                 return 0
             if self.dry_run:

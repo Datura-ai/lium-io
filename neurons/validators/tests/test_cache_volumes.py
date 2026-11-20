@@ -197,6 +197,29 @@ async def test_an_engy_create_sweeps_the_old_dolphin_cache_but_a_dolphin_create_
     assert await docker_service.sweep_stale_cache_volumes(ssh_client, payload, {}) == []
 
 
+@pytest.mark.asyncio
+async def test_a_lium_filler_create_sweeps_a_provider_jobs_leftover_cache_and_a_job_keeps_its_own(docker_service):
+    engy = [CacheVolume(name="engy_cache_hf_new", target="/c")]
+    ssh_client = FakeSshClient(["engy_cache_hf_new", "job_cache_200gb_0123456789ab"])
+    payload = _make_payload(workload_kind=WorkloadKind.FILLER, cache_volumes=engy)
+
+    assert await docker_service.sweep_stale_cache_volumes(ssh_client, payload, {}) == ["job_cache_200gb_0123456789ab"]
+
+    job = [CacheVolume(name="job_cache_300gb_0123456789ab", target="/cache")]
+    ssh_client = FakeSshClient(["job_cache_300gb_0123456789ab", "job_cache_200gb_0123456789ab", "engy_cache_hf_x"])
+    payload = _make_payload(workload_kind=WorkloadKind.FILLER, cache_volumes=job)
+
+    assert await docker_service.sweep_stale_cache_volumes(ssh_client, payload, {}) == ["job_cache_200gb_0123456789ab"]
+
+
+
+@pytest.mark.asyncio
+async def test_a_cacheless_filler_create_sweeps_only_a_provider_jobs_leftover_cache(docker_service):
+    ssh_client = FakeSshClient(["dphn_cache_hf_old", "engy_cache_hf_x", "job_cache_200gb_0123456789ab", "volume_pod"])
+    payload = _make_payload(workload_kind=WorkloadKind.FILLER, cache_volumes=None)
+
+    assert await docker_service.sweep_stale_cache_volumes(ssh_client, payload, {}) == ["job_cache_200gb_0123456789ab"]
+
 # ---------------------------------------------------------------- DAH-5192: partial caches, thresholds, rentals
 
 _KIMI = "engy_cache_hf_1561gb_kimi-k3-1a2b3c4d"
@@ -897,6 +920,77 @@ def test_the_idle_filler_removal_keeps_the_rented_image_under_any_docker_hub_pre
 
     assert "reference=daturaai/dolphin " not in command
     assert "reference=daturaai/dlph " in command
+
+
+# ---------------------------------------------------------------- provider job cache (/cache, size in the name)
+
+_JOB_CACHE = "job_cache_200gb_0123456789ab"
+
+
+def _job_with_cache() -> ContainerCreateRequest:
+    return _make_payload(
+        workload_kind=WorkloadKind.FILLER, cache_volumes=[CacheVolume(name=_JOB_CACHE, target="/cache")]
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_job_cache_within_its_size_is_mounted_as_is(docker_service):
+    ssh_client = DuHostSshClient([_JOB_CACHE], free_gb=10, du_stdout=_kb(150))
+
+    assert await docker_service.select_affordable_cache_volumes(ssh_client, _job_with_cache(), {}) != []
+    assert _removed_volumes(ssh_client) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("free_gb", "granted"), [(5000, True), (300, False)])
+async def test_a_job_cache_over_its_size_is_removed_and_charged_as_a_new_one(docker_service, free_gb, granted):
+    ssh_client = DuHostSshClient([_JOB_CACHE], free_gb=free_gb, du_stdout=_kb(250))
+
+    affordable = await docker_service.select_affordable_cache_volumes(ssh_client, _job_with_cache(), {})
+
+    assert any("volume rm" in command and _JOB_CACHE in command for command in ssh_client.commands)
+    assert bool(affordable) is granted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("free_gb", "cache_gb", "volume_limit_gb", "granted"),
+    [
+        (600, 150, 400, True),  # within 30% of free disk: created, however little the run volume leaves beside it
+        (400, 200, 20, False),  # over 30% of free disk: refused, though download + volume + 150 GB would fit
+    ],
+)
+async def test_a_new_job_cache_follows_the_30pct_free_disk_share_alone(
+    docker_service, free_gb, cache_gb, volume_limit_gb, granted
+):
+    name = f"job_cache_{cache_gb}gb_0123456789ab"
+    payload = _make_payload(workload_kind=WorkloadKind.FILLER, cache_volumes=[CacheVolume(name=name, target="/cache")])
+    payload.volume_limit_gb = volume_limit_gb
+    ssh_client = DuHostSshClient([], free_gb=free_gb, du_stdout="")
+
+    affordable = await docker_service.select_affordable_cache_volumes(ssh_client, payload, {})
+
+    assert bool(affordable) is granted
+
+
+class RefusingDuHostSshClient(DuHostSshClient):
+    """docker refuses the `volume rm` (exit 1)."""
+
+    async def run(self, command: str, *args, **kwargs):
+        if "volume rm" in command:
+            self.commands.append(command)
+            return SimpleNamespace(exit_status=1, stdout="", stderr="volume is in use")
+        return await super().run(command, *args, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_a_job_cache_over_its_size_that_docker_cannot_remove_stays_mounted(docker_service):
+    ssh_client = RefusingDuHostSshClient([_JOB_CACHE], free_gb=10, du_stdout=_kb(250))
+
+    affordable = await docker_service.select_affordable_cache_volumes(ssh_client, _job_with_cache(), {})
+
+    assert any("volume rm" in command and _JOB_CACHE in command for command in ssh_client.commands)
+    assert [volume.name for volume in affordable] == [_JOB_CACHE]
 
 
 class CacheDuHostSshClient(RemovingHostSshClient):

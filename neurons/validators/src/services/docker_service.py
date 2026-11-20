@@ -95,6 +95,7 @@ from services.const import (
     DPHN_CACHE_LISTING_FLOOR_GB,
     DPHN_CACHE_SIZE_GB,
     ENGY_CACHE_VOLUME_PREFIX,
+    JOB_CACHE_VOLUME_PREFIX,
     FILLER_CACHE_MAX_FREE_DISK_SHARE,
     FILLER_RUN_VOLUME_GB_BESIDE_ENGY_CACHE,
     ENGY_CACHE_COMPLETE_SHARE,
@@ -539,14 +540,19 @@ def _parse_listening_ports(output: str) -> set[int]:
 
 _DPHN_CACHE_EMPTY_KB = 1024
 _ENGY_CACHE_SIZE_IN_NAME = re.compile(rf"^{ENGY_CACHE_VOLUME_PREFIX}hf_(\d+)gb_")
+_JOB_CACHE_SIZE_IN_NAME = re.compile(rf"^{JOB_CACHE_VOLUME_PREFIX}(\d+)gb_")
 
 
 def _cache_download_gb(volume_name: str) -> float:
     # DAH-5014: an Engy checkpoint's size is in its name (engy_cache_hf_<N>gb_...); one without it is
-    # never afforded, rather than assumed to be DPHN's 40 GB.
-    if not volume_name.startswith(ENGY_CACHE_VOLUME_PREFIX):
+    # never afforded, rather than assumed to be DPHN's 40 GB. A provider job's cache (job_cache_<N>gb_...)
+    # is charged its whole limit: the job can fill it.
+    if volume_name.startswith(JOB_CACHE_VOLUME_PREFIX):
+        match = _JOB_CACHE_SIZE_IN_NAME.match(volume_name)
+    elif volume_name.startswith(ENGY_CACHE_VOLUME_PREFIX):
+        match = _ENGY_CACHE_SIZE_IN_NAME.match(volume_name)
+    else:
         return DPHN_CACHE_SIZE_GB
-    match: re.Match[str] | None = _ENGY_CACHE_SIZE_IN_NAME.match(volume_name)
     return int(match.group(1)) if match else math.inf
 
 
@@ -6926,7 +6932,10 @@ class DockerService:
             (payload.volume_limit_gb is not None and download_gb > payload.volume_limit_gb)
             or free_gb - download_gb < ENGY_CACHE_MIN_FREE_BESIDE_GB
         )
-        if over_share or free_after_gb <= floor_gb:
+        # DAH-6406 (Rustam, 20 Nov): a provider job's cache is created under the share rule alone, like the Lium
+        # caches; the floor of download + run volume + listing margin granted it on small disks it then clamped
+        is_job_cache: bool = any(volume.name.startswith(JOB_CACHE_VOLUME_PREFIX) for volume in payload.cache_volumes)
+        if over_share or (not is_job_cache and free_after_gb <= floor_gb):
             logger.info(
                 _m(
                     "Node cannot afford the filler cache download; keeping only the volumes it already has",
@@ -7005,6 +7014,8 @@ class DockerService:
         if not used_kb.isdigit():
             return unmeasured_missing_gb
         held_gb: float = int(used_kb) * 1024 / 10**9
+        if volume_name.startswith(JOB_CACHE_VOLUME_PREFIX):
+            return await self._remove_oversized_job_cache_and_get_gb_to_charge(ssh_client, volume_name, held_gb, expected_gb, default_extra)
         if is_dphn_cache:
             # du of an empty directory is a few KB
             return expected_gb if int(used_kb) < _DPHN_CACHE_EMPTY_KB else 0
@@ -7017,6 +7028,39 @@ class DockerService:
             )
         )
         return expected_gb - held_gb
+
+    async def _remove_oversized_job_cache_and_get_gb_to_charge(
+        self,
+        ssh_client: asyncssh.SSHClientConnection,
+        volume_name: str,
+        held_gb: float,
+        limit_gb: float,
+        default_extra: dict,
+    ) -> float:
+        """A provider job's cache within its limit is ready (0). One over it is removed so the run starts it
+        empty, and the whole limit is charged like a new cache; if docker cannot remove it, it is kept as is."""
+        if held_gb <= limit_gb:
+            return 0
+        try:
+            result = await ssh_client.run(DockerCommand.volume_remove_strict(volume_name))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return 0
+        if result.exit_status != 0:
+            return 0
+        logger.info(
+            _m(
+                "Job cache was over its size; removed so the run starts it empty",
+                extra=get_extra_info({
+                    **default_extra,
+                    "volume": volume_name,
+                    "held_gb": round(held_gb, 1),
+                    "limit_gb": limit_gb,
+                }),
+            )
+        )
+        return limit_gb
 
     @staticmethod
     def _cache_volume_families(volume_names: list[str]) -> tuple[str, ...]:
@@ -7086,15 +7130,13 @@ class DockerService:
 
         Returns the volumes it asked docker to remove (empty when nothing was swept).
         """
-        if payload.workload_kind != WorkloadKind.FILLER or not payload.cache_volumes:
-            # No cache requested -> this is version GC with nothing to compare against, NOT a reclaim.
-            # Deleting here would thrash: the backend denies the cache to a node whose free disk sits
-            # under its threshold, but a node's free disk is LOWER precisely because the cache is
-            # already downloaded — so deny would delete it, free disk would rise back over the
-            # threshold, the next cycle would grant it again, and the node would re-download ~37 GB
-            # every cycle. Reclaiming a cache the node can no longer afford is the rental/disk-pressure
-            # path's job, where the decision is made against real free space.
+        if payload.workload_kind != WorkloadKind.FILLER:
             return []
+        # No cache requested -> no own family, so only a provider job's leftover cache is swept below (the
+        # backend asks for a job's cache whenever the job has one). Lium's caches are NOT swept here: the backend
+        # denies them to a node whose free disk sits under its threshold, which is LOWER precisely because the
+        # cache is downloaded, so deleting would free disk, re-grant the cache and re-download ~37 GB every cycle.
+        # Reclaiming a cache the node can no longer afford is the rental/disk-pressure path's job.
         # A live filler SIBLING holds this node's cache and docker cannot remove an in-use volume, so
         # the listing round-trip would be a no-op. The run being created is already STARTING in the
         # backend by the time it builds this request, so its OWN container name is in the list too —
@@ -7106,7 +7148,7 @@ class DockerService:
         ):
             return []
 
-        keep_names: set[str] = {cache_volume.name for cache_volume in payload.cache_volumes}
+        keep_names: set[str] = {cache_volume.name for cache_volume in payload.cache_volumes or []}
         cache_prefixes_to_sweep: tuple[str, ...] = self._cache_volume_families(sorted(keep_names))
         if (
             ENGY_CACHE_VOLUME_PREFIX in cache_prefixes_to_sweep
@@ -7115,6 +7157,9 @@ class DockerService:
             # A node moved to Engy no longer runs Dolphin, so its old Dolphin cache is leftover disk.
             # Only this way round: the Dolphin cache is tens of GB, an Engy checkpoint terabytes.
             cache_prefixes_to_sweep += (DPHN_CACHE_VOLUME_PREFIX,)
+        if JOB_CACHE_VOLUME_PREFIX not in cache_prefixes_to_sweep:
+            # Lium's own filler runs only where no provider job does, so a provider job's cache there is leftover
+            cache_prefixes_to_sweep += (JOB_CACHE_VOLUME_PREFIX,)
         stale_volumes: list[str] = await self._find_cache_volumes_to_sweep(
             ssh_client,
             keep_names,

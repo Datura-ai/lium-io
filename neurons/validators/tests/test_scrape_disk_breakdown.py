@@ -42,6 +42,7 @@ DISK_HELPERS = {
     "get_docker_disk_usage",
     "cache_volume_bytes",
     "ENGY_CACHE_VOLUME_PREFIX",
+    "JOB_CACHE_VOLUME_PREFIX",
     "FILLER_VOLUME_LABEL_KEY",
     "FILLER_VOLUME_LABEL_VALUE",
     "release_filler_cache",
@@ -651,6 +652,30 @@ def test_the_engy_cache_is_reported_as_free_disk_and_the_dolphin_cache_stays_use
             "volume_renter": 10 * 1024**2,
         },
     }
+
+
+def test_a_provider_job_cache_is_reported_as_free_disk(scrape: dict) -> None:
+    # A rental removes a provider job's /cache volume like the Engy cache, so the listing counts it as free
+    _stub_docker_api(
+        scrape,
+        {
+            "/system/df": {
+                "LayersSize": 0,
+                "Containers": [],
+                "Volumes": [{"Name": "job_cache_200gb_0123456789ab", "UsageData": {"Size": 150 * 1024**3}}],
+            },
+            "/info": {"DockerRootDir": "/var/lib/docker"},
+            "/volumes": {"Volumes": []},
+        },
+    )
+    hard_disk = {"hard_disk_total": 4000 * 1024**2, "hard_disk_used": 1000 * 1024**2, "hard_disk_free": 3000 * 1024**2}
+
+    hard_disk.update(scrape["get_docker_disk_usage"]())
+    scrape["release_filler_cache"](hard_disk)
+
+    assert (hard_disk["hard_disk_used"], hard_disk["hard_disk_free"]) == (850 * 1024**2, 3150 * 1024**2)
+    assert hard_disk["hard_disk_volumes"] == 0
+    assert hard_disk["hard_disk_engy_cache_used_gb"] == 0
 
 
 def test_a_fillers_own_run_volume_is_reported_as_free_disk(scrape: dict, monkeypatch) -> None:
