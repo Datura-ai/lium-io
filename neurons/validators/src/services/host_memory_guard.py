@@ -48,14 +48,16 @@ def _host_memory_min_script() -> str:
     )
     inner = (
         "[ -f /sys/fs/cgroup/cgroup.controllers ] || { echo memory_min_skipped no_cgroup_v2; exit 0; }; "
-        # never lower a cgroup that already has more protection, as set_min below
-        'set_cg_min() { f="/sys/fs/cgroup$1/memory.min"; [ "$(cat "$f" 2>/dev/null)" -ge "$2" ] 2>/dev/null && return; '
+        # never lower a cgroup that already has more protection ("max" included), as set_min below
+        'set_cg_min() { f="/sys/fs/cgroup$1/memory.min"; c=$(cat "$f" 2>/dev/null); '
+        '{ [ "$c" = max ] || [ "$c" -ge "$2" ]; } 2>/dev/null && return; '
         '{ echo "$2" > "$f"; } 2>/dev/null && echo "memory_min_set $1" || echo "memory_min_failed $1 write_denied"; }; '
         # cgroups written directly (not systemd units): a child's protection never exceeds its parent's, so every
-        # ancestor gets the sum of what is protected below it, parents first; /system.slice stays systemd's
+        # ancestor gets the sum of what is protected below it, parents first; flush's argument names a path
+        # left to systemd (/system.slice when systemd sets it)
         'acc=; add() { acc="$acc $1=$2"; }; '
-        "flush() { for kv in $acc; do echo \"${kv%=*} ${kv#*=}\"; done | awk '{n=split($1,a,\"/\"); p=\"\"; "
-        "for(i=2;i<=n;i++){p=p \"/\" a[i]; if(p!=\"/system.slice\") s[p]+=$2}} END{for(p in s) print p, s[p]}' "
+        "flush() { for kv in $acc; do echo \"${kv%=*} ${kv#*=}\"; done | awk -v k=\"$1\" '{n=split($1,a,\"/\"); p=\"\"; "
+        "for(i=2;i<=n;i++){p=p \"/\" a[i]; if(p!=k) s[p]+=$2}} END{for(p in s) print p, s[p]}' "
         '| sort | while read -r p v; do set_cg_min "$p" "$v"; done; }; '
         # this shell sits in the executor's cgroup; with the host cgroup namespace its path is absolute
         "ex=$(sed -n 's#^0::##p' /proc/self/cgroup); "
@@ -67,17 +69,22 @@ def _host_memory_min_script() -> str:
         '{ [ "$v" = infinity ] || [ "$v" -ge "$2" ]; } 2>/dev/null && return; '
         'systemctl set-property --runtime "$1" MemoryMin="$2" >/dev/null 2>&1 && echo "memory_min_set $1" '
         '|| echo "memory_min_failed $1 set_property_failed"; }; '
-        f"for kv in {units}; do u=${{kv%=*}}; systemctl is-active -q \"$u\" && set_min \"$u\" \"${{kv#*=}}\"; done; "
+        # a unit holding the executor keeps its own share on top of the executor's when its cgroup is summed
+        f"for kv in {units}; do u=${{kv%=*}}; case \"$ex\" in \"/system.slice/$u/\"*) add \"/system.slice/$u\" \"${{kv#*=}}\";; esac; "
+        'systemctl is-active -q "$u" && set_min "$u" "${kv#*=}"; done; '
         f"sl={units_mib * MIB}; "
         'case "$ex" in '
         f'/system.slice/docker-*.scope) set_min "${{ex#/system.slice/}}" {ex_min}; sl=$((sl + {ex_min}));; '
         f'/system.slice/*) add "$ex" {ex_min}; sl=$((sl + {ex_min}));; '
         f'?*) add "$ex" {ex_min};; esac; '
-        'flush; set_min system.slice "$sl"; '
+        'flush /system.slice; set_min system.slice "$sl"; '
         "else "
-        # no systemd (another init, a container as PID 1): the services' own cgroups, found from /proc
+        # no systemd (another init, a container as PID 1): the services' own cgroups, found from /proc. The host
+        # PID namespace shows rental and executor processes too, so only processes in PID 1's mount namespace count
+        "hm=$(readlink /proc/1/ns/mnt); "
         f"seen=; for d in /proc/[0-9]*; do n=$(cat \"$d/comm\" 2>/dev/null); v=; for kv in {procs}; do "
-        '[ "${kv%=*}" = "$n" ] && v=${kv#*=}; done; [ -n "$v" ] || continue; case " $seen " in *" $n "*) continue;; esac; '
+        '[ "${kv%=*}" = "$n" ] && v=${kv#*=}; done; [ -n "$v" ] || continue; '
+        '[ "$(readlink "$d/ns/mnt")" = "$hm" ] || continue; case " $seen " in *" $n "*) continue;; esac; '
         'seen="$seen $n"; p=$(sed -n \'s#^0::##p\' "$d/cgroup" 2>/dev/null); '
         # memory.min does not exist on the root cgroup: a service there cannot be protected without moving it
         'case "$p" in /|"") echo "memory_min_failed $n root_cgroup";; /..*) ;; *) add "$p" "$v";; esac; done; '

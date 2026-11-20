@@ -59,17 +59,20 @@ def _run_memory_min(
     procs: tuple = (),
 ):
     """Runs the memory.min script against a fake systemctl (docker.service and ssh.service active), a fake
-    cgroup tree, a fake /proc placing this shell at executor_cgroup and holding `procs` ((comm, cgroup) pairs),
-    and a host with or without systemd. Returns a callable giving the script's stdout."""
+    cgroup tree, a fake /proc placing this shell at executor_cgroup and holding `procs` ((comm, cgroup) or
+    (comm, cgroup, mount namespace) tuples; PID 1 and the default namespace are the host's), and a host with or
+    without systemd. Returns a callable giving the script's stdout."""
     state, root, proc = tmp_path / "sd", tmp_path / "cg", tmp_path / "proc"
     state.mkdir(exist_ok=True)
     (proc / "self").mkdir(parents=True, exist_ok=True)
     (proc / "self" / "cgroup").write_text(f"0::{executor_cgroup}\n")
-    for pid, (comm, cgroup) in enumerate(procs, start=1):
-        (proc / str(pid)).mkdir(exist_ok=True)
+    for pid, (comm, cgroup, mnt) in enumerate([("init", "/init", "host"), *(p + ("host",)[len(p) - 2:] for p in procs)], 1):
+        (proc / str(pid) / "ns").mkdir(parents=True, exist_ok=True)
         (proc / str(pid) / "comm").write_text(f"{comm}\n")
         (proc / str(pid) / "cgroup").write_text(f"0::{cgroup}\n")
-    for cgroup in [executor_cgroup, *(cg for _, cg in procs)]:
+        if not (proc / str(pid) / "ns" / "mnt").is_symlink():
+            (proc / str(pid) / "ns" / "mnt").symlink_to(f"mnt:[{mnt}]")
+    for cgroup in [executor_cgroup, *(p[1] for p in procs)]:
         if cgroup.strip("/") and not cgroup.startswith("/.."):
             (root / cgroup.lstrip("/")).mkdir(parents=True, exist_ok=True)
     run_systemd = tmp_path / "run_systemd"
@@ -126,13 +129,14 @@ def test_executor_on_a_cgroupfs_host_gets_memory_min_written_with_its_parent(tmp
     assert parse_guard_output(second)["set"] == []
 
 
-def test_cgroupfs_parent_with_more_protection_is_not_lowered(tmp_path):
+@pytest.mark.parametrize("existing", [f"{EX * 2}", "max"])
+def test_cgroupfs_parent_with_more_protection_is_not_lowered(tmp_path, existing):
     run = _run_memory_min(tmp_path, "/docker/abc")
-    (tmp_path / "cg/docker/memory.min").write_text(f"{EX * 2}\n")
+    (tmp_path / "cg/docker/memory.min").write_text(f"{existing}\n")
 
     run()
 
-    assert _read(tmp_path / "cg/docker/memory.min") == EX * 2
+    assert (tmp_path / "cg/docker/memory.min").read_text().strip() == existing
 
 
 def test_systemd_unit_with_more_protection_is_not_lowered(tmp_path):
@@ -178,7 +182,7 @@ def test_executor_under_system_slice_counts_in_the_slice_set_by_systemd(tmp_path
 
     root, state = tmp_path / "cg", tmp_path / "sd"
     assert _read(root / "system.slice/containerd.service/x/memory.min") == EX
-    assert _read(root / "system.slice/containerd.service/memory.min") == EX
+    assert _read(root / "system.slice/containerd.service/memory.min") == EX + UNIT_MEMORY_MIN_MIB["containerd.service"] * MIB
     assert not (root / "system.slice/memory.min").exists()
     assert _read(state / "system.slice") == UNITS_MIB * MIB + EX
 
@@ -215,6 +219,27 @@ def test_host_without_systemd_protects_each_service_cgroup_and_the_executor(tmp_
     assert first["failed"] == ["memory_min sysbox-mgr root_cgroup"]
     assert not list((tmp_path / "sd").iterdir())
     assert second["set"] == []
+
+
+def test_host_without_systemd_protects_the_host_service_not_a_rental_one(tmp_path):
+    procs = (("sshd", "/rental/ssh", "rental"), ("sshd", "/host/ssh"))
+    run = _run_memory_min(tmp_path, "/docker/abc", systemd=False, procs=procs)
+
+    run()
+
+    root = tmp_path / "cg"
+    assert _read(root / "host/ssh/memory.min") == UNIT_MEMORY_MIN_MIB["sshd.service"] * MIB
+    assert not (root / "rental/ssh/memory.min").exists()
+    assert not (root / "rental/memory.min").exists()
+
+
+def test_host_without_systemd_sums_system_slice_itself(tmp_path):
+    run = _run_memory_min(tmp_path, "/system.slice/executor", systemd=False, procs=(("sshd", "/system.slice/sshd"),))
+
+    run()
+
+    sshd = UNIT_MEMORY_MIN_MIB["sshd.service"] * MIB
+    assert _read(tmp_path / "cg/system.slice/memory.min") == EX + sshd
 
 
 @pytest.mark.asyncio
