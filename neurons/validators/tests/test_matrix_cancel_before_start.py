@@ -48,4 +48,22 @@ def test_a_cancel_between_install_and_start_stops_that_run_and_no_other(node: Pa
     time.sleep(0.3)
     assert not (node / f"{mine}.started").exists()   # cancelled before it started: never started
     assert (node / f"{other}.started").read_text() == "started" and b.returncode == 0
-    assert list((node / "service").iterdir()) == []   # the cancelled run's directory is gone, the other cleaned itself
+    # the cancelled run's directory is gone, the other cleaned itself; only the cancel's marker stays
+    assert [p.name for p in (node / "service").iterdir()] == [Path(executor_payload.cancel_marker("matrix", mine)).name]
+
+
+def test_a_cancel_that_lands_before_the_launch_shell_exists_still_stops_that_run(node: Path) -> None:
+    # the cancel's SSH command can finish before the launch's exec has started its shell: nothing to kill yet
+    mine, other = executor_payload.new_run_tag(), executor_payload.new_run_tag()
+    subprocess.run(["sh", "-c", executor_payload.kill_runs("matrix", executor_payload.MATRIX, mine)], check=True)
+    a, b = _launch(node, mine), _launch(node, other)
+    try:
+        a.wait(timeout=5)
+        b.wait(timeout=10)
+    finally:
+        for p in (a, b):
+            if p.poll() is None:
+                p.kill()
+    assert not (node / f"{mine}.started").exists() and a.returncode == 1
+    assert (node / f"{other}.started").read_text() == "started" and b.returncode == 0
+    assert [p.name for p in (node / "service").iterdir()] == [Path(executor_payload.cancel_marker("matrix", mine)).name]

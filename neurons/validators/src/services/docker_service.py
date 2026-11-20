@@ -234,10 +234,10 @@ from services.ssh_connect_timing import connect_with_phase_timing
 from services.storage_operations import (
     forget_storage_helper,
     note_started_storage_helper,
+    run_job_with_secrets,
     start_storage_operation,
     supports_bootstrap_restore,
     supports_storage_operation,
-    upload_secrets_file,
     wait_for_storage_operation,
 )
 from services.task.runner import SSHCommandRunner
@@ -12453,26 +12453,32 @@ class DockerService:
         local_volume: str,
         local_volume_path: str,
     ) -> None:
-        # the validator's restore job and its helper, staged and run in a fresh private directory (run_job)
-        args = [
-            "--api-url",
-            settings.COMPUTE_REST_API_URL_EXTERNAL,
-            "--target-volume",
-            local_volume,
-            "--restore-path",
-            restore.restore_path or local_volume_path,
-            "--backup-source-path",
-            restore.legacy_object_key or "",
-            "--secrets-file",
-            await upload_secrets_file(ssh_client, restore.auth_token, restore.backup_volume_info),
-            "--restore-log-id",
-            restore.restore_log_id,
-            "--backup-volume-name",
-            restore.backup_volume_info.name,
-            "--target-volume-path",
-            local_volume_path,
-        ]
-        await ssh_client.run(executor_payload.run_job("restore", executor_payload.RESTORE_JOB, args), check=True)
+        # the validator's restore job, staged first; its credentials file only then (run_job_with_secrets)
+        await run_job_with_secrets(
+            ssh_client,
+            "restore",
+            executor_payload.RESTORE_JOB,
+            restore.auth_token,
+            restore.backup_volume_info,
+            lambda secrets_file: [
+                "--api-url",
+                settings.COMPUTE_REST_API_URL_EXTERNAL,
+                "--target-volume",
+                local_volume,
+                "--restore-path",
+                restore.restore_path or local_volume_path,
+                "--backup-source-path",
+                restore.legacy_object_key or "",
+                "--secrets-file",
+                secrets_file,
+                "--restore-log-id",
+                restore.restore_log_id,
+                "--backup-volume-name",
+                restore.backup_volume_info.name,
+                "--target-volume-path",
+                local_volume_path,
+            ],
+        )
 
     async def _report_pull_progress(self, docker_client, image: str, log_tag: str, every: float = 15) -> None:
         """DAH-6025: a big pull showed one 'Pulling' line for minutes, and renters cancelled pods that were

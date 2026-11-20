@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import shlex
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -301,13 +300,14 @@ async def start_storage_operation(
             check=True,
         )
         stage_dir = _staged_directory(staged.stdout)
+        claimed = False
         try:
+            # the spec's exclusive create is this dispatch's claim on the operation: a repeated dispatch that passed the
+            # checks above while this one was staging finds the spec there and leaves the operation to its owner
             async with ssh_client.start_sftp_client() as sftp:
-                async with sftp.open(str(files.spec), "w") as remote_spec:
-                    await remote_spec.write(
-                        json.dumps(dict(spec), separators=(",", ":"), sort_keys=True)
-                    )
-                await sftp.chmod(str(files.spec), 0o600)
+                async with sftp.open(str(files.spec), "x", asyncssh.SFTPAttrs(permissions=0o600)) as remote_spec:
+                    claimed = True
+                    await remote_spec.write(json.dumps(dict(spec), separators=(",", ":"), sort_keys=True))
 
             # the validator's runner and storage package, staged in a root-only directory ($D) that goes when the runner
             # has exited
@@ -341,7 +341,13 @@ async def start_storage_operation(
             )
             await ssh_client.run(launch_command, check=True)
         except Exception:
-            # no runner took the spec: remove it and the staged runner here
+            if not claimed:
+                # the operation's spec is another dispatch's (or none was made): only the runner staged here goes
+                await ssh_client.run(f"rm -rf {shlex.quote(stage_dir)}", check=False)
+                if await _remote_file_exists(ssh_client, files.spec):
+                    return files
+                raise
+            # no runner took this dispatch's spec: remove it and the staged runner here
             await ssh_client.run(f"rm -rf {shlex.quote(stage_dir)} {shlex.quote(str(files.spec))}", check=False)
             raise
         return files
@@ -351,11 +357,33 @@ async def start_storage_operation(
 
 
 def _staged_directory(stdout: object) -> str:
-    """The directory the staging command made: only a fresh one of the storage template, never another path."""
-    path = stdout.strip() if isinstance(stdout, str) else ""
-    if not re.fullmatch(re.escape(executor_payload.service_dir_glob("storage")) + r"[A-Za-z0-9]{8}", path):
-        raise StorageOperationLaunchError("staging the storage runner returned no directory")
-    return path
+    try:
+        return executor_payload.staged_directory("storage", stdout)
+    except ValueError as error:
+        raise StorageOperationLaunchError(str(error)) from None
+
+
+async def run_job_with_secrets(
+    ssh_client: asyncssh.SSHClientConnection,
+    purpose: str,
+    files: tuple[str, ...],
+    auth_token: str,
+    volume_info,
+    argv: Callable[[str], list[str]],
+    log: str | None = None,
+    **run_kwargs,
+) -> None:
+    """Stage a legacy tar job, then hand it its credentials file (upload_secrets_file) and start it: the credentials reach
+    the node only once the job that reads and deletes them is in place. A failed start removes both."""
+    staged = await ssh_client.run(executor_payload.stage_job(purpose, files), check=True)
+    stage_dir = executor_payload.staged_directory(purpose, staged.stdout)
+    remove = [stage_dir]
+    try:
+        remove.append(await upload_secrets_file(ssh_client, auth_token, volume_info))
+        await ssh_client.run(executor_payload.run_job(stage_dir, files, argv(remove[1]), log=log), check=True, **run_kwargs)
+    except Exception:
+        await ssh_client.run(f"rm -rf -- {shlex.join(remove)}", check=False)
+        raise
 
 
 async def wait_for_storage_operation(

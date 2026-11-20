@@ -5,10 +5,11 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from services import executor_payload
+from services import executor_payload, storage_operations
 
 
 @pytest.fixture
@@ -35,8 +36,15 @@ def _sh(command: str, service: Path) -> subprocess.CompletedProcess:
     return subprocess.run(["sh", "-c", command], cwd=service, env=env, capture_output=True, text=True)
 
 
+def _stage_and_run(purpose: str, args: list[str], service: Path, log: str | None = None) -> subprocess.CompletedProcess:
+    files = ("job.py", "helper.py")
+    staged = _sh(executor_payload.stage_job(purpose, files), service)
+    assert staged.returncode == 0, staged.stderr
+    return _sh(executor_payload.run_job(executor_payload.staged_directory(purpose, staged.stdout), files, args, log=log), service)
+
+
 def test_a_foreground_job_imports_only_its_staged_helper_and_leaves_nothing(jobs: Path) -> None:
-    done = _sh(executor_payload.run_job("backup", ("job.py", "helper.py"), ["--x", "a b"]), jobs)
+    done = _stage_and_run("backup", ["--x", "a b"], jobs)
     assert done.returncode == 0, done.stderr
     lines = done.stdout.splitlines()
     assert lines[0].startswith("helper from " + executor_payload.service_dir_glob("backup", str(jobs)))
@@ -46,7 +54,7 @@ def test_a_foreground_job_imports_only_its_staged_helper_and_leaves_nothing(jobs
 
 def test_a_detached_job_logs_and_its_worker_removes_the_directory(jobs: Path, tmp_path: Path) -> None:
     log = tmp_path / "job.log"
-    done = _sh(executor_payload.run_job("restore", ("job.py", "helper.py"), ["--y"], log=str(log)), jobs)
+    done = _stage_and_run("restore", ["--y"], jobs, log=str(log))
     assert done.returncode == 0, done.stderr
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline and (len(list(jobs.iterdir())) > 1 or not log.exists() or "safe" not in log.read_text()):
@@ -57,7 +65,46 @@ def test_a_detached_job_logs_and_its_worker_removes_the_directory(jobs: Path, tm
 
 
 def test_a_failed_staging_leaves_no_partial_directory(jobs: Path) -> None:
-    command = executor_payload.run_job("backup", ("job.py", "helper.py"), [])
+    command = executor_payload.stage_job("backup", ("job.py", "helper.py"))
     broken = command.replace("base64 -d >", "false >", 1)   # the first write fails after mktemp
     assert _sh(broken, jobs).returncode == 1
+    assert sorted(p.name for p in jobs.iterdir()) == ["helper.py"]
+
+
+@pytest.mark.parametrize("fails", ["staging", "start"])
+def test_the_credentials_file_never_outlives_a_job_that_did_not_start(
+    jobs: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fails: str
+) -> None:
+    # the job reads and deletes its credentials file: the file is uploaded only once the job is staged, and a failed
+    # start removes it with the staged directory
+    import asyncio
+
+    secrets_dir = tmp_path / "secrets"
+    secrets_dir.mkdir()
+    uploaded: list[str] = []
+
+    async def upload(ssh_client, auth_token, volume_info):
+        path = secrets_dir / "s.json"
+        path.write_text("{}")
+        uploaded.append(str(path))
+        return str(path)
+
+    monkeypatch.setattr(storage_operations, "upload_secrets_file", upload)
+    async def run(command: str, check: bool = False, **_) -> SimpleNamespace:
+        if fails == "start" and "nohup" in command:
+            raise RuntimeError("the start failed")
+        if fails == "staging" and "mktemp" in command:
+            command = command.replace("base64 -d >", "false >", 1)   # the node fails a write after mktemp
+        done = _sh(command, jobs)
+        if check and done.returncode:
+            raise RuntimeError(f"exit {done.returncode}")
+        return SimpleNamespace(exit_status=done.returncode, stdout=done.stdout, stderr=done.stderr)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(storage_operations.run_job_with_secrets(
+            SimpleNamespace(run=run), "backup", ("job.py", "helper.py"), "token", None,
+            lambda secrets_file: ["--secrets-file", secrets_file], log=str(tmp_path / "job.log"),
+        ))
+    assert uploaded == ([] if fails == "staging" else [str(secrets_dir / "s.json")])
+    assert list(secrets_dir.iterdir()) == []
     assert sorted(p.name for p in jobs.iterdir()) == ["helper.py"]

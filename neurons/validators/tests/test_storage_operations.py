@@ -1,5 +1,6 @@
 import inspect
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -147,9 +148,11 @@ def test_detached_wrapper_keeps_the_log_only_when_the_runner_fails(
         async def __aexit__(self, *exc):
             return False
 
-        def open(self, path, mode):
+        def open(self, path, mode, attrs=None):
             class Handle:
                 async def __aenter__(self):
+                    if "x" in mode:
+                        os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
                     return self
 
                 async def __aexit__(self, *exc):
@@ -233,3 +236,63 @@ def test_a_failed_unpack_leaves_no_spec_and_no_staging_directory(
     assert not Path(str(files.spec)).exists() and sftp_used == []
     assert not list((tmp_path / "service").iterdir())  # the partial staging directory is gone
     reported.assert_awaited_once()
+
+
+def test_a_repeated_dispatch_that_stages_alongside_leaves_the_operation_to_the_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # two dispatches of one operation both pass the checks while staging: the spec's exclusive create decides the
+    # owner, and the other launches nothing, keeps the owner's spec and removes only what it staged
+    import asyncio as aio
+
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", storage_operations.PurePosixPath(str(tmp_path)))
+    monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
+    monkeypatch.setattr(storage_operations, "report_launch_failure", AsyncMock())
+    payloads = tmp_path / "payloads"
+    payloads.mkdir()
+    (payloads / "storage_runner.py").write_text("raise SystemExit(0)\n")
+    monkeypatch.setattr(executor_payload, "PAYLOAD_DIR", payloads)
+    monkeypatch.setattr(executor_payload, "STORAGE", ("storage_runner.py",))
+    monkeypatch.setattr(executor_payload, "SERVICE_DIR_PARENT", str(tmp_path / "service"))
+    (tmp_path / "service").mkdir()
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    launched: list[str] = []
+
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        if "nohup" in command:
+            launched.append(command)
+            return SimpleNamespace(exit_status=0, stdout="", stderr="")
+        done = subprocess.run(["sh", "-c", command], input=input, capture_output=True, text=True)
+        if "sha256sum" in command:
+            Path(str(files.spec)).write_text("first dispatch")   # the other dispatch claims it while this one stages
+        if check and done.returncode:
+            raise RuntimeError(f"exit {done.returncode}")
+        return SimpleNamespace(exit_status=done.returncode, stdout=done.stdout, stderr=done.stderr)
+
+    class Sftp:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def open(self, path, mode, attrs=None):
+            class Handle:
+                async def __aenter__(self):
+                    os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))   # raises: it exists
+                    return self
+
+                async def __aexit__(self, *exc):
+                    return False
+
+            return Handle()
+
+    ssh_client = SimpleNamespace(run=run, start_sftp_client=lambda: Sftp())
+    returned = aio.run(
+        storage_operations.start_storage_operation(
+            ssh_client, sys.executable, OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+        )
+    )
+    assert returned == files and launched == []
+    assert Path(str(files.spec)).read_text() == "first dispatch"
+    assert not list((tmp_path / "service").iterdir())

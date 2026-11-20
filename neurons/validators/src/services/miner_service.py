@@ -102,7 +102,7 @@ from services.storage_operations import (
     start_storage_operation,
     supports_workspace_field,
 )
-from services.storage_operations import upload_secrets_file
+from services.storage_operations import run_job_with_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -1804,20 +1804,20 @@ class MinerService:
             # the validator's backup job and its helper, staged and run in a fresh private directory (run_job), never
             # beside node-local code it could import
             logger.info(_m("Starting the backup job on the executor", extra=get_extra_info({"backup_log_id": payload.backup_log_id})))
-            argv = [
-                "--api-url", settings.COMPUTE_REST_API_URL_EXTERNAL,
-                "--source-volume", payload.source_volume,
-                "--backup-path", payload.backup_path,
-                "--secrets-file", await upload_secrets_file(ssh_client, payload.auth_token, payload.backup_volume_info),
-                "--backup-log-id", payload.backup_log_id,
-                "--backup-volume-name", payload.backup_volume_info.name,
-                "--source-volume-path", payload.source_volume_path,
-                "--backup-target-path", payload.backup_target_path,
-            ]
-            await ssh_client.run(
-                executor_payload.run_job("backup", executor_payload.BACKUP_JOB, argv, log="/root/app/backup_storage.log"),
+            await run_job_with_secrets(
+                ssh_client, "backup", executor_payload.BACKUP_JOB, payload.auth_token, payload.backup_volume_info,
+                lambda secrets_file: [
+                    "--api-url", settings.COMPUTE_REST_API_URL_EXTERNAL,
+                    "--source-volume", payload.source_volume,
+                    "--backup-path", payload.backup_path,
+                    "--secrets-file", secrets_file,
+                    "--backup-log-id", payload.backup_log_id,
+                    "--backup-volume-name", payload.backup_volume_info.name,
+                    "--source-volume-path", payload.source_volume_path,
+                    "--backup-target-path", payload.backup_target_path,
+                ],
+                log="/root/app/backup_storage.log",
                 timeout=50,
-                check=True,
             )
 
     async def handle_restore_container_req(self, executor_info: ExecutorSSHInfo, payload: RestoreContainerRequest, pkey: SSHKey, docker_service: DockerService):
@@ -1853,20 +1853,20 @@ class MinerService:
 
             # the validator's restore job and its helper, staged and run in a fresh private directory (run_job)
             logger.info(_m("Starting the restore job on the executor", extra=get_extra_info({"restore_log_id": payload.restore_log_id})))
-            argv = [
-                "--api-url", settings.COMPUTE_REST_API_URL_EXTERNAL,
-                "--target-volume", payload.target_volume,
-                "--restore-path", payload.restore_path,
-                "--backup-source-path", payload.backup_source_path,
-                "--secrets-file", await upload_secrets_file(ssh_client, payload.auth_token, payload.backup_volume_info),
-                "--restore-log-id", payload.restore_log_id,
-                "--backup-volume-name", payload.backup_volume_info.name,
-                "--target-volume-path", payload.target_volume_path,
-            ]
-            await ssh_client.run(
-                executor_payload.run_job("restore", executor_payload.RESTORE_JOB, argv, log="/root/app/restore_storage.log"),
+            await run_job_with_secrets(
+                ssh_client, "restore", executor_payload.RESTORE_JOB, payload.auth_token, payload.backup_volume_info,
+                lambda secrets_file: [
+                    "--api-url", settings.COMPUTE_REST_API_URL_EXTERNAL,
+                    "--target-volume", payload.target_volume,
+                    "--restore-path", payload.restore_path,
+                    "--backup-source-path", payload.backup_source_path,
+                    "--secrets-file", secrets_file,
+                    "--restore-log-id", payload.restore_log_id,
+                    "--backup-volume-name", payload.backup_volume_info.name,
+                    "--target-volume-path", payload.target_volume_path,
+                ],
+                log="/root/app/restore_storage.log",
                 timeout=50,
-                check=True,
             )
 
     async def handle_cancel_storage_operation_req(

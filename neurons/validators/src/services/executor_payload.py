@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import re
 import secrets
 import shlex
 import tarfile
@@ -116,22 +117,34 @@ def run(files: tuple[str, ...]) -> str:
 def run_once(purpose: str, files: tuple[str, ...], args: str, env: str = "", tag: str = "") -> str:
     """Install, run with `args` (`env` assignments before the interpreter); the directory goes when the shell ends,
     also on a hangup or kill signal of the session. The exit status is the run's."""
-    return f"{install(purpose, files, cleanup=True, tag=tag)}; {env}{run(files)} {args}"
+    # a tagged run cancelled before its shell existed (kill_runs left the marker) never starts
+    gate = f"[ ! -e {shlex.quote(cancel_marker(purpose, tag))} ] || exit 1; " if tag else ""
+    return f"{gate}{install(purpose, files, cleanup=True, tag=tag)}; {env}{run(files)} {args}"
 
 
-def run_job(purpose: str, files: tuple[str, ...], args: list[str], log: str | None = None) -> str:
-    """A validator miner job (`files` from MINER_JOBS): staged in a fresh 0700 directory and run there by the trusted
-    interpreter with -E -s, so its imports resolve to the staged files only, never to code on the node or in its
-    environment. The directory goes when the run ends. `log`: run detached (nohup) with its output there; the detached
-    worker then owns the cleanup, also when it is killed."""
+def stage_job(purpose: str, files: tuple[str, ...]) -> str:
+    """Shell that stages a validator miner job (`files` from MINER_JOBS) in a fresh 0700 directory and prints it; nothing
+    runs. A failed staging leaves no directory. The caller hands the job its inputs, then starts it with run_job."""
+    return f'{install(purpose, files, source=MINER_JOBS)}; printf "%s" "$d"'
+
+
+def staged_directory(purpose: str, stdout: object) -> str:
+    """The directory a stage command printed: only a fresh one of the `purpose` template, never another path."""
+    path = stdout.strip() if isinstance(stdout, str) else ""
+    if not re.fullmatch(re.escape(service_dir_glob(purpose)) + r"[A-Za-z0-9]{8}", path):
+        raise ValueError(f"staging the {purpose} files returned no directory")
+    return path
+
+
+def run_job(staged: str, files: tuple[str, ...], args: list[str], log: str | None = None) -> str:
+    """Start the job staged in `staged` (stage_job) with the trusted interpreter and -E -s, so its imports resolve to the
+    staged files only, never to code on the node or in its environment. The directory goes when the run ends, also when
+    it is killed. `log`: run detached (nohup) with its output there."""
     command = f'{shlex.quote(EXECUTOR_PYTHON)} -E -s "$D"/{shlex.quote(files[0])} {shlex.join(args)}'
-    if log is None:
-        return f'{install(purpose, files, cleanup=True, source=MINER_JOBS)}; D="$d"; {command}'
     worker = "trap 'rm -rf \"$D\"' EXIT; trap 'exit 1' HUP INT TERM; " + command
-    return (
-        f"{install(purpose, files, source=MINER_JOBS)}; "
-        f'D="$d" nohup /bin/sh -c {shlex.quote(worker)} > {shlex.quote(log)} 2>&1 < /dev/null &'
-    )
+    if log is None:
+        return f"D={shlex.quote(staged)}; {worker}"
+    return f"D={shlex.quote(staged)} nohup /bin/sh -c {shlex.quote(worker)} > {shlex.quote(log)} 2>&1 < /dev/null &"
 
 
 def label(files: tuple[str, ...], args: str) -> str:
@@ -152,12 +165,22 @@ def launcher_pattern(purpose: str, tag: str) -> str:
     return (service_dir_glob(purpose) + f"{tag}.XXXXXXXX").replace(".", r"\.")
 
 
+def cancel_marker(purpose: str, tag: str) -> str:
+    """The file kill_runs leaves for `tag`: outside the run directories' glob, so their removal keeps it."""
+    return f"{service_dir_glob(purpose)}{tag}-cancelled"
+
+
 def kill_runs(purpose: str, files: tuple[str, ...], tag: str) -> str:
     """Shell that ends every run of `purpose` tagged `tag`: SIGKILL to the whole process group of each tagged launcher,
     so a script it is still installing or has not started yet never starts, then to any tagged entry script left, then
     removes the tagged directories. Runs with other tags, and the shell running this, are not touched."""
     me = "$(ps -o pgid= -p $$ | tr -d ' ')"
+    marker = shlex.quote(cancel_marker(purpose, tag))
     return (
+        # the marker first: a launcher whose shell is not up yet (its exec still in flight) sees it and never starts;
+        # one already up is in the process groups killed next. Markers of long-finished runs are swept.
+        f"find {shlex.quote(SERVICE_DIR_PARENT)} -maxdepth 1 -name {shlex.quote(Path(cancel_marker(purpose, '*')).name)} "
+        f"-mmin +60 -delete 2>/dev/null; : > {marker}; "
         f"for p in $(pgrep -f {SAME_MOUNT_NS} -- {shlex.quote(launcher_pattern(purpose, tag))}); do "
         "g=$(ps -o pgid= -p \"$p\" | tr -d ' '); "
         f'[ -n "$g" ] && [ "$g" != "{me}" ] && kill -9 -- "-$g" 2>/dev/null; done; '
