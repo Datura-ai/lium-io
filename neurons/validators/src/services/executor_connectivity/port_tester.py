@@ -27,8 +27,9 @@ class PortTester:
         expected = f"{token}:{port.internal}"
 
         try:
-            # the node answers its own address only: a redirect would point the probe somewhere else
-            async with session.get(url, timeout=PROBE_TIMEOUT, allow_redirects=False) as resp:
+            # the node answers its own address only: a redirect would point the probe somewhere else. The answer is
+            # never decompressed, so the cap counts the bytes the node sent, not what a compressed body expands to
+            async with session.get(url, timeout=PROBE_TIMEOUT, allow_redirects=False, auto_decompress=False) as resp:
                 body = b""
                 while len(body) <= PROBE_BODY_LIMIT:
                     chunk = await resp.content.read(PROBE_BODY_LIMIT + 1 - len(body))

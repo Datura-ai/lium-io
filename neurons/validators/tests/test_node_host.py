@@ -307,12 +307,14 @@ async def test_the_port_probe_does_not_follow_a_redirect():
     assert target_hits == []
 
 
-async def _streaming_server(chunks: list[bytes]) -> tuple[web.AppRunner, int, list[int]]:
+async def _streaming_server(
+    chunks: list[bytes], headers: dict[str, str] | None = None
+) -> tuple[web.AppRunner, int, list[int]]:
     """A loopback node that writes ``chunks`` one by one; the list it returns counts the bytes it got out."""
     written: list[int] = []
 
     async def handler(request):
-        resp = web.StreamResponse()
+        resp = web.StreamResponse(headers=headers)
         await resp.prepare(request)
         try:
             for chunk in chunks:
@@ -371,6 +373,25 @@ async def test_the_port_probe_reads_an_answer_of_up_to_the_cap_across_chunks(mon
     finally:
         await runner.cleanup()
     assert ok is passes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("encoding", ["gzip", "deflate"])
+@pytest.mark.parametrize("expanded", [b"token:7", b"token:7" + b" " * 10_000_000], ids=["the-answer", "a-bomb"])
+async def test_the_port_probe_never_decompresses_an_answer(monkeypatch, encoding, expanded):
+    """A compressed answer stays compressed: the cap counts the bytes on the wire, so a small body cannot expand into
+    a large one inside the validator, and a compressed copy of the right answer does not pass."""
+    import zlib
+
+    packer = zlib.compressobj(wbits=31 if encoding == "gzip" else 15)
+    body = packer.compress(expanded) + packer.flush()
+    runner, port, _ = await _streaming_server([body], headers={"Content-Encoding": encoding})
+    try:
+        ok, read = await _probe(port, monkeypatch)
+    finally:
+        await runner.cleanup()
+    assert not ok
+    assert sum(read) == min(len(body), 256 + 1)
 
 
 def _logged(caplog, level):
