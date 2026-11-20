@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiohttp
 import bittensor
 import pytest
+from neurons.validators.src.clients import backend_client as backend_client_module
 from neurons.validators.src.clients.backend_client import BackendClient
 from pydantic import BaseModel
 from tenacity import wait_none
@@ -199,6 +200,25 @@ async def test_check_executor_health_sends_loopback_plugin_only_when_given(clien
 
     assert "loopback_plugin" not in post.await_args_list[0].kwargs["json_data"]
     assert post.await_args_list[1].kwargs["json_data"]["loopback_plugin"] == "vloopback:v2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nonce", [None, "4c545331" + "00" * 28])
+async def test_check_executor_health_sends_the_dated_nonce_the_backend_needs_to_sign_owner_hotkeys(client, nonce):
+    """The health check sent owner_hotkeys but no upload_nonce, and the backend signs owner hotkeys only with a dated
+    nonce, so a linked node would fail the check once executors require a bound key. The nonce follows the
+    validator's own rule (upload_nonce_for_miner): none for a miner not proven to relay it."""
+    with (
+        patch.object(backend_client_module, "portal_owner_hotkeys", return_value={"5OtherAccount"}),
+        patch.object(backend_client_module, "upload_nonce_for_miner", return_value=nonce) as nonce_for,
+        patch.object(client, "_signed_request", AsyncMock(return_value=None)) as post,
+    ):
+        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001)
+
+    sent = post.await_args.kwargs["json_data"]
+    nonce_for.assert_called_once_with("hotkey")
+    assert sent["owner_hotkeys"] == ["5OtherAccount"]
+    assert sent.get("upload_nonce") == nonce
 
 
 @pytest.mark.asyncio

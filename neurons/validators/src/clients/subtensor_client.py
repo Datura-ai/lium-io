@@ -18,6 +18,7 @@ from datura.chain import (
     EndpointSource,
     is_chain_error,
 )
+from datura.requests.validator_requests import fresh_upload_nonce
 from pydantic import BaseModel, Field, ValidationError
 
 from clients.validator_portal_api import OptedInMiner, ValidatorPortalAPI
@@ -30,6 +31,10 @@ if TYPE_CHECKING:
     from bittensor_wallet import bittensor_wallet
 
 logger = get_logger(__name__)
+
+# I-78: bittensor packs a.b.c into axon_info.version as a*1000**2 + b*1000 + c. 10.5.0 is what
+# miner-v1.003+ announces; the upload nonce field shipped in miner-v1.002 (fbfbde79, DAH-2338).
+MIN_DATED_NONCE_MINER_AXON_VERSION = 10_005_000
 ChainReadResult = TypeVar("ChainReadResult")
 
 SYNC_CYCLE = 12
@@ -1186,3 +1191,27 @@ class SubtensorClient:
         if subnet is None or subnet.price is None:
             raise RuntimeError(f"No subnet price available for netuid {self.netuid}")
         return subnet.price.tao
+
+
+def upload_nonce_for_miner(miner_hotkey: str) -> str | None:
+    """A dated nonce for an SSH-key upload, the validator's own or the backend's health check, so a captured
+    signature goes stale (I-78).
+
+    Only for a miner proven to relay the nonce field: the central miner, or an axon announcing
+    bittensor 10.5.0+. Older miners drop the field and the upload fails, so they get none.
+    """
+    subtensor = SubtensorClient.get_instance()
+    if miner_hotkey in subtensor.hotkeys_routed_via_central_miner:
+        return fresh_upload_nonce()
+    # in-memory metagraph snapshot only: no chain read on the upload path
+    neuron = next((n for n in subtensor.miners if n.hotkey == miner_hotkey), None)
+    axon_version = getattr(neuron.axon_info, "version", None) if neuron is not None else None
+    if axon_version and axon_version >= MIN_DATED_NONCE_MINER_AXON_VERSION:
+        return fresh_upload_nonce()
+    logger.info(
+        _m(
+            "dated_upload_nonce_skipped",
+            extra=get_extra_info({"miner_hotkey": miner_hotkey, "axon_version": axon_version}),
+        )
+    )
+    return None

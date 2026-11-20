@@ -32,6 +32,7 @@ from protocol.vc_protocol.compute_requests import (
 from pydantic import BaseModel, ValidationError
 from tenacity import retry, retry_if_result, stop_after_attempt, wait_fixed
 
+from clients.subtensor_client import upload_nonce_for_miner
 from clients.validator_portal_api import portal_owner_hotkeys
 from core.utils import _m, get_extra_info
 
@@ -619,6 +620,11 @@ class BackendClient:
         owner_hotkeys = portal_owner_hotkeys(miner_hotkey)
         if owner_hotkeys:
             json_data["owner_hotkeys"] = sorted(owner_hotkeys)
+        # the backend signs the owner hotkeys only with a dated nonce (an undated signature would never expire), and
+        # dates its own upload with it, as the validator's uploads are dated
+        upload_nonce = upload_nonce_for_miner(miner_hotkey)
+        if upload_nonce:
+            json_data["upload_nonce"] = upload_nonce
 
         try:
             # the whole call, retries included: a connection retry must not restart the wait
