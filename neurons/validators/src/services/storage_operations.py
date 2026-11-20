@@ -122,7 +122,13 @@ _wave_read: WaveRead | None = None
 
 def _wave_raw_records(redis: RedisService, wave_id: str) -> Awaitable[dict[str, list[str]]]:
     global _wave_read
-    if _wave_read is None or _wave_read.wave_id != wave_id:
+    failed = (
+        _wave_read is not None
+        and _wave_read.records.done()
+        and (_wave_read.records.cancelled() or _wave_read.records.exception() is not None)
+    )
+    # a failed read is not the wave's records: the next check reads again
+    if _wave_read is None or _wave_read.wave_id != wave_id or failed:
         _wave_read = WaveRead(wave_id, asyncio.ensure_future(_all_raw_records(redis)))
     # one check timing out must not cancel the read the rest of the wave awaits
     return asyncio.shield(_wave_read.records)
