@@ -1471,6 +1471,9 @@ MAD_METHOD_GET = 0x01
 MAD_METHOD_GET_RESPONSE = 0x81
 # an LID-routed SMP carries its attribute 64 bytes into the MAD; SMInfo starts with the SM port's GUID
 SMP_DATA_OFFSET = 64
+# SMInfo byte 20: priority in the high nibble, SMState in the low one; only the master's GUID names the fabric
+SM_INFO_STATE_OFFSET = 20
+SM_STATE_MASTER = 3
 SM_INFO_TIMEOUT_MS = 500
 SM_INFO_RETRIES = 2
 # the whole walk's budget: a fabric that never answers must not hold up the machine scrape
@@ -1785,6 +1788,8 @@ def sm_guid_of_response(response: bytes) -> str:
         return ""
     if int.from_bytes(mad[16:18], "big") != SM_INFO_ATTRIBUTE:
         return ""
+    if mad[SMP_DATA_OFFSET + SM_INFO_STATE_OFFSET] & 0x0F != SM_STATE_MASTER:
+        return ""  # a standby or discovering SM answered (e.g. mid-handover): its GUID is not the fabric's
     guid = mad[SMP_DATA_OFFSET : SMP_DATA_OFFSET + 8].hex()
     if guid == "0" * 16:
         return ""
@@ -1808,25 +1813,41 @@ def query_sm_guid(umad_path: str, sm_lid: int) -> str:
         os.close(fd)
 
 
-def query_sm_guids(ports: list[InfinibandPort]) -> None:
-    for port in ports:
-        if port.link_layer.lower() != "infiniband" or not port.state.upper().endswith("ACTIVE"):
-            continue
-        try:
-            sm_lid = int(port.sm_lid, 16)
-            umad_path = umad_device_of(port.device, port.port)
-            if sm_lid and umad_path:
-                port.sm_guid = query_sm_guid(umad_path, sm_lid)
-        except Exception:
-            port.sm_guid = ""
+def query_port_sm_guid(port: InfinibandPort, index: int, found: dict) -> None:
+    """Puts the port's SM GUID in found[index] when the port is active InfiniBand and its SM answers."""
+    if port.link_layer.lower() != "infiniband" or not port.state.upper().endswith("ACTIVE"):
+        return
+    try:
+        sm_lid = int(port.sm_lid, 16)
+        umad_path = umad_device_of(port.device, port.port)
+        if sm_lid and umad_path:
+            found[index] = query_sm_guid(umad_path, sm_lid)
+    except Exception:
+        pass
+
+
+def join_all(workers: list) -> None:
+    for worker in workers:
+        worker.join()
 
 
 def fill_sm_guids(ports: list[InfinibandPort]) -> None:
-    """Sets sm_guid on every active InfiniBand port whose SM answers, within SM_GUID_QUERY_BUDGET_SECONDS."""
-    # module-level target, not a nested def: the obfuscator renames a call's Name but not a nested def's own name
-    worker = threading.Thread(target=query_sm_guids, args=(ports,), daemon=True)
-    worker.start()
-    worker.join(SM_GUID_QUERY_BUDGET_SECONDS)
+    """Sets sm_guid on every active InfiniBand port whose SM answers within SM_GUID_QUERY_BUDGET_SECONDS."""
+    # one thread per port, so a port whose SM never answers cannot keep the others from being asked;
+    # module-level targets, not nested defs: the obfuscator renames a call's Name but not a nested def's own name
+    found: dict = {}
+    workers = [
+        threading.Thread(target=query_port_sm_guid, args=(port, index, found), daemon=True)
+        for index, port in enumerate(ports)
+    ]
+    for worker in workers:
+        worker.start()
+    waiter = threading.Thread(target=join_all, args=(workers,), daemon=True)
+    waiter.start()
+    waiter.join(SM_GUID_QUERY_BUDGET_SECONDS)
+    answered = dict(found)  # a port answering after the budget is left out, not written in later
+    for index, port in enumerate(ports):
+        port.sm_guid = answered.get(index, "")
 
 
 class InfinibandObservation:
