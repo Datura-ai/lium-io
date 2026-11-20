@@ -55,6 +55,9 @@ CREATE_DISPATCH_ORDER_PREFIX = "create_dispatch_order:"
 CREATE_DISPATCH_ORDER_TTL_SECONDS = 24 * 3600
 CREATE_DISPATCH_ORDER_KEPT = 20
 BACKEND_COMMAND_PREFIX = "backend_command:"
+# pod_id|executor_id -> command IDs of that pod's creates on that node whose records may still be kept, so a delete
+# settles them without scanning every command record
+BACKEND_CREATES_OF_POD_PREFIX = "backend_creates_of_pod:"
 # DAH-5592: a create's replies that failed it for a host fault (the backend stops billing on these), by command id; sent
 # again on every backend socket for HOST_FAULT_FAILURE_RESEND_SECONDS, since one the backend lost (its database and
 # broker down, then a restart) is not otherwise sent again. The backend ignores a copy of one it already has.
@@ -309,9 +312,9 @@ class _CommandLock:
 class BackendCommand(BaseModel):
     state: Literal["running", "finished"]
     owner: str = ""
-    # a create's record never expires on its own: the backend may resend a create for as long as the pod is pending, so
-    # only its receipt or a delete of the pod on that node (settle_backend_command*) starts the answer's lifetime, and a
-    # connector restart releases only the claims of creates it asks to be resent
+    # a create that made a container keeps its record until its receipt or a delete of the pod on that node
+    # (settle_backend_command*): the backend may resend it for as long as the pod is pending. On start the restart
+    # sweep releases each running create claim whose pod has no container in use
     create: bool = False
     pod_id: str = ""
     executor_id: str = ""
@@ -328,8 +331,6 @@ class InflightBackendCreate(BaseModel):
     # DAH-5437: how many connector restarts this create has already been resumed after. The request itself is never
     # stored (it carries the renter's environment and credentials); the backend re-sends it from its own records.
     resumes: int = 0
-    # the backend command the create runs under; the backend's re-send keeps it, so a resume releases its claim
-    command_id: str = ""
 
 
 def _inflight_create_field(pod_id: str, create_id: str) -> str:
@@ -1240,13 +1241,28 @@ class RedisService:
 
     async def settle_backend_creates_of_pod(self, pod_id: str, executor_id: str, ttl: int) -> None:
         """A delete of the pod on that node cancels its creates: the backend never resends one of them."""
+        index = f"{BACKEND_CREATES_OF_POD_PREFIX}{pod_id}|{executor_id}"
+        for command_id in await self.redis.smembers(index):
+            await self.redis.expire(f"{BACKEND_COMMAND_PREFIX}{command_id}", ttl)
+        await self.redis.delete(index)
+
+    async def index_backend_create(self, pod_id: str, executor_id: str, command_id: str) -> None:
+        await self.redis.sadd(f"{BACKEND_CREATES_OF_POD_PREFIX}{pod_id}|{executor_id}", command_id)
+
+    async def unindex_backend_create(self, pod_id: str, executor_id: str, command_id: str) -> None:
+        await self.redis.srem(f"{BACKEND_CREATES_OF_POD_PREFIX}{pod_id}|{executor_id}", command_id)
+
+    async def running_create_claims(self) -> dict[str, BackendCommand]:
+        """command ID -> running create claim (on start, every one is a cut-off run's)"""
+        claims: dict[str, BackendCommand] = {}
         async for key in self.redis.scan_iter(match=f"{BACKEND_COMMAND_PREFIX}*", count=100):
             value = await self.redis.get(key)
             if value is None:
                 continue
             command = BackendCommand.model_validate_json(value)
-            if command.create and command.pod_id == pod_id and command.executor_id == executor_id:
-                await self.redis.expire(key, ttl)
+            if command.create and command.state == "running":
+                claims[key.removeprefix(BACKEND_COMMAND_PREFIX)] = command
+        return claims
 
     async def update_backend_command(
         self, command_id: str, claim: str, value: str, ttl: int
@@ -1273,7 +1289,7 @@ class RedisService:
         )
 
     async def clear_running_backend_commands(self) -> None:
-        """A create's claim stays: its outcome is unknown, and only the restart sweep knows which ones are resent."""
+        """A create's claim stays: the restart sweep decides it (fail_creates_cut_off_by_restart)."""
         async for key in self.redis.scan_iter(match=f"{BACKEND_COMMAND_PREFIX}*", count=100):
             value = await self.redis.get(key)
             if value is None:
@@ -1296,7 +1312,6 @@ class RedisService:
         workload_kind: WorkloadKind,
         create_id: str = "",
         resumes: int = 0,
-        command_id: str = "",
     ) -> None:
         create = InflightBackendCreate(
             miner_hotkey=miner_hotkey,
@@ -1305,7 +1320,6 @@ class RedisService:
             started_at_unix_seconds=int(time.time()),
             create_id=create_id,
             resumes=resumes,
-            command_id=command_id,
         )
         await self.hset(INFLIGHT_BACKEND_CREATES_KEY, _inflight_create_field(pod_id, create_id), create.model_dump_json())
 

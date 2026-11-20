@@ -74,6 +74,15 @@ class FakeRedis:
         for field in fields:
             self.values.get(key, ({}, 0))[0].pop(field, None)
 
+    async def sadd(self, key, member):
+        self.values.setdefault(key, (set(), float("inf")))[0].add(member)
+
+    async def srem(self, key, member):
+        self.values.get(key, (set(), 0))[0].discard(member)
+
+    async def smembers(self, key):
+        return set(self.values.get(key, (set(), 0))[0])
+
     async def scan_iter(self, *, match, count):
         for key in list(self.values):
             if fnmatch(key, match):
@@ -571,3 +580,20 @@ async def test_a_create_resent_long_after_any_bound_still_replays_until_a_receip
     )
     key = BACKEND_COMMAND_PREFIX + "command"
     assert service.redis.values[key][1] == service.redis.now + settings.BACKEND_COMMAND_ANSWER_TTL_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_a_failed_create_is_answered_like_any_command_and_leaves_no_kept_record(client):
+    """The backend sends no receipt for a failed create: its answer expires with the ordinary TTL, and it leaves the
+    pod's index, so failures never accumulate kept records."""
+    service = client.miner_service.redis_service
+    failure = FailedContainerRequest(
+        miner_hotkey="miner", executor_id="executor", pod_id="pod", msg="failed",
+        error_type=FailedContainerErrorTypes.ContainerCreationFailed,
+    )
+    client.miner_service.handle_container.return_value = failure
+    await client.miner_driver(request())
+    assert service.redis.values[BACKEND_COMMAND_PREFIX + "command"][1] == (
+        service.redis.now + settings.BACKEND_COMMAND_ANSWER_TTL_SECONDS
+    )
+    assert await service.redis.smembers("backend_creates_of_pod:pod|executor") == set()

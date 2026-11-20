@@ -25,6 +25,7 @@ from payload_models.payloads import (
     BaseValidatorResponse,
     ContainerCreateRequest,
     ContainerDeleteRequest,
+    ContainerResponseType,
     ContainerStartRequest,
     ContainerStopRequest,
     AddSshPublicKeyRequest,
@@ -144,6 +145,11 @@ def mark_connector_unready() -> None:
 
 
 command_responses: ContextVar[list[str] | None] = ContextVar("command_responses", default=None)
+# (pod_id, create_id) of a create run under a command claim: its in-flight record is removed only once the claim's
+# outcome is written, so a restart always finds one of the two and never a claim nothing recovers
+deferred_create_retirements: ContextVar[list[tuple[str, str]] | None] = ContextVar(
+    "deferred_create_retirements", default=None
+)
 
 
 # lium-io#1952: retries of a create's dispatch record that failed in the receive loop, before the create gives up
@@ -1086,6 +1092,8 @@ class ComputeClient:
         try:
             # a create's record lasts until the backend cannot resend it (its receipt or a delete of the pod): any
             # lifetime of its own, a claim's or an answer's, would end while a same-ID resend can still arrive
+            if create:   # indexed first: an entry without a record is harmless, a record no delete can find is not
+                await redis_service.index_backend_create(job_request.pod_id, job_request.executor_id, command_id)
             existing = await redis_service.claim_backend_command(command_id, claim, persist=create)
         except Exception:
             logger.exception(_m(
@@ -1102,6 +1110,8 @@ class ComputeClient:
 
         responses: list[str] = []
         token = command_responses.set(responses)
+        retirements: list[tuple[str, str]] = []
+        retirements_token = deferred_create_retirements.set(retirements if create else None)
         heartbeat = None if create else asyncio.create_task(self._refresh_backend_command(command_id, claim))
         succeeded = False
         try:
@@ -1110,6 +1120,7 @@ class ComputeClient:
             return result
         finally:
             command_responses.reset(token)
+            deferred_create_retirements.reset(retirements_token)
             if heartbeat is not None:
                 heartbeat.cancel()
                 with suppress(asyncio.CancelledError):
@@ -1120,7 +1131,13 @@ class ComputeClient:
                 if succeeded or responses
                 else ""
             )
-            ttl = 0 if create else settings.BACKEND_COMMAND_ANSWER_TTL_SECONDS
+            # only a create that made a container is kept until its receipt or a delete: a re-run would replace it.
+            # A failed one is answered like any command: the backend gets no receipt for it, and a later re-run of a
+            # create that made nothing is the retry the backend asked for
+            kept = create and any(
+                json.loads(raw).get("message_type") == ContainerResponseType.ContainerCreated.value for raw in responses
+            )
+            ttl = 0 if kept else settings.BACKEND_COMMAND_ANSWER_TTL_SECONDS
             # until the outcome is written a re-send is only ignored, never answered; the write compares the claim,
             # so once the claim is gone (released or expired) it is a no-op and the loop ends
             while True:
@@ -1130,6 +1147,11 @@ class ComputeClient:
                 except Exception:
                     logger.exception("Failed to finish backend command, retrying: %s", command_id)
                     await asyncio.sleep(BACKEND_CREATE_TRACKING_RETRY_SECONDS)
+            for pod_id, create_id in retirements:
+                await self._retire_backend_create_record(pod_id, create_id)
+            if create and not kept:
+                with suppress(Exception):   # a left entry only costs the pod's delete one no-op expire
+                    await redis_service.unindex_backend_create(job_request.pod_id, job_request.executor_id, command_id)
 
     async def _handle_backend_command_duplicate(
         self, job_request: BaseServerRequest, existing: BackendCommand
@@ -1223,7 +1245,6 @@ class ComputeClient:
                     job_request.workload_kind,
                     create_id,
                     resumes=resumes,
-                    command_id=job_request.command_id or "",
                 )
 
             retrying = None
@@ -1237,7 +1258,10 @@ class ComputeClient:
                 if retrying is not None:
                     retrying.cancel()
                     await asyncio.wait({retrying})
-                await self._retire_backend_create_record(pod_id, create_id)
+                if (later := deferred_create_retirements.get()) is not None:
+                    later.append((pod_id, create_id))   # retired by miner_driver once the outcome is written
+                else:
+                    await self._retire_backend_create_record(pod_id, create_id)
                 if inflight_creates.is_only_create(pod_id):
                     self.deleted_pod_ids.discard((pod_id, executor))
 
@@ -1475,8 +1499,17 @@ class ComputeClient:
         Reports are queued only once the whole sweep succeeded, so a retried sweep never sends one twice."""
         redis_service = self.miner_service.redis_service
         creates = await redis_service.inflight_backend_creates()
-        unacked = await redis_service.unacked_container_created() if creates else {}
-        rented_pod_ids = await redis_service.rented_pod_ids() if creates else frozenset()
+        claims = await redis_service.running_create_claims()
+        unacked = await redis_service.unacked_container_created() if creates or claims else {}
+        rented_pod_ids = await redis_service.rented_pod_ids() if creates or claims else frozenset()
+        for command_id, claim in claims.items():
+            # no create runs yet, so each running claim is a cut-off run's. A container in use (rented, or a saved
+            # success the reconnect replays) keeps it; otherwise the backend's same-ID resend must run, not be ignored
+            if claim.pod_id in rented_pod_ids or (
+                claim.pod_id in unacked and await self._replayable_success(claim.pod_id, unacked[claim.pod_id])
+            ):
+                continue
+            await redis_service.release_backend_command(command_id)
         resumed: list[str] = []
         reports: list[tuple[FailedContainerRequest, InflightBackendCreate]] = []
         reported_create_ids: dict[str, list[str]] = {}
@@ -1514,11 +1547,7 @@ class ComputeClient:
                     create.workload_kind,
                     create.create_id,
                     resumes=create.resumes + 1,
-                    command_id=create.command_id,
                 )
-                if create.command_id:
-                    # the backend re-sends it under the same command ID; its claim is the cut-off run's
-                    await redis_service.release_backend_command(create.command_id)
                 for other in pod_creates:
                     if other.create_id != create.create_id:
                         await self._retire_backend_create_record(pod_id, other.create_id)
@@ -1736,6 +1765,9 @@ class ComputeClient:
                 # the backend no longer resends this create: its answer is kept only as long as any other command's
                 await self.miner_service.redis_service.settle_backend_command(
                     job_request.create_command_id, settings.BACKEND_COMMAND_ANSWER_TTL_SECONDS
+                )
+                await self.miner_service.redis_service.unindex_backend_create(
+                    job_request.pod_id, job_request.executor_id, job_request.create_command_id
                 )
         elif isinstance(job_request, GetPodLogsRequestFromServer):
             job_request.miner_address = miner_axon_info.ip

@@ -537,9 +537,7 @@ async def test_the_redis_record_of_a_create_holds_ids_and_counters_only() -> Non
         "started_at_unix_seconds",
         "create_id",
         "resumes",
-        "command_id",
     }
-    assert record["command_id"] == "cmd-1"
     for secret in ("registry-pw", "env-secret", "sk-1", "HF_TOKEN", "environment", "docker_password"):
         assert secret not in stored_raw[0]
 
@@ -1563,17 +1561,19 @@ async def test_a_cut_off_create_lock_release_that_redis_fails_is_logged_not_rais
 
 
 @pytest.mark.asyncio
-async def test_a_restart_keeps_an_unresolved_create_claim_and_releases_it_only_for_the_resend_it_asks_for() -> None:
-    """A create's claim survives the restart (its outcome is unknown, so a resend must not run it); the sweep releases
-    it only for a create it asks the backend to send again under the same command ID."""
+@pytest.mark.parametrize("in_flight_record", [True, False])
+async def test_a_restart_releases_a_cut_off_create_claim_unless_its_pod_has_a_container_in_use(in_flight_record) -> None:
+    """On start no create runs, so every running create claim is a cut-off run's, with or without an in-flight record
+    (a crash between the claim and the record leaves none): the resend of one whose pod has no container in use must
+    run, and a rented pod's claim stays so a resend never replaces its container."""
     redis_service = _redis_service()
-    for command_id in ("cmd-1", "cmd-kept"):
-        claim = BackendCommand(state="running", owner=command_id, create=True).model_dump_json()
-        assert await redis_service.claim_backend_command(command_id, claim, 3600) is None
+    for command_id, pod_id in (("cmd-1", "pod-1"), ("cmd-rented", "pod-rented")):
+        claim = BackendCommand(state="running", owner=command_id, create=True, pod_id=pod_id, executor_id="exec-1")
+        assert await redis_service.claim_backend_command(command_id, claim.model_dump_json(), persist=True) is None
     await redis_service.claim_backend_command("cmd-other", BackendCommand(state="running").model_dump_json())
-    await redis_service.add_inflight_backend_create(
-        "pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER, "c1", command_id="cmd-1"
-    )
+    if in_flight_record:
+        await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER, "c1")
+    redis_service.rented_pod_ids = AsyncMock(return_value=frozenset({"pod-rented"}))
     client = _client(redis_service)
 
     await redis_service.clear_running_backend_commands()
@@ -1581,7 +1581,31 @@ async def test_a_restart_keeps_an_unresolved_create_claim_and_releases_it_only_f
     assert await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-1") is not None
     await client.fail_creates_cut_off_by_restart()
 
-    assert client.resumed_creates_report.pod_ids == ["pod-1"]
-    assert await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-1") is None
-    assert await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-kept") is not None
-    assert [c.command_id for c in (await redis_service.inflight_backend_creates())["pod-1"]] == ["cmd-1"]
+    assert await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-1") is None   # its resend runs
+    assert await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-rented") is not None
+    assert (client.resumed_creates_report.pod_ids if in_flight_record else None) == (
+        ["pod-1"] if in_flight_record else None
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_create_under_a_command_claim_keeps_its_in_flight_record_until_its_outcome_is_written() -> None:
+    """A restart must find the claim's outcome or the in-flight record, never neither."""
+    redis_service = _redis_service()
+    client = _client(redis_service)
+    client.get_miner_axon_info = AsyncMock()
+    client.lock = asyncio.Lock()
+    client._accept_create_dispatch = AsyncMock(return_value=True)
+    client._drive_miner_job = AsyncMock()
+    seen: list[dict] = []
+    update = redis_service.update_backend_command
+
+    async def spy(command_id, claim, value, ttl):
+        seen.append(await redis_service.inflight_backend_creates())
+        await update(command_id, claim, value, ttl)
+
+    redis_service.update_backend_command = spy
+    await client.miner_driver(_create_request())
+
+    assert len(seen) == 1 and list(seen[0]) == ["pod-1"]
+    assert await redis_service.inflight_backend_creates() == {}
