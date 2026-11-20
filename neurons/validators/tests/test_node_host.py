@@ -225,6 +225,88 @@ async def test_http_request_to_a_name_with_a_private_address_is_never_sent(monke
             await session.get("http://gpu-node1.example.net:8080/")
 
 
+async def _local_server(hits: list, redirect_to: str | None = None) -> tuple[web.AppRunner, int]:
+    """A loopback HTTP server that counts its requests and, given ``redirect_to``, redirects there."""
+
+    async def handler(request):
+        hits.append(request.path)
+        if redirect_to:
+            raise web.HTTPFound(redirect_to)
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    return runner, site._server.sockets[0].getsockname()[1]
+
+
+@pytest.mark.asyncio
+async def test_http_request_to_a_non_public_ip_literal_is_never_sent():
+    """aiohttp dials an IP literal without asking the resolver; the connector itself refuses it."""
+    hits: list = []
+    runner, port = await _local_server(hits)
+    try:
+        async with aiohttp.ClientSession(connector=public_host_connector()) as session:
+            with pytest.raises(aiohttp.ClientConnectorError) as refused:
+                await session.get(f"http://127.0.0.1:{port}/version", allow_redirects=False)
+    finally:
+        await runner.cleanup()
+    assert isinstance(refused.value.os_error, NodeHostError)
+    assert hits == []
+
+
+def _public_only_at(monkeypatch, node_port: int) -> None:
+    """127.0.0.1 at ``node_port`` stands in for a public node; every other address keeps the real rule."""
+    real = node_host._check_literal
+    monkeypatch.setattr(
+        node_host, "_check_literal", lambda host, port: None if port == node_port else real(host, port)
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_node_that_redirects_to_a_non_public_ip_literal_is_not_followed(monkeypatch):
+    target_hits: list = []
+    target, target_port = await _local_server(target_hits)
+    node_hits: list = []
+    node, node_port = await _local_server(node_hits, redirect_to=f"http://127.0.0.1:{target_port}/")
+    _public_only_at(monkeypatch, node_port)
+    try:
+        async with aiohttp.ClientSession(connector=public_host_connector()) as session:
+            with pytest.raises(aiohttp.ClientConnectorError) as refused:
+                await session.get(f"http://127.0.0.1:{node_port}/")  # redirects followed, as by default
+    finally:
+        await node.cleanup()
+        await target.cleanup()
+    assert isinstance(refused.value.os_error, NodeHostError)
+    assert node_hits == ["/"]
+    assert target_hits == []
+
+
+@pytest.mark.asyncio
+async def test_the_port_probe_does_not_follow_a_redirect():
+    from neurons.validators.src.services.executor_connectivity.models import PortPair
+    from neurons.validators.src.services.executor_connectivity.port_tester import PortTester
+
+    target_hits: list = []
+    target, target_port = await _local_server(target_hits)
+    node_hits: list = []
+    node, node_port = await _local_server(node_hits, redirect_to=f"http://127.0.0.1:{target_port}/")
+    try:
+        async with aiohttp.ClientSession() as session:  # no connector rule: the probe's own setting alone
+            ok = await PortTester().test_one(
+                session, "127.0.0.1", PortPair(internal=1, external=node_port), "token"
+            )
+    finally:
+        await node.cleanup()
+        await target.cleanup()
+    assert not ok
+    assert node_hits == ["/"]
+    assert target_hits == []
+
+
 def _logged(caplog, level):
     return [(r.getMessage(), r.msg.extra) for r in caplog.records if r.levelno == level]
 
