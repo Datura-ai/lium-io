@@ -657,20 +657,37 @@ async def test_a_portal_that_sends_no_notice_map_keeps_the_failed_read_enforced(
     ("setup", "ok", "output"),
     [
         ("missing", True, "hotkey=hk\nclaim=\n"),
+        ("no-directory", True, "hotkey=\nclaim=\n"),
         ("empty", True, "hotkey=hk\nclaim=\n"),
         ("unreadable", False, ""),
+        ("io-error", False, ""),
     ],
 )
-def test_the_account_read_command_fails_only_on_an_unreadable_file(tmp_path, setup, ok, output):
-    """The real command under sh: a claim file that exists but cannot be read fails the read (NODE_ACCOUNT_UNVERIFIED
-    path) instead of reading as an empty claim; a missing or empty one still reads as no claim."""
-    (tmp_path / "miner_hotkey").write_text("hk\n")
-    claim = tmp_path / "account_claim"
+def test_the_account_read_command_reads_empty_only_for_a_file_that_is_not_there(tmp_path, setup, ok, output):
+    """The real command under sh: only a file (or directory) that is not there reads as no claim. Any other failure, in
+    the lookup or the read (an I/O error), fails the read (NODE_ACCOUNT_UNVERIFIED path) instead of reading as an
+    empty claim."""
+    host = tmp_path / "liumd"
+    path = {"PATH": "/usr/bin:/bin"}
+    if setup != "no-directory":
+        host.mkdir()
+        (host / "miner_hotkey").write_text("hk\n")
+    claim = host / "account_claim"
     if setup == "empty":
         claim.write_text("")
     elif setup == "unreadable":
-        claim.mkdir()  # cat fails on it even as root, as an I/O error would
-    command = READ_NODE_ACCOUNT_COMMAND.replace("/etc/liumd/", f"{tmp_path}/")
-    run = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
+        claim.mkdir()  # cat fails on it even as root
+    elif setup == "io-error":
+        claim.write_text("claim\n")
+        stub = tmp_path / "bin"
+        stub.mkdir()
+        (stub / "cat").write_text(
+            '#!/bin/sh\ncase "$1" in *account_claim) echo "cat: $1: Input/output error" >&2; exit 1;; esac\n'
+            'exec /bin/cat "$@"\n'
+        )
+        (stub / "cat").chmod(0o755)
+        path = {"PATH": f"{stub}:/usr/bin:/bin"}
+    command = READ_NODE_ACCOUNT_COMMAND.replace("/etc/liumd/", f"{host}/")
+    run = subprocess.run(["sh", "-c", command], capture_output=True, text=True, env=path)
     assert (run.returncode == 0) is ok
     assert run.stdout == output

@@ -41,12 +41,13 @@ from .enforcement import enforced, fresh, reported_only
 
 logger = get_logger(__name__)
 
-# fixed text, no node-supplied value; `$(...)` drops the trailing newline the executor writes. A missing file reads as
-# empty (an older executor); a file that exists but cannot be read fails the command, so it is an unverified read and
-# never an empty claim
+# fixed text, no node-supplied value; `$(...)` drops the trailing newline the executor writes. Only a file that is not
+# there (cat's ENOENT, under the C locale) reads as empty (an older executor); any other failure, in the lookup or the
+# read, fails the command, so it is an unverified read and never an empty claim
 READ_NODE_ACCOUNT_COMMAND = (
-    "h=$([ ! -e /etc/liumd/miner_hotkey ] || cat /etc/liumd/miner_hotkey 2>/dev/null) && "
-    "c=$([ ! -e /etc/liumd/account_claim ] || cat /etc/liumd/account_claim 2>/dev/null) && "
+    "r() { o=$(LC_ALL=C cat \"$1\" 2>&1) && { printf '%s' \"$o\"; return 0; }; "
+    "case $o in *': No such file or directory') return 0;; esac; return 1; }; "
+    "h=$(r /etc/liumd/miner_hotkey) && c=$(r /etc/liumd/account_claim) && "
     "printf 'hotkey=%s\\nclaim=%s\\n' \"$h\" \"$c\""
 )
 READ_TIMEOUT_SECONDS = 15
