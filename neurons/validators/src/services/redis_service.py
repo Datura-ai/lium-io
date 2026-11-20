@@ -309,6 +309,8 @@ class _CommandLock:
 class BackendCommand(BaseModel):
     state: Literal["running", "finished"]
     owner: str = ""
+    # a create's claim outlives a connector restart: the restart sweep releases only the ones it asks to be resent
+    create: bool = False
     responses: list[str] = []
 
 
@@ -322,6 +324,8 @@ class InflightBackendCreate(BaseModel):
     # DAH-5437: how many connector restarts this create has already been resumed after. The request itself is never
     # stored (it carries the renter's environment and credentials); the backend re-sends it from its own records.
     resumes: int = 0
+    # the backend command the create runs under; the backend's re-send keeps it, so a resume releases its claim
+    command_id: str = ""
 
 
 def _inflight_create_field(pod_id: str, create_id: str) -> str:
@@ -1211,11 +1215,13 @@ class RedisService:
             return
         await self.remove_unacked_container_created(pod_id, saved)
 
-    async def claim_backend_command(self, command_id: str, claim: str) -> BackendCommand | None:
+    async def claim_backend_command(
+        self, command_id: str, claim: str, ttl: int | None = None
+    ) -> BackendCommand | None:
         key = f"{BACKEND_COMMAND_PREFIX}{command_id}"
         while True:
             if await self.redis.set(
-                key, claim, nx=True, ex=settings.BACKEND_COMMAND_CLAIM_TTL_SECONDS
+                key, claim, nx=True, ex=ttl or settings.BACKEND_COMMAND_CLAIM_TTL_SECONDS
             ):
                 return None
             existing = await self.redis.get(key)
@@ -1258,10 +1264,20 @@ class RedisService:
         )
 
     async def clear_running_backend_commands(self) -> None:
+        """A create's claim stays: its outcome is unknown, and only the restart sweep knows which ones are resent."""
         async for key in self.redis.scan_iter(match=f"{BACKEND_COMMAND_PREFIX}*", count=100):
             value = await self.redis.get(key)
-            if value is not None and BackendCommand.model_validate_json(value).state == "running":
+            if value is None:
+                continue
+            command = BackendCommand.model_validate_json(value)
+            if command.state == "running" and not command.create:
                 await self.redis.delete(key)
+
+    async def release_backend_command(self, command_id: str) -> None:
+        """Drops a running claim (a finished answer stays) so the backend's re-send of that command runs."""
+        stored = await self.redis.get(f"{BACKEND_COMMAND_PREFIX}{command_id}")
+        if stored is not None and BackendCommand.model_validate_json(stored).state == "running":
+            await self.update_backend_command(command_id, stored, "", 0)
 
     async def add_inflight_backend_create(
         self,
@@ -1271,6 +1287,7 @@ class RedisService:
         workload_kind: WorkloadKind,
         create_id: str = "",
         resumes: int = 0,
+        command_id: str = "",
     ) -> None:
         create = InflightBackendCreate(
             miner_hotkey=miner_hotkey,
@@ -1279,6 +1296,7 @@ class RedisService:
             started_at_unix_seconds=int(time.time()),
             create_id=create_id,
             resumes=resumes,
+            command_id=command_id,
         )
         await self.hset(INFLIGHT_BACKEND_CREATES_KEY, _inflight_create_field(pod_id, create_id), create.model_dump_json())
 

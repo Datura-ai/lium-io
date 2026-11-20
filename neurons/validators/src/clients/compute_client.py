@@ -1074,9 +1074,14 @@ class ComputeClient:
             return await self._run_miner_job(job_request)
         command_id = job_request.command_id
         redis_service = self.miner_service.redis_service
-        claim = BackendCommand(state="running", owner=uuid4().hex).model_dump_json()
+        create = isinstance(job_request, ContainerCreateRequest)
+        claim = BackendCommand(state="running", owner=uuid4().hex, create=create).model_dump_json()
         try:
-            existing = await redis_service.claim_backend_command(command_id, claim)
+            # a create's claim lasts as long as its answer may be needed: with Redis or the heartbeat unavailable, a
+            # 60-second claim would expire while the create's outcome is unknown and let a re-send run it again
+            existing = await redis_service.claim_backend_command(
+                command_id, claim, settings.BACKEND_CREATE_ANSWER_MAX_SECONDS if create else None
+            )
         except Exception:
             logger.exception(_m(
                 "Backend command dedup failed open",
@@ -1092,7 +1097,7 @@ class ComputeClient:
 
         responses: list[str] = []
         token = command_responses.set(responses)
-        heartbeat = asyncio.create_task(self._refresh_backend_command(command_id, claim))
+        heartbeat = None if create else asyncio.create_task(self._refresh_backend_command(command_id, claim))
         succeeded = False
         try:
             result = await self._run_miner_job(job_request)
@@ -1100,26 +1105,26 @@ class ComputeClient:
             return result
         finally:
             command_responses.reset(token)
-            heartbeat.cancel()
-            with suppress(asyncio.CancelledError):
-                await heartbeat
+            if heartbeat is not None:
+                heartbeat.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat
             # A failure without any answer releases the claim so a retry can run.
             value = (
                 BackendCommand(state="finished", responses=responses).model_dump_json()
                 if succeeded or responses
                 else ""
             )
-            try:
-                await redis_service.update_backend_command(
-                    command_id,
-                    claim,
-                    value,
-                    settings.BACKEND_CREATE_ANSWER_MAX_SECONDS
-                    if isinstance(job_request, ContainerCreateRequest)
-                    else settings.BACKEND_COMMAND_ANSWER_TTL_SECONDS,
-                )
-            except Exception:
-                logger.exception("Failed to finish backend command: %s", command_id)
+            ttl = settings.BACKEND_CREATE_ANSWER_MAX_SECONDS if create else settings.BACKEND_COMMAND_ANSWER_TTL_SECONDS
+            # until the outcome is written a re-send is only ignored, never answered; the write compares the claim,
+            # so once the claim is gone (released or expired) it is a no-op and the loop ends
+            while True:
+                try:
+                    await redis_service.update_backend_command(command_id, claim, value, ttl)
+                    break
+                except Exception:
+                    logger.exception("Failed to finish backend command, retrying: %s", command_id)
+                    await asyncio.sleep(BACKEND_CREATE_TRACKING_RETRY_SECONDS)
 
     async def _handle_backend_command_duplicate(
         self, job_request: BaseServerRequest, existing: BackendCommand
@@ -1207,6 +1212,7 @@ class ComputeClient:
                     job_request.workload_kind,
                     create_id,
                     resumes=resumes,
+                    command_id=job_request.command_id or "",
                 )
 
             retrying = None
@@ -1497,7 +1503,11 @@ class ComputeClient:
                     create.workload_kind,
                     create.create_id,
                     resumes=create.resumes + 1,
+                    command_id=create.command_id,
                 )
+                if create.command_id:
+                    # the backend re-sends it under the same command ID; its claim is the cut-off run's
+                    await redis_service.release_backend_command(create.command_id)
                 for other in pod_creates:
                     if other.create_id != create.create_id:
                         await self._retire_backend_create_record(pod_id, other.create_id)

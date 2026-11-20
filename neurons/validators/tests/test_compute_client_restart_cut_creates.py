@@ -25,9 +25,11 @@ from payload_models.payloads import (
 from protocol.vc_protocol.compute_requests import Response
 import services.redis_service as redis_service_module
 from services.redis_service import (
+    BACKEND_COMMAND_PREFIX,
     GPU_CLOCKS_PENDING_KIND,
     GPU_RESET_PENDING_KIND,
     PENDING_PODS_PREFIX,
+    BackendCommand,
     InflightBackendCreate,
     RedisService,
     create_started_at_key,
@@ -42,7 +44,12 @@ class _FakeRedis(FakeRedis):
     def __init__(self, server: FakeServer | None = None) -> None:
         super().__init__(server=server or FakeServer(), decode_responses=True)
 
-    async def eval(self, script: str, numkeys: int, key: str, field: str, expected: str) -> int:
+    async def eval(self, script: str, numkeys: int, key: str, field: str, expected: str, ttl: int = 0) -> int:
+        if key.startswith(BACKEND_COMMAND_PREFIX):  # update_backend_command: (claim, value, ttl) on a string key
+            claim, value = field, expected
+            if await self.get(key) != claim:
+                return 0
+            return await (self.set(key, value, ex=ttl) if value else self.delete(key))
         # HDEL the field only while it still holds `expected`
         assert "HDEL" in script and numkeys == 1
         if await self.hget(key, field) != expected:
@@ -528,7 +535,9 @@ async def test_the_redis_record_of_a_create_holds_ids_and_counters_only() -> Non
         "started_at_unix_seconds",
         "create_id",
         "resumes",
+        "command_id",
     }
+    assert record["command_id"] == "cmd-1"
     for secret in ("registry-pw", "env-secret", "sk-1", "HF_TOKEN", "environment", "docker_password"):
         assert secret not in stored_raw[0]
 
@@ -1549,3 +1558,28 @@ async def test_a_cut_off_create_lock_release_that_redis_fails_is_logged_not_rais
     redis_service.redis.pipeline = lambda **_: _PipelineOnADownRedis()
 
     await redis_service.release_cut_off_create_lock("exec-1", "pod-1")
+
+
+@pytest.mark.asyncio
+async def test_a_restart_keeps_an_unresolved_create_claim_and_releases_it_only_for_the_resend_it_asks_for() -> None:
+    """A create's claim survives the restart (its outcome is unknown, so a resend must not run it); the sweep releases
+    it only for a create it asks the backend to send again under the same command ID."""
+    redis_service = _redis_service()
+    for command_id in ("cmd-1", "cmd-kept"):
+        claim = BackendCommand(state="running", owner=command_id, create=True).model_dump_json()
+        assert await redis_service.claim_backend_command(command_id, claim, 3600) is None
+    await redis_service.claim_backend_command("cmd-other", BackendCommand(state="running").model_dump_json())
+    await redis_service.add_inflight_backend_create(
+        "pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER, "c1", command_id="cmd-1"
+    )
+    client = _client(redis_service)
+
+    await redis_service.clear_running_backend_commands()
+    assert await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-other") is None
+    assert await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-1") is not None
+    await client.fail_creates_cut_off_by_restart()
+
+    assert client.resumed_creates_report.pod_ids == ["pod-1"]
+    assert await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-1") is None
+    assert await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-kept") is not None
+    assert [c.command_id for c in (await redis_service.inflight_backend_creates())["pod-1"]] == ["cmd-1"]

@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import clients.compute_client as compute_client_module
 from clients.compute_client import ComputeClient, OutgoingMessages
 from core.config import settings
 from payload_models.payloads import (
@@ -118,9 +119,7 @@ def request(command_id="command"):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("heartbeat_error", [False, True])
-async def test_create_duplicates_during_and_after_long_job(client, caplog, heartbeat_error):
-    client.miner_service.redis_service.redis.fail_refresh = heartbeat_error
+async def test_create_duplicates_during_and_after_long_job(client, caplog):
     started, finish = asyncio.Event(), asyncio.Event()
     response = client.miner_service.handle_container.return_value
 
@@ -138,10 +137,8 @@ async def test_create_duplicates_during_and_after_long_job(client, caplog, heart
             await client.miner_driver(request())
         assert "Ignoring running backend command duplicate" in caplog.text
         assert client.message_queue == []
-        for _ in range(5):
-            redis.now += 1
-            await asyncio.wait_for(redis.refreshed.wait(), 1)
-            redis.refreshed.clear()
+        # far past the 60-second claim of other commands, with no heartbeat: a create's claim needs none
+        redis.now += 100 * settings.BACKEND_COMMAND_CLAIM_TTL_SECONDS
         await client.miner_driver(request())
         assert client.message_queue == []
     finally:
@@ -232,11 +229,14 @@ async def test_redis_failure_fails_open(client, monkeypatch, operation):
             return False
 
         monkeypatch.setattr(service.redis, "set", retried_set)
-    else:
-        monkeypatch.setattr(service, operation, AsyncMock(side_effect=ConnectionError))
+    else:  # a failed finish write is retried until it lands
+        monkeypatch.setattr(compute_client_module, "BACKEND_CREATE_TRACKING_RETRY_SECONDS", 0)
+        monkeypatch.setattr(service, operation, AsyncMock(side_effect=[ConnectionError, None]))
     await client.miner_driver(request())
     assert client.miner_service.handle_container.await_count == 1
     assert len(client.message_queue) == 1
+    if operation == "update_backend_command":
+        assert service.update_backend_command.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -516,3 +516,32 @@ async def test_the_receipt_ends_a_create_answer_like_any_other(client, monkeypat
     ))
 
     assert service.redis.values[key][1] == service.redis.now + settings.BACKEND_COMMAND_ANSWER_TTL_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_a_create_whose_finish_write_is_lost_is_never_run_again_by_a_resend(client, monkeypatch):
+    redis = client.miner_service.redis_service.redis
+    response = client.miner_service.handle_container.return_value
+    monkeypatch.setattr(compute_client_module, "BACKEND_CREATE_TRACKING_RETRY_SECONDS", 0)
+    real_eval, lost = redis.eval, asyncio.Event()
+    resent = asyncio.Event()
+
+    async def eval_(script, numkeys, key, claim, value, ttl):
+        if '"finished"' in value and not resent.is_set():
+            lost.set()
+            await asyncio.sleep(0)
+            raise ConnectionError("redis unavailable")
+        return await real_eval(script, numkeys, key, claim, value, ttl)
+
+    monkeypatch.setattr(redis, "eval", eval_)
+    task = asyncio.create_task(client.miner_driver(request()))
+    await asyncio.wait_for(lost.wait(), 1)
+    redis.now += 100 * settings.BACKEND_COMMAND_CLAIM_TTL_SECONDS  # the outage outlasts any short claim
+    await client.miner_driver(request())   # the backend's resend while the outcome is unrecorded
+    assert client.miner_service.handle_container.await_count == 1
+    resent.set()
+    await asyncio.wait_for(task, 1)
+    await client.miner_driver(request())   # once written, a resend gets the recorded answer
+    assert client.miner_service.handle_container.await_count == 1
+    assert client.message_queue == [response, response]
+
