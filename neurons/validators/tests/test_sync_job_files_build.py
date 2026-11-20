@@ -17,7 +17,7 @@ def _digests():
 @pytest.mark.asyncio
 async def test_a_failed_job_files_build_records_no_rollout_attempt(validator_with_mocks):
     validator = validator_with_mocks
-    validator.file_encrypt_service.ecrypt_miner_job_files.side_effect = RuntimeError("obfuscator exit 1")
+    validator.file_encrypt_service.prepare_cycle_job_files.side_effect = RuntimeError("obfuscator exit 1")
     validator.observe_executor_rollout = AsyncMock(return_value=None)
     first, second = _digests()
     with first, second:
@@ -30,7 +30,7 @@ async def test_a_failed_job_files_build_records_no_rollout_attempt(validator_wit
 @pytest.mark.asyncio
 async def test_a_failed_forced_request_clear_still_publishes_the_new_job_files(validator_with_mocks):
     validator = validator_with_mocks
-    validator.file_encrypt_service.ecrypt_miner_job_files.return_value = {"dir": "new"}
+    validator.file_encrypt_service.prepare_cycle_job_files.return_value = {"dir": "new"}
     validator.an_operator_asked_for_a_cycle_now = AsyncMock(return_value=True)
     validator.redis_service.clear_forced_validation_cycle_request = AsyncMock(side_effect=ConnectionError("reply lost"))
     first, second = _digests()
@@ -47,9 +47,12 @@ async def test_the_build_keeps_the_published_job_files_while_no_express_verifica
     validator.cycle_inputs.encrypted_files.tmp_directory = "/jobs/previous"
     validator.express_lane.directories_in_use = MagicMock(return_value=set())
     validator.observe_executor_rollout = AsyncMock(return_value=None)
+    kept = []
+    validator.file_encrypt_service.prepare_cycle_job_files.side_effect = (
+        lambda keep_directories: kept.extend(keep_directories()) or {}
+    )
     first, second = _digests()
     with first, second:
         await validator.sync()
 
-    kept = validator.file_encrypt_service.ecrypt_miner_job_files.call_args.kwargs["keep_directories"]
     assert "/jobs/previous" in kept
