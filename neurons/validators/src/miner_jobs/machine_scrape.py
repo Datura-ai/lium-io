@@ -982,15 +982,38 @@ def get_host_memory(list_workloads=list_workload_container_ids, host_root=HOST_M
     return facts
 
 
-def get_executor_pid_mode():
-    # PidMode of the executor's own container (hostname = container id): "host", or "" when private.
-    # A missing or non-string value raises, so the scrape reports unknown instead of a failing mode.
-    inspection = docker_api_get(f"/containers/{socket.gethostname()}/json")
-    host_config = inspection.get("HostConfig") if isinstance(inspection, dict) else None
-    pid_mode = host_config.get("PidMode") if isinstance(host_config, dict) else None
-    if not isinstance(pid_mode, str):
-        raise ValueError(f"docker inspect has no HostConfig.PidMode: {pid_mode!r}")
-    return pid_mode
+def get_executor_pid_mode(notes=None):
+    # PidMode of the container this scrape runs in: the one whose processes (listed by cgroup, like
+    # `docker top`) include this one. A hostname can name any container. Under `pid: host` the scrape sees
+    # its host pid, so its container is always found; in a private PID namespace the pid is not a host pid,
+    # which is reported as "" (not host). The pid namespace must match too: a private-namespace pid can
+    # equal a host pid in another `pid: host` container.
+    # A host ps without the pidns column (old procps) falls back to the pid-only match and says so in notes,
+    # rather than missing the executor's own container.
+    # A missing or non-string PidMode raises, so the scrape reports unknown instead of a failing mode.
+    own = [str(os.getpid()), str(os.stat("/proc/self/ns/pid").st_ino)]
+    for summary in docker_api_get("/containers/json") or []:
+        container_id = summary.get("Id")
+        want = own
+        try:
+            top = docker_api_get(f"/containers/{container_id}/top?ps_args=-eo%20pid,pidns") or {}
+        except RuntimeError:
+            try:
+                top = docker_api_get(f"/containers/{container_id}/top?ps_args=-eo%20pid") or {}
+            except RuntimeError:
+                continue  # restarting (409) or gone (404): never this scrape's own container
+            want = own[:1]
+            if notes is not None:
+                notes.append(f"pidns not listed for {str(container_id)[:12]}; matched by pid only")
+        if want not in [row[: len(want)] for row in top.get("Processes") or []]:
+            continue
+        inspection = docker_api_get(f"/containers/{container_id}/json")
+        host_config = inspection.get("HostConfig") if isinstance(inspection, dict) else None
+        pid_mode = host_config.get("PidMode") if isinstance(host_config, dict) else None
+        if not isinstance(pid_mode, str):
+            raise ValueError(f"docker inspect has no HostConfig.PidMode: {pid_mode!r}")
+        return pid_mode
+    return ""
 
 
 NEEDRESTART_GUARD_FILE = "/etc/needrestart/conf.d/lium-container-runtime.conf"
@@ -3007,12 +3030,15 @@ def get_machine_specs():
     except Exception as exc:
         data["data_disk_health_scrape_error"] = repr(exc)
 
-    # DAH: the executor's PID namespace mode, read from its own container (hostname = container id).
+    # DAH: the executor's PID namespace mode, read from the container this scrape runs in.
     # "host" is required: backups read /proc/<rental pid> of the host. Missing key = unknown, never fails.
+    pid_mode_notes = []
     try:
-        data["data_executor_pid_mode"] = get_executor_pid_mode()
+        data["data_executor_pid_mode"] = get_executor_pid_mode(pid_mode_notes)
     except Exception as exc:
         data["data_executor_pid_mode_scrape_error"] = repr(exc)
+    if pid_mode_notes and "data_executor_pid_mode_scrape_error" not in data:
+        data["data_executor_pid_mode_scrape_error"] = "; ".join(pid_mode_notes[:3])
 
     # DAH: hosts set up before 16 Nov lack the needrestart guard; missing key = unknown, never fails
     try:
