@@ -13,6 +13,7 @@ dependencies = [
     "pydantic-settings>=2.7.0",
     "python-dotenv>=1.0.0",
     "pytest>=8.3.0",
+    "datura @ file:///${PROJECT_ROOT}/../datura",
 ]
 requires-python = "<3.13,>=3.11"
 license = {text = "MIT"}

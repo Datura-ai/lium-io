@@ -12,10 +12,10 @@ from config import (
     WATCHTOWER_ENDPOINT_URL,
     WATCHTOWER_USER_AGENT,
     WATCHTOWER_VALIDATOR_HOTKEY,
-    WATCHTOWER_VALIDATOR_NEXT_HOTKEY,
 )
 from logger import get_logger, _m
 from models import WatchtowerDigestResponse
+from validator_trust_service import validator_trust
 
 logger = get_logger(__name__)
 
@@ -278,17 +278,9 @@ def container_image_digest(client: docker.DockerClient, container: Container) ->
 
 
 def trusted_validator_hotkeys() -> tuple[str, ...]:
-    """The validator hotkeys a digest signature is checked against, the active one first, no blanks or repeats.
-
-    Two during the hotkey rotation (config.py): the digest is signed by whichever wallet the platform
-    holds, and an executor must keep updating across the swap.
-    """
-    hotkeys: list[str] = []
-    for hotkey in (WATCHTOWER_VALIDATOR_HOTKEY, WATCHTOWER_VALIDATOR_NEXT_HOTKEY):
-        hotkey = (hotkey or "").strip()
-        if hotkey and hotkey not in hotkeys:
-            hotkeys.append(hotkey)
-    return tuple(hotkeys)
+    """The validator hotkeys a digest signature is checked against: the one the subnet owner's signed message names,
+    else the baked one (validator_trust_service.py)."""
+    return validator_trust.hotkeys(WATCHTOWER_VALIDATOR_HOTKEY)
 
 
 def verify_watchtower_signature(payload: WatchtowerDigestResponse) -> None:
@@ -713,15 +705,20 @@ def main():
         logger.info("Watchtower is disabled (WATCHTOWER_ENABLED=False)")
         return
 
+    validator_trust.load()
+
     logger.info(_m("Starting watchtower", {
         "image": settings.WATCHTOWER_IMAGE,
         "interval": settings.WATCHTOWER_INTERVAL,
         "endpoint": WATCHTOWER_ENDPOINT_URL,
         "validator_hotkeys": list(trusted_validator_hotkeys()),
+        "validator_trust": validator_trust.report(),
     }))
 
     while True:
         try:
+            # before the digest is read, so a validator change is known by the time its digest is checked
+            validator_trust.refresh()
             check_and_update()
         except Exception as e:
             logger.error(_m("Unexpected error in main loop", {"error": str(e)}), exc_info=True)
