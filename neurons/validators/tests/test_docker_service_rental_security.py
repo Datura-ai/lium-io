@@ -25,7 +25,6 @@ from payload_models.payloads import (
 )
 import services.docker_service as docker_service_module
 from services.docker_service import LEGACY_S3FS_PLUGIN_ALIAS, DockerService, _is_vloopback_driver, _s3fs_plugin_alias
-import services.s3fs_plugin_copy as s3fs_plugin_copy_module
 from services.s3fs_plugin_copy import s3fs_plugin_command
 from services.rental_docker_sdk import (
     ContainerExecResult,
@@ -804,7 +803,6 @@ def test_only_v2_is_installed_or_enabled_and_only_s3fs_instances_are_disabled_re
         "{LEGACY_S3FS_PLUGIN_ALIAS}",
     }
     assert set(re.findall(r"\bplugin_alias(?:: str)? = (\w+)", source)) == {"_s3fs_plugin_alias"}
-    assert not _is_vloopback_driver(s3fs_plugin_copy_module.S3FS_TEMPLATE_ALIAS)
 
 
 @pytest.mark.parametrize("volume_name", ["vloopback", "vloopback-v2", "volume_abc"])

@@ -147,11 +147,13 @@ class TaskService:
         executor_image_snapshot: ExpectedImageSnapshot | None = None,
         attestation_nonce: AttestationNonce | None = None,
         first_pass: bool = False,
+        deadline_monotonic: float | None = None,
     ):
         """New pipeline-based validation task implementation.
 
         `first_pass` (DAH-3011): the caller knows this is the executor's first, unscored verification
         (the express lane, DAH-2958). The wave never sets it.
+        `deadline_monotonic`: the caller's own deadline when sooner than the task timeout (an express recheck's).
         """
         task_started_at = time.monotonic()
         attestation_digest = None
@@ -225,6 +227,7 @@ class TaskService:
                     first_pass=first_pass,
                     encrypted_private_key=encrypted_private_key,
                     task_started_at=task_started_at,
+                    deadline_monotonic=deadline_monotonic,
                 )
 
                 # Build and run validation pipeline

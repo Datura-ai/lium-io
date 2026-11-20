@@ -10,14 +10,15 @@ made by validation or, on a node that has none yet, by the first Volume rental; 
 
 import shlex
 
-# Pinned by tag and checked by manifest digest after the install: a digest reference must never reach
-# `plugin install` (dockerd <25.0.3 can panic, see loopback_plugin_setup). v2.0.9 is the build `latest` has
-# carried since Dec 2021; a retagged upstream is refused, never run.
-S3FS_PLUGIN_TAG = "mochoa/s3fs-volume-plugin:v2.0.9"
+# The pinned build, fetched by digest over the registry API: the manifest, the plugin config and every layer are
+# checked against their sha256 as they arrive, so nothing but this build can become the copy. v2.0.9 is the build
+# `latest` has carried since Dec 2021. Nothing here goes through `docker plugin install` or reads dockerd's own
+# plugin store, whose layout is internal to dockerd (lium-io#2345 review).
+S3FS_PLUGIN_REPOSITORY = "mochoa/s3fs-volume-plugin"
 S3FS_PLUGIN_MANIFEST = "sha256:c3a12ea5bc1f86eb86e8b4890cfbda19a0c45be4678bf9008421b85c8d11daf9"
-# staging installs the build under this name, copies it and removes it again
-S3FS_TEMPLATE_ALIAS = "lium-s3fs-template"
-# an install on a slow registry path, a 150 MB copy and a create; the rent path waits for it on a node without the copy
+REGISTRY_URL = "https://registry-1.docker.io"
+REGISTRY_TOKEN_URL = "https://auth.docker.io/token?service=registry.docker.io"
+# a 57 MB download, a 150 MB unpack and a create; the rent path waits for it on a node without the copy
 S3FS_PLUGIN_COMMAND_TIMEOUT_SECONDS = 300
 
 # Executed by the executor's Python against the host's dockerd. The executor has host PID access, so the
@@ -25,13 +26,16 @@ S3FS_PLUGIN_COMMAND_TIMEOUT_SECONDS = 300
 # `plugin create`'s directory from there.
 _SCRIPT = r'''
 import fcntl
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 
-docker, host_root, tag, manifest, template, alias = sys.argv[1:]
+docker, host_root, registry, token_url, repository, manifest, alias = sys.argv[1:]
 
 def run(*args, timeout=120):
     return subprocess.run([docker, *args], capture_output=True, text=True, check=False, timeout=timeout)
@@ -39,38 +43,54 @@ def run(*args, timeout=120):
 def tail(text):
     return (text or "").strip()[-300:]
 
+def fetch(url, token=None, accept=None):
+    request = urllib.request.Request(url)
+    if token:
+        # never sent on to the blob store a blob request is redirected to
+        request.add_unredirected_header("Authorization", "Bearer " + token)
+    if accept:
+        request.add_header("Accept", accept)
+    return urllib.request.urlopen(request, timeout=60)
+
+def pinned(response, digest, out=None):
+    # the body, checked against its digest; with `out`, streamed there instead of kept
+    hashed, kept = hashlib.sha256(), []
+    while chunk := response.read(1 << 20):
+        hashed.update(chunk)
+        out.write(chunk) if out else kept.append(chunk)
+    if "sha256:" + hashed.hexdigest() != digest:
+        raise RuntimeError("downloaded plugin does not match the pinned digest")
+    return b"".join(kept)
+
 def stage(copy):
-    # the node's one registry contact for this build: install it disabled under the template name, check
-    # it is the pinned build, keep its config and files, drop the template
-    installed = None
-    if run("plugin", "inspect", template).returncode:
-        installed = run("plugin", "install", tag, "--alias", template, "--grant-all-permissions", "--disable",
-                        timeout=240)
-    found = run("plugin", "inspect", "-f", "{{.Id}}", template)
-    if found.returncode:
-        raise RuntimeError("plugin install failed: " + tail(installed.stderr if installed else found.stderr))
-    plugin_id = found.stdout.strip()
-    if len(plugin_id) != 64 or any(c not in "0123456789abcdef" for c in plugin_id):
-        raise RuntimeError("invalid plugin ID")
-    plugin_dir = host_root + root + "/plugins/" + plugin_id
-    with open(plugin_dir + "/config.json") as saved:
-        if json.load(saved).get("Manifest") != manifest:
-            run("plugin", "rm", "-f", template)
-            raise RuntimeError("downloaded manifest does not match the pinned digest")
-    config = run("plugin", "inspect", "-f", "{{json .Config}}", template)
-    if config.returncode:
-        raise RuntimeError("plugin inspect failed")
-    staging = copy + ".tmp"
-    shutil.rmtree(staging, ignore_errors=True)
-    os.makedirs(staging)
-    with open(staging + "/config.json", "w") as out:
-        out.write(config.stdout)
-    if subprocess.run(["cp", "-a", plugin_dir + "/rootfs", staging + "/rootfs"], capture_output=True).returncode:
-        raise RuntimeError("copying the plugin files failed")
+    # the node's one registry contact for this build
+    try:
+        scope = "&scope=repository:" + repository + ":pull"
+        token = json.load(fetch(token_url + scope)).get("token")
+        blob = registry + "/v2/" + repository + "/blobs/"
+        found = json.loads(pinned(fetch(registry + "/v2/" + repository + "/manifests/" + manifest, token,
+                                        "application/vnd.docker.distribution.manifest.v2+json"), manifest))
+        if found["config"]["mediaType"] != "application/vnd.docker.plugin.v1+json":
+            raise RuntimeError("the pinned digest is not a plugin")
+        config = pinned(fetch(blob + found["config"]["digest"], token), found["config"]["digest"])
+        staging = copy + ".tmp"
+        shutil.rmtree(staging, ignore_errors=True)
+        os.makedirs(staging + "/rootfs")
+        for layer in found["layers"]:
+            with open(staging + "/layer", "wb") as out:
+                pinned(fetch(blob + layer["digest"], token), layer["digest"], out)
+            unpacked = subprocess.run(["tar", "-xzf", staging + "/layer", "-C", staging + "/rootfs", "--numeric-owner"],
+                                      capture_output=True, text=True)
+            if unpacked.returncode:
+                raise RuntimeError("unpacking the plugin files failed: " + tail(unpacked.stderr))
+            os.remove(staging + "/layer")
+    except (urllib.error.URLError, OSError, ValueError, KeyError) as error:
+        raise RuntimeError("plugin download failed: " + str(getattr(error, "reason", error))[:300])
+    with open(staging + "/config.json", "wb") as out:
+        out.write(config)
     shutil.rmtree(copy, ignore_errors=True)
     os.rename(staging, copy)
     open(copy + "/ready", "w").close()
-    run("plugin", "rm", "-f", template)
 
 def create_instance(copy):
     if run("plugin", "inspect", alias).returncode == 0:
@@ -115,8 +135,15 @@ except Exception as error:
 '''
 
 
-def s3fs_plugin_command(alias: str = "", host_root: str = "/proc/1/root", docker: str = "/usr/bin/docker") -> str:
+def s3fs_plugin_command(
+    alias: str = "",
+    host_root: str = "/proc/1/root",
+    docker: str = "/usr/bin/docker",
+    registry: str = REGISTRY_URL,
+    token_url: str = REGISTRY_TOKEN_URL,
+    manifest: str = S3FS_PLUGIN_MANIFEST,
+) -> str:
     """Make sure the node holds the pinned plugin copy; with an alias, also create that Volume's instance from it."""
     return shlex.join(
-        ("python3", "-c", _SCRIPT, docker, host_root, S3FS_PLUGIN_TAG, S3FS_PLUGIN_MANIFEST, S3FS_TEMPLATE_ALIAS, alias)
+        ("python3", "-c", _SCRIPT, docker, host_root, registry, token_url, S3FS_PLUGIN_REPOSITORY, manifest, alias)
     )
