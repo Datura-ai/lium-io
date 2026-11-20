@@ -280,3 +280,88 @@ async def test_the_feature_is_off_by_default(monkeypatch):
 
     assert await ensure_liumd_binary(_ctx(runner)) is None
     assert runner.calls == []
+
+
+# The signed manifest: the real fetch path with a test release key pinned in place of the production one.
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat  # noqa: E402
+
+RELEASE_KEY = Ed25519PrivateKey.generate()
+OTHER_KEY = Ed25519PrivateKey.generate()
+MANIFEST_BYTES = (json.dumps(MANIFEST, indent=2) + "\n").encode()
+
+
+def _sig(key, data=MANIFEST_BYTES):
+    return (key.sign(data).hex() + "\n").encode()
+
+
+def _serve(monkeypatch, files):
+    """files: URL suffix -> bytes, or None for a 404."""
+    fetched = []
+
+    async def fetch_bytes(url, timeout, limit):
+        fetched.append(url)
+        body = files.get(url.rsplit("/", 1)[-1])
+        return (body, None) if body is not None else (None, "fetch status 404")
+
+    monkeypatch.setattr(liumd_binary_refresh, "_fetch_bytes", fetch_bytes)
+    pub = RELEASE_KEY.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
+    monkeypatch.setattr(liumd_binary_refresh, "MANIFEST_PUBLIC_KEY_HEX", pub)
+    return fetched
+
+
+def test_the_pinned_key_is_the_liumd_release_key():
+    assert liumd_binary_refresh.MANIFEST_PUBLIC_KEY_HEX == (
+        "7b187df472a586d61423cf24d72bbccdb98bfd671df5b4b6b9e713676990a41b"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_manifest_signed_by_the_release_key_installs(monkeypatch):
+    fetched = _serve(monkeypatch, {"manifest.json": MANIFEST_BYTES, "manifest.json.sig": _sig(RELEASE_KEY)})
+    runner = Runner()
+
+    result = await ensure_liumd_binary(_ctx(runner), budget_seconds=60)
+
+    assert fetched == ["https://example.test/manifest.json", "https://example.test/manifest.json.sig"]
+    assert (result.ok, result.changed, result.build_sha) == (True, True, NEW_BUILD)
+    assert runner.installed
+
+
+@pytest.mark.parametrize(
+    ("case", "manifest", "signature", "error"),
+    [
+        ("missing", MANIFEST_BYTES, None, "manifest signature fetch status 404"),
+        ("other key", MANIFEST_BYTES, _sig(OTHER_KEY), "does not verify against the pinned release key"),
+        ("manifest changed after signing", MANIFEST_BYTES.replace(b"a" * 64, b"c" * 64), _sig(RELEASE_KEY),
+         "does not verify against the pinned release key"),
+        ("not hex", MANIFEST_BYTES, b"zz\n", "manifest signature is not hex"),
+        ("short", MANIFEST_BYTES, b"00" * 32, "manifest signature is not 64 bytes"),
+        ("empty", MANIFEST_BYTES, b"", "manifest signature is not 64 bytes"),
+    ],
+)
+@pytest.mark.parametrize("local_present", [True, False])
+@pytest.mark.asyncio
+async def test_a_manifest_without_a_valid_signature_installs_nothing(
+    monkeypatch, case, manifest, signature, error, local_present
+):
+    _serve(monkeypatch, {"manifest.json": manifest, "manifest.json.sig": signature})
+    runner = Runner(local_present=local_present)
+
+    result = await ensure_liumd_binary(_ctx(runner), budget_seconds=60)
+
+    assert error in result.detail
+    assert not runner.installed
+    assert not any(c.startswith(("curl ", "install ")) for c in runner.calls)
+    # fail closed: a node keeps the binary it has; one without a binary gets none
+    assert (result.ok, result.build_sha) == ((True, "old-build") if local_present else (False, None))
+
+
+@pytest.mark.asyncio
+async def test_the_manifest_is_not_parsed_before_its_signature_verifies(monkeypatch):
+    _serve(monkeypatch, {"manifest.json": b"not json", "manifest.json.sig": _sig(OTHER_KEY, b"not json")})
+
+    doc, error = await liumd_binary_refresh._fetch_manifest("https://example.test/manifest.json", 5)
+
+    assert doc is None
+    assert error == "manifest signature does not verify against the pinned release key"

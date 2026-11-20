@@ -1,4 +1,9 @@
-"""Install the latest published liumd binary on an executor when it is missing or stale."""
+"""Install the latest published liumd binary on an executor when it is missing or stale.
+
+The manifest names the build and each binary's sha256. It is trusted only when manifest.json.sig, an ed25519
+signature over the manifest's exact bytes, verifies against the release key pinned below. A missing, malformed or
+foreign signature refuses the refresh: nothing is installed and the local binary stays.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +17,8 @@ from typing import Any
 from urllib.parse import urljoin
 
 import aiohttp
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from core.config import settings
 
@@ -24,6 +31,10 @@ TMP_BINARY = "/tmp/liumd.binary.fetch"
 
 MANIFEST_TIMEOUT_SECONDS = 10
 MAX_MANIFEST_BYTES = 64 * 1024
+MAX_SIGNATURE_BYTES = 1024
+# The liumd release key (ed25519:04d614eaf59dbbb8). Its seed is held only by the release signing job, which signs
+# manifest.json on a liumd-v* tag; a manifest changed without that key does not verify.
+MANIFEST_PUBLIC_KEY_HEX = "7b187df472a586d61423cf24d72bbccdb98bfd671df5b4b6b9e713676990a41b"
 # The manifest is the same for every executor in a cycle; the batch id keeps one fetch per cycle.
 MANIFEST_CACHE_TTL_SECONDS = 15 * 60
 MANIFEST_FALLBACK_CACHE_SECONDS = 60
@@ -78,18 +89,46 @@ async def _read_version(ctx: Any) -> LiumdVersion:
     return _version_doc(result.stdout or "")
 
 
-async def _fetch_manifest(url: str, timeout: float) -> tuple[dict[str, Any] | None, str | None]:
+async def _fetch_bytes(url: str, timeout: float, limit: int) -> tuple[bytes | None, str | None]:
     try:
         client_timeout = aiohttp.ClientTimeout(total=timeout)
         async with aiohttp.ClientSession(timeout=client_timeout) as session:
             async with session.get(url, allow_redirects=False) as response:
                 if response.status != 200:
-                    return None, f"manifest fetch status {response.status}"
-                body = await response.content.read(MAX_MANIFEST_BYTES + 1)
+                    return None, f"fetch status {response.status}"
+                body = await response.content.read(limit + 1)
     except (aiohttp.ClientError, TimeoutError) as exc:
         return None, f"{type(exc).__name__}: {exc}"[:300]
-    if len(body) > MAX_MANIFEST_BYTES:
-        return None, "manifest response is too large"
+    if len(body) > limit:
+        return None, "response is too large"
+    return body, None
+
+
+def _signature_error(manifest: bytes, signature: bytes) -> str | None:
+    """None when `signature` (64 bytes, hex) is the pinned release key's ed25519 signature over `manifest`."""
+    try:
+        sig = bytes.fromhex(signature.decode("ascii").strip())
+    except (UnicodeDecodeError, ValueError):
+        return "manifest signature is not hex"
+    if len(sig) != 64:
+        return "manifest signature is not 64 bytes"
+    try:
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(MANIFEST_PUBLIC_KEY_HEX)).verify(sig, manifest)
+    except InvalidSignature:
+        return "manifest signature does not verify against the pinned release key"
+    return None
+
+
+async def _fetch_manifest(url: str, timeout: float) -> tuple[dict[str, Any] | None, str | None]:
+    """The manifest, only once its signature verifies over the exact bytes fetched; nothing in it is read before."""
+    body, error = await _fetch_bytes(url, timeout, MAX_MANIFEST_BYTES)
+    if body is None:
+        return None, f"manifest {error}"
+    signature, error = await _fetch_bytes(url + ".sig", timeout, MAX_SIGNATURE_BYTES)
+    if signature is None:
+        return None, f"manifest signature {error}"
+    if error := _signature_error(body, signature):
+        return None, error
     try:
         doc = json.loads(body)
     except ValueError as exc:
