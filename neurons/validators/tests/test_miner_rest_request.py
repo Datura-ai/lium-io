@@ -9,6 +9,8 @@ from aiohttp import web
 from services.miner_service import MinerService
 from services.node_host import NodeHostError
 
+from core.config import settings
+
 
 async def _serve(handler):
     app = web.Application()
@@ -74,3 +76,32 @@ async def test_a_non_public_axon_is_refused_with_nothing_sent(monkeypatch, host)
     monkeypatch.setattr(aiohttp, "ClientSession", no_session)
     with pytest.raises(NodeHostError):
         await _request(f"http://{host}:8080/executors")
+
+
+@pytest.mark.asyncio
+async def test_the_configured_local_miner_is_reached_at_its_private_address(monkeypatch):
+    """A debug validator's local miner (DEBUG_USE_LOCAL_MINER) is the operator's setting, so its private address is
+    dialled; any other private address, even on the same host, is still refused."""
+
+    async def handler(request):
+        return web.json_response({"ok": True})
+
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    monkeypatch.setattr(settings.debug, "USE_LOCAL_MINER", True)
+    monkeypatch.setattr(settings.debug, "MINER_ADDRESS", "0.0.0.0")
+    monkeypatch.setattr(settings.debug, "MINER_PORT", port)
+    try:
+        assert await _request(f"http://0.0.0.0:{port}/executors") == (200, {"ok": True})
+        with pytest.raises(NodeHostError):
+            await _request(f"http://0.0.0.0:{port + 1}/executors")
+        monkeypatch.setattr(settings.debug, "USE_LOCAL_MINER", False)
+        with pytest.raises(NodeHostError):
+            await _request(f"http://0.0.0.0:{port}/executors")
+    finally:
+        await runner.cleanup()

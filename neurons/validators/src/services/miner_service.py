@@ -2085,9 +2085,14 @@ class MinerService:
             # name; aiohttp dials a literal without a lookup, so it is checked here), and a redirect is never
             # followed to another address.
             target = yarl.URL(url)
-            if target.host and is_ip_literal(target.host):
+            # the local miner a debug validator is pointed at is the operator's own setting, not an address a miner
+            # reported, so it is dialled as configured (a stand's miner sits on a private compose address)
+            debug = settings.debug
+            configured = debug.USE_LOCAL_MINER and (target.host, target.port) == (debug.MINER_ADDRESS, debug.MINER_PORT)
+            if not configured and target.host and is_ip_literal(target.host):
                 await resolve_node_host(target.host, target.port)
-            async with aiohttp.ClientSession(connector=public_host_connector()) as session:
+            connector = aiohttp.TCPConnector() if configured else public_host_connector()
+            async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.request(
                     method=method,
                     url=url,
