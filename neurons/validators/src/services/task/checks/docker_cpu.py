@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncssh
 
-from core.config import settings
-
 from ..messages import DockerCpuMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
@@ -19,8 +17,8 @@ class DockerCpuCheck:
 
     A daemon limited to fewer CPUs (CPU affinity or a cgroup on the Docker service) cannot start a
     container with the CPUs the node is listed with, so its rentals fail. Compares the scraped
-    CPU(s) count with `docker info` NCPU. With DOCKER_CPU_MISMATCH_ENFORCEMENT_ENABLED off, a
-    mismatch is logged only. Rented nodes are warned and keep their score. An unreadable count passes.
+    CPU(s) count with `docker info` NCPU. Rented nodes are warned and keep their score. An unreadable
+    count passes.
     """
 
     check_id = "executor.validate.docker_cpu"
@@ -39,7 +37,7 @@ class DockerCpuCheck:
         if host is None or docker is None or docker >= host:
             return CheckResult(passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id, what=what))
         remediation = f"Docker sees {docker} of {host} CPUs; remove the CPU limit on the Docker service."
-        if is_rented or not settings.DOCKER_CPU_MISMATCH_ENFORCEMENT_ENABLED:
+        if is_rented:
             event = render_message(
                 Msg.WARNING, ctx=ctx, check_id=self.check_id, what=what, remediation=remediation
             )

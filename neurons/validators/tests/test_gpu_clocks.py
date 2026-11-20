@@ -893,23 +893,20 @@ async def test_a_reboots_hung_gpu_reset_waits_for_a_gpu_operation_in_flight(monk
     assert not ds.pod_gpu_operation_locks._locks
 
 
-@pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.asyncio
-async def test_the_reboot_hung_gpu_reset_flag(monkeypatch, enabled):
-    # DAH-5301: off = shadow (logged, no warning to the backend); on = the reset and its warning
+async def test_a_reboot_resets_a_hung_gpu_and_returns_its_warning(monkeypatch):
+    # DAH-5301: the reset and its warning to the backend
     import services.docker_service as ds
     from services.hung_gpu_reset import HungGpuResult
 
     service, _gates, _started = _service_with_gated_steps([])
     service.redis_service = None
     monkeypatch.setattr(ds, "SSHCommandRunner", lambda *_a, **_k: None)
-    monkeypatch.setattr(ds.settings, "HUNG_GPU_RESET_ON_REBOOT_ENABLED", enabled)
-    warning = ds.ContainerWarningCode.HungGpuReset if enabled else None
-    reset = AsyncMock(return_value=HungGpuResult(["gpu-0"], warning, "would reset"))
+    warning = ds.ContainerWarningCode.HungGpuReset
+    reset = AsyncMock(return_value=HungGpuResult(["gpu-0"], warning, "reset"))
     monkeypatch.setattr(ds, "reset_hung_pod_gpus", reset)
 
     assert await service._reset_hung_gpus_before_run(None, _create_payload(), {}) == warning
-    assert reset.await_args.kwargs["shadow"] is not enabled
 
 
 @pytest.mark.asyncio

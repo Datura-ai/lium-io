@@ -127,13 +127,9 @@ class PodSshObservation(pydantic.BaseModel):
 
 # The backend bounds ExecutorSpecRequest.pod_states at 256 entries (lium-platform#312,
 # `Field(max_length=256)`); a longer list fails its validation and the WHOLE spec is dropped, node
-# listing included. One PodStatesReport chunk holds the same number. With
-# settings.POD_STATES_REPORT_ENABLED every state of the cycle goes out in report chunks after the
-# spec, and the spec keeps this bounded head as a copy for a backend that does not read the report
-# yet (a copy that is reaped ids only when 256 or more are queued). With the flag off the spec is
-# the only carrier: StaleContainerCleanupCheck hands its queued `reaped` ids at least
-# REAPED_POD_STATES_FLOOR slots (they sit first in the list, so this cut never reaches them) and
-# the last rented pods' observed states are cut every cycle until the queue drains.
+# listing included. One PodStatesReport chunk holds the same number. Every state of the cycle goes
+# out in report chunks after the spec, and the spec keeps this bounded head as a copy (a copy that
+# is reaped ids only when 256 or more are queued).
 POD_STATES_MAX_ITEMS = 256
 
 
