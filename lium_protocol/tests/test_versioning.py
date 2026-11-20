@@ -137,3 +137,25 @@ def test_release_pr_passes(repo: Path, bump: str) -> None:
     assert release(repo).returncode == 0
     result = check(repo)
     assert result.returncode == 0, result.stdout
+
+
+def test_a_release_that_keeps_the_base_version_fails(repo: Path) -> None:
+    """a release rebased onto another release and resolved to the base's version deletes fragments but names no new wire"""
+    change_wire(repo)
+    fragment(repo, "new-field", "minor")
+    commit(repo, "feature")
+    (repo / "lium_protocol/changes/new-field.md").unlink()
+    result = check(repo)
+    assert result.returncode == 1 and "must raise PROTOCOL_VERSION" in result.stdout
+
+
+def test_a_release_that_lowers_the_version_fails(repo: Path) -> None:
+    fragment(repo, "new-field", "minor")
+    commit(repo, "feature")
+    (repo / "lium_protocol/changes/new-field.md").unlink()
+    path = repo / "lium_protocol/lium_protocol/__init__.py"
+    major, minor, patch = PROTOCOL_VERSION.split(".")
+    lower = f"{int(major) - 1}.{minor}.{patch}" if int(major) > 0 else f"{major}.{minor}.{max(int(patch) - 1, 0)}"
+    path.write_text(path.read_text().replace(PROTOCOL_VERSION, lower))
+    result = check(repo)
+    assert result.returncode == 1 and "must raise PROTOCOL_VERSION" in result.stdout

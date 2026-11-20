@@ -2,8 +2,10 @@
 
 Compares the tree at <base> with HEAD (`git diff <base> HEAD`; locally pass `$(git merge-base origin/main HEAD)`)
 and fails when
-1. the version changes in a PR that is not a release PR, or
-2. the wire (anything under lium_protocol/lium_protocol/ but a version line, a comment or a blank line) changes and
+1. the version changes in a PR that is not a release PR,
+2. a release PR does not raise the version above the base's (a release rebased onto another one and resolved to the
+   base's version would name two wires with one version), or
+3. the wire (anything under lium_protocol/lium_protocol/ but a version line, a comment or a blank line) changes and
    no fragment is added under lium_protocol/changes/.
 A release PR is one that deletes at least one fragment: `scripts/release.py` does that, nothing else does.
 """
@@ -27,14 +29,24 @@ def version(ref: str) -> str:
     return re.search(r'^PROTOCOL_VERSION = "([^"]+)"$', git("show", f"{ref}:{INIT}"), re.MULTILINE).group(1)
 
 
+def _key(v: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in v.split("."))
+
+
 def problems(base: str) -> list[str]:
     status = [line.split("\t") for line in git("diff", "--name-status", "--no-renames", base, "HEAD").splitlines()]
     is_release = any(s == "D" and p.startswith(CHANGES) for s, p, *_ in status)
     adds_fragment = any(s in ("A", "M") and p.startswith(CHANGES) and p.endswith(".md") for s, p, *_ in status)
     found = []
-    if not is_release and version(base) != version("HEAD"):
+    old, new = version(base), version("HEAD")
+    if is_release and _key(new) <= _key(old):
         found.append(
-            f"PROTOCOL_VERSION changed {version(base)} → {version('HEAD')} outside a release PR: "
+            f"a release PR must raise PROTOCOL_VERSION above the base's {old} (it is {new}): "
+            "run scripts/release.py again on the current main"
+        )
+    if not is_release and old != new:
+        found.append(
+            f"PROTOCOL_VERSION changed {old} → {new} outside a release PR: "
             "add a fragment under lium_protocol/changes/ instead; the release sets the version"
         )
     # -M: a major release renames the snapshot, which must read as a version-line change only
