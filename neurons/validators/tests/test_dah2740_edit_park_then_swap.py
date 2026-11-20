@@ -1542,6 +1542,8 @@ def test_the_layer_read_runs_in_a_real_shell(tmp_path, mounts, diff, kept):
         ("containerd", True, None, None),
         # Docker restarted it inside the validator start's window: files since then are the renter's
         ("overlay2", True, ((120, -60),), 60),
+        # a sysbox (DinD) pod on the containerd store: its root is a bind mount, the host's mount table names the overlay
+        ("sysbox", False, ((0, -60),), 0),
         ("given", False, ((0, -60),), 0),  # stopped on the containerd store: the upper dir the running read used
         ("none", True, ((0, -60),), 0),  # no upper dir anywhere: docker diff decides, and lists the startup file
         ("kept", True, ((0, -60),), 0),  # a copy already kept: a window never releases it, only docker diff decides
@@ -1563,11 +1565,19 @@ def test_the_layer_read_skips_only_files_written_in_a_recorded_validator_start(
     (upper / "root" / ".jupyter").mkdir(parents=True)
     (upper / "root" / ".jupyter" / "lab.json").write_text("{}")
     (proc / "4242").mkdir()
+    overlay = f"overlay overlay rw,lowerdir=/l1:/l2,upperdir={host_upper},workdir=/w\n"
     (proc / "4242" / "mountinfo").write_text(
         "1 0 0:1 / /proc rw - proc proc rw\n"
-        f"2 0 0:2 / / rw,relatime - overlay overlay rw,lowerdir=/l1:/l2,upperdir={host_upper},workdir=/w\n"
+        + ("2 0 0:2 /rootfs / rw - ext4 /dev/root rw\n" if store == "sysbox" else f"2 0 0:2 / / rw,relatime - {overlay}")
     )
-    inspect = {"overlay2": f"4242 {host_upper}", "containerd": "4242 <no value>"}.get(store, "0 <no value>")
+    # only a running container's rootfs is mounted on the host
+    (proc / "1" / "mountinfo").write_text(
+        f"3 1 0:3 / /var/lib/docker/rootfs/overlayfs/othercid rw - overlay overlay rw,upperdir=/other/diff\n"
+        + (f"4 1 0:4 / /var/lib/docker/rootfs/overlayfs/cid rw,relatime - {overlay}" if store == "sysbox" else "")
+    )
+    inspect = {"overlay2": f"4242 {host_upper}", "containerd": "4242 <no value>", "sysbox": "4242 <no value>"}.get(
+        store, "0 <no value>"
+    )
     docker_started = (
         "0001-01-01T00:00:00Z"
         if docker_started_ago is None
