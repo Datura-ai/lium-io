@@ -582,8 +582,9 @@ def main():
 main()
 PY
     chmod 755 "$bin" || return 1
+    # the version line goes in last, once the unit is enabled and Docker's drop-in is in place: a cut-off or failed
+    # install reads as an old version (no line), so the validator installs again next check
     cat > "$unit" <<UNIT || return 1
-# lium-layer-reset-version=$LAYER_RESET_VERSION
 [Unit]
 Description=Lium: shift sysbox pods' layers back after an unclean stop
 After=local-fs.target sysbox.service sysbox-mgr.service containerd.service
@@ -603,12 +604,20 @@ ExecStart=/usr/bin/python3 -I /usr/local/sbin/lium-sysbox-layer-reset
 [Install]
 WantedBy=multi-user.target
 UNIT
+    if [ -z "${SYSBOX_SETUP_HOST_ROOT:-}" ]; then
+        systemctl is-active -q docker && touch /run/lium-docker-started  # this boot's Docker already started
+        # Docker must never depend on a unit that is not enabled: no drop-in until enable succeeded, none left after
+        # a failure (an older install's drop-in included)
+        if ! { systemctl daemon-reload && systemctl enable lium-sysbox-layer-reset.service >/dev/null 2>&1; }; then
+            rm -f "$dropin"; systemctl daemon-reload >/dev/null 2>&1; return 1
+        fi
+    fi
     # Docker starts only after a successful reset: never a pod on a half-reset layer (the reset log names the failure)
-    printf '[Unit]\nRequires=lium-sysbox-layer-reset.service\nAfter=lium-sysbox-layer-reset.service\n[Service]\nExecStartPost=/bin/touch /run/lium-docker-started\n' \
-        > "$dropin" || return 1
-    [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] && return 0
-    systemctl is-active -q docker && touch /run/lium-docker-started  # this boot's Docker already started
-    systemctl daemon-reload && systemctl enable lium-sysbox-layer-reset.service >/dev/null 2>&1
+    if ! printf '[Unit]\nRequires=lium-sysbox-layer-reset.service\nAfter=lium-sysbox-layer-reset.service\n[Service]\nExecStartPost=/bin/touch /run/lium-docker-started\n' \
+        > "$dropin" || ! sed -i "1i # lium-layer-reset-version=$LAYER_RESET_VERSION" "$unit"; then
+        rm -f "$dropin"; [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] || systemctl daemon-reload >/dev/null 2>&1; return 1
+    fi
+    [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] || systemctl daemon-reload
 }
 
 self_cmd() {

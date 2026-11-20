@@ -114,6 +114,53 @@ def test_the_unit_carries_the_version_the_validator_compares(tmp_path):
     assert unit.splitlines()[0] == f"# lium-layer-reset-version={_layer_reset_version()}"
 
 
+def _install_on_a_live_host(root, enable_fails: bool) -> subprocess.CompletedProcess:
+    # the live-host path (no SYSBOX_SETUP_HOST_ROOT), its files under `root`; systemctl and docker are stand-ins
+    log = root / "systemctl.log"
+    script = (
+        f'host_path() {{ echo "{root}$1"; }}\nwarn() {{ echo "WARN $*"; }}\n'
+        + f'systemctl() {{ echo "$*" >> "{log}"; [ "$1" = enable ] && {"return 1" if enable_fails else "return 0"}; [ "$1" = is-active ] && return 1; return 0; }}\n'
+        + 'docker() { return 1; }\n'
+        + f"LAYER_RESET_VERSION={_layer_reset_version()}\n"
+        + _function("docker_containerd_address")
+        + _function("systemd_quote")
+        + _function("systemd_env")
+        + _function("shift_sysbox_layers_back_at_boot")
+        + "shift_sysbox_layers_back_at_boot\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "SYSBOX_SETUP_HOST_ROOT"}
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+
+
+def test_a_failed_enable_leaves_no_docker_dependency_and_no_new_version(tmp_path):
+    # lio#2373 review: a failed install must not leave Docker requiring an unit that is not enabled, nor the new
+    # version line, so the validator's next check installs again
+    dropin = tmp_path / "etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf"
+    dropin.parent.mkdir(parents=True)
+    dropin.write_text("[Unit]\nRequires=lium-sysbox-layer-reset.service\n")  # an older install's drop-in
+
+    result = _install_on_a_live_host(tmp_path, enable_fails=True)
+
+    assert result.returncode != 0
+    assert not dropin.exists()
+    unit = (tmp_path / "etc/systemd/system/lium-sysbox-layer-reset.service").read_text()
+    assert not unit.startswith("# lium-layer-reset-version=")
+
+
+def test_once_enable_works_the_next_install_adds_the_dependency_and_the_version(tmp_path):
+    _install_on_a_live_host(tmp_path, enable_fails=True)
+
+    result = _install_on_a_live_host(tmp_path, enable_fails=False)
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf").read_text().startswith(
+        "[Unit]\nRequires=lium-sysbox-layer-reset.service\n"
+    )
+    unit = (tmp_path / "etc/systemd/system/lium-sysbox-layer-reset.service").read_text()
+    assert unit.splitlines()[0] == f"# lium-layer-reset-version={_layer_reset_version()}"
+    assert unit.count("# lium-layer-reset-version=") == 1
+
+
 @pytest.mark.skipif(os.getuid() == 0, reason="the not-root answer needs a non-root run")
 def test_install_layer_reset_mode_answers_one_line_and_installs_nothing_without_root(tmp_path):
     result = subprocess.run(
