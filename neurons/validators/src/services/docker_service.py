@@ -150,6 +150,7 @@ from services.gpu_clocks import (
 )
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, reset_pod_gpus
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
+from services.rental_gpu_proof import prove_rented_gpus
 from services.hung_gpu_reset import HungGpuResult, reset_hung_pod_gpus
 from services.host_memory_guard import apply_host_memory_guard
 from services.image_flatten import (
@@ -12236,6 +12237,17 @@ class DockerService:
                     await _raise_unless_running_before_created(
                         docker_client, container_name=container_name, container_id=container_id
                     )
+                    if payload.workload_kind != WorkloadKind.FILLER:
+                        # billing starts on ContainerCreated: CUDA in the pod must use every rented GPU first
+                        current_step = "gpu_cuda_proof"
+                        await prove_rented_gpus(
+                            ssh_client,
+                            container=container_id or container_name,
+                            python_path=executor_info.python_path,
+                            gpu_uuids=list(payload.gpu_uuids or []),
+                            log_extra=default_extra,
+                        )
+                        current_step = soft_failed_step or "finalize"
                     # SSH is expected only when our bootstrap left sshd listening or the template starts its own:
                     # an image our bootstrap cannot give sshd still rents (soft failure), and a filler has no renter
                     ssh_expected = soft_failed_step is None

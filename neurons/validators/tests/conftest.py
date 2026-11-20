@@ -178,6 +178,14 @@ def pod_ssh_answers_on_create_path(request):
 
 
 @pytest.fixture(autouse=True)
+def rented_gpus_prove_on_create_path():
+    """create_container proves the rented GPUs with CUDA in the pod before ContainerCreated; tests have no GPU.
+    test_rental_gpu_proof.py covers the proof, test_docker_service.py its place in the create."""
+    with patch("services.docker_service.prove_rented_gpus", AsyncMock(return_value=None)) as proof:
+        yield proof
+
+
+@pytest.fixture(autouse=True)
 def no_leftover_clock_locks_on_create_path():
     """create_container resets leftover GPU clock locks (Redis + -rgc); test_gpu_clocks.py covers that step."""
     with patch("services.docker_service.reset_leftover_clock_locks", AsyncMock(return_value=[])) as reset:
