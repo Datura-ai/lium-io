@@ -9,6 +9,7 @@ from typing import Annotated
 from uuid import UUID
 
 import aiohttp
+import yarl
 from asyncssh import SSHKey
 import asyncssh
 import bittensor
@@ -78,7 +79,13 @@ from services.docker_service import (
     inflight_creates,
 )
 from services.executor_image_policy import ExpectedImageSnapshot
-from services.node_host import for_payload_miner, public_host_sock
+from services.node_host import (
+    for_payload_miner,
+    is_ip_literal,
+    public_host_connector,
+    public_host_sock,
+    resolve_node_host,
+)
 from services.redis_service import MACHINE_SPEC_CHANNEL, POD_STATES_CHANNEL, RedisService
 from services.efa_link_probe import measure_and_attach as measure_and_attach_efa
 from services.roce_link_probe import CYCLE_JOB_WAIT_SECONDS, PROBE_TAIL_MARGIN_SECONDS, measure_and_attach
@@ -2074,13 +2081,20 @@ class MinerService:
             aiohttp.ClientError: For other HTTP client errors
         """
         try:
-            async with aiohttp.ClientSession() as session:
+            # The URL is the miner's own axon address: only a public one is dialled (the connector checks a
+            # name; aiohttp dials a literal without a lookup, so it is checked here), and a redirect is never
+            # followed to another address.
+            target = yarl.URL(url)
+            if target.host and is_ip_literal(target.host):
+                await resolve_node_host(target.host, target.port)
+            async with aiohttp.ClientSession(connector=public_host_connector()) as session:
                 async with session.request(
                     method=method,
                     url=url,
                     json=json_data,
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=timeout, sock_connect=MINER_CONNECT_TIMEOUT_S),
+                    allow_redirects=False,
                 ) as response:
                     response.raise_for_status
                     response_data = await response.json()
