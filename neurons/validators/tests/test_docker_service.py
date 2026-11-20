@@ -5764,6 +5764,8 @@ async def test_a_create_is_reported_only_once_cuda_uses_every_rented_gpu(
     if outcome == "failed at gpu_cuda_proof":
         assert isinstance(result, FailedContainerRequest)
         assert result.failure_step == "gpu_cuda_proof" and "1 of the 8 rented GPUs" in result.detail
+        # the backend's rent retry and creation-failure classifier read this type and step
+        assert result.error_type == FailedContainerErrorTypes.ContainerCreationFailed
     else:
         assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
     if "not checked" in outcome:
