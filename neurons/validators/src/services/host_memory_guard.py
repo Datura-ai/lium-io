@@ -56,16 +56,24 @@ def _host_memory_min_script() -> str:
         # A child's protection never exceeds its parent's, so bottom-up each cgroup gets the larger of its existing
         # memory.min and its own request plus its children's totals ("max" absorbs), parents written first. tree's
         # argument names a path left to systemd (/system.slice when systemd sets it); its direct children's total is
-        # the record "<total> =", which flush skips
+        # the record "<total> =", which flush skips.
+        # A parent's protection is shared among all its children, so each written parent also counts its other
+        # children ("s path" records from sib), each with the protection it already holds: its memory.min, never more
+        # than the parent grants today (a sibling may be a rental; its own claim must not raise the host's reserve)
         'acc=; add() { acc="$acc$2 $1\n"; }; '
-        "tree() { printf '%s' \"$acc\" | awk -v k=\"$1\" '"
+        "sib() { printf '%s' \"$acc\" | while IFS= read -r r; do p=${r#* }; "
+        'while u=${p%/*}; [ -n "$u" ] && [ "$u" != "$1" ]; do for c in "/sys/fs/cgroup$u"/*/; do '
+        '[ -f "${c}memory.min" ] || continue; c=${c%/}; printf \'s %s\\n\' "${c#/sys/fs/cgroup}"; done; p=$u; done; done; }; '
+        "tree() { { printf '%s' \"$acc\"; sib \"$1\"; } | awk -v k=\"$1\" '"
         'function sum(a,b){return (a=="max"||b=="max")?"max":a+b} '
         'function big(a,b){return (a=="max"||b=="max")?"max":(a+0>b+0?a:b)} '
-        '{v=$1; q=substr($0,length(v)+2); own[q]=sum(own[q],v); n=split(q,a,"/"); p=""; '
-        "for(i=2;i<=n;i++){p=p \"/\" a[i]; if(p!=k){d[p]=i; if(i>m) m=i}}} "
-        'END{for(i=m;i>=2;i--) for(p in d) if(d[p]==i){c=""; f="/sys/fs/cgroup" p "/memory.min"; '
-        "if((getline c < f)<=0) c=0; close(f); t[p]=big(c,sum(own[p],t[p])); "
-        'u=p; sub(/\\/[^\\/]*$/,"",u); if(u in d) t[u]=sum(t[u],t[p]); else if(u==k) s=sum(s,t[p]); print t[p], p} '
+        'function small(a,b){return a=="max"?b:(b=="max"?a:(a+0<b+0?a:b))} '
+        'function rd(p, c,f){c=""; f="/sys/fs/cgroup" p "/memory.min"; if((getline c < f)<=0) c=0; close(f); return c} '
+        '{v=$1; q=substr($0,length(v)+2); if(v!="s") own[q]=sum(own[q],v); n=split(q,a,"/"); p=""; '
+        "for(i=2;i<=n;i++){p=p \"/\" a[i]; if(p!=k){d[p]=i; if(i>m) m=i; if(v!=\"s\") w[p]=1}}} "
+        'END{for(i=m;i>=2;i--) for(p in d) if(d[p]==i){u=p; sub(/\\/[^\\/]*$/,"",u); '
+        "t[p]=(p in w)?big(rd(p),sum(own[p],t[p])):small(rd(p),rd(u)); "
+        'if(u in d) t[u]=sum(t[u],t[p]); else if(u==k) s=sum(s,t[p]); if(p in w) print t[p], p} '
         'print (s==""?0:s), "="}\'; }; '
         'flush() { tree "$1" | LC_ALL=C sort -k2 | while read -r v p; do [ "$p" = = ] || set_cg_min "$p" "$v"; done; }; '
         # this shell sits in the executor's cgroup; with the host cgroup namespace its path is absolute
@@ -88,9 +96,10 @@ def _host_memory_min_script() -> str:
         'set_min "$u" "$d"; fi; '
         'case "$ex" in "/system.slice/$u/"*) add "/system.slice/$u" "$e"; hs=$e;; esac; done; '
         # the executor's scope counts with its larger existing MemoryMin ("infinity" included); an executor directly
-        # in system.slice adds its own share to the slice
+        # in system.slice adds its own share to the slice; one nested deeper (even under a docker scope) is written directly
         'case "$ex" in '
         f'/system.slice) sl=$((sl + {ex_min}));; '
+        f'/system.slice/*/*) add "$ex" {ex_min};; '
         '/system.slice/docker-*.scope) s=${ex#/system.slice/}; v=$(systemctl show -p MemoryMin --value "$s"); '
         f'if [ "$v" = infinity ]; then inf=1; elif [ "$v" -gt {ex_min} ] 2>/dev/null; then sl=$((sl + v)); '
         f'else sl=$((sl + {ex_min})); fi; set_min "$s" {ex_min};; '

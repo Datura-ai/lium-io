@@ -362,3 +362,35 @@ async def test_unapplied_settings_log_a_warning_with_the_node_and_reason(caplog)
     assert len(warning) == 1
     extra = warning[0].msg.extra
     assert extra["executor_uuid"] == "node-1" and extra["failed"] == ["memory_min no_systemd"]
+
+
+def test_executor_nested_under_a_docker_scope_is_written_with_its_parent(tmp_path):
+    run = _run_memory_min(tmp_path, "/system.slice/docker-abc.scope/worker.scope")
+
+    out = parse_guard_output(run())
+
+    root, state = tmp_path / "cg", tmp_path / "sd"
+    assert _read(root / "system.slice/docker-abc.scope/worker.scope/memory.min") == EX
+    assert _read(root / "system.slice/docker-abc.scope/memory.min") == EX
+    assert not (state / "docker-abc.scope/worker.scope").exists()
+    assert _read(state / "system.slice") == UNITS_MIB * MIB + EX
+    assert out["failed"] == []
+
+
+@pytest.mark.parametrize(("granted", "sibling", "parent"), [
+    (4096 * MIB, 4096 * MIB, 4096 * MIB + EX),  # a reservation the parent already grants keeps it, the executor adds
+    (0, "max", EX),  # a claim the parent never granted (a rental's own) does not raise the parent
+    (2048 * MIB, 4096 * MIB, 2048 * MIB + EX),  # only the granted part counts
+])
+def test_parent_counts_the_protection_its_other_children_already_hold(tmp_path, granted, sibling, parent):
+    run = _run_memory_min(tmp_path, "/tenant/executor", systemd=False)
+    root = tmp_path / "cg"
+    (root / "tenant/other").mkdir(parents=True)
+    (root / "tenant/other/memory.min").write_text(f"{sibling}\n")
+    (root / "tenant/memory.min").write_text(f"{granted}\n")
+
+    run()
+
+    assert _read(root / "tenant/memory.min") == parent
+    assert _read(root / "tenant/executor/memory.min") == EX
+    assert (root / "tenant/other/memory.min").read_text().strip() == str(sibling)
