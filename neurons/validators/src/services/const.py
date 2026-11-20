@@ -1,5 +1,7 @@
 import re
 
+from datura.rental_egress import RENTAL_CONTAINER_NAME
+
 MIN_JOB_TAKEN_TIME = 20
 
 # the plugin aliases new rental volumes are created on: v3 with LOOPBACK_PLUGIN_V3_ENABLED, else v2
@@ -420,9 +422,8 @@ LIUM_POD_ID_LABEL = "io.lium.pod_id"
 LIUM_WORKLOAD_LOOKUPS_PER_CYCLE = 10
 # A pod or filler container created before the label: reaped only when the backend's record of
 # that pod or filler run confirms it ended.
-LEGACY_LIUM_CONTAINER_NAME = re.compile(
-    r"^(?:pod|filler)_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:__prev|__stopped)?$"
-)
+# One pattern with the executor's own rental egress rules (datura.rental_egress).
+LEGACY_LIUM_CONTAINER_NAME = RENTAL_CONTAINER_NAME
 # The backend's own probe, created over SSH and so never labelled: health_check_{uuid4().hex}, or
 # the int(time.time()) suffix it used before (lium-platform orchestrator/executor_health_check.py).
 LIUM_HEALTH_CHECK_CONTAINER_NAME = re.compile(r"^health_check_(?:[0-9a-f]{32}|[0-9]{10})$")

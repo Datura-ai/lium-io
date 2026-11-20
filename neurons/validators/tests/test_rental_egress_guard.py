@@ -9,6 +9,7 @@ import subprocess
 from types import SimpleNamespace
 
 import pytest
+from datura import rental_egress
 from services.task import pipeline_factory
 from services.task.checks import rental_egress_guard
 from services.task.checks.rental_egress_guard import (
@@ -25,9 +26,20 @@ from services.task.checks.rental_egress_guard import (
 )
 from services.task.pipeline_factory import (
     _RENTAL_EGRESS_GUARD_IDLE,
+    _RENTAL_EGRESS_GUARD_IDLE_READ,
     _RENTAL_EGRESS_GUARD_RENTED,
     PipelineFactory,
 )
+
+
+@pytest.fixture(autouse=True)
+def _an_executor_without_the_capability(monkeypatch):
+    """Every test here is an older executor's (the SSH write path) unless it sets the capability itself."""
+
+    async def advertised(ctx):
+        return set()
+
+    monkeypatch.setattr(rental_egress_guard, "advertised_capabilities", advertised)
 
 
 NET_ID = "0123456789abcdef" * 4
@@ -52,6 +64,7 @@ def _ssh(
     legacy_nets=f"{LEGACY_NET_ID} bridge docker0",
     legacy_nets_rc=0,
     legacy_nets_stderr="",
+    helper_stdout="",
 ):
     calls: list[str] = []
     if network_stderr is None:
@@ -67,7 +80,9 @@ def _ssh(
             return SimpleNamespace(exit_status=inspect_rc, stdout=network, stderr=network_stderr)
         if "docker inspect" in cmd:
             return SimpleNamespace(exit_status=pods_rc, stdout=legacy, stderr=pods_stderr)
-        return SimpleNamespace(exit_status=helper_rc, stdout="", stderr="DOCKER-USER chain not found" if helper_rc else "")
+        return SimpleNamespace(
+            exit_status=helper_rc, stdout=helper_stdout, stderr="DOCKER-USER chain not found" if helper_rc else ""
+        )
 
     return SimpleNamespace(run=run, calls=calls)
 
@@ -202,8 +217,11 @@ def test_never_runs_before_a_scored_step(build):
     # rented: inside TenantEnforcementCheck's rented halt; idle: after ScoreCheck
     [tenant] = [check for check in checks if type(check).__name__ == "TenantEnforcementCheck"]
     assert tenant.egress_guard is _RENTAL_EGRESS_GUARD_RENTED
-    assert names[checks.index(_RENTAL_EGRESS_GUARD_IDLE) - 1] == "ScoreCheck"
-    assert names.count("RentalEgressGuardCheck") == 1
+    # the idle read right after ScoreCheck, then the completion instance (the pipeline runs it when the run ends)
+    assert names[checks.index(_RENTAL_EGRESS_GUARD_IDLE_READ) - 1] == "ScoreCheck"
+    assert checks.index(_RENTAL_EGRESS_GUARD_IDLE) == checks.index(_RENTAL_EGRESS_GUARD_IDLE_READ) + 1
+    assert names.count("RentalEgressGuardCheck") == 2
+    assert _RENTAL_EGRESS_GUARD_IDLE.on_completion and not _RENTAL_EGRESS_GUARD_IDLE_READ.on_completion
 
 
 def test_not_in_the_dry_run():
@@ -214,6 +232,7 @@ def test_not_in_the_dry_run():
 
 def test_both_positions_share_one_cadence():
     assert _RENTAL_EGRESS_GUARD_RENTED._last_run is _RENTAL_EGRESS_GUARD_IDLE._last_run
+    assert _RENTAL_EGRESS_GUARD_IDLE_READ._last_run is _RENTAL_EGRESS_GUARD_IDLE._last_run
     assert pipeline_factory._RENTAL_EGRESS_GUARD_LAST_RUN is _RENTAL_EGRESS_GUARD_IDLE._last_run
 
 
@@ -428,7 +447,7 @@ async def test_apply_and_cleanup_take_the_same_host_lock(context_factory):
     assert cleanup_cmd.endswith(helper_command(link_local_cleanup_script()))
     # the host file the previous release locked too, reached through PID 1's root
     assert rental_egress_guard.HOST_LOCK == "/proc/1/root/run/lock/lium-rental-egress/apply.lock"
-    assert rental_egress_guard.HELPER_RUN_SECONDS < rental_egress_guard.HELPER_TIMEOUT_SECONDS
+    assert rental_egress.HELPER_RUN_SECONDS < rental_egress_guard.HELPER_TIMEOUT_SECONDS
 
 
 def _legacy_rental(monkeypatch):
@@ -715,7 +734,7 @@ def _probe(tmp_path, monkeypatch, slow=""):
         (bin_dir / name).write_text(_LOCK_PROBE_STUB)
         (bin_dir / name).chmod(0o755)
     lock = str(tmp_path / "egress.lock")
-    monkeypatch.setattr(rental_egress_guard, "HOST_LOCK", lock)
+    monkeypatch.setattr(rental_egress, "HOST_LOCK", lock)
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "STATE": str(state), "LOCK": lock, "SLOW": slow}
     return state, lock, env
 
@@ -735,7 +754,7 @@ def test_every_iptables_call_of_the_helper_runs_under_the_host_lock(tmp_path, mo
 
 def test_a_held_lock_is_waited_for_and_never_skipped(tmp_path, monkeypatch):
     state, lock, env = _probe(tmp_path, monkeypatch)
-    monkeypatch.setattr(rental_egress_guard, "LOCK_WAIT_SECONDS", 1)
+    monkeypatch.setattr(rental_egress, "LOCK_WAIT_SECONDS", 1)
     with open(lock, "w") as held:
         import fcntl
 
@@ -754,7 +773,7 @@ def test_the_helper_bound_cannot_free_the_lock_while_a_mutation_runs(tmp_path, m
     import time
 
     state, lock, env = _probe(tmp_path, monkeypatch, slow="-I")
-    monkeypatch.setattr(rental_egress_guard, "HELPER_RUN_SECONDS", 1)
+    monkeypatch.setattr(rental_egress, "HELPER_RUN_SECONDS", 1)
     command = helper_command(link_local_drop_script("br-0123456789ab", []))
     if kills == "shell-only":
         command = command.replace("timeout -s KILL", "timeout --foreground -s KILL", 1)
@@ -800,7 +819,7 @@ def test_the_helper_runs_only_iptables_in_the_host_root(tmp_path, monkeypatch, s
         (bin_dir / name).write_text(body)
         (bin_dir / name).chmod(0o755)
     (state / "DOCKER-USER").write_text("RETURN\n")
-    monkeypatch.setattr(rental_egress_guard, "HOST_LOCK", str(tmp_path / "lock" / "apply.lock"))
+    monkeypatch.setattr(rental_egress, "HOST_LOCK", str(tmp_path / "lock" / "apply.lock"))
     body = link_local_drop_script("br-0123456789ab", []) if script == "apply" else link_local_cleanup_script()
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "STATE": str(state)}
 
@@ -811,3 +830,208 @@ def test_the_helper_runs_only_iptables_in_the_host_root(tmp_path, monkeypatch, s
     if script == "apply":
         [(_, rules)] = _jumps_and_rules(state)
         assert rules == [f"-i br-0123456789ab -d {LINK_LOCAL_CIDR} -p {p} ! --dport 53 -j DROP" for p in ("tcp", "udp")]
+
+
+
+# DAH-6855: an executor that applies the rules itself; the validator only reads them back.
+
+
+def _capable(monkeypatch, capabilities=(rental_egress.RENTAL_EGRESS_CAPABILITY,)):
+    async def advertised(ctx):
+        return set(capabilities)
+
+    monkeypatch.setattr(rental_egress_guard, "advertised_capabilities", advertised)
+
+
+# `iptables -S <chain>` as the host prints it: options in its own order, with the -m module the rule loads.
+def _listed(chain, bridge):
+    return "".join(
+        f"-A {chain} -d {LINK_LOCAL_CIDR} -i {bridge} -p {p} -m {p} ! --dport 53 -j DROP\n" for p in ("tcp", "udp")
+    )
+
+
+_MUTATING = (" -A ", " -I ", " -D ", " -F ", " -N ", " -X ", "flock", "mkdir")
+
+
+def _read_only(ssh) -> bool:
+    return all(not any(op in call for op in _MUTATING) for call in _helper_calls(ssh))
+
+
+@pytest.mark.asyncio
+async def test_rules_in_place_on_a_capable_executor_are_read_and_never_written(context_factory, monkeypatch):
+    _capable(monkeypatch)
+    ssh = _ssh(helper_stdout=f"-N {CHAINS[0]}\n" + _listed(CHAINS[0], "br-0123456789ab"))
+    check = RentalEgressGuardCheck(on_completion=False)
+
+    result = await check.run(context_factory(ssh=ssh))
+
+    assert result.event.reason_code == "RENTAL_EGRESS_GUARD_PRESENT"
+    assert result.event.what_we_saw["missing"] == [] and result.event.what_we_saw["bridge"] == "br-0123456789ab"
+    [read] = _helper_calls(ssh)
+    assert _read_only(ssh) and rental_egress.HOST_LOCK not in read
+    assert check._last_run  # read once per interval while they are in place
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("listed", ["", f"-N {CHAINS[1]}\n", _listed(CHAINS[0], "br-ffffffffffff")])
+async def test_rules_missing_on_a_capable_executor_are_an_availability_error_read_again_next_cycle(
+    context_factory, monkeypatch, listed
+):
+    from services.task.availability import AvailabilityErrorCode, availability_errors
+
+    _capable(monkeypatch)
+    ssh = _ssh(helper_stdout=listed)
+    check = RentalEgressGuardCheck(rented_only=True)
+    monkeypatch.setattr(
+        rental_egress_guard,
+        "rental_of_this_node",
+        lambda ctx: SimpleNamespace(pods=[SimpleNamespace(docker_container_name="pod")]),
+    )
+
+    result = await check.run(context_factory(ssh=ssh))
+
+    assert result.passed is True  # a running rental is kept; the node only takes no new one
+    [error] = availability_errors([result.event])
+    assert error.reason_code == AvailabilityErrorCode.RENTAL_EGRESS_RULES_MISSING
+    assert error.what_we_saw["missing"] == ["br-0123456789ab"]
+    assert _read_only(ssh)
+    assert check._last_run == {}  # read again on the next cycle, so the error stands only while they are missing
+
+
+@pytest.mark.asyncio
+async def test_a_failed_read_is_fail_open_and_never_hides_the_node(context_factory, monkeypatch):
+    from services.task.availability import availability_errors
+
+    _capable(monkeypatch)
+    ssh = _ssh(helper_rc=3)  # no DOCKER-USER chain: the executor could not apply them either
+
+    result = await RentalEgressGuardCheck(on_completion=False).run(context_factory(ssh=ssh))
+
+    assert result.event.reason_code == "RENTAL_EGRESS_GUARD_NOT_READ"
+    assert availability_errors([result.event]) == [] and _read_only(ssh)
+
+
+@pytest.mark.asyncio
+async def test_a_capable_executor_with_nothing_to_guard_reads_nothing_and_cleans_nothing(context_factory, monkeypatch):
+    _capable(monkeypatch)
+    ssh = _ssh(network="", inspect_rc=1)
+
+    result = await RentalEgressGuardCheck(on_completion=False).run(context_factory(ssh=ssh))
+
+    assert result.event.reason_code == "RENTAL_EGRESS_GUARD_SKIPPED" and _helper_calls(ssh) == []
+
+
+@pytest.mark.asyncio
+async def test_the_completion_instance_never_touches_a_capable_executors_host(context_factory, monkeypatch):
+    _capable(monkeypatch)
+    ssh = _ssh()
+    check = RentalEgressGuardCheck()
+
+    result = await check.run(context_factory(ssh=ssh))
+
+    assert result.event.what_we_saw["reason"] == "applied by the executor; read in the run"
+    assert ssh.calls == [] and check._last_run == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capabilities", [(), ("local_verify/1",)])
+async def test_an_older_executor_keeps_the_ssh_write_path_and_is_never_hidden_for_its_age(
+    context_factory, monkeypatch, capabilities
+):
+    from services.task.availability import availability_errors
+
+    _capable(monkeypatch, capabilities)
+    last_run: dict = {}
+    in_run = RentalEgressGuardCheck(on_completion=False, last_run=last_run)
+    at_completion = RentalEgressGuardCheck(last_run=last_run)
+    ssh = _ssh()
+    ctx = context_factory(ssh=ssh)
+
+    read = await in_run.run(ctx)
+    assert read.event.what_we_saw["reason"] == "written when the run ends" and ssh.calls == [] and last_run == {}
+    written = await at_completion.run(ctx)
+
+    assert written.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
+    [helper] = _helper_calls(ssh)
+    assert "-j DROP" in helper and rental_egress.HOST_LOCK in helper
+    assert availability_errors([read.event, written.event]) == []
+
+
+def test_missing_rules_accepts_the_hosts_listing_and_nothing_weaker():
+    bridges = ["br-0123456789ab", "docker0"]
+    full = _listed(CHAINS[0], "br-0123456789ab") + _listed(CHAINS[0], "docker0")
+    assert rental_egress.missing_rules(full, bridges) == []
+    # our own append form, as the test iptables keeps it
+    appended = "".join(f"-A X {rental_egress.drop_rule(b, p)}\n" for b in bridges for p in ("tcp", "udp"))
+    assert rental_egress.missing_rules(appended, bridges) == []
+    assert rental_egress.missing_rules(_listed(CHAINS[0], "docker0"), bridges) == ["br-0123456789ab"]
+    udp_only = _listed(CHAINS[0], "docker0").splitlines()[1]
+    assert rental_egress.missing_rules(udp_only, ["docker0"]) == ["docker0"]
+    narrowed = full.replace("-i docker0 -p tcp", "-i docker0 -s 10.0.0.2/32 -p tcp")
+    assert rental_egress.missing_rules(narrowed, bridges) == ["docker0"]
+    wider_dns = full.replace("! --dport 53", "! --dport 443", 1)
+    assert rental_egress.missing_rules(wider_dns, bridges) == ["br-0123456789ab"]
+
+
+def test_the_read_script_sees_exactly_what_the_apply_script_writes(tmp_path):
+    """The two scripts share one source: whatever the apply leaves in force, the read reports as present."""
+    bin_dir, state = tmp_path / "bin", tmp_path / "state"
+    bin_dir.mkdir()
+    state.mkdir()
+    stub = _IPTABLES_STUB.replace(
+        '  -S) echo "-N DOCKER-USER";',
+        '  -S) [ "$chain" != DOCKER-USER ] && { echo "-N $chain"; sed "s/^/-A $chain /" "$STATE/$chain"; exit 0; }; '
+        'echo "-N DOCKER-USER";',
+    )
+    for name in ("iptables-nft", "iptables-legacy"):
+        (bin_dir / name).write_text(stub)
+        (bin_dir / name).chmod(0o755)
+    (state / "DOCKER-USER").write_text("RETURN\n")
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "STATE": str(state)}
+    bridges = ["br-0123456789ab", "docker0"]
+
+    def read() -> list[str]:
+        done = subprocess.run(["sh", "-c", rental_egress.link_local_read_script()], env=env, capture_output=True, text=True)
+        assert done.returncode == 0, done.stderr
+        return rental_egress.missing_rules(done.stdout, bridges)
+
+    assert read() == bridges  # nothing applied yet
+    for _ in range(2):  # the first apply and a swap to the other chain
+        applied = subprocess.run(["sh", "-c", link_local_drop_script(*bridges[:1], bridges[1:])], env=env)
+        assert applied.returncode == 0
+        assert read() == []
+    subprocess.run(["sh", "-c", link_local_cleanup_script()], env=env, check=True)
+    assert read() == bridges
+
+
+@pytest.mark.asyncio
+async def test_an_idle_capable_executor_without_its_rules_is_hidden_by_the_runs_own_events(context_factory, monkeypatch):
+    """The idle read is a step of the run, not a completion step, so its error is one the backend hides the node for;
+    the completion instance leaves the host alone."""
+    from unittest.mock import AsyncMock
+
+    from services.task.availability import run_availability_errors
+    from services.task.pipeline import Pipeline
+
+    _capable(monkeypatch)
+    ssh = _ssh(helper_stdout="")
+    last_run: dict = {}
+    checks = [RentalEgressGuardCheck(on_completion=False, last_run=last_run), RentalEgressGuardCheck(last_run=last_run)]
+
+    ok, events, _ = await Pipeline(checks, AsyncMock()).run(context_factory(ssh=ssh))
+
+    assert ok is True
+    assert [e.reason_code for e in events] == ["RENTAL_EGRESS_RULES_MISSING"]
+    assert [e["reason_code"] for e in run_availability_errors(ok, events)] == ["RENTAL_EGRESS_RULES_MISSING"]
+    assert len(_helper_calls(ssh)) == 1 and _read_only(ssh)
+
+
+def test_the_validator_and_the_executor_share_one_rule_source():
+    """The executor imports the same module (neurons/executor/src/services/rental_egress_service.py), so the rules a
+    capable executor applies are exactly the ones read back here and written here for an older one."""
+    from services import const, rental_docker_sdk
+
+    for name in ("link_local_drop_script", "link_local_cleanup_script", "_helper", "apply_rules", "verify_rules"):
+        assert getattr(rental_egress_guard, name) is getattr(rental_egress, name)
+    assert const.LEGACY_LIUM_CONTAINER_NAME is rental_egress.RENTAL_CONTAINER_NAME
+    assert rental_docker_sdk.RENTAL_NETWORK_NAME == rental_egress.RENTAL_NETWORK_NAME

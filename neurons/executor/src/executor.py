@@ -15,6 +15,7 @@ from routes.apis import apis_router
 from services.cache_template_service import run_cache_template_prefetch
 from services.heartbeat_service import run_node_heartbeat
 from services.pod_ssh_recovery_service import start_pod_ssh_recovery_watcher
+from services.rental_egress_service import start_rental_egress_rules
 from services.ssh_service import run_ssh_sources_refresh, run_uploaded_key_purge
 from services.validator_trust_service import run_validator_trust_refresh, validator_trust
 
@@ -53,6 +54,8 @@ async def lifespan(app: FastAPI):
     validator_trust_task = asyncio.create_task(run_validator_trust_refresh())
     # DAH-6379: a restarted pod gets its sshd back
     start_pod_ssh_recovery_watcher()
+    # DAH-6855: the rental egress rules, at start and whenever the rental network or a rental container comes up
+    start_rental_egress_rules()
     try:
         yield
     finally:

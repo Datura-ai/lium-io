@@ -19,6 +19,7 @@ import requests
 import urllib3
 
 from core.utils import _m, get_extra_info
+from datura.rental_egress import RENTAL_NETWORK_NAME as SHARED_RENTAL_NETWORK_NAME
 from datura.requests.miner_requests import ExecutorSSHInfo
 from services.const import RENTAL_CPU_COUNT_LABEL
 from services.node_host import NodeHostError, dial_validated, reports_registered_host_key, resolve_node_host
@@ -87,7 +88,8 @@ _DOCKER_EXECUTOR = ThreadPoolExecutor(
 # host could otherwise reach each other's unpublished ports. Docker enforces ICC=false with a FORWARD
 # drop between ports of this bridge; published ports still arrive through the host and NAT egress is
 # untouched. One network per host — nothing to remove at teardown.
-RENTAL_NETWORK_NAME = "lium-rentals"
+# the name the executor watches for its egress rules (datura.rental_egress)
+RENTAL_NETWORK_NAME = SHARED_RENTAL_NETWORK_NAME
 RENTAL_NETWORK_ICC_OPTION = "com.docker.network.bridge.enable_icc"
 RENTAL_NETWORK_OPTIONS = {RENTAL_NETWORK_ICC_OPTION: "false"}
 RENTAL_NETWORK_LABELS = {"io.lium.purpose": "rental-isolation"}

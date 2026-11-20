@@ -30,6 +30,7 @@ from core.logger import _m
 
 from payloads.miner import UploadSShKeyPayload, GetPodLogsPaylod, MinerIdentityResponse
 from payloads.backend import ContainerUtilizationPayload, SignaturePayload
+from datura.rental_egress import RENTAL_EGRESS_CAPABILITY
 from payloads.verify import CAPABILITY as LOCAL_VERIFY_CAPABILITY, VerifyIntent
 from dependencies.auth import (
     match_validator_hotkey,
@@ -447,7 +448,8 @@ async def get_version():
     """
     return {
         "version": _get_version(),
-        "capabilities": [LOCAL_VERIFY_CAPABILITY],
+        # RENTAL_EGRESS_CAPABILITY: this executor applies the rental egress rules itself (services/rental_egress_service.py)
+        "capabilities": [LOCAL_VERIFY_CAPABILITY, RENTAL_EGRESS_CAPABILITY],
         "local_verify_port": settings.INTERNAL_PORT,
         # DAH-6590: the validator address and revision this node trusts, so a switch is measured per node
         "validator_trust": validator_trust.report(),

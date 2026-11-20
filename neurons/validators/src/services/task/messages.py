@@ -1273,6 +1273,32 @@ class RentalEgressGuardMessages:
         category="prep",
         impact="Proceed; retried at the next interval",
     )
+    # An executor that applies the rules itself: the validator only reads them back.
+    PRESENT = MessageTemplate(
+        event="Rental egress rules in place",
+        reason="RENTAL_EGRESS_GUARD_PRESENT",
+        severity="info",
+        category="prep",
+        impact="Proceed",
+    )
+    NOT_READ = MessageTemplate(
+        event="Rental egress rules could not be read",
+        reason="RENTAL_EGRESS_GUARD_NOT_READ",
+        severity="warning",
+        category="prep",
+        impact="Proceed; read again at the next interval",
+    )
+    MISSING = MessageTemplate(
+        event="Rental egress rules missing on this node",
+        reason="RENTAL_EGRESS_RULES_MISSING",
+        severity="error",
+        # an availability error: no new rental is placed on the node, a running rental is kept
+        category=AVAILABILITY_CATEGORY,
+        impact="Not rentable until the executor's rental network rules are back (a running rental is kept)",
+        remediation="The executor applies these rules at start and whenever a rental starts. Restart the executor "
+        "container (docker compose up -d in ~/compute-subnet/neurons/executor) and check its log for "
+        "'rental egress'; the node is listed again on the next check that reads them.",
+    )
 
 
 class InspectorMessages:

@@ -129,6 +129,8 @@ _CUSTOM_BUILD_ORPHAN_SWEEP_SINGLETON = CustomBuildOrphanSweepCheck()
 _RENTAL_EGRESS_GUARD_LAST_RUN: dict[tuple, float] = {}
 _RENTAL_EGRESS_GUARD_RENTED = RentalEgressGuardCheck(rented_only=True, last_run=_RENTAL_EGRESS_GUARD_LAST_RUN)
 _RENTAL_EGRESS_GUARD_IDLE = RentalEgressGuardCheck(last_run=_RENTAL_EGRESS_GUARD_LAST_RUN)
+# DAH-6855: the idle read of an executor that applies the rules itself, in the run so a missing drop is its event
+_RENTAL_EGRESS_GUARD_IDLE_READ = RentalEgressGuardCheck(on_completion=False, last_run=_RENTAL_EGRESS_GUARD_LAST_RUN)
 
 # DAH-2805: same reason — the download-temporary sweep inside this check carries its own per-executor
 # cadence, and a fresh instance every cycle would sweep every cycle.
@@ -478,6 +480,7 @@ class PipelineFactory:
                 # DAH-5462: VerifyX's second sample of a cold never-measured node, in whatever time the checks above left
                 VerifyXColdRetryCheck(),
                 ScoreCheck(),
+                _RENTAL_EGRESS_GUARD_IDLE_READ,
                 _RENTAL_EGRESS_GUARD_IDLE,
                 FinalizeCheck(),
             ],
@@ -617,6 +620,7 @@ class PipelineFactory:
                 # DAH-5462: VerifyX's second sample of a cold never-measured node, in whatever time the checks above left
                 VerifyXColdRetryCheck(),
                 ScoreCheck(),
+                _RENTAL_EGRESS_GUARD_IDLE_READ,
                 _RENTAL_EGRESS_GUARD_IDLE,
                 FinalizeCheck(),
             ],

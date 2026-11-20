@@ -77,6 +77,8 @@ class AvailabilityErrorCode(StrEnum):
     NODE_ACCOUNT_MISMATCH = "NODE_ACCOUNT_MISMATCH"
     # DAH-6539: the account read failed or stalled; a reach failure, so silenced with our own outage like one.
     NODE_ACCOUNT_UNVERIFIED = "NODE_ACCOUNT_UNVERIFIED"
+    # DAH-6855: an executor that applies the rental egress rules itself runs a rental network without them.
+    RENTAL_EGRESS_RULES_MISSING = "RENTAL_EGRESS_RULES_MISSING"
 
 
 # Faults the node itself proved: never a sign of our own outage, and never silenced with one.
@@ -91,6 +93,8 @@ NODE_GPU_FAULT_CODES = frozenset(
         AvailabilityErrorCode.GPU_WORK_PROOF_FAILED,
         # read off the machine itself (its host key or account files)
         AvailabilityErrorCode.NODE_ACCOUNT_MISMATCH,
+        # read back off the host's own iptables after the executor had to apply them (RentalEgressGuardCheck)
+        AvailabilityErrorCode.RENTAL_EGRESS_RULES_MISSING,
         # only raised for REASONS_THAT_HIDE_AT_ONCE, all read off the node's own report or probe
         AvailabilityErrorCode.VERIFICATION_FAILED,
     }
