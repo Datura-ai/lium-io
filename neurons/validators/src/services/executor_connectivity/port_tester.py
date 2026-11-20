@@ -1,12 +1,14 @@
 import asyncio
 import logging
 import statistics
+import threading
 import time
 
 import aiohttp
 
 from core.utils import _m, get_extra_info
 from services.executor_connectivity.models import PortPair
+from services.node_host import public_host_connector
 
 logger = logging.getLogger(__name__)
 
@@ -14,18 +16,49 @@ logger = logging.getLogger(__name__)
 # connector hands out a socket, so a probe queued behind a full pool burned its budget waiting
 # and was recorded as a dead port without ever putting a packet on the wire
 PROBE_TIMEOUT = aiohttp.ClientTimeout(sock_connect=3, sock_read=3)
+# open probe sockets across every node being verified; a probe waiting for one has not started its budget
+PROBE_CONCURRENCY = 256
 
 
 class PortTester:
-    """Tests port connectivity via HTTP. Stateless and easily mockable."""
+    """Tests port connectivity via HTTP on its own event loop in a daemon thread.
 
-    async def test_one(self, session: aiohttp.ClientSession, host: str, port: PortPair, token: str) -> bool:
+    Probes never run on the validator's loop: a wave of probe callbacks there delayed every other
+    reply on it, so Redis replies sat unread and pool checkouts ran past their wait.
+    """
+
+    def __init__(self, concurrency: int = PROBE_CONCURRENCY):
+        self._concurrency = concurrency
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._session: aiohttp.ClientSession | None = None  # touched only on the probe loop
+        self._start_lock = threading.Lock()
+
+    def _probe_loop(self) -> asyncio.AbstractEventLoop:
+        with self._start_lock:
+            if self._loop is None:
+                loop = asyncio.new_event_loop()
+                threading.Thread(target=loop.run_forever, name="port-probes", daemon=True).start()
+                self._loop = loop
+            return self._loop
+
+    async def _on_probe_loop(self, coro):
+        # cancelling the caller (its deadline) cancels the probes on the probe loop too
+        return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(coro, self._probe_loop()))
+
+    async def test_one(self, host: str, port: PortPair, token: str) -> bool:
         """Test single port connectivity via HTTP."""
+        return await self._on_probe_loop(self._probe(host, port, token))
+
+    async def _probe(self, host: str, port: PortPair, token: str) -> bool:
+        if self._session is None:
+            self._session = aiohttp.ClientSession(
+                connector=public_host_connector(limit=self._concurrency, force_close=True)
+            )
         url = f"http://{host}:{port.external}/"
         expected = f"{token}:{port.internal}"
 
         try:
-            async with session.get(url, timeout=PROBE_TIMEOUT) as resp:
+            async with self._session.get(url, timeout=PROBE_TIMEOUT) as resp:
                 text = await resp.text()
                 return text.strip() == expected
         except Exception:
@@ -33,7 +66,6 @@ class PortTester:
 
     async def test_many(
         self,
-        session: aiohttp.ClientSession,
         host: str,
         ports: list[PortPair],
         token: str,
@@ -45,12 +77,15 @@ class PortTester:
         async def timed(port: PortPair) -> bool:
             started = time.monotonic()
             try:
-                return await self.test_one(session, host, port, token)
+                return await self._probe(host, port, token)
             finally:
                 durations.append(time.monotonic() - started)
 
+        async def probe_all() -> list[bool]:
+            return await asyncio.gather(*[timed(p) for p in ports])
+
         wall_started = time.monotonic()
-        results = await asyncio.gather(*[timed(p) for p in ports])
+        results = await self._on_probe_loop(probe_all())
         wall = time.monotonic() - wall_started
 
         successful = [p for p, ok in zip(ports, results) if ok]
