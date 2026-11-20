@@ -37,7 +37,7 @@ def _fetch(host: str, port: int, timeout: float) -> str | None:
     return _get(f"http://{host}:{port}/", timeout)
 
 
-def _get(url: str, timeout: float) -> str | None:
+def _get(url: str, timeout: float, read=None) -> str | None:
     # one handler for opening and reading: an error status is an answer too, and a node that stalls or drops mid-body
     # is no answer for that target, never a failure of the whole invocation
     try:
@@ -46,9 +46,14 @@ def _get(url: str, timeout: float) -> str | None:
         except urllib.error.HTTPError as e:
             resp = e
         with resp:
-            return _capped(resp)
+            return (read or _capped)(resp)
     except Exception:
         return None
+
+
+def _canary_up(timeout: float) -> bool:
+    # the canary proves egress by answering at all; the node-answer size rule is not about it
+    return _get(CANARY_URL, timeout, read=lambda resp: "") is not None
 
 
 def _capped(resp) -> str | None:
@@ -79,9 +84,9 @@ def handler(event, context):
     if not targets or len(targets) > MAX_TARGETS or not all(_public(h) and 0 < p < 65536 for h, p in targets):
         return {"statusCode": 400, "body": "bad targets"}
     with ThreadPoolExecutor(max_workers=16) as pool:
-        canary = pool.submit(_get, CANARY_URL, timeout)
+        canary = pool.submit(_canary_up, timeout)
         bodies = list(pool.map(lambda t: _fetch(t[0], t[1], timeout), targets))
-        if canary.result() is None:
+        if not canary.result():
             return {"statusCode": 503, "body": "prober egress failed"}
     results = [{"host": h, "port": p, "body": b} for (h, p), b in zip(targets, bodies)]
     return {"statusCode": 200, "headers": {"content-type": "application/json"}, "body": json.dumps({"results": results})}

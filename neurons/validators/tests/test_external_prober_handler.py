@@ -26,12 +26,12 @@ def probe_token_env(monkeypatch):
 
 
 def test_egress_down_answers_no_verdict(monkeypatch):
-    monkeypatch.setattr(handler, "_get", lambda url, timeout: None)
+    monkeypatch.setattr(handler, "_get", lambda url, timeout, read=None: None)
     assert handler.handler(EVENT, None)["statusCode"] == 503
 
 
 def test_canary_ok_reports_each_target(monkeypatch):
-    monkeypatch.setattr(handler, "_get", lambda url, timeout: "ok" if url == handler.CANARY_URL else None)
+    monkeypatch.setattr(handler, "_get", lambda url, timeout, read=None: "ok" if url == handler.CANARY_URL else None)
     res = handler.handler(EVENT, None)
     assert res["statusCode"] == 200
     assert json.loads(res["body"])["results"] == [{"host": "1.2.3.4", "port": 8080, "body": None}]
@@ -57,6 +57,28 @@ def test_redirects_are_not_followed():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         assert handler._fetch("127.0.0.1", server.server_port, 3) == "moved"
+    finally:
+        server.shutdown()
+
+
+def test_a_canary_with_a_long_answer_still_proves_egress(monkeypatch):
+    """The canary only has to answer; the 256-byte rule is for node answers, so a long canary page is still egress."""
+
+    class Canary(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"x" * 1000)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Canary)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setattr(handler, "CANARY_URL", f"http://127.0.0.1:{server.server_port}/")
+    try:
+        assert handler._canary_up(3)
+        assert handler._fetch("127.0.0.1", server.server_port, 3) is None
     finally:
         server.shutdown()
 
