@@ -53,6 +53,7 @@ def _ssh(
     legacy_nets_stderr="",
     labelled="",
     labelled_rc=0,
+    helper_stdout="",
 ):
     calls: list[str] = []
     if network_stderr is None:
@@ -74,7 +75,7 @@ def _ssh(
             return SimpleNamespace(exit_status=pods_rc, stdout=legacy, stderr=pods_stderr)
         # a list is one exit per helper run; its last value repeats
         rc = (helper_rc.pop(0) if len(helper_rc) > 1 else helper_rc[0]) if isinstance(helper_rc, list) else helper_rc
-        return SimpleNamespace(exit_status=rc, stdout="", stderr="DOCKER-USER chain not found" if rc else "")
+        return SimpleNamespace(exit_status=rc, stdout=helper_stdout, stderr="DOCKER-USER chain not found" if rc else "")
 
     return SimpleNamespace(run=run, calls=calls)
 
@@ -1232,9 +1233,10 @@ def test_the_rules_are_back_before_dockerd_starts_a_container_after_a_reboot(tmp
     ]
 
 
-def test_a_boot_copy_that_cannot_restore_the_rules_fails_the_docker_start(tmp_path):
+def test_a_boot_copy_holds_the_docker_start_until_the_rules_are_back(tmp_path):
     """The boot copy's failure is not ignored by systemd: dockerd, which restarts rental containers on its own, does
-    not start until the rules are back."""
+    not start until the rules are back. It waits inside the one start, so a firewall write that fails for a while
+    uses none of Docker's start limit, and Docker starts once the write succeeds."""
     state, root, env = _modelled_host(tmp_path, docker_user=True)
     applied = subprocess.run(
         ["sh", "-c", link_local_drop_script("br-0123456789ab", [], str(root))], env=env, capture_output=True, text=True
@@ -1244,12 +1246,26 @@ def test_a_boot_copy_that_cannot_restore_the_rules_fails_the_docker_start(tmp_pa
     [line] = [x for x in dropin.splitlines() if x.startswith("ExecStartPre=")]
     assert not line.startswith("ExecStartPre=-")
 
-    # the reboot, with the firewall write failing
-    bin_dir = tmp_path / "bin"
-    (bin_dir / "iptables").write_text('#!/bin/sh\necho "write failed" >&2\nexit 4\n')
+    assert "TimeoutStartSec=infinity" in dropin.splitlines()  # no start timeout cuts the wait short
+
+    # the reboot, with the firewall write failing for a while
+    for chain in [p for p in state.iterdir() if p.name not in ("FORWARD", "reloads")]:
+        chain.unlink()
+    (state / "FORWARD").write_text("")
+    iptables = tmp_path / "bin" / "iptables"
+    working = iptables.read_text()
+    iptables.write_text('#!/bin/sh\necho "write failed" >&2\nexit 4\n')
     boot = root / rental_egress_guard.BOOT_SCRIPT.lstrip("/")
-    restored = subprocess.run(["sh", str(boot)], env=env, capture_output=True, text=True)
-    assert restored.returncode != 0
+    restoring = subprocess.Popen(["sh", str(boot)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            restoring.wait(timeout=2.5)  # still holding the start: neither failed nor passed without the rules
+        iptables.write_text(working)
+        assert restoring.wait(timeout=10) == 0
+    finally:
+        restoring.kill()
+    [(_, rules)] = _jumps_and_rules(state)
+    assert rules == [f"-i br-0123456789ab -d {LINK_LOCAL_CIDR} -p {p} ! --dport 53 -j DROP" for p in ("tcp", "udp")]
 
 
 def test_a_docker_start_after_the_last_rental_ended_restores_no_rules(tmp_path):
@@ -1309,6 +1325,29 @@ async def test_the_pre_start_guard_requires_the_pods_own_bridge_in_the_applied_r
         assert f"-i br-{LEGACY_NET_ID[:12]} " in helper
     else:
         assert error == f"the pod's bridge {LEGACY_NET_ID[:12]} is not in the applied rules"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boot_line, required, refused",
+    [
+        ("boot restore not installed: directories not created", True, True),
+        ("boot restore not installed: docker.service drop-in not loaded", True, True),
+        (rental_egress_guard.NO_BOOT_UNIT, True, False),
+        ("boot restore not installed: directories not created", False, False),
+    ],
+)
+async def test_a_pod_start_is_refused_where_the_boot_copy_is_not_installed(boot_line, required, refused):
+    """Docker restarts a started pod at boot by itself: a pod start on a host whose systemd Docker could not take the
+    boot copy is refused. The periodic run, which starts nothing, only reports it."""
+    nets = f"{LEGACY_NET_ID} bridge <no value>"
+    ssh = _ssh(labelled="", legacy_nets=nets, helper_stdout=boot_line + "\n")
+
+    guarded, error = await rental_egress_guard.apply_rental_egress_guard(
+        ssh, attempts=None, required_network_id=LEGACY_NET_ID if required else None
+    )
+
+    assert error == (boot_line if refused else None)
 
 
 def test_a_failed_daemon_reload_is_retried_by_the_next_run_although_the_drop_in_is_unchanged(tmp_path):

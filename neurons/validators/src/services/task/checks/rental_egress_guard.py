@@ -256,9 +256,13 @@ def link_local_drop_script(bridge: str | None, legacy_bridges: list[str], host_r
         "$IPT -F $OLD || exit 4",
         _DETACH_OLD_JUMPS,
     ]
-    # the same rules, run by systemd on the host before dockerd starts any container after a reboot
-    boot = "; ".join(["HOST_NS=", *lines, "exit 0"])
+    # the same rules, run by systemd on the host before dockerd starts any container after a reboot. Tried again
+    # until they apply, inside the one start: a failing firewall write holds dockerd without using up its start limit
+    boot = "until ( " + "; ".join(["HOST_NS=", *lines, "exit 0"]) + " ); do sleep 1; done; exit 0"
     return "; ".join([*lines, _boot_restore(boot, host_root), "exit 0"])
+
+
+NO_BOOT_UNIT = "boot restore not installed: no systemd docker.service"
 
 
 def _boot_restore(boot: str, host_root: str) -> str:
@@ -267,13 +271,14 @@ def _boot_restore(boot: str, host_root: str) -> str:
     script, dropin = shlex.quote(host_root + BOOT_SCRIPT), shlex.quote(host_root + BOOT_DROPIN)
     dirs = " ".join(shlex.quote(host_root + path.rsplit("/", 1)[0]) for path in (BOOT_SCRIPT, BOOT_DROPIN))
     # printf makes the newlines, so the command stays on one line
-    # no "-": dockerd restarts rental containers itself (unless-stopped), past the validator's pre-start guard, so a
-    # boot copy that cannot put the rules back keeps dockerd from starting; systemd's own restarts retry it
-    unit = shlex.quote(f"[Service]\\nExecStartPre=/bin/sh {BOOT_SCRIPT}\\n")
+    # no "-": dockerd restarts rental containers itself (unless-stopped), past the validator's pre-start guard, so
+    # dockerd does not start until the boot copy has put the rules back; no start timeout cuts that wait short
+    unit = shlex.quote(f"[Service]\\nTimeoutStartSec=infinity\\nExecStartPre=/bin/sh {BOOT_SCRIPT}\\n")
     return (
         f"if [ -d {shlex.quote(host_root + '/run/systemd/system')} ] && "
         '[ "$($HOST_NS systemctl show -p LoadState --value docker.service 2>/dev/null)" = loaded ]; then '
-        # reported, never failed: the runtime rules are already in force (e.g. a read-only /etc/systemd/system)
+        # reported here; a pod start refuses on it (apply_rental_egress_guard), so no pod Docker would restart at
+        # boot is started without the boot copy
         f"if ! mkdir -p {dirs}; then echo 'boot restore not installed: directories not created'; "
         f"elif ! {{ printf '%s\\n' {shlex.quote(boot)} > {script}.tmp && mv -f {script}.tmp {script}; }}; then "
         "echo 'boot restore not installed: boot rules not written'; "
@@ -283,7 +288,7 @@ def _boot_restore(boot: str, host_root: str) -> str:
         '[ "$($HOST_NS systemctl show -p NeedDaemonReload --value docker.service 2>/dev/null)" != yes ]; then :; '
         f"elif ! {{ {{ [ ! -e {dropin}.tmp ] || mv -f {dropin}.tmp {dropin}; }} && $HOST_NS systemctl daemon-reload; }}; then "
         "echo 'boot restore not installed: docker.service drop-in not loaded'; fi; "
-        "else echo 'boot restore not installed: no systemd docker.service'; fi"
+        f"else echo '{NO_BOOT_UNIT}'; fi"
     )
 
 
@@ -564,6 +569,9 @@ async def apply_rental_egress_guard(
     error = _error(result)
     if error is None and required_missing:
         error = f"the pod's bridge {required_network_id[:12]} is not in the applied rules"
+    # Docker restarts a started pod at boot on its own (unless-stopped): never start one where the boot copy is missing
+    if error is None and required_network_id is not None and (not_installed := [b for b in boot if b != NO_BOOT_UNIT]):
+        error = not_installed[0]
     return guarded, error
 
 
