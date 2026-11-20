@@ -120,7 +120,6 @@ from services.node_host import node_owner, public_host_sock
 from services.default_docker_image_digest_service import fetch_docker_hub_digest
 from services.gpu_power_limit import (
     NVIDIA_SMI_TIMEOUT_SECONDS,
-    _read_host_boot_id,
     POWER_LIMIT_SET_CONCURRENCY,
     GpuPowerCapResult,
     GpuPowerRestoreStateError,
@@ -1842,6 +1841,31 @@ class KeptContainersNotRemoved(RuntimeError):
 def _kept_container_prefix(container_name: str) -> str:
     # kept_unmounted_<pod id>_<time>: the trailing "_" keeps one pod's prefix from matching another's
     return f"{KEPT_UNMOUNTED_PREFIX}{container_name.removeprefix(POD_CONTAINER_PREFIX)}_"
+
+
+_NOT_THE_NODE_LEFT_EXIT = 97
+
+
+def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
+    """Exits 97 on another boot; 0 once the pod's container, its kept edit containers and its volumes are gone."""
+    volumes = [
+        _quote_safe_docker_volume_name(volume, field_name=field)
+        for field, volume in (("local_volume", payload.local_volume), ("external_volume", payload.external_volume))
+        if volume
+    ]
+    name = shlex.quote(payload.container_name)
+    lines = [
+        f'[ "$(cat /proc/sys/kernel/random/boot_id)" = {shlex.quote(payload.expected_boot_id)} ] '
+        f"|| exit {_NOT_THE_NODE_LEFT_EXIT}",
+        f"kept=$(/usr/bin/docker ps -aq --filter name=^{shlex.quote(_kept_container_prefix(payload.container_name))}) "
+        "|| exit 1",
+        f"/usr/bin/docker rm -fv {name} $kept >/dev/null 2>&1",
+        f"/usr/bin/docker inspect --type container {name} >/dev/null 2>&1 && exit 1",
+    ]
+    if volumes:
+        # shortcut: an external volume's s3fs plugin is left installed, upgrade if a moved pod ever carries one
+        lines.append(f"/usr/bin/docker volume rm -f {' '.join(volumes)} >/dev/null || exit 1")
+    return "\n".join(lines)
 
 
 async def _remove_kept_containers(ssh_client: asyncssh.SSHClientConnection, container_name: str) -> list[str]:
@@ -14984,6 +15008,9 @@ class DockerService:
         keypair: bittensor.Keypair,
         private_key: str,
     ):
+        if isinstance(payload, ContainerDeleteOnNodeLeftRequest):
+            # the pod lives on another node now: none of this validator's per-pod create or GPU state is this host's
+            return await self._delete_on_node_left(payload, executor_info, keypair, private_key)
         refused = await self._stop_create_before_delete(payload, executor_info)
         if refused is not None:
             return refused
@@ -15001,6 +15028,56 @@ class DockerService:
                 )
                 return self._deletion_in_progress(payload, msg="A GPU operation is still running; retry deletion")
             return await self._delete_container(payload, executor_info, keypair, private_key)
+
+    async def _delete_on_node_left(
+        self,
+        payload: ContainerDeleteOnNodeLeftRequest,
+        executor_info: ExecutorSSHInfo,
+        keypair: bittensor.Keypair,
+        private_key: str,
+    ):
+        """The registration may point at the replacement's host by now, so the boot id check and the removal run as
+        one shell on one connection: they cannot land on different hosts or boots."""
+        default_extra = _delete_container_log_extra(payload, executor_info)
+        log = _BoundLog(default_extra)
+        if not payload.container_name:
+            payload.container_name = self.get_container_name(payload)
+        try:
+            command = _node_left_delete_command(payload)
+        except ValueError as exc:
+            log.error("Invalid Docker volume name", error=str(exc))
+            return self._failed_delete(payload, msg="Invalid Docker volume name")
+
+        pkey = asyncssh.import_private_key(self.ssh_service.decrypt_payload(keypair.ss58_address, private_key))
+        try:
+            known_hosts_policy = await self._prepare_known_hosts_policy(executor_info, payload.miner_hotkey, default_extra)
+            require_rental_docker_ssh_host_key(executor_info)
+            async with asyncssh.connect(
+                **await _ssh_connect_kwargs(executor_info, pkey, known_hosts_policy)
+            ) as ssh_client:
+                result = await _run_with_host_timeout(ssh_client, command, _PARK_COMMAND_TIMEOUT_SECONDS)
+        except (AttestationError, RentalDockerConnectionError) as exc:
+            log.error("Delete for the node a moved pod left could not connect", error=str(exc))
+            return self._failed_delete(payload, msg=f"Could not connect: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            log.error("Delete for the node a moved pod left failed", error=str(exc))
+            return self._failed_delete(payload, msg=f"Unknown Error delete_container: {exc}")
+
+        if result.exit_status == _NOT_THE_NODE_LEFT_EXIT:
+            log.warning("Delete for the node a moved pod left reached another host or boot; nothing deleted")
+            return self._failed_delete(
+                payload,
+                msg="The host reached is not the node the pod left",
+                error_code=FailedContainerErrorCodes.NotTheNodeLeft,
+            )
+        if result.exit_status != 0:
+            log.warning("Delete for the node a moved pod left did not finish", exit_status=result.exit_status,
+                        stderr=(result.stderr or "").strip())
+            return self._failed_delete(payload, msg=f"Removal on the node left exited {result.exit_status}")
+        with _best_effort_delete_step(log, "remove_rented_machine"):
+            await self.redis_service.remove_rented_machine(executor_info, payload.container_name)
+        log.info("Deleted the container on the node a moved pod left")
+        return self._container_deleted(payload)
 
     async def _stop_create_before_delete(self, payload: ContainerDeleteRequest, executor_info: ExecutorSSHInfo):
         """The delete's steps before its teardown: the refusal to answer, or None."""
@@ -15085,18 +15162,6 @@ class DockerService:
                     private_key=private_key,
                 ) as docker_client,
             ):
-                if isinstance(payload, ContainerDeleteOnNodeLeftRequest):
-                    # the registration may point at the replacement's host by now: delete only on the host the
-                    # node left booted as; an unreadable boot id is no proof either
-                    boot_id = await _read_host_boot_id(ssh_client)
-                    if boot_id != payload.expected_boot_id:
-                        log.warning("Delete for the node a moved pod left reached another host; nothing deleted",
-                                    boot_id_read=boot_id is not None)
-                        return self._failed_delete(
-                            payload,
-                            msg="The host reached is not the node the pod left",
-                            error_code=FailedContainerErrorCodes.NotTheNodeLeft,
-                        )
                 cleared_cap_claims: dict[str, int] = {}
                 if payload.workload_kind == WorkloadKind.FILLER:
                     # DAH-2786: our job ends here, so a limit reset from now on is no revert.
