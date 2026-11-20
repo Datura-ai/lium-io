@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import subprocess
+import time
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -631,11 +632,12 @@ def _fake_fd(proc, pid: int, device: str) -> None:
 def _unit_script(cmd: str, tmp_path) -> str:
     """The host unit's shell script, with its stopped-services file under tmp_path (stopped), not the host's /run."""
     script = shlex.split(cmd)[-1].replace(gpu_reset.STOPPED_UNITS_FILE, str(tmp_path / "stopped"))
-    return script.replace(gpu_reset.LATE_SCAN_FILE, str(tmp_path / "late"))
+    return script.replace(gpu_reset.LATE_SCAN_FILE, str(tmp_path / "late"))  # the scan unit's fresh files
 
 
 def _run_fabric_script(
     tmp_path, *, stop_fails="", start_fails="", reset_exit=0, units=(FM, NVLSM), containers=(), procs=None, needs="",
+    scan_busy=False,
 ):
     """Runs the host unit's script under /bin/sh with logging stand-ins for systemctl, docker and nvidia-smi. The
     host's /dev holds nvidia0 (195:0), gpu0 (another name for it, 195:0) and dri-card0 (226:0); procs is the host's
@@ -669,6 +671,12 @@ def _run_fabric_script(
         # an open file on a stalled filesystem (/mnt): its stat -L never returns
         ("stat", STALLING_STAT),
         ("nvidia-smi", f'echo "reset $*" >> {log}; echo "In use by another client"; exit {reset_exit}'),
+        # the holder scan's own host unit: started in the background, or refused while an earlier one is still there
+        (
+            "systemd-run",
+            f'echo "systemd-run $*" | cut -d" " -f1-5 >> {tmp_path / "units"}; [ -n "$SCAN_BUSY" ] && exit 1; '
+            'while [ $# -gt 0 ] && [ "$1" != /bin/sh ]; do shift; done; "$@" </dev/null >/dev/null 2>&1 & exit 0',
+        ),
     ):
         (tmp_path / name).write_text(f"#!/bin/sh\n{body}\n")
         (tmp_path / name).chmod(0o755)
@@ -678,7 +686,8 @@ def _run_fabric_script(
     script = script.replace("-lname '/dev/nvidia*'", f"-lname '{dev}/nvidia*'")
     # what systemd does to the command line before the shell runs: unknown ${...} becomes "", $$ becomes $
     script = re.sub(r"\$\{[^}]*\}", "", script).replace("$$", "$")
-    env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}", "STOP_FAILS": stop_fails, "START_FAILS": start_fails, "NEEDS": needs}
+    env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}", "STOP_FAILS": stop_fails, "START_FAILS": start_fails, "NEEDS": needs,
+           "SCAN_BUSY": "1" if scan_busy else ""}
     done = subprocess.run(["/bin/sh", "-c", script], env=env, capture_output=True, text=True, timeout=60)
     return done, log.read_text().splitlines()
 
@@ -721,9 +730,25 @@ def test_a_late_look_stalled_on_an_open_file_skips_the_reset_and_still_starts_ev
     # mount keeps it from ending, so the holders are unknown: no reset, and the unit still reaches its starts
     monkeypatch.setattr(gpu_reset, "LATE_SCAN_SECONDS", 2)
     procs = {4242: ("agent", f"0::/system.slice/{AGENT}"), 4250: ("reader", "0::/system.slice/r.service", "/mnt/f")}
+    began = time.monotonic()
     done, log = _run_fabric_script(tmp_path, procs=procs)
+    assert time.monotonic() - began < 15  # the stalled scan (20 s here) is never waited on
     assert done.returncode == gpu_reset._FABRIC_STOP_FAILED_EXIT
     assert "could not read which host services hold a GPU after the stops" in done.stderr
+    assert log == [f"stop {FM}", f"stop {NVLSM}", f"start {NVLSM}", f"start {FM}"]
+    # the scan ran as its own host unit (outside the reset unit's cgroup, so it cannot keep the reset unit from
+    # ending), one per host by its fixed name
+    assert (tmp_path / "units").read_text().split("\n")[0] == (
+        f"systemd-run --quiet --collect --unit={gpu_reset.LATE_SCAN_UNIT} -p"
+    )
+
+
+def test_a_holder_scan_unit_still_there_skips_the_reset_at_once_and_starts_everything(tmp_path):
+    # DAH-6741 review: a stuck scan from an earlier reset holds the scan unit's name; no second scanner starts
+    began = time.monotonic()
+    done, log = _run_fabric_script(tmp_path, procs={4242: ("agent", f"0::/system.slice/{AGENT}")}, scan_busy=True)
+    assert time.monotonic() - began < gpu_reset.LATE_SCAN_SECONDS  # no wait for a scan that never started
+    assert done.returncode == gpu_reset._FABRIC_STOP_FAILED_EXIT
     assert log == [f"stop {FM}", f"stop {NVLSM}", f"start {NVLSM}", f"start {FM}"]
 
 

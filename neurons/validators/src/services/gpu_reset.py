@@ -157,9 +157,13 @@ FABRIC_RESET_UNIT = "lium-gpu-reset-fabric"
 HOST_GPU_HOLDER_UNITS_COMMAND = f"nsenter -t 1 -m -C -- /bin/sh -c {shlex.quote(GPU_HOLDER_UNITS_SCRIPT)}"
 _HOLDER_SCAN_TIMEOUT_SECONDS = 60
 # the unit's second look after its stops (GPU_HOLDER_UNITS_SCRIPT: device numbers, so a GPU opened through any path,
-# a bind mount included, is found) runs in the background into this file; the unit waits for it at most
-# LATE_SCAN_SECONDS and never on the scan itself, so a scan stalled on an open file cannot keep it from its starts
-LATE_SCAN_FILE = f"/run/{FABRIC_RESET_UNIT}.late"
+# a bind mount included, is found) runs as its own host unit, outside the reset unit's cgroup, into a fresh file
+# under this prefix. The reset unit waits for that file at most LATE_SCAN_SECONDS and never on the scan's processes:
+# a scan stuck on an open file (uninterruptible) cannot keep it from its starts or from ending. One scan unit per
+# host (its fixed name), bounded by RuntimeMaxSec: while a stuck one is still there, a new one does not start and
+# the reset is skipped
+LATE_SCAN_UNIT = "lium-gpu-reset-holder-scan"
+LATE_SCAN_FILE = f"/run/{LATE_SCAN_UNIT}"
 LATE_SCAN_SECONDS = 30
 # every host service a reset unit stopped, one per line, written before its stop: the validator's restore checks
 # them with the ones it asked for, and removes the file only once all of them are up again. Never truncated by a
@@ -635,8 +639,9 @@ def build_fabric_reset_command(units: list[str], reset_command: str, containers:
     systemd unit. After its stops it looks once more (GPU_HOLDER_UNITS_SCRIPT) for a host service that opened a
     GPU after the validator's scan: it stops it too and starts it again after the others. Every service it stops is
     listed in STOPPED_UNITS_FILE first, for the validator's restore check. A refused reset prints the processes still
-    holding a GPU. The second look follows open files (device numbers) in the background with a deadline, so a stalled
-    one cannot keep it from its starts; a look that is not whole or not done in time skips the reset.
+    holding a GPU. The second look follows open files (device numbers) in its own host unit (LATE_SCAN_UNIT) with a
+    deadline, so a stalled one can keep neither this unit from its starts nor from ending; a look that is not whole,
+    not done in time or not started skips the reset.
 
     The unit outlives the SSH session, and SIGPIPE is ignored so a closed pipe cannot kill it before the start."""
     fail = f'|| {{ echo "could not stop $u" >&2; rc={_FABRIC_STOP_FAILED_EXIT}; break; }}'
@@ -658,16 +663,18 @@ def build_fabric_reset_command(units: list[str], reset_command: str, containers:
     # a host service that opened a GPU after the validator's scan: stopped too (and started again after the others),
     # or the driver refuses the reset with the pod already stopped
     planned = " ".join(u if u.endswith(".service") else f"{u}.service" for u in units)
-    # a scan that is not whole or did not end in time: the holders are unknown, so no reset (the starts still run)
-    lf = LATE_SCAN_FILE
+    # a scan that is not whole, did not end in time or could not start: the holders are unknown, so no reset (the
+    # starts still run)
+    scan = f'( {GPU_HOLDER_UNITS_SCRIPT} ) >"$0"; echo $? >"$0.rc"'
     script += (
-        f'[ $rc -ne 0 ] || {{ rm -f {lf} {lf}.rc; '
-        f'( ( {GPU_HOLDER_UNITS_SCRIPT} ) >{lf}; echo $? >{lf}.rc ) </dev/null >/dev/null 2>&1 & '
-        f'i=0; while [ ! -s {lf}.rc ] && [ $i -lt {LATE_SCAN_SECONDS} ]; do sleep 1; i=$((i+1)); done; '
-        f'if [ "$(cat {lf}.rc 2>/dev/null)" = 0 ]; then for u in $(cat {lf}); do '
+        f"[ $rc -ne 0 ] || {{ if f=$(mktemp {LATE_SCAN_FILE}.XXXXXXXX) && systemd-run --quiet --collect "
+        f"--unit={LATE_SCAN_UNIT} -p RuntimeMaxSec={LATE_SCAN_SECONDS} /bin/sh -c {shlex.quote(scan)} \"$f\" "
+        ">/dev/null 2>&1; then "
+        f'i=0; while [ ! -s "$f.rc" ] && [ $i -lt {LATE_SCAN_SECONDS} ]; do sleep 1; i=$((i+1)); done; fi; '
+        'if [ -n "$f" ] && [ "$(cat "$f.rc" 2>/dev/null)" = 0 ]; then for u in $(cat "$f"); do '
         f'case " {planned} " in *" $u "*) ;; *) late="$late $u"; {stop_late};; esac; done; '
-        f'else echo "could not read which host services hold a GPU after the stops" >&2; '
-        f"rc={_FABRIC_STOP_FAILED_EXIT}; fi; }}; "
+        'else echo "could not read which host services hold a GPU after the stops" >&2; '
+        f'rc={_FABRIC_STOP_FAILED_EXIT}; fi; rm -f "$f" "$f.rc"; }}; '
     )
     script += (
         f"[ $rc -ne 0 ] || {{ {reset_command}; rc=$?; "
