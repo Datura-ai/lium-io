@@ -39,9 +39,21 @@ Field types are what a receiver must accept: a field one peer sends and the othe
 Compatibility rules for a change:
 
 - add an optional field or an enum member → minor version bump (`1.0.0` → `1.1.0`, as `FailedContainerRequest.build_log_tail` did);
-- make a field required, remove or rename one, change a type → major version bump and a new `snapshots/lium_protocol.v2.json`.
+- make a field required, remove or rename one, change a type → major version bump (the release moves the snapshot to `snapshots/lium_protocol.v<major>.json`).
 
 Consumers pin a tag `lium-protocol-v<PROTOCOL_VERSION>` of this repository. The plan for lium-platform: vendor the tree — models, snapshot and recordings — under `apps/lium/backend/apps/server/src/lium_protocol/`, with a `PROTOCOL_PIN.json` naming the tag, the commit and the tree's sha256, and a CI check that compares the vendored copy with that commit.
+
+## Changing the wire, and releasing
+
+A pull request that changes the wire never touches the version. It adds a fragment `lium_protocol/changes/<short-name>.md`: the first line `minor` or `major` (the rules above), then the one-line entry for the version list below. Do not write the coming version number anywhere; nobody knows it until the release.
+
+A release is its own pull request: run `python lium_protocol/scripts/release.py`, commit what it changed and open the PR. It takes the highest bump among the fragments, writes the new version to `__init__.py`, `pyproject.toml`, `uv.lock`, this README and the snapshot, adds one line to the version list and deletes the fragments. When that PR merges, tag its merge commit:
+
+```bash
+git tag lium-protocol-v<version> <merge commit> && git push origin lium-protocol-v<version>
+```
+
+CI (`scripts/check_version.py`, job `protocol`) fails a PR that changes `PROTOCOL_VERSION` without deleting a fragment (deleting fragments is what marks a release PR), and a PR that changes anything under `lium_protocol/lium_protocol/` other than a version line, a comment or a blank line without adding a fragment. Locally: `python lium_protocol/scripts/check_version.py $(git merge-base origin/main HEAD)`.
 
 ## Versions
 
