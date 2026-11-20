@@ -20,7 +20,8 @@ from core.config import settings
 from payload_models.payloads import MinerJobEnryptedFiles, MinerJobRequestPayload
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from services.attestation_service import AttestationService
-from services.miner_service import MIN_DATED_NONCE_MINER_AXON_VERSION, MinerService
+from services.miner_service import MinerService
+from services.upload_nonce import MIN_DATED_NONCE_MINER_AXON_VERSION, upload_nonce_for_miner
 
 pytest_plugins = ["fixtures.rest_miner_fixtures"]
 
@@ -74,7 +75,7 @@ def _subtensor(monkeypatch, *, axon_versions=None, central=()):
     monkeypatch.setattr(SubtensorClient, "get_instance", classmethod(lambda cls: fake))
 
 
-def test_upload_nonce_dated_for_a_miner_on_bittensor_10_5(miner_service, monkeypatch, caplog):
+def test_upload_nonce_dated_for_a_miner_on_bittensor_10_5(monkeypatch, caplog):
     # I-78: a miner announcing bittensor 10.5.0+ (miner-v1.003+) relays the dated nonce
     _subtensor(
         monkeypatch, axon_versions={"new": MIN_DATED_NONCE_MINER_AXON_VERSION, "newer": 10_006_001}
@@ -83,7 +84,7 @@ def test_upload_nonce_dated_for_a_miner_on_bittensor_10_5(miner_service, monkeyp
         for hotkey in ("new", "newer"):
             assert (
                 abs(
-                    upload_nonce_issued_at(miner_service._upload_nonce_for_miner(hotkey))
+                    upload_nonce_issued_at(upload_nonce_for_miner(hotkey))
                     - time.time()
                 )
                 < 5
@@ -91,18 +92,16 @@ def test_upload_nonce_dated_for_a_miner_on_bittensor_10_5(miner_service, monkeyp
     assert "dated_upload_nonce_skipped" not in caplog.text
 
 
-def test_upload_nonce_dated_for_the_central_miner_whatever_its_axon(miner_service, monkeypatch):
+def test_upload_nonce_dated_for_the_central_miner_whatever_its_axon(monkeypatch):
     _subtensor(monkeypatch, axon_versions={"opted": 0}, central={"opted"})
-    assert upload_nonce_issued_at(miner_service._upload_nonce_for_miner("opted")) is not None
+    assert upload_nonce_issued_at(upload_nonce_for_miner("opted")) is not None
 
 
 @pytest.mark.parametrize("hotkey", ["old", "zero", "unknown"])
-def test_upload_nonce_skipped_and_logged_for_an_unproven_miner(
-    miner_service, monkeypatch, caplog, hotkey
-):
+def test_upload_nonce_skipped_and_logged_for_an_unproven_miner(monkeypatch, caplog, hotkey):
     _subtensor(monkeypatch, axon_versions={"old": 9_010_001, "zero": 0})
     with caplog.at_level(logging.INFO):
-        assert miner_service._upload_nonce_for_miner(hotkey) is None
+        assert upload_nonce_for_miner(hotkey) is None
     [skipped] = [r.msg.extra for r in caplog.records if str(r.msg) == "dated_upload_nonce_skipped"]
     assert skipped["miner_hotkey"] == hotkey
     assert skipped["axon_version"] == {"old": 9_010_001, "zero": 0, "unknown": None}[hotkey]

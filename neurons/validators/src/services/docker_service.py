@@ -1885,9 +1885,12 @@ def _layer_data_check(
         '$0 == "diff-failed" {f=1} ($1 == "A" || $1 == "C") && index(substr($0, 3), p) == 1 {k=1} '
         f'END {{if (!f && !k) print "{_DROP_MARK}"}}'
     )
+    # A readable upper dir decides either way: docker diff walks the whole layer (minutes on a DinD pod) and holds the
+    # container meanwhile, so the next docker inspect of the park timed out too and every reboot of the pod failed
     shortcut = (
-        f"{_layer_upper_scope(name, plaintext_path, upper_dir)} && [ -d \"$x\" ] "
-        "&& f=$(find \"$x\" -mindepth 1 \\( -type f -o -type l \\) $w -print -quit 2>/dev/null) && [ -z \"$f\" ] && { echo " + _DROP_MARK + "; exit 0; }; "
+        f"{_layer_upper_scope(name, plaintext_path, upper_dir)} && {{ [ -d \"$x\" ] || {{ echo {_DROP_MARK}; exit 0; }}; "
+        "f=$(find \"$x\" -mindepth 1 \\( -type f -o -type l \\) $w -print -quit 2>/dev/null) "
+        "&& { [ -n \"$f\" ] || echo " + _DROP_MARK + "; exit 0; }; }; "
     )
     return (
         f"m=$(/usr/bin/docker inspect -f '{{{{range .Mounts}}}}{{{{println .Destination}}}}{{{{end}}}}' {name}) || exit 1; "
@@ -2110,12 +2113,18 @@ class _EditSwap:
         for leftover in list(kept):
             # every edit parks under the kept name, so a clean one is an earlier edit's copy whose removal failed
             if await self._layer_safe_to_remove(ids_by_name.get(leftover) or leftover, already_kept=True):
-                removed = await self._run(f"/usr/bin/docker rm -fv {shlex.quote(ids_by_name.get(leftover) or leftover)}")
-                if removed.exit_status != 0:
-                    # a clean copy Docker will not remove: parking another under a new name would pile them up
-                    raise Exception(
-                        f"[park_current_container] a clean container from an earlier edit ({leftover}) could not be "
-                        f"removed: {(removed.stderr or '').strip() or f'exit {removed.exit_status}'}; the pod was left as it was"
+                # Detached: removing a DinD pod's layer outlasts the command timeout (exit 124 failed every reboot of the
+                # pod, 19 Nov), and this park takes a new kept name, so nothing waits on it. A copy Docker still refuses
+                # is listed and removed again by the next edit, and by the pod's delete.
+                started = await self._run(
+                    f"nohup /usr/bin/docker rm -fv {shlex.quote(ids_by_name.get(leftover) or leftover)} >/dev/null 2>&1 &"
+                )
+                if started.exit_status != 0:
+                    logger.warning(
+                        _m(
+                            "Removal of a clean container from an earlier edit could not be started; the next edit retries",
+                            extra=get_extra_info({**self.default_extra, "leftover": leftover, "exit": started.exit_status}),
+                        )
                     )
                 kept.remove(leftover)
         # the layer, not the current mount state: a copy written unmounted and since remounted is still kept.
@@ -2329,7 +2338,7 @@ class _EditSwap:
                 if removed.exit_status != 0:
                     logger.warning(
                         _m(
-                            "Parked container could not be removed after edit; the next edit removes it or stops",
+                            "Parked container could not be removed after edit; the next edit removes it",
                             extra=get_extra_info({**self.default_extra, "parked": self.parked_name, "error": (removed.stderr or "").strip()}),
                         )
                     )

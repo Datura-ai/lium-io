@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import ipaddress
 import socket
 import sys
 import threading
@@ -46,7 +47,7 @@ async def test_ip_literal_is_not_resolved(monkeypatch):
     _resolves_to(monkeypatch)  # would raise if consulted
 
     # Act
-    extra = await public_host_sock("10.0.0.5")
+    extra = await public_host_sock("8.8.8.8")  # a public IP literal: dialled as given
 
     # Assert
     assert extra == {}
@@ -109,6 +110,41 @@ async def test_unresolvable_name_is_refused(monkeypatch):
     # Act / Assert
     with pytest.raises(NodeHostError, match="does not resolve"):
         await public_host_sock("gone.example.net")
+
+
+@pytest.mark.parametrize(
+    "address", ["fec0::1", "64:ff9b::7f00:1", "100::1", "::ffff:127.0.0.1", "::ffff:169.254.169.254", "ff0e::1"]
+)
+def test_addresses_python_calls_global_but_are_not_public(address):
+    """lium-io#2369 review: Python 3.11-3.12 call some of these global (site-local, NAT64 of 127.0.0.1)."""
+    assert not node_host.is_public_ip(ipaddress.ip_address(address))
+
+
+def test_public_addresses_stay_public():
+    assert node_host.is_public_ip(ipaddress.ip_address("8.8.8.8"))
+    assert node_host.is_public_ip(ipaddress.ip_address("2001:4860:4860::8888"))
+    # review 5981962325: an IPv6-only validator's DNS64 answer for a public A record stays reachable
+    assert node_host.is_public_ip(ipaddress.ip_address("64:ff9b::808:808"))
+    assert not node_host.is_public_ip(ipaddress.ip_address("64:ff9b::a9fe:a9fe"))  # its NAT64 metadata address is not
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host", ["127.0.0.1", "169.254.169.254", "192.0.2.1", "::1", "[::1]", "fec0::1", "::ffff:127.0.0.1"])
+async def test_a_node_registered_at_a_non_public_ip_is_refused_before_any_dial(monkeypatch, host):
+    """A node's IP address is reported by its miner and dialled as given: a non-public one is refused like a hostname
+    resolving there, on the SSH path (public_host_sock) and the HTTP path (PublicHostResolver)."""
+    monkeypatch.setattr("socket.getaddrinfo", lambda *a, **k: pytest.fail("a literal is never looked up"))
+
+    with pytest.raises(NodeHostError, match="not a public address"):
+        await public_host_sock(host, 22)
+    with pytest.raises(NodeHostError, match="not a public address"):
+        await node_host.resolve_public_host(host, 22)
+
+
+@pytest.mark.asyncio
+async def test_a_node_registered_at_a_public_ip_is_dialled_as_given():
+    assert await public_host_sock("8.8.8.8", 22) == {}
+    assert await node_host.resolve_node_host("8.8.8.8", 22) == []
 
 
 def test_is_ip_literal():
@@ -187,6 +223,88 @@ async def test_http_request_to_a_name_with_a_private_address_is_never_sent(monke
     async with aiohttp.ClientSession(connector=public_host_connector()) as session:
         with pytest.raises(aiohttp.ClientConnectorError):
             await session.get("http://gpu-node1.example.net:8080/")
+
+
+async def _local_server(hits: list, redirect_to: str | None = None) -> tuple[web.AppRunner, int]:
+    """A loopback HTTP server that counts its requests and, given ``redirect_to``, redirects there."""
+
+    async def handler(request):
+        hits.append(request.path)
+        if redirect_to:
+            raise web.HTTPFound(redirect_to)
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    return runner, site._server.sockets[0].getsockname()[1]
+
+
+@pytest.mark.asyncio
+async def test_http_request_to_a_non_public_ip_literal_is_never_sent():
+    """aiohttp dials an IP literal without asking the resolver; the connector itself refuses it."""
+    hits: list = []
+    runner, port = await _local_server(hits)
+    try:
+        async with aiohttp.ClientSession(connector=public_host_connector()) as session:
+            with pytest.raises(aiohttp.ClientConnectorError) as refused:
+                await session.get(f"http://127.0.0.1:{port}/version", allow_redirects=False)
+    finally:
+        await runner.cleanup()
+    assert isinstance(refused.value.os_error, NodeHostError)
+    assert hits == []
+
+
+def _public_only_at(monkeypatch, node_port: int) -> None:
+    """127.0.0.1 at ``node_port`` stands in for a public node; every other address keeps the real rule."""
+    real = node_host._check_literal
+    monkeypatch.setattr(
+        node_host, "_check_literal", lambda host, port: None if port == node_port else real(host, port)
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_node_that_redirects_to_a_non_public_ip_literal_is_not_followed(monkeypatch):
+    target_hits: list = []
+    target, target_port = await _local_server(target_hits)
+    node_hits: list = []
+    node, node_port = await _local_server(node_hits, redirect_to=f"http://127.0.0.1:{target_port}/")
+    _public_only_at(monkeypatch, node_port)
+    try:
+        async with aiohttp.ClientSession(connector=public_host_connector()) as session:
+            with pytest.raises(aiohttp.ClientConnectorError) as refused:
+                await session.get(f"http://127.0.0.1:{node_port}/")  # redirects followed, as by default
+    finally:
+        await node.cleanup()
+        await target.cleanup()
+    assert isinstance(refused.value.os_error, NodeHostError)
+    assert node_hits == ["/"]
+    assert target_hits == []
+
+
+@pytest.mark.asyncio
+async def test_the_port_probe_does_not_follow_a_redirect(monkeypatch):
+    from neurons.validators.src.services.executor_connectivity import port_tester
+    from neurons.validators.src.services.executor_connectivity.models import PortPair
+
+    # a plain connector, no address rule: the probe's own setting alone keeps it off the redirect
+    monkeypatch.setattr(port_tester, "public_host_connector", lambda **kw: aiohttp.TCPConnector(**kw))
+
+    target_hits: list = []
+    target, target_port = await _local_server(target_hits)
+    node_hits: list = []
+    node, node_port = await _local_server(node_hits, redirect_to=f"http://127.0.0.1:{target_port}/")
+    try:
+        ok = await port_tester.PortTester().test_one("127.0.0.1", PortPair(internal=1, external=node_port), "token")
+    finally:
+        await node.cleanup()
+        await target.cleanup()
+    assert not ok
+    assert node_hits == ["/"]
+    assert target_hits == []
 
 
 def _logged(caplog, level):
@@ -289,8 +407,8 @@ async def test_ip_literal_logs_nothing(caplog):
 
     # Act
     with caplog.at_level(logging.INFO, logger=node_host.logger.name):
-        await public_host_sock("203.0.113.9")
-        await resolver.resolve("203.0.113.9", 8080)
+        await public_host_sock("8.8.8.8")
+        await resolver.resolve("8.8.8.8", 8080)
 
     # Assert
     assert caplog.records == []

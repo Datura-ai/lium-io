@@ -58,7 +58,8 @@ class PortTester:
         expected = f"{token}:{port.internal}"
 
         try:
-            async with self._session.get(url, timeout=PROBE_TIMEOUT) as resp:
+            # the node answers its own address only: a redirect would point the probe somewhere else
+            async with self._session.get(url, timeout=PROBE_TIMEOUT, allow_redirects=False) as resp:
                 text = await resp.text()
                 return text.strip() == expected
         except Exception:
