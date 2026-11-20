@@ -61,7 +61,7 @@ async def test_a_healthy_reboot_runs_only_the_one_query():
     # a GPU outside the pod being broken is not the pod's business
     host = HungHost(query=_query({U[2]: f"{U[2]}, [Unknown Error], [Unknown Error]"}))
     result = await _reset(host)
-    assert host.commands == [HUNG_GPU_QUERY_COMMAND]
+    assert host.commands == [gpu_reset.STOPPED_UNITS_READ_COMMAND, HUNG_GPU_QUERY_COMMAND]
     assert result.warning is None and result.hung_uuids == []
 
 
@@ -99,7 +99,7 @@ async def test_a_latched_gpu_gets_the_context_cycle_before_any_reset(cure_ok):
 async def test_a_busy_gpu_with_a_live_process_is_not_the_latch():
     host = HungHost(query=_query({U[0]: f"{U[0]}, 100, 0"}, apps="4242\n"))
     assert (await _reset(host)).warning is None
-    assert host.commands == [HUNG_GPU_QUERY_COMMAND]
+    assert host.commands == [gpu_reset.STOPPED_UNITS_READ_COMMAND, HUNG_GPU_QUERY_COMMAND]
 
 
 @pytest.mark.asyncio
@@ -166,7 +166,7 @@ async def test_a_runner_error_changes_nothing():
     # the SSH session failed (no exit status): nothing is known about the GPUs; the shell timeout (124) still means hung
     host = HungHost(query="", query_exit=-1)
     result = await _reset(host)
-    assert host.commands == [HUNG_GPU_QUERY_COMMAND]
+    assert host.commands == [gpu_reset.STOPPED_UNITS_READ_COMMAND, HUNG_GPU_QUERY_COMMAND]
     assert result.warning is None and result.hung_uuids == []
 
 
@@ -417,6 +417,27 @@ async def test_a_service_left_stopped_is_restored_before_a_latch_cure_returns():
     result = await _reset(host)
     assert result.warning is None and _resets(host) == []
     assert host.active[late] and host.stopped_file == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("query_exit", [0, -1])
+async def test_a_service_left_stopped_is_restored_when_no_gpu_is_hung_or_the_query_fails(query_exit):
+    # DAH-6741 review: those checks return early; the listed service must not wait for the next hung GPU
+    late = "late-monitor.service"
+    host = HungHost(query="" if query_exit else _query(), query_exit=query_exit)
+    host.active[late], host.stopped_file = False, [late]
+    result = await _reset(host)
+    assert result.warning is None and _resets(host) == []
+    assert host.active[late] and host.stopped_file == []
+
+
+@pytest.mark.asyncio
+async def test_the_shadow_check_restores_nothing():
+    late = "late-monitor.service"
+    host = HungHost(query=_query())
+    host.active[late], host.stopped_file = False, [late]
+    await reset_hung_pod_gpus(host, list(U), settle_seconds=0, shadow=True)
+    assert not host.active[late] and host.stopped_file == [late] and ("start", late) not in host.fm_log
 
 
 @pytest.mark.asyncio

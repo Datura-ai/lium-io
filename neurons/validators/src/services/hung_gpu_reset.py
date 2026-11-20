@@ -13,6 +13,7 @@ fallback. A latch clear is never reported as a reset (HungGpuNotResetUnsupported
 from __future__ import annotations
 
 import contextlib
+import logging
 import re
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
@@ -26,6 +27,7 @@ from services.gpu_reset import (
     FABRIC_SERVICES,
     HOST_GPUS_COMMAND,
     NVSWITCH_COMMAND,
+    STOPPED_UNITS_READ_COMMAND,
     TOPOLOGY_COMMAND,
     GpuResetRefused,
     HostGpu,
@@ -72,6 +74,8 @@ _NOT_RESET_WARNING = {
     GpuResetErrorCode.GpuInUseOutsidePod: ContainerWarningCode.HungGpuNotResetInUse,
 }
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class HungGpuResult:
@@ -116,6 +120,8 @@ async def reset_hung_pod_gpus(
     `resetting` is entered once a GPU is found hung and held until the reset is over (the caller's
     gpu_reset pending-pod mark, so the rented checks skip the node meanwhile). A list it yields gets the
     result before it exits."""
+    if not shadow:
+        await _restore_left_stopped(runner)
     query = await _run(runner, HUNG_GPU_QUERY_COMMAND, timeout=_QUERY_SSH_TIMEOUT_SECONDS)
     if query.exit_code == -1 and not (query.stdout or "").strip():
         # the SSH command itself failed: nothing is known about the GPUs (a hung nvidia-smi is the shell's 124)
@@ -132,6 +138,17 @@ async def reset_hung_pod_gpus(
         if reset_result_holder is not None:
             reset_result_holder.append(result)  # the caller acts on it while still holding its mark
     return result
+
+
+async def _restore_left_stopped(runner: SSHCommandRunner) -> None:
+    """Starts the services an earlier reset left stopped, on every check: the returns below (no GPU hung, a failed
+    query) must not leave them down until a GPU hangs again. A healthy host pays one read of the unit's list."""
+    try:
+        listed = await _run(runner, STOPPED_UNITS_READ_COMMAND)
+        if listed.exit_code == 0 and (listed.stdout or "").strip() and not await _reset_unit_pending(runner):
+            await _restore_fabric_services(runner, [])  # logs what stays down; _reset refuses on it
+    except Exception as exc:
+        logger.error("could not restore the host services an earlier GPU reset stopped: %s", exc)
 
 
 async def _shadow_detail(

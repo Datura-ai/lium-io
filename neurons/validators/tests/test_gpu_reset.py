@@ -209,7 +209,7 @@ class FakeHost:
                 return make_command_result(False, exit_code=1)
             return make_command_result(True, f"{self.reset_unit_procs}\n")
         if cmd.startswith("nsenter -t 1 -m -- systemctl "):
-            verb, unit = cmd.split()[-2:]
+            verb, unit = shlex.split(cmd)[-2:]
             self.fm_log.append((verb, unit))
             if unit == gpu_reset.FABRIC_RESET_UNIT:
                 if self.hung_units and not self.reset_unit_stuck and self.reset_unit_procs == 0:
@@ -1181,6 +1181,20 @@ async def test_a_service_the_unit_stopped_on_its_own_is_checked_after_the_others
     assert report.ok and host.active[late]
     checks = [unit for verb, unit in host.fm_log if verb == "is-active"]
     assert checks[-1] == late and host.stopped_file == []  # all up again: the list is cleared
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("left_by_earlier", [False, True])
+async def test_an_escaped_service_name_is_checked_and_started_as_itself(left_by_earlier):
+    # DAH-6741 review: systemd escapes "-" in an instance name as \x2d; unquoted, the shell drops the backslash and
+    # is-active / start name another unit, so the real one stays down
+    escaped = "gpu-agent@pci\\x2d0000.service"
+    host = _b300(host_holder_units="" if left_by_earlier else f"{escaped}\n")
+    if left_by_earlier:
+        host.active[escaped], host.stopped_file = False, [escaped]
+    report, _ = await _reset(host, backend=U)
+    assert report.ok and host.active[escaped]
+    assert ("start", escaped) in host.fm_log and ("is-active", escaped) in host.fm_log
 
 
 @pytest.mark.asyncio

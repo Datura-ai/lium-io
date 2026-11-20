@@ -595,7 +595,7 @@ async def plan_host_holders(
 
 
 async def _service_active(runner: SSHCommandRunner, unit: str) -> bool:
-    result = await _run(runner, f"{HOST_SYSTEMCTL} is-active {unit}")
+    result = await _run(runner, f"{HOST_SYSTEMCTL} is-active {shlex.quote(unit)}")
     return (result.stdout or "").strip() == "active"
 
 
@@ -788,7 +788,8 @@ async def _restore_fabric_services(
         try:
             if await _service_active(runner, unit):
                 continue
-            started = await _run(runner, f"{HOST_SYSTEMCTL} start {unit}", timeout=_RESET_TIMEOUT_SECONDS)
+            start = f"{HOST_SYSTEMCTL} start {shlex.quote(unit)}"  # an escaped name (\x2d) keeps its backslash
+            started = await _run(runner, start, timeout=_RESET_TIMEOUT_SECONDS)
             if started.exit_code != 0 or not await _service_active(runner, unit):
                 problems.append(f"{unit} is not active again after the reset: {_tail(started.stderr)}")
         except Exception as exc:
