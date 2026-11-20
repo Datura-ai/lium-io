@@ -37,6 +37,7 @@ SERVICE_PROCESS = {"docker.service": "dockerd"}
 
 def _host_memory_min_script() -> str:
     units = " ".join(f"{unit}={mib * MIB}" for unit, mib in UNIT_MEMORY_MIN_MIB.items())
+    unit_names = " ".join(UNIT_MEMORY_MIN_MIB)
     # sshd is ssh.service on Debian/Ubuntu and sshd.service elsewhere: count it once
     units_mib = sum(UNIT_MEMORY_MIN_MIB.values()) - UNIT_MEMORY_MIN_MIB["ssh.service"]
     ex_min = EXECUTOR_MEMORY_MIN_MIB * MIB
@@ -108,6 +109,14 @@ def _host_memory_min_script() -> str:
         # included), in place of the share already counted for the unit holding the executor
         'ts=$(tree /system.slice | sed -n "s/ =\$//p"); '
         'if [ "$ts" = max ] || [ "$hs" = max ]; then inf=1; else sl=$((sl - ${hs:-0} + ${ts:-0})); fi; '
+        # the slice's other children (services this guard does not set, rentals' scopes) keep the protection they
+        # already hold: their memory.min, never more than the slice grants today, as for a written parent's children
+        'st=$(systemctl show -p MemoryMin --value system.slice); [ "$st" = infinity ] && st=max; '
+        'for c in /sys/fs/cgroup/system.slice/*/; do [ -f "${c}memory.min" ] || continue; n=${c%/}; n=${n##*/}; '
+        f'case " {unit_names} " in *" $n "*) continue;; esac; case "$ex/" in "/system.slice/$n/"*) continue;; esac; '
+        'v=$(cat "${c}memory.min" 2>/dev/null); [ "$v" = max ] && v=$st; '
+        '[ "$st" != max ] && [ "$v" -gt "$st" ] 2>/dev/null && v=$st; '
+        'if [ "$v" = max ]; then inf=1; elif [ "$v" -gt 0 ] 2>/dev/null; then sl=$((sl + v)); fi; done; '
         'flush /system.slice; [ -n "$inf" ] && sl=infinity; set_min system.slice "$sl"; '
         "else "
         # no systemd (another init, a container as PID 1): the services' own cgroups, found from /proc. A host service

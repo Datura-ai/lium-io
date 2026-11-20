@@ -394,3 +394,20 @@ def test_parent_counts_the_protection_its_other_children_already_hold(tmp_path, 
     assert _read(root / "tenant/memory.min") == parent
     assert _read(root / "tenant/executor/memory.min") == EX
     assert (root / "tenant/other/memory.min").read_text().strip() == str(sibling)
+
+
+@pytest.mark.parametrize(("granted", "other", "counted"), [
+    (4096 * MIB, 4096 * MIB, 4096 * MIB),  # a reservation the slice already grants keeps it
+    (0, "max", 0),  # a claim the slice never granted (a rental's own scope) does not raise the slice
+    (2048 * MIB, 4096 * MIB, 2048 * MIB),  # only the granted part counts
+])
+def test_system_slice_counts_the_protection_its_other_children_already_hold(tmp_path, granted, other, counted):
+    run = _run_memory_min(tmp_path, "/system.slice/docker-abc.scope")
+    root, state = tmp_path / "cg", tmp_path / "sd"
+    (root / "system.slice/other.service").mkdir(parents=True)
+    (root / "system.slice/other.service/memory.min").write_text(f"{other}\n")
+    (state / "system.slice").write_text(f"{granted}\n")
+
+    run()
+
+    assert _read(state / "system.slice") == max(granted, UNITS_MIB * MIB + EX + counted)
