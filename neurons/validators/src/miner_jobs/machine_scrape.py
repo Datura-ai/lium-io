@@ -1021,7 +1021,8 @@ def needrestart_data_line(line, literal, plain_setting):
     rest = r"\s*(?:=>\s*" + literal + r"\s*)?,?\s*(#.*)?"
     entry = re.fullmatch(r"[ \t]*" + literal + rest, line)
     if entry:
-        return ("entry", entry.group(1).strip("'\""), entry.group(3), False)
+        key = entry.group(1)  # Perl drops one pair of quotes: "'^docker'" is another key than "^docker"
+        return ("entry", key[1:-1] if key[0] in "'\"" else key, entry.group(3), False)
     start = re.match(r"[ \t]*qr([^\w\s])", line)
     if not start:
         return None
@@ -1070,6 +1071,8 @@ def get_needrestart_guard(host_root="/proc/1/root"):
             return float(value) == 0
         return value[1:-1] in ("", "0") if re.fullmatch(literal, value) else False
 
+    zero = ("0", "'0'", '"0"')  # the guard's own spellings: only these keep a service guarded
+
     plain_setting = r"[ \t]*\$nrconf\{(\w+)\}\s*=\s*" + literal + r"\s*;\s*(#.*)?"
     # A reason names a file, a physical line and what is wrong there, never the line itself: a local config line
     # can hold a secret, and the reason reaches the validator log and the published machine specs.
@@ -1084,6 +1087,10 @@ def get_needrestart_guard(host_root="/proc/1/root"):
         where = f"{NEEDRESTART_GUARD_FILE} line {number}"
         if not match:
             return unknowable(f"{where} is not a guard line")
+        # a value may only be literals and arithmetic: anything else (an assignment, a call, a variable) may set
+        # another rule as it runs, which the last-assignment bookkeeping below would never see
+        if not re.fullmatch(r"[\d\s.+*/%()-]*", re.sub(literal, "", match.group(2))):
+            return unknowable(f"{where} runs code in its value")
         if match.group(1) in NEEDRESTART_GUARD_SERVICES:
             last_values[match.group(1)] = (match.group(2), where)  # Perl keeps the last assignment
         else:
@@ -1209,9 +1216,9 @@ def get_needrestart_guard(host_root="/proc/1/root"):
     unguarded = []
     unproven = None
     for service in NEEDRESTART_GUARD_SERVICES:
-        proven, unsure = False, None
+        proven, unsure, other_zero = False, None, None
         for pattern, value, where in other_rules:
-            if value is not None and perl_false(value):
+            if value in zero:
                 continue
             try:
                 matches = any(re.search(pattern, unit) for unit in NEEDRESTART_GUARD_UNITS[service])
@@ -1220,18 +1227,23 @@ def get_needrestart_guard(host_root="/proc/1/root"):
                 continue
             if not matches:
                 continue
-            if value is None or re.fullmatch(literal, value):
+            if value is None or (re.fullmatch(literal, value) and not perl_false(value)):
                 proven = True
+            elif re.fullmatch(literal, value):  # false in Perl too, but not a zero the guard writes
+                other_zero = other_zero or f"{where} sets a zero other than the guard's 0"
             else:
                 unsure = unsure or f"{where} sets a computed value the scrape cannot evaluate"
         value, where = last_values.get(service, (None, None))
         if value is None:
             proven = True  # no guard line for it
-        elif not perl_false(value):
-            if re.fullmatch(literal, value):
+        elif value not in zero:
+            if re.fullmatch(literal, value) and not perl_false(value):
                 proven = True
+            elif re.fullmatch(literal, value):
+                other_zero = other_zero or f"{where} sets {service} to a zero other than the guard's 0"
             else:
                 unsure = unsure or f"{where} sets {service} to a computed value the scrape cannot evaluate"
+        unsure = unsure or other_zero
         if proven or unsure:
             unguarded.append(service)
             if not proven:

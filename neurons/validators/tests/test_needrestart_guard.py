@@ -688,3 +688,36 @@ def test_a_dotfile_in_conf_d_is_not_loaded_and_never_named(tmp_path):
     assert _read(host) == ("present", [])
     (host / "etc/needrestart/conf.d/00-local.conf").write_text("system('true');\n")
     assert _reason(host) == "/etc/needrestart/conf.d/00-local.conf line 1, loaded before the guard, is not plain data"
+
+
+def test_a_guard_value_that_runs_code_is_named_with_its_line(tmp_path):
+    # a chained assignment sets another rule as it runs: a later line resetting the first key does not undo that
+    guard = _setup_script_guard() + (
+        "\n$nrconf{override_rc}->{qr(^dock)} = $nrconf{override_rc}->{qr(^docker)} = 1;\n"
+        "$nrconf{override_rc}->{qr(^dock)} = 0;\n"
+    )
+    host = _host(tmp_path, guard)
+    line = next(n for n, ln in enumerate(guard.splitlines(), 1) if "= $nrconf" in ln)
+    assert _read(host) == ("partial", ALL)
+    assert _reason(host) == f"{GUARD} line {line} runs code in its value"
+
+
+@pytest.mark.parametrize("value", ["0.0", "-0", "''"])
+def test_only_the_guards_own_zeros_keep_a_service_guarded(tmp_path, value):
+    guard = _setup_script_guard().replace("qr(^docker)} = 0;", f"qr(^docker)}} = {value};")
+    host = _host(tmp_path, guard)
+    line = next(n for n, ln in enumerate(guard.splitlines(), 1) if f"qr(^docker)}} = {value};" in ln)
+    assert _read(host) == ("partial", ["docker"])
+    assert _reason(host) == f"{GUARD} line {line} sets docker to a zero other than the guard's 0"
+
+    host = _host(tmp_path / "broader", _setup_script_guard())
+    _rules(host, f"qr(^dock) => {value},")
+    assert _read(host) == ("partial", ["docker"])
+    assert _reason(host) == "/etc/needrestart/needrestart.conf line 2 sets a zero other than the guard's 0"
+
+
+def test_a_quoted_key_keeps_its_inner_quotes(tmp_path):
+    host = _host(tmp_path, _setup_script_guard())
+    _rules(host, '"^docker" => 1,', "\"'^docker'\" => 0,")
+    assert _read(host) == ("partial", ["docker"])
+    assert _reason(host) is None
