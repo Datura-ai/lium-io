@@ -224,6 +224,21 @@ def _rpc_result(node, method: str, params: list):
     return reply["result"]
 
 
+# Finality normally trails the best block by a few blocks; an endpoint whose finalized head is further behind its own
+# best block than this has stopped finalizing.
+FINALITY_LAG_ALLOWANCE_BLOCKS = 10
+
+
+def _is_block_hash(value) -> bool:
+    if not isinstance(value, str) or len(value) != 66 or not value.startswith("0x"):
+        return False
+    try:
+        bytes.fromhex(value[2:])
+    except ValueError:
+        return False
+    return True
+
+
 def _twox(data: bytes, seeds: tuple[int, ...]) -> bytes:
     return b"".join(xxhash.xxh64(data, seed=seed).intdigest().to_bytes(8, "little") for seed in seeds)
 
@@ -1095,8 +1110,17 @@ class SubtensorClient:
                 # one blocking call per block on the shared loop). Until finality reaches the height there is no answer
                 # and the block is retried; the map holds the last BlockHashCount blocks, so an older one has none.
                 head = _rpc_result(node, "chain_getFinalizedHead", [])
+                if not _is_block_hash(head):
+                    # chain_getHeader with no hash answers the best block, which can be reorganized away
+                    raise ConnectionError(f"no finalized head: {head!r}")
                 header = _rpc_result(node, "chain_getHeader", [head])
-                if not header or int(header["number"], 16) < block:
+                if not header:
+                    raise ConnectionError(f"no header for the finalized head {head}")
+                if int(header["number"], 16) < block:
+                    best = _rpc_result(node, "chain_getHeader", [])
+                    if best and int(best["number"], 16) - int(header["number"], 16) > FINALITY_LAG_ALLOWANCE_BLOCKS:
+                        # this endpoint serves new blocks but its finality has stopped: another one may have it
+                        raise ConnectionError(f"finality stalled at {int(header['number'], 16)} on this endpoint")
                     raise LookupError(f"block {block} is not finalized yet")
                 block_hash = head
                 if int(header["number"], 16) > block:

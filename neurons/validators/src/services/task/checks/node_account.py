@@ -43,14 +43,18 @@ logger = get_logger(__name__)
 
 # fixed text, no node-supplied value; `$(...)` drops the trailing newline the executor writes. Only a file that is not
 # there (cat's ENOENT, under the C locale) reads as empty (an older executor). Any other failure, in the lookup or the
-# read, leaves the field empty and names it on the `unread` line, so each field's read is judged on its own: a hotkey
-# that settles the result settles it whatever the claim's read did
-READ_NODE_ACCOUNT_COMMAND = (
+# read, leaves the field empty and names it on the `unread` line. The hotkey and the claim are read by separate
+# commands: a claim read that stalls cannot hide a hotkey that settles the result, and the claim is only read when it
+# can change the verdict
+_READ_FILE = (
     "r() { o=$(LC_ALL=C cat \"$1\" 2>&1) && { printf '%s' \"$o\"; return 0; }; "
     "case $o in *': No such file or directory') return 0;; esac; return 1; }; "
-    "u=; h=$(r /etc/liumd/miner_hotkey) || { h=; u=\"$u hotkey\"; }; "
-    "c=$(r /etc/liumd/account_claim) || { c=; u=\"$u claim\"; }; "
-    "printf 'hotkey=%s\\nclaim=%s\\nunread=%s\\n' \"$h\" \"$c\" \"$u\""
+)
+READ_NODE_HOTKEY_COMMAND = _READ_FILE + (
+    "u=; h=$(r /etc/liumd/miner_hotkey) || { h=; u=hotkey; }; printf 'hotkey=%s\\nunread=%s\\n' \"$h\" \"$u\""
+)
+READ_NODE_CLAIM_COMMAND = _READ_FILE + (
+    "u=; c=$(r /etc/liumd/account_claim) || { c=; u=claim; }; printf 'claim=%s\\nunread=%s\\n' \"$c\" \"$u\""
 )
 READ_TIMEOUT_SECONDS = 15
 BINDING_FIELDS = (
@@ -127,28 +131,20 @@ class NodeAccountCheck:
         refused, at once (the relay case). A read that fails proves nothing either way: it only reports until the
         provider was notified (checks/enforcement.py)."""
         started = datetime.now(UTC)  # the deadline is judged at the read's start, not when its failure is handled
-        result = await ctx.runner.run(
-            READ_NODE_ACCOUNT_COMMAND, timeout=READ_TIMEOUT_SECONDS, retryable=True
-        )
-        # the binding as of the verdict, after the read: a read that outlasts the owner-wide grant's end is judged
+        result = await ctx.runner.run(READ_NODE_HOTKEY_COMMAND, timeout=READ_TIMEOUT_SECONDS, retryable=True)
+        # the binding as of the verdict, after the last read: a read that outlasts the owner-wide grant's end is judged
         # against the listing account's own binding
         executor = current_binding(ctx.executor)
         if not executor.expected_node_hotkeys:
             return None, False  # a listing binding naming no hotkey: nothing to compare, as for a node sent without one
-        found = dict(
-            line.split("=", 1) for line in (result.stdout or "").splitlines() if "=" in line
-        )
-        hotkey, claim = found.get("hotkey", "").strip(), found.get("claim", "").strip()
-        unread = set(found.get("unread", "").split())
+        found = _fields(result)
+        hotkey = found.get("hotkey", "").strip()
         what = {
             **what,
             "node_hotkey": hotkey,
             "expected_node_hotkeys": executor.expected_node_hotkeys,
         }
-        claims = set(executor.expected_account_claims or ()) | (
-            {executor.expected_account_claim} - {None, ""}
-        )
-        if not result.success or "hotkey" in unread:
+        if not result.success or "hotkey" in found["unread"]:
             # failed, timed out or closed without an exit status, or the hotkey file could not be read: ownership is
             # not proven
             failure = result.error_type or f"exit {result.exit_code}"
@@ -164,6 +160,24 @@ class NodeAccountCheck:
             )
             return None, False
         by_hotkey = executor.expected_claims_by_hotkey or {}
+        claims = set(executor.expected_account_claims or ()) | ({executor.expected_account_claim} - {None, ""})
+        if hotkey not in executor.expected_node_hotkeys and hotkey not in by_hotkey:
+            # another owner's setup: the hotkey alone settles it, whatever the claim would read
+            what["binding_mismatch"] = "hotkey"
+            return _refused(ctx, self.check_id, Msg.BINDING_MISMATCH, what), False
+        if hotkey not in by_hotkey and not (claims and hotkey == ctx.miner_hotkey):
+            return None, True  # one of the owner's own hotkeys: no claim can change that
+        result = await ctx.runner.run(READ_NODE_CLAIM_COMMAND, timeout=READ_TIMEOUT_SECONDS, retryable=True)
+        executor = current_binding(ctx.executor)
+        if not executor.expected_node_hotkeys:
+            return None, False
+        found = _fields(result)
+        claim = found.get("claim", "").strip()
+        claim_error = None if result.success else result.error_type or f"exit {result.exit_code}"
+        unread = found["unread"] | ({"claim"} if claim_error else set())
+        what["expected_node_hotkeys"] = executor.expected_node_hotkeys
+        claims = set(executor.expected_account_claims or ()) | ({executor.expected_account_claim} - {None, ""})
+        by_hotkey = executor.expected_claims_by_hotkey or {}
         if "claim" in unread:
             # decided by the hotkey alone where it settles the result: another owner's setup is refused, one of the
             # owner's own hotkeys passes. A setup the claim decides (a shared pool hotkey) is unverified.
@@ -171,7 +185,7 @@ class NodeAccountCheck:
                 what["binding_mismatch"] = "hotkey"
                 return _refused(ctx, self.check_id, Msg.BINDING_MISMATCH, what), False
             if hotkey in by_hotkey or (claims and hotkey == ctx.miner_hotkey):
-                what["read_error"] = "claim unreadable"
+                what["read_error"] = claim_error or "claim unreadable"
                 return self._unverified(ctx, what, started), False
             return None, True
         # an empty claim on a hotkey the listing already accepts keeps the legacy path below (an older executor)
@@ -206,10 +220,21 @@ class NodeAccountCheck:
         if enforced(ctx, Msg.BINDING_UNVERIFIED.reason, started):
             return _refused(ctx, self.check_id, Msg.BINDING_UNVERIFIED, what)
         what = {**what, "enforced": False}
-        return reported_only(
+        result = reported_only(
             ctx,
             render_message(Msg.UNVERIFIED_REPORTED, ctx=ctx, check_id=self.check_id, what=what),
         )
+        # the run is only reported, but nothing proved this machine the account's: no repair or cleanup writes to it
+        # unless the host key it presented is one the portal registered for the node
+        if not registered_host_keys(ctx.executor):
+            result.updates["host_writes_deferred"] = True
+        return result
+
+
+def _fields(result) -> dict:
+    """The `key=value` lines of a read, with `unread` as the set of fields it could not read."""
+    found = dict(line.split("=", 1) for line in (result.stdout or "").splitlines() if "=" in line)
+    return {**found, "unread": set(found.get("unread", "").split())}
 
 
 def _refused(ctx: Context, check_id: str, template, what: dict) -> CheckResult:
@@ -220,10 +245,12 @@ def _refused(ctx: Context, check_id: str, template, what: dict) -> CheckResult:
     what = {**what, "reach_source": str(ReachSource.VALIDATOR), "reach_target": str(ReachTarget.NODE)}
     event = render_message(template, ctx=ctx, check_id=check_id, what=what)
     if has_live_rental(ctx):
-        return CheckResult(passed=False, event=event, updates={"node_account_passed": False}, fatal=False)
+        return CheckResult(
+            passed=False, event=event, updates={"node_account_passed": False, "host_writes_deferred": True}, fatal=False
+        )
     return CheckResult(
         passed=False,
         event=event,
-        updates={"node_account_passed": False, "clear_verified_job_info": True},
+        updates={"node_account_passed": False, "clear_verified_job_info": True, "host_writes_deferred": True},
         fatal=True,
     )

@@ -14,7 +14,7 @@ import pytest
 import pytest_asyncio
 from datura.requests.miner_requests import ExecutorSSHInfo
 
-from services.task.checks.node_account import READ_NODE_ACCOUNT_COMMAND, NodeAccountCheck
+from services.task.checks.node_account import READ_NODE_CLAIM_COMMAND, READ_NODE_HOTKEY_COMMAND, NodeAccountCheck
 from tests.helpers import make_context
 
 IP_A, IP_B = "127.0.0.1", "127.0.0.2"
@@ -79,7 +79,7 @@ async def test_hostname_re_pointed_to_another_machine_is_refused(two_machines):
     result = await NodeAccountCheck().run(_ctx("node.example.com", await dial(IP_B), registered_key))
     assert not result.passed
     assert result.event.reason_code == "NODE_ACCOUNT_MISMATCH"
-    assert result.updates == {"node_account_passed": False, "clear_verified_job_info": True}
+    assert result.updates == {"node_account_passed": False, "clear_verified_job_info": True, "host_writes_deferred": True}
 
 
 async def test_ip_addressed_node_is_unchanged(two_machines):
@@ -192,9 +192,11 @@ async def test_ip_node_is_refused_on_a_machine_set_up_for_another_account(files,
     assert result.event.reason_code == reason
     assert result.passed is (reason != "NODE_ACCOUNT_MISMATCH")
     if not result.passed:
-        assert result.updates == {"node_account_passed": False, "clear_verified_job_info": True}
+        assert result.updates == {"node_account_passed": False, "clear_verified_job_info": True, "host_writes_deferred": True}
         assert "hostname" not in result.event.remediation
-    assert runner.commands == [READ_NODE_ACCOUNT_COMMAND]  # its behaviour on real files: the test below
+    # the claim is read only for a setup it decides (the shared pool hotkey); real-file behaviour: the test below
+    claim_decides = files.startswith(f"hotkey={POOL}")
+    assert runner.commands == [READ_NODE_HOTKEY_COMMAND] + [READ_NODE_CLAIM_COMMAND] * claim_decides
 
 
 @pytest.mark.parametrize(
@@ -228,9 +230,9 @@ async def test_a_rented_node_on_another_accounts_machine_keeps_its_rental(rented
     result = await NodeAccountCheck().run(_relay_ctx(_HostFiles("hotkey=5Victim\nclaim=\n")))
     assert not result.passed and result.event.reason_code == "NODE_ACCOUNT_MISMATCH"
     if rented:
-        assert (result.updates, result.fatal) == ({"node_account_passed": False}, False)
+        assert (result.updates, result.fatal) == ({"node_account_passed": False, "host_writes_deferred": True}, False)
     else:
-        assert (result.updates, result.fatal) == ({"node_account_passed": False, "clear_verified_job_info": True}, True)
+        assert (result.updates, result.fatal) == ({"node_account_passed": False, "clear_verified_job_info": True, "host_writes_deferred": True}, True)
     # an availability entry: the backend hides the node, so a partly rented one takes no rental on its free GPUs
     from services.task.availability import NODE_GPU_FAULT_CODES, availability_errors
 
@@ -536,7 +538,7 @@ async def test_a_failed_read_only_reports_until_the_provider_was_notified(enforc
         "NODE_ACCOUNT_UNVERIFIED",
         "warning",
     )
-    assert result.updates == {"reported_only": ("NODE_ACCOUNT_UNVERIFIED",)}
+    assert result.updates == {"reported_only": ("NODE_ACCOUNT_UNVERIFIED",), "host_writes_deferred": True}
     assert availability_errors([result.event]) == []
 
 
@@ -562,7 +564,7 @@ async def test_a_failed_read_that_straddles_the_deadline_only_reports_and_the_ne
 
     straddling = await NodeAccountCheck().run(_relay_ctx(_SlowFailedRead(0.6), enforce=notified))
     assert datetime.now(UTC) > deadline
-    assert straddling.passed and straddling.updates == {"reported_only": ("NODE_ACCOUNT_UNVERIFIED",)}
+    assert straddling.passed and straddling.updates["reported_only"] == ("NODE_ACCOUNT_UNVERIFIED",)
 
     after = await NodeAccountCheck().run(_relay_ctx(_HostFiles("", success=False), enforce=notified))
     assert not after.passed and after.event.reason_code == "NODE_ACCOUNT_UNVERIFIED"
@@ -656,16 +658,16 @@ async def test_a_portal_that_sends_no_notice_map_keeps_the_failed_read_enforced(
 @pytest.mark.parametrize(
     ("setup", "output"),
     [
-        ("missing", "hotkey=hk\nclaim=\nunread=\n"),
-        ("no-directory", "hotkey=\nclaim=\nunread=\n"),
-        ("empty", "hotkey=hk\nclaim=\nunread=\n"),
-        ("unreadable", "hotkey=hk\nclaim=\nunread= claim\n"),
-        ("io-error", "hotkey=hk\nclaim=\nunread= claim\n"),
-        ("hotkey-io-error", "hotkey=\nclaim=claim\nunread= hotkey\n"),
+        ("missing", ("hotkey=hk\nunread=\n", "claim=\nunread=\n")),
+        ("no-directory", ("hotkey=\nunread=\n", "claim=\nunread=\n")),
+        ("empty", ("hotkey=hk\nunread=\n", "claim=\nunread=\n")),
+        ("unreadable", ("hotkey=hk\nunread=\n", "claim=\nunread=claim\n")),
+        ("io-error", ("hotkey=hk\nunread=\n", "claim=\nunread=claim\n")),
+        ("hotkey-io-error", ("hotkey=\nunread=hotkey\n", "claim=claim\nunread=\n")),
     ],
 )
-def test_the_account_read_command_reads_empty_only_for_a_file_that_is_not_there(tmp_path, setup, output):
-    """The real command under sh: only a file (or directory) that is not there reads as empty. Any other failure, in
+def test_the_account_read_commands_read_empty_only_for_a_file_that_is_not_there(tmp_path, setup, output):
+    """The real commands under sh: only a file (or directory) that is not there reads as empty. Any other failure, in
     the lookup or the read (an I/O error), names the field on the `unread` line, so the check judges each field's
     read on its own instead of reading it as an empty value."""
     host = tmp_path / "liumd"
@@ -689,11 +691,15 @@ def test_the_account_read_command_reads_empty_only_for_a_file_that_is_not_there(
         )
         (stub / "cat").chmod(0o755)
         path = {"PATH": f"{stub}:/usr/bin:/bin"}
-    command = READ_NODE_ACCOUNT_COMMAND.replace("/etc/liumd/", f"{host}/")
     for shell in ("sh", "dash", "bash"):
-        run = subprocess.run([shell, "-c", command], capture_output=True, text=True, env=path)
-        assert run.returncode == 0
-        assert run.stdout == output
+        outputs = []
+        for read in (READ_NODE_HOTKEY_COMMAND, READ_NODE_CLAIM_COMMAND):
+            run = subprocess.run(
+                [shell, "-c", read.replace("/etc/liumd/", f"{host}/")], capture_output=True, text=True, env=path
+            )
+            assert run.returncode == 0
+            outputs.append(run.stdout)
+        assert tuple(outputs) == output
 
 
 @pytest.mark.parametrize(
@@ -723,3 +729,79 @@ async def test_an_unreadable_hotkey_is_unverified(notified):
     runner = _HostFiles(f"hotkey=\nclaim={CLAIM}\nunread= hotkey\n")
     result = await NodeAccountCheck().run(_relay_ctx(runner, enforce=NOTIFIED if notified else {}))
     assert (result.event.reason_code, result.passed) == ("NODE_ACCOUNT_UNVERIFIED", not notified)
+
+
+class _StalledClaim(_HostFiles):
+    """The hotkey reads; the claim read stalls past its timeout (a relay can hold it open)."""
+
+    async def run(self, cmd, **kwargs):
+        result = await super().run(cmd, **kwargs)
+        if cmd == READ_NODE_CLAIM_COMMAND:
+            return result.model_copy(update={"success": False, "stdout": "", "exit_code": None, "error_type": "timeout"})
+        return result
+
+
+@pytest.mark.parametrize(
+    ("hotkey", "notified", "reason", "passed"),
+    [
+        # another owner's setup is refused by its hotkey alone, whatever the claim read does, before the notice too
+        ("5Victim", False, "NODE_ACCOUNT_MISMATCH", False),
+        ("5Victim", True, "NODE_ACCOUNT_MISMATCH", False),
+        # one of the owner's own hotkeys needs no claim: never hidden by a stalled claim read
+        ("5Account", False, "NODE_ACCOUNT_OK", True),
+        ("5Account", True, "NODE_ACCOUNT_OK", True),
+        # the shared pool hotkey proves the owner only by the claim: unverified, enforced only after the notice
+        (POOL, False, "NODE_ACCOUNT_UNVERIFIED", True),
+        (POOL, True, "NODE_ACCOUNT_UNVERIFIED", False),
+    ],
+)
+async def test_a_stalled_claim_read_never_hides_a_hotkey_that_settles_the_result(hotkey, notified, reason, passed):
+    runner = _StalledClaim(f"hotkey={hotkey}\nunread=\n")
+    result = await NodeAccountCheck().run(_relay_ctx(runner, enforce=NOTIFIED if notified else {}))
+    assert (result.event.reason_code, result.passed) == (reason, passed)
+
+
+async def test_an_unverified_read_before_the_notice_promises_no_notice_it_cannot_guarantee():
+    result = await NodeAccountCheck().run(_relay_ctx(_HostFiles("", success=False), enforce={}))
+    assert result.event.impact == (
+        "This check has no effect on this run. A later failed check can hide the node once its notice deadline passes."
+    )
+
+
+@pytest.mark.parametrize(
+    "files, success, written",
+    [
+        ("", False, False),  # unread before the notice: reported only, and nothing proved the machine the account's
+        (f"hotkey={POOL}\nclaim={CLAIM}\n", True, True),  # its own pool node
+    ],
+)
+async def test_an_unverified_node_is_scored_but_its_host_is_never_repaired_or_cleaned(files, success, written):
+    """The run goes on for scoring and the report, but the needrestart guard, container cleanup and build sweep write
+    to the host only once the account check proved the machine the listing account's."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from services.task.checks.custom_build_orphan_sweep import CustomBuildOrphanSweepCheck
+    from services.task.checks.needrestart_guard import NeedrestartGuardCheck
+    from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
+    from services.task.pipeline import Pipeline
+
+    from tests.helpers import build_state
+
+    class _Sink:
+        async def emit(self, event):
+            pass
+
+    ssh = SimpleNamespace(run=AsyncMock(return_value=SimpleNamespace(stdout="needrestart_guard_set", stderr="")))
+    ctx = _relay_ctx(_HostFiles(files, success=success), enforce={}).model_copy(
+        update={"ssh": ssh, "state": build_state(specs={"needrestart_guard": "missing"})}
+    )
+    passed, events, end = await Pipeline([NodeAccountCheck(), NeedrestartGuardCheck()], _Sink()).run(ctx)
+
+    assert passed
+    assert ssh.run.await_count == (1 if written else 0)
+    assert end.host_writes_deferred is not written
+    if not written:
+        for check in (StaleContainerCleanupCheck(), CustomBuildOrphanSweepCheck()):
+            result = await check.run(end)
+            assert result.passed and result.event.reason_code.endswith("_DEFERRED")

@@ -37,6 +37,8 @@ class _Chain:
         if method == "chain_getFinalizedHead":
             return {"result": self.finalized}
         if method == "chain_getHeader":
+            if not params:  # no hash: the best block
+                return {"result": {"number": hex(max(height for height, _, _ in self.blocks.values()))}}
             block = self.blocks.get(params[0])
             return {"result": block and {"number": hex(block[0]), "parentHash": block[1]}}
         if method == "state_getStorage":
@@ -219,3 +221,73 @@ async def test_an_endpoint_that_keeps_answering_no_timestamp_is_left_for_the_fal
 
     assert await SubtensorClient.get_time_from_block(client, BLOCK) == "2026-11-19 18:52:38"
     client._switch_endpoint_after_read_failure.assert_called_once()
+
+
+def _failing_over(primary, fallback) -> MagicMock:
+    client = _client(primary)
+    client._switch_endpoint_after_read_failure.side_effect = lambda error: setattr(
+        client.get_node, "return_value", fallback
+    )
+    return client
+
+
+class _NullFinalizedHead(_Chain):
+    """An endpoint that answers chain_getFinalizedHead with a null result; chain_getHeader(null) is the best block."""
+
+    def rpc_request(self, method, params):
+        if method == "chain_getFinalizedHead":
+            self.calls += 1
+            return {"result": None}
+        if method == "chain_getHeader" and params == [None]:
+            return super().rpc_request(method, [])
+        return super().rpc_request(method, params)
+
+
+@pytest.mark.asyncio
+async def test_a_null_finalized_head_never_reads_the_best_block():
+    """A null finalized head made the header lookup answer the best block, so one job block could report under a
+    best-chain block's time on one attempt and the finalized one's on the next."""
+    a = _branch("a", BLOCK, BLOCK + 2, ROOT, T)
+    b = _branch("b", BLOCK, BLOCK + 2, ROOT, T + 12000)
+    blocks = {**a, **b, ROOT: (BLOCK - 1, _hash("genesis"), T - 12000)}
+    primary = _NullFinalizedHead(blocks, _hash(f"a{BLOCK + 2}"))
+    fallback = _Chain(blocks, _hash(f"b{BLOCK + 2}"))
+    answers = [await SubtensorClient.get_time_from_block(_failing_over(primary, fallback), BLOCK) for _ in range(2)]
+    assert answers == ["2026-11-19 18:52:50", "2026-11-19 18:52:50"]
+
+
+@pytest.mark.asyncio
+async def test_an_endpoint_whose_finality_stalled_is_left_for_the_fallback():
+    """The primary serves new blocks, but its finalized head stays far behind them; the fallback has finality."""
+    chain = _branch("a", BLOCK - 20, BLOCK + 2, ROOT, T - 20 * 12000)
+    primary = _Chain(chain, _hash(f"a{BLOCK - 20}"))
+    fallback = _Chain(chain, _hash(f"a{BLOCK + 2}"))
+    client = _failing_over(primary, fallback)
+    assert await SubtensorClient.get_time_from_block(client, BLOCK) == "2026-11-19 18:52:38"
+    client._switch_endpoint_after_read_failure.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_an_endpoint_without_the_finalized_heads_header_is_left_for_the_fallback():
+    primary = _Chain(CHAIN, _hash("missing"))
+    fallback = _Chain(CHAIN, _hash(f"a{BLOCK + 2}"))
+    client = _failing_over(primary, fallback)
+    assert await SubtensorClient.get_time_from_block(client, BLOCK) == "2026-11-19 18:52:38"
+    client._switch_endpoint_after_read_failure.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_finality_a_few_blocks_behind_keeps_the_block_pending_on_the_same_endpoint():
+    """The normal finality lag is no fault: the block waits, and the endpoint is kept."""
+    node = _Chain(CHAIN, _hash(f"a{BLOCK - 1}"))
+    client = _client(node)
+    assert await SubtensorClient.get_time_from_block(client, BLOCK) is None
+    for call in client._switch_endpoint_after_read_failure.call_args_list:
+        assert isinstance(call.args[0], LookupError)  # never a chain error, so the cursor does not move
+
+
+@pytest.mark.asyncio
+async def test_no_endpoint_with_finality_keeps_the_block_pending():
+    chain = _branch("a", BLOCK - 20, BLOCK + 2, ROOT, T - 20 * 12000)
+    stalled = _Chain(chain, _hash(f"a{BLOCK - 20}"))
+    assert await SubtensorClient.get_time_from_block(_failing_over(stalled, stalled), BLOCK) is None

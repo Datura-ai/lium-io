@@ -176,7 +176,7 @@ async def test_the_cycle_asks_for_every_executor(rest_miner_service):
 async def test_every_wave_result_carries_when_its_own_run_started(rest_miner_service):
     """Review on 4f44d24: the cycle id is the job block's estimated time, so a node registered after that estimate
     but before its run had no look time the backend could tie a finding to. Each wave result now carries its run's
-    start (the backend uses the later of the two), set before any early publish reads it."""
+    start in run_started_at (the backend uses the later of the two), set before any early publish reads it."""
     node = str(uuid4())
     rest_miner_service.miner_returns(node)
     before = datetime.now(UTC)
@@ -184,7 +184,8 @@ async def test_every_wave_result_carries_when_its_own_run_started(rest_miner_ser
     job = await _request(rest_miner_service)
 
     [result] = job["results"]
-    assert before <= result.check_started_at <= datetime.now(UTC)
+    assert before <= result.run_started_at <= datetime.now(UTC)
+    assert result.check_started_at is None  # the express recheck's marker, which a maintenance hold reads
 
 
 @pytest.mark.asyncio

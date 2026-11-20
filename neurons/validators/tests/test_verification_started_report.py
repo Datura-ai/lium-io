@@ -344,9 +344,10 @@ async def test_the_report_carries_the_claimed_list_not_what_the_express_lane_hol
 
 @pytest.mark.asyncio
 async def test_an_ordinary_wave_result_carries_its_runs_own_start(monkeypatch):
-    """The wave's job_batch_id is the job block's estimated time, which can be before the run really started; each
-    result carries its run's start (check_started_at), so the backend ties a finding to a node registered between the
-    two (lp#3232 review 4634721648)."""
+    """The wave's job_batch_id is the job block's time, before the run really started; each result carries its run's
+    start (run_started_at), so the backend ties a finding to a node registered between the two (lp#3232 review
+    4634721648). Never as check_started_at: that marks an express recheck, which a maintenance hold judges by its own
+    start, so a wave whose node ran after the window's end would re-list the node a cycle before its cycle did."""
     service = _miner_service_recording([])
     results: list[tuple[JobResult, datetime]] = []
 
@@ -370,7 +371,8 @@ async def test_an_ordinary_wave_result_carries_its_runs_own_start(monkeypatch):
         await service.request_job_to_miner(_payload(), MagicMock(), RentedExecutorsResponse(executors={}), {})
 
     [(result, running_at)] = results
-    assert before <= result.check_started_at <= running_at
+    assert before <= result.run_started_at <= running_at
+    assert result.check_started_at is None
 
 
 @pytest.mark.asyncio

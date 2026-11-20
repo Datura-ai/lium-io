@@ -379,6 +379,9 @@ class Context(BaseModel):
     # False once NodeAccountCheck finds the node on another account's machine (DAH-6539); non-fatal on a live
     # rental, so the score gate lives in calculate_scores.
     node_account_passed: bool = True
+    # True once NodeAccountCheck could not prove the machine is the listing account's, by its registered host key or
+    # by its account files: the run goes on for scoring and reporting, but no check repairs or cleans up the host.
+    host_writes_deferred: bool = False
     # Reason codes of checks that found a failure they do not enforce yet (report-only until the portal sent the
     # provider its per-node notice, see checks/enforcement.py). Finalize reports them so the portal can send it.
     reported_only: tuple[str, ...] = ()

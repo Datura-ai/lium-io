@@ -1213,7 +1213,8 @@ class NodeAccountMessages:
         reason="NODE_ACCOUNT_UNVERIFIED",
         severity="warning",
         category="policy",
-        impact="Proceed; the provider is notified first, and only after that notice does this finding hide the node",
+        impact="This check has no effect on this run. A later failed check can hide the node once its notice deadline "
+        "passes.",
         remediation="The validator could not read this node's account files over SSH. Make sure the executor is up "
         "and reachable at this address.",
     )
@@ -1242,6 +1243,13 @@ class StaleContainerCleanupMessages:
         impact="Cleanup stopped for this cycle; the rest of the validation runs",
         remediation="Docker on the node answers slowly; check that dockerd is responsive.",
     )
+    DEFERRED = MessageTemplate(
+        event="Stale container cleanup skipped: node account not verified",
+        reason="STALE_CLEANUP_DEFERRED",
+        severity="info",
+        category="prep",
+        impact="No container removed this cycle; cleanup runs once a check verifies the node's account",
+    )
 
 
 class CustomBuildOrphanSweepMessages:
@@ -1256,6 +1264,13 @@ class CustomBuildOrphanSweepMessages:
         severity="info",
         category="prep",
         impact="Proceed",
+    )
+    DEFERRED = MessageTemplate(
+        event="Custom build orphan sweep skipped: node account not verified",
+        reason="CUSTOM_BUILD_SWEEP_DEFERRED",
+        severity="info",
+        category="prep",
+        impact="Proceed; the sweep runs once a check verifies the node's account",
     )
     SWEPT = MessageTemplate(
         event="Custom build orphan sweep complete",
