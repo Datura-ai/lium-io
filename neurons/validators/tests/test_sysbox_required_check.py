@@ -163,6 +163,18 @@ async def test_no_sysbox_without_dind_probe_error_keeps_the_install_advice(conte
     assert "dind_probe_error" not in result.event.what_we_saw
 
 
+@pytest.mark.asyncio
+async def test_no_sysbox_event_carries_the_nodes_own_sysbox_test_error(context_factory):
+    error = "Sysbox runtime does not support GPU access. docker: Error response from daemon: unknown runtime"
+    ctx = context_factory(state=build_state(sysbox_runtime=False, specs={"sysbox_runtime_scrape_error": error}))
+
+    result = await SysboxRequiredCheck().run(ctx)
+
+    assert result.event.reason_code == Msg.SYSBOX_MISSING.reason
+    assert result.event.what_we_saw["sysbox_scrape_error"] == error
+    assert error in result.event.remediation and Msg.SYSBOX_MISSING.remediation in result.event.remediation
+
+
 # DAH-3634 — the probe's `docker run` was refused by the NVIDIA container hook.
 
 # the hook's stderr verbatim from the validator log (`DinD creation failed`, 10 to 17 Sep 2026)

@@ -537,6 +537,23 @@ def test_sysbox_probe_returns_the_p2p_table_its_shipped_command_prints(tmp_path)
     assert rental_table.strip() == table.strip()
 
 
+def test_failed_sysbox_check_keeps_the_tail_of_dockers_error() -> None:
+    scrape = build_scrape_namespace(
+        SRC / "miner_jobs" / "machine_scrape.py",
+        {"COMMANDS", "SYSBOX_CHECK_DETAIL_CAP", "check_sysbox_gpu_compatibility"},
+        {"subprocess": subprocess},
+    )
+    error = "docker: Error response from daemon: unknown or invalid runtime name: sysbox-runc.\n"
+    scrape["run_capability_check"] = lambda command: subprocess.CompletedProcess(command, 125, "", "x" * 2000 + error)
+
+    ok, message, rental_table = scrape["check_sysbox_gpu_compatibility"]()
+
+    assert (ok, rental_table) == (False, None)
+    assert message.startswith("Sysbox runtime does not support GPU access. ")
+    assert message.endswith(error.strip())
+    assert len(message) <= len("Sysbox runtime does not support GPU access. ") + 500
+
+
 @pytest.mark.parametrize(
     ("capture", "devices", "ok_pairs", "p2p", "pcie_class"),
     [
