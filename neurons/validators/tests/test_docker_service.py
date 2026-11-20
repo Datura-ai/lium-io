@@ -25,6 +25,7 @@ from core.docker_utils import DockerCommand
 import services.docker_service as docker_service_module
 from services.attestation_service import AttestationError
 from services.image_flatten import FLATTEN_NO_DISK_RENTER_SENTENCE, ImageFlattenNoDisk
+from services.rental_gpu_proof import RentalGpuProofFailed
 import services.image_flatten as image_flatten_module
 from services.cvm_quote_broker import DSTACK_GUEST_SOCKET_PATH, QUOTE_BROKER_SOCKET_PATH
 from services.docker_service import (
@@ -5719,6 +5720,60 @@ async def test_create_container_login_failure_does_not_block_successful_pull(
 
     assert isinstance(result, ContainerCreated)
     assert docker_client.pulled_images == [payload.docker_image]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "workload_kind, proves, outcome",
+    [
+        (WorkloadKind.CUSTOMER_RENTAL, True, "created"),
+        (WorkloadKind.CUSTOMER_RENTAL, False, "failed at gpu_cuda_proof"),  # 8 listed, CUDA saw 1
+        (WorkloadKind.FILLER, False, "created, not checked"),
+    ],
+)
+async def test_a_create_is_reported_only_once_cuda_uses_every_rented_gpu(
+    docker_service, monkeypatch, rented_gpus_prove_on_create_path, workload_kind, proves, outcome
+):
+    """Billing starts on ContainerCreated: a rented GPU CUDA cannot use in the pod fails the create, unbilled."""
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    if not proves:
+        rented_gpus_prove_on_create_path.side_effect = RentalGpuProofFailed(
+            "GPU check failed before billing: CUDA can use 1 of the 8 rented GPUs"
+        )
+    payload = _private_registry_create_payload().model_copy(
+        update={"workload_kind": workload_kind, "gpu_uuids": ["GPU-a", "GPU-b"]}
+    )
+    executor_info = ExecutorSSHInfo(
+        uuid=payload.executor_id,
+        address="127.0.0.1",
+        port=8080,
+        ssh_username="root",
+        ssh_port=2200,
+        python_path="/usr/bin/python",
+        root_dir="/root/app",
+        ssh_host_key=FAKE_SSH_HOST_KEY,
+    )
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=executor_info,
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    if outcome == "failed at gpu_cuda_proof":
+        assert isinstance(result, FailedContainerRequest)
+        assert result.failure_step == "gpu_cuda_proof" and "1 of the 8 rented GPUs" in result.detail
+        # the backend's rent retry and creation-failure classifier read this type and step
+        assert result.error_type == FailedContainerErrorTypes.ContainerCreationFailed
+    else:
+        assert isinstance(result, ContainerCreated), getattr(result, "detail", result)
+    if "not checked" in outcome:
+        rented_gpus_prove_on_create_path.assert_not_awaited()
+    else:
+        rented_gpus_prove_on_create_path.assert_awaited_once()
+        kwargs = rented_gpus_prove_on_create_path.await_args.kwargs
+        assert kwargs["gpu_uuids"] == ["GPU-a", "GPU-b"] and kwargs["python_path"] == "/usr/bin/python"
 
 
 @pytest.mark.asyncio
