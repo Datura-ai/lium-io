@@ -1219,6 +1219,26 @@ def test_the_rules_are_back_before_dockerd_starts_a_container_after_a_reboot(tmp
     ]
 
 
+def test_a_docker_start_after_the_last_rental_ended_restores_no_rules(tmp_path):
+    """Cleanup leaves the boot copy a no-op under the same path the drop-in names, so a later Docker start puts back no
+    rules of a rental that has ended."""
+    state, root, env = _modelled_host(tmp_path, docker_user=True)
+    applied = subprocess.run(
+        ["sh", "-c", link_local_drop_script(None, ["docker0"], str(root))], env=env, capture_output=True, text=True
+    )
+    assert applied.returncode == 0, applied.stderr
+
+    cleaned = subprocess.run(["sh", "-c", link_local_cleanup_script(str(root))], env=env, capture_output=True, text=True)
+    assert cleaned.returncode == 0, cleaned.stderr
+    replayed = subprocess.run(
+        ["sh", str(root / rental_egress_guard.BOOT_SCRIPT.lstrip("/"))], env=env, capture_output=True, text=True
+    )
+
+    assert replayed.returncode == 0, replayed.stderr
+    assert not [rules for _, rules in _jumps_and_rules(state) if rules]
+    assert (root / rental_egress_guard.BOOT_DROPIN.lstrip("/")).exists()
+
+
 def test_a_host_without_a_systemd_docker_service_is_reported_not_failed(tmp_path):
     state, root, env = _modelled_host(tmp_path, docker_user=True, systemd=False)
 

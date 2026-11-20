@@ -273,13 +273,26 @@ def _boot_restore(boot: str, host_root: str) -> str:
     )
 
 
-def link_local_cleanup_script() -> str:
-    """Remove our chains and their DOCKER-USER jumps: run when a host has nothing left to guard."""
+def _boot_clear(host_root: str) -> str:
+    """Replace an installed boot copy with a no-op: the drop-in keeps naming it, and a Docker start never brings back
+    the rules of a rental that has ended."""
+    script = shlex.quote(host_root + BOOT_SCRIPT)
+    return (
+        f"if [ -f {script} ]; then printf 'exit 0\\n' > {script}.tmp && mv -f {script}.tmp {script} || "
+        "{ echo 'boot rules not cleared' >&2; exit 4; }; fi"
+    )
+
+
+def link_local_cleanup_script(host_root: str = HOST_ROOT) -> str:
+    """Remove our chains, their DOCKER-USER jumps and the boot copy of the rules: run when a host has nothing left to
+    guard."""
+    clear = _boot_clear(host_root)
     lines = [
         _BACKEND_PROBE,
         # nothing to clean only when an iptables said so on every backend; a probe that failed otherwise may hide our
         # jumps, and no iptables at all (a PID 1 that is not the host's) proves nothing: 3, so the helper reads the host
-        '[ -n "$IPT" ] || { [ -n "$ERRS" ] && { printf %s "$ERRS" >&2; exit 4; }; [ -n "$FOUND" ] && exit 0; '
+        '[ -n "$IPT" ] || { [ -n "$ERRS" ] && { printf %s "$ERRS" >&2; exit 4; }; '
+        f'[ -n "$FOUND" ] && {{ {clear}; exit 0; }}; '
         'echo "no iptables" >&2; exit 3; }',
     ]
     for chain in CHAINS:
@@ -291,7 +304,7 @@ def link_local_cleanup_script() -> str:
             f"$IPT -F {chain} || exit 4; $IPT -X {chain} || exit 4; "
             f'else case "$ERR" in *"No chain"*|*"does not exist"*) ;; *) echo "$ERR" >&2; exit 4;; esac; fi'
         )
-    return "; ".join(lines) + f"; {_DETACH_OLD_JUMPS}; exit 0"
+    return "; ".join(lines) + f"; {_DETACH_OLD_JUMPS}; {clear}; exit 0"
 
 
 def locked_script(script: str, generation: str | None = None) -> str:
