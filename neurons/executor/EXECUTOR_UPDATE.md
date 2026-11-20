@@ -15,6 +15,13 @@ The updater never pulls by tag. A pull by tag (`runner:latest`) asks the host's 
 
 Stacks started before this change run `nickfedor/watchtower` (or the older `containrrr/watchtower`), which pulls by tag. The runner replaces it: every time the runner starts, it checks the stack's updater container and, when it runs another image, starts `daturaai/lium-watchtower` in its place with the same name. When that container does not start, the runner puts the old updater back. The next runner release reaches those hosts through their old updater, so they need no step. The one-time restart below is for a host whose updater no longer runs.
 
+## A node on an old executor image
+
+The validator compares the executor image each node runs with the current release. The release just replaced still counts as current for 16 validation cycles (about 4 hours) after a push, so a node has time to update itself. After that:
+
+- A free node on an old image fails validation, earns nothing and is off the rent list until it runs the current release.
+- A rented node keeps its rental and its incentive. Update it before the rental ends, or it leaves the rent list then.
+
 ## Make sure that a node is current
 
 Ask the node. The executor answers on the host port `EXTERNAL_PORT` from `.env`. Run this in the directory that holds `.env`:
