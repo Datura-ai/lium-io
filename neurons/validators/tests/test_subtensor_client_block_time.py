@@ -12,29 +12,37 @@ BLOCK = 9542550
 
 
 class _Chain:
-    """A node's RPC: the finalized height, the best chain's hash per height and each hash's timestamp (ms)."""
+    """A node's RPC over hash-linked headers: hash -> (height, parent hash, timestamp in ms), and the finalized head."""
 
-    def __init__(self, finalized: int, hashes: dict[int, str | None], times: dict[str, int]):
-        self.finalized, self.hashes, self.times = finalized, hashes, times
+    def __init__(self, blocks: dict[str, tuple[int, str, int]], finalized: str):
+        self.blocks, self.finalized = blocks, finalized
         self.down = False
 
     def rpc_request(self, method, params):
         if self.down:
             raise ConnectionError("down")
         if method == "chain_getFinalizedHead":
-            return {"result": f"0xfinal{self.finalized}"}
+            return {"result": self.finalized}
         if method == "chain_getHeader":
-            return {"result": {"number": hex(self.finalized)}}
-        if method == "chain_getBlockHash":
-            return {"result": self.hashes.get(params[0])}
-        raise AssertionError(method)
+            block = self.blocks.get(params[0])
+            return {"result": block and {"number": hex(block[0]), "parentHash": block[1]}}
+        raise AssertionError(f"{method}: a lookup by height can reach a peer on another branch")
 
     def query(self, module, storage, block_hash):
         assert (module, storage) == ("Timestamp", "Now")
-        return SimpleNamespace(value=self.times[block_hash])
+        return SimpleNamespace(value=self.blocks[block_hash][2])
 
     def get_block_hash(self, block):
         raise AssertionError("the client's cached get_block_hash keeps a null answer")
+
+
+def _branch(name: str, start: int, end: int, parent: str, first_ms: int) -> dict[str, tuple[int, str, int]]:
+    """Blocks start..end on one branch, 12 s apart, the first one's parent `parent`."""
+    blocks = {}
+    for height in range(start, end + 1):
+        blocks[f"0x{name}{height}"] = (height, parent, first_ms + (height - start) * 12000)
+        parent = f"0x{name}{height}"
+    return blocks
 
 
 def _client(node) -> MagicMock:
@@ -48,9 +56,13 @@ def _time_of(node):
     return SubtensorClient.get_time_from_block(_client(node), BLOCK)
 
 
+T = 1795114358000  # 2026-11-19 18:52:38 UTC, in ms
+CHAIN = _branch("a", BLOCK - 1, BLOCK + 2, "0xroot", T - 12000)
+
+
 @pytest.mark.asyncio
 async def test_a_blocks_time_is_its_chain_timestamp_in_utc_whatever_the_hosts_zone(monkeypatch):
-    node = _Chain(BLOCK, {BLOCK: "0xabc"}, {"0xabc": 1795114358000})  # 2026-11-19 18:52:38 UTC, in ms
+    node = _Chain(CHAIN, f"0xa{BLOCK + 2}")
     monkeypatch.setenv("TZ", "America/New_York")
     time.tzset()
     try:
@@ -62,41 +74,40 @@ async def test_a_blocks_time_is_its_chain_timestamp_in_utc_whatever_the_hosts_zo
 
 @pytest.mark.asyncio
 async def test_a_chain_that_does_not_answer_gives_no_time():
-    node = _Chain(BLOCK, {BLOCK: "0xabc"}, {"0xabc": 1795114358000})
+    node = _Chain(CHAIN, f"0xa{BLOCK + 2}")
     node.down = True
     assert await _time_of(node) is None
 
 
 @pytest.mark.asyncio
-async def test_a_peer_with_no_hash_for_the_block_gives_no_time_never_its_best_blocks():
-    node = _Chain(BLOCK, {BLOCK: None}, {})
+async def test_a_block_finality_has_not_reached_gives_no_time_and_is_read_once_it_has():
+    node = _Chain(CHAIN, f"0xa{BLOCK - 1}")
+    assert await _time_of(node) is None
+    node.finalized = f"0xa{BLOCK}"
+    assert await _time_of(node) == "2026-11-19 18:52:38"
+
+
+@pytest.mark.asyncio
+async def test_a_peer_missing_a_header_on_the_way_gives_no_time():
+    blocks = dict(CHAIN)
+    del blocks[f"0xa{BLOCK + 1}"]
+    node = _Chain(blocks, f"0xa{BLOCK + 2}")
     node.query = MagicMock()
     assert await _time_of(node) is None
     node.query.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_a_peer_that_answered_no_hash_is_asked_again_and_its_later_answer_is_used():
-    """The client's get_block_hash keeps a height's first answer, a null one included, so the block stayed unreadable
-    after the peer caught up. Every attempt asks the chain again."""
-    node = _Chain(BLOCK, {BLOCK: None}, {"0xabc": 1795114358000})
-
-    assert await _time_of(node) is None
-    node.hashes[BLOCK] = "0xabc"
-    assert await _time_of(node) == "2026-11-19 18:52:38"
-
-
-@pytest.mark.asyncio
 async def test_a_block_reorganized_before_finality_reports_under_one_cycle_id_only():
-    """Review on f37a14f: two best-chain hashes at one height (a reorganization) gave two timestamps, so one job block
-    reported under two cycle ids and settlement could count it twice. Only a finalized block gives a time: while
-    finality is behind, no attempt runs, and every attempt after it reads the one finalized block."""
-    node = _Chain(BLOCK - 1, {BLOCK: "0xfirst"}, {"0xfirst": 1795114358000, "0xsecond": 1795114370000})
-    answers = [await _time_of(node)]
-    node.hashes[BLOCK] = "0xsecond"  # the best chain at this height changes
-    answers.append(await _time_of(node))
-    node.finalized = BLOCK  # finality reaches the block on the second branch
+    """Reviews on f37a14f and e95f474: two branches at one height (a reorganization, or a lookup by height that a
+    reconnect sent to a peer on the other branch) gave two timestamps, so one job block reported under two cycle ids.
+    The hash is taken only by walking back from the finalized head, so every attempt reads the finalized branch."""
+    a = _branch("a", BLOCK, BLOCK + 2, "0xroot", T)
+    b = _branch("b", BLOCK, BLOCK + 2, "0xroot", T + 12000)  # the competing branch: 18:52:50 at the same height
+    node = _Chain({**a, **b}, "0xroot")
+    node.blocks["0xroot"] = (BLOCK - 1, "0xgenesis", T - 12000)
+    answers = [await _time_of(node)]  # finality is behind the height
+    node.finalized = f"0xb{BLOCK + 2}"  # finality reaches it on branch b; a peer may still serve branch a's blocks
     answers += [await _time_of(node), await _time_of(node)]
 
-    assert answers == [None, None, "2026-11-19 18:52:50", "2026-11-19 18:52:50"]
-    assert len({answer for answer in answers if answer}) == 1
+    assert answers == [None, "2026-11-19 18:52:50", "2026-11-19 18:52:50"]

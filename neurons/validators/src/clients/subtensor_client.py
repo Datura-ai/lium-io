@@ -1063,19 +1063,21 @@ class SubtensorClient:
         while retries < max_retries:
             try:
                 node = self.get_node()
-                # Only a finalized block: a best-chain block can be reorganized away, and the block at that height then
-                # has another timestamp, so one job block would report under two cycle ids. Until finality reaches it,
-                # there is no answer and the block is retried.
-                finalized = node.rpc_request("chain_getFinalizedHead", [])["result"]
-                if int(node.rpc_request("chain_getHeader", [finalized])["result"]["number"], 16) < block:
+                # Only a finalized block, and its hash taken from the finalized chain itself: from the finalized head,
+                # parent by parent down to the height. A best-chain block can be reorganized away, and a separate
+                # lookup by height can reach another peer (the SDK reconnects per call) on a competing branch; either
+                # way one job block would report under two cycle ids. A block hash fixes its parent, so whichever peer
+                # answers each step, the walk stays on the chain the finalized head belongs to. Until finality reaches
+                # the height there is no answer and the block is retried.
+                block_hash = node.rpc_request("chain_getFinalizedHead", [])["result"]
+                header = node.rpc_request("chain_getHeader", [block_hash])["result"]
+                if not header or int(header["number"], 16) < block:
                     raise LookupError(f"block {block} is not finalized yet")
-                # asked of the chain on every attempt: get_block_hash caches a height's answer in the client
-                # (lru_cache), a null one included, so a peer that answered no hash once would answer it until restart
-                block_hash = node.rpc_request("chain_getBlockHash", [block])["result"]
-                if not block_hash:
-                    # a peer that has not seen the block answers no hash, and a storage read without one reads the
-                    # peer's best block instead: that is no answer for this block
-                    raise LookupError(f"no hash for block {block}")
+                while int(header["number"], 16) > block:
+                    block_hash = header["parentHash"]
+                    header = node.rpc_request("chain_getHeader", [block_hash])["result"]
+                    if not header:
+                        raise LookupError(f"no header for {block_hash}")
                 return datetime.fromtimestamp(
                     node.query("Timestamp", "Now", block_hash=block_hash).value / 1000, tz=UTC
                 ).strftime("%Y-%m-%d %H:%M:%S")
