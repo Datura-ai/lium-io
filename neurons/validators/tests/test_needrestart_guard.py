@@ -647,6 +647,14 @@ def test_a_changed_loader_line_is_named_and_a_missing_loader_names_the_file(tmp_
         f"/etc/needrestart/needrestart.conf line {glob_line + 4} differs from the stock conf.d loader"
     )
 
+    # only a commented opener: it anchors the loader once its comment is stripped, but no line aligns as written,
+    # so it is named (the stand's crash at 409768f)
+    main.write_text("if(-d q(/etc/needrestart/conf.d)) { # c\n")
+    assert _read(host) == ("partial", ALL)
+    assert _reason(host) == "/etc/needrestart/needrestart.conf line 1 differs from the stock conf.d loader"
+    main.write_text("$nrconf{a} = 1;\nforeach my $fn (sort </etc/needrestart/conf.d/*.conf>) { # c\n")
+    assert _reason(host) == "/etc/needrestart/needrestart.conf line 2 differs from the stock conf.d loader"
+
     main.write_text("$nrconf{restart} = 'a';\nif (1) {\n}\n}\n")  # stray braces are not a loader
     assert _reason(host) == "/etc/needrestart/needrestart.conf has no stock conf.d loader"
 

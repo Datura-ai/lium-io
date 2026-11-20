@@ -1143,6 +1143,8 @@ def get_needrestart_guard(host_root="/proc/1/root"):
 
         i, j = min(candidates, key=lambda c: (-sum(m.size for m in aligned(*c)[1]), c[1], c[0]))
         start, runs = aligned(i, j)
+        if not runs:  # the anchor matched only with its comment stripped and no loader line aligns: it differs
+            return unknowable(f"{main_path} line {main[i][0]} differs from the stock conf.d loader")
         first = runs[0]
         if first.a:
             # the first aligned line is below the opener: the line in the opener's place is the (edited) opener only
