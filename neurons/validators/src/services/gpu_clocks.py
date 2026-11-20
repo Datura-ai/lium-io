@@ -58,6 +58,8 @@ def _rgc_failure(code: str) -> str:
 # a completed -rgc refusal by a GPU whose clocks cannot be changed from here: 3 "not supported", 4 "insufficient
 # permissions" (a passthrough VM), as -lgc answers for the lock (_record_and_lock): no clock lock to undo
 _NO_CLOCK_CONTROL = {_rgc_failure("3"), _rgc_failure("4")}
+# no "<uuid> <exit>" line for the GPU: the SSH call timed out or lost its answer (the runner answers -1, no output)
+_NO_ANSWER = "nvidia-smi -rgc gave no answer"
 # one per GPU uuid this validator ever changed; a few thousand at most, never freed
 _GPU_LOCKS: dict[str, asyncio.Lock] = {}
 
@@ -238,7 +240,7 @@ async def _reset_gpu_clocks(
     result = await _run(runner, cmd)
     exits = dict(line.split()[:2] for line in (result.stdout or "").splitlines() if len(line.split()) >= 2)
     failures: dict[str, str | None] = {
-        uuid: None if exits.get(uuid) == "0" else _rgc_failure(exits.get(uuid, "unknown"))
+        uuid: None if exits.get(uuid) == "0" else _rgc_failure(exits[uuid]) if uuid in exits else _NO_ANSWER
         for uuid in uuids
     }
     await _reset_app_and_memory_clocks_of(runner, uuids)
@@ -482,6 +484,8 @@ async def _reset_leftovers(
             raise
         # the SSH call failed: no verdict on any GPU, so only the recorded ones count, as when nothing is recorded
         ran, failures = False, dict.fromkeys(gpu_uuids, "the reset did not run")
+    if gpu_uuids and all(failure == _NO_ANSWER for failure in failures.values()):
+        ran = False  # the whole batch gave no answer (timeout, lost output): no verdict on any GPU, as above
     try:
         await _forget(redis, [uuid for uuid, failure in failures.items() if failure is None])
     except Exception:

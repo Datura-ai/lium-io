@@ -65,6 +65,8 @@ class FakeHost:
             parts = [p.split() for p in cmd.split("; ") if p.startswith("nvidia-smi -i ")]
             return make_command_result(True, "\n".join(f"{p[2]} {p[3]} {self.app_mem_exit}" for p in parts))
         if " -rgc " in cmd:  # the batched resets: one "<uuid> <exit>" line per GPU
+            if self.rgc_exit is None:  # the whole batch times out: the runner answers -1, no output
+                return make_command_result(False, "", exit_code=-1)
             uuids = _reset_uuids(cmd)
             return make_command_result(True, "\n".join(f"{u} {self.rgc_exit}" for u in uuids))
         raise AssertionError(f"unexpected command {cmd}")
@@ -565,6 +567,17 @@ async def test_a_create_reset_whose_ssh_call_fails_answers_every_recorded_gpu():
     host.run = AsyncMock(side_effect=OSError("connection lost"))
 
     assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == [U[1]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("recorded", "expected"), [([], []), ([U[1]], [U[1]])], ids=["no-records", "one-record"])
+async def test_a_create_reset_batch_that_times_out_answers_only_the_recorded_gpus(recorded, expected):
+    host, redis = FakeHost(rgc_exit=None), FakeRedis()
+    for uuid in recorded:
+        redis.store[f"gpu_clock_lock:{uuid}"] = json.dumps({"pod_id": "old"})
+
+    # no "<uuid> <exit>" line at all is no verdict on any GPU: with no records the create goes on to Docker
+    assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == expected
 
 
 @pytest.mark.asyncio
