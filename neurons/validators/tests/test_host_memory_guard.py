@@ -116,7 +116,13 @@ def _run_memory_min(
                     (host / f.name).symlink_to(f.resolve())
         path = str(host)
     env = {**os.environ, "PATH": path}
-    return lambda: subprocess.run(["sh", "-c", inner], capture_output=True, text=True, env=env, check=False).stdout
+
+    def run(popen: bool = False):
+        if popen:
+            return subprocess.Popen(["sh", "-c", inner], stdout=subprocess.DEVNULL, env=env)
+        return subprocess.run(["sh", "-c", inner], capture_output=True, text=True, env=env, check=False).stdout
+
+    return run
 
 
 def _read(path):
@@ -521,6 +527,29 @@ def test_a_host_without_flock_still_protects_the_executor_and_its_parent(tmp_pat
     assert out["failed"] == []
     assert _read(tmp_path / "cg" / executor.lstrip("/") / "memory.min") == EX
     assert _read(tmp_path / "cg" / parent.lstrip("/") / "memory.min") == EX
+
+
+def test_the_host_part_keeps_the_lock_if_the_executor_shell_dies(tmp_path):
+    """A dropped session can kill the executor's shell while the host part still runs: the lock must stay held."""
+    run = _run_memory_min(tmp_path, "/tenant/executor", systemd=False, outer=True)
+    release = tmp_path / "release"
+    # the host part blocks until released, as a slow baseline read or write would
+    _fake_bin(
+        tmp_path,
+        "nsenter",
+        f'while [ ! -e "{release}" ]; do sleep 0.05; done; while [ "$1" != -- ]; do shift; done; shift; exec "$@"\n',
+    )
+    lock = tmp_path / "proc/1/root/run/lium-memory-guard.lock"
+    outer = run(popen=True)
+    try:
+        time.sleep(0.5)
+        outer.kill()
+        outer.wait()
+        assert subprocess.run(["flock", "-n", str(lock), "true"]).returncode != 0
+    finally:
+        release.touch()
+    time.sleep(0.5)
+    assert subprocess.run(["flock", "-w", "5", str(lock), "true"]).returncode == 0
 
 
 def test_the_lock_is_held_around_the_host_part(tmp_path):

@@ -156,8 +156,9 @@ def _host_memory_min_script() -> str:
         "if ! command -v nsenter >/dev/null 2>&1; then echo memory_min_skipped no_nsenter; "
         "elif ! command -v flock >/dev/null 2>&1; then echo memory_min_skipped no_flock; "
         f"elif ! (: >>{LOCK}) 2>/dev/null; then echo memory_min_skipped lock_unavailable; "
+        # the host part inherits descriptor 9, so the lock stays held until it exits even if this shell dies first
         "else { if flock -w 25 9; then nsenter -t 1 -m -C -- sh -c " + shlex.quote(inner)
-        + " 9>&- 2>/dev/null || echo memory_min_skipped nsenter_failed; else echo memory_min_skipped lock_busy; fi; "
+        + " 2>/dev/null || echo memory_min_skipped nsenter_failed; else echo memory_min_skipped lock_busy; fi; "
         f"}} 9>>{LOCK}; fi"
     )
 
