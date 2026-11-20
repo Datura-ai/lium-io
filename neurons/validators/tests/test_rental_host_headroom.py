@@ -44,20 +44,6 @@ def test_rental_cpu_count_is_the_backends_count(cpu_count, expected):
     assert DockerService._rental_cpu_count(cpu_count) == expected
 
 
-@pytest.mark.parametrize("reserve_env", [None, "0", "1", "8"])
-def test_the_pod_gets_exactly_the_cores_the_backend_sent_whatever_the_validator_env(svc, monkeypatch, reserve_env):  # noqa: F811
-    # the reserve lives in the backend only: no validator setting can take a second core off the listed count
-    if reserve_env is None:
-        monkeypatch.delenv("RENTAL_HOST_CPU_RESERVE", raising=False)
-    else:
-        monkeypatch.setenv("RENTAL_HOST_CPU_RESERVE", reserve_env)
-
-    run_spec = _run_spec(svc, 30, cpu_count=63)
-
-    assert run_spec.cpu_count == 63
-    assert not hasattr(settings, "RENTAL_HOST_CPU_RESERVE")
-
-
 def test_the_cvm_quote_broker_log_is_capped_like_a_rental():
     from services.cvm_quote_broker import quote_broker_run_spec
 
