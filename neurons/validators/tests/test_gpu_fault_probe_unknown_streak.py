@@ -1,4 +1,7 @@
 import pytest
+from neurons.validators.src.protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from neurons.validators.src.services.const import FILLER_CONTAINER_PREFIX
+from neurons.validators.src.services.task.checks import gpu_fault_probe
 from neurons.validators.src.services.task.checks.gpu_fault_probe import (
     BUSY_VRAM_ERROR_PREFIX,
     UNKNOWN_STREAK_LIMIT,
@@ -7,7 +10,9 @@ from neurons.validators.src.services.task.checks.gpu_fault_probe import (
 )
 from neurons.validators.src.services.task.messages import GpuFaultProbeMessages as Msg
 
+from tests.helpers import default_executor
 from tests.test_gpu_fault_probe_check import FakeRunner, make_ctx, probe_stdout
+from tests.test_gpu_usage_check import _run_the_renter_ending_mid_run, _scored_ctx, _snapshot_with_pod
 
 NO_VERDICT = dict(stdout="", exit_code=-1, error_type="timeout")
 OK = dict(stdout=probe_stdout("ok"))
@@ -94,3 +99,54 @@ async def test_a_busy_card_beside_a_silent_one_still_counts(context_factory):
 def test_the_busy_prefix_is_the_probes_own_setup_error():
     assert f'f"{BUSY_VRAM_ERROR_PREFIX}: ' in probe_source()
 
+
+
+FILLER = "filler"
+
+
+async def _cycles_with_fillers(context_factory, answers: list) -> list:
+    """FILLER is a cycle a filler holds the node: the probe is skipped."""
+    results = []
+    for answer in answers:
+        if answer == FILLER:
+            rented_data = RentedExecutorsResponse(
+                executors={},
+                banned_guids=[],
+                filler_containers_by_executor={default_executor().uuid: f"{FILLER_CONTAINER_PREFIX}active"},
+            )
+            ctx = make_ctx(context_factory, FakeRunner(probe_stdout("ok")), rented_data=rented_data)
+        else:
+            answer = dict(answer)
+            ctx = make_ctx(context_factory, FakeRunner(answer.pop("stdout"), **answer))
+        results.append(await GpuFaultProbeCheck().run(ctx))
+    return results
+
+
+@pytest.mark.asyncio
+async def test_a_filler_cycle_between_no_verdicts_ends_the_streak(context_factory):
+    # 7b3527db, 14-15 Nov: a healthy card hung once on the first idle cycle after each rental, a filler between each
+    answers = [NO_VERDICT, FILLER] * UNKNOWN_STREAK_LIMIT
+
+    results = await _cycles_with_fillers(context_factory, answers)
+
+    assert all(result.passed for result in results)
+
+
+@pytest.mark.asyncio
+async def test_a_rented_cycle_ends_the_streak(context_factory):
+    ctx = _scored_ctx(context_factory, rented_data=_snapshot_with_pod(last_verifyx_download_speed=800.0))
+    key = (ctx.miner_hotkey, ctx.executor.uuid)
+    gpu_fault_probe._unknown_streak[key] = UNKNOWN_STREAK_LIMIT - 1
+
+    await _run_the_renter_ending_mid_run(ctx)
+
+    assert key not in gpu_fault_probe._unknown_streak
+
+
+@pytest.mark.asyncio
+async def test_the_streak_has_its_own_advice_not_reseat_the_card(context_factory):
+    results = await _cycles(context_factory, [NO_VERDICT] * UNKNOWN_STREAK_LIMIT)
+
+    remediation = results[-1].event.remediation
+    assert "libcuda" in remediation
+    assert remediation != Msg.PROBE_FAILED.remediation

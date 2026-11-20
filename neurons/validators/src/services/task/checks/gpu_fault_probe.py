@@ -55,6 +55,23 @@ MAX_XID_CHARS = 200
 # verdict are counted per (miner hotkey, executor uuid), per process, and judged like a fault from this many on.
 UNKNOWN_STREAK_LIMIT = 5
 _unknown_streak: dict[tuple[str, str], int] = {}
+# the streak's own advice: the probe never gave an answer, so nothing says the card is bad; most often the
+# CUDA library is missing or broken (35014785: no libcuda, 54 cycles, 15-16 Nov), not the card
+UNKNOWN_STREAK_REMEDIATION = (
+    "The kernel-fault probe could not run or finish on this idle node for several checks in a row, so its GPUs "
+    "could not be checked. The error names the cause: a missing or unloadable CUDA driver library "
+    "(libcuda.so.1), cuInit failing, a driver and library version mismatch, or kernels that hang. Check "
+    "`nvidia-smi` and `ldconfig -p | grep libcuda` on the host and repair the NVIDIA driver install; reseat or "
+    "replace a card only if its kernels still hang after that."
+)
+
+
+def forget_unknown_streak(ctx: Context) -> None:
+    """A cycle that does not probe the node (rented, or a filler holds it) ends a no-verdict run: the
+    no-verdicts on either side of it are not in a row. Without this, a healthy card that hangs once on the
+    first idle cycle after each rental (7b3527db, 14-15 Nov: five such hangs hours apart, a rental or a
+    filler between each) adds up to a streak."""
+    _unknown_streak.pop((ctx.miner_hotkey, ctx.executor.uuid), None)
 
 
 class GpuFaultProbeCheck:
@@ -84,6 +101,7 @@ class GpuFaultProbeCheck:
         filler_container = get_filler_only_container(ctx)
         # the recheck only probes beside a filler after it removed the node's Lium fillers
         if filler_container and not self.is_post_rental_recheck:
+            forget_unknown_streak(ctx)
             event = render_message(
                 Msg.FILLER_SKIPPED,
                 ctx=ctx,
@@ -128,7 +146,7 @@ class GpuFaultProbeCheck:
         what["probe"] = _summary(report)
         status = report.get("status")
         if status in ("ok", "fault"):
-            _unknown_streak.pop((ctx.miner_hotkey, ctx.executor.uuid), None)
+            forget_unknown_streak(ctx)
         if status == "ok":
             return CheckResult(
                 passed=True,
@@ -162,14 +180,22 @@ class GpuFaultProbeCheck:
         if streak >= UNKNOWN_STREAK_LIMIT:
             what["unknown_streak"] = streak
             error = f"probe gave no verdict {streak} cycles in a row: {what.get('error')}"
-            return self._fault_verdict(ctx, what, error=error, report=None)
+            return self._fault_verdict(
+                ctx, what, error=error, report=None, remediation=UNKNOWN_STREAK_REMEDIATION
+            )
         return CheckResult(
             passed=True,
             event=render_message(Msg.UNKNOWN, ctx=ctx, check_id=self.check_id, what=what),
         )
 
     def _fault_verdict(
-        self, ctx: Context, what: dict[str, Any], *, error: str, report: dict[str, Any] | None
+        self,
+        ctx: Context,
+        what: dict[str, Any],
+        *,
+        error: str,
+        report: dict[str, Any] | None,
+        remediation: str | None = None,
     ) -> CheckResult:
         what["error"] = error[: MAX_FAULT_LINES * MAX_FAULT_CHARS]
         if report is not None:
@@ -179,6 +205,7 @@ class GpuFaultProbeCheck:
             ctx=ctx,
             check_id=self.check_id,
             what=what,
+            remediation=remediation,
         )
         return CheckResult(passed=False, event=event)
 

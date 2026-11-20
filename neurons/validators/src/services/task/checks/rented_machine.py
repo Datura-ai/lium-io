@@ -43,6 +43,7 @@ from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
 from ..pipeline import Check, CheckResult, Context
 from . import port_connectivity
+from .gpu_fault_probe import forget_unknown_streak
 from .gpu_usage import _fillers_off_their_image
 from .port_connectivity import PortConnectivityCheck
 from .provider_maintenance import maintenance_failure, maintenance_window_at_cycle_start
@@ -301,6 +302,8 @@ class TenantEnforcementCheck:
             )
 
         rented_pods = rented_executor.pods
+        # a rented cycle does not reach the kernel-fault probe, so no-verdicts before and after it are not in a row
+        forget_unknown_streak(ctx)
         extra = {
             **ctx.default_extra,
             "rented": True,
