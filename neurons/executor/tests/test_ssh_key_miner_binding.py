@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from bittensor_wallet import Keypair
 import pytest
-from datura.requests.validator_requests import ssh_pubkey_signing_blob
+from datura.requests.validator_requests import fresh_upload_nonce, ssh_pubkey_signing_blob
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from middlewares.miner import MinerMiddleware
@@ -59,7 +59,8 @@ def _sign(kp, msg):
     return "0x" + kp.sign(msg).hex()
 
 
-def _payload(miner_kp, validator_kp, bound_hotkey=None, nonce=None, signer=None):
+def _payload(miner_kp, validator_kp, bound_hotkey=None, signer=None):
+    nonce = fresh_upload_nonce()  # every upload carries a dated nonce
     body = {
         "public_key": _SSH_KEY,
         "data_to_sign": _SSH_KEY,
@@ -80,10 +81,9 @@ def _binding_logs(caplog):
     return [r for r in caplog.records if _LOG_KEY in r.getMessage()]
 
 
-@pytest.mark.parametrize("nonce", [None, _NONCE])
-def test_matching_hotkey_accepted_without_log(client, miner_kp, validator_kp, caplog, nonce):
+def test_matching_hotkey_accepted_without_log(client, miner_kp, validator_kp, caplog):
     caplog.set_level(logging.INFO)
-    resp = client.post("/upload_ssh_key", json=_payload(miner_kp, validator_kp, miner_kp.ss58_address, nonce))
+    resp = client.post("/upload_ssh_key", json=_payload(miner_kp, validator_kp, miner_kp.ss58_address))
     assert resp.status_code == 200
     assert _binding_logs(caplog) == []
 

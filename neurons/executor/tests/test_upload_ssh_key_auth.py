@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from bittensor_wallet import Keypair
 import pytest
+from datura.requests.validator_requests import fresh_upload_nonce, ssh_pubkey_signing_blob
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -110,13 +111,15 @@ def client(validator_keypair, miner_keypair, monkeypatch):
 
 def _build_payload(public_key: str, miner_kp, validator_kp) -> dict:
     """Return a fully signed UploadSShKeyPayload dict."""
+    nonce = fresh_upload_nonce()  # an upload without a dated nonce is refused
     miner_sig = "0x" + miner_kp.sign(public_key).hex()
-    validator_sig = "0x" + validator_kp.sign(public_key).hex()
+    validator_sig = "0x" + validator_kp.sign(ssh_pubkey_signing_blob(public_key, nonce)).hex()
     return {
         "public_key": public_key,
         "data_to_sign": public_key,  # must equal public_key per Issue #744 check
         "signature": miner_sig,
         "validator_signature": validator_sig,
+        "nonce": nonce,
     }
 
 

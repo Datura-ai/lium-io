@@ -57,13 +57,7 @@ def test_miner_refuses_a_stranger_listing_executors():
 def _submit(headers: dict, body: dict | None = None):
     priv, pub = lib.ssh_keypair()
     vk = lib.validator_keypair()
-    body = body or {
-        "message_type": "SSHPubKeySubmitRequest",
-        "public_key": pub,
-        "validator_signature": lib.sign(vk, pub),
-        "validator_miner_signature": lib.sign(vk, lib.ssh_pubkey_signing_blob(pub, None, lib.MINER_HOTKEY)),
-        "miner_hotkey": lib.MINER_HOTKEY,
-    }
+    body = body or {"message_type": "SSHPubKeySubmitRequest", **lib.validator_signed_upload_fields(vk, pub)}
     return lib.http("POST", f"{lib.MINER_URL}/api/validator/ssh-pubkey-submit", json=body, headers=headers, timeout=60), priv, pub
 
 
@@ -223,7 +217,7 @@ def test_executor_refuses_a_key_without_a_miner_binding_403():
 def test_executor_refuses_a_binding_signed_by_a_stranger_403():
     _, pub = lib.ssh_keypair()
     body = lib.upload_ssh_key_payload(lib.miner_keypair(), lib.validator_keypair(), pub)
-    body["validator_miner_signature"] = lib.sign(lib.stranger_keypair(), lib.ssh_pubkey_signing_blob(pub, None, lib.MINER_HOTKEY))
+    body["validator_miner_signature"] = lib.sign(lib.stranger_keypair(), lib.ssh_pubkey_signing_blob(pub, body["nonce"], lib.MINER_HOTKEY))
     r = _upload_ssh_key_to_executor(body)
     assert r.status_code == 403, r.text
 

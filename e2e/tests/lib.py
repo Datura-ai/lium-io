@@ -6,7 +6,7 @@ import time
 
 import requests
 from bittensor_wallet import Keypair
-from datura.requests.validator_requests import AuthenticationPayload, ssh_pubkey_signing_blob
+from datura.requests.validator_requests import AuthenticationPayload, fresh_upload_nonce, ssh_pubkey_signing_blob
 
 ENV = os.environ
 MINER_URL = f"http://{ENV['E2E_MINER_IP']}:{ENV['E2E_MINER_PORT']}"
@@ -71,12 +71,15 @@ def validator_rest_headers(kp: Keypair, miner_hotkey: str = MINER_HOTKEY, timest
 
 
 def upload_ssh_key_payload(
-    miner_kp: Keypair, validator_kp: Keypair, public_key: str, nonce: str | None = None, bound_to: str | None = MINER_HOTKEY
+    miner_kp: Keypair, validator_kp: Keypair, public_key: str, nonce: str | None = "", bound_to: str | None = MINER_HOTKEY
 ) -> dict:
     """What the miner posts to the executor's /upload_ssh_key (ExecutorService.send_pubkey_to_executor).
 
     `bound_to` is the miner hotkey the validator issued the key for (`validator_miner_signature`), as every validator
-    upload carries; the stack's executor refuses a key without it (REQUIRE_MINER_BOUND_SSH_KEY, executor/e2e.env)."""
+    upload carries; the stack's executor refuses a key without it (REQUIRE_MINER_BOUND_SSH_KEY, executor/e2e.env).
+    `nonce` defaults to a fresh dated nonce, which executors require on upload; pass None for the legacy format."""
+    if nonce == "":
+        nonce = fresh_upload_nonce()
     body = {
         "public_key": public_key,
         "validator_signature": sign(validator_kp, ssh_pubkey_signing_blob(public_key, nonce)),
@@ -89,6 +92,19 @@ def upload_ssh_key_payload(
         body["miner_hotkey"] = bound_to
         body["validator_miner_signature"] = sign(validator_kp, ssh_pubkey_signing_blob(public_key, nonce, bound_to))
     return body
+
+
+def validator_signed_upload_fields(validator_kp: Keypair, public_key: str) -> dict:
+    """The validator-signed fields of an SSH-key upload (MinerService): validator_signature over the key and a fresh
+    dated nonce, and validator_miner_signature binding the key to this miner's hotkey."""
+    nonce = fresh_upload_nonce()
+    return {
+        "public_key": public_key,
+        "validator_signature": sign(validator_kp, ssh_pubkey_signing_blob(public_key, nonce)),
+        "nonce": nonce,
+        "miner_hotkey": MINER_HOTKEY,
+        "validator_miner_signature": sign(validator_kp, ssh_pubkey_signing_blob(public_key, nonce, MINER_HOTKEY)),
+    }
 
 
 def executor_sh(command: str, timeout: float = 60) -> tuple[int, str]:
