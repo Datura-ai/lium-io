@@ -95,6 +95,7 @@ HOST_NS = "nsenter -t 1 -m -n -r --"
 HOST_ROOT = "/proc/1/root"
 BOOT_SCRIPT = "/etc/lium/rental-egress-boot.sh"
 BOOT_DROPIN = "/etc/systemd/system/docker.service.d/lium-rental-egress.conf"
+BOOT_UNIT = "/etc/systemd/system/lium-rental-egress-boot.service"
 _ABSENT_NETWORK = re.compile(r"no such network|network \S+ not found", re.IGNORECASE)
 _ABSENT_CONTAINER = re.compile(r"no such (object|container)", re.IGNORECASE)
 
@@ -266,29 +267,42 @@ NO_BOOT_UNIT = "boot restore not installed: no systemd docker.service"
 
 
 def _boot_restore(boot: str, host_root: str) -> str:
-    """Install ``boot`` as ``ExecStartPre`` of the host's ``docker.service``; daemon-reload when the drop-in is new or
-    systemd has not loaded it yet."""
-    script, dropin = shlex.quote(host_root + BOOT_SCRIPT), shlex.quote(host_root + BOOT_DROPIN)
+    """Install ``boot`` as a unit of its own that ``docker.service`` requires and starts after; daemon-reload when
+    either file is new or systemd has not loaded it yet. Nothing of Docker's own start settings is changed."""
+    script, dropin, own = (shlex.quote(host_root + p) for p in (BOOT_SCRIPT, BOOT_DROPIN, BOOT_UNIT))
     dirs = " ".join(shlex.quote(host_root + path.rsplit("/", 1)[0]) for path in (BOOT_SCRIPT, BOOT_DROPIN))
+    name = BOOT_UNIT.rsplit("/", 1)[1]
     # printf makes the newlines, so the command stays on one line
-    # no "-": dockerd restarts rental containers itself (unless-stopped), past the validator's pre-start guard, so
-    # dockerd does not start until the boot copy has put the rules back; no start timeout cuts that wait short
-    unit = shlex.quote(f"[Service]\\nTimeoutStartSec=infinity\\nExecStartPre=/bin/sh {BOOT_SCRIPT}\\n")
+    # dockerd restarts rental containers itself (unless-stopped), past the validator's pre-start guard: Requires= with
+    # After= keeps dockerd from starting until the boot copy has put the rules back, and a boot copy that fails stops
+    # it. The wait has no deadline on this unit only, so Docker's own start timeout and the provider's settings stay.
+    # No RemainAfterExit: the copy runs again on every Docker start, as before
+    unit = shlex.quote(
+        "[Unit]\\nDescription=Lium rental egress rules\\n"
+        f"[Service]\\nType=oneshot\\nTimeoutStartSec=infinity\\nExecStart=/bin/sh {BOOT_SCRIPT}\\n"
+    )
+    hook = shlex.quote(f"[Unit]\\nRequires={name}\\nAfter={name}\\n")
+    need = "$HOST_NS systemctl show -p NeedDaemonReload --value"
     return (
-        f"if [ -d {shlex.quote(host_root + '/run/systemd/system')} ] && "
-        '[ "$($HOST_NS systemctl show -p LoadState --value docker.service 2>/dev/null)" = loaded ]; then '
+        f"if [ ! -d {shlex.quote(host_root + '/run/systemd/system')} ]; then echo '{NO_BOOT_UNIT}'; "
+        # a state that cannot be read is not taken for "no docker.service": the pod start refuses on it
+        "elif ! boot_unit_state=$($HOST_NS systemctl show -p LoadState --value docker.service 2>/dev/null) || "
+        '[ -z "$boot_unit_state" ]; then echo \'boot restore not installed: docker.service state not read\'; '
+        f'elif [ "$boot_unit_state" != loaded ]; then echo \'{NO_BOOT_UNIT}\'; '
         # reported here; a pod start refuses on it (apply_rental_egress_guard), so no pod Docker would restart at
         # boot is started without the boot copy
-        f"if ! mkdir -p {dirs}; then echo 'boot restore not installed: directories not created'; "
+        f"elif ! mkdir -p {dirs}; then echo 'boot restore not installed: directories not created'; "
         f"elif ! {{ printf '%s\\n' {shlex.quote(boot)} > {script}.tmp && mv -f {script}.tmp {script}; }}; then "
         "echo 'boot restore not installed: boot rules not written'; "
-        f"elif ! printf {unit} > {dropin}.tmp; then echo 'boot restore not installed: drop-in not written'; "
+        f"elif ! {{ printf {unit} > {own}.tmp && printf {hook} > {dropin}.tmp; }}; then "
+        "echo 'boot restore not installed: drop-in not written'; "
         # same bytes: still reloaded while systemd has not loaded them (an earlier run's reload failed)
-        f"elif cmp {dropin}.tmp {dropin} >/dev/null 2>&1 && rm -f {dropin}.tmp && "
-        '[ "$($HOST_NS systemctl show -p NeedDaemonReload --value docker.service 2>/dev/null)" != yes ]; then :; '
-        f"elif ! {{ {{ [ ! -e {dropin}.tmp ] || mv -f {dropin}.tmp {dropin}; }} && $HOST_NS systemctl daemon-reload; }}; then "
-        "echo 'boot restore not installed: docker.service drop-in not loaded'; fi; "
-        f"else echo '{NO_BOOT_UNIT}'; fi"
+        f"elif cmp {own}.tmp {own} >/dev/null 2>&1 && cmp {dropin}.tmp {dropin} >/dev/null 2>&1 && "
+        f"rm -f {own}.tmp {dropin}.tmp && [ \"$({need} {name} 2>/dev/null)\" != yes ] && "
+        f'[ "$({need} docker.service 2>/dev/null)" != yes ]; then :; '
+        f"elif ! {{ {{ [ ! -e {own}.tmp ] || mv -f {own}.tmp {own}; }} && {{ [ ! -e {dropin}.tmp ] || "
+        f"mv -f {dropin}.tmp {dropin}; }} && $HOST_NS systemctl daemon-reload; }}; then "
+        "echo 'boot restore not installed: docker.service drop-in not loaded'; fi"
     )
 
 

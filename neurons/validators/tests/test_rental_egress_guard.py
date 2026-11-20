@@ -91,7 +91,7 @@ def _helper_calls(ssh) -> list[str]:
 
 def test_script_rebuilds_the_rules_in_a_fresh_chain_and_swaps_it_in():
     full = link_local_drop_script("br-0123456789ab", ["docker0"])
-    script = full[: full.index("if [ -d ")]  # the rules; the boot copy after them is the same text again
+    script = full[: full.index("if [ ! -d ")]  # the rules; the boot copy after them is the same text again
     for match in ("-i br-0123456789ab", "-i docker0"):
         for proto in ("tcp", "udp"):
             assert f"$IPT -A $NEW {match} -d {LINK_LOCAL_CIDR} -p {proto} ! --dport 53 -j DROP" in script
@@ -1214,8 +1214,11 @@ def test_the_rules_are_back_before_dockerd_starts_a_container_after_a_reboot(tmp
         done = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True)
         assert done.returncode == 0, done.stderr
     dropin = (root / rental_egress_guard.BOOT_DROPIN.lstrip("/")).read_text()
-    # no "-": a boot copy that fails stops dockerd, so no rental container restarts without its rules
-    assert f"ExecStartPre=/bin/sh {rental_egress_guard.BOOT_SCRIPT}" in dropin.splitlines()
+    unit = (root / rental_egress_guard.BOOT_UNIT.lstrip("/")).read_text()
+    name = rental_egress_guard.BOOT_UNIT.rsplit("/", 1)[1]
+    # no "-": a boot copy that fails fails its unit, and Requires= with After= keeps dockerd from starting
+    assert f"ExecStart=/bin/sh {rental_egress_guard.BOOT_SCRIPT}" in unit.splitlines()
+    assert {f"Requires={name}", f"After={name}"} <= set(dropin.splitlines())
     assert (state / "reloads").read_text().split() == ["x"]  # reloaded once, not on every apply
 
     # the reboot: no chain survives, dockerd has not run yet; the drop-in's script alone restores the rules
@@ -1242,11 +1245,13 @@ def test_a_boot_copy_holds_the_docker_start_until_the_rules_are_back(tmp_path):
         ["sh", "-c", link_local_drop_script("br-0123456789ab", [], str(root))], env=env, capture_output=True, text=True
     )
     assert applied.returncode == 0, applied.stderr
+    unit = (root / rental_egress_guard.BOOT_UNIT.lstrip("/")).read_text()
+    [line] = [x for x in unit.splitlines() if x.startswith("ExecStart=")]
+    assert not line.startswith("ExecStart=-")
+    assert "TimeoutStartSec=infinity" in unit.splitlines()  # no start timeout cuts the wait short
+    # sergej-bot review at 957d8e3: Docker's own start settings, the provider's included, are left as they are
     dropin = (root / rental_egress_guard.BOOT_DROPIN.lstrip("/")).read_text()
-    [line] = [x for x in dropin.splitlines() if x.startswith("ExecStartPre=")]
-    assert not line.startswith("ExecStartPre=-")
-
-    assert "TimeoutStartSec=infinity" in dropin.splitlines()  # no start timeout cuts the wait short
+    assert dropin.splitlines()[0] == "[Unit]" and "[Service]" not in dropin and "Timeout" not in dropin
 
     # the reboot, with the firewall write failing for a while
     for chain in [p for p in state.iterdir() if p.name not in ("FORWARD", "reloads")]:
@@ -1307,6 +1312,21 @@ def test_a_host_without_a_systemd_docker_service_is_reported_not_failed(tmp_path
         assert not (root / "etc").exists()
 
 
+def test_a_docker_service_state_that_cannot_be_read_is_not_taken_for_no_docker_service(tmp_path):
+    # sergej-bot review at 957d8e3: a failed systemctl query must not pass as "no systemd docker.service", which a pod
+    # start accepts; it is reported as not installed, so the pod start refuses
+    state, root, env = _modelled_host(tmp_path, docker_user=True)
+    (tmp_path / "bin" / "systemctl").write_text("#!/bin/sh\nexit 1\n")
+
+    done = subprocess.run(
+        ["sh", "-c", link_local_drop_script("br-0123456789ab", [], str(root))], env=env, capture_output=True, text=True
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert "boot restore not installed: docker.service state not read" in done.stdout.splitlines()
+    assert rental_egress_guard.NO_BOOT_UNIT not in done.stdout
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("on_host", [True, False])
 async def test_the_pre_start_guard_requires_the_pods_own_bridge_in_the_applied_rules(on_host):
@@ -1333,6 +1353,7 @@ async def test_the_pre_start_guard_requires_the_pods_own_bridge_in_the_applied_r
     [
         ("boot restore not installed: directories not created", True, True),
         ("boot restore not installed: docker.service drop-in not loaded", True, True),
+        ("boot restore not installed: docker.service state not read", True, True),
         (rental_egress_guard.NO_BOOT_UNIT, True, False),
         ("boot restore not installed: directories not created", False, False),
     ],
@@ -1355,13 +1376,14 @@ def test_a_failed_daemon_reload_is_retried_by_the_next_run_although_the_drop_in_
     # same bytes and must still reload while systemd says NeedDaemonReload=yes, or a Docker restart skips the rules
     state, root, env = _modelled_host(tmp_path, docker_user=True)
     dropin = root / rental_egress_guard.BOOT_DROPIN.lstrip("/")
+    unit = root / rental_egress_guard.BOOT_UNIT.lstrip("/")
     (tmp_path / "bin" / "systemctl").write_text(
         "#!/bin/sh\n"
         'case "$1 $3" in\n'
         '  "show LoadState") echo loaded ;;\n'
-        f'  "show NeedDaemonReload") cmp -s {dropin} "$STATE/loaded" && echo no || echo yes ;;\n'
+        f'  "show NeedDaemonReload") cat {dropin} {unit} | cmp -s - "$STATE/loaded" && echo no || echo yes ;;\n'
         '  "daemon-reload ") [ -e "$STATE/reload_fails" ] && exit 1; '
-        f'cp {dropin} "$STATE/loaded"; echo x >> "$STATE/reloads" ;;\n'
+        f'cat {dropin} {unit} > "$STATE/loaded"; echo x >> "$STATE/reloads" ;;\n'
         "esac\n"
     )
     (state / "reload_fails").touch()
@@ -1374,7 +1396,7 @@ def test_a_failed_daemon_reload_is_retried_by_the_next_run_although_the_drop_in_
         again = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True)
         assert again.returncode == 0 and "boot restore not installed" not in again.stdout
 
-    assert (state / "loaded").read_text() == dropin.read_text()
+    assert (state / "loaded").read_text() == dropin.read_text() + unit.read_text()
     assert (state / "reloads").read_text().split() == ["x"]  # reloaded once loaded, not on every apply
 
 
