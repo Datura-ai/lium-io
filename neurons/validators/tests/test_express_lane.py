@@ -7,6 +7,7 @@ imported by test_rented_executor_not_listed.py.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import shutil
@@ -1444,12 +1445,20 @@ class _Killed(BaseException):
     """The process ending mid-tick: nothing after it runs, and no handler in sync() sees it."""
 
 
+async def _killed_at_the_wave(jobs, *args, **kwargs):
+    for job in jobs:  # scheduled, none has sent its request yet
+        job.cancel()
+    raise _Killed
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("killed_at", ["job_files", "wave"])
 async def test_a_restart_after_the_blocks_time_was_read_but_before_its_wave_was_sent_runs_that_wave(
-    validator_with_mocks, create_neuron_info
+    validator_with_mocks, create_neuron_info, killed_at
 ):
-    """Review on 34557fb: the pending block left Redis as soon as its time was read, before any miner was asked, so a
-    restart in between started from nothing and block 1050's wave never ran. It stays pending until its wave is sent."""
+    """Reviews on 34557fb and 228145e: the pending block left Redis once its time was read (later: once the wave's
+    requests were scheduled), before any miner was asked, so a restart in between started from nothing and block
+    1050's wave never ran. It stays pending until its wave has run."""
     from core.config import settings
     from core.validator import Validator
 
@@ -1463,9 +1472,13 @@ async def test_a_restart_after_the_blocks_time_was_read_but_before_its_wave_was_
     validator.subtensor_client.get_miners = AsyncMock(return_value=[create_neuron_info(1, "miner-a")])
     block = 14 * n  # 1050 with a 75-block interval
     encrypt = validator.file_encrypt_service.ecrypt_miner_job_files
-    validator.file_encrypt_service.ecrypt_miner_job_files = Mock(side_effect=_Killed)  # the wave's files: before it is sent
+    kill = contextlib.nullcontext()
+    if killed_at == "job_files":
+        validator.file_encrypt_service.ecrypt_miner_job_files = Mock(side_effect=_Killed)
+    else:
+        kill = patch("asyncio.wait", new=_killed_at_the_wave)
 
-    with pytest.raises(_Killed):
+    with kill, pytest.raises(_Killed):
         await _run_ticks(validator, (block + n - 1,), lambda b, attempt: True)  # 1124: 1050's time is read
     assert store["validator_pending_job_block"] == f"[{block}, {block + n - 1}]"
 

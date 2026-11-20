@@ -637,9 +637,6 @@ class Validator:
                         "miner_port": miner.axon_info.port,
                         "job_batch_id": job_batch_id,
                     }
-                # the block stops being pending only once its wave is sent: a restart at any step above (after its time
-                # was read) restores it and runs its wave, within the same one-interval limit
-                await self.keep_pending_job(None)
 
                 try:
                     all_job_results = {}
@@ -650,6 +647,10 @@ class Validator:
                         done, pending = await asyncio.wait(jobs, timeout=settings.JOB_TIME_OUT - 50)
                     else:
                         done, pending = set(), set()
+                    # The block stops being pending only once its wave has run: a restart at any step before (after its
+                    # time was read, or before a request left) restores it and runs the wave again, within the same
+                    # one-interval limit and under the same cycle id, the block's own chain time.
+                    await self.keep_pending_job(None)
 
                     # Process completed jobs
                     for task in done:
