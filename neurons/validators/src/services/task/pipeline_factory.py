@@ -331,7 +331,7 @@ class PipelineFactory:
                 # DAH-6566: right after the scrape, before any fatal check: writes the needrestart guard on hosts set up
                 # before 16 Nov, idle and rented alike, so apt never restarts sysbox-fs under running pods
                 NeedrestartGuardCheck(),
-                # DAH-6804: same place: installs the boot-time layer reset on Sysbox hosts without it (rented ones too)
+                # DAH-6804: same place: installs the boot-time layer reset on idle Sysbox hosts without it
                 SysboxLayerResetCheck(),
                 # Non-fatal, right after the scrape. A rented node that lost a GPU fails the fatal
                 # GPU checks below (DETAILS_MISMATCH, GPU_MISSING), which halt the cycle before
@@ -543,7 +543,7 @@ class PipelineFactory:
                 # DAH-6566: right after the scrape, before any fatal check: writes the needrestart guard on hosts set up
                 # before 16 Nov, idle and rented alike, so apt never restarts sysbox-fs under running pods
                 NeedrestartGuardCheck(),
-                # DAH-6804: same place: installs the boot-time layer reset on Sysbox hosts without it (rented ones too)
+                # DAH-6804: same place: installs the boot-time layer reset on idle Sysbox hosts without it
                 SysboxLayerResetCheck(),
                 RentedGpuDropCheck(),
                 GpuLossHoldCheck(),

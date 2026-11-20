@@ -19,6 +19,7 @@ from neurons.validators.tests.helpers import build_scrape_namespace
 
 from core.config import settings
 from tests.helpers import build_state
+from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from tests.test_sysbox_required_check import _rented_data
 
 SRC = Path(__file__).resolve().parents[1] / "src"
@@ -44,8 +45,9 @@ def _unit(tmp_path: Path, first_line: str) -> Path:
 
 
 def test_the_unit_the_setup_script_writes_reads_as_its_version(tmp_path):
-    # the line the setup script writes first, with its own version: scrape and script cannot drift apart
-    line = re.search(r'^    cat > "\$unit" <<UNIT \|\| return 1\n(.*)$', SETUP_SCRIPT.read_text(), re.M).group(1)
+    # the line the setup script inserts first (once the unit is enabled), with its own version: scrape and script
+    # cannot drift apart
+    line = re.search(r'sed -i "1i (# lium-layer-reset-version=\$LAYER_RESET_VERSION)" "\$unit"', SETUP_SCRIPT.read_text()).group(1)
     assert _read(_unit(tmp_path, line.replace("$LAYER_RESET_VERSION", str(CURRENT)))) == CURRENT
 
 
@@ -74,7 +76,7 @@ def _ssh(stdout: str):
 
 
 def _run(context_factory, specs, ssh, write=True, hotkey=HOTKEY, rented=False):
-    state = build_state(specs=specs, rented_data=_rented_data() if rented else None)
+    state = build_state(specs=specs, rented_data=_rented_data() if rented else RentedExecutorsResponse(executors={}))
     return SysboxLayerResetCheck(write=write).run(context_factory(state=state, ssh=ssh, miner_hotkey=hotkey))
 
 
@@ -89,12 +91,11 @@ def mode(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("installed", [0, 1, CURRENT - 1])
-@pytest.mark.parametrize("rented", [False, True])
-async def test_an_outdated_host_gets_the_shipped_script_installed_and_keeps_its_score(context_factory, mode, installed, rented):
+async def test_an_outdated_idle_host_gets_the_shipped_script_installed_and_keeps_its_score(context_factory, mode, installed):
     mode("all")
     ssh = _ssh(f"layer_reset_installed {CURRENT}\n")
 
-    result = await _run(context_factory, {"sysbox_layer_reset_version": installed}, ssh, rented=rented)
+    result = await _run(context_factory, {"sysbox_layer_reset_version": installed}, ssh)
 
     assert (result.passed, result.event.reason_code, result.updates) == (True, Msg.INSTALLED.reason, {})
     assert ssh.run.await_args.args[0] == INSTALL_COMMAND
@@ -102,7 +103,7 @@ async def test_an_outdated_host_gets_the_shipped_script_installed_and_keeps_its_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("value,hotkeys,hotkey", [("shadow", HOTKEY, HOTKEY), ("off", HOTKEY, HOTKEY), ("allowlist", "5Other", HOTKEY)])
+@pytest.mark.parametrize("value,hotkeys,hotkey", [("off", HOTKEY, HOTKEY), ("allowlist", "5Other", HOTKEY)])
 async def test_outside_the_rollout_it_reports_and_installs_nothing(context_factory, mode, value, hotkeys, hotkey):
     mode(value, hotkeys)
     ssh = _ssh("")
@@ -222,3 +223,36 @@ def test_every_scrape_key_is_registered_in_both_obfuscation_tables():
 
     assert {"data_sysbox_layer_reset_version", "data_sysbox_layer_reset_scrape_error"} <= mapped_keys
     assert sorted(original_keys - mapped_keys) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [None, "RUNNING", "STOPPED"])
+async def test_a_rented_host_waits_for_an_idle_cycle(context_factory, mode, status):
+    # a stopped pod is a live rental too: daemon-reload and the boot-time Docker dependency wait until no pod is listed
+    mode("all")
+    rented = _rented_data(miner_hotkey=HOTKEY)
+    rented.executors["executor-123"].pods[0].status = status
+    ssh = _ssh(f"layer_reset_installed {CURRENT}\n")
+    state = build_state(specs={"sysbox_layer_reset_version": 0}, rented_data=rented)
+
+    result = await SysboxLayerResetCheck().run(context_factory(state=state, ssh=ssh, miner_hotkey=HOTKEY))
+
+    assert (result.passed, result.event.reason_code) == (True, Msg.OUTDATED.reason)
+    ssh.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_no_rented_list_this_cycle_installs_nothing(context_factory, mode):
+    mode("all")
+    ssh = _ssh(f"layer_reset_installed {CURRENT}\n")
+    state = build_state(specs={"sysbox_layer_reset_version": 0}, rented_data=None)
+
+    result = await SysboxLayerResetCheck().run(context_factory(state=state, ssh=ssh, miner_hotkey=HOTKEY))
+
+    assert result.event.reason_code == Msg.OUTDATED.reason
+    ssh.run.assert_not_awaited()
+
+
+def test_off_is_the_default():
+    fields = getattr(type(settings), "model_fields", None) or type(settings).__fields__
+    assert fields["SYSBOX_LAYER_RESET_INSTALL"].default == "off"

@@ -38,6 +38,15 @@ def setup_script() -> tuple[str, int] | None:
     return None
 
 
+def host_may_be_rented(ctx: Context) -> bool:
+    """Any pod on this executor's rented list, stopped ones too (a stopped pod is a live rental), or no list this cycle.
+    The install runs `systemctl daemon-reload` and adds a unit that keeps Docker down at boot if the reset fails, so it
+    waits for a cycle that shows the host idle."""
+    rented_data = ctx.state.rented_data
+    listed = rented_data.executors.get(ctx.executor.uuid) if rented_data is not None else None
+    return rented_data is None or bool(listed and listed.pods)
+
+
 def install_wanted(mode: str, miner_hotkey: str) -> bool:
     allowlist = {h.strip() for h in settings.SYSBOX_LAYER_RESET_INSTALL_HOTKEYS.split(",") if h.strip()}
     return mode == "all" or (mode == "allowlist" and miner_hotkey in allowlist)
@@ -64,10 +73,10 @@ class SysboxLayerResetCheck:
     (lium-io #2276), but only the setup script installs it and providers rarely re-run that. The scrape reports the
     installed version (``specs.sysbox_layer_reset_version``: 0 none, 1 before the version line, N); below the
     shipped setup script's LAYER_RESET_VERSION this runs that script's ``--install-layer-reset`` on the host, which
-    installs the unit and Docker's drop-in only: it never runs the reset and never restarts Docker, so running pods
-    are not touched. SYSBOX_LAYER_RESET_INSTALL rolls it out: shadow reports, allowlist, then all. Skipped under dry
-    run. Non-fatal, right after the scrape and before the rented short-circuit, so rented hosts get it too. The
-    score is not changed.
+    installs the unit and Docker's drop-in only: it never runs the reset and never restarts Docker. It installs only on
+    a host with no rental (host_may_be_rented); a host rented the whole time gets it at its first idle cycle.
+    SYSBOX_LAYER_RESET_INSTALL rolls it out: off, allowlist, then all. Skipped under dry run. Non-fatal, right after
+    the scrape. The score is not changed.
     """
 
     check_id = "executor.validate.sysbox_layer_reset"
@@ -89,7 +98,7 @@ class SysboxLayerResetCheck:
             return CheckResult(passed=True, event=render_message(Msg.UNKNOWN, ctx=ctx, check_id=self.check_id, what=what))
         if installed >= shipped[1]:
             return CheckResult(passed=True, event=render_message(Msg.OK, ctx=ctx, check_id=self.check_id, what=what))
-        if not (self.write and install_wanted(mode, ctx.miner_hotkey)):
+        if not (self.write and install_wanted(mode, ctx.miner_hotkey)) or host_may_be_rented(ctx):
             return CheckResult(passed=True, event=render_message(Msg.OUTDATED, ctx=ctx, check_id=self.check_id, what=what))
         what["install"] = await install_layer_reset(ctx.ssh, shipped[0])
         template = Msg.INSTALLED if what["install"] == f"installed {shipped[1]}" else Msg.INSTALL_FAILED

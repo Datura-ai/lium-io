@@ -361,11 +361,11 @@ class Settings(BaseSettings):
     # endpoint. Empty = none.
     LIUMD_SHADOW_RESERVED_EXECUTORS: str = Field(env="LIUMD_SHADOW_RESERVED_EXECUTORS", default="")
     # DAH-6804: the boot-time layer reset (nvidia_docker_sysbox_setup.sh --install-layer-reset) on Sysbox hosts whose
-    # unit is missing or older than the setup script's. off; shadow = report which hosts would get it, install nothing;
+    # unit is missing or older than the setup script's, on hosts with no rental. off (default) = install nothing;
     # allowlist = install on SYSBOX_LAYER_RESET_INSTALL_HOTKEYS (comma-separated miner hotkeys) only; all = every host.
     # A host change is rolled out gradually (the v1.151 host sysctl change reached every host at once and was rolled back).
-    SYSBOX_LAYER_RESET_INSTALL: Literal["off", "shadow", "allowlist", "all"] = Field(
-        env="SYSBOX_LAYER_RESET_INSTALL", default="shadow"
+    SYSBOX_LAYER_RESET_INSTALL: Literal["off", "allowlist", "all"] = Field(
+        env="SYSBOX_LAYER_RESET_INSTALL", default="off"
     )
     SYSBOX_LAYER_RESET_INSTALL_HOTKEYS: str = Field(env="SYSBOX_LAYER_RESET_INSTALL_HOTKEYS", default="")
     # The shadow can run only the fact steps while the Python path still owns VerifyX and matmul.
