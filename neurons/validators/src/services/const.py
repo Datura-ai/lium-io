@@ -415,6 +415,11 @@ RENTAL_CONTAINER_PREFIXES = ("pod_", "filler_", "container_", "health_check_")
 # the value is the pod id (a filler's run id, a probe's own name). The stale cleanup reaps only a
 # labelled container whose pod is no longer live, so a provider's container is never touched.
 LIUM_POD_ID_LABEL = "io.lium.pod_id"
+# the backend command that created the container: a re-sent create of the same command recognises its own container
+# (docker_service._replay_own_finished_create) instead of starting a second one
+LIUM_CREATE_COMMAND_ID_LABEL = "io.lium.create_command_id"
+# a finished create's reply, one file per pod: {"command_id": ..., "reply": ContainerCreated}
+CREATE_RECORD_DIR = "/var/lib/lium/creates"
 # Backend ownership lookups (one sequential request each) the stale cleanup makes per node per cycle;
 # the rest of a host's pod_/filler_ candidates wait for a later cycle, so a host cannot flood the backend.
 LIUM_WORKLOAD_LOOKUPS_PER_CYCLE = 10
