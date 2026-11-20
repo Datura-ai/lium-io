@@ -447,7 +447,7 @@ async def test_an_empty_claim_on_a_hotkey_the_listing_already_accepts_keeps_the_
         (timedelta(minutes=5), True),  # the grant still runs: the partner's setup is the owner's
         (timedelta(seconds=-1), False),  # ended before the check, though the miner read the row before its end
         ("not a time", False),  # an unreadable end grants nothing beyond the listing
-        (None, True),  # an older miner sends no end: the binding as sent
+        (None, False),  # no end: the owner-wide binding counts for nothing, the listing's own applies
     ],
 )
 async def test_an_owner_wide_grant_counts_only_until_its_end_when_the_node_is_checked(until, passed):
@@ -458,9 +458,9 @@ async def test_an_owner_wide_grant_counts_only_until_its_end_when_the_node_is_ch
         until = (datetime.now(UTC) + until).isoformat()
     executor = ExecutorSSHInfo(
         uuid="node-1", address="203.0.113.7", port=8001, ssh_username="root", ssh_port=22,
-        python_path="/usr/bin/python3", root_dir="/root", expected_node_hotkeys=["5Account", "5Partner"],
+        python_path="/usr/bin/python3", root_dir="/root", expected_node_hotkeys=["5Account"],
         check_enforce_after={}, snapshot_valid_until=until,
-        listing_binding=None if until is None else {"expected_node_hotkeys": ["5Account"]},
+        owner_binding={"expected_node_hotkeys": ["5Account", "5Partner"]},
     )
     ctx = make_context(executor=executor, runner=_HostFiles("hotkey=5Partner\nclaim=\n"), miner_hotkey="5Account")
 
@@ -483,9 +483,9 @@ async def test_a_read_that_outlasts_the_owner_grant_is_judged_by_the_binding_aft
 
     executor = ExecutorSSHInfo(
         uuid="node-1", address="203.0.113.7", port=8001, ssh_username="root", ssh_port=22,
-        python_path="/usr/bin/python3", root_dir="/root", expected_node_hotkeys=["5Account", "5Partner"],
+        python_path="/usr/bin/python3", root_dir="/root", expected_node_hotkeys=["5Account"],
         check_enforce_after={}, snapshot_valid_until=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
-        listing_binding={"expected_node_hotkeys": ["5Account"]},
+        owner_binding={"expected_node_hotkeys": ["5Account", "5Partner"]},
     )
     ctx = make_context(executor=executor, runner=_SlowRead("hotkey=5Partner\nclaim=\n"), miner_hotkey="5Account")
 
@@ -654,19 +654,20 @@ async def test_a_portal_that_sends_no_notice_map_keeps_the_failed_read_enforced(
 
 
 @pytest.mark.parametrize(
-    ("setup", "ok", "output"),
+    ("setup", "output"),
     [
-        ("missing", True, "hotkey=hk\nclaim=\n"),
-        ("no-directory", True, "hotkey=\nclaim=\n"),
-        ("empty", True, "hotkey=hk\nclaim=\n"),
-        ("unreadable", False, ""),
-        ("io-error", False, ""),
+        ("missing", "hotkey=hk\nclaim=\nunread=\n"),
+        ("no-directory", "hotkey=\nclaim=\nunread=\n"),
+        ("empty", "hotkey=hk\nclaim=\nunread=\n"),
+        ("unreadable", "hotkey=hk\nclaim=\nunread= claim\n"),
+        ("io-error", "hotkey=hk\nclaim=\nunread= claim\n"),
+        ("hotkey-io-error", "hotkey=\nclaim=claim\nunread= hotkey\n"),
     ],
 )
-def test_the_account_read_command_reads_empty_only_for_a_file_that_is_not_there(tmp_path, setup, ok, output):
-    """The real command under sh: only a file (or directory) that is not there reads as no claim. Any other failure, in
-    the lookup or the read (an I/O error), fails the read (NODE_ACCOUNT_UNVERIFIED path) instead of reading as an
-    empty claim."""
+def test_the_account_read_command_reads_empty_only_for_a_file_that_is_not_there(tmp_path, setup, output):
+    """The real command under sh: only a file (or directory) that is not there reads as empty. Any other failure, in
+    the lookup or the read (an I/O error), names the field on the `unread` line, so the check judges each field's
+    read on its own instead of reading it as an empty value."""
     host = tmp_path / "liumd"
     path = {"PATH": "/usr/bin:/bin"}
     if setup != "no-directory":
@@ -677,17 +678,48 @@ def test_the_account_read_command_reads_empty_only_for_a_file_that_is_not_there(
         claim.write_text("")
     elif setup == "unreadable":
         claim.mkdir()  # cat fails on it even as root
-    elif setup == "io-error":
+    elif setup in ("io-error", "hotkey-io-error"):
         claim.write_text("claim\n")
+        broken = "account_claim" if setup == "io-error" else "miner_hotkey"
         stub = tmp_path / "bin"
         stub.mkdir()
         (stub / "cat").write_text(
-            '#!/bin/sh\ncase "$1" in *account_claim) echo "cat: $1: Input/output error" >&2; exit 1;; esac\n'
+            f'#!/bin/sh\ncase "$1" in *{broken}) echo "cat: $1: Input/output error" >&2; exit 1;; esac\n'
             'exec /bin/cat "$@"\n'
         )
         (stub / "cat").chmod(0o755)
         path = {"PATH": f"{stub}:/usr/bin:/bin"}
     command = READ_NODE_ACCOUNT_COMMAND.replace("/etc/liumd/", f"{host}/")
-    run = subprocess.run(["sh", "-c", command], capture_output=True, text=True, env=path)
-    assert (run.returncode == 0) is ok
-    assert run.stdout == output
+    for shell in ("sh", "dash", "bash"):
+        run = subprocess.run([shell, "-c", command], capture_output=True, text=True, env=path)
+        assert run.returncode == 0
+        assert run.stdout == output
+
+
+@pytest.mark.parametrize(
+    ("hotkey", "notified", "reason", "passed"),
+    [
+        # another owner's setup is refused by its hotkey alone, before the notice too
+        ("5Victim", False, "NODE_ACCOUNT_MISMATCH", False),
+        ("5Victim", True, "NODE_ACCOUNT_MISMATCH", False),
+        # one of the owner's own hotkeys needs no claim: it passes after the deadline too
+        ("5Account", False, "NODE_ACCOUNT_OK", True),
+        ("5Account", True, "NODE_ACCOUNT_OK", True),
+        # the shared pool hotkey proves the owner only by the claim: unverified, enforced only after the notice
+        (POOL, False, "NODE_ACCOUNT_UNVERIFIED", True),
+        (POOL, True, "NODE_ACCOUNT_UNVERIFIED", False),
+    ],
+)
+async def test_an_unreadable_claim_is_judged_by_the_hotkey_where_it_settles_the_result(
+    hotkey, notified, reason, passed
+):
+    runner = _HostFiles(f"hotkey={hotkey}\nclaim=\nunread= claim\n")
+    result = await NodeAccountCheck().run(_relay_ctx(runner, enforce=NOTIFIED if notified else {}))
+    assert (result.event.reason_code, result.passed) == (reason, passed)
+
+
+@pytest.mark.parametrize("notified", [False, True])
+async def test_an_unreadable_hotkey_is_unverified(notified):
+    runner = _HostFiles(f"hotkey=\nclaim={CLAIM}\nunread= hotkey\n")
+    result = await NodeAccountCheck().run(_relay_ctx(runner, enforce=NOTIFIED if notified else {}))
+    assert (result.event.reason_code, result.passed) == ("NODE_ACCOUNT_UNVERIFIED", not notified)

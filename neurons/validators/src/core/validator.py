@@ -82,6 +82,8 @@ UNACKED_CYCLE_REPORTS_KEY = "settlement_unacked_cycle_reports"
 # DAH-4001: the cycles summed into miner_scores since the last live submission, and live submissions not yet
 # acknowledged by the backend
 LIVE_CYCLE_IDS_KEY = "settlement_live_cycle_ids"
+# the due job block a cycle has not started yet and the height that first chose it, kept across a restart
+PENDING_JOB_KEY = "validator_pending_job_block"
 UNACKED_LIVE_WEIGHTS_KEY = "settlement_unacked_live_weights"
 UNACKED_CYCLE_REPORTS_MAX = 200
 # one cycle's settlement HTTP (kept reports, pending inclusions, this cycle's report) is cut off past this, retries
@@ -260,6 +262,7 @@ class Validator:
             else:
                 self.miner_scores = json.loads(miner_scores_json)
             self.live_cycle_ids = json.loads(await self.redis_service.get(LIVE_CYCLE_IDS_KEY) or "[]")
+            await self.restore_pending_job()
 
             # remove pod renting-in-progress status
             await self.redis_service.delete(PENDING_PODS_PREFIX)
@@ -317,6 +320,39 @@ class Validator:
                 ),
             )
             return False
+
+    async def keep_pending_job(self, pending: tuple[int, int] | None) -> None:
+        """Set the due job block (and the height that first chose it) and keep it in Redis, so a restart before its
+        cycle starts runs that block, not the one the new height falls in. A Redis error leaves it in memory only."""
+        self.pending_job = pending
+        try:
+            if pending is None:
+                await self.redis_service.delete(PENDING_JOB_KEY)
+            else:
+                await self.redis_service.set(PENDING_JOB_KEY, json.dumps(list(pending)))
+        except Exception as e:
+            logger.error(
+                _m(
+                    "[sync] failed to keep the pending job block",
+                    extra=get_extra_info({**self.default_extra, "error": str(e)}),
+                )
+            )
+
+    async def restore_pending_job(self) -> None:
+        """The due job block a previous run had not started (keep_pending_job). It is dropped by the same one-interval
+        limit as before the restart, at the first tick."""
+        try:
+            raw = await self.redis_service.get(PENDING_JOB_KEY)
+            if raw:
+                job_block, chosen_at = json.loads(raw)
+                self.pending_job = (int(job_block), int(chosen_at))
+        except Exception as e:
+            logger.error(
+                _m(
+                    "[initiate_services] unreadable pending job block",
+                    extra=get_extra_info({**self.default_extra, "error": str(e)}),
+                )
+            )
 
     async def sync(self):
         try:
@@ -436,11 +472,10 @@ class Validator:
                 # chose it: by then the healthy schedule has moved to the next block, so a block the chain can no longer
                 # read (pruned state) never holds back the cycles after it.
                 if self.pending_job is not None and current_block - self.pending_job[1] >= settings.BLOCKS_FOR_JOB:
-                    self.pending_job = None
+                    await self.keep_pending_job(None)
                 if self.pending_job is None:
-                    self.pending_job = (
-                        (current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB,
-                        current_block,
+                    await self.keep_pending_job(
+                        ((current_block // settings.BLOCKS_FOR_JOB) * settings.BLOCKS_FOR_JOB, current_block)
                     )
                 job_block, chosen_at = self.pending_job
                 # The cycle id is the job block's own chain time (DAH-6539). The backend reads the cycle's start from it
@@ -516,7 +551,7 @@ class Validator:
                 # a block run late (after a failed attempt) counts as run at the height that first chose it, so the next
                 # job block is due exactly when it would have been had the first attempt run
                 self.last_job_run_blocks = chosen_at
-                self.pending_job = None
+                await self.keep_pending_job(None)
                 if cycle_asked_for_now:
                     # Cleared here and not at the read: every return above this line means no
                     # cycle started, and the operator's request must survive to the next tick.

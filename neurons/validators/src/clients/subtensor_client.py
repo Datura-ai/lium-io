@@ -213,6 +213,15 @@ def _classify_missing_scored_hotkeys(
     )
 
 
+
+def _rpc_result(node, method: str, params: list):
+    """The `result` of a raw RPC call; an error reply (a node that does not serve the method) raises a chain error,
+    so the caller moves to the next endpoint."""
+    reply = node.rpc_request(method, params)
+    if not isinstance(reply, dict) or "result" not in reply:
+        raise ConnectionError(f"{method} failed: {reply.get('error') if isinstance(reply, dict) else reply!r}")
+    return reply["result"]
+
 class SubtensorClient:
     # Static class variables (shared across all instances)
     _instance = None
@@ -1071,8 +1080,8 @@ class SubtensorClient:
                 # a fixed three or four calls, however far the head is past the height (a walk down the parents took
                 # one blocking call per block on the shared loop). Until finality reaches the height there is no answer
                 # and the block is retried; the map holds the last BlockHashCount blocks, so an older one has none.
-                head = node.rpc_request("chain_getFinalizedHead", [])["result"]
-                header = node.rpc_request("chain_getHeader", [head])["result"]
+                head = _rpc_result(node, "chain_getFinalizedHead", [])
+                header = _rpc_result(node, "chain_getHeader", [head])
                 if not header or int(header["number"], 16) < block:
                     raise LookupError(f"block {block} is not finalized yet")
                 block_hash = head
@@ -1080,9 +1089,12 @@ class SubtensorClient:
                     block_hash = str(node.query("System", "BlockHash", [block], block_hash=head).value or "")
                     if not block_hash or int(block_hash, 16) == 0:  # the map's default: no such block in its range
                         raise LookupError(f"no hash for block {block} in the finalized head's state")
-                return datetime.fromtimestamp(
-                    node.query("Timestamp", "Now", block_hash=block_hash).value / 1000, tz=UTC
-                ).strftime("%Y-%m-%d %H:%M:%S")
+                timestamp_ms = node.query("Timestamp", "Now", block_hash=block_hash).value
+                if not timestamp_ms or timestamp_ms <= 0:
+                    # the SDK decodes a null or failed storage reply as the type's default, zero: that is no answer,
+                    # never a 1970 cycle id that would settle the block a second time next to its real one
+                    raise LookupError(f"no timestamp for block {block}")
+                return datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC).strftime("%Y-%m-%d %H:%M:%S")
             except Exception as e:
                 logger.error(
                     _m(
@@ -1097,6 +1109,12 @@ class SubtensorClient:
                     ),
                 )
                 retries += 1
+                if retries < max_retries and is_chain_error(e):
+                    # an endpoint failing the read (one that rejects this method while it serves the others too) is
+                    # left for the next one, and the retry dials it, as a failed sync does
+                    async with self._pause_chain_reads_in_thread():
+                        self._switch_endpoint_after_read_failure(e)
+                        self.set_subtensor()
         return None
 
     async def _warm_up_subtensor(self):

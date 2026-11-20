@@ -42,16 +42,18 @@ from .enforcement import enforced, fresh, reported_only
 logger = get_logger(__name__)
 
 # fixed text, no node-supplied value; `$(...)` drops the trailing newline the executor writes. Only a file that is not
-# there (cat's ENOENT, under the C locale) reads as empty (an older executor); any other failure, in the lookup or the
-# read, fails the command, so it is an unverified read and never an empty claim
+# there (cat's ENOENT, under the C locale) reads as empty (an older executor). Any other failure, in the lookup or the
+# read, leaves the field empty and names it on the `unread` line, so each field's read is judged on its own: a hotkey
+# that settles the result settles it whatever the claim's read did
 READ_NODE_ACCOUNT_COMMAND = (
     "r() { o=$(LC_ALL=C cat \"$1\" 2>&1) && { printf '%s' \"$o\"; return 0; }; "
     "case $o in *': No such file or directory') return 0;; esac; return 1; }; "
-    "h=$(r /etc/liumd/miner_hotkey) && c=$(r /etc/liumd/account_claim) && "
-    "printf 'hotkey=%s\\nclaim=%s\\n' \"$h\" \"$c\""
+    "u=; h=$(r /etc/liumd/miner_hotkey) || { h=; u=\"$u hotkey\"; }; "
+    "c=$(r /etc/liumd/account_claim) || { c=; u=\"$u claim\"; }; "
+    "printf 'hotkey=%s\\nclaim=%s\\nunread=%s\\n' \"$h\" \"$c\" \"$u\""
 )
 READ_TIMEOUT_SECONDS = 15
-LISTING_BINDING_FIELDS = (
+BINDING_FIELDS = (
     "expected_node_hotkeys",
     "expected_account_claim",
     "expected_account_claims",
@@ -70,14 +72,13 @@ def presented_host_key(ctx: Context) -> str:
 
 
 def current_binding(executor: ExecutorSSHInfo) -> ExecutorSSHInfo:
-    """The node as it may be bound now (DAH-6539): the owner-wide binding the miner sent counts while the portal read
-    it came from vouches for it (`snapshot_valid_until`), read here at check time because the miner can serve a cached
-    snapshot and finish the upload after it; from then on, or when the time does not parse, the listing account's own
-    binding."""
-    if not isinstance(executor.listing_binding, dict) or fresh(executor.snapshot_valid_until):
+    """The node as it may be bound now (DAH-6539): the owner-wide binding the miner sent (`owner_binding`) counts while
+    the portal read it came from vouches for it (`snapshot_valid_until`), read here at check time because the miner can
+    serve a cached snapshot and finish the upload after it; from then on, or when the time does not parse, the listing
+    account's own binding (the expected_* fields as sent)."""
+    if not isinstance(executor.owner_binding, dict) or not fresh(executor.snapshot_valid_until):
         return executor
-    listing = {field: executor.listing_binding.get(field) for field in LISTING_BINDING_FIELDS}
-    return executor.model_copy(update=listing)
+    return executor.model_copy(update={field: executor.owner_binding.get(field) for field in BINDING_FIELDS})
 
 
 class NodeAccountCheck:
@@ -138,6 +139,7 @@ class NodeAccountCheck:
             line.split("=", 1) for line in (result.stdout or "").splitlines() if "=" in line
         )
         hotkey, claim = found.get("hotkey", "").strip(), found.get("claim", "").strip()
+        unread = set(found.get("unread", "").split())
         what = {
             **what,
             "node_hotkey": hotkey,
@@ -146,16 +148,12 @@ class NodeAccountCheck:
         claims = set(executor.expected_account_claims or ()) | (
             {executor.expected_account_claim} - {None, ""}
         )
-        if not result.success:
-            # failed, timed out or closed without an exit status: ownership is not proven
-            what["read_error"] = result.error_type or f"exit {result.exit_code}"
-            if enforced(ctx, Msg.BINDING_UNVERIFIED.reason, started):
-                return _refused(ctx, self.check_id, Msg.BINDING_UNVERIFIED, what), False
-            what = {**what, "enforced": False}
-            return reported_only(
-                ctx,
-                render_message(Msg.UNVERIFIED_REPORTED, ctx=ctx, check_id=self.check_id, what=what),
-            ), False
+        if not result.success or "hotkey" in unread:
+            # failed, timed out or closed without an exit status, or the hotkey file could not be read: ownership is
+            # not proven
+            failure = result.error_type or f"exit {result.exit_code}"
+            what["read_error"] = "hotkey unreadable" if result.success else failure
+            return self._unverified(ctx, what, started), False
         if not hotkey:
             # the read worked and found no host files: an older executor, no evidence either way
             logger.info(
@@ -166,6 +164,16 @@ class NodeAccountCheck:
             )
             return None, False
         by_hotkey = executor.expected_claims_by_hotkey or {}
+        if "claim" in unread:
+            # decided by the hotkey alone where it settles the result: another owner's setup is refused, one of the
+            # owner's own hotkeys passes. A setup the claim decides (a shared pool hotkey) is unverified.
+            if hotkey not in executor.expected_node_hotkeys and hotkey not in by_hotkey:
+                what["binding_mismatch"] = "hotkey"
+                return _refused(ctx, self.check_id, Msg.BINDING_MISMATCH, what), False
+            if hotkey in by_hotkey or (claims and hotkey == ctx.miner_hotkey):
+                what["read_error"] = "claim unreadable"
+                return self._unverified(ctx, what, started), False
+            return None, True
         # an empty claim on a hotkey the listing already accepts keeps the legacy path below (an older executor)
         if hotkey in by_hotkey and (claim or hotkey not in executor.expected_node_hotkeys):
             # a shared (pool) hotkey of the owner's accounts that only this map accepts: every pool node can write
@@ -192,6 +200,16 @@ class NodeAccountCheck:
                 return None, False
             return None, True
         return _refused(ctx, self.check_id, Msg.BINDING_MISMATCH, what), False
+
+    def _unverified(self, ctx: Context, what: dict, started: datetime) -> CheckResult:
+        """Ownership not proven: refused once the provider was notified (checks/enforcement.py), reported before."""
+        if enforced(ctx, Msg.BINDING_UNVERIFIED.reason, started):
+            return _refused(ctx, self.check_id, Msg.BINDING_UNVERIFIED, what)
+        what = {**what, "enforced": False}
+        return reported_only(
+            ctx,
+            render_message(Msg.UNVERIFIED_REPORTED, ctx=ctx, check_id=self.check_id, what=what),
+        )
 
 
 def _refused(ctx: Context, check_id: str, template, what: dict) -> CheckResult:

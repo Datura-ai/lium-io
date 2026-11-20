@@ -77,13 +77,14 @@ class ExecutorSSHInfo(pydantic.BaseModel):
     # the listing account's owner, whatever hotkey the node is listed under. A machine set up for one of them passes
     # only with one of these claims (an empty claim proves nothing either way, as for the listing hotkey).
     expected_claims_by_hotkey: dict[str, list[str]] | None = None
-    # DAH-6539: until this ISO-8601 time the portal read this node came from vouches for it. After it, or when it does
-    # not parse, the validator checks the node against `listing_binding` (the listing account's own binding, keyed by
-    # the four expected_* field names above; None when the fields above already are that) and enforces no report-first
-    # finding: a miner can serve a cached snapshot, and an upload can finish, after it. None from an older miner or
-    # portal: the fields above as they are.
+    # DAH-6539: until this ISO-8601 time the portal read this node came from vouches for it. Until then the validator
+    # also accepts `owner_binding` (the owner-wide binding: the hotkeys and claims of every account of the listing's
+    # owner, keyed by the four expected_* field names above); after it, or when it does not parse, only the fields
+    # above, which always hold the listing account's own binding (all a validator that predates `owner_binding`
+    # reads), and it enforces no report-first finding: a miner can serve a cached snapshot, and an upload can finish,
+    # after it. None from an older miner or portal: the fields above as they are.
     snapshot_valid_until: str | None = None
-    listing_binding: dict | None = None
+    owner_binding: dict | None = None
 
 
 class AcceptSSHKeyRequest(BaseMinerRequest):

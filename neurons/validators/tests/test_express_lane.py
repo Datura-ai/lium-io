@@ -1397,3 +1397,44 @@ async def test_a_recheck_whose_sessions_are_lost_keeps_its_runs_for_a_verdict(mo
             harness.lane._recheck_pending[node].not_before = 0.0
     assert await harness.redis_service.get_executor_recheck_requests() == set()
     assert await harness.tick_and_settle() == 0
+
+
+@pytest.mark.asyncio
+async def test_a_restart_between_retry_ticks_runs_the_pending_block(validator_with_mocks, create_neuron_info):
+    """A tick that failed to read the due block's time leaves it pending; a restart before the next tick started from
+    nothing and chose the block its new height falls in, so the pending block's wave never ran. The pending block and
+    the height that chose it are kept in Redis and restored within the same one-interval limit."""
+    from core.config import settings
+    from core.validator import Validator
+
+    n = settings.BLOCKS_FOR_JOB
+    store: dict = {}
+    redis = validator_with_mocks.redis_service
+    redis.get = AsyncMock(side_effect=lambda key: store.get(key))
+    redis.set = AsyncMock(side_effect=lambda key, value, *a, **k: store.__setitem__(key, value))
+    redis.delete = AsyncMock(side_effect=lambda key: store.pop(key, None))
+    validator = validator_with_mocks
+    validator.subtensor_client.get_miners = AsyncMock(return_value=[create_neuron_info(1, "miner-a")])
+    block = 14 * n  # 1050 with a 75-block interval
+
+    read, asked = await _run_ticks(validator, (block + n - 1,), lambda b, attempt: False)  # 1124: no time for 1050
+    assert (read, asked) == ([block], [])
+
+    restarted = Validator()
+    for name in ("incentive", "redis_service", "subtensor_client", "file_encrypt_service", "miner_service",
+                 "express_lane", "backend_client"):
+        setattr(restarted, name, getattr(validator, name))
+    restarted.last_job_run_blocks = 0
+    await restarted.restore_pending_job()
+    read, asked = await _run_ticks(restarted, (block + n,), lambda b, attempt: True)  # 1125, after the restart
+    assert (read, asked) == ([block], [f"time-of-{block}"])
+    assert "validator_pending_job_block" not in store  # its cycle started
+
+    late = Validator()
+    for name in ("incentive", "redis_service", "subtensor_client", "file_encrypt_service", "miner_service",
+                 "express_lane", "backend_client"):
+        setattr(late, name, getattr(validator, name))
+    store["validator_pending_job_block"] = f"[{block}, {block + n - 1}]"
+    await late.restore_pending_job()
+    read, asked = await _run_ticks(late, (block + 2 * n - 1,), lambda b, attempt: True)  # past its one interval
+    assert (read, asked) == ([block + n], [f"time-of-{block + n}"])

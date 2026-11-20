@@ -128,3 +128,50 @@ async def test_a_block_reorganized_before_finality_reports_under_one_cycle_id_on
     answers += [await _time_of(node), await _time_of(node)]
 
     assert answers == [None, "2026-11-19 18:52:50", "2026-11-19 18:52:50"]
+
+
+class _RejectsFinalizedHead(_Chain):
+    """An endpoint that serves storage and the metagraph but answers chain_getFinalizedHead with an error."""
+
+    def rpc_request(self, method, params):
+        if method == "chain_getFinalizedHead":
+            self.calls += 1
+            return {"jsonrpc": "2.0", "id": 1, "error": {"code": -32601, "message": "Method not found"}}
+        return super().rpc_request(method, params)
+
+
+@pytest.mark.asyncio
+async def test_an_endpoint_that_rejects_the_finalized_head_is_left_for_the_fallback():
+    primary = _RejectsFinalizedHead(CHAIN, f"0xa{BLOCK + 2}")
+    fallback = _Chain(CHAIN, f"0xa{BLOCK + 2}")
+    client = _client(primary)
+    client._switch_endpoint_after_read_failure.side_effect = lambda error: setattr(
+        client.get_node, "return_value", fallback
+    )
+
+    assert await SubtensorClient.get_time_from_block(client, BLOCK) == "2026-11-19 18:52:38"
+    client._switch_endpoint_after_read_failure.assert_called_once()
+    client.set_subtensor.assert_called_once()  # the retry dials the next endpoint
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed", [0, None])
+async def test_a_failed_timestamp_read_decoded_as_zero_gives_no_cycle_id(failed):
+    """The SDK decodes a null or failed storage reply as Timestamp.Now's default, zero; read as 1970-01-01 it would
+    settle the block under a second cycle id next to its real one."""
+    node = _Chain(CHAIN, f"0xa{BLOCK + 2}")
+    real = node.query
+    replies = iter([failed])
+
+    def query(module, storage, params=None, block_hash=None):
+        if (module, storage) == ("Timestamp", "Now"):
+            node.calls += 1
+            value = next(replies, "real")
+            if value != "real":
+                return SimpleNamespace(value=value)
+        return real(module, storage, params, block_hash=block_hash)
+
+    node.query = query
+    assert await _time_of(node) == "2026-11-19 18:52:38"  # the next attempt reads the real value
+    replies = iter([failed] * 3)
+    assert await _time_of(node) is None
