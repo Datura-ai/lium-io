@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -445,3 +446,47 @@ def test_system_slice_other_children_count_together_up_to_what_the_slice_granted
     run()
 
     assert _read(state / "system.slice") == UNITS_MIB * MIB + EX + 2048 * MIB
+
+
+def test_parent_baseline_is_taken_before_the_first_raise_even_without_siblings(tmp_path):
+    """A sibling that appears after the first run is not credited with the executor's grant."""
+    run = _run_memory_min(tmp_path, "/tenant/executor", systemd=False)
+    root = tmp_path / "cg"
+
+    run()  # no sibling yet: the parent's baseline (0) is recorded before it is raised
+    (root / "tenant/other").mkdir()
+    (root / "tenant/other/memory.min").write_text("max\n")
+    run()
+
+    assert _read(root / "tenant/memory.min") == EX
+
+
+def test_system_slice_reads_one_baseline_record_when_two_were_written(tmp_path):
+    """Two first runs that raced before the lock each appended a baseline; a later run reads the first one."""
+    run = _run_memory_min(tmp_path, "/system.slice/docker-abc.scope")
+    root, state = tmp_path / "cg", tmp_path / "sd"
+    (root / "system.slice/other.scope").mkdir(parents=True)
+    (root / "system.slice/other.scope/memory.min").write_text("max\n")
+    (state / "system.slice").write_text("0\n")
+    (tmp_path / "guard-base.").write_text("0 /system.slice\n0 /system.slice\n")
+
+    out = parse_guard_output(run())
+
+    assert out["failed"] == []
+    assert _read(state / "system.slice") == UNITS_MIB * MIB + EX
+
+
+def test_runs_wait_for_each_other(tmp_path):
+    """A second run waits for the lock, so a baseline is recorded once, before the first raise."""
+    run = _run_memory_min(tmp_path, "/tenant/executor", systemd=False)
+    lock = tmp_path / "guard-base..lock"
+    holder = subprocess.Popen(["flock", str(lock), "sh", "-c", "sleep 1.5"])
+    try:
+        time.sleep(0.3)
+        start = time.monotonic()
+        out = run()
+        waited = time.monotonic() - start
+    finally:
+        holder.wait()
+    assert waited >= 1.0
+    assert "memory_min_set /tenant/executor" in out

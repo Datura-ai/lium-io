@@ -73,18 +73,25 @@ def _host_memory_min_script() -> str:
         'function small(a,b){return a=="max"?b:(b=="max"?a:(a+0<b+0?a:b))} '
         'function rd(p, c,f){c=""; f="/sys/fs/cgroup" p "/memory.min"; if((getline c < f)<=0) c=0; close(f); return c} '
         'function base(p){if(!(p in bs)){bs[p]=rd(p); nb[p]=1} return bs[p]} '
-        'BEGIN{while((getline l < B)>0){v=l; sub(/ .*/,"",v); bs[substr(l,length(v)+2)]=v} close(B)} '
+        'BEGIN{while((getline l < B)>0){v=l; sub(/ .*/,"",v); q=substr(l,length(v)+2); '
+        'if(q!="" && !(q in bs) && v ~ /^([0-9]+|max)$/) bs[q]=v} close(B)} '
         '{v=$1; q=substr($0,length(v)+2); if(v!="s") own[q]=sum(own[q],v); n=split(q,a,"/"); p=""; '
         "for(i=2;i<=n;i++){p=p \"/\" a[i]; if(p!=k){d[p]=i; if(i>m) m=i; if(v!=\"s\") w[p]=1}}} "
         'END{for(i=m;i>=2;i--) for(p in d) if(d[p]==i){u=p; sub(/\\/[^\\/]*$/,"",u); '
         'if(!(p in w)){ss[u]=sum(ss[u],rd(p)); continue} '
-        "t[p]=big(rd(p),sum(own[p],sum(t[p],(p in ss)?small(ss[p],base(p)):0))); "
+        # every written parent's baseline is taken before its first write, siblings or not, so one that appears
+        # later is never credited with the guard's own increment
+        "b=base(p); t[p]=big(rd(p),sum(own[p],sum(t[p],(p in ss)?small(ss[p],b):0))); "
         'if(u in d) t[u]=sum(t[u],t[p]); else if(u==k) s=sum(s,t[p]); print t[p], p} '
         'for(p in nb) print bs[p], p >> B; print (s==""?0:s), "="}\'; }; '
         'flush() { tree "$1" | LC_ALL=C sort -k2 | while read -r v p; do [ "$p" = = ] || set_cg_min "$p" "$v"; done; }; '
         # this shell sits in the executor's cgroup; with the host cgroup namespace its path is absolute
         "ex=$(sed -n 's#^0::##p' /proc/self/cgroup); "
         "B=/run/lium-host-memory-guard.$(cat /proc/sys/kernel/random/boot_id 2>/dev/null); "
+        # a rental create and a resources check can run the guard at once: one run at a time, so a baseline is
+        # recorded once and always before this guard first raises that cgroup
+        'command -v flock >/dev/null 2>&1 || { echo memory_min_skipped no_flock; exit 0; }; '
+        'exec 9>>"$B.lock"; flock -w 25 9 || { echo memory_min_skipped lock_busy; exit 0; }; '
         'case "$ex" in /|"") ex=; echo "memory_min_failed executor root_cgroup";; '
         '/..*) ex=; echo "memory_min_failed executor outside_host_cgroup_namespace";; esac; '
         "if [ -d /run/systemd/system ]; then "
@@ -118,7 +125,7 @@ def _host_memory_min_script() -> str:
         # the slice's other children (services this guard does not set, rentals' scopes) keep the protection they
         # already hold: their memory.min summed, never more in total than the slice granted before this guard first
         # raised it (the per-boot baseline in $B), as for a written parent's children
-        "bs=$(awk '$2==\"/system.slice\"{print $1}' \"$B\" 2>/dev/null); "
+        "bs=$(awk '$2==\"/system.slice\" && $1 ~ /^([0-9]+|max)$/ {print $1; exit}' \"$B\" 2>/dev/null); "
         'if [ -z "$bs" ]; then bs=$(systemctl show -p MemoryMin --value system.slice); [ "$bs" = infinity ] && bs=max; '
         'bs=${bs:-0}; echo "$bs /system.slice" >> "$B"; fi; ss=0; '
         'for c in /sys/fs/cgroup/system.slice/*/; do [ -f "${c}memory.min" ] || continue; n=${c%/}; n=${n##*/}; '
