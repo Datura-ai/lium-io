@@ -6,8 +6,10 @@ foreign signature refuses the refresh: nothing is installed and the local binary
 
 The signed manifest also names its `release` (the liumd-v X.Y.Z tag). The validator keeps the highest release it
 accepted, for each node and overall, and refuses a lower one, so an older signed manifest (with its binaries) cannot be
-put back on main to roll nodes back. MIN_RELEASE in code is only an extra floor: the same main-merge rights could lower
-it. A refusal is reported as `refused`, not as an unavailable manifest.
+put back on main to roll nodes back. The floor is recorded before anything is installed; if it cannot be recorded,
+nothing is installed. MIN_RELEASE, the release of the signed manifest vendored with this code, is a floor no Redis
+loss can lower, so every release vendored into the image raises it. A refusal is reported as `refused`, not as an
+unavailable manifest.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import re
 import shlex
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
@@ -37,7 +40,11 @@ TMP_BINARY = "/tmp/liumd.binary.fetch"
 
 # X.Y.Z, each part at most 6 digits with no leading zero (sign_manifest.py signs only this form)
 RELEASE_RX = re.compile(r"(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})")
-MIN_RELEASE = (1, 0, 0)
+# the signed manifest vendored with this code: neurons/executor/liumd in the repo, /app/liumd-vendored in the image
+VENDORED_MANIFEST_DIRS = (
+    Path(__file__).resolve().parents[2] / "liumd-vendored",
+    Path(__file__).resolve().parents[3] / "executor" / "liumd",
+)
 # highest release accepted overall, and per node under ":<miner hotkey>:<executor uuid>"; stored zero-padded, so the
 # strings compare in release order
 RELEASE_FLOOR_KEY = "liumd_release_floor"
@@ -97,7 +104,7 @@ async def _release_floor(ctx: Any) -> tuple[int, int, int]:
 
 
 async def _raise_floor(ctx: Any, release: tuple[int, int, int]) -> str:
-    """Records an accepted release; "" or why it could not be recorded (the next cycle records it again)."""
+    """Records an accepted release before anything is installed; "" or why it could not be recorded."""
     keys, value = _floor_keys(ctx), _padded(release)
     try:
         # WATCHed: a concurrent raise reruns the compare, so a lower release never overwrites a higher one
@@ -114,7 +121,7 @@ async def _raise_floor(ctx: Any, release: tuple[int, int, int]) -> str:
                     break
                 except redis.exceptions.WatchError:
                     continue
-    except Exception as exc:  # noqa: BLE001 - the binary is fine; only the floor waits for the next cycle
+    except Exception as exc:  # noqa: BLE001 - the caller installs nothing on an unrecorded floor
         return f"release floor not recorded: {type(exc).__name__}: {exc}"[:300]
     return ""
 
@@ -182,6 +189,24 @@ def _signature_error(manifest: bytes, signature: bytes) -> str | None:
     except InvalidSignature:
         return "manifest signature does not verify against the pinned release key"
     return None
+
+
+def _vendored_release(dirs: tuple[Path, ...] = VENDORED_MANIFEST_DIRS) -> tuple[int, int, int]:
+    """The release of the first vendored manifest.json found, if its .sig verifies; 1.0.0 while none is signed."""
+    for directory in dirs:
+        manifest = directory / "manifest.json"
+        if manifest.is_file():
+            try:
+                body, signature = manifest.read_bytes(), (directory / "manifest.json.sig").read_bytes()
+                doc = json.loads(body) if _signature_error(body, signature) is None else None
+            except (OSError, ValueError):
+                doc = None
+            release = _release(doc.get("release")) if isinstance(doc, dict) else None
+            return release or (1, 0, 0)
+    return (1, 0, 0)
+
+
+MIN_RELEASE = _vendored_release()
 
 
 async def _fetch_manifest(url: str, timeout: float) -> tuple[dict[str, Any] | None, str | None]:
@@ -341,9 +366,12 @@ async def _ensure(ctx: Any, budget: float, started: float) -> LiumdRefresh:
                 f"{'.'.join(map(str, floor))}, the highest accepted",
                 refused=True,
             )
+        # recorded first: an install the floor does not remember could be rolled back by an older signed manifest
+        if error := await _raise_floor(ctx, release):
+            return LiumdRefresh(bool(version.build_sha), version.build_sha, f"nothing installed: {error}")
 
         if version.build_sha == expected_build:
-            return LiumdRefresh(True, expected_build, await _raise_floor(ctx, release))
+            return LiumdRefresh(True, expected_build)
 
         arch = _target_arch(version.target) or await _host_arch(ctx)
         if arch is None:
@@ -389,6 +417,6 @@ async def _ensure(ctx: Any, budget: float, started: float) -> LiumdRefresh:
             return LiumdRefresh(
                 False, installed_build.build_sha, "installed binary reports the wrong build_sha"
             )
-        return LiumdRefresh(True, installed_build.build_sha, await _raise_floor(ctx, release), changed=True)
+        return LiumdRefresh(True, installed_build.build_sha, changed=True)
     except Exception as exc:  # noqa: BLE001 - a repair failure is reported to the caller
         return LiumdRefresh(False, None, f"{type(exc).__name__}: {exc}"[:300])

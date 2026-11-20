@@ -19,6 +19,8 @@ RUN pdm lock --check
 RUN pdm install --prod
 
 COPY . .
+# the signed liumd manifest vendored with this code: its release is the refresh's code floor (MIN_RELEASE)
+COPY --from=liumd manifest.json* liumd-vendored/
 
 RUN mv libdmcompverify.so /usr/lib/
 RUN mv libverifyx.so /usr/lib/

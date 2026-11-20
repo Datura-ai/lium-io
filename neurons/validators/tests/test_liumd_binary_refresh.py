@@ -6,6 +6,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+import redis.exceptions
 from fakeredis.aioredis import FakeRedis
 from services.liumd_binary_refresh import ensure_liumd_binary
 
@@ -464,3 +465,118 @@ async def test_the_manifest_is_not_parsed_before_its_signature_verifies(monkeypa
 
     assert doc is None
     assert error == "manifest signature does not verify against the pinned release key"
+
+
+class _WritesRefused(FakeRedis):
+    """Redis that serves reads but refuses writes (maxmemory + noeviction) until `refusing` is cleared."""
+
+    refusing = True
+
+    def pipeline(self, *args, **kwargs):
+        if self.refusing:
+            raise redis.exceptions.ResponseError("OOM command not allowed when used memory > 'maxmemory'.")
+        return super().pipeline(*args, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_a_floor_that_cannot_be_recorded_installs_nothing(monkeypatch):
+    """The floor is written before the install: a release the floor does not remember is never installed, so it
+    cannot be rolled back by an older signed one afterwards."""
+    store = _WritesRefused()
+    for release in ("1.5.0", "1.2.0"):
+        liumd_binary_refresh._MANIFEST_CACHE.clear()
+        _serve(monkeypatch, _signed(release))
+        runner = Runner()
+        result = await ensure_liumd_binary(_ctx(runner, redis=store), budget_seconds=60)
+        assert (result.ok, result.refused, result.build_sha, runner.installed) == (True, False, "old-build", False)
+        assert "nothing installed: release floor not recorded: ResponseError: OOM" in result.detail
+        assert not any(c.startswith(("curl ", "install ")) for c in runner.calls)
+
+    store.refusing = False
+    liumd_binary_refresh._MANIFEST_CACHE.clear()
+    _serve(monkeypatch, _signed("1.5.0"))
+    assert (await ensure_liumd_binary(_ctx(Runner(), redis=store), budget_seconds=60)).changed
+    liumd_binary_refresh._MANIFEST_CACHE.clear()
+    _serve(monkeypatch, _signed("1.2.0"))
+    runner = Runner(local=NEW_BUILD)
+    result = await ensure_liumd_binary(_ctx(runner, redis=store), budget_seconds=60)
+    assert (result.ok, result.refused, runner.installed) == (False, True, False)
+
+
+@pytest.mark.asyncio
+async def test_the_floor_is_stored_zero_padded_so_1_10_stays_above_1_9():
+    store = FakeRedis()
+    ctx = _ctx(Runner(), redis=store)
+    for release in ((1, 9, 0), (1, 10, 0)):
+        assert await liumd_binary_refresh._raise_floor(ctx, release) == ""
+
+    assert await store.mget(liumd_binary_refresh._floor_keys(ctx)) == [b"000001.000010.000000"] * 2
+    assert await liumd_binary_refresh._release_floor(ctx) == (1, 10, 0)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_floor_raises_keep_the_highest_release():
+    """The WATCH compare-and-set: whatever order the raises land in, a lower one never overwrites a higher one."""
+    import asyncio
+
+    store = FakeRedis()
+    ctx = _ctx(Runner(), redis=store)
+    releases = [(1, 10, 0), (1, 9, 0), (2, 0, 0), (1, 2, 3)] * 5
+
+    assert set(await asyncio.gather(*(liumd_binary_refresh._raise_floor(ctx, r) for r in releases))) == {""}
+
+    assert await store.mget(liumd_binary_refresh._floor_keys(ctx)) == [b"000002.000000.000000"] * 2
+
+
+def _vendor(path, release, key=RELEASE_KEY, sign=True):
+    data = (json.dumps({**MANIFEST, "release": release}, indent=2) + "\n").encode()
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "manifest.json").write_bytes(data)
+    if sign:
+        (path / "manifest.json.sig").write_bytes(_sig(key, data))
+    return path
+
+
+@pytest.mark.parametrize(
+    ("vendored", "floor"),
+    [
+        ({"release": "1.4.2"}, (1, 4, 2)),
+        ({"release": "1.4.2", "key": OTHER_KEY}, (1, 0, 0)),
+        ({"release": "1.4.2", "sign": False}, (1, 0, 0)),
+        ({"release": "1.4"}, (1, 0, 0)),
+        (None, (1, 0, 0)),
+    ],
+)
+def test_the_code_floor_is_the_release_of_the_signed_manifest_vendored_with_the_code(
+    monkeypatch, tmp_path, vendored, floor
+):
+    _serve(monkeypatch, {})   # pins the test release key
+    dirs = (tmp_path / "image", tmp_path / "repo")
+    if vendored is not None:
+        _vendor(dirs[1], **vendored)
+
+    assert liumd_binary_refresh._vendored_release(dirs) == floor
+
+
+def test_the_image_copy_wins_over_the_repo_copy(monkeypatch, tmp_path):
+    _serve(monkeypatch, {})
+    dirs = (_vendor(tmp_path / "image", "1.6.0"), _vendor(tmp_path / "repo", "1.4.2"))
+
+    assert liumd_binary_refresh._vendored_release(dirs) == (1, 6, 0)
+
+
+@pytest.mark.asyncio
+async def test_after_a_redis_flush_the_vendored_release_still_refuses_an_older_one(monkeypatch, tmp_path):
+    """A flush, an eviction or a new Redis drops the recorded floors; the release vendored with the code does not
+    go, so a signed release older than it is still refused."""
+    _serve(monkeypatch, {})
+    monkeypatch.setattr(
+        liumd_binary_refresh, "MIN_RELEASE", liumd_binary_refresh._vendored_release((_vendor(tmp_path, "1.5.0"),))
+    )
+    _serve(monkeypatch, _signed("1.2.0"))
+    runner = Runner()
+
+    result = await ensure_liumd_binary(_ctx(runner, redis=FakeRedis()), budget_seconds=60)
+
+    assert (result.ok, result.refused, runner.installed) == (False, True, False)
+    assert "release 1.2.0 is below 1.5.0" in result.detail

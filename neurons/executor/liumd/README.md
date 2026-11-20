@@ -18,6 +18,9 @@ release is tagged. The validator's refresh pins that key, fetches the signature 
 installs nothing unless it verifies; a missing or foreign signature keeps the node's current binary.
 The signed manifest also carries `release`, the release tag's X.Y.Z. The validator keeps the highest release it has
 accepted, for each node and overall, and refuses a lower one, so an older signed manifest cannot roll nodes back.
+It records that release before it installs anything, and installs nothing when it cannot. The validator image
+also carries this `manifest.json` and its signature, and the release of that copy is a floor a Redis flush cannot
+lower, so vendoring a signed release here raises it with no other edit.
 The image digest is still the normal delivery trust boundary.
 
 Refresh both binaries, both provenance files, `manifest.json` and `manifest.json.sig` together from
