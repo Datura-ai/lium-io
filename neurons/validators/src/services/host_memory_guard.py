@@ -87,8 +87,13 @@ def _host_memory_min_script() -> str:
         'if [ "$v" = infinity ]; then e=max; inf=1; elif [ "$v" -gt "$d" ] 2>/dev/null; then e=$v; sl=$((sl + v - d)); fi; '
         'set_min "$u" "$d"; fi; '
         'case "$ex" in "/system.slice/$u/"*) add "/system.slice/$u" "$e"; hs=$e;; esac; done; '
+        # the executor's scope counts with its larger existing MemoryMin ("infinity" included); an executor directly
+        # in system.slice adds its own share to the slice
         'case "$ex" in '
-        f'/system.slice/docker-*.scope) set_min "${{ex#/system.slice/}}" {ex_min}; sl=$((sl + {ex_min}));; '
+        f'/system.slice) sl=$((sl + {ex_min}));; '
+        '/system.slice/docker-*.scope) s=${ex#/system.slice/}; v=$(systemctl show -p MemoryMin --value "$s"); '
+        f'if [ "$v" = infinity ]; then inf=1; elif [ "$v" -gt {ex_min} ] 2>/dev/null; then sl=$((sl + v)); '
+        f'else sl=$((sl + {ex_min})); fi; set_min "$s" {ex_min};; '
         f'?*) add "$ex" {ex_min};; esac; '
         # the cgroups under system.slice written here count with their full totals (an existing larger memory.min
         # included), in place of the share already counted for the unit holding the executor

@@ -220,6 +220,25 @@ def test_executor_with_a_larger_existing_reservation_under_system_slice_counts_i
     assert _read(tmp_path / "sd/system.slice") == UNITS_MIB * MIB + 4096 * MIB
 
 
+@pytest.mark.parametrize(("existing", "slice_total"), [(4096 * MIB, UNITS_MIB * MIB + 4096 * MIB), ("infinity", "infinity")])
+def test_executor_scope_with_a_larger_existing_memory_min_counts_in_full_in_the_slice(tmp_path, existing, slice_total):
+    run = _run_memory_min(tmp_path, "/system.slice/docker-abc.scope")
+    (tmp_path / "sd/docker-abc.scope").write_text(f"{existing}\n")
+
+    run()
+
+    assert (tmp_path / "sd/docker-abc.scope").read_text().strip() == str(existing)
+    assert (tmp_path / "sd/system.slice").read_text().strip() == str(slice_total)
+
+
+def test_executor_directly_in_system_slice_adds_its_share_to_the_slice(tmp_path):
+    run = _run_memory_min(tmp_path, "/system.slice")
+
+    run()
+
+    assert _read(tmp_path / "sd/system.slice") == UNITS_MIB * MIB + EX
+
+
 @pytest.mark.parametrize(
     ("path", "reason"),
     [("/", "root_cgroup"), ("/../../docker/abc", "outside_host_cgroup_namespace")],
