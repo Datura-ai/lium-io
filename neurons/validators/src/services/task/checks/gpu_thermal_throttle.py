@@ -103,7 +103,7 @@ CAUSES: dict[str, tuple[str, str]] = {
     "hw_slowdown": (
         "a hardware slowdown",
         "The driver reports a hardware slowdown without saying why: heat, a power brake from the power supply, or "
-        "a power spike. Check `Clocks Event Reasons` in `nvidia-smi -q -d PERFORMANCE`, then the power supply and "
+        "a power spike. Check `Clocks Event Reasons` (`Clocks Throttle Reasons` on older drivers) in `nvidia-smi -q -d PERFORMANCE`, then the power supply and "
         "cables as well as the cooling.",
     ),
     "power_cap": (

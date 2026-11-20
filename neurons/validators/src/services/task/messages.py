@@ -420,7 +420,8 @@ class GpuThermalThrottleMessages:
         category="env",
         impact="Proceed; score not changed (observation only)",
         remediation="See gpus[]: causes, temperature_c, graphics_clock_mhz, max_graphics_clock_mhz, "
-        "clocks_event_reasons. A renter on this card gets a fraction of its speed.",
+        "clocks_event_reasons. A renter on this card gets a fraction of its speed. On a rented node, pause new "
+        "rentals and wait for running ones to end before work that shuts the node down.",
     )
     COLLAPSED = MessageTemplate(
         event="GPU clock collapsed under load",
