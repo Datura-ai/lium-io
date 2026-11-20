@@ -40,7 +40,7 @@ class Runner:
 
     async def run(self, command, timeout, retryable):
         self.calls.append(command)
-        if command.endswith(" version"):
+        if command.endswith('"$b" version'):
             if self.version_error:
                 return SimpleNamespace(
                     success=False, stdout="", stderr="", exit_status=None, error_type="timeout"
@@ -62,14 +62,14 @@ class Runner:
             return SimpleNamespace(
                 success=True, stdout=self.arch + "\n", stderr="", exit_status=0
             )
-        if command.startswith("curl "):
+        if "curl -fsSL" in command:
             return SimpleNamespace(
                 success=True,
-                stdout=f"RC:0\n{self.download_sha}  /tmp/liumd.binary.fetch\n",
+                stdout=f"RC:0\n{self.download_sha}  liumd.fetch\n",
                 stderr="",
                 exit_status=0,
             )
-        if command.startswith("install -m 0755"):
+        if "install -m 0755" in command:
             self.installed = True
             return SimpleNamespace(success=True, stdout="", stderr="", exit_status=0)
         raise AssertionError(command)
@@ -121,7 +121,7 @@ async def test_an_up_to_date_binary_is_not_downloaded(monkeypatch):
     assert len(fetches) == 1
     assert fetches[0][1] <= liumd_binary_refresh.MANIFEST_TIMEOUT_SECONDS
     assert len(runner.calls) == 1
-    assert runner.calls[0].endswith(" version")
+    assert runner.calls[0].endswith('"$b" version')
     assert not any("curl " in c for c in runner.calls)
     assert "uname -m" not in runner.calls
 
@@ -138,10 +138,10 @@ async def test_a_stale_binary_is_downloaded_only_after_the_hash_matches(monkeypa
     assert result.changed is True
     assert result.build_sha == NEW_BUILD
     assert runner.installed is True
-    [download] = [c for c in runner.calls if c.startswith("curl ")]
+    [download] = [c for c in runner.calls if "curl -fsSL" in c]
     max_time = int(download.split("--max-time ")[1].split()[0])
     assert 0 < max_time <= 60
-    assert any(c.startswith("install -m 0755") for c in runner.calls)
+    assert any("install -m 0755" in c for c in runner.calls)
 
 
 @pytest.mark.asyncio
@@ -168,8 +168,8 @@ async def test_a_manifest_fetch_failure_keeps_a_usable_local_binary(monkeypatch)
     assert result.ok is True
     assert result.changed is False
     assert "manifest timeout" in result.detail
-    assert runner.calls[0].endswith(" version")
-    assert not any(c.startswith("curl ") or c.startswith("install ") for c in runner.calls)
+    assert runner.calls[0].endswith('"$b" version')
+    assert not any("curl -fsSL" in c or "install -m" in c for c in runner.calls)
 
 
 @pytest.mark.asyncio
@@ -182,7 +182,7 @@ async def test_a_manifest_fetch_failure_without_a_local_binary_fails(monkeypatch
 
     assert result.ok is False
     assert result.detail == "manifest timeout"
-    assert runner.calls[0].endswith(" version")
+    assert runner.calls[0].endswith('"$b" version')
 
 
 @pytest.mark.asyncio
@@ -213,7 +213,7 @@ async def test_no_room_for_the_download_does_not_start_it(monkeypatch):
     assert result.ok is False
     assert result.skipped is True
     assert "no task budget" in result.detail
-    assert not any(c.startswith("curl ") for c in runner.calls)
+    assert not any("curl -fsSL" in c for c in runner.calls)
 
 
 @pytest.mark.asyncio
@@ -240,7 +240,7 @@ async def test_a_local_version_that_cannot_be_read_does_not_download(monkeypatch
 
     assert result.ok is False
     assert "could not be read" in result.detail
-    assert not any(c.startswith("curl ") for c in runner.calls)
+    assert not any("curl -fsSL" in c for c in runner.calls)
 
 
 @pytest.mark.asyncio
@@ -253,7 +253,7 @@ async def test_an_unsupported_arch_does_not_download(monkeypatch):
 
     assert result.ok is False
     assert "architecture" in result.detail
-    assert not any(c.startswith("curl ") for c in runner.calls)
+    assert not any("curl -fsSL" in c for c in runner.calls)
 
 
 @pytest.mark.asyncio
@@ -270,7 +270,7 @@ async def test_a_manifest_file_outside_the_two_names_is_rejected(monkeypatch):
 
     assert result.ok is False
     assert "no binary for this arch" in result.detail
-    assert not any(c.startswith("curl ") for c in runner.calls)
+    assert not any("curl -fsSL" in c for c in runner.calls)
 
 
 @pytest.mark.asyncio
@@ -280,3 +280,68 @@ async def test_the_feature_is_off_by_default(monkeypatch):
 
     assert await ensure_liumd_binary(_ctx(runner)) is None
     assert runner.calls == []
+
+
+class ShRunner:
+    """Runs each refresh command through real `sh` as a non-root user with a fake HOME."""
+
+    def __init__(self, env):
+        self.env = env
+
+    async def run(self, command, timeout, retryable):
+        import subprocess
+
+        out = subprocess.run(
+            ["sh", "-c", command], env=self.env, capture_output=True, text=True, timeout=timeout
+        )
+        return SimpleNamespace(
+            success=out.returncode == 0,
+            stdout=out.stdout,
+            stderr=out.stderr,
+            exit_status=out.returncode,
+            error_type=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_non_root_refresh_runs_the_copy_it_installed(tmp_path, monkeypatch):
+    import hashlib
+    import os
+
+    system = tmp_path / "sys" / "liumd"
+    home = tmp_path / "home"
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    fake_liumd = f"#!/bin/sh\necho '{json.dumps({'build_sha': NEW_BUILD})}'\n"
+    stubs = {
+        "id": "#!/bin/sh\necho 1000\n",
+        # Writes the fake liumd to the -o path, like a download would.
+        "curl": (
+            "#!/bin/sh\nwhile [ $# -gt 0 ]; do [ \"$1\" = -o ] && o=$2; shift; done\n"
+            f"cat > \"$o\" <<'X'\n{fake_liumd}X\n"
+        ),
+    }
+    for name, body in stubs.items():
+        (stub / name).write_text(body)
+        (stub / name).chmod(0o755)
+    sha = hashlib.sha256(fake_liumd.encode()).hexdigest()
+    manifest = {
+        "build_sha": NEW_BUILD,
+        "binaries": {
+            "x86_64": {"file": "liumd-amd64", "sha256": sha},
+            "aarch64": {"file": "liumd-arm64", "sha256": sha},
+        },
+    }
+    fetch, _ = _manifest_fetcher(manifest=manifest)
+    monkeypatch.setattr(liumd_binary_refresh, "_fetch_manifest", fetch)
+    monkeypatch.setattr(liumd_binary_refresh.settings, "LIUMD_BINARY_PATH", str(system))
+    runner = ShRunner({"HOME": str(home), "PATH": f"{stub}:{os.environ['PATH']}"})
+
+    result = await ensure_liumd_binary(_ctx(runner), budget_seconds=60)
+
+    assert result.ok is True, result.detail
+    assert result.changed is True and result.build_sha == NEW_BUILD
+    user_copy = home / ".local" / "bin" / "liumd"
+    assert user_copy.read_text() == fake_liumd
+    assert sorted(p.name for p in user_copy.parent.iterdir()) == ["liumd"]
+    assert not system.exists()
