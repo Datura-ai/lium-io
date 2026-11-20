@@ -165,6 +165,9 @@ _HOLDER_SCAN_TIMEOUT_SECONDS = 60
 LATE_SCAN_UNIT = "lium-gpu-reset-holder-scan"
 LATE_SCAN_FILE = f"/run/{LATE_SCAN_UNIT}"
 LATE_SCAN_SECONDS = 30
+# the launch is --no-block (only queued, never a wait on systemd's start job) and the call itself has this deadline: a
+# busy manager cannot keep the stopped services down; a launch that does not return in time skips the reset
+LATE_SCAN_LAUNCH_SECONDS = 10
 # every host service a reset unit stopped, one per line, written before its stop: the validator's restore checks
 # them with the ones it asked for, and removes the file only once all of them are up again. Never truncated by a
 # unit, so a reset whose restore did not run (a dropped session) leaves them to the next restore
@@ -663,11 +666,12 @@ def build_fabric_reset_command(units: list[str], reset_command: str, containers:
     # a host service that opened a GPU after the validator's scan: stopped too (and started again after the others),
     # or the driver refuses the reset with the pod already stopped
     planned = " ".join(u if u.endswith(".service") else f"{u}.service" for u in units)
-    # a scan that is not whole, did not end in time or could not start: the holders are unknown, so no reset (the
-    # starts still run)
+    # a scan that is not whole, did not end in time, or whose launch failed or timed out: the holders are unknown, so
+    # no reset (the starts still run)
     scan = f'( {GPU_HOLDER_UNITS_SCRIPT} ) >"$0"; echo $? >"$0.rc"'
     script += (
-        f"[ $rc -ne 0 ] || {{ if f=$(mktemp {LATE_SCAN_FILE}.XXXXXXXX) && systemd-run --quiet --collect "
+        f"[ $rc -ne 0 ] || {{ if f=$(mktemp {LATE_SCAN_FILE}.XXXXXXXX) && timeout -k 2 {LATE_SCAN_LAUNCH_SECONDS} "
+        "systemd-run --quiet --collect --no-block "
         f"--unit={LATE_SCAN_UNIT} -p RuntimeMaxSec={LATE_SCAN_SECONDS} /bin/sh -c {shlex.quote(scan)} \"$f\" "
         ">/dev/null 2>&1; then "
         f'i=0; while [ ! -s "$f.rc" ] && [ $i -lt {LATE_SCAN_SECONDS} ]; do sleep 1; i=$((i+1)); done; fi; '

@@ -637,7 +637,7 @@ def _unit_script(cmd: str, tmp_path) -> str:
 
 def _run_fabric_script(
     tmp_path, *, stop_fails="", start_fails="", reset_exit=0, units=(FM, NVLSM), containers=(), procs=None, needs="",
-    scan_busy=False,
+    scan_busy=False, scan_launch_hangs=False,
 ):
     """Runs the host unit's script under /bin/sh with logging stand-ins for systemctl, docker and nvidia-smi. The
     host's /dev holds nvidia0 (195:0), gpu0 (another name for it, 195:0) and dri-card0 (226:0); procs is the host's
@@ -675,6 +675,7 @@ def _run_fabric_script(
         (
             "systemd-run",
             f'echo "systemd-run $*" | cut -d" " -f1-5 >> {tmp_path / "units"}; [ -n "$SCAN_BUSY" ] && exit 1; '
+            '[ -n "$SCAN_LAUNCH_HANGS" ] && exec sleep 20; '
             'while [ $# -gt 0 ] && [ "$1" != /bin/sh ]; do shift; done; "$@" </dev/null >/dev/null 2>&1 & exit 0',
         ),
     ):
@@ -687,7 +688,7 @@ def _run_fabric_script(
     # what systemd does to the command line before the shell runs: unknown ${...} becomes "", $$ becomes $
     script = re.sub(r"\$\{[^}]*\}", "", script).replace("$$", "$")
     env = {**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}", "STOP_FAILS": stop_fails, "START_FAILS": start_fails, "NEEDS": needs,
-           "SCAN_BUSY": "1" if scan_busy else ""}
+           "SCAN_BUSY": "1" if scan_busy else "", "SCAN_LAUNCH_HANGS": "1" if scan_launch_hangs else ""}
     done = subprocess.run(["/bin/sh", "-c", script], env=env, capture_output=True, text=True, timeout=60)
     return done, log.read_text().splitlines()
 
@@ -739,8 +740,18 @@ def test_a_late_look_stalled_on_an_open_file_skips_the_reset_and_still_starts_ev
     # the scan ran as its own host unit (outside the reset unit's cgroup, so it cannot keep the reset unit from
     # ending), one per host by its fixed name
     assert (tmp_path / "units").read_text().split("\n")[0] == (
-        f"systemd-run --quiet --collect --unit={gpu_reset.LATE_SCAN_UNIT} -p"
+        f"systemd-run --quiet --collect --no-block --unit={gpu_reset.LATE_SCAN_UNIT}"
     )
+
+
+def test_a_scan_launch_that_does_not_return_skips_the_reset_and_starts_everything(tmp_path, monkeypatch):
+    # DAH-6741 review: a busy systemd manager holding the launch call cannot keep the stopped services down
+    monkeypatch.setattr(gpu_reset, "LATE_SCAN_LAUNCH_SECONDS", 1)
+    began = time.monotonic()
+    done, log = _run_fabric_script(tmp_path, procs={4242: ("agent", f"0::/system.slice/{AGENT}")}, scan_launch_hangs=True)
+    assert time.monotonic() - began < 10  # the launch (20 s here) is cut at its deadline, the scan is not waited for
+    assert done.returncode == gpu_reset._FABRIC_STOP_FAILED_EXIT
+    assert log == [f"stop {FM}", f"stop {NVLSM}", f"start {NVLSM}", f"start {FM}"]
 
 
 def test_a_holder_scan_unit_still_there_skips_the_reset_at_once_and_starts_everything(tmp_path):
