@@ -39,6 +39,7 @@ jobs:
           context: ./neurons/validators
           build-contexts: |
             datura=./datura
+            liumd=./neurons/executor/liumd
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging

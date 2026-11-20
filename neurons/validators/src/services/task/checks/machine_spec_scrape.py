@@ -410,7 +410,22 @@ class MachineSpecScrapeCheck:
                     DEFAULT_REFRESH_BUDGET_SECONDS, task_seconds_left(ctx) - SCRAPE_BUDGET_SECONDS
                 ),
             )
-            if refresh is not None and refresh.skipped:
+            if refresh is not None and refresh.refused:
+                # not a network miss: the published manifest failed its signature or would roll liumd back. The
+                # node is not at fault, so it keeps its local binary; with none there is nothing to run
+                logger.error(
+                    _m(
+                        "liumd manifest REFUSED; nothing installed, keeping the local binary",
+                        extra=get_extra_info(
+                            {**ctx.default_extra, "detail": refresh.detail[:300], "alert": "liumd_manifest_refused"}
+                        ),
+                    )
+                )
+                if liumd_specs and not refresh.build_sha:
+                    return self._fail_liumd(
+                        ctx, None, f"liumd binary refresh failed: {refresh.detail}", reason="binary_refresh_failed"
+                    )
+            elif refresh is not None and refresh.skipped:
                 logger.warning(
                     _m(
                         "liumd binary refresh skipped; using the local binary",
