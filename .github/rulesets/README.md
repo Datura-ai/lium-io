@@ -93,3 +93,10 @@ gh api "orgs/Datura-ai/rulesets" --method POST --input .github/rulesets/pinned-a
 ```
 
 Check: `gh api "orgs/Datura-ai/rulesets" --jq '.[]|.name+" "+.enforcement'` → `pinned-actions-required-workflow active`.
+
+**After retargeting a PR to `main`, update its branch or push a commit.** A workflow required by a ruleset runs on its
+own trigger list and ignores the `types` in the file, so the `edited` event of a retarget (a stacked PR whose base PR
+merged) does not start the required run. Without a new push the required check keeps the result of the old merge tree
+or stays pending, and the new merge tree is never scanned. "Update branch" on the PR, or any push to its head, starts
+the required run on the new merge tree. The repository's own run (on `edited`) still reports, but it is not the
+required check.
