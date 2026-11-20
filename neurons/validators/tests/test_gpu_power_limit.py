@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import time
 from unittest.mock import AsyncMock
 
+import asyncssh
 import neurons.validators.src.services.gpu_power_limit as gpl
 import pytest
 from helpers import FakeRedis as SharedFakeRedis
@@ -519,12 +520,20 @@ async def test_repeated_partial_reads_keep_failing_the_create_until_a_real_readi
         (None, GpuPowerCapResult.APPLIED),
         ("nonzero", GpuPowerCapResult.HOST_REFUSED),
         ("not_stuck", GpuPowerCapResult.HOST_REFUSED),
+        ("unreadable", GpuPowerCapResult.HOST_REFUSED),
+        ("garbled", GpuPowerCapResult.HOST_REFUSED),
+        ("unreadable_once", GpuPowerCapResult.APPLIED),
         ("timeout", GpuPowerCapResult.FAILED),
+        ("refused_session", GpuPowerCapResult.FAILED),
+        ("readback_timeout", GpuPowerCapResult.FAILED),
+        ("readback_refused_session", GpuPowerCapResult.FAILED),
         ("redis", GpuPowerCapResult.FAILED),
     ],
 )
-async def test_apply_tells_a_host_refusal_from_our_own_error(failure, expected):
+async def test_apply_tells_a_host_refusal_from_our_own_error(failure, expected, monkeypatch):
     # Arrange: one GPU to cap at 200 W; the host's -pl fails or does not stick, or our SSH or Redis fails.
+    monkeypatch.setattr(gpl, "POWER_LIMIT_READBACK_RETRY_SECONDS", 0)
+    readbacks = []
     redis = FakeRedis()
     if failure == "redis":
         redis.set = AsyncMock(side_effect=ConnectionError("redis down"))
@@ -535,8 +544,22 @@ async def test_apply_tells_a_host_refusal_from_our_own_error(failure, expected):
         if " -pl 200" in command:
             if failure == "timeout":
                 raise TimeoutError("hung")
+            if failure == "refused_session":
+                raise asyncssh.ChannelOpenError(asyncssh.OPEN_CONNECT_FAILED, "refused")
             return FakeRun(exit_status=1 if failure == "nonzero" else 0)
-        return FakeRun(stdout=f"{400 if failure == 'not_stuck' else 200}, Enabled\n")
+        if "--query-gpu=power.limit" in command:
+            if failure == "readback_timeout":
+                raise TimeoutError("hung")
+            if failure == "readback_refused_session":
+                raise asyncssh.ChannelOpenError(asyncssh.OPEN_CONNECT_FAILED, "refused")
+            readbacks.append(command)
+            # a one-off nvidia-smi glitch: the retry reads the target, so the cap counts as applied
+            if failure == "unreadable" or (failure == "unreadable_once" and len(readbacks) == 1):
+                return FakeRun(exit_status=9)
+            if failure == "garbled":
+                return FakeRun(stdout="[N/A], [N/A]\n")
+            return FakeRun(stdout=f"{400 if failure == 'not_stuck' else 200}, Enabled\n")
+        return FakeRun()
 
     ssh = AsyncMock(run=AsyncMock(side_effect=run))
     # Act / Assert: only the host's own refusal reads HOST_REFUSED.
