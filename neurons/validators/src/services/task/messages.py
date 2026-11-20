@@ -3018,9 +3018,10 @@ class RentedPodResourcesMessages:
         category="runtime",
         impact="Proceed without penalty; the renter's pod cannot read /proc/sys",
         remediation=(
-            "The FUSE service behind the container's /proc (sysbox-fs) stopped or restarted, so the running "
-            "pod answers 'Transport endpoint is not connected'. Check `systemctl status sysbox`, restart it if "
-            "needed, then restart the pod container; tell the renter first."
+            "The pod's /proc/sys answers 'Transport endpoint is not connected': its FUSE connection to "
+            "sysbox-fs is gone. This read does not show why; a sysbox-fs restart under the pod is reported "
+            "separately as RENTED_POD_OWNERSHIP_RUNTIME_RESTARTED. Restarting sysbox breaks every other "
+            "running pod: contact support before changing anything on the host."
         ),
     )
     RESOURCES_UNKNOWN = MessageTemplate(
