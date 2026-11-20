@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import ipaddress
 import socket
 import sys
 import threading
@@ -46,7 +47,7 @@ async def test_ip_literal_is_not_resolved(monkeypatch):
     _resolves_to(monkeypatch)  # would raise if consulted
 
     # Act
-    extra = await public_host_sock("10.0.0.5")
+    extra = await public_host_sock("8.8.8.8")  # a public IP literal: dialled as given
 
     # Assert
     assert extra == {}
@@ -109,6 +110,41 @@ async def test_unresolvable_name_is_refused(monkeypatch):
     # Act / Assert
     with pytest.raises(NodeHostError, match="does not resolve"):
         await public_host_sock("gone.example.net")
+
+
+@pytest.mark.parametrize(
+    "address", ["fec0::1", "64:ff9b::7f00:1", "100::1", "::ffff:127.0.0.1", "::ffff:169.254.169.254", "ff0e::1"]
+)
+def test_addresses_python_calls_global_but_are_not_public(address):
+    """lium-io#2369 review: Python 3.11-3.12 call some of these global (site-local, NAT64 of 127.0.0.1)."""
+    assert not node_host.is_public_ip(ipaddress.ip_address(address))
+
+
+def test_public_addresses_stay_public():
+    assert node_host.is_public_ip(ipaddress.ip_address("8.8.8.8"))
+    assert node_host.is_public_ip(ipaddress.ip_address("2001:4860:4860::8888"))
+    # review 5981962325: an IPv6-only validator's DNS64 answer for a public A record stays reachable
+    assert node_host.is_public_ip(ipaddress.ip_address("64:ff9b::808:808"))
+    assert not node_host.is_public_ip(ipaddress.ip_address("64:ff9b::a9fe:a9fe"))  # its NAT64 metadata address is not
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host", ["127.0.0.1", "169.254.169.254", "192.0.2.1", "::1", "[::1]", "fec0::1", "::ffff:127.0.0.1"])
+async def test_a_node_registered_at_a_non_public_ip_is_refused_before_any_dial(monkeypatch, host):
+    """A node's IP address is reported by its miner and dialled as given: a non-public one is refused like a hostname
+    resolving there, on the SSH path (public_host_sock) and the HTTP path (PublicHostResolver)."""
+    monkeypatch.setattr("socket.getaddrinfo", lambda *a, **k: pytest.fail("a literal is never looked up"))
+
+    with pytest.raises(NodeHostError, match="not a public address"):
+        await public_host_sock(host, 22)
+    with pytest.raises(NodeHostError, match="not a public address"):
+        await node_host.resolve_public_host(host, 22)
+
+
+@pytest.mark.asyncio
+async def test_a_node_registered_at_a_public_ip_is_dialled_as_given():
+    assert await public_host_sock("8.8.8.8", 22) == {}
+    assert await node_host.resolve_node_host("8.8.8.8", 22) == []
 
 
 def test_is_ip_literal():
@@ -289,8 +325,8 @@ async def test_ip_literal_logs_nothing(caplog):
 
     # Act
     with caplog.at_level(logging.INFO, logger=node_host.logger.name):
-        await public_host_sock("203.0.113.9")
-        await resolver.resolve("203.0.113.9", 8080)
+        await public_host_sock("8.8.8.8")
+        await resolver.resolve("8.8.8.8", 8080)
 
     # Assert
     assert caplog.records == []
