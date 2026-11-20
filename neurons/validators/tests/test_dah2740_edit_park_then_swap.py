@@ -34,6 +34,7 @@ from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS
 from services.hung_gpu_reset import HUNG_GPU_QUERY_COMMAND, HungGpuResult
 from services.redis_service import GPU_RESET_PENDING_KIND
 from services.prerun_host_probe import prerun_host_probe_command
+from helpers import no_host_start_lock, shared_pod_start_stop_lock
 
 
 @pytest.fixture(autouse=True)
@@ -49,6 +50,8 @@ def svc():
     # the same service test_deploy_optimizations builds; a local fixture rather than an import, which
     # pyflakes reads as a name every `svc` parameter below redefines (F811)
     service = DockerService(ssh_service=Mock(), redis_service=Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True)), attestation_service=Mock())
+    service.redis_service.pod_start_stop_lock = shared_pod_start_stop_lock({})
+    service._hold_pod_start_host_lock = no_host_start_lock
     # the pre-run kernel.pid_max read is mandatory and the SSH doubles here do not model /proc
     service._read_host_pid_max = AsyncMock(return_value=4_194_304)
     service._read_host_ram_kib = AsyncMock(return_value=None)
@@ -903,12 +906,18 @@ _STALE_MOUNT_START_ERROR = (
 async def test_the_undo_repairs_a_stale_vloopback_mountpoint_left_by_park_and_starts_again(svc, start_error, repaired, starts, raises):
     docker_client = Mock()
     docker_client.start = AsyncMock(side_effect=[RuntimeError(start_error), None])
+    # the parked container reads as stopped, with its id; the put-back-down of a failed start is tested elsewhere
+    docker_client.inspect_container_state = AsyncMock(return_value=Mock(running=False, restarting=False))
+    docker_client.container_identity = AsyncMock(return_value="cid@2026-11-16T14:03:00Z")
+    svc._stop_after_failed_start = AsyncMock()
     svc._repair_stale_mountpoint_of_container_volume = AsyncMock(return_value=repaired)
     svc._restore_mount_and_sshd_after_start = AsyncMock()
     ssh = Mock()
 
     async def bring_up():
         await svc._bring_up_existing_container(
+            executor_info=Mock(uuid="exec-1"),
+            private_key="private-key",
             docker_client=docker_client,
             ssh_client=ssh,
             container_name="pod_abc",
@@ -926,7 +935,7 @@ async def test_the_undo_repairs_a_stale_vloopback_mountpoint_left_by_park_and_st
         svc._restore_mount_and_sshd_after_start.assert_awaited_once()
     assert docker_client.start.await_count == starts
     if "file exists" in start_error:
-        svc._repair_stale_mountpoint_of_container_volume.assert_awaited_once_with(ssh, "pod_abc", {})
+        svc._repair_stale_mountpoint_of_container_volume.assert_awaited_once_with(ssh, "cid", {})
     else:
         svc._repair_stale_mountpoint_of_container_volume.assert_not_awaited()
 
@@ -1133,11 +1142,12 @@ async def test_the_stopped_layer_read_reuses_the_upper_dir_the_running_read_foun
 
 
 @pytest.mark.asyncio
-async def test_a_write_during_the_stop_with_a_kept_container_on_the_host_fails_the_edit_before_the_replacement(svc, monkeypatch):
-    # the one-kept limit holds for a write seen only on the stopped layer: the edit fails and the pod comes back
+async def test_a_write_during_the_stop_with_a_kept_container_on_the_host_is_copied_onto_it(svc, monkeypatch):
+    # DAH-6226: a write seen only on the stopped layer goes onto the pod's one kept copy; the pod reboots
     payload = _edit_payload()
     ssh = _ssh_recording()
-    ssh.kept = [f"kept_unmounted_{payload.pod_id}_1700000000"]
+    old = f"kept_unmounted_{payload.pod_id}_1700000000"
+    ssh.kept = [old]
     answer = ssh.run.side_effect
     name = _pod_name(payload)
 
@@ -1155,10 +1165,9 @@ async def test_a_write_during_the_stop_with_a_kept_container_on_the_host_fails_t
 
     result = await _run(svc, payload)
 
-    assert isinstance(result, FailedContainerRequest)
-    assert result.failure_step == "park_current_container"
-    svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
-    assert _docker(ssh.commands, "rm -fv id-") == []
+    assert isinstance(result, ContainerCreated)
+    assert len(_docker(ssh.commands, "cp")) == 1 and f"id-{old}:" in _docker(ssh.commands, "cp")[0]
+    assert _docker(ssh.commands, "rm -fv id-") == [f"/usr/bin/docker rm -fv id-{name}"]
 
 
 @pytest.mark.asyncio
@@ -1261,15 +1270,15 @@ async def test_a_failed_edit_brings_a_kept_container_back_unmounted(
 
     assert isinstance(result, FailedContainerRequest)
     kept = _docker(ssh.commands, "rename")[0].split()[3]
-    # the real bring-up, under the kept name: start, sshd, never the remount
-    assert docker_client.start.await_args.kwargs["container_name"] == kept
+    # the real bring-up of the kept container, by the id read before it: start, sshd, never the remount
+    assert docker_client.start.await_args.kwargs["container_name"] == "cid"
     svc._encrypted_local_volume_name.assert_not_awaited()
     svc.setup_encrypted_local_volume.assert_not_awaited()
     sshd = svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker
     if start_error:
         sshd.assert_not_awaited()
     else:
-        assert sshd.await_args.kwargs["container_name"] == kept
+        assert sshd.await_args.kwargs["container_name"] == "cid"
     if renamed_back:
         assert ssh.commands[-2:] == [f"/usr/bin/docker inspect -f '{{{{.State.Status}}}}' {kept}", f"/usr/bin/docker rename {kept} {name}"]
         return
@@ -1401,19 +1410,69 @@ async def test_a_failed_edit_restores_the_mount_the_pod_had(svc, monkeypatch, mo
 
 
 @pytest.mark.asyncio
-async def test_a_second_unmounted_edit_is_refused_while_a_kept_container_is_on_the_host(svc, monkeypatch):
+async def test_a_second_unmounted_edit_copies_its_files_onto_the_kept_copy_and_reboots_the_pod(svc, monkeypatch):
+    # DAH-6226: a one-kept refusal left pod 1625a2bb REBOOT_FAILED while it ran and billed. One rolling copy instead:
+    # the new layer's renter files go onto the earlier kept copy, the parked one is removed, the count stays one
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    old = f"kept_unmounted_{payload.pod_id}_1700000000"
+    ssh.kept = [old]
+    _report_unmounted(ssh)
+    _patch_happy(svc, monkeypatch, ssh)
+    name = _pod_name(payload)
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, ContainerCreated)
+    [copy] = _docker(ssh.commands, "cp")
+    # newest over older: the parked layer's files are extracted onto the earlier kept copy, not the other way
+    assert f"| /usr/bin/docker cp - id-{old}:/root" in copy
+    assert "pipefail" in copy
+    assert _docker(ssh.commands, "rm -fv id-") == [f"/usr/bin/docker rm -fv id-{name}"]  # the copied parked one only
+
+
+@pytest.mark.asyncio
+async def test_the_kept_copy_takes_only_the_parked_layers_own_files_never_its_image_files(svc, monkeypatch):
+    # an archive of the stopped container's merged path carries image files, which would overwrite older renter
+    # files of the same name on the kept copy: only the layer's own files, outside the start windows, are copied
+    payload = _edit_payload()
+    ssh = _ssh_recording()
+    old = f"kept_unmounted_{payload.pod_id}_1700000000"
+    ssh.kept = [old]
+    _report_unmounted(ssh)
+    _patch_happy(svc, monkeypatch, ssh)
+
+    await _run(svc, payload)
+
+    [copy] = _docker(ssh.commands, "cp")
+    assert f"{_kept(payload)}:" not in copy  # never `docker cp <parked>:<path>`, the merged rootfs
+    assert "GraphDriver.Data.UpperDir" in copy and "find . -mindepth 1" in copy and "$w -print0" in copy
+    assert "tar --null -T - -cf - | /usr/bin/docker cp - " in copy
+
+
+@pytest.mark.asyncio
+async def test_a_failed_copy_onto_the_kept_copy_fails_the_edit_and_keeps_both(svc, monkeypatch):
     payload = _edit_payload()
     ssh = _ssh_recording()
     ssh.kept = [f"kept_unmounted_{payload.pod_id}_1700000000"]
     _report_unmounted(ssh)
+    answer = ssh.run.side_effect
+
+    def _side(cmd, *args, **kwargs):
+        if "/usr/bin/docker cp" in cmd:
+            ssh.commands.append(cmd)
+            return _ssh_result(exit_status=1, stderr="no space left on device")
+        return answer(cmd, *args, **kwargs)
+
+    ssh.run.side_effect = _side
     _patch_happy(svc, monkeypatch, ssh)
 
     result = await _run(svc, payload)
 
     assert isinstance(result, FailedContainerRequest)
-    assert _docker(ssh.commands, "rename") == [] and _docker(ssh.commands, "stop") == []
-    assert _docker(ssh.commands, "rm -fv id-") == []
+    assert result.failure_step == "park_current_container"
     svc._run_rental_docker_create_with_port_retry.assert_not_awaited()
+    assert _docker(ssh.commands, "rm -fv id-") == []
 
 
 @pytest.mark.asyncio
@@ -1547,7 +1606,7 @@ def test_the_layer_read_skips_only_files_written_in_a_recorded_validator_start(
         (SimpleNamespace(running=False, restarting=False), True, True),  # the validator's own start, then its mount
         (SimpleNamespace(running=True, restarting=False), True, False),  # Docker accepts a start of a running one
         (SimpleNamespace(running=False, restarting=True), True, False),  # Docker is starting it itself
-        (RuntimeError("inspect failed"), True, False),  # unknown: no window, the layer read keeps the copy
+        (RuntimeError("inspect failed"), True, False),  # unknown: no start at all, so no window
         (SimpleNamespace(running=False, restarting=False), False, False),  # no mount, no window
     ],
 )
@@ -1560,12 +1619,21 @@ async def test_only_a_start_of_a_stopped_container_records_a_validator_start(svc
     docker_client.inspect_container_state = AsyncMock(
         **({"side_effect": state_before} if isinstance(state_before, Exception) else {"return_value": state_before})
     )
+    docker_client.container_identity = AsyncMock(return_value="cid@2026-11-16T14:03:00Z")
     ssh = Mock(run=AsyncMock())
 
-    await svc._bring_up_existing_container(
-        docker_client=docker_client, ssh_client=ssh, container_name="pod_x", local_volume_path="/root",
+    bring_up = svc._bring_up_existing_container(
+        executor_info=Mock(uuid="exec-1"), private_key="private-key", docker_client=docker_client, ssh_client=ssh,
+        container_name="pod_x",
+        local_volume_path="/root",
         pod_id="x", default_extra={}, remount=remount,
     )
+    if isinstance(state_before, Exception):
+        with pytest.raises(RuntimeError):
+            await bring_up
+        docker_client.start.assert_not_awaited()
+    else:
+        await bring_up
 
     recorded = [c for c in ssh.run.await_args_list if docker_service._VALIDATOR_STARTS_DIR in c.args[0]]
     assert len(recorded) == records

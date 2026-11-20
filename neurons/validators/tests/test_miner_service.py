@@ -24,6 +24,7 @@ from payload_models.payloads import (
     CustomOptions,
     PayloadPortMapping,
 )
+import services.miner_service as miner_service_module
 from services.miner_service import MinerService
 
 
@@ -443,3 +444,102 @@ def test_a_failed_stop_request_is_reported_as_a_stop_failure(miner_service):
 
     assert isinstance(result, FailedContainerRequest)
     assert result.error_type == FailedContainerErrorTypes.ContainerStopFailed
+
+
+@pytest.mark.asyncio
+async def test_a_container_start_request_reaches_start_container(mocker, miner_service):
+    from payload_models.payloads import ContainerStartRequest
+
+    executor_id = str(uuid4())
+    _wire_common_mocks(mocker, miner_service, executor_id)
+    start_mock = mocker.patch("services.miner_service.DockerService.start_container", AsyncMock(return_value=Mock()))
+    payload = ContainerStartRequest(
+        miner_hotkey="5TestMiner", executor_id=executor_id, miner_address="192.0.2.1", miner_port=8000,
+        pod_id=str(uuid4()), container_name="pod_x", local_volume_path="/root",
+    )
+
+    await miner_service._handle_container(payload)
+
+    start_mock.assert_awaited_once()
+
+
+def _start_leaving_a_stop_retry(mocker, miner_service, retry_done: asyncio.Event):
+    """A start request whose start failed and left a background stop retry, which reconnects with the request's key."""
+    import services.docker_service as docker_service_module
+    from payload_models.payloads import ContainerStartRequest
+
+    executor_id, pod_id = str(uuid4()), str(uuid4())
+    _wire_common_mocks(mocker, miner_service, executor_id)
+    mocker.patch.dict(docker_service_module._HALF_STARTED_STOP_LATER, clear=True)
+
+    async def start_failing(*args, **kwargs):
+        retry = asyncio.create_task(retry_done.wait())
+        docker_service_module._HALF_STARTED_STOP_LATER[f"{executor_id}:{pod_id}:cid"] = retry
+        return Mock()
+
+    mocker.patch("services.miner_service.DockerService.start_container", AsyncMock(side_effect=start_failing))
+    remove = mocker.patch.object(miner_service, "_remove_ssh_key_via_rest", AsyncMock(return_value=True))
+    payload = ContainerStartRequest(
+        miner_hotkey="5TestMiner", executor_id=executor_id, miner_address="192.0.2.1", miner_port=8000,
+        pod_id=pod_id, container_name="pod_x", local_volume_path="/root",
+    )
+    return payload, remove
+
+
+@pytest.mark.asyncio
+async def test_the_request_key_stays_until_the_pods_background_stop_retry_is_done(mocker, miner_service):
+    # gateway review: the retry reconnects with this key; removed with the reply, every retry would be refused
+    retry_done = asyncio.Event()
+    payload, remove = _start_leaving_a_stop_retry(mocker, miner_service, retry_done)
+
+    await miner_service._handle_container(payload)
+    await asyncio.sleep(0.01)
+    remove.assert_not_awaited()
+
+    retry_done.set()
+    await asyncio.gather(*miner_service_module._KEY_REMOVALS_AFTER_STOP_RETRY)
+    remove.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_wait_for_the_stop_retry_still_removes_the_request_key(mocker, miner_service):
+    payload, remove = _start_leaving_a_stop_retry(mocker, miner_service, asyncio.Event())
+
+    await miner_service._handle_container(payload)
+    (removal,) = miner_service_module._KEY_REMOVALS_AFTER_STOP_RETRY
+    await asyncio.sleep(0.01)  # waiting on the retry
+    removal.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await removal
+
+    remove.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_pod_logs_failure_message_carries_no_miner_address(mocker, miner_service):
+    from payload_models.payloads import FailedGetPodLogs, GetPodLogsRequestFromServer
+
+    _wire_common_mocks(mocker, miner_service, "executor")
+    miner_service._make_rest_request.return_value = (500, None)
+    payload = GetPodLogsRequestFromServer(
+        miner_hotkey="5TestMiner", executor_id="executor", miner_address="192.0.2.7", miner_port=8123,
+        pod_id="pod", container_name="pod_x",
+    )
+
+    result = await miner_service._get_pod_logs(payload)
+
+    assert isinstance(result, FailedGetPodLogs)
+    assert "192.0.2.7" not in result.msg and "8123" not in result.msg
+
+
+def test_a_start_request_failing_before_docker_is_reported_as_a_start_failure(miner_service):
+    from payload_models.payloads import ContainerStartRequest, FailedContainerErrorTypes
+
+    payload = ContainerStartRequest(
+        miner_hotkey="m", executor_id="e", pod_id="p", container_name="pod_p", local_volume_path="/root"
+    )
+
+    result = miner_service._handle_container_error(payload, "Error", FailedContainerErrorCodes.UnknownError)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_type == FailedContainerErrorTypes.ContainerStartFailed

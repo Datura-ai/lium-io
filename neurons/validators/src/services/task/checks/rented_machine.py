@@ -30,6 +30,7 @@ from ...const import (
 )
 from core.config import settings
 from services.gpu_reset import renter_gpu_reset_in_progress
+from services.rental_docker_sdk import _authorized_keys_lock
 from services.redis_service import (
     EXECUTOR_CREATE_LOCK_TIMEOUT,
     RECENT_FILLER_PREFIX,
@@ -238,6 +239,33 @@ class _DownedPodOutcome:
     # it back, unknown when the transport died, else the state the diagnostics read before the
     # recovery was attempted.
     container_state: ContainerState
+
+
+class HalfStartedStopRetryCheck:
+    """F-31: a failed start whose stop and kill failed may have left a pod running without its mount. Every such stop
+    on this node is retried first in the cycle, before any check that can halt it, rented or not: the pod may be gone
+    from the rental since (deleted, reassigned) while its old run still writes the renter's data unencrypted.
+    Never fails or halts the cycle; a stop still refused stays pending for the next one."""
+
+    check_id = "executor.recover.half_started_stops"
+    fatal = False
+
+    async def run(self, ctx: Context) -> CheckResult:
+        try:
+            async with asyncio.timeout(
+                min(_HALF_STARTED_STOP_CHECK_SEC, max(1.0, task_seconds_left(ctx) - POD_READ_RESERVE_SECONDS))
+            ):
+                await ctx.services.pod_recovery.retry_pending_half_started_stops(
+                    executor_info=ctx.executor,
+                    private_key=ctx.executor_ssh_private_key,
+                    default_extra=ctx.default_extra,
+                )
+        except Exception as exc:  # noqa: BLE001 — its own failures are logged inside; the cycle goes on
+            _log_recovery_failed("POD_HALF_STARTED_STOP_STILL_PENDING", ctx, None, None, exc)
+        event = render_message(
+            Msg.HALF_STARTED_STOPS_RETRIED, ctx=ctx, check_id=self.check_id, what={"executor_uuid": ctx.executor.uuid}
+        )
+        return CheckResult(passed=True, event=event)
 
 
 class TenantEnforcementCheck:
@@ -1037,6 +1065,8 @@ _RECOVERY_DEADLINE_SEC = EXECUTOR_CREATE_LOCK_TIMEOUT - 120
 _RECOVERY_MARK_CLEAR_TIMEOUT_SEC = 5
 # the running-pod mount probe: the backend's path lookup (10 s) and the docker probe (30 s)
 _MOUNT_PROBE_SECONDS = 40
+# three stops, a kill and their inspects of a pod left possibly running unmounted (F-31)
+_HALF_STARTED_STOP_CHECK_SEC = 45
 # a restore cut by the deadline still marks, records, parks and stops the pod: the 5 s mark, the 5 s DB record, three
 # 30 s commands and the record's 5 s drop after a park or stop that did not take
 _MOUNT_RESTORE_CLEANUP_RESERVE_SEC = 105
@@ -1193,7 +1223,7 @@ async def _clear_leftover_recovery_mark(
         return absence_confirmed
 
 
-def _log_recovery_failed(event: str, ctx: Context, container_name: str, pod_id: str, exc: Exception) -> None:
+def _log_recovery_failed(event: str, ctx: Context, container_name: str | None, pod_id: str | None, exc: Exception) -> None:
     logger.warning(
         _m(
             event,
@@ -1463,7 +1493,9 @@ async def _strip_foreign_pod_keys(
     # cat into the same file keeps its owner and mode; copy only on grep exit 0 or 1 (1 = every line went), never on
     # an error such as a full disk, which would leave an empty temp file and wipe the renter's keys.
     script = (
-        "f=/root/.ssh/authorized_keys; t=$(mktemp) || exit 1; "
+        # DAH-6441: under the add/remove lock, or a key removed between this grep and the cat comes back
+        _authorized_keys_lock("/root/.ssh", 1)
+        + "f=/root/.ssh/authorized_keys; t=$(mktemp) || exit 1; "
         f'grep -vF {patterns} "$f" > "$t" || [ $? -eq 1 ] && cat "$t" > "$f"; s=$?; rm -f "$t"; exit $s'
     )
     try:

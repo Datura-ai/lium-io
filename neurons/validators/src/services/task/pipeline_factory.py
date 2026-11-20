@@ -94,6 +94,7 @@ from .checks import (
     PidHostRequiredCheck,
     SysboxRequiredCheck,
     TdxHostCheck,
+    HalfStartedStopRetryCheck,
     TenantEnforcementCheck,
     UploadFilesCheck,
     VerifyXCheck,
@@ -319,6 +320,8 @@ class PipelineFactory:
             [
                 # DAH-4629: first, before any fatal check, so every node reports its ssh logins, rented ones too
                 SshdAuthLogCheck(),
+                # F-31: before any check that can halt the cycle, so a pending stop is retried on every node, every cycle
+                HalfStartedStopRetryCheck(),
                 # DAH-5729: before any work on the node, the node must be the registering account's
                 NodeAccountCheck(),
                 StartGPUMonitorCheck(),
@@ -527,6 +530,8 @@ class PipelineFactory:
             [
                 # DAH-4629: first, before any fatal check, so every node reports its ssh logins, rented ones too
                 SshdAuthLogCheck(),
+                # F-31: before any check that can halt the cycle, so a pending stop is retried on every node, every cycle
+                HalfStartedStopRetryCheck(),
                 # DAH-5729: before any work on the node, the node must be the registering account's
                 NodeAccountCheck(),
                 StartGPUMonitorCheck(),

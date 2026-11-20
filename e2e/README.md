@@ -7,12 +7,14 @@ obfuscated scrape, walk the check pipeline, publish the verdict, rent a containe
 missing is the chain: the subtensor client is never connected, the miner never syncs, and the hotkeys are three
 throwaway keys derived from BIP-39 test vectors (`stack.env`). Everything else is the code that runs in production.
 
-CI runs it on every approved PR that touches a neuron, `datura/`, `.github/` or `e2e/` (`.github/workflows/test.yml`, job
-**`e2e-gate`**, routed by `.github/actions/changed-packages`; it starts with the approving review and reruns on each
-push after it; a push to `main` runs it when the push changed one of those); a PR that touches none of those, or only a neuron's own `tests/`, skips it, and
-`tests-ok` reports green either way. lium-platform#186 (not merged) adds the same gate for the platform side (its
-stub validator/executor stand in for this repo); together they cover the loop from the renter's `lium up` to the
-container on the provider's host.
+CI runs it in the merge queue once the queue is enabled (`.github/workflows/test.yml`, job **`e2e-gate`**, routed by
+`.github/actions/changed-packages`): the queued group runs the gate on the merged tree, and an approved PR reports the
+required check as deferred. With the queue off (`MERGE_QUEUE_ENABLED` unset), it runs as before: on every approved PR
+that touches a neuron, `datura/`, `.github/` or `e2e/` (it starts with the approving review and reruns on each push
+after it, and a push to `main` runs it when the push changed one of those); a PR that touches none of those, or only a
+neuron's own `tests/`, skips it, and `tests-ok` reports green either way. lium-platform#186 (not merged) adds the same
+gate for the platform side (its stub validator/executor stand in for this repo); together they cover the loop from the
+renter's `lium up` to the container on the provider's host.
 
 ## The stack (`docker-compose.e2e.yml`)
 
@@ -52,7 +54,8 @@ prove is marked below.
 `make up` is idempotent (`--wait` on every healthcheck, seed is `ON CONFLICT DO NOTHING`). Measured on the local
 compose path (`make build`, a daemon that keeps its layers): cold build 136 s on 16 vCPU (sandbox EC2) and 155 s on the
 4-vCPU GitHub runner, warm build ≈ 1 s; the whole gate ≈ 3 min warm (170 s on EC2) and ≈ 6 min cold (5m49s in CI). The
-`e2e-gate` job's sticky comment on the PR carries the per-stage times of the latest run.
+`e2e-gate` job's sticky comment on the PR carries the per-stage times of the latest run; a merge-group run has no PR
+to comment on and leaves them in its `e2e-gate-*` artifact.
 
 `E2E_CACHE=gha make build` (what CI sets; `gha` is the only value the Makefile's `scope=` attributes fit) builds the five
 compose images with one `docker buildx bake` over the same compose file(s), one GitHub Actions cache scope per image
@@ -81,8 +84,8 @@ run with a `T_TOTAL` budget): build → up → every `tests/<name>` suite → lo
 fails, `artifacts/` holding `timings.txt`, `summary.md`, `<suite>-junit.xml`, `compose.log`, `compose-ps.txt`,
 `executor-docker-ps.txt` and the suites' JSON dumps on every exit the script takes itself (the per-step ceilings sum
 to more than the CI step's 55 minutes, so a build and two suites all at their ceiling would be killed from outside
-before the summary is written; the PR comment then says so). CI uploads the directory on every run and posts
-`summary.md` as one sticky PR comment. A new suite = `tests/<name>/` + nothing else (`test-%` in the Makefile).
+before the summary is written; the PR comment then says so). CI uploads the directory on every run and, on a PR run,
+posts `summary.md` as one sticky PR comment. A new suite = `tests/<name>/` + nothing else (`test-%` in the Makefile).
 
 ## What the suites prove
 

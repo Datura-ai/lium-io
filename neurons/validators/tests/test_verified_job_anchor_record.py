@@ -15,7 +15,7 @@ from neurons.validators.src.services.task.checks.gpu_fingerprint import GpuFinge
 from neurons.validators.src.services.task.checks.spec_change import SpecChangeCheck
 from neurons.validators.src.services.task.pipeline import Pipeline
 from neurons.validators.src.services.task.result_handler import ResultHandler
-from services.redis_service import GPU_ANCHOR_BROKEN_KEY, VERIFIED_JOB_COUNT_KEY, RedisService
+from services.redis_service import VERIFIED_JOB_COUNT_KEY, RedisService
 
 from tests.helpers import build_state
 
@@ -79,7 +79,7 @@ async def test_a_full_set_of_other_cards_is_re_anchored_and_verified_the_same_cy
     await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", hard=hard)
 
     ok, _, record = await _cycle(service, handler, context_factory, uuids=swapped, hard=hard)
-    assert ok is passes and record["uuids"] == anchored_after and GPU_ANCHOR_BROKEN_KEY not in record
+    assert ok is passes and record["uuids"] == anchored_after and "anchor_broken" not in record
     # no verification reset for a full set change
     assert service.publish.await_count == (0 if passes else 1)
     if passes:

@@ -1,5 +1,5 @@
-"""DAH-4548: the validator reads the Inspector sensor's rental-interference verdict. A host write
-into a rented pod fails the node; a read, a sensor without the verdict and a non-rented pod never do."""
+"""DAH-4548/DAH-6216: the validator reads the Inspector sensor's rental-interference verdict and
+logs a host write into or read of a rented pod. It is a record only: the check and the score never change."""
 
 import logging
 
@@ -62,40 +62,42 @@ def _logs(caplog, name):
 
 
 @pytest.mark.asyncio
-async def test_write_verdict_fails_the_node(context_factory, caplog):
+async def test_write_verdict_is_logged_and_changes_neither_the_check_nor_the_score(
+    context_factory, caplog
+):
     with caplog.at_level(logging.WARNING, logger=inspector.logger.name):
         result = await _run(context_factory, [HOST_WRITE])
 
-    assert result.passed is False
-    assert result.updates["inspector_host_write_passed"] is False
-    assert "node failed" in result.event.impact
-    assert "score stays zero" in result.event.remediation
+    assert result.passed is True
+    assert set(result.updates) == {"default_extra", "state"}
+    assert result.updates["state"].inspector_event is not None
+    assert "score unchanged" in result.event.impact
     logs = _logs(caplog, "INSPECTOR_HOST_WRITE")
-    assert [log["enforced"] for log in logs] == [True]
+    assert len(logs) == 1 and logs[0]["host_writes"] == 1
     assert "dmi-cloak-inner.sh" in logs[0]["commands"][0]
 
 
 @pytest.mark.asyncio
-async def test_read_verdict_is_logged_never_enforced(context_factory, caplog):
+async def test_read_verdict_is_logged_only(context_factory, caplog):
     with caplog.at_level(logging.WARNING, logger=inspector.logger.name):
         result = await _run(context_factory, [HOST_READ])
 
     assert result.passed is True
-    assert "inspector_host_write_passed" not in result.updates
     logs = _logs(caplog, "INSPECTOR_HOST_READ")
-    assert len(logs) == 1 and logs[0]["host_reads"] == 1 and logs[0]["enforced"] is False
+    assert len(logs) == 1 and logs[0]["host_reads"] == 1
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "version", [{"interference_rules_version": None}, {"interference_rules_version": 0}]
 )
-async def test_sensor_without_the_verdict_does_not_fail(context_factory, caplog, version):
+async def test_sensor_without_the_verdict_is_logged_as_unsupported(
+    context_factory, caplog, version
+):
     with caplog.at_level(logging.INFO, logger=inspector.logger.name):
         result = await _run(context_factory, [HOST_WRITE], **version)
 
     assert result.passed is True
-    assert "inspector_host_write_passed" not in result.updates
     assert len(_logs(caplog, "INSPECTOR_INTERFERENCE_UNSUPPORTED")) == 1
 
 

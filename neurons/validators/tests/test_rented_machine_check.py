@@ -16,6 +16,7 @@ from neurons.validators.src.core.docker_utils import DockerCommand, _collect_hos
 from neurons.validators.src.services.task.checks.rented_machine import (
     RENTAL_STATE_UNKNOWN_MAX_HELD,
     RENTAL_STATE_UNKNOWN_PREFIX,
+    HalfStartedStopRetryCheck,
     TenantEnforcementCheck,
     _collect_pod_diagnostics,
 )
@@ -689,14 +690,17 @@ async def test_collect_pod_diagnostics_handles_removed_container():
     ssh = DiagnosticsSSHClient(
         inspect_stdout="",
         inspect_stderr="Error: No such object: pod_abc",
-        logs_stdout="",
+        # what `docker logs ... 2>&1` prints for a removed container: never the pod's output
+        logs_stdout="Error response from daemon: No such container: pod_abc\n",
     )
 
     diagnostics = await _collect_pod_diagnostics(ssh, "pod_abc")
 
     assert diagnostics["container_status"] is None
+    assert diagnostics["container_missing"] is True
     assert "Error: No such object: pod_abc" in diagnostics["diagnostics_capture_error"]
     assert diagnostics["container_logs_tail"] is None
+    assert not any("docker logs" in cmd for cmd in ssh.commands_called)
 
 
 @pytest.mark.asyncio
@@ -1436,6 +1440,28 @@ async def test_tenant_enforcement_defers_a_pod_its_own_restore_stopped_to_the_ne
     docker.recover_parked_pod_container.assert_not_awaited()
     assert result.updates["default_extra"]["pods_stopped_by_validator"] == ["pod-1"]
     assert _pod_states(result)["pod-1"] == "exited"
+
+
+@pytest.mark.asyncio
+async def test_the_half_started_stop_check_retries_the_nodes_pending_stops_and_never_fails(context_factory):
+    # F-31: a failed start whose stop and kill failed left a pod possibly running unmounted, rented or not
+    docker = AsyncMock()
+    docker.retry_pending_half_started_stops.side_effect = ConnectionError("redis down")
+    ctx = build_recovery_context(context_factory, DummySSHClient(pod_running=True, ssh_keys=[]), docker)
+
+    result = await HalfStartedStopRetryCheck().run(ctx)
+
+    assert result.passed and not result.halt
+    assert docker.retry_pending_half_started_stops.await_args.kwargs["executor_info"] is ctx.executor
+
+
+@pytest.mark.parametrize("build", [PipelineFactory.build_checks, PipelineFactory.build_fast_path_checks])
+def test_pending_half_started_stops_are_retried_before_any_check_that_can_halt_the_cycle(build):
+    # gateway review: a fatal check before TenantEnforcementCheck (a maintenance window) skipped the retry all window
+    checks = build()
+    at = next(i for i, check in enumerate(checks) if isinstance(check, HalfStartedStopRetryCheck))
+    assert not any(getattr(check, "fatal", True) for check in checks[:at])
+    assert not any(isinstance(check, HalfStartedStopRetryCheck) for check in PipelineFactory.build_dry_run_checks())
 
 
 @pytest.mark.parametrize("stop_outcome", ["failed", "unknown"])

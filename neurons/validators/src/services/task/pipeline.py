@@ -108,6 +108,10 @@ class PodRecoverer(Protocol):
 
     async def unmounted_stop_outcome(self, pod_id: str) -> str | None: ...
 
+    async def retry_pending_half_started_stops(
+        self, *, executor_info: ExecutorSSHInfo, private_key: str | None, default_extra: dict[str, Any]
+    ) -> None: ...
+
     async def forget_recovery_stop(self, pod_id: str) -> None: ...
 
     async def recovery_stop_pending(self, pod_id: str) -> bool: ...
@@ -174,6 +178,9 @@ class ContextState:
     upload_remote_dir: Optional[str] = None
     remote_dir: Optional[str] = None
     specs: dict[str, Any] = field(default_factory=dict)
+    # The normalized scrape document before later checks write into it; None when this cycle used
+    # the liumd document instead of the Python scrape.
+    scrape_specs: dict[str, Any] | None = None
     gpu_model: Optional[str] = None
     gpu_count: Optional[int] = None
     gpu_details: list[dict] = field(default_factory=list)
@@ -336,9 +343,6 @@ class Context(BaseModel):
     # False only once ProviderSideLoadCheck sees provider-side CPU/disk above the floors under
     # enforcement; the score gate lives in calculate_scores for the same reason as above.
     provider_side_load_passed: bool = True
-    # False only once InspectorRentedCheck counts a blind streak at the limit under enforcement;
-    # the score gate lives in calculate_scores for the same reason as above.
-    inspector_blind_streak_passed: bool = True
     # False only once RentedPodResourcesCheck sees a pinned cpuset or a cut CPU quota under
     # enforcement; the score gate lives in calculate_scores for the same reason as above.
     rented_pod_resources_passed: bool = True
@@ -361,9 +365,6 @@ class Context(BaseModel):
     # False once HardwareIdentityCheck has a finding; non-fatal on a live rental, so the score
     # gate lives in calculate_scores.
     hardware_identity_passed: bool = True
-    # False only once InspectorRentedCheck reads the sensor's verdict of a host write into a
-    # rented pod under enforcement.
-    inspector_host_write_passed: bool = True
     # False only once BannedProviderCheck finds the kernel GPU view overlaid; the check is
     # non-fatal on a live rental, so the score gate lives in calculate_scores.
     kernel_gpu_view_passed: bool = True
