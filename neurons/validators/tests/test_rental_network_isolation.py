@@ -1,4 +1,4 @@
-"""DAH-3199: every rental container runs on the ICC-off bridge `lium-rentals`, not on docker0.
+"""DAH-3199 / DAH-6737: every rental container runs on an ICC-off bridge of its own, not on docker0.
 
 The daemon's default bridge lets every container on it reach every other one, and a pod holds
 NET_ADMIN, so two rentals on a split host could otherwise open connections to each other's
@@ -12,7 +12,7 @@ from unittest.mock import Mock
 import pytest
 from payload_models.payloads import ClusterMembership, ContainerCreateRequest, CustomOptions
 from services.docker_service import DockerService
-from services.rental_docker_sdk import RENTAL_NETWORK_NAME, GpuDockerConfig
+from services.rental_docker_sdk import GpuDockerConfig, rental_network_for
 
 
 @pytest.fixture
@@ -59,7 +59,7 @@ def _run_spec(docker_service: DockerService, payload: ContainerCreateRequest):
 def test_a_rental_joins_the_isolated_network(docker_service, is_sysbox) -> None:
     run_spec = _run_spec(docker_service, _payload(is_sysbox=is_sysbox))
 
-    assert run_spec.network == RENTAL_NETWORK_NAME
+    assert run_spec.network == rental_network_for("pod_test") == "lium-rentals-pod_test"
     # what the pod needs from docker0 it keeps on the new bridge: its published ports and NET_ADMIN
     assert [(port.container_port, port.host_port) for port in run_spec.ports] == [(22, 30022)]
     assert "NET_ADMIN" in run_spec.cap_add

@@ -80,7 +80,7 @@ def _kept(payload) -> str:
     return f"kept_unmounted_{payload.pod_id}_{_PARKED_AT}"
 
 
-def _ssh_recording(*, container_present: bool = True, stop_exit: int = 0, rename_back_exit: int = 0, listed_with_ids: bool = True, kill_stops: bool = False):
+def _ssh_recording(*, container_present: bool = True, stop_exit: int = 0, rename_back_exit: int = 0, listed_with_ids: bool = True, kill_stops: bool = False, after_undo: str = "running"):
     """An ssh mock that answers docker like a host with (or without) the pod's container, recording every command."""
     client = AsyncMock()
     client.image_exists_result = True
@@ -99,6 +99,12 @@ def _ssh_recording(*, container_present: bool = True, stop_exit: int = 0, rename
             names = [n for n in names if not n.startswith("kept_unmounted_")]
             present = kept + [n for n in names if (n.endswith(EDIT_PARKED_SUFFIX) and client.parked_present) or (not n.endswith(EDIT_PARKED_SUFFIX) and container_present)]
             return _ssh_result(stdout="".join(f"{n} id-{n}\n" if listed_with_ids else f"{n}\n" for n in present))
+        if "docker ps --format" in cmd and "--filter status=running" in cmd:  # what runs of the pod after a failed edit
+            if after_undo == "unreadable":
+                return _ssh_result(exit_status=1, stderr="Cannot connect to the Docker daemon")
+            # Docker ORs filters on one key; a paused container is listed only under status=paused
+            listed = after_undo == "running" or (after_undo == "paused" and "--filter status=paused" in cmd)
+            return _ssh_result(stdout="pod\n" if listed else "")
         if "/usr/bin/docker diff" in cmd:  # the park's layer read: no renter files under the volume path
             return _ssh_result(stdout="drop\n")
         if "/proc/$p/mountinfo" in cmd:  # the park's mount read: the plaintext path is not mounted
@@ -363,6 +369,134 @@ async def test_a_failed_edit_restores_the_previous_container(svc, monkeypatch):
     kwargs = bring_up.await_args.kwargs
     assert kwargs["container_name"] == name and kwargs["pod_id"] == payload.pod_id
     assert kwargs["local_volume_path"] == "/root" and kwargs["ssh_client"] is ssh
+
+
+@pytest.mark.parametrize(
+    ("present", "error", "restore_fails", "after_undo", "code"),
+    [
+        (False, "guard", False, "down", "ExecutorUnreachable"),  # nothing of the pod on the node: no host-fault charge
+        (True, "guard", False, "running", "UnknownError"),  # the original pod was brought back running: still billed
+        (True, "guard", True, "down", "ExecutorUnreachable"),  # the undo failed too and Docker reports it down
+        (True, "guard", True, "running", "UnknownError"),  # the undo failed but the pod may still run: still billed
+        (True, "guard", False, "down", "ExecutorUnreachable"),  # brought back, then it exited: not billed
+        (True, "guard", True, "unreadable", "UnknownError"),  # an unread state is never taken as down
+        # a recovery check's fenced stop froze it and may unpause it: it can resume without a start, still billed
+        (True, "guard", True, "paused", "UnknownError"),
+        (True, "ordinary", False, "running", "UnknownError"),
+        # an edit that failed on anything, whose undo's own guard was refused: down is down, not billed, and our
+        # undo's refusal is not the host's fault
+        (True, "ordinary", "guard", "down", "PodDownNotHostFault"),
+        # finding 3: a replacement that failed on the node's link, then the undo's guard refused: neutral, and the
+        # neutral reply goes with no hold (the failure handler decides it, after the code)
+        (True, "drop", "guard", "down", "PodDownNotHostFault"),
+        (True, "drop", False, "running", "UnknownError"),  # restored: the node's link failure still holds it
+        (True, "ordinary", "guard", "running", "UnknownError"),
+        # review on lium-platform#3246: the pod's guarded bridge removed on the host (our reaper keeps it) is the host's
+        # fault, never the neutral code a provider could trigger by deleting it
+        (False, "bridge", False, "down", "ExecutorUnreachable"),  # a balance-stopped pod's reboot: nothing runs
+        (True, "bridge", False, "down", "ExecutorUnreachable"),
+        (True, "bridge", False, "running", "UnknownError"),  # the original came back: still billed
+        (True, "bridge", False, "unreadable", "UnknownError"),
+        # the undo's move of the stopped original onto its bridge refused by the host's Docker: the host's
+        (True, "ordinary", "move", "down", "ExecutorUnreachable"),
+        (True, "ordinary", "move", "running", "UnknownError"),
+    ],
+    ids=[
+        "absent_guard",
+        "restored_guard",
+        "restore_failed_guard",
+        "restore_failed_still_running",
+        "restored_then_exited",
+        "state_unreadable",
+        "paused_during_fenced_stop",
+        "restored_ordinary",
+        "ordinary_undo_guard_refused_down",
+        "host_fault_undo_guard_refused_down",
+        "host_fault_restored",
+        "ordinary_undo_guard_refused_running",
+        "bridge_gone_absent",
+        "bridge_gone_down",
+        "bridge_gone_restored",
+        "bridge_gone_unreadable",
+        "undo_move_refused_down",
+        "undo_move_refused_running",
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_reboot_the_guard_refused_is_a_host_fault_only_while_no_container_of_the_pod_runs(
+    svc, monkeypatch, present, error, restore_fails, after_undo, code
+):
+    # DAH-6737 review: the code follows what Docker reports for the pod after the undo, never the undo's own steps
+    from payload_models.payloads import FailedContainerErrorCodes
+    from services.docker_service import RentalEgressGuardRefused
+
+    payload = _edit_payload()
+    ssh = _ssh_recording(container_present=present, after_undo=after_undo)
+    _patch_happy(svc, monkeypatch, ssh)
+    from services.rental_docker_sdk import RentalPodNetworkMoveFailed
+
+    restore_error = {
+        "guard": RentalEgressGuardRefused("undo not applied"),
+        "move": RentalPodNetworkMoveFailed("Docker SDK move of pod_x onto network lium-rentals-pod_x failed"),
+    }.get(restore_fails, RuntimeError("sshd"))
+    monkeypatch.setattr(
+        svc, "_bring_up_existing_container", AsyncMock(side_effect=restore_error if restore_fails else None)
+    )
+    from services.rental_docker_sdk import RentalDockerTransportDropped, RentalPodBridgeGone
+
+    exc = {
+        "guard": RentalEgressGuardRefused("not applied"),
+        "bridge": RentalPodBridgeGone("Docker network lium-rentals-pod_x is gone since its egress drop was applied"),
+        "drop": RentalDockerTransportDropped("ssh channel closed"),
+    }.get(error, RuntimeError("gocryptfs: EPERM"))
+    monkeypatch.setattr(svc, "_run_rental_docker_create_with_port_retry", AsyncMock(side_effect=exc))
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == getattr(FailedContainerErrorCodes, code)
+    from services.redis_service import RENTAL_PROBE_FAILED_PREFIX
+
+    held = [c for c in svc.redis_service.set.await_args_list if str(c.args[0]).startswith(RENTAL_PROBE_FAILED_PREFIX)]
+    # the node is held only for its own fault, never with the neutral code (no hold, no provider penalty)
+    if code == "PodDownNotHostFault":
+        assert held == []
+    elif error in ("guard", "drop") or code == "ExecutorUnreachable":
+        assert held
+
+
+@pytest.mark.parametrize(("undo", "after_undo", "code"), [
+    ("guard", "down", "PodDownNotHostFault"),
+    ("guard", "running", "ContainerVanished"),
+    ("ok", "down", "ContainerVanished"),
+], ids=["vanished_undo_guard_refused_down", "vanished_undo_guard_refused_running", "vanished_undo_ok"])
+@pytest.mark.asyncio
+async def test_a_vanished_replacement_never_masks_an_undo_guard_refusal_that_left_the_pod_down(
+    svc, monkeypatch, undo, after_undo, code
+):
+    # F-26 (DAH-6737 review): the replacement starts and is gone during bootstrap; the undo's guard is refused and
+    # Docker reports nothing of the pod running: not billed (PodDownNotHostFault), never ContainerVanished
+    from payload_models.payloads import FailedContainerErrorCodes
+    from services.docker_service import RentalEgressGuardRefused
+
+    payload = _edit_payload()
+    ssh = _ssh_recording(after_undo=after_undo)
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr(
+        svc,
+        "_bring_up_existing_container",
+        AsyncMock(side_effect=RentalEgressGuardRefused("undo not applied") if undo == "guard" else None),
+    )
+    monkeypatch.setattr(
+        svc, "install_open_ssh_server_and_start_ssh_service_with_rental_docker", AsyncMock(side_effect=RuntimeError("sshd"))
+    )
+    monkeypatch.setattr(svc, "_run_rental_docker_create_with_port_retry", AsyncMock(return_value="replacement-id"))
+    monkeypatch.setattr(svc, "cleanup_failed_container_creation", AsyncMock(return_value=True))  # it was gone
+
+    result = await _run(svc, payload)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == getattr(FailedContainerErrorCodes, code)
 
 
 @pytest.mark.parametrize(
@@ -943,6 +1077,31 @@ async def test_the_undo_repairs_a_stale_vloopback_mountpoint_left_by_park_and_st
 
 
 @pytest.mark.asyncio
+async def test_the_undo_leaves_a_pod_whose_ssh_bootstrap_failed_running(svc):
+    # review on lium-io#2352: a failed bootstrap copy does not prove the original unreachable (its workload or its own
+    # sshd may serve), so the undo logs it and leaves the pod up; billing follows Docker's state, not this step
+    docker_client = Mock()
+    docker_client.start = AsyncMock()
+    docker_client.inspect_container_state = AsyncMock(return_value=Mock(running=False, restarting=False))
+    docker_client.container_identity = AsyncMock(return_value="cid@2026-11-16T14:03:00Z")
+    svc._stop_after_failed_start = AsyncMock()
+    svc._restore_mount_and_sshd_after_start = AsyncMock(return_value=False)
+
+    await svc._bring_up_existing_container(
+        executor_info=Mock(uuid="exec-1"),
+        private_key="private-key",
+        docker_client=docker_client,
+        ssh_client=Mock(),
+        container_name="pod_abc",
+        local_volume_path="/root",
+        pod_id="abc",
+        default_extra={},
+    )
+    docker_client.start.assert_awaited_once()
+    svc._stop_after_failed_start.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_a_docker_stop_that_never_returns_fails_the_edit_in_bounded_time_and_keeps_the_pod(svc, monkeypatch):
     # a reboot hung in park: `docker stop` over SSH never returned and nothing bounded it
     monkeypatch.setattr("services.docker_service._PARK_KILL_SETTLE_SECONDS", 0)
@@ -1274,6 +1433,10 @@ async def test_a_failed_edit_brings_a_kept_container_back_unmounted(
     kept = _docker(ssh.commands, "rename")[0].split()[3]
     # the real bring-up of the kept container, by the id read before it: start, sshd, never the remount
     assert docker_client.start.await_args.kwargs["container_name"] == "cid"
+    # F-39: started by its kept name, but on the pod's own bridge, never one named after the kept name
+    from services.rental_docker_sdk import rental_network_for
+
+    assert docker_client.start.await_args.kwargs["network"] == rental_network_for(name)
     svc._encrypted_local_volume_name.assert_not_awaited()
     svc.setup_encrypted_local_volume.assert_not_awaited()
     sshd = svc.install_open_ssh_server_and_start_ssh_service_with_rental_docker

@@ -121,6 +121,19 @@ def test_default_mode_pod_moved_to_another_network_probes_there(get_egress_ip, w
     assert _probe_network(_Fake.calls[0][0]) == "lium-rentals"
 
 
+@pytest.mark.parametrize(
+    ("mode", "networks"),
+    [("lium-rentals-pod_abc", {"lium-rentals-pod_abc": {}}), ("default", {"lium-rentals-pod_abc": {}})],
+    ids=["created-on-own", "moved-to-own"],
+)
+def test_a_pod_on_its_own_bridge_is_probed_on_the_template_not_inside_it(
+    get_egress_ip, with_pod, mode, networks
+) -> None:
+    _Fake.pod_mode, _Fake.pod_networks = mode, networks
+    get_egress_ip()
+    assert _probe_network(_Fake.calls[0][0]) == "lium-rentals"
+
+
 def test_no_pod_probes_on_the_rental_network(get_egress_ip) -> None:
     get_egress_ip()
     assert _probe_network(_Fake.calls[0][0]) == "lium-rentals"
