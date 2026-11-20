@@ -8,6 +8,7 @@ authors = [
 dependencies = [
     "docker>=7.1.0",
     "requests>=2.32.0",
+    "aiohttp>=3.13.3",
     "bittensor==9.10.1",
     "pydantic>=2.10.0",
     "pydantic-settings>=2.7.0",

@@ -20,6 +20,7 @@ While no message is held, the watchtower trusts the hotkey baked into the image 
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import random
@@ -27,7 +28,7 @@ import time
 from http import HTTPStatus
 from pathlib import Path
 
-import requests
+import aiohttp
 from datura.validator_trust import (
     PUBLIC_CHAIN_NODES,
     RELEASE_SUBNET_OWNER_COLDKEY,
@@ -52,27 +53,30 @@ FETCH_LIMIT_BYTES = 64 * 1024
 
 
 def fetch_json(url: str, body: dict | None = None) -> dict | None:
-    """The JSON a GET (or, with `body`, a POST) returns; None on a 404. Reads at most FETCH_LIMIT_BYTES and gives up
-    after about twice FETCH_TIMEOUT_SECONDS, so a slow server cannot hold the update loop; raises on anything else."""
-    deadline = time.monotonic() + FETCH_TIMEOUT_SECONDS
+    """The JSON a GET (or, with `body`, a POST) returns; None on a 404. The whole request (connect, headers and body)
+    ends within FETCH_TIMEOUT_SECONDS and reads at most FETCH_LIMIT_BYTES, so a slow server cannot hold the update
+    loop; raises on anything else. Synchronous for the watchtower loop; the bound is aiohttp's total timeout, as in the
+    executor (a socket read timeout alone restarts on every short read)."""
+    return asyncio.run(_fetch_json(url, body))
+
+
+async def _fetch_json(url: str, body: dict | None) -> dict | None:
+    # no decompression: the cap counts the bytes as they arrive, so a small compressed reply cannot expand past it
+    timeout = aiohttp.ClientTimeout(total=FETCH_TIMEOUT_SECONDS)
     headers = {"Accept-Encoding": "identity", "User-Agent": WATCHTOWER_USER_AGENT}
-    method = "GET" if body is None else "POST"
-    timeout = FETCH_TIMEOUT_SECONDS
-    with requests.request(method, url, json=body, headers=headers, timeout=timeout, stream=True) as response:
-        if response.status_code == HTTPStatus.NOT_FOUND:
-            return None
-        response.raise_for_status()
-        # no decompression: the cap counts the bytes as they arrive, so a small compressed reply cannot expand past it
-        if response.headers.get("Content-Encoding", "identity").lower() != "identity":
-            raise ValueError(f"encoded reply: {response.headers['Content-Encoding']}")
-        data = bytearray()
-        for chunk in response.iter_content(chunk_size=8192):
-            data += chunk
-            if len(data) > FETCH_LIMIT_BYTES:
-                raise ValueError(f"reply over {FETCH_LIMIT_BYTES} bytes")
-            if time.monotonic() > deadline:
-                raise TimeoutError(f"reply not read within {FETCH_TIMEOUT_SECONDS}s")
-        return json.loads(data)
+    async with aiohttp.ClientSession(timeout=timeout, auto_decompress=False) as session:
+        async with session.request("GET" if body is None else "POST", url, json=body, headers=headers) as response:
+            if response.status == HTTPStatus.NOT_FOUND:
+                return None
+            response.raise_for_status()
+            if response.headers.get("Content-Encoding", "identity").lower() != "identity":
+                raise ValueError(f"encoded reply: {response.headers['Content-Encoding']}")
+            data = bytearray()
+            async for chunk in response.content.iter_any():
+                data += chunk
+                if len(data) > FETCH_LIMIT_BYTES:
+                    raise ValueError(f"reply over {FETCH_LIMIT_BYTES} bytes")
+            return json.loads(data)
 
 
 def read_subnet_owner_coldkey(url: str) -> str:

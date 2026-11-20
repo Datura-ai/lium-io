@@ -1580,11 +1580,69 @@ def test_the_message_route_sits_next_to_the_digest_endpoint():
     assert trust_service.VALIDATOR_MESSAGE_URL == "https://lium.io/api/watchtower/validator-message"
 
 
-def test_fetch_json_refuses_a_reply_over_the_cap(monkeypatch):
-    response = Mock(status_code=200, headers={})
-    response.__enter__ = Mock(return_value=response)
-    response.__exit__ = Mock(return_value=False)
-    response.iter_content = Mock(return_value=iter([b" " * 8192] * 9))
-    monkeypatch.setattr(trust_service.requests, "request", Mock(return_value=response))
-    with pytest.raises(ValueError, match="over"):
-        trust_service.fetch_json("http://backend/watchtower/validator-message")
+def _serve(handler_body):
+    """A real HTTP server on localhost whose GET runs `handler_body(handler)`; returns (url, stop)."""
+    import http.server
+    import threading
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            handler_body(self)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{server.server_port}/watchtower/validator-message", server.shutdown
+
+
+def test_fetch_json_gives_up_on_a_reply_that_arrives_in_short_reads_within_the_total_bound(monkeypatch):
+    """review lium-io#2384: a server sending a byte every 0.3 s never trips a socket read timeout; the whole request
+    is bounded instead (aiohttp total timeout), so a slow chain node cannot hold the digest check"""
+    import time as _time
+
+    def drip(handler):
+        handler.send_response(200)
+        handler.send_header("Content-Length", "256")
+        handler.end_headers()
+        for _ in range(256):
+            try:
+                handler.wfile.write(b" ")
+                handler.wfile.flush()
+            except OSError:
+                return
+            _time.sleep(0.3)
+
+    url, stop = _serve(drip)
+    monkeypatch.setattr(trust_service, "FETCH_TIMEOUT_SECONDS", 1.0)
+    try:
+        started = _time.monotonic()
+        with pytest.raises(TimeoutError):
+            trust_service.fetch_json(url)
+        assert _time.monotonic() - started < 3
+    finally:
+        stop()
+
+
+def test_fetch_json_reads_a_reply_and_refuses_one_over_the_cap():
+    def reply(body):
+        def handle(handler):
+            handler.send_response(200)
+            handler.send_header("Content-Length", str(len(body)))
+            handler.end_headers()
+            handler.wfile.write(body)
+        return handle
+
+    url, stop = _serve(reply(b'{"message": "m", "signature": "s"}'))
+    try:
+        assert trust_service.fetch_json(url) == {"message": "m", "signature": "s"}
+    finally:
+        stop()
+    url, stop = _serve(reply(b" " * (trust_service.FETCH_LIMIT_BYTES + 8192)))
+    try:
+        with pytest.raises(ValueError, match="over"):
+            trust_service.fetch_json(url)
+    finally:
+        stop()
