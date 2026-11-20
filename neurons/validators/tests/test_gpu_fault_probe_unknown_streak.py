@@ -1,7 +1,13 @@
+from unittest.mock import AsyncMock, patch
+
 import pytest
 from neurons.validators.src.protocol.vc_protocol.compute_requests import RentedExecutorsResponse
 from neurons.validators.src.services.const import FILLER_CONTAINER_PREFIX
 from neurons.validators.src.services.task.checks import gpu_fault_probe
+from neurons.validators.src.services.task.checks.rented_machine import (
+    PodRunningAndAuthorizedKeys,
+    TenantEnforcementCheck,
+)
 from neurons.validators.src.services.task.checks.gpu_fault_probe import (
     BUSY_VRAM_ERROR_PREFIX,
     UNKNOWN_STREAK_LIMIT,
@@ -132,15 +138,40 @@ async def test_a_filler_cycle_between_no_verdicts_ends_the_streak(context_factor
     assert all(result.passed for result in results)
 
 
+async def _rented_cycle_with_a_running_pod(ctx):
+    rented_machine = "neurons.validators.src.services.task.checks.rented_machine"
+    with (
+        patch(
+            f"{rented_machine}._check_pod_running_and_read_authorized_keys",
+            AsyncMock(return_value=PodRunningAndAuthorizedKeys(running=True, authorized_keys=[])),
+        ),
+        patch(f"{rented_machine}._restore_missing_volume_mount", AsyncMock(return_value=True)),
+    ):
+        return await TenantEnforcementCheck().run(ctx)
+
+
 @pytest.mark.asyncio
 async def test_a_rented_cycle_ends_the_streak(context_factory):
     ctx = _scored_ctx(context_factory, rented_data=_snapshot_with_pod(last_verifyx_download_speed=800.0))
     key = (ctx.miner_hotkey, ctx.executor.uuid)
     gpu_fault_probe._unknown_streak[key] = UNKNOWN_STREAK_LIMIT - 1
 
+    result = await _rented_cycle_with_a_running_pod(ctx)
+
+    assert result.halt is True and result.updates["rented"] is True
+    assert key not in gpu_fault_probe._unknown_streak
+
+
+@pytest.mark.asyncio
+async def test_a_stale_pod_run_goes_on_as_idle_and_keeps_the_streak(context_factory):
+    # every listed pod stale: the run continues unrented and reaches the probe, so it is a probe cycle
+    ctx = _scored_ctx(context_factory, rented_data=_snapshot_with_pod(last_verifyx_download_speed=800.0))
+    key = (ctx.miner_hotkey, ctx.executor.uuid)
+    gpu_fault_probe._unknown_streak[key] = UNKNOWN_STREAK_LIMIT - 1
+
     await _run_the_renter_ending_mid_run(ctx)
 
-    assert key not in gpu_fault_probe._unknown_streak
+    assert gpu_fault_probe._unknown_streak[key] == UNKNOWN_STREAK_LIMIT - 1
 
 
 @pytest.mark.asyncio

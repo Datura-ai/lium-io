@@ -302,8 +302,6 @@ class TenantEnforcementCheck:
             )
 
         rented_pods = rented_executor.pods
-        # a rented cycle does not reach the kernel-fault probe, so no-verdicts before and after it are not in a row
-        forget_unknown_streak(ctx)
         extra = {
             **ctx.default_extra,
             "rented": True,
@@ -322,6 +320,10 @@ class TenantEnforcementCheck:
         closed_pod_ids: set[str] = set()
 
         def with_pod_states(result: CheckResult) -> CheckResult:
+            if result.updates.get("rented") is not False:
+                # the run ends here as rented and never reaches the kernel-fault probe, so the no-verdicts before
+                # and after it are not in a row. A stale-pod run goes on as idle (rented=False) and is probed: no reset.
+                forget_unknown_streak(ctx)
             return _with_pod_states(result, ctx, rented_pods, state_by_pod_id)
 
         # DAH-4709: inside the window every pod's state is still read for the backend, but a pod that is down
