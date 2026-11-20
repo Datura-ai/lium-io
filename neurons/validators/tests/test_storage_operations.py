@@ -354,3 +354,40 @@ async def test_a_cancel_right_after_a_launch_finds_and_stops_its_runner(
         subprocess.run(["kill", "-KILL", str(runner_pid)], capture_output=True)
     assert subprocess.run(["kill", "-0", str(runner_pid)], capture_output=True).returncode != 0
     assert Path(str(files.cancel)).exists()
+
+
+@pytest.mark.asyncio
+async def test_a_launch_whose_pid_is_not_written_in_time_stops_its_runner_and_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # the wrapper starts the runner but is delayed before writing its PID past the launch's wait:
+    # the launch must not release the lock with a runner a cancel cannot find
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", storage_operations.PurePosixPath(str(tmp_path / "ops")))
+    monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
+    launch_failure = AsyncMock()
+    monkeypatch.setattr(storage_operations, "report_launch_failure", launch_failure)
+    worked = tmp_path / "worked"
+    runner = tmp_path / "runner"
+    runner.write_text(f"#!/bin/sh\nsleep 1\ntouch {worked}\n")
+    runner.chmod(0o755)
+    monkeypatch.setattr(storage_operations, "REMOTE_RUNNER_PATH", str(runner))
+    local = _local_ssh()
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+
+    async def run(command: str, check: bool = False) -> SimpleNamespace:
+        if "nohup" in command:
+            assert "child=$!; " in command and "-lt 100; do sleep 0.05" in command
+            command = command.replace("child=$!; ", "child=$!; sleep 2; ").replace(
+                "-lt 100; do sleep 0.05", "-lt 4; do sleep 0.05"
+            )
+        return await local.run(command, check)
+
+    with pytest.raises(storage_operations.StorageOperationLaunchError):
+        await storage_operations.start_storage_operation(
+            SimpleNamespace(run=run, start_sftp_client=local.start_sftp_client),
+            "sh", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False,
+        )
+    launch_failure.assert_awaited_once()
+    time.sleep(1.5)
+    assert not worked.exists()
+    assert not Path(str(files.spec)).exists() and not Path(str(files.pid)).exists()

@@ -357,7 +357,16 @@ async def start_storage_operation(
             f"> {shlex.quote(str(files.log))} 2>&1 < /dev/null 9>&- & wrapper=$!; "
             f"attempt=0; while ! test -s {pid_path} && kill -0 \"$wrapper\" 2>/dev/null "
             "&& test \"$attempt\" -lt 100; do "
-            "sleep 0.05; attempt=$((attempt + 1)); done"
+            "sleep 0.05; attempt=$((attempt + 1)); done; "
+            # never release the lock with a runner whose PID a cancel cannot read: stop what started
+            # (the runner first, so it removes its helper) and fail the launch
+            f"if ! test -s {pid_path} && kill -0 \"$wrapper\" 2>/dev/null; then "
+            'kids=$(pgrep -P "$wrapper"); kill -TERM $kids "$wrapper" 2>/dev/null; wait "$wrapper"; '
+            'alive() { for p in $kids; do kill -0 "$p" 2>/dev/null && return 0; done; return 1; }; '
+            'attempt=0; while alive && test "$attempt" -lt 100; do sleep 0.1; attempt=$((attempt + 1)); done; '
+            'kill -KILL $kids 2>/dev/null; '
+            f"/usr/bin/docker rm -f -- {shlex.quote(storage_helper_name(operation_id))} >/dev/null 2>&1; "
+            f"rm -f {shlex.quote(str(files.spec))} {pid_path} {shlex.quote(str(files.status))}; exit 7; fi"
         )
         launched = await ssh_client.run(launch_command, check=False)
         if launched.exit_status == 5:
