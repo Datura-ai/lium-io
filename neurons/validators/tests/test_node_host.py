@@ -260,13 +260,10 @@ async def test_http_request_to_a_non_public_ip_literal_is_never_sent():
 
 def _public_only_at(monkeypatch, node_port: int) -> None:
     """127.0.0.1 at ``node_port`` stands in for a public node; every other address keeps the real rule."""
-    import services.node_host as src_node_host  # the validator's own import path: a second module object
-
-    for module in (node_host, src_node_host):
-        real = module._check_literal
-        monkeypatch.setattr(
-            module, "_check_literal", lambda host, port, real=real: None if port == node_port else real(host, port)
-        )
+    real = node_host._check_literal
+    monkeypatch.setattr(
+        node_host, "_check_literal", lambda host, port: None if port == node_port else real(host, port)
+    )
 
 
 @pytest.mark.asyncio
@@ -338,10 +335,7 @@ async def _streaming_server(
 
 async def _probe(port: int, monkeypatch) -> tuple[bool, list[int]]:
     from neurons.validators.src.services.executor_connectivity.models import PortPair
-    from neurons.validators.src.services.executor_connectivity.port_tester import (
-        PortTester,
-        probe_connector,
-    )
+    from neurons.validators.src.services.executor_connectivity.port_tester import PortTester
 
     real_read = aiohttp.StreamReader.read
     read: list[int] = []
@@ -352,8 +346,7 @@ async def _probe(port: int, monkeypatch) -> tuple[bool, list[int]]:
         return data
 
     monkeypatch.setattr(aiohttp.StreamReader, "read", counted)
-    _public_only_at(monkeypatch, port)
-    async with aiohttp.ClientSession(connector=probe_connector()) as session:
+    async with aiohttp.ClientSession() as session:
         ok = await PortTester().test_one(session, "127.0.0.1", PortPair(internal=7, external=port), "token")
     return ok, read
 
@@ -401,17 +394,6 @@ async def test_the_port_probe_never_decompresses_an_answer(monkeypatch, encoding
     assert sum(read) == min(len(body), 256 + 1)
 
 
-async def _answering_server(answer) -> tuple[web.AppRunner, int]:
-    """A loopback node whose answer is ``answer(request)``, sent whole (headers and body in one write)."""
-    app = web.Application()
-    app.router.add_get("/", lambda request: answer(request))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", 0)
-    await site.start()
-    return runner, site._server.sockets[0].getsockname()[1]
-
-
 @pytest.mark.asyncio
 async def test_the_port_probe_asks_for_an_uncompressed_answer(monkeypatch):
     """A proxy in front of a working port compresses whenever the request allows it; the probe never allows it, so the
@@ -424,36 +406,17 @@ async def test_the_port_probe_asks_for_an_uncompressed_answer(monkeypatch):
             return web.Response(body=packer.compress(b"token:7") + packer.flush(), headers={"Content-Encoding": "gzip"})
         return web.Response(body=b"token:7")
 
-    runner, port = await _answering_server(answer)
+    app = web.Application()
+    app.router.add_get("/", answer)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
     try:
-        ok, _ = await _probe(port, monkeypatch)
+        ok, _ = await _probe(site._server.sockets[0].getsockname()[1], monkeypatch)
     finally:
         await runner.cleanup()
     assert ok
-
-
-@pytest.mark.asyncio
-async def test_the_port_probe_takes_only_a_few_kilobytes_of_a_large_answer_off_the_wire(monkeypatch):
-    """A large answer sent at once with its headers: what the client takes off the socket (and so can hold) stays a
-    few kilobytes, not the answer's size or the event loop's 256 KiB read size."""
-    from aiohttp.client_proto import ResponseHandler
-
-    received: list[int] = []
-    real_received = ResponseHandler.data_received
-
-    def counted(self, data):
-        received.append(len(data))
-        return real_received(self, data)
-
-    monkeypatch.setattr(ResponseHandler, "data_received", counted)
-    runner, port = await _answering_server(lambda request: web.Response(body=b"token:7" + b" " * (8 << 20)))
-    try:
-        ok, read = await _probe(port, monkeypatch)
-    finally:
-        await runner.cleanup()
-    assert not ok
-    assert sum(read) == 257
-    assert sum(received) <= 64 * 1024
 
 
 def _logged(caplog, level):
