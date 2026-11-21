@@ -257,7 +257,8 @@ async def test_a_launch_that_reaches_the_node_after_its_cancel_never_runs(
     monkeypatch.setattr(
         storage_operations, "REMOTE_OPERATION_DIRECTORY", storage_operations.PurePosixPath(str(tmp_path / "ops"))
     )
-    monkeypatch.setattr(storage_operations, "_report_cancelled", AsyncMock(return_value=True))
+    reported = AsyncMock(return_value=True)
+    monkeypatch.setattr(storage_operations, "_report_cancelled", reported)
     monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
     launch_failure = AsyncMock()
     monkeypatch.setattr(storage_operations, "report_launch_failure", launch_failure)
@@ -281,6 +282,8 @@ async def test_a_launch_that_reaches_the_node_after_its_cancel_never_runs(
         )
     assert launched == []
     launch_failure.assert_not_awaited()
+    # the cancel had no spec, so no reporter: the launch reports CANCELLED with its own spec
+    reported.assert_awaited_once_with(OPERATION_ID, {"engine": "restic"})
 
 
 def _local_ssh(fake_docker: str = "true"):

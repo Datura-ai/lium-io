@@ -20,6 +20,9 @@ from storage.restic import (
 )
 from storage.workspace import WorkspaceResolutionError, WorkspaceResolver
 
+# the validator's cancel marker that outlives the cancel (one per operation); a runner started by any
+# validator release, whatever --cancel-file it was given, stops on it
+PERSISTENT_CANCEL_DIRECTORY = Path("/var/lium-reserve/storage-cancels")
 
 def _cancel_on_sigterm(signum: int, frame: object) -> None:
     # Raising unwinds through ResticStorageRunner's finally, which removes the helper container.
@@ -38,17 +41,22 @@ def main() -> int:
             if operation.reporter
             else None
         )
+        markers = [PERSISTENT_CANCEL_DIRECTORY / f"{operation.operation_id}.cancel"]
+        if arguments.cancel_file:
+            markers.append(Path(arguments.cancel_file))
+
+        def cancelled() -> bool:
+            return any(marker.exists() for marker in markers)
+
         event_writer = JsonEventWriter(
             str(operation.operation_id),
             operation.progress_interval_seconds,
             operation.heartbeat_interval_seconds,
             reporter=reporter,
-            cancellation_probe=(
-                lambda: Path(arguments.cancel_file).exists() if arguments.cancel_file else False
-            ),
+            cancellation_probe=cancelled,
         )
         # a cancel that marked the operation before this runner started: no workspace or restore work
-        if arguments.cancel_file and Path(arguments.cancel_file).exists():
+        if cancelled():
             raise StorageOperationCancelled("storage operation was cancelled before the runner started")
         if operation.action.value == "restore":
             event_writer.stage("PREPARING")

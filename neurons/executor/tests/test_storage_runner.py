@@ -2629,3 +2629,27 @@ def test_a_runner_started_after_its_cancel_does_no_restore_work(
 
     assert storage_runner.main() == 130
     resolve.assert_not_called()
+
+
+@pytest.mark.parametrize("cancel_file", [None, "absent"])
+def test_a_runner_stops_on_the_persistent_cancel_whatever_cancel_file_it_was_given(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cancel_file: str | None
+) -> None:
+    # an earlier validator release launches with its own --cancel-file (or none), after the cancel was acknowledged
+    payload = _operation_payload(action="restore")
+    spec = tmp_path / "op.json"
+    spec.write_text(json.dumps(payload))
+    spec.chmod(0o600)
+    persistent = tmp_path / "storage-cancels"
+    persistent.mkdir()
+    (persistent / f"{payload['operation_id']}.cancel").touch()
+    monkeypatch.setattr(storage_runner, "PERSISTENT_CANCEL_DIRECTORY", persistent)
+    argv = ["storage_runner.py", "--spec", str(spec)]
+    if cancel_file:
+        argv += ["--cancel-file", str(tmp_path / "legacy.cancel")]
+    monkeypatch.setattr(sys, "argv", argv)
+    resolve = MagicMock(side_effect=AssertionError("resolved the workspace after a cancel"))
+    monkeypatch.setattr(storage_runner.WorkspaceResolver, "resolve", resolve)
+
+    assert storage_runner.main() == 130
+    resolve.assert_not_called()

@@ -428,7 +428,11 @@ async def _start_storage_operation(
             raise StorageOperationLaunchError(f"storage operation launch failed (exit {launched.exit_status})")
         return files
     except Exception as error:
-        if not isinstance(error, StorageOperationCancelledBeforeLaunch):  # the cancel already reported it
+        if isinstance(error, StorageOperationCancelledBeforeLaunch):
+            # a cancel that reached the node before this launch's spec had no reporter to report with; the
+            # backend ignores a second report on a log the cancel already made terminal
+            await _report_cancelled(operation_id, spec)
+        else:
             await report_launch_failure(operation_id, spec, error)
         raise
 
