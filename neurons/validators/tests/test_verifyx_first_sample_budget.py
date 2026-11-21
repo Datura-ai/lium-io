@@ -190,9 +190,21 @@ def test_a_bounded_run_on_a_host_without_timeout_k_runs_under_the_python_watchdo
 
 
 def _preflight_passes(
-    monkeypatch, service, module, *, preflight_s: float = 0.0, exit_status: int = 0, stderr: str | None = None
+    monkeypatch,
+    service,
+    module,
+    *,
+    preflight_s: float = 0.0,
+    exit_status: int = 0,
+    stderr: str | None = None,
+    run_s: float = 0.0,
 ):
     from types import SimpleNamespace
+
+    # the remote run takes `run_s` on the service's clock
+    ran = [0.0]
+    real = time.monotonic
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: real() + ran[0]))
 
     async def arch(shell):
         await asyncio.sleep(preflight_s)
@@ -211,6 +223,7 @@ def _preflight_passes(
 
     async def ssh(shell, command):
         commands.append(command)
+        ran[0] += run_s
         return module.SSHCapture(stdout="captured", stderr=stderr, exit_status=exit_status)
 
     monkeypatch.setattr(service, "_run_ssh_command", ssh)
@@ -286,26 +299,29 @@ def test_both_remote_watchdogs_take_the_given_seconds():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "bounded,exit_status,marked,cut",
+    "left,run_s,exit_status,marked,cut",
     [
-        (True, 124, True, True),  # GNU timeout at the deadline
-        (True, 143, True, True),  # busybox timeout: the child's status after its TERM (F-29)
-        (True, 124, False, False),  # the child exited 124 itself before the deadline: judged (F-29)
-        (True, 143, False, False),  # the child exited 143 itself before the deadline: judged (F-29)
-        (False, 124, True, False),  # unbounded: judged as before
+        (250, 250, 124, True, True),  # GNU timeout at the deadline
+        (250, 250, 143, True, True),  # busybox timeout: the child's status after its TERM (F-29)
+        (250, 10, 124, False, False),  # the child exited 124 itself before the deadline: judged (F-29)
+        (250, 10, 143, False, False),  # the child exited 143 itself before the deadline: judged (F-29)
+        (None, 600, 124, True, False),  # unbounded: judged as before
+        (250, 10, 124, True, False),  # the marker printed long before the deadline: the host's word alone, judged
+        (700, 600, 124, True, False),  # the cap, not the deadline, set the run: judged, never no task time
     ],
-    ids=["gnu-deadline", "busybox-deadline", "early-child-124", "early-child-143", "unbounded"],
+    ids=["gnu-deadline", "busybox-deadline", "early-child-124", "early-child-143", "unbounded", "early-marker",
+         "marker-at-cap"],
 )
-async def test_only_the_hosts_deadline_record_makes_a_run_the_cut(monkeypatch, bounded, exit_status, marked, cut):
+async def test_only_the_hosts_deadline_record_makes_a_run_the_cut(monkeypatch, left, run_s, exit_status, marked, cut):
     from neurons.validators.src.services import verifyx_validation_service as module
 
     service = module.VerifyXValidationService.__new__(module.VerifyXValidationService)
     stderr = f"Terminated\n{module.VERIFYX_DEADLINE_MARKER}\n" if marked else "boom\n"
-    _preflight_passes(monkeypatch, service, module, exit_status=exit_status, stderr=stderr)
+    _preflight_passes(monkeypatch, service, module, exit_status=exit_status, stderr=stderr, run_s=run_s)
 
     result = await service.validate_verifyx_and_process_job(
         shell=None, executor_info=None, default_extra={}, machine_spec={}, run_dir=".verifyx-t",
-        deadline_monotonic=time.monotonic() + 250 if bounded else None,
+        deadline_monotonic=None if left is None else time.monotonic() + left,
     )
 
     # the cut is reported as no task time by the caller; anything else is judged
