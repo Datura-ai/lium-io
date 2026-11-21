@@ -12,7 +12,6 @@ from neurons.validators.src.services.task.checks import verifyx as verifyx_check
 from neurons.validators.src.services.task.checks.verifyx import (
     COLD_RETRY_MARGIN_SECONDS,
     MIN_COLD_RETRY_SECONDS,
-    VERIFYX_LATER_CHECKS_RESERVE_SECONDS,
     VerifyXCheck,
 )
 from neurons.validators.src.services.task.messages import VerifyXMessages as Msg
@@ -57,7 +56,7 @@ async def test_too_little_time_for_verifyx_is_no_task_time_and_no_run(context_fa
 
 @pytest.mark.asyncio
 async def test_a_full_budget_runs_verifyx_as_before(context_factory, monkeypatch):
-    _left(monkeypatch, VERIFYX_LATER_CHECKS_RESERVE_SECONDS + VERIFYX_COMMAND_TIMEOUT_SECONDS)
+    _left(monkeypatch, COLD_RETRY_MARGIN_SECONDS + VERIFYX_COMMAND_TIMEOUT_SECONDS)
     service = _Probe(_probe(760.0))
 
     result = await VerifyXCheck().run(_ctx(context_factory, service, _known(500.0)))
@@ -70,7 +69,7 @@ async def test_a_full_budget_runs_verifyx_as_before(context_factory, monkeypatch
 @pytest.mark.asyncio
 async def test_a_short_budget_cuts_verifyx_at_it_and_judges_a_finished_run(context_factory, monkeypatch):
     budget = MIN_COLD_RETRY_SECONDS + 10.0
-    _left(monkeypatch, VERIFYX_LATER_CHECKS_RESERVE_SECONDS + budget)
+    _left(monkeypatch, COLD_RETRY_MARGIN_SECONDS + budget)
     timeouts = []
     wait_for = asyncio.wait_for
 
@@ -92,7 +91,7 @@ async def test_a_short_budget_cuts_verifyx_at_it_and_judges_a_finished_run(conte
 @pytest.mark.asyncio
 async def test_a_run_cut_by_the_budget_is_no_task_time_and_killed_on_the_host(context_factory, monkeypatch):
     monkeypatch.setattr(verifyx_check, "MIN_COLD_RETRY_SECONDS", 0.05)
-    _left(monkeypatch, VERIFYX_LATER_CHECKS_RESERVE_SECONDS + 0.05)
+    _left(monkeypatch, COLD_RETRY_MARGIN_SECONDS + 0.1)
     service = _Probe(_probe(760.0), run_s=5.0)
 
     result = await asyncio.wait_for(VerifyXCheck().run(_ctx(context_factory, service, _known(500.0))), 2.0)
@@ -112,19 +111,13 @@ def test_an_express_deadline_shortens_the_task_time(context_factory):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "probe_due,left,budget",
-    [(False, 320, 260), (True, 320, 260), (True, 359, 299), (True, 360, 300), (True, 390, 240), (False, 299, None)],
-    ids=["probe-done", "probe-due-short", "probe-due-359", "probe-due-360", "probe-due-reserved", "no-time"],
+    "left,budget",
+    [(320, 260), (390, 330), (600, 540), (299, None)],
+    ids=["short", "390", "600", "no-time"],
 )
-async def test_the_reserve_is_what_can_still_run_after_verifyx(context_factory, monkeypatch, probe_due, left, budget):
-    # review: the rental check already ran, so only a still-due rental probe keeps its share, and only while the
-    # mandatory first sample still gets its minimum (F-15/F-23: at 360 s the reserve took the sample to zero attempts)
+async def test_the_first_sample_leaves_only_the_scoring_margin(context_factory, monkeypatch, left, budget):
+    # review at 1749a1d: a rental-probe reserve below the probe's own 360 s never let it run and cut passing runs
     _left(monkeypatch, left)
-
-    async def due(ctx):
-        return probe_due
-
-    monkeypatch.setattr(verifyx_check, "rental_probe_due", due)
     timeouts = []
     wait_for = asyncio.wait_for
 
@@ -366,56 +359,3 @@ def test_the_watchdog_stops_the_run_with_both_ssh_readers_gone(tmp_path):
     time.sleep(3)
 
     assert not done.exists()
-
-@pytest.mark.asyncio
-async def test_no_probe_lookup_when_its_answer_cannot_change_the_reserve(context_factory, monkeypatch):
-    # review at b49619d: at 305 s only the 60 s tail can apply, so a slow Redis read must not eat the sample's time
-    _left(monkeypatch, 305)
-    lookups = []
-
-    async def due(ctx):
-        lookups.append(ctx)
-        return True
-
-    monkeypatch.setattr(verifyx_check, "rental_probe_due", due)
-    timeouts = []
-    wait_for = asyncio.wait_for
-
-    async def spy(aw, timeout):
-        timeouts.append(timeout)
-        return await wait_for(aw, timeout)
-
-    monkeypatch.setattr(verifyx_check.asyncio, "wait_for", spy)
-    service = _Probe(_probe(760.0))
-
-    await VerifyXCheck().run(_ctx(context_factory, service, _known(500.0)))
-
-    assert lookups == []
-    assert timeouts == [pytest.approx(245)]
-
-
-@pytest.mark.asyncio
-async def test_the_budget_reads_the_clock_after_the_probe_lookup(context_factory, monkeypatch):
-    # review at e79ac9c: 660.5 s before a 1 s lookup that says not due leaves 599.5 s: bounded, never the full run
-    clock = {"left": 660.5}
-    monkeypatch.setattr(verifyx_check, "task_seconds_left", lambda ctx: clock["left"])
-
-    async def due(ctx):
-        clock["left"] -= 1
-        return False
-
-    monkeypatch.setattr(verifyx_check, "rental_probe_due", due)
-    timeouts = []
-    wait_for = asyncio.wait_for
-
-    async def spy(aw, timeout):
-        timeouts.append(timeout)
-        return await wait_for(aw, timeout)
-
-    monkeypatch.setattr(verifyx_check.asyncio, "wait_for", spy)
-    service = _Probe(_probe(760.0))
-
-    await VerifyXCheck().run(_ctx(context_factory, service, _known(500.0)))
-
-    assert timeouts == [pytest.approx(599.5)]
-    assert "deadline_monotonic" in service.calls[0]

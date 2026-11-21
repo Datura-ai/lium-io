@@ -32,10 +32,9 @@ from services.verifyx_validation_service import (
 from ..messages import VerifyXMessages as Msg, render_message, shown
 from ..pipeline import CheckResult, Context
 from .disk_space import DiskSpaceCheck
-from .rental_probe import has_standing_failure, rental_probe_due
+from .rental_probe import has_standing_failure
 from .network_ema import compute_ema
 from .task_time import task_seconds_left
-from .rental_verification import RENTAL_CHECK_MIN_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -61,13 +60,11 @@ _package_fallback_probes: dict[tuple[str, str], int] = {}
 # margin for scoring, publishing and cleanup; with less than MIN_COLD_RETRY_SECONDS of that it is skipped.
 MIN_COLD_RETRY_SECONDS = 240
 COLD_RETRY_MARGIN_SECONDS = 60
-# DAH-5933: the first sample's share of the task, so a slow VerifyX (up to its 600 s cap) leaves the checks after it
-# their time: when the rental probe still has to run this cycle, the rental check's minimum plus its cleanup reserve
-# (rental_verification), when VerifyX still gets MIN_COLD_RETRY_SECONDS after it; otherwise only COLD_RETRY_MARGIN_SECONDS
-# for scoring, publishing and cleanup. With less than
-# MIN_COLD_RETRY_SECONDS for VerifyX itself the cycle reports VERIFYX_NO_TASK_TIME, which carries like
-# RENTAL_CHECK_NO_TASK_TIME: the validator's budget, not the node, decided it.
-VERIFYX_LATER_CHECKS_RESERVE_SECONDS = RENTAL_CHECK_MIN_SECONDS + 30
+# DAH-5933: the first sample gets the task's time less COLD_RETRY_MARGIN_SECONDS for scoring, publishing and cleanup,
+# so a slow VerifyX (up to its 600 s cap) cannot run past the task. With less than MIN_COLD_RETRY_SECONDS for VerifyX
+# itself the cycle reports VERIFYX_NO_TASK_TIME, which carries like RENTAL_CHECK_NO_TASK_TIME: the validator's budget,
+# not the node, decided it. No extra reserve for the rental probe: it needs 360 s after the GPU checks, so a smaller
+# reserve never lets it run and only cuts VerifyX runs that would pass (review at 1749a1d).
 # cap on the rental-state re-read before the retry; a slower answer counts as unknown (busy)
 RENTAL_STATE_TIMEOUT_SECONDS = 30
 # during the retry only the per-executor pending-pod marker is re-read, every interval; the backend's
@@ -303,22 +300,7 @@ class VerifyXCheck:
             result = local.verifyx
             transport = "local_verify"
         else:
-            # the rental check already ran before VerifyX on both paths; only a still-due rental probe needs more, and
-            # only while the first sample still gets its minimum: the sample is mandatory, RentalProbeCheck applies
-            # its own time rules to what is left
-            left = task_seconds_left(ctx)
-            # the lookup reads Redis and takes time: made only when its answer can still change the reserve (review)
-            probe_due = left - VERIFYX_LATER_CHECKS_RESERVE_SECONDS >= MIN_COLD_RETRY_SECONDS and await rental_probe_due(
-                ctx
-            )
-            # the clock is read again after the lookup (review)
-            left = task_seconds_left(ctx)
-            reserve = (
-                VERIFYX_LATER_CHECKS_RESERVE_SECONDS
-                if probe_due and left - VERIFYX_LATER_CHECKS_RESERVE_SECONDS >= MIN_COLD_RETRY_SECONDS
-                else COLD_RETRY_MARGIN_SECONDS
-            )
-            budget = left - reserve
+            budget = task_seconds_left(ctx) - COLD_RETRY_MARGIN_SECONDS
             if budget < MIN_COLD_RETRY_SECONDS:
                 return self._no_task_time(ctx, {"seconds_left": max(0, int(budget))})
             if budget >= VERIFYX_COMMAND_TIMEOUT_SECONDS:
