@@ -591,6 +591,8 @@ class PipelineFactory:
                 # `POST /verify` nor VerifyX can spend the rental check's time
                 PortConnectivityCheck(),
                 PortCountCheck(),
+                # a customer pod PortCountCheck's rental re-read found is handled before the executor's POST /verify
+                RentedSinceStartCheck(TenantEnforcementCheck(egress_guard=_RENTAL_EGRESS_GUARD_RENTED)),
                 RegistryPullCheck(),
                 ContainerDownloadSpeedCheck(),
                 SysboxRequiredCheck(),

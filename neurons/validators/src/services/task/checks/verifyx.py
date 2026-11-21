@@ -63,7 +63,8 @@ MIN_COLD_RETRY_SECONDS = 240
 COLD_RETRY_MARGIN_SECONDS = 60
 # DAH-5933: the first sample's share of the task, so a slow VerifyX (up to its 600 s cap) leaves the checks after it
 # their time: when the rental probe still has to run this cycle, the rental check's minimum plus its cleanup reserve
-# (rental_verification); otherwise only COLD_RETRY_MARGIN_SECONDS for scoring, publishing and cleanup. With less than
+# (rental_verification), when VerifyX still gets MIN_COLD_RETRY_SECONDS after it; otherwise only COLD_RETRY_MARGIN_SECONDS
+# for scoring, publishing and cleanup. With less than
 # MIN_COLD_RETRY_SECONDS for VerifyX itself the cycle reports VERIFYX_NO_TASK_TIME, which carries like
 # RENTAL_CHECK_NO_TASK_TIME: the validator's budget, not the node, decided it.
 VERIFYX_LATER_CHECKS_RESERVE_SECONDS = RENTAL_CHECK_MIN_SECONDS + 30
@@ -302,11 +303,16 @@ class VerifyXCheck:
             result = local.verifyx
             transport = "local_verify"
         else:
-            # the rental check already ran before VerifyX on both paths; only a still-due rental probe needs more
+            # the rental check already ran before VerifyX on both paths; only a still-due rental probe needs more, and
+            # only while the first sample still gets its minimum: the sample is mandatory, RentalProbeCheck applies
+            # its own time rules to what is left
+            left = task_seconds_left(ctx)
             reserve = (
-                VERIFYX_LATER_CHECKS_RESERVE_SECONDS if await rental_probe_due(ctx) else COLD_RETRY_MARGIN_SECONDS
+                VERIFYX_LATER_CHECKS_RESERVE_SECONDS
+                if left - VERIFYX_LATER_CHECKS_RESERVE_SECONDS >= MIN_COLD_RETRY_SECONDS and await rental_probe_due(ctx)
+                else COLD_RETRY_MARGIN_SECONDS
             )
-            budget = task_seconds_left(ctx) - reserve
+            budget = left - reserve
             if budget < MIN_COLD_RETRY_SECONDS:
                 return self._no_task_time(ctx, {"seconds_left": max(0, int(budget))})
             if budget >= VERIFYX_COMMAND_TIMEOUT_SECONDS:
@@ -993,7 +999,8 @@ async def _verifyx_within(ctx: Context, specs: dict, sizing: dict, budget: float
                 default_extra=ctx.default_extra,
                 machine_spec=specs,
                 run_dir=run_dir,
-                python_watchdog=True,
+                # the remote deadline is this one, so a run whose cleanup cannot connect stops with it (review F-24)
+                deadline_monotonic=time.monotonic() + budget,
                 **sizing,
             ),
             timeout=budget,

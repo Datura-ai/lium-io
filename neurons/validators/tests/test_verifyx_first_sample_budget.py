@@ -10,6 +10,7 @@ import pytest
 from neurons.validators.src.services.task.checks import task_time
 from neurons.validators.src.services.task.checks import verifyx as verifyx_check
 from neurons.validators.src.services.task.checks.verifyx import (
+    COLD_RETRY_MARGIN_SECONDS,
     MIN_COLD_RETRY_SECONDS,
     VERIFYX_LATER_CHECKS_RESERVE_SECONDS,
     VerifyXCheck,
@@ -43,7 +44,8 @@ def _left(monkeypatch, seconds):
 
 @pytest.mark.asyncio
 async def test_too_little_time_for_verifyx_is_no_task_time_and_no_run(context_factory, monkeypatch):
-    _left(monkeypatch, VERIFYX_LATER_CHECKS_RESERVE_SECONDS + MIN_COLD_RETRY_SECONDS - 1)
+    # under the first sample's minimum even with only the scoring margin kept
+    _left(monkeypatch, COLD_RETRY_MARGIN_SECONDS + MIN_COLD_RETRY_SECONDS - 1)
     service = _Probe(_probe(760.0))
 
     result = await VerifyXCheck().run(_ctx(context_factory, service, _known(500.0)))
@@ -109,10 +111,15 @@ def test_an_express_deadline_shortens_the_task_time(context_factory):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("probe_due,budget", [(False, 260), (True, None)], ids=["probe-done", "probe-due"])
-async def test_the_reserve_is_what_can_still_run_after_verifyx(context_factory, monkeypatch, probe_due, budget):
-    # review: 320 s left after the lanes; the rental check already ran, so only a still-due rental probe keeps its share
-    _left(monkeypatch, 320)
+@pytest.mark.parametrize(
+    "probe_due,left,budget",
+    [(False, 320, 260), (True, 320, 260), (True, 359, 299), (True, 360, 300), (True, 390, 240), (False, 299, None)],
+    ids=["probe-done", "probe-due-short", "probe-due-359", "probe-due-360", "probe-due-reserved", "no-time"],
+)
+async def test_the_reserve_is_what_can_still_run_after_verifyx(context_factory, monkeypatch, probe_due, left, budget):
+    # review: the rental check already ran, so only a still-due rental probe keeps its share, and only while the
+    # mandatory first sample still gets its minimum (F-15/F-23: at 360 s the reserve took the sample to zero attempts)
+    _left(monkeypatch, left)
 
     async def due(ctx):
         return probe_due
@@ -136,8 +143,8 @@ async def test_the_reserve_is_what_can_still_run_after_verifyx(context_factory, 
     else:
         assert result.passed is True
         assert timeouts == [pytest.approx(budget)]
-        # the bounded first sample has no earlier result to stand: its deadline falls back to the executor's Python
-        assert service.calls[0]["python_watchdog"] is True
+        # the bounded first sample carries its own deadline to the host (review F-24)
+        assert service.calls[0]["deadline_monotonic"] == pytest.approx(time.monotonic() + budget, abs=5)
 
 
 def test_a_bounded_run_on_a_host_without_timeout_k_runs_under_the_python_watchdog(tmp_path):
@@ -170,3 +177,79 @@ def test_a_bounded_run_on_a_host_without_timeout_k_runs_under_the_python_watchdo
     # the cold retry keeps its skip there: its first sample already stands
     retry = run()
     assert retry.returncode == 1 and "no timeout -k" in retry.stderr
+
+
+def _preflight_passes(monkeypatch, service, module, *, preflight_s: float = 0.0):
+    from types import SimpleNamespace
+
+    async def arch(shell):
+        await asyncio.sleep(preflight_s)
+        return "x86_64"
+
+    async def checksum(shell, lib_name):
+        return "same"
+
+    monkeypatch.setattr(module, "executor_arch", arch)
+    monkeypatch.setattr(module, "sha256_from_executor", checksum)
+    monkeypatch.setattr(service, "gated_lib_name", lambda: "lib")
+    monkeypatch.setattr(service, "lib_sha256", lambda source: "same")
+    monkeypatch.setattr(service, "prepare_verifyx_challenge", lambda *a, **k: SimpleNamespace(log_extra={}))
+    monkeypatch.setattr(service, "evaluate_verifyx_capture", lambda challenge, capture, extra: capture)
+    commands = []
+
+    async def ssh(shell, command):
+        commands.append(command)
+        return "captured"
+
+    monkeypatch.setattr(service, "_run_ssh_command", ssh)
+    monkeypatch.setattr(service, "_verifyx_command", lambda *a: f"timeout -k 10 {a[5]} run &")
+    return commands
+
+
+@pytest.mark.asyncio
+async def test_the_remote_deadline_is_what_the_budget_leaves_after_the_preflight(monkeypatch):
+    # review F-24: the host's watchdog ends with the validator's cut, not 600 s after the launch
+    from neurons.validators.src.services import verifyx_validation_service as module
+
+    service = module.VerifyXValidationService.__new__(module.VerifyXValidationService)
+    commands = _preflight_passes(monkeypatch, service, module)
+
+    result = await service.validate_verifyx_and_process_job(
+        shell=None, executor_info=None, default_extra={}, machine_spec={}, run_dir=".verifyx-t",
+        deadline_monotonic=time.monotonic() + 250.5,
+    )
+
+    assert result == "captured"
+    assert commands == ["timeout -k 10 250 run &"] or commands == ["timeout -k 10 249 run &"]
+
+
+@pytest.mark.asyncio
+async def test_no_launch_once_the_preflight_spent_the_budget(monkeypatch):
+    from neurons.validators.src.services import verifyx_validation_service as module
+
+    service = module.VerifyXValidationService.__new__(module.VerifyXValidationService)
+    commands = _preflight_passes(monkeypatch, service, module, preflight_s=0.05)
+
+    result = await service.validate_verifyx_and_process_job(
+        shell=None, executor_info=None, default_extra={}, machine_spec={}, run_dir=".verifyx-t",
+        deadline_monotonic=time.monotonic() + 0.01,
+    )
+
+    assert result is None
+    assert commands == []
+
+
+def test_both_remote_watchdogs_take_the_given_seconds():
+    from types import SimpleNamespace
+
+    from neurons.validators.src.services.verifyx_validation_service import VerifyXValidationService
+
+    service = VerifyXValidationService.__new__(VerifyXValidationService)
+    executor = SimpleNamespace(python_path="/usr/bin/python3", root_dir="/root/app")
+    challenge = SimpleNamespace(seed=1, cipher_text="x")
+
+    command = service._verifyx_command(executor, challenge, "lib", ".verifyx-t", True, 137)
+
+    assert "timeout -k 10 137 " in command
+    assert " 137 /usr/bin/python3 /root/app/src/verifyx_executor.py" in command
+    assert " 600 " not in command

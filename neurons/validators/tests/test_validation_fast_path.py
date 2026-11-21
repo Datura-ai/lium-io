@@ -32,6 +32,7 @@ from neurons.validators.src.services.task.checks import (
     GpuFaultProbeCheck,
     LocalVerifyCheck,
     PortConnectivityCheck,
+    PortCountCheck,
     RentalVerificationCheck,
     SysboxRequiredCheck,
     RentedSinceStartCheck,
@@ -304,8 +305,8 @@ def test_fast_path_checks_are_the_serial_checks_re_ordered():
 
     serial_ids = sorted(type(c).__name__ for c in serial)
     fast_ids = sorted(type(c).__name__ for c in flat)
-    # the one addition: the rented halt again before VerifyX, for a pod started during the run (DAH-5933 review)
-    assert fast_ids == sorted([*serial_ids, RentedSinceStartCheck.__name__]), "no other check added, none dropped"
+    # the one addition: the rented halt again after each rental re-read, for a pod started during the run
+    assert fast_ids == sorted([*serial_ids, *[RentedSinceStartCheck.__name__] * 2]), "no other check added, none dropped"
     assert [type(c) for c in PipelineFactory.build_checks(fast_path=True)] == [type(c) for c in fast]
 
     names = [type(c).__name__ for c in fast]
@@ -321,11 +322,14 @@ def test_fast_path_checks_are_the_serial_checks_re_ordered():
         CapabilityCheck,
         # the kernel-fault probe follows the matmul it complements
         GpuFaultProbeCheck,
-        RentedSinceStartCheck,
         VerifyXCheck,
     ]
     positions = [names.index(check.__name__) for check in order]
     assert positions == sorted(positions)
+    # DAH-5933 review: a pod the port re-read finds is halted before POST /verify, one CapabilityCheck finds before VerifyX
+    halts = [i for i, name in enumerate(names) if name == RentedSinceStartCheck.__name__]
+    assert names.index(PortCountCheck.__name__) < halts[0] < names.index(LocalVerifyCheck.__name__)
+    assert names.index(CapabilityCheck.__name__) < halts[1] < names.index(VerifyXCheck.__name__)
 
 
 def _rented(executor_uuid="exe-1", pods=(), fillers=()):

@@ -867,9 +867,9 @@ class HostGpuContainerFailure(BaseModel):
 
 
 class RentedSinceStartCheck:
-    """DAH-5933 review, fast path: the rented halt again once the parallel lanes merged. CapabilityCheck can find a
-    customer pod that started during the run and put it in the snapshot; the halt then handles that rental before
-    VerifyX puts its load on the node. A node still idle passes and the run goes on."""
+    """DAH-5933 review, fast path: the rented halt again after a check that re-reads the rentals. PortCountCheck and
+    CapabilityCheck can find a customer pod that started during the run and put it in the snapshot; the halt then
+    handles that rental before `POST /verify` or VerifyX puts load on the node. A node still idle passes."""
 
     check_id = TenantEnforcementCheck.check_id
     replays_after_session_drop = TenantEnforcementCheck.replays_after_session_drop

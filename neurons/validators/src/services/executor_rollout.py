@@ -798,16 +798,20 @@ async def carry_renter_gpu_reset_results(
     The provider loses nothing: the carried result is scored as in the cycle it came from, with this cycle's
     pay flags and a fresh ban lookup. A node the backend no longer lists as rented (`rented_executor_ids`,
     lower-case), or without a readable last result, keeps the held one, and `withhold_renter_gpu_reset_verdicts`
-    takes it out. DAH-5933: a no-task-time hold reads its rented GPUs from `rented_at_end`, the read
-    `rented_executor_ids` came from (`rented_data` when not given), and carries only the same allocation.
+    takes it out. DAH-5933: a no-task-time hold carries only on the cycle-end read `rented_at_end` (None: the
+    backend gave none), which classes the node and counts its rented GPUs; it carries only the same allocation.
+    The cycle-start snapshot can list a rental this run saw close, so it never stands in for that read.
     """
-    split_read = rented_at_end or rented_data
+    rented_at_end_ids = {str(uuid).lower() for uuid in rented_at_end.executors} if rented_at_end else set()
     for miner_hotkey, results in job_results.items():
         for index, held in enumerate(results):
             if not _held_for_renter_gpu_reset(held):
                 continue
             no_task_time = held.failure_reason_code in NO_TASK_TIME_REASONS
-            rented_now = str(held.executor_info.uuid).lower() in rented_executor_ids
+            if no_task_time and rented_at_end is None:
+                continue
+            ids = rented_at_end_ids if no_task_time else rented_executor_ids
+            rented_now = str(held.executor_info.uuid).lower() in ids
             if not no_task_time and not rented_now:
                 continue
             previous = await _last_scored_result(redis_service, miner_hotkey, held)
@@ -819,8 +823,10 @@ async def carry_renter_gpu_reset_results(
             rented_gpu_count = pods_rented_gpu_count(rented_data, str(held.executor_info.uuid))
             if no_task_time:
                 # the stored split pays rented and idle GPUs apart: it stands only for the same rented GPUs, read from
-                # the snapshot that classed the node (review)
-                rented_gpu_count = pods_rented_gpu_count(split_read, str(held.executor_info.uuid)) if rented_now else 0
+                # the cycle-end read that classed the node (review)
+                rented_gpu_count = (
+                    pods_rented_gpu_count(rented_at_end, str(held.executor_info.uuid)) if rented_now else 0
+                )
                 if rented_now and (rented_gpu_count is None or rented_gpu_count != previous.rented_gpu_count):
                     continue
             if no_task_time and not await _spend_kept_result(redis_service, miner_hotkey, held):

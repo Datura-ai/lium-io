@@ -351,7 +351,16 @@ def _rented_scored(uuid: str):
 async def _carry_then_withhold(service, results, rented_executor_ids=frozenset({"node-1"})):
     """The cycle's order: carry before the duplicate pass and the GPU count, withhold after."""
     job_results = {"5Miner": results}
-    await carry_renter_gpu_reset_results(job_results, service, rented_executor_ids, None, {})
+    # the cycle-end read lists the same nodes; a no-task-time hold carries only on it
+    at_end = RentedExecutorsResponse(
+        executors={
+            uuid: RentedExecutor(
+                miner_hotkey="5Miner", executor_ip_address="203.0.113.5", executor_ip_port="22", pods=[]
+            )
+            for uuid in rented_executor_ids
+        }
+    )
+    await carry_renter_gpu_reset_results(job_results, service, rented_executor_ids, None, {}, at_end)
     validator_process = _validator_process(ExecutorRolloutTracker(redis_service=MagicMock(), grace_cycles=0))
     validator_process.fetch_executor_digest_or_none = AsyncMock(return_value=None)
     validator_process.observe_executor_rollout = AsyncMock(return_value=MagicMock(covers=lambda _: False))
@@ -985,3 +994,26 @@ async def test_a_no_task_time_carry_stands_only_for_the_same_rented_gpus(end_gpu
     assert result.carried_for_renter_gpu_reset is carried
     if carried:
         assert result.rented_gpu_count == 8
+
+
+@pytest.mark.asyncio
+async def test_a_no_task_time_carry_needs_the_cycle_end_read():
+    # review F-21: the start snapshot lists 8 rented GPUs, the run saw the rental close, the end read failed
+    service = _redis_service()
+    previous = _rented_scored("node-1")
+    previous.rented_gpu_count = 8
+    await remember_rented_scored_results({"5Miner": [previous]}, service)
+    pod = RentedPod(pod_id=POD_ID, container_name="c", gpu_count=8, status="RUNNING")
+    at_start = RentedExecutorsResponse(
+        executors={
+            "node-1": RentedExecutor(
+                miner_hotkey="5Miner", executor_ip_address="203.0.113.5", executor_ip_port="22", pods=[pod]
+            )
+        }
+    )
+    job_results = {"5Miner": [_no_task_time("node-1")]}
+
+    await carry_renter_gpu_reset_results(job_results, service, {"node-1"}, at_start, {}, None)
+
+    [result] = job_results["5Miner"]
+    assert not result.carried_for_renter_gpu_reset

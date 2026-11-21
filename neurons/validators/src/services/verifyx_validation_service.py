@@ -7,6 +7,7 @@ import os
 import logging
 import re
 import shlex
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, NamedTuple, Optional, Tuple, List
@@ -402,8 +403,11 @@ class VerifyXValidationService:
         machine_spec: dict,
         challenge_config_overrides: dict | None = None,
         run_dir: str | None = None,
-        python_watchdog: bool = False,
+        deadline_monotonic: float | None = None,
     ):
+        """`deadline_monotonic` (time.monotonic()) bounds a run the validator cuts off: the remote run gets what is
+        left of it after the checksum and the challenge, under a watchdog of its own, and None comes back without a
+        launch once nothing is left (DAH-5933 review)."""
         # The SSH transport: library checksum over the shell → prepare_verifyx_challenge → one
         # remote `verifyx_executor.py` run → evaluate_verifyx_capture. The local transport
         # (checks/local_verify.py) calls the same prepare/evaluate around `POST /verify`.
@@ -494,7 +498,14 @@ class VerifyXValidationService:
                 machine_spec, default_extra, challenge_config_overrides, lib_name=lib_name
             )
 
-            command = self._verifyx_command(executor_info, challenge, lib_name, run_dir, python_watchdog)
+            seconds = VERIFYX_COMMAND_TIMEOUT_SECONDS
+            if deadline_monotonic is not None:
+                seconds = min(seconds, int(deadline_monotonic - time.monotonic()))
+                if seconds <= 0:
+                    return None
+            command = self._verifyx_command(
+                executor_info, challenge, lib_name, run_dir, deadline_monotonic is not None, seconds
+            )
 
             logger.info(_m("VerifyX Python Script Command", extra=get_extra_info(challenge.log_extra)))
 
@@ -643,6 +654,7 @@ class VerifyXValidationService:
         lib_name: str,
         run_dir: str | None = None,
         python_watchdog: bool = False,
+        seconds: int = VERIFYX_COMMAND_TIMEOUT_SECONDS,
     ) -> str:
         command = (
             f"{shlex.quote(executor_info.python_path)} {shlex.quote(executor_info.root_dir + '/src/verifyx_executor.py')} "
@@ -653,13 +665,13 @@ class VerifyXValidationService:
         # A run the validator may cut off: its own scratch dir (cwd, so the disk-test file lands in
         # it on the same filesystem) and its PID on record, for kill_remote_verifyx.
         d = shlex.quote(run_dir)
-        deadline = f"timeout -k 10 {VERIFYX_COMMAND_TIMEOUT_SECONDS} {command} &"
+        deadline = f"timeout -k 10 {int(seconds)} {command} &"
         if python_watchdog:
             # DAH-5933 review: the bounded first sample has no earlier result to fall back on, so a host whose
             # `timeout` lacks -k (busybox) gets the same deadline from the executor's own Python
             watchdog = (
                 f"{shlex.quote(executor_info.python_path)} -c {shlex.quote(_PYTHON_WATCHDOG)} "
-                f"{VERIFYX_COMMAND_TIMEOUT_SECONDS} {command} &"
+                f"{int(seconds)} {command} &"
             )
             start = f"mkdir {d} && cd {d} || exit 1; if timeout -k 1 1 true 2>/dev/null; then {deadline} else {watchdog} fi; "
         else:
