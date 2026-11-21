@@ -1847,19 +1847,21 @@ def _kept_container_prefix(container_name: str) -> str:
 _NOT_THE_NODE_LEFT_EXIT = 97
 
 
+def _executor_label(payload) -> str:
+    # the registration pair, as executor_key: one executor id can be registered by two miners on one daemon
+    return f"{payload.miner_hotkey}:{payload.executor_id}"
+
+
 def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
-    """Exits 97 on another boot, or when the pod's container there was created for another executor (a replacement
-    made on this host through a re-pointed registration); 0 once the left executor's container, its kept edit
-    containers and its volumes are gone. Unlabelled containers and volumes (made before the label) are kept."""
-    if not payload.executor_id:
-        raise ValueError("the delete names no executor")
-    volumes = [
-        _quote_safe_docker_volume_name(volume, field_name=field)
-        for field, volume in (("local_volume", payload.local_volume), ("external_volume", payload.external_volume))
-        if volume
-    ]
+    """Exits 97 on another boot, or when the pod's container there was created for another registration (a
+    replacement made on this host through a re-pointed registration or another miner's registration of the same
+    executor); 0 once the left registration's container and its kept edit containers are gone. Unlabelled containers
+    (made before the label) are kept. The pod's named volumes are never removed here: a replacement on the same
+    daemon reuses volume_<pod id> as it is, label included, so nothing on the volume tells the two apart."""
+    if not payload.executor_id or not payload.miner_hotkey:
+        raise ValueError("the delete names no registration")
     name = shlex.quote(payload.container_name)
-    owner = shlex.quote(payload.executor_id)
+    owner = shlex.quote(_executor_label(payload))
     found = f'{{{{.Id}}}} {{{{index .Config.Labels "{LIUM_EXECUTOR_ID_LABEL}"}}}}'
     lines = [
         f'[ "$(cat /proc/sys/kernel/random/boot_id)" = {shlex.quote(payload.expected_boot_id)} ] '
@@ -1869,17 +1871,12 @@ def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
         # removed by the ID that was checked: a container created under the same name after the check is not it
         'id=${found%% *}',
         f"kept=$(/usr/bin/docker ps -aq --filter name=^{shlex.quote(_kept_container_prefix(payload.container_name))} "
-        f"--filter label={shlex.quote(f'{LIUM_EXECUTOR_ID_LABEL}={payload.executor_id}')}) || exit 1",
+        f"--filter label={shlex.quote(f'{LIUM_EXECUTOR_ID_LABEL}={_executor_label(payload)}')}) || exit 1",
         "/usr/bin/docker rm -fv $id $kept >/dev/null 2>&1",
         '[ -n "$id" ] && /usr/bin/docker inspect --type container "$id" >/dev/null 2>&1 && exit 1',
+        "exit 0",
     ]
-    volume_label = f'{{{{index .Labels "{LIUM_EXECUTOR_ID_LABEL}"}}}}'
-    for volume in volumes:
-        # shortcut: an external volume's s3fs plugin is left installed, upgrade if a moved pod ever carries one
-        lines.append(
-            f"if [ \"$(/usr/bin/docker volume inspect -f {shlex.quote(volume_label)} {volume} 2>/dev/null)\" = {owner} ]; "
-            f"then /usr/bin/docker volume rm -f {volume} >/dev/null || exit 1; fi"
-        )
+    # shortcut: the left node keeps the pod's named volumes; remove them once a delete can prove another daemon
     return "\n".join(lines)
 
 
@@ -4646,7 +4643,7 @@ class DockerService:
             log_opts={"max-size": settings.RENTAL_LOG_MAX_SIZE, "max-file": str(settings.RENTAL_LOG_MAX_FILE)},
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
-            labels={LIUM_POD_ID_LABEL: payload.pod_id, LIUM_EXECUTOR_ID_LABEL: payload.executor_id},
+            labels={LIUM_POD_ID_LABEL: payload.pod_id, LIUM_EXECUTOR_ID_LABEL: _executor_label(payload)},
             before_create=lambda: _refuse_filler_during_customer_create(payload),
             # a customer pod created since the cleanup's listing is seen here, before the filler starts
             before_start=(
@@ -11611,7 +11608,7 @@ class DockerService:
                         labels=(
                             FILLER_VOLUME_LABELS
                             if payload.workload_kind == WorkloadKind.FILLER
-                            else {LIUM_EXECUTOR_ID_LABEL: payload.executor_id}
+                            else {LIUM_EXECUTOR_ID_LABEL: _executor_label(payload)}
                         ),
                     )
                     created_local_volume = True

@@ -72,10 +72,10 @@ def test_run_spec_swap_off_follows_the_memory_limit(svc, memory_gb, expected):  
 
 def test_run_spec_labels_the_container_with_its_pod_id_and_executor(svc):  # noqa: F811
     """DAH-5117: the stale cleanup reaps only containers carrying the pod label; DAH-6531: the delete for the
-    node a moved pod left removes only a container carrying the left executor's id."""
+    node a moved pod left removes only a container carrying the left registration's miner:executor pair."""
     from services.const import LIUM_EXECUTOR_ID_LABEL, LIUM_POD_ID_LABEL
 
-    assert _run_spec(svc, 30).labels == {LIUM_POD_ID_LABEL: "pod", LIUM_EXECUTOR_ID_LABEL: "ex"}
+    assert _run_spec(svc, 30).labels == {LIUM_POD_ID_LABEL: "pod", LIUM_EXECUTOR_ID_LABEL: "hk:ex"}
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "1001"])
