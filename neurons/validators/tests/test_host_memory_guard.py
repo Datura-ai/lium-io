@@ -412,12 +412,12 @@ def test_executor_nested_under_a_docker_scope_is_written_with_its_parent(tmp_pat
     assert out["failed"] == []
 
 
-@pytest.mark.parametrize(("granted", "sibling", "parent"), [
-    (4096 * MIB, 4096 * MIB, 4096 * MIB + EX),  # a reservation the parent already grants keeps it, the executor adds
-    (0, "max", EX),  # a claim the parent never granted (a rental's own) does not raise the parent
-    (2048 * MIB, 4096 * MIB, 2048 * MIB + EX),  # only the granted part counts
+@pytest.mark.parametrize(("granted", "sibling", "parent", "kept"), [
+    (4096 * MIB, 4096 * MIB, 4096 * MIB + EX, 4096 * MIB),  # a reservation the parent grants keeps it, the executor adds
+    (0, "max", EX, 0),  # a claim the parent never granted (a rental's own) does not raise the parent, and is lowered
+    (2048 * MIB, 4096 * MIB, 2048 * MIB + EX, 2048 * MIB),  # only the granted part counts, and stays
 ])
-def test_parent_counts_the_protection_its_other_children_already_hold(tmp_path, granted, sibling, parent):
+def test_parent_counts_the_protection_its_other_children_already_hold(tmp_path, granted, sibling, parent, kept):
     run = _run_memory_min(tmp_path, "/tenant/executor", systemd=False)
     root = tmp_path / "cg"
     (root / "tenant/other").mkdir(parents=True)
@@ -429,7 +429,7 @@ def test_parent_counts_the_protection_its_other_children_already_hold(tmp_path, 
 
     assert _read(root / "tenant/memory.min") == parent
     assert _read(root / "tenant/executor/memory.min") == EX
-    assert (root / "tenant/other/memory.min").read_text().strip() == str(sibling)
+    assert _read(root / "tenant/other/memory.min") == kept
 
 
 @pytest.mark.parametrize(("granted", "other", "counted"), [
@@ -465,6 +465,7 @@ def test_other_children_count_together_up_to_what_the_parent_granted(tmp_path):
     run()
 
     assert _read(root / "tenant/memory.min") == 2048 * MIB + EX
+    assert [_read(root / "tenant" / name / "memory.min") for name in ("a", "b")] == [1024 * MIB, 1024 * MIB]
 
 
 def test_system_slice_other_children_count_together_up_to_what_the_slice_granted(tmp_path):
@@ -506,8 +507,9 @@ def test_system_slice_reads_one_baseline_record_when_two_were_written(tmp_path):
 
     out = parse_guard_output(run())
 
-    # other.scope's own claim (max) is more than the slice grants: reported, never granted
-    assert out["failed"] == ["memory_min /system.slice overcommitted"]
+    # other.scope's own claim (max) is more than the slice granted: never granted, lowered to that grant
+    assert out["failed"] == []
+    assert _read(root / "system.slice/other.scope/memory.min") == 0
     assert _read(state / "system.slice") == UNITS_MIB * MIB + EX
 
 
@@ -585,7 +587,7 @@ def test_a_unit_raised_by_systemd_has_its_baseline_taken_before_the_raise(tmp_pa
 
     unit = UNIT_MEMORY_MIN_MIB["containerd.service"] * MIB
     assert _read(root / "system.slice/containerd.service/memory.min") == unit + EX
-    assert "memory_min /system.slice/containerd.service overcommitted" in first["failed"]
+    assert first["failed"] == [] and _read(root / "system.slice/containerd.service/y/memory.min") == 0
     assert second["set"] == []
 
 
@@ -669,11 +671,14 @@ def test_a_dot_named_system_slice_child_is_counted(tmp_path):
     assert _read(state / "system.slice") == UNITS_MIB * MIB + EX + 2048 * MIB
 
 
-@pytest.mark.parametrize(("granted", "sibling", "over"), [(0, "max", True), (0, 4096 * MIB, True), (4096 * MIB, 4096 * MIB, False)])
+@pytest.mark.parametrize(("granted", "sibling", "kept"), [(0, "max", 0), (0, 4096 * MIB, 0), (4096 * MIB, 4096 * MIB, 4096 * MIB)])
 @pytest.mark.parametrize("systemd", [False, True])
-def test_a_parent_whose_children_claim_more_than_it_grants_is_reported(tmp_path, granted, sibling, over, systemd):
-    """The cap stays (a rental's claim never raises the parent), but children claiming more than the final grant
-    get less than they claim, so the parent is reported."""
+def test_children_claiming_more_than_the_parent_granted_are_lowered_so_the_executor_keeps_its_share(
+    tmp_path, granted, sibling, kept, systemd
+):
+    """A rental's claim never raises the parent; a sibling claiming more than the parent granted before the guard
+    is lowered to that grant, so the children's claims fit the parent and the kernel never splits the executor's
+    share with it."""
     parent = "/system.slice" if systemd else "/tenant"
     run = _run_memory_min(tmp_path, f"{parent}/docker-abc.scope" if systemd else f"{parent}/executor", systemd=systemd)
     root = tmp_path / "cg"
@@ -684,10 +689,18 @@ def test_a_parent_whose_children_claim_more_than_it_grants_is_reported(tmp_path,
     else:
         (root / "tenant/memory.min").write_text(f"{granted}\n")
 
-    failed = parse_guard_output(run())["failed"]
+    out = parse_guard_output(run())
 
-    assert (f"memory_min {parent} overcommitted" in failed) is over
-    assert [f for f in failed if not f.endswith("overcommitted")] == []
+    assert out["failed"] == []
+    assert _read(root / parent.lstrip("/") / "other.scope/memory.min") == kept
+    # every child's claim fits the parent's protection
+    grant = _read(tmp_path / "sd/system.slice") if systemd else _read(root / "tenant/memory.min")
+    claims = sum(
+        _read(c / "memory.min") if c.name != "docker-abc.scope" else EX
+        for c in (root / parent.lstrip("/")).iterdir() if (c / "memory.min").exists() or c.name == "docker-abc.scope"
+    )
+    assert claims <= grant
+    assert parse_guard_output(run()) == {"set": [], "failed": []}  # nothing left to lower on a later run
 
 
 @pytest.mark.parametrize("systemd", [False, True])
@@ -733,3 +746,19 @@ def test_an_executor_path_ending_in_a_space_is_written_not_its_namesake(tmp_path
     assert _read(root / "tenant/worker " / "memory.min") == EX
     assert not (root / "tenant/worker/memory.min").exists()
     assert out["failed"] == []
+
+
+@pytest.mark.parametrize("awk", [a for a in ("mawk", "gawk", "busybox") if shutil.which(a)])
+def test_lowered_children_keep_small_claims_whole_and_share_the_rest_evenly(tmp_path, awk):
+    run = _run_memory_min(tmp_path, "/tenant/executor", systemd=False)
+    _fake_bin(tmp_path, "awk", f'exec {awk}{" awk" if awk == "busybox" else ""} "$@"\n')
+    root = tmp_path / "cg"
+    for name, claim in (("a", "max"), ("b", 1024 * MIB), ("c", 5000 * MIB)):
+        (root / "tenant" / name).mkdir(parents=True)
+        (root / "tenant" / name / "memory.min").write_text(f"{claim}\n")
+    (root / "tenant/memory.min").write_text(f"{6144 * MIB}\n")
+
+    assert parse_guard_output(run())["failed"] == []
+
+    assert [_read(root / "tenant" / name / "memory.min") for name in "abc"] == [2560 * MIB, 1024 * MIB, 2560 * MIB]
+    assert _read(root / "tenant/memory.min") == 6144 * MIB + EX
