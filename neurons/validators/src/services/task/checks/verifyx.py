@@ -306,10 +306,12 @@ class VerifyXCheck:
             # the rental check already ran before VerifyX on both paths; only a still-due rental probe needs more, and
             # only while the first sample still gets its minimum: the sample is mandatory, RentalProbeCheck applies
             # its own time rules to what is left
+            probe_due = await rental_probe_due(ctx)
+            # the clock is read after the lookup, which itself takes time (review)
             left = task_seconds_left(ctx)
             reserve = (
                 VERIFYX_LATER_CHECKS_RESERVE_SECONDS
-                if left - VERIFYX_LATER_CHECKS_RESERVE_SECONDS >= MIN_COLD_RETRY_SECONDS and await rental_probe_due(ctx)
+                if probe_due and left - VERIFYX_LATER_CHECKS_RESERVE_SECONDS >= MIN_COLD_RETRY_SECONDS
                 else COLD_RETRY_MARGIN_SECONDS
             )
             budget = left - reserve

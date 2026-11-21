@@ -179,7 +179,7 @@ def test_a_bounded_run_on_a_host_without_timeout_k_runs_under_the_python_watchdo
     assert retry.returncode == 1 and "no timeout -k" in retry.stderr
 
 
-def _preflight_passes(monkeypatch, service, module, *, preflight_s: float = 0.0):
+def _preflight_passes(monkeypatch, service, module, *, preflight_s: float = 0.0, exit_status: int = 0):
     from types import SimpleNamespace
 
     async def arch(shell):
@@ -199,7 +199,7 @@ def _preflight_passes(monkeypatch, service, module, *, preflight_s: float = 0.0)
 
     async def ssh(shell, command):
         commands.append(command)
-        return "captured"
+        return module.SSHCapture(stdout="captured", exit_status=exit_status)
 
     monkeypatch.setattr(service, "_run_ssh_command", ssh)
     monkeypatch.setattr(service, "_verifyx_command", lambda *a: f"timeout -k 10 {a[5]} run &")
@@ -219,7 +219,7 @@ async def test_the_remote_deadline_is_what_the_budget_leaves_after_the_preflight
         deadline_monotonic=time.monotonic() + 250.5,
     )
 
-    assert result == "captured"
+    assert result.stdout == "captured"
     assert commands == ["timeout -k 10 250 run &"] or commands == ["timeout -k 10 249 run &"]
 
 
@@ -253,3 +253,48 @@ def test_both_remote_watchdogs_take_the_given_seconds():
     assert "timeout -k 10 137 " in command
     assert " 137 /usr/bin/python3 /root/app/src/verifyx_executor.py" in command
     assert " 600 " not in command
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bounded", [True, False])
+async def test_a_run_the_host_watchdog_stopped_is_the_deadline_never_a_crash(monkeypatch, bounded):
+    # review at e79ac9c: exit 124 of the watchdog can reach the validator just before its own timer
+    from neurons.validators.src.services import verifyx_validation_service as module
+
+    service = module.VerifyXValidationService.__new__(module.VerifyXValidationService)
+    _preflight_passes(monkeypatch, service, module, exit_status=124)
+
+    result = await service.validate_verifyx_and_process_job(
+        shell=None, executor_info=None, default_extra={}, machine_spec={}, run_dir=".verifyx-t",
+        deadline_monotonic=time.monotonic() + 250 if bounded else None,
+    )
+
+    # bounded: the cut, reported as no task time by the caller; unbounded: judged as before
+    assert (result is None) is bounded
+
+
+@pytest.mark.asyncio
+async def test_the_budget_reads_the_clock_after_the_probe_lookup(context_factory, monkeypatch):
+    # review at e79ac9c: 660.5 s before a 1 s lookup that says not due leaves 599.5 s: bounded, never the full run
+    clock = {"left": 660.5}
+    monkeypatch.setattr(verifyx_check, "task_seconds_left", lambda ctx: clock["left"])
+
+    async def due(ctx):
+        clock["left"] -= 1
+        return False
+
+    monkeypatch.setattr(verifyx_check, "rental_probe_due", due)
+    timeouts = []
+    wait_for = asyncio.wait_for
+
+    async def spy(aw, timeout):
+        timeouts.append(timeout)
+        return await wait_for(aw, timeout)
+
+    monkeypatch.setattr(verifyx_check.asyncio, "wait_for", spy)
+    service = _Probe(_probe(760.0))
+
+    await VerifyXCheck().run(_ctx(context_factory, service, _known(500.0)))
+
+    assert timeouts == [pytest.approx(599.5)]
+    assert "deadline_monotonic" in service.calls[0]

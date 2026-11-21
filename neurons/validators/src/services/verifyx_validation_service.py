@@ -510,6 +510,10 @@ class VerifyXValidationService:
             logger.info(_m("VerifyX Python Script Command", extra=get_extra_info(challenge.log_extra)))
 
             ssh_capture = await self._run_ssh_command(shell, command)
+            if deadline_monotonic is not None and ssh_capture.transport_error is None and ssh_capture.exit_status == 124:
+                # the host's watchdog for this deadline stopped the run (`timeout` and _PYTHON_WATCHDOG exit 124):
+                # the validator's own cut, the same as the local timer's, never a crash of the executor (review)
+                return None
             return self.evaluate_verifyx_capture(challenge, ssh_capture, default_extra)
 
         except Exception as e:
