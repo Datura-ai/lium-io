@@ -214,6 +214,7 @@ from services.rental_docker_sdk import (
     ContainerOfAnotherRegistration,
     ContainerRunSpec,
     ContainerStateSnapshot,
+    created_container_id,
     docker_size,
     ContainerUlimit,
     DeviceMount,
@@ -2173,6 +2174,15 @@ class _EditSwap:
         ids_by_name = {fields[0]: fields[1] for fields in listing if len(fields) > 1}
         kept = sorted(name for name in names if name.startswith(kept_prefix))
         names -= set(kept)
+        if self.owner is not None:
+            # each kept copy is checked by its own ID before it can be recovered, written into or removed: the copy
+            # under the pod's kept prefix may be another registration's
+            kept = [
+                name
+                for name in kept
+                if name in ids_by_name
+                and _made_for(await self._run(_registration_label_command(ids_by_name[name])), self.owner)
+            ]
         # a crashed edit that parked under the kept name: the newest kept one is then the pod's only copy
         recover_kept = kept[-1] if self.container_name not in names and parked not in names and kept else None
         # the container this edit parks: the pod's, or the one recovered from a crashed edit below
@@ -4051,7 +4061,12 @@ class DockerService:
                 flatten_lease=flatten_lease,
                 pod_id=pod_id,
             )
-            await apply_host_memory_guard(ssh_client, default_extra)
+            try:
+                await apply_host_memory_guard(ssh_client, default_extra)
+            except BaseException as exc:
+                if container_id:  # the create's cleanup removes this container by its ID (created_container_id)
+                    exc.rental_container_id = container_id
+                raise
             return container_id
         finally:
             for lease in flatten_lease:
@@ -4167,15 +4182,19 @@ class DockerService:
                     # the SDK's transport retry met the same name on another image (a flattened copy)
                     or isinstance(exc, ContainerNameTakenOnRetry)
                 ):
-                    # every same-name conflict is decided here: without the one checked removal (already spent, or
-                    # another create of the pod running) the container is kept, never left to a cleanup by name
-                    if own_leftover_removed or pod_id is None or not inflight_creates.is_only_create_on_any_registration(pod_id):
-                        raise _SameNameContainerKept(str(exc)) from exc
+                    # every same-name conflict is decided here. The owner is read first, so another registration's
+                    # container is always reported as such; then, without the one checked removal (already spent, or
+                    # another create of the pod running) the container is kept, never left to a cleanup by name.
                     leftover = await self._own_leftover_container(
                         docker_client, container_name, run_spec.labels.get(LIUM_EXECUTOR_ID_LABEL)
                     )
-                    # another create may have registered (and started the pod) during the status read
-                    if leftover is None or not inflight_creates.is_only_create_on_any_registration(pod_id):
+                    # read after the inspect: another create may have registered (and started the pod) during it
+                    if (
+                        leftover is None
+                        or own_leftover_removed
+                        or pod_id is None
+                        or not inflight_creates.is_only_create_on_any_registration(pod_id)
+                    ):
                         raise _SameNameContainerKept(str(exc)) from exc
                     own_leftover_removed = True
                     attempt += 1
@@ -4212,7 +4231,7 @@ class DockerService:
                         # name and the retry would fail on a 409 name conflict
                         await self._remove_failed_rental_container_for_retry(
                             docker_client=docker_client,
-                            container_name=container_name,
+                            container_name=created_container_id(exc),
                             default_extra=default_extra,
                             warning_event="STALE_MOUNT_RETRY_RM_FAILED",
                         )
@@ -4237,7 +4256,7 @@ class DockerService:
                     if flat_image is not None:
                         await self._remove_failed_rental_container_for_retry(
                             docker_client=docker_client,
-                            container_name=container_name,
+                            container_name=created_container_id(exc),
                             default_extra=default_extra,
                             warning_event="FLATTEN_RETRY_RM_FAILED",
                         )
@@ -4259,7 +4278,7 @@ class DockerService:
                         attempt += 1
                         await self._remove_failed_rental_container_for_retry(
                             docker_client=docker_client,
-                            container_name=container_name,
+                            container_name=created_container_id(exc),
                             default_extra=default_extra,
                             warning_event="PORT_RETRY_STALE_RM_FAILED",
                         )
@@ -4295,7 +4314,7 @@ class DockerService:
                         attempt += 1
                         await self._remove_failed_rental_container_for_retry(
                             docker_client=docker_client,
-                            container_name=container_name,
+                            container_name=created_container_id(exc),
                             default_extra=default_extra,
                             warning_event="PORT_COLLISION_STALE_RM_FAILED",
                         )
@@ -4319,7 +4338,7 @@ class DockerService:
                     await asyncio.sleep(_PORT_ALLOCATED_RETRY_SLEEP_SEC)
                     await self._remove_failed_rental_container_for_retry(
                         docker_client=docker_client,
-                        container_name=container_name,
+                        container_name=created_container_id(exc),
                         default_extra=default_extra,
                         warning_event="PORT_RETRY_STALE_RM_FAILED",
                     )
@@ -4407,12 +4426,15 @@ class DockerService:
         self,
         *,
         docker_client: RentalDockerSdkClient,
-        container_name: str,
+        container_name: str | None,
         default_extra: dict,
         warning_event: str,
         force: bool = True,
     ) -> bool:
-        """False when the removal failed (logged as `warning_event`)."""
+        """False when the removal failed (logged as `warning_event`). With no `container_name` (no container proven to
+        be this create's), nothing is removed: a container under the pod's name may be another create's."""
+        if container_name is None:
+            return True
         try:
             await run_logged_rental_docker_sdk_operation(
                 operation="remove_failed_container_for_retry",
@@ -7386,17 +7408,16 @@ class DockerService:
 
         ``container_id``, once the create has one, is what gets read and removed: a concurrent
         retry for the same pod can be running its own container under ``container_name``.
-        Without an id, the name is removed only while no other create for ``pod_id`` is live.
+        Without an id, a create for ``pod_id`` removes no container: the name may be another create's.
         ``keep_container`` leaves the container alone: a re-sent create met the pod already running.
 
         DAH-2703: unproven cases (SSH dead, diagnostics failed) report False — never accuse a host
         on missing evidence.
         """
         container_missing = False
-        # without an id, the container under this name may be another live create's: leave it to that create
-        owns_container = not keep_container and (
-            container_id is not None or pod_id is None or inflight_creates.is_only_create_on_any_registration(pod_id)
-        )
+        # without an id, the container under the pod's name may be another create's, now or once it finishes: never
+        # removed by name
+        owns_container = not keep_container and (container_id is not None or pod_id is None)
         try:
             if owns_container:
                 # DAH-2395: read the death evidence before `rm -fv` destroys it —
@@ -9217,17 +9238,20 @@ class DockerService:
     # ------------------------------------------------------------------
     # DAH-2211 — custom-dockerfile pod build helpers
     # ------------------------------------------------------------------
+    # Every build names its image, scratch path and DinD container after its pod and its own create attempt
+    # (`<pod id>.<attempt>`): two creates of one pod never share them, so neither's teardown or cleanup reaches the
+    # other's. The orphan sweep reads the pod id before the ".".
     @staticmethod
-    def _custom_build_image_tag(pod_id: str) -> str:
-        return f"lium-build-{pod_id}"
+    def _custom_build_image_tag(pod_id: str, attempt: str) -> str:
+        return f"lium-build-{pod_id}.{attempt}"
 
     @staticmethod
-    def _custom_build_scratch_dir(pod_id: str) -> str:
-        return f"/tmp/lium-build-{pod_id}"
+    def _custom_build_scratch_dir(pod_id: str, attempt: str) -> str:
+        return f"/tmp/lium-build-{pod_id}.{attempt}"
 
     @staticmethod
-    def _dind_container_name(pod_id: str) -> str:
-        return f"lium-dind-build-{pod_id}"
+    def _dind_container_name(pod_id: str, attempt: str) -> str:
+        return f"lium-dind-build-{pod_id}.{attempt}"
 
     @staticmethod
     def _dind_firewall_helper_names(dind_name: str) -> tuple[str, str]:
@@ -9492,11 +9516,12 @@ class DockerService:
         payload: ContainerCreateRequest,
         log_tag: str,
         default_extra: dict,
+        build_attempt: str | None = None,
     ) -> CustomBuildOutcome:
         """Build a custom image from `payload.dockerfile_content` on the executor.
 
         Returns a CustomBuildOutcome. On success `ok` is True and the built image tag is
-        `_custom_build_image_tag(pod_id)`. On failure the caller raises CustomBuildFailed so the
+        `_custom_build_image_tag(pod_id, build_attempt)`. On failure the caller raises CustomBuildFailed so the
         CCF `UnknownError` path used by today's pull-failure carries `failure_step` and `log_tail`:
         the last lines the build printed (docker_build), the timeout in seconds (build_timeout),
         or a fixed one-line reason for build_export and the setup steps (never their stderr).
@@ -9505,8 +9530,9 @@ class DockerService:
 
         started = time.monotonic()
         pod_id = payload.pod_id
-        image_tag = self._custom_build_image_tag(pod_id)
-        dind_name = self._dind_container_name(pod_id)
+        build_attempt = build_attempt or secrets.token_hex(4)
+        image_tag = self._custom_build_image_tag(pod_id, build_attempt)
+        dind_name = self._dind_container_name(pod_id, build_attempt)
         ctx = self._DIND_BUILD_CONTEXT
         timeout_s = int(settings.CUSTOM_DOCKERFILE_BUILD_TIMEOUT_SECONDS)
         ready_timeout_s = int(settings.CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS)
@@ -9583,35 +9609,35 @@ class DockerService:
             )
             if inflight_creates.is_only_create_on_any_registration(pod_id):
                 # DAH-5437: a create resumed after a connector restart meets the build container its cut-off
-                # attempt left under this pod's name; no other create of this pod runs, so it is ours to replace.
+                # attempt left for this pod; no other create of this pod runs, so it is ours to replace.
                 # The full teardown, so the egress rules of the old DinD's IP go with it.
-                old_ip: str | None = None
-                try:
-                    ip_res = await ssh_client.run(
-                        "/usr/bin/docker inspect -f "
-                        "'{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "
-                        f"{shlex.quote(dind_name)}",
-                        check=False,
-                        timeout=setup_timeout_s,
-                    )
-                    if ip_res.exit_status == 0:
-                        old_ip = str(ipaddress.ip_address((ip_res.stdout or "").strip()))
-                except (asyncio.TimeoutError, ValueError):
-                    pass
-                if not await self._teardown_dind_build(
-                    ssh_client=ssh_client,
-                    dind_name=dind_name,
-                    dind_image=dind_image,
-                    dind_ip=old_ip,
-                    cidrs=cidrs,
-                    default_extra=default_extra,
-                ):
-                    # the old DinD still holds the name, so `docker run --name` would fail; the finally's
-                    # teardown tries it once more with its IP, so its rules go only once it is stopped
-                    dind_ip = old_ip
-                    return CustomBuildOutcome(
-                        False, "build_dind_start", "the previous build container could not be stopped"
-                    )
+                for old_name in await self._leftover_dind_builds(ssh_client, pod_id, setup_timeout_s):
+                    old_ip: str | None = None
+                    try:
+                        ip_res = await ssh_client.run(
+                            "/usr/bin/docker inspect -f "
+                            "'{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "
+                            f"{shlex.quote(old_name)}",
+                            check=False,
+                            timeout=setup_timeout_s,
+                        )
+                        if ip_res.exit_status == 0:
+                            old_ip = str(ipaddress.ip_address((ip_res.stdout or "").strip()))
+                    except (asyncio.TimeoutError, ValueError):
+                        pass
+                    if not await self._teardown_dind_build(
+                        ssh_client=ssh_client,
+                        dind_name=old_name,
+                        dind_image=dind_image,
+                        dind_ip=old_ip,
+                        cidrs=cidrs,
+                        default_extra=default_extra,
+                    ):
+                        # still running with its egress rules: no second build beside it; it stays for the next
+                        # create of the pod (or the orphan sweep) to stop
+                        return CustomBuildOutcome(
+                            False, "build_dind_start", "the previous build container could not be stopped"
+                        )
             # `timeout(1)` on the executor kills the `docker run` (and so the
             # image pull) when it outlives the bound: asyncssh's own `timeout=`
             # only stops waiting, the remote command would run on. The
@@ -10031,6 +10057,27 @@ class DockerService:
         )
         return False
 
+    @staticmethod
+    async def _leftover_dind_builds(
+        ssh_client: asyncssh.SSHClientConnection, pod_id: str, timeout_s: int
+    ) -> list[str]:
+        """The pod's build containers an earlier create left (any attempt, and the name used before attempts were
+        named), without their firewall helpers. Empty when the listing fails: the build then starts beside them."""
+        from services.task.checks.custom_build_orphan_sweep import BUILD_DIND_PREFIX, dind_build_pod_id
+
+        name_filter = shlex.quote(f"name=^{BUILD_DIND_PREFIX}{pod_id}")
+        try:
+            listed = await ssh_client.run(
+                f"/usr/bin/docker ps -a --format '{{{{.Names}}}}' --filter {name_filter}",
+                check=False,
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError:
+            return []
+        if listed.exit_status != 0:
+            return []
+        return [name for name in (listed.stdout or "").split() if dind_build_pod_id(name) == pod_id]
+
     async def _teardown_dind_build(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -10149,22 +10196,35 @@ class DockerService:
         ssh_client: asyncssh.SSHClientConnection,
         pod_id: str,
         default_extra: dict,
+        build_attempt: str | None = None,
     ) -> None:
         """Always-on inline cleanup (Phase 3.4(i)).
 
-        Removes the per-pod built image and scratch directory. Best-effort —
+        Removes the built image and scratch directory of one create attempt (`build_attempt`), or, on the pod's
+        delete (None), of every attempt of the pod and the names used before attempts were named. Best-effort —
         any failure is logged but never raised. Safe to call for non-custom
         pods (no-op when the artifacts do not exist).
         """
-        image_tag = self._custom_build_image_tag(pod_id)
-        scratch_dir = self._custom_build_scratch_dir(pod_id)
+        if build_attempt is not None:
+            image_tag = self._custom_build_image_tag(pod_id, build_attempt)
+            images = shlex.quote(image_tag)
+            scratch = shlex.quote(self._custom_build_scratch_dir(pod_id, build_attempt))
+        else:
+            image_tag = f"lium-build-{pod_id}"
+            # the pod's own tags only: the "." ends the pod id, so no other pod's prefix matches
+            images = (
+                f"$(/usr/bin/docker images --format '{{{{.Repository}}}}' "
+                f"| awk -v p={shlex.quote(image_tag)} '$0 == p || index($0, p \".\") == 1' | sort -u)"
+            )
+            scratch_root = shlex.quote(f"/tmp/{image_tag}")
+            scratch = f"{scratch_root} {scratch_root}.*"
         try:
             await ssh_client.run(
-                f"/usr/bin/docker image rm {shlex.quote(image_tag)} 2>/dev/null || true",
+                f"/usr/bin/docker image rm {images} 2>/dev/null || true",
                 check=False,
             )
             await ssh_client.run(
-                f"/usr/bin/rm -rf {shlex.quote(scratch_dir)}",
+                f"/usr/bin/rm -rf {scratch}",
                 check=False,
             )
         except Exception as exc:  # noqa: BLE001 — best-effort
@@ -10565,6 +10625,8 @@ class DockerService:
             dockerfile_content_raw is not None
             and dockerfile_content_raw.strip() != ""
         )
+        # names this create's build artifacts apart from any other create of the pod
+        build_attempt = secrets.token_hex(4)
         if dockerfile_content_raw is not None and not is_custom_build:
             current_step = "build_input_empty"
             log_text = _m(
@@ -11178,6 +11240,7 @@ class DockerService:
                         payload=payload,
                         log_tag=log_tag,
                         default_extra=default_extra,
+                        build_attempt=build_attempt,
                     )
                     if not build_ok:
                         # Best-effort scratch dir cleanup; image is most likely
@@ -11186,6 +11249,7 @@ class DockerService:
                             ssh_client=ssh_client,
                             pod_id=payload.pod_id,
                             default_extra=default_extra,
+                            build_attempt=build_attempt,
                         )
                         # Raise so the existing except-Exception block in
                         # create_container emits the CCF FailedContainerRequest
@@ -11208,7 +11272,7 @@ class DockerService:
                         raise CustomBuildFailed(current_step, build_log_tail)
                     # Override docker_image so the downstream `docker run` uses
                     # the locally built tag for this branch only.
-                    effective_image = self._custom_build_image_tag(payload.pod_id)
+                    effective_image = self._custom_build_image_tag(payload.pod_id, build_attempt)
                     default_extra = {**default_extra, "docker_image": effective_image}
                     payload.docker_image = effective_image
                     profilers.append(ProfilerStep.since(ProfilerStepName.CUSTOM_DOCKER_BUILD, prev_timestamp))
@@ -12165,6 +12229,8 @@ class DockerService:
 
                         raise Exception("Run docker run command but container is not running")
                 except Exception as docker_run_error:
+                    # a start that failed after the create still names the container it made (or adopted)
+                    container_id = container_id or created_container_id(docker_run_error)
                     container_missing = await self.cleanup_failed_container_creation(
                         ssh_client=ssh_client,
                         default_extra=default_extra,
@@ -12176,13 +12242,13 @@ class DockerService:
                         keep_container=isinstance(docker_run_error, _SameNameContainerKept),
                     )
                     container_vanished = container_created and container_missing
-                    # DAH-2211: inline cleanup of custom-build artifacts on docker_run failure; named by pod, so
-                    # left to another live create of the same pod (F-78)
-                    if is_custom_build and inflight_creates.is_only_create_on_any_registration(payload.pod_id):
+                    # DAH-2211: inline cleanup of this create's own custom-build artifacts on docker_run failure
+                    if is_custom_build:
                         await self._cleanup_custom_build_artifacts(
                             ssh_client=ssh_client,
                             pod_id=payload.pod_id,
                             default_extra=default_extra,
+                            build_attempt=build_attempt,
                         )
                     if isinstance(
                         docker_run_error, _FillerRefusedForCustomerCreate
@@ -12528,12 +12594,13 @@ class DockerService:
                         pod_id=payload.pod_id,
                     )
                     container_vanished = container_created and container_missing
-                    # DAH-2211: inline cleanup of custom-build artifacts on post-run failure.
+                    # DAH-2211: inline cleanup of this create's own custom-build artifacts on post-run failure.
                     if is_custom_build:
                         await self._cleanup_custom_build_artifacts(
                             ssh_client=ssh_client,
                             pod_id=payload.pod_id,
                             default_extra=default_extra,
+                            build_attempt=build_attempt,
                         )
                     if isinstance(post_run_exc, ContainerGoneBeforeExec):
                         # The container left between `docker run` and the end of the bootstrap.

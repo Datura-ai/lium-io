@@ -1875,3 +1875,29 @@ async def test_an_edit_parks_the_pods_container_only_when_made_for_its_registrat
             await swap.park()
         assert _docker(ssh.commands, "rename") == [] and _docker(ssh.commands, "stop") == []
         assert _docker(ssh.commands, "rm") == []
+
+
+@pytest.mark.asyncio
+async def test_an_edit_leaves_another_registrations_kept_copy_alone():
+    """Review on lium-io#2394: each kept copy under the pod's kept prefix is checked by its own ID before the edit
+    recovers, writes into or removes it; another registration's copy is not this edit's."""
+    from services.docker_service import _EditSwap
+
+    ssh = _ssh_recording()
+    foreign = "kept_unmounted_abc_1700000000"
+    ssh.kept = [foreign]
+    answer = ssh.run.side_effect
+
+    def side(cmd, *args, **kwargs):
+        if cmd.startswith("/usr/bin/docker inspect --type container -f") and "io.lium.executor_id" in cmd:
+            ssh.commands.append(cmd)
+            return _ssh_result(stdout="miner-b:ex-2\n" if f"id-{foreign}" in cmd else "miner-a:ex-1\n")
+        return answer(cmd, *args, **kwargs)
+
+    ssh.run.side_effect = side
+    swap = _EditSwap(ssh, "pod_abc", {}, redis=AsyncMock(), executor_id="ex-1", owner="miner-a:ex-1")
+
+    assert await swap.park()
+    touched = [cmd for cmd in ssh.commands if foreign in cmd and "io.lium.executor_id" not in cmd]
+    verbs = ("docker rm", "docker cp", "docker rename", "docker start")
+    assert not any(verb in cmd for cmd in touched for verb in verbs)

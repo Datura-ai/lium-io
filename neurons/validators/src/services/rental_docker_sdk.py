@@ -114,6 +114,19 @@ class RentalDockerOperationError(RuntimeError):
     """Raised when Docker SDK reports a rental Docker operation failure."""
 
 
+def created_container_id(exc: BaseException | None) -> str | None:
+    """The ID of the container `run_container` made or adopted before it failed (a failed start), or None when the
+    failure came before any container was this create's; read through the wrapping errors' causes."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        container_id = getattr(exc, "rental_container_id", None)
+        if container_id:
+            return container_id
+        exc = exc.__cause__ or exc.__context__
+    return None
+
+
 class ContainerOfAnotherRegistration(RentalDockerOperationError):
     """A same-name container on the daemon carries another registration's label: it is never adopted or removed."""
 
@@ -1199,19 +1212,24 @@ class RentalDockerSdkClient:
                 adopted_id = self._wait_for_inflight_create_sync(spec)
                 if adopted_id is None:
                     raise
-        if spec.before_start is not None:
-            spec.before_start(
-                [
-                    name.lstrip("/")
-                    for container in self._api_client.containers(all=True)
-                    for name in container.get("Names") or ()
-                ]
-            )
         container_id = created.get("Id") if isinstance(created, dict) else adopted_id
         container_id = container_id if isinstance(container_id, str) and container_id else None
-        # A create with a start check starts the container it checked, by ID, never a same-name successor.
-        # Others keep the name: a failed start leaves no ID for the cleanup, which then removes by name.
-        self._api_client.start(container_id if spec.before_start is not None and container_id else spec.name)
+        try:
+            if spec.before_start is not None:
+                spec.before_start(
+                    [
+                        name.lstrip("/")
+                        for container in self._api_client.containers(all=True)
+                        for name in container.get("Names") or ()
+                    ]
+                )
+            # A create with a start check starts the container it checked, by ID, never a same-name successor.
+            self._api_client.start(container_id if spec.before_start is not None and container_id else spec.name)
+        except BaseException as exc:
+            # the caller removes only a container this create made or adopted, by its ID (created_container_id)
+            if container_id:
+                exc.rental_container_id = container_id
+            raise
         return container_id
 
     def _wait_for_inflight_create_sync(self, spec: ContainerRunSpec) -> str | None:

@@ -85,7 +85,8 @@ def _removed_names(ssh_client) -> list[str]:
     # the containers and volumes every `docker rm` / `docker volume rm` the create sent targeted, in order
     commands = [c.args[0] for c in ssh_client.run.await_args_list if c.args]
     removals = [cmd for cmd in commands if cmd.startswith(("/usr/bin/docker rm", "/usr/bin/docker volume rm"))]
-    return [word for cmd in removals for word in shlex.split(cmd) if word.startswith(("filler_", "pod_", "volume_"))]
+    targets = ("filler_", "filler-container", "pod_", "volume_")
+    return [word for cmd in removals for word in shlex.split(cmd) if word.startswith(targets)]
 
 
 @pytest.fixture
@@ -121,8 +122,10 @@ async def test_filler_create_beside_an_unlisted_pod_refuses_and_removes_only_the
     assert result.error_code == FailedContainerErrorCodes.RentingInProgress
     assert result.failure_step == "customer_create_in_flight"
     docker_api.start.assert_not_called()
-    # once created, the filler's container and volume are removed and its power cap lifted; the customer's pod never
-    assert _removed_names(ssh_client) == ([] if pod_listed_before_the_create else [f"filler_{filler.pod_id}", f"volume_{filler.pod_id}"])
+    # once created, the filler's container (by the ID its create returned) and volume are removed and its power cap
+    # lifted; the customer's pod never
+    removed = [] if pod_listed_before_the_create else ["filler-container", f"volume_{filler.pod_id}"]
+    assert _removed_names(ssh_client) == removed
     assert restore_power.await_count == (0 if pod_listed_before_the_create else 1)
     refusals = [r.msg.to_full_string() for r in caplog.records if "filler create refused" in r.getMessage()]
     assert [r.startswith("filler create refused: unlisted pod_* on the node >>> ") and _CUSTOMER_POD in r for r in refusals] == [True]

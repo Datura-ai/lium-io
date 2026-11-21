@@ -95,3 +95,35 @@ async def test_a_later_pending_pod_write_keeps_a_build_past_30_minutes():
 
     await service.remove_pending_pod("miner", "exec", "pod-other")
     assert [i["pod_id"] for i in await stored()] == ["pod-long-build", "pod-new"]
+
+
+def test_an_attempt_named_build_artifact_reads_as_its_pods():
+    # review on lium-io#2394: build artifacts are named `<pod id>.<create attempt>`; the sweep keeps an active pod's
+    from neurons.validators.src.services.task.checks.custom_build_orphan_sweep import (
+        dind_build_pod_id,
+        dind_container_pod_id,
+    )
+
+    assert dind_container_pod_id("lium-dind-build-pod-1.ab12-fw-apply") == "pod-1"
+    assert dind_build_pod_id("lium-dind-build-pod-1.ab12") == "pod-1"
+    assert dind_build_pod_id("lium-dind-build-pod-1.ab12-fw-remove") is None
+    assert dind_build_pod_id("lium-dind-build-pod-1") == "pod-1"
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_keeps_an_active_pods_attempt_named_image_and_scratch():
+    from neurons.validators.src.services.task.checks.custom_build_orphan_sweep import CustomBuildOrphanSweepCheck
+
+    async def run(cmd, *args, **kwargs):
+        stdout = ""
+        if "docker images" in cmd:
+            stdout = "lium-build-pod-1.ab12:latest\nlium-build-pod-2.cd34:latest\n"
+        elif "ls -1d" in cmd:
+            stdout = "/tmp/lium-build-pod-1.ab12\n/tmp/lium-build-pod-2.cd34\n"
+        return SimpleNamespace(exit_status=0, stdout=stdout, stderr="")
+
+    ssh = SimpleNamespace(run=run)
+    check = CustomBuildOrphanSweepCheck.__new__(CustomBuildOrphanSweepCheck)
+
+    assert await check._list_orphan_images(ssh, {"pod-1"}) == ["lium-build-pod-2.cd34:latest"]
+    assert await check._list_orphan_scratch_dirs(ssh, {"pod-1"}) == ["/tmp/lium-build-pod-2.cd34"]

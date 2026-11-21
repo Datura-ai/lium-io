@@ -44,7 +44,7 @@ SWEEP_INTERVAL_SECONDS = 6 * 60 * 60
 BUILD_IMAGE_PREFIX = "lium-build-"
 BUILD_SCRATCH_PREFIX = "/tmp/lium-build-"
 # DAH-2211 — internet-enabled builds run in a throwaway sysbox DinD container
-# named ``lium-dind-build-{pod_id}`` (see ``docker_service._dind_container_name``).
+# named ``lium-dind-build-{pod_id}.{attempt}`` (see ``docker_service._dind_container_name``).
 # Inline teardown removes it; this sweep mops up the validator-crashed-mid-build
 # leftover so a stale container does not pin CPU/mem/disk on the executor host.
 BUILD_DIND_PREFIX = "lium-dind-build-"
@@ -67,7 +67,19 @@ def dind_container_pod_id(name: str) -> str | None:
         if pod_id.endswith(suffix):
             pod_id = pod_id[: -len(suffix)]
             break
-    return pod_id or None
+    return _pod_id_of(pod_id)
+
+
+def dind_build_pod_id(name: str) -> str | None:
+    """Pod id of a ``lium-dind-build-*`` build container itself, not of its firewall helpers."""
+    if name.endswith(BUILD_DIND_HELPER_SUFFIXES):
+        return None
+    return dind_container_pod_id(name)
+
+
+def _pod_id_of(name_rest: str) -> str | None:
+    # `<pod id>.<create attempt>` (docker_service._custom_build_image_tag), or a bare pod id named before attempts
+    return name_rest.split(".", 1)[0] or None
 
 
 class CustomBuildOrphanSweepCheck:
@@ -124,7 +136,7 @@ class CustomBuildOrphanSweepCheck:
             repo = line.split(":", 1)[0]
             if not repo.startswith(BUILD_IMAGE_PREFIX):
                 continue
-            pod_id = repo[len(BUILD_IMAGE_PREFIX):]
+            pod_id = _pod_id_of(repo[len(BUILD_IMAGE_PREFIX):])
             if pod_id in active_pod_ids:
                 continue
             orphans.append(line)
@@ -145,7 +157,7 @@ class CustomBuildOrphanSweepCheck:
             path = raw.strip()
             if not path.startswith(BUILD_SCRATCH_PREFIX):
                 continue
-            pod_id = path[len(BUILD_SCRATCH_PREFIX):]
+            pod_id = _pod_id_of(path[len(BUILD_SCRATCH_PREFIX):])
             if not pod_id or pod_id in active_pod_ids:
                 continue
             orphans.append(path)

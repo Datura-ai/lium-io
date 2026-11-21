@@ -654,6 +654,39 @@ async def test_run_container_maps_spec_to_docker_sdk_api():
     assert api_client.started == ["pod_test"]
 
 
+@pytest.mark.asyncio
+async def test_a_start_failure_names_the_container_this_create_made():
+    # a failed start names the container it made, so the create's cleanup never falls back to removal by name
+    api_client = FakeApiClient()
+
+    def fail_start(container_name):
+        raise APIError("500 Server Error: start failed")
+
+    api_client.start = fail_start
+    client = RentalDockerSdkClient(api_client)
+
+    with pytest.raises(rental_docker_sdk.RentalDockerOperationError) as failure:
+        await client.run_container(ContainerRunSpec(image="img", name="pod_test"))
+
+    assert rental_docker_sdk.created_container_id(failure.value) == "container-id"
+
+
+@pytest.mark.asyncio
+async def test_a_failure_before_the_create_names_no_container():
+    api_client = FakeApiClient()
+
+    def fail_create(**kwargs):
+        raise APIError("500 Server Error: network inspect failed")
+
+    api_client.create_container = fail_create
+    client = RentalDockerSdkClient(api_client)
+
+    with pytest.raises(rental_docker_sdk.RentalDockerOperationError) as failure:
+        await client.run_container(ContainerRunSpec(image="img", name="pod_test"))
+
+    assert rental_docker_sdk.created_container_id(failure.value) is None
+
+
 # --- DAH-3199: a rental joins the ICC-off bridge, never docker0 ---
 
 
