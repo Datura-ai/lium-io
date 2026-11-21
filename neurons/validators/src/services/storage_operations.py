@@ -535,7 +535,11 @@ async def cancel_storage_operation(
         f'if test -z "$pid" && ! test -s {start_path}; then attempt=0; '
         f'while test -z "$pid" && {{ test -e {spec_path} || spec_alive; }} && test "$attempt" -lt 100; do '
         f"sleep 0.25; attempt=$((attempt + 1)); pid=$(cat {pid_path} 2>/dev/null); done; "
-        'test -z "$pid" && spec_alive && exit 3; fi; '
+        # the failure still stops and removes the helper; no PID was verified, so nothing is signalled
+        'if test -z "$pid" && spec_alive; then '
+        f"/usr/bin/docker stop --time 5 {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
+        f"/usr/bin/docker rm -f -- {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
+        "exit 3; fi; fi; "
         # a PID recorded without a start time comes from an earlier release, whose runner watches the old marker
         f'if test -n "$pid" && ! test -s {start_path}; then '
         f"touch {shlex.quote(str(files.legacy_cancel))} || marked=4; fi; "

@@ -914,10 +914,17 @@ async def test_a_cancel_fails_while_an_earlier_release_wrapper_runs_without_a_pi
     report = AsyncMock(return_value=True)
     monkeypatch.setattr(storage_operations, "_report_cancelled", report)
     files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    # review at 64c448a: the failed cancel still stops and removes the helper, which holds the credentials
+    docker_log = tmp_path / "docker.log"
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text(f'#!/bin/sh\necho "$*" >> {docker_log}\n')
+    fake_docker.chmod(0o755)
+    helper = storage_operations.storage_helper_name(OPERATION_ID)
     wrapper = subprocess.Popen(["sh", "-c", f"sleep 30; : --spec {files.spec}"])
     try:
         with pytest.raises(storage_operations.StorageOperationLaunchError):
-            await storage_operations.cancel_storage_operation(_local_ssh(), OPERATION_ID)
+            await storage_operations.cancel_storage_operation(_local_ssh(str(fake_docker)), OPERATION_ID)
         report.assert_not_awaited()
+        assert docker_log.read_text().splitlines() == [f"stop --time 5 {helper}", f"rm -f -- {helper}"]
     finally:
         wrapper.kill()
