@@ -43,8 +43,8 @@ logger = logging.getLogger(__name__)
 DISK_PROBE_BYTES = 256 * 1024 * 1024
 DISK_TIMEOUT_SECONDS = 60
 # the 2 s busy window, the disk-pressure reading (2 s snapshots, syncfs poll cap), the disk probe (direct, then
-# buffered), both fetches and a second container start
-COMMAND_TIMEOUT_SECONDS = 270 + SNAPSHOT_SECONDS + SYNCFS_POLL_SECONDS
+# buffered), both fetches, the upload and a second container start
+COMMAND_TIMEOUT_SECONDS = 300 + SNAPSHOT_SECONDS + SYNCFS_POLL_SECONDS
 PROBE_SKIPPED_MARKER = "lium_dp_skipped"
 # a reading needs its full command timeout plus the checks after it; started later, the task deadline cuts it off
 # and the node's whole cycle is dropped without a result (316223c6, 30 Oct 17:49Z)
@@ -609,7 +609,7 @@ class RentedThroughputCheck:
             settings.DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED and pressure is not None and pressure.pressure
         )
 
-        judged = await ContainerDownloadSpeedCheck()._judge(endpoints)
+        judged = await ContainerDownloadSpeedCheck()._judge(ctx, endpoints)
         # a bridge fallback (rentals network not inspectable) did not measure the renter's path
         off_rentals = not endpoints or any(r.network != RENTAL_NETWORK_NAME for r in endpoints)
         net_unsure = net_busy or net_mbps is None or off_rentals
@@ -657,6 +657,7 @@ class RentedThroughputCheck:
             "network_verdict": net,
             "disk_verdict": disk_side,
             "min_mbps": settings.CONTAINER_DOWNLOAD_SPEED_MIN_MBPS,
+            "min_upload_mbps": settings.CONTAINER_UPLOAD_SPEED_MIN_MBPS,
             "disk_min_mb_per_s": settings.RENTED_THROUGHPUT_DISK_MIN_MB_PER_S,
         }
         if net == "fail":

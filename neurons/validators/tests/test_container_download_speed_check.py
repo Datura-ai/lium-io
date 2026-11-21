@@ -32,16 +32,21 @@ def line(ep: str, got: int, secs: float, rc: int, err: str = "") -> str:
 
 
 RENTALS = "lium_dl_net name=lium-rentals\n"
+# the pod's upload: 16 MiB posted in 1.0 s = 134 Mbps
+UP = line("cf_up", CAP_BYTES, 1.0, 0)
 BRIDGE = "lium_dl_net name=bridge\n"  # a node with no rental yet has no lium-rentals network
 # 16 MiB in 1.0 s = 134 Mbps on both
-FAST = RENTALS + line("pypi", CAP_BYTES, 1.0, 0) + line("hf", CAP_BYTES, 1.0, 0)
+FAST = RENTALS + line("pypi", CAP_BYTES, 1.0, 0) + line("hf", CAP_BYTES, 1.0, 0) + UP
 # a slow link: both endpoints crawl, 1.8 MB in the 30 s bound
-SLOW = RENTALS + line("pypi", 1_800_000, 30.0, 143) + line("hf", 1_800_000, 30.0, 143)
+SLOW = RENTALS + line("pypi", 1_800_000, 30.0, 143) + line("hf", 1_800_000, 30.0, 143) + UP
 # only PyPI's CDN crawls while Hugging Face reads fast: the CDN path, not the node
-PYPI_ONLY_SLOW = RENTALS + line("pypi", 1_800_000, 30.0, 143) + line("hf", CAP_BYTES, 1.0, 0)
+PYPI_ONLY_SLOW = RENTALS + line("pypi", 1_800_000, 30.0, 143) + line("hf", CAP_BYTES, 1.0, 0) + UP
 SLOW_ON_BRIDGE = SLOW.replace(RENTALS, BRIDGE)
 DNS_DOWN = (
-    RENTALS + line("pypi", 0, 0.05, 1, "wget: bad address 'files.pythonhosted.org'") + line("hf", CAP_BYTES, 1.0, 0)
+    RENTALS
+    + line("pypi", 0, 0.05, 1, "wget: bad address 'files.pythonhosted.org'")
+    + line("hf", CAP_BYTES, 1.0, 0)
+    + UP
 )
 
 
@@ -86,6 +91,25 @@ class FakeRedis:
         return -1 if key in self.store else -2
 
 
+class FleetRedis(FakeRedis):
+    """FakeRedis with the endpoint fleet window, preloaded with other providers' readings."""
+
+    def __init__(self, **slow_share: tuple[int, int]):
+        super().__init__()
+        self.fleet: dict[str, list[tuple[float, str]]] = {}
+        for endpoint, (slow, total) in slow_share.items():
+            for i in range(total):
+                self.fleet.setdefault(endpoint, []).append(
+                    (Clock.now - 60, f"5Other{i % 7}|node-{i}|{Clock.now - 60:.3f}|{int(i < slow)}")
+                )
+
+    async def record_endpoint_speed(self, endpoint, member, now, window_seconds):
+        self.fleet.setdefault(endpoint, []).append((now, member))
+
+    async def endpoint_speeds_since(self, endpoint, since):
+        return [m for t, m in self.fleet.get(endpoint, []) if t >= since]
+
+
 class Clock:
     now = 1_790_000_000.0
 
@@ -98,6 +122,7 @@ def flags(*, reachable=True):
     fake = SimpleNamespace(
         CONTAINER_DOWNLOAD_SPEED_CHECK_ENABLED=True,
         CONTAINER_DOWNLOAD_SPEED_MIN_MBPS=10.0,
+        CONTAINER_UPLOAD_SPEED_MIN_MBPS=10.0,
         CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS=6.0,
     )
     clock = Clock()
@@ -144,14 +169,14 @@ def test_command_runs_in_a_container_with_the_renter_runtime_and_a_size_cap():
 
 
 def test_parse_reports_the_network_on_every_reading_failed_or_not():
-    assert [r.network for r in parse_download_speed(DNS_DOWN)] == ["lium-rentals", "lium-rentals"]
+    assert [r.network for r in parse_download_speed(DNS_DOWN)] == ["lium-rentals"] * 3
     assert parse_download_speed(DNS_DOWN)[0].error == "dns_failed"
     assert parse_download_speed(FAST.replace(RENTALS, ""))[0].network is None
 
 
 def test_parse_measures_mbps_and_names_errors():
     fast = parse_download_speed(FAST)
-    assert [r.endpoint for r in fast] == ["pypi", "hf"]
+    assert [r.endpoint for r in fast] == ["pypi", "hf", "cf_up"]
     assert fast[0].mbps == pytest.approx(CAP_BYTES * 8 / 1e6, rel=1e-3) and fast[0].error is None
 
     slow = parse_download_speed(SLOW)[0]
@@ -196,13 +221,77 @@ async def test_slow_twice_fails_the_node():
 async def test_one_slow_cdn_while_the_other_endpoint_is_fast_passes():
     # DAH-5979: PyPI's CDN alone crawled on unrelated networks at once while Hugging Face read 20-80 Mbps
     with flags() as clock:
-        ctx, runner, _ = make_ctx(PYPI_ONLY_SLOW, PYPI_ONLY_SLOW)
+        burst = FleetRedis(pypi=(15, 40), hf=(0, 40), cf_up=(0, 40))
+        ctx, runner, _ = make_ctx(PYPI_ONLY_SLOW, PYPI_ONLY_SLOW, redis=burst)
         check = ContainerDownloadSpeedCheck()
         res = await check.run(ctx)
         assert res.passed and res.event.reason_code == Msg.OK.reason
         clock.now += 31 * 60
         res = await check.run(ctx)  # a pass waits the full interval: no confirming retry
         assert res.passed and len(runner.commands) == 1
+
+
+async def test_one_slow_cdn_that_only_this_provider_reads_slow_fails_the_node():
+    # 5DFDRHm6, 16-21 Nov: PyPI under 10 Mbps on 42 of its 134 in-pod readings, 38 excused by a fast HF, while other
+    # providers read PyPI fast; a renter's pip ran at ~60 kbit/s
+    with flags() as clock:
+        fleet = FleetRedis(pypi=(2, 40), hf=(0, 40), cf_up=(0, 40))
+        ctx, runner, redis = make_ctx(PYPI_ONLY_SLOW, PYPI_ONLY_SLOW, redis=fleet)
+        check = ContainerDownloadSpeedCheck()
+        first = await check.run(ctx)
+        assert first.passed and first.event.reason_code == Msg.SLOW_ONCE.reason
+        clock.now += 31 * 60
+        second = await check.run(ctx)
+        assert second.passed is False and second.event.reason_code == Msg.SLOW.reason
+        assert [r["endpoint"] for r in second.event.what_we_saw["endpoints"] if r["mbps"] < 10] == ["pypi"]
+        # this node's own readings went into the window under its hotkey
+        mine = [m for _, m in redis.fleet["pypi"] if m.startswith(f"{ctx.miner_hotkey}|")]
+        assert len(mine) == 2 and all(m.endswith("|1") for m in mine)
+
+
+async def test_the_fleet_control_leaves_out_this_providers_own_nodes():
+    with flags():
+        # every slow PyPI reading in the window is this provider's: the rest of the fleet reads it fast
+        fleet = FleetRedis(pypi=(0, 30), hf=(0, 30), cf_up=(0, 30))
+        ctx, _, _ = make_ctx(PYPI_ONLY_SLOW, redis=fleet)
+        for i in range(30):
+            fleet.fleet["pypi"].append((Clock.now - 30, f"{ctx.miner_hotkey}|sibling-{i}|0|1"))
+        res = await ContainerDownloadSpeedCheck().run(ctx)
+        assert res.event.reason_code == Msg.SLOW_ONCE.reason
+
+
+async def test_too_few_fleet_readings_keep_the_excuse():
+    with flags():
+        ctx, _, _ = make_ctx(PYPI_ONLY_SLOW, redis=FleetRedis(pypi=(0, 5), hf=(0, 5), cf_up=(0, 5)))
+        res = await ContainerDownloadSpeedCheck().run(ctx)
+        assert res.passed and res.event.reason_code == Msg.OK.reason
+
+
+async def test_a_slow_upload_fails_unless_the_fleet_uploads_slow_too():
+    slow_up = FAST.replace(UP, line("cf_up", 0, 30.0, 143))  # 16 MiB not sent in 30 s: at most 4.5 Mbps
+    with flags():
+        ctx, _, _ = make_ctx(slow_up, redis=FleetRedis(pypi=(0, 30), hf=(0, 30), cf_up=(1, 30)))
+        res = await ContainerDownloadSpeedCheck().run(ctx)
+        assert res.event.reason_code == Msg.SLOW_ONCE.reason
+    with flags():
+        ctx, _, _ = make_ctx(slow_up, redis=FleetRedis(pypi=(0, 30), hf=(0, 30), cf_up=(20, 30)))
+        res = await ContainerDownloadSpeedCheck().run(ctx)
+        assert res.event.reason_code == Msg.OK.reason
+
+
+def test_parse_an_upload_that_did_not_finish_is_an_upper_bound_reading():
+    up = parse_download_speed(line("cf_up", 0, 30.0, 143))[2]
+    assert up.error is None and up.mbps == pytest.approx(CAP_BYTES * 8 / 30 / 1e6) and "upper bound" in up.detail
+    assert parse_download_speed(line("cf_up", CAP_BYTES, 2.0, 0))[2].mbps == pytest.approx(CAP_BYTES * 8 / 2 / 1e6)
+    assert parse_download_speed(line("cf_up", 0, 0.1, 1, "wget: bad address 'speed.cloudflare.com'"))[2].error == (
+        "dns_failed"
+    )
+
+
+def test_the_upload_posts_the_capped_body_to_the_speed_test_sink():
+    cmd = download_speed_command(True)
+    assert "--post-file=/tmp/u" in cmd and "https://speed.cloudflare.com/__up" in cmd
+    assert f"head -c {CAP_BYTES} /dev/zero" in cmd
 
 
 async def test_a_streak_with_a_default_bridge_reading_is_never_enforced():

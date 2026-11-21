@@ -37,10 +37,23 @@ ENDPOINTS: tuple[tuple[str, str], ...] = (
         "https://huggingface.co/openai-community/gpt2/resolve/607a30d783dfa663caf39e06633721c8d4cfcd7e/model.safetensors",
     ),
 )
+# What a pod sends: CAP_BYTES posted to Cloudflare's speed-test sink, the target the host-side VerifyX test uses, so
+# the in-pod upload reads against the same reference as the host's. Its control is a one-byte read of the same host.
+UPLOAD_ENDPOINTS: tuple[tuple[str, str], ...] = (("cf_up", "https://speed.cloudflare.com/__up"),)
+_UPLOAD_NAMES = frozenset(name for name, _ in UPLOAD_ENDPOINTS)
+_CONTROL_URLS = {**dict(ENDPOINTS), "cf_up": "https://speed.cloudflare.com/__down?bytes=1"}
 CAP_BYTES = 16 * 1024 * 1024
 FETCH_TIMEOUT_SECONDS = 30
-# container start plus both fetches, each with its timeout's grace
-COMMAND_TIMEOUT_SECONDS = 120
+# container start plus both fetches and the upload, each with its timeout's grace
+COMMAND_TIMEOUT_SECONDS = 150
+# DAH-5979 excused one slow download while another read fast, because PyPI-only slow readings came in bursts across
+# unrelated networks. That also excused a provider whose pods crawl to PyPI on every other reading (5DFDRHm6, 16-21
+# Nov: 42 of 134 readings under 10 Mbps, 38 excused by a fast HF). A slow endpoint is now excused only while other
+# providers' nodes read it slow too: FLEET_SLOW_SHARE of their readings in FLEET_WINDOW_SECONDS, from at least
+# FLEET_MIN_READINGS of them. Fewer, or an unreadable window, keeps the excuse: a missing control never fails a node.
+FLEET_WINDOW_SECONDS = 3600
+FLEET_SLOW_SHARE = 0.25
+FLEET_MIN_READINGS = 20
 # a slow reading is confirmed by a second one this soon, not one interval later
 RETRY_SECONDS = 30 * 60
 READINGS_BEFORE_VERDICT = 2
@@ -64,6 +77,15 @@ _FETCH_SCRIPT = (
     f'echo "{MARKER} ep=$1 bytes=$n start=$s end=$e rc=$(cat /tmp/rc 2>/dev/null)"; '
     f"echo \"{MARKER}_err ep=$1 $(head -c {_TAIL_CHARS} /tmp/e | tr '\\n' ' ')\"; }}; "
     + "; ".join(f"probe {name} {shlex.quote(url)}" for name, url in ENDPOINTS)
+    # wget cannot say how much of a body went out, so an upload reads CAP_BYTES on success and nothing otherwise
+    + "; upl() { head -c "
+    + str(CAP_BYTES)
+    + " /dev/zero >/tmp/u; s=$(up); "
+    f"timeout {FETCH_TIMEOUT_SECONDS} wget -q -O /dev/null --post-file=/tmp/u \"$2\" 2>/tmp/e; rc=$?; e=$(up); "
+    f'n=0; [ "$rc" = 0 ] && n={CAP_BYTES}; rm -f /tmp/u; '
+    f'echo "{MARKER} ep=$1 bytes=$n start=$s end=$e rc=$rc"; '
+    f"echo \"{MARKER}_err ep=$1 $(head -c {_TAIL_CHARS} /tmp/e | tr '\\n' ' ')\"; }}; "
+    + "; ".join(f"upl {name} {shlex.quote(url)}" for name, url in UPLOAD_ENDPOINTS)
     + "; exit 0"
 )
 
@@ -131,7 +153,7 @@ def parse_download_speed(stdout: str) -> list[EndpointReading]:
             tokens = dict(t.partition("=")[::2] for t in line[len(MARKER) :].split())
             fields[tokens.get("ep", "")] = tokens
     readings = []
-    for name, _ in ENDPOINTS:
+    for name, _ in ENDPOINTS + UPLOAD_ENDPOINTS:
         reading = fields.get(name)
         detail = errors.get(name, "")[:_TAIL_CHARS] or None
         if reading is None:
@@ -150,6 +172,10 @@ def parse_download_speed(stdout: str) -> list[EndpointReading]:
             # reading whatever wget's exit (head stops a large file at the cap and wget dies of SIGPIPE)
             mbps = got * 8 / max(seconds, 0.01) / 1e6
             readings.append(EndpointReading(name, got, seconds, mbps))
+        elif timed_out and name in _UPLOAD_NAMES:
+            # CAP_BYTES not sent in the time: the upload ran at most this fast, a slow reading, not an error
+            upper = CAP_BYTES * 8 / max(seconds, 0.01) / 1e6
+            readings.append(EndpointReading(name, 0, seconds, upper, detail="upper bound: the upload did not finish"))
         elif timed_out:
             readings.append(EndpointReading(name, got, seconds, error="timeout", detail=detail))
         else:
@@ -174,6 +200,39 @@ async def validator_reaches(url: str) -> bool:
                 return response.status < 400
     except Exception:  # noqa: BLE001 — any failure is "cannot reach"
         return False
+
+
+def _is_slow(r: EndpointReading) -> bool:
+    if r.mbps is None:
+        return False
+    if r.endpoint in _UPLOAD_NAMES:
+        return r.mbps < settings.CONTAINER_UPLOAD_SPEED_MIN_MBPS
+    return r.mbps < settings.CONTAINER_DOWNLOAD_SPEED_MIN_MBPS
+
+
+async def _record_fleet(ctx: Context, readings: list[EndpointReading], now: float) -> None:
+    """This node's measured readings into each endpoint's fleet window, tagged with its hotkey."""
+    for r in readings:
+        if r.mbps is None:
+            continue
+        member = f"{ctx.miner_hotkey}|{ctx.executor.uuid}|{now:.3f}|{int(_is_slow(r))}"
+        try:
+            await ctx.services.redis.record_endpoint_speed(r.endpoint, member, now, FLEET_WINDOW_SECONDS)
+        except Exception:  # noqa: BLE001 — the window only loses this reading
+            logger.warning(_m("Endpoint fleet window: reading not recorded", extra=get_extra_info(ctx.default_extra)))
+
+
+async def _fleet_reads_slow(ctx: Context, endpoint: str, now: float) -> bool:
+    """Other providers' nodes read this endpoint slow too in the window (this provider's own nodes do not count)."""
+    try:
+        members = await ctx.services.redis.endpoint_speeds_since(endpoint, now - FLEET_WINDOW_SECONDS)
+    except Exception:  # noqa: BLE001 — no control: keep the excuse
+        logger.warning(_m("Endpoint fleet window unreadable", extra=get_extra_info(ctx.default_extra)))
+        return True
+    others = [m.rsplit("|", 1)[-1] for m in members if m.split("|", 1)[0] != ctx.miner_hotkey]
+    if len(others) < FLEET_MIN_READINGS:
+        return True
+    return others.count("1") / len(others) >= FLEET_SLOW_SHARE
 
 
 @dataclass
@@ -215,9 +274,12 @@ class ContainerDownloadSpeedCheck:
     alpine container (sysbox-runc where the node has it, on the rentals bridge pods use) and reads up to
     CAP_BYTES of a pinned PyPI wheel and a pinned Hugging Face file, each under FETCH_TIMEOUT_SECONDS.
 
-    Every measurement is logged as CONTAINER_DOWNLOAD_SPEED. A reading fails when every measured endpoint is below
-    CONTAINER_DOWNLOAD_SPEED_MIN_MBPS, or the container cannot reach an endpoint (DNS, refused, nothing read in
-    time) that the validator itself reaches. An endpoint the validator cannot reach either, an HTTP error, or a
+    The same container then posts CAP_BYTES to Cloudflare's speed-test sink (what the pod sends).
+
+    Every measurement is logged as CONTAINER_DOWNLOAD_SPEED. A reading fails when every measured download is below
+    CONTAINER_DOWNLOAD_SPEED_MIN_MBPS; when one download, or the upload (CONTAINER_UPLOAD_SPEED_MIN_MBPS), is slow
+    while other providers' nodes read that endpoint fast (FLEET_SLOW_SHARE); or when the container cannot reach an
+    endpoint (DNS, refused, nothing read in time) that the validator itself reaches. An endpoint the validator cannot reach either, an HTTP error, or a
     container that did not run is no verdict. READINGS_BEFORE_VERDICT failing readings in a row (the second
     RETRY_SECONDS after the first) are the finding: a fail (CONTAINER_DOWNLOAD_SLOW, score 0) that stands
     until a reading passes, or CONTAINER_DOWNLOAD_SLOW_OBSERVED (logged only) when a failing reading in the
@@ -258,7 +320,7 @@ class ContainerDownloadSpeedCheck:
             return self._verdict(ctx, state, probed=False)
 
         readings = await self._measure(ctx)
-        judgement = await self._judge(readings)
+        judgement = await self._judge(ctx, readings)
         failing, no_verdict = judgement.is_failing, judgement.has_no_verdict
         on_rentals = all(r.network == RENTAL_NETWORK_NAME for r in readings)
         if failing:
@@ -283,6 +345,7 @@ class ContainerDownloadSpeedCheck:
                         **ctx.default_extra,
                         "endpoints": [asdict(r) for r in readings],
                         "min_mbps": settings.CONTAINER_DOWNLOAD_SPEED_MIN_MBPS,
+                        "min_upload_mbps": settings.CONTAINER_UPLOAD_SPEED_MIN_MBPS,
                         "failing": failing,
                         "no_verdict": no_verdict,
                         "failures_in_a_row": failures,
@@ -302,19 +365,28 @@ class ContainerDownloadSpeedCheck:
         readings = parse_download_speed(result.stdout or "")
         if result.error_type is not None or all(r.error == "no_output" for r in readings):
             detail = f"{result.error_type or 'exit ' + str(result.exit_code)}: {(result.error_message or result.stderr or '')}"
-            return [EndpointReading(name, error="no_output", detail=detail[-_TAIL_CHARS:]) for name, _ in ENDPOINTS]
+            return [
+                EndpointReading(name, error="no_output", detail=detail[-_TAIL_CHARS:])
+                for name, _ in ENDPOINTS + UPLOAD_ENDPOINTS
+            ]
         return readings
 
-    async def _judge(self, readings: list[EndpointReading]) -> Judgement:
-        """Slow on every measured endpoint fails. One CDN slow while another endpoint reads fast is that CDN's
-        path, not the node's link: PyPI-only slow readings come in bursts across unrelated networks (DAH-5979)."""
-        threshold = settings.CONTAINER_DOWNLOAD_SPEED_MIN_MBPS
-        measured = [r for r in readings if r.mbps is not None]
-        if measured and max(r.mbps for r in measured) < threshold:
-            return Judgement(is_failing=True, has_no_verdict=False, failed=tuple(measured))
-        urls = dict(ENDPOINTS)
+    async def _judge(self, ctx: Context, readings: list[EndpointReading]) -> Judgement:
+        """Slow on every measured download fails. Any other slow endpoint (one download, or the upload) fails unless
+        other providers' nodes read it slow too in the fleet window: then it is that endpoint's path, not the node's."""
+        now = time.time()
+        await _record_fleet(ctx, readings, now)
+        downloads = [r for r in readings if r.mbps is not None and r.endpoint not in _UPLOAD_NAMES]
+        if downloads and max(r.mbps for r in downloads) < settings.CONTAINER_DOWNLOAD_SPEED_MIN_MBPS:
+            return Judgement(is_failing=True, has_no_verdict=False, failed=tuple(downloads))
+        failed = []
         for r in readings:
-            if r.error in NODE_SIDE_ERRORS and await validator_reaches(urls[r.endpoint]):
+            if _is_slow(r) and not await _fleet_reads_slow(ctx, r.endpoint, now):
+                failed.append(r)
+        if failed:
+            return Judgement(is_failing=True, has_no_verdict=False, failed=tuple(failed))
+        for r in readings:
+            if r.error in NODE_SIDE_ERRORS and await validator_reaches(_CONTROL_URLS[r.endpoint]):
                 return Judgement(is_failing=True, has_no_verdict=False, failed=(r,))
         # an endpoint left unmeasured (ours, or the endpoint's) and no failure: no verdict
         return Judgement(is_failing=False, has_no_verdict=any(r.mbps is None for r in readings))
