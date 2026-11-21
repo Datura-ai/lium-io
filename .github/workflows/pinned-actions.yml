@@ -146,25 +146,28 @@ jobs:
                       jobs, runs = [j for j in (jobs or {}).values() if isinstance(j, dict)], runs or {}
                       steps = [step for job in jobs for step in flat(job.get("steps"), odd)] + list(flat(runs.get("steps"), odd))
                       # these actions start a registry image that their own default names by a mutable tag
-                      # (buildkit:buildx-stable-1, binfmt:latest): the image they run must be given by digest
+                      # (buildkit:buildx-stable-1, binfmt:latest). They are accepted in one shape only, the one this
+                      # repository uses: an allowlist, not a model of their parsers. setup-buildx-action (8d2750c)
+                      # trims the input, splits records at LF, CRLF and CR (csv-parse, quote off), and passes each
+                      # record as a --driver-opt; Buildx then splits it again as CSV with quotes into key=value, the
+                      # last key winning. Its other inputs (driver, endpoint, append, version, ...) choose a builder
+                      # or binary this scan cannot pin. So with: holds driver-opts alone, and that is a single
+                      # image=<ref>@sha256:<digest> whose characters include no separator, quote, space or dollar
+                      pinned = r"[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}"
                       for step in steps:
                           name = str(step.get("uses") or "").split("@")[0].lower()
-                          args = step.get("with") if isinstance(step.get("with"), dict) else {}
-                          if name == "docker/setup-buildx-action" and str(args.get("driver", "docker-container")) != "docker":
-                              # exactly one image option, by digest: Buildx gets every option, so a second one could pick
-                              # another image. An expression (\x24 is the dollar sign, as in the self-test) is expanded after this scan and quoted CSV fields are not
-                              # parsed here, so both are refused; a key that only differs in case or spacing counts as image
-                              raw = str(args.get("driver-opts") or "")
-                              # the action's CSV parser also ends a record at a carriage return; any other control or
-                              # non-ASCII character could be a separator this split does not see, so it is refused
-                              fields = [f.strip() for f in re.split(r"[\r\n,]", raw) if f.strip()]
-                              keys = [f.split("=", 1)[0].strip().lower() for f in fields]
-                              imgs = [f for f, k in zip(fields, keys) if k == "image"]
-                              if ("\x24{{" in raw or re.search(r"[\"']|[^\n\x20-\x7e]", raw) or len(imgs) != 1
-                                      or not imgs[0].startswith("image=") or not is_digest(imgs[0][6:])):
-                                  bad.append(f"{where}: {name}: with.driver-opts image=<image>@sha256:<digest> only")
-                          elif name == "docker/setup-qemu-action" and not is_digest(args.get("image") or ""):
-                              bad.append(f"{where}: {name}: with.image <image>@sha256:<digest> only")
+                          args = step.get("with")
+                          if name == "docker/setup-buildx-action":
+                              ok = (isinstance(args, dict) and set(args) == {"driver-opts"} and isinstance(args["driver-opts"], str)
+                                    and re.fullmatch(r"[ \n]*image=" + pinned + r"[ \n]*", args["driver-opts"]))
+                              if not ok:
+                                  bad.append(f"{where}: {name}: with: driver-opts: image=<image>@sha256:<digest> and nothing else")
+                          elif name == "docker/setup-qemu-action":
+                              # setup-qemu-action (c7c5346) passes with.image as one docker argument
+                              ok = (isinstance(args, dict) and set(args) == {"image"} and isinstance(args["image"], str)
+                                    and re.fullmatch(pinned, args["image"]))
+                              if not ok:
+                                  bad.append(f"{where}: {name}: with: image: <image>@sha256:<digest> and nothing else")
                       refs = [("job", job.get("uses")) for job in jobs] + [("step", step.get("uses")) for step in steps]
                       for level, ref in refs:
                           if ref is None:
@@ -345,25 +348,40 @@ jobs:
               step("$/.\\sub"): 1,  # a backslash in a ref
               step("$/x\\..\\sub"): 1,
               step("$/sub\\"): 1,
-              # BuildKit and binfmt images by digest: the actions' defaults are mutable tags
-              step("docker/setup-buildx-action@" + sha): 1,
+              # BuildKit and binfmt images by digest, in the one accepted shape (one case per parser rule below)
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit:v0.33.1" + dig): 0,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            image=ghcr.io/acme/buildkit-image" + dig): 0,  # a block scalar's newline
+              step("docker/setup-buildx-action@" + sha): 1,  # the default image tag
               step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit:v1"): 1,
-              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            network=host\n            image=moby/buildkit" + dig): 0,
-              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver: docker"): 0,
-              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            image=moby/buildkit" + dig + "\n            image=acme/buildkit:latest"): 1,
-              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit" + dig + ",\"image=acme/buildkit:latest\""): 1,
-              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: IMAGE=acme/buildkit:latest"): 1,
-              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=ghcr.io/acme/buildkit-image" + dig): 0,  # "image" inside the repository name
-              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            image=moby/buildkit" + dig + "\n            env.IMAGE_MODE=debug"): 0,
-              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit" + dig + "\n            image =acme/buildkit:latest"): 1,
-              # \x24 spells the dollar sign (see above): an expression could expand into a second image option
-              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            image=moby/buildkit" + dig + "\n            \x24{{ format('{0}=acme/buildkit:latest', 'image') }}"): 1,
-              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            image=moby/buildkit" + dig + "\n            \x24{{ vars.BUILDKIT_OPT }}"): 1,
-              # a carriage return ends a record for the action's parser: YAML keeps an escaped one in a quoted value
-              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: \"image=moby/buildkit" + dig + ",target=x\\rimage=acme/buildkit" + dig + "\""): 1,
-              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: \"image=moby/buildkit" + dig + "\\ttarget=x\""): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit" + dig[:-1]): 1,  # a short digest
+              # records: LF, CRLF and CR each start another --driver-opt
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            image=moby/buildkit" + dig + "\n            image=acme/buildkit" + dig): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: \"image=moby/buildkit" + dig + "\\r\\nimage=acme/buildkit" + dig + "\""): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: \"image=moby/buildkit" + dig + "\\rimage=acme/buildkit" + dig + "\""): 1,
+              # fields: Buildx splits a record at commas, honours quotes, and keeps the last key
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit" + dig + ",image=acme/buildkit" + dig): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: '\"image=moby/buildkit" + dig + "\"'"): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit" + dig + " network=host"): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            image=moby/buildkit" + dig + "\n            env.IMAGE_MODE=debug"): 1,  # any other option
+              # keys are matched exactly, as Buildx does
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: IMAGE=moby/buildkit" + dig): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image =moby/buildkit" + dig): 1,
+              # characters the YAML value can carry that a parser could read as a separator, and expressions
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: \"image=moby/buildkit" + dig + "\\t\""): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: \"image=moby/buildkit" + dig + "\\u2028\""): 1,
+              # \x24 spells the dollar sign: an expression is expanded after this scan
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit\x24{{ vars.D }}"): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: \x24{{ vars.BUILDKIT_OPT }}"): 1,
+              # every other input chooses a builder or binary this scan cannot pin
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit" + dig + "\n          driver: remote\n          endpoint: tcp://acme:1234"): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit" + dig + "\n          append: |\n            - driver-opts: image=acme/buildkit:latest"): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit" + dig + "\n          version: latest"): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver: docker"): 1,
+              "jobs:\n  a:\n    steps:\n      - uses: docker/setup-buildx-action@" + sha + "\n        with: \x24{{ fromJSON(vars.W) }}\n": 1,
               step("docker/setup-qemu-action@" + sha): 1,
-              step("docker/setup-qemu-action@" + sha + "\n        with:\n          image: tonistiigi/binfmt" + dig): 0,
+              step("docker/setup-qemu-action@" + sha + "\n        with:\n          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3" + dig): 0,
+              step("docker/setup-qemu-action@" + sha + "\n        with:\n          image: tonistiigi/binfmt:latest"): 1,
+              step("docker/setup-qemu-action@" + sha + "\n        with:\n          image: tonistiigi/binfmt" + dig + "\n          platforms: arm64"): 1,
           }
           for i, (text, want) in enumerate(cases.items()):
               tree = {**base, (None, f"w/case{i}.yml", None): text}
