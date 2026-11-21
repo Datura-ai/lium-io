@@ -253,6 +253,7 @@ _PYTHON_WATCHDOG = (
     "try:\n sys.exit(p.wait(float(sys.argv[1])))\n"
     "except subprocess.TimeoutExpired:\n pass\n"
     "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+    f"print({VERIFYX_DEADLINE_MARKER!r},file=sys.stderr,flush=True)\n"
     "os.killpg(0,signal.SIGTERM)\n"
     "try:\n p.wait(10)\n"
     "except subprocess.TimeoutExpired:\n os.killpg(0,signal.SIGKILL)\n"
@@ -677,30 +678,22 @@ class VerifyXValidationService:
         # A run the validator may cut off: its own scratch dir (cwd, so the disk-test file lands in
         # it on the same filesystem) and its PID on record, for kill_remote_verifyx.
         d = shlex.quote(run_dir)
-        deadline = f"timeout -k 10 {int(seconds)} {command} &"
         if python_watchdog:
-            # DAH-5933 review: the bounded first sample has no earlier result to fall back on, so a host whose
-            # `timeout` lacks -k (busybox) gets the same deadline from the executor's own Python
-            watchdog = (
-                f"{shlex.quote(executor_info.python_path)} -c {shlex.quote(_PYTHON_WATCHDOG)} "
-                f"{int(seconds)} {command} &"
+            # DAH-5933 review F-29/F-32: the bounded first sample runs under the executor's own Python watchdog,
+            # the one actor that stops it at the deadline, so it alone writes the deadline marker, right before its
+            # kill. No exit code (GNU 124, busybox 143, a child's own 124) and no wall-clock arithmetic decides it.
+            start = (
+                f"mkdir {d} && cd {d} || exit 1; "
+                f"{shlex.quote(executor_info.python_path)} -c {shlex.quote(_PYTHON_WATCHDOG)} {int(seconds)} {command} & "
             )
-            start = f"mkdir {d} && cd {d} || exit 1; if timeout -k 1 1 true 2>/dev/null; then {deadline} else {watchdog} fi; "
         else:
             # a host whose `timeout` lacks -k (busybox) skips the retry, so the first sample stands
             start = (
                 f"timeout -k 1 1 true 2>/dev/null || {{ echo 'no timeout -k' >&2; exit 1; }}; "
-                f"mkdir {d} && cd {d} || exit 1; {deadline} "
+                f"mkdir {d} && cd {d} || exit 1; timeout -k 10 {int(seconds)} {command} & "
             )
-        return (
-            # a remote deadline of its own: the run cannot outlive its budget even if the kill never lands
-            f"t0=$(date +%s); {start}echo $! > pid; wait $!; rc=$?; "
-            # the host's own record that the deadline ended the run: the exit code cannot say it (GNU timeout gives
-            # 124, busybox the child's 143 after its TERM, and a child may exit 124 itself). shortcut: whole
-            # seconds, so a run ending in the last second before the deadline also counts as cut by it
-            f"[ $(($(date +%s) - t0)) -ge {int(seconds)} ] && echo {VERIFYX_DEADLINE_MARKER} >&2; "
-            f"cd .. && rm -rf {d}; exit $rc"
-        )
+        # a remote deadline of its own: the run cannot outlive its budget even if the kill never lands
+        return f"{start}echo $! > pid; wait $!; rc=$?; cd .. && rm -rf {d}; exit $rc"
 
     async def kill_remote_verifyx(self, shell, run_dir: str, default_extra: dict) -> bool:
         """Kill a VerifyX run started with `run_dir` and cut off by the validator; True once it is gone.

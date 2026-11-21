@@ -250,11 +250,12 @@ def test_both_remote_watchdogs_take_the_given_seconds():
     executor = SimpleNamespace(python_path="/usr/bin/python3", root_dir="/root/app")
     challenge = SimpleNamespace(seed=1, cipher_text="x")
 
-    command = service._verifyx_command(executor, challenge, "lib", ".verifyx-t", True, 137)
+    bounded = service._verifyx_command(executor, challenge, "lib", ".verifyx-t", True, 137)
+    retry = service._verifyx_command(executor, challenge, "lib", ".verifyx-t", False, 137)
 
-    assert "timeout -k 10 137 " in command
-    assert " 137 /usr/bin/python3 /root/app/src/verifyx_executor.py" in command
-    assert " 600 " not in command
+    assert " 137 /usr/bin/python3 /root/app/src/verifyx_executor.py" in bounded
+    assert "timeout -k 10 137 " in retry
+    assert " 600 " not in bounded + retry
 
 
 @pytest.mark.asyncio
@@ -264,9 +265,10 @@ def test_both_remote_watchdogs_take_the_given_seconds():
         (True, 124, True, True),  # GNU timeout at the deadline
         (True, 143, True, True),  # busybox timeout: the child's status after its TERM (F-29)
         (True, 124, False, False),  # the child exited 124 itself before the deadline: judged (F-29)
+        (True, 143, False, False),  # the child exited 143 itself before the deadline: judged (F-29)
         (False, 124, True, False),  # unbounded: judged as before
     ],
-    ids=["gnu-deadline", "busybox-deadline", "early-child-124", "unbounded"],
+    ids=["gnu-deadline", "busybox-deadline", "early-child-124", "early-child-143", "unbounded"],
 )
 async def test_only_the_hosts_deadline_record_makes_a_run_the_cut(monkeypatch, bounded, exit_status, marked, cut):
     from neurons.validators.src.services import verifyx_validation_service as module
@@ -293,17 +295,19 @@ wait $p
 """
 
 
+@pytest.mark.parametrize("timeout_kind", ["busybox", "gnu", "none"])
 @pytest.mark.parametrize(
-    "timeout_kind,child,marked",
+    "child,marked",
     [
-        ("busybox", "import time; time.sleep(30)", True),
-        ("gnu", "import time; time.sleep(30)", True),
-        ("gnu", "import sys; sys.exit(124)", False),
-        ("python-watchdog", "import time; time.sleep(30)", True),
+        ("import time; time.sleep(30)", True),  # stopped at the deadline
+        ("import sys; sys.exit(124)", False),  # the child's own 124 (F-29)
+        ("import sys; sys.exit(143)", False),  # the child's own 143 (F-29)
+        ("import time; time.sleep(1.5)", False),  # done 0.5 s before the deadline: not cut, whatever the clock (F-32)
     ],
+    ids=["stopped", "own-124", "own-143", "just-in-time"],
 )
-def test_the_wrapper_records_the_deadline_whatever_the_watchdog_exits(tmp_path, timeout_kind, child, marked):
-    # F-29: busybox 1.36 `timeout` takes -k and leaves the child's 143; a child may exit 124 on its own
+def test_only_the_watchdogs_stop_writes_the_deadline_marker(tmp_path, timeout_kind, child, marked):
+    # F-29/F-32: the marker comes from the one actor that stops the run, whatever `timeout` the host has
     import os
     import shutil
     import subprocess
@@ -323,7 +327,7 @@ def test_the_wrapper_records_the_deadline_whatever_the_watchdog_exits(tmp_path, 
     if timeout_kind != "gnu":
         fake_bin = tmp_path / "bin"
         fake_bin.mkdir()
-        # python-watchdog: a timeout without -k, so the executor's own Python watchdog runs the deadline
+        # none: a `timeout` that refuses everything
         (fake_bin / "timeout").write_text(_BUSYBOX_TIMEOUT if timeout_kind == "busybox" else "#!/bin/sh\nexit 1\n")
         (fake_bin / "timeout").chmod(0o755)
         env["PATH"] = f"{fake_bin}:{env['PATH']}"
