@@ -404,6 +404,60 @@ async def test_verifyx_probes_never_measured_node_under_active_filler(context_fa
     assert network["ema_verifyx_download_speed"] == pytest.approx(510.0)
 
 
+def _filler_state(network_ema: dict) -> object:
+    return build_state(
+        specs={"gpu": {"count": 8}},
+        rented_data=RentedExecutorsResponse(
+            executors={},
+            banned_guids=[],
+            filler_containers_by_executor={"executor-123": "filler_active"},
+            network_ema=network_ema,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_verifyx_remeasures_a_first_sample_ema_under_a_filler(context_factory):
+    """Prod 21 Nov 2026 node 7baf9ac3: a filler started minutes after the first sample (135/280 Mbps, cold, single
+    stream; siblings on its link read 800-900), and the stored EMA, that one sample alone, was reused for a day."""
+    verifyx_service = DummyVerifyXService(
+        success=True, updated_specs={"network": {"download_speed": 820.0, "upload_speed": 310.0}}
+    )
+    services = build_services(verifyx=verifyx_service)
+    ctx = context_factory(services=services, config=build_context_config(), state=_filler_state({}))
+    await VerifyXCheck().run(ctx)  # never measured: probed, and the node is marked unseeded
+
+    ctx.state.rented_data.network_ema["executor-123"] = NetworkEMA(
+        ema_verifyx_download_speed=135.0, ema_verifyx_upload_speed=280.0
+    )
+    for _ in range(2):  # measured every cycle while the stored EMA is still the first sample
+        verifyx_service.called_with = None
+        result = await VerifyXCheck().run(ctx)
+        assert result.event.reason_code != Msg.FILLER_SKIPPED.reason
+        assert verifyx_service.called_with["challenge_config_overrides"] == (
+            verifyx_module.FILLER_REFRESH_CHALLENGE_CONFIG
+        )
+
+    # the backend folded a second sample in: reuse starts
+    ctx.state.rented_data.network_ema["executor-123"] = NetworkEMA(
+        ema_verifyx_download_speed=477.5, ema_verifyx_upload_speed=295.0
+    )
+    verifyx_service.called_with = None
+    assert (await VerifyXCheck().run(ctx)).event.reason_code == Msg.FILLER_SKIPPED.reason
+    assert verifyx_service.called_with is None
+
+
+@pytest.mark.asyncio
+async def test_verifyx_reuses_a_settled_ema_under_a_filler(context_factory):
+    """A node seeded before this validator saw it unseeded carries no mark: its EMA is reused, as before."""
+    verifyx_service = DummyVerifyXService(success=True, updated_specs={"network": {}})
+    state = _filler_state({"executor-123": NetworkEMA(ema_verifyx_download_speed=802.0, ema_verifyx_upload_speed=315.0)})
+    ctx = context_factory(services=build_services(verifyx=verifyx_service), config=build_context_config(), state=state)
+
+    assert (await VerifyXCheck().run(ctx)).event.reason_code == Msg.FILLER_SKIPPED.reason
+    assert verifyx_service.called_with is None
+
+
 @pytest.mark.asyncio
 async def test_verifyx_failure_without_prev_ema_leaves_specs_empty(context_factory):
     """No prior EMA anywhere — failure branch must not fabricate a state update."""
