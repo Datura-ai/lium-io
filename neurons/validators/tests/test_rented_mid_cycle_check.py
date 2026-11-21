@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -28,6 +29,14 @@ from test_compute_client_restart_cut_creates import _client
 from test_executor_rollout_grace import _failed, _scored, _validator_process
 
 KEY = rent_requested_key("miner-hotkey", "executor-123")
+
+
+def mark(redis: FakeRedis, pod: str, expires_in: float = RENT_REQUESTED_TTL_SECONDS) -> None:
+    redis.hashes.setdefault(KEY, {})[pod] = repr(time.time() + expires_in)
+
+
+def marked_pods(redis: FakeRedis) -> set[str]:
+    return set(redis.hashes.get(KEY, {}))
 
 
 def rented(*pods: RentedPod) -> RentedExecutorsResponse:
@@ -58,7 +67,7 @@ class NoSSH:
 def make_ctx(marked: str | None = None, at_start: RentedExecutorsResponse = UNRENTED, redis: FakeRedis | None = None):
     services = build_services(redis=redis or FakeRedis())
     if marked:
-        services.redis.store[KEY] = marked
+        mark(services.redis, marked)
     return make_context(services=services, state=build_state(rented_data=at_start), ssh=NoSSH())
 
 
@@ -107,7 +116,7 @@ async def test_a_starved_redis_pool_does_not_hold_the_check(monkeypatch):
     async def stuck(_key):
         await asyncio.sleep(3600)
 
-    ctx.services.redis.get = stuck
+    ctx.services.redis.hgetall = stuck
     real_wait_for = asyncio.wait_for
     monkeypatch.setattr(asyncio, "wait_for", lambda aw, timeout: real_wait_for(aw, 0.01))
     result = await RentedMidCycleCheck().run(ctx)
@@ -125,8 +134,19 @@ async def test_a_mark_left_by_a_crash_expires_on_its_own():
     redis = FakeRedis()
     await redis_service(redis).mark_rent_requested("miner-hotkey", "executor-123", "pod-new")
 
-    assert redis.store[KEY] == "pod-new"
+    assert marked_pods(redis) == {"pod-new"}
     assert redis.ttl[KEY] == RENT_REQUESTED_TTL_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_a_mark_past_its_own_expiry_does_not_stop_the_run():
+    # a later create refreshed the node key's TTL and then failed: the earlier pod's own expiry still ends its mark
+    redis = FakeRedis()
+    mark(redis, "pod-crashed", expires_in=-1)
+
+    result = await RentedMidCycleCheck().run(make_ctx(redis=redis))
+
+    assert result.passed and result.event.reason_code == Msg.NOT_RENTED.reason
 
 
 @pytest.mark.asyncio
@@ -137,7 +157,7 @@ async def test_clearing_one_pod_keeps_a_later_pods_mark():
 
     await service.clear_rent_requested("miner-hotkey", "executor-123", "pod-1")
 
-    assert redis.store[KEY] == "pod-2"
+    assert marked_pods(redis) == {"pod-2"}
 
 
 # the connector: marks a renter's create on receipt, clears it when the create fails or the pod is deleted
@@ -162,15 +182,15 @@ async def test_a_renters_create_is_marked_while_it_runs_and_the_mark_stays_once_
     seen = []
 
     async def drive(request):
-        seen.append(redis.store.get(KEY))
+        seen.append(marked_pods(redis))
 
     client, redis = _connector(drive)
 
     await client._run_miner_job(_create())
 
-    assert seen == ["pod-new"]
+    assert seen == [{"pod-new"}]
     # the pod is up: the next cycle's rented list carries it, the mark ends with its TTL
-    assert redis.store[KEY] == "pod-new"
+    assert marked_pods(redis) == {"pod-new"}
 
 
 @pytest.mark.asyncio
@@ -187,7 +207,7 @@ async def test_a_failed_create_clears_its_mark():
 
     await client._run_miner_job(_create())
 
-    assert KEY not in redis.store
+    assert not marked_pods(redis)
 
 
 @pytest.mark.asyncio
@@ -197,7 +217,7 @@ async def test_a_create_that_raises_clears_its_mark():
     with pytest.raises(RuntimeError):
         await client._run_miner_job(_create())
 
-    assert KEY not in redis.store
+    assert not marked_pods(redis)
 
 
 @pytest.mark.asyncio
@@ -207,19 +227,19 @@ async def test_a_create_cancelled_mid_way_clears_its_mark():
     with pytest.raises(asyncio.CancelledError):
         await client._run_miner_job(_create())
 
-    assert KEY not in redis.store
+    assert not marked_pods(redis)
 
 
 @pytest.mark.asyncio
 async def test_deleting_the_pod_clears_its_mark():
     client, redis = _connector(AsyncMock())
-    redis.store[KEY] = "pod-new"
+    mark(redis, "pod-new")
 
     await client._run_miner_job(
         ContainerDeleteRequest.model_construct(pod_id="pod-new", miner_hotkey="miner-hotkey", executor_id="executor-123")
     )
 
-    assert KEY not in redis.store
+    assert not marked_pods(redis)
 
 
 @pytest.mark.asyncio
@@ -228,7 +248,7 @@ async def test_a_filler_create_is_not_marked():
 
     await client._run_miner_job(_create(WorkloadKind.FILLER))
 
-    assert KEY not in redis.store
+    assert not marked_pods(redis)
 
 
 @pytest.mark.asyncio
@@ -259,7 +279,7 @@ class HeavyStep:
         try:
             if self.redis is not None:
                 # the renter's create lands while the test runs
-                self.redis.store[KEY] = "pod-new"
+                mark(self.redis, "pod-new")
             await asyncio.sleep(0.2)
         except asyncio.CancelledError:
             self.cancelled = True
@@ -492,3 +512,50 @@ def test_the_post_rental_recheck_stops_on_a_rent():
     from services.task.checks.post_rental_gpu_recheck import PostRentalGpuRecheckCheck
 
     assert PostRentalGpuRecheckCheck.stops_on_rent
+
+
+# two creates on one node: each create's cleanup removes only its own mark
+
+
+class InterleavingRedis(FakeRedis):
+    """Every call yields first, as a real round trip does, so two concurrent callers interleave."""
+
+    async def _yield_then(self, name, *args, **kwargs):
+        await asyncio.sleep(0)
+        return await getattr(FakeRedis, name)(self, *args, **kwargs)
+
+
+for _name in ("get", "set", "delete", "expire", "hset", "hget", "hgetall", "hdel"):
+    setattr(InterleavingRedis, _name, lambda self, *a, _n=_name, **k: self._yield_then(_n, *a, **k))
+
+
+async def _stops_for(redis: FakeRedis) -> str | None:
+    result = await RentedMidCycleCheck().run(make_ctx(redis=redis))
+    return None if result.passed else result.event.what_we_saw["pods"][0]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_creates_cleanup_keeps_a_later_create_that_lands_meanwhile():
+    redis = InterleavingRedis()
+    service = redis_service(redis)
+    await service.mark_rent_requested("miner-hotkey", "executor-123", "pod-a")
+
+    # pod-a's create failed; its cleanup runs while pod-b's create is received
+    await asyncio.gather(
+        service.clear_rent_requested("miner-hotkey", "executor-123", "pod-a"),
+        service.mark_rent_requested("miner-hotkey", "executor-123", "pod-b"),
+    )
+
+    assert await _stops_for(redis) == "pod-b"
+
+
+@pytest.mark.asyncio
+async def test_a_later_create_that_fails_keeps_the_mark_of_one_still_in_flight():
+    redis = FakeRedis()
+    service = redis_service(redis)
+    await service.mark_rent_requested("miner-hotkey", "executor-123", "pod-a")
+    await service.mark_rent_requested("miner-hotkey", "executor-123", "pod-b")
+
+    await service.clear_rent_requested("miner-hotkey", "executor-123", "pod-b")
+
+    assert await _stops_for(redis) == "pod-a"

@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import redis.exceptions
 
@@ -13,18 +14,23 @@ async def rent_requested_since_cycle_start(ctx: Context) -> str | None:
     """The pod of a renter's create the connector marked on this node, unless the cycle-start rented list has it.
 
     `rented_data` is read once, at cycle start; a pod it already listed was judged by `TenantEnforcementCheck`.
-    No mark (none sent, the create failed, or the mark expired) or no Redis: no rent to stop for. The read is bounded,
+    No mark (none sent, the create failed, or every mark expired) or no Redis: no rent to stop for. The read is bounded,
     so a starved Redis pool cannot hold a finished step.
     """
     try:
-        pod = await asyncio.wait_for(ctx.services.redis.get(rent_requested_key(ctx.miner_hotkey, ctx.executor.uuid)), 5)
+        marks = await asyncio.wait_for(
+            ctx.services.redis.hgetall(rent_requested_key(ctx.miner_hotkey, ctx.executor.uuid)), 5
+        )
     except (redis.exceptions.RedisError, TimeoutError):
         return None
-    if pod is None:
-        return None
-    pod = pod.decode() if isinstance(pod, bytes) else pod
     at_start = rental_of_this_node(ctx)
-    return None if at_start and pod in {listed.pod_id for listed in at_start.pods} else pod
+    listed = {pod.pod_id for pod in at_start.pods} if at_start else set()
+    now = time.time()
+    for pod, expires_at in (marks or {}).items():
+        pod = pod.decode() if isinstance(pod, bytes) else pod
+        if float(expires_at) > now and pod not in listed:
+            return pod
+    return None
 
 
 def rented_since_cycle_start_event(ctx: Context, pod: str):
