@@ -152,10 +152,14 @@ jobs:
                           args = step.get("with") if isinstance(step.get("with"), dict) else {}
                           if name == "docker/setup-buildx-action" and str(args.get("driver", "docker-container")) != "docker":
                               # exactly one image option, by digest: Buildx gets every option, so a second one could pick
-                              # another image, and any spelling the split below does not read as image= fails too
+                              # another image. An expression (\x24 is the dollar sign, as in the self-test) is expanded after this scan and quoted CSV fields are not
+                              # parsed here, so both are refused; a key that only differs in case or spacing counts as image
                               raw = str(args.get("driver-opts") or "")
-                              opts = [o for o in re.split(r"[\s,]+", raw) if o.startswith("image=")]
-                              if len(re.findall("image", raw, flags=re.I)) != 1 or len(opts) != 1 or not is_digest(opts[0][6:]):
+                              fields = [f.strip() for f in re.split(r"[\n,]", raw) if f.strip()]
+                              keys = [f.split("=", 1)[0].strip().lower() for f in fields]
+                              imgs = [f for f, k in zip(fields, keys) if k == "image"]
+                              if ("\x24{{" in raw or re.search(r"[\"']", raw) or len(imgs) != 1
+                                      or not imgs[0].startswith("image=") or not is_digest(imgs[0][6:])):
                                   bad.append(f"{where}: {name}: with.driver-opts image=<image>@sha256:<digest> only")
                           elif name == "docker/setup-qemu-action" and not is_digest(args.get("image") or ""):
                               bad.append(f"{where}: {name}: with.image <image>@sha256:<digest> only")
@@ -347,6 +351,12 @@ jobs:
               step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            image=moby/buildkit" + dig + "\n            image=acme/buildkit:latest"): 1,
               step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit" + dig + ",\"image=acme/buildkit:latest\""): 1,
               step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: IMAGE=acme/buildkit:latest"): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=ghcr.io/acme/buildkit-image" + dig): 0,  # "image" inside the repository name
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            image=moby/buildkit" + dig + "\n            env.IMAGE_MODE=debug"): 0,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit" + dig + "\n            image =acme/buildkit:latest"): 1,
+              # \x24 spells the dollar sign (see above): an expression could expand into a second image option
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            image=moby/buildkit" + dig + "\n            \x24{{ format('{0}=acme/buildkit:latest', 'image') }}"): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            image=moby/buildkit" + dig + "\n            \x24{{ vars.BUILDKIT_OPT }}"): 1,
               step("docker/setup-qemu-action@" + sha): 1,
               step("docker/setup-qemu-action@" + sha + "\n        with:\n          image: tonistiigi/binfmt" + dig): 0,
           }
