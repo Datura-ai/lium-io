@@ -790,6 +790,8 @@ class ContainerStopped(ContainerBaseResponse):
 
 class ContainerDeleted(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.ContainerDeleted
+    # lium_protocol 2.18.0: a ContainerDeleteOnNodeLeftRequest's command_id, echoed; empty for any other delete
+    command_id: str = ""
 
 
 class SshPubKeyAdded(ContainerBaseResponse):

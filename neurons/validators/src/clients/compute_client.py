@@ -1616,6 +1616,9 @@ class ComputeClient:
             response: (
                 ContainerDeleted | FailedContainerRequest
             ) = await self.miner_service.handle_container(job_request)
+            if isinstance(job_request, ContainerDeleteOnNodeLeftRequest):
+                # the backend matches this answer to the one delete it waits on, not to any reply for the pod
+                response.command_id = job_request.command_id
 
             logger.info(
                 _m(

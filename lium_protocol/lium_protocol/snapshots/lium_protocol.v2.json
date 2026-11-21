@@ -1470,6 +1470,11 @@
     },
     "ContainerDeleted": {
       "properties": {
+        "command_id": {
+          "default": "",
+          "title": "Command Id",
+          "type": "string"
+        },
         "executor_id": {
           "title": "Executor Id",
           "type": "string"

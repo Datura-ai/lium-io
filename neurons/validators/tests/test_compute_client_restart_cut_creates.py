@@ -16,6 +16,7 @@ from clients.compute_client import (
 )
 from payload_models.payloads import (
     ContainerCreated,
+    ContainerDeleted,
     ContainerCreateRequest,
     ContainerDeleteOnNodeLeftRequest,
     ContainerDeleteRequest,
@@ -675,6 +676,30 @@ async def test_a_node_left_delete_keeps_the_source_creates_record_for_a_restart(
 
     assert client.deleted_pod_ids == set()
     assert list(await redis_service.inflight_backend_creates()) == ["pod-1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deleted", [True, False])
+@pytest.mark.parametrize("node_left", [True, False])
+async def test_only_a_node_left_deletes_answer_echoes_its_command_id(deleted: bool, node_left: bool) -> None:
+    """DAH-6531: the backend waits on one node-left delete; an answer to any other delete for the pod must not match."""
+    client = _client(_redis_service())
+    client.lock = asyncio.Lock()
+    client.get_miner_axon_info = AsyncMock(return_value=MagicMock(ip="1.2.3.4", port=8000))
+    ids = {"pod_id": "pod-1", "miner_hotkey": "miner-hk", "executor_id": "exec-1"}
+    client.miner_service.handle_container = AsyncMock(
+        return_value=ContainerDeleted(**ids) if deleted else FailedContainerRequest(**ids, msg="not the node left")
+    )
+    fields = {**ids, "container_name": "", "command_id": "cmd-1"}
+    request = (
+        ContainerDeleteOnNodeLeftRequest(**fields, expected_boot_id="b")
+        if node_left
+        else ContainerDeleteRequest(**fields)
+    )
+
+    await client._drive_miner_job(request)
+
+    assert [m.command_id for m in client.message_queue] == ["cmd-1" if node_left else ""]
 
 
 @pytest.mark.asyncio
