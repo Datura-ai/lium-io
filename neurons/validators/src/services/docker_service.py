@@ -3727,6 +3727,10 @@ async def _replay_own_finished_create(
         raise _OwnCreateWithoutRecord(f"docker could not list the container (exit {result.exit_status})")
     record_text, _, state = (result.stdout or "").partition(_CREATE_RECORD_STATE_MARK)
     fields = state.split()
+    if len(fields) == 1 and create_node_absent.get() is not None:
+        # the pod's container carries no command label: an older validator made it, maybe this very command's run cut
+        # off by the upgrade. Its outcome is unknown; the cleanup below would remove it and its volume
+        raise _OwnCreateWithoutRecord("the pod's container has no command label and this command ran before")
     if len(fields) != 2 or fields[1] != payload.command_id:
         if (absent := create_node_absent.get()) is not None:
             absent.append(True)

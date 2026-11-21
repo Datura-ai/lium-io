@@ -96,6 +96,8 @@ def client(monkeypatch):
     service = RedisService.__new__(RedisService)
     service.redis = FakeRedis()
     service.lock = asyncio.Lock()
+    # no pending mark of an earlier run of the command (compute_client._command_ran_before)
+    service.get_pending_pods = AsyncMock(return_value=[])
     client = ComputeClient.__new__(ComputeClient)
     client.message_queue = OutgoingMessages()
     client.lock = asyncio.Lock()

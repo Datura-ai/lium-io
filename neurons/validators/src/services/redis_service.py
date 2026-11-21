@@ -1299,6 +1299,8 @@ class RedisService:
             created = [   # readable: _backend_commands yields no create with an unreadable reply
                 raw for raw in command.responses
                 if json.loads(raw)["message_type"] == ContainerResponseType.ContainerCreated.value
+                # a filler's success gets no receipt from the backend: it is never one awaited
+                and json.loads(raw).get("workload_kind") != WorkloadKind.FILLER.value
             ]
             if not created or await self.redis.ttl(f"{BACKEND_COMMAND_PREFIX}{command_id}") != -1:
                 continue

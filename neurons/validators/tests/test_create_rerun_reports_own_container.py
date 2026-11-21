@@ -169,3 +169,32 @@ async def test_only_a_listing_without_this_commands_container_counts_as_absent(s
         create_node_absent.reset(token)
 
     assert absent == ([True] if node in ("empty", "other_command") else [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ran_before", [True, False])
+async def test_an_unlabelled_container_from_before_the_upgrade_is_kept_when_this_command_ran_before(
+    svc, monkeypatch, ran_before
+):
+    """An older validator labelled no container with its command. When this command ran before (its record or its
+    pending mark says so), the pod's unlabelled container may be that run's: the create answers nothing and never
+    reaches the cleanup that would remove it with its volume. A command that never ran replaces it as before."""
+    n = _Node()
+    ssh_client = n.wrap(_ssh_client(inspect_exit=0))
+    _patch_happy(svc, monkeypatch, ssh_client)
+    n.container = (True, "")
+    cleanup = AsyncMock()
+    monkeypatch.setattr(svc, "clean_existing_containers", cleanup)
+    absent: list[bool] = []
+    token = create_node_absent.set(absent if ran_before else None)
+    try:
+        result = await _create(svc, _payload(command_id="cmd-1"), ssh_client)
+    finally:
+        create_node_absent.reset(token)
+
+    if ran_before:
+        assert result is None
+        cleanup.assert_not_awaited()
+        assert absent == []
+    else:
+        cleanup.assert_awaited()

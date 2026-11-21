@@ -2000,3 +2000,67 @@ async def test_a_create_passes_its_own_earlier_pending_mark_but_not_another_comm
     assert not await redis_service.renting_in_progress("miner-hk", "exec-1", "pod-1", except_command_id="cmd-1")
     assert await redis_service.renting_in_progress("miner-hk", "exec-1", "pod-1", except_command_id="cmd-2")
     assert await redis_service.renting_in_progress("miner-hk", "exec-1", "pod-1")
+
+
+@pytest.mark.parametrize("kept_in", ["command_record", "saved_report"])
+@pytest.mark.asyncio
+async def test_a_running_fillers_success_does_not_hold_back_the_restart_report(kept_in) -> None:
+    """The backend handles a filler's success without a rent-finished receipt. A running filler's kept success is
+    therefore neither replayed nor waited on, so an interrupted customer create (a custom build, which the backend
+    resends only from the report) still gets its resend at once."""
+    redis_service = _redis_service()
+    client = _client(redis_service)
+    client.lock = asyncio.Lock()
+    filler = ContainerCreated(
+        miner_hotkey="miner-hk", executor_id="exec-1", pod_id="pod-f", container_name="filler_1", volume_name="v-f",
+        port_maps=[(22, 40022)], command_id="cmd-f", workload_kind=WorkloadKind.FILLER,
+    )
+    await _finished_create_record(redis_service, "cmd-f", filler)
+    if kept_in == "saved_report":   # saved while its pending mark was still there, as for any create
+        await redis_service.add_pending_pod("miner-hk", "exec-1", "pod-f", command_id="cmd-f")
+        await redis_service.add_unacked_container_created("pod-f", filler.model_dump_json())
+    await redis_service.add_inflight_backend_create("pod-c", "miner-hk", "exec-1", WorkloadKind.CUSTOMER_RENTAL, "cc")
+    redis_service.rented_pod_ids = AsyncMock(return_value=frozenset())
+
+    await client.fail_creates_cut_off_by_restart()
+    ws = AsyncMock()
+    awaiting = await client.resend_unacked_container_created(ws)
+
+    assert awaiting == {}
+    ws.send.assert_not_awaited()
+    assert client.resumed_creates_report.pod_ids == ["pod-c"]
+    assert await redis_service.unsettled_create_successes() == {}
+
+
+@pytest.mark.parametrize("mark", ["this_command", "another_command", "none"])
+@pytest.mark.asyncio
+async def test_a_create_whose_pending_mark_shows_an_earlier_run_holds_its_failure_back(mark) -> None:
+    """A create cut off before its command record existed (an older validator's run, cut off by the upgrade) left
+    only its pending mark, which carries the command ID. Its resend fails before the node was asked: the failure is
+    held back and the outcome kept unknown. Another command's mark, or none, changes nothing."""
+    redis_service = _redis_service()
+    if mark != "none":
+        await redis_service.add_pending_pod(
+            "miner-hk", "exec-1", "pod-1", command_id="cmd-1" if mark == "this_command" else "cmd-0"
+        )
+    client = _client(redis_service)
+    client.lock = asyncio.Lock()
+    client.message_queue = OutgoingMessages()
+    client.keypair = MagicMock()
+    client._accept_create_dispatch = AsyncMock(return_value=True)
+    client.get_miner_axon_info = AsyncMock(return_value=MagicMock(ip="1.2.3.4", port=8000))
+    client.miner_service.handle_container = AsyncMock(return_value=_failure())
+    request = ContainerCreateRequest.model_construct(
+        pod_id="pod-1", miner_hotkey="miner-hk", executor_id="exec-1", workload_kind=WorkloadKind.CUSTOMER_RENTAL,
+        command_id="cmd-1",
+    )
+
+    await client.miner_driver(request)
+
+    stored = BackendCommand.model_validate_json(await redis_service.redis.get(BACKEND_COMMAND_PREFIX + "cmd-1"))
+    if mark == "this_command":
+        assert list(client.message_queue) == []
+        assert (stored.state, stored.unknown) == ("finished", True)
+    else:
+        assert len(client.message_queue) == 1
+        assert stored.unknown is False

@@ -26,6 +26,7 @@ from payload_models.payloads import (
     ContainerCreateRequest,
     ContainerDeleteRequest,
     ContainerResponseType,
+    WorkloadKind,
     ContainerStartRequest,
     ContainerStopRequest,
     AddSshPublicKeyRequest,
@@ -1118,6 +1119,10 @@ class ComputeClient:
             claim, existing = record.model_dump_json(), None
         if existing is not None:
             return await self._handle_backend_command_duplicate(job_request, existing)
+        # an earlier run of this command may have left its container: its record says so, or (a run cut off before
+        # this record existed, by an older validator too) the pod's pending mark carries this command ID, written
+        # before any `docker run`
+        uncertain = create and (record.unknown or await self._command_ran_before(job_request))
 
         responses: list[str] = []
         token = command_responses.set(responses)
@@ -1126,7 +1131,7 @@ class ComputeClient:
         retirements: list[tuple[str, str]] = []
         retirements_token = deferred_create_retirements.set(retirements if create else None)
         # an earlier run of this command may have left its container: no failure is answered until the node says not
-        absent_token = create_node_absent.set([] if create and record.unknown else None)
+        absent_token = create_node_absent.set([] if uncertain else None)
         heartbeat = None if create else asyncio.create_task(self._refresh_backend_command(command_id, claim))
         succeeded = False
         try:
@@ -1145,7 +1150,7 @@ class ComputeClient:
             # A failure without any answer releases the claim so a retry can run; a create whose container may be on
             # the node with no known outcome (found so now, or so before and not answered by this re-check) is kept as
             # unknown instead, so the restart report never fails its pod (fail_creates_cut_off_by_restart)
-            unknown = bool(unknown_flags) or (record.unknown and not responses)
+            unknown = bool(unknown_flags) or (uncertain and not responses)
             value = (
                 record.model_copy(
                     update={"state": "finished", "owner": "", "responses": responses, "unknown": unknown}
@@ -1177,6 +1182,20 @@ class ComputeClient:
             if create and not kept:
                 with suppress(Exception):   # a left entry only costs the pod's delete one no-op expire
                     await redis_service.unindex_backend_create(job_request.pod_id, job_request.executor_id, command_id)
+
+    async def _command_ran_before(self, job_request: ContainerCreateRequest) -> bool:
+        """the pod's pending marks include one of this command (any age); unreadable counts as yes, which only holds a
+        failure back until the node is asked"""
+        try:
+            marks = await self.miner_service.redis_service.get_pending_pods(
+                job_request.miner_hotkey, job_request.executor_id, None
+            )
+        except Exception:  # noqa: BLE001
+            return True
+        return any(
+            mark.get("pod_id") == job_request.pod_id and mark.get("command_id") == job_request.command_id
+            for mark in marks
+        )
 
     async def _handle_backend_command_duplicate(
         self, job_request: BaseServerRequest, existing: BackendCommand
@@ -1354,6 +1373,10 @@ class ComputeClient:
         try:
             created = ContainerCreated.model_validate_json(message_json)
         except pydantic.ValidationError:
+            return False
+        if created.workload_kind == WorkloadKind.FILLER:
+            # the backend handles a filler's success without a rent-finished receipt, so it waits on none: replayed,
+            # its receipt would never come and the restart report would wait on it for good
             return False
         redis_service = self.miner_service.redis_service
         return await redis_service.renting_in_progress(
