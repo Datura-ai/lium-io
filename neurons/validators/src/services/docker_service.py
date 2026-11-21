@@ -1852,12 +1852,35 @@ def _executor_label(payload) -> str:
     return f"{payload.miner_hotkey}:{payload.executor_id}"
 
 
+def _pod_volume_labels(payload) -> dict[str, str]:
+    """A customer volume's ownership: the pod and the registration that created it (the node-left delete's filter)."""
+    return {LIUM_POD_ID_LABEL: payload.pod_id, LIUM_EXECUTOR_ID_LABEL: _executor_label(payload)}
+
+
+class PodVolumeOfAnotherRegistrationInUse(RuntimeError):
+    """The pod's volume name on this daemon is held by another registration's volume that is still in use."""
+
+
+def _drop_another_registrations_volume_command(volume: str, owner: str) -> str:
+    """Docker hands an existing volume of the same name back to a create as it is, label included, so a replacement
+    made on the daemon the pod left would mount the left registration's volume and the node-left delete could remove
+    it. That volume (the pod's failed create there) is removed first; one in use fails the command. Unlabelled
+    volumes (made before the label) are reused as before; the node-left delete never removes them."""
+    found = f'{{{{index .Labels "{LIUM_EXECUTOR_ID_LABEL}"}}}}'
+    return (
+        f"owner=$(/usr/bin/docker volume inspect -f {shlex.quote(found)} {volume} 2>/dev/null) || exit 0; "
+        f'[ -z "$owner" ] || [ "$owner" = {shlex.quote(owner)} ] || /usr/bin/docker volume rm {volume} >/dev/null'
+    )
+
+
 def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
     """Exits 97 on another boot, or when the pod's container there was created for another registration (a
     replacement made on this host through a re-pointed registration or another miner's registration of the same
-    executor); 0 once the left registration's container and its kept edit containers are gone. Unlabelled containers
-    (made before the label) are kept. The pod's named volumes are never removed here: a replacement on the same
-    daemon reuses volume_<pod id> as it is, label included, so nothing on the volume tells the two apart."""
+    executor); 0 once the left registration's container, its kept edit containers and the pod's volumes it created
+    are gone. Volumes go by a label-filtered prune: the daemon matches each volume's pod and registration labels as
+    it removes it, so a replacement's volume (a create never reuses another registration's, see
+    _drop_another_registrations_volume_command) is never removed, and one in use is skipped. Unlabelled containers
+    and volumes (made before the labels) are kept."""
     if not payload.executor_id or not payload.miner_hotkey:
         raise ValueError("the delete names no registration")
     name = shlex.quote(payload.container_name)
@@ -1874,9 +1897,16 @@ def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
         f"--filter label={shlex.quote(f'{LIUM_EXECUTOR_ID_LABEL}={_executor_label(payload)}')}) || exit 1",
         "/usr/bin/docker rm -fv $id $kept >/dev/null 2>&1",
         '[ -n "$id" ] && /usr/bin/docker inspect --type container "$id" >/dev/null 2>&1 && exit 1',
-        "exit 0",
     ]
-    # shortcut: the left node keeps the pod's named volumes; remove them once a delete can prove another daemon
+    owned = " ".join(
+        f"--filter label={shlex.quote(f'{key}={value}')}" for key, value in _pod_volume_labels(payload).items()
+    )
+    # -a (Docker 23+) also prunes named volumes; older daemons prune named volumes without it
+    lines.append(
+        f"/usr/bin/docker volume prune -f -a {owned} >/dev/null 2>&1 "
+        f"|| /usr/bin/docker volume prune -f {owned} >/dev/null || exit 1"
+    )
+    lines.append("exit 0")
     return "\n".join(lines)
 
 
@@ -8709,6 +8739,20 @@ class DockerService:
             )
         )
         await self.stream_log(log_text, "success", log_tag)
+        if labels and LIUM_EXECUTOR_ID_LABEL in labels:
+            dropped = await _run_with_host_timeout(
+                ssh_client,
+                _drop_another_registrations_volume_command(
+                    _quote_safe_docker_volume_name(local_volume, field_name="local_volume"),
+                    labels[LIUM_EXECUTOR_ID_LABEL],
+                ),
+                timeout,
+            )
+            if dropped.exit_status != 0:
+                raise PodVolumeOfAnotherRegistrationInUse(
+                    f"volume {local_volume} on this host belongs to another registration and could not be removed "
+                    f"(exit {dropped.exit_status})"
+                )
         await run_logged_rental_docker_sdk_operation(
             operation="create_volume",
             log_extra=volume_log_extra,
@@ -11608,7 +11652,7 @@ class DockerService:
                         labels=(
                             FILLER_VOLUME_LABELS
                             if payload.workload_kind == WorkloadKind.FILLER
-                            else {LIUM_EXECUTOR_ID_LABEL: _executor_label(payload)}
+                            else _pod_volume_labels(payload)
                         ),
                     )
                     created_local_volume = True

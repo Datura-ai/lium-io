@@ -170,6 +170,8 @@ async def test_a_filler_volume_is_labelled_filler_and_a_filler_create_sweeps_onl
     assert type(result).__name__ == "ContainerCreated"
     # a customer volume carries the registration it was made for (DAH-6531), never the filler label
     assert svc.create_local_volume.await_args.kwargs["labels"] == (
-        labels if labels is not None else {"io.lium.executor_id": f"{payload.miner_hotkey}:{payload.executor_id}"}
+        labels
+        if labels is not None
+        else {"io.lium.pod_id": payload.pod_id, "io.lium.executor_id": f"{payload.miner_hotkey}:{payload.executor_id}"}
     )
     assert _removed_names(ssh_client) == swept_volumes

@@ -17,7 +17,12 @@ from payload_models.payloads import (
     FailedContainerErrorCodes,
     FailedContainerRequest,
 )
-from services.docker_service import _node_left_delete_command, executor_key, inflight_creates
+from services.docker_service import (
+    _drop_another_registrations_volume_command,
+    _node_left_delete_command,
+    executor_key,
+    inflight_creates,
+)
 
 from tests.test_delete_drops_dirty_volume import _delete, _delete_payload, _wire_delete
 from tests.test_docker_service import (  # noqa: F401
@@ -76,17 +81,17 @@ LEFT_MINER = "miner-a"
 LEFT_LABEL = f"{LEFT_MINER}:{LEFT}"
 
 
-def _run(
-    tmp_path: Path, payload, container_owner: str | None = LEFT_LABEL, sticky: bool = False
-) -> tuple[int, str]:
-    """Runs the real command against a docker stub: the container exists while its owner file does, a removal
-    deletes it unless sticky; the volume answers the left registration's label."""
-    log, container, volume = tmp_path / "calls", tmp_path / "container", tmp_path / "volume"
+def _daemon_stub(tmp_path: Path, container_owner: str | None, sticky: bool = False, old_prune: bool = False) -> Path:
+    """A docker stub: the container exists while its owner file does, a removal deletes it unless sticky; each file
+    under volumes/ is a volume whose content is its labels, and `volume prune` removes those carrying every
+    `--filter label=` it is given (with `-a` refused when old_prune)."""
+    log, container, volumes = tmp_path / "calls", tmp_path / "container", tmp_path / "volumes"
+    volumes.mkdir(exist_ok=True)
     if container_owner is not None:
         container.write_text(container_owner)
-    volume.write_text(LEFT_LABEL)
-    stub = tmp_path / "docker"
     keep = "true" if sticky else f"rm -f {shlex.quote(str(container))}"
+    refuse_all = 'case " $* " in *" -a "*) exit 125;; esac; ' if old_prune else ""
+    stub = tmp_path / "docker"
     stub.write_text(
         "#!/bin/sh\n"
         f'echo "$*" >> {shlex.quote(str(log))}\n'
@@ -94,13 +99,30 @@ def _run(
         "  ps) echo kept1;;\n"
         f'  inspect) [ -e {shlex.quote(str(container))} ] || exit 1; case "$*" in *-f*) printf "cid "; cat {shlex.quote(str(container))};; esac;;\n'
         f"  rm) {keep};;\n"
-        f'  volume) if [ "$2" = inspect ]; then cat {shlex.quote(str(volume))}; fi;;\n'
+        '  volume) [ "$2" = prune ] || exit 0; ' + refuse_all + "want=; for a in \"$@\"; do case \"$a\" in label=*) want=\"$want ${a#label=}\";; esac; done; "
+        f'for v in {shlex.quote(str(volumes))}/*; do [ -e "$v" ] || continue; ok=1; '
+        'for w in $want; do grep -qxF "$w" "$v" || ok=; done; [ -n "$ok" ] && rm -f "$v"; done; exit 0;;\n'
         "esac\n"
     )
     stub.chmod(0o755)
+    return stub
+
+
+def _volume(tmp_path: Path, name: str, *labels: str) -> Path:
+    path = tmp_path / "volumes" / name
+    path.parent.mkdir(exist_ok=True)
+    path.write_text("".join(f"{label}\n" for label in labels))
+    return path
+
+
+def _run(
+    tmp_path: Path, payload, container_owner: str | None = LEFT_LABEL, sticky: bool = False, old_prune: bool = False
+) -> tuple[int, str]:
+    stub = _daemon_stub(tmp_path, container_owner, sticky, old_prune)
     payload = payload.model_copy(update={"executor_id": LEFT, "miner_hotkey": LEFT_MINER})
     command = _node_left_delete_command(payload).replace("/usr/bin/docker", str(stub))
     done = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
+    log = tmp_path / "calls"
     return done.returncode, log.read_text() if log.exists() else ""
 
 
@@ -110,14 +132,24 @@ def test_another_boot_runs_no_docker_command(tmp_path):
     assert (status, calls) == (97, "")
 
 
-def test_the_node_left_removes_the_container_and_its_kept_containers_never_the_volume(tmp_path):
-    # a replacement on the same daemon reuses volume_<pod id> with the left registration's label still on it
-    status, calls = _run(tmp_path, _payload(HOST_BOOT))
+@pytest.mark.parametrize("old_prune", [False, True])
+def test_the_node_left_removes_its_container_kept_containers_and_only_its_own_volume(tmp_path, old_prune):
+    payload = _payload(HOST_BOOT)
+    pod = f"io.lium.pod_id={payload.pod_id}"
+    own = _volume(tmp_path, "volume_left", pod, f"io.lium.executor_id={LEFT_LABEL}")
+    # a replacement made on this daemon by another registration, or another miner's registration of this executor
+    replacement = _volume(tmp_path, "volume_replacement", pod, "io.lium.executor_id=miner-b:replacement-executor")
+    same_executor_other_miner = _volume(tmp_path, "volume_other_miner", pod, f"io.lium.executor_id=miner-b:{LEFT}")
+    other_pod = _volume(tmp_path, "volume_other_pod", "io.lium.pod_id=other", f"io.lium.executor_id={LEFT_LABEL}")
+    unlabelled = _volume(tmp_path, "volume_unlabelled")
+
+    status, calls = _run(tmp_path, payload, old_prune=old_prune)
 
     assert status == 0
     assert "rm -fv cid kept1" in calls  # the checked container, by its ID
     assert f"label=io.lium.executor_id={LEFT_LABEL}" in calls  # kept containers of the left registration only
-    assert "volume" not in calls
+    assert not own.exists()
+    assert all(v.exists() for v in (replacement, same_executor_other_miner, other_pod, unlabelled))
 
 
 @pytest.mark.parametrize("owner", [f"{LEFT_MINER}:replacement-executor", f"miner-b:{LEFT}", LEFT, ""])
@@ -130,17 +162,49 @@ def test_a_container_made_for_another_registration_on_this_host_is_never_touched
     assert "rm" not in calls.replace("inspect", "")
 
 
-def test_with_no_container_left_nothing_is_removed(tmp_path):
-    status, calls = _run(tmp_path, _payload(HOST_BOOT), container_owner=None)
+def test_with_no_container_left_only_its_own_volume_is_removed(tmp_path):
+    payload = _payload(HOST_BOOT)
+    own = _volume(tmp_path, "volume_left", f"io.lium.pod_id={payload.pod_id}", f"io.lium.executor_id={LEFT_LABEL}")
 
-    assert status == 0
-    assert "volume" not in calls and "rm -fv cid" not in calls
+    status, calls = _run(tmp_path, payload, container_owner=None)
+
+    assert status == 0 and "rm -fv cid" not in calls
+    assert not own.exists()
 
 
-def test_a_container_still_present_fails(tmp_path):
+def test_a_container_still_present_fails_before_the_volumes(tmp_path):
     status, calls = _run(tmp_path, _payload(HOST_BOOT), sticky=True)
 
     assert status == 1
+    assert "volume" not in calls
+
+
+@pytest.mark.parametrize(
+    ("present", "rm_fails", "expected_status", "removed"),
+    [
+        (None, False, 0, False),  # no volume yet: the create makes it
+        ("", False, 0, False),  # made before the label: reused as before
+        (LEFT_LABEL, False, 0, False),  # this registration's own: reused
+        ("miner-b:replacement-executor", False, 0, True),  # another registration's: removed before the create
+        ("miner-b:replacement-executor", True, 1, False),  # another registration's, in use: the create fails
+    ],
+)
+def test_a_create_never_reuses_another_registrations_volume(tmp_path, present, rm_fails, expected_status, removed):
+    log = tmp_path / "calls"
+    stub = tmp_path / "docker"
+    inspect = "exit 1" if present is None else f"echo {shlex.quote(present)}"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f'echo "$*" >> {shlex.quote(str(log))}\n'
+        f'case "$2" in inspect) {inspect};; rm) exit {1 if rm_fails else 0};; esac\n'
+    )
+    stub.chmod(0o755)
+    command = _drop_another_registrations_volume_command("volume_p", LEFT_LABEL).replace("/usr/bin/docker", str(stub))
+
+    done = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
+
+    assert done.returncode == expected_status
+    assert ("volume rm volume_p" in log.read_text()) is (removed or rm_fails)
 
 
 @pytest.mark.parametrize("missing", ["executor_id", "miner_hotkey"])
