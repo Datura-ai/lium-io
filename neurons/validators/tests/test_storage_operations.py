@@ -785,3 +785,58 @@ def test_a_launch_cut_by_a_hangup_while_receiving_its_spec_removes_the_partial_c
     assert shell.wait(timeout=10) != 0
     assert not part.exists() and not Path(str(files.spec)).exists()
     assert not started.exists()
+
+
+def test_a_launch_waiting_for_the_lock_leaves_the_holders_partial_spec_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # review at 42e8268: a second launch that times out on the lock must not remove the spec the holder is receiving
+    import fcntl
+
+    _patch_launch(monkeypatch, tmp_path)
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    Path(str(files.spec)).parent.mkdir(parents=True)
+    Path(str(files.lock)).parent.mkdir(parents=True)
+    commands: list[str] = []
+
+    async def capture(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        commands.append(command)
+        failed = "nohup" in command or command.startswith(("test -e", "pgrep"))
+        return SimpleNamespace(exit_status=1 if failed else 0, stdout="", stderr="")
+
+    with pytest.raises(storage_operations.StorageOperationLaunchError):
+        asyncio.run(storage_operations.start_storage_operation(
+            SimpleNamespace(run=capture), "sh", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+        ))
+    launch = next(c for c in commands if "nohup" in c).replace("flock -w 30 9", "flock -w 0.2 9")
+    part = Path(str(files.part))
+    part.write_text('{"engine":')  # the lock holder's transfer in progress
+    with open(str(files.lock), "a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        done = subprocess.run(["sh", "-c", launch], input=b'{"engine":"restic"}', capture_output=True, timeout=10)
+    assert done.returncode == 6
+    assert part.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_stops_a_runner_of_the_earlier_release_through_its_own_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # review at 42e8268: a runner started before start times were recorded watches the old marker; it gets it and
+    # stops, while its PID is still never signalled
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    monkeypatch.setattr(storage_operations, "_report_cancelled", AsyncMock(return_value=True))
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    legacy = tmp_path / f"{OPERATION_ID}.cancel"
+    spawned = subprocess.run(
+        ["sh", "-c", f"sh -c 'while ! test -e {legacy}; do sleep 0.05; done; : --spec {files.spec}' "
+         ">/dev/null 2>&1 & echo $!"],
+        capture_output=True, text=True,
+    )
+    runner_pid = int(spawned.stdout)
+    (tmp_path / f"{OPERATION_ID}.pid").write_text(str(runner_pid))
+    try:
+        await storage_operations.cancel_storage_operation(_local_ssh(), OPERATION_ID)
+        assert subprocess.run(["kill", "-0", str(runner_pid)], capture_output=True).returncode != 0
+    finally:
+        subprocess.run(["kill", "-KILL", str(runner_pid)], capture_output=True)

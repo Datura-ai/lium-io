@@ -184,6 +184,7 @@ class StorageOperationFiles:
     lock: PurePosixPath
     start: PurePosixPath
     part: PurePosixPath
+    legacy_cancel: PurePosixPath
 
     @classmethod
     def for_operation(cls, operation_id: UUID) -> StorageOperationFiles:
@@ -200,6 +201,8 @@ class StorageOperationFiles:
             start=REMOTE_OPERATION_DIRECTORY / f"{stem}.start",
             # the spec while the launch receives it; one name per operation, so a cut launch's copy is overwritten
             part=REMOTE_OPERATION_DIRECTORY / f"{stem}.json.part",
+            # the marker a runner started by an earlier validator release watches
+            legacy_cancel=REMOTE_OPERATION_DIRECTORY / f"{stem}.cancel",
         )
 
 
@@ -391,8 +394,9 @@ async def _start_storage_operation(
         launch_command = (
             _owned_shell_function(files)
             # a cut session (HUP) or a kill ends the shell through its EXIT trap, which removes the partial spec
-            + f"trap 'rm -f {part_path}' EXIT; trap 'exit 1' HUP INT TERM PIPE; "
-            f"command exec 9>>{lock_path} 2>/dev/null; flock -w 30 9 || exit 6; "
+            # only the lock holder owns the partial spec: a launch still waiting for the lock removes nothing
+            + "trap 'exit 1' HUP INT TERM PIPE; "
+            f"command exec 9>>{lock_path} 2>/dev/null; flock -w 30 9 || exit 6; trap 'rm -f {part_path}' EXIT; "
             f"if test -e {shlex.quote(str(files.cancel))}; then rm -f {shlex.quote(str(files.spec))}; exit 5; fi; "
             # another launch (this or another validator process) got there first: a live recorded wrapper (or a
             # runner recorded before process groups) is the operation, and a written status is its result;
@@ -520,6 +524,9 @@ async def cancel_storage_operation(
         # read under the lock: a launch that took it first has written its PID by now; release it before
         # the bounded wait so other operations' launches never queue behind this one
         f"pid=$(cat {pid_path} 2>/dev/null); exec 9>&-; "
+        # a PID recorded without a start time comes from an earlier release, whose runner watches the old marker
+        f'if test -n "$pid" && ! test -s {shlex.quote(str(files.start))}; then '
+        f"touch {shlex.quote(str(files.legacy_cancel))} || marked=4; fi; "
         "case \"$pid\" in (*[!0-9]*) exit 2;; esac; "
         # a recorded PID the host has since given to another process is not signalled; only the helper is removed.
         # A signal needs the recorded start time to match (`started`): a PID recorded without one (before this
@@ -638,7 +645,7 @@ async def _remove_operation_artifacts(
             shlex.quote(str(path))
             # the cancel marker stays: the operation id is never reused, and a late launch must see it
             # shortcut: one empty marker per cancelled operation stays on the reserve volume; sweep old ones if they pile up
-            for path in (files.status, files.log, files.pid, files.start, files.spec, files.part)
+            for path in (files.status, files.log, files.pid, files.start, files.spec, files.part, files.legacy_cancel)
         ),
         check=False,
     )
