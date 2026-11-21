@@ -534,6 +534,37 @@ async def test_a_second_no_task_time_cycle_without_a_pass_between_is_withheld(re
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason", [RentalVerificationMessages.NO_TASK_TIME.reason, VerifyXMessages.NO_TASK_TIME.reason]
+)
+@pytest.mark.parametrize("earlier_gate", [None, "cpu_truth_passed", "cc_vbios_passed"])
+async def test_a_budget_stop_after_a_check_zeroed_the_score_keeps_that_failure(context_factory, reason, earlier_gate):
+    # review: a check that already ran this cycle and zeroed its score is no budget stop the last pass may replace
+    from services.task.service import budget_stop_reason
+
+    ctx = context_factory()
+    gate_event = build_msg(event="CPU count mismatch", reason="CPU_TRUTH_MISMATCH", severity="error", impact="")
+    events = [build_msg(event="ok", reason="VALIDATION_STEP_OK", severity="info", impact="")]
+    if earlier_gate:
+        ctx = ctx.model_copy(update={earlier_gate: False})
+        events.append(gate_event)
+    events.append(build_msg(event="no time", reason=reason, severity="warning", impact=""))
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_scored("node-idle")]}, service)
+    result = _failed("node-idle", budget_stop_reason(reason, events, ctx))
+
+    kept, withheld = await _carry_then_withhold(service, [result], rented_executor_ids=frozenset())
+
+    if earlier_gate:
+        [published] = kept["5Miner"]
+        assert published.failure_reason_code == "CPU_TRUTH_MISMATCH"
+        assert published.score == 0 and not published.carried_for_renter_gpu_reset
+        assert withheld == []
+    else:
+        assert [r.carried_for_renter_gpu_reset for r in kept["5Miner"]] == [True]
+
+
+@pytest.mark.asyncio
 async def test_an_idle_pass_never_stands_in_for_a_rented_gpu_reset_cycle():
     # review case B: idle pass, then a rental, then the renter's GPU reset: withheld as on main, not paid as idle
     service = _redis_service()

@@ -194,7 +194,6 @@ class VerifyXCheck:
         return result.error
 
     async def run(self, ctx: Context) -> CheckResult:
-        verifyx_service = ctx.services.verifyx
         specs = ctx.state.specs
         if not specs:
             event = render_message(
@@ -303,18 +302,11 @@ class VerifyXCheck:
             budget = task_seconds_left(ctx) - COLD_RETRY_MARGIN_SECONDS
             if budget < MIN_COLD_RETRY_SECONDS:
                 return self._no_task_time(ctx, {"seconds_left": max(0, int(budget))})
-            if budget >= VERIFYX_COMMAND_TIMEOUT_SECONDS:
-                result = await verifyx_service.validate_verifyx_and_process_job(
-                    shell=ctx.services.shell,
-                    executor_info=ctx.executor,
-                    default_extra=ctx.default_extra,
-                    machine_spec=specs,
-                    **sizing,
-                )
-            else:
-                result = await _verifyx_within(ctx, specs, sizing, budget)
-                if result is None:
-                    return self._no_task_time(ctx, {"cut_off_after_seconds": int(budget)})
+            # the preflight shares this budget, so even a full one bounds the whole call; the service still caps
+            # the remote run at VERIFYX_COMMAND_TIMEOUT_SECONDS after the preflight
+            result = await _verifyx_within(ctx, specs, sizing, budget)
+            if result is None:
+                return self._no_task_time(ctx, {"cut_off_after_seconds": int(budget)})
 
         prev_ema = (
             ctx.state.rented_data.network_ema.get(ctx.executor.uuid)

@@ -3287,3 +3287,8 @@ class SshdAuthLogMessages:
         category="runtime",
         impact="Proceed; observation only",
     )
+
+
+# DAH-5933: the run left the backend's rental probe, or VerifyX, too little time; the validator's budget, not the
+# node, decides that, so it is no failed check: an idle node carries its last scored result too
+NO_TASK_TIME_REASONS = (RentalVerificationMessages.NO_TASK_TIME.reason, VerifyXMessages.NO_TASK_TIME.reason)

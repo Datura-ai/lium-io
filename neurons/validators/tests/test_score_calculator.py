@@ -4,7 +4,11 @@ via integration in test_score_check.py and test_pipeline_default_scenarios.py.
 """
 import pytest
 
-from neurons.validators.src.services.task.score_calculator import calculate_scores
+from neurons.validators.src.services.task.score_calculator import (
+    ZERO_SCORE_GATE_FLAGS,
+    calculate_scores,
+    zero_score_gate_failed,
+)
 from neurons.validators.src.services.task.checks.verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
 from helpers import build_context_config, build_services, build_state, default_executor, make_context
 
@@ -218,3 +222,12 @@ def test_node_account_flag_zeroes_a_rented_score(passed):
     actual_score, _, warning = calculate_scores(ctx, rented=True)
     assert actual_score == (1.0 if passed else 0.0)
     assert ("not on the machine its account registered" in warning) is not passed
+
+
+@pytest.mark.parametrize("flag", ZERO_SCORE_GATE_FLAGS)
+def test_every_listed_gate_flag_zeroes_the_score(flag):
+    # zero_score_gate_failed tells a budget stop it has no pass to stand in for; its list must be the real gates
+    ctx = _ctx(500.0).model_copy(update={flag: False})
+    assert calculate_scores(ctx, rented=True)[0] == 0.0
+    assert zero_score_gate_failed(ctx)
+    assert not zero_score_gate_failed(_ctx(500.0))

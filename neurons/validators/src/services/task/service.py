@@ -36,6 +36,7 @@ from .availability import (
 )
 from .liumd_shadow import run_liumd_shadow, shadow_deadline
 from .messages import (
+    NO_TASK_TIME_REASONS,
     REASON_CODE_DOCS_URL,
     GpuLossHoldMessages,
     PostRentalGpuRecheckMessages,
@@ -46,8 +47,18 @@ from .models import VALIDATOR_REDIS_UNAVAILABLE, JobResult, ValidationEvent, bui
 from .pipeline import PodRecoverer
 from .pipeline_factory import PipelineFactory
 from .result_handler import ResultHandler
+from .score_calculator import zero_score_gate_failed
 
 logger = logging.getLogger(__name__)
+
+
+def budget_stop_reason(reason: str | None, events: list[ValidationEvent], ctx) -> str | None:
+    """A budget stop after a check that already zeroed this cycle's score is that check's failure, not a result
+    the rollout may hold back or replace with the last scored one: the reason becomes the check's own."""
+    if reason not in NO_TASK_TIME_REASONS or not zero_score_gate_failed(ctx):
+        return reason
+    return next((e.reason_code for e in reversed(events[:-1]) if e.severity in ("error", "warning")), None)
+
 
 def _is_ssh_transport_failure(error: BaseException) -> bool:
     """The pair the rented-machine check uses; OSError also covers a hung handshake since 3.11.
@@ -306,6 +317,7 @@ class TaskService:
                 # (success=True, score 0 when the image is OUTDATED).
                 if not success or result.score <= 0:
                     result.failure_reason_code = last_event.reason_code
+                result.failure_reason_code = budget_stop_reason(result.failure_reason_code, events, last_context)
                 # The liumd shadow is logged only; the result above is final before it starts.
                 # Never on a first pass: the express lane publishes only after this returns.
                 if settings.VALIDATOR_LIUMD_SHADOW and not settings.DRY_RUN and not first_pass:

@@ -12,6 +12,34 @@ from services.gpu_spec_table import normalize_gpu_model, reference_gpu_model
 from services.task.pipeline import Context
 
 
+# The context flags a non-fatal check clears to zero this cycle's score in calculate_scores below.
+ZERO_SCORE_GATE_FLAGS = (
+    "cpu_truth_passed",
+    "spec_floor_passed",
+    "provider_side_load_passed",
+    "rented_pod_resources_passed",
+    "rented_throughput_passed",
+    "gpu_attestation_identity_passed",
+    "cc_vbios_passed",
+    "hardware_identity_passed",
+    "kernel_gpu_view_passed",
+    "gpu_kernel_count_passed",
+    "gpu_model_passed",
+    "node_account_passed",
+)
+
+
+def zero_score_gate_failed(ctx: Context) -> bool:
+    """A check that already ran this cycle has zeroed its score, whatever the checks after it find."""
+    return any(not getattr(ctx, flag) for flag in ZERO_SCORE_GATE_FLAGS) or _tdx_gate_failed(ctx)
+
+
+def _tdx_gate_failed(ctx: Context) -> bool:
+    # GPU attestation is observe-only: tdx_attestation_passed also drops on a verified-bad GPU verdict
+    tdx_passed = ctx.tdx_attestation_passed or ctx.gpu_attestation_passed is False
+    return bool(settings.ENABLE_TCB_ENFORCEMENT and ctx.executor.tdx_quote and not tdx_passed)
+
+
 def calculate_scores(
     ctx: Context,
     rented: bool = False,
@@ -66,8 +94,7 @@ def calculate_scores(
     # known CVM is rejected upstream by the attestation ratchet. GPU attestation is
     # observe-only: tdx_attestation_passed also drops on a verified-bad GPU verdict
     # (only verified beside a TDX digest, so False implies one), and that alone must not zero the score.
-    tdx_passed = ctx.tdx_attestation_passed or ctx.gpu_attestation_passed is False
-    if settings.ENABLE_TCB_ENFORCEMENT and ctx.executor.tdx_quote and not tdx_passed:
+    if _tdx_gate_failed(ctx):
         actual_score = 0.0
         job_score = 0.0
         warning_messages.append("CVM attestation not passed (TDX attestation required)")

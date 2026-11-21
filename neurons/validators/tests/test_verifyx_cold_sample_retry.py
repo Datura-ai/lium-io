@@ -60,7 +60,7 @@ class _ProbeSequence:
         self.calls = 0
 
     async def validate_verifyx_and_process_job(
-        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None
+        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None, deadline_monotonic=None
     ):
         self.calls += 1
         self.run_dir = run_dir
@@ -460,9 +460,9 @@ class _HungRetryService(VerifyXValidationService):
         self.run_dirs = []
 
     async def validate_verifyx_and_process_job(
-        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None
+        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None, deadline_monotonic=None
     ):
-        if run_dir is None:
+        if not run_dir.startswith(".verifyx-retry-"):  # the first sample runs bounded too (DAH-5933)
             return self.firsts.pop(0)
         self.run_dirs.append(run_dir)
         challenge = SimpleNamespace(seed=1, cipher_text="c")
@@ -620,7 +620,9 @@ async def test_the_retry_only_gets_the_time_the_other_checks_left(
     assert result.passed is retried
     # with room to retry, the rental-state lookup (capped) and then the retry itself
     expected = [verifyx_check.RENTAL_STATE_TIMEOUT_SECONDS, left_before_score - verifyx_check.COLD_RETRY_MARGIN_SECONDS]
-    assert timeouts == (expected if retried else [])
+    # the first sample is cut at its own budget (900 s in _first_sample) before any of these
+    first_sample = 900.0 - verifyx_check.COLD_RETRY_MARGIN_SECONDS
+    assert timeouts == [first_sample] + (expected if retried else [])
 
 
 def _pod_on(uuid):

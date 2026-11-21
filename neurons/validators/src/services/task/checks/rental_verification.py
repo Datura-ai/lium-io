@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import asyncssh
+from clients.backend_client import HealthCheckTimedOut
 
 from core.config import settings
 from core.docker_utils import (
@@ -241,6 +242,7 @@ class RentalVerificationCheck:
                 ),
                 updates={},
             )
+        probe_timeout = int(min(HEALTH_CHECK_TIMEOUT_SECONDS, seconds_for_the_probe))
         try:
             # Call backend API to verify executor health. Pass the rental hint: when this validator
             # already sees an active customer rental, the backend skips the container-creating check
@@ -259,7 +261,7 @@ class RentalVerificationCheck:
                 else LEGACY_LOOPBACK_PLUGIN_ALIAS,
                 # DAH-6606: the backend's upload is dated like this validator's own, so it can be required
                 upload_nonce=upload_nonce_for_miner(miner_hotkey),
-                timeout=int(min(HEALTH_CHECK_TIMEOUT_SECONDS, seconds_for_the_probe)),
+                timeout=probe_timeout,
             )
 
             # Handle API failure (None response) - fail this executor
@@ -363,6 +365,24 @@ class RentalVerificationCheck:
                     updates={},
                 )
 
+        except HealthCheckTimedOut as e:
+            # a wait the task's time cut below the backend's full 300 s says nothing about the backend or the node
+            shortened = probe_timeout < HEALTH_CHECK_TIMEOUT_SECONDS
+            event = render_message(
+                Msg.NO_TASK_TIME if shortened else Msg.API_ERROR,
+                ctx=ctx,
+                check_id=self.check_id,
+                impact="This cycle fails; the task's time cut off the backend's rental probe, so this is not a "
+                "backend or API error"
+                if shortened
+                else None,
+                what={
+                    "error": str(e),
+                    "executor_uuid": executor.uuid,
+                    **({"cut_off_after_seconds": probe_timeout, "seconds_needed": HEALTH_CHECK_TIMEOUT_SECONDS} if shortened else {}),
+                },
+            )
+            return CheckResult(passed=False, event=event, updates={})
         except Exception as e:
             # Handle unexpected errors - fail this executor
             event = render_message(

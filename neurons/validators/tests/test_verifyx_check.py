@@ -49,6 +49,7 @@ class DummyVerifyXService:
         machine_spec: dict,
         challenge_config_overrides: dict | None = None,
         run_dir: str | None = None,
+        deadline_monotonic: float | None = None,
     ) -> MockVerifyXResponse:
         """Mock method that mimics the real verifyx service."""
         # Track what parameters we were called with
@@ -166,9 +167,12 @@ class _VerifyXServiceReturning:
         self._response = response
 
     async def validate_verifyx_and_process_job(
-        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None
+        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None, deadline_monotonic=None
     ):
         return self._response
+
+    async def kill_remote_verifyx(self, shell, run_dir, default_extra):
+        return True
 
 
 @pytest.mark.parametrize(

@@ -55,15 +55,32 @@ async def test_too_little_time_for_verifyx_is_no_task_time_and_no_run(context_fa
 
 
 @pytest.mark.asyncio
-async def test_a_full_budget_runs_verifyx_as_before(context_factory, monkeypatch):
-    _left(monkeypatch, COLD_RETRY_MARGIN_SECONDS + VERIFYX_COMMAND_TIMEOUT_SECONDS)
+async def test_a_full_budget_bounds_the_whole_call_at_the_time_left(context_factory, monkeypatch):
+    # the preflight runs inside the budget too, so a full budget is a deadline as well, not an unbounded 600 s run
+    _left(monkeypatch, COLD_RETRY_MARGIN_SECONDS + VERIFYX_COMMAND_TIMEOUT_SECONDS + 100)
     service = _Probe(_probe(760.0))
 
+    started = time.monotonic()
     result = await VerifyXCheck().run(_ctx(context_factory, service, _known(500.0)))
 
     assert result.passed is True
-    assert "run_dir" not in service.calls[0]
+    assert service.calls[0]["run_dir"].startswith(".verifyx-")
+    deadline_in = service.calls[0]["deadline_monotonic"] - started
+    assert VERIFYX_COMMAND_TIMEOUT_SECONDS + 100 <= deadline_in <= VERIFYX_COMMAND_TIMEOUT_SECONDS + 101
     assert service.kills == []
+
+
+@pytest.mark.asyncio
+async def test_a_full_budget_run_cut_by_the_time_left_is_no_task_time_and_killed(context_factory, monkeypatch):
+    _left(monkeypatch, COLD_RETRY_MARGIN_SECONDS + VERIFYX_COMMAND_TIMEOUT_SECONDS)
+    monkeypatch.setattr(verifyx_check, "COLD_RETRY_MARGIN_SECONDS", COLD_RETRY_MARGIN_SECONDS + VERIFYX_COMMAND_TIMEOUT_SECONDS - 0.05)
+    monkeypatch.setattr(verifyx_check, "MIN_COLD_RETRY_SECONDS", 0.01)
+    service = _Probe(_probe(760.0), run_s=1.0)
+
+    result = await VerifyXCheck().run(_ctx(context_factory, service, _known(500.0)))
+
+    assert result.event.reason_code == Msg.NO_TASK_TIME.reason
+    assert service.kills == [service.calls[0]["run_dir"]]
 
 
 @pytest.mark.asyncio
@@ -216,6 +233,22 @@ async def test_the_remote_deadline_is_what_the_budget_leaves_after_the_preflight
 
     assert result.stdout == "captured"
     assert commands == ["timeout -k 10 250 run &"] or commands == ["timeout -k 10 249 run &"]
+
+
+@pytest.mark.asyncio
+async def test_a_deadline_past_the_cap_still_runs_the_remote_for_the_cap(monkeypatch):
+    # a full budget now passes its deadline too; the 600 s remote cap still applies after the preflight
+    from neurons.validators.src.services import verifyx_validation_service as module
+
+    service = module.VerifyXValidationService.__new__(module.VerifyXValidationService)
+    commands = _preflight_passes(monkeypatch, service, module)
+
+    await service.validate_verifyx_and_process_job(
+        shell=None, executor_info=None, default_extra={}, machine_spec={}, run_dir=".verifyx-t",
+        deadline_monotonic=time.monotonic() + VERIFYX_COMMAND_TIMEOUT_SECONDS + 300,
+    )
+
+    assert commands == [f"timeout -k 10 {VERIFYX_COMMAND_TIMEOUT_SECONDS} run &"]
 
 
 @pytest.mark.asyncio

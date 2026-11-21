@@ -46,6 +46,7 @@ from services.task.messages import (
     GpuPowerLimitMessages,
     GpuUsageMessages,
     MachineSpecMessages,
+    NO_TASK_TIME_REASONS,
     PortConnectivityMessages,
     PortCountMessages,
     RentalVerificationMessages,
@@ -53,7 +54,6 @@ from services.task.messages import (
     SCRAPE_UNDETERMINED_FAILURE_REASONS,
     TenantEnforcementMessages,
     UploadFilesMessages,
-    VerifyXMessages,
 )
 from services.task.models import VALIDATOR_REDIS_UNAVAILABLE, JobResult
 from services.task.result_handler import pods_rented_gpu_count
@@ -757,9 +757,6 @@ def has_renter_gpu_reset_holds(job_results: dict[str, list[JobResult]]) -> bool:
     return any(_held_for_renter_gpu_reset(result) for results in job_results.values() for result in results)
 
 
-# DAH-5933: the run left the backend's rental probe, or VerifyX, too little time; the validator's budget, not the
-# node, decides that, so it is no failed check: an idle node carries its last scored result too
-NO_TASK_TIME_REASONS = (RentalVerificationMessages.NO_TASK_TIME.reason, VerifyXMessages.NO_TASK_TIME.reason)
 # a cycle that cannot tell the node's state gives no verdict: the renter's GPU reset (DAH-4658), a power tier
 # reading whose clear was not confirmed (F-43), or a check the task had no time left for (DAH-5933)
 _HELD_REASONS = (

@@ -438,6 +438,31 @@ async def test_rental_verification_api_error():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "seconds_left, reason",
+    [(200, Msg.NO_TASK_TIME.reason), (500, Msg.API_ERROR.reason)],
+    ids=["wait-cut-by-the-task-time", "full-300s-wait"],
+)
+async def test_a_probe_wait_cut_by_the_task_time_is_no_task_time_not_an_api_error(context_factory, seconds_left, reason):
+    # review: only the task's budget shortened the wait; a timeout at the full 300 s stays an API error
+    from clients.backend_client import HealthCheckTimedOut
+
+    class TimingOutBackend(DummyBackendClient):
+        async def check_executor_health(self, **kwargs):
+            raise HealthCheckTimedOut(kwargs["timeout"])
+
+    backend = TimingOutBackend(response=None)
+    services = build_services(backend=backend, container_cleanup=ContainerCleanup())
+    ctx = context_factory(services=services, state=build_state(specs={"verified_ports": [8080]}))
+    ctx = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - (settings.JOB_TIME_OUT - 120 - seconds_left)})
+
+    result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.event.reason_code == reason
+
+
+@pytest.mark.asyncio
 async def test_rental_verification_exception():
     """Test handling of exceptions during API call."""
     class ExceptionBackendClient:
