@@ -151,8 +151,11 @@ jobs:
                           name = str(step.get("uses") or "").split("@")[0].lower()
                           args = step.get("with") if isinstance(step.get("with"), dict) else {}
                           if name == "docker/setup-buildx-action" and str(args.get("driver", "docker-container")) != "docker":
-                              opts = re.split(r"[\s,]+", str(args.get("driver-opts") or ""))
-                              if not any(o.startswith("image=") and is_digest(o[6:]) for o in opts):
+                              # exactly one image option, by digest: Buildx gets every option, so a second one could pick
+                              # another image, and any spelling the split below does not read as image= fails too
+                              raw = str(args.get("driver-opts") or "")
+                              opts = [o for o in re.split(r"[\s,]+", raw) if o.startswith("image=")]
+                              if len(re.findall("image", raw, flags=re.I)) != 1 or len(opts) != 1 or not is_digest(opts[0][6:]):
                                   bad.append(f"{where}: {name}: with.driver-opts image=<image>@sha256:<digest> only")
                           elif name == "docker/setup-qemu-action" and not is_digest(args.get("image") or ""):
                               bad.append(f"{where}: {name}: with.image <image>@sha256:<digest> only")
@@ -341,6 +344,9 @@ jobs:
               step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit:v1"): 1,
               step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            network=host\n            image=moby/buildkit" + dig): 0,
               step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver: docker"): 0,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            image=moby/buildkit" + dig + "\n            image=acme/buildkit:latest"): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit" + dig + ",\"image=acme/buildkit:latest\""): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: IMAGE=acme/buildkit:latest"): 1,
               step("docker/setup-qemu-action@" + sha): 1,
               step("docker/setup-qemu-action@" + sha + "\n        with:\n          image: tonistiigi/binfmt" + dig): 0,
           }
