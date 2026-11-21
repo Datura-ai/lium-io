@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -56,7 +57,8 @@ EX = EXECUTOR_MEMORY_MIN_MIB * MIB
 def _run_memory_min(
     tmp_path,
     executor_cgroup: str,
-    set_property: str = 'echo "${4#MemoryMin=}" > "$S/$3"',
+    set_property: str = 'v=${4#MemoryMin=}; echo "$v" > "$S/$3"; [ "$v" = infinity ] && v=max; c="$C$(cg "$3")"; '
+    '[ ! -d "$c" ] || echo "$v" > "$c/memory.min"',
     systemd: bool = True,
     procs: tuple = (),
     active: tuple = ("docker.service", "ssh.service"),
@@ -87,7 +89,12 @@ def _run_memory_min(
     _fake_bin(
         tmp_path,
         "systemctl",
-        f'S="{state}"; case "$1" in show) cat "$S/$5" 2>/dev/null || echo 0;; '
+        # as systemd: Id resolves an alias (sd/<unit>.id), ControlGroup (sd/<unit>.cg) defaults to the unit under
+        # system.slice, and set-property writes the unit's cgroup as well
+        f'S="{state}"; C="{root}"; '
+        'cg() { cat "$S/$1.cg" 2>/dev/null || { [ "$1" = system.slice ] && echo /system.slice || echo "/system.slice/$1"; }; }; '
+        'case "$1" in show) case "$3" in Id) cat "$S/$5.id" 2>/dev/null || echo "$5";; ControlGroup) cg "$5";; '
+        '*) cat "$S/$5" 2>/dev/null || echo 0;; esac;; '
         f'is-active) case " {" ".join(active)} " in *" $3 "*) ;; *) exit 1;; esac;; '
         f"set-property) {set_property};; esac\n",
     )
@@ -231,9 +238,10 @@ def test_executor_under_system_slice_counts_in_the_slice_set_by_systemd(tmp_path
     assert _read(root / "system.slice/containerd.service/x/memory.min") == EX
     assert _read(root / "system.slice/containerd.service/memory.min") == EX + share
     assert _read(state / "containerd.service") == share
-    assert not (root / "system.slice/memory.min").exists()
     extra = share - UNIT_MEMORY_MIN_MIB["containerd.service"] * MIB
     assert _read(state / "system.slice") == UNITS_MIB * MIB + extra + EX
+    # the slice is systemd's to write: its cgroup holds what set-property set
+    assert _read(root / "system.slice/memory.min") == _read(state / "system.slice")
 
 
 def test_executor_with_a_larger_existing_reservation_under_system_slice_counts_in_full(tmp_path):
@@ -493,11 +501,13 @@ def test_system_slice_reads_one_baseline_record_when_two_were_written(tmp_path):
     (root / "system.slice/other.scope").mkdir(parents=True)
     (root / "system.slice/other.scope/memory.min").write_text("max\n")
     (state / "system.slice").write_text("0\n")
-    (tmp_path / "guard-base.").write_text("0 /system.slice\n0 /system.slice\n")
+    ino = os.stat(root / "system.slice").st_ino
+    (tmp_path / "guard-base.").write_text(f"0 {ino} /system.slice\n0 {ino} /system.slice\n")
 
     out = parse_guard_output(run())
 
-    assert out["failed"] == []
+    # other.scope's own claim (max) is more than the slice grants: reported, never granted
+    assert out["failed"] == ["memory_min /system.slice overcommitted"]
     assert _read(state / "system.slice") == UNITS_MIB * MIB + EX
 
 
@@ -559,3 +569,167 @@ def test_the_lock_is_held_around_the_host_part(tmp_path):
 
     assert "memory_min_set /tenant/executor" in out
     assert (tmp_path / "proc/1/root/run/lium-memory-guard.lock").exists()
+
+
+def test_a_unit_raised_by_systemd_has_its_baseline_taken_before_the_raise(tmp_path):
+    """set-property writes the unit's cgroup at once: its baseline (0) is recorded first, so a max sibling under it
+    is not credited with the unit's own 512 MiB."""
+    run = _run_memory_min(
+        tmp_path, "/system.slice/containerd.service/x", active=("docker.service", "ssh.service", "containerd.service")
+    )
+    root = tmp_path / "cg"
+    (root / "system.slice/containerd.service/y").mkdir()
+    (root / "system.slice/containerd.service/y/memory.min").write_text("max\n")
+
+    first, second = parse_guard_output(run()), parse_guard_output(run())
+
+    unit = UNIT_MEMORY_MIN_MIB["containerd.service"] * MIB
+    assert _read(root / "system.slice/containerd.service/memory.min") == unit + EX
+    assert "memory_min /system.slice/containerd.service overcommitted" in first["failed"]
+    assert second["set"] == []
+
+
+def test_an_alias_of_an_active_unit_is_counted_once(tmp_path):
+    run = _run_memory_min(tmp_path, "/system.slice/docker-abc.scope", active=("docker.service", "ssh.service", "sshd.service"))
+    state = tmp_path / "sd"
+    for name in ("ssh.service", "sshd.service"):
+        (state / name).write_text(f"{1024 * MIB}\n")
+    (state / "sshd.service.id").write_text("ssh.service\n")
+
+    run()
+
+    extra = (1024 - UNIT_MEMORY_MIN_MIB["ssh.service"]) * MIB
+    assert _read(state / "system.slice") == UNITS_MIB * MIB + extra + EX
+
+
+@pytest.mark.parametrize(("unit_cgroup", "executor", "slice_total"), [
+    # the executor in the unit's own cgroup shares it, inside system.slice
+    ("/system.slice/containerd.service", "/system.slice/containerd.service", UNITS_MIB * MIB + EX),
+    # a unit placed outside system.slice by Slice=: neither it nor the executor counts in the slice
+    ("/custom.slice/containerd.service", "/custom.slice/containerd.service", (UNITS_MIB - 512) * MIB),
+    ("/custom.slice/containerd.service", "/custom.slice/containerd.service/x", (UNITS_MIB - 512) * MIB),
+])
+def test_an_executor_in_a_units_cgroup_adds_to_the_units_share(tmp_path, unit_cgroup, executor, slice_total):
+    run = _run_memory_min(tmp_path, executor, active=("docker.service", "ssh.service", "containerd.service"))
+    root, state = tmp_path / "cg", tmp_path / "sd"
+    (root / unit_cgroup.lstrip("/")).mkdir(parents=True, exist_ok=True)
+    (state / "containerd.service.cg").write_text(f"{unit_cgroup}\n")
+
+    first, second = parse_guard_output(run()), parse_guard_output(run())
+
+    unit = UNIT_MEMORY_MIN_MIB["containerd.service"] * MIB
+    assert _read(root / unit_cgroup.lstrip("/") / "memory.min") == unit + EX
+    if unit_cgroup.startswith("/custom.slice"):
+        assert _read(root / "custom.slice/memory.min") == unit + EX
+    assert _read(state / "system.slice") == slice_total
+    assert first["failed"] == [] and second["set"] == []
+
+
+def test_a_parent_made_again_in_the_same_boot_takes_a_new_baseline(tmp_path):
+    run = _run_memory_min(tmp_path, "/tenant/executor", systemd=False)
+    root = tmp_path / "cg"
+    (root / "tenant/other").mkdir(parents=True)
+    (root / "tenant/other/memory.min").write_text(f"{4096 * MIB}\n")
+    (root / "tenant/memory.min").write_text(f"{4096 * MIB}\n")
+    run()
+    assert _read(root / "tenant/memory.min") == 4096 * MIB + EX
+
+    # /tenant removed and made again (a new cgroup, a new inode), starting at zero, with a sibling claiming max
+    (root / "tenant").rename(root / "tenant.gone")
+    for path in ("tenant/executor", "tenant/other"):
+        (root / path).mkdir(parents=True)
+    (root / "tenant/other/memory.min").write_text("max\n")
+    run()
+
+    assert _read(root / "tenant/memory.min") == EX
+
+
+@pytest.mark.parametrize("name", ["other", ".reserved", "..x"])
+def test_a_dot_named_sibling_is_counted(tmp_path, name):
+    run = _run_memory_min(tmp_path, "/tenant/executor", systemd=False)
+    root = tmp_path / "cg"
+    (root / "tenant" / name).mkdir(parents=True)
+    (root / "tenant" / name / "memory.min").write_text(f"{4096 * MIB}\n")
+    (root / "tenant/memory.min").write_text(f"{4096 * MIB}\n")
+
+    run()
+
+    assert _read(root / "tenant/memory.min") == 4096 * MIB + EX
+
+
+def test_a_dot_named_system_slice_child_is_counted(tmp_path):
+    run = _run_memory_min(tmp_path, "/system.slice/docker-abc.scope")
+    root, state = tmp_path / "cg", tmp_path / "sd"
+    (root / "system.slice/.reserved").mkdir(parents=True)
+    (root / "system.slice/.reserved/memory.min").write_text(f"{2048 * MIB}\n")
+    (state / "system.slice").write_text(f"{2048 * MIB}\n")
+
+    run()
+
+    assert _read(state / "system.slice") == UNITS_MIB * MIB + EX + 2048 * MIB
+
+
+@pytest.mark.parametrize(("granted", "sibling", "over"), [(0, "max", True), (0, 4096 * MIB, True), (4096 * MIB, 4096 * MIB, False)])
+@pytest.mark.parametrize("systemd", [False, True])
+def test_a_parent_whose_children_claim_more_than_it_grants_is_reported(tmp_path, granted, sibling, over, systemd):
+    """The cap stays (a rental's claim never raises the parent), but children claiming more than the final grant
+    get less than they claim, so the parent is reported."""
+    parent = "/system.slice" if systemd else "/tenant"
+    run = _run_memory_min(tmp_path, f"{parent}/docker-abc.scope" if systemd else f"{parent}/executor", systemd=systemd)
+    root = tmp_path / "cg"
+    (root / parent.lstrip("/") / "other.scope").mkdir(parents=True)
+    (root / parent.lstrip("/") / "other.scope/memory.min").write_text(f"{sibling}\n")
+    if systemd:
+        (tmp_path / "sd/system.slice").write_text(f"{granted}\n")
+    else:
+        (root / "tenant/memory.min").write_text(f"{granted}\n")
+
+    failed = parse_guard_output(run())["failed"]
+
+    assert (f"memory_min {parent} overcommitted" in failed) is over
+    assert [f for f in failed if not f.endswith("overcommitted")] == []
+
+
+@pytest.mark.parametrize("systemd", [False, True])
+def test_nothing_is_raised_when_a_baseline_cannot_be_stored(tmp_path, systemd):
+    """A full /run: no write may happen, or a later run would take the guard's own raise as the parent's grant."""
+    executor = "/system.slice/docker-abc.scope/worker" if systemd else "/tenant/executor"
+    run = _run_memory_min(tmp_path, executor, systemd=systemd)
+    root, state = tmp_path / "cg", tmp_path / "sd"
+    (tmp_path / "guard-base.").mkdir()  # the append fails
+
+    out = parse_guard_output(run())
+
+    assert out == {"set": [], "failed": ["memory_min baseline write_failed"]}
+    assert not list(root.rglob("memory.min")) and not list(state.iterdir())
+
+    (tmp_path / "guard-base.").rmdir()
+    assert parse_guard_output(run())["failed"] == []
+    assert _read(root / executor.lstrip("/") / "memory.min") == EX
+
+
+@pytest.mark.parametrize("awk", [a for a in ("mawk", "gawk", "busybox") if shutil.which(a)])
+def test_totals_over_2_gib_are_written_as_digits_with_every_awk(tmp_path, awk):
+    run = _run_memory_min(tmp_path, "/tenant/executor", systemd=False)
+    _fake_bin(tmp_path, "awk", f'exec {awk}{" awk" if awk == "busybox" else ""} "$@"\n')
+    (tmp_path / "cg/tenant/memory.min").write_text("0\n")
+    (tmp_path / "cg/tenant/a").mkdir()
+    (tmp_path / "cg/tenant/a/memory.min").write_text(f"{4096 * MIB}\n")
+    (tmp_path / "cg/tenant/memory.min").write_text(f"{4096 * MIB}\n")
+
+    out = parse_guard_output(run())
+
+    assert out["failed"] == []
+    assert (tmp_path / "cg/tenant/memory.min").read_text().strip() == str(4096 * MIB + EX)
+
+
+def test_an_executor_path_ending_in_a_space_is_written_not_its_namesake(tmp_path):
+    run = _run_memory_min(tmp_path, "/tenant/worker ", systemd=False)
+    root = tmp_path / "cg"
+    (root / "tenant/worker").mkdir()
+
+    out = parse_guard_output(run())
+
+    assert _read(root / "tenant/worker " / "memory.min") == EX
+    assert not (root / "tenant/worker/memory.min").exists()
+    assert out["failed"] == []
