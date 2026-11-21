@@ -56,6 +56,9 @@ RENTAL_PRICES_PER_HOUR["NVIDIA GB200"] = RENTAL_PRICES_PER_HOUR["NVIDIA B200"]  
 RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4090 48GB"] = 0.42
 RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4080 32GB"] = 0.26
 RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4080 SUPER 32GB"] = 0.26
+# DAH-5863: `NVIDIA GB10` (DGX Spark), its own model and idle tier. Anchor = the backend's MACHINE_PRICES (DAH-5864):
+# 0.25, the 5 Nov Vast median 0.376 x the median Lium/Vast ratio 0.668.
+RENTAL_PRICES_PER_HOUR["NVIDIA GB10"] = 0.25
 
 # Unrented incentive for more GPU types (DAH-4042). Anchors are the backend's MACHINE_PRICES, the listing
 # price renters see; the rows are in lium-core's defaults too, so this override drops on the next lium-core release.
@@ -254,6 +257,7 @@ MAX_UNRENTED_GPUS_BY_TYPE["GB200"] = dict(MAX_UNRENTED_GPUS_BY_TYPE["B200"])  # 
 MAX_UNRENTED_GPUS_BY_TYPE["RTX 4090 48GB"] = {1: 10, 8: 64}
 MAX_UNRENTED_GPUS_BY_TYPE["RTX 4080 32GB"] = {1: 10, 8: 64}
 MAX_UNRENTED_GPUS_BY_TYPE["RTX 4080 SUPER 32GB"] = {1: 10, 8: 64}
+MAX_UNRENTED_GPUS_BY_TYPE["GB10"] = {1: 10, 8: 64}  # DAH-5863: the default tier (DAH-5070)
 # Per-(gpu_model, gpu_count) hourly prices in USD.
 # Keys are full NVIDIA GPU names; values are dicts of {count_str: price_or_default}.
 # Use DEFAULT_PRICE sentinel to fall back to rental_prices_per_hour.
@@ -382,6 +386,7 @@ BASE_GPU_MAP["NVIDIA GB200"] = "GB200"  # own family, see RENTAL_PRICES_PER_HOUR
 BASE_GPU_MAP["NVIDIA GeForce RTX 4090 48GB"] = "RTX 4090 48GB"
 BASE_GPU_MAP["NVIDIA GeForce RTX 4080 32GB"] = "RTX 4080 32GB"
 BASE_GPU_MAP["NVIDIA GeForce RTX 4080 SUPER 32GB"] = "RTX 4080 SUPER 32GB"
+BASE_GPU_MAP["NVIDIA GB10"] = "GB10"  # own family, see RENTAL_PRICES_PER_HOUR
 
 
 class IncentiveConfig(BaseModel):
