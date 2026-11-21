@@ -1278,6 +1278,9 @@ class _PodBridgeHold:
     guarded: bool = False
     # the connection the guard ran on, for a hold with no `connect` of its own
     borrowed: Any = None
+    # the caller's deadline (event loop time, an edit's undo): the release ends before it, so a stalled release never
+    # turns the undo's own result into its timeout
+    deadline: float | None = None
 
 
 async def _on_own_ssh(connect: Callable[[], Any], work: Callable[[Any], Awaitable[Any]]) -> Any:
@@ -1292,8 +1295,15 @@ async def _on_own_ssh(connect: Callable[[], Any], work: Callable[[Any], Awaitabl
             raise
 
 
+def _hold_command_seconds(hold: _PodBridgeHold) -> float:
+    if hold.deadline is None:
+        return BRIDGE_HOLD_COMMAND_SECONDS
+    left = hold.deadline - asyncio.get_running_loop().time() - _PRE_START_GUARD_DEADLINE_MARGIN_SECONDS
+    return max(0.0, min(BRIDGE_HOLD_COMMAND_SECONDS, left))
+
+
 async def _on_hold_session(hold: _PodBridgeHold, command: Callable[..., Awaitable[None]]) -> None:
-    async with asyncio.timeout(BRIDGE_HOLD_COMMAND_SECONDS):
+    async with asyncio.timeout(_hold_command_seconds(hold)):
         if hold.connect is None:
             await command(hold.borrowed, hold.network, hold.token)
         else:
@@ -1316,19 +1326,22 @@ async def _renew_pod_bridge_hold(hold: _PodBridgeHold) -> None:
 
 
 @contextlib.asynccontextmanager
-async def _pod_bridge_held(network: str | None, connect: Callable[[], Any] | None = None):
+async def _pod_bridge_held(
+    network: str | None, connect: Callable[[], Any] | None = None, deadline: float | None = None
+):
     """``connect`` opens a connection of the hold's own; without it (a caller with no pinned host key to dial
-    with) the hold uses the connection its guard ran on."""
+    with) the hold uses the connection its guard ran on. ``deadline``: the caller's, which the release ends before."""
     from services.task.checks.rental_egress_guard import release_pod_bridge
 
-    hold = _PodBridgeHold(network, connect) if network else None
+    hold = _PodBridgeHold(network, connect, deadline=deadline) if network else None
     renewal = asyncio.create_task(_renew_pod_bridge_hold(hold)) if hold is not None else None
     try:
         yield hold
     finally:
         if renewal is not None:
             renewal.cancel()  # not awaited: a renewal mid-flight can at most leave a reservation that then expires
-        if hold is not None and hold.guarded:
+        # no time left before the caller's deadline: the reservation expires, unrenewed
+        if hold is not None and hold.guarded and _hold_command_seconds(hold) > 0:
             try:
                 await _on_hold_session(hold, release_pod_bridge)
             except Exception as exc:  # noqa: BLE001 — a reservation left behind expires, unrenewed
@@ -13887,7 +13900,7 @@ class DockerService:
         # under the pod's lock like start_existing_container: a pending stop's retry cannot probe the container
         # unmounted and then stop it after this undo restarted and remounted it
         # kept from every reaper from its guard until the started container references it
-        async with _pod_bridge_held(network, connect_own_ssh) as bridge_hold:
+        async with _pod_bridge_held(network, connect_own_ssh, deadline) as bridge_hold:
             async with self._pod_start_exclusion(executor_info, private_key, pod_id):
                 # unreadable state or id fails the undo before any start, like start_existing_container: a start the
                 # cleanup below could not follow by id would leave the pod up without its remount. The id is read first and

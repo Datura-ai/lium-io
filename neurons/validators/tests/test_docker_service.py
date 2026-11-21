@@ -12858,6 +12858,24 @@ async def test_a_held_bridge_reservation_is_renewed_until_its_release(monkeypatc
     assert renewed >= 2 and calls[-1] == "release" and len(calls) == renewed + 1  # none after the release
 
 
+@pytest.mark.asyncio
+async def test_a_hold_with_no_time_left_before_its_callers_deadline_is_left_to_expire(monkeypatch):
+    # gateway review at 2b4ddb8 on lium-io#2352: no release is dialed once the caller's deadline is within the margin
+    calls: list = []
+
+    async def release(ssh, network, token):
+        calls.append("release")
+
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.release_pod_bridge", release)
+    deadline = asyncio.get_running_loop().time() + docker_service_module._PRE_START_GUARD_DEADLINE_MARGIN_SECONDS
+    async with docker_service_module._pod_bridge_held(
+        rental_network_for("pod_a"), lambda: contextlib.nullcontext(Mock()), deadline
+    ) as hold:
+        hold.guarded = True
+
+    assert calls == []
+
+
 @pytest.mark.real_egress_guard
 @pytest.mark.asyncio
 async def test_a_slow_guard_never_uses_up_the_port_retry_budget(docker_service, monkeypatch):

@@ -534,6 +534,80 @@ async def test_an_undo_whose_bridge_reservation_and_release_stall_is_its_guards_
     own_sessions[0].abort.assert_called_once()
 
 
+@pytest.mark.real_egress_guard
+@pytest.mark.parametrize(("start", "after_undo", "code"), [
+    ("ok", "running", "UnknownError"),
+    ("bridge_gone", "down", "ExecutorUnreachable"),
+], ids=["restored", "bridge_gone"])
+@pytest.mark.asyncio
+async def test_a_release_that_stalls_near_the_undos_deadline_keeps_the_undos_result(
+    svc, monkeypatch, start, after_undo, code
+):
+    # gateway review at 2b4ddb8 on lium-io#2352: the guard passed and the undo ran most of its deadline; the
+    # reservation's release then dials a host that stopped answering. The release ends before the undo's deadline,
+    # so a restored original is never stopped again and a lost bridge is still the host's, never the undo's timeout
+    from payload_models.payloads import FailedContainerErrorCodes
+    from services.rental_docker_sdk import ContainerStateSnapshot, RentalPodBridgeGone
+
+    payload = _edit_payload()
+    ssh = _ssh_recording(after_undo=after_undo)
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr(
+        svc, "_run_rental_docker_create_with_port_retry", AsyncMock(side_effect=RuntimeError("gocryptfs: EPERM"))
+    )
+
+    @contextlib.asynccontextmanager
+    async def own_ssh(*args):
+        yield Mock()
+
+    monkeypatch.setattr(docker_service, "_connect_own_ssh", own_ssh)
+    released: list = []
+
+    async def reserve(on_ssh, network, token):
+        return None
+
+    async def guard(on_ssh, attempts=None, required_network_id=None):
+        return {}, None
+
+    async def stalls(on_ssh, network, token):
+        released.append(network)
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.reserve_pod_bridge", reserve)
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.apply_rental_egress_guard", guard)
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.release_pod_bridge", stalls)
+    monkeypatch.setattr(docker_service, "_PRE_START_GUARD_DEADLINE_MARGIN_SECONDS", 0.05, raising=False)
+    monkeypatch.setattr(docker_service, "_RESTORE_BRING_UP_TIMEOUT_SECONDS", 0.6)
+    client = svc.rental_docker_client_factory.client
+    client.ensure_network = AsyncMock(return_value="guarded-id")
+    client.inspect_container_state = AsyncMock(return_value=ContainerStateSnapshot(
+        status="exited", running=False, restarting=False, exit_code=0, restart_count=0, error=None, oom_killed=False
+    ))
+    if start == "bridge_gone":
+        client.start = AsyncMock(side_effect=RentalPodBridgeGone("Docker network of the pod is gone"))
+    else:
+        client.start = AsyncMock()
+
+    async def remount(**kwargs):
+        await asyncio.sleep(0.4)  # the remount uses most of the undo's deadline before the release
+
+    svc._restore_mount_and_sshd_after_start = remount
+    # a kept copy: the undo starts it under its kept name and renames it only once it runs, stopping it on any error
+    monkeypatch.setattr(docker_service._EditSwap, "_layer_safe_to_remove", AsyncMock(return_value=False))
+
+    result = await asyncio.wait_for(_run(svc, payload), 10)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == getattr(FailedContainerErrorCodes, code)
+    assert released  # the release was tried, inside the undo's deadline
+    # the undo opens by removing the replacement; the park's own stop of the kept copy comes before it
+    undo = ssh.commands[next(i for i, c in enumerate(ssh.commands) if c.startswith("/usr/bin/docker rm -fv")):]
+    if start == "ok":
+        # the restored original keeps running and gets the pod's name back
+        assert any(c.startswith("/usr/bin/docker rename kept_unmounted_") for c in undo)
+        assert not any(c.startswith("/usr/bin/docker stop") for c in undo)
+
+
 @pytest.mark.parametrize(("undo", "after_undo", "code"), [
     ("guard", "down", "PodDownNotHostFault"),
     ("guard", "running", "ContainerVanished"),
