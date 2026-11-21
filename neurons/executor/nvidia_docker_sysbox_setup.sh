@@ -776,12 +776,22 @@ fusermount3_profile_enforced() {
 
 # the rules missing from the local profile, one per line (both are needed: a host with only the mount rule, e.g. added
 # by hand, cannot unmount sysbox-fs)
+# the local profile's active rules, one per line: AppArmor ignores everything after a '#'
+fusermount3_local_rules() {
+    sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$(host_path "$FUSERMOUNT3_LOCAL")" 2>/dev/null | grep -v '^$'
+}
+
 fusermount3_missing_sysboxfs_rules() {
     local rule
     for rule in "$FUSERMOUNT3_RULE" "$FUSERMOUNT3_UMOUNT_RULE"; do
-        # only an active rule counts: AppArmor ignores everything after a '#'
-        sed 's/#.*//' "$(host_path "$FUSERMOUNT3_LOCAL")" 2>/dev/null | grep -qF "$rule" || printf '%s\n' "$rule"
+        # only the allow rule itself counts, not a line that merely contains it (e.g. "deny <rule>")
+        fusermount3_local_rules | sed 's/^allow[[:space:]]\+//' | grep -qxF "$rule" || printf '%s\n' "$rule"
     done
+}
+
+# deny rules on /var/lib/sysboxfs in the local profile: a deny wins over any allow, so adding ours cannot fix them
+fusermount3_sysboxfs_denies() {
+    fusermount3_local_rules | grep -E '^(audit[[:space:]]+)?deny[[:space:]].*/var/lib/sysboxfs'
 }
 
 fusermount3_needs_sysboxfs_rule() {
@@ -789,6 +799,12 @@ fusermount3_needs_sysboxfs_rule() {
 }
 
 check_fusermount3_apparmor() {
+    local denies
+    if fusermount3_profile_enforced && denies=$(fusermount3_sysboxfs_denies); then
+        pf_fix "$FUSERMOUNT3_LOCAL denies fusermount3 on /var/lib/sysboxfs; AppArmor applies a deny over any allow, so sysbox-fs mounts stay broken: $(echo $denies)" \
+            "remove those deny lines from $FUSERMOUNT3_LOCAL, then rerun $(self_cmd)"
+        return 1
+    fi
     if ! fusermount3_needs_sysboxfs_rule; then
         pf_pass "fusermount3 may mount and unmount sysbox-fs under /var/lib/sysboxfs (no enforced AppArmor profile, or both rules are in $FUSERMOUNT3_LOCAL)."
         return 0
@@ -814,6 +830,12 @@ install_sysbox_restart_dropins() {
 
 allow_sysboxfs_in_fusermount3_apparmor() {
     fusermount3_profile_enforced || return 0
+    local denies
+    # the provider's own deny: we do not remove a rule we did not write
+    if denies=$(fusermount3_sysboxfs_denies); then
+        fail "$FUSERMOUNT3_LOCAL denies fusermount3 on /var/lib/sysboxfs ($(echo $denies)); remove those deny lines and rerun."
+        return 1
+    fi
     if fusermount3_needs_sysboxfs_rule; then
         mkdir -p "$(dirname "$(host_path "$FUSERMOUNT3_LOCAL")")"
         { echo "# lium: sysbox-fs mounts its FUSE file systems under /var/lib/sysboxfs"; fusermount3_missing_sysboxfs_rules; } \

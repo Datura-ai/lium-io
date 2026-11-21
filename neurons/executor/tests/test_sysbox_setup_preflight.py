@@ -491,6 +491,25 @@ def test_a_commented_rule_does_not_count_and_the_install_adds_it(tmp_path, local
     assert rc == 0
     assert (active.count(APPARMOR_RULE), active.count(APPARMOR_UMOUNT_RULE)) == (1, 1)
 
+@pytest.mark.parametrize(
+    "deny",
+    ["deny umount /var/lib/sysboxfs/,", "  audit deny umount /var/lib/sysboxfs/**,", "deny " + APPARMOR_UMOUNT_RULE],
+    ids=["deny-dir", "audit-deny", "deny-of-our-rule"],
+)
+def test_a_deny_on_sysboxfs_is_a_fix_and_the_install_refuses_instead_of_reloading(tmp_path, deny):
+    # a deny wins over any allow: passing or appending our rule would leave the mounts broken
+    local = BOTH_RULES + deny + "\n"
+    files = {**APPARMOR_ON, "etc/apparmor.d/local/fusermount3": local}
+    rc, out, fixes = run_check(tmp_path, "check_fusermount3_apparmor", files=files)
+    assert (rc, fixes) == (1, 1)
+    assert "remove those deny lines" in out
+
+    rc, _, _ = run_check(tmp_path, "allow_sysboxfs_in_fusermount3_apparmor", files=files)
+    assert rc == 1
+    assert not (tmp_path / "root/.stub-docker/apparmor").exists()
+    assert (tmp_path / "root/etc/apparmor.d/local/fusermount3").read_text() == local
+
+
 def test_install_gives_sysbox_services_time_to_start_and_a_restart(tmp_path):
     # sysbox-ce 0.7.1: 10 s (fs) / 45 s (mgr) start timeouts and no Restart=, so a slow boot left sysbox down
     rc, _, _ = run_check(tmp_path, "install_sysbox_restart_dropins")
