@@ -294,7 +294,7 @@ class RestoreContainerRequest(ContainerRequest):
 class CancelStorageOperationRequest(ContainerRequest):
     message_type: BackendMessageType = BackendMessageType.CancelStorageOperationRequest
     operation_id: str
-    # 2.17.0: the operation's reporter token and resource, so the validator confirms CANCELLED even when no runner
+    # 2.22.0: the operation's reporter token and resource, so the validator confirms CANCELLED even when no runner
     # or spec on the node holds them (an older backend omits them: confirmed only through the spec, as before)
     auth_token: str | None = pydantic.Field(default=None, repr=False)
     resource: Literal["backup", "restore"] | None = None

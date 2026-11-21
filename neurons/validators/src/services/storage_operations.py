@@ -510,7 +510,7 @@ async def cancel_storage_operation(
     files = StorageOperationFiles.for_operation(operation_id)
     # once the runner has read it, the spec holds only the reporter (DAH-6463)
     spec = await _read_operation_spec(ssh_client, files.spec)
-    # no runner or spec on the node holds the reporter: confirm with the one the cancel request carries (2.17.0)
+    # no runner or spec on the node holds the reporter: confirm with the one the cancel request carries (2.22.0)
     if reporter and not (spec and isinstance(spec.get("reporter"), Mapping)):
         spec = {"reporter": reporter}
     helper_name = storage_helper_name(operation_id)
