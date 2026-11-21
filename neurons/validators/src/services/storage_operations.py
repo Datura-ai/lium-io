@@ -369,7 +369,8 @@ async def _start_storage_operation(
         # lock until the runner has started (the runner does not inherit it), so a cancel's marker
         # either stops the runner here or comes after it started, as for any running operation.
         wrapper = (
-            f"exec 8>>{lock_path}; "
+            # `command`: a lock file that cannot be opened must not end the shell before its status is written
+            f"command exec 8>>{lock_path} 2>/dev/null; "
             "flock -w 30 8 && locked=1; "
             # only the wrapper the launch recorded as the operation's process group owns its files: one whose PID
             # write failed, or that another launch's record replaced, writes, removes and starts nothing
@@ -388,7 +389,7 @@ async def _start_storage_operation(
         # lock, so a cancel that comes after always finds every process of the operation.
         # The wrapper must not inherit the held lock (9>&-).
         launch_command = (
-            f"exec 9>>{lock_path}; flock -w 30 9 || exit 6; "
+            f"command exec 9>>{lock_path} 2>/dev/null; flock -w 30 9 || exit 6; "
             f"if test -e {shlex.quote(str(files.cancel))}; then rm -f {shlex.quote(str(files.spec))}; exit 5; fi; "
             # a launch of this operation from another validator process already recorded a live wrapper: it is the
             # operation, and its PID and spec stay as they are
@@ -495,7 +496,8 @@ async def cancel_storage_operation(
     lock_path = shlex.quote(str(files.lock))
     command = (
         "marked=0; "
-        f"{{ install -d -m 0700 {shlex.quote(str(REMOTE_CANCEL_DIRECTORY))} && exec 9>>{lock_path} "
+        # `command`: a failed open of the lock fails the step instead of ending the shell before the stop fallback
+        f"{{ install -d -m 0700 {shlex.quote(str(REMOTE_CANCEL_DIRECTORY))} && command exec 9>>{lock_path} 2>/dev/null "
         f"&& flock -w 30 9 && touch {cancel_path}; }} || marked=4; "
         # read under the lock: a launch that took it first has written its PID by now; release it before
         # the bounded wait so other operations' launches never queue behind this one

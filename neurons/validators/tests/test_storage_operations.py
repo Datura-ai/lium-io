@@ -63,8 +63,9 @@ async def test_cancel_fallback_removes_the_helper_container(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failing_step", ["marker", "lock_open"])
 async def test_a_cancel_that_cannot_write_its_marker_still_stops_the_runner_then_fails(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failing_step: str
 ) -> None:
     monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
     reported = AsyncMock(return_value=True)
@@ -76,14 +77,15 @@ async def test_a_cancel_that_cannot_write_its_marker_still_stops_the_runner_then
     spawned = subprocess.run(["sh", "-c", "sleep 60 >/dev/null 2>&1 & echo $!"], capture_output=True, text=True)
     runner_pid = int(spawned.stdout)
     (tmp_path / f"{OPERATION_ID}.pid").write_text(str(runner_pid))
+    if failing_step == "lock_open":
+        # the lock file cannot be opened at all (a directory in its place): the open itself fails in the shell
+        Path(storage_operations.StorageOperationFiles.for_operation(OPERATION_ID).lock).mkdir(parents=True)
 
     async def run_locally(command: str, check: bool = False) -> SimpleNamespace:
         # a full or read-only filesystem: the marker write fails
-        command = (
-            command.replace("/usr/bin/docker", str(fake_docker))
-            .replace("sleep 0.25", "sleep 0.01")
-            .replace("touch ", "false ")
-        )
+        command = command.replace("/usr/bin/docker", str(fake_docker)).replace("sleep 0.25", "sleep 0.01")
+        if failing_step == "marker":
+            command = command.replace("touch ", "false ")
         result = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
         return SimpleNamespace(exit_status=result.returncode, stdout=result.stdout, stderr=result.stderr)
 
