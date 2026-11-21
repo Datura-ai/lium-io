@@ -702,6 +702,20 @@ def test_a_guard_value_that_runs_code_is_named_with_its_line(tmp_path):
     assert _reason(host) == f"{GUARD} line {line} runs code in its value"
 
 
+
+@pytest.mark.parametrize("value", ["!1", "!0", "~0", "1 < 2 ? 1 : 0"])
+def test_an_operator_only_rule_for_another_service_leaves_the_guard_present(tmp_path, value):
+    host = _host(tmp_path, _setup_script_guard() + f"\n$nrconf{{override_rc}}->{{qr(^cron)}} = {value};\n")
+    assert _read(host) == ("present", [])
+
+
+def test_an_operator_only_value_on_a_guarded_service_is_not_proven_zero(tmp_path):
+    guard = _setup_script_guard().replace("qr(^docker)} = 0;", "qr(^docker)} = !1;")
+    host = _host(tmp_path, guard)
+    line = next(n for n, ln in enumerate(guard.splitlines(), 1) if "qr(^docker)} = !1;" in ln)
+    assert _read(host) == ("partial", ["docker"])
+    assert _reason(host) == f"{GUARD} line {line} sets docker to a computed value the scrape cannot evaluate"
+
 @pytest.mark.parametrize("value", ["0.0", "-0", "''"])
 def test_only_the_guards_own_zeros_keep_a_service_guarded(tmp_path, value):
     guard = _setup_script_guard().replace("qr(^docker)} = 0;", f"qr(^docker)}} = {value};")

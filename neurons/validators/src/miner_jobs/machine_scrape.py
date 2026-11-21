@@ -1087,9 +1087,9 @@ def get_needrestart_guard(host_root="/proc/1/root"):
         where = f"{NEEDRESTART_GUARD_FILE} line {number}"
         if not match:
             return unknowable(f"{where} is not a guard line")
-        # a value may only be literals and arithmetic: anything else (an assignment, a call, a variable) may set
-        # another rule as it runs, which the last-assignment bookkeeping below would never see
-        if not re.fullmatch(r"[\d\s.+*/%()-]*", re.sub(literal, "", match.group(2))):
+        # a value may only be literals and operators: a name, a variable, a backtick or a brace (an assignment, a
+        # call) may set another rule as it runs, which the last-assignment bookkeeping below would never see
+        if re.search(r"[A-Za-z_$@`{}\[\]\\'\"]", re.sub(literal, "", match.group(2))):
             return unknowable(f"{where} runs code in its value")
         if match.group(1) in NEEDRESTART_GUARD_SERVICES:
             last_values[match.group(1)] = (match.group(2), where)  # Perl keeps the last assignment
