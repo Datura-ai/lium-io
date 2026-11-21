@@ -332,8 +332,12 @@ def _incumbent_condition(files: StorageOperationFiles) -> str:
 
 
 async def _has_incumbent(ssh_client: asyncssh.SSHClientConnection, files: StorageOperationFiles) -> bool:
-    """Read-only: the operation already has a result or a live run (see _incumbent_condition)."""
-    result = await ssh_client.run(f"if {_incumbent_condition(files)}; then echo YES; fi", check=False)
+    """The operation already has a result or a live run (see _incumbent_condition). Read under the operation's lock: a
+    launch holds it until its launcher is recorded, so a launch in its handoff is seen once it has one."""
+    q = shlex.quote(str(files.lock))
+    result = await ssh_client.run(
+        f"exec 9>>{q} && flock -x 9 || exit 1; if {_incumbent_condition(files)}; then echo YES; fi", check=False
+    )
     return result.exit_status == 0 and (result.stdout or "").strip() == "YES"
 
 

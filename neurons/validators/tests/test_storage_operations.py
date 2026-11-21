@@ -328,3 +328,43 @@ def test_a_dispatch_whose_staging_fails_with_no_run_reports_the_failure(node: Pa
             SimpleNamespace(run=run), sys.executable, OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
         ))
     storage_operations.report_launch_failure.assert_awaited_once()
+
+
+def test_a_staging_failure_during_another_dispatchs_launch_handoff_waits_for_its_launcher(node: Path) -> None:
+    # F-59: the other dispatch holds the launch lock and has started its wrapper, but neither its launcher nor the
+    # runner's PID is recorded yet when this dispatch's staging fails: the recheck waits for the lock and finds the run
+    import asyncio as aio
+    import fcntl
+    import threading
+
+    _runner(node, "raise SystemExit(0)\n")
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    runners: list[subprocess.Popen] = []
+
+    def finish_handoff(lock) -> None:
+        import time
+
+        time.sleep(0.5)
+        runners.append(_legacy_runner(files))
+        Path(str(files.launcher)).write_text(Path(str(files.pid)).read_text())
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        if "printf \"%s\" \"$d\"" in command:
+            lock = open(str(files.lock), "a")
+            fcntl.flock(lock, fcntl.LOCK_EX)   # the other dispatch's launch, mid-handoff
+            threading.Thread(target=finish_handoff, args=(lock,)).start()
+            raise OSError(28, "No space left on device")
+        return await _run_locally(command, check, input)
+
+    try:
+        returned_files = aio.run(storage_operations.start_storage_operation(
+            SimpleNamespace(run=run), sys.executable, OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+        ))
+        assert returned_files == files
+        storage_operations.report_launch_failure.assert_not_awaited()
+    finally:
+        for r in runners:
+            r.kill()
+            r.wait()
