@@ -6617,7 +6617,8 @@ async def test_rental_create_keeps_a_same_name_container_while_another_registrat
     await registered.wait()
     try:
         with registry.track("test", ("miner-a", "exec")):
-            assert not registry.is_only_create("test")
+            assert registry.is_only_create("test")  # its own registration's marker: still the only create
+            assert not registry.is_only_create_on_any_registration("test")
             with pytest.raises(Exception):
                 await docker_service._run_rental_docker_create_with_port_retry(
                     docker_client=FakeRentalClient(),

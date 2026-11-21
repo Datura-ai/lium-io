@@ -36,6 +36,7 @@ from payload_models.payloads import (
     RestoreContainerRequest,
     ContainerBaseRequest,
     ContainerCreateRequest,
+    ContainerDeleteOnNodeLeftRequest,
     ContainerDeleteRequest,
     ContainerStartRequest,
     ContainerStopRequest,
@@ -275,6 +276,10 @@ def _bypasses_renting_in_progress(payload: ContainerBaseRequest) -> bool:
     if not isinstance(payload, ContainerDeleteRequest):
         return False
     if payload.workload_kind == WorkloadKind.FILLER:
+        return True
+    if isinstance(payload, ContainerDeleteOnNodeLeftRequest):
+        # DAH-6531: sent once, it waits for the pod's creates itself; the source create's pending flag outlives its
+        # run while its receipt is processed, and declining here would drop the only delete
         return True
     # DAH-2728: the pending-pod flag this guard reads is set by the very create this delete is
     # about to cancel, so declining here would leave that create to finish and orphan its

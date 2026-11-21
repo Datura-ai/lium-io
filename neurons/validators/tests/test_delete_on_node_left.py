@@ -15,6 +15,7 @@ from payload_models.payloads import (
     BaseServerRequest,
     ContainerDeleted,
     ContainerDeleteOnNodeLeftRequest,
+    ContainerDeleteRequest,
     FailedContainerErrorCodes,
     FailedContainerRequest,
 )
@@ -238,3 +239,13 @@ async def test_a_create_still_running_at_the_end_of_the_wait_deletes_nothing(doc
         result = await _delete(docker_service, payload)
 
     assert isinstance(result, FailedContainerRequest) and order == []
+
+
+def test_a_node_left_delete_is_never_declined_as_renting_in_progress():
+    # sent once: the source create's pending flag outlives its run while its receipt is processed
+    from services.miner_service import _bypasses_renting_in_progress
+
+    payload = _payload()
+    assert not inflight_creates.is_running(payload.pod_id, (payload.miner_hotkey, payload.executor_id))
+    assert _bypasses_renting_in_progress(payload)
+    assert not _bypasses_renting_in_progress(ContainerDeleteRequest(**_delete_payload().model_dump(exclude={"message_type"})))

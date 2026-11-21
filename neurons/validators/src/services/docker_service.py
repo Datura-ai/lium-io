@@ -2582,7 +2582,11 @@ class _InflightCreateRegistry:
                 return False
         return True
 
-    def is_only_create(self, pod_id: str) -> bool:
+    def is_only_create(self, pod_id: str, executor: ExecutorKey | None = None) -> bool:
+        """Exactly one create for this pod is registered (the caller's): no other attempt is live."""
+        return sum(create.running for create in self._matching(pod_id, executor)) == 1
+
+    def is_only_create_on_any_registration(self, pod_id: str) -> bool:
         """Exactly one create for this pod is running in this process (the caller's), on any registration.
 
         Its callers remove what is named by the pod alone (the container, its volume, build artifacts), so a create
@@ -4109,13 +4113,13 @@ class DockerService:
                 ):
                     # every same-name conflict is decided here: without the one checked removal (already spent, or
                     # another create of the pod running) the container is kept, never left to a cleanup by name
-                    if own_leftover_removed or pod_id is None or not inflight_creates.is_only_create(pod_id):
+                    if own_leftover_removed or pod_id is None or not inflight_creates.is_only_create_on_any_registration(pod_id):
                         raise _SameNameContainerKept(str(exc)) from exc
                     leftover = await self._own_leftover_container(
                         docker_client, container_name, run_spec.labels.get(LIUM_EXECUTOR_ID_LABEL)
                     )
                     # another create may have registered (and started the pod) during the status read
-                    if leftover is None or not inflight_creates.is_only_create(pod_id):
+                    if leftover is None or not inflight_creates.is_only_create_on_any_registration(pod_id):
                         raise _SameNameContainerKept(str(exc)) from exc
                     own_leftover_removed = True
                     attempt += 1
@@ -7294,7 +7298,7 @@ class DockerService:
         container_missing = False
         # without an id, the container under this name may be another live create's: leave it to that create
         owns_container = not keep_container and (
-            container_id is not None or pod_id is None or inflight_creates.is_only_create(pod_id)
+            container_id is not None or pod_id is None or inflight_creates.is_only_create_on_any_registration(pod_id)
         )
         try:
             if owns_container:
@@ -7316,7 +7320,7 @@ class DockerService:
                 )
 
             # the pod's volume is shared by name too: another live create of the pod may have restored into it (F-78)
-            if remove_volume and volume_name and (pod_id is None or inflight_creates.is_only_create(pod_id)):
+            if remove_volume and volume_name and (pod_id is None or inflight_creates.is_only_create_on_any_registration(pod_id)):
                 volume = shlex.quote(volume_name)
                 await retry_ssh_command(
                     ssh_client,
@@ -9480,7 +9484,7 @@ class DockerService:
             await self.stream_log(
                 f"Starting isolated build container {dind_name}", "success", log_tag
             )
-            if inflight_creates.is_only_create(pod_id):
+            if inflight_creates.is_only_create_on_any_registration(pod_id):
                 # DAH-5437: a create resumed after a connector restart meets the build container its cut-off
                 # attempt left under this pod's name; no other create of this pod runs, so it is ours to replace.
                 # The full teardown, so the egress rules of the old DinD's IP go with it.
@@ -12075,7 +12079,7 @@ class DockerService:
                     container_vanished = container_created and container_missing
                     # DAH-2211: inline cleanup of custom-build artifacts on docker_run failure; named by pod, so
                     # left to another live create of the same pod (F-78)
-                    if is_custom_build and inflight_creates.is_only_create(payload.pod_id):
+                    if is_custom_build and inflight_creates.is_only_create_on_any_registration(payload.pod_id):
                         await self._cleanup_custom_build_artifacts(
                             ssh_client=ssh_client,
                             pod_id=payload.pod_id,
