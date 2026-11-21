@@ -1,0 +1,69 @@
+name: "CD: s3fs volume plugin"
+
+# Builds neurons/validators/s3fs_volume_plugin and pushes it as the Docker plugin
+# daturaai/compute-subnet-validator:s3fs-volume-plugin, the plugin the validator installs for every Volume
+# (S3FS_PLUGIN_IMAGE). A tag of the validator repository, because the lium-io-publish OIDC ruleset already covers
+# it. Published from main when its inputs change. The published mochoa/s3fs-volume-plugin carries s3fs 1.86, whose
+# retries go out unsigned, so a rental's reads fail after a network blip (s3fs_volume_plugin/Dockerfile).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - neurons/validators/s3fs_volume_plugin/**
+      - .github/workflows/s3fs_volume_plugin.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: s3fs-volume-plugin
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: dockerhub-push
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PLUGIN: daturaai/compute-subnet-validator:s3fs-volume-plugin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build before the login: the base images are public docker.io images, and once the OIDC
+      # token is the docker.io credential every pull uses it.
+      - name: Build the plugin's root filesystem
+        run: |
+          cd neurons/validators/s3fs_volume_plugin
+          docker build -t s3fs-volume-plugin-rootfs .
+          # a plugin is a config.json next to its rootfs (Docker's managed plugin format)
+          mkdir -p "$RUNNER_TEMP/plugin/rootfs"
+          cp config.json "$RUNNER_TEMP/plugin/"
+          id=$(docker create s3fs-volume-plugin-rootfs true)
+          docker export "$id" | tar -x -C "$RUNNER_TEMP/plugin/rootfs"
+          docker rm "$id"
+
+      - name: Check the plugin's s3fs is past the unsigned-retry bug (fixed in 1.88)
+        run: |
+          version=$(docker run --rm s3fs-volume-plugin-rootfs s3fs --version | sed -n 's/.*V\([0-9][0-9.]*\).*/\1/p' | head -1)
+          echo "s3fs $version"
+          printf '1.88\n%s\n' "$version" | sort -V -C || { echo "::error::s3fs $version is older than 1.88"; exit 1; }
+
+      - name: Create the plugin
+        run: docker plugin create "$PLUGIN" "$RUNNER_TEMP/plugin"
+
+      - name: Log in to Docker Hub (OIDC, no stored token)
+        uses: docker/login-action@v4   # >= 4.5.0 for Docker Hub OIDC
+        env:
+          DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
+          DOCKERHUB_OIDC_EXPIREIN: "1800"
+        with:
+          username: daturaai
+
+      - name: Push the plugin
+        run: docker plugin push "$PLUGIN"

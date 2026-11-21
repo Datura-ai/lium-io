@@ -539,7 +539,9 @@ async def test_fresh_create_fails_when_sysbox_cannot_align_the_volume_owner(
     # A range wider than one slice means sysbox picks a different base per
     # container, so the mount owner cannot be aligned. A fresh rental fails
     # before the container exists instead of starting on runc.
-    ssh_client = RecordingSSHClient(stdout="sysbox:231072:1048576")
+    ssh_client = InstalledPluginSSHClient(
+        f"docker.io/{docker_service_module.S3FS_PLUGIN_IMAGE}", stdout="sysbox:231072:1048576"
+    )
     _patch_create_harness(monkeypatch, docker_service, ssh_client)
     plugin_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "remove_s3fs_volume_plugin", plugin_spy)
@@ -752,6 +754,94 @@ async def test_create_s3fs_volume_retries_a_failed_plugin_install(
     assert _s3fs_install_count(ssh_client) == expected_installs
     # the instance is still configured and enabled after the retried install
     assert any("plugin enable s3fs-celium-volume-safe" in command for command in ssh_client.commands)
+
+
+class InstalledPluginSSHClient(RecordingSSHClient):
+    # answers `plugin inspect` with the installed instance's reference, every other command with `stdout`
+    def __init__(self, reference: str, stdout: str = ""):
+        super().__init__(stdout=stdout)
+        self.reference = reference
+
+    async def run(self, command, *args, **kwargs):
+        self.commands.append(command)
+        stdout = self.reference + "\n" if "plugin inspect --format '{{.PluginReference}}'" in command else self.stdout
+        return SimpleNamespace(stdout=stdout, stderr="", exit_status=0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reference", "replaced"),
+    [
+        # an instance from the mochoa build (s3fs 1.86: retries go out unsigned) is removed before the install
+        ("docker.io/mochoa/s3fs-volume-plugin:latest", True),
+        # one from our build is only reconfigured, as before
+        (f"docker.io/{docker_service_module.S3FS_PLUGIN_IMAGE}", False),
+        # `docker plugin create` records the name without the registry
+        (docker_service_module.S3FS_PLUGIN_IMAGE, False),
+    ],
+)
+async def test_create_s3fs_volume_replaces_an_instance_of_another_build(
+    docker_service,
+    monkeypatch,
+    reference,
+    replaced,
+):
+    ssh_client = InstalledPluginSSHClient(reference)
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
+
+    result = await docker_service.create_s3fs_volume(
+        ssh_client=ssh_client,
+        log_extra={},
+        volume_info=_s3fs_volume_info(),
+        log_tag="tag",
+        sysbox_subuid_base=None,
+    )
+
+    assert result == (True, "")
+    removal = "/usr/bin/docker plugin rm s3fs-celium-volume-safe"
+    install = next(i for i, command in enumerate(ssh_client.commands) if "plugin install" in command)
+    assert (removal in ssh_client.commands[:install]) is replaced
+    assert f"plugin install {docker_service_module.S3FS_PLUGIN_IMAGE} " in ssh_client.commands[install]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("free_space", "cache_options"),
+    [
+        # DAH-6876: a read-through cache that may fill half the disk space free at mount time
+        (SimpleNamespace(stdout="10001\n", exit_status=0), ",use_cache=/var/cache/s3fs,del_cache,ensure_diskfree=5001"),
+        # no reading, no safe limit: the mount stays uncached
+        (SimpleNamespace(stdout="", exit_status=1), ""),
+        (SimpleNamespace(stdout="df: no such file\n", exit_status=0), ""),
+    ],
+)
+async def test_create_s3fs_volume_caches_reads_within_half_the_free_disk(
+    docker_service,
+    monkeypatch,
+    free_space,
+    cache_options,
+):
+    ssh_client = InstalledPluginSSHClient(f"docker.io/{docker_service_module.S3FS_PLUGIN_IMAGE}")
+    answer = ssh_client.run
+
+    async def run(command, *args, **kwargs):
+        if command.startswith("df -Pm "):
+            ssh_client.commands.append(command)
+            return SimpleNamespace(stderr="", **vars(free_space))
+        return await answer(command, *args, **kwargs)
+
+    monkeypatch.setattr(ssh_client, "run", run)
+    monkeypatch.setattr(docker_service, "execute_and_stream_logs", AsyncMock(return_value=(True, "")))
+
+    await docker_service.create_s3fs_volume(
+        ssh_client=ssh_client,
+        log_extra={},
+        volume_info=_s3fs_volume_info(),
+        log_tag="tag",
+        sysbox_subuid_base=None,
+    )
+
+    assert shlex.quote(f"DEFAULT_S3FSOPTS=allow_other,umask=0000{cache_options}") in " ".join(ssh_client.commands)
 
 
 @pytest.mark.asyncio
