@@ -1,3 +1,4 @@
+import functools
 import logging
 import pathlib
 from enum import Enum
@@ -20,6 +21,23 @@ from incentive.config import IncentiveConfig
 from lium_core.shared_config import DEFAULT_SHARED_CONFIG, SharedConfigClient
 
 logger = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=4)
+def _parse_miner_origins(value: str) -> frozenset[tuple[str, int]]:
+    """CONFIGURED_MINER_ORIGINS as (host, port) pairs. A malformed entry is skipped (and logged once per value), so one
+    typo never stops the validator dialling every other miner; cached, since every miner request reads it."""
+    origins = set()
+    for entry in (e.strip() for e in value.split(",")):
+        if not entry:
+            continue
+        host, _, port = entry.rpartition(":")
+        host = host.strip("[]")
+        if host and port.isdigit() and 0 < int(port) < 65536:
+            origins.add((host, int(port)))
+        else:
+            logger.warning("CONFIGURED_MINER_ORIGINS entry %r is not host:port; skipped", entry)
+    return frozenset(origins)
 
 
 class FeatureFlag(str, Enum):
@@ -1079,11 +1097,7 @@ class Settings(BaseSettings):
 
     def configured_miner_origins(self) -> set[tuple[str, int]]:
         """(host, port) of the miners the operator configured: CONFIGURED_MINER_ORIGINS and the debug local miner."""
-        origins = {
-            (host.strip("[]"), int(port))
-            for host, _, port in (o.strip().rpartition(":") for o in self.CONFIGURED_MINER_ORIGINS.split(","))
-            if host
-        }
+        origins = set(_parse_miner_origins(self.CONFIGURED_MINER_ORIGINS))
         if self.debug.USE_LOCAL_MINER and self.debug.MINER_ADDRESS and self.debug.MINER_PORT:
             origins.add((self.debug.MINER_ADDRESS, self.debug.MINER_PORT))
         return origins

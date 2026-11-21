@@ -113,3 +113,20 @@ async def test_a_miner_the_operator_configured_is_reached_at_its_private_address
             await _request(f"http://0.0.0.0:{port + 1}/executors")
     finally:
         await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_configured_origin_breaks_no_other_request(monkeypatch):
+    """A typo in CONFIGURED_MINER_ORIGINS (a port that is not a number) is skipped: the well-formed entry still counts
+    and a request to any public miner still goes out (stand check 2381-03)."""
+    monkeypatch.setattr(settings, "CONFIGURED_MINER_ORIGINS", "miner.example.net:abc, good.example.net:9000, :1, x:0")
+    assert settings.configured_miner_origins() == {("good.example.net", 9000)}
+
+    async def handler(request):
+        return web.json_response({"ok": True})
+
+    runner, port = await _serve(handler)
+    try:
+        assert await _request(f"http://127.0.0.1:{port}/executors") == (200, {"ok": True})
+    finally:
+        await runner.cleanup()
