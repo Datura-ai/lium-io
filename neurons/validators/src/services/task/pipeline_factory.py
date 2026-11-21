@@ -76,6 +76,7 @@ from .checks import (
     ProviderSideLoadCheck,
     RegistryPullCheck,
     RentalProbeCheck,
+    RentedSinceStartCheck,
     RentalVerificationCheck,
     RentedGpuDropCheck,
     RentedPodNetworkCheck,
@@ -107,7 +108,6 @@ from .pipeline import (
     ContextServices,
     ContextState,
     LoggerSink,
-    ParallelStage,
     Pipeline,
     PodRecoverer,
     StatusChangeTracker,
@@ -513,23 +513,18 @@ class PipelineFactory:
         """The first-pass pipeline with the validation fast path on: every check of build_checks,
         each deciding exactly as there, in an order that waits less.
 
-        - One `ParallelStage` with two lanes that share no data: the GPU lane (matmul,
-          fault probe, cached template — the challenge lives on the card) and the host lane
-          (port connectivity, port count, registry pull, sysbox, rental check — containers, ports and the
-          backend's probe). The executor's own one-call verification already runs its facts
-          steps (docker, ports, inspector) beside its GPU group (`LocalVerifyService`,
-          `parallel_gpu`) — the same split kept here. `StaleContainerCleanupCheck` still precedes the port
-          checks, and `TenantEnforcementCheck` still halts a rented node before either lane
-          starts. `LocalVerifyCheck` runs alone before them: the matmul consumes its answer.
-        - VerifyX runs alone after both lanes (DAH-5933): it measures the node's network, so nothing else of ours
-          may be pulling an image or copying a challenge while it does, and its up to 600 s come after the
-          rental check instead of leaving it short.
+        - The host prerequisites (port connectivity, port count, registry pull, sysbox, pid, docker CPU) and the
+          rental check run first, after `TenantEnforcementCheck` halted a rented node, so neither the executor's
+          `POST /verify` nor VerifyX can spend the rental check's time (DAH-5933 review).
+        - `LocalVerifyCheck` runs alone next: its VerifyX challenge measures the node's network, so nothing else
+          of ours may be pulling an image or copying a challenge while it does, and the matmul consumes its answer.
+        - The GPU checks (matmul, fault probe, cached template) follow. `RentedSinceStartCheck` then halts a node
+          whose customer pod CapabilityCheck found started during the run, before VerifyX puts its load beside it.
+        - VerifyX runs alone after them, its up to 600 s after the rental check instead of before it.
         - The rental probe, score and finalize follow as today.
-        The list differs from build_checks only in where these checks sit; a node that would fail
-        there fails here too. A node that would fail two checks can report the other one first:
-        the port checks now run before VerifyX, and a lane that stops first wins. One read is not
-        shared: when the matmul fails and CapabilityCheck finds a Lium workload started during the
-        run, RentalVerificationCheck in the host lane still sees the cycle-start rented_data.
+        The checks run one after another, as in build_checks; a node that would fail there fails here too. A node
+        that would fail two checks can report the other one first: the port checks run after the rented halt and
+        VerifyX after the matmul.
         """
         return cast(
             list[Check],
@@ -592,30 +587,26 @@ class PipelineFactory:
                 # DAH-4663: idle nodes only; resets a leftover clock lock or unlists the node
                 GpuClockLockCheck(),
                 GpuUsageCheck(),
+                # DAH-5933 review: the host prerequisites and the rental check first, so neither the executor's
+                # `POST /verify` nor VerifyX can spend the rental check's time
+                PortConnectivityCheck(),
+                PortCountCheck(),
+                RegistryPullCheck(),
+                ContainerDownloadSpeedCheck(),
+                SysboxRequiredCheck(),
+                PidHostRequiredCheck(),
+                DockerCpuCheck(),
+                RentalVerificationCheck(),
+                # alone, so no traffic of ours shares the network it measures; ahead of the matmul that consumes it
                 LocalVerifyCheck(),
-                # DAH-5933 review: the lanes before VerifyX, so its up to 600 s never leave the rental check short
-                ParallelStage(
-                    [
-                        [
-                            PortConnectivityCheck(),
-                            PortCountCheck(),
-                            RegistryPullCheck(),
-                            ContainerDownloadSpeedCheck(),
-                            SysboxRequiredCheck(),
-                            PidHostRequiredCheck(),
-                            DockerCpuCheck(),
-                            RentalVerificationCheck(),
-                        ],
-                        [
-                            CapabilityCheck(),
-                            GpuFaultProbeCheck(),
-                            PinnedMemoryProbeCheck(),
-                            PostRentalGpuRecheckCheck(),
-                            NvlinkFaultCheck(),
-                            CachedTemplateVerificationCheck(),
-                        ],
-                    ]
-                ),
+                CapabilityCheck(),
+                GpuFaultProbeCheck(),
+                PinnedMemoryProbeCheck(),
+                PostRentalGpuRecheckCheck(),
+                NvlinkFaultCheck(),
+                CachedTemplateVerificationCheck(),
+                # a customer pod CapabilityCheck found started during the run is handled before VerifyX starts
+                RentedSinceStartCheck(TenantEnforcementCheck(egress_guard=_RENTAL_EGRESS_GUARD_RENTED)),
                 VerifyXCheck(),
                 DiskSpaceCheck(),
                 RentalProbeCheck(),

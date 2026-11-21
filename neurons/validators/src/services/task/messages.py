@@ -1437,6 +1437,13 @@ class TenantEnforcementMessages:
         category="policy",
         impact="Proceed",
     )
+    STILL_NOT_RENTED = MessageTemplate(
+        event="Executor still not rented after the parallel checks",
+        reason="EXECUTOR_STILL_NOT_RENTED",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
     POD_NOT_RUNNING = MessageTemplate(
         event="Pod not running",
         reason="POD_NOT_RUNNING",

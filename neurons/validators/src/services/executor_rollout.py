@@ -791,14 +791,17 @@ async def carry_renter_gpu_reset_results(
     rented_executor_ids: set[str],
     rented_data: RentedExecutorsResponse | None,
     miner_coldkeys: dict[str, str | None],
+    rented_at_end: RentedExecutorsResponse | None = None,
 ) -> None:
     """DAH-4658: a scrape held for the renter's own GPU reset takes the node's last scored result, in place.
 
     The provider loses nothing: the carried result is scored as in the cycle it came from, with this cycle's
     pay flags and a fresh ban lookup. A node the backend no longer lists as rented (`rented_executor_ids`,
     lower-case), or without a readable last result, keeps the held one, and `withhold_renter_gpu_reset_verdicts`
-    takes it out.
+    takes it out. DAH-5933: a no-task-time hold reads its rented GPUs from `rented_at_end`, the read
+    `rented_executor_ids` came from (`rented_data` when not given), and carries only the same allocation.
     """
+    split_read = rented_at_end or rented_data
     for miner_hotkey, results in job_results.items():
         for index, held in enumerate(results):
             if not _held_for_renter_gpu_reset(held):
@@ -812,6 +815,14 @@ async def carry_renter_gpu_reset_results(
             # in for a rented cycle, nor a rented one for an idle cycle (review)
             if previous is None or previous.is_rented != rented_now:
                 continue
+            # the hold ends the run before the rented check, so the held result counts no rented GPU
+            rented_gpu_count = pods_rented_gpu_count(rented_data, str(held.executor_info.uuid))
+            if no_task_time:
+                # the stored split pays rented and idle GPUs apart: it stands only for the same rented GPUs, read from
+                # the snapshot that classed the node (review)
+                rented_gpu_count = pods_rented_gpu_count(split_read, str(held.executor_info.uuid)) if rented_now else 0
+                if rented_now and (rented_gpu_count is None or rented_gpu_count != previous.rented_gpu_count):
+                    continue
             if no_task_time and not await _spend_kept_result(redis_service, miner_hotkey, held):
                 continue
             results[index] = previous.model_copy(
@@ -831,9 +842,7 @@ async def carry_renter_gpu_reset_results(
                         if rented_data
                         else previous.filler_revenue_usd_per_hour
                     ),
-                    # the hold ends the run before the rented check, so the held result counts no rented GPU
-                    "rented_gpu_count": pods_rented_gpu_count(rented_data, str(held.executor_info.uuid))
-                    or previous.rented_gpu_count,
+                    "rented_gpu_count": rented_gpu_count or previous.rented_gpu_count,
                 }
             )
             logger.info(

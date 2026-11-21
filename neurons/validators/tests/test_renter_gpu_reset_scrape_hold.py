@@ -959,3 +959,29 @@ async def test_no_verified_job_reset_is_sent_just_after_a_renter_reset():
         await client.subscribe_mesages_from_redis()
 
     assert [request.executor_uuid for request in client.message_queue] == [EXECUTOR, "idle"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("end_gpus", "carried"), [(2, False), (8, True), (None, False)], ids=["split-changed", "same", "unknown"])
+async def test_a_no_task_time_carry_stands_only_for_the_same_rented_gpus(end_gpus, carried):
+    # review: last pass 8 GPUs rented; the cycle-start snapshot idle; a pod started during the no-time run
+    service = _redis_service()
+    previous = _rented_scored("node-1")
+    previous.rented_gpu_count = 8
+    await remember_rented_scored_results({"5Miner": [previous]}, service)
+    pod = RentedPod(pod_id=POD_ID, container_name="c", gpu_count=end_gpus, status="RUNNING")
+    at_end = RentedExecutorsResponse(
+        executors={
+            "node-1": RentedExecutor(
+                miner_hotkey="5Miner", executor_ip_address="203.0.113.5", executor_ip_port="22", pods=[pod]
+            )
+        }
+    )
+    job_results = {"5Miner": [_no_task_time("node-1")]}
+
+    await carry_renter_gpu_reset_results(job_results, service, {"node-1"}, _rented_executors(), {}, at_end)
+
+    [result] = job_results["5Miner"]
+    assert result.carried_for_renter_gpu_reset is carried
+    if carried:
+        assert result.rented_gpu_count == 8

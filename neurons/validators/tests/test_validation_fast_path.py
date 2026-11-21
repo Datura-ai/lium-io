@@ -34,6 +34,7 @@ from neurons.validators.src.services.task.checks import (
     PortConnectivityCheck,
     RentalVerificationCheck,
     SysboxRequiredCheck,
+    RentedSinceStartCheck,
     TenantEnforcementCheck,
     VerifyXCheck,
 )
@@ -303,28 +304,28 @@ def test_fast_path_checks_are_the_serial_checks_re_ordered():
 
     serial_ids = sorted(type(c).__name__ for c in serial)
     fast_ids = sorted(type(c).__name__ for c in flat)
-    assert fast_ids == serial_ids, "no check added, none dropped"
+    # the one addition: the rented halt again before VerifyX, for a pod started during the run (DAH-5933 review)
+    assert fast_ids == sorted([*serial_ids, RentedSinceStartCheck.__name__]), "no other check added, none dropped"
     assert [type(c) for c in PipelineFactory.build_checks(fast_path=True)] == [type(c) for c in fast]
 
     names = [type(c).__name__ for c in fast]
-    stage = next(s for s in fast if isinstance(s, ParallelStage))
-    stage_at = fast.index(stage)
-    # The gates that must decide before any GPU or port work stay ahead of the stage; the matmul consumes LocalVerify.
-    for gate in (TenantEnforcementCheck, LocalVerifyCheck):
-        assert names.index(gate.__name__) < stage_at
-    # DAH-5933 review: VerifyX after the stage, so its up to 600 s never leave the rental check short of time.
-    assert names.index(VerifyXCheck.__name__) > stage_at
-    # VerifyX measures the network alone; the executor refuses VerifyX beside the matmul.
-    lane_types = [[type(c) for c in lane] for lane in stage.lanes]
-    assert VerifyXCheck not in [t for lane in lane_types for t in lane]
-    assert RentalVerificationCheck in [t for lane in lane_types for t in lane]
-    # Only the orderings that matter: the checks reading sysbox_runtime run after the probe that
-    # settles it, and the kernel-fault probe follows the matmul it complements.
-    port_lane = next(lane for lane in lane_types if PortConnectivityCheck in lane)
-    for after in (ContainerDownloadSpeedCheck, SysboxRequiredCheck):
-        assert port_lane.index(PortConnectivityCheck) < port_lane.index(after)
-    gpu_lane = next(lane for lane in lane_types if CapabilityCheck in lane)
-    assert gpu_lane.index(CapabilityCheck) < gpu_lane.index(GpuFaultProbeCheck)
+    order = [
+        TenantEnforcementCheck,
+        PortConnectivityCheck,
+        ContainerDownloadSpeedCheck,
+        SysboxRequiredCheck,
+        # DAH-5933 review: the host prerequisites and the rental check before POST /verify and VerifyX
+        RentalVerificationCheck,
+        # its answer is the matmul's
+        LocalVerifyCheck,
+        CapabilityCheck,
+        # the kernel-fault probe follows the matmul it complements
+        GpuFaultProbeCheck,
+        RentedSinceStartCheck,
+        VerifyXCheck,
+    ]
+    positions = [names.index(check.__name__) for check in order]
+    assert positions == sorted(positions)
 
 
 def _rented(executor_uuid="exe-1", pods=(), fillers=()):
@@ -383,3 +384,41 @@ def test_express_lane_waits_shorten_only_with_the_flag_on(monkeypatch):
     assert max_attempts_for("verification failed") == 3
     monkeypatch.setattr(settings, "VALIDATION_FAST_PATH_ENABLED", False)
     assert max_attempts_for(MINER_DID_NOT_RETURN_EXECUTOR) == 3
+
+
+class _Halt:
+    check_id = "executor.validate.rented_state"
+
+    def __init__(self):
+        self.calls = 0
+
+    async def run(self, ctx) -> CheckResult:
+        self.calls += 1
+        return CheckResult(passed=True, event=_event(self.check_id, True), halt=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pods,halts", [((), False), (("p1",), True)], ids=["still-idle", "pod-started"])
+async def test_a_pod_started_during_the_run_is_halted_before_verifyx(context_factory, pods, halts):
+    # DAH-5933 review: CapabilityCheck put a customer pod started during the run into the snapshot
+    ctx = context_factory()
+    rented = RentedExecutorsResponse(
+        executors={
+            str(ctx.executor.uuid): RentedExecutor(
+                miner_hotkey=ctx.miner_hotkey, executor_ip_address="1.1.1.1", executor_ip_port="1",
+                pods=[RentedPod(pod_id=p, container_name=f"c-{p}") for p in pods],
+            )
+        }
+        if pods
+        else {}
+    )
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, rented_data=rented)})
+    halt = _Halt()
+
+    result = await RentedSinceStartCheck(halt).run(ctx)
+
+    assert result.passed
+    assert halt.calls == (1 if halts else 0)
+    assert result.halt is halts
+    if not halts:
+        assert result.event.reason_code == "EXECUTOR_STILL_NOT_RENTED"

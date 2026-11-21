@@ -1600,7 +1600,7 @@ class Validator:
         rented = rented_now or rented_executors
         rented_executor_ids = {str(executor_id).lower() for executor_id in rented.executors} if rented else set()
         await carry_renter_gpu_reset_results(
-            all_job_results, self.redis_service, rented_executor_ids, rented_executors, miner_coldkeys
+            all_job_results, self.redis_service, rented_executor_ids, rented_executors, miner_coldkeys, rented
         )
 
     async def rented_at_cycle_end(

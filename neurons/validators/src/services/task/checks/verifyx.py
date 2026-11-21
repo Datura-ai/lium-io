@@ -32,7 +32,7 @@ from services.verifyx_validation_service import (
 from ..messages import VerifyXMessages as Msg, render_message, shown
 from ..pipeline import CheckResult, Context
 from .disk_space import DiskSpaceCheck
-from .rental_probe import has_standing_failure
+from .rental_probe import has_standing_failure, rental_probe_due
 from .network_ema import compute_ema
 from .task_time import task_seconds_left
 from .rental_verification import RENTAL_CHECK_MIN_SECONDS
@@ -62,7 +62,8 @@ _package_fallback_probes: dict[tuple[str, str], int] = {}
 MIN_COLD_RETRY_SECONDS = 240
 COLD_RETRY_MARGIN_SECONDS = 60
 # DAH-5933: the first sample's share of the task, so a slow VerifyX (up to its 600 s cap) leaves the checks after it
-# their time: the rental verification's minimum plus its cleanup reserve (rental_verification). With less than
+# their time: when the rental probe still has to run this cycle, the rental check's minimum plus its cleanup reserve
+# (rental_verification); otherwise only COLD_RETRY_MARGIN_SECONDS for scoring, publishing and cleanup. With less than
 # MIN_COLD_RETRY_SECONDS for VerifyX itself the cycle reports VERIFYX_NO_TASK_TIME, which carries like
 # RENTAL_CHECK_NO_TASK_TIME: the validator's budget, not the node, decided it.
 VERIFYX_LATER_CHECKS_RESERVE_SECONDS = RENTAL_CHECK_MIN_SECONDS + 30
@@ -301,7 +302,11 @@ class VerifyXCheck:
             result = local.verifyx
             transport = "local_verify"
         else:
-            budget = task_seconds_left(ctx) - VERIFYX_LATER_CHECKS_RESERVE_SECONDS
+            # the rental check already ran before VerifyX on both paths; only a still-due rental probe needs more
+            reserve = (
+                VERIFYX_LATER_CHECKS_RESERVE_SECONDS if await rental_probe_due(ctx) else COLD_RETRY_MARGIN_SECONDS
+            )
+            budget = task_seconds_left(ctx) - reserve
             if budget < MIN_COLD_RETRY_SECONDS:
                 return self._no_task_time(ctx, {"seconds_left": max(0, int(budget))})
             if budget >= VERIFYX_COMMAND_TIMEOUT_SECONDS:
@@ -988,6 +993,7 @@ async def _verifyx_within(ctx: Context, specs: dict, sizing: dict, budget: float
                 default_extra=ctx.default_extra,
                 machine_spec=specs,
                 run_dir=run_dir,
+                python_watchdog=True,
                 **sizing,
             ),
             timeout=budget,

@@ -239,6 +239,22 @@ class NetworkGateTally:
 NETWORK_GATE_TALLY = NetworkGateTally()
 
 
+# DAH-5933: `timeout -k 10 SECONDS CMD...` for a host without it: the watchdog leads its own process group, which
+# kill_remote_verifyx kills by the recorded PID; at the deadline TERM to the group, then KILL after 10 s.
+_PYTHON_WATCHDOG = (
+    "import os,signal,subprocess,sys\n"
+    "os.setpgid(0,0)\n"
+    "p=subprocess.Popen(sys.argv[2:])\n"
+    "try:\n sys.exit(p.wait(float(sys.argv[1])))\n"
+    "except subprocess.TimeoutExpired:\n pass\n"
+    "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+    "os.killpg(0,signal.SIGTERM)\n"
+    "try:\n p.wait(10)\n"
+    "except subprocess.TimeoutExpired:\n os.killpg(0,signal.SIGKILL)\n"
+    "sys.exit(124)\n"
+)
+
+
 class VerifyXValidationService:
     def __init__(self):
         self.lib_name = LIB_PATH
@@ -386,6 +402,7 @@ class VerifyXValidationService:
         machine_spec: dict,
         challenge_config_overrides: dict | None = None,
         run_dir: str | None = None,
+        python_watchdog: bool = False,
     ):
         # The SSH transport: library checksum over the shell → prepare_verifyx_challenge → one
         # remote `verifyx_executor.py` run → evaluate_verifyx_capture. The local transport
@@ -477,7 +494,7 @@ class VerifyXValidationService:
                 machine_spec, default_extra, challenge_config_overrides, lib_name=lib_name
             )
 
-            command = self._verifyx_command(executor_info, challenge, lib_name, run_dir)
+            command = self._verifyx_command(executor_info, challenge, lib_name, run_dir, python_watchdog)
 
             logger.info(_m("VerifyX Python Script Command", extra=get_extra_info(challenge.log_extra)))
 
@@ -620,7 +637,12 @@ class VerifyXValidationService:
         return None
 
     def _verifyx_command(
-        self, executor_info, challenge: "VerifyXChallenge", lib_name: str, run_dir: str | None = None
+        self,
+        executor_info,
+        challenge: "VerifyXChallenge",
+        lib_name: str,
+        run_dir: str | None = None,
+        python_watchdog: bool = False,
     ) -> str:
         command = (
             f"{shlex.quote(executor_info.python_path)} {shlex.quote(executor_info.root_dir + '/src/verifyx_executor.py')} "
@@ -631,12 +653,24 @@ class VerifyXValidationService:
         # A run the validator may cut off: its own scratch dir (cwd, so the disk-test file lands in
         # it on the same filesystem) and its PID on record, for kill_remote_verifyx.
         d = shlex.quote(run_dir)
-        return (
-            # a remote deadline of its own: the run cannot outlive its budget even if the kill never lands;
+        deadline = f"timeout -k 10 {VERIFYX_COMMAND_TIMEOUT_SECONDS} {command} &"
+        if python_watchdog:
+            # DAH-5933 review: the bounded first sample has no earlier result to fall back on, so a host whose
+            # `timeout` lacks -k (busybox) gets the same deadline from the executor's own Python
+            watchdog = (
+                f"{shlex.quote(executor_info.python_path)} -c {shlex.quote(_PYTHON_WATCHDOG)} "
+                f"{VERIFYX_COMMAND_TIMEOUT_SECONDS} {command} &"
+            )
+            start = f"mkdir {d} && cd {d} || exit 1; if timeout -k 1 1 true 2>/dev/null; then {deadline} else {watchdog} fi; "
+        else:
             # a host whose `timeout` lacks -k (busybox) skips the retry, so the first sample stands
-            f"timeout -k 1 1 true 2>/dev/null || {{ echo 'no timeout -k' >&2; exit 1; }}; "
-            f"mkdir {d} && cd {d} || exit 1; "
-            f"timeout -k 10 {VERIFYX_COMMAND_TIMEOUT_SECONDS} {command} & echo $! > pid; wait $!; rc=$?; "
+            start = (
+                f"timeout -k 1 1 true 2>/dev/null || {{ echo 'no timeout -k' >&2; exit 1; }}; "
+                f"mkdir {d} && cd {d} || exit 1; {deadline} "
+            )
+        return (
+            # a remote deadline of its own: the run cannot outlive its budget even if the kill never lands
+            f"{start}echo $! > pid; wait $!; rc=$?; "
             f"cd .. && rm -rf {d}; exit $rc"
         )
 
