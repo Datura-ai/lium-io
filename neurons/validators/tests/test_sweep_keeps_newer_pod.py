@@ -218,3 +218,42 @@ async def test_a_long_list_runs_a_bounded_number_of_tasks():
 
     # the test's own task plus one per worker, never one per name
     assert tasks_seen <= ds_module._POD_RENTAL_READS_AT_ONCE + 1
+
+
+OWN_ID = "a" * 64
+
+
+@pytest.mark.parametrize(
+    ("listing", "label", "kept"),
+    [
+        (f"pod_target {OWN_ID}\n", "miner-a:exec-a\n", False),  # the create's registration: a stale leftover of its own
+        (f"pod_target {OWN_ID}\n", "\n", False),  # made before the label
+        (f"pod_target {OWN_ID}\n", "miner-b:exec-b\n", True),  # another registration's pod on a daemon both share
+        (f"pod_target {OWN_ID}\n", None, True),  # the label could not be read
+        ("pod_target\n", "miner-a:exec-a\n", True),  # listed without its ID: nothing to check the label of
+    ],
+)
+@pytest.mark.asyncio
+async def test_the_creates_own_pod_name_is_swept_only_when_made_for_its_registration(
+    retry_ssh_mock, listing, label, kept
+):
+    """DAH-6531: one pod keeps one name on every registration; the sweep checks the exact ID's registration."""
+    svc = DockerService(
+        ssh_service=Mock(), redis_service=Mock(get=AsyncMock(return_value=None)), attestation_service=Mock()
+    )
+
+    async def run(command, *args, **kwargs):
+        if "docker inspect" in command:
+            assert OWN_ID in command
+            return Mock(exit_status=1 if label is None else 0, stdout=label or "", stderr="")
+        return Mock(exit_status=0, stdout=listing, stderr="")
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=run)
+    removed = await svc.clean_existing_containers(
+        ssh_client=ssh_client, default_extra={}, pod_name="pod_target", active_container_names=[], owner="miner-a:exec-a"
+    )
+
+    sent = " ".join(call.args[1] for call in retry_ssh_mock.await_args_list)
+    assert (removed == []) is kept
+    assert ("volume_target" in sent) is not kept

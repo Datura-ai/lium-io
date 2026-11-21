@@ -1859,6 +1859,17 @@ def _executor_label(payload) -> str:
     return f"{payload.miner_hotkey}:{payload.executor_id}"
 
 
+def _registration_label_command(container_id: str) -> str:
+    template = "{{index .Config.Labels \"%s\"}}" % LIUM_EXECUTOR_ID_LABEL
+    return f"/usr/bin/docker inspect --type container -f {shlex.quote(template)} {shlex.quote(container_id)}"
+
+
+def _made_for(result, owner: str) -> bool:
+    """The inspected container is this registration's: the read succeeded and the label is `owner`, or empty (a
+    container made before the label). On a daemon two registrations share, the pod's name may be the other's."""
+    return result.exit_status == 0 and (result.stdout or "").strip() in ("", owner)
+
+
 def _pod_volume_labels(payload) -> dict[str, str]:
     """A customer volume's ownership: the pod and the registration that created it."""
     return {LIUM_POD_ID_LABEL: payload.pod_id, LIUM_EXECUTOR_ID_LABEL: _executor_label(payload)}
@@ -1884,14 +1895,18 @@ def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
         # an unreadable boot id is not this node's: the read must succeed and give a value before it is compared
         f'boot=$(cat /proc/sys/kernel/random/boot_id) && [ -n "$boot" ] '
         f'&& [ "$boot" = {shlex.quote(payload.expected_boot_id)} ] || exit {_NOT_THE_NODE_LEFT_EXIT}',
-        f"found=$(/usr/bin/docker inspect --type container -f {shlex.quote(found)} {name} 2>/dev/null)",
+        # a failed inspect is absence only when a listing that succeeded shows no container under the name
+        f"found=$(/usr/bin/docker inspect --type container -f {shlex.quote(found)} {name} 2>/dev/null) "
+        f"|| {{ found=; named=$(/usr/bin/docker ps -aq --no-trunc --filter name=^{name}$) && [ -z \"$named\" ] || exit 1; }}",
         f'[ -z "$found" ] || [ "${{found#* }}" = {owner} ] || exit {_NOT_THE_NODE_LEFT_EXIT}',
         # removed by the ID that was checked: a container created under the same name after the check is not it
         'id=${found%% *}',
-        f"kept=$(/usr/bin/docker ps -aq --filter name=^{shlex.quote(_kept_container_prefix(payload.container_name))} "
+        f"kept=$(/usr/bin/docker ps -aq --no-trunc --filter name=^{shlex.quote(_kept_container_prefix(payload.container_name))} "
         f"--filter label={shlex.quote(f'{LIUM_EXECUTOR_ID_LABEL}={_executor_label(payload)}')}) || exit 1",
         "/usr/bin/docker rm -fv $id $kept >/dev/null 2>&1",
-        '[ -n "$id" ] && /usr/bin/docker inspect --type container "$id" >/dev/null 2>&1 && exit 1',
+        # done only when a listing that succeeded shows none of the selected containers
+        "left=$(/usr/bin/docker ps -aq --no-trunc) || exit 1",
+        'for c in $id $kept; do case "$left" in *"$c"*) exit 1;; esac; done',
         "exit 0",
     ]
     return "\n".join(lines)
@@ -2055,8 +2070,11 @@ class _EditSwap:
         docker_client=None,
         redis: RedisService | None = None,
         executor_id: str | None = None,
+        owner: str | None = None,
     ):
         self.ssh_client = ssh_client
+        # DAH-6531: the edit's registration; a container under the pod's names made for another is never touched
+        self.owner = owner
         # the create's Docker SDK connection, independent of the SSH session: stops a renamed pod a dead SSH lost track of
         self.docker_client = docker_client
         self.container_name = container_name
@@ -2139,6 +2157,13 @@ class _EditSwap:
         if (names or recover_kept) and container_id is None:
             # its removal after the reply could only go by name, and a later edit may park another container under it
             raise Exception("[park_current_container] docker ps listed the pod without its container ID; the pod was left as it was")
+        if self.owner is not None:
+            for name in (self.container_name, parked, recover_kept):
+                if name in ids_by_name and not _made_for(await self._run(_registration_label_command(ids_by_name[name])), self.owner):
+                    raise Exception(
+                        "[park_current_container] a container under the pod's name was not made for this "
+                        "registration; the pod was left as it was"
+                    )
         if self.container_name not in names:
             if parked in names or recover_kept:
                 # An earlier edit crashed between park and restore: the parked container is the
@@ -5886,8 +5911,12 @@ class DockerService:
         report: ContainerCleanupReport | None = None,
         removed_at_ssh_connect: dict[str, str] | None = None,
         refuse_before_removal: Callable[[list[str]], None] | None = None,
+        owner: str | None = None,
     ) -> list[str]:
         """Force-remove stale pod_/filler_ containers (and their volumes); returns the names removed.
+
+        DAH-6531: with ``owner`` (the create's registration), ``pod_name`` itself goes only when the listing gave its
+        ID and that container is the registration's (`_made_for`); else it and its volume stay.
 
         DAH-5392: an unlisted `pod_*` other than ``pod_name`` is removed (with its volume) only when the
         backend confirms its rental closed: a create that waited may sweep after a newer create on the
@@ -5965,6 +5994,10 @@ class DockerService:
             if unlisted_pods:
                 closed = await self._pods_with_closed_rental(unlisted_pods, default_extra)
                 stale_containers = [name for name in stale_containers if name not in unlisted_pods or name in closed]
+            if owner is not None and pod_name in stale_containers:
+                own_id = listed_ids.get(pod_name)
+                if own_id is None or not _made_for(await ssh_client.run(_registration_label_command(own_id)), owner):
+                    stale_containers.remove(pod_name)
             container_names = " ".join(shlex.quote(name) for name in stale_containers)
             if not container_names:
                 return []
@@ -10847,6 +10880,7 @@ class DockerService:
                         docker_client=docker_client,
                         redis=self.redis_service,
                         executor_id=str(executor_info.uuid),
+                        owner=_executor_label(payload),
                     )
                 )
                 # Add profiler for ssh connection
@@ -11368,6 +11402,7 @@ class DockerService:
                     report=cleanup_report,
                     removed_at_ssh_connect=fillers_removed_at_ssh_connect.listed_id_by_filler_name,
                     refuse_before_removal=lambda names: _refuse_filler_beside_unlisted_pod(payload, names),
+                    owner=_executor_label(payload),
                 )
                 # DAH-3980: removing only fillers (confirmed gone, their volumes left to the backend's
                 # filler delete) changes no listing but the containers and their mounts, so the listings

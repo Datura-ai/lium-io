@@ -80,24 +80,35 @@ LEFT_MINER = "miner-a"
 LEFT_LABEL = f"{LEFT_MINER}:{LEFT}"
 
 
-def _daemon_stub(tmp_path: Path, container_owner: str | None, sticky: bool = False) -> Path:
-    """A docker stub: the container exists while its owner file does, a removal deletes it unless sticky; each file
-    under volumes/ is a volume whose lines are its labels (`inuse` marks one a container still uses), inspected as
-    "<pod id> <registration>" and removed by name."""
-    log, container, volumes = tmp_path / "calls", tmp_path / "container", tmp_path / "volumes"
+def _daemon_stub(
+    tmp_path: Path,
+    container_owner: str | None,
+    sticky: bool = False,
+    sticky_kept: bool = False,
+    inspect_fails: bool = False,
+) -> Path:
+    """A docker stub: the container `cid` exists while its owner file does and the kept container `kept1` while its
+    file does; a removal deletes each unless sticky. `inspect_fails` makes inspect fail as a daemon error would, with
+    the container still there. Each file under volumes/ is a volume whose lines are its labels (`inuse` marks one a
+    container still uses), inspected as "<pod id> <registration>" and removed by name."""
+    log, container, kept, volumes = tmp_path / "calls", tmp_path / "container", tmp_path / "kept", tmp_path / "volumes"
     volumes.mkdir(exist_ok=True)
+    kept.write_text("")
     if container_owner is not None:
         container.write_text(container_owner)
-    keep = "true" if sticky else f"rm -f {shlex.quote(str(container))}"
-    vols = shlex.quote(str(volumes))
+    c, k, vols = (shlex.quote(str(path)) for path in (container, kept, volumes))
+    rm_container = "true" if sticky else f"rm -f {c}"
+    rm_kept = "true" if sticky_kept else f"rm -f {k}"
     stub = tmp_path / "docker"
     stub.write_text(
         "#!/bin/sh\n"
         f'echo "$*" >> {shlex.quote(str(log))}\n'
         'case "$1" in\n'
-        "  ps) echo kept1;;\n"
-        f'  inspect) [ -e {shlex.quote(str(container))} ] || exit 1; case "$*" in *-f*) printf "cid "; cat {shlex.quote(str(container))};; esac;;\n'
-        f"  rm) {keep};;\n"
+        f'  ps) case "$*" in *label=*) [ -e {k} ] && echo kept1;; *name=*) [ -e {c} ] && echo cid;; '
+        f"*) [ -e {c} ] && echo cid; [ -e {k} ] && echo kept1;; esac; exit 0;;\n"
+        + ("  inspect) exit 1;;\n" if inspect_fails else "")
+        + f'  inspect) [ -e {c} ] || exit 1; case "$*" in *-f*) printf "cid "; cat {c};; esac;;\n'
+        f'  rm) for a in "$@"; do case "$a" in cid) {rm_container};; kept1) {rm_kept};; esac; done;;\n'
         '  volume) eval "v=\\${$#}"; f=' + vols + '/$v; [ -e "$f" ] || exit 1; case "$2" in\n'
         '    inspect) pod=$(sed -n "s/^io.lium.pod_id=//p" "$f"); ex=$(sed -n "s/^io.lium.executor_id=//p" "$f"); '
         'echo "$pod $ex";;\n'
@@ -116,8 +127,8 @@ def _volume(tmp_path: Path, name: str, *labels: str) -> Path:
     return path
 
 
-def _run(tmp_path: Path, payload, container_owner: str | None = LEFT_LABEL, sticky: bool = False) -> tuple[int, str]:
-    stub = _daemon_stub(tmp_path, container_owner, sticky)
+def _run(tmp_path: Path, payload, container_owner: str | None = LEFT_LABEL, **stub) -> tuple[int, str]:
+    stub = _daemon_stub(tmp_path, container_owner, **stub)
     payload = payload.model_copy(update={"executor_id": LEFT, "miner_hotkey": LEFT_MINER})
     command = _node_left_delete_command(payload).replace("/usr/bin/docker", str(stub))
     done = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
@@ -190,11 +201,20 @@ def test_a_container_made_for_another_registration_on_this_host_is_never_touched
     assert "rm" not in calls.replace("inspect", "")
 
 
-def test_a_container_still_present_fails_the_delete(tmp_path):
-    status, calls = _run(tmp_path, _payload(HOST_BOOT), sticky=True)
+@pytest.mark.parametrize("stub", [{"sticky": True}, {"sticky_kept": True}])
+def test_a_container_still_present_fails_the_delete(tmp_path, stub):
+    status, calls = _run(tmp_path, _payload(HOST_BOOT), **stub)
 
     assert status == 1
     assert "volume" not in calls
+
+
+def test_a_failed_inspect_of_a_container_still_there_removes_nothing_and_fails(tmp_path):
+    # only a listing that succeeded and shows nothing under the name proves the container absent
+    status, calls = _run(tmp_path, _payload(HOST_BOOT), inspect_fails=True)
+
+    assert status == 1
+    assert "rm " not in calls
 
 
 @pytest.mark.parametrize("missing", ["executor_id", "miner_hotkey", "expected_boot_id"])
