@@ -514,6 +514,51 @@ def test_a_deny_on_sysboxfs_is_a_fix_and_the_install_refuses_instead_of_reloadin
     assert (tmp_path / "root/etc/apparmor.d/local/fusermount3").read_text() == local
 
 
+@pytest.mark.parametrize(
+    "rule, blocks",
+    [
+        ("deny umount /var/lib/**,", True),
+        ("deny umount /var/**,", True),
+        ("deny umount /var/lib/sysbox*/**,", True),
+        ("deny umount /var/lib/{docker,sysboxfs}/**,", True),
+        ("deny umount /var/lib/[s]ysboxfs/**,", True),
+        ("deny umount /var/lib/sysboxfs/*/proc/**,", True),
+        ("deny umount @{HOME}/**,", True),
+        ("deny umount,", True),
+        ("deny mount,", True),
+        ("deny mount -> /var/lib/**,", True),
+        ("deny mount fstype=fuse.sshfs -> /**,", True),
+        ("deny /var/lib/sysboxfs/** w,", True),
+        # '/var/lib/' is that directory only (apparmor.d(5) Globbing), not the mount points below it
+        ("deny umount /var/lib/,", False),
+        ("deny umount /var/lib/{docker,containerd}/**,", False),
+        ("deny mount -> /mnt/**,", False),
+        ("deny mount fstype=nfs,", False),
+        ("deny /etc/** w,", False),
+    ],
+)
+def test_a_deny_glob_is_matched_against_the_sysboxfs_mount_points(tmp_path, rule, blocks):
+    # a literal-path match missed wildcard and prefix denies, so --check passed and the install reloaded a denying profile
+    files = {**APPARMOR_ON, "etc/apparmor.d/local/fusermount3": BOTH_RULES + rule + "\n"}
+    rc, _, fixes = run_check(tmp_path, "check_fusermount3_sysboxfs_denies", files=files)
+    assert (rc, fixes) == ((1, 1) if blocks else (0, 0))
+    rc, out, _ = run_check(tmp_path, "check_fusermount3_apparmor", files=files)
+    assert ("PASS fusermount3" in out) is not blocks
+
+
+def test_install_mode_refuses_a_wildcard_deny_before_stopping_any_workload(tmp_path):
+    files = {**APPARMOR_ON, "etc/apparmor.d/local/fusermount3": BOTH_RULES + "deny umount /var/lib/**,\n"}
+    proc = run_script(
+        tmp_path,
+        files=files,
+        env={"STUB_SYSBOX_VERSION": "0.6.6", "STUB_RUNNING": "filler_abc\nexecutor-1", "STUB_ALL_CONTAINERS": "aaa filler_abc"},
+    )
+    assert proc.returncode == 1
+    assert "remove those deny lines" in proc.stdout
+    assert "Nothing was installed." in proc.stdout
+    assert not [c for c in _docker_calls(tmp_path) if c.startswith(("stop", "compose", "rm"))]
+
+
 def test_install_gives_sysbox_services_time_to_start_and_a_restart(tmp_path):
     # sysbox-ce 0.7.1: 10 s (fs) / 45 s (mgr) start timeouts and no Restart=, so a slow boot left sysbox down
     rc, _, _ = run_check(tmp_path, "install_sysbox_restart_dropins")
