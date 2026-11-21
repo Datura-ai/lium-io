@@ -20,7 +20,7 @@ import urllib3
 
 from core.utils import _m, get_extra_info
 from datura.requests.miner_requests import ExecutorSSHInfo
-from services.const import RENTAL_CPU_COUNT_LABEL
+from services.const import LIUM_EXECUTOR_ID_LABEL, RENTAL_CPU_COUNT_LABEL
 from services.node_host import NodeHostError, dial_validated, reports_registered_host_key, resolve_node_host
 
 
@@ -1221,6 +1221,16 @@ class RentalDockerSdkClient:
             raise
         config = info.get("Config") if isinstance(info, dict) else None
         existing_image = config.get("Image") if isinstance(config, dict) else None
+        # DAH-6531: one pod keeps its container name on every registration; on a daemon two registrations share, a
+        # same-name container made for another registration is not this create's to adopt
+        wanted_owner = spec.labels.get(LIUM_EXECUTOR_ID_LABEL)
+        existing_labels = (config.get("Labels") if isinstance(config, dict) else None) or {}
+        existing_owner = existing_labels.get(LIUM_EXECUTOR_ID_LABEL)
+        if wanted_owner is not None and existing_owner != wanted_owner:
+            raise ContainerNameTakenOnRetry(
+                "Docker SDK run container refused after a transport retry: a container named "
+                f"{spec.name} already exists for another registration"
+            )
         if existing_image == spec.image:
             existing_id = info.get("Id")
             return existing_id if isinstance(existing_id, str) else ""
@@ -1302,7 +1312,8 @@ class RentalDockerSdkClient:
         labels: dict[str, str] | None = None,
         adopt_existing: bool = False,
     ) -> None:
-        if adopt_existing and self._adopt_volume_by_name_sync(volume_name, driver):
+        owner = (labels or {}).get(LIUM_EXECUTOR_ID_LABEL)
+        if adopt_existing and self._adopt_volume_by_name_sync(volume_name, driver, owner):
             return
         original_timeout = getattr(self._api_client, "timeout", None)
         should_override_timeout = timeout is not None and hasattr(
@@ -1322,9 +1333,10 @@ class RentalDockerSdkClient:
             if should_override_timeout:
                 self._api_client.timeout = original_timeout
 
-    def _adopt_volume_by_name_sync(self, volume_name: str, driver: str | None) -> bool:
+    def _adopt_volume_by_name_sync(self, volume_name: str, driver: str | None, owner: str | None = None) -> bool:
         """The idempotency check before a retried `volumes/create`: adopt a same-name volume on
-        the requested driver (Docker's default `local` when none was asked for); refuse another."""
+        the requested driver (Docker's default `local` when none was asked for) and, when the create names a
+        registration (`owner`), carrying that registration's label; refuse another."""
         try:
             info = self._api_client.inspect_volume(volume_name)
         except Exception as exc:
@@ -1333,6 +1345,12 @@ class RentalDockerSdkClient:
             raise
         existing_driver = info.get("Driver") if isinstance(info, dict) else None
         wanted_driver = driver or "local"
+        existing_owner = ((info.get("Labels") if isinstance(info, dict) else None) or {}).get(LIUM_EXECUTOR_ID_LABEL)
+        if owner is not None and existing_owner != owner:
+            raise RentalDockerOperationError(
+                "Docker SDK create volume refused after a transport retry: a volume named "
+                f"{volume_name} already exists for another registration"
+            )
         # a plugin driver is inspected as `<alias>:<tag>` while it may be requested as `<alias>`,
         # which is `<alias>:latest`; another tag is another plugin (vloopback:v2 beside vloopback)
         if isinstance(existing_driver, str) and _with_default_tag(existing_driver) == _with_default_tag(wanted_driver):
