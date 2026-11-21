@@ -151,23 +151,31 @@ jobs:
                       # trims the input, splits records at LF, CRLF and CR (csv-parse, quote off), and passes each
                       # record as a --driver-opt; Buildx then splits it again as CSV with quotes into key=value, the
                       # last key winning. Its other inputs (driver, endpoint, append, version, ...) choose a builder
-                      # or binary this scan cannot pin. So with: holds driver-opts alone, and that is a single
-                      # image=<ref>@sha256:<digest> whose characters include no separator, quote, space or dollar
-                      pinned = r"[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}"
+                      # or binary this scan cannot pin. So with: holds driver-opts alone: one option per line, exactly
+                      # one image=<ref>@sha256:<digest> and any env.<NAME>=<value> (Buildx keeps env.* apart from the
+                      # image). The reference follows Docker's grammar (lowercase path, optional registry port, a tag of
+                      # up to 128 word characters); no allowed character is a separator, quote, space or dollar
+                      comp = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+                      pinned = (r"(?:[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*(?::[0-9]+)?/)?" + comp + r"(?:/" + comp + r")*"
+                                r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}")
+                      env = r"env\.[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9._/:@+=-]*"
                       for step in steps:
                           name = str(step.get("uses") or "").split("@")[0].lower()
                           args = step.get("with")
                           if name == "docker/setup-buildx-action":
-                              ok = (isinstance(args, dict) and set(args) == {"driver-opts"} and isinstance(args["driver-opts"], str)
-                                    and re.fullmatch(r"[ \n]*image=" + pinned + r"[ \n]*", args["driver-opts"]))
+                              opts = args.get("driver-opts") if isinstance(args, dict) else None
+                              lines = [ln.strip(" ") for ln in opts.strip(" \n").split("\n")] if isinstance(opts, str) else []
+                              ok = (set(args or {}) == {"driver-opts"} and sum(bool(re.fullmatch("image=" + pinned, ln)) for ln in lines) == 1
+                                    and all(re.fullmatch("image=" + pinned, ln) or re.fullmatch(env, ln) for ln in lines))
                               if not ok:
-                                  bad.append(f"{where}: {name}: with: driver-opts: image=<image>@sha256:<digest> and nothing else")
+                                  bad.append(f"{where}: {name}: with: driver-opts: image=<image>@sha256:<digest> and env.* lines only")
                           elif name == "docker/setup-qemu-action":
-                              # setup-qemu-action (c7c5346) passes with.image as one docker argument
-                              ok = (isinstance(args, dict) and set(args) == {"image"} and isinstance(args["image"], str)
-                                    and re.fullmatch(pinned, args["image"]))
+                              # setup-qemu-action (c7c5346) passes with.image as one docker argument and platforms after --install
+                              ok = (isinstance(args, dict) and "image" in args and set(args) <= {"image", "platforms"}
+                                    and isinstance(args["image"], str) and re.fullmatch(pinned, args["image"])
+                                    and re.fullmatch(r"[A-Za-z0-9/_.,-]+", str(args.get("platforms", "all"))))
                               if not ok:
-                                  bad.append(f"{where}: {name}: with: image: <image>@sha256:<digest> and nothing else")
+                                  bad.append(f"{where}: {name}: with: image: <image>@sha256:<digest> (and platforms) only")
                       refs = [("job", job.get("uses")) for job in jobs] + [("step", step.get("uses")) for step in steps]
                       for level, ref in refs:
                           if ref is None:
@@ -362,7 +370,9 @@ jobs:
               step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit" + dig + ",image=acme/buildkit" + dig): 1,
               step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: '\"image=moby/buildkit" + dig + "\"'"): 1,
               step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit" + dig + " network=host"): 1,
-              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            image=moby/buildkit" + dig + "\n            env.IMAGE_MODE=debug"): 1,  # any other option
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            image=moby/buildkit" + dig + "\n            env.IMAGE_MODE=debug"): 0,  # env.* is kept apart from the image
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            env.A=x,image=acme/buildkit" + dig + "\n            image=moby/buildkit" + dig): 1,  # a comma inside an env value
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            image=moby/buildkit" + dig + "\n            cgroup-parent=x"): 1,  # any other option
               # keys are matched exactly, as Buildx does
               step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: IMAGE=moby/buildkit" + dig): 1,
               step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image =moby/buildkit" + dig): 1,
@@ -381,7 +391,14 @@ jobs:
               step("docker/setup-qemu-action@" + sha): 1,
               step("docker/setup-qemu-action@" + sha + "\n        with:\n          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3" + dig): 0,
               step("docker/setup-qemu-action@" + sha + "\n        with:\n          image: tonistiigi/binfmt:latest"): 1,
-              step("docker/setup-qemu-action@" + sha + "\n        with:\n          image: tonistiigi/binfmt" + dig + "\n          platforms: arm64"): 1,
+              step("docker/setup-qemu-action@" + sha + "\n        with:\n          image: tonistiigi/binfmt" + dig + "\n          platforms: arm64,riscv64"): 0,
+              step("docker/setup-qemu-action@" + sha + "\n        with:\n          image: tonistiigi/binfmt" + dig + "\n          platforms: arm64 --x"): 1,
+              step("docker/setup-qemu-action@" + sha + "\n        with:\n          image: tonistiigi/binfmt" + dig + "\n          cache-image: false"): 1,
+              step("docker/setup-qemu-action@" + sha + "\n        with:\n          image: ghcr.io/acme/binfmt:RC1" + dig): 0,  # a tag may hold upper case
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=ghcr.io/example/buildkit:RC1" + dig): 0,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=localhost:5000/buildkit" + dig): 0,  # a registry port
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=ghcr.io/Acme/buildkit" + dig): 1,  # the path is lower case
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit:v1:v2" + dig): 1,
           }
           for i, (text, want) in enumerate(cases.items()):
               tree = {**base, (None, f"w/case{i}.yml", None): text}
