@@ -789,88 +789,12 @@ fusermount3_missing_sysboxfs_rules() {
     done
 }
 
-# an AppArmor path glob (apparmor.d(5) "Globbing"): ** any text, * and ? within one path segment, {a,b} alternation,
-# [..] a class; a path ending in '/' is that directory only. Parses $AA_G from $AA_I up to an unnested ',' or '}' and
-# sets AA_FULL to the ERE of what that part matches and AA_PREF to an ERE of every prefix of a path it matches.
-# @{var} matches nothing here: its value is not in the profile, and taking it as any text reported @{HOME}/** denies.
-aa_glob_seq() {
-    local -a full=() pref=()
-    local c atom alts_full alts_pref opt i rest
-    while [ $AA_I -lt ${#AA_G} ]; do
-        c=${AA_G:$AA_I:1}
-        if [ $AA_D -gt 0 ] && { [ "$c" = , ] || [ "$c" = '}' ]; }; then break; fi
-        atom=''
-        case $c in
-            '*') if [ "${AA_G:$((AA_I + 1)):1}" = '*' ]; then atom='.*'; AA_I=$((AA_I + 1)); else atom='[^/]*'; fi ;;
-            '?') atom='[^/]' ;;
-            '[') c=${AA_G:$AA_I}; c=${c%%]*}; atom="$c]"; AA_I=$((AA_I + ${#c})) ;;
-            '@') if [ "${AA_G:$((AA_I + 1)):1}" = '{' ]; then c=${AA_G:$AA_I}; c=${c%%\}*}; AA_I=$((AA_I + ${#c})); fi
-                 atom='@' ;;  # no sysbox-fs path has an '@', so this branch of the glob cannot reach one
-            '\') AA_I=$((AA_I + 1)); atom="\\${AA_G:$AA_I:1}" ;;
-            .|+|'('|')'|'|'|^|'$'|'}') atom="\\$c" ;;
-            '{')
-                AA_I=$((AA_I + 1)); AA_D=$((AA_D + 1)); alts_full=''; alts_pref=''; opt=''
-                while :; do
-                    aa_glob_seq
-                    if [ -n "$AA_FULL" ]; then alts_full+="|$AA_FULL"; alts_pref+="|$AA_PREF"; else opt='?'; fi
-                    c=${AA_G:$AA_I:1}; AA_I=$((AA_I + 1))
-                    [ "$c" = , ] || break
-                done
-                AA_D=$((AA_D - 1))
-                [ -n "$alts_full" ] && { full+=("(${alts_full#|})$opt"); pref+=("${alts_pref#|}"); }
-                continue
-                ;;
-            *) atom=$c ;;
-        esac
-        full+=("$atom"); pref+=('')
-        AA_I=$((AA_I + 1))
-    done
-    # prefixes of X R: those of X, or X then a prefix of R; for a single atom that is (X R)?
-    rest=''; AA_FULL=''
-    for ((i = ${#full[@]} - 1; i >= 0; i--)); do
-        if [ -n "${pref[i]}" ]; then rest="(${pref[i]}|${full[i]}$rest)"; else rest="(${full[i]}$rest)?"; fi
-        AA_FULL="${full[i]}$AA_FULL"
-    done
-    AA_PREF=$rest
-}
-
-# whether a rule's path can name a sysbox-fs mount point: sysbox-fs mounts at /var/lib/sysboxfs and fusermount3
-# unmounts there and below (AppArmor matches a directory mount point with its trailing '/'), so the glob covers one
-# exactly when some path it matches starts with /var/lib/sysboxfs/
-aa_path_names_sysboxfs() {
-    AA_G=$1 AA_I=0 AA_D=0
-    aa_glob_seq
-    [ -n "$AA_PREF" ] && printf '%s\n' /var/lib/sysboxfs/ | grep -qE "^$AA_PREF\$"
-}
-
-# deny rules in the local profile that stop fusermount3 mounting or unmounting sysbox-fs: a deny wins over any allow,
-# so adding ours cannot fix them. A mount/umount deny with no mount point covers every one; one with fstype= covers
-# FUSE only if the type can be FUSE.
+# deny rules in the local profile that stop fusermount3 on sysbox-fs: a deny wins over any allow, so adding ours cannot
+# fix them. shortcut: only a deny naming /var/lib/sysboxfs or an unconditional mount/umount/remount deny is caught, not
+# one written as a wider glob (e.g. /var/**); a full AppArmor glob match was judged disproportionate (lium-io#2400).
 fusermount3_sysboxfs_denies() {
-    local line rule kind path found=1
-    while IFS= read -r line; do
-        [[ $line =~ ^(audit[[:space:]]+)?deny[[:space:]]+(.*)$ ]] || continue
-        rule=${BASH_REMATCH[2]%,}
-        read -r kind _ <<< "$rule"
-        case $kind in
-            mount)
-                if [[ $rule =~ fstype=([^[:space:]]+) ]]; then
-                    case ${BASH_REMATCH[1]} in *fuse* | *'@{'* | *'*'* | *'{'*) ;; *) continue ;; esac
-                fi
-                path=''; [[ $rule == *'->'* ]] && read -r path _ <<< "${rule##*->}"
-                ;;
-            umount | remount)
-                path=''; [[ $rule =~ [[:space:]]([/@][^[:space:]]*)$ ]] && path=${BASH_REMATCH[1]}
-                ;;
-            *)
-                # file and other rules: only a literal mention of the directory counts, as before
-                [[ $rule == */var/lib/sysboxfs* ]] && { printf '%s\n' "$line"; found=0; }
-                continue
-                ;;
-        esac
-        if [ -z "$path" ] || aa_path_names_sysboxfs "$path"; then printf '%s\n' "$line"; found=0; fi
-    done < <(fusermount3_local_rules)
-    return $found
+    fusermount3_local_rules | grep -E '^(audit[[:space:]]+)?deny[[:space:]]' \
+        | grep -E '/var/lib/sysboxfs|^(audit[[:space:]]+)?deny[[:space:]]+(mount|umount|remount)[[:space:]]*,$'
 }
 
 fusermount3_needs_sysboxfs_rule() {
