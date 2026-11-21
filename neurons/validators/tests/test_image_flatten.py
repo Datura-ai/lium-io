@@ -835,20 +835,29 @@ async def test_flatten_copy_bytes_budgets_only_a_copy_still_to_write(stdout, cop
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("listed, readable", [("sha256:abc 30GB\n", True), ("", False)])
-async def test_flatten_copy_bytes_before_docker_29_8_budgets_the_listed_size(listed, readable):
+@pytest.mark.parametrize(
+    "version, listed, readable",
+    [("29.4.3\n", "sha256:abc 30GB\n", True), ("29.4.3\n", "", False), (RuntimeError("ssh"), "", False)],
+)
+async def test_flatten_copy_bytes_before_docker_29_8_budgets_the_listed_size(version, listed, readable):
+    # an unreadable size (no list entry, or the version read failing) stops the sizing: never "no copy needed"
     async def run(command, **kwargs):
         if command.startswith("/usr/bin/docker version"):
-            return Mock(stdout="29.4.3\n")
+            if isinstance(version, Exception):
+                raise version
+            return Mock(stdout=version)
         if command.startswith("/usr/bin/docker image ls"):
             return Mock(stdout=listed)
         if "--format" in command:
             return Mock(stdout=f"{_GIB24} {_MANY} sha256:abc\noverlayfs\n")
         return Mock(exit_status=1)
 
+    if not readable:
+        with pytest.raises(image_flatten.FlattenSizeUnreadable):
+            await image_flatten.flatten_copy_bytes(Mock(run=run), "sglang")
+        return
     got = await image_flatten.flatten_copy_bytes(Mock(run=run), "sglang")
-    want = 2 * image_flatten.listed_size_bytes("30GB") + FLATTEN_DISK_MARGIN_BYTES if readable else None
-    assert got == want
+    assert got == 2 * image_flatten.listed_size_bytes("30GB") + FLATTEN_DISK_MARGIN_BYTES
 
 
 @pytest.mark.asyncio

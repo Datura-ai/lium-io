@@ -75,6 +75,10 @@ class FlattenMeasureFailed(RuntimeError):
     """Only the disk measure failed, after the node lock was held and the mark written."""
 
 
+class FlattenSizeUnreadable(RuntimeError):
+    """A many-layer image's size on disk could not be read, so the room its flatten needs is unknown."""
+
+
 def _dockerfile_word(value: str) -> str:
     # inside double quotes the Dockerfile parser unescapes only \, " and $ (no variable expansion)
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$") + '"'
@@ -297,7 +301,8 @@ def _copy_bytes(size: int, driver: str) -> int:
 async def flatten_copy_bytes(ssh_client: asyncssh.SSHClientConnection, image: str) -> int | None:
     """The disk a one-layer copy of the local `image` would take (`_copy_bytes` plus FLATTEN_DISK_MARGIN_BYTES), for
     the sizing to keep free; None when the image has too few layers to need one, its copy is already on the
-    node (a flatten reuses it, writing nothing), or it cannot be read."""
+    node (a flatten reuses it, writing nothing), or it cannot be inspected. Raises FlattenSizeUnreadable when a
+    many-layer image's size on disk cannot be read: the copy may be needed, so the sizing must not grant its room."""
     try:
         result = await ssh_client.run(
             "/usr/bin/docker image inspect --format '{{.Size}} {{len .RootFS.Layers}} {{.Id}}' "
@@ -313,7 +318,7 @@ async def flatten_copy_bytes(ssh_client: asyncssh.SSHClientConnection, image: st
         return None
     size = await image_disk_bytes(ssh_client, image_id, size, driver)
     if size is None:
-        return None
+        raise FlattenSizeUnreadable(f"the size on disk of {image!r} on storage driver {driver!r} is unreadable")
     tag = f"{FLATTENED_IMAGE_REPO}:{image_id.removeprefix('sha256:')}"
     try:
         copy = await ssh_client.run(
