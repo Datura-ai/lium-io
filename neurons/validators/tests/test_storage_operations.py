@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import asyncio
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -325,7 +326,7 @@ async def test_a_cancel_between_the_launch_check_and_its_start_stops_the_launch(
             SimpleNamespace(run=run, start_sftp_client=local.start_sftp_client),
             "sh", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False,
         )
-    time.sleep(0.2)
+    await asyncio.sleep(0.2)
     assert not started.exists()
     assert not Path(str(files.spec)).exists() and not Path(str(files.pid)).exists()
 
@@ -354,7 +355,7 @@ async def test_a_cancel_right_after_a_launch_finds_and_stops_its_runner(
     for _ in range(100):
         if runner_pid_file.exists() and runner_pid_file.read_text().strip():
             break
-        time.sleep(0.05)
+        await asyncio.sleep(0.05)
     runner_pid = int(runner_pid_file.read_text())
     try:
         await storage_operations.cancel_storage_operation(local, OPERATION_ID)
@@ -396,7 +397,7 @@ async def test_a_cancel_before_a_slow_wrapper_starts_its_runner_leaves_nothing_r
         await storage_operations.cancel_storage_operation(local, OPERATION_ID)
     finally:
         subprocess.run(["sh", "-c", f"kill -KILL -{group}"], capture_output=True)
-    time.sleep(0.2)
+    await asyncio.sleep(0.2)
     assert not worked.exists()
     with pytest.raises(ProcessLookupError):
         os.killpg(group, 0)
