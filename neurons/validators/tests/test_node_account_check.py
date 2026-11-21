@@ -831,3 +831,20 @@ async def test_an_unverified_node_is_scored_but_its_host_is_never_repaired_or_cl
         result = await guard.run(end)
         assert result.event.reason_code == "RENTAL_EGRESS_GUARD_SKIPPED" and not guard._last_run
         assert ssh.run.await_count == 0
+
+
+@pytest.mark.parametrize("files", ["hotkey=5Account\nunread=claim\n", "hotkey=5Account\nclaim=claim-of-another-account\n"])
+async def test_an_own_key_listing_with_owner_wide_claims_is_settled_by_its_hotkey(files):
+    """lio#2349 stand: an own-key listing (no claim of its own) still gets its owner's claims; a machine set up for its
+    own key passes after the notice deadline whatever the claim reads, and the claim is not read."""
+    executor = ExecutorSSHInfo(
+        uuid="node-1", address="203.0.113.7", port=8001, ssh_username="root", ssh_port=22,
+        python_path="/usr/bin/python3", root_dir="/root", expected_node_hotkeys=["5Account"],
+        expected_account_claims=[CLAIM], check_enforce_after=NOTIFIED,
+        snapshot_valid_until=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+    )
+    runner = _HostFiles(files)
+    result = await NodeAccountCheck().run(make_context(executor=executor, runner=runner, miner_hotkey="5Account"))
+    assert result.passed
+    assert result.event.reason_code == "NODE_ACCOUNT_OK"
+    assert runner.commands == [READ_NODE_HOTKEY_COMMAND]

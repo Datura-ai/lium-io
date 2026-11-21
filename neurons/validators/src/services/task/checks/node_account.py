@@ -160,12 +160,11 @@ class NodeAccountCheck:
             )
             return None, False
         by_hotkey = executor.expected_claims_by_hotkey or {}
-        claims = set(executor.expected_account_claims or ()) | ({executor.expected_account_claim} - {None, ""})
         if hotkey not in executor.expected_node_hotkeys and hotkey not in by_hotkey:
             # another owner's setup: the hotkey alone settles it, whatever the claim would read
             what["binding_mismatch"] = "hotkey"
             return _refused(ctx, self.check_id, Msg.BINDING_MISMATCH, what), False
-        if hotkey not in by_hotkey and not (claims and hotkey == ctx.miner_hotkey):
+        if hotkey not in by_hotkey and not (_pool_listed(executor, ctx, hotkey)):
             return None, True  # one of the owner's own hotkeys: no claim can change that
         result = await ctx.runner.run(READ_NODE_CLAIM_COMMAND, timeout=READ_TIMEOUT_SECONDS, retryable=True)
         executor = current_binding(ctx.executor)
@@ -184,7 +183,7 @@ class NodeAccountCheck:
             if hotkey not in executor.expected_node_hotkeys and hotkey not in by_hotkey:
                 what["binding_mismatch"] = "hotkey"
                 return _refused(ctx, self.check_id, Msg.BINDING_MISMATCH, what), False
-            if hotkey in by_hotkey or (claims and hotkey == ctx.miner_hotkey):
+            if hotkey in by_hotkey or (_pool_listed(executor, ctx, hotkey)):
                 what["read_error"] = claim_error or "claim unreadable"
                 return self._unverified(ctx, what, started), False
             return None, True
@@ -198,13 +197,13 @@ class NodeAccountCheck:
             what["node_claim"] = claim
         elif hotkey not in executor.expected_node_hotkeys:
             what["binding_mismatch"] = "hotkey"
-        elif claims and hotkey == ctx.miner_hotkey and claim and claim not in claims:
+        elif _pool_listed(executor, ctx, hotkey) and claim and claim not in claims:
             # a node set up for the listing (pool) hotkey proves its owner only by the claim; one set up for one of
             # the owner's own hotkeys needs none. The claim is the HMAC the node publishes at /miner-identity.
             what["binding_mismatch"] = "claim"
             what["node_claim"] = claim
         else:
-            if claims and hotkey == ctx.miner_hotkey and not claim:
+            if _pool_listed(executor, ctx, hotkey) and not claim:
                 logger.info(
                     _m(
                         "NODE_ACCOUNT_BINDING_UNVERIFIED",
@@ -233,6 +232,15 @@ class NodeAccountCheck:
         )
         result.updates["host_writes_deferred"] = True
         return result
+
+
+def _pool_listed(executor: ExecutorSSHInfo, ctx: Context, hotkey: str) -> bool:
+    """A machine set up for the hotkey the node is listed under, when that is a shared pool hotkey: only a claim proves
+    its owner. The listing's own claim says so (the portal sends it only for a node listed under a pool hotkey), as
+    does the listing hotkey being one of the owner's pool hotkeys; the owner-wide claims do not, an own-key listing gets
+    them too and its own key settles ownership (lio#2349 stand)."""
+    pools = executor.expected_claims_by_hotkey or {}
+    return hotkey == ctx.miner_hotkey and (bool(executor.expected_account_claim) or hotkey in pools)
 
 
 def _fields(result) -> dict:
