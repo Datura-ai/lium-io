@@ -253,7 +253,8 @@ _PYTHON_WATCHDOG = (
     "try:\n sys.exit(p.wait(float(sys.argv[1])))\n"
     "except subprocess.TimeoutExpired:\n pass\n"
     "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
-    f"print({VERIFYX_DEADLINE_MARKER!r},file=sys.stderr,flush=True)\n"
+    # the marker is best effort: a closed SSH reader (EPIPE) must never stop the kill below
+    f"try:\n os.write(2,{(VERIFYX_DEADLINE_MARKER + chr(10)).encode()!r})\nexcept OSError:\n pass\n"
     "os.killpg(0,signal.SIGTERM)\n"
     "try:\n p.wait(10)\n"
     "except subprocess.TimeoutExpired:\n os.killpg(0,signal.SIGKILL)\n"

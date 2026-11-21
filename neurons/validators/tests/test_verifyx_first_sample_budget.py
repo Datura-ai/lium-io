@@ -342,6 +342,31 @@ def test_only_the_watchdogs_stop_writes_the_deadline_marker(tmp_path, timeout_ki
     assert not (tmp_path / ".verifyx-t").exists()
 
 
+
+def test_the_watchdog_stops_the_run_with_both_ssh_readers_gone(tmp_path):
+    # review at 77549c7: with the session's readers closed the marker write fails (EPIPE); the kill must still land
+    import subprocess
+    import sys
+    import time
+    from types import SimpleNamespace
+
+    from neurons.validators.src.services.verifyx_validation_service import VerifyXValidationService
+
+    done = tmp_path / "done"
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "verifyx_executor.py").write_text(f"import time; time.sleep(3); open({str(done)!r}, 'w')\n")
+    executor = SimpleNamespace(python_path=sys.executable, root_dir=str(tmp_path))
+    service = VerifyXValidationService.__new__(VerifyXValidationService)
+    command = service._verifyx_command(executor, SimpleNamespace(seed=1, cipher_text="x"), "lib", ".verifyx-t", True, 1)
+
+    run = subprocess.Popen(["sh", "-c", command], cwd=tmp_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    run.stdout.close()
+    run.stderr.close()
+    run.wait(timeout=30)
+    time.sleep(3)
+
+    assert not done.exists()
+
 @pytest.mark.asyncio
 async def test_no_probe_lookup_when_its_answer_cannot_change_the_reserve(context_factory, monkeypatch):
     # review at b49619d: at 305 s only the 60 s tail can apply, so a slow Redis read must not eat the sample's time
