@@ -482,3 +482,67 @@ async def test_a_wrapper_whose_pid_was_not_recorded_never_starts_the_runner(
         )
     await asyncio.sleep(1.5)
     assert not started.exists()
+
+
+def _counting_runner(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", storage_operations.PurePosixPath(str(tmp_path / "ops")))
+    monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
+    monkeypatch.setattr(storage_operations, "report_launch_failure", AsyncMock())
+    starts = tmp_path / "runner-starts"
+    runner = tmp_path / "runner"
+    runner.write_text(f"#!/bin/sh\necho x >> {starts}\nsleep 0.5\n")
+    runner.chmod(0o755)
+    monkeypatch.setattr(storage_operations, "REMOTE_RUNNER_PATH", str(runner))
+    return starts
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_dispatch_racing_the_first_launch_leaves_it_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # both dispatches would pass the state checks before either launched; the repeat must not rewrite the first's
+    # PID and spec, which made both wrappers refuse and neither runner start
+    starts = _counting_runner(monkeypatch, tmp_path)
+    local = _local_ssh()
+
+    async def run(command: str, check: bool = False) -> SimpleNamespace:
+        await asyncio.sleep(0)  # interleave the two dispatches at every host command
+        # the wrapper starts late, as over a slow connection: the repeat's launch lands before it takes the lock
+        return await local.run(command.replace("exec 8>>", "sleep 0.5; exec 8>>"), check)
+
+    ssh_client = SimpleNamespace(run=run, start_sftp_client=local.start_sftp_client)
+    launches = [
+        storage_operations.start_storage_operation(
+            ssh_client, "sh", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=True
+        )
+        for _ in range(2)
+    ]
+    await asyncio.gather(*launches)
+    await asyncio.sleep(1.6)
+
+    assert starts.read_text() == "x\n"
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    assert Path(str(files.status)).read_text().strip() == "0"
+
+
+def test_a_launch_finding_a_live_recorded_wrapper_rewrites_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # another validator process already launched the operation: its PID and spec stay
+    _counting_runner(monkeypatch, tmp_path)
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    Path(str(files.pid)).parent.mkdir(parents=True, exist_ok=True)
+    live = subprocess.Popen(["setsid", "sleep", "5"])
+    try:
+        time.sleep(0.2)
+        Path(str(files.pid)).write_text(f"{live.pid}\n")
+        Path(str(files.spec)).write_text("{}")
+        launched = asyncio.run(
+            storage_operations._start_storage_operation(
+                _local_ssh(), "sh", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=True
+            )
+        )
+        assert launched == files
+        assert Path(str(files.pid)).read_text().strip() == str(live.pid)
+    finally:
+        live.kill()

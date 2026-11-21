@@ -5,6 +5,7 @@ import json
 import logging
 import shlex
 import time
+import weakref
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -264,7 +265,31 @@ async def supports_workspace_field(
     )
 
 
+# A repeated backend dispatch of one operation reaches this validator while the first is still between its state
+# checks and its launch; both would pass the checks, and the second would rewrite the PID and spec the first's wrapper
+# checks. In-process, like the rest of an operation's dispatch: launches of one operation run one after another, so a
+# repeat finds the first launch recorded and returns it.
+_launch_locks: weakref.WeakValueDictionary[UUID, asyncio.Lock] = weakref.WeakValueDictionary()
+
+
 async def start_storage_operation(
+    ssh_client: asyncssh.SSHClientConnection,
+    python_path: str,
+    operation_id: UUID,
+    spec: Mapping[str, object],
+    *,
+    retain_terminal_artifacts: bool,
+) -> StorageOperationFiles:
+    lock = _launch_locks.get(operation_id)
+    if lock is None:
+        lock = _launch_locks[operation_id] = asyncio.Lock()
+    async with lock:
+        return await _start_storage_operation(
+            ssh_client, python_path, operation_id, spec, retain_terminal_artifacts=retain_terminal_artifacts
+        )
+
+
+async def _start_storage_operation(
     ssh_client: asyncssh.SSHClientConnection,
     python_path: str,
     operation_id: UUID,
@@ -364,6 +389,9 @@ async def start_storage_operation(
         launch_command = (
             f"exec 9>>{lock_path}; flock -w 30 9 || exit 6; "
             f"if test -e {shlex.quote(str(files.cancel))}; then rm -f {shlex.quote(str(files.spec))}; exit 5; fi; "
+            # a launch of this operation from another validator process already recorded a live wrapper: it is the
+            # operation, and its PID and spec stay as they are
+            f'if p=$(cat {pid_path} 2>/dev/null) && [ -n "$p" ] && kill -0 -"$p" 2>/dev/null; then exit 0; fi; '
             f"setsid nohup /bin/sh -c {shlex.quote(wrapper)} "
             f"> {shlex.quote(str(files.log))} 2>&1 < /dev/null 9>&- & "
             f"if ! printf '%s\\n' \"$!\" > {pid_path}; then "
