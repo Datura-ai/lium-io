@@ -267,6 +267,9 @@ async def start_storage_operation(
 ) -> StorageOperationFiles:
     files = StorageOperationFiles.for_operation(operation_id)
     try:
+        # a repeat dispatch of a running or finished operation stages nothing: a staging failure must not fail it
+        if await _has_incumbent(ssh_client, files):
+            return files
         engine = spec.get("engine")
         if not await supports_storage_operation(ssh_client, engine):
             raise StorageOperationLaunchError(
@@ -294,6 +297,12 @@ async def start_storage_operation(
             raise StorageOperationLaunchError(f"storage runner launch failed (exit {result.exit_status})")
         return files
     except Exception as error:
+        # another dispatch may have launched it meanwhile: its run, not this dispatch's failure, is the operation's
+        try:
+            if await _has_incumbent(ssh_client, files):
+                return files
+        except Exception:  # noqa: BLE001 - the node cannot say: the failure stands
+            pass
         await report_launch_failure(operation_id, spec, error)
         raise
 
@@ -303,6 +312,29 @@ _ALREADY_LAUNCHED = "ALREADY_LAUNCHED"
 # an online run's done marker outlives the backend's re-dispatches of the operation: they stop once its terminal report
 # lands or its stale sweep fails it (15 min without a heartbeat). Swept only as housekeeping, a day after
 _FINISHED_MARKER_SWEEP_MINUTES = 24 * 60
+
+
+def _incumbent_condition(files: StorageOperationFiles) -> str:
+    """Shell test, true when the operation has a result or a live run: its done marker or status, or a launcher (this
+    validator's) or runner PID (an older validator's, which records no launcher) still running this operation's spec. A
+    PID counts only while its process carries this operation's exact --spec path (a reused PID does not)."""
+    q = lambda path: shlex.quote(str(path))  # noqa: E731
+    # argv is NUL-separated: as spaces, both the runner's own argv and the launcher's `sh -c` text carry it
+    spec_arg = shlex.quote(f"--spec {files.spec} ")
+
+    def live(path) -> str:
+        return (
+            f'{{ p=$(cat {q(path)} 2>/dev/null); case "$p" in (*[!0-9]*|"") false;; '
+            f"(*) kill -0 \"$p\" 2>/dev/null && tr '\\0' ' ' < /proc/\"$p\"/cmdline | grep -qF -- {spec_arg};; esac; }}"
+        )
+
+    return f"{{ [ -e {q(files.done)} ] || [ -s {q(files.status)} ] || {live(files.launcher)} || {live(files.pid)}; }}"
+
+
+async def _has_incumbent(ssh_client: asyncssh.SSHClientConnection, files: StorageOperationFiles) -> bool:
+    """Read-only: the operation already has a result or a live run (see _incumbent_condition)."""
+    result = await ssh_client.run(f"if {_incumbent_condition(files)}; then echo YES; fi", check=False)
+    return result.exit_status == 0 and (result.stdout or "").strip() == "YES"
 
 
 def _launch_command(
@@ -343,17 +375,12 @@ def _launch_command(
         f"printf '%s\\n' \"$result\" > {q(files.status)}; "
         f"rm -f {q(files.spec)} {q(files.pid)} {q(files.cancel)}{terminal_cleanup}"
     )
-    # a recorded launcher is live only while that PID still runs this operation's wrapper (a reused PID does not)
-    launcher_live = (
-        f'l=$(cat {q(files.launcher)} 2>/dev/null); case "$l" in (*[!0-9]*|"") false;; '
-        f'(*) kill -0 "$l" 2>/dev/null && grep -qaF -- {shlex.quote("--spec " + str(files.spec))} /proc/"$l"/cmdline;; esac'
-    )
     already = f'rm -rf -- {stage}; cat > /dev/null; echo {_ALREADY_LAUNCHED}; exit 0'
     return (
         f"exec 9>>{q(files.lock)} && flock -x 9 || {{ rm -rf -- {stage}; exit 1; }}; "
         f"find {q(REMOTE_OPERATION_DIRECTORY)} -maxdepth 1 \\( -name '*.done' -o -name '*.launcher' -o -name '*.lock' \\) "
         f"-mmin +{_FINISHED_MARKER_SWEEP_MINUTES} -delete 2>/dev/null; "
-        f"if [ -e {q(files.done)} ] || [ -s {q(files.status)} ] || {{ {launcher_live}; }}; then {already}; fi; "
+        f"if {_incumbent_condition(files)}; then {already}; fi; "
         # no result and no live launcher: whatever an earlier run left is stale, its helper container included
         f"rm -f {q(files.status)} {q(files.log)} {q(files.pid)} {q(files.spec)} {q(files.cancel)} {q(files.launcher)}; "
         f"/usr/bin/docker rm -f -- {shlex.quote(storage_helper_name(operation_id))} >/dev/null 2>&1 || true; "

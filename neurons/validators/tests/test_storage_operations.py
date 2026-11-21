@@ -131,14 +131,21 @@ def test_an_online_run_leaves_its_done_marker_and_its_log_only_when_it_fails(nod
     _runner(node, f"print('working', flush=True)\nraise SystemExit({exit_code})\n")
     files = _dispatch()
     _wait_for(Path(str(files.done)))
-    _wait_for(Path(str(files.pid)), gone=True)
-    assert _staged(node) == []   # the staged runner goes when it has exited
-    assert not Path(str(files.status)).exists() and not Path(str(files.spec)).exists()
     log = Path(str(files.log))
+    # the log is the wrapper's last step, after the done marker
     if exit_code:
+        import time
+
+        deadline = time.time() + 10
+        while "runner exited" not in log.read_text():
+            assert time.time() < deadline
+            time.sleep(0.05)
         assert log.read_text().splitlines() == ["working", "runner exited 3"]
     else:
-        assert not log.exists()
+        _wait_for(log, gone=True)
+    assert _staged(node) == []   # the staged runner goes when it has exited
+    assert not Path(str(files.status)).exists() and not Path(str(files.spec)).exists()
+    assert not Path(str(files.pid)).exists()
 
 
 def test_a_re_dispatch_after_an_online_run_finished_never_runs_it_again(node: Path) -> None:
@@ -241,4 +248,83 @@ def test_a_failed_unpack_leaves_no_spec_and_no_staging_directory(
     files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
     assert not Path(str(files.spec)).exists() and not Path(str(files.launcher)).exists()
     assert _staged(node) == []   # the partial staging directory is gone
+    storage_operations.report_launch_failure.assert_awaited_once()
+
+
+def _legacy_runner(files: storage_operations.StorageOperationFiles) -> subprocess.Popen:
+    """A runner an older validator launched: its PID file only (no launcher record), running this operation's spec."""
+    runner = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)", "--spec", str(files.spec), "--cancel-file", str(files.cancel)]
+    )
+    Path(str(files.pid)).write_text(f"{runner.pid}\n")
+    return runner
+
+
+def test_a_re_dispatch_after_the_upgrade_leaves_the_older_validators_live_runner_alone(node: Path) -> None:
+    runs = node / "runs"
+    _runner(node, f"open({str(runs)!r}, 'a').write('run\\n')\n")
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    legacy_runner = _legacy_runner(files)
+    try:
+        assert _dispatch() == files
+        import time
+
+        time.sleep(0.5)
+        assert legacy_runner.poll() is None
+        assert not runs.exists() and _staged(node) == []   # no second wrapper, nothing staged
+        assert Path(str(files.pid)).read_text() == f"{legacy_runner.pid}\n"
+    finally:
+        legacy_runner.kill()
+        legacy_runner.wait()
+
+
+@pytest.mark.parametrize("incumbent", ["launcher_before", "legacy_before", "launched_during_staging"])
+def test_a_repeat_dispatch_whose_staging_fails_never_fails_the_running_operation(node: Path, incumbent: str) -> None:
+    import asyncio as aio
+
+    _runner(node, "raise SystemExit(0)\n")
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    runners: list[subprocess.Popen] = []
+
+    def start_incumbent() -> None:
+        runners.append(_legacy_runner(files))
+        if incumbent != "legacy_before":   # this validator's launch: a launcher record, the PID as the runner
+            Path(str(files.launcher)).write_text(Path(str(files.pid)).read_text())
+
+    if incumbent != "launched_during_staging":
+        start_incumbent()
+
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        if "printf \"%s\" \"$d\"" in command:   # the staging step: the disk is full
+            if incumbent == "launched_during_staging":
+                start_incumbent()
+            raise OSError(28, "No space left on device")
+        return await _run_locally(command, check, input)
+
+    try:
+        returned_files = aio.run(storage_operations.start_storage_operation(
+            SimpleNamespace(run=run), sys.executable, OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+        ))
+        assert returned_files == files
+        storage_operations.report_launch_failure.assert_not_awaited()
+        assert all(r.poll() is None for r in runners)
+    finally:
+        for r in runners:
+            r.kill()
+            r.wait()
+
+
+def test_a_dispatch_whose_staging_fails_with_no_run_reports_the_failure(node: Path) -> None:
+    import asyncio as aio
+
+    _runner(node, "raise SystemExit(0)\n")
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        if "printf \"%s\" \"$d\"" in command:
+            raise OSError(28, "No space left on device")
+        return await _run_locally(command, check, input)
+
+    with pytest.raises(OSError):
+        aio.run(storage_operations.start_storage_operation(
+            SimpleNamespace(run=run), sys.executable, OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+        ))
     storage_operations.report_launch_failure.assert_awaited_once()
