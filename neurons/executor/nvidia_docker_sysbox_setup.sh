@@ -766,24 +766,35 @@ check_fuse3() {
 FUSERMOUNT3_PROFILE=/etc/apparmor.d/fusermount3
 FUSERMOUNT3_LOCAL=/etc/apparmor.d/local/fusermount3
 FUSERMOUNT3_RULE='mount fstype=@{fuse_types} -> /var/lib/sysboxfs/**,'
+# without it a stopped container's sysbox-fs mount stays behind and the next sysbox container start fails
+FUSERMOUNT3_UMOUNT_RULE='umount /var/lib/sysboxfs/**,'
 
 # the profile only binds when AppArmor is on: with apparmor=0 there is nothing to fix and apparmor_parser fails
 fusermount3_profile_enforced() {
     [ -f "$(host_path "$FUSERMOUNT3_PROFILE")" ] && grep -q Y "$(host_path /sys/module/apparmor/parameters/enabled)" 2>/dev/null
 }
 
+# the rules missing from the local profile, one per line (both are needed: a host with only the mount rule, e.g. added
+# by hand, cannot unmount sysbox-fs)
+fusermount3_missing_sysboxfs_rules() {
+    local rule
+    for rule in "$FUSERMOUNT3_RULE" "$FUSERMOUNT3_UMOUNT_RULE"; do
+        grep -qF "$rule" "$(host_path "$FUSERMOUNT3_LOCAL")" 2>/dev/null || printf '%s\n' "$rule"
+    done
+}
+
 fusermount3_needs_sysboxfs_rule() {
-    fusermount3_profile_enforced && ! grep -qF "$FUSERMOUNT3_RULE" "$(host_path "$FUSERMOUNT3_LOCAL")" 2>/dev/null
+    fusermount3_profile_enforced && [ -n "$(fusermount3_missing_sysboxfs_rules)" ]
 }
 
 check_fusermount3_apparmor() {
     if ! fusermount3_needs_sysboxfs_rule; then
-        pf_pass "fusermount3 may mount sysbox-fs under /var/lib/sysboxfs (no enforced AppArmor profile, or the rule is in $FUSERMOUNT3_LOCAL)."
+        pf_pass "fusermount3 may mount and unmount sysbox-fs under /var/lib/sysboxfs (no enforced AppArmor profile, or both rules are in $FUSERMOUNT3_LOCAL)."
         return 0
     fi
     pf_fix "The AppArmor profile $FUSERMOUNT3_PROFILE (Ubuntu 26.04) stops sysbox-fs mounting under /var/lib/sysboxfs — every sysbox container fails." \
-        "$(self_cmd)   # adds the rule below and reloads the profile" \
-        "or by hand: printf '%s\\n' '$FUSERMOUNT3_RULE' 'umount /var/lib/sysboxfs/**,' | sudo tee -a $FUSERMOUNT3_LOCAL && sudo apparmor_parser -r $FUSERMOUNT3_PROFILE"
+        "$(self_cmd)   # adds the rules below and reloads the profile" \
+        "or by hand: printf '%s\\n' '$FUSERMOUNT3_RULE' '$FUSERMOUNT3_UMOUNT_RULE' | sudo tee -a $FUSERMOUNT3_LOCAL && sudo apparmor_parser -r $FUSERMOUNT3_PROFILE"
 }
 
 # sysbox-ce 0.7.1 ships sysbox-fs (10 s) and sysbox-mgr (45 s) start timeouts and no Restart=: a slow boot leaves
@@ -804,8 +815,8 @@ allow_sysboxfs_in_fusermount3_apparmor() {
     fusermount3_profile_enforced || return 0
     if fusermount3_needs_sysboxfs_rule; then
         mkdir -p "$(dirname "$(host_path "$FUSERMOUNT3_LOCAL")")"
-        printf '%s\n' "# lium: sysbox-fs mounts its FUSE file systems under /var/lib/sysboxfs" \
-            "$FUSERMOUNT3_RULE" 'umount /var/lib/sysboxfs/**,' >> "$(host_path "$FUSERMOUNT3_LOCAL")"
+        { echo "# lium: sysbox-fs mounts its FUSE file systems under /var/lib/sysboxfs"; fusermount3_missing_sysboxfs_rules; } \
+            >> "$(host_path "$FUSERMOUNT3_LOCAL")"
     fi
     # reload even when the rule was already on disk: an earlier run may have written it and then failed to reload
     apparmor_parser -r "$FUSERMOUNT3_PROFILE" || { fail "Could not reload $FUSERMOUNT3_PROFILE with the sysbox-fs rule."; return 1; }
