@@ -2004,10 +2004,11 @@ async def test_a_create_passes_its_own_earlier_pending_mark_but_not_another_comm
 
 @pytest.mark.parametrize("kept_in", ["command_record", "saved_report"])
 @pytest.mark.asyncio
-async def test_a_running_fillers_success_does_not_hold_back_the_restart_report(kept_in) -> None:
+async def test_a_running_fillers_success_is_replayed_but_does_not_hold_back_the_restart_report(kept_in) -> None:
     """The backend handles a filler's success without a rent-finished receipt. A running filler's kept success is
-    therefore neither replayed nor waited on, so an interrupted customer create (a custom build, which the backend
-    resends only from the report) still gets its resend at once."""
+    replayed (a report lost to a connector restart would leave its run STARTING until the backend's watchdog fails and
+    deletes it) but never waited on, so an interrupted customer create (a custom build, which the backend resends only
+    from the report) still gets its resend at once."""
     redis_service = _redis_service()
     client = _client(redis_service)
     client.lock = asyncio.Lock()
@@ -2027,9 +2028,10 @@ async def test_a_running_fillers_success_does_not_hold_back_the_restart_report(k
     awaiting = await client.resend_unacked_container_created(ws)
 
     assert awaiting == {}
-    ws.send.assert_not_awaited()
+    assert [ContainerCreated.model_validate_json(c.args[0]).pod_id for c in ws.send.await_args_list] == ["pod-f"]
     assert client.resumed_creates_report.pod_ids == ["pod-c"]
-    assert await redis_service.unsettled_create_successes() == {}
+    if kept_in == "command_record":   # the durable copy covers a filler's success whose saved report was lost
+        assert list(await redis_service.unsettled_create_successes()) == ["pod-f"]
 
 
 @pytest.mark.parametrize("mark", ["this_command", "another_command", "none"])

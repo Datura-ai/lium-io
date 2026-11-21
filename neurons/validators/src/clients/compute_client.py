@@ -1374,10 +1374,6 @@ class ComputeClient:
             created = ContainerCreated.model_validate_json(message_json)
         except pydantic.ValidationError:
             return False
-        if created.workload_kind == WorkloadKind.FILLER:
-            # the backend handles a filler's success without a rent-finished receipt, so it waits on none: replayed,
-            # its receipt would never come and the restart report would wait on it for good
-            return False
         redis_service = self.miner_service.redis_service
         return await redis_service.renting_in_progress(
             created.miner_hotkey, created.executor_id, pod_id, max_age_seconds=None
@@ -1402,7 +1398,7 @@ class ComputeClient:
     async def resend_unacked_container_created(self, ws=None) -> dict[str, str]:
         """ws given: each one is sent on it now, not queued, ahead of the ResumedCreatesReport; a Redis error then
         raises, so the report waits for the next socket instead of failing a create whose replay could not be read.
-        Returns pod id -> command_id of each one sent or queued."""
+        Returns pod id -> command_id of each customer one sent or queued: the ones whose receipt is awaited."""
         redis_service = self.miner_service.redis_service
         try:
             unacked = await self._unacked_successes()
@@ -1441,7 +1437,10 @@ class ComputeClient:
                     ):
                         continue  # never left: the queue sends it
                     self.message_queue.append(created)
-            sent[pod_id] = created.command_id
+            if created.workload_kind != WorkloadKind.FILLER:
+                # the backend handles a filler's success without a rent-finished receipt: replayed, it starts the run a
+                # lost report left STARTING, but no receipt is awaited for it, so the restart report never waits on it
+                sent[pod_id] = created.command_id
             logger.warning(
                 _m(
                     "Resending a created-container report the backend did not answer",
