@@ -790,35 +790,57 @@ fusermount3_missing_sysboxfs_rules() {
 }
 
 # an AppArmor path glob (apparmor.d(5) "Globbing"): ** any text, * and ? within one path segment, {a,b} alternation,
-# [..] a class; a path ending in '/' is that directory only. @{var} is taken as any text (it could expand to anything).
-aa_glob_ere() {
-    local p=$1 out='' c i=0 depth=0
-    while [ $i -lt ${#p} ]; do
-        c=${p:$i:1}
+# [..] a class; a path ending in '/' is that directory only. Parses $AA_G from $AA_I up to an unnested ',' or '}' and
+# sets AA_FULL to the ERE of what that part matches and AA_PREF to an ERE of every prefix of a path it matches.
+# @{var} matches nothing here: its value is not in the profile, and taking it as any text reported @{HOME}/** denies.
+aa_glob_seq() {
+    local -a full=() pref=()
+    local c atom alts_full alts_pref opt i rest
+    while [ $AA_I -lt ${#AA_G} ]; do
+        c=${AA_G:$AA_I:1}
+        if [ $AA_D -gt 0 ] && { [ "$c" = , ] || [ "$c" = '}' ]; }; then break; fi
+        atom=''
         case $c in
-            '*') if [ "${p:$((i + 1)):1}" = '*' ]; then out+='.*'; i=$((i + 1)); else out+='[^/]*'; fi ;;
-            '?') out+='[^/]' ;;
-            '{') out+='('; depth=$((depth + 1)) ;;
-            '}') out+=')'; depth=$((depth - 1)) ;;
-            ',') if [ $depth -gt 0 ]; then out+='|'; else out+=','; fi ;;
-            '[') c=${p:$i}; c=${c%%]*}; out+="$c]"; i=$((i + ${#c})) ;;
-            '@') if [ "${p:$((i + 1)):1}" = '{' ]; then c=${p:$i}; c=${c%%\}*}; out+='.*'; i=$((i + ${#c})); else out+='@'; fi ;;
-            '\') i=$((i + 1)); out+="\\${p:$i:1}" ;;
-            .|+|'('|')'|'|'|^|'$') out+="\\$c" ;;
-            *) out+=$c ;;
+            '*') if [ "${AA_G:$((AA_I + 1)):1}" = '*' ]; then atom='.*'; AA_I=$((AA_I + 1)); else atom='[^/]*'; fi ;;
+            '?') atom='[^/]' ;;
+            '[') c=${AA_G:$AA_I}; c=${c%%]*}; atom="$c]"; AA_I=$((AA_I + ${#c})) ;;
+            '@') if [ "${AA_G:$((AA_I + 1)):1}" = '{' ]; then c=${AA_G:$AA_I}; c=${c%%\}*}; AA_I=$((AA_I + ${#c})); fi
+                 atom='@' ;;  # no sysbox-fs path has an '@', so this branch of the glob cannot reach one
+            '\') AA_I=$((AA_I + 1)); atom="\\${AA_G:$AA_I:1}" ;;
+            .|+|'('|')'|'|'|^|'$'|'}') atom="\\$c" ;;
+            '{')
+                AA_I=$((AA_I + 1)); AA_D=$((AA_D + 1)); alts_full=''; alts_pref=''; opt=''
+                while :; do
+                    aa_glob_seq
+                    if [ -n "$AA_FULL" ]; then alts_full+="|$AA_FULL"; alts_pref+="|$AA_PREF"; else opt='?'; fi
+                    c=${AA_G:$AA_I:1}; AA_I=$((AA_I + 1))
+                    [ "$c" = , ] || break
+                done
+                AA_D=$((AA_D - 1))
+                [ -n "$alts_full" ] && { full+=("(${alts_full#|})$opt"); pref+=("${alts_pref#|}"); }
+                continue
+                ;;
+            *) atom=$c ;;
         esac
-        i=$((i + 1))
+        full+=("$atom"); pref+=('')
+        AA_I=$((AA_I + 1))
     done
-    printf '^%s$' "$out"
+    # prefixes of X R: those of X, or X then a prefix of R; for a single atom that is (X R)?
+    rest=''; AA_FULL=''
+    for ((i = ${#full[@]} - 1; i >= 0; i--)); do
+        if [ -n "${pref[i]}" ]; then rest="(${pref[i]}|${full[i]}$rest)"; else rest="(${full[i]}$rest)?"; fi
+        AA_FULL="${full[i]}$AA_FULL"
+    done
+    AA_PREF=$rest
 }
 
 # whether a rule's path can name a sysbox-fs mount point: sysbox-fs mounts at /var/lib/sysboxfs and fusermount3
-# unmounts there and below (AppArmor matches a directory mount point with its trailing '/')
-# shortcut: a glob is tried against three sample mount points, not intersected with /var/lib/sysboxfs/**; a glob that
-# names only an unusual subpath (e.g. /var/**/proc/x) is missed unless it starts inside /var/lib/sysboxfs/
+# unmounts there and below (AppArmor matches a directory mount point with its trailing '/'), so the glob covers one
+# exactly when some path it matches starts with /var/lib/sysboxfs/
 aa_path_names_sysboxfs() {
-    case ${1%%[\[*?\{@]*} in /var/lib/sysboxfs/*) return 0 ;; esac
-    printf '%s\n' /var/lib/sysboxfs/ /var/lib/sysboxfs/0123abcd/ /var/lib/sysboxfs/0123abcd/proc/sys/ | grep -qE "$(aa_glob_ere "$1")"
+    AA_G=$1 AA_I=0 AA_D=0
+    aa_glob_seq
+    [ -n "$AA_PREF" ] && printf '%s\n' /var/lib/sysboxfs/ | grep -qE "^$AA_PREF\$"
 }
 
 # deny rules in the local profile that stop fusermount3 mounting or unmounting sysbox-fs: a deny wins over any allow,

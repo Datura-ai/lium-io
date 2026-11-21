@@ -523,7 +523,7 @@ def test_a_deny_on_sysboxfs_is_a_fix_and_the_install_refuses_instead_of_reloadin
         ("deny umount /var/lib/{docker,sysboxfs}/**,", True),
         ("deny umount /var/lib/[s]ysboxfs/**,", True),
         ("deny umount /var/lib/sysboxfs/*/proc/**,", True),
-        ("deny umount @{HOME}/**,", True),
+        ("deny umount /var/**/proc/x,", True),
         ("deny umount,", True),
         ("deny mount,", True),
         ("deny mount -> /var/lib/**,", True),
@@ -535,6 +535,9 @@ def test_a_deny_on_sysboxfs_is_a_fix_and_the_install_refuses_instead_of_reloadin
         ("deny mount -> /mnt/**,", False),
         ("deny mount fstype=nfs,", False),
         ("deny /etc/** w,", False),
+        # @{HOME} is home directories, never /var/lib/sysboxfs
+        ("deny umount @{HOME}/**,", False),
+        ("deny mount fstype=fuse -> @{HOME}/**,", False),
     ],
 )
 def test_a_deny_glob_is_matched_against_the_sysboxfs_mount_points(tmp_path, rule, blocks):
