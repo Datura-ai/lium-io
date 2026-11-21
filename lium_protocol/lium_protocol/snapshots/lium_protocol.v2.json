@@ -2978,7 +2978,8 @@
         "AttestationError",
         "ContainerVanished",
         "ExecutorUnreachable",
-        "NotTheNodeLeft"
+        "NotTheNodeLeft",
+        "SameNameHeldByNodeLeft"
       ],
       "title": "FailedContainerErrorCodes",
       "type": "string"

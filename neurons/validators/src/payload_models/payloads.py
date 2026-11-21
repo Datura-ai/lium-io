@@ -835,6 +835,8 @@ class FailedContainerErrorCodes(enum.Enum):
     ContainerVanished = "ContainerVanished"
     # lium_protocol 2.18.0: a delete for the node a moved pod left reached a host with another boot id
     NotTheNodeLeft = "NotTheNodeLeft"
+    # lium_protocol 2.18.0: the create met the pod's name held by another registration's container on this daemon
+    SameNameHeldByNodeLeft = "SameNameHeldByNodeLeft"
 
 
 class FailedContainerErrorTypes(enum.Enum):

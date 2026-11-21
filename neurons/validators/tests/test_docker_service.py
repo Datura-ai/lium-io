@@ -6640,6 +6640,7 @@ async def test_rental_create_keeps_a_same_name_container_while_another_registrat
     [
         # the replacement's create finished (no longer tracked) and its container exited: still not this create's
         ("miner-b:exec-2", "exited", ["run"]),
+        ("miner-b:exec-2", "running", ["run"]),
         ("miner-a:exec", "exited", ["run", "rm cid-1", "run"]),
         ("", "created", ["run", "rm cid-1", "run"]),
         ("miner-a:exec", "running", ["run"]),
@@ -6684,8 +6685,13 @@ async def test_rental_create_removes_a_same_name_leftover_only_of_its_own_regist
         if expected_events[-1] == "run" and len(expected_events) > 1:
             assert await run == "cid-2"
         else:
-            with pytest.raises(docker_service_module._SameNameContainerKept):
+            with pytest.raises(docker_service_module._SameNameContainerKept) as kept:
                 await run
+            # F-12: another registration's container is typed, so the backend can send the create again once the
+            # node-left delete removed it; this registration's running pod is not
+            assert isinstance(kept.value, docker_service_module._SameNameHeldByAnotherRegistration) == (
+                found_owner == "miner-b:exec-2"
+            )
     assert events == expected_events
 
 
@@ -11542,6 +11548,42 @@ async def test_create_failure_before_the_container_exists_is_not_a_host_kill(
     assert result.error_code == FailedContainerErrorCodes.UnknownError
     # The verdict must never cost us the cleanup itself — volumes and leftovers still go.
     cleanup.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "kept, expected_error_code",
+    [
+        ("another_registration", FailedContainerErrorCodes.SameNameHeldByNodeLeft),
+        ("own_running", FailedContainerErrorCodes.UnknownError),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_create_whose_name_another_registration_holds_reports_it_typed(
+    docker_service, monkeypatch, kept, expected_error_code
+):
+    """DAH-6531 F-12: the backend sends a moved pod's create once more only on this code, after the node-left delete
+    removed the left registration's container; the pod's own running container stays the generic failure."""
+    _patch_create_container_happy_path(docker_service, monkeypatch)
+    error = (
+        docker_service_module._SameNameHeldByAnotherRegistration("held")
+        if kept == "another_registration"
+        else docker_service_module._SameNameContainerKept("running")
+    )
+    monkeypatch.setattr(docker_service, "_run_rental_docker_create_with_port_retry", AsyncMock(side_effect=error))
+    cleanup = AsyncMock(return_value=False)
+    monkeypatch.setattr(docker_service, "cleanup_failed_container_creation", cleanup)
+    payload = _filler_create_payload()
+
+    result = await docker_service.create_container(
+        payload=payload,
+        executor_info=_filler_executor_info(payload),
+        keypair=Mock(ss58_address="validator-hotkey"),
+        private_key="encrypted",
+    )
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == expected_error_code
+    assert cleanup.await_args.kwargs["keep_container"] is True
 
 
 # DAH-3678: the backend turns an `add_public_keys` failure into the DAH-2624 renter text ("the image's

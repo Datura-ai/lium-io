@@ -1367,6 +1367,12 @@ class _SameNameContainerKept(Exception):
     """A re-sent create met the pod's own container already running (or unreadable): it is the renter's, never removed."""
 
 
+class _SameNameHeldByAnotherRegistration(_SameNameContainerKept):
+    """DAH-6531 F-12: the pod's name is held on this daemon by a container another registration made: for a moved pod,
+    the one the node-left delete removes. Reported as SameNameHeldByNodeLeft, so the backend can send the create once
+    more after that delete is confirmed."""
+
+
 class _FillerRefusedForCustomerCreate(ContainerCreateRefused):
     """Raised at a filler's `docker run` while a customer create runs on the same executor."""
 
@@ -4072,7 +4078,9 @@ class DockerService:
         if identity is None:
             return None
         container_id, status, found_owner = identity
-        if not container_id or status not in ("created", "exited", "dead") or found_owner not in ("", owner):
+        if container_id and found_owner not in ("", owner):
+            raise _SameNameHeldByAnotherRegistration(f"the name {container_name} is held by another registration's container")
+        if not container_id or status not in ("created", "exited", "dead"):
             return None
         return container_id
 
@@ -4145,7 +4153,7 @@ class DockerService:
             except ContainerOfAnotherRegistration as exc:
                 # DAH-6531: the transport retry found the name held by another registration's container (a daemon two
                 # registrations share): never this create's leftover, kept like any container this create does not own
-                raise _SameNameContainerKept(str(exc)) from exc
+                raise _SameNameHeldByAnotherRegistration(str(exc)) from exc
             except Exception as exc:
                 # A re-sent create for this pod meets its earlier attempt's container under the
                 # pod's own (unique) name: 409 "The container name "/pod_<id>" is already in use".
@@ -12792,6 +12800,8 @@ class DockerService:
                 error_code=(
                     FailedContainerErrorCodes.ContainerVanished
                     if container_vanished
+                    else FailedContainerErrorCodes.SameNameHeldByNodeLeft
+                    if isinstance(_last_attempt_exception(e), _SameNameHeldByAnotherRegistration)
                     else FailedContainerErrorCodes.RentingInProgress
                     if isinstance(e, _FillerRefusedForCustomerCreate)
                     else FailedContainerErrorCodes.UnknownError

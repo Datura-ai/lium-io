@@ -97,6 +97,9 @@ class FailedContainerErrorCodes(enum.Enum):
     ExecutorUnreachable = "ExecutorUnreachable"
     # 2.18.0: a ContainerDeleteOnNodeLeftRequest reached a host with another boot id; nothing was deleted
     NotTheNodeLeft = "NotTheNodeLeft"
+    # 2.18.0: the create met the pod's name held by another registration's container (for a moved pod, the node-left
+    # delete's); the backend sends the create once more after that delete is confirmed
+    SameNameHeldByNodeLeft = "SameNameHeldByNodeLeft"
 
 
 class FailedContainerErrorTypes(enum.Enum):
