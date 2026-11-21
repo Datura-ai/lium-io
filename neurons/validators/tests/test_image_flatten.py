@@ -861,6 +861,20 @@ async def test_flatten_copy_bytes_before_docker_29_8_budgets_the_listed_size(ver
 
 
 @pytest.mark.asyncio
+async def test_an_existing_copy_needs_no_size_so_an_unreadable_one_does_not_stop_the_create():
+    # review at fc11bf3: the flatten reuses the copy, writing nothing; only a new copy needs a readable size
+    async def run(command, **kwargs):
+        if command.startswith("/usr/bin/docker version"):
+            raise RuntimeError("ssh")
+        if "--format" in command:
+            return Mock(stdout=f"{_GIB24} {_MANY} sha256:abc\noverlayfs\n")
+        assert "lium-flattened:abc" in command
+        return Mock(exit_status=0)
+
+    assert await image_flatten.flatten_copy_bytes(Mock(run=run), "sglang") is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("driver, copies", [("overlay2", 1), ("overlayfs", 2)])
 async def test_the_flattens_own_disk_check_budgets_the_containerd_import_twice(driver, copies):
     # a snapshots-only image (compressed blobs gone) still has Size ~ its unpacked data; the import writes both again

@@ -316,9 +316,6 @@ async def flatten_copy_bytes(ssh_client: asyncssh.SSHClientConnection, image: st
         return None
     if layers < FLATTEN_BUDGET_MIN_LAYERS:
         return None
-    size = await image_disk_bytes(ssh_client, image_id, size, driver)
-    if size is None:
-        raise FlattenSizeUnreadable(f"the size on disk of {image!r} on storage driver {driver!r} is unreadable")
     tag = f"{FLATTENED_IMAGE_REPO}:{image_id.removeprefix('sha256:')}"
     try:
         copy = await ssh_client.run(
@@ -329,7 +326,12 @@ async def flatten_copy_bytes(ssh_client: asyncssh.SSHClientConnection, image: st
     except Exception:
         copy = None  # unknown: keep the room for a new copy
     # shortcut: the copy may be removed before the flatten reuses it; the flatten's own disk check then refuses
-    return None if copy is not None and copy.exit_status == 0 else _copy_bytes(size, driver) + FLATTEN_DISK_MARGIN_BYTES
+    if copy is not None and copy.exit_status == 0:
+        return None  # reused: no size needed, so an unreadable one does not stop the create
+    size = await image_disk_bytes(ssh_client, image_id, size, driver)
+    if size is None:
+        raise FlattenSizeUnreadable(f"the size on disk of {image!r} on storage driver {driver!r} is unreadable")
+    return _copy_bytes(size, driver) + FLATTEN_DISK_MARGIN_BYTES
 
 
 _CONTAINERD_DEFAULT_ROOT = "/var/lib/containerd"
