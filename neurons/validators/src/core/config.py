@@ -1,3 +1,4 @@
+import functools
 import logging
 import pathlib
 from enum import Enum
@@ -20,6 +21,23 @@ from incentive.config import IncentiveConfig
 from lium_core.shared_config import DEFAULT_SHARED_CONFIG, SharedConfigClient
 
 logger = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=4)
+def _parse_miner_origins(value: str) -> frozenset[tuple[str, int]]:
+    """CONFIGURED_MINER_ORIGINS as (host, port) pairs. A malformed entry is skipped (and logged once per value), so one
+    typo never stops the validator dialling every other miner; cached, since every miner request reads it."""
+    origins = set()
+    for entry in (e.strip() for e in value.split(",")):
+        if not entry:
+            continue
+        host, _, port = entry.rpartition(":")
+        host = host.strip("[]")
+        if host and port.isdigit() and 0 < int(port) < 65536:
+            origins.add((host, int(port)))
+        else:
+            logger.warning("CONFIGURED_MINER_ORIGINS entry %r is not host:port; skipped", entry)
+    return frozenset(origins)
 
 
 class FeatureFlag(str, Enum):
@@ -142,6 +160,11 @@ class Settings(BaseSettings):
     # DAH-5592: how long a host-fault create failure is sent again on each new backend socket (redis_service)
     HOST_FAULT_FAILURE_RESEND_SECONDS: int = Field(default=2 * 3600, gt=0)
     COMPUTE_APP_URI: str = Field(env="COMPUTE_APP_URI", default="wss://lium.io/api")
+    CONFIGURED_MINER_ORIGINS: str = Field(
+        default="",
+        description="Comma-separated host:port of miners this validator's operator set up itself (a dev copy's "
+        "in-cluster central miner). Dialled as configured; every address a miner reports must be public.",
+    )
     COMPUTE_REST_API_URL: str | None = Field(
         env="COMPUTE_REST_API_URL", default="https://lium.io/api"
     )
@@ -1079,6 +1102,13 @@ class Settings(BaseSettings):
             chain_endpoint=self.BITTENSOR_CHAIN_ENDPOINT,
             network=self.BITTENSOR_NETWORK,
         )
+
+    def configured_miner_origins(self) -> set[tuple[str, int]]:
+        """(host, port) of the miners the operator configured: CONFIGURED_MINER_ORIGINS and the debug local miner."""
+        origins = set(_parse_miner_origins(self.CONFIGURED_MINER_ORIGINS))
+        if self.debug.USE_LOCAL_MINER and self.debug.MINER_ADDRESS and self.debug.MINER_PORT:
+            origins.add((self.debug.MINER_ADDRESS, self.debug.MINER_PORT))
+        return origins
 
     def get_debug_miner(self) -> dict:
         if not self.debug.MINER_ADDRESS or not self.debug.MINER_PORT:
