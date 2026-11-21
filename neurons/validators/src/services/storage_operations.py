@@ -545,9 +545,13 @@ async def cancel_storage_operation(
         f"/usr/bin/docker rm -f -- {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
         "exit 3; fi; "
         # nothing runs yet, but a launch from an earlier validator release can still arrive; it removes the
-        # old marker, so only a runner that checks the persistent marker stops it. Fail (retryable) until it does
-        f'test -z "$pid" && ! grep -qF -- {shlex.quote(str(REMOTE_CANCEL_DIRECTORY))} '
-        f"{shlex.quote(REMOTE_RUNNER_PATH)} 2>/dev/null && exit 5; fi; "
+        # old marker, so only a runner that checks the persistent marker stops it. Fail (retryable) until it does,
+        # still stopping and removing a helper an old runner left behind, as it holds the repository credentials
+        f'if test -z "$pid" && ! grep -qF -- {shlex.quote(str(REMOTE_CANCEL_DIRECTORY))} '
+        f"{shlex.quote(REMOTE_RUNNER_PATH)} 2>/dev/null; then "
+        f"/usr/bin/docker stop --time 5 {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
+        f"/usr/bin/docker rm -f -- {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
+        "exit 5; fi; fi; "
         # a PID recorded without a start time comes from an earlier release, whose runner watches the old marker
         f'if test -n "$pid" && ! test -s {start_path}; then '
         f"touch {shlex.quote(str(files.legacy_cancel))} || marked=4; fi; "

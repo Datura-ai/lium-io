@@ -47,7 +47,8 @@ async def test_a_cancel_with_nothing_running_needs_a_runner_that_checks_the_pers
     if not marker_aware:
         Path(storage_operations.REMOTE_RUNNER_PATH).write_text("CANCEL_FILE = '--cancel-file'\n")
     fake_docker = tmp_path / "docker"
-    fake_docker.write_text("#!/bin/sh\n")
+    docker_calls = tmp_path / "docker-calls"
+    fake_docker.write_text(f'#!/bin/sh\necho "$1" >> {docker_calls}\n')
     fake_docker.chmod(0o755)
 
     async def run_locally(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
@@ -68,6 +69,8 @@ async def test_a_cancel_with_nothing_running_needs_a_runner_that_checks_the_pers
         reported.assert_not_awaited()
     # the marker is written either way, so an updated runner stops a later launch
     assert (tmp_path / "cancels" / f"{OPERATION_ID}.cancel").exists()
+    # either way a helper an old runner left behind is stopped and removed, as it holds the repository credentials
+    assert docker_calls.read_text().split() == ["stop", "rm"]
 
 
 def _spawn_runner(spec_path: object) -> int:
