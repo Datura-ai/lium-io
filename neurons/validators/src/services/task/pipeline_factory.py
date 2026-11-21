@@ -64,6 +64,7 @@ from .checks import (
     IdleDiskWriteCheck,
     InspectorRentedCheck,
     LocalVerifyCheck,
+    LoginUserCheck,
     MachineSpecScrapeCheck,
     NodeAccountCheck,
     NvlinkFaultCheck,
@@ -268,9 +269,7 @@ class PipelineFactory:
                 pod_recovery=self.pod_recovery,
             ),
             config=ContextConfig(
-                executor_root=executor_info.root_dir,
                 compute_rest_app_url=settings.COMPUTE_REST_API_URL,
-                gpu_monitor_script_relative="src/gpus_utility.py",
                 machine_scrape_filename=encrypted_files.machine_scrape_file_name,
                 # DAH-2794: an executor that can run the source needs no upload at all. The
                 # binary stays built because the miner picks the executor image, and one that
@@ -324,6 +323,8 @@ class PipelineFactory:
                 HalfStartedStopRetryCheck(),
                 # DAH-5729: before any work on the node, the node must be the registering account's
                 NodeAccountCheck(),
+                # the scripts below run from a root-only directory under /root/app: a non-root login is refused first
+                LoginUserCheck(),
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),
@@ -534,6 +535,8 @@ class PipelineFactory:
                 HalfStartedStopRetryCheck(),
                 # DAH-5729: before any work on the node, the node must be the registering account's
                 NodeAccountCheck(),
+                # the scripts below run from a root-only directory under /root/app: a non-root login is refused first
+                LoginUserCheck(),
                 StartGPUMonitorCheck(),
                 UploadFilesCheck(),
                 MachineSpecScrapeCheck(),

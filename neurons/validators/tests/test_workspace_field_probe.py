@@ -1,4 +1,4 @@
-"""The workspace-field probe, run for real against fake executor source trees."""
+"""The workspace-field probe, run for real against the validator's storage models staged as on an executor."""
 
 import asyncio
 import subprocess
@@ -8,36 +8,37 @@ from types import SimpleNamespace
 import pytest
 from services.storage_operations import supports_workspace_field
 
+from services import executor_payload
+
 
 class _LocalSSH:
-    """Runs the probe command locally with `src` on the path, as the executor's /root/app/src would be."""
+    """Runs the probe command locally, its stdin carrying the staged files."""
 
-    def __init__(self, src):
-        self.src = src
-
-    async def run(self, command, check=False):
-        done = subprocess.run(
-            command, shell=True, capture_output=True, text=True, env={"PYTHONPATH": str(self.src)}
-        )
+    async def run(self, command, check=False, input=None):
+        done = subprocess.run(command, shell=True, input=input, capture_output=True, text=True)
         return SimpleNamespace(exit_status=done.returncode, stderr=done.stderr)
 
 
-def _probe(src, field="exclude_patterns"):
-    return asyncio.run(supports_workspace_field(_LocalSSH(src), sys.executable, field))
-
-
-def _models(tmp_path, body):
-    (tmp_path / "storage").mkdir()
-    (tmp_path / "storage" / "__init__.py").write_text("")
-    (tmp_path / "storage" / "models.py").write_text(body)
+@pytest.fixture
+def service(tmp_path, monkeypatch):
+    monkeypatch.setattr(executor_payload, "SERVICE_DIR_PARENT", str(tmp_path))
     return tmp_path
 
 
-def test_image_without_storage_package_is_an_old_image(tmp_path):
-    assert _probe(tmp_path) is False
+def _probe(field, python=sys.executable):
+    return asyncio.run(supports_workspace_field(_LocalSSH(), python, field))
 
 
-def test_other_import_error_still_fails_the_probe(tmp_path):
-    src = _models(tmp_path, "import not_a_real_module_xyz\n")
-    with pytest.raises(RuntimeError, match="not_a_real_module_xyz"):
-        _probe(src)
+@pytest.mark.parametrize("field", ["bootstrap", "exclude_patterns"])
+def test_the_staged_models_know_the_fields_the_validator_sends(service, field):
+    assert _probe(field) is True
+    assert not list(service.iterdir())  # the staged copy goes with the probe
+
+
+def test_an_unknown_field_is_reported_missing(service):
+    assert _probe("no_such_field") is False
+
+
+def test_a_probe_that_cannot_run_fails_rather_than_reading_as_missing(service):
+    with pytest.raises(RuntimeError, match="exit 127"):
+        _probe("bootstrap", python="/nonexistent/python")

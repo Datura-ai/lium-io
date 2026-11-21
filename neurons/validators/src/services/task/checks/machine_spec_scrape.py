@@ -9,6 +9,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, fields, replace
 from typing import Any, Literal
 
+from services import executor_payload
 from services.file_encrypt_service import ORIGINAL_KEYS
 from services.gpu_spec_table import classify_gpu_model, list_sxm_on_pcie_adapter_as_pcie
 from services.liumd_binary_refresh import DEFAULT_REFRESH_BUDGET_SECONDS, ensure_liumd_binary
@@ -622,7 +623,7 @@ class MachineSpecScrapeCheck:
         # from sys.path, so a file left next to the SSH login shell cannot shadow psutil or
         # json. It does not disable site processing: a .pth or sitecustomize inside the image
         # still runs and prints, which is what `_decrypt_payload` searches through.
-        command = f"{shlex.quote(ctx.executor.python_path)} -I -"
+        command = f"{shlex.quote(executor_payload.EXECUTOR_PYTHON)} -I -"
         scrape_run = await ctx.runner.run(
             command,
             timeout=timeout,

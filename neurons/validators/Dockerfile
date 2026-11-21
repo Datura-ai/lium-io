@@ -19,6 +19,9 @@ RUN pdm lock --check
 RUN pdm install --prod
 
 COPY . .
+# the scripts the validator writes onto an executor and runs there (src/services/executor_payload.py), taken from the
+# executor sources at build: what runs on a node never comes from a path the node reports
+COPY --from=executor_src . src/executor_payloads/
 
 RUN mv libdmcompverify.so /usr/lib/
 RUN mv libverifyx.so /usr/lib/

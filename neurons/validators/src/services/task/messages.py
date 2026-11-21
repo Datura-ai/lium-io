@@ -1151,6 +1151,33 @@ class CollateralStatusMessages:
     )
 
 
+class LoginUserMessages:
+    ROOT = MessageTemplate(
+        event="Validator logged in as root",
+        reason="LOGIN_USER_ROOT",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
+    UNREAD = MessageTemplate(
+        event="Login user could not be read; checked again next cycle",
+        reason="LOGIN_USER_UNREAD",
+        severity="warning",
+        category="env",
+        impact="This run stops before anything is installed; nothing is reset and the node is checked again next cycle",
+        remediation="Usually a slow or interrupted SSH session and nothing is needed. If it repeats, check that `id -u` "
+        "answers promptly over the validator's SSH login.",
+    )
+    NOT_ROOT = MessageTemplate(
+        event="Executor SSH user must be root",
+        reason="LOGIN_USER_NOT_ROOT",
+        severity="error",
+        category="policy",
+        impact="Verification failed; the node is not validated while its SSH login is not root",
+        remediation="Run the executor from the standard image, which logs the validator in as root.",
+    )
+
+
 class NodeAccountMessages:
     MATCH = MessageTemplate(
         event="Node is the one its account registered",

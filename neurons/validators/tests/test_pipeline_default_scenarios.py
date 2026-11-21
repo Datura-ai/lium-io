@@ -85,13 +85,11 @@ class DummySSHCommandRunner:
         from datetime import datetime, UTC
 
         # Mock successful responses for different commands
-        if "ps aux | grep" in command:
-            # GPU monitor not running initially
-            stdout = ""
-        elif "pip install" in command:
+        if "pip install" in command:
             stdout = "Successfully installed packages"
         elif "nohup" in command:
-            stdout = ""
+            # GPU monitor not running initially: the check starts one
+            stdout = "STARTED 4242\n"
         elif "chmod +x" in command and "scrape.sh" in command:
             # Return encrypted machine specs
             stdout = self.machine_specs_encrypted
@@ -346,7 +344,6 @@ async def test_successful_unrented_pipeline_flow(context_factory):
     config = build_context_config(
         validator_keypair=keypair,
         compute_rest_app_url="http://validator:8000",
-        gpu_monitor_script_relative="src/gpus_utility.py",
         machine_scrape_filename="scrape.sh",
         machine_scrape_timeout=300,
         obfuscation_keys={},
@@ -528,7 +525,6 @@ async def test_successful_rented_pipeline_flow(context_factory):
     config = build_context_config(
         validator_keypair=keypair,
         compute_rest_app_url="http://validator:8000",
-        gpu_monitor_script_relative="src/gpus_utility.py",
         machine_scrape_filename="scrape.sh",
         machine_scrape_timeout=300,
         obfuscation_keys={},

@@ -81,6 +81,7 @@ from payload_models.payloads import (
 from daos.recovery_stop import UnmarkedRecoveryStopDao
 from services.attestation_service import AttestationError, AttestationService
 from services import build_context as build_context_service
+from services import executor_payload
 from services.const import (
     EDIT_PARKED_SUFFIX,
     PARKED_SUFFIXES,
@@ -240,10 +241,10 @@ from services.ssh_connect_timing import connect_with_phase_timing
 from services.storage_operations import (
     forget_storage_helper,
     note_started_storage_helper,
+    run_job_with_secrets,
     start_storage_operation,
     supports_bootstrap_restore,
     supports_storage_operation,
-    upload_secrets_file,
     wait_for_storage_operation,
 )
 from services.task.runner import SSHCommandRunner
@@ -3730,11 +3731,16 @@ class DockerService:
             "start": "--start-collector",
             "stop": "--stop-collector",
         }[action]
-        script = f"{executor_info.root_dir.rstrip('/')}/src/inspector_executor.py"
-        command = f"{shlex.quote(executor_info.python_path)} {shlex.quote(script)} {flag}"
+        # the script and interpreter are the validator's (services.executor_payload), not executor_info's paths
+        run = f"{executor_payload.run(executor_payload.INSPECTOR)} {flag}"
         if action == "start":
-            command = f"nohup {command} >/dev/null 2>&1 &"
-        return command
+            # the starter exits once the library's collector runs: earlier starters' directories go first
+            return (
+                f"rm -rf {shlex.quote(executor_payload.service_dir_glob('inspector-collector'))}*; "
+                f"{executor_payload.install('inspector-collector', executor_payload.INSPECTOR)}; "
+                f"nohup {run} >/dev/null 2>&1 &"
+            )
+        return executor_payload.run_once("inspector", executor_payload.INSPECTOR, flag)
 
     async def _run_inspector_collector_lifecycle(
         self,
@@ -3746,7 +3752,7 @@ class DockerService:
         command = self._build_inspector_collector_command(executor_info, action)
         log_extra = {
             **default_extra,
-            "command": command,
+            "command": executor_payload.label(executor_payload.INSPECTOR, action),
             "executor_uuid": executor_info.uuid,
             "inspector_action": action,
         }
@@ -11429,7 +11435,7 @@ class DockerService:
                     # would put the backup's plaintext on a disk the renter asked to encrypt, and
                     # the old encrypted mode would hand the executor the passphrase.
                     current_step = "bootstrap_restore_probe"
-                    if not await supports_bootstrap_restore(ssh_client, executor_info.python_path):
+                    if not await supports_bootstrap_restore(ssh_client, executor_payload.EXECUTOR_PYTHON):
                         raise RuntimeError(
                             "executor image cannot restore into an encrypted volume at create time "
                             "(no workspace.bootstrap); the provider must update the executor image"
@@ -12711,7 +12717,7 @@ class DockerService:
         try:
             files = await start_storage_operation(
                 ssh_client,
-                executor_info.python_path,
+                executor_payload.EXECUTOR_PYTHON,
                 operation_id,
                 spec,
                 retain_terminal_artifacts=True,
@@ -12730,33 +12736,32 @@ class DockerService:
         local_volume: str,
         local_volume_path: str,
     ) -> None:
-        local_jobs = Path(__file__).resolve().parent.parent / "miner_jobs"
-        remote_script = "/root/app/restore_storage.py"
-        remote_helper = "/root/app/workspace_mount.py"
-        async with ssh_client.start_sftp_client() as sftp:
-            await sftp.put(str(local_jobs / "restore_storage.py"), remote_script)
-            await sftp.put(str(local_jobs / "workspace_mount.py"), remote_helper)
-        command = [
-            executor_info.python_path,
-            remote_script,
-            "--api-url",
-            settings.COMPUTE_REST_API_URL_EXTERNAL,
-            "--target-volume",
-            local_volume,
-            "--restore-path",
-            restore.restore_path or local_volume_path,
-            "--backup-source-path",
-            restore.legacy_object_key or "",
-            "--secrets-file",
-            await upload_secrets_file(ssh_client, restore.auth_token, restore.backup_volume_info),
-            "--restore-log-id",
-            restore.restore_log_id,
-            "--backup-volume-name",
-            restore.backup_volume_info.name,
-            "--target-volume-path",
-            local_volume_path,
-        ]
-        await ssh_client.run(shlex.join(command), check=True)
+        # the validator's restore job, staged first; its credentials file only then (run_job_with_secrets)
+        await run_job_with_secrets(
+            ssh_client,
+            "restore",
+            executor_payload.RESTORE_JOB,
+            restore.auth_token,
+            restore.backup_volume_info,
+            lambda secrets_file: [
+                "--api-url",
+                settings.COMPUTE_REST_API_URL_EXTERNAL,
+                "--target-volume",
+                local_volume,
+                "--restore-path",
+                restore.restore_path or local_volume_path,
+                "--backup-source-path",
+                restore.legacy_object_key or "",
+                "--secrets-file",
+                secrets_file,
+                "--restore-log-id",
+                restore.restore_log_id,
+                "--backup-volume-name",
+                restore.backup_volume_info.name,
+                "--target-volume-path",
+                local_volume_path,
+            ],
+        )
 
     async def _report_pull_progress(self, docker_client, image: str, log_tag: str, every: float = 15) -> None:
         """DAH-6025: a big pull showed one 'Pulling' line for minutes, and renters cancelled pods that were

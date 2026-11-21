@@ -14,6 +14,7 @@ from typing import Any, Dict, NamedTuple, Optional, Tuple, List
 import asyncssh
 
 from core.config import FeatureFlag, settings
+from services import executor_payload
 from services.verifyx_network_probe import (
     is_cloudflare_probe_failure as _is_cloudflare_probe_failure,
     is_positive_number as _is_positive_number,
@@ -622,12 +623,15 @@ class VerifyXValidationService:
     def _verifyx_command(
         self, executor_info, challenge: "VerifyXChallenge", lib_name: str, run_dir: str | None = None
     ) -> str:
+        # the script and interpreter are the validator's (services.executor_payload), not the executor's reported paths
         command = (
-            f"{shlex.quote(executor_info.python_path)} {shlex.quote(executor_info.root_dir + '/src/verifyx_executor.py')} "
+            f"{executor_payload.run(executor_payload.VERIFYX)} "
             f"--seed {challenge.seed} --cipher_text {challenge.cipher_text}"
         )
         if run_dir is None:
-            return command
+            return executor_payload.run_once(
+                "verifyx", executor_payload.VERIFYX, f"--seed {challenge.seed} --cipher_text {challenge.cipher_text}"
+            )
         # A run the validator may cut off: its own scratch dir (cwd, so the disk-test file lands in
         # it on the same filesystem) and its PID on record, for kill_remote_verifyx.
         d = shlex.quote(run_dir)
@@ -636,6 +640,8 @@ class VerifyXValidationService:
             # a host whose `timeout` lacks -k (busybox) skips the retry, so the first sample stands
             f"timeout -k 1 1 true 2>/dev/null || {{ echo 'no timeout -k' >&2; exit 1; }}; "
             f"mkdir {d} && cd {d} || exit 1; "
+            # inside the run's dir, so the removal below and kill_remote_verifyx's take the script with it
+            f"{executor_payload.install('verifyx', executor_payload.VERIFYX, parent='.')}; "
             f"timeout -k 10 {VERIFYX_COMMAND_TIMEOUT_SECONDS} {command} & echo $! > pid; wait $!; rc=$?; "
             f"cd .. && rm -rf {d}; exit $rc"
         )
