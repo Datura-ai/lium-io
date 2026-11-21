@@ -6689,6 +6689,40 @@ async def test_rental_create_removes_a_same_name_leftover_only_of_its_own_regist
 
 
 @pytest.mark.asyncio
+async def test_a_second_same_name_conflict_after_the_one_checked_removal_keeps_the_container(
+    docker_service, monkeypatch,
+):
+    # DAH-6531: the create removed its own stopped leftover by ID; a replacement took the name before the retry. That
+    # second 409 is kept (typed), so the outer failure cleanup never removes the name
+    events: list[str] = []
+    conflict = '409 Client Error: Conflict ("Conflict. The container name "/pod_test" is already in use")'
+
+    class FakeRentalClient:
+        async def run_container(self, spec):
+            events.append("run")
+            raise Exception(conflict)
+
+        async def container_owner_state(self, *, container_name):
+            return "cid-1", "exited", "miner-a:exec"
+
+        async def remove_container(self, *, container_name, force, remove_volumes):
+            events.append(f"rm {container_name}")
+
+    monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
+    with docker_service_module.inflight_creates.track("test", ("miner-a", "exec")):
+        with pytest.raises(docker_service_module._SameNameContainerKept):
+            await docker_service._run_rental_docker_create_with_port_retry(
+                docker_client=FakeRentalClient(),
+                ssh_client=Mock(),
+                run_spec=ContainerRunSpec(image="img", name="pod_test", labels={"io.lium.executor_id": "miner-a:exec"}),
+                container_name="pod_test",
+                default_extra={},
+                pod_id="test",
+            )
+    assert events == ["run", "rm cid-1", "run"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("race", ["other_create_registers_during_inspect", "pod_started_before_rm"])
 async def test_rental_create_keeps_a_same_name_pod_that_changed_after_its_status_read(
     docker_service, monkeypatch, race,

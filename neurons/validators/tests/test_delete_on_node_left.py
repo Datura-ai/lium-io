@@ -130,6 +130,28 @@ def test_another_boot_runs_no_docker_command(tmp_path):
     assert (status, calls) == (97, "")
 
 
+@pytest.mark.parametrize("read", ["unreadable", "empty"])
+def test_a_host_boot_id_that_cannot_be_read_never_matches(tmp_path, read):
+    # even against an empty expected value (refused before the command is built): a failed read is no boot identity
+    boot_file = tmp_path / "boot_id"
+    if read == "empty":
+        boot_file.write_text("")
+    stub = _daemon_stub(tmp_path, LEFT_LABEL, False)
+    payload = _payload(HOST_BOOT).model_copy(update={"executor_id": LEFT, "miner_hotkey": LEFT_MINER})
+    command = (
+        _node_left_delete_command(payload)
+        .replace("/usr/bin/docker", str(stub))
+        .replace("/proc/sys/kernel/random/boot_id", str(boot_file))
+        .replace(f"= {HOST_BOOT} ]", "= '' ]")
+    )
+    assert "= '' ]" in command
+
+    done = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
+
+    assert done.returncode == 97
+    assert not (tmp_path / "calls").exists()
+
+
 @pytest.mark.parametrize(
     "labels",
     [
@@ -174,8 +196,8 @@ def test_a_container_still_present_fails_the_delete(tmp_path):
     assert "volume" not in calls
 
 
-@pytest.mark.parametrize("missing", ["executor_id", "miner_hotkey"])
-def test_a_delete_naming_no_registration_is_refused(missing):
+@pytest.mark.parametrize("missing", ["executor_id", "miner_hotkey", "expected_boot_id"])
+def test_a_delete_naming_no_registration_or_boot_id_is_refused(missing):
     with pytest.raises(ValueError):
         _node_left_delete_command(_payload(HOST_BOOT).model_copy(update={missing: ""}))
 

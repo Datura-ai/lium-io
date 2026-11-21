@@ -1875,12 +1875,15 @@ def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
     tells the two apart until the mount exists. It stays until the pod ends, as before this delete."""
     if not payload.executor_id or not payload.miner_hotkey:
         raise ValueError("the delete names no registration")
+    if not payload.expected_boot_id:
+        raise ValueError("the delete names no boot id")
     name = shlex.quote(payload.container_name)
     owner = shlex.quote(_executor_label(payload))
     found = f'{{{{.Id}}}} {{{{index .Config.Labels "{LIUM_EXECUTOR_ID_LABEL}"}}}}'
     lines = [
-        f'[ "$(cat /proc/sys/kernel/random/boot_id)" = {shlex.quote(payload.expected_boot_id)} ] '
-        f"|| exit {_NOT_THE_NODE_LEFT_EXIT}",
+        # an unreadable boot id is not this node's: the read must succeed and give a value before it is compared
+        f'boot=$(cat /proc/sys/kernel/random/boot_id) && [ -n "$boot" ] '
+        f'&& [ "$boot" = {shlex.quote(payload.expected_boot_id)} ] || exit {_NOT_THE_NODE_LEFT_EXIT}',
         f"found=$(/usr/bin/docker inspect --type container -f {shlex.quote(found)} {name} 2>/dev/null)",
         f'[ -z "$found" ] || [ "${{found#* }}" = {owner} ] || exit {_NOT_THE_NODE_LEFT_EXIT}',
         # removed by the ID that was checked: a container created under the same name after the check is not it
@@ -4100,15 +4103,14 @@ class DockerService:
                 # A container the earlier attempt already started (or one whose state cannot be read) is
                 # the renter's pod and is never removed: the conflict then fails as before.
                 if (
-                    not own_leftover_removed
-                    and pod_id is not None
-                    and inflight_creates.is_only_create(pod_id)
-                    and (
-                        f'"/{container_name}" is already in use' in str(exc)
-                        # the SDK's transport retry met the same name on another image (a flattened copy)
-                        or isinstance(exc, ContainerNameTakenOnRetry)
-                    )
+                    f'"/{container_name}" is already in use' in str(exc)
+                    # the SDK's transport retry met the same name on another image (a flattened copy)
+                    or isinstance(exc, ContainerNameTakenOnRetry)
                 ):
+                    # every same-name conflict is decided here: without the one checked removal (already spent, or
+                    # another create of the pod running) the container is kept, never left to a cleanup by name
+                    if own_leftover_removed or pod_id is None or not inflight_creates.is_only_create(pod_id):
+                        raise _SameNameContainerKept(str(exc)) from exc
                     leftover = await self._own_leftover_container(
                         docker_client, container_name, run_spec.labels.get(LIUM_EXECUTOR_ID_LABEL)
                     )
