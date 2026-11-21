@@ -182,6 +182,8 @@ class StorageOperationFiles:
     status: PurePosixPath
     cancel: PurePosixPath
     lock: PurePosixPath
+    start: PurePosixPath
+    part: PurePosixPath
 
     @classmethod
     def for_operation(cls, operation_id: UUID) -> StorageOperationFiles:
@@ -194,6 +196,10 @@ class StorageOperationFiles:
             cancel=REMOTE_CANCEL_DIRECTORY / f"{stem}.cancel",
             # one lock for every operation: each holder keeps it only for a check and a write
             lock=REMOTE_CANCEL_DIRECTORY / "launch.lock",
+            # the recorded process's start time: with the PID it names one process, never one that reused the PID
+            start=REMOTE_OPERATION_DIRECTORY / f"{stem}.start",
+            # the spec while the launch receives it; one name per operation, so a cut launch's copy is overwritten
+            part=REMOTE_OPERATION_DIRECTORY / f"{stem}.json.part",
         )
 
 
@@ -328,17 +334,11 @@ async def _start_storage_operation(
             # its helper; a second runner would interrupt it.
             # A helper whose runner died is an orphan: it is removed below and the run relaunched.
             return files
-        # This dispatch's spec goes to its own file; the launch command claims it under the node's launch lock,
-        # after it has checked the operation again and cleared a dead run's files and helper there, so another
-        # validator process's launch can never interleave with these steps (the checks above only return early).
-        claim = files.spec.with_name(f"{files.spec.name}.{uuid4().hex}")
-        async with ssh_client.start_sftp_client() as sftp:
-            async with sftp.open(str(claim), "w") as remote_spec:
-                await remote_spec.write(
-                    json.dumps(dict(spec), separators=(",", ":"), sort_keys=True)
-                )
-            await sftp.chmod(str(claim), 0o600)
-
+        # The spec (it holds the repository credentials) goes over the launch command's stdin and is written only
+        # under the node's launch lock, after the operation has been checked again there, to one file per operation
+        # that the launch's own exit, the next launch and the artifact cleanup all remove: a launch cut at any
+        # point leaves no copy under a name nothing cleans.
+        payload = json.dumps(dict(spec), separators=(",", ":"), sort_keys=True)
         runner = " ".join(
             shlex.quote(item)
             for item in [
@@ -380,16 +380,18 @@ async def _start_storage_operation(
             'wait "$child"; result=$?; '
             "else exec 8>&-; result=5; fi; "
             f"printf '%s\\n' \"$result\" > {shlex.quote(str(files.status))}; "
-            f"rm -f {shlex.quote(str(files.spec))} {pid_path}{terminal_cleanup}"
+            f"rm -f {shlex.quote(str(files.spec))} {pid_path} {shlex.quote(str(files.start))}{terminal_cleanup}"
         )
         # Under the launch lock (the cancel takes it too): refuse if a cancel has marked it, else
         # start the wrapper as its own process group and record that group before releasing the
         # lock, so a cancel that comes after always finds every process of the operation.
         # The wrapper must not inherit the held lock (9>&-).
-        claim_path = shlex.quote(str(claim))
+        part_path = shlex.quote(str(files.part))
+        start_path = shlex.quote(str(files.start))
         launch_command = (
             _owned_shell_function(files)
-            + f"trap 'rm -f {claim_path}' EXIT; "
+            # a cut session (HUP) or a kill ends the shell through its EXIT trap, which removes the partial spec
+            + f"trap 'rm -f {part_path}' EXIT; trap 'exit 1' HUP INT TERM PIPE; "
             f"command exec 9>>{lock_path} 2>/dev/null; flock -w 30 9 || exit 6; "
             f"if test -e {shlex.quote(str(files.cancel))}; then rm -f {shlex.quote(str(files.spec))}; exit 5; fi; "
             # another launch (this or another validator process) got there first: a live recorded wrapper (or a
@@ -398,18 +400,24 @@ async def _start_storage_operation(
             f"test -s {shlex.quote(str(files.status))} && exit 0; "
             f'if p=$(cat {pid_path} 2>/dev/null) && [ -n "$p" ] && owned "$p" '
             '&& { kill -0 -"$p" 2>/dev/null || kill -0 "$p" 2>/dev/null; }; then exit 0; fi; '
-            # nothing of the operation runs: a dead run's files and its orphaned helper go, then this spec is claimed
-            f"rm -f {' '.join(shlex.quote(str(path)) for path in (files.status, files.log, files.pid, files.spec))}; "
+            # nothing of the operation runs: a dead run's files and its orphaned helper go, then this spec is written
+            f"rm -f {' '.join(shlex.quote(str(path)) for path in (files.status, files.log, files.pid, files.start))} "
+            f"{shlex.quote(str(files.spec))}; "
             f"/usr/bin/docker rm -f -- {shlex.quote(storage_helper_name(operation_id))} >/dev/null 2>&1; "
-            f"mv {claim_path} {shlex.quote(str(files.spec))} || exit 8; "
+            # all of it or nothing: a session cut mid-transfer ends stdin early, and that spec must not run
+            f"{{ (umask 077; cat > {part_path}) && test \"$(wc -c < {part_path})\" -eq {len(payload.encode())}; }} || exit 9; "
+            f"mv {part_path} {shlex.quote(str(files.spec))} || exit 8; "
             f"setsid nohup /bin/sh -c {shlex.quote(wrapper)} "
             f"> {shlex.quote(str(files.log))} 2>&1 < /dev/null 9>&- & "
-            f"if ! printf '%s\\n' \"$!\" > {pid_path}; then "
+            # the start time first: a PID file is never there without the start time that names its process
+            "wrapper=$!; started_at=$(sed 's/.*) //' /proc/\"$wrapper\"/stat 2>/dev/null | cut -d' ' -f20); "
+            f"if ! {{ test -n \"$started_at\" && printf '%s\\n' \"$started_at\" > {start_path} "
+            f"&& printf '%s\\n' \"$wrapper\" > {pid_path}; }}; then "
             # the wrapper is still waiting for this lock, so nothing of the operation has run yet
-            'kill -KILL -"$!" 2>/dev/null; '
-            f"rm -f {shlex.quote(str(files.spec))} {pid_path}; exit 7; fi"
+            'kill -KILL -"$wrapper" 2>/dev/null; '
+            f"rm -f {shlex.quote(str(files.spec))} {pid_path} {start_path}; exit 7; fi"
         )
-        launched = await ssh_client.run(launch_command, check=False)
+        launched = await ssh_client.run(launch_command, check=False, input=payload)
         if launched.exit_status == 5:
             raise StorageOperationCancelledBeforeLaunch("storage operation was cancelled before launch")
         if launched.exit_status != 0:
@@ -513,7 +521,9 @@ async def cancel_storage_operation(
         # the bounded wait so other operations' launches never queue behind this one
         f"pid=$(cat {pid_path} 2>/dev/null); exec 9>&-; "
         "case \"$pid\" in (*[!0-9]*) exit 2;; esac; "
-        # a recorded PID the host has since given to another process is not signalled; only the helper is removed
+        # a recorded PID the host has since given to another process is not signalled; only the helper is removed.
+        # A signal needs the recorded start time to match (`started`): a PID recorded without one (before this
+        # release) is only waited for, as its runner stops on the marker itself
         'if test -n "$pid" && owned "$pid"; then '
         # an operation launched before process groups recorded its runner's PID, which leads no group; owned is
         # checked again before every signal, as the PID can be reused while this waits
@@ -522,8 +532,8 @@ async def cancel_storage_operation(
         "sleep 0.25; attempt=$((attempt + 1)); done; "
         'if alive; then '
         f"/usr/bin/docker stop --time 5 {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
-        'owned "$pid" && { kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null; }; sleep 2; '
-        'if alive; then kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true; '
+        'started "$pid" && { kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null; }; sleep 2; '
+        'if alive && started "$pid"; then kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true; '
         'attempt=0; while alive && test "$attempt" -lt 20; do '
         "sleep 0.1; attempt=$((attempt + 1)); done; fi; "
         # the stopped helper still holds the repository credentials; remove it, not just stop it
@@ -564,14 +574,24 @@ async def _read_operation_spec(
 
 
 def _owned_shell_function(files: StorageOperationFiles) -> str:
-    """Shell `owned PID`: the PID is still this operation's process, not one the host reused for another.
+    """Shell `started PID` and `owned PID`.
 
-    Every process of the operation (the wrapper, and a runner recorded before process groups) carries the
-    operation's spec path on its command line. A PID with no process is owned too: Linux does not reuse a PID
-    while a process group of that ID is alive, so a group found under it is still the operation's."""
+    `started`: the PID's process started at the time the launch recorded with it, so it is the process the launch
+    started and not one the host gave the PID to since. Only this allows a signal.
+
+    `owned`: the PID is still the operation's for a state read or a launch's check. A PID with no process is owned:
+    Linux does not reuse a PID while a process group of that ID is alive, so a group found under it is still the
+    operation's. With a recorded start time it must match; a PID recorded without one (before this release) is
+    owned while its command line carries the operation's spec path, as every process of the operation does."""
+    start = shlex.quote(str(files.start))
     return (
-        'owned() { test ! -e /proc/"$1" || '
-        f"tr '\\000' ' ' < /proc/\"$1\"/cmdline 2>/dev/null | grep -qF -- {shlex.quote(str(files.spec))}; }}; "
+        f'started() {{ s=$(cat {start} 2>/dev/null) && test -n "$s" '
+        "&& test \"$(sed 's/.*) //' /proc/\"$1\"/stat 2>/dev/null | cut -d' ' -f20)\" = \"$s\"; }; "
+        'owned() { test ! -e /proc/"$1" || started "$1" || { ! test -s '
+        + start
+        + " && tr '\\000' ' ' < /proc/\"$1\"/cmdline 2>/dev/null | grep -qF -- "
+        + shlex.quote(str(files.spec))
+        + "; }; }; "
     )
 
 
@@ -618,7 +638,7 @@ async def _remove_operation_artifacts(
             shlex.quote(str(path))
             # the cancel marker stays: the operation id is never reused, and a late launch must see it
             # shortcut: one empty marker per cancelled operation stays on the reserve volume; sweep old ones if they pile up
-            for path in (files.status, files.log, files.pid, files.spec)
+            for path in (files.status, files.log, files.pid, files.start, files.spec, files.part)
         ),
         check=False,
     )

@@ -33,6 +33,16 @@ def _spawn_runner(spec_path: object) -> int:
     return int(spawned.stdout)
 
 
+def _record_runner(directory: Path, pid: int) -> None:
+    """The PID and start time as a launch records them."""
+    (directory / f"{OPERATION_ID}.start").write_text(_start_time(pid) + "\n")
+    (directory / f"{OPERATION_ID}.pid").write_text(f"{pid}\n")
+
+
+def _start_time(pid: int) -> str:
+    return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("runner_alive", [True, False])
 async def test_cancel_fallback_removes_the_helper_container(
@@ -48,12 +58,12 @@ async def test_cancel_fallback_removes_the_helper_container(
     runner_pid = None
     if runner_alive:
         runner_pid = _spawn_runner(storage_operations.StorageOperationFiles.for_operation(OPERATION_ID).spec)
-        (tmp_path / f"{OPERATION_ID}.pid").write_text(str(runner_pid))
+        _record_runner(tmp_path, runner_pid)
 
-    async def run_locally(command: str, check: bool = False) -> SimpleNamespace:
+    async def run_locally(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
         # the remote path is fixed; point it at the fake and shorten the bounded wait
         command = command.replace("/usr/bin/docker", str(fake_docker)).replace("sleep 0.25", "sleep 0.01")
-        result = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
+        result = subprocess.run(["sh", "-c", command], capture_output=True, text=True, input=input)
         return SimpleNamespace(exit_status=result.returncode, stdout=result.stdout, stderr=result.stderr)
 
     ssh_client = SimpleNamespace(run=run_locally)
@@ -82,17 +92,17 @@ async def test_a_cancel_that_cannot_write_its_marker_still_stops_the_runner_then
     fake_docker.write_text(f'#!/bin/sh\necho "$*" >> {docker_log}\n')
     fake_docker.chmod(0o755)
     runner_pid = _spawn_runner(storage_operations.StorageOperationFiles.for_operation(OPERATION_ID).spec)
-    (tmp_path / f"{OPERATION_ID}.pid").write_text(str(runner_pid))
+    _record_runner(tmp_path, runner_pid)
     if failing_step == "lock_open":
         # the lock file cannot be opened at all (a directory in its place): the open itself fails in the shell
         Path(storage_operations.StorageOperationFiles.for_operation(OPERATION_ID).lock).mkdir(parents=True)
 
-    async def run_locally(command: str, check: bool = False) -> SimpleNamespace:
+    async def run_locally(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
         # a full or read-only filesystem: the marker write fails
         command = command.replace("/usr/bin/docker", str(fake_docker)).replace("sleep 0.25", "sleep 0.01")
         if failing_step == "marker":
             command = command.replace("touch ", "false ")
-        result = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
+        result = subprocess.run(["sh", "-c", command], capture_output=True, text=True, input=input)
         return SimpleNamespace(exit_status=result.returncode, stdout=result.stdout, stderr=result.stderr)
 
     try:
@@ -127,7 +137,7 @@ async def test_a_repeated_dispatch_never_starts_a_second_runner(
     monkeypatch.setattr(storage_operations.asyncio, "sleep", AsyncMock())
     commands: list[str] = []
 
-    async def run(command: str, check: bool = False) -> SimpleNamespace:
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
         commands.append(command)
         stdout = ""
         status = 1 if command.startswith("test -e") else 0
@@ -137,23 +147,18 @@ async def test_a_repeated_dispatch_never_starts_a_second_runner(
             status = 0 if runner_alive else 1
         return SimpleNamespace(exit_status=status, stdout=stdout, stderr="")
 
-    ssh_client = SimpleNamespace(run=run, start_sftp_client=None)
-    if runner_alive:
-        files = await storage_operations.start_storage_operation(
-            ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
-        )
-        assert files == storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
-    else:
-        monkeypatch.setattr(storage_operations, "report_launch_failure", AsyncMock())
-        with pytest.raises(TypeError):  # stops at the sftp spec write
-            await storage_operations.start_storage_operation(
-                ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
-            )
+    ssh_client = SimpleNamespace(run=run)
+    files = await storage_operations.start_storage_operation(
+        ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+    )
+    assert files == storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
     probe = next(c for c in commands if c.startswith("pgrep -f"))
     assert f"[-]-spec {storage_operations.StorageOperationFiles.for_operation(OPERATION_ID).spec}" in probe
-    # a dead run's helper is removed only under the launch lock, in the launch command itself
-    assert not any("docker rm -f" in c for c in commands)
-    assert any("nohup" in c for c in commands) is False  # never launched a second wrapper
+    launches = [c for c in commands if "nohup" in c]
+    # a live runner gets no second wrapper; a dead run is relaunched once, its helper removed only under the
+    # launch lock, in the launch command itself
+    assert len(launches) == (0 if runner_alive else 1)
+    assert not any("docker rm -f" in c for c in commands if "nohup" not in c)
 
 
 @pytest.mark.asyncio
@@ -168,8 +173,8 @@ async def test_a_cancel_reports_with_the_reporter_the_runner_left_in_its_spec(
     spec = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID).spec
     spec.write_text(json.dumps({"reporter": reporter}))
 
-    async def run_locally(command: str, check: bool = False) -> SimpleNamespace:
-        result = subprocess.run(["sh", "-c", command.replace("/usr/bin/docker", "true")], capture_output=True, text=True)
+    async def run_locally(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        result = subprocess.run(["sh", "-c", command.replace("/usr/bin/docker", "true")], capture_output=True, text=True, input=input)
         return SimpleNamespace(exit_status=result.returncode, stdout=result.stdout, stderr=result.stderr)
 
     await storage_operations.cancel_storage_operation(SimpleNamespace(run=run_locally), OPERATION_ID)
@@ -193,10 +198,10 @@ def test_detached_wrapper_keeps_the_log_only_when_the_runner_fails(
     monkeypatch.setattr(storage_operations, "REMOTE_RUNNER_PATH", str(runner))
     launched: list[str] = []
 
-    async def run(command: str, check: bool = False) -> SimpleNamespace:
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
         if "nohup" in command:
             launched.append(command)
-        done = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
+        done = subprocess.run(["sh", "-c", command], capture_output=True, text=True, input=input)
         return SimpleNamespace(exit_status=done.returncode, stdout=done.stdout, stderr=done.stderr)
 
     class Sftp:
@@ -258,11 +263,11 @@ async def test_a_launch_that_reaches_the_node_after_its_cancel_never_runs(
     monkeypatch.setattr(storage_operations, "report_launch_failure", launch_failure)
     launched: list[str] = []
 
-    async def run(command: str, check: bool = False) -> SimpleNamespace:
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
         if command.startswith("nohup"):
             launched.append(command)
             return SimpleNamespace(exit_status=0, stdout="", stderr="")
-        done = subprocess.run(["sh", "-c", command.replace("/usr/bin/docker", "true")], capture_output=True, text=True)
+        done = subprocess.run(["sh", "-c", command.replace("/usr/bin/docker", "true")], capture_output=True, text=True, input=input)
         return SimpleNamespace(exit_status=done.returncode, stdout=done.stdout, stderr=done.stderr)
 
     ssh_client = SimpleNamespace(run=run, start_sftp_client=None)
@@ -279,9 +284,9 @@ async def test_a_launch_that_reaches_the_node_after_its_cancel_never_runs(
 
 
 def _local_ssh(fake_docker: str = "true"):
-    async def run(command: str, check: bool = False) -> SimpleNamespace:
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
         command = command.replace("/usr/bin/docker", fake_docker).replace("sleep 0.25", "sleep 0.01")
-        done = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
+        done = subprocess.run(["sh", "-c", command], capture_output=True, text=True, input=input)
         return SimpleNamespace(exit_status=done.returncode, stdout=done.stdout, stderr=done.stderr)
 
     class Sftp:
@@ -326,10 +331,10 @@ async def test_a_cancel_between_the_launch_check_and_its_start_stops_the_launch(
     local = _local_ssh()
     files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
 
-    async def run(command: str, check: bool = False) -> SimpleNamespace:
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
         if "nohup" in command:
             await storage_operations.cancel_storage_operation(local, OPERATION_ID)
-        return await local.run(command, check)
+        return await local.run(command, check, input)
 
     with pytest.raises(storage_operations.StorageOperationCancelledBeforeLaunch):
         await storage_operations.start_storage_operation(
@@ -392,11 +397,11 @@ async def test_a_cancel_before_a_slow_wrapper_starts_its_runner_leaves_nothing_r
     local = _local_ssh()
     files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
 
-    async def run(command: str, check: bool = False) -> SimpleNamespace:
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
         if "nohup" in command:
             assert "exec 8>>" in command
             command = command.replace("exec 8>>", "sleep 1; exec 8>>", 1)
-        return await local.run(command, check)
+        return await local.run(command, check, input)
 
     await storage_operations.start_storage_operation(
         SimpleNamespace(run=run, start_sftp_client=local.start_sftp_client),
@@ -435,12 +440,12 @@ async def test_a_cancel_cannot_mark_the_operation_between_the_wrapper_check_and_
     runner.chmod(0o755)
     monkeypatch.setattr(storage_operations, "REMOTE_RUNNER_PATH", str(runner))
 
-    async def run(command: str, check: bool = False) -> SimpleNamespace:
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
         if "nohup" in command:
             runner_start = f"sh {runner} --spec"
             assert command.count(runner_start) == 1
             command = command.replace(runner_start, "sleep 1; " + runner_start)
-        return await local.run(command, check)
+        return await local.run(command, check, input)
 
     await storage_operations.start_storage_operation(
         SimpleNamespace(run=run, start_sftp_client=local.start_sftp_client),
@@ -477,13 +482,13 @@ async def test_a_wrapper_whose_pid_was_not_recorded_never_starts_the_runner(
     local = _local_ssh()
     files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
 
-    async def run(command: str, check: bool = False) -> SimpleNamespace:
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
         if "nohup" in command:
             # the PID write fails (its path is a directory) and setsid runs only after the launcher has given up
             Path(str(files.pid)).mkdir(parents=True, exist_ok=True)
             assert command.count("setsid nohup ") == 1
             command = command.replace("setsid nohup ", "sh -c 'sleep 0.5; exec \"$0\" \"$@\"' setsid nohup ")
-        return await local.run(command, check)
+        return await local.run(command, check, input)
 
     with pytest.raises(storage_operations.StorageOperationLaunchError):
         await storage_operations.start_storage_operation(
@@ -515,10 +520,10 @@ async def test_a_repeated_dispatch_racing_the_first_launch_leaves_it_running(
     starts = _counting_runner(monkeypatch, tmp_path)
     local = _local_ssh()
 
-    async def run(command: str, check: bool = False) -> SimpleNamespace:
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
         await asyncio.sleep(0)  # interleave the two dispatches at every host command
         # the wrapper starts late, as over a slow connection: the repeat's launch lands before it takes the lock
-        return await local.run(command.replace("exec 8>>", "sleep 0.5; exec 8>>"), check)
+        return await local.run(command.replace("exec 8>>", "sleep 0.5; exec 8>>"), check, input)
 
     ssh_client = SimpleNamespace(run=run, start_sftp_client=local.start_sftp_client)
     launches = [
@@ -569,11 +574,11 @@ async def test_a_wrapper_whose_record_another_launch_replaced_touches_nothing(
     files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
     other = "999999"
 
-    async def run(command: str, check: bool = False) -> SimpleNamespace:
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
         if "nohup" not in command:
-            return await local.run(command, check)
+            return await local.run(command, check, input)
         # the wrapper starts late; the other launch's record lands first
-        done = await local.run(command.replace("exec 8>>", "sleep 0.5; exec 8>>"), check)
+        done = await local.run(command.replace("exec 8>>", "sleep 0.5; exec 8>>"), check, input)
         Path(str(files.pid)).write_text(f"{other}\n")
         return done
 
@@ -590,22 +595,27 @@ async def test_a_wrapper_whose_record_another_launch_replaced_touches_nothing(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("carries_spec_path", [False, True])
 async def test_a_cancel_leaves_a_process_that_reused_the_recorded_pid_alone(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, carries_spec_path: bool
 ) -> None:
-    # the wrapper was killed before removing its PID file and the host gave that PID to an unrelated group leader
+    # the wrapper was killed before removing its PID file and the host gave that PID to an unrelated group leader,
+    # also one whose command line happens to carry the spec path: its start time is not the recorded one
     monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
     monkeypatch.setattr(storage_operations, "_report_cancelled", AsyncMock(return_value=True))
     docker_log = tmp_path / "docker.log"
     fake_docker = tmp_path / "docker"
     fake_docker.write_text(f'#!/bin/sh\necho "$*" >> {docker_log}\n')
     fake_docker.chmod(0o755)
-    unrelated = subprocess.Popen(["setsid", "sleep", "60"])
+    spec = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID).spec
+    unrelated = subprocess.Popen(["setsid", "sh", "-c", f"sleep 60; : {spec}"] if carries_spec_path else ["setsid", "sleep", "60"])
     (tmp_path / f"{OPERATION_ID}.pid").write_text(str(unrelated.pid))
+    if carries_spec_path:
+        (tmp_path / f"{OPERATION_ID}.start").write_text(str(int(_start_time(unrelated.pid)) + 1) + "\n")
 
-    async def run_locally(command: str, check: bool = False) -> SimpleNamespace:
+    async def run_locally(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
         command = command.replace("/usr/bin/docker", str(fake_docker)).replace("sleep 0.25", "sleep 0.01")
-        result = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
+        result = subprocess.run(["sh", "-c", command], capture_output=True, text=True, input=input)
         return SimpleNamespace(exit_status=result.returncode, stdout=result.stdout, stderr=result.stderr)
 
     try:
@@ -639,12 +649,12 @@ async def test_two_validator_processes_launching_one_operation_start_one_runner(
             else:
                 second_checked.set()
 
-        async def run(command: str, check: bool = False) -> SimpleNamespace:
+        async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
             if not (command.startswith(read_only) or "echo STARTING" in command):
                 await gate()
                 if not first:
                     await first_launched.wait()
-            result = await local.run(command, check)
+            result = await local.run(command, check, input)
             if first and "setsid nohup" in command:
                 await asyncio.sleep(0.2)  # the first wrapper has taken the lock and started its runner
                 first_launched.set()
@@ -681,3 +691,97 @@ async def test_two_validator_processes_launching_one_operation_start_one_runner(
     assert starts.read_text() == "x\n"
     assert Path(str(files.status)).read_text().strip() == "0"
     assert not list(Path(str(files.spec)).parent.glob(f"{Path(str(files.spec)).name}.*"))
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_never_signals_a_pid_recorded_without_its_start_time(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # a PID file from before start times were recorded: only waited for (a real runner stops on the marker),
+    # the helper removed, and the cancel fails while that process still runs
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    monkeypatch.setattr(storage_operations, "_report_cancelled", AsyncMock(return_value=True))
+    docker_log = tmp_path / "docker.log"
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text(f'#!/bin/sh\necho "$*" >> {docker_log}\n')
+    fake_docker.chmod(0o755)
+    runner_pid = _spawn_runner(storage_operations.StorageOperationFiles.for_operation(OPERATION_ID).spec)
+    (tmp_path / f"{OPERATION_ID}.pid").write_text(str(runner_pid))
+    local = _local_ssh(str(fake_docker))
+    try:
+        with pytest.raises(storage_operations.StorageOperationLaunchError):
+            await storage_operations.cancel_storage_operation(local, OPERATION_ID)
+        assert subprocess.run(["kill", "-0", str(runner_pid)], capture_output=True).returncode == 0
+    finally:
+        subprocess.run(["kill", "-KILL", str(runner_pid)], capture_output=True)
+    helper = f"lium-storage-{str(OPERATION_ID)[:12]}"
+    assert docker_log.read_text().splitlines() == [f"stop --time 5 {helper}", f"rm -f -- {helper}"]
+
+
+def _patch_launch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", storage_operations.PurePosixPath(str(tmp_path / "ops")))
+    monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
+    monkeypatch.setattr(storage_operations, "report_launch_failure", AsyncMock())
+    started = tmp_path / "runner-started"
+    runner = tmp_path / "runner"
+    runner.write_text(f"#!/bin/sh\ntouch {started}\n")
+    runner.chmod(0o755)
+    monkeypatch.setattr(storage_operations, "REMOTE_RUNNER_PATH", str(runner))
+    return started
+
+
+@pytest.mark.asyncio
+async def test_a_launch_whose_spec_arrives_cut_short_runs_nothing_and_leaves_no_copy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    started = _patch_launch(monkeypatch, tmp_path)
+    local = _local_ssh()
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        # the session drops mid-transfer: stdin ends early
+        return await local.run(command, check, input[:-3] if input else input)
+
+    with pytest.raises(storage_operations.StorageOperationLaunchError, match="exit 9"):
+        await storage_operations.start_storage_operation(
+            SimpleNamespace(run=run), "sh", OPERATION_ID, {"engine": "restic", "password": "secret"},
+            retain_terminal_artifacts=False,
+        )
+    await asyncio.sleep(0.2)
+    assert not started.exists()
+    assert sorted(p.name for p in Path(str(files.spec)).parent.iterdir()) == []
+
+
+def test_a_launch_cut_by_a_hangup_while_receiving_its_spec_removes_the_partial_copy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    started = _patch_launch(monkeypatch, tmp_path)
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    Path(str(files.spec)).parent.mkdir(parents=True)
+    Path(str(files.lock)).parent.mkdir(parents=True)
+    commands: list[str] = []
+
+    async def capture(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        commands.append(command)
+        # nothing there yet (no marker, no runner); the launch command itself is only captured
+        failed = "nohup" in command or command.startswith(("test -e", "pgrep"))
+        return SimpleNamespace(exit_status=1 if failed else 0, stdout="", stderr="")
+
+    with pytest.raises(storage_operations.StorageOperationLaunchError):
+        asyncio.run(storage_operations.start_storage_operation(
+            SimpleNamespace(run=capture), "sh", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+        ))
+    launch = next(c for c in commands if "nohup" in c)
+    shell = subprocess.Popen(["sh", "-c", launch], stdin=subprocess.PIPE, start_new_session=True)
+    shell.stdin.write(b'{"engine":')
+    shell.stdin.flush()
+    part = Path(str(files.part))
+    for _ in range(100):
+        if part.exists():
+            break
+        time.sleep(0.02)
+    assert part.exists()
+    os.killpg(shell.pid, 1)  # the session's hangup reaches the whole command
+    assert shell.wait(timeout=10) != 0
+    assert not part.exists() and not Path(str(files.spec)).exists()
+    assert not started.exists()
