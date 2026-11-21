@@ -36,6 +36,7 @@ from services.docker_service import (
     VolumeMinSizeError,
     _LIUM_CIPHER_MOUNT,
     _build_gocryptfs_setup_and_mount_script,
+    _docker_root_dir_shell,
     _is_docker_container_removal_in_progress_error,
     _is_docker_read_timeout_error,
     _is_docker_volume_in_use_error,
@@ -6844,7 +6845,7 @@ async def test_repair_stale_vloopback_mountpoint_uses_rmdir_helper(docker_servic
 
     assert repaired is True
     commands = _vloopback_repair_commands(ssh_client)
-    assert commands[2] == "/usr/bin/docker info --format '{{.DockerRootDir}}'"
+    assert commands[2] == _docker_root_dir_shell() + "printf '%s\\n' \"$root\""
     assert commands[3] == (
         "/usr/bin/findmnt /var/lib/docker/plugins/plugin123/propagated-mount/volume_test "
         ">/dev/null 2>&1"

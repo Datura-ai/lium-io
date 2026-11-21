@@ -91,6 +91,10 @@ def plugin():
     identity = "b" * 64 if state.get("enable_switch_id") and state.get("enabled") else plugin_id
     return {"Id": identity, "Enabled": state.get("enabled", False), "Settings": {"Env": env}}
 
+if state.get(action + "_stderr"):
+    print(state[action + "_stderr"], file=sys.stderr)
+if action == "install" and state.get("install_leaves_nothing"):
+    sys.exit(1)
 if action == "install":
     time.sleep(state.get("install_delay", 0))
     state["installed"] = True
@@ -386,7 +390,7 @@ def test_setup_removes_a_probe_container_its_timeout_cut_off_before_its_volume(t
     state = json.loads((tmp_path / "state.json").read_text())
     for result in results:
         assert result.returncode == 1
-        assert "probe volume failed: TimeoutExpired" in result.stderr
+        assert "docker run --rm timed out" in result.stderr
         assert "could not be disabled" not in result.stderr
     assert state["containers"] == []
     assert state["enabled"] is False
@@ -519,7 +523,7 @@ def test_setup_whose_install_took_most_of_the_deadline_reports_a_hung_disable_in
     # Assert: every disable try ran and both reasons reached stderr before the deadline
     assert time.monotonic() - started < deadline_seconds
     assert result.returncode == 1
-    assert "probe volume failed: TimeoutExpired" in result.stderr
+    assert "docker run --rm timed out" in result.stderr
     assert "could not be disabled" in result.stderr
     assert sum(call[1] == "disable" for call in _plugin_calls(tmp_path)) == 3
     assert not (tmp_path / "probe-ok").exists()
@@ -587,7 +591,7 @@ def test_setup_reports_a_probe_that_ran_out_of_its_budget_and_a_disable_that_hun
 
     # Assert
     assert result.returncode == 1
-    assert "probe volume failed: TimeoutExpired" in result.stderr
+    assert "docker run --rm timed out" in result.stderr
     assert "could not be disabled" in result.stderr
     assert not (tmp_path / "probe-ok").exists()
 
@@ -607,7 +611,7 @@ def test_setup_cut_short_by_the_validators_deadline_says_so_on_stderr(tmp_path: 
 
     # Assert
     assert process.returncode == 1
-    assert "setup cut short by the validator's deadline" in stderr
+    assert "setup cut short by the validator's deadline during docker run --rm" in stderr
     assert not (tmp_path / "probe-ok").exists()
 
 @pytest.mark.asyncio
@@ -658,3 +662,31 @@ async def test_setup_command_quotes_the_root_and_never_installs_a_digest(alias, 
     assert args[4:8] == [alias, tag, digest, generation]
     assert args[8] == ("" if generation == "v2" else "docker.io/library/alpine:3.19")
     assert "sha256" not in tag
+
+
+@pytest.mark.parametrize(
+    "overrides, reason",
+    [
+        (
+            {"install_leaves_nothing": True,
+             "install_stderr": "Error response from daemon: Get https://bot:hunter2@registry.example/v2/:\n  unauthorized"},
+            "installation did not produce a plugin: Error response from daemon: "
+            "Get https://registry.example/v2/: unauthorized",
+        ),
+        (
+            {"enable_exit": 1, "enable_stderr": "Error response from daemon: dial unix plugin.sock: connect refused"},
+            "verified plugin remains disabled: Error response from daemon: dial unix plugin.sock: connect refused",
+        ),
+    ],
+)
+def test_setup_failure_carries_docker_s_own_reason_without_credentials(tmp_path: Path, overrides, reason) -> None:
+    # Arrange
+    arguments = _setup_arguments(tmp_path, overrides)
+
+    # Act
+    result = subprocess.run(arguments, capture_output=True, text=True, timeout=20)
+
+    # Assert
+    assert result.returncode == 1
+    assert result.stderr.strip() == reason
+    assert "hunter2" not in result.stderr
