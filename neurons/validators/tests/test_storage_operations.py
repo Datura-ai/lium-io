@@ -981,3 +981,31 @@ async def test_a_cancel_fails_while_an_earlier_release_wrapper_runs_without_a_pi
         assert docker_log.read_text().splitlines() == [f"stop --time 5 {helper}", f"rm -f -- {helper}"]
     finally:
         wrapper.kill()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spec_on_node", [False, True])
+async def test_a_cancel_confirms_with_the_requests_reporter_only_when_the_node_holds_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, spec_on_node: bool
+) -> None:
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    report = AsyncMock(return_value=True)
+    monkeypatch.setattr(storage_operations, "_report_cancelled", report)
+    on_node = {"api_url": "https://api.example", "auth_token": "node", "resource": "restore"}
+    requested = {"api_url": "https://api.example", "auth_token": "request", "resource": "backup"}
+    if spec_on_node:
+        storage_operations.StorageOperationFiles.for_operation(OPERATION_ID).spec.write_text(
+            json.dumps({"reporter": on_node})
+        )
+    # nothing launched on the node yet: the cancel has nothing to wait for
+    monkeypatch.setattr(storage_operations, "REMOTE_RUNNER_PATH", str(tmp_path / "runner"))
+    (tmp_path / "runner").write_text(str(storage_operations.REMOTE_CANCEL_DIRECTORY))
+
+    async def run_locally(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        command = command.replace("/usr/bin/docker", "true").replace("sleep 0.25", "sleep 0.01")
+        result = subprocess.run(["sh", "-c", command], capture_output=True, text=True, input=input)
+        return SimpleNamespace(exit_status=result.returncode, stdout=result.stdout, stderr=result.stderr)
+
+    await storage_operations.cancel_storage_operation(SimpleNamespace(run=run_locally), OPERATION_ID, requested)
+
+    report.assert_awaited_once_with(OPERATION_ID, {"reporter": on_node if spec_on_node else requested})

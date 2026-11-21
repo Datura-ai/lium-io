@@ -561,6 +561,9 @@ class RestoreContainerRequest(ContainerBaseRequest):
 class CancelStorageOperationRequest(ContainerBaseRequest):
     message_type: ContainerRequestType = ContainerRequestType.CancelStorageOperationRequest
     operation_id: str
+    # lium_protocol 2.17.0: the operation's reporter, so the cancel is confirmed even with no spec on the node
+    auth_token: str | None = Field(default=None, repr=False)
+    resource: Literal["backup", "restore"] | None = None
 
 
 ##############################################################

@@ -1926,7 +1926,16 @@ class MinerService:
             client_keys=[pkey],
             known_hosts=await _storage_known_hosts(docker_service, executor_info, payload),
         ) as ssh_client:
-            await cancel_storage_operation(ssh_client, UUID(payload.operation_id))
+            reporter = (
+                {
+                    "api_url": settings.COMPUTE_REST_API_URL_EXTERNAL,
+                    "auth_token": payload.auth_token,
+                    "resource": payload.resource,
+                }
+                if payload.auth_token and payload.resource
+                else None
+            )
+            await cancel_storage_operation(ssh_client, UUID(payload.operation_id), reporter)
             await forget_storage_helper(
                 self.redis_service, executor_info.uuid, payload.operation_id
             )
