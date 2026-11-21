@@ -369,12 +369,13 @@ async def _start_storage_operation(
         # lock until the runner has started (the runner does not inherit it), so a cancel's marker
         # either stops the runner here or comes after it started, as for any running operation.
         wrapper = (
-            f"rm -f {shlex.quote(str(files.status))}; "
             f"exec 8>>{lock_path}; "
-            # and only when the launch recorded this wrapper as the operation's process group: a wrapper whose PID
-            # write failed is one no cancel could find, so it never starts the runner
-            f"if flock -w 30 8 && ! test -e {shlex.quote(str(files.cancel))} "
-            f'&& [ "$(cat {pid_path} 2>/dev/null)" = "$$" ]; then '
+            "flock -w 30 8 && locked=1; "
+            # only the wrapper the launch recorded as the operation's process group owns its files: one whose PID
+            # write failed, or that another launch's record replaced, writes, removes and starts nothing
+            f'[ "$(cat {pid_path} 2>/dev/null)" = "$$" ] || exit 0; '
+            f"rm -f {shlex.quote(str(files.status))}; "
+            f'if [ -n "$locked" ] && ! test -e {shlex.quote(str(files.cancel))}; then '
             f"{runner} 8>&- & child=$!; "
             "trap 'kill -TERM \"$child\" 2>/dev/null || true' TERM INT; exec 8>&-; "
             'wait "$child"; result=$?; '

@@ -546,3 +546,34 @@ def test_a_launch_finding_a_live_recorded_wrapper_rewrites_nothing(
         assert Path(str(files.pid)).read_text().strip() == str(live.pid)
     finally:
         live.kill()
+
+
+@pytest.mark.asyncio
+async def test_a_wrapper_whose_record_another_launch_replaced_touches_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # another launch recorded its own wrapper after this one was started: the replaced wrapper must leave the
+    # operation's PID, spec and status to the recorded one, and start no runner
+    starts = _counting_runner(monkeypatch, tmp_path)
+    local = _local_ssh()
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    other = "999999"
+
+    async def run(command: str, check: bool = False) -> SimpleNamespace:
+        if "nohup" not in command:
+            return await local.run(command, check)
+        # the wrapper starts late; the other launch's record lands first
+        done = await local.run(command.replace("exec 8>>", "sleep 0.5; exec 8>>"), check)
+        Path(str(files.pid)).write_text(f"{other}\n")
+        return done
+
+    await storage_operations._start_storage_operation(
+        SimpleNamespace(run=run, start_sftp_client=local.start_sftp_client),
+        "sh", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=True,
+    )
+    await asyncio.sleep(1.0)
+
+    assert not starts.exists()
+    assert Path(str(files.pid)).read_text().strip() == other
+    assert Path(str(files.spec)).exists()
+    assert not Path(str(files.status)).exists()
