@@ -24,6 +24,9 @@ permissions:
 
 jobs:
   check:
+    # GitHub runs a ruleset workflow on pull_request in a repository other than its source (lium) only when the job has a
+    # condition (docs: Troubleshooting rules, Supported directory); this one is always true
+    if: true
     name: pinned-actions  # carries the ruleset's up-to-date (strict) rule only; trust comes from the required run itself
     runs-on: ubuntu-24.04  # its /usr/bin/python3 ships the distro PyYAML the check imports below
     steps:

@@ -88,9 +88,21 @@ and `lium`, workflow `.github/workflows/pinned-actions.yml` from `Datura-ai/lium
 runs main's copy on every PR and every queued group, whatever the candidate changes in its own workflow files. The rule
 exists at organization level only, so an organization owner applies it:
 
+Apply it in evaluate mode first, so a run that never reports cannot block every PR. Then confirm that the required run
+reports on a PR in `lium`, the repository that is not the workflow's source: GitHub runs a ruleset workflow on
+`pull_request` there only because the job has a condition (`if: true` in the workflow; GitHub's "Troubleshooting rules",
+Supported directory). Activate the ruleset only after that:
+
 ```bash
-gh api "orgs/Datura-ai/rulesets" --method POST --input .github/rulesets/pinned-actions-required-workflow.json
+jq '.enforcement = "evaluate"' .github/rulesets/pinned-actions-required-workflow.json |
+  gh api "orgs/Datura-ai/rulesets" --method POST --input -
+# open a test PR in Datura-ai/lium: its checks must list pinned-actions from Datura-ai/lium-io, with a result
+id=$(gh api "orgs/Datura-ai/rulesets" --jq '.[]|select(.name=="pinned-actions-required-workflow")|.id')
+gh api "orgs/Datura-ai/rulesets/$id" --method PUT --input .github/rulesets/pinned-actions-required-workflow.json
 ```
+
+If the organization's plan has no evaluate mode, the POST refuses it. Apply the file as it is and check a `lium` test PR
+straight away. If no pinned-actions result appears there, set the ruleset's enforcement to `disabled` until it does.
 
 Check: `gh api "orgs/Datura-ai/rulesets" --jq '.[]|.name+" "+.enforcement'` → `pinned-actions-required-workflow active`.
 
