@@ -312,7 +312,8 @@ jobs:
               "jobs:\n  a:\n    container:\n      image: false\n": 1,
               "jobs:\n  a:\n    services:\n      db: 0\n": 1,
               "jobs:\n  a:\n    services:\n      db:\n        image: 0\n": 1,
-              "jobs:\n  a:\n    services: ${{ fromJSON(vars.S) }}\n": 1,
+              # \x24 spells the dollar sign: a literal dollar-brace-brace here is evaluated by Actions and breaks the template
+              "jobs:\n  a:\n    services: \x24{{ fromJSON(vars.S) }}\n": 1,
               "jobs: x\n": 1,
               "jobs:\n  a: x\n": 1,
               "jobs:\n  a:\n    steps: x\n": 1,
