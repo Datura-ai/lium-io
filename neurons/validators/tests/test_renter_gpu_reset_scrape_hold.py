@@ -22,6 +22,7 @@ from services.executor_rollout import (
     ExecutorRolloutTracker,
     carry_renter_gpu_reset_results,
     remember_rented_scored_results,
+    rollout_grace_reason,
     session_kept_hotkeys,
 )
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, renter_gpu_reset_recent
@@ -44,7 +45,7 @@ from services.ssh_service import SSHService
 from services.task.models import build_msg
 from test_executor_rollout_grace import _failed, _scored, _validator_process
 from neurons.validators.src.services.task.messages import GpuFingerprintMessages as FingerprintMsg
-from services.task.messages import VerifyXMessages
+from services.task.messages import ZEROED_BEFORE_THE_BUDGET_STOP, ExecutorImageMessages, VerifyXMessages
 from test_rented_host_gpu_fault_reset import (
     ENCRYPT_KEY,
     EXECUTOR,
@@ -562,11 +563,60 @@ async def test_a_budget_stop_after_a_check_zeroed_the_score_keeps_that_failure(c
 
     if earlier_gate:
         [published] = kept["5Miner"]
-        assert published.failure_reason_code == "CPU_TRUTH_MISMATCH"
+        assert published.failure_reason_code == ZEROED_BEFORE_THE_BUDGET_STOP
         assert published.score == 0 and not published.carried_for_renter_gpu_reset
         assert withheld == []
     else:
         assert [r.carried_for_renter_gpu_reset for r in kept["5Miner"]] == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason", [RentalVerificationMessages.NO_TASK_TIME.reason, VerifyXMessages.NO_TASK_TIME.reason]
+)
+async def test_a_warn_only_image_event_after_a_cpu_mismatch_never_lets_a_rollout_hold_the_zero(
+    context_factory, reason
+):
+    # review at ea74f37: CPU truth fails, the image check then logs a warn-only EXECUTOR_IMAGE_OUTDATED, and the
+    # rental check runs out of time during a rollout. The zero is published, not withheld, and the cached pass is
+    # never carried into the next cycle
+    from services.task.service import budget_stop_reason
+    from test_executor_rollout_grace import _open_window, J0
+
+    ctx = context_factory(state=build_state(specs={"network": {"ema_verifyx_download_speed": 500.0}}))
+    ctx = ctx.model_copy(
+        update={"cpu_truth_passed": False, "executor": ctx.executor.model_copy(update={"price_per_gpu": None})}
+    )
+    events = [
+        build_msg(event="CPU count mismatch", reason="CPU_TRUTH_MISMATCH", severity="error", impact=""),
+        build_msg(event="image outdated", reason=ExecutorImageMessages.OUTDATED.reason, severity="warning", impact=""),
+        build_msg(event="no time", reason=reason, severity="warning", impact=""),
+    ]
+    result = _failed("node-idle", budget_stop_reason(reason, events, ctx))
+
+    assert result.failure_reason_code == ZEROED_BEFORE_THE_BUDGET_STOP
+    assert rollout_grace_reason(result, _open_window(), J0) is None
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_scored("node-idle")]}, service)
+    kept, withheld = await _carry_then_withhold(service, [result], rented_executor_ids=frozenset())
+    [published] = kept["5Miner"]
+    assert published.score == 0 and not published.carried_for_renter_gpu_reset and withheld == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason", [RentalVerificationMessages.NO_TASK_TIME.reason, VerifyXMessages.NO_TASK_TIME.reason]
+)
+async def test_a_budget_stop_before_verifyx_measured_a_node_stays_a_neutral_stop(context_factory, reason):
+    # review at ea74f37: a new node with no VerifyX speed on record keeps the no-time reason, so it is held (and
+    # carries a recent pass) instead of being published as a failed first pass
+    from services.task.service import budget_stop_reason
+
+    ctx = context_factory(state=build_state(specs={}))
+    ctx = ctx.model_copy(update={"executor": ctx.executor.model_copy(update={"price_per_gpu": None})})
+    events = [build_msg(event="no time", reason=reason, severity="warning", impact="")]
+
+    assert budget_stop_reason(reason, events, ctx) == reason
 
 
 @pytest.mark.asyncio

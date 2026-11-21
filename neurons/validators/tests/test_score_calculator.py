@@ -245,7 +245,6 @@ def _unofficial(ctx):
         # review at 4d7bf12: zero-score branches that are no boolean flag
         lambda ctx: ctx.model_copy(update={"executor": ctx.executor.model_copy(update={"price_per_gpu": 1e9})}),
         _unofficial,
-        lambda ctx: ctx.model_copy(update={"state": replace(ctx.state, specs={})}),
     ],
 )
 @pytest.mark.parametrize("rented", [False, True])
@@ -254,17 +253,19 @@ def test_every_zero_score_branch_leaves_a_budget_stop_nothing_to_carry(zeroed, r
     passing = _ctx(500.0).model_copy(update={"rented": rented})
     ctx = zeroed(passing)
     assert not zero_score_gate_failed(passing)
-    assert zero_score_gate_failed(ctx) is (calculate_scores(ctx, rented=rented)[0] == 0.0)
-    if rented and not ctx.state.specs:
-        return  # a rented node has no EMA gate
+    assert calculate_scores(ctx, rented=rented)[0] == 0.0
     assert zero_score_gate_failed(ctx)
 
 
-def test_a_verifyx_sample_the_stop_cut_off_is_no_zero_when_an_ema_is_on_record():
+@pytest.mark.parametrize("ema_on_record", [False, True])
+def test_a_verifyx_speed_not_on_record_is_no_failure_for_a_budget_stop(ema_on_record):
+    # review at ea74f37: a new node reaches the stop before VerifyX measured it, or the backend snapshot omits its
+    # EMA; the score check still zeroes a full run without one, the budget stop does not count it as a failure
     ctx = _ctx_without_specs({})
-    ctx = ctx.model_copy(
-        update={"state": replace(ctx.state, rented_data=SimpleNamespace(network_ema={ctx.executor.uuid: NetworkEMA(
-            ema_verifyx_download_speed=500.0, ema_verifyx_upload_speed=None)}))}
-    )
+    if ema_on_record:
+        ctx = ctx.model_copy(
+            update={"state": replace(ctx.state, rented_data=SimpleNamespace(network_ema={ctx.executor.uuid: NetworkEMA(
+                ema_verifyx_download_speed=500.0, ema_verifyx_upload_speed=None)}))}
+        )
     assert calculate_scores(ctx, rented=False)[0] == 0.0
     assert not zero_score_gate_failed(ctx)

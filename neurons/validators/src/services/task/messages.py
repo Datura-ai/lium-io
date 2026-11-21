@@ -3292,3 +3292,7 @@ class SshdAuthLogMessages:
 # DAH-5933: the run left the backend's rental probe, or VerifyX, too little time; the validator's budget, not the
 # node, decides that, so it is no failed check: an idle node carries its last scored result too
 NO_TASK_TIME_REASONS = (RentalVerificationMessages.NO_TASK_TIME.reason, VerifyXMessages.NO_TASK_TIME.reason)
+# DAH-5933 review at ea74f37: a budget stop after a check that already zeroed the cycle's score. Its own code, since
+# the last event before the stop can be one a rollout withholds (a warn-only EXECUTOR_IMAGE_OUTDATED): no rule withholds
+# or carries this one, so the zero is published as it is
+ZEROED_BEFORE_THE_BUDGET_STOP = "SCORE_ZEROED_BEFORE_THE_TASK_TIME_RAN_OUT"
