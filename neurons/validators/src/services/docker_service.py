@@ -5911,12 +5911,14 @@ class DockerService:
         report: ContainerCleanupReport | None = None,
         removed_at_ssh_connect: dict[str, str] | None = None,
         refuse_before_removal: Callable[[list[str]], None] | None = None,
-        owner: str | None = None,
+        keep_pod_name: bool = False,
     ) -> list[str]:
         """Force-remove stale pod_/filler_ containers (and their volumes); returns the names removed.
 
-        DAH-6531: with ``owner`` (the create's registration), ``pod_name`` itself goes only when the listing gave its
-        ID and that container is the registration's (`_made_for`); else it and its volume stay.
+        DAH-6531: ``keep_pod_name`` (a pod create) never sweeps ``pod_name`` or its volume: one pod keeps one name on
+        every registration, so on a shared daemon it may be another registration's running replacement, labelled or
+        made before the labels. A leftover under it is the same-name conflict's to decide (stopped, this
+        registration's or unlabelled, removed by its ID, never forced).
 
         DAH-5392: an unlisted `pod_*` other than ``pod_name`` is removed (with its volume) only when the
         backend confirms its rental closed: a create that waited may sweep after a newer create on the
@@ -5994,10 +5996,8 @@ class DockerService:
             if unlisted_pods:
                 closed = await self._pods_with_closed_rental(unlisted_pods, default_extra)
                 stale_containers = [name for name in stale_containers if name not in unlisted_pods or name in closed]
-            if owner is not None and pod_name in stale_containers:
-                own_id = listed_ids.get(pod_name)
-                if own_id is None or not _made_for(await ssh_client.run(_registration_label_command(own_id)), owner):
-                    stale_containers.remove(pod_name)
+            if keep_pod_name and pod_name in stale_containers:
+                stale_containers.remove(pod_name)
             container_names = " ".join(shlex.quote(name) for name in stale_containers)
             if not container_names:
                 return []
@@ -11402,7 +11402,7 @@ class DockerService:
                     report=cleanup_report,
                     removed_at_ssh_connect=fillers_removed_at_ssh_connect.listed_id_by_filler_name,
                     refuse_before_removal=lambda names: _refuse_filler_beside_unlisted_pod(payload, names),
-                    owner=_executor_label(payload),
+                    keep_pod_name=container_name.startswith(POD_CONTAINER_PREFIX),
                 )
                 # DAH-3980: removing only fillers (confirmed gone, their volumes left to the backend's
                 # filler delete) changes no listing but the containers and their mounts, so the listings

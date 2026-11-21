@@ -169,6 +169,8 @@ async def test_edit_parks_the_current_container_before_the_sweep_and_removes_it_
     # the sweep was told the parked name is not stale
     protected = svc.clean_existing_containers.await_args.kwargs["active_container_names"]
     assert protected == ["pod_someone_else", parked]
+    # DAH-6531: the pod's own name is never the sweep's; the same-name conflict decides a leftover
+    assert svc.clean_existing_containers.await_args.kwargs["keep_pod_name"] is True
     # only after the replacement is up is the old container removed, by its ID: a later edit may park
     # another container under the same name before a late rm lands; the new one is never removed
     assert _docker(ssh.commands, "rm -fv")[-1] == f"/usr/bin/docker rm -fv id-{name}"
