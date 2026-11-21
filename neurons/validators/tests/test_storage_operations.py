@@ -448,3 +448,37 @@ async def test_a_cancel_cannot_mark_the_operation_between_the_wrapper_check_and_
         await asyncio.sleep(0.05)
     assert started.exists()
     assert not (tmp_path / "marked-before-start").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_wrapper_whose_pid_was_not_recorded_never_starts_the_runner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # the background shell is delayed before setsid, so the launcher's group kill after a failed PID write finds
+    # no group; the surviving wrapper must still never start a runner no cancel could find
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", storage_operations.PurePosixPath(str(tmp_path / "ops")))
+    monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
+    monkeypatch.setattr(storage_operations, "report_launch_failure", AsyncMock())
+    started = tmp_path / "runner-started"
+    runner = tmp_path / "runner"
+    runner.write_text(f"#!/bin/sh\ntouch {started}\n")
+    runner.chmod(0o755)
+    monkeypatch.setattr(storage_operations, "REMOTE_RUNNER_PATH", str(runner))
+    local = _local_ssh()
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+
+    async def run(command: str, check: bool = False) -> SimpleNamespace:
+        if "nohup" in command:
+            # the PID write fails (its path is a directory) and setsid runs only after the launcher has given up
+            Path(str(files.pid)).mkdir(parents=True, exist_ok=True)
+            assert command.count("setsid nohup ") == 1
+            command = command.replace("setsid nohup ", "sh -c 'sleep 0.5; exec \"$0\" \"$@\"' setsid nohup ")
+        return await local.run(command, check)
+
+    with pytest.raises(storage_operations.StorageOperationLaunchError):
+        await storage_operations.start_storage_operation(
+            SimpleNamespace(run=run, start_sftp_client=local.start_sftp_client),
+            "sh", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False,
+        )
+    await asyncio.sleep(1.5)
+    assert not started.exists()

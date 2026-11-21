@@ -346,7 +346,10 @@ async def start_storage_operation(
         wrapper = (
             f"rm -f {shlex.quote(str(files.status))}; "
             f"exec 8>>{lock_path}; "
-            f"if flock -w 30 8 && ! test -e {shlex.quote(str(files.cancel))}; then "
+            # and only when the launch recorded this wrapper as the operation's process group: a wrapper whose PID
+            # write failed is one no cancel could find, so it never starts the runner
+            f"if flock -w 30 8 && ! test -e {shlex.quote(str(files.cancel))} "
+            f'&& [ "$(cat {pid_path} 2>/dev/null)" = "$$" ]; then '
             f"{runner} 8>&- & child=$!; "
             "trap 'kill -TERM \"$child\" 2>/dev/null || true' TERM INT; exec 8>&-; "
             'wait "$child"; result=$?; '
