@@ -24,6 +24,15 @@ def _cancel_markers_in_tmp(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     )
 
 
+def _spawn_runner(spec_path: object) -> int:
+    """An unresponsive runner (ignores the cancel file) that carries its spec path like the real one; detached so no
+    zombie keeps `kill -0` true."""
+    spawned = subprocess.run(
+        ["sh", "-c", f"sh -c 'sleep 60; : --spec {spec_path}' >/dev/null 2>&1 & echo $!"], capture_output=True, text=True
+    )
+    return int(spawned.stdout)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("runner_alive", [True, False])
 async def test_cancel_fallback_removes_the_helper_container(
@@ -38,9 +47,7 @@ async def test_cancel_fallback_removes_the_helper_container(
     fake_docker.chmod(0o755)
     runner_pid = None
     if runner_alive:
-        # ignores the cancel file like an unresponsive runner; detached so no zombie keeps `kill -0` true
-        spawned = subprocess.run(["sh", "-c", "sleep 60 >/dev/null 2>&1 & echo $!"], capture_output=True, text=True)
-        runner_pid = int(spawned.stdout)
+        runner_pid = _spawn_runner(storage_operations.StorageOperationFiles.for_operation(OPERATION_ID).spec)
         (tmp_path / f"{OPERATION_ID}.pid").write_text(str(runner_pid))
 
     async def run_locally(command: str, check: bool = False) -> SimpleNamespace:
@@ -74,8 +81,7 @@ async def test_a_cancel_that_cannot_write_its_marker_still_stops_the_runner_then
     fake_docker = tmp_path / "docker"
     fake_docker.write_text(f'#!/bin/sh\necho "$*" >> {docker_log}\n')
     fake_docker.chmod(0o755)
-    spawned = subprocess.run(["sh", "-c", "sleep 60 >/dev/null 2>&1 & echo $!"], capture_output=True, text=True)
-    runner_pid = int(spawned.stdout)
+    runner_pid = _spawn_runner(storage_operations.StorageOperationFiles.for_operation(OPERATION_ID).spec)
     (tmp_path / f"{OPERATION_ID}.pid").write_text(str(runner_pid))
     if failing_step == "lock_open":
         # the lock file cannot be opened at all (a directory in its place): the open itself fails in the shell
@@ -92,6 +98,7 @@ async def test_a_cancel_that_cannot_write_its_marker_still_stops_the_runner_then
     try:
         with pytest.raises(storage_operations.StorageOperationLaunchError):
             await storage_operations.cancel_storage_operation(SimpleNamespace(run=run_locally), OPERATION_ID)
+        assert subprocess.run(["kill", "-0", str(runner_pid)], capture_output=True).returncode != 0
     finally:
         subprocess.run(["kill", "-KILL", str(runner_pid)], capture_output=True)
     helper = f"lium-storage-{str(OPERATION_ID)[:12]}"
@@ -138,13 +145,14 @@ async def test_a_repeated_dispatch_never_starts_a_second_runner(
         assert files == storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
     else:
         monkeypatch.setattr(storage_operations, "report_launch_failure", AsyncMock())
-        with pytest.raises(TypeError):  # stops at the sftp spec write, after the stale-helper removal
+        with pytest.raises(TypeError):  # stops at the sftp spec write
             await storage_operations.start_storage_operation(
                 ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
             )
     probe = next(c for c in commands if c.startswith("pgrep -f"))
     assert f"[-]-spec {storage_operations.StorageOperationFiles.for_operation(OPERATION_ID).spec}" in probe
-    assert any("docker rm -f" in c for c in commands) is not runner_alive
+    # a dead run's helper is removed only under the launch lock, in the launch command itself
+    assert not any("docker rm -f" in c for c in commands)
     assert any("nohup" in c for c in commands) is False  # never launched a second wrapper
 
 
@@ -534,7 +542,7 @@ def test_a_launch_finding_a_live_recorded_wrapper_rewrites_nothing(
     _counting_runner(monkeypatch, tmp_path)
     files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
     Path(str(files.pid)).parent.mkdir(parents=True, exist_ok=True)
-    live = subprocess.Popen(["setsid", "sleep", "5"])
+    live = subprocess.Popen(["setsid", "sh", "-c", f"sleep 5; : {files.spec}"])
     try:
         time.sleep(0.2)
         Path(str(files.pid)).write_text(f"{live.pid}\n")
@@ -579,3 +587,97 @@ async def test_a_wrapper_whose_record_another_launch_replaced_touches_nothing(
     assert Path(str(files.pid)).read_text().strip() == other
     assert Path(str(files.spec)).exists()
     assert not Path(str(files.status)).exists()
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_leaves_a_process_that_reused_the_recorded_pid_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # the wrapper was killed before removing its PID file and the host gave that PID to an unrelated group leader
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    monkeypatch.setattr(storage_operations, "_report_cancelled", AsyncMock(return_value=True))
+    docker_log = tmp_path / "docker.log"
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text(f'#!/bin/sh\necho "$*" >> {docker_log}\n')
+    fake_docker.chmod(0o755)
+    unrelated = subprocess.Popen(["setsid", "sleep", "60"])
+    (tmp_path / f"{OPERATION_ID}.pid").write_text(str(unrelated.pid))
+
+    async def run_locally(command: str, check: bool = False) -> SimpleNamespace:
+        command = command.replace("/usr/bin/docker", str(fake_docker)).replace("sleep 0.25", "sleep 0.01")
+        result = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
+        return SimpleNamespace(exit_status=result.returncode, stdout=result.stdout, stderr=result.stderr)
+
+    try:
+        await asyncio.sleep(0.2)
+        await storage_operations.cancel_storage_operation(SimpleNamespace(run=run_locally), OPERATION_ID)
+        assert unrelated.poll() is None
+    finally:
+        unrelated.kill()
+    helper = f"lium-storage-{str(OPERATION_ID)[:12]}"
+    assert docker_log.read_text().splitlines() == [f"stop --time 5 {helper}", f"rm -f -- {helper}"]
+
+
+@pytest.mark.asyncio
+async def test_two_validator_processes_launching_one_operation_start_one_runner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # two processes, which the in-process launch lock does not cover: both find a dead run and pass the checks
+    # before either launches, then the second pauses until the first's runner is up, before any step that changes
+    # the node
+    starts = _counting_runner(monkeypatch, tmp_path)
+    local = _local_ssh()
+    first_launched, second_checked = asyncio.Event(), asyncio.Event()
+    read_only = ("test -e", "install -d", "pgrep -f")
+
+    def process(first: bool) -> SimpleNamespace:
+        # the first changes nothing until the second has passed its checks; the second then changes nothing (on the
+        # node, beyond its own spec file) until the first's runner is up
+        async def gate() -> None:
+            if first:
+                await second_checked.wait()
+            else:
+                second_checked.set()
+
+        async def run(command: str, check: bool = False) -> SimpleNamespace:
+            if not (command.startswith(read_only) or "echo STARTING" in command):
+                await gate()
+                if not first:
+                    await first_launched.wait()
+            result = await local.run(command, check)
+            if first and "setsid nohup" in command:
+                await asyncio.sleep(0.2)  # the first wrapper has taken the lock and started its runner
+                first_launched.set()
+            return result
+
+        class Sftp:
+            async def __aenter__(self):
+                await gate()
+                self.inner = local.start_sftp_client()
+                return await self.inner.__aenter__()
+
+            async def __aexit__(self, *exc):
+                return await self.inner.__aexit__(*exc)
+
+        return SimpleNamespace(run=run, start_sftp_client=Sftp)
+
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    # an earlier run died and left its files: both processes find it dead and would clear it
+    Path(str(files.pid)).parent.mkdir(parents=True, exist_ok=True)
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    Path(str(files.pid)).write_text(f"{dead.pid}\n")
+    Path(str(files.spec)).write_text("{}")
+    await asyncio.gather(
+        *(
+            storage_operations._start_storage_operation(
+                process(first), "sh", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=True
+            )
+            for first in (True, False)
+        )
+    )
+    await asyncio.sleep(1.2)
+
+    assert starts.read_text() == "x\n"
+    assert Path(str(files.status)).read_text().strip() == "0"
+    assert not list(Path(str(files.spec)).parent.glob(f"{Path(str(files.spec)).name}.*"))

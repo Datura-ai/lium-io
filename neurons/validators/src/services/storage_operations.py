@@ -328,18 +328,16 @@ async def _start_storage_operation(
             # its helper; a second runner would interrupt it.
             # A helper whose runner died is an orphan: it is removed below and the run relaunched.
             return files
-        if existing_state in {"EXITED", "INVALID"} or await _remote_file_exists(
-            ssh_client, files.spec
-        ):
-            await _remove_operation_artifacts(ssh_client, files)
-        await _remove_stale_helper_container(ssh_client, operation_id)
-
+        # This dispatch's spec goes to its own file; the launch command claims it under the node's launch lock,
+        # after it has checked the operation again and cleared a dead run's files and helper there, so another
+        # validator process's launch can never interleave with these steps (the checks above only return early).
+        claim = files.spec.with_name(f"{files.spec.name}.{uuid4().hex}")
         async with ssh_client.start_sftp_client() as sftp:
-            async with sftp.open(str(files.spec), "w") as remote_spec:
+            async with sftp.open(str(claim), "w") as remote_spec:
                 await remote_spec.write(
                     json.dumps(dict(spec), separators=(",", ":"), sort_keys=True)
                 )
-            await sftp.chmod(str(files.spec), 0o600)
+            await sftp.chmod(str(claim), 0o600)
 
         runner = " ".join(
             shlex.quote(item)
@@ -388,12 +386,22 @@ async def _start_storage_operation(
         # start the wrapper as its own process group and record that group before releasing the
         # lock, so a cancel that comes after always finds every process of the operation.
         # The wrapper must not inherit the held lock (9>&-).
+        claim_path = shlex.quote(str(claim))
         launch_command = (
+            _owned_shell_function(files)
+            + f"trap 'rm -f {claim_path}' EXIT; "
             f"command exec 9>>{lock_path} 2>/dev/null; flock -w 30 9 || exit 6; "
             f"if test -e {shlex.quote(str(files.cancel))}; then rm -f {shlex.quote(str(files.spec))}; exit 5; fi; "
-            # a launch of this operation from another validator process already recorded a live wrapper: it is the
-            # operation, and its PID and spec stay as they are
-            f'if p=$(cat {pid_path} 2>/dev/null) && [ -n "$p" ] && kill -0 -"$p" 2>/dev/null; then exit 0; fi; '
+            # another launch (this or another validator process) got there first: a live recorded wrapper (or a
+            # runner recorded before process groups) is the operation, and a written status is its result;
+            # their PID, spec and status stay as they are
+            f"test -s {shlex.quote(str(files.status))} && exit 0; "
+            f'if p=$(cat {pid_path} 2>/dev/null) && [ -n "$p" ] && owned "$p" '
+            '&& { kill -0 -"$p" 2>/dev/null || kill -0 "$p" 2>/dev/null; }; then exit 0; fi; '
+            # nothing of the operation runs: a dead run's files and its orphaned helper go, then this spec is claimed
+            f"rm -f {' '.join(shlex.quote(str(path)) for path in (files.status, files.log, files.pid, files.spec))}; "
+            f"/usr/bin/docker rm -f -- {shlex.quote(storage_helper_name(operation_id))} >/dev/null 2>&1; "
+            f"mv {claim_path} {shlex.quote(str(files.spec))} || exit 8; "
             f"setsid nohup /bin/sh -c {shlex.quote(wrapper)} "
             f"> {shlex.quote(str(files.log))} 2>&1 < /dev/null 9>&- & "
             f"if ! printf '%s\\n' \"$!\" > {pid_path}; then "
@@ -467,10 +475,11 @@ async def _operation_state(
     status_path = shlex.quote(str(files.status))
     pid_path = shlex.quote(str(files.pid))
     command = (
-        f"if test -s {status_path}; then printf 'STATUS:'; cat {status_path}; "
+        _owned_shell_function(files)
+        + f"if test -s {status_path}; then printf 'STATUS:'; cat {status_path}; "
         f"elif test -s {pid_path}; then pid=$(cat {pid_path}); "
         "case \"$pid\" in (*[!0-9]*|'') echo INVALID;; "
-        '(*) if kill -0 "$pid" 2>/dev/null; then echo RUNNING; else echo EXITED; fi;; esac; '
+        '(*) if owned "$pid" && kill -0 "$pid" 2>/dev/null; then echo RUNNING; else echo EXITED; fi;; esac; '
         "else echo STARTING; fi"
     )
     result = await ssh_client.run(command, check=False)
@@ -495,22 +504,25 @@ async def cancel_storage_operation(
     # first; the PID is that group's leader, so every check and signal below covers the whole group
     lock_path = shlex.quote(str(files.lock))
     command = (
-        "marked=0; "
+        _owned_shell_function(files)
+        + "marked=0; "
         # `command`: a failed open of the lock fails the step instead of ending the shell before the stop fallback
         f"{{ install -d -m 0700 {shlex.quote(str(REMOTE_CANCEL_DIRECTORY))} && command exec 9>>{lock_path} 2>/dev/null "
         f"&& flock -w 30 9 && touch {cancel_path}; }} || marked=4; "
         # read under the lock: a launch that took it first has written its PID by now; release it before
         # the bounded wait so other operations' launches never queue behind this one
         f"pid=$(cat {pid_path} 2>/dev/null); exec 9>&-; "
-        'if test -n "$pid"; then '
-        "case \"$pid\" in (*[!0-9]*|'') exit 2;; esac; "
-        # an operation launched before process groups recorded its runner's PID, which leads no group
-        'alive() { kill -0 -"$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null; }; '
+        "case \"$pid\" in (*[!0-9]*) exit 2;; esac; "
+        # a recorded PID the host has since given to another process is not signalled; only the helper is removed
+        'if test -n "$pid" && owned "$pid"; then '
+        # an operation launched before process groups recorded its runner's PID, which leads no group; owned is
+        # checked again before every signal, as the PID can be reused while this waits
+        'alive() { owned "$pid" && { kill -0 -"$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null; }; }; '
         'attempt=0; while alive && test "$attempt" -lt 100; do '
         "sleep 0.25; attempt=$((attempt + 1)); done; "
         'if alive; then '
         f"/usr/bin/docker stop --time 5 {shlex.quote(helper_name)} >/dev/null 2>&1 || true; "
-        'kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true; sleep 2; '
+        'owned "$pid" && { kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null; }; sleep 2; '
         'if alive; then kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true; '
         'attempt=0; while alive && test "$attempt" -lt 20; do '
         "sleep 0.1; attempt=$((attempt + 1)); done; fi; "
@@ -551,6 +563,18 @@ async def _read_operation_spec(
     return value if isinstance(value, Mapping) else None
 
 
+def _owned_shell_function(files: StorageOperationFiles) -> str:
+    """Shell `owned PID`: the PID is still this operation's process, not one the host reused for another.
+
+    Every process of the operation (the wrapper, and a runner recorded before process groups) carries the
+    operation's spec path on its command line. A PID with no process is owned too: Linux does not reuse a PID
+    while a process group of that ID is alive, so a group found under it is still the operation's."""
+    return (
+        'owned() { test ! -e /proc/"$1" || '
+        f"tr '\\000' ' ' < /proc/\"$1\"/cmdline 2>/dev/null | grep -qF -- {shlex.quote(str(files.spec))}; }}; "
+    )
+
+
 async def _remote_file_exists(
     ssh_client: asyncssh.SSHClientConnection,
     path: PurePosixPath,
@@ -570,17 +594,6 @@ async def _runner_alive(
         check=False,
     )
     return result.exit_status == 0
-
-
-async def _remove_stale_helper_container(
-    ssh_client: asyncssh.SSHClientConnection,
-    operation_id: UUID,
-) -> None:
-    helper_name = storage_helper_name(operation_id)
-    await ssh_client.run(
-        f"/usr/bin/docker rm -f -- {shlex.quote(helper_name)} >/dev/null 2>&1 || true",
-        check=False,
-    )
 
 
 async def _tail_operation_log(
