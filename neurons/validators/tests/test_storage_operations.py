@@ -871,3 +871,53 @@ async def test_a_cancel_before_an_earlier_release_wrapper_records_its_pid_still_
     finally:
         if seen.exists():
             subprocess.run(["kill", "-KILL", seen.read_text().strip()], capture_output=True)
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_after_the_earlier_release_runner_read_its_spec_still_stops_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # review at 175c9ca: that runner unlinks the spec on read, which can be before its wrapper writes the PID;
+    # the spec's absence is no sign the run is gone
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    monkeypatch.setattr(storage_operations, "_report_cancelled", AsyncMock(return_value=True))
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    legacy = tmp_path / f"{OPERATION_ID}.cancel"
+    seen = tmp_path / "runner.pid"
+    Path(str(files.spec)).write_text('{"engine":"restic"}')
+    wrapper = subprocess.Popen(
+        ["sh", "-c", f"sleep 0.2; rm -f {legacy}; "
+         f"sh -c 'rm -f {files.spec}; while ! test -e {legacy}; do sleep 0.05; done; : --spec {files.spec}' "
+         f">/dev/null 2>&1 & echo $! > {seen}; sleep 0.5; echo $! > {files.pid}"],
+    )
+    try:
+        await storage_operations.cancel_storage_operation(_local_ssh(), OPERATION_ID)
+        wrapper.wait(timeout=10)
+        runner_pid = int(seen.read_text())
+        for _ in range(40):
+            if subprocess.run(["kill", "-0", str(runner_pid)], capture_output=True).returncode != 0:
+                break
+            await asyncio.sleep(0.05)
+        assert subprocess.run(["kill", "-0", str(runner_pid)], capture_output=True).returncode != 0
+    finally:
+        wrapper.kill()
+        if seen.exists():
+            subprocess.run(["kill", "-KILL", seen.read_text().strip()], capture_output=True)
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_fails_while_an_earlier_release_wrapper_runs_without_a_pid_past_its_wait(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # review at 175c9ca: a wrapper delayed past the bounded wait would start a runner no marker reaches
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    report = AsyncMock(return_value=True)
+    monkeypatch.setattr(storage_operations, "_report_cancelled", report)
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    wrapper = subprocess.Popen(["sh", "-c", f"sleep 30; : --spec {files.spec}"])
+    try:
+        with pytest.raises(storage_operations.StorageOperationLaunchError):
+            await storage_operations.cancel_storage_operation(_local_ssh(), OPERATION_ID)
+        report.assert_not_awaited()
+    finally:
+        wrapper.kill()
