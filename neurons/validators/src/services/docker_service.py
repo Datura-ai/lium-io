@@ -88,6 +88,8 @@ from services.const import (
     unparked_name,
     KEPT_UNMOUNTED_PREFIX,
     LIUM_POD_ID_LABEL,
+    LIUM_CREATE_COMMAND_ID_LABEL,
+    CREATE_RECORD_DIR,
     LEGACY_LOOPBACK_PLUGIN_ALIAS,
     LOOPBACK_PLUGIN_ALIAS,
     FILLER_CACHE_VOLUME_PREFIXES,
@@ -3692,6 +3694,96 @@ def _jupyter_root_sed(root: str) -> str:
 _DIND_STOP_ATTEMPTS = 3
 
 
+
+_CREATE_RECORD_STATE_MARK = "--lium-create-state--"
+
+
+def _create_record_path(pod_id: str) -> str:
+    return f"{CREATE_RECORD_DIR}/{pod_id}.json"
+
+
+def _create_record(reply: ContainerCreated) -> str:
+    return json.dumps({"command_id": reply.command_id, "reply": reply.model_dump(mode="json")})
+
+
+# set (to an empty list) by miner_driver for a create whose earlier run may have left its container: True is appended
+# once the node's own listing shows no container of this command. Until then a failure of this run is not answered,
+# since the backend would fail or replace the pod while that container may run (compute_client._drive_miner_job)
+create_node_absent: contextvars.ContextVar[list[bool] | None] = contextvars.ContextVar("create_node_absent", default=None)
+
+
+class _OwnCreateWithoutRecord(Exception):
+    """This command's container is (or may be) on the node, but the reply its first run saved cannot be read, or the
+    node could not be asked whether the container is there."""
+
+
+async def _replay_own_finished_create(
+    ssh_client: asyncssh.SSHClientConnection, payload: ContainerCreateRequest, container_name: str, log_extra: dict
+) -> ContainerCreated | None:
+    """A create re-sent under the same command ID (its first answer lost to a connector restart) finds the container
+    its first run started and never starts a second one. With the run's saved reply and the container running, that
+    reply is reported. A container carrying this command's label without a readable reply (the run was cut off between
+    `docker run` and the record write, or the write failed) raises _OwnCreateWithoutRecord: the create then answers
+    nothing and leaves the container, because the cleanup would treat it as the pod's stale container and remove it
+    with its volume. So does a node that cannot be asked (SSH or Docker failing): only a listing Docker answered without
+    this command's container returns None, and the create runs as usual."""
+    if not payload.command_id:
+        return None
+    # `docker ps` exits 0 with no line when the name is absent and non-zero when Docker cannot answer, unlike
+    # `docker inspect`, whose failure looks the same for both
+    command = (
+        f"cat {shlex.quote(_create_record_path(payload.pod_id))} 2>/dev/null; echo; echo {_CREATE_RECORD_STATE_MARK}; "
+        f"/usr/bin/docker ps -a --no-trunc --filter {shlex.quote(f'name=^/?{re.escape(container_name)}$')} "
+        f"--format '{{{{.State}}}} {{{{.Label \"{LIUM_CREATE_COMMAND_ID_LABEL}\"}}}}'"
+    )
+    try:
+        result = await ssh_client.run(command, check=False, timeout=30)
+    except Exception as exc:
+        raise _OwnCreateWithoutRecord(f"the node could not be asked: {exc}") from exc
+    if result.exit_status != 0:
+        raise _OwnCreateWithoutRecord(f"docker could not list the container (exit {result.exit_status})")
+    record_text, _, state = (result.stdout or "").partition(_CREATE_RECORD_STATE_MARK)
+    fields = state.split()
+    if len(fields) == 1 and create_node_absent.get() is not None:
+        # the pod's container carries no command label: an older validator made it, maybe this very command's run cut
+        # off by the upgrade. Its outcome is unknown; the cleanup below would remove it and its volume
+        raise _OwnCreateWithoutRecord("the pod's container has no command label and this command ran before")
+    if len(fields) != 2 or fields[1] != payload.command_id:
+        if (absent := create_node_absent.get()) is not None:
+            absent.append(True)
+        return None
+    try:
+        if fields[0] != "running":
+            raise ValueError("the container is not running")
+        record = json.loads(record_text.strip())
+        if record.get("command_id") != payload.command_id:
+            raise ValueError("no saved reply of this command")
+        reply = ContainerCreated.model_validate(record["reply"])
+    except Exception as exc:
+        raise _OwnCreateWithoutRecord(str(exc)) from exc
+    logger.info(_m("Create re-sent after its first run finished: reporting that run", extra=get_extra_info(log_extra)))
+    return reply
+
+
+async def _write_create_record(
+    ssh_client: asyncssh.SSHClientConnection, reply: ContainerCreated, log_extra: dict
+) -> None:
+    """Best effort: without the record a re-sent create finds its own container by the label and answers nothing,
+    never replaces it."""
+    if not reply.command_id:
+        return
+    path = _create_record_path(reply.pod_id)
+    try:
+        await ssh_client.run(
+            f"mkdir -p {shlex.quote(CREATE_RECORD_DIR)} && umask 077 && "
+            f"printf %s {shlex.quote(_create_record(reply))} > {shlex.quote(path + '.tmp')} && "
+            f"mv {shlex.quote(path + '.tmp')} {shlex.quote(path)}",
+            check=True,
+            timeout=30,
+        )
+    except Exception as exc:
+        logger.warning(_m("Could not write a finished create's record", extra=get_extra_info({**log_extra, "error": str(exc)})))
+
 class DockerService:
     def __init__(
         self,
@@ -4604,7 +4696,10 @@ class DockerService:
             log_opts={"max-size": settings.RENTAL_LOG_MAX_SIZE, "max-file": str(settings.RENTAL_LOG_MAX_FILE)},
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
-            labels={LIUM_POD_ID_LABEL: payload.pod_id},
+            labels={
+                LIUM_POD_ID_LABEL: payload.pod_id,
+                **({LIUM_CREATE_COMMAND_ID_LABEL: payload.command_id} if payload.command_id else {}),
+            },
             before_create=lambda: _refuse_filler_during_customer_create(payload),
             # a customer pod created since the cleanup's listing is seen here, before the filler starts
             before_start=(
@@ -10729,6 +10824,26 @@ class DockerService:
                     on_ssh_connected=start_early_probes,
                     log_extra=default_extra,
                 )
+                # before any step changes the host: a re-sent create whose first run finished reports that run
+                try:
+                    replayed = await _replay_own_finished_create(
+                        ssh_client, payload, self.get_container_name(payload), default_extra
+                    )
+                except _OwnCreateWithoutRecord as exc:
+                    logger.error(
+                        _m(
+                            "Create re-sent while its first run's container is on the node without a readable reply: "
+                            "leaving the container and answering nothing",
+                            extra=get_extra_info({**default_extra, "error": str(exc)}),
+                        )
+                    )
+                    await settle_filler_removal_at_ssh_connect()
+                    await self.finish_stream_logs()
+                    return None
+                if replayed is not None:
+                    await settle_filler_removal_at_ssh_connect()
+                    await self.finish_stream_logs()
+                    return replayed
                 # DAH-2740: undoes a failed edit while this SSH session is still open
                 edit_swap = await connections.enter_async_context(
                     _EditSwap(
@@ -12443,6 +12558,7 @@ class DockerService:
                     volume_encryption_status=volume_encryption_status,
                     command_id=payload.command_id,
                 )
+                await _write_create_record(ssh_client, container_created_reply, default_extra)
                 # Last, so nothing can fail after it: the pod is usable, the reply goes now, and
                 # the steps after it take over this create's sessions and close them.
                 edit_swap.replacement_is_up = True
@@ -15135,6 +15251,9 @@ class DockerService:
                         step="remove_kept_containers",
                         error=str(exc),
                     )
+
+                with _best_effort_delete_step(log, "remove_create_record"):
+                    await ssh_client.run(f"rm -f {shlex.quote(_create_record_path(payload.pod_id))}", check=False)
 
                 # DAH-2211: always-on inline cleanup of custom-build artifacts
                 # for this pod. No-op if the pod was not a custom build.
