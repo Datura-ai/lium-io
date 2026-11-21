@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 TIMEOUT_SECONDS = 30
 MIB = 1024 * 1024
 # protection per host unit, MiB. Only what a unit really uses is protected, so a generous value costs
-# nothing; the sum stays under the pod's minimum host RAM reserve (4 GiB).
+# nothing; the sum stays under the pod's minimum host RAM reserve (8 GiB).
 UNIT_MEMORY_MIN_MIB = {
     "ssh.service": 128,
     "sshd.service": 128,

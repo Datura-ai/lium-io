@@ -82,14 +82,13 @@ class InspectorRentedCheck:
             inspector_event = _build_inspector_event(
                 ctx, event, rented_pods, result, outcome="ERROR"
             )
-            passed = await _record_blind_streak_and_decide_pass(ctx, "ERROR")
+            await _record_blind_streak(ctx, "ERROR")
             return CheckResult(
-                passed=passed,
+                passed=True,
                 event=event,
                 updates={
                     "default_extra": extra,
                     "state": replace(ctx.state, inspector_event=inspector_event),
-                    **_score_gate_updates_for_failed_streak(passed),
                 },
             )
 
@@ -112,14 +111,13 @@ class InspectorRentedCheck:
             inspector_event = _build_inspector_event(
                 ctx, event, rented_pods, result, outcome="ERROR", report=report
             )
-            passed = await _record_blind_streak_and_decide_pass(ctx, "ERROR")
+            await _record_blind_streak(ctx, "ERROR")
             return CheckResult(
-                passed=passed,
+                passed=True,
                 event=event,
                 updates={
                     "default_extra": extra,
                     "state": replace(ctx.state, inspector_event=inspector_event),
-                    **_score_gate_updates_for_failed_streak(passed),
                 },
             )
         warnings = _collector_start_warnings(report)
@@ -132,7 +130,7 @@ class InspectorRentedCheck:
         if verdict.provider_origin:
             # a finding seen while the canary failed or the collector was down or just started
             # does not show the sensor saw everything, so that cycle still counts as blind
-            await _record_blind_streak_and_decide_pass(ctx, _sensor_outcome(report, warnings))
+            await _record_blind_streak(ctx, _sensor_outcome(report, warnings))
             return self._record_provider_origin(
                 ctx,
                 verdict=verdict,
@@ -207,14 +205,13 @@ class InspectorRentedCheck:
         inspector_event = _build_inspector_event(
             ctx, event, rented_pods, result, outcome=outcome, report=report, verdict=verdict
         )
-        passed = await _record_blind_streak_and_decide_pass(ctx, outcome)
+        await _record_blind_streak(ctx, outcome)
         return CheckResult(
-            passed=passed,
+            passed=True,
             event=event,
             updates={
                 "default_extra": extra,
                 "state": replace(ctx.state, inspector_event=inspector_event),
-                **_score_gate_updates_for_failed_streak(passed),
             },
         )
 
@@ -231,8 +228,7 @@ class InspectorRentedCheck:
     ) -> CheckResult:
         """A provider-origin verdict becomes the MALICIOUS event and the inspector event that
         carries its evidence. It is a record only: the check passes, nothing reaches the score
-        and no renter or backend is asked to act — except the sensor's rental-interference verdict
-        of a host write into a rented pod (DAH-4548), which fails the check and the score. A read is
+        and no renter or backend is asked to act. A host write into or read of a rented pod is
         logged only."""
         interference = host_write_findings(
             report, verdict.provider_findings, [p.pod_id for p in rented_pods]
@@ -249,7 +245,6 @@ class InspectorRentedCheck:
             )
         else:
             writes, reads = interference
-        enforced = bool(writes)
         if writes or reads:
             logger.warning(
                 _m(
@@ -257,7 +252,6 @@ class InspectorRentedCheck:
                     extra=get_extra_info(
                         {
                             **ctx.default_extra,
-                            "enforced": enforced,
                             "host_writes": len(writes),
                             "host_reads": len(reads),
                             "commands": [
@@ -267,9 +261,7 @@ class InspectorRentedCheck:
                     ),
                 )
             )
-        if enforced:
-            impact = "The host wrote into a rented pod (Inspector verdict); node failed"
-        elif verdict.affected_pod_ids:
+        if verdict.affected_pod_ids:
             impact = "Provider-origin access to a rented pod recorded; score unchanged"
         else:
             impact = "Provider-origin finding on a container that is not a rented pod recorded; score unchanged"
@@ -287,11 +279,6 @@ class InspectorRentedCheck:
             ctx=ctx,
             check_id=self.check_id,
             impact=impact,
-            remediation=(
-                "Stop host-side writes (docker update/exec/cp) into rented pods; the score stays zero while they continue."
-                if enforced
-                else None
-            ),
             what=what,
             extra=extra,
         )
@@ -299,31 +286,24 @@ class InspectorRentedCheck:
             ctx, event, rented_pods, result, outcome="MALICIOUS", report=report, verdict=verdict
         )
         return CheckResult(
-            passed=not enforced,
+            passed=True,
             event=event,
             updates={
                 "default_extra": extra,
                 "state": replace(ctx.state, inspector_event=inspector_event),
-                **({"inspector_host_write_passed": False} if enforced else {}),
             },
         )
 
 
-async def _record_blind_streak_and_decide_pass(ctx: Context, outcome: str) -> bool:
-    """Counts the rented cycles in a row whose inspector outcome saw nothing of the rental.
-
-    Each of those outcomes passes on its own (a sensor can break honestly), so a host that keeps
-    the sensor dead for a whole rental is never looked at. The streak is logged from
-    INSPECTOR_BLIND_STREAK_LIMIT on; it fails the check only under
-    INSPECTOR_BLIND_STREAK_ENFORCEMENT_ENABLED. The check is non-fatal, so the caller also sets
-    `inspector_blind_streak_passed` (`_score_gate_updates_for_failed_streak`), which
-    calculate_scores zeroes on. A collector that only just started counts as blind. A Redis outage
-    decides nothing."""
+async def _record_blind_streak(ctx: Context, outcome: str) -> None:
+    """Counts the rented cycles in a row whose inspector outcome saw nothing of the rental and logs
+    the streak from INSPECTOR_BLIND_STREAK_LIMIT on. A record only: it never fails the check or the
+    score. A collector that only just started counts as blind."""
     key = f"{BLIND_STREAK_KEY_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
     try:
         if outcome not in BLIND_OUTCOMES:
             await ctx.services.redis.delete(key)
-            return True
+            return
         streak = int(await ctx.services.redis.get(key) or 0) + 1
         await ctx.services.redis.set(key, str(streak), ex=BLIND_STREAK_TTL_SECONDS)
     except Exception:
@@ -331,24 +311,14 @@ async def _record_blind_streak_and_decide_pass(ctx: Context, outcome: str) -> bo
             _m("INSPECTOR_BLIND_STREAK_UNAVAILABLE", extra=get_extra_info(ctx.default_extra)),
             exc_info=True,
         )
-        return True
-    if streak < settings.INSPECTOR_BLIND_STREAK_LIMIT:
-        return True
-    enforced = settings.INSPECTOR_BLIND_STREAK_ENFORCEMENT_ENABLED
-    logger.warning(
-        _m(
-            "INSPECTOR_BLIND_STREAK",
-            extra=get_extra_info(
-                {**ctx.default_extra, "streak": streak, "outcome": outcome, "enforced": enforced}
-            ),
+        return
+    if streak >= settings.INSPECTOR_BLIND_STREAK_LIMIT:
+        logger.warning(
+            _m(
+                "INSPECTOR_BLIND_STREAK",
+                extra=get_extra_info({**ctx.default_extra, "streak": streak, "outcome": outcome}),
+            )
         )
-    )
-    return not enforced
-
-
-def _score_gate_updates_for_failed_streak(passed: bool) -> dict[str, bool]:
-    """The context flag calculate_scores zeroes the score on; set only when the streak failed."""
-    return {} if passed else {"inspector_blind_streak_passed": False}
 
 
 def _build_inspector_event(

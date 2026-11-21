@@ -606,13 +606,6 @@ class PostRentalGpuRecheckMessages:
         category="env",
         impact="Proceed",
     )
-    FILLER_SKIPPED = MessageTemplate(
-        event="Post-rental GPU recheck waits: active filler",
-        reason="POST_RENTAL_GPU_RECHECK_SKIPPED_ACTIVE_FILLER",
-        severity="info",
-        category="policy",
-        impact="Proceed; the recheck runs on a cycle without a filler, or after a few filler cycles anyway.",
-    )
     INCONCLUSIVE = MessageTemplate(
         event="Post-rental GPU recheck gave no verdict",
         reason="POST_RENTAL_GPU_RECHECK_INCONCLUSIVE",
@@ -1457,6 +1450,13 @@ class InspectorMessages:
 
 
 class TenantEnforcementMessages:
+    HALF_STARTED_STOPS_RETRIED = MessageTemplate(
+        event="Pending stops of half-started pods retried",
+        reason="HALF_STARTED_STOPS_RETRIED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
     NOT_RENTED = MessageTemplate(
         event="Executor not rented",
         reason="EXECUTOR_NOT_RENTED",
@@ -1565,6 +1565,10 @@ class GpuUsageMessages:
         "{vram_utilization}, with Lium's filler running on the node. Stop the GPU processes "
         "outside Lium's containers and re-run your node: {processes}. Leave Lium's own filler "
         "running: {fillers}."
+    )
+    FOREIGN_PROCESS_IN_FILLER_REMEDIATION = (
+        "A GPU process that is not the workload of Lium's filler runs inside the filler container: "
+        "{processes}. Stop it, run nothing else inside Lium's containers, and re-run your node."
     )
     USAGE_HIGH_BESIDE_A_RENTAL_REMEDIATION = (
         "Stop the GPU processes outside Lium's containers and re-run your node: {outside_processes}. "
@@ -3231,7 +3235,8 @@ SSHD_BOOTSTRAP_REMEDIATION = (
     "\"/run/sshd must be owned by root and not group or world-writable\"). Fix the runtime/image setup so "
     "a fresh container gets a root-owned /run/sshd with mode 755, then check that `docker run --rm ubuntu sh -c "
     "'apt-get update -qq && apt-get install -y -qq openssh-server && mkdir -p /run/sshd && /usr/sbin/sshd -t'` "
-    "succeeds. The node is validated again once a new container on it starts sshd."
+    "succeeds. Each validation cycle starts sshd in a fresh container on the node again; the node is validated again the "
+    "cycle sshd starts there."
 )
 
 
