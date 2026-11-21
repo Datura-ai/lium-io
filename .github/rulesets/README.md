@@ -77,3 +77,46 @@ Add a person by appending `{ "actor_id": <id>, "actor_type": "User", "bypass_mod
 
 Check: `gh api "repos/$R/rulesets?targets=tag" --jq '.[]|.name+" "+.enforcement'` → `release-tags active`.
 A push of `executor-v*` by anyone outside the bypass list is refused by GitHub before any workflow runs.
+
+## `pinned-actions-required-workflow`: the pinned-actions check always comes from main (organization owner, once)
+
+`pinned-actions.yml` judges whether a PR or a merge-queue group may land, so the copy that runs must be the one on
+`main`, not the one the candidate carries. A repository workflow cannot guarantee that on `pull_request` or
+`merge_group` (both run the candidate's copy), so an organization ruleset requires it instead:
+`pinned-actions-required-workflow.json` ("Require workflows to pass before merging" on the default branch of `lium-io`
+and `lium`, workflow `.github/workflows/pinned-actions.yml` from `Datura-ai/lium-io` at `refs/heads/main`). GitHub then
+runs main's copy on every PR and every queued group, whatever the candidate changes in its own workflow files. The rule
+exists at organization level only, so an organization owner applies it:
+
+Apply it in evaluate mode first, so a run that never reports cannot block every PR. Then confirm that the required run
+reports on a PR in `lium`, the repository that is not the workflow's source: GitHub runs a ruleset workflow on
+`pull_request` there only because the job has a condition (`if: true` in the workflow; GitHub's "Troubleshooting rules",
+Supported directory). Activate the ruleset only after that:
+
+```bash
+jq '.enforcement = "evaluate"' .github/rulesets/pinned-actions-required-workflow.json |
+  gh api "orgs/Datura-ai/rulesets" --method POST --input -
+# open a test PR in Datura-ai/lium: its checks must list pinned-actions from Datura-ai/lium-io, with a result
+id=$(gh api "orgs/Datura-ai/rulesets" --jq '.[]|select(.name=="pinned-actions-required-workflow")|.id')
+gh api "orgs/Datura-ai/rulesets/$id" --method PUT --input .github/rulesets/pinned-actions-required-workflow.json
+```
+
+If the organization's plan has no evaluate mode, the POST refuses it. Apply the file as it is and check a `lium` test PR
+straight away. If no pinned-actions result appears there, set the ruleset's enforcement to `disabled` until it does.
+
+Check: `gh api "orgs/Datura-ai/rulesets" --jq '.[]|.name+" "+.enforcement'` → `pinned-actions-required-workflow active`.
+
+**A retargeted PR cannot merge unscanned, but it waits for a push.** A workflow required by a ruleset runs on its own
+trigger list and ignores the `types` in the file, so a retarget (a stacked PR whose base PR merged) starts no required run.
+A PR opened against another branch never got a required run (the ruleset covers the default branch only), so after the
+retarget the required workflow shows as expected and the PR cannot merge. Strict mode forces a branch update only when
+`main` is not yet an ancestor of the head; when the head already contains `main`, nothing forces one. In both cases start
+the required run yourself: push a commit (or use "Update branch"), or close and reopen the PR, which runs it on the same
+head. After a retarget, a required result exists only if a run already happened on that head while the PR targeted `main`.
+The required run scans the PR's head commit, not its merge ref: a retarget changes the base but not the head, so an existing
+result still describes the commit under review. The same ruleset also sets "Require branches to be up to date before merging" (strict), which
+GitHub checks on the branch itself: a PR can merge only when `main` is an ancestor of its head, and then the merged tree is
+exactly the head's tree. Bringing a branch up to date is a push, which starts the required run on the new head. The
+`pinned-actions` status context only carries the strict rule. A PR's own copy of the workflow can report that context
+too, but that grants nothing: the merge still needs the required run of `main`'s copy on the current head. In `lium-io`
+the merge queue goes further: every queued group is checked on its own merge commit.
