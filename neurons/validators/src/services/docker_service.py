@@ -6032,6 +6032,9 @@ class DockerService:
                     check = await _run_with_host_timeout(
                         ssh_client, _own_stopped_leftover_check(own_id, pod_owner), REMOVE_CONFIRM_INSPECT_TIMEOUT_SECONDS
                     )
+                    if check.exit_status in (124, 137):
+                        # the host's timeout cut the check short: Docker is wedged, so the sweep ends here
+                        raise TimeoutError(f"the check of leftover {own_id} hit the host timeout")
                     if check.exit_status == 0:
                         marked = _MarkOwnRemovalsOnSubmit(ssh_client, [own_id])
                         rm_timeout = _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS
@@ -6044,11 +6047,13 @@ class DockerService:
                                 check=False,
                                 timeout=rm_timeout + _HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS,
                             )
+                        if removal.exit_status in (124, 137):
+                            # cut short by the host timeout: it may still complete, so the mark stays
+                            raise TimeoutError(f"the removal of leftover {own_id} hit the host timeout")
                         if removal.exit_status == 0:
                             own_leftover_removed.append(pod_name)
-                        elif removal.exit_status not in (124, 137):
-                            # Docker refused it; a removal cut short by the host timeout may still complete
-                            marked.take_back()
+                        else:
+                            marked.take_back()  # Docker refused it
             container_names = " ".join(shlex.quote(name) for name in stale_containers)
             if not container_names:
                 return own_leftover_removed

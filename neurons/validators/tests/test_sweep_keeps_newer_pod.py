@@ -291,7 +291,7 @@ def _sweep_service():
     )
 
 
-@pytest.mark.parametrize(("check_exit", "rm_exit"), [(0, 0), (0, 1), (0, 124), (3, 0)])
+@pytest.mark.parametrize(("check_exit", "rm_exit"), [(0, 0), (0, 1), (3, 0)])
 @pytest.mark.parametrize("listing", [f"pod_target {OWN_ID}\n", "pod_target\n"], ids=["with-id", "without-id"])
 @pytest.mark.asyncio
 async def test_a_pod_creates_sweep_never_force_removes_the_pods_own_name_or_its_volume(
@@ -300,7 +300,7 @@ async def test_a_pod_creates_sweep_never_force_removes_the_pods_own_name_or_its_
     """DAH-6531: one pod keeps one name on every registration; on a shared daemon it may be another registration's
     running replacement, labelled or made before the labels. Only the checked leftover may be removed, and a removal
     is recorded as this sweep's only once the check passed: one Docker refused leaves no record, one the host timeout
-    cut short keeps it (Docker may still complete it)."""
+    cut short keeps it (Docker may still complete it) and ends the sweep (see the host-timeout test)."""
     own_sweep_removals.clear()
     ssh_client, seen = _sweep_ssh(listing, {"check": check_exit, "rm": rm_exit})
 
@@ -314,7 +314,7 @@ async def test_a_pod_creates_sweep_never_force_removes_the_pods_own_name_or_its_
         [("check", False)] + ([("rm", True)] if check_exit == 0 else []) if listed else []
     )
     assert seen == expected  # nothing is marked before the check passes
-    assert own_sweep_removals.sent_rm_for(OWN_ID) is (listed and check_exit == 0 and rm_exit in (0, 124))
+    assert own_sweep_removals.sent_rm_for(OWN_ID) is (listed and check_exit == 0 and rm_exit == 0)
     assert removed == (["pod_target"] if listed and check_exit == 0 and rm_exit == 0 else [])
     own_sweep_removals.clear()
 
@@ -341,4 +341,30 @@ async def test_a_stalled_docker_behind_a_live_ssh_session_ends_the_sweep_at_its_
     assert sweep_task in done
     with pytest.raises(TimeoutError):
         sweep_task.result()
+    own_sweep_removals.clear()
+
+
+@pytest.mark.parametrize("status", [124, 137])
+@pytest.mark.parametrize("stalled", ["check", "rm"])
+@pytest.mark.asyncio
+async def test_a_host_timeout_of_the_check_or_removal_ends_the_sweep_before_any_volume_step(
+    retry_ssh_mock, stalled, status
+):
+    # the host's own timeout answers first: the sweep must not go on to the volume listing, which has no deadline
+    own_sweep_removals.clear()
+    ssh_client, seen = _sweep_ssh(f"pod_target {OWN_ID}\n", {stalled: status})
+
+    with pytest.raises(TimeoutError):
+        await _sweep_service().clean_existing_containers(
+            ssh_client=ssh_client,
+            default_extra={},
+            pod_name="pod_target",
+            active_container_names=[],
+            pod_owner=OWNER,
+            clear_volume=True,
+        )
+
+    assert [kind for kind, _ in seen] == ["list", "check"] + (["rm"] if stalled == "rm" else [])
+    assert retry_ssh_mock.await_args_list == []
+    assert own_sweep_removals.sent_rm_for(OWN_ID) is (stalled == "rm")  # a removal that may still complete stays marked
     own_sweep_removals.clear()
