@@ -45,7 +45,7 @@ class BackendMessageType(enum.Enum):
     LockPodGpuClocksRequest = "LockPodGpuClocksRequest"
     # 2.6.0: validate one node now (a provider's "Recheck now")
     RecheckExecutorRequest = "RecheckExecutorRequest"
-    # 2.18.0: delete a moved pod's container on the node it left, only on the host that node booted as
+    # 2.23.0: delete a moved pod's container on the node it left, only on the host that node booted as
     ContainerDeleteOnNodeLeftRequest = "ContainerDeleteOnNodeLeftRequest"
 
 
@@ -209,7 +209,7 @@ class ContainerDeleteRequest(ContainerRequest):
 
 @BACKEND_MESSAGES.register
 class ContainerDeleteOnNodeLeftRequest(ContainerDeleteRequest):
-    """2.18.0: a ContainerDeleteRequest for the node a moved pod left. The node's registration can point at
+    """2.23.0: a ContainerDeleteRequest for the node a moved pod left. The node's registration can point at
     another host by the time it is sent, so the validator deletes only when the host it reaches reports
     `expected_boot_id` (/proc/sys/kernel/random/boot_id) and otherwise answers a FailedContainerRequest with
     `NotTheNodeLeft`. Its own type, not a field: a validator that does not know it refuses the message

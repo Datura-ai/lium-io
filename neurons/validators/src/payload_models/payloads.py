@@ -517,7 +517,7 @@ class ContainerDeleteRequest(ContainerBaseRequest):
 
 
 class ContainerDeleteOnNodeLeftRequest(ContainerDeleteRequest):
-    """lium_protocol 2.18.0: the delete for the node a moved pod left. Its registration may point at another host
+    """lium_protocol 2.23.0: the delete for the node a moved pod left. Its registration may point at another host
     by now, so the delete runs only on a host whose boot id is expected_boot_id (DockerService.delete_container)."""
 
     message_type: ContainerRequestType = ContainerRequestType.ContainerDeleteOnNodeLeftRequest
@@ -790,7 +790,7 @@ class ContainerStopped(ContainerBaseResponse):
 
 class ContainerDeleted(ContainerBaseResponse):
     message_type: ContainerResponseType = ContainerResponseType.ContainerDeleted
-    # lium_protocol 2.18.0: a ContainerDeleteOnNodeLeftRequest's command_id, echoed; empty for any other delete
+    # lium_protocol 2.23.0: a ContainerDeleteOnNodeLeftRequest's command_id, echoed; empty for any other delete
     command_id: str = ""
 
 
@@ -833,9 +833,9 @@ class FailedContainerErrorCodes(enum.Enum):
     # DAH-2703: the container we created was gone from the host before creation finished — a
     # host-side reaper, not a container that failed on its own.
     ContainerVanished = "ContainerVanished"
-    # lium_protocol 2.18.0: a delete for the node a moved pod left reached a host with another boot id
+    # lium_protocol 2.23.0: a delete for the node a moved pod left reached a host with another boot id
     NotTheNodeLeft = "NotTheNodeLeft"
-    # lium_protocol 2.18.0: the create met the pod's name held by another registration's container on this daemon
+    # lium_protocol 2.23.0: the create met the pod's name held by another registration's container on this daemon
     SameNameHeldByNodeLeft = "SameNameHeldByNodeLeft"
 
 

@@ -1285,7 +1285,7 @@
       "type": "object"
     },
     "ContainerDeleteOnNodeLeftRequest": {
-      "description": "2.18.0: a ContainerDeleteRequest for the node a moved pod left. The node's registration can point at\nanother host by the time it is sent, so the validator deletes only when the host it reaches reports\n`expected_boot_id` (/proc/sys/kernel/random/boot_id) and otherwise answers a FailedContainerRequest with\n`NotTheNodeLeft`. Its own type, not a field: a validator that does not know it refuses the message\ninstead of deleting unchecked.",
+      "description": "2.23.0: a ContainerDeleteRequest for the node a moved pod left. The node's registration can point at\nanother host by the time it is sent, so the validator deletes only when the host it reaches reports\n`expected_boot_id` (/proc/sys/kernel/random/boot_id) and otherwise answers a FailedContainerRequest with\n`NotTheNodeLeft`. Its own type, not a field: a validator that does not know it refuses the message\ninstead of deleting unchecked.",
       "properties": {
         "command_id": {
           "default": "",
@@ -6732,7 +6732,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "2.18.0",
+  "protocol_version": "2.23.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"

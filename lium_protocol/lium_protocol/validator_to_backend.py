@@ -95,9 +95,9 @@ class FailedContainerErrorCodes(enum.Enum):
     ContainerVanished = "ContainerVanished"
     # DAH-3338: the miner knows the executor but could not reach it; distinct from InvalidExecutorId
     ExecutorUnreachable = "ExecutorUnreachable"
-    # 2.18.0: a ContainerDeleteOnNodeLeftRequest reached a host with another boot id; nothing was deleted
+    # 2.23.0: a ContainerDeleteOnNodeLeftRequest reached a host with another boot id; nothing was deleted
     NotTheNodeLeft = "NotTheNodeLeft"
-    # 2.18.0: the create met the pod's name held by another registration's container (for a moved pod, the node-left
+    # 2.23.0: the create met the pod's name held by another registration's container (for a moved pod, the node-left
     # delete's); the backend sends the create once more after that delete is confirmed
     SameNameHeldByNodeLeft = "SameNameHeldByNodeLeft"
 
@@ -470,7 +470,7 @@ class ContainerStopped(PodContainerResponse):
 @VALIDATOR_MESSAGES.register
 class ContainerDeleted(PodContainerResponse):
     message_type: ValidatorMessageType = ValidatorMessageType.ContainerDeleted
-    # 2.18.0: a ContainerDeleteOnNodeLeftRequest's command_id, echoed so the backend can tell which delete this answers;
+    # 2.23.0: a ContainerDeleteOnNodeLeftRequest's command_id, echoed so the backend can tell which delete this answers;
     # empty for any other delete and from older validators
     command_id: str = ""
 
@@ -495,7 +495,7 @@ class SshPubKeyRemoved(PodContainerResponse):
 class FailedContainerRequest(PodContainerResponse):
     message_type: ValidatorMessageType = ValidatorMessageType.FailedRequest
     # the failed request's command_id, echoed for an AddSshPublicKeyRequest, (since lium-io#2028) a
-    # ContainerCreateRequest and (2.18.0) a ContainerDeleteOnNodeLeftRequest; empty otherwise and from older validators
+    # ContainerCreateRequest and (2.23.0) a ContainerDeleteOnNodeLeftRequest; empty otherwise and from older validators
     command_id: str = ""
     error_type: FailedContainerErrorTypes = FailedContainerErrorTypes.ContainerCreationFailed
     error_code: FailedContainerErrorCodes | None = None
