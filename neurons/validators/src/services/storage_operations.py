@@ -328,7 +328,9 @@ def _incumbent_condition(files: StorageOperationFiles) -> str:
             f"(*) kill -0 \"$p\" 2>/dev/null && tr '\\0' ' ' < /proc/\"$p\"/cmdline | grep -qF -- {spec_arg};; esac; }}"
         )
 
-    return f"{{ [ -e {q(files.done)} ] || [ -s {q(files.status)} ] || {live(files.launcher)} || {live(files.pid)}; }}"
+    # liveness first, then the status, then the done marker: the order the wrapper publishes them in reverse (status,
+    # then done, then it exits), so a run that ends between two reads is still found by a later one
+    return f"{{ {live(files.launcher)} || {live(files.pid)} || [ -s {q(files.status)} ] || [ -e {q(files.done)} ]; }}"
 
 
 async def _has_incumbent(ssh_client: asyncssh.SSHClientConnection, files: StorageOperationFiles) -> bool:

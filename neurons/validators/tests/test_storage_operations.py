@@ -1,6 +1,7 @@
 import inspect
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -368,3 +369,24 @@ def test_a_staging_failure_during_another_dispatchs_launch_handoff_waits_for_its
         for r in runners:
             r.kill()
             r.wait()
+
+
+def test_a_run_that_ends_between_the_checks_is_still_found(node: Path) -> None:
+    # the wrapper publishes its end as: status, PID record removed, done marker, status removed, exit. A stand-in grep
+    # ends the run at the first liveness check, as if it finished between two reads: the later checks find it
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    for path in (files.launcher, files.pid):
+        Path(str(path)).write_text(f"{os.getpid()}\n")
+    fake_bin, ended = node / "bin", node / "ended"
+    fake_bin.mkdir()
+    q = lambda path: shlex.quote(str(path))  # noqa: E731
+    (fake_bin / "grep").write_text(
+        "#!/bin/sh\n"
+        f"if [ ! -e {q(ended)} ]; then : > {q(ended)}; printf '0\\n' > {q(files.status)}; rm -f {q(files.pid)}; "
+        f": > {q(files.done)}; rm -f {q(files.status)}; cat > /dev/null; exit 1; fi\n"
+        'exec /usr/bin/grep "$@"\n'
+    )
+    (fake_bin / "grep").chmod(0o755)
+    check = f"if {storage_operations._incumbent_condition(files)}; then echo YES; fi"
+    done = subprocess.run(["sh", "-c", check], capture_output=True, text=True, env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"})
+    assert ended.exists() and done.stdout.strip() == "YES"
