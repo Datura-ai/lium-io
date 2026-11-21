@@ -788,19 +788,22 @@ async def carry_renter_gpu_reset_results(
     The provider loses nothing: the carried result is scored as in the cycle it came from, with this cycle's
     pay flags and a fresh ban lookup. A node the backend no longer lists as rented (`rented_executor_ids`,
     lower-case), or without a readable last result, keeps the held one, and `withhold_renter_gpu_reset_verdicts`
-    takes it out.
+    takes it out. A run stopped for a renter's create (`RENTED_SINCE_CYCLE_START`) carries without the rented list:
+    the provider did not end it, so a create that then fails takes nothing from the cycle.
     """
     for miner_hotkey, results in job_results.items():
         for index, held in enumerate(results):
             if not _held_for_renter_gpu_reset(held):
                 continue
-            if str(held.executor_info.uuid).lower() not in rented_executor_ids:
+            # a run stopped for a renter's create carries whether or not the create then succeeds
+            rented_mid_cycle = held.failure_reason_code == _RENTED_MID_CYCLE
+            if not rented_mid_cycle and str(held.executor_info.uuid).lower() not in rented_executor_ids:
                 continue
             previous = await _last_scored_result(redis_service, miner_hotkey, held)
             if previous is None:
                 continue
             # an idle score stands only for a node rented mid-cycle; the other holds keep carrying rented scores only
-            if not previous.is_rented and held.failure_reason_code != _RENTED_MID_CYCLE:
+            if not previous.is_rented and not rented_mid_cycle:
                 continue
             results[index] = previous.model_copy(
                 update={

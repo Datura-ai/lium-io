@@ -477,6 +477,33 @@ async def test_a_node_rented_mid_cycle_keeps_its_idle_score_of_the_cycle_before(
 
 
 @pytest.mark.asyncio
+async def test_a_node_whose_mid_cycle_create_failed_still_keeps_its_score_of_the_cycle_before():
+    # the create failed, so the backend lists no pod on the node at the cycle end
+    service = _redis_service()
+    await remember_scored_results({"5Miner": [_scored("node-1")]}, service)
+    held = _failed("node-1", TenantMsg.RENTED_SINCE_CYCLE_START.reason)
+
+    kept, withheld = await _carry_then_withhold(service, [held], rented_executor_ids=frozenset())
+
+    [carried] = kept["5Miner"]
+    assert carried.is_successful and carried.carried_for_renter_gpu_reset and carried.score == 1.0
+    assert withheld == []
+
+
+@pytest.mark.asyncio
+async def test_a_gpu_reset_hold_on_a_node_no_longer_rented_is_still_withheld():
+    service = _redis_service()
+    await remember_scored_results({"5Miner": [_rented_scored("node-1")]}, service)
+
+    kept, withheld = await _carry_then_withhold(
+        service, [_failed("node-1", Msg.SCRAPE_GPU_RESET_IN_PROGRESS.reason)], rented_executor_ids=frozenset()
+    )
+
+    assert kept == {"5Miner": []}
+    assert [w.result.executor_info.uuid for w in withheld] == ["node-1"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("reason", [Msg.SCRAPE_GPU_RESET_IN_PROGRESS.reason, PowerMsg.TIER_STATE_UNKNOWN.reason])
 async def test_an_idle_score_stands_only_for_a_node_rented_mid_cycle(reason):
     # a renter's GPU reset or an unknown power tier after an idle cycle stays withheld, as before

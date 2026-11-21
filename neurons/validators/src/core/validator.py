@@ -1591,7 +1591,7 @@ class Validator:
         rented_now: RentedExecutorsResponse | None,
     ) -> None:
         """DAH-4658: only a node the backend still lists as rented carries its score: at the cycle end (`rented_now`),
-        or in this cycle's snapshot when the backend did not answer."""
+        or in this cycle's snapshot when the backend did not answer. A run stopped for a renter's create needs no listing."""
         if not has_renter_gpu_reset_holds(all_job_results):
             return
         rented = rented_now or rented_executors
