@@ -177,6 +177,10 @@ class StorageOperationFiles:
     pid: PurePosixPath
     status: PurePosixPath
     cancel: PurePosixPath
+    # the operation's launch lock, its launcher's PID and an online run's done marker: none holds a credential
+    lock: PurePosixPath
+    launcher: PurePosixPath
+    done: PurePosixPath
 
     @classmethod
     def for_operation(cls, operation_id: UUID) -> StorageOperationFiles:
@@ -187,6 +191,9 @@ class StorageOperationFiles:
             pid=REMOTE_OPERATION_DIRECTORY / f"{stem}.pid",
             status=REMOTE_OPERATION_DIRECTORY / f"{stem}.status",
             cancel=REMOTE_OPERATION_DIRECTORY / f"{stem}.cancel",
+            lock=REMOTE_OPERATION_DIRECTORY / f"{stem}.lock",
+            launcher=REMOTE_OPERATION_DIRECTORY / f"{stem}.launcher",
+            done=REMOTE_OPERATION_DIRECTORY / f"{stem}.done",
         )
 
 
@@ -269,28 +276,6 @@ async def start_storage_operation(
             f"install -d -m 0700 {shlex.quote(str(REMOTE_OPERATION_DIRECTORY))}",
             check=True,
         )
-        existing_state = await _operation_state(ssh_client, files)
-        if existing_state == "STARTING" and await _remote_file_exists(ssh_client, files.spec):
-            # A repeated backend dispatch can arrive while the first wrapper is between
-            # writing its spec and PID. Give that deterministic operation a chance to appear.
-            for _ in range(20):
-                await asyncio.sleep(0.25)
-                existing_state = await _operation_state(ssh_client, files)
-                if existing_state != "STARTING":
-                    break
-        if existing_state == "RUNNING" or existing_state.startswith("STATUS:"):
-            return files
-        if await _runner_alive(ssh_client, files):
-            # an earlier dispatch's runner is still working, even before it wrote its PID or started
-            # its helper; a second runner would interrupt it.
-            # A helper whose runner died is an orphan: it is removed below and the run relaunched.
-            return files
-        if existing_state in {"EXITED", "INVALID"} or await _remote_file_exists(
-            ssh_client, files.spec
-        ):
-            await _remove_operation_artifacts(ssh_client, files)
-        await _remove_stale_helper_container(ssh_client, operation_id)
-
         # stage and verify the runner first: the spec carries the repository credentials, so it is written only once the
         # runner that consumes and removes it is in place; a failed unpack or check leaves no spec and no partial directory
         staged = await ssh_client.run(
@@ -300,60 +285,82 @@ async def start_storage_operation(
             check=True,
         )
         stage_dir = _staged_directory(staged.stdout)
-        claimed = False
-        try:
-            # the spec's exclusive create is this dispatch's claim on the operation: a repeated dispatch that passed the
-            # checks above while this one was staging finds the spec there and leaves the operation to its owner
-            async with ssh_client.start_sftp_client() as sftp:
-                async with sftp.open(str(files.spec), "x", asyncssh.SFTPAttrs(permissions=0o600)) as remote_spec:
-                    claimed = True
-                    await remote_spec.write(json.dumps(dict(spec), separators=(",", ":"), sort_keys=True))
-
-            # the validator's runner and storage package, staged in a root-only directory ($D) that goes when the runner
-            # has exited
-            runner = (
-                f'{shlex.quote(python_path)} -E -s "$D"/{executor_payload.STORAGE[0]} '
-                f"--spec {shlex.quote(str(files.spec))} --cancel-file {shlex.quote(str(files.cancel))}"
-            )
-            terminal_cleanup = (
-                ""
-                if retain_terminal_artifacts
-                # a failed run keeps its log: a runner that dies before reporting leaves no other trace
-                else f"; rm -f {shlex.quote(str(files.status))}; "
-                f'if [ "$result" = 0 ]; then rm -f {shlex.quote(str(files.log))}; '
-                f"else echo \"runner exited $result\" >> {shlex.quote(str(files.log))}; fi"
-            )
-            # Bootstrap callers consume the terminal files; detached online jobs
-            # remove them themselves after the runner has finished reporting.
-            wrapper = (
-                f"rm -f {shlex.quote(str(files.status))} {shlex.quote(str(files.cancel))}; "
-                f"{runner} & child=$!; "
-                f"printf '%s\\n' \"$child\" > {shlex.quote(str(files.pid))}; "
-                "trap 'kill -TERM \"$child\" 2>/dev/null || true' TERM INT; "
-                'wait "$child"; result=$?; rm -rf "$D"; '
-                f"printf '%s\\n' \"$result\" > {shlex.quote(str(files.status))}; "
-                f"rm -f {shlex.quote(str(files.spec))} {shlex.quote(str(files.pid))} "
-                f"{shlex.quote(str(files.cancel))}{terminal_cleanup}"
-            )
-            launch_command = (
-                f"D={shlex.quote(stage_dir)} nohup /bin/sh -c {shlex.quote(wrapper)} "
-                f"> {shlex.quote(str(files.log))} 2>&1 < /dev/null &"
-            )
-            await ssh_client.run(launch_command, check=True)
-        except Exception:
-            if not claimed:
-                # the operation's spec is another dispatch's (or none was made): only the runner staged here goes
-                await ssh_client.run(f"rm -rf {shlex.quote(stage_dir)}", check=False)
-                if await _remote_file_exists(ssh_client, files.spec):
-                    return files
-                raise
-            # no runner took this dispatch's spec: remove it and the staged runner here
-            await ssh_client.run(f"rm -rf {shlex.quote(stage_dir)} {shlex.quote(str(files.spec))}", check=False)
-            raise
+        result = await ssh_client.run(
+            _launch_command(files, operation_id, python_path, stage_dir, retain_terminal_artifacts),
+            input=json.dumps(dict(spec), separators=(",", ":"), sort_keys=True),
+            check=False,
+        )
+        if result.exit_status != 0 or (result.stdout or "").strip() not in (_LAUNCHED, _ALREADY_LAUNCHED):
+            raise StorageOperationLaunchError(f"storage runner launch failed (exit {result.exit_status})")
         return files
     except Exception as error:
         await report_launch_failure(operation_id, spec, error)
         raise
+
+
+_LAUNCHED = "LAUNCHED"
+_ALREADY_LAUNCHED = "ALREADY_LAUNCHED"
+# an online run's done marker outlives the backend's re-dispatches of the operation: they stop once its terminal report
+# lands or its stale sweep fails it (15 min without a heartbeat). Swept only as housekeeping, a day after
+_FINISHED_MARKER_SWEEP_MINUTES = 24 * 60
+
+
+def _launch_command(
+    files: StorageOperationFiles,
+    operation_id: UUID,
+    python_path: str,
+    stage_dir: str,
+    retain_terminal_artifacts: bool,
+) -> str:
+    """One shell, under the operation's own lock, that decides whether this dispatch launches the operation and, if so,
+    launches it. Under that lock it checks for a terminal result or a live launcher, removes a dead run's leftovers,
+    writes the spec from stdin and records the launcher's PID, so a second dispatch of the operation waits for the lock
+    and then finds this one's launcher (or its result) and launches nothing. The lock is the operation's, not its spec,
+    which the runner removes once it has read it. A dispatch that launches nothing removes only the runner it staged."""
+    q = lambda path: shlex.quote(str(path))  # noqa: E731
+    stage = shlex.quote(stage_dir)
+    runner = (
+        f'{shlex.quote(python_path)} -E -s "$D"/{executor_payload.STORAGE[0]} '
+        f"--spec {q(files.spec)} --cancel-file {q(files.cancel)}"
+    )
+    terminal_cleanup = (
+        ""
+        if retain_terminal_artifacts
+        # the done marker first: a re-dispatch after this run must find it finished, not relaunch it. A failed run
+        # keeps its log: a runner that dies before reporting leaves no other trace
+        else f"; : > {q(files.done)}; rm -f {q(files.status)}; "
+        f'if [ "$result" = 0 ]; then rm -f {q(files.log)}; '
+        f"else echo \"runner exited $result\" >> {q(files.log)}; fi"
+    )
+    # Bootstrap callers consume the terminal files; detached online jobs remove them themselves after the runner
+    # has finished reporting.
+    wrapper = (
+        f"rm -f {q(files.status)} {q(files.cancel)}; "
+        f"{runner} & child=$!; "
+        f"printf '%s\\n' \"$child\" > {q(files.pid)}; "
+        "trap 'kill -TERM \"$child\" 2>/dev/null || true' TERM INT; "
+        'wait "$child"; result=$?; rm -rf "$D"; '
+        f"printf '%s\\n' \"$result\" > {q(files.status)}; "
+        f"rm -f {q(files.spec)} {q(files.pid)} {q(files.cancel)}{terminal_cleanup}"
+    )
+    # a recorded launcher is live only while that PID still runs this operation's wrapper (a reused PID does not)
+    launcher_live = (
+        f'l=$(cat {q(files.launcher)} 2>/dev/null); case "$l" in (*[!0-9]*|"") false;; '
+        f'(*) kill -0 "$l" 2>/dev/null && grep -qaF -- {shlex.quote("--spec " + str(files.spec))} /proc/"$l"/cmdline;; esac'
+    )
+    already = f'rm -rf -- {stage}; cat > /dev/null; echo {_ALREADY_LAUNCHED}; exit 0'
+    return (
+        f"exec 9>>{q(files.lock)} && flock -x 9 || {{ rm -rf -- {stage}; exit 1; }}; "
+        f"find {q(REMOTE_OPERATION_DIRECTORY)} -maxdepth 1 \\( -name '*.done' -o -name '*.launcher' -o -name '*.lock' \\) "
+        f"-mmin +{_FINISHED_MARKER_SWEEP_MINUTES} -delete 2>/dev/null; "
+        f"if [ -e {q(files.done)} ] || [ -s {q(files.status)} ] || {{ {launcher_live}; }}; then {already}; fi; "
+        # no result and no live launcher: whatever an earlier run left is stale, its helper container included
+        f"rm -f {q(files.status)} {q(files.log)} {q(files.pid)} {q(files.spec)} {q(files.cancel)} {q(files.launcher)}; "
+        f"/usr/bin/docker rm -f -- {shlex.quote(storage_helper_name(operation_id))} >/dev/null 2>&1 || true; "
+        f"(umask 077 && cat > {q(files.spec)}) || {{ rm -rf -- {stage} {q(files.spec)}; exit 1; }}; "
+        f"D={stage} nohup /bin/sh -c {shlex.quote(wrapper)} > {q(files.log)} 2>&1 < /dev/null 9>&- & "
+        f"printf '%s\\n' \"$!\" > {q(files.launcher)}; echo {_LAUNCHED}"
+    )
 
 
 def _staged_directory(stdout: object) -> str:
@@ -509,38 +516,6 @@ async def _read_operation_spec(
     except json.JSONDecodeError:
         return None
     return value if isinstance(value, Mapping) else None
-
-
-async def _remote_file_exists(
-    ssh_client: asyncssh.SSHClientConnection,
-    path: PurePosixPath,
-) -> bool:
-    result = await ssh_client.run(f"test -e {shlex.quote(str(path))}", check=False)
-    return result.exit_status == 0
-
-
-async def _runner_alive(
-    ssh_client: asyncssh.SSHClientConnection,
-    files: StorageOperationFiles,
-) -> bool:
-    # "[-]-spec" keeps pgrep from matching this command's own shell
-    runner_pattern = f"[-]-spec {files.spec}"
-    result = await ssh_client.run(
-        f"pgrep -f -- {shlex.quote(runner_pattern)} >/dev/null",
-        check=False,
-    )
-    return result.exit_status == 0
-
-
-async def _remove_stale_helper_container(
-    ssh_client: asyncssh.SSHClientConnection,
-    operation_id: UUID,
-) -> None:
-    helper_name = storage_helper_name(operation_id)
-    await ssh_client.run(
-        f"/usr/bin/docker rm -f -- {shlex.quote(helper_name)} >/dev/null 2>&1 || true",
-        check=False,
-    )
 
 
 async def _tail_operation_log(

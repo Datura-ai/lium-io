@@ -54,44 +54,6 @@ async def test_cancel_fallback_removes_the_helper_container(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("runner_alive", [True, False])
-async def test_a_repeated_dispatch_never_starts_a_second_runner(
-    monkeypatch: pytest.MonkeyPatch, runner_alive: bool
-) -> None:
-    # The first runner has read (and deleted) its spec but has no PID or helper yet: the state is STARTING.
-    monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
-    monkeypatch.setattr(storage_operations.asyncio, "sleep", AsyncMock())
-    commands: list[str] = []
-
-    async def run(command: str, check: bool = False) -> SimpleNamespace:
-        commands.append(command)
-        stdout = ""
-        status = 1 if command.startswith("test -e") else 0
-        if "echo STARTING" in command:
-            stdout = "STARTING\n"
-        elif command.startswith("pgrep -f"):
-            status = 0 if runner_alive else 1
-        return SimpleNamespace(exit_status=status, stdout=stdout, stderr="")
-
-    ssh_client = SimpleNamespace(run=run, start_sftp_client=None)
-    if runner_alive:
-        files = await storage_operations.start_storage_operation(
-            ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
-        )
-        assert files == storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
-    else:
-        monkeypatch.setattr(storage_operations, "report_launch_failure", AsyncMock())
-        with pytest.raises(TypeError):  # stops at the sftp spec write, after the stale-helper removal
-            await storage_operations.start_storage_operation(
-                ssh_client, "python3", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
-            )
-    probe = next(c for c in commands if c.startswith("pgrep -f"))
-    assert f"[-]-spec {storage_operations.StorageOperationFiles.for_operation(OPERATION_ID).spec}" in probe
-    assert any("docker rm -f" in c for c in commands) is not runner_alive
-    assert any("nohup" in c for c in commands) is False  # never launched a second wrapper
-
-
-@pytest.mark.asyncio
 async def test_a_cancel_reports_with_the_reporter_the_runner_left_in_its_spec(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -113,99 +75,156 @@ async def test_a_cancel_reports_with_the_reporter_the_runner_left_in_its_spec(
     assert "redis" not in inspect.signature(storage_operations.start_storage_operation).parameters
 
 
-@pytest.mark.parametrize("exit_code", [0, 3])
-def test_detached_wrapper_keeps_the_log_only_when_the_runner_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int
-) -> None:
-    # runs the real launch wrapper with a fake runner; a failed run must leave its log behind
-    import asyncio as aio
-
+@pytest.fixture
+def node(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A stand-in executor: the operation directory, the staging parent and the validator's runner payload (a script
+    the test writes per case), with every remote command run by a local shell."""
     monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", storage_operations.PurePosixPath(str(tmp_path)))
     monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
-    # the validator's runner, staged from its payloads: a stand-in that logs and exits
+    monkeypatch.setattr(storage_operations, "report_launch_failure", AsyncMock())
     payloads = tmp_path / "payloads"
     payloads.mkdir()
-    (payloads / "storage_runner.py").write_text(f"print('working', flush=True)\nraise SystemExit({exit_code})\n")
     monkeypatch.setattr(executor_payload, "PAYLOAD_DIR", payloads)
     monkeypatch.setattr(executor_payload, "STORAGE", ("storage_runner.py",))
     monkeypatch.setattr(executor_payload, "SERVICE_DIR_PARENT", str(tmp_path / "service"))
     (tmp_path / "service").mkdir()
-    launched: list[tuple[str, str]] = []
+    return tmp_path
 
-    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
-        if "nohup" in command:
-            launched.append((command, input))
-            return SimpleNamespace(exit_status=0, stdout="", stderr="")
-        done = subprocess.run(["sh", "-c", command], input=input, capture_output=True, text=True)
-        if check and done.returncode:
-            raise RuntimeError(f"exit {done.returncode}")
-        return SimpleNamespace(exit_status=done.returncode, stdout=done.stdout, stderr=done.stderr)
 
-    class Sftp:
-        async def __aenter__(self):
-            return self
+def _runner(node: Path, body: str) -> None:
+    (node / "payloads" / "storage_runner.py").write_text(body)
 
-        async def __aexit__(self, *exc):
-            return False
 
-        def open(self, path, mode, attrs=None):
-            class Handle:
-                async def __aenter__(self):
-                    if "x" in mode:
-                        os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
-                    return self
+async def _run_locally(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+    done = subprocess.run(["sh", "-c", command.replace("/usr/bin/docker", "true")], input=input, capture_output=True, text=True)
+    if check and done.returncode:
+        raise RuntimeError(f"exit {done.returncode}")
+    return SimpleNamespace(exit_status=done.returncode, stdout=done.stdout, stderr=done.stderr)
 
-                async def __aexit__(self, *exc):
-                    return False
 
-                async def write(self, data):
-                    open(path, "w").write(data)
+def _dispatch(spec: dict | None = None, retain: bool = False) -> storage_operations.StorageOperationFiles:
+    import asyncio as aio
 
-            return Handle()
-
-        async def chmod(self, path, mode):
-            return None
-
-    ssh_client = SimpleNamespace(run=run, start_sftp_client=lambda: Sftp())
-    files = aio.run(
+    return aio.run(
         storage_operations.start_storage_operation(
-            ssh_client, sys.executable, OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+            SimpleNamespace(run=_run_locally), sys.executable, OPERATION_ID, spec or {"engine": "restic"},
+            retain_terminal_artifacts=retain,
         )
     )
-    command, _ = launched[0]
-    assert "storage_runner.py" in command and storage_operations.REMOTE_RUNNER_PATH not in command
-    # the launch in the foreground: the wrapper's own end (its cleanup) is then over when this returns
-    subprocess.run(["sh", "-c", command.replace("nohup ", "").rsplit(" &", 1)[0]], text=True, check=True)
-    assert not list((tmp_path / "service").iterdir())  # the staged runner goes when it has exited
+
+
+def _wait_for(path: Path, gone: bool = False, seconds: float = 10.0) -> None:
+    import time
+
+    deadline = time.time() + seconds
+    while path.exists() is gone:
+        assert time.time() < deadline, f"{path} {'still there' if gone else 'never appeared'}"
+        time.sleep(0.05)
+
+
+def _staged(node: Path) -> list[str]:
+    return [p.name for p in (node / "service").iterdir()]
+
+
+@pytest.mark.parametrize("exit_code", [0, 3])
+def test_an_online_run_leaves_its_done_marker_and_its_log_only_when_it_fails(node: Path, exit_code: int) -> None:
+    _runner(node, f"print('working', flush=True)\nraise SystemExit({exit_code})\n")
+    files = _dispatch()
+    _wait_for(Path(str(files.done)))
+    _wait_for(Path(str(files.pid)), gone=True)
+    assert _staged(node) == []   # the staged runner goes when it has exited
+    assert not Path(str(files.status)).exists() and not Path(str(files.spec)).exists()
     log = Path(str(files.log))
-    assert not Path(str(files.status)).exists()
     if exit_code:
         assert log.read_text().splitlines() == ["working", "runner exited 3"]
     else:
         assert not log.exists()
 
 
+def test_a_re_dispatch_after_an_online_run_finished_never_runs_it_again(node: Path) -> None:
+    # the online wrapper removes its spec and status when the run ends; a re-dispatch (its terminal report not landed
+    # yet) must still find the operation finished
+    runs = node / "runs"
+    _runner(node, f"open({str(runs)!r}, 'a').write('run\\n')\n")
+    files = _dispatch()
+    _wait_for(Path(str(files.done)))
+    _wait_for(Path(str(files.pid)), gone=True)
+    assert _dispatch() == files
+    import time
+
+    time.sleep(0.5)
+    assert runs.read_text() == "run\n" and _staged(node) == []
+    assert not Path(str(files.spec)).exists()   # the re-dispatch's credentials were never written
+
+
+def test_a_re_dispatch_while_the_runner_works_launches_nothing_once_the_runner_removed_its_spec(node: Path) -> None:
+    # the runner reads and removes its spec at once, before any PID of its own: the launcher recorded under the lock
+    # is what a second dispatch finds, so it neither overwrites the spec nor starts a second wrapper
+    runs, release = node / "runs", node / "release"
+    _runner(node, (
+        "import pathlib, sys, time\n"
+        "spec = pathlib.Path(sys.argv[sys.argv.index('--spec') + 1]); spec.unlink()\n"
+        f"open({str(runs)!r}, 'a').write('run\\n')\n"
+        f"while not pathlib.Path({str(release)!r}).exists(): time.sleep(0.05)\n"
+    ))
+    files = _dispatch()
+    _wait_for(runs)
+    _wait_for(Path(str(files.spec)), gone=True)
+    try:
+        assert _dispatch({"engine": "restic", "second": True}) == files
+        assert not Path(str(files.spec)).exists() and len(_staged(node)) == 1   # only the first run's runner
+    finally:
+        release.write_text("")
+    _wait_for(Path(str(files.done)))
+    assert runs.read_text() == "run\n"
+
+
+def test_two_dispatches_at_once_launch_one_wrapper(node: Path) -> None:
+    # both pass staging together; the operation's lock lets one launch and the other find its launcher
+    from concurrent.futures import ThreadPoolExecutor
+
+    runs, release = node / "runs", node / "release"
+    _runner(node, (
+        "import pathlib, time\n"
+        f"open({str(runs)!r}, 'a').write('run\\n')\n"
+        f"while not pathlib.Path({str(release)!r}).exists(): time.sleep(0.05)\n"
+    ))
+    try:
+        with ThreadPoolExecutor(4) as pool:
+            results = list(pool.map(lambda _: _dispatch(), range(4)))
+        _wait_for(runs)
+        import time
+
+        time.sleep(0.5)
+        assert runs.read_text() == "run\n" and len(_staged(node)) == 1
+    finally:
+        release.write_text("")
+    assert len(set(results)) == 1
+    _wait_for(Path(str(results[0].done)))
+
+
+def test_a_dead_runs_leftovers_are_removed_and_the_operation_launched_again(node: Path) -> None:
+    # a launcher that died without a result (the node rebooted): its PID no longer runs this operation's wrapper
+    runs = node / "runs"
+    _runner(node, f"open({str(runs)!r}, 'a').write('run\\n')\n")
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    Path(str(files.launcher)).write_text(f"{os.getpid()}\n")   # a live PID, but not this operation's wrapper
+    Path(str(files.spec)).write_text("stale")
+    _dispatch()
+    _wait_for(Path(str(files.done)))
+    assert runs.read_text() == "run\n"
+
+
 @pytest.mark.parametrize("bad_archive", ["not a tar", "changed runner"])
 def test_a_failed_unpack_leaves_no_spec_and_no_staging_directory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_archive: str
+    node: Path, monkeypatch: pytest.MonkeyPatch, bad_archive: str
 ) -> None:
     # the spec carries the repository credentials: it must not exist on the node unless a runner is there to take it
-    import asyncio as aio
     import base64
     import io
     import tarfile
 
-    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", storage_operations.PurePosixPath(str(tmp_path)))
-    monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
-    reported = AsyncMock()
-    monkeypatch.setattr(storage_operations, "report_launch_failure", reported)
-    payloads = tmp_path / "payloads"
-    payloads.mkdir()
-    (payloads / "storage_runner.py").write_text("raise SystemExit(0)\n")
-    monkeypatch.setattr(executor_payload, "PAYLOAD_DIR", payloads)
-    monkeypatch.setattr(executor_payload, "STORAGE", ("storage_runner.py",))
-    monkeypatch.setattr(executor_payload, "SERVICE_DIR_PARENT", str(tmp_path / "service"))
-    (tmp_path / "service").mkdir()
+    _runner(node, "raise SystemExit(0)\n")
     if bad_archive == "not a tar":
         monkeypatch.setattr(executor_payload, "archive", lambda files: base64.b64encode(b"not a tar"))
     else:
@@ -216,83 +235,10 @@ def test_a_failed_unpack_leaves_no_spec_and_no_staging_directory(
             entry.size = len(data)
             tar.addfile(entry, io.BytesIO(data))
         monkeypatch.setattr(executor_payload, "archive", lambda files: base64.b64encode(buffer.getvalue()))
-    sftp_used: list[str] = []
-
-    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
-        done = subprocess.run(["sh", "-c", command], input=input, capture_output=True, text=True)
-        if check and done.returncode:
-            raise RuntimeError(f"exit {done.returncode}")
-        return SimpleNamespace(exit_status=done.returncode, stdout=done.stdout, stderr=done.stderr)
-
-    ssh_client = SimpleNamespace(run=run, start_sftp_client=lambda: sftp_used.append("opened"))
     spec = {"engine": "restic", "repository": {"s3_access_key_id": "AKIA-TEST", "password": "restic-test"}}
     with pytest.raises(RuntimeError):
-        aio.run(
-            storage_operations.start_storage_operation(
-                ssh_client, sys.executable, OPERATION_ID, spec, retain_terminal_artifacts=False
-            )
-        )
+        _dispatch(spec)
     files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
-    assert not Path(str(files.spec)).exists() and sftp_used == []
-    assert not list((tmp_path / "service").iterdir())  # the partial staging directory is gone
-    reported.assert_awaited_once()
-
-
-def test_a_repeated_dispatch_that_stages_alongside_leaves_the_operation_to_the_first(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # two dispatches of one operation both pass the checks while staging: the spec's exclusive create decides the
-    # owner, and the other launches nothing, keeps the owner's spec and removes only what it staged
-    import asyncio as aio
-
-    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", storage_operations.PurePosixPath(str(tmp_path)))
-    monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
-    monkeypatch.setattr(storage_operations, "report_launch_failure", AsyncMock())
-    payloads = tmp_path / "payloads"
-    payloads.mkdir()
-    (payloads / "storage_runner.py").write_text("raise SystemExit(0)\n")
-    monkeypatch.setattr(executor_payload, "PAYLOAD_DIR", payloads)
-    monkeypatch.setattr(executor_payload, "STORAGE", ("storage_runner.py",))
-    monkeypatch.setattr(executor_payload, "SERVICE_DIR_PARENT", str(tmp_path / "service"))
-    (tmp_path / "service").mkdir()
-    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
-    launched: list[str] = []
-
-    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
-        if "nohup" in command:
-            launched.append(command)
-            return SimpleNamespace(exit_status=0, stdout="", stderr="")
-        done = subprocess.run(["sh", "-c", command], input=input, capture_output=True, text=True)
-        if "sha256sum" in command:
-            Path(str(files.spec)).write_text("first dispatch")   # the other dispatch claims it while this one stages
-        if check and done.returncode:
-            raise RuntimeError(f"exit {done.returncode}")
-        return SimpleNamespace(exit_status=done.returncode, stdout=done.stdout, stderr=done.stderr)
-
-    class Sftp:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc):
-            return False
-
-        def open(self, path, mode, attrs=None):
-            class Handle:
-                async def __aenter__(self):
-                    os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))   # raises: it exists
-                    return self
-
-                async def __aexit__(self, *exc):
-                    return False
-
-            return Handle()
-
-    ssh_client = SimpleNamespace(run=run, start_sftp_client=lambda: Sftp())
-    returned = aio.run(
-        storage_operations.start_storage_operation(
-            ssh_client, sys.executable, OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
-        )
-    )
-    assert returned == files and launched == []
-    assert Path(str(files.spec)).read_text() == "first dispatch"
-    assert not list((tmp_path / "service").iterdir())
+    assert not Path(str(files.spec)).exists() and not Path(str(files.launcher)).exists()
+    assert _staged(node) == []   # the partial staging directory is gone
+    storage_operations.report_launch_failure.assert_awaited_once()

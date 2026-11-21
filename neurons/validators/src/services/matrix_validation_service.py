@@ -334,7 +334,7 @@ class ValidationService:
         if not sized_vram_mb:
             return _not_probed(f"no work-proof size for GPU model {gpu_model!r}")
 
-        # one tag for every card's run of this validation (and its retry): the kill reaches these and nothing else
+        # one tag for every card's run of this attempt: the kill reaches these and nothing else
         run_tag = executor_payload.new_run_tag()
 
         # DAH-6241: one challenge per card, pinned to that card's UUID and keyed to it alone (the
@@ -357,6 +357,8 @@ class ValidationService:
         if (timed_out or slow) and all(outcome["reason"] != "wrong_answer" for outcome in per_card):
             # the whole run again, together, so the retry is as concurrent as the first try
             await self._kill_remote_matmul(ssh_client, run_tag, {**default_extra, "retry": "all_cards"})
+            # a fresh tag: the kill left the first one's cancel marker, which stops any run started under it
+            run_tag = executor_payload.new_run_tag()
             retry = await self._run_all_cards(
                 ssh_client, executor_info, run_tag, gpu_model, sized_vram_mb, card_uuids, default_extra
             )
