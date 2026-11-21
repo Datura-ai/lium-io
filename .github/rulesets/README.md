@@ -88,21 +88,39 @@ and `lium`, workflow `.github/workflows/pinned-actions.yml` from `Datura-ai/lium
 runs main's copy on every PR and every queued group, whatever the candidate changes in its own workflow files. The rule
 exists at organization level only, so an organization owner applies it:
 
-Apply it in evaluate mode first, so a run that never reports cannot block every PR. Then confirm that the required run
-reports on a PR in `lium`, the repository that is not the workflow's source: GitHub runs a ruleset workflow on
-`pull_request` there only because the job has a condition (`if: true` in the workflow; GitHub's "Troubleshooting rules",
-Supported directory). Activate the ruleset only after that:
+Roll it out in three separate steps, each run on its own; never paste them as one script. Activating too early blocks
+ordinary PRs in two ways: a required run that never reports leaves every PR pending, and a required run that fails
+blocks every PR whose tree still has a mutable reference.
 
-```bash
-jq '.enforcement = "evaluate"' .github/rulesets/pinned-actions-required-workflow.json |
-  gh api "orgs/Datura-ai/rulesets" --method POST --input -
-# open a test PR in Datura-ai/lium: its checks must list pinned-actions from Datura-ai/lium-io, with a result
-id=$(gh api "orgs/Datura-ai/rulesets" --jq '.[]|select(.name=="pinned-actions-required-workflow")|.id')
-gh api "orgs/Datura-ai/rulesets/$id" --method PUT --input .github/rulesets/pinned-actions-required-workflow.json
-```
+1. Precondition: the default branch of each target repository passes the check with zero refusals. `lium` does not yet
+   (its own pinning PR, Datura-ai/lium#458, must merge first). Until both default branches pass, stop here.
 
-If the organization's plan has no evaluate mode, the POST refuses it. Apply the file as it is and check a `lium` test PR
-straight away. If no pinned-actions result appears there, set the ruleset's enforcement to `disabled` until it does.
+2. Apply the ruleset in evaluate mode. It reports the required run but blocks nothing:
+
+   ```bash
+   jq '.enforcement = "evaluate"' .github/rulesets/pinned-actions-required-workflow.json |
+     gh api "orgs/Datura-ai/rulesets" --method POST --input -
+   ```
+
+   Open a test PR in `lium`, the repository that is not the workflow's source, with any harmless change. Its checks
+   must list `pinned-actions` from `Datura-ai/lium-io` with the result **success**. A pending check means the run never
+   reports there (GitHub runs a ruleset workflow on `pull_request` outside its source repository only because the job has
+   a condition, `if: true` in the workflow; GitHub's "Troubleshooting rules", Supported directory). A failure means that
+   tree still has a mutable reference. In either case stay in evaluate mode and fix the cause first. Do the same on a test
+   PR in `lium-io`.
+
+3. Only after both test PRs show success, activate:
+
+   ```bash
+   id=$(gh api "orgs/Datura-ai/rulesets" --jq '.[]|select(.name=="pinned-actions-required-workflow")|.id')
+   gh api "orgs/Datura-ai/rulesets/$id" --method PUT --input .github/rulesets/pinned-actions-required-workflow.json
+   ```
+
+If the organization's plan has no evaluate mode, the POST in step 2 refuses it. Do not apply the file active to find out
+whether the run reports. Instead, apply it with the repository condition narrowed to `lium-io` (the workflow's source,
+where the run is known to report) and confirm success on a `lium-io` test PR. Add `lium` to the condition only once step 1
+holds for `lium` and the ruleset's own run on `lium-io` has shown success. Then check a `lium` test PR straight away, and
+remove `lium` from the condition again if its result is not success.
 
 Check: `gh api "orgs/Datura-ai/rulesets" --jq '.[]|.name+" "+.enforcement'` → `pinned-actions-required-workflow active`.
 
