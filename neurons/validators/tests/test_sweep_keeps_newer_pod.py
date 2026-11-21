@@ -221,23 +221,66 @@ async def test_a_long_list_runs_a_bounded_number_of_tasks():
 
 
 OWN_ID = "a" * 64
+OWNER = "miner-a:exec-a"
 
 
+@pytest.mark.parametrize(
+    ("status", "label", "removed"),
+    [
+        ("exited", OWNER, True),  # this registration's earlier attempt: its layer is freed before disk admission
+        ("created", "", True),  # made before the labels
+        ("dead", OWNER, True),
+        ("running", OWNER, False),
+        ("running", "", False),  # an unlabelled running replacement on a shared daemon
+        ("exited", "miner-b:exec-b", False),  # another registration's
+        (None, None, False),  # the inspect failed
+    ],
+)
+def test_only_a_stopped_leftover_of_this_registration_is_removed_by_its_id_without_force(tmp_path, status, label, removed):
+    import shlex
+    import subprocess
+
+    from services.docker_service import _own_stopped_leftover_command
+
+    log = tmp_path / "calls"
+    inspect = "exit 1" if status is None else f"echo {shlex.quote(f'{status} {label}')}"
+    stub = tmp_path / "docker"
+    stub.write_text(
+        f'#!/bin/sh\necho "$*" >> {shlex.quote(str(log))}\ncase "$1" in inspect) {inspect};; rm) exit 0;; esac\n'
+    )
+    stub.chmod(0o755)
+    command = _own_stopped_leftover_command(OWN_ID, OWNER).replace("/usr/bin/docker", str(stub))
+
+    done = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
+
+    calls = log.read_text().splitlines()
+    assert (done.returncode == 0) is removed
+    assert [c for c in calls if c.startswith("rm")] == ([f"rm -v {OWN_ID}"] if removed else [])
+
+
+@pytest.mark.parametrize("rm_exit", [0, 3])
 @pytest.mark.parametrize("listing", [f"pod_target {OWN_ID}\n", "pod_target\n"], ids=["with-id", "without-id"])
 @pytest.mark.asyncio
-async def test_a_pod_creates_sweep_never_removes_the_pods_own_name_or_its_volume(retry_ssh_mock, listing):
+async def test_a_pod_creates_sweep_never_force_removes_the_pods_own_name_or_its_volume(retry_ssh_mock, listing, rm_exit):
     """DAH-6531: one pod keeps one name on every registration; on a shared daemon it may be another registration's
-    running replacement, labelled or made before the labels. The same-name conflict decides a leftover instead."""
+    running replacement, labelled or made before the labels. Only the checked leftover command may remove it."""
+    from services.docker_service import _own_stopped_leftover_command
+
     svc = DockerService(
         ssh_service=Mock(), redis_service=Mock(get=AsyncMock(return_value=None)), attestation_service=Mock()
     )
     ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(return_value=Mock(exit_status=0, stdout=listing, stderr=""))
-
-    removed = await svc.clean_existing_containers(
-        ssh_client=ssh_client, default_extra={}, pod_name="pod_target", active_container_names=[], keep_pod_name=True
+    ssh_client.run = AsyncMock(
+        side_effect=lambda command, **_: Mock(
+            exit_status=rm_exit if command.startswith("s=") else 0, stdout="" if command.startswith("s=") else listing, stderr=""
+        )
     )
 
-    assert removed == []
-    assert retry_ssh_mock.await_args_list == []
-    assert ssh_client.run.await_count == 1  # the listing only: nothing inspected or removed
+    removed = await svc.clean_existing_containers(
+        ssh_client=ssh_client, default_extra={}, pod_name="pod_target", active_container_names=[], pod_owner=OWNER
+    )
+
+    sent = [call.args[0] for call in ssh_client.run.await_args_list[1:]]
+    assert retry_ssh_mock.await_args_list == []  # no forced rm, no volume rm
+    assert sent == ([_own_stopped_leftover_command(OWN_ID, OWNER)] if "aaaa" in listing else [])
+    assert removed == (["pod_target"] if "aaaa" in listing and rm_exit == 0 else [])
