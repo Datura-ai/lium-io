@@ -1998,6 +1998,20 @@ class VerifyXMessages:
         category="policy",
         impact="Rental probe gets this cycle's time to clear its standing failure; reused last-known VerifyX EMA",
     )
+    NO_TASK_TIME = MessageTemplate(
+        event="VerifyX not finished: not enough task time left",
+        reason="VERIFYX_NO_TASK_TIME",
+        severity="warning",
+        category="policy",
+        impact=(
+            "No verdict this cycle; the node's last scored result stands. The validator's budget, not the node, "
+            "ended it"
+        ),
+        remediation=(
+            "The checks before VerifyX used most of the executor task's time, and VerifyX gets only what the checks "
+            "after it can spare. The next cycle runs it again."
+        ),
+    )
     NO_SPECS = MessageTemplate(
         event="VerifyX validation skipped (no specs)",
         reason="VERIFYX_NO_SPECS",

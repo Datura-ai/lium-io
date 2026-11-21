@@ -730,17 +730,20 @@ async def test_a_session_lost_in_the_port_check_is_retried_not_a_failed_first_pa
 
 
 @pytest.mark.asyncio
-async def test_a_rental_probe_the_task_had_no_time_for_is_no_failed_first_pass(monkeypatch, wallet):
-    """DAH-5933: the validator's budget left the rental probe no time: nothing is published, the node is not
-    validated, and it is asked again as a deferral until MAX_ATTEMPTS leaves it to the cycle."""
-    from services.task.messages import RentalVerificationMessages
+@pytest.mark.parametrize("check", ["rental", "verifyx"])
+async def test_a_rental_probe_the_task_had_no_time_for_is_no_failed_first_pass(monkeypatch, wallet, check):
+    """DAH-5933: the validator's budget left the rental probe (or VerifyX) no time: nothing is published, the node is
+    not validated, and it is asked again as a deferral until MAX_ATTEMPTS leaves it to the cycle."""
+    from services.task.messages import RentalVerificationMessages, VerifyXMessages
+
+    no_time_reason = (RentalVerificationMessages if check == "rental" else VerifyXMessages).NO_TASK_TIME.reason
 
     new_node = str(uuid4())
     harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
 
     def no_time(payload, executor_id):
         result = _job_result(executor_id, score=0.0)
-        result.failure_reason_code = RentalVerificationMessages.NO_TASK_TIME.reason
+        result.failure_reason_code = no_time_reason
         return {"miner_hotkey": "miner-a", "miner_coldkey": "c", "results": [result]}
 
     harness.job_for = no_time

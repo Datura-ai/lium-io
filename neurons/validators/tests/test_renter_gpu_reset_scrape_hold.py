@@ -44,6 +44,7 @@ from services.ssh_service import SSHService
 from services.task.models import build_msg
 from test_executor_rollout_grace import _failed, _scored, _validator_process
 from neurons.validators.src.services.task.messages import GpuFingerprintMessages as FingerprintMsg
+from services.task.messages import VerifyXMessages
 from test_rented_host_gpu_fault_reset import (
     ENCRYPT_KEY,
     EXECUTOR,
@@ -490,7 +491,8 @@ async def test_an_idle_node_the_task_had_no_time_to_probe_keeps_its_last_score_a
 
 
 @pytest.mark.asyncio
-async def test_a_no_task_time_cycle_without_a_last_score_gets_no_verdict_and_keeps_the_miner_active():
+async def test_a_no_task_time_cycle_without_a_last_score_gets_no_verdict_and_keeps_no_miner_active():
+    # review: the node's own checks can spend the task's time, so running out of it keeps no eligibility
     service = _redis_service()
     held = _no_task_time("node-idle")
 
@@ -498,7 +500,54 @@ async def test_a_no_task_time_cycle_without_a_last_score_gets_no_verdict_and_kee
 
     assert kept == {"5Miner": []}
     assert [w.result.executor_info.uuid for w in withheld] == ["node-idle"]
-    assert session_kept_hotkeys(withheld) == {"5Miner"}
+    assert session_kept_hotkeys(withheld) == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason", [RentalVerificationMessages.NO_TASK_TIME.reason, VerifyXMessages.NO_TASK_TIME.reason]
+)
+async def test_a_second_no_task_time_cycle_without_a_pass_between_is_withheld(reason):
+    # review: a node that stalls its checks past the task's time cannot keep its last pass's score
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_scored("node-idle")]}, service)
+
+    first, _ = await _carry_then_withhold(service, [_failed("node-idle", reason)], rented_executor_ids=frozenset())
+    await remember_rented_scored_results(first, service)
+    second, withheld = await _carry_then_withhold(
+        service, [_failed("node-idle", reason)], rented_executor_ids=frozenset()
+    )
+
+    assert [r.carried_for_renter_gpu_reset for r in first["5Miner"]] == [True]
+    assert second == {"5Miner": []}
+    assert [w.result.executor_info.uuid for w in withheld] == ["node-idle"]
+    assert session_kept_hotkeys(withheld) == set()
+
+
+@pytest.mark.asyncio
+async def test_an_idle_pass_never_stands_in_for_a_rented_gpu_reset_cycle():
+    # review case B: idle pass, then a rental, then the renter's GPU reset: withheld as on main, not paid as idle
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_scored("node-1")]}, service)
+    held = _failed("node-1", Msg.SCRAPE_GPU_RESET_IN_PROGRESS.reason)
+
+    kept, withheld = await _carry_then_withhold(service, [held])
+
+    assert kept == {"5Miner": []}
+    assert [w.result.executor_info.uuid for w in withheld] == ["node-1"]
+
+
+@pytest.mark.asyncio
+async def test_a_rented_pass_never_stands_in_for_an_idle_no_task_time_cycle():
+    # review case A: rented pass, the rental ends, then a no-time cycle: not paid as rented emission
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_rented_scored("node-1")]}, service)
+    held = _no_task_time("node-1")
+
+    kept, withheld = await _carry_then_withhold(service, [held], rented_executor_ids=frozenset())
+
+    assert kept == {"5Miner": []}
+    assert [w.result.executor_info.uuid for w in withheld] == ["node-1"]
 
 
 @pytest.mark.asyncio

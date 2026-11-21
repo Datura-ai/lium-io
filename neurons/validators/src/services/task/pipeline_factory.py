@@ -191,6 +191,7 @@ class PipelineFactory:
         first_pass: bool = False,
         encrypted_private_key: str | None = None,
         task_started_at: float | None = None,
+        deadline_monotonic: float | None = None,
     ) -> Context:
         """Build the base validation context with all configuration.
 
@@ -204,6 +205,7 @@ class PipelineFactory:
             encrypted_private_key: the same key as the backend sent it, for the rental probe's
                 create_container / delete_container calls (DAH-3436); None disables the probe
             task_started_at: time.monotonic() at the executor task's start, which its timeout counts from
+            deadline_monotonic: an express recheck's own earlier deadline (time.monotonic()), or None
             encrypted_files: Encrypted validation files
             tdx_attestation_passed: Whether TDX attestation passed
             gpu_attestation_passed: NVIDIA CC GPU attestation outcome (None = not performed)
@@ -241,6 +243,7 @@ class PipelineFactory:
         return Context(
             pipeline_id=pipeline_id,
             started_at_monotonic=task_started_at or time.monotonic(),
+            deadline_monotonic=deadline_monotonic,
             executor=executor_info,
             miner_hotkey=miner_info.miner_hotkey,
             miner_coldkey=miner_info.miner_coldkey,
@@ -510,21 +513,21 @@ class PipelineFactory:
         """The first-pass pipeline with the validation fast path on: every check of build_checks,
         each deciding exactly as there, in an order that waits less.
 
-        - VerifyX runs alone first: it measures the node's network, and nothing else of ours may
-          be pulling an image or copying a challenge while it does.
-        - Then one `ParallelStage` with two lanes that share no data: the GPU lane (matmul,
+        - One `ParallelStage` with two lanes that share no data: the GPU lane (matmul,
           fault probe, cached template — the challenge lives on the card) and the host lane
           (port connectivity, port count, registry pull, sysbox, rental check — containers, ports and the
           backend's probe). The executor's own one-call verification already runs its facts
-          steps (docker, ports, inspector) beside its GPU group, and runs VerifyX before the
-          matmul unless asked otherwise (`LocalVerifyService`, `parallel_gpu`) — the same split
-          and the same order kept here. `StaleContainerCleanupCheck` still precedes the port
+          steps (docker, ports, inspector) beside its GPU group (`LocalVerifyService`,
+          `parallel_gpu`) — the same split kept here. `StaleContainerCleanupCheck` still precedes the port
           checks, and `TenantEnforcementCheck` still halts a rented node before either lane
-          starts.
+          starts. `LocalVerifyCheck` runs alone before them: the matmul consumes its answer.
+        - VerifyX runs alone after both lanes (DAH-5933): it measures the node's network, so nothing else of ours
+          may be pulling an image or copying a challenge while it does, and its up to 600 s come after the
+          rental check instead of leaving it short.
         - The rental probe, score and finalize follow as today.
         The list differs from build_checks only in where these checks sit; a node that would fail
         there fails here too. A node that would fail two checks can report the other one first:
-        the port checks now run after VerifyX, and a lane that stops first wins. One read is not
+        the port checks now run before VerifyX, and a lane that stops first wins. One read is not
         shared: when the matmul fails and CapabilityCheck finds a Lium workload started during the
         run, RentalVerificationCheck in the host lane still sees the cycle-start rented_data.
         """
@@ -590,8 +593,7 @@ class PipelineFactory:
                 GpuClockLockCheck(),
                 GpuUsageCheck(),
                 LocalVerifyCheck(),
-                VerifyXCheck(),
-                DiskSpaceCheck(),
+                # DAH-5933 review: the lanes before VerifyX, so its up to 600 s never leave the rental check short
                 ParallelStage(
                     [
                         [
@@ -614,6 +616,8 @@ class PipelineFactory:
                         ],
                     ]
                 ),
+                VerifyXCheck(),
+                DiskSpaceCheck(),
                 RentalProbeCheck(),
                 # DAH-5320: the idle node's disk write with fsync, shadow only; last so it never takes the checks' time.
                 IdleDiskWriteCheck(),

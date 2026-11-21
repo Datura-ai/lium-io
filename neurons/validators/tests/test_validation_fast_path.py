@@ -309,12 +309,15 @@ def test_fast_path_checks_are_the_serial_checks_re_ordered():
     names = [type(c).__name__ for c in fast]
     stage = next(s for s in fast if isinstance(s, ParallelStage))
     stage_at = fast.index(stage)
-    # The gates that must decide before any GPU or port work stay ahead of the stage.
-    for gate in (TenantEnforcementCheck, VerifyXCheck):
+    # The gates that must decide before any GPU or port work stay ahead of the stage; the matmul consumes LocalVerify.
+    for gate in (TenantEnforcementCheck, LocalVerifyCheck):
         assert names.index(gate.__name__) < stage_at
+    # DAH-5933 review: VerifyX after the stage, so its up to 600 s never leave the rental check short of time.
+    assert names.index(VerifyXCheck.__name__) > stage_at
     # VerifyX measures the network alone; the executor refuses VerifyX beside the matmul.
     lane_types = [[type(c) for c in lane] for lane in stage.lanes]
     assert VerifyXCheck not in [t for lane in lane_types for t in lane]
+    assert RentalVerificationCheck in [t for lane in lane_types for t in lane]
     # Only the orderings that matter: the checks reading sysbox_runtime run after the probe that
     # settles it, and the kernel-fault probe follows the matmul it complements.
     port_lane = next(lane for lane in lane_types if PortConnectivityCheck in lane)

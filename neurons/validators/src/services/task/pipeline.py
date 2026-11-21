@@ -287,6 +287,8 @@ class Context(BaseModel):
     # time.monotonic() at the executor task's start; a best-effort step budgets against
     # the executor task's timeout from here.
     started_at_monotonic: float = Field(default_factory=time.monotonic)
+    # an express recheck's own deadline (time.monotonic()), when it cancels the task before its timeout does
+    deadline_monotonic: float | None = None
     executor: ExecutorSSHInfo
     miner_hotkey: str
     miner_coldkey: str | None = None

@@ -93,12 +93,23 @@ def _idle_now(services, fresh=None, creating=False):
     services.redis.renting_in_progress = AsyncMock(return_value=creating)
 
 
+async def _first_sample(ctx):
+    """VerifyXCheck with the whole task ahead: these tests set task_seconds_left for the retry, and the first
+    sample's own budget (DAH-5933) has its tests in test_verifyx_first_sample_budget."""
+    patched = verifyx_check.task_seconds_left
+    verifyx_check.task_seconds_left = lambda ctx: 900.0
+    try:
+        return await VerifyXCheck().run(ctx)
+    finally:
+        verifyx_check.task_seconds_left = patched
+
+
 async def _run(ctx, idle=True):
     """VerifyXCheck, then (as the pipeline does, last before scoring) VerifyXColdRetryCheck, on a
     node still idle then unless `idle` is False (the test set the rental state itself)."""
     if idle:
         _idle_now(ctx.services)
-    first = await VerifyXCheck().run(ctx)
+    first = await _first_sample(ctx)
     if not first.passed:
         return first
     ctx = ctx.model_copy(update=first.updates)
@@ -485,7 +496,7 @@ async def test_a_cut_off_retry_whose_cleanup_timed_out_is_reaped_on_the_next_run
     assert (run_dir / "temp_1.dat").exists()
 
     shell.stalled = False  # the node is reachable again on the next cycle
-    await VerifyXCheck().run(ctx)
+    await _first_sample(ctx)
 
     for _ in range(100):  # the killed run's wrapper shell exits and is reaped by the local bash
         try:
@@ -564,7 +575,7 @@ async def test_reaping_stale_runs_is_bounded_per_cycle(context_factory, monkeypa
         await ctx.services.redis.hset(key, f".verifyx-retry-{i}", str(now - i))
     await ctx.services.redis.hset(key, ".verifyx-retry-old", str(now - VERIFYX_STALE_RUNS_TTL_SECONDS - 1))
 
-    await VerifyXCheck().run(ctx)
+    await _first_sample(ctx)
 
     tried = [c.args[1] for c in service.kill_remote_verifyx.await_args_list]
     assert tried == [".verifyx-retry-0", ".verifyx-retry-1"]  # newest first, capped
@@ -640,7 +651,7 @@ async def test_the_retry_runs_only_on_a_node_still_idle(context_factory, state, 
         ctx.services.backend.get_rented_executors_now = AsyncMock(return_value=None)
     if state == "lookup_failed":
         ctx.services.redis.renting_in_progress = AsyncMock(side_effect=ConnectionError("redis down"))
-    first = await VerifyXCheck().run(ctx)
+    first = await _first_sample(ctx)
     ctx = ctx.model_copy(update=first.updates)
     if state == "seen_rented_by_a_check":  # e.g. CapabilityCheck refreshed the snapshot
         rented = ctx.state.rented_data.model_copy(update={"executors": {EXECUTOR: _pod_on(EXECUTOR)}})
@@ -673,7 +684,7 @@ async def test_a_slow_rental_lookup_never_costs_the_first_sample(context_factory
         await asyncio.sleep(3600)
 
     ctx.services.redis.renting_in_progress = AsyncMock(side_effect=hang)
-    first = await VerifyXCheck().run(ctx)
+    first = await _first_sample(ctx)
 
     result = await asyncio.wait_for(VerifyXColdRetryCheck().run(ctx.model_copy(update=first.updates)), 5)
 
@@ -705,7 +716,7 @@ async def test_a_rental_starting_during_the_retry_cuts_it_off(
     service = _TimedProbeSequence(_probe(88.0), _probe(760.0), retry_s=5.0)
     ctx = _ctx(context_factory, service, _never_measured())
     _idle_now(ctx.services)
-    first = await VerifyXCheck().run(ctx)
+    first = await _first_sample(ctx)
     later = {"marker": [False, False, True], "unavailable": [False, False, ConnectionError("redis down")]}[flip]
     ctx.services.redis.renting_in_progress = AsyncMock(side_effect=later + [True] * 10)
     ctx.services.backend.get_rented_executors_now = AsyncMock(return_value=_never_measured())
@@ -795,7 +806,7 @@ async def test_a_create_between_two_watcher_reads_still_cuts_the_retry_off(conte
         await redis.remove_pending_pod(ctx.miner_hotkey, EXECUTOR, "pod-old")
         await asyncio.sleep(0.01)
     ctx.services.backend.get_rented_executors_now = AsyncMock(return_value=_never_measured())
-    first = await VerifyXCheck().run(ctx)
+    first = await _first_sample(ctx)
 
     result = await asyncio.wait_for(VerifyXColdRetryCheck().run(ctx.model_copy(update=first.updates)), 2)
 
@@ -877,7 +888,7 @@ async def test_a_create_done_between_the_shared_read_and_the_retry_skips_it(
         if create != "probe_running":
             await redis.remove_pending_pod(ctx.miner_hotkey, EXECUTOR, "pod-fast")
     await asyncio.sleep(0.01)
-    first = await VerifyXCheck().run(ctx)
+    first = await _first_sample(ctx)
 
     result = await asyncio.wait_for(VerifyXColdRetryCheck().run(ctx.model_copy(update=first.updates)), 2)
 

@@ -53,6 +53,7 @@ from services.task.messages import (
     SCRAPE_UNDETERMINED_FAILURE_REASONS,
     TenantEnforcementMessages,
     UploadFilesMessages,
+    VerifyXMessages,
 )
 from services.task.models import VALIDATOR_REDIS_UNAVAILABLE, JobResult
 from services.task.result_handler import pods_rented_gpu_count
@@ -552,14 +553,21 @@ def withhold_renter_gpu_reset_verdicts(
             if not (redis_fault or port_check_deferred or _held_for_renter_gpu_reset(result)):
                 standing_by_miner[miner_hotkey].append(result)
                 continue
-            withheld.append(WithheldVerdict(miner_hotkey=miner_hotkey, result=result))
+            withheld.append(
+                WithheldVerdict(
+                    miner_hotkey=miner_hotkey,
+                    result=result,
+                    # the node's own checks can spend the task's time: that keeps no miner active (review)
+                    keeps_miner_active=result.failure_reason_code not in NO_TASK_TIME_REASONS,
+                )
+            )
             logger.info(
                 _m(
                     "Verdict withheld: the validator's Redis was unavailable"
                     if redis_fault
                     else "Verdict withheld: the port check was deferred for disk pressure"
                     if port_check_deferred
-                    else "Verdict withheld: the renter is resetting the node's GPUs, its power tier is unknown, or the task had no time left for the rental probe",
+                    else "Verdict withheld: the renter is resetting the node's GPUs, its power tier is unknown, or the task had no time left for a check",
                     extra={
                         "miner_hotkey": miner_hotkey,
                         "executor_uuid": result.executor_info.uuid,
@@ -749,15 +757,15 @@ def has_renter_gpu_reset_holds(job_results: dict[str, list[JobResult]]) -> bool:
     return any(_held_for_renter_gpu_reset(result) for results in job_results.values() for result in results)
 
 
-# DAH-5933: the run left the backend's rental probe too little time; the validator's budget, not the node, decides
-# that, so it is no failed rental check: an idle node carries its last scored result too
-_NO_TASK_TIME = RentalVerificationMessages.NO_TASK_TIME.reason
+# DAH-5933: the run left the backend's rental probe, or VerifyX, too little time; the validator's budget, not the
+# node, decides that, so it is no failed check: an idle node carries its last scored result too
+NO_TASK_TIME_REASONS = (RentalVerificationMessages.NO_TASK_TIME.reason, VerifyXMessages.NO_TASK_TIME.reason)
 # a cycle that cannot tell the node's state gives no verdict: the renter's GPU reset (DAH-4658), a power tier
-# reading whose clear was not confirmed (F-43), or a rental probe the task had no time left for (DAH-5933)
+# reading whose clear was not confirmed (F-43), or a check the task had no time left for (DAH-5933)
 _HELD_REASONS = (
     MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason,
     GpuPowerLimitMessages.TIER_STATE_UNKNOWN.reason,
-    _NO_TASK_TIME,
+    *NO_TASK_TIME_REASONS,
 )
 
 
@@ -795,11 +803,16 @@ async def carry_renter_gpu_reset_results(
         for index, held in enumerate(results):
             if not _held_for_renter_gpu_reset(held):
                 continue
-            no_task_time = held.failure_reason_code == _NO_TASK_TIME
-            if not no_task_time and str(held.executor_info.uuid).lower() not in rented_executor_ids:
+            no_task_time = held.failure_reason_code in NO_TASK_TIME_REASONS
+            rented_now = str(held.executor_info.uuid).lower() in rented_executor_ids
+            if not no_task_time and not rented_now:
                 continue
             previous = await _last_scored_result(redis_service, miner_hotkey, held)
-            if previous is None:
+            # is_rented picks the pool the result is paid from: a result kept while the node was idle never stands
+            # in for a rented cycle, nor a rented one for an idle cycle (review)
+            if previous is None or previous.is_rented != rented_now:
+                continue
+            if no_task_time and not await _spend_kept_result(redis_service, miner_hotkey, held):
                 continue
             results[index] = previous.model_copy(
                 update={
@@ -825,7 +838,7 @@ async def carry_renter_gpu_reset_results(
             )
             logger.info(
                 _m(
-                    "Score carried: the task had no time left for the rental probe, the last scored result stands"
+                    "Score carried: the task had no time left for a check, the last scored result stands"
                     if no_task_time
                     else "Score carried: the renter is resetting the node's GPUs, the last scored result stands",
                     extra={
@@ -871,6 +884,23 @@ def _filler_revenue_now(rented_data: RentedExecutorsResponse | None, previous: J
     )
 
 
+async def _spend_kept_result(redis_service: RedisService, miner_hotkey: str, held: JobResult) -> bool:
+    """A cycle the task had no time for carries the last pass once: the next such cycle, with no pass between,
+    is withheld. The node's own checks spend the task's time, so a node that keeps running out of it never keeps
+    its score (review). False when the kept result could not be dropped: the held result is withheld then."""
+    try:
+        await redis_service.delete(last_scored_result_key(miner_hotkey, held.executor_info.uuid))
+        return True
+    except Exception as exc:
+        logger.warning(
+            _m(
+                "Kept result could not be dropped; the held verdict is withheld",
+                extra={"miner_hotkey": miner_hotkey, "executor_uuid": held.executor_info.uuid, "error": str(exc)},
+            )
+        )
+        return False
+
+
 async def _last_scored_result(
     redis_service: RedisService, miner_hotkey: str, held: JobResult
 ) -> JobResult | None:
@@ -903,7 +933,7 @@ async def remember_rented_scored_results(
             if result.carried_for_renter_gpu_reset:
                 continue
             key = last_scored_result_key(miner_hotkey, result.executor_info.uuid)
-            # an idle node's too (DAH-5933): RENTAL_CHECK_NO_TASK_TIME carries it; the GPU-reset carry stays rented-only
+            # an idle node's too (DAH-5933): a NO_TASK_TIME_REASONS result carries it; the GPU-reset carry stays rented-only
             if result.is_successful:
                 writes.set(key, result.model_dump_json(), ex=LAST_SCORED_RESULT_TTL_SECONDS)
             else:
