@@ -155,10 +155,12 @@ jobs:
                               # another image. An expression (\x24 is the dollar sign, as in the self-test) is expanded after this scan and quoted CSV fields are not
                               # parsed here, so both are refused; a key that only differs in case or spacing counts as image
                               raw = str(args.get("driver-opts") or "")
-                              fields = [f.strip() for f in re.split(r"[\n,]", raw) if f.strip()]
+                              # the action's CSV parser also ends a record at a carriage return; any other control or
+                              # non-ASCII character could be a separator this split does not see, so it is refused
+                              fields = [f.strip() for f in re.split(r"[\r\n,]", raw) if f.strip()]
                               keys = [f.split("=", 1)[0].strip().lower() for f in fields]
                               imgs = [f for f, k in zip(fields, keys) if k == "image"]
-                              if ("\x24{{" in raw or re.search(r"[\"']", raw) or len(imgs) != 1
+                              if ("\x24{{" in raw or re.search(r"[\"']|[^\n\x20-\x7e]", raw) or len(imgs) != 1
                                       or not imgs[0].startswith("image=") or not is_digest(imgs[0][6:])):
                                   bad.append(f"{where}: {name}: with.driver-opts image=<image>@sha256:<digest> only")
                           elif name == "docker/setup-qemu-action" and not is_digest(args.get("image") or ""):
@@ -357,6 +359,9 @@ jobs:
               # \x24 spells the dollar sign (see above): an expression could expand into a second image option
               step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            image=moby/buildkit" + dig + "\n            \x24{{ format('{0}=acme/buildkit:latest', 'image') }}"): 1,
               step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: |\n            image=moby/buildkit" + dig + "\n            \x24{{ vars.BUILDKIT_OPT }}"): 1,
+              # a carriage return ends a record for the action's parser: YAML keeps an escaped one in a quoted value
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: \"image=moby/buildkit" + dig + ",target=x\\rimage=acme/buildkit" + dig + "\""): 1,
+              step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: \"image=moby/buildkit" + dig + "\\ttarget=x\""): 1,
               step("docker/setup-qemu-action@" + sha): 1,
               step("docker/setup-qemu-action@" + sha + "\n        with:\n          image: tonistiigi/binfmt" + dig): 0,
           }
