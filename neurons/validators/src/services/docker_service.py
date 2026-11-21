@@ -6028,12 +6028,26 @@ class DockerService:
                 if own_id is not None:
                     # the mark goes on only once the check passed: a refused check removes nothing, so a later
                     # disappearance of that container must not read as this sweep's removal
-                    check = await ssh_client.run(_own_stopped_leftover_check(own_id, pod_owner))
+                    # each bounded on the host and here: an SSH session can stay up while Docker stops answering
+                    check = await _run_with_host_timeout(
+                        ssh_client, _own_stopped_leftover_check(own_id, pod_owner), REMOVE_CONFIRM_INSPECT_TIMEOUT_SECONDS
+                    )
                     if check.exit_status == 0:
                         marked = _MarkOwnRemovalsOnSubmit(ssh_client, [own_id])
-                        if (await marked.run(_own_leftover_rm_command(own_id))).exit_status == 0:
+                        rm_timeout = _CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS
+                        # asyncssh's timeout= bounds only the command, not its channel open
+                        async with asyncio.timeout_at(
+                            asyncio.get_running_loop().time() + rm_timeout + _HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS
+                        ):
+                            removal = await marked.run(
+                                _host_bounded_command(_own_leftover_rm_command(own_id), rm_timeout),
+                                check=False,
+                                timeout=rm_timeout + _HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS,
+                            )
+                        if removal.exit_status == 0:
                             own_leftover_removed.append(pod_name)
-                        else:
+                        elif removal.exit_status not in (124, 137):
+                            # Docker refused it; a removal cut short by the host timeout may still complete
                             marked.take_back()
             container_names = " ".join(shlex.quote(name) for name in stale_containers)
             if not container_names:

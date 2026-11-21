@@ -261,45 +261,84 @@ def test_only_a_stopped_leftover_of_this_registration_is_removed_by_its_id_witho
     assert [c for c in calls if c.startswith("rm")] == ([f"rm -v {OWN_ID}"] if removed else [])
 
 
-@pytest.mark.parametrize(("check_exit", "rm_exit"), [(0, 0), (0, 1), (3, 0)])
+def _sweep_ssh(listing: str, answers: dict):
+    """An SSH double for the pod create's sweep: the listing through run(), the leftover's check and removal as host
+    bounded commands. `answers` maps "check"/"rm" to an exit status, or to an Event the command waits on (a stalled
+    daemon behind a live transport); `seen` records each command and whether the leftover was marked at that time."""
+    seen = []
+
+    async def answer(command, **_):
+        kind = "check" if "docker inspect" in command else "rm" if "docker rm -v" in command else "list"
+        seen.append((kind, own_sweep_removals.sent_rm_for(OWN_ID)))
+        reply = answers.get(kind, 0)
+        if isinstance(reply, asyncio.Event):
+            await reply.wait()
+        return Mock(exit_status=reply if isinstance(reply, int) else 0, stdout=listing if kind == "list" else "", stderr="")
+
+    async def create_process(command, *args, **kwargs):
+        # the channel opens at once; the command's answer is what may never come
+        return Mock(wait=lambda: answer(command), wait_closed=AsyncMock(), close=Mock())
+
+    ssh_client = AsyncMock()
+    ssh_client.run = AsyncMock(side_effect=answer)
+    ssh_client.create_process = create_process
+    return ssh_client, seen
+
+
+def _sweep_service():
+    return DockerService(
+        ssh_service=Mock(), redis_service=Mock(get=AsyncMock(return_value=None)), attestation_service=Mock()
+    )
+
+
+@pytest.mark.parametrize(("check_exit", "rm_exit"), [(0, 0), (0, 1), (0, 124), (3, 0)])
 @pytest.mark.parametrize("listing", [f"pod_target {OWN_ID}\n", "pod_target\n"], ids=["with-id", "without-id"])
 @pytest.mark.asyncio
 async def test_a_pod_creates_sweep_never_force_removes_the_pods_own_name_or_its_volume(
     retry_ssh_mock, listing, check_exit, rm_exit
 ):
     """DAH-6531: one pod keeps one name on every registration; on a shared daemon it may be another registration's
-    running replacement, labelled or made before the labels. Only the checked leftover may be removed, and only a
-    removal Docker carried out stays marked as this sweep's: a container whose check or removal was refused and that
-    disappears later is never read as removed by a sweep."""
-    from services.docker_service import _own_leftover_rm_command, _own_stopped_leftover_check, own_sweep_removals
-
+    running replacement, labelled or made before the labels. Only the checked leftover may be removed, and a removal
+    is recorded as this sweep's only once the check passed: one Docker refused leaves no record, one the host timeout
+    cut short keeps it (Docker may still complete it)."""
     own_sweep_removals.clear()
-    check, rm = _own_stopped_leftover_check(OWN_ID, OWNER), _own_leftover_rm_command(OWN_ID)
-    svc = DockerService(
-        ssh_service=Mock(), redis_service=Mock(get=AsyncMock(return_value=None)), attestation_service=Mock()
-    )
-    ssh_client = AsyncMock()
-    marked_at_check = []
+    ssh_client, seen = _sweep_ssh(listing, {"check": check_exit, "rm": rm_exit})
 
-    def answer(command, **_):
-        if command == check:
-            marked_at_check.append(own_sweep_removals.sent_rm_for(OWN_ID))
-            return Mock(exit_status=check_exit, stdout="", stderr="")
-        if command == rm:
-            return Mock(exit_status=rm_exit, stdout="", stderr="")
-        return Mock(exit_status=0, stdout=listing, stderr="")
-
-    ssh_client.run = AsyncMock(side_effect=answer)
-
-    removed = await svc.clean_existing_containers(
+    removed = await _sweep_service().clean_existing_containers(
         ssh_client=ssh_client, default_extra={}, pod_name="pod_target", active_container_names=[], pod_owner=OWNER
     )
 
     listed = "aaaa" in listing
-    sent = [call.args[0] for call in ssh_client.run.await_args_list[1:]]
     assert retry_ssh_mock.await_args_list == []  # no forced rm, no volume rm
-    assert sent == (([check] + ([rm] if check_exit == 0 else [])) if listed else [])
-    assert marked_at_check == ([False] if listed else [])  # nothing is marked before the check passes
-    assert own_sweep_removals.sent_rm_for(OWN_ID) is (listed and check_exit == 0 and rm_exit == 0)
+    expected = [("list", False)] + (
+        [("check", False)] + ([("rm", True)] if check_exit == 0 else []) if listed else []
+    )
+    assert seen == expected  # nothing is marked before the check passes
+    assert own_sweep_removals.sent_rm_for(OWN_ID) is (listed and check_exit == 0 and rm_exit in (0, 124))
     assert removed == (["pod_target"] if listed and check_exit == 0 and rm_exit == 0 else [])
+    own_sweep_removals.clear()
+
+
+@pytest.mark.parametrize("stalled", ["check", "rm"])
+@pytest.mark.asyncio
+async def test_a_stalled_docker_behind_a_live_ssh_session_ends_the_sweep_at_its_deadline(
+    retry_ssh_mock, monkeypatch, stalled
+):
+    # the SSH transport stays open while the daemon never answers the check or the removal
+    monkeypatch.setattr(ds_module, "REMOVE_CONFIRM_INSPECT_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(ds_module, "_CUSTOMER_CONTAINER_REMOVAL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(ds_module, "_HOST_TIMEOUT_VALIDATOR_MARGIN_SECONDS", 0.05)
+    own_sweep_removals.clear()
+    ssh_client, _ = _sweep_ssh(f"pod_target {OWN_ID}\n", {stalled: asyncio.Event()})
+
+    sweep_task = asyncio.ensure_future(
+        _sweep_service().clean_existing_containers(
+            ssh_client=ssh_client, default_extra={}, pod_name="pod_target", active_container_names=[], pod_owner=OWNER
+        )
+    )
+    done, _ = await asyncio.wait({sweep_task}, timeout=5)
+
+    assert sweep_task in done
+    with pytest.raises(TimeoutError):
+        sweep_task.result()
     own_sweep_removals.clear()
