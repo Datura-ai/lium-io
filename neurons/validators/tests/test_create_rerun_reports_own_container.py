@@ -173,11 +173,16 @@ async def test_only_a_listing_without_this_commands_container_counts_as_absent(s
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ran_before", [True, False])
-async def test_an_unlabelled_container_from_before_the_upgrade_is_always_kept(svc, monkeypatch, ran_before):
+@pytest.mark.parametrize("reboot_or_edit", [True, False])
+async def test_an_unlabelled_container_from_before_the_upgrade_is_replaced_only_by_a_fresh_reboot_or_edit(
+    svc, monkeypatch, ran_before, reboot_or_edit
+):
     """An older validator labelled no container with its command, and its pending marks carry no command ID (a full
-    start clears them too), so nothing shows which run made the pod's unlabelled container: it may be this one, cut off
-    by the upgrade. Whether or not a run of this command is known, the create answers nothing (an unknown outcome) and
-    never reaches the cleanup that would remove the container with its volume."""
+    start clears them too). A fresh create (no volume) has no container of its own yet, so the pod's unlabelled
+    container is an earlier run of it, maybe cut off by the upgrade: the create answers nothing (an unknown outcome)
+    and never reaches the cleanup that would remove it with its volume. So does any command known to have run before.
+    A new reboot or edit of a pod made before the upgrade brings the pod's volume and goes ahead: that container is
+    the pod's own, which it replaces."""
     n = _Node()
     ssh_client = n.wrap(_ssh_client(inspect_exit=0))
     _patch_happy(svc, monkeypatch, ssh_client)
@@ -186,11 +191,16 @@ async def test_an_unlabelled_container_from_before_the_upgrade_is_always_kept(sv
     monkeypatch.setattr(svc, "clean_existing_containers", cleanup)
     absent: list[bool] = []
     token = create_node_absent.set(absent if ran_before else None)
+    payload = _payload(command_id="cmd-1", **({"local_volume": "pod-volume"} if reboot_or_edit else {}))
     try:
-        result = await _create(svc, _payload(command_id="cmd-1"), ssh_client)
+        result = await _create(svc, payload, ssh_client)
     finally:
         create_node_absent.reset(token)
 
-    assert result is None
-    cleanup.assert_not_awaited()
-    assert absent == []
+    if ran_before or not reboot_or_edit:
+        assert result is None
+        cleanup.assert_not_awaited()
+        assert absent == []
+    else:
+        assert result is not None
+        assert absent == []

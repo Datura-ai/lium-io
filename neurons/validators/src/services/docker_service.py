@@ -3727,11 +3727,13 @@ async def _replay_own_finished_create(
         raise _OwnCreateWithoutRecord(f"docker could not list the container (exit {result.exit_status})")
     record_text, _, state = (result.stdout or "").partition(_CREATE_RECORD_STATE_MARK)
     fields = state.split()
-    if len(fields) == 1:
-        # the pod's container carries no command label: an older validator made it, maybe a run of this pod cut off
-        # by the upgrade. Nothing proves it is not (that validator's pending marks carry no command ID, and a full
-        # start clears them), so its outcome is unknown until the pod's delete settles it; the cleanup below would
-        # remove it and its volume
+    if len(fields) == 1 and (create_node_absent.get() is not None or not payload.local_volume):
+        # the pod's container carries no command label: an older validator made it. A reboot or edit brings the pod's
+        # volume and replaces that container, the pod's own, through the edit swap (kept until its replacement runs).
+        # A fresh create (no volume) has no container of its own yet, so this one is an earlier run of the pod, maybe
+        # cut off by the upgrade (that validator's pending marks carry no command ID, and a full start clears them);
+        # so is any one when this command ran before. Its outcome is unknown; the cleanup below would remove it and
+        # its volume
         raise _OwnCreateWithoutRecord("the pod's container has no command label")
     if len(fields) != 2 or fields[1] != payload.command_id:
         if (absent := create_node_absent.get()) is not None:
