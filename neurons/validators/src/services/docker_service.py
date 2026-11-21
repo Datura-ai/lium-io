@@ -15,7 +15,6 @@ import secrets
 import shlex
 import threading
 import time
-import weakref
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
@@ -212,6 +211,7 @@ from services.rental_docker_sdk import (
     ContainerExecSpec,
     ContainerNameTakenOnRetry,
     ContainerGoneBeforeExec,
+    ContainerOfAnotherRegistration,
     ContainerRunSpec,
     ContainerStateSnapshot,
     docker_size,
@@ -1860,45 +1860,19 @@ def _executor_label(payload) -> str:
 
 
 def _pod_volume_labels(payload) -> dict[str, str]:
-    """A customer volume's ownership: the pod and the registration that created it (the node-left delete's filter)."""
+    """A customer volume's ownership: the pod and the registration that created it."""
     return {LIUM_POD_ID_LABEL: payload.pod_id, LIUM_EXECUTOR_ID_LABEL: _executor_label(payload)}
-
-
-class PodVolumeOfAnotherRegistrationInUse(RuntimeError):
-    """The pod's volume name on this daemon is held by another registration's volume that is still in use."""
-
-
-def _drop_another_registrations_volume_command(volume: str, owner: str, may_remove: bool) -> str:
-    """Docker hands an existing volume of the same name back to a create as it is, label included, so a replacement
-    made on the daemon the pod left would mount the left registration's volume and the node-left delete could remove
-    it. That volume (the pod's failed create there) is removed first, under pod_volume_lock and only when no other
-    registration's create of the pod is running (may_remove): an unused volume of a create still running is not
-    left over, it is not mounted yet. Otherwise, or when it is in use, the command fails. Unlabelled volumes (made
-    before the label) are reused as before; the node-left delete never removes them."""
-    found = f'{{{{index .Labels "{LIUM_EXECUTOR_ID_LABEL}"}}}}'
-    remove = f"/usr/bin/docker volume rm {volume} >/dev/null" if may_remove else "exit 1"
-    # only a volume Docker reports absent is absent: an inspect that fails otherwise could hide another
-    # registration's volume, which the create would then be handed back
-    return (
-        f"owner=$(/usr/bin/docker volume inspect -f {shlex.quote(found)} {volume} 2>&1) || "
-        'case "$owner" in *[Nn]"o such volume"*) exit 0;; *) exit 1;; esac; '
-        f'[ -z "$owner" ] || [ "$owner" = {shlex.quote(owner)} ] || {remove}'
-    )
-
-
-def _left_pod_volume_name(payload) -> str:
-    # the name a fresh create gives the pod's volume on any registration
-    return _quote_safe_docker_volume_name(f"volume_{payload.pod_id}", field_name="local_volume")
 
 
 def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
     """Exits 97 on another boot, or when the pod's container there was created for another registration (a
     replacement made on this host through a re-pointed registration or another miner's registration of the same
-    executor); 0 once the left registration's container, its kept edit containers and the pod's volumes it created
-    are gone. The pod's volume is removed by name when its labels name the pod and the left registration: a
-    replacement's volume carries its own registration (a create never reuses another registration's, see
-    _drop_another_registrations_volume_command). Unlabelled containers and volumes (made before the labels) are
-    kept."""
+    executor); 0 once the left registration's container and its kept edit containers are gone. Unlabelled
+    containers (made before the label) are kept.
+
+    The pod's named volume is never removed here: one pod keeps one volume name on every registration, so on a
+    daemon two registrations share it may be the replacement's, mounted or about to be, and nothing on the host
+    tells the two apart until the mount exists. It stays until the pod ends, as before this delete."""
     if not payload.executor_id or not payload.miner_hotkey:
         raise ValueError("the delete names no registration")
     name = shlex.quote(payload.container_name)
@@ -1915,16 +1889,6 @@ def _node_left_delete_command(payload: ContainerDeleteOnNodeLeftRequest) -> str:
         f"--filter label={shlex.quote(f'{LIUM_EXECUTOR_ID_LABEL}={_executor_label(payload)}')}) || exit 1",
         "/usr/bin/docker rm -fv $id $kept >/dev/null 2>&1",
         '[ -n "$id" ] && /usr/bin/docker inspect --type container "$id" >/dev/null 2>&1 && exit 1',
-    ]
-    # by name, so any driver (the size-limited loopback plugin too), and only when its labels name this pod and the
-    # left registration; the caller holds pod_volume_lock with no create of the pod running, so no create replaces
-    # the volume between this check and the removal
-    volume = shlex.quote(_left_pod_volume_name(payload))
-    labels = f'{{{{index .Labels "{LIUM_POD_ID_LABEL}"}}}} {{{{index .Labels "{LIUM_EXECUTOR_ID_LABEL}"}}}}'
-    lines += [
-        f"vowner=$(/usr/bin/docker volume inspect -f {shlex.quote(labels)} {volume} 2>/dev/null) || exit 0",
-        f'[ "$vowner" = {shlex.quote(f"{payload.pod_id} {_executor_label(payload)}")} ] || exit 0',
-        f"/usr/bin/docker volume rm {volume} >/dev/null || exit 1",
         "exit 0",
     ]
     return "\n".join(lines)
@@ -2602,10 +2566,6 @@ class _InflightCreateRegistry:
     def is_running(self, pod_id: str, executor: ExecutorKey | None = None) -> bool:
         return bool(self._matching(pod_id, executor))
 
-    def registrations_creating(self, pod_id: str) -> set[ExecutorKey]:
-        """Every registration with a create of this pod running in this process, whatever the caller holds."""
-        return {executor for (pod, executor) in self._creates if pod == pod_id}
-
     async def wait_for_no_create(self, pod_id: str, timeout: float) -> bool:
         """Wait until no registration has a create of this pod running. False when the wait ran out."""
         loop = asyncio.get_running_loop()
@@ -2641,20 +2601,6 @@ class _InflightCreateRegistry:
 # In-process: a pod's create and delete are driven by the same validator event loop. Move it to
 # Redis if the two ever land in different processes.
 inflight_creates = _InflightCreateRegistry()
-
-# DAH-6531: a pod keeps its volume name (volume_<pod id>) on every registration it moves to, so on a daemon two
-# registrations share, which registration a volume of that name belongs to changes between the create's check and
-# its volume create, and between the node-left delete's check and its removal. Both run under this per-pod lock
-# (in-process, like inflight_creates), so no create's volume step interleaves with a removal or with another create's.
-_pod_volume_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = weakref.WeakValueDictionary()
-
-
-def pod_volume_lock(pod_id: str) -> asyncio.Lock:
-    lock = _pod_volume_locks.get(pod_id)
-    if lock is None:
-        lock = _pod_volume_locks[pod_id] = asyncio.Lock()
-    return lock
-
 
 class _CreateStepsAfterReplyRegistry:
     """Create steps the backend's reply does not wait for, by pod and executor.
@@ -4054,15 +4000,26 @@ class DockerService:
                     logger.warning(_m("SYSBOX_FLATTEN_LEASE_RELEASE_FAILED", extra=get_extra_info(default_extra)))
 
     @staticmethod
-    async def _leftover_container_never_started(
-        docker_client: RentalDockerSdkClient, container_name: str
-    ) -> bool:
-        """True only when the same-name container is known to be stopped (created, exited or dead)."""
+    async def _own_leftover_container(
+        docker_client: RentalDockerSdkClient, container_name: str, owner: str | None
+    ) -> str | None:
+        """What to remove for a same-name conflict, or None to keep it: only a container known to be stopped (created,
+        exited or dead) and, for a create that names its registration (`owner`), carrying that registration or no
+        label (made before the label). Removed by the ID inspected, so a container made under the name after the
+        inspect is not it. A container another registration made on a daemon both share is never this create's."""
         try:
-            status = await docker_client.container_status(container_name=container_name)
+            if owner is None:
+                status = await docker_client.container_status(container_name=container_name)
+                return container_name if status in ("created", "exited", "dead") else None
+            identity = await docker_client.container_owner_state(container_name=container_name)
         except Exception:
-            return False
-        return status in ("created", "exited", "dead")
+            return None
+        if identity is None:
+            return None
+        container_id, status, found_owner = identity
+        if not container_id or status not in ("created", "exited", "dead") or found_owner not in ("", owner):
+            return None
+        return container_id
 
     async def _run_rental_docker_create_attempts(
         self,
@@ -4130,6 +4087,10 @@ class DockerService:
                 return container_id if isinstance(container_id, str) else None
             except ContainerCreateRefused:
                 raise
+            except ContainerOfAnotherRegistration as exc:
+                # DAH-6531: the transport retry found the name held by another registration's container (a daemon two
+                # registrations share): never this create's leftover, kept like any container this create does not own
+                raise _SameNameContainerKept(str(exc)) from exc
             except Exception as exc:
                 # A re-sent create for this pod meets its earlier attempt's container under the
                 # pod's own (unique) name: 409 "The container name "/pod_<id>" is already in use".
@@ -4148,18 +4109,18 @@ class DockerService:
                         or isinstance(exc, ContainerNameTakenOnRetry)
                     )
                 ):
-                    if not (
-                        await self._leftover_container_never_started(docker_client, container_name)
-                        # another create may have registered (and started the pod) during the status read
-                        and inflight_creates.is_only_create(pod_id)
-                    ):
+                    leftover = await self._own_leftover_container(
+                        docker_client, container_name, run_spec.labels.get(LIUM_EXECUTOR_ID_LABEL)
+                    )
+                    # another create may have registered (and started the pod) during the status read
+                    if leftover is None or not inflight_creates.is_only_create(pod_id):
                         raise _SameNameContainerKept(str(exc)) from exc
                     own_leftover_removed = True
                     attempt += 1
                     # not forced: dockerd itself refuses the removal if the pod was started meanwhile
                     if not await self._remove_failed_rental_container_for_retry(
                         docker_client=docker_client,
-                        container_name=container_name,
+                        container_name=leftover,
                         default_extra=default_extra,
                         warning_event="OWN_LEFTOVER_CONTAINER_RM_FAILED",
                         force=False,
@@ -8792,41 +8753,21 @@ class DockerService:
             )
         )
         await self.stream_log(log_text, "success", log_tag)
-        owner = (labels or {}).get(LIUM_EXECUTOR_ID_LABEL)
-        async with (
-            pod_volume_lock(labels[LIUM_POD_ID_LABEL]) if owner and LIUM_POD_ID_LABEL in labels
-            else contextlib.nullcontext()
-        ):
-            if owner:
-                others = {f"{hotkey}:{executor}" for hotkey, executor in
-                          inflight_creates.registrations_creating(labels.get(LIUM_POD_ID_LABEL, ""))} - {owner}
-                dropped = await _run_with_host_timeout(
-                    ssh_client,
-                    _drop_another_registrations_volume_command(
-                        _quote_safe_docker_volume_name(local_volume, field_name="local_volume"), owner, not others
-                    ),
-                    timeout,
-                )
-                if dropped.exit_status != 0:
-                    raise PodVolumeOfAnotherRegistrationInUse(
-                        f"volume {local_volume} on this host belongs to another registration that is still using or "
-                        f"creating it (exit {dropped.exit_status})"
-                    )
-            await run_logged_rental_docker_sdk_operation(
-                operation="create_volume",
-                log_extra=volume_log_extra,
-                call=lambda: docker_client.create_volume(
-                    volume_name=local_volume,
-                    driver=volume_driver,
-                    driver_opts=volume_driver_opts,
-                    timeout=timeout,
-                    labels=labels,
-                ),
+        await run_logged_rental_docker_sdk_operation(
+            operation="create_volume",
+            log_extra=volume_log_extra,
+            call=lambda: docker_client.create_volume(
                 volume_name=local_volume,
-                volume_driver=volume_driver,
-                volume_driver_opts=volume_driver_opts,
-                timeout_seconds=timeout,
-            )
+                driver=volume_driver,
+                driver_opts=volume_driver_opts,
+                timeout=timeout,
+                labels=labels,
+            ),
+            volume_name=local_volume,
+            volume_driver=volume_driver,
+            volume_driver_opts=volume_driver_opts,
+            timeout_seconds=timeout,
+        )
         return volume_driver
 
     async def _get_fs_available_bytes(
@@ -15206,17 +15147,12 @@ class DockerService:
 
     @staticmethod
     async def _run_with_no_create_of_the_pod(pod_id: str, ssh_client, command: str):
-        """Run the node-left removal while no registration has a create of the pod running and none can start its
-        volume step (pod_volume_lock): a create still running there may be about to mount the volume it made or
-        found. The backend sends this delete once, so it waits for those creates instead of answering a retry."""
-        deadline = time.monotonic() + _NODE_LEFT_CREATE_WAIT_SECONDS
-        while True:
-            if not await inflight_creates.wait_for_no_create(pod_id, max(0.0, deadline - time.monotonic())):
-                raise _CreatesOfThePodStillRunning(pod_id)
-            async with pod_volume_lock(pod_id):
-                # a create registered between the wait and the lock goes round again
-                if not inflight_creates.registrations_creating(pod_id):
-                    return await _run_with_host_timeout(ssh_client, command, _PARK_COMMAND_TIMEOUT_SECONDS)
+        """Run the node-left removal once no registration has a create of the pod running: a delayed create of the
+        left registration could otherwise make the container after its removal. The backend sends this delete once,
+        so it waits for those creates instead of answering a retry."""
+        if not await inflight_creates.wait_for_no_create(pod_id, _NODE_LEFT_CREATE_WAIT_SECONDS):
+            raise _CreatesOfThePodStillRunning(pod_id)
+        return await _run_with_host_timeout(ssh_client, command, _PARK_COMMAND_TIMEOUT_SECONDS)
 
     async def _stop_create_before_delete(self, payload: ContainerDeleteRequest, executor_info: ExecutorSSHInfo):
         """The delete's steps before its teardown: the refusal to answer, or None."""

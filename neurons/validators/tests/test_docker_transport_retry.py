@@ -17,6 +17,7 @@ from services.node_host import node_owner
 from services.rental_docker_sdk import (
     ContainerExecSpec,
     ContainerNameTakenOnRetry,
+    ContainerOfAnotherRegistration,
     ContainerRunSpec,
     RentalDockerConnectionError,
     RentalDockerOperationError,
@@ -165,27 +166,6 @@ async def test_adopt_takes_a_same_name_volume_only_from_the_requested_plugin_tag
     assert api.calls == ["create_volume", "inspect_volume"]
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("existing_owner, adopted", [("hk-a:ex-1", True), ("hk-b:ex-1", False), (None, False)])
-async def test_volume_retry_adopts_only_its_own_registrations_volume(existing_owner, adopted):
-    # DAH-6531: a pod keeps its volume name on every registration; another registration's is not this create's
-    api = _FakeApiClient(adapter=_FakeAdapter())
-    api.create_volume_errors = [EOFError()]
-    labels = {} if existing_owner is None else {"io.lium.executor_id": existing_owner}
-    api.existing_volumes["volume_p1"] = {"Name": "volume_p1", "Driver": "local", "Labels": labels}
-    created = _client(api).create_volume(
-        volume_name="volume_p1", driver=None, driver_opts=None, labels={"io.lium.executor_id": "hk-a:ex-1"}
-    )
-
-    if adopted:
-        await created
-    else:
-        with pytest.raises(RentalDockerOperationError, match="already exists for another registration"):
-            await created
-
-    assert api.calls == ["create_volume", "inspect_volume"]
-
-
 # ---------------------------------------------------------------------------
 # run container: create is never run twice without the name check
 # ---------------------------------------------------------------------------
@@ -207,22 +187,27 @@ async def test_run_container_retry_refuses_a_same_name_container_on_another_imag
 
 
 @pytest.mark.asyncio
-async def test_run_container_retry_refuses_a_same_name_container_of_another_registration():
-    """DAH-6531: on a daemon two registrations share, the left registration's pod_<id> on the same image is not
-    adopted (the node-left delete would remove it under the replacement)."""
+@pytest.mark.parametrize("existing_labels, adopted", [({"io.lium.executor_id": "hk-a:ex-1"}, False), ({}, True), ({"io.lium.executor_id": "hk-b:ex-2"}, True)])
+async def test_run_container_retry_adopts_a_same_name_container_only_of_its_own_or_no_registration(
+    existing_labels, adopted
+):
+    """DAH-6531: on a daemon two registrations share, another registration's pod_<id> on the same image is not
+    adopted, and the refusal is typed so the create never removes it as its own leftover; an unlabelled one (made
+    before the label) or its own is the first attempt's container."""
     api = _FakeApiClient(adapter=_FakeAdapter())
     api.create_container_errors = [EOFError()]
-    api.existing_containers["pod_test"] = {
-        "Id": "left", "Config": {"Image": "lium/pod:1", "Labels": {"io.lium.executor_id": "hk-a:ex-1"}}
-    }
+    api.existing_containers["pod_test"] = {"Id": "left", "Config": {"Image": "lium/pod:1", "Labels": existing_labels}}
     spec = ContainerRunSpec(
         image="lium/pod:1", name="pod_test", network="lium-rentals", labels={"io.lium.executor_id": "hk-b:ex-2"}
     )
 
-    with pytest.raises(ContainerNameTakenOnRetry, match="already exists for another registration"):
+    if adopted:
         await _client(api).run_container(spec)
-
-    assert "start" not in api.calls
+        assert api.calls.count("create_container") == 1
+    else:
+        with pytest.raises(ContainerOfAnotherRegistration, match="already exists for another registration"):
+            await _client(api).run_container(spec)
+        assert "start" not in api.calls
 
 
 @pytest.mark.asyncio

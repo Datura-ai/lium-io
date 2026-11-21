@@ -114,6 +114,10 @@ class RentalDockerOperationError(RuntimeError):
     """Raised when Docker SDK reports a rental Docker operation failure."""
 
 
+class ContainerOfAnotherRegistration(RentalDockerOperationError):
+    """A same-name container on the daemon carries another registration's label: it is never adopted or removed."""
+
+
 class ContainerNameTakenOnRetry(RentalDockerOperationError):
     """A transport retry of `run_container` found the spec's name already held by a container on another image."""
 
@@ -814,6 +818,21 @@ class RentalDockerSdkClient:
             ) from exc
         return str(info.get("Image") or "")
 
+    async def container_owner_state(self, *, container_name: str) -> tuple[str, str, str] | None:
+        """One inspect: the container's ID, ``State.Status`` and registration label (`io.lium.executor_id`, empty
+        when unlabelled), or None when dockerd no longer knows the name (404)."""
+        try:
+            info = await _in_docker_thread(self._api_client.inspect_container, container_name)
+        except Exception as exc:
+            if _is_docker_not_found_error(exc):
+                return None
+            raise RentalDockerOperationError(_wrap_error_message("Docker SDK inspect container failed", exc)) from exc
+        info = info if isinstance(info, dict) else {}
+        state = info.get("State") if isinstance(info.get("State"), dict) else {}
+        config = info.get("Config") if isinstance(info.get("Config"), dict) else {}
+        labels = config.get("Labels") or {}
+        return str(info.get("Id") or ""), str(state.get("Status") or "").lower(), str(labels.get(LIUM_EXECUTOR_ID_LABEL) or "")
+
     async def container_status(self, *, container_name: str) -> str | None:
         """Return the container's ``State.Status`` (``running``, ``exited``, ``removing``, …), or
         None when dockerd no longer knows the name (404)."""
@@ -1226,8 +1245,8 @@ class RentalDockerSdkClient:
         wanted_owner = spec.labels.get(LIUM_EXECUTOR_ID_LABEL)
         existing_labels = (config.get("Labels") if isinstance(config, dict) else None) or {}
         existing_owner = existing_labels.get(LIUM_EXECUTOR_ID_LABEL)
-        if wanted_owner is not None and existing_owner != wanted_owner:
-            raise ContainerNameTakenOnRetry(
+        if wanted_owner is not None and existing_owner is not None and existing_owner != wanted_owner:
+            raise ContainerOfAnotherRegistration(
                 "Docker SDK run container refused after a transport retry: a container named "
                 f"{spec.name} already exists for another registration"
             )
@@ -1312,8 +1331,7 @@ class RentalDockerSdkClient:
         labels: dict[str, str] | None = None,
         adopt_existing: bool = False,
     ) -> None:
-        owner = (labels or {}).get(LIUM_EXECUTOR_ID_LABEL)
-        if adopt_existing and self._adopt_volume_by_name_sync(volume_name, driver, owner):
+        if adopt_existing and self._adopt_volume_by_name_sync(volume_name, driver):
             return
         original_timeout = getattr(self._api_client, "timeout", None)
         should_override_timeout = timeout is not None and hasattr(
@@ -1333,10 +1351,9 @@ class RentalDockerSdkClient:
             if should_override_timeout:
                 self._api_client.timeout = original_timeout
 
-    def _adopt_volume_by_name_sync(self, volume_name: str, driver: str | None, owner: str | None = None) -> bool:
+    def _adopt_volume_by_name_sync(self, volume_name: str, driver: str | None) -> bool:
         """The idempotency check before a retried `volumes/create`: adopt a same-name volume on
-        the requested driver (Docker's default `local` when none was asked for) and, when the create names a
-        registration (`owner`), carrying that registration's label; refuse another."""
+        the requested driver (Docker's default `local` when none was asked for); refuse another."""
         try:
             info = self._api_client.inspect_volume(volume_name)
         except Exception as exc:
@@ -1345,12 +1362,6 @@ class RentalDockerSdkClient:
             raise
         existing_driver = info.get("Driver") if isinstance(info, dict) else None
         wanted_driver = driver or "local"
-        existing_owner = ((info.get("Labels") if isinstance(info, dict) else None) or {}).get(LIUM_EXECUTOR_ID_LABEL)
-        if owner is not None and existing_owner != owner:
-            raise RentalDockerOperationError(
-                "Docker SDK create volume refused after a transport retry: a volume named "
-                f"{volume_name} already exists for another registration"
-            )
         # a plugin driver is inspected as `<alias>:<tag>` while it may be requested as `<alias>`,
         # which is `<alias>:latest`; another tag is another plugin (vloopback:v2 beside vloopback)
         if isinstance(existing_driver, str) and _with_default_tag(existing_driver) == _with_default_tag(wanted_driver):

@@ -20,10 +20,8 @@ from payload_models.payloads import (
 )
 import services.docker_service as docker_service_module
 from services.docker_service import (
-    _drop_another_registrations_volume_command,
     _node_left_delete_command,
     inflight_creates,
-    pod_volume_lock,
 )
 
 from tests.test_delete_drops_dirty_volume import _delete, _delete_payload, _wire_delete
@@ -133,37 +131,30 @@ def test_another_boot_runs_no_docker_command(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("labels", "removed"),
+    "labels",
     [
-        (lambda pod: [pod, f"io.lium.executor_id={LEFT_LABEL}"], True),  # the left registration's: removed by name
+        lambda pod: [pod, f"io.lium.executor_id={LEFT_LABEL}"],  # the left registration's
         # a replacement made on this daemon by another registration, or another miner's registration of this executor
-        (lambda pod: [pod, "io.lium.executor_id=miner-b:replacement-executor"], False),
-        (lambda pod: [pod, f"io.lium.executor_id=miner-b:{LEFT}"], False),
-        (lambda pod: ["io.lium.pod_id=other", f"io.lium.executor_id={LEFT_LABEL}"], False),
-        (lambda pod: [], False),  # made before the labels
+        lambda pod: [pod, "io.lium.executor_id=miner-b:replacement-executor"],
+        lambda pod: [pod, f"io.lium.executor_id=miner-b:{LEFT}"],
+        lambda pod: [],  # made before the labels
     ],
 )
-def test_the_node_left_removes_its_container_kept_containers_and_only_its_own_volume(tmp_path, labels, removed):
+@pytest.mark.parametrize("container_owner", [LEFT_LABEL, None])
+def test_the_node_left_removes_its_container_and_kept_containers_and_never_the_pods_volume(
+    tmp_path, labels, container_owner
+):
+    # one pod keeps one volume name on every registration: on a shared daemon it may be the replacement's
     payload = _payload(HOST_BOOT)
     volume = _volume(tmp_path, f"volume_{payload.pod_id}", *labels(f"io.lium.pod_id={payload.pod_id}"))
 
-    status, calls = _run(tmp_path, payload)
+    status, calls = _run(tmp_path, payload, container_owner=container_owner)
 
     assert status == 0
-    assert "rm -fv cid kept1" in calls  # the checked container, by its ID
+    assert ("rm -fv cid kept1" in calls) is (container_owner is not None)  # the checked container, by its ID
     assert f"label=io.lium.executor_id={LEFT_LABEL}" in calls  # kept containers of the left registration only
-    assert volume.exists() is not removed
-    assert "prune" not in calls  # a prune skips plugin volumes and re-resolves the name after its label match
-
-
-def test_a_volume_still_in_use_fails_the_delete(tmp_path):
-    payload = _payload(HOST_BOOT)
-    _volume(tmp_path, f"volume_{payload.pod_id}", f"io.lium.pod_id={payload.pod_id}",
-            f"io.lium.executor_id={LEFT_LABEL}", "inuse")
-
-    status, _ = _run(tmp_path, payload)
-
-    assert status == 1
+    assert volume.exists()
+    assert "volume" not in calls
 
 
 @pytest.mark.parametrize("owner", [f"{LEFT_MINER}:replacement-executor", f"miner-b:{LEFT}", LEFT, ""])
@@ -176,61 +167,11 @@ def test_a_container_made_for_another_registration_on_this_host_is_never_touched
     assert "rm" not in calls.replace("inspect", "")
 
 
-def test_with_no_container_left_only_its_own_volume_is_removed(tmp_path):
-    payload = _payload(HOST_BOOT)
-    own = _volume(
-        tmp_path, f"volume_{payload.pod_id}", f"io.lium.pod_id={payload.pod_id}", f"io.lium.executor_id={LEFT_LABEL}"
-    )
-
-    status, calls = _run(tmp_path, payload, container_owner=None)
-
-    assert status == 0 and "rm -fv cid" not in calls
-    assert not own.exists()
-
-
-def test_a_container_still_present_fails_before_the_volumes(tmp_path):
+def test_a_container_still_present_fails_the_delete(tmp_path):
     status, calls = _run(tmp_path, _payload(HOST_BOOT), sticky=True)
 
     assert status == 1
     assert "volume" not in calls
-
-
-@pytest.mark.parametrize(
-    ("present", "rm_fails", "may_remove", "expected_status", "removed"),
-    [
-        (None, False, True, 0, False),  # no volume yet: the create makes it
-        ("unreadable", False, True, 1, False),  # an inspect that fails otherwise hides nothing: the create fails
-        ("", False, True, 0, False),  # made before the label: reused as before
-        (LEFT_LABEL, False, False, 0, False),  # this registration's own: reused
-        ("miner-b:replacement-executor", False, True, 0, True),  # another registration's, left over: removed
-        ("miner-b:replacement-executor", True, True, 1, True),  # another registration's, in use: the create fails
-        # another registration's while that registration's create of the pod runs: not left over, the create fails
-        ("miner-b:replacement-executor", False, False, 1, False),
-    ],
-)
-def test_a_create_never_reuses_another_registrations_volume(
-    tmp_path, present, rm_fails, may_remove, expected_status, removed
-):
-    log = tmp_path / "calls"
-    stub = tmp_path / "docker"
-    inspect = {
-        None: "echo 'Error response from daemon: get volume_p: no such volume' >&2; exit 1",
-        "unreadable": "echo 'Cannot connect to the Docker daemon' >&2; exit 1",
-    }.get(present, f"echo {shlex.quote(str(present))}")
-    stub.write_text(
-        "#!/bin/sh\n"
-        f'echo "$*" >> {shlex.quote(str(log))}\n'
-        f'case "$2" in inspect) {inspect};; rm) exit {1 if rm_fails else 0};; esac\n'
-    )
-    stub.chmod(0o755)
-    command = _drop_another_registrations_volume_command("volume_p", LEFT_LABEL, may_remove).replace(
-        "/usr/bin/docker", str(stub)
-    )
-
-    done = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
-
-    assert done.returncode == expected_status
-    assert ("volume rm volume_p" in log.read_text()) is removed
 
 
 @pytest.mark.parametrize("missing", ["executor_id", "miner_hotkey"])
@@ -247,8 +188,8 @@ def test_the_backend_message_parses_to_the_checked_delete():
 
 @pytest.mark.asyncio
 async def test_the_removal_waits_for_every_create_of_the_pod_and_cancels_none(docker_service, monkeypatch):
-    # a create of the pod (the replacement's, or a late one from the node left) may be about to mount the volume it
-    # made or found; the delete is sent once, so it waits for those creates instead of answering a retry
+    # a late create of the pod from the node left could make its container after the removal; the delete is sent
+    # once, so it waits for the pod's creates instead of answering a retry
     order = _wire_delete(docker_service, monkeypatch, _host_exits(0))
     payload = _payload()
     replacement = ("miner-b", "replacement-executor")
@@ -275,12 +216,3 @@ async def test_a_create_still_running_at_the_end_of_the_wait_deletes_nothing(doc
         result = await _delete(docker_service, payload)
 
     assert isinstance(result, FailedContainerRequest) and order == []
-
-
-@pytest.mark.asyncio
-async def test_the_removal_and_a_creates_volume_step_never_overlap():
-    payload = _payload()
-    lock = pod_volume_lock(payload.pod_id)
-    async with lock:
-        # the create's volume step and the node-left removal take the same lock object for the pod
-        assert pod_volume_lock(payload.pod_id) is lock and lock.locked()
