@@ -340,13 +340,15 @@ async def start_storage_operation(
         lock_path = shlex.quote(str(files.lock))
         pid_path = shlex.quote(str(files.pid))
         # The wrapper takes the launch lock before it starts the runner, so it runs only after the
-        # launch has recorded its PID, and never once a cancel has marked the operation.
+        # launch has recorded its PID, and never once a cancel has marked the operation. It holds the
+        # lock until the runner has started (the runner does not inherit it), so a cancel's marker
+        # either stops the runner here or comes after it started, as for any running operation.
         wrapper = (
             f"rm -f {shlex.quote(str(files.status))}; "
             f"exec 8>>{lock_path}; "
-            f"if flock -w 30 8 && ! test -e {shlex.quote(str(files.cancel))}; then exec 8>&-; "
-            f"{runner} & child=$!; "
-            "trap 'kill -TERM \"$child\" 2>/dev/null || true' TERM INT; "
+            f"if flock -w 30 8 && ! test -e {shlex.quote(str(files.cancel))}; then "
+            f"{runner} 8>&- & child=$!; "
+            "trap 'kill -TERM \"$child\" 2>/dev/null || true' TERM INT; exec 8>&-; "
             'wait "$child"; result=$?; '
             "else exec 8>&-; result=5; fi; "
             f"printf '%s\\n' \"$result\" > {shlex.quote(str(files.status))}; "

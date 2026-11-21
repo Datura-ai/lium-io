@@ -402,3 +402,49 @@ async def test_a_cancel_before_a_slow_wrapper_starts_its_runner_leaves_nothing_r
     with pytest.raises(ProcessLookupError):
         os.killpg(group, 0)
     assert not Path(str(files.spec)).exists() and not Path(str(files.pid)).exists()
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_cannot_mark_the_operation_between_the_wrapper_check_and_the_runner_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # the wrapper is delayed right before it starts the runner; it holds the lock until the runner has started,
+    # so a cancel that comes in that delay marks the operation only after the runner exists
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", storage_operations.PurePosixPath(str(tmp_path / "ops")))
+    monkeypatch.setattr(storage_operations, "supports_storage_operation", AsyncMock(return_value=True))
+    monkeypatch.setattr(storage_operations, "_report_cancelled", AsyncMock(return_value=True))
+    local = _local_ssh()
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    started = tmp_path / "runner-started"
+    runner = tmp_path / "runner"
+    # this runner stops on the marker; it records whether the marker was already there when it started
+    runner.write_text(
+        f"#!/bin/sh\ntest -e {files.cancel} && touch {tmp_path / 'marked-before-start'}\ntouch {started}\n"
+        f"while ! test -e {files.cancel}; do sleep 0.05; done\n"
+    )
+    runner.chmod(0o755)
+    monkeypatch.setattr(storage_operations, "REMOTE_RUNNER_PATH", str(runner))
+
+    async def run(command: str, check: bool = False) -> SimpleNamespace:
+        if "nohup" in command:
+            runner_start = f"sh {runner} --spec"
+            assert command.count(runner_start) == 1
+            command = command.replace(runner_start, "sleep 1; " + runner_start)
+        return await local.run(command, check)
+
+    await storage_operations.start_storage_operation(
+        SimpleNamespace(run=run, start_sftp_client=local.start_sftp_client),
+        "sh", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False,
+    )
+    group = int(Path(str(files.pid)).read_text())
+    await asyncio.sleep(0.3)
+    try:
+        await storage_operations.cancel_storage_operation(local, OPERATION_ID)
+    finally:
+        subprocess.run(["sh", "-c", f"kill -KILL -{group}"], capture_output=True)
+    for _ in range(40):
+        if started.exists():
+            break
+        await asyncio.sleep(0.05)
+    assert started.exists()
+    assert not (tmp_path / "marked-before-start").exists()
