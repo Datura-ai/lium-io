@@ -539,6 +539,7 @@ def withhold_renter_gpu_reset_verdicts(
 ) -> tuple[dict[str, list[JobResult]], list[WithheldVerdict]]:
     """DAH-4658: a scrape held for the renter's own GPU reset gets no verdict, as a rollout failure gets none.
     DAH-5805: neither does a run the validator's own Redis ended; the node is not scored 0 for it.
+    DAH-5933: nor a rental probe the task had no time left for, when no last scored result was carried.
     DAH-5851: neither does an idle node's port check deferred for disk pressure; it is never carried, so no
     idle pay comes from the republished ports."""
     standing_by_miner: dict[str, list[JobResult]] = {}
@@ -558,7 +559,7 @@ def withhold_renter_gpu_reset_verdicts(
                     if redis_fault
                     else "Verdict withheld: the port check was deferred for disk pressure"
                     if port_check_deferred
-                    else "Verdict withheld: the renter is resetting the node's GPUs, or its power tier is unknown",
+                    else "Verdict withheld: the renter is resetting the node's GPUs, its power tier is unknown, or the task had no time left for the rental probe",
                     extra={
                         "miner_hotkey": miner_hotkey,
                         "executor_uuid": result.executor_info.uuid,
@@ -748,9 +749,16 @@ def has_renter_gpu_reset_holds(job_results: dict[str, list[JobResult]]) -> bool:
     return any(_held_for_renter_gpu_reset(result) for results in job_results.values() for result in results)
 
 
-# a cycle that cannot tell the node's state gives no verdict: the renter's GPU reset (DAH-4658), or a power tier
-# reading whose clear was not confirmed (F-43)
-_HELD_REASONS = (MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason, GpuPowerLimitMessages.TIER_STATE_UNKNOWN.reason)
+# DAH-5933: the run left the backend's rental probe too little time; the validator's budget, not the node, decides
+# that, so it is no failed rental check: an idle node carries its last scored result too
+_NO_TASK_TIME = RentalVerificationMessages.NO_TASK_TIME.reason
+# a cycle that cannot tell the node's state gives no verdict: the renter's GPU reset (DAH-4658), a power tier
+# reading whose clear was not confirmed (F-43), or a rental probe the task had no time left for (DAH-5933)
+_HELD_REASONS = (
+    MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason,
+    GpuPowerLimitMessages.TIER_STATE_UNKNOWN.reason,
+    _NO_TASK_TIME,
+)
 
 
 def _held_for_renter_gpu_reset(result: JobResult) -> bool:
@@ -787,7 +795,8 @@ async def carry_renter_gpu_reset_results(
         for index, held in enumerate(results):
             if not _held_for_renter_gpu_reset(held):
                 continue
-            if str(held.executor_info.uuid).lower() not in rented_executor_ids:
+            no_task_time = held.failure_reason_code == _NO_TASK_TIME
+            if not no_task_time and str(held.executor_info.uuid).lower() not in rented_executor_ids:
                 continue
             previous = await _last_scored_result(redis_service, miner_hotkey, held)
             if previous is None:
@@ -816,7 +825,9 @@ async def carry_renter_gpu_reset_results(
             )
             logger.info(
                 _m(
-                    "Score carried: the renter is resetting the node's GPUs, the last scored result stands",
+                    "Score carried: the task had no time left for the rental probe, the last scored result stands"
+                    if no_task_time
+                    else "Score carried: the renter is resetting the node's GPUs, the last scored result stands",
                     extra={
                         "miner_hotkey": miner_hotkey,
                         "executor_uuid": held.executor_info.uuid,
@@ -880,7 +891,7 @@ async def _last_scored_result(
 async def remember_rented_scored_results(
     job_results: dict[str, list[JobResult]], redis_service: RedisService
 ) -> None:
-    """DAH-4658: keep each rented node's scored result of this cycle for `carry_renter_gpu_reset_results`.
+    """DAH-4658: keep each node's scored result of this cycle for `carry_renter_gpu_reset_results`.
 
     Any other standing result drops the kept one, so only the cycle right before a reset is carried.
     A carried result is not kept again, so the TTL bounds how long one result can stand in. A Redis
@@ -892,7 +903,8 @@ async def remember_rented_scored_results(
             if result.carried_for_renter_gpu_reset:
                 continue
             key = last_scored_result_key(miner_hotkey, result.executor_info.uuid)
-            if result.is_rented and result.is_successful:
+            # an idle node's too (DAH-5933): RENTAL_CHECK_NO_TASK_TIME carries it; the GPU-reset carry stays rented-only
+            if result.is_successful:
                 writes.set(key, result.model_dump_json(), ex=LAST_SCORED_RESULT_TTL_SECONDS)
             else:
                 writes.delete(key)

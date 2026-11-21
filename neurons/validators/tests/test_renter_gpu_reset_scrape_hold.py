@@ -22,6 +22,7 @@ from services.executor_rollout import (
     ExecutorRolloutTracker,
     carry_renter_gpu_reset_results,
     remember_rented_scored_results,
+    session_kept_hotkeys,
 )
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, renter_gpu_reset_recent
 from services.redis_service import (
@@ -70,6 +71,7 @@ from neurons.validators.src.services.task.checks.gpu_loss_hold import GpuLossHol
 from neurons.validators.src.services.task.checks.machine_spec_scrape import MachineSpecScrapeCheck
 from neurons.validators.src.services.task.checks.rented_machine import TenantEnforcementCheck
 from neurons.validators.src.services.task.messages import MachineSpecMessages as Msg
+from neurons.validators.src.services.task.messages import RentalVerificationMessages
 from neurons.validators.src.services.task.pipeline import Pipeline
 from neurons.validators.src.services.task.result_handler import ResultHandler
 
@@ -445,7 +447,7 @@ async def test_an_unreadable_previous_score_withholds_the_held_scrape():
 
 
 @pytest.mark.asyncio
-async def test_only_scored_rented_results_are_remembered_and_a_redis_error_is_logged_only():
+async def test_only_scored_results_are_remembered_and_a_redis_error_is_logged_only():
     service = _redis_service()
     idle = _scored("node-idle")
     failed = _failed("node-failed", Msg.SCRAPE_FAILED_NO_GPU.reason)
@@ -457,8 +459,58 @@ async def test_only_scored_rented_results_are_remembered_and_a_redis_error_is_lo
     )
 
     assert await service.get(last_scored_result_key("5Miner", "node-1"))
-    assert await service.get(last_scored_result_key("5Miner", "node-idle")) is None
+    # DAH-5933: an idle node's too, for a rental probe the task has no time left for
+    assert await service.get(last_scored_result_key("5Miner", "node-idle"))
     assert await service.get(last_scored_result_key("5Miner", "node-failed")) is None
+
+
+def _no_task_time(uuid: str):
+    return _failed(uuid, RentalVerificationMessages.NO_TASK_TIME.reason)
+
+
+@pytest.mark.asyncio
+async def test_an_idle_node_the_task_had_no_time_to_probe_keeps_its_last_score_and_its_pay():
+    """DAH-5933: not a failed rental check, no zero score, no lost idle cycle, nothing published over the backend row."""
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_scored("node-idle")]}, service)
+    held = _no_task_time("node-idle")
+
+    kept, withheld = await _carry_then_withhold(service, [held], rented_executor_ids=frozenset())
+
+    [carried] = kept["5Miner"]
+    assert carried.is_successful and carried.score == 1.0
+    assert carried.carried_for_renter_gpu_reset is True
+    assert carried.job_batch_id == held.job_batch_id
+    assert withheld == []
+    assert specs_to_publish(kept["5Miner"]) == []
+    # a carried result is not kept again, so the 1 h TTL ends a run of such cycles
+    await service.delete(last_scored_result_key("5Miner", "node-idle"))
+    await remember_rented_scored_results(kept, service)
+    assert await service.get(last_scored_result_key("5Miner", "node-idle")) is None
+
+
+@pytest.mark.asyncio
+async def test_a_no_task_time_cycle_without_a_last_score_gets_no_verdict_and_keeps_the_miner_active():
+    service = _redis_service()
+    held = _no_task_time("node-idle")
+
+    kept, withheld = await _carry_then_withhold(service, [held], rented_executor_ids=frozenset())
+
+    assert kept == {"5Miner": []}
+    assert [w.result.executor_info.uuid for w in withheld] == ["node-idle"]
+    assert session_kept_hotkeys(withheld) == {"5Miner"}
+
+
+@pytest.mark.asyncio
+async def test_the_gpu_reset_carry_still_needs_the_node_rented():
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_scored("node-idle")]}, service)
+    held = _failed("node-idle", Msg.SCRAPE_GPU_RESET_IN_PROGRESS.reason)
+
+    kept, withheld = await _carry_then_withhold(service, [held], rented_executor_ids=frozenset())
+
+    assert kept == {"5Miner": []}
+    assert [w.result.executor_info.uuid for w in withheld] == ["node-idle"]
 
 
 @pytest.mark.asyncio
