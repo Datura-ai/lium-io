@@ -31,6 +31,10 @@ RENTED_MACHINE_PREFIX = "rented_machines_prefix"
 # set with every rebuild of the hash above: before the first one a missing machine proves nothing
 RENTED_MACHINES_SYNCED_KEY = "rented_machines_synced"
 PENDING_PODS_PREFIX = "pending_pods_prefix"
+# pod id -> time of a rental create an older validator (marks without a command ID) left unanswered when it stopped:
+# it keeps its mark until the backend's receipt, so the pod's unlabelled container may be that create's
+PRE_UPGRADE_CREATE_MARKS_KEY = "pre_upgrade_create_marks"
+PENDING_MARK_MAX_AGE_SECONDS = 30 * 60
 # epoch seconds of the node's latest create (add_pending_pod); outlives VERIFYX_COMMAND_TIMEOUT_SECONDS (600) so a
 # VerifyX cold retry sees a create whose pending-pod marker came and went between two of its reads
 CREATE_STARTED_AT_PREFIX = "create_started_at"
@@ -1491,8 +1495,27 @@ class RedisService:
                 await self.hset(INFLIGHT_BACKEND_CREATES_KEY, field, creates[pod_id][-1].model_dump_json())
         return {pod_id: pod_creates for pod_id, pod_creates in creates.items() if pod_creates}
 
+    async def clear_pending_pods(self) -> None:
+        """At start no create is running, so every pending mark goes. An older validator's rental marks (no command
+        ID, no kind) are kept by pod first: its create may have started a container whose answer never left."""
+        kept = {}
+        for marks in (await self.hgetall(PENDING_PODS_PREFIX) or {}).values():
+            for item in _parse_pending_pods(marks):
+                if item.get("pod_id") and not item.get("command_id") and not item.get("kind"):
+                    kept[item["pod_id"]] = max(kept.get(item["pod_id"], 0), int(item.get("time", 0)))
+        for pod_id, started in kept.items():
+            await self.hset(PRE_UPGRADE_CREATE_MARKS_KEY, pod_id, str(started))
+        if kept:
+            await self.expire(PRE_UPGRADE_CREATE_MARKS_KEY, PENDING_MARK_MAX_AGE_SECONDS)
+        await self.delete(PENDING_PODS_PREFIX)
+
+    async def pre_upgrade_create_unanswered(self, pod_id: str) -> bool:
+        """An older validator left a rental create of the pod unanswered within the pending-mark window."""
+        started = await self.hget(PRE_UPGRADE_CREATE_MARKS_KEY, pod_id)
+        return started is not None and time.time() - int(started) < PENDING_MARK_MAX_AGE_SECONDS
+
     async def get_pending_pods(
-        self, miner_hotkey: str, executor_id: str, max_age_seconds: int | None = 30 * 60
+        self, miner_hotkey: str, executor_id: str, max_age_seconds: int | None = PENDING_MARK_MAX_AGE_SECONDS
     ) -> list[dict]:
         """Pending-pod entries younger than `max_age_seconds` (None: every entry)."""
         data = _parse_pending_pods(await self.hget(PENDING_PODS_PREFIX, f"{miner_hotkey}:{executor_id}"))

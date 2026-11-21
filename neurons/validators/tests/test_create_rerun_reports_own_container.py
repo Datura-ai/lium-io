@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from payload_models.payloads import ContainerCreated
 from services.const import LIUM_CREATE_COMMAND_ID_LABEL
-from services.docker_service import DockerService, _CREATE_RECORD_STATE_MARK, _EDIT_PARKED_MARK, _create_record_path, create_node_absent
+from services.docker_service import DockerService, _CREATE_RECORD_STATE_MARK, _create_record_path, create_node_absent
 from test_deploy_optimizations import _executor_info, _patch_happy, _payload, _ssh_client, _ssh_result
 
 
@@ -27,8 +27,6 @@ class _Node:
         self.container: tuple[bool, str] | None = None
         # None: Docker answers. "docker": the listing exits non-zero. "ssh": the command cannot be run
         self.unavailable: str | None = None
-        # the pod's edit-parked container is on the node too (an edit cut off before its create returned)
-        self.parked = False
 
     def wrap(self, ssh_client):
         inner = ssh_client.run.side_effect
@@ -44,8 +42,6 @@ class _Node:
                 path = next(p for p in self.files) if self.files else ""
                 running = "running" if self.container and self.container[0] else "exited"
                 state = f"{running} {self.container[1]}" if self.container and not self.unavailable else ""
-                if self.parked and not self.unavailable:
-                    state += f"\n{_EDIT_PARKED_MARK}"
                 return _ssh_result(
                     exit_status=1 if self.unavailable == "docker" else 0,
                     stdout=f"{self.files.get(path, '')}\n{_CREATE_RECORD_STATE_MARK}\n{state}\n",
@@ -178,22 +174,19 @@ async def test_only_a_listing_without_this_commands_container_counts_as_absent(s
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ran_before", [True, False])
 @pytest.mark.parametrize("reboot_or_edit", [True, False])
-@pytest.mark.parametrize("parked", [True, False])
 async def test_an_unlabelled_container_from_before_the_upgrade_is_replaced_only_by_a_fresh_reboot_or_edit(
-    svc, monkeypatch, ran_before, reboot_or_edit, parked
+    svc, monkeypatch, ran_before, reboot_or_edit
 ):
     """An older validator labelled no container with its command, and its pending marks carry no command ID (a full
     start clears them too). A fresh create (no volume) has no container of its own yet, so the pod's unlabelled
     container is an earlier run of it, maybe cut off by the upgrade: the create answers nothing (an unknown outcome)
     and never reaches the cleanup that would remove it with its volume. So does any command known to have run before.
     A new reboot or edit of a pod made before the upgrade brings the pod's volume and goes ahead: that container is
-    the pod's own, which it replaces, unless the pod's edit-parked container is still there: the older validator removed
-    it only once its create returned, so that edit was cut off after starting this container."""
+    the pod's own, which it replaces."""
     n = _Node()
     ssh_client = n.wrap(_ssh_client(inspect_exit=0))
     _patch_happy(svc, monkeypatch, ssh_client)
     n.container = (True, "")
-    n.parked = parked
     cleanup = AsyncMock()
     monkeypatch.setattr(svc, "clean_existing_containers", cleanup)
     absent: list[bool] = []
@@ -204,7 +197,7 @@ async def test_an_unlabelled_container_from_before_the_upgrade_is_replaced_only_
     finally:
         create_node_absent.reset(token)
 
-    if ran_before or not reboot_or_edit or parked:
+    if ran_before or not reboot_or_edit:
         assert result is None
         cleanup.assert_not_awaited()
         assert absent == []

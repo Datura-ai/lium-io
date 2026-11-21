@@ -3679,7 +3679,6 @@ _DIND_STOP_ATTEMPTS = 3
 
 
 _CREATE_RECORD_STATE_MARK = "--lium-create-state--"
-_EDIT_PARKED_MARK = "--lium-edit-parked--"
 
 
 def _create_record_path(pod_id: str) -> str:
@@ -3717,12 +3716,8 @@ async def _replay_own_finished_create(
     # `docker inspect`, whose failure looks the same for both
     command = (
         f"cat {shlex.quote(_create_record_path(payload.pod_id))} 2>/dev/null; echo; echo {_CREATE_RECORD_STATE_MARK}; "
-        # the pod's edit-parked container too: an edit keeps it until its create has returned
-        f"p=$(/usr/bin/docker ps -aq --filter {shlex.quote(f'name=^/?{re.escape(container_name + EDIT_PARKED_SUFFIX)}$')}) "
-        "|| exit 1; "
         f"/usr/bin/docker ps -a --no-trunc --filter {shlex.quote(f'name=^/?{re.escape(container_name)}$')} "
-        f"--format '{{{{.State}}}} {{{{.Label \"{LIUM_CREATE_COMMAND_ID_LABEL}\"}}}}' "
-        f'&& {{ [ -z "$p" ] || echo {_EDIT_PARKED_MARK}; }}'
+        f"--format '{{{{.State}}}} {{{{.Label \"{LIUM_CREATE_COMMAND_ID_LABEL}\"}}}}'"
     )
     try:
         result = await ssh_client.run(command, check=False, timeout=30)
@@ -3732,17 +3727,13 @@ async def _replay_own_finished_create(
         raise _OwnCreateWithoutRecord(f"docker could not list the container (exit {result.exit_status})")
     record_text, _, state = (result.stdout or "").partition(_CREATE_RECORD_STATE_MARK)
     fields = state.split()
-    edit_in_flight = _EDIT_PARKED_MARK in fields
-    if edit_in_flight:
-        fields.remove(_EDIT_PARKED_MARK)
-    if len(fields) == 1 and (create_node_absent.get() is not None or not payload.local_volume or edit_in_flight):
-        # the pod's container carries no command label: an older validator made it. Its outcome is unknown, and the
-        # cleanup below would remove it and its volume, when it may be a run of this pod cut off by the upgrade (that
-        # validator's pending marks carry no command ID, and a full start clears them): a fresh create (no volume) has
-        # no container of its own yet; an edit or reboot whose parked container is still there was cut off after
-        # starting this one (that validator removed the parked one only once its create returned); and any one when
-        # this command ran before. Otherwise a reboot or edit brings the pod's volume and replaces the pod's own
-        # container through the edit swap (kept until its replacement runs)
+    if len(fields) == 1 and (create_node_absent.get() is not None or not payload.local_volume):
+        # the pod's container carries no command label: an older validator made it. A reboot or edit brings the pod's
+        # volume and replaces that container, the pod's own, through the edit swap (kept until its replacement runs).
+        # A fresh create (no volume) has no container of its own yet, so this one is an earlier run of the pod, maybe
+        # cut off by the upgrade; so is any one when this command ran before, or when that validator left a create of
+        # the pod unanswered (its pending mark, kept by pod at start). Its outcome is unknown; the cleanup below would
+        # remove it and its volume
         raise _OwnCreateWithoutRecord("the pod's container has no command label")
     if len(fields) != 2 or fields[1] != payload.command_id:
         if (absent := create_node_absent.get()) is not None:

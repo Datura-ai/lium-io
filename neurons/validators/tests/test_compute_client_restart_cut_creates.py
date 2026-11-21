@@ -2066,3 +2066,29 @@ async def test_a_create_whose_pending_mark_shows_an_earlier_run_holds_its_failur
     else:
         assert len(client.message_queue) == 1
         assert stored.unknown is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("age_minutes", [1, 31])
+async def test_a_rental_create_an_older_validator_left_unanswered_counts_as_run_before_after_the_upgrade(age_minutes):
+    """The older validator's mark (no command ID) stays until the backend's receipt, so one left at its stop is a create
+    whose answer may never have left: a full start keeps it by pod, and a same-pod create after the upgrade (maybe that
+    one sent again) counts as run before. A GPU operation's mark, this validator's own marks and one past the pending
+    window do not; the pending marks themselves still go."""
+    redis_service = _redis_service()
+    started = int(time.time()) - age_minutes * 60
+    await redis_service.hset(PENDING_PODS_PREFIX, "miner-hk:exec-1", json.dumps([
+        {"time": started, "pod_id": "pod-1"},
+        {"time": started, "pod_id": "pod-gpu", "kind": GPU_RESET_PENDING_KIND},
+        {"time": started, "pod_id": "pod-new", "command_id": "cmd-0"},
+    ]))
+    client = _client(redis_service)
+
+    await redis_service.clear_pending_pods()
+
+    assert await redis_service.hgetall(PENDING_PODS_PREFIX) == {}
+    ran_before = {
+        pod_id: await client._command_ran_before(_create_request().model_copy(update={"pod_id": pod_id}))
+        for pod_id in ("pod-1", "pod-gpu", "pod-new")
+    }
+    assert ran_before == {"pod-1": age_minutes < 30, "pod-gpu": False, "pod-new": False}
