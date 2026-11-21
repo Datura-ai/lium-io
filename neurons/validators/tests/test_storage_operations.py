@@ -15,13 +15,59 @@ import pytest
 from services import storage_operations
 
 OPERATION_ID = UUID("11111111-1111-4111-8111-111111111111")
+PRODUCTION_CANCEL_DIRECTORY = storage_operations.REMOTE_CANCEL_DIRECTORY
 
 
 @pytest.fixture(autouse=True)
 def _cancel_markers_in_tmp(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(
-        storage_operations, "REMOTE_CANCEL_DIRECTORY", storage_operations.PurePosixPath(str(tmp_path / "cancels"))
-    )
+    cancels = tmp_path / "cancels"
+    monkeypatch.setattr(storage_operations, "REMOTE_CANCEL_DIRECTORY", storage_operations.PurePosixPath(str(cancels)))
+    # an executor runner that checks the persistent marker; tests that launch replace it with their own
+    runner = tmp_path / "marker_aware_runner.py"
+    runner.write_text(f'CANCELS = "{cancels}"\n')
+    monkeypatch.setattr(storage_operations, "REMOTE_RUNNER_PATH", str(runner))
+
+
+def test_the_executor_runner_checks_the_persistent_cancel_marker_the_cancel_looks_for() -> None:
+    runner = Path(__file__).resolve().parents[2] / "executor" / "src" / "storage_runner.py"
+    assert str(PRODUCTION_CANCEL_DIRECTORY) in runner.read_text()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker_aware", [True, False])
+async def test_a_cancel_with_nothing_running_needs_a_runner_that_checks_the_persistent_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, marker_aware: bool
+) -> None:
+    # an earlier validator release can still launch the operation after this cancel; the old runner checks
+    # only the marker that launch removes, so the cancel is not confirmed until the runner is updated
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    reported = AsyncMock(return_value=True)
+    monkeypatch.setattr(storage_operations, "_report_cancelled", reported)
+    (tmp_path / f"{OPERATION_ID}.json").write_text(json.dumps({"reporter": {"api_url": "x"}}))
+    if not marker_aware:
+        Path(storage_operations.REMOTE_RUNNER_PATH).write_text("CANCEL_FILE = '--cancel-file'\n")
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text("#!/bin/sh\n")
+    fake_docker.chmod(0o755)
+
+    async def run_locally(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        if "marked=0" in command:
+            # the old launch has not reached the node yet: no spec on disk to wait for
+            (tmp_path / f"{OPERATION_ID}.json").unlink(missing_ok=True)
+        command = command.replace("/usr/bin/docker", str(fake_docker)).replace("sleep 0.25", "sleep 0.01")
+        result = subprocess.run(["sh", "-c", command], capture_output=True, text=True, input=input)
+        return SimpleNamespace(exit_status=result.returncode, stdout=result.stdout, stderr=result.stderr)
+
+    cancel = storage_operations.cancel_storage_operation(SimpleNamespace(run=run_locally), OPERATION_ID)
+    if marker_aware:
+        await cancel
+        reported.assert_awaited_once()
+    else:
+        with pytest.raises(storage_operations.StorageOperationLaunchError, match="not updated"):
+            await cancel
+        reported.assert_not_awaited()
+    # the marker is written either way, so an updated runner stops a later launch
+    assert (tmp_path / "cancels" / f"{OPERATION_ID}.cancel").exists()
 
 
 def _spawn_runner(spec_path: object) -> int:
@@ -328,7 +374,8 @@ async def test_a_cancel_between_the_launch_check_and_its_start_stops_the_launch(
     monkeypatch.setattr(storage_operations, "report_launch_failure", AsyncMock())
     started = tmp_path / "runner-started"
     runner = tmp_path / "runner"
-    runner.write_text(f"#!/bin/sh\ntouch {started}\n")
+    # an updated runner: it names the persistent cancel directory
+    runner.write_text(f"#!/bin/sh\n# {storage_operations.REMOTE_CANCEL_DIRECTORY}\ntouch {started}\n")
     runner.chmod(0o755)
     monkeypatch.setattr(storage_operations, "REMOTE_RUNNER_PATH", str(runner))
     local = _local_ssh()
