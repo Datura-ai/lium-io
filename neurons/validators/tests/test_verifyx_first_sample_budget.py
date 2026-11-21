@@ -179,7 +179,9 @@ def test_a_bounded_run_on_a_host_without_timeout_k_runs_under_the_python_watchdo
     assert retry.returncode == 1 and "no timeout -k" in retry.stderr
 
 
-def _preflight_passes(monkeypatch, service, module, *, preflight_s: float = 0.0, exit_status: int = 0):
+def _preflight_passes(
+    monkeypatch, service, module, *, preflight_s: float = 0.0, exit_status: int = 0, stderr: str | None = None
+):
     from types import SimpleNamespace
 
     async def arch(shell):
@@ -199,7 +201,7 @@ def _preflight_passes(monkeypatch, service, module, *, preflight_s: float = 0.0,
 
     async def ssh(shell, command):
         commands.append(command)
-        return module.SSHCapture(stdout="captured", exit_status=exit_status)
+        return module.SSHCapture(stdout="captured", stderr=stderr, exit_status=exit_status)
 
     monkeypatch.setattr(service, "_run_ssh_command", ssh)
     monkeypatch.setattr(service, "_verifyx_command", lambda *a: f"timeout -k 10 {a[5]} run &")
@@ -256,21 +258,111 @@ def test_both_remote_watchdogs_take_the_given_seconds():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bounded", [True, False])
-async def test_a_run_the_host_watchdog_stopped_is_the_deadline_never_a_crash(monkeypatch, bounded):
-    # review at e79ac9c: exit 124 of the watchdog can reach the validator just before its own timer
+@pytest.mark.parametrize(
+    "bounded,exit_status,marked,cut",
+    [
+        (True, 124, True, True),  # GNU timeout at the deadline
+        (True, 143, True, True),  # busybox timeout: the child's status after its TERM (F-29)
+        (True, 124, False, False),  # the child exited 124 itself before the deadline: judged (F-29)
+        (False, 124, True, False),  # unbounded: judged as before
+    ],
+    ids=["gnu-deadline", "busybox-deadline", "early-child-124", "unbounded"],
+)
+async def test_only_the_hosts_deadline_record_makes_a_run_the_cut(monkeypatch, bounded, exit_status, marked, cut):
     from neurons.validators.src.services import verifyx_validation_service as module
 
     service = module.VerifyXValidationService.__new__(module.VerifyXValidationService)
-    _preflight_passes(monkeypatch, service, module, exit_status=124)
+    stderr = f"Terminated\n{module.VERIFYX_DEADLINE_MARKER}\n" if marked else "boom\n"
+    _preflight_passes(monkeypatch, service, module, exit_status=exit_status, stderr=stderr)
 
     result = await service.validate_verifyx_and_process_job(
         shell=None, executor_info=None, default_extra={}, machine_spec={}, run_dir=".verifyx-t",
         deadline_monotonic=time.monotonic() + 250 if bounded else None,
     )
 
-    # bounded: the cut, reported as no task time by the caller; unbounded: judged as before
-    assert (result is None) is bounded
+    # the cut is reported as no task time by the caller; anything else is judged
+    assert (result is None) is cut
+
+
+_BUSYBOX_TIMEOUT = """#!/bin/sh
+[ "$1" = "-k" ] && shift 2
+s=$1; shift
+"$@" & p=$!
+( sleep "$s"; kill -TERM $p 2>/dev/null ) &
+wait $p
+"""
+
+
+@pytest.mark.parametrize(
+    "timeout_kind,child,marked",
+    [
+        ("busybox", "import time; time.sleep(30)", True),
+        ("gnu", "import time; time.sleep(30)", True),
+        ("gnu", "import sys; sys.exit(124)", False),
+        ("python-watchdog", "import time; time.sleep(30)", True),
+    ],
+)
+def test_the_wrapper_records_the_deadline_whatever_the_watchdog_exits(tmp_path, timeout_kind, child, marked):
+    # F-29: busybox 1.36 `timeout` takes -k and leaves the child's 143; a child may exit 124 on its own
+    import os
+    import shutil
+    import subprocess
+    import sys
+    from types import SimpleNamespace
+
+    from neurons.validators.src.services.verifyx_validation_service import (
+        VERIFYX_DEADLINE_MARKER,
+        VerifyXValidationService,
+    )
+
+    if timeout_kind == "gnu" and shutil.which("timeout") is None:
+        pytest.skip("no timeout on this host")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "verifyx_executor.py").write_text(child + "\n")
+    env = dict(os.environ)
+    if timeout_kind != "gnu":
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        # python-watchdog: a timeout without -k, so the executor's own Python watchdog runs the deadline
+        (fake_bin / "timeout").write_text(_BUSYBOX_TIMEOUT if timeout_kind == "busybox" else "#!/bin/sh\nexit 1\n")
+        (fake_bin / "timeout").chmod(0o755)
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    executor = SimpleNamespace(python_path=sys.executable, root_dir=str(tmp_path))
+    challenge = SimpleNamespace(seed=1, cipher_text="x")
+    service = VerifyXValidationService.__new__(VerifyXValidationService)
+
+    command = service._verifyx_command(executor, challenge, "lib", ".verifyx-t", True, 2)
+    done = subprocess.run(["sh", "-c", command], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30)
+
+    assert (VERIFYX_DEADLINE_MARKER in done.stderr) is marked
+    assert not (tmp_path / ".verifyx-t").exists()
+
+
+@pytest.mark.asyncio
+async def test_no_probe_lookup_when_its_answer_cannot_change_the_reserve(context_factory, monkeypatch):
+    # review at b49619d: at 305 s only the 60 s tail can apply, so a slow Redis read must not eat the sample's time
+    _left(monkeypatch, 305)
+    lookups = []
+
+    async def due(ctx):
+        lookups.append(ctx)
+        return True
+
+    monkeypatch.setattr(verifyx_check, "rental_probe_due", due)
+    timeouts = []
+    wait_for = asyncio.wait_for
+
+    async def spy(aw, timeout):
+        timeouts.append(timeout)
+        return await wait_for(aw, timeout)
+
+    monkeypatch.setattr(verifyx_check.asyncio, "wait_for", spy)
+    service = _Probe(_probe(760.0))
+
+    await VerifyXCheck().run(_ctx(context_factory, service, _known(500.0)))
+
+    assert lookups == []
+    assert timeouts == [pytest.approx(245)]
 
 
 @pytest.mark.asyncio

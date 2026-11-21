@@ -70,6 +70,10 @@ class VerifyXFailureClass(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 
+# printed to stderr by the bounded run's wrapper once its deadline has passed on the host
+VERIFYX_DEADLINE_MARKER = "lium-verifyx-deadline-reached"
+
+
 class SSHCapture(NamedTuple):
     """Result of an SSH command. `transport_error` is None on normal completion (even if exit_status != 0)."""
 
@@ -510,9 +514,13 @@ class VerifyXValidationService:
             logger.info(_m("VerifyX Python Script Command", extra=get_extra_info(challenge.log_extra)))
 
             ssh_capture = await self._run_ssh_command(shell, command)
-            if deadline_monotonic is not None and ssh_capture.transport_error is None and ssh_capture.exit_status == 124:
-                # the host's watchdog for this deadline stopped the run (`timeout` and _PYTHON_WATCHDOG exit 124):
-                # the validator's own cut, the same as the local timer's, never a crash of the executor (review)
+            if (
+                deadline_monotonic is not None
+                and ssh_capture.transport_error is None
+                and VERIFYX_DEADLINE_MARKER in (ssh_capture.stderr or "")
+            ):
+                # the host's watchdog for this deadline stopped the run: the validator's own cut, the same as the
+                # local timer's, never a crash of the executor, whatever exit code the watchdog left (review F-29)
                 return None
             return self.evaluate_verifyx_capture(challenge, ssh_capture, default_extra)
 
@@ -686,7 +694,11 @@ class VerifyXValidationService:
             )
         return (
             # a remote deadline of its own: the run cannot outlive its budget even if the kill never lands
-            f"{start}echo $! > pid; wait $!; rc=$?; "
+            f"t0=$(date +%s); {start}echo $! > pid; wait $!; rc=$?; "
+            # the host's own record that the deadline ended the run: the exit code cannot say it (GNU timeout gives
+            # 124, busybox the child's 143 after its TERM, and a child may exit 124 itself). shortcut: whole
+            # seconds, so a run ending in the last second before the deadline also counts as cut by it
+            f"[ $(($(date +%s) - t0)) -ge {int(seconds)} ] && echo {VERIFYX_DEADLINE_MARKER} >&2; "
             f"cd .. && rm -rf {d}; exit $rc"
         )
 
