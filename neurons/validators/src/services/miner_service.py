@@ -404,6 +404,12 @@ async def _remount_dropped_gocryptfs(ssh_client, payload: BackupContainerRequest
         )
 
 
+def _miner_base_url(address: str | None, port: int | str | None) -> str:
+    """http://host:port of a miner's axon, with an IPv6 address bracketed (a bare one makes an unparsable URL)."""
+    host = f"[{address.strip('[]')}]" if address and ":" in address else address
+    return f"http://{host}:{port}"
+
+
 class MinerService:
     def __init__(
         self,
@@ -2033,7 +2039,7 @@ class MinerService:
             )
             status, data = await self._make_rest_request(
                 method="POST",
-                url=f"http://{miner.axon_info.ip}:{miner.axon_info.port}/executors",
+                url=f"{_miner_base_url(miner.axon_info.ip, miner.axon_info.port)}/executors",
                 json_data=request.model_dump(),
                 headers={"Content-Type": "application/json", **self._generate_auth_headers(my_key, miner.hotkey)},
                 timeout=REST_EXECUTOR_LIST_TIMEOUT,
@@ -2299,7 +2305,7 @@ class MinerService:
             )
             
             # Make REST API call
-            base_url = f"http://{payload.miner_address}:{payload.miner_port}"
+            base_url = _miner_base_url(payload.miner_address, payload.miner_port)
             headers = self._generate_auth_headers(my_key, payload.miner_hotkey)
             headers["Content-Type"] = "application/json"
             
@@ -2554,7 +2560,7 @@ class MinerService:
         )
 
         try:
-            base_url = f"http://{payload.miner_address}:{payload.miner_port}"
+            base_url = _miner_base_url(payload.miner_address, payload.miner_port)
             # Generate SSH key and send it to miner
             private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
 
@@ -2862,7 +2868,7 @@ class MinerService:
         }
 
         try:
-            base_url = f"http://{payload.miner_address}:{payload.miner_port}"
+            base_url = _miner_base_url(payload.miner_address, payload.miner_port)
             headers = self._generate_auth_headers(my_key, payload.miner_hotkey)
             headers["Content-Type"] = "application/json"
             
@@ -2976,7 +2982,7 @@ class MinerService:
         }
 
         try:
-            base_url = f"http://{payload.miner_address}:{payload.miner_port}"
+            base_url = _miner_base_url(payload.miner_address, payload.miner_port)
             headers = self._generate_auth_headers(my_key, payload.miner_hotkey)
             headers["Content-Type"] = "application/json"
             

@@ -130,3 +130,21 @@ async def test_a_malformed_configured_origin_breaks_no_other_request(monkeypatch
         assert await _request(f"http://127.0.0.1:{port}/executors") == (200, {"ok": True})
     finally:
         await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_a_bare_ipv6_axon_reaches_the_address_check(monkeypatch):
+    """A miner reports a bare IPv6 axon address; the URL the callers build brackets it, so the request reaches the
+    public-address check (refused here: fd00::/8 is not public) instead of failing on an unparsable URL."""
+    from services.miner_service import _miner_base_url
+
+    assert _miner_base_url("2001:db8::1", 8080) == "http://[2001:db8::1]:8080"
+    assert _miner_base_url("[2001:db8::1]", "8080") == "http://[2001:db8::1]:8080"
+    assert _miner_base_url("203.0.113.7", 8080) == "http://203.0.113.7:8080"
+
+    def no_session(*args, **kwargs):
+        raise AssertionError("a session was opened")
+
+    monkeypatch.setattr(aiohttp, "ClientSession", no_session)
+    with pytest.raises(NodeHostError):
+        await _request(f"{_miner_base_url('fd00::5', 8080)}/executors")
