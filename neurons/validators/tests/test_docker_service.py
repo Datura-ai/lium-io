@@ -6581,6 +6581,58 @@ async def test_rental_create_removes_only_its_own_leftover_container_on_a_name_c
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("conflict", ["409", "retry_found_another_registrations"])
+async def test_rental_create_keeps_a_same_name_container_while_another_registrations_create_of_the_pod_runs(
+    docker_service, monkeypatch, conflict,
+):
+    # DAH-6531: two registrations share a daemon and the pod's name; the other one's container is not a leftover
+    events: list[str] = []
+    registry = docker_service_module.inflight_creates
+    registered, release = asyncio.Event(), asyncio.Event()
+
+    async def replacement_create():
+        with registry.track("test", ("miner-b", "exec-2")):
+            registered.set()
+            await release.wait()
+
+    class FakeRentalClient:
+        async def run_container(self, spec):
+            events.append("run")
+            if conflict == "409":
+                raise Exception(
+                    '409 Client Error: Conflict ("Conflict. The container name "/pod_test" '
+                    'is already in use by container "25b3b093".")'
+                )
+            raise ContainerNameTakenOnRetry("a container named pod_test already exists for another registration")
+
+        async def container_status(self, *, container_name):
+            return "created"
+
+        async def remove_container(self, *, container_name, force, remove_volumes):
+            events.append(f"rm {container_name}")
+
+    monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
+    other = asyncio.create_task(replacement_create(), context=contextvars.Context())
+    await registered.wait()
+    try:
+        with registry.track("test", ("miner-a", "exec")):
+            assert not registry.is_only_create("test")
+            with pytest.raises(Exception):
+                await docker_service._run_rental_docker_create_with_port_retry(
+                    docker_client=FakeRentalClient(),
+                    ssh_client=Mock(),
+                    run_spec=ContainerRunSpec(image="img", name="pod_test"),
+                    container_name="pod_test",
+                    default_extra={},
+                    pod_id="test",
+                )
+    finally:
+        release.set()
+        await other
+    assert events == ["run"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("race", ["other_create_registers_during_inspect", "pod_started_before_rm"])
 async def test_rental_create_keeps_a_same_name_pod_that_changed_after_its_status_read(
     docker_service, monkeypatch, race,

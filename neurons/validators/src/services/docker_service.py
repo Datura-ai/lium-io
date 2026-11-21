@@ -1877,8 +1877,11 @@ def _drop_another_registrations_volume_command(volume: str, owner: str, may_remo
     before the label) are reused as before; the node-left delete never removes them."""
     found = f'{{{{index .Labels "{LIUM_EXECUTOR_ID_LABEL}"}}}}'
     remove = f"/usr/bin/docker volume rm {volume} >/dev/null" if may_remove else "exit 1"
+    # only a volume Docker reports absent is absent: an inspect that fails otherwise could hide another
+    # registration's volume, which the create would then be handed back
     return (
-        f"owner=$(/usr/bin/docker volume inspect -f {shlex.quote(found)} {volume} 2>/dev/null) || exit 0; "
+        f"owner=$(/usr/bin/docker volume inspect -f {shlex.quote(found)} {volume} 2>&1) || "
+        'case "$owner" in *[Nn]"o such volume"*) exit 0;; *) exit 1;; esac; '
         f'[ -z "$owner" ] || [ "$owner" = {shlex.quote(owner)} ] || {remove}'
     )
 
@@ -2616,9 +2619,12 @@ class _InflightCreateRegistry:
                 return False
         return True
 
-    def is_only_create(self, pod_id: str, executor: ExecutorKey | None = None) -> bool:
-        """Exactly one create for this pod is registered (the caller's): no other attempt is live."""
-        return sum(create.running for create in self._matching(pod_id, executor)) == 1
+    def is_only_create(self, pod_id: str) -> bool:
+        """Exactly one create for this pod is running in this process (the caller's), on any registration.
+
+        Its callers remove what is named by the pod alone (the container, its volume, build artifacts), so a create
+        of the pod on another registration, which may share the daemon, keeps them from it too (DAH-6531)."""
+        return sum(create.running for (pod, _), create in self._creates.items() if pod == pod_id) == 1
 
     async def wait_until_done(self, pod_id: str, timeout: float, executor: ExecutorKey | None = None) -> bool:
         """Wait for the create(s) on this pod to leave. False when the wait ran out."""

@@ -199,6 +199,7 @@ def test_a_container_still_present_fails_before_the_volumes(tmp_path):
     ("present", "rm_fails", "may_remove", "expected_status", "removed"),
     [
         (None, False, True, 0, False),  # no volume yet: the create makes it
+        ("unreadable", False, True, 1, False),  # an inspect that fails otherwise hides nothing: the create fails
         ("", False, True, 0, False),  # made before the label: reused as before
         (LEFT_LABEL, False, False, 0, False),  # this registration's own: reused
         ("miner-b:replacement-executor", False, True, 0, True),  # another registration's, left over: removed
@@ -212,7 +213,10 @@ def test_a_create_never_reuses_another_registrations_volume(
 ):
     log = tmp_path / "calls"
     stub = tmp_path / "docker"
-    inspect = "exit 1" if present is None else f"echo {shlex.quote(present)}"
+    inspect = {
+        None: "echo 'Error response from daemon: get volume_p: no such volume' >&2; exit 1",
+        "unreadable": "echo 'Cannot connect to the Docker daemon' >&2; exit 1",
+    }.get(present, f"echo {shlex.quote(str(present))}")
     stub.write_text(
         "#!/bin/sh\n"
         f'echo "$*" >> {shlex.quote(str(log))}\n'
