@@ -474,6 +474,23 @@ def test_a_profile_with_only_the_mount_rule_is_a_fix_and_the_install_adds_the_um
     assert (local.count(APPARMOR_RULE), local.count(APPARMOR_UMOUNT_RULE)) == (1, 1)
 
 
+
+@pytest.mark.parametrize(
+    "local",
+    [APPARMOR_RULE + "\n# " + APPARMOR_UMOUNT_RULE + "\n", "# " + APPARMOR_UMOUNT_RULE + "\n"],
+    ids=["mount-and-commented-umount", "only-commented-umount"],
+)
+def test_a_commented_rule_does_not_count_and_the_install_adds_it(tmp_path, local):
+    # AppArmor ignores a commented line, so the rule it carries is still missing
+    files = {**APPARMOR_ON, "etc/apparmor.d/local/fusermount3": local}
+    rc, _, fixes = run_check(tmp_path, "check_fusermount3_apparmor", files=files)
+    assert (rc, fixes) == (1, 1)
+
+    rc, _, _ = run_check(tmp_path, "allow_sysboxfs_in_fusermount3_apparmor", files=files)
+    active = [line.strip() for line in (tmp_path / "root/etc/apparmor.d/local/fusermount3").read_text().splitlines()]
+    assert rc == 0
+    assert (active.count(APPARMOR_RULE), active.count(APPARMOR_UMOUNT_RULE)) == (1, 1)
+
 def test_install_gives_sysbox_services_time_to_start_and_a_restart(tmp_path):
     # sysbox-ce 0.7.1: 10 s (fs) / 45 s (mgr) start timeouts and no Restart=, so a slow boot left sysbox down
     rc, _, _ = run_check(tmp_path, "install_sysbox_restart_dropins")

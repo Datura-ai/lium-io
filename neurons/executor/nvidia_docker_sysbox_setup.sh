@@ -779,7 +779,8 @@ fusermount3_profile_enforced() {
 fusermount3_missing_sysboxfs_rules() {
     local rule
     for rule in "$FUSERMOUNT3_RULE" "$FUSERMOUNT3_UMOUNT_RULE"; do
-        grep -qF "$rule" "$(host_path "$FUSERMOUNT3_LOCAL")" 2>/dev/null || printf '%s\n' "$rule"
+        # only an active rule counts: AppArmor ignores everything after a '#'
+        sed 's/#.*//' "$(host_path "$FUSERMOUNT3_LOCAL")" 2>/dev/null | grep -qF "$rule" || printf '%s\n' "$rule"
     done
 }
 
