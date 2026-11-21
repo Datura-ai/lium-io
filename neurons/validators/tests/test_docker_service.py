@@ -3318,9 +3318,11 @@ async def test_a_stopped_pod_start_keeps_its_bridge_from_every_reaper_from_the_g
 
         @contextlib.asynccontextmanager
         async def session():
-            yield "guard-ssh"
+            yield Mock()
 
-        hold.release_with = session
+        # the guard passed: the hold is released on a connection of its own
+        hold.connect = session
+        hold.guarded = True
         return "guarded-id"
 
     async def start(**kwargs):
@@ -12689,6 +12691,148 @@ async def test_a_bridge_reservation_that_stalls_is_the_guards_refusal(docker_ser
     client.ensure_network.assert_not_awaited()
 
 
+class _OneSessionSSH:
+    """A connection with MaxSessions=1: a command opened while another runs on it is refused."""
+
+    def __init__(self):
+        self.busy = False
+
+    @contextlib.asynccontextmanager
+    async def session(self):
+        if self.busy:
+            raise RuntimeError("open failed: administratively prohibited")
+        self.busy = True
+        try:
+            yield
+        finally:
+            self.busy = False
+
+
+@pytest.mark.real_egress_guard
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["create", "start"])
+async def test_a_bridge_renewal_never_takes_the_session_the_guards_inventory_needs(docker_service, monkeypatch, path):
+    # gateway review at 3b3c86b on lium-io#2352: on a node with MaxSessions=1, ensure_network returns while a renewal
+    # would be in flight. Nothing is renewed before the guard passed (the reservation is 10 min, the guard at most 3),
+    # so the guard's inventory gets the session and the pod starts once
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.BRIDGE_RESERVATION_RENEW_SECONDS", 0.01)
+    borrowed = _OneSessionSSH()
+    events: list = []
+
+    async def renew(ssh, network, token):
+        async with ssh.session():
+            events.append("renew")
+            await asyncio.sleep(0.2)
+
+    async def guard(ssh, attempts=None, required_network_id=None):
+        async with ssh.session():
+            events.append("inventory")
+        return {}, None
+
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.renew_pod_bridge", renew)
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.apply_rental_egress_guard", guard)
+
+    class Client:
+        async def ensure_network(self, name):
+            await asyncio.sleep(0.05)  # several renewal periods
+            return "guarded-id"
+
+        async def run_container(self, spec):
+            events.append("start")
+            return "cid"
+
+        async def start(self, *, container_name, network=None, network_id=None):
+            events.append("start")
+
+        async def container_identity(self, *, container_name):
+            return "cid@2026-11-21T00:00:00Z"
+
+        async def inspect_container_state(self, *, container_name):
+            return SimpleNamespace(running=False, restarting=False)
+
+    docker_service._restore_mount_and_sshd_after_start = AsyncMock()
+    docker_service._pod_start_exclusion = lambda *args: contextlib.nullcontext()
+    if path == "create":
+        await docker_service._run_rental_docker_create_with_port_retry(
+            docker_client=Client(),
+            ssh_client=borrowed,
+            run_spec=ContainerRunSpec(name="pod_a", image="img", network=rental_network_for("pod_a")),
+            container_name="pod_a",
+            default_extra={},
+        )
+    else:
+        await docker_service._bring_up_existing_container(
+            executor_info=Mock(uuid="exec-1"),
+            private_key="private-key",
+            docker_client=Client(),
+            ssh_client=borrowed,
+            container_name="pod_a",
+            local_volume_path=None,
+            pod_id="p",
+            default_extra={},
+        )
+
+    assert [e for e in events if e != "renew"] == ["inventory", "start"]
+
+
+@pytest.mark.real_egress_guard
+@pytest.mark.asyncio
+async def test_a_guarded_bridge_is_renewed_and_released_on_connections_of_its_own(docker_service, monkeypatch):
+    # gateway review at 3b3c86b: once the guard passed, renewals and the release dial their own pinned connection,
+    # each bounded and aborted at its deadline, never a session of the connection the create runs on
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.BRIDGE_RESERVATION_RENEW_SECONDS", 0.01)
+    monkeypatch.setattr(docker_service_module, "BRIDGE_HOLD_COMMAND_SECONDS", 0.05)
+    borrowed, own_sessions, on = Mock(), [], []
+
+    @contextlib.asynccontextmanager
+    async def own_ssh():
+        own_sessions.append(Mock())
+        yield own_sessions[-1]
+
+    async def renew(ssh, network, token):
+        on.append(("renew", ssh))
+        await asyncio.Event().wait()  # a host that stopped answering
+
+    async def release(ssh, network, token):
+        on.append(("release", ssh))
+        await asyncio.Event().wait()
+
+    async def guard(ssh, attempts=None, required_network_id=None):
+        on.append(("inventory", ssh))
+        return {}, None
+
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.renew_pod_bridge", renew)
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.release_pod_bridge", release)
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.apply_rental_egress_guard", guard)
+
+    class Client:
+        async def ensure_network(self, name):
+            return "guarded-id"
+
+        async def run_container(self, spec):
+            await asyncio.sleep(0.1)  # a renewal stalls meanwhile
+            return "cid"
+
+    await asyncio.wait_for(
+        docker_service._run_rental_docker_create_with_port_retry(
+            docker_client=Client(),
+            ssh_client=borrowed,
+            run_spec=ContainerRunSpec(name="pod_a", image="img", network=rental_network_for("pod_a")),
+            container_name="pod_a",
+            default_extra={},
+            connect_own_ssh=own_ssh,
+        ),
+        2,
+    )
+
+    kinds = [kind for kind, _ in on]
+    assert kinds[0] == "inventory" and "renew" in kinds and kinds[-1] == "release"
+    assert all(ssh is not borrowed for _, ssh in on)
+    # the guard's connection closed normally; every stalled renewal and the release were aborted at their deadline
+    assert [ssh for _, ssh in on] == own_sessions
+    assert not own_sessions[0].abort.called and all(own.abort.called for own in own_sessions[1:])
+
+
 @pytest.mark.asyncio
 async def test_a_held_bridge_reservation_is_renewed_until_its_release(monkeypatch):
     # gateway review at 98b4318: a reservation expires unless its live holder renews it
@@ -12703,8 +12847,10 @@ async def test_a_held_bridge_reservation_is_renewed_until_its_release(monkeypatc
 
     monkeypatch.setattr("services.task.checks.rental_egress_guard.renew_pod_bridge", renew)
     monkeypatch.setattr("services.task.checks.rental_egress_guard.release_pod_bridge", release)
-    async with docker_service_module._pod_bridge_held(rental_network_for("pod_a")) as hold:
-        hold.release_with = lambda: contextlib.nullcontext("ssh")
+    async with docker_service_module._pod_bridge_held(
+        rental_network_for("pod_a"), lambda: contextlib.nullcontext(Mock())
+    ) as hold:
+        hold.guarded = True
         await asyncio.sleep(0.05)
     renewed = len(calls) - 1
     await asyncio.sleep(0.03)

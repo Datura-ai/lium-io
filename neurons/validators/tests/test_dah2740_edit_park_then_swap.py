@@ -10,6 +10,7 @@ name, and a failure renames the old one back and starts it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import shlex
 import time
 from types import SimpleNamespace
@@ -463,6 +464,74 @@ async def test_a_reboot_the_guard_refused_is_a_host_fault_only_while_no_containe
         assert held == []
     elif error in ("guard", "drop") or code == "ExecutorUnreachable":
         assert held
+
+
+@pytest.mark.real_egress_guard
+@pytest.mark.parametrize("stall", ["within_the_guard", "past_the_undos_deadline"])
+@pytest.mark.parametrize(("after_undo", "code"), [("down", "PodDownNotHostFault"), ("running", "UnknownError")])
+@pytest.mark.asyncio
+async def test_an_undo_whose_bridge_reservation_and_release_stall_is_its_guards_refusal(
+    svc, monkeypatch, stall, after_undo, code
+):
+    # gateway review at 3b3c86b on lium-io#2352 (F-80 and the stalled-reservation billing rows): the replacement fails
+    # on an ordinary error; the undo's bridge reservation stalls, and so would its release. The refusal is the undo
+    # guard's, never the undo's own timeout: a pod left down is not billed, one still running is. The guard runs on a
+    # connection of its own, aborted at its deadline, so the stalled command never keeps the session the read of
+    # Docker's state needs, and a refused guard's reservation is left to expire, never released over the stall
+    from payload_models.payloads import FailedContainerErrorCodes
+    from services.rental_docker_sdk import ContainerStateSnapshot
+
+    payload = _edit_payload()
+    ssh = _ssh_recording(after_undo=after_undo)
+    _patch_happy(svc, monkeypatch, ssh)
+    monkeypatch.setattr(
+        svc, "_run_rental_docker_create_with_port_retry", AsyncMock(side_effect=RuntimeError("gocryptfs: EPERM"))
+    )
+    own_sessions: list = []
+
+    @contextlib.asynccontextmanager
+    async def own_ssh(*args):
+        own_sessions.append(Mock())
+        yield own_sessions[-1]
+
+    monkeypatch.setattr(docker_service, "_connect_own_ssh", own_ssh)
+    stalled_on: list = []
+
+    async def stalls(on_ssh, network, token):
+        stalled_on.append(on_ssh)
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.reserve_pod_bridge", stalls)
+    monkeypatch.setattr("services.task.checks.rental_egress_guard.release_pod_bridge", stalls)
+    client = svc.rental_docker_client_factory.client
+    client.ensure_network = AsyncMock(return_value="guarded-id")
+    client.start = AsyncMock()
+    stopped = ContainerStateSnapshot(
+        status="exited", running=False, restarting=False, exit_code=0, restart_count=0, error=None, oom_killed=False
+    )
+    monkeypatch.setattr(docker_service, "_PRE_START_GUARD_DEADLINE_MARGIN_SECONDS", 0.05, raising=False)
+    if stall == "within_the_guard":
+        monkeypatch.setattr(docker_service, "PRE_START_GUARD_SECONDS", 0.05)
+        monkeypatch.setattr(docker_service, "_RESTORE_BRING_UP_TIMEOUT_SECONDS", 2)
+        client.inspect_container_state = AsyncMock(return_value=stopped)
+    else:
+        # the undo's steps before the guard use up most of its deadline; the guard's own 180 s lies far past it
+        monkeypatch.setattr(docker_service, "_RESTORE_BRING_UP_TIMEOUT_SECONDS", 0.5)
+
+        async def slow_inspect(**kwargs):
+            await asyncio.sleep(0.35)
+            return stopped
+
+        client.inspect_container_state = slow_inspect
+
+    result = await asyncio.wait_for(_run(svc, payload), 10)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert result.error_code == getattr(FailedContainerErrorCodes, code)
+    client.start.assert_not_awaited()
+    # the reservation only, on the guard's own connection, aborted when the guard gave up: never released
+    assert stalled_on == own_sessions[:1]
+    own_sessions[0].abort.assert_called_once()
 
 
 @pytest.mark.parametrize(("undo", "after_undo", "code"), [
