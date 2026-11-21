@@ -789,7 +789,8 @@ async def carry_renter_gpu_reset_results(
     pay flags and a fresh ban lookup. A node the backend no longer lists as rented (`rented_executor_ids`,
     lower-case), or without a readable last result, keeps the held one, and `withhold_renter_gpu_reset_verdicts`
     takes it out. A run stopped for a renter's create (`RENTED_SINCE_CYCLE_START`) carries without the rented list:
-    the provider did not end it, so a create that then fails takes nothing from the cycle.
+    the provider did not end it, so a create that then fails takes nothing from the cycle. That carry spends the
+    kept result, so it stands in for one stopped run only.
     """
     for miner_hotkey, results in job_results.items():
         for index, held in enumerate(results):
@@ -804,6 +805,10 @@ async def carry_renter_gpu_reset_results(
                 continue
             # an idle score stands only for a node rented mid-cycle; the other holds keep carrying rented scores only
             if not previous.is_rented and not rented_mid_cycle:
+                continue
+            # a run stopped for a create spends the kept result: a later stopped run (the create failed or the pod
+            # was deleted) is withheld instead of re-carrying the same score until the key expires
+            if rented_mid_cycle and not await _spend_last_scored_result(redis_service, miner_hotkey, held):
                 continue
             results[index] = previous.model_copy(
                 update={
@@ -888,6 +893,21 @@ async def _last_scored_result(
             )
         )
         return None
+
+
+async def _spend_last_scored_result(redis_service: RedisService, miner_hotkey: str, held: JobResult) -> bool:
+    """False when the kept result could not be deleted: it is then not carried, so it can never stand twice."""
+    try:
+        await redis_service.delete(last_scored_result_key(miner_hotkey, held.executor_info.uuid))
+        return True
+    except Exception as exc:
+        logger.warning(
+            _m(
+                "Last scored result could not be spent; the held verdict is withheld",
+                extra={"miner_hotkey": miner_hotkey, "executor_uuid": held.executor_info.uuid, "error": str(exc)},
+            )
+        )
+        return False
 
 
 async def remember_scored_results(
