@@ -24,6 +24,7 @@ from payload_models.payloads import (
     BaseServerRequest,
     BaseValidatorResponse,
     ContainerCreateRequest,
+    ContainerDeleteOnNodeLeftRequest,
     ContainerDeleteRequest,
     ContainerStartRequest,
     ContainerStopRequest,
@@ -1173,7 +1174,11 @@ class ComputeClient:
         # DAH-2728: track the create from the moment this task picks it up. The axon lookup below
         # fetches the whole miner set on a cold cache, so a delete arriving seconds later can sail
         # past it and find nothing to cancel — and the create it raced then orphans its container.
-        if isinstance(job_request, ContainerDeleteRequest):
+        # DAH-6531: a node-left delete may be refused as another host, so it leaves the source create's records alone;
+        # it waits for that create, which retires its own record on exit
+        if isinstance(job_request, ContainerDeleteRequest) and not isinstance(
+            job_request, ContainerDeleteOnNodeLeftRequest
+        ):
             # DAH-5437: the renter deleted this pod; a connector restart must not resume its in-flight create
             executor = executor_key(job_request)
             if inflight_creates.is_running(job_request.pod_id, executor):
@@ -1611,6 +1616,9 @@ class ComputeClient:
             response: (
                 ContainerDeleted | FailedContainerRequest
             ) = await self.miner_service.handle_container(job_request)
+            if isinstance(job_request, ContainerDeleteOnNodeLeftRequest):
+                # the backend matches this answer to the one delete it waits on, not to any reply for the pod
+                response.command_id = job_request.command_id
 
             logger.info(
                 _m(

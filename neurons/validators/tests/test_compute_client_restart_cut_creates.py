@@ -16,7 +16,9 @@ from clients.compute_client import (
 )
 from payload_models.payloads import (
     ContainerCreated,
+    ContainerDeleted,
     ContainerCreateRequest,
+    ContainerDeleteOnNodeLeftRequest,
     ContainerDeleteRequest,
     ExecutorRentFinishedRequest,
     FailedContainerRequest,
@@ -653,6 +655,71 @@ async def test_a_delete_on_the_node_a_moved_pod_left_keeps_its_create_on_the_new
         await client._run_miner_job(_create_request())  # the move's create, on exec-1
 
     assert [create.executor_id for create in seen[0]["pod-1"]] == ["exec-1"]
+
+
+@pytest.mark.asyncio
+async def test_a_node_left_delete_keeps_the_source_creates_record_for_a_restart() -> None:
+    """DAH-6531: the node-left delete may be refused as another host; it waits for the create instead of retiring it."""
+    from services.docker_service import inflight_creates
+
+    redis_service = _redis_service()
+    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER, "c-1")
+    client = _client(redis_service)
+    client._drive_miner_job = AsyncMock()
+
+    with inflight_creates.track("pod-1", ("miner-hk", "exec-1")):
+        await client._run_miner_job(
+            ContainerDeleteOnNodeLeftRequest.model_construct(
+                pod_id="pod-1", miner_hotkey="miner-hk", executor_id="exec-1", expected_boot_id="b"
+            )
+        )
+
+    assert client.deleted_pod_ids == set()
+    assert list(await redis_service.inflight_backend_creates()) == ["pod-1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deleted", [True, False])
+@pytest.mark.parametrize("node_left", [True, False])
+async def test_only_a_node_left_deletes_answer_echoes_its_command_id(deleted: bool, node_left: bool) -> None:
+    """DAH-6531: the backend waits on one node-left delete; an answer to any other delete for the pod must not match."""
+    client = _client(_redis_service())
+    client.lock = asyncio.Lock()
+    client.get_miner_axon_info = AsyncMock(return_value=MagicMock(ip="1.2.3.4", port=8000))
+    ids = {"pod_id": "pod-1", "miner_hotkey": "miner-hk", "executor_id": "exec-1"}
+    client.miner_service.handle_container = AsyncMock(
+        return_value=ContainerDeleted(**ids) if deleted else FailedContainerRequest(**ids, msg="not the node left")
+    )
+    fields = {**ids, "container_name": "", "command_id": "cmd-1"}
+    request = (
+        ContainerDeleteOnNodeLeftRequest(**fields, expected_boot_id="b")
+        if node_left
+        else ContainerDeleteRequest(**fields)
+    )
+
+    await client._drive_miner_job(request)
+
+    assert [m.command_id for m in client.message_queue] == ["cmd-1" if node_left else ""]
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_creates_marker_is_cleared_when_it_ends_while_another_registrations_create_runs() -> None:
+    from services.docker_service import inflight_creates
+
+    client = _client(_redis_service())
+
+    async def fake_drive_miner_job(job_request) -> None:
+        if isinstance(job_request, ContainerCreateRequest):
+            await client._run_miner_job(
+                ContainerDeleteRequest.model_construct(pod_id="pod-1", miner_hotkey="miner-hk", executor_id="exec-1")
+            )
+            assert ("pod-1", ("miner-hk", "exec-1")) in client.deleted_pod_ids
+
+    client._drive_miner_job = fake_drive_miner_job
+    with inflight_creates.track("pod-1", ("miner-b", "exec-2")):  # another registration's create of the pod
+        await client._run_miner_job(_create_request())
+
+    assert client.deleted_pod_ids == set()
 
 
 @pytest.mark.asyncio

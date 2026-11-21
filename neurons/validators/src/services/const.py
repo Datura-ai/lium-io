@@ -415,6 +415,9 @@ RENTAL_CONTAINER_PREFIXES = ("pod_", "filler_", "container_", "health_check_")
 # the value is the pod id (a filler's run id, a probe's own name). The stale cleanup reaps only a
 # labelled container whose pod is no longer live, so a provider's container is never touched.
 LIUM_POD_ID_LABEL = "io.lium.pod_id"
+# DAH-6531: the executor (registration) a pod container or volume was created for; the delete for the node a
+# moved pod left removes only what carries the left executor's id, never a replacement made on the same host.
+LIUM_EXECUTOR_ID_LABEL = "io.lium.executor_id"
 # Backend ownership lookups (one sequential request each) the stale cleanup makes per node per cycle;
 # the rest of a host's pod_/filler_ candidates wait for a later cycle, so a host cannot flood the backend.
 LIUM_WORKLOAD_LOOKUPS_PER_CYCLE = 10

@@ -20,7 +20,7 @@ import urllib3
 
 from core.utils import _m, get_extra_info
 from datura.requests.miner_requests import ExecutorSSHInfo
-from services.const import RENTAL_CPU_COUNT_LABEL
+from services.const import LIUM_EXECUTOR_ID_LABEL, RENTAL_CPU_COUNT_LABEL
 from services.node_host import NodeHostError, dial_validated, reports_registered_host_key, resolve_node_host
 
 
@@ -112,6 +112,10 @@ class ContainerCreateRefused(Exception):
 
 class RentalDockerOperationError(RuntimeError):
     """Raised when Docker SDK reports a rental Docker operation failure."""
+
+
+class ContainerOfAnotherRegistration(RentalDockerOperationError):
+    """A same-name container on the daemon carries another registration's label: it is never adopted or removed."""
 
 
 class ContainerNameTakenOnRetry(RentalDockerOperationError):
@@ -814,6 +818,21 @@ class RentalDockerSdkClient:
             ) from exc
         return str(info.get("Image") or "")
 
+    async def container_owner_state(self, *, container_name: str) -> tuple[str, str, str] | None:
+        """One inspect: the container's ID, ``State.Status`` and registration label (`io.lium.executor_id`, empty
+        when unlabelled), or None when dockerd no longer knows the name (404)."""
+        try:
+            info = await _in_docker_thread(self._api_client.inspect_container, container_name)
+        except Exception as exc:
+            if _is_docker_not_found_error(exc):
+                return None
+            raise RentalDockerOperationError(_wrap_error_message("Docker SDK inspect container failed", exc)) from exc
+        info = info if isinstance(info, dict) else {}
+        state = info.get("State") if isinstance(info.get("State"), dict) else {}
+        config = info.get("Config") if isinstance(info.get("Config"), dict) else {}
+        labels = config.get("Labels") or {}
+        return str(info.get("Id") or ""), str(state.get("Status") or "").lower(), str(labels.get(LIUM_EXECUTOR_ID_LABEL) or "")
+
     async def container_status(self, *, container_name: str) -> str | None:
         """Return the container's ``State.Status`` (``running``, ``exited``, ``removing``, …), or
         None when dockerd no longer knows the name (404)."""
@@ -1221,6 +1240,16 @@ class RentalDockerSdkClient:
             raise
         config = info.get("Config") if isinstance(info, dict) else None
         existing_image = config.get("Image") if isinstance(config, dict) else None
+        # DAH-6531: one pod keeps its container name on every registration; on a daemon two registrations share, a
+        # same-name container made for another registration is not this create's to adopt
+        wanted_owner = spec.labels.get(LIUM_EXECUTOR_ID_LABEL)
+        existing_labels = (config.get("Labels") if isinstance(config, dict) else None) or {}
+        existing_owner = existing_labels.get(LIUM_EXECUTOR_ID_LABEL)
+        if wanted_owner is not None and existing_owner is not None and existing_owner != wanted_owner:
+            raise ContainerOfAnotherRegistration(
+                "Docker SDK run container refused after a transport retry: a container named "
+                f"{spec.name} already exists for another registration"
+            )
         if existing_image == spec.image:
             existing_id = info.get("Id")
             return existing_id if isinstance(existing_id, str) else ""

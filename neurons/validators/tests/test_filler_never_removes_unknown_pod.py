@@ -157,15 +157,21 @@ async def test_filler_create_without_an_unlisted_pod_starts_its_own_container_by
     ids=["filler", "customer"],
 )
 @pytest.mark.asyncio
-async def test_only_a_filler_volume_is_labelled_and_a_filler_create_sweeps_only_labelled_volumes(
+async def test_a_filler_volume_is_labelled_filler_and_a_filler_create_sweeps_only_labelled_volumes(
     svc, monkeypatch, workload_kind: WorkloadKind, labels: dict[str, str] | None, swept_volumes: list[str]
 ) -> None:
     # a customer create made its encrypted volume and has not run its pod yet (its create lock lapsed or
     # another connector runs it): no `pod_*` exists, so only the volume sweep could touch it
     ssh_client, _ = _create_over_a_host(svc, monkeypatch, [], [_CUSTOMER_VOLUME], ["volume_ended-filler-run"])
 
-    result = await _run(svc, _payload(workload_kind))
+    payload = _payload(workload_kind)
+    result = await _run(svc, payload)
 
     assert type(result).__name__ == "ContainerCreated"
-    assert svc.create_local_volume.await_args.kwargs["labels"] == labels
+    # a customer volume carries the registration it was made for (DAH-6531), never the filler label
+    assert svc.create_local_volume.await_args.kwargs["labels"] == (
+        labels
+        if labels is not None
+        else {"io.lium.pod_id": payload.pod_id, "io.lium.executor_id": f"{payload.miner_hotkey}:{payload.executor_id}"}
+    )
     assert _removed_names(ssh_client) == swept_volumes
