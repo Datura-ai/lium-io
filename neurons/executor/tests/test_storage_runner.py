@@ -2613,3 +2613,19 @@ def test_load_operation_leaves_only_the_reporter_in_the_spec_file(tmp_path: Path
     assert payload["repository"] == {"password": "p"}
     assert json.loads(spec.read_text()) == {"reporter": reporter}
     assert spec.stat().st_mode & 0o777 == 0o600
+
+
+def test_a_runner_started_after_its_cancel_does_no_restore_work(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    spec = tmp_path / "op.json"
+    spec.write_text(json.dumps(_operation_payload(action="restore")))
+    spec.chmod(0o600)
+    cancel = tmp_path / "op.cancel"
+    cancel.touch()
+    monkeypatch.setattr(sys, "argv", ["storage_runner.py", "--spec", str(spec), "--cancel-file", str(cancel)])
+    resolve = MagicMock(side_effect=AssertionError("resolved the workspace after a cancel"))
+    monkeypatch.setattr(storage_runner.WorkspaceResolver, "resolve", resolve)
+
+    assert storage_runner.main() == 130
+    resolve.assert_not_called()
