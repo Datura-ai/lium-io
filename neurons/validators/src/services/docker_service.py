@@ -360,11 +360,12 @@ FILLER_STILL_RUNNING_EVENT = "FILLER_STILL_RUNNING"
 # image-managed Jupyter path is only safe while the mapped docker port is this one.
 IMAGE_JUPYTER_DOCKER_PORT = 8888
 
-DOCKER_VOLUME_PLUGINS = {
-    "s3fs": "mochoa/s3fs-volume-plugin"
-}
-
-S3FS_PLUGIN_IMAGE = "mochoa/s3fs-volume-plugin"
+# our build of the s3fs volume plugin (s3fs_volume_plugin/, .github/workflows/s3fs_volume_plugin.yml): the published
+# mochoa/s3fs-volume-plugin carries s3fs 1.86, whose retried requests go out unsigned, so S3 refuses a renter's read
+# after a network blip and it fails with an I/O error
+S3FS_PLUGIN_IMAGE = "daturaai/compute-subnet-validator:s3fs-volume-plugin"
+# made in the plugin image (s3fs_volume_plugin/Dockerfile): the read-through cache of each instance
+S3FS_PLUGIN_CACHE_DIR = "/var/cache/s3fs"
 S3FS_PLUGIN_INSTALL_RETRIES = 2
 S3FS_PLUGIN_INSTALL_RETRY_WAIT_SECONDS = 5
 
@@ -8159,6 +8160,7 @@ class DockerService:
         mount_options: str = "allow_other,umask=0000"
         if sysbox_subuid_base is not None:
             mount_options = f"allow_other,umask=0000,uid={sysbox_subuid_base},gid={sysbox_subuid_base}"
+        mount_options += await self._s3fs_cache_options(ssh_client)
 
         setup_results: list[asyncssh.SSHCompletedProcess] = (
             await self._install_s3fs_plugin_instance(
@@ -8204,6 +8206,22 @@ class DockerService:
 
         return result
 
+    async def _s3fs_cache_options(self, ssh_client: asyncssh.SSHClientConnection) -> str:
+        """s3fs options for a read-through cache on the node's disk, so a file read twice is fetched from S3 once.
+
+        The cache lives in the instance's plugin rootfs (gone with the instance; del_cache also empties it at
+        each mount) and may fill at most half the disk space free now: s3fs keeps ensure_diskfree MB free,
+        dropping cached files that are not open, and reading uncached, when the pod's own writes need the room.
+        """
+        free = await ssh_client.run(
+            "df -Pm \"$(/usr/bin/docker info -f '{{.DockerRootDir}}')/plugins\" | awk 'NR==2 {print $4}'"
+        )
+        free_mb = (free.stdout or "").strip() if free.exit_status == 0 else ""
+        if not free_mb.isdigit():
+            # without a free-space reading there is no safe limit: mount uncached, as before
+            return ""
+        return f",use_cache={S3FS_PLUGIN_CACHE_DIR},del_cache,ensure_diskfree={int(free_mb) - int(free_mb) // 2}"
+
     async def _install_s3fs_plugin_instance(
         self,
         ssh_client: asyncssh.SSHClientConnection,
@@ -8212,6 +8230,13 @@ class DockerService:
         mount_options: str,
     ) -> list[asyncssh.SSHCompletedProcess]:
         """Install and configure the plugin instance that serves this one volume."""
+        installed = await ssh_client.run(
+            f"/usr/bin/docker plugin inspect --format '{{{{.PluginReference}}}}' {plugin_alias}"
+        )
+        reference = (installed.stdout or "").strip() if installed.exit_status == 0 else ""
+        if reference and reference.removeprefix("docker.io/") != S3FS_PLUGIN_IMAGE:
+            # an instance left from another build (the old s3fs 1.86 one) would only be reconfigured: replace it
+            await self.remove_s3fs_volume_plugin(ssh_client, volume_info.name)
         install_command: str = (
             f"/usr/bin/docker plugin install {S3FS_PLUGIN_IMAGE} "
             f"--alias {plugin_alias} --grant-all-permissions --disable"
