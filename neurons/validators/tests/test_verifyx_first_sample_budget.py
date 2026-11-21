@@ -408,3 +408,32 @@ def test_the_watchdog_stops_the_run_with_both_ssh_readers_gone(tmp_path):
     time.sleep(3)
 
     assert not done.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "left,run_s",
+    [(250, 10), (VERIFYX_COMMAND_TIMEOUT_SECONDS + 100, VERIFYX_COMMAND_TIMEOUT_SECONDS)],
+    ids=["marker-before-the-deadline", "marker-at-the-cap"],
+)
+async def test_a_node_written_deadline_marker_never_turns_a_failing_check_into_a_carried_pass(
+    context_factory, monkeypatch, left, run_s
+):
+    # the run's output is the node's: only the validator's own clock and budget may make a failing run a cut, which
+    # the rollout would carry (NO_TASK_TIME_REASONS); a marker the validator's deadline did not cause is judged
+    from neurons.validators.src.services import verifyx_validation_service as module
+    from neurons.validators.src.services.task.messages import NO_TASK_TIME_REASONS
+
+    service = module.VerifyXValidationService.__new__(module.VerifyXValidationService)
+    _preflight_passes(
+        monkeypatch, service, module, exit_status=1, stderr=f"{module.VERIFYX_DEADLINE_MARKER}\n", run_s=run_s
+    )
+    monkeypatch.setattr(
+        service, "evaluate_verifyx_capture", lambda challenge, capture, extra: module.VerifyXResponse(error="rejected")
+    )
+    _left(monkeypatch, COLD_RETRY_MARGIN_SECONDS + left)
+
+    result = await VerifyXCheck().run(_ctx(context_factory, service, _known(500.0)))
+
+    assert result.passed is False
+    assert result.event.reason_code not in NO_TASK_TIME_REASONS
