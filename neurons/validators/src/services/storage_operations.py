@@ -515,6 +515,8 @@ async def cancel_storage_operation(
     # under the launch lock, so a launch either sees this marker or has recorded its process group
     # first; the PID is that group's leader, so every check and signal below covers the whole group
     lock_path = shlex.quote(str(files.lock))
+    spec_path = shlex.quote(str(files.spec))
+    start_path = shlex.quote(str(files.start))
     command = (
         _owned_shell_function(files)
         + "marked=0; "
@@ -524,8 +526,14 @@ async def cancel_storage_operation(
         # read under the lock: a launch that took it first has written its PID by now; release it before
         # the bounded wait so other operations' launches never queue behind this one
         f"pid=$(cat {pid_path} 2>/dev/null); exec 9>&-; "
+        # a spec with no PID after the lock is an earlier release's launch (this release writes both under the
+        # lock): its wrapper removes the old marker before it starts the runner and records the PID, so the
+        # marker is written only once the PID is there, within the same bounded wait
+        f'if test -z "$pid" && test -e {spec_path} && ! test -s {start_path}; then attempt=0; '
+        f'while test -z "$pid" && test -e {spec_path} && test "$attempt" -lt 100; do '
+        f"sleep 0.25; attempt=$((attempt + 1)); pid=$(cat {pid_path} 2>/dev/null); done; fi; "
         # a PID recorded without a start time comes from an earlier release, whose runner watches the old marker
-        f'if test -n "$pid" && ! test -s {shlex.quote(str(files.start))}; then '
+        f'if test -n "$pid" && ! test -s {start_path}; then '
         f"touch {shlex.quote(str(files.legacy_cancel))} || marked=4; fi; "
         "case \"$pid\" in (*[!0-9]*) exit 2;; esac; "
         # a recorded PID the host has since given to another process is not signalled; only the helper is removed.

@@ -840,3 +840,34 @@ async def test_a_cancel_stops_a_runner_of_the_earlier_release_through_its_own_ma
         assert subprocess.run(["kill", "-0", str(runner_pid)], capture_output=True).returncode != 0
     finally:
         subprocess.run(["kill", "-KILL", str(runner_pid)], capture_output=True)
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_before_an_earlier_release_wrapper_records_its_pid_still_stops_its_runner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # review at ecaaa94: that wrapper writes the spec, removes any old marker, starts the runner and only then
+    # writes its PID; a cancel in between must still leave the old marker for that runner
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    monkeypatch.setattr(storage_operations, "_report_cancelled", AsyncMock(return_value=True))
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    legacy = tmp_path / f"{OPERATION_ID}.cancel"
+    seen = tmp_path / "runner.pid"
+    Path(str(files.spec)).write_text('{"engine":"restic"}')
+    wrapper = subprocess.Popen(
+        ["sh", "-c", f"sleep 0.5; rm -f {legacy}; "
+         f"sh -c 'while ! test -e {legacy}; do sleep 0.05; done; : --spec {files.spec}' >/dev/null 2>&1 & "
+         f"echo $! > {seen}; echo $! > {files.pid}"],
+    )
+    try:
+        await storage_operations.cancel_storage_operation(_local_ssh(), OPERATION_ID)
+        wrapper.wait(timeout=10)
+        runner_pid = int(seen.read_text())
+        for _ in range(40):
+            if subprocess.run(["kill", "-0", str(runner_pid)], capture_output=True).returncode != 0:
+                break
+            await asyncio.sleep(0.05)
+        assert subprocess.run(["kill", "-0", str(runner_pid)], capture_output=True).returncode != 0
+    finally:
+        if seen.exists():
+            subprocess.run(["kill", "-KILL", seen.read_text().strip()], capture_output=True)
