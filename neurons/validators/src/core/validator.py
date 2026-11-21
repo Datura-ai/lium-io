@@ -1592,14 +1592,15 @@ class Validator:
         miner_coldkeys: dict[str, str | None],
         rented_now: RentedExecutorsResponse | None,
     ) -> None:
-        """DAH-4658: only a node the backend still lists as rented carries its score: at the cycle end (`rented_now`),
-        or in this cycle's snapshot when the backend did not answer."""
+        """DAH-4658: only a node the backend still lists as rented carries its score over a GPU reset: at the cycle end
+        (`rented_now`), or in this cycle's snapshot when the backend did not answer. DAH-5933: a no-task-time hold carries
+        an idle node's too, and only on the cycle-end read itself."""
         if not has_renter_gpu_reset_holds(all_job_results):
             return
         rented = rented_now or rented_executors
         rented_executor_ids = {str(executor_id).lower() for executor_id in rented.executors} if rented else set()
         await carry_renter_gpu_reset_results(
-            all_job_results, self.redis_service, rented_executor_ids, rented_executors, miner_coldkeys
+            all_job_results, self.redis_service, rented_executor_ids, rented_executors, miner_coldkeys, rented_now
         )
 
     async def rented_at_cycle_end(

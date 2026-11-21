@@ -587,6 +587,12 @@ async def _skip_reason(ctx: Context, standing: _Failure | None = None) -> tuple[
     return None, {}
 
 
+async def rental_probe_due(ctx: Context) -> bool:
+    """DAH-5933: whether this cycle's RentalProbeCheck would still start its container, as its own skip reasons read now."""
+    skip_reason, _ = await _skip_reason(ctx, await _standing_failure(ctx))
+    return skip_reason is None
+
+
 def _read_failed(ctx: Context, what: str) -> None:
     # every unreadable input ends as a skip or no verdict (never a penalty); the log line says which read
     logger.warning(

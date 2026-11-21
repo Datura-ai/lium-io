@@ -53,6 +53,7 @@ from services.task.messages import (
     SCRAPE_UNDETERMINED_FAILURE_REASONS,
     TenantEnforcementMessages,
     UploadFilesMessages,
+    VerifyXMessages,
 )
 from services.task.models import VALIDATOR_REDIS_UNAVAILABLE, JobResult
 from services.task.result_handler import pods_rented_gpu_count
@@ -539,6 +540,7 @@ def withhold_renter_gpu_reset_verdicts(
 ) -> tuple[dict[str, list[JobResult]], list[WithheldVerdict]]:
     """DAH-4658: a scrape held for the renter's own GPU reset gets no verdict, as a rollout failure gets none.
     DAH-5805: neither does a run the validator's own Redis ended; the node is not scored 0 for it.
+    DAH-5933: nor a rental probe the task had no time left for, when no last scored result was carried.
     DAH-5851: neither does an idle node's port check deferred for disk pressure; it is never carried, so no
     idle pay comes from the republished ports."""
     standing_by_miner: dict[str, list[JobResult]] = {}
@@ -551,14 +553,21 @@ def withhold_renter_gpu_reset_verdicts(
             if not (redis_fault or port_check_deferred or _held_for_renter_gpu_reset(result)):
                 standing_by_miner[miner_hotkey].append(result)
                 continue
-            withheld.append(WithheldVerdict(miner_hotkey=miner_hotkey, result=result))
+            withheld.append(
+                WithheldVerdict(
+                    miner_hotkey=miner_hotkey,
+                    result=result,
+                    # the node's own checks can spend the task's time: that keeps no miner active (review)
+                    keeps_miner_active=result.failure_reason_code not in NO_TASK_TIME_REASONS,
+                )
+            )
             logger.info(
                 _m(
                     "Verdict withheld: the validator's Redis was unavailable"
                     if redis_fault
                     else "Verdict withheld: the port check was deferred for disk pressure"
                     if port_check_deferred
-                    else "Verdict withheld: the renter is resetting the node's GPUs, or its power tier is unknown",
+                    else "Verdict withheld: the renter is resetting the node's GPUs, its power tier is unknown, or the task had no time left for a check",
                     extra={
                         "miner_hotkey": miner_hotkey,
                         "executor_uuid": result.executor_info.uuid,
@@ -748,9 +757,16 @@ def has_renter_gpu_reset_holds(job_results: dict[str, list[JobResult]]) -> bool:
     return any(_held_for_renter_gpu_reset(result) for results in job_results.values() for result in results)
 
 
-# a cycle that cannot tell the node's state gives no verdict: the renter's GPU reset (DAH-4658), or a power tier
-# reading whose clear was not confirmed (F-43)
-_HELD_REASONS = (MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason, GpuPowerLimitMessages.TIER_STATE_UNKNOWN.reason)
+# DAH-5933: the run left the backend's rental probe, or VerifyX, too little time; the validator's budget, not the
+# node, decides that, so it is no failed check: an idle node carries its last scored result too
+NO_TASK_TIME_REASONS = (RentalVerificationMessages.NO_TASK_TIME.reason, VerifyXMessages.NO_TASK_TIME.reason)
+# a cycle that cannot tell the node's state gives no verdict: the renter's GPU reset (DAH-4658), a power tier
+# reading whose clear was not confirmed (F-43), or a check the task had no time left for (DAH-5933)
+_HELD_REASONS = (
+    MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason,
+    GpuPowerLimitMessages.TIER_STATE_UNKNOWN.reason,
+    *NO_TASK_TIME_REASONS,
+)
 
 
 def _held_for_renter_gpu_reset(result: JobResult) -> bool:
@@ -775,22 +791,45 @@ async def carry_renter_gpu_reset_results(
     rented_executor_ids: set[str],
     rented_data: RentedExecutorsResponse | None,
     miner_coldkeys: dict[str, str | None],
+    rented_at_end: RentedExecutorsResponse | None = None,
 ) -> None:
     """DAH-4658: a scrape held for the renter's own GPU reset takes the node's last scored result, in place.
 
     The provider loses nothing: the carried result is scored as in the cycle it came from, with this cycle's
     pay flags and a fresh ban lookup. A node the backend no longer lists as rented (`rented_executor_ids`,
     lower-case), or without a readable last result, keeps the held one, and `withhold_renter_gpu_reset_verdicts`
-    takes it out.
+    takes it out. DAH-5933: a no-task-time hold carries only on the cycle-end read `rented_at_end` (None: the
+    backend gave none), which classes the node and counts its rented GPUs; it carries only the same allocation.
+    The cycle-start snapshot can list a rental this run saw close, so it never stands in for that read.
     """
+    rented_at_end_ids = {str(uuid).lower() for uuid in rented_at_end.executors} if rented_at_end else set()
     for miner_hotkey, results in job_results.items():
         for index, held in enumerate(results):
             if not _held_for_renter_gpu_reset(held):
                 continue
-            if str(held.executor_info.uuid).lower() not in rented_executor_ids:
+            no_task_time = held.failure_reason_code in NO_TASK_TIME_REASONS
+            if no_task_time and rented_at_end is None:
+                continue
+            ids = rented_at_end_ids if no_task_time else rented_executor_ids
+            rented_now = str(held.executor_info.uuid).lower() in ids
+            if not no_task_time and not rented_now:
                 continue
             previous = await _last_scored_result(redis_service, miner_hotkey, held)
-            if previous is None:
+            # is_rented picks the pool the result is paid from: a result kept while the node was idle never stands
+            # in for a rented cycle, nor a rented one for an idle cycle (review)
+            if previous is None or previous.is_rented != rented_now:
+                continue
+            # the hold ends the run before the rented check, so the held result counts no rented GPU
+            rented_gpu_count = pods_rented_gpu_count(rented_data, str(held.executor_info.uuid))
+            if no_task_time:
+                # the stored split pays rented and idle GPUs apart: it stands only for the same rented GPUs, read from
+                # the cycle-end read that classed the node (review)
+                rented_gpu_count = (
+                    pods_rented_gpu_count(rented_at_end, str(held.executor_info.uuid)) if rented_now else 0
+                )
+                if rented_now and (rented_gpu_count is None or rented_gpu_count != previous.rented_gpu_count):
+                    continue
+            if no_task_time and not await _spend_kept_result(redis_service, miner_hotkey, held):
                 continue
             results[index] = previous.model_copy(
                 update={
@@ -809,14 +848,14 @@ async def carry_renter_gpu_reset_results(
                         if rented_data
                         else previous.filler_revenue_usd_per_hour
                     ),
-                    # the hold ends the run before the rented check, so the held result counts no rented GPU
-                    "rented_gpu_count": pods_rented_gpu_count(rented_data, str(held.executor_info.uuid))
-                    or previous.rented_gpu_count,
+                    "rented_gpu_count": rented_gpu_count or previous.rented_gpu_count,
                 }
             )
             logger.info(
                 _m(
-                    "Score carried: the renter is resetting the node's GPUs, the last scored result stands",
+                    "Score carried: the task had no time left for a check, the last scored result stands"
+                    if no_task_time
+                    else "Score carried: the renter is resetting the node's GPUs, the last scored result stands",
                     extra={
                         "miner_hotkey": miner_hotkey,
                         "executor_uuid": held.executor_info.uuid,
@@ -860,6 +899,23 @@ def _filler_revenue_now(rented_data: RentedExecutorsResponse | None, previous: J
     )
 
 
+async def _spend_kept_result(redis_service: RedisService, miner_hotkey: str, held: JobResult) -> bool:
+    """A cycle the task had no time for carries the last pass once: the next such cycle, with no pass between,
+    is withheld. The node's own checks spend the task's time, so a node that keeps running out of it never keeps
+    its score (review). False when the kept result could not be dropped: the held result is withheld then."""
+    try:
+        await redis_service.delete(last_scored_result_key(miner_hotkey, held.executor_info.uuid))
+        return True
+    except Exception as exc:
+        logger.warning(
+            _m(
+                "Kept result could not be dropped; the held verdict is withheld",
+                extra={"miner_hotkey": miner_hotkey, "executor_uuid": held.executor_info.uuid, "error": str(exc)},
+            )
+        )
+        return False
+
+
 async def _last_scored_result(
     redis_service: RedisService, miner_hotkey: str, held: JobResult
 ) -> JobResult | None:
@@ -880,7 +936,7 @@ async def _last_scored_result(
 async def remember_rented_scored_results(
     job_results: dict[str, list[JobResult]], redis_service: RedisService
 ) -> None:
-    """DAH-4658: keep each rented node's scored result of this cycle for `carry_renter_gpu_reset_results`.
+    """DAH-4658: keep each node's scored result of this cycle for `carry_renter_gpu_reset_results`.
 
     Any other standing result drops the kept one, so only the cycle right before a reset is carried.
     A carried result is not kept again, so the TTL bounds how long one result can stand in. A Redis
@@ -892,7 +948,8 @@ async def remember_rented_scored_results(
             if result.carried_for_renter_gpu_reset:
                 continue
             key = last_scored_result_key(miner_hotkey, result.executor_info.uuid)
-            if result.is_rented and result.is_successful:
+            # an idle node's too (DAH-5933): a NO_TASK_TIME_REASONS result carries it; the GPU-reset carry stays rented-only
+            if result.is_successful:
                 writes.set(key, result.model_dump_json(), ex=LAST_SCORED_RESULT_TTL_SECONDS)
             else:
                 writes.delete(key)

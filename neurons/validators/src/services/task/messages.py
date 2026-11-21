@@ -1437,6 +1437,13 @@ class TenantEnforcementMessages:
         category="policy",
         impact="Proceed",
     )
+    STILL_NOT_RENTED = MessageTemplate(
+        event="Executor still not rented after the parallel checks",
+        reason="EXECUTOR_STILL_NOT_RENTED",
+        severity="info",
+        category="policy",
+        impact="Proceed",
+    )
     POD_NOT_RUNNING = MessageTemplate(
         event="Pod not running",
         reason="POD_NOT_RUNNING",
@@ -1998,6 +2005,20 @@ class VerifyXMessages:
         category="policy",
         impact="Rental probe gets this cycle's time to clear its standing failure; reused last-known VerifyX EMA",
     )
+    NO_TASK_TIME = MessageTemplate(
+        event="VerifyX not finished: not enough task time left",
+        reason="VERIFYX_NO_TASK_TIME",
+        severity="warning",
+        category="policy",
+        impact=(
+            "No verdict this cycle; the node's last scored result stands. The validator's budget, not the node, "
+            "ended it"
+        ),
+        remediation=(
+            "The checks before VerifyX used most of the executor task's time, and VerifyX gets only what the checks "
+            "after it can spare. The next cycle runs it again."
+        ),
+    )
     NO_SPECS = MessageTemplate(
         event="VerifyX validation skipped (no specs)",
         reason="VERIFYX_NO_SPECS",
@@ -2547,6 +2568,17 @@ class RentalVerificationMessages:
         category="policy",
         impact="Proceed with existing rental status",
         remediation="Check backend API connectivity and logs",
+    )
+    NO_TASK_TIME = MessageTemplate(
+        event="Rental verification not run: not enough task time left",
+        reason="RENTAL_CHECK_NO_TASK_TIME",
+        severity="warning",
+        category="policy",
+        impact="This cycle fails; the backend's rental probe was not sent, so this is not a backend or API error",
+        remediation=(
+            "The checks before the rental verification used the executor task's time. A slow VerifyX download is "
+            "the usual cause: check the host's download speed. The next cycle runs it again."
+        ),
     )
     FILLER_VERIFIED = MessageTemplate(
         event="Lium default job runtime verified",

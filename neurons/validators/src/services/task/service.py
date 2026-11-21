@@ -147,6 +147,7 @@ class TaskService:
         executor_image_snapshot: ExpectedImageSnapshot | None = None,
         attestation_nonce: AttestationNonce | None = None,
         first_pass: bool = False,
+        deadline_monotonic: float | None = None,
     ):
         """New pipeline-based validation task implementation.
 
@@ -225,6 +226,7 @@ class TaskService:
                     first_pass=first_pass,
                     encrypted_private_key=encrypted_private_key,
                     task_started_at=task_started_at,
+                    deadline_monotonic=deadline_monotonic,
                 )
 
                 # Build and run validation pipeline
