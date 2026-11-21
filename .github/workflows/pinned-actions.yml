@@ -163,7 +163,10 @@ jobs:
                                 r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}")
                       env = r"env\.[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9._/:@+=-]*"
                       for step in steps:
-                          name = str(step.get("uses") or "").split("@")[0].lower()
+                          # the action the runner resolves (repository and normalized directory, as the manifest lookup
+                          # below reads it), not the literal uses text, so every spelling of the root gets the input check
+                          m = remote.fullmatch(str(step.get("uses") or ""))
+                          name = m[1].lower() if m and posixpath.normpath(m[2] or ".") == "." else None
                           args = step.get("with")
                           if name == "docker/setup-buildx-action":
                               opts = args.get("driver-opts") if isinstance(args, dict) else None
@@ -402,6 +405,13 @@ jobs:
               step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=localhost:5000/buildkit" + dig): 0,  # a registry port
               step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=ghcr.io/Acme/buildkit" + dig): 1,  # the path is lower case
               step("docker/setup-buildx-action@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit:v1:v2" + dig): 1,
+              # an equivalent spelling of the action's root is the same action: same input check, same result
+              step("docker/setup-buildx-action/.@" + sha): 1,
+              step("docker/setup-buildx-action/x/..@" + sha): 1,
+              step("docker/setup-buildx-action/.@" + sha + "\n        with:\n          driver-opts: image=moby/buildkit" + dig): 0,
+              step("docker/setup-qemu-action/.@" + sha): 1,
+              step("docker/setup-qemu-action/x/..@" + sha): 1,
+              step("docker/setup-qemu-action/.@" + sha + "\n        with:\n          image: tonistiigi/binfmt" + dig): 0,
           }
           for i, (text, want) in enumerate(cases.items()):
               tree = {**base, (None, f"w/case{i}.yml", None): text}
@@ -412,6 +422,14 @@ jobs:
                   return v
               got = scan([f"w/case{i}.yml"], tfetch, "acme/self")
               assert len(got) == want, (i, got)
+
+          # the organization ruleset requires this exact file on lium-io's main (.github/rulesets/
+          # pinned-actions-required-workflow.json): a lium-io candidate that renames or removes it would leave every later
+          # candidate in lium-io and lium without the required run, so it fails here. Other repositories have no such file
+          SOURCE_REPO, SOURCE_PATH = "datura-ai/lium-io", ".github/workflows/pinned-actions.yml"
+          source_missing = lambda tracked, repo: repo.lower() == SOURCE_REPO and SOURCE_PATH not in tracked
+          assert source_missing(set(), "Datura-ai/lium-io") and not source_missing({SOURCE_PATH}, "Datura-ai/lium-io")
+          assert not source_missing(set(), "Datura-ai/lium")
 
           tracked = set(subprocess.run(["git", "ls-files", "-z"], capture_output=True, text=True, check=True).stdout.split("\0"))
           root = pathlib.Path.cwd().resolve()
@@ -450,6 +468,8 @@ jobs:
           actions = sorted(p for p in tracked if posixpath.basename(p) in ("action.yml", "action.yaml"))
           files = sorted(str(p) for p in pathlib.Path(".github/workflows").glob("*.y*ml")) + actions
           bad = scan(files, fetch, os.environ["GITHUB_REPOSITORY"])
+          if source_missing(tracked, os.environ["GITHUB_REPOSITORY"]):
+              bad.append(f"{SOURCE_PATH}: the ruleset's required workflow must stay at this path in {SOURCE_REPO}")
           print("\n".join(bad) or f"all pinned ({len(files)} files, {len(reads)} remote reads)")
           sys.exit(1 if bad else 0)
           PY
