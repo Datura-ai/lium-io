@@ -30,7 +30,9 @@ from neurons.validators.src.services.task.checks import (
     CapabilityCheck,
     ContainerDownloadSpeedCheck,
     GpuFaultProbeCheck,
+    LocalVerifyCheck,
     PortConnectivityCheck,
+    RentalVerificationCheck,
     SysboxRequiredCheck,
     TenantEnforcementCheck,
     VerifyXCheck,
@@ -281,6 +283,17 @@ def _flatten(checks):
     for step in checks:
         out.extend(step.checks if isinstance(step, ParallelStage) else [step])
     return out
+
+
+def test_the_rental_check_runs_before_verifyx_and_after_the_rented_halt():
+    # DAH-5933: a slow VerifyX (ad2382f9, 518 s) left the rental check 1 s when it ran after it
+    names = [type(c) for c in PipelineFactory.build_checks()]
+
+    at = names.index(RentalVerificationCheck)
+
+    assert names.index(TenantEnforcementCheck) < at
+    assert names.index(PortConnectivityCheck) < at
+    assert at < names.index(LocalVerifyCheck) < names.index(VerifyXCheck)
 
 
 def test_fast_path_checks_are_the_serial_checks_re_ordered():

@@ -442,6 +442,10 @@ class PipelineFactory:
                 # DAH-4663: idle nodes only; resets a leftover clock lock or unlists the node
                 GpuClockLockCheck(),
                 GpuUsageCheck(),
+                # DAH-5933: before VerifyX, which can take its whole 600 s on a slow download; after it, the
+                # backend's probe was left 1 s and its client timeout read as an API error (ad2382f9, 21 Nov).
+                # Needs only the verified ports, GPU details and rented data, all settled above.
+                RentalVerificationCheck(),
                 # liumd phase 1 (DAH-2834): one signed `POST /verify` runs the VerifyX and matmul
                 # challenges on the executor side by side; the two checks below consume a judged,
                 # passing answer and run over SSH otherwise. Off by default, never fatal.
@@ -467,7 +471,6 @@ class PipelineFactory:
                 # after specs/gpu_model/driver are populated and the GPU is validated, on the
                 # idle valid-executor population. No scoring impact; fails open on any error.
                 CachedTemplateVerificationCheck(),
-                RentalVerificationCheck(),
                 # DAH-3436: rent the idle node from the validator once per interval, the way a renter
                 # would (default image, probe key, verified ports), and prove sshd, the login and
                 # `nvidia-smi -L`. Last before scoring: it needs the verified ports, the GPU list and

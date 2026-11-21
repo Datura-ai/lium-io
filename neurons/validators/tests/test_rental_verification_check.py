@@ -142,18 +142,54 @@ async def test_rental_verification_always_calls_backend(context_factory):
 
 @pytest.mark.asyncio
 async def test_rental_verification_health_check_waits_no_longer_than_the_task_has_left(context_factory):
-    # Arrange: 100 s before the executor task is cancelled
+    # Arrange: 200 s before the executor task is cancelled
     backend = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
     services = build_services(backend=backend, container_cleanup=ContainerCleanup())
     ctx = context_factory(services=services, state=build_state(specs={"verified_ports": [8080]}))
-    elapsed = settings.JOB_TIME_OUT - 120 - 100
+    elapsed = settings.JOB_TIME_OUT - 120 - 200
     ctx = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - elapsed})
 
     # Act
     await RentalVerificationCheck().run(ctx)
 
     # Assert: the wait ends before the cancel, leaving the probe cleanup its time
-    assert 65 <= backend.timeout <= 70
+    assert 165 <= backend.timeout <= 170
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seconds_left", [149, 31, 1])
+async def test_too_little_task_time_sends_no_probe_and_says_so_not_an_api_error(context_factory, seconds_left):
+    # Arrange: less than the probe's 120 s plus the 30 s cleanup reserve before the task is cancelled
+    backend = DummyBackendClient(response=None)
+    services = build_services(backend=backend, container_cleanup=ContainerCleanup())
+    ctx = context_factory(services=services, state=build_state(specs={"verified_ports": [8080]}))
+    elapsed = settings.JOB_TIME_OUT - 120 - seconds_left
+    ctx = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - elapsed})
+
+    # Act
+    result = await RentalVerificationCheck().run(ctx)
+
+    # Assert
+    assert backend.called_with is None
+    assert result.passed is False
+    assert result.event.reason_code == Msg.NO_TASK_TIME.reason
+    assert result.event.what_we_saw["seconds_left"] <= max(0, seconds_left - 30)
+
+
+@pytest.mark.asyncio
+async def test_the_probe_is_sent_with_exactly_its_minimum_time_left(context_factory):
+    # Arrange: 120 s for the probe once the 30 s cleanup reserve is kept
+    backend = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
+    services = build_services(backend=backend, container_cleanup=ContainerCleanup())
+    ctx = context_factory(services=services, state=build_state(specs={"verified_ports": [8080]}))
+    ctx = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - (settings.JOB_TIME_OUT - 120 - 151)})
+
+    # Act
+    result = await RentalVerificationCheck().run(ctx)
+
+    # Assert
+    assert result.passed is True
+    assert 120 <= backend.timeout <= 121
 
 
 class StalledCleanup(ContainerCleanup):
@@ -166,12 +202,12 @@ class StalledCleanup(ContainerCleanup):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("seconds_left, cleanup_timeout", [(100, 20), (15, 5), (5, 1)])
 async def test_rental_verification_stalled_cleanup_is_cut_and_the_result_kept(context_factory, seconds_left, cleanup_timeout):
-    # Arrange: a cleanup that hangs, with 100 s left, then inside the 30 s reserve
+    # Arrange: a cleanup that hangs, with 100 s left after the backend's answer, then inside the 30 s reserve
     backend = DummyBackendClient(response=ExecutorHealthCheckResponse(success=True, error=None, details={}))
     services = build_services(backend=backend, container_cleanup=StalledCleanup())
     ctx = context_factory(services=services, state=build_state(specs={"verified_ports": [8080]}))
-    elapsed = settings.JOB_TIME_OUT - 120 - seconds_left
-    ctx = ctx.model_copy(update={"started_at_monotonic": time.monotonic() - elapsed})
+    # the probe starts with 200 s left; the cleanup then runs with `seconds_left`, as after a long backend wait
+    task_time = iter([200, seconds_left])
     waits = []
     real_wait_for = asyncio.wait_for
 
@@ -180,13 +216,19 @@ async def test_rental_verification_stalled_cleanup_is_cut_and_the_result_kept(co
         return await real_wait_for(aw, timeout=0.01)
 
     # Act
-    with patch("neurons.validators.src.services.task.checks.rental_verification.asyncio.wait_for", recording_wait_for):
+    with (
+        patch("neurons.validators.src.services.task.checks.rental_verification.asyncio.wait_for", recording_wait_for),
+        patch(
+            "neurons.validators.src.services.task.checks.rental_verification.task_seconds_left",
+            lambda ctx: next(task_time),
+        ),
+    ):
         result = await RentalVerificationCheck().run(ctx)
 
     # Assert: the cleanup wait is bounded and leaves time for the result, which still arrives
     assert result.passed is True
     assert len(waits) == 1 and cleanup_timeout - 1 <= waits[0] <= cleanup_timeout
-    assert backend.timeout == 1 or seconds_left == 100
+    assert backend.timeout == 170
 
 
 @pytest.mark.asyncio

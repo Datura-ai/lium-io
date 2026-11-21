@@ -2548,6 +2548,17 @@ class RentalVerificationMessages:
         impact="Proceed with existing rental status",
         remediation="Check backend API connectivity and logs",
     )
+    NO_TASK_TIME = MessageTemplate(
+        event="Rental verification not run: not enough task time left",
+        reason="RENTAL_CHECK_NO_TASK_TIME",
+        severity="warning",
+        category="policy",
+        impact="This cycle fails; the backend's rental probe was not sent, so this is not a backend or API error",
+        remediation=(
+            "The checks before the rental verification used the executor task's time. A slow VerifyX download is "
+            "the usual cause: check the host's download speed. The next cycle runs it again."
+        ),
+    )
     FILLER_VERIFIED = MessageTemplate(
         event="Lium default job runtime verified",
         reason="FILLER_RUNTIME_VERIFIED",

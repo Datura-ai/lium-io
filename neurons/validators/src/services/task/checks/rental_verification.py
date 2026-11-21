@@ -61,6 +61,9 @@ _CLEANUP_RESERVE_SECONDS = 30
 # The cleanup's ssh call has no timeout of its own; 10 s of the reserve stay for writing the result.
 _CLEANUP_TIMEOUT_SECONDS = 20
 _RESULT_RESERVE_SECONDS = 10
+# Below this much task time the backend's probe is not sent: it took up to 96 s in prod (21 Nov 2026, 323 runs,
+# p99 66 s), and a wait cut short reads as an API error the backend never made (ad2382f9: 1 s left, 21 Nov).
+RENTAL_CHECK_MIN_SECONDS = 120
 
 # How bad each per-container filler verdict is, worst wins. A GPU-split node yields one verdict per
 # bundle but the pipeline emits a single event, so the node must be judged by its worst container:
@@ -222,6 +225,22 @@ class RentalVerificationCheck:
         # rent skips `--cpus` there too) and when the count is unreadable.
         cpu_count = advertised_cpu_count(ctx) if not ctx.executor.tdx_quote else None
 
+        seconds_for_the_probe = task_seconds_left(ctx) - _CLEANUP_RESERVE_SECONDS
+        if seconds_for_the_probe < RENTAL_CHECK_MIN_SECONDS:
+            return CheckResult(
+                passed=False,
+                event=render_message(
+                    Msg.NO_TASK_TIME,
+                    ctx=ctx,
+                    check_id=self.check_id,
+                    what={
+                        "executor_uuid": executor.uuid,
+                        "seconds_left": max(0, int(seconds_for_the_probe)),
+                        "seconds_needed": RENTAL_CHECK_MIN_SECONDS,
+                    },
+                ),
+                updates={},
+            )
         try:
             # Call backend API to verify executor health. Pass the rental hint: when this validator
             # already sees an active customer rental, the backend skips the container-creating check
@@ -240,9 +259,7 @@ class RentalVerificationCheck:
                 else LEGACY_LOOPBACK_PLUGIN_ALIAS,
                 # DAH-6606: the backend's upload is dated like this validator's own, so it can be required
                 upload_nonce=upload_nonce_for_miner(miner_hotkey),
-                timeout=int(
-                    max(1, min(HEALTH_CHECK_TIMEOUT_SECONDS, task_seconds_left(ctx) - _CLEANUP_RESERVE_SECONDS))
-                ),
+                timeout=int(min(HEALTH_CHECK_TIMEOUT_SECONDS, seconds_for_the_probe)),
             )
 
             # Handle API failure (None response) - fail this executor
