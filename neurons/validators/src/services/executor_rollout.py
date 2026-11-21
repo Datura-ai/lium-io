@@ -748,9 +748,16 @@ def has_renter_gpu_reset_holds(job_results: dict[str, list[JobResult]]) -> bool:
     return any(_held_for_renter_gpu_reset(result) for results in job_results.values() for result in results)
 
 
-# a cycle that cannot tell the node's state gives no verdict: the renter's GPU reset (DAH-4658), or a power tier
-# reading whose clear was not confirmed (F-43)
-_HELD_REASONS = (MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason, GpuPowerLimitMessages.TIER_STATE_UNKNOWN.reason)
+# a cycle that cannot tell the node's state gives no verdict: the renter's GPU reset (DAH-4658), a power tier
+# reading whose clear was not confirmed (F-43), or a pod created while the run was going
+_HELD_REASONS = (
+    MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason,
+    GpuPowerLimitMessages.TIER_STATE_UNKNOWN.reason,
+    TenantEnforcementMessages.RENTED_SINCE_CYCLE_START.reason,
+)
+
+
+_RENTED_MID_CYCLE = TenantEnforcementMessages.RENTED_SINCE_CYCLE_START.reason
 
 
 def _held_for_renter_gpu_reset(result: JobResult) -> bool:
@@ -781,16 +788,27 @@ async def carry_renter_gpu_reset_results(
     The provider loses nothing: the carried result is scored as in the cycle it came from, with this cycle's
     pay flags and a fresh ban lookup. A node the backend no longer lists as rented (`rented_executor_ids`,
     lower-case), or without a readable last result, keeps the held one, and `withhold_renter_gpu_reset_verdicts`
-    takes it out.
+    takes it out. A run stopped for a renter's create (`RENTED_SINCE_CYCLE_START`) carries without the rented list:
+    the provider did not end it, so a create that then fails takes nothing from the cycle. That carry spends the
+    kept result, so it stands in for one stopped run only.
     """
     for miner_hotkey, results in job_results.items():
         for index, held in enumerate(results):
             if not _held_for_renter_gpu_reset(held):
                 continue
-            if str(held.executor_info.uuid).lower() not in rented_executor_ids:
+            # a run stopped for a renter's create carries whether or not the create then succeeds
+            rented_mid_cycle = held.failure_reason_code == _RENTED_MID_CYCLE
+            if not rented_mid_cycle and str(held.executor_info.uuid).lower() not in rented_executor_ids:
                 continue
             previous = await _last_scored_result(redis_service, miner_hotkey, held)
             if previous is None:
+                continue
+            # an idle score stands only for a node rented mid-cycle; the other holds keep carrying rented scores only
+            if not previous.is_rented and not rented_mid_cycle:
+                continue
+            # a run stopped for a create spends the kept result: a later stopped run (the create failed or the pod
+            # was deleted) is withheld instead of re-carrying the same score until the key expires
+            if rented_mid_cycle and not await _spend_last_scored_result(redis_service, miner_hotkey, held):
                 continue
             results[index] = previous.model_copy(
                 update={
@@ -877,10 +895,27 @@ async def _last_scored_result(
         return None
 
 
-async def remember_rented_scored_results(
+async def _spend_last_scored_result(redis_service: RedisService, miner_hotkey: str, held: JobResult) -> bool:
+    """False when the kept result could not be deleted: it is then not carried, so it can never stand twice."""
+    try:
+        await redis_service.delete(last_scored_result_key(miner_hotkey, held.executor_info.uuid))
+        return True
+    except Exception as exc:
+        logger.warning(
+            _m(
+                "Last scored result could not be spent; the held verdict is withheld",
+                extra={"miner_hotkey": miner_hotkey, "executor_uuid": held.executor_info.uuid, "error": str(exc)},
+            )
+        )
+        return False
+
+
+async def remember_scored_results(
     job_results: dict[str, list[JobResult]], redis_service: RedisService
 ) -> None:
-    """DAH-4658: keep each rented node's scored result of this cycle for `carry_renter_gpu_reset_results`.
+    """DAH-4658: keep each node's scored result of this cycle for `carry_renter_gpu_reset_results`.
+
+    Idle nodes too: a node rented while its run goes on is held, and its idle result of the cycle before stands.
 
     Any other standing result drops the kept one, so only the cycle right before a reset is carried.
     A carried result is not kept again, so the TTL bounds how long one result can stand in. A Redis
@@ -892,7 +927,7 @@ async def remember_rented_scored_results(
             if result.carried_for_renter_gpu_reset:
                 continue
             key = last_scored_result_key(miner_hotkey, result.executor_info.uuid)
-            if result.is_rented and result.is_successful:
+            if result.is_successful:
                 writes.set(key, result.model_dump_json(), ex=LAST_SCORED_RESULT_TTL_SECONDS)
             else:
                 writes.delete(key)

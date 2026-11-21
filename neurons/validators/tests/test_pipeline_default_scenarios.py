@@ -250,7 +250,7 @@ class DummyVerifyXService:
     """Mock VerifyX validation service."""
 
     async def validate_verifyx_and_process_job(
-        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None
+        self, *, shell, executor_info, default_extra, machine_spec, run_dir=None, **_
     ):
         return VerifyXResult()
 

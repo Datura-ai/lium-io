@@ -10,6 +10,7 @@ from services.gpu_spec_table import is_sxm_on_pcie_adapter, normalize_gpu_model
 from ..messages import NvlinkFaultMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
+from ..runner import run_killed_on_cancel
 
 # Stdlib-only, shipped over stdin like the pinned-memory probe: nothing to upload or update.
 PROBE_SOURCE_PATH = Path(__file__).resolve().parents[3] / "miner_jobs" / "nvlink_multicast_probe.py"
@@ -62,6 +63,8 @@ class NvlinkFaultCheck:
     """
 
     check_id = "gpu.validate.nvlink_fault"
+    # a renter's create on the node stops it mid-run (Pipeline._run_step_unless_rented)
+    stops_on_rent = True
     replays_after_session_drop = True
     fatal = True
 
@@ -80,10 +83,10 @@ class NvlinkFaultCheck:
             return CheckResult(
                 passed=True, event=render_message(Msg.SKIPPED, ctx=ctx, check_id=self.check_id)
             )
-        run = await ctx.runner.run(
+        run = await run_killed_on_cancel(
+            ctx.runner,
             f"{shlex.quote(ctx.executor.python_path)} -I -",
-            timeout=PROBE_TIMEOUT_SECONDS,
-            retryable=False,
+            seconds=PROBE_TIMEOUT_SECONDS,
             stdin_text=PROBE_SOURCE,
         )
         report = _parse_report(run.stdout)

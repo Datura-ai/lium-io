@@ -456,6 +456,8 @@ async def test_a_cancelled_all_cards_run_kills_the_remote_matmuls_and_stays_canc
         if cmd.startswith("pkill"):
             kills.append(cmd)
             return SimpleNamespace(exit_status=0, stdout="", stderr="")
+        if "kill -KILL" in cmd:  # the per-card kill _run_cards sends first on a cancel
+            return SimpleNamespace(exit_status=0, stdout="", stderr="")
         started.set()
         await asyncio.sleep(3600)
 

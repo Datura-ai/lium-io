@@ -29,7 +29,7 @@ from services.executor_rollout import (
     WithheldVerdict,
     carry_renter_gpu_reset_results,
     has_renter_gpu_reset_holds,
-    remember_rented_scored_results,
+    remember_scored_results,
     has_rental_change_candidates,
     withhold_rental_change_verdicts,
     withhold_renter_gpu_reset_verdicts,
@@ -722,7 +722,7 @@ class Validator:
                     all_job_results, withheld_results = await self.withhold_verdicts_for_rollout(
                         all_job_results, job_block, job_batch_id, rollout_window, rented_executors, rented_at_end
                     )
-                    await remember_rented_scored_results(all_job_results, self.redis_service)
+                    await remember_scored_results(all_job_results, self.redis_service)
 
                     # DAH-2622: a miner whose machine passed validation must keep its UID even
                     # when it earned nothing this cycle. Overwrite, never accumulate. A miner with a
@@ -1593,7 +1593,7 @@ class Validator:
         rented_now: RentedExecutorsResponse | None,
     ) -> None:
         """DAH-4658: only a node the backend still lists as rented carries its score: at the cycle end (`rented_now`),
-        or in this cycle's snapshot when the backend did not answer."""
+        or in this cycle's snapshot when the backend did not answer. A run stopped for a renter's create needs no listing."""
         if not has_renter_gpu_reset_holds(all_job_results):
             return
         rented = rented_now or rented_executors
