@@ -1864,9 +1864,9 @@ def _registration_label_command(container_id: str) -> str:
     return f"/usr/bin/docker inspect --type container -f {shlex.quote(template)} {shlex.quote(container_id)}"
 
 
-def _own_stopped_leftover_command(container_id: str, owner: str) -> str:
-    """Exits 0 once the container is removed: only when it is stopped (created, exited or dead) and carries `owner` or
-    no registration label. `docker rm` without force refuses one started after the check."""
+def _own_stopped_leftover_check(container_id: str, owner: str) -> str:
+    """Exits 0 only when the container is stopped (created, exited or dead) and carries `owner` or no registration
+    label. Run before its removal is marked as ours, so a refused check leaves no mark."""
     template = "{{.State.Status}} {{index .Config.Labels \"%s\"}}" % LIUM_EXECUTOR_ID_LABEL
     cid = shlex.quote(container_id)
     return "\n".join(
@@ -1874,9 +1874,13 @@ def _own_stopped_leftover_command(container_id: str, owner: str) -> str:
             f"s=$(/usr/bin/docker inspect --type container -f {shlex.quote(template)} {cid}) || exit 3",
             'case "${s%% *}" in created|exited|dead) ;; *) exit 3;; esac',
             f'case "${{s#* }}" in {shlex.quote(owner)}|"") ;; *) exit 3;; esac',
-            f"/usr/bin/docker rm -v {cid} >/dev/null",
         ]
     )
+
+
+def _own_leftover_rm_command(container_id: str) -> str:
+    """Without force: Docker refuses a container started after the check."""
+    return f"/usr/bin/docker rm -v {shlex.quote(container_id)} >/dev/null"
 
 
 def _made_for(result, owner: str) -> bool:
@@ -2952,6 +2956,10 @@ class _MarkOwnRemovalsOnSubmit:
             raise
         self._channel_opened = True
         return result
+
+    def take_back(self) -> None:
+        """A one-ID `rm` Docker answered with a refusal removed nothing: its mark goes."""
+        own_sweep_removals.unmark(self._ids, self._token)
 
 
 class _PendingDeletionRegistry:
@@ -5934,7 +5942,8 @@ class DockerService:
         stays: one pod keeps one name on every registration, so on a shared daemon it may be another registration's
         running replacement, labelled or made before the labels. Only the same-name conflict's leftover goes, here,
         before disk admission counts its layer: the listed ID, stopped, this registration's or unlabelled, removed
-        without force (`_own_stopped_leftover_command`), so a container started meanwhile is refused by Docker.
+        without force (`_own_stopped_leftover_check`, then `_own_leftover_rm_command`), so a container started meanwhile is
+        refused by Docker; only a removal that passed the check is marked as this sweep's.
 
         DAH-5392: an unlisted `pod_*` other than ``pod_name`` is removed (with its volume) only when the
         backend confirms its rental closed: a create that waited may sweep after a newer create on the
@@ -6017,11 +6026,15 @@ class DockerService:
                 stale_containers.remove(pod_name)
                 own_id = listed_ids.get(pod_name)
                 if own_id is not None:
-                    removal = await _MarkOwnRemovalsOnSubmit(ssh_client, [own_id]).run(
-                        _own_stopped_leftover_command(own_id, pod_owner)
-                    )
-                    if removal.exit_status == 0:
-                        own_leftover_removed.append(pod_name)
+                    # the mark goes on only once the check passed: a refused check removes nothing, so a later
+                    # disappearance of that container must not read as this sweep's removal
+                    check = await ssh_client.run(_own_stopped_leftover_check(own_id, pod_owner))
+                    if check.exit_status == 0:
+                        marked = _MarkOwnRemovalsOnSubmit(ssh_client, [own_id])
+                        if (await marked.run(_own_leftover_rm_command(own_id))).exit_status == 0:
+                            own_leftover_removed.append(pod_name)
+                        else:
+                            marked.take_back()
             container_names = " ".join(shlex.quote(name) for name in stale_containers)
             if not container_names:
                 return own_leftover_removed

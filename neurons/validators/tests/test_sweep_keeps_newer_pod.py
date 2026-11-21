@@ -240,7 +240,7 @@ def test_only_a_stopped_leftover_of_this_registration_is_removed_by_its_id_witho
     import shlex
     import subprocess
 
-    from services.docker_service import _own_stopped_leftover_command
+    from services.docker_service import _own_leftover_rm_command, _own_stopped_leftover_check
 
     log = tmp_path / "calls"
     inspect = "exit 1" if status is None else f"echo {shlex.quote(f'{status} {label}')}"
@@ -249,7 +249,10 @@ def test_only_a_stopped_leftover_of_this_registration_is_removed_by_its_id_witho
         f'#!/bin/sh\necho "$*" >> {shlex.quote(str(log))}\ncase "$1" in inspect) {inspect};; rm) exit 0;; esac\n'
     )
     stub.chmod(0o755)
-    command = _own_stopped_leftover_command(OWN_ID, OWNER).replace("/usr/bin/docker", str(stub))
+    # the sweep sends the removal only after the check exits 0
+    command = f"({_own_stopped_leftover_check(OWN_ID, OWNER)}) && {_own_leftover_rm_command(OWN_ID)}".replace(
+        "/usr/bin/docker", str(stub)
+    )
 
     done = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
 
@@ -258,29 +261,45 @@ def test_only_a_stopped_leftover_of_this_registration_is_removed_by_its_id_witho
     assert [c for c in calls if c.startswith("rm")] == ([f"rm -v {OWN_ID}"] if removed else [])
 
 
-@pytest.mark.parametrize("rm_exit", [0, 3])
+@pytest.mark.parametrize(("check_exit", "rm_exit"), [(0, 0), (0, 1), (3, 0)])
 @pytest.mark.parametrize("listing", [f"pod_target {OWN_ID}\n", "pod_target\n"], ids=["with-id", "without-id"])
 @pytest.mark.asyncio
-async def test_a_pod_creates_sweep_never_force_removes_the_pods_own_name_or_its_volume(retry_ssh_mock, listing, rm_exit):
+async def test_a_pod_creates_sweep_never_force_removes_the_pods_own_name_or_its_volume(
+    retry_ssh_mock, listing, check_exit, rm_exit
+):
     """DAH-6531: one pod keeps one name on every registration; on a shared daemon it may be another registration's
-    running replacement, labelled or made before the labels. Only the checked leftover command may remove it."""
-    from services.docker_service import _own_stopped_leftover_command
+    running replacement, labelled or made before the labels. Only the checked leftover may be removed, and only a
+    removal Docker carried out stays marked as this sweep's: a container whose check or removal was refused and that
+    disappears later is never read as removed by a sweep."""
+    from services.docker_service import _own_leftover_rm_command, _own_stopped_leftover_check, own_sweep_removals
 
+    own_sweep_removals.clear()
+    check, rm = _own_stopped_leftover_check(OWN_ID, OWNER), _own_leftover_rm_command(OWN_ID)
     svc = DockerService(
         ssh_service=Mock(), redis_service=Mock(get=AsyncMock(return_value=None)), attestation_service=Mock()
     )
     ssh_client = AsyncMock()
-    ssh_client.run = AsyncMock(
-        side_effect=lambda command, **_: Mock(
-            exit_status=rm_exit if command.startswith("s=") else 0, stdout="" if command.startswith("s=") else listing, stderr=""
-        )
-    )
+    marked_at_check = []
+
+    def answer(command, **_):
+        if command == check:
+            marked_at_check.append(own_sweep_removals.sent_rm_for(OWN_ID))
+            return Mock(exit_status=check_exit, stdout="", stderr="")
+        if command == rm:
+            return Mock(exit_status=rm_exit, stdout="", stderr="")
+        return Mock(exit_status=0, stdout=listing, stderr="")
+
+    ssh_client.run = AsyncMock(side_effect=answer)
 
     removed = await svc.clean_existing_containers(
         ssh_client=ssh_client, default_extra={}, pod_name="pod_target", active_container_names=[], pod_owner=OWNER
     )
 
+    listed = "aaaa" in listing
     sent = [call.args[0] for call in ssh_client.run.await_args_list[1:]]
     assert retry_ssh_mock.await_args_list == []  # no forced rm, no volume rm
-    assert sent == ([_own_stopped_leftover_command(OWN_ID, OWNER)] if "aaaa" in listing else [])
-    assert removed == (["pod_target"] if "aaaa" in listing and rm_exit == 0 else [])
+    assert sent == (([check] + ([rm] if check_exit == 0 else [])) if listed else [])
+    assert marked_at_check == ([False] if listed else [])  # nothing is marked before the check passes
+    assert own_sweep_removals.sent_rm_for(OWN_ID) is (listed and check_exit == 0 and rm_exit == 0)
+    assert removed == (["pod_target"] if listed and check_exit == 0 and rm_exit == 0 else [])
+    own_sweep_removals.clear()
