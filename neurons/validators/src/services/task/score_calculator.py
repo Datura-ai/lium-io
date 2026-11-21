@@ -4,34 +4,23 @@ This module contains the business logic for calculating actual and job scores
 based on executor checks and rental state.
 """
 
+from dataclasses import replace
 from typing import Tuple
 
 from core.config import settings, shared_client
 from services.executor_image_policy import ImageVerdict
 from services.gpu_spec_table import normalize_gpu_model, reference_gpu_model
+from services.task.checks.verifyx import specs_with_last_known_verifyx_ema
 from services.task.pipeline import Context
 
 
-# The context flags a non-fatal check clears to zero this cycle's score in calculate_scores below.
-ZERO_SCORE_GATE_FLAGS = (
-    "cpu_truth_passed",
-    "spec_floor_passed",
-    "provider_side_load_passed",
-    "rented_pod_resources_passed",
-    "rented_throughput_passed",
-    "gpu_attestation_identity_passed",
-    "cc_vbios_passed",
-    "hardware_identity_passed",
-    "kernel_gpu_view_passed",
-    "gpu_kernel_count_passed",
-    "gpu_model_passed",
-    "node_account_passed",
-)
-
-
 def zero_score_gate_failed(ctx: Context) -> bool:
-    """A check that already ran this cycle has zeroed its score, whatever the checks after it find."""
-    return any(not getattr(ctx, flag) for flag in ZERO_SCORE_GATE_FLAGS) or _tdx_gate_failed(ctx)
+    """What the run read before it stopped has already zeroed this cycle's score, whatever the checks after it find.
+
+    The same calculate_scores the score check runs, so no zero-score branch is left out; the last known VerifyX EMA
+    stands in for a sample the stop cut off."""
+    state = replace(ctx.state, specs=specs_with_last_known_verifyx_ema(ctx))
+    return calculate_scores(ctx.model_copy(update={"state": state}), ctx.rented)[0] <= 0
 
 
 def _tdx_gate_failed(ctx: Context) -> bool:

@@ -537,15 +537,20 @@ async def test_a_second_no_task_time_cycle_without_a_pass_between_is_withheld(re
 @pytest.mark.parametrize(
     "reason", [RentalVerificationMessages.NO_TASK_TIME.reason, VerifyXMessages.NO_TASK_TIME.reason]
 )
-@pytest.mark.parametrize("earlier_gate", [None, "cpu_truth_passed", "cc_vbios_passed"])
+@pytest.mark.parametrize("earlier_gate", [None, "cpu_truth_passed", "cc_vbios_passed", "price_per_gpu"])
 async def test_a_budget_stop_after_a_check_zeroed_the_score_keeps_that_failure(context_factory, reason, earlier_gate):
-    # review: a check that already ran this cycle and zeroed its score is no budget stop the last pass may replace
+    # review: a check that already ran this cycle and zeroed its score is no budget stop the last pass may replace;
+    # 4d7bf12: a price raised above the cap zeroes it too, with no boolean flag behind it
     from services.task.service import budget_stop_reason
 
-    ctx = context_factory()
+    ctx = context_factory(state=build_state(specs={"network": {"ema_verifyx_download_speed": 500.0}}))
+    ctx = ctx.model_copy(update={"executor": ctx.executor.model_copy(update={"price_per_gpu": None})})  # a pass
     gate_event = build_msg(event="CPU count mismatch", reason="CPU_TRUTH_MISMATCH", severity="error", impact="")
     events = [build_msg(event="ok", reason="VALIDATION_STEP_OK", severity="info", impact="")]
-    if earlier_gate:
+    if earlier_gate == "price_per_gpu":
+        ctx = ctx.model_copy(update={"executor": ctx.executor.model_copy(update={"price_per_gpu": 1e9})})
+        events.append(gate_event)
+    elif earlier_gate:
         ctx = ctx.model_copy(update={earlier_gate: False})
         events.append(gate_event)
     events.append(build_msg(event="no time", reason=reason, severity="warning", impact=""))
