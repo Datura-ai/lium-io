@@ -1,5 +1,6 @@
 """Cancelling a matmul while its script is still being installed must stop it from ever starting, and only that tag."""
 
+import signal
 import subprocess
 import sys
 import time
@@ -24,13 +25,16 @@ def node(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
-def _launch(node: Path, tag: str) -> subprocess.Popen:
+def _launch(node: Path, tag: str, paused: str = "before_start") -> subprocess.Popen:
     command = executor_payload.run_once("matrix", executor_payload.MATRIX, str(node / f"{tag}.started"), tag=tag)
     run = executor_payload.run(executor_payload.MATRIX)
-    assert f"; {run} " in command
-    # the window the cancel must cover: installed, interpreter not started yet
-    slowed = command.replace(f"; {run} ", f"; sleep 1.5; {run} ", 1)
-    return subprocess.Popen(["sh", "-c", slowed], start_new_session=True)   # its own session, as an SSH exec
+    assert f"; {run} " in command and command.count("|| exit 1; { ") == 1
+    if paused == "before_start":   # installed, interpreter not started yet
+        slowed = command.replace(f"; {run} ", f"; sleep 1.5; {run} ", 1)
+    else:   # past the cancel-marker check, its directory and script not written yet
+        slowed = command.replace("|| exit 1; { ", "|| exit 1; sleep 1.5; { ", 1)
+    # /bin/sh as an SSH exec runs it (dash on Debian/Ubuntu nodes), in its own session
+    return subprocess.Popen(["/bin/sh", "-c", slowed], start_new_session=True)
 
 
 def test_a_cancel_between_install_and_start_stops_that_run_and_no_other(node: Path) -> None:
@@ -67,3 +71,22 @@ def test_a_cancel_that_lands_before_the_launch_shell_exists_still_stops_that_run
     assert not (node / f"{mine}.started").exists() and a.returncode == 1
     assert (node / f"{other}.started").read_text() == "started" and b.returncode == 0
     assert [p.name for p in (node / "service").iterdir()] == [Path(executor_payload.cancel_marker("matrix", mine)).name]
+
+
+def test_a_cancel_of_a_launcher_paused_before_its_install_kills_it_and_no_other(node: Path) -> None:
+    # its directory does not exist yet, so only killing the launcher's process group stops it (dash's kill included)
+    mine, other = executor_payload.new_run_tag(), executor_payload.new_run_tag()
+    a, b = _launch(node, mine, paused="before_install"), _launch(node, other, paused="before_install")
+    try:
+        time.sleep(0.5)   # both past the marker check, neither installed
+        subprocess.run(["/bin/sh", "-c", executor_payload.kill_runs("matrix", executor_payload.MATRIX, mine)], check=True)
+        a.wait(timeout=5)
+        b.wait(timeout=10)
+    finally:
+        for p in (a, b):
+            if p.poll() is None:
+                p.kill()
+    time.sleep(2)   # a surviving launcher would have installed and started by now
+    assert a.returncode == -signal.SIGKILL
+    assert not (node / f"{mine}.started").exists()
+    assert (node / f"{other}.started").read_text() == "started" and b.returncode == 0

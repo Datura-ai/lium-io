@@ -181,9 +181,10 @@ def kill_runs(purpose: str, files: tuple[str, ...], tag: str) -> str:
         # one already up is in the process groups killed next. Markers of long-finished runs are swept.
         f"find {shlex.quote(SERVICE_DIR_PARENT)} -maxdepth 1 -name {shlex.quote(Path(cancel_marker(purpose, '*')).name)} "
         f"-mmin +60 -delete 2>/dev/null; : > {marker}; "
+        # no `--` before the group: dash's kill builtin takes it as a number and kills nothing
         f"for p in $(pgrep -f {SAME_MOUNT_NS} -- {shlex.quote(launcher_pattern(purpose, tag))}); do "
         "g=$(ps -o pgid= -p \"$p\" | tr -d ' '); "
-        f'[ -n "$g" ] && [ "$g" != "{me}" ] && kill -9 -- "-$g" 2>/dev/null; done; '
+        f'[ -n "$g" ] && [ "$g" != "{me}" ] && kill -9 "-$g" 2>/dev/null; done; '
         f"pkill -9 -f {SAME_MOUNT_NS} -- {shlex.quote(process_pattern(purpose, files, tag))}; "
         f'rm -rf -- "{service_dir_glob(purpose)}"{tag}.*; true'
     )

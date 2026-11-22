@@ -299,7 +299,7 @@ async def start_storage_operation(
     except Exception as error:
         # another dispatch may have launched it meanwhile: its run, not this dispatch's failure, is the operation's
         try:
-            if await _has_incumbent(ssh_client, files):
+            if await _settle_failed_dispatch(ssh_client, files, retain_terminal_artifacts):
                 return files
         except Exception:  # noqa: BLE001 - the node cannot say: the failure stands
             pass
@@ -339,6 +339,22 @@ async def _has_incumbent(ssh_client: asyncssh.SSHClientConnection, files: Storag
     q = shlex.quote(str(files.lock))
     result = await ssh_client.run(
         f"exec 9>>{q} && flock -x 9 || exit 1; if {_incumbent_condition(files)}; then echo YES; fi", check=False
+    )
+    return result.exit_status == 0 and (result.stdout or "").strip() == "YES"
+
+
+async def _settle_failed_dispatch(
+    ssh_client: asyncssh.SSHClientConnection, files: StorageOperationFiles, retain_terminal_artifacts: bool
+) -> bool:
+    """True when the operation has a result or a live run (see _incumbent_condition); else, under the same lock, it
+    records this dispatch's failure as the operation's result, as a finished run would (an online run's done marker, a
+    bootstrap run's non-zero status), so no dispatch launches it between this check and the FAILED report."""
+    q = lambda path: shlex.quote(str(path))  # noqa: E731
+    failed = f"printf '1\\n' > {q(files.status)}" if retain_terminal_artifacts else f": > {q(files.done)}"
+    result = await ssh_client.run(
+        f"install -d -m 0700 {q(REMOTE_OPERATION_DIRECTORY)} && exec 9>>{q(files.lock)} && flock -x 9 || exit 1; "
+        f"if {_incumbent_condition(files)}; then echo YES; else {failed} || exit 1; fi",
+        check=False,
     )
     return result.exit_status == 0 and (result.stdout or "").strip() == "YES"
 

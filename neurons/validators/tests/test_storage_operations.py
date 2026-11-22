@@ -331,6 +331,47 @@ def test_a_dispatch_whose_staging_fails_with_no_run_reports_the_failure(node: Pa
     storage_operations.report_launch_failure.assert_awaited_once()
 
 
+@pytest.mark.parametrize("retain_terminal_artifacts", [False, True])
+def test_a_failed_dispatch_records_its_failure_before_reporting_so_no_later_dispatch_launches(
+    node: Path, retain_terminal_artifacts: bool
+) -> None:
+    # the "no run" read and the failure's record are one step under the operation's lock: a dispatch that takes the lock
+    # once the failed one released it finds that result and launches nothing, so the FAILED report is the operation's
+    import asyncio as aio
+
+    _runner(node, "raise SystemExit(0)\n")
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    launches: list[str] = []
+
+    async def failing(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        if "printf \"%s\" \"$d\"" in command:
+            raise OSError(28, "No space left on device")
+        return await _run_locally(command, check, input)
+
+    async def recording(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        result = await _run_locally(command, check, input)
+        if "nohup" in command:
+            launches.append((result.stdout or "").strip())
+        return result
+
+    with pytest.raises(OSError):
+        aio.run(storage_operations.start_storage_operation(
+            SimpleNamespace(run=failing), sys.executable, OPERATION_ID, {"engine": "restic"},
+            retain_terminal_artifacts=retain_terminal_artifacts,
+        ))
+    storage_operations.report_launch_failure.assert_awaited_once()
+    recorded = files.status if retain_terminal_artifacts else files.done
+    assert Path(str(recorded)).exists() and not Path(str(files.launcher)).exists()
+
+    returned_files = aio.run(storage_operations.start_storage_operation(
+        SimpleNamespace(run=recording), sys.executable, OPERATION_ID, {"engine": "restic"},
+        retain_terminal_artifacts=retain_terminal_artifacts,
+    ))
+    assert returned_files == files and launches == []
+    assert not Path(str(files.launcher)).exists() and not Path(str(files.spec)).exists()
+    storage_operations.report_launch_failure.assert_awaited_once()
+
+
 def test_a_staging_failure_during_another_dispatchs_launch_handoff_waits_for_its_launcher(node: Path) -> None:
     # F-59: the other dispatch holds the launch lock and has started its wrapper, but neither its launcher nor the
     # runner's PID is recorded yet when this dispatch's staging fails: the recheck waits for the lock and finds the run
