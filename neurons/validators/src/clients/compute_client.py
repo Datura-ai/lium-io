@@ -107,7 +107,6 @@ from services.redis_service import (
     RESET_VERIFIED_JOB_CHANNEL,
     STREAMING_LOG_CHANNEL,
     NORMALIZED_SCORE_CHANNEL,
-    PENDING_MARK_MAX_AGE_SECONDS,
     _saved_command_id,
     renter_create_id,
 )
@@ -1189,8 +1188,9 @@ class ComputeClient:
         the pod unanswered when it stopped (its marks carry no command ID: it may be this one, sent again after the
         upgrade). That older create counts unless the backend says this create is the pod's first since its last new
         rental, reboot or retry (a legacy create that succeeded but whose receipt was lost leaves the same mark, and a
-        renter's new reboot of that pod must run); the backend saying it repeats an earlier one, it counts at any age; an
-        older backend that says neither, within the pending-mark window. The older marks are read where the start kept
+        renter's new reboot of that pod must run). Otherwise (it repeats one, or an older backend cannot say) it counts
+        at any age: the older validator wrote no command ID, so its age says nothing about which command started the
+        pod's unlabelled container, and replacing it is not undone. The older marks are read where the start kept
         them and, when that start could not move them, where the older validator left them. Unreadable counts as yes,
         which only holds a failure back until the node is asked"""
         redis_service = self.miner_service.redis_service
@@ -1205,10 +1205,7 @@ class ComputeClient:
                     for mark in marks
                     if mark.get("pod_id") == pod_id and not mark.get("command_id") and not mark.get("kind")
                 ]
-                started = [t for t in started if t is not None]
-                if started and (
-                    built_before is True or time.time() - max(started) < PENDING_MARK_MAX_AGE_SECONDS
-                ):
+                if any(t is not None for t in started):
                     return True
         except Exception:  # noqa: BLE001
             return True

@@ -1167,6 +1167,13 @@ class RedisService:
         def other_dispatch(item_command_id: str) -> bool:
             return bool(command_id and item_command_id and item_command_id != command_id)
 
+        # an older validator's create mark carries no command ID, so a bound receipt settles it only as the pod's
+        # current dispatch (or with none recorded since the upgrade): a late receipt of an earlier dispatch must not
+        # drop the mark a newer, unanswered create of the pod still depends on
+        settles_older_create = kind is None and (
+            not command_id or await self.current_create_dispatch(pod_id) in ("", command_id)
+        )
+
         def keep(item: dict) -> bool:
             # a gpu_reset/gpu_clocks mark carries no command_id: a bound receipt never clears one
             return (
@@ -1174,6 +1181,7 @@ class RedisService:
                 or other_dispatch(item.get("command_id", ""))
                 or bool(command_id and item.get("kind"))
                 or (kind is not None and item.get("kind") != kind)
+                or (not settles_older_create and not item.get("command_id") and not item.get("kind"))
             )
 
         await self._update_pending_pods(
@@ -1182,7 +1190,8 @@ class RedisService:
         if kind is None:  # clearing one kind of mark (a GPU reset's) is no create's receipt
             # rent-finished is the ContainerCreated's receipt; nothing is resent for a pod no longer pending
             await self._remove_unacked_container_created_unless(pod_id, other_dispatch)
-            await self.hdel(PRE_UPGRADE_CREATE_MARKS_KEY, pod_id)   # an older validator's create of the pod, answered
+            if settles_older_create:  # an older validator's create of the pod, answered
+                await self.hdel(PRE_UPGRADE_CREATE_MARKS_KEY, pod_id)
 
     async def accept_create_dispatch(self, pod_id: str, command_id: str, accepted_ns: int) -> None:
         """Records a create the backend sent, placed by `accepted_ns`, the time the receive loop took its message: the
