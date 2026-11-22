@@ -838,10 +838,10 @@ async def carry_renter_gpu_reset_results(
     snapshot: its own scrape saw the renter resetting GPUs inside that rental. A kept result that fails the rule is
     dropped, and so is one a cycle saw rented after its start even when a read is missing: the rental state it was
     scored with is gone. A held result not carried is taken out by
-    `withhold_renter_gpu_reset_verdicts`. Only a rented pass is kept (`remember_rented_scored_results`), so every
-    hold carries a rented node only; a no-task-time hold carries once (`_spend_kept_result`). A kept result is
-    eligible only while every cycle since it was scored vouched for it (`_last_scored_result`). `rented_executor_ids`
-    is kept for the caller's signature.
+    `withhold_renter_gpu_reset_verdicts`. The GPU-reset and power-tier holds carry a rented node only; a no-task-time
+    hold carries a rented or an idle node once (`_spend_kept_result`, `_take_idle_pass`). A kept result is eligible
+    only while every cycle since it was scored vouched for it (`_last_scored_result`, `_take_idle_pass`).
+    `rented_executor_ids` is kept for the caller's signature.
     """
     def by_uuid(rented: RentedExecutorsResponse | None) -> dict[str, RentedExecutor] | None:
         return None if rented is None else {str(uuid).lower(): rental for uuid, rental in rented.executors.items()}
@@ -851,13 +851,17 @@ async def carry_renter_gpu_reset_results(
         for index, held in enumerate(results):
             if not _held_for_renter_gpu_reset(held):
                 continue
-            previous = await _last_scored_result(redis_service, miner_hotkey, held, job_block)
+            previous = _take_idle_pass(miner_hotkey, held, job_block)
+            in_redis = previous is None
+            if in_redis:
+                previous = await _last_scored_result(redis_service, miner_hotkey, held, job_block)
             if previous is None:
                 continue
             gpu_reset = held.failure_reason_code == MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason
             if rentals_at_start is None or (rentals_at_end is None and not gpu_reset):
                 # a rental state that cannot be read carries nothing; one the cycle saw change still drops the kept result
-                if held.failure_reason_code == RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason:
+                seen_rented = held.failure_reason_code == RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason
+                if in_redis and seen_rented:
                     await _spend_kept_result(redis_service, miner_hotkey, held)
                 continue
             info = held.executor_info
@@ -871,14 +875,15 @@ async def carry_renter_gpu_reset_results(
                 else rental_owned_by(rentals_at_end.get(uuid), miner_hotkey, info.address, info.port)
             )
             if not rental_state_unchanged(held, previous, rental_at_start, rental_at_end):
-                await _spend_kept_result(redis_service, miner_hotkey, held)
+                if in_redis:
+                    await _spend_kept_result(redis_service, miner_hotkey, held)
                 continue
             no_task_time = held.failure_reason_code in NO_TASK_TIME_REASONS
             rented_now = rental_at_end is not None
             if not no_task_time and not rented_now:
                 continue
             rented_gpu_count = rental_gpu_count(rental_at_end) if rented_now else 0
-            if no_task_time and not await _spend_kept_result(redis_service, miner_hotkey, held):
+            if no_task_time and in_redis and not await _spend_kept_result(redis_service, miner_hotkey, held):
                 continue
             results[index] = previous.model_copy(
                 update={
@@ -967,15 +972,30 @@ async def _spend_kept_result(redis_service: RedisService, miner_hotkey: str, hel
         return False
 
 
+# DAH-5933: each node's idle pass of the last cycle, in this process only and never in Redis: taking or dropping one
+# cannot fail, and a restart starts with none (the next held cycle is withheld). (result, job block it was scored on)
+_idle_passes: dict[tuple[str, str], tuple[JobResult, int]] = {}
+
+
+def _take_idle_pass(miner_hotkey: str, held: JobResult, job_block: int) -> JobResult | None:
+    """The node's idle pass kept by the cycle right before this one, or None. Taken on read, so whatever this cycle
+    decides, no later cycle finds it; only a pass this cycle scores is kept for the next."""
+    kept = _idle_passes.pop((miner_hotkey, held.executor_info.uuid), None)
+    if kept is None or kept[1] < job_block - settings.BLOCKS_FOR_JOB:
+        return None
+    return kept[0]
+
+
 async def _last_scored_result(
     redis_service: RedisService, miner_hotkey: str, held: JobResult, job_block: int
 ) -> JobResult | None:
-    """The node's kept result, or None: none, unreadable, or not vouched for by the cycle right before this one (the
-    held result is then withheld, as before). Eligibility is a fact of the store, not of a process: every cycle that
-    keeps the result eligible writes its job block with the cycle's results (`remember_rented_scored_results`). A
-    cycle that dropped it, withheld the node, or wrote nothing at all (a Redis outage, a restart) leaves no vouch, so
-    a row such a cycle could not delete is never read as eligible again. The read takes the vouch it finds, so a
-    cycle that shares the job block of the one before it cannot leave that cycle's vouch behind."""
+    """The node's kept rented result (an idle one is `_take_idle_pass`'s), or None: none, unreadable, or not vouched
+    for by the cycle right before this one (the held result is then withheld, as before). Eligibility is a fact of
+    the store, not of a process: every cycle that keeps the result eligible writes its job block with the cycle's
+    results (`remember_rented_scored_results`). A cycle that dropped it, withheld the node, or wrote nothing at all
+    (a Redis outage, a restart) leaves no vouch, so a row such a cycle could not delete is never read as eligible
+    again. The read takes the vouch it finds, so a cycle that shares the job block of the one before it cannot
+    leave that cycle's vouch behind."""
     try:
         # the read spends the vouch: only this cycle's own write can vouch for the next one, so a cycle that drops the
         # result (on any job block) and cannot delete it leaves nothing a later cycle accepts
@@ -1014,24 +1034,31 @@ async def remember_rented_scored_results(
     A carried result is not kept again, so the TTL bounds how long one result can stand in. A Redis
     error only logs: the next cycle writes again.
 
-    In the same write, each node whose kept result stays eligible (a new pass, or a carried one) is vouched for at
-    `job_block`; a node withheld this cycle is left out of `job_results` and gets no vouch (`_last_scored_result`).
+    A rented pass is kept in Redis, as on main, and in the same write each node whose kept rented result stays
+    eligible (a new pass, or a carried one) is vouched for at `job_block`; a node withheld this cycle is left out of
+    `job_results` and gets no vouch (`_last_scored_result`). DAH-5933: an idle pass is kept in this process only
+    (`_take_idle_pass`), and the cycle's idle passes replace the last cycle's, so a node withheld this cycle has none.
     """
     writes = RedisWrites()
+    idle_passes: dict[tuple[str, str], tuple[JobResult, int]] = {}
     for miner_hotkey, results in job_results.items():
         for result in results:
             vouch = last_scored_result_vouch_key(miner_hotkey, result.executor_info.uuid)
             if result.carried_for_renter_gpu_reset:
-                writes.set(vouch, str(job_block), ex=LAST_SCORED_RESULT_TTL_SECONDS)
+                if result.is_rented:
+                    writes.set(vouch, str(job_block), ex=LAST_SCORED_RESULT_TTL_SECONDS)
                 continue
             key = last_scored_result_key(miner_hotkey, result.executor_info.uuid)
-            # rented passes only, as on main: an idle cycle with no task time is withheld, never carried
             if result.is_rented and result.is_successful:
                 writes.set(key, result.model_dump_json(), ex=LAST_SCORED_RESULT_TTL_SECONDS)
                 writes.set(vouch, str(job_block), ex=LAST_SCORED_RESULT_TTL_SECONDS)
-            else:
-                writes.delete(key)
-                writes.delete(vouch)
+                continue
+            writes.delete(key)
+            writes.delete(vouch)
+            if result.is_successful:
+                idle_passes[(miner_hotkey, result.executor_info.uuid)] = (result, job_block)
+    _idle_passes.clear()
+    _idle_passes.update(idle_passes)
     try:
         await redis_service.write_atomically(writes)
     except Exception as exc:
