@@ -491,6 +491,32 @@ async def test_a_node_whose_mid_cycle_create_failed_still_keeps_its_score_of_the
 
 
 @pytest.mark.asyncio
+async def test_a_failed_create_on_a_node_idle_at_cycle_start_does_not_carry_the_rental_of_the_cycle_before():
+    # rented in the cycle before, idle at this cycle's start, a create stopped the run and then failed
+    service = _redis_service()
+    await remember_scored_results({"5Miner": [_rented_scored("node-1")]}, service)
+    held = _failed("node-1", TenantMsg.RENTED_SINCE_CYCLE_START.reason)
+
+    kept, withheld = await _carry_then_withhold(service, [held], rented_executor_ids=frozenset())
+
+    assert kept == {"5Miner": []}
+    assert [w.result.executor_info.uuid for w in withheld] == ["node-1"]
+
+
+@pytest.mark.asyncio
+async def test_a_create_that_succeeded_carries_the_rented_score_of_the_cycle_before():
+    service = _redis_service()
+    await remember_scored_results({"5Miner": [_rented_scored("node-1")]}, service)
+    held = _failed("node-1", TenantMsg.RENTED_SINCE_CYCLE_START.reason)
+
+    kept, withheld = await _carry_then_withhold(service, [held])
+
+    [carried] = kept["5Miner"]
+    assert carried.is_rented and carried.carried_for_renter_gpu_reset
+    assert withheld == []
+
+
+@pytest.mark.asyncio
 async def test_a_run_stopped_for_a_create_spends_the_kept_score_so_a_second_stopped_run_is_withheld():
     # the create failed or the pod was deleted: the next run stopped for a create has no earlier score to stand in
     service = _redis_service()

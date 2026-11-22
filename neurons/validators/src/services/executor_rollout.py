@@ -788,8 +788,9 @@ async def carry_renter_gpu_reset_results(
     The provider loses nothing: the carried result is scored as in the cycle it came from, with this cycle's
     pay flags and a fresh ban lookup. A node the backend no longer lists as rented (`rented_executor_ids`,
     lower-case), or without a readable last result, keeps the held one, and `withhold_renter_gpu_reset_verdicts`
-    takes it out. A run stopped for a renter's create (`RENTED_SINCE_CYCLE_START`) carries without the rented list:
-    the provider did not end it, so a create that then fails takes nothing from the cycle. That carry spends the
+    takes it out. A run stopped for a renter's create (`RENTED_SINCE_CYCLE_START`) carries an idle result without the
+    rented list: the provider did not end it, so a create that then fails takes nothing from the cycle. A rented
+    result it carries only for a node the rented list still holds, as the other holds do. That carry spends the
     kept result, so it stands in for one stopped run only.
     """
     for miner_hotkey, results in job_results.items():
@@ -798,13 +799,18 @@ async def carry_renter_gpu_reset_results(
                 continue
             # a run stopped for a renter's create carries whether or not the create then succeeds
             rented_mid_cycle = held.failure_reason_code == _RENTED_MID_CYCLE
-            if not rented_mid_cycle and str(held.executor_info.uuid).lower() not in rented_executor_ids:
+            listed_rented = str(held.executor_info.uuid).lower() in rented_executor_ids
+            if not rented_mid_cycle and not listed_rented:
                 continue
             previous = await _last_scored_result(redis_service, miner_hotkey, held)
             if previous is None:
                 continue
             # an idle score stands only for a node rented mid-cycle; the other holds keep carrying rented scores only
             if not previous.is_rented and not rented_mid_cycle:
+                continue
+            # a rented score stands only for a node the backend lists as rented: a create that failed on a node
+            # idle at cycle start must not carry the rental of the cycle before
+            if previous.is_rented and not listed_rented:
                 continue
             # a run stopped for a create spends the kept result: a later stopped run (the create failed or the pod
             # was deleted) is withheld instead of re-carrying the same score until the key expires
