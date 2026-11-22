@@ -279,7 +279,10 @@ def test_a_re_dispatch_after_the_upgrade_leaves_the_older_validators_live_runner
         legacy_runner.wait()
 
 
-@pytest.mark.parametrize("incumbent", ["launcher_before", "legacy_before", "launched_during_staging"])
+# legacy_lock_uncreatable: an older validator's run (no lock file) on a node whose disk cannot create one
+@pytest.mark.parametrize(
+    "incumbent", ["launcher_before", "legacy_before", "launched_during_staging", "legacy_lock_uncreatable"]
+)
 def test_a_repeat_dispatch_whose_staging_fails_never_fails_the_running_operation(node: Path, incumbent: str) -> None:
     import asyncio as aio
 
@@ -289,7 +292,9 @@ def test_a_repeat_dispatch_whose_staging_fails_never_fails_the_running_operation
 
     def start_incumbent() -> None:
         runners.append(_legacy_runner(files))
-        if incumbent != "legacy_before":   # this validator's launch: a launcher record, the PID as the runner
+        if incumbent == "legacy_lock_uncreatable":
+            Path(str(files.lock)).mkdir()   # opening it for writing fails, as on a full disk
+        elif incumbent != "legacy_before":   # this validator's launch: a launcher record, the PID as the runner
             Path(str(files.launcher)).write_text(Path(str(files.pid)).read_text())
 
     if incumbent != "launched_during_staging":

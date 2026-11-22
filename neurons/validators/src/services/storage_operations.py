@@ -334,26 +334,36 @@ def _incumbent_condition(files: StorageOperationFiles) -> str:
 
 
 async def _has_incumbent(ssh_client: asyncssh.SSHClientConnection, files: StorageOperationFiles) -> bool:
-    """The operation already has a result or a live run (see _incumbent_condition). Read under the operation's lock: a
-    launch holds it until its launcher is recorded, so a launch in its handoff is seen once it has one."""
-    q = shlex.quote(str(files.lock))
+    """The operation already has a result or a live run (see _incumbent_condition). Read under the operation's lock when
+    its file can be created (_lock_if_possible): a launch holds it until its launcher is recorded, so a launch in its
+    handoff is seen once it has one."""
     result = await ssh_client.run(
-        f"exec 9>>{q} && flock -x 9 || exit 1; if {_incumbent_condition(files)}; then echo YES; fi", check=False
+        f"{_lock_if_possible(files)}if {_incumbent_condition(files)}; then echo YES; fi", check=False
     )
     return result.exit_status == 0 and (result.stdout or "").strip() == "YES"
+
+
+def _lock_if_possible(files: StorageOperationFiles) -> str:
+    """Shell that takes the operation's lock and sets `locked`, or, when its file cannot be created (a full disk; an
+    older validator's run has none), goes on unlocked: a launch cannot take the lock either, and the PID and result
+    files an older validator's run left are read all the same."""
+    q = shlex.quote(str(files.lock))
+    # `exec` with a failed redirection would end the shell, so the file is opened by a plain command first
+    return f"locked=; if ( : >>{q} ) 2>/dev/null; then exec 9>>{q} && flock -x 9 || exit 1; locked=1; fi; "
 
 
 async def _settle_failed_dispatch(
     ssh_client: asyncssh.SSHClientConnection, files: StorageOperationFiles, retain_terminal_artifacts: bool
 ) -> bool:
-    """True when the operation has a result or a live run (see _incumbent_condition); else, under the same lock, it
+    """True when the operation has a result or a live run (see _incumbent_condition); else, holding the lock, it
     records this dispatch's failure as the operation's result, as a finished run would (an online run's done marker, a
     bootstrap run's non-zero status), so no dispatch launches it between this check and the FAILED report."""
     q = lambda path: shlex.quote(str(path))  # noqa: E731
     failed = f"printf '1\\n' > {q(files.status)}" if retain_terminal_artifacts else f": > {q(files.done)}"
     result = await ssh_client.run(
-        f"install -d -m 0700 {q(REMOTE_OPERATION_DIRECTORY)} && exec 9>>{q(files.lock)} && flock -x 9 || exit 1; "
-        f"if {_incumbent_condition(files)}; then echo YES; else {failed} || exit 1; fi",
+        f"install -d -m 0700 {q(REMOTE_OPERATION_DIRECTORY)} 2>/dev/null; {_lock_if_possible(files)}"
+        # unlocked, "no run" may change before the report: nothing is recorded, the failure is reported as before
+        f'if {_incumbent_condition(files)}; then echo YES; elif [ -n "$locked" ]; then {failed} || exit 1; fi',
         check=False,
     )
     return result.exit_status == 0 and (result.stdout or "").strip() == "YES"
