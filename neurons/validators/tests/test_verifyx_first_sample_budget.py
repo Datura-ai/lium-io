@@ -254,6 +254,24 @@ async def test_the_hosts_watchdog_fires_after_the_validators_own_cut(monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("left_s", [VERIFYX_COMMAND_TIMEOUT_SECONDS - 0.2, VERIFYX_COMMAND_TIMEOUT_SECONDS])
+async def test_a_budget_near_the_cap_never_arms_the_watchdog_past_the_cap(monkeypatch, left_s):
+    # review at d7b5daf: 599.8 s left armed TERM at 609 s, past the fixed command cap a cleanup that never reaches
+    # the host leaves to the watchdog; the grace after the validator's cut never lifts the watchdog over the cap
+    from neurons.validators.src.services import verifyx_validation_service as module
+
+    service = module.VerifyXValidationService.__new__(module.VerifyXValidationService)
+    commands = _preflight_passes(monkeypatch, service, module)
+
+    await service.validate_verifyx_and_process_job(
+        shell=None, executor_info=None, default_extra={}, machine_spec={}, run_dir=".verifyx-t",
+        deadline_monotonic=time.monotonic() + left_s,
+    )
+
+    assert commands == [f"timeout -k 10 {VERIFYX_COMMAND_TIMEOUT_SECONDS} run &"]
+
+
+@pytest.mark.asyncio
 async def test_a_deadline_past_the_cap_still_runs_the_remote_for_the_cap(monkeypatch):
     # a full budget now passes its deadline too; the 600 s remote cap still applies after the preflight
     from neurons.validators.src.services import verifyx_validation_service as module

@@ -509,12 +509,12 @@ class VerifyXValidationService:
                 left = int(deadline_monotonic - time.monotonic())
                 if left <= 0:
                     return None
-                if left < seconds:
-                    # The caller's own wait, on this clock, cuts the run at the deadline and kills it
-                    # (checks/verifyx.py `_verifyx_within`); the host's watchdog is only the backstop for a kill that
-                    # never lands, so it fires after that cut and the kill's own timeout. A run that returns before the
-                    # cut is judged as any run: the host's clock never decides a cut (review at ea74f37).
-                    seconds = left + VERIFYX_KILL_TIMEOUT_SECONDS
+                # The caller's own wait, on this clock, cuts the run at the deadline and kills it
+                # (checks/verifyx.py `_verifyx_within`); the host's watchdog is only the backstop for a kill that never
+                # lands, so it fires after that cut and the kill's own timeout. A run that returns before the cut is
+                # judged as any run: the host's clock never decides a cut (review at ea74f37). Never past the fixed
+                # command cap, which a budget near it would otherwise exceed by the kill's timeout.
+                seconds = min(seconds, left + VERIFYX_KILL_TIMEOUT_SECONDS)
             command = self._verifyx_command(
                 executor_info, challenge, lib_name, run_dir, deadline_monotonic is not None, seconds
             )
