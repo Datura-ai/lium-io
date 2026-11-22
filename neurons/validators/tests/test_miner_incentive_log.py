@@ -191,7 +191,8 @@ def _job(**overrides) -> JobResult:
             "fewer than its minimum rental",
         ),
         (
-            # DAH-5851: a deferred cycle's filler ports are not the node's free ports; no port change is asked for
+            # DAH-5851: a deferred cycle's filler ports are not the node's free ports; the pay after it is not promised,
+            # it follows the next completed check's ports (review 6011537848)
             lambda job: MinerLogLine.no_payout_because_port_limited_remainder(
                 job, PortLimitedRemainder(
                     available_port_count=2, required_port_count=3, free_split_count=3, paid_split_count=0,
@@ -199,7 +200,7 @@ def _job(**overrides) -> JobResult:
                 )
             ),
             "port_check_deferred_remainder",
-            "No port change is needed",
+            "depends on the free ports the next completed port check measures",
         ),
     ],
 )

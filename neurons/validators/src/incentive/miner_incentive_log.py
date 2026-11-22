@@ -538,8 +538,8 @@ class MinerLogLine(BaseModel):
                     "node: its port check was deferred because writes were still being flushed to the Docker "
                     "filesystem, and idle pay counts only ports measured in the same cycle "
                     f"({port_limited.available_port_count} this time). The free GPUs stay listed on the ports "
-                    "from the last completed check and the rented GPUs keep earning. No port change is needed: "
-                    "full idle pay resumes with the next completed port check."
+                    "from the last completed check and the rented GPUs keep earning. How many of the free GPUs "
+                    "earn after this depends on the free ports the next completed port check measures."
                 ),
                 extra_fields={
                     "gpu_count": unpaid,
