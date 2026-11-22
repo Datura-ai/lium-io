@@ -1537,3 +1537,30 @@ async def test_states_that_do_not_prove_a_death_are_never_punished(docker_status
 
     assert result.passed is True
     assert result.event.reason_code == Msg.FILLER_STATE_UNKNOWN.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason_code", ["skipped_rented", "rented_during_check"])
+async def test_a_rental_the_snapshot_missed_stops_the_pipeline_as_rented(reason_code):
+    """The backend answers success=True for a node it found rented after this cycle's snapshot: the node is scored as
+    rented and the pipeline halts, so no later check (LocalVerify, VerifyX) loads the renter's pod."""
+    backend_client = DummyBackendClient(
+        response=ExecutorHealthCheckResponse(success=True, error=None, reason_code=reason_code)
+    )
+    services = build_services(
+        backend=backend_client,
+        container_cleanup=ContainerCleanup(),
+        score_calculator=lambda ctx, rented: (1.5, 2.5, "") if rented else (0.0, 0.0, ""),
+    )
+    state = build_state(specs={"verified_ports": [8080]})
+
+    from tests.helpers import make_context
+    ctx = make_context(services=services, state=state)
+
+    with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
+        result = await RentalVerificationCheck().run(ctx)
+
+    assert result.passed is True and result.halt is True
+    assert result.event.reason_code == Msg.RENTED_SINCE_THE_SNAPSHOT.reason
+    assert result.updates["rented"] is True
+    assert (result.updates["score"], result.updates["job_score"]) == (1.5, 2.5)

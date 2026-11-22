@@ -55,6 +55,10 @@ _GPU_RUNTIME_QUARANTINE: dict[str, GpuRuntimeQuarantine] = {
     ),
 }
 
+# The backend's success=True answers for a node it found rented (its routes/validator.py HEALTH_CHECK_SKIPPED_RENTED,
+# HEALTH_CHECK_RENTED_DURING_CHECK)
+_RENTED_REASON_CODES = frozenset({"skipped_rented", "rented_during_check"})
+
 # The backend's health check may take 5 minutes. It waits no longer than the executor task has left, minus the
 # probe cleanup's time: a wait cut by the task cancel drops the node's whole cycle result (c8c6b803, 6 Nov).
 HEALTH_CHECK_TIMEOUT_SECONDS = 300
@@ -281,6 +285,10 @@ class RentalVerificationCheck:
                     updates={},
                 )
 
+            # a customer rental the cycle's snapshot did not see: stop as rented, before any further executor work
+            # (LocalVerify, VerifyX) loads the renter's pod
+            if response.success and response.reason_code in _RENTED_REASON_CODES:
+                return self._rented_since_the_snapshot(ctx, response)
             # Check if verification was successful
             if response.success:
                 event = render_message(
@@ -410,6 +418,34 @@ class RentalVerificationCheck:
                 )
             except TimeoutError:
                 pass  # best effort: the 15-min stale sweep removes a probe left behind
+
+    def _rented_since_the_snapshot(self, ctx: Context, response) -> CheckResult:
+        actual_score, job_score, warning_message = ctx.services.score_calculator(ctx, True)
+        event = render_message(
+            Msg.RENTED_SINCE_THE_SNAPSHOT,
+            ctx=ctx,
+            check_id=self.check_id,
+            what={
+                "executor_uuid": ctx.executor.uuid,
+                "reason_code": response.reason_code,
+                "actual_score": actual_score,
+                "job_score": job_score,
+            },
+        )
+        return CheckResult(
+            passed=True,
+            event=event,
+            updates={
+                "rented": True,
+                "score": actual_score,
+                "job_score": job_score,
+                "score_warning": warning_message or None,
+                "log_status": "info",
+                "log_text": event.event,
+                "success": True,
+            },
+            halt=True,
+        )
 
     def _cpu_quota_verdict(self, ctx: Context, response) -> CheckResult:
         """Render the CPU-quota verdict: the host's daemon refused `--cpus=<advertised>` at create.

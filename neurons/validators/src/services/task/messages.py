@@ -2504,6 +2504,16 @@ class RentalVerificationMessages:
         category="policy",
         impact="Proceed",
     )
+    # the backend found a customer rental on the node, started after this cycle's snapshot: the node is scored as
+    # rented and no further check puts load on it
+    RENTED_SINCE_THE_SNAPSHOT = MessageTemplate(
+        event="Node rented during this check",
+        reason="RENTAL_STARTED_DURING_CHECK",
+        severity="info",
+        category="policy",
+        impact="Validation stopped as rented; the next cycle checks the rental",
+        remediation="No action needed.",
+    )
     FAILED = MessageTemplate(
         event="Rental verification failed",
         reason="RENTAL_NOT_VERIFIED",
