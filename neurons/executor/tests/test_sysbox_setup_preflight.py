@@ -502,55 +502,6 @@ def test_a_commented_rule_does_not_count_and_the_install_adds_it(tmp_path, local
     assert rc == 0
     assert (active.count(APPARMOR_RULE), active.count(APPARMOR_UMOUNT_RULE)) == (1, 1)
 
-@pytest.mark.parametrize(
-    "deny",
-    ["deny umount /var/lib/sysboxfs/,", "  audit deny umount /var/lib/sysboxfs/**,", "deny " + APPARMOR_UMOUNT_RULE],
-    ids=["deny-dir", "audit-deny", "deny-of-our-rule"],
-)
-def test_a_deny_on_sysboxfs_is_a_fix_and_the_install_refuses_instead_of_reloading(tmp_path, deny):
-    # a deny wins over any allow: passing or appending our rule would leave the mounts broken
-    local = BOTH_RULES + deny + "\n"
-    files = {**APPARMOR_ON, "etc/apparmor.d/local/fusermount3": local}
-    rc, out, fixes = run_check(tmp_path, "check_fusermount3_sysboxfs_denies", files=files)
-    assert (rc, fixes) == (1, 1)
-    assert "remove those deny lines" in out
-    # reported once, by the blocking check; the stack check neither passes nor asks to add the rules
-    rc, out, fixes = run_check(tmp_path, "check_fusermount3_apparmor", files=files)
-    assert (rc, fixes) == (1, 0)
-    assert "PASS fusermount3" not in out
-
-    rc, _, _ = run_check(tmp_path, "allow_sysboxfs_in_fusermount3_apparmor", files=files)
-    assert rc == 1
-    assert not (tmp_path / "root/.stub-docker/apparmor").exists()
-    assert (tmp_path / "root/etc/apparmor.d/local/fusermount3").read_text() == local
-
-
-@pytest.mark.parametrize(
-    "rule, blocks",
-    [
-        ("deny umount /var/lib/sysboxfs/*/proc/**,", True),
-        ("audit deny umount,", True),
-        ("deny umount,", True),
-        ("deny mount,", True),
-        ("deny remount ,", True),
-        ("deny mount fstype=fuse -> /var/lib/sysboxfs/**,", True),
-        ("deny /var/lib/sysboxfs/** w,", True),
-        ("deny umount /var/lib/{docker,containerd}/**,", False),
-        ("deny mount -> /mnt/**,", False),
-        ("deny mount fstype=nfs,", False),
-        ("deny /etc/** w,", False),
-        ("deny umount @{HOME}/**,", False),
-        # shortcut in the installer: a wider glob is not matched (a full AppArmor glob match was disproportionate)
-        ("deny umount /var/lib/**,", False),
-    ],
-)
-def test_a_deny_naming_sysboxfs_or_every_mount_point_blocks(tmp_path, rule, blocks):
-    files = {**APPARMOR_ON, "etc/apparmor.d/local/fusermount3": BOTH_RULES + rule + "\n"}
-    rc, _, fixes = run_check(tmp_path, "check_fusermount3_sysboxfs_denies", files=files)
-    assert (rc, fixes) == ((1, 1) if blocks else (0, 0))
-    rc, out, _ = run_check(tmp_path, "check_fusermount3_apparmor", files=files)
-    assert ("PASS fusermount3" in out) is not blocks
-
 
 def test_install_gives_sysbox_services_time_to_start_and_a_restart(tmp_path):
     # sysbox-ce 0.7.1: 10 s (fs) / 45 s (mgr) start timeouts and no Restart=, so a slow boot left sysbox down
@@ -636,21 +587,6 @@ def test_install_mode_keeps_a_default_job_that_was_already_stopped(tmp_path):
     calls = (tmp_path / "root/.stub-docker/calls").read_text().splitlines()
     assert "stop filler_abc" in calls
     assert not [c for c in calls if c.startswith("rm")]
-
-
-def test_install_mode_refuses_a_sysboxfs_deny_before_stopping_any_workload(tmp_path):
-    # the deny can only be removed by the provider: stopping the executor and the Default Job first left both down
-    files = {**APPARMOR_ON, "etc/apparmor.d/local/fusermount3": BOTH_RULES + "deny umount /var/lib/sysboxfs/,\n"}
-    proc = run_script(
-        tmp_path,
-        files=files,
-        env={"STUB_SYSBOX_VERSION": "0.6.6", "STUB_RUNNING": "filler_abc\nexecutor-1", "STUB_ALL_CONTAINERS": "aaa filler_abc"},
-    )
-    assert proc.returncode == 1
-    assert "remove those deny lines" in proc.stdout
-    assert "Nothing was installed." in proc.stdout
-    calls = _docker_calls(tmp_path)
-    assert not [c for c in calls if c.startswith(("stop", "compose", "rm"))], calls
 
 
 def test_install_mode_loads_the_iptables_modules_itself(tmp_path):

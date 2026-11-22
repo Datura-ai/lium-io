@@ -789,30 +789,11 @@ fusermount3_missing_sysboxfs_rules() {
     done
 }
 
-# deny rules in the local profile that stop fusermount3 on sysbox-fs: a deny wins over any allow, so adding ours cannot
-# fix them. shortcut: only a deny naming /var/lib/sysboxfs or an unconditional mount/umount/remount deny is caught, not
-# one written as a wider glob (e.g. /var/**); a full AppArmor glob match was judged disproportionate (lium-io#2400).
-fusermount3_sysboxfs_denies() {
-    fusermount3_local_rules | grep -E '^(audit[[:space:]]+)?deny[[:space:]]' \
-        | grep -E '/var/lib/sysboxfs|^(audit[[:space:]]+)?deny[[:space:]]+(mount|umount|remount)[[:space:]]*,$'
-}
-
 fusermount3_needs_sysboxfs_rule() {
     fusermount3_profile_enforced && [ -n "$(fusermount3_missing_sysboxfs_rules)" ]
 }
 
-# blocking: the install would stop the executor and the Default Job, then fail on the deny before starting them again
-check_fusermount3_sysboxfs_denies() {
-    local denies
-    fusermount3_profile_enforced && denies=$(fusermount3_sysboxfs_denies) || return 0
-    pf_fix "$FUSERMOUNT3_LOCAL denies fusermount3 on /var/lib/sysboxfs; AppArmor applies a deny over any allow, so sysbox-fs mounts stay broken: $(echo $denies)" \
-        "remove those deny lines from $FUSERMOUNT3_LOCAL, then rerun $(self_cmd)"
-    return 1
-}
-
 check_fusermount3_apparmor() {
-    # a deny is reported by check_fusermount3_sysboxfs_denies; neither PASS nor "add the rules" is true then
-    fusermount3_profile_enforced && fusermount3_sysboxfs_denies > /dev/null && return 1
     if ! fusermount3_needs_sysboxfs_rule; then
         pf_pass "fusermount3 may mount and unmount sysbox-fs under /var/lib/sysboxfs (no enforced AppArmor profile, or both rules are in $FUSERMOUNT3_LOCAL)."
         return 0
@@ -838,12 +819,6 @@ install_sysbox_restart_dropins() {
 
 allow_sysboxfs_in_fusermount3_apparmor() {
     fusermount3_profile_enforced || return 0
-    local denies
-    # the provider's own deny: we do not remove a rule we did not write
-    if denies=$(fusermount3_sysboxfs_denies); then
-        fail "$FUSERMOUNT3_LOCAL denies fusermount3 on /var/lib/sysboxfs ($(echo $denies)); remove those deny lines and rerun."
-        return 1
-    fi
     if fusermount3_needs_sysboxfs_rule; then
         mkdir -p "$(dirname "$(host_path "$FUSERMOUNT3_LOCAL")")"
         { echo "# lium: sysbox-fs mounts its FUSE file systems under /var/lib/sysboxfs"; fusermount3_missing_sysboxfs_rules; } \
@@ -1337,13 +1312,11 @@ preflight_summary() {
 preflight_blocking() {
     # what sysbox itself needs before it can go on this host: x86_64 or aarch64 (the .debs), a kernel with
     # ID-mapped mounts (or the override), Docker installed and running (the runtime is registered in its
-    # daemon.json and it is restarted), and no AppArmor deny on sysbox-fs (only the provider can remove it). Returns 1
-    # when any of them is a FIX; install mode stops there, before it stops any workload.
+    # daemon.json and it is restarted). Returns 1 when any of them is a FIX; install mode stops there.
     local fixes_before=$PREFLIGHT_FIX
     check_arch || true
     check_kernel || true
     check_docker || true
-    check_fusermount3_sysboxfs_denies || true
     [ "$PREFLIGHT_FIX" -eq "$fixes_before" ]
 }
 
@@ -1387,7 +1360,7 @@ case "${1:-}" in
     -h|--help)
         echo "Usage: sudo bash nvidia_docker_sysbox_setup.sh [--check]"
         echo "  (no option)  preflight the host, then install sysbox + NVIDIA container toolkit, configure Docker, verify;"
-        echo "               a FIX on root, architecture, kernel, Docker or an AppArmor deny on sysbox-fs stops the install, any other FIX is printed and the install goes on;"
+        echo "               a FIX on root, architecture, kernel or Docker stops the install, any other FIX is printed and the install goes on;"
         echo "               then sets up the vloopback volume plugin and mounts a test volume into a sysbox container (exit 1 if it fails)"
         echo "  --check      preflight only: host requirements and what this script installs, PASS/FIX per line, exit 1 on any FIX"
         echo "Env: SYSBOX_SKIP_KERNEL_CHECK=1, EXECUTOR_PORT, SSH_PORT (see the header of this script)"
