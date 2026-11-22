@@ -79,12 +79,11 @@ def test_the_credentials_file_never_outlives_a_job_that_did_not_start(
     # start removes it with the staged directory
     import asyncio
 
-    secrets_dir = tmp_path / "secrets"
-    secrets_dir.mkdir()
     uploaded: list[str] = []
 
-    async def upload(ssh_client, auth_token, volume_info):
-        path = secrets_dir / "s.json"
+    async def upload(ssh_client, auth_token, volume_info, directory):
+        # into the job's own staged directory (the real upload_secrets_file's place)
+        path = Path(directory) / "secrets.json"
         path.write_text("{}")
         uploaded.append(str(path))
         return str(path)
@@ -105,6 +104,39 @@ def test_the_credentials_file_never_outlives_a_job_that_did_not_start(
             SimpleNamespace(run=run), "backup", ("job.py", "helper.py"), "token", None,
             lambda secrets_file: ["--secrets-file", secrets_file], log=str(tmp_path / "job.log"),
         ))
-    assert uploaded == ([] if fails == "staging" else [str(secrets_dir / "s.json")])
-    assert list(secrets_dir.iterdir()) == []
+    assert len(uploaded) == (0 if fails == "staging" else 1)
+    assert not any(Path(path).exists() for path in uploaded)
+    assert sorted(p.name for p in jobs.iterdir()) == ["helper.py"]
+
+
+def test_the_credentials_file_never_outlives_a_detached_job_whose_log_cannot_be_opened(
+    jobs: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the log is opened before detaching: a job that could not open it would never start the shell removing the directory
+    import asyncio
+
+    uploaded: list[str] = []
+
+    async def upload(ssh_client, auth_token, volume_info, directory):
+        path = Path(directory) / "secrets.json"
+        path.write_text("{}")
+        uploaded.append(str(path))
+        return str(path)
+
+    monkeypatch.setattr(storage_operations, "upload_secrets_file", upload)
+
+    async def run(command: str, check: bool = False, **_) -> SimpleNamespace:
+        done = _sh(command, jobs)
+        if check and done.returncode:
+            raise RuntimeError(f"exit {done.returncode}")
+        return SimpleNamespace(exit_status=done.returncode, stdout=done.stdout, stderr=done.stderr)
+
+    log = tmp_path / "job.log"
+    log.mkdir()
+    with pytest.raises(RuntimeError):
+        asyncio.run(storage_operations.run_job_with_secrets(
+            SimpleNamespace(run=run), "backup", ("job.py", "helper.py"), "token", None,
+            lambda secrets_file: ["--secrets-file", secrets_file], log=str(log),
+        ))
+    assert len(uploaded) == 1 and not Path(uploaded[0]).exists()
     assert sorted(p.name for p in jobs.iterdir()) == ["helper.py"]

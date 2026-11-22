@@ -296,14 +296,21 @@ class ValidationService:
 
         return max_dim_k
 
-    async def _kill_remote_matmul(self, ssh_client, run_tag: str, log_extra: dict) -> None:
+    async def _kill_remote_matmul(self, ssh_client, run_tag: str, log_extra: dict) -> bool:
+        """True when the cancellation is complete (kill_runs exited 0): no run of `run_tag` can still start or hold VRAM."""
         # best-effort kill of the leaked matmul process so it stops holding GPU memory; only this validation's
         # (its run tag) in the executor's mount namespace, never another validation's on the same host. The launcher's
         # process group goes too, so a run cancelled while its script is still being written never starts a matmul.
         try:
             # SIGKILL: a SIGTERM can be ignored/slow on a wedged process; -9 is strictly
             # more reliable outside pure D-state (where no signal lands anyway)
-            await ssh_client.run(executor_payload.kill_runs("matrix", executor_payload.MATRIX, run_tag), timeout=10)
+            result = await ssh_client.run(
+                executor_payload.kill_runs("matrix", executor_payload.MATRIX, run_tag), timeout=10, check=False
+            )
+            if result.exit_status == 0:
+                return True
+            logger.warning(_m(f"Remote matmul cancellation incomplete (exit {result.exit_status})", extra=get_extra_info(log_extra)))
+            return False
         except Exception as e:
             logger.warning(
                 _m(
@@ -311,6 +318,7 @@ class ValidationService:
                     extra=get_extra_info(log_extra),
                 )
             )
+            return False
 
     async def probe_all_claimed_cards(
         self, ssh_client, executor_info, default_extra: dict, machine_spec: dict
@@ -354,9 +362,14 @@ class ValidationService:
         timed_out = any(outcome["reason"] == "timeout" for outcome in per_card)
         # a slow run where every card answered right is retried the same way (DAH-6576)
         slow = elapsed > wall_clock_threshold and all(outcome["ok"] for outcome in per_card)
-        if (timed_out or slow) and all(outcome["reason"] != "wrong_answer" for outcome in per_card):
-            # the whole run again, together, so the retry is as concurrent as the first try
-            await self._kill_remote_matmul(ssh_client, run_tag, {**default_extra, "retry": "all_cards"})
+        # the whole run again, together, so the retry is as concurrent as the first try; only once the first run is
+        # fully cancelled: a retry beside one that may still hold VRAM would measure the node against our own leftover,
+        # so then the first run's result stands
+        if (
+            (timed_out or slow)
+            and all(outcome["reason"] != "wrong_answer" for outcome in per_card)
+            and await self._kill_remote_matmul(ssh_client, run_tag, {**default_extra, "retry": "all_cards"})
+        ):
             # a fresh tag: the kill left the first one's cancel marker, which stops any run started under it
             run_tag = executor_payload.new_run_tag()
             retry = await self._run_all_cards(

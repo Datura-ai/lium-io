@@ -78,3 +78,37 @@ def test_the_cycle_withholds_a_run_the_validator_redis_ended():
 
     assert standing == {"5Miner": [node_fault, scored]}
     assert [w.result for w in withheld] == [redis_fault]
+
+
+def test_the_cycle_withholds_a_run_whose_login_uid_could_not_be_read():
+    # the node gave no readable answer: no verdict either way, as for a run the validator's own Redis ended
+    unread = _failed("node-1", "LOGIN_USER_UNREAD")
+    node_fault = _failed("node-2", "GPU_LOST")
+
+    standing, withheld = withhold_renter_gpu_reset_verdicts({"5Miner": [unread, node_fault]})
+
+    assert standing == {"5Miner": [node_fault]}
+    assert [w.result for w in withheld] == [unread]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason, persisted", [("LOGIN_USER_UNREAD", False), ("GPU_LOST", True)])
+async def test_a_run_whose_login_uid_could_not_be_read_records_no_verification_outcome(context_factory, reason, persisted):
+    from datetime import UTC, datetime
+
+    from protocol.vc_protocol.validator_requests import ValidationEvent
+    from services.task.result_handler import ResultHandler
+
+    event = ValidationEvent(
+        event=reason, reason_code=reason, severity="warning", impact="x", check_id="login_user", what_we_saw={},
+        context={}, when=datetime(2026, 11, 22, tzinfo=UTC),
+    )
+
+    handler = ResultHandler(redis_service=MagicMock(), dry_run=False)
+    handler._persist_verification_data = AsyncMock()
+    ctx = context_factory()
+    await handler.handle_result(
+        context=ctx, miner_info=MagicMock(miner_hotkey="5Miner", job_batch_id="batch"), executor_info=ctx.executor,
+        verified_job_info={}, log_text="", success=False, validation_event=event,
+    )
+    assert handler._persist_verification_data.await_count == (1 if persisted else 0)

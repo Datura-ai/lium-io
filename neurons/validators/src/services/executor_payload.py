@@ -144,7 +144,14 @@ def run_job(staged: str, files: tuple[str, ...], args: list[str], log: str | Non
     worker = "trap 'rm -rf \"$D\"' EXIT; trap 'exit 1' HUP INT TERM; " + command
     if log is None:
         return f"D={shlex.quote(staged)}; {worker}"
-    return f"D={shlex.quote(staged)} nohup /bin/sh -c {shlex.quote(worker)} > {shlex.quote(log)} 2>&1 < /dev/null &"
+    log_q = shlex.quote(log)
+    # the log is opened before detaching: a detached job that could not open it would never start the shell that
+    # removes the directory (and the credentials in it), while this command still succeeded
+    return (
+        f"D={shlex.quote(staged)}; if ( : > {log_q} ) 2>/dev/null; then exec 8>>{log_q}; "
+        'else rm -rf "$D"; exit 1; fi; '
+        f'D="$D" nohup /bin/sh -c {shlex.quote(worker)} >&8 2>&8 < /dev/null 8>&- &'
+    )
 
 
 def label(files: tuple[str, ...], args: str) -> str:
@@ -173,18 +180,21 @@ def cancel_marker(purpose: str, tag: str) -> str:
 def kill_runs(purpose: str, files: tuple[str, ...], tag: str) -> str:
     """Shell that ends every run of `purpose` tagged `tag`: SIGKILL to the whole process group of each tagged launcher,
     so a script it is still installing or has not started yet never starts, then to any tagged entry script left, then
-    removes the tagged directories. Runs with other tags, and the shell running this, are not touched."""
+    removes the tagged directories. Runs with other tags, and the shell running this, are not touched. Exits 1 when the
+    marker could not be written (the kills still run): a launcher not up yet may then still start."""
     me = "$(ps -o pgid= -p $$ | tr -d ' ')"
     marker = shlex.quote(cancel_marker(purpose, tag))
     return (
         # the marker first: a launcher whose shell is not up yet (its exec still in flight) sees it and never starts;
         # one already up is in the process groups killed next. Markers of long-finished runs are swept.
         f"find {shlex.quote(SERVICE_DIR_PARENT)} -maxdepth 1 -name {shlex.quote(Path(cancel_marker(purpose, '*')).name)} "
-        f"-mmin +60 -delete 2>/dev/null; : > {marker}; "
+        # in a subshell: a marker dash cannot create would end this shell before the kills; the status is kept instead
+        f"-mmin +60 -delete 2>/dev/null; m=0; ( : > {marker} ) 2>/dev/null || m=1; "
         # no `--` before the group: dash's kill builtin takes it as a number and kills nothing
         f"for p in $(pgrep -f {SAME_MOUNT_NS} -- {shlex.quote(launcher_pattern(purpose, tag))}); do "
         "g=$(ps -o pgid= -p \"$p\" | tr -d ' '); "
         f'[ -n "$g" ] && [ "$g" != "{me}" ] && kill -9 "-$g" 2>/dev/null; done; '
         f"pkill -9 -f {SAME_MOUNT_NS} -- {shlex.quote(process_pattern(purpose, files, tag))}; "
-        f'rm -rf -- "{service_dir_glob(purpose)}"{tag}.*; true'
+        # without the marker a launcher not up yet may still start: the cancellation is incomplete (exit 1)
+        f'rm -rf -- "{service_dir_glob(purpose)}"{tag}.*; [ "$m" = 0 ]'
     )

@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import aiohttp
 import asyncssh
@@ -25,7 +25,6 @@ REMOTE_OPERATION_DIRECTORY = PurePosixPath("/root/app/storage-operations")
 # the executor image's own runner: its presence marks an image that supports storage operations. It is never run; the
 # validator runs its own copy (executor_payload.STORAGE)
 REMOTE_RUNNER_PATH = "/root/app/src/storage_runner.py"
-REMOTE_SECRETS_DIRECTORY = PurePosixPath("/root/app/storage-secrets")
 
 # DAH-6148: an operation runs restic in a `lium-storage-<operation id[:12]>` helper container on
 # the node, and reruns it under the same name when it renews credentials or retries an upload.
@@ -170,6 +169,12 @@ class StorageOperationLaunchError(RuntimeError):
     pass
 
 
+class StorageDispatchOutcomeUnknown(StorageOperationLaunchError):
+    """A dispatch failed and the node could not say whether another dispatch launched the operation, nor record this
+    failure under the operation's lock: nothing is reported, so a run that may be live is never failed; the backend's
+    next dispatch of the operation reconciles (it finds the run, its result or nothing to launch)."""
+
+
 @dataclass(frozen=True)
 class StorageOperationFiles:
     spec: PurePosixPath
@@ -268,7 +273,7 @@ async def start_storage_operation(
     files = StorageOperationFiles.for_operation(operation_id)
     try:
         # a repeat dispatch of a running or finished operation stages nothing: a staging failure must not fail it
-        if await _has_incumbent(ssh_client, files):
+        if await storage_operation_has_incumbent(ssh_client, operation_id, spec):
             return files
         engine = spec.get("engine")
         if not await supports_storage_operation(ssh_client, engine):
@@ -297,18 +302,72 @@ async def start_storage_operation(
             raise StorageOperationLaunchError(f"storage runner launch failed (exit {result.exit_status})")
         return files
     except Exception as error:
-        # another dispatch may have launched it meanwhile: its run, not this dispatch's failure, is the operation's
-        try:
-            if await _settle_failed_dispatch(ssh_client, files, retain_terminal_artifacts):
-                return files
-        except Exception:  # noqa: BLE001 - the node cannot say: the failure stands
-            pass
-        await report_launch_failure(operation_id, spec, error)
-        raise
+        await settle_dispatch_failure(
+            ssh_client, operation_id, spec, error, retain_terminal_artifacts=retain_terminal_artifacts
+        )
+        return files
+
+
+async def settle_dispatch_failure(
+    ssh_client: asyncssh.SSHClientConnection,
+    operation_id: UUID,
+    spec: Mapping[str, object],
+    error: Exception,
+    *,
+    retain_terminal_artifacts: bool,
+) -> None:
+    """Settles a dispatch that failed before its launch was acknowledged, in one of three ways. The operation has a
+    result or a live run (another dispatch launched it): returns, its run is the operation's. This dispatch's failure
+    was recorded on the node under the operation's lock (no later dispatch launches it): reports FAILED and raises
+    `error`. Neither could be established (the node could not be asked, or no lock): raises
+    StorageDispatchOutcomeUnknown and reports nothing. Only a recorded failure is ever reported."""
+    files = StorageOperationFiles.for_operation(operation_id)
+    message = _launch_failure_message(error)
+    try:
+        outcome = await _settle_failed_dispatch(ssh_client, files, retain_terminal_artifacts, message)
+    except Exception:  # noqa: BLE001 - the node could not be asked: unknown
+        outcome = _UNKNOWN
+    if outcome == _INCUMBENT:
+        await _redeliver_recorded_failure(ssh_client, files, operation_id, spec)
+        return
+    if outcome != _RECORDED:
+        raise StorageDispatchOutcomeUnknown(f"storage dispatch outcome unknown after: {message}") from error
+    # recorded with its reason (online runs): a report the backend did not take is sent again by the next dispatch
+    if await report_launch_failure(operation_id, spec, error) and not retain_terminal_artifacts:
+        await _acknowledge_recorded_failure(ssh_client, files)
+    raise error
+
+
+async def _redeliver_recorded_failure(
+    ssh_client: asyncssh.SSHClientConnection,
+    files: StorageOperationFiles,
+    operation_id: UUID,
+    spec: Mapping[str, object],
+) -> None:
+    """An online operation's done marker holding a reason is a recorded launch failure the backend has not taken yet:
+    it is reported again with this dispatch's reporter (the node keeps no credentials for it) and, once taken, the
+    marker is emptied (an ordinary finished run). Best effort: the marker keeps it for the next dispatch."""
+    try:
+        result = await ssh_client.run(f"cat {shlex.quote(str(files.done))} 2>/dev/null", check=False)
+        message = (result.stdout or "").strip() if isinstance(result.stdout, str) else ""
+        if message and await _report_operation_status(
+            operation_id, spec, status="FAILED", stage="LAUNCH", message=message
+        ):
+            await _acknowledge_recorded_failure(ssh_client, files)
+    except Exception:  # noqa: BLE001 - the marker stays for the next dispatch
+        logger.warning("A recorded storage launch failure could not be reported again", exc_info=True)
+
+
+async def _acknowledge_recorded_failure(ssh_client: asyncssh.SSHClientConnection, files: StorageOperationFiles) -> None:
+    await ssh_client.run(f": > {shlex.quote(str(files.done))}", check=False)
 
 
 _LAUNCHED = "LAUNCHED"
 _ALREADY_LAUNCHED = "ALREADY_LAUNCHED"
+# _settle_failed_dispatch's outcomes
+_INCUMBENT = "INCUMBENT"
+_RECORDED = "RECORDED"
+_UNKNOWN = "UNKNOWN"
 # an online run's done marker outlives the backend's re-dispatches of the operation: they stop once its terminal report
 # lands or its stale sweep fails it (15 min without a heartbeat). Swept only as housekeeping, a day after
 _FINISHED_MARKER_SWEEP_MINUTES = 24 * 60
@@ -319,23 +378,32 @@ def _incumbent_condition(files: StorageOperationFiles) -> str:
     validator's) or runner PID (an older validator's, which records no launcher) still running this operation's spec. A
     PID counts only while its process carries this operation's exact --spec path (a reused PID does not)."""
     q = lambda path: shlex.quote(str(path))  # noqa: E731
-    # argv is NUL-separated: as spaces, both the runner's own argv and the launcher's `sh -c` text carry it
-    spec_arg = shlex.quote(f"--spec {files.spec} ")
-
-    def live(path) -> str:
-        return (
-            f'{{ p=$(cat {q(path)} 2>/dev/null); case "$p" in (*[!0-9]*|"") false;; '
-            f"(*) kill -0 \"$p\" 2>/dev/null && tr '\\0' ' ' < /proc/\"$p\"/cmdline | grep -qF -- {spec_arg};; esac; }}"
-        )
-
+    live = lambda path: _live(path, files)  # noqa: E731
     # liveness first, then the status, then the done marker: the order the wrapper publishes them in reverse (status,
     # then done, then it exits), so a run that ends between two reads is still found by a later one
     return f"{{ {live(files.launcher)} || {live(files.pid)} || [ -s {q(files.status)} ] || [ -e {q(files.done)} ]; }}"
 
 
-async def storage_operation_has_incumbent(ssh_client: asyncssh.SSHClientConnection, operation_id: UUID) -> bool:
-    """The operation already has a result or a live run on the node (_has_incumbent): a repeat dispatch does nothing."""
-    return await _has_incumbent(ssh_client, StorageOperationFiles.for_operation(operation_id))
+def _live(path, files: StorageOperationFiles) -> str:
+    """Shell test, true while the PID in `path` runs this operation's exact --spec path (a reused PID does not)."""
+    # argv is NUL-separated: as spaces, both the runner's own argv and the launcher's `sh -c` text carry it
+    spec_arg = shlex.quote(f"--spec {files.spec} ")
+    return (
+        f'{{ p=$(cat {shlex.quote(str(path))} 2>/dev/null); case "$p" in (*[!0-9]*|"") false;; '
+        f"(*) kill -0 \"$p\" 2>/dev/null && tr '\\0' ' ' < /proc/\"$p\"/cmdline | grep -qF -- {spec_arg};; esac; }}"
+    )
+
+
+async def storage_operation_has_incumbent(
+    ssh_client: asyncssh.SSHClientConnection, operation_id: UUID, spec: Mapping[str, object]
+) -> bool:
+    """The operation already has a result or a live run on the node (_has_incumbent): a repeat dispatch does nothing,
+    except report again a recorded launch failure the backend has not taken (_redeliver_recorded_failure)."""
+    files = StorageOperationFiles.for_operation(operation_id)
+    if not await _has_incumbent(ssh_client, files):
+        return False
+    await _redeliver_recorded_failure(ssh_client, files, operation_id, spec)
+    return True
 
 
 async def _has_incumbent(ssh_client: asyncssh.SSHClientConnection, files: StorageOperationFiles) -> bool:
@@ -358,20 +426,26 @@ def _lock_if_possible(files: StorageOperationFiles) -> str:
 
 
 async def _settle_failed_dispatch(
-    ssh_client: asyncssh.SSHClientConnection, files: StorageOperationFiles, retain_terminal_artifacts: bool
-) -> bool:
-    """True when the operation has a result or a live run (see _incumbent_condition); else, holding the lock, it
-    records this dispatch's failure as the operation's result, as a finished run would (an online run's done marker, a
-    bootstrap run's non-zero status), so no dispatch launches it between this check and the FAILED report."""
+    ssh_client: asyncssh.SSHClientConnection, files: StorageOperationFiles, retain_terminal_artifacts: bool, message: str
+) -> str:
+    """_INCUMBENT when the operation has a result or a live run (see _incumbent_condition); _RECORDED when, holding the
+    lock, it recorded this dispatch's failure as the operation's result, as a finished run would (an online run's done
+    marker, holding `message` until the backend takes the report; a bootstrap run's non-zero status), so no dispatch
+    launches it after; _UNKNOWN when neither (no lock to hold, or the write or the read failed)."""
     q = lambda path: shlex.quote(str(path))  # noqa: E731
-    failed = f"printf '1\\n' > {q(files.status)}" if retain_terminal_artifacts else f": > {q(files.done)}"
+    # published whole (written aside, then renamed): a marker is either the full reason or absent
+    target, content = (files.status, "1") if retain_terminal_artifacts else (files.done, message[:2000])
+    tmp = q(f"{target}.tmp")
+    failed = f"{{ printf '%s\\n' {shlex.quote(content)} > {tmp} && mv {tmp} {q(target)} || {{ rm -f {tmp}; false; }}; }}"
     result = await ssh_client.run(
         f"install -d -m 0700 {q(REMOTE_OPERATION_DIRECTORY)} 2>/dev/null; {_lock_if_possible(files)}"
-        # unlocked, "no run" may change before the report: nothing is recorded, the failure is reported as before
-        f'if {_incumbent_condition(files)}; then echo YES; elif [ -n "$locked" ]; then {failed} || exit 1; fi',
+        f'if {_incumbent_condition(files)}; then echo {_INCUMBENT}; '
+        # unlocked, "no run" may change before a report: nothing is recorded and the outcome is unknown
+        f'elif [ -n "$locked" ] && {failed}; then echo {_RECORDED}; fi',
         check=False,
     )
-    return result.exit_status == 0 and (result.stdout or "").strip() == "YES"
+    outcome = (result.stdout or "").strip() if result.exit_status == 0 and isinstance(result.stdout, str) else ""
+    return outcome if outcome in (_INCUMBENT, _RECORDED) else _UNKNOWN
 
 
 def _launch_command(
@@ -403,27 +477,37 @@ def _launch_command(
     )
     # Bootstrap callers consume the terminal files; detached online jobs remove them themselves after the runner
     # has finished reporting.
+    status_tmp = q(f"{files.status}.tmp")
     wrapper = (
+        # the runner starts only once the launch recorded this shell as the operation's launcher and let go of the lock;
+        # a launch that could not record it leaves a wrapper that starts nothing
+        f'flock {q(files.lock)} true && [ "$(cat {q(files.launcher)} 2>/dev/null)" = "$$" ] || {{ rm -rf "$D"; exit 1; }}; '
         f"rm -f {q(files.status)} {q(files.cancel)}; "
         f"{runner} & child=$!; "
         f"printf '%s\\n' \"$child\" > {q(files.pid)}; "
         "trap 'kill -TERM \"$child\" 2>/dev/null || true' TERM INT; "
-        'wait "$child"; result=$?; rm -rf "$D"; '
-        f"printf '%s\\n' \"$result\" > {q(files.status)}; "
+        # the status first, published whole, and only then the staged tree: a waiter that finds the runner gone reads it
+        f'wait "$child"; result=$?; printf \'%s\\n\' "$result" > {status_tmp} && mv {status_tmp} {q(files.status)}; '
+        'rm -rf "$D"; '
         f"rm -f {q(files.spec)} {q(files.pid)} {q(files.cancel)}{terminal_cleanup}"
     )
     already = f'rm -rf -- {stage}; cat > /dev/null; echo {_ALREADY_LAUNCHED}; exit 0'
     return (
-        f"exec 9>>{q(files.lock)} && flock -x 9 || {{ rm -rf -- {stage}; exit 1; }}; "
-        f"find {q(REMOTE_OPERATION_DIRECTORY)} -maxdepth 1 \\( -name '*.done' -o -name '*.launcher' -o -name '*.lock' \\) "
+        # a lock file that cannot be created ends the shell through the `||`, not through a failed `exec`
+        f"( : >> {q(files.lock)} ) 2>/dev/null && exec 9>>{q(files.lock)} && flock -x 9 || {{ rm -rf -- {stage}; exit 1; }}; "
+        # lock files are never swept: one held or waited on for longer than the sweep's age would lose its exclusion
+        f"find {q(REMOTE_OPERATION_DIRECTORY)} -maxdepth 1 \\( -name '*.done' -o -name '*.launcher' \\) "
         f"-mmin +{_FINISHED_MARKER_SWEEP_MINUTES} -delete 2>/dev/null; "
         f"if {_incumbent_condition(files)}; then {already}; fi; "
         # no result and no live launcher: whatever an earlier run left is stale, its helper container included
         f"rm -f {q(files.status)} {q(files.log)} {q(files.pid)} {q(files.spec)} {q(files.cancel)} {q(files.launcher)}; "
         f"/usr/bin/docker rm -f -- {shlex.quote(storage_helper_name(operation_id))} >/dev/null 2>&1 || true; "
+        # the log is opened here, before the spec: a node that cannot create it gets no spec (no credentials left behind)
+        f"if ( : > {q(files.log)} ) 2>/dev/null; then exec 8>>{q(files.log)}; else rm -rf -- {stage}; exit 1; fi; "
         f"(umask 077 && cat > {q(files.spec)}) || {{ rm -rf -- {stage} {q(files.spec)}; exit 1; }}; "
-        f"D={stage} nohup /bin/sh -c {shlex.quote(wrapper)} > {q(files.log)} 2>&1 < /dev/null 9>&- & "
-        f"printf '%s\\n' \"$!\" > {q(files.launcher)}; echo {_LAUNCHED}"
+        f"D={stage} nohup /bin/sh -c {shlex.quote(wrapper)} >&8 2>&8 < /dev/null 8>&- 9>&- & "
+        # acknowledged only once the launcher is recorded; without the record its wrapper starts nothing, so the spec goes
+        f"printf '%s\\n' \"$!\" > {q(files.launcher)} || {{ rm -f {q(files.spec)}; exit 1; }}; echo {_LAUNCHED}"
     )
 
 
@@ -448,12 +532,13 @@ async def run_job_with_secrets(
     the node only once the job that reads and deletes them is in place. A failed start removes both."""
     staged = await ssh_client.run(executor_payload.stage_job(purpose, files), check=True)
     stage_dir = executor_payload.staged_directory(purpose, staged.stdout)
-    remove = [stage_dir]
     try:
-        remove.append(await upload_secrets_file(ssh_client, auth_token, volume_info))
-        await ssh_client.run(executor_payload.run_job(stage_dir, files, argv(remove[1]), log=log), check=True, **run_kwargs)
+        # inside the job's own private directory: whatever fails (the upload's close, the start, the job), removing that
+        # directory removes the credentials, and the job's shell removes it when it ends
+        secrets_file = await upload_secrets_file(ssh_client, auth_token, volume_info, stage_dir)
+        await ssh_client.run(executor_payload.run_job(stage_dir, files, argv(secrets_file), log=log), check=True, **run_kwargs)
     except Exception:
-        await ssh_client.run(f"rm -rf -- {shlex.join(remove)}", check=False)
+        await ssh_client.run(f"rm -rf -- {shlex.quote(stage_dir)}", check=False)
         raise
 
 
@@ -514,7 +599,11 @@ async def _operation_state(
         f"if test -s {status_path}; then printf 'STATUS:'; cat {status_path}; "
         f"elif test -s {pid_path}; then pid=$(cat {pid_path}); "
         "case \"$pid\" in (*[!0-9]*|'') echo INVALID;; "
-        '(*) if kill -0 "$pid" 2>/dev/null; then echo RUNNING; else echo EXITED; fi;; esac; '
+        '(*) if kill -0 "$pid" 2>/dev/null; then echo RUNNING; '
+        # the runner has exited but its wrapper may still be publishing the status: wait for it, then read it again
+        f"elif {_live(files.launcher, files)}; then echo RUNNING; "
+        f"elif test -s {status_path}; then printf 'STATUS:'; cat {status_path}; "
+        "else echo EXITED; fi;; esac; "
         "else echo STARTING; fi"
     )
     result = await ssh_client.run(command, check=False)
@@ -608,17 +697,17 @@ async def _remove_operation_artifacts(
     )
 
 
+def _launch_failure_message(error: Exception) -> str:
+    return f"Storage runner launch failed: {type(error).__name__}: {error}"[:2000]
+
+
 async def report_launch_failure(
     operation_id: UUID,
     spec: Mapping[str, object],
     error: Exception,
-) -> None:
-    await _report_operation_status(
-        operation_id,
-        spec,
-        status="FAILED",
-        stage="LAUNCH",
-        message=f"Storage runner launch failed: {type(error).__name__}: {error}",
+) -> bool:
+    return await _report_operation_status(
+        operation_id, spec, status="FAILED", stage="LAUNCH", message=_launch_failure_message(error)
     )
 
 
@@ -685,14 +774,16 @@ async def _report_operation_status(
     return False
 
 
-async def upload_secrets_file(ssh_client: asyncssh.SSHClientConnection, auth_token: str, volume_info) -> str:
-    """Hand the legacy tar backup/restore scripts their credentials as a fresh 0600 file.
+async def upload_secrets_file(
+    ssh_client: asyncssh.SSHClientConnection, auth_token: str, volume_info, directory: str
+) -> str:
+    """Hand the legacy tar backup/restore scripts their credentials as a fresh 0600 file in `directory`, the job's own
+    0700 staging directory (stage_job), so the file goes with it.
 
-    Keeps the values out of the remote command line. The file is
-    created exclusively with mode 0600 inside a 0700 directory; the script deletes it on read.
+    Keeps the values out of the remote command line. The file is created exclusively with mode 0600; the script deletes
+    it on read.
     """
-    path = str(REMOTE_SECRETS_DIRECTORY / f"{uuid4().hex}.json")
-    await ssh_client.run(f"install -d -m 0700 {shlex.quote(str(REMOTE_SECRETS_DIRECTORY))}", check=True)
+    path = f"{directory}/secrets.json"
     async with ssh_client.start_sftp_client() as sftp:
         async with sftp.open(path, "x", asyncssh.SFTPAttrs(permissions=0o600)) as remote_file:
             await remote_file.write(

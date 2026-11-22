@@ -97,7 +97,7 @@ from incentive.config import BASE_GPU_MAP
 from services.task_service import TaskService, JobResult
 from services.storage_operations import (
     cancel_storage_operation,
-    report_launch_failure,
+    settle_dispatch_failure,
     forget_storage_helper,
     note_started_storage_helper,
     start_storage_operation,
@@ -1700,25 +1700,12 @@ class MinerService:
         # DAH-2728: register the create BEFORE the miner handshake — a delete whose handshake is
         # quicker would otherwise reach the executor first and see a pod that does not exist yet.
         if not isinstance(payload, ContainerCreateRequest):
-            result = await self._route_container(payload)
-            await self._report_storage_dispatch_failure(payload, result)
-            return result
+            # a Restic backup/restore reports its own failure only once it is recorded on the node
+            # (storage_operations.settle_dispatch_failure); one that never reached the node reports nothing, since another
+            # dispatch may have launched the operation, and the backend's next dispatch reconciles
+            return await self._route_container(payload)
         with inflight_creates.track(payload.pod_id, executor_key(payload)), customer_creates.track(payload):
             return await self._route_container(payload)
-
-    async def _report_storage_dispatch_failure(self, payload: ContainerBaseRequest, result: object) -> None:
-        """A Restic backup/restore that fails before its runner starts (executor unreachable, old image)
-        reports nothing itself, so the backend waited 20 min and logged "stopped reporting progress".
-        Report the failure now. The backend ignores a second report on a log that is already terminal."""
-        if not isinstance(result, FailedContainerRequest) or getattr(payload, "backup_engine", None) != "restic":
-            return
-        if isinstance(payload, BackupContainerRequest):
-            operation_id, spec = payload.backup_log_id, self._restic_backup_operation_spec(payload)
-        elif isinstance(payload, RestoreContainerRequest) and not payload.recovery:
-            operation_id, spec = payload.restore_log_id, self._restic_restore_operation_spec(payload)
-        else:
-            return
-        await report_launch_failure(UUID(operation_id), spec, RuntimeError(result.msg))
 
     async def _route_container(self, payload: ContainerBaseRequest):
         """Route a container request over the miner's REST API."""
@@ -1775,23 +1762,28 @@ class MinerService:
 
             if payload.backup_engine == "restic":
                 operation_id = UUID(payload.backup_log_id)
+                spec = self._restic_backup_operation_spec(payload)
                 # a repeat dispatch of a running or finished backup: its run or result is the operation's, so nothing
                 # here (the probe, the remount, staging) may run or fail it; its helper stays recorded as Lium's
-                if await storage_operation_has_incumbent(ssh_client, operation_id):
+                if await storage_operation_has_incumbent(ssh_client, operation_id, spec):
                     await note_started_storage_helper(self.redis_service, executor_info.uuid, operation_id)
                     return
-                if payload.exclude_patterns and not await supports_workspace_field(
-                    ssh_client, executor_payload.EXECUTOR_PYTHON, "exclude_patterns"
-                ):
-                    error = RuntimeError(
-                        "executor image cannot skip caches and keys (no workspace.exclude_patterns); "
-                        "the provider must update the executor image"
-                    )
-                    # report the real reason first; the generic dispatch-failure report then finds the log terminal
-                    await report_launch_failure(operation_id, self._restic_backup_operation_spec(payload), error)
-                    raise error
-                if payload.volume_encrypted and payload.container_name:
-                    await _remount_dropped_gocryptfs(ssh_client, payload, docker_service)
+                try:
+                    if payload.exclude_patterns and not await supports_workspace_field(
+                        ssh_client, executor_payload.EXECUTOR_PYTHON, "exclude_patterns"
+                    ):
+                        raise RuntimeError(
+                            "executor image cannot skip caches and keys (no workspace.exclude_patterns); "
+                            "the provider must update the executor image"
+                        )
+                    if payload.volume_encrypted and payload.container_name:
+                        await _remount_dropped_gocryptfs(ssh_client, payload, docker_service)
+                except Exception as error:
+                    # another dispatch may have launched the backup since the check above: settled like a staging
+                    # failure (returns when that run is the operation's; else raises, reporting only a recorded failure)
+                    await settle_dispatch_failure(ssh_client, operation_id, spec, error, retain_terminal_artifacts=False)
+                    await note_started_storage_helper(self.redis_service, executor_info.uuid, operation_id)
+                    return
                 await note_started_storage_helper(
                     self.redis_service, executor_info.uuid, operation_id
                 )
@@ -1800,7 +1792,7 @@ class MinerService:
                         ssh_client,
                         executor_payload.EXECUTOR_PYTHON,
                         operation_id,
-                        self._restic_backup_operation_spec(payload),
+                        spec,
                         retain_terminal_artifacts=False,
                     )
                 except Exception:

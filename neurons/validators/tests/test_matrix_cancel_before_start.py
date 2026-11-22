@@ -90,3 +90,20 @@ def test_a_cancel_of_a_launcher_paused_before_its_install_kills_it_and_no_other(
     assert a.returncode == -signal.SIGKILL
     assert not (node / f"{mine}.started").exists()
     assert (node / f"{other}.started").read_text() == "started" and b.returncode == 0
+
+
+def test_a_cancel_that_cannot_leave_its_marker_still_kills_and_says_it_is_incomplete(node: Path) -> None:
+    # without the marker a launcher not up yet may still start: the kills run, and the cancel exits 1 so no retry follows
+    mine = executor_payload.new_run_tag()
+    # the marker cannot be written (its target's directory is missing), yet the launcher's check finds no marker
+    Path(executor_payload.cancel_marker("matrix", mine)).symlink_to(node / "missing" / "marker")
+    a = _launch(node, mine)
+    try:
+        time.sleep(0.5)
+        done = subprocess.run(["sh", "-c", executor_payload.kill_runs("matrix", executor_payload.MATRIX, mine)])
+        a.wait(timeout=5)
+    finally:
+        if a.poll() is None:
+            a.kill()
+    assert done.returncode == 1
+    assert a.returncode != 0 and not (node / f"{mine}.started").exists()

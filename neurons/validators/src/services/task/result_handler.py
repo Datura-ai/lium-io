@@ -18,6 +18,7 @@ from services.gpu_spec_table import (
     reference_gpu_model,
 )
 from services.redis_service import GPU_ANCHOR_KEY, INSPECTOR_EVENT_CHANNEL, RedisService
+from services.task.messages import LoginUserMessages
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -124,8 +125,10 @@ class ResultHandler:
         log_status = "info" if success else "warning"
         logger.info(log_text)
 
-        # Persist verification data to Redis (unless in DRY_RUN mode)
-        if not self.dry_run:
+        # Persist verification data to Redis (unless in DRY_RUN mode). A run whose login uid could not be read stopped
+        # before any check: no verdict, so no failure is counted against the node
+        unread = validation_event is not None and validation_event.reason_code == LoginUserMessages.UNREAD.reason
+        if not self.dry_run and not unread:
             await self._persist_verification_data(
                 miner_hotkey=miner_info.miner_hotkey,
                 executor_id=executor_info.uuid,

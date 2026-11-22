@@ -520,3 +520,37 @@ async def test_restic_backup_remounts_a_dropped_gocryptfs_mount_without_init(mon
     assert (kwargs["container_name"], kwargs["plaintext_path"], kwargs["volume_name"], kwargs["pod_id"]) == (
         "container_pod", "/root", "source-volume", "pod",
     )
+
+
+@pytest.mark.asyncio
+async def test_a_probe_failure_after_another_dispatch_launched_the_backup_leaves_that_run_alone(monkeypatch):
+    # the probe fails, but meanwhile another dispatch launched the backup: the locked settlement finds that run and this
+    # dispatch neither fails the operation nor starts it again
+    from services import storage_operations
+
+    ssh_client = AsyncMock()
+    monkeypatch.setattr(miner_service_module.asyncssh, "connect", Mock(return_value=_FakeSshContext(ssh_client)))
+    monkeypatch.setattr(miner_service_module, "storage_operation_has_incumbent", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        miner_service_module, "supports_workspace_field", AsyncMock(side_effect=RuntimeError("probe could not run"))
+    )
+    monkeypatch.setattr(storage_operations, "_settle_failed_dispatch", AsyncMock(return_value="INCUMBENT"))
+    monkeypatch.setattr(storage_operations, "_redeliver_recorded_failure", AsyncMock())
+    reported = AsyncMock()
+    monkeypatch.setattr(storage_operations, "report_launch_failure", reported)
+    start = AsyncMock()
+    monkeypatch.setattr(miner_service_module, "start_storage_operation", start)
+    noted = AsyncMock()
+    monkeypatch.setattr(miner_service_module, "note_started_storage_helper", noted)
+    payload = _backup_payload()
+    payload.backup_engine = "restic"
+    payload.backup_log_id = "11111111-1111-4111-8111-111111111111"
+    payload.exclude_patterns = [".ssh"]
+    service = MinerService.__new__(MinerService)
+    service.redis_service = AsyncMock()
+
+    await service.handle_backup_container_req(_executor_info(), payload, Mock(), _docker_service_with_pinned_hosts())
+
+    start.assert_not_awaited()
+    reported.assert_not_awaited()
+    noted.assert_awaited_once()

@@ -322,8 +322,9 @@ async def test_a_run_is_written_under_its_tag_and_the_kill_takes_only_that_tag(n
     assert f".lium-validator-matrix.{tag}.XXXXXXXX" in command
     ssh = SimpleNamespace(commands=[])
 
-    async def run(cmd, timeout=None):
+    async def run(cmd, timeout=None, check=True):
         ssh.commands.append(cmd)
+        return SimpleNamespace(exit_status=0)
 
     ssh.run = run
     await ValidationService._kill_remote_matmul(None, ssh, tag, {})
