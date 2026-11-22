@@ -64,6 +64,10 @@ DIND_PREFIXES = (ATTEMPT_DIND_PREFIX, BUILD_DIND_PREFIX)
 # lists them with the DinD, so the pod id is read after the suffix is stripped:
 # a helper of an active build belongs to that build and is not an orphan.
 BUILD_DIND_HELPER_SUFFIXES = ("-fw-apply", "-fw-remove")
+# The node's build listing covers every pod on it, the local keep set only this registration's: a candidate goes
+# only once the backend confirms its rental over. Bounded so a slow backend never stalls the pipeline.
+MAX_RENTAL_LOOKUPS = 20
+RENTAL_LOOKUP_TIMEOUT_SECONDS = 15
 
 
 def dind_container_pod_id(name: str) -> str | None:
@@ -215,6 +219,28 @@ class CustomBuildOrphanSweepCheck:
             orphans.append(name)
         return orphans
 
+    @staticmethod
+    async def _pods_confirmed_over(ctx: Context, pod_ids: set[str]) -> set[str]:
+        """The ``pod_ids`` the backend says have no live rental. A failed, timed-out or capped lookup keeps the pod:
+        a removal cannot be undone."""
+        over: set[str] = set()
+
+        async def ask(pod_id: str) -> None:
+            try:
+                answer = await ctx.services.backend.get_pod_rental_active(pod_id)
+            except Exception as exc:  # noqa: BLE001 — unknown: keep
+                logger.warning("Custom build orphan sweep: rental lookup failed (%s): %s", pod_id, exc)
+                return
+            if answer is not None and not answer.active:
+                over.add(pod_id)
+
+        try:
+            async with asyncio.timeout(RENTAL_LOOKUP_TIMEOUT_SECONDS):
+                await asyncio.gather(*(ask(p) for p in sorted(pod_ids)[:MAX_RENTAL_LOOKUPS]))
+        except TimeoutError:
+            logger.warning("Custom build orphan sweep: rental lookups timed out; unanswered pods kept")
+        return over
+
     async def _remove_dind_container(self, ssh, name: str) -> bool:
         # Defensive — only act on names matching our prefix.
         if _after_prefix(name, DIND_PREFIXES) is None:
@@ -312,6 +338,16 @@ class CustomBuildOrphanSweepCheck:
                 },
             )
             return CheckResult(passed=True, event=event)
+
+        pod_of = {
+            **{ref: _pod_id_of(_after_prefix(ref.split(":", 1)[0], IMAGE_PREFIXES) or "") for ref in orphan_images},
+            **{path: _pod_id_of(_after_prefix(path, SCRATCH_PREFIXES) or "") for path in orphan_scratch},
+            **{name: dind_container_pod_id(name) for name in orphan_dind},
+        }
+        over = await self._pods_confirmed_over(ctx, {p for p in pod_of.values() if p})
+        orphan_images, orphan_scratch, orphan_dind = (
+            [item for item in items if pod_of[item] in over] for items in (orphan_images, orphan_scratch, orphan_dind)
+        )
 
         removed_images = 0
         removed_scratch = 0

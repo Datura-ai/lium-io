@@ -16,6 +16,7 @@ from fakeredis.aioredis import FakeRedis
 from neurons.validators.src.services.task.checks.custom_build_orphan_sweep import (
     CustomBuildOrphanSweepCheck,
 )
+from protocol.vc_protocol.compute_requests import PodRentalActiveResponse
 from services.redis_service import PENDING_PODS_PREFIX, RedisService
 
 from tests.helpers import build_services
@@ -24,12 +25,12 @@ INFLIGHT = "lium-dind-build-pod-inflight"
 ORPHAN = "lium-dind-build-pod-gone"
 
 
-def _ssh():
+def _ssh(*extra_dind: str):
     calls: list[str] = []
 
     async def run(cmd, *args, **kwargs):
         calls.append(cmd)
-        stdout = f"{INFLIGHT}\n{ORPHAN}\n" if "docker ps -a" in cmd else ""
+        stdout = "".join(f"{n}\n" for n in (INFLIGHT, ORPHAN, *extra_dind)) if "docker ps -a" in cmd else ""
         return SimpleNamespace(exit_status=0, stdout=stdout, stderr="")
 
     return SimpleNamespace(run=run, calls=calls)
@@ -41,18 +42,33 @@ def _removed(ssh) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_a_pending_pods_build_dind_is_not_removed(context_factory):
-    redis = AsyncMock()
-    redis.get_pending_pods.return_value = [{"time": 0, "pod_id": "pod-inflight"}]
-    ssh = _ssh()
+    redis = RedisService.__new__(RedisService)
+    redis.redis = FakeRedis(server=FakeServer())
+    redis._remove_unacked_container_created_unless = AsyncMock()
+    # another registration on the same node is creating a pod: only the backend knows that pod
+    live_build_name = "lium-poddind-pod-other-registration.deadbeef"
+    unreadable_build_name = "lium-poddind-pod-unreadable.deadbeef"
+    await redis.add_pending_pod("miner-b", "exec-b", "pod-other-registration")
+    ssh = _ssh(live_build_name, unreadable_build_name)
     ctx = context_factory(ssh=ssh, services=build_services(redis=redis))
+    await redis.add_pending_pod(ctx.miner_hotkey, ctx.executor.uuid, "pod-inflight")
+    redis.get_pending_pods = AsyncMock(wraps=redis.get_pending_pods)
+
+    async def rental_active(pod_id):
+        if pod_id == "pod-unreadable":
+            raise TimeoutError
+        return PodRentalActiveResponse(active=pod_id == "pod-other-registration")
+
+    ctx.services.backend.get_pod_rental_active.side_effect = rental_active
 
     result = await CustomBuildOrphanSweepCheck().run(ctx)
 
     assert result.passed is True
-    assert _removed(ssh) == [ORPHAN]
-    redis.get_pending_pods.assert_awaited_once_with(
-        ctx.miner_hotkey, ctx.executor.uuid, max_age_seconds=None
-    )
+    removed_dind_names = _removed(ssh)
+    assert removed_dind_names == [ORPHAN]
+    assert await redis.get_pending_pods("miner-b", "exec-b")
+    assert live_build_name not in removed_dind_names
+    redis.get_pending_pods.assert_any_await(ctx.miner_hotkey, ctx.executor.uuid, max_age_seconds=None)
 
 
 @pytest.mark.asyncio
