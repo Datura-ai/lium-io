@@ -1196,7 +1196,9 @@ class RedisService:
                     if command_id not in (e[0] for e in order):
                         order = sorted([*order, [command_id, accepted_ns]], key=lambda e: e[1])
                     pipe.multi()
-                    pipe.set(key, json.dumps(order[-CREATE_DISPATCH_ORDER_KEPT:]), ex=CREATE_DISPATCH_ORDER_TTL_SECONDS)
+                    # no expiry while a create of the pod is unsettled: its durable record outlives any fixed TTL, and
+                    # without the order the restart replay cannot tell which success is current (_expire_dispatch_order)
+                    pipe.set(key, json.dumps(order[-CREATE_DISPATCH_ORDER_KEPT:]))
                     await pipe.execute()
                     return
                 except redis.exceptions.WatchError:
@@ -1267,12 +1269,28 @@ class RedisService:
         for command_id in await self.redis.smembers(index):
             await self.redis.expire(f"{BACKEND_COMMAND_PREFIX}{_text(command_id)}", ttl)
         await self.redis.delete(index)
+        await self._expire_dispatch_order_once_settled(pod_id)
 
     async def index_backend_create(self, pod_id: str, executor_id: str, command_id: str) -> None:
         await self.redis.sadd(f"{BACKEND_CREATES_OF_POD_PREFIX}{pod_id}|{executor_id}", command_id)
 
     async def unindex_backend_create(self, pod_id: str, executor_id: str, command_id: str) -> None:
         await self.redis.srem(f"{BACKEND_CREATES_OF_POD_PREFIX}{pod_id}|{executor_id}", command_id)
+        await self._expire_dispatch_order_once_settled(pod_id)
+
+    async def _expire_dispatch_order_once_settled(self, pod_id: str) -> None:
+        """The pod's dispatch order gets its expiry only once no create of the pod, on any node, is unsettled (a running
+        claim or a finished record with no expiry). Its current dispatch counts until its claim exists (accepted, not yet
+        indexed). A dispatch accepted after this check rewrites the order without an expiry."""
+        order_key = f"{CREATE_DISPATCH_ORDER_PREFIX}{pod_id}"
+        current = _current_dispatch(_dispatch_order(await self.redis.get(order_key)))
+        if current and not await self.redis.exists(f"{BACKEND_COMMAND_PREFIX}{current}"):
+            return
+        async for index in self.redis.scan_iter(match=f"{BACKEND_CREATES_OF_POD_PREFIX}{pod_id}|*", count=100):
+            for command_id in await self.redis.smembers(index):
+                if await self.redis.ttl(f"{BACKEND_COMMAND_PREFIX}{_text(command_id)}") == -1:
+                    return
+        await self.redis.expire(order_key, CREATE_DISPATCH_ORDER_TTL_SECONDS)
 
     async def pods_of_backend_creates(self, command_ids: list[str]) -> "set[str]":   # quoted: the class has a set method
         """pod IDs of the creates among `command_ids`, read from the create index (written before each create record)"""

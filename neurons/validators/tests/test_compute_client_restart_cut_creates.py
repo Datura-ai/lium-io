@@ -1690,6 +1690,64 @@ async def test_a_finished_success_whose_saved_report_was_lost_is_replayed_before
 
 
 @pytest.mark.asyncio
+async def test_the_pods_current_dispatch_outlives_a_day_while_any_of_its_creates_is_unsettled() -> None:
+    """An older success A stays unacknowledged; a later custom-build create B succeeds and its saved report is lost.
+    Past the order's old 24 h expiry, recovery still replays B, never A; the order expires only once both are
+    settled. Before, the order key expired after 24 h and the replay picked whichever success the scan yielded last."""
+    redis_service = _redis_service()
+    client = _client(redis_service)
+    client.lock = asyncio.Lock()
+    successes = {
+        cmd: ContainerCreated(
+            miner_hotkey="miner-hk", executor_id="exec-1", pod_id="pod-1", container_name=f"c-{cmd}",
+            volume_name="v-1", port_maps=[(22, 40022)], command_id=cmd,
+        )
+        for cmd in ("cmd-a", "cmd-b")
+    }
+    for accepted_ns, cmd in enumerate(successes, 1):
+        await redis_service.accept_create_dispatch("pod-1", cmd, accepted_ns)
+        await redis_service.index_backend_create("pod-1", "exec-1", cmd)
+        await _finished_create_record(redis_service, cmd, successes[cmd])
+    order_key = redis_service_module.CREATE_DISPATCH_ORDER_PREFIX + "pod-1"
+
+    assert await redis_service.redis.ttl(order_key) == -1   # nothing a day can expire
+    await client.fail_creates_cut_off_by_restart()
+    ws = AsyncMock()
+    awaiting = await client.resend_unacked_container_created(ws)
+
+    assert awaiting == {"pod-1": "cmd-b"}
+    assert [ContainerCreated.model_validate_json(c.args[0]) for c in ws.send.await_args_list] == [successes["cmd-b"]]
+
+    # B's receipt settles B; A is still unsettled, so the order keeps no expiry
+    await redis_service.settle_backend_command("cmd-b", 900)
+    await redis_service.unindex_backend_create("pod-1", "exec-1", "cmd-b")
+    assert await redis_service.redis.ttl(order_key) == -1
+    # a delete of the pod settles A too: the order now expires
+    await redis_service.settle_backend_creates_of_pod("pod-1", "exec-1", 900)
+    assert 0 < await redis_service.redis.ttl(order_key) <= redis_service_module.CREATE_DISPATCH_ORDER_TTL_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_an_accepted_dispatch_not_yet_claimed_keeps_the_order_from_expiring() -> None:
+    """A receipt for an older create lands between a new dispatch's acceptance and its claim: the new dispatch is
+    current but not yet indexed, so the order must not get an expiry."""
+    redis_service = _redis_service()
+    await redis_service.accept_create_dispatch("pod-1", "cmd-a", 1)
+    await redis_service.index_backend_create("pod-1", "exec-1", "cmd-a")
+    created = ContainerCreated(
+        miner_hotkey="miner-hk", executor_id="exec-1", pod_id="pod-1", container_name="c-a",
+        volume_name="v-1", port_maps=[(22, 40022)], command_id="cmd-a",
+    )
+    await _finished_create_record(redis_service, "cmd-a", created)
+    await redis_service.accept_create_dispatch("pod-1", "cmd-b", 2)
+
+    await redis_service.settle_backend_command("cmd-a", 900)
+    await redis_service.unindex_backend_create("pod-1", "exec-1", "cmd-a")
+
+    assert await redis_service.redis.ttl(redis_service_module.CREATE_DISPATCH_ORDER_PREFIX + "pod-1") == -1
+
+
+@pytest.mark.asyncio
 async def test_a_create_left_unanswered_by_the_node_queues_nothing() -> None:
     """create_container returns None when this command's container is on the node without a readable reply."""
     redis_service = _redis_service()
