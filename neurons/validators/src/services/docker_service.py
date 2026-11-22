@@ -15301,10 +15301,11 @@ class DockerService:
             return self._failed_delete(payload, msg=f"Invalid delete: {exc}")
 
         pkey = asyncssh.import_private_key(self.ssh_service.decrypt_payload(keypair.ss58_address, private_key))
-        # one deadline, the backend's too (it holds the replacement's name-held failure that long): the waits for the
-        # pod's creates end early enough to leave the connection and the host command their own bounds
+        # one deadline, the backend's too (it holds the replacement's name-held failure that long), counted from the
+        # request's arrival, not from here: the miner handshake already spent part of it. The waits for the pod's creates
+        # end early enough to leave the connection and the host command their own bounds
         loop = asyncio.get_running_loop()
-        answer_by = loop.time() + NODE_LEFT_DELETE_ANSWER_SECONDS
+        answer_by = loop.time() + NODE_LEFT_DELETE_ANSWER_SECONDS - (time.monotonic() - payload._received_at)
         creates_by = answer_by - _PARK_COMMAND_TIMEOUT_SECONDS - _OWN_SSH_CONNECTION_MARGIN_SEC
         try:
             async with asyncio.timeout_at(answer_by):

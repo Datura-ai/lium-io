@@ -312,6 +312,23 @@ async def test_the_delete_is_answered_within_the_deadline_the_backend_holds_for(
     assert len(host_commands) == (1 if create_runs < _ANSWER_BY - _RESERVED else 0)
 
 
+@pytest.mark.asyncio
+async def test_the_answer_deadline_counts_from_the_requests_arrival_not_from_the_delete(docker_service, monkeypatch):
+    # review on lium-io#2394 (F-57): the backend counts its hold from the send, so a slow miner handshake before the
+    # delete starts must come out of the validator's deadline too, or the answer lands after the backend gave up
+    _shrink_the_answer_deadline(monkeypatch)
+    _wire_delete(docker_service, monkeypatch, _host_exits(0))
+    payload = _payload()
+    received = asyncio.get_running_loop().time()
+    await asyncio.sleep(_ANSWER_BY / 2)  # the miner handshake
+
+    with inflight_creates.track(payload.pod_id, ("miner-b", "replacement-executor")):
+        result = await asyncio.wait_for(_delete(docker_service, payload), 5)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert asyncio.get_running_loop().time() - received < _ANSWER_BY + 0.1
+
+
 def test_the_answer_deadline_is_the_protocols():
     import sys
 

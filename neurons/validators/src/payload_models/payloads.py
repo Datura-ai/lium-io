@@ -1,12 +1,20 @@
 import enum
 import posixpath
 import re
+import time
 from datetime import datetime
 from typing import Literal
 
 from datura.requests.base import BaseRequest
 from datura.requests.miner_requests import PodLog
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_serializer
+from pydantic import (
+    BaseModel,
+    Field,
+    PrivateAttr,
+    ValidationError,
+    field_validator,
+    model_serializer,
+)
 
 # absolute, no `.`/`..` segment, no shell metacharacter; `/lium-cipher` (the encrypted volume's ciphertext mount) and
 # `/mnt` (where an attached Volume mounts) are reserved
@@ -527,6 +535,9 @@ class ContainerDeleteOnNodeLeftRequest(ContainerDeleteRequest):
 
     message_type: ContainerRequestType = ContainerRequestType.ContainerDeleteOnNodeLeftRequest
     expected_boot_id: str
+    # time.monotonic() when the message was parsed off the backend socket: the answer deadline counts from here, so
+    # the miner handshake before the delete runs inside it instead of before it
+    _received_at: float = PrivateAttr(default_factory=time.monotonic)
 
 
 class GetPodLogsRequestFromServer(ContainerBaseRequest):

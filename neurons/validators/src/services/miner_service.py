@@ -2792,8 +2792,8 @@ class MinerService:
                             executor_key(payload),
                             self._log_ssh_key_removal_after_reply(remove_ssh_key, default_extra),
                         )
-                    elif stop_retry is not None:
-                        # the reply does not wait out the retry's backoff
+                    elif stop_retry is not None or isinstance(payload, ContainerDeleteOnNodeLeftRequest):
+                        # the reply does not wait out the retry's backoff, nor a node-left delete's answer deadline
                         removal = asyncio.create_task(self._log_ssh_key_removal_after_reply(remove_ssh_key, default_extra))
                         _KEY_REMOVALS_AFTER_STOP_RETRY.add(removal)
                         removal.add_done_callback(_KEY_REMOVALS_AFTER_STOP_RETRY.discard)
