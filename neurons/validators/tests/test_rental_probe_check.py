@@ -1997,6 +1997,24 @@ def test_gpu_count_step_lets_the_device_nodes_decide_on_mig_cards():
     assert outcome.failed_step == STEP_GPU_COUNT
 
 
+def test_gpu_count_without_a_cuda_reading_is_decided_by_the_device_nodes():
+    """An image without python3 or libcuda.so.1 prints nothing under the CUDA mark: no CUDA reading is
+    no pass by itself; the device nodes of the listed cards still decide."""
+    eight = tuple((f"GPU-{i}", i) for i in range(8))
+    listing = "".join(f"GPU {i}: NVIDIA H100 (UUID: GPU-{i})\n" for i in range(8))
+    one_node = module._usable_gpus(
+        gpu_list_output(listing, nodes=(0,), minors=eight, cuda="", mig=("Disabled",) * 8)
+    )
+    assert one_node.cuda_count is None and one_node.cuda_error is None
+    assert one_node.short_of(8) == "1 usable GPU device node(s) (/dev/nvidiaN)"
+    all_nodes = module._usable_gpus(
+        gpu_list_output(listing, nodes=tuple(range(8)), minors=eight, cuda="", mig=("Disabled",) * 8)
+    )
+    assert all_nodes.short_of(8) is None
+    assert _gpu_step(gpu_list_output(nodes=(0,), cuda="")).failed_step == STEP_GPU_COUNT
+    assert _gpu_step(gpu_list_output(cuda="")).failed_step is None
+
+
 def test_gpu_count_reads_cuda_with_the_image_cuda_visible_devices_unset():
     """An image default CUDA_VISIBLE_DEVICES=0 narrows nothing a renter cannot undo; the count must not
     read it as a missing card."""

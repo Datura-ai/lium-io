@@ -1644,6 +1644,7 @@ def _usable_gpus(output: str) -> _UsableGpus:
     if re.search(r"^\s*Enabled\s*$", mig_text, re.MULTILINE):
         # CUDA enumerates MIG instances, not cards, so its count says nothing per card; the device nodes decide
         return _UsableGpus(usable, None, None)
+    # empty (no python3 or no libcuda.so.1 in the image): no CUDA reading, the device nodes alone decide
     cuda = cuda_text.strip().splitlines()[-1].strip() if cuda_text.strip() else ""
     if cuda.isdigit():
         return _UsableGpus(usable, int(cuda), None)
