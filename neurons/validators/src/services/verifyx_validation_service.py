@@ -507,7 +507,8 @@ class VerifyXValidationService:
             seconds = VERIFYX_COMMAND_TIMEOUT_SECONDS
             cut = None
             if deadline_monotonic is not None:
-                left = int(deadline_monotonic - time.monotonic())
+                remaining = deadline_monotonic - time.monotonic()
+                left = int(remaining)
                 if left <= 0:
                     return None
                 # The caller's own wait, on this clock, cuts the run at the deadline and kills it
@@ -516,9 +517,10 @@ class VerifyXValidationService:
                 # judged as any run: the host's clock never decides a cut (review at ea74f37). Never past the fixed
                 # command cap, which a budget near it would otherwise exceed by the kill's timeout.
                 seconds = min(seconds, left + VERIFYX_KILL_TIMEOUT_SECONDS)
-                # this wait cuts at the deadline, or the kill's timeout before a watchdog the cap clamped, so the
-                # validator's clock always cuts first (review r4655966507)
-                cut = seconds - VERIFYX_KILL_TIMEOUT_SECONDS
+                # cut only at the deadline, and only when the budget cannot afford the full command and the kill: a
+                # budget that can keeps the uncut 600 s wait, so a run answering before the deadline is always judged
+                # (review r4656251199)
+                cut = remaining if remaining < VERIFYX_COMMAND_TIMEOUT_SECONDS + VERIFYX_KILL_TIMEOUT_SECONDS else None
             command = self._verifyx_command(
                 executor_info, challenge, lib_name, run_dir, deadline_monotonic is not None, seconds
             )
@@ -529,6 +531,8 @@ class VerifyXValidationService:
                 ssh_capture = await asyncio.wait_for(self._run_ssh_command(shell, command), cut)
             except TimeoutError:
                 return None  # cut, as by the caller's wait: the caller kills the run
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                return None  # answered past the deadline (a watchdog the cap fired near it): the caller's cut, not a verdict
             return self.evaluate_verifyx_capture(challenge, ssh_capture, default_extra)
 
         except Exception as e:

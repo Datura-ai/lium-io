@@ -272,37 +272,38 @@ async def test_a_budget_near_the_cap_never_arms_the_watchdog_past_the_cap(monkey
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("run_s,cut", [(0.6, True), (0.0, False)], ids=["clamped-watchdog-124", "early-child-124"])
-async def test_a_watchdog_the_cap_clamped_never_beats_the_validators_cut(monkeypatch, run_s, cut):
-    # review r4655966507: 599.9 s left clamps the watchdog to the 600 s cap, so a host clock 0.04% fast stopped the run
-    # (exit 124) before the deadline and it read as an executor crash; the validator's own wait now cuts the kill's
-    # timeout before that watchdog. Scaled: a 2 s cap, a 1.9 s kill timeout, 1.99 s left
+@pytest.mark.parametrize(
+    "left_s,run_s,judged",
+    [(3.0, 1.6, True), (3.0, 0.0, True), (1.2, 1.4, False)],
+    ids=["budget-affords-the-command", "early-child-124", "short-budget-cut-at-the-deadline"],
+)
+async def test_the_validators_cut_comes_only_at_the_deadline(monkeypatch, left_s, run_s, judged):
+    # review r4656251199: with enough budget for the whole command the wait is uncut, so a run answering after
+    # cap - kill but before the deadline is judged on its merits (it was cut at 590 s and read as no task time); a
+    # short budget is still cut at its deadline, never before. Scaled: a 2 s cap, a 0.5 s kill timeout
     from neurons.validators.src.services import verifyx_validation_service as module
 
     monkeypatch.setattr(module, "VERIFYX_COMMAND_TIMEOUT_SECONDS", 2)
-    monkeypatch.setattr(module, "VERIFYX_KILL_TIMEOUT_SECONDS", 1.9)
+    monkeypatch.setattr(module, "VERIFYX_KILL_TIMEOUT_SECONDS", 0.5)
     service = module.VerifyXValidationService.__new__(module.VerifyXValidationService)
     _preflight_passes(monkeypatch, service, module, exit_status=124, stderr="boom\n")
     returned = service._run_ssh_command
-    commands = []
 
-    async def watchdog_stops_it(shell, command):
-        commands.append(command)
-        await asyncio.sleep(run_s)  # the clamped watchdog's 124, on the host's fast clock
+    async def answers_after(shell, command):
+        await asyncio.sleep(run_s)
         return await returned(shell, command)
 
-    monkeypatch.setattr(service, "_run_ssh_command", watchdog_stops_it)
+    monkeypatch.setattr(service, "_run_ssh_command", answers_after)
 
     result = await service.validate_verifyx_and_process_job(
         shell=None, executor_info=None, default_extra={}, machine_spec={}, run_dir=".verifyx-t",
-        deadline_monotonic=time.monotonic() + 1.99,
+        deadline_monotonic=time.monotonic() + left_s,
     )
 
-    assert commands == ["timeout -k 10 2 run &"]
-    if cut:
-        assert result is None  # no-task-time, killed by the caller: never EXECUTOR_CRASH
+    if judged:
+        assert result is not None and result.exit_status == 124
     else:
-        assert result is not None and result.exit_status == 124  # the child's own 124 is still judged (F-29)
+        assert result is None  # no task time, killed by the caller
 
 
 @pytest.mark.asyncio
