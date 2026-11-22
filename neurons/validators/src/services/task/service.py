@@ -36,7 +36,7 @@ from .availability import (
 )
 from .liumd_shadow import run_liumd_shadow, shadow_deadline
 from .messages import (
-    NO_TASK_TIME_REASONS,
+    CYCLE_END_READ_REASONS,
     REASON_CODE_DOCS_URL,
     ZEROED_BEFORE_THE_BUDGET_STOP,
     GpuLossHoldMessages,
@@ -57,7 +57,8 @@ def budget_stop_reason(reason: str | None, events: list[ValidationEvent], ctx) -
     """A budget stop after a check that already zeroed this cycle's score is that check's failure, not a result
     the rollout may hold back or replace with the last scored one. The check's own event stays in `events`; the
     reason is never the last earlier event, which can be one a rollout withholds (review at ea74f37)."""
-    if reason not in NO_TASK_TIME_REASONS or not zero_score_gate_failed(ctx):
+    # a rented-since-the-snapshot hold is carried the same way, so it too must not carry over a zero this run found
+    if reason not in CYCLE_END_READ_REASONS or not zero_score_gate_failed(ctx):
         return reason
     return ZEROED_BEFORE_THE_BUDGET_STOP
 

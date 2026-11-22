@@ -41,6 +41,7 @@ from services.task.availability import AvailabilityErrorCode, _is_the_nodes_own_
 from services.task.checks.rental_owner import listed_under_another_miner, rental_owned_by
 from services.task.checks.executor_image import observed_executor_digest
 from services.task.messages import (
+    CYCLE_END_READ_REASONS,
     ExecutorImageMessages,
     FinalizeMessages,
     GpuPowerLimitMessages,
@@ -762,7 +763,7 @@ def has_renter_gpu_reset_holds(job_results: dict[str, list[JobResult]]) -> bool:
 _HELD_REASONS = (
     MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason,
     GpuPowerLimitMessages.TIER_STATE_UNKNOWN.reason,
-    *NO_TASK_TIME_REASONS,
+    *CYCLE_END_READ_REASONS,
 )
 
 
@@ -804,7 +805,7 @@ async def carry_renter_gpu_reset_results(
         for index, held in enumerate(results):
             if not _held_for_renter_gpu_reset(held):
                 continue
-            no_task_time = held.failure_reason_code in NO_TASK_TIME_REASONS
+            no_task_time = held.failure_reason_code in CYCLE_END_READ_REASONS
             if no_task_time and rented_at_end is None:
                 continue
             info = held.executor_info

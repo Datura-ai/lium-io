@@ -420,31 +420,19 @@ class RentalVerificationCheck:
                 pass  # best effort: the 15-min stale sweep removes a probe left behind
 
     def _rented_since_the_snapshot(self, ctx: Context, response) -> CheckResult:
-        actual_score, job_score, warning_message = ctx.services.score_calculator(ctx, True)
-        event = render_message(
-            Msg.RENTED_SINCE_THE_SNAPSHOT,
-            ctx=ctx,
-            check_id=self.check_id,
-            what={
-                "executor_uuid": ctx.executor.uuid,
-                "reason_code": response.reason_code,
-                "actual_score": actual_score,
-                "job_score": job_score,
-            },
-        )
+        """No verdict from this run: the cycle's snapshot, which every later read of the context (the score, the rented
+        GPU count of a split node) comes from, still has the node idle. The result is held like a run the task had no
+        time for (CYCLE_END_READ_REASONS): the cycle-end rented read carries the last scored result only when it was
+        scored with this same rental, else the node gets no verdict and the next cycle scores it rented."""
         return CheckResult(
-            passed=True,
-            event=event,
-            updates={
-                "rented": True,
-                "score": actual_score,
-                "job_score": job_score,
-                "score_warning": warning_message or None,
-                "log_status": "info",
-                "log_text": event.event,
-                "success": True,
-            },
-            halt=True,
+            passed=False,
+            event=render_message(
+                Msg.RENTED_SINCE_THE_SNAPSHOT,
+                ctx=ctx,
+                check_id=self.check_id,
+                what={"executor_uuid": ctx.executor.uuid, "reason_code": response.reason_code},
+            ),
+            updates={},
         )
 
     def _cpu_quota_verdict(self, ctx: Context, response) -> CheckResult:

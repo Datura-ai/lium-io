@@ -19,6 +19,7 @@ from neurons.validators.src.protocol.vc_protocol.compute_requests import (
 )
 from neurons.validators.src.services.container_cleanup import ContainerCleanup
 from neurons.validators.src.services.task.checks.rental_verification import RentalVerificationCheck
+from neurons.validators.src.services.task.messages import CYCLE_END_READ_REASONS
 from neurons.validators.src.services.task.messages import RentalVerificationMessages as Msg
 from neurons.validators.src.services.task.pipeline import CheckResult, Context
 
@@ -1542,8 +1543,9 @@ async def test_states_that_do_not_prove_a_death_are_never_punished(docker_status
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reason_code", ["skipped_rented", "rented_during_check"])
 async def test_a_rental_the_snapshot_missed_stops_the_pipeline_as_rented(reason_code):
-    """The backend answers success=True for a node it found rented after this cycle's snapshot: the node is scored as
-    rented and the pipeline halts, so no later check (LocalVerify, VerifyX) loads the renter's pod."""
+    """The backend answers success=True for a node it found rented after this cycle's snapshot: the pipeline stops, so
+    no later check (LocalVerify, VerifyX) loads the renter's pod, and nothing is scored from the snapshot, which still
+    has the node idle (its GPU count of a split rental would be None). The cycle-end rented read decides."""
     backend_client = DummyBackendClient(
         response=ExecutorHealthCheckResponse(success=True, error=None, reason_code=reason_code)
     )
@@ -1560,7 +1562,7 @@ async def test_a_rental_the_snapshot_missed_stops_the_pipeline_as_rented(reason_
     with patch("neurons.validators.src.services.task.checks.rental_verification.settings"):
         result = await RentalVerificationCheck().run(ctx)
 
-    assert result.passed is True and result.halt is True
+    assert result.passed is False
     assert result.event.reason_code == Msg.RENTED_SINCE_THE_SNAPSHOT.reason
-    assert result.updates["rented"] is True
-    assert (result.updates["score"], result.updates["job_score"]) == (1.5, 2.5)
+    assert result.event.reason_code in CYCLE_END_READ_REASONS
+    assert result.updates == {}

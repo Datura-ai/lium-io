@@ -21,6 +21,7 @@ from core.validator import specs_to_publish
 from services.executor_rollout import (
     ExecutorRolloutTracker,
     carry_renter_gpu_reset_results,
+    has_renter_gpu_reset_holds,
     remember_rented_scored_results,
     rollout_grace_reason,
     session_kept_hotkeys,
@@ -536,7 +537,12 @@ async def test_a_second_no_task_time_cycle_without_a_pass_between_is_withheld(re
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "reason", [RentalVerificationMessages.NO_TASK_TIME.reason, VerifyXMessages.NO_TASK_TIME.reason]
+    "reason",
+    [
+        RentalVerificationMessages.NO_TASK_TIME.reason,
+        VerifyXMessages.NO_TASK_TIME.reason,
+        RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason,
+    ],
 )
 @pytest.mark.parametrize("earlier_gate", [None, "cpu_truth_passed", "cc_vbios_passed", "price_per_gpu"])
 async def test_a_budget_stop_after_a_check_zeroed_the_score_keeps_that_failure(context_factory, reason, earlier_gate):
@@ -1169,3 +1175,58 @@ def test_a_budget_stop_after_a_zeroing_check_shows_the_provider_that_check_not_t
     else:
         assert payload["reason_code"] == "CPU_TRUTH_MISMATCH"
     assert reason not in json.dumps(payload)
+
+
+def _rented_during_check(uuid: str):
+    return _failed(uuid, RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason)
+
+
+def _rented_at_end(gpu_count: int) -> RentedExecutorsResponse:
+    pod = RentedPod(pod_id=POD_ID, container_name="c", gpu_count=gpu_count, status="RUNNING")
+    return RentedExecutorsResponse(
+        executors={
+            "node-1": RentedExecutor(
+                miner_hotkey="5Miner", executor_ip_address="203.0.113.5", executor_ip_port="22", pods=[pod]
+            )
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_split_node_rented_during_the_check_never_puts_all_its_gpus_in_the_rented_pool():
+    """Review at 1601cba: an 8-GPU node idle in the snapshot gets a 2-GPU rental during the rental check. Scored from the
+    snapshot it went rented with rented_gpu_count None, all 8 GPUs in the rented pool. Held, it asks for the cycle-end
+    read, and the idle last score never stands in for the rented cycle: no verdict, nothing published."""
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_scored("node-1")]}, service)
+    held = _rented_during_check("node-1")
+    job_results = {"5Miner": [held]}
+    assert has_renter_gpu_reset_holds(job_results)  # the cycle-end rented read is taken
+
+    await carry_renter_gpu_reset_results(job_results, service, set(), _rented_executors(), {}, _rented_at_end(2))
+    [result] = job_results["5Miner"]
+    assert result.carried_for_renter_gpu_reset is False
+    validator_process = _validator_process(ExecutorRolloutTracker(redis_service=MagicMock(), grace_cycles=0))
+    validator_process.fetch_executor_digest_or_none = AsyncMock(return_value=None)
+    validator_process.observe_executor_rollout = AsyncMock(return_value=MagicMock(covers=lambda _: False))
+    kept, withheld = await validator_process.withhold_verdicts_for_rollout(job_results, 7500, "batch-2", MagicMock())
+
+    assert kept == {"5Miner": []}
+    assert [w.result.executor_info.uuid for w in withheld] == ["node-1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("end_gpus", "carried"), [(2, True), (3, False)], ids=["same-rental", "other-rental"])
+async def test_a_node_rented_during_the_check_carries_only_a_score_of_the_same_rented_gpus(end_gpus, carried):
+    service = _redis_service()
+    previous = _rented_scored("node-1")
+    previous.rented_gpu_count = 2
+    await remember_rented_scored_results({"5Miner": [previous]}, service)
+    job_results = {"5Miner": [_rented_during_check("node-1")]}
+
+    await carry_renter_gpu_reset_results(job_results, service, set(), _rented_executors(), {}, _rented_at_end(end_gpus))
+
+    [result] = job_results["5Miner"]
+    assert result.carried_for_renter_gpu_reset is carried
+    if carried:
+        assert (result.is_rented, result.rented_gpu_count) == (True, 2)

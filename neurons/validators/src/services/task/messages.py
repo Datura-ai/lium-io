@@ -2511,7 +2511,10 @@ class RentalVerificationMessages:
         reason="RENTAL_STARTED_DURING_CHECK",
         severity="info",
         category="policy",
-        impact="Validation stopped as rented; the next cycle checks the rental",
+        impact=(
+            "No verdict this cycle; the node's last scored result stands only if it was scored with this rental, "
+            "else the next cycle scores the node rented"
+        ),
         remediation="No action needed.",
     )
     FAILED = MessageTemplate(
@@ -3302,6 +3305,9 @@ class SshdAuthLogMessages:
 # DAH-5933: the run left the backend's rental probe, or VerifyX, too little time; the validator's budget, not the
 # node, decides that, so it is no failed check: an idle node carries its last scored result too
 NO_TASK_TIME_REASONS = (RentalVerificationMessages.NO_TASK_TIME.reason, VerifyXMessages.NO_TASK_TIME.reason)
+# results the cycle's snapshot cannot score, held for the cycle-end rented read: a budget stop (above), or a node the
+# backend found rented after the snapshot listed it idle (its GPU count and pool come from that read, never the snapshot)
+CYCLE_END_READ_REASONS = (*NO_TASK_TIME_REASONS, RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason)
 # DAH-5933 review at ea74f37: a budget stop after a check that already zeroed the cycle's score. Its own code, since
 # the last event before the stop can be one a rollout withholds (a warn-only EXECUTOR_IMAGE_OUTDATED): no rule withholds
 # or carries this one, so the zero is published as it is
