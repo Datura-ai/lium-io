@@ -61,10 +61,32 @@ IMAGE = DefaultDockerImage(docker_image="daturaai/pytorch", docker_image_tag="2.
 GPU_DETAILS = [{"uuid": "GPU-aaaa", "name": "RTX 5090"}, {"uuid": "GPU-bbbb", "name": "RTX 5090"}]
 # a NAT'd node: the container binds 20001 on the host, renters reach it on 30001
 PORT_PAIRS = [(20001, 30001), (20002, 30002), (20003, 30003)]
-SMI_TWO_GPUS = (
+SMI_TWO_GPUS_LISTING = (
     "GPU 0: NVIDIA GeForce RTX 5090 (UUID: GPU-aaaa)\n"
     "GPU 1: NVIDIA GeForce RTX 5090 (UUID: GPU-bbbb)\n"
 )
+
+
+def gpu_list_output(
+    listing: str = SMI_TWO_GPUS_LISTING,
+    *,
+    nodes: tuple[int, ...] = (0, 1),
+    minors: tuple[tuple[str, int], ...] = (("GPU-aaaa", 0), ("GPU-bbbb", 1)),
+    cuda: str = "2",
+) -> str:
+    """What the probe's GPU_LIST_COMMAND prints inside the renter container."""
+    return (
+        listing
+        + "--gpu-device-nodes--\n"
+        + "".join(f"/dev/nvidia{n}\n" for n in nodes)
+        + "--gpu-minors--\n"
+        + "".join(f"{u}, {m}\n" for u, m in minors)
+        + "--cuda-device-count--\n"
+        + (f"{cuda}\n" if cuda else "")
+    )
+
+
+SMI_TWO_GPUS = gpu_list_output()
 
 
 @contextmanager
@@ -1904,3 +1926,55 @@ async def test_the_teardown_wait_never_outlasts_the_job():
     assert asyncio.get_running_loop().time() - started < 1
     assert not task.done()
     task.cancel()
+
+
+def _gpu_step(output: str):
+    ctx, _, _ = make_probe_context()
+    outcome = module._ProbeOutcome()
+    smi = MagicMock(stdout=output, stderr="", exit_status=0)
+    module._step_gpu_count(ctx, outcome, module._Login(result=smi, command_seconds=0.5))
+    return outcome
+
+
+def test_gpu_count_step_fails_listed_gpus_the_container_has_no_device_node_for():
+    """Regression: nvidia-smi -L in the renter container lists every advertised card while only
+    /dev/nvidia0 was handed to it, so a renter's CUDA sees one GPU and the probe passed."""
+    outcome = _gpu_step(gpu_list_output(nodes=(0,), cuda="1"))
+    assert outcome.failed_step == STEP_GPU_COUNT
+    assert "1 usable GPU device node(s)" in outcome.steps[-1].detail
+    # the kernel lists both cards under one minor: one device node opens only one card
+    outcome = _gpu_step(gpu_list_output(minors=(("GPU-aaaa", 0), ("GPU-bbbb", 0)), cuda=""))
+    assert outcome.failed_step == STEP_GPU_COUNT
+
+
+def test_gpu_count_step_fails_when_cuda_sees_fewer_gpus_than_listed():
+    outcome = _gpu_step(gpu_list_output(cuda="1"))
+    assert outcome.failed_step == STEP_GPU_COUNT
+    assert "CUDA sees 1 device(s)" in outcome.steps[-1].detail
+    outcome = _gpu_step(gpu_list_output(cuda="error 100"))
+    assert outcome.failed_step == STEP_GPU_COUNT
+    assert "CUDA failed to start (error 100)" in outcome.steps[-1].detail
+
+
+def test_gpu_count_step_passes_every_device_node_and_cuda_count():
+    outcome = _gpu_step(gpu_list_output())
+    assert outcome.failed_step is None and outcome.steps[-1].ok is True
+    # an image without python3 gives no CUDA reading; the device nodes still decide
+    outcome = _gpu_step(gpu_list_output(cuda=""))
+    assert outcome.failed_step is None
+    # unreadable minors in the container: every GPU device node counts
+    outcome = _gpu_step(gpu_list_output(minors=()))
+    assert outcome.failed_step is None
+    # output without the command's sections is nothing usable
+    outcome = _gpu_step(SMI_TWO_GPUS_LISTING)
+    assert outcome.failed_step == STEP_GPU_COUNT
+
+
+@pytest.mark.asyncio
+async def test_probe_fails_a_renter_container_that_can_open_one_of_two_listed_gpus():
+    ctx, docker, _ = make_probe_context()
+    with probe_settings(), renter_path(smi_stdout=gpu_list_output(nodes=(0,), cuda="1")) as seen:
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False
+    assert result.event.what_we_saw["failed_step"] == STEP_GPU_COUNT
+    assert seen["conn"].commands[0] == module.GPU_LIST_COMMAND

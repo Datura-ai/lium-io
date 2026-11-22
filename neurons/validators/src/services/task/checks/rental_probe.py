@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shlex
 import time
 import uuid
@@ -24,6 +25,7 @@ from payload_models.payloads import (
 from core.config import settings
 from core.utils import _m, get_extra_info
 from services.container_cleanup import retained_volume_pod_ids
+from services.nvidia_devices import GPU_DEVICE_NODES_CMD, PROC_GPU_INFO_CMD, _parse_uuid_minor_csv
 from services.redis_service import (
     RENTAL_PROBE_FAILED_PREFIX,
     RENTAL_PROBE_OK_PREFIX,
@@ -94,9 +96,10 @@ _REMEDIATION_BY_STEP: dict[str, str] = {
         "login as root."
     ),
     STEP_GPU_COUNT: (
-        "The renter container started and SSH worked, but `nvidia-smi -L` inside it did not list "
-        "the {expected} GPU(s) this node advertises. Check the NVIDIA container runtime and "
-        "`docker run --gpus all nvidia-smi -L` by hand."
+        "The renter container started and SSH worked, but it could not use the {expected} GPU(s) this "
+        "node advertises: `nvidia-smi -L` inside it must list them all, each one's /dev/nvidiaN device "
+        "node must be present and CUDA must see them all. Check the NVIDIA container runtime and "
+        "`docker run --gpus all <image> sh -c 'nvidia-smi -L; ls /dev/nvidia*'` by hand."
     ),
     STEP_EGRESS: NO_OUTBOUND_INTERNET_REMEDIATION,
 }
@@ -108,6 +111,28 @@ _SSH_LOGIN_TIMEOUT_SECONDS = 30
 # waits between login attempts; the last value repeats until the deadline
 _SSH_LOGIN_BACKOFF_SECONDS = (1.0, 2.0, 4.0, 8.0)
 _NVIDIA_SMI_TIMEOUT_SECONDS = 30
+# NVML lists every card the driver knows, so `nvidia-smi -L` can name a card whose /dev/nvidiaN was never
+# handed to the container; the renter gets only the cards it can open. The same session also prints the
+# container's GPU device nodes, the kernel minors of its listed cards and the CUDA device count.
+_DEVICE_NODES_MARK = "--gpu-device-nodes--"
+_GPU_MINORS_MARK = "--gpu-minors--"
+_CUDA_COUNT_MARK = "--cuda-device-count--"
+# prints the count, `error <rc>` when the driver refuses, nothing when the image has no python3 or libcuda
+_CUDA_COUNT_PY = (
+    "import ctypes\n"
+    "try:\n"
+    "    cuda = ctypes.CDLL('libcuda.so.1')\n"
+    "except OSError:\n"
+    "    raise SystemExit(0)\n"
+    "n = ctypes.c_int(0)\n"
+    "rc = cuda.cuInit(0) or cuda.cuDeviceGetCount(ctypes.byref(n))\n"
+    "print(n.value if rc == 0 else f'error {rc}')\n"
+)
+GPU_LIST_COMMAND = (
+    f"nvidia-smi -L; rc=$?; echo {_DEVICE_NODES_MARK}; {GPU_DEVICE_NODES_CMD}; "
+    f"echo {_GPU_MINORS_MARK}; {PROC_GPU_INFO_CMD}; "
+    f"echo {_CUDA_COUNT_MARK}; python3 -c {shlex.quote(_CUDA_COUNT_PY)} 2>/dev/null; exit $rc"
+)
 # getent's resolver timeouts plus the script's 10 s fetch
 _EGRESS_TIMEOUT_SECONDS = 45
 # create_container has its own bounded retries (a 90 s port-retry budget, SSH timeouts) but no overall
@@ -211,7 +236,8 @@ class RentalProbeCheck:
     default renter image through `DockerService.create_container`, the path a renter's pod takes,
     with a probe-owned SSH key and the ports PortConnectivityCheck verified; waits for sshd's banner
     on the mapped port; logs in, retrying until the same RENTAL_PROBE_SSH_DEADLINE_SECONDS deadline;
-    runs `nvidia-smi -L`; and tears the container down through `delete_container`. Each step is
+    runs `nvidia-smi -L` and confirms the container can open every listed GPU (its device node, the CUDA
+    device count); and tears the container down through `delete_container`. Each step is
     timed and lands in `what_we_saw["probe_steps"]`.
 
     A failed step zeroes the score and clears the verified job with reason code RENTAL_PROBE_FAILED
@@ -945,7 +971,8 @@ async def _probe(
     2. `_step_sshd_listen`: wait for sshd's banner on the mapped port.
     3. `_step_ssh_login`: log in with the probe's key, retrying until the deadline, and run `nvidia-smi -L`
        (and EGRESS_PROBE_SCRIPT, under NO_OUTBOUND_INTERNET_CHECK_ENABLED).
-    4. `_step_gpu_count`: compare the listed GPUs with what the node advertises.
+    4. `_step_gpu_count`: compare the listed GPUs, and those the container can open, with what the node
+       advertises.
     5. `_step_egress`: the container resolved and fetched pypi.org; fails the probe only under
        NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED.
     6. `_step_teardown`: remove the container and the pending-pod mark, whichever step ended the probe.
@@ -1138,21 +1165,27 @@ async def _step_ssh_login(
 
 
 def _step_gpu_count(ctx: Context, outcome: _ProbeOutcome, login: _Login) -> None:
-    """Step 4: `nvidia-smi -L` inside the container must list the GPUs this node advertises."""
+    """Step 4: `nvidia-smi -L` inside the container must list the GPUs this node advertises, and the
+    container must be able to open each of them (_usable_gpus)."""
     expected = _expected_gpu_count(ctx)
     if login.command_error is not None:
         gpu_ok = False
         detail = f"nvidia-smi -L did not run over the SSH session: {login.command_error}"
     else:
         smi = login.result
-        seen = _count_gpus(smi.stdout or "")
-        gpu_ok = smi.exit_status == 0 and seen == expected
-        detail = (
-            None
-            if gpu_ok
-            else f"expected {expected} GPU(s), nvidia-smi -L listed {seen} (exit {smi.exit_status}): "
-            f"{(smi.stderr or smi.stdout or '')[-_TAIL_CHARS:]}"
-        )
+        smi_out = (smi.stdout or "").partition(_DEVICE_NODES_MARK)[0]
+        seen = _count_gpus(smi_out)
+        short = _usable_gpus(smi.stdout or "").short_of(expected)
+        gpu_ok = smi.exit_status == 0 and seen == expected and short is None
+        if gpu_ok:
+            detail = None
+        elif smi.exit_status != 0 or seen != expected:
+            detail = (
+                f"expected {expected} GPU(s), nvidia-smi -L listed {seen} (exit {smi.exit_status}): "
+                f"{(smi.stderr or smi_out or '')[-_TAIL_CHARS:]}"
+            )
+        else:
+            detail = f"expected {expected} GPU(s), nvidia-smi -L listed {seen} but the container has {short}"
     outcome.steps.append(_Step(STEP_GPU_COUNT, login.command_seconds, gpu_ok, detail))
     if not gpu_ok:
         outcome.failed_step = STEP_GPU_COUNT
@@ -1532,7 +1565,7 @@ async def _login_and_list_gpus(
     try:
         async with conn:
             login.result = await conn.run(
-                "nvidia-smi -L", check=False, timeout=_NVIDIA_SMI_TIMEOUT_SECONDS
+                GPU_LIST_COMMAND, check=False, timeout=_NVIDIA_SMI_TIMEOUT_SECONDS
             )
             login.command_seconds = time.perf_counter() - command_started
             if egress:
@@ -1574,6 +1607,40 @@ async def _run_egress_script(conn: asyncssh.SSHClientConnection) -> asyncssh.SSH
 
 def _count_gpus(nvidia_smi_output: str) -> int:
     return sum(1 for line in nvidia_smi_output.splitlines() if line.startswith("GPU "))
+
+
+@dataclass(frozen=True)
+class _UsableGpus:
+    """What a process in the renter container can open: the GPU device nodes it was given (only those of
+    its listed cards when the kernel's minors are readable) and the CUDA device count (None: no reading)."""
+
+    device_nodes: int
+    cuda_count: int | None
+    cuda_error: str | None
+
+    def short_of(self, expected: int) -> str | None:
+        if self.device_nodes < expected:
+            return f"{self.device_nodes} usable GPU device node(s) (/dev/nvidiaN)"
+        if self.cuda_error is not None:
+            return f"CUDA failed to start ({self.cuda_error})"
+        if self.cuda_count is not None and self.cuda_count < expected:
+            return f"CUDA sees {self.cuda_count} device(s)"
+        return None
+
+
+def _usable_gpus(output: str) -> _UsableGpus:
+    """Parse GPU_LIST_COMMAND's sections. A missing section reads as nothing usable: the command always
+    prints its marks, so output without them did not come from it."""
+    _, _, rest = output.partition(_DEVICE_NODES_MARK)
+    nodes_text, _, rest = rest.partition(_GPU_MINORS_MARK)
+    minors_text, _, cuda_text = rest.partition(_CUDA_COUNT_MARK)
+    node_minors = {int(m) for m in re.findall(r"^/dev/nvidia(\d+)$", nodes_text, re.MULTILINE)}
+    listed_minors = set(_parse_uuid_minor_csv(minors_text).values())
+    usable = len(listed_minors & node_minors) if listed_minors else len(node_minors)
+    cuda = cuda_text.strip().splitlines()[-1].strip() if cuda_text.strip() else ""
+    if cuda.isdigit():
+        return _UsableGpus(usable, int(cuda), None)
+    return _UsableGpus(usable, None, cuda[:80] or None)
 
 
 async def _teardown(ctx: Context, created: ContainerCreated, pod_id: str) -> str | None:
