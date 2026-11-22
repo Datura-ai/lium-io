@@ -1458,6 +1458,8 @@ if [ "$SYSBOX_UP_TO_DATE" = true ] && docker info 2>/dev/null | grep -q sysbox-r
     fi
     if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &>/dev/null; then
         install_sysbox_restart_dropins || exit 1   # safe under rentals: no service restarts
+        # a host that already starts containers may hold a hand-added mount-only rule; only a profile reload, safe under rentals
+        allow_sysboxfs_in_fusermount3_apparmor || exit 1
         setup_vloopback || { fail_vloopback; exit 1; }
         if [ -n "$VLOOPBACK_CHANGED" ]; then
             ok "Sysbox is already working."

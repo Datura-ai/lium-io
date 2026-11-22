@@ -474,6 +474,17 @@ def test_a_profile_with_only_the_mount_rule_is_a_fix_and_the_install_adds_the_um
     assert (local.count(APPARMOR_RULE), local.count(APPARMOR_UMOUNT_RULE)) == (1, 1)
 
 
+def test_install_mode_adds_the_umount_rule_on_a_host_where_sysbox_already_works(tmp_path):
+    # a hand-added mount-only rule means sysbox already starts containers, so the run takes the "already working" exit
+    files = {**APPARMOR_ON, "etc/apparmor.d/local/fusermount3": APPARMOR_RULE + "\n"}
+    proc = run_script(tmp_path, files=files)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Sysbox is already working." in proc.stdout
+    local = (tmp_path / "root/etc/apparmor.d/local/fusermount3").read_text()
+    assert (local.count(APPARMOR_RULE), local.count(APPARMOR_UMOUNT_RULE)) == (1, 1)
+    assert (tmp_path / "root/.stub-docker/apparmor").read_text() == "-r /etc/apparmor.d/fusermount3\n"
+
+
 
 @pytest.mark.parametrize(
     "local",
