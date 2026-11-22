@@ -213,7 +213,7 @@ async def test_an_express_pass_after_the_row_was_built_keeps_it_off_the_publish(
 
 
 def test_a_node_that_answered_with_a_stale_nonce_is_reported_as_refusing_and_names_the_clock(flag_on):
-    """22 Nov: 17cec9c3 answered every upload with 401 "Stale upload nonce" (its clock more than 10 minutes off) and
+    """22 Nov: a node answered every upload with 401 "Stale upload nonce" (its clock more than 10 minutes off) and
     the provider was told the miner "could not reach" it. The miner's refused_executors names the answer."""
     msg = AcceptSSHKeyRequest(
         executors=miner_returned(LISTED),

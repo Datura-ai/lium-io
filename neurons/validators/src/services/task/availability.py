@@ -274,7 +274,7 @@ def build_executor_unreachable_by_miner_event(
 
     ``refusal`` is the node's own answer when it did answer and turned the key down
     (``refused_executors``): the node is reachable, so the event names the answer, and for a stale
-    nonce the node's clock (redpandamining, 22 Nov: 14 refusals read as "could not reach"). Same
+    nonce the node's clock (22 Nov: 14 refusals were read as "could not reach"). Same
     code and score: the node still took no key.
     """
     if refusal is not None:
