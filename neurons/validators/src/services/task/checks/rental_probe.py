@@ -116,6 +116,7 @@ _NVIDIA_SMI_TIMEOUT_SECONDS = 30
 # container's GPU device nodes, the kernel minors of its listed cards and the CUDA device count.
 _DEVICE_NODES_MARK = "--gpu-device-nodes--"
 _GPU_MINORS_MARK = "--gpu-minors--"
+_MIG_MODE_MARK = "--gpu-mig-mode--"
 _CUDA_COUNT_MARK = "--cuda-device-count--"
 # prints the count, `error <rc>` when the driver refuses, nothing when the image has no python3 or libcuda
 _CUDA_COUNT_PY = (
@@ -131,7 +132,9 @@ _CUDA_COUNT_PY = (
 GPU_LIST_COMMAND = (
     f"nvidia-smi -L; rc=$?; echo {_DEVICE_NODES_MARK}; {GPU_DEVICE_NODES_CMD}; "
     f"echo {_GPU_MINORS_MARK}; {PROC_GPU_INFO_CMD}; "
-    f"echo {_CUDA_COUNT_MARK}; python3 -c {shlex.quote(_CUDA_COUNT_PY)} 2>/dev/null; exit $rc"
+    f"echo {_MIG_MODE_MARK}; nvidia-smi --query-gpu=mig.mode.current --format=csv,noheader 2>/dev/null; "
+    # counted with the image's CUDA_VISIBLE_DEVICES unset: an image default narrows nothing a renter can't undo
+    f"echo {_CUDA_COUNT_MARK}; env -u CUDA_VISIBLE_DEVICES python3 -c {shlex.quote(_CUDA_COUNT_PY)} 2>/dev/null; exit $rc"
 )
 # getent's resolver timeouts plus the script's 10 s fetch
 _EGRESS_TIMEOUT_SECONDS = 45
@@ -1633,10 +1636,14 @@ def _usable_gpus(output: str) -> _UsableGpus:
     prints its marks, so output without them did not come from it."""
     _, _, rest = output.partition(_DEVICE_NODES_MARK)
     nodes_text, _, rest = rest.partition(_GPU_MINORS_MARK)
-    minors_text, _, cuda_text = rest.partition(_CUDA_COUNT_MARK)
+    minors_text, _, rest = rest.partition(_MIG_MODE_MARK)
+    mig_text, _, cuda_text = rest.partition(_CUDA_COUNT_MARK)
     node_minors = {int(m) for m in re.findall(r"^/dev/nvidia(\d+)$", nodes_text, re.MULTILINE)}
     listed_minors = set(_parse_uuid_minor_csv(minors_text).values())
     usable = len(listed_minors & node_minors) if listed_minors else len(node_minors)
+    if re.search(r"^\s*Enabled\s*$", mig_text, re.MULTILINE):
+        # CUDA enumerates MIG instances, not cards, so its count says nothing per card; the device nodes decide
+        return _UsableGpus(usable, None, None)
     cuda = cuda_text.strip().splitlines()[-1].strip() if cuda_text.strip() else ""
     if cuda.isdigit():
         return _UsableGpus(usable, int(cuda), None)

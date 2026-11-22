@@ -73,6 +73,7 @@ def gpu_list_output(
     nodes: tuple[int, ...] = (0, 1),
     minors: tuple[tuple[str, int], ...] = (("GPU-aaaa", 0), ("GPU-bbbb", 1)),
     cuda: str = "2",
+    mig: tuple[str, ...] = ("Disabled", "Disabled"),
 ) -> str:
     """What the probe's GPU_LIST_COMMAND prints inside the renter container."""
     return (
@@ -81,6 +82,8 @@ def gpu_list_output(
         + "".join(f"/dev/nvidia{n}\n" for n in nodes)
         + "--gpu-minors--\n"
         + "".join(f"{u}, {m}\n" for u, m in minors)
+        + "--gpu-mig-mode--\n"
+        + "".join(f"{mode}\n" for mode in mig)
         + "--cuda-device-count--\n"
         + (f"{cuda}\n" if cuda else "")
     )
@@ -1978,3 +1981,26 @@ async def test_probe_fails_a_renter_container_that_can_open_one_of_two_listed_gp
     assert result.passed is False
     assert result.event.what_we_saw["failed_step"] == STEP_GPU_COUNT
     assert seen["conn"].commands[0] == module.GPU_LIST_COMMAND
+
+
+def test_gpu_count_step_lets_the_device_nodes_decide_on_mig_cards():
+    """CUDA enumerates MIG instances, not cards: with MIG on, a CUDA count unlike the card count is no
+    shortfall, and the device nodes still decide."""
+    outcome = _gpu_step(gpu_list_output(mig=("Enabled", "Disabled"), cuda="7"))
+    assert outcome.failed_step is None
+    outcome = _gpu_step(gpu_list_output(mig=("Enabled", "Enabled"), cuda="error 100"))
+    assert outcome.failed_step is None
+    outcome = _gpu_step(gpu_list_output(nodes=(0,), mig=("Enabled", "Enabled"), cuda="1"))
+    assert outcome.failed_step == STEP_GPU_COUNT
+    # a card without MIG support prints [N/A]: CUDA still counts
+    outcome = _gpu_step(gpu_list_output(mig=("[N/A]", "[N/A]"), cuda="1"))
+    assert outcome.failed_step == STEP_GPU_COUNT
+
+
+def test_gpu_count_reads_cuda_with_the_image_cuda_visible_devices_unset():
+    """An image default CUDA_VISIBLE_DEVICES=0 narrows nothing a renter cannot undo; the count must not
+    read it as a missing card."""
+    assert "env -u CUDA_VISIBLE_DEVICES python3 -c" in module.GPU_LIST_COMMAND
+    assert module.GPU_LIST_COMMAND.index("--gpu-mig-mode--") < module.GPU_LIST_COMMAND.index(
+        "--cuda-device-count--"
+    )
