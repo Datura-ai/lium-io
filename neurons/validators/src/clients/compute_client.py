@@ -1184,33 +1184,20 @@ class ComputeClient:
                     await redis_service.unindex_backend_create(job_request.pod_id, job_request.executor_id, command_id)
 
     async def _command_ran_before(self, job_request: ContainerCreateRequest) -> bool:
-        """the pod's pending marks include one of this command (any age), or an older validator left a rental create of
-        the pod unanswered when it stopped (its marks carry no command ID: it may be this one, sent again after the
-        upgrade). That older create counts unless the backend says this create is the pod's first since its last new
-        rental, reboot or retry (a legacy create that succeeded but whose receipt was lost leaves the same mark, and a
-        renter's new reboot of that pod must run). Otherwise (it repeats one, or an older backend cannot say) it counts
-        at any age: the older validator wrote no command ID, so its age says nothing about which command started the
-        pod's unlabelled container, and replacing it is not undone. The older marks are read where the start kept
-        them and, when that start could not move them, where the older validator left them. Unreadable counts as yes,
-        which only holds a failure back until the node is asked"""
-        redis_service = self.miner_service.redis_service
-        pod_id, built_before = job_request.pod_id, job_request.earlier_create_built
+        """The backend says this create repeats one it already sent (`earlier_create_built`: an earlier send may have
+        run, also on an older validator, which labels no container and keeps no record), or the pod's pending marks
+        include one of this command (any age: a run cut off before its command record existed). Unreadable counts as
+        yes, which only holds a failure back until the node is asked"""
+        if job_request.earlier_create_built:
+            return True
         try:
-            marks = await redis_service.get_pending_pods(job_request.miner_hotkey, job_request.executor_id, None)
-            if built_before is False:
-                await redis_service.settle_pre_upgrade_create(pod_id)
-            else:
-                started = [await redis_service.pre_upgrade_create_started(pod_id)] + [
-                    int(mark.get("time", 0))
-                    for mark in marks
-                    if mark.get("pod_id") == pod_id and not mark.get("command_id") and not mark.get("kind")
-                ]
-                if any(t is not None for t in started):
-                    return True
+            marks = await self.miner_service.redis_service.get_pending_pods(
+                job_request.miner_hotkey, job_request.executor_id, None
+            )
         except Exception:  # noqa: BLE001
             return True
         return any(
-            mark.get("pod_id") == pod_id and mark.get("command_id") == job_request.command_id for mark in marks
+            mark.get("pod_id") == job_request.pod_id and mark.get("command_id") == job_request.command_id for mark in marks
         )
 
     async def _handle_backend_command_duplicate(

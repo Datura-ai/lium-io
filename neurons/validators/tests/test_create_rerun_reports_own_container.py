@@ -174,15 +174,15 @@ async def test_only_a_listing_without_this_commands_container_counts_as_absent(s
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ran_before", [True, False])
 @pytest.mark.parametrize("reboot_or_edit", [True, False])
-async def test_an_unlabelled_container_from_before_the_upgrade_is_replaced_only_by_a_fresh_reboot_or_edit(
-    svc, monkeypatch, ran_before, reboot_or_edit
+@pytest.mark.parametrize("earlier_create_built", [False, True, None])
+async def test_an_unlabelled_container_from_before_the_upgrade_is_replaced_only_by_a_first_send_of_a_reboot_or_edit(
+    svc, monkeypatch, ran_before, reboot_or_edit, earlier_create_built
 ):
-    """An older validator labelled no container with its command, and its pending marks carry no command ID (a full
-    start clears them too). A fresh create (no volume) has no container of its own yet, so the pod's unlabelled
-    container is an earlier run of it, maybe cut off by the upgrade: the create answers nothing (an unknown outcome)
-    and never reaches the cleanup that would remove it with its volume. So does any command known to have run before.
-    A new reboot or edit of a pod made before the upgrade brings the pod's volume and goes ahead: that container is
-    the pod's own, which it replaces."""
+    """An older validator labelled no container with its command and kept no record of it. Only a reboot or edit the
+    backend says is its command's first send replaces the pod's unlabelled container: it cannot be that command's own
+    run. A repeat (the same command, its answer lost at the upgrade, sent again), a fresh create (no volume: no
+    container of its own yet), an older backend that cannot say, and any command known to have run before answer
+    nothing (an unknown outcome) and never reach the cleanup that would remove the container with its volume."""
     n = _Node()
     ssh_client = n.wrap(_ssh_client(inspect_exit=0))
     _patch_happy(svc, monkeypatch, ssh_client)
@@ -191,13 +191,16 @@ async def test_an_unlabelled_container_from_before_the_upgrade_is_replaced_only_
     monkeypatch.setattr(svc, "clean_existing_containers", cleanup)
     absent: list[bool] = []
     token = create_node_absent.set(absent if ran_before else None)
-    payload = _payload(command_id="cmd-1", **({"local_volume": "pod-volume"} if reboot_or_edit else {}))
+    payload = _payload(
+        command_id="cmd-1", earlier_create_built=earlier_create_built,
+        **({"local_volume": "pod-volume"} if reboot_or_edit else {}),
+    )
     try:
         result = await _create(svc, payload, ssh_client)
     finally:
         create_node_absent.reset(token)
 
-    if ran_before or not reboot_or_edit:
+    if ran_before or not reboot_or_edit or earlier_create_built is not False:
         assert result is None
         cleanup.assert_not_awaited()
         assert absent == []

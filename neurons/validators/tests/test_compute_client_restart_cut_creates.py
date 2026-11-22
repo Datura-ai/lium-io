@@ -33,7 +33,6 @@ from services.redis_service import (
     GPU_CLOCKS_PENDING_KIND,
     GPU_RESET_PENDING_KIND,
     PENDING_PODS_PREFIX,
-    PRE_UPGRADE_CREATE_MARKS_KEY,
     BackendCommand,
     InflightBackendCreate,
     RedisService,
@@ -2070,79 +2069,18 @@ async def test_a_create_whose_pending_mark_shows_an_earlier_run_holds_its_failur
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("age_minutes", [1, 31])
-async def test_a_rental_create_an_older_validator_left_unanswered_counts_as_run_before_after_the_upgrade(age_minutes):
-    """The older validator's mark (no command ID) stays until the backend's receipt, so one left at its stop is a create
-    whose answer may never have left: a full start keeps it by pod, and a same-pod create after the upgrade (maybe that
-    one sent again) counts as run before, at any age, also from an older backend that cannot say whether it built the
-    pod's create before. A GPU operation's mark and this validator's own marks do not; the pending marks themselves
-    still go."""
-    redis_service = _redis_service()
-    started = int(time.time()) - age_minutes * 60
-    await redis_service.hset(PENDING_PODS_PREFIX, "miner-hk:exec-1", json.dumps([
-        {"time": started, "pod_id": "pod-1"},
-        {"time": started, "pod_id": "pod-gpu", "kind": GPU_RESET_PENDING_KIND},
-        {"time": started, "pod_id": "pod-new", "command_id": "cmd-0"},
-    ]))
-    client = _client(redis_service)
-
-    await redis_service.clear_pending_pods()
-
-    assert await redis_service.hgetall(PENDING_PODS_PREFIX) == {}
-    ran_before = {
-        pod_id: await client._command_ran_before(_create_request().model_copy(update={"pod_id": pod_id}))
-        for pod_id in ("pod-1", "pod-gpu", "pod-new")
-    }
-    assert ran_before == {"pod-1": True, "pod-gpu": False, "pod-new": False}
-    # the backend says this create repeats one it built before: the older validator's create may be it, at any age
-    repeat = _create_request().model_copy(update={"pod_id": "pod-1", "earlier_create_built": True})
-    assert await client._command_ran_before(repeat) is True
-    # it says this create is the pod's first since its last new rental, reboot or retry: the older validator's create
-    # was settled (a success whose receipt was lost leaves the same mark), so a renter's new reboot runs, and the kept
-    # mark goes
-    first = repeat.model_copy(update={"earlier_create_built": False})
-    assert await client._command_ran_before(first) is False
-    assert await redis_service.pre_upgrade_create_started("pod-1") is None
-    assert await client._command_ran_before(repeat) is False
-
-
-@pytest.mark.asyncio
-async def test_an_older_validators_mark_the_start_could_not_move_still_counts_and_its_receipt_settles_it():
-    """A start whose move of the older validator's marks failed (Redis away at that moment) leaves them where that
-    validator wrote them: they count all the same, at any age; the create's receipt then clears the kept mark too."""
+@pytest.mark.parametrize("earlier_create_built", [True, False, None])
+async def test_only_the_backends_word_that_a_create_repeats_one_it_sent_counts_an_older_validators_run(
+    earlier_create_built,
+):
+    """An older validator labels no container and keeps no record of its command, and its pending marks carry no command
+    ID and may be gone (a late receipt of another dispatch cleared them, or a later mark dropped them): nothing it left
+    can say which command made the pod's container, so none counts. A repeat of a create the backend already sent
+    counts as run before; a first send does not, nor does an older backend's create without this command's own mark."""
     redis_service = _redis_service()
     old = int(time.time()) - 31 * 60
     await redis_service.hset(PENDING_PODS_PREFIX, "miner-hk:exec-1", json.dumps([{"time": old, "pod_id": "pod-1"}]))
     client = _client(redis_service)
-    repeat = _create_request().model_copy(update={"pod_id": "pod-1", "earlier_create_built": True})
+    request = _create_request().model_copy(update={"pod_id": "pod-1", "earlier_create_built": earlier_create_built})
 
-    assert await client._command_ran_before(repeat) is True
-    assert await client._command_ran_before(repeat.model_copy(update={"earlier_create_built": None})) is True
-
-    await redis_service.hset(PRE_UPGRADE_CREATE_MARKS_KEY, "pod-1", str(old))
-    await redis_service.remove_pending_pod("miner-hk", "exec-1", "pod-1")
-    assert await redis_service.pre_upgrade_create_started("pod-1") is None
-    assert await client._command_ran_before(repeat) is False
-
-
-@pytest.mark.asyncio
-async def test_a_late_receipt_of_an_earlier_dispatch_keeps_the_older_validators_mark_a_newer_create_depends_on():
-    """The older validator's mark carries no command ID. A receipt bound to an earlier dispatch of the pod, arriving
-    while a newer create is the pod's current one, leaves it (kept by the start or still where that validator wrote
-    it); the current dispatch's receipt settles it."""
-    redis_service = _redis_service()
-    old = int(time.time()) - 31 * 60
-    await redis_service.hset(PENDING_PODS_PREFIX, "miner-hk:exec-1", json.dumps([{"time": old, "pod_id": "pod-1"}]))
-    await redis_service.hset(PRE_UPGRADE_CREATE_MARKS_KEY, "pod-1", str(old))
-    await redis_service.accept_create_dispatch("pod-1", "cmd-early", 1)
-    await redis_service.accept_create_dispatch("pod-1", "cmd-new", 2)
-    client = _client(redis_service)
-    newer = _create_request().model_copy(update={"pod_id": "pod-1", "command_id": "cmd-new"})
-
-    await redis_service.remove_pending_pod("miner-hk", "exec-1", "pod-1", command_id="cmd-early")
-    assert await redis_service.pre_upgrade_create_started("pod-1") == old
-    assert await client._command_ran_before(newer) is True
-
-    await redis_service.remove_pending_pod("miner-hk", "exec-1", "pod-1", command_id="cmd-new")
-    assert await redis_service.pre_upgrade_create_started("pod-1") is None
-    assert await client._command_ran_before(newer) is False
+    assert await client._command_ran_before(request) is (earlier_create_built is True)

@@ -98,8 +98,6 @@ def client(monkeypatch):
     service.lock = asyncio.Lock()
     # no pending mark of an earlier run of the command (compute_client._command_ran_before)
     service.get_pending_pods = AsyncMock(return_value=[])
-    service.pre_upgrade_create_started = AsyncMock(return_value=None)
-    service.settle_pre_upgrade_create = AsyncMock()
     client = ComputeClient.__new__(ComputeClient)
     client.message_queue = OutgoingMessages()
     client.lock = asyncio.Lock()

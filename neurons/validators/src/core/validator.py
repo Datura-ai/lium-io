@@ -51,6 +51,7 @@ from services.matrix_validation_service import ValidationService
 from services.miner_service import MinerService
 from services.redis_service import (
     GPU_ESTIMATES_CHANNEL,
+    PENDING_PODS_PREFIX,
     RedisService,
 )
 from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
@@ -259,7 +260,7 @@ class Validator:
             self.live_cycle_ids = json.loads(await self.redis_service.get(LIVE_CYCLE_IDS_KEY) or "[]")
 
             # remove pod renting-in-progress status
-            await self.redis_service.clear_pending_pods()
+            await self.redis_service.delete(PENDING_PODS_PREFIX)
         except Exception as e:
             logger.error(
                 _m(

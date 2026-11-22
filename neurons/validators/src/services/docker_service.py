@@ -3727,12 +3727,14 @@ async def _replay_own_finished_create(
         raise _OwnCreateWithoutRecord(f"docker could not list the container (exit {result.exit_status})")
     record_text, _, state = (result.stdout or "").partition(_CREATE_RECORD_STATE_MARK)
     fields = state.split()
-    if len(fields) == 1 and (create_node_absent.get() is not None or not payload.local_volume):
-        # the pod's container carries no command label: an older validator made it. A reboot or edit brings the pod's
-        # volume and replaces that container, the pod's own, through the edit swap (kept until its replacement runs).
-        # A fresh create (no volume) has no container of its own yet, so this one is an earlier run of the pod, maybe
-        # cut off by the upgrade; so is any one when this command ran before, or when that validator left a create of
-        # the pod unanswered (its pending mark, kept by pod at start). Its outcome is unknown; the cleanup below would
+    if len(fields) == 1 and (
+        create_node_absent.get() is not None or payload.earlier_create_built is not False or not payload.local_volume
+    ):
+        # the pod's container carries no command label: an older validator made it, under a command this validator
+        # cannot name. Only a reboot or edit the backend says is its command's first send (earlier_create_built False)
+        # replaces it, through the edit swap: it cannot be that command's own run, so it is the pod's current container.
+        # A repeat may be the very command that made it (an answer lost at the upgrade); a fresh create (no volume) has
+        # no container of its own yet; an older backend cannot say. Its outcome is unknown; the cleanup below would
         # remove it and its volume
         raise _OwnCreateWithoutRecord("the pod's container has no command label")
     if len(fields) != 2 or fields[1] != payload.command_id:
