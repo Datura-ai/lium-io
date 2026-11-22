@@ -8213,14 +8213,19 @@ class DockerService:
         each mount) and may fill at most half the disk space free now: s3fs keeps ensure_diskfree MB free,
         dropping cached files that are not open, and reading uncached, when the pod's own writes need the room.
         """
+        # the SSH session lands in the executor container, where the host's Docker root does not exist:
+        # measure it through the helper container, as every other free-disk reading does
         free = await ssh_client.run(
-            "df -Pm \"$(/usr/bin/docker info -f '{{.DockerRootDir}}')/plugins\" | awk 'NR==2 {print $4}'"
+            "root=\"$(/usr/bin/docker info -f '{{.DockerRootDir}}')\" && " + df_command('"$root/plugins"')
         )
-        free_mb = (free.stdout or "").strip() if free.exit_status == 0 else ""
-        if not free_mb.isdigit():
+        try:
+            free_mb = parse_df_available_bytes(free.stdout or "") // 2**20 if free.exit_status == 0 else None
+        except Exception:
+            free_mb = None
+        if free_mb is None:
             # without a free-space reading there is no safe limit: mount uncached, as before
             return ""
-        return f",use_cache={S3FS_PLUGIN_CACHE_DIR},del_cache,ensure_diskfree={int(free_mb) - int(free_mb) // 2}"
+        return f",use_cache={S3FS_PLUGIN_CACHE_DIR},del_cache,ensure_diskfree={free_mb - free_mb // 2}"
 
     async def _install_s3fs_plugin_instance(
         self,

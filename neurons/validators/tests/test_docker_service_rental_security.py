@@ -804,12 +804,18 @@ async def test_create_s3fs_volume_replaces_an_instance_of_another_build(
     assert f"plugin install {docker_service_module.S3FS_PLUGIN_IMAGE} " in ssh_client.commands[install]
 
 
+_DF_HEADER = "Filesystem 1-blocks Used Available Capacity Mounted on\n"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("free_space", "cache_options"),
     [
         # DAH-6876: a read-through cache that may fill half the disk space free at mount time
-        (SimpleNamespace(stdout="10001\n", exit_status=0), ",use_cache=/var/cache/s3fs,del_cache,ensure_diskfree=5001"),
+        (
+            SimpleNamespace(stdout=_DF_HEADER + f"/dev/root 1 1 {10001 * 2**20} 1% /hostfs\n", exit_status=0),
+            ",use_cache=/var/cache/s3fs,del_cache,ensure_diskfree=5001",
+        ),
         # no reading, no safe limit: the mount stays uncached
         (SimpleNamespace(stdout="", exit_status=1), ""),
         (SimpleNamespace(stdout="df: no such file\n", exit_status=0), ""),
@@ -825,7 +831,8 @@ async def test_create_s3fs_volume_caches_reads_within_half_the_free_disk(
     answer = ssh_client.run
 
     async def run(command, *args, **kwargs):
-        if command.startswith("df -Pm "):
+        # the SSH session lands in the executor container: the host's Docker root is read through the helper
+        if command.startswith("root=") and '-v "$root/plugins":/hostfs:ro' in command:
             ssh_client.commands.append(command)
             return SimpleNamespace(stderr="", **vars(free_space))
         return await answer(command, *args, **kwargs)
