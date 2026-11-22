@@ -1182,6 +1182,7 @@ class RedisService:
         if kind is None:  # clearing one kind of mark (a GPU reset's) is no create's receipt
             # rent-finished is the ContainerCreated's receipt; nothing is resent for a pod no longer pending
             await self._remove_unacked_container_created_unless(pod_id, other_dispatch)
+            await self.hdel(PRE_UPGRADE_CREATE_MARKS_KEY, pod_id)   # an older validator's create of the pod, answered
 
     async def accept_create_dispatch(self, pod_id: str, command_id: str, accepted_ns: int) -> None:
         """Records a create the backend sent, placed by `accepted_ns`, the time the receive loop took its message: the
@@ -1503,16 +1504,20 @@ class RedisService:
             for item in _parse_pending_pods(marks):
                 if item.get("pod_id") and not item.get("command_id") and not item.get("kind"):
                     kept[item["pod_id"]] = max(kept.get(item["pod_id"], 0), int(item.get("time", 0)))
+        # kept until the create's receipt, the pod's next first create (the backend says so) or its delete: an edit cut
+        # off by the upgrade can be sent again at any time later
         for pod_id, started in kept.items():
             await self.hset(PRE_UPGRADE_CREATE_MARKS_KEY, pod_id, str(started))
-        if kept:
-            await self.expire(PRE_UPGRADE_CREATE_MARKS_KEY, PENDING_MARK_MAX_AGE_SECONDS)
         await self.delete(PENDING_PODS_PREFIX)
 
-    async def pre_upgrade_create_unanswered(self, pod_id: str) -> bool:
-        """An older validator left a rental create of the pod unanswered within the pending-mark window."""
+    async def pre_upgrade_create_started(self, pod_id: str) -> int | None:
+        """When an older validator started the rental create of the pod it left unanswered (clear_pending_pods), or None."""
         started = await self.hget(PRE_UPGRADE_CREATE_MARKS_KEY, pod_id)
-        return started is not None and time.time() - int(started) < PENDING_MARK_MAX_AGE_SECONDS
+        return None if started is None else int(started)
+
+    async def settle_pre_upgrade_create(self, pod_id: str) -> None:
+        """The older validator's create of the pod is answered or superseded: its kept mark goes."""
+        await self.hdel(PRE_UPGRADE_CREATE_MARKS_KEY, pod_id)
 
     async def get_pending_pods(
         self, miner_hotkey: str, executor_id: str, max_age_seconds: int | None = PENDING_MARK_MAX_AGE_SECONDS
