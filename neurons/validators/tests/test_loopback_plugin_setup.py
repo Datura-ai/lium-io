@@ -677,6 +677,15 @@ async def test_setup_command_quotes_the_root_and_never_installs_a_digest(alias, 
             {"enable_exit": 1, "enable_stderr": "Error response from daemon: dial unix plugin.sock: connect refused"},
             "verified plugin remains disabled: Error response from daemon: dial unix plugin.sock: connect refused",
         ),
+        (
+            {"install_leaves_nothing": True,
+             "install_stderr": 'Get "https://blobs.example/b/l?X-Amz-Signature=hunter2&X-Amz-Expires=60": EOF'},
+            'installation did not produce a plugin: Get "https://blobs.example/b/l": EOF',
+        ),
+        (
+            {"enable_exit": 1, "enable_stderr": "pull https://u:hunter2@blobs.example/b/l?sig=hunter2#hunter2 failed"},
+            "verified plugin remains disabled: pull https://blobs.example/b/l failed",
+        ),
     ],
 )
 def test_setup_failure_carries_docker_s_own_reason_without_credentials(tmp_path: Path, overrides, reason) -> None:

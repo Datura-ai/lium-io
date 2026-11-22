@@ -89,8 +89,10 @@ def end_on_validator_deadline(*_):
     sys.exit(1)
 
 def stderr_of(result):
-    # docker's own message, without credentials a registry URL may carry, on one line
-    text = re.sub(r"://[^/\s@]+@", "://", result.stderr or "").strip()[-300:]
+    # docker's own message on one line, each URL cut to scheme, host and path: its user info and its query
+    # (a signed URL's signature or token) are credentials
+    text = re.sub(r"://(?:[^/\s@]+@)?([^\s?#\"']*)[?#][^\s\"']*", r"://\1", result.stderr or "")
+    text = re.sub(r"://[^/\s@]+@", "://", text).strip()[-300:]
     return ": " + " ".join(text.split()) if text else ""
 
 signal.signal(signal.SIGTERM, end_on_validator_deadline)
@@ -165,12 +167,12 @@ def mount_probe_volume():
         created = run_docker("volume", "create", "-d", alias, "-o", "size=1g", "-o", "sparse=true", probe_volume,
                              timeout=max(1, deadline - time.monotonic()))
         if created.returncode:
-            raise RuntimeError("probe volume create failed: " + created.stderr.strip()[-300:])
+            raise RuntimeError("probe volume create failed" + stderr_of(created))
         mounted = run_docker("run", "--rm", "--name", probe_container, "--network", "none",
                              "-v", probe_volume + ":/mnt", probe_image, "sh", "-c", "echo probe > /mnt/probe && sync /mnt/probe",
                              timeout=max(1, deadline - time.monotonic()))
         if mounted.returncode:
-            raise RuntimeError("probe volume mount failed: " + mounted.stderr.strip()[-300:])
+            raise RuntimeError("probe volume mount failed" + stderr_of(mounted))
     except BaseException:
         remove_probe_leftovers()
         raise
