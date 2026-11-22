@@ -1345,20 +1345,44 @@ async def test_a_kept_pass_that_could_not_be_dropped_is_never_carried_after_a_re
 
 
 @pytest.mark.asyncio
+async def test_a_kept_pass_invalidated_by_a_cycle_on_the_same_block_is_never_carried_after_a_restart(monkeypatch):
+    """Review at 8058786: a cycle an operator asks for runs on the job block of the scheduled cycle before it, so it
+    finds that cycle's vouch. It sees a rental start and close, Redis refuses the delete, and the validator restarts.
+    The next scheduled cycle must not pay the pass on the vouch the invalidating cycle read."""
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_kept({})]}, service, job_block=JOB_BLOCK)
+    delete = service.delete
+    monkeypatch.setattr(service, "delete", AsyncMock(side_effect=ConnectionError("redis down")))
+    forced = {"5Miner": [_failed("node-1", SEEN_RENTED)]}
+    await carry_renter_gpu_reset_results(forced, service, set(), _listed(), {}, _listed(), job_block=JOB_BLOCK)
+    assert forced["5Miner"][0].carried_for_renter_gpu_reset is False
+    assert await service.get(last_scored_result_key("5Miner", "node-1")) is not None  # the delete failed
+    await remember_rented_scored_results({"5Miner": []}, service, job_block=JOB_BLOCK)  # the node was withheld
+    monkeypatch.setattr(service, "delete", delete)
+    # a restart here keeps nothing in memory: what follows reads only the store
+
+    next_cycle = {"5Miner": [_failed("node-1", NO_TIME)]}
+    await carry_renter_gpu_reset_results(
+        next_cycle, service, set(), _listed(), {}, _listed(), job_block=JOB_BLOCK + settings.BLOCKS_FOR_JOB
+    )
+    assert next_cycle["5Miner"][0].carried_for_renter_gpu_reset is False
+
+
+@pytest.mark.asyncio
 async def test_a_kept_pass_whose_read_failed_in_the_cycle_that_invalidated_it_is_never_carried_later(monkeypatch):
     """Review at 4d2ac28: the cycle that sees a rental start and close cannot read the idle pass (Redis refuses the
     read), so nothing deletes it. The node was withheld, so that cycle vouched for nothing, and a later idle cycle with
     Redis back, after a restart or not, does not pay the pass."""
     service = _redis_service()
     await remember_rented_scored_results({"5Miner": [_kept({})]}, service, job_block=PREV_BLOCK)
-    mget = service.mget
-    monkeypatch.setattr(service, "mget", AsyncMock(side_effect=ConnectionError("redis down")))
+    read_and_take = service.read_and_take
+    monkeypatch.setattr(service, "read_and_take", AsyncMock(side_effect=ConnectionError("redis down")))
     job_results = {"5Miner": [_failed("node-1", SEEN_RENTED)]}
     await carry_renter_gpu_reset_results(job_results, service, set(), _listed(), {}, _listed(), job_block=JOB_BLOCK)
     assert job_results["5Miner"][0].carried_for_renter_gpu_reset is False
     assert await service.get(last_scored_result_key("5Miner", "node-1")) is not None  # nothing deleted it
     await remember_rented_scored_results({"5Miner": []}, service, job_block=JOB_BLOCK)  # the node was withheld
-    monkeypatch.setattr(service, "mget", mget)
+    monkeypatch.setattr(service, "read_and_take", read_and_take)
 
     next_cycle = {"5Miner": [_failed("node-1", NO_TIME)]}
     await carry_renter_gpu_reset_results(

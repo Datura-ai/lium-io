@@ -973,13 +973,14 @@ async def _last_scored_result(
     held result is then withheld, as before). Eligibility is a fact of the store, not of a process: every cycle that
     keeps the result eligible writes its job block with the cycle's results (`remember_rented_scored_results`). A
     cycle that dropped it, withheld the node, or wrote nothing at all (a Redis outage, a restart) leaves no vouch, so
-    a row such a cycle could not delete is never read as eligible again."""
+    a row such a cycle could not delete is never read as eligible again. The read takes the vouch it finds, so a
+    cycle that shares the job block of the one before it cannot leave that cycle's vouch behind."""
     try:
-        raw, vouch = await redis_service.mget(
-            [
-                last_scored_result_key(miner_hotkey, held.executor_info.uuid),
-                last_scored_result_vouch_key(miner_hotkey, held.executor_info.uuid),
-            ]
+        # the read spends the vouch: only this cycle's own write can vouch for the next one, so a cycle that drops the
+        # result (on any job block) and cannot delete it leaves nothing a later cycle accepts
+        raw, vouch = await redis_service.read_and_take(
+            last_scored_result_key(miner_hotkey, held.executor_info.uuid),
+            last_scored_result_vouch_key(miner_hotkey, held.executor_info.uuid),
         )
         if not raw:
             return None

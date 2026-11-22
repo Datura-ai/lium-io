@@ -898,6 +898,15 @@ class RedisService:
             return []
         return await self.redis.mget(keys)
 
+    async def read_and_take(self, key: str, taken_key: str) -> tuple:
+        """`key` and `taken_key` read in one MULTI that also deletes `taken_key`: a value read is never read again."""
+        async with self.redis.pipeline(transaction=True) as pipe:
+            pipe.get(key)
+            pipe.get(taken_key)
+            pipe.delete(taken_key)
+            value, taken, _ = await pipe.execute()
+        return value, taken
+
     async def delete(self, key: str):
         """Remove a key from Redis."""
         await self.redis.delete(key)
