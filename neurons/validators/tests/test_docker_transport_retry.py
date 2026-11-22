@@ -183,20 +183,31 @@ async def test_run_container_retry_refuses_a_same_name_container_on_another_imag
     assert api.calls == ["create_container", "inspect_container"]
 
 
-@pytest.mark.asyncio
-async def test_run_container_retry_adopts_the_first_create_still_running_in_dockerd(monkeypatch):
-    """29 Oct: the first create outlived the 60 s read timeout; dockerd still held the name (409) while
-    inspect said 404. The retry waits for that create to register and adopts it, no third create."""
-    import services.rental_docker_sdk as sdk
-
-    monkeypatch.setattr(sdk, "_INFLIGHT_CREATE_POLL_SECONDS", 0)
-    api = _FakeApiClient(adapter=_FakeAdapter())
-    conflict = APIError(
+def _name_conflict() -> APIError:
+    return APIError(
         "Conflict",
         response=Mock(status_code=409, url="containers/create", reason="Conflict"),
         explanation='Conflict. The container name "/pod_test" is already in use by container "abc".',
     )
-    api.create_container_errors = [EOFError(), conflict]
+
+
+@pytest.mark.asyncio
+async def test_run_container_retry_adopts_the_first_create_however_long_dockerd_runs_it(monkeypatch):
+    """22 Nov (pod d98d08ae): the first create outlived the 60 s read timeout and dockerd kept running it
+    past the retry's 60 s wait (409 on the name, inspect 404), so the rent failed on its own name. The
+    retry waits while dockerd holds the name and adopts the container once it registers; no third create."""
+    import requests
+    import services.rental_docker_sdk as sdk
+
+    monkeypatch.setattr(sdk, "_INFLIGHT_CREATE_POLL_SECONDS", 0)
+    # the first create outlasts any fixed wait (the removed 60 s one included)
+    monkeypatch.setattr(sdk, "_INFLIGHT_CREATE_WAIT_SECONDS", 0, raising=False)
+    api = _FakeApiClient(adapter=_FakeAdapter())
+    api.create_container_errors = [
+        requests.exceptions.ReadTimeout("Read timed out. (read timeout=60)"),
+        _name_conflict(),
+        _name_conflict(),
+    ]
     inspects = iter([_not_found(), _not_found()])
 
     def inspect_container(name):
@@ -210,8 +221,32 @@ async def test_run_container_retry_adopts_the_first_create_still_running_in_dock
 
     assert await _client(api).run_container(_run_spec()) == "first"
     assert api.calls == [
-        "create_container", "inspect_container", "create_container",
-        "inspect_container", "inspect_container", "start",
+        "create_container",
+        "inspect_container", "create_container",
+        "inspect_container", "create_container",
+        "inspect_container", "start",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_container_retry_creates_once_dockerd_released_the_name(monkeypatch):
+    """The first create failed in dockerd after the read timeout: the name is free again and the retry's
+    create is the only container."""
+    import requests
+    import services.rental_docker_sdk as sdk
+
+    monkeypatch.setattr(sdk, "_INFLIGHT_CREATE_POLL_SECONDS", 0)
+    api = _FakeApiClient(adapter=_FakeAdapter())
+    api.create_container_errors = [
+        requests.exceptions.ReadTimeout("Read timed out. (read timeout=60)"),
+        _name_conflict(),
+    ]
+
+    assert await _client(api).run_container(_run_spec()) == "cid"
+    assert api.calls == [
+        "create_container",
+        "inspect_container", "create_container",
+        "inspect_container", "create_container", "start",
     ]
 
 

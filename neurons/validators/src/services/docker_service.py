@@ -11830,40 +11830,47 @@ class DockerService:
                     # again right before the create: a customer create may register while the run
                     # waits for a thread.
                     _refuse_filler_during_customer_create(payload)
-                    container_id = await self._run_rental_docker_create_with_port_retry(
-                        docker_client=docker_client,
-                        ssh_client=ssh_client,
-                        run_spec=run_spec,
-                        container_name=container_name,
-                        default_extra=default_extra,
-                        local_volume=local_volume,
-                        log_tag=log_tag,
-                        port_maps=port_maps,
-                        spare_port_pairs=_spare_port_pairs(payload.available_ports, port_maps),
-                        pod_id=payload.pod_id,
-                        remove_port_checks_listed_live=(
-                            None
-                            if probed_port_check_names is None
-                            else lambda: self.wait_for_port_check_containers(
-                                executor_info=executor_info,
-                                miner_hotkey=payload.miner_hotkey,
-                                keypair=keypair,
-                                private_key=private_key,
-                                ssh_client=ssh_client,
-                            )
+                    # a create retried after a lost answer waits for dockerd's first create, which a delete ends
+                    container_id = await self._unless_cancelled_by_delete(
+                        ssh_client,
+                        payload,
+                        default_extra,
+                        self._run_rental_docker_create_with_port_retry(
+                            docker_client=docker_client,
+                            ssh_client=ssh_client,
+                            run_spec=run_spec,
+                            container_name=container_name,
+                            default_extra=default_extra,
+                            local_volume=local_volume,
+                            log_tag=log_tag,
+                            port_maps=port_maps,
+                            spare_port_pairs=_spare_port_pairs(payload.available_ports, port_maps),
+                            pod_id=payload.pod_id,
+                            remove_port_checks_listed_live=(
+                                None
+                                if probed_port_check_names is None
+                                else lambda: self.wait_for_port_check_containers(
+                                    executor_info=executor_info,
+                                    miner_hotkey=payload.miner_hotkey,
+                                    keypair=keypair,
+                                    private_key=private_key,
+                                    ssh_client=ssh_client,
+                                )
+                            ),
+                            # fillers keep no RepoDigests on a flattened copy, so their image check would be skipped
+                            flatten_reserved_bytes=(
+                                _flatten_reserved_bytes(
+                                    effective_storage_limit_gb, effective_volume_limit_gb, payload.disk_share
+                                )
+                                if payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
+                                else None
+                            ),
+                            before_flatten_retry=lambda: self._abort_if_cancelled_by_delete(
+                                ssh_client, payload, default_extra, settle_early_probes
+                            ),
+                            flatten_beside_other_create=lambda: customer_creates.others_running(payload),
                         ),
-                        # fillers keep no RepoDigests on a flattened copy, so their image check would be skipped
-                        flatten_reserved_bytes=(
-                            _flatten_reserved_bytes(
-                                effective_storage_limit_gb, effective_volume_limit_gb, payload.disk_share
-                            )
-                            if payload.workload_kind == WorkloadKind.CUSTOMER_RENTAL
-                            else None
-                        ),
-                        before_flatten_retry=lambda: self._abort_if_cancelled_by_delete(
-                            ssh_client, payload, default_extra, settle_early_probes
-                        ),
-                        flatten_beside_other_create=lambda: customer_creates.others_running(payload),
+                        settle_early_probes=settle_early_probes,
                     )
                     edit_swap.replacement_id = container_id
                     # A customer create that ran while the daemon created this container may have

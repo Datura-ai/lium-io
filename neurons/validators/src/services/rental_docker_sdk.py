@@ -39,7 +39,6 @@ _DOCKER_SDK_SSH_ADAPTER_LOCK = threading.Lock()
 # timeouts) plus one more attempt of the same call with its own timeout; there is no third try.
 _DOCKER_SSH_REOPEN_TIMEOUT_SECONDS = 15
 # a create that outlived the client's read timeout holds its name in dockerd until it registers the container
-_INFLIGHT_CREATE_WAIT_SECONDS = 60
 _INFLIGHT_CREATE_POLL_SECONDS = 2
 TRANSPORT_ERROR_CLASS = "transport"
 # The texts docker-py/urllib3/paramiko produce when the SSH channel under a Docker call is gone.
@@ -627,8 +626,26 @@ class RentalDockerSdkClient:
         return await self._retry_once_on_transport_drop(
             operation="run container",
             attempt=lambda: self._run_container_once(spec, adopt_existing=False),
-            resume=lambda: self._run_container_once(spec, adopt_existing=True),
+            resume=lambda: self._resume_run_container(spec),
         )
+
+    async def _resume_run_container(self, spec: ContainerRunSpec) -> str | None:
+        """The retry after the first `containers/create` lost its answer: adopt that create's container.
+
+        dockerd may still be running that create (a create that copies the image's files into a new
+        volume takes minutes): it holds the name (409) while inspect answers 404 until the container is
+        registered. As long as dockerd keeps the name held, the first create's outcome is still coming,
+        so the retry waits for it: adopted once registered, or created here once dockerd released the
+        name because that create failed. A delete of the pod ends the wait (the caller's
+        `_unless_cancelled_by_delete`).
+        """
+        while True:
+            try:
+                return await self._run_container_once(spec, adopt_existing=True)
+            except RentalDockerOperationError as exc:
+                if f'"/{spec.name}" is already in use' not in str(exc):
+                    raise
+            await asyncio.sleep(_INFLIGHT_CREATE_POLL_SECONDS)
 
     async def _run_container_once(self, spec: ContainerRunSpec, *, adopt_existing: bool) -> str | None:
         try:
@@ -1155,31 +1172,22 @@ class RentalDockerSdkClient:
             )
             if spec.before_create is not None:
                 spec.before_create()
-            try:
-                created = self._api_client.create_container(
-                    image=spec.image,
-                    command=list(spec.command) or None,
-                    detach=True,
-                    ports=_container_ports(spec.ports) or None,
-                    environment=spec.environment or None,
-                    volumes=_container_volumes(spec.volumes) or None,
-                    name=spec.name,
-                    entrypoint=spec.entrypoint or None,
-                    host_config=host_config,
-                    labels={
-                        **spec.labels,
-                        **({RENTAL_CPU_COUNT_LABEL: str(spec.cpu_count)} if spec.cpu_count else {}),
-                    }
-                    or None,
-                )
-            except Exception as exc:
-                # The first attempt's create timed out on the client but still runs in dockerd: it holds
-                # the name (409) while inspect answers 404 until it registers the container. Adopt it then.
-                if not adopt_existing or f'"/{spec.name}" is already in use' not in str(exc):
-                    raise
-                adopted_id = self._wait_for_inflight_create_sync(spec)
-                if adopted_id is None:
-                    raise
+            created = self._api_client.create_container(
+                image=spec.image,
+                command=list(spec.command) or None,
+                detach=True,
+                ports=_container_ports(spec.ports) or None,
+                environment=spec.environment or None,
+                volumes=_container_volumes(spec.volumes) or None,
+                name=spec.name,
+                entrypoint=spec.entrypoint or None,
+                host_config=host_config,
+                labels={
+                    **spec.labels,
+                    **({RENTAL_CPU_COUNT_LABEL: str(spec.cpu_count)} if spec.cpu_count else {}),
+                }
+                or None,
+            )
         if spec.before_start is not None:
             spec.before_start(
                 [
@@ -1194,16 +1202,6 @@ class RentalDockerSdkClient:
         # Others keep the name: a failed start leaves no ID for the cleanup, which then removes by name.
         self._api_client.start(container_id if spec.before_start is not None and container_id else spec.name)
         return container_id
-
-    def _wait_for_inflight_create_sync(self, spec: ContainerRunSpec) -> str | None:
-        """The adopted ID once the in-flight create of `spec.name` registers; None after the wait."""
-        deadline = time.monotonic() + _INFLIGHT_CREATE_WAIT_SECONDS
-        while time.monotonic() < deadline:
-            time.sleep(_INFLIGHT_CREATE_POLL_SECONDS)
-            adopted_id = self._adopt_container_by_name_sync(spec)
-            if adopted_id is not None:
-                return adopted_id
-        return None
 
     def _adopt_container_by_name_sync(self, spec: ContainerRunSpec) -> str | None:
         """The idempotency check before a retried `containers/create`.
