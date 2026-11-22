@@ -42,7 +42,7 @@ class FakeHost:
                  lgc_exit=0, rgc_exit=0, supported=SUPPORTED, app_mem_exit=0):
         self.commands: list[str] = []
         self.timeouts: list[int] = []
-        self.app_mem_exit = app_mem_exit  # None: the -rac/-rmc call times out (the runner answers -1, no output)
+        self.app_mem_exit = app_mem_exit  # None: the host's timeout kills the -rac/-rmc batch (no line of theirs)
         request = {"Count": count or 0, "DeviceIDs": list(device_ids) or None, "Capabilities": [["gpu"]]}
         self.inspect = json.dumps({"Id": "c" * 64, "HostConfig": {"Runtime": runtime, "DeviceRequests": [request]}})
         self.gpus = "\n".join(f"{i}, {U[i]}, {BUS[i]}, {'Enabled' if i in mig else 'Disabled'}" for i in range(4))
@@ -63,14 +63,12 @@ class FakeHost:
             return make_command_result(self.lgc_exit == 0, "not supported", exit_code=self.lgc_exit)
         if "--query-gpu=clocks.gr" in cmd:
             return make_command_result(True, "1410")
-        if " -rac " in cmd:  # after the -rgc batch, in its own call: one "<uuid> <flag> <exit>" line per reset
-            if self.app_mem_exit is None:
-                return make_command_result(False, "", exit_code=-1)
-            resets = re.findall(r"nvidia-smi -i (\S+) (-rac|-rmc) ", cmd)
-            return make_command_result(True, "\n".join(f"{u} {flag} {self.app_mem_exit}" for u, flag in resets))
-        if " -rgc " in cmd:  # the batched resets: one "<uuid> <exit>" line per GPU
-            uuids = _reset_uuids(cmd)
-            return make_command_result(True, "\n".join(f"{u} {self.rgc_exit}" for u in uuids))
+        if " -rgc " in cmd:  # the batched resets: "<uuid> <exit>" per GPU, then "<uuid> <flag> <exit>" per -rac/-rmc
+            lines = [f"{u} {self.rgc_exit}" for u in _reset_uuids(cmd)]
+            if self.app_mem_exit is not None:
+                resets = re.findall(r"nvidia-smi -i (\S+) (-rac|-rmc) ", cmd)
+                lines += [f"{u} {flag} {self.app_mem_exit}" for u, flag in resets]
+            return make_command_result(True, "\n".join(lines))
         raise AssertionError(f"unexpected command {cmd}")
 
 
@@ -272,18 +270,22 @@ async def test_reset_runs_rgc_per_gpu_and_clears_the_records():
 @pytest.mark.asyncio
 async def test_a_create_resets_application_and_memory_clocks_after_the_graphics_reset_of_every_gpu():
     """A host's -ac/-lmc (or a pod's -ac once the host ran -acp UNRESTRICTED) never reaches the next renter: after
-    the -rgc batch, one call with its own timeout resets them on every GPU and echoes each exit."""
+    the -rgc batch, in the same SSH call (one round trip on the create's path) and under its own host-side timeout,
+    -rac/-rmc reset them on every GPU in parallel and echo each exit."""
     host, redis = FakeHost(), FakeRedis()
     assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == []
     _assert_invariants(host, [U[0], U[1]])
-    rgc, app_mem = host.commands
+    (cmd,) = host.commands
+    rgc, _, app_mem = cmd.partition("; timeout ")
     assert _reset_uuids(rgc) == [U[0], U[1]] and " -rac" not in rgc
-    assert app_mem == " ".join(
+    resets = " ".join(
         "( " + "; ".join(f"nvidia-smi -i {u} {flag} >/dev/null 2>&1; echo {u} {flag} $?" for flag in ("-rac", "-rmc"))
         + " ) &"
         for u in (U[0], U[1])
     ) + " wait"
-    assert host.timeouts[1] == APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS
+    assert app_mem == f"-k 5 {APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS} sh -c '{resets}'"
+    # the runner waits past both budgets, so a stalled -rac/-rmc is killed on the host before the call is given up
+    assert host.timeouts[0] > 30 + APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS + 5
 
 
 @pytest.mark.asyncio
@@ -294,7 +296,7 @@ async def test_application_and_memory_clock_resets_of_an_8_gpu_node_run_in_paral
     fake.write_text("#!/bin/sh\nsleep 1\n")
     fake.chmod(0o755)
     uuids = [f"GPU-{i:08d}-0000-0000-0000-000000000000" for i in range(8)]
-    cmd = " ".join(gpu_clocks._reset_app_and_memory_clocks(u) for u in uuids) + " wait"
+    cmd = gpu_clocks._reset_app_and_memory_clocks(uuids)
     t0 = time.monotonic()
     proc = await asyncio.create_subprocess_shell(
         cmd, stdout=asyncio.subprocess.PIPE, env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"}
@@ -307,12 +309,36 @@ async def test_application_and_memory_clock_resets_of_an_8_gpu_node_run_in_paral
 
 
 @pytest.mark.asyncio
+async def test_a_stalled_application_or_memory_reset_is_killed_on_the_host_and_the_rgc_lines_still_come_back(
+    tmp_path, monkeypatch
+):
+    """Review (lio#2309): in one SSH call a hung -rac/-rmc must not hold the -rgc results. Run for real: an
+    nvidia-smi that never returns is killed by the batch's host-side timeout, the -rgc lines already printed come
+    back, and the call ends near that timeout."""
+    fake = tmp_path / "nvidia-smi"
+    fake.write_text("#!/bin/sh\nsleep 60\n")
+    fake.chmod(0o755)
+    monkeypatch.setattr(gpu_clocks, "APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr(gpu_clocks, "_APP_MEM_KILL_AFTER_SECONDS", 1)
+    cmd = f"echo {U[0]} 0; echo {U[1]} 0; {gpu_clocks._reset_app_and_memory_clocks([U[0], U[1]])}"
+    t0 = time.monotonic()
+    proc = await asyncio.create_subprocess_shell(
+        cmd, stdout=asyncio.subprocess.PIPE, env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"}
+    )
+    out, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+    elapsed = time.monotonic() - t0
+    assert out.decode().split("\n")[:2] == [f"{U[0]} 0", f"{U[1]} 0"]
+    assert elapsed < 5, f"{elapsed:.1f} s: the stalled reset was not killed on the host"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("app_mem_exit", [None, 1])
 async def test_a_stalled_or_failed_application_or_memory_reset_keeps_the_rgc_results_and_the_create(
     app_mem_exit, caplog
 ):
-    """Review: a -rac/-rmc that times out (or fails) never erases the -rgc results: the GPUs' lock records from a
-    previous rental go, the create is not refused, and each failure is logged; exit 3 (not supported) is not."""
+    """Review: a -rac/-rmc that times out (killed on the host) or fails never erases the -rgc results: the GPUs' lock
+    records from a previous rental go, the create is not refused, and each failure is logged; exit 3 (not supported)
+    is not."""
     host, redis = FakeHost(app_mem_exit=app_mem_exit), FakeRedis()
     for u in (U[0], U[1]):
         redis.store[f"gpu_clock_lock:{u}"] = json.dumps({"pod_id": "old"})
@@ -320,8 +346,7 @@ async def test_a_stalled_or_failed_application_or_memory_reset_keeps_the_rgc_res
         assert await reset_leftover_clock_locks(host, redis, [U[0], U[1]]) == []
     assert not any(k.startswith("gpu_clock_lock:") for k in redis.store)
     expected = "unknown" if app_mem_exit is None else "1"
-    lost = 1 if app_mem_exit is None else 0  # an empty answer also logs why, once
-    assert caplog.text.count("gpu_clock_action=rac_rmc_failed") == 4 + lost and f"exit={expected}" in caplog.text
+    assert caplog.text.count("gpu_clock_action=rac_rmc_failed") == 4 and f"exit={expected}" in caplog.text
 
     caplog.clear()
     host.app_mem_exit = 3
@@ -341,7 +366,7 @@ async def test_the_pods_delete_resets_its_locks_and_a_failed_reset_is_caught_by_
     host.rgc_exit, host.commands = 0, []
     # U[2] has no record (a lost one looks the same): reset too
     assert await reset_leftover_clock_locks(host, redis, [U[0], U[1], U[2]]) == []
-    assert len(host.commands) == 2 and _reset_uuids(host.commands[0]) == [U[0], U[1], U[2]], "one -rgc call"
+    assert len(host.commands) == 1 and _reset_uuids(host.commands[0]) == [U[0], U[1], U[2]], "one call"
     assert not any(k.startswith("gpu_clock_lock:") for k in redis.store)
 
 
@@ -540,7 +565,7 @@ async def test_teardown_without_a_lock_costs_no_ssh_and_a_whole_node_create_chec
     assert await reset_pod_clock_locks(host, redis, "pod1", "hk", "ex") == 0 and host.commands == []
     redis.store[f"gpu_clock_lock:{U[3]}"] = json.dumps({"pod_id": "old"})
     assert await reset_leftover_clock_locks(host, redis, []) == []
-    assert len(host.commands) == 3 and _reset_uuids(host.commands[1]) == U
+    assert len(host.commands) == 2 and _reset_uuids(host.commands[1]) == U
     assert f"gpu_clock_lock:{U[3]}" not in redis.store
 
 
