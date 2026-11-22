@@ -730,13 +730,18 @@ async def test_a_session_lost_in_the_port_check_is_retried_not_a_failed_first_pa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("check", ["rental", "verifyx"])
+@pytest.mark.parametrize("check", ["rental", "verifyx", "rented"])
 async def test_a_rental_probe_the_task_had_no_time_for_is_no_failed_first_pass(monkeypatch, wallet, check):
-    """DAH-5933: the validator's budget left the rental probe (or VerifyX) no time: nothing is published, the node is
-    not validated, and it is asked again as a deferral until MAX_ATTEMPTS leaves it to the cycle."""
+    """DAH-5933: the validator's budget left the rental probe (or VerifyX) no time, or the backend found the node
+    rented during the check (review 4656859541): the scored cycle has no verdict for it, so nothing is published, the
+    node is not validated, and it is asked again as a deferral until MAX_ATTEMPTS leaves it to the cycle."""
     from services.task.messages import RentalVerificationMessages, VerifyXMessages
 
-    no_time_reason = (RentalVerificationMessages if check == "rental" else VerifyXMessages).NO_TASK_TIME.reason
+    no_time_reason = {
+        "rental": RentalVerificationMessages.NO_TASK_TIME.reason,
+        "verifyx": VerifyXMessages.NO_TASK_TIME.reason,
+        "rented": RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason,
+    }[check]
 
     new_node = str(uuid4())
     harness = _Harness(monkeypatch, {"miner-a": [_portal_executor(new_node)]}, [_Neuron("miner-a")])
