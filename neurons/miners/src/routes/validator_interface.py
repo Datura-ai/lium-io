@@ -147,7 +147,8 @@ async def submit_ssh_pubkey(
             len(executors),
         )
         return AcceptSSHKeyRequest(
-            executors=executors, known_executor_ids=registration.known_executor_ids
+            executors=executors, known_executor_ids=registration.known_executor_ids,
+            refused_executors=registration.refused,
         )
     except Exception as e:
         logger.error("Storing SSH key or Sending AcceptSSHKeyRequest failed: %s", str(e), exc_info=True)

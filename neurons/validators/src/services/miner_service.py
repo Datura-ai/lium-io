@@ -1203,12 +1203,13 @@ class MinerService:
         }
         if rented_data:
             skip |= {str(uuid).lower() for uuid in rented_data.executors}
+        refused = {str(uuid).lower(): str(text)[:200] for uuid, text in (msg.refused_executors or {}).items()}
         results = []
         for executor_uuid in known:
             if executor_uuid in skip:
                 continue
             event = build_executor_unreachable_by_miner_event(
-                executor_uuid=executor_uuid, miner_hotkey=payload.miner_hotkey
+                executor_uuid=executor_uuid, miner_hotkey=payload.miner_hotkey, refusal=refused.get(executor_uuid)
             )
             log_text = _m(
                 event.event,

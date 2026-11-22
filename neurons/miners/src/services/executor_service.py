@@ -119,6 +119,20 @@ MAX_EXECUTOR_ANSWER_BYTES = 4 * 1024 * 1024
 MAX_POD_LOGS_ANSWER_BYTES = 64 * 1024 * 1024
 
 
+# a refusal is relayed to the validator and shown to the provider; an executor answers {"detail": "..."}
+MAX_REFUSAL_CHARS = 200
+
+
+def _refusal_text(status: int, body: str) -> str:
+    """`HTTP <status>: <the executor's detail>`, or the start of its body when that is no FastAPI error."""
+    try:
+        detail = json.loads(body).get("detail")
+    except (ValueError, AttributeError):
+        detail = None
+    text = detail if isinstance(detail, str) else body
+    return f"HTTP {status}: {' '.join(text.split())}"[:MAX_REFUSAL_CHARS]
+
+
 class ExecutorAnswerTooLarge(Exception):
     pass
 
@@ -147,6 +161,8 @@ class PubkeyRegistration(pydantic.BaseModel):
     known_executor_ids: list[str]
     # The subset that accepted the key, with the SSH info the validator connects with.
     accepted: list[ExecutorSSHInfo]
+    # The ones that answered the upload with a refusal: id -> the node's answer.
+    refused: dict[str, str] = pydantic.Field(default_factory=dict)
 
 
 class ExecutorService:
@@ -379,6 +395,7 @@ class ExecutorService:
         miner_hotkey: str | None = None,
         validator_miner_signature: str | None = None,
         deadline: float | None = None,
+        refusals: dict[str, str] | None = None,
     ) -> ExecutorSSHInfo | None:
         """TODO: Send API request to executor with pubkey
 
@@ -389,6 +406,7 @@ class ExecutorService:
                 verbatim (it is covered by validator_signature)
             deadline (Optional[float]): time.monotonic() by which the last attempt must end;
                 default UPLOAD_SSH_KEY_BUDGET_SECONDS from now
+            refusals (Optional[dict]): gets the executor's answer when it refuses the key (a non-200), by id
 
         Return:
             response (ExecutorSSHInfo | None): Executor SSH connection info.
@@ -436,6 +454,8 @@ class ExecutorService:
                         body = await _read_capped(response)
                         if response.status != 200:
                             text = body.decode(errors="replace")
+                            if refusals is not None:
+                                refusals[str(executor.uuid)] = _refusal_text(response.status, text)
                             logger.error(
                                 _m(
                                     "API request failed to register SSH key - HTTP error",
@@ -572,6 +592,7 @@ class ExecutorService:
         deadline = time.monotonic() + budget
         host_keys: dict[str, str] = {}
         node_accounts: dict[str, dict] = {}
+        refusals: dict[str, str] = {}
         executors = await self.get_executors_for_validator(
             validator_hotkey, miner_hotkey, executor_id, host_keys=host_keys, node_accounts=node_accounts
         )
@@ -580,7 +601,7 @@ class ExecutorService:
                 self.send_pubkey_to_executor(
                     executor, pubkey.decode("utf-8"), validator_signature, nonce=nonce,
                     miner_hotkey=miner_hotkey, validator_miner_signature=validator_miner_signature,
-                    deadline=deadline,
+                    deadline=deadline, refusals=refusals,
                 ),
                 name=f"{executor}.send_pubkey_to_executor",
             )
@@ -622,6 +643,7 @@ class ExecutorService:
         return PubkeyRegistration(
             known_executor_ids=[str(executor.uuid) for executor in executors],
             accepted=results,
+            refused=refusals,
         )
 
     async def deregister_pubkey(
