@@ -2015,6 +2015,63 @@ def test_gpu_count_without_a_cuda_reading_is_decided_by_the_device_nodes():
     assert _gpu_step(gpu_list_output(cuda="")).failed_step is None
 
 
+# b79a5aca (8x RTX PRO 6000), real run 22 Nov: the nvidia-smi index is not the kernel minor
+B79A_UUIDS = (
+    "GPU-387f548b-c862-4bbd-5278-937ab2a27111",
+    "GPU-880613b1-43ab-d0fa-834c-57c9d2575632",
+    "GPU-eb01c9cc-24e4-c6cc-2069-b938b9dd081b",
+    "GPU-c37646d3-489b-f908-e710-614efdc4e071",
+    "GPU-ca5fa561-09e7-4f3e-ff76-de6be57a5028",
+    "GPU-70635d8f-b358-3ef7-72f7-0730c61cd0c0",
+    "GPU-932dbdf5-31ff-b429-8a4c-d0efa6ee0281",
+    "GPU-b918ddb9-aded-4789-8a8b-3e8fbe2729a4",
+)
+B79A_MINORS = (2, 3, 0, 1, 6, 7, 4, 5)
+
+
+def _smi_listing(uuids) -> str:
+    return "".join(f"GPU {i}: NVIDIA RTX PRO 6000 Blackwell Server Edition (UUID: {u})\n" for i, u in enumerate(uuids))
+
+
+def test_gpu_count_links_cards_by_uuid_to_kernel_minor_not_by_index():
+    """Real b79a5aca output passes; a one-card container whose nvidia-smi GPU 0 is kernel minor 2 needs
+    /dev/nvidia2, and /dev/nvidia0 (index match) is not its card."""
+    whole = module._usable_gpus(
+        gpu_list_output(
+            _smi_listing(B79A_UUIDS),
+            nodes=tuple(range(8)),
+            minors=tuple(zip(B79A_UUIDS, B79A_MINORS)),
+            cuda="8",
+            mig=("Disabled",) * 8,
+        )
+    )
+    assert whole.short_of(8) is None
+    one_card = dict(
+        minors=tuple(zip(B79A_UUIDS, B79A_MINORS)), cuda="1", mig=("Disabled",)
+    )
+    by_index = module._usable_gpus(gpu_list_output(_smi_listing(B79A_UUIDS[:1]), nodes=(0,), **one_card))
+    assert by_index.short_of(1) == "0 usable GPU device node(s) (/dev/nvidiaN)"
+    by_minor = module._usable_gpus(gpu_list_output(_smi_listing(B79A_UUIDS[:1]), nodes=(2,), **one_card))
+    assert by_minor.short_of(1) is None
+
+
+def test_gpu_count_fails_nvidia_smi_uuids_the_kernel_does_not_list():
+    """0a8f24a9 shape, real run 22 Nov: nvidia-smi reports 8 UUIDs, the kernel lists one other card,
+    one device node, CUDA 1."""
+    fake = tuple(f"GPU-0000000{i}-0000-0000-0000-000000000000" for i in range(8))
+    shape = module._usable_gpus(
+        gpu_list_output(
+            _smi_listing(fake),
+            nodes=(0,),
+            minors=(("GPU-ad5fa337-0000-0000-0000-000000000000", 0),),
+            cuda="1",
+            mig=("Disabled",) * 8,
+        )
+    )
+    assert shape.unknown_uuids == 8
+    assert shape.short_of(8) == "8 nvidia-smi GPU UUID(s) the kernel driver does not know"
+
+
 def test_gpu_count_reads_cuda_with_the_image_cuda_visible_devices_unset():
     """An image default CUDA_VISIBLE_DEVICES=0 narrows nothing a renter cannot undo; the count must not
     read it as a missing card."""

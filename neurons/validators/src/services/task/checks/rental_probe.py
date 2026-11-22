@@ -1620,8 +1620,11 @@ class _UsableGpus:
     device_nodes: int
     cuda_count: int | None
     cuda_error: str | None
+    unknown_uuids: int = 0
 
     def short_of(self, expected: int) -> str | None:
+        if self.unknown_uuids:
+            return f"{self.unknown_uuids} nvidia-smi GPU UUID(s) the kernel driver does not know"
         if self.device_nodes < expected:
             return f"{self.device_nodes} usable GPU device node(s) (/dev/nvidiaN)"
         if self.cuda_error is not None:
@@ -1634,21 +1637,29 @@ class _UsableGpus:
 def _usable_gpus(output: str) -> _UsableGpus:
     """Parse GPU_LIST_COMMAND's sections. A missing section reads as nothing usable: the command always
     prints its marks, so output without them did not come from it."""
-    _, _, rest = output.partition(_DEVICE_NODES_MARK)
+    smi_text, _, rest = output.partition(_DEVICE_NODES_MARK)
     nodes_text, _, rest = rest.partition(_GPU_MINORS_MARK)
     minors_text, _, rest = rest.partition(_MIG_MODE_MARK)
     mig_text, _, cuda_text = rest.partition(_CUDA_COUNT_MARK)
     node_minors = {int(m) for m in re.findall(r"^/dev/nvidia(\d+)$", nodes_text, re.MULTILINE)}
-    listed_minors = set(_parse_uuid_minor_csv(minors_text).values())
-    usable = len(listed_minors & node_minors) if listed_minors else len(node_minors)
+    kernel_minors = _parse_uuid_minor_csv(minors_text)
+    smi_uuids = re.findall(r"\(UUID: (GPU-[0-9a-fA-F-]+)\)", smi_text)
+    unknown = 0
+    if kernel_minors:
+        # linked by UUID -> kernel minor -> /dev/nvidiaN: the nvidia-smi index is not the minor on every host,
+        # and a UUID the kernel does not list is no card the driver gave this container
+        unknown = sum(1 for uuid in smi_uuids if uuid not in kernel_minors)
+        usable = len({kernel_minors[uuid] for uuid in smi_uuids if uuid in kernel_minors} & node_minors)
+    else:
+        usable = len(node_minors)
     if re.search(r"^\s*Enabled\s*$", mig_text, re.MULTILINE):
         # CUDA enumerates MIG instances, not cards, so its count says nothing per card; the device nodes decide
-        return _UsableGpus(usable, None, None)
+        return _UsableGpus(usable, None, None, unknown)
     # empty (no python3 or no libcuda.so.1 in the image): no CUDA reading, the device nodes alone decide
     cuda = cuda_text.strip().splitlines()[-1].strip() if cuda_text.strip() else ""
     if cuda.isdigit():
-        return _UsableGpus(usable, int(cuda), None)
-    return _UsableGpus(usable, None, cuda[:80] or None)
+        return _UsableGpus(usable, int(cuda), None, unknown)
+    return _UsableGpus(usable, None, cuda[:80] or None, unknown)
 
 
 async def _teardown(ctx: Context, created: ContainerCreated, pod_id: str) -> str | None:
