@@ -267,7 +267,7 @@ async def lium_containers(ctx: Context) -> set[str] | None:
         return None
     containers: set[str] = lium_workload_containers(ctx)
     specs = ctx.state.specs or {}
-    # A custom image builds in `lium-dind-build-<pod_id>.<attempt>`, which is on no rental list and burns
+    # A custom image builds in `lium-poddind-<pod_id>.<attempt>`, which is on no rental list and burns
     # cores. The pod id keeps the name rename-proof: it has to match a pod the BACKEND reports
     # here, the same rule the orphan sweep removes such a container by.
     rented_executor = rental_of_this_node(ctx)

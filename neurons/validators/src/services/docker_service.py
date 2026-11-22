@@ -9240,18 +9240,19 @@ class DockerService:
     # ------------------------------------------------------------------
     # Every build names its image, scratch path and DinD container after its pod and its own create attempt
     # (`<pod id>.<attempt>`): two creates of one pod never share them, so neither's teardown or cleanup reaches the
-    # other's. The orphan sweep reads the pod id before the ".".
+    # other's. The orphan sweep reads the pod id before the ".". The prefixes are custom_build_orphan_sweep's
+    # ATTEMPT_*_PREFIX, which an older validator's sweep never selects.
     @staticmethod
     def _custom_build_image_tag(pod_id: str, attempt: str) -> str:
-        return f"lium-build-{pod_id}.{attempt}"
+        return f"lium-podbuild-{pod_id}.{attempt}"
 
     @staticmethod
     def _custom_build_scratch_dir(pod_id: str, attempt: str) -> str:
-        return f"/tmp/lium-build-{pod_id}.{attempt}"
+        return f"/tmp/lium-podbuild-{pod_id}.{attempt}"
 
     @staticmethod
     def _dind_container_name(pod_id: str, attempt: str) -> str:
-        return f"lium-dind-build-{pod_id}.{attempt}"
+        return f"lium-poddind-{pod_id}.{attempt}"
 
     @staticmethod
     def _dind_firewall_helper_names(dind_name: str) -> tuple[str, str]:
@@ -10063,12 +10064,12 @@ class DockerService:
     ) -> list[str]:
         """The pod's build containers an earlier create left (any attempt, and the name used before attempts were
         named), without their firewall helpers. Empty when the listing fails: the build then starts beside them."""
-        from services.task.checks.custom_build_orphan_sweep import BUILD_DIND_PREFIX, dind_build_pod_id
+        from services.task.checks.custom_build_orphan_sweep import DIND_PREFIXES, dind_build_pod_id
 
-        name_filter = shlex.quote(f"name=^{BUILD_DIND_PREFIX}{pod_id}")
+        name_filter = " ".join(f"--filter {shlex.quote(f'name=^{prefix}{pod_id}')}" for prefix in DIND_PREFIXES)
         try:
             listed = await ssh_client.run(
-                f"/usr/bin/docker ps -a --format '{{{{.Names}}}}' --filter {name_filter}",
+                f"/usr/bin/docker ps -a --format '{{{{.Names}}}}' {name_filter}",
                 check=False,
                 timeout=timeout_s,
             )
@@ -10211,13 +10212,15 @@ class DockerService:
             scratch = shlex.quote(self._custom_build_scratch_dir(pod_id, build_attempt))
         else:
             image_tag = f"lium-build-{pod_id}"
-            # the pod's own tags only: the "." ends the pod id, so no other pod's prefix matches
+            attempts = f"lium-podbuild-{pod_id}."
+            # the pod's own tags only: the legacy name exactly, or an attempt name; the "." ends the pod id, so no
+            # other pod's prefix matches
             images = (
                 f"$(/usr/bin/docker images --format '{{{{.Repository}}}}' "
-                f"| awk -v p={shlex.quote(image_tag)} '$0 == p || index($0, p \".\") == 1' | sort -u)"
+                f"| awk -v p={shlex.quote(image_tag)} -v a={shlex.quote(attempts)} '$0 == p || index($0, a) == 1' "
+                "| sort -u)"
             )
-            scratch_root = shlex.quote(f"/tmp/{image_tag}")
-            scratch = f"{scratch_root} {scratch_root}.*"
+            scratch = f"{shlex.quote(f'/tmp/{image_tag}')} {shlex.quote(f'/tmp/{attempts}')}*"
         try:
             await ssh_client.run(
                 f"/usr/bin/docker image rm {images} 2>/dev/null || true",

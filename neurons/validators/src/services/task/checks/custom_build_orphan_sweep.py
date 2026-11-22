@@ -40,8 +40,8 @@ logger = logging.getLogger(__name__)
 # 6 hour cadence per the plan / Phase 0.8 outcome (b).
 SWEEP_INTERVAL_SECONDS = 6 * 60 * 60
 
-# Tag prefix and scratch-dir prefix invariants from the build subroutine in
-# ``docker_service._custom_build_image_tag`` / ``_custom_build_scratch_dir``.
+# Names before builds were named per create attempt: ``<prefix><pod id>``. Validators of that release still write
+# and sweep them, so they stay readable here.
 BUILD_IMAGE_PREFIX = "lium-build-"
 BUILD_SCRATCH_PREFIX = "/tmp/lium-build-"
 # DAH-2211 — internet-enabled builds run in a throwaway sysbox DinD container
@@ -49,6 +49,16 @@ BUILD_SCRATCH_PREFIX = "/tmp/lium-build-"
 # Inline teardown removes it; this sweep mops up the validator-crashed-mid-build
 # leftover so a stale container does not pin CPU/mem/disk on the executor host.
 BUILD_DIND_PREFIX = "lium-dind-build-"
+# Per-attempt names, ``<prefix><pod id>.<attempt>`` (``docker_service._custom_build_image_tag``,
+# ``_custom_build_scratch_dir``, ``_dind_container_name``). The prefixes are ones an older validator's sweep never
+# selects: it reads everything after its own prefix as the pod id, so it would take `<pod id>.<attempt>` for an
+# unknown pod and remove a running build.
+ATTEMPT_IMAGE_PREFIX = "lium-podbuild-"
+ATTEMPT_SCRATCH_PREFIX = "/tmp/lium-podbuild-"
+ATTEMPT_DIND_PREFIX = "lium-poddind-"
+IMAGE_PREFIXES = (ATTEMPT_IMAGE_PREFIX, BUILD_IMAGE_PREFIX)
+SCRATCH_PREFIXES = (ATTEMPT_SCRATCH_PREFIX, BUILD_SCRATCH_PREFIX)
+DIND_PREFIXES = (ATTEMPT_DIND_PREFIX, BUILD_DIND_PREFIX)
 # A build's two iptables helpers are named after its DinD with these suffixes
 # (``docker_service._dind_firewall_helper_names``). ``docker ps --filter name=``
 # lists them with the DinD, so the pod id is read after the suffix is stripped:
@@ -61,9 +71,9 @@ def dind_container_pod_id(name: str) -> str | None:
 
     ``None`` when the name carries another prefix or no pod id at all.
     """
-    if not name.startswith(BUILD_DIND_PREFIX):
+    pod_id = _after_prefix(name, DIND_PREFIXES)
+    if pod_id is None:
         return None
-    pod_id = name[len(BUILD_DIND_PREFIX):]
     for suffix in BUILD_DIND_HELPER_SUFFIXES:
         if pod_id.endswith(suffix):
             pod_id = pod_id[: -len(suffix)]
@@ -73,14 +83,23 @@ def dind_container_pod_id(name: str) -> str | None:
 
 def dind_build_pod_id(name: str) -> str | None:
     """Pod id of a ``lium-dind-build-*`` build container itself, not of its firewall helpers."""
-    if name.endswith(BUILD_DIND_HELPER_SUFFIXES) or not name.startswith(BUILD_DIND_PREFIX):
+    rest = _after_prefix(name, DIND_PREFIXES)
+    if name.endswith(BUILD_DIND_HELPER_SUFFIXES) or rest is None:
         return None
     # only `<pod id>.<attempt>` with the create's 8-hex attempt (secrets.token_hex(4)), or a bare pod id named before
     # attempts: any other suffix is not a build this validator made
-    pod_id, dot, attempt = name[len(BUILD_DIND_PREFIX):].partition(".")
+    pod_id, dot, attempt = rest.partition(".")
     if dot and not re.fullmatch(r"[0-9a-f]{8}", attempt):
         return None
     return pod_id or None
+
+
+def _after_prefix(name: str, prefixes: tuple[str, ...]) -> str | None:
+    """What follows the one of `prefixes` that `name` starts with; None when it starts with none."""
+    for prefix in prefixes:
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return None
 
 
 def _pod_id_of(name_rest: str) -> str | None:
@@ -124,7 +143,8 @@ class CustomBuildOrphanSweepCheck:
     async def _list_orphan_images(self, ssh, active_pod_ids: set[str]) -> list[str]:
         """Return `lium-build-*` image tags that are NOT in active_pod_ids."""
         cmd = (
-            f'/usr/bin/docker images --filter "reference={BUILD_IMAGE_PREFIX}*" '
+            f'/usr/bin/docker images --filter "reference={ATTEMPT_IMAGE_PREFIX}*" '
+            f'--filter "reference={BUILD_IMAGE_PREFIX}*" '
             f'--format "{{{{.Repository}}}}:{{{{.Tag}}}}" 2>/dev/null || true'
         )
         try:
@@ -140,9 +160,10 @@ class CustomBuildOrphanSweepCheck:
             # Format is `repo:tag`. Repo is `lium-build-{pod_id}`; tag is usually
             # `latest`. We match on the repo segment.
             repo = line.split(":", 1)[0]
-            if not repo.startswith(BUILD_IMAGE_PREFIX):
+            rest = _after_prefix(repo, IMAGE_PREFIXES)
+            if rest is None:
                 continue
-            pod_id = _pod_id_of(repo[len(BUILD_IMAGE_PREFIX):])
+            pod_id = _pod_id_of(rest)
             if pod_id in active_pod_ids:
                 continue
             orphans.append(line)
@@ -151,7 +172,7 @@ class CustomBuildOrphanSweepCheck:
     async def _list_orphan_scratch_dirs(self, ssh, active_pod_ids: set[str]) -> list[str]:
         """Return `/tmp/lium-build-*` scratch dirs whose pod_id is not active."""
         cmd = (
-            'ls -1d /tmp/lium-build-* 2>/dev/null || true'
+            'ls -1d /tmp/lium-podbuild-* /tmp/lium-build-* 2>/dev/null || true'
         )
         try:
             result = await ssh.run(cmd, check=False)
@@ -161,9 +182,10 @@ class CustomBuildOrphanSweepCheck:
         orphans: list[str] = []
         for raw in (result.stdout or "").splitlines():
             path = raw.strip()
-            if not path.startswith(BUILD_SCRATCH_PREFIX):
+            rest = _after_prefix(path, SCRATCH_PREFIXES)
+            if rest is None:
                 continue
-            pod_id = _pod_id_of(path[len(BUILD_SCRATCH_PREFIX):])
+            pod_id = _pod_id_of(rest)
             if not pod_id or pod_id in active_pod_ids:
                 continue
             orphans.append(path)
@@ -176,7 +198,7 @@ class CustomBuildOrphanSweepCheck:
         `<dind>-fw-remove`); they go with their pod's verdict.
         """
         cmd = (
-            f'/usr/bin/docker ps -a --filter "name={BUILD_DIND_PREFIX}" '
+            f'/usr/bin/docker ps -a --filter "name={ATTEMPT_DIND_PREFIX}" --filter "name={BUILD_DIND_PREFIX}" '
             f'--format "{{{{.Names}}}}" 2>/dev/null || true'
         )
         try:
@@ -195,7 +217,7 @@ class CustomBuildOrphanSweepCheck:
 
     async def _remove_dind_container(self, ssh, name: str) -> bool:
         # Defensive — only act on names matching our prefix.
-        if not name.startswith(BUILD_DIND_PREFIX):
+        if _after_prefix(name, DIND_PREFIXES) is None:
             return False
         # name, image ref and path are node output: quoted, so a planted name cannot run as shell
         cmd = f'/usr/bin/docker rm -fv {shlex.quote(name)} 2>/dev/null || true'
@@ -221,7 +243,8 @@ class CustomBuildOrphanSweepCheck:
 
     async def _remove_scratch(self, ssh, path: str) -> bool:
         # Defensive — only act on paths matching our prefix.
-        if not path.startswith(BUILD_SCRATCH_PREFIX) or "/" in path[len(BUILD_SCRATCH_PREFIX):]:
+        rest = _after_prefix(path, SCRATCH_PREFIXES)
+        if rest is None or "/" in rest:
             return False
         cmd = f'/usr/bin/rm -rf -- {shlex.quote(path)}'
         try:

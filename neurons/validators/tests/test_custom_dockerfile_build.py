@@ -575,9 +575,9 @@ async def test_A27f_two_builds_of_one_pod_never_reach_each_others_build_containe
     )
 
     assert not any(".aaaa0000" in c for c in ssh_client.calls)
-    assert any(c.startswith(f"/usr/bin/docker rm -fv lium-dind-build-{payload.pod_id}.bbbb0000 ") for c in ssh_client.calls)
-    assert any(f"image rm lium-build-{payload.pod_id}.bbbb0000 " in c for c in ssh_client.calls)
-    assert any(f"rm -rf /tmp/lium-build-{payload.pod_id}.bbbb0000" in c for c in ssh_client.calls)
+    assert any(c.startswith(f"/usr/bin/docker rm -fv lium-poddind-{payload.pod_id}.bbbb0000 ") for c in ssh_client.calls)
+    assert any(f"image rm lium-podbuild-{payload.pod_id}.bbbb0000 " in c for c in ssh_client.calls)
+    assert any(f"rm -rf /tmp/lium-podbuild-{payload.pod_id}.bbbb0000" in c for c in ssh_client.calls)
 
 
 @pytest.mark.asyncio
@@ -587,8 +587,8 @@ async def test_A27g_the_pods_delete_cleans_up_the_build_artifacts_of_every_attem
     await svc._cleanup_custom_build_artifacts(ssh_client=ssh_client, pod_id="pod-1", default_extra={})
 
     image_rm = next(c for c in ssh_client.calls if "image rm" in c)
-    assert "awk -v p=lium-build-pod-1 '$0 == p || index($0, p \".\") == 1'" in image_rm
-    assert any(c == "/usr/bin/rm -rf /tmp/lium-build-pod-1 /tmp/lium-build-pod-1.*" for c in ssh_client.calls)
+    assert "awk -v p=lium-build-pod-1 -v a=lium-podbuild-pod-1. '$0 == p || index($0, a) == 1'" in image_rm
+    assert any(c == "/usr/bin/rm -rf /tmp/lium-build-pod-1 /tmp/lium-podbuild-pod-1.*" for c in ssh_client.calls)
 
 
 @pytest.mark.asyncio
@@ -597,7 +597,7 @@ async def test_A27e_a_resumed_build_whose_old_build_container_cannot_be_stopped_
     from services.docker_service import executor_key, inflight_creates
 
     payload = _base_payload(dockerfile_content="FROM alpine\n")
-    ssh_client = _make_dind_ssh(leftover_dinds=(f"lium-dind-build-{payload.pod_id}.c0ff0001",))
+    ssh_client = _make_dind_ssh(leftover_dinds=(f"lium-poddind-{payload.pod_id}.c0ff0001",))
     inner = ssh_client.run
 
     async def _run(cmd, **kw):

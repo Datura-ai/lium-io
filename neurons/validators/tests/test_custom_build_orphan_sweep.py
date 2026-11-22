@@ -5,6 +5,7 @@ build's DinD one second into the build)."""
 from __future__ import annotations
 
 import json
+import re
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -104,28 +105,83 @@ def test_an_attempt_named_build_artifact_reads_as_its_pods():
         dind_container_pod_id,
     )
 
-    assert dind_container_pod_id("lium-dind-build-pod-1.ab12-fw-apply") == "pod-1"
-    assert dind_build_pod_id("lium-dind-build-pod-1.ab12cd34") == "pod-1"
-    assert dind_build_pod_id("lium-dind-build-pod-1.zzzz-not-hex") is None
-    assert dind_build_pod_id("lium-dind-build-pod-1.ab12") is None
-    assert dind_build_pod_id("lium-dind-build-pod-1.ab12-fw-remove") is None
+    assert dind_container_pod_id("lium-poddind-pod-1.ab12-fw-apply") == "pod-1"
+    assert dind_build_pod_id("lium-poddind-pod-1.ab12cd34") == "pod-1"
+    assert dind_build_pod_id("lium-poddind-pod-1.zzzz-not-hex") is None
+    assert dind_build_pod_id("lium-poddind-pod-1.ab12") is None
+    assert dind_build_pod_id("lium-poddind-pod-1.ab12-fw-remove") is None
     assert dind_build_pod_id("lium-dind-build-pod-1") == "pod-1"
+    assert dind_container_pod_id("lium-dind-build-pod-1-fw-apply") == "pod-1"
 
 
-@pytest.mark.asyncio
-async def test_the_sweep_keeps_an_active_pods_attempt_named_image_and_scratch():
-    from neurons.validators.src.services.task.checks.custom_build_orphan_sweep import CustomBuildOrphanSweepCheck
+def _listings(pod_id: str, attempt: str | None) -> dict[str, list[str]]:
+    from services.docker_service import DockerService
+
+    if attempt is None:  # the names a validator before per-attempt names writes
+        image, scratch, dind = f"lium-build-{pod_id}", f"/tmp/lium-build-{pod_id}", f"lium-dind-build-{pod_id}"
+    else:
+        image = DockerService._custom_build_image_tag(pod_id, attempt)
+        scratch = DockerService._custom_build_scratch_dir(pod_id, attempt)
+        dind = DockerService._dind_container_name(pod_id, attempt)
+    return {"images": [f"{image}:latest"], "scratch": [scratch], "dind": [dind, f"{dind}-fw-apply"]}
+
+
+def _legacy_orphans(active_pods: set[str], listings: dict[str, list[str]]) -> tuple[list, list, list]:
+    """The sweep of a validator released before per-attempt names (eec20430b), as it selects and reads: docker's
+    `reference=lium-build-*` and `ls /tmp/lium-build-*` globs, `docker ps --filter name=lium-dind-build-` (a
+    substring match), and the pod id is everything after its prefix."""
+    from fnmatch import fnmatchcase
+
+    def pod(rest: str) -> str:
+        for suffix in ("-fw-apply", "-fw-remove"):
+            rest = rest.removesuffix(suffix)
+        return rest
+
+    images = [i for i in listings["images"] if fnmatchcase(i.split(":")[0], "lium-build-*")]
+    scratch = [s for s in listings["scratch"] if fnmatchcase(s, "/tmp/lium-build-*")]
+    dind = [d for d in listings["dind"] if "lium-dind-build-" in d]
+    return (
+        [i for i in images if pod(i.split(":")[0][len("lium-build-"):]) not in active_pods],
+        [s for s in scratch if pod(s[len("/tmp/lium-build-"):]) not in active_pods],
+        [d for d in dind if pod(d[len("lium-dind-build-"):]) not in active_pods],
+    )
+
+
+async def _current_orphans(active_pods: set[str], listings: dict[str, list[str]]) -> tuple[list, list, list]:
+    from fnmatch import fnmatchcase
 
     async def run(cmd, *args, **kwargs):
-        stdout = ""
+        # the node answers each listing with what its filters select, as docker and the shell would
         if "docker images" in cmd:
-            stdout = "lium-build-pod-1.ab12:latest\nlium-build-pod-2.cd34:latest\n"
+            pats = re.findall(r'reference=([^"]+)"', cmd)
+            rows = [i for i in listings["images"] if any(fnmatchcase(i.split(":")[0], p) for p in pats)]
         elif "ls -1d" in cmd:
-            stdout = "/tmp/lium-build-pod-1.ab12\n/tmp/lium-build-pod-2.cd34\n"
-        return SimpleNamespace(exit_status=0, stdout=stdout, stderr="")
+            globs = [w for w in cmd.split() if w.startswith("/tmp/")]
+            rows = [s for s in listings["scratch"] if any(fnmatchcase(s, g) for g in globs)]
+        else:
+            subs = re.findall(r'name=([^"]+)"', cmd)
+            rows = [d for d in listings["dind"] if any(s in d for s in subs)]
+        return SimpleNamespace(exit_status=0, stdout="".join(f"{r}\n" for r in rows), stderr="")
 
     ssh = SimpleNamespace(run=run)
     check = CustomBuildOrphanSweepCheck.__new__(CustomBuildOrphanSweepCheck)
+    return (
+        await check._list_orphan_images(ssh, active_pods),
+        await check._list_orphan_scratch_dirs(ssh, active_pods),
+        await check._list_orphan_dind_containers(ssh, active_pods),
+    )
 
-    assert await check._list_orphan_images(ssh, {"pod-1"}) == ["lium-build-pod-2.cd34:latest"]
-    assert await check._list_orphan_scratch_dirs(ssh, {"pod-1"}) == ["/tmp/lium-build-pod-2.cd34"]
+
+@pytest.mark.asyncio
+async def test_an_older_validators_sweep_never_selects_a_running_builds_attempt_names():
+    # review on lium-io#2394: the validator and the connector roll out apart, so an older validator's sweep meets
+    # the names this one writes; it would read `<pod id>.<attempt>` as an unknown pod and `docker rm -fv` the build
+    current = _listings("pod-1", "ab12cd34")
+    assert _legacy_orphans({"pod-1"}, current) == ([], [], [])
+    assert await _current_orphans({"pod-1"}, current) == ([], [], [])
+    # and a build of a pod no longer rented is still found, under either name
+    legacy = _listings("pod-gone", None)
+    assert await _current_orphans({"pod-1"}, legacy) == (legacy["images"], legacy["scratch"], legacy["dind"])
+    gone = _listings("pod-gone", "ab12cd34")
+    assert await _current_orphans({"pod-1"}, gone) == (gone["images"], gone["scratch"], gone["dind"])
+    assert await _current_orphans({"pod-gone"}, legacy) == ([], [], [])

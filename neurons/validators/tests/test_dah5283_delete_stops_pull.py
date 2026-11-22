@@ -119,7 +119,7 @@ async def test_a_delete_mid_custom_build_stops_the_build_before_its_export_and_t
 
     assert build_cancelled.is_set()
     assert not any("docker save" in c for c in seen)
-    assert any("rm -f" in c and "lium-dind-build-" in c for c in ssh_client.calls)
+    assert any("rm -f" in c and "lium-poddind-" in c for c in ssh_client.calls)
 
 
 @pytest.mark.asyncio
