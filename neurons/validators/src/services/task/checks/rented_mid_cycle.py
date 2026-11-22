@@ -18,9 +18,9 @@ async def rent_requested_since_cycle_start(ctx: Context) -> str | None:
     so a starved Redis pool cannot hold a finished step.
     """
     try:
-        marks = await asyncio.wait_for(
-            ctx.services.redis.hgetall(rent_requested_key(ctx.miner_hotkey, ctx.executor.uuid)), 5
-        )
+        # asyncio.timeout, not wait_for: on 3.11 wait_for drops a cancel that lands as the read completes
+        async with asyncio.timeout(5):
+            marks = await ctx.services.redis.hgetall(rent_requested_key(ctx.miner_hotkey, ctx.executor.uuid))
     except (redis.exceptions.RedisError, TimeoutError):
         return None
     at_start = rental_of_this_node(ctx)

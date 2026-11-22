@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import re
+import signal
+import sys
 import time
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
@@ -332,6 +334,53 @@ async def test_an_outside_cancel_returns_only_after_the_steps_own_cleanup_ran():
     await asyncio.gather(run, return_exceptions=True)
 
     assert step.cleaned_up
+
+
+class HeldReadRedis(FakeRedis):
+    """The first rent-mark read waits until the test answers it; later reads find no mark."""
+
+    def __init__(self):
+        super().__init__()
+        self.read = asyncio.get_running_loop().create_future()
+        self.called = asyncio.Event()
+
+    async def hgetall(self, key):
+        if self.called.is_set():
+            return {}
+        self.called.set()
+        return await self.read
+
+
+class SubprocessStep(HeavyStep):
+    """Local GPU-work stand-in: a 2 s subprocess, killed on cancel."""
+
+    async def run(self, ctx):
+        self.proc = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(2)")
+        try:
+            await self.proc.wait()
+        except asyncio.CancelledError:
+            self.proc.kill()
+            await self.proc.wait()
+            raise
+        self.finished = True
+        return CheckResult(passed=True, event=render_message(Msg.NOT_RENTED, ctx=ctx, check_id=self.check_id, what={}))
+
+
+@pytest.mark.parametrize("read_done_same_turn", [False, True])
+@pytest.mark.asyncio
+async def test_an_outside_cancel_is_never_lost_to_a_rent_read_that_completes_in_the_same_turn(read_done_same_turn):
+    redis = HeldReadRedis()
+    step = SubprocessStep()
+    run = asyncio.ensure_future(Pipeline([step], AsyncMock()).run(make_ctx(redis=redis)))
+    await redis.called.wait()
+
+    if read_done_same_turn:
+        redis.read.set_result({})
+    run.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(run, 1.5)
+    assert step.proc.returncode == -signal.SIGKILL and not step.finished
 
 
 @pytest.mark.asyncio
