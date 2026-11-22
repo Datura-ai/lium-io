@@ -232,20 +232,25 @@ def _preflight_passes(
 
 
 @pytest.mark.asyncio
-async def test_the_remote_deadline_is_what_the_budget_leaves_after_the_preflight(monkeypatch):
-    # review F-24: the host's watchdog ends with the validator's cut, not 600 s after the launch
+async def test_the_hosts_watchdog_fires_after_the_validators_own_cut(monkeypatch):
+    # review F-24: the host's watchdog follows the deadline, not 600 s after the launch. Review at ea74f37: it fires
+    # only after the validator's own cut and that cut's kill, so a host clock running fast (0.04%) cannot stop an
+    # honest run before the validator does, and the host's clock never decides a cut
     from neurons.validators.src.services import verifyx_validation_service as module
 
     service = module.VerifyXValidationService.__new__(module.VerifyXValidationService)
     commands = _preflight_passes(monkeypatch, service, module)
+    deadline_s = 250.8
 
     result = await service.validate_verifyx_and_process_job(
         shell=None, executor_info=None, default_extra={}, machine_spec={}, run_dir=".verifyx-t",
-        deadline_monotonic=time.monotonic() + 250.5,
+        deadline_monotonic=time.monotonic() + deadline_s,
     )
 
+    watchdog_s = int(commands[0].split()[3])
     assert result.stdout == "captured"
-    assert commands == ["timeout -k 10 250 run &"] or commands == ["timeout -k 10 249 run &"]
+    assert watchdog_s in (249 + module.VERIFYX_KILL_TIMEOUT_SECONDS, 250 + module.VERIFYX_KILL_TIMEOUT_SECONDS)
+    assert watchdog_s / 1.0004 > deadline_s  # a host clock 0.04% fast still stops after the validator cut
 
 
 @pytest.mark.asyncio
@@ -299,20 +304,21 @@ def test_both_remote_watchdogs_take_the_given_seconds():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "left,run_s,exit_status,marked,cut",
+    "left,run_s,exit_status,marked",
     [
-        (250, 250, 124, True, True),  # GNU timeout at the deadline
-        (250, 250, 143, True, True),  # busybox timeout: the child's status after its TERM (F-29)
-        (250, 10, 124, False, False),  # the child exited 124 itself before the deadline: judged (F-29)
-        (250, 10, 143, False, False),  # the child exited 143 itself before the deadline: judged (F-29)
-        (None, 600, 124, True, False),  # unbounded: judged as before
-        (250, 10, 124, True, False),  # the marker printed long before the deadline: the host's word alone, judged
-        (700, 600, 124, True, False),  # the cap, not the deadline, set the run: judged, never no task time
+        (250, 249.92, 124, True),  # the host's watchdog early on its own clock: the validator's cut had not come
+        (250, 10, 143, True),  # the marker printed long before the deadline: the host's word alone
+        (250, 10, 124, False),  # the child exited 124 itself before the deadline (F-29)
+        (None, 600, 124, True),  # unbounded
+        (700, 600, 124, True),  # the cap, not the deadline, set the run
     ],
-    ids=["gnu-deadline", "busybox-deadline", "early-child-124", "early-child-143", "unbounded", "early-marker",
-         "marker-at-cap"],
+    ids=["host-watchdog-early", "early-marker", "early-child-124", "unbounded", "marker-at-cap"],
 )
-async def test_only_the_hosts_deadline_record_makes_a_run_the_cut(monkeypatch, left, run_s, exit_status, marked, cut):
+async def test_a_run_that_returns_is_judged_whatever_its_exit_status_or_marker(
+    monkeypatch, left, run_s, exit_status, marked
+):
+    # review at ea74f37: only the caller's own wait, on the validator's clock, cuts a run (it returns None there and
+    # kills the run); whatever comes back from the host is judged, never read as the cut
     from neurons.validators.src.services import verifyx_validation_service as module
 
     service = module.VerifyXValidationService.__new__(module.VerifyXValidationService)
@@ -324,8 +330,7 @@ async def test_only_the_hosts_deadline_record_makes_a_run_the_cut(monkeypatch, l
         deadline_monotonic=None if left is None else time.monotonic() + left,
     )
 
-    # the cut is reported as no task time by the caller; anything else is judged
-    assert (result is None) is cut
+    assert result is not None and result.exit_status == exit_status
 
 
 _BUSYBOX_TIMEOUT = """#!/bin/sh

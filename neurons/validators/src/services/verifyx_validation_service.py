@@ -506,30 +506,22 @@ class VerifyXValidationService:
 
             seconds = VERIFYX_COMMAND_TIMEOUT_SECONDS
             if deadline_monotonic is not None:
-                seconds = min(seconds, int(deadline_monotonic - time.monotonic()))
-                if seconds <= 0:
+                left = int(deadline_monotonic - time.monotonic())
+                if left <= 0:
                     return None
+                if left < seconds:
+                    # The caller's own wait, on this clock, cuts the run at the deadline and kills it
+                    # (checks/verifyx.py `_verifyx_within`); the host's watchdog is only the backstop for a kill that
+                    # never lands, so it fires after that cut and the kill's own timeout. A run that returns before the
+                    # cut is judged as any run: the host's clock never decides a cut (review at ea74f37).
+                    seconds = left + VERIFYX_KILL_TIMEOUT_SECONDS
             command = self._verifyx_command(
                 executor_info, challenge, lib_name, run_dir, deadline_monotonic is not None, seconds
             )
 
             logger.info(_m("VerifyX Python Script Command", extra=get_extra_info(challenge.log_extra)))
 
-            launched = time.monotonic()
             ssh_capture = await self._run_ssh_command(shell, command)
-            if (
-                deadline_monotonic is not None
-                and seconds < VERIFYX_COMMAND_TIMEOUT_SECONDS
-                and time.monotonic() >= launched + seconds
-                and ssh_capture.transport_error is None
-                and VERIFYX_DEADLINE_MARKER in (ssh_capture.stderr or "")
-            ):
-                # the host's watchdog for this deadline stopped the run: the validator's own cut, never a crash of
-                # the executor, whatever exit code the watchdog left (review F-29). The marker arrives on the
-                # provider's own stderr, so it counts only when the deadline, not the cap, set `seconds` and that
-                # long has really passed here; the host's watchdog starts after this stamp, so an honest cut always
-                # meets both. Otherwise the capture is judged as any run.
-                return None
             return self.evaluate_verifyx_capture(challenge, ssh_capture, default_extra)
 
         except Exception as e:
@@ -686,10 +678,9 @@ class VerifyXValidationService:
         # it on the same filesystem) and its PID on record, for kill_remote_verifyx.
         d = shlex.quote(run_dir)
         if python_watchdog:
-            # DAH-5933 review F-29/F-32: the bounded first sample runs under the executor's own Python watchdog,
-            # the one actor that stops it at the deadline, so it alone writes the deadline marker, right before its
-            # kill. No exit code (GNU 124, busybox 143, a child's own 124) decides it; the validator also checks its own
-            # clock before believing the marker (validate_verifyx_and_process_job).
+            # DAH-5933 review F-29/F-32: the bounded first sample runs under the executor's own Python watchdog, the
+            # backstop that stops it after the validator's own cut if that cut's kill never landed. Its marker,
+            # written right before its kill, is a diagnostic in the stderr tail only: nothing decides on it.
             start = (
                 f"mkdir {d} && cd {d} || exit 1; "
                 f"{shlex.quote(executor_info.python_path)} -c {shlex.quote(_PYTHON_WATCHDOG)} {int(seconds)} {command} & "
