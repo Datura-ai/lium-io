@@ -153,14 +153,15 @@ async def _read_first_sample_mark(ctx: Context) -> dict | None:
 
 
 async def _mark_unseeded(ctx: Context, stored: tuple) -> None:
-    """Marks each direction the stored EMA does not hold yet; a direction already tracked keeps its state."""
+    """Marks each direction the stored EMA does not hold yet; a direction already tracked keeps its state. Runs on
+    every check, and every check renews an existing mark's expiry: a node checked every cycle never loses its mark
+    while the stored EMA stays its first sample, whether or not the EMA is reusable this cycle."""
     unseeded = [direction for direction, value in zip(_DIRECTIONS, stored) if value is None]
-    if not unseeded:
-        return
     try:
-        mark = await _read_first_sample_mark(ctx) or {}
-        if all(direction in mark for direction in unseeded):
+        mark = await _read_first_sample_mark(ctx)
+        if mark is None and not unseeded:
             return
+        mark = mark or {}
         for direction in unseeded:
             mark.setdefault(direction, None)
         await ctx.services.redis.set(_first_sample_key(ctx), json.dumps(mark), ex=_FILLER_REUSE_TTL_SECONDS)
