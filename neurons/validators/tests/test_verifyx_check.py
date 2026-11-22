@@ -448,6 +448,55 @@ async def test_verifyx_remeasures_a_first_sample_ema_under_a_filler(context_fact
 
 
 @pytest.mark.asyncio
+async def test_verifyx_settles_each_direction_on_its_own_under_a_filler(context_factory):
+    """Review at fd6ec1d: the first cycle stores download 135 and no upload (a failed upload keeps the download). The
+    next stores download 477.5 and the first upload 280: the download settled, the upload is still its first sample
+    alone, so the node is measured until the upload has advanced too."""
+    verifyx_service = DummyVerifyXService(
+        success=True, updated_specs={"network": {"download_speed": 820.0, "upload_speed": 310.0}}
+    )
+    services = build_services(verifyx=verifyx_service)
+    ctx = context_factory(services=services, config=build_context_config(), state=_filler_state({}))
+    await VerifyXCheck().run(ctx)  # never measured: probed, both directions marked unseeded
+
+    def stored(download, upload):
+        ctx.state.rented_data.network_ema["executor-123"] = NetworkEMA(
+            ema_verifyx_download_speed=download, ema_verifyx_upload_speed=upload
+        )
+
+    async def skipped() -> bool:
+        verifyx_service.called_with = None
+        result = await VerifyXCheck().run(ctx)
+        return result.event.reason_code == Msg.FILLER_SKIPPED.reason and verifyx_service.called_with is None
+
+    stored(135.0, None)
+    assert not await skipped()  # the download's first sample
+    stored(477.5, 280.0)
+    assert not await skipped()  # the download settled; the upload's first sample
+    assert not await skipped()
+    stored(477.5, 291.0)
+    assert await skipped()  # both advanced: reuse starts
+
+
+@pytest.mark.asyncio
+async def test_verifyx_measures_an_upload_seeded_after_a_settled_download(context_factory):
+    """A node seen with a settled download and no upload: the upload's first reading is not reused alone."""
+    verifyx_service = DummyVerifyXService(
+        success=True, updated_specs={"network": {"download_speed": 820.0, "upload_speed": 310.0}}
+    )
+    state = _filler_state({"executor-123": NetworkEMA(ema_verifyx_download_speed=802.0, ema_verifyx_upload_speed=None)})
+    ctx = context_factory(services=build_services(verifyx=verifyx_service), config=build_context_config(), state=state)
+    assert (await VerifyXCheck().run(ctx)).event.reason_code == Msg.FILLER_SKIPPED.reason  # nothing to measure yet
+
+    ctx.state.rented_data.network_ema["executor-123"] = NetworkEMA(
+        ema_verifyx_download_speed=802.0, ema_verifyx_upload_speed=280.0
+    )
+    verifyx_service.called_with = None
+    assert (await VerifyXCheck().run(ctx)).event.reason_code != Msg.FILLER_SKIPPED.reason
+    assert verifyx_service.called_with is not None
+
+
+@pytest.mark.asyncio
 async def test_verifyx_reuses_a_settled_ema_under_a_filler(context_factory):
     """A node seeded before this validator saw it unseeded carries no mark: its EMA is reused, as before."""
     verifyx_service = DummyVerifyXService(success=True, updated_specs={"network": {}})
