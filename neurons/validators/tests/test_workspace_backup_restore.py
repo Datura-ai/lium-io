@@ -361,6 +361,7 @@ def test_load_secrets_file_exports_keys_and_deletes_the_file(tmp_path, monkeypat
 async def test_restic_backup_with_excludes_stops_on_an_executor_that_cannot_apply_them(monkeypatch):
     ssh_client = AsyncMock()
     monkeypatch.setattr(miner_service_module.asyncssh, "connect", Mock(return_value=_FakeSshContext(ssh_client)))
+    monkeypatch.setattr(miner_service_module, "storage_operation_has_incumbent", AsyncMock(return_value=False))
     monkeypatch.setattr(miner_service_module, "supports_workspace_field", AsyncMock(return_value=False))
     start = AsyncMock()
     monkeypatch.setattr(miner_service_module, "start_storage_operation", start)
@@ -374,6 +375,31 @@ async def test_restic_backup_with_excludes_stops_on_an_executor_that_cannot_appl
             _executor_info(), payload, Mock(), _docker_service_with_pinned_hosts()
         )
     start.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_repeat_restic_backup_with_excludes_leaves_its_running_or_finished_operation_alone(monkeypatch):
+    ssh_client = AsyncMock()
+    monkeypatch.setattr(miner_service_module.asyncssh, "connect", Mock(return_value=_FakeSshContext(ssh_client)))
+    monkeypatch.setattr(miner_service_module, "storage_operation_has_incumbent", AsyncMock(return_value=True))
+    probe = AsyncMock(side_effect=RuntimeError("exclude_patterns probe could not run on the executor (exit 1)"))
+    monkeypatch.setattr(miner_service_module, "supports_workspace_field", probe)
+    start = AsyncMock()
+    monkeypatch.setattr(miner_service_module, "start_storage_operation", start)
+    noted = AsyncMock()
+    monkeypatch.setattr(miner_service_module, "note_started_storage_helper", noted)
+    payload = _backup_payload()
+    payload.backup_engine = "restic"
+    payload.backup_log_id = "11111111-1111-4111-8111-111111111111"
+    payload.exclude_patterns = [".ssh"]
+    service = MinerService.__new__(MinerService)
+    service.redis_service = AsyncMock()
+
+    await service.handle_backup_container_req(_executor_info(), payload, Mock(), _docker_service_with_pinned_hosts())
+
+    probe.assert_not_awaited()
+    start.assert_not_awaited()
+    noted.assert_awaited_once()
 
 
 def test_restic_backup_spec_carries_the_exclude_patterns():
@@ -466,6 +492,7 @@ async def _run_encrypted_restic_backup(monkeypatch, mountinfo: str):
     ssh_client.run.return_value = SimpleNamespace(stdout=mountinfo)
     monkeypatch.setattr(miner_service_module.asyncssh, "connect", Mock(return_value=_FakeSshContext(ssh_client)))
     start = AsyncMock()
+    monkeypatch.setattr(miner_service_module, "storage_operation_has_incumbent", AsyncMock(return_value=False))
     monkeypatch.setattr(miner_service_module, "start_storage_operation", start)
     docker_service = _docker_service_with_pinned_hosts()
     docker_service.setup_encrypted_local_volume = AsyncMock()

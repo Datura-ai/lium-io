@@ -179,6 +179,7 @@ async def test_an_old_executor_image_reports_its_specific_reason(mocker, miner_s
     ssh.__aexit__ = AsyncMock(return_value=False)
     mocker.patch("services.miner_service.asyncssh.connect", return_value=ssh)
     mocker.patch("services.miner_service.public_host_sock", AsyncMock(return_value={}))
+    mocker.patch("services.miner_service.storage_operation_has_incumbent", AsyncMock(return_value=False))
     mocker.patch("services.miner_service.supports_workspace_field", AsyncMock(return_value=False))
     start = mocker.patch("services.miner_service.start_storage_operation", AsyncMock())
     report = mocker.patch("services.miner_service.report_launch_failure", AsyncMock())

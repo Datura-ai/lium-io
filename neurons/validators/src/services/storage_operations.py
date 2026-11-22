@@ -333,6 +333,11 @@ def _incumbent_condition(files: StorageOperationFiles) -> str:
     return f"{{ {live(files.launcher)} || {live(files.pid)} || [ -s {q(files.status)} ] || [ -e {q(files.done)} ]; }}"
 
 
+async def storage_operation_has_incumbent(ssh_client: asyncssh.SSHClientConnection, operation_id: UUID) -> bool:
+    """The operation already has a result or a live run on the node (_has_incumbent): a repeat dispatch does nothing."""
+    return await _has_incumbent(ssh_client, StorageOperationFiles.for_operation(operation_id))
+
+
 async def _has_incumbent(ssh_client: asyncssh.SSHClientConnection, files: StorageOperationFiles) -> bool:
     """The operation already has a result or a live run (see _incumbent_condition). Read under the operation's lock when
     its file can be created (_lock_if_possible): a launch holds it until its launcher is recorded, so a launch in its

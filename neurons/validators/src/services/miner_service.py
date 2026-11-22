@@ -101,6 +101,7 @@ from services.storage_operations import (
     forget_storage_helper,
     note_started_storage_helper,
     start_storage_operation,
+    storage_operation_has_incumbent,
     supports_workspace_field,
 )
 from services.storage_operations import run_job_with_secrets
@@ -1774,6 +1775,11 @@ class MinerService:
 
             if payload.backup_engine == "restic":
                 operation_id = UUID(payload.backup_log_id)
+                # a repeat dispatch of a running or finished backup: its run or result is the operation's, so nothing
+                # here (the probe, the remount, staging) may run or fail it; its helper stays recorded as Lium's
+                if await storage_operation_has_incumbent(ssh_client, operation_id):
+                    await note_started_storage_helper(self.redis_service, executor_info.uuid, operation_id)
+                    return
                 if payload.exclude_patterns and not await supports_workspace_field(
                     ssh_client, executor_payload.EXECUTOR_PYTHON, "exclude_patterns"
                 ):
