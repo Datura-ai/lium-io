@@ -128,6 +128,9 @@ class ZeroIncentiveReason(StrEnum):
     RENTED_SYSBOX_NOT_CONFIRMED = "rented_sysbox_not_confirmed"
     # Group B (appended): free splits of a partly rented split node without disk room for their share (DAH-4961)
     DISK_LIMITED_REMAINDER = "disk_limited_remainder"
+    # Group B (appended): the free splits' pay was capped by a port check deferred for disk pressure (DAH-5851), not
+    # by the node's ports; not a listing gate, the free GPUs stay listed on the last completed check's ports
+    PORT_CHECK_DEFERRED_REMAINDER = "port_check_deferred_remainder"
 
 
 # The reason code a failed run carries when no check produced one (an exception in the pipeline).
@@ -522,6 +525,28 @@ class MinerLogLine(BaseModel):
                     "required_port_count": port_limited.required_port_count,
                     "free_split_count": 0,
                     "paid_split_count": 0,
+                },
+            )
+        if port_limited.port_check_deferred:
+            # DAH-5851: the count is this deferred cycle's filler ports; the node's own free ports were not measured,
+            # so naming it as the node's free ports (or asking for more ports) would misstate the node
+            return MinerLogLine._no_payout(
+                result,
+                reason=ZeroIncentiveReason.PORT_CHECK_DEFERRED_REMAINDER,
+                message=(
+                    f"No unrented incentive this cycle for {unpaid} of the free GPUs on this partially rented "
+                    "node: its port check was deferred because writes were still being flushed to the Docker "
+                    "filesystem, and idle pay counts only ports measured in the same cycle "
+                    f"({port_limited.available_port_count} this time). The free GPUs stay listed on the ports "
+                    "from the last completed check and the rented GPUs keep earning. No port change is needed: "
+                    "full idle pay resumes with the next completed port check."
+                ),
+                extra_fields={
+                    "gpu_count": unpaid,
+                    "available_port_count": port_limited.available_port_count,
+                    "required_port_count": port_limited.required_port_count,
+                    "free_split_count": port_limited.free_split_count,
+                    "paid_split_count": port_limited.paid_split_count,
                 },
             )
         if port_limited.paid_split_count:

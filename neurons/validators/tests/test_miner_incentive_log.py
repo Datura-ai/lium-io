@@ -47,6 +47,7 @@ def test_reason_enum_pins_the_stable_code_contract():
         "validation_failed",
         "rented_sysbox_not_confirmed",
         "disk_limited_remainder",
+        "port_check_deferred_remainder",
     }
 
 
@@ -188,6 +189,17 @@ def _job(**overrides) -> JobResult:
             ),
             "port_limited_remainder",
             "fewer than its minimum rental",
+        ),
+        (
+            # DAH-5851: a deferred cycle's filler ports are not the node's free ports; no port change is asked for
+            lambda job: MinerLogLine.no_payout_because_port_limited_remainder(
+                job, PortLimitedRemainder(
+                    available_port_count=2, required_port_count=3, free_split_count=3, paid_split_count=0,
+                    unpaid_gpu_count=3, port_check_deferred=True,
+                )
+            ),
+            "port_check_deferred_remainder",
+            "No port change is needed",
         ),
     ],
 )

@@ -115,6 +115,8 @@ class PortLimitedRemainder(BaseModel):
     free_split_count: int
     paid_split_count: int  # splits that have a port: their GPUs keep the idle pay
     unpaid_gpu_count: int
+    # the count is this deferred cycle's filler ports (DAH-5851), not a measure of the node's free ports
+    port_check_deferred: bool = False
 
 
 class DiskLimitedRemainder(BaseModel):
@@ -551,12 +553,16 @@ class RentalPriceIncentive(DefaultIncentive):
         if isinstance(verified, list):
             # a port two mappings both publish can still serve only one renter
             available = min(available, len(set(verified)))
-        # DAH-5851: a deferred port check lists the last completed check's ports but pays only from this cycle's
-        deferred: Any = result.spec.get("deferred_idle_pay_port_count")
-        if isinstance(deferred, int) and not isinstance(deferred, bool):
-            available = min(available, deferred)
         free_gpu_count: int = result.gpu_count + result.port_unpaid_gpu_count
         free_split_count: int = free_gpu_count // result.gpu_splitting_min_count
+        # DAH-5851: a deferred port check lists the last completed check's ports but pays only from this cycle's
+        deferred: Any = result.spec.get("deferred_idle_pay_port_count")
+        # the listed ports would pay every free split: only the deferral limits the pay, not the node's ports
+        port_check_deferred: bool = free_split_count > 0 and available >= max(free_split_count, MIN_PORT_COUNT)
+        if isinstance(deferred, int) and not isinstance(deferred, bool):
+            available = min(available, deferred)
+        else:
+            port_check_deferred = False
         # the rent path refuses any pod below MIN_PORT_COUNT free ports, so below it no split is rentable
         paid_split_count: int = min(free_split_count, available) if available >= MIN_PORT_COUNT else 0
         # free GPUs below one whole split can't be listed or rented, so they get no idle pay either
@@ -571,6 +577,7 @@ class RentalPriceIncentive(DefaultIncentive):
             unpaid_gpu_count=free_gpu_count
             if paid_split_count == 0
             else (free_split_count - paid_split_count) * result.gpu_splitting_min_count,
+            port_check_deferred=port_check_deferred,
         )
 
     @staticmethod
@@ -632,7 +639,9 @@ class RentalPriceIncentive(DefaultIncentive):
                     "paid_split_count": port_limited.paid_split_count,
                     "unpaid_gpu_count": port_limited.unpaid_gpu_count,
                     "enforced": True,
-                    "reason": ZeroIncentiveReason.PORT_LIMITED_REMAINDER,
+                    "reason": ZeroIncentiveReason.PORT_CHECK_DEFERRED_REMAINDER
+                    if port_limited.port_check_deferred
+                    else ZeroIncentiveReason.PORT_LIMITED_REMAINDER,
                     "pool": "rental_partial" if port_limited.paid_split_count else "rental_excluded",
                 },
             )
