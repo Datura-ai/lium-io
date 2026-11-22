@@ -1640,7 +1640,7 @@ def _usable_gpus(output: str) -> _UsableGpus:
     smi_text, _, rest = output.partition(_DEVICE_NODES_MARK)
     nodes_text, _, rest = rest.partition(_GPU_MINORS_MARK)
     minors_text, _, rest = rest.partition(_MIG_MODE_MARK)
-    mig_text, _, cuda_text = rest.partition(_CUDA_COUNT_MARK)
+    mig_text, cuda_mark, cuda_text = rest.partition(_CUDA_COUNT_MARK)
     node_minors = {int(m) for m in re.findall(r"^/dev/nvidia(\d+)$", nodes_text, re.MULTILINE)}
     kernel_minors = _parse_uuid_minor_csv(minors_text)
     smi_uuids = re.findall(r"\(UUID: (GPU-[0-9a-fA-F-]+)\)", smi_text)
@@ -1652,6 +1652,9 @@ def _usable_gpus(output: str) -> _UsableGpus:
         usable = len({kernel_minors[uuid] for uuid in smi_uuids if uuid in kernel_minors} & node_minors)
     else:
         usable = len(node_minors)
+    if not cuda_mark:
+        # the command prints every mark, the CUDA one last: without it the output was cut short
+        return _UsableGpus(usable, None, "probe output ended before the CUDA section", unknown)
     if re.search(r"^\s*Enabled\s*$", mig_text, re.MULTILINE):
         # CUDA enumerates MIG instances, not cards, so its count says nothing per card; the device nodes decide
         return _UsableGpus(usable, None, None, unknown)

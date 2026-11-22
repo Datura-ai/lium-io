@@ -2072,6 +2072,18 @@ def test_gpu_count_fails_nvidia_smi_uuids_the_kernel_does_not_list():
     assert shape.short_of(8) == "8 nvidia-smi GPU UUID(s) the kernel driver does not know"
 
 
+def test_gpu_count_fails_output_cut_short_before_the_cuda_section():
+    """A missing CUDA mark means the output was cut short and fails, unlike an empty CUDA section (an image
+    without python3), where the device nodes decide."""
+    full = gpu_list_output()
+    assert _gpu_step(full).failed_step is None
+    truncated = full.partition("--cuda-device-count--")[0]
+    outcome = _gpu_step(truncated)
+    assert outcome.failed_step == STEP_GPU_COUNT
+    assert "ended before the CUDA section" in outcome.steps[-1].detail
+    assert _gpu_step(full.partition("--gpu-mig-mode--")[0]).failed_step == STEP_GPU_COUNT
+
+
 def test_gpu_count_reads_cuda_with_the_image_cuda_visible_devices_unset():
     """An image default CUDA_VISIBLE_DEVICES=0 narrows nothing a renter cannot undo; the count must not
     read it as a missing card."""
