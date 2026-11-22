@@ -2592,6 +2592,8 @@ async def test_create_customer_rental_starts_inspector_collector(docker_service,
     ssh_client = _patch_create_container_happy_path(docker_service, monkeypatch)
     lifecycle_spy = AsyncMock()
     monkeypatch.setattr(docker_service, "_run_inspector_collector_lifecycle", lifecycle_spy)
+    memory_guard_spy = AsyncMock(return_value={"set": [], "failed": []})
+    monkeypatch.setattr("services.docker_service.apply_host_memory_guard", memory_guard_spy)
 
     pod_id = str(uuid4())
     payload = ContainerCreateRequest(
@@ -2632,11 +2634,15 @@ async def test_create_customer_rental_starts_inspector_collector(docker_service,
         private_key="encrypted",
     )
 
-    # the reply does not wait for the collector or the session close: both come after the return
+    # the reply does not wait for the collector, the host memory guard or the session close: all come after the return
     lifecycle_spy.assert_not_awaited()
+    memory_guard_spy.assert_not_awaited()
     assert ssh_session.closed is False
     await _drain_create_steps_after_reply(payload)
     lifecycle_spy.assert_awaited_once()
+    # host-level, on the create's session before it closes
+    memory_guard_spy.assert_awaited_once()
+    assert memory_guard_spy.await_args.args[0] is ssh_client
     assert ssh_session.closed is True
     assert lifecycle_spy.await_args.kwargs["action"] == "start"
     assert lifecycle_spy.await_args.kwargs["ssh_client"] is ssh_client

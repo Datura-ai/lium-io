@@ -31,6 +31,7 @@ from services.docker_service import (
     inflight_creates,
 )
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS
+from services.host_memory_guard import host_memory_guard_script
 from services.hung_gpu_reset import HUNG_GPU_QUERY_COMMAND, HungGpuResult
 from services.redis_service import GPU_RESET_PENDING_KIND
 from services.prerun_host_probe import prerun_host_probe_command
@@ -232,6 +233,8 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         "nvidia-smi -i GPU-test -rmc >/dev/null 2>&1; echo GPU-test -rmc $?",
         host_key,
         "nohup /usr/bin/python /root/app/src/inspector_executor.py --start-collector >/dev/null 2>&1 &",
+        # after the reply, on the create's session: host-level, so no renter waits for it
+        host_memory_guard_script(),
         f"/usr/bin/docker rm -fv id-{name}",
     ]
 
