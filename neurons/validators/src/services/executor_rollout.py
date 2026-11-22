@@ -838,9 +838,10 @@ async def carry_renter_gpu_reset_results(
     snapshot: its own scrape saw the renter resetting GPUs inside that rental. A kept result that fails the rule is
     dropped, and so is one a cycle saw rented after its start even when a read is missing: the rental state it was
     scored with is gone. A held result not carried is taken out by
-    `withhold_renter_gpu_reset_verdicts`. The GPU-reset and power-tier holds carry a rented node only; a no-task-time
-    hold carries once (`_spend_kept_result`). A kept result is eligible only while every cycle since it was scored
-    vouched for it (`_last_scored_result`). `rented_executor_ids` is kept for the caller's signature.
+    `withhold_renter_gpu_reset_verdicts`. Only a rented pass is kept (`remember_rented_scored_results`), so every
+    hold carries a rented node only; a no-task-time hold carries once (`_spend_kept_result`). A kept result is
+    eligible only while every cycle since it was scored vouched for it (`_last_scored_result`). `rented_executor_ids`
+    is kept for the caller's signature.
     """
     def by_uuid(rented: RentedExecutorsResponse | None) -> dict[str, RentedExecutor] | None:
         return None if rented is None else {str(uuid).lower(): rental for uuid, rental in rented.executors.items()}
@@ -1024,8 +1025,8 @@ async def remember_rented_scored_results(
                 writes.set(vouch, str(job_block), ex=LAST_SCORED_RESULT_TTL_SECONDS)
                 continue
             key = last_scored_result_key(miner_hotkey, result.executor_info.uuid)
-            # an idle node's too (DAH-5933): a NO_TASK_TIME_REASONS result carries it; the GPU-reset carry stays rented-only
-            if result.is_successful:
+            # rented passes only, as on main: an idle cycle with no task time is withheld, never carried
+            if result.is_rented and result.is_successful:
                 writes.set(key, result.model_dump_json(), ex=LAST_SCORED_RESULT_TTL_SECONDS)
                 writes.set(vouch, str(job_block), ex=LAST_SCORED_RESULT_TTL_SECONDS)
             else:

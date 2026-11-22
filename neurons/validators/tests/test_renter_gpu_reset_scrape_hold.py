@@ -480,8 +480,8 @@ async def test_only_scored_results_are_remembered_and_a_redis_error_is_logged_on
     )
 
     assert await service.get(last_scored_result_key("5Miner", "node-1"))
-    # DAH-5933: an idle node's too, for a rental probe the task has no time left for
-    assert await service.get(last_scored_result_key("5Miner", "node-idle"))
+    # rented passes only, as on main
+    assert await service.get(last_scored_result_key("5Miner", "node-idle")) is None
     assert await service.get(last_scored_result_key("5Miner", "node-failed")) is None
 
 
@@ -490,24 +490,16 @@ def _no_task_time(uuid: str):
 
 
 @pytest.mark.asyncio
-async def test_an_idle_node_the_task_had_no_time_to_probe_keeps_its_last_score_and_its_pay():
-    """DAH-5933: not a failed rental check, no zero score, no lost idle cycle, nothing published over the backend row."""
+async def test_an_idle_node_the_task_had_no_time_to_probe_gets_no_verdict():
+    """An idle pass is not kept (as on main), so an idle no-task-time cycle is withheld: no zero score and nothing
+    published over the backend row."""
     service = _redis_service()
     await remember_rented_scored_results({"5Miner": [_idle_scored("node-idle")]}, service, job_block=PREV_BLOCK)
-    held = _no_task_time("node-idle")
 
-    kept, withheld = await _carry_then_withhold(service, [held], rented_executor_ids=frozenset())
+    kept, withheld = await _carry_then_withhold(service, [_no_task_time("node-idle")], rented_executor_ids=frozenset())
 
-    [carried] = kept["5Miner"]
-    assert carried.is_successful and carried.score == 1.0
-    assert carried.carried_for_renter_gpu_reset is True
-    assert carried.job_batch_id == held.job_batch_id
-    assert withheld == []
-    assert specs_to_publish(kept["5Miner"]) == []
-    # a carried result is not kept again, so the 1 h TTL ends a run of such cycles
-    await service.delete(last_scored_result_key("5Miner", "node-idle"))
-    await remember_rented_scored_results(kept, service, job_block=PREV_BLOCK)
-    assert await service.get(last_scored_result_key("5Miner", "node-idle")) is None
+    assert kept == {"5Miner": []}
+    assert [w.result.executor_info.uuid for w in withheld] == ["node-idle"]
 
 
 @pytest.mark.asyncio
@@ -530,17 +522,17 @@ async def test_a_no_task_time_cycle_without_a_last_score_gets_no_verdict_and_kee
 async def test_a_second_no_task_time_cycle_without_a_pass_between_is_withheld(reason):
     # review: a node that stalls its checks past the task's time cannot keep its last pass's score
     service = _redis_service()
-    await remember_rented_scored_results({"5Miner": [_idle_scored("node-idle")]}, service, job_block=PREV_BLOCK)
+    await remember_rented_scored_results({"5Miner": [_rented_scored("node-1")]}, service, job_block=PREV_BLOCK)
 
-    first, _ = await _carry_then_withhold(service, [_failed("node-idle", reason)], rented_executor_ids=frozenset())
+    first, _ = await _carry_then_withhold(service, [_failed("node-1", reason)])
     await remember_rented_scored_results(first, service, job_block=PREV_BLOCK)
     second, withheld = await _carry_then_withhold(
-        service, [_failed("node-idle", reason)], rented_executor_ids=frozenset()
+        service, [_failed("node-1", reason)]
     )
 
     assert [r.carried_for_renter_gpu_reset for r in first["5Miner"]] == [True]
     assert second == {"5Miner": []}
-    assert [w.result.executor_info.uuid for w in withheld] == ["node-idle"]
+    assert [w.result.executor_info.uuid for w in withheld] == ["node-1"]
     assert session_kept_hotkeys(withheld) == set()
 
 
@@ -571,10 +563,10 @@ async def test_a_budget_stop_after_a_check_zeroed_the_score_keeps_that_failure(c
         events.append(gate_event)
     events.append(build_msg(event="no time", reason=reason, severity="warning", impact=""))
     service = _redis_service()
-    await remember_rented_scored_results({"5Miner": [_idle_scored("node-idle")]}, service, job_block=PREV_BLOCK)
-    result = _failed("node-idle", budget_stop_reason(reason, events, ctx))
+    await remember_rented_scored_results({"5Miner": [_rented_scored("node-1")]}, service, job_block=PREV_BLOCK)
+    result = _failed("node-1", budget_stop_reason(reason, events, ctx))
 
-    kept, withheld = await _carry_then_withhold(service, [result], rented_executor_ids=frozenset())
+    kept, withheld = await _carry_then_withhold(service, [result])
 
     if earlier_gate:
         [published] = kept["5Miner"]
@@ -583,7 +575,7 @@ async def test_a_budget_stop_after_a_check_zeroed_the_score_keeps_that_failure(c
         assert withheld == []
     elif reason == RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason:
         assert kept == {"5Miner": []}  # the node's rentals changed during the cycle: no verdict
-        assert [w.result.executor_info.uuid for w in withheld] == ["node-idle"]
+        assert [w.result.executor_info.uuid for w in withheld] == ["node-1"]
     else:
         assert [r.carried_for_renter_gpu_reset for r in kept["5Miner"]] == [True]
 
@@ -1242,7 +1234,7 @@ GPU_RESET = Msg.SCRAPE_GPU_RESET_IN_PROGRESS.reason
 # a kept pass carries only for the exact rental state, no rental or the same pod ids, seen at the cycle's start and
 # at its end read, with no change seen during it.
 RENTAL_TIMELINES = [
-    ({}, {}, NO_TIME, {}, True),  # no rental all along
+    ({}, {}, NO_TIME, {}, False),  # no rental all along: an idle pass is not kept, as on main
     ({"pod-a": 8}, {"pod-a": 8}, NO_TIME, {"pod-a": 8}, True),  # rented the whole cycle by the same rental
     ({"pod-a": 2}, {"pod-a": 2}, NO_TIME, {"pod-a": 2}, True),  # split node, the same 2-GPU rental throughout
     ({"pod-a": 8}, {"pod-a": 8}, GPU_RESET, {"pod-a": 8}, True),  # the renter's own GPU reset, same rental
@@ -1288,7 +1280,7 @@ async def test_a_kept_pass_carries_only_for_the_exact_rental_state_seen_at_both_
     else:
         # dropped when the state the pass was scored with is gone, a change seen by the cycle itself included; kept
         # when a read is missing and nothing was seen to change, and for an idle pass a GPU-reset hold cannot use
-        dropped = reason == SEEN_RENTED or (end is not None and reason != GPU_RESET)
+        dropped = reason == SEEN_RENTED or (end is not None and reason != GPU_RESET) or not _kept(kept).is_rented
         assert (await service.get(last_scored_result_key("5Miner", "node-1")) is None) is dropped
 
 
@@ -1314,84 +1306,6 @@ async def test_a_rental_that_starts_and_closes_inside_the_cycle_pays_nothing_for
 
 
 @pytest.mark.asyncio
-async def test_a_kept_pass_that_could_not_be_dropped_is_never_carried_after_a_restart(monkeypatch):
-    """Review at d4f5e64: a cycle sees a rental start and close while Redis refuses the delete of the idle pass it
-    invalidates, and the validator restarts. Redis is back for the next cycle, which must not pay that pass: the cycle
-    that withheld the node vouched for nothing, so the row is not eligible. A pass scored after it carries as usual."""
-    service = _redis_service()
-    await remember_rented_scored_results({"5Miner": [_kept({})]}, service, job_block=PREV_BLOCK)
-    key = last_scored_result_key("5Miner", "node-1")
-    delete = service.delete
-    monkeypatch.setattr(service, "delete", AsyncMock(side_effect=ConnectionError("redis down")))
-    job_results = {"5Miner": [_failed("node-1", SEEN_RENTED)]}
-    await carry_renter_gpu_reset_results(job_results, service, set(), _listed(), {}, _listed(), job_block=JOB_BLOCK)
-    assert job_results["5Miner"][0].carried_for_renter_gpu_reset is False
-    assert await service.get(key) is not None  # the delete failed
-    await remember_rented_scored_results({"5Miner": []}, service, job_block=JOB_BLOCK)  # the node was withheld
-    monkeypatch.setattr(service, "delete", delete)
-    # a restart here keeps nothing in memory: what follows reads only the store
-
-    next_block = JOB_BLOCK + settings.BLOCKS_FOR_JOB
-    next_cycle = {"5Miner": [_failed("node-1", NO_TIME)]}
-    await carry_renter_gpu_reset_results(next_cycle, service, set(), _listed(), {}, _listed(), job_block=next_block)
-    assert next_cycle["5Miner"][0].carried_for_renter_gpu_reset is False
-
-    await remember_rented_scored_results({"5Miner": [_kept({})]}, service, job_block=next_block)
-    later = {"5Miner": [_failed("node-1", NO_TIME)]}
-    await carry_renter_gpu_reset_results(
-        later, service, set(), _listed(), {}, _listed(), job_block=next_block + settings.BLOCKS_FOR_JOB
-    )
-    assert later["5Miner"][0].carried_for_renter_gpu_reset is True
-
-
-@pytest.mark.asyncio
-async def test_a_kept_pass_invalidated_by_a_cycle_on_the_same_block_is_never_carried_after_a_restart(monkeypatch):
-    """Review at 8058786: a cycle an operator asks for runs on the job block of the scheduled cycle before it, so it
-    finds that cycle's vouch. It sees a rental start and close, Redis refuses the delete, and the validator restarts.
-    The next scheduled cycle must not pay the pass on the vouch the invalidating cycle read."""
-    service = _redis_service()
-    await remember_rented_scored_results({"5Miner": [_kept({})]}, service, job_block=JOB_BLOCK)
-    delete = service.delete
-    monkeypatch.setattr(service, "delete", AsyncMock(side_effect=ConnectionError("redis down")))
-    forced = {"5Miner": [_failed("node-1", SEEN_RENTED)]}
-    await carry_renter_gpu_reset_results(forced, service, set(), _listed(), {}, _listed(), job_block=JOB_BLOCK)
-    assert forced["5Miner"][0].carried_for_renter_gpu_reset is False
-    assert await service.get(last_scored_result_key("5Miner", "node-1")) is not None  # the delete failed
-    await remember_rented_scored_results({"5Miner": []}, service, job_block=JOB_BLOCK)  # the node was withheld
-    monkeypatch.setattr(service, "delete", delete)
-    # a restart here keeps nothing in memory: what follows reads only the store
-
-    next_cycle = {"5Miner": [_failed("node-1", NO_TIME)]}
-    await carry_renter_gpu_reset_results(
-        next_cycle, service, set(), _listed(), {}, _listed(), job_block=JOB_BLOCK + settings.BLOCKS_FOR_JOB
-    )
-    assert next_cycle["5Miner"][0].carried_for_renter_gpu_reset is False
-
-
-@pytest.mark.asyncio
-async def test_a_kept_pass_whose_read_failed_in_the_cycle_that_invalidated_it_is_never_carried_later(monkeypatch):
-    """Review at 4d2ac28: the cycle that sees a rental start and close cannot read the idle pass (Redis refuses the
-    read), so nothing deletes it. The node was withheld, so that cycle vouched for nothing, and a later idle cycle with
-    Redis back, after a restart or not, does not pay the pass."""
-    service = _redis_service()
-    await remember_rented_scored_results({"5Miner": [_kept({})]}, service, job_block=PREV_BLOCK)
-    read_and_take = service.read_and_take
-    monkeypatch.setattr(service, "read_and_take", AsyncMock(side_effect=ConnectionError("redis down")))
-    job_results = {"5Miner": [_failed("node-1", SEEN_RENTED)]}
-    await carry_renter_gpu_reset_results(job_results, service, set(), _listed(), {}, _listed(), job_block=JOB_BLOCK)
-    assert job_results["5Miner"][0].carried_for_renter_gpu_reset is False
-    assert await service.get(last_scored_result_key("5Miner", "node-1")) is not None  # nothing deleted it
-    await remember_rented_scored_results({"5Miner": []}, service, job_block=JOB_BLOCK)  # the node was withheld
-    monkeypatch.setattr(service, "read_and_take", read_and_take)
-
-    next_cycle = {"5Miner": [_failed("node-1", NO_TIME)]}
-    await carry_renter_gpu_reset_results(
-        next_cycle, service, set(), _listed(), {}, _listed(), job_block=JOB_BLOCK + settings.BLOCKS_FOR_JOB
-    )
-    assert next_cycle["5Miner"][0].carried_for_renter_gpu_reset is False
-
-
-@pytest.mark.asyncio
 async def test_a_kept_pass_carries_on_the_vouch_of_the_cycle_before_and_never_across_a_silent_cycle():
     """The vouch chain: a pass, then a GPU-reset carry, vouches for each next cycle; a cycle that wrote nothing (a
     Redis outage) breaks it, so the next held cycle is withheld."""
@@ -1409,3 +1323,39 @@ async def test_a_kept_pass_carries_on_the_vouch_of_the_cycle_before_and_never_ac
         held, service, {"node-1"}, rented, {}, rented, job_block=JOB_BLOCK + 3 * settings.BLOCKS_FOR_JOB
     )
     assert held["5Miner"][0].carried_for_renter_gpu_reset is False
+
+
+async def _idle_cycle(service, reason: str, job_block: int) -> list[float]:
+    """One idle cycle end to end, as the validator runs it: carry, withhold, keep. The scores left standing."""
+    job_results = {"5Miner": [_failed("node-1", reason)]}
+    await carry_renter_gpu_reset_results(job_results, service, set(), _listed(), {}, _listed(), job_block=job_block)
+    validator_process = _validator_process(ExecutorRolloutTracker(redis_service=MagicMock(), grace_cycles=0))
+    validator_process.fetch_executor_digest_or_none = AsyncMock(return_value=None)
+    validator_process.observe_executor_rollout = AsyncMock(return_value=MagicMock(covers=lambda _: False))
+    standing, _ = await validator_process.withhold_verdicts_for_rollout(job_results, job_block, "batch", MagicMock())
+    await remember_rented_scored_results(standing, service, job_block=job_block)
+    return [result.score for results in standing.values() for result in results]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing", ["delete", "delete_then_restart", "read_and_take"])
+@pytest.mark.parametrize("next_block", [JOB_BLOCK, JOB_BLOCK + settings.BLOCKS_FOR_JOB])
+async def test_an_idle_pass_a_rental_start_and_close_invalidated_never_stands_after_redis_recovers(
+    monkeypatch, failing, next_block
+):
+    """An idle pass is not kept, so whatever Redis refuses in between (a read, a delete) and whether or not the
+    validator restarts, a later idle cycle with no task time has no score standing for the node."""
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_kept({})]}, service, job_block=PREV_BLOCK)
+    assert await service.get(last_scored_result_key("5Miner", "node-1")) is None  # an idle pass is not kept
+    method = "delete" if failing.startswith("delete") else failing
+    working = getattr(service, method)
+    monkeypatch.setattr(service, method, AsyncMock(side_effect=ConnectionError("redis down")))
+    assert await _idle_cycle(service, SEEN_RENTED, JOB_BLOCK) == []
+    monkeypatch.setattr(service, method, working)
+    if failing == "delete_then_restart":
+        restarted = _redis_service()  # a new process on the same store
+        restarted.redis = service.redis
+        service = restarted
+
+    assert await _idle_cycle(service, NO_TIME, next_block) == []
