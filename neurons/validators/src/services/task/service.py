@@ -48,7 +48,7 @@ from .models import VALIDATOR_REDIS_UNAVAILABLE, JobResult, ValidationEvent, bui
 from .pipeline import PodRecoverer
 from .pipeline_factory import PipelineFactory
 from .result_handler import ResultHandler
-from .score_calculator import zero_score_gate_failed
+from .score_calculator import calculate_scores, zero_score_gate_failed
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +60,22 @@ def budget_stop_reason(reason: str | None, events: list[ValidationEvent], ctx) -
     if reason not in NO_TASK_TIME_REASONS or not zero_score_gate_failed(ctx):
         return reason
     return ZEROED_BEFORE_THE_BUDGET_STOP
+
+
+def budget_stop_event(events: list[ValidationEvent], ctx) -> ValidationEvent:
+    """What the provider is shown for a ZEROED_BEFORE_THE_BUDGET_STOP result: the zeroing check's own failure (the last
+    error before the stop), else the score's own warning for a gate with no event (a price over the cap), never the
+    no-time event that says the last score stands (review at a8afce8)."""
+    failed = [event for event in events[:-1] if event.severity == "error"]
+    if failed:
+        return failed[-1]
+    warning = calculate_scores(ctx, ctx.rented, verifyx_ema_required=False)[2].replace("WARNING:", "").strip()
+    return build_msg(
+        event="Score zeroed before the task time ran out",
+        reason=ZEROED_BEFORE_THE_BUDGET_STOP,
+        severity="error",
+        impact=warning or "This cycle's score is zero",
+    )
 
 
 def _is_ssh_transport_failure(error: BaseException) -> bool:
@@ -320,6 +336,9 @@ class TaskService:
                 if not success or result.score <= 0:
                     result.failure_reason_code = last_event.reason_code
                 result.failure_reason_code = budget_stop_reason(result.failure_reason_code, events, last_context)
+                if result.failure_reason_code == ZEROED_BEFORE_THE_BUDGET_STOP:
+                    # the rollout reads the reason; the provider reads the event, which names the zeroing check
+                    result.validation_event = budget_stop_event(events, last_context)
                 # The liumd shadow is logged only; the result above is final before it starts.
                 # Never on a first pass: the express lane publishes only after this returns.
                 if settings.VALIDATOR_LIUMD_SHADOW and not settings.DRY_RUN and not first_pass:

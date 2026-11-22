@@ -505,6 +505,7 @@ class VerifyXValidationService:
             )
 
             seconds = VERIFYX_COMMAND_TIMEOUT_SECONDS
+            cut = None
             if deadline_monotonic is not None:
                 left = int(deadline_monotonic - time.monotonic())
                 if left <= 0:
@@ -515,13 +516,19 @@ class VerifyXValidationService:
                 # judged as any run: the host's clock never decides a cut (review at ea74f37). Never past the fixed
                 # command cap, which a budget near it would otherwise exceed by the kill's timeout.
                 seconds = min(seconds, left + VERIFYX_KILL_TIMEOUT_SECONDS)
+                # this wait cuts at the deadline, or the kill's timeout before a watchdog the cap clamped, so the
+                # validator's clock always cuts first (review r4655966507)
+                cut = seconds - VERIFYX_KILL_TIMEOUT_SECONDS
             command = self._verifyx_command(
                 executor_info, challenge, lib_name, run_dir, deadline_monotonic is not None, seconds
             )
 
             logger.info(_m("VerifyX Python Script Command", extra=get_extra_info(challenge.log_extra)))
 
-            ssh_capture = await self._run_ssh_command(shell, command)
+            try:
+                ssh_capture = await asyncio.wait_for(self._run_ssh_command(shell, command), cut)
+            except TimeoutError:
+                return None  # cut, as by the caller's wait: the caller kills the run
             return self.evaluate_verifyx_capture(challenge, ssh_capture, default_extra)
 
         except Exception as e:

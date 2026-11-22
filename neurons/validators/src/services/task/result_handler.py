@@ -10,7 +10,7 @@ from typing import Any, Optional
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobRequestPayload
-from protocol.vc_protocol.compute_requests import RentedExecutorsResponse
+from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse
 from protocol.vc_protocol.validator_requests import ResetVerifiedJobReason, ValidationEvent
 from services.gpu_spec_table import (
     classify_gpu_model,
@@ -58,7 +58,11 @@ def _canonicalize_published_gpu_names(specs: dict) -> dict:
 
 def pods_rented_gpu_count(rented_data: RentedExecutorsResponse | None, executor_uuid: str) -> int | None:
     """GPUs the node's rented pods hold, or None when a pod does not report its count."""
-    rented_executor = rented_data.executors.get(executor_uuid) if rented_data else None
+    return rental_gpu_count(rented_data.executors.get(executor_uuid) if rented_data else None)
+
+
+def rental_gpu_count(rented_executor: RentedExecutor | None) -> int | None:
+    """GPUs one rental record's pods hold, or None when it has no pod or a pod does not report its count."""
     if not rented_executor or not rented_executor.pods:
         return None
     pod_gpu_counts: list[int | None] = [pod.gpu_count for pod in rented_executor.pods]

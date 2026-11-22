@@ -272,6 +272,40 @@ async def test_a_budget_near_the_cap_never_arms_the_watchdog_past_the_cap(monkey
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("run_s,cut", [(0.6, True), (0.0, False)], ids=["clamped-watchdog-124", "early-child-124"])
+async def test_a_watchdog_the_cap_clamped_never_beats_the_validators_cut(monkeypatch, run_s, cut):
+    # review r4655966507: 599.9 s left clamps the watchdog to the 600 s cap, so a host clock 0.04% fast stopped the run
+    # (exit 124) before the deadline and it read as an executor crash; the validator's own wait now cuts the kill's
+    # timeout before that watchdog. Scaled: a 2 s cap, a 1.9 s kill timeout, 1.99 s left
+    from neurons.validators.src.services import verifyx_validation_service as module
+
+    monkeypatch.setattr(module, "VERIFYX_COMMAND_TIMEOUT_SECONDS", 2)
+    monkeypatch.setattr(module, "VERIFYX_KILL_TIMEOUT_SECONDS", 1.9)
+    service = module.VerifyXValidationService.__new__(module.VerifyXValidationService)
+    _preflight_passes(monkeypatch, service, module, exit_status=124, stderr="boom\n")
+    returned = service._run_ssh_command
+    commands = []
+
+    async def watchdog_stops_it(shell, command):
+        commands.append(command)
+        await asyncio.sleep(run_s)  # the clamped watchdog's 124, on the host's fast clock
+        return await returned(shell, command)
+
+    monkeypatch.setattr(service, "_run_ssh_command", watchdog_stops_it)
+
+    result = await service.validate_verifyx_and_process_job(
+        shell=None, executor_info=None, default_extra={}, machine_spec={}, run_dir=".verifyx-t",
+        deadline_monotonic=time.monotonic() + 1.99,
+    )
+
+    assert commands == ["timeout -k 10 2 run &"]
+    if cut:
+        assert result is None  # no-task-time, killed by the caller: never EXECUTOR_CRASH
+    else:
+        assert result is not None and result.exit_status == 124  # the child's own 124 is still judged (F-29)
+
+
+@pytest.mark.asyncio
 async def test_a_deadline_past_the_cap_still_runs_the_remote_for_the_cap(monkeypatch):
     # a full budget now passes its deadline too; the 600 s remote cap still applies after the preflight
     from neurons.validators.src.services import verifyx_validation_service as module

@@ -1103,3 +1103,69 @@ async def test_a_no_task_time_carry_needs_the_cycle_end_read():
 
     [result] = job_results["5Miner"]
     assert not result.carried_for_renter_gpu_reset
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owner", "endpoint", "carried"),
+    [
+        ("5Miner", ("198.51.100.9", "22"), True),
+        ("5Other", ("203.0.113.5", "8080"), True),
+        ("5Other", ("198.51.100.9", "22"), False),
+    ],
+    ids=["same-owner", "other-owner-same-endpoint", "other-owner-other-endpoint"],
+)
+async def test_a_no_task_time_rented_carry_counts_only_this_nodes_own_rental(owner, endpoint, carried):
+    # review at a8afce8: the uuid is the miner's word; another miner's eight-GPU rental on another endpoint under the
+    # same uuid never pays this miner's cached rented pass, the end read is owned as the checks own it
+    service = _redis_service()
+    previous = _rented_scored("node-1")
+    previous.rented_gpu_count = 8
+    await remember_rented_scored_results({"5Miner": [previous]}, service)
+    pod = RentedPod(pod_id=POD_ID, container_name="c", gpu_count=8, status="RUNNING")
+    at_end = RentedExecutorsResponse(
+        executors={
+            "node-1": RentedExecutor(
+                miner_hotkey=owner, executor_ip_address=endpoint[0], executor_ip_port=endpoint[1], pods=[pod]
+            )
+        }
+    )
+    job_results = {"5Miner": [_no_task_time("node-1")]}
+
+    await carry_renter_gpu_reset_results(job_results, service, {"node-1"}, _rented_executors(), {}, at_end)
+
+    [result] = job_results["5Miner"]
+    assert result.carried_for_renter_gpu_reset is carried
+
+
+@pytest.mark.parametrize(
+    "reason", [RentalVerificationMessages.NO_TASK_TIME.reason, VerifyXMessages.NO_TASK_TIME.reason]
+)
+@pytest.mark.parametrize("earlier_gate", ["cpu_truth_passed", "price_per_gpu"])
+def test_a_budget_stop_after_a_zeroing_check_shows_the_provider_that_check_not_the_no_time_event(
+    context_factory, reason, earlier_gate
+):
+    # review at a8afce8: the reason was ZEROED_BEFORE_THE_BUDGET_STOP but the published event still said the task had
+    # no time and the last score stands; the provider is shown the zeroing check (or the score's own warning)
+    from services.task.service import budget_stop_event, budget_stop_reason
+
+    ctx = context_factory(state=build_state(specs={"network": {"ema_verifyx_download_speed": 500.0}}))
+    ctx = ctx.model_copy(update={"executor": ctx.executor.model_copy(update={"price_per_gpu": None})})
+    events = [build_msg(event="ok", reason="VALIDATION_STEP_OK", severity="info", impact="")]
+    if earlier_gate == "price_per_gpu":
+        ctx = ctx.model_copy(update={"executor": ctx.executor.model_copy(update={"price_per_gpu": 1e9})})
+    else:
+        ctx = ctx.model_copy(update={earlier_gate: False})
+        events.append(build_msg(event="CPU count mismatch", reason="CPU_TRUTH_MISMATCH", severity="error", impact=""))
+    events.append(build_msg(event="image outdated", reason=ExecutorImageMessages.OUTDATED.reason, severity="warning", impact=""))
+    events.append(build_msg(event="no time", reason=reason, severity="warning", impact=""))
+    assert budget_stop_reason(reason, events, ctx) == ZEROED_BEFORE_THE_BUDGET_STOP
+
+    payload = budget_stop_event(events, ctx).model_dump(mode="json")
+
+    if earlier_gate == "price_per_gpu":
+        assert payload["reason_code"] == ZEROED_BEFORE_THE_BUDGET_STOP and payload["severity"] == "error"
+        assert payload["impact"] and "WARNING" not in payload["impact"]
+    else:
+        assert payload["reason_code"] == "CPU_TRUTH_MISMATCH"
+    assert reason not in json.dumps(payload)
