@@ -18,6 +18,7 @@ from incentive.config import IncentiveConfig
 from incentive.rental_price import RentalPriceIncentive
 from services.docker_service import DockerService
 from core.validator import specs_to_publish
+from services import executor_rollout
 from services.executor_rollout import (
     ExecutorRolloutTracker,
     carry_renter_gpu_reset_results,
@@ -350,6 +351,7 @@ def _rented_scored(uuid: str):
         PodContainerState(pod_id=POD_ID, container_state=ContainerState.RUNNING, observed_at=datetime.now(UTC))
     ]
     result.rental_pod_ids = [POD_ID]
+    result.rented_gpu_count = 8
     return result
 
 
@@ -700,7 +702,7 @@ def _rented_executors(*executor_ids: str, **fields) -> RentedExecutorsResponse:
         miner_hotkey="5Miner",
         executor_ip_address="203.0.113.5",
         executor_ip_port="22",
-        pods=[RentedPod(pod_id=POD_ID, container_name="tenant-123")],
+        pods=[RentedPod(pod_id=POD_ID, container_name="tenant-123", gpu_count=8)],
     )
     return RentedExecutorsResponse(executors={executor_id: rented for executor_id in executor_ids}, **fields)
 
@@ -710,7 +712,7 @@ def _rented_executors(*executor_ids: str, **fields) -> RentedExecutorsResponse:
     [
         (_rented_executors("NODE-1"), _rented_executors("NODE-1"), True),
         (_rented_executors("NODE-1"), _rented_executors(), False),
-        (None, _rented_executors("NODE-1"), False),
+        (None, _rented_executors("NODE-1"), True),  # review at d4f5e64: a GPU-reset hold falls back to the snapshot
         (None, _rented_executors(), False),
     ],
     ids=["listed-now-and-in-snapshot", "listed-now-not-in-snapshot", "no-answer-snapshot-lists-it", "no-answer"],
@@ -1250,9 +1252,13 @@ RENTAL_TIMELINES = [
     ({"pod-a": 2}, {"pod-a": 2, "pod-b": 2}, NO_TIME, {"pod-a": 2, "pod-b": 2}, False),  # split node, a second rental
     ({"pod-a": 2}, {"pod-a": 2}, NO_TIME, {"pod-a": 3}, False),  # same pod, other GPU count: not the same allocation
     ({"pod-a": 8}, {"pod-a": 8}, NO_TIME, {"pod-a": None}, False),  # the end read cannot count the rental's GPUs
+    ({"pod-a": None}, {"pod-a": None}, NO_TIME, {"pod-a": None}, False),  # nobody knows the rented GPU count
     (None, {}, NO_TIME, {}, False),  # a pass kept before rental pod ids were recorded
     ({}, {}, GPU_RESET, {}, False),  # the GPU-reset carry stands for a rented node only
     ({}, {}, NO_TIME, None, False),  # no end read
+    ({"pod-a": 8}, {"pod-a": 8}, NO_TIME, None, False),  # no end read for a rented node
+    ({"pod-a": 2}, {"pod-a": 2}, GPU_RESET, None, True),  # no end read: the reset's own scrape saw the start rental
+    ({}, {}, SEEN_RENTED, None, False),  # a rental seen starting, then no end read
 ]
 
 
@@ -1276,9 +1282,11 @@ async def test_a_kept_pass_carries_only_for_the_exact_rental_state_seen_at_both_
     assert result.carried_for_renter_gpu_reset is carried
     if carried:
         assert (result.is_rented, result.rented_gpu_count) == (bool(kept), _kept(kept).rented_gpu_count)
-    elif end is not None and reason != GPU_RESET:
-        # the state the pass was scored with is gone (an idle pass a GPU-reset hold cannot use stays kept)
-        assert await service.get(last_scored_result_key("5Miner", "node-1")) is None
+    else:
+        # dropped when the state the pass was scored with is gone, a change seen by the cycle itself included; kept
+        # when a read is missing and nothing was seen to change, and for an idle pass a GPU-reset hold cannot use
+        dropped = reason == SEEN_RENTED or (end is not None and reason != GPU_RESET)
+        assert (await service.get(last_scored_result_key("5Miner", "node-1")) is None) is dropped
 
 
 @pytest.mark.asyncio
@@ -1300,3 +1308,33 @@ async def test_a_rental_that_starts_and_closes_inside_the_cycle_pays_nothing_for
     next_cycle = {"5Miner": [_failed("node-1", NO_TIME)]}
     await carry_renter_gpu_reset_results(next_cycle, service, set(), _listed(), {}, _listed())
     assert next_cycle["5Miner"][0].carried_for_renter_gpu_reset is False
+
+
+@pytest.mark.asyncio
+async def test_a_kept_pass_that_could_not_be_dropped_is_never_carried_until_it_is_deleted_or_replaced(monkeypatch):
+    """Review at d4f5e64: a cycle sees a rental start and close while Redis refuses the delete of the idle pass it
+    invalidates. Once Redis is back, the next idle no-task-time cycle must not pay that pass: it stays ineligible and
+    its delete is retried. A new pass written after it carries as usual."""
+    monkeypatch.setattr(executor_rollout, "_UNDROPPED_KEPT_RESULTS", {})
+    service = _redis_service()
+    await remember_rented_scored_results({"5Miner": [_kept({})]}, service)
+    key = last_scored_result_key("5Miner", "node-1")
+    delete = service.delete
+    monkeypatch.setattr(service, "delete", AsyncMock(side_effect=ConnectionError("redis down")))
+    job_results = {"5Miner": [_failed("node-1", SEEN_RENTED)]}
+    await carry_renter_gpu_reset_results(job_results, service, set(), _listed(), {}, _listed())
+    assert job_results["5Miner"][0].carried_for_renter_gpu_reset is False
+    assert await service.get(key) is not None  # the delete failed
+
+    monkeypatch.setattr(service, "delete", delete)
+    next_cycle = {"5Miner": [_failed("node-1", NO_TIME)]}
+    await carry_renter_gpu_reset_results(next_cycle, service, set(), _listed(), {}, _listed())
+    assert next_cycle["5Miner"][0].carried_for_renter_gpu_reset is False
+    assert await service.get(key) is None  # retried and deleted
+
+    fresh = _kept({})
+    fresh.job_batch_id = "batch-new"
+    await remember_rented_scored_results({"5Miner": [fresh]}, service)
+    later = {"5Miner": [_failed("node-1", NO_TIME)]}
+    await carry_renter_gpu_reset_results(later, service, set(), _listed(), {}, _listed())
+    assert later["5Miner"][0].carried_for_renter_gpu_reset is True

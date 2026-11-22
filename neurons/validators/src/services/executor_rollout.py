@@ -800,8 +800,8 @@ def rental_state_unchanged(
 ) -> bool:
     """The one rule every carry goes through (DAH-5933): a kept result stands in for a held cycle only when it was
     scored with exactly the node's rental state that cycle saw at its start (the snapshot) and at the cycle-end read:
-    no rental, or the same rental pod ids holding the same GPU count. A cycle that itself saw the node rented after its
-    start (RENTAL_STARTED_DURING_CHECK) saw a change. Anything else is withheld: never scored or paid.
+    no rental, or the same rental pod ids holding the same known GPU count. A cycle that itself saw the node rented
+    after its start (RENTAL_STARTED_DURING_CHECK) saw a change. Anything else is withheld: never scored or paid.
     `rental_at_start` / `rental_at_end` are the node's own rentals (rental_owned_by), None for none."""
     if held.failure_reason_code == RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason:
         return False
@@ -812,8 +812,12 @@ def rental_state_unchanged(
         return False
     if previous.is_rented != bool(at_end):
         return False
-    # a split node is paid rented and idle GPUs apart: the same pods holding another count is another allocation
-    return not at_end or rental_gpu_count(rental_at_start) == rental_gpu_count(rental_at_end) == previous.rented_gpu_count
+    if not at_end:
+        return True
+    # a split node is paid rented and idle GPUs apart: the same pods holding another count, or a count nobody knows,
+    # is not the allocation the kept result was scored with
+    count_at_end = rental_gpu_count(rental_at_end)
+    return count_at_end is not None and rental_gpu_count(rental_at_start) == count_at_end == previous.rented_gpu_count
 
 
 async def carry_renter_gpu_reset_results(
@@ -827,39 +831,49 @@ async def carry_renter_gpu_reset_results(
     """DAH-4658: a held scrape (the renter's own GPU reset, an unconfirmed power tier, no task time) takes the node's
     last scored result, in place, scored as in the cycle it came from with this cycle's pay flags and a fresh ban
     lookup. It carries only by `rental_state_unchanged`, on the cycle-start snapshot `rented_data` and the cycle-end
-    read `rented_at_end` (None: the backend gave none, nothing carries). A kept result that fails it is dropped: the
-    rental state it was scored with is gone. A held result not carried is taken out by
+    read `rented_at_end`. With no end read (None: the backend gave none) only a GPU-reset hold carries, on the start
+    snapshot: its own scrape saw the renter resetting GPUs inside that rental. A kept result that fails the rule is
+    dropped, and so is one a cycle saw rented after its start even when a read is missing: the rental state it was
+    scored with is gone. A held result not carried is taken out by
     `withhold_renter_gpu_reset_verdicts`. The GPU-reset and power-tier holds carry a rented node only; a no-task-time
     hold carries once (`_spend_kept_result`). `rented_executor_ids` is kept for the caller's signature.
     """
-    if rented_at_end is None or rented_data is None:
-        return
-
-    def by_uuid(rented: RentedExecutorsResponse) -> dict[str, RentedExecutor]:
-        return {str(uuid).lower(): rental for uuid, rental in rented.executors.items()}
+    def by_uuid(rented: RentedExecutorsResponse | None) -> dict[str, RentedExecutor] | None:
+        return None if rented is None else {str(uuid).lower(): rental for uuid, rental in rented.executors.items()}
 
     rentals_at_start, rentals_at_end = by_uuid(rented_data), by_uuid(rented_at_end)
     for miner_hotkey, results in job_results.items():
         for index, held in enumerate(results):
             if not _held_for_renter_gpu_reset(held):
                 continue
+            previous = await _last_scored_result(redis_service, miner_hotkey, held)
+            if previous is None:
+                continue
+            gpu_reset = held.failure_reason_code == MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason
+            if rentals_at_start is None or (rentals_at_end is None and not gpu_reset):
+                # a rental state that cannot be read carries nothing; one the cycle saw change still drops the kept result
+                if held.failure_reason_code == RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason:
+                    await _spend_kept_result(redis_service, miner_hotkey, held, previous)
+                continue
             info = held.executor_info
             uuid = str(info.uuid).lower()
             # owned as the checks own it: the uuid is the miner's word, so another miner's rental on another endpoint
             # under it is not this node's (review at a8afce8)
             rental_at_start = rental_owned_by(rentals_at_start.get(uuid), miner_hotkey, info.address, info.port)
-            rental_at_end = rental_owned_by(rentals_at_end.get(uuid), miner_hotkey, info.address, info.port)
-            previous = await _last_scored_result(redis_service, miner_hotkey, held)
+            rental_at_end = (
+                rental_at_start
+                if rentals_at_end is None
+                else rental_owned_by(rentals_at_end.get(uuid), miner_hotkey, info.address, info.port)
+            )
             if not rental_state_unchanged(held, previous, rental_at_start, rental_at_end):
-                if previous is not None:
-                    await _spend_kept_result(redis_service, miner_hotkey, held)
+                await _spend_kept_result(redis_service, miner_hotkey, held, previous)
                 continue
             no_task_time = held.failure_reason_code in NO_TASK_TIME_REASONS
             rented_now = rental_at_end is not None
             if not no_task_time and not rented_now:
                 continue
             rented_gpu_count = rental_gpu_count(rental_at_end) if rented_now else 0
-            if no_task_time and not await _spend_kept_result(redis_service, miner_hotkey, held):
+            if no_task_time and not await _spend_kept_result(redis_service, miner_hotkey, held, previous):
                 continue
             results[index] = previous.model_copy(
                 update={
@@ -929,14 +943,28 @@ def _filler_revenue_now(rented_data: RentedExecutorsResponse | None, previous: J
     )
 
 
-async def _spend_kept_result(redis_service: RedisService, miner_hotkey: str, held: JobResult) -> bool:
-    """A cycle the task had no time for carries the last pass once: the next such cycle, with no pass between,
-    is withheld. The node's own checks spend the task's time, so a node that keeps running out of it never keeps
-    its score (review). False when the kept result could not be dropped: the held result is withheld then."""
+# kept results dropped while Redis refused the delete: key -> the dropped result's job_batch_id. Each stays ineligible,
+# and its delete is retried, until a delete succeeds or a new standing result replaces it (another job_batch_id).
+# shortcut: held in this process only, so a restart while Redis is back but the delete was never retried forgets it;
+# make it durable (a Redis set written with the next successful write) if restarts during Redis outages show up.
+_UNDROPPED_KEPT_RESULTS: dict[str, str] = {}
+
+
+async def _spend_kept_result(
+    redis_service: RedisService, miner_hotkey: str, held: JobResult, previous: JobResult
+) -> bool:
+    """Drops the kept result `previous`. A cycle the task had no time for carries the last pass once: the next such
+    cycle, with no pass between, is withheld. The node's own checks spend the task's time, so a node that keeps
+    running out of it never keeps its score (review). A kept result invalidated by a rental change is dropped here
+    too. False when it could not be dropped: the held result is withheld then, and the kept result is never read as
+    eligible again (`_UNDROPPED_KEPT_RESULTS`)."""
+    key = last_scored_result_key(miner_hotkey, held.executor_info.uuid)
     try:
-        await redis_service.delete(last_scored_result_key(miner_hotkey, held.executor_info.uuid))
+        await redis_service.delete(key)
+        _UNDROPPED_KEPT_RESULTS.pop(key, None)
         return True
     except Exception as exc:
+        _UNDROPPED_KEPT_RESULTS[key] = previous.job_batch_id
         logger.warning(
             _m(
                 "Kept result could not be dropped; the held verdict is withheld",
@@ -949,10 +977,19 @@ async def _spend_kept_result(redis_service: RedisService, miner_hotkey: str, hel
 async def _last_scored_result(
     redis_service: RedisService, miner_hotkey: str, held: JobResult
 ) -> JobResult | None:
-    """None when there is none or it cannot be read: the held result is then withheld, as before."""
+    """None when there is none or it cannot be read: the held result is then withheld, as before. None as well for a
+    kept result an earlier cycle dropped but could not delete: its delete is retried."""
+    key = last_scored_result_key(miner_hotkey, held.executor_info.uuid)
     try:
-        raw = await redis_service.get(last_scored_result_key(miner_hotkey, held.executor_info.uuid))
-        return JobResult.model_validate_json(raw) if raw else None
+        raw = await redis_service.get(key)
+        previous = JobResult.model_validate_json(raw) if raw else None
+        if key not in _UNDROPPED_KEPT_RESULTS:
+            return previous
+        if previous is None or previous.job_batch_id != _UNDROPPED_KEPT_RESULTS[key]:
+            _UNDROPPED_KEPT_RESULTS.pop(key, None)  # gone, or replaced by a newer standing result
+            return previous
+        await _spend_kept_result(redis_service, miner_hotkey, held, previous)
+        return None
     except Exception as exc:
         logger.warning(
             _m(
