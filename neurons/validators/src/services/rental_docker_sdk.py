@@ -1263,7 +1263,8 @@ class RentalDockerSdkClient:
         wanted_owner = spec.labels.get(LIUM_EXECUTOR_ID_LABEL)
         existing_labels = (config.get("Labels") if isinstance(config, dict) else None) or {}
         existing_owner = existing_labels.get(LIUM_EXECUTOR_ID_LABEL)
-        if wanted_owner is not None and existing_owner is not None and existing_owner != wanted_owner:
+        # an empty label is a container made before the label: decided below like the first attempt's 409 (_made_for)
+        if wanted_owner and existing_owner and existing_owner != wanted_owner:
             raise ContainerOfAnotherRegistration(
                 "Docker SDK run container refused after a transport retry: a container named "
                 f"{spec.name} already exists for another registration"

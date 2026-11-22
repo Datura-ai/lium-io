@@ -105,7 +105,9 @@ def test_an_attempt_named_build_artifact_reads_as_its_pods():
     )
 
     assert dind_container_pod_id("lium-dind-build-pod-1.ab12-fw-apply") == "pod-1"
-    assert dind_build_pod_id("lium-dind-build-pod-1.ab12") == "pod-1"
+    assert dind_build_pod_id("lium-dind-build-pod-1.ab12cd34") == "pod-1"
+    assert dind_build_pod_id("lium-dind-build-pod-1.zzzz-not-hex") is None
+    assert dind_build_pod_id("lium-dind-build-pod-1.ab12") is None
     assert dind_build_pod_id("lium-dind-build-pod-1.ab12-fw-remove") is None
     assert dind_build_pod_id("lium-dind-build-pod-1") == "pod-1"
 

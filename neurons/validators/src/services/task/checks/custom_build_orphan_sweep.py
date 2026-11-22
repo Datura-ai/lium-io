@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shlex
 import time
 
@@ -72,9 +73,14 @@ def dind_container_pod_id(name: str) -> str | None:
 
 def dind_build_pod_id(name: str) -> str | None:
     """Pod id of a ``lium-dind-build-*`` build container itself, not of its firewall helpers."""
-    if name.endswith(BUILD_DIND_HELPER_SUFFIXES):
+    if name.endswith(BUILD_DIND_HELPER_SUFFIXES) or not name.startswith(BUILD_DIND_PREFIX):
         return None
-    return dind_container_pod_id(name)
+    # only `<pod id>.<attempt>` with the create's 8-hex attempt (secrets.token_hex(4)), or a bare pod id named before
+    # attempts: any other suffix is not a build this validator made
+    pod_id, dot, attempt = name[len(BUILD_DIND_PREFIX):].partition(".")
+    if dot and not re.fullmatch(r"[0-9a-f]{8}", attempt):
+        return None
+    return pod_id or None
 
 
 def _pod_id_of(name_rest: str) -> str | None:

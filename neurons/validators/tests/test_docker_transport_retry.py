@@ -187,7 +187,7 @@ async def test_run_container_retry_refuses_a_same_name_container_on_another_imag
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("existing_labels, adopted", [({"io.lium.executor_id": "hk-a:ex-1"}, False), ({}, True), ({"io.lium.executor_id": "hk-b:ex-2"}, True)])
+@pytest.mark.parametrize("existing_labels, adopted", [({"io.lium.executor_id": "hk-a:ex-1"}, False), ({}, True), ({"io.lium.executor_id": ""}, True), ({"io.lium.executor_id": "hk-b:ex-2"}, True)])
 async def test_run_container_retry_adopts_a_same_name_container_only_of_its_own_or_no_registration(
     existing_labels, adopted
 ):

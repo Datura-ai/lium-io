@@ -528,7 +528,7 @@ async def test_A27_a_resumed_build_replaces_the_build_container_its_cut_off_atte
     from services.docker_service import executor_key, inflight_creates
 
     payload = _base_payload(dockerfile_content="FROM alpine\n")
-    dind = svc._dind_container_name(payload.pod_id, "cutoff1")
+    dind = svc._dind_container_name(payload.pod_id, "c0ff0001")
     # the cut-off attempt's DinD, its firewall helper (left to the teardown) and one named before attempts were
     ssh_client = _make_dind_ssh(
         leftover_dinds=(dind, f"{dind}-fw-apply", f"lium-dind-build-{payload.pod_id}")
@@ -559,7 +559,7 @@ async def test_A27f_two_builds_of_one_pod_never_reach_each_others_build_containe
     from services.docker_service import executor_key, inflight_creates
 
     payload = _base_payload(dockerfile_content="FROM alpine\n")
-    other = svc._dind_container_name(payload.pod_id, "aaaa")
+    other = svc._dind_container_name(payload.pod_id, "aaaa0000")
     ssh_client = _make_dind_ssh(leftover_dinds=(other,))
     monkeypatch.setattr(svc, "execute_and_stream_logs", _make_esl(build=(False, "boom")))
     monkeypatch.setattr(svc, "stream_log", AsyncMock())
@@ -567,17 +567,17 @@ async def test_A27f_two_builds_of_one_pod_never_reach_each_others_build_containe
     with inflight_creates.track(payload.pod_id, executor_key(payload)):
         inflight_creates._creates[payload.pod_id, executor_key(payload)].running += 1  # the other create, still live
         await svc._custom_build_image(
-            ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={}, build_attempt="bbbb"
+            ssh_client=ssh_client, payload=payload, log_tag="t", default_extra={}, build_attempt="bbbb0000"
         )
         inflight_creates._creates[payload.pod_id, executor_key(payload)].running = 1
     await svc._cleanup_custom_build_artifacts(
-        ssh_client=ssh_client, pod_id=payload.pod_id, default_extra={}, build_attempt="bbbb"
+        ssh_client=ssh_client, pod_id=payload.pod_id, default_extra={}, build_attempt="bbbb0000"
     )
 
-    assert not any(".aaaa" in c for c in ssh_client.calls)
-    assert any(c.startswith(f"/usr/bin/docker rm -fv lium-dind-build-{payload.pod_id}.bbbb ") for c in ssh_client.calls)
-    assert any(f"image rm lium-build-{payload.pod_id}.bbbb " in c for c in ssh_client.calls)
-    assert any(f"rm -rf /tmp/lium-build-{payload.pod_id}.bbbb" in c for c in ssh_client.calls)
+    assert not any(".aaaa0000" in c for c in ssh_client.calls)
+    assert any(c.startswith(f"/usr/bin/docker rm -fv lium-dind-build-{payload.pod_id}.bbbb0000 ") for c in ssh_client.calls)
+    assert any(f"image rm lium-build-{payload.pod_id}.bbbb0000 " in c for c in ssh_client.calls)
+    assert any(f"rm -rf /tmp/lium-build-{payload.pod_id}.bbbb0000" in c for c in ssh_client.calls)
 
 
 @pytest.mark.asyncio
@@ -597,7 +597,7 @@ async def test_A27e_a_resumed_build_whose_old_build_container_cannot_be_stopped_
     from services.docker_service import executor_key, inflight_creates
 
     payload = _base_payload(dockerfile_content="FROM alpine\n")
-    ssh_client = _make_dind_ssh(leftover_dinds=(f"lium-dind-build-{payload.pod_id}.cutoff1",))
+    ssh_client = _make_dind_ssh(leftover_dinds=(f"lium-dind-build-{payload.pod_id}.c0ff0001",))
     inner = ssh_client.run
 
     async def _run(cmd, **kw):
