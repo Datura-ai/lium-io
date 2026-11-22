@@ -63,6 +63,10 @@ class JobResult(BaseModel):
     # executor is then scored whole-box; set and below gpu_count on a split node, the incentive
     # engine scores the free GPUs in the unrented pool.
     rented_gpu_count: int | None = None
+    # DAH-5933: the pod ids of the node's own rental in the snapshot this result was scored with, sorted; [] = scored
+    # idle, None = not known (kept before this field, or a verdict the snapshot's rental does not match). A kept result
+    # stands in for a later cycle only for this exact rental state (executor_rollout.rental_state_unchanged).
+    rental_pod_ids: list[str] | None = None
     # DAH-2467: the free remainder of a partially rented split node. It is always rated at the
     # minimum-split tier and rate, never as a bundle of its own size.
     is_split_remainder: bool = False

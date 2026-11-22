@@ -2512,8 +2512,8 @@ class RentalVerificationMessages:
         severity="info",
         category="policy",
         impact=(
-            "No verdict this cycle; the node's last scored result stands only if it was scored with this rental, "
-            "else the next cycle scores the node rented"
+            "No verdict this cycle: the node's rentals changed during it, so no earlier result stands in; the next "
+            "cycle scores the node rented"
         ),
         remediation="No action needed.",
     )
