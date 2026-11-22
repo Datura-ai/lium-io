@@ -1170,7 +1170,7 @@ class MinerService:
 
         A miner that reached none of its nodes is down itself (its own network, a restart), not its
         nodes: that wave writes none of these rows, so one miner-side blip does not mark every node
-        down (Pixel, 19 Oct). Manual rentals are left out, as the miner cannot reach them anyway. The
+        down (Pixel, 19 Oct). A node that answered with a refusal (``refused_executors``) was reached. Manual rentals are left out, as the miner cannot reach them anyway. The
         zero-executor wave then fails as before.
         """
         if (
@@ -1183,7 +1183,9 @@ class MinerService:
         reached = {str(executor.uuid).lower() for executor in msg.executors}
         manual = {str(uuid).lower() for uuid in ((rented_data and rented_data.manual_rental_executors) or {})}
         reachable = set(known) - manual
-        if reachable and not reached & reachable:
+        # a node that answered with a refusal was reached: the miner is up even when no node took the key
+        refused = {str(uuid).lower(): str(text)[:200] for uuid, text in (msg.refused_executors or {}).items()}
+        if reachable and not (reached | refused.keys()) & reachable:
             if log:
                 logger.warning(
                     _m(
@@ -1203,7 +1205,6 @@ class MinerService:
         }
         if rented_data:
             skip |= {str(uuid).lower() for uuid in rented_data.executors}
-        refused = {str(uuid).lower(): str(text)[:200] for uuid, text in (msg.refused_executors or {}).items()}
         results = []
         for executor_uuid in known:
             if executor_uuid in skip:
