@@ -1185,12 +1185,16 @@ class ComputeClient:
 
     async def _command_ran_before(self, job_request: ContainerCreateRequest) -> bool:
         """the pod's pending marks include one of this command (any age), or an older validator left a create of the pod
-        unanswered when it stopped (its marks carry no command ID: it may be this one, sent again after the upgrade);
-        unreadable counts as yes, which only holds a failure back until the node is asked"""
+        unanswered when it stopped (its marks carry no command ID: it may be this one, sent again after the upgrade)
+        and the backend does not say this create is the pod's first since its last new rental, reboot or retry (a
+        legacy create that succeeded but whose receipt was lost leaves the same mark, and a renter's new reboot of
+        that pod must run); unreadable counts as yes, which only holds a failure back until the node is asked"""
         redis_service = self.miner_service.redis_service
         try:
             marks = await redis_service.get_pending_pods(job_request.miner_hotkey, job_request.executor_id, None)
-            if await redis_service.pre_upgrade_create_unanswered(job_request.pod_id):
+            if job_request.earlier_create_built is not False and await redis_service.pre_upgrade_create_unanswered(
+                job_request.pod_id
+            ):
                 return True
         except Exception:  # noqa: BLE001
             return True

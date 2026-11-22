@@ -800,6 +800,18 @@
           "default": null,
           "title": "Dockerfile Content"
         },
+        "earlier_create_built": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Earlier Create Built"
+        },
         "enable_jupyter": {
           "anyOf": [
             {
@@ -6626,7 +6638,7 @@
       "$ref": "#/$defs/RentedExecutorsResponse"
     }
   },
-  "protocol_version": "2.16.0",
+  "protocol_version": "2.24.0",
   "socket_replies": {
     "RentedMachineResponse": {
       "$ref": "#/$defs/RentedMachineResponse"

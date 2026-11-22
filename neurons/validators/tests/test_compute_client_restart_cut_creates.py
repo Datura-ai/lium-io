@@ -2092,3 +2092,11 @@ async def test_a_rental_create_an_older_validator_left_unanswered_counts_as_run_
         for pod_id in ("pod-1", "pod-gpu", "pod-new")
     }
     assert ran_before == {"pod-1": age_minutes < 30, "pod-gpu": False, "pod-new": False}
+    # the backend says this create is the pod's first since its last new rental, reboot or retry: the older validator's
+    # create was settled (a success whose receipt was lost leaves the same mark), so a renter's new reboot runs
+    first = _create_request().model_copy(update={"pod_id": "pod-1", "earlier_create_built": False})
+    repeat = first.model_copy(update={"earlier_create_built": True})
+    assert (await client._command_ran_before(first), await client._command_ran_before(repeat)) == (
+        False,
+        age_minutes < 30,
+    )

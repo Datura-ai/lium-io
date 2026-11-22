@@ -157,6 +157,9 @@ class ContainerCreateRequest(ContainerRequest):
     docker_username: str | None = None
     docker_password: str | None = pydantic.Field(default=None, repr=False)
     timestamp: int | None = None
+    # 2.24.0: True when the backend already built a create of this pod since its last new rental, reboot or retry
+    # (this one may repeat it, and that one may have run); False when this is the first; None from an older backend
+    earlier_create_built: bool | None = None
     # DAH-2458: backend-measured pre-dispatch spans ({name, duration}), seeding the validator's profile
     pre_dispatch_profilers: list[dict[str, Any]] = []
     backup_log_id: str | None = None

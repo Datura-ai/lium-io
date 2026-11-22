@@ -369,6 +369,10 @@ class ContainerCreateRequest(ContainerBaseRequest):
     # when edit pod, docker_password is required
     docker_password: str | None = Field(default=None, repr=False)
     timestamp: int | None = None
+    # lium_protocol 2.24.0: False when the backend built no create of this pod before this one since its last new
+    # rental, reboot or retry, so a create an older validator left unanswered cannot be this one; None from an older
+    # backend
+    earlier_create_built: bool | None = None
     # DAH-2458: backend-measured pre-dispatch profiler spans (e.g. filler preemption, rent prep),
     # as wire dicts {name, duration}. create_container seeds the deploy profile with these so the
     # persisted profile is one ordered backend -> subnet -> backend timeline. Optional/defaulted so
