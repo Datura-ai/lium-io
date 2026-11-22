@@ -388,6 +388,11 @@ def last_scored_result_key(miner_hotkey: str, executor_id: str) -> str:
     return f"{LAST_SCORED_RESULT_PREFIX}:{miner_hotkey}:{executor_id}"
 
 
+def last_scored_result_vouch_key(miner_hotkey: str, executor_id: str) -> str:
+    """The job block of the last cycle that kept the node's last scored result eligible (DAH-5933)."""
+    return f"{LAST_SCORED_RESULT_PREFIX}_vouch:{miner_hotkey}:{executor_id}"
+
+
 def _verified_job_field(miner_hotkey: str, executor_id: str) -> str:
     """The verified record is per (miner hotkey, executor id): an executor id is unique only per hotkey, so a
     hotkey that lists another's executor id writes, resets and marks only its own record."""

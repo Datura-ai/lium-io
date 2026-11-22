@@ -688,7 +688,7 @@ class Validator:
                     # DAH-6564: one cycle-end read of the rented list, shared by the carry and the rental-change rule
                     rented_at_end = await self.rented_at_cycle_end(all_job_results)
                     await self.carry_scores_over_renter_gpu_resets(
-                        all_job_results, rented_executors, miner_coldkeys, rented_at_end
+                        all_job_results, rented_executors, miner_coldkeys, rented_at_end, job_block=job_block
                     )
                     total_gpu_model_count_map = settle_cycle_results(
                         all_job_results,
@@ -722,7 +722,7 @@ class Validator:
                     all_job_results, withheld_results = await self.withhold_verdicts_for_rollout(
                         all_job_results, job_block, job_batch_id, rollout_window, rented_executors, rented_at_end
                     )
-                    await remember_rented_scored_results(all_job_results, self.redis_service)
+                    await remember_rented_scored_results(all_job_results, self.redis_service, job_block=job_block)
 
                     # DAH-2622: a miner whose machine passed validation must keep its UID even
                     # when it earned nothing this cycle. Overwrite, never accumulate. A miner with a
@@ -1591,6 +1591,8 @@ class Validator:
         rented_executors: RentedExecutorsResponse | None,
         miner_coldkeys: dict[str, str | None],
         rented_now: RentedExecutorsResponse | None,
+        *,
+        job_block: int,
     ) -> None:
         """DAH-4658: only a node the backend still lists as rented carries its score over a GPU reset: at the cycle end
         (`rented_now`), or in this cycle's snapshot when the backend did not answer. DAH-5933: a no-task-time hold carries
@@ -1600,7 +1602,13 @@ class Validator:
         rented = rented_now or rented_executors
         rented_executor_ids = {str(executor_id).lower() for executor_id in rented.executors} if rented else set()
         await carry_renter_gpu_reset_results(
-            all_job_results, self.redis_service, rented_executor_ids, rented_executors, miner_coldkeys, rented_now
+            all_job_results,
+            self.redis_service,
+            rented_executor_ids,
+            rented_executors,
+            miner_coldkeys,
+            rented_now,
+            job_block=job_block,
         )
 
     async def rented_at_cycle_end(
