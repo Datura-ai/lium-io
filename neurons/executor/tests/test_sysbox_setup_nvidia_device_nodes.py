@@ -45,3 +45,45 @@ def test_a_host_without_nvidia_modprobe_exits_cleanly(tmp_path):
         [str(tmp_path / "usr/local/sbin/lium-nvidia-device-nodes")], env={"PATH": "/nonexistent"}, capture_output=True
     )
     assert out.returncode == 0
+
+
+def test_a_host_without_nvidia_modprobe_still_gets_every_node(tmp_path):
+    # Ubuntu's nvidia-utils-580-server ships no nvidia-modprobe: the unit used to do nothing there and setup said ok
+    _install(tmp_path)
+    gpus = tmp_path / "gpus"
+    for minor in (0, 1):
+        (gpus / str(minor)).mkdir(parents=True)
+        (gpus / str(minor) / "information").write_text(f"Model: \t\t NVIDIA RTX 4090\nDevice Minor: \t {minor}\n")
+    devices = tmp_path / "devices"
+    devices.write_text("Character devices:\n195 nvidia\n509 nvidia-uvm\n")
+    dev = tmp_path / "dev"
+    dev.mkdir()
+    (dev / "nvidia0").touch()  # a node that is already there is left alone
+    calls = tmp_path / "calls"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for name in ("modprobe", "mknod"):
+        (bindir / name).write_text(f'#!/bin/sh\necho "{name} $*" >> {calls}\n')
+        (bindir / name).chmod(0o755)
+    out = subprocess.run(
+        [str(tmp_path / "usr/local/sbin/lium-nvidia-device-nodes")],
+        env={
+            "PATH": f"{bindir}:/usr/bin:/bin",
+            "LIUM_NVIDIA_GPUS_DIR": str(gpus),
+            "LIUM_NVIDIA_DEV_DIR": str(dev),
+            "LIUM_NVIDIA_PROC_DEVICES": str(devices),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert out.returncode == 0, out.stderr
+    assert calls.read_text().splitlines() == [
+        "modprobe nvidia",
+        f"mknod -m 666 {dev}/nvidiactl c 195 255",
+        f"mknod -m 666 {dev}/nvidia1 c 195 1",
+        "modprobe nvidia-uvm",
+        f"mknod -m 666 {dev}/nvidia-uvm c 509 0",
+        f"mknod -m 666 {dev}/nvidia-uvm-tools c 509 1",
+        "modprobe nvidia-modeset",
+        f"mknod -m 666 {dev}/nvidia-modeset c 195 254",
+    ]

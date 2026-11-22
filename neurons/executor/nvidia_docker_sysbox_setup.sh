@@ -619,15 +619,30 @@ create_nvidia_device_nodes_before_docker() {
 #!/bin/sh
 # Lium (nvidia_docker_sysbox_setup.sh): create the NVIDIA device nodes at boot, before Docker starts the pods that
 # use them. nvidia-modprobe only loads the modules and makes the nodes; it does not touch the GPUs.
-command -v nvidia-modprobe >/dev/null 2>&1 || exit 0
-nvidia-modprobe -c=255  # loads nvidia, makes /dev/nvidiactl
-for info in "${LIUM_NVIDIA_GPUS_DIR:-/proc/driver/nvidia/gpus}"/*/information; do
-    [ -r "$info" ] || continue
-    minor=$(sed -n 's/^Device Minor:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$info")
-    [ -n "$minor" ] && nvidia-modprobe -c="$minor"  # /dev/nvidia<minor>
-done
-nvidia-modprobe -u -c=0  # /dev/nvidia-uvm and /dev/nvidia-uvm-tools
-nvidia-modprobe -m  # /dev/nvidia-modeset
+gpus="${LIUM_NVIDIA_GPUS_DIR:-/proc/driver/nvidia/gpus}"
+minors() {
+    for info in "$gpus"/*/information; do
+        [ -r "$info" ] && sed -n 's/^Device Minor:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$info"
+    done; }
+if command -v nvidia-modprobe >/dev/null 2>&1; then
+    nvidia-modprobe -c=255  # loads nvidia, makes /dev/nvidiactl
+    for minor in $(minors); do nvidia-modprobe -c="$minor"; done  # /dev/nvidia<minor>
+    nvidia-modprobe -u -c=0  # /dev/nvidia-uvm and /dev/nvidia-uvm-tools
+    nvidia-modprobe -m  # /dev/nvidia-modeset
+    exit 0
+fi
+# No nvidia-modprobe (Ubuntu's nvidia-utils-*-server do not ship it): load the modules and make the nodes from their
+# numbers, as nvidia-modprobe does. 195 is the driver's fixed major; 255 nvidiactl, 254 modeset; mode 0666 its default.
+dev="${LIUM_NVIDIA_DEV_DIR:-/dev}"
+mk() { [ -e "$dev/$1" ] || mknod -m 666 "$dev/$1" c "$2" "$3"; }
+modprobe nvidia || exit 0
+mk nvidiactl 195 255
+for minor in $(minors); do mk "nvidia$minor" 195 "$minor"; done
+if modprobe nvidia-uvm; then
+    uvm=$(awk '$2 == "nvidia-uvm" {print $1}' "${LIUM_NVIDIA_PROC_DEVICES:-/proc/devices}")
+    [ -n "$uvm" ] && mk nvidia-uvm "$uvm" 0 && mk nvidia-uvm-tools "$uvm" 1
+fi
+modprobe nvidia-modeset && mk nvidia-modeset 195 254
 exit 0
 SH
     chmod 755 "$bin" || return 1
