@@ -41,6 +41,7 @@ from core.docker_utils import (
 from datura.requests.miner_requests import ExecutorSSHInfo
 from fastapi import Depends
 from payload_models.payloads import (
+    NODE_LEFT_DELETE_ANSWER_SECONDS,
     PARALLEL_PROFILER_STEP_NAMES,
     AddSshPublicKeyRequest,
     BootstrapRestoreSpec,
@@ -1368,6 +1369,10 @@ class _SameNameContainerKept(Exception):
     """A re-sent create met the pod's own container already running (or unreadable): it is the renter's, never removed."""
 
 
+# a same-name conflict's holder was gone by the inspect (dockerd answered 404): the name is free to create under
+_NAME_NOW_FREE = object()
+
+
 class _SameNameHeldByAnotherRegistration(_SameNameContainerKept):
     """DAH-6531 F-12: the pod's name is held on this daemon by a container another registration made: for a moved pod,
     the one the node-left delete removes. Reported as SameNameHeldByNodeLeft, so the backend can send the create once
@@ -1853,8 +1858,6 @@ def _kept_container_prefix(container_name: str) -> str:
 
 
 _NOT_THE_NODE_LEFT_EXIT = 97
-# a create's own steps are bounded well inside this; past it the creates are stuck and nothing is deleted
-_NODE_LEFT_CREATE_WAIT_SECONDS = 1800.0
 
 
 class _CreatesOfThePodStillRunning(RuntimeError):
@@ -4078,20 +4081,24 @@ class DockerService:
     @staticmethod
     async def _own_leftover_container(
         docker_client: RentalDockerSdkClient, container_name: str, owner: str | None
-    ) -> str | None:
+    ) -> str | object | None:
         """What to remove for a same-name conflict, or None to keep it: only a container known to be stopped (created,
         exited or dead) and, for a create that names its registration (`owner`), carrying that registration or no
         label (made before the label). Removed by the ID inspected, so a container made under the name after the
-        inspect is not it. A container another registration made on a daemon both share is never this create's."""
+        inspect is not it. A container another registration made on a daemon both share is never this create's.
+        `_NAME_NOW_FREE` when dockerd no longer knows the name (its holder went after the conflict); an unreadable
+        state is None."""
         try:
             if owner is None:
                 status = await docker_client.container_status(container_name=container_name)
+                if status is None:
+                    return _NAME_NOW_FREE
                 return container_name if status in ("created", "exited", "dead") else None
             identity = await docker_client.container_owner_state(container_name=container_name)
         except Exception:
             return None
         if identity is None:
-            return None
+            return _NAME_NOW_FREE
         container_id, status, found_owner = identity
         if container_id and found_owner not in ("", owner):
             raise _SameNameHeldByAnotherRegistration(f"the name {container_name} is held by another registration's container")
@@ -4153,6 +4160,7 @@ class DockerService:
         image_flattened = False
         remaps = 0
         own_leftover_removed = False
+        freed_name_retried = False
         while True:
             try:
                 container_id = await run_logged_rental_docker_sdk_operation(
@@ -4188,9 +4196,16 @@ class DockerService:
                     leftover = await self._own_leftover_container(
                         docker_client, container_name, run_spec.labels.get(LIUM_EXECUTOR_ID_LABEL)
                     )
+                    if leftover is _NAME_NOW_FREE and not freed_name_retried:
+                        # DAH-6531: the holder went between the conflict and the inspect (a moved pod's delete on the
+                        # node it left): the create is sent again, once, removing nothing
+                        freed_name_retried = True
+                        attempt += 1
+                        continue
                     # read after the inspect: another create may have registered (and started the pod) during it
                     if (
                         leftover is None
+                        or leftover is _NAME_NOW_FREE
                         or own_leftover_removed
                         or pod_id is None
                         or not inflight_creates.is_only_create_on_any_registration(pod_id)
@@ -15286,16 +15301,24 @@ class DockerService:
             return self._failed_delete(payload, msg=f"Invalid delete: {exc}")
 
         pkey = asyncssh.import_private_key(self.ssh_service.decrypt_payload(keypair.ss58_address, private_key))
+        # one deadline, the backend's too (it holds the replacement's name-held failure that long): the waits for the
+        # pod's creates end early enough to leave the connection and the host command their own bounds
+        loop = asyncio.get_running_loop()
+        answer_by = loop.time() + NODE_LEFT_DELETE_ANSWER_SECONDS
+        creates_by = answer_by - _PARK_COMMAND_TIMEOUT_SECONDS - _OWN_SSH_CONNECTION_MARGIN_SEC
         try:
-            # the long wait before connecting; _run_with_no_create_of_the_pod re-checks under the lock
-            if not await inflight_creates.wait_for_no_create(payload.pod_id, _NODE_LEFT_CREATE_WAIT_SECONDS):
-                raise _CreatesOfThePodStillRunning(payload.pod_id)
-            known_hosts_policy = await self._prepare_known_hosts_policy(executor_info, payload.miner_hotkey, default_extra)
-            require_rental_docker_ssh_host_key(executor_info)
-            async with asyncssh.connect(
-                **await _ssh_connect_kwargs(executor_info, pkey, known_hosts_policy)
-            ) as ssh_client:
-                result = await self._run_with_no_create_of_the_pod(payload.pod_id, ssh_client, command)
+            async with asyncio.timeout_at(answer_by):
+                # the long wait before connecting; _run_with_no_create_of_the_pod re-checks under the lock
+                if not await inflight_creates.wait_for_no_create(payload.pod_id, max(0.0, creates_by - loop.time())):
+                    raise _CreatesOfThePodStillRunning(payload.pod_id)
+                known_hosts_policy = await self._prepare_known_hosts_policy(
+                    executor_info, payload.miner_hotkey, default_extra
+                )
+                require_rental_docker_ssh_host_key(executor_info)
+                async with asyncssh.connect(
+                    **await _ssh_connect_kwargs(executor_info, pkey, known_hosts_policy)
+                ) as ssh_client:
+                    result = await self._run_with_no_create_of_the_pod(payload.pod_id, ssh_client, command, creates_by)
         except _CreatesOfThePodStillRunning:
             log.error("Creates of the moved pod were still running; nothing deleted on the node it left")
             return self._failed_delete(payload, msg="Creates of the pod were still running; nothing deleted")
@@ -15317,17 +15340,18 @@ class DockerService:
             log.warning("Delete for the node a moved pod left did not finish", exit_status=result.exit_status,
                         stderr=(result.stderr or "").strip())
             return self._failed_delete(payload, msg=f"Removal on the node left exited {result.exit_status}")
-        with _best_effort_delete_step(log, "remove_rented_machine"):
-            await self.redis_service.remove_rented_machine(executor_info, payload.container_name)
+        # the rented-machine record is keyed by endpoint and container name, which the replacement may share: it is
+        # never touched here; the backend's rented-machine list replaces it
         log.info("Deleted the container on the node a moved pod left")
         return self._container_deleted(payload)
 
     @staticmethod
-    async def _run_with_no_create_of_the_pod(pod_id: str, ssh_client, command: str):
+    async def _run_with_no_create_of_the_pod(pod_id: str, ssh_client, command: str, creates_by: float):
         """Run the node-left removal once no registration has a create of the pod running: a delayed create of the
         left registration could otherwise make the container after its removal. The backend sends this delete once,
-        so it waits for those creates instead of answering a retry."""
-        if not await inflight_creates.wait_for_no_create(pod_id, _NODE_LEFT_CREATE_WAIT_SECONDS):
+        so it waits for those creates (until `creates_by`, loop time) instead of answering a retry."""
+        remaining = max(0.0, creates_by - asyncio.get_running_loop().time())
+        if not await inflight_creates.wait_for_no_create(pod_id, remaining):
             raise _CreatesOfThePodStillRunning(pod_id)
         return await _run_with_host_timeout(ssh_client, command, _PARK_COMMAND_TIMEOUT_SECONDS)
 

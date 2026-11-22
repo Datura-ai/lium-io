@@ -207,6 +207,12 @@ class ContainerDeleteRequest(ContainerRequest):
     external_volume: str | None = None
 
 
+# 2.23.0: a validator answers a ContainerDeleteOnNodeLeftRequest within this many seconds of starting it: its wait for
+# the pod's creates, the connection and the host command together. The backend keeps a replacement's
+# SameNameHeldByNodeLeft failure held for at least as long after sending the delete, so the answer always finds it.
+NODE_LEFT_DELETE_ANSWER_SECONDS = 1800
+
+
 @BACKEND_MESSAGES.register
 class ContainerDeleteOnNodeLeftRequest(ContainerDeleteRequest):
     """2.23.0: a ContainerDeleteRequest for the node a moved pod left. The node's registration can point at

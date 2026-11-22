@@ -6769,6 +6769,57 @@ async def test_a_second_same_name_conflict_after_the_one_checked_removal_keeps_t
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("label", ["miner-b:exec-2", None])
+@pytest.mark.parametrize("freed_again", [False, True])
+async def test_a_same_name_holder_gone_by_the_inspect_sends_the_create_again_once_removing_nothing(
+    docker_service, monkeypatch, label, freed_again,
+):
+    # DAH-6531: the moved pod's create met the left registration's container, whose node-left delete removed it before
+    # the inspect: dockerd's 404 frees the name, so the create runs once more and removes nothing. A second conflict
+    # whose holder is gone again is kept, never a loop
+    events: list[str] = []
+    conflict = Exception('409 Client Error: Conflict ("Conflict. The container name "/pod_test" is already in use")')
+    runs = iter([conflict, conflict if freed_again else "cid-2"])
+
+    class FakeRentalClient:
+        async def run_container(self, spec):
+            events.append("run")
+            result = next(runs)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        async def container_owner_state(self, *, container_name):
+            return None
+
+        async def container_status(self, *, container_name):
+            return None
+
+        async def remove_container(self, *, container_name, force, remove_volumes):
+            events.append(f"rm {container_name}")
+
+    monkeypatch.setattr(docker_service, "stream_log", AsyncMock())
+    registry = docker_service_module.inflight_creates
+    with registry.track("test", ("miner-a", "exec")), registry.track("test", ("miner-b", "exec-2")):
+        run = docker_service._run_rental_docker_create_with_port_retry(
+            docker_client=FakeRentalClient(),
+            ssh_client=Mock(),
+            run_spec=ContainerRunSpec(
+                image="img", name="pod_test", labels={"io.lium.executor_id": label} if label else {}
+            ),
+            container_name="pod_test",
+            default_extra={},
+            pod_id="test",
+        )
+        if freed_again:
+            with pytest.raises(docker_service_module._SameNameContainerKept):
+                await run
+        else:
+            assert await run == "cid-2"
+    assert events == ["run", "run"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("race", ["other_create_registers_during_inspect", "pod_started_before_rm"])
 async def test_rental_create_keeps_a_same_name_pod_that_changed_after_its_status_read(
     docker_service, monkeypatch, race,

@@ -516,6 +516,11 @@ class ContainerDeleteRequest(ContainerBaseRequest):
     external_volume: str | None = None
 
 
+# lium_protocol 2.23.0 (backend_to_validator): the node-left delete is answered within this many seconds of its start;
+# the backend holds the replacement's SameNameHeldByNodeLeft failure that long
+NODE_LEFT_DELETE_ANSWER_SECONDS = 1800
+
+
 class ContainerDeleteOnNodeLeftRequest(ContainerDeleteRequest):
     """lium_protocol 2.23.0: the delete for the node a moved pod left. Its registration may point at another host
     by now, so the delete runs only on a host whose boot id is expected_boot_id (DockerService.delete_container)."""

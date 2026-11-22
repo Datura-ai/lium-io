@@ -6,6 +6,7 @@ removal run as one shell on one connection, before any of the validator's per-po
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import shlex
 import subprocess
 from pathlib import Path
@@ -249,9 +250,20 @@ async def test_the_removal_waits_for_every_create_of_the_pod_and_cancels_none(do
     assert isinstance(result, ContainerDeleted) and len(order) == 1
 
 
+# the answer deadline the test shrinks it to, and the bounds the host command and the dial keep inside it
+_ANSWER_BY = 1.0
+_RESERVED = 0.4
+
+
+def _shrink_the_answer_deadline(monkeypatch) -> None:
+    monkeypatch.setattr(docker_service_module, "NODE_LEFT_DELETE_ANSWER_SECONDS", _ANSWER_BY)
+    monkeypatch.setattr(docker_service_module, "_PARK_COMMAND_TIMEOUT_SECONDS", _RESERVED / 2)
+    monkeypatch.setattr(docker_service_module, "_OWN_SSH_CONNECTION_MARGIN_SEC", _RESERVED / 2)
+
+
 @pytest.mark.asyncio
 async def test_a_create_still_running_at_the_end_of_the_wait_deletes_nothing(docker_service, monkeypatch):
-    monkeypatch.setattr(docker_service_module, "_NODE_LEFT_CREATE_WAIT_SECONDS", 0.05)
+    _shrink_the_answer_deadline(monkeypatch)
     order = _wire_delete(docker_service, monkeypatch, _host_exits(0))
     payload = _payload()
 
@@ -259,6 +271,80 @@ async def test_a_create_still_running_at_the_end_of_the_wait_deletes_nothing(doc
         result = await _delete(docker_service, payload)
 
     assert isinstance(result, FailedContainerRequest) and order == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("create_runs", [0.2, 10.0])
+async def test_the_delete_is_answered_within_the_deadline_the_backend_holds_for(docker_service, monkeypatch, create_runs):
+    # review on lium-io#2394: the backend holds the replacement's name-held failure for NODE_LEFT_DELETE_ANSWER_SECONDS
+    # after sending this delete. Both waits for the pod's creates (before the dial and under the lock) and the host
+    # command share that one deadline, so the answer comes inside it: never after two full waits and the command
+    _shrink_the_answer_deadline(monkeypatch)
+    payload = _payload()
+    host_commands: list[str] = []
+
+    async def the_host_stalls(command: str):
+        host_commands.append(command)
+        await asyncio.sleep(10)
+
+    _wire_delete(docker_service, monkeypatch, the_host_stalls)
+    prepare = docker_service._prepare_known_hosts_policy
+
+    async def dial_while_a_create_runs(*args, **kwargs):
+        registered = asyncio.Event()
+
+        async def create():  # of the pod, registered after the first wait passed; its own task and context
+            with inflight_creates.track(payload.pod_id, ("miner-b", "replacement-executor")):
+                registered.set()
+                await asyncio.sleep(create_runs)
+
+        asyncio.get_running_loop().create_task(create(), context=contextvars.Context())
+        await registered.wait()
+        return await prepare(*args, **kwargs)
+
+    docker_service._prepare_known_hosts_policy = dial_while_a_create_runs
+    started = asyncio.get_running_loop().time()
+    result = await asyncio.wait_for(_delete(docker_service, payload), 5)
+
+    assert isinstance(result, FailedContainerRequest)
+    assert asyncio.get_running_loop().time() - started < _ANSWER_BY + 0.2
+    # a create that ended in time leaves the command its own bound; one still running sends nothing to the host
+    assert len(host_commands) == (1 if create_runs < _ANSWER_BY - _RESERVED else 0)
+
+
+def test_the_answer_deadline_is_the_protocols():
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "lium_protocol"))
+    from lium_protocol import backend_to_validator
+
+    assert docker_service_module.NODE_LEFT_DELETE_ANSWER_SECONDS == backend_to_validator.NODE_LEFT_DELETE_ANSWER_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_the_removal_never_touches_the_rented_machine_record_the_replacement_shares(docker_service, monkeypatch):
+    # stand check 2394-08: the record is keyed by endpoint, and the container name is the pod's on both registrations,
+    # so a replacement at the same endpoint would lose its entry
+    from fakeredis import FakeServer
+    from fakeredis.aioredis import FakeRedis
+    from services.redis_service import RedisService
+
+    from tests.test_delete_drops_dirty_volume import _executor_info
+
+    _wire_delete(docker_service, monkeypatch, _host_exits(0))
+    redis = RedisService.__new__(RedisService)
+    redis.redis = FakeRedis(server=FakeServer())
+    docker_service.redis_service = redis
+    payload = _payload()
+    executor = _executor_info(payload)
+    await redis.add_rented_pod(executor, payload.pod_id, payload.container_name)
+    await redis.add_rented_pod(executor, "other-pod", "pod_other")
+
+    result = await _delete(docker_service, payload)
+
+    assert isinstance(result, ContainerDeleted)
+    names = [container["name"] for container in (await redis.get_rented_machine(executor))["containers"]]
+    assert names == [payload.container_name, "pod_other"]
 
 
 def test_a_node_left_delete_is_never_declined_as_renting_in_progress():
