@@ -95,6 +95,8 @@ class FailedContainerErrorCodes(enum.Enum):
     ContainerVanished = "ContainerVanished"
     # DAH-3338: the miner knows the executor but could not reach it; distinct from InvalidExecutorId
     ExecutorUnreachable = "ExecutorUnreachable"
+    # DAH-6737: the validator's own step left no container of the pod running: not billed, not a host fault
+    PodDownNotHostFault = "PodDownNotHostFault"
     # 2.23.0: a ContainerDeleteOnNodeLeftRequest reached a host with another boot id; nothing was deleted
     NotTheNodeLeft = "NotTheNodeLeft"
     # 2.23.0: the create met the pod's name held by another registration's container (for a moved pod, the node-left

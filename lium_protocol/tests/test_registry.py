@@ -10,7 +10,7 @@ from lium_protocol import (
     VALIDATOR_MESSAGES,
     ProtocolError,
 )
-from lium_protocol.validator_to_backend import ContainerDeleted
+from lium_protocol.validator_to_backend import ContainerDeleted, FailedContainerErrorCodes, FailedContainerRequest
 
 A_DELETED = {
     "message_type": "ContainerDeleted",
@@ -45,3 +45,12 @@ def test_a_refused_message_never_carries_the_input_into_the_error() -> None:
     assert all("input" not in e and "url" not in e for e in errors)
 
 
+@pytest.mark.parametrize("code", ["PodDownNotHostFault", "NotTheNodeLeft", "SameNameHeldByNodeLeft"])
+def test_failed_request_codes_of_every_version_line_parse(code: str) -> None:
+    """2.23.0 carries 2.20.0's PodDownNotHostFault next to its own codes, so the backend that vendors it
+    accepts both validator releases, whichever merges first."""
+    message = VALIDATOR_MESSAGES.parse(
+        json.dumps({**A_DELETED, "message_type": "FailedRequest", "msg": "x", "error_code": code})
+    )
+    assert type(message) is FailedContainerRequest
+    assert message.error_code is FailedContainerErrorCodes(code)

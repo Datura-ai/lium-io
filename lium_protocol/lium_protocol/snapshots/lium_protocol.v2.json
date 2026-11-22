@@ -2978,6 +2978,7 @@
         "AttestationError",
         "ContainerVanished",
         "ExecutorUnreachable",
+        "PodDownNotHostFault",
         "NotTheNodeLeft",
         "SameNameHeldByNodeLeft"
       ],
