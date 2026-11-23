@@ -14,6 +14,7 @@ on:
   # ruleset first, then set the repository variable MERGE_QUEUE_ENABLED=true; to turn the queue off, unset the
   # variable first. If the variable is true while the rule is off, or a merge bypasses the queue, the PR run
   # defers and no run tests that tree.
+  workflow_dispatch:
   pull_request:
   push:
     branches: [main]
@@ -261,7 +262,7 @@ jobs:
     # the one required check, merges the shards' summaries and fails when either side failed.
     name: e2e ${{ matrix.shard }}
     needs: [route]
-    if: ${{ !cancelled() && needs.route.result == 'success' && needs.route.outputs.approved == 'true' && needs.route.outputs.e2e == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') }}
+    if: ${{ !cancelled() && needs.route.result == 'success' && needs.route.outputs.approved == 'true' && needs.route.outputs.e2e == 'true' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || vars.MERGE_QUEUE_ENABLED != 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
