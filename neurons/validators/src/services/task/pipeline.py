@@ -326,8 +326,8 @@ class Context(BaseModel):
     contract_version: str | None = None
     is_rental_succeed: bool = False
     rented: bool = False
-    # pods the rented halt already judged closed this run: a later halt does not judge them again
-    pods_judged_closed: frozenset[str] = frozenset()
+    # the rental snapshot whose listed pods the rented halt judged all closed: a later halt judges only a fresher read
+    rentals_judged_closed: RentedExecutorsResponse | None = None
     renting_in_progress: bool = False
     ssh_pub_keys: list[str] | None = None
     port_count: int = 0
