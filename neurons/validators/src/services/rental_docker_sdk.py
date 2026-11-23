@@ -107,7 +107,7 @@ class RentalDockerConnectionError(RuntimeError):
 
 class ContainerCreateRefused(Exception):
     """Raised by a run spec's `before_create` (nothing was created; on the resume after a dropped create, created
-    and never started) or `before_start` (created, never started)."""
+    and never started), `before_start` or `before_start_call` (created, never started)."""
 
 
 class RentalDockerOperationError(RuntimeError):
@@ -407,6 +407,9 @@ class ContainerRunSpec:
     # runs in the Docker thread between the create and the start call with the names of every container
     # on the host; may raise ContainerCreateRefused, and the created container is then left unstarted
     before_start: Callable[[list[str]], None] | None = field(default=None, repr=False, compare=False)
+    # runs in the Docker thread right before the start call, on every path (created or adopted); may raise
+    # ContainerCreateRefused, and the container is then left unstarted
+    before_start_call: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # DAH-6302: Docker reads nano_cpus 0 as no limit, so a share that rounded down to 0 gets one core
@@ -1203,6 +1206,8 @@ class RentalDockerSdkClient:
                     for name in container.get("Names") or ()
                 ]
             )
+        if spec.before_start_call is not None:
+            spec.before_start_call()
         container_id = created.get("Id") if isinstance(created, dict) else adopted_id
         container_id = container_id if isinstance(container_id, str) and container_id else None
         # A create with a start check starts the container it checked, by ID, never a same-name successor.

@@ -10,7 +10,7 @@ import asyncio
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from payload_models.payloads import FailedContainerRequest
+from payload_models.payloads import ContainerDeleteRequest, FailedContainerRequest
 from services.docker_service import DockerService, executor_key, inflight_creates
 from test_deploy_optimizations import _docker_client, _patch_happy, _payload, _run, _ssh_client
 
@@ -153,7 +153,8 @@ async def test_a_delete_while_dockerd_runs_the_create_removes_the_container_once
     """lium-io#2406 review: a delete acknowledged while dockerd still ran `containers/create` must not leave
     that container behind. The Docker thread cannot be cancelled, so the create waits for dockerd's answer
     and then removes the container and its volume; a cleanup run before the container existed removed
-    nothing and the container then started holding the pod volume."""
+    nothing and the container then started holding the pod volume. The delete itself does not wait for
+    dockerd: the create's run step removes its own container, so the delete answers while it is pending."""
     payload = _payload()
     _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=1))
     events: list[str] = []
@@ -185,8 +186,15 @@ async def test_a_delete_while_dockerd_runs_the_create_removes_the_container_once
 
     create = asyncio.create_task(tracked_create())
     await asyncio.wait_for(run_started.wait(), 10)
-    assert inflight_creates.cancel(payload.pod_id, executor_key(payload))
-    await asyncio.sleep(0.05)
+    delete = ContainerDeleteRequest(
+        miner_hotkey=payload.miner_hotkey,
+        executor_id=payload.executor_id,
+        pod_id=payload.pod_id,
+        container_name=svc.get_container_name(payload),
+    )
+    # the delete's own wait for the create, well inside its 30 s bound, while dockerd still runs the create
+    assert await asyncio.wait_for(svc._stop_create_before_delete(delete, Mock()), 5) is None
+    assert inflight_creates.is_cancelled(payload.pod_id, executor_key(payload)) and events == []
     released.set()
     result = await asyncio.wait_for(create, 10)
     await asyncio.wait_for(dockerd_task[0], 10)
@@ -197,13 +205,14 @@ async def test_a_delete_while_dockerd_runs_the_create_removes_the_container_once
 
 
 @pytest.mark.asyncio
-async def test_a_delete_during_the_resume_wait_keeps_waiting_and_adopts_dockerds_container(svc, monkeypatch):
+async def test_a_delete_during_the_resume_wait_keeps_waiting_and_never_starts_dockerds_container(svc, monkeypatch):
     """lium-io#2406 review: the resume after a lost `containers/create` answer waits while dockerd holds the
     name (409, inspect 404). A delete during that wait must not end it: the first create registers later,
-    and only a run that returns it lets the delete checkpoint after the run remove it and its volume."""
+    and is adopted but never started, so the create's cleanup removes it and its volume."""
     import requests
     import services.rental_docker_sdk as sdk
     from docker.errors import APIError
+    from services.docker_service import _CreateCancelledByDelete
     from services.rental_docker_sdk import RentalDockerSdkClient
     from test_docker_transport_retry import _FakeAdapter, _FakeApiClient, _not_found
 
@@ -234,6 +243,7 @@ async def test_a_delete_during_the_resume_wait_keeps_waiting_and_adopts_dockerds
             return {"Id": "first", "Config": {"Image": spec.image}}
 
         api.inspect_container = inspect_container
-        assert await RentalDockerSdkClient(api).run_container(spec) == "first"
-    assert api.calls[-2:] == ["inspect_container", "start"]
+        with pytest.raises(_CreateCancelledByDelete):
+            await RentalDockerSdkClient(api).run_container(spec)
+    assert api.calls[-1] == "inspect_container" and "start" not in api.calls
     assert api.calls.count("create_container") == 3
