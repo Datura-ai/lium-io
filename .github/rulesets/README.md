@@ -77,3 +77,64 @@ Add a person by appending `{ "actor_id": <id>, "actor_type": "User", "bypass_mod
 
 Check: `gh api "repos/$R/rulesets?targets=tag" --jq '.[]|.name+" "+.enforcement'` → `release-tags active`.
 A push of `executor-v*` by anyone outside the bypass list is refused by GitHub before any workflow runs.
+
+## `pinned-actions-required-workflow`: the pinned-actions check always comes from main (organization owner, once)
+
+`pinned-actions.yml` judges whether a PR or a merge-queue group may land, so the copy that runs must be the one on
+`main`, not the one the candidate carries. A repository workflow cannot guarantee that on `pull_request` or
+`merge_group` (both run the candidate's copy), so an organization ruleset requires it instead:
+`pinned-actions-required-workflow.json` ("Require workflows to pass before merging" on the default branch of `lium-io`
+and `lium`, workflow `.github/workflows/pinned-actions.yml` from `Datura-ai/lium-io` at `refs/heads/main`). GitHub then
+runs main's copy on every PR and every queued group, whatever the candidate changes in its own workflow files. The rule
+exists at organization level only, so an organization owner applies it:
+
+Roll it out in three separate steps, each run on its own; never paste them as one script. Activating too early blocks
+ordinary PRs in two ways: a required run that never reports leaves every PR pending, and a required run that fails
+blocks every PR whose tree still has a mutable reference.
+
+1. Precondition: the default branch of each target repository passes the check with zero refusals. `lium` does not yet
+   (its own pinning PR, Datura-ai/lium#458, must merge first). Until both default branches pass, stop here.
+
+2. Apply the ruleset in evaluate mode. It reports the required run but blocks nothing:
+
+   ```bash
+   jq '.enforcement = "evaluate"' .github/rulesets/pinned-actions-required-workflow.json |
+     gh api "orgs/Datura-ai/rulesets" --method POST --input -
+   ```
+
+   Open a test PR in `lium`, the repository that is not the workflow's source, with any harmless change. Its checks
+   must list `pinned-actions` from `Datura-ai/lium-io` with the result **success**. A pending check means the run never
+   reports there (GitHub runs a ruleset workflow on `pull_request` outside its source repository only because the job has
+   a condition, `if: true` in the workflow; GitHub's "Troubleshooting rules", Supported directory). A failure means that
+   tree still has a mutable reference. In either case stay in evaluate mode and fix the cause first. Do the same on a test
+   PR in `lium-io`.
+
+3. Only after both test PRs show success, activate:
+
+   ```bash
+   id=$(gh api "orgs/Datura-ai/rulesets" --jq '.[]|select(.name=="pinned-actions-required-workflow")|.id')
+   gh api "orgs/Datura-ai/rulesets/$id" --method PUT --input .github/rulesets/pinned-actions-required-workflow.json
+   ```
+
+If the organization's plan has no evaluate mode, the POST in step 2 refuses it. Do not apply the file active to find out
+whether the run reports. Instead, apply it with the repository condition narrowed to `lium-io` (the workflow's source,
+where the run is known to report) and confirm success on a `lium-io` test PR. Add `lium` to the condition only once step 1
+holds for `lium` and the ruleset's own run on `lium-io` has shown success. Then check a `lium` test PR straight away, and
+remove `lium` from the condition again if its result is not success.
+
+Check: `gh api "orgs/Datura-ai/rulesets" --jq '.[]|.name+" "+.enforcement'` → `pinned-actions-required-workflow active`.
+
+**A retargeted PR cannot merge unscanned, but it waits for a push.** A workflow required by a ruleset runs on its own
+trigger list and ignores the `types` in the file, so a retarget (a stacked PR whose base PR merged) starts no required run.
+A PR opened against another branch never got a required run (the ruleset covers the default branch only), so after the
+retarget the required workflow shows as expected and the PR cannot merge. Strict mode forces a branch update only when
+`main` is not yet an ancestor of the head; when the head already contains `main`, nothing forces one. In both cases start
+the required run yourself: push a commit (or use "Update branch"), or close and reopen the PR, which runs it on the same
+head. After a retarget, a required result exists only if a run already happened on that head while the PR targeted `main`.
+The required run scans the PR's head commit, not its merge ref: a retarget changes the base but not the head, so an existing
+result still describes the commit under review. The same ruleset also sets "Require branches to be up to date before merging" (strict), which
+GitHub checks on the branch itself: a PR can merge only when `main` is an ancestor of its head, and then the merged tree is
+exactly the head's tree. Bringing a branch up to date is a push, which starts the required run on the new head. The
+`pinned-actions` status context only carries the strict rule. A PR's own copy of the workflow can report that context
+too, but that grants nothing: the merge still needs the required run of `main`'s copy on the current head. In `lium-io`
+the merge queue goes further: every queued group is checked on its own merge commit.
