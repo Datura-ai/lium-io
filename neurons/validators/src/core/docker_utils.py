@@ -351,6 +351,7 @@ async def collect_container_death_diagnostics(
     ssh_client: asyncssh.SSHClientConnection,
     container_name: str,
     diagnostics: ContainerDeathDiagnostics | None = None,
+    read_logs: bool = True,
 ) -> ContainerDeathDiagnostics:
     """Read why a container died over an already-open SSH session.
 
@@ -396,7 +397,8 @@ async def collect_container_death_diagnostics(
         capture_errors.append(f"inspect: {exc}")
 
     # a removed container's log went with it: `2>&1` would store docker's "No such container" as its output
-    if not diagnostics.container_missing:
+    # read_logs=False: a renter workload still running may print its own secrets; its output stays off our logs
+    if read_logs and not diagnostics.container_missing:
         try:
             logs_result = await ssh_client.run(
                 f"/usr/bin/docker logs --tail {_CONTAINER_DEATH_LOG_TAIL_LINES} {quoted_name} 2>&1 || true"

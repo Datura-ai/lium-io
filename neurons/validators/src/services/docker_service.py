@@ -14434,8 +14434,9 @@ class DockerService:
         default_extra: dict[str, Any],
     ) -> None:
         # a bootstrap killed under us (exit 137) is most often the container itself dying or restarting: its
-        # State, restart count and log tail are the only record of why, the host being the provider's
-        diagnostics = await self._bounded_death_diagnostics(ssh_client, container_name)
+        # State and restart count are the only record of why, the host being the provider's. Not its log tail: the
+        # renter's workload keeps running and whatever it prints is the renter's, not the validator log's
+        diagnostics = await self._bounded_death_diagnostics(ssh_client, container_name, read_logs=False)
         logger.warning(
             _m(
                 "Docker container started but SSH bootstrap did not complete cleanly",
@@ -14449,13 +14450,14 @@ class DockerService:
         self,
         ssh_client: asyncssh.SSHClientConnection,
         container_name: str,
+        read_logs: bool = True,
     ) -> ContainerDeathDiagnostics:
         # a hung `docker logs` on the miner's host must not hold back the recovery's verdict or stop;
         # the state read before the hang is kept, so a dead container is not taken for a recovery
         diagnostics = ContainerDeathDiagnostics()
         try:
             return await asyncio.wait_for(
-                collect_container_death_diagnostics(ssh_client, container_name, diagnostics),
+                collect_container_death_diagnostics(ssh_client, container_name, diagnostics, read_logs=read_logs),
                 timeout=_VLOOPBACK_REPAIR_COMMAND_TIMEOUT_SEC,
             )
         except TimeoutError:
