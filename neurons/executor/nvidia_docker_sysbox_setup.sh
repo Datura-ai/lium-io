@@ -6,6 +6,7 @@ set -e
 #   curl -fsSL https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/nvidia_docker_sysbox_setup.sh | sudo bash
 #   or: cd lium-io/neurons/executor && sudo bash nvidia_docker_sysbox_setup.sh
 #   sudo bash nvidia_docker_sysbox_setup.sh --check   only the preflight, one PASS/FIX line per requirement; exit 1 on any FIX
+#   sudo bash nvidia_docker_sysbox_setup.sh --install-layer-reset   only (re)install the boot-time layer reset (validators run it)
 # After sysbox works, install mode also sets up the vloopback volume plugin (pinned by digest,
 # DATA_DIR=<Docker data-root>/loopback) and mounts a 1 GB test volume into a sysbox container; the run exits 1
 # with a doc link when that fails.
@@ -18,6 +19,10 @@ set -e
 # 0.7.1 (DAH-3833): 0.6.6 cannot start an image with 44+ layers under Docker 29's containerd image store,
 # and 0.7.0 brings the runc container-escape fixes (CVE-2025-52565, CVE-2025-52881)
 SYSBOX_VERSION="0.7.1"
+# DAH-6804: the boot-time layer reset's version, written into its unit; the validator reinstalls it (--install-layer-reset)
+# on Sysbox hosts whose unit is missing or older. Bump it whenever shift_sysbox_layers_back_at_boot's output changes.
+# 1 is reserved for units written before this marker.
+LAYER_RESET_VERSION=2
 # nestybox publishes amd64 and arm64 .debs; arm64 is for GB300 / Grace hosts (check_arch refuses the rest)
 case "$(uname -m)" in
     aarch64|arm64) SYSBOX_ARCH=arm64; SYSBOX_SHA="04ca894ae0b53f0fa54eaacc173ce40363c9a95ea5450f773716a84ef650a69b" ;;
@@ -577,6 +582,8 @@ def main():
 main()
 PY
     chmod 755 "$bin" || return 1
+    # the version line goes in last, once the unit is enabled and Docker's drop-in is in place: a cut-off or failed
+    # install reads as an old version (no line), so the validator installs again next check
     cat > "$unit" <<UNIT || return 1
 [Unit]
 Description=Lium: shift sysbox pods' layers back after an unclean stop
@@ -597,12 +604,86 @@ ExecStart=/usr/bin/python3 -I /usr/local/sbin/lium-sysbox-layer-reset
 [Install]
 WantedBy=multi-user.target
 UNIT
+    if [ -z "${SYSBOX_SETUP_HOST_ROOT:-}" ]; then
+        systemctl is-active -q docker && touch /run/lium-docker-started  # this boot's Docker already started
+        # Docker must never depend on a unit that is not enabled: no drop-in until enable succeeded, none left after
+        # a failure (an older install's drop-in included)
+        if ! { systemctl daemon-reload && systemctl enable lium-sysbox-layer-reset.service >/dev/null 2>&1; }; then
+            rm -f "$dropin"; systemctl daemon-reload >/dev/null 2>&1; return 1
+        fi
+    fi
     # Docker starts only after a successful reset: never a pod on a half-reset layer (the reset log names the failure)
-    printf '[Unit]\nRequires=lium-sysbox-layer-reset.service\nAfter=lium-sysbox-layer-reset.service\n[Service]\nExecStartPost=/bin/touch /run/lium-docker-started\n' \
-        > "$dropin" || return 1
+    if ! printf '[Unit]\nRequires=lium-sysbox-layer-reset.service\nAfter=lium-sysbox-layer-reset.service\n[Service]\nExecStartPost=/bin/touch /run/lium-docker-started\n' \
+        > "$dropin" || ! sed -i "1i # lium-layer-reset-version=$LAYER_RESET_VERSION" "$unit"; then
+        rm -f "$dropin"; [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] || systemctl daemon-reload >/dev/null 2>&1; return 1
+    fi
+    [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] || systemctl daemon-reload
+}
+
+create_nvidia_device_nodes_before_docker() {
+    # A pod is created with every GPU device node it uses as an explicit --device (they keep the GPUs readable across a
+    # systemd daemon-reload). The driver makes those nodes only when something first opens a GPU, so at boot Docker's
+    # restart-policy start can come before them and fails "error gathering device information while adding custom
+    # device /dev/nvidiaN": the pod stays down until it is recreated. A boot oneshot before Docker makes them first.
+    local bin unit dropin
+    bin=$(host_path /usr/local/sbin/lium-nvidia-device-nodes)
+    unit=$(host_path /etc/systemd/system/lium-nvidia-device-nodes.service)
+    dropin=$(host_path /etc/systemd/system/docker.service.d/lium-nvidia-device-nodes.conf)
+    mkdir -p "$(dirname "$bin")" "$(dirname "$unit")" "$(dirname "$dropin")" || return 1
+    cat > "$bin" <<'SH' || return 1
+#!/bin/sh
+# Lium (nvidia_docker_sysbox_setup.sh): create the NVIDIA device nodes at boot, before Docker starts the pods that
+# use them. nvidia-modprobe only loads the modules and makes the nodes; it does not touch the GPUs.
+gpus="${LIUM_NVIDIA_GPUS_DIR:-/proc/driver/nvidia/gpus}"
+minors() {
+    for info in "$gpus"/*/information; do
+        [ -r "$info" ] && sed -n 's/^Device Minor:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$info"
+    done; }
+if command -v nvidia-modprobe >/dev/null 2>&1; then
+    nvidia-modprobe -c=255  # loads nvidia, makes /dev/nvidiactl
+    for minor in $(minors); do nvidia-modprobe -c="$minor"; done  # /dev/nvidia<minor>
+    nvidia-modprobe -u -c=0  # /dev/nvidia-uvm and /dev/nvidia-uvm-tools
+    nvidia-modprobe -m  # /dev/nvidia-modeset
+    exit 0
+fi
+# No nvidia-modprobe (Ubuntu's nvidia-utils-*-server do not ship it): load the modules and make the nodes from their
+# numbers, as nvidia-modprobe does. 195 is the driver's fixed major; 255 nvidiactl, 254 modeset; mode 0666 its default.
+dev="${LIUM_NVIDIA_DEV_DIR:-/dev}"
+mk() { [ -e "$dev/$1" ] || mknod -m 666 "$dev/$1" c "$2" "$3"; }
+modprobe nvidia || exit 0
+mk nvidiactl 195 255
+for minor in $(minors); do mk "nvidia$minor" 195 "$minor"; done
+if modprobe nvidia-uvm; then
+    uvm=$(awk '$2 == "nvidia-uvm" {print $1}' "${LIUM_NVIDIA_PROC_DEVICES:-/proc/devices}")
+    [ -n "$uvm" ] && mk nvidia-uvm "$uvm" 0 && mk nvidia-uvm-tools "$uvm" 1
+fi
+modprobe nvidia-modeset && mk nvidia-modeset 195 254
+exit 0
+SH
+    chmod 755 "$bin" || return 1
+    cat > "$unit" <<'UNIT' || return 1
+[Unit]
+Description=Lium: create the NVIDIA device nodes before Docker starts the pods
+After=systemd-modules-load.service
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# a hung nvidia-modprobe is killed here, so Docker (which only Wants this unit) still starts:
+# SIGKILL at the start timeout (systemd 246+), and a short stop wait bounds it on older systemd
+TimeoutStartSec=60
+TimeoutStartFailureMode=kill
+TimeoutStopSec=5
+ExecStart=/usr/local/sbin/lium-nvidia-device-nodes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    # Wants, not Requires: a node it could not make fails only the pod that needs it, never Docker itself
+    printf '[Unit]\nWants=lium-nvidia-device-nodes.service\nAfter=lium-nvidia-device-nodes.service\n' > "$dropin" || return 1
     [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] && return 0
-    systemctl is-active -q docker && touch /run/lium-docker-started  # this boot's Docker already started
-    systemctl daemon-reload && systemctl enable lium-sysbox-layer-reset.service >/dev/null 2>&1
+    systemctl daemon-reload && systemctl enable lium-nvidia-device-nodes.service >/dev/null 2>&1
 }
 
 self_cmd() {
@@ -1359,16 +1440,29 @@ CHECK_MODE_OPTION=""
 case "${1:-}" in
     "") ;;
     --check) CHECK_MODE_OPTION="--check" ;;
+    --install-layer-reset)
+        # DAH-6804: what the validator runs on Sysbox hosts whose layer reset is missing or old. Installs the unit and
+        # Docker's drop-in only: never runs the reset, never restarts Docker, so running pods are not touched. One
+        # result line for the validator. Without python3 the unit's ExecStart fails at boot and the drop-in's
+        # Requires= then keeps Docker down, so it installs nothing there.
+        if [ "$(id -u)" != 0 ]; then echo "layer_reset_skipped not_root"
+        elif [ ! -x /usr/bin/python3 ]; then echo "layer_reset_skipped no_python3"
+        elif ! command -v sysbox-runc >/dev/null 2>&1; then echo "layer_reset_skipped no_sysbox"
+        elif shift_sysbox_layers_back_at_boot >/dev/null 2>&1; then echo "layer_reset_installed $LAYER_RESET_VERSION"
+        else echo "layer_reset_failed install"; fi
+        exit 0
+        ;;
     -h|--help)
-        echo "Usage: sudo bash nvidia_docker_sysbox_setup.sh [--check]"
+        echo "Usage: sudo bash nvidia_docker_sysbox_setup.sh [--check | --install-layer-reset]"
         echo "  (no option)  preflight the host, then install sysbox + NVIDIA container toolkit, configure Docker, verify;"
         echo "               a FIX on root, architecture, kernel or Docker stops the install, any other FIX is printed and the install goes on;"
         echo "               then sets up the vloopback volume plugin and mounts a test volume into a sysbox container (exit 1 if it fails)"
         echo "  --check      preflight only: host requirements and what this script installs, PASS/FIX per line, exit 1 on any FIX"
+        echo "  --install-layer-reset  only (re)install the boot-time layer reset unit; runs no reset, restarts nothing"
         echo "Env: SYSBOX_SKIP_KERNEL_CHECK=1, EXECUTOR_PORT, SSH_PORT (see the header of this script)"
         exit 0
         ;;
-    *)  fail "Unknown option: $1 (use --check or --help)"; exit 2 ;;
+    *)  fail "Unknown option: $1 (use --check, --install-layer-reset or --help)"; exit 2 ;;
 esac
 
 # ── 1. Pre-flight ────────────────────────────────────────
@@ -1413,6 +1507,9 @@ keep_needrestart_off_the_container_runtime && ok "apt (needrestart) never restar
 
 shift_sysbox_layers_back_at_boot && ok "After an unclean stop, each pod's files are shifted back at boot before Docker starts it." \
     || warn "Could not install lium-sysbox-layer-reset.service; after a power loss rented pods may lose sudo and apt."
+
+create_nvidia_device_nodes_before_docker && ok "At boot the NVIDIA device nodes are made before Docker starts the pods." \
+    || warn "Could not install lium-nvidia-device-nodes.service; after a reboot a pod may fail to start (missing /dev/nvidiaN)."
 
 # before "Already working?" and its active-rental and image exits: a host whose profile already exists may hold a
 # hand-added mount-only rule. Only appends missing rules and reloads the profile, so it is safe under rentals; the
