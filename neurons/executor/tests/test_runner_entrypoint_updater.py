@@ -38,6 +38,7 @@ DOCKER_STUB = textwrap.dedent(
         "inspect --format {{.Config.Image}} "*) echo "$STUB_UPDATER_IMAGE" ;;
         "inspect --format {{.State.Running}} "*) echo "${STUB_RUNNING-true}" ;;
         "inspect --format {{.Name}} wt1") echo "/executor-watchtower-1" ;;
+        "inspect --format {{range .Config.Env}}{{println .}}{{end}} wt1") printf '%s' "${STUB_UPDATER_ENV-}" ;;
         "inspect --format {{range "*" wt1") printf '%s\\n' com.docker.compose.config-hash=abc \\
             com.docker.compose.oneoff=False com.docker.compose.project=executor \\
             com.docker.compose.service=watchtower org.opencontainers.image.title=watchtower ;;
@@ -155,6 +156,18 @@ def test_no_single_updater_in_the_runners_project_means_nothing_is_created(tmp_p
     _, calls = run(tmp_path, EXECUTOR, STUB_UPDATER_IMAGE="nickfedor/watchtower", **env)
 
     assert not updater_run(calls)
+
+
+def test_the_providers_runtime_settings_go_to_the_new_updater(tmp_path):
+    # a 1.2.3 updater the provider turned off (watchtower/README.md) and slowed down; image env (PATH) stays behind
+    env = "PATH=/usr/local/bin\nWATCHTOWER_ENABLED=false\nWATCHTOWER_INTERVAL=3600\nWATCHTOWER_ENV_FILE_PATH=/a b/.env\n"
+    _, calls = run(tmp_path, EXECUTOR, STUB_UPDATER_IMAGE="daturaai/lium-watchtower:1.2.3", STUB_UPDATER_ENV=env)
+
+    assert updater_run(calls) == [
+        "run --detach --name executor-watchtower-1 --restart unless-stopped -v /var/run/docker.sock:/var/run/docker.sock"
+        f"{COMPOSE_LABELS} --env WATCHTOWER_ENABLED=false --env WATCHTOWER_INTERVAL=3600"
+        " --env WATCHTOWER_ENV_FILE_PATH=/a b/.env daturaai/lium-watchtower:1.2.4"
+    ]
 
 
 def test_an_updater_that_cannot_be_pulled_is_kept(tmp_path):

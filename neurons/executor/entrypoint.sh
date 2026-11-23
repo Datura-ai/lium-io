@@ -64,6 +64,17 @@ ensure_updater() {
     done <<LABELS
 $labels
 LABELS
+    # The provider's runtime settings (watchtower/README.md) go to the new container too: dropping them would turn
+    # a disabled updater back on, or reset a longer WATCHTOWER_INTERVAL to the default.
+    env=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$updater" 2>/dev/null) || return 0
+    while IFS= read -r setting; do
+        case "$setting" in
+            WATCHTOWER_ENABLED=* | WATCHTOWER_IMAGE=* | WATCHTOWER_INTERVAL=* | WATCHTOWER_ENV_FILE_PATH=*)
+                set -- "$@" --env "$setting" ;;
+        esac
+    done <<SETTINGS
+$env
+SETTINGS
     if ! docker pull --quiet "$want" >/dev/null 2>&1; then
         echo "Updater kept: $want cannot be pulled; retrying at the next runner start."
         return 0
