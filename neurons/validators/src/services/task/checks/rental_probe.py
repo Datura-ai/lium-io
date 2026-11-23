@@ -807,9 +807,6 @@ async def _standing_failure(ctx: Context) -> _Failure | None:
         _read_failed(ctx, "the lifetime of its standing failure in Redis")
     text = raw.decode() if isinstance(raw, bytes) else str(raw)
     step, _, create_step = text.partition(":")
-    if step == STEP_EGRESS and not settings.NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED:
-        # enforcement switched off after the failure was stamped: the egress step fails nothing any more
-        return None
     return _Failure(step, create_step or None) if step else None
 
 
@@ -976,8 +973,7 @@ async def _probe(
        (and EGRESS_PROBE_SCRIPT, under NO_OUTBOUND_INTERNET_CHECK_ENABLED).
     4. `_step_gpu_count`: compare the listed GPUs, and those the container can open, with what the node
        advertises.
-    5. `_step_egress`: the container resolved and fetched pypi.org; fails the probe only under
-       NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED.
+    5. `_step_egress`: the container resolved and fetched pypi.org, or the probe fails.
     6. `_step_teardown`: remove the container and the pending-pod mark, whichever step ended the probe.
 
     A step that ends the probe returns None and says why in `outcome` (a failed step, or an inconclusive
@@ -1221,17 +1217,8 @@ def _step_egress(ctx: Context, outcome: _ProbeOutcome, login: _Login) -> None:
         return
     ok = probe.verdict == "ok"
     outcome.steps.append(_Step(STEP_EGRESS, login.egress_seconds, ok, None if ok else reason))
-    if ok:
-        return
-    if settings.NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED:
+    if not ok:
         outcome.failed_step = STEP_EGRESS
-        return
-    logger.warning(
-        _m(
-            "Rental probe container cannot reach the internet (NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED is off)",
-            extra=get_extra_info({**ctx.default_extra, **probe.as_record()}),
-        )
-    )
 
 
 def _teardown_deadline_seconds() -> int:

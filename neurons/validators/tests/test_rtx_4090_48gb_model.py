@@ -1,4 +1,5 @@
-"""DAH-5508: memory-modded cards (RTX 4090 48GB, RTX 4080 / 4080 SUPER 32GB) are their own models, named from VRAM."""
+"""DAH-5508/DAH-6595: memory-modded cards (RTX 4090 48GB, RTX 4080 / 4080 SUPER 32GB, RTX 4090 D 48GB, RTX 3080 20GB,
+RTX 2080 Ti 22GB) are their own models, named from VRAM."""
 
 import json
 
@@ -16,7 +17,7 @@ from services.gpu_spec_table import (
     name_reported_by_driver,
     matmul_probe_vram_mb,
 )
-from services.task.checks.gpu_model_truth import EXPECTED_CC_AND_SM, gpu_model_mismatch
+from services.task.checks.gpu_model_truth import expected_cc_and_sm, gpu_model_mismatch
 from services.task.checks.machine_spec_scrape import _normalize_gpu_details
 from services.task.result_handler import _canonicalize_published_gpu_names
 
@@ -32,6 +33,9 @@ RTX_4080_SUPER_32GB = "NVIDIA GeForce RTX 4080 SUPER 32GB"
         (RTX_4090, 46068, RTX_4090_48GB),
         (RTX_4080, 32607, RTX_4080_32GB),
         ("NVIDIA GeForce RTX 4080 SUPER", 32607, RTX_4080_SUPER_32GB),
+        ("NVIDIA GeForce RTX 4090 D", 49140, "NVIDIA GeForce RTX 4090 D 48GB"),
+        ("NVIDIA GeForce RTX 3080", 20470, "NVIDIA GeForce RTX 3080 20GB"),
+        ("NVIDIA GeForce RTX 2080 Ti", 22528, "NVIDIA GeForce RTX 2080 Ti 22GB"),
     ],
 )
 def test_a_modded_card_is_its_own_model_and_passes_both_prechecks(raw, vram_mb, model):
@@ -40,7 +44,18 @@ def test_a_modded_card_is_its_own_model_and_passes_both_prechecks(raw, vram_mb, 
     precheck_gpu_spec(raw, vram_mb)  # the provider preflight passes the driver's name
 
 
-@pytest.mark.parametrize("raw, vram_mb", [(RTX_4090, 24564), (RTX_4090, 23028), (RTX_4080, 16376)])
+@pytest.mark.parametrize(
+    "raw, vram_mb",
+    [
+        (RTX_4090, 24564),
+        (RTX_4090, 23028),
+        (RTX_4080, 16376),
+        ("NVIDIA GeForce RTX 3080", 10240),
+        ("NVIDIA GeForce RTX 3080", 12288),
+        ("NVIDIA GeForce RTX 2080 Ti", 11264),
+        ("NVIDIA GeForce RTX 4090 D", 24564),
+    ],
+)
 def test_a_factory_card_is_unchanged(raw, vram_mb):
     assert classify_gpu_model(raw, vram_mb) == raw
     precheck_gpu_spec(raw, vram_mb)
@@ -62,7 +77,8 @@ def test_a_card_reporting_a_modded_name_is_judged_by_its_vram():
 
 def test_other_cards_of_that_memory_are_untouched():
     assert classify_gpu_model("NVIDIA L40", 46068) == "NVIDIA L40"
-    assert classify_gpu_model("NVIDIA GeForce RTX 4090 D", 49140) == "NVIDIA GeForce RTX 4090 D"
+    assert classify_gpu_model("NVIDIA GeForce RTX 3090", 24564) == "NVIDIA GeForce RTX 3090"
+    assert classify_gpu_model("NVIDIA GeForce RTX 3080 Ti", 20470) == "NVIDIA GeForce RTX 3080 Ti"
     assert classify_gpu_model("NVIDIA GeForce RTX 5090", 32607) == "NVIDIA GeForce RTX 5090"
 
 
@@ -71,10 +87,10 @@ def test_every_modded_model_has_its_own_economics_and_checks(model):
     base, size_mb = MODDED_VRAM_MODELS[model]
     family = BASE_GPU_MAP[model]
     assert GPU_MODEL_RATES[model] == 0.0  # no rental history yet
-    assert RENTAL_PRICES_PER_HOUR[model] > RENTAL_PRICES_PER_HOUR[base]
+    assert RENTAL_PRICES_PER_HOUR[model] >= RENTAL_PRICES_PER_HOUR[base]
     assert family != BASE_GPU_MAP[base]
     assert MAX_UNRENTED_GPUS_BY_TYPE[family] == {1: 10, 8: 64}  # the default tier
-    assert EXPECTED_CC_AND_SM[model] == EXPECTED_CC_AND_SM[base]
+    assert expected_cc_and_sm(model) == expected_cc_and_sm(base)
     assert name_reported_by_driver(model) == base
     assert matmul_probe_vram_mb(model) == round(size_mb * 0.90)  # the all-card probe uses the modded size
 
@@ -93,6 +109,11 @@ def test_the_standard_cards_keep_their_numbers():
     assert GPU_MODEL_RATES[RTX_4090] == 0.05
     assert RENTAL_PRICES_PER_HOUR[RTX_4090_48GB] == 0.42
     assert RENTAL_PRICES_PER_HOUR[RTX_4080_32GB] == RENTAL_PRICES_PER_HOUR[RTX_4080_SUPER_32GB] == 0.26
+    assert (
+        RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 4090 D 48GB"],
+        RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 3080 20GB"],
+        RENTAL_PRICES_PER_HOUR["NVIDIA GeForce RTX 2080 Ti 22GB"],
+    ) == (0.16, 0.09, 0.08)
     assert MAX_UNRENTED_GPUS_BY_TYPE["RTX 4090"] == {1: 10, 8: 64}
     assert name_reported_by_driver(RTX_4090) == RTX_4090
 
