@@ -432,6 +432,23 @@ def _parse_pending_pods(data) -> list[dict]:
     return data
 
 
+def _after_held_reset(cleared: dict, prev_info: dict, current_info: dict) -> dict:
+    """DAH-6951: a reset held to its cycle's end, sent after later runs of the node wrote the record from the same
+    `prev_info`: the reset happened first, so their writes stand on the cleared record, as when it was sent at once.
+    A later run only adds to the counts and sets spec/anchor, so what it added is the difference to `prev_info`."""
+    if any(current_info.get(k, 0) < prev_info.get(k, 0) for k in ("count", "failed")):
+        # a later reset already landed (sent at once): the record is already as it is after both
+        return current_info
+    return {
+        "count": current_info.get("count", 0) - prev_info.get("count", 0),
+        "failed": current_info.get("failed", 0) - prev_info.get("failed", 0),
+        **{
+            k: current_info.get(k, "") if current_info.get(k, "") != prev_info.get(k, "") else cleared[k]
+            for k in ("spec", GPU_ANCHOR_KEY)
+        },
+    }
+
+
 class RedisService:
     def __init__(self):
         self.redis = aioredis.Redis(
@@ -1450,6 +1467,7 @@ class RedisService:
         evidence: dict | None = None,
         reanchor_uuids: str = '',
         respec: str = '',
+        current_info: dict | None = None,
     ):
         # a changed model:count is reset once, then verified from scratch as it is now
         spec = respec or prev_info.get('spec', '')
@@ -1462,6 +1480,8 @@ class RedisService:
             "spec": spec,
             GPU_ANCHOR_KEY: uuids,
         }
+        if current_info is not None and current_info != prev_info:
+            data = _after_held_reset(data, prev_info, current_info)
         await self.hset(VERIFIED_JOB_COUNT_KEY, _verified_job_field(miner_hotkey, executor_id), json.dumps(data))
 
         # DAH-3386: the check that cleared the job and what it saw ride along; the backend puts them on the

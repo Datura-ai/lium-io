@@ -1702,7 +1702,11 @@ class Validator:
             if held.result is not None and rollout_grace_reason(held.result, window, job_block) is not None:
                 continue
             try:
-                await self.redis_service.clear_verified_job_info(**held.reset)
+                # the record as it is now: a later pass of the node this cycle may have written it (DAH-6951)
+                current = await self.redis_service.get_verified_job_info(
+                    held.reset["miner_hotkey"], held.reset["executor_id"]
+                )
+                await self.redis_service.clear_verified_job_info(**held.reset, current_info=current)
             except Exception as exc:
                 if held.result is not None:
                     if isinstance(exc, (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError)):

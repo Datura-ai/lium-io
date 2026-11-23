@@ -224,3 +224,36 @@ async def test_a_host_confirmed_gpu_fault_reset_is_sent_at_once_inside_a_rollout
     withheld = await cycle_end(tasks, service, result, "withheld")
     assert [w.result for w in withheld] == [result]
     assert len(_resets(service)) == 1
+
+
+@pytest.mark.parametrize("pass_after", [True, False], ids=["same-cycle-pass", "no-later-write"])
+@pytest.mark.asyncio
+async def test_a_held_reset_sent_after_a_same_cycle_pass_keeps_the_pass_write(pass_after):
+    """DAH-6951: a held reset is sent at the cycle end, after a same-cycle pass of the node (an express recheck)
+    that re-anchored its GPUs. The reset happened first, so the record ends as it did when the reset went out at
+    once: cleared, then the pass's write on top (count 1, the pass's anchor), never the failing run's stale
+    snapshot, which would bring back the old anchor and fail the next cycle on a GPU mismatch."""
+    from test_node_account_check import cycle_end
+
+    from services.task.service import HeldReset, TaskService
+
+    service = _redis_service()
+    snapshot = {"count": 3, "failed": 0, "spec": "NVIDIA H100:8", "uuids": "GPU-old"}
+    await service.redis.hset(VERIFIED_JOB_COUNT_KEY, f"hk:{EXECUTOR}", json.dumps(snapshot))
+    tasks = TaskService.__new__(TaskService)
+    tasks.open_hold_batch = "batch-1"
+    tasks.held_resets = {
+        "batch-1": [HeldReset(EXECUTOR, dict(miner_hotkey="hk", executor_id=EXECUTOR, prev_info=snapshot, evidence={}))]
+    }
+    if pass_after:
+        # the pass read the same snapshot and re-anchored (ResultHandler's gpu_reanchor write)
+        await service.set_verified_job_info(
+            "hk", EXECUTOR, prev_info={**snapshot, "uuids": ""}, success=True, spec="NVIDIA H100:8", uuids="GPU-new"
+        )
+
+    await cycle_end(tasks, service, None, "stands")
+
+    assert len(_resets(service)) == 1
+    record = await _record(service)
+    assert (record["count"], record["failed"], record["spec"]) == (1 if pass_after else 0, 0, "NVIDIA H100:8")
+    assert record["uuids"] == ("GPU-new" if pass_after else "GPU-old")

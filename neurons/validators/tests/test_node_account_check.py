@@ -577,7 +577,7 @@ async def test_a_reset_waits_for_the_rollout_decision_only_when_its_own_cause_is
     end_reason = "NODE_ACCOUNT_UNVERIFIED" if case == "session_stayed_open" else "EXECUTOR_TRANSPORT_UNREACHABLE"
     assert not run[0] and run[1][-1].reason_code == end_reason
 
-    redis = MagicMock(clear_verified_job_info=AsyncMock())
+    redis = MagicMock(clear_verified_job_info=AsyncMock(), get_verified_job_info=AsyncMock(return_value={}))
     service, result = await wave_create_task(run, redis, open_batch=None if case == "batch_decided" else "batch-1")
     assert result.failure_reason_code == end_reason
     assert redis.clear_verified_job_info.await_count == (1 if sent_in_the_cycle else 0)
@@ -602,7 +602,7 @@ async def test_a_reset_held_before_handle_result_raised_is_still_decided(monkeyp
 
     ok, events, end = await _account_run(monkeypatch)
     end = end.model_copy(update={"state": replace(end.state, gpu_model_count="H100:x")})
-    redis = MagicMock(clear_verified_job_info=AsyncMock())
+    redis = MagicMock(clear_verified_job_info=AsyncMock(), get_verified_job_info=AsyncMock(return_value={}))
     service, result = await wave_create_task((ok, events, end), redis)
     assert result.log_status == "error"
     [held] = service.held_resets["batch-1"]
@@ -625,7 +625,7 @@ async def test_a_held_reset_redis_refuses_at_the_cycle_end_withholds_its_verdict
     from services.task.models import VALIDATOR_REDIS_UNAVAILABLE
 
     run = await _account_run(monkeypatch)
-    redis_service = MagicMock(clear_verified_job_info=AsyncMock())
+    redis_service = MagicMock(clear_verified_job_info=AsyncMock(), get_verified_job_info=AsyncMock(return_value={}))
     service, result = await wave_create_task(run, redis_service)
     redis_service.clear_verified_job_info.side_effect = getattr(redis.exceptions, error)("redis down")
 
@@ -644,7 +644,7 @@ async def test_a_pass_of_the_node_never_drops_a_held_reset(monkeypatch, same_min
     from unittest.mock import AsyncMock, MagicMock
 
     run = await _account_run(monkeypatch)
-    redis = MagicMock(clear_verified_job_info=AsyncMock())
+    redis = MagicMock(clear_verified_job_info=AsyncMock(), get_verified_job_info=AsyncMock(return_value={}))
     service, _ = await wave_create_task(run, redis)
     assert len(service.held_resets["batch-1"]) == 1
 
@@ -713,7 +713,7 @@ async def test_an_express_pass_never_cancels_a_reset_only_a_covering_window_with
     assert service.open_hold_batch == ("batch-1" if held else None)
 
     run = await _account_run(monkeypatch)
-    redis = MagicMock(clear_verified_job_info=AsyncMock())
+    redis = MagicMock(clear_verified_job_info=AsyncMock(), get_verified_job_info=AsyncMock(return_value={}))
     _, result = await wave_create_task(run, redis, service=service)
     assert redis.clear_verified_job_info.await_count == (0 if held else 1)
 
@@ -735,7 +735,7 @@ async def test_a_held_reset_failing_on_another_error_follows_the_base_error_path
     from services.task.models import VALIDATOR_REDIS_UNAVAILABLE
 
     run = await _account_run(monkeypatch)
-    redis_service = MagicMock(clear_verified_job_info=AsyncMock())
+    redis_service = MagicMock(clear_verified_job_info=AsyncMock(), get_verified_job_info=AsyncMock(return_value={}))
     service, result = await wave_create_task(run, redis_service)
     redis_service.clear_verified_job_info.side_effect = ValueError("malformed reset")
 
