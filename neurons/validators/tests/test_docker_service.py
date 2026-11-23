@@ -12086,6 +12086,17 @@ async def test_flatten_sizing_budget_adds_the_neighbours_unwritten_layers(copy, 
     assert ssh.run.await_count == (0 if copy is None else 1)
 
 
+@pytest.mark.asyncio
+async def test_an_unreadable_image_size_stops_the_sizing_before_the_volume():
+    # never read as "no copy needed": the grant would take the room the flatten later needs
+    ssh = _node_ssh("")
+    unreadable = AsyncMock(side_effect=image_flatten_module.FlattenSizeUnreadable("size"))
+    with patch.object(docker_service_module, "flatten_copy_bytes", unreadable):
+        with pytest.raises(image_flatten_module.FlattenSizeUnreadable):
+            await docker_service_module._flatten_sizing_budget(ssh, "sglang", "pod_x")
+    ssh.run.assert_not_awaited()
+
+
 def test_others_running_counts_only_the_other_customer_creates_on_the_executor():
     registry = docker_service_module._CustomerCreateRegistry()
     own, other = (Mock(miner_hotkey="hk", executor_id="ex", workload_kind=WorkloadKind.CUSTOMER_RENTAL) for _ in range(2))
