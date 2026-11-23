@@ -250,19 +250,24 @@ class RentedPodOwnershipCheck:
 
         async def settle() -> set[str]:
             seen = await ctx.services.redis.mget([key(p) for p in candidates])
-            if not settings.DRY_RUN:
-                writes = RedisWrites()
-                for pod in candidates:
-                    writes.set(key(pod), ctx.pipeline_id, ex=MID_REVERT_TTL_SECONDS)
-                for pod in clean:
-                    writes.delete(key(pod))
-                await ctx.services.redis.write_atomically(writes)
             run = ctx.pipeline_id.encode()
-            return {
+            first = {
                 p["container"]
                 for p, mark in zip(candidates, seen)
                 if mark is None or (mark.encode() if isinstance(mark, str) else mark) == run
             }
+            if not settings.DRY_RUN:
+                writes = RedisWrites()
+                for pod in candidates:
+                    if pod["container"] in first:
+                        writes.set(key(pod), ctx.pipeline_id, ex=MID_REVERT_TTL_SECONDS)
+                    else:
+                        # a later sight keeps the earlier run's id: a rerun of this run must still read it as later
+                        writes.expire(key(pod), MID_REVERT_TTL_SECONDS)
+                for pod in clean:
+                    writes.delete(key(pod))
+                await ctx.services.redis.write_atomically(writes)
+            return first
 
         try:
             return await asyncio.wait_for(settle(), timeout=MID_REVERT_MARKS_BUDGET_SECONDS)

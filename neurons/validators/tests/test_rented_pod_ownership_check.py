@@ -725,3 +725,21 @@ async def test_names_the_node_was_not_asked_about_are_ignored(context_factory):
     services = build_services()
     await RentedPodOwnershipCheck().run(_ctx(context_factory, SimpleNamespace(run=run), services=services))
     assert len(services.redis.store) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_later_sight_run_again_after_a_dropped_session_stays_shifted(context_factory):
+    # a later sight keeps the earlier run's mark, so the rerun of this run still reads it as later
+    from neurons.validators.src.services.task.pipeline import Pipeline
+
+    services = build_services()
+    assert await _reasons(context_factory, services, [_mid_revert_ssh()]) == [Msg.UNREAD.reason]
+    earlier = dict(services.redis.store)
+
+    async def reconnect():
+        return SimpleNamespace(run=_mid_revert_ssh().run, is_closed=lambda: False)
+
+    ctx = _ctx(context_factory, _drops_after_the_ownership_read(), services=services)
+    _, events, _ = await Pipeline([RentedPodOwnershipCheck()], _NullSink(), reconnect=reconnect).run(ctx)
+    assert [e.reason_code for e in events] == [Msg.SHIFTED.reason]
+    assert services.redis.store == earlier
