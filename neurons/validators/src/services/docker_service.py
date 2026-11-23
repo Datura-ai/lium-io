@@ -151,6 +151,7 @@ from services.gpu_clocks import (
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS, GpuResetReport, reset_pod_gpus
 from services.gpu_wedge import cure_wedged_gpus, query_wedged_gpu_uuids
 from services.hung_gpu_reset import HungGpuResult, reset_hung_pod_gpus
+from services.host_memory_guard import TIMEOUT_SECONDS as HOST_MEMORY_GUARD_TIMEOUT_SECONDS
 from services.host_memory_guard import apply_host_memory_guard
 from services.image_flatten import (
     FLATTEN_NO_DISK_RENTER_SENTENCE,
@@ -589,6 +590,8 @@ RENTAL_DISK_SHORT_STEP = "rental_disk_short"
 HOST_READ_PID_MAX_STEP = "host_read_pid_max"
 HOST_READ_RAM_KIB_STEP = "host_read_ram_kib"
 HOST_READ_GPU_COUNT_STEP = "host_read_gpu_count"
+# the host memory guard that ends the host reads; its step only names a channel it may still hold
+HOST_MEMORY_GUARD_STEP = "host_memory_guard"
 # each fail-closed host read, on the validator side: its open, then its command
 _HOST_READ_TIMEOUT_SECONDS = 15
 # DAH-5260: `docker volume rm` of the 1561 GB kimi-k3 cache unlinks ~1.5 TB; ext4 frees ~180 GB/s of
@@ -3923,7 +3926,6 @@ class DockerService:
                 flatten_lease=flatten_lease,
                 pod_id=pod_id,
             )
-            await apply_host_memory_guard(ssh_client, default_extra)
             return container_id
         finally:
             for lease in flatten_lease:
@@ -10618,6 +10620,19 @@ class DockerService:
                 if ram_kib is not None and payload.gpu_uuids:
                     host_read_step = HOST_READ_GPU_COUNT_STEP
                     gpu_count = await self._read_host_gpu_count(connected_ssh_client)
+                # DAH-6379/6916: host-level MemoryMin before any container of this create starts, so a new pod
+                # cannot starve the host services during its readiness wait. Here it overlaps the Docker connect
+                # and, on this session's serial channel, no other step. Logs what it could not apply; a timed-out
+                # guard frees its channel like the reads, and one whose close is not confirmed stops the create
+                host_read_step = HOST_MEMORY_GUARD_STEP
+                await apply_host_memory_guard(
+                    connected_ssh_client,
+                    default_extra,
+                    run=lambda script: _run_closing_channel_on_timeout(
+                        connected_ssh_client, script, HOST_MEMORY_GUARD_TIMEOUT_SECONDS
+                    ),
+                    reraise=(SshSessionMayStillBeTakenError,),
+                )
                 return pid_max, ram_kib, gpu_count
 
             async def after_host_limits_read(
