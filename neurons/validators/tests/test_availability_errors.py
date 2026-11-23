@@ -103,6 +103,7 @@ def test_the_class_names_who_could_not_reach_what() -> None:
 def _task_service_that_reaches_the_ssh_connect() -> TaskService:
     """A TaskService whose only live steps are key decryption and the attestation policy."""
     service = TaskService.__new__(TaskService)
+    service.held_resets = {}
     service.ssh_service = MagicMock()
     service.ssh_service.decrypt_payload = MagicMock(return_value="decrypted-key")
     service.attestation_service = MagicMock()
@@ -307,6 +308,7 @@ async def test_a_failure_after_the_shell_opened_reports_the_node_as_reachable() 
             return False
 
     service = TaskService.__new__(TaskService)
+    service.held_resets = {}
     service.ssh_service = MagicMock()
     service.ssh_service.decrypt_payload = MagicMock(return_value="key")
     service.attestation_service = MagicMock()

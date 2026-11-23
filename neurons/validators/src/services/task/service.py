@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated
 
@@ -80,6 +81,16 @@ def _transport_unreachable_event(*, executor_uuid: str, error: BaseException) ->
     )
 
 
+@dataclass(eq=False)
+class HeldReset:
+    """DAH-3405: one verified-job reset held for its cycle's end, with its run's result once handle_result returned
+    (None: the run raised after the reset was held, so nothing withholds it and it is sent)."""
+
+    executor_id: str
+    reset: dict
+    result: JobResult | None = None
+
+
 class TaskService:
     def __init__(
         self,
@@ -99,6 +110,11 @@ class TaskService:
         self.wallet = settings.get_bittensor_wallet()
         # DAH-3019: the start reports run in the background; the set keeps them referenced until done.
         self._start_reports: set[asyncio.Task] = set()
+        # DAH-3405: the verified-job resets the wave held, by job_batch_id, for that cycle's end to decide; kept here,
+        # not on the miner's job, so a job that times out before the cycle end still has its resets decided
+        self.held_resets: dict[str, list[HeldReset]] = {}
+        # DAH-6951: the one cycle whose resets may still be held; a reset of any other (decided) cycle is sent at once
+        self.open_hold_batch: str | None = None
 
         # Initialize pipeline factory with all required services
         self.pipeline_factory = PipelineFactory(
@@ -134,6 +150,26 @@ class TaskService:
         self._start_reports.add(task)
         task.add_done_callback(self._start_reports.discard)
 
+    def take_held_resets(self, job_batch_id: str) -> list[HeldReset]:
+        """The cycle's held resets, for its end to decide; from here on that cycle holds none (sent at once)."""
+        if self.open_hold_batch == job_batch_id:
+            self.open_hold_batch = None
+        return self.held_resets.pop(job_batch_id, [])
+
+    def drop_held_resets(
+        self, executor_id: str | None = None, miner_hotkey: str | None = None, result: JobResult | None = None
+    ) -> None:
+        """Forget the held resets a newer verdict made stale: the node's as this miner lists it (it passed; another
+        miner listing the same executor id keeps its own) or one run's (a rerun replaced it)."""
+
+        def stale(e: HeldReset) -> bool:
+            if result is not None:
+                return e.result is result
+            return e.executor_id == executor_id and e.reset["miner_hotkey"] == miner_hotkey
+
+        for entries in self.held_resets.values():
+            entries[:] = [e for e in entries if not stale(e)]
+
     async def create_task(
         self,
         miner_info: MinerJobRequestPayload,
@@ -147,11 +183,14 @@ class TaskService:
         executor_image_snapshot: ExpectedImageSnapshot | None = None,
         attestation_nonce: AttestationNonce | None = None,
         first_pass: bool = False,
+        hold_rollout_resets: bool = False,
     ):
         """New pipeline-based validation task implementation.
 
         `first_pass` (DAH-3011): the caller knows this is the executor's first, unscored verification
         (the express lane, DAH-2958). The wave never sets it.
+        `hold_rollout_resets` (DAH-6951): the cycle's wave asks for it (Validator.request_wave_job); a verified-job
+        reset the rollout window may explain is kept in `held_resets` for the cycle end, not sent now.
         """
         task_started_at = time.monotonic()
         attestation_digest = None
@@ -252,6 +291,32 @@ class TaskService:
                 log_text = _m(last_event.event, extra=last_event.model_dump())
                 success = False if not ok else last_context.success
 
+                # executor_rollout imports services.task, so it is imported here and not at the top
+                from services.executor_rollout import a_rollout_may_withhold_the_reset
+
+                held: list[HeldReset] = []
+
+                def hold_reset(reset: dict) -> bool:
+                    """DAH-3405: filed before any further await, so neither a cancel nor an error can lose it."""
+                    image_report = last_context.state.executor_image_report
+                    if not (
+                        hold_rollout_resets
+                        and miner_info.job_batch_id == self.open_hold_batch
+                        and a_rollout_may_withhold_the_reset(
+                            reset.get("evidence") or {},
+                            last_context.score,
+                            last_event.reason_code,
+                            image_report.as_dict() if image_report else None,
+                        )
+                    ):
+                        return False
+                    held.append(HeldReset(executor_info.uuid, reset))
+                    self.held_resets.setdefault(miner_info.job_batch_id, []).append(held[-1])
+                    return True
+
+                if success:
+                    # a pass is the node's latest verdict: a reset an earlier run of this cycle held is stale
+                    self.drop_held_resets(executor_id=executor_info.uuid, miner_hotkey=miner_info.miner_hotkey)
                 # Handle result using ResultHandler
                 result_handler = ResultHandler(self.redis_service, dry_run=settings.DRY_RUN)
                 result = await result_handler.handle_result(
@@ -262,7 +327,12 @@ class TaskService:
                     log_text=log_text.to_full_string(),
                     success=success,
                     validation_event=last_event,
+                    # DAH-3405: a wave reset the rollout window could withhold waits for the cycle end; every other
+                    # reset, and every reset of the express lane and the CLI, is sent now
+                    hold_reset=hold_reset,
                 )
+                for entry in held:
+                    entry.result = result
                 result.attestation_digest = attestation_digest
                 result.tee_type = tee_type
                 result.gpu_attestation_passed = gpu_attestation_passed

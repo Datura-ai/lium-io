@@ -144,8 +144,8 @@ POOL, CLAIM = "5Pool", "claim-of-this-account"
 class _HostFiles:
     """The validator's SSH runner on a machine whose /etc/liumd files read `stdout` (fixed command only)."""
 
-    def __init__(self, stdout: str, success: bool = True):
-        self.stdout, self.success, self.commands = stdout, success, []
+    def __init__(self, stdout: str, success: bool = True, error_type: str | None = None):
+        self.stdout, self.success, self.error_type, self.commands = stdout, success, error_type, []
 
     async def run(self, cmd, *, timeout=60, check=False, retryable=True, stdin_text=None):  # noqa: ASYNC109
         from datetime import UTC, datetime
@@ -155,8 +155,9 @@ class _HostFiles:
         self.commands.append(cmd)
         now = datetime.now(UTC)
         return SSHCommandResult(
-            command=cmd, command_id="c", exit_code=0 if self.success else 1, stdout=self.stdout, stderr="",
-            duration_ms=1, started_at=now, finished_at=now, success=self.success,
+            command=cmd, command_id="c", exit_code=0 if self.success else -1 if self.error_type else 1,
+            stdout=self.stdout, stderr="", duration_ms=1, started_at=now, finished_at=now, success=self.success,
+            error_type=self.error_type,
         )
 
 
@@ -281,10 +282,14 @@ class _Ssh:
         return SimpleNamespace(stdout="", stderr="", exit_status=self.outcome)
 
 
-@pytest.mark.parametrize("outcome, read_error", [(1, "exit 1"), (None, "no_exit_status"), ("stall", "timeout")])
-async def test_every_way_the_read_can_fail_is_refused(outcome, read_error, monkeypatch):
-    """Through the real runner: a nonzero exit, a channel closed without an exit status and a timeout (after its
-    retry) are all NODE_ACCOUNT_UNVERIFIED; the read that worked on an older executor passes (above)."""
+@pytest.mark.parametrize(
+    "outcome, read_error, closed",
+    [(1, "exit 1", False), (None, "no_exit_status", True), (-1, "exit -1", True), ("stall", "timeout", False)],
+)
+async def test_every_way_the_read_can_fail_is_refused(outcome, read_error, closed, monkeypatch):
+    """Through the real runner: a nonzero exit, a channel closed without an exit status, a signal and a timeout
+    (after its retry) are all NODE_ACCOUNT_UNVERIFIED; the read that worked on an older executor passes (above).
+    DAH-6951 r262: only a session that closed under the read is marked so, the one reset a rollout may hold."""
     from services.task import runner as runner_module
     from services.task.checks import node_account as module
 
@@ -295,6 +300,8 @@ async def test_every_way_the_read_can_fail_is_refused(outcome, read_error, monke
     assert not result.passed and result.fatal
     assert result.event.reason_code == "NODE_ACCOUNT_UNVERIFIED"
     assert result.event.what_we_saw["read_error"] == read_error
+    evidence = result.updates.get("clear_verified_job_evidence") or {}
+    assert bool(evidence.get("session_closed_under_read")) is closed
 
 
 def _no_wait(sleep):
@@ -309,8 +316,9 @@ def _no_wait(sleep):
 class _DropsTheSession(_HostFiles):
     """The account read on a session that closes under it (a recreated executor container, or a relay)."""
 
-    def __init__(self, ssh):
-        super().__init__("", success=False)
+    def __init__(self, ssh, error_type="no_exit_status"):
+        # the channel closed without an exit status; "timeout": a read that stalled, then the session dropped
+        super().__init__("", success=False, error_type=error_type)
         self.ssh = ssh
 
     async def run(self, cmd, **kwargs):
@@ -375,3 +383,294 @@ async def test_a_dropped_session_during_the_account_read_is_reconnected_through_
     assert len(calls) == (1 if drops else 0)
     assert end.node_account_passed is account_passed
     assert end.clear_verified_job_info is (not account_passed and not rented)
+
+
+class _FindingThenTheSessionCloses:
+    """A check that finished reading a finding off the node, cleared the verified job and found the session closed
+    afterwards (a provider dropping it): not replayable, so the run ends on EXECUTOR_TRANSPORT_UNREACHABLE."""
+
+    check_id = "test.validate.finding"
+    fatal = True
+
+    def __init__(self, template):
+        self.template = template
+
+    async def run(self, ctx):
+        from services.task.messages import render_message
+        from services.task.pipeline import CheckResult
+
+        ctx.ssh.is_closed.return_value = True
+        event = render_message(self.template, ctx=ctx, check_id=self.check_id)
+        return CheckResult(passed=False, event=event, updates={"clear_verified_job_info": True}, fatal=True)
+
+
+def _finding(name):
+    from services.task.messages import BannedGpuMessages, NvmlDigestMessages, SpecChangeMessages
+
+    return {
+        "GPU_BANNED": BannedGpuMessages.GPU_BANNED,
+        "NVML_DIGEST_MISMATCH": NvmlDigestMessages.DIGEST_MISMATCH,
+        "SPEC_CHANGED": SpecChangeMessages.SPEC_CHANGED,
+    }[name]
+
+
+class _Shell:
+    def __init__(self, *args, **kwargs):
+        self.ssh_client = None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+async def wave_create_task(run, redis, *, open_batch="batch-1", service=None, handler=None, miner_hotkey=POOL):
+    """TaskService.create_task as the cycle's wave runs it, on a pipeline run already made: the real ResultHandler
+    (unless ``handler``), `run` = (ok, events, end context). A given ``service`` keeps its held resets."""
+    from contextlib import nullcontext
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from payload_models.payloads import MinerJobRequestPayload
+    from services.task.service import TaskService
+
+    if service is None:
+        service = TaskService.__new__(TaskService)
+        service.held_resets = {}
+        service.open_hold_batch = open_batch
+    service.redis_service = redis
+    service.ssh_service = MagicMock(decrypt_payload=MagicMock(return_value="key"))
+    service.attestation_service = MagicMock(
+        prepare_host_policy=AsyncMock(
+            return_value=MagicMock(
+                known_hosts=None, attestation_digest=None, tee_type=None, gpu_attestation_passed=None,
+                attestation_passed=False,
+            )
+        )
+    )
+    service.pipeline_factory = MagicMock(build_context=AsyncMock(return_value=MagicMock(verified={})))
+    service.pipeline_factory.build_pipeline.return_value.run = AsyncMock(return_value=run)
+    miner = MinerJobRequestPayload(
+        job_batch_id="batch-1", miner_hotkey=miner_hotkey, miner_coldkey="5Cold", miner_address="192.0.2.5", miner_port=8080,
+    )
+    with (
+        patch("services.task.service.InteractiveShellService", _Shell),
+        patch("services.task.service.PipelineFactory.takes_fast_path", return_value=False),
+        patch("services.task.service.run_liumd_shadow", AsyncMock()),
+        patch("services.task.service.settings.DRY_RUN", False),
+        patch("services.task.service.ResultHandler", handler) if handler else nullcontext(),
+    ):
+        result = await service.create_task(
+            miner_info=miner, executor_info=run[2].executor, keypair=MagicMock(ss58_address="5Val"),
+            private_key="key", public_key="pub", encrypted_files=MagicMock(), rented_data=MagicMock(),
+            default_docker_image_digests={}, hold_rollout_resets=True,
+        )
+    return service, result
+
+
+async def cycle_end(service, redis, result, case):
+    """The cycle-end withhold and reset decision of batch-1 in a covering window, or outside one."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    from core.validator import Validator
+    from services.executor_rollout import RolloutWindow
+
+    window = RolloutWindow(
+        digest="sha256:" + "b" * 64, previous_digest="sha256:" + "a" * 64, started_at=None,
+        opened_job_block=7500 if case in ("withheld", "job_timed_out", "raised_after_holding", "read_stalled") else None,
+        cycles_seen=1, grace_cycles=2,
+    )
+    validator = Validator.__new__(Validator)
+    validator.default_extra = {}
+    validator.redis_service = redis
+    validator.miner_service = SimpleNamespace(task_service=service, outage_tally=None)
+    validator.rollout_tracker = MagicMock(record_withheld=AsyncMock())
+    validator.fetch_executor_digest_or_none = AsyncMock(return_value=window.digest)
+    validator.observe_executor_rollout = AsyncMock(return_value=window)
+    # a timed-out miner job was cancelled: its results never reach the cycle end
+    cycle = {} if result is None or case.startswith("job_timed_out") or case == "raised_after_holding" else {POOL: [result]}
+    _, withheld = await validator.withhold_verdicts_for_rollout(cycle, 7500, "batch-1", window)
+    assert service.held_resets == {} and service.open_hold_batch is None
+    return withheld
+
+
+async def _account_run(monkeypatch, *, drops=True, error_type="no_exit_status"):
+    from unittest.mock import MagicMock
+
+    from services.task import pipeline as pipeline_module
+    from services.task.pipeline import Pipeline
+
+    class _Sink:
+        async def emit(self, event):
+            pass
+
+    async def reconnect():
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("services.task.checks.node_account.has_live_rental", lambda ctx: False)
+    first = MagicMock(spec=asyncssh.SSHClientConnection)
+    first.is_closed.return_value = False
+    ctx = _relay_ctx(_DropsTheSession(first, error_type) if drops else _HostFiles("", success=False)).model_copy(
+        update={"ssh": first}
+    )
+    monkeypatch.setattr(pipeline_module, "SSHCommandRunner", lambda conn, max_retries=1: _HostFiles(""))
+    return await Pipeline([NodeAccountCheck()], _Sink(), reconnect=reconnect).run(ctx)
+
+
+@pytest.mark.parametrize(
+    "cause, case, sent_in_the_cycle, sent_at_the_end",
+    [
+        # the account read the session drop cut, reconnect refused (run ends on the transport): held for the cycle end
+        ("NODE_ACCOUNT_UNVERIFIED", "withheld", False, False),
+        ("NODE_ACCOUNT_UNVERIFIED", "stands", False, True),
+        # a miner job cancelled at the wait: its result is judged on itself, as its verdict would have been
+        ("NODE_ACCOUNT_UNVERIFIED", "job_timed_out", False, False),
+        ("NODE_ACCOUNT_UNVERIFIED", "job_timed_out_outside_a_window", False, True),
+        # the read failed on a session that stayed open: no window withholds that run, so nothing waits (as at base)
+        ("NODE_ACCOUNT_UNVERIFIED", "session_stayed_open", True, False),
+        # r262: the read timed out (a relay can stall it), then the session dropped: no restart explains a stall
+        ("NODE_ACCOUNT_UNVERIFIED", "read_stalled", True, False),
+        # the cycle was already decided (a late run): sent at once, never left held
+        ("NODE_ACCOUNT_UNVERIFIED", "batch_decided", True, False),
+        # a finished finding followed by a closed session, inside a window: its reset goes at once
+        ("GPU_BANNED", "withheld", True, False),
+        ("NVML_DIGEST_MISMATCH", "withheld", True, False),
+        ("SPEC_CHANGED", "withheld", True, False),
+    ],
+)
+async def test_a_reset_waits_for_the_rollout_decision_only_when_its_own_cause_is_a_read_that_did_not_finish(
+    cause, case, sent_in_the_cycle, sent_at_the_end, monkeypatch
+):
+    """DAH-3405 + DAH-6539, 23 Nov: a recreated executor container dropped the account read and refused the
+    reconnect; the run ended on EXECUTOR_TRANSPORT_UNREACHABLE, which the rollout window withheld at cycle end, but
+    its NODE_ACCOUNT_UNVERIFIED reset had gone out inside the cycle and hid the node. Such a reset now waits for the
+    cycle end, which drops it when the window withholds its result and sends it otherwise. DAH-6951: a reset waits
+    only when a window could withhold its run and its own cause is a read that did not finish: a reset a finished
+    finding set (GPU_BANNED, NVML_DIGEST_MISMATCH, SPEC_CHANGED) goes out at once even when the session was found
+    closed after the check, and so does any reset whose run no window withholds. Through TaskService.create_task."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from services.task import pipeline as pipeline_module
+    from services.task.pipeline import Pipeline
+
+    if cause == "NODE_ACCOUNT_UNVERIFIED":
+        run = await _account_run(
+            monkeypatch,
+            drops=case != "session_stayed_open",
+            error_type="timeout" if case == "read_stalled" else "no_exit_status",
+        )
+    else:
+
+        class _Sink:
+            async def emit(self, event):
+                pass
+
+        async def reconnect():
+            raise OSError("connection refused")
+
+        first = MagicMock(spec=asyncssh.SSHClientConnection)
+        first.is_closed.return_value = False
+        ctx = _relay_ctx(_HostFiles("")).model_copy(update={"ssh": first})
+        monkeypatch.setattr(pipeline_module, "SSHCommandRunner", lambda conn, max_retries=1: _HostFiles(""))
+        run = await Pipeline([_FindingThenTheSessionCloses(_finding(cause))], _Sink(), reconnect=reconnect).run(ctx)
+    end_reason = "NODE_ACCOUNT_UNVERIFIED" if case == "session_stayed_open" else "EXECUTOR_TRANSPORT_UNREACHABLE"
+    assert not run[0] and run[1][-1].reason_code == end_reason
+
+    redis = MagicMock(clear_verified_job_info=AsyncMock())
+    service, result = await wave_create_task(run, redis, open_batch=None if case == "batch_decided" else "batch-1")
+    assert result.failure_reason_code == end_reason
+    assert redis.clear_verified_job_info.await_count == (1 if sent_in_the_cycle else 0)
+    held = [h.result for h in service.held_resets.get("batch-1", [])]
+    assert held == ([] if sent_in_the_cycle else [result])
+
+    withheld = await cycle_end(service, redis, result, case)
+    # the stalled read's run is withheld like any transport end inside the window; its reset went out at once
+    assert [w.result for w in withheld] == ([result] if case in ("withheld", "read_stalled") else [])
+    assert redis.clear_verified_job_info.await_count == (1 if sent_in_the_cycle or sent_at_the_end else 0)
+    if redis.clear_verified_job_info.await_count:
+        reset = redis.clear_verified_job_info.await_args.kwargs
+        assert reset["executor_id"] == "node-1"
+        assert reset["evidence"]["reason_code"] == cause
+
+
+async def test_a_reset_held_before_handle_result_raised_is_still_decided(monkeypatch):
+    """r255: the reset is filed before any further await of handle_result, so an error there (a malformed
+    gpu_model_count) cannot lose it; with no result to withhold it is sent at the cycle end, even in a window."""
+    from dataclasses import replace
+    from unittest.mock import AsyncMock, MagicMock
+
+    ok, events, end = await _account_run(monkeypatch)
+    end = end.model_copy(update={"state": replace(end.state, gpu_model_count="H100:x")})
+    redis = MagicMock(clear_verified_job_info=AsyncMock())
+    service, result = await wave_create_task((ok, events, end), redis)
+    assert result.log_status == "error"
+    [held] = service.held_resets["batch-1"]
+    assert held.result is None
+    redis.clear_verified_job_info.assert_not_awaited()
+
+    await cycle_end(service, redis, result, "raised_after_holding")
+    redis.clear_verified_job_info.assert_awaited_once()
+
+
+async def test_a_held_reset_redis_refuses_at_the_cycle_end_withholds_its_verdict(monkeypatch):
+    """r262: at base a Redis error on the reset made the run VALIDATOR_REDIS_UNAVAILABLE, withheld; a held reset
+    that cannot be sent at the cycle end must not be lost silently either: its verdict is withheld the same way, so
+    the node is neither scored nor published without its reset, and the next cycle checks it again."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    import redis.exceptions
+
+    from services.task.models import VALIDATOR_REDIS_UNAVAILABLE
+
+    run = await _account_run(monkeypatch)
+    redis_service = MagicMock(clear_verified_job_info=AsyncMock())
+    service, result = await wave_create_task(run, redis_service)
+    redis_service.clear_verified_job_info.side_effect = redis.exceptions.ConnectionError("redis down")
+
+    withheld = await cycle_end(service, redis_service, result, "stands")
+
+    redis_service.clear_verified_job_info.assert_awaited_once()
+    assert [w.result for w in withheld] == [result]
+    assert result.failure_reason_code == VALIDATOR_REDIS_UNAVAILABLE and result.availability_errors is None
+
+
+@pytest.mark.parametrize("same_miner", [True, False], ids=["same-miner", "another-miner"])
+async def test_a_pass_of_the_same_node_drops_its_held_reset(monkeypatch, same_miner):
+    """r254: a later pass of the node before the cycle end (an express recheck after the provider fixed it) is its
+    latest verdict: the reset an earlier run held is dropped, never sent over the pass. r262: only a pass of the same
+    miner's listing; another miner listing the same executor id leaves this miner's held reset to the cycle end."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    run = await _account_run(monkeypatch)
+    redis = MagicMock(clear_verified_job_info=AsyncMock())
+    service, _ = await wave_create_task(run, redis)
+    assert len(service.held_resets["batch-1"]) == 1
+
+    passed = (True, run[1][:1], run[2].model_copy(update={"success": True}))
+    handler = MagicMock()
+    handler.return_value.handle_result = AsyncMock(return_value=MagicMock(score=1.0, availability_errors=None))
+    await wave_create_task(passed, redis, service=service, handler=handler, miner_hotkey=POOL if same_miner else "5Other")
+
+    assert len(service.held_resets["batch-1"]) == (0 if same_miner else 1)
+    await cycle_end(service, redis, None, "withheld_nothing")
+    assert redis.clear_verified_job_info.await_count == (0 if same_miner else 1)
+
+
+def test_held_resets_are_kept_per_cycle_and_a_replaced_run_drops_its_own():
+    """DAH-6951: the cycle end takes only its own batch's resets and closes that batch; a rerun that replaced a run
+    drops the replaced run's reset only."""
+    from services.task.service import HeldReset, TaskService
+
+    service = TaskService.__new__(TaskService)
+    first, other = object(), object()
+    service.held_resets = {
+        "batch-1": [HeldReset("node-1", {}, first), HeldReset("node-2", {}, other)],
+        "batch-2": [HeldReset("node-1", {})],
+    }
+    service.open_hold_batch = "batch-1"
+
+    service.drop_held_resets(result=first)
+    assert [h.executor_id for h in service.held_resets["batch-1"]] == ["node-2"]
+    assert [h.executor_id for h in service.take_held_resets("batch-1")] == ["node-2"]
+    assert service.open_hold_batch is None and list(service.held_resets) == ["batch-2"]

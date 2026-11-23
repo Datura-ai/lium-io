@@ -91,7 +91,12 @@ class NodeAccountCheck:
             # failed, timed out or closed without an exit status: a relay could stall it on purpose, so ownership is
             # not proven and the node is hidden until a cycle reads it
             what["read_error"] = result.error_type or f"exit {result.exit_code}"
-            return _refused(ctx, self.check_id, Msg.BINDING_UNVERIFIED, what)
+            # DAH-6951: only a session that closed under the read (no exit status, a transport error, a signal) is
+            # one a rollout's container restart explains; a read that timed out (a stall) never is
+            closed = result.error_type != "timeout" and (result.error_type is not None or result.exit_code < 0)
+            return _refused(
+                ctx, self.check_id, Msg.BINDING_UNVERIFIED, what, evidence={"session_closed_under_read": True} if closed else None
+            )
         if not hotkey:
             # the read worked and found no host files: an older executor, no evidence either way
             logger.info(_m("NODE_ACCOUNT_BINDING_UNVERIFIED", extra=get_extra_info({**what, "unread": "hotkey"})))
@@ -109,7 +114,7 @@ class NodeAccountCheck:
         return _refused(ctx, self.check_id, Msg.BINDING_MISMATCH, what)
 
 
-def _refused(ctx: Context, check_id: str, template, what: dict) -> CheckResult:
+def _refused(ctx: Context, check_id: str, template, what: dict, evidence: dict | None = None) -> CheckResult:
     """Like GPU_MODEL_MISMATCH: an availability entry, so the backend hides the node and refuses new rentals on its
     free GPUs too (the node stays active), and score 0. With a live rental the renter's pod runs on and is billed as
     usual: the verified job is kept and the run is not fatal, because clearing it resets the node inactive in the
@@ -121,6 +126,10 @@ def _refused(ctx: Context, check_id: str, template, what: dict) -> CheckResult:
     return CheckResult(
         passed=False,
         event=event,
-        updates={"node_account_passed": False, "clear_verified_job_info": True},
+        updates={
+            "node_account_passed": False,
+            "clear_verified_job_info": True,
+            **({"clear_verified_job_evidence": evidence} if evidence else {}),
+        },
         fatal=True,
     )

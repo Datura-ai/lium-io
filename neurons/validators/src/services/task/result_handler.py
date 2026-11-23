@@ -6,7 +6,7 @@ and converting the validation context into a JobResult for reporting.
 
 import logging
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobRequestPayload
@@ -89,6 +89,7 @@ class ResultHandler:
         log_text: str,
         success: bool,
         validation_event: ValidationEvent | None = None,
+        hold_reset: Callable[[dict], bool] | None = None,
     ) -> JobResult:
         """Handle task result by persisting verification data and building JobResult.
 
@@ -100,6 +101,8 @@ class ResultHandler:
             log_text: Log message for this result
             success: Whether validation succeeded
             validation_event: Structured final validation outcome
+            hold_reset: given a verified-job reset's clear_verified_job_info arguments, files it for the cycle end
+                and returns True, or returns False and the reset is sent here (DAH-3405)
 
         Returns:
             JobResult containing all validation outcomes
@@ -132,6 +135,7 @@ class ResultHandler:
                 verified_job_info=verified_job_info,
                 context=context,
                 success=success,
+                hold_reset=hold_reset,
             )
         else:
             logger.info("DRY_RUN: Skipping Redis persistence")
@@ -371,6 +375,7 @@ class ResultHandler:
         verified_job_info: dict,
         context: Context,
         success: bool,
+        hold_reset: Callable[[dict], bool] | None = None,
     ) -> None:
         """Persist verification data to Redis based on validation outcome.
 
@@ -380,6 +385,7 @@ class ResultHandler:
             verified_job_info: Previous verification info
             context: Pipeline context with verification state
             success: Whether validation succeeded
+            hold_reset: see handle_result
         """
         if success:
             # On success, update verification data if we have GPU info
@@ -408,7 +414,7 @@ class ResultHandler:
                     "executor_port": context.executor.port,
                     **({"job_batch_id": context.config.job_batch_id} if context.config.job_batch_id else {}),
                 }
-                await self.redis_service.clear_verified_job_info(
+                reset = dict(
                     miner_hotkey=miner_hotkey,
                     executor_id=executor_id,
                     prev_info=verified_job_info,
@@ -417,6 +423,9 @@ class ResultHandler:
                     reanchor_uuids=(context.state.gpu_uuids or '') if context.gpu_reanchor else '',
                     respec=(context.state.gpu_model_count or '') if context.gpu_respec else '',
                 )
+                if hold_reset is not None and hold_reset(reset):
+                    return
+                await self.redis_service.clear_verified_job_info(**reset)
             else:
                 # a full set of other cards stays anchored when a later check failed, or it re-anchors every cycle
                 reanchor_uuids = (context.state.gpu_uuids or '') if context.gpu_reanchor else ''

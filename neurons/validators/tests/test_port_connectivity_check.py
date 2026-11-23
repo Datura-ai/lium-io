@@ -1966,6 +1966,7 @@ async def _create_task_on_a_session_lost_in_the_port_check(context_factory, monk
             return False
 
     service = TaskService.__new__(TaskService)
+    service.held_resets = {}
     service.ssh_service = MagicMock(decrypt_payload=MagicMock(return_value="key"))
     service.attestation_service = MagicMock(prepare_host_policy=AsyncMock(return_value=HostPolicyResult()))
     service.redis_service = MagicMock()
