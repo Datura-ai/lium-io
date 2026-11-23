@@ -102,6 +102,46 @@ def update_snapshot(request: pytest.FixtureRequest) -> bool:
 
 
 @pytest.fixture(autouse=True)
+def _loopback_fakes_stand_in_for_public_nodes(request):
+    """Tests run their fake nodes on loopback or on the documentation ranges (TEST-NET-1/2/3), which the validator
+    refuses as a node address in production (services/node_host.py `_check_literal`). Here those stand in for a
+    public node; every other non-public address is still refused. test_node_host.py tests the real rule."""
+    if request.module.__name__.endswith("test_node_host"):
+        yield
+        return
+    import contextlib
+    import importlib
+    import ipaddress
+
+    # tests load the module as services.node_host and as neurons.validators.src.services.node_host: two module objects,
+    # each with its own _check_literal, so both are patched
+    modules = [importlib.import_module("services.node_host")]
+    with contextlib.suppress(ImportError):
+        modules.append(importlib.import_module("neurons.validators.src.services.node_host"))
+    documentation = [ipaddress.ip_network(n) for n in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")]
+
+    def allowing_stand_ins(real):
+        def allow_stand_ins(host: str, port: int) -> None:
+            h = host.strip("[]")
+            if h == "localhost":
+                return
+            try:
+                addr = ipaddress.ip_address(h.split("%", 1)[0])
+            except ValueError:
+                addr = None
+            if addr is not None and (addr.is_loopback or any(addr in n for n in documentation)):
+                return
+            real(host, port)
+
+        return allow_stand_ins
+
+    with contextlib.ExitStack() as stack:
+        for module in modules:
+            stack.enter_context(patch.object(module, "_check_literal", allowing_stand_ins(module._check_literal)))
+        yield
+
+
+@pytest.fixture(autouse=True)
 def no_docker_hub_digest_on_rent_path():
     """create_container asks Docker Hub for a present image's digest; no answer keeps tests offline."""
     with patch("services.docker_service.fetch_docker_hub_digest", AsyncMock(return_value=None)) as lookup:
@@ -135,6 +175,18 @@ def pod_ssh_answers_on_create_path(request):
         return
     with patch("services.docker_service._raise_unless_pod_ssh_answers", AsyncMock(return_value=None)) as check:
         yield check
+
+
+@pytest.fixture(autouse=True)
+def first_owner_hotkeys_read_already_done():
+    """Signed uploads wait for the validator's first owner-hotkeys read (DAH-6740); tests start past it.
+    test_ssh_key_signing.py covers the wait itself."""
+    from clients import validator_portal_api
+
+    with patch.object(validator_portal_api, "_owner_hotkeys_read_once", True), patch.object(
+        validator_portal_api, "_owner_read", None
+    ):
+        yield
 
 
 @pytest.fixture(autouse=True)

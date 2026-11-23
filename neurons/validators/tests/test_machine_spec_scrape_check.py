@@ -10,6 +10,7 @@ import pytest
 from neurons.validators.src.services.task.checks.machine_spec_scrape import (
     MachineSpecScrapeCheck,
     _normalize_gpu_details,
+    scrape_gpu_details,
 )
 from neurons.validators.src.services.task.messages import MachineSpecMessages as Msg
 from neurons.validators.src.services.task.messages import (
@@ -1063,3 +1064,33 @@ async def test_a_successful_scrape_starts_the_liumd_facts_read(context_factory, 
     assert result.passed is True
     assert result.updates["state"].liumd_shadow_facts_task is started and len(seen) == 1
     assert result.updates["state"].liumd_shadow_facts_attempted is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stdout,expected",
+    [
+        # DAH-6469: the cards' rows, normalised as the check stores them
+        (FERNET_TOKEN, [{"name": "NVIDIA A10 Tensor Core GPU", "uuid": "GPU-abc123"}]),
+        # a reading only counts from a payload this validator can decrypt
+        ("GPU-abc123 99 % 1980 MHz", []),
+    ],
+)
+async def test_scrape_gpu_details_reads_the_encrypted_scrape_and_leaves_the_state_alone(
+    context_factory, stdout, expected
+):
+    runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=stdout))
+    ctx = context_factory(
+        services=build_services(ssh=DummySSHService(decrypted_data=RAW_SPECS, valid_payload=FERNET_TOKEN)),
+        config=build_context_config(machine_scrape_source="print('scrape')"),
+        state=build_state(gpu_details=[{"uuid": "GPU-before"}]),
+        runner=runner,
+        encrypt_key="test-encrypt-key",
+    )
+
+    rows = await scrape_gpu_details(ctx, 120)
+
+    assert rows == expected
+    assert runner.called_with.command == "/usr/bin/python -I -"
+    assert runner.called_with.timeout == 120
+    assert ctx.state.gpu_details == [{"uuid": "GPU-before"}]

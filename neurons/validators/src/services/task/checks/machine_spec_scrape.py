@@ -11,7 +11,6 @@ from typing import Any, Literal
 
 from services.file_encrypt_service import ORIGINAL_KEYS
 from services.gpu_spec_table import classify_gpu_model, list_sxm_on_pcie_adapter_as_pcie
-from services.liumd_binary_refresh import DEFAULT_REFRESH_BUDGET_SECONDS, ensure_liumd_binary
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -35,8 +34,6 @@ logger = logging.getLogger(__name__)
 # per-executor timeout. The upload gets one attempt for exactly that reason.
 STDIN_FAILURE_RETRY_WINDOW_MS = 120_000
 FALLBACK_UPLOAD_ATTEMPTS = 1
-# The scrape's own worst case from above; the liumd refresh must not eat the time this needs.
-SCRAPE_BUDGET_SECONDS = 720
 
 # The scrape says only two things on stdout: a Fernet token when it worked, and a JSON object
 # with an "error" key when it ran but had nothing to report. Every Fernet token is base64url of
@@ -386,6 +383,33 @@ def _binary_command(remote_dir: str, script_filename: str) -> str:
     return f"chmod +x {script_path} && {script_path}"
 
 
+async def scrape_gpu_details(ctx: Context, timeout: int) -> list[dict[str, Any]]:
+    """A fresh scrape's gpu_details, normalised as MachineSpecScrapeCheck stores them; [] when no payload decrypted.
+
+    DAH-6469: GpuThermalThrottleCheck reads the cards under its own load with it. It writes nothing to ctx.state, so
+    the checks after it keep the cycle's own scrape."""
+    if ctx.config.machine_scrape_source:
+        command, stdin_text = f"{shlex.quote(ctx.executor.python_path)} -I -", ctx.config.machine_scrape_source
+    elif ctx.state.remote_dir and ctx.config.machine_scrape_filename:
+        command, stdin_text = _binary_command(ctx.state.remote_dir, ctx.config.machine_scrape_filename), None
+    else:
+        return []
+    scrape_run = await ctx.runner.run(command, timeout=timeout, retryable=False, stdin_text=stdin_text)
+    if not scrape_run.success:
+        return []
+    try:
+        specs = _deobfuscate(json.loads(_decrypt_payload(ctx, scrape_run.stdout)), ctx.config.obfuscation_keys)
+    except Exception:  # noqa: BLE001 - no token this validator can read: no reading
+        return []
+    gpu_info = specs.get("gpu") if isinstance(specs, dict) else None
+    details = gpu_info.get("details") if isinstance(gpu_info, dict) else None
+    if not isinstance(details, list):
+        return []
+    return list_sxm_on_pcie_adapter_as_pcie(
+        specs, _normalize_gpu_details([detail for detail in details if isinstance(detail, dict)])
+    )
+
+
 class MachineSpecScrapeCheck:
     """Run the obfuscated scrape script and unpack the executor's hardware profile.
 
@@ -403,48 +427,6 @@ class MachineSpecScrapeCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         liumd_specs = settings.VALIDATOR_LIUMD_SPECS and not settings.DRY_RUN
-        if settings.VALIDATOR_LIUMD_SHADOW or liumd_specs:
-            refresh = await ensure_liumd_binary(
-                ctx,
-                budget_seconds=min(
-                    DEFAULT_REFRESH_BUDGET_SECONDS, task_seconds_left(ctx) - SCRAPE_BUDGET_SECONDS
-                ),
-            )
-            if refresh is not None and refresh.skipped:
-                logger.warning(
-                    _m(
-                        "liumd binary refresh skipped; using the local binary",
-                        extra=get_extra_info({**ctx.default_extra, "detail": refresh.detail[:300]}),
-                    )
-                )
-            elif refresh is not None and not refresh.ok:
-                if liumd_specs:
-                    return self._fail_liumd(
-                        ctx,
-                        None,
-                        f"liumd binary refresh failed: {refresh.detail}",
-                        reason="binary_refresh_failed",
-                    )
-                logger.warning(
-                    _m(
-                        "liumd binary refresh failed; shadow continues",
-                        extra=get_extra_info({**ctx.default_extra, "detail": refresh.detail[:300]}),
-                    )
-                )
-            elif refresh is not None and refresh.changed:
-                logger.info(
-                    _m(
-                        "liumd binary refreshed",
-                        extra=get_extra_info({**ctx.default_extra, "build_sha": refresh.build_sha}),
-                    )
-                )
-            elif refresh is not None and refresh.detail:
-                logger.warning(
-                    _m(
-                        "liumd binary refresh degraded; using the local binary",
-                        extra=get_extra_info({**ctx.default_extra, "detail": refresh.detail[:300]}),
-                    )
-                )
         if liumd_specs:
             return await self._scrape_with_liumd(ctx)
 

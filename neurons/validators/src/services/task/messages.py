@@ -606,13 +606,6 @@ class PostRentalGpuRecheckMessages:
         category="env",
         impact="Proceed",
     )
-    FILLER_SKIPPED = MessageTemplate(
-        event="Post-rental GPU recheck waits: active filler",
-        reason="POST_RENTAL_GPU_RECHECK_SKIPPED_ACTIVE_FILLER",
-        severity="info",
-        category="policy",
-        impact="Proceed; the recheck runs on a cycle without a filler, or after a few filler cycles anyway.",
-    )
     INCONCLUSIVE = MessageTemplate(
         event="Post-rental GPU recheck gave no verdict",
         reason="POST_RENTAL_GPU_RECHECK_INCONCLUSIVE",
@@ -790,8 +783,8 @@ class SpecChangeMessages:
 
 
 class GpuFingerprintMessages:
-    # A set that lost or gained cards (a full set of other cards is re-anchored, not this). Its what_we_saw carries
-    # `anchor_hard_would_be`: GPU_MISSING (only anchored cards missing) or ANCHOR_BROKEN (other cards among them).
+    # A set with cards outside the anchor (a full set of other cards is re-anchored, not this). Its what_we_saw
+    # carries `anchor_hard_would_be`: ANCHOR_BROKEN.
     UUID_CHANGED = MessageTemplate(
         event="GPU fingerprints changed",
         reason="GPU_UUID_CHANGED",
@@ -801,7 +794,7 @@ class GpuFingerprintMessages:
         remediation="Ensure every GPU of the node stays attached and visible. A node that comes back with the same "
         "number of GPUs, all of them other cards, is verified again on its own.",
     )
-    # Hard mode: the scrape lists a strict subset of the anchored set. Transient by definition: the node
+    # The scrape lists a strict subset of the anchored set. Transient by definition: the node
     # scores again on the first cycle that shows the full set.
     GPU_MISSING = MessageTemplate(
         event="GPU missing from the listed set",
@@ -1041,6 +1034,51 @@ class NeedrestartGuardMessages:
     OK = MessageTemplate(
         event="Host needrestart guard ok",
         reason="NEEDRESTART_GUARD_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+
+
+class SysboxLayerResetMessages:
+    OUTDATED = MessageTemplate(
+        event="Host boot-time layer reset missing or old",
+        reason="SYSBOX_LAYER_RESET_OUTDATED",
+        severity="info",
+        category="env",
+        impact="Proceed; score not changed",
+        remediation=(
+            "After a power loss or hard reset, rented pods on this host come back with their files owned by the "
+            "host's root, so sudo and apt fail inside them. Run `sudo bash nvidia_docker_sysbox_setup.sh "
+            "--install-layer-reset` from lium-io neurons/executor on the host: it installs "
+            "lium-sysbox-layer-reset.service, runs nothing and restarts nothing."
+        ),
+    )
+    INSTALLED = MessageTemplate(
+        event="Host boot-time layer reset installed",
+        reason="SYSBOX_LAYER_RESET_INSTALLED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    INSTALL_FAILED = MessageTemplate(
+        event="Host boot-time layer reset could not be installed",
+        reason="SYSBOX_LAYER_RESET_INSTALL_FAILED",
+        severity="warning",
+        category="env",
+        impact="Proceed; score not changed",
+        remediation=OUTDATED.remediation,
+    )
+    UNKNOWN = MessageTemplate(
+        event="Host boot-time layer reset not reported",
+        reason="SYSBOX_LAYER_RESET_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    OK = MessageTemplate(
+        event="Host boot-time layer reset ok",
+        reason="SYSBOX_LAYER_RESET_OK",
         severity="info",
         category="env",
         impact="Proceed",
@@ -1761,7 +1799,7 @@ NO_OUTBOUND_INTERNET_REMEDIATION = (
 
 
 class OutboundInternetMessages:
-    # the rental probe's egress step, under NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED
+    # the rental probe's egress step
     NO_OUTBOUND_INTERNET = MessageTemplate(
         event="Containers cannot reach the internet",
         reason="NO_OUTBOUND_INTERNET",
@@ -2733,13 +2771,6 @@ class SpecFloorMessages:
             "counted GPU, and each card's own GPU UUID."
         ),
     )
-    WARNING = MessageTemplate(
-        event="Hardware specs below the floor",
-        reason="SPEC_FLOOR_REJECTED",
-        severity="warning",
-        category="env",
-        impact="Warning only: score unchanged",
-    )
 
 
 class DockerCpuMessages:
@@ -3025,9 +3056,10 @@ class RentedPodResourcesMessages:
         category="runtime",
         impact="Proceed without penalty; the renter's pod cannot read /proc/sys",
         remediation=(
-            "The FUSE service behind the container's /proc (sysbox-fs) stopped or restarted, so the running "
-            "pod answers 'Transport endpoint is not connected'. Check `systemctl status sysbox`, restart it if "
-            "needed, then restart the pod container; tell the renter first."
+            "The pod's /proc/sys answers 'Transport endpoint is not connected': its FUSE connection to "
+            "sysbox-fs is gone. This read does not show why; a sysbox-fs restart under the pod is reported "
+            "separately as RENTED_POD_OWNERSHIP_RUNTIME_RESTARTED. Restarting sysbox breaks every other "
+            "running pod: contact support before changing anything on the host."
         ),
     )
     RESOURCES_UNKNOWN = MessageTemplate(
@@ -3133,7 +3165,9 @@ class RentedPodOwnershipMessages:
         severity="warning",
         category="runtime",
         impact="Proceed; pods running across a sysbox or NVIDIA fabric manager restart can lose /proc paths or NVLink",
-        remediation="A runtime service listed in runtime_restarted_under_pods started after the listed pods. "
+        remediation="A runtime service listed in runtime_restarted_under_pods started after the listed pods, at the "
+        "time in runtime_started_at (which can be days before this report; \"unknown\" when the host's boot time "
+        "could not be read). "
         "Contact support before changing anything on the host; restarting the pod alone does not repair it.",
     )
     UNREAD = MessageTemplate(

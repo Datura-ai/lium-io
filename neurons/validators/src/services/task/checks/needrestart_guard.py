@@ -81,6 +81,8 @@ class NeedrestartGuardCheck:
         specs = ctx.state.specs or {}
         guard = specs.get("needrestart_guard")
         what = {"needrestart_guard": guard, "unguarded": specs.get("needrestart_guard_unguarded")}
+        if specs.get("needrestart_guard_reason"):
+            what["reason"] = specs["needrestart_guard_reason"]
         if not isinstance(guard, str):
             what = {"scrape_error": specs.get("needrestart_guard_scrape_error")}
         if guard not in GUARDED and self.write:

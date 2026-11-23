@@ -1,4 +1,5 @@
 import asyncio
+import re
 
 import pytest
 
@@ -118,7 +119,9 @@ async def test_dind_start_is_killed_on_the_node_before_the_container_is_removed(
 
     assert result.success is False
     assert commands[0].startswith(f"timeout -s KILL {dind_probe.DIND_RUN_TIMEOUT_SECONDS} /usr/bin/docker run ")
-    assert "docker rm -fv container_x_9000" in commands[-1]
+    assert re.search(r"docker rm -fv container_x_9000_[0-9a-f]{8}$", commands[-1])
+    # the name the run created is the one removed
+    assert re.search(r"--name (container_x_9000_[0-9a-f]{8}) ", commands[0]).group(1) in commands[-1]
 
 
 @pytest.mark.asyncio
@@ -472,3 +475,28 @@ async def test_batch_keeps_verified_ports_when_cleanup_passes_the_attempt_timeou
     assert result.successful == ports[:7]
     assert verifier.runner.run.await_count == 1  # no second attempt, no fallback tier
     assert len(cleanup_calls) == 1  # the batch container is removed once, after the attempt
+
+
+@pytest.mark.asyncio
+async def test_two_probes_on_one_port_never_share_a_container_name(mocker):
+    # a second probe on the same host and port (another validator or lane) removed a live probe's container by its
+    # shared name, so the first probe's sshd "never answered" and its log read said "No such container"
+    from services.executor_connectivity import dind_probe
+
+    names = []
+
+    async def run(cmd):
+        if "docker run" in cmd:
+            names.append(re.search(r"--name (\S+) ", cmd).group(1))
+            return mocker.Mock(exit_status=125, stdout="", stderr="refused")
+        return mocker.Mock(exit_status=0, stdout="", stderr="")
+
+    ssh_service = mocker.Mock()
+    ssh_service.generate_keypair = mocker.Mock(return_value=("private", "public"))
+    for _ in range(2):
+        await dind_probe.DindVerifier(ssh_service).verify(
+            PortPair(9000, 9000), ssh_client=mocker.Mock(run=run), host="1.2.3.4", container_name_prefix="container_x", sysbox=False
+        )
+
+    assert len(names) == 2 and names[0] != names[1]
+    assert all(name.startswith("container_x_9000_") for name in names)  # rentals still clear probes by the prefix

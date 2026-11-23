@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import secrets
 import socket
 import time
 from typing import Any
@@ -211,8 +212,11 @@ class DindVerifier:
         deadline_monotonic: float | None = None,
     ) -> DindProbeResult:
         """Verify DinD on port. `deadline_monotonic`: the cycle time budget the create must end within."""
-        name = f"{container_name_prefix}_{port.external}"
-        log_ctx = {**(log_ctx or {}), "port": port.internal, "sysbox_requested": sysbox}
+        # unique per probe: every validator names its probe container_<miner hotkey>_<port>, and each probe removes its
+        # name on the way out, so a second probe on the same host and port (another validator, or another lane of
+        # ours) removed a live probe's container mid-check; the prefix stays, rentals clear probes by it
+        name = f"{container_name_prefix}_{port.external}_{secrets.token_hex(4)}"
+        log_ctx = {**(log_ctx or {}), "port": port.internal, "sysbox_requested": sysbox, "probe_container": name}
         run_timeout = DIND_RUN_TIMEOUT_SECONDS
         if deadline_monotonic is not None:
             left = int(deadline_monotonic - time.monotonic())

@@ -7,7 +7,6 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from uuid import UUID
 
-from core.config import settings
 from protocol.vc_protocol.compute_requests import (
     BROKEN_POD_STATUS,
     LIVE_FILLER_RUN_STATUSES,
@@ -28,6 +27,7 @@ from services.const import (
     RENTAL_CLOSE_CLOCK_SKEW_MINUTES,
     RENTAL_TEARDOWN_GRACE_MINUTES,
 )
+from services.container_cleanup import image_repository
 from services.gpu_reset import renter_gpu_resets
 from services.redis_service import (
     EDIT_PARKED_CONTAINER_PREFIX,
@@ -59,6 +59,11 @@ logger = logging.getLogger(__name__)
 # of the executable's basename, or of the script or module an interpreter runs, or the part before "::"
 # of a renamed process title (vLLM's engine child shows as "VLLM::EngineCore"). A repository not
 # listed here is not judged.
+# the name of a child Python's multiprocessing started with `spawn` or `forkserver`: its command line is
+# `python -c "from multiprocessing.spawn import spawn_main; ..." --multiprocessing-fork`, not the program it runs
+MULTIPROCESSING_CHILD = "multiprocessing-child"
+
+
 @dataclass(frozen=True)
 class FillerWorkload:
     strategy: str
@@ -67,10 +72,14 @@ class FillerWorkload:
 
 FILLER_PROCESS_ALLOWLISTS: dict[str, FillerWorkload] = {
     "daturaai/pearl-miner": FillerWorkload("PEARL", ("peakminer",)),
-    # the worker downloads its inference engine at run time; the engine has been vLLM and sonar
-    "daturaai/dolphin": FillerWorkload("DPHN", ("dolphinpod", "sonar", "vllm")),
+    # the worker downloads its inference engine at run time; the engine has been vLLM and sonar, and the engine
+    # starts GPU children through multiprocessing's spawn start method (sonar's P2P probe at engine start)
+    "daturaai/dolphin": FillerWorkload("DPHN", ("dolphinpod", "sonar", "vllm", MULTIPROCESSING_CHILD)),
 }
 _INTERPRETER = re.compile(r"python[0-9.]*")
+# interpreter options that take the next argument as their value (`-W ignore`, `-X faulthandler`)
+_INTERPRETER_OPTIONS_WITH_VALUE = {"-W", "-X", "--check-hash-based-pycs"}
+_MULTIPROCESSING_CHILD_MODULES = ("multiprocessing.spawn", "multiprocessing.forkserver")
 
 
 @dataclass(frozen=True)
@@ -562,11 +571,18 @@ async def _fillers_off_their_image(ctx: Context, names: set[str]) -> list[str]:
 
 def _process_executable_name(cmdline: str) -> str:
     """The name a process runs as: its executable's basename, the script or module an interpreter runs,
-    or the part of a renamed process title before "::"."""
+    MULTIPROCESSING_CHILD for a child multiprocessing started, or the part of a renamed process title before "::"."""
     argv = cmdline.split()
     name = argv[0].rsplit("/", 1)[-1] if argv else ""
     if _INTERPRETER.fullmatch(name):
-        args = [arg for arg in argv[1:] if arg != "-u"]
+        args = argv[1:]
+        # skip the interpreter's own options (multiprocessing passes the parent's, e.g. -s -E -X ...)
+        while args and args[0].startswith("-") and args[0] not in ("-m", "-c"):
+            args = args[2:] if args[0] in _INTERPRETER_OPTIONS_WITH_VALUE else args[1:]
+        if args[:1] == ["-c"]:
+            if args[2:3] and args[1] == "from" and args[2].startswith(_MULTIPROCESSING_CHILD_MODULES):
+                return MULTIPROCESSING_CHILD
+            return "-c"
         if args[:1] == ["-m"]:
             args = args[1:]
         name = args[0].rsplit("/", 1)[-1] if args else name
@@ -577,24 +593,39 @@ async def _foreign_processes_in_fillers(
     ctx: Context, gpu_processes: list[dict], filler_container_names: set[str]
 ) -> list[str]:
     """The GPU processes inside these fillers whose command is not one their workload runs, as
-    "<container> (pid <pid>): <command>". Judged as foreign GPU work only when
-    FILLER_PROCESS_ALLOWLIST_ENFORCED is on, logged either way. Not judged: a process with no scraped
-    command (the scrape could not read it, or a scraper that does not report it), a filler with no
-    readable repository record, or a workload with no allowlist."""
+    "<container> (pid <pid>): <command>", each judged as foreign GPU work. A filler's workload is read from the
+    image its running container reports this cycle, so a filler started before the creation-time record existed
+    is judged too; that record is the cross-check."""
+    running = {
+        str(entry.get("name") or ""): image_repository(str(entry.get("repository") or ""))
+        for entry in ((ctx.state.specs or {}).get("docker") or {}).get("containers") or []
+        if isinstance(entry, dict)
+    }
     workloads: dict[str, FillerWorkload] = {}
     for name in sorted(filler_container_names):
+        recorded = None
         try:
             key = f"{FILLER_IMAGE_REPOSITORY_PREFIX}{name}"
-            repository = await ctx.services.redis.get(key)
-            if repository:
+            recorded = await ctx.services.redis.get(key)
+            if recorded:
                 # a filler can outlive the TTL: keep its record while it is still being checked
                 await ctx.services.redis.expire(key, FILLER_IMAGE_DIGESTS_TTL_SECONDS)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Filler image repository record unreadable, not judging %s: %s", name, exc)
-            continue
-        if isinstance(repository, bytes):  # the prod Redis client returns bytes
-            repository = repository.decode()
-        if workload := FILLER_PROCESS_ALLOWLISTS.get(repository or ""):
+            logger.warning("Filler image repository record unreadable for %s, using its running image: %s", name, exc)
+        if isinstance(recorded, bytes):  # the prod Redis client returns bytes
+            recorded = recorded.decode()
+        live = running.get(name) or None
+        if recorded and live and recorded != live:
+            # the container runs another image than the validator started: judge it by what was started
+            logger.warning(
+                "FILLER_IMAGE_REPOSITORY_MISMATCH executor=%s miner=%s container=%s started=%s running=%s",
+                ctx.executor.uuid,
+                ctx.miner_hotkey,
+                name,
+                recorded,
+                live,
+            )
+        if workload := FILLER_PROCESS_ALLOWLISTS.get(recorded or live or ""):
             workloads[name] = workload
     foreign: list[tuple[str, str]] = []
     for process in gpu_processes:
@@ -607,16 +638,14 @@ async def _foreign_processes_in_fillers(
             foreign.append((workload.strategy, f"{container} (pid {process.get('pid')}): {cmdline}"))
     if not foreign:
         return []
-    enforced = settings.FILLER_PROCESS_ALLOWLIST_ENFORCED
     logger.warning(
-        "FILLER_FOREIGN_PROCESS executor=%s miner=%s processes=%s strategies=%s enforced=%s",
+        "FILLER_FOREIGN_PROCESS executor=%s miner=%s processes=%s strategies=%s",
         ctx.executor.uuid,
         ctx.miner_hotkey,
         [described for _, described in foreign],
         sorted({strategy for strategy, _ in foreign}),
-        enforced,
     )
-    return [described for _, described in foreign] if enforced else []
+    return [described for _, described in foreign]
 
 
 def _foreign_process_remediation(foreign_in_fillers: list[str]) -> dict[str, str]:
