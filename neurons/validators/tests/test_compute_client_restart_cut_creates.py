@@ -1748,6 +1748,44 @@ async def test_an_accepted_dispatch_not_yet_claimed_keeps_the_order_from_expirin
 
 
 @pytest.mark.asyncio
+async def test_a_cleanup_paused_after_its_check_never_expires_an_order_written_meanwhile() -> None:
+    """A's receipt starts the cleanup; it finds nothing unsettled and pauses before its expire. Meanwhile B and C are
+    accepted and finish with unacknowledged successes. The cleanup must not put the expiry on the order that now names
+    C: once it lapsed, the restart replay could pick B instead of the current C."""
+    redis_service = _redis_service()
+    await redis_service.accept_create_dispatch("pod-1", "cmd-a", 1)
+    await redis_service.index_backend_create("pod-1", "exec-1", "cmd-a")
+
+    def created(cmd: str) -> ContainerCreated:
+        return ContainerCreated(
+            miner_hotkey="miner-hk", executor_id="exec-1", pod_id="pod-1", container_name=f"c-{cmd}",
+            volume_name="v-1", port_maps=[(22, 40022)], command_id=cmd,
+        )
+
+    await _finished_create_record(redis_service, "cmd-a", created("cmd-a"))
+    await redis_service.settle_backend_command("cmd-a", 900)
+
+    scan_iter, paused = redis_service.redis.scan_iter, []
+
+    async def scan_then_pause(*args, **kwargs):
+        async for key in scan_iter(*args, **kwargs):
+            yield key
+        if not paused:   # the cleanup has checked every index; B and C land before its expire
+            paused.append(True)
+            for accepted_ns, cmd in ((2, "cmd-b"), (3, "cmd-c")):
+                await redis_service.accept_create_dispatch("pod-1", cmd, accepted_ns)
+                await redis_service.index_backend_create("pod-1", "exec-1", cmd)
+                await _finished_create_record(redis_service, cmd, created(cmd))
+
+    redis_service.redis.scan_iter = scan_then_pause
+    await redis_service.unindex_backend_create("pod-1", "exec-1", "cmd-a")
+
+    assert paused
+    assert await redis_service.current_create_dispatch("pod-1") == "cmd-c"
+    assert await redis_service.redis.ttl(redis_service_module.CREATE_DISPATCH_ORDER_PREFIX + "pod-1") == -1
+
+
+@pytest.mark.asyncio
 async def test_a_create_left_unanswered_by_the_node_queues_nothing() -> None:
     """create_container returns None when this command's container is on the node without a readable reply."""
     redis_service = _redis_service()
