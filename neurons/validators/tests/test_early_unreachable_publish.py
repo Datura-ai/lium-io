@@ -245,8 +245,8 @@ async def test_a_push_mid_cycle_holds_the_early_publish_for_the_rollout_withhold
 
 
 @pytest.mark.asyncio
-async def test_miners_answering_together_share_one_registry_read(monkeypatch):
-    """DAH-6951: one registry read in flight per cycle, shared by every miner answering meanwhile."""
+async def test_one_registry_read_per_cycle_is_shared_by_every_miner(monkeypatch):
+    """DAH-6951: one registry read per cycle, shared by the miners answering meanwhile and reused by later ones."""
     gate = asyncio.Event()
 
     async def slow_read():
@@ -263,9 +263,11 @@ async def test_miners_answering_together_share_one_registry_read(monkeypatch):
     await asyncio.sleep(0)
     gate.set()
     await both
+    # a miner answering later in the cycle reuses the cycle's answer
+    await service.publish_unreachable_early(_job([_result([SSH])]))
 
     reads.assert_awaited_once()
-    assert service.publish_machine_specs.await_count == 2
+    assert service.publish_machine_specs.await_count == 3
 
 
 @pytest.mark.parametrize(

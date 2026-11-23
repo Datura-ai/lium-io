@@ -6,7 +6,7 @@ and converting the validation context into a JobResult for reporting.
 
 import logging
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from datura.requests.miner_requests import ExecutorSSHInfo
 from payload_models.payloads import MinerJobRequestPayload
@@ -89,7 +89,7 @@ class ResultHandler:
         log_text: str,
         success: bool,
         validation_event: ValidationEvent | None = None,
-        hold_reset_for: frozenset[str] = frozenset(),
+        hold_reset: Callable[[dict], bool] | None = None,
     ) -> JobResult:
         """Handle task result by persisting verification data and building JobResult.
 
@@ -101,8 +101,8 @@ class ResultHandler:
             log_text: Log message for this result
             success: Whether validation succeeded
             validation_event: Structured final validation outcome
-            hold_reset_for: a verified-job reset whose own cause (its evidence reason_code) is in this set is not
-                sent here but returned on the JobResult (held_verified_job_reset), for the cycle end to decide (DAH-3405)
+            hold_reset: given a verified-job reset's clear_verified_job_info arguments, files it for the cycle end
+                and returns True, or returns False and the reset is sent here (DAH-3405)
 
         Returns:
             JobResult containing all validation outcomes
@@ -128,15 +128,14 @@ class ResultHandler:
         logger.info(log_text)
 
         # Persist verification data to Redis (unless in DRY_RUN mode)
-        held_reset = None
         if not self.dry_run:
-            held_reset = await self._persist_verification_data(
+            await self._persist_verification_data(
                 miner_hotkey=miner_info.miner_hotkey,
                 executor_id=executor_info.uuid,
                 verified_job_info=verified_job_info,
                 context=context,
                 success=success,
-                hold_reset_for=hold_reset_for,
+                hold_reset=hold_reset,
             )
         else:
             logger.info("DRY_RUN: Skipping Redis persistence")
@@ -302,7 +301,6 @@ class ResultHandler:
             # and cuts the PodStatesReport chunks.
             pod_states=list(context.state.pod_states) or None,
             host_runtime_fault=context.state.host_runtime_fault,
-            held_verified_job_reset=held_reset,
         )
 
     @staticmethod
@@ -377,8 +375,8 @@ class ResultHandler:
         verified_job_info: dict,
         context: Context,
         success: bool,
-        hold_reset_for: frozenset[str] = frozenset(),
-    ) -> dict | None:
+        hold_reset: Callable[[dict], bool] | None = None,
+    ) -> None:
         """Persist verification data to Redis based on validation outcome.
 
         Args:
@@ -387,10 +385,7 @@ class ResultHandler:
             verified_job_info: Previous verification info
             context: Pipeline context with verification state
             success: Whether validation succeeded
-            hold_reset_for: the reset causes whose reset's arguments are returned instead of sent
-
-        Returns:
-            The held reset's clear_verified_job_info arguments, else None
+            hold_reset: see handle_result
         """
         if success:
             # On success, update verification data if we have GPU info
@@ -428,10 +423,8 @@ class ResultHandler:
                     reanchor_uuids=(context.state.gpu_uuids or '') if context.gpu_reanchor else '',
                     respec=(context.state.gpu_model_count or '') if context.gpu_respec else '',
                 )
-                # DAH-6951: the reset's own cause decides, not the run's last event: a finished finding followed by a
-                # session found closed ends the run on the transport, yet its reset is the finding's and goes now
-                if evidence.get("reason_code") in hold_reset_for:
-                    return reset
+                if hold_reset is not None and hold_reset(reset):
+                    return
                 await self.redis_service.clear_verified_job_info(**reset)
             else:
                 # a full set of other cards stays anchored when a later check failed, or it re-anchors every cycle

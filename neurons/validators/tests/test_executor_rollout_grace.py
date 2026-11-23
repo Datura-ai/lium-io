@@ -263,7 +263,7 @@ def _miner_service(published: dict[tuple[str, str], list[dict]]) -> MinerService
     service = MinerService.__new__(MinerService)
     service.cycle_published_availability = published
     service.publish_machine_specs = AsyncMock()
-    service.task_service = SimpleNamespace(held_resets={})
+    service.task_service = SimpleNamespace(take_held_resets=lambda job_batch_id: [])
     return service
 
 

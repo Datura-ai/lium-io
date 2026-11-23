@@ -51,13 +51,16 @@ async def test_a_pod_left_on_old_gpus_is_checked_again_and_its_pass_published(re
 @pytest.mark.asyncio
 async def test_a_rerun_that_fails_again_keeps_the_result_and_publishes_nothing(rest_service):  # noqa: F811
     rest_service.miner_returns(LISTED)
-    _runs(rest_service, _pod_gpus_gone(LISTED), _pod_gpus_gone(LISTED))
+    first = _pod_gpus_gone(LISTED)
+    _runs(rest_service, first, _pod_gpus_gone(LISTED))
 
     out = await request(rest_service, RentedExecutorsResponse(executors={LISTED: rented()}))
 
     assert rest_service.task_service.create_task.await_count == 2
     assert [r.score for r in out["results"] if r.executor_info.uuid == LISTED] == [0.0]
     rest_service.publish_machine_specs.assert_not_awaited()
+    # DAH-6951: the replaced first run is no verdict any more; a reset it held is dropped with it
+    rest_service.task_service.drop_held_resets.assert_called_once_with(result=first)
 
 
 @pytest.mark.asyncio

@@ -105,6 +105,7 @@ async def _cycle(
     rented: bool = True,
     enabled=True,
     miner_hotkey: str = RENTAL_OWNER,
+    persist: bool = True,
 ):
     """One validation cycle as the service runs it: the record from Redis, the checks through the Pipeline, the
     outcome persisted by the ResultHandler."""
@@ -135,6 +136,8 @@ async def _cycle(
         ok, events, ctx = await Pipeline(
             [MachineSpecScrapeCheck(), GpuFingerprintCheck(), TenantEnforcementCheck()], _Sink()
         ).run(ctx)
+    if not persist:
+        return ok, events, ctx
     await ResultHandler(redis_service=service, dry_run=False)._persist_verification_data(
         miner_hotkey="hk", executor_id=EXECUTOR, verified_job_info=verified, context=ctx, success=ok
     )
@@ -187,6 +190,7 @@ async def test_a_dead_gpu_runtime_on_a_rented_node_marks_the_executor_inactive(
         "pod_id": POD_ID,
         "rented_pod_ids": [POD_ID],
         "scrape_error": "no_gpu_details",
+        "host_gpu_fault_reset": True,
         "executor_ip": ctx.executor.address,
         "executor_port": ctx.executor.port,
         "job_batch_id": ctx.config.job_batch_id,
@@ -198,3 +202,25 @@ async def test_a_dead_gpu_runtime_on_a_rented_node_marks_the_executor_inactive(
     assert (record["count"], record["uuids"]) == (0, "GPU-abc123")
 
 
+
+
+@pytest.mark.parametrize("stdout", [NO_GPU_REPORT, _driver_report("NVMLError(15)")], ids=["zero-gpus", "gpu-lost"])
+@pytest.mark.asyncio
+async def test_a_host_confirmed_gpu_fault_reset_is_sent_at_once_inside_a_rollout_window(context_factory, stdout):
+    """r254 (DAH-6951): the scrape's reset for a rented node whose host confirms a dead GPU runtime carries a
+    rollout failure reason (SCRAPE_FAILED_NO_GPU / _DRIVER), but it is a finding, not a read cut short: the wave
+    sends it at once, inside a rollout window too, so billing stops as at base. The window still withholds the
+    run's verdict."""
+    from test_node_account_check import cycle_end, wave_create_task
+
+    service = _redis_service()
+    run = await _cycle(context_factory, service, scrape=_scrape_result(stdout=stdout, exit_code=1), persist=False)
+    assert run[0] is False and run[1][-1].what_we_saw["host_gpu_fault_reset"] is True
+
+    tasks, result = await wave_create_task(run, service)
+    [reset] = _resets(service)
+    assert reset["reason_code"] == run[1][-1].reason_code and tasks.held_resets == {}
+
+    withheld = await cycle_end(tasks, service, result, "withheld")
+    assert [w.result for w in withheld] == [result]
+    assert len(_resets(service)) == 1

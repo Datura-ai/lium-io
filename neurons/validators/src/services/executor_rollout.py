@@ -462,6 +462,33 @@ def _observed_digest(result: JobResult) -> str | None:
     return observed_executor_digest(result.spec or {})
 
 
+def withholdable_reason(score: float, reason: str | None, executor_image_report: dict | None) -> str | None:
+    """The reason a covering window could withhold a run with this score and final reason for (rollout_grace_reason
+    before its window and digest tests), or None when no window ever withholds it."""
+    if score > 0:
+        return None
+    if reason in ROLLOUT_FAILURE_REASONS:
+        return reason
+    outdated = (
+        settings.EXECUTOR_IMAGE_CHECK_ENFORCE
+        and (executor_image_report or {}).get("status") == ImageVerdict.OUTDATED.value
+    )
+    return _OUTDATED if reason in RUN_ENDED_WITHOUT_FAILING and outdated else None
+
+
+def a_rollout_may_withhold_the_reset(
+    evidence: dict, score: float, run_reason: str | None, executor_image_report: dict | None
+) -> bool:
+    """DAH-6951: a verified-job reset waits for the cycle end only when a rollout window could withhold its run
+    (withholdable_reason) and its own cause is a read that did not finish (ROLLOUT_RESET_CAUSES). A finding, the
+    host-confirmed GPU runtime fault of a rented node included, never waits."""
+    return (
+        evidence.get("reason_code") in ROLLOUT_RESET_CAUSES
+        and not evidence.get("host_gpu_fault_reset")
+        and withholdable_reason(score, run_reason, executor_image_report) is not None
+    )
+
+
 def rollout_grace_reason(result: JobResult, window: RolloutWindow, job_block: int) -> str | None:
     """The reason code this result's verdict is withheld for, or None when the verdict stands.
 
@@ -476,18 +503,11 @@ def rollout_grace_reason(result: JobResult, window: RolloutWindow, job_block: in
     its own (pod not running, filler killed) failed for that reason, OUTDATED or not; and a result
     with a score is never touched.
     """
-    if not window.covers(job_block) or result.score > 0:
+    if not window.covers(job_block):
         return None
-    reason = result.failure_reason_code
-    if reason not in ROLLOUT_FAILURE_REASONS:
-        ended_without_failing = reason in RUN_ENDED_WITHOUT_FAILING
-        outdated = (
-            settings.EXECUTOR_IMAGE_CHECK_ENFORCE
-            and (result.executor_image_report or {}).get("status") == ImageVerdict.OUTDATED.value
-        )
-        if not (ended_without_failing and outdated):
-            return None
-        reason = _OUTDATED
+    reason = withholdable_reason(result.score, result.failure_reason_code, result.executor_image_report)
+    if reason is None:
+        return None
     # OUTDATED is withheld whatever the observed digest says: old = not pulled yet, new = the
     # validator's own snapshot predated the push. Every other reason on an executor that already
     # runs the new image is that executor's own failure.

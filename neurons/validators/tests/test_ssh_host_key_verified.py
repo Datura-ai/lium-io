@@ -26,6 +26,7 @@ class _Shell:
 
 def _service(known_hosts: asyncssh.SSHKnownHosts | None) -> TaskService:
     service = TaskService.__new__(TaskService)
+    service.held_resets = {}
     service.redis_service = MagicMock()
     service.ssh_service = MagicMock()
     service.ssh_service.decrypt_payload = MagicMock(return_value="key")

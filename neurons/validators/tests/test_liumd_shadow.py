@@ -1069,6 +1069,7 @@ def _result() -> JobResult:
 
 async def _cycle(pipeline_ctx, *, ok=True, events=PASSED, first_pass=False) -> JobResult:
     service = TaskService.__new__(TaskService)
+    service.held_resets = {}
     service.ssh_service = MagicMock(decrypt_payload=MagicMock(return_value="key"))
     service.attestation_service = MagicMock(
         prepare_host_policy=AsyncMock(return_value=HostPolicyResult())

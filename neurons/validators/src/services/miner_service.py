@@ -582,6 +582,8 @@ class MinerService:
                 and rerun.log_status != "error"
                 and rerun.failure_reason_code != TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason
             ):
+                # DAH-6951: the replaced run is no verdict any more, so a reset it held is stale
+                self.task_service.drop_held_resets(result=raw_results[i])
                 raw_results[i] = rerun
         passed = [r for r in reruns if isinstance(r, JobResult) and r.is_successful]
         logger.info(
@@ -1397,8 +1399,8 @@ class MinerService:
         rollout_digest (no window can open this cycle, RolloutWindow.a_new_window_may_open): never held, no read."""
         if tally.rollout_digest is None or tally.rollout_began:
             return tally.rollout_began
-        # one read in flight per tally, shared by every miner answering meanwhile; a later answer starts a fresh one
-        if tally.digest_read is None or tally.digest_read.done():
+        # one read per cycle, shared by every miner answering
+        if tally.digest_read is None:
             tally.digest_read = asyncio.ensure_future(fetch_executor_image_digest())
         try:
             digest = normalize_sha256_digest(await tally.digest_read)

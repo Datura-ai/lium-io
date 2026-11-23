@@ -265,6 +265,8 @@ def _host_gpu_fault_reset(ctx: Context, failure: ScrapeFailure, check_id: str) -
         "pod_id": pod_ids[0],
         "rented_pod_ids": pod_ids,
         "scrape_error": failure.scrape_error,
+        # DAH-6951: a fault the host confirmed, not a read cut short: the reset is never held for a rollout window
+        "host_gpu_fault_reset": True,
     }
     if failure.gpu_scrape_error is not None:
         evidence["gpu_scrape_error"] = failure.gpu_scrape_error

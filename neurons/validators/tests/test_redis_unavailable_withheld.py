@@ -22,6 +22,7 @@ async def _run_with(error: Exception):
             return False
 
     service = TaskService.__new__(TaskService)
+    service.held_resets = {}
     service.ssh_service = MagicMock()
     service.ssh_service.decrypt_payload = MagicMock(return_value="key")
     service.attestation_service = MagicMock()

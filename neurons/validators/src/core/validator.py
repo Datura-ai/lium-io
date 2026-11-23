@@ -574,6 +574,8 @@ class Validator:
                         ),
                     )
                 )
+                # DAH-6951: the wave's resets a rollout window could withhold wait for this cycle's end
+                self.miner_service.task_service.open_hold_batch = job_batch_id
                 # every listed rented pod's SSH (any status), probed once while the miners work
                 pod_ssh_probe = asyncio.create_task(self.probe_rented_pod_ssh(rented_executors, job_batch_id))
 
@@ -1677,19 +1679,20 @@ class Validator:
     async def send_held_verified_job_resets(self, job_batch_id: str, window: RolloutWindow, job_block: int) -> None:
         """DAH-3405: decide every verified-job reset cycle `job_batch_id`'s wave runs held back: a reset is dropped
         when the rollout window withholds its own result (rollout_grace_reason), and sent otherwise. Each result is
-        judged on itself, whether or not it reached the cycle end (a miner job cancelled at the wait timeout, a run a
-        rerun replaced, a session-lost verdict): what would withhold its verdict drops its reset, nothing else does."""
-        for result in self.miner_service.task_service.held_resets.pop(job_batch_id, []):
-            if rollout_grace_reason(result, window, job_block) is not None:
+        judged on itself, whether or not it reached the cycle end (a miner job cancelled at the wait timeout, a
+        session-lost verdict): what would withhold its verdict drops its reset, nothing else does. A run that raised
+        after holding its reset has no result to withhold: sent."""
+        for held in self.miner_service.task_service.take_held_resets(job_batch_id):
+            if held.result is not None and rollout_grace_reason(held.result, window, job_block) is not None:
                 continue
             try:
-                await self.redis_service.clear_verified_job_info(**result.held_verified_job_reset)
+                await self.redis_service.clear_verified_job_info(**held.reset)
             except Exception as exc:
                 logger.error(
                     _m(
                         "[rollout-grace] could not send a held verified-job reset",
                         extra=get_extra_info(
-                            {**self.default_extra, "executor_uuid": result.executor_info.uuid, "error": str(exc)}
+                            {**self.default_extra, "executor_uuid": held.executor_id, "error": str(exc)}
                         ),
                     ),
                 )

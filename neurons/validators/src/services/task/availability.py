@@ -361,7 +361,7 @@ class RunningOutageTally:
         # or the tracker would open no window on a push this cycle (one opened too recently, or grace off)
         self.rollout_digest = rollout_digest
         self.rollout_began = False
-        # the registry read in flight, shared by the miners answering meanwhile (MinerService._rollout_window_may_open)
+        # the cycle's one registry read, shared by every miner answering (MinerService._rollout_window_may_open)
         self.digest_read: asyncio.Future | None = None
         # the backend's rented list at cycle start: a failure is built before the result knows its rentals
         self.rented_executor_ids = rented_executor_ids
