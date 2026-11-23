@@ -9,8 +9,9 @@ RUN apt-get update && apt-get install -y \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy dependency files
+# Copy dependency files; the shared datura library comes in as a build context (docker_build.sh)
 COPY pyproject.toml pdm.lock* ./
+COPY --from=datura . /datura
 
 # Install PDM and dependencies
 # pdm[locked]: pdm's own dependency pins; plain pdm took hishel 2.0.0, which crashes `pdm install` (DAH-5825)
