@@ -1210,6 +1210,37 @@ async def test_a_host_read_whose_channel_may_still_hold_the_session_stops_the_cr
 
 
 @pytest.mark.asyncio
+async def test_a_timed_out_host_memory_guard_whose_channel_may_still_hold_the_session_stops_the_create(
+    svc_fixture, monkeypatch
+):
+    """Review on lium-io#2405: the guard runs on the host reads' session. A guard that times out and whose channel close
+    is not confirmed may still hold a one-session sshd, so the create stops at the guard's step before the delete
+    check, the filler cleanup or the power restore can put a command on the session."""
+    svc = svc_fixture
+    ssh_client = _wire_customer_create_over_the_host(svc, monkeypatch, probe=_probe_with_containers("filler_x"))
+    answer_through_run = ssh_client.create_process
+
+    async def create_process(command, *args, **kwargs):
+        if command != host_memory_guard_script():
+            return await answer_through_run(command, *args, **kwargs)
+        never = asyncio.Event()  # the guard neither ends nor confirms its channel closed
+        return Mock(wait=AsyncMock(side_effect=never.wait), wait_closed=AsyncMock(side_effect=never.wait), close=Mock())
+
+    ssh_client.create_process = create_process
+    monkeypatch.setattr(ds_module, "HOST_MEMORY_GUARD_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(svc, "_abort_if_cancelled_by_delete", AsyncMock())
+
+    result = await asyncio.wait_for(
+        _run_create_container(svc, _deploy_payload(workload_kind=WorkloadKind.FILLER, active_volume_names=["volume_x"])),
+        timeout=5,
+    )
+
+    assert result.failure_step == ds_module.HOST_MEMORY_GUARD_STEP == "host_memory_guard"
+    svc._abort_if_cancelled_by_delete.assert_not_awaited()
+    svc.probe_prerun_host.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_early_probes_start_only_after_host_reads_succeed_while_docker_connects(
     svc_fixture, monkeypatch
 ):
