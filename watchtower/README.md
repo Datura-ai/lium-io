@@ -7,7 +7,7 @@ Monitors a Docker image for validator-signed updates and automatically pulls and
 1. Finds the runner container: `executor-runner` (the CVM stack), else the one container with the compose label `com.docker.compose.service=executor-runner` (the standard stack, `executor-executor-runner-1`)
 2. Reads the digest of the image that container runs
 3. Fetches the latest authorized digest from the validator-signed endpoint
-4. Verifies the signature using the validator's public key (hotkey)
+4. Verifies the signature using the trusted validator's public key (hotkey; see Validator trust below)
 5. If digests differ, checks that the host's NVIDIA runtime can start a GPU container: a throwaway container from the runner's own image with every GPU requested and the entrypoint `true` (nothing pulled, removed afterwards). The container carries the label `io.lium.watchtower.probe=nvidia-runtime`; a labelled leftover from an earlier cycle is removed before a new one is created, and a leftover that cannot be removed holds the update with no new container. If the probe cannot start, the cycle ends with `Update held` and a `reason_code` (`NVIDIA_RUNTIME_MISMATCH` when the daemon's message says `driver/library version mismatch`, else `RUNTIME_PROBE_FAILED`); the check repeats every cycle, so the update resumes once the host is fixed. A first boot with no runner skips this step.
 6. Pulls `image@digest` (never a tag), then recreates the container from it (10 s stop timeout)
 
@@ -52,7 +52,11 @@ The validator endpoint must return:
 }
 ```
 
-The signature is produced by signing the string `<digest>:<timestamp>` (for example `sha256:abc123...:1234567890`) with the validator's hotkey. `verify_watchtower_signature` checks it with `WATCHTOWER_VALIDATOR_HOTKEY` and refuses a timestamp more than 10 minutes from now.
+The signature is produced by signing the string `<digest>:<timestamp>` (for example `sha256:abc123...:1234567890`) with the validator's hotkey. `verify_watchtower_signature` checks it with the trusted validator hotkey and refuses a timestamp more than 10 minutes from now.
+
+### Validator trust
+
+The trusted validator is the one named in a message signed by the SN51 subnet owner's coldkey, `lium-validator:<validator hotkey>:<revision>` (`datura/datura/validator_trust.py`), the same message the executor and the miner take. The image carries a copy (`src/validator_trust_message.json`); every cycle, before the digest is read, the watchtower reads the current one from `/watchtower/validator-message` next to the digest endpoint. A message is taken when the current subnet owner signed it and its revision is higher than the held one; on any error the held one stays. The owner coldkey is read from the public chain nodes about once an hour (all must agree; otherwise the known owner stays). The container has no volume, so the taken message is kept in memory and a restart starts again from the image copy. While no message is held, `WATCHTOWER_VALIDATOR_HOTKEY` in `src/config.py` is trusted. The start log line reports the trusted validator, its revision and the subnet owner (`validator_trust`); a change is logged as `Validator trust: now trusting ...`. A non-prod build (`config_override.py`) trusts its own `WATCHTOWER_VALIDATOR_HOTKEY` and reads no message.
 
 ## Build & Deploy
 
@@ -87,7 +91,10 @@ pdm run python src/watchtower.py
 ```yaml
 services:
   watchtower:
-    build: ./watchtower
+    build:
+      context: ./watchtower
+      additional_contexts:
+        datura: ./datura
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     env_file:
