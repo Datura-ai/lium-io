@@ -60,3 +60,47 @@ async def test_spec_change_non_fatal_after_rented_fingerprint_failure(context_fa
     assert result.passed is False
     assert result.event.reason_code == Msg.SPEC_CHANGED.reason
     assert result.fatal is False
+
+
+@pytest.mark.parametrize(
+    "verified_spec,new_spec",
+    [
+        ("NVIDIA H100 80GB HBM3:8", "NVIDIA B300 SXM6 AC:8"),
+        ("NVIDIA B300 SXM6 AC:8", "NVIDIA H100 80GB HBM3:8"),
+    ],
+)
+@pytest.mark.parametrize("rented", [False, True])
+@pytest.mark.asyncio
+async def test_other_cards_of_another_model_stay_unverified(verified_spec, new_spec, rented, context_factory):
+    # the fingerprint check re-anchored a full set of other cards this cycle: another machine, not a rename
+    ctx = context_factory(
+        services=build_services(),
+        config=build_context_config(),
+        state=build_state(gpu_model_count=new_spec),
+        verified={"spec": verified_spec},
+    ).model_copy(update={"gpu_reanchor": True, "gpu_fingerprint_passed": True, "rented": rented})
+
+    result = await SpecChangeCheck().run(ctx)
+
+    assert result.passed is False
+    assert result.fatal is True
+    assert result.event.reason_code == Msg.SPEC_CHANGED.reason
+    assert result.updates.get("clear_verified_job_info") is True
+    # the record keeps the node's model and cards, so the next cycle fails the same way
+    assert not result.updates.get("gpu_respec")
+    assert result.updates.get("gpu_reanchor") is False
+
+
+@pytest.mark.asyncio
+async def test_other_cards_of_the_same_card_pair_still_pass(context_factory):
+    ctx = context_factory(
+        services=build_services(),
+        config=build_context_config(),
+        state=build_state(gpu_model_count="NVIDIA B300 SXM6 PC:8"),
+        verified={"spec": "NVIDIA B300 SXM6 AC:8"},
+    ).model_copy(update={"gpu_reanchor": True})
+
+    result = await SpecChangeCheck().run(ctx)
+
+    assert result.passed is True
+    assert "gpu_reanchor" not in result.updates

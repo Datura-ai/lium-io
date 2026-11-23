@@ -101,20 +101,40 @@ async def test_a_re_anchor_is_kept_when_a_later_check_fails_the_cycle(context_fa
 
 
 @pytest.mark.asyncio
-async def test_a_node_on_another_gpu_model_is_reset_once_then_verified_as_it_is_now(context_factory):
-    """Regression: the reset kept the old model:count, so a node moved onto another model failed every cycle."""
+async def test_the_same_cards_under_another_model_name_are_reset_once_then_verified_as_they_are_now(context_factory):
+    """Regression (DAH-6295): the reset kept the old model:count, so renamed cards failed every cycle."""
     service = _redis_service()
     service.publish = AsyncMock()
     handler = ResultHandler(redis_service=service, dry_run=False)
     await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", model="B300 PC")
 
-    ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-003,gpu-004", model="B300 AC")
+    ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", model="B300 AC")
     assert ok is False and record["spec"] == "B300 AC:2" and record["count"] == 0
     assert service.publish.await_count == 1
 
-    ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-003,gpu-004", model="B300 AC")
+    ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", model="B300 AC")
     assert ok is True and record["spec"] == "B300 AC:2" and record["count"] == 1
 
     # a change back is reset again: every model change still costs a fresh audit
-    ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-003,gpu-004", model="B300 PC")
+    ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", model="B300 PC")
     assert ok is False and record["spec"] == "B300 PC:2" and record["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_other_cards_of_another_model_never_verify_under_the_node(context_factory):
+    """Another machine behind the node (a full set of other cards, another model) fails every cycle: the record
+    keeps the node's model and cards, so it is never verified, listed or billed as the other model under this id."""
+    service = _redis_service()
+    service.publish = AsyncMock()
+    handler = ResultHandler(redis_service=service, dry_run=False)
+    await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", model="H100")
+
+    for cycle in (1, 2, 3):
+        ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-003,gpu-004", model="B300")
+        assert ok is False
+        assert record["spec"] == "H100:2" and record["uuids"] == "gpu-001,gpu-002" and record["count"] == 0
+        assert service.publish.await_count == cycle
+
+    # the node's own cards back: verified again
+    ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", model="H100")
+    assert ok is True and record["spec"] == "H100:2" and record["count"] == 1

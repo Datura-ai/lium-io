@@ -773,6 +773,14 @@ class SpecChangeMessages:
         impact="Verification reset; score set to 0",
         remediation="Keep GPU configuration stable between checks.",
     )
+    SPEC_MODEL_CHANGED = MessageTemplate(
+        event="Other GPUs of another model",
+        reason="SPEC_CHANGED",
+        severity="warning",
+        category="env",
+        impact="Node stays unverified; score set to 0",
+        remediation="Put this node's GPUs back, or add the machine as a new node.",
+    )
     SPEC_UNCHANGED = MessageTemplate(
         event="GPU inventory stable",
         reason="SPEC_UNCHANGED",
