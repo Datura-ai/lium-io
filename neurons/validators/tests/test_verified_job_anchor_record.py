@@ -61,6 +61,7 @@ async def _cycle(
     later_check_fails: bool = False,
     model: str = "A100",
     attestation_fails: bool = False,
+    ends_after_fingerprint: bool = False,
 ):
     """One validation cycle as the service runs it: record from Redis, the two GPU-set checks through the real
     Pipeline, the outcome persisted by the ResultHandler. `attestation_fails` adds a fatally failing attestation
@@ -75,6 +76,9 @@ async def _cycle(
         checks.insert(
             1 if order.index(GpuAttestationIdentityCheck) < order.index(SpecChangeCheck) else 2, _AttestationFails()
         )
+    if ends_after_fingerprint:
+        # the run ends before the spec change decision, whatever ends it
+        checks = [GpuFingerprintCheck(), _AttestationFails()]
     ok, events, ctx = await Pipeline(checks, _Sink()).run(ctx)
     await handler._persist_verification_data(
         miner_hotkey="hk", executor_id=EXECUTOR, verified_job_info=verified, context=ctx,
@@ -195,3 +199,23 @@ async def test_other_cards_of_another_model_stay_unverified_when_the_attestation
         assert ok is False and record["spec"] == "H100:2" and record["uuids"] == "gpu-001,gpu-002"
     ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-003,gpu-004", model="B300")
     assert ok is False and record["spec"] == "H100:2" and record["uuids"] == "gpu-001,gpu-002"
+
+
+@pytest.mark.asyncio
+async def test_other_cards_of_another_model_stay_unverified_when_the_run_ends_before_the_spec_change_decision(
+    context_factory,
+):
+    """DAH-7001 review: the re-anchor onto other cards of another model was saved by any run that ended between the
+    fingerprint check and the spec change decision; the next cycle then verified the other model under the node."""
+    service = _redis_service()
+    service.publish = AsyncMock()
+    handler = ResultHandler(redis_service=service, dry_run=False)
+    await _cycle(service, handler, context_factory, uuids="gpu-001,gpu-002", model="H100")
+
+    ok, _, record = await _cycle(
+        service, handler, context_factory, uuids="gpu-003,gpu-004", model="B300", ends_after_fingerprint=True
+    )
+    assert ok is False and record["spec"] == "H100:2" and record["uuids"] == "gpu-001,gpu-002"
+    for _ in range(2):
+        ok, _, record = await _cycle(service, handler, context_factory, uuids="gpu-003,gpu-004", model="B300")
+        assert ok is False and record["spec"] == "H100:2" and record["uuids"] == "gpu-001,gpu-002"

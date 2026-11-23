@@ -152,3 +152,30 @@ async def test_the_run_still_ends_as_the_fingerprint_failure_after_the_rented_ch
         ["executor.validate.rented_state", "gpu.validate.fingerprint"] if rented else ["gpu.validate.fingerprint"]
     )
     assert (end.rented, end.score, end.success, end.clear_verified_job_info) == (False, 0.0, False, True)
+
+
+@pytest.mark.parametrize(
+    "prev_spec,current_spec,reanchored",
+    [
+        ("NVIDIA H100 80GB HBM3:2", "NVIDIA B300 SXM6 AC:2", False),  # another model: another machine
+        ("NVIDIA B300 SXM6 AC:2", "NVIDIA B300 SXM6 PC:2", True),  # one card under two datacenter names
+        ("NVIDIA H100 80GB HBM3:2", "NVIDIA H100 80GB HBM3:2", True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_full_set_is_re_anchored_only_onto_the_records_model(
+    prev_spec, current_spec, reanchored, context_factory
+):
+    """Regression (DAH-7001): other cards of another model were re-anchored here, so any run that ended before the
+    spec change decision saved them as the node's cards and the next cycle verified the other model under the node."""
+    ctx = context_factory(
+        services=build_services(),
+        config=build_context_config(),
+        state=build_state(gpu_uuids="gpu-003,gpu-004", gpu_model_count=current_spec),
+        verified={"uuids": "gpu-001,gpu-002", "spec": prev_spec},
+    )
+
+    result = await GpuFingerprintCheck().run(ctx)
+
+    assert result.passed is True
+    assert result.updates.get("gpu_reanchor", False) is reanchored
