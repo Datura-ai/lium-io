@@ -268,3 +268,97 @@ async def _ensure(ctx: Any, budget: float, started: float) -> LiumdRefresh:
         return LiumdRefresh(True, installed_build.build_sha, changed=True)
     except Exception as exc:  # noqa: BLE001 - a repair failure is reported to the caller
         return LiumdRefresh(False, None, f"{type(exc).__name__}: {exc}"[:300])
+
+
+async def refresh_liumd_from_answer(
+    ctx: Any,
+    build_sha: str | None,
+    target: str | None,
+    *,
+    budget_seconds: float | None = None,
+) -> LiumdRefresh | None:
+    """Refresh from the build the run answered with, without a separate version command."""
+    if not settings.LIUMD_BINARY_REFRESH_ENABLED:
+        return None
+    budget = (
+        DEFAULT_REFRESH_BUDGET_SECONDS
+        if budget_seconds is None
+        else min(DEFAULT_REFRESH_BUDGET_SECONDS, budget_seconds)
+    )
+    if budget <= 0:
+        return LiumdRefresh(False, build_sha, "no task budget for the liumd refresh", skipped=True)
+    started = time.monotonic()
+    try:
+        async with asyncio.timeout(budget):
+            return await _refresh_from_answer(
+                ctx, build_sha or None, target or None, budget, started
+            )
+    except TimeoutError:
+        return LiumdRefresh(False, build_sha, "liumd refresh budget spent", skipped=True)
+
+
+async def _refresh_from_answer(
+    ctx: Any, build_sha: str | None, target: str | None, budget: float, started: float
+) -> LiumdRefresh:
+    try:
+        manifest, error = await _manifest(ctx, min(MANIFEST_TIMEOUT_SECONDS, budget))
+        if manifest is None:
+            if build_sha:
+                return LiumdRefresh(
+                    True,
+                    build_sha,
+                    f"manifest unavailable, using local liumd: {error or 'unknown error'}",
+                )
+            return LiumdRefresh(False, None, error or "manifest unavailable")
+        expected_build = manifest.get("build_sha")
+        if not isinstance(expected_build, str) or not expected_build:
+            return LiumdRefresh(False, build_sha, "manifest has no build_sha")
+        if build_sha == expected_build:
+            return LiumdRefresh(True, expected_build)
+
+        arch = _target_arch(target) or await _host_arch(ctx)
+        if arch is None:
+            return LiumdRefresh(False, build_sha, "unsupported host architecture")
+        entry = _manifest_entry(manifest, arch)
+        if entry is None:
+            return LiumdRefresh(False, build_sha, "manifest has no binary for this arch")
+        filename, expected_sha = entry
+
+        remaining = budget - (time.monotonic() - started)
+        if remaining < MIN_DOWNLOAD_BUDGET_SECONDS:
+            return LiumdRefresh(
+                False, build_sha, "no task budget for the liumd download", skipped=True
+            )
+        url = urljoin(settings.LIUMD_BINARY_MANIFEST_URL, filename)
+        fetched_sha, error = await _download(ctx, url, max(1, int(remaining)))
+        if fetched_sha is None:
+            return LiumdRefresh(False, build_sha, error or "download failed")
+        if fetched_sha != expected_sha:
+            return LiumdRefresh(False, build_sha, "downloaded sha256 does not match manifest")
+
+        install = await _run(
+            ctx,
+            f"install -m 0755 {shlex.quote(TMP_BINARY)} {shlex.quote(settings.LIUMD_BINARY_PATH)}"
+            f" && sha256sum {shlex.quote(settings.LIUMD_BINARY_PATH)}",
+            30,
+        )
+        if not install.success:
+            return LiumdRefresh(
+                False,
+                build_sha,
+                (install.stderr or install.stdout or "install failed")[-300:],
+            )
+        installed_sha = None
+        for line in (install.stdout or "").splitlines():
+            parts = line.split()
+            if (
+                parts
+                and len(parts[0]) == 64
+                and all(c in "0123456789abcdef" for c in parts[0])
+            ):
+                installed_sha = parts[0]
+        if installed_sha != expected_sha:
+            return LiumdRefresh(False, build_sha, "installed binary sha256 does not match manifest")
+        return LiumdRefresh(True, expected_build, changed=True)
+    except Exception as exc:  # noqa: BLE001 - a repair failure is reported to the caller
+        return LiumdRefresh(False, build_sha, f"{type(exc).__name__}: {exc}"[:300])

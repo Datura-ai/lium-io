@@ -23,10 +23,10 @@ jobs:
       run:
         working-directory: packages/lium-core
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
       with:
         python-version: '3.11'
 
@@ -52,7 +52,7 @@ jobs:
       run: twine check dist/*
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
         name: dist
         path: packages/lium-core/dist/
@@ -115,14 +115,24 @@ jobs:
           fail "can_admins_bypass is not false; a repository admin could start this job without a reviewer's approval"
 
     - name: Download artifact
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
       with:
         name: dist
         path: dist/
 
     - name: Publish package distributions to PyPI
-      uses: pypa/gh-action-pypi-publish@release/v1
+      # the published image by digest, not the upstream action: its generated runs.image uses a movable
+      # GHCR tag in every revision, so a repointed tag would run new code with PyPI OIDC rights
+      uses: docker://ghcr.io/pypa/gh-action-pypi-publish@sha256:411241df99067c98b6d08fd8e26d14e86740a22460599c2af571e6dc26e27ffc # v1.14.3 image (GHCR tag 7245906fb61f)
       with:
+        # the image reads only these INPUT_* values (no action.yml defaults), so the upstream defaults are written out
+        user: __token__
+        # the entrypoint reads INPUT_PASSWORD under set -u; empty selects Trusted Publishing
+        password: ''
+        repository-url: https://upload.pypi.org/legacy/
+        packages-dir: dist/
+        verify-metadata: true
+        skip-existing: false
         attestations: true
         verbose: true
         print-hash: true

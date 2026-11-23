@@ -783,8 +783,8 @@ class SpecChangeMessages:
 
 
 class GpuFingerprintMessages:
-    # A set that lost or gained cards (a full set of other cards is re-anchored, not this). Its what_we_saw carries
-    # `anchor_hard_would_be`: GPU_MISSING (only anchored cards missing) or ANCHOR_BROKEN (other cards among them).
+    # A set with cards outside the anchor (a full set of other cards is re-anchored, not this). Its what_we_saw
+    # carries `anchor_hard_would_be`: ANCHOR_BROKEN.
     UUID_CHANGED = MessageTemplate(
         event="GPU fingerprints changed",
         reason="GPU_UUID_CHANGED",
@@ -794,7 +794,7 @@ class GpuFingerprintMessages:
         remediation="Ensure every GPU of the node stays attached and visible. A node that comes back with the same "
         "number of GPUs, all of them other cards, is verified again on its own.",
     )
-    # Hard mode: the scrape lists a strict subset of the anchored set. Transient by definition: the node
+    # The scrape lists a strict subset of the anchored set. Transient by definition: the node
     # scores again on the first cycle that shows the full set.
     GPU_MISSING = MessageTemplate(
         event="GPU missing from the listed set",
@@ -1799,7 +1799,7 @@ NO_OUTBOUND_INTERNET_REMEDIATION = (
 
 
 class OutboundInternetMessages:
-    # the rental probe's egress step, under NO_OUTBOUND_INTERNET_ENFORCEMENT_ENABLED
+    # the rental probe's egress step
     NO_OUTBOUND_INTERNET = MessageTemplate(
         event="Containers cannot reach the internet",
         reason="NO_OUTBOUND_INTERNET",
@@ -2770,13 +2770,6 @@ class SpecFloorMessages:
             "Report the machine's real specs: at least one CPU core, 4 GB of RAM per GPU, one card per "
             "counted GPU, and each card's own GPU UUID."
         ),
-    )
-    WARNING = MessageTemplate(
-        event="Hardware specs below the floor",
-        reason="SPEC_FLOOR_REJECTED",
-        severity="warning",
-        category="env",
-        impact="Warning only: score unchanged",
     )
 
 

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 
-from core.config import settings
 from services.redis_service import GPU_ANCHOR_KEY
 
 from ..messages import GpuFingerprintMessages as Msg, render_message
@@ -53,8 +52,7 @@ class GpuFingerprintCheck:
     GPU UUIDs listed by two nodes at once is judged by DuplicateExecutorCheck, not here.
 
     Any other difference (cards missing, or a card count that changed) is fatal with a verification reset and
-    keeps the anchor: GPU_UUID_CHANGED, or under GPU_ANCHOR_HARD_ENABLED (DAH-3457) GPU_MISSING when only
-    anchored cards are missing. The node passes again on the first cycle that shows the full set. This check runs
+    keeps the anchor: GPU_MISSING (DAH-3457) when only anchored cards are missing, GPU_UUID_CHANGED otherwise. The node passes again on the first cycle that shows the full set. This check runs
     before SpecChangeCheck (pipeline_factory), so every such change is filed here, and SpecChangeCheck only fires
     when the UUIDs match but the model:count string differs.
 
@@ -75,7 +73,6 @@ class GpuFingerprintCheck:
         verified = ctx.verified or {}
         prev_uuids = verified.get(GPU_ANCHOR_KEY) or ""
         current_uuids = ctx.state.gpu_uuids or ""
-        hard = settings.GPU_ANCHOR_HARD_ENABLED
 
         anchor = split_uuids(prev_uuids)
         current = split_uuids(current_uuids)
@@ -114,7 +111,7 @@ class GpuFingerprintCheck:
                 "unexpected": unexpected,
                 **seen,
             }
-            if hard and decision == DECISION_GPU_MISSING:
+            if decision == DECISION_GPU_MISSING:
                 event = render_message(Msg.GPU_MISSING, ctx=ctx, check_id=self.check_id, what=what)
             else:
                 event = render_message(
