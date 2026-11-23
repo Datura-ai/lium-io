@@ -456,3 +456,23 @@ async def test_a_deploy_keeps_the_open_streak_saved_under_the_uuid_alone():
         ctx, _, _ = make_ctx(SLOW, redis=redis)
         res = await ContainerDownloadSpeedCheck().run(ctx)
     assert not res.passed and res.event.reason_code == Msg.SLOW.reason
+
+
+def test_the_upload_body_has_no_nul_bytes(tmp_path):
+    # BusyBox wget sends a --post-file body through strlen(), so a NUL body goes out empty and the upload reads fast
+    import os
+    import subprocess
+
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    (stub / "timeout").write_text('#!/bin/sh\nshift\nexec "$@"\n')
+    (stub / "wget").write_text(
+        '#!/bin/sh\nfor a; do case "$a" in --post-file=*) cp "${a#--post-file=}" "$OUT";; esac; done\nexit 0\n'
+    )
+    for f in stub.iterdir():
+        f.chmod(0o755)
+    out = tmp_path / "body"
+    env = {**os.environ, "PATH": f"{stub}:{os.environ['PATH']}", "OUT": str(out)}
+    subprocess.run(["sh", "-c", module._FETCH_SCRIPT], env=env, check=True, capture_output=True, timeout=60)
+    body = out.read_bytes()
+    assert len(body) == module.CAP_BYTES and b"\0" not in body

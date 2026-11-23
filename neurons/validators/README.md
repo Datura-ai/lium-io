@@ -86,8 +86,6 @@ Code: `src/services/executor_connectivity/port_selector.py` (`select`, `tally_po
 
 The VerifyX speed test runs on the host network. A renter's container goes through the docker bridge and NAT and can get far less, so on an idle node (no pod, no filler) the validator also starts a throwaway `alpine:3.19` container (with `sysbox-runc` where the node has it) once every `CONTAINER_DOWNLOAD_SPEED_INTERVAL_HOURS` (6) and reads up to 16 MiB of a pinned PyPI wheel (files.pythonhosted.org) and a pinned Hugging Face file, 30 s each. The same container then uploads a test file to Cloudflare's speed-test endpoint, the reference the host-side VerifyX test uses. Each run logs `CONTAINER_DOWNLOAD_SPEED` with endpoint (`pypi`, `hf`, `cf_up`), bytes, seconds and Mbps, or an error kind (`dns_failed`, `unreachable`, `timeout`, `connection_reset`, `http_error`, `no_output`, `other`).
 
-A reading fails when both downloads are slow. It also fails when one download, or the upload, is slow on this node while the same endpoint is fast for other providers' nodes: an endpoint that is slow for everyone is that endpoint's problem, not this node's path.
-
 A node whose container downloads are too slow or cannot connect in two readings in a row (the second 30 min after the first), both on the `lium-rentals` network, fails: `CONTAINER_DOWNLOAD_SLOW` (score 0, until a reading passes). A streak with a default-bridge reading is only logged as `CONTAINER_DOWNLOAD_SLOW_OBSERVED`. An endpoint the validator cannot reach either, an HTTP error or a container that did not start is no verdict.
 
 Code: `src/services/task/checks/container_download_speed.py`.

@@ -46,8 +46,7 @@ CAP_BYTES = 16 * 1024 * 1024
 FETCH_TIMEOUT_SECONDS = 30
 # container start plus both fetches and the upload, each with its timeout's grace
 COMMAND_TIMEOUT_SECONDS = 150
-# A slow endpoint is that endpoint's path, not the node's, only while other providers' nodes read it slow too in the
-# fleet window; without enough of their readings, or an unreadable window, a missing control never fails a node.
+# the fleet comparison for a slow endpoint (_fleet_reads_slow); the rule is on DAH-6887
 FLEET_WINDOW_SECONDS = 3600
 FLEET_SLOW_SHARE = 0.25
 FLEET_MIN_READINGS = 20
@@ -77,7 +76,7 @@ _FETCH_SCRIPT = (
     # wget cannot say how much of a body went out, so an upload reads CAP_BYTES on success and nothing otherwise
     + "; upl() { head -c "
     + str(CAP_BYTES)
-    + " /dev/zero >/tmp/u; s=$(up); "
+    + " /dev/zero | tr '\\0' a >/tmp/u; s=$(up); "
     f"timeout {FETCH_TIMEOUT_SECONDS} wget -q -O /dev/null --post-file=/tmp/u \"$2\" 2>/tmp/e; rc=$?; e=$(up); "
     f'n=0; [ "$rc" = 0 ] && n={CAP_BYTES}; rm -f /tmp/u; '
     f'echo "{MARKER} ep=$1 bytes=$n start=$s end=$e rc=$rc"; '
@@ -220,10 +219,10 @@ async def _record_fleet(ctx: Context, readings: list[EndpointReading], now: floa
 
 
 async def _fleet_reads_slow(ctx: Context, endpoint: str, now: float) -> bool:
-    """Other providers' nodes read this endpoint slow too in the window (this provider's own nodes do not count)."""
+    """Whether the fleet comparison attributes a slow reading of this endpoint to the endpoint (DAH-6887)."""
     try:
         members = await ctx.services.redis.endpoint_speeds_since(endpoint, now - FLEET_WINDOW_SECONDS)
-    except Exception:  # noqa: BLE001 — no control: keep the excuse
+    except Exception:  # noqa: BLE001 — no comparison available
         logger.warning(_m("Endpoint fleet window unreadable", extra=get_extra_info(ctx.default_extra)))
         return True
     others = [m.rsplit("|", 1)[-1] for m in members if m.split("|", 1)[0] != ctx.miner_hotkey]
@@ -275,7 +274,7 @@ class ContainerDownloadSpeedCheck:
 
     Every measurement is logged as CONTAINER_DOWNLOAD_SPEED. A reading fails when every measured download is below
     CONTAINER_DOWNLOAD_SPEED_MIN_MBPS; when one download, or the upload (CONTAINER_UPLOAD_SPEED_MIN_MBPS), is slow
-    while other providers' nodes read that endpoint fast (FLEET_SLOW_SHARE); or when the container cannot reach an
+    and the fleet comparison does not attribute it to the endpoint; or when the container cannot reach an
     endpoint (DNS, refused, nothing read in time) that the validator itself reaches. An endpoint the validator cannot reach either, an HTTP error, or a
     container that did not run is no verdict. READINGS_BEFORE_VERDICT failing readings in a row (the second
     RETRY_SECONDS after the first) are the finding: a fail (CONTAINER_DOWNLOAD_SLOW, score 0) that stands
@@ -369,8 +368,8 @@ class ContainerDownloadSpeedCheck:
         return readings
 
     async def _judge(self, ctx: Context, readings: list[EndpointReading]) -> Judgement:
-        """Slow on every measured download fails. Any other slow endpoint (one download, or the upload) fails unless
-        other providers' nodes read it slow too in the fleet window: then it is that endpoint's path, not the node's."""
+        """Slow on every measured download fails. Any other slow endpoint (one download, or the upload) fails unless the
+        fleet comparison attributes it to the endpoint."""
         now = time.time()
         await _record_fleet(ctx, readings, now)
         downloads = [r for r in readings if r.mbps is not None and r.endpoint not in _UPLOAD_NAMES]
