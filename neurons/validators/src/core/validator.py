@@ -15,6 +15,7 @@ from incentive.eligibility import earns_spot_rental_incentive, is_missing_discor
 from incentive.factory import IncentiveFactory
 from incentive.rental_price import precompute_all_estimates
 from payload_models.payloads import MinerJobRequestPayload
+import redis.exceptions
 from services.attestation_service import AttestationService
 from services.default_docker_image_digest_service import (
     fetch_default_image_digests,
@@ -555,28 +556,7 @@ class Validator:
                                 extra=get_extra_info({**self.default_extra, "error": str(exc)}),
                             ),
                         )
-                # DAH-5635: a fresh running share per cycle. None inside an executor rollout window,
-                # where the cycle withholds an unreachable verdict that an early publish would leak.
-                # DAH-6951: a window this cycle's end opens (a push mid-cycle) is caught by the tally's rollout_digest,
-                # set only when the tracker would open one on a push now
-                self.miner_service.outage_tally = (
-                    None
-                    if rollout_window.covers(job_block)
-                    else RunningOutageTally(
-                        job_batch_id,
-                        frozenset(
-                            str(executor_id).lower()
-                            for executor_id in (rented_executors.executors if rented_executors else {})
-                        ),
-                        rollout_digest=(
-                            rollout_window.digest
-                            if rollout_window.grace_cycles > 0 and rollout_window.a_new_window_may_open()
-                            else None
-                        ),
-                    )
-                )
-                # DAH-6951: the wave's resets a rollout window could withhold wait for this cycle's end
-                self.miner_service.task_service.open_hold_batch = job_batch_id
+                self.open_wave_tally_and_holds(job_batch_id, rollout_window, job_block, rented_executors)
                 # every listed rented pod's SSH (any status), probed once while the miners work
                 pod_ssh_probe = asyncio.create_task(self.probe_rented_pod_ssh(rented_executors, job_batch_id))
 
@@ -1498,6 +1478,38 @@ class Validator:
         publish.add_done_callback(self.early_publishes.discard)
         return job
 
+    def open_wave_tally_and_holds(
+        self, job_batch_id: str, rollout_window: RolloutWindow, job_block: int, rented_executors
+    ) -> None:
+        """The wave's running outage share and its reset holds, set at cycle start."""
+        # DAH-5635: a fresh running share per cycle. None inside an executor rollout window,
+        # where the cycle withholds an unreachable verdict that an early publish would leak.
+        # DAH-6951: a window this cycle's end opens (a push mid-cycle) is caught by the tally's rollout_digest,
+        # set only when the tracker would open one on a push now
+        covered = rollout_window.covers(job_block)
+        tally = self.miner_service.outage_tally = (
+            None
+            if covered
+            else RunningOutageTally(
+                job_batch_id,
+                frozenset(
+                    str(executor_id).lower()
+                    for executor_id in (rented_executors.executors if rented_executors else {})
+                ),
+                rollout_digest=(
+                    rollout_window.digest
+                    if rollout_window.grace_cycles > 0 and rollout_window.a_new_window_may_open()
+                    else None
+                ),
+            )
+        )
+        # DAH-6951: the wave holds its resets for the cycle end only when a rollout window could withhold this
+        # cycle's verdicts; otherwise none is held and each is sent at once, as at base, so a later pass of the
+        # node cannot drop it
+        self.miner_service.task_service.open_hold_batch = (
+            job_batch_id if covered or tally.rollout_digest is not None else None
+        )
+
     async def stop_early_publishes(self) -> None:
         for publish in self.early_publishes:
             publish.cancel()
@@ -1682,9 +1694,10 @@ class Validator:
         when the rollout window withholds its own result (rollout_grace_reason), and sent otherwise. Each result is
         judged on itself, whether or not it reached the cycle end (a miner job cancelled at the wait timeout, a
         session-lost verdict): what would withhold its verdict drops its reset, nothing else does. A run that raised
-        after holding its reset has no result to withhold: sent. A reset that cannot be sent makes its run
-        VALIDATOR_REDIS_UNAVAILABLE, as the same error did at base: the next withhold step takes that verdict out of
-        the cycle, so the node is neither scored nor published without its reset, and the next cycle checks it again."""
+        after holding its reset has no result to withhold: sent. A reset Redis cannot take (a connection or timeout
+        error) makes its run VALIDATOR_REDIS_UNAVAILABLE, as the same error did at base: the next withhold step takes
+        that verdict out of the cycle, so the node is neither scored nor published without its reset, and the next
+        cycle checks it again. Any other error ends the run as base's generic pipeline error did."""
         for held in self.miner_service.task_service.take_held_resets(job_batch_id):
             if held.result is not None and rollout_grace_reason(held.result, window, job_block) is not None:
                 continue
@@ -1692,11 +1705,17 @@ class Validator:
                 await self.redis_service.clear_verified_job_info(**held.reset)
             except Exception as exc:
                 if held.result is not None:
-                    held.result.failure_reason_code = VALIDATOR_REDIS_UNAVAILABLE
-                    held.result.availability_errors = None
+                    if isinstance(exc, (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError)):
+                        held.result.failure_reason_code = VALIDATOR_REDIS_UNAVAILABLE
+                        held.result.availability_errors = None
+                    else:
+                        # any other error ends the run as base's generic pipeline error did: scored, not withheld
+                        held.result.failure_reason_code = None
+                        held.result.availability_errors = []
+                        held.result.log_status = "error"
                 logger.error(
                     _m(
-                        "[rollout-grace] could not send a held verified-job reset; its verdict is withheld",
+                        "[rollout-grace] could not send a held verified-job reset",
                         extra=get_extra_info(
                             {**self.default_extra, "executor_uuid": held.executor_id, "error": str(exc)}
                         ),

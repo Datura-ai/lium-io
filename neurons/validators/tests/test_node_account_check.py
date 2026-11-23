@@ -674,3 +674,72 @@ def test_held_resets_are_kept_per_cycle_and_a_replaced_run_drops_its_own():
     assert [h.executor_id for h in service.held_resets["batch-1"]] == ["node-2"]
     assert [h.executor_id for h in service.take_held_resets("batch-1")] == ["node-2"]
     assert service.open_hold_batch is None and list(service.held_resets) == ["batch-2"]
+
+
+@pytest.mark.parametrize(
+    "window, held",
+    [
+        # grace off: no window ever withholds, so nothing is held
+        (dict(opened_job_block=None, cycles_seen=0, grace_cycles=0), False),
+        # a window closed one cycle ago and no new one may open yet: nothing this cycle can be withheld
+        (dict(opened_job_block=7000, cycles_seen=3, grace_cycles=2), False),
+        # a covering window, or a push mid-cycle may open one at its end: held for the cycle end
+        (dict(opened_job_block=7500, cycles_seen=1, grace_cycles=2), True),
+        (dict(opened_job_block=None, cycles_seen=0, grace_cycles=2), True),
+    ],
+    ids=["grace-off", "window-just-closed", "window-covers", "window-may-open"],
+)
+async def test_a_reset_is_held_only_in_a_cycle_a_rollout_window_could_withhold(monkeypatch, window, held):
+    """r269: a cycle no rollout window can withhold holds no reset. A closed-session failure's reset is sent at once,
+    as at base, so a later express pass of the same node cannot drop it."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    from core.validator import Validator
+    from services.executor_rollout import RolloutWindow
+    from services.task.service import TaskService
+
+    service = TaskService.__new__(TaskService)
+    service.held_resets, service.open_hold_batch = {}, "an-earlier-batch"
+    validator = Validator.__new__(Validator)
+    validator.miner_service = SimpleNamespace(task_service=service, outage_tally=None)
+    validator.open_wave_tally_and_holds(
+        "batch-1",
+        RolloutWindow(digest="sha256:" + "b" * 64, previous_digest=None, started_at=None, **window),
+        7500,
+        None,
+    )
+    assert service.open_hold_batch == ("batch-1" if held else None)
+
+    run = await _account_run(monkeypatch)
+    redis = MagicMock(clear_verified_job_info=AsyncMock())
+    await wave_create_task(run, redis, service=service)
+    assert redis.clear_verified_job_info.await_count == (0 if held else 1)
+
+    # the provider asks for a recheck and the express pass of the same node passes
+    passed = (True, run[1][:1], run[2].model_copy(update={"success": True}))
+    handler = MagicMock()
+    handler.return_value.handle_result = AsyncMock(return_value=MagicMock(score=1.0, availability_errors=None))
+    await wave_create_task(passed, redis, service=service, handler=handler)
+
+    await cycle_end(service, redis, None, "stands")
+    assert redis.clear_verified_job_info.await_count == (0 if held else 1)
+
+
+async def test_a_held_reset_failing_on_another_error_follows_the_base_error_path(monkeypatch):
+    """r269: only a Redis connection or timeout error withholds the verdict (VALIDATOR_REDIS_UNAVAILABLE, as at base);
+    any other error ends the run as base's generic pipeline error did: scored, not withheld."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from services.task.models import VALIDATOR_REDIS_UNAVAILABLE
+
+    run = await _account_run(monkeypatch)
+    redis_service = MagicMock(clear_verified_job_info=AsyncMock())
+    service, result = await wave_create_task(run, redis_service)
+    redis_service.clear_verified_job_info.side_effect = ValueError("malformed reset")
+
+    withheld = await cycle_end(service, redis_service, result, "stands")
+
+    redis_service.clear_verified_job_info.assert_awaited_once()
+    assert withheld == []
+    assert result.failure_reason_code != VALIDATOR_REDIS_UNAVAILABLE and result.log_status == "error"
