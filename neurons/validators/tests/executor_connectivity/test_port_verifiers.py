@@ -34,6 +34,21 @@ async def test_semi_batch_fails_a_chunk_that_does_not_answer_in_time(mocker):
 
 
 @pytest.mark.asyncio
+async def test_semi_batch_publishes_a_mapped_port_on_the_host_port_the_router_forwards_to(mocker):
+    # port_mappings: the router forwards external 40000 to host port 9000, where a rental pod binds
+    ports = [PortPair(9000, 40000)]
+    runner = mocker.Mock()
+    runner.run = mocker.AsyncMock(return_value=CONTAINER_STARTED)
+    runner.cleanup = mocker.AsyncMock()
+    port_tester = mocker.Mock()
+    port_tester.test_many = mocker.AsyncMock(side_effect=lambda _s, _h, chunk, *_a: (chunk, []))
+
+    await SemiBatchVerifier(port_tester, runner).verify(ports, ssh_client=mocker.Mock(), host="1.2.3.4")
+
+    assert runner.run.await_args.args[3] == "-p 9000:9000"
+
+
+@pytest.mark.asyncio
 async def test_fallback_stops_when_a_container_start_hangs(mocker):
     # DAH-5419: a stuck docker daemon held the start until the task was dropped with no result
     ports = [PortPair(9000 + i, 9000 + i) for i in range(10)]

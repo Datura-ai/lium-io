@@ -581,8 +581,9 @@ class SemiBatchVerifier:
         token = uuid.uuid4().hex
         container_name = f"port_test_pub_{token[:8]}"
         script = NetcatScript.batch(ports, token, 0)
-        # external differs from internal when the miner advertises port_mappings
-        publish_flags = " ".join(f"-p {port.external}:{port.internal}" for port in ports)
+        # -p is HOST:CONTAINER; with port_mappings the router forwards external to the host's internal
+        # port, where rental pods bind too, so the host side is internal like the other tiers
+        publish_flags = " ".join(f"-p {port.internal}:{port.internal}" for port in ports)
 
         # any error below must not escape: an exception here would zero the whole
         # verification (fatal PortCountCheck) instead of falling through to the
