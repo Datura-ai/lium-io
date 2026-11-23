@@ -604,6 +604,9 @@ async def _operation_state(
         f"elif {_live(files.launcher, files)}; then echo RUNNING; "
         f"elif test -s {status_path}; then printf 'STATUS:'; cat {status_path}; "
         "else echo EXITED; fi;; esac; "
+        # the wrapper publishes the status before it removes the pid, so a pid gone since the first read means the
+        # status is there now: read it again before calling the runner not started
+        f"elif test -s {status_path}; then printf 'STATUS:'; cat {status_path}; "
         "else echo STARTING; fi"
     )
     result = await ssh_client.run(command, check=False)

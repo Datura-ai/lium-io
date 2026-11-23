@@ -528,6 +528,26 @@ def test_a_finished_runner_whose_wrapper_is_still_publishing_reads_as_running_th
     assert aio.run(storage_operations._operation_state(ssh, files)) == "STATUS:0"
 
 
+def test_a_wrapper_that_publishes_between_the_two_reads_gives_the_status_not_starting(node: Path) -> None:
+    # review at 4e85079: status read empty, then the wrapper publishes it and removes the pid before the pid read
+    import asyncio as aio
+    import shlex
+
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    status, pid = shlex.quote(str(files.status)), shlex.quote(str(files.pid))
+    Path(str(files.pid)).write_text("999999999\n")
+    Path(f"{files.status}.tmp").write_text("0\n")
+    publish = f"mv {shlex.quote(str(files.status) + '.tmp')} {status}; rm -f {pid}; "
+
+    async def run_with_publication_between_the_reads(command: str, check: bool = False) -> SimpleNamespace:
+        probe = f"elif test -s {pid};"
+        assert probe in command
+        return await _run_locally(command.replace(probe, f"elif {publish}test -s {pid};", 1), check)
+
+    ssh = SimpleNamespace(run=run_with_publication_between_the_reads)
+    assert aio.run(storage_operations._operation_state(ssh, files)) == "STATUS:0"
+
+
 def test_a_dispatch_never_sweeps_another_operations_lock(node: Path) -> None:
     _runner(node, "raise SystemExit(0)\n")
     other = node / "22222222-2222-4222-8222-222222222222.lock"
