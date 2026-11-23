@@ -1251,3 +1251,39 @@ async def test_a_measured_run_seeds_the_kept_ema_for_a_node_already_inactive(con
     assert result.event.reason_code == Msg.STANDING_PROBE_FAILURE_SKIPPED.reason
     assert verifyx_service.called_with is None
     assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(500.0)
+
+
+_KEPT_POD = "11111111-2222-3333-4444-555555555555"
+_KB_PER_GB = 1024 * 1024
+
+
+def _kept_volume_state(by_volume: dict | None, kept_ids: list[str]):
+    hard_disk = {} if by_volume is None else {"by_volume": by_volume}
+    return build_state(
+        specs={"gpu": {"count": 8}, "hard_disk": hard_disk},
+        rented_data=RentedExecutorsResponse(
+            executors={}, banned_guids=[], network_ema={}, retained_volume_pod_ids=kept_ids
+        ),
+    )
+
+
+@pytest.mark.parametrize("first_pass", [False, True])
+@pytest.mark.asyncio
+async def test_a_kept_volume_claim_never_lowers_the_storage_floor(context_factory, monkeypatch, first_pass):
+    # review: the per-volume size is the node's own report, so an oversized claim for a retained id must not
+    # lower the floor this challenge measures independently
+    monkeypatch.setattr(verifyx_module.settings.verifyx, "STORAGE_MIN_AVAILABLE_GB", 100)
+    monkeypatch.setattr(verifyx_module.settings, "MIN_FREE_DISK_GB", 50)
+    verifyx_service = DummyVerifyXService(
+        success=True, updated_specs={"network": {"download_speed": 510.0, "upload_speed": 100.0}}
+    )
+    ctx = context_factory(
+        services=build_services(verifyx=verifyx_service),
+        config=build_context_config(first_pass=first_pass),
+        state=_kept_volume_state({f"volume_{_KEPT_POD}": 500 * _KB_PER_GB}, [_KEPT_POD]),
+    )
+
+    await VerifyXCheck().run(ctx)
+
+    overrides = verifyx_service.called_with.get("challenge_config_overrides") or {}
+    assert "storage_min_available_gb" not in overrides
