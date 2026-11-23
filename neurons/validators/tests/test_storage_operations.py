@@ -843,7 +843,7 @@ def test_a_launch_cut_by_a_hangup_while_receiving_its_spec_removes_the_partial_c
 def test_a_launch_waiting_for_the_lock_leaves_the_holders_partial_spec_alone(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # review at 42e8268: a second launch that times out on the lock must not remove the spec the holder is receiving
+    # review at 42e8268: a second launch cut while it waits for the lock must not remove the spec the holder receives
     import fcntl
 
     _patch_launch(monkeypatch, tmp_path)
@@ -861,14 +861,120 @@ def test_a_launch_waiting_for_the_lock_leaves_the_holders_partial_spec_alone(
         asyncio.run(storage_operations.start_storage_operation(
             SimpleNamespace(run=capture), "sh", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
         ))
-    launch = next(c for c in commands if "nohup" in c).replace("flock -w 30 9", "flock -w 0.2 9")
+    launch = next(c for c in commands if "nohup" in c)
     part = Path(str(files.part))
     part.write_text('{"engine":')  # the lock holder's transfer in progress
     with open(str(files.lock), "a") as held:
         fcntl.flock(held, fcntl.LOCK_EX)
-        done = subprocess.run(["sh", "-c", launch], input=b'{"engine":"restic"}', capture_output=True, timeout=10)
-    assert done.returncode == 6
+        shell = subprocess.Popen(["sh", "-c", launch], stdin=subprocess.PIPE, start_new_session=True)
+        time.sleep(0.3)
+        os.killpg(shell.pid, 1)  # cut while it waits
+        assert shell.wait(timeout=10) != 0
     assert part.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_launch_kept_waiting_for_the_lock_returns_the_run_its_holder_started(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # review at bedb326: another validator process holds the lock past any deadline, then starts the runner; this
+    # launch must find that run and never report the operation failed
+    import fcntl
+    import threading
+
+    started = _patch_launch(monkeypatch, tmp_path)
+    failure = storage_operations.report_launch_failure
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    ops = Path(str(files.spec)).parent
+    ops.mkdir(parents=True)
+    Path(str(files.lock)).parent.mkdir(parents=True)
+    local = _local_ssh()
+    waiting = threading.Event()
+    incumbent = subprocess.Popen(["sleep", "60"])
+    held = open(str(files.lock), "a")
+    fcntl.flock(held, fcntl.LOCK_EX)
+
+    def holder() -> None:
+        waiting.wait(10)
+        time.sleep(0.5)  # longer than the deadline the launch used to give up at
+        (ops / f"{OPERATION_ID}.start").write_text(_start_time(incumbent.pid) + "\n")
+        (ops / f"{OPERATION_ID}.pid").write_text(f"{incumbent.pid}\n")
+        held.close()
+
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        if "nohup" in command:
+            waiting.set()
+            command = command.replace("flock -w 30", "flock -w 0.2")
+        return await local.run(command, check, input)
+
+    thread = threading.Thread(target=holder)
+    thread.start()
+    try:
+        await storage_operations.start_storage_operation(
+            SimpleNamespace(run=run), "sh", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+        )
+    finally:
+        thread.join()
+        incumbent.kill()
+    failure.assert_not_awaited()
+    assert (ops / f"{OPERATION_ID}.pid").read_text() == f"{incumbent.pid}\n"
+    await asyncio.sleep(0.2)
+    assert not started.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_waiter_never_removes_the_files_of_a_launch_that_follows_the_run_it_saw_end(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # review at bedb326: the waiter reads the run as EXITED; a new dispatch then takes the lock and receives its spec
+    import fcntl
+    import threading
+
+    monkeypatch.setattr(storage_operations, "REMOTE_OPERATION_DIRECTORY", tmp_path)
+    files = storage_operations.StorageOperationFiles.for_operation(OPERATION_ID)
+    Path(str(files.lock)).parent.mkdir(parents=True)
+    dead = subprocess.Popen(["true"])
+    dead_start = _start_time(dead.pid)
+    dead.wait()
+    (tmp_path / f"{OPERATION_ID}.start").write_text(dead_start + "\n")
+    (tmp_path / f"{OPERATION_ID}.pid").write_text(f"{dead.pid}\n")
+    local = _local_ssh()
+    incumbent = subprocess.Popen(["sleep", "60"])
+    part, spec = Path(str(files.part)), Path(str(files.spec))
+    held = open(str(files.lock), "a")
+    errors: list[BaseException] = []
+
+    def new_dispatch() -> None:
+        try:
+            time.sleep(0.3)  # receiving its spec while the waiter cleans up
+            part.rename(spec)
+            (tmp_path / f"{OPERATION_ID}.start").write_text(_start_time(incumbent.pid) + "\n")
+            (tmp_path / f"{OPERATION_ID}.pid").write_text(f"{incumbent.pid}\n")
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+        finally:
+            held.close()
+
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        if "rm -f" in command and not held.closed and not part.exists():
+            # the waiter has read EXITED: the new dispatch takes the lock before its cleanup runs
+            fcntl.flock(held, fcntl.LOCK_EX)
+            part.write_text('{"engine":')
+            threading.Thread(target=new_dispatch).start()
+        return await local.run(command, check, input)
+
+    try:
+        with pytest.raises(storage_operations.StorageOperationLaunchError, match="disappeared"):
+            await storage_operations.wait_for_storage_operation(SimpleNamespace(run=run), files, poll_interval_seconds=0)
+    finally:
+        for _ in range(100):
+            if held.closed:
+                break
+            time.sleep(0.02)
+        incumbent.kill()
+    assert errors == []
+    assert spec.exists()
+    assert (tmp_path / f"{OPERATION_ID}.pid").read_text() == f"{incumbent.pid}\n"
 
 
 @pytest.mark.asyncio

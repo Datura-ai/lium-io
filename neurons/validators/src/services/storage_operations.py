@@ -397,7 +397,9 @@ async def _start_storage_operation(
             # a cut session (HUP) or a kill ends the shell through its EXIT trap, which removes the partial spec
             # only the lock holder owns the partial spec: a launch still waiting for the lock removes nothing
             + "trap 'exit 1' HUP INT TERM PIPE; "
-            f"command exec 9>>{lock_path} 2>/dev/null; flock -w 30 9 || exit 6; trap 'rm -f {part_path}' EXIT; "
+            # no deadline: a busy lock is another launch or cancel of this operation, whose outcome this launch reads
+            # once it holds the lock (an incumbent run returns it), so a busy lock is never reported as a failure
+            f"command exec 9>>{lock_path} 2>/dev/null && flock 9 || exit 6; trap 'rm -f {part_path}' EXIT; "
             # the wrapper's handle on the lock (fd 8): a failed open fails this launch, which reports it
             f"command exec 8<{lock_path} 2>/dev/null || exit 6; "
             f"if test -e {shlex.quote(str(files.cancel))}; then rm -f {shlex.quote(str(files.spec))}; exit 5; fi; "
@@ -451,28 +453,28 @@ async def wait_for_storage_operation(
     while True:
         # Healthy large operations have no wall-clock deadline; only terminal
         # status or loss of the supervised runner ends this wait.
-        state = await _operation_state(ssh_client, files)
+        state, run = await _observe_operation(ssh_client, files)
         if state.startswith("STATUS:"):
             try:
                 exit_code = int(state.removeprefix("STATUS:").strip())
             except ValueError as error:
-                await _remove_operation_artifacts(ssh_client, files)
+                await _remove_operation_artifacts(ssh_client, files, run)
                 raise StorageOperationLaunchError(
                     "storage operation returned an invalid status"
                 ) from error
             if exit_code != 0:
                 detail = await _tail_operation_log(ssh_client, files.log)
-                await _remove_operation_artifacts(ssh_client, files)
+                await _remove_operation_artifacts(ssh_client, files, run)
                 raise StorageOperationLaunchError(
                     f"storage operation failed with exit {exit_code}: {detail}"
                 )
-            await _remove_operation_artifacts(ssh_client, files)
+            await _remove_operation_artifacts(ssh_client, files, run)
             return
         if state == "RUNNING":
             runner_seen = True
         elif state in {"EXITED", "INVALID"} or runner_seen:
             detail = await _tail_operation_log(ssh_client, files.log)
-            await _remove_operation_artifacts(ssh_client, files)
+            await _remove_operation_artifacts(ssh_client, files, run)
             raise StorageOperationLaunchError(
                 f"storage operation runner disappeared without a terminal status: {detail}"
             )
@@ -480,7 +482,7 @@ async def wait_for_storage_operation(
             starting_polls += 1
             if starting_polls >= launch_grace_polls:
                 detail = await _tail_operation_log(ssh_client, files.log)
-                await _remove_operation_artifacts(ssh_client, files)
+                await _remove_operation_artifacts(ssh_client, files, run)
                 raise StorageOperationLaunchError(
                     f"storage operation runner did not start: {detail}"
                 )
@@ -491,6 +493,14 @@ async def _operation_state(
     ssh_client: asyncssh.SSHClientConnection,
     files: StorageOperationFiles,
 ) -> str:
+    return (await _observe_operation(ssh_client, files))[0]
+
+
+async def _observe_operation(
+    ssh_client: asyncssh.SSHClientConnection,
+    files: StorageOperationFiles,
+) -> tuple[str, str]:
+    """The operation's state, and the run recorded with it (its PID and start time, empty when none is)."""
     status_path = shlex.quote(str(files.status))
     pid_path = shlex.quote(str(files.pid))
     command = (
@@ -499,10 +509,16 @@ async def _operation_state(
         f"elif test -s {pid_path}; then pid=$(cat {pid_path}); "
         "case \"$pid\" in (*[!0-9]*|'') echo INVALID;; "
         '(*) if owned "$pid" && kill -0 "$pid" 2>/dev/null; then echo RUNNING; else echo EXITED; fi;; esac; '
-        "else echo STARTING; fi"
+        "else echo STARTING; fi; "
+        f"printf '%s' {_RUN_MARK}; cat {pid_path} {shlex.quote(str(files.start))} 2>/dev/null"
     )
     result = await ssh_client.run(command, check=False)
-    return (result.stdout or "").strip()
+    state, _, run = (result.stdout or "").partition(_RUN_MARK)
+    # compared with the shell's `$(cat …)`, which drops trailing newlines
+    return state.strip(), run.rstrip("\n")
+
+
+_RUN_MARK = "--run--"
 
 
 async def cancel_storage_operation(
@@ -675,9 +691,24 @@ async def _tail_operation_log(
 async def _remove_operation_artifacts(
     ssh_client: asyncssh.SSHClientConnection,
     files: StorageOperationFiles,
+    observed_run: str | None = None,
 ) -> None:
+    """Removes the operation's files under its lock, so never a launch's spec while it is being received.
+
+    `observed_run` is the run (PID and start time) a waiter saw end: once another launch has recorded a different
+    run, the files are that run's and stay. A run that ended clears its record, so no record also matches. None (a
+    cancel, whose marker stops every later launch) removes unconditionally."""
+    owner_check = (
+        ""
+        if observed_run is None
+        else f'run=$(cat {shlex.quote(str(files.pid))} {shlex.quote(str(files.start))} 2>/dev/null); '
+        f'test -z "$run" || test "$run" = {shlex.quote(observed_run)} || exit 0; '
+    )
     await ssh_client.run(
-        "rm -f "
+        # no lock, no removal: the next launch clears a dead run's files under the lock itself
+        f"command exec 9>>{shlex.quote(str(files.lock))} 2>/dev/null && flock 9 || exit 0; "
+        + owner_check
+        + "rm -f "
         + " ".join(
             shlex.quote(str(path))
             # the cancel marker stays: the operation id is never reused, and a late launch must see it
