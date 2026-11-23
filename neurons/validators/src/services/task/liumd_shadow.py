@@ -556,6 +556,15 @@ NOT_COMPARABLE_SPEC_PATHS = frozenset(
         "hard_disk.containers",
         "hard_disk.volumes",
         "docker.containers",
+        "host_memory.mem_available_kb",
+        "host_memory.swap_used_kb",
+        "host_memory.hugepages_free",
+        "host_memory.shmem_kb",
+        "host_memory.page_cache_kb",
+        "host_memory.outside_workloads_kb",
+        "host_memory.outside_workloads_no_cache_kb",
+        "host_memory.mapped_kb",
+        "host_memory.mapped_outside_workloads_kb",
     }
 )
 LIVE_GPU_DETAIL_FIELDS = frozenset(
