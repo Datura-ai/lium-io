@@ -17,6 +17,9 @@ class UploadSShKeyPayload(MinerAuthPayload):
     # ssh_pubkey_signing_blob(public_key, nonce, miner_hotkey). Absent from older validators/miners.
     miner_hotkey: str | None = None
     validator_miner_signature: str | None = None
+    # DAH-6740: the same signature for each other hotkey of the listing owner's accounts (hotkey -> signature),
+    # so a node set up under one of the owner's own keys takes a key issued for another. Absent from older miners.
+    owner_hotkey_signatures: dict[str, str] | None = None
 
 
 class GetPodLogsPaylod(MinerAuthPayload):

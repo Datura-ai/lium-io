@@ -26,6 +26,8 @@ import logging
 import re
 import subprocess
 from unittest.mock import AsyncMock, Mock
+
+from ssh_channel_double import create_process_answering_through
 from uuid import uuid4
 
 import pytest
@@ -316,6 +318,8 @@ def _make_dind_ssh(
     def _create_process(command: str):
         if _is_probe(command):
             return _probe_process(command)
+        if command.startswith(("cat /proc/", "ls -1d /dev/nvidia")):  # the bounded host reads
+            return create_process_answering_through(_run)(command)
         raise AssertionError(
             f"unexpected create_process (the streamed steps are stubbed here): {command}"
         )

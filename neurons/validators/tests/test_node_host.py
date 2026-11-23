@@ -307,6 +307,119 @@ async def test_the_port_probe_does_not_follow_a_redirect(monkeypatch):
     assert target_hits == []
 
 
+async def _streaming_server(
+    chunks: list[bytes], headers: dict[str, str] | None = None
+) -> tuple[web.AppRunner, int, list[int]]:
+    """A loopback node that writes ``chunks`` one by one; the list it returns counts the bytes it got out."""
+    written: list[int] = []
+
+    async def handler(request):
+        resp = web.StreamResponse(headers=headers)
+        await resp.prepare(request)
+        try:
+            for chunk in chunks:
+                await resp.write(chunk)
+                written.append(len(chunk))
+        except ConnectionError:
+            pass  # the probe stopped reading and closed the connection
+        return resp
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    return runner, site._server.sockets[0].getsockname()[1], written
+
+
+async def _probe(port: int, monkeypatch) -> tuple[bool, list[int]]:
+    from neurons.validators.src.services.executor_connectivity import port_tester
+    from neurons.validators.src.services.executor_connectivity.models import PortPair
+
+    # a plain connector, no address rule: the probe dials a loopback node here
+    monkeypatch.setattr(port_tester, "public_host_connector", lambda **kw: aiohttp.TCPConnector(**kw))
+    real_read = aiohttp.StreamReader.read
+    read: list[int] = []
+
+    async def counted(self, n=-1):
+        data = await real_read(self, n)
+        read.append(len(data))
+        return data
+
+    monkeypatch.setattr(aiohttp.StreamReader, "read", counted)
+    ok = await port_tester.PortTester().test_one("127.0.0.1", PortPair(internal=7, external=port), "token")
+    return ok, read
+
+
+@pytest.mark.asyncio
+async def test_the_port_probe_fails_a_large_answer_having_read_only_the_cap(monkeypatch):
+    from neurons.validators.src.services.executor_connectivity.port_tester import PROBE_BODY_LIMIT
+
+    runner, port, written = await _streaming_server([b"token:7" + b" " * 65536] * 64)
+    try:
+        ok, read = await _probe(port, monkeypatch)
+    finally:
+        await runner.cleanup()
+    assert not ok
+    assert sum(read) == PROBE_BODY_LIMIT + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pad, passes", [(256 - len("token:7"), True), (257 - len("token:7"), False)])
+async def test_the_port_probe_reads_an_answer_of_up_to_the_cap_across_chunks(monkeypatch, pad, passes):
+    runner, port, _ = await _streaming_server([b"tok", b"en:7", b" " * pad])
+    try:
+        ok, _ = await _probe(port, monkeypatch)
+    finally:
+        await runner.cleanup()
+    assert ok is passes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("encoding", ["gzip", "deflate"])
+@pytest.mark.parametrize("expanded", [b"token:7", b"token:7" + b" " * 10_000_000], ids=["the-answer", "a-bomb"])
+async def test_the_port_probe_never_decompresses_an_answer(monkeypatch, encoding, expanded):
+    """A compressed answer stays compressed: the cap counts the bytes on the wire, so a small body cannot expand into
+    a large one inside the validator, and a compressed copy of the right answer does not pass."""
+    import zlib
+
+    packer = zlib.compressobj(wbits=31 if encoding == "gzip" else 15)
+    body = packer.compress(expanded) + packer.flush()
+    runner, port, _ = await _streaming_server([body], headers={"Content-Encoding": encoding})
+    try:
+        ok, read = await _probe(port, monkeypatch)
+    finally:
+        await runner.cleanup()
+    assert not ok
+    assert sum(read) == min(len(body), 256 + 1)
+
+
+@pytest.mark.asyncio
+async def test_the_port_probe_asks_for_an_uncompressed_answer(monkeypatch):
+    """A proxy in front of a working port compresses whenever the request allows it; the probe never allows it, so the
+    right answer arrives as sent and passes."""
+    import zlib
+
+    async def answer(request):
+        if "gzip" in request.headers.get("Accept-Encoding", ""):
+            packer = zlib.compressobj(wbits=31)
+            return web.Response(body=packer.compress(b"token:7") + packer.flush(), headers={"Content-Encoding": "gzip"})
+        return web.Response(body=b"token:7")
+
+    app = web.Application()
+    app.router.add_get("/", answer)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    try:
+        ok, _ = await _probe(site._server.sockets[0].getsockname()[1], monkeypatch)
+    finally:
+        await runner.cleanup()
+    assert ok
+
+
 def _logged(caplog, level):
     return [(r.getMessage(), r.msg.extra) for r in caplog.records if r.levelno == level]
 

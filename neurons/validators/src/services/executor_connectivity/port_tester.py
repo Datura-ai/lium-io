@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 PROBE_TIMEOUT = aiohttp.ClientTimeout(sock_connect=3, sock_read=3)
 # open probe sockets across every node being verified; a probe waiting for one has not started its budget
 PROBE_CONCURRENCY = 256
+# a node's answer is "<token>:<port>"; reading more than this lets a node grow the validator's memory
+PROBE_BODY_LIMIT = 256
 
 
 class PortTester:
@@ -58,10 +60,24 @@ class PortTester:
         expected = f"{token}:{port.internal}"
 
         try:
-            # the node answers its own address only: a redirect would point the probe somewhere else
-            async with self._session.get(url, timeout=PROBE_TIMEOUT, allow_redirects=False) as resp:
-                text = await resp.text()
-                return text.strip() == expected
+            # the node answers its own address only: a redirect would point the probe somewhere else. The answer is
+            # asked for and read uncompressed, so the cap counts the bytes the node sent
+            async with self._session.get(
+                url,
+                timeout=PROBE_TIMEOUT,
+                allow_redirects=False,
+                auto_decompress=False,
+                headers={"Accept-Encoding": "identity"},
+            ) as resp:
+                body = b""
+                while len(body) <= PROBE_BODY_LIMIT:
+                    chunk = await resp.content.read(PROBE_BODY_LIMIT + 1 - len(body))
+                    if not chunk:
+                        break
+                    body += chunk
+                if len(body) > PROBE_BODY_LIMIT:
+                    return False
+                return body.decode(errors="replace").strip() == expected
         except Exception:
             return False
 
