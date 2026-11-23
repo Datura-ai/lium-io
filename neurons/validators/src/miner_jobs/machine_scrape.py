@@ -1421,27 +1421,105 @@ def cache_volume_bytes(df, prefixes):
     )
 
 
+# DAH-6981: a local volume's _data is a plain directory on docker's own filesystem, so statvfs reads the whole disk;
+# only a walk of its blocks sizes it. Walked only for volumes the containers mount that nothing else sized (that is,
+# when /system/df failed), all inside one shared budget; a container whose volume stays unsized is reported as such.
+LOCAL_VOLUME_WALK_SECONDS = 20
+
+
+def local_volume_bytes(path, deadline):
+    # blocks held under one volume's directory on this filesystem (like du -x: a DinD volume holds its own overlay
+    # mounts), hard links counted once; None past `deadline` (time.monotonic()) or when the walk cannot read it
+    try:
+        root_dev = os.lstat(path).st_dev
+    except OSError:
+        return None
+    total = 0
+    seen = set()
+    stack = [path]
+    while stack:
+        if time.monotonic() > deadline:
+            return None
+        try:
+            entries = os.scandir(stack.pop())
+        except FileNotFoundError:
+            continue  # removed while walking: holds nothing now
+        except OSError:
+            return None
+        try:
+            with entries:
+                # lazily, the budget checked per entry: one huge directory cannot run past it
+                for entry in entries:
+                    if time.monotonic() > deadline:
+                        return None
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if st.st_dev != root_dev:
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+                    elif st.st_nlink > 1:
+                        if (st.st_dev, st.st_ino) in seen:
+                            continue
+                        seen.add((st.st_dev, st.st_ino))
+                    total += st.st_blocks * 512
+        except OSError:
+            return None
+    return total
+
+
+def is_pod_disk_volume(mount):
+    # a volume that holds the pod's data on this node's disk: the `local` driver (plain and dm-crypt) or vloopback.
+    # An attached volume (the s3fs plugin at /mnt) or any other external driver is not on this disk: never sized,
+    # never required for the pod's size to be complete
+    driver = str(mount.get("Driver") or "local")
+    return (
+        mount.get("Type") == "volume"
+        and bool(mount.get("Name"))
+        and (driver == "local" or driver.startswith(VLOOPBACK_DRIVER_PREFIX))
+    )
+
+
 def get_docker_disk_usage():
-    # what actually filled the disk, split by kind, in kB to match the other hard_disk fields
-    df = docker_api_get("/system/df")
-    containers = sum(
-        max(int(container.get("SizeRw") or 0), 0) for container in df.get("Containers") or []
-    )
-    volumes = sum(
-        max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
-        for volume in df.get("Volumes") or []
-    )
+    # what actually filled the disk, split by kind, in kB to match the other hard_disk fields.
+    # Each pod's own sizes are read without /system/df: that one call walks every image and local volume and
+    # times out on busy rented nodes, and a miss there dropped every pod's size (pod backups failed SIZE_UNKNOWN).
+    # Without it only the image, local-volume and aggregate fields go; its reason comes back under docker_df_error.
     docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
+    # writable layer per container (all: a stopped pod keeps its disk); docker walks only the containers' own layers
+    container_error = None
+    try:
+        container_list = docker_api_get("/containers/json?all=1&size=1") or []
+    except Exception as exc:
+        container_error = repr(exc)
+        # an older daemon ignores the type filters, so its full /system/df answer still lists the containers
+        try:
+            container_list = (docker_api_get("/system/df") or {}).get("Containers") or []
+            container_error = None
+        except Exception:
+            container_list = []
+    try:
+        # images, local volumes and build cache only: the containers are read above
+        df = docker_api_get("/system/df?type=image&type=volume&type=build-cache")
+        df_error = None
+    except Exception as exc:
+        df = None
+        df_error = repr(exc)
+    df_volumes = (df or {}).get("Volumes") or []
+    containers = sum(max(int(container.get("SizeRw") or 0), 0) for container in container_list)
+    volumes = sum(max(int((volume.get("UsageData") or {}).get("Size") or 0), 0) for volume in df_volumes)
     # A filler's own run volume is preallocated to its full size, but any rental removes the filler
     # and its volume first (a paying pod never shares the node with one), so it reads as free disk:
     # renters were shown half of an idle node's disk. DAH-5260: so does the Engy checkpoint cache
     # (1561 GB on an 8x B300), which a customer create removes when the renter needs the space.
     # The Dolphin cache (~40 GB) stays used.
-    engy_cache = cache_volume_bytes(df, ENGY_CACHE_VOLUME_PREFIX)
+    engy_cache = cache_volume_bytes(df or {}, ENGY_CACHE_VOLUME_PREFIX)
     filler_run_volumes = get_vloopback_volume_bytes(docker_root_dir, True)
     by_volume = {
         str(volume.get("Name")): max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
-        for volume in df.get("Volumes") or []
+        for volume in df_volumes
         if volume.get("Name")
     }
     volumes += get_vloopback_volume_bytes(docker_root_dir, False, by_volume) - filler_run_volumes
@@ -1449,36 +1527,78 @@ def get_docker_disk_usage():
     volumes += get_dmcrypt_volume_bytes(docker_root_dir, by_volume)
     containers += get_container_log_bytes(docker_root_dir)
 
-    # BuildCache rides in the same answer and holds image layers a custom build left behind.
-    # Folded into images: unenumerated docker bytes read as the provider's own data downstream.
-    build_cache = sum(
-        max(int(record.get("Size") or 0), 0) for record in df.get("BuildCache") or []
-    )
+    # DAH-6981: the local volumes the containers mount that nothing above sized (no /system/df answer) are walked
+    # from their own Mountpoint, the pods' volumes only, in one budget
+    mounted = {
+        str(mount.get("Name"))
+        for container in container_list
+        for mount in container.get("Mounts") or []
+        if is_pod_disk_volume(mount)
+    }
+    unsized_names = mounted - set(by_volume)
+    if unsized_names:
+        deadline = time.monotonic() + LOCAL_VOLUME_WALK_SECONDS
+        try:
+            volume_list = (docker_api_get("/volumes") or {}).get("Volumes") or []
+        except Exception:
+            # the pods stay listed as unsized; their backups read SIZE_UNKNOWN, never a partial size
+            volume_list = []
+        for volume in volume_list:
+            if volume.get("Name") in unsized_names and volume.get("Driver") == "local" and volume.get("Mountpoint"):
+                size = local_volume_bytes(f"/proc/1/root{volume['Mountpoint']}", deadline)
+                if size is not None:
+                    by_volume[volume["Name"]] = size
 
     # DAH-5059: each pod's own share, so the pod page can show used against its limits: the writable
     # layer per container name, plus the anonymous volumes it mounts (a dind image's VOLUME
     # /var/lib/docker has no name the backend knows); named volumes stand alone under their name.
+    # DAH-6981: a container with any volume still unsized is listed in unsized_containers, so its backup fails
+    # SIZE_UNKNOWN and its page hides the figure; left out of by_container when the missing one is its own.
     by_container = {}
-    for container in df.get("Containers") or []:
+    unsized_containers = []
+    for container in container_list:
         name = str((container.get("Names") or [""])[0]).lstrip("/")
         if not name:
             continue
-        by_container[name] = max(int(container.get("SizeRw") or 0), 0) + sum(
-            by_volume.get(str(mount.get("Name")), 0)
+        volume_names = [
+            str(mount.get("Name"))
             for mount in container.get("Mounts") or []
-            if mount.get("Type") == "volume" and re.fullmatch(r"[0-9a-f]{64}", str(mount.get("Name")))
-        )
+            if is_pod_disk_volume(mount)
+        ]
+        anonymous = [v for v in volume_names if re.fullmatch(r"[0-9a-f]{64}", v)]
+        if any(v not in by_volume for v in volume_names):
+            unsized_containers.append(name)
+        if any(v not in by_volume for v in anonymous):
+            continue
+        by_container[name] = max(int(container.get("SizeRw") or 0), 0) + sum(by_volume[v] for v in anonymous)
 
-    return {
+    usage = {
+        "hard_disk_by_container": {name: size // 1024 for name, size in by_container.items()},
+        "hard_disk_by_volume": {name: size // 1024 for name, size in by_volume.items()},
+        "hard_disk_unsized_containers": unsized_containers,
+    }
+    if df is None:
+        # popped by the caller into hard_disk_docker_scrape_error; the aggregates below would under-report
+        if container_error:
+            usage["docker_df_error"] = f"/system/df: {df_error}; /containers: {container_error}"
+        else:
+            usage["docker_df_error"] = df_error
+        return usage
+    if container_error:
+        # popped by the caller into hard_disk_docker_scrape_error; the pod sizes are missing, not zero
+        usage["docker_df_error"] = f"/containers: {container_error}"
+    # BuildCache holds image layers a custom build left behind. Folded into images: unenumerated docker
+    # bytes read as the provider's own data downstream.
+    build_cache = sum(max(int(record.get("Size") or 0), 0) for record in df.get("BuildCache") or [])
+    usage.update({
         "hard_disk_images": (int(df.get("LayersSize") or 0) + build_cache) // 1024,
         "hard_disk_containers": containers // 1024,
         "hard_disk_volumes": volumes // 1024,
         "filler_released_kb": (filler_run_volumes + engy_cache) // 1024,
         # DAH-5045: how far the Engy checkpoint download has got, in GB (10**9 bytes)
         "hard_disk_engy_cache_used_gb": engy_cache // 10**9,
-        "hard_disk_by_container": {name: size // 1024 for name, size in by_container.items()},
-        "hard_disk_by_volume": {name: size // 1024 for name, size in by_volume.items()},
-    }
+    })
+    return usage
 
 
 def release_filler_cache(hard_disk):
@@ -3117,6 +3237,10 @@ def get_machine_specs():
 
     try:
         data["data_hard_disk"].update(get_docker_disk_usage())
+        df_error = data["data_hard_disk"].pop("docker_df_error", None)
+        if df_error:
+            # the per-pod sizes above stand; only the /system/df aggregates are missing
+            data["hard_disk_docker_scrape_error"] = df_error
         release_filler_cache(data["data_hard_disk"])
     except Exception as exc:
         # kept apart from hard_disk_scrape_error: the docker socket is the fragile half, and a
