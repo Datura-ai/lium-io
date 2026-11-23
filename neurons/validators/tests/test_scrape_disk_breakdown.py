@@ -301,7 +301,7 @@ def test_vloopback_volumes_are_added_to_the_local_driver_total(scrape: dict, mon
             "_Os",
             (),
             {
-                "path": os.path,
+                "path": SimpleNamespace(join=os.path.join, isdir=lambda path: True),
                 "stat": staticmethod(lambda path: type("_Stat", (), {"st_blocks": blocks_by_path[path]})),
             },
         ),
@@ -344,7 +344,7 @@ def test_vloopback_volume_missing_its_backing_file_is_skipped(scrape: dict, monk
             "_Os",
             (),
             {
-                "path": os.path,
+                "path": SimpleNamespace(join=os.path.join, isdir=lambda path: True),
                 "stat": staticmethod(lambda path: (_ for _ in ()).throw(FileNotFoundError(path))),
             },
         ),
@@ -364,14 +364,17 @@ def test_vloopback_volume_missing_its_backing_file_is_skipped(scrape: dict, monk
         [{"Id": "x", "Name": "vloopback:latest", "Settings": {"Env": ["LOG_LEVEL=2"]}}],
         [{"Id": "x", "Name": "vloopback:latest", "Settings": {"Env": ["DATA_DIR=relative"]}}],
         [_plugin("y", "other-driver:latest", "/srv/var/lib/other")],
+        # reported, but the directory is not on the host
+        [V2_PLUGIN],
     ],
-    ids=["no-plugin", "no-data-dir", "relative-data-dir", "only-another-driver"],
+    ids=["no-plugin", "no-data-dir", "relative-data-dir", "only-another-driver", "data-dir-absent"],
 )
-def test_missing_plugin_data_dir_raises_instead_of_reporting_zero(scrape: dict, plugins) -> None:
+def test_missing_plugin_data_dir_raises_instead_of_reporting_zero(scrape: dict, monkeypatch, plugins) -> None:
     # Arrange — docker reports no vloopback plugin DATA_DIR, so every volume would be counted as 0.
     # That is a structural miss, not a single unmaterialised volume: reporting 0 TB of volumes
     # reads as "the disk is free", so it has to surface as an error key instead.
     _stub_docker_api(scrape, {"/plugins": plugins, "/volumes": {"Volumes": [{"Name": "volume_full", "Driver": "vloopback"}]}})
+    monkeypatch.setitem(scrape, "os", SimpleNamespace(path=SimpleNamespace(join=os.path.join, isdir=lambda path: False)))
 
     # Act / Assert
     with pytest.raises(RuntimeError):
@@ -397,7 +400,7 @@ def test_vloopback_volume_bytes_counts_the_v2_and_v3_host_data_dirs_beside_the_o
         return SimpleNamespace(st_blocks=blocks[path])
 
     monkeypatch.setitem(scrape, "glob", SimpleNamespace(glob=lambda pattern: [old_dir] if old_blocks else []))
-    path = SimpleNamespace(join=os.path.join, isdir=lambda candidate: candidate in (v2_dir, v3_dir))
+    path = SimpleNamespace(join=os.path.join, isdir=lambda candidate: candidate in (old_dir, v2_dir, v3_dir))
     monkeypatch.setitem(scrape, "os", SimpleNamespace(path=path, stat=stat))
     volumes = [
         {"Name": "volume_old", "Driver": "vloopback:latest"},
@@ -442,7 +445,8 @@ def test_vloopback_volume_bytes_reads_a_custom_data_dir_from_the_plugin(scrape: 
         return SimpleNamespace(st_blocks=blocks[path])
 
     monkeypatch.setitem(scrape, "glob", SimpleNamespace(glob=lambda pattern: []))
-    monkeypatch.setitem(scrape, "os", SimpleNamespace(path=os.path, stat=stat))
+    path = SimpleNamespace(join=os.path.join, isdir=lambda candidate: candidate == backing_dir)
+    monkeypatch.setitem(scrape, "os", SimpleNamespace(path=path, stat=stat))
     _stub_docker_api(scrape, {"/plugins": [plugin], "/volumes": {"Volumes": [{"Name": "volume_pod", "Driver": plugin["Name"]}]}})
 
     # Act

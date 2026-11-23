@@ -1290,7 +1290,9 @@ def vloopback_plugin_data_dirs(docker_root_dir):
                 host_dir, matched = source.rstrip("/") + data_dir[len(destination):], len(destination)
         if host_dir is None:
             host_dir = f"{docker_root_dir}/plugins/{plugin.get('Id')}/rootfs{data_dir}"
-        data_dirs.append(f"/proc/1/root{host_dir}")
+        # a DATA_DIR the plugin has never written (or a mount source gone from the host) holds no volume
+        if os.path.isdir(f"/proc/1/root{host_dir}"):
+            data_dirs.append(f"/proc/1/root{host_dir}")
     return data_dirs
 
 
@@ -1315,7 +1317,7 @@ def get_vloopback_volume_bytes(docker_root_dir, filler_only=False, sizes=None):
     if not data_dirs:
         # every volume would be counted as 0 and the breakdown would silently under-report by
         # terabytes; fail like the rest of the docker half so the miss lands in an error key
-        raise RuntimeError(f"docker reports no vloopback plugin DATA_DIR for {len(names)} volumes")
+        raise RuntimeError(f"docker reports no existing vloopback plugin DATA_DIR for {len(names)} volumes")
 
     total = 0
     mount_points = None
