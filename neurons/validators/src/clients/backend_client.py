@@ -32,6 +32,7 @@ from protocol.vc_protocol.compute_requests import (
 from pydantic import BaseModel, ValidationError
 from tenacity import retry, retry_if_result, stop_after_attempt, wait_fixed
 
+from clients.validator_portal_api import portal_owner_hotkeys
 from core.utils import _m, get_extra_info
 
 logger = logging.getLogger(__name__)
@@ -636,6 +637,12 @@ class BackendClient:
         if executor_id:
             json_data["executor_id"] = executor_id
 
+        # DAH-6740: the backend signs its own SSH key for these too, so the executor of a node the listing's owner set
+        # up under another of their accounts takes it (an older backend ignores the field). It signs them only with
+        # the dated upload_nonce (an undated signature would never expire).
+        owner_hotkeys = portal_owner_hotkeys(miner_hotkey)
+        if owner_hotkeys:
+            json_data["owner_hotkeys"] = sorted(owner_hotkeys)
         if upload_nonce is not None:
             json_data["upload_nonce"] = upload_nonce
 

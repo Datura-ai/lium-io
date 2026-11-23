@@ -135,6 +135,81 @@ async def _filler_reuse_is_due(ctx: Context, stored: tuple) -> bool:
     return due
 
 
+# The EMA starts as the first sample alone (compute_ema), and the wire carries no sample count: a node whose first
+# sample is stored while a filler runs must not reuse that one cold sample for a day. Each direction is seeded on its
+# own (a failed upload keeps the download, an unmeasured upload stays unseeded), so each is tracked on its own: the
+# validator marks a direction it sees unseeded, then the first reading stored for it; that direction settles once the
+# backend stores a different one. Reuse waits until no direction holds its first sample alone.
+_FIRST_SAMPLE_PREFIX = "verifyx:first_sample_ema"
+_DIRECTIONS = ("download", "upload")
+_SETTLED = "settled"
+
+
+def _first_sample_key(ctx: Context) -> str:
+    return f"{_FIRST_SAMPLE_PREFIX}:{ctx.miner_hotkey}:{ctx.executor.uuid}"
+
+
+async def _read_first_sample_mark(ctx: Context) -> dict | None:
+    raw = await ctx.services.redis.get(_first_sample_key(ctx))
+    if raw is None:
+        return None
+    mark = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+    return mark if isinstance(mark, dict) else None
+
+
+async def _mark_unseeded(ctx: Context, stored: tuple) -> None:
+    """Marks each direction the stored EMA does not hold as unseeded, whatever its tracked state: an EMA the backend
+    no longer sends (a node that went inactive) starts again from its next sample alone, so that sample is a first
+    sample too. Runs on every check, and every check renews an existing mark's expiry: a node checked every cycle
+    never loses its mark while the stored EMA stays its first sample, whether or not the EMA is reusable this cycle."""
+    unseeded = [direction for direction, value in zip(_DIRECTIONS, stored) if value is None]
+    try:
+        mark = await _read_first_sample_mark(ctx)
+        if mark is None and not unseeded:
+            return
+        mark = mark or {}
+        for direction in unseeded:
+            mark[direction] = None
+        await ctx.services.redis.set(_first_sample_key(ctx), json.dumps(mark), ex=_FILLER_REUSE_TTL_SECONDS)
+    except Exception:
+        logger.warning(_m("VerifyX unseeded mark not written to Redis", extra=get_extra_info(ctx.default_extra)))
+
+
+def _advance_first_sample_mark(mark: dict, stored: tuple) -> tuple[dict, bool]:
+    """The mark after this stored EMA, and whether some direction still holds only its first sample. A direction
+    missing from the mark was seeded before it was seen unseeded: settled, as before."""
+    first = False
+    advanced = {}
+    for direction, value in zip(_DIRECTIONS, stored):
+        state = mark.get(direction, _SETTLED)
+        if state is None and value is not None:
+            state = value  # the direction's first stored reading
+        elif state not in (None, _SETTLED) and value != state:
+            state = _SETTLED
+        first = first or state not in (None, _SETTLED)
+        advanced[direction] = state
+    return advanced, first
+
+
+async def _is_first_sample(ctx: Context, stored: tuple) -> bool:
+    """True while a direction of the stored EMA is still the first reading stored for it after the validator saw it
+    unseeded. No mark (a node seeded before this validator saw it unseeded, or Redis down) reads as settled."""
+    redis = ctx.services.redis
+    try:
+        mark = await _read_first_sample_mark(ctx)
+        if mark is None:
+            return False
+        advanced, first = _advance_first_sample_mark(mark, stored)
+        if all(state == _SETTLED for state in advanced.values()):
+            await redis.delete(_first_sample_key(ctx))
+        elif advanced != mark:
+            await redis.set(_first_sample_key(ctx), json.dumps(advanced), ex=_FILLER_REUSE_TTL_SECONDS)
+        return first
+    except Exception:
+        logger.warning(_m("VerifyX first-sample mark unreadable in Redis", extra=get_extra_info(ctx.default_extra)))
+    return False
+
+
 @dataclass(frozen=True)
 class ColdSampleRetry:
     """DAH-2959: a never-measured node's two download samples and the one the check kept.
@@ -207,6 +282,8 @@ class VerifyXCheck:
         filler_container = _get_filler_only_container(ctx)
         stored_ema = _stored_network_ema(ctx)
         await _keep_ema_copy(ctx, stored_ema)
+        seen = (stored_ema.ema_verifyx_download_speed, stored_ema.ema_verifyx_upload_speed) if stored_ema else ()
+        await _mark_unseeded(ctx, seen or (None, None))
         # A never-measured node is probed even under a filler: with no EMA to reuse it would
         # score 0 every cycle and stay hidden for as long as the filler runs.
         # A stored upload EMA below the floor is probed too: skipping would pass it while the
@@ -220,9 +297,11 @@ class VerifyXCheck:
                 or stored_ema.ema_verifyx_upload_speed >= MIN_VERIFYX_EMA_UPLOAD_SPEED_MBPS
             )
         )
-        # a day of reuse is up: this probe refreshes the network reading only (r4472607210)
-        filler_refresh = bool(reusable) and await _filler_reuse_is_due(
-            ctx, (stored_ema.ema_verifyx_download_speed, stored_ema.ema_verifyx_upload_speed)
+        # a day of reuse is up, or the stored EMA is still the first sample alone: this probe refreshes the network
+        # reading only (r4472607210)
+        stored = (stored_ema.ema_verifyx_download_speed, stored_ema.ema_verifyx_upload_speed) if reusable else ()
+        filler_refresh = bool(reusable) and (
+            await _is_first_sample(ctx, stored) or await _filler_reuse_is_due(ctx, stored)
         )
         if reusable and not filler_refresh:
             updated_specs = specs_with_last_known_verifyx_ema(ctx)

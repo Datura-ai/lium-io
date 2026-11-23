@@ -59,6 +59,7 @@ from .stale_container_cleanup import StaleContainerCleanupCheck
 from .start_gpu_monitor import StartGPUMonitorCheck
 from .docker_cpu import DockerCpuCheck
 from .needrestart_guard import NeedrestartGuardCheck
+from .sysbox_layer_reset import SysboxLayerResetCheck
 from .pid_host_required import PidHostRequiredCheck
 from .sysbox_required import SysboxRequiredCheck
 from .tdx_host import TdxHostCheck
@@ -128,6 +129,7 @@ __all__ = [
     "StartGPUMonitorCheck",
     "DockerCpuCheck",
     "NeedrestartGuardCheck",
+    "SysboxLayerResetCheck",
     "PidHostRequiredCheck",
     "SysboxRequiredCheck",
     "SpecChangeCheck",

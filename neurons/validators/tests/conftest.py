@@ -186,6 +186,18 @@ def pod_ssh_answers_on_create_path(request):
 
 
 @pytest.fixture(autouse=True)
+def first_owner_hotkeys_read_already_done():
+    """Signed uploads wait for the validator's first owner-hotkeys read (DAH-6740); tests start past it.
+    test_ssh_key_signing.py covers the wait itself."""
+    from clients import validator_portal_api
+
+    with patch.object(validator_portal_api, "_owner_hotkeys_read_once", True), patch.object(
+        validator_portal_api, "_owner_read", None
+    ):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def no_leftover_clock_locks_on_create_path():
     """create_container resets leftover GPU clock locks (Redis + -rgc); test_gpu_clocks.py covers that step."""
     with patch("services.docker_service.reset_leftover_clock_locks", AsyncMock(return_value=[])) as reset:
