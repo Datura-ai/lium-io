@@ -970,7 +970,7 @@ async def test_a_waiter_never_removes_the_files_of_a_launch_that_follows_the_run
         for _ in range(100):
             if held.closed:
                 break
-            time.sleep(0.02)
+            await asyncio.sleep(0.02)
         incumbent.kill()
     assert errors == []
     assert spec.exists()
