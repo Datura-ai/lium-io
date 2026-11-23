@@ -487,3 +487,33 @@ async def test_the_runtime_read_runs_in_a_real_shell_and_dates_from_the_kernel(m
     assert restarted == {"sleep": ["pod_1"]}
     started = calendar.timegm(time.strptime(started_at["sleep"], "%Y-%m-%dT%H:%M:%SZ"))
     assert abs(started - time.time()) < 60
+
+
+# 22 Nov, last read before a host reboot: / /usr /usr/lib already back at host root, sudo files still in the range
+_MID_REVERT = "4242|0 231072 65536|0||231072|231072|231072|231072|0|0|231072|231072"
+
+
+def test_a_pod_whose_files_are_being_handed_back_to_the_host_is_not_shifted():
+    pod = judge(_MID_REVERT)
+    assert pod["outside_namespace"] == []
+    assert pod["being_reverted"] == ["/", "/usr", "/usr/lib"]
+    # every path at host root (never shifted into the range) and sudo files alone at host root stay shifted
+    assert judge("4242|0 231072 65536|0||0|0|0|0|0|0|0|0")["outside_namespace"]
+    assert judge("4242|0 231072 65536|231072|231072|0|0|0|0|231072|231072|231072|231072")["outside_namespace"] == [
+        "/etc/sudoers", "/etc/sudoers.d", "/etc/sudoers.d/README", "/usr/bin/sudo",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_pod_read_mid_stop_is_unread_not_shifted(context_factory):
+    async def run(cmd, check=False):
+        if cmd.startswith("/usr/bin/docker inspect"):
+            return SimpleNamespace(exit_status=0, stdout="/pod_1 4242\n/pod_2 4343\n", stderr="")
+        if cmd.startswith("for p in"):
+            healthy = "4343|0 231072 65536|231072|231072"
+            return SimpleNamespace(exit_status=0, stdout=f"{_MID_REVERT}\n{healthy}\n", stderr="")
+        return SimpleNamespace(exit_status=0, stdout="", stderr="")
+
+    result = await RentedPodOwnershipCheck().run(_ctx(context_factory, SimpleNamespace(run=run)))
+    assert result.event.reason_code == Msg.UNREAD.reason
+    assert result.event.what_we_saw["being_reverted"] == ["pod_1"]

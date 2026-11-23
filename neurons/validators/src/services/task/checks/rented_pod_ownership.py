@@ -101,12 +101,13 @@ def judge(line: str) -> dict | None:
     # (an image without /root or sudo) are judged from the rest
     if not shifted and read["/"] is None:
         return None
-    return {
-        "pid": pid_num,
-        "uid_map_base": base,
-        "host_owners": owners,
-        "outside_namespace": shifted,
-    }
+    pod = {"pid": pid_num, "uid_map_base": base, "host_owners": owners, "outside_namespace": shifted}
+    # Sysbox hands a stopping pod's files back to their host owners top-down: / is at host root while paths not yet
+    # reached are still in the range. Only that walk leaves / at host root beside in-range paths; a real shift
+    # keeps / in the range (sudo files out) or at the old range's uid, and the renter cannot chown to host root
+    if shifted and read["/"] == 0 and any(base <= uid < base + length for uid in owners.values()):
+        pod.update(outside_namespace=[], being_reverted=shifted)
+    return pod
 
 
 class RentedPodOwnershipCheck:
@@ -181,6 +182,7 @@ class RentedPodOwnershipCheck:
                 # when each flagged runtime started: a notice must date the restart, not the day the check first saw it
                 what["runtime_started_at"] = started_at
         shifted = [p for p in pods.values() if p["outside_namespace"]]
+        reverting = sorted(p["container"] for p in pods.values() if p.get("being_reverted"))
         if shifted:
             template = await self._shift_template(ctx, shifted)
         elif unread:
@@ -188,6 +190,10 @@ class RentedPodOwnershipCheck:
             what.update(reason="pod not read back", unread=unread, exit_status=res.exit_status)
             if empty_reads:
                 what["empty_reads"] = empty_reads
+        elif reverting:
+            # read mid-stop (the host going down): the pod's files say nothing about its ownership until it is back
+            template = Msg.UNREAD
+            what.update(reason="ownership being reverted: the pod is stopping", being_reverted=reverting)
         elif "runtime_restarted_under_pods" in what:
             # own outcome, not OK: a repeated OK is logged at DEBUG, so the restart would never surface
             template = Msg.RUNTIME_RESTARTED
