@@ -441,6 +441,9 @@ async def test_failed_late_filler_power_restore_fails_and_cleans_customer(svc, m
     # a host nvidia-smi failure is the node's step, not container_cleanup (excused while a filler run is known)
     assert result.failure_step == ("gpu_power_restore_state" if platform_state_failure else "gpu_power_restore")
     assert restore.await_args.kwargs["require_complete"] is True
+    # the host's refusal takes the node off the market until a rental probe passes; our own Redis does not
+    stamps = [c.args for c in svc.redis_service.set.await_args_list if str(c.args[0]).startswith("rental_probe_failed:")]
+    assert stamps == ([] if platform_state_failure else [(f"rental_probe_failed:{result.executor_id}", "container_start:gpu_power_restore")])
     assert f"/usr/bin/docker rm -fv {_CUSTOMER_CONTAINER_ID} 2>/dev/null || true" in _commands(ssh_client)
 
 

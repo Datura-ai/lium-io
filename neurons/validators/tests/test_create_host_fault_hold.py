@@ -26,6 +26,10 @@ def _service() -> tuple[DockerService, Mock]:
     [
         ("volume_creation", True),
         ("gpu_flags", True),
+        # the host's nvidia-smi would not give a GPU its power back before the renter's container
+        ("gpu_power_restore", True),
+        # our own Redis could not confirm the restore state: not the node's fault
+        ("gpu_power_restore_state", False),
         # runc echoes the renter's command, so a docker run error can carry any text the renter chose
         ("docker_run", False),
         ("docker_pull", False),

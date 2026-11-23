@@ -1208,11 +1208,14 @@ def volume_step_detail(exc: BaseException) -> str | None:
     return text[:VOLUME_STEP_DETAIL_MAX_CHARS]
 
 
-# A create that fails here failed on the node itself: its storage refused the volume, or a GPU it
-# advertises is gone. Such a failure stands like a failed rental probe, so the node scores 0 until a
-# probe on it passes instead of going to the next renter. docker_run is left out: runc echoes the
-# renter's command in its start error, so no text there is the node's alone.
-_HOST_FAULT_CREATE_STEPS = frozenset({"volume_creation", "gpu_flags"})
+# A create that fails here failed on the node itself: its storage refused the volume, a GPU it
+# advertises is gone, or its nvidia-smi would not give a GPU its power back before the renter's
+# container (the strict restore; our own Redis fails as gpu_power_restore_state, not held). Such a
+# failure stands like a failed rental probe, so the node scores 0 until a probe on it passes instead
+# of going to the next renter; the probe's create runs the same strict restore, so a host that still
+# refuses stays off. docker_run is left out: runc echoes the renter's command in its start error, so
+# no text there is the node's alone.
+_HOST_FAULT_CREATE_STEPS = frozenset({"volume_creation", "gpu_flags", "gpu_power_restore"})
 # rental_probe.STEP_CONTAINER_START: the stamp reads as that probe step failing at the create step
 _RENTAL_PROBE_CONTAINER_START_STEP = "container_start"
 

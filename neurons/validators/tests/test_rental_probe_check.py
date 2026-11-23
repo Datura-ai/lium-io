@@ -38,6 +38,7 @@ from payload_models.payloads import (
     FailedContainerErrorCodes,
     FailedContainerErrorTypes,
     FailedContainerRequest,
+    WorkloadKind,
 )
 from protocol.vc_protocol.compute_requests import (
     DefaultDockerImage,
@@ -867,6 +868,8 @@ async def test_create_payload_is_what_a_renter_gets():
     )
     assert [(p.internal_port, p.external_port) for p in payload.available_ports] == PORT_PAIRS
     assert payload.pod_mapping == [] and payload.active_container_names == []
+    # a customer create's strict GPU power restore: a node held at gpu_power_restore clears only when it works
+    assert payload.workload_kind is WorkloadKind.CUSTOMER_RENTAL
     assert len(payload.user_public_keys) == 1 and payload.user_public_keys[0].startswith(
         "ssh-ed25519 "
     )
