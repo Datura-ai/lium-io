@@ -250,6 +250,50 @@ async def test_run_container_retry_creates_once_dockerd_released_the_name(monkey
     ]
 
 
+@pytest.mark.asyncio
+async def test_a_refusal_during_the_resume_wait_is_raised_once_dockerds_container_exists(monkeypatch):
+    """A filler's `before_create` refusal (a customer create started during the 409 wait) is checked on the
+    resume only once the container exists, so the caller's removal by name finds it; never started."""
+    import requests
+    import services.rental_docker_sdk as sdk
+    from services.rental_docker_sdk import ContainerCreateRefused
+
+    monkeypatch.setattr(sdk, "_INFLIGHT_CREATE_POLL_SECONDS", 0)
+    api = _FakeApiClient(adapter=_FakeAdapter())
+    api.create_container_errors = [
+        requests.exceptions.ReadTimeout("Read timed out. (read timeout=60)"),
+        _name_conflict(),
+        _name_conflict(),
+    ]
+    inspects = iter([_not_found(), _not_found()])
+
+    def inspect_container(name):
+        api.calls.append("inspect_container")
+        error = next(inspects, None)
+        if error is not None:
+            raise error
+        return {"Id": "first", "Config": {"Image": "lium/pod:1"}}
+
+    api.inspect_container = inspect_container
+
+    def before_create():
+        # the customer create starts after the first 409
+        if api.calls.count("create_container") >= 2:
+            raise ContainerCreateRefused("a customer create is running")
+
+    spec = _run_spec()
+    spec.before_create = before_create
+
+    with pytest.raises(ContainerCreateRefused):
+        await _client(api).run_container(spec)
+    assert api.calls == [
+        "create_container",
+        "inspect_container", "create_container",
+        "inspect_container", "create_container",
+        "inspect_container",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # pull: the stream cut mid-pull (27 Oct alert ece89) → one re-open and one more pull
 # ---------------------------------------------------------------------------

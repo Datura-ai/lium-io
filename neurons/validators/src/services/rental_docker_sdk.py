@@ -106,7 +106,8 @@ class RentalDockerConnectionError(RuntimeError):
 
 
 class ContainerCreateRefused(Exception):
-    """Raised by a run spec's `before_create` (nothing was created) or `before_start` (created, never started)."""
+    """Raised by a run spec's `before_create` (nothing was created; on the resume after a dropped create, created
+    and never started) or `before_start` (created, never started)."""
 
 
 class RentalDockerOperationError(RuntimeError):
@@ -400,7 +401,8 @@ class ContainerRunSpec:
     network: str | None = None
     # DAH-5117: LIUM_POD_ID_LABEL for a pod or filler, so the stale cleanup knows the container is Lium's
     labels: dict[str, str] = field(default_factory=dict)
-    # runs in the Docker thread right before the create call; may raise ContainerCreateRefused
+    # runs in the Docker thread right before the create call (on the resume, once the container exists);
+    # may raise ContainerCreateRefused
     before_create: Callable[[], None] | None = field(default=None, repr=False, compare=False)
     # runs in the Docker thread between the create and the start call with the names of every container
     # on the host; may raise ContainerCreateRefused, and the created container is then left unstarted
@@ -1171,7 +1173,9 @@ class RentalDockerSdkClient:
             host_config = self._api_client.create_host_config(
                 **_build_host_config_kwargs(spec)
             )
-            if spec.before_create is not None:
+            # On the resume dockerd may still hold the name for the first create's container, so the check
+            # runs below, once a container exists for the caller's removal by name to find.
+            if spec.before_create is not None and not adopt_existing:
                 spec.before_create()
             created = self._api_client.create_container(
                 image=spec.image,
@@ -1189,6 +1193,8 @@ class RentalDockerSdkClient:
                 }
                 or None,
             )
+        if spec.before_create is not None and adopt_existing:
+            spec.before_create()
         if spec.before_start is not None:
             spec.before_start(
                 [
