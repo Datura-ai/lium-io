@@ -168,6 +168,7 @@ services:
       context: ../neurons/validators
       additional_contexts:
         datura: ../datura
+        executor_setup: ../neurons/executor
     image: lium-e2e/validator
     profiles: [tools]
     entrypoint: ["true"]

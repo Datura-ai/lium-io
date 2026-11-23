@@ -1047,6 +1047,24 @@ def needrestart_data_line(line, literal, plain_setting):
     return None
 
 
+# DAH-6804: the boot-time layer reset nvidia_docker_sysbox_setup.sh installs, and the version line it writes first
+SYSBOX_LAYER_RESET_UNIT = "/etc/systemd/system/lium-sysbox-layer-reset.service"
+SYSBOX_LAYER_RESET_VERSION_LINE = re.compile(r"# lium-layer-reset-version=(\d{1,5})")
+
+
+def get_sysbox_layer_reset_version(host_root="/proc/1/root"):
+    # 0 = not installed, 1 = installed before the setup script wrote a version line, N = that version
+    if os.path.samefile(host_root + "/", "/"):  # as get_needrestart_guard
+        raise RuntimeError("no host view: the executor is not in the host PID namespace")
+    try:
+        with open(host_root + SYSBOX_LAYER_RESET_UNIT) as unit_file:
+            first_line = unit_file.readline().rstrip("\n")
+    except FileNotFoundError:
+        return 0
+    match = SYSBOX_LAYER_RESET_VERSION_LINE.fullmatch(first_line)
+    return int(match.group(1)) if match else 1
+
+
 def get_needrestart_guard(host_root="/proc/1/root"):
     # "present", "partial", "missing" or "no_needrestart", the services the host file leaves unguarded, and why a
     # "partial" could not prove the guard effective (None when it could read everything).
@@ -3132,6 +3150,13 @@ def get_machine_specs():
         ) = get_needrestart_guard()
     except Exception as exc:
         data["data_needrestart_guard_scrape_error"] = repr(exc)
+
+    # DAH-6804: Sysbox hosts only; missing key = not a Sysbox host or unknown, never fails
+    if data.get("data_sysbox_version"):
+        try:
+            data["data_sysbox_layer_reset_version"] = get_sysbox_layer_reset_version()
+        except Exception as exc:
+            data["data_sysbox_layer_reset_scrape_error"] = repr(exc)
 
     data["data_os"] = ""
     try:
