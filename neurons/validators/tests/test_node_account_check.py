@@ -18,11 +18,18 @@ from tests.helpers import make_context
 
 IP_A, IP_B = "127.0.0.1", "127.0.0.2"
 # an idle node's refusal clears its verified job, marked so the backend applies the reset only while it stays unrented
-REFUSED_IDLE = {
-    "node_account_passed": False,
-    "clear_verified_job_info": True,
-    "clear_verified_job_unrented_only": True,
-}
+HOST_KEY_PART = "executor.validate.node_account.host_key"
+BINDING_PART = "executor.validate.node_account.account_binding"
+
+
+def refused_idle(part):
+    """A free node's refusal: the reset names the part that failed, the one a later pass must prove to lift a hold."""
+    return {
+        "node_account_passed": False,
+        "clear_verified_job_info": True,
+        "clear_verified_job_unrented_only": True,
+        "clear_verified_job_evidence": {"check_id": part},
+    }
 HOST_KEYS_SCRIPT = Path(__file__).resolve().parents[2] / "executor" / "ssh_host_keys.sh"
 
 pytestmark = pytest.mark.asyncio
@@ -84,7 +91,7 @@ async def test_hostname_re_pointed_to_another_machine_is_refused(two_machines):
     result = await NodeAccountCheck().run(_ctx("node.example.com", await dial(IP_B), registered_key))
     assert not result.passed
     assert result.event.reason_code == "NODE_ACCOUNT_MISMATCH"
-    assert result.updates == REFUSED_IDLE
+    assert result.updates == refused_idle(HOST_KEY_PART)
 
 
 async def test_ip_addressed_node_is_unchanged(two_machines):
@@ -191,7 +198,7 @@ async def test_ip_node_is_refused_on_a_machine_set_up_for_another_account(files,
     assert result.event.reason_code == reason
     assert result.passed is (reason != "NODE_ACCOUNT_MISMATCH")
     if not result.passed:
-        assert result.updates == REFUSED_IDLE
+        assert result.updates == refused_idle(BINDING_PART)
         assert "hostname" not in result.event.remediation
     assert runner.commands == [
         "printf 'hotkey=%s\\nclaim=%s\\n' \"$(cat /etc/liumd/miner_hotkey 2>/dev/null)\" "
@@ -232,7 +239,7 @@ async def test_a_rented_node_on_another_accounts_machine_keeps_its_rental(rented
     if rented:
         assert (result.updates, result.fatal) == ({"node_account_passed": False}, False)
     else:
-        assert (result.updates, result.fatal) == (REFUSED_IDLE, True)
+        assert (result.updates, result.fatal) == (refused_idle(BINDING_PART), True)
     # an availability entry: the backend hides the node, so a partly rented one takes no rental on its free GPUs
     from services.task.availability import NODE_GPU_FAULT_CODES, availability_errors
 
@@ -385,29 +392,75 @@ async def test_a_dropped_session_during_the_account_read_is_reconnected_through_
         assert end.clear_verified_job_unrented_only is True
 
 
-# DAH-6784: the check lists itself as run in full only when it proved all this node can be checked by
+# DAH-6784: a pass lists the parts it proved; a part whose input is missing is not proven
 
 
 @pytest.mark.parametrize(
-    "files, hotkeys, listed",
+    "files, hotkeys, proven",
     [
-        (f"hotkey={POOL}\nclaim={CLAIM}\n", ("5Account", POOL), True),  # binding read and proven
-        ("hotkey=5Account\nclaim=\n", ("5Account", POOL), True),  # an own-key node needs no claim
-        ("hotkey=\nclaim=\n", ("5Account", POOL), False),  # no host files: nothing proven
-        (f"hotkey={POOL}\nclaim=\n", ("5Account", POOL), False),  # the claim unread
-        ("hotkey=5Account\n", None, False),  # an IP node naming no account: nothing to prove
+        (f"hotkey={POOL}\nclaim={CLAIM}\n", ("5Account", POOL), (BINDING_PART,)),  # binding read and proven
+        ("hotkey=5Account\nclaim=\n", ("5Account", POOL), (BINDING_PART,)),  # an own-key node needs no claim
+        ("hotkey=\nclaim=\n", ("5Account", POOL), None),  # no host files: nothing proven
+        (f"hotkey={POOL}\nclaim=\n", ("5Account", POOL), None),  # the claim unread
+        ("hotkey=5Account\n", None, None),  # an IP node naming no account: nothing to prove
     ],
 )
-async def test_only_a_proven_binding_is_the_full_check(files, hotkeys, listed):
+async def test_only_a_proven_binding_is_listed(files, hotkeys, proven):
     result = await NodeAccountCheck().run(_relay_ctx(_HostFiles(files), hotkeys=hotkeys))
     assert result.passed
-    assert (result.updates.get("idle_check_passed") is True) is listed
+    assert result.updates.get("idle_check_passed") == proven
 
 
-async def test_a_matched_host_key_is_the_full_check(recorded_machine):
+async def test_a_matched_host_key_is_listed_as_that_part_only(recorded_machine):
     keys, recorded = recorded_machine
     result = await _check_against(keys["ed25519"], recorded)
-    assert result.event.reason_code == "NODE_ACCOUNT_OK" and result.updates == {"idle_check_passed": True}
+    assert result.event.reason_code == "NODE_ACCOUNT_OK" and result.updates == {"idle_check_passed": (HOST_KEY_PART,)}
+
+
+def _lifts(failed: str, passed: tuple[str, ...]) -> bool:
+    """The backend's rule (lium-platform daos/executor.py _fault_checks_proven): a hold lifts once the check its reset
+    named is among the ids a later pass listed."""
+    return failed in passed
+
+
+@pytest.mark.parametrize(
+    "fail, later, lifts",
+    [
+        # a binding hold, then a cycle whose miner lists no hotkeys: only the host key is proven, the hold stays
+        ({"hotkeys": ("5Account", POOL), "files": "hotkey=5Victim\nclaim=\n", "host_key": True}, {"hotkeys": None, "host_key": True}, False),
+        # the converse: a host-key hold, then a cycle without the recorded key and a proven binding
+        ({"host_key": "other"}, {"host_key": False, "files": f"hotkey={POOL}\nclaim={CLAIM}\n"}, False),
+        # the same part proven again lifts it
+        ({"hotkeys": ("5Account", POOL), "files": "hotkey=5Victim\nclaim=\n", "host_key": True}, {"files": f"hotkey={POOL}\nclaim={CLAIM}\n", "host_key": True}, True),
+        ({"host_key": "other"}, {"host_key": True}, True),
+    ],
+)
+async def test_a_hold_lifts_only_on_proof_of_the_part_that_failed(fail, later, lifts, monkeypatch):
+    from services.task.pipeline import updates_with_clear_verified_job_evidence
+
+    monkeypatch.setattr("services.task.checks.node_account.has_live_rental", lambda ctx: False)
+
+    async def cycle(hotkeys=("5Account", POOL), files="hotkey=\nclaim=\n", host_key=False):
+        monkeypatch.setattr(
+            "services.task.checks.node_account.presented_host_key",
+            lambda ctx: "ssh-ed25519 AAAAother" if host_key == "other" else "ssh-ed25519 AAAAregistered",
+        )
+        ctx = _relay_ctx(_HostFiles(files), hotkeys=hotkeys, address="node.example.test")
+        ctx.executor.expected_ssh_host_key = "ssh-ed25519 AAAAregistered" if host_key else None
+        result = await NodeAccountCheck().run(ctx)
+        return updates_with_clear_verified_job_evidence(result, NodeAccountCheck.check_id)
+
+    failed = (await cycle(**fail))["clear_verified_job_evidence"]["check_id"]
+    assert _lifts(failed, (await cycle(**later)).get("idle_checks_passed", ())) is lifts
+
+
+async def test_both_parts_proven_list_the_whole_check_too(monkeypatch):
+    # a reset that named no check needs every idle-only check id, the bare one of this check among them
+    monkeypatch.setattr("services.task.checks.node_account.presented_host_key", lambda ctx: "ssh-ed25519 AAAAregistered")
+    ctx = _relay_ctx(_HostFiles(f"hotkey={POOL}\nclaim={CLAIM}\n"), address="node.example.test")
+    ctx.executor.expected_ssh_host_key = "ssh-ed25519 AAAAregistered"
+    result = await NodeAccountCheck().run(ctx)
+    assert result.updates == {"idle_check_passed": (HOST_KEY_PART, BINDING_PART, "executor.validate.node_account")}
 
 
 async def test_a_node_set_up_under_another_account_of_the_listing_owner_passes_by_the_portals_own_answer(monkeypatch):

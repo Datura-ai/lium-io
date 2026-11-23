@@ -39,6 +39,12 @@ READ_NODE_ACCOUNT_COMMAND = (
 )
 READ_TIMEOUT_SECONDS = 15
 
+# DAH-6784: the two parts of this check, each its own id in a reset's evidence and in a pass's idle_checks_passed. The
+# backend lifts a hold once a pass lists the id the reset named, so a hold one part left lifts only on proof of that part.
+CHECK_ID = "executor.validate.node_account"
+HOST_KEY_PART = f"{CHECK_ID}.host_key"
+BINDING_PART = f"{CHECK_ID}.account_binding"
+
 _logged_without_expected: set[str] = set()
 
 
@@ -51,7 +57,7 @@ def presented_host_key(ctx: Context) -> str:
 
 
 class NodeAccountCheck:
-    check_id = "executor.validate.node_account"
+    check_id = CHECK_ID
     replays_after_session_drop = True
     fatal = True
 
@@ -62,7 +68,7 @@ class NodeAccountCheck:
         expected = registered_host_keys(executor)
         # compared first: it needs no read, so a stalled account read cannot hide this direct evidence
         if expected and presented_host_key(ctx) not in expected:
-            return _refused(ctx, self.check_id, Msg.MISMATCH, what)
+            return _refused(ctx, self.check_id, Msg.MISMATCH, what, HOST_KEY_PART)
         binding_proven: bool | None = None  # None: the node names no account to bind it to
         if executor.expected_node_hotkeys:
             binding_proven = False
@@ -71,9 +77,10 @@ class NodeAccountCheck:
                 if isinstance(refused, CheckResult):
                     return refused
                 binding_proven = refused
-        # DAH-6784: the check ran in full when it proved all this node can be checked by (its recorded host key, the
-        # account binding it names), and at least one of them; only then may it lift a hold it left on a rented node
-        full = {"idle_check_passed": True} if binding_proven is not False and (expected or binding_proven) else {}
+        # DAH-6784: the parts this pass proved; a part whose input is missing (no recorded host key, no hotkeys listed,
+        # host files unread) is not proven, so a hold that part left stays. Both proven: the whole check too.
+        proven = (HOST_KEY_PART,) * bool(expected) + (BINDING_PART,) * (binding_proven is True)
+        full = {"idle_check_passed": proven + (CHECK_ID,) * (len(proven) == 2)} if proven else {}
         if not expected:
             if not is_ip_literal(executor.address) and executor.uuid not in _logged_without_expected:
                 _logged_without_expected.add(executor.uuid)
@@ -104,7 +111,7 @@ class NodeAccountCheck:
             # failed, timed out or closed without an exit status: a relay could stall it on purpose, so ownership is
             # not proven and the node is hidden until a cycle reads it
             what["read_error"] = result.error_type or f"exit {result.exit_code}"
-            return _refused(ctx, self.check_id, Msg.BINDING_UNVERIFIED, what)
+            return _refused(ctx, self.check_id, Msg.BINDING_UNVERIFIED, what, BINDING_PART)
         if not hotkey:
             # the read worked and found no host files: an older executor, no evidence either way
             logger.info(_m("NODE_ACCOUNT_BINDING_UNVERIFIED", extra=get_extra_info({**what, "unread": "hotkey"})))
@@ -122,10 +129,10 @@ class NodeAccountCheck:
                 logger.info(_m("NODE_ACCOUNT_BINDING_UNVERIFIED", extra=get_extra_info({**what, "unread": "claim"})))
                 return False
             return True
-        return _refused(ctx, self.check_id, Msg.BINDING_MISMATCH, what)
+        return _refused(ctx, self.check_id, Msg.BINDING_MISMATCH, what, BINDING_PART)
 
 
-def _refused(ctx: Context, check_id: str, template, what: dict) -> CheckResult:
+def _refused(ctx: Context, check_id: str, template, what: dict, part: str) -> CheckResult:
     """Like GPU_MODEL_MISMATCH: an availability entry, so the backend hides the node and refuses new rentals on its
     free GPUs too (the node stays active), and score 0. With a live rental the renter's pod runs on and is billed as
     usual: the verified job is kept and the run is not fatal, because clearing it resets the node inactive in the
@@ -140,6 +147,8 @@ def _refused(ctx: Context, check_id: str, template, what: dict) -> CheckResult:
         updates={
             "node_account_passed": False,
             "clear_verified_job_info": True,
+            # the part that failed, so only a pass that proves that part lifts the hold this reset may leave
+            "clear_verified_job_evidence": {"check_id": part},
             # has_live_rental reads a snapshot: a rental placed since must not be ended, so the backend applies this
             # reset only while no customer pod runs on the node, under its row lock
             "clear_verified_job_unrented_only": True,

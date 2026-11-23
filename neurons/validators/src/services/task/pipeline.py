@@ -517,9 +517,13 @@ def updates_with_clear_verified_job_evidence(
     rented-machine check adds the container's death diagnostics) keeps it; only the two names are filled in.
     """
     updates = dict(res.updates)
-    # DAH-6784: never a Context field of its own; a passing check's mark becomes its id in the run's list
-    if updates.pop("idle_check_passed", False) is True and res.passed:
+    # DAH-6784: never a Context field of its own; a passing check's mark becomes its id in the run's list, or the ids
+    # of the parts it proved when it names them (node_account: a hold one part left lifts only on proof of that part)
+    mark = updates.pop("idle_check_passed", False)
+    if res.passed and mark is True:
         updates["idle_checks_passed"] = (*idle_checks_passed, res.event.check_id or check_id)
+    elif res.passed and isinstance(mark, tuple) and mark and all(isinstance(part, str) for part in mark):
+        updates["idle_checks_passed"] = (*idle_checks_passed, *mark)
     if not updates.get("clear_verified_job_info"):
         return updates
     evidence = dict(updates.get("clear_verified_job_evidence") or {})

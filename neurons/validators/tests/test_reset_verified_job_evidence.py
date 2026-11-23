@@ -120,6 +120,25 @@ def test_a_passing_idle_only_check_appends_its_id_and_a_failed_one_does_not():
     assert updates_with_clear_verified_job_evidence(result(False), "x", ("a",)) == {}
 
 
+def test_a_check_that_names_its_proven_parts_appends_those_ids():
+    # DAH-6784: node_account lists the parts it proved, so a hold one part left lifts only on proof of that part
+    from datetime import UTC, datetime
+
+    from services.task.models import ValidationEvent
+    from services.task.pipeline import CheckResult, updates_with_clear_verified_job_evidence
+
+    event = ValidationEvent(
+        event="ok", reason_code="NODE_ACCOUNT_OK", severity="info", impact="", check_id="executor.validate.node_account",
+        when=datetime.now(UTC),
+    )
+    parts = ("executor.validate.node_account.host_key",)
+    marked = CheckResult(passed=True, event=event, updates={"idle_check_passed": parts})
+    assert updates_with_clear_verified_job_evidence(marked, "x", ("a",)) == {"idle_checks_passed": ("a", *parts)}
+    for bad in ((), ("x", 1), ["x"], "x"):
+        odd = CheckResult(passed=True, event=event, updates={"idle_check_passed": bad})
+        assert updates_with_clear_verified_job_evidence(odd, "x") == {}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("success", [True, False])
 async def test_the_result_carries_the_idle_only_checks_that_passed_once_each(context_factory, success):
