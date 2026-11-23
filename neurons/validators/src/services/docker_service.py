@@ -4588,7 +4588,7 @@ class DockerService:
             ulimits=self._memlock_ulimit_for(devices, memory_gb),
             devices=devices,
             device_requests=gpu_devices.device_requests,
-            cpu_count=cpu_count,
+            cpu_count=self._rental_cpu_count(cpu_count),
             memory_gb=memory_gb,
             memory_swap_gb=memory_gb if swap_off else None,
             oom_score_adj=settings.RENTAL_CONTAINER_OOM_SCORE_ADJ if swap_off else None,
@@ -4599,6 +4599,9 @@ class DockerService:
             ),
             pids_limit=self._rental_pids_limit(cpu_count, host_pid_max),
             shm_size=custom_options.shm_size,
+            # Docker's json-file log is unbounded by default and sits outside --storage-opt, so a
+            # pod printing to stdout could fill the host disk under the Docker root
+            log_opts={"max-size": settings.RENTAL_LOG_MAX_SIZE, "max-file": str(settings.RENTAL_LOG_MAX_FILE)},
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
             labels={LIUM_POD_ID_LABEL: payload.pod_id},
@@ -4727,6 +4730,19 @@ class DockerService:
                     why = "not positive"
         logger.warning(_m(f"Host kernel.pid_max could not be read: {why}"))
         return None
+
+    @staticmethod
+    def _rental_cpu_count(cpu_count: int | None) -> int | None:
+        """The rental's --cpus: exactly the count the backend sent for this pod (DAH-5951).
+
+        The backend is the one source: it holds the host's reserved core back (rentable_cpu_count) before it
+        lists the node and before it sizes the pod, so the listing and the pod cannot disagree. A count
+        above the host's CPUs is refused by Docker at create, so a malformed count fails the rental closed.
+        No per-pod cap (None: the validator's own probe pod, a legacy row) stays uncapped, as before."""
+        if cpu_count is None:
+            return None
+        # a 1-GPU slice of a small host rounds down to 0 cores, and 0 means no --cpus (the whole host)
+        return max(cpu_count, 1)
 
     async def _read_host_ram_kib(self, ssh_client) -> int | None:
         """The executor host's MemTotal in KiB, or None when unreadable. Same bounded read as pid_max."""

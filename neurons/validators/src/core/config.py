@@ -968,6 +968,14 @@ class Settings(BaseSettings):
             "376 GiB host used 14 GiB outside the rental's cgroup, more than the former 3 %)."
         ),
     )
+    RENTAL_LOG_MAX_SIZE: str = Field(
+        env="RENTAL_LOG_MAX_SIZE", default="100m",
+        description="json-file max-size of a rental container's log, so its stdout cannot fill the host disk.",
+    )
+    RENTAL_LOG_MAX_FILE: int = Field(
+        env="RENTAL_LOG_MAX_FILE", default=3, gt=0,
+        description="json-file max-file of a rental container's log (see RENTAL_LOG_MAX_SIZE).",
+    )
     CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS: int = Field(
         env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60, gt=0,
         description=(
