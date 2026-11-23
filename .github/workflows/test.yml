@@ -376,7 +376,7 @@ jobs:
               md = d / 'summary.md'
               body = md.read_text().strip() if md.exists() else '**e2e gate: FAIL**: no summary written'
               first, _, rest = body.partition('\n')
-              present[d.name] = 'PASS' in first
+              present[d.name.removeprefix('e2e-')] = 'PASS' in first
               t = d / 'timings.txt'
               suites = [l.split('\t')[0].removeprefix('test-') for l in t.read_text().splitlines() if l.startswith('test-')] if t.exists() else []
               blocks.append(f"### {' + '.join(suites) or d.name}\n\n{rest.strip()}\n")
