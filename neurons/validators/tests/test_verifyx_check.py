@@ -1112,25 +1112,11 @@ def _kept_volume_state(by_volume: dict | None, kept_ids: list[str]):
     )
 
 
-@pytest.mark.parametrize(
-    "by_volume, kept_ids, expected",
-    [
-        # 30 GB kept: 70 GB free beside it meet the 100 GB floor
-        ({f"volume_{_KEPT_POD}": 30 * _KB_PER_GB}, [_KEPT_POD], {"storage_min_available_gb": 70}),
-        # a large kept volume never lowers the floor below the listing's real free-disk floor
-        ({f"volume_{_KEPT_POD}": 500 * _KB_PER_GB}, [_KEPT_POD], {"storage_min_available_gb": 50}),
-        # no kept volume, a listed volume not on this host, an unreadable size: the call is today's
-        ({f"volume_{_KEPT_POD}": 30 * _KB_PER_GB}, [], None),
-        ({"volume_other": 30 * _KB_PER_GB}, [_KEPT_POD], None),
-        ({f"volume_{_KEPT_POD}": "n/a"}, [_KEPT_POD], None),
-        ({f"volume_{_KEPT_POD}": None}, [_KEPT_POD], None),
-        (None, [_KEPT_POD], None),
-    ],
-)
+@pytest.mark.parametrize("first_pass", [False, True])
 @pytest.mark.asyncio
-async def test_verifyx_storage_floor_counts_a_kept_volume_as_free(
-    context_factory, monkeypatch, by_volume, kept_ids, expected
-):
+async def test_a_kept_volume_claim_never_lowers_the_storage_floor(context_factory, monkeypatch, first_pass):
+    # review: the per-volume size is the node's own report, so an oversized claim for a retained id must not
+    # lower the floor this challenge measures independently
     monkeypatch.setattr(verifyx_module.settings.verifyx, "STORAGE_MIN_AVAILABLE_GB", 100)
     monkeypatch.setattr(verifyx_module.settings, "MIN_FREE_DISK_GB", 50)
     verifyx_service = DummyVerifyXService(
@@ -1138,24 +1124,11 @@ async def test_verifyx_storage_floor_counts_a_kept_volume_as_free(
     )
     ctx = context_factory(
         services=build_services(verifyx=verifyx_service),
-        config=build_context_config(),
-        state=_kept_volume_state(by_volume, kept_ids),
+        config=build_context_config(first_pass=first_pass),
+        state=_kept_volume_state({f"volume_{_KEPT_POD}": 500 * _KB_PER_GB}, [_KEPT_POD]),
     )
 
     await VerifyXCheck().run(ctx)
 
-    assert verifyx_service.called_with["challenge_config_overrides"] == expected
-
-
-def test_a_first_pass_keeps_its_sizing_beside_the_kept_volume_floor(context_factory, monkeypatch):
-    monkeypatch.setattr(verifyx_module.settings.verifyx, "STORAGE_MIN_AVAILABLE_GB", 100)
-    monkeypatch.setattr(verifyx_module.settings, "MIN_FREE_DISK_GB", 50)
-    ctx = context_factory(
-        config=build_context_config(first_pass=True),
-        state=_kept_volume_state({f"volume_{_KEPT_POD}": 30 * _KB_PER_GB}, [_KEPT_POD]),
-    )
-
-    assert verifyx_module.verifyx_challenge_config(ctx) == {
-        **verifyx_module._first_pass_challenge_config(),
-        "storage_min_available_gb": 70,
-    }
+    overrides = verifyx_service.called_with.get("challenge_config_overrides") or {}
+    assert "storage_min_available_gb" not in overrides

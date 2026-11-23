@@ -4,7 +4,6 @@ import asyncio
 import copy
 import json
 import logging
-import math
 import secrets
 import time
 from dataclasses import asdict, dataclass, replace
@@ -32,7 +31,7 @@ from services.verifyx_validation_service import (
 
 from ..messages import VerifyXMessages as Msg, render_message, shown
 from ..pipeline import CheckResult, Context
-from .disk_space import KB_PER_GB, DiskSpaceCheck, kept_volume_kb
+from .disk_space import DiskSpaceCheck
 from .rental_probe import has_standing_failure
 from .network_ema import compute_ema
 from .task_time import task_seconds_left
@@ -266,14 +265,15 @@ class VerifyXCheck:
             )
 
         # DAH-3011: a first, unscored verification writes less RAM/disk (the measurements are still
-        # taken and published). The keyword is only passed when a key is replaced, so an ordinary
-        # scored call is byte-for-byte today's.
-        overrides = (
-            FILLER_REFRESH_CHALLENGE_CONFIG
-            if filler_refresh and not ctx.config.first_pass
-            else verifyx_challenge_config(ctx)
+        # taken and published). The keyword is only passed on that path so the scored call is
+        # byte-for-byte today's.
+        sizing = (
+            {"challenge_config_overrides": _first_pass_challenge_config()}
+            if ctx.config.first_pass
+            else {"challenge_config_overrides": FILLER_REFRESH_CHALLENGE_CONFIG}
+            if filler_refresh
+            else {}
         )
-        sizing = {"challenge_config_overrides": overrides} if overrides else {}
         # liumd phase 1: LocalVerifyCheck already ran this challenge through `POST /verify` and
         # judged it with evaluate_verifyx_capture — the same function the SSH path ends in. Only a
         # PASSING local result is consumed; anything else (and the cold-sample retry below) runs
@@ -585,22 +585,6 @@ FILLER_REFRESH_CHALLENGE_CONFIG = {
     "storage_min_available_gb": 1,
     "storage_throughput_test_gb": 1,
 }
-
-
-def verifyx_challenge_config(ctx: Context) -> dict[str, float]:
-    """The challenge config keys this run replaces: the first pass's sizing, the kept-volume storage floor."""
-    return {**(_first_pass_challenge_config() if ctx.config.first_pass else {}), **_kept_volume_storage_floor(ctx)}
-
-
-def _kept_volume_storage_floor(ctx: Context) -> dict[str, int]:
-    """DAH-3333: the volume a balance stop keeps is the renter's for a day and leaves with them, so it counts toward
-    the storage floor like free disk. The floor never drops below the listing's free-disk floor: a new rental gets
-    only real free disk (resolve_volume_sizing sizes it on df free), so that much must be free beside the volume."""
-    kept_gb = math.floor(kept_volume_kb(ctx) / KB_PER_GB)
-    floor_gb = settings.verifyx.STORAGE_MIN_AVAILABLE_GB
-    if not kept_gb or floor_gb <= settings.MIN_FREE_DISK_GB:
-        return {}
-    return {"storage_min_available_gb": max(floor_gb - kept_gb, settings.MIN_FREE_DISK_GB)}
 
 
 def _first_pass_challenge_config() -> dict[str, float]:
