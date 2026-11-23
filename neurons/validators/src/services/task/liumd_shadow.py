@@ -745,6 +745,10 @@ def _facts(ctx: Context, answer: LocalVerifyAnswer) -> dict[str, Any]:
         reason = python_specs.get("needrestart_guard_reason")
         if isinstance(reason, str) and reason:
             extra.update({"needrestart_guard", "needrestart_guard_unguarded"})
+        if python_specs.get("needrestart_guard") == "missing" and liumd_specs.get(
+            "needrestart_guard"
+        ) in {"present", "partial"}:
+            extra.update({"needrestart_guard", "needrestart_guard_unguarded"})
         for value_key, error_key in (
             ("storage_limit_supported", "storage_limit_scrape_error"),
             ("sysbox_runtime", "sysbox_runtime_scrape_error"),
