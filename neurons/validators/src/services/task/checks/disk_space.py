@@ -6,9 +6,9 @@ from dataclasses import replace
 from typing import Any
 
 from services.const import MAX_DISK_UTILIZATION_PERCENT
+from services.container_cleanup import retained_volume_pod_ids
 
 from core.config import settings
-from services.container_cleanup import retained_volume_pod_ids
 
 from ..messages import DiskSpaceMessages as Msg
 from ..messages import render_message, shown
