@@ -526,6 +526,7 @@ async def test_live_and_python_timeout_fields_are_not_a_specs_difference(
         "infiniband_ports": [{"state": "down"}],
         "needrestart_guard": "present",
         "needrestart_guard_unguarded": [],
+        "needrestart_guard_reason": "a later conf file runs code",
         "storage_limit_supported": True,
         "sysbox_runtime": True,
         "interconnect_scrape_error": "NVMLError(999)",

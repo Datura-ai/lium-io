@@ -614,7 +614,6 @@ NOT_COMPARABLE_SPEC_PATHS = frozenset(
         "host_memory.mapped_outside_workloads_kb",
         "egress_ip",
         "infiniband_ports",
-        "needrestart_guard_reason",
     }
 )
 LIVE_GPU_DETAIL_FIELDS = frozenset(
