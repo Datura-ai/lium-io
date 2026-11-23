@@ -1,7 +1,5 @@
-"""A renter's pod leaves the host room for its own work: container logs rotate and CPU keeps a reserve."""
-
-import asyncio
-from types import SimpleNamespace
+"""A renter's pod leaves the host room for its own work: container logs rotate, and the pod gets exactly the CPU
+count the backend sent, which already holds the host's core back (DAH-5951: one source for the reserve)."""
 
 import pytest
 
@@ -34,26 +32,16 @@ def test_a_rental_container_log_is_capped_so_stdout_cannot_fill_the_host_disk(sv
 
 
 @pytest.mark.parametrize(
-    "cpu_count, host_cpus, expected",
+    "cpu_count, expected",
     [
-        (128, 128, 128 - settings.RENTAL_HOST_CPU_RESERVE),  # whole host: keeps the reserve
-        (16, 128, 16),  # a split pod already below the host is unchanged
-        (128, None, 128),  # host count unknown: the backend's value
-        (None, 128, None),  # no per-pod cap (CVM) stays uncapped
-        (2, 1, 2),  # a host too small for the reserve keeps the backend's value
-        (4, 2, 4 - settings.RENTAL_HOST_CPU_RESERVE),  # a low host count never cuts more than the reserve
-        (0, 8, 1),  # a 1-GPU slice of an 8-core 8-GPU host rounds to 0: floored at 1, never unlimited
-        (0, None, 1),  # same with the host count unread
+        (127, 127),  # whole host: the backend already held the host's core back
+        (16, 16),  # a split pod
+        (None, None),  # no per-pod cap (the validator's probe pod, a legacy row) stays uncapped
+        (0, 1),  # a 1-GPU slice of an 8-core 8-GPU host rounds to 0: floored at 1, never unlimited
     ],
 )
-def test_rental_cpu_count_leaves_the_host_reserve(cpu_count, host_cpus, expected):
-    assert DockerService._rental_cpu_count(cpu_count, host_cpus) == expected
-
-
-def test_a_whole_host_rental_does_not_get_every_host_core(svc):  # noqa: F811
-    run_spec = _run_spec(svc, 30, cpu_count=64, host_cpu_count=64)
-
-    assert run_spec.cpu_count == 64 - settings.RENTAL_HOST_CPU_RESERVE
+def test_rental_cpu_count_is_the_backends_count(cpu_count, expected):
+    assert DockerService._rental_cpu_count(cpu_count) == expected
 
 
 def test_the_cvm_quote_broker_log_is_capped_like_a_rental():
@@ -63,19 +51,3 @@ def test_the_cvm_quote_broker_log_is_capped_like_a_rental():
         "max-size": settings.RENTAL_LOG_MAX_SIZE,
         "max-file": str(settings.RENTAL_LOG_MAX_FILE),
     }
-
-
-def test_read_host_cpu_count_counts_the_processors(svc):  # noqa: F811
-    class _Ssh:
-        async def run(self, cmd, check=False, timeout=None):
-            return SimpleNamespace(exit_status=0, stdout="96\n")
-
-    assert asyncio.run(svc._read_host_cpu_count(_Ssh())) == 96
-
-
-def test_read_host_cpu_count_is_none_on_a_failed_read(svc):  # noqa: F811
-    class _Ssh:
-        async def run(self, cmd, check=False, timeout=None):
-            return SimpleNamespace(exit_status=1, stdout="")
-
-    assert asyncio.run(svc._read_host_cpu_count(_Ssh())) is None

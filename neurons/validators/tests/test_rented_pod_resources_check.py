@@ -247,3 +247,12 @@ async def test_scored_finding_wins_over_dead_proc_fuse_mount(context_factory):
     result = await _run(_ctx(context_factory, _ssh(_container(cpuset="2-7"), proc_err=err)))
     assert result.passed is False
     assert result.event.reason_code == Msg.RESOURCES_REDUCED.reason
+
+
+def test_dead_proc_fuse_text_claims_no_cause_and_asks_no_runtime_restart():
+    """the read sees only ENOTCONN, never why: it must not tell a provider sysbox-fs restarted (a provider's
+    sysbox-fs was still the 13/14 Nov process after our 17 Nov notice said it restarted), nor to restart sysbox"""
+    text = Msg.PROC_FUSE_DISCONNECTED.remediation
+    assert "stopped or restarted" not in text
+    assert "restart it" not in text
+    assert "RENTED_POD_OWNERSHIP_RUNTIME_RESTARTED" in text
