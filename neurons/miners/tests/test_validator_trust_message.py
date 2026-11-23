@@ -4,6 +4,7 @@ Real signatures with ephemeral keypairs; a temp SQLite database stands in for th
 """
 
 import json
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
@@ -289,3 +290,59 @@ async def test_a_database_a_staging_build_wrote_never_chooses_a_release_builds_t
     monkeypatch.setattr(trust_service, "read_subnet_owner_coldkey", chain)
     assert await prod.refresh_owner()
     assert prod.held is None and new_validator.ss58_address not in prod.trusted_before
+
+
+def _chain_names(monkeypatch, owner_key) -> None:
+    async def chain(url):
+        return owner_key.ss58_address
+
+    monkeypatch.setattr(trust_service, "read_subnet_owner_coldkey", chain)
+
+
+@pytest.mark.asyncio
+async def test_two_owner_rotations_and_a_restart_with_the_chain_down_keep_the_rotated_validator(
+    tmp_path, monkeypatch, engine, owner, old_validator, new_validator
+):
+    second, third = Keypair.create_from_uri("//LiumTrustSecondOwner"), Keypair.create_from_uri("//LiumTrustThirdOwner")
+    image = _image(tmp_path, _signed(owner, old_validator, 1))
+    trust = _start(monkeypatch, engine, image)
+    _chain_names(monkeypatch, second)
+    assert await trust.refresh_owner()
+    _serves(monkeypatch, lambda: _signed(second, new_validator, 5)._asdict())   # B, signed by the chain owner
+    await trust.refresh_message()
+    _chain_names(monkeypatch, third)
+    assert await trust.refresh_owner()
+    # restart: backend and chain down, the image still names the release owner's rev 1
+    _serves(monkeypatch, _down)
+    monkeypatch.setattr(trust_service, "read_subnet_owner_coldkey", _down)
+    restarted = _start(monkeypatch, engine, image)
+    assert (restarted.report()["validator"], restarted.report()["revision"]) == (new_validator.ss58_address, 5)
+    assert _signs_in(new_validator.ss58_address)
+
+
+def test_a_staging_written_row_marked_chain_confirmed_is_dropped_by_a_release_build(
+    tmp_path, monkeypatch, engine, owner, new_validator
+):
+    signed = _signed(owner, new_validator, 9)   # even a release line the release owner signed
+    with Session(engine) as session:
+        session.add(ValidatorTrustMessage(revision=9, signer=owner.ss58_address, network="test",
+                                          owner_confirmed_at=datetime.now(UTC), **signed._asdict()))
+        session.commit()
+    trust = _start(monkeypatch, engine, tmp_path / "absent.json")
+    assert trust.held is None and new_validator.ss58_address not in trust.trusted_before
+
+
+@pytest.mark.asyncio
+async def test_an_unmarked_row_counts_only_while_its_signer_is_the_release_or_chain_owner(
+    tmp_path, monkeypatch, engine, owner, old_validator, new_validator
+):
+    other = Keypair.create_from_uri("//LiumTrustNotTheOwner")
+    with Session(engine) as session:   # rows stored before the marks were kept
+        session.add(ValidatorTrustMessage(revision=3, signer=owner.ss58_address, **_signed(owner, old_validator, 3)._asdict()))
+        session.add(ValidatorTrustMessage(revision=4, signer=other.ss58_address, **_signed(other, new_validator, 4)._asdict()))
+        session.commit()
+    trust = _start(monkeypatch, engine, tmp_path / "absent.json")
+    assert trust.report()["validator"] == old_validator.ss58_address
+    _chain_names(monkeypatch, owner)
+    assert await trust.refresh_owner()
+    assert trust.report()["revision"] == 3 and new_validator.ss58_address not in trust.trusted_before

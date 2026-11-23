@@ -10,6 +10,12 @@ Every message taken is kept in the miner database (table validator_trust_message
 trusting the same validator with the backend and the chain both unreachable; at start the highest revision of the
 stored ones and the image copy wins. A failed write is logged and tried again at the next refresh.
 
+Each row records the network of the build that wrote it and when a chain read had named its signer as the subnet
+owner. At start a row another kind of build wrote is dropped; a row whose signer the chain confirmed is checked
+against that signer, so a node keeps a rotated owner's validator across a restart with the chain down; any other row
+(one written before the owner was read, or before these marks were kept) counts only while its signer is the release
+owner or, after a chain read, the chain owner.
+
 The executor rows keyed to a validator this miner trusted before (or to a baked hotkey) are served to the trusted
 one, so a validator change needs no row migration. While no message is held, the miner trusts the baked hotkeys
 (core.config). A non-prod build (core/config_override.py) names its own validator; when it also names a staging owner key (datura.validator_trust.override_trust) it follows messages that key signed,
@@ -22,6 +28,7 @@ import asyncio
 import json
 import logging
 import random
+from datetime import UTC, datetime
 from http import HTTPStatus
 from pathlib import Path
 
@@ -112,6 +119,8 @@ class ValidatorTrust:
         self.owner = self.release_owner
         # stored messages the release owner did not sign: taken only once a chain read names their signer as the owner
         self._deferred: list[SignedTrustMessage] = []
+        # the owner the last successful chain read named; a message it signed is stored as chain-confirmed
+        self._chain_owner: str | None = None
         self.held: TrustedValidator | None = None
         # every validator a message named that this miner took, the held one included
         self.trusted_before: set[str] = set()
@@ -134,10 +143,16 @@ class ValidatorTrust:
             # build: its own key), and one another key signed waits for a chain read that names that key (a database a
             # non-prod build wrote must not choose the owner, or the validators trusted before, of a release build)
             signed = SignedTrustMessage(row.message, row.signature)
+            if row.network is not None and row.network != self.network:
+                logger.warning("Validator trust: stored message %d ignored: written by a %r build", row.revision,
+                               row.network)
+                continue
+            # only a row this kind of build wrote after a chain read named its signer keeps that signer
+            confirmed = self.read_chain and row.network is not None and row.owner_confirmed_at is not None
             try:
-                self._hold(signed, self.owner, stored=True)
+                self._hold(signed, row.signer if confirmed else self.owner, stored=True)
             except Exception as exc:
-                if self.read_chain:
+                if self.read_chain and not confirmed:
                     self._deferred.append(signed)
                 else:
                     logger.warning("Validator trust: stored message %d ignored: %s", row.revision, exc)
@@ -161,7 +176,9 @@ class ValidatorTrust:
         if not stored:
             self._unsaved.append(
                 ValidatorTrustMessage(
-                    revision=trusted.revision, message=signed.message, signature=signed.signature, signer=signer
+                    revision=trusted.revision, message=signed.message, signature=signed.signature, signer=signer,
+                    network=self.network,
+                    owner_confirmed_at=datetime.now(UTC) if signer == self._chain_owner else None,
                 )
             )
             logger.warning("Validator trust: now trusting %s (revision %d)", trusted.validator, trusted.revision)
@@ -249,10 +266,12 @@ class ValidatorTrust:
         if owner != self.owner:
             logger.warning("Validator trust: subnet owner changed from %s to %s", self.owner, owner)
             self.owner = owner
+        self._chain_owner = owner
         deferred, self._deferred = self._deferred, []
         for signed in deferred:
             try:
-                self._hold(signed, owner, stored=True)
+                # stored again, now with this build's network and the chain confirmation
+                self._hold(signed, owner)
             except Exception as exc:
                 logger.warning("Validator trust: stored message dropped, not the chain owner's: %s", exc)
         return True

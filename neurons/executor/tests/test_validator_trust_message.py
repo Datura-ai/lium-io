@@ -496,3 +496,26 @@ def test_a_kept_message_of_a_new_owner_waits_for_the_chain_read(tmp_path, monkey
     assert asyncio.run(restarted.refresh_owner())
     assert (restarted.owner, restarted.held.validator, restarted.held.revision) == (
         new_owner.ss58_address, new_validator.ss58_address, 9)
+
+
+def test_a_save_while_the_chain_is_down_keeps_the_waiting_message_on_the_volume(
+    tmp_path, monkeypatch, owner, new_owner, old_validator, new_validator
+):
+    # the volume holds a newer owner's rev 5 (B), the image the release owner's rev 1 (A), the chain is down at start
+    waiting = _signed(new_owner, new_validator, 5)
+    (tmp_path / trust_service.STATE_FILE).write_text(json.dumps(
+        {"owner": new_owner.ss58_address, "signer": new_owner.ss58_address, "message": waiting._asdict()}))
+    image = _image(tmp_path, _signed(owner, old_validator, 1))
+    _chain(monkeypatch, _down)
+    _backend(monkeypatch, _down)
+    trust = _trust(tmp_path, image)
+    assert trust.held.validator == old_validator.ss58_address
+    assert not asyncio.run(trust.refresh_owner())
+    asyncio.run(trust.refresh_message())   # the first tick writes the image message
+    kept = json.loads((tmp_path / trust_service.STATE_FILE).read_text())
+    assert kept["deferred"] == waiting._asdict()
+    restarted = _trust(tmp_path, image)   # a restart before any chain read still has B to confirm
+    _chain(monkeypatch, lambda url: new_owner.ss58_address)
+    assert asyncio.run(restarted.refresh_owner())
+    assert (restarted.held.validator, restarted.held.revision) == (new_validator.ss58_address, 5)
+    assert json.loads((tmp_path / trust_service.STATE_FILE).read_text())["deferred"] is None

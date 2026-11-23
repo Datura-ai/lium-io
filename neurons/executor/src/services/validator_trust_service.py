@@ -7,9 +7,12 @@ minutes, and from the image
 owner's coldkey signed it and its revision is higher than the held one's (one counter, whoever signed the held one);
 on any error the held message stays.
 
-The taken message, the key that signed it and the current owner are kept in one small file on the reserve_data
-volume, which outlives a container recreate, so a restarted node keeps trusting the same validator with the backend
-and the chain both unreachable. The file is written atomically, off the event loop, when a message or an owner is
+The taken message is kept in one small file on the reserve_data volume, which outlives a container recreate, with a
+kept message that still waits for a chain read (below); the file also names the signer and the owner for readers,
+but a start never takes an owner or a signer from it. A restarted node checks the kept message against the release
+owner (a fixed owner's build: its own key), so with the backend and the chain both unreachable it keeps trusting the
+same validator; a message another key signed (an owner rotated since the release) stays on the volume, untrusted,
+until a chain read names that key as the owner. The file is written atomically, off the event loop, when a message or an owner is
 taken; a failed write is logged and tried again at the next refresh. A missing, unreadable or badly signed file is
 ignored: the node uses the image copy, else the baked hotkeys, and keeps polling.
 
@@ -17,7 +20,7 @@ The owner coldkey starts as the address known at release and is re-read from the
 about once an hour with random jitter. A new owner is taken only when every public node answers with it; a failed or
 disagreeing read keeps the known owner, whose messages are still taken (a chain outage never blocks a validator
 change). An owner change only changes the key that verifies new messages: the held validator stays until the new
-owner signs a higher revision.
+owner signs a higher revision; after a restart it is held again once the chain read confirms that owner.
 
 While no message is held, the executor trusts the hotkeys baked into the image (core.config), as before. A non-prod
 build (core/config_override.py) names its own validator; when it also names a staging owner key
@@ -153,8 +156,8 @@ class ValidatorTrust:
             return
         try:
             state = json.loads((self.state_dir / STATE_FILE).read_text())
-            if state["message"] is not None:
-                kept = _signed(state["message"])
+            # the held message, then one that waited for a chain read when this state was written
+            for kept in [_signed(state[k]) for k in ("message", "deferred") if state.get(k) is not None]:
                 try:
                     self._hold(kept, self.owner)
                 except ValueError:
@@ -203,6 +206,8 @@ class ValidatorTrust:
             "owner": self.owner,
             "signer": self.held_signer,
             "message": self.held_signed._asdict() if self.held_signed else None,
+            # a kept message waiting for the chain read: written back, so a save before that read never drops it
+            "deferred": self._deferred._asdict() if self._deferred else None,
         }
 
     async def save(self) -> None:
@@ -260,7 +265,7 @@ class ValidatorTrust:
             logger.warning("Validator trust: subnet owner changed from %s to %s", self.owner, owner)
             self.owner, self._unsaved = owner, True
         if self._deferred is not None:
-            kept, self._deferred = self._deferred, None
+            kept, self._deferred, self._unsaved = self._deferred, None, True
             try:
                 self._hold(kept, owner)
             except ValueError as exc:
