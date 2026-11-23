@@ -22,7 +22,6 @@ from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
 from .gpu_loss_hold import GpuLossHoldCheck
 from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
-from .task_time import task_seconds_left
 from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
 
 logger = logging.getLogger(__name__)
