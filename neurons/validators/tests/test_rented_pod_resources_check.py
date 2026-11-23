@@ -310,3 +310,12 @@ async def test_a_failed_proc_read_sends_no_verdict_so_an_earlier_fault_stands(co
     result = await _run(_ctx(context_factory, ssh))
     assert result.passed is True
     assert "state" not in result.updates
+
+
+def test_dead_proc_fuse_text_claims_no_cause_and_asks_no_runtime_restart():
+    """the read sees only ENOTCONN, never why: it must not tell a provider sysbox-fs restarted (a provider's
+    sysbox-fs was still the 13/14 Nov process after our 17 Nov notice said it restarted), nor to restart sysbox"""
+    text = Msg.PROC_FUSE_DISCONNECTED.remediation
+    assert "stopped or restarted" not in text
+    assert "restart it" not in text
+    assert "RENTED_POD_OWNERSHIP_RUNTIME_RESTARTED" in text

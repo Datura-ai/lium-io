@@ -3,6 +3,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -32,10 +33,10 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     logger.debug(
         f"Validation error on {request.method} {request.url.path}: {exc.errors()}"
     )
-    return JSONResponse(
-        status_code=422,
-        content={"detail": exc.errors()},
-    )
+    # the errors echo the request's input, which can be raw bytes (a non-JSON body): encoded as text (undecodable
+    # bytes replaced), so the answer is the 422 it should be and never a 500 from encoding it
+    detail = jsonable_encoder(exc.errors(), custom_encoder={bytes: lambda raw: raw.decode("utf-8", "replace")})
+    return JSONResponse(status_code=422, content={"detail": detail})
 
 
 @asynccontextmanager
