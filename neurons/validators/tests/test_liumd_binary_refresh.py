@@ -28,12 +28,16 @@ class Runner:
         local="old-build",
         local_present=True,
         download_sha="a" * 64,
+        download_rc=0,
+        install_ok=True,
         version_error=False,
     ):
         self.arch = arch
         self.local = local
         self.local_present = local_present
         self.download_sha = download_sha
+        self.download_rc = download_rc
+        self.install_ok = install_ok
         self.version_error = version_error
         self.calls: list[str] = []
         self.installed = False
@@ -63,6 +67,13 @@ class Runner:
                 success=True, stdout=self.arch + "\n", stderr="", exit_status=0
             )
         if command.startswith("curl "):
+            if self.download_rc:
+                return SimpleNamespace(
+                    success=True,
+                    stdout=f"RC:{self.download_rc}\n",
+                    stderr="curl: (22) 404",
+                    exit_status=0,
+                )
             return SimpleNamespace(
                 success=True,
                 stdout=f"RC:0\n{self.download_sha}  /tmp/liumd.binary.fetch\n",
@@ -70,6 +81,13 @@ class Runner:
                 exit_status=0,
             )
         if command.startswith("install -m 0755"):
+            if not self.install_ok:
+                return SimpleNamespace(
+                    success=False,
+                    stdout="",
+                    stderr="install: permission denied",
+                    exit_status=1,
+                )
             self.installed = True
             return SimpleNamespace(
                 success=True,
@@ -303,3 +321,83 @@ async def test_the_answer_build_refreshes_without_a_version_command(monkeypatch)
     install = [c for c in runner.calls if c.startswith("install -m 0755")]
     assert len(install) == 1
     assert "sha256sum /usr/local/bin/liumd" in install[0]
+
+
+@pytest.mark.asyncio
+async def test_an_answer_on_the_expected_build_is_not_downloaded(monkeypatch):
+    runner = Runner()
+    fetch, fetches = _manifest_fetcher()
+    monkeypatch.setattr(liumd_binary_refresh, "_fetch_manifest", fetch)
+
+    result = await liumd_binary_refresh.refresh_liumd_from_answer(
+        _ctx(runner), NEW_BUILD, "x86_64-unknown-linux-gnu", budget_seconds=60
+    )
+
+    assert result.ok is True
+    assert result.changed is False
+    assert len(fetches) == 1
+    assert runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_failed_answer_download_keeps_the_usable_answer(monkeypatch):
+    runner = Runner(download_rc=22)
+    fetch, _ = _manifest_fetcher()
+    monkeypatch.setattr(liumd_binary_refresh, "_fetch_manifest", fetch)
+
+    result = await liumd_binary_refresh.refresh_liumd_from_answer(
+        _ctx(runner), "old-build", "x86_64-unknown-linux-gnu", budget_seconds=60
+    )
+
+    assert result.ok is False
+    assert result.skipped is True
+    assert result.build_sha == "old-build"
+    assert "404" in result.detail
+    assert not any(c.startswith("install -m 0755") for c in runner.calls)
+
+
+@pytest.mark.asyncio
+async def test_a_wrong_answer_download_hash_keeps_the_usable_answer(monkeypatch):
+    runner = Runner(download_sha="c" * 64)
+    fetch, _ = _manifest_fetcher()
+    monkeypatch.setattr(liumd_binary_refresh, "_fetch_manifest", fetch)
+
+    result = await liumd_binary_refresh.refresh_liumd_from_answer(
+        _ctx(runner), "old-build", "x86_64-unknown-linux-gnu", budget_seconds=60
+    )
+
+    assert result.ok is False
+    assert result.skipped is True
+    assert "does not match" in result.detail
+    assert runner.installed is False
+
+
+@pytest.mark.asyncio
+async def test_a_failed_answer_install_keeps_the_usable_answer(monkeypatch):
+    runner = Runner(install_ok=False)
+    fetch, _ = _manifest_fetcher()
+    monkeypatch.setattr(liumd_binary_refresh, "_fetch_manifest", fetch)
+
+    result = await liumd_binary_refresh.refresh_liumd_from_answer(
+        _ctx(runner), "old-build", "x86_64-unknown-linux-gnu", budget_seconds=60
+    )
+
+    assert result.ok is False
+    assert result.skipped is True
+    assert "permission denied" in result.detail
+    assert runner.installed is False
+
+
+@pytest.mark.asyncio
+async def test_a_failed_answer_repair_without_a_build_is_not_skipped(monkeypatch):
+    runner = Runner(local_present=False, download_rc=22)
+    fetch, _ = _manifest_fetcher()
+    monkeypatch.setattr(liumd_binary_refresh, "_fetch_manifest", fetch)
+
+    result = await liumd_binary_refresh.refresh_liumd_from_answer(
+        _ctx(runner), "", None, budget_seconds=60
+    )
+
+    assert result.ok is False
+    assert result.skipped is False
+    assert not any(c.endswith(" version") for c in runner.calls)

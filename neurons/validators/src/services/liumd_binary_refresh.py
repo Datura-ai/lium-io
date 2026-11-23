@@ -332,9 +332,16 @@ async def _refresh_from_answer(
         url = urljoin(settings.LIUMD_BINARY_MANIFEST_URL, filename)
         fetched_sha, error = await _download(ctx, url, max(1, int(remaining)))
         if fetched_sha is None:
-            return LiumdRefresh(False, build_sha, error or "download failed")
+            return LiumdRefresh(
+                False, build_sha, error or "download failed", skipped=bool(build_sha)
+            )
         if fetched_sha != expected_sha:
-            return LiumdRefresh(False, build_sha, "downloaded sha256 does not match manifest")
+            return LiumdRefresh(
+                False,
+                build_sha,
+                "downloaded sha256 does not match manifest",
+                skipped=bool(build_sha),
+            )
 
         install = await _run(
             ctx,
@@ -347,6 +354,7 @@ async def _refresh_from_answer(
                 False,
                 build_sha,
                 (install.stderr or install.stdout or "install failed")[-300:],
+                skipped=bool(build_sha),
             )
         installed_sha = None
         for line in (install.stdout or "").splitlines():
