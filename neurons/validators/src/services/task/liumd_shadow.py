@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from datura.requests.validator_requests import MatmulStep, VerifyXStep
+from services.liumd_binary_refresh import refresh_liumd_from_answer
 from services.liumd_exec_client import LiumdExecClient, LiumdRefusal
 from services.local_verify_client import (
     DETAIL_MAX_CHARS,
@@ -179,17 +180,63 @@ def start_facts_after_scrape(
 async def _facts_only(ctx: Context, client_factory: Callable[[Context, float], Any]) -> Any:
     """The liumd answer to a facts-only intent, or the LocalVerifyUnavailable it failed with."""
     budget = float(settings.LIUMD_SHADOW_TIMEOUT_SECONDS)
-    intent = build_intent(
-        executor_uuid=ctx.executor.uuid,
-        miner_hotkey=ctx.miner_hotkey,
-        matmul=None,
-        verifyx=None,
-        parallel_gpu=False,
-        deadline_s=executor_deadline_s(int(budget)),
-    )
-    intent["steps"]["inspector"] = False
+
+    def make_intent() -> dict[str, Any]:
+        intent = build_intent(
+            executor_uuid=ctx.executor.uuid,
+            miner_hotkey=ctx.miner_hotkey,
+            matmul=None,
+            verifyx=None,
+            parallel_gpu=False,
+            deadline_s=executor_deadline_s(int(budget)),
+        )
+        intent["steps"]["inspector"] = False
+        return intent
+
     try:
-        return await client_factory(ctx, budget).run(ctx.ssh, intent)
+        answer = await client_factory(ctx, budget).run(ctx.ssh, make_intent())
+    except LocalVerifyUnavailable as exc:
+        answer = exc
+    except Exception as exc:  # noqa: BLE001 — the task is awaited later; never fail the cycle
+        return LocalVerifyUnavailable("internal_error", f"{type(exc).__name__}: {exc}"[:DETAIL_MAX_CHARS])
+
+    if not settings.LIUMD_BINARY_REFRESH_ENABLED:
+        return answer
+    build_sha = answer.build_sha if isinstance(answer, LocalVerifyAnswer) else ""
+    target = answer.target if isinstance(answer, LocalVerifyAnswer) else ""
+    refresh = await refresh_liumd_from_answer(
+        ctx, build_sha, target, budget_seconds=budget
+    )
+    if refresh is None:
+        return answer
+    if refresh.skipped:
+        logger.warning(
+            _m(
+                "liumd binary refresh skipped; using the local binary",
+                extra=get_extra_info({**ctx.default_extra, "detail": refresh.detail[:300]}),
+            )
+        )
+        return answer
+    if not refresh.ok:
+        logger.warning(
+            _m(
+                "liumd binary refresh failed; shadow continues",
+                extra=get_extra_info({**ctx.default_extra, "detail": refresh.detail[:300]}),
+            )
+        )
+        if settings.VALIDATOR_LIUMD_SPECS:
+            return LocalVerifyUnavailable("binary_refresh_failed", refresh.detail[:DETAIL_MAX_CHARS])
+        return answer
+    if not refresh.changed:
+        return answer
+    logger.info(
+        _m(
+            "liumd binary refreshed",
+            extra=get_extra_info({**ctx.default_extra, "build_sha": refresh.build_sha}),
+        )
+    )
+    try:
+        return await client_factory(ctx, budget).run(ctx.ssh, make_intent())
     except LocalVerifyUnavailable as exc:
         return exc
     except Exception as exc:  # noqa: BLE001 — the task is awaited later; never fail the cycle
