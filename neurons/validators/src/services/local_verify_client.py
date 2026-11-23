@@ -216,6 +216,8 @@ class LocalVerifyAnswer:
     steps: dict[str, StepEvidence]
     round_trip_ms: int
     specs: dict[str, Any] = field(default_factory=dict)
+    build_sha: str = ""
+    target: str = ""
 
     def step(self, name: str) -> StepEvidence:
         return self.steps.get(name) or StepEvidence(status="skipped")
@@ -243,6 +245,8 @@ def parse_answer(raw: Any, *, intent: dict[str, Any], round_trip_ms: int) -> Loc
         steps={name: StepEvidence.from_wire(steps[name]) for name in STEP_NAMES if name in steps},
         round_trip_ms=round_trip_ms,
         specs=raw.get("specs") if isinstance(raw.get("specs"), dict) else {},
+        build_sha=str(raw.get("build_sha") or "")[:EXECUTOR_VERSION_MAX_CHARS],
+        target=str(raw.get("target") or "")[:EXECUTOR_VERSION_MAX_CHARS],
     )
 
 

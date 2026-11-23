@@ -11,7 +11,6 @@ from typing import Any, Literal
 
 from services.file_encrypt_service import ORIGINAL_KEYS
 from services.gpu_spec_table import classify_gpu_model, list_sxm_on_pcie_adapter_as_pcie
-from services.liumd_binary_refresh import DEFAULT_REFRESH_BUDGET_SECONDS, ensure_liumd_binary
 
 from core.config import settings
 from core.utils import _m, get_extra_info
@@ -23,7 +22,6 @@ from ..pipeline import CheckResult, Context
 from ..runner import SSHCommandResult
 from .gpu_loss_hold import GpuLossHoldCheck
 from .rented_gpu_drop import RentedGpuDropCheck, missing_gpus_under_reset
-from .task_time import task_seconds_left
 from .upload_files import UploadFailed, upload_validation_files_to_fresh_remote_dir
 
 logger = logging.getLogger(__name__)
@@ -35,8 +33,6 @@ logger = logging.getLogger(__name__)
 # per-executor timeout. The upload gets one attempt for exactly that reason.
 STDIN_FAILURE_RETRY_WINDOW_MS = 120_000
 FALLBACK_UPLOAD_ATTEMPTS = 1
-# The scrape's own worst case from above; the liumd refresh must not eat the time this needs.
-SCRAPE_BUDGET_SECONDS = 720
 
 # The scrape says only two things on stdout: a Fernet token when it worked, and a JSON object
 # with an "error" key when it ran but had nothing to report. Every Fernet token is base64url of
@@ -430,63 +426,6 @@ class MachineSpecScrapeCheck:
 
     async def run(self, ctx: Context) -> CheckResult:
         liumd_specs = settings.VALIDATOR_LIUMD_SPECS and not settings.DRY_RUN
-        if settings.VALIDATOR_LIUMD_SHADOW or liumd_specs:
-            refresh = await ensure_liumd_binary(
-                ctx,
-                budget_seconds=min(
-                    DEFAULT_REFRESH_BUDGET_SECONDS, task_seconds_left(ctx) - SCRAPE_BUDGET_SECONDS
-                ),
-            )
-            if refresh is not None and refresh.refused:
-                # not a network miss: the published manifest failed its signature or would roll liumd back. The
-                # node is not at fault, so it keeps its local binary; with none there is nothing to run
-                logger.error(
-                    _m(
-                        "liumd manifest REFUSED; nothing installed, keeping the local binary",
-                        extra=get_extra_info(
-                            {**ctx.default_extra, "detail": refresh.detail[:300], "alert": "liumd_manifest_refused"}
-                        ),
-                    )
-                )
-                if liumd_specs and not refresh.build_sha:
-                    return self._fail_liumd(
-                        ctx, None, f"liumd binary refresh failed: {refresh.detail}", reason="binary_refresh_failed"
-                    )
-            elif refresh is not None and refresh.skipped:
-                logger.warning(
-                    _m(
-                        "liumd binary refresh skipped; using the local binary",
-                        extra=get_extra_info({**ctx.default_extra, "detail": refresh.detail[:300]}),
-                    )
-                )
-            elif refresh is not None and not refresh.ok:
-                if liumd_specs:
-                    return self._fail_liumd(
-                        ctx,
-                        None,
-                        f"liumd binary refresh failed: {refresh.detail}",
-                        reason="binary_refresh_failed",
-                    )
-                logger.warning(
-                    _m(
-                        "liumd binary refresh failed; shadow continues",
-                        extra=get_extra_info({**ctx.default_extra, "detail": refresh.detail[:300]}),
-                    )
-                )
-            elif refresh is not None and refresh.changed:
-                logger.info(
-                    _m(
-                        "liumd binary refreshed",
-                        extra=get_extra_info({**ctx.default_extra, "build_sha": refresh.build_sha}),
-                    )
-                )
-            elif refresh is not None and refresh.detail:
-                logger.warning(
-                    _m(
-                        "liumd binary refresh degraded; using the local binary",
-                        extra=get_extra_info({**ctx.default_extra, "detail": refresh.detail[:300]}),
-                    )
-                )
         if liumd_specs:
             return await self._scrape_with_liumd(ctx)
 

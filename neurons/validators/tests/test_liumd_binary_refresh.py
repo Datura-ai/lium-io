@@ -74,7 +74,12 @@ class Runner:
             )
         if command.startswith("install -m 0755"):
             self.installed = True
-            return SimpleNamespace(success=True, stdout="", stderr="", exit_status=0)
+            return SimpleNamespace(
+                success=True,
+                stdout=f"{self.download_sha}  /usr/local/bin/liumd\n",
+                stderr="",
+                exit_status=0,
+            )
         raise AssertionError(command)
 
 
@@ -400,6 +405,31 @@ async def test_a_validly_signed_older_release_is_refused_after_a_newer_one_was_a
 
 
 @pytest.mark.asyncio
+async def test_the_run_answer_refresh_refuses_an_older_release_and_a_bad_signature(monkeypatch):
+    """The refresh after a run answers takes the same gate: no older signed release, no unsigned manifest."""
+    redis = FakeRedis()
+    _serve(monkeypatch, _signed("1.2.3"))
+    assert (await ensure_liumd_binary(_ctx(Runner(), redis=redis), budget_seconds=60)).ok
+
+    liumd_binary_refresh._MANIFEST_CACHE.clear()
+    _serve(monkeypatch, _signed("1.2.2"))
+    runner = Runner()
+    result = await liumd_binary_refresh.refresh_liumd_from_answer(
+        _ctx(runner, redis=redis), "old-build", "x86_64-unknown-linux-gnu", budget_seconds=60
+    )
+    assert (result.ok, result.refused, result.build_sha) == (False, True, "old-build")
+    assert not any(c.startswith(("curl ", "install ")) for c in runner.calls)
+
+    liumd_binary_refresh._MANIFEST_CACHE.clear()
+    _serve(monkeypatch, {**_signed("1.2.4"), "manifest.json.sig": b"00" * 64})
+    result = await liumd_binary_refresh.refresh_liumd_from_answer(
+        _ctx(runner, redis=redis), "old-build", "x86_64-unknown-linux-gnu", budget_seconds=60
+    )
+    assert (result.ok, result.refused) == (False, True)
+    assert not any(c.startswith(("curl ", "install ")) for c in runner.calls)
+
+
+@pytest.mark.asyncio
 async def test_an_older_release_is_refused_on_a_node_that_never_saw_the_newer_one(monkeypatch):
     """The floor is the validator's too, not only the node's: a node new to it gets no older release either."""
     redis = FakeRedis()
@@ -580,3 +610,21 @@ async def test_after_a_redis_flush_the_vendored_release_still_refuses_an_older_o
 
     assert (result.ok, result.refused, runner.installed) == (False, True, False)
     assert "release 1.2.0 is below 1.5.0" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_the_answer_build_refreshes_without_a_version_command(monkeypatch):
+    runner = Runner()
+    fetch, _ = _manifest_fetcher()
+    monkeypatch.setattr(liumd_binary_refresh, "_fetch_manifest", fetch)
+
+    result = await liumd_binary_refresh.refresh_liumd_from_answer(
+        _ctx(runner), "old-build", "x86_64-unknown-linux-gnu", budget_seconds=60
+    )
+
+    assert result.ok is True
+    assert result.changed is True
+    assert not any(c.endswith(" version") for c in runner.calls)
+    install = [c for c in runner.calls if c.startswith("install -m 0755")]
+    assert len(install) == 1
+    assert "sha256sum /usr/local/bin/liumd" in install[0]

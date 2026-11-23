@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from unittest.mock import AsyncMock
 
@@ -221,17 +222,13 @@ def test_normalization_maps_the_liumd_contract_without_mutating_the_snapshot():
 
 
 @pytest.mark.asyncio
-async def test_a_failed_binary_refresh_fails_specs_mode_before_the_scrape(monkeypatch):
+async def test_a_failed_binary_refresh_fails_specs_mode(monkeypatch):
     _liumd_on(monkeypatch)
-
-    seen = []
-
-    async def failed_refresh(ctx, *, budget_seconds=None):
-        seen.append(budget_seconds)
-        return LiumdRefresh(False, None, "manifest unavailable")
-
-    monkeypatch.setattr(machine_spec_scrape, "ensure_liumd_binary", failed_refresh)
-    runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=FERNET_TOKEN))
+    _start_reading(
+        monkeypatch,
+        LocalVerifyUnavailable("binary_refresh_failed", "manifest unavailable"),
+    )
+    runner = DummySSHCommandRunner(result=make_command_result(success=False))
 
     result = await MachineSpecScrapeCheck().run(_ctx(runner))
 
@@ -239,18 +236,12 @@ async def test_a_failed_binary_refresh_fails_specs_mode_before_the_scrape(monkey
     assert result.event.reason_code == Msg.SCRAPE_FAILED_ON_HOST.reason
     assert result.event.what_we_saw["liumd_reason"] == "binary_refresh_failed"
     assert runner.calls == []
-    assert seen and 0 < seen[0] <= 20
 
 
 @pytest.mark.asyncio
-async def test_a_skipped_binary_refresh_does_not_fail_specs_mode(monkeypatch):
+async def test_a_stale_answer_does_not_fail_specs_mode(monkeypatch):
     _liumd_on(monkeypatch)
     _start_reading(monkeypatch, _answer(LIUMD_SPECS))
-
-    async def skipped_refresh(ctx, *, budget_seconds=None):
-        return LiumdRefresh(False, None, "refresh budget spent", skipped=True)
-
-    monkeypatch.setattr(machine_spec_scrape, "ensure_liumd_binary", skipped_refresh)
     runner = DummySSHCommandRunner(result=make_command_result(success=False))
 
     result = await MachineSpecScrapeCheck().run(_ctx(runner))
@@ -261,15 +252,10 @@ async def test_a_skipped_binary_refresh_does_not_fail_specs_mode(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_failed_binary_refresh_does_not_fail_shadow_mode(monkeypatch):
+async def test_shadow_mode_still_runs_the_python_scrape(monkeypatch):
     monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_SPECS", False)
     monkeypatch.setattr(machine_spec_scrape.settings, "VALIDATOR_LIUMD_SHADOW", True)
     monkeypatch.setattr(machine_spec_scrape.settings, "DRY_RUN", False)
-
-    async def failed_refresh(ctx, *, budget_seconds=None):
-        return LiumdRefresh(False, None, "manifest unavailable")
-
-    monkeypatch.setattr(machine_spec_scrape, "ensure_liumd_binary", failed_refresh)
     runner = DummySSHCommandRunner(result=make_command_result(success=True, stdout=FERNET_TOKEN))
 
     result = await MachineSpecScrapeCheck().run(_ctx(runner))
@@ -279,28 +265,29 @@ async def test_a_failed_binary_refresh_does_not_fail_shadow_mode(monkeypatch):
     assert len(runner.calls) == 1
 
 
-@pytest.mark.parametrize("local", ["old-build", None])
+@pytest.mark.parametrize("local", ["old-build", ""])
 @pytest.mark.asyncio
 async def test_a_refused_manifest_is_reported_as_a_refusal_and_keeps_the_local_binary(monkeypatch, caplog, local):
     """A bad signature or an older release is not the node's fault: it logs its own error (not 'using the local
-    binary' like a network miss), and the scrape goes on with the node's binary; with none there is nothing to run."""
+    binary' like a network miss), and the read goes on with the node's binary; with none there is nothing to run."""
     _liumd_on(monkeypatch)
-    _start_reading(monkeypatch, _answer(LIUMD_SPECS))
+    monkeypatch.setattr(liumd_shadow.settings, "LIUMD_BINARY_REFRESH_ENABLED", True)
+    answer = dataclasses.replace(_answer(LIUMD_SPECS), build_sha=local)
 
-    async def refused(ctx, *, budget_seconds=None):
-        return LiumdRefresh(False, local, "manifest refused: release 1.2.2 is below 1.2.3", refused=True)
+    async def refused(ctx, build_sha, target, *, budget_seconds=None):
+        return LiumdRefresh(False, build_sha or None, "manifest refused: release 1.2.2 is below 1.2.3", refused=True)
 
-    monkeypatch.setattr(machine_spec_scrape, "ensure_liumd_binary", refused)
-    runner = DummySSHCommandRunner(result=make_command_result(success=False))
+    monkeypatch.setattr(liumd_shadow, "refresh_liumd_from_answer", refused)
+    client = AsyncMock()
+    client.run.return_value = answer
 
     with caplog.at_level("ERROR"):
-        result = await MachineSpecScrapeCheck().run(_ctx(runner))
+        result = await liumd_shadow._facts_only(_ctx(DummySSHCommandRunner()), lambda ctx, budget: client)
 
     assert any("liumd manifest REFUSED" in r.getMessage() and r.levelname == "ERROR" for r in caplog.records)
     assert not any("using the local binary" in r.getMessage() and "REFUSED" not in r.getMessage() for r in caplog.records)
+    assert client.run.await_count == 1
     if local:
-        assert result.passed is True
-        assert result.event.what_we_saw["delivery"] == "liumd"
+        assert result is answer
     else:
-        assert result.passed is False
-        assert result.event.what_we_saw["liumd_reason"] == "binary_refresh_failed"
+        assert isinstance(result, LocalVerifyUnavailable) and result.reason == "binary_refresh_failed"
