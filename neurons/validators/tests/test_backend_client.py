@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiohttp
 import bittensor
 import pytest
+from neurons.validators.src.clients import backend_client as backend_client_module
 from neurons.validators.src.clients.backend_client import BackendClient
 from pydantic import BaseModel
 from tenacity import wait_none
@@ -199,6 +200,22 @@ async def test_check_executor_health_sends_loopback_plugin_only_when_given(clien
 
     assert "loopback_plugin" not in post.await_args_list[0].kwargs["json_data"]
     assert post.await_args_list[1].kwargs["json_data"]["loopback_plugin"] == "vloopback:v2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nonce", [None, "4c545331" + "00" * 28])
+async def test_check_executor_health_sends_owner_hotkeys_with_the_dated_nonce_it_was_given(client, nonce):
+    """The backend signs owner hotkeys only with a dated nonce, so the health check sends the owner hotkeys next to the
+    nonce the caller passes (upload_nonce_for_miner: none for a miner not proven to relay it)."""
+    with (
+        patch.object(backend_client_module, "portal_owner_hotkeys", return_value={"5OtherAccount"}),
+        patch.object(client, "_signed_request", AsyncMock(return_value=None)) as post,
+    ):
+        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001, upload_nonce=nonce)
+
+    sent = post.await_args.kwargs["json_data"]
+    assert sent["owner_hotkeys"] == ["5OtherAccount"]
+    assert sent.get("upload_nonce") == nonce
 
 
 @pytest.mark.asyncio
@@ -646,3 +663,20 @@ async def test_backend_calls_sign_the_whole_request(reset_session, method, path,
     message = BackendClient.signed_request_message(method, path, body, headers["timestamp"])
     assert headers["hotkey"] == keypair.ss58_address
     assert keypair.verify(message, bytes.fromhex(headers["signature"].removeprefix("0x")))
+
+
+@pytest.mark.asyncio
+async def test_check_executor_health_sends_the_portals_owner_hotkeys_for_the_listing(client, monkeypatch):
+    # DAH-6740: the backend signs its health-check key for these, as the validator's own uploads do
+    from clients import validator_portal_api
+
+    monkeypatch.setattr(validator_portal_api, "_owner_hotkeys", {})
+    monkeypatch.setattr(validator_portal_api, "_owner_hotkeys_read_at", None)
+    validator_portal_api.remember_owner_hotkeys({"hotkey": ["5OwnerB", "5OwnerA"]})
+    with patch.object(client, "_signed_request", new=AsyncMock(return_value=None)) as signed:
+        await client.check_executor_health("1.2.3.4", 8001, "hotkey", 9001)
+        await client.check_executor_health("1.2.3.4", 8001, "another", 9001)
+
+    owned, other = (call.kwargs["json_data"] for call in signed.await_args_list)
+    assert owned["owner_hotkeys"] == ["5OwnerA", "5OwnerB"]
+    assert "owner_hotkeys" not in other
