@@ -2006,7 +2006,7 @@ def test_gpu_count_without_a_cuda_reading_is_decided_by_the_device_nodes():
         gpu_list_output(listing, nodes=(0,), minors=eight, cuda="", mig=("Disabled",) * 8)
     )
     assert one_node.cuda_count is None and one_node.cuda_error is None
-    assert one_node.short_of(8) == "1 usable GPU device node(s) (/dev/nvidiaN)"
+    assert one_node.short_of(8) == "the container has 1 usable GPU device node(s) (/dev/nvidiaN)"
     all_nodes = module._usable_gpus(
         gpu_list_output(listing, nodes=tuple(range(8)), minors=eight, cuda="", mig=("Disabled",) * 8)
     )
@@ -2050,7 +2050,7 @@ def test_gpu_count_links_cards_by_uuid_to_kernel_minor_not_by_index():
         minors=tuple(zip(B79A_UUIDS, B79A_MINORS)), cuda="1", mig=("Disabled",)
     )
     by_index = module._usable_gpus(gpu_list_output(_smi_listing(B79A_UUIDS[:1]), nodes=(0,), **one_card))
-    assert by_index.short_of(1) == "0 usable GPU device node(s) (/dev/nvidiaN)"
+    assert by_index.short_of(1) == "the container has 0 usable GPU device node(s) (/dev/nvidiaN)"
     by_minor = module._usable_gpus(gpu_list_output(_smi_listing(B79A_UUIDS[:1]), nodes=(2,), **one_card))
     assert by_minor.short_of(1) is None
 
@@ -2069,7 +2069,7 @@ def test_gpu_count_fails_nvidia_smi_uuids_the_kernel_does_not_list():
         )
     )
     assert shape.unknown_uuids == 8
-    assert shape.short_of(8) == "8 nvidia-smi GPU UUID(s) the kernel driver does not know"
+    assert shape.short_of(8) == "the container has 8 nvidia-smi GPU UUID(s) the kernel driver does not know"
 
 
 def test_gpu_count_fails_output_cut_short_before_the_cuda_section():
@@ -2080,7 +2080,9 @@ def test_gpu_count_fails_output_cut_short_before_the_cuda_section():
     truncated = full.partition("--cuda-device-count--")[0]
     outcome = _gpu_step(truncated)
     assert outcome.failed_step == STEP_GPU_COUNT
-    assert "ended before the CUDA section" in outcome.steps[-1].detail
+    detail = outcome.steps[-1].detail
+    assert detail.endswith("but the probe output ended before the CUDA section")
+    assert "CUDA failed to start" not in detail
     assert _gpu_step(full.partition("--gpu-mig-mode--")[0]).failed_step == STEP_GPU_COUNT
 
 

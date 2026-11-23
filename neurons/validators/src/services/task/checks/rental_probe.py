@@ -1188,7 +1188,7 @@ def _step_gpu_count(ctx: Context, outcome: _ProbeOutcome, login: _Login) -> None
                 f"{(smi.stderr or smi_out or '')[-_TAIL_CHARS:]}"
             )
         else:
-            detail = f"expected {expected} GPU(s), nvidia-smi -L listed {seen} but the container has {short}"
+            detail = f"expected {expected} GPU(s), nvidia-smi -L listed {seen} but {short}"
     outcome.steps.append(_Step(STEP_GPU_COUNT, login.command_seconds, gpu_ok, detail))
     if not gpu_ok:
         outcome.failed_step = STEP_GPU_COUNT
@@ -1621,16 +1621,23 @@ class _UsableGpus:
     cuda_count: int | None
     cuda_error: str | None
     unknown_uuids: int = 0
+    cut_short: bool = False
 
     def short_of(self, expected: int) -> str | None:
+        if self.cut_short:
+            # no CUDA result was read, so this is no CUDA failure
+            return "the probe output ended before the CUDA section"
         if self.unknown_uuids:
-            return f"{self.unknown_uuids} nvidia-smi GPU UUID(s) the kernel driver does not know"
+            return (
+                f"the container has {self.unknown_uuids} nvidia-smi GPU UUID(s) the kernel driver "
+                "does not know"
+            )
         if self.device_nodes < expected:
-            return f"{self.device_nodes} usable GPU device node(s) (/dev/nvidiaN)"
+            return f"the container has {self.device_nodes} usable GPU device node(s) (/dev/nvidiaN)"
         if self.cuda_error is not None:
-            return f"CUDA failed to start ({self.cuda_error})"
+            return f"the container has CUDA failed to start ({self.cuda_error})"
         if self.cuda_count is not None and self.cuda_count < expected:
-            return f"CUDA sees {self.cuda_count} device(s)"
+            return f"the container has CUDA sees {self.cuda_count} device(s)"
         return None
 
 
@@ -1654,7 +1661,7 @@ def _usable_gpus(output: str) -> _UsableGpus:
         usable = len(node_minors)
     if not cuda_mark:
         # the command prints every mark, the CUDA one last: without it the output was cut short
-        return _UsableGpus(usable, None, "probe output ended before the CUDA section", unknown)
+        return _UsableGpus(usable, None, None, unknown, cut_short=True)
     if re.search(r"^\s*Enabled\s*$", mig_text, re.MULTILINE):
         # CUDA enumerates MIG instances, not cards, so its count says nothing per card; the device nodes decide
         return _UsableGpus(usable, None, None, unknown)
