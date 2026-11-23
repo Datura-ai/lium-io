@@ -128,3 +128,27 @@ async def test_a_failed_build_is_not_started_again_in_the_same_cycle(job_files_r
 
     # at most one build per cycle (review 23 Nov); the next cycle builds again
     assert attempts == ["tmpabc"]
+
+
+@pytest.mark.asyncio
+async def test_a_build_that_fails_after_every_waiter_left_is_logged_not_unretrieved(job_files_root, monkeypatch, caplog):
+    directory = cycle_dir(job_files_root, 1)
+    monkeypatch.setattr(
+        file_encrypt_service, "_pyinstaller_command",
+        lambda *_: [sys.executable, "-c", "import time; time.sleep(0.3); raise SystemExit(7)"],
+    )
+    build = ScrapeBinaryBuild(directory, "tmpabc", "print(1)", lambda: ())
+    handler_calls = []
+    asyncio.get_running_loop().set_exception_handler(lambda _loop, context: handler_calls.append(context))
+
+    with pytest.raises(TimeoutError):
+        await build.ensure(0.01)
+    task = build._build
+    await asyncio.wait({task})
+    del task
+    build._build = None
+    import gc
+    gc.collect()
+
+    assert handler_calls == []
+    assert "scrape binary build failed" in caplog.text and "exited 7" in caplog.text

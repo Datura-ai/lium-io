@@ -597,8 +597,14 @@ class ScrapeBinaryBuild:
         otherwise cost one PyInstaller run per node. Raises TimeoutError after `wait_seconds`; the build goes on."""
         if self._build is None:
             self._build = asyncio.create_task(self._run())
+            self._build.add_done_callback(self._log_failure)
         # shielded: one verification giving up must not cancel the build the others wait on
         await asyncio.wait_for(asyncio.shield(self._build), wait_seconds)
+
+    def _log_failure(self, build: asyncio.Task) -> None:
+        # the build owns its failure: every waiter may have timed out and left before it ended
+        if not build.cancelled() and build.exception() is not None:
+            logger.error("[job-files] scrape binary build failed for %s: %r", self.directory.name, build.exception())
 
     async def _run(self) -> None:
         started = asyncio.get_running_loop().time()
