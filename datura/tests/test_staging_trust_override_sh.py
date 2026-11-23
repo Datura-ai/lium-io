@@ -47,3 +47,19 @@ def test_unset_leaves_the_override_as_it_was(tmp_path):
 def test_a_partial_or_malformed_value_fails_and_writes_nothing(tmp_path, bad):
     r, override = _run(tmp_path, bad)
     assert r.returncode != 0 and override.read_text() == '_VALIDATOR_HOTKEY_SS58 = "x"\n'
+
+
+WORKFLOWS = Path(__file__).resolve().parents[2] / ".github" / "workflows"
+
+
+@pytest.mark.parametrize("workflow", ["executor_cd_dev.yml", "miner_cd_staging.yml", "watchtower_image.yml"])
+def test_every_staging_image_build_names_the_same_signed_owner_message(workflow):
+    # the staging executor, miner and watchtower must follow one owner; a build without the values drops the trust
+    import re
+
+    text = (WORKFLOWS / workflow).read_text()
+    values = {k: re.search(rf'^\s+{k}: "([^"]+)"$', text, re.M).group(1)
+              for k in ("STAGING_TRUST_OWNER_SS58", "STAGING_TRUST_MESSAGE", "STAGING_TRUST_SIGNATURE")}
+    assert values["STAGING_TRUST_OWNER_SS58"] == "5EeYEmUGfAJeTmVvYSmkpsUmVhiySd2Zch5nyt4tE1HygFX8"
+    assert Keypair(ss58_address=values["STAGING_TRUST_OWNER_SS58"]).verify(
+        values["STAGING_TRUST_MESSAGE"], bytes.fromhex(values["STAGING_TRUST_SIGNATURE"][2:]))

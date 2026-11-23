@@ -14,6 +14,12 @@ jobs:
       IMAGE_REPO_SUFFIX: ${{ github.ref != 'refs/heads/main' && '-dev' || '' }}
       TAG: "dev" 
       VALIDATOR_HOTKEY_SS58: "5DHgdomxxHSQf7neJWcagvGhTMKpqvKWwuprEaFF8C653qty"
+      # the staging owner key (staging only, not on chain) and the message it signed: the `dev` executor, which the
+      # staging stack runs, follows validator messages that key signs (scripts/staging_trust_override.sh), as the
+      # staging watchtower and miner do (watchtower_image.yml, miner_cd_staging.yml)
+      STAGING_TRUST_OWNER_SS58: "5EeYEmUGfAJeTmVvYSmkpsUmVhiySd2Zch5nyt4tE1HygFX8"
+      STAGING_TRUST_MESSAGE: "lium-validator:5DHgdomxxHSQf7neJWcagvGhTMKpqvKWwuprEaFF8C653qty:1"
+      STAGING_TRUST_SIGNATURE: "0x462f3d57f5307db9dc0d1e820015204e57f5fea61f2a3fa330c0507b7554ce333fdc046406d3a4aaf74599109b25bbb5e842377706d4491ae2f8efad8bd35181"
       TARGET_FILE: "docker-compose.app.dev.yml"
       SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
       # One OCI index for x86 and ARM (GB300 Grace) hosts; docker_build.sh / docker_runner_build.sh build it
