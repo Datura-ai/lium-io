@@ -1825,9 +1825,8 @@ class RegistryPullMessages:
 
 
 CONTAINER_DOWNLOAD_SLOW_REMEDIATION = (
-    "a container on this node downloads from PyPI or Hugging Face, or uploads, too slowly or cannot connect, while "
-    "other providers' nodes read the same endpoint fast, so a renter's `pip install`, model download or upload "
-    "crawls; remove any traffic shaping or extra firewall rules added on docker "
+    "a container on this node downloads from PyPI or Hugging Face, or uploads, too slowly or cannot connect, "
+    "so a renter's `pip install`, model download or upload crawls; remove any traffic shaping or extra firewall rules added on docker "
     "traffic (keep docker's own NAT rules); "
     "if the uplink MTU (`ip link`) is below 1500, recreate the rentals network with it while no pod container exists, running or stopped: "
     "`docker network rm lium-rentals` then `docker network create -d bridge -o "
@@ -1898,8 +1897,8 @@ class RentedThroughputMessages:
         category="runtime",
         impact="Score set to 0",
         remediation=(
-            "repeated readings found a container on this rented node downloading from PyPI or Hugging Face, or "
-            "uploading, below 10 Mbps while other providers' nodes read the same endpoint fast, or writing to its disk below 50 MB/s, while the node's own traffic on that resource stayed "
+            "repeated readings found a container on this rented node downloading from PyPI or Hugging Face below "
+            "10 Mbps, or uploading too slowly, or writing to its disk below 50 MB/s, while the node's own traffic on that resource stayed "
             "under its busy threshold (200 Mbps on the network cards, 200 MB/s on the docker disk). Remove any "
             "traffic shaping or I/O "
             "throttling on docker traffic and containers, check the docker bridge MTU against the uplink "

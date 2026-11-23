@@ -232,8 +232,7 @@ async def test_one_slow_cdn_while_the_other_endpoint_is_fast_passes():
 
 
 async def test_one_slow_cdn_that_only_this_provider_reads_slow_fails_the_node():
-    # 5DFDRHm6, 16-21 Nov: PyPI under 10 Mbps on 42 of its 134 in-pod readings, 38 excused by a fast HF, while other
-    # providers read PyPI fast; a renter's pip ran at ~60 kbit/s
+    # one provider's pods read PyPI slow on many readings while HF reads fast and other providers read PyPI fast
     with flags() as clock:
         fleet = FleetRedis(pypi=(2, 40), hf=(0, 40), cf_up=(0, 40))
         ctx, runner, redis = make_ctx(PYPI_ONLY_SLOW, PYPI_ONLY_SLOW, redis=fleet)
@@ -268,7 +267,7 @@ async def test_too_few_fleet_readings_keep_the_excuse():
 
 
 async def test_a_slow_upload_fails_unless_the_fleet_uploads_slow_too():
-    slow_up = FAST.replace(UP, line("cf_up", 0, 30.0, 143))  # 16 MiB not sent in 30 s: at most 4.5 Mbps
+    slow_up = FAST.replace(UP, line("cf_up", 0, 30.0, 143))  # the upload did not finish in time: an upper-bound slow reading
     with flags():
         ctx, _, _ = make_ctx(slow_up, redis=FleetRedis(pypi=(0, 30), hf=(0, 30), cf_up=(1, 30)))
         res = await ContainerDownloadSpeedCheck().run(ctx)

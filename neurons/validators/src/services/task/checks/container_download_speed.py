@@ -46,11 +46,8 @@ CAP_BYTES = 16 * 1024 * 1024
 FETCH_TIMEOUT_SECONDS = 30
 # container start plus both fetches and the upload, each with its timeout's grace
 COMMAND_TIMEOUT_SECONDS = 150
-# DAH-5979 excused one slow download while another read fast, because PyPI-only slow readings came in bursts across
-# unrelated networks. That also excused a provider whose pods crawl to PyPI on every other reading (5DFDRHm6, 16-21
-# Nov: 42 of 134 readings under 10 Mbps, 38 excused by a fast HF). A slow endpoint is now excused only while other
-# providers' nodes read it slow too: FLEET_SLOW_SHARE of their readings in FLEET_WINDOW_SECONDS, from at least
-# FLEET_MIN_READINGS of them. Fewer, or an unreadable window, keeps the excuse: a missing control never fails a node.
+# A slow endpoint is that endpoint's path, not the node's, only while other providers' nodes read it slow too in the
+# fleet window; without enough of their readings, or an unreadable window, a missing control never fails a node.
 FLEET_WINDOW_SECONDS = 3600
 FLEET_SLOW_SHARE = 0.25
 FLEET_MIN_READINGS = 20

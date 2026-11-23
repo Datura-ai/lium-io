@@ -1408,7 +1408,7 @@ def test_a_standing_disk_verdict_names_only_a_write_this_reading_judged_failing(
 
 
 async def test_a_rented_pod_slow_to_pypi_only_on_this_providers_path_fails():
-    # F11ED7CE, 21 Nov 14:21Z: pypi 1.2 Mbps, hf 52 Mbps, verdict pass; the renter's pip then ran at ~60 kbit/s
+    # PyPI slow and HF fast on one node only: the old rule passed it
     answer = snaps() + disk() + PYPI_ONLY_SLOW
     with flags():
         ctx, _ = make_ctx(answer, redis=FleetRedis(pypi=(2, 40), hf=(0, 40), cf_up=(0, 40)))
