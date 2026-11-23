@@ -1489,7 +1489,17 @@ def get_docker_disk_usage():
     # Without it only the image, local-volume and aggregate fields go; its reason comes back under docker_df_error.
     docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
     # writable layer per container (all: a stopped pod keeps its disk); docker walks only the containers' own layers
-    container_list = docker_api_get("/containers/json?all=1&size=1") or []
+    container_error = None
+    try:
+        container_list = docker_api_get("/containers/json?all=1&size=1") or []
+    except Exception as exc:
+        container_error = repr(exc)
+        # an older daemon ignores the type filters, so its full /system/df answer still lists the containers
+        try:
+            container_list = (docker_api_get("/system/df") or {}).get("Containers") or []
+            container_error = None
+        except Exception:
+            container_list = []
     try:
         # images, local volumes and build cache only: the containers are read above
         df = docker_api_get("/system/df?type=image&type=volume&type=build-cache")
@@ -1528,7 +1538,12 @@ def get_docker_disk_usage():
     unsized_names = mounted - set(by_volume)
     if unsized_names:
         deadline = time.monotonic() + LOCAL_VOLUME_WALK_SECONDS
-        for volume in (docker_api_get("/volumes") or {}).get("Volumes") or []:
+        try:
+            volume_list = (docker_api_get("/volumes") or {}).get("Volumes") or []
+        except Exception:
+            # the pods stay listed as unsized; their backups read SIZE_UNKNOWN, never a partial size
+            volume_list = []
+        for volume in volume_list:
             if volume.get("Name") in unsized_names and volume.get("Driver") == "local" and volume.get("Mountpoint"):
                 size = local_volume_bytes(f"/proc/1/root{volume['Mountpoint']}", deadline)
                 if size is not None:
@@ -1564,8 +1579,14 @@ def get_docker_disk_usage():
     }
     if df is None:
         # popped by the caller into hard_disk_docker_scrape_error; the aggregates below would under-report
-        usage["docker_df_error"] = df_error
+        if container_error:
+            usage["docker_df_error"] = f"/system/df: {df_error}; /containers: {container_error}"
+        else:
+            usage["docker_df_error"] = df_error
         return usage
+    if container_error:
+        # popped by the caller into hard_disk_docker_scrape_error; the pod sizes are missing, not zero
+        usage["docker_df_error"] = f"/containers: {container_error}"
     # BuildCache holds image layers a custom build left behind. Folded into images: unenumerated docker
     # bytes read as the provider's own data downstream.
     build_cache = sum(max(int(record.get("Size") or 0), 0) for record in df.get("BuildCache") or [])

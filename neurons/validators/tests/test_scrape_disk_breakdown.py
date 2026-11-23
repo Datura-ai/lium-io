@@ -216,6 +216,107 @@ def test_pod_sizes_survive_a_failed_system_df(scrape: dict, monkeypatch) -> None
     }
 
 
+def test_a_failed_container_list_falls_back_to_the_full_system_df(scrape: dict) -> None:
+    # Arrange — the per-container read times out; the full /system/df answer still lists the containers
+    responses = {
+        "/info": {"DockerRootDir": "/var/lib/docker"},
+        "/system/df": {"Containers": [{"Names": ["/pod_plain"], "SizeRw": 4096, "Mounts": []}]},
+        DF_PATH: {"LayersSize": 0, "Volumes": [], "BuildCache": []},
+        "/volumes": {"Volumes": []},
+    }
+
+    def docker_api_get(path):
+        if path == CONTAINERS_PATH:
+            raise TimeoutError("timed out")
+        return responses[path]
+
+    scrape["docker_api_get"] = docker_api_get
+
+    # Act
+    usage = scrape["get_docker_disk_usage"]()
+
+    # Assert — the pod keeps its size and the scrape does not report it as unknown
+    assert usage["hard_disk_by_container"] == {"pod_plain": 4}
+    assert usage["hard_disk_containers"] == 4
+    assert "docker_df_error" not in usage
+
+
+def test_an_unreadable_container_list_is_reported_not_silently_empty(scrape: dict) -> None:
+    # Arrange — neither per-container read answers: the aggregate fields still go, the missing pod sizes are
+    # reported rather than read as zero
+    responses = {
+        "/info": {"DockerRootDir": "/var/lib/docker"},
+        DF_PATH: {"LayersSize": 0, "Volumes": [], "BuildCache": []},
+        "/volumes": {"Volumes": []},
+    }
+
+    def docker_api_get(path):
+        if path in (CONTAINERS_PATH, "/system/df"):
+            raise TimeoutError("timed out")
+        return responses[path]
+
+    scrape["docker_api_get"] = docker_api_get
+
+    # Act
+    usage = scrape["get_docker_disk_usage"]()
+
+    # Assert
+    assert usage["hard_disk_by_container"] == {}
+    assert usage["hard_disk_unsized_containers"] == []
+    assert usage["docker_df_error"] == "/containers: TimeoutError('timed out')"
+
+
+def test_both_docker_reads_failing_keeps_the_result_shape(scrape: dict) -> None:
+    # Arrange — neither the containers nor /system/df answer
+    def docker_api_get(path):
+        if path.startswith("/system/df") or path == CONTAINERS_PATH:
+            raise TimeoutError("timed out")
+        return {
+            "/info": {"DockerRootDir": "/var/lib/docker"},
+            "/volumes": {"Volumes": []},
+        }[path]
+
+    scrape["docker_api_get"] = docker_api_get
+
+    # Act
+    usage = scrape["get_docker_disk_usage"]()
+
+    # Assert
+    assert usage == {
+        "hard_disk_by_container": {},
+        "hard_disk_by_volume": {},
+        "hard_disk_unsized_containers": [],
+        "docker_df_error": "/system/df: TimeoutError('timed out'); /containers: TimeoutError('timed out')",
+    }
+
+
+def test_a_failed_volume_list_leaves_the_pods_flagged_unsized(scrape: dict, monkeypatch) -> None:
+    # Arrange — the walk's volume listing fails after /system/df; the pod cannot be sized
+    monkeypatch.setitem(scrape, "get_vloopback_volume_bytes", lambda *args: 0)
+    monkeypatch.setitem(scrape, "get_dmcrypt_volume_bytes", lambda root, sizes: 0)
+    responses = {
+        CONTAINERS_PATH: [
+            {"Names": ["/pod_plain"], "SizeRw": 1024, "Mounts": [{"Type": "volume", "Name": "volume_plain"}]}
+        ],
+        "/info": {"DockerRootDir": "/var/lib/docker"},
+    }
+
+    def docker_api_get(path):
+        if path.startswith("/system/df") or path == "/volumes":
+            raise TimeoutError("timed out")
+        return responses[path]
+
+    scrape["docker_api_get"] = docker_api_get
+
+    # Act
+    usage = scrape["get_docker_disk_usage"]()
+
+    # Assert — the pod's writable layer stands, and its unsized volume keeps it out of the complete set
+    assert usage["hard_disk_by_container"] == {"pod_plain": 1}
+    assert usage["hard_disk_unsized_containers"] == ["pod_plain"]
+    assert usage["docker_df_error"] == "TimeoutError('timed out')"
+
+
 def test_a_failed_system_df_walks_the_pods_own_local_volumes(scrape: dict, monkeypatch) -> None:
     # Arrange — DAH-6981: a no-limit pod's plain local /root volume and a dind pod's anonymous volume are sized from
     # their own Mountpoint; a third pod's volume whose walk does not finish leaves that pod listed as unsized
