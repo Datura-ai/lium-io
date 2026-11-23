@@ -4990,7 +4990,7 @@
       "type": "object"
     },
     "PodStatesReport": {
-      "description": "DAH-3338: one chunk of the container states one cycle saw on one node, sent after that cycle's\n`ExecutorSpecRequest` when the validator's POD_STATES_REPORT_ENABLED is on. The backend writes the\nstates onto the rental rows and nothing else (no cycle row, no validation report); the write is\nidempotent. `job_batch_id` is the cycle; `chunk_index` counts from 0 up to `chunk_total - 1`.",
+      "description": "DAH-3338: one chunk of the container states one cycle saw on one node, sent after that cycle's\n`ExecutorSpecRequest`. The backend writes the\nstates onto the rental rows and nothing else (no cycle row, no validation report); the write is\nidempotent. `job_batch_id` is the cycle; `chunk_index` counts from 0 up to `chunk_total - 1`.",
       "properties": {
         "chunk_index": {
           "minimum": 0,
