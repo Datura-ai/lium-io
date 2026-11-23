@@ -255,14 +255,18 @@ jobs:
   # summary.md, junit per suite, compose logs, the suites' JSON dumps) — uploaded on every run, and summarised in
   # one sticky PR comment when the run is on a PR. Reproduce: make -C e2e e2e-full.
   e2e:
-    # e2e-gate is the one required check. An unapproved PR reports this job skipped under another name, so the
-    # check is missing and a merge cannot pass on the skip (DAH-5832). With the queue active, an approved PR
-    # reports e2e-gate as deferred and the merge-group run executes the gate for the queued tree.
-    name: ${{ needs.route.outputs.approved == 'true' && 'e2e-gate' || 'e2e-gate (runs once a review approves)' }}
+    # e2e-gate is the one required check, so the job never skips: a skipped job does not evaluate its
+    # name expression and reports under the raw expression text, and a static-name skip would report the
+    # required check as passing (DAH-6742). A review that is not a gating run (a comment, a request for
+    # changes, an outside approval, or an approval that route does not count) reports under another name,
+    # so it cannot overwrite the gate. A PR reports the gate deferred when the queue is active, or runs
+    # it on approval; the merge-group run executes the gate for the queued tree, and is green only when
+    # the gate ran (or no package changed), never when route failed.
+    name: ${{ (needs.route.result == 'skipped' || (github.event_name == 'pull_request_review' && needs.route.result == 'success' && needs.route.outputs.approved != 'true')) && 'e2e-gate (not a gating review)' || 'e2e-gate' }}
     # e2e-gate is the one required check, so it also fails when route, ruff-check or a package test job failed:
     # a red unit test cannot merge on a green e2e
     needs: [route, validators, executor, miners, ruff-check, protocol]
-    if: ${{ !cancelled() && needs.route.outputs.approved == 'true' && (github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true') }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -278,18 +282,42 @@ jobs:
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
         working-directory: ${{ github.workspace }}
         run: echo "::error::a package test job or ruff failed (see tests-ok)" && exit 1
+      - name: a gating run must route
+        # route skips only a review that cannot gate; when it was supposed to run and did not, fail closed
+        if: >-
+          needs.route.result != 'success'
+          && (github.event_name != 'pull_request_review'
+          || (github.event.review.state == 'approved'
+          && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"]'), github.event.review.author_association)))
+        working-directory: ${{ github.workspace }}
+        run: echo "::error::route did not succeed (needs.route.result=${{ needs.route.result }})" && exit 1
+      - name: a merge-group entry must have a route approval
+        if: github.event_name == 'merge_group' && needs.route.outputs.approved != 'true'
+        working-directory: ${{ github.workspace }}
+        run: echo "::error::route did not approve the merge-group tree" && exit 1
+      - name: not a gating review
+        if: needs.route.result == 'skipped'
+        working-directory: ${{ github.workspace }}
+        run: echo "this review cannot gate the tree; the last e2e-gate result stands"
+      # With the queue off the PR check is the real gate: a green here would let an approved head merge
+      # before the approval run reports, so fail closed instead.
+      - name: not approved yet
+        if: needs.route.result == 'success' && github.event_name != 'merge_group' && needs.route.outputs.approved != 'true'
+        working-directory: ${{ github.workspace }}
+        run: echo "the approval rule blocks the merge; e2e-gate reports after a review approves" && [ "${{ vars.MERGE_QUEUE_ENABLED }}" = "true" ]
       - name: deferred to the merge queue
-        if: github.event_name != 'merge_group' && vars.MERGE_QUEUE_ENABLED == 'true'
+        if: github.event_name != 'merge_group' && needs.route.outputs.approved == 'true' && vars.MERGE_QUEUE_ENABLED == 'true'
+        working-directory: ${{ github.workspace }}
         run: echo "e2e gate runs in the merge queue for this tree"
       - uses: actions/checkout@v4
-        if: (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
+        if: needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
       # the gha layer cache (E2E_CACHE, e2e/Makefile) needs a builder that exports cache and the Actions cache URL + token
       - uses: docker/setup-buildx-action@v3
-        if: (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
+        if: needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
       - uses: crazy-max/ghaction-github-runtime@v3
-        if: (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
+        if: needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
       - name: build, up, every suite, logs, down — each step under a hard timeout (gate.sh)
-        if: (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
+        if: needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
         id: gate
         timeout-minutes: 55
         env:
@@ -297,13 +325,13 @@ jobs:
         run: ./gate.sh
       - uses: actions/upload-artifact@v4
         id: artifacts
-        if: always() && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
+        if: always() && needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
         with:
           name: e2e-gate-${{ github.event.pull_request.number || github.run_id }}-${{ github.run_attempt }}
           path: e2e/artifacts
           retention-days: 14
       - name: result on the PR
-        if: always() && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true' && github.event.pull_request && github.event.pull_request.head.repo.full_name == github.repository
+        if: always() && needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true' && github.event.pull_request && github.event.pull_request.head.repo.full_name == github.repository
         continue-on-error: true
         uses: actions/github-script@v7
         env:

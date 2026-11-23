@@ -3,6 +3,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -16,6 +17,7 @@ from services.cache_template_service import run_cache_template_prefetch
 from services.heartbeat_service import run_node_heartbeat
 from services.pod_ssh_recovery_service import start_pod_ssh_recovery_watcher
 from services.ssh_service import run_ssh_sources_refresh, run_uploaded_key_purge
+from services.validator_trust_service import run_validator_trust_refresh, validator_trust
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -31,10 +33,10 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     logger.debug(
         f"Validation error on {request.method} {request.url.path}: {exc.errors()}"
     )
-    return JSONResponse(
-        status_code=422,
-        content={"detail": exc.errors()},
-    )
+    # the errors echo the request's input, which can be raw bytes (a non-JSON body): encoded as text (undecodable
+    # bytes replaced), so the answer is the 422 it should be and never a 500 from encoding it
+    detail = jsonable_encoder(exc.errors(), custom_encoder={bytes: lambda raw: raw.decode("utf-8", "replace")})
+    return JSONResponse(status_code=422, content={"detail": detail})
 
 
 @asynccontextmanager
@@ -47,6 +49,9 @@ async def lifespan(app: FastAPI):
     heartbeat_task = asyncio.create_task(run_node_heartbeat())
     # DAH-4631: the signed list uploads are pinned to, fetched off the upload path
     ssh_sources_task = asyncio.create_task(run_ssh_sources_refresh())
+    # DAH-6590: the validator named in the subnet owner's signed message, loaded before the first request
+    validator_trust.load()
+    validator_trust_task = asyncio.create_task(run_validator_trust_refresh())
     # DAH-6379: a restarted pod gets its sshd back
     start_pod_ssh_recovery_watcher()
     try:
@@ -57,6 +62,7 @@ async def lifespan(app: FastAPI):
             ("uploaded ssh key purge", key_purge_task),
             ("node heartbeat", heartbeat_task),
             ("ssh sources refresh", ssh_sources_task),
+            ("validator trust refresh", validator_trust_task),
         ):
             task.cancel()
             try:

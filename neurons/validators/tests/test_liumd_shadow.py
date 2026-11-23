@@ -357,6 +357,10 @@ PYTHON_GPU_DETAILS = [
         "memory_used_mb": 3,
         "graphics_speed": 4,
         "memory_speed": 5,
+        "power_limit": 600,
+        "pcie": 16,
+        "pcie_speed": 8000,
+        "clocks_event_reasons": 0,
     }
 ]
 LIUMD_GPU_DETAILS = [
@@ -370,6 +374,10 @@ LIUMD_GPU_DETAILS = [
         "memory_used_mb": 93,
         "graphics_speed": 94,
         "memory_speed": 95,
+        "power_limit": 420,
+        "pcie": 8,
+        "pcie_speed": 2500,
+        "clocks_event_reasons": 1,
     }
 ]
 PYTHON_SCRAPE = {
@@ -383,8 +391,12 @@ PYTHON_SCRAPE = {
         "utilization": 7,
         "engy_cache_used_gb": 8,
         "containers": 210288,
+        "images": 100,
         "by_container": {"c1": 100},
+        "by_volume": {"v1": 100},
+        "volumes": 200,
     },
+    "gpu_processes": [{"pid": 100, "info": "live", "container_name": "c1"}],
     "docker": {
         "version": "29.10.0",
         "host_cpu_percent": 9,
@@ -404,8 +416,12 @@ LIUMD_SCRAPE = {
         "utilization": 97,
         "engy_cache_used_gb": 98,
         "containers": 210300,
+        "images": 200,
         "by_container": {"c1": 112},
+        "by_volume": {"v1": 112},
+        "volumes": 212,
     },
+    "gpu_processes": [{"pid": 101, "info": "live", "container_name": "c1"}],
     "docker": {
         "version": "29.9.3",
         "host_cpu_percent": 99,

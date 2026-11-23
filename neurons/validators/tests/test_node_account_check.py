@@ -408,3 +408,32 @@ async def test_a_matched_host_key_is_the_full_check(recorded_machine):
     keys, recorded = recorded_machine
     result = await _check_against(keys["ed25519"], recorded)
     assert result.event.reason_code == "NODE_ACCOUNT_OK" and result.updates == {"idle_check_passed": True}
+
+
+async def test_a_node_set_up_under_another_account_of_the_listing_owner_passes_by_the_portals_own_answer(monkeypatch):
+    """DAH-6740: set up under the owner's account X, listed under their account Y. The relayed list names Y only; the
+    owner map this validator read from the portal itself names X for Y, so the setup passes. A hotkey the portal does
+    not name for Y is still another owner's machine."""
+    from clients import validator_portal_api
+
+    monkeypatch.setattr(validator_portal_api, "_owner_hotkeys", {})
+    monkeypatch.setattr(validator_portal_api, "_owner_hotkeys_read_at", None)
+    validator_portal_api.remember_owner_hotkeys({"5ListingY": ["5OwnerX"]})
+    executor = ExecutorSSHInfo(
+        uuid="node-1", address="203.0.113.7", port=8001, ssh_username="root", ssh_port=22,
+        python_path="/usr/bin/python3", root_dir="/root", expected_node_hotkeys=["5ListingY"], expected_account_claim=None,
+    )
+
+    def ctx(files):
+        return make_context(executor=executor, runner=_HostFiles(files), miner_hotkey="5ListingY")
+
+    assert (await NodeAccountCheck().run(ctx("hotkey=5OwnerX\nclaim=\n"))).passed
+    refused = await NodeAccountCheck().run(ctx("hotkey=5Victim\nclaim=\n"))
+    assert refused.event.reason_code == "NODE_ACCOUNT_MISMATCH"
+    # the portal answer aged out (outage): X is a stranger again
+    monkeypatch.setattr(
+        validator_portal_api, "_owner_hotkeys_read_at",
+        validator_portal_api.time.monotonic() - validator_portal_api.OWNER_HOTKEYS_MAX_AGE_SECONDS - 1,
+    )
+    stale = await NodeAccountCheck().run(ctx("hotkey=5OwnerX\nclaim=\n"))
+    assert stale.event.reason_code == "NODE_ACCOUNT_MISMATCH"

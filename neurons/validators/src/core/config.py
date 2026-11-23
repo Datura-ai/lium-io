@@ -242,10 +242,6 @@ class Settings(BaseSettings):
     # just-started collector) are counted per node and logged as INSPECTOR_BLIND_STREAK from this
     # many on.
     INSPECTOR_BLIND_STREAK_LIMIT: int = Field(env="INSPECTOR_BLIND_STREAK_LIMIT", default=5)
-    # On: the Inspector check fails from that cycle until the sensor reports again. Off by default.
-    INSPECTOR_BLIND_STREAK_ENFORCEMENT_ENABLED: bool = Field(
-        env="INSPECTOR_BLIND_STREAK_ENFORCEMENT_ENABLED", default=False
-    )
     # On a libinspector.so hash mismatch a RENTED executor, during the rental, curls
     # INSPECTOR_LIBRARY_FETCH_URL once into a temp file beside /usr/lib/libinspector.so, and the
     # file replaces the library (one rename) only if its sha256 is the validator's own. This is a
@@ -364,6 +360,14 @@ class Settings(BaseSettings):
     # Executor UUIDs are miner-chosen, so an entry matches only that miner's executor at that SSH
     # endpoint. Empty = none.
     LIUMD_SHADOW_RESERVED_EXECUTORS: str = Field(env="LIUMD_SHADOW_RESERVED_EXECUTORS", default="")
+    # DAH-6804: the boot-time layer reset (nvidia_docker_sysbox_setup.sh --install-layer-reset) on Sysbox hosts whose
+    # unit is missing or older than the setup script's, on hosts with no rental. off (default) = install nothing;
+    # allowlist = install on SYSBOX_LAYER_RESET_INSTALL_HOTKEYS (comma-separated miner hotkeys) only; all = every host.
+    # A host change is rolled out gradually (the v1.151 host sysctl change reached every host at once and was rolled back).
+    SYSBOX_LAYER_RESET_INSTALL: Literal["off", "allowlist", "all"] = Field(
+        env="SYSBOX_LAYER_RESET_INSTALL", default="off"
+    )
+    SYSBOX_LAYER_RESET_INSTALL_HOTKEYS: str = Field(env="SYSBOX_LAYER_RESET_INSTALL_HOTKEYS", default="")
     # The shadow can run only the fact steps while the Python path still owns VerifyX and matmul.
     # Flip this on when liumd's GPU checks are the thing being compared again.
     LIUMD_SHADOW_GPU_STEPS_ENABLED: bool = Field(
@@ -971,6 +975,14 @@ class Settings(BaseSettings):
             "Percent of host RAM kept back, see RENTAL_HOST_RAM_RESERVE_GB (10 %, as the backend: an idle "
             "376 GiB host used 14 GiB outside the rental's cgroup, more than the former 3 %)."
         ),
+    )
+    RENTAL_LOG_MAX_SIZE: str = Field(
+        env="RENTAL_LOG_MAX_SIZE", default="100m",
+        description="json-file max-size of a rental container's log, so its stdout cannot fill the host disk.",
+    )
+    RENTAL_LOG_MAX_FILE: int = Field(
+        env="RENTAL_LOG_MAX_FILE", default=3, gt=0,
+        description="json-file max-file of a rental container's log (see RENTAL_LOG_MAX_SIZE).",
     )
     CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS: int = Field(
         env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60, gt=0,
