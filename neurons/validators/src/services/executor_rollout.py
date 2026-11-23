@@ -834,8 +834,8 @@ async def carry_renter_gpu_reset_results(
     """DAH-4658: a held scrape (the renter's own GPU reset, an unconfirmed power tier, no task time) takes the node's
     last scored result, in place, scored as in the cycle it came from with this cycle's pay flags and a fresh ban
     lookup. It carries only by `rental_state_unchanged`, on the cycle-start snapshot `rented_data` and the cycle-end
-    read `rented_at_end`. With no end read (None: the backend gave none) only a GPU-reset hold carries, on the start
-    snapshot: its own scrape saw the renter resetting GPUs inside that rental. A kept result that fails the rule is
+    read `rented_at_end`. With no end read (None: the backend gave none) a GPU-reset or power-tier hold still carries,
+    on the start snapshot: its own scrape ran inside that rental; a no-task-time or rented-during-check one does not. A kept result that fails the rule is
     dropped, and so is one a cycle saw rented after its start even when a read is missing: the rental state it was
     scored with is gone. A held result not carried is taken out by
     `withhold_renter_gpu_reset_verdicts`. The GPU-reset and power-tier holds carry a rented node only; a no-task-time
@@ -857,8 +857,10 @@ async def carry_renter_gpu_reset_results(
                 previous = await _last_scored_result(redis_service, miner_hotkey, held, job_block)
             if previous is None:
                 continue
-            gpu_reset = held.failure_reason_code == MachineSpecMessages.SCRAPE_GPU_RESET_IN_PROGRESS.reason
-            if rentals_at_start is None or (rentals_at_end is None and not gpu_reset):
+            # a GPU-reset or power-tier hold carries a rented node only, on its start snapshot as before this change:
+            # its own scrape ran inside that rental. A no-task-time or rented-during-check cycle needs the end read
+            needs_end_read = held.failure_reason_code in CYCLE_END_READ_REASONS
+            if rentals_at_start is None or (rentals_at_end is None and needs_end_read):
                 # a rental state that cannot be read carries nothing; one the cycle saw change still drops the kept result
                 seen_rented = held.failure_reason_code == RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason
                 if in_redis and seen_rented:

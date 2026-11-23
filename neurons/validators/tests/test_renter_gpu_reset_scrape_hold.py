@@ -48,7 +48,12 @@ from services.ssh_service import SSHService
 from services.task.models import JobResult, build_msg
 from test_executor_rollout_grace import _failed, _scored, _validator_process
 from neurons.validators.src.services.task.messages import GpuFingerprintMessages as FingerprintMsg
-from services.task.messages import ZEROED_BEFORE_THE_BUDGET_STOP, ExecutorImageMessages, VerifyXMessages
+from services.task.messages import (
+    ZEROED_BEFORE_THE_BUDGET_STOP,
+    ExecutorImageMessages,
+    GpuPowerLimitMessages,
+    VerifyXMessages,
+)
 from test_rented_host_gpu_fault_reset import (
     ENCRYPT_KEY,
     EXECUTOR,
@@ -1257,6 +1262,7 @@ def _kept(pods: dict[str, int | None] | None) -> JobResult:
 NO_TIME = RentalVerificationMessages.NO_TASK_TIME.reason
 SEEN_RENTED = RentalVerificationMessages.RENTED_SINCE_THE_SNAPSHOT.reason
 GPU_RESET = Msg.SCRAPE_GPU_RESET_IN_PROGRESS.reason
+POWER_TIER = GpuPowerLimitMessages.TIER_STATE_UNKNOWN.reason
 
 # (kept pass, snapshot, what the held cycle saw, cycle-end read, carried): one row per rental timeline. The rule:
 # a kept pass carries only for the exact rental state, no rental or the same pod ids, seen at the cycle's start and
@@ -1282,6 +1288,9 @@ RENTAL_TIMELINES = [
     ({"pod-a": 8}, {"pod-a": 8}, NO_TIME, None, False),  # no end read for a rented node
     ({"pod-a": 2}, {"pod-a": 2}, GPU_RESET, None, True),  # no end read: the reset's own scrape saw the start rental
     ({}, {}, SEEN_RENTED, None, False),  # a rental seen starting, then no end read
+    # stand check at c795850: an unconfirmed power tier on a rented node carries on the start snapshot, as on main
+    ({"pod-a": 8}, {"pod-a": 8}, POWER_TIER, None, True),
+    ({}, {}, POWER_TIER, None, False),  # the power-tier carry stands for a rented node only
 ]
 
 

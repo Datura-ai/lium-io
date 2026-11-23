@@ -326,10 +326,11 @@ def test_fast_path_checks_are_the_serial_checks_re_ordered():
     ]
     positions = [names.index(check.__name__) for check in order]
     assert positions == sorted(positions)
-    # DAH-5933 review: a pod the port re-read finds is halted before POST /verify, one CapabilityCheck finds before VerifyX
+    # DAH-5933 review: a pod the port re-read finds is halted before POST /verify; one CapabilityCheck finds is halted
+    # right after it, before the fault, pinned-memory and NVLink probes or VerifyX load the GPUs (stand check at c795850)
     halts = [i for i, name in enumerate(names) if name == RentedSinceStartCheck.__name__]
     assert names.index(PortCountCheck.__name__) < halts[0] < names.index(LocalVerifyCheck.__name__)
-    assert names.index(CapabilityCheck.__name__) < halts[1] < names.index(VerifyXCheck.__name__)
+    assert halts[1] == names.index(CapabilityCheck.__name__) + 1
 
 
 def _rented(executor_uuid="exe-1", pods=(), fillers=()):

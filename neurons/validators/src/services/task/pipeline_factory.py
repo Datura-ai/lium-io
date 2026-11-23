@@ -521,8 +521,8 @@ class PipelineFactory:
           `POST /verify` nor VerifyX can spend the rental check's time (DAH-5933 review).
         - `LocalVerifyCheck` runs alone next: its VerifyX challenge measures the node's network, so nothing else
           of ours may be pulling an image or copying a challenge while it does, and the matmul consumes its answer.
-        - The GPU checks (matmul, fault probe, cached template) follow. `RentedSinceStartCheck` then halts a node
-          whose customer pod CapabilityCheck found started during the run, before VerifyX puts its load beside it.
+        - The GPU checks (matmul, fault probe, cached template) follow. `RentedSinceStartCheck` right after the matmul
+          halts a node whose customer pod CapabilityCheck found started during the run, before any later GPU workload.
         - VerifyX runs alone after them, its up to 600 s after the rental check instead of before it.
         - The rental probe, score and finalize follow as today.
         The checks run one after another, as in build_checks; a node that would fail there fails here too. A node
@@ -607,13 +607,14 @@ class PipelineFactory:
                 # alone, so no traffic of ours shares the network it measures; ahead of the matmul that consumes it
                 LocalVerifyCheck(),
                 CapabilityCheck(),
+                # a customer pod CapabilityCheck found started during the run is handled right here, before the next
+                # GPU workload (fault, pinned-memory and NVLink probes, VerifyX) runs beside it (stand check at c795850)
+                RentedSinceStartCheck(TenantEnforcementCheck(egress_guard=_RENTAL_EGRESS_GUARD_RENTED)),
                 GpuFaultProbeCheck(),
                 PinnedMemoryProbeCheck(),
                 PostRentalGpuRecheckCheck(),
                 NvlinkFaultCheck(),
                 CachedTemplateVerificationCheck(),
-                # a customer pod CapabilityCheck found started during the run is handled before VerifyX starts
-                RentedSinceStartCheck(TenantEnforcementCheck(egress_guard=_RENTAL_EGRESS_GUARD_RENTED)),
                 VerifyXCheck(),
                 DiskSpaceCheck(),
                 RentalProbeCheck(),
