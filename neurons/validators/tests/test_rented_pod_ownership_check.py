@@ -16,7 +16,7 @@ from neurons.validators.src.services.task.checks.rented_pod_ownership import (
 from neurons.validators.src.services.task.messages import RentedPodOwnershipMessages as Msg
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
 
-from tests.helpers import build_state
+from tests.helpers import FakeRedis, build_services, build_state
 
 
 def _proc(tmp_path, pid: int, uid_map: str) -> None:
@@ -38,7 +38,7 @@ def _ssh(proc: str):
     return SimpleNamespace(run=run)
 
 
-def _ctx(context_factory, ssh):
+def _ctx(context_factory, ssh, **overrides):
     rented = RentedExecutorsResponse(
         executors={
             "executor-123": RentedExecutor(
@@ -53,7 +53,7 @@ def _ctx(context_factory, ssh):
         }
     )
     return context_factory(
-        state=build_state(rented_data=rented, specs={"executor_pid_mode": "host"}), ssh=ssh
+        state=build_state(rented_data=rented, specs={"executor_pid_mode": "host"}), ssh=ssh, **overrides
     )
 
 
@@ -517,3 +517,70 @@ async def test_a_pod_read_mid_stop_is_unread_not_shifted(context_factory):
     result = await RentedPodOwnershipCheck().run(_ctx(context_factory, SimpleNamespace(run=run)))
     assert result.event.reason_code == Msg.UNREAD.reason
     assert result.event.what_we_saw["being_reverted"] == ["pod_1"]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # r271 (23 Nov): / at host root beside a real shift is a shift, not a hand-back
+        "1|0 231072 65536|0|165536|165536|165536|165536|165536|165536|165536|231072|165536",
+        "1|0 231072 65536|0|231072|65534|65534|65534|65534|65534|65534|65534|65534",
+        "1|0 231072 65536|0|0|0|0|0|0|0|0|0|231072",
+        # / alone at host root: the hand-back reaches /usr and /usr/lib with it
+        "1|0 231072 65536|0|231072|231072|231072|231072|231072|231072|231072|231072|231072",
+    ],
+)
+def test_root_at_host_root_beside_anything_but_the_hand_back_shape_is_shifted(line):
+    pod = judge(line)
+    assert pod["outside_namespace"] and "being_reverted" not in pod
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # 21-22 Nov reads before a host reboot: the package dirs came back in either order
+        "1|0 231072 65536|0||231072|231072|231072|231072|0|0|0|0",
+        "1|0 231072 65536|0||231072|231072|231072|231072|0|0|231072|0",
+    ],
+)
+def test_the_package_dirs_may_follow_the_top_dirs_in_the_hand_back(line):
+    assert judge(line)["outside_namespace"] == []
+
+
+def _mid_revert_ssh(pid: int = 4242):
+    async def run(cmd, check=False):
+        if cmd.startswith("/usr/bin/docker inspect"):
+            return SimpleNamespace(exit_status=0, stdout=f"/pod_1 {pid}\n/pod_2 4343\n", stderr="")
+        if cmd.startswith("for p in"):
+            line = _MID_REVERT.replace("4242|", f"{pid}|", 1)
+            return SimpleNamespace(exit_status=0, stdout=f"{line}\n4343|0 231072 65536|231072|231072\n", stderr="")
+        return SimpleNamespace(exit_status=0, stdout="", stderr="")
+
+    return SimpleNamespace(run=run)
+
+
+@pytest.mark.asyncio
+async def test_the_hand_back_shape_still_there_next_cycle_on_the_same_pod_is_shifted(context_factory):
+    # r271 P2-2: a hand-back cut short (power lost), then the pod running on: the shape lasts, the pod is not stopping
+    ctx = _ctx(context_factory, _mid_revert_ssh())
+    first = await RentedPodOwnershipCheck().run(ctx)
+    second = await RentedPodOwnershipCheck().run(ctx)
+    assert first.event.reason_code == Msg.UNREAD.reason
+    assert second.event.reason_code == Msg.SHIFTED.reason
+    pod = next(p for p in second.event.what_we_saw["pods"] if p["container"] == "pod_1")
+    assert pod["outside_namespace"] == ["/", "/usr", "/usr/lib"]
+
+
+@pytest.mark.asyncio
+async def test_a_new_init_pid_with_the_hand_back_shape_is_a_new_stop(context_factory):
+    services = build_services()
+    await RentedPodOwnershipCheck().run(_ctx(context_factory, _mid_revert_ssh(4242), services=services))
+    result = await RentedPodOwnershipCheck().run(_ctx(context_factory, _mid_revert_ssh(5252), services=services))
+    assert result.event.reason_code == Msg.UNREAD.reason
+
+
+@pytest.mark.asyncio
+async def test_the_hand_back_shape_is_shifted_when_redis_cannot_say(context_factory):
+    ctx = _ctx(context_factory, _mid_revert_ssh(), services=build_services(redis=FakeRedis(failing=True)))
+    result = await RentedPodOwnershipCheck().run(ctx)
+    assert result.event.reason_code == Msg.SHIFTED.reason

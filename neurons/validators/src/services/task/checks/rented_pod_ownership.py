@@ -5,6 +5,7 @@ import shlex
 from datetime import datetime, timezone
 
 import asyncssh
+import redis.exceptions
 
 from ..messages import RentedPodOwnershipMessages as Msg
 from ..messages import render_message
@@ -39,6 +40,16 @@ PATHS = (
     "/usr/share",
     "/var/lib/dpkg",
 )
+
+
+# Sysbox hands a stopping pod's files back to their host owners from the top of the tree: in 11 of 11 reads taken
+# just before a host reboot (21-22 Nov) these were back at host root, the sudo files still in the range. The two
+# package dirs came back in either order, so they are a set that may follow the top dirs, not a fixed sequence
+REVERTED_FIRST = ("/", "/usr", "/usr/lib")
+MAY_BE_REVERTED_NEXT = ("/usr/share", "/var/lib/dpkg")
+# a pod seen mid-revert is remembered for its next cycle: the same init pid still showing it is not stopping
+MID_REVERT_KEY_PREFIX = "rented_pod_ownership:mid_revert"
+MID_REVERT_TTL_SECONDS = 24 * 3600
 
 
 def read_command(pids: list[int], proc: str = "/proc") -> str:
@@ -102,10 +113,14 @@ def judge(line: str) -> dict | None:
     if not shifted and read["/"] is None:
         return None
     pod = {"pid": pid_num, "uid_map_base": base, "host_owners": owners, "outside_namespace": shifted}
-    # Sysbox hands a stopping pod's files back to their host owners top-down: / is at host root while paths not yet
-    # reached are still in the range. Only that walk leaves / at host root beside in-range paths; a real shift
-    # keeps / in the range (sudo files out) or at the old range's uid, and the renter cannot chown to host root
-    if shifted and read["/"] == 0 and any(base <= uid < base + length for uid in owners.values()):
+    # the shape a stopping pod's hand-back leaves: the top dirs (and maybe the package dirs) at host root, everything
+    # else read in the range. It is only a candidate: run() reports it unread once, and SHIFTED when the same pod
+    # still shows it a cycle later (a hand-back cut short by a power loss stays like this on a running pod)
+    if (
+        set(REVERTED_FIRST) <= set(shifted) <= set(REVERTED_FIRST + MAY_BE_REVERTED_NEXT)
+        and all(owners[path] == 0 for path in shifted)
+        and len(owners) > len(shifted)
+    ):
         pod.update(outside_namespace=[], being_reverted=shifted)
     return pod
 
@@ -181,6 +196,10 @@ class RentedPodOwnershipCheck:
                 what["runtime_restarted_under_pods"] = restarted
                 # when each flagged runtime started: a notice must date the restart, not the day the check first saw it
                 what["runtime_started_at"] = started_at
+        for pod in pods.values():
+            if pod.get("being_reverted") and not await self._first_sight_of_mid_revert(ctx, pod):
+                # still there a cycle later on the same init pid: not a stop, a lasting state
+                pod["outside_namespace"] = pod.pop("being_reverted")
         shifted = [p for p in pods.values() if p["outside_namespace"]]
         reverting = sorted(p["container"] for p in pods.values() if p.get("being_reverted"))
         if shifted:
@@ -191,9 +210,10 @@ class RentedPodOwnershipCheck:
             if empty_reads:
                 what["empty_reads"] = empty_reads
         elif reverting:
-            # read mid-stop (the host going down): the pod's files say nothing about its ownership until it is back
+            # first sight of the hand-back shape a stopping pod leaves (the host going down): unknown until the next
+            # cycle shows whether the pod stopped or keeps it
             template = Msg.UNREAD
-            what.update(reason="ownership being reverted: the pod is stopping", being_reverted=reverting)
+            what.update(reason="ownership being handed back, as when the pod stops", being_reverted=reverting)
         elif "runtime_restarted_under_pods" in what:
             # own outcome, not OK: a repeated OK is logged at DEBUG, so the restart would never surface
             template = Msg.RUNTIME_RESTARTED
@@ -202,6 +222,18 @@ class RentedPodOwnershipCheck:
         if unread:
             what["unread"] = unread
         return self._event(ctx, template, what)
+
+    async def _first_sight_of_mid_revert(self, ctx: Context, pod: dict) -> bool:
+        """True the first cycle a pod shows the hand-back shape on this init pid, remembering it; False when an earlier
+        cycle saw the same pid like this, or when Redis cannot say (then the shape is reported, not hidden)."""
+        key = f"{MID_REVERT_KEY_PREFIX}:{ctx.executor.uuid}:{pod['container']}"
+        try:
+            if await ctx.services.redis.get(key) in (str(pod["pid"]), str(pod["pid"]).encode()):
+                return False
+            await ctx.services.redis.set(key, str(pod["pid"]), ex=MID_REVERT_TTL_SECONDS)
+        except (redis.exceptions.RedisError, OSError):
+            return False
+        return True
 
     async def _shift_template(self, ctx: Context, shifted: list[dict]):
         """A container restarted long after the host booted was not brought back by a host reboot: say so,
