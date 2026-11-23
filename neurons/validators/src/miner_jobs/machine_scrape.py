@@ -1421,6 +1421,48 @@ def cache_volume_bytes(df, prefixes):
     )
 
 
+# DAH-6981: a local volume's _data is a plain directory on docker's own filesystem, so statvfs reads the whole disk;
+# only a walk of its blocks sizes it. Walked only for volumes the containers mount that nothing else sized (that is,
+# when /system/df failed), all inside one shared budget; a container whose volume stays unsized is reported as such.
+LOCAL_VOLUME_WALK_SECONDS = 20
+
+
+def local_volume_bytes(path, deadline):
+    # blocks held under one volume's directory on this filesystem (like du -x: a DinD volume holds its own overlay
+    # mounts), hard links counted once; None past `deadline` (time.monotonic()) or when the walk cannot read it
+    try:
+        root_dev = os.lstat(path).st_dev
+    except OSError:
+        return None
+    total = 0
+    seen = set()
+    stack = [path]
+    while stack:
+        if time.monotonic() > deadline:
+            return None
+        try:
+            entries = list(os.scandir(stack.pop()))
+        except FileNotFoundError:
+            continue  # removed while walking: holds nothing now
+        except OSError:
+            return None
+        for entry in entries:
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if st.st_dev != root_dev:
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                stack.append(entry.path)
+            elif st.st_nlink > 1:
+                if (st.st_dev, st.st_ino) in seen:
+                    continue
+                seen.add((st.st_dev, st.st_ino))
+            total += st.st_blocks * 512
+    return total
+
+
 def get_docker_disk_usage():
     # what actually filled the disk, split by kind, in kB to match the other hard_disk fields.
     # Each pod's own sizes are read without /system/df: that one call walks every image and local volume and
@@ -1456,25 +1498,50 @@ def get_docker_disk_usage():
     volumes += get_dmcrypt_volume_bytes(docker_root_dir, by_volume)
     containers += get_container_log_bytes(docker_root_dir)
 
+    # DAH-6981: the local volumes the containers mount that nothing above sized (no /system/df answer) are walked
+    # from their own Mountpoint, the pods' volumes only, in one budget
+    mounted = {
+        str(mount.get("Name"))
+        for container in container_list
+        for mount in container.get("Mounts") or []
+        if mount.get("Type") == "volume" and mount.get("Name")
+    }
+    unsized_names = mounted - set(by_volume)
+    if unsized_names:
+        deadline = time.monotonic() + LOCAL_VOLUME_WALK_SECONDS
+        for volume in (docker_api_get("/volumes") or {}).get("Volumes") or []:
+            if volume.get("Name") in unsized_names and volume.get("Driver") == "local" and volume.get("Mountpoint"):
+                size = local_volume_bytes(f"/proc/1/root{volume['Mountpoint']}", deadline)
+                if size is not None:
+                    by_volume[volume["Name"]] = size
+
     # DAH-5059: each pod's own share, so the pod page can show used against its limits: the writable
     # layer per container name, plus the anonymous volumes it mounts (a dind image's VOLUME
     # /var/lib/docker has no name the backend knows); named volumes stand alone under their name.
-    # A container with an anonymous volume nobody sized (no /system/df) is left out: unknown, never undercounted.
+    # DAH-6981: a container with any volume still unsized is listed in unsized_containers, so its backup fails
+    # SIZE_UNKNOWN and its page hides the figure; left out of by_container when the missing one is its own.
     by_container = {}
+    unsized_containers = []
     for container in container_list:
         name = str((container.get("Names") or [""])[0]).lstrip("/")
-        anonymous = [
+        if not name:
+            continue
+        volume_names = [
             str(mount.get("Name"))
             for mount in container.get("Mounts") or []
-            if mount.get("Type") == "volume" and re.fullmatch(r"[0-9a-f]{64}", str(mount.get("Name")))
+            if mount.get("Type") == "volume" and mount.get("Name")
         ]
-        if not name or any(volume_name not in by_volume for volume_name in anonymous):
+        anonymous = [v for v in volume_names if re.fullmatch(r"[0-9a-f]{64}", v)]
+        if any(v not in by_volume for v in volume_names):
+            unsized_containers.append(name)
+        if any(v not in by_volume for v in anonymous):
             continue
         by_container[name] = max(int(container.get("SizeRw") or 0), 0) + sum(by_volume[v] for v in anonymous)
 
     usage = {
         "hard_disk_by_container": {name: size // 1024 for name, size in by_container.items()},
         "hard_disk_by_volume": {name: size // 1024 for name, size in by_volume.items()},
+        "hard_disk_unsized_containers": unsized_containers,
     }
     if df is None:
         # popped by the caller into hard_disk_docker_scrape_error; the aggregates below would under-report

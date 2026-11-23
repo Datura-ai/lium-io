@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import socket
+import time
 from collections import namedtuple
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,6 +41,8 @@ DISK_HELPERS = {
     "get_container_log_bytes",
     "get_host_disk_usage",
     "get_docker_disk_usage",
+    "LOCAL_VOLUME_WALK_SECONDS",
+    "local_volume_bytes",
     "cache_volume_bytes",
     "ENGY_CACHE_VOLUME_PREFIX",
     "FILLER_VOLUME_LABEL_KEY",
@@ -54,7 +57,7 @@ def scrape() -> dict:
     return build_scrape_namespace(
         SRC / "miner_jobs" / "machine_scrape.py",
         DISK_HELPERS,
-        {"glob": glob, "http": http, "json": json, "os": os, "re": re, "shutil": shutil, "socket": socket},
+        {"glob": glob, "http": http, "json": json, "os": os, "re": re, "shutil": shutil, "socket": socket, "time": time},
     )
 
 
@@ -102,6 +105,7 @@ def test_docker_disk_usage_splits_df_by_kind(scrape: dict) -> None:
         "hard_disk_engy_cache_used_gb": 0,
         "hard_disk_by_container": {},
         "hard_disk_by_volume": {},
+        "hard_disk_unsized_containers": [],
     }
 
 
@@ -206,8 +210,64 @@ def test_pod_sizes_survive_a_failed_system_df(scrape: dict, monkeypatch) -> None
     assert usage == {
         "hard_disk_by_container": {"container_pod1": 4},
         "hard_disk_by_volume": {"volume_pod1": 2048 * 512 // 1024},
+        "hard_disk_unsized_containers": ["container_dind"],
         "docker_df_error": "TimeoutError('timed out')",
     }
+
+
+def test_a_failed_system_df_walks_the_pods_own_local_volumes(scrape: dict, monkeypatch) -> None:
+    # Arrange — DAH-6981: a no-limit pod's plain local /root volume and a dind pod's anonymous volume are sized from
+    # their own Mountpoint; a third pod's volume whose walk does not finish leaves that pod listed as unsized
+    dind_volume = "cd" * 32
+    walked = {
+        "/proc/1/root/var/lib/docker/volumes/volume_plain/_data": 3 * 1024 * 1024,
+        f"/proc/1/root/var/lib/docker/volumes/{dind_volume}/_data": 5 * 1024,
+        "/proc/1/root/var/lib/docker/volumes/volume_slow/_data": None,
+    }
+    monkeypatch.setitem(scrape, "local_volume_bytes", lambda path, deadline: walked[path])
+    volumes = [
+        {"Name": name, "Driver": "local", "Mountpoint": f"/var/lib/docker/volumes/{name}/_data"}
+        for name in ("volume_plain", dind_volume, "volume_slow", "volume_unused")
+    ]
+    responses = {
+        CONTAINERS_PATH: [
+            {"Names": ["/pod_plain"], "SizeRw": 1024, "Mounts": [{"Type": "volume", "Name": "volume_plain"}]},
+            {"Names": ["/pod_dind"], "SizeRw": 1024, "Mounts": [{"Type": "volume", "Name": dind_volume}]},
+            {"Names": ["/pod_slow"], "SizeRw": 1024, "Mounts": [{"Type": "volume", "Name": "volume_slow"}]},
+        ],
+        "/info": {"DockerRootDir": "/var/lib/docker"},
+        "/volumes": {"Volumes": volumes},
+    }
+
+    def docker_api_get(path):
+        if path.startswith("/system/df"):
+            raise TimeoutError("timed out")
+        return responses[path]
+
+    scrape["docker_api_get"] = docker_api_get
+
+    # Act
+    usage = scrape["get_docker_disk_usage"]()
+
+    # Assert — the unused volume is never walked (walked[] would raise); the slow pod's layer stays, flagged unsized
+    assert usage["hard_disk_by_volume"] == {"volume_plain": 3 * 1024, dind_volume: 5}
+    assert usage["hard_disk_by_container"] == {"pod_plain": 1, "pod_dind": 6, "pod_slow": 1}
+    assert usage["hard_disk_unsized_containers"] == ["pod_slow"]
+
+
+def test_local_volume_bytes_counts_blocks_once_and_stops_at_its_deadline(scrape: dict, tmp_path) -> None:
+    # Arrange
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "a").write_bytes(b"x" * 10000)
+    os.link(tmp_path / "sub" / "a", tmp_path / "b")
+    expected = sum(
+        os.lstat(path).st_blocks * 512 for path in (tmp_path / "sub", tmp_path / "sub" / "a")
+    )
+
+    # Act / Assert — the hard link adds nothing; a spent budget is unknown, never a partial total
+    assert scrape["local_volume_bytes"](str(tmp_path), time.monotonic() + 60) == expected
+    assert scrape["local_volume_bytes"](str(tmp_path), time.monotonic() - 1) is None
+    assert scrape["local_volume_bytes"](str(tmp_path / "missing"), time.monotonic() + 60) is None
 
 
 GIB = 1024**3
@@ -322,6 +382,7 @@ def test_docker_disk_usage_ignores_unknown_sizes(scrape: dict) -> None:
         "hard_disk_engy_cache_used_gb": 0,
         "hard_disk_by_container": {},
         "hard_disk_by_volume": {},
+        "hard_disk_unsized_containers": [],
     }
 
 
@@ -707,6 +768,7 @@ def test_the_engy_cache_is_reported_as_free_disk_and_the_dolphin_cache_stays_use
             "dphn_cache_hf_x": 40 * 1024**2,
             "volume_renter": 10 * 1024**2,
         },
+        "hard_disk_unsized_containers": [],
     }
 
 
