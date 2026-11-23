@@ -14,6 +14,7 @@ on:
   # ruleset first, then set the repository variable MERGE_QUEUE_ENABLED=true; to turn the queue off, unset the
   # variable first. If the variable is true while the rule is off, or a merge bypasses the queue, the PR run
   # defers and no run tests that tree.
+  workflow_dispatch:
   pull_request:
   push:
     branches: [main]
@@ -55,6 +56,7 @@ jobs:
       miners: ${{ steps.pkgs.outputs.miners }}
       protocol: ${{ steps.pkgs.outputs.protocol }}
       e2e: ${{ steps.pkgs.outputs.e2e }}
+      shards: ${{ steps.pkgs.outputs.shards }}
       approved: ${{ steps.pkgs.outputs.approved }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -261,7 +263,7 @@ jobs:
     # the one required check, merges the shards' summaries and fails when either side failed.
     name: e2e ${{ matrix.shard }}
     needs: [route]
-    if: ${{ !cancelled() && needs.route.result == 'success' && needs.route.outputs.approved == 'true' && needs.route.outputs.e2e == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') }}
+    if: ${{ !cancelled() && needs.route.result == 'success' && needs.route.outputs.approved == 'true' && needs.route.outputs.e2e == 'true' && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || vars.MERGE_QUEUE_ENABLED != 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -280,13 +282,17 @@ jobs:
         working-directory: e2e
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        if: contains(fromJSON(needs.route.outputs.shards), matrix.shard)
       # the gha layer cache (E2E_CACHE, e2e/Makefile) needs a builder that exports cache and the Actions cache URL + token
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        if: contains(fromJSON(needs.route.outputs.shards), matrix.shard)
         with:
           driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
       - uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124 # v3.1.0
+        if: contains(fromJSON(needs.route.outputs.shards), matrix.shard)
       - name: build, up, ${{ matrix.suites }}, logs, down — each step under a hard timeout (gate.sh)
         id: gate
+        if: contains(fromJSON(needs.route.outputs.shards), matrix.shard)
         timeout-minutes: 55
         env:
           E2E_CACHE: gha
@@ -294,11 +300,12 @@ jobs:
         run: ./gate.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         id: artifacts
-        if: always()
+        if: always() && contains(fromJSON(needs.route.outputs.shards), matrix.shard)
         with:
-          name: e2e-gate-${{ github.event.pull_request.number || github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
+          name: e2e-${{ matrix.shard }}
           path: e2e/artifacts
           retention-days: 14
+          overwrite: true
 
   e2e:
     # e2e-gate is the one required check, so the job never skips: a skipped job does not evaluate its
@@ -351,29 +358,34 @@ jobs:
         if: always() && needs.e2e-suites.result != 'skipped'
         continue-on-error: true
         with:
-          pattern: e2e-gate-${{ github.event.pull_request.number || github.run_id }}-${{ github.run_attempt }}-*
+          pattern: e2e-*
           path: e2e/artifacts/shards
       - name: one summary from the shards
         if: always() && needs.e2e-suites.result != 'skipped'
         env:
           SHARDS_RESULT: ${{ needs.e2e-suites.result }}
+          EXPECTED: ${{ needs.route.outputs.shards }}
         run: |
           python3 - <<'PY'
-          import os, pathlib
+          import json, os, pathlib, sys
           root, out = pathlib.Path('e2e/artifacts/shards'), pathlib.Path('e2e/artifacts/summary.md')
+          expected = json.loads(os.environ.get('EXPECTED') or '[]')
           out.parent.mkdir(parents=True, exist_ok=True)
-          blocks, verdicts = [], []
+          blocks, present = [], {}
           for d in sorted(p for p in root.glob('*') if p.is_dir()):
               md = d / 'summary.md'
               body = md.read_text().strip() if md.exists() else '**e2e gate: FAIL**: no summary written'
               first, _, rest = body.partition('\n')
-              verdicts.append('PASS' in first)
+              present[d.name] = 'PASS' in first
               t = d / 'timings.txt'
               suites = [l.split('\t')[0].removeprefix('test-') for l in t.read_text().splitlines() if l.startswith('test-')] if t.exists() else []
               blocks.append(f"### {' + '.join(suites) or d.name}\n\n{rest.strip()}\n")
-          ok = bool(blocks) and all(verdicts) and os.environ.get('SHARDS_RESULT') == 'success'
+          ok = sorted(present) == sorted(expected) and all(present.values()) and os.environ.get('SHARDS_RESULT') == 'success'
           out.write_text(('**e2e gate: PASS**' if ok else '**e2e gate: FAIL**') + '\n\n' + '\n'.join(blocks))
           print(out.read_text())
+          if not ok:
+              print(f"::error::e2e shards: expected {expected}, reported {sorted(present)}")
+              sys.exit(1)
           PY
       - name: result on the PR
         if: always() && needs.e2e-suites.result != 'skipped' && github.event.pull_request && github.event.pull_request.head.repo.full_name == github.repository
