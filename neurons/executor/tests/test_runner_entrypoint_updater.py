@@ -60,7 +60,7 @@ def run(tmp_path, script, **env):
     # the log-follow loop never ends; a `sleep` that fails ends the script after one round
     (bin_dir / "sleep").write_text("#!/bin/sh\nexit 7\n")
     (bin_dir / "sleep").chmod(0o755)
-    for tool in ("sh", "tail", "timeout", "sed", "head"):
+    for tool in ("sh", "tail", "timeout", "sed", "head", "tr"):
         os.symlink(shutil.which(tool), bin_dir / tool)
     calls = tmp_path / "calls"
     calls.touch()
@@ -167,6 +167,17 @@ def test_the_providers_runtime_settings_go_to_the_new_updater(tmp_path):
         "run --detach --name executor-watchtower-1 --restart unless-stopped -v /var/run/docker.sock:/var/run/docker.sock"
         f"{COMPOSE_LABELS} --env WATCHTOWER_ENABLED=false --env WATCHTOWER_INTERVAL=3600"
         " --env WATCHTOWER_ENV_FILE_PATH=/a b/.env daturaai/lium-watchtower:1.2.4"
+    ]
+
+
+def test_settings_in_any_case_go_to_the_new_updater_as_written(tmp_path):
+    # the updater reads its settings' names in any case, so a lower- or mixed-case opt-out must survive the swap
+    env = "watchtower_enabled=false\nWaTcHtOwEr_InTeRvAl=3600\nWATCHTOWER_ENABLED_EXTRA=1\nwatchtower_image\n"
+    _, calls = run(tmp_path, EXECUTOR, STUB_UPDATER_IMAGE="daturaai/lium-watchtower:1.2.3", STUB_UPDATER_ENV=env)
+
+    assert updater_run(calls) == [
+        "run --detach --name executor-watchtower-1 --restart unless-stopped -v /var/run/docker.sock:/var/run/docker.sock"
+        f"{COMPOSE_LABELS} --env watchtower_enabled=false --env WaTcHtOwEr_InTeRvAl=3600 daturaai/lium-watchtower:1.2.4"
     ]
 
 
