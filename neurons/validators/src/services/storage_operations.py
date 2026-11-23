@@ -195,8 +195,8 @@ class StorageOperationFiles:
             pid=REMOTE_OPERATION_DIRECTORY / f"{stem}.pid",
             status=REMOTE_OPERATION_DIRECTORY / f"{stem}.status",
             cancel=REMOTE_CANCEL_DIRECTORY / f"{stem}.cancel",
-            # one lock for every operation: each holder keeps it only for a check and a write
-            lock=REMOTE_CANCEL_DIRECTORY / "launch.lock",
+            # one lock per operation: a slow launch or cancel of one operation never holds up another's
+            lock=REMOTE_CANCEL_DIRECTORY / f"{stem}.lock",
             # the recorded process's start time: with the PID it names one process, never one that reused the PID
             start=REMOTE_OPERATION_DIRECTORY / f"{stem}.start",
             # the spec while the launch receives it; one name per operation, so a cut launch's copy is overwritten
@@ -338,7 +338,7 @@ async def _start_storage_operation(
             # A helper whose runner died is an orphan: it is removed below and the run relaunched.
             return files
         # The spec (it holds the repository credentials) goes over the launch command's stdin and is written only
-        # under the node's launch lock, after the operation has been checked again there, to one file per operation
+        # under the operation's lock, after the operation has been checked again there, to one file per operation
         # that the launch's own exit, the next launch and the artifact cleanup all remove: a launch cut at any
         # point leaves no copy under a name nothing cleans.
         payload = json.dumps(dict(spec), separators=(",", ":"), sort_keys=True)
@@ -365,14 +365,15 @@ async def _start_storage_operation(
         # remove them themselves after the runner has finished reporting.
         lock_path = shlex.quote(str(files.lock))
         pid_path = shlex.quote(str(files.pid))
-        # The wrapper takes the launch lock before it starts the runner, so it runs only after the
+        # The wrapper takes the operation's lock before it starts the runner, so it runs only after the
         # launch has recorded its PID, and never once a cancel has marked the operation. It holds the
         # lock until the runner has started (the runner does not inherit it), so a cancel's marker
         # either stops the runner here or comes after it started, as for any running operation.
+        # fd 8 is the launch's own second handle on the lock, opened before the wrapper starts, so the wrapper opens
+        # nothing that could fail. It waits without a deadline: only this operation's launch and cancel take this
+        # lock, each for a check and a write, so a deadline could only drop a recorded run nobody would report.
         wrapper = (
-            # `command`: a lock file that cannot be opened must not end the shell before its status is written
-            f"command exec 8>>{lock_path} 2>/dev/null; "
-            "flock -w 30 8 && locked=1; "
+            "flock 8 && locked=1; "
             # only the wrapper the launch recorded as the operation's process group owns its files: one whose PID
             # write failed, or that another launch's record replaced, writes, removes and starts nothing
             f'[ "$(cat {pid_path} 2>/dev/null)" = "$$" ] || exit 0; '
@@ -385,7 +386,7 @@ async def _start_storage_operation(
             f"printf '%s\\n' \"$result\" > {shlex.quote(str(files.status))}; "
             f"rm -f {shlex.quote(str(files.spec))} {pid_path} {shlex.quote(str(files.start))}{terminal_cleanup}"
         )
-        # Under the launch lock (the cancel takes it too): refuse if a cancel has marked it, else
+        # Under the operation's lock (the cancel takes it too): refuse if a cancel has marked it, else
         # start the wrapper as its own process group and record that group before releasing the
         # lock, so a cancel that comes after always finds every process of the operation.
         # The wrapper must not inherit the held lock (9>&-).
@@ -397,6 +398,8 @@ async def _start_storage_operation(
             # only the lock holder owns the partial spec: a launch still waiting for the lock removes nothing
             + "trap 'exit 1' HUP INT TERM PIPE; "
             f"command exec 9>>{lock_path} 2>/dev/null; flock -w 30 9 || exit 6; trap 'rm -f {part_path}' EXIT; "
+            # the wrapper's handle on the lock (fd 8): a failed open fails this launch, which reports it
+            f"command exec 8<{lock_path} 2>/dev/null || exit 6; "
             f"if test -e {shlex.quote(str(files.cancel))}; then rm -f {shlex.quote(str(files.spec))}; exit 5; fi; "
             # another launch (this or another validator process) got there first: a live recorded wrapper (or a
             # runner recorded before process groups) is the operation, and a written status is its result;
@@ -412,7 +415,7 @@ async def _start_storage_operation(
             f"{{ (umask 077; cat > {part_path}) && test \"$(wc -c < {part_path})\" -eq {len(payload.encode())}; }} || exit 9; "
             f"mv {part_path} {shlex.quote(str(files.spec))} || exit 8; "
             f"setsid nohup /bin/sh -c {shlex.quote(wrapper)} "
-            f"> {shlex.quote(str(files.log))} 2>&1 < /dev/null 9>&- & "
+            f"> {shlex.quote(str(files.log))} 2>&1 < /dev/null 9>&- & exec 8<&-; "
             # the start time first: a PID file is never there without the start time that names its process
             "wrapper=$!; started_at=$(sed 's/.*) //' /proc/\"$wrapper\"/stat 2>/dev/null | cut -d' ' -f20); "
             f"if ! {{ test -n \"$started_at\" && printf '%s\\n' \"$started_at\" > {start_path} "
@@ -520,7 +523,7 @@ async def cancel_storage_operation(
     # process termination is only a bounded fallback for an unresponsive runner.
     # the marker is what stops a later launch, so a cancel that cannot write it fails, but only
     # after it has still stopped the runner and helper
-    # under the launch lock, so a launch either sees this marker or has recorded its process group
+    # under the operation's lock, so a launch either sees this marker or has recorded its process group
     # first; the PID is that group's leader, so every check and signal below covers the whole group
     lock_path = shlex.quote(str(files.lock))
     spec_path = shlex.quote(str(files.spec))
@@ -532,7 +535,7 @@ async def cancel_storage_operation(
         f"{{ install -d -m 0700 {shlex.quote(str(REMOTE_CANCEL_DIRECTORY))} && command exec 9>>{lock_path} 2>/dev/null "
         f"&& flock -w 30 9 && touch {cancel_path}; }} || marked=4; "
         # read under the lock: a launch that took it first has written its PID by now; release it before
-        # the bounded wait so other operations' launches never queue behind this one
+        # the bounded wait, so the operation's wrapper, which waits on it without a deadline, never waits behind it
         f"pid=$(cat {pid_path} 2>/dev/null); exec 9>&-; "
         # no PID after the lock is either nothing running or an earlier release's launch (this release writes
         # both under the lock): its wrapper removes the old marker before it starts the runner and records the PID,
@@ -678,7 +681,8 @@ async def _remove_operation_artifacts(
         + " ".join(
             shlex.quote(str(path))
             # the cancel marker stays: the operation id is never reused, and a late launch must see it
-            # shortcut: one empty marker per cancelled operation stays on the reserve volume; sweep old ones if they pile up
+            # and so does the operation's lock file: removing it while a launch or cancel waits on it would split the lock
+            # shortcut: one empty lock per operation and marker per cancelled one stay on the reserve volume; sweep old ones if they pile up
             for path in (files.status, files.log, files.pid, files.start, files.spec, files.part, files.legacy_cancel)
         ),
         check=False,

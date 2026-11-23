@@ -452,8 +452,8 @@ async def test_a_cancel_before_a_slow_wrapper_starts_its_runner_leaves_nothing_r
 
     async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
         if "nohup" in command:
-            assert "exec 8>>" in command
-            command = command.replace("exec 8>>", "sleep 1; exec 8>>", 1)
+            assert command.count("flock 8 &&") == 1
+            command = command.replace("flock 8 &&", "sleep 1; flock 8 &&")
         return await local.run(command, check, input)
 
     await storage_operations.start_storage_operation(
@@ -576,7 +576,7 @@ async def test_a_repeated_dispatch_racing_the_first_launch_leaves_it_running(
     async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
         await asyncio.sleep(0)  # interleave the two dispatches at every host command
         # the wrapper starts late, as over a slow connection: the repeat's launch lands before it takes the lock
-        return await local.run(command.replace("exec 8>>", "sleep 0.5; exec 8>>"), check, input)
+        return await local.run(command.replace("flock 8 &&", "sleep 0.5; flock 8 &&"), check, input)
 
     ssh_client = SimpleNamespace(run=run, start_sftp_client=local.start_sftp_client)
     launches = [
@@ -631,7 +631,7 @@ async def test_a_wrapper_whose_record_another_launch_replaced_touches_nothing(
         if "nohup" not in command:
             return await local.run(command, check, input)
         # the wrapper starts late; the other launch's record lands first
-        done = await local.run(command.replace("exec 8>>", "sleep 0.5; exec 8>>"), check, input)
+        done = await local.run(command.replace("flock 8 &&", "sleep 0.5; flock 8 &&"), check, input)
         Path(str(files.pid)).write_text(f"{other}\n")
         return done
 
@@ -869,6 +869,57 @@ def test_a_launch_waiting_for_the_lock_leaves_the_holders_partial_spec_alone(
         done = subprocess.run(["sh", "-c", launch], input=b'{"engine":"restic"}', capture_output=True, timeout=10)
     assert done.returncode == 6
     assert part.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_launch_held_up_by_another_operation_still_starts_its_runner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # review at c1d9804: a slow launch or cancel of one operation must not make another's launch or wrapper fail
+    import fcntl
+
+    started = _patch_launch(monkeypatch, tmp_path)
+    local = _local_ssh()
+    other = storage_operations.StorageOperationFiles.for_operation(UUID("22222222-2222-4222-8222-222222222222"))
+    Path(str(other.lock)).parent.mkdir(parents=True)
+
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        return await local.run(command.replace("flock -w 30", "flock -w 0.5"), check, input)
+
+    with open(str(other.lock), "a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)  # the other operation's launch, still receiving its spec
+        await storage_operations.start_storage_operation(
+            SimpleNamespace(run=run), "sh", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+        )
+        for _ in range(40):
+            if started.exists():
+                break
+            await asyncio.sleep(0.05)
+    assert started.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_wrapper_kept_waiting_for_the_lock_still_starts_its_runner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # review at c1d9804: a wrapper that gave up on the lock exited without a runner, so nothing reported the run
+    started = _patch_launch(monkeypatch, tmp_path)
+    local = _local_ssh()
+
+    async def run(command: str, check: bool = False, input: str | None = None) -> SimpleNamespace:
+        if "nohup" in command:
+            # the launch keeps the lock past what any deadline in the command allows
+            command = command.replace("flock -w 30", "flock -w 0.5") + "; sleep 1.5"
+        return await local.run(command, check, input)
+
+    await storage_operations.start_storage_operation(
+        SimpleNamespace(run=run), "sh", OPERATION_ID, {"engine": "restic"}, retain_terminal_artifacts=False
+    )
+    for _ in range(40):
+        if started.exists():
+            break
+        await asyncio.sleep(0.05)
+    assert started.exists()
 
 
 @pytest.mark.asyncio
