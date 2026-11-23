@@ -30,6 +30,8 @@ from services.executor_rollout import (
     carry_renter_gpu_reset_results,
     has_renter_gpu_reset_holds,
     remember_rented_scored_results,
+    has_rental_change_candidates,
+    withhold_rental_change_verdicts,
     withhold_renter_gpu_reset_verdicts,
     withhold_rollout_verdicts,
     session_kept_hotkeys,
@@ -574,7 +576,9 @@ class Validator:
                 executor_image_snapshot = build_expected_image_snapshot(executor_digest)
 
                 # Fetch all rented executors from backend API
-                rented_executors = await self.backend_client.get_all_rented_executors()
+                rented_executors = await self.backend_client.get_all_rented_executors(
+                    cycle_snapshot_block=job_block
+                )
                 if rented_executors is None:
                     logger.error(
                         _m(
@@ -583,6 +587,15 @@ class Validator:
                         ),
                     )
                     return
+
+                # A fresh job-files directory for this cycle; the ones an express verification
+                # still reads are kept (DAH-2958). The express lane uses the new one from here on.
+                # Built before the cycle and the rollout window count: a failed build (obfuscator exit) retries next tick.
+                # keep the published inputs' directory too: an express tick reads it until the new inputs are published below
+                keep = self.express_lane.directories_in_use()
+                if self.cycle_inputs is not None:
+                    keep.add(self.cycle_inputs.encrypted_files.tmp_directory)
+                encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files(keep_directories=keep)
 
                 # DAH-3405: a push between two cycles opens the grace window here, after the last
                 # early return and before the first job of this cycle runs against the new digest,
@@ -594,6 +607,12 @@ class Validator:
                     executor_image_snapshot = dataclasses.replace(
                         executor_image_snapshot,
                         rollout_previous_digest=normalize_sha256_digest(rollout_window.previous_digest),
+                    )
+                earlier = rollout_window.earlier_reading_current(job_block)
+                if earlier:
+                    executor_image_snapshot = dataclasses.replace(
+                        executor_image_snapshot,
+                        rollout_earlier_digests=tuple(filter(None, map(normalize_sha256_digest, earlier))),
                     )
 
                 logger.info(
@@ -616,16 +635,20 @@ class Validator:
                 if cycle_asked_for_now:
                     # Cleared here and not at the read: every return above this line means no
                     # cycle started, and the operator's request must survive to the next tick.
-                    await self.redis_service.clear_forced_validation_cycle_request()
+                    try:
+                        await self.redis_service.clear_forced_validation_cycle_request()
+                    except Exception as exc:
+                        # the cycle has started and its job files are built; a lost clear only means one more forced cycle
+                        logger.error(
+                            _m(
+                                "[sync] Failed to clear the forced validation cycle request",
+                                extra=get_extra_info({**self.default_extra, "error": str(exc)}),
+                            ),
+                        )
 
                 first_cycle = self.first_cycle_started_at is None
                 if first_cycle:
                     self.first_cycle_started_at = datetime.now(UTC)
-                # A fresh job-files directory for this cycle; the ones an express verification
-                # still reads are kept (DAH-2958). The express lane uses the new one from here on.
-                encrypted_files = self.file_encrypt_service.ecrypt_miner_job_files(
-                    keep_directories=self.express_lane.directories_in_use()
-                )
                 self.cycle_inputs = CycleInputs(
                     encrypted_files=encrypted_files,
                     default_image_digests=default_image_digests,
@@ -788,7 +811,11 @@ class Validator:
                             task.cancel()
 
                     # DAH-4658: before the duplicate pass and the GPU count, so a carried result counts in both
-                    await self.carry_scores_over_renter_gpu_resets(all_job_results, rented_executors, miner_coldkeys)
+                    # DAH-6564: one cycle-end read of the rented list, shared by the carry and the rental-change rule
+                    rented_at_end = await self.rented_at_cycle_end(all_job_results)
+                    await self.carry_scores_over_renter_gpu_resets(
+                        all_job_results, rented_executors, miner_coldkeys, rented_at_end
+                    )
                     total_gpu_model_count_map = settle_cycle_results(
                         all_job_results,
                         {**self.default_extra, "job_batch_id": job_batch_id},
@@ -819,7 +846,7 @@ class Validator:
                     )
 
                     all_job_results, withheld_results = await self.withhold_verdicts_for_rollout(
-                        all_job_results, job_block, job_batch_id, rollout_window
+                        all_job_results, job_block, job_batch_id, rollout_window, rented_executors, rented_at_end
                     )
                     await remember_rented_scored_results(all_job_results, self.redis_service)
 
@@ -991,11 +1018,7 @@ class Validator:
                             if batch == job_batch_id
                         }
                     )
-                    result_missing = (
-                        pod_ssh_only_results(rented_executors, pod_ssh, reported, job_batch_id)
-                        if settings.RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED
-                        else {}
-                    )
+                    result_missing = pod_ssh_only_results(rented_executors, pod_ssh, reported, job_batch_id)
                     # Not the whole miner's batch, not scored: no scored_at, and not "validated" for
                     # the express lane below.
                     await self.publish_result_missing(result_missing, miners, miner_coldkeys, job_batch_id)
@@ -1697,16 +1720,32 @@ class Validator:
         all_job_results: dict[str, list[JobResult]],
         rented_executors: RentedExecutorsResponse | None,
         miner_coldkeys: dict[str, str | None],
+        rented_now: RentedExecutorsResponse | None,
     ) -> None:
-        """DAH-4658: only a node the backend still lists as rented carries its score: right now, or in this
-        cycle's snapshot when the backend does not answer."""
+        """DAH-4658: only a node the backend still lists as rented carries its score: at the cycle end (`rented_now`),
+        or in this cycle's snapshot when the backend did not answer."""
         if not has_renter_gpu_reset_holds(all_job_results):
             return
-        rented = await self.backend_client.get_rented_executors_now() or rented_executors
+        rented = rented_now or rented_executors
         rented_executor_ids = {str(executor_id).lower() for executor_id in rented.executors} if rented else set()
         await carry_renter_gpu_reset_results(
             all_job_results, self.redis_service, rented_executor_ids, rented_executors, miner_coldkeys
         )
+
+    async def rented_at_cycle_end(
+        self, all_job_results: dict[str, list[JobResult]]
+    ) -> RentedExecutorsResponse | None:
+        """The rented list now, read only when a renter GPU reset hold or a rental-change rule failure needs it.
+        None when not needed or when the backend gives no answer (an exception counts as none)."""
+        if not (has_renter_gpu_reset_holds(all_job_results) or has_rental_change_candidates(all_job_results)):
+            return None
+        try:
+            return await self.backend_client.get_rented_executors_now()
+        except Exception as exc:
+            logger.warning(
+                _m("[sync] Cycle-end rented list unreadable", extra=get_extra_info({**self.default_extra, "error": str(exc)}))
+            )
+            return None
 
     async def withhold_verdicts_for_rollout(
         self,
@@ -1714,6 +1753,8 @@ class Validator:
         job_block: int,
         job_batch_id: str,
         window_at_cycle_start: RolloutWindow,
+        rented_at_start: RentedExecutorsResponse | None = None,
+        rented_at_end: RentedExecutorsResponse | None = None,
     ) -> tuple[dict[str, list[JobResult]], list[WithheldVerdict]]:
         """DAH-3405: at cycle end, take the results the rollout explains out of the cycle.
 
@@ -1728,7 +1769,13 @@ class Validator:
         await self.record_withheld_verdicts(window, withheld_results, job_batch_id, job_block)
         standing, held_for_gpu_reset = withhold_renter_gpu_reset_verdicts(standing)
         standing, session_lost = withhold_session_lost_verdicts(standing)
-        return standing, withheld_results + held_for_gpu_reset + session_lost
+        rental_changed = []
+        if rented_at_start is not None:
+            tally = self.miner_service.outage_tally
+            standing, rental_changed = await withhold_rental_change_verdicts(
+                standing, rented_at_start, rented_at_end, self.redis_service, tally.published_early if tally else set()
+            )
+        return standing, withheld_results + held_for_gpu_reset + session_lost + rental_changed
 
     async def publish_session_lost_findings(
         self,

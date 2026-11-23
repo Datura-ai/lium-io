@@ -32,6 +32,7 @@ from protocol.vc_protocol.compute_requests import (
 from pydantic import BaseModel, ValidationError
 from tenacity import retry, retry_if_result, stop_after_attempt, wait_fixed
 
+from clients.validator_portal_api import portal_owner_hotkeys
 from core.utils import _m, get_extra_info
 
 logger = logging.getLogger(__name__)
@@ -340,16 +341,22 @@ class BackendClient:
         # without this, tenacity raises RetryError after the last None
         retry_error_callback=lambda retry_state: None,
     )
-    async def get_all_rented_executors(self) -> RentedExecutorsResponse | None:
+    async def get_all_rented_executors(
+        self, cycle_snapshot_block: int | None = None
+    ) -> RentedExecutorsResponse | None:
         """Fetch all rented executors with their ports from the backend.
 
         Retried three times, 30 s apart: this is the cycle's snapshot, and a cycle without it
         cannot start. None when all three fail. A check that asks mid-cycle uses
-        `get_rented_executors_now` instead.
+        `get_rented_executors_now` instead. `cycle_snapshot_block`, the cycle's job block, marks the
+        one read per cycle (DAH-6400): only that read counts as a resumed node's list read for its
+        idle-pay hold, and a retry of it (same block) still holds the node.
         """
-        return await self.get_rented_executors_now()
+        return await self.get_rented_executors_now(cycle_snapshot_block=cycle_snapshot_block)
 
-    async def get_rented_executors_now(self) -> RentedExecutorsResponse | None:
+    async def get_rented_executors_now(
+        self, cycle_snapshot_block: int | None = None
+    ) -> RentedExecutorsResponse | None:
         """One un-retried read of the rented executors and fillers as the backend sees them now.
 
         For a check that re-asks after the cycle snapshot (DAH-3480): a backend that does not
@@ -358,7 +365,9 @@ class BackendClient:
         """
         return await self._signed_request(
             "GET",
-            "/internal/executors/rented",
+            "/internal/executors/rented"
+            if cycle_snapshot_block is None
+            else f"/internal/executors/rented?snapshot_cycle={cycle_snapshot_block}",
             RentedExecutorsResponse,
             timeout=30,
         )
@@ -559,6 +568,7 @@ class BackendClient:
         gpu_uuids: list[str] | None = None,
         cpu_count: int | None = None,
         loopback_plugin: str | None = None,
+        upload_nonce: str | None = None,
         timeout: int = 300,
     ) -> ExecutorHealthCheckResponse | None:
         """Check executor health via backend API.
@@ -582,6 +592,9 @@ class BackendClient:
             loopback_plugin: The plugin alias this validator creates rental volumes on. The backend
                 probes that plugin; without it (or on an older backend, which ignores it) only the
                 legacy plugin is probed. None omits the field.
+            upload_nonce: The dated nonce (datura fresh_upload_nonce) the backend signs into its SSH-key upload
+                with the miner binding, as this validator's own uploads do (DAH-6606), so a captured upload
+                signature goes stale. None for a miner that does not relay the field (upload_nonce_for_miner).
             timeout: Seconds to wait; the backend needs time to SSH and verify the container.
 
         Returns:
@@ -612,6 +625,15 @@ class BackendClient:
 
         if executor_id:
             json_data["executor_id"] = executor_id
+
+        # DAH-6740: the backend signs its own SSH key for these too, so the executor of a node the listing's owner set
+        # up under another of their accounts takes it (an older backend ignores the field). It signs them only with
+        # the dated upload_nonce (an undated signature would never expire).
+        owner_hotkeys = portal_owner_hotkeys(miner_hotkey)
+        if owner_hotkeys:
+            json_data["owner_hotkeys"] = sorted(owner_hotkeys)
+        if upload_nonce is not None:
+            json_data["upload_nonce"] = upload_nonce
 
         try:
             # the whole call, retries included: a connection retry must not restart the wait

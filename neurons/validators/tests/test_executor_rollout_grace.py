@@ -421,3 +421,35 @@ async def test_a_second_release_inside_the_8_cycles_gives_its_previous_release_a
     # own rules: not reopened in cycle 3 (no uncovered cycle has published yet), a fresh 2 cycles in cycle 5
     reopened = push >= 5
     assert seen == [(c, NEW, c < push + 8, reopened and c < push + 2) for c in range(push, push + 9)]
+
+
+@pytest.mark.asyncio
+async def test_a_second_release_keeps_the_release_before_it_current_through_its_own_cycle_8() -> None:
+    """Regression (18 Nov): v1.188 then v1.189 two cycles apart; nodes still on v1.187 read OUTDATED in
+    the cycle v1.189 was seen, because only the release just replaced kept its grace."""
+    tracker = _tracker(_FakeRedis())
+    await tracker.observe(OLD, J0 - BPC, now=T0)
+    await tracker.observe(NEW, J0, now=T0)  # OLD replaced: OLD's cycle 1
+    await tracker.observe(NEW, J0 + BPC, now=T0)
+
+    seen = []
+    for cycle in range(3, 12):  # NEWER pushed in cycle 3
+        job_block = J0 + (cycle - 1) * BPC
+        window = await tracker.observe(NEWER, job_block, now=T0)
+        seen.append((cycle, OLD in window.earlier_reading_current(job_block), window.previous_reads_current(job_block)))
+
+    # OLD: its own 8 cycles counted from cycle 1; NEW (now previous): 8 cycles from cycle 3
+    assert seen == [(c, c <= 8, c <= 10) for c in range(3, 12)]
+
+
+@pytest.mark.asyncio
+async def test_a_rollback_to_an_earlier_release_drops_it_from_the_earlier_list() -> None:
+    tracker = _tracker(_FakeRedis())
+    await tracker.observe(OLD, J0 - BPC, now=T0)
+    await tracker.observe(NEW, J0, now=T0)
+    await tracker.observe(NEWER, J0 + BPC, now=T0)
+    window = await tracker.observe(OLD, J0 + 2 * BPC, now=T0)  # rollback: OLD is current again
+
+    assert window.digest == OLD
+    assert window.previous_digest == NEWER
+    assert window.earlier_reading_current(J0 + 2 * BPC) == (NEW,)

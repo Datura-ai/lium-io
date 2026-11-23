@@ -8,6 +8,7 @@ import bittensor
 from core.config import settings
 from core.validator import Validator
 from incentive.config import IncentiveConfig
+from payload_models.payloads import MinerJobEnryptedFiles
 from services.task_service import JobResult
 
 
@@ -34,7 +35,6 @@ def incentive_redis_service():
 
 @pytest.fixture
 def mock_settings(monkeypatch):
-    monkeypatch.setattr(settings, "PORTION_FOR_SYSBOX", 0.1)
     monkeypatch.setattr(settings, "PORTION_FOR_UPTIME", 0.2)
     monkeypatch.setattr(settings, "UPTIME_REQUIRED_MINUTES", 120)
     monkeypatch.setattr(settings, "BURNERS", [0, 1])
@@ -149,7 +149,13 @@ def validator_with_mocks(incentive_redis_service, mock_subtensor_client, mock_se
     validator.redis_service = incentive_redis_service
     validator.subtensor_client = mock_subtensor_client
     validator.file_encrypt_service = MagicMock()
-    validator.file_encrypt_service.ecrypt_miner_job_files = MagicMock(return_value={})
+    # the real return type: sync reads its tmp_directory to keep it from cleanup
+    validator.file_encrypt_service.ecrypt_miner_job_files = MagicMock(
+        return_value=MinerJobEnryptedFiles(
+            encrypt_key="k", all_keys={}, tmp_directory="/nonexistent/cycle-test", machine_scrape_file_name="s",
+            machine_scrape_source="",
+        )
+    )
     validator.miner_service = MagicMock()
     validator.miner_service.request_job_to_miner = AsyncMock()
     validator.miner_service.publish_machine_specs = AsyncMock()
@@ -157,7 +163,7 @@ def validator_with_mocks(incentive_redis_service, mock_subtensor_client, mock_se
     validator.miner_service.publish_unreachable_early = AsyncMock()
     # sync() asks the express lane (built in initiate_services) which job-file directories to keep
     validator.express_lane = MagicMock()
-    validator.express_lane.directories_in_use = MagicMock(return_value=())
+    validator.express_lane.directories_in_use = MagicMock(return_value=set())  # the real method returns a set (sync adds to it)
     validator.backend_client = MagicMock()
     validator.backend_client.get_all_rented_executors = AsyncMock(return_value=[])
     validator.last_job_run_blocks = 0

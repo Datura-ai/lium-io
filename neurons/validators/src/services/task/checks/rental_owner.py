@@ -30,10 +30,16 @@ def rental_of_validated_miner(
                 ),
             )
         )
-    same_endpoint = (rented_executor.executor_ip_address, str(rented_executor.executor_ip_port)) == (
-        ctx.executor.address,
-        str(ctx.executor.port),
-    )
+    return rental_owned_by(rented_executor, ctx.miner_hotkey, ctx.executor.address, ctx.executor.port)
+
+
+def rental_owned_by(
+    rented_executor: RentedExecutor | None, miner_hotkey: str, address: str, port: int | str
+) -> RentedExecutor | None:
+    """rental_of_validated_miner without a check Context, for the cycle end (DAH-6564)."""
+    if not rented_executor or rented_executor.miner_hotkey == miner_hotkey:
+        return rented_executor
+    same_endpoint = (rented_executor.executor_ip_address, str(rented_executor.executor_ip_port)) == (address, str(port))
     return rented_executor if same_endpoint else None
 
 
@@ -52,5 +58,10 @@ def rental_of_this_node(
 def uuid_listed_under_another_miner(ctx: Context, rented_data: RentedExecutorsResponse | None) -> bool:
     """True when the backend lists this executor UUID under another miner's hotkey, so the filler it
     lists under that UUID is not on this node. An older backend sends no owners: no change."""
-    owner = rented_data.executor_owner_hotkeys.get(str(ctx.executor.uuid)) if rented_data else None
-    return bool(owner) and owner != ctx.miner_hotkey
+    return listed_under_another_miner(rented_data, str(ctx.executor.uuid), ctx.miner_hotkey)
+
+
+def listed_under_another_miner(rented_data: RentedExecutorsResponse | None, executor_uuid: str, miner_hotkey: str) -> bool:
+    """uuid_listed_under_another_miner without a check Context, for the cycle end (DAH-6564)."""
+    owner = rented_data.executor_owner_hotkeys.get(executor_uuid) if rented_data else None
+    return bool(owner) and owner != miner_hotkey

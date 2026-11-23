@@ -1,6 +1,5 @@
 import logging
 import pathlib
-from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
@@ -158,10 +157,6 @@ class Settings(BaseSettings):
     PORTION_FOR_UPTIME: float = 1
     UPTIME_REQUIRED_MINUTES: int = 60 * 24 * 14 # 14 days
 
-    PORTION_FOR_SYSBOX: float = 0.2
-    PORTION_FOR_SYSBOX_UNRENTED: float = 1
-    PORTION_FOR_SYSBOX_RENTED: float = 1
-    SYSBOX_RENTED_CUTOFF: datetime = datetime(2026, 4, 3, 12, 0, 0)
     # DAH-3597: first-miss grace for a DinD probe that never reached its container; the rule is
     # in PortConnectivityCheck, the TTL bounds the window between two misses.
     DIND_PROBE_FIRST_MISS_GRACE: bool = Field(env="DIND_PROBE_FIRST_MISS_GRACE", default=False)
@@ -247,10 +242,6 @@ class Settings(BaseSettings):
     # just-started collector) are counted per node and logged as INSPECTOR_BLIND_STREAK from this
     # many on.
     INSPECTOR_BLIND_STREAK_LIMIT: int = Field(env="INSPECTOR_BLIND_STREAK_LIMIT", default=5)
-    # On: the Inspector check fails from that cycle until the sensor reports again. Off by default.
-    INSPECTOR_BLIND_STREAK_ENFORCEMENT_ENABLED: bool = Field(
-        env="INSPECTOR_BLIND_STREAK_ENFORCEMENT_ENABLED", default=False
-    )
     # On a libinspector.so hash mismatch a RENTED executor, during the rental, curls
     # INSPECTOR_LIBRARY_FETCH_URL once into a temp file beside /usr/lib/libinspector.so, and the
     # file replaces the library (one rename) only if its sha256 is the validator's own. This is a
@@ -369,6 +360,14 @@ class Settings(BaseSettings):
     # Executor UUIDs are miner-chosen, so an entry matches only that miner's executor at that SSH
     # endpoint. Empty = none.
     LIUMD_SHADOW_RESERVED_EXECUTORS: str = Field(env="LIUMD_SHADOW_RESERVED_EXECUTORS", default="")
+    # DAH-6804: the boot-time layer reset (nvidia_docker_sysbox_setup.sh --install-layer-reset) on Sysbox hosts whose
+    # unit is missing or older than the setup script's, on hosts with no rental. off (default) = install nothing;
+    # allowlist = install on SYSBOX_LAYER_RESET_INSTALL_HOTKEYS (comma-separated miner hotkeys) only; all = every host.
+    # A host change is rolled out gradually (the v1.151 host sysctl change reached every host at once and was rolled back).
+    SYSBOX_LAYER_RESET_INSTALL: Literal["off", "allowlist", "all"] = Field(
+        env="SYSBOX_LAYER_RESET_INSTALL", default="off"
+    )
+    SYSBOX_LAYER_RESET_INSTALL_HOTKEYS: str = Field(env="SYSBOX_LAYER_RESET_INSTALL_HOTKEYS", default="")
     # The shadow can run only the fact steps while the Python path still owns VerifyX and matmul.
     # Flip this on when liumd's GPU checks are the thing being compared again.
     LIUMD_SHADOW_GPU_STEPS_ENABLED: bool = Field(
@@ -441,13 +440,6 @@ class Settings(BaseSettings):
         env="RENTED_POD_WATCH_NO_BANNER_RETRY_TIMEOUT_SECONDS", default=20.0, gt=0
     )
     RENTED_POD_WATCH_NO_BANNER_MISSES: int = Field(env="RENTED_POD_WATCH_NO_BANNER_MISSES", default=10, ge=1)
-    # A probed rented node the cycle has no result for (the miner timed out, failed, or left it out)
-    # is reported as EXECUTOR_RESULT_MISSING with only its observations. Off until the backend that
-    # stores such a report as evidence only (lium-platform) is deployed:
-    # an older backend would score it as a failed validation.
-    RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED: bool = Field(
-        env="RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED", default=False
-    )
     # A rented node whose scrape, run in the already-running executor, finds the GPU runtime
     # dead on the host (NVML: driver not loaded, GPU lost, GPU requires reset, GPU not found; or zero
     # cards) is reset the way POD_NOT_RUNNING and GPU_MISSING are: verified job cleared, so the backend
@@ -683,15 +675,6 @@ class Settings(BaseSettings):
     # Root log level. DEBUG brings back the per-cycle check outcomes that repeat the previous cycle
     # and the per-executor job-result dump after scoring; asyncssh and sqlalchemy keep their own levels.
     LOG_LEVEL: str = Field(env="LOG_LEVEL", default="INFO", description="Root log level (DEBUG, INFO, WARNING, ...)")
-
-    # DAH-2786 — GPU power cap revert gate. When True, an unrented executor whose host put the
-    # GPU power limit back while a Lium idle job was running, often enough inside the window,
-    # loses the unrented rental incentive while staying active. Ships in shadow mode: unlike
-    # DAH-2715 this gate reads provider behaviour rather than a capability, so the prod numbers
-    # are read first. Set to True to enforce.
-    ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT: bool = Field(
-        env="ENABLE_UNRENTED_POWER_CAP_REVERT_LIMIT", default=False
-    )
 
     # DAH-4299: whether an idle provider-chosen spot node is paid is decided as for a secure node
     # (its GPU model is in the unrented program and every idle-pool gate passes), not by whether a
@@ -978,16 +961,28 @@ class Settings(BaseSettings):
         ),
     )
     RENTAL_HOST_RAM_RESERVE_GB: int = Field(
-        env="RENTAL_HOST_RAM_RESERVE_GB", default=4, ge=0,
+        env="RENTAL_HOST_RAM_RESERVE_GB", default=8, ge=0,
         description=(
-            "RAM kept back for the host (sshd, dockerd, the executor) when a rental arrives with no "
-            "memory limit: the container gets host MemTotal minus max(this, "
-            "RENTAL_HOST_RAM_RESERVE_PERCENT), so a renter cannot exhaust the host's memory."
+            "RAM kept back for the host's own use outside the rental's cgroup (sshd, dockerd, the "
+            "executor, NVIDIA driver memory): the container's limit is at most (host MemTotal minus "
+            "max(this, RENTAL_HOST_RAM_RESERVE_PERCENT)) times its GPU share, so a renter at its limit "
+            "cannot starve the host. The backend lists pod RAM with the same figures."
         ),
     )
     RENTAL_HOST_RAM_RESERVE_PERCENT: float = Field(
-        env="RENTAL_HOST_RAM_RESERVE_PERCENT", default=3.0, ge=0, lt=100,
-        description="Percent of host RAM kept back, see RENTAL_HOST_RAM_RESERVE_GB (3 %, as the backend: DAH-5206).",
+        env="RENTAL_HOST_RAM_RESERVE_PERCENT", default=10.0, ge=0, lt=100,
+        description=(
+            "Percent of host RAM kept back, see RENTAL_HOST_RAM_RESERVE_GB (10 %, as the backend: an idle "
+            "376 GiB host used 14 GiB outside the rental's cgroup, more than the former 3 %)."
+        ),
+    )
+    RENTAL_LOG_MAX_SIZE: str = Field(
+        env="RENTAL_LOG_MAX_SIZE", default="100m",
+        description="json-file max-size of a rental container's log, so its stdout cannot fill the host disk.",
+    )
+    RENTAL_LOG_MAX_FILE: int = Field(
+        env="RENTAL_LOG_MAX_FILE", default=3, gt=0,
+        description="json-file max-file of a rental container's log (see RENTAL_LOG_MAX_SIZE).",
     )
     CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS: int = Field(
         env="CUSTOM_DOCKERFILE_DIND_READY_TIMEOUT_SECONDS", default=60, gt=0,

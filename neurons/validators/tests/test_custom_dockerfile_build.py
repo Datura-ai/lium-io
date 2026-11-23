@@ -26,6 +26,8 @@ import logging
 import re
 import subprocess
 from unittest.mock import AsyncMock, Mock
+
+from ssh_channel_double import create_process_answering_through
 from uuid import uuid4
 
 import pytest
@@ -82,7 +84,6 @@ class _FakeRentalDockerClient:
         self.exec_specs = []
         self.created_volumes = []
         self.removed_volumes = []
-        self.pruned_images = 0
         self.pull_error = None
         self.run_error = None
 
@@ -131,9 +132,6 @@ class _FakeRentalDockerClient:
         self.removed_volumes.append(
             {"volume_name": volume_name, "force": force}
         )
-
-    async def prune_images(self) -> None:
-        self.pruned_images += 1
 
 
 class _FakeRentalDockerFactory:
@@ -320,6 +318,8 @@ def _make_dind_ssh(
     def _create_process(command: str):
         if _is_probe(command):
             return _probe_process(command)
+        if command.startswith(("cat /proc/", "ls -1d /dev/nvidia")):  # the bounded host reads
+            return create_process_answering_through(_run)(command)
         raise AssertionError(
             f"unexpected create_process (the streamed steps are stubbed here): {command}"
         )

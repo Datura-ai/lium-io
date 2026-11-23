@@ -7,7 +7,6 @@ from constants import TOTAL_BURN_EMISSION
 BASE_JOB_SCORE = 1.0
 BURNER_COUNT = 2
 MINING_ALLOCATION = 1 - TOTAL_BURN_EMISSION
-SYSBOX_PENALTY_PORTION = 0.1
 UPTIME_PENALTY_PORTION = 0.2
 UPTIME_REQUIRED_MINUTES = 120
 
@@ -31,7 +30,7 @@ def expected_score(
 ) -> float:
     score = BASE_JOB_SCORE * portion * gpu_count / total_gpu_count
     if not sysbox_runtime:
-        score *= 1 - SYSBOX_PENALTY_PORTION
+        return 0.0  # sysbox is required: a node without it scores 0
     if not collateral_deposited:
         uptime_ratio = min(1.0, (uptime_minutes or 0) / UPTIME_REQUIRED_MINUTES)
         score *= 1 - UPTIME_PENALTY_PORTION + UPTIME_PENALTY_PORTION * uptime_ratio
@@ -403,7 +402,7 @@ async def test_scenario_mixed_sysbox_usage(
     create_job_result,
     create_neuron_info,
 ):
-    """Miners using sysbox should score higher than those not using it."""
+    """Sysbox is required: a miner without it scores 0, the one with it takes the mining pool."""
     validator = validator_with_mocks
     validator.miner_scores = {}
 
@@ -1669,7 +1668,6 @@ async def test_an_express_pass_during_the_spec_publish_is_in_the_cycles_reported
 
     validator.miner_service.publish_machine_specs = AsyncMock(side_effect=lane_pass_lands)
     validator.publish_result_missing = AsyncMock()
-    monkeypatch.setattr(mock_settings, "RENTED_POD_SSH_RESULT_MISSING_REPORT_ENABLED", True)
     seen_reported = []
 
     def spy(rented, observations, reported, batch_id):

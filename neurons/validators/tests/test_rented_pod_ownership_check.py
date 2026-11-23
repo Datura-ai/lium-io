@@ -328,12 +328,27 @@ async def test_each_age_stays_with_its_own_pid_when_one_pid_prints_nothing(conte
     assert result.event.remediation == Msg.SHIFTED.remediation  # pod_1's history is unknown
 
 
-def _ssh_with_runtime_ages(proc: str, ages: str):
+UPTIME_S = 100000  # the host booted 100000 s before the read
+
+
+def _starts(ages: str, clock: str | None) -> str:
+    """the check's read, from the fixtures' ages: each last field becomes the kernel start time in ticks since
+    boot (100 a second), then the boot epoch and CLK_TCK (None: not readable)"""
+    out = []
+    for line in ages.splitlines():
+        fields = line.split()
+        if fields and fields[-1].isdigit():
+            fields[-1] = str((UPTIME_S - int(fields[-1])) * 100)
+        out.append(" ".join(fields))
+    return "\n".join(out) + "\n--\n" + (clock if clock is not None else "") + "\n"
+
+
+def _ssh_with_runtime_ages(proc: str, ages: str, clock: str | None = "1794500000\n100"):
     inner = _ssh(proc)
 
     async def run(cmd, check=False):
-        if cmd.startswith("ps -eo comm=,etimes="):
-            return SimpleNamespace(exit_status=0, stdout=ages, stderr="")
+        if cmd.startswith("ps -eo pid=,ppid=,comm= | grep"):
+            return SimpleNamespace(exit_status=0, stdout=_starts(ages, clock), stderr="")
         return await inner.run(cmd, check=check)
 
     return SimpleNamespace(run=run)
@@ -344,13 +359,25 @@ def _ssh_with_runtime_ages(proc: str, ages: str):
     [
         # needrestart restarted sysbox-fs and the fabric manager 100 s ago; pod_1 runs for a day, pod_2 for 50 s
         (
-            "sysbox-mgr 90000\nsysbox-fs     100\nnv-fabricmanage 100\n--\n 4242 86400\n 4343 50\n",
+            "  10     1 sysbox-mgr 90000\n  11     1 sysbox-fs     100\n"
+            "  12 1 nv-fabricmanage 100\n--\n 4242 86400\n 4343 50\n",
             {"nv-fabricmanager": ["pod_1"], "sysbox-fs": ["pod_1"]},
         ),
         # every runtime process is older than both pods (a reboot brings them up first): nothing to flag
-        ("sysbox-mgr 90000\nsysbox-fs 90000\n--\n4242 86400\n4343 50\n", None),
+        ("10 1 sysbox-mgr 90000\n11 1 sysbox-fs 90000\n--\n4242 86400\n4343 50\n", None),
         # a pod age not read flags nothing for that pod
-        ("sysbox-fs 100\n--\n4343 50\n", None),
+        ("11 1 sysbox-fs 100\n--\n4343 50\n", None),
+        # the daemons run since boot; their own helpers (re-execs, seconds old): no restart
+        (
+            "10 1 sysbox-mgr 90000\n11 1 sysbox-fs 90000\n900 11 sysbox-fs 1\n901 10 sysbox-mgr 2\n"
+            "--\n4242 86400\n4343 50\n",
+            None,
+        ),
+        # a restarted daemon is flagged even beside an orphaned helper of the old one
+        (
+            "11 1 sysbox-fs 100\n77 1 sysbox-fs 90000\n--\n4242 86400\n4343 50\n",
+            {"sysbox-fs": ["pod_1"]},
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -402,3 +429,61 @@ async def test_every_shifted_pod_gets_the_cause_its_creation_and_start_show(
     out = f"1400.25\n4242 {age_1}\n4343 {age_2}\n--\n{boot}\n/pod_1 {created_1}\n/pod_2 {created_2}\n"
     result = await RentedPodOwnershipCheck().run(_ctx(context_factory, _ssh_with_uptime(str(tmp_path), out)))
     assert result.event.remediation == template.remediation
+
+
+@pytest.mark.parametrize(
+    ("clock", "started_at"),
+    [
+        # boot epoch and ticks a second both read
+        ("1794500000\n100", "2026-11-13T18:00:00Z"),
+        # boot time or tick rate not readable: the report says unknown instead of leaving the time out
+        ("", "unknown"),
+        ("1794500000", "unknown"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_flagged_runtime_carries_when_it_started_from_the_kernel_start_time(
+    context_factory, tmp_path, clock, started_at
+):
+    """the check first ran days after a restart: the report dates the restart itself, from the kernel's start
+    time of the daemon (boot epoch + ticks since boot), not a clock and an age read apart (arhangel66 on
+    lio#2379: a 3 s later clock read moved the date across midnight)"""
+    me = os.getuid()
+    _proc(tmp_path, 4242, f"         0     {me}      65536\n")
+    _proc(tmp_path, 4343, f"         0     {me}      65536\n")
+    # boot 1794500000 + uptime 100000 = a read at 2026-11-13T20:00:00Z; sysbox-fs started 7200 s before it
+    # (2026-11-13T18:00:00Z), pod_1 50000 s before, pod_2 50 s before (after the restart: not flagged)
+    ages = "10 1 sysbox-mgr 99000\n11 1 sysbox-fs 7200\n--\n4242 50000\n4343 50\n"
+    result = await RentedPodOwnershipCheck().run(
+        _ctx(context_factory, _ssh_with_runtime_ages(str(tmp_path), ages, clock))
+    )
+    assert result.event.reason_code == Msg.RUNTIME_RESTARTED.reason
+    assert result.event.what_we_saw["runtime_restarted_under_pods"] == {"sysbox-fs": ["pod_1"]}
+    assert result.event.what_we_saw["runtime_started_at"] == {"sysbox-fs": started_at}
+
+
+@pytest.mark.asyncio
+async def test_the_runtime_read_runs_in_a_real_shell_and_dates_from_the_kernel(monkeypatch):
+    """the command itself, run by bash on this Linux host: a process started after the "pod" (this test
+    process) is flagged and dated within seconds of now"""
+    import calendar
+    import time
+
+    from neurons.validators.src.services.task.checks import rented_pod_ownership as mod
+
+    monkeypatch.setattr(mod, "RUNTIME_PROCESSES", ("sleep",))
+    daemon = subprocess.Popen(["sleep", "30"])
+    try:
+
+        async def run(cmd, check=False):
+            out = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, check=False)
+            return SimpleNamespace(exit_status=out.returncode, stdout=out.stdout, stderr=out.stderr)
+
+        restarted, started_at = await RentedPodOwnershipCheck()._runtime_restarted_under(
+            SimpleNamespace(ssh=SimpleNamespace(run=run)), [{"pid": os.getpid(), "container": "pod_1"}]
+        )
+    finally:
+        daemon.kill()
+    assert restarted == {"sleep": ["pod_1"]}
+    started = calendar.timegm(time.strptime(started_at["sleep"], "%Y-%m-%dT%H:%M:%SZ"))
+    assert abs(started - time.time()) < 60

@@ -613,13 +613,6 @@ class PostRentalGpuRecheckMessages:
         category="env",
         impact="Proceed",
     )
-    FILLER_SKIPPED = MessageTemplate(
-        event="Post-rental GPU recheck waits: active filler",
-        reason="POST_RENTAL_GPU_RECHECK_SKIPPED_ACTIVE_FILLER",
-        severity="info",
-        category="policy",
-        impact="Proceed; the recheck runs on a cycle without a filler, or after a few filler cycles anyway.",
-    )
     INCONCLUSIVE = MessageTemplate(
         event="Post-rental GPU recheck gave no verdict",
         reason="POST_RENTAL_GPU_RECHECK_INCONCLUSIVE",
@@ -1054,6 +1047,51 @@ class NeedrestartGuardMessages:
     )
 
 
+class SysboxLayerResetMessages:
+    OUTDATED = MessageTemplate(
+        event="Host boot-time layer reset missing or old",
+        reason="SYSBOX_LAYER_RESET_OUTDATED",
+        severity="info",
+        category="env",
+        impact="Proceed; score not changed",
+        remediation=(
+            "After a power loss or hard reset, rented pods on this host come back with their files owned by the "
+            "host's root, so sudo and apt fail inside them. Run `sudo bash nvidia_docker_sysbox_setup.sh "
+            "--install-layer-reset` from lium-io neurons/executor on the host: it installs "
+            "lium-sysbox-layer-reset.service, runs nothing and restarts nothing."
+        ),
+    )
+    INSTALLED = MessageTemplate(
+        event="Host boot-time layer reset installed",
+        reason="SYSBOX_LAYER_RESET_INSTALLED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    INSTALL_FAILED = MessageTemplate(
+        event="Host boot-time layer reset could not be installed",
+        reason="SYSBOX_LAYER_RESET_INSTALL_FAILED",
+        severity="warning",
+        category="env",
+        impact="Proceed; score not changed",
+        remediation=OUTDATED.remediation,
+    )
+    UNKNOWN = MessageTemplate(
+        event="Host boot-time layer reset not reported",
+        reason="SYSBOX_LAYER_RESET_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    OK = MessageTemplate(
+        event="Host boot-time layer reset ok",
+        reason="SYSBOX_LAYER_RESET_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+
+
 class PidHostRequiredMessages:
     MISSING = MessageTemplate(
         event="Executor not in the host PID namespace",
@@ -1474,6 +1512,13 @@ class InspectorMessages:
 
 
 class TenantEnforcementMessages:
+    HALF_STARTED_STOPS_RETRIED = MessageTemplate(
+        event="Pending stops of half-started pods retried",
+        reason="HALF_STARTED_STOPS_RETRIED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
     NOT_RENTED = MessageTemplate(
         event="Executor not rented",
         reason="EXECUTOR_NOT_RENTED",
@@ -1582,6 +1627,10 @@ class GpuUsageMessages:
         "{vram_utilization}, with Lium's filler running on the node. Stop the GPU processes "
         "outside Lium's containers and re-run your node: {processes}. Leave Lium's own filler "
         "running: {fillers}."
+    )
+    FOREIGN_PROCESS_IN_FILLER_REMEDIATION = (
+        "A GPU process that is not the workload of Lium's filler runs inside the filler container: "
+        "{processes}. Stop it, run nothing else inside Lium's containers, and re-run your node."
     )
     USAGE_HIGH_BESIDE_A_RENTAL_REMEDIATION = (
         "Stop the GPU processes outside Lium's containers and re-run your node: {outside_processes}. "
@@ -3058,9 +3107,10 @@ class RentedPodResourcesMessages:
         category="runtime",
         impact="Proceed without penalty; the renter's pod cannot read /proc/sys",
         remediation=(
-            "The FUSE service behind the container's /proc (sysbox-fs) stopped or restarted, so the running "
-            "pod answers 'Transport endpoint is not connected'. Check `systemctl status sysbox`, restart it if "
-            "needed, then restart the pod container; tell the renter first."
+            "The pod's /proc/sys answers 'Transport endpoint is not connected': its FUSE connection to "
+            "sysbox-fs is gone. This read does not show why; a sysbox-fs restart under the pod is reported "
+            "separately as RENTED_POD_OWNERSHIP_RUNTIME_RESTARTED. Restarting sysbox breaks every other "
+            "running pod: contact support before changing anything on the host."
         ),
     )
     RESOURCES_UNKNOWN = MessageTemplate(
@@ -3166,7 +3216,9 @@ class RentedPodOwnershipMessages:
         severity="warning",
         category="runtime",
         impact="Proceed; pods running across a sysbox or NVIDIA fabric manager restart can lose /proc paths or NVLink",
-        remediation="A runtime service listed in runtime_restarted_under_pods started after the listed pods. "
+        remediation="A runtime service listed in runtime_restarted_under_pods started after the listed pods, at the "
+        "time in runtime_started_at (which can be days before this report; \"unknown\" when the host's boot time "
+        "could not be read). "
         "Contact support before changing anything on the host; restarting the pod alone does not repair it.",
     )
     UNREAD = MessageTemplate(
@@ -3248,7 +3300,8 @@ SSHD_BOOTSTRAP_REMEDIATION = (
     "\"/run/sshd must be owned by root and not group or world-writable\"). Fix the runtime/image setup so "
     "a fresh container gets a root-owned /run/sshd with mode 755, then check that `docker run --rm ubuntu sh -c "
     "'apt-get update -qq && apt-get install -y -qq openssh-server && mkdir -p /run/sshd && /usr/sbin/sshd -t'` "
-    "succeeds. The node is validated again once a new container on it starts sshd."
+    "succeeds. Each validation cycle starts sshd in a fresh container on the node again; the node is validated again the "
+    "cycle sshd starts there."
 )
 
 

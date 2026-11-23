@@ -509,8 +509,13 @@ async def test_the_cycle_asks_the_backend_once_whether_the_node_is_still_rented(
     validator_process.backend_client = MagicMock(get_rented_executors_now=AsyncMock(return_value=rented_now))
     job_results = {"5Miner": [_failed("node-1", Msg.SCRAPE_GPU_RESET_IN_PROGRESS.reason), _scored("node-2")]}
 
-    await validator_process.carry_scores_over_renter_gpu_resets(job_results, snapshot, {})
-    await validator_process.carry_scores_over_renter_gpu_resets({"5Miner": [_scored("node-3")]}, snapshot, {})
+    await validator_process.carry_scores_over_renter_gpu_resets(
+        job_results, snapshot, {}, await validator_process.rented_at_cycle_end(job_results)
+    )
+    no_hold = {"5Miner": [_scored("node-3")]}
+    await validator_process.carry_scores_over_renter_gpu_resets(
+        no_hold, snapshot, {}, await validator_process.rented_at_cycle_end(no_hold)
+    )
 
     assert job_results["5Miner"][0].carried_for_renter_gpu_reset is carried
     validator_process.backend_client.get_rented_executors_now.assert_awaited_once()
@@ -618,7 +623,7 @@ async def _reset_with_gpus_lost(service, backend):
     with patch("services.docker_service.reset_pod_gpus", AsyncMock(return_value=GPUS_LOST)):
         result = await _run_reset(service, backend, return_value=connection)
     assert (result.ok, result.error_code, result.detail, result.container_restarted, result.gpus) == (
-        False, GpuResetErrorCode.ResetNotSupported, GPUS_LOST_DETAIL, False, []
+        False, GpuResetErrorCode.GpusLostOnHost, GPUS_LOST_DETAIL, False, []
     )
 
 

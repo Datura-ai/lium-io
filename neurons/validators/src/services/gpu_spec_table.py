@@ -49,6 +49,7 @@ Pre-check policy:
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from services.const import GPU_MODEL_RATES
@@ -192,6 +193,9 @@ MODDED_VRAM_MODELS: dict[str, tuple[str, int]] = {
     RTX_4090_48GB: ("NVIDIA GeForce RTX 4090", 49152),  # 48 GB; observed: 49140
     "NVIDIA GeForce RTX 4080 32GB": ("NVIDIA GeForce RTX 4080", 32768),  # 32 GB
     "NVIDIA GeForce RTX 4080 SUPER 32GB": ("NVIDIA GeForce RTX 4080 SUPER", 32768),  # 32 GB
+    "NVIDIA GeForce RTX 4090 D 48GB": ("NVIDIA GeForce RTX 4090 D", 49152),  # 48 GB
+    "NVIDIA GeForce RTX 3080 20GB": ("NVIDIA GeForce RTX 3080", 20480),  # 20 GB
+    "NVIDIA GeForce RTX 2080 Ti 22GB": ("NVIDIA GeForce RTX 2080 Ti", 22528),  # 22 GB
 }
 for _modded, (_base, _size_mb) in MODDED_VRAM_MODELS.items():
     GPU_VRAM_SIZES_MB[_modded] = [_size_mb]
@@ -210,13 +214,12 @@ KNOWN_UNRANGED: set[str] = set()
 # logs. Unmapped names pass through unchanged (and will likely produce
 # UnsupportedGpuModelError until added here).
 NORMALIZATION_MAP: dict[str, str] = {
-    # Tesla V100 family — CUDA reports "Tesla V100-..." in some driver versions
-    "Tesla V100-SXM2-16GB": "NVIDIA Tesla V100 Tensor Core GPU",
-    "Tesla V100-SXM2-32GB": "NVIDIA Tesla V100 Tensor Core GPU",
-    "Tesla V100-PCIE-16GB": "NVIDIA Tesla V100 Tensor Core GPU",
-    "Tesla V100-PCIE-32GB": "NVIDIA Tesla V100 Tensor Core GPU",
+    # Tesla V100 boards ("Tesla V100-SXM2-32GB", ...): V100_BOARD_NAME_RE below
     # H100 — some driver/OS combos report without the "NVIDIA " prefix
     "Tesla H100 80GB HBM3": "NVIDIA H100 80GB HBM3",
+    # 80 GB HBM2e H100 (PCI 10de:2336, board 900-21010) the driver names bare "NVIDIA H100": paid as the PCIe
+    # card; a bigger SXM card under the PCIe name still passes gpu_model_truth and is not paid more (15 Nov)
+    "NVIDIA H100": "NVIDIA H100 PCIe",
     # T4 / A10 — CUDA sometimes drops the "Tensor Core GPU" suffix
     "Tesla T4": "NVIDIA T4 Tensor Core GPU",
     "NVIDIA T4": "NVIDIA T4 Tensor Core GPU",
@@ -228,17 +231,26 @@ NORMALIZATION_MAP: dict[str, str] = {
 }
 
 
+# Every V100 board the driver names "Tesla V100-<board>-<16|32>GB[-LS]": SXM2, SXM3 (DGX-2), PCIE, FHHL, DGXS (DGX
+# Station). Listing boards one by one refused each one not listed yet (DGXS, 18 Nov); the VRAM range still judges the
+# card. V100S is another card ("Tesla V100S-PCIE-32GB") and does not match.
+V100_BOARD_NAME_RE = re.compile(r"Tesla V100-[A-Z0-9]+-(16|32)GB(-LS)?")
+V100 = "NVIDIA Tesla V100 Tensor Core GPU"
+
+
 def normalize_gpu_model(name: str | None) -> str:
     """Map a CUDA-reported GPU name to a canonical GPU_MODEL_RATES key.
 
     Returns:
         - "" if `name` is empty/None.
-        - The mapped canonical name if `name.strip()` is in NORMALIZATION_MAP.
+        - The mapped canonical name if `name.strip()` is in NORMALIZATION_MAP or names a V100 board.
         - Otherwise `name.strip()` unchanged (caller decides what to do).
     """
     if not name:
         return ""
     stripped = name.strip()
+    if V100_BOARD_NAME_RE.fullmatch(stripped):
+        return V100
     return NORMALIZATION_MAP.get(stripped, stripped)
 
 

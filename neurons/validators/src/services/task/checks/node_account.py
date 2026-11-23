@@ -31,6 +31,7 @@ from datetime import UTC, datetime
 from datura.requests.miner_requests import ExecutorSSHInfo
 
 from core.utils import _m, get_extra_info, get_logger
+from clients.validator_portal_api import portal_owner_hotkeys
 from services.node_host import host_key_body, is_ip_literal, registered_host_keys
 
 from ..messages import NodeAccountMessages as Msg, render_message
@@ -160,8 +161,14 @@ class NodeAccountCheck:
             )
             return None, False
         by_hotkey = executor.expected_claims_by_hotkey or {}
-        if hotkey not in executor.expected_node_hotkeys and hotkey not in by_hotkey:
-            # another owner's setup: the hotkey alone settles it, whatever the claim would read
+        if (
+            hotkey not in executor.expected_node_hotkeys
+            and hotkey not in by_hotkey
+            and hotkey not in portal_owner_hotkeys(ctx.miner_hotkey)
+        ):
+            # another owner's setup: the hotkey alone settles it, whatever the claim would read. DAH-6740: the listing
+            # owner's other accounts, as this validator read them from the portal itself; the list a miner relays is
+            # never widened
             what["binding_mismatch"] = "hotkey"
             return _refused(ctx, self.check_id, Msg.BINDING_MISMATCH, what), False
         if hotkey not in by_hotkey and not (_pool_listed(executor, ctx, hotkey)):

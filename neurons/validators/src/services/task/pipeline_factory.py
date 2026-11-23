@@ -91,9 +91,11 @@ from .checks import (
     SshdBootstrapCheck,
     DockerCpuCheck,
     NeedrestartGuardCheck,
+    SysboxLayerResetCheck,
     PidHostRequiredCheck,
     SysboxRequiredCheck,
     TdxHostCheck,
+    HalfStartedStopRetryCheck,
     TenantEnforcementCheck,
     UploadFilesCheck,
     VerifyXCheck,
@@ -319,6 +321,8 @@ class PipelineFactory:
             [
                 # DAH-4629: first, before any fatal check, so every node reports its ssh logins, rented ones too
                 SshdAuthLogCheck(),
+                # F-31: before any check that can halt the cycle, so a pending stop is retried on every node, every cycle
+                HalfStartedStopRetryCheck(),
                 # DAH-5729: before any work on the node, the node must be the registering account's
                 NodeAccountCheck(),
                 StartGPUMonitorCheck(),
@@ -327,6 +331,8 @@ class PipelineFactory:
                 # DAH-6566: right after the scrape, before any fatal check: writes the needrestart guard on hosts set up
                 # before 16 Nov, idle and rented alike, so apt never restarts sysbox-fs under running pods
                 NeedrestartGuardCheck(),
+                # DAH-6804: same place: installs the boot-time layer reset on idle Sysbox hosts without it
+                SysboxLayerResetCheck(),
                 # Non-fatal, right after the scrape. A rented node that lost a GPU fails the fatal
                 # GPU checks below (DETAILS_MISMATCH, GPU_MISSING), which halt the cycle before
                 # TenantEnforcementCheck; this reports it to the backend on that same cycle.
@@ -527,6 +533,8 @@ class PipelineFactory:
             [
                 # DAH-4629: first, before any fatal check, so every node reports its ssh logins, rented ones too
                 SshdAuthLogCheck(),
+                # F-31: before any check that can halt the cycle, so a pending stop is retried on every node, every cycle
+                HalfStartedStopRetryCheck(),
                 # DAH-5729: before any work on the node, the node must be the registering account's
                 NodeAccountCheck(),
                 StartGPUMonitorCheck(),
@@ -535,6 +543,8 @@ class PipelineFactory:
                 # DAH-6566: right after the scrape, before any fatal check: writes the needrestart guard on hosts set up
                 # before 16 Nov, idle and rented alike, so apt never restarts sysbox-fs under running pods
                 NeedrestartGuardCheck(),
+                # DAH-6804: same place: installs the boot-time layer reset on idle Sysbox hosts without it
+                SysboxLayerResetCheck(),
                 RentedGpuDropCheck(),
                 GpuLossHoldCheck(),
                 GpuThermalThrottleCheck(),
@@ -638,6 +648,8 @@ class PipelineFactory:
                 MachineSpecScrapeCheck(),
                 # DAH-6566: same place as in build_checks(); under DRY_RUN it reports and writes nothing
                 NeedrestartGuardCheck(write=False),
+                # DAH-6804: same place as in build_checks(); under DRY_RUN it reports and installs nothing
+                SysboxLayerResetCheck(write=False),
                 # RentedGpuDropCheck: same place as in build_checks(); under DRY_RUN it logs and posts nothing.
                 RentedGpuDropCheck(),
                 # DAH-4457: same place as in build_checks(); under DRY_RUN it reads the hold and writes none.
