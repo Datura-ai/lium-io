@@ -497,3 +497,24 @@ def test_the_upload_body_has_no_nul_bytes(tmp_path):
     subprocess.run(["sh", "-c", module._FETCH_SCRIPT], env=env, check=True, capture_output=True, timeout=60)
     body = out.read_bytes()
     assert len(body) == module.CAP_BYTES and b"\0" not in body
+
+
+async def test_the_fleet_control_counts_each_other_node_once_by_its_latest_reading():
+    # lio#2411: 3 slow nodes re-read every retry (6 readings each) outnumbered 30 fast nodes read once and excused PyPI
+    with flags():
+        fleet = FleetRedis(pypi=(0, 30), hf=(0, 30), cf_up=(0, 30))
+        for n in range(3):
+            for k in range(6):
+                at = Clock.now - 3000 + k * 300
+                fleet.fleet["pypi"].append((at, f"5Slow|slow-{n}|{at:.3f}|1"))
+        ctx, _, _ = make_ctx(PYPI_ONLY_SLOW, redis=fleet)
+        res = await ContainerDownloadSpeedCheck().run(ctx)
+        assert res.event.reason_code == Msg.SLOW_ONCE.reason
+    with flags():
+        # a node that read slow and then fast counts as fast
+        fleet = FleetRedis(pypi=(10, 30), hf=(0, 30), cf_up=(0, 30))
+        for i in range(10):
+            fleet.fleet["pypi"].append((Clock.now - 30, f"5Other{i % 7}|node-{i}|{Clock.now - 30:.3f}|0"))
+        ctx, _, _ = make_ctx(PYPI_ONLY_SLOW, redis=fleet)
+        res = await ContainerDownloadSpeedCheck().run(ctx)
+        assert res.event.reason_code == Msg.SLOW_ONCE.reason

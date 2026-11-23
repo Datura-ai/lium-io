@@ -1436,3 +1436,14 @@ async def test_a_rented_pod_slow_to_pypi_only_on_this_providers_path_fails():
         ctx, _ = make_ctx(answer, redis=FleetRedis(pypi=(20, 40), hf=(0, 40), cf_up=(0, 40)))
         _, net, _ = await RentedThroughputCheck()._measure_and_judge(ctx)
         assert net == "pass"
+
+
+@pytest.mark.parametrize("answer, recorded", [(SLOW_NET, True), (BUSY_NET, False), (NO_COUNTERS, False)])
+async def test_only_a_reading_this_check_judges_goes_into_the_fleet_window(answer, recorded):
+    # lio#2411: a slow reading on a busy or unmeasured host is no verdict here, so it never speaks for the endpoint
+    with flags():
+        fleet = FleetRedis()
+        ctx, _ = make_ctx(answer, redis=fleet)
+        await RentedThroughputCheck()._measure_and_judge(ctx)
+        mine = [m for ms in fleet.fleet.values() for _, m in ms if m.startswith(f"{ctx.miner_hotkey}|")]
+        assert bool(mine) is recorded

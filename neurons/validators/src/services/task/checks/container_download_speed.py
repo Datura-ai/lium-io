@@ -225,7 +225,15 @@ async def _fleet_reads_slow(ctx: Context, endpoint: str, now: float) -> bool:
     except Exception:  # noqa: BLE001 — no comparison available
         logger.warning(_m("Endpoint fleet window unreadable", extra=get_extra_info(ctx.default_extra)))
         return True
-    others = [m.rsplit("|", 1)[-1] for m in members if m.split("|", 1)[0] != ctx.miner_hotkey]
+    # each other provider's node counts once, by its latest reading: a slow node re-read every RETRY_SECONDS would
+    # otherwise outweigh the fast nodes read once per interval and excuse the endpoint for everyone
+    latest: dict[str, tuple[float, str]] = {}
+    for m in members:
+        hotkey, uuid, at, slow = m.split("|")
+        node = f"{hotkey}|{uuid}"
+        if hotkey != ctx.miner_hotkey and float(at) >= latest.get(node, (float("-inf"), ""))[0]:
+            latest[node] = (float(at), slow)
+    others = [slow for _, slow in latest.values()]
     if len(others) < FLEET_MIN_READINGS:
         return True
     return others.count("1") / len(others) >= FLEET_SLOW_SHARE
@@ -367,11 +375,14 @@ class ContainerDownloadSpeedCheck:
             ]
         return readings
 
-    async def _judge(self, ctx: Context, readings: list[EndpointReading]) -> Judgement:
+    async def _judge(
+        self, ctx: Context, readings: list[EndpointReading], *, fleet: list[EndpointReading] | None = None
+    ) -> Judgement:
         """Slow on every measured download fails. Any other slow endpoint (one download, or the upload) fails unless the
-        fleet comparison attributes it to the endpoint."""
+        fleet comparison attributes it to the endpoint. `fleet`: the readings the caller judges, the only ones recorded
+        in the fleet window (default: all)."""
         now = time.time()
-        await _record_fleet(ctx, readings, now)
+        await _record_fleet(ctx, readings if fleet is None else fleet, now)
         downloads = [r for r in readings if r.mbps is not None and r.endpoint not in _UPLOAD_NAMES]
         if downloads and max(r.mbps for r in downloads) < settings.CONTAINER_DOWNLOAD_SPEED_MIN_MBPS:
             return Judgement(is_failing=True, has_no_verdict=False, failed=tuple(downloads))

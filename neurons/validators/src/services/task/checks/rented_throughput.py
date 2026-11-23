@@ -33,6 +33,7 @@ from .container_download_speed import (
     _TIMEOUT_EXITS,
     _UPLOAD_NAMES,
     ContainerDownloadSpeedCheck,
+    _is_slow,
     download_speed_command,
     parse_download_speed,
 )
@@ -618,10 +619,18 @@ class RentedThroughputCheck:
             settings.DISK_PRESSURE_GATE_ENFORCEMENT_ENABLED and pressure is not None and pressure.pressure
         )
 
-        judged = await ContainerDownloadSpeedCheck()._judge(ctx, endpoints)
         # a bridge fallback (rentals network not inspectable) did not measure the renter's path
         off_rentals = not endpoints or any(r.network != RENTAL_NETWORK_NAME for r in endpoints)
         net_unsure = net_busy or net_mbps is None or off_rentals
+
+        def net_load(during: tuple[Any, Any]) -> bool:
+            return during[0] is not None and during[0] >= DURING_NET_MBPS
+
+        # the fleet window holds only readings this check judges: an unsure or incomplete measurement is never a pass
+        # or a fail here, and _excuse turns a slow reading under renter load into no verdict
+        loaded = net_load(own) or net_load(maybe)
+        judged_here = [] if net_unsure or net_incomplete else [r for r in endpoints if not (loaded and _is_slow(r))]
+        judged = await ContainerDownloadSpeedCheck()._judge(ctx, endpoints, fleet=judged_here)
         if judged.is_failing:
             net = "fail"
         elif any(r.error == "no_output" for r in endpoints):
@@ -632,9 +641,6 @@ class RentedThroughputCheck:
             net = "none"
         else:
             net = "none" if net_unsure else "pass"
-
-        def net_load(during: tuple[Any, Any]) -> bool:
-            return during[0] is not None and during[0] >= DURING_NET_MBPS
 
         def disk_load(during: tuple[Any, Any]) -> bool:
             mb, iops = during[1]
