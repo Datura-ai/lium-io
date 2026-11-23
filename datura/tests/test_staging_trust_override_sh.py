@@ -55,6 +55,14 @@ def test_a_partial_or_malformed_value_fails_and_writes_nothing(tmp_path, bad):
     assert r.returncode != 0 and override.read_text() == '_VALIDATOR_HOTKEY_SS58 = "x"\n'
 
 
+@pytest.mark.parametrize("key", sorted(GOOD))
+@pytest.mark.parametrize("char", ['"', "\n", "\\"])
+def test_a_quote_newline_or_backslash_in_any_value_is_refused(tmp_path, key, char):
+    # the override is Python source: no value may carry a character that ends or escapes its string
+    r, override = _run(tmp_path, {**GOOD, key: GOOD[key] + char})
+    assert r.returncode != 0 and override.read_text() == '_VALIDATOR_HOTKEY_SS58 = "x"\n'
+
+
 WORKFLOWS = Path(__file__).resolve().parents[2] / ".github" / "workflows"
 
 
