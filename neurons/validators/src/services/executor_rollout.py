@@ -1056,7 +1056,8 @@ async def remember_rented_scored_results(
             writes.delete(key)
             writes.delete(vouch)
             if result.is_successful:
-                idle_passes[(miner_hotkey, result.executor_info.uuid)] = (result, job_block)
+                # a copy as it stands now, as the rented pass's Redis copy is: scoring later sets flags on `result`
+                idle_passes[(miner_hotkey, result.executor_info.uuid)] = (result.model_copy(deep=True), job_block)
     _idle_passes.clear()
     _idle_passes.update(idle_passes)
     try:

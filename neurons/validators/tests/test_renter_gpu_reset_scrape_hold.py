@@ -520,6 +520,22 @@ async def test_an_idle_node_the_task_had_no_time_to_probe_keeps_its_last_score_o
 
 
 @pytest.mark.asyncio
+async def test_an_idle_pass_is_kept_as_it_was_before_scoring_set_its_flags():
+    """F-69: scoring sets flags on the cycle's own result after it is kept, so the kept pass is a copy taken then,
+    as the rented pass's Redis copy is: a later no-time cycle never carries the earlier cycle's Spot eligibility."""
+    service = _redis_service()
+    idle = _idle_scored("node-idle")
+    await remember_rented_scored_results({"5Miner": [idle]}, service, job_block=PREV_BLOCK)
+    idle.spot_pay_candidate = True  # what the incentive engine does to the cycle's result after it is kept
+
+    kept, _ = await _carry_then_withhold(service, [_no_task_time("node-idle")], rented_executor_ids=frozenset())
+
+    [carried] = kept["5Miner"]
+    assert carried.carried_for_renter_gpu_reset is True
+    assert carried.spot_pay_candidate is False
+
+
+@pytest.mark.asyncio
 async def test_a_no_task_time_cycle_without_a_last_score_gets_no_verdict_and_keeps_no_miner_active():
     # review: the node's own checks can spend the task's time, so running out of it keeps no eligibility
     service = _redis_service()
