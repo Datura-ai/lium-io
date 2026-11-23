@@ -13,6 +13,23 @@ from services.const import DOCKER_DIND_IMAGE, LIUM_POD_ID_LABEL
 _CONTAINER_DEATH_LOG_TAIL_LINES = 100
 _CONTAINER_DEATH_LOG_MAX_CHARS = 4000
 
+# dockerd's two bind refusals name the host address the bind was for:
+#   `failed to bind host port for 0.0.0.0:9101:172.17.0.2:22/tcp: address already in use`
+#   `failed to bind host port 0.0.0.0:9030/tcp: address already in use`
+#   `Bind for 0.0.0.0:9101 failed: port is already allocated`
+_BOUND_HOST_PORT_RE = re.compile(
+    r"(?:Bind for|failed to bind host port(?: for)?) (?:\[[0-9a-fA-F:.]{0,45}\]|[0-9.]{1,15}):(\d{1,5})(?![0-9])"
+)
+
+
+def bound_host_port(text: str) -> int | None:
+    """The host port dockerd could not bind, read from its refusal text; None when the text has none."""
+    match = _BOUND_HOST_PORT_RE.search(text)
+    if match is None:
+        return None
+    port = int(match.group(1))
+    return port if 0 < port <= 65535 else None
+
 
 class DockerCommand:
     """Builds safe docker command strings."""

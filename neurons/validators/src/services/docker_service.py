@@ -33,6 +33,7 @@ from core.docker_utils import (
     ALPINE_HELPER_IMAGE,
     ContainerDeathDiagnostics,
     DockerCommand,
+    bound_host_port,
     collect_container_death_diagnostics,
     df_available_bytes,
     df_command,
@@ -438,13 +439,6 @@ _LISTENING_PORTS_COMMAND = (
 )
 # docker ps prints a published block as a range: `0.0.0.0:20040-20049->20040-20049/tcp`
 _PUBLISHED_HOST_PORT_RE = re.compile(r":(\d{1,5})(?:-(\d{1,5}))?->[\d-]+/tcp")
-# dockerd's two bind refusals name the host address the bind was for:
-#   `failed to bind host port for 0.0.0.0:9101:172.17.0.2:22/tcp: address already in use`
-#   `failed to bind host port 0.0.0.0:9030/tcp: address already in use`
-#   `Bind for 0.0.0.0:9101 failed: port is already allocated`
-_BOUND_HOST_PORT_RE = re.compile(
-    r"(?:Bind for|failed to bind host port(?: for)?) (?:\[[0-9a-fA-F:.]{0,45}\]|[0-9.]{1,15}):(\d{1,5})(?![0-9])"
-)
 
 
 class RentalPortCollisionError(RuntimeError):
@@ -478,11 +472,7 @@ def port_collision_error_class(exc: BaseException) -> str | None:
 
 def _bound_host_port_from_error(exc: BaseException) -> int | None:
     """The host port dockerd could not bind, read from its refusal text; None when the text has none."""
-    match = _BOUND_HOST_PORT_RE.search(str(exc))
-    if match is None:
-        return None
-    port = int(match.group(1))
-    return port if 0 < port <= 65535 else None
+    return bound_host_port(str(exc))
 
 
 def _spare_port_pairs(
