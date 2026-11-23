@@ -8,6 +8,7 @@ from typing import Any
 from services.const import MAX_DISK_UTILIZATION_PERCENT
 
 from core.config import settings
+from services.container_cleanup import retained_volume_pod_ids
 
 from ..messages import DiskSpaceMessages as Msg
 from ..messages import render_message, shown
@@ -39,6 +40,21 @@ def _as_float(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return math.nan
+
+
+def kept_volume_kb(ctx: Context) -> float:
+    """kB on the host held by the volumes kept after a balance stop (DAH-3333), whose pods count as ended.
+
+    Read from the scrape's per-volume figure, the blocks each volume takes on the host, never a declared size. A
+    listed pod whose volume is not on this host, or whose size is missing or unreadable, adds nothing.
+    """
+    hard_disk = (ctx.state.specs or {}).get("hard_disk")
+    by_volume = hard_disk.get("by_volume") if isinstance(hard_disk, dict) else None
+    if not isinstance(by_volume, dict):
+        return 0.0
+    kept_ids = retained_volume_pod_ids(ctx.state.rented_data)
+    sizes = (_as_float(by_volume.get(f"volume_{pod_id}")) for pod_id in kept_ids)
+    return sum(size for size in sizes if math.isfinite(size) and size > 0)
 
 
 def split_disk(ctx: Context, pods: list, free_kb: float) -> dict[str, Any] | None:
@@ -119,6 +135,13 @@ class DiskSpaceCheck:
         if isinstance(hard_disk, dict) and "utilization" in hard_disk and "free" in hard_disk:
             utilization = _as_float(hard_disk.get("utilization"))
             free_kb = _as_float(hard_disk.get("free"))
+            # a kept volume is the stopped renter's, so it does not count toward the utilization cap; the free floor
+            # stays on real free disk, the room a new rental gets (it never takes the kept volume's disk)
+            kept_kb = kept_volume_kb(ctx)
+            total_kb = _as_float(hard_disk.get("total"))
+            if kept_kb and math.isfinite(total_kb) and total_kb > 0:
+                utilization = max(utilization - kept_kb / total_kb * 100, 0)
+                what["kept_volume_gb"] = round(kept_kb / KB_PER_GB, 1)
         # a missing, null, unparsable, NaN or Infinity figure is not a reading
         if not (math.isfinite(utilization) and math.isfinite(free_kb)):
             template = Msg.NOT_REPORTED

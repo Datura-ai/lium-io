@@ -60,7 +60,7 @@ from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .capability import get_filler_only_container
 from .task_time import task_seconds_left
-from .verifyx import _first_pass_challenge_config
+from .verifyx import verifyx_challenge_config
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +206,7 @@ class LocalVerifyCheck:
             verifyx_challenge = ctx.services.verifyx.prepare_verifyx_challenge(
                 specs,
                 ctx.default_extra,
-                challenge_config_overrides=(_first_pass_challenge_config() if first_pass else None),
+                challenge_config_overrides=verifyx_challenge_config(ctx) or None,
             )
         except Exception as exc:  # a native library error is ours, not the node's
             if matmul_challenge is not None:

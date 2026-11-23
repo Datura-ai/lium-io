@@ -1096,3 +1096,66 @@ async def test_a_measured_run_seeds_the_kept_ema_for_a_node_already_inactive(con
     assert result.event.reason_code == Msg.STANDING_PROBE_FAILURE_SKIPPED.reason
     assert verifyx_service.called_with is None
     assert result.updates["state"].specs["network"]["ema_verifyx_download_speed"] == pytest.approx(500.0)
+
+
+_KEPT_POD = "11111111-2222-3333-4444-555555555555"
+_KB_PER_GB = 1024 * 1024
+
+
+def _kept_volume_state(by_volume: dict | None, kept_ids: list[str]):
+    hard_disk = {} if by_volume is None else {"by_volume": by_volume}
+    return build_state(
+        specs={"gpu": {"count": 8}, "hard_disk": hard_disk},
+        rented_data=RentedExecutorsResponse(
+            executors={}, banned_guids=[], network_ema={}, retained_volume_pod_ids=kept_ids
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "by_volume, kept_ids, expected",
+    [
+        # 30 GB kept: 70 GB free beside it meet the 100 GB floor
+        ({f"volume_{_KEPT_POD}": 30 * _KB_PER_GB}, [_KEPT_POD], {"storage_min_available_gb": 70}),
+        # a large kept volume never lowers the floor below the listing's real free-disk floor
+        ({f"volume_{_KEPT_POD}": 500 * _KB_PER_GB}, [_KEPT_POD], {"storage_min_available_gb": 50}),
+        # no kept volume, a listed volume not on this host, an unreadable size: the call is today's
+        ({f"volume_{_KEPT_POD}": 30 * _KB_PER_GB}, [], None),
+        ({"volume_other": 30 * _KB_PER_GB}, [_KEPT_POD], None),
+        ({f"volume_{_KEPT_POD}": "n/a"}, [_KEPT_POD], None),
+        ({f"volume_{_KEPT_POD}": None}, [_KEPT_POD], None),
+        (None, [_KEPT_POD], None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_verifyx_storage_floor_counts_a_kept_volume_as_free(
+    context_factory, monkeypatch, by_volume, kept_ids, expected
+):
+    monkeypatch.setattr(verifyx_module.settings.verifyx, "STORAGE_MIN_AVAILABLE_GB", 100)
+    monkeypatch.setattr(verifyx_module.settings, "MIN_FREE_DISK_GB", 50)
+    verifyx_service = DummyVerifyXService(
+        success=True, updated_specs={"network": {"download_speed": 510.0, "upload_speed": 100.0}}
+    )
+    ctx = context_factory(
+        services=build_services(verifyx=verifyx_service),
+        config=build_context_config(),
+        state=_kept_volume_state(by_volume, kept_ids),
+    )
+
+    await VerifyXCheck().run(ctx)
+
+    assert verifyx_service.called_with["challenge_config_overrides"] == expected
+
+
+def test_a_first_pass_keeps_its_sizing_beside_the_kept_volume_floor(context_factory, monkeypatch):
+    monkeypatch.setattr(verifyx_module.settings.verifyx, "STORAGE_MIN_AVAILABLE_GB", 100)
+    monkeypatch.setattr(verifyx_module.settings, "MIN_FREE_DISK_GB", 50)
+    ctx = context_factory(
+        config=build_context_config(first_pass=True),
+        state=_kept_volume_state({f"volume_{_KEPT_POD}": 30 * _KB_PER_GB}, [_KEPT_POD]),
+    )
+
+    assert verifyx_module.verifyx_challenge_config(ctx) == {
+        **verifyx_module._first_pass_challenge_config(),
+        "storage_min_available_gb": 70,
+    }
