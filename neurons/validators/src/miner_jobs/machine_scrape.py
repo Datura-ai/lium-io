@@ -1874,6 +1874,9 @@ def rental_p2p_output(stdout):
     return table if table.strip() else None
 
 
+SYSBOX_CHECK_DETAIL_CAP = 500
+
+
 def check_sysbox_gpu_compatibility() -> tuple[bool, str, str | None]:
     """
     Checks if the system supports running Docker containers with the sysbox-runc runtime
@@ -1890,7 +1893,10 @@ def check_sysbox_gpu_compatibility() -> tuple[bool, str, str | None]:
         if result.returncode == 0:
             return True, "Sysbox runtime supports GPU access.", rental_p2p_output(result.stdout)
         else:
-            return False, "Sysbox runtime does not support GPU access.", None
+            # docker's own error (unknown runtime, OCI hook failure, ...) so the validator log says why
+            detail = (result.stderr or "").strip()[-SYSBOX_CHECK_DETAIL_CAP:]
+            message = "Sysbox runtime does not support GPU access."
+            return False, f"{message} {detail}" if detail else message, None
 
     except subprocess.TimeoutExpired:
         return False, "Test command timed out.", None
