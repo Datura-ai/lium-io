@@ -12,6 +12,7 @@ import aiohttp
 from asyncssh import SSHKey
 import asyncssh
 import bittensor
+from clients.validator_portal_api import first_owner_hotkeys_read, portal_owner_hotkeys
 from datura.requests.miner_requests import (
     AcceptSSHKeyRequest,
     ExecutorSSHInfo,
@@ -683,6 +684,15 @@ class MinerService:
         """
         pubkey = self._normalize_public_key(public_key)
         return f"0x{keypair.sign(ssh_pubkey_signing_blob(pubkey, nonce, miner_hotkey)).hex()}"
+
+    def _owner_hotkey_signatures(
+        self, keypair: bittensor.Keypair, public_key: bytes | str, nonce: str | None, miner_hotkey: str
+    ) -> dict[str, str] | None:
+        """DAH-6740: the miner-bound signature for each other hotkey of the listing owner, None when there is none."""
+        hotkeys = portal_owner_hotkeys(miner_hotkey)
+        if not hotkeys:
+            return None
+        return {h: self._sign_validator_pubkey(keypair, public_key, nonce=nonce, miner_hotkey=h) for h in sorted(hotkeys)}
 
     @for_payload_miner
     async def request_job_to_miner(
@@ -1517,8 +1527,7 @@ class MinerService:
             # only a passed spec moves the backend to these UUIDs; a failed one must not hide the recovery
             if result.is_successful and (gpu_uuids := _gpu_uuids(result)):
                 self.published_gpu_uuids[str(result.executor_info.uuid).lower()] = set(gpu_uuids)
-            if settings.POD_STATES_REPORT_ENABLED:
-                await self._publish_pod_states_report(result, miner_hotkey=miner_hotkey, default_extra=default_extra)
+            await self._publish_pod_states_report(result, miner_hotkey=miner_hotkey, default_extra=default_extra)
 
     @staticmethod
     def _pod_states_capped_for_spec(result: JobResult, default_extra: dict) -> list[dict] | None:
@@ -1528,12 +1537,7 @@ class MinerService:
         if len(bounded) < len(result.pod_states):
             logger.warning(
                 _m(
-                    "pod_states over the spec's bound"
-                    + (
-                        "; every state goes in the PodStatesReport chunks"
-                        if settings.POD_STATES_REPORT_ENABLED
-                        else "; the observed states past it are cut until the reaped queue drains"
-                    ),
+                    "pod_states over the spec's bound; every state goes in the PodStatesReport chunks",
                     extra=get_extra_info(
                         {
                             **default_extra,
@@ -2273,11 +2277,15 @@ class MinerService:
             attestation_nonce = await self.attestation_service.maybe_issue_nonce(nonce_hex)
 
             # Prepare request
+            await first_owner_hotkeys_read()  # DAH-6740: never sign against the empty map of a restart
             ssh_request = SSHPubKeySubmitRequest(
                 public_key=public_key,
                 validator_signature=self._sign_validator_pubkey(my_key, public_key, nonce=nonce_hex),
                 validator_miner_signature=self._sign_validator_pubkey(
                     my_key, public_key, nonce=nonce_hex, miner_hotkey=payload.miner_hotkey
+                ),
+                owner_hotkey_signatures=self._owner_hotkey_signatures(
+                    my_key, public_key, nonce_hex, payload.miner_hotkey
                 ),
                 miner_hotkey=payload.miner_hotkey,
                 executor_id=executor_id,
@@ -2545,11 +2553,15 @@ class MinerService:
             private_key, public_key = self.ssh_service.generate_ssh_key(my_key.ss58_address)
 
             upload_nonce = upload_nonce_for_miner(payload.miner_hotkey)
+            await first_owner_hotkeys_read()  # DAH-6740: never sign against the empty map of a restart
             ssh_request = SSHPubKeySubmitRequest(
                 public_key=public_key,
                 validator_signature=self._sign_validator_pubkey(my_key, public_key, nonce=upload_nonce),
                 validator_miner_signature=self._sign_validator_pubkey(
                     my_key, public_key, nonce=upload_nonce, miner_hotkey=payload.miner_hotkey
+                ),
+                owner_hotkey_signatures=self._owner_hotkey_signatures(
+                    my_key, public_key, upload_nonce, payload.miner_hotkey
                 ),
                 executor_id=payload.executor_id,
                 is_rental_request=isinstance(payload, ContainerCreateRequest),
@@ -2962,16 +2974,21 @@ class MinerService:
         }
 
         try:
+            # DAH-6740: never sign against the empty map of a restart; wait before the 10 s auth headers are made
+            await first_owner_hotkeys_read()
             base_url = f"http://{payload.miner_address}:{payload.miner_port}"
             headers = self._generate_auth_headers(my_key, payload.miner_hotkey)
             headers["Content-Type"] = "application/json"
-            
+
             upload_nonce = upload_nonce_for_miner(payload.miner_hotkey)
             ssh_request = SSHPubKeySubmitRequest(
                 public_key=payload.public_key,
                 validator_signature=self._sign_validator_pubkey(my_key, payload.public_key, nonce=upload_nonce),
                 validator_miner_signature=self._sign_validator_pubkey(
                     my_key, payload.public_key, nonce=upload_nonce, miner_hotkey=payload.miner_hotkey
+                ),
+                owner_hotkey_signatures=self._owner_hotkey_signatures(
+                    my_key, payload.public_key, upload_nonce, payload.miner_hotkey
                 ),
                 executor_id=payload.executor_id,
                 is_rental_request=False,

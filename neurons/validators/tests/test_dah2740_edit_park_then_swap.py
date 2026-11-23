@@ -32,18 +32,11 @@ from services.docker_service import (
     inflight_creates,
 )
 from services.gpu_reset import RECENT_RENTER_GPU_RESET_SECONDS
+from services.host_memory_guard import host_memory_guard_script
 from services.hung_gpu_reset import HUNG_GPU_QUERY_COMMAND, HungGpuResult
 from services.redis_service import GPU_RESET_PENDING_KIND
 from services.prerun_host_probe import prerun_host_probe_command
 from helpers import no_host_start_lock, shared_pod_start_stop_lock
-
-
-@pytest.fixture(autouse=True)
-def _hung_gpu_reset_on(monkeypatch):
-    # DAH-5301: these cover the reset itself (the flag on); its shadow mode is in test_gpu_clocks/test_hung_gpu_reset
-    from core.config import settings
-
-    monkeypatch.setattr(settings, "HUNG_GPU_RESET_ON_REBOOT_ENABLED", True)
 
 
 @pytest.fixture
@@ -56,7 +49,6 @@ def svc():
     # the pre-run kernel.pid_max read is mandatory and the SSH doubles here do not model /proc
     service._read_host_pid_max = AsyncMock(return_value=4_194_304)
     service._read_host_ram_kib = AsyncMock(return_value=None)
-    service._read_host_cpu_count = AsyncMock(return_value=None)
     return service
 
 
@@ -202,6 +194,8 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
     assert ssh.commands.index('/usr/bin/docker volume ls --format "{{.Name}}"') < hung_query
     assert hung_query < len(ssh.commands) - 1 - ssh.commands[::-1].index(_POWER_READ)  # before the last power read
     assert [cmd for cmd in ssh.commands if cmd != HUNG_GPU_QUERY_COMMAND] == [
+        # with the host reads, before anything else on the session and before any container starts
+        host_memory_guard_script(),
         # the pre-run host probe (DAH-3257); no image-label section, the volume is not encrypted; before the park, so
         # a probe that stops the create leaves the current container as it was
         prerun_host_probe_command(
@@ -517,8 +511,7 @@ def _hung_reset(outcome, calls: list | None = None):
     """Stands in for reset_hung_pod_gpus the way it uses `resetting`: a hung find holds the caller's mark
     and hands it the result before letting go; an exception escapes like an SSH error would."""
 
-    async def fake(runner, pod_gpu_uuids, *, resetting, shadow):
-        assert not shadow
+    async def fake(runner, pod_gpu_uuids, *, resetting):
         if calls is not None:
             calls.append(pod_gpu_uuids)
         if isinstance(outcome, Exception):
@@ -567,8 +560,7 @@ async def test_the_hung_gpu_reset_holds_the_gpu_reset_pending_mark(svc, monkeypa
     svc.redis_service.mark_gpu_reset_recent = AsyncMock()
     held = []
 
-    async def fake_reset(runner, pod_gpu_uuids, *, resetting, shadow):
-        assert not shadow
+    async def fake_reset(runner, pod_gpu_uuids, *, resetting):
         async with resetting():
             # the rented checks skip the node while the GPUs reset
             held.append(svc.redis_service.add_pending_pod.await_args)

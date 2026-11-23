@@ -64,7 +64,6 @@ from test_rented_host_gpu_fault_reset import (
 
 from helpers import FakeRedis, build_context_config, build_services, build_state
 from neurons.validators.src.services.task.checks import machine_spec_scrape
-from neurons.validators.src.services.task.checks import gpu_fingerprint
 from neurons.validators.src.services.task.checks.gpu_fingerprint import GpuFingerprintCheck
 from neurons.validators.src.services.task.checks.gpu_loss_hold import GpuLossHoldCheck
 from neurons.validators.src.services.task.checks.machine_spec_scrape import MachineSpecScrapeCheck
@@ -193,11 +192,10 @@ async def test_a_split_node_whose_renter_resets_its_four_gpus_is_held_not_zeroed
     """8x H200 split 4+4: the renter resets their 4; the scrape lists only the other 4, so the zero-GPU hold
     never fires. The loss hold must hold the cycle, or GpuFingerprintCheck fails it with GPU_MISSING."""
     service = _redis_service()
-    with patch.object(gpu_fingerprint.settings, "GPU_ANCHOR_HARD_ENABLED", True):
-        await _scored_on_all_eight(context_factory, service)
-        await mark(service, H200_UUIDS[:4])
+    await _scored_on_all_eight(context_factory, service)
+    await mark(service, H200_UUIDS[:4])
 
-        ok, event, ctx, _ = await _cycle(context_factory, service, scrape=_gpus_listed(H200_UUIDS[4:]))
+    ok, event, ctx, _ = await _cycle(context_factory, service, scrape=_gpus_listed(H200_UUIDS[4:]))
 
     assert ok is False
     assert event.check_id == GpuLossHoldCheck.check_id
@@ -224,11 +222,10 @@ async def _old_recent_mark_without_gpus(service, gpu_uuids) -> None:
 @pytest.mark.asyncio
 async def test_a_missing_card_outside_the_reset_gpus_still_fails_the_fingerprint(context_factory, mark, listed):
     service = _redis_service()
-    with patch.object(gpu_fingerprint.settings, "GPU_ANCHOR_HARD_ENABLED", True):
-        await _scored_on_all_eight(context_factory, service)
-        await mark(service, H200_UUIDS[:4])
+    await _scored_on_all_eight(context_factory, service)
+    await mark(service, H200_UUIDS[:4])
 
-        ok, event, ctx, _ = await _cycle(context_factory, service, scrape=_gpus_listed(listed))
+    ok, event, ctx, _ = await _cycle(context_factory, service, scrape=_gpus_listed(listed))
 
     assert ok is False
     assert event.reason_code == FingerprintMsg.GPU_MISSING.reason
@@ -261,15 +258,14 @@ async def test_a_carried_split_node_keeps_only_its_rented_gpus_in_the_mining_poo
     """8x H200 split 4+4, the renter's pod holds 4: the carried result must still say 4 rented, or the
     split pricing reads the whole node as rented for up to the carry TTL."""
     service = _redis_service()
-    with patch.object(gpu_fingerprint.settings, "GPU_ANCHOR_HARD_ENABLED", True):
-        ok, event, ctx, _ = await _cycle(context_factory, service, scrape=_gpus_listed(H200_UUIDS), pod_gpu_count=4)
-        previous = await _job_result(ctx, ok, event)
-        previous.supports_gpu_splitting, previous.gpu_splitting_min_count = True, 4  # the provider's split opt-in
-        await remember_rented_scored_results({RENTAL_OWNER: [previous]}, service)
-        await _reset_in_progress(service, H200_UUIDS[:4])
+    ok, event, ctx, _ = await _cycle(context_factory, service, scrape=_gpus_listed(H200_UUIDS), pod_gpu_count=4)
+    previous = await _job_result(ctx, ok, event)
+    previous.supports_gpu_splitting, previous.gpu_splitting_min_count = True, 4  # the provider's split opt-in
+    await remember_rented_scored_results({RENTAL_OWNER: [previous]}, service)
+    await _reset_in_progress(service, H200_UUIDS[:4])
 
-        ok, event, ctx, _ = await _cycle(context_factory, service, scrape=_gpus_listed(H200_UUIDS[4:]), pod_gpu_count=4)
-        held = await _job_result(ctx, ok, event)
+    ok, event, ctx, _ = await _cycle(context_factory, service, scrape=_gpus_listed(H200_UUIDS[4:]), pod_gpu_count=4)
+    held = await _job_result(ctx, ok, event)
     job_results = {RENTAL_OWNER: [held]}
 
     await carry_renter_gpu_reset_results(job_results, service, {EXECUTOR}, ctx.state.rented_data, {})
@@ -285,10 +281,9 @@ async def test_a_carried_split_node_keeps_only_its_rented_gpus_in_the_mining_poo
 @pytest.mark.asyncio
 async def test_four_gpus_missing_without_a_renter_reset_still_fail_the_fingerprint(context_factory):
     service = _redis_service()
-    with patch.object(gpu_fingerprint.settings, "GPU_ANCHOR_HARD_ENABLED", True):
-        await _cycle(context_factory, service, scrape=_gpus_listed(H200_UUIDS))
+    await _cycle(context_factory, service, scrape=_gpus_listed(H200_UUIDS))
 
-        ok, event, ctx, _ = await _cycle(context_factory, service, scrape=_gpus_listed(H200_UUIDS[4:]))
+    ok, event, ctx, _ = await _cycle(context_factory, service, scrape=_gpus_listed(H200_UUIDS[4:]))
 
     assert ok is False
     assert event.reason_code == FingerprintMsg.GPU_MISSING.reason
@@ -623,7 +618,7 @@ async def _reset_with_gpus_lost(service, backend):
     with patch("services.docker_service.reset_pod_gpus", AsyncMock(return_value=GPUS_LOST)):
         result = await _run_reset(service, backend, return_value=connection)
     assert (result.ok, result.error_code, result.detail, result.container_restarted, result.gpus) == (
-        False, GpuResetErrorCode.ResetNotSupported, GPUS_LOST_DETAIL, False, []
+        False, GpuResetErrorCode.GpusLostOnHost, GPUS_LOST_DETAIL, False, []
     )
 
 
