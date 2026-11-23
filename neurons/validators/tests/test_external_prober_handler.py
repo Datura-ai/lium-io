@@ -113,7 +113,6 @@ def test_a_node_that_stalls_mid_answer_is_no_answer(status):
 @pytest.mark.parametrize("size, passes", [(256, True), (257, False)])
 async def test_both_probe_paths_judge_an_answer_of_the_same_size_alike(size, passes):
     """The outside prober and the validator's own probe accept and reject exactly the same answers."""
-    import aiohttp
     from neurons.validators.src.services.executor_connectivity.models import PortPair
     from neurons.validators.src.services.executor_connectivity.port_tester import (
         PROBE_BODY_LIMIT,
