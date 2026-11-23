@@ -99,6 +99,10 @@ if [[ -n "${VALIDATOR_NEXT_HOTKEY_SS58:-}" && -z "${VALIDATOR_HOTKEY_SS58:-}" ]]
   log_error "VALIDATOR_NEXT_HOTKEY_SS58 is set but VALIDATOR_HOTKEY_SS58 is not; a rotation build names both hotkeys"
   exit 1
 fi
+if [[ -n "${STAGING_TRUST_OWNER_SS58:-}" && -z "${VALIDATOR_HOTKEY_SS58:-}" ]]; then
+  log_error "STAGING_TRUST_OWNER_SS58 is set but VALIDATOR_HOTKEY_SS58 is not; only a non-prod build names a staging owner"
+  exit 1
+fi
 if [[ -n "${VALIDATOR_HOTKEY_SS58:-}" || -n "${VALIDATOR_NEXT_HOTKEY_SS58:-}" ]]; then
   log_info "VALIDATOR_HOTKEY_SS58 / VALIDATOR_NEXT_HOTKEY_SS58 set — generating config_override.py"
   : > "${CONFIG_OVERRIDE_FILE}"
@@ -115,6 +119,9 @@ if [[ -n "${VALIDATOR_HOTKEY_SS58:-}" || -n "${VALIDATOR_NEXT_HOTKEY_SS58:-}" ]]
     echo "_VALIDATOR_SSH_SOURCES = \"${VALIDATOR_SSH_SOURCES}\"" >> "${CONFIG_OVERRIDE_FILE}"
     log_kv "Validator ssh sources:" "${VALIDATOR_SSH_SOURCES}"
   fi
+  # the staging owner key whose signed messages this non-prod build follows (unset = message trust stays off)
+  source "${SCRIPT_DIR}/../../scripts/staging_trust_override.sh"
+  staging_trust_override "${CONFIG_OVERRIDE_FILE}"
   log_success "Generated: ${CONFIG_OVERRIDE_FILE}"
 else
   log_warn "Neither VALIDATOR_HOTKEY_SS58 nor VALIDATOR_NEXT_HOTKEY_SS58 is set — skipping config_override.py generation"

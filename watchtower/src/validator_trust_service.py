@@ -15,13 +15,13 @@ until a read succeeds, then about once an hour with random jitter. A new owner i
 answers with it; a failed or disagreeing read keeps the known owner.
 
 While no message is held, the watchtower trusts the hotkey baked into the image (config.py). A non-prod build
-(config_override.py) names its own validator and never reads a message.
+(config_override.py) names its own validator; when it also names a staging owner key (datura.validator_trust.override_trust) it follows messages that key signed,
+starting from the build's own signed message, and never reads the chain.
 """
 
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import json
 import random
 import time
@@ -34,6 +34,7 @@ from datura.validator_trust import (
     RELEASE_SUBNET_OWNER_COLDKEY,
     SignedTrustMessage,
     TrustedValidator,
+    override_trust,
     subnet_owner_from_reply,
     subnet_owner_request,
     verify_trust_message,
@@ -89,10 +90,22 @@ def _signed(data: dict) -> SignedTrustMessage:
 
 
 class ValidatorTrust:
-    def __init__(self, image_message: Path = IMAGE_MESSAGE_PATH, enabled: bool = True):
+    def __init__(
+        self,
+        image_message: Path = IMAGE_MESSAGE_PATH,
+        enabled: bool = True,
+        owner: str | None = None,
+        read_chain: bool = True,
+        message: SignedTrustMessage | None = None,
+    ):
         self.image_message = image_message
         self.enabled = enabled
-        self.owner = RELEASE_SUBNET_OWNER_COLDKEY
+        # the key the start message is checked against; with read_chain off it is the only owner ever taken
+        self.release_owner = owner or RELEASE_SUBNET_OWNER_COLDKEY
+        self.read_chain = read_chain
+        # the build's own signed message (a staging build), used instead of the image copy
+        self.message = message
+        self.owner = self.release_owner
         self.held: TrustedValidator | None = None
         self._owner_due = 0.0
 
@@ -101,7 +114,8 @@ class ValidatorTrust:
         if not self.enabled:
             return
         try:
-            self._hold(_signed(json.loads(self.image_message.read_text())), RELEASE_SUBNET_OWNER_COLDKEY)
+            start = self.message or _signed(json.loads(self.image_message.read_text()))
+            self._hold(start, self.release_owner)
         except FileNotFoundError:
             pass
         except Exception as exc:
@@ -153,8 +167,8 @@ class ValidatorTrust:
 
     def refresh_owner(self) -> bool:
         """True when every public chain node answered with one owner (at least two nodes, so one cannot name an
-        owner by itself); a failure or a disagreement keeps the known owner."""
-        if not self.enabled:
+        owner by itself); a failure or a disagreement keeps the known owner. A fixed owner is never read."""
+        if not self.enabled or not self.read_chain:
             return False
         answers = set()
         for url in PUBLIC_CHAIN_NODES:
@@ -181,4 +195,4 @@ class ValidatorTrust:
         self.refresh_message()
 
 
-validator_trust = ValidatorTrust(enabled=importlib.util.find_spec("config_override") is None)
+validator_trust = ValidatorTrust(**override_trust("config_override"))
