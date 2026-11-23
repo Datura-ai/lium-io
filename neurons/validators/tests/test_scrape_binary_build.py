@@ -109,7 +109,7 @@ def test_preparing_a_cycle_builds_nothing(job_files_root, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_call_after_a_failed_build_starts_a_new_one(job_files_root, monkeypatch):
+async def test_a_failed_build_is_not_started_again_in_the_same_cycle(job_files_root, monkeypatch):
     directory = cycle_dir(job_files_root, 1)
     attempts = []
 
@@ -122,9 +122,9 @@ async def test_a_call_after_a_failed_build_starts_a_new_one(job_files_root, monk
     monkeypatch.setattr(file_encrypt_service, "_pyinstaller_command", command)
     build = ScrapeBinaryBuild(directory, "tmpabc", "print(1)", lambda: ())
 
-    with pytest.raises(RuntimeError, match="exited 3"):
-        await build.ensure(5)
-    await build.ensure(5)
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="exited 3"):
+            await build.ensure(5)
 
-    assert attempts == ["tmpabc", "tmpabc"]
-    assert (directory / "tmpabc").read_text() == "bin"
+    # at most one build per cycle (review 23 Nov); the next cycle builds again
+    assert attempts == ["tmpabc"]
