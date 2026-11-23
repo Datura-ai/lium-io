@@ -88,6 +88,11 @@ STOPPED_BY_RECOVERY_PREFIX = "stopped_by_recovery:"
 # still judged down); STOPPED also means the recovery itself stopped the pod
 STOPPED_BY_RECOVERY_RENAMING = "renaming"
 STOPPED_BY_RECOVERY_STOPPED = "stopped"
+# executor uuid -> hash of pod id -> the run a failed start left up, set when its stop and kill both failed, so the pod
+# may still run without its mount (F-31/F-37/F-15). Record and index are one field, written and dropped in one command,
+# so no record exists that the node check cannot find. No expiry: dropped only once that run is confirmed stopped or
+# changed. Every node check retries them, rented or not, so a pod deleted or reassigned since never strands one
+HALF_STARTED_STOP_INDEX_PREFIX = "half_started_stop_index:"
 # DAH-5904: "<executor uuid>:<filler container name>" while the cycle snapshot lists that filler on that node
 RECENT_FILLER_PREFIX = "recent_filler:"
 # a filler stopped for a customer rent leaves the snapshot at once but stays on the host until its delete lands:
@@ -97,7 +102,8 @@ RECENT_FILLER_TTL_SECONDS = 45 * 60
 # closes the run only after ~30 min of missing reports; until then the container's absence is not a host kill.
 FILLER_REMOVED_BY_VALIDATOR_PREFIX = "filler_removed_by_validator:"
 FILLER_REMOVED_BY_VALIDATOR_TTL_SECONDS = 2 * 3600
-# set by a filler create whose sshd never came up in the container, cleared by one where it did
+# set by a filler create whose sshd never came up in the container, cleared by one where it did or by
+# SshdBootstrapCheck's re-probe in a fresh container of the same image
 SSHD_BOOTSTRAP_FAILED_PREFIX = "sshd_bootstrap_failed"
 # prod, 24 h: failed filler creates on a broken node came 5 min to 2.7 h apart, so 6 h outlives the
 # longest gap about twice over; a stale stamp ends by itself
@@ -120,6 +126,11 @@ def verifyx_stale_runs_key(miner_hotkey: str, executor_uuid: str) -> str:
 def sshd_bootstrap_failed_key(miner_hotkey: str, executor_uuid: str) -> str:
     # the UUID is the miner's word: keyed with the hotkey, a node copying it cannot set or clear the owner's stamp
     return f"{SSHD_BOOTSTRAP_FAILED_PREFIX}:{miner_hotkey}:{executor_uuid}"
+
+
+def sshd_bootstrap_failed_stamp(image: str, sysbox: bool) -> str:
+    """The stamp's value: the failed filler create's image and runtime, which SshdBootstrapCheck re-probes each cycle."""
+    return json.dumps({"image": image, "sysbox": sysbox})
 
 
 async def get_or_adopt_legacy(redis, key: str, legacy_key: str):
@@ -206,6 +217,9 @@ EXPRESS_LANE_FIRST_SEEN_TTL_SECONDS = 2 * 3600
 # Distributed lock settings
 EXECUTOR_LOCK_TIMEOUT = 30  # TTL for lock auto-release (seconds)
 EXECUTOR_LOCK_BLOCKING_TIMEOUT = 10  # Time to wait for lock acquisition (seconds)
+# a pod's start/remount and its pending stop's retry (pod_start_stop_lock): renewed while held, so only a dead
+# holder's lock lapses, this long after it died
+POD_START_STOP_LOCK_TTL = 30
 # DAH-3436 (review): the per-executor CREATE lock. `create_container` sweeps every `pod_*` container it
 # is not told about, so two creates on one node must not overlap: a renter's create holds this lock from
 # before its call until create_container returns (executor_create_exclusion); the rental probe takes it
@@ -349,6 +363,10 @@ class RedisWrites:
 
     def hset(self, key: str, field: str, value: str) -> "RedisWrites":
         self.ops.append(RedisWrite("hset", (key, field, value), {}))
+        return self
+
+    def hdel(self, key: str, field: str) -> "RedisWrites":
+        self.ops.append(RedisWrite("hdel", (key, field), {}))
         return self
 
     def expire(self, key: str, seconds: int) -> "RedisWrites":
@@ -526,6 +544,40 @@ class RedisService:
                             extra={"error": str(e)},
                         )
                     )
+
+    @asynccontextmanager
+    async def pod_start_stop_lock(self, slot: str):
+        """Held by every start and remount of one pod and by its pending half-started stop's retry, in the validator
+        and the connector alike (separate processes), so their work on one pod runs in turn. Waits while another
+        holder has it. Yields False when Redis is unreachable: a start goes ahead (it never refuses a renter), a stop's
+        retry stays pending. Not the safety of the stop itself, which a lapsed lease cannot break: that is the pod's
+        host start lock, which the retry's fenced stop must take (docker_service._fenced_stop_command)."""
+        lock = aioredis.lock.Lock(self.redis, f"lock:pod_start_stop:{slot}", timeout=POD_START_STOP_LOCK_TTL, sleep=0.2)
+        try:
+            held = bool(await lock.acquire())
+        except (redis.exceptions.RedisError, OSError) as e:
+            logger.warning(_m(f"Pod start/stop lock {slot} could not be taken", extra={"error": str(e)}))
+            held = False
+        renewer = asyncio.create_task(self._renew_pod_start_stop_lock(lock, slot)) if held else None
+        try:
+            yield held
+        finally:
+            if renewer is not None:
+                renewer.cancel()
+            if held:
+                with suppress(redis.exceptions.RedisError, OSError):  # lapsed: no longer ours to release
+                    await lock.release()
+
+    async def _renew_pod_start_stop_lock(self, lock: aioredis.lock.Lock, slot: str) -> None:
+        while True:
+            await asyncio.sleep(POD_START_STOP_LOCK_TTL / 3)
+            try:
+                await lock.reacquire()
+            except redis.exceptions.LockNotOwnedError:
+                logger.error(_m(f"Pod start/stop lock {slot} lapsed while held"))
+                return
+            except (redis.exceptions.RedisError, OSError) as e:
+                logger.warning(_m(f"Pod start/stop lock {slot} renewal failed", extra={"error": str(e)}))
 
     @asynccontextmanager
     async def rented_gpu_drop_lock(self, pod_id: str):

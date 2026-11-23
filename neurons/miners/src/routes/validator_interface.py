@@ -115,6 +115,7 @@ async def submit_ssh_pubkey(
             request.executor_id,
             nonce=request.nonce,
             validator_miner_signature=request.validator_miner_signature,
+            owner_hotkey_signatures=request.owner_hotkey_signatures,
             is_rental_request=request.is_rental_request,
             # verify_validator_auth_from_headers accepted it; > 1e12 is milliseconds there too
             requested_at=x_timestamp / 1000 if x_timestamp > 1e12 else x_timestamp,

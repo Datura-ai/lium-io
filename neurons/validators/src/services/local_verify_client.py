@@ -342,7 +342,8 @@ class LocalVerifyClient:
         except Exception as exc:  # asyncssh errors (session gone), a loopback bind failure
             raise LocalVerifyUnavailable("transport", f"tunnel: {type(exc).__name__}: {exc}")
         try:
-            async with self._session_factory(timeout=timeout) as session:
+            # our own loopback end of the SSH tunnel, not the node's address: no node-address check applies
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"http://{TUNNEL_LISTEN_HOST}:{listener.get_port()}/verify",
                     json=signed,

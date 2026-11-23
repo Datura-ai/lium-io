@@ -859,9 +859,9 @@ async def test_create_payload_is_what_a_renter_gets():
     assert private_key == ctx.executor_ssh_private_key_encrypted
     assert payload.docker_image == IMAGE.image_ref
     assert payload.gpu_uuids == ["GPU-aaaa", "GPU-bbbb"]
-    # the backend's whole-node limit (64 GiB less the 4 GiB reserve), so create_container never takes
+    # the backend's whole-node limit (64 GiB less the 8 GiB reserve), so create_container never takes
     # the no-memory-limit path that reads the host's /dev/nvidia* count
-    assert payload.memory_gb == 60
+    assert payload.memory_gb == 56
     assert (
         payload.ships_sshd is True and payload.is_sysbox is True and payload.enable_jupyter is False
     )

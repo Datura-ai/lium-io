@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
@@ -36,12 +37,14 @@ from services.redis_service import (
     RedisWrites,
     last_scored_result_key,
 )
-from services.task.availability import AvailabilityErrorCode
+from services.task.availability import AvailabilityErrorCode, _is_the_nodes_own_fault
+from services.task.checks.rental_owner import listed_under_another_miner, rental_owned_by
 from services.task.checks.executor_image import observed_executor_digest
 from services.task.messages import (
     ExecutorImageMessages,
     FinalizeMessages,
     GpuPowerLimitMessages,
+    GpuUsageMessages,
     MachineSpecMessages,
     PortConnectivityMessages,
     PortCountMessages,
@@ -196,6 +199,7 @@ class WithheldVerdict:
 
     miner_hotkey: str
     result: JobResult
+    keeps_miner_active: bool = True
 
 
 @dataclass(frozen=True)
@@ -591,10 +595,153 @@ def withhold_session_lost_verdicts(
     return standing_by_miner, withheld
 
 
+# DAH-6564: failures a rental or filler that started or ended during the cycle produces (the checks judge the node
+# against the list read at the cycle start)
+RENTAL_CHANGE_REASONS = frozenset(
+    {
+        PortCountMessages.INSUFFICIENT_PORTS.reason,
+        RentalVerificationMessages.FAILED.reason,
+        GpuUsageMessages.USAGE_HIGH.reason,
+    }
+)
+# one hash for the fleet: "<miner hotkey>:<executor uuid>" -> {"batches": [withheld job_batch_ids], "at": epoch}
+RENTAL_CHANGE_STATE_KEY = "rental_change_withheld"
+# cycles withheld by this rule since the node last passed; the backend's 45 min inactive sweep is not reset by it
+MAX_RENTAL_CHANGE_WITHHELD_CYCLES = 2
+RENTAL_CHANGE_STATE_MAX_AGE_SECONDS = 7 * 24 * 3600
+
+
+def has_rental_change_candidates(job_results: dict[str, list[JobResult]]) -> bool:
+    return any(
+        result.failure_reason_code in RENTAL_CHANGE_REASONS for results in job_results.values() for result in results
+    )
+
+
+def node_rentals(rented_data: RentedExecutorsResponse, miner_hotkey: str, result: JobResult) -> frozenset[str]:
+    """The node's pod ids and filler container names in one rented list, owned as the checks own them
+    (checks/rental_owner.py): the executor uuid is the miner's word."""
+    executor = result.executor_info
+    uuid = str(executor.uuid)
+    rental = rental_owned_by(rented_data.executors.get(uuid), miner_hotkey, executor.address, executor.port)
+    pods = {f"pod:{pod.pod_id}" for pod in rental.pods} if rental else set()
+    if listed_under_another_miner(rented_data, uuid, miner_hotkey):
+        return frozenset(pods)
+    return frozenset(pods | {f"filler:{name}" for name in rented_data.get_filler_containers(uuid)})
+
+
+def _rental_change(
+    result: JobResult,
+    miner_hotkey: str,
+    at_start: RentedExecutorsResponse,
+    at_end: RentedExecutorsResponse,
+    published_early: set[str],
+) -> tuple[frozenset[str], frozenset[str]] | None:
+    """(rentals at the cycle start, at its end) when the rule may withhold this failure, else None."""
+    reason = result.failure_reason_code
+    if reason not in RENTAL_CHANGE_REASONS or str(result.executor_info.uuid) in published_early:
+        return None
+    # a node that declares fewer ports than it needs fails whatever its rentals are
+    if result.validation_event and _is_the_nodes_own_fault(result.validation_event.model_dump()):
+        return None
+    # an earlier check's finding (a GPU fault) hides the node and must be published
+    if any(error.get("reason_code") != reason for error in result.availability_errors or []):
+        return None
+    before, after = node_rentals(at_start, miner_hotkey, result), node_rentals(at_end, miner_hotkey, result)
+    return None if before == after else (before, after)
+
+
+async def withhold_rental_change_verdicts(
+    job_results: dict[str, list[JobResult]],
+    rented_at_start: RentedExecutorsResponse,
+    rented_at_end: RentedExecutorsResponse | None,
+    redis_service: RedisService,
+    published_early: set[str],
+) -> tuple[dict[str, list[JobResult]], list[WithheldVerdict]]:
+    """DAH-6564: a ports, rental-check or GPU-usage failure on a node whose pods or fillers changed between the
+    cycle-start list and the cycle-end list gets no verdict, at most MAX_RENTAL_CHANGE_WITHHELD_CYCLES cycles
+    since the node's last real pass. No cycle-end list, or Redis not answering: every verdict stands."""
+    candidates = has_rental_change_candidates(job_results)
+    if candidates and rented_at_end is None:
+        logger.warning(_m("Rental-change rule: the cycle-end rented list gave no answer; every verdict stands"))
+    try:
+        state = {
+            (field.decode() if isinstance(field, bytes) else field): json.loads(raw)
+            for field, raw in (await redis_service.hgetall(RENTAL_CHANGE_STATE_KEY)).items()
+        }
+    except Exception as exc:
+        if candidates:
+            logger.warning(_m("Rental-change rule: state unreadable; every verdict stands", extra={"error": str(exc)}))
+        return job_results, []
+    now = time.time()
+    writes = RedisWrites()
+    standing: dict[str, list[JobResult]] = {}
+    pending: list[tuple[WithheldVerdict, dict]] = []
+    for miner_hotkey, results in job_results.items():
+        standing[miner_hotkey] = []
+        for result in results:
+            field = f"{miner_hotkey}:{result.executor_info.uuid}"
+            change = None
+            if result.is_successful and not result.carried_for_renter_gpu_reset:
+                if field in state:
+                    writes.hdel(RENTAL_CHANGE_STATE_KEY, field)
+                    state.pop(field)
+            elif rented_at_end is not None:
+                change = _rental_change(result, miner_hotkey, rented_at_start, rented_at_end, published_early)
+            if change is None:
+                standing[miner_hotkey].append(result)
+                continue
+            before, after = change
+            batches = state.get(field, {}).get("batches", [])
+            extra = {
+                "miner_hotkey": miner_hotkey,
+                "executor_uuid": result.executor_info.uuid,
+                "job_batch_id": result.job_batch_id,
+                "reason_code": result.failure_reason_code,
+                "started": sorted(after - before),
+                "ended": sorted(before - after),
+            }
+            if result.job_batch_id not in batches and len(batches) >= MAX_RENTAL_CHANGE_WITHHELD_CYCLES:
+                logger.info(
+                    _m(
+                        "Rental-change rule: cap reached, the verdict stands",
+                        extra={**extra, "withheld_cycles_since_pass": len(batches)},
+                    )
+                )
+                standing[miner_hotkey].append(result)
+                continue
+            if result.job_batch_id not in batches:
+                batches = [*batches, result.job_batch_id]
+            state[field] = {"batches": batches, "at": now}
+            writes.hset(RENTAL_CHANGE_STATE_KEY, field, json.dumps(state[field]))
+            pending.append(
+                (
+                    WithheldVerdict(miner_hotkey=miner_hotkey, result=result, keeps_miner_active=False),
+                    {**extra, "withheld_cycles_since_pass": len(batches)},
+                )
+            )
+    for field, entry in state.items():
+        if now - entry.get("at", 0) > RENTAL_CHANGE_STATE_MAX_AGE_SECONDS:
+            writes.hdel(RENTAL_CHANGE_STATE_KEY, field)
+    try:
+        await redis_service.write_atomically(writes)
+    except Exception as exc:
+        if pending:
+            logger.warning(_m("Rental-change rule: state not written; every verdict stands", extra={"error": str(exc)}))
+        return job_results, []
+    for withheld, extra in pending:
+        logger.info(_m("Verdict withheld: the node's rentals or fillers changed during the cycle", extra=extra))
+    return standing, [withheld for withheld, _ in pending]
+
+
 def session_kept_hotkeys(withheld_results: list[WithheldVerdict]) -> set[str]:
     """The miners a withheld verdict keeps active this cycle. Not one whose session died in the port check (review
-    4469609776): a miner can close SSH itself, and that must not earn the eligibility floor."""
-    return {withheld.miner_hotkey for withheld in withheld_results if not withheld.result.session_lost_in_port_check}
+    4469609776): a miner can close SSH itself, and that must not earn the eligibility floor. Nor one withheld for a
+    rental change (DAH-6564): a provider can change his own node's rentals."""
+    return {
+        withheld.miner_hotkey
+        for withheld in withheld_results
+        if withheld.keeps_miner_active and not withheld.result.session_lost_in_port_check
+    }
 
 
 def has_renter_gpu_reset_holds(job_results: dict[str, list[JobResult]]) -> bool:
