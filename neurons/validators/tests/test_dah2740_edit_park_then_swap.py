@@ -199,6 +199,8 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
     assert ssh.commands.index('/usr/bin/docker volume ls --format "{{.Name}}"') < hung_query
     assert hung_query < len(ssh.commands) - 1 - ssh.commands[::-1].index(_POWER_READ)  # before the last power read
     assert [cmd for cmd in ssh.commands if cmd != HUNG_GPU_QUERY_COMMAND] == [
+        # with the host reads, before anything else on the session and before any container starts
+        host_memory_guard_script(),
         # the pre-run host probe (DAH-3257); no image-label section, the volume is not encrypted; before the park, so
         # a probe that stops the create leaves the current container as it was
         prerun_host_probe_command(
@@ -233,8 +235,6 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         "nvidia-smi -i GPU-test -rmc >/dev/null 2>&1; echo GPU-test -rmc $?",
         host_key,
         "nohup /usr/bin/python /root/app/src/inspector_executor.py --start-collector >/dev/null 2>&1 &",
-        # after the reply, on the create's session: host-level, so no renter waits for it
-        host_memory_guard_script(),
         f"/usr/bin/docker rm -fv id-{name}",
     ]
 

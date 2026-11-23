@@ -2538,8 +2538,8 @@ inflight_creates = _InflightCreateRegistry()
 class _CreateStepsAfterReplyRegistry:
     """Create steps the backend's reply does not wait for, by pod and executor.
 
-    DAH-3980: the inspector start, the host memory guard, the create's session close and the validator key
-    removal run after the reply. Held here so the tasks are not collected, and so a delete of the pod waits for
+    DAH-3980: the inspector start, the create's session close and the validator key removal run
+    after the reply. Held here so the tasks are not collected, and so a delete of the pod waits for
     them first: an inspector start landing after the delete's stop would leave the collector running.
     Each step logs its own failure. DAH-6540: a delete on a node the pod left does not wait for the new node's.
     """
@@ -10265,9 +10265,6 @@ class DockerService:
                         }),
                     )
                 )
-                # host-level, not per pod, and set again by every rented-pod resources check: no renter waits for
-                # it (DAH-6379). Never raises; logs what it could not apply
-                await apply_host_memory_guard(ssh_client, log_extra)
         except Exception as exc:
             logger.error(
                 _m(
@@ -10629,6 +10626,10 @@ class DockerService:
                 if ram_kib is not None and payload.gpu_uuids:
                     host_read_step = HOST_READ_GPU_COUNT_STEP
                     gpu_count = await self._read_host_gpu_count(connected_ssh_client)
+                # DAH-6379/6916: host-level MemoryMin before any container of this create starts, so a new pod
+                # cannot starve the host services during its readiness wait. Here it overlaps the Docker connect
+                # and, on this session's serial channel, no other step. Never raises; logs what it could not apply
+                await apply_host_memory_guard(connected_ssh_client, default_extra)
                 return pid_max, ram_kib, gpu_count
 
             async def after_host_limits_read(

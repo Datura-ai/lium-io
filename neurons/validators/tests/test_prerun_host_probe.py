@@ -46,6 +46,7 @@ from services.docker_service import (
     _remove_and_list_containers_command,
 )
 import services.docker_service as ds_module
+from services.host_memory_guard import host_memory_guard_script
 from services.image_flatten import flatten_wait_command
 from services.nvidia_devices import (
     MissingRentedGpuError,
@@ -599,12 +600,13 @@ async def test_customer_create_keeps_the_listings_but_not_the_volume_facts_after
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
     # the fail-closed pid_max read every rental makes first and the host RAM read that clamps its memory limit,
-    # then the listing that finds the filler and the rm with its confirming listing in one command — the
-    # removal starts only once the host reads succeed
+    # the host memory guard, then the listing that finds the filler and the rm with its confirming listing in one
+    # command — the removal starts only once the host reads succeed
     assert "pod_ssh_host_key" in _cmds(ssh_client)[-1]
     assert _cmds(ssh_client)[:-1] == [
         "cat /proc/sys/kernel/pid_max",
         "cat /proc/meminfo",
+        host_memory_guard_script(),
         *([] if removal_lost_its_channel else [DOCKER_PS_ALL_NAMES_IDS_CMD, _FILLER_X_REMOVAL, DOCKER_PS_ALL_NAMES_IDS_CMD]),
         # the sizing measures the disk under the node flatten lock
         next((c for c in _cmds(ssh_client) if c.startswith(flatten_wait_command()[:40])), "no flatten wait"),
@@ -846,12 +848,13 @@ async def test_only_a_customer_create_removes_fillers_at_ssh_connect(
     result = await _run_create_container(svc, payload)
 
     assert type(result).__name__ == "ContainerCreated", getattr(result, "msg", "")
-    # the fail-closed pid_max read every rental makes and the host RAM read come first; only then does the removal
-    # run (at SSH connect for a customer create, at the cleanup step for a bootstrap restore), so it is always after
+    # the fail-closed pid_max read every rental makes, the host RAM read and the host memory guard come first; only
+    # then does the removal run (at SSH connect for a customer create, at the cleanup step for a bootstrap restore)
     assert "pod_ssh_host_key" in _cmds(ssh_client)[-1]
     assert _cmds(ssh_client)[:-1] == [
         "cat /proc/sys/kernel/pid_max",
         "cat /proc/meminfo",
+        host_memory_guard_script(),
         *commands,
     ]
     svc.probe_prerun_host.assert_awaited_once()
