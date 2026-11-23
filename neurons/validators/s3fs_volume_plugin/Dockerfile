@@ -16,7 +16,7 @@ RUN CGO_ENABLED=0 go build -mod=readonly -trimpath -o /s3fs-volume-plugin ./s3fs
 FROM ubuntu:24.04
 RUN apt-get update \
  && apt-get install -y --no-install-recommends s3fs rsyslog tini ca-certificates \
- && mkdir -p /var/lib/rsyslog /var/lib/docker-volumes /var/cache/s3fs \
+ && mkdir -p /var/lib/rsyslog /var/lib/docker-volumes \
  && rm -rf /var/lib/apt/lists/*
 COPY rsyslog.conf /etc/rsyslog.conf
 COPY fuse.conf /etc/fuse.conf
