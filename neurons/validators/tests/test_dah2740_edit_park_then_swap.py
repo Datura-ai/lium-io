@@ -37,14 +37,6 @@ from services.prerun_host_probe import prerun_host_probe_command
 from helpers import no_host_start_lock, shared_pod_start_stop_lock
 
 
-@pytest.fixture(autouse=True)
-def _hung_gpu_reset_on(monkeypatch):
-    # DAH-5301: these cover the reset itself (the flag on); its shadow mode is in test_gpu_clocks/test_hung_gpu_reset
-    from core.config import settings
-
-    monkeypatch.setattr(settings, "HUNG_GPU_RESET_ON_REBOOT_ENABLED", True)
-
-
 @pytest.fixture
 def svc():
     # the same service test_deploy_optimizations builds; a local fixture rather than an import, which
@@ -511,8 +503,7 @@ def _hung_reset(outcome, calls: list | None = None):
     """Stands in for reset_hung_pod_gpus the way it uses `resetting`: a hung find holds the caller's mark
     and hands it the result before letting go; an exception escapes like an SSH error would."""
 
-    async def fake(runner, pod_gpu_uuids, *, resetting, shadow):
-        assert not shadow
+    async def fake(runner, pod_gpu_uuids, *, resetting):
         if calls is not None:
             calls.append(pod_gpu_uuids)
         if isinstance(outcome, Exception):
@@ -561,8 +552,7 @@ async def test_the_hung_gpu_reset_holds_the_gpu_reset_pending_mark(svc, monkeypa
     svc.redis_service.mark_gpu_reset_recent = AsyncMock()
     held = []
 
-    async def fake_reset(runner, pod_gpu_uuids, *, resetting, shadow):
-        assert not shadow
+    async def fake_reset(runner, pod_gpu_uuids, *, resetting):
         async with resetting():
             # the rented checks skip the node while the GPUs reset
             held.append(svc.redis_service.add_pending_pod.await_args)
