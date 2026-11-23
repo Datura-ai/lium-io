@@ -1441,26 +1441,45 @@ def local_volume_bytes(path, deadline):
         if time.monotonic() > deadline:
             return None
         try:
-            entries = list(os.scandir(stack.pop()))
+            entries = os.scandir(stack.pop())
         except FileNotFoundError:
             continue  # removed while walking: holds nothing now
         except OSError:
             return None
-        for entry in entries:
-            try:
-                st = entry.stat(follow_symlinks=False)
-            except OSError:
-                continue
-            if st.st_dev != root_dev:
-                continue
-            if entry.is_dir(follow_symlinks=False):
-                stack.append(entry.path)
-            elif st.st_nlink > 1:
-                if (st.st_dev, st.st_ino) in seen:
-                    continue
-                seen.add((st.st_dev, st.st_ino))
-            total += st.st_blocks * 512
+        try:
+            with entries:
+                # lazily, the budget checked per entry: one huge directory cannot run past it
+                for entry in entries:
+                    if time.monotonic() > deadline:
+                        return None
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if st.st_dev != root_dev:
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+                    elif st.st_nlink > 1:
+                        if (st.st_dev, st.st_ino) in seen:
+                            continue
+                        seen.add((st.st_dev, st.st_ino))
+                    total += st.st_blocks * 512
+        except OSError:
+            return None
     return total
+
+
+def is_pod_disk_volume(mount):
+    # a volume that holds the pod's data on this node's disk: the `local` driver (plain and dm-crypt) or vloopback.
+    # An attached volume (the s3fs plugin at /mnt) or any other external driver is not on this disk: never sized,
+    # never required for the pod's size to be complete
+    driver = str(mount.get("Driver") or "local")
+    return (
+        mount.get("Type") == "volume"
+        and bool(mount.get("Name"))
+        and (driver == "local" or driver.startswith(VLOOPBACK_DRIVER_PREFIX))
+    )
 
 
 def get_docker_disk_usage():
@@ -1504,7 +1523,7 @@ def get_docker_disk_usage():
         str(mount.get("Name"))
         for container in container_list
         for mount in container.get("Mounts") or []
-        if mount.get("Type") == "volume" and mount.get("Name")
+        if is_pod_disk_volume(mount)
     }
     unsized_names = mounted - set(by_volume)
     if unsized_names:
@@ -1529,7 +1548,7 @@ def get_docker_disk_usage():
         volume_names = [
             str(mount.get("Name"))
             for mount in container.get("Mounts") or []
-            if mount.get("Type") == "volume" and mount.get("Name")
+            if is_pod_disk_volume(mount)
         ]
         anonymous = [v for v in volume_names if re.fullmatch(r"[0-9a-f]{64}", v)]
         if any(v not in by_volume for v in volume_names):

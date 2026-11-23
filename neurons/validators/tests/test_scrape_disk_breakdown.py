@@ -43,6 +43,7 @@ DISK_HELPERS = {
     "get_docker_disk_usage",
     "LOCAL_VOLUME_WALK_SECONDS",
     "local_volume_bytes",
+    "is_pod_disk_volume",
     "cache_volume_bytes",
     "ENGY_CACHE_VOLUME_PREFIX",
     "FILLER_VOLUME_LABEL_KEY",
@@ -254,6 +255,60 @@ def test_a_failed_system_df_walks_the_pods_own_local_volumes(scrape: dict, monke
     assert usage["hard_disk_by_container"] == {"pod_plain": 1, "pod_dind": 6, "pod_slow": 1}
     assert usage["hard_disk_unsized_containers"] == ["pod_slow"]
 
+
+
+def test_an_attached_s3fs_volume_is_never_required_for_a_pods_size(scrape: dict, monkeypatch) -> None:
+    # Arrange — a pod with a vloopback /root and an attached s3fs volume at /mnt, while /system/df fails: the s3fs
+    # volume is not on this disk, so it is never walked and never makes the pod's size unknown
+    blocks_by_path = {"/proc/1/root/var/lib/docker/vloopback-v2/volume_pod1": 2048}
+    monkeypatch.setitem(scrape, "glob", type("_Glob", (), {"glob": staticmethod(lambda pattern: [])}))
+    monkeypatch.setitem(
+        scrape,
+        "os",
+        type(
+            "_Os",
+            (),
+            {
+                "path": type("_Path", (), {"join": staticmethod(os.path.join), "isdir": staticmethod(lambda path: True)}),
+                "stat": staticmethod(lambda path: type("_Stat", (), {"st_blocks": blocks_by_path[path]})),
+            },
+        ),
+    )
+    monkeypatch.setitem(scrape, "local_volume_bytes", lambda path, deadline: pytest.fail(f"walked {path}"))
+    responses = {
+        CONTAINERS_PATH: [
+            {
+                "Names": ["/pod_attached"],
+                "SizeRw": 1024,
+                "Mounts": [
+                    {"Type": "volume", "Name": "volume_pod1", "Driver": "vloopback:v2"},
+                    {"Type": "volume", "Name": "s3_bucket", "Driver": "s3fs:latest", "Destination": "/mnt"},
+                ],
+            },
+        ],
+        "/info": {"DockerRootDir": "/var/lib/docker"},
+        "/volumes": {
+            "Volumes": [
+                {"Name": "volume_pod1", "Driver": "vloopback-v2"},
+                {"Name": "s3_bucket", "Driver": "s3fs:latest", "Mountpoint": "/mnt/s3_bucket"},
+            ]
+        },
+    }
+
+    def docker_api_get(path):
+        if path.startswith("/system/df"):
+            raise TimeoutError("timed out")
+        return responses[path]
+
+    scrape["docker_api_get"] = docker_api_get
+
+    # Act
+    usage = scrape["get_docker_disk_usage"]()
+
+    # Assert
+    assert usage["hard_disk_by_container"] == {"pod_attached": 1}
+    assert usage["hard_disk_by_volume"] == {"volume_pod1": 2048 * 512 // 1024}
+    assert usage["hard_disk_unsized_containers"] == []
 
 def test_local_volume_bytes_counts_blocks_once_and_stops_at_its_deadline(scrape: dict, tmp_path) -> None:
     # Arrange
