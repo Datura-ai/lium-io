@@ -413,6 +413,17 @@ async def _read_back_power_state(ssh: asyncssh.SSHClientConnection, uuid: str) -
     return _parse_power_readback_csv(str(result.stdout))
 
 
+async def _accept_if_already_at(
+    ssh: asyncssh.SSHClientConnection, uuid: str, watts: int, failed: PowerLimitSetOutcome
+) -> PowerLimitSetOutcome:
+    """A failed ``-pl`` on a GPU that already shows the target is not a failed set: the limit the
+    caller wants is in place (a strict restore must not fail the rent over it)."""
+    readback = await _read_back_power_state(ssh, uuid)
+    if readback.watts == watts:
+        return PowerLimitSetOutcome(failure=None, persistence_enabled=readback.persistence_enabled)
+    return failed
+
+
 async def _set_power_limit(
     ssh: asyncssh.SSHClientConnection,
     uuid: str,
@@ -428,12 +439,19 @@ async def _set_power_limit(
     except asyncssh.ChannelOpenError:
         raise
     except Exception as exc:
-        return PowerLimitSetOutcome(failure=f"nvidia-smi -pl errored: {exc}", persistence_enabled=None)
+        return await _accept_if_already_at(
+            ssh, uuid, watts, PowerLimitSetOutcome(failure=f"nvidia-smi -pl errored: {exc}", persistence_enabled=None)
+        )
     if result.exit_status != 0:
-        return PowerLimitSetOutcome(
-            failure=f"nvidia-smi -pl failed: exit={result.exit_status}, stderr={result.stderr!r}",
-            persistence_enabled=None,
-            host_refused=True,
+        return await _accept_if_already_at(
+            ssh,
+            uuid,
+            watts,
+            PowerLimitSetOutcome(
+                failure=f"nvidia-smi -pl failed: exit={result.exit_status}, stderr={result.stderr!r}",
+                persistence_enabled=None,
+                host_refused=True,
+            ),
         )
     readback = await _read_back_power_state(ssh, uuid)
     if readback.watts is None:

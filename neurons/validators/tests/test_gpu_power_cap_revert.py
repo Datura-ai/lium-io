@@ -866,7 +866,9 @@ def host_after_reboot(failing_gpu: str | None = None, readback_watts: int = 280)
             failed = failing_gpu is not None and failing_gpu in command
             return FakeRun(exit_status=1 if failed else 0, stderr="not permitted" if failed else "")
         if "--query-gpu=power.limit,persistence_mode" in command:
-            return FakeRun(stdout=f"{readback_watts}.00, Enabled\n")
+            # the reboot left a GPU whose -pl failed at its 400 W default
+            watts = 400 if failing_gpu is not None and failing_gpu in command else readback_watts
+            return FakeRun(stdout=f"{watts}.00, Enabled\n")
         return FakeRun()
 
     ssh = AsyncMock()

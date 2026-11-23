@@ -98,7 +98,7 @@ def _dump_measurements(measurements: list[GpuPowerMeasurement]) -> list[dict[str
 FILLER_INSPECT_TIMEOUT_SECONDS = 30
 
 
-async def _own_restore_records(ctx: Context, gpu_uuids: list[str]) -> list[GpuPowerRestoreRecord]:
+async def _restore_records_of_this_executor(ctx: Context, gpu_uuids: list[str]) -> list[GpuPowerRestoreRecord]:
     """This executor's restore records for these GPUs (the host's own limits under our cap)."""
     read_result = await read_gpu_power_restore_records(ctx.services.redis, gpu_uuids, log_extra=ctx.default_extra)
     return [record for record in read_result.records if record.executor_id == ctx.executor.uuid]
@@ -283,7 +283,7 @@ class GpuPowerLimitCheck:
         updates: dict[str, Any] = {}
         if default_job_owner == DEFAULT_JOB_OWNER_MINER:
             # the provider's own capped job (DAH-5861): the badge judges the host's pre-cap limit, as under Pearl
-            records = await _own_restore_records(ctx, [m.uuid for m in measurements if m.uuid])
+            records = await _restore_records_of_this_executor(ctx, [m.uuid for m in measurements if m.uuid])
             updates = _with_host_limits(ctx, records)
         return CheckResult(passed=True, event=event, updates=updates)
 
@@ -395,7 +395,7 @@ class GpuPowerLimitCheck:
         }
         if not live_watts_by_uuid:
             return LiveCapReadout([], {})
-        records = await _own_restore_records(ctx, list(live_watts_by_uuid))
+        records = await _restore_records_of_this_executor(ctx, list(live_watts_by_uuid))
         # same reason the stale-cap rescue is gated: the dry-run pipeline must not write shared state
         if not self.restore_stale_caps:
             return LiveCapReadout(records, {})

@@ -99,6 +99,8 @@ async def test_strict_pod_restore_requires_every_record_to_be_restored(failure):
                 raise TimeoutError("hung")
             if failure != "partial" or "GPU-b" in command:
                 return FakeRun(exit_status=1)
+        if failure in ("timeout", "nonzero") or (failure == "partial" and "GPU-b" in command):
+            return FakeRun(stdout="100, Enabled\n")  # the failed -pl left the cap in place
         return FakeRun(stdout="400, Enabled\n" if "GPU-a" in command else "250, Enabled\n")
     ssh = AsyncMock(run=AsyncMock(side_effect=run))
     # Act: strict caller cannot succeed with an unknown or remaining cap.
@@ -181,6 +183,27 @@ async def test_a_customer_create_never_starts_on_a_cap_whose_restore_failed(whol
     else:
         assert await restore() == 0  # fillers and the early restore stay best-effort
     assert _restore_key("GPU-a") in redis.store
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pl_failure", ["nonzero", "timeout"])
+async def test_a_failed_restore_set_on_a_gpu_already_at_the_recorded_limit_is_a_restore(pl_failure):
+    # lio#2238 review (taiberium 23 Nov): -pl fails but GPU-a already shows its recorded 400 W.
+    redis = FakeRedis({_restore_key("GPU-a"): _record("GPU-a", 400)})
+
+    async def run(command, **kwargs):
+        if command == POWER_STATE_CMD:
+            return FakeRun(stdout="GPU-a, 400, 400, 100, 400\n")
+        if " -pl " in command:
+            if pl_failure == "timeout":
+                raise TimeoutError("hung")
+            return FakeRun(exit_status=1)
+        return FakeRun(stdout="400, Enabled\n")
+
+    ssh = AsyncMock(run=AsyncMock(side_effect=run))
+    # Act / Assert: the strict restore succeeds and clears the record instead of failing the rent.
+    assert await restore_tracked_gpu_power_limits(ssh, redis, ["GPU-a"], require_restored=True) == 1
+    assert _restore_key("GPU-a") not in redis.store
 
 
 @pytest.mark.asyncio
@@ -617,7 +640,7 @@ async def test_apply_tells_a_host_refusal_from_our_own_error(failure, expected):
             if failure == "timeout":
                 raise TimeoutError("hung")
             return FakeRun(exit_status=1 if failure == "nonzero" else 0)
-        return FakeRun(stdout=f"{400 if failure == 'not_stuck' else 200}, Enabled\n")
+        return FakeRun(stdout=f"{200 if failure in (None, 'redis') else 400}, Enabled\n")
 
     ssh = AsyncMock(run=AsyncMock(side_effect=run))
     # Act / Assert: only the host's own refusal reads HOST_REFUSED.
