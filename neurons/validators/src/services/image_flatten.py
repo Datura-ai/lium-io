@@ -265,8 +265,10 @@ def flatten_wait_command() -> str:
     # flatten that has not started copying refuses once it sees the mark (nothing to print without flock)
     return (
         f"command -v flock >/dev/null || exit 0; exec 9>>{FLATTEN_LOCK_PATH}; "
-        # -E: only flock's own wait running out exits FLATTEN_LOCK_TIMEOUT_EXIT; a flock crash or error keeps its status
-        f"flock -E {FLATTEN_LOCK_TIMEOUT_EXIT} -w {FLATTEN_TIMEOUT_SECONDS + 300} 9 || exit $?; "
+        # -E: only flock's own wait running out exits FLATTEN_LOCK_TIMEOUT_EXIT; any other flock status (a crash, an
+        # error, or a host flock returning one of this command's own codes) is the plain lock failure (1), named on stderr
+        f"flock -E {FLATTEN_LOCK_TIMEOUT_EXIT} -w {FLATTEN_TIMEOUT_SECONDS + 300} 9 || "
+        f'{{ s=$?; [ "$s" -eq {FLATTEN_LOCK_TIMEOUT_EXIT} ] && exit $s; echo "flock failed: exit $s" >&2; exit 1; }}; '
         f"touch {FLATTEN_SIZED_PATH} || exit 1; "
         f"{df_command(root)} || exit {FLATTEN_MEASURE_FAILED_EXIT}"
     )
@@ -288,7 +290,8 @@ async def wait_for_node_flatten(ssh_client: asyncssh.SSHClientConnection) -> int
     if result.exit_status == FLATTEN_LOCK_TIMEOUT_EXIT:
         raise FlattenLockTimedOut("an image copy on this node held the flatten lock for the whole wait")
     if result.exit_status != 0:
-        raise RuntimeError(f"waiting for any image copy on this node failed (exit {result.exit_status})")
+        detail = str(result.stderr or "").strip()[-200:]
+        raise RuntimeError(f"waiting for any image copy on this node failed (exit {result.exit_status}) {detail}")
     out = str(result.stdout or "")
     try:
         return parse_df_available_bytes(out) if out.strip() else None

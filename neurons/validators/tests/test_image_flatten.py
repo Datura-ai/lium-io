@@ -777,13 +777,15 @@ async def test_only_a_lock_held_past_the_wait_reads_as_the_node_busy(tmp_path):
     finally:
         held.kill()
         held.wait()
-    # review: flock itself crashing (segfault, 139) or erroring must keep its own status, not read as the timeout
+    # review: flock itself crashing (segfault, 139) or erroring is the plain lock failure, not the timeout;
+    # its own status is named on stderr
     fake = tmp_path / "bin"
     fake.mkdir()
     (fake / "flock").write_text("#!/bin/sh\nkill -SEGV $$\n")
     (fake / "flock").chmod(0o755)
-    flock_crashed = subprocess.run(["sh", "-c", wait], env={"PATH": f"{fake}:{os.environ['PATH']}"}).returncode
-    assert flock_crashed == 139
+    crashed = subprocess.run(["sh", "-c", wait], env={"PATH": f"{fake}:{os.environ['PATH']}"}, capture_output=True)
+    flock_crashed = crashed.returncode
+    assert flock_crashed == 1 and b"flock failed: exit 139" in crashed.stderr
 
     with pytest.raises(image_flatten.FlattenLockTimedOut):
         await image_flatten.wait_for_node_flatten(Mock(run=AsyncMock(return_value=Mock(exit_status=timed_out))))
@@ -791,6 +793,21 @@ async def test_only_a_lock_held_past_the_wait_reads_as_the_node_busy(tmp_path):
         with pytest.raises(RuntimeError) as raised:
             await image_flatten.wait_for_node_flatten(Mock(run=AsyncMock(return_value=Mock(exit_status=crashed))))
         assert not isinstance(raised.value, image_flatten.FlattenLockTimedOut)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [image_flatten.FLATTEN_MEASURE_FAILED_EXIT, 1, 64])
+async def test_a_failed_flock_never_reads_as_a_measure_under_the_held_lock(tmp_path, status):
+    # review: a host flock exiting this command's own measure code must not authorize the fallback sizing
+    (tmp_path / "flock").write_text(f"#!/bin/sh\nexit {status}\n")
+    (tmp_path / "flock").chmod(0o755)
+    wait = image_flatten.flatten_wait_command().replace(FLATTEN_LOCK_PATH, str(tmp_path / "lock"))
+    done = subprocess.run(["sh", "-c", wait], env={"PATH": f"{tmp_path}:{os.environ['PATH']}"}, capture_output=True)
+
+    assert done.returncode == 1 and f"flock failed: exit {status}".encode() in done.stderr
+    with pytest.raises(RuntimeError) as raised:
+        await image_flatten.wait_for_node_flatten(Mock(run=AsyncMock(return_value=Mock(exit_status=done.returncode))))
+    assert not isinstance(raised.value, (image_flatten.FlattenMeasureFailed, image_flatten.FlattenLockTimedOut))
 
 
 @pytest.mark.asyncio
