@@ -1800,6 +1800,32 @@ async def test_a_filler_node_is_probed_beside_its_filler():
 
 
 @pytest.mark.asyncio
+async def test_a_power_restore_hold_is_not_cleared_by_a_probe_beside_a_filler():
+    """DAH-5861 (coordinator, 23 Nov): the probe beside a filler skips the GPU power restore, so its pass
+    relisted a node held for a failed restore untested, and the next renter hit the same failure."""
+    fillers = rented_data(fillers=1)
+    ctx, docker, redis = make_probe_context(rented=fillers, rented_now=fillers)
+    redis.store[f"rental_probe_failed:{EXECUTOR.uuid}"] = f"{STEP_CONTAINER_START}:gpu_power_restore"
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+
+    assert result.passed is False and result.event.what_we_saw["standing_failure"] is True
+    assert docker.create_calls == [] and redis.standing_failure() == STEP_CONTAINER_START
+
+
+@pytest.mark.asyncio
+async def test_a_power_restore_hold_clears_on_a_probe_without_a_filler():
+    redis = FakeRedis()
+    redis.store[f"rental_probe_failed:{EXECUTOR.uuid}"] = f"{STEP_CONTAINER_START}:gpu_power_restore"
+    ctx, docker, _ = make_probe_context(redis=redis)
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+
+    assert result.passed is True and docker.create_options == [{"beside_fillers": False, "synthetic_probe": True}]
+    assert redis.standing_failure() is None
+
+
+@pytest.mark.asyncio
 async def test_a_cycle_whose_port_check_was_deferred_for_disk_pressure_rents_nothing():
     """Regression (DAH-5244 review): the port check kept its memory instead of a container on a Docker root
     whose sync stalls, and the probe then started one on the same root: its create waited in that sync and

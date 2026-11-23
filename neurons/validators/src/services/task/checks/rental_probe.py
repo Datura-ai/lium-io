@@ -149,6 +149,9 @@ _REDIS_LAST_OK_PREFIX = RENTAL_PROBE_OK_PREFIX
 # next cycle must not relist the node without a clean probe). It has no lifetime: a broken node relisted
 # without a clean probe would fail a renter's pod first.
 _REDIS_FAILED_PREFIX = RENTAL_PROBE_FAILED_PREFIX
+# docker_service's create step for the strict GPU power restore before a renter's container (DAH-5861): a hold
+# stamped at it clears only on a probe that runs that restore, never on one beside a filler
+_GPU_POWER_RESTORE_CREATE_STEP = "gpu_power_restore"
 # the OK stamp expires: a deregistered executor's stamp ages out, and an expired stamp only makes the
 # probe run again on the next idle cycle
 _REDIS_STAMP_TTL_SECONDS = 30 * 24 * 3600
@@ -281,6 +284,11 @@ class RentalProbeCheck:
         if isinstance(gate, CheckResult):
             return gate
         standing = gate.standing
+        if gate.fillers_beside and standing is not None and standing.create_step == _GPU_POWER_RESTORE_CREATE_STEP:
+            # the probe beside a filler lifts no power cap, so it cannot show the host now restores GPU power:
+            # a pass here would relist the node untested and the next renter would hit the failure
+            await gate.create_lock.release(ctx)
+            return self._skipped(ctx, "held for a GPU power restore failure; a filler is running", standing=standing)
         image_ref = gate.image_ref
         create_deadline = _create_deadline_seconds(ctx)
         if create_deadline < _MIN_CREATE_DEADLINE_SECONDS:
