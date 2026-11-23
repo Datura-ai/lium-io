@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 import asyncssh
 import redis.exceptions
+from core.config import settings
 
 from ..messages import RentedPodOwnershipMessages as Msg
 from ..messages import render_message
@@ -47,7 +48,8 @@ PATHS = (
 # package dirs came back in either order, so they are a set that may follow the top dirs, not a fixed sequence
 REVERTED_FIRST = ("/", "/usr", "/usr/lib")
 MAY_BE_REVERTED_NEXT = ("/usr/share", "/var/lib/dpkg")
-# a pod seen mid-revert is remembered for its next cycle: the same init pid still showing it is not stopping
+# a container seen mid-revert is remembered until a clean read: any later read still showing the shape, on the same init
+# pid or a new one (a pod restarted into it has finished stopping), is a lasting state, not a stop
 MID_REVERT_KEY_PREFIX = "rented_pod_ownership:mid_revert"
 MID_REVERT_TTL_SECONDS = 24 * 3600
 
@@ -114,8 +116,8 @@ def judge(line: str) -> dict | None:
         return None
     pod = {"pid": pid_num, "uid_map_base": base, "host_owners": owners, "outside_namespace": shifted}
     # the shape a stopping pod's hand-back leaves: the top dirs (and maybe the package dirs) at host root, everything
-    # else read in the range. It is only a candidate: run() reports it unread once, and SHIFTED when the same pod
-    # still shows it a cycle later (a hand-back cut short by a power loss stays like this on a running pod)
+    # else read in the range. It is only a candidate: run() reports it unread once, and SHIFTED on any later read of the
+    # same container before a clean one (a hand-back cut short by a power loss stays like this on a running pod)
     if (
         set(REVERTED_FIRST) <= set(shifted) <= set(REVERTED_FIRST + MAY_BE_REVERTED_NEXT)
         and all(owners[path] == 0 for path in shifted)
@@ -197,9 +199,11 @@ class RentedPodOwnershipCheck:
                 # when each flagged runtime started: a notice must date the restart, not the day the check first saw it
                 what["runtime_started_at"] = started_at
         for pod in pods.values():
-            if pod.get("being_reverted") and not await self._first_sight_of_mid_revert(ctx, pod):
-                # still there a cycle later on the same init pid: not a stop, a lasting state
-                pod["outside_namespace"] = pod.pop("being_reverted")
+            if pod.get("being_reverted"):
+                if not await self._first_sight_of_mid_revert(ctx, pod):
+                    pod["outside_namespace"] = pod.pop("being_reverted")
+            elif not pod["outside_namespace"]:
+                await self._forget_mid_revert(ctx, pod)
         shifted = [p for p in pods.values() if p["outside_namespace"]]
         reverting = sorted(p["container"] for p in pods.values() if p.get("being_reverted"))
         if shifted:
@@ -224,16 +228,27 @@ class RentedPodOwnershipCheck:
         return self._event(ctx, template, what)
 
     async def _first_sight_of_mid_revert(self, ctx: Context, pod: dict) -> bool:
-        """True the first cycle a pod shows the hand-back shape on this init pid, remembering it; False when an earlier
-        cycle saw the same pid like this, or when Redis cannot say (then the shape is reported, not hidden)."""
+        """True the first read of this container showing the hand-back shape since its last clean read, remembering
+        it; False on any later read (whatever the init pid), or when Redis cannot say (then the shape is reported,
+        not hidden). The TTL only ends marks of containers never read again; each sight renews it."""
         key = f"{MID_REVERT_KEY_PREFIX}:{ctx.executor.uuid}:{pod['container']}"
         try:
-            if await ctx.services.redis.get(key) in (str(pod["pid"]), str(pod["pid"]).encode()):
-                return False
-            await ctx.services.redis.set(key, str(pod["pid"]), ex=MID_REVERT_TTL_SECONDS)
+            seen = await ctx.services.redis.get(key) is not None
+            # a dry run shares Redis with the live validator: it reads the mark, never sets one
+            if not settings.DRY_RUN:
+                await ctx.services.redis.set(key, "1", ex=MID_REVERT_TTL_SECONDS)
         except (redis.exceptions.RedisError, OSError):
             return False
-        return True
+        return not seen
+
+    async def _forget_mid_revert(self, ctx: Context, pod: dict) -> None:
+        # a clean read ends the stop the mark stood for, so the next hand-back is a new stop
+        if settings.DRY_RUN:
+            return
+        try:
+            await ctx.services.redis.delete(f"{MID_REVERT_KEY_PREFIX}:{ctx.executor.uuid}:{pod['container']}")
+        except (redis.exceptions.RedisError, OSError):
+            pass  # a mark left behind reads the next hand-back as SHIFTED: reported, never hidden
 
     async def _shift_template(self, ctx: Context, shifted: list[dict]):
         """A container restarted long after the host booted was not brought back by a host reboot: say so,

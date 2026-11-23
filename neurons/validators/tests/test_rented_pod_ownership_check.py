@@ -7,6 +7,7 @@ import subprocess
 from types import SimpleNamespace
 
 import pytest
+from neurons.validators.src.services.task.checks import rented_pod_ownership
 from neurons.validators.src.services.task.checks.rented_pod_ownership import (
     PATHS,
     RentedPodOwnershipCheck,
@@ -571,12 +572,60 @@ async def test_the_hand_back_shape_still_there_next_cycle_on_the_same_pod_is_shi
     assert pod["outside_namespace"] == ["/", "/usr", "/usr/lib"]
 
 
+def _clean_ssh(pid: int = 4242):
+    async def run(cmd, check=False):
+        if cmd.startswith("/usr/bin/docker inspect"):
+            return SimpleNamespace(exit_status=0, stdout=f"/pod_1 {pid}\n/pod_2 4343\n", stderr="")
+        if cmd.startswith("for p in"):
+            lines = f"{pid}|0 231072 65536|231072|231072\n4343|0 231072 65536|231072|231072\n"
+            return SimpleNamespace(exit_status=0, stdout=lines, stderr="")
+        return SimpleNamespace(exit_status=0, stdout="", stderr="")
+
+    return SimpleNamespace(run=run)
+
+
+async def _reasons(context_factory, services, ssh_list):
+    return [
+        (await RentedPodOwnershipCheck().run(_ctx(context_factory, ssh, services=services))).event.reason_code
+        for ssh in ssh_list
+    ]
+
+
 @pytest.mark.asyncio
-async def test_a_new_init_pid_with_the_hand_back_shape_is_a_new_stop(context_factory):
+async def test_a_pod_back_on_a_new_init_pid_still_in_the_hand_back_shape_is_shifted(context_factory):
+    # r284 P2-A: a pod started again into the shape has finished its stop, so the shape lasts (a restart does not
+    # repair it); a provider restarting the pod every cycle, or a pod crash-looping on its broken sudo, gets no unread
+    reasons = await _reasons(context_factory, build_services(), [_mid_revert_ssh(4242 + i) for i in range(4)])
+    assert reasons == [Msg.UNREAD.reason] + [Msg.SHIFTED.reason] * 3
+
+
+@pytest.mark.asyncio
+async def test_a_clean_read_ends_the_stop_so_a_later_hand_back_is_a_new_stop(context_factory):
+    # r284 P3: the mark goes with a clean read, so a second honest stop (the pid may even be reused) reads unread again
     services = build_services()
-    await RentedPodOwnershipCheck().run(_ctx(context_factory, _mid_revert_ssh(4242), services=services))
-    result = await RentedPodOwnershipCheck().run(_ctx(context_factory, _mid_revert_ssh(5252), services=services))
-    assert result.event.reason_code == Msg.UNREAD.reason
+    reasons = await _reasons(
+        context_factory, services, [_mid_revert_ssh(4242), _clean_ssh(4242), _mid_revert_ssh(4242)]
+    )
+    assert reasons == [Msg.UNREAD.reason, Msg.OK.reason, Msg.UNREAD.reason]
+
+
+@pytest.mark.asyncio
+async def test_a_dry_run_reads_the_mark_but_never_writes_it(context_factory, monkeypatch):
+    # r284 P2-B: the dry-run validator shares Redis with the live one, so its read must not turn live's first sight of
+    # an honest stop into a second one
+    services = build_services()
+    monkeypatch.setattr(rented_pod_ownership.settings, "DRY_RUN", True)
+    dry = await _reasons(context_factory, services, [_mid_revert_ssh(), _mid_revert_ssh(), _clean_ssh()])
+    assert dry == [Msg.UNREAD.reason, Msg.UNREAD.reason, Msg.OK.reason]
+    assert services.redis.store == {}
+    monkeypatch.setattr(rented_pod_ownership.settings, "DRY_RUN", False)
+    assert await _reasons(context_factory, services, [_mid_revert_ssh()]) == [Msg.UNREAD.reason]
+    # a live mark the dry run sees is read, and the dry run leaves it in place
+    monkeypatch.setattr(rented_pod_ownership.settings, "DRY_RUN", True)
+    assert await _reasons(context_factory, services, [_mid_revert_ssh(), _clean_ssh()]) == [
+        Msg.SHIFTED.reason, Msg.OK.reason
+    ]
+    assert len(services.redis.store) == 1
 
 
 @pytest.mark.asyncio
