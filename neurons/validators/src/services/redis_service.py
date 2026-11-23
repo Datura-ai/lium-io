@@ -96,8 +96,6 @@ HALF_STARTED_STOP_INDEX_PREFIX = "half_started_stop_index:"
 # the executor uuids whose index above holds a record: written and dropped with the record, so one read a cycle tells
 # every node check whether it has a pending stop, instead of one index read per node in the cycle's Redis burst
 HALF_STARTED_STOP_EXECUTORS_KEY = "half_started_stop_executors"
-# set once every index written before the set existed has been added to it; until then each node reads its own index
-HALF_STARTED_STOP_EXECUTORS_BACKFILLED_KEY = "half_started_stop_executors_backfilled"
 # DAH-5904: "<executor uuid>:<filler container name>" while the cycle snapshot lists that filler on that node
 RECENT_FILLER_PREFIX = "recent_filler:"
 # a filler stopped for a customer rent leaves the snapshot at once but stays on the host until its delete lands:
@@ -996,25 +994,21 @@ class RedisService:
                 except redis.exceptions.WatchError:
                     continue
 
-    async def half_started_stop_executors(self) -> frozenset[str] | None:
-        """The executors with a pending half-started stop, in one round trip; None until the set is backfilled."""
-        async with self.redis.pipeline(transaction=False) as pipe:
-            pipe.exists(HALF_STARTED_STOP_EXECUTORS_BACKFILLED_KEY)
-            pipe.smembers(HALF_STARTED_STOP_EXECUTORS_KEY)
-            backfilled, members = await pipe.execute()
-        if not backfilled:
-            return None
+    async def half_started_stop_executors(self) -> frozenset[str]:
+        """The executors with a pending half-started stop, in one round trip; complete only once this process has run
+        backfill_half_started_stop_executors."""
+        members = await self.redis.smembers(HALF_STARTED_STOP_EXECUTORS_KEY)
         return frozenset(m.decode() if isinstance(m, bytes) else m for m in members)
 
     async def backfill_half_started_stop_executors(self) -> None:
         """Adds every executor whose index holds a record to the pending set (records written before the set
-        existed), then marks the set complete. Idempotent: an entry for an index emptied meanwhile only costs that
-        node one index read, which drops it."""
+        existed or by an earlier release run since, e.g. a rollback). Run once per process, no stored marker: a marker
+        would outlive a rollback whose release writes records without set entries. Idempotent: an entry for an index
+        emptied meanwhile only costs that node one index read, which drops it."""
         async for key in self.redis.scan_iter(match=f"{HALF_STARTED_STOP_INDEX_PREFIX}*", count=1000):
             key = key.decode() if isinstance(key, bytes) else key
             if await self.redis.hlen(key):
                 await self.redis.sadd(HALF_STARTED_STOP_EXECUTORS_KEY, key.removeprefix(HALF_STARTED_STOP_INDEX_PREFIX))
-        await self.redis.set(HALF_STARTED_STOP_EXECUTORS_BACKFILLED_KEY, "1")
 
     async def write_atomically(self, writes: RedisWrites) -> None:
         """Apply every write in `writes` as one MULTI/EXEC, or none of them.

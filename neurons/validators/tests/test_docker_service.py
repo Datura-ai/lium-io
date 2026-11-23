@@ -360,7 +360,7 @@ def create_mock_port_dict(
 def mock_dependencies():
     """Mock all DockerService dependencies."""
     ssh_service = Mock()
-    redis_service = Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True), delete=AsyncMock(), sadd=AsyncMock(), srem=AsyncMock(), smembers=AsyncMock(return_value=set()), hset=AsyncMock(), hget=AsyncMock(return_value=None), hdel=AsyncMock(), hgetall=AsyncMock(return_value={}), mark_half_started_stop=AsyncMock(), forget_half_started_stop=AsyncMock(), half_started_stop_executors=AsyncMock(return_value=None), backfill_half_started_stop_executors=AsyncMock())
+    redis_service = Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True), delete=AsyncMock(), sadd=AsyncMock(), srem=AsyncMock(), smembers=AsyncMock(return_value=set()), hset=AsyncMock(), hget=AsyncMock(return_value=None), hdel=AsyncMock(), hgetall=AsyncMock(return_value={}), mark_half_started_stop=AsyncMock(), forget_half_started_stop=AsyncMock(), half_started_stop_executors=AsyncMock(return_value=frozenset()), backfill_half_started_stop_executors=AsyncMock())
     attestation_service = Mock()
 
     # Mock the async context manager for Redis lock
@@ -3978,10 +3978,17 @@ async def test_a_confirmed_half_started_stop_leaves_the_nodes_index(docker_servi
     docker_service.redis_service.forget_half_started_stop.assert_awaited_once_with("exec-1", "pod-id:cid")
 
 
-@pytest.fixture
-def fresh_pending_set_state(monkeypatch):
-    monkeypatch.setattr(docker_service_module, "_HALF_STARTED_STOP_EXECUTORS_READS", {})
-    monkeypatch.setattr(docker_service_module, "_HALF_STARTED_STOP_BACKFILL", None)
+@pytest.fixture(autouse=True)
+def fresh_pending_set_state():
+    # a fresh validator process: nothing read, not backfilled (no monkeypatch: it would tear down after the loop)
+    docker_service_module._HALF_STARTED_STOP_EXECUTORS_READS = {}
+    docker_service_module._HALF_STARTED_STOP_BACKFILL = None
+
+
+def _backfilled(monkeypatch):
+    done = asyncio.get_running_loop().create_future()
+    done.set_result(None)
+    monkeypatch.setattr(docker_service_module, "_HALF_STARTED_STOP_BACKFILL", done)
 
 
 def _fake_redis_service() -> RedisService:
@@ -4003,8 +4010,9 @@ async def _retry_cycle(docker_service, uuids, job_batch_id="batch-1"):
 
 @pytest.mark.asyncio
 async def test_one_cycle_reads_the_pending_set_once_and_only_flagged_nodes_read_their_index(
-    docker_service, fresh_pending_set_state
+    docker_service, fresh_pending_set_state, monkeypatch
 ):
+    _backfilled(monkeypatch)
     # the per-node index read at the cycle's Redis burst timed out on ~10% of nodes every cycle (19 Nov)
     redis_service = docker_service.redis_service
     redis_service.half_started_stop_executors = AsyncMock(return_value=frozenset({"exec-7"}))
@@ -4047,7 +4055,8 @@ async def test_before_the_backfill_every_node_reads_its_own_index_and_the_backfi
 
 
 @pytest.mark.asyncio
-async def test_a_failed_pending_set_read_is_not_kept_for_the_cycle(docker_service, fresh_pending_set_state):
+async def test_a_failed_pending_set_read_is_not_kept_for_the_cycle(docker_service, fresh_pending_set_state, monkeypatch):
+    _backfilled(monkeypatch)
     redis_service = docker_service.redis_service
     redis_service.half_started_stop_executors = AsyncMock(side_effect=[ConnectionError("down"), frozenset()])
 
@@ -4061,8 +4070,9 @@ async def test_a_failed_pending_set_read_is_not_kept_for_the_cycle(docker_servic
 
 @pytest.mark.asyncio
 async def test_a_stale_pending_set_entry_is_dropped_by_the_node_that_finds_its_index_empty(
-    docker_service, fresh_pending_set_state
+    docker_service, fresh_pending_set_state, monkeypatch
 ):
+    _backfilled(monkeypatch)
     redis_service = docker_service.redis_service
     redis_service.half_started_stop_executors = AsyncMock(return_value=frozenset({"exec-1"}))
     redis_service.hgetall = AsyncMock(return_value={})
@@ -4118,6 +4128,36 @@ async def test_a_record_written_before_the_pending_set_existed_is_backfilled_and
         "exec-old",
         "exec-old",
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_record_written_by_a_rolled_back_release_after_a_backfill_is_retried_when_this_release_returns(
+    docker_service, monkeypatch
+):
+    service = _fake_redis_service()
+    docker_service.redis_service = service
+    docker_service.retry_half_started_stop = AsyncMock(return_value=False)
+    # this release ran and backfilled the (empty) set
+    await _retry_cycle(docker_service, ["exec-1"])
+    await docker_service_module._HALF_STARTED_STOP_BACKFILL
+
+    # rolled back: the earlier release records a stop in the index only, no set entry
+    await service.redis.hset("half_started_stop_index:exec-1", "pod-b:cid-b", "{}")
+
+    # this release runs again (a new process): the record is retried, before and after its backfill
+    monkeypatch.setattr(docker_service_module, "_HALF_STARTED_STOP_EXECUTORS_READS", {})
+    monkeypatch.setattr(docker_service_module, "_HALF_STARTED_STOP_BACKFILL", None)
+    def retried():
+        return [
+            (c.kwargs["executor_info"].uuid, c.kwargs["pod_id"], c.kwargs["container_id"])
+            for c in docker_service.retry_half_started_stop.await_args_list
+        ]
+
+    await _retry_cycle(docker_service, ["exec-1"], job_batch_id="batch-2")
+    assert retried() == [("exec-1", "pod-b", "cid-b")]
+    await docker_service_module._HALF_STARTED_STOP_BACKFILL
+    await _retry_cycle(docker_service, ["exec-1", "exec-2"], job_batch_id="batch-3")
+    assert retried() == [("exec-1", "pod-b", "cid-b")] * 2
 
 
 @pytest.mark.parametrize(

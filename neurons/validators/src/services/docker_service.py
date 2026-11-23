@@ -3001,7 +3001,8 @@ def _half_started_stop_slot(executor_info: ExecutorSSHInfo, pod_id: str) -> str:
 # wave and the express lane's runs overlap)
 _HALF_STARTED_STOP_EXECUTORS_READS: dict[str, asyncio.Future] = {}
 _HALF_STARTED_STOP_EXECUTORS_READS_KEPT = 4
-# the one backfill of the pending set from the indexes written before it existed; redone only after a failure
+# this process's one backfill of the pending set from the indexes (records an earlier release wrote without a set
+# entry); redone only after a failure
 _HALF_STARTED_STOP_BACKFILL: asyncio.Future | None = None
 
 
@@ -13511,7 +13512,17 @@ class DockerService:
 
     async def _half_started_stop_executors(self, job_batch_id: str | None) -> frozenset[str] | None:
         """The executors with a pending half-started stop, read once per cycle (job_batch_id) for all of its node
-        checks; None (every node reads its own index) until the set is backfilled, which this starts."""
+        checks; None (every node reads its own index) until this process has backfilled the set, which this starts.
+        Per process, not a stored marker: a record an earlier release wrote (no set entry) before this process started,
+        rollback included, is in the set before the set is trusted."""
+        global _HALF_STARTED_STOP_BACKFILL
+        backfill = _HALF_STARTED_STOP_BACKFILL
+        if backfill is None or (backfill.done() and (backfill.cancelled() or backfill.exception() is not None)):
+            backfill = _HALF_STARTED_STOP_BACKFILL = asyncio.ensure_future(
+                self.redis_service.backfill_half_started_stop_executors()
+            )
+        if not backfill.done():
+            return None
         read = _HALF_STARTED_STOP_EXECUTORS_READS.get(job_batch_id) if job_batch_id else None
         if read is None:
             read = asyncio.ensure_future(
@@ -13533,16 +13544,7 @@ class DockerService:
 
                 read.add_done_callback(drop_failed)
         # shielded: one node check's deadline does not cancel the read the cycle's other checks share
-        flagged = await asyncio.shield(read)
-        if flagged is None:
-            global _HALF_STARTED_STOP_BACKFILL
-            if _HALF_STARTED_STOP_BACKFILL is None or (
-                _HALF_STARTED_STOP_BACKFILL.done() and _HALF_STARTED_STOP_BACKFILL.exception() is not None
-            ):
-                _HALF_STARTED_STOP_BACKFILL = asyncio.ensure_future(
-                    self.redis_service.backfill_half_started_stop_executors()
-                )
-        return flagged
+        return await asyncio.shield(read)
 
     async def retry_pending_half_started_stops(
         self, *, executor_info: ExecutorSSHInfo, private_key: str | None, default_extra: dict[str, Any]
