@@ -612,6 +612,9 @@ NOT_COMPARABLE_SPEC_PATHS = frozenset(
         "host_memory.outside_workloads_no_cache_kb",
         "host_memory.mapped_kb",
         "host_memory.mapped_outside_workloads_kb",
+        "egress_ip",
+        "infiniband_ports",
+        "needrestart_guard_reason",
     }
 )
 LIVE_GPU_DETAIL_FIELDS = frozenset(
@@ -630,8 +633,8 @@ LIVE_GPU_DETAIL_FIELDS = frozenset(
 )
 
 
-def _is_not_comparable(path: str) -> bool:
-    if path in NOT_COMPARABLE_SPEC_PATHS:
+def _is_not_comparable(path: str, extra: frozenset[str] = frozenset()) -> bool:
+    if path in extra or path in NOT_COMPARABLE_SPEC_PATHS:
         return True
     if path in {"hard_disk.by_container", "hard_disk.by_volume"}:
         return True
@@ -645,9 +648,19 @@ def _is_not_comparable(path: str) -> bool:
     return leaf in LIVE_GPU_DETAIL_FIELDS and parent.startswith("gpu.details[")
 
 
-def _spec_diffs(python: Any, liumd: Any, path: str = "") -> list[dict[str, Any]]:
+def _spec_diffs(
+    python: Any, liumd: Any, path: str = "", extra: frozenset[str] = frozenset()
+) -> list[dict[str, Any]]:
     """Every differing leaf in the two normalized specs documents, capped for logging."""
-    if path and _is_not_comparable(path):
+    if path and _is_not_comparable(path, extra):
+        return []
+    if (
+        path.endswith("_scrape_error")
+        and isinstance(python, str)
+        and isinstance(liumd, str)
+        and python
+        and liumd
+    ):
         return []
     diffs: list[dict[str, Any]] = []
     if type(python) is not type(liumd) and not (
@@ -657,7 +670,7 @@ def _spec_diffs(python: Any, liumd: Any, path: str = "") -> list[dict[str, Any]]
     if isinstance(python, dict):
         for key in sorted(set(python) | set(liumd)):
             child = f"{path}.{key}" if path else key
-            if _is_not_comparable(child):
+            if _is_not_comparable(child, extra):
                 continue
             if key not in python or key not in liumd:
                 diffs.append(
@@ -668,13 +681,13 @@ def _spec_diffs(python: Any, liumd: Any, path: str = "") -> list[dict[str, Any]]
                     }
                 )
             else:
-                diffs.extend(_spec_diffs(python[key], liumd[key], child))
+                diffs.extend(_spec_diffs(python[key], liumd[key], child, extra))
     elif isinstance(python, list):
         if len(python) != len(liumd):
             diffs.append({"path": path or "$", "python": len(python), "liumd": len(liumd)})
         else:
             for i, (a, b) in enumerate(zip(python, liumd)):
-                diffs.extend(_spec_diffs(a, b, f"{path}[{i}]"))
+                diffs.extend(_spec_diffs(a, b, f"{path}[{i}]", extra))
     elif python != liumd:
         diffs.append({"path": path or "$", "python": repr(python)[:120], "liumd": repr(liumd)[:120]})
     return diffs[:DETAIL_MAX_CHARS]
@@ -727,8 +740,20 @@ def _facts(ctx: Context, answer: LocalVerifyAnswer) -> dict[str, Any]:
     raw_specs = answer.specs
     liumd_specs = normalize_liumd_specs(raw_specs) if isinstance(raw_specs, dict) and raw_specs else {}
     python_specs = ctx.state.scrape_specs
+    extra: set[str] = set()
+    if isinstance(python_specs, dict):
+        reason = python_specs.get("needrestart_guard_reason")
+        if isinstance(reason, str) and reason:
+            extra.update({"needrestart_guard", "needrestart_guard_unguarded"})
+        for value_key, error_key in (
+            ("storage_limit_supported", "storage_limit_scrape_error"),
+            ("sysbox_runtime", "sysbox_runtime_scrape_error"),
+        ):
+            error = python_specs.get(error_key)
+            if isinstance(error, str) and "timed out" in error.lower():
+                extra.update({value_key, error_key})
     compared = python_specs is not None and bool(liumd_specs)
-    diffs = _spec_diffs(python_specs, liumd_specs) if compared else []
+    diffs = _spec_diffs(python_specs, liumd_specs, extra=frozenset(extra)) if compared else []
     return {
         "agree": all(c["agree"] for c in checks) if checks else None,
         "checks": checks,

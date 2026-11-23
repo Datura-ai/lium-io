@@ -504,6 +504,42 @@ async def test_a_stable_host_memory_value_is_still_compared(
 
 
 @pytest.mark.asyncio
+async def test_live_and_python_timeout_fields_are_not_a_specs_difference(
+    keypair, monkeypatch, verifyx_service
+):
+    python_specs = {
+        **PYTHON_SCRAPE,
+        "egress_ip": "1.1.1.1",
+        "infiniband_ports": [{"state": "active"}],
+        "needrestart_guard": "missing",
+        "needrestart_guard_unguarded": ["sysbox.service"],
+        "needrestart_guard_reason": "a later conf file runs code",
+        "storage_limit_supported": False,
+        "storage_limit_scrape_error": "Test command timed out.",
+        "sysbox_runtime": False,
+        "sysbox_runtime_scrape_error": "Test command timed out.",
+        "interconnect_scrape_error": '"parse: IndexError"',
+    }
+    liumd_specs = {
+        **LIUMD_SCRAPE,
+        "egress_ip": "2.2.2.2",
+        "infiniband_ports": [{"state": "down"}],
+        "needrestart_guard": "present",
+        "needrestart_guard_unguarded": [],
+        "storage_limit_supported": True,
+        "sysbox_runtime": True,
+        "interconnect_scrape_error": "NVMLError(999)",
+    }
+    state = build_state(specs=SPECS, scrape_specs=python_specs)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=liumd_specs))
+
+    assert record["specs_agree"] is True
+    assert record["specs_diff"] == []
+
+
+@pytest.mark.asyncio
 async def test_specs_agree_is_none_without_the_python_snapshot(
     keypair, monkeypatch, verifyx_service
 ):
