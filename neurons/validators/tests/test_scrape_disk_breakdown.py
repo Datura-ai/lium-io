@@ -58,7 +58,18 @@ def scrape() -> dict:
     )
 
 
+CONTAINERS_PATH = "/containers/json?all=1&size=1"
+DF_PATH = "/system/df?type=image&type=volume&type=build-cache"
+
+
 def _stub_docker_api(scrape: dict, responses: dict) -> None:
+    # a "/system/df" stub keeps docker's full answer in one place: its Containers are served by the
+    # containers listing the scrape now reads them from, the rest by the typed /system/df call
+    responses = dict(responses)
+    if "/system/df" in responses:
+        df = dict(responses.pop("/system/df"))
+        responses.setdefault(CONTAINERS_PATH, df.pop("Containers", []))
+        responses[DF_PATH] = df
     scrape["docker_api_get"] = lambda path: responses[path]
 
 
@@ -151,6 +162,52 @@ def test_docker_disk_usage_reports_each_pods_share(scrape: dict, monkeypatch) ->
     assert usage["hard_disk_by_volume"] == {"volume_pod1": 2048 * 512 // 1024, dind_volume: 10}
     assert usage["hard_disk_containers"] == 5
     assert usage["hard_disk_volumes"] == (10240 + 2048 * 512) // 1024
+
+
+
+def test_pod_sizes_survive_a_failed_system_df(scrape: dict, monkeypatch) -> None:
+    # Arrange — the one slow /system/df walk times out on a busy rented node; the pod's writable layer
+    # and its vloopback /root volume are read without it, so its backup still knows its size
+    blocks_by_path = {"/proc/1/root/var/lib/docker/vloopback-v2/volume_pod1": 2048}
+    monkeypatch.setitem(scrape, "glob", type("_Glob", (), {"glob": staticmethod(lambda pattern: [])}))
+    monkeypatch.setitem(
+        scrape,
+        "os",
+        type(
+            "_Os",
+            (),
+            {
+                "path": type("_Path", (), {"join": staticmethod(os.path.join), "isdir": staticmethod(lambda path: True)}),
+                "stat": staticmethod(lambda path: type("_Stat", (), {"st_blocks": blocks_by_path[path]})),
+            },
+        ),
+    )
+    responses = {
+        CONTAINERS_PATH: [
+            {"Names": ["/container_pod1"], "SizeRw": 4096, "Mounts": [{"Type": "volume", "Name": "volume_pod1"}]},
+            # a dind pod whose anonymous local volume only /system/df sizes: unknown, not undercounted
+            {"Names": ["/container_dind"], "SizeRw": 1024, "Mounts": [{"Type": "volume", "Name": "ab" * 32}]},
+        ],
+        "/info": {"DockerRootDir": "/var/lib/docker"},
+        "/volumes": {"Volumes": [{"Name": "volume_pod1", "Driver": "vloopback-v2"}]},
+    }
+
+    def docker_api_get(path):
+        if path.startswith("/system/df"):
+            raise TimeoutError("timed out")
+        return responses[path]
+
+    scrape["docker_api_get"] = docker_api_get
+
+    # Act
+    usage = scrape["get_docker_disk_usage"]()
+
+    # Assert
+    assert usage == {
+        "hard_disk_by_container": {"container_pod1": 4},
+        "hard_disk_by_volume": {"volume_pod1": 2048 * 512 // 1024},
+        "docker_df_error": "TimeoutError('timed out')",
+    }
 
 
 GIB = 1024**3

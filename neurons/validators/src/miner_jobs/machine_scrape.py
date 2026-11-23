@@ -1422,26 +1422,33 @@ def cache_volume_bytes(df, prefixes):
 
 
 def get_docker_disk_usage():
-    # what actually filled the disk, split by kind, in kB to match the other hard_disk fields
-    df = docker_api_get("/system/df")
-    containers = sum(
-        max(int(container.get("SizeRw") or 0), 0) for container in df.get("Containers") or []
-    )
-    volumes = sum(
-        max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
-        for volume in df.get("Volumes") or []
-    )
+    # what actually filled the disk, split by kind, in kB to match the other hard_disk fields.
+    # Each pod's own sizes are read without /system/df: that one call walks every image and local volume and
+    # times out on busy rented nodes, and a miss there dropped every pod's size (pod backups failed SIZE_UNKNOWN).
+    # Without it only the image, local-volume and aggregate fields go; its reason comes back under docker_df_error.
     docker_root_dir = (docker_api_get("/info") or {}).get("DockerRootDir") or "/var/lib/docker"
+    # writable layer per container (all: a stopped pod keeps its disk); docker walks only the containers' own layers
+    container_list = docker_api_get("/containers/json?all=1&size=1") or []
+    try:
+        # images, local volumes and build cache only: the containers are read above
+        df = docker_api_get("/system/df?type=image&type=volume&type=build-cache")
+        df_error = None
+    except Exception as exc:
+        df = None
+        df_error = repr(exc)
+    df_volumes = (df or {}).get("Volumes") or []
+    containers = sum(max(int(container.get("SizeRw") or 0), 0) for container in container_list)
+    volumes = sum(max(int((volume.get("UsageData") or {}).get("Size") or 0), 0) for volume in df_volumes)
     # A filler's own run volume is preallocated to its full size, but any rental removes the filler
     # and its volume first (a paying pod never shares the node with one), so it reads as free disk:
     # renters were shown half of an idle node's disk. DAH-5260: so does the Engy checkpoint cache
     # (1561 GB on an 8x B300), which a customer create removes when the renter needs the space.
     # The Dolphin cache (~40 GB) stays used.
-    engy_cache = cache_volume_bytes(df, ENGY_CACHE_VOLUME_PREFIX)
+    engy_cache = cache_volume_bytes(df or {}, ENGY_CACHE_VOLUME_PREFIX)
     filler_run_volumes = get_vloopback_volume_bytes(docker_root_dir, True)
     by_volume = {
         str(volume.get("Name")): max(int((volume.get("UsageData") or {}).get("Size") or 0), 0)
-        for volume in df.get("Volumes") or []
+        for volume in df_volumes
         if volume.get("Name")
     }
     volumes += get_vloopback_volume_bytes(docker_root_dir, False, by_volume) - filler_run_volumes
@@ -1449,36 +1456,42 @@ def get_docker_disk_usage():
     volumes += get_dmcrypt_volume_bytes(docker_root_dir, by_volume)
     containers += get_container_log_bytes(docker_root_dir)
 
-    # BuildCache rides in the same answer and holds image layers a custom build left behind.
-    # Folded into images: unenumerated docker bytes read as the provider's own data downstream.
-    build_cache = sum(
-        max(int(record.get("Size") or 0), 0) for record in df.get("BuildCache") or []
-    )
-
     # DAH-5059: each pod's own share, so the pod page can show used against its limits: the writable
     # layer per container name, plus the anonymous volumes it mounts (a dind image's VOLUME
     # /var/lib/docker has no name the backend knows); named volumes stand alone under their name.
+    # A container with an anonymous volume nobody sized (no /system/df) is left out: unknown, never undercounted.
     by_container = {}
-    for container in df.get("Containers") or []:
+    for container in container_list:
         name = str((container.get("Names") or [""])[0]).lstrip("/")
-        if not name:
-            continue
-        by_container[name] = max(int(container.get("SizeRw") or 0), 0) + sum(
-            by_volume.get(str(mount.get("Name")), 0)
+        anonymous = [
+            str(mount.get("Name"))
             for mount in container.get("Mounts") or []
             if mount.get("Type") == "volume" and re.fullmatch(r"[0-9a-f]{64}", str(mount.get("Name")))
-        )
+        ]
+        if not name or any(volume_name not in by_volume for volume_name in anonymous):
+            continue
+        by_container[name] = max(int(container.get("SizeRw") or 0), 0) + sum(by_volume[v] for v in anonymous)
 
-    return {
+    usage = {
+        "hard_disk_by_container": {name: size // 1024 for name, size in by_container.items()},
+        "hard_disk_by_volume": {name: size // 1024 for name, size in by_volume.items()},
+    }
+    if df is None:
+        # popped by the caller into hard_disk_docker_scrape_error; the aggregates below would under-report
+        usage["docker_df_error"] = df_error
+        return usage
+    # BuildCache holds image layers a custom build left behind. Folded into images: unenumerated docker
+    # bytes read as the provider's own data downstream.
+    build_cache = sum(max(int(record.get("Size") or 0), 0) for record in df.get("BuildCache") or [])
+    usage.update({
         "hard_disk_images": (int(df.get("LayersSize") or 0) + build_cache) // 1024,
         "hard_disk_containers": containers // 1024,
         "hard_disk_volumes": volumes // 1024,
         "filler_released_kb": (filler_run_volumes + engy_cache) // 1024,
         # DAH-5045: how far the Engy checkpoint download has got, in GB (10**9 bytes)
         "hard_disk_engy_cache_used_gb": engy_cache // 10**9,
-        "hard_disk_by_container": {name: size // 1024 for name, size in by_container.items()},
-        "hard_disk_by_volume": {name: size // 1024 for name, size in by_volume.items()},
-    }
+    })
+    return usage
 
 
 def release_filler_cache(hard_disk):
@@ -3117,6 +3130,10 @@ def get_machine_specs():
 
     try:
         data["data_hard_disk"].update(get_docker_disk_usage())
+        df_error = data["data_hard_disk"].pop("docker_df_error", None)
+        if df_error:
+            # the per-pod sizes above stand; only the /system/df aggregates are missing
+            data["hard_disk_docker_scrape_error"] = df_error
         release_filler_cache(data["data_hard_disk"])
     except Exception as exc:
         # kept apart from hard_disk_scrape_error: the docker socket is the fragile half, and a
