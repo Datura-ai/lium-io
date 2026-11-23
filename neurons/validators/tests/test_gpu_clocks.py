@@ -283,9 +283,9 @@ async def test_a_create_resets_application_and_memory_clocks_after_the_graphics_
         + " ) &"
         for u in (U[0], U[1])
     ) + " wait"
-    assert app_mem == f"-k 5 {APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS} sh -c '{resets}'"
+    assert app_mem == f"-s KILL {APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS} sh -c '{resets}'"
     # the runner waits past both budgets, so a stalled -rac/-rmc is killed on the host before the call is given up
-    assert host.timeouts[0] > 30 + APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS + 5
+    assert host.timeouts[0] > 30 + APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS
 
 
 @pytest.mark.asyncio
@@ -309,17 +309,20 @@ async def test_application_and_memory_clock_resets_of_an_8_gpu_node_run_in_paral
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ignores_term", [False, True])
 async def test_a_stalled_application_or_memory_reset_is_killed_on_the_host_and_the_rgc_lines_still_come_back(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, ignores_term
 ):
     """Review (lio#2309): in one SSH call a hung -rac/-rmc must not hold the -rgc results. Run for real: an
     nvidia-smi that never returns is killed by the batch's host-side timeout, the -rgc lines already printed come
-    back, and the call ends near that timeout."""
+    back, and the call ends near that timeout. Review (lio#2362): one that ignores TERM is killed too, so it never
+    changes clocks after the handoff (it would touch the marker 3 s in)."""
+    marker = tmp_path / "still-running"
     fake = tmp_path / "nvidia-smi"
-    fake.write_text("#!/bin/sh\nsleep 60\n")
+    trap = 'trap "" TERM\n' if ignores_term else ""
+    fake.write_text(f"#!/bin/sh\n{trap}sleep 3\ntouch {marker}\n")
     fake.chmod(0o755)
     monkeypatch.setattr(gpu_clocks, "APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS", 1)
-    monkeypatch.setattr(gpu_clocks, "_APP_MEM_KILL_AFTER_SECONDS", 1)
     cmd = f"echo {U[0]} 0; echo {U[1]} 0; {gpu_clocks._reset_app_and_memory_clocks([U[0], U[1]])}"
     t0 = time.monotonic()
     proc = await asyncio.create_subprocess_shell(
@@ -328,7 +331,9 @@ async def test_a_stalled_application_or_memory_reset_is_killed_on_the_host_and_t
     out, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
     elapsed = time.monotonic() - t0
     assert out.decode().split("\n")[:2] == [f"{U[0]} 0", f"{U[1]} 0"]
-    assert elapsed < 5, f"{elapsed:.1f} s: the stalled reset was not killed on the host"
+    assert elapsed < 2.5, f"{elapsed:.1f} s: the stalled reset was not killed on the host"
+    await asyncio.sleep(4 - elapsed)
+    assert not marker.exists(), "an nvidia-smi outlived the call"
 
 
 @pytest.mark.asyncio

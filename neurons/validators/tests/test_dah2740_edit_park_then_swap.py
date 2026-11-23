@@ -226,7 +226,7 @@ async def test_a_successful_edit_runs_the_same_host_commands(svc, monkeypatch):
         " --format=csv,noheader,nounits",
         # DAH-4663: the clock-lock safety net resets the pod's GPUs, inside the failed-create cleanup, before docker run
         # then, in the same call under its own timeout: application and memory clocks back to default
-        "nvidia-smi -i GPU-test -rgc >/dev/null 2>&1; echo GPU-test $?; timeout -k 5 30 sh -c "
+        "nvidia-smi -i GPU-test -rgc >/dev/null 2>&1; echo GPU-test $?; timeout -s KILL 30 sh -c "
         "'( nvidia-smi -i GPU-test -rac >/dev/null 2>&1; echo GPU-test -rac $?; "
         "nvidia-smi -i GPU-test -rmc >/dev/null 2>&1; echo GPU-test -rmc $? ) & wait'",
         host_key,

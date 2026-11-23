@@ -48,9 +48,8 @@ CLOCK_LOCK_KEY_PREFIX = "gpu_clock_lock:"
 # its own budget, after the -rgc batch in the same call: the host kills a stalled -rac/-rmc, so it never costs the
 # -rgc results (review)
 APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS = 30
-_APP_MEM_KILL_AFTER_SECONDS = 5  # SIGKILL an nvidia-smi ignoring TERM
-# the -rgc batch's budget, then the -rac/-rmc one and its kill, with a margin: the call answers before the runner gives up
-_RESET_CALL_TIMEOUT_SECONDS = _QUERY_TIMEOUT_SECONDS + APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS + 2 * _APP_MEM_KILL_AFTER_SECONDS
+# the -rgc batch's budget, then the -rac/-rmc one, with a margin: the call answers before the runner gives up
+_RESET_CALL_TIMEOUT_SECONDS = _QUERY_TIMEOUT_SECONDS + APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS + 10
 # 3 = "not supported": a GPU without application or memory clock control
 _APP_MEM_RESET_OK_EXITS = {"0", "3"}
 CLOCK_LOCK_POD_KEY_PREFIX = "gpu_clock_lock_pod:"
@@ -124,8 +123,10 @@ def _reset_app_and_memory_clocks(uuids: list[str]) -> str:
     back to default, so a create never hands a renter clocks the host or the last pod lowered. Each GPU's -rac then
     -rmc runs in the background so every GPU resets at once: one after another, the 16 nvidia-smi runs of an 8-GPU
     H200/B300 node outlast the budget and no clock is reset (prod, 18-19 Nov). The batch runs after the -rgc batch in
-    the same SSH call (one round trip on the create's path) under its own host-side timeout, which signals the whole
-    process group, so a stalled reset never costs the -rgc results. Each reset echoes "<uuid> <flag> <exit>"."""
+    the same SSH call (one round trip on the create's path) under its own host-side timeout, which SIGKILLs the whole
+    process group, so a stalled reset never costs the -rgc results and none outlives the call. Not TERM then -k: the
+    batch's shell dies on TERM, timeout then returns without the KILL, and an nvidia-smi ignoring TERM keeps changing
+    clocks after the handoff (review). Each reset echoes "<uuid> <flag> <exit>"."""
     resets = " ".join(
         "( "
         + "; ".join(f"nvidia-smi -i {shlex.quote(u)} {flag} >/dev/null 2>&1; echo {shlex.quote(u)} {flag} $?"
@@ -133,7 +134,7 @@ def _reset_app_and_memory_clocks(uuids: list[str]) -> str:
         + " ) &"
         for u in uuids
     ) + " wait"
-    return f"timeout -k {_APP_MEM_KILL_AFTER_SECONDS} {APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS} sh -c {shlex.quote(resets)}"
+    return f"timeout -s KILL {APP_MEM_CLOCK_RESET_TIMEOUT_SECONDS} sh -c {shlex.quote(resets)}"
 
 
 def _log_app_and_memory_resets(lines: list[list[str]], uuids: list[str]) -> None:
