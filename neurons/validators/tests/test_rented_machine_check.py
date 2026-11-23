@@ -10,7 +10,14 @@ from unittest.mock import AsyncMock, Mock
 
 import asyncssh
 import pytest
-from helpers import FakeRedis, build_context_config, build_services, build_state
+from helpers import (
+    FakeRedis,
+    HeldCleanup,
+    assert_cleanup_outlasts_a_repeat_cancel,
+    build_context_config,
+    build_services,
+    build_state,
+)
 import neurons.validators.src.services.task.checks.rented_machine as rented_machine_module
 from neurons.validators.src.core.docker_utils import DockerCommand, _collect_host_context
 from neurons.validators.src.services.task.checks.rented_machine import (
@@ -2784,3 +2791,28 @@ async def test_egress_guard_runs_only_in_the_rented_halt(context_factory, contai
     assert result.halt is guarded
     assert guard.calls == int(guarded)
     assert [e.reason_code for e in result.extra_events] == (["RENTAL_EGRESS_GUARD_APPLIED"] if guarded else [])
+
+
+@pytest.mark.asyncio
+async def test_a_repeat_cancel_waits_for_the_recovery_create_lock_release():
+    """Review: the pipeline cancels a step again until it ends; the recovery's create-lock release still finishes
+    first, so a renter's create never waits out the lock's TTL."""
+    release = HeldCleanup()
+    lock = Mock(acquire=AsyncMock(return_value=True), release=release.run)
+    ctx = SimpleNamespace(
+        services=SimpleNamespace(redis=_recovery_redis(lock, {})),
+        miner_hotkey="miner-hotkey",
+        executor=SimpleNamespace(uuid="executor-123"),
+    )
+    entered = asyncio.Event()
+
+    async def recover():
+        async with rented_machine_module._no_create_in_flight(ctx, "pod-1", "RUNNING") as acquired:
+            assert acquired
+            entered.set()
+            await asyncio.sleep(3600)
+
+    task = asyncio.ensure_future(recover())
+    await entered.wait()
+
+    await assert_cleanup_outlasts_a_repeat_cancel(task, release)

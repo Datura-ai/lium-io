@@ -303,7 +303,7 @@ class RentalProbeCheck:
                 create_deadline=create_deadline,
             )
         finally:
-            await gate.create_lock.release(ctx)
+            await run_to_end(gate.create_lock.release(ctx))
         # `steps` is the pipeline's own per-check duration summary on the run's last event
         # (summarize_steps); the probe's records need their own key to survive it.
         what = {
@@ -1056,7 +1056,7 @@ async def _step_container_start(
         outcome.inconclusive_reason = "create_container raised"
         return None
     finally:
-        await asyncio.shield(create_lock.release(ctx))
+        await run_to_end(create_lock.release(ctx))
 
     if not isinstance(result, ContainerCreated):
         detail, create_step = _failure_detail(result)

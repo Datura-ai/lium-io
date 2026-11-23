@@ -33,7 +33,14 @@ from neurons.validators.src.services.verifyx_validation_service import (
 )
 from protocol.vc_protocol.compute_requests import NetworkEMA, RentedExecutorsResponse
 
-from tests.helpers import FakeRedis, build_context_config, build_services, build_state
+from tests.helpers import (
+    FakeRedis,
+    HeldCleanup,
+    assert_cleanup_outlasts_a_repeat_cancel,
+    build_context_config,
+    build_services,
+    build_state,
+)
 from tests.test_verifyx_check import MockVerifyXResponse
 
 EXECUTOR = "executor-123"  # tests.helpers.default_executor().uuid
@@ -318,6 +325,30 @@ async def test_an_outer_cancel_during_the_retry_still_cancels_the_task(context_f
     with pytest.raises(asyncio.CancelledError):
         await task
     assert service.kills == 1  # the cut-off remote run is killed on the way out
+
+
+class _HeldKillSequence(_TimedProbeSequence):
+    def __init__(self, *responses, retry_s):
+        super().__init__(*responses, retry_s=retry_s)
+        self.kill = HeldCleanup()
+
+    async def kill_remote_verifyx(self, shell, run_dir, default_extra):
+        await self.kill.run()
+        return await super().kill_remote_verifyx(shell, run_dir, default_extra)
+
+
+@pytest.mark.asyncio
+async def test_a_repeat_cancel_waits_for_the_cut_off_retrys_remote_kill(context_factory, monkeypatch):
+    """Review: the pipeline cancels a stopped step again while it runs; the retry's remote kill must still finish
+    before the step ends and the session closes."""
+    monkeypatch.setattr(verifyx_check, "task_seconds_left", lambda ctx: 900.0)
+    service = _HeldKillSequence(_probe(88.0), _probe(760.0), retry_s=5.0)
+    task = asyncio.create_task(_run(_ctx(context_factory, service, _never_measured())))
+    while service.calls < 2:
+        await asyncio.sleep(0)
+
+    await assert_cleanup_outlasts_a_repeat_cancel(task, service.kill)
+    assert service.kills == 1
 
 
 class _LocalShell:

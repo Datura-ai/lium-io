@@ -39,6 +39,7 @@ from services.redis_service import (
     STOPPED_BY_RECOVERY_STOPPED,
 )
 
+from ..runner import run_to_end
 from ..messages import PortCountMessages, TenantEnforcementMessages as Msg
 from ..messages import render_message
 from ..pipeline import Check, CheckResult, Context
@@ -1095,7 +1096,7 @@ async def _no_create_in_flight(ctx: Context, pod_id: str, pod_status: str | None
     finally:
         if acquired:
             with contextlib.suppress(Exception):  # a release past the TTL: the lock is not held anyway
-                await lock.release()
+                await run_to_end(lock.release())
 
 
 async def _recover_parked_pod_container(

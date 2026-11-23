@@ -2,13 +2,15 @@ import asyncio
 import time
 import uuid
 from datetime import UTC, datetime
-from typing import Awaitable, Optional
+from typing import Awaitable, Optional, TypeVar
 
 import asyncssh
 from pydantic import BaseModel
 
 # error_type when ssh.run returned but the host sent neither an exit status nor an exit signal
 NO_EXIT_STATUS = "no_exit_status"
+
+T = TypeVar("T")
 
 
 class SSHCommandResult(BaseModel):
@@ -176,16 +178,17 @@ async def run_killed_on_cancel(
         raise
 
 
-async def run_to_end(aw: Awaitable) -> None:
-    """Await `aw` (a step's cleanup) to its end through any number of cancels, then re-raise the cancel if one came:
-    the pipeline re-cancels a step until it ends, and the cleanup must still finish before the caller closes the
-    session."""
+async def run_to_end(aw: Awaitable[T]) -> T:
+    """Await `aw` (a step's cleanup) to its end through any number of cancels, then re-raise the cancel if one came,
+    else return its result: the pipeline re-cancels a step until it ends, and every remote kill or cleanup a step runs
+    while cancelled goes through here so it still finishes before the caller closes the session."""
     task = asyncio.ensure_future(aw)
     cancelled = False
     while not task.done():
         try:
-            await asyncio.shield(task)
+            await asyncio.wait({task})
         except asyncio.CancelledError:
             cancelled = True
     if cancelled:
         raise asyncio.CancelledError()
+    return task.result()

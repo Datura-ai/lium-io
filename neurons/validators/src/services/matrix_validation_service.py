@@ -442,10 +442,12 @@ class ValidationService:
         try:
             per_card = await self._run_cards(ssh_client, executor_info, script_path, challenges, card_uuids)
         except asyncio.CancelledError:
+            from services.task.runner import run_to_end  # services.task imports this module
+
             # the cycle's deadline or the fast path cancelled us: the remote matmuls keep the cards
-            # busy into the next run, so kill them (shielded: a second cancel must not stop the kill)
+            # busy into the next run, so kill them (to its end: a repeat cancel must not stop the kill)
             # and stay cancelled, as the single-card run does
-            await asyncio.shield(
+            await run_to_end(
                 self._kill_remote_matmul(ssh_client, script_path, {**default_extra, "cancelled": "all_cards"})
             )
             raise
@@ -516,11 +518,13 @@ class ValidationService:
                 *(run_gated(index, challenge) for index, challenge in enumerate(challenges))
             )
         except asyncio.CancelledError:
+            from services.task.runner import run_to_end  # services.task imports this module
+
             # a rent cancelled the recheck: one kill for every started card over ONE session, since the
             # still-running card sessions hold the rest of sshd's MaxSessions (a kill per card is refused)
             if kills:
                 try:
-                    await asyncio.shield(ssh_client.run("; ".join(kills), timeout=10))
+                    await run_to_end(ssh_client.run("; ".join(kills), timeout=10))
                 except Exception:  # noqa: BLE001 — the cancel goes on whether the kill landed or not
                     pass
             raise
@@ -924,10 +928,12 @@ class ValidationService:
                     timed_out=True,
                 )
             except asyncio.CancelledError:
+                from services.task.runner import run_to_end  # services.task imports this module
+
                 # DAH-4366: the fast path cancels this lane when the host lane fails first. The
                 # remote matmul would keep the GPU busy into the next cycle's retry, so kill it
-                # (shielded, a second cancel must not stop the kill) and stay cancelled.
-                await asyncio.shield(self._kill_remote_matmul(ssh_client, script_path, log_extra))
+                # (to its end: a repeat cancel must not stop the kill) and stay cancelled.
+                await run_to_end(self._kill_remote_matmul(ssh_client, script_path, log_extra))
                 raise
             except Exception as e:
                 error_msg = f"Failed to execute SSH command: {str(e)}"

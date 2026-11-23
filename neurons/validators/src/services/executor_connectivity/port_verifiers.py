@@ -381,10 +381,13 @@ class BatchVerifier:
                 first_round, _ = await self.port_tester.test_many(session, host, remaining, token, log_ctx)
             return reached, first_round
         finally:
-            # shielded: a failed sibling start or the deadline cancels this reading, never the removal of its listener
+            # to its end: a failed sibling start, the deadline or a repeat cancel stops this reading, never the removal
+            # of its listener
+            from services.task.runner import run_to_end  # services.task imports this module
+
             removal = asyncio.ensure_future(self.runner.cleanup(ssh_client, name))
             start_watch.cleanups.append(removal)
-            await asyncio.shield(removal)
+            await run_to_end(removal)
 
 
 class FallbackVerifier:

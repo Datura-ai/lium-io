@@ -1226,14 +1226,16 @@ class VerifyXColdRetryCheck:
         finally:
             probe.cancel()
             watch.cancel()
-            await asyncio.gather(probe, watch, return_exceptions=True)
-            # Cut off (deadline, SSH timeout, lost connection, rental, outer cancel): the remote run may live on.
-            if (retry is None or transport_error is not None) and not (
-                await verifyx_service.kill_remote_verifyx(
-                    ctx.services.shell, run_dir, ctx.default_extra
-                )
-            ):
-                await _remember_stale_run(ctx, run_dir)
+
+            async def cut_off() -> None:
+                await asyncio.gather(probe, watch, return_exceptions=True)
+                # Cut off (deadline, SSH timeout, lost connection, rental, outer cancel): the remote run may live on.
+                if (retry is None or transport_error is not None) and not (
+                    await verifyx_service.kill_remote_verifyx(ctx.services.shell, run_dir, ctx.default_extra)
+                ):
+                    await _remember_stale_run(ctx, run_dir)
+
+            await run_to_end(cut_off())
         if busy is not None:
             logger.info(
                 _m(

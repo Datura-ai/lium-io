@@ -23,7 +23,7 @@ from neurons.validators.src.services.task.messages import RentalVerificationMess
 from neurons.validators.src.services.task.pipeline import CheckResult, Context
 
 from protocol.vc_protocol.compute_requests import RentedExecutor, RentedExecutorsResponse, RentedPod
-from tests.helpers import build_services, build_state
+from tests.helpers import HeldCleanup, assert_cleanup_outlasts_a_repeat_cancel, build_services, build_state
 
 
 class DummyBackendClient:
@@ -1470,3 +1470,28 @@ async def test_states_that_do_not_prove_a_death_are_never_punished(docker_status
 
     assert result.passed is True
     assert result.event.reason_code == Msg.FILLER_STATE_UNKNOWN.reason
+
+
+@pytest.mark.asyncio
+async def test_a_repeat_cancel_waits_for_the_health_check_probe_removal(context_factory):
+    """Review: the pipeline cancels a step again until it ends; the health_check_* removal still finishes before the
+    step ends and the session closes, so the probe cannot race a renter's pod."""
+    removal = HeldCleanup()
+    entered = asyncio.Event()
+
+    class HangingBackend(DummyBackendClient):
+        async def check_executor_health(self, *args, **kwargs):
+            entered.set()
+            await asyncio.sleep(3600)
+
+    class HeldRemoval(ContainerCleanup):
+        async def force_remove_health_checks(self, ssh_client, executor_uuid):
+            await removal.run()
+
+    backend = HangingBackend(response=None)
+    services = build_services(backend=backend, container_cleanup=HeldRemoval())
+    ctx = context_factory(services=services, state=build_state(specs={"verified_ports": [8080]}))
+    task = asyncio.ensure_future(RentalVerificationCheck().run(ctx))
+    await asyncio.wait_for(entered.wait(), 5)
+
+    await assert_cleanup_outlasts_a_repeat_cancel(task, removal)
