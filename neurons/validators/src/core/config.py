@@ -40,7 +40,7 @@ def _parse_miner_origins(value: str) -> frozenset[tuple[str, int]]:
         try:
             url = yarl.URL(f"http://{entry}")
             origin = (url.host, url.explicit_port)
-            # nothing but host:port: a path, query, fragment or userinfo ('x@10.0.0.1:80') is a malformed entry
+            # nothing but host:port: a path, query, fragment or userinfo ('x@192.0.2.1:80') is a malformed entry
             bare = url.raw_path in ("", "/") and not (url.query_string or url.fragment or url.user or url.password)
         except ValueError:
             origin, bare = None, False
