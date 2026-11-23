@@ -1905,12 +1905,12 @@ async def test_the_teardown_wait_never_outlasts_the_job():
     task.cancel()
 
 
-def _gpu_step(output: str, gpus: int | None = None):
+def _gpu_step(output: str, gpus: int | None = None, exit_status: int = 0, stderr: str = ""):
     ctx, _, _ = make_probe_context()
     if gpus is not None:
         ctx = ctx.model_copy(update={"state": replace(ctx.state, gpu_count=gpus)})
     outcome = module._ProbeOutcome()
-    smi = MagicMock(stdout=output, stderr="", exit_status=0)
+    smi = MagicMock(stdout=output, stderr=stderr, exit_status=exit_status)
     module._step_gpu_count(ctx, outcome, module._Login(result=smi, command_seconds=0.5))
     return outcome
 
@@ -2075,6 +2075,20 @@ def test_gpu_count_reports_the_usable_count_when_listed_uuids_are_missing_from_t
     )
     outcome = _gpu_step(whole, gpus=8)
     assert outcome.failed_step is None and outcome.steps[-1].ok is True
+
+
+def test_gpu_count_keeps_the_usable_count_in_the_record_with_long_diagnostic_output():
+    """Review 23 Nov: a nonzero exit with over 600 characters of diagnostic output. The recorded detail
+    kept only the output's tail and lost the usable count."""
+    eight = tuple(f"GPU-0000000{i}-0000-0000-0000-000000000000" for i in range(8))
+    listing = "".join(f"GPU {i}: NVIDIA H100 (UUID: {u})\n" for i, u in enumerate(eight))
+    mig = ("Disabled",) * 8
+    one = gpu_list_output(listing, nodes=(0,), minors=tuple(zip(eight, range(8))), cuda="1", mig=mig)
+    outcome = _gpu_step(one, gpus=8, exit_status=1, stderr="x" * 700 + " last line")
+    assert outcome.failed_step == STEP_GPU_COUNT
+    detail = outcome.steps[-1].as_record()["detail"]
+    assert "1 of 8 GPU(s) confirmed usable" in detail
+    assert detail.endswith(" last line") and len(detail) <= module._TAIL_CHARS
 
 
 def test_gpu_count_reports_the_usable_count_when_nvidia_smi_lists_too_few():

@@ -1179,11 +1179,15 @@ def _step_gpu_count(ctx: Context, outcome: _ProbeOutcome, login: _Login) -> None
         if gpu_ok:
             detail = None
         elif smi.exit_status != 0 or seen != expected:
-            detail = (
+            summary = (
                 f"expected {expected} GPU(s), nvidia-smi -L listed {seen} (exit {smi.exit_status})"
                 + (f", {short}" if short else "")
-                + f" | output: {(smi.stderr or smi_out or '')[-_TAIL_CHARS:]}"
+                + " | output: "
             )
+            # the record keeps the last _TAIL_CHARS of a detail: the output gets only the room the summary
+            # leaves, so the usable count is never cut off
+            room = max(_TAIL_CHARS - len(summary), 0)
+            detail = summary + ((smi.stderr or smi_out or "")[-room:] if room else "")
         else:
             detail = f"expected {expected} GPU(s), nvidia-smi -L listed {seen} but {short}"
     outcome.steps.append(_Step(STEP_GPU_COUNT, login.command_seconds, gpu_ok, detail))
