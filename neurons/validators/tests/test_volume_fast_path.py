@@ -12,7 +12,7 @@ import pytest
 from core.config import settings
 from payload_models.payloads import ContainerCreateRequest
 from services import docker_service as docker_service_module
-from services.image_flatten import FlattenMeasureFailed
+from services.image_flatten import FlattenLockTimedOut, FlattenMeasureFailed
 from services.loopback_plugin_setup import (
     LOOPBACK_PLUGIN_BUILDS,
     loopback_plugin_probe_marker_path,
@@ -622,6 +622,31 @@ async def test_a_flatten_lock_or_mark_failure_stops_the_create_before_any_sizing
     assert type(result).__name__ != "ContainerCreated"
     svc.resolve_volume_sizing.assert_not_awaited()
     svc.create_local_volume.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "step_detail"),
+    [
+        (FlattenLockTimedOut("held"), docker_service_module.FLATTEN_LOCK_TIMEOUT_STEP_DETAIL),
+        # prod 23 Nov 2026: the wait command crashed in 13 s with no copy running
+        (
+            RuntimeError("waiting for any image copy on this node failed (exit 139)"),
+            docker_service_module.FLATTEN_WAIT_FAILED_STEP_DETAIL,
+        ),
+        (asyncssh.ConnectionLost("Connection lost"), docker_service_module.FLATTEN_WAIT_FAILED_STEP_DETAIL),
+    ],
+)
+async def test_a_failed_flatten_wait_tells_the_backend_whether_its_lock_timed_out(svc, monkeypatch, error, step_detail):
+    # the backend tells the renter to wait only when a copy held the lock past the wait
+    ssh_client = _deploy_ssh_client()
+    _patch_happy(svc, monkeypatch, ssh_client)
+    monkeypatch.setattr(svc, "probe_volume_host", AsyncMock(return_value=None))
+    monkeypatch.setattr(docker_service_module, "wait_for_node_flatten", AsyncMock(side_effect=error))
+
+    result = await _run_create_container(svc, _create_payload())
+
+    assert (result.failure_step, result.step_detail) == ("flatten_wait", step_detail)
 
 
 @pytest.mark.asyncio
