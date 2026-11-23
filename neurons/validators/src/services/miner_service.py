@@ -582,8 +582,6 @@ class MinerService:
                 and rerun.log_status != "error"
                 and rerun.failure_reason_code != TenantEnforcementMessages.EXECUTOR_TRANSPORT_UNREACHABLE.reason
             ):
-                # DAH-6951: the replaced run is no verdict any more, so a reset it held is stale
-                self.task_service.drop_held_resets(result=raw_results[i])
                 raw_results[i] = rerun
         passed = [r for r in reruns if isinstance(r, JobResult) and r.is_successful]
         logger.info(

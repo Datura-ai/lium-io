@@ -156,20 +156,6 @@ class TaskService:
             self.open_hold_batch = None
         return self.held_resets.pop(job_batch_id, [])
 
-    def drop_held_resets(
-        self, executor_id: str | None = None, miner_hotkey: str | None = None, result: JobResult | None = None
-    ) -> None:
-        """Forget the held resets a newer verdict made stale: the node's as this miner lists it (it passed; another
-        miner listing the same executor id keeps its own) or one run's (a rerun replaced it)."""
-
-        def stale(e: HeldReset) -> bool:
-            if result is not None:
-                return e.result is result
-            return e.executor_id == executor_id and e.reset["miner_hotkey"] == miner_hotkey
-
-        for entries in self.held_resets.values():
-            entries[:] = [e for e in entries if not stale(e)]
-
     async def create_task(
         self,
         miner_info: MinerJobRequestPayload,
@@ -314,9 +300,6 @@ class TaskService:
                     self.held_resets.setdefault(miner_info.job_batch_id, []).append(held[-1])
                     return True
 
-                if success:
-                    # a pass is the node's latest verdict: a reset an earlier run of this cycle held is stale
-                    self.drop_held_resets(executor_id=executor_info.uuid, miner_hotkey=miner_info.miner_hotkey)
                 # Handle result using ResultHandler
                 result_handler = ResultHandler(self.redis_service, dry_run=settings.DRY_RUN)
                 result = await result_handler.handle_result(

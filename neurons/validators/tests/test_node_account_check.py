@@ -613,7 +613,8 @@ async def test_a_reset_held_before_handle_result_raised_is_still_decided(monkeyp
     redis.clear_verified_job_info.assert_awaited_once()
 
 
-async def test_a_held_reset_redis_refuses_at_the_cycle_end_withholds_its_verdict(monkeypatch):
+@pytest.mark.parametrize("error", ["ConnectionError", "TimeoutError"])
+async def test_a_held_reset_redis_refuses_at_the_cycle_end_withholds_its_verdict(monkeypatch, error):
     """r262: at base a Redis error on the reset made the run VALIDATOR_REDIS_UNAVAILABLE, withheld; a held reset
     that cannot be sent at the cycle end must not be lost silently either: its verdict is withheld the same way, so
     the node is neither scored nor published without its reset, and the next cycle checks it again."""
@@ -626,7 +627,7 @@ async def test_a_held_reset_redis_refuses_at_the_cycle_end_withholds_its_verdict
     run = await _account_run(monkeypatch)
     redis_service = MagicMock(clear_verified_job_info=AsyncMock())
     service, result = await wave_create_task(run, redis_service)
-    redis_service.clear_verified_job_info.side_effect = redis.exceptions.ConnectionError("redis down")
+    redis_service.clear_verified_job_info.side_effect = getattr(redis.exceptions, error)("redis down")
 
     withheld = await cycle_end(service, redis_service, result, "stands")
 
@@ -636,10 +637,10 @@ async def test_a_held_reset_redis_refuses_at_the_cycle_end_withholds_its_verdict
 
 
 @pytest.mark.parametrize("same_miner", [True, False], ids=["same-miner", "another-miner"])
-async def test_a_pass_of_the_same_node_drops_its_held_reset(monkeypatch, same_miner):
-    """r254: a later pass of the node before the cycle end (an express recheck after the provider fixed it) is its
-    latest verdict: the reset an earlier run held is dropped, never sent over the pass. r262: only a pass of the same
-    miner's listing; another miner listing the same executor id leaves this miner's held reset to the cycle end."""
+async def test_a_pass_of_the_node_never_drops_a_held_reset(monkeypatch, same_miner):
+    """r273: a later pass of the node before the cycle end (an express recheck, or another miner listing the same
+    executor id) cannot undo a failure that already happened: the held reset stays for the cycle end, which sends
+    it outside a window, as base sent it at once. The next cycle's check handles the recovery."""
     from unittest.mock import AsyncMock, MagicMock
 
     run = await _account_run(monkeypatch)
@@ -652,46 +653,46 @@ async def test_a_pass_of_the_same_node_drops_its_held_reset(monkeypatch, same_mi
     handler.return_value.handle_result = AsyncMock(return_value=MagicMock(score=1.0, availability_errors=None))
     await wave_create_task(passed, redis, service=service, handler=handler, miner_hotkey=POOL if same_miner else "5Other")
 
-    assert len(service.held_resets["batch-1"]) == (0 if same_miner else 1)
+    assert len(service.held_resets["batch-1"]) == 1
     await cycle_end(service, redis, None, "withheld_nothing")
-    assert redis.clear_verified_job_info.await_count == (0 if same_miner else 1)
+    redis.clear_verified_job_info.assert_awaited_once()
 
 
-def test_held_resets_are_kept_per_cycle_and_a_replaced_run_drops_its_own():
-    """DAH-6951: the cycle end takes only its own batch's resets and closes that batch; a rerun that replaced a run
-    drops the replaced run's reset only."""
+def test_held_resets_are_kept_per_cycle():
+    """DAH-6951: the cycle end takes only its own batch's resets and closes that batch."""
     from services.task.service import HeldReset, TaskService
 
     service = TaskService.__new__(TaskService)
-    first, other = object(), object()
     service.held_resets = {
-        "batch-1": [HeldReset("node-1", {}, first), HeldReset("node-2", {}, other)],
+        "batch-1": [HeldReset("node-1", {}), HeldReset("node-2", {})],
         "batch-2": [HeldReset("node-1", {})],
     }
     service.open_hold_batch = "batch-1"
 
-    service.drop_held_resets(result=first)
-    assert [h.executor_id for h in service.held_resets["batch-1"]] == ["node-2"]
-    assert [h.executor_id for h in service.take_held_resets("batch-1")] == ["node-2"]
+    assert [h.executor_id for h in service.take_held_resets("batch-1")] == ["node-1", "node-2"]
     assert service.open_hold_batch is None and list(service.held_resets) == ["batch-2"]
 
 
 @pytest.mark.parametrize(
-    "window, held",
+    "window, held, withheld",
     [
         # grace off: no window ever withholds, so nothing is held
-        (dict(opened_job_block=None, cycles_seen=0, grace_cycles=0), False),
+        (dict(opened_job_block=None, cycles_seen=0, grace_cycles=0), False, False),
         # a window closed one cycle ago and no new one may open yet: nothing this cycle can be withheld
-        (dict(opened_job_block=7000, cycles_seen=3, grace_cycles=2), False),
-        # a covering window, or a push mid-cycle may open one at its end: held for the cycle end
-        (dict(opened_job_block=7500, cycles_seen=1, grace_cycles=2), True),
-        (dict(opened_job_block=None, cycles_seen=0, grace_cycles=2), True),
+        (dict(opened_job_block=7000, cycles_seen=3, grace_cycles=2), False, False),
+        # a covering window withholds the failure, so its reset is never sent
+        (dict(opened_job_block=7500, cycles_seen=1, grace_cycles=2), True, True),
+        # a push mid-cycle may open a window: held, but none opened, so the cycle end sends it
+        (dict(opened_job_block=None, cycles_seen=0, grace_cycles=2), True, False),
     ],
     ids=["grace-off", "window-just-closed", "window-covers", "window-may-open"],
 )
-async def test_a_reset_is_held_only_in_a_cycle_a_rollout_window_could_withhold(monkeypatch, window, held):
-    """r269: a cycle no rollout window can withhold holds no reset. A closed-session failure's reset is sent at once,
-    as at base, so a later express pass of the same node cannot drop it."""
+async def test_an_express_pass_never_cancels_a_reset_only_a_covering_window_withholds_it(
+    monkeypatch, window, held, withheld
+):
+    """r269: a cycle no rollout window can withhold holds no reset; it is sent at once, as at base. r273: a held
+    reset survives a later express pass of the same node, and the cycle end sends it unless the window actually
+    covers the cycle and withholds that failure."""
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, MagicMock
 
@@ -713,7 +714,7 @@ async def test_a_reset_is_held_only_in_a_cycle_a_rollout_window_could_withhold(m
 
     run = await _account_run(monkeypatch)
     redis = MagicMock(clear_verified_job_info=AsyncMock())
-    await wave_create_task(run, redis, service=service)
+    _, result = await wave_create_task(run, redis, service=service)
     assert redis.clear_verified_job_info.await_count == (0 if held else 1)
 
     # the provider asks for a recheck and the express pass of the same node passes
@@ -722,8 +723,8 @@ async def test_a_reset_is_held_only_in_a_cycle_a_rollout_window_could_withhold(m
     handler.return_value.handle_result = AsyncMock(return_value=MagicMock(score=1.0, availability_errors=None))
     await wave_create_task(passed, redis, service=service, handler=handler)
 
-    await cycle_end(service, redis, None, "stands")
-    assert redis.clear_verified_job_info.await_count == (0 if held else 1)
+    await cycle_end(service, redis, result, "withheld" if withheld else "stands")
+    assert redis.clear_verified_job_info.await_count == (0 if withheld else 1)
 
 
 async def test_a_held_reset_failing_on_another_error_follows_the_base_error_path(monkeypatch):

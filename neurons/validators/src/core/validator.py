@@ -1504,8 +1504,8 @@ class Validator:
             )
         )
         # DAH-6951: the wave holds its resets for the cycle end only when a rollout window could withhold this
-        # cycle's verdicts; otherwise none is held and each is sent at once, as at base, so a later pass of the
-        # node cannot drop it
+        # cycle's verdicts; otherwise each is sent at once, as at base. No later run drops a held reset: the cycle
+        # end sends it unless the window it decides with withholds that run's own failure
         self.miner_service.task_service.open_hold_batch = (
             job_batch_id if covered or tally.rollout_digest is not None else None
         )
