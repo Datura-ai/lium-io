@@ -10,6 +10,7 @@ from uuid import uuid4
 import pytest
 import services.docker_service as ds_module
 from payload_models.payloads import ContainerCreateRequest, FailedContainerErrorCodes, WorkloadKind
+from services.attestation_service import HostPolicyResult
 from services.prerun_host_probe import DOCKER_PS_ALL_NAMES_IDS_CMD, DOCKER_VOLUME_LS_NAME_DRIVER_CMD
 from services.rental_docker_sdk import (
     FILLER_VOLUME_LABELS,
@@ -90,7 +91,7 @@ def _removed_names(ssh_client) -> list[str]:
 
 @pytest.fixture
 def svc() -> ds_module.DockerService:
-    return ds_module.DockerService(ssh_service=Mock(), redis_service=Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True)), attestation_service=Mock())
+    return ds_module.DockerService(ssh_service=Mock(), redis_service=Mock(mget=AsyncMock(side_effect=lambda keys: [None] * len(keys)), set=AsyncMock(), write_atomically=AsyncMock(), get_rented_machine=AsyncMock(return_value=None), rented_machines_synced=AsyncMock(return_value=True)), attestation_service=Mock(prepare_host_policy=AsyncMock(return_value=HostPolicyResult())))
 
 
 @pytest.mark.parametrize(
