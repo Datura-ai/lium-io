@@ -331,9 +331,12 @@ class Validator:
 
     async def keep_pending_job(self, pending: tuple[int, int] | None) -> None:
         """Set the due job block (and the height that first chose it) and keep it in Redis, so a restart before its
-        cycle starts runs that block, not the one the new height falls in. A Redis error leaves it in memory only."""
+        cycle starts runs that block, not the one the new height falls in. A Redis error leaves it in memory only, and
+        so does an unread stored block: an unread block is no proof that none was kept."""
         self.pending_job = pending
         self.pending_applied_at = None
+        if not self.pending_job_read:
+            return
         try:
             if pending is None:
                 await self.redis_service.delete(PENDING_JOB_KEY)
@@ -518,16 +521,9 @@ class Validator:
                 or self.pending_job is not None
             ):
                 if not self.pending_job_read:
+                    # read again before choosing; while it stays unread the cycle still runs, and keep_pending_job and
+                    # persist_state leave the stored block alone, so a block a previous run kept is never overwritten
                     await self.restore_pending_job()
-                    if not self.pending_job_read:
-                        # choosing a block now could overwrite one a previous run kept; retried on the next tick
-                        logger.error(
-                            _m(
-                                "[sync] pending job block still unread; cycle not started",
-                                extra=get_extra_info(self.default_extra),
-                            )
-                        )
-                        return
                 # A failed attempt keeps its block for the following ticks, for one interval from the height that first
                 # chose it: by then the healthy schedule has moved to the next block, so a block the chain can no longer
                 # read (pruned state) never holds back the cycles after it.

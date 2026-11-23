@@ -1518,6 +1518,35 @@ async def test_a_pending_block_unread_at_startup_is_read_again_before_a_new_bloc
 
 
 @pytest.mark.asyncio
+async def test_an_unreadable_pending_block_does_not_stop_the_waves_or_get_overwritten(
+    validator_with_mocks, create_neuron_info
+):
+    """Review on 89ccb18: while Redis cannot read the stored pending block, the cycle still runs on the block its height
+    falls in, and neither the choice nor the checkpoint writes over the block a previous run kept."""
+    from core.config import settings
+
+    n = settings.BLOCKS_FOR_JOB
+    validator = validator_with_mocks
+    store = _keep_in(validator.redis_service)
+    validator.subtensor_client.get_miners = AsyncMock(return_value=[create_neuron_info(1, "miner-a")])
+    block = 14 * n
+    kept = f"[{block - n}, {block - 1}]"
+    store["validator_pending_job_block"] = kept
+    read_from_store = validator.redis_service.get.side_effect
+
+    def unreadable(key):
+        if key == "validator_pending_job_block":
+            raise TimeoutError("redis timeout")
+        return read_from_store(key)
+
+    validator.redis_service.get.side_effect = unreadable
+    validator.pending_job_read = False
+    read, asked = await _run_ticks(validator, (block + 1,), lambda b, attempt: True)
+    assert (read, asked) == ([block], [f"time-of-{block}"])
+    assert store["validator_pending_job_block"] == kept
+
+
+@pytest.mark.asyncio
 async def test_a_failed_job_file_step_leaves_its_block_due_on_the_next_tick(validator_with_mocks, create_neuron_info):
     """Review 4644806239: the throttle moved before the job files were prepared, so after an ordinary error there the
     pending block waited a whole interval and expired unrun, unless the process restarted."""
