@@ -1180,8 +1180,9 @@ def _step_gpu_count(ctx: Context, outcome: _ProbeOutcome, login: _Login) -> None
             detail = None
         elif smi.exit_status != 0 or seen != expected:
             detail = (
-                f"expected {expected} GPU(s), nvidia-smi -L listed {seen} (exit {smi.exit_status}): "
-                f"{(smi.stderr or smi_out or '')[-_TAIL_CHARS:]}"
+                f"expected {expected} GPU(s), nvidia-smi -L listed {seen} (exit {smi.exit_status})"
+                + (f", {short}" if short else "")
+                + f" | output: {(smi.stderr or smi_out or '')[-_TAIL_CHARS:]}"
             )
         else:
             detail = f"expected {expected} GPU(s), nvidia-smi -L listed {seen} but {short}"
@@ -1611,21 +1612,31 @@ class _UsableGpus:
     cut_short: bool = False
 
     def short_of(self, expected: int) -> str | None:
+        """Every shortfall found, after the count of listed GPUs the container can use."""
+        reasons = []
         if self.cut_short:
             # no CUDA result was read, so this is no CUDA failure
-            return "the probe output ended before the CUDA section"
+            reasons.append("the probe output ended before the CUDA section")
         if self.unknown_uuids:
-            return (
+            reasons.append(
                 f"the container has {self.unknown_uuids} nvidia-smi GPU UUID(s) the kernel driver "
                 "does not know"
             )
         if self.device_nodes < expected:
-            return f"the container has {self.device_nodes} usable GPU device node(s) (/dev/nvidiaN)"
+            reasons.append(
+                f"the container has {self.device_nodes} usable GPU device node(s) (/dev/nvidiaN)"
+            )
         if self.cuda_error is not None:
-            return f"the container has CUDA failed to start ({self.cuda_error})"
-        if self.cuda_count is not None and self.cuda_count < expected:
-            return f"the container has CUDA sees {self.cuda_count} device(s)"
-        return None
+            reasons.append(f"CUDA failed to start ({self.cuda_error})")
+        elif self.cuda_count is not None and self.cuda_count < expected:
+            reasons.append(f"CUDA sees {self.cuda_count} device(s)")
+        if not reasons:
+            return None
+        # cut short: the device node and CUDA readings are incomplete, so no card is confirmed
+        cuda = expected if self.cuda_count is None else self.cuda_count
+        unread = self.cut_short or self.cuda_error is not None
+        usable = 0 if unread else min(self.device_nodes, cuda, expected)
+        return f"{usable} of {expected} GPU(s) confirmed usable: {'; '.join(reasons)}"
 
 
 def _usable_gpus(output: str) -> _UsableGpus:

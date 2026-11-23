@@ -1905,8 +1905,10 @@ async def test_the_teardown_wait_never_outlasts_the_job():
     task.cancel()
 
 
-def _gpu_step(output: str):
+def _gpu_step(output: str, gpus: int | None = None):
     ctx, _, _ = make_probe_context()
+    if gpus is not None:
+        ctx = ctx.model_copy(update={"state": replace(ctx.state, gpu_count=gpus)})
     outcome = module._ProbeOutcome()
     smi = MagicMock(stdout=output, stderr="", exit_status=0)
     module._step_gpu_count(ctx, outcome, module._Login(result=smi, command_seconds=0.5))
@@ -1980,7 +1982,9 @@ def test_gpu_count_without_a_cuda_reading_is_decided_by_the_device_nodes():
         gpu_list_output(listing, nodes=(0,), minors=eight, cuda="", mig=("Disabled",) * 8)
     )
     assert one_node.cuda_count is None and one_node.cuda_error is None
-    assert one_node.short_of(8) == "the container has 1 usable GPU device node(s) (/dev/nvidiaN)"
+    assert one_node.short_of(8) == (
+        "1 of 8 GPU(s) confirmed usable: the container has 1 usable GPU device node(s) (/dev/nvidiaN)"
+    )
     all_nodes = module._usable_gpus(
         gpu_list_output(listing, nodes=tuple(range(8)), minors=eight, cuda="", mig=("Disabled",) * 8)
     )
@@ -2024,7 +2028,9 @@ def test_gpu_count_links_cards_by_uuid_to_kernel_minor_not_by_index():
         minors=tuple(zip(B79A_UUIDS, B79A_MINORS)), cuda="1", mig=("Disabled",)
     )
     by_index = module._usable_gpus(gpu_list_output(_smi_listing(B79A_UUIDS[:1]), nodes=(0,), **one_card))
-    assert by_index.short_of(1) == "the container has 0 usable GPU device node(s) (/dev/nvidiaN)"
+    assert by_index.short_of(1) == (
+        "0 of 1 GPU(s) confirmed usable: the container has 0 usable GPU device node(s) (/dev/nvidiaN)"
+    )
     by_minor = module._usable_gpus(gpu_list_output(_smi_listing(B79A_UUIDS[:1]), nodes=(2,), **one_card))
     assert by_minor.short_of(1) is None
 
@@ -2043,7 +2049,38 @@ def test_gpu_count_fails_nvidia_smi_uuids_the_kernel_does_not_list():
         )
     )
     assert shape.unknown_uuids == 8
-    assert shape.short_of(8) == "the container has 8 nvidia-smi GPU UUID(s) the kernel driver does not know"
+    assert shape.short_of(8) == (
+        "0 of 8 GPU(s) confirmed usable: the container has 8 nvidia-smi GPU UUID(s) the kernel driver "
+        "does not know; the container has 0 usable GPU device node(s) (/dev/nvidiaN); CUDA sees 1 "
+        "device(s)"
+    )
+
+
+def test_gpu_count_reports_the_usable_count_when_listed_uuids_are_missing_from_the_kernel():
+    """Review 23 Nov: 8 listed, 7 UUIDs absent from the kernel inventory, one device node, CUDA 1. The
+    failure named the unknown UUIDs but not how many GPUs the container can use."""
+    eight = tuple(f"GPU-0000000{i}-0000-0000-0000-000000000000" for i in range(8))
+    listing = "".join(f"GPU {i}: NVIDIA H100 (UUID: {u})\n" for i, u in enumerate(eight))
+    mig = ("Disabled",) * 8
+    outcome = _gpu_step(
+        gpu_list_output(listing, nodes=(0,), minors=((eight[0], 0),), cuda="1", mig=mig), gpus=8
+    )
+    assert outcome.failed_step == STEP_GPU_COUNT
+    detail = outcome.steps[-1].detail
+    assert "nvidia-smi -L listed 8 but 1 of 8 GPU(s) confirmed usable" in detail
+    assert "7 nvidia-smi GPU UUID(s) the kernel driver does not know" in detail
+    # control: all eight device nodes and UUID mappings restored
+    whole = gpu_list_output(
+        listing, nodes=tuple(range(8)), minors=tuple(zip(eight, range(8))), cuda="8", mig=mig
+    )
+    outcome = _gpu_step(whole, gpus=8)
+    assert outcome.failed_step is None and outcome.steps[-1].ok is True
+
+
+def test_gpu_count_reports_the_usable_count_when_nvidia_smi_lists_too_few():
+    outcome = _gpu_step(gpu_list_output(_smi_listing(B79A_UUIDS[:1]), nodes=(0,), cuda="1"))
+    assert outcome.failed_step == STEP_GPU_COUNT
+    assert "nvidia-smi -L listed 1 (exit 0), 0 of 2 GPU(s) confirmed usable" in outcome.steps[-1].detail
 
 
 def test_gpu_count_fails_output_cut_short_before_the_cuda_section():
@@ -2055,7 +2092,9 @@ def test_gpu_count_fails_output_cut_short_before_the_cuda_section():
     outcome = _gpu_step(truncated)
     assert outcome.failed_step == STEP_GPU_COUNT
     detail = outcome.steps[-1].detail
-    assert detail.endswith("but the probe output ended before the CUDA section")
+    assert detail.endswith(
+        "but 0 of 2 GPU(s) confirmed usable: the probe output ended before the CUDA section"
+    )
     assert "CUDA failed to start" not in detail
     assert _gpu_step(full.partition("--gpu-mig-mode--")[0]).failed_step == STEP_GPU_COUNT
 
