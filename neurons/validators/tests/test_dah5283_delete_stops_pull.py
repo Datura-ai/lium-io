@@ -197,16 +197,43 @@ async def test_a_delete_while_dockerd_runs_the_create_removes_the_container_once
 
 
 @pytest.mark.asyncio
-async def test_no_container_is_created_once_the_delete_flagged_the_create(svc, monkeypatch):
-    """The SDK's resume creates once dockerd frees the name; after a delete it makes nothing."""
-    from services.docker_service import _CreateRefusedAfterDelete
+async def test_a_delete_during_the_resume_wait_keeps_waiting_and_adopts_dockerds_container(svc, monkeypatch):
+    """lium-io#2406 review: the resume after a lost `containers/create` answer waits while dockerd holds the
+    name (409, inspect 404). A delete during that wait must not end it: the first create registers later,
+    and only a run that returns it lets the delete checkpoint after the run remove it and its volume."""
+    import requests
+    import services.rental_docker_sdk as sdk
+    from docker.errors import APIError
+    from services.rental_docker_sdk import RentalDockerSdkClient
+    from test_docker_transport_retry import _FakeAdapter, _FakeApiClient, _not_found
 
     payload = _payload()
     _patch_happy(svc, monkeypatch, _ssh_client(inspect_exit=1))
+    monkeypatch.setattr(sdk, "_INFLIGHT_CREATE_POLL_SECONDS", 0)
     with inflight_creates.track(payload.pod_id, executor_key(payload)):
         await _run(svc, payload)
-        before_create = svc._run_rental_docker_create_with_port_retry.await_args.kwargs["run_spec"].before_create
-        before_create()
-        inflight_creates.cancel(payload.pod_id, executor_key(payload))
-        with pytest.raises(_CreateRefusedAfterDelete):
-            before_create()
+        # the run spec the create hands the SDK, with its own `before_create`
+        spec = svc._run_rental_docker_create_with_port_retry.await_args.kwargs["run_spec"]
+        held = APIError(
+            "Conflict",
+            response=Mock(status_code=409, url="containers/create", reason="Conflict"),
+            explanation=f'Conflict. The container name "/{spec.name}" is already in use by container "abc".',
+        )
+        api = _FakeApiClient(adapter=_FakeAdapter())
+        api.create_container_errors = [requests.exceptions.ReadTimeout("Read timed out. (read timeout=60)"), held, held]
+        inspects = iter([_not_found(), "delete"])
+
+        def inspect_container(name):
+            api.calls.append("inspect_container")
+            step = next(inspects, None)
+            if step == "delete":  # the renter deletes while dockerd still runs the first create
+                assert inflight_creates.cancel(payload.pod_id, executor_key(payload))
+                raise _not_found()
+            if step is not None:
+                raise step
+            return {"Id": "first", "Config": {"Image": spec.image}}
+
+        api.inspect_container = inspect_container
+        assert await RentalDockerSdkClient(api).run_container(spec) == "first"
+    assert api.calls[-2:] == ["inspect_container", "start"]
+    assert api.calls.count("create_container") == 3

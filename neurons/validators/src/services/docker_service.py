@@ -1364,10 +1364,6 @@ class _SameNameContainerKept(Exception):
     """A re-sent create met the pod's own container already running (or unreadable): it is the renter's, never removed."""
 
 
-class _CreateRefusedAfterDelete(ContainerCreateRefused):
-    """Raised at `containers/create` when this pod's delete has already reported it gone: nothing was created."""
-
-
 class _FillerRefusedForCustomerCreate(ContainerCreateRefused):
     """Raised at a filler's `docker run` while a customer create runs on the same executor."""
 
@@ -2692,14 +2688,6 @@ def _refuse_filler_during_customer_create(payload: ContainerCreateRequest) -> No
         raise _FillerRefusedForCustomerCreate(
             f"a customer create is running on executor {payload.executor_id}; filler {payload.pod_id} not started"
         )
-
-
-def _refuse_create_before_docker(payload: ContainerCreateRequest) -> None:
-    """The run spec's `before_create`, called in the Docker thread right before each `containers/create`."""
-    _refuse_filler_during_customer_create(payload)
-    if inflight_creates.is_cancelled(payload.pod_id, executor_key(payload)):
-        # the resume's create once dockerd freed the name, or a delete since the last checkpoint: make nothing
-        raise _CreateRefusedAfterDelete(f"delete for pod {payload.pod_id} arrived before its container was created")
 
 
 def _refuse_filler_beside_unlisted_pod(payload: ContainerCreateRequest, container_names: Iterable[str]) -> None:
@@ -4617,7 +4605,7 @@ class DockerService:
             entrypoint=custom_options.entrypoint,
             network=RENTAL_NETWORK_NAME,
             labels={LIUM_POD_ID_LABEL: payload.pod_id},
-            before_create=lambda: _refuse_create_before_docker(payload),
+            before_create=lambda: _refuse_filler_during_customer_create(payload),
             # a customer pod created since the cleanup's listing is seen here, before the filler starts
             before_start=(
                 (lambda names: _refuse_filler_beside_unlisted_pod(payload, names))
