@@ -114,15 +114,15 @@ jobs:
                       except Unreadable as e:
                           cache[(repo, path, at)] = e  # it exists: a lookup finds it, and the scan reports it as not checkable
                   return cache[(repo, path, at)]
-              bad, queue, seen = [], [(None, str(f), None, 0) for f in files], set()
+              bad, queue, seen = [], [(None, str(f), None, 0, None) for f in files], set()
               # one rule for every input the scan cannot read or does not recognise: it fails as not checkable, never passes
               odd = lambda what: bad.append(f"{where}: not checkable: {what}")
               try:
                   while queue:
-                      repo, path, at, depth = queue.pop(0)
-                      if (repo, path, at) in seen:
+                      repo, path, at, depth, want = queue.pop(0)
+                      if (repo, path, at, want) in seen:
                           continue
-                      seen.add((repo, path, at))
+                      seen.add((repo, path, at, want))
                       where = f"{repo}/{path}@{at}" if repo else path
                       text = get(repo, path, at)
                       if isinstance(text, Unreadable):
@@ -135,6 +135,11 @@ jobs:
                           continue
                       if not isinstance(doc, dict):
                           bad.append(f"{where}: not a readable workflow or action manifest")
+                          continue
+                      # a fetched file counts only when it holds what the runner takes from it (runs: for an action, jobs: for
+                      # a reusable workflow); any other mapping is not that file, so it fails rather than passing with nothing to scan
+                      if repo is not None and want and not isinstance(doc.get(want), dict):
+                          bad.append(f"{where}: not checkable: no {want} mapping")
                           continue
                       jobs, runs = doc.get("jobs"), doc.get("runs")
                       if jobs is not None and not isinstance(jobs, dict):
@@ -198,7 +203,7 @@ jobs:
                                   if get(repo, p, at) is None:
                                       bad.append(f"{where}: {ref} is not a workflow at that commit")
                                   else:
-                                      queue.append((repo, p, at, depth))
+                                      queue.append((repo, p, at, depth, "jobs"))
                               elif ref.startswith("./"):
                                   # the runner resolves a step's ./ in the job's workspace at run time, which any earlier step
                                   # can change; $/ resolves at the running commit instead
@@ -206,7 +211,7 @@ jobs:
                               else:
                                   man = next((n for n in (posixpath.normpath(f"{p}/{n}") for n in ("action.yml", "action.yaml")) if get(repo, n, at) is not None), None)
                                   if man:
-                                      queue.append((repo, man, at, depth))
+                                      queue.append((repo, man, at, depth, "runs"))
                                   else:
                                       bad.append(f"{where}: {ref} has no action manifest at that commit")
                               continue
@@ -229,7 +234,7 @@ jobs:
                           names = [sub] if level == "job" else [posixpath.normpath(f"{sub}/{n}") for n in ("action.yml", "action.yaml")]
                           man = next((n for n in names if get(r, n, sha) is not None), None)
                           if man:
-                              queue.append((r, man, sha, depth + 1))
+                              queue.append((r, man, sha, depth + 1, "jobs" if level == "job" else "runs"))
                           else:
                               bad.append(f"{where}: {ref} has no readable workflow or action manifest at that commit")
                       # a Docker action runs a registry image by digest, written docker://...@sha256: (the runner prepares any other
@@ -285,6 +290,10 @@ jobs:
               ("acme/img", "action.yml", sha): img + "Dockerfile\n",
               ("acme/img", "action.yml", s2): img + "docker://alpine" + dig + "\n",
               ("acme/img", "action.yml", s3): img + "alpine" + dig + "\n",
+              # a mapping that is neither manifest: an API answer about a path, not the file the runner loads
+              ("acme/meta", "action.yml", sha): '{"type": "dir", "name": "action.yml"}\n',
+              ("acme/wf", ".github/workflows/meta.yml", sha): '{"type": "dir", "name": "meta.yml"}\n',
+              ("acme/wf", ".github/workflows/clean.yml", sha): "jobs:\n  a:\n    steps:\n      - uses: acme/act@" + sha + "\n",
           }
           for i in range(MAX_DEPTH + 1):
               base[(f"acme/deep{i}", "action.yml", sha)] = comp + f"    - uses: acme/deep{i + 1}@{sha}\n"
@@ -313,6 +322,9 @@ jobs:
               step("vendor/comp/ws@" + sha): 1,  # a workspace action inside a pinned one
               step("vendor/comp/own@" + sha): 1,  # its $/ child, at its commit, uses a tag
               step("acme/none@" + sha): 1,
+              step("acme/meta@" + sha): 1,  # no runs: mapping
+              "jobs:\n  a:\n    uses: acme/wf/.github/workflows/meta.yml@" + sha + "\n": 1,  # no jobs: mapping
+              "jobs:\n  a:\n    uses: acme/wf/.github/workflows/clean.yml@" + sha + "\n": 0,
               step("acme/loop@" + s3): 0,  # a cycle ends
               step("acme/deep0@" + sha): 1,  # deeper than the bound
               "jobs:\n  a:\n    uses: acme/wf/.github/workflows/outer.yml@" + sha + "\n": 1,  # its ./ child, at that commit
