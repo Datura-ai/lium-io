@@ -98,6 +98,7 @@ class ValidatorTrust:
         read_chain: bool = True,
         message: SignedTrustMessage | None = None,
         api_url: str | None = None,
+        network: str = "",
     ):
         self.image_message = image_message
         self.enabled = enabled
@@ -108,6 +109,8 @@ class ValidatorTrust:
         self.message = message
         # a staging build reads its owner's messages from the backend that serves them, not this host's backend
         self.api_url = api_url
+        # the network this build's lines name (datura.validator_trust.trust_line): fixed at build time
+        self.network = network
         self.owner = self.release_owner
         self.held: TrustedValidator | None = None
         self._owner_due = 0.0
@@ -128,7 +131,7 @@ class ValidatorTrust:
     def _hold(self, signed: SignedTrustMessage, signer: str) -> bool:
         """Hold `signed` when `signer` signed it and its revision is higher than the held one's. Raises on a bad
         signature."""
-        trusted = verify_trust_message(signed, signer)
+        trusted = verify_trust_message(signed, signer, self.network)
         if self.held is not None and trusted.revision <= self.held.revision:
             return False
         self.held = trusted

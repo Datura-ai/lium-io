@@ -37,7 +37,6 @@ from http import HTTPStatus
 from pathlib import Path
 
 import aiohttp
-from bittensor_wallet import Keypair
 from datura.validator_trust import (
     PUBLIC_CHAIN_NODES,
     RELEASE_SUBNET_OWNER_COLDKEY,
@@ -121,6 +120,7 @@ class ValidatorTrust:
         read_chain: bool = True,
         message: SignedTrustMessage | None = None,
         api_url: str | None = None,
+        network: str = "",
     ):
         self.state_dir = state_dir
         self.image_message = image_message
@@ -132,7 +132,11 @@ class ValidatorTrust:
         self.message = message
         # a staging build reads its owner's messages from the backend that serves them, not this host's backend
         self.api_url = api_url
+        # the network this build's lines name (datura.validator_trust.trust_line): fixed at build time, never stored
+        self.network = network
         self.owner = self.release_owner
+        # a kept message the release owner did not sign: taken only once a chain read names its signer as the owner
+        self._deferred: SignedTrustMessage | None = None
         self.held: TrustedValidator | None = None
         self.held_signed: SignedTrustMessage | None = None
         # the key that signed the held message: an owner change keeps the message until the new owner signs a higher one
@@ -142,18 +146,21 @@ class ValidatorTrust:
 
     def load(self) -> None:
         """At start: the kept state, then the image copy (signed by the release owner) when its revision is higher.
-        A missing, unreadable or badly signed state is ignored."""
+        A missing, unreadable or badly signed state is ignored. The volume names no key this node follows: its message
+        is checked against the release owner (a fixed owner's build: its own key), and one another key signed waits for
+        a chain read that names that key (a volume a non-prod build wrote must not choose the owner of a release build)."""
         if not self.enabled:
             return
         try:
             state = json.loads((self.state_dir / STATE_FILE).read_text())
-            Keypair(ss58_address=state["owner"])
-            # a fixed owner (no chain reads) takes only its own key's messages from the volume
-            signer = state["signer"] if self.read_chain else self.owner
             if state["message"] is not None:
-                self._hold(_signed(state["message"]), signer)
-            if self.read_chain:
-                self.owner = state["owner"]
+                kept = _signed(state["message"])
+                try:
+                    self._hold(kept, self.owner)
+                except ValueError:
+                    if not self.read_chain:
+                        raise
+                    self._deferred = kept
         except FileNotFoundError:
             pass
         except Exception as exc:
@@ -173,7 +180,7 @@ class ValidatorTrust:
     def _hold(self, signed: SignedTrustMessage, signer: str) -> bool:
         """Hold `signed` when `signer` signed it and its revision is higher than the held one's. Raises on a bad
         signature."""
-        trusted = verify_trust_message(signed, signer)
+        trusted = verify_trust_message(signed, signer, self.network)
         if self.held is not None and trusted.revision <= self.held.revision:
             return False
         self.held, self.held_signed, self.held_signer = trusted, signed, signer
@@ -252,7 +259,13 @@ class ValidatorTrust:
         if owner != self.owner:
             logger.warning("Validator trust: subnet owner changed from %s to %s", self.owner, owner)
             self.owner, self._unsaved = owner, True
-            await self.save()
+        if self._deferred is not None:
+            kept, self._deferred = self._deferred, None
+            try:
+                self._hold(kept, owner)
+            except ValueError as exc:
+                logger.warning("Validator trust: kept message dropped, not the chain owner's: %s", exc)
+        await self.save()
         return True
 
 

@@ -260,3 +260,32 @@ async def test_a_staging_build_follows_only_its_own_owner_key_and_never_reads_th
     assert trust.offer(_signed(owner, new_validator, 2)) is False
     assert await trust.refresh_owner() is False and trust.owner == staging.ss58_address
     assert trust.offer(_signed(staging, new_validator, 2)) is True
+
+
+@pytest.mark.asyncio
+async def test_a_database_a_staging_build_wrote_never_chooses_a_release_builds_trust(
+    tmp_path, monkeypatch, engine, owner, new_validator
+):
+    """A staging miner (staging owner key, `test` lines) keeps its db_data when the host switches to the release image: the
+    release build trusts no staging validator and serves it no rows trusted before."""
+    staging = Keypair.create_from_uri("//LiumTrustStagingOwner")
+    dev = ValidatorTrust(engine=engine, image_message=tmp_path / "absent.json", owner=staging.ss58_address,
+                         read_chain=False, network="test")
+    dev.load()
+    line = trust_line(new_validator.ss58_address, 10**17, "test")
+    assert dev.offer(SignedTrustMessage(line, "0x" + staging.sign(line).hex()))
+    release_line = trust_line(new_validator.ss58_address, 10**17 + 1)   # the same key signing a release line
+    assert verify_trust_message(SignedTrustMessage(release_line, "0x" + staging.sign(release_line).hex()), staging.ss58_address)
+    dev._unsaved.append(ValidatorTrustMessage(revision=10**17 + 1, message=release_line,
+                                              signature="0x" + staging.sign(release_line).hex(), signer=staging.ss58_address))
+    await dev.save()
+    prod = _start(monkeypatch, engine, tmp_path / "absent.json")
+    assert prod.held is None and new_validator.ss58_address not in prod.trusted_before
+    assert prod.owner == owner.ss58_address
+
+    async def chain(url):
+        return owner.ss58_address
+
+    monkeypatch.setattr(trust_service, "read_subnet_owner_coldkey", chain)
+    assert await prod.refresh_owner()
+    assert prod.held is None and new_validator.ss58_address not in prod.trusted_before

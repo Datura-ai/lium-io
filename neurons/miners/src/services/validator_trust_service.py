@@ -93,12 +93,13 @@ class ValidatorTrust:
         read_chain: bool = True,
         message: SignedTrustMessage | None = None,
         api_url: str | None = None,
+        network: str = "",
     ):
         self.engine = engine or db_engine
         self.image_message = image_message
         self.enabled = enabled
-        # shortcut: the owner is not stored, so after an owner change a restart trusts the release owner until a chain
-        # read succeeds; store it next to the messages if that window matters.
+        # the owner is never taken from storage: after an owner change a restart trusts the release owner until a chain
+        # read succeeds, and rows the new owner signed wait for that read (_deferred)
         # the key the start message is checked against; with read_chain off it is the only owner ever taken
         self.release_owner = owner or RELEASE_SUBNET_OWNER_COLDKEY
         self.read_chain = read_chain
@@ -106,7 +107,11 @@ class ValidatorTrust:
         self.message = message
         # a staging build reads its owner's messages from the backend that serves them, not this host's backend
         self.api_url = api_url
+        # the network this build's lines name (datura.validator_trust.trust_line): fixed at build time, never stored
+        self.network = network
         self.owner = self.release_owner
+        # stored messages the release owner did not sign: taken only once a chain read names their signer as the owner
+        self._deferred: list[SignedTrustMessage] = []
         self.held: TrustedValidator | None = None
         # every validator a message named that this miner took, the held one included
         self.trusted_before: set[str] = set()
@@ -125,12 +130,17 @@ class ValidatorTrust:
             logger.warning("Validator trust: stored messages not read: %s: %s", type(exc).__name__, exc)
             rows = []
         for row in rows:
+            # the table names no key this miner follows: a row is checked against the release owner (a fixed owner's
+            # build: its own key), and one another key signed waits for a chain read that names that key (a database a
+            # non-prod build wrote must not choose the owner, or the validators trusted before, of a release build)
+            signed = SignedTrustMessage(row.message, row.signature)
             try:
-                # a fixed owner (no chain reads) takes only its own key's stored messages
-                signer = row.signer if self.read_chain else self.owner
-                self._hold(SignedTrustMessage(row.message, row.signature), signer, stored=True)
+                self._hold(signed, self.owner, stored=True)
             except Exception as exc:
-                logger.warning("Validator trust: stored message %d ignored: %s", row.revision, exc)
+                if self.read_chain:
+                    self._deferred.append(signed)
+                else:
+                    logger.warning("Validator trust: stored message %d ignored: %s", row.revision, exc)
         try:
             start = self.message or _signed(json.loads(self.image_message.read_text()))
             self._hold(start, self.release_owner)
@@ -143,7 +153,7 @@ class ValidatorTrust:
     def _hold(self, signed: SignedTrustMessage, signer: str, stored: bool = False) -> bool:
         """Hold `signed` when `signer` signed it and its revision is higher than the held one's. Raises on a bad
         signature."""
-        trusted = verify_trust_message(signed, signer)
+        trusted = verify_trust_message(signed, signer, self.network)
         if self.held is not None and trusted.revision <= self.held.revision:
             return False
         self.held = trusted
@@ -239,6 +249,12 @@ class ValidatorTrust:
         if owner != self.owner:
             logger.warning("Validator trust: subnet owner changed from %s to %s", self.owner, owner)
             self.owner = owner
+        deferred, self._deferred = self._deferred, []
+        for signed in deferred:
+            try:
+                self._hold(signed, owner, stored=True)
+            except Exception as exc:
+                logger.warning("Validator trust: stored message dropped, not the chain owner's: %s", exc)
         return True
 
 

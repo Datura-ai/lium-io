@@ -4,12 +4,14 @@ from bittensor_wallet import Keypair
 
 from datura.validator_trust import (
     RELEASE_SUBNET_OWNER_COLDKEY,
+    STAGING_NETWORK,
     SignedTrustMessage,
     override_trust,
     subnet_owner_from_reply,
     subnet_owner_request,
     subnet_owner_storage_key,
     trust_line,
+    verify_trust_message,
 )
 
 
@@ -42,14 +44,23 @@ def test_override_trust_release_build_staging_owner_and_plain_non_prod(tmp_path,
     _override(tmp_path, monkeypatch, "plain_override_6670", '_VALIDATOR_HOTKEY_SS58 = "x"\n')
     assert override_trust("plain_override_6670") == {"enabled": False}   # non-prod without an owner: as before
     staging, validator = Keypair.create_from_uri("//StagingOwner6670"), Keypair.create_from_uri("//StagingValidator6670")
-    line = trust_line(validator.ss58_address, 1)
+    line = trust_line(validator.ss58_address, 1, STAGING_NETWORK)
     signed = {"message": line, "signature": "0x" + staging.sign(line).hex()}
     url = "https://staging.example/api"
     _override(tmp_path, monkeypatch, "staging_override_6670",
               f"_STAGING_TRUST_OWNER_SS58 = {staging.ss58_address!r}\n_STAGING_TRUST_MESSAGE = {signed!r}\n"
               f"_STAGING_TRUST_API_URL = {url!r}\n")
     assert override_trust("staging_override_6670") == {
-        "owner": staging.ss58_address, "read_chain": False, "message": SignedTrustMessage(**signed), "api_url": url}
+        "owner": staging.ss58_address, "read_chain": False, "message": SignedTrustMessage(**signed), "api_url": url,
+        "network": STAGING_NETWORK}
+    # a release line signed by the staging owner is not a staging build's start message
+    release_line = trust_line(validator.ss58_address, 1)
+    release_signed = {"message": release_line, "signature": "0x" + staging.sign(release_line).hex()}
+    _override(tmp_path, monkeypatch, "relline_override_6670",
+              f"_STAGING_TRUST_OWNER_SS58 = {staging.ss58_address!r}\n_STAGING_TRUST_MESSAGE = {release_signed!r}\n"
+              f"_STAGING_TRUST_API_URL = {url!r}\n")
+    with pytest.raises(ValueError, match="of this build"):
+        override_trust("relline_override_6670")
     # a staging owner without the backend that serves its messages would read the host's (prod) backend: refused
     for bad in ("", '_STAGING_TRUST_API_URL = "http://staging.example/api"\n', '_STAGING_TRUST_API_URL = "https://x/a\\"b"\n'):
         _override(tmp_path, monkeypatch, f"nourl_override_6670_{len(bad)}",
@@ -64,3 +75,16 @@ def test_override_trust_release_build_staging_owner_and_plain_non_prod(tmp_path,
     _override(tmp_path, monkeypatch, "badowner_override_6670", '_STAGING_TRUST_OWNER_SS58 = "not-an-address"\n')
     with pytest.raises(ValueError):
         override_trust("badowner_override_6670")
+
+
+def test_a_line_signed_for_one_network_never_verifies_as_the_other():
+    owner, validator = Keypair.create_from_uri("//NetOwner6670"), Keypair.create_from_uri("//NetValidator6670").ss58_address
+    staging_line, release_line = trust_line(validator, 7, STAGING_NETWORK), trust_line(validator, 7)
+    assert staging_line == f"lium-validator:test:{validator}:7" and release_line == f"lium-validator:{validator}:7"
+    staging_sig = SignedTrustMessage(staging_line, "0x" + owner.sign(staging_line).hex())
+    release_sig = SignedTrustMessage(release_line, "0x" + owner.sign(release_line).hex())
+    assert verify_trust_message(staging_sig, owner.ss58_address, STAGING_NETWORK) == (validator, 7)
+    assert verify_trust_message(release_sig, owner.ss58_address) == (validator, 7)
+    for signed, network in ((staging_sig, ""), (release_sig, STAGING_NETWORK)):
+        with pytest.raises(ValueError, match="of this build"):
+            verify_trust_message(signed, owner.ss58_address, network)
