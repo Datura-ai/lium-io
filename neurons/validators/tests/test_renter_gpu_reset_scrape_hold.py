@@ -623,7 +623,7 @@ async def _reset_with_gpus_lost(service, backend):
     with patch("services.docker_service.reset_pod_gpus", AsyncMock(return_value=GPUS_LOST)):
         result = await _run_reset(service, backend, return_value=connection)
     assert (result.ok, result.error_code, result.detail, result.container_restarted, result.gpus) == (
-        False, GpuResetErrorCode.ResetNotSupported, GPUS_LOST_DETAIL, False, []
+        False, GpuResetErrorCode.GpusLostOnHost, GPUS_LOST_DETAIL, False, []
     )
 
 

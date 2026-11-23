@@ -4,6 +4,8 @@ import re
 import shlex
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+
+from ssh_channel_double import create_process_answering_through
 from uuid import uuid4
 
 import pytest
@@ -73,6 +75,12 @@ class RecordingSSHClient:
             stderr=self.stderr,
             exit_status=self.exit_status,
         )
+
+    async def create_process(self, command, *args, **kwargs):
+        # only the bounded host reads open a channel here; other channel users stay unmodelled, as before
+        if not command.startswith(("cat /proc/", "ls -1d /dev/nvidia")):
+            raise AttributeError("create_process")
+        return await create_process_answering_through(self.run)(command)
 
 
 class RecordingRentalDockerClient:

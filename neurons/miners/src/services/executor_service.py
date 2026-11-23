@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import secrets
 import time
 from typing import Annotated, Optional, Union
 from uuid import UUID
@@ -17,6 +18,7 @@ from daos.executor import ExecutorDao
 from models.executor import Executor
 from services.node_address import executor_session
 from services.ssh_service import MinerSSHService
+from services.validator_trust_service import validator_trust
 
 from protocol.miner_portal_request import (
     ExecutorAdded,
@@ -108,6 +110,7 @@ UPLOAD_SSH_KEY_ATTEMPTS = 3
 UPLOAD_SSH_KEY_ATTEMPT_TIMEOUT_SECONDS = 10.0
 UPLOAD_SSH_KEY_BUDGET_SECONDS = VALIDATOR_SSH_SUBMIT_TIMEOUT_SECONDS - UPLOAD_SSH_KEY_RESPONSE_MARGIN_SECONDS
 UPLOAD_SSH_KEY_RETRY_DELAY_SECONDS = 1.0
+MINER_IDENTITY_TIMEOUT_SECONDS = 3.0
 # a retry with less time than this left cannot get the executor's answer (it collects attestation)
 UPLOAD_SSH_KEY_MIN_ATTEMPT_SECONDS = 3.0
 # the validator's clock starts when it signs the request; a request queued longer than this is read as clock skew
@@ -133,6 +136,48 @@ async def _read_capped(response: aiohttp.ClientResponse, limit: int = MAX_EXECUT
         if len(body) > limit:
             raise ExecutorAnswerTooLarge(f"answer over {limit} bytes")
     return bytes(body)
+
+
+async def _executor_own_hotkey(session: aiohttp.ClientSession, executor: Executor, deadline: float) -> str | None:
+    """The miner hotkey the executor says it is set up for (its public /miner-identity), None when it does not answer.
+
+    Not trusted for anything but picking which owner signature to relay: the executor checks that signature against its
+    own setting. Every executor that reads owner_hotkey_signatures also serves /miner-identity (DAH-5729 came first).
+    """
+    nonce = secrets.token_hex(16)
+    timeout = aiohttp.ClientTimeout(total=max(0.5, min(MINER_IDENTITY_TIMEOUT_SECONDS, deadline - time.monotonic())))
+    try:
+        async with session.get(
+            f"http://{executor.address}:{executor.port}/miner-identity", params={"nonce": nonce}, timeout=timeout,
+            allow_redirects=False,
+        ) as response:
+            if response.status != 200:
+                return None
+            answer = json.loads(await _read_capped(response))
+    except (*_UPLOAD_RETRY_ERRORS, ExecutorAnswerTooLarge, ValueError):
+        return None
+    if not isinstance(answer, dict) or answer.get("nonce") != nonce or not isinstance(answer.get("miner_hotkey"), str):
+        return None
+    return answer["miner_hotkey"]
+
+
+# executor uuid -> the hotkey its /miner-identity last named; read off the upload path so it never spends an upload's deadline
+_executor_own_hotkeys: dict[str, str] = {}
+_identity_reads: set[asyncio.Task] = set()
+
+
+async def _learn_own_hotkey(executor: Executor) -> str | None:
+    async with executor_session() as session:
+        own = await _executor_own_hotkey(session, executor, time.monotonic() + MINER_IDENTITY_TIMEOUT_SECONDS)
+    if own:
+        _executor_own_hotkeys[str(executor.uuid)] = own
+    return own
+
+
+def _learn_own_hotkey_later(executor: Executor) -> None:
+    task = asyncio.create_task(_learn_own_hotkey(executor))
+    _identity_reads.add(task)
+    task.add_done_callback(_identity_reads.discard)
 
 
 class PubkeyRegistration(pydantic.BaseModel):
@@ -323,9 +368,11 @@ class ExecutorService:
         at registration, by executor id, from the same portal read as the list (DAH-5729). `node_accounts` likewise
         gets the hotkeys and account claim the portal checked the node against (`node_hotkeys`, `account_claim`,
         DAH-6539)."""
+        # the trusted validator also gets the rows keyed to a validator this miner trusted before
+        served_keys = validator_trust.served_keys(validator_hotkey)
         # Standard mode: use local DB, in Standard mode
         if not settings.CENTRAL_MODE:
-            return self.executor_dao.get_executors_for_validator(validator_hotkey, executor_id)
+            return self.executor_dao.get_executors_for_validator(served_keys, executor_id)
 
         # Central mode: fetch from portal
         from clients.miner_portal_api import MinerPortalAPI
@@ -343,7 +390,7 @@ class ExecutorService:
         result: list[Executor] = []
         for item in data:
             try:
-                if item.get("validator_hotkey") != validator_hotkey:
+                if item.get("validator_hotkey") not in served_keys:
                     continue
 
                 uuid = UUID(item.get("id"))
@@ -378,6 +425,7 @@ class ExecutorService:
         nonce: str | None = None,
         miner_hotkey: str | None = None,
         validator_miner_signature: str | None = None,
+        owner_hotkey_signatures: dict[str, str] | None = None,
         deadline: float | None = None,
     ) -> ExecutorSSHInfo | None:
         """TODO: Send API request to executor with pubkey
@@ -409,7 +457,7 @@ class ExecutorService:
             # relayed verbatim: the executor checks the validator signed this key for its own miner
             payload["miner_hotkey"] = miner_hotkey
             payload["validator_miner_signature"] = validator_miner_signature
-        
+
         base_log_extra = {
             "executor_id": str(executor.uuid),
             "executor_address": executor.address,
@@ -423,7 +471,18 @@ class ExecutorService:
             ),
         )
         async with executor_session() as session:
-            for attempt in range(1, UPLOAD_SSH_KEY_ATTEMPTS + 1):
+            # DAH-6740: relay only the entry the executor checks (an owner's whole map can pass its 256 KiB body limit),
+            # known from an earlier identity read; the upload itself never waits on that read
+            looked_up = False
+            if owner_hotkey_signatures:
+                own = _executor_own_hotkeys.get(str(executor.uuid))
+                if own in owner_hotkey_signatures:
+                    payload["owner_hotkey_signatures"] = {own: owner_hotkey_signatures[own]}
+                elif own is None:
+                    _learn_own_hotkey_later(executor)
+            attempt, attempts = 0, UPLOAD_SSH_KEY_ATTEMPTS
+            while attempt < attempts:
+                attempt += 1
                 # the first attempt keeps main's full timeout, so a slow portal lookup never fails an upload main
                 # accepted; only the retries are clipped to the deadline
                 total = UPLOAD_SSH_KEY_ATTEMPT_TIMEOUT_SECONDS
@@ -434,6 +493,24 @@ class ExecutorService:
                 try:
                     async with session.post(url, json=payload, timeout=timeout, allow_redirects=False) as response:
                         body = await _read_capped(response)
+                        if response.status == 403 and owner_hotkey_signatures and not looked_up:
+                            # refused for its binding: read which hotkey it is set up for now, retry with that entry
+                            looked_up = True
+                            own = await _executor_own_hotkey(session, executor, deadline)
+                            # a transient identity failure is read again while a read plus the retry still fit
+                            while own is None and deadline - time.monotonic() - UPLOAD_SSH_KEY_RETRY_DELAY_SECONDS \
+                                    >= MINER_IDENTITY_TIMEOUT_SECONDS + UPLOAD_SSH_KEY_MIN_ATTEMPT_SECONDS:
+                                await asyncio.sleep(UPLOAD_SSH_KEY_RETRY_DELAY_SECONDS)
+                                own = await _executor_own_hotkey(session, executor, deadline)
+                            if own:
+                                _executor_own_hotkeys[str(executor.uuid)] = own
+                            entry = {own: owner_hotkey_signatures[own]} if own in owner_hotkey_signatures else None
+                            if entry and entry != payload.get("owner_hotkey_signatures") \
+                                    and deadline - time.monotonic() >= UPLOAD_SSH_KEY_MIN_ATTEMPT_SECONDS:
+                                payload["owner_hotkey_signatures"] = entry
+                                # the signed retry is its own step: a refusal on the last attempt still sends it
+                                attempts = max(attempts, attempt + 1)
+                                continue
                         if response.status != 200:
                             text = body.decode(errors="replace")
                             logger.error(
@@ -460,7 +537,7 @@ class ExecutorService:
                         return ExecutorSSHInfo.parse_obj(response_obj)
                 except _UPLOAD_RETRY_ERRORS as e:
                     time_left = deadline - time.monotonic() - UPLOAD_SSH_KEY_RETRY_DELAY_SECONDS
-                    if attempt < UPLOAD_SSH_KEY_ATTEMPTS and time_left >= UPLOAD_SSH_KEY_MIN_ATTEMPT_SECONDS:
+                    if attempt < attempts and time_left >= UPLOAD_SSH_KEY_MIN_ATTEMPT_SECONDS:
                         await asyncio.sleep(UPLOAD_SSH_KEY_RETRY_DELAY_SECONDS)
                         # a delay that overran (busy event loop) must not start a retry past the deadline
                         if deadline - time.monotonic() >= UPLOAD_SSH_KEY_MIN_ATTEMPT_SECONDS:
@@ -545,6 +622,7 @@ class ExecutorService:
         executor_id: Optional[str] = None,
         nonce: str | None = None,
         validator_miner_signature: str | None = None,
+        owner_hotkey_signatures: dict[str, str] | None = None,
         is_rental_request: bool = False,
         requested_at: float | None = None,
     ) -> PubkeyRegistration:
@@ -580,7 +658,7 @@ class ExecutorService:
                 self.send_pubkey_to_executor(
                     executor, pubkey.decode("utf-8"), validator_signature, nonce=nonce,
                     miner_hotkey=miner_hotkey, validator_miner_signature=validator_miner_signature,
-                    deadline=deadline,
+                    owner_hotkey_signatures=owner_hotkey_signatures, deadline=deadline,
                 ),
                 name=f"{executor}.send_pubkey_to_executor",
             )

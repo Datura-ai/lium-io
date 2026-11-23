@@ -408,6 +408,16 @@ class PublicHostResolver(AbstractResolver):
         pass
 
 
+class PublicHostConnector(aiohttp.TCPConnector):
+    """aiohttp dials an IP literal as given, without asking the resolver, so the public-address rule for a literal is
+    applied here: for the first request and for any address a response redirects to."""
+
+    async def _resolve_host(self, host: str, port: int, traces=None) -> list[ResolveResult]:
+        if is_ip_literal(host):
+            _check_literal(host, port)
+        return await super()._resolve_host(host, port, traces)
+
+
 def public_host_connector(**kwargs) -> aiohttp.TCPConnector:
-    """A TCPConnector for HTTP requests to a node's address (a hostname is pinned, see above)."""
-    return aiohttp.TCPConnector(resolver=PublicHostResolver(), **kwargs)
+    """A TCPConnector for HTTP requests to a node's address (a hostname is pinned, a literal checked, see above)."""
+    return PublicHostConnector(resolver=PublicHostResolver(), **kwargs)

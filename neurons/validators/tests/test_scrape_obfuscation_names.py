@@ -108,3 +108,22 @@ def test_no_script_calls_its_own_functions_with_keyword_arguments() -> None:
             and node.keywords
         ]
         assert keyword_calls == [], "call these positionally — the packaged script cannot take those keywords"
+
+
+def test_obfuscated_nested_def_and_lambda_keep_their_bindings() -> None:
+    # Arrange: the shape of get_needrestart_guard's unknowable(why) helper (lium-io#2333 review)
+    source = (
+        "def outer(value):\n"
+        "    def unknowable(why):\n"
+        "        return 'partial', why\n"
+        "    double = lambda n: n * 2\n"
+        "    return unknowable(double(value))\n"
+    )
+    namespace: dict = {}
+
+    # Act
+    exec(compile(obfuscate_code(source), "<obfuscated>", "exec"), namespace)
+    (outer,) = [f for name, f in namespace.items() if name.startswith("_") and callable(f) and f.__code__.co_argcount == 1]
+
+    # Assert
+    assert outer(21) == ("partial", 42)
