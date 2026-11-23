@@ -469,6 +469,45 @@ async def test_tenant_enforcement_skips_pod_not_running_when_backend_says_inacti
 
 
 @pytest.mark.asyncio
+async def test_a_pod_a_halt_judged_closed_is_not_judged_again_later_in_the_run(context_factory):
+    """DAH-5933 review: a later rented halt in the same run looked the closed pod up again, and an unanswered lookup
+    then read as a live rental. A pod an earlier halt judged closed is not judged again."""
+    from neurons.validators.src.services.task.checks.rented_machine import RentedSinceStartCheck
+
+    rented_data = build_rented_data(
+        "executor-123", {"containers": [{"name": "tenant-123", "pod_id": "pod-1"}], "owner_flag": False}
+    )
+    backend = DummyBackendClient(active=False)
+    services = build_services(
+        score_calculator=DummyScoreCalculator(actual_score=1.0, job_score=1.0, warning=""),
+        container_cleanup=MockContainerCleanup(),
+        backend=backend,
+    )
+    ctx = context_factory(
+        services=services,
+        config=build_context_config(),
+        state=build_state(gpu_processes=[], gpu_details=[], gpu_model="NVIDIA RTX 4090", rented_data=rented_data),
+        ssh=DummySSHClient(pod_running=False),
+        collateral_deposited=True,
+        is_rental_succeed=True,
+        contract_version="v1.0.0",
+    )
+    halt = RentedSinceStartCheck(TenantEnforcementCheck())
+
+    first = await halt.run(ctx)
+    assert first.event.reason_code == Msg.STALE_POD_NOT_RUNNING.reason
+    ctx = ctx.model_copy(update=first.updates)
+    backend.active = None  # the next lookup would go unanswered
+
+    second = await halt.run(ctx)
+
+    assert second.passed is True and not second.halt
+    assert second.event.reason_code == "EXECUTOR_STILL_NOT_RENTED"
+    assert ctx.rented is False
+    assert backend.called_with == ["pod-1"]
+
+
+@pytest.mark.asyncio
 async def test_tenant_enforcement_withholds_the_verdict_when_the_backend_state_is_unknown(context_factory):
     executor_uuid = "executor-123"
     rented_data = build_rented_data(
