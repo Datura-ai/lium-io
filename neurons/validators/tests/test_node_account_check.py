@@ -489,7 +489,7 @@ async def test_a_reset_waits_for_the_rollout_decision_only_when_its_own_cause_is
     service.pipeline_factory = MagicMock(build_context=AsyncMock(return_value=MagicMock(verified={})))
     service.pipeline_factory.build_pipeline.return_value.run = AsyncMock(return_value=run)
     miner = MinerJobRequestPayload(
-        job_batch_id="batch-1", miner_hotkey=POOL, miner_coldkey="5Cold", miner_address="10.0.0.5", miner_port=8080,
+        job_batch_id="batch-1", miner_hotkey=POOL, miner_coldkey="5Cold", miner_address="192.0.2.5", miner_port=8080,
     )
     with (
         patch("services.task.service.InteractiveShellService", _Shell),
