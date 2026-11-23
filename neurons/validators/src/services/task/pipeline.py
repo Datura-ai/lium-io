@@ -182,7 +182,7 @@ class ContextState:
     gpu_details: list[dict] = field(default_factory=list)
     # DAH-6571: wall time (time.time()) the scrape that produced gpu_details began; its readings are no older.
     # None = unknown (no scrape ran this cycle)
-    gpu_details_read_after: float | None = None
+    gpu_details_scrape_started_at: float | None = None
     gpu_processes: list[dict] = field(default_factory=list)
     sysbox_runtime: bool = False
     supports_gpu_splitting: bool = False

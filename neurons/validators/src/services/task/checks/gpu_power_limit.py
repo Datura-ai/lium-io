@@ -130,6 +130,13 @@ class LiveCapReadout:
     recapped_watts_by_uuid: dict[str, int]
 
 
+def _scrape_started_at(ctx: Context, observed_at: float) -> float:
+    """Wall time this cycle's scrape began; the cycle start when no scrape time is known (DAH-6571)."""
+    if ctx.state.gpu_details_scrape_started_at is not None:
+        return ctx.state.gpu_details_scrape_started_at
+    return observed_at - (time.monotonic() - ctx.started_at_monotonic)
+
+
 class GpuPowerLimitCheck:
     """Gate validation on the current GPU power cap relative to the default cap."""
 
@@ -394,13 +401,11 @@ class GpuPowerLimitCheck:
         observed_at = time.time()
         # DAH-6571: the readings come from this cycle's scrape; a cap applied after that scrape began may be newer
         # than them, and its pre-cap reading would look like a revert. A cap applied before it is judged.
-        read_after = ctx.state.gpu_details_read_after
-        if read_after is None:
-            read_after = observed_at - (time.monotonic() - ctx.started_at_monotonic)
+        scrape_started_at = _scrape_started_at(ctx, observed_at)
         reverts: list[GpuPowerCapRevert] = []
         for record in records:
             measurement = live_watts_by_uuid.get(record.gpu_uuid)
-            if measurement is None or measurement.power_limit is None or record.capped_at > read_after:
+            if measurement is None or measurement.power_limit is None or record.capped_at > scrape_started_at:
                 continue
             revert = detect_cap_revert(
                 record, measurement.power_limit, measurement.power_default_limit, observed_at

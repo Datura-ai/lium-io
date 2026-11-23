@@ -447,7 +447,7 @@ class MachineSpecScrapeCheck:
                     )
                 )
         # every read below (the Python scrape, its retry, the liumd facts task) starts after this
-        read_after = time.time()
+        scrape_started_at = time.time()
         if liumd_specs:
             result = await self._scrape_with_liumd(ctx)
         elif ctx.config.machine_scrape_source:
@@ -458,7 +458,7 @@ class MachineSpecScrapeCheck:
             result = await self._scrape_uploaded_binary(ctx, timeout, start_shadow=True)
         state = result.updates.get("state")
         if isinstance(state, ContextState):
-            result.updates["state"] = replace(state, gpu_details_read_after=read_after)
+            result.updates["state"] = replace(state, gpu_details_scrape_started_at=scrape_started_at)
         return result
 
     async def _scrape_with_liumd(self, ctx: Context) -> CheckResult:

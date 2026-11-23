@@ -274,7 +274,7 @@ async def _run_check_while_filler_runs(
     records: list[GpuPowerRestoreRecord],
     live_watts_by_uuid: list[tuple[str, float]],
     ssh: AsyncMock | None = None,
-    read_after: float | None = None,
+    scrape_started_at: float | None = None,
     cycle_age: float = 0.0,
 ) -> None:
     monkeypatch.setattr(
@@ -283,7 +283,7 @@ async def _run_check_while_filler_runs(
         AsyncMock(return_value=GpuPowerRestoreReadResult(records=records, read_failed=False)),
     )
     ctx = context_factory(
-        state=dataclasses.replace(_running_filler_state(*live_watts_by_uuid), gpu_details_read_after=read_after),
+        state=dataclasses.replace(_running_filler_state(*live_watts_by_uuid), gpu_details_scrape_started_at=scrape_started_at),
         services=build_services(redis=redis),
         ssh=ssh or host_with_running_fillers(),
         started_at_monotonic=time.monotonic() - cycle_age,
@@ -343,7 +343,7 @@ async def test_a_cap_applied_mid_cycle_before_the_scrape_began_is_judged(context
     record = _record().model_copy(update={"capped_at": scrape_began - 5})
 
     await _run_check_while_filler_runs(
-        context_factory, monkeypatch, redis, [record], [("GPU-a", 400.0)], read_after=scrape_began, cycle_age=60
+        context_factory, monkeypatch, redis, [record], [("GPU-a", 400.0)], scrape_started_at=scrape_began, cycle_age=60
     )
 
     assert _revert_key(CHECK_EXECUTOR_UUID) in redis.store
@@ -357,7 +357,7 @@ async def test_a_cap_applied_after_the_scrape_began_is_not_judged_on_it(context_
     record = _record().model_copy(update={"capped_at": scrape_began + 1})
 
     await _run_check_while_filler_runs(
-        context_factory, monkeypatch, redis, [record], [("GPU-a", 400.0)], read_after=scrape_began, cycle_age=60
+        context_factory, monkeypatch, redis, [record], [("GPU-a", 400.0)], scrape_started_at=scrape_began, cycle_age=60
     )
 
     assert _revert_key(CHECK_EXECUTOR_UUID) not in redis.store

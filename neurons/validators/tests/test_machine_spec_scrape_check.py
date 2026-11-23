@@ -82,6 +82,7 @@ class DummySSHCommandRunner:
         """
         self.results = results or [result]
         self.calls: list[RunCall] = []
+        self.run_times: list[float] = []
 
     @property
     def called_with(self) -> RunCall | None:
@@ -95,6 +96,7 @@ class DummySSHCommandRunner:
         stdin_text: str | None = None,
     ) -> SSHCommandResult:
         self.calls.append(RunCall(command, timeout, retryable, stdin_text))
+        self.run_times.append(time.time())
         return self.results[min(len(self.calls) - 1, len(self.results) - 1)]
 
 
@@ -159,7 +161,7 @@ async def test_machine_spec_scrape_preserves_raw_a10_name_for_native_challenge(
     assert result.passed is True
     updated_state = result.updates["state"]
     # DAH-6571: the power-cap check judges a cap only against readings taken after it
-    assert before <= updated_state.gpu_details_read_after <= time.time()
+    assert before <= updated_state.gpu_details_scrape_started_at <= runner.run_times[0]
     assert updated_state.specs["gpu"]["details"][0]["name"] == "NVIDIA A10"
     assert updated_state.gpu_details[0]["name"] == "NVIDIA A10 Tensor Core GPU"
     assert updated_state.gpu_model == "NVIDIA A10 Tensor Core GPU"
