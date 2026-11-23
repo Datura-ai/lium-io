@@ -54,19 +54,12 @@ class ExecutorDao(BaseDao):
         self.session.commit()
         return True
 
-    def get_executors_for_validator(self, validator_key: str, executor_id: Optional[str] = None) -> list[Executor]:
-        """Get executors that opened to valdiator
-
-        Args:
-            validator_key (str): validator hotkey string
-
-        Return:
-            List[Executor]: list of Executors
-        """
+    def get_executors_for_validator(self, validator_keys: set[str], executor_id: Optional[str] = None) -> list[Executor]:
+        """The executors whose rows are keyed to any of `validator_keys` (and with `executor_id`, when given)."""
+        query = self.session.query(Executor).filter(Executor.validator.in_(validator_keys))
         if executor_id:
-            return list(self.session.query(Executor).filter_by(validator=validator_key, uuid=executor_id))
-
-        return list(self.session.query(Executor).filter_by(validator=validator_key))
+            query = query.filter_by(uuid=executor_id)
+        return list(query)
 
     def count_executors_for_validator(self, validator_key: str) -> int:
         count_query = select(func.count(Executor.uuid)).where(Executor.validator == validator_key)
