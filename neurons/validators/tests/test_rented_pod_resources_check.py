@@ -67,6 +67,7 @@ def _ctx(context_factory, ssh):
 async def _run(ctx):
     with patch(SETTINGS) as s:
         s.RENTED_POD_RESOURCES_CHECK_ENABLED = True
+        s.DRY_RUN = False
         return await RentedPodResourcesCheck().run(ctx)
 
 
@@ -202,6 +203,35 @@ async def test_cgroup_written_directly_is_seen(context_factory, cgroup_cpuset, c
 
 
 @pytest.mark.asyncio
+async def test_memory_guard_coverage_is_counted_in_the_result(context_factory):
+    ssh = _ssh(_container())
+    inner_run = ssh.run
+
+    async def run(cmd, *args, **kwargs):
+        if "MemoryMin" in cmd:
+            return SimpleNamespace(exit_status=0, stdout="memory_min_skipped no_systemd\n", stderr="")
+        return await inner_run(cmd, *args, **kwargs)
+
+    result = await _run(_ctx(context_factory, SimpleNamespace(run=run)))
+
+    assert result.event.what_we_saw["memory_guard"] == {"set": 0, "failed": ["memory_min no_systemd"]}
+
+
+@pytest.mark.asyncio
+async def test_dry_run_validator_writes_no_memory_guard_on_the_host(context_factory):
+    ctx = _ctx(context_factory, _ssh(_container()))
+    with patch(SETTINGS) as s, patch(
+        "neurons.validators.src.services.task.checks.rented_pod_resources.apply_host_memory_guard"
+    ) as guard:
+        s.RENTED_POD_RESOURCES_CHECK_ENABLED = True
+        s.DRY_RUN = True
+        result = await RentedPodResourcesCheck().run(ctx)
+
+    guard.assert_not_called()
+    assert result.event.what_we_saw["memory_guard"] == {"set": 0, "failed": []}
+
+
+@pytest.mark.asyncio
 async def test_dead_proc_fuse_mount_is_reported_never_failed(context_factory):
     err = "cat: /proc/4242/root/proc/sys/kernel/hostname: Transport endpoint is not connected"
     result = await _run(_ctx(context_factory, _ssh(_container(), proc_err=err)))
@@ -217,3 +247,12 @@ async def test_scored_finding_wins_over_dead_proc_fuse_mount(context_factory):
     result = await _run(_ctx(context_factory, _ssh(_container(cpuset="2-7"), proc_err=err)))
     assert result.passed is False
     assert result.event.reason_code == Msg.RESOURCES_REDUCED.reason
+
+
+def test_dead_proc_fuse_text_claims_no_cause_and_asks_no_runtime_restart():
+    """the read sees only ENOTCONN, never why: it must not tell a provider sysbox-fs restarted (a provider's
+    sysbox-fs was still the 13/14 Nov process after our 17 Nov notice said it restarted), nor to restart sysbox"""
+    text = Msg.PROC_FUSE_DISCONNECTED.remediation
+    assert "stopped or restarted" not in text
+    assert "restart it" not in text
+    assert "RENTED_POD_OWNERSHIP_RUNTIME_RESTARTED" in text

@@ -3,6 +3,8 @@
 import logging
 import shlex
 from unittest.mock import AsyncMock, MagicMock, Mock
+
+from ssh_channel_double import create_process_answering_through
 from uuid import uuid4
 
 import pytest
@@ -50,6 +52,7 @@ def _create_over_a_host(svc, monkeypatch, container_names, unmounted_vloopback=(
     }
     ssh_client = AsyncMock()
     ssh_client.run.side_effect = lambda cmd, *args, **kwargs: Mock(exit_status=0, stdout=answers.get(cmd, ""))
+    ssh_client.create_process = create_process_answering_through(ssh_client.run)
     docker_api = Mock(inspect_network=Mock(return_value={"Driver": "bridge", "Options": RENTAL_NETWORK_OPTIONS}))
     docker_api.create_container.return_value = {"Id": "filler-container"}
     docker_api.containers.return_value = []
@@ -74,7 +77,7 @@ async def _run(svc, payload):
     executor_info.ssh_host_key = "ssh-ed25519 AAAATESTKEY"
     # production registers every create before create_container (handle_container); the cleanup
     # removes the failed container by name only while this create is the pod's only one
-    with ds_module.inflight_creates.track(payload.pod_id):
+    with ds_module.inflight_creates.track(payload.pod_id, ds_module.executor_key(payload)):
         return await svc.create_container(payload, executor_info, Mock(ss58_address="validator-hotkey"), "private-key")
 
 

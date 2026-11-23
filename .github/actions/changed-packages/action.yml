@@ -76,8 +76,29 @@ runs:
             const latest = {};
             // the repo is public: only a member's or collaborator's review counts, not any GitHub user's
             const TEAM = ['OWNER', 'MEMBER', 'COLLABORATOR'];
-            for (const r of reviews) if (r.user && r.state !== 'COMMENTED' && TEAM.includes(r.author_association)) latest[r.user.login] = r.state;
+            // DAH-6518: a member whose org membership is private shows as CONTRIBUTOR to this job's token, so a
+            // review outside TEAM counts when its author can write to the repo (asked once per login)
+            const canWrite = new Map();
+            const writes = async login => {
+              if (!canWrite.has(login)) {
+                const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner: context.repo.owner, repo: context.repo.repo, username: login,
+                }).catch(() => ({ data: {} }));
+                canWrite.set(login, ['admin', 'maintain', 'write'].includes(data.permission));
+              }
+              return canWrite.get(login);
+            };
+            for (const r of reviews) {
+              if (!r.user || r.state === 'COMMENTED') continue;
+              if (TEAM.includes(r.author_association) || await writes(r.user.login)) latest[r.user.login] = r.state;
+            }
             approved = Object.values(latest).includes('APPROVED');
+            // an outside approval also starts route (test.yml); it must not launch the suites on a trusted reviewer's
+            // earlier approval, so on a review event the reviewer who triggered the run must count too
+            const trigger = context.payload.review;
+            if (approved && context.eventName === 'pull_request_review' && trigger?.user) {
+              approved = TEAM.includes(trigger.author_association) || await writes(trigger.user.login);
+            }
           } else {
             // merge group: base..head; push: before..after (all zeros on a new branch: no diff, every package)
             const mg = context.payload.merge_group;

@@ -84,6 +84,12 @@ def reserved_executor(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def allcards_off(monkeypatch):
+    """The one call carries the matmul only while the all-cards check (on by default) is off."""
+    monkeypatch.setattr(settings, "MATMUL_ALLCARDS_CHECK_ENABLED", False)
+
+
 @pytest.fixture
 def gpu_steps(monkeypatch):
     """The shadow's GPU steps are off by default; these tests cover what they compare."""
@@ -128,6 +134,7 @@ class FakeLiumd:
         matmul=None,
         deadline_hit=False,
         facts=None,
+        specs=None,
     ):
         self.matmul = matmul  # a dict replacing the matmul step's reply
         self.deadline_hit = deadline_hit  # the document-wide flag: any step reached the deadline
@@ -135,6 +142,7 @@ class FakeLiumd:
         self.lib_sha = lib_sha
         self.result = result
         self.facts = facts or {}
+        self.specs = specs or {}
         self.intents: list[dict] = []
         self.timeouts: list[float] = []
 
@@ -180,6 +188,7 @@ class FakeLiumd:
             "elapsed_ms": 91_000,
             "deadline_hit": self.deadline_hit,
             "steps": steps,
+            "specs": self.specs,
         }
         return parse_answer(raw, intent=intent, round_trip_ms=92_000)
 
@@ -335,6 +344,153 @@ async def test_facts_are_compared_when_both_sides_have_them(keypair, monkeypatch
 
 def _docker(*names):
     return {"docker": {"data": {"containers": [{"name": n, "status": "running"} for n in names]}}}
+
+
+PYTHON_GPU_DETAILS = [
+    {
+        "uuid": "GPU-1",
+        "name": "H100",
+        "capacity": 81559,
+        "temperature": 34,
+        "gpu_utilization": 1,
+        "memory_utilization": 2,
+        "memory_used_mb": 3,
+        "graphics_speed": 4,
+        "memory_speed": 5,
+        "power_limit": 600,
+        "pcie": 16,
+        "pcie_speed": 8000,
+        "clocks_event_reasons": 0,
+    }
+]
+LIUMD_GPU_DETAILS = [
+    {
+        "uuid": "GPU-1",
+        "name": "H100",
+        "capacity": 81559,
+        "temperature": 35,
+        "gpu_utilization": 91,
+        "memory_utilization": 92,
+        "memory_used_mb": 93,
+        "graphics_speed": 94,
+        "memory_speed": 95,
+        "power_limit": 420,
+        "pcie": 8,
+        "pcie_speed": 2500,
+        "clocks_event_reasons": 1,
+    }
+]
+PYTHON_SCRAPE = {
+    **SPECS,
+    "gpu": {"count": 1, "details": PYTHON_GPU_DETAILS},
+    "cpu": {"utilization": 10},
+    "ram": {"free": 1, "used": 2, "available": 3, "utilization": 4},
+    "hard_disk": {
+        "used": 5,
+        "free": 6,
+        "utilization": 7,
+        "engy_cache_used_gb": 8,
+        "containers": 210288,
+        "images": 100,
+        "by_container": {"c1": 100},
+        "by_volume": {"v1": 100},
+        "volumes": 200,
+    },
+    "gpu_processes": [{"pid": 100, "info": "live", "container_name": "c1"}],
+    "docker": {
+        "version": "29.10.0",
+        "host_cpu_percent": 9,
+        "containers": [
+            {"name": "c1", "cpu_percent": 10, "net_rx_bytes": 11, "net_tx_bytes": 12}
+        ],
+    },
+}
+LIUMD_SCRAPE = {
+    **SPECS,
+    "gpu": {"count": 1, "details": LIUMD_GPU_DETAILS},
+    "cpu": {"utilization": 90},
+    "ram": {"free": 91, "used": 92, "available": 93, "utilization": 94},
+    "hard_disk": {
+        "used": 95,
+        "free": 96,
+        "utilization": 97,
+        "engy_cache_used_gb": 98,
+        "containers": 210300,
+        "images": 200,
+        "by_container": {"c1": 112},
+        "by_volume": {"v1": 112},
+        "volumes": 212,
+    },
+    "gpu_processes": [{"pid": 101, "info": "live", "container_name": "c1"}],
+    "docker": {
+        "version": "29.9.3",
+        "host_cpu_percent": 99,
+        "containers": [
+            {"name": "c1", "cpu_percent": 100, "net_rx_bytes": 101, "net_tx_bytes": 102}
+        ],
+    },
+    "vloopback_check": {"verdict": "supported"},
+}
+
+
+@pytest.mark.asyncio
+async def test_specs_are_compared_from_the_post_scrape_snapshot(
+    keypair, monkeypatch, verifyx_service
+):
+    later = {**SPECS, "port_verify_first_miss": True, "split_disk": {"free": 1}}
+    state = build_state(specs=later, scrape_specs=PYTHON_SCRAPE)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=LIUMD_SCRAPE))
+
+    assert record["specs_agree"] is True
+    assert record["specs_diff"] == []
+
+
+@pytest.mark.asyncio
+async def test_specs_agree_is_none_without_the_python_snapshot(
+    keypair, monkeypatch, verifyx_service
+):
+    ctx = _ctx(keypair, monkeypatch, verifyx_service)
+
+    record = await _shadow(ctx, FakeLiumd(specs=SPECS))
+
+    assert record["specs_agree"] is None
+    assert record["specs_diff"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_real_specs_difference_is_reported(keypair, monkeypatch, verifyx_service):
+    changed = {**SPECS, "gpu": {"count": 2, "details": SPECS["gpu"]["details"]}}
+    state = build_state(specs=SPECS, scrape_specs=SPECS)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=changed))
+
+    assert record["specs_agree"] is False
+    assert [diff["path"] for diff in record["specs_diff"]] == ["gpu.count"]
+
+
+@pytest.mark.asyncio
+async def test_docker_facts_come_from_the_scrape_snapshot(
+    keypair, monkeypatch, verifyx_service
+):
+    snapshot = {**SPECS, "docker": {"containers": [{"name": "executor-1", "container_id": "c1"}]}}
+    later = {
+        **SPECS,
+        "docker": {
+            "containers": [
+                {"name": "executor-1", "container_id": "c1"},
+                {"name": "pod_x", "container_id": "c2"},
+            ]
+        },
+    }
+    state = build_state(specs=later, scrape_specs=snapshot)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(facts=_docker("executor-1")))
+
+    assert record["facts_agree"] is True
 
 
 def _with_facts_task(ctx, early):

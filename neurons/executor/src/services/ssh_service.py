@@ -1,5 +1,8 @@
 import asyncio
+import base64
+import binascii
 import getpass
+import hashlib
 import ipaddress
 import logging
 import os
@@ -11,6 +14,7 @@ from collections.abc import Callable
 from http import HTTPStatus
 
 import requests
+from cryptography.hazmat.primitives.serialization import load_ssh_public_key
 from pydantic import BaseModel
 
 from core.config import VALIDATOR_SSH_SOURCES, settings
@@ -19,8 +23,8 @@ from dependencies.auth import match_validator_hotkey
 logger = logging.getLogger(__name__)
 
 # DAH-3394: every key /upload_ssh_key appends carries this trailing comment token with the upload
-# time; the purge below expires marked lines only. Lines without it are the previous release's
-# uploads, which the startup stamp (stamp_legacy_uploaded_keys) marks once. sshd treats
+# time; the purge below expires marked lines and drops unmarked key lines. The previous release's
+# uploads lack it and are marked once by the startup stamp (stamp_legacy_uploaded_keys). sshd treats
 # everything after the key material as a comment, so the token changes nothing for logins.
 UPLOADED_KEY_MARKER = b"lium-uploaded-at="
 
@@ -80,6 +84,26 @@ SSH_SOURCES_CACHE_SECONDS = 300
 SSH_SOURCES_TIMEOUT_SECONDS = 5.0
 SSH_SOURCES_MAX_SKEW_SECONDS = 10 * 60
 
+
+
+AUTHORIZED_KEY_TYPES = frozenset(
+    {"ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa"}
+)
+
+
+def check_authorized_key(pub_key: str) -> None:
+    """Raise ValueError unless `pub_key` is `<type> <base64> [comment]` holding a real public key.
+
+    sshd reads anything before the key type as options (command=, environment=, ...), so a line
+    must start with an allowed type and the key must parse.
+    """
+    parts = pub_key.split()
+    if len(parts) < 2 or parts[0] not in AUTHORIZED_KEY_TYPES:
+        raise ValueError("an authorized_keys entry is a public key of an allowed type, with no options")
+    try:
+        load_ssh_public_key(f"{parts[0]} {parts[1]}".encode())
+    except Exception as exc:
+        raise ValueError(f"not a valid {parts[0]} public key") from exc
 
 class SshSourcesAnswer(BaseModel):
     """The `/watchtower/ssh-sources` answer (lium-platform SignedSshSourcesResponse)."""
@@ -242,21 +266,40 @@ def stamp_legacy_uploaded_keys(now: float | None = None) -> int | None:
     return stamped
 
 
-def purge_expired_uploaded_keys(ttl_s: int, now: float | None = None) -> int:
-    """Drop every marked key uploaded more than `ttl_s` seconds ago; returns how many.
+def _key_fingerprint(line: bytes) -> str:
+    """`SHA256:...` as ssh-keygen -l prints it, from the first token that decodes to an ssh key blob."""
+    for token in line.split():
+        try:
+            blob = base64.b64decode(token, validate=True)
+        except (binascii.Error, ValueError):
+            continue
+        type_len = int.from_bytes(blob[:4], "big")
+        if blob[4 : 4 + type_len].startswith((b"ssh-", b"ecdsa-", b"sk-")):
+            return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+    return "unparsed"
 
-    Only lines carrying UPLOADED_KEY_MARKER are candidates; every other line is kept unchanged.
-    A marked line whose timestamp cannot be read, or lies more than `ttl_s` in the future (the
-    host clock was stepped back after the upload), is dropped too: the marker is ours, so an age
-    we cannot bound is a key we cannot bound. Every marked key therefore lives at most 2 × ttl_s.
+
+def purge_expired_uploaded_keys(ttl_s: int, now: float | None = None) -> int:
+    """Drop every marked key uploaded more than `ttl_s` seconds ago and every unmarked key line; returns how many.
+
+    Every key we install goes through /upload_ssh_key and carries UPLOADED_KEY_MARKER, so an unmarked key line
+    was written past that route and is dropped (blank lines and `#` comments stay). A marked line whose
+    timestamp cannot be read, or lies more than `ttl_s` in the future (the host clock was stepped back after
+    the upload), is dropped too: the marker is ours, so an age we cannot bound is a key we cannot bound.
+    Every marked key therefore lives at most 2 × ttl_s.
     """
     now = time.time() if now is None else now
     path = authorized_keys_path()
+    unmarked: list[bytes] = []
 
     def keep(line: bytes) -> bool:
+        stripped = line.strip()
+        if not stripped or stripped.startswith(b"#"):
+            return True
         _, uploaded_at = _split_marker(line)
         if uploaded_at is None:
-            return True
+            unmarked.append(stripped)
+            return False
         try:
             return abs(now - int(uploaded_at)) <= ttl_s
         except ValueError:
@@ -264,9 +307,17 @@ def purge_expired_uploaded_keys(ttl_s: int, now: float | None = None) -> int:
 
     with _authorized_keys_lock:
         try:
-            return _rewrite_authorized_keys(path, keep)
+            removed = _rewrite_authorized_keys(path, keep)
         except FileNotFoundError:
             return 0
+    if unmarked:
+        # fingerprints only: the key text is never logged
+        logger.warning(
+            "removed %d unmarked ssh key line(s): %s",
+            len(unmarked),
+            ", ".join(_key_fingerprint(line) for line in unmarked),
+        )
+    return removed
 
 
 async def run_ssh_sources_refresh() -> None:
@@ -284,21 +335,19 @@ async def run_uploaded_key_purge() -> None:
     ttl_s = settings.EXECUTOR_UPLOADED_KEY_TTL_S
     interval_s = settings.EXECUTOR_UPLOADED_KEY_PURGE_INTERVAL_S
     logger.info("uploaded ssh keys expire after %ss (checked every %ss)", ttl_s, interval_s)
-    try:
-        stamped = stamp_legacy_uploaded_keys()
-        if stamped is not None:
-            # the count is the record that the upgrade closed the legacy access on this node
-            (logger.warning if stamped else logger.info)("legacy keys stamped: %d", stamped)
-    except Exception:
-        logger.exception("legacy ssh key stamp failed; the purge still runs")
     while True:
         try:
+            # every pass until it has run once: a failed stamp skips the purge, which would drop the unstamped keys
+            stamped = stamp_legacy_uploaded_keys()
+            if stamped is not None:
+                # the count is the record that the upgrade closed the legacy access on this node
+                (logger.warning if stamped else logger.info)("legacy keys stamped: %d", stamped)
             removed = purge_expired_uploaded_keys(ttl_s)
             if removed:
                 # the count only: a key still present after its TTL is what this line reports
-                logger.warning("removed %d uploaded ssh key(s) older than %ss", removed, ttl_s)
+                logger.warning("removed %d ssh key line(s): expired after %ss or unmarked", removed, ttl_s)
         except Exception:
-            logger.exception("uploaded ssh key purge failed; retrying next interval")
+            logger.exception("uploaded ssh key stamp or purge failed; retrying next interval")
         await asyncio.sleep(interval_s)
 
 
@@ -308,6 +357,7 @@ class SSHService:
         if "\n" in pub_key or "\r" in pub_key:
             # a second line would be a second, unmarked key that no TTL reaches
             raise ValueError("an authorized_keys entry is one line")
+        check_authorized_key(pub_key)
         line = _validator_source_pin_option() + pub_key.encode() + b" " + UPLOADED_KEY_MARKER + str(int(time.time())).encode() + b"\n"
         with _authorized_keys_lock:
             path = authorized_keys_path()

@@ -60,6 +60,11 @@ class ExecutorSSHInfo(pydantic.BaseModel):
     # by a central miner. The validator requires the host key presented in its SSH handshake to be this one for a
     # hostname-addressed node. None from a standalone or older miner, or a portal that does not record it.
     expected_ssh_host_key: str | None = None
+    # DAH-6539: the hotkeys the listing account's nodes may be set up for (its own and its listing hotkey) and, for a
+    # pool-hotkey account, the claim its nodes report (MINER_ACCOUNT_CLAIM), as the portal checked them at
+    # registration. The validator requires the machine it reached to be set up for them. None from an older miner.
+    expected_node_hotkeys: list[str] | None = None
+    expected_account_claim: str | None = None
 
 
 class AcceptSSHKeyRequest(BaseMinerRequest):

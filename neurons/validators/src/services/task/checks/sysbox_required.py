@@ -14,6 +14,7 @@ from .rental_owner import rental_of_this_node
 _NVIDIA_HOOK_TEMPLATE_BY_REASON_CODE: dict[str, MessageTemplate] = {
     Msg.NVIDIA_RUNTIME_MISMATCH.reason: Msg.NVIDIA_RUNTIME_MISMATCH,
     Msg.NVIDIA_CONTAINER_HOOK_FAILED.reason: Msg.NVIDIA_CONTAINER_HOOK_FAILED,
+    Msg.NVIDIA_TOOLKIT_CDI_MODE.reason: Msg.NVIDIA_TOOLKIT_CDI_MODE,
 }
 
 

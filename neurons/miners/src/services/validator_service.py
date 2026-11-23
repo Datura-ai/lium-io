@@ -5,6 +5,7 @@ from fastapi import Depends
 from daos.executor import ExecutorDao
 from daos.validator import ValidatorDao
 from core.config import settings
+from services.validator_trust_service import validator_trust
 
 
 class ValidatorRowMigration(NamedTuple):
@@ -44,4 +45,4 @@ class ValidatorService:
         if settings.debug.SKIP_VALIDATOR_REGISTRATION_CHECK:
             return True
 
-        return validator_hotkey in settings.accepted_validator_hotkeys
+        return validator_hotkey in validator_trust.hotkeys()

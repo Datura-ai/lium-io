@@ -10,6 +10,7 @@ synthesis next to it); the last tests drive the REST path end to end, so the emp
 and the result list are checked where the cycle reads them.
 """
 
+import time
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
@@ -306,3 +307,67 @@ async def test_a_miner_whose_only_rented_node_is_down_gets_a_row_for_the_node_no
 
     assert [r.executor_info.uuid for r in out["results"]] == [MISSING]
     assert out["results"][0].failure_reason_code == "RENTED_EXECUTOR_NOT_LISTED"
+
+
+# --- DAH-6596: a row older than an express pass in the same wave ----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_not_listed_row_built_before_a_same_wave_express_pass_is_not_published():
+    """16 Nov: the wave built the row at 19:09:53, the express lane passed the node at 19:13:54 and 19:14:48 under the
+    same cycle id, and the row published at 19:17:23 turned the node red again while its pod kept running."""
+    service = missed_last_cycle(make_service(), MISSING)
+    service.redis_service.publish = AsyncMock(return_value=1)
+    payload = make_payload()
+    [row] = build(service, RentedExecutorsResponse(executors={MISSING: rented(), LISTED: rented()}))
+    service.express_published[MISSING] = payload.job_batch_id
+    service.express_published_miner[MISSING] = payload.miner_hotkey
+    service.express_passed_at[MISSING] = row.observed_at + 1
+
+    await service.publish_machine_specs([row], payload.miner_hotkey, payload.miner_coldkey)
+
+    service.redis_service.publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["built_after_the_pass", "pass_in_an_older_cycle", "pass_for_another_miner"])
+async def test_a_not_listed_row_newer_than_any_express_pass_still_publishes(case):
+    service = missed_last_cycle(make_service(), MISSING)
+    service.redis_service.publish = AsyncMock(return_value=1)
+    payload = make_payload()
+    [row] = build(service, RentedExecutorsResponse(executors={MISSING: rented(), LISTED: rented()}))
+    service.express_published[MISSING] = payload.job_batch_id
+    service.express_published_miner[MISSING] = payload.miner_hotkey
+    service.express_passed_at[MISSING] = row.observed_at + 1
+    if case == "built_after_the_pass":
+        service.express_passed_at[MISSING] = row.observed_at - 1
+    elif case == "pass_in_an_older_cycle":
+        service.express_published[MISSING] = "2026-09-16 13:06:48"
+    else:
+        service.express_published_miner[MISSING] = OTHER_MINER_HOTKEY
+
+    await service.publish_machine_specs([row], payload.miner_hotkey, payload.miner_coldkey)
+
+    assert service.redis_service.publish.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_an_express_pass_while_the_wave_runs_its_other_nodes_makes_the_row_stale(rest_service):
+    # review 4601831891: the row is built after the miner's whole task run; it says what the miner answered before it
+    rest_service.miner_returns(LISTED)
+    missed_last_cycle(rest_service, MISSING)
+    payload = make_payload()
+
+    async def create_task(miner_info, executor_info, **_):
+        # the express lane passes the missing node while the wave checks the listed one
+        rest_service.express_published[MISSING] = payload.job_batch_id
+        rest_service.express_published_miner[MISSING] = payload.miner_hotkey
+        rest_service.express_passed_at[MISSING] = time.monotonic()
+        return _job_result(executor_info.uuid)
+
+    rest_service.task_service.create_task = AsyncMock(side_effect=create_task)
+
+    out = await request(rest_service, RentedExecutorsResponse(executors={MISSING: rented(), LISTED: rented()}))
+
+    [row] = [r for r in out["results"] if r.executor_info.uuid == MISSING]
+    assert rest_service._express_passed_after_miner_answer(row, payload.miner_hotkey)

@@ -316,7 +316,10 @@ async def start_storage_operation(
         terminal_cleanup = (
             ""
             if retain_terminal_artifacts
-            else f"; rm -f {shlex.quote(str(files.status))} {shlex.quote(str(files.log))}"
+            # a failed run keeps its log: a runner that dies before reporting leaves no other trace
+            else f"; rm -f {shlex.quote(str(files.status))}; "
+            f'if [ "$result" = 0 ]; then rm -f {shlex.quote(str(files.log))}; '
+            f"else echo \"runner exited $result\" >> {shlex.quote(str(files.log))}; fi"
         )
         # Bootstrap callers consume the terminal files; detached online jobs
         # remove them themselves after the runner has finished reporting.

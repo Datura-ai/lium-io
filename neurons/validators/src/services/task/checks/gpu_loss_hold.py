@@ -13,7 +13,8 @@ is dropped when no anchored card is left (a partial swap keeps it and still owes
 GpuFingerprintCheck re-anchors it the same cycle. Under a rental, a pod whose container was made
 for the old cards (the host's docker record of it names GPUs the host no longer lists) has no GPU: the cycle fails
 here with a GPU_LOST entry (POD_GPUS_GONE), so the node is hidden, scores 0 and is not re-anchored, until the pod is
-recreated on the new cards or the rental ends. A fault (fewer cards, a card missing, an NVML error) puts the node on a hold; weak
+recreated on the new cards or the rental ends. A container that cannot be read (the backend may be recreating it right
+then) gives no verdict on its GPUs: the cycle stops on GPU_LOST_POD_UNREAD, not GPU_LOST, and is checked again. A fault (fewer cards, a card missing, an NVML error) puts the node on a hold; weak
 evidence (`confirm_first`) starts it only when the cycle before also showed a fault. Every held cycle carries a
 GPU_LOST availability entry: the backend hides the node and refuses new rentals, and leaves `active`, billing and a
 rental already on the node alone.
@@ -55,7 +56,7 @@ from ..messages import GpuLossHoldMessages as Msg
 from ..messages import render_message
 from ..pipeline import CheckResult, Context
 from .gpu_fingerprint import full_set_changed, split_uuids
-from .post_rental_gpu_recheck import MARKER_TTL_SECONDS, SOURCE_GPU_LOSS_HOLD, RecheckMarker, record_marker
+from .post_rental_gpu_recheck import SOURCE_GPU_LOSS_HOLD, RecheckMarker, record_marker
 from .rented_gpu_drop import (
     FAULT_NVML_ERROR,
     GPU_DROP_REDIS_ERRORS,
@@ -71,9 +72,9 @@ logger = logging.getLogger(__name__)
 GPU_LOSS_HOLD_KEY_PREFIX = "gpu_loss_hold"
 # A weak first sighting waits this long for the next cycle (15 min apart) to confirm it.
 GPU_LOSS_CONFIRM_SECONDS = 45 * 60
-# shortcut: not a hold window, only how long Redis keeps the mark of a node no cycle sees any more (every held cycle
-# renews it, like the load-test marker); the hold itself ends only on a clean read.
-GPU_LOSS_MARK_TTL_SECONDS = MARKER_TTL_SECONDS
+# DAH-6355: a held mark has no TTL (None), like the load-test marker: the hold ends only on a clean read, also for a
+# node that no cycle sees for days
+GPU_LOSS_MARK_TTL_SECONDS = None
 # DAH-6137: at most one early recheck per node in this window while a pod is left on the old cards.
 POD_GPUS_GONE_RECHECK_SECONDS = 30 * 60
 
@@ -215,6 +216,13 @@ class GpuLossHoldCheck:
                 if mark is not None and replaced_all:
                     await self._forget(ctx, key)
                 await self._recheck_soon(ctx)
+                if not stranded["missing_uuids"]:
+                    # no container read names an old GPU: no verdict on the pod, not a GPU loss. Fatal all the same,
+                    # so nothing re-anchors past a pod that may still be on the old cards; the rerun looks again.
+                    event = render_message(
+                        Msg.POD_UNREAD, ctx=ctx, check_id=self.check_id, what={"faults": ["pod_unread"], **stranded}
+                    )
+                    return CheckResult(passed=False, event=event, fatal=True)
                 stamp = now.isoformat()
                 # fatal: the cycle scores 0 (no passing report for a pod with no GPU) and nothing re-anchors yet
                 return self._lost(
@@ -255,7 +263,8 @@ class GpuLossHoldCheck:
         """The pods whose container still names GPUs the host no longer lists; None when every one is served.
 
         The host's own docker record of each container (as the GPU reset reads it), never the inside of a pod.
-        A container that cannot be read counts as not served: a recreated pod reads clean on its next cycle.
+        A container that cannot be read is not served either way (`pods_unread`, with docker's exit status and stderr):
+        the backend may be recreating it on the new cards right now.
         """
         names = [pod.container_name for pod in pods if pod.container_name]
         if not names:
@@ -266,8 +275,8 @@ class GpuLossHoldCheck:
                 + " ".join(shlex.quote(name) for name in names),
                 timeout=30,
             )
-        except (asyncssh.Error, OSError):
-            return {"pods_unread": names}
+        except (asyncssh.Error, OSError) as exc:
+            return {"missing_uuids": [], "pods_unread": names, "inspect_error": str(exc)[:300]}
         read: dict[str, list] = {}
         for line in (getattr(res, "stdout", "") or "").splitlines():
             name, _, requests = line.partition(" ")
@@ -281,7 +290,11 @@ class GpuLossHoldCheck:
         )
         if not gone and not unread:
             return None
-        return {"missing_uuids": gone, "pods_unread": unread}
+        stranded = {"missing_uuids": gone, "pods_unread": unread}
+        if unread:
+            stranded["inspect_exit_status"] = getattr(res, "exit_status", None)
+            stranded["inspect_stderr"] = str(getattr(res, "stderr", "") or "")[:300]
+        return stranded
 
     def _lost(self, ctx: Context, mark: DropMark, what: dict, *, fatal: bool, template=Msg.LOST) -> CheckResult:
         event = render_message(
@@ -311,7 +324,7 @@ class GpuLossHoldCheck:
         except GPU_DROP_REDIS_ERRORS:
             self._log_redis_unavailable(ctx, "recheck request")
 
-    async def _save(self, ctx: Context, key: str, mark: DropMark, ttl: int) -> None:
+    async def _save(self, ctx: Context, key: str, mark: DropMark, ttl: int | None) -> None:
         # A dry run shares Redis with the live validator, so it leaves the live hold alone.
         if settings.DRY_RUN:
             return

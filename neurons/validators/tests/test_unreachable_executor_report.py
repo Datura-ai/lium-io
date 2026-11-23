@@ -201,6 +201,7 @@ async def test_an_express_pass_after_the_row_was_built_keeps_it_off_the_publish(
     [row] = service._build_unreachable_known_results(payload, RentedExecutorsResponse(executors={}), msg, None)
     service.express_published[UNREACHABLE] = payload.job_batch_id
     service.express_published_miner[UNREACHABLE] = "another miner"
+    service.express_passed_at[UNREACHABLE] = row.observed_at + 1
 
     await service.publish_machine_specs([row], payload.miner_hotkey, payload.miner_coldkey)
     assert service.redis_service.publish.await_count == 1

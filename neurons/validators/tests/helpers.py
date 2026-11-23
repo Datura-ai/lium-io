@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -446,3 +447,22 @@ def assert_rental_price_incentive_log_full_content(full_log_text: str) -> None:
         RENTAL_PRICE_INCENTIVE_LOG_MESSAGE in full_log_text
     ), f"Expected rental price incentive message not found in full_log_text"
     assert_log_contains_keys(full_log_text, RENTAL_PRICE_INCENTIVE_EXTRA_KEYS)
+
+
+def shared_pod_start_stop_lock(locks: dict[str, asyncio.Lock]):
+    """RedisService.pod_start_stop_lock for a Mock Redis service: one lock per slot across every DockerService given
+    this function, as the validator and the connector share Redis."""
+
+    @asynccontextmanager
+    async def pod_start_stop_lock(slot: str):
+        async with locks.setdefault(slot, asyncio.Lock()):
+            yield True
+
+    return pod_start_stop_lock
+
+
+@asynccontextmanager
+async def no_host_start_lock(*args):
+    """DockerService._hold_pod_start_host_lock for doubles that model no host shell: the host lock is tested on its
+    own with a real shell (test_docker_service: the fenced stop and its hold command)."""
+    yield

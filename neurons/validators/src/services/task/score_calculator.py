@@ -94,14 +94,6 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append("Provider-side workload consumes the machine's CPU or disk")
 
-    # Rental-sensor blind-streak gate (DAH-4271): same mechanics as the CPU-truth gate above,
-    # the check is non-fatal, so only this line zeroes the score, and shadow leaves the flag True.
-    # It reads only whether the sensor saw the rental at all, never what it found.
-    if not ctx.inspector_blind_streak_passed:
-        actual_score = 0.0
-        job_score = 0.0
-        warning_messages.append("Rental sensor saw nothing of the rental too many cycles in a row")
-
     # Rented-pod resources gate (DAH-4564): same mechanics as the CPU-truth gate above.
     if not ctx.rented_pod_resources_passed:
         actual_score = 0.0
@@ -139,13 +131,6 @@ def calculate_scores(
         job_score = 0.0
         warning_messages.append("Host hardware identity does not match the hardware")
 
-    # Host-write gate (DAH-4548): same mechanics; it reads only the sensor's verdict that the host
-    # wrote into a rented pod under enforcement, and shadow leaves the flag True.
-    if not ctx.inspector_host_write_passed:
-        actual_score = 0.0
-        job_score = 0.0
-        warning_messages.append("The host wrote into a renter's container")
-
     # Kernel GPU view gate: BannedProviderCheck is non-fatal on a live rental, so only this
     # line zeroes the score there.
     if not ctx.kernel_gpu_view_passed:
@@ -163,6 +148,13 @@ def calculate_scores(
         actual_score = 0.0
         job_score = 0.0
         warning_messages.append("A GPU is not the model the node reports")
+
+    # Node account gate (DAH-6539): a rented node on another account's machine scores 0; its renter's pod runs on and
+    # is billed as usual.
+    if not ctx.node_account_passed:
+        actual_score = 0.0
+        job_score = 0.0
+        warning_messages.append("The node is not on the machine its account registered")
 
     # EMA verifyx download speed check — threshold enforced upstream in VerifyXCheck
     ema_verifyx_download = ((ctx.state.specs or {}).get("network") or {}).get(

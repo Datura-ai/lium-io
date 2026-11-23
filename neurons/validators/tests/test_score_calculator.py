@@ -117,14 +117,6 @@ def test_executor_without_deposit_scores_in_full(gpu_model):
     assert warning == ""
 
 
-def test_inspector_blind_streak_flag_zeroes_a_rented_score():
-    """InspectorRentedCheck is non-fatal: only this flag, set under enforcement, zeroes it."""
-    ctx = _ctx(500.0).model_copy(update={"inspector_blind_streak_passed": False})
-    actual_score, _, warning = calculate_scores(ctx, rented=True)
-    assert actual_score == 0.0
-    assert "Rental sensor saw nothing of the rental" in warning
-
-
 def test_rented_pod_resources_flag_zeroes_a_rented_score():
     """RentedPodResourcesCheck is non-fatal: only this flag, set under enforcement, zeroes it."""
     ctx = _ctx(500.0).model_copy(update={"rented_pod_resources_passed": False})
@@ -173,13 +165,6 @@ def test_cc_vbios_flag_zeroes_a_rented_score():
     assert "below NVIDIA's minimum" in warning
 
 
-def test_inspector_host_write_flag_zeroes_a_rented_score():
-    ctx = _ctx(500.0).model_copy(update={"inspector_host_write_passed": False})
-    actual_score, _, warning = calculate_scores(ctx, rented=True)
-    assert actual_score == 0.0
-    assert "The host wrote into a renter's container" in warning
-
-
 @pytest.mark.parametrize("passed", [True, False])
 def test_kernel_gpu_view_flag_zeroes_a_rented_score(passed):
     """BannedProviderCheck's overlay fail is non-fatal on a live rental: only this flag zeroes it."""
@@ -224,3 +209,12 @@ def test_gpu_model_flag_zeroes_a_rented_score(passed):
     actual_score, _, warning = calculate_scores(ctx, rented=True)
     assert actual_score == (1.0 if passed else 0.0)
     assert ("A GPU is not the model the node reports" in warning) is not passed
+
+
+@pytest.mark.parametrize("passed", [True, False])
+def test_node_account_flag_zeroes_a_rented_score(passed):
+    """DAH-6539: a node on another account's machine is non-fatal on a live rental; only this flag zeroes its score."""
+    ctx = _ctx(500.0).model_copy(update={"node_account_passed": passed})
+    actual_score, _, warning = calculate_scores(ctx, rented=True)
+    assert actual_score == (1.0 if passed else 0.0)
+    assert ("not on the machine its account registered" in warning) is not passed

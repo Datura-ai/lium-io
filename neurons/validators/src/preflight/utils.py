@@ -93,13 +93,16 @@ def _sample_utilization(pynvml, gpu_details: list, samples: int = UTILIZATION_SA
         logger.debug(f"GPU {detail['index']} utilization samples (gpu, memory): {detail['utilization_samples']}")
 
 
-def get_gpu_info(include_utilization: bool = False, include_memory: bool = False) -> Optional[dict]:
+def get_gpu_info(
+    include_utilization: bool = False, include_memory: bool = False, raise_errors: bool = False
+) -> Optional[dict]:
     """
     Get GPU information from the local system.
 
     Args:
         include_utilization: If True, include utilization and memory details for each GPU
         include_memory: If True, include GPU memory info from first GPU
+        raise_errors: If True, an NVML failure raises instead of reading as "no GPUs"
 
     Returns:
         Dict with gpu_count, gpu_model, gpu_uuids, and optionally gpu_details, gpu_memory_mb
@@ -176,5 +179,7 @@ def get_gpu_info(include_utilization: bool = False, include_memory: bool = False
         return result
 
     except Exception as e:
+        if raise_errors:
+            raise
         logger.debug(f"Failed to get GPU info: {e}")
         return None

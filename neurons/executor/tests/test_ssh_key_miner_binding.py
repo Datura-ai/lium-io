@@ -20,7 +20,7 @@ from routes.apis import apis_router
 from services.local_verify_service import accepted_miner_hotkeys
 from services.miner_service import MinerService
 
-_SSH_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey123456789abcdef user@host"
+_SSH_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFdStYghocJM65d3WyCC6wtbXYeqq4wUyfjS3e6wskzJ user@host"
 _NONCE = "ab" * 32
 _LOG_KEY = "ssh_key_miner_binding"
 
@@ -170,3 +170,67 @@ def test_accepted_hotkeys_never_take_an_empty_or_portal_pool():
     assert accepted_miner_hotkeys(own="5Own", pool="", shared_portal_hotkey="5Portal") == {"5Own"}
     assert accepted_miner_hotkeys(own="5Own", pool="5Portal", shared_portal_hotkey="5Portal") == {"5Own"}
     assert accepted_miner_hotkeys(own="5Own", pool="5Pool", shared_portal_hotkey="5Portal") == {"5Own", "5Pool"}
+
+
+# --- DAH-6740: a node set up under another of the listing owner's own keys --------------------------------------
+
+
+def _owner_signed(miner_kp, validator_kp, listing_hotkey, signatures):
+    body = _payload(miner_kp, validator_kp, listing_hotkey)
+    body["owner_hotkey_signatures"] = signatures
+    return body
+
+
+def test_owner_set_signature_for_the_own_hotkey_is_accepted_when_enforced(
+    client, miner_kp, validator_kp, other_miner_kp, caplog, monkeypatch
+):
+    monkeypatch.setattr(settings, "REQUIRE_MINER_BOUND_SSH_KEY", True)
+    caplog.set_level(logging.INFO)
+    own = miner_kp.ss58_address
+    body = _owner_signed(
+        miner_kp, validator_kp, other_miner_kp.ss58_address,
+        {own: _sign(validator_kp, ssh_pubkey_signing_blob(_SSH_KEY, None, own))},
+    )
+    assert client.post("/upload_ssh_key", json=body).status_code == 200
+    assert _binding_logs(caplog) == []
+
+
+@pytest.mark.parametrize("case", ["forged", "other_owner", "for_another_key"])
+def test_owner_set_signature_not_for_this_node_is_refused_when_enforced(
+    client, miner_kp, validator_kp, other_miner_kp, monkeypatch, case
+):
+    monkeypatch.setattr(settings, "REQUIRE_MINER_BOUND_SSH_KEY", True)
+    own, other = miner_kp.ss58_address, other_miner_kp.ss58_address
+    signatures = {
+        # signed by someone who is not a validator
+        "forged": {own: _sign(other_miner_kp, ssh_pubkey_signing_blob(_SSH_KEY, None, own))},
+        # the listing owner's set does not hold this node's hotkey
+        "other_owner": {other: _sign(validator_kp, ssh_pubkey_signing_blob(_SSH_KEY, None, other))},
+        # a validator signature for another hotkey, filed under this node's
+        "for_another_key": {own: _sign(validator_kp, ssh_pubkey_signing_blob(_SSH_KEY, None, other))},
+    }[case]
+    body = _owner_signed(miner_kp, validator_kp, other, signatures)
+    assert client.post("/upload_ssh_key", json=body).status_code == 403
+
+
+def test_owner_set_never_accepts_the_pool_hotkey(client, miner_kp, validator_kp, other_miner_kp, monkeypatch):
+    # the pool hotkey is accepted on every pool node: an own-key listing's set must not bind a key to it
+    pool = Keypair.create_from_uri("//LiumTestPool").ss58_address
+    monkeypatch.setattr(settings, "LIUM_POOL_HOTKEY", pool)
+    monkeypatch.setattr(settings, "REQUIRE_MINER_BOUND_SSH_KEY", True)
+    body = _owner_signed(
+        miner_kp, validator_kp, other_miner_kp.ss58_address,
+        {pool: _sign(validator_kp, ssh_pubkey_signing_blob(_SSH_KEY, None, pool))},
+    )
+    assert client.post("/upload_ssh_key", json=body).status_code == 403
+
+
+@pytest.mark.parametrize("signatures", [None, {}])
+def test_without_an_owner_set_the_binding_is_unchanged(
+    client, miner_kp, validator_kp, other_miner_kp, monkeypatch, signatures
+):
+    monkeypatch.setattr(settings, "REQUIRE_MINER_BOUND_SSH_KEY", True)
+    own_body = _owner_signed(miner_kp, validator_kp, miner_kp.ss58_address, signatures)
+    other_body = _owner_signed(miner_kp, validator_kp, other_miner_kp.ss58_address, signatures)
+    assert client.post("/upload_ssh_key", json=own_body).status_code == 200
+    assert client.post("/upload_ssh_key", json=other_body).status_code == 403

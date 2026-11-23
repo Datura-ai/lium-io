@@ -30,11 +30,23 @@ vfio_iommu_type1.dma_entry_limit=16777216
 - `vfio_iommu_type1.dma_entry_limit=16777216` is **required**, not tuning. The launcher passes GPUs through via the legacy type1 VFIO container (see §3), and TDX shared↔private page conversions exhaust the default 65 535 DMA mappings — QEMU dies mid-boot with `VFIO_MAP_DMA failed: No space left on device`. To apply without a reboot: `echo 16777216 | sudo tee /sys/module/vfio_iommu_type1/parameters/dma_entry_limit` (runtime-only; the GRUB entry is what persists).
 - `vfio-pci.ids=` must cover the GPUs **and** any NVSwitches being passed through.
 
+On Ubuntu kernels `vfio-pci` is a module, not built in, so `vfio-pci.ids=` takes effect only once the module is loaded, and nothing loads it at boot by itself. Load it at boot, ahead of any GPU driver (use your own IDs):
+
+```bash
+printf 'vfio\nvfio_iommu_type1\nvfio_pci\n' | sudo tee /etc/modules-load.d/vfio-pci.conf
+printf 'options vfio-pci ids=10de:2335,10de:22a3\nsoftdep nvidia pre: vfio-pci\nsoftdep nouveau pre: vfio-pci\n' \
+  | sudo tee /etc/modprobe.d/vfio-pci.conf
+printf 'vfio\nvfio_iommu_type1\nvfio_pci\n' | sudo tee -a /etc/initramfs-tools/modules
+sudo update-initramfs -u -k all
+```
+
 Then `sudo update-grub && sudo reboot`, and verify:
 
 ```bash
 cat /sys/module/kvm_intel/parameters/tdx     # Y
+ls /sys/kernel/iommu_groups | wc -l           # more than 0; 0 means the IOMMU is off (VT-d in BIOS, intel_iommu=on)
 lspci -nnk -s <gpu-addr>                      # Kernel driver in use: vfio-pci
+ls /dev/vfio                                  # vfio plus one numbered group per device bound to vfio-pci
 ```
 
 ## 3. QEMU — the dstack 9.2.1 build (required for attestation)
@@ -73,7 +85,7 @@ path = /opt/qemu-dstack/bin/qemu-system-x86_64
 
 (`dstack.py` merges `/etc/dstack/client.conf`, `~/.config/dstack/client.conf`, and any `.dstack/client.conf` at or above the working directory, later files overriding earlier ones. `/etc/dstack/client.conf` is recommended because `lium-cvm.sh` runs under sudo.)
 
-Optionally symlink it so `lium-cvm.sh check` finds a QEMU on PATH:
+`lium-cvm.sh check` reads the same `client.conf` and warns unless that QEMU reports version 9.2.1. Optionally also symlink it onto PATH:
 
 ```bash
 sudo ln -s /opt/qemu-dstack/bin/qemu-system-x86_64 /usr/local/bin/qemu-system-x86_64
@@ -165,6 +177,7 @@ sudo ./lium-cvm.sh new my-executor && sudo ./lium-cvm.sh run my-executor
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| `run` fails: QEMU `Could not open /dev/vfio/<N>` | that GPU or NVSwitch is not bound to `vfio-pci`: still on `nvidia`, or on no driver because the `vfio-pci` module never loaded at boot | §2 — add its PCI ID to `vfio-pci.ids`, reboot, confirm with `lspci -nnk -s <gpu-addr>`; `./lium-cvm.sh check` now lists every passthrough device and its driver |
 | QEMU exits during guest boot: `VFIO_MAP_DMA failed: No space left on device` | default `dma_entry_limit` (65 535) exhausted by TDX page conversions | §2 — set `vfio_iommu_type1.dma_entry_limit=16777216` (runtime echo + GRUB persist) |
 | Guest reboot-loops; console shows `Failed to open encrypted data disk` | measurements changed under an existing `hda.img` (QEMU/image/compose changed), or the key provider was rebuilt outside `cvm_upgrade_guard.sh` | if a `lium-key-provider:pre-upgrade-*` or `pinned-*` tag holds the old image, `docker tag <that> lium-key-provider:local`, write its id to `/var/lib/lium-cvm/key-provider.image` and `sudo ./cvm_upgrade_guard.sh start`; otherwise recreate the VM (`stop`, remove `run/vms/<name>`, `new`, `run`) |
 | `cvm_upgrade_guard.sh upgrade` exits 3 | CVM disks exist on the host (the list names each `hda.img`, stopped CVMs included) | §6.1 — remove each listed disk by hand once its data is not needed; the guard never deletes |
@@ -176,4 +189,4 @@ sudo ./lium-cvm.sh new my-executor && sudo ./lium-cvm.sh run my-executor
 | Attestation fails on RTMR0 / quote not whitelisted, image and compose correct | host running distro QEMU instead of the dstack 9.2.1 build | §3 — install the fork and set `client.conf`; confirm with `--version` |
 | QEMU launch error mentioning `iommufd` / `VFIO_DEVICE_BIND_IOMMUFD` EINVAL | launcher predates the QEMU-version-gated VFIO backend | update to the current release — `dstack.py` now selects type1 automatically for QEMU < 10 |
 | Validation fails `CHECK_SYSBOX_COMPATIBILITY` inside the guest | compose not the released one (pre-launch sysbox force-install missing or altered) | redeploy with the unmodified released compose (§5) |
-| `lium-cvm.sh check` reports QEMU missing although §3 is done | `check` looks for `qemu-system-x86_64` on PATH; the launcher itself uses `client.conf` | add the §3 symlink, or ignore this one check line |
+| `lium-cvm.sh check` warns the QEMU is not the dstack 9.2.1 build | `check` tests the QEMU the launcher will run: `[qemu] path` from `client.conf`, else `qemu-system-x86_64` on PATH | §3 — build the fork and set `[qemu] path`; `check` names the binary it tested |

@@ -49,7 +49,12 @@ class SpecChangeCheck:
         return CheckResult(passed=True, event=event)
 
 
+# DAH-6546: the same GPU under two datacenter names, one explicit pair as the backend's GPU-set move treats it
+# (executor_gpu.py _swap_model); never a broad grouping, which could let a node swap to a weaker GPU without a reset
+_SAME_MODEL = {H100_SXM: H100_PCIE, "NVIDIA B300 SXM6 PC": "NVIDIA B300 SXM6 AC"}
+
+
 def _as_listed(spec: str) -> str:
     # DAH-5677: an H100 SXM-on-PCIe-adapter node verified before as "H100 80GB HBM3:N" is listed as "H100 PCIe:N" now
     model, sep, count = spec.rpartition(":")
-    return f"{H100_PCIE}{sep}{count}" if model == H100_SXM else spec
+    return f"{_SAME_MODEL[model]}{sep}{count}" if model in _SAME_MODEL else spec

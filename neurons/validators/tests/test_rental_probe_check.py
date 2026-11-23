@@ -663,6 +663,19 @@ async def test_a_probe_that_clears_a_standing_failure_in_a_cycle_without_verifyx
 
 
 @pytest.mark.asyncio
+async def test_a_probe_that_clears_a_standing_failure_in_a_cycle_without_the_all_cards_run_does_not_pass_the_cycle():
+    """lio-deployment#129 review: the all-cards work proof was deferred for the standing failure; the cycle must not
+    relist the node before every card proved itself."""
+    redis = FakeRedis(failed_step=STEP_GPU_COUNT)
+    ctx, docker, _ = make_probe_context(redis=redis)
+    ctx = ctx.model_copy(update={"state": replace(ctx.state, allcards_skipped_for_standing_probe_failure=True)})
+    with probe_settings(), renter_path():
+        result = await RentalProbeCheck().run(ctx)
+    assert result.passed is False and result.event.reason_code == Msg.CYCLE_WITHOUT_ALLCARDS.reason
+    assert redis.standing_failure() is None and redis.stamped()
+
+
+@pytest.mark.asyncio
 async def test_a_standing_failure_holds_through_cycles_without_a_verdict_until_a_probe_passes():
     """The failure is carried by every cycle that reaches no verdict and never lapses on its own: a broken
     node relisted without a clean probe fails a renter's pod first."""
@@ -846,9 +859,9 @@ async def test_create_payload_is_what_a_renter_gets():
     assert private_key == ctx.executor_ssh_private_key_encrypted
     assert payload.docker_image == IMAGE.image_ref
     assert payload.gpu_uuids == ["GPU-aaaa", "GPU-bbbb"]
-    # the backend's whole-node limit (64 GiB less the 4 GiB reserve), so create_container never takes
+    # the backend's whole-node limit (64 GiB less the 8 GiB reserve), so create_container never takes
     # the no-memory-limit path that reads the host's /dev/nvidia* count
-    assert payload.memory_gb == 60
+    assert payload.memory_gb == 56
     assert (
         payload.ships_sshd is True and payload.is_sysbox is True and payload.enable_jupyter is False
     )

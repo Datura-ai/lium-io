@@ -73,7 +73,7 @@ def _ssh(
 
 
 def _helper_calls(ssh) -> list[str]:
-    return [c for c in ssh.calls if "--cap-add=NET_ADMIN" in c]
+    return [c for c in ssh.calls if "nsenter -t 1 " in c]
 
 
 def test_script_rebuilds_the_rules_in_a_fresh_chain_and_swaps_it_in():
@@ -113,20 +113,28 @@ def test_bridge_name_and_legacy_sources_are_parsed_safely():
 
 
 @pytest.mark.asyncio
-async def test_applies_the_drop_through_a_host_network_helper(context_factory):
+async def test_applies_the_drop_in_the_hosts_namespaces_without_any_image(context_factory):
     ssh = _ssh()
     result = await RentalEgressGuardCheck().run(context_factory(ssh=ssh))
 
     assert result.passed is True
     assert result.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
     [helper] = _helper_calls(ssh)
-    assert "--network=host" in helper and helper.startswith("timeout ")
-    # the lock and the helper's own bound are inside the container, in one dedicated host lock directory (never all
-    # of the host's /run/lock); none is executor-side
-    assert "--init" in helper and "-v /run/lock/lium-rental-egress:/lium-rental-egress-lock " in helper
-    assert "/run/lock:" not in helper
-    assert "flock" not in helper.split("/usr/bin/docker run")[0]
-    assert helper.endswith(shlex.quote(helper_command(link_local_drop_script("br-0123456789ab", []))))
+    assert helper.startswith(f"HOST_NS={shlex.quote(rental_egress_guard.HOST_NS)} exec timeout ")
+    # no container: a registry refusing an anonymous pull (Docker Hub's rate limit) can never leave a node unguarded
+    assert not any("docker run" in call or "docker pull" in call for call in ssh.calls)
+    assert helper.endswith(helper_command(link_local_drop_script("br-0123456789ab", [])))
+
+
+@pytest.mark.asyncio
+async def test_the_lock_and_iptables_resolve_in_the_hosts_root_not_the_executors(context_factory):
+    ssh = _ssh()
+    await RentalEgressGuardCheck().run(context_factory(ssh=ssh))
+
+    [helper] = _helper_calls(ssh)
+    # without the host root two executors on one host take a lock in their own roots: two locks, interleaved swaps
+    assert rental_egress_guard.HOST_LOCK.startswith("/proc/1/root/") and rental_egress_guard.HOST_LOCK in helper
+    assert "-r" in shlex.split(rental_egress_guard.HOST_NS)
 
 
 @pytest.mark.asyncio
@@ -148,7 +156,7 @@ async def test_nothing_left_to_guard_removes_our_rules_pulling_a_pruned_image(co
 
     assert result.passed is True
     [helper] = _helper_calls(ssh)
-    assert "--pull=never" not in helper and shlex.quote(helper_command(link_local_cleanup_script())) in helper
+    assert helper_command(link_local_cleanup_script()) in helper
     script = link_local_cleanup_script()
     for chain in CHAINS:
         assert f"$IPT -D DOCKER-USER -j {chain}" in script and f"$IPT -F {chain}" in script
@@ -334,15 +342,19 @@ async def test_the_guard_runs_once_per_cycle_however_the_pipeline_ends(context_f
     assert [event.check_id for event in events] == ran
     assert sink.emit.await_args_list[-1].args[0].check_id == RentalEgressGuardCheck.check_id
     [helper] = _helper_calls(ssh)
-    assert helper.endswith(shlex.quote(helper_command(link_local_drop_script("br-0123456789ab", []))))
+    assert helper.endswith(helper_command(link_local_drop_script("br-0123456789ab", [])))
     assert len(last_run) == 1
 
 
+@pytest.mark.parametrize("template", ["MISMATCH", "BINDING_UNVERIFIED"])
 @pytest.mark.parametrize("rented", [True, False])
 @pytest.mark.asyncio
-async def test_no_completion_step_touches_a_host_refused_as_another_accounts(context_factory, monkeypatch, rented):
+async def test_no_completion_step_touches_a_host_refused_as_another_accounts(
+    context_factory, monkeypatch, rented, template
+):
     """A hostname pointed at another provider's machine is refused by NodeAccountCheck; that machine may still accept
-    the validator's key, so the guard's NET_ADMIN helper must never run there."""
+    the validator's key, so the guard's NET_ADMIN helper must never run there. The same when the machine could not be
+    confirmed as the account's (DAH-6539: the account read failed, which a relay can cause)."""
     from unittest.mock import AsyncMock
 
     from services.task.messages import NodeAccountMessages
@@ -360,14 +372,14 @@ async def test_no_completion_step_touches_a_host_refused_as_another_accounts(con
             return CheckResult(
                 passed=False,
                 event=rental_egress_guard.render_message(
-                    NodeAccountMessages.MISMATCH, ctx=ctx, check_id=self.check_id, what={}
+                    getattr(NodeAccountMessages, template), ctx=ctx, check_id=self.check_id, what={}
                 ),
             )
 
     sink = AsyncMock()
     ok, events, _ = await Pipeline([_NodeAccount(), RentalEgressGuardCheck()], sink).run(context_factory(ssh=ssh))
 
-    assert ok is False and events[-1].reason_code == "NODE_ACCOUNT_MISMATCH"
+    assert ok is False and events[-1].reason_code == getattr(NodeAccountMessages, template).reason
     assert ssh.calls == []
     assert RentalEgressGuardCheck.check_id not in [call.args[0].check_id for call in sink.emit.await_args_list]
 
@@ -385,7 +397,7 @@ async def test_a_running_legacy_rental_off_the_rental_network_is_guarded(context
     assert inspect.endswith(f"{POD_A} filler_00000000-0000-4000-8000-00000000000c {POD_B}__prev")
     assert ".State.Running" in inspect
     [helper] = _helper_calls(ssh)
-    assert shlex.quote(helper_command(link_local_drop_script(None, ["docker0"]))) in helper
+    assert helper_command(link_local_drop_script(None, ["docker0"])) in helper
     assert result.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
 
 
@@ -412,9 +424,10 @@ async def test_apply_and_cleanup_take_the_same_host_lock(context_factory):
     await RentalEgressGuardCheck().run(context_factory(ssh=cleaned))
 
     [apply_cmd], [cleanup_cmd] = _helper_calls(applied), _helper_calls(cleaned)
-    assert apply_cmd.endswith(shlex.quote(helper_command(link_local_drop_script("br-0123456789ab", []))))
-    assert cleanup_cmd.endswith(shlex.quote(helper_command(link_local_cleanup_script())))
-    assert rental_egress_guard.HOST_LOCK == "/lium-rental-egress-lock/apply.lock"
+    assert apply_cmd.endswith(helper_command(link_local_drop_script("br-0123456789ab", [])))
+    assert cleanup_cmd.endswith(helper_command(link_local_cleanup_script()))
+    # the host file the previous release locked too, reached through PID 1's root
+    assert rental_egress_guard.HOST_LOCK == "/proc/1/root/run/lock/lium-rental-egress/apply.lock"
     assert rental_egress_guard.HELPER_RUN_SECONDS < rental_egress_guard.HELPER_TIMEOUT_SECONDS
 
 
@@ -447,9 +460,7 @@ async def test_two_registrations_of_one_host_reconcile_the_same_host_wide_set(
     for ctx, rented_only in order:
         await RentalEgressGuardCheck(rented_only=rented_only).run(ctx)
 
-    expected = shlex.quote(
-        helper_command(link_local_drop_script("br-0123456789ab" if network_present else None, ["docker0"]))
-    )
+    expected = helper_command(link_local_drop_script("br-0123456789ab" if network_present else None, ["docker0"]))
     assert [expected in helper for helper in _helper_calls(ssh)] == [True, True]
 
 
@@ -496,7 +507,7 @@ async def test_an_unknown_inventory_keeps_the_rules_and_is_retried(context_facto
         assert result.event.reason_code == "RENTAL_EGRESS_GUARD_SKIPPED"
     elif outcome == "cleaned":
         [helper] = helpers
-        assert shlex.quote(helper_command(link_local_cleanup_script())) in helper
+        assert helper_command(link_local_cleanup_script()) in helper
     else:
         [helper] = helpers
         assert "-j DROP" in helper and result.event.reason_code == "RENTAL_EGRESS_GUARD_APPLIED"
@@ -528,7 +539,7 @@ esac
 rc=$?
 if [ -n "${mutating:-}" ] && [ -n "${DIE_AFTER:-}" ]; then
   n=$(( $(cat "$STATE/count" 2>/dev/null || echo 0) + 1 )); echo $n > "$STATE/count"
-  [ "$n" -eq "$DIE_AFTER" ] && kill -9 $PPID
+  [ "$n" -eq "$DIE_AFTER" ] && kill -9 "$(cat "$STATE/run_pid")"
 fi
 exit $rc
 """
@@ -566,6 +577,71 @@ def test_cleanup_script_accepts_absence_and_reports_a_failed_removal(tmp_path, c
     assert returncode == rc and state == left
 
 
+@pytest.mark.parametrize("script", ["apply", "cleanup"])
+def test_a_failed_chain_probe_is_reported_not_taken_for_an_absent_chain(tmp_path, script):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in ("iptables-nft", "iptables-legacy", "iptables"):
+        (bin_dir / name).write_text("#!/bin/sh\necho 'nsenter: reassociate to namespace: Operation not permitted' >&2\nexit 1\n")
+        (bin_dir / name).chmod(0o755)
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    body = link_local_drop_script("br-0123456789ab", []) if script == "apply" else link_local_cleanup_script()
+
+    done = subprocess.run(["sh", "-c", body], env=env, capture_output=True, text=True)
+
+    assert done.returncode != 0
+    assert "Operation not permitted" in done.stderr
+
+
+_DENIED = "#!/bin/sh\necho 'nsenter: reassociate to namespace: Operation not permitted' >&2\nexit 1\n"
+_NO_CHAIN = "#!/bin/sh\necho 'iptables: No chain/target/match by that name.' >&2\nexit 1\n"
+
+
+@pytest.mark.parametrize(
+    ("nft", "script", "rc"),
+    [(_DENIED, "apply", 4), (_DENIED, "cleanup", 4), (_NO_CHAIN, "apply", 3), (_NO_CHAIN, "cleanup", 0)],
+    ids=["denied-apply", "denied-cleanup", "absent-apply", "absent-cleanup"],
+)
+def test_a_later_backends_absence_never_hides_an_earlier_failed_probe(tmp_path, nft, script, rc):
+    """The last legacy rental stops and the nft probe is refused: legacy and plain iptables saying "no chain" is not
+    proof the host has none of our jumps, so cleanup reports it and is retried. Only absence on every backend is 0."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, body in (("iptables-nft", nft), ("iptables-legacy", _NO_CHAIN), ("iptables", _NO_CHAIN)):
+        (bin_dir / name).write_text(body)
+        (bin_dir / name).chmod(0o755)
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    body = link_local_drop_script("br-0123456789ab", []) if script == "apply" else link_local_cleanup_script()
+
+    done = subprocess.run(["sh", "-c", body], env=env, capture_output=True, text=True)
+
+    assert done.returncode == rc, done.stderr
+    assert ("Operation not permitted" in done.stderr) == (nft is _DENIED)
+
+
+@pytest.mark.parametrize("script", ["apply", "cleanup"])
+def test_a_host_iptables_without_the_nft_or_legacy_names_is_used(tmp_path, script):
+    """The rules run with the host's own binaries now: an older host ships plain `iptables` only."""
+    bin_dir, state = tmp_path / "bin", tmp_path / "state"
+    bin_dir.mkdir()
+    state.mkdir()
+    for name in ("iptables-nft", "iptables-legacy"):  # shadow any on this machine: absent on the modelled host
+        (bin_dir / name).write_text("#!/bin/sh\nexit 127\n")
+        (bin_dir / name).chmod(0o755)
+    (bin_dir / "iptables").write_text(_IPTABLES_STUB)
+    (bin_dir / "iptables").chmod(0o755)
+    (state / "DOCKER-USER").write_text("RETURN\n")
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "STATE": str(state)}
+    body = link_local_drop_script("br-0123456789ab", []) if script == "apply" else link_local_cleanup_script()
+
+    done = subprocess.run(["sh", "-c", body], env=env, capture_output=True, text=True)
+
+    assert done.returncode == 0, done.stderr
+    if script == "apply":
+        [(_, rules)] = _jumps_and_rules(state)
+        assert rules == [f"-i br-0123456789ab -d {LINK_LOCAL_CIDR} -p {p} ! --dport 53 -j DROP" for p in ("tcp", "udp")]
+
+
 def _jumps_and_rules(state) -> list[tuple[str, list[str]]]:
     jumps = [j for j in (state / "DOCKER-USER").read_text().split() if j in CHAINS]
     return [(j, (state / j).read_text().splitlines()) for j in jumps]
@@ -591,7 +667,10 @@ def test_a_swap_killed_after_any_mutation_is_recovered_without_flushing_the_prot
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "STATE": str(state)}
     script = link_local_drop_script("br-bbbbbbbbbbbb", [])
 
-    first = subprocess.run(["sh", "-c", script], env={**env, "DIE_AFTER": str(die_after)}, capture_output=True)
+    # the stub kills the pid the run started as, never its own $PPID: a shell that execs its last command (bash -c) makes
+    # that command's parent the test runner itself
+    killable = f'echo $$ > "$STATE/run_pid"; {script}'
+    first = subprocess.run(["sh", "-c", killable], env={**env, "DIE_AFTER": str(die_after)}, capture_output=True)
     in_force = _jumps_and_rules(state)
     assert in_force and in_force[0][1] in (old_rules, new_rules)  # something still protects after the kill
     second = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True)
@@ -674,7 +753,7 @@ def test_a_held_lock_is_waited_for_and_never_skipped(tmp_path, monkeypatch):
 def test_the_helper_bound_cannot_free_the_lock_while_a_mutation_runs(tmp_path, monkeypatch, kills):
     """Killed at its bound mid-swap: GNU timeout kills the whole group, busybox's (modelled by --foreground) only the
     shell, leaving the running iptables call; that call still holds the lock until it ends, and in the container the
-    kernel ends it as soon as the init exits (--init). Either way the lock is never free while a mutation runs."""
+    host it ends on its own. Either way the lock is never free while a mutation runs."""
     import time
 
     state, lock, env = _probe(tmp_path, monkeypatch, slow="-I")
@@ -701,3 +780,37 @@ def test_the_helper_bound_cannot_free_the_lock_while_a_mutation_runs(tmp_path, m
     # the lock until it ended. Only GNU timeout kills the whole group, so the call never finished
     version = subprocess.run(["timeout", "--version"], capture_output=True, text=True).stdout.splitlines()[:1]
     assert finished_when_freed == (kills == "shell-only" or "GNU coreutils" not in str(version)), version
+
+
+# The host root as the executor reaches it through nsenter: only iptables is there, no shell or coreutils.
+_HOST_NSENTER_STUB = r"""#!/bin/sh
+while [ "$1" != -- ]; do shift; done; shift
+echo "$1" >> "$STATE/host_exec"
+case "$1" in
+  iptables*) exec "$@" ;;
+  *) echo "nsenter: failed to execute $1: No such file or directory" >&2; exit 127 ;;
+esac
+"""
+
+
+@pytest.mark.parametrize("script", ["apply", "cleanup"])
+def test_the_helper_runs_only_iptables_in_the_host_root(tmp_path, monkeypatch, script):
+    """A host root without /bin/sh or timeout still gets the rules: the shell, lock and bound are the executor's."""
+    bin_dir, state = tmp_path / "bin", tmp_path / "state"
+    bin_dir.mkdir()
+    state.mkdir()
+    for name, body in (("iptables-nft", _IPTABLES_STUB), ("iptables-legacy", _IPTABLES_STUB), ("nsenter", _HOST_NSENTER_STUB)):
+        (bin_dir / name).write_text(body)
+        (bin_dir / name).chmod(0o755)
+    (state / "DOCKER-USER").write_text("RETURN\n")
+    monkeypatch.setattr(rental_egress_guard, "HOST_LOCK", str(tmp_path / "lock" / "apply.lock"))
+    body = link_local_drop_script("br-0123456789ab", []) if script == "apply" else link_local_cleanup_script()
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "STATE": str(state)}
+
+    done = subprocess.run(["bash", "-c", rental_egress_guard._helper(body)], env=env, capture_output=True, text=True)
+
+    assert done.returncode == 0, done.stderr
+    assert set((state / "host_exec").read_text().split()) == {"iptables-nft"}
+    if script == "apply":
+        [(_, rules)] = _jumps_and_rules(state)
+        assert rules == [f"-i br-0123456789ab -d {LINK_LOCAL_CIDR} -p {p} ! --dport 53 -j DROP" for p in ("tcp", "udp")]

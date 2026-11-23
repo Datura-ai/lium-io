@@ -546,6 +546,18 @@ class GpuLossHoldMessages:
         "missing_uuids). The pod cannot use the new cards until it is recreated; the node is verified on its new "
         "cards on the first check after that, or after the rental ends.",
     )
+    # DAH-6546: no verdict on the pod's GPUs, so not GPU_LOST; the run stops (nothing re-anchors) and is checked again
+    POD_UNREAD = MessageTemplate(
+        event="A rented pod's container could not be read after the node's GPUs changed; checked again shortly",
+        reason="GPU_LOST_POD_UNREAD",
+        severity="warning",
+        category="env",
+        impact="This check scores 0 and the node is checked again within minutes; a pod being recreated on the new "
+        "GPUs reads clean then",
+        remediation="Usually the pod is being recreated on the new GPUs and nothing is needed. If it repeats, run "
+        "`docker inspect <container>` on the host for the pods in pods_unread (see inspect_exit_status and "
+        "inspect_stderr).",
+    )
     CLEAN_AGAIN = MessageTemplate(
         event="Every GPU is listed again; each card is load-tested before the node is listed",
         reason="GPU_LOST_CLEAN_AGAIN",
@@ -593,13 +605,6 @@ class PostRentalGpuRecheckMessages:
         severity="info",
         category="env",
         impact="Proceed",
-    )
-    FILLER_SKIPPED = MessageTemplate(
-        event="Post-rental GPU recheck waits: active filler",
-        reason="POST_RENTAL_GPU_RECHECK_SKIPPED_ACTIVE_FILLER",
-        severity="info",
-        category="policy",
-        impact="Proceed; the recheck runs on a cycle without a filler, or after a few filler cycles anyway.",
     )
     INCONCLUSIVE = MessageTemplate(
         event="Post-rental GPU recheck gave no verdict",
@@ -959,6 +964,18 @@ class SysboxRequiredMessages:
             "toolkit; the sysbox check runs again on the next cycle."
         ),
     )
+    NVIDIA_TOOLKIT_CDI_MODE = MessageTemplate(
+        event="NVIDIA container toolkit is in CDI mode",
+        reason="NVIDIA_TOOLKIT_CDI_MODE",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0 for this cycle; verification is kept until repeated failures deactivate the executor",
+        remediation=(
+            'Set mode = "auto" under [nvidia-container-runtime] in /etc/nvidia-container-runtime/config.toml '
+            "then `sudo systemctl restart docker`; "
+            "the sysbox check runs again on the next cycle."
+        ),
+    )
     # DAH-5844: the test container started but its sshd never answered and its log names no cause
     # (dind_probe.DIND_SSHD_NOT_READY), so nothing about sysbox was measured. Same impact as SYSBOX_MISSING.
     DIND_PROBE_UNREACHABLE = MessageTemplate(
@@ -977,6 +994,93 @@ class SysboxRequiredMessages:
         reason="SYSBOX_REQUIRED_OK",
         severity="info",
         category="policy",
+        impact="Proceed",
+    )
+
+
+class NeedrestartGuardMessages:
+    MISSING = MessageTemplate(
+        event="Host apt can restart the container runtime under running pods",
+        reason="NEEDRESTART_GUARD_MISSING",
+        severity="warning",
+        category="env",
+        impact="Proceed; score not changed",
+        remediation=(
+            "An apt upgrade's needrestart may restart sysbox, Docker, containerd or the NVIDIA fabric manager "
+            "under running pods, which breaks those pods. Hosts set up before 16 Nov 2026 lack the guard. Create "
+            "/etc/needrestart/conf.d/lium-container-runtime.conf containing these five lines: "
+            "$nrconf{override_rc}->{qr(^sysbox)} = 0; "
+            "$nrconf{override_rc}->{qr(^docker)} = 0; "
+            "$nrconf{override_rc}->{qr(^containerd)} = 0; "
+            "$nrconf{override_rc}->{qr(^nvidia-fabricmanager)} = 0; "
+            "$nrconf{override_rc}->{qr(^nvidia-persistenced)} = 0; "
+            "(one per line). Writing the file restarts nothing."
+        ),
+    )
+    WRITTEN = MessageTemplate(
+        event="Host needrestart guard added",
+        reason="NEEDRESTART_GUARD_WRITTEN",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    UNKNOWN = MessageTemplate(
+        event="Host needrestart guard not reported",
+        reason="NEEDRESTART_GUARD_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    OK = MessageTemplate(
+        event="Host needrestart guard ok",
+        reason="NEEDRESTART_GUARD_OK",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+
+
+class SysboxLayerResetMessages:
+    OUTDATED = MessageTemplate(
+        event="Host boot-time layer reset missing or old",
+        reason="SYSBOX_LAYER_RESET_OUTDATED",
+        severity="info",
+        category="env",
+        impact="Proceed; score not changed",
+        remediation=(
+            "After a power loss or hard reset, rented pods on this host come back with their files owned by the "
+            "host's root, so sudo and apt fail inside them. Run `sudo bash nvidia_docker_sysbox_setup.sh "
+            "--install-layer-reset` from lium-io neurons/executor on the host: it installs "
+            "lium-sysbox-layer-reset.service, runs nothing and restarts nothing."
+        ),
+    )
+    INSTALLED = MessageTemplate(
+        event="Host boot-time layer reset installed",
+        reason="SYSBOX_LAYER_RESET_INSTALLED",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    INSTALL_FAILED = MessageTemplate(
+        event="Host boot-time layer reset could not be installed",
+        reason="SYSBOX_LAYER_RESET_INSTALL_FAILED",
+        severity="warning",
+        category="env",
+        impact="Proceed; score not changed",
+        remediation=OUTDATED.remediation,
+    )
+    UNKNOWN = MessageTemplate(
+        event="Host boot-time layer reset not reported",
+        reason="SYSBOX_LAYER_RESET_UNKNOWN",
+        severity="info",
+        category="env",
+        impact="Proceed",
+    )
+    OK = MessageTemplate(
+        event="Host boot-time layer reset ok",
+        reason="SYSBOX_LAYER_RESET_OK",
+        severity="info",
+        category="env",
         impact="Proceed",
     )
 
@@ -1110,10 +1214,36 @@ class NodeAccountMessages:
     MISMATCH = MessageTemplate(
         event="Node at this address is not the one its account registered",
         reason="NODE_ACCOUNT_MISMATCH",
-        severity="warning",
-        category="policy",
-        impact="Verification failed; verification cleared",
+        severity="error",
+        # an availability error: the backend hides the node and refuses new rentals, a rental on it runs on
+        category=AVAILABILITY_CATEGORY,
+        impact="Verification failed; node hidden and not rentable while the mismatch stands (a running rental is "
+        "kept)",
         remediation="Point the node's hostname at the machine registered under this account, or register the node again.",
+    )
+    # DAH-6539: the address leads to a machine set up for another account
+    BINDING_MISMATCH = MessageTemplate(
+        event="Node at this address is not set up for the account that lists it",
+        reason="NODE_ACCOUNT_MISMATCH",
+        severity="error",
+        # an availability error: the backend hides the node and refuses new rentals, a rental on it runs on
+        category=AVAILABILITY_CATEGORY,
+        impact="Verification failed; node hidden and not rentable while the mismatch stands (a running rental is "
+        "kept)",
+        remediation="Ensure this address reaches a node configured for this account, update the node if needed, and retry "
+        "verification.",
+    )
+    # DAH-6539: the read of the node's account files failed, timed out or closed without an exit status
+    BINDING_UNVERIFIED = MessageTemplate(
+        event="Node account ownership could not be verified at this address",
+        reason="NODE_ACCOUNT_UNVERIFIED",
+        severity="error",
+        # an availability error: hidden and not rentable until a cycle reads the files, a running rental runs on
+        category=AVAILABILITY_CATEGORY,
+        impact="Verification failed; node hidden and not rentable until the next check reads it (a running rental "
+        "is kept)",
+        remediation="The validator could not read this node's account files over SSH. Make sure the executor is up "
+        "and reachable at this address; the node is listed again after the next successful check.",
     )
 
 
@@ -1338,6 +1468,13 @@ class InspectorMessages:
 
 
 class TenantEnforcementMessages:
+    HALF_STARTED_STOPS_RETRIED = MessageTemplate(
+        event="Pending stops of half-started pods retried",
+        reason="HALF_STARTED_STOPS_RETRIED",
+        severity="info",
+        category="runtime",
+        impact="Proceed",
+    )
     NOT_RENTED = MessageTemplate(
         event="Executor not rented",
         reason="EXECUTOR_NOT_RENTED",
@@ -1446,6 +1583,10 @@ class GpuUsageMessages:
         "{vram_utilization}, with Lium's filler running on the node. Stop the GPU processes "
         "outside Lium's containers and re-run your node: {processes}. Leave Lium's own filler "
         "running: {fillers}."
+    )
+    FOREIGN_PROCESS_IN_FILLER_REMEDIATION = (
+        "A GPU process that is not the workload of Lium's filler runs inside the filler container: "
+        "{processes}. Stop it, run nothing else inside Lium's containers, and re-run your node."
     )
     USAGE_HIGH_BESIDE_A_RENTAL_REMEDIATION = (
         "Stop the GPU processes outside Lium's containers and re-run your node: {outside_processes}. "
@@ -2065,6 +2206,19 @@ class CapabilityMessages:
             "the current executor image with its default environment; the next measured pass clears it."
         ),
     )
+    # lio#2305: a claimed card gave no right answer to its own work-proof; stored until a run on it passes
+    GPU_WORK_PROOF_FAILED = MessageTemplate(
+        event="GPU check failed: a claimed card gave no right answer to its own work-proof",
+        reason="GPU_WORK_PROOF_FAILED",
+        severity="error",
+        category=AVAILABILITY_CATEGORY,
+        impact="Score set to 0; node hidden and not rentable until a GPU check on that card passes (a "
+        "running rental is kept)",
+        remediation=(
+            "Every GPU the node reports must run the GPU check itself. Make sure CUDA sees each listed card "
+            "(nvidia-smi and a CUDA sample inside a container); the next passing check on that card clears it."
+        ),
+    )
     # DAH-6241: a rented node has no stored GPU model mismatch (or is not rented: judged later)
     GPU_MODEL_VERDICT_OK = MessageTemplate(
         event="GPU model verdict: no stored mismatch",
@@ -2535,6 +2689,13 @@ class RentalProbeMessages:
         category="runtime",
         impact="Proceed",
     )
+    CYCLE_WITHOUT_ALLCARDS = MessageTemplate(
+        event="Cycle not passed: the all-cards GPU work proof did not run this cycle",
+        reason="RENTAL_PROBE_CYCLE_WITHOUT_ALLCARDS",
+        severity="warning",
+        category="runtime",
+        impact="Score set to 0 for this cycle; every card proves itself next cycle",
+    )
     CYCLE_WITHOUT_VERIFYX = MessageTemplate(
         event="Cycle not passed: VerifyX did not run this cycle",
         reason="RENTAL_PROBE_CYCLE_WITHOUT_VERIFYX",
@@ -2902,9 +3063,10 @@ class RentedPodResourcesMessages:
         category="runtime",
         impact="Proceed without penalty; the renter's pod cannot read /proc/sys",
         remediation=(
-            "The FUSE service behind the container's /proc (sysbox-fs) stopped or restarted, so the running "
-            "pod answers 'Transport endpoint is not connected'. Check `systemctl status sysbox`, restart it if "
-            "needed, then restart the pod container; tell the renter first."
+            "The pod's /proc/sys answers 'Transport endpoint is not connected': its FUSE connection to "
+            "sysbox-fs is gone. This read does not show why; a sysbox-fs restart under the pod is reported "
+            "separately as RENTED_POD_OWNERSHIP_RUNTIME_RESTARTED. Restarting sysbox breaks every other "
+            "running pod: contact support before changing anything on the host."
         ),
     )
     RESOURCES_UNKNOWN = MessageTemplate(
@@ -2986,8 +3148,8 @@ class RentedPodOwnershipMessages:
         severity="warning",
         category="runtime",
         impact="Proceed; incorrect ownership can break package installation, root login, or sudo until repaired",
-        remediation="The pod's container was restarted while the host kept running (not a host reboot), and "
-        "it came back with a user-namespace range its files are not in, so they belong to nobody inside it. "
+        remediation="The pod's container was created or restarted while the host kept running (not a host "
+        "reboot), and it came back with a user-namespace range its files are not in, so they belong to nobody inside it. "
         "A restart does not repair it. Contact support: the renter is moved to a fresh pod free of charge. "
         "Do not change file ownership on the host or restart a rented pod's container yourself.",
     )
@@ -2997,8 +3159,9 @@ class RentedPodOwnershipMessages:
         severity="warning",
         category="runtime",
         impact="Proceed; incorrect ownership can break package installation, root login, or sudo until repaired",
-        remediation="The shifted pods do not share one cause: a pod whose started_after_boot_s is 600 or more "
-        "had its container restarted while the host kept running; one started right after boot came back "
+        remediation="The shifted pods do not share one cause. A pod created after the boot, or started 600 seconds "
+        "or more after it when its creation time is unknown, was created or restarted while the host kept running. "
+        "A pod created before the boot, or started sooner after it when its creation time is unknown, came back "
         "after the host stopped without a clean shutdown. A restart does not repair it. Contact support: the "
         "renters are moved to fresh pods free of charge. Do not change file ownership on the host or restart "
         "a rented pod's container yourself, and shut the host down cleanly.",
@@ -3009,7 +3172,9 @@ class RentedPodOwnershipMessages:
         severity="warning",
         category="runtime",
         impact="Proceed; pods running across a sysbox or NVIDIA fabric manager restart can lose /proc paths or NVLink",
-        remediation="A runtime service listed in runtime_restarted_under_pods started after the listed pods. "
+        remediation="A runtime service listed in runtime_restarted_under_pods started after the listed pods, at the "
+        "time in runtime_started_at (which can be days before this report; \"unknown\" when the host's boot time "
+        "could not be read). "
         "Contact support before changing anything on the host; restarting the pod alone does not repair it.",
     )
     UNREAD = MessageTemplate(
@@ -3091,7 +3256,8 @@ SSHD_BOOTSTRAP_REMEDIATION = (
     "\"/run/sshd must be owned by root and not group or world-writable\"). Fix the runtime/image setup so "
     "a fresh container gets a root-owned /run/sshd with mode 755, then check that `docker run --rm ubuntu sh -c "
     "'apt-get update -qq && apt-get install -y -qq openssh-server && mkdir -p /run/sshd && /usr/sbin/sshd -t'` "
-    "succeeds. The node is validated again once a new container on it starts sshd."
+    "succeeds. Each validation cycle starts sshd in a fresh container on the node again; the node is validated again the "
+    "cycle sshd starts there."
 )
 
 

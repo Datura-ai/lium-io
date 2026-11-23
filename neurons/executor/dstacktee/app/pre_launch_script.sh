@@ -9,8 +9,10 @@ chmod +x /usr/bin/containerd-shim-runc-v2
 systemctl unmask sysbox-mgr sysbox-fs 2>/dev/null || true
 systemctl stop sysbox-mgr sysbox-fs 2>/dev/null || true
 systemctl disable sysbox-mgr sysbox-fs 2>/dev/null || true
+# Keep the guest's own rsync (built against its glibc; sysbox needs it): the installer's is a static glibc build
+# whose user/group lookups load the guest's libc.so.6 and die with a divide error in __libc_early_init (DAH-6549).
 # TODO: pin digest
-docker run --rm --privileged --pid=host --net=host -v /:/host dstacktee/dstack-sysbox-installer:1.0.0@sha256:2f5dbea99176f3ea0362b85346b31b1160bfb70c1d98d1c8d375d57782127dd1 bash -c "sed -i '/^check_existing() {/,/^}/c\\check_existing() { return 0; }' /usr/local/bin/install-sysbox-complete.sh && /usr/local/bin/install-sysbox-complete.sh"
+docker run --rm --privileged --pid=host --net=host -v /:/host dstacktee/dstack-sysbox-installer:1.0.0@sha256:2f5dbea99176f3ea0362b85346b31b1160bfb70c1d98d1c8d375d57782127dd1 bash -c "sed -i -e '/^check_existing() {/,/^}/c\\check_existing() { return 0; }' -e 's#cp /usr/local/bin/rsync /host/usr/bin/#:#' /usr/local/bin/install-sysbox-complete.sh && /usr/local/bin/install-sysbox-complete.sh"
 systemctl restart docker
 # Warm the images the validator's sysbox/DinD probes run, so first-cycle
 # probes don't burn their timeout budget on multi-GB registry pulls.

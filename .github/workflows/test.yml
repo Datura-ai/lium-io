@@ -7,11 +7,13 @@ on:
   # datura/ or .github/ changed (lium_protocol/ also selects validators). tests-ok reports on every PR either way. No `branches:` filter
   # either: a PR stacked on another PR's branch (the loop's and the team's dependent PRs) used
   # to get no run at all until its base merged and GitHub retargeted it to main.
-  # DAH-5832 (CI minutes): before a review approves, a PR runs only route and ruff-check; the package jobs and
-  # e2e-gate run once it is approved (the approving review starts a run) and on every push after that.
-  # e2e-gate is the required check, and an unapproved run reports it under another name, so a PR cannot
-  # merge until e2e-gate has run on its head. The push to main still runs: the ruleset does not require an
-  # up-to-date branch, so a squash merge can land a tree no PR run tested.
+  # CI minutes: once the merge queue is active, a PR runs only route, ruff-check and the deferred e2e-gate
+  # check, a push to main only route and tests-ok, and the queue runs the suites. Until then PRs and pushes
+  # keep running them as before.
+  # The flag and the queue rule are independent, so enable them in order: add the merge-queue rule to the main
+  # ruleset first, then set the repository variable MERGE_QUEUE_ENABLED=true; to turn the queue off, unset the
+  # variable first. If the variable is true while the rule is off, or a merge bypasses the queue, the PR run
+  # defers and no run tests that tree.
   pull_request:
   push:
     branches: [main]
@@ -38,10 +40,13 @@ concurrency:
 
 jobs:
   route:
-    # a comment, request-changes or outside review starts a run too; it skips every job (no minutes)
+    # a comment, request-changes or outside review starts a run too; it skips every job (no minutes).
+    # DAH-6518: a CONTRIBUTOR approval runs route too: a member with private org membership shows as CONTRIBUTOR
+    # here, and changed-packages counts the approval only if its author can write to the repo.
+    # Known limit: a writer shown as NONE or FIRST_TIME_CONTRIBUTOR still skips; make the org membership public or have a member approve.
     if: >-
       github.event_name != 'pull_request_review' || (github.event.review.state == 'approved'
-      && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.review.author_association))
+      && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"]'), github.event.review.author_association))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -62,10 +67,12 @@ jobs:
     # and ASYNC210/ASYNC251 (blocking HTTP call / time.sleep inside a coroutine). F541 stays
     # ignored and the other families stay out until each is at zero; add a family here in the
     # commit that fixes it. Config: the root pyproject.toml ([tool.ruff]).
-    # Runs before approval too; like route, a review other than a member's approval skips it.
+    # Runs before approval too; it starts on the same reviews as route (e2e-gate passes a skipped ruff-check).
     if: >-
-      github.event_name != 'pull_request_review' || (github.event.review.state == 'approved'
-      && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.review.author_association))
+      (github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true')
+      && (github.event_name != 'pull_request_review'
+      || (github.event.review.state == 'approved'
+      && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"]'), github.event.review.author_association)))
     name: ruff check (pyflakes, blocking calls in coroutines)
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -81,7 +88,7 @@ jobs:
   validators:
     name: Validators Tests
     needs: route
-    if: ${{ !cancelled() && needs.route.outputs.validators == 'true' && needs.route.outputs.approved == 'true' }}
+    if: ${{ !cancelled() && needs.route.outputs.validators == 'true' && needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -107,19 +114,28 @@ jobs:
       - name: Install dependencies
         run: pdm install
 
-      - name: Run tests
+      - name: Run tests (parallel)
         env:
           BITTENSOR_WALLET_NAME: test_wallet
           BITTENSOR_WALLET_HOTKEY_NAME: test_hotkey
           SQLALCHEMY_DATABASE_URI: sqlite:///test.db
           ASYNC_SQLALCHEMY_DATABASE_URI: sqlite+aiosqlite:///test.db
           TDX_VERIFIER_URL: http://localhost:8000/verify
-        run: pdm run pytest tests/ -v --tb=short --strict-markers
+        run: pdm run pytest tests/ -v --tb=short --strict-markers -n 2 --dist loadfile --ignore=tests/test_loopback_plugin_setup.py --ignore=tests/test_sshd_bootstrap_script.py
+
+      - name: Run timing-sensitive tests (serial)
+        env:
+          BITTENSOR_WALLET_NAME: test_wallet
+          BITTENSOR_WALLET_HOTKEY_NAME: test_hotkey
+          SQLALCHEMY_DATABASE_URI: sqlite:///test.db
+          ASYNC_SQLALCHEMY_DATABASE_URI: sqlite+aiosqlite:///test.db
+          TDX_VERIFIER_URL: http://localhost:8000/verify
+        run: pdm run pytest tests/test_loopback_plugin_setup.py tests/test_sshd_bootstrap_script.py -v --tb=short --strict-markers
 
   executor:
     name: Executor Tests
     needs: route
-    if: ${{ !cancelled() && needs.route.outputs.executor == 'true' && needs.route.outputs.approved == 'true' }}
+    if: ${{ !cancelled() && needs.route.outputs.executor == 'true' && needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -153,7 +169,7 @@ jobs:
     # validators, so a broken client ships to every provider on the next tag
     name: Miners Tests
     needs: route
-    if: ${{ !cancelled() && needs.route.outputs.miners == 'true' && needs.route.outputs.approved == 'true' }}
+    if: ${{ !cancelled() && needs.route.outputs.miners == 'true' && needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -189,7 +205,7 @@ jobs:
     # Routed like the neurons; a lium_protocol/ change also selects `validators` (the compat test).
     name: Protocol package (tests + schema snapshot)
     needs: route
-    if: ${{ !cancelled() && needs.route.outputs.protocol == 'true' && needs.route.outputs.approved == 'true' }}
+    if: ${{ !cancelled() && needs.route.outputs.protocol == 'true' && needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -219,9 +235,8 @@ jobs:
 
   tests-ok:
     # sums up every job; the ruleset requires e2e-gate (see the e2e job).
-    # A package whose job was skipped as unchanged passes, and so does a skipped e2e-gate
-    # (a PR that touches no neuron); a failed or cancelled one fails this. Before approval it is skipped: ruff-check shows
-    # its own result, and e2e-gate makes the same check once the jobs run.
+    # A package whose job was skipped as unchanged passes, and so does the deferred e2e gate on a PR;
+    # a failed or cancelled one fails this. Before approval it is skipped: ruff-check shows its own result.
     name: tests-ok
     needs: [route, validators, executor, miners, ruff-check, protocol, e2e]
     if: always() && needs.route.result != 'skipped' && needs.route.outputs.approved == 'true'
@@ -233,20 +248,25 @@ jobs:
   # The subnet loop end to end on one runner (e2e/README.md): the PR's executor on its own dockerd, the PR's miner that
   # owns it, and the PR's validator services signing in, installing keys, scraping, walking the check pipeline,
   # publishing the verdict, then renting a container and tearing it down — plus every refusal a spoofer must hit.
-  # Routed like the package jobs: runs when any neuron, datura/, .github/ or e2e/ changed (a change only under a
-  # neuron's own tests/ directory does not count: the stack never runs those), skipped otherwise, and
-  # reported through tests-ok either way. gate.sh puts a hard timeout on every step, runs every suite even after a
-  # failure, and always leaves e2e/artifacts (timings, summary.md, junit per suite, compose logs, the suites' JSON
-  # dumps) — uploaded on every run and summarised in one sticky PR comment. Reproduce: make -C e2e e2e-full.
+  # The real gate runs in the merge queue (and on approved PRs and pushes until the queue is active): runs when
+  # any neuron, datura/, .github/ or e2e/ changed (a change only under a neuron's own tests/ directory does not
+  # count: the stack never runs those), skipped otherwise, and reported through tests-ok either way. gate.sh puts
+  # a hard timeout on every step, runs every suite even after a failure, and always leaves e2e/artifacts (timings,
+  # summary.md, junit per suite, compose logs, the suites' JSON dumps) — uploaded on every run, and summarised in
+  # one sticky PR comment when the run is on a PR. Reproduce: make -C e2e e2e-full.
   e2e:
-    # DAH-5832: the check is named e2e-gate only when it runs on an approved PR (or off a PR). Skipped, it reports
-    # under another name, so the required e2e-gate stays missing and the PR cannot merge before e2e-gate ran.
-    # An approved PR that changed no neuron runs the job with its steps skipped and passes.
-    name: ${{ needs.route.outputs.approved == 'true' && 'e2e-gate' || 'e2e-gate (runs once a review approves)' }}
+    # e2e-gate is the one required check, so the job never skips: a skipped job does not evaluate its
+    # name expression and reports under the raw expression text, and a static-name skip would report the
+    # required check as passing (DAH-6742). A review that is not a gating run (a comment, a request for
+    # changes, an outside approval, or an approval that route does not count) reports under another name,
+    # so it cannot overwrite the gate. A PR reports the gate deferred when the queue is active, or runs
+    # it on approval; the merge-group run executes the gate for the queued tree, and is green only when
+    # the gate ran (or no package changed), never when route failed.
+    name: ${{ (needs.route.result == 'skipped' || (github.event_name == 'pull_request_review' && needs.route.result == 'success' && needs.route.outputs.approved != 'true')) && 'e2e-gate (not a gating review)' || 'e2e-gate' }}
     # e2e-gate is the one required check, so it also fails when route, ruff-check or a package test job failed:
     # a red unit test cannot merge on a green e2e
     needs: [route, validators, executor, miners, ruff-check, protocol]
-    if: ${{ !cancelled() && needs.route.outputs.approved == 'true' }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -262,15 +282,42 @@ jobs:
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
         working-directory: ${{ github.workspace }}
         run: echo "::error::a package test job or ruff failed (see tests-ok)" && exit 1
+      - name: a gating run must route
+        # route skips only a review that cannot gate; when it was supposed to run and did not, fail closed
+        if: >-
+          needs.route.result != 'success'
+          && (github.event_name != 'pull_request_review'
+          || (github.event.review.state == 'approved'
+          && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR"]'), github.event.review.author_association)))
+        working-directory: ${{ github.workspace }}
+        run: echo "::error::route did not succeed (needs.route.result=${{ needs.route.result }})" && exit 1
+      - name: a merge-group entry must have a route approval
+        if: github.event_name == 'merge_group' && needs.route.outputs.approved != 'true'
+        working-directory: ${{ github.workspace }}
+        run: echo "::error::route did not approve the merge-group tree" && exit 1
+      - name: not a gating review
+        if: needs.route.result == 'skipped'
+        working-directory: ${{ github.workspace }}
+        run: echo "this review cannot gate the tree; the last e2e-gate result stands"
+      # With the queue off the PR check is the real gate: a green here would let an approved head merge
+      # before the approval run reports, so fail closed instead.
+      - name: not approved yet
+        if: needs.route.result == 'success' && github.event_name != 'merge_group' && needs.route.outputs.approved != 'true'
+        working-directory: ${{ github.workspace }}
+        run: echo "the approval rule blocks the merge; e2e-gate reports after a review approves" && [ "${{ vars.MERGE_QUEUE_ENABLED }}" = "true" ]
+      - name: deferred to the merge queue
+        if: github.event_name != 'merge_group' && needs.route.outputs.approved == 'true' && vars.MERGE_QUEUE_ENABLED == 'true'
+        working-directory: ${{ github.workspace }}
+        run: echo "e2e gate runs in the merge queue for this tree"
       - uses: actions/checkout@v4
-        if: env.RUN == 'true'
+        if: needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
       # the gha layer cache (E2E_CACHE, e2e/Makefile) needs a builder that exports cache and the Actions cache URL + token
       - uses: docker/setup-buildx-action@v3
-        if: env.RUN == 'true'
+        if: needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
       - uses: crazy-max/ghaction-github-runtime@v3
-        if: env.RUN == 'true'
+        if: needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
       - name: build, up, every suite, logs, down — each step under a hard timeout (gate.sh)
-        if: env.RUN == 'true'
+        if: needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
         id: gate
         timeout-minutes: 55
         env:
@@ -278,13 +325,13 @@ jobs:
         run: ./gate.sh
       - uses: actions/upload-artifact@v4
         id: artifacts
-        if: always() && env.RUN == 'true'
+        if: always() && needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true'
         with:
           name: e2e-gate-${{ github.event.pull_request.number || github.run_id }}-${{ github.run_attempt }}
           path: e2e/artifacts
           retention-days: 14
       - name: result on the PR
-        if: always() && env.RUN == 'true' && github.event.pull_request && github.event.pull_request.head.repo.full_name == github.repository
+        if: always() && needs.route.outputs.approved == 'true' && (github.event_name == 'merge_group' || vars.MERGE_QUEUE_ENABLED != 'true') && env.RUN == 'true' && github.event.pull_request && github.event.pull_request.head.repo.full_name == github.repository
         continue-on-error: true
         uses: actions/github-script@v7
         env:

@@ -6,6 +6,7 @@ set -e
 #   curl -fsSL https://raw.githubusercontent.com/Datura-ai/lium-io/main/neurons/executor/nvidia_docker_sysbox_setup.sh | sudo bash
 #   or: cd lium-io/neurons/executor && sudo bash nvidia_docker_sysbox_setup.sh
 #   sudo bash nvidia_docker_sysbox_setup.sh --check   only the preflight, one PASS/FIX line per requirement; exit 1 on any FIX
+#   sudo bash nvidia_docker_sysbox_setup.sh --install-layer-reset   only (re)install the boot-time layer reset (validators run it)
 # After sysbox works, install mode also sets up the vloopback volume plugin (pinned by digest,
 # DATA_DIR=<Docker data-root>/loopback) and mounts a 1 GB test volume into a sysbox container; the run exits 1
 # with a doc link when that fails.
@@ -18,6 +19,10 @@ set -e
 # 0.7.1 (DAH-3833): 0.6.6 cannot start an image with 44+ layers under Docker 29's containerd image store,
 # and 0.7.0 brings the runc container-escape fixes (CVE-2025-52565, CVE-2025-52881)
 SYSBOX_VERSION="0.7.1"
+# DAH-6804: the boot-time layer reset's version, written into its unit; the validator reinstalls it (--install-layer-reset)
+# on Sysbox hosts whose unit is missing or older. Bump it whenever shift_sysbox_layers_back_at_boot's output changes.
+# 1 is reserved for units written before this marker.
+LAYER_RESET_VERSION=2
 # nestybox publishes amd64 and arm64 .debs; arm64 is for GB300 / Grace hosts (check_arch refuses the rest)
 case "$(uname -m)" in
     aarch64|arm64) SYSBOX_ARCH=arm64; SYSBOX_SHA="04ca894ae0b53f0fa54eaacc173ce40363c9a95ea5450f773716a84ef650a69b" ;;
@@ -236,6 +241,387 @@ $nrconf{override_rc}->{qr(^nvidia-persistenced)} = 0;
 NRCONF
 }
 
+docker_containerd_address() {
+    # the containerd Docker talks to: its --containerd flag, else daemon.json "containerd", else the system containerd
+    # when its socket is up (dockerd uses it then); otherwise Docker starts its own containerd, which runs only with it
+    local a="" exec="" cfg=""
+    [ -z "${SYSBOX_SETUP_HOST_ROOT:-}" ] && exec=$(systemctl show -p ExecStart --value docker 2>/dev/null)
+    a=$(grep -o -- '--containerd[= ][^ ;]*' <<<"$exec" | head -1); a=${a#--containerd}; a=${a#[= ]}
+    # the daemon.json dockerd reads: its --config-file, else the default
+    cfg=$(grep -o -- '--config-file[= ][^ ;]*' <<<"$exec" | head -1); cfg=${cfg#--config-file}; cfg=${cfg#[= ]}
+    # python3, not jq: this runs before the installer installs jq
+    [ -n "$a" ] || a=$(python3 -Ic 'import json, sys; print(json.load(open(sys.argv[1])).get("containerd") or "")' \
+        "$(host_path "${cfg:-/etc/docker/daemon.json}")" 2>/dev/null)
+    [ -n "$a" ] || { [ -S "$(host_path /run/containerd/containerd.sock)" ] && a=/run/containerd/containerd.sock; }
+    echo "${a:-docker-managed}"  # Docker starts its own: the boot reset runs one on Docker's store itself
+}
+
+systemd_quote() {
+    # one quoted word of a unit setting: systemd splits an unquoted one at a space ("/srv/docker data") and expands %
+    local v=$1
+    v=${v//\\/\\\\}; v=${v//\"/\\\"}; v=${v//%/%%}
+    printf '"%s"' "$v"
+}
+
+systemd_env() {
+    printf 'Environment=%s\n' "$(systemd_quote "$1=$2")"
+}
+
+shift_sysbox_layers_back_at_boot() {
+    # Sysbox chowns a pod's writable layer into its uid range on start and back on a stop it sees. After an unclean
+    # stop (power loss, hard reset) the layer stays shifted, and the restart-policy start at boot mounts the image
+    # layers unmapped: every image file is host uid 0, nobody inside the pod, so sudo and apt break (DAH-6503;
+    # reproduced: a hard reset always, a clean reboot never). A boot oneshot before Docker shifts such a layer back.
+    local bin unit dropin address mounts root=""
+    address=$(docker_containerd_address)
+    # Docker's effective data-root (its --data-root flag or --config-file included), as check_total_disk_for_vram reads it
+    [ -z "${SYSBOX_SETUP_HOST_ROOT:-}" ] && root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+    # the disk the reset reads: Docker's own unit waits for a nofail data-disk mount, local-fs.target does not
+    mounts=$root
+    [ -n "$mounts" ] || mounts=$(python3 -Ic 'import json, sys; print(json.load(open(sys.argv[1])).get("data-root") or "")' \
+        "$(host_path /etc/docker/daemon.json)" 2>/dev/null)
+    bin=$(host_path /usr/local/sbin/lium-sysbox-layer-reset)
+    unit=$(host_path /etc/systemd/system/lium-sysbox-layer-reset.service)
+    dropin=$(host_path /etc/systemd/system/docker.service.d/lium-sysbox-layer-reset.conf)
+    mkdir -p "$(dirname "$bin")" "$(dirname "$unit")" "$(dirname "$dropin")" || return 1
+    cat > "$bin" <<'PY' || return 1
+#!/usr/bin/python3 -I
+# Lium (nvidia_docker_sysbox_setup.sh): shift back the writable layer a sysbox pod kept after an unclean stop, the way
+# sysbox's own stop does. Runs at boot before Docker; --dry-run only prints. Setuid bits and file capabilities kept.
+import atexit, errno, json, os, re, stat, struct, subprocess, sys, time
+
+DRY = "--dry-run" in sys.argv
+ROOT = os.environ.get("LIUM_LAYER_RESET_ROOT", "")
+RANGE = 65536
+# Docker's containerd, taken from its effective settings at install (unit Environment=); "docker-managed" when Docker
+# starts its own, which is not up before Docker: then this starts one on Docker's store for the lookup and stops it
+ADDRESS = os.environ.get("LIUM_CONTAINERD_ADDRESS", "/run/containerd/containerd.sock")
+_socket = None
+# mode and file capabilities of each entry of a batch whose chown clears them, written before its chowns, replayed first
+JOURNAL = ROOT + "/var/lib/lium-sysbox-layer-reset/pending.jsonl"
+BATCH = 512  # entries per journal write: bounds its size and the fsyncs a layer with many files costs
+ACLS = ("system.posix_acl_access", "system.posix_acl_default")
+# set on tmpfs each time Docker starts (unit drop-in): a reset belongs only before Docker's first start of a boot
+STARTED = ROOT + "/run/lium-docker-started"
+
+
+def data_root():
+    if os.environ.get("LIUM_DOCKER_DATA_ROOT"):
+        return ROOT + os.environ["LIUM_DOCKER_DATA_ROOT"]
+    # only a missing or unparsable file means Docker's default (Docker itself would not start on an unparsable one);
+    # any other read error fails the reset rather than scan the wrong root and succeed
+    try:
+        return ROOT + json.load(open(ROOT + "/etc/docker/daemon.json")).get("data-root", "/var/lib/docker")
+    except (FileNotFoundError, ValueError):
+        return ROOT + "/var/lib/docker"
+
+
+def containerd_socket():
+    global _socket
+    if _socket is None:
+        _socket = ROOT + ADDRESS
+        if ADDRESS == "docker-managed" and docker_running():
+            _socket = ROOT + "/var/run/docker/containerd/containerd.sock"  # a dry run: Docker's own is up, never a second
+        elif ADDRESS == "docker-managed":
+            # the store Docker's own containerd keeps under its data-root; containerd restarts no container by itself
+            state = ROOT + "/run/lium-sysbox-layer-reset"
+            _socket = state + "/containerd.sock"
+            proc = subprocess.Popen(["containerd", "--config", "/dev/null", "--root", data_root() + "/containerd/daemon",
+                                     "--state", state + "/state", "--address", _socket],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            atexit.register(lambda: (proc.terminate(), proc.wait(30)))
+        deadline = time.monotonic() + 60
+        while not os.path.exists(_socket) and time.monotonic() < deadline:
+            time.sleep(1)  # ordered after containerd.service; a socket from another unit may come up later
+    return _socket
+
+
+def containerd_upper(cid):
+    # Docker 29's containerd image store: the container's snapshot (key = container id, namespace moby) holds the
+    # writable layer; containerd answers before Docker starts any container
+    # a lookup that fails (no ctr, timeout, containerd down) fails the reset, so Docker stays down and the next boot
+    # retries; only a snapshot containerd says is missing is skipped
+    try:
+        r = subprocess.run(["ctr", "--address", containerd_socket(), "-n", "moby", "snapshots",
+                            "--snapshotter", "overlayfs", "mounts", "/", cid],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        sys.exit(f"ctr could not read the snapshot of {cid[:12]}: {e}")
+    if r.returncode != 0:
+        if "not found" in r.stderr:
+            return None
+        sys.exit(f"ctr could not read the snapshot of {cid[:12]} (exit {r.returncode}): {r.stderr.strip()[-300:]}")
+    m = re.search(r"upperdir=([^,\n]+)", r.stdout)  # ctr prints the options verbatim: a space is part of the path
+    return ROOT + m.group(1) if m else None
+
+
+def docker_running():
+    try:
+        os.kill(int(open(ROOT + "/var/run/docker.pid").read()), 0)
+        return True
+    except (FileNotFoundError, ProcessLookupError, ValueError):
+        return False  # no pid file, a stale pid, or an empty file: Docker is not running
+
+
+def back(i, base):
+    return i - base if base <= i < base + RANGE else i
+
+
+def subid(name):
+    # the host id range sysbox maps pods into: the "sysbox:start:count" line of /etc/subuid or /etc/subgid
+    try:
+        lines = open(ROOT + name).read().splitlines()
+    except FileNotFoundError:
+        return None  # no sysbox range at all; any other read error fails the reset (Docker stays down, next boot retries)
+    for line in lines:
+        parts = line.strip().split(":")
+        if len(parts) == 3 and parts[0] == "sysbox" and parts[1].isdigit() and parts[2].isdigit():
+            return int(parts[1]), int(parts[2])
+    return None
+
+
+def pod_base(i, ids):
+    # the start of the RANGE-sized slice of sysbox's range that id i falls in; None outside it (not shifted)
+    start, count = ids
+    return start + (i - start) // RANGE * RANGE if start <= i < start + count else None
+
+
+def xattr(path, name):
+    # None only when the attribute is absent or the filesystem has none; any other read error must stop the reset
+    # before a chown drops what could not be read
+    try:
+        return os.getxattr(path, name, follow_symlinks=False)
+    except OSError as e:
+        if e.errno in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP):
+            return None
+        raise
+
+
+def shift_acls(path, base):
+    # named user/group entries of a POSIX ACL (version 2, then tag u16, perm u16, id u32 each) carry ids too
+    n = 0
+    for name in ACLS:
+        raw = xattr(path, name)
+        if raw is None:
+            continue
+        out = bytearray(raw)
+        for off in range(4, len(raw) - 7, 8):
+            tag, perm, qid = struct.unpack_from("<HHI", raw, off)
+            if tag in (0x02, 0x08):  # ACL_USER, ACL_GROUP
+                struct.pack_into("<HHI", out, off, tag, perm, back(qid, base[0] if tag == 0x02 else base[1]))
+        if out != raw:
+            n = 1
+            if not DRY:
+                os.setxattr(path, name, bytes(out), follow_symlinks=False)
+    return n
+
+
+def journal(entries):
+    # one fsync per batch, and the file never holds more than one batch: its size stays bounded by BATCH paths
+    os.makedirs(os.path.dirname(JOURNAL), exist_ok=True)
+    with open(JOURNAL, "w") as f:
+        f.write("".join(json.dumps(e) + "\n" for e in entries))
+        f.flush()
+        os.fsync(f.fileno())
+    d = os.open(os.path.dirname(JOURNAL), os.O_RDONLY)
+    try:
+        os.fsync(d)  # the journal's own directory entry is durable before any chown
+    finally:
+        os.close(d)
+
+
+def restore(e):
+    os.chmod(e["p"], e["m"])
+    if e["c"]:
+        os.setxattr(e["p"], "security.capability", bytes.fromhex(e["c"]), follow_symlinks=False)
+
+
+def replay_journal():
+    # a run cut off between a chown and the mode/capability restore left them stripped: restore them first
+    try:
+        lines = open(JOURNAL).read().splitlines()
+    except FileNotFoundError:
+        return
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue  # torn while written: its batch had not reached any chown yet
+        try:
+            restore(e)
+        except FileNotFoundError:
+            pass  # gone with its container
+        # any other error fails the unit with the journal kept, so Docker stays down and the next boot retries
+    os.sync()  # restored metadata is on disk before the journal that describes it goes
+    os.remove(JOURNAL)
+
+
+def shift_batch(paths, base):
+    n = 0
+    todo = []
+    for path in paths:
+        try:
+            st = os.lstat(path)
+            link = stat.S_ISLNK(st.st_mode)
+            changed = 0 if link else shift_acls(path, base)
+        except OSError as e:
+            # a renter's path past PATH_MAX on the host (ENAMETOOLONG) stays as it is in that pod and must not hold
+            # Docker down for every pod; any other error fails the unit, so the next boot retries the layer
+            if e.errno != errno.ENAMETOOLONG:
+                raise
+            print(f"skipped ...{path[-80:]}: {e.strerror}", file=sys.stderr, flush=True)
+            continue
+        uid, gid = back(st.st_uid, base[0]), back(st.st_gid, base[1])
+        if (uid, gid) != (st.st_uid, st.st_gid):
+            changed = 1
+            if not DRY:
+                caps = None if link else xattr(path, "security.capability")
+                todo.append((path, uid, gid, link, stat.S_IMODE(st.st_mode), caps))
+        n += changed
+    entries = [{"p": p, "m": m, "c": c.hex() if c else None}
+               for p, _, _, link, m, c in todo if not link and (c or m & (stat.S_ISUID | stat.S_ISGID))]
+    if entries:
+        journal(entries)
+    for path, uid, gid, link, mode, caps in todo:
+        os.lchown(path, uid, gid)
+        if not link:
+            os.chmod(path, mode)  # chown clears setuid/setgid
+            if caps:
+                os.setxattr(path, "security.capability", caps, follow_symlinks=False)
+    if entries:
+        os.sync()  # the batch's restored metadata is on disk before its journal goes
+        os.remove(JOURNAL)
+    return n
+
+
+def main():
+    # a running pod's layer is shifted on purpose: only act while Docker is down, before it starts any pod
+    if docker_running() and not DRY:
+        sys.exit("Docker is running; not touching any layer")
+    if os.path.exists(STARTED) and not DRY:
+        print("Docker already ran this boot (its pods may still run under live-restore); nothing to reset", flush=True)
+        return
+    if not DRY:
+        replay_journal()
+    uids, gids = subid("/etc/subuid"), subid("/etc/subgid")
+    if not uids or not gids:
+        print("no sysbox range in /etc/subuid or /etc/subgid; nothing to reset", flush=True)
+        return
+    d = data_root()
+    # only an input that is not there is skipped: a read error (EIO) fails the unit, so Docker stays down and never
+    # starts a pod whose layer was left shifted. Not glob: it swallows a directory read error into "no containers".
+    try:
+        cids = sorted(e.name for e in os.scandir(f"{d}/containers"))
+    except FileNotFoundError:
+        cids = []
+    for cid in cids:
+        hc = f"{d}/containers/{cid}/hostconfig.json"
+        try:
+            if json.load(open(hc)).get("Runtime") != "sysbox-runc":
+                continue
+        except FileNotFoundError:
+            continue  # no hostconfig (yet), or removed since the listing
+        except ValueError:
+            continue  # unparsable: Docker does not load such a container either
+        try:
+            upper = f"{d}/overlay2/" + open(f"{d}/image/overlay2/layerdb/mounts/{cid}/mount-id").read().strip() + "/diff"
+        except FileNotFoundError:
+            upper = containerd_upper(cid)  # not in the overlay2 store: the containerd image store holds it
+        try:
+            # not os.path.isdir: it turns a read error into "no layer"
+            is_dir = bool(upper) and stat.S_ISDIR(os.stat(upper).st_mode)
+        except FileNotFoundError:
+            is_dir = False
+        if not is_dir:
+            print(f"no writable layer found for sysbox container {cid[:12]}", file=sys.stderr, flush=True)
+            continue
+        # shifted = the top's owner lies in sysbox's range; the pod's slice comes from that range, not from the owner
+        # itself, which a renter's `chown 1000 /` moves (a top outside the range is unshifted, or already done)
+        top = os.lstat(upper)
+        bu = pod_base(top.st_uid, uids)
+        if bu is None:
+            continue
+        base = (bu, pod_base(top.st_gid, gids) or gids[0] + (bu - uids[0]))
+        n = 0
+        batch = []
+
+        def unreadable(e):
+            if e.errno != errno.ENAMETOOLONG:
+                raise e
+            print(f"skipped ...{(e.filename or '')[-80:]}: {e.strerror}", file=sys.stderr, flush=True)
+
+        # one open directory per level, read entry by entry: memory stays at the depth plus one batch, however many
+        # entries a directory holds, and no recursion (os.walk before Python 3.12 recursed once per level)
+        dirs = []
+
+        def enter(path):
+            try:
+                dirs.append(os.scandir(path))
+            except OSError as e:
+                unreadable(e)
+
+        enter(upper)
+        while dirs:
+            try:
+                entry = next(dirs[-1], None)
+            except OSError as e:
+                unreadable(e)
+                entry = None
+            if entry is None:
+                dirs.pop().close()
+                continue
+            batch.append(entry.path)
+            if len(batch) >= BATCH:
+                n += shift_batch(batch, base)
+                batch = []
+            if entry.is_dir(follow_symlinks=False):
+                enter(entry.path)
+        batch.append(upper)  # last: its owner marks the layer done, so a cut-off run is redone next boot
+        n += shift_batch(batch, base)
+        print(f"{'would shift' if DRY else 'shifted'} {n} entries of {cid[:12]} back from {bu}", flush=True)
+
+
+main()
+PY
+    chmod 755 "$bin" || return 1
+    # the version line goes in last, once the unit is enabled and Docker's drop-in is in place: a cut-off or failed
+    # install reads as an old version (no line), so the validator installs again next check
+    cat > "$unit" <<UNIT || return 1
+[Unit]
+Description=Lium: shift sysbox pods' layers back after an unclean stop
+After=local-fs.target sysbox.service sysbox-mgr.service containerd.service
+Before=docker.service
+RequiresMountsFor=$(systemd_quote "${mounts:-/var/lib/docker}")
+
+[Service]
+Type=oneshot
+# active for the rest of the boot: a later Docker restart (live-restore keeps pods running) never reruns it
+RemainAfterExit=yes
+# the walk holds one open directory per level of a layer (PATH_MAX allows ~2048)
+LimitNOFILE=65536
+$(systemd_env LIUM_CONTAINERD_ADDRESS "$address")
+$(systemd_env LIUM_DOCKER_DATA_ROOT "$root")
+ExecStart=/usr/bin/python3 -I /usr/local/sbin/lium-sysbox-layer-reset
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    if [ -z "${SYSBOX_SETUP_HOST_ROOT:-}" ]; then
+        systemctl is-active -q docker && touch /run/lium-docker-started  # this boot's Docker already started
+        # Docker must never depend on a unit that is not enabled: no drop-in until enable succeeded, none left after
+        # a failure (an older install's drop-in included)
+        if ! { systemctl daemon-reload && systemctl enable lium-sysbox-layer-reset.service >/dev/null 2>&1; }; then
+            rm -f "$dropin"; systemctl daemon-reload >/dev/null 2>&1; return 1
+        fi
+    fi
+    # Docker starts only after a successful reset: never a pod on a half-reset layer (the reset log names the failure)
+    if ! printf '[Unit]\nRequires=lium-sysbox-layer-reset.service\nAfter=lium-sysbox-layer-reset.service\n[Service]\nExecStartPost=/bin/touch /run/lium-docker-started\n' \
+        > "$dropin" || ! sed -i "1i # lium-layer-reset-version=$LAYER_RESET_VERSION" "$unit"; then
+        rm -f "$dropin"; [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] || systemctl daemon-reload >/dev/null 2>&1; return 1
+    fi
+    [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] || systemctl daemon-reload
+}
+
 self_cmd() {
     # how to run this script again: the file when there is one, else the one-liner (curl | bash). A leading VAR=VALUE
     # argument goes after sudo (sudo's env_reset drops variables set before it); the rest are the script's options.
@@ -415,6 +801,20 @@ check_fusermount3_apparmor() {
     pf_fix "The AppArmor profile $FUSERMOUNT3_PROFILE (Ubuntu 26.04) stops sysbox-fs mounting under /var/lib/sysboxfs — every sysbox container fails." \
         "$(self_cmd)   # adds the rule below and reloads the profile" \
         "or by hand: printf '%s\\n' '$FUSERMOUNT3_RULE' 'umount /var/lib/sysboxfs/**,' | sudo tee -a $FUSERMOUNT3_LOCAL && sudo apparmor_parser -r $FUSERMOUNT3_PROFILE"
+}
+
+# sysbox-ce 0.7.1 ships sysbox-fs (10 s) and sysbox-mgr (45 s) start timeouts and no Restart=: a slow boot leaves
+# sysbox down until someone restarts it by hand, and the node fails every check meanwhile
+SYSBOX_DROPIN_NAME="lium-restart.conf"
+install_sysbox_restart_dropins() {
+    local svc dir
+    for svc in sysbox-fs sysbox-mgr; do
+        dir=$(host_path "/etc/systemd/system/${svc}.service.d")
+        mkdir -p "$dir"
+        printf '%s\n' "[Service]" "TimeoutStartSec=90" "Restart=on-failure" "RestartSec=5" > "$dir/$SYSBOX_DROPIN_NAME"
+    done
+    systemctl daemon-reload || { fail "systemctl daemon-reload failed after writing the sysbox restart drop-ins."; return 1; }
+    ok "sysbox-fs and sysbox-mgr restart on failure and get 90 s to start after a reboot."
 }
 
 allow_sysboxfs_in_fusermount3_apparmor() {
@@ -693,6 +1093,14 @@ check_sysbox() {
             "$(self_cmd)   # upgrades Sysbox; it refuses to run while the node has a rental"
         return 1
     fi
+    local svc
+    for svc in sysbox-fs sysbox-mgr; do
+        if [ ! -f "$(host_path "/etc/systemd/system/${svc}.service.d/$SYSBOX_DROPIN_NAME")" ]; then
+            pf_fix "$svc has no restart-on-failure drop-in: after a slow reboot Sysbox can stay down." \
+                "$(self_cmd)   # adds the drop-ins; restarts no service"
+            return 1
+        fi
+    done
     pf_pass "sysbox-runc ${installed:-installed} runs a container."
 }
 
@@ -954,16 +1362,29 @@ CHECK_MODE_OPTION=""
 case "${1:-}" in
     "") ;;
     --check) CHECK_MODE_OPTION="--check" ;;
+    --install-layer-reset)
+        # DAH-6804: what the validator runs on Sysbox hosts whose layer reset is missing or old. Installs the unit and
+        # Docker's drop-in only: never runs the reset, never restarts Docker, so running pods are not touched. One
+        # result line for the validator. Without python3 the unit's ExecStart fails at boot and the drop-in's
+        # Requires= then keeps Docker down, so it installs nothing there.
+        if [ "$(id -u)" != 0 ]; then echo "layer_reset_skipped not_root"
+        elif [ ! -x /usr/bin/python3 ]; then echo "layer_reset_skipped no_python3"
+        elif ! command -v sysbox-runc >/dev/null 2>&1; then echo "layer_reset_skipped no_sysbox"
+        elif shift_sysbox_layers_back_at_boot >/dev/null 2>&1; then echo "layer_reset_installed $LAYER_RESET_VERSION"
+        else echo "layer_reset_failed install"; fi
+        exit 0
+        ;;
     -h|--help)
-        echo "Usage: sudo bash nvidia_docker_sysbox_setup.sh [--check]"
+        echo "Usage: sudo bash nvidia_docker_sysbox_setup.sh [--check | --install-layer-reset]"
         echo "  (no option)  preflight the host, then install sysbox + NVIDIA container toolkit, configure Docker, verify;"
         echo "               a FIX on root, architecture, kernel or Docker stops the install, any other FIX is printed and the install goes on;"
         echo "               then sets up the vloopback volume plugin and mounts a test volume into a sysbox container (exit 1 if it fails)"
         echo "  --check      preflight only: host requirements and what this script installs, PASS/FIX per line, exit 1 on any FIX"
+        echo "  --install-layer-reset  only (re)install the boot-time layer reset unit; runs no reset, restarts nothing"
         echo "Env: SYSBOX_SKIP_KERNEL_CHECK=1, EXECUTOR_PORT, SSH_PORT (see the header of this script)"
         exit 0
         ;;
-    *)  fail "Unknown option: $1 (use --check or --help)"; exit 2 ;;
+    *)  fail "Unknown option: $1 (use --check, --install-layer-reset or --help)"; exit 2 ;;
 esac
 
 # ── 1. Pre-flight ────────────────────────────────────────
@@ -1006,6 +1427,9 @@ fi
 keep_needrestart_off_the_container_runtime && ok "apt (needrestart) never restarts sysbox, Docker, containerd or the NVIDIA fabric manager." \
     || warn "Could not write /etc/needrestart/conf.d/lium-container-runtime.conf; apt upgrades may restart sysbox under pods."
 
+shift_sysbox_layers_back_at_boot && ok "After an unclean stop, each pod's files are shifted back at boot before Docker starts it." \
+    || warn "Could not install lium-sysbox-layer-reset.service; after a power loss rented pods may lose sudo and apt."
+
 # ── 2. Already working? ─────────────────────────────────
 
 INSTALLED_SYSBOX=$(sysbox_runc_version || true)
@@ -1024,6 +1448,7 @@ if [ "$SYSBOX_UP_TO_DATE" = true ] && docker info 2>/dev/null | grep -q sysbox-r
         docker pull "$VERIFY_IMAGE" &>/dev/null || true
     fi
     if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &>/dev/null; then
+        install_sysbox_restart_dropins || exit 1   # safe under rentals: no service restarts
         setup_vloopback || { fail_vloopback; exit 1; }
         if [ -n "$VLOOPBACK_CHANGED" ]; then
             ok "Sysbox is already working."
@@ -1168,6 +1593,7 @@ if [ "$SKIP_INSTALL" = false ]; then
 else
     ok "Sysbox already installed, skipping."
 fi
+install_sysbox_restart_dropins || exit 1
 
 # ── 5. Configure Docker ────────────────────────────────
 
