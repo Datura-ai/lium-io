@@ -24,9 +24,12 @@ description: >-
   output, e2e, is true when any package is or when e2e/ itself changed: the e2e stack builds
   every neuron, so it runs whenever one of them could have changed and skips (green, via
   tests-ok) on a PR that touches none. A file under a neuron's own tests/ directory does not select
-  e2e, and neither does neurons/executor/liumd/: the stack runs e2e/tests and never the vendored
-  binary (the shadow that runs it is off in e2e), while tests/test_liumd_binary_manifest.py checks
-  the pin, so liumd/ also selects validators.
+  e2e, and neither do the files the stack never builds or runs: a neuron's tests/ directory, the
+  vendored liumd/ binary (the shadow that runs it is off in e2e; tests/test_liumd_binary_manifest.py
+  checks the pin, so liumd/ also selects validators), dstacktee/ (CVM apps), validators/
+  external_prober/ (the deploy-side lambda), the compose and Dockerfile.runner deployment manifests,
+  the docker_build.sh / docker_publish.sh pair, .env templates and the provider-host setup files
+  (sysbox installer and .deb, daemon.json, config.toml, run_jupyter.sh).
 
 outputs:
   validators:
@@ -120,10 +123,19 @@ runs:
           }
 
           const rows = [];
-          // the stack never runs a neuron's own tests/ or the vendored liumd binary, so a change there alone
-          // does not select e2e
-          const notE2E = f => /^neurons\/[^/]+\/tests\//.test(f) || /^neurons\/executor\/liumd\//.test(f);
-          const e2eFiles = files && files.filter(f => !notE2E(f));
+          // a change that only touches one of these cannot be exercised by the stack, so it does not select e2e
+          const STACK_IRRELEVANT = [
+            /^neurons\/[^/]+\/tests\//,
+            /^neurons\/executor\/liumd\//,
+            /^neurons\/executor\/dstacktee\//,
+            /^neurons\/validators\/external_prober\//,
+            /^neurons\/[^/]+\/docker-compose.*\.ya?ml$/,
+            /^neurons\/[^/]+\/\.env(\.dev)?\.template$/,
+            /^neurons\/[^/]+\/docker(_runner)?_(build|publish)\.sh$/,
+            /^neurons\/[^/]+\/Dockerfile\.runner$/,
+            /^neurons\/executor\/(nvidia_docker_sysbox_setup\.sh|sysbox-ce-.*\.deb|daemon\.json|config\.toml|run_jupyter\.sh)$/,
+          ];
+          const e2eFiles = files && files.filter(f => !STACK_IRRELEVANT.some(rx => rx.test(f)));
           let anyPackage = false;
           for (const [pkg, prefix] of Object.entries(PACKAGES)) {
             const changed = files ? touches(files, pkg, prefix) : true;
