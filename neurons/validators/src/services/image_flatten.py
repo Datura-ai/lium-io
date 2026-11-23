@@ -49,7 +49,7 @@ FLATTEN_MAX_LEASES = 2
 FLATTEN_BUSY_EXIT = 92
 FLATTEN_NO_DISK_EXIT = 95
 FLATTEN_MEASURE_FAILED_EXIT = 90
-# the node flatten lock not taken in time: a copy is still running (the other flock waits here exit 96 too)
+# flatten_wait: flock's wait for the node flatten lock ran out, so a copy is still running
 FLATTEN_LOCK_TIMEOUT_EXIT = 96
 
 FLATTEN_NO_DISK_RENTER_SENTENCE = (
@@ -265,7 +265,8 @@ def flatten_wait_command() -> str:
     # flatten that has not started copying refuses once it sees the mark (nothing to print without flock)
     return (
         f"command -v flock >/dev/null || exit 0; exec 9>>{FLATTEN_LOCK_PATH}; "
-        f"flock -w {FLATTEN_TIMEOUT_SECONDS + 300} 9 || exit {FLATTEN_LOCK_TIMEOUT_EXIT}; "
+        # -E: only flock's own wait running out exits FLATTEN_LOCK_TIMEOUT_EXIT; a flock crash or error keeps its status
+        f"flock -E {FLATTEN_LOCK_TIMEOUT_EXIT} -w {FLATTEN_TIMEOUT_SECONDS + 300} 9 || exit $?; "
         f"touch {FLATTEN_SIZED_PATH} || exit 1; "
         f"{df_command(root)} || exit {FLATTEN_MEASURE_FAILED_EXIT}"
     )

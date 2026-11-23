@@ -777,10 +777,17 @@ async def test_only_a_lock_held_past_the_wait_reads_as_the_node_busy(tmp_path):
     finally:
         held.kill()
         held.wait()
+    # review: flock itself crashing (segfault, 139) or erroring must keep its own status, not read as the timeout
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "flock").write_text("#!/bin/sh\nkill -SEGV $$\n")
+    (fake / "flock").chmod(0o755)
+    flock_crashed = subprocess.run(["sh", "-c", wait], env={"PATH": f"{fake}:{os.environ['PATH']}"}).returncode
+    assert flock_crashed == 139
 
     with pytest.raises(image_flatten.FlattenLockTimedOut):
         await image_flatten.wait_for_node_flatten(Mock(run=AsyncMock(return_value=Mock(exit_status=timed_out))))
-    for crashed in (1, 139):
+    for crashed in (1, flock_crashed):
         with pytest.raises(RuntimeError) as raised:
             await image_flatten.wait_for_node_flatten(Mock(run=AsyncMock(return_value=Mock(exit_status=crashed))))
         assert not isinstance(raised.value, image_flatten.FlattenLockTimedOut)
