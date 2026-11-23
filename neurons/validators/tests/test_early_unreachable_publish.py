@@ -213,13 +213,14 @@ OLD, NEW = "sha256:" + "a" * 64, "sha256:" + "b" * 64
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("registry", "published"),
-    [(OLD, True), (NEW, False), (None, False), (RuntimeError("registry down"), False)],
+    [(OLD, True), (NEW, False), (None, True), (RuntimeError("registry down"), True)],
     ids=["no-push", "push-mid-cycle", "registry-no-answer", "registry-error"],
 )
 async def test_a_push_mid_cycle_holds_the_early_publish_for_the_rollout_withhold(monkeypatch, registry, published):
     """DAH-6951: a push landing mid-cycle opens a rollout window at this cycle's end, which withholds an unreachable
     verdict; an early publish would already have hidden the node. Such a node is held for the cycle end, which
-    publishes it only if its verdict stands. With the registry where it was at cycle start, it goes early as before."""
+    publishes it only if its verdict stands. With the registry where it was at cycle start, it goes early as before;
+    an unreadable registry opens no window at the cycle end either, so it goes early too (r262)."""
     from services.executor_rollout import RolloutWindow, withhold_rollout_verdicts
 
     reads = AsyncMock(side_effect=registry) if isinstance(registry, Exception) else AsyncMock(return_value=registry)

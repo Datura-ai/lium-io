@@ -111,6 +111,7 @@ ROLLOUT_FAILURE_REASONS = frozenset(
 # SPEC_CHANGED, GPU_COUNT_ZERO) is sent at once, whatever ended the run after it (a session found closed afterwards).
 ROLLOUT_RESET_CAUSES = ROLLOUT_FAILURE_REASONS | {AvailabilityErrorCode.NODE_ACCOUNT_UNVERIFIED.value}
 _OUTDATED = ExecutorImageMessages.OUTDATED.reason
+_NODE_ACCOUNT_UNVERIFIED = AvailabilityErrorCode.NODE_ACCOUNT_UNVERIFIED.value
 # The ways a run ends with score 0 and the OUTDATED report attached instead of failing at the
 # image check: a rented executor's image check passes and the tenant-enforcement halt ends the run
 # (RENTED); a run that reaches finalize ends on VALIDATION_COMPLETED.
@@ -481,9 +482,12 @@ def a_rollout_may_withhold_the_reset(
 ) -> bool:
     """DAH-6951: a verified-job reset waits for the cycle end only when a rollout window could withhold its run
     (withholdable_reason) and its own cause is a read that did not finish (ROLLOUT_RESET_CAUSES). A finding, the
-    host-confirmed GPU runtime fault of a rented node included, never waits."""
+    host-confirmed GPU runtime fault of a rented node included, never waits; nor does an account read that timed out
+    (a stall), only one whose session closed under it."""
+    cause = evidence.get("reason_code")
     return (
-        evidence.get("reason_code") in ROLLOUT_RESET_CAUSES
+        cause in ROLLOUT_RESET_CAUSES
+        and (cause != _NODE_ACCOUNT_UNVERIFIED or bool(evidence.get("session_closed_under_read")))
         and not evidence.get("host_gpu_fault_reset")
         and withholdable_reason(score, run_reason, executor_image_report) is not None
     )

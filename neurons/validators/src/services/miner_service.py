@@ -1394,9 +1394,10 @@ class MinerService:
     @staticmethod
     async def _rollout_window_may_open(tally: RunningOutageTally) -> bool:
         """DAH-6951: True when this cycle's end may open an executor rollout window, which withholds an unreachable
-        verdict: the registry digest moved since cycle start (a push mid-cycle), or cannot be read now. Nothing goes
-        early then, as in a cycle that starts inside a window. A seen push holds for the rest of the cycle. No
-        rollout_digest (no window can open this cycle, RolloutWindow.a_new_window_may_open): never held, no read."""
+        verdict: the registry digest moved since cycle start (a push mid-cycle). Nothing goes early then, as in a
+        cycle that starts inside a window. A seen push holds for the rest of the cycle. A registry that cannot be read
+        opens no window at the cycle end either (observe_executor_rollout keeps the window it had), so it holds
+        nothing. No rollout_digest (no window can open this cycle, RolloutWindow.a_new_window_may_open): no read."""
         if tally.rollout_digest is None or tally.rollout_began:
             return tally.rollout_began
         # one read per cycle, shared by every miner answering
@@ -1407,7 +1408,7 @@ class MinerService:
         except Exception:
             digest = None
         tally.rollout_began = digest is not None and digest != tally.rollout_digest
-        return digest is None or tally.rollout_began
+        return tally.rollout_began
 
     async def publish_machine_specs(
         self,

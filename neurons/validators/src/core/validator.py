@@ -61,6 +61,7 @@ from services.rented_pod_watch import RentedPodWatch
 from services.task.availability import RunningOutageTally, silence_availability_errors_on_our_own_outage
 from services.task.checks.duplicate_executor import keep_one_executor_per_gpu, keep_one_miner_per_executor
 from services.task.checks.verifyx import MIN_VERIFYX_EMA_DOWNLOAD_SPEED_MBPS
+from services.task.models import VALIDATOR_REDIS_UNAVAILABLE
 from services.task_service import JobResult, TaskService
 from services.verifyx_validation_service import NETWORK_GATE_TALLY, VerifyXValidationService
 
@@ -1681,16 +1682,21 @@ class Validator:
         when the rollout window withholds its own result (rollout_grace_reason), and sent otherwise. Each result is
         judged on itself, whether or not it reached the cycle end (a miner job cancelled at the wait timeout, a
         session-lost verdict): what would withhold its verdict drops its reset, nothing else does. A run that raised
-        after holding its reset has no result to withhold: sent."""
+        after holding its reset has no result to withhold: sent. A reset that cannot be sent makes its run
+        VALIDATOR_REDIS_UNAVAILABLE, as the same error did at base: the next withhold step takes that verdict out of
+        the cycle, so the node is neither scored nor published without its reset, and the next cycle checks it again."""
         for held in self.miner_service.task_service.take_held_resets(job_batch_id):
             if held.result is not None and rollout_grace_reason(held.result, window, job_block) is not None:
                 continue
             try:
                 await self.redis_service.clear_verified_job_info(**held.reset)
             except Exception as exc:
+                if held.result is not None:
+                    held.result.failure_reason_code = VALIDATOR_REDIS_UNAVAILABLE
+                    held.result.availability_errors = None
                 logger.error(
                     _m(
-                        "[rollout-grace] could not send a held verified-job reset",
+                        "[rollout-grace] could not send a held verified-job reset; its verdict is withheld",
                         extra=get_extra_info(
                             {**self.default_extra, "executor_uuid": held.executor_id, "error": str(exc)}
                         ),
