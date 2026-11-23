@@ -143,8 +143,8 @@ class RentedPodOwnershipCheck:
     """
 
     check_id = "host.observe.rented_pod_ownership"
-    # it moves the mid-revert marks: a rerun on a fresh session would read its own first-sight mark as a later sight
-    replays_after_session_drop = False
+    # safe to rerun on a fresh session: a mark carries the run's pipeline id, so a rerun reads its own mark as the same sight
+    replays_after_session_drop = True
     fatal = False
 
     async def run(self, ctx: Context) -> CheckResult:
@@ -166,11 +166,13 @@ class RentedPodOwnershipCheck:
                 timeout=READ_TIMEOUT_SECONDS,
             )
             pid_by_name = {}
-            # docker inspect exits 1 on a missing name but still prints the others
+            # docker inspect exits 1 on a missing name but still prints the others; a name not asked for is ignored
+            # (the provider controls the reply, and each pod read can move a Redis mark)
             for line in (res.stdout or "").splitlines():
                 name, _, pid = line.partition(" ")
-                if (_num(pid) or 0) > 0:
-                    pid_by_name[name.lstrip("/")] = _num(pid)
+                name = name.lstrip("/")
+                if name in names and (_num(pid) or 0) > 0:
+                    pid_by_name[name] = _num(pid)
             if not pid_by_name:
                 return self._event(
                     ctx, Msg.UNREAD, {"reason": "no running rented container", "pods": names}
@@ -235,9 +237,10 @@ class RentedPodOwnershipCheck:
 
     async def _settle_mid_revert_marks(self, ctx: Context, candidates: list[dict], clean: list[dict]) -> set[str]:
         """The candidates read in the hand-back shape for the first time since their last clean read (any init pid).
-        One MGET and one MULTI/EXEC within MID_REVERT_MARKS_BUDGET_SECONDS: each candidate's mark is set (the TTL only
-        ends marks of containers never read again; each sight renews it) and each clean pod's is cleared, as a clean
-        read ends the stop the mark stood for. When Redis cannot say in time, no candidate is a first sight: the shape
+        One MGET and one MULTI/EXEC within MID_REVERT_MARKS_BUDGET_SECONDS: each candidate's mark is set to this run's
+        pipeline id (a mark of the same run, left by the check before its session dropped and it ran again, is the same
+        sight; the TTL only ends marks of containers never read again; each sight renews it) and each clean pod's is
+        cleared, as a clean read ends the stop the mark stood for. When Redis cannot say in time, no candidate is a first sight: the shape
         is reported, never hidden. A dry run shares Redis with the live validator: it reads the marks, never writes."""
         if not candidates and (not clean or settings.DRY_RUN):
             return set()
@@ -250,11 +253,16 @@ class RentedPodOwnershipCheck:
             if not settings.DRY_RUN:
                 writes = RedisWrites()
                 for pod in candidates:
-                    writes.set(key(pod), "1", ex=MID_REVERT_TTL_SECONDS)
+                    writes.set(key(pod), ctx.pipeline_id, ex=MID_REVERT_TTL_SECONDS)
                 for pod in clean:
                     writes.delete(key(pod))
                 await ctx.services.redis.write_atomically(writes)
-            return {p["container"] for p, mark in zip(candidates, seen) if mark is None}
+            run = ctx.pipeline_id.encode()
+            return {
+                p["container"]
+                for p, mark in zip(candidates, seen)
+                if mark is None or (mark.encode() if isinstance(mark, str) else mark) == run
+            }
 
         try:
             return await asyncio.wait_for(settle(), timeout=MID_REVERT_MARKS_BUDGET_SECONDS)

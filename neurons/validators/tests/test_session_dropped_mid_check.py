@@ -31,7 +31,6 @@ from services.task.checks.inspector import InspectorRentedCheck
 from services.task.checks.port_connectivity import PortConnectivityCheck
 from services.task.checks.rental_probe import RentalProbeCheck
 from services.task.checks.rented_gpu_drop import RentedGpuDropCheck
-from services.task.checks.rented_pod_ownership import RentedPodOwnershipCheck
 from services.task.checks.rented_machine import TenantEnforcementCheck
 from services.task.checks.stale_container_cleanup import StaleContainerCleanupCheck
 from services.task.availability import REASONS_THAT_HIDE_AT_ONCE, failed_check_event
@@ -197,7 +196,6 @@ def test_checks_that_write_redis_or_host_state_are_not_replayable():
         ContainerDownloadSpeedCheck,
         CustomBuildOrphanSweepCheck,
         GpuUsageCheck,
-        RentedPodOwnershipCheck,
     ):
         assert getattr(check, "replays_after_session_drop", False) is False
 
