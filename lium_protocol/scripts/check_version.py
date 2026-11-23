@@ -1,12 +1,15 @@
 """CI check for lium_protocol versioning (stdlib only): `python lium_protocol/scripts/check_version.py <base>`.
 
-Compares the tree at <base> with HEAD (`git diff <base> HEAD`; locally pass `$(git merge-base origin/main HEAD)`)
-and fails when
+Compares the tree at <base> with HEAD (`git diff <base> HEAD`; CI passes the commit the PR merges onto, in the merge
+queue too, so each PR is judged on its own diff; locally pass `$(git merge-base origin/main HEAD)`) and fails when
 1. the version changes in a PR that is not a release PR,
 2. a release PR does not raise the version above the base's (a release rebased onto another one and resolved to the
-   base's version would name two wires with one version), or
-3. the wire (anything under lium_protocol/lium_protocol/ but a version line, a comment or a blank line) changes and
-   no fragment is added under lium_protocol/changes/.
+   base's version would name two wires with one version),
+3. a release PR leaves a fragment that is on its base (a feature merged after the release was cut: its change would
+   ship under the release's tag without its bump), or
+4. the wire changes and no fragment is added under lium_protocol/changes/. The wire is the committed schema snapshot
+   (CI holds it equal to the models: `python -m lium_protocol.schema --check`) but its protocol_version line, so a
+   comment or a docstring that is not in the schema needs no fragment.
 A release PR is one that deletes at least one fragment: `scripts/release.py` does that, nothing else does.
 """
 
@@ -14,11 +17,11 @@ import re
 import subprocess
 import sys
 
-WIRE = "lium_protocol/lium_protocol/"
+WIRE = "lium_protocol/lium_protocol/snapshots/"
 CHANGES = "lium_protocol/changes/"
 INIT = "lium_protocol/lium_protocol/__init__.py"
-# changed lines that are not the wire: the version itself, comments, blank lines
-NOT_WIRE = re.compile(r'^\s*(#.*|PROTOCOL_VERSION = "[^"]*"|"protocol_version": "[^"]*",?)?\s*$')
+# changed snapshot lines that are not the wire: the version itself, blank lines
+NOT_WIRE = re.compile(r'^\s*("protocol_version": "[^"]*",?)?\s*$')
 
 
 def git(*args: str) -> str:
@@ -27,6 +30,10 @@ def git(*args: str) -> str:
 
 def version(ref: str) -> str:
     return re.search(r'^PROTOCOL_VERSION = "([^"]+)"$', git("show", f"{ref}:{INIT}"), re.MULTILINE).group(1)
+
+
+def fragments(ref: str) -> set[str]:
+    return {p for p in git("ls-tree", "-r", "--name-only", ref, "--", f":(top){CHANGES}").splitlines() if p.endswith(".md")}
 
 
 def _key(v: str) -> tuple[int, ...]:
@@ -42,6 +49,12 @@ def problems(base: str) -> list[str]:
     if is_release and _key(new) <= _key(old):
         found.append(
             f"a release PR must raise PROTOCOL_VERSION above the base's {old} (it is {new}): "
+            "run scripts/release.py again on the current main"
+        )
+    kept = sorted(fragments(base) & fragments("HEAD")) if is_release else []
+    if kept:
+        found.append(
+            f"a release PR must take every fragment on its base, and {', '.join(kept)} stays: "
             "run scripts/release.py again on the current main"
         )
     if not is_release and old != new:

@@ -227,16 +227,14 @@ jobs:
 
       - name: Version is set only by a release PR; a wire change carries a fragment
         # scripts/check_version.py: a release PR is one that deletes a fragment under changes/. A push to main is not checked (its PR was).
+        # HEAD^1 is the commit this PR merges onto, in the queue too (the entry ahead of it, not the queue's base): each PR is judged on
+        # its own diff, so a fragment of a PR ahead in the queue never stands in for a missing one here
         env:
           EVENT_NAME: ${{ github.event_name }}
-          MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
         run: |
           case "$EVENT_NAME" in
-            pull_request|pull_request_review) base=HEAD^1 ;;
-            merge_group) git fetch -q --depth=1 origin "$MERGE_GROUP_BASE" && base="$MERGE_GROUP_BASE" ;;
-            *) exit 0 ;;
+            pull_request|pull_request_review|merge_group) python scripts/check_version.py HEAD^1 ;;
           esac
-          python scripts/check_version.py "$base"
 
       - name: Install
         # the renderer is pinned: the snapshot is pydantic's JSON Schema, and a pydantic release can change it

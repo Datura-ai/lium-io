@@ -59,8 +59,9 @@ def check(repo: Path) -> subprocess.CompletedProcess:
 
 
 def change_wire(repo: Path) -> None:
-    path = repo / "lium_protocol/lium_protocol/http.py"
-    path.write_text(path.read_text() + "\nNEW_FIELD = 1\n")
+    # the wire is the committed snapshot (CI holds it equal to the models)
+    path = repo / SNAPSHOT.format(MAJOR)
+    path.write_text(path.read_text().replace('  "$defs": {\n', '  "$defs": {\n    "NewField": {},\n', 1))
 
 
 def next_minor() -> str:
@@ -121,6 +122,13 @@ def test_comment_only_change_needs_no_fragment(repo: Path) -> None:
     assert check(repo).returncode == 0
 
 
+def test_a_source_change_the_snapshot_does_not_show_needs_no_fragment(repo: Path) -> None:
+    """a docstring or code comment that is not in the schema (taiberium on lium-io#2376: the schema.py docstring fix)"""
+    path = repo / "lium_protocol/lium_protocol/http.py"
+    path.write_text(path.read_text() + '\n\ndef helper():\n    """a reworded docstring."""\n')
+    assert check(repo).returncode == 0
+
+
 def test_version_change_in_a_feature_pr_fails(repo: Path) -> None:
     path = repo / "lium_protocol/lium_protocol/__init__.py"
     path.write_text(path.read_text().replace(PROTOCOL_VERSION, next_minor()))
@@ -159,3 +167,22 @@ def test_a_release_that_lowers_the_version_fails(repo: Path) -> None:
     path.write_text(path.read_text().replace(PROTOCOL_VERSION, lower))
     result = check(repo)
     assert result.returncode == 1 and "must raise PROTOCOL_VERSION" in result.stdout
+
+
+def test_a_release_that_keeps_a_fragment_of_its_base_fails(repo: Path) -> None:
+    """taiberium on lium-io#2376: the release was cut before a major feature merged; merged onto that base, the release
+    takes only its own fragment and the feature's major change would ship under the minor tag"""
+    fragment(repo, "small", "minor")
+    commit(repo, "a minor feature")
+    run(repo, "git", "branch", "release")
+    change_wire(repo)
+    fragment(repo, "breaking", "major")
+    commit(repo, "a major feature merged after the release was cut")
+    base = run(repo, "git", "rev-parse", "HEAD").stdout.strip()
+    run(repo, "git", "checkout", "-q", "release")
+    assert release(repo).returncode == 0
+    commit(repo, "release")
+    run(repo, "git", "checkout", "-q", base)
+    run(repo, "git", "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "--no-ff", "-m", "merge", "release")
+    result = run(repo / "lium_protocol", sys.executable, str(SCRIPTS / "check_version.py"), "HEAD^1")
+    assert result.returncode == 1 and "breaking.md stays" in result.stdout

@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 BUMPS = ("minor", "major")
 INIT = "lium_protocol/lium_protocol/__init__.py"
@@ -26,13 +27,18 @@ SNAPSHOT_PATTERN = r'^  "protocol_version": "([^"]+)",$'
 CHANGES = "lium_protocol/changes"
 
 
-def read_fragment(path: Path) -> tuple[str, str]:
-    """(bump, changelog text) of one fragment; SystemExit when it is malformed."""
+class Fragment(NamedTuple):
+    bump: str
+    changelog_entry: str
+
+
+def read_fragment(path: Path) -> Fragment:
+    """one fragment's bump and changelog entry; SystemExit when it is malformed."""
     first, _, rest = path.read_text().strip().partition("\n")
     bump, text = first.strip().lower(), " ".join(rest.split())
     if bump not in BUMPS or not text:
         sys.exit(f"{path}: first line must be one of {BUMPS}, then a one-line changelog entry")
-    return bump, text
+    return Fragment(bump, text)
 
 
 def bumped(version: str, bump: str) -> str:
@@ -48,12 +54,12 @@ def replace_version(text: str, pattern: str, old: str, new: str, name: str) -> s
     return text[:start] + new + text[end:]
 
 
-def release(root: Path) -> str:
+def release_and_return_new_version(root: Path) -> str:
     fragments = sorted((root / CHANGES).glob("*.md"))
     if not fragments:
         sys.exit(f"no fragments in {CHANGES}/: nothing to release")
     entries = [read_fragment(path) for path in fragments]
-    bump = max((b for b, _ in entries), key=BUMPS.index)
+    bump = max((entry.bump for entry in entries), key=BUMPS.index)
     old = re.search(VERSION_FILES[INIT], (root / INIT).read_text(), re.MULTILINE).group(1)
     new = bumped(old, bump)
 
@@ -70,7 +76,7 @@ def release(root: Path) -> str:
 
     # the version list: the new line goes above `1.0.0`, the list's last line
     readme = root / README
-    line = f"- `{new}` — {' '.join(entry for _, entry in entries)}\n"
+    line = f"- `{new}` — {' '.join(entry.changelog_entry for entry in entries)}\n"
     lines = readme.read_text().splitlines(keepends=True)
     at = next((i for i, x in enumerate(lines) if x.startswith("- `1.0.0` —")), None)
     if at is None:
@@ -84,7 +90,7 @@ def release(root: Path) -> str:
 
 def main() -> None:
     root = Path(subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip())
-    new = release(root)
+    new = release_and_return_new_version(root)
     print(
         f"lium_protocol {new}. After the release PR merges: "
         f"git tag lium-protocol-v{new} <merge commit> && git push origin lium-protocol-v{new}"
