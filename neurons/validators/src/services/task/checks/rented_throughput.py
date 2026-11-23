@@ -31,6 +31,7 @@ from ..runner import SSHCommandResult
 from .container_download_speed import (
     _FETCH_SCRIPT,
     _TIMEOUT_EXITS,
+    _UPLOAD_NAMES,
     ContainerDownloadSpeedCheck,
     download_speed_command,
     parse_download_speed,
@@ -371,10 +372,18 @@ def slow_detail(state: _State) -> str:
     reading = state.reading
     parts = []
     if state.net_failures >= READINGS_BEFORE_VERDICT:
-        need = reading.get("min_mbps")
         # only what this reading's network verdict confirmed; a later unjudged reading names no endpoint
         slow = reading.get("net_failed") or []
-        parts.append(f"network: {', '.join(slow)} measured, {need:g} Mbps required" if slow and need else "network")
+        # each failed endpoint against its own minimum: an upload is judged by the upload one (lio#2411)
+        mins = {"download": reading.get("min_mbps"), "upload": reading.get("min_upload_mbps", reading.get("min_mbps"))}
+        kinds = sorted({"upload" if entry.split(" ", 1)[0] in _UPLOAD_NAMES else "download" for entry in slow})
+        if not slow or not all(mins[kind] for kind in kinds):
+            parts.append("network")
+        elif len({mins[kind] for kind in kinds}) == 1:
+            parts.append(f"network: {', '.join(slow)} measured, {mins[kinds[0]]:g} Mbps required")
+        else:
+            need = ", ".join(f"{mins[kind]:g} Mbps {kind}" for kind in kinds)
+            parts.append(f"network: {', '.join(slow)} measured, {need} required")
     if state.disk_failures >= READINGS_BEFORE_VERDICT:
         mb, need = (reading.get("disk") or {}).get("mb_per_s"), reading.get("disk_min_mb_per_s")
         # a standing verdict can carry a later passing, excused or unjudged write; only a write this reading judged

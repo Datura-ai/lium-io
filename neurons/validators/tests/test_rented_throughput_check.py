@@ -1407,6 +1407,23 @@ def test_a_standing_disk_verdict_names_only_a_write_this_reading_judged_failing(
     assert slow_detail(_State(at=0, disk_failures=2, reading=reading)) == detail
 
 
+@pytest.mark.parametrize(
+    "failed, detail",
+    [
+        (["cf_up 3.0 Mbps"], "network: cf_up 3.0 Mbps measured, 5 Mbps required"),
+        (["pypi 1.5 Mbps"], "network: pypi 1.5 Mbps measured, 10 Mbps required"),
+        (
+            ["pypi 1.5 Mbps", "cf_up 3.0 Mbps"],
+            "network: pypi 1.5 Mbps, cf_up 3.0 Mbps measured, 10 Mbps download, 5 Mbps upload required",
+        ),
+    ],
+)
+def test_a_failed_upload_is_shown_against_the_upload_minimum(failed, detail):
+    # lio#2411: the upload is judged by CONTAINER_UPLOAD_SPEED_MIN_MBPS, so the detail names that minimum for it
+    reading = {"net_failed": failed, "min_mbps": 10, "min_upload_mbps": 5}
+    assert slow_detail(_State(at=0, net_failures=2, reading=reading)) == detail
+
+
 async def test_a_rented_pod_slow_to_pypi_only_on_this_providers_path_fails():
     # PyPI slow and HF fast on one node only: the old rule passed it
     answer = snaps() + disk() + PYPI_ONLY_SLOW
