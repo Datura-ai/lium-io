@@ -61,11 +61,13 @@ def test_changes_refuse_an_env_value_with_a_line_break():
 
 def _ssh(
     *, exists: bool, flatten_rc: int = 0, size: int = 24 * 1024**3, driver: str = "overlay2", same_disk_rc=0,
-    docker_version: str = "29.8.0", stderr: str = "boom",
+    docker_version: str = "29.8.0", stderr: str = "boom", listed: str | None = None,
 ):
     async def run(command, check=False, timeout=None):
         if command.startswith("/usr/bin/docker version"):
             return Mock(exit_status=0, stdout=f"{docker_version}\n")
+        if command.startswith("/usr/bin/docker image ls -a --no-trunc"):
+            return Mock(exit_status=0 if listed is not None else 1, stdout=listed or "")
         if "--pid=host" in command:
             return Mock(exit_status=0, stdout="/usr/bin/containerd \n")
         if command == image_flatten.containerd_plugins_command("/run/containerd/containerd.sock"):
@@ -148,15 +150,40 @@ async def test_no_flatten_on_a_store_off_the_measured_disk():
     ssh = _ssh(exists=False, driver="overlayfs", same_disk_rc=1)
     with pytest.raises(RuntimeError, match="storage driver"):
         await flatten_image_on_host(ssh, "model:dev", lease="r1")
-    assert ssh.run.await_count == 4
+    assert ssh.run.await_count == 3
 
 
 @pytest.mark.asyncio
-async def test_no_flatten_on_the_containerd_store_of_a_docker_that_undercounts_image_size():
-    ssh = _ssh(exists=False, driver="overlayfs", docker_version="29.7.2")
-    with pytest.raises(RuntimeError, match="storage driver 'overlayfs': docker version '29.7.2' does not count"):
+async def test_before_docker_29_8_the_containerd_store_copy_is_budgeted_from_the_listed_size():
+    # inspect Size (packed only) says 1 GiB; the list counts the unpacked snapshots too: 24.6GB
+    listed = f"sha256:{'cd' * 32} 3GB\n{_IMAGE_ID} 24.6GB\n{_IMAGE_ID} 24.6GB\n"
+    ssh = _ssh(exists=False, driver="overlayfs", docker_version="29.4.3", size=1024**3, listed=listed)
+    assert await flatten_image_on_host(ssh, "model:dev", lease="r1") == _TAG
+    need = 2 * image_flatten.listed_size_bytes("24.6GB") + FLATTEN_DISK_MARGIN_BYTES
+    assert f'[ "$avail" -ge {need} ]' in ssh.run.await_args_list[-1].args[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("listed", [None, "", f"{'sha256:' + 'cd' * 32} 3GB\n", f"{_IMAGE_ID} 24.6GiB\n"])
+async def test_before_docker_29_8_no_flatten_when_the_listed_size_is_unreadable(listed):
+    ssh = _ssh(exists=False, driver="overlayfs", docker_version="29.4.3", listed=listed)
+    with pytest.raises(RuntimeError, match="size on disk is unreadable"):
         await flatten_image_on_host(ssh, "model:dev", lease="r1")
-    assert ssh.run.await_count == 2
+    assert "docker create" not in ssh.run.await_args_list[-1].args[0]
+
+
+@pytest.mark.parametrize(
+    "word, low, high",
+    [("24.6GB", 24.55e9, 24.6e9 * 1.005), ("1GB", 0.995e9, 1.005e9), ("1e+03kB", 999.5e3, 1.005e6), ("0B", 0, 0),
+     ("999B", 999, 999 * 1.005 + 1)],
+)
+def test_a_listed_size_is_read_up_to_at_least_the_bytes_it_rounds(word, low, high):
+    assert low <= image_flatten.listed_size_bytes(word) <= high + 1
+
+
+@pytest.mark.parametrize("word", ["24.6GiB", "24.6 GB", "N/A", "", "-1GB"])
+def test_a_listed_size_in_any_other_form_is_unreadable(word):
+    assert image_flatten.listed_size_bytes(word) is None
 
 
 @pytest.mark.parametrize(
@@ -209,8 +236,6 @@ def _same_disk_rc(
         f"#!{sys.executable}\n"
         "import subprocess, sys\n"
         "a = sys.argv[1:]\n"
-        "if a[0] == 'version':\n"
-        "    print('29.8.0'); sys.exit(0)\n"
         f"if '--pid=host' in a:\n    print({daemons!r}, end=''); sys.exit(0)\n"
         "if a[0] == 'info':\n"
         f"    print({driver_status!r} if 'DriverStatus' in a[2] else {str(data_root)!r}); sys.exit(0)\n"
@@ -822,6 +847,8 @@ _MANY = image_flatten.FLATTEN_BUDGET_MIN_LAYERS
 )
 async def test_flatten_copy_bytes_budgets_only_a_copy_still_to_write(stdout, copy_exit, expected):
     async def run(command, **kwargs):
+        if command.startswith("/usr/bin/docker version"):
+            return Mock(stdout="29.8.0\n")
         if "--format" in command:
             return Mock(stdout=stdout)
         assert "lium-flattened:abc" in command
@@ -830,6 +857,46 @@ async def test_flatten_copy_bytes_budgets_only_a_copy_still_to_write(stdout, cop
         return Mock(exit_status=copy_exit)
 
     assert await image_flatten.flatten_copy_bytes(Mock(run=run), "sglang") == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "version, listed, readable",
+    [("29.4.3\n", "sha256:abc 30GB\n", True), ("29.4.3\n", "", False), (RuntimeError("ssh"), "", False)],
+)
+async def test_flatten_copy_bytes_before_docker_29_8_budgets_the_listed_size(version, listed, readable):
+    # an unreadable size (no list entry, or the version read failing) stops the sizing: never "no copy needed"
+    async def run(command, **kwargs):
+        if command.startswith("/usr/bin/docker version"):
+            if isinstance(version, Exception):
+                raise version
+            return Mock(stdout=version)
+        if command.startswith("/usr/bin/docker image ls"):
+            return Mock(stdout=listed)
+        if "--format" in command:
+            return Mock(stdout=f"{_GIB24} {_MANY} sha256:abc\noverlayfs\n")
+        return Mock(exit_status=1)
+
+    if not readable:
+        with pytest.raises(image_flatten.FlattenSizeUnreadable):
+            await image_flatten.flatten_copy_bytes(Mock(run=run), "sglang")
+        return
+    got = await image_flatten.flatten_copy_bytes(Mock(run=run), "sglang")
+    assert got == 2 * image_flatten.listed_size_bytes("30GB") + FLATTEN_DISK_MARGIN_BYTES
+
+
+@pytest.mark.asyncio
+async def test_an_existing_copy_needs_no_size_so_an_unreadable_one_does_not_stop_the_create():
+    # review at fc11bf3: the flatten reuses the copy, writing nothing; only a new copy needs a readable size
+    async def run(command, **kwargs):
+        if command.startswith("/usr/bin/docker version"):
+            raise RuntimeError("ssh")
+        if "--format" in command:
+            return Mock(stdout=f"{_GIB24} {_MANY} sha256:abc\noverlayfs\n")
+        assert "lium-flattened:abc" in command
+        return Mock(exit_status=0)
+
+    assert await image_flatten.flatten_copy_bytes(Mock(run=run), "sglang") is None
 
 
 @pytest.mark.asyncio

@@ -11,6 +11,7 @@ shell-form health check instead) and ONBUILD (build-time only) are not carried o
 """
 
 import json
+import math
 import re
 import shlex
 import tomllib
@@ -78,6 +79,10 @@ class FlattenMeasureFailed(RuntimeError):
 
 class FlattenLockTimedOut(RuntimeError):
     """An image copy held the node flatten lock for the whole wait: the node is busy, not failing."""
+
+
+class FlattenSizeUnreadable(RuntimeError):
+    """A many-layer image's size on disk could not be read, so the room its flatten needs is unknown."""
 
 
 def _dockerfile_word(value: str) -> str:
@@ -305,7 +310,8 @@ def _copy_bytes(size: int, driver: str) -> int:
 async def flatten_copy_bytes(ssh_client: asyncssh.SSHClientConnection, image: str) -> int | None:
     """The disk a one-layer copy of the local `image` would take (`_copy_bytes` plus FLATTEN_DISK_MARGIN_BYTES), for
     the sizing to keep free; None when the image has too few layers to need one, its copy is already on the
-    node (a flatten reuses it, writing nothing), or it cannot be read."""
+    node (a flatten reuses it, writing nothing), or it cannot be inspected. Raises FlattenSizeUnreadable when a
+    many-layer image's size on disk cannot be read: the copy may be needed, so the sizing must not grant its room."""
     try:
         result = await ssh_client.run(
             "/usr/bin/docker image inspect --format '{{.Size}} {{len .RootFS.Layers}} {{.Id}}' "
@@ -329,7 +335,12 @@ async def flatten_copy_bytes(ssh_client: asyncssh.SSHClientConnection, image: st
     except Exception:
         copy = None  # unknown: keep the room for a new copy
     # shortcut: the copy may be removed before the flatten reuses it; the flatten's own disk check then refuses
-    return None if copy is not None and copy.exit_status == 0 else _copy_bytes(size, driver) + FLATTEN_DISK_MARGIN_BYTES
+    if copy is not None and copy.exit_status == 0:
+        return None  # reused: no size needed, so an unreadable one does not stop the create
+    size = await image_disk_bytes(ssh_client, image_id, size, driver)
+    if size is None:
+        raise FlattenSizeUnreadable(f"the size on disk of {image!r} on storage driver {driver!r} is unreadable")
+    return _copy_bytes(size, driver) + FLATTEN_DISK_MARGIN_BYTES
 
 
 _CONTAINERD_DEFAULT_ROOT = "/var/lib/containerd"
@@ -472,8 +483,8 @@ def same_filesystem_as_data_root_command(path: str) -> str:
     )
 
 
-# Before Docker 29.8.0 `image inspect` Size on the containerd store leaves out the unpacked snapshots, so
-# the copy's disk budget would be too small (moby/moby, Docker 29.8.0 release notes)
+# Before Docker 29.8.0 `image inspect` Size on the containerd store leaves out the unpacked snapshots, while
+# `image ls` Size counts them (moby/moby#53426: 29.8 gives inspect the list's count)
 _CONTAINERD_SIZE_MIN_DOCKER = (29, 8, 0)
 
 
@@ -483,15 +494,51 @@ def docker_counts_unpacked_size(server_version: str) -> bool:
     return bool(match) and tuple(map(int, match.groups())) >= _CONTAINERD_SIZE_MIN_DOCKER
 
 
+_LISTED_SIZE = re.compile(r"(\d+(?:\.\d+)?(?:e\+\d+)?)(B|kB|MB|GB|TB|PB)")
+_LISTED_UNITS = {"B": 1, "kB": 10**3, "MB": 10**6, "GB": 10**9, "TB": 10**12, "PB": 10**15}
+
+
+def listed_size_bytes(word: str) -> int | None:
+    """At least the bytes behind `docker image ls`'s Size word (three significant digits, decimal units: "24.6GB"),
+    so a budget from it is never short; None for any other form."""
+    match = _LISTED_SIZE.fullmatch(word.strip())
+    if not match:
+        return None
+    # the word is rounded to 3 significant digits: the true size is below 1.005 times it
+    return math.ceil(float(match.group(1)) * _LISTED_UNITS[match.group(2)] * 1.005)
+
+
+async def image_disk_bytes(
+    ssh_client: asyncssh.SSHClientConnection, image_id: str, size: int, driver: str
+) -> int | None:
+    """The bytes the local image `image_id` holds, from its inspect `size`: as is on overlay2 and on a Docker whose
+    containerd-store inspect counts the unpacked snapshots; before that (Docker < 29.8) the image list's Size, which
+    counts them. None when it cannot be read: the caller refuses rather than budget from the packed size alone."""
+    if driver == "overlay2":
+        return size
+    try:
+        version = await ssh_client.run(
+            "/usr/bin/docker version --format '{{.Server.Version}}'", check=True, timeout=_DOCKER_READ_TIMEOUT_SECONDS
+        )
+        if docker_counts_unpacked_size(str(version.stdout)):
+            return size
+        listed = await ssh_client.run(
+            "/usr/bin/docker image ls -a --no-trunc --format '{{.ID}} {{.Size}}'",
+            check=True,
+            timeout=_DOCKER_READ_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return None
+    words = [line.split() for line in str(listed.stdout).splitlines()]
+    sizes = {listed_size_bytes(w[1]) for w in words if len(w) == 2 and w[0] == image_id}
+    # one image under several tags lists the same Size; none or a disagreeing or unparsable one is unreadable
+    return sizes.pop() if len(sizes) == 1 and None not in sizes else None
+
+
 async def containerd_store_refusal(ssh_client: asyncssh.SSHClientConnection) -> str | None:
-    """None on Docker's containerd image store with containerd's root on the filesystem of Docker's data root, on a
-    Docker whose image Size counts the unpacked snapshots; else which of those could not be confirmed. Refused
-    whenever either cannot be determined, so a flatten never measures the wrong disk or budgets too little of it."""
-    version = await ssh_client.run(
-        "/usr/bin/docker version --format '{{.Server.Version}}'", check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS
-    )
-    if version.exit_status != 0 or not docker_counts_unpacked_size(str(version.stdout)):
-        return f"docker version {str(version.stdout).strip()!r} does not count unpacked snapshots"
+    """None on Docker's containerd image store with containerd's root on the filesystem of Docker's data root; else
+    which of those could not be confirmed. Refused whenever either cannot be determined, so a flatten never measures
+    the wrong disk (`image_disk_bytes` reads what the image holds on it)."""
     daemons = await ssh_client.run(containerd_daemons_command(), check=False, timeout=_DOCKER_READ_TIMEOUT_SECONDS)
     if daemons.exit_status != 0 or not containerd_daemon_reads_etc_config(str(daemons.stdout)):
         return "not exactly one containerd reading /etc/containerd/config.toml"
@@ -563,7 +610,10 @@ async def flatten_image_on_host(
     config = info.get("Config") or {}
     driver_name = str(driver.stdout).strip()
     fixed = FLATTEN_DISK_MARGIN_BYTES + reserved_bytes
-    need_bytes = _copy_bytes(int(info.get("Size") or 0), driver_name) + fixed
+    size = await image_disk_bytes(ssh_client, info["Id"], int(info.get("Size") or 0), driver_name)
+    if size is None:
+        raise RuntimeError(f"not flattening on storage driver {driver_name!r}: the image's size on disk is unreadable")
+    need_bytes = _copy_bytes(size, driver_name) + fixed
     command = _flatten_command(
         info["Id"],
         tag,
