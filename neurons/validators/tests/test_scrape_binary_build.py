@@ -106,3 +106,25 @@ def test_preparing_a_cycle_builds_nothing(job_files_root, monkeypatch):
     # an empty earlier directory holds nothing anyone reads; one with a binary waits for the next build
     assert not (job_files_root / "cycle-empty").exists()
     assert (job_files_root / "cycle-built").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_call_after_a_failed_build_starts_a_new_one(job_files_root, monkeypatch):
+    directory = cycle_dir(job_files_root, 1)
+    attempts = []
+
+    def command(_source, dist, _work, name):
+        attempts.append(name)
+        if len(attempts) == 1:
+            return [sys.executable, "-c", "raise SystemExit(3)"]
+        return [sys.executable, "-c", FAKE_BUILD, dist, name]
+
+    monkeypatch.setattr(file_encrypt_service, "_pyinstaller_command", command)
+    build = ScrapeBinaryBuild(directory, "tmpabc", "print(1)", lambda: ())
+
+    with pytest.raises(RuntimeError, match="exited 3"):
+        await build.ensure(5)
+    await build.ensure(5)
+
+    assert attempts == ["tmpabc", "tmpabc"]
+    assert (directory / "tmpabc").read_text() == "bin"

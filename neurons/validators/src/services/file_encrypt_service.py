@@ -592,9 +592,9 @@ class ScrapeBinaryBuild:
         self._build: asyncio.Task | None = None
 
     async def ensure(self, wait_seconds: float) -> None:
-        """Returns once the binary is in `directory`; concurrent callers wait on the same build, and a failed
-        build fails every caller of this cycle. Raises TimeoutError after `wait_seconds`; the build goes on."""
-        if self._build is None:
+        """Returns once the binary is in `directory`; concurrent callers wait on the same build, and a call after
+        a failed build starts a new one. Raises TimeoutError after `wait_seconds`; the build goes on."""
+        if self._build is None or (self._build.done() and self._build.exception() is not None):
             self._build = asyncio.create_task(self._run())
         # shielded: one verification giving up must not cancel the build the others wait on
         await asyncio.wait_for(asyncio.shield(self._build), wait_seconds)
