@@ -772,7 +772,7 @@ async def test_plugin_setup_runs_under_the_probed_budget_only_for_the_generation
 # hosts): local volumes in $VOLUMES live under /data/fs/docker
 _DATA_ROOT_FAKE_DOCKER = r"""#!/bin/sh
 case "$1 $2" in
-  "info --format") echo "error during connect: context deadline exceeded" >&2; exit 1 ;;
+  "info --format") [ -n "$CALLS" ] && echo info >> "$CALLS"; echo "error during connect: context deadline exceeded" >&2; exit 1 ;;
   "volume ls")
     case "$*" in *"-q"*) [ -n "$VOLUMES" ] && printf '%s\n' $VOLUMES ;; esac; exit 0 ;;
   "volume inspect") eval "name=\${$#}"; echo "/data/fs/docker/volumes/$name/_data" ;;
@@ -808,15 +808,58 @@ def test_an_unknown_data_root_names_why_docker_info_gave_none(tmp_path):
 
     # Assert
     assert _parse_docker_root_dir(stdout) == ("", "docker info exit 1: error during connect: context deadline exceeded")
-    with pytest.raises(Exception, match=r"no DockerRootDir \(docker info exit 1: error during connect"):
-        _parse_volume_host_probe(
-            _run_with_fake_docker(tmp_path, _volume_host_probe_command(with_df=False)), with_df=False
-        )
+    probe = _parse_volume_host_probe(
+        _run_with_fake_docker(tmp_path, _volume_host_probe_command(with_df=True)), with_df=True
+    )
+    # the probe's answer stands (no root, and why), so no caller asks docker info again
+    assert (probe.docker_root_dir, probe.root_error) == (
+        "", "docker info exit 1: error during connect: context deadline exceeded"
+    )
+    assert probe.df_avail_bytes is None
+
+
+def test_a_failing_docker_info_is_asked_once_per_reader(tmp_path):
+    # review 23 Nov: a docker info failing after 16 s was asked twice by the probe and twice more by the
+    # fallback reader, so the v2 fallback took 62 s; each reader now calls it once
+    calls = tmp_path / "calls"
+    for command in (_docker_root_dir_shell() + "printf '%s\\n' \"$root\"", _volume_host_probe_command(with_df=False)):
+        calls.write_text("")
+        stdout = _run_with_fake_docker(tmp_path, command, CALLS=str(calls))
+        assert calls.read_text().count("info") == 1
+        assert "ROOTERR\t1 error during connect" in stdout
+
+
+@pytest.mark.asyncio
+async def test_a_probe_without_a_root_falls_back_to_v2_without_asking_docker_again(monkeypatch):
+    service = DockerService.__new__(DockerService)
+    probe = VolumeHostProbe(
+        docker_root_dir="", df_avail_bytes=None, vloopback_volume_names=[],
+        loopback_plugin_enabled=False, root_error="docker info exit 1: boom",
+    )
+    asked = []
+
+    async def ask(*_args, **_kwargs):
+        asked.append(_args)
+        raise AssertionError("docker asked again")
+
+    fallbacks = []
+
+    async def fall_back(_ssh, _timeout, _extra, reason, _root):
+        fallbacks.append(reason)
+        return "v2"
+
+    monkeypatch.setattr(DockerService, "read_docker_root_dir", staticmethod(ask))
+    monkeypatch.setattr(service, "_get_current_loopback_plugin_state", ask)
+    monkeypatch.setattr(service, "_fall_back_to_old_loopback_plugin", fall_back)
+    monkeypatch.setattr(docker_service_module.settings, "LOOPBACK_PLUGIN_V2_ENABLED", True)
+
+    assert await service._pick_loopback_driver_for_new_volume(object(), 10, {}, probe) == "v2"
+    assert fallbacks == ["Docker data root unknown (docker info exit 1: boom)"] and not asked
 
 
 _ROOT_FAKE_DOCKER = r"""#!/bin/sh
 case "$1 $2" in
-  "info --format") echo "WARNING: No swap limit support" >&2; echo /var/lib/docker ;;
+  "info --format") echo "WARNING: No swap limit support" >&2; echo DOCKERROOT=/var/lib/docker ;;
   "volume ls") exit 0 ;;
   "plugin inspect") exit 1 ;;
 esac
