@@ -384,8 +384,14 @@ class ContainerDownloadSpeedCheck:
         for r in readings:
             if r.error in NODE_SIDE_ERRORS and await validator_reaches(_CONTROL_URLS[r.endpoint]):
                 return Judgement(is_failing=True, has_no_verdict=False, failed=(r,))
-        # an endpoint left unmeasured (ours, or the endpoint's) and no failure: no verdict
-        return Judgement(is_failing=False, has_no_verdict=any(r.mbps is None for r in readings))
+        # an endpoint left unmeasured (ours, or the endpoint's) and no failure: no verdict. An upload the receiver answered
+        # with an HTTP error (403, 429) reached it, so it says nothing about the pod and does not hold the downloads' verdict
+        return Judgement(
+            is_failing=False,
+            has_no_verdict=any(
+                r.mbps is None and not (r.endpoint in _UPLOAD_NAMES and r.error == "http_error") for r in readings
+            ),
+        )
 
     def _verdict(self, ctx: Context, state: _State, *, probed: bool) -> CheckResult:
         enforced = state.failing_readings_on_rentals_network >= READINGS_BEFORE_VERDICT

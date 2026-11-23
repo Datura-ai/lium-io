@@ -337,6 +337,27 @@ async def test_slow_then_fast_resets():
     assert res.passed and res.event.reason_code == Msg.OK.reason
 
 
+@pytest.mark.parametrize(
+    "upload",
+    [
+        line("cf_up", 0, 0.1, 1, "wget: server returned error: HTTP/1.1 403 Forbidden"),
+        line("cf_up", 0, 0.1, 1, "wget: server returned error: HTTP/1.1 429 Too Many Requests"),
+        UP,
+    ],
+)
+async def test_fast_downloads_clear_a_failure_when_the_upload_receiver_refuses(upload):
+    fast_downloads = RENTALS + line("pypi", CAP_BYTES, 1.0, 0) + line("hf", CAP_BYTES, 1.0, 0) + upload
+    with flags() as clock:
+        ctx, runner, redis = make_ctx(SLOW, fast_downloads)
+        check = ContainerDownloadSpeedCheck()
+        await check.run(ctx)
+        assert json.loads(next(iter(redis.store.values())))["failures_in_a_row"] == 1
+        clock.now += 31 * 60
+        res = await check.run(ctx)
+    assert res.passed and res.event.reason_code == Msg.OK.reason
+    assert json.loads(next(iter(redis.store.values())))["failures_in_a_row"] == 0
+
+
 async def test_endpoint_unreachable_counts_only_when_the_validator_reaches_it():
     with flags(reachable=True):
         ctx, _, redis = make_ctx(DNS_DOWN)
