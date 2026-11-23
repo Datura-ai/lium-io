@@ -32,6 +32,7 @@ from services.redis_service import (
     RedisService,
     create_started_at_key,
     renter_create_id,
+    resumed_create,
 )
 
 
@@ -483,6 +484,26 @@ async def test_the_backends_resend_is_tracked_with_its_resume_counted() -> None:
     # the re-sent create takes over the resumed record: one record, its resume counted
     assert [c.resumes for c in seen[0]] == [1]
     assert await redis_service.inflight_backend_creates() == {}
+
+
+@pytest.mark.asyncio
+async def test_only_the_backends_resend_runs_as_a_resumed_create() -> None:
+    # DAH-6992: the docker create replaces the cut-off attempt's container only on the re-send
+    redis_service = _redis_service()
+    await redis_service.add_inflight_backend_create("pod-1", "miner-hk", "exec-1", WorkloadKind.FILLER)
+    client = _client(redis_service)
+    await client.fail_creates_cut_off_by_restart()
+    seen: list[bool] = []
+
+    async def fake_drive_miner_job(job_request: ContainerCreateRequest) -> None:
+        seen.append(resumed_create.get())
+
+    client._drive_miner_job = fake_drive_miner_job
+    await client._run_miner_job(_create_request())  # the re-send
+    await client._run_miner_job(_create_request())  # a later fresh create of the pod
+
+    assert seen == [True, False]
+    assert resumed_create.get() is False
 
 
 @pytest.mark.asyncio

@@ -106,6 +106,7 @@ from services.redis_service import (
     STREAMING_LOG_CHANNEL,
     NORMALIZED_SCORE_CHANNEL,
     renter_create_id,
+    resumed_create,
 )
 from clients.handlers.backup_handler import BackupHandler
 
@@ -1203,9 +1204,11 @@ class ComputeClient:
             if not await self._write_backend_create_record(pod_id, add):
                 retrying = asyncio.ensure_future(self._retry_backend_create_record(pod_id, add))
             create_id_token = renter_create_id.set(create_id)  # the create lock's owner, see executor_create_exclusion
+            resumed_token = resumed_create.set(resumes > 0)
             try:
                 return await self._drive_miner_job(job_request)
             finally:
+                resumed_create.reset(resumed_token)
                 renter_create_id.reset(create_id_token)
                 if retrying is not None:
                     retrying.cancel()
