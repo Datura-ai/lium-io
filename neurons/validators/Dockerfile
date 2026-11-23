@@ -1,5 +1,10 @@
 ARG BASE_IMAGE=python:3.11-slim
 
+# DAH-6804: the executor_setup build context (neurons/executor) replaces this stage; a build without it (the staging
+# workflow until its build-contexts list it) ships an empty placeholder, and SysboxLayerResetCheck then installs nothing
+FROM $BASE_IMAGE AS executor_setup
+RUN touch /nvidia_docker_sysbox_setup.sh
+
 FROM $BASE_IMAGE
 
 RUN apt-get update \
@@ -21,6 +26,8 @@ RUN pdm install --prod
 COPY . .
 # the signed liumd manifest vendored with this code: its release is the refresh's code floor (MIN_RELEASE)
 COPY --from=liumd manifest.json* liumd-vendored/
+# DAH-6804: SysboxLayerResetCheck runs this script's --install-layer-reset on Sysbox hosts (context: neurons/executor)
+COPY --from=executor_setup nvidia_docker_sysbox_setup.sh /app/executor_setup/
 
 RUN mv libdmcompverify.so /usr/lib/
 RUN mv libverifyx.so /usr/lib/
