@@ -138,7 +138,7 @@ async def test_applies_the_drop_in_the_hosts_namespaces_without_any_image(contex
     assert helper.startswith('if ! { [ "$(id -u)" = 0 ] && { [ "$(readlink /proc/1/ns/mnt)" ') and helper.endswith(
         f"; fi; {root}"
     )
-    assert "then exec /usr/bin/docker run --rm --privileged --pid=host " in helper
+    assert "then /usr/bin/docker run --rm --privileged --pid=host " in helper
     # no container on a root executor: a registry refusing an anonymous pull (Docker Hub's rate limit) never matters
     assert not any("docker run" in call or "docker pull" in call for call in ssh.calls if call != helper and not _is_generation_read(call))
 
@@ -1515,3 +1515,42 @@ def test_a_reload_query_that_fails_never_passes_for_loaded(tmp_path, failing):
     again = subprocess.run(["sh", "-c", script], env=env, capture_output=True, text=True)
 
     assert again.returncode == 0 and "docker.service drop-in not loaded" in again.stdout
+
+
+# An iptables that crashes on -I: "segv" the way a crashing binary does (the step's own status), "shell" by killing the
+# shell that runs the steps, the way an "exit 139" with no stderr reaches the validator.
+_CRASH_STUB = r"""#!/bin/sh
+case "$1" in
+  --version) echo "iptables v1.8.7 (nf_tables)" ;;
+  -C|-D) exit 1 ;;
+  -I) [ "$2" = FORWARD ] && exit 0; [ "$CRASH" = shell ] && kill -SEGV $PPID; kill -SEGV $$ ;;
+esac
+exit 0
+"""
+
+
+@pytest.mark.parametrize("crash", ["segv", "shell"])
+def test_a_crash_names_the_failing_step_its_status_and_the_iptables_build(tmp_path, monkeypatch, crash):
+    _state, _lock, env = _probe(tmp_path, monkeypatch)
+    for name in ("iptables-nft", "iptables-legacy"):
+        (tmp_path / "bin" / name).write_text(_CRASH_STUB)
+    command = helper_command(link_local_drop_script("br-0123456789ab", []))
+
+    done = subprocess.run(["sh", "-c", command], env={**env, "CRASH": crash}, capture_output=True, text=True)
+    error = rental_egress_guard._error(SimpleNamespace(exit_status=done.returncode, stderr=done.stderr))
+
+    if crash == "segv":
+        assert done.returncode == 4
+        assert error.startswith("step swap (exit 4): ") and "exit 139 (iptables v1.8.7 (nf_tables))" in error, error
+    else:
+        assert done.returncode == 139
+        assert error.startswith("step swap (exit 139, signal 11)"), error
+        assert "helper shell ended by signal 11" in error
+
+
+def test_a_killed_helper_container_is_reported():
+    command = rental_egress_guard._reporting_exit("sh -c 'kill -SEGV $$'", "helper container")
+
+    done = subprocess.run(["sh", "-c", command], capture_output=True, text=True)
+
+    assert done.returncode == 139 and "helper container ended by signal 11" in done.stderr

@@ -182,6 +182,19 @@ def legacy_network_ids(inspect_stdout: str) -> list[str]:
     return ids
 
 
+# Every helper step names itself on stderr before it runs, and a failed step reports its exit status and the host's
+# iptables version and backend: the error then names the step even when the shell itself is killed (``_error``).
+STEP_MARK = "@step "
+_STEP_FUNCS = (
+    f'step() {{ echo "{STEP_MARK}$1" >&2; }}; '
+    'fail() { RC=$?; V=; [ -z "$IPT" ] || V=" ($($IPT --version 2>/dev/null))"; echo "${1:+$1: }exit $RC$V" >&2; exit 4; }'
+)
+
+
+def _steps(steps: list[tuple[str, str]]) -> list[str]:
+    return [_STEP_FUNCS] + [f"step {name}; {command}" for name, command in steps]
+
+
 # The host's iptables whose DOCKER-USER reads, tried in order (plain `iptables` for a host without -nft/-legacy).
 # A backend is absent only when its binary is missing (127) or iptables says the chain does not exist; any other
 # failed probe is kept in ERRS, so a later backend's absence is never taken for the whole host's.
@@ -216,8 +229,7 @@ _ENSURE_DOCKER_USER = (
     '$IPT -L DOCKER-USER -n >/dev/null || { echo "DOCKER-USER not created" >&2; exit 4; }; }; '
     # 1 is "no such rule"; any other failed check is an error, never a reason to insert a second jump
     '$IPT -C FORWARD -j DOCKER-USER 2>/dev/null; RC=$?; '
-    '[ $RC -eq 0 ] || { [ $RC -eq 1 ] && $IPT -I FORWARD -j DOCKER-USER; } || '
-    '{ echo "FORWARD jump to DOCKER-USER not ensured" >&2; exit 4; }'
+    '[ $RC -eq 0 ] || { [ $RC -eq 1 ] && $IPT -I FORWARD -j DOCKER-USER; } || fail "FORWARD jump to DOCKER-USER not ensured"'
 )
 
 
@@ -234,33 +246,41 @@ def link_local_drop_script(bridge: str | None, legacy_bridges: list[str], host_r
     (the newer) and takes the other out before flushing it.
     """
     a, b = CHAINS
-    lines = [
-        _BACKEND_PROBE,
-        _ENSURE_DOCKER_USER,
-        f"$IPT -N {a} 2>/dev/null; $IPT -N {b} 2>/dev/null",
-        'RULES=$($IPT -S DOCKER-USER) || { echo "DOCKER-USER not readable" >&2; exit 4; }',
-        f"ACTIVE=$(printf '%s\\n' \"$RULES\" | awk '$1 == \"-A\" && $3 == \"-j\" && ($4 == \"{a}\" || $4 == \"{b}\") "
-        "{ print $4; exit }')",
-        f'if [ "$ACTIVE" = {a} ]; then NEW={b}; OLD={a}; else NEW={a}; OLD={b}; fi',
-        "while $IPT -D DOCKER-USER -j $NEW 2>/dev/null; do :; done",
+    steps = [
+        ("probe", _BACKEND_PROBE),
+        ("docker-user", _ENSURE_DOCKER_USER),
+        ("chains", f"$IPT -N {a} 2>/dev/null; $IPT -N {b} 2>/dev/null"),
+        ("read", 'RULES=$($IPT -S DOCKER-USER) || fail "DOCKER-USER not readable"'),
+        (
+            "pick",
+            f"ACTIVE=$(printf '%s\\n' \"$RULES\" | awk '$1 == \"-A\" && $3 == \"-j\" && ($4 == \"{a}\" || $4 == \"{b}\") "
+            "{ print $4; exit }'); "
+            f'if [ "$ACTIVE" = {a} ]; then NEW={b}; OLD={a}; else NEW={a}; OLD={b}; fi',
+        ),
+        ("unhook-new", "while $IPT -D DOCKER-USER -j $NEW 2>/dev/null; do :; done"),
         # 1 is "no such rule"; anything else is a failed read, never taken for an unreferenced chain
-        '$IPT -C DOCKER-USER -j $NEW 2>/dev/null; [ $? -eq 1 ] || { echo "jump to $NEW not removed" >&2; exit 4; }',
-        "$IPT -F $NEW || exit 4",
+        (
+            "check-new",
+            '$IPT -C DOCKER-USER -j $NEW 2>/dev/null; RC=$?; [ $RC -eq 1 ] || '
+            '{ echo "jump to $NEW not removed: exit $RC" >&2; exit 4; }',
+        ),
+        ("flush-new", "$IPT -F $NEW || fail"),
     ]
     matches = [f"-i {iface}" for iface in dict.fromkeys(([bridge] if bridge else []) + legacy_bridges)]
     for match in matches:
         for proto in ("tcp", "udp"):
-            lines.append(f"$IPT -A $NEW {match} -d {LINK_LOCAL_CIDR} -p {proto} ! --dport 53 -j DROP || exit 4")
-    lines += [
-        "$IPT -I DOCKER-USER -j $NEW || exit 4",
-        "while $IPT -D DOCKER-USER -j $OLD 2>/dev/null; do :; done",
-        "$IPT -F $OLD || exit 4",
-        _DETACH_OLD_JUMPS,
+            steps.append(("rule", f"$IPT -A $NEW {match} -d {LINK_LOCAL_CIDR} -p {proto} ! --dport 53 -j DROP || fail"))
+    steps += [
+        ("swap", "$IPT -I DOCKER-USER -j $NEW || fail"),
+        ("unhook-old", "while $IPT -D DOCKER-USER -j $OLD 2>/dev/null; do :; done"),
+        ("flush-old", "$IPT -F $OLD || fail"),
+        ("old-releases", _DETACH_OLD_JUMPS),
     ]
+    lines = _steps(steps)
     # the same rules, run by systemd on the host before dockerd starts any container after a reboot. Tried again
     # until they apply, inside the one start: a failing firewall write holds dockerd without using up its start limit
     boot = "until ( " + "; ".join(["HOST_NS=", *lines, "exit 0"]) + " ); do sleep 1; done; exit 0"
-    return "; ".join([*lines, _boot_restore(boot, host_root), "exit 0"])
+    return "; ".join([*lines, f"step boot-restore; {_boot_restore(boot, host_root)}", "exit 0"])
 
 
 NO_BOOT_UNIT = "boot restore not installed: no systemd docker.service"
@@ -387,24 +407,29 @@ def link_local_cleanup_script(host_root: str = HOST_ROOT) -> str:
     """Remove our chains, their DOCKER-USER jumps and the boot copy of the rules: run when a host has nothing left to
     guard."""
     clear = _boot_clear(host_root)
-    lines = [
-        _BACKEND_PROBE,
+    steps = [
+        ("probe", _BACKEND_PROBE),
         # nothing to clean only when an iptables said so on every backend; a probe that failed otherwise may hide our
         # jumps, and no iptables at all (a PID 1 that is not the host's) proves nothing: 3, so the helper reads the host
-        '[ -n "$IPT" ] || { [ -n "$ERRS" ] && { printf %s "$ERRS" >&2; exit 4; }; '
-        f'[ -n "$FOUND" ] && {{ {clear}; exit 0; }}; '
-        'echo "no iptables" >&2; exit 3; }',
+        (
+            "backend",
+            '[ -n "$IPT" ] || { [ -n "$ERRS" ] && { printf %s "$ERRS" >&2; exit 4; }; '
+            f'[ -n "$FOUND" ] && {{ {clear}; exit 0; }}; '
+            'echo "no iptables" >&2; exit 3; }',
+        ),
     ]
     for chain in CHAINS:
         # a chain iptables says does not exist is done; one that exists must lose its jumps, rules and itself
-        lines.append(
+        steps.append((
+            f"remove-{chain}",
             f"if ERR=$($IPT -n -L {chain} 2>&1 >/dev/null); then "
             f"while $IPT -D DOCKER-USER -j {chain} 2>/dev/null; do :; done; "
             f"if $IPT -C DOCKER-USER -j {chain} 2>/dev/null; then echo 'jump to {chain} not removed' >&2; exit 4; fi; "
-            f"$IPT -F {chain} || exit 4; $IPT -X {chain} || exit 4; "
+            f"$IPT -F {chain} || fail; $IPT -X {chain} || fail; "
             f'else case "$ERR" in *"No chain"*|*"does not exist"*) ;; *) echo "$ERR" >&2; exit 4;; esac; fi'
-        )
-    return "; ".join(lines) + f"; {_DETACH_OLD_JUMPS}; {clear}; exit 0"
+        ))
+    steps += [("old-releases", _DETACH_OLD_JUMPS), ("boot-clear", clear)]
+    return "; ".join(_steps(steps)) + "; exit 0"
 
 
 def locked_script(script: str, generation: str | None = None) -> str:
@@ -416,6 +441,7 @@ def locked_script(script: str, generation: str | None = None) -> str:
     ``timeout`` around a plain ``flock``: busybox's flock (the alpine helper) has no ``-w``."""
     lock_dir = shlex.quote(HOST_LOCK.rsplit("/", 1)[0])
     locked = (
+        f"{_STEP_FUNCS}; step lock; "
         f"mkdir -p {lock_dir} && exec 9>>{HOST_LOCK} || exit 5; "
         f"timeout -s KILL {LOCK_WAIT_SECONDS} flock 9 || {{ echo 'host lock not taken' >&2; exit 5; }}; "
     )
@@ -423,7 +449,7 @@ def locked_script(script: str, generation: str | None = None) -> str:
         return locked + script
     gen, tmp = shlex.quote(HOST_GENERATION), shlex.quote(f"{HOST_GENERATION}.tmp")
     return locked + (
-        f"G=$(cat {gen} 2>/dev/null); "
+        f"step generation; G=$(cat {gen} 2>/dev/null); "
         f'[ "${{G:-0}}" = {shlex.quote(generation)} ] || '
         f"{{ echo 'host rules changed since this inventory' >&2; exit {STALE_INVENTORY_EXIT}; }}; "
         # bumped before any rule changes, atomically: a run that cannot record it (a full /run) changes nothing and
@@ -434,9 +460,17 @@ def locked_script(script: str, generation: str | None = None) -> str:
     )
 
 
+def _reporting_exit(command: str, what: str) -> str:
+    """``command``, then its status as the exit; a signal exit (a crash or a kill) is reported on stderr first."""
+    return f'{command}; RC=$?; [ $RC -le 128 ] || echo "{what} ended by signal $((RC - 128))" >&2; exit $RC'
+
+
 def helper_command(script: str, generation: str | None = None) -> str:
     """What the executor runs: ``script`` under the lock, killed at ``HELPER_RUN_SECONDS``."""
-    return f"exec timeout -s KILL {HELPER_RUN_SECONDS} /bin/sh -c {shlex.quote(locked_script(script, generation))}"
+    return _reporting_exit(
+        f"timeout -s KILL {HELPER_RUN_SECONDS} /bin/sh -c {shlex.quote(locked_script(script, generation))}",
+        "helper shell",
+    )
 
 
 def _helper(script: str, generation: str | None = None) -> str:
@@ -444,7 +478,7 @@ def _helper(script: str, generation: str | None = None) -> str:
     # can refuse. The shell, flock and timeout are the executor image's; only iptables resolves in the host root, the one
     # binary dockerd itself needs there
     inner = f"HOST_NS={shlex.quote(HOST_NS)} {helper_command(script, generation)}"
-    in_helper = f"exec {NON_ROOT_HELPER} /bin/sh -c {shlex.quote(inner)}"
+    in_helper = _reporting_exit(f"{NON_ROOT_HELPER} /bin/sh -c {shlex.quote(inner)}", "helper container")
     # the lock directory in the host's /run through PID 1
     lock_dir = shlex.quote(HOST_LOCK.rsplit("/", 1)[0])
     tools = " && ".join(f"command -v {tool} >/dev/null" for tool in ("nsenter", "flock", "timeout"))
@@ -671,4 +705,15 @@ async def _inventory_and_apply(ssh, generation: str, required_network_id: str | 
 
 
 def _error(result) -> str | None:
-    return None if result.exit_status == 0 else (result.stderr or "").strip()[-300:] or f"exit {result.exit_status}"
+    """A failed run's stderr; for a helper, led by the step it was in and its exit status (and signal, if killed)."""
+    if result.exit_status == 0:
+        return None
+    lines = (result.stderr or "").splitlines()
+    steps = [line[len(STEP_MARK) :] for line in lines if line.startswith(STEP_MARK)]
+    text = "\n".join(line for line in lines if not line.startswith(STEP_MARK)).strip()
+    if not steps:
+        return text[-300:] or f"exit {result.exit_status}"
+    status = f"exit {result.exit_status}"
+    if result.exit_status > 128:
+        status += f", signal {result.exit_status - 128}"
+    return f"step {steps[-1]} ({status})" + (f": {text[-250:]}" if text else "")
