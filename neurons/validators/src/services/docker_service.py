@@ -980,12 +980,14 @@ def _docker_root_dir_shell() -> str:
     gives none. Some hosts' `docker info` prints no DockerRootDir while the volume API answers in the
     same trip, so the root is then read from a local volume's Mountpoint (<root>/volumes/<name>/_data).
     shortcut: a host with no local volume stays unknown (its reason names docker info's error); read the
-    root from a throwaway volume if the reasons show such hosts."""
+    root from a throwaway volume if the reasons show such hosts.
+    No temporary file: a host where mktemp fails (no writable /tmp) would lose the root to a redirect into
+    an empty name before docker info ran, so the error is read by asking again, only when no root came back."""
     return (
-        'err_file="$(mktemp)"; '
-        "root=\"$(/usr/bin/docker info --format '{{.DockerRootDir}}' 2>\"$err_file\")\"; info_status=$?; "
-        'info_err="$(head -c 300 "$err_file" | tr \'\\n\' \' \')"; rm -f "$err_file"; '
+        "root=\"$(/usr/bin/docker info --format '{{.DockerRootDir}}' 2>/dev/null)\"; info_status=$?; "
         'case "$root" in /*) ;; *) '
+        "info_err=\"$(/usr/bin/docker info --format '{{.DockerRootDir}}' 2>&1 >/dev/null | head -c 300 "
+        "| tr '\\n' ' ')\"; "
         "printf 'ROOTERR\\t%s %s\\n' \"$info_status\" \"$info_err\"; "
         "mount=\"$(/usr/bin/docker volume ls -q --filter driver=local | head -n 1 "
         "| xargs -r /usr/bin/docker volume inspect --format '{{.Mountpoint}}')\"; "

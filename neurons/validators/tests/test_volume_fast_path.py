@@ -814,5 +814,40 @@ def test_an_unknown_data_root_names_why_docker_info_gave_none(tmp_path):
         )
 
 
+_ROOT_FAKE_DOCKER = r"""#!/bin/sh
+case "$1 $2" in
+  "info --format") echo "WARNING: No swap limit support" >&2; echo /var/lib/docker ;;
+  "volume ls") exit 0 ;;
+  "plugin inspect") exit 1 ;;
+esac
+"""
+
+
+def test_both_data_root_readers_need_no_temporary_file(tmp_path):
+    # Arrange: a working docker info (with a warning on stderr) on a host where mktemp fails, as with no
+    # writable /tmp (review 23 Nov: a redirect into the empty name stopped docker info before it ran)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "mktemp").write_text("#!/bin/sh\nexit 1\n")
+    (bin_dir / "mktemp").chmod(0o755)
+    docker = tmp_path / "docker"
+    docker.write_text(_ROOT_FAKE_DOCKER)
+    docker.chmod(0o755)
+
+    def run(command: str) -> str:
+        return subprocess.run(
+            ["sh", "-c", command.replace("/usr/bin/docker", str(docker))],
+            capture_output=True, text=True, env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+        ).stdout
+
+    # Act
+    plain = run(_docker_root_dir_shell() + "printf '%s\\n' \"$root\"")
+    probe = _parse_volume_host_probe(run(_volume_host_probe_command(with_df=False)), with_df=False)
+
+    # Assert: both readers get the root docker info gives, and no error is reported
+    assert _parse_docker_root_dir(plain) == ("/var/lib/docker", "")
+    assert probe.docker_root_dir == "/var/lib/docker"
+
+
 def test_a_readable_data_root_is_read_as_before():
     assert _parse_docker_root_dir("/var/lib/docker\n") == ("/var/lib/docker", "")
