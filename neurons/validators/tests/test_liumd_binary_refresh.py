@@ -30,6 +30,7 @@ class Runner:
         download_sha="a" * 64,
         download_rc=0,
         install_ok=True,
+        install_sha=None,
         version_error=False,
     ):
         self.arch = arch
@@ -38,6 +39,7 @@ class Runner:
         self.download_sha = download_sha
         self.download_rc = download_rc
         self.install_ok = install_ok
+        self.install_sha = install_sha
         self.version_error = version_error
         self.calls: list[str] = []
         self.installed = False
@@ -91,7 +93,7 @@ class Runner:
             self.installed = True
             return SimpleNamespace(
                 success=True,
-                stdout=f"{self.download_sha}  /usr/local/bin/liumd\n",
+                stdout=f"{self.install_sha or self.download_sha}  /usr/local/bin/liumd\n",
                 stderr="",
                 exit_status=0,
             )
@@ -386,6 +388,23 @@ async def test_a_failed_answer_install_keeps_the_usable_answer(monkeypatch):
     assert result.skipped is True
     assert "permission denied" in result.detail
     assert runner.installed is False
+
+
+@pytest.mark.asyncio
+async def test_a_wrong_installed_answer_hash_keeps_the_usable_answer(monkeypatch):
+    runner = Runner(install_sha="d" * 64)
+    fetch, _ = _manifest_fetcher()
+    monkeypatch.setattr(liumd_binary_refresh, "_fetch_manifest", fetch)
+
+    result = await liumd_binary_refresh.refresh_liumd_from_answer(
+        _ctx(runner), "old-build", "x86_64-unknown-linux-gnu", budget_seconds=60
+    )
+
+    assert result.ok is False
+    assert result.skipped is True
+    assert result.build_sha == "old-build"
+    assert "installed binary sha256 does not match" in result.detail
+    assert runner.installed is True
 
 
 @pytest.mark.asyncio

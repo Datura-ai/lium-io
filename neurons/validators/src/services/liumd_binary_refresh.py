@@ -366,7 +366,12 @@ async def _refresh_from_answer(
             ):
                 installed_sha = parts[0]
         if installed_sha != expected_sha:
-            return LiumdRefresh(False, build_sha, "installed binary sha256 does not match manifest")
+            return LiumdRefresh(
+                False,
+                build_sha,
+                "installed binary sha256 does not match manifest",
+                skipped=bool(build_sha),
+            )
         return LiumdRefresh(True, expected_build, changed=True)
     except Exception as exc:  # noqa: BLE001 - a repair failure is reported to the caller
         return LiumdRefresh(False, build_sha, f"{type(exc).__name__}: {exc}"[:300])
