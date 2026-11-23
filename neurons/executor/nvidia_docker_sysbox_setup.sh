@@ -769,9 +769,11 @@ FUSERMOUNT3_RULE='mount fstype=@{fuse_types} -> /var/lib/sysboxfs/**,'
 # without it a stopped container's sysbox-fs mount stays behind and the next sysbox container start fails
 FUSERMOUNT3_UMOUNT_RULE='umount /var/lib/sysboxfs/**,'
 
-# the profile only binds when AppArmor is on: with apparmor=0 there is nothing to fix and apparmor_parser fails
+# only a profile the kernel holds in enforce mode binds. A file on disk is not enough: with apparmor=0 there is nothing to
+# fix (apparmor_parser fails), and a profile the provider unloaded (aa-disable) must not be loaded back by a reload
 fusermount3_profile_enforced() {
-    [ -f "$(host_path "$FUSERMOUNT3_PROFILE")" ] && grep -q Y "$(host_path /sys/module/apparmor/parameters/enabled)" 2>/dev/null
+    [ -f "$(host_path "$FUSERMOUNT3_PROFILE")" ] \
+        && grep -qxF 'fusermount3 (enforce)' "$(host_path /sys/kernel/security/apparmor/profiles)" 2>/dev/null
 }
 
 # the rules missing from the local profile, one per line (both are needed: a host with only the mount rule, e.g. added
