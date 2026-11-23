@@ -360,6 +360,14 @@ class Settings(BaseSettings):
     # Executor UUIDs are miner-chosen, so an entry matches only that miner's executor at that SSH
     # endpoint. Empty = none.
     LIUMD_SHADOW_RESERVED_EXECUTORS: str = Field(env="LIUMD_SHADOW_RESERVED_EXECUTORS", default="")
+    # DAH-6804: the boot-time layer reset (nvidia_docker_sysbox_setup.sh --install-layer-reset) on Sysbox hosts whose
+    # unit is missing or older than the setup script's, on hosts with no rental. off (default) = install nothing;
+    # allowlist = install on SYSBOX_LAYER_RESET_INSTALL_HOTKEYS (comma-separated miner hotkeys) only; all = every host.
+    # A host change is rolled out gradually (the v1.151 host sysctl change reached every host at once and was rolled back).
+    SYSBOX_LAYER_RESET_INSTALL: Literal["off", "allowlist", "all"] = Field(
+        env="SYSBOX_LAYER_RESET_INSTALL", default="off"
+    )
+    SYSBOX_LAYER_RESET_INSTALL_HOTKEYS: str = Field(env="SYSBOX_LAYER_RESET_INSTALL_HOTKEYS", default="")
     # The shadow can run only the fact steps while the Python path still owns VerifyX and matmul.
     # Flip this on when liumd's GPU checks are the thing being compared again.
     LIUMD_SHADOW_GPU_STEPS_ENABLED: bool = Field(
@@ -966,13 +974,6 @@ class Settings(BaseSettings):
         description=(
             "Percent of host RAM kept back, see RENTAL_HOST_RAM_RESERVE_GB (10 %, as the backend: an idle "
             "376 GiB host used 14 GiB outside the rental's cgroup, more than the former 3 %)."
-        ),
-    )
-    RENTAL_HOST_CPU_RESERVE: int = Field(
-        env="RENTAL_HOST_CPU_RESERVE", default=1, ge=0,
-        description=(
-            "CPUs kept back for the host (sshd, dockerd, the executor): a rental's --cpus is at most "
-            "the host's CPU count minus this, so a whole-host rental cannot take every core."
         ),
     )
     RENTAL_LOG_MAX_SIZE: str = Field(

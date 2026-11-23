@@ -9,4 +9,4 @@ fi
 
 IMAGE_NAME="daturaai/compute-subnet-validator:$TAG"
 
-docker build --build-arg ALLOW_PROTOCOL_AHEAD=$ALLOW_PROTOCOL_AHEAD --build-context datura=../../datura -t $IMAGE_NAME .
+docker build --build-arg ALLOW_PROTOCOL_AHEAD=$ALLOW_PROTOCOL_AHEAD --build-context datura=../../datura --build-context executor_setup=../executor -t $IMAGE_NAME .
