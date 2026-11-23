@@ -485,6 +485,16 @@ def test_install_mode_adds_the_umount_rule_on_a_host_where_sysbox_already_works(
     assert (tmp_path / "root/.stub-docker/apparmor").read_text() == "-r /etc/apparmor.d/fusermount3\n"
 
 
+def test_install_mode_adds_the_umount_rule_before_a_rental_stops_the_run(tmp_path):
+    # no local VERIFY_IMAGE and a pod_* rental: the run exits at abort_on_active_rentals, after the repair
+    files = {**APPARMOR_ON, "etc/apparmor.d/local/fusermount3": APPARMOR_RULE + "\n"}
+    proc = run_script(tmp_path, env={"STUB_PODS": "pod_4f1c", "STUB_NO_VERIFY_IMAGE": "1"}, files=files)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "Rentals found (pod_* containers, running or stopped). Cannot proceed." in proc.stdout
+    local = (tmp_path / "root/etc/apparmor.d/local/fusermount3").read_text()
+    assert (local.count(APPARMOR_RULE), local.count(APPARMOR_UMOUNT_RULE)) == (1, 1)
+    assert (tmp_path / "root/.stub-docker/apparmor").read_text() == "-r /etc/apparmor.d/fusermount3\n"
+
 
 @pytest.mark.parametrize(
     "local",

@@ -1412,6 +1412,11 @@ keep_needrestart_off_the_container_runtime && ok "apt (needrestart) never restar
 shift_sysbox_layers_back_at_boot && ok "After an unclean stop, each pod's files are shifted back at boot before Docker starts it." \
     || warn "Could not install lium-sysbox-layer-reset.service; after a power loss rented pods may lose sudo and apt."
 
+# before "Already working?" and its active-rental and image exits: a host whose profile already exists may hold a
+# hand-added mount-only rule. Only appends missing rules and reloads the profile, so it is safe under rentals; the
+# call after fuse3 is installed covers a profile that appears only then.
+allow_sysboxfs_in_fusermount3_apparmor || exit 1
+
 # ── 2. Already working? ─────────────────────────────────
 
 INSTALLED_SYSBOX=$(sysbox_runc_version || true)
@@ -1431,8 +1436,6 @@ if [ "$SYSBOX_UP_TO_DATE" = true ] && docker info 2>/dev/null | grep -q sysbox-r
     fi
     if docker run --rm --runtime=sysbox-runc --gpus all "$VERIFY_IMAGE" nvidia-smi &>/dev/null; then
         install_sysbox_restart_dropins || exit 1   # safe under rentals: no service restarts
-        # a host that already starts containers may hold a hand-added mount-only rule; only a profile reload, safe under rentals
-        allow_sysboxfs_in_fusermount3_apparmor || exit 1
         setup_vloopback || { fail_vloopback; exit 1; }
         if [ -n "$VLOOPBACK_CHANGED" ]; then
             ok "Sysbox is already working."
