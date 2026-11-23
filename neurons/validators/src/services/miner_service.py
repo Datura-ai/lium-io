@@ -1522,8 +1522,7 @@ class MinerService:
             # only a passed spec moves the backend to these UUIDs; a failed one must not hide the recovery
             if result.is_successful and (gpu_uuids := _gpu_uuids(result)):
                 self.published_gpu_uuids[str(result.executor_info.uuid).lower()] = set(gpu_uuids)
-            if settings.POD_STATES_REPORT_ENABLED:
-                await self._publish_pod_states_report(result, miner_hotkey=miner_hotkey, default_extra=default_extra)
+            await self._publish_pod_states_report(result, miner_hotkey=miner_hotkey, default_extra=default_extra)
 
     @staticmethod
     def _pod_states_capped_for_spec(result: JobResult, default_extra: dict) -> list[dict] | None:
@@ -1533,12 +1532,7 @@ class MinerService:
         if len(bounded) < len(result.pod_states):
             logger.warning(
                 _m(
-                    "pod_states over the spec's bound"
-                    + (
-                        "; every state goes in the PodStatesReport chunks"
-                        if settings.POD_STATES_REPORT_ENABLED
-                        else "; the observed states past it are cut until the reaped queue drains"
-                    ),
+                    "pod_states over the spec's bound; every state goes in the PodStatesReport chunks",
                     extra=get_extra_info(
                         {
                             **default_extra,
