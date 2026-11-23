@@ -26,6 +26,7 @@ from services.executor_rollout import (
     ROLLOUT_GRACE,
     ExecutorRolloutTracker,
     RolloutWindow,
+    rollout_grace_reason,
     WithheldVerdict,
     carry_renter_gpu_reset_results,
     has_renter_gpu_reset_holds,
@@ -152,6 +153,8 @@ class Validator:
     def __init__(self):
 
         self.should_exit = False
+        # DAH-6951: the wave's early unreachable publishes, run off the miner jobs' path
+        self.early_publishes: set[asyncio.Task] = set()
         self.last_job_run_blocks = 0
         self.default_extra = {}
         # DAH-2958: the current cycle's job files / digests / image snapshot, reused by the
@@ -553,7 +556,8 @@ class Validator:
                         )
                 # DAH-5635: a fresh running share per cycle. None inside an executor rollout window,
                 # where the cycle withholds an unreachable verdict that an early publish would leak.
-                # DAH-6951: a window this cycle's end opens (a push mid-cycle) is caught by the tally's rollout_digest
+                # DAH-6951: a window this cycle's end opens (a push mid-cycle) is caught by the tally's rollout_digest,
+                # set only when the tracker would open one on a push now
                 self.miner_service.outage_tally = (
                     None
                     if rollout_window.covers(job_block)
@@ -563,7 +567,11 @@ class Validator:
                             str(executor_id).lower()
                             for executor_id in (rented_executors.executors if rented_executors else {})
                         ),
-                        rollout_digest=rollout_window.digest,
+                        rollout_digest=(
+                            rollout_window.digest
+                            if rollout_window.grace_cycles > 0 and rollout_window.a_new_window_may_open()
+                            else None
+                        ),
                     )
                 )
                 # every listed rented pod's SSH (any status), probed once while the miners work
@@ -685,6 +693,8 @@ class Validator:
                                 ),
                             )
                             task.cancel()
+                    # DAH-6951: the cycle end publishes every node itself; an early publish still running would land after it
+                    await self.stop_early_publishes()
 
                     # DAH-4658: before the duplicate pass and the GPU count, so a carried result counts in both
                     # DAH-6564: one cycle-end read of the rented list, shared by the carry and the rental-change rule
@@ -948,6 +958,11 @@ class Validator:
                         ),
                         exc_info=True,
                     )
+                finally:
+                    # DAH-6951: a cycle that raised before its withhold decides its held resets here, with the window
+                    # it knew at start; nothing of this cycle is left for the next one. A no-op once the withhold ran.
+                    await self.send_held_verified_job_resets(job_batch_id, rollout_window, job_block)
+                    await self.stop_early_publishes()
             else:
                 remaining_blocks = (
                     current_block // settings.BLOCKS_FOR_JOB + 1
@@ -1472,10 +1487,18 @@ class Validator:
     async def request_wave_job(self, **kwargs) -> dict | None:
         """One miner's wave request; its new executors that passed are listed now, and its unrented nodes that
         failed with an availability error are hidden now (DAH-5635), not at the cycle's end."""
-        job = await self.miner_service.request_job_to_miner(**kwargs)
+        job = await self.miner_service.request_job_to_miner(**kwargs, hold_rollout_resets=True)
         await self.miner_service.publish_new_executors_at_pass(job)
-        await self.miner_service.publish_unreachable_early(job)
+        # DAH-6951: off the job's path: its registry read must not hold the job's results past the cycle's wait
+        publish = asyncio.create_task(self.miner_service.publish_unreachable_early(job))
+        self.early_publishes.add(publish)
+        publish.add_done_callback(self.early_publishes.discard)
         return job
+
+    async def stop_early_publishes(self) -> None:
+        for publish in self.early_publishes:
+            publish.cancel()
+        await asyncio.gather(*self.early_publishes, return_exceptions=True)
 
     async def probe_rented_pod_ssh(self, rented_executors, job_batch_id: str) -> dict:
         """The cycle's pod SSH observations (services/pod_ssh_probe.py); {} when off or on any error."""
@@ -1639,8 +1662,8 @@ class Validator:
         )
         standing, withheld_results = withhold_rollout_verdicts(all_job_results, window, job_block)
         await self.record_withheld_verdicts(window, withheld_results, job_batch_id, job_block)
-        # a withheld result's held verified-job reset is dropped with it: it would hide the node like a verdict
-        await self.send_held_verified_job_resets(withheld_results)
+        # decided with the window that withholds the verdicts, before anything of this cycle is published
+        await self.send_held_verified_job_resets(job_batch_id, window, job_block)
         standing, held_for_gpu_reset = withhold_renter_gpu_reset_verdicts(standing)
         standing, session_lost = withhold_session_lost_verdicts(standing)
         rental_changed = []
@@ -1651,20 +1674,16 @@ class Validator:
             )
         return standing, withheld_results + held_for_gpu_reset + session_lost + rental_changed
 
-    async def send_held_verified_job_resets(self, withheld_results: list[WithheldVerdict]) -> None:
-        """DAH-3405: send every verified-job reset the cycle's wave runs held back for the rollout decision, except
-        those of the results the rollout window withheld. A result whose miner job timed out before the cycle end
-        never reached the withhold, so nothing withheld it: it stands and its reset is sent."""
-        task_service = self.miner_service.task_service
-        held, task_service.results_holding_a_reset = task_service.results_holding_a_reset, []
-        # by node, not object: a result may be copied on its way to the cycle end
-        withheld = {(w.miner_hotkey, str(w.result.executor_info.uuid)) for w in withheld_results}
-        for result in held:
-            reset = result.held_verified_job_reset
-            if (reset["miner_hotkey"], str(reset["executor_id"])) in withheld:
+    async def send_held_verified_job_resets(self, job_batch_id: str, window: RolloutWindow, job_block: int) -> None:
+        """DAH-3405: decide every verified-job reset cycle `job_batch_id`'s wave runs held back: a reset is dropped
+        when the rollout window withholds its own result (rollout_grace_reason), and sent otherwise. Each result is
+        judged on itself, whether or not it reached the cycle end (a miner job cancelled at the wait timeout, a run a
+        rerun replaced, a session-lost verdict): what would withhold its verdict drops its reset, nothing else does."""
+        for result in self.miner_service.task_service.held_resets.pop(job_batch_id, []):
+            if rollout_grace_reason(result, window, job_block) is not None:
                 continue
             try:
-                await self.redis_service.clear_verified_job_info(**reset)
+                await self.redis_service.clear_verified_job_info(**result.held_verified_job_reset)
             except Exception as exc:
                 logger.error(
                     _m(

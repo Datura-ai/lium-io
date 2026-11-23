@@ -106,6 +106,10 @@ ROLLOUT_FAILURE_REASONS = frozenset(
         ExecutorImageMessages.OUTDATED.reason,
     }
 )
+# DAH-6951: the causes of a verified-job reset the rollout window may explain, read off the reset's own evidence: a read
+# that did not finish. A reset a finished finding set (GPU_BANNED, EXECUTOR_DUPLICATE, NVML_DIGEST_MISMATCH,
+# SPEC_CHANGED, GPU_COUNT_ZERO) is sent at once, whatever ended the run after it (a session found closed afterwards).
+ROLLOUT_RESET_CAUSES = ROLLOUT_FAILURE_REASONS | {AvailabilityErrorCode.NODE_ACCOUNT_UNVERIFIED.value}
 _OUTDATED = ExecutorImageMessages.OUTDATED.reason
 # The ways a run ends with score 0 and the OUTDATED report attached instead of failing at the
 # image check: a rented executor's image check passes and the tenant-enforcement halt ends the run
@@ -226,6 +230,11 @@ class RolloutWindow:
         if self.grace_cycles <= 0 or self.opened_job_block is None:
             return False
         return job_block >= self.opened_job_block and 0 < self.cycles_seen <= self.grace_cycles
+
+    def a_new_window_may_open(self) -> bool:
+        """True when no window was ever opened, or one uncovered cycle has published since: a digest change seen now
+        opens a window (ExecutorRolloutTracker). DAH-6951: read at cycle start, for the early publishes."""
+        return self.opened_job_block is None or self.cycles_seen >= self.grace_cycles + 2
 
     def previous_reads_current(self, job_block: int) -> bool:
         """DAH-6560: a node still on the release just replaced reads CURRENT, not OUTDATED, in this cycle."""
@@ -375,7 +384,7 @@ class ExecutorRolloutTracker:
 
     def _a_new_window_may_open(self, state: RolloutState) -> bool:
         """True when no window was ever opened, or one uncovered cycle has published since."""
-        return state.opened_job_block is None or state.cycles_seen >= self.grace_cycles + 2
+        return self._window(state).a_new_window_may_open()
 
     async def _close_the_window_when_it_is_over(
         self, state: RolloutState, job_block: int

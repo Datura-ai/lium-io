@@ -691,6 +691,7 @@ class MinerService:
         executor_id: str | None = None,
         first_pass: bool = False,
         job_timeout: float | None = None,
+        hold_rollout_resets: bool = False,
     ):
         """See _route_job_to_miner. A wave request that ends before the miner's list arrived
         (unreachable, refused, timed out) settles its miners_awaiting_wave_list entry too."""
@@ -704,6 +705,7 @@ class MinerService:
                 executor_id=executor_id,
                 first_pass=first_pass,
                 job_timeout=job_timeout,
+                hold_rollout_resets=hold_rollout_resets,
             )
             if executor_id is None:
                 await self.publish_gpu_set_changes(job)
@@ -722,6 +724,7 @@ class MinerService:
         executor_id: str | None = None,
         first_pass: bool = False,
         job_timeout: float | None = None,
+        hold_rollout_resets: bool = False,
     ):
         """Request job to miner over the miner's REST API.
 
@@ -732,6 +735,7 @@ class MinerService:
         TaskService.create_task, where it shrinks the probes. The cycle never sets it.
         job_timeout: the caller's own timeout around this call when shorter than JOB_TIME_OUT (an express recheck's
         deadline); the pod-left-on-old-GPUs rerun must finish inside it.
+        hold_rollout_resets (DAH-6951): set by the cycle's wave only; handed to TaskService.create_task.
         """
         logger.info(
             _m(
@@ -750,6 +754,7 @@ class MinerService:
             executor_id=executor_id,
             first_pass=first_pass,
             job_timeout=job_timeout,
+            hold_rollout_resets=hold_rollout_resets,
         )
 
     def _filter_task_results(
@@ -1388,11 +1393,15 @@ class MinerService:
     async def _rollout_window_may_open(tally: RunningOutageTally) -> bool:
         """DAH-6951: True when this cycle's end may open an executor rollout window, which withholds an unreachable
         verdict: the registry digest moved since cycle start (a push mid-cycle), or cannot be read now. Nothing goes
-        early then, as in a cycle that starts inside a window. A seen push holds for the rest of the cycle."""
+        early then, as in a cycle that starts inside a window. A seen push holds for the rest of the cycle. No
+        rollout_digest (no window can open this cycle, RolloutWindow.a_new_window_may_open): never held, no read."""
         if tally.rollout_digest is None or tally.rollout_began:
             return tally.rollout_began
+        # one read in flight per tally, shared by every miner answering meanwhile; a later answer starts a fresh one
+        if tally.digest_read is None or tally.digest_read.done():
+            tally.digest_read = asyncio.ensure_future(fetch_executor_image_digest())
         try:
-            digest = normalize_sha256_digest(await fetch_executor_image_digest())
+            digest = normalize_sha256_digest(await tally.digest_read)
         except Exception:
             digest = None
         tally.rollout_began = digest is not None and digest != tally.rollout_digest
@@ -2260,6 +2269,7 @@ class MinerService:
         executor_id: str | None = None,
         first_pass: bool = False,
         job_timeout: float | None = None,
+        hold_rollout_resets: bool = False,
     ):
         """REST API version of request_job_to_miner."""
         # DAH-2667: what the RoCE probe subtracts from the cycle's own wait, so a job that already
@@ -2374,6 +2384,7 @@ class MinerService:
                             executor_image_snapshot=executor_image_snapshot,
                             attestation_nonce=attestation_nonce,
                             first_pass=first_pass,
+                            hold_rollout_resets=hold_rollout_resets,
                         ),
                         timeout=timeout,
                     )

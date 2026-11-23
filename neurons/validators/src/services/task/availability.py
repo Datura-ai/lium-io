@@ -10,6 +10,7 @@ Docker Hub or Hugging Face tomorrow. Nothing downstream changes: the backend hid
 whose last cycle carried an availability error, and the provider portal shows the reason.
 """
 
+import asyncio
 from enum import StrEnum
 from typing import Any
 
@@ -356,9 +357,12 @@ class RunningOutageTally:
     ):
         self.job_batch_id = job_batch_id
         # DAH-6951: the executor image digest the rollout tracker knew at cycle start; a registry digest other than
-        # it means a push landed in this cycle and its end opens a rollout window. None: no digest to compare with
+        # it means a push landed in this cycle and its end opens a rollout window. None: no digest to compare with,
+        # or the tracker would open no window on a push this cycle (one opened too recently, or grace off)
         self.rollout_digest = rollout_digest
         self.rollout_began = False
+        # the registry read in flight, shared by the miners answering meanwhile (MinerService._rollout_window_may_open)
+        self.digest_read: asyncio.Future | None = None
         # the backend's rented list at cycle start: a failure is built before the result knows its rentals
         self.rented_executor_ids = rented_executor_ids
         self.checked_count = 0

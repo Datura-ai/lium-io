@@ -89,7 +89,7 @@ class ResultHandler:
         log_text: str,
         success: bool,
         validation_event: ValidationEvent | None = None,
-        hold_reset: bool = False,
+        hold_reset_for: frozenset[str] = frozenset(),
     ) -> JobResult:
         """Handle task result by persisting verification data and building JobResult.
 
@@ -101,8 +101,8 @@ class ResultHandler:
             log_text: Log message for this result
             success: Whether validation succeeded
             validation_event: Structured final validation outcome
-            hold_reset: a verified-job reset is not sent here but returned on the JobResult
-                (held_verified_job_reset), for the cycle end to send once the rollout window decided (DAH-3405)
+            hold_reset_for: a verified-job reset whose own cause (its evidence reason_code) is in this set is not
+                sent here but returned on the JobResult (held_verified_job_reset), for the cycle end to decide (DAH-3405)
 
         Returns:
             JobResult containing all validation outcomes
@@ -136,7 +136,7 @@ class ResultHandler:
                 verified_job_info=verified_job_info,
                 context=context,
                 success=success,
-                hold_reset=hold_reset,
+                hold_reset_for=hold_reset_for,
             )
         else:
             logger.info("DRY_RUN: Skipping Redis persistence")
@@ -377,7 +377,7 @@ class ResultHandler:
         verified_job_info: dict,
         context: Context,
         success: bool,
-        hold_reset: bool = False,
+        hold_reset_for: frozenset[str] = frozenset(),
     ) -> dict | None:
         """Persist verification data to Redis based on validation outcome.
 
@@ -387,7 +387,7 @@ class ResultHandler:
             verified_job_info: Previous verification info
             context: Pipeline context with verification state
             success: Whether validation succeeded
-            hold_reset: return a verified-job reset's arguments instead of sending it
+            hold_reset_for: the reset causes whose reset's arguments are returned instead of sent
 
         Returns:
             The held reset's clear_verified_job_info arguments, else None
@@ -428,7 +428,9 @@ class ResultHandler:
                     reanchor_uuids=(context.state.gpu_uuids or '') if context.gpu_reanchor else '',
                     respec=(context.state.gpu_model_count or '') if context.gpu_respec else '',
                 )
-                if hold_reset:
+                # DAH-6951: the reset's own cause decides, not the run's last event: a finished finding followed by a
+                # session found closed ends the run on the transport, yet its reset is the finding's and goes now
+                if evidence.get("reason_code") in hold_reset_for:
                     return reset
                 await self.redis_service.clear_verified_job_info(**reset)
             else:

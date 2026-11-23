@@ -89,6 +89,7 @@ async def _run_sync_with_jobs(validator, miners, job_results_by_hotkey, *, job_b
         rented_data,
         default_docker_image_digests,
         executor_image_snapshot,
+        hold_rollout_resets=False,
     ):
         hotkey = payload.miner_hotkey
         results = job_results_by_hotkey.get(hotkey, [])

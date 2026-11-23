@@ -138,7 +138,7 @@ class JobResult(BaseModel):
     # only the findings of the checks that finished are published
     session_lost_in_port_check: bool = Field(default=False, exclude=True)
     # DAH-3405: the verified-job reset (clear_verified_job_info arguments) of a wave run the rollout window may
-    # withhold; the cycle end sends it only for a result that stands (Validator.withhold_verdicts_for_rollout)
+    # withhold; the cycle end sends it unless the window withholds this result (Validator.send_held_verified_job_resets)
     held_verified_job_reset: dict[str, Any] | None = Field(default=None, exclude=True)
 
     # Incentive relevant fields

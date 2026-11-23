@@ -99,9 +99,9 @@ class TaskService:
         self.wallet = settings.get_bittensor_wallet()
         # DAH-3019: the start reports run in the background; the set keeps them referenced until done.
         self._start_reports: set[asyncio.Task] = set()
-        # DAH-3405: the wave results holding a verified-job reset for the cycle end; kept here, not only on the
-        # miner's job, so a job that times out before the cycle end still has its resets sent
-        self.results_holding_a_reset: list[JobResult] = []
+        # DAH-3405: the wave results holding a verified-job reset, by job_batch_id, for that cycle's end to decide; kept
+        # here, not only on the miner's job, so a job that times out before the cycle end still has its resets decided
+        self.held_resets: dict[str, list[JobResult]] = {}
 
         # Initialize pipeline factory with all required services
         self.pipeline_factory = PipelineFactory(
@@ -150,11 +150,14 @@ class TaskService:
         executor_image_snapshot: ExpectedImageSnapshot | None = None,
         attestation_nonce: AttestationNonce | None = None,
         first_pass: bool = False,
+        hold_rollout_resets: bool = False,
     ):
         """New pipeline-based validation task implementation.
 
         `first_pass` (DAH-3011): the caller knows this is the executor's first, unscored verification
         (the express lane, DAH-2958). The wave never sets it.
+        `hold_rollout_resets` (DAH-6951): the cycle's wave asks for it (Validator.request_wave_job); a verified-job
+        reset the rollout window may explain is kept in `held_resets` for the cycle end, not sent now.
         """
         task_started_at = time.monotonic()
         attestation_digest = None
@@ -256,7 +259,7 @@ class TaskService:
                 success = False if not ok else last_context.success
 
                 # executor_rollout imports services.task, so it is imported here and not at the top
-                from services.executor_rollout import ROLLOUT_FAILURE_REASONS
+                from services.executor_rollout import ROLLOUT_RESET_CAUSES
 
                 # Handle result using ResultHandler
                 result_handler = ResultHandler(self.redis_service, dry_run=settings.DRY_RUN)
@@ -268,12 +271,12 @@ class TaskService:
                     log_text=log_text.to_full_string(),
                     success=success,
                     validation_event=last_event,
-                    # DAH-3405: a wave run the rollout window may withhold sends its reset only once the cycle end
-                    # decided the verdict stands; the express lane has no rollout withhold and sends it now
-                    hold_reset=not first_pass and last_event.reason_code in ROLLOUT_FAILURE_REASONS,
+                    # DAH-3405: a wave reset caused by a read that did not finish waits for the cycle end to decide
+                    # whether the rollout withholds the run; the express lane and the CLI have no withhold: sent now
+                    hold_reset_for=ROLLOUT_RESET_CAUSES if hold_rollout_resets else frozenset(),
                 )
                 if result.held_verified_job_reset:
-                    self.results_holding_a_reset.append(result)
+                    self.held_resets.setdefault(miner_info.job_batch_id, []).append(result)
                 result.attestation_digest = attestation_digest
                 result.tee_type = tee_type
                 result.gpu_attestation_passed = gpu_attestation_passed

@@ -1,6 +1,7 @@
 """DAH-5635: an unrented node that failed with an availability error is published as soon as its
 miner answers, while the cycle's share so far does not look like our own outage."""
 
+import asyncio
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -241,3 +242,73 @@ async def test_a_push_mid_cycle_holds_the_early_publish_for_the_rollout_withhold
         await service.publish_unreachable_early(_job([_result([SSH])]))
         service.publish_machine_specs.assert_not_awaited()
         reads.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_miners_answering_together_share_one_registry_read(monkeypatch):
+    """DAH-6951: one registry read in flight per cycle, shared by every miner answering meanwhile."""
+    gate = asyncio.Event()
+
+    async def slow_read():
+        await gate.wait()
+        return OLD
+
+    reads = AsyncMock(side_effect=slow_read)
+    monkeypatch.setattr("services.miner_service.fetch_executor_image_digest", reads)
+    service = _service(RunningOutageTally(BATCH, rollout_digest=OLD))
+    both = asyncio.gather(
+        service.publish_unreachable_early(_job(_healthy(9) + [_result([SSH])])),
+        service.publish_unreachable_early(_job([_result([SSH])])),
+    )
+    await asyncio.sleep(0)
+    gate.set()
+    await both
+
+    reads.assert_awaited_once()
+    assert service.publish_machine_specs.await_count == 2
+
+
+@pytest.mark.parametrize(
+    ("opened_job_block", "cycles_seen", "may_open"),
+    [(None, 0, True), (7500, 1, False), (7500, 3, False), (7500, 4, True)],
+    ids=["never-opened", "inside-the-window", "first-uncovered-cycle", "one-uncovered-cycle-published"],
+)
+def test_the_early_publish_holds_only_when_a_push_can_open_a_window(opened_job_block, cycles_seen, may_open):
+    """DAH-6951: the cycle gives the tally a digest to compare with only when the tracker would open a window on a
+    push now (grace_cycles 2); otherwise a digest change cannot withhold anything and the early publish goes on."""
+    from services.executor_rollout import RolloutWindow
+
+    window = RolloutWindow(
+        digest=OLD, previous_digest=None, started_at=None, opened_job_block=opened_job_block,
+        cycles_seen=cycles_seen, grace_cycles=2,
+    )
+    assert window.a_new_window_may_open() is may_open
+
+
+@pytest.mark.asyncio
+async def test_the_early_publish_runs_off_the_miner_jobs_path():
+    """DAH-6951: a wave job returns its results without waiting for its early publish (and its registry read); the
+    cycle end stops one still running, since it publishes every node itself. The wave asks for held resets."""
+    from types import SimpleNamespace
+
+    from core.validator import Validator
+
+    blocked = asyncio.Event()
+
+    async def publish(job):
+        await blocked.wait()
+
+    validator = Validator.__new__(Validator)
+    validator.early_publishes = set()
+    job = _job([_result([SSH])])
+    validator.miner_service = SimpleNamespace(
+        request_job_to_miner=AsyncMock(return_value=job),
+        publish_new_executors_at_pass=AsyncMock(),
+        publish_unreachable_early=publish,
+    )
+
+    assert await asyncio.wait_for(validator.request_wave_job(payload="p"), timeout=1) is job
+    validator.miner_service.request_job_to_miner.assert_awaited_once_with(payload="p", hold_rollout_resets=True)
+    [running] = validator.early_publishes
+    await validator.stop_early_publishes()
+    assert running.cancelled() and not validator.early_publishes
