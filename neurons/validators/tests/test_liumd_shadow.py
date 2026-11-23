@@ -448,6 +448,62 @@ async def test_specs_are_compared_from_the_post_scrape_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_live_host_memory_values_are_not_a_specs_difference(
+    keypair, monkeypatch, verifyx_service
+):
+    python_specs = {
+        **PYTHON_SCRAPE,
+        "host_memory": {"mem_total_kb": 100, "mem_available_kb": 50, "mapped_kb": 10},
+    }
+    liumd_specs = {
+        **LIUMD_SCRAPE,
+        "host_memory": {"mem_total_kb": 100, "mem_available_kb": 40, "mapped_kb": 12},
+    }
+    state = build_state(specs=SPECS, scrape_specs=python_specs)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=liumd_specs))
+
+    assert record["specs_agree"] is True
+    assert record["specs_diff"] == []
+
+
+@pytest.mark.asyncio
+async def test_missing_host_memory_is_still_a_specs_difference(
+    keypair, monkeypatch, verifyx_service
+):
+    python_specs = {**PYTHON_SCRAPE, "host_memory": {"mem_total_kb": 100}}
+    state = build_state(specs=SPECS, scrape_specs=python_specs)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=LIUMD_SCRAPE))
+
+    assert record["specs_agree"] is False
+    assert [diff["path"] for diff in record["specs_diff"]] == ["host_memory"]
+
+
+@pytest.mark.asyncio
+async def test_a_stable_host_memory_value_is_still_compared(
+    keypair, monkeypatch, verifyx_service
+):
+    python_specs = {
+        **PYTHON_SCRAPE,
+        "host_memory": {"mem_total_kb": 100, "mem_available_kb": 50},
+    }
+    liumd_specs = {
+        **LIUMD_SCRAPE,
+        "host_memory": {"mem_total_kb": 90, "mem_available_kb": 40},
+    }
+    state = build_state(specs=SPECS, scrape_specs=python_specs)
+    ctx = _ctx(keypair, monkeypatch, verifyx_service, state=state)
+
+    record = await _shadow(ctx, FakeLiumd(specs=liumd_specs))
+
+    assert record["specs_agree"] is False
+    assert [diff["path"] for diff in record["specs_diff"]] == ["host_memory.mem_total_kb"]
+
+
+@pytest.mark.asyncio
 async def test_specs_agree_is_none_without_the_python_snapshot(
     keypair, monkeypatch, verifyx_service
 ):
