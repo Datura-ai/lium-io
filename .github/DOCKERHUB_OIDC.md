@@ -11,7 +11,7 @@ Per job: `permissions: id-token: write` (plus `contents: read` for the checkout)
 
 ```yaml
 - name: Log in to Docker Hub (OIDC, no stored token)
-  uses: docker/login-action@v4
+  uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
   env:
     DOCKERHUB_OIDC_CONNECTIONID: ${{ vars.DOCKERHUB_OIDC_CONNECTIONID }}
     DOCKERHUB_OIDC_EXPIREIN: "1800"

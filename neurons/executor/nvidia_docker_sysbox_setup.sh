@@ -620,6 +620,72 @@ UNIT
     [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] || systemctl daemon-reload
 }
 
+create_nvidia_device_nodes_before_docker() {
+    # A pod is created with every GPU device node it uses as an explicit --device (they keep the GPUs readable across a
+    # systemd daemon-reload). The driver makes those nodes only when something first opens a GPU, so at boot Docker's
+    # restart-policy start can come before them and fails "error gathering device information while adding custom
+    # device /dev/nvidiaN": the pod stays down until it is recreated. A boot oneshot before Docker makes them first.
+    local bin unit dropin
+    bin=$(host_path /usr/local/sbin/lium-nvidia-device-nodes)
+    unit=$(host_path /etc/systemd/system/lium-nvidia-device-nodes.service)
+    dropin=$(host_path /etc/systemd/system/docker.service.d/lium-nvidia-device-nodes.conf)
+    mkdir -p "$(dirname "$bin")" "$(dirname "$unit")" "$(dirname "$dropin")" || return 1
+    cat > "$bin" <<'SH' || return 1
+#!/bin/sh
+# Lium (nvidia_docker_sysbox_setup.sh): create the NVIDIA device nodes at boot, before Docker starts the pods that
+# use them. nvidia-modprobe only loads the modules and makes the nodes; it does not touch the GPUs.
+gpus="${LIUM_NVIDIA_GPUS_DIR:-/proc/driver/nvidia/gpus}"
+minors() {
+    for info in "$gpus"/*/information; do
+        [ -r "$info" ] && sed -n 's/^Device Minor:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$info"
+    done; }
+if command -v nvidia-modprobe >/dev/null 2>&1; then
+    nvidia-modprobe -c=255  # loads nvidia, makes /dev/nvidiactl
+    for minor in $(minors); do nvidia-modprobe -c="$minor"; done  # /dev/nvidia<minor>
+    nvidia-modprobe -u -c=0  # /dev/nvidia-uvm and /dev/nvidia-uvm-tools
+    nvidia-modprobe -m  # /dev/nvidia-modeset
+    exit 0
+fi
+# No nvidia-modprobe (Ubuntu's nvidia-utils-*-server do not ship it): load the modules and make the nodes from their
+# numbers, as nvidia-modprobe does. 195 is the driver's fixed major; 255 nvidiactl, 254 modeset; mode 0666 its default.
+dev="${LIUM_NVIDIA_DEV_DIR:-/dev}"
+mk() { [ -e "$dev/$1" ] || mknod -m 666 "$dev/$1" c "$2" "$3"; }
+modprobe nvidia || exit 0
+mk nvidiactl 195 255
+for minor in $(minors); do mk "nvidia$minor" 195 "$minor"; done
+if modprobe nvidia-uvm; then
+    uvm=$(awk '$2 == "nvidia-uvm" {print $1}' "${LIUM_NVIDIA_PROC_DEVICES:-/proc/devices}")
+    [ -n "$uvm" ] && mk nvidia-uvm "$uvm" 0 && mk nvidia-uvm-tools "$uvm" 1
+fi
+modprobe nvidia-modeset && mk nvidia-modeset 195 254
+exit 0
+SH
+    chmod 755 "$bin" || return 1
+    cat > "$unit" <<'UNIT' || return 1
+[Unit]
+Description=Lium: create the NVIDIA device nodes before Docker starts the pods
+After=systemd-modules-load.service
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# a hung nvidia-modprobe is killed here, so Docker (which only Wants this unit) still starts:
+# SIGKILL at the start timeout (systemd 246+), and a short stop wait bounds it on older systemd
+TimeoutStartSec=60
+TimeoutStartFailureMode=kill
+TimeoutStopSec=5
+ExecStart=/usr/local/sbin/lium-nvidia-device-nodes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    # Wants, not Requires: a node it could not make fails only the pod that needs it, never Docker itself
+    printf '[Unit]\nWants=lium-nvidia-device-nodes.service\nAfter=lium-nvidia-device-nodes.service\n' > "$dropin" || return 1
+    [ -n "${SYSBOX_SETUP_HOST_ROOT:-}" ] && return 0
+    systemctl daemon-reload && systemctl enable lium-nvidia-device-nodes.service >/dev/null 2>&1
+}
+
 self_cmd() {
     # how to run this script again: the file when there is one, else the one-liner (curl | bash). A leading VAR=VALUE
     # argument goes after sudo (sudo's env_reset drops variables set before it); the rest are the script's options.
@@ -1422,6 +1488,9 @@ keep_needrestart_off_the_container_runtime && ok "apt (needrestart) never restar
 
 shift_sysbox_layers_back_at_boot && ok "After an unclean stop, each pod's files are shifted back at boot before Docker starts it." \
     || warn "Could not install lium-sysbox-layer-reset.service; after a power loss rented pods may lose sudo and apt."
+
+create_nvidia_device_nodes_before_docker && ok "At boot the NVIDIA device nodes are made before Docker starts the pods." \
+    || warn "Could not install lium-nvidia-device-nodes.service; after a reboot a pod may fail to start (missing /dev/nvidiaN)."
 
 # ── 2. Already working? ─────────────────────────────────
 
